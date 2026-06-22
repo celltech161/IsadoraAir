@@ -146,11 +146,14 @@ class Command(BaseCommand):
     def _process_file(self, filepath, root, dry_run):
         tags, info = parse_tags(filepath)
 
-        title = tags.get("title") or filepath.stem
-        artist_name = tags.get("artist") or "Unknown Artist"
-        album_title = tags.get("album") or ""
-        album_artist_name = tags.get("album_artist") or ""
-        genre_name = tags.get("genre") or ""
+        def clean(val):
+            return val.replace("\x00", "").strip() if val else val
+
+        title = clean(tags.get("title")) or filepath.stem
+        artist_name = clean(tags.get("artist")) or "Unknown Artist"
+        album_title = clean(tags.get("album")) or ""
+        album_artist_name = clean(tags.get("album_artist")) or ""
+        genre_name = clean(tags.get("genre")) or ""
         fmt = filepath.suffix.lstrip(".").lower()
 
         rel = filepath.relative_to(root)
@@ -185,9 +188,9 @@ class Command(BaseCommand):
             )
 
         defaults = {
-            "filename": filepath.name,
+            "filename": clean(filepath.name),
             "format": fmt,
-            "title": title,
+            "title": clean(title),
             "artist": artist_obj,
             "album": album_obj,
             "genre": genre_obj,
