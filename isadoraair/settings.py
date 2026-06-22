@@ -21,7 +21,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # See https://docs.djangoproject.com/en/5.2/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = 'django-insecure-mgl(1gz6l^$j*(q+-8+9rp3n%2=7l0sr9$iu-lapa4^_!2%#&+'
+SECRET_KEY = config('SECRET_KEY', default='django-insecure-mgl(1gz6l^$j*(q+-8+9rp3n%2=7l0sr9$iu-lapa4^_!2%#&+')
 
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
@@ -129,6 +129,13 @@ STATIC_URL = 'static/'
 STATIC_ROOT = BASE_DIR / 'staticfiles'
 
 LIBRARY_ROOT = config('LIBRARY_ROOT', default='/srv/isadoraair/music')
+
+SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+CSRF_TRUSTED_ORIGINS = config(
+    'CSRF_TRUSTED_ORIGINS',
+    default='https://isadoraair,https://192.168.1.125',
+    cast=lambda v: [o.strip() for o in v.split(',')],
+)
 
 # Default primary key field type
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field

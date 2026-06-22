@@ -1,0 +1,29 @@
+server {
+    listen 80;
+    server_name isadoraair 192.168.1.125;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    server_name isadoraair 192.168.1.125;
+
+    ssl_certificate     /etc/ssl/isadoraair/selfsigned.crt;
+    ssl_certificate_key /etc/ssl/isadoraair/selfsigned.key;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+
+    client_max_body_size 100M;
+
+    location /static/ {
+        alias /opt/isadoraair/staticfiles/;
+        expires 1h;
+    }
+
+    location / {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}

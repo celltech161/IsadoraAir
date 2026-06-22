@@ -1,0 +1,15 @@
+[Unit]
+Description=IsadoraAir Gunicorn
+After=network.target postgresql.service
+
+[Service]
+User=jreed
+Group=jreed
+WorkingDirectory=/opt/isadoraair
+ExecStart=/opt/isadoraair/venv/bin/gunicorn isadoraair.wsgi:application --bind 127.0.0.1:8000 --workers 3
+Restart=on-failure
+RestartSec=5
+EnvironmentFile=/opt/isadoraair/.env
+
+[Install]
+WantedBy=multi-user.target
