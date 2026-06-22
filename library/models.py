@@ -1,3 +1,4 @@
+from django.conf import settings
 from django.db import models
 from django.contrib.postgres.fields import ArrayField
 
@@ -325,3 +326,67 @@ class LogItem(models.Model):
 
     def __str__(self):
         return f"{self.playlist_log.date} #{self.position}: {self.track}"
+
+
+# ---------------------------------------------------------------
+# Site configuration (singleton models)
+# ---------------------------------------------------------------
+
+class AnalysisConfig(models.Model):
+    """Singleton — audio analysis thresholds editable from admin."""
+    next_start_threshold_db = models.FloatField(
+        default=-26.0,
+        verbose_name="Next Start threshold (dBFS)",
+        help_text="Scan backward from end of track; last sample above this level sets the auto-mix trigger point.",
+    )
+    cue_in_threshold_db = models.FloatField(
+        default=-45.0,
+        verbose_name="Cue In threshold (dBFS)",
+        help_text="Scan forward from start; first sample above this level sets the cue-in point.",
+    )
+    cue_in_min_seconds = models.FloatField(
+        default=0.1,
+        verbose_name="Cue In minimum (seconds)",
+        help_text="Cue-in values smaller than this are treated as 0.",
+    )
+    analysis_sample_rate = models.PositiveIntegerField(
+        default=4410,
+        verbose_name="Analysis sample rate (Hz)",
+        help_text="Sample rate for the ffmpeg decode pass. Lower = faster but less precise.",
+    )
+    analysis_window_seconds = models.FloatField(
+        default=0.05,
+        verbose_name="RMS window (seconds)",
+        help_text="Length of each RMS envelope window.",
+    )
+    waveform_points = models.PositiveIntegerField(
+        default=1000,
+        verbose_name="Waveform resolution",
+        help_text="Number of data points in the UI waveform.",
+    )
+
+    class Meta:
+        verbose_name = "Analysis Configuration"
+        verbose_name_plural = "Analysis Configuration"
+
+    def __str__(self):
+        return "Analysis Configuration"
+
+    def save(self, *args, **kwargs):
+        self.pk = 1
+        super().save(*args, **kwargs)
+
+    @classmethod
+    def load(cls):
+        obj, _created = cls.objects.get_or_create(
+            pk=1,
+            defaults={
+                "next_start_threshold_db": getattr(settings, "NEXT_START_THRESHOLD_DB", -26.0),
+                "cue_in_threshold_db": getattr(settings, "CUE_IN_THRESHOLD_DB", -45.0),
+                "cue_in_min_seconds": getattr(settings, "CUE_IN_MIN_SECONDS", 0.1),
+                "analysis_sample_rate": getattr(settings, "ANALYSIS_SAMPLE_RATE", 4410),
+                "analysis_window_seconds": getattr(settings, "ANALYSIS_WINDOW_SECONDS", 0.05),
+                "waveform_points": getattr(settings, "ANALYSIS_WAVEFORM_POINTS", 1000),
+            },
+        )
+        return obj

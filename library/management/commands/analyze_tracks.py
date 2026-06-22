@@ -6,10 +6,9 @@ import subprocess
 import sys
 from pathlib import Path
 
-from django.conf import settings
 from django.core.management.base import BaseCommand
 
-from library.models import Track
+from library.models import AnalysisConfig, Track
 
 
 def decode_audio_to_pcm(filepath, sample_rate):
@@ -190,14 +189,16 @@ class Command(BaseCommand):
         force = options["force"]
         limit = options["limit"]
 
-        sample_rate = settings.ANALYSIS_SAMPLE_RATE
-        window_seconds = settings.ANALYSIS_WINDOW_SECONDS
-        target_points = settings.ANALYSIS_WAVEFORM_POINTS
-        next_start_db = settings.NEXT_START_THRESHOLD_DB
-        cue_in_db = settings.CUE_IN_THRESHOLD_DB
-        cue_in_min = settings.CUE_IN_MIN_SECONDS
+        cfg = AnalysisConfig.load()
+        sample_rate = cfg.analysis_sample_rate
+        window_seconds = cfg.analysis_window_seconds
+        target_points = cfg.waveform_points
+        next_start_db = cfg.next_start_threshold_db
+        cue_in_db = cfg.cue_in_threshold_db
+        cue_in_min = cfg.cue_in_min_seconds
 
-        wave_dir = Path(settings.WAVEFORMS_DIR)
+        from django.conf import settings as django_settings
+        wave_dir = Path(getattr(django_settings, "WAVEFORMS_DIR", "/srv/isadoraair/waveforms"))
         wave_dir.mkdir(parents=True, exist_ok=True)
 
         qs = Track.objects.filter(filepath__isnull=False)

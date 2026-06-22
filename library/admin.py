@@ -1,7 +1,11 @@
 from django.contrib import admin
 
+from django.http import HttpResponseRedirect
+from django.urls import reverse
+
 from .models import (
     Album,
+    AnalysisConfig,
     Artist,
     Category,
     Clock,
@@ -96,3 +100,35 @@ class PlaylistLogAdmin(admin.ModelAdmin):
     list_display = ["date", "status", "generated_at"]
     list_filter = ["status"]
     inlines = [LogItemInline]
+
+
+@admin.register(AnalysisConfig)
+class AnalysisConfigAdmin(admin.ModelAdmin):
+    fieldsets = [
+        ("Detection Thresholds", {
+            "fields": [
+                "next_start_threshold_db",
+                "cue_in_threshold_db",
+                "cue_in_min_seconds",
+            ],
+        }),
+        ("Analysis Parameters", {
+            "fields": [
+                "analysis_sample_rate",
+                "analysis_window_seconds",
+                "waveform_points",
+            ],
+        }),
+    ]
+
+    def has_add_permission(self, request):
+        return not AnalysisConfig.objects.exists()
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+    def changelist_view(self, request, extra_context=None):
+        obj = AnalysisConfig.load()
+        return HttpResponseRedirect(
+            reverse("admin:library_analysisconfig_change", args=[obj.pk])
+        )
