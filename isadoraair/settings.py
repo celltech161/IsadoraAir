@@ -129,6 +129,15 @@ STATIC_URL = 'static/'
 STATIC_ROOT = BASE_DIR / 'staticfiles'
 
 LIBRARY_ROOT = config('LIBRARY_ROOT', default='/srv/isadoraair/music')
+WAVEFORMS_DIR = config('WAVEFORMS_DIR', default='/srv/isadoraair/waveforms')
+
+# --- Audio analysis thresholds ---
+ANALYSIS_SAMPLE_RATE = config('ANALYSIS_SAMPLE_RATE', default=4410, cast=int)
+ANALYSIS_WINDOW_SECONDS = config('ANALYSIS_WINDOW_SECONDS', default=0.05, cast=float)
+ANALYSIS_WAVEFORM_POINTS = config('ANALYSIS_WAVEFORM_POINTS', default=1000, cast=int)
+NEXT_START_THRESHOLD_DB = config('NEXT_START_THRESHOLD_DB', default=-26.0, cast=float)
+CUE_IN_THRESHOLD_DB = config('CUE_IN_THRESHOLD_DB', default=-45.0, cast=float)
+CUE_IN_MIN_SECONDS = config('CUE_IN_MIN_SECONDS', default=0.1, cast=float)
 
 SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
 CSRF_TRUSTED_ORIGINS = config(
