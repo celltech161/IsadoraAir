@@ -26,7 +26,11 @@ SECRET_KEY = 'django-insecure-mgl(1gz6l^$j*(q+-8+9rp3n%2=7l0sr9$iu-lapa4^_!2%#&+
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-ALLOWED_HOSTS = []
+ALLOWED_HOSTS = config(
+    'ALLOWED_HOSTS',
+    default='localhost,127.0.0.1,isadoraair,192.168.1.125',
+    cast=lambda v: [h.strip() for h in v.split(',')],
+)
 
 
 # Application definition
@@ -122,6 +126,7 @@ USE_TZ = True
 # https://docs.djangoproject.com/en/5.2/howto/static-files/
 
 STATIC_URL = 'static/'
+STATIC_ROOT = BASE_DIR / 'staticfiles'
 
 LIBRARY_ROOT = config('LIBRARY_ROOT', default='/srv/isadoraair/music')
 
