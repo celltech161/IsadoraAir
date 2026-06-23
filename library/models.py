@@ -51,8 +51,16 @@ class Category(models.Model):
     """Rotation category - e.g. HOT_CURR, DEEP_80S. Distinct from Genre,
     which is descriptive only; Category is what actually drives rotation
     logic (RotationSlot references this, not Genre)."""
+    KIND_CHOICES = [
+        ("music", "Music"),
+        ("imaging", "Imaging"),
+        ("spot", "Spot"),
+        ("talk", "Talk"),
+    ]
+
     code = models.CharField(max_length=20, unique=True)
     name = models.CharField(max_length=100)
+    kind = models.CharField(max_length=10, choices=KIND_CHOICES, default="music")
     description = models.TextField(blank=True)
     color = models.CharField(max_length=20, blank=True)  # for UI display
     sort_order = models.PositiveIntegerField(default=0)

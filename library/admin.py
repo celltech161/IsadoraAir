@@ -42,8 +42,9 @@ class GenreAdmin(admin.ModelAdmin):
 
 @admin.register(Category)
 class CategoryAdmin(admin.ModelAdmin):
-    list_display = ["code", "name", "track_count", "sort_order"]
-    list_editable = ["name", "sort_order"]
+    list_display = ["code", "name", "kind", "track_count", "sort_order"]
+    list_editable = ["name", "kind", "sort_order"]
+    list_filter = ["kind"]
     search_fields = ["code", "name"]
 
     def get_queryset(self, request):
