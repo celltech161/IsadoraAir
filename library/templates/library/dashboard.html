@@ -408,6 +408,16 @@ function fmtDur(sec) {
   return (sec < 0 ? '-' : '') + m + ':' + String(s).padStart(2, '0');
 }
 
+function getCookie(name) {
+  let val = null;
+  document.cookie.split(';').forEach(c => {
+    c = c.trim();
+    if (c.startsWith(name + '='))
+      val = decodeURIComponent(c.substring(name.length + 1));
+  });
+  return val;
+}
+
 function esc(s) {
   if (!s) return '';
   const d = document.createElement('div');
