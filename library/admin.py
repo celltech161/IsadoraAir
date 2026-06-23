@@ -1,5 +1,5 @@
 from django.contrib import admin
-
+from django.db.models import Count
 from django.http import HttpResponseRedirect
 from django.urls import reverse
 
@@ -42,8 +42,16 @@ class GenreAdmin(admin.ModelAdmin):
 
 @admin.register(Category)
 class CategoryAdmin(admin.ModelAdmin):
-    list_display = ["code", "name", "sort_order"]
+    list_display = ["code", "name", "track_count", "sort_order"]
     list_editable = ["name", "sort_order"]
+    search_fields = ["code", "name"]
+
+    def get_queryset(self, request):
+        return super().get_queryset(request).annotate(_track_count=Count("tracks"))
+
+    @admin.display(description="Tracks", ordering="_track_count")
+    def track_count(self, obj):
+        return obj._track_count
 
 
 @admin.register(Holiday)
@@ -51,14 +59,24 @@ class HolidayAdmin(admin.ModelAdmin):
     list_display = ["code", "name", "month", "day", "ramp_in_days", "ramp_out_days"]
 
 
+@admin.action(description="Mark selected tracks as ready to air")
+def mark_ready2air(modeladmin, request, queryset):
+    queryset.update(ready2air=True)
+
+@admin.action(description="Mark selected tracks as NOT ready to air")
+def mark_not_ready2air(modeladmin, request, queryset):
+    queryset.update(ready2air=False)
+
 @admin.register(Track)
 class TrackAdmin(admin.ModelAdmin):
     list_display = ["title", "artist", "album", "category", "duration_seconds", "ready2air"]
-    list_filter = ["ready2air", "category", "energy", "end_type"]
+    list_filter = ["ready2air", "category", "energy", "end_type", "format"]
     search_fields = ["title", "artist__name", "album__title"]
     list_editable = ["ready2air", "category"]
     list_per_page = 50
+    list_select_related = ["artist", "album", "category"]
     raw_id_fields = ["artist", "album", "genre"]
+    actions = [mark_ready2air, mark_not_ready2air]
 
 
 class RotationSlotInline(admin.TabularInline):
