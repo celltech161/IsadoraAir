@@ -413,67 +413,91 @@ function updatePositionIndicator() {
   if (elapsedEl) elapsedEl.textContent = fmtDur(pos);
 }
 
-function renderNowPlaying(data) {
+let deckBuilt = false;
+
+function buildDeckDOM(data) {
   const np = data.now_playing;
   const container = document.getElementById('nowPlaying');
-  const nextUpEl = document.getElementById('nextUp');
-  const offline = document.getElementById('offlineMsg');
-
-  if (!np || data.transport === 'OFFLINE' || data.transport === 'STOPPED') {
-    container.innerHTML = '';
-    container.appendChild(offline || document.createElement('div'));
-    if (offline) {
-      offline.style.display = '';
-      offline.querySelector('.offline-icon').textContent =
-        data.transport === 'STOPPED' ? '&#9632;' : '&#9654;';
-      offline.childNodes[offline.childNodes.length - 1].textContent =
-        data.transport === 'STOPPED' ? 'Engine stopped' : 'Engine not running';
-    }
-    nextUpEl.style.display = 'none';
-    return;
-  }
-
-  localPosition = np.position || 0;
-  localDuration = np.duration || 0;
-  localNextStart = np.next_start || localDuration;
-  lastPollTime = Date.now();
-
-  if (np.track_id !== lastTrackId) {
-    lastTrackId = np.track_id;
-    loadWaveform(np.track_id);
-  }
 
   container.innerHTML = `
     <div class="np-status-row">
-      <span class="transport-badge ${esc(data.transport)}">${esc(data.transport)}</span>
+      <span class="transport-badge" id="transportBadge"></span>
       <span class="np-clock" id="liveClock"></span>
     </div>
     <div class="np-meta">
-      <div class="np-title">${esc(np.title)}</div>
-      <div class="np-artist">${esc(np.artist)}</div>
-      ${np.album ? `<div class="np-album">${esc(np.album)}</div>` : ''}
-      ${np.category ? `<span class="np-category">${esc(np.category)}</span>` : ''}
+      <div class="np-title" id="npTitle"></div>
+      <div class="np-artist" id="npArtist"></div>
+      <div class="np-album" id="npAlbum"></div>
+      <span class="np-category" id="npCategory"></span>
     </div>
     <div class="np-waveform">
       <canvas id="npWaveform"></canvas>
       <div class="position-line" id="posLine"></div>
     </div>
     <div class="np-timing">
-      <div class="np-countdown" id="npCountdown">${fmtDur(Math.max(0, localNextStart - localPosition))}</div>
+      <div class="np-countdown" id="npCountdown"></div>
       <div class="np-progress-wrap">
         <div class="np-progress-bar">
-          <div class="np-progress-fill" id="npProgressFill"
-               style="width:${localDuration ? (localPosition / localDuration * 100) : 0}%"></div>
+          <div class="np-progress-fill" id="npProgressFill"></div>
         </div>
         <div class="np-times">
-          <span id="npElapsed">${fmtDur(localPosition)}</span>
-          <span>${fmtDur(localDuration)}</span>
+          <span id="npElapsed"></span>
+          <span id="npTotal"></span>
         </div>
       </div>
     </div>
   `;
 
-  if (waveformSamples) drawWaveform();
+  deckBuilt = true;
+}
+
+function renderNowPlaying(data) {
+  const np = data.now_playing;
+  const container = document.getElementById('nowPlaying');
+  const nextUpEl = document.getElementById('nextUp');
+
+  if (!np || data.transport === 'OFFLINE' || data.transport === 'STOPPED') {
+    container.innerHTML = `
+      <div class="offline-msg">
+        <div class="offline-icon">${data.transport === 'STOPPED' ? '&#9632;' : '&#9654;'}</div>
+        ${data.transport === 'STOPPED' ? 'Engine stopped' : 'Engine not running'}
+      </div>
+    `;
+    nextUpEl.style.display = 'none';
+    lastTrackId = null;
+    deckBuilt = false;
+    return;
+  }
+
+  // Build DOM structure once, then just update values
+  if (!deckBuilt) buildDeckDOM(data);
+
+  // Update track info only on track change
+  if (np.track_id !== lastTrackId) {
+    lastTrackId = np.track_id;
+    loadWaveform(np.track_id);
+
+    document.getElementById('npTitle').textContent = np.title || '';
+    document.getElementById('npArtist').textContent = np.artist || '';
+    const albumEl = document.getElementById('npAlbum');
+    albumEl.textContent = np.album || '';
+    albumEl.style.display = np.album ? '' : 'none';
+    const catEl = document.getElementById('npCategory');
+    catEl.textContent = np.category || '';
+    catEl.style.display = np.category ? '' : 'none';
+    document.getElementById('npTotal').textContent = fmtDur(np.duration);
+  }
+
+  // Update transport badge
+  const badge = document.getElementById('transportBadge');
+  badge.textContent = data.transport;
+  badge.className = 'transport-badge ' + data.transport;
+
+  // Update position timing
+  localPosition = np.position || 0;
+  localDuration = np.duration || 0;
+  localNextStart = np.next_start || localDuration;
+  lastPollTime = Date.now();
 
   // Next up
   if (data.next_up) {
