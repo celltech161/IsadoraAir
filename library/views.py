@@ -501,27 +501,21 @@ def api_log_reorder(request, pk):
     return JsonResponse(_log_to_dict(log))
 
 
-@require_http_methods(["POST"])
-def api_engine_queue_reorder(request):
+def _read_engine_current_item_id():
+    """Read the engine state to find which LogItem is currently playing."""
+    state_path = Path("/run/isadoraair/engine_state.json")
     try:
-        body = json.loads(request.body)
-    except (json.JSONDecodeError, ValueError):
-        return JsonResponse({"error": "Invalid JSON"}, status=400)
-
-    order = body.get("order")
-    log_id = body.get("log_id")
-    if not order or not log_id:
-        return JsonResponse({"error": "log_id and order required"}, status=400)
-
-    log = get_object_or_404(PlaylistLog, pk=log_id)
-    items = {item.id: item for item in log.items.all()}
-
-    for pos, item_id in enumerate(order):
-        if item_id in items:
-            items[item_id].position = pos
-    LogItem.objects.bulk_update(items.values(), ["position"])
-
-    return JsonResponse({"ok": True})
+        data = json.loads(state_path.read_text(encoding="utf-8"))
+        np = data.get("now_playing")
+        if np and data.get("log_id"):
+            log = PlaylistLog.objects.get(id=data["log_id"])
+            items = list(log.items.order_by("position"))
+            idx = data.get("current_index", 0)
+            if 0 <= idx < len(items):
+                return items[idx].id, items, idx
+    except Exception:
+        pass
+    return None, [], 0
 
 
 @require_http_methods(["POST"])
@@ -532,15 +526,12 @@ def api_engine_set_next(request):
         return JsonResponse({"error": "Invalid JSON"}, status=400)
 
     item_id = body.get("item_id")
-    current_index = body.get("current_index", 0)
     if not item_id:
         return JsonResponse({"error": "item_id required"}, status=400)
 
-    item = get_object_or_404(LogItem.objects.select_related("playlist_log"), pk=item_id)
-    log = item.playlist_log
-
-    all_items = list(log.items.order_by("position"))
-    target_pos = current_index + 1
+    current_item_id, all_items, current_idx = _read_engine_current_item_id()
+    if not all_items:
+        return JsonResponse({"error": "No active log"}, status=400)
 
     src_idx = None
     for i, li in enumerate(all_items):
@@ -548,11 +539,15 @@ def api_engine_set_next(request):
             src_idx = i
             break
 
-    if src_idx is None or src_idx <= target_pos:
+    if src_idx is None:
+        return JsonResponse({"error": "Item not found"}, status=404)
+
+    target_idx = current_idx + 1
+    if src_idx <= target_idx:
         return JsonResponse({"ok": True})
 
     moved = all_items.pop(src_idx)
-    all_items.insert(target_pos, moved)
+    all_items.insert(target_idx, moved)
 
     for pos, li in enumerate(all_items):
         li.position = pos
@@ -568,18 +563,16 @@ def api_engine_insert_track(request):
     except (json.JSONDecodeError, ValueError):
         return JsonResponse({"error": "Invalid JSON"}, status=400)
 
-    log_id = body.get("log_id")
     track_id = body.get("track_id")
-    after_index = body.get("after_index", 0)
+    if not track_id:
+        return JsonResponse({"error": "track_id required"}, status=400)
 
-    if not log_id or not track_id:
-        return JsonResponse({"error": "log_id and track_id required"}, status=400)
+    current_item_id, all_items, current_idx = _read_engine_current_item_id()
+    if not all_items:
+        return JsonResponse({"error": "No active log"}, status=400)
 
-    log = get_object_or_404(PlaylistLog, pk=log_id)
     track = get_object_or_404(Track, pk=track_id)
-
-    all_items = list(log.items.order_by("position"))
-    insert_pos = after_index + 1
+    log = all_items[0].playlist_log
 
     new_item = LogItem.objects.create(
         playlist_log=log,
@@ -589,12 +582,32 @@ def api_engine_insert_track(request):
         category=track.category,
     )
 
-    all_items.insert(insert_pos, new_item)
+    insert_idx = current_idx + 1
+    all_items.insert(insert_idx, new_item)
     for pos, li in enumerate(all_items):
         li.position = pos
     LogItem.objects.bulk_update(all_items, ["position"])
 
     return JsonResponse({"ok": True, "item_id": new_item.id})
+
+
+@require_http_methods(["POST"])
+def api_engine_seek(request):
+    try:
+        body = json.loads(request.body)
+    except (json.JSONDecodeError, ValueError):
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+
+    position = body.get("position")
+    if position is None:
+        return JsonResponse({"error": "position required"}, status=400)
+
+    cmd_path = Path("/run/isadoraair/engine_cmd.json")
+    cmd_path.write_text(
+        json.dumps({"command": "seek", "position": float(position)}),
+        encoding="utf-8",
+    )
+    return JsonResponse({"ok": True})
 
 
 @require_http_methods(["GET"])

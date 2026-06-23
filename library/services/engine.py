@@ -20,6 +20,7 @@ from django.utils import timezone
 from library.models import LogItem, PlaylistLog, Track
 
 STATE_PATH = Path("/run/isadoraair/engine_state.json")
+CMD_PATH = Path("/run/isadoraair/engine_cmd.json")
 POSITION_POLL_MS = 500
 
 
@@ -284,6 +285,31 @@ class PlaybackEngine:
             return time.time() - deck.started_at
         return 0.0
 
+    def _check_commands(self):
+        try:
+            if not CMD_PATH.is_file():
+                return
+            data = json.loads(CMD_PATH.read_text(encoding="utf-8"))
+            CMD_PATH.unlink(missing_ok=True)
+
+            cmd = data.get("command")
+            if cmd == "seek":
+                position = float(data.get("position", 0))
+                with self._lock:
+                    if self.decks:
+                        leading = self.decks[0]
+                        seek_ns = int(position * Gst.SECOND)
+                        leading.pipeline.seek_simple(
+                            Gst.Format.TIME,
+                            Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT,
+                            seek_ns,
+                        )
+                        leading.started_at = time.time() - position
+                        self._next_triggered = False
+                        print(f"  Seek to {position:.1f}s")
+        except Exception as exc:
+            print(f"  Command error: {exc}")
+
     def _reload_queue_if_changed(self):
         if not self.current_log:
             return
@@ -314,6 +340,7 @@ class PlaybackEngine:
         if not self.running:
             return False
 
+        self._check_commands()
         self._reload_queue_if_changed()
 
         with self._lock:

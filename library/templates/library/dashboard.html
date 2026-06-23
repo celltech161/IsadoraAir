@@ -139,7 +139,10 @@
     background: rgba(148, 163, 184, 0.15);
     border-radius: 3px;
     overflow: hidden;
+    cursor: pointer;
+    position: relative;
   }
+  .np-progress-bar:hover { height: 10px; }
 
   .np-progress-fill {
     height: 100%;
@@ -553,6 +556,14 @@ function buildDeckDOM(data) {
   `;
 
   deckBuilt = true;
+
+  document.getElementById('npProgressFill').parentElement.addEventListener('click', function(e) {
+    if (!localDuration) return;
+    const rect = this.getBoundingClientRect();
+    const pct = (e.clientX - rect.left) / rect.width;
+    const pos = pct * localDuration;
+    seekTo(Math.max(0, Math.min(localDuration, pos)));
+  });
 }
 
 function renderNowPlaying(data) {
@@ -696,9 +707,19 @@ async function setNext(itemId) {
   await fetch('/api/engine/queue/set-next/', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') },
-    body: JSON.stringify({ item_id: itemId, current_index: currentEngineIndex }),
+    body: JSON.stringify({ item_id: itemId }),
   });
   poll();
+}
+
+async function seekTo(seconds) {
+  await fetch('/api/engine/seek/', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') },
+    body: JSON.stringify({ position: seconds }),
+  });
+  localPosition = seconds;
+  lastPollTime = Date.now();
 }
 
 // --- Search to insert ---
@@ -738,15 +759,10 @@ async function searchForInsert(q) {
 }
 
 async function insertTrack(trackId) {
-  if (!currentLogId) return;
   await fetch('/api/engine/queue/insert/', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') },
-    body: JSON.stringify({
-      log_id: currentLogId,
-      track_id: trackId,
-      after_index: currentEngineIndex,
-    }),
+    body: JSON.stringify({ track_id: trackId }),
   });
   document.getElementById('queueInsertSearch').value = '';
   document.getElementById('queueInsertResults').classList.remove('visible');
