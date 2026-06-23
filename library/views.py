@@ -493,11 +493,9 @@ def api_log_reorder(request, pk):
     if not order or not isinstance(order, list):
         return JsonResponse({"error": "order (list of item IDs) is required"}, status=400)
 
-    items = {item.id: item for item in log.items.all()}
-    for pos, item_id in enumerate(order):
-        if item_id in items:
-            items[item_id].position = pos
-    LogItem.objects.bulk_update(items.values(), ["position"])
+    items_by_id = {item.id: item for item in log.items.all()}
+    ordered = [items_by_id[i] for i in order if i in items_by_id]
+    _reposition_items(ordered)
 
     return JsonResponse(_log_to_dict(log))
 
@@ -551,11 +549,23 @@ def api_engine_set_next(request):
     moved = all_items.pop(src_idx)
     all_items.insert(target_idx, moved)
 
-    for pos, li in enumerate(all_items):
-        li.position = pos
-    LogItem.objects.bulk_update(all_items, ["position"])
+    _reposition_items(all_items)
 
     return JsonResponse({"ok": True})
+
+
+def _reposition_items(items):
+    """Two-pass position update to avoid unique constraint violations
+    when reordering LogItems within a PlaylistLog."""
+    from django.db import transaction
+    OFFSET = 100000
+    with transaction.atomic():
+        for i, li in enumerate(items):
+            li.position = i + OFFSET
+        LogItem.objects.bulk_update(items, ["position"])
+        for i, li in enumerate(items):
+            li.position = i
+        LogItem.objects.bulk_update(items, ["position"])
 
 
 @csrf_exempt
@@ -587,9 +597,7 @@ def api_engine_insert_track(request):
 
     insert_idx = current_idx + 1
     all_items.insert(insert_idx, new_item)
-    for pos, li in enumerate(all_items):
-        li.position = pos
-    LogItem.objects.bulk_update(all_items, ["position"])
+    _reposition_items(all_items)
 
     return JsonResponse({"ok": True, "item_id": new_item.id})
 
