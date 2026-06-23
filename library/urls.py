@@ -22,4 +22,5 @@ urlpatterns = [
     path('api/log/<int:pk>/delete/', views.api_log_delete, name='api-log-delete'),
     path('api/log/<int:pk>/reorder/', views.api_log_reorder, name='api-log-reorder'),
     path('api/log/item/<int:item_id>/swap/', views.api_log_item_swap, name='api-log-item-swap'),
+    path('api/waveform/<int:track_id>/', views.api_waveform, name='api-waveform'),
 ]

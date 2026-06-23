@@ -112,6 +112,43 @@
     height: 16px;
   }
 
+  /* --- Waveform --- */
+  .waveform-wrap {
+    background: var(--bg-dark);
+    border: 1px solid var(--border-subtle);
+    border-radius: 10px;
+    padding: 0.75rem 1rem;
+    margin-bottom: 1.25rem;
+    position: relative;
+  }
+
+  .waveform-wrap canvas {
+    width: 100%;
+    height: 80px;
+    display: block;
+  }
+
+  .waveform-legend {
+    display: flex;
+    gap: 1.25rem;
+    margin-top: 0.4rem;
+    font-size: 0.7rem;
+    color: var(--text-muted);
+  }
+
+  .waveform-legend .legend-item {
+    display: flex;
+    align-items: center;
+    gap: 0.3rem;
+  }
+
+  .legend-swatch {
+    width: 10px;
+    height: 10px;
+    border-radius: 2px;
+    display: inline-block;
+  }
+
   .save-bar {
     margin-top: 1.25rem;
     display: flex;
@@ -146,6 +183,15 @@
 <div class="detail-header">
   <a href="{% url 'library:library' %}" class="back">&larr;</a>
   <h1>{{ track.title }} <span class="track-artist">— {{ track.artist.name }}</span></h1>
+</div>
+
+<div class="waveform-wrap" id="waveformWrap" style="display:none;">
+  <canvas id="waveformCanvas"></canvas>
+  <div class="waveform-legend">
+    <span class="legend-item"><span class="legend-swatch" style="background:#22c55e;"></span> Waveform</span>
+    <span class="legend-item"><span class="legend-swatch" style="background:#3b82f6;"></span> Cue In</span>
+    <span class="legend-item"><span class="legend-swatch" style="background:#f97373;"></span> Next Start</span>
+  </div>
 </div>
 
 <div class="detail-grid">
@@ -421,5 +467,69 @@ async function saveTrack() {
   msg.classList.add('show');
   setTimeout(() => msg.classList.remove('show'), 2000);
 }
+
+// --- Waveform ---
+async function loadWaveform() {
+  const resp = await fetch(`/api/waveform/${TRACK_ID}/`);
+  if (!resp.ok) return;
+
+  const data = await resp.json();
+  const samples = data.samples;
+  if (!samples || !samples.length) return;
+
+  const wrap = document.getElementById('waveformWrap');
+  const canvas = document.getElementById('waveformCanvas');
+  wrap.style.display = '';
+
+  const dpr = window.devicePixelRatio || 1;
+  const rect = canvas.getBoundingClientRect();
+  canvas.width = rect.width * dpr;
+  canvas.height = rect.height * dpr;
+  const ctx = canvas.getContext('2d');
+  ctx.scale(dpr, dpr);
+
+  const w = rect.width;
+  const h = rect.height;
+  const n = samples.length;
+  const barW = Math.max(1, w / n);
+  const duration = data.analysis_duration || dur || 1;
+
+  // Draw waveform bars
+  ctx.fillStyle = '#22c55e';
+  for (let i = 0; i < n; i++) {
+    const level = samples[i] / 255;
+    const barH = level * h;
+    const x = (i / n) * w;
+    ctx.fillRect(x, h - barH, Math.max(barW - 0.5, 0.5), barH);
+  }
+
+  // Draw cue-in marker
+  if (data.cue_in_seconds && data.cue_in_seconds > 0) {
+    const x = (data.cue_in_seconds / duration) * w;
+    ctx.strokeStyle = '#3b82f6';
+    ctx.lineWidth = 2;
+    ctx.setLineDash([4, 3]);
+    ctx.beginPath();
+    ctx.moveTo(x, 0);
+    ctx.lineTo(x, h);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  // Draw next-start marker
+  if (data.next_start) {
+    const x = (data.next_start / duration) * w;
+    ctx.strokeStyle = '#f97373';
+    ctx.lineWidth = 2;
+    ctx.setLineDash([4, 3]);
+    ctx.beginPath();
+    ctx.moveTo(x, 0);
+    ctx.lineTo(x, h);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+}
+
+loadWaveform();
 </script>
 {% endblock %}

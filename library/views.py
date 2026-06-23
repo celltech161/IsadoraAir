@@ -1,5 +1,6 @@
 import json
 from datetime import date as date_type, time
+from pathlib import Path
 
 from django.http import JsonResponse
 from django.shortcuts import render
@@ -492,3 +493,20 @@ def api_log_reorder(request, pk):
     LogItem.objects.bulk_update(items.values(), ["position"])
 
     return JsonResponse(_log_to_dict(log))
+
+
+@require_http_methods(["GET"])
+def api_waveform(request, track_id):
+    from django.conf import settings as django_settings
+    wave_dir = Path(getattr(django_settings, "WAVEFORMS_DIR", "/srv/isadoraair/waveforms"))
+    wave_file = wave_dir / f"{track_id}.json"
+
+    if not wave_file.is_file():
+        return JsonResponse({"error": "Waveform not found"}, status=404)
+
+    try:
+        data = json.loads(wave_file.read_text(encoding="utf-8"))
+    except Exception:
+        return JsonResponse({"error": "Failed to read waveform"}, status=500)
+
+    return JsonResponse(data)
