@@ -182,7 +182,7 @@ class PlaybackEngine:
             return Gst.PadProbeReturn.OK
 
         ghost_pad.add_probe(
-            Gst.PadProbeType.EVENT_DOWNSTREAM | Gst.PadProbeType.BLOCK,
+            Gst.PadProbeType.EVENT_DOWNSTREAM,
             eos_probe,
         )
 
