@@ -290,6 +290,12 @@ class PlaybackEngine:
             self._write_state()
             return True
 
+        # Don't check trigger until deck has been playing for at least 5 seconds
+        deck_age = time.time() - (leading_deck.started_at or time.time())
+        if deck_age < 5.0:
+            self._write_state()
+            return True
+
         pos = self._get_deck_position(leading_deck)
         track = leading_deck.track
 
@@ -297,18 +303,28 @@ class PlaybackEngine:
         if next_start is None:
             next_start = track.duration_seconds or 0
 
+        # Sanity: position must be reasonable (> 5s, < track duration + buffer)
+        max_pos = (track.duration_seconds or 3600) + 10
+        if pos <= 5.0 or pos > max_pos:
+            self._write_state()
+            return True
+
         next_index = self.current_index + 1
         if next_index < len(self.log_items):
             next_item = self.log_items[next_index]
             next_cue_in = next_item.track.cue_in_seconds or 0.0
             trigger_point = next_start - next_cue_in
 
+            if trigger_point < 10.0:
+                trigger_point = next_start
+
             with self._lock:
                 already_started = any(
                     d.log_item.id == next_item.id for d in self.decks
                 )
 
-            if not already_started and pos >= trigger_point and trigger_point > 0:
+            if not already_started and pos >= trigger_point:
+                print(f"  Trigger: pos={pos:.1f}s >= trigger={trigger_point:.1f}s, starting next")
                 self._start_track(next_index)
 
         self._write_state()

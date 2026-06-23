@@ -318,6 +318,9 @@
 <script>
 let lastTrackId = null;
 let waveformSamples = null;
+let waveformCueIn = null;
+let waveformNextStart = null;
+let waveformAnalysisDuration = null;
 let localPosition = 0;
 let localDuration = 0;
 let localNextStart = 0;
@@ -353,6 +356,9 @@ async function loadWaveform(trackId) {
     if (!resp.ok) { waveformSamples = null; return; }
     const data = await resp.json();
     waveformSamples = data.samples;
+    waveformCueIn = data.cue_in_seconds;
+    waveformNextStart = data.next_start;
+    waveformAnalysisDuration = data.analysis_duration;
     drawWaveform();
   } catch {
     waveformSamples = null;
@@ -383,6 +389,32 @@ function drawWaveform() {
     const x = (i / n) * w;
     const barW = Math.ceil(w / n);
     ctx.fillRect(x, h - barH, barW, barH);
+  }
+
+  const dur = waveformAnalysisDuration || localDuration || 1;
+
+  if (waveformCueIn && waveformCueIn > 0) {
+    const x = (waveformCueIn / dur) * w;
+    ctx.strokeStyle = '#3b82f6';
+    ctx.lineWidth = 2;
+    ctx.setLineDash([4, 3]);
+    ctx.beginPath();
+    ctx.moveTo(x, 0);
+    ctx.lineTo(x, h);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  if (waveformNextStart) {
+    const x = (waveformNextStart / dur) * w;
+    ctx.strokeStyle = '#f97373';
+    ctx.lineWidth = 2;
+    ctx.setLineDash([4, 3]);
+    ctx.beginPath();
+    ctx.moveTo(x, 0);
+    ctx.lineTo(x, h);
+    ctx.stroke();
+    ctx.setLineDash([]);
   }
 }
 
