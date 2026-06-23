@@ -1,6 +1,6 @@
 # IsadoraAir
 
-Django-based radio automation system built for [Oak Grove Radio](https://oakgroveradio.com) (KOGR, Miltonvale KS).
+Django-based radio automation system built for [Oak Grove Radio](https://oakgroveradio.com) (KOGR-LP, Minneapolis KS).
 
 IsadoraAir manages the full music library, schedule programming, and playlist generation for a broadcast radio station. It replaces a previous FastAPI/mpv prototype with a proper Django application backed by PostgreSQL.
 
