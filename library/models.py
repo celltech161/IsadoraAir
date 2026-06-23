@@ -409,6 +409,11 @@ class AnalysisConfig(models.Model):
         verbose_name="Waveform resolution",
         help_text="Number of data points in the UI waveform.",
     )
+    waveform_floor_db = models.FloatField(
+        default=-50.0,
+        verbose_name="Waveform display floor (dBFS)",
+        help_text="Levels below this are invisible in the waveform display. Separate from detection thresholds.",
+    )
 
     class Meta:
         verbose_name = "Analysis Configuration"
@@ -432,6 +437,7 @@ class AnalysisConfig(models.Model):
                 "analysis_sample_rate": getattr(settings, "ANALYSIS_SAMPLE_RATE", 4410),
                 "analysis_window_seconds": getattr(settings, "ANALYSIS_WINDOW_SECONDS", 0.05),
                 "waveform_points": getattr(settings, "ANALYSIS_WAVEFORM_POINTS", 1000),
+                "waveform_floor_db": -50.0,
             },
         )
         return obj

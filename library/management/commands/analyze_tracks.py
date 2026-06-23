@@ -196,6 +196,7 @@ class Command(BaseCommand):
         next_start_db = cfg.next_start_threshold_db
         cue_in_db = cfg.cue_in_threshold_db
         cue_in_min = cfg.cue_in_min_seconds
+        waveform_floor_db = cfg.waveform_floor_db
 
         from django.conf import settings as django_settings
         wave_dir = Path(getattr(django_settings, "WAVEFORMS_DIR", "/srv/isadoraair/waveforms"))
@@ -234,7 +235,7 @@ class Command(BaseCommand):
                 continue
 
             times, envelope_db, waveform = compute_envelope_and_waveform(
-                raw, sample_rate, window_seconds, target_points, next_start_db,
+                raw, sample_rate, window_seconds, target_points, waveform_floor_db,
             )
             if not waveform:
                 skipped += 1

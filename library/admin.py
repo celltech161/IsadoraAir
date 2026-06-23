@@ -146,6 +146,11 @@ class AnalysisConfigAdmin(admin.ModelAdmin):
                 "waveform_points",
             ],
         }),
+        ("Waveform Display", {
+            "fields": [
+                "waveform_floor_db",
+            ],
+        }),
     ]
 
     def has_add_permission(self, request):
