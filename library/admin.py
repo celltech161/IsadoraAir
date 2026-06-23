@@ -7,6 +7,7 @@ from .models import (
     Album,
     AnalysisConfig,
     Artist,
+    RecencyConfig,
     Category,
     Clock,
     ClockSlot,
@@ -42,10 +43,17 @@ class GenreAdmin(admin.ModelAdmin):
 
 @admin.register(Category)
 class CategoryAdmin(admin.ModelAdmin):
-    list_display = ["code", "name", "kind", "track_count", "sort_order"]
+    list_display = ["code", "name", "kind", "track_count", "recency_mode", "artist_separation", "title_separation", "sort_order"]
     list_editable = ["name", "kind", "sort_order"]
-    list_filter = ["kind"]
+    list_filter = ["kind", "recency_mode"]
     search_fields = ["code", "name"]
+    fieldsets = [
+        (None, {"fields": ["code", "name", "kind", "description", "color", "sort_order"]}),
+        ("Recency Overrides", {
+            "fields": ["recency_mode", "artist_separation", "title_separation"],
+            "description": "Leave separation fields blank to use global defaults from Recency Configuration.",
+        }),
+    ]
 
     def get_queryset(self, request):
         return super().get_queryset(request).annotate(_track_count=Count("tracks"))
@@ -150,4 +158,26 @@ class AnalysisConfigAdmin(admin.ModelAdmin):
         obj = AnalysisConfig.load()
         return HttpResponseRedirect(
             reverse("admin:library_analysisconfig_change", args=[obj.pk])
+        )
+
+
+@admin.register(RecencyConfig)
+class RecencyConfigAdmin(admin.ModelAdmin):
+    fieldsets = [
+        ("Global Defaults", {
+            "fields": ["artist_separation", "title_separation"],
+            "description": "These apply to all categories unless overridden on the category itself.",
+        }),
+    ]
+
+    def has_add_permission(self, request):
+        return not RecencyConfig.objects.exists()
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+    def changelist_view(self, request, extra_context=None):
+        obj = RecencyConfig.load()
+        return HttpResponseRedirect(
+            reverse("admin:library_recencyconfig_change", args=[obj.pk])
         )

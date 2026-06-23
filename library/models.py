@@ -58,12 +58,31 @@ class Category(models.Model):
         ("talk", "Talk"),
     ]
 
+    RECENCY_MODE_CHOICES = [
+        ("time", "Time-based"),
+        ("proportional", "Proportional to category size"),
+    ]
+
     code = models.CharField(max_length=20, unique=True)
     name = models.CharField(max_length=100)
     kind = models.CharField(max_length=10, choices=KIND_CHOICES, default="music")
     description = models.TextField(blank=True)
-    color = models.CharField(max_length=20, blank=True)  # for UI display
+    color = models.CharField(max_length=20, blank=True)
     sort_order = models.PositiveIntegerField(default=0)
+    artist_separation = models.FloatField(
+        null=True, blank=True,
+        verbose_name="Artist separation (hours)",
+        help_text="Override: minimum hours before repeating the same artist in this category. Blank = use global default.",
+    )
+    title_separation = models.FloatField(
+        null=True, blank=True,
+        verbose_name="Title separation (hours)",
+        help_text="Override: minimum hours before repeating the same title in this category. Blank = use global default.",
+    )
+    recency_mode = models.CharField(
+        max_length=12, choices=RECENCY_MODE_CHOICES, default="time",
+        help_text="Time-based uses fixed hour windows. Proportional scales separation to category size.",
+    )
 
     class Meta:
         ordering = ["sort_order", "code"]
@@ -395,6 +414,42 @@ class AnalysisConfig(models.Model):
                 "analysis_sample_rate": getattr(settings, "ANALYSIS_SAMPLE_RATE", 4410),
                 "analysis_window_seconds": getattr(settings, "ANALYSIS_WINDOW_SECONDS", 0.05),
                 "waveform_points": getattr(settings, "ANALYSIS_WAVEFORM_POINTS", 1000),
+            },
+        )
+        return obj
+
+
+class RecencyConfig(models.Model):
+    """Singleton — global recency avoidance defaults for the log builder."""
+    artist_separation = models.FloatField(
+        default=2.5,
+        verbose_name="Artist separation (hours)",
+        help_text="Default minimum hours before repeating the same artist. Can be overridden per category.",
+    )
+    title_separation = models.FloatField(
+        default=8.0,
+        verbose_name="Title separation (hours)",
+        help_text="Default minimum hours before repeating the same title. Can be overridden per category.",
+    )
+
+    class Meta:
+        verbose_name = "Recency Configuration"
+        verbose_name_plural = "Recency Configuration"
+
+    def __str__(self):
+        return "Recency Configuration"
+
+    def save(self, *args, **kwargs):
+        self.pk = 1
+        super().save(*args, **kwargs)
+
+    @classmethod
+    def load(cls):
+        obj, _created = cls.objects.get_or_create(
+            pk=1,
+            defaults={
+                "artist_separation": 2.5,
+                "title_separation": 8.0,
             },
         )
         return obj
