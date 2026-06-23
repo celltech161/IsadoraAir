@@ -43,6 +43,7 @@ class PlaybackEngine:
         self.decks = []
         self._deck_bin_map = {}
         self._last_queue_reload = 0
+        self._next_triggered = False
         self.current_log = None
         self.log_items = []
         self.current_index = 0
@@ -256,6 +257,7 @@ class PlaybackEngine:
 
         if as_leading:
             self.current_index = index
+            self._next_triggered = False
 
         log_item = self.log_items[index]
         deck = self._create_deck(log_item)
@@ -352,13 +354,9 @@ class PlaybackEngine:
             if trigger_point < 10.0:
                 trigger_point = next_start
 
-            with self._lock:
-                already_started = any(
-                    d.log_item.id == next_item.id for d in self.decks
-                )
-
-            if not already_started and pos >= trigger_point:
+            if not self._next_triggered and pos >= trigger_point:
                 print(f"  Trigger: pos={pos:.1f}s >= trigger={trigger_point:.1f}s, starting next")
+                self._next_triggered = True
                 self._start_track(next_index)
 
         self._write_state()
@@ -381,6 +379,7 @@ class PlaybackEngine:
     def _handle_deck_finished(self, deck, was_leading):
         self._remove_deck(deck)
         if was_leading:
+            self._next_triggered = False
             next_idx = self.current_index + 1
             with self._lock:
                 already_playing = any(
