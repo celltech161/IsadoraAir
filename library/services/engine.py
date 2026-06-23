@@ -239,7 +239,7 @@ class PlaybackEngine:
                 self._start_track(index + 1, as_leading=True)
             return
 
-        self._deck_bin_map[id(deck_bin)] = deck
+        self._deck_bin_map[id(deck.pipeline)] = deck
 
         with self._lock:
             self.decks.append(deck)
