@@ -1,0 +1,322 @@
+{% extends "base.html" %}
+
+{% block title %}Library — IsadoraAir{% endblock %}
+{% block nav_library %}class="active"{% endblock %}
+
+{% block extra_css %}
+<style>
+  .lib-toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.6rem;
+    align-items: center;
+    margin-bottom: 1rem;
+  }
+
+  .lib-search {
+    flex: 1;
+    min-width: 220px;
+    max-width: 400px;
+    background: var(--bg-dark);
+    border: 1px solid var(--border-subtle);
+    border-radius: 8px;
+    padding: 0.5rem 0.8rem;
+    color: var(--text-main);
+    font-size: 0.875rem;
+  }
+  .lib-search:focus { outline: none; border-color: var(--accent); }
+  .lib-search::placeholder { color: var(--text-muted); }
+
+  .lib-select {
+    background: var(--bg-dark);
+    border: 1px solid var(--border-subtle);
+    border-radius: 8px;
+    padding: 0.45rem 0.6rem;
+    color: var(--text-main);
+    font-size: 0.8rem;
+    cursor: pointer;
+  }
+  .lib-select:focus { outline: none; border-color: var(--accent); }
+
+  .lib-stats {
+    color: var(--text-muted);
+    font-size: 0.8rem;
+    margin-left: auto;
+  }
+
+  /* --- Table --- */
+  .lib-table-wrap {
+    overflow-x: auto;
+    border-radius: 8px;
+    border: 1px solid var(--border-subtle);
+  }
+
+  table.lib-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.825rem;
+  }
+
+  table.lib-table th {
+    background: var(--bg-dark);
+    color: var(--text-muted);
+    font-weight: 600;
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    padding: 0.55rem 0.7rem;
+    text-align: left;
+    cursor: pointer;
+    user-select: none;
+    white-space: nowrap;
+    border-bottom: 1px solid var(--border-subtle);
+    transition: color 0.12s;
+    position: sticky;
+    top: 0;
+    z-index: 1;
+  }
+  table.lib-table th:hover { color: var(--text-main); }
+  table.lib-table th.sorted { color: var(--accent); }
+  table.lib-table th .arrow { font-size: 0.65rem; margin-left: 3px; }
+
+  table.lib-table td {
+    padding: 0.45rem 0.7rem;
+    border-bottom: 1px solid rgba(148, 163, 184, 0.08);
+    color: var(--text-main);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 300px;
+  }
+
+  table.lib-table tr:hover td {
+    background: rgba(148, 163, 184, 0.06);
+  }
+
+  td.col-duration, td.col-format, td.col-ready {
+    text-align: center;
+    color: var(--text-muted);
+  }
+
+  td.col-category {
+    color: var(--text-muted);
+    font-size: 0.75rem;
+  }
+
+  .ready-yes { color: var(--accent); }
+  .ready-no  { color: var(--text-muted); opacity: 0.5; }
+
+  /* --- Pagination --- */
+  .lib-pager {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.75rem;
+    margin-top: 1rem;
+  }
+
+  .lib-pager button {
+    background: var(--bg-dark);
+    border: 1px solid var(--border-subtle);
+    border-radius: 6px;
+    color: var(--text-main);
+    padding: 0.35rem 0.8rem;
+    font-size: 0.8rem;
+    cursor: pointer;
+    transition: border-color 0.12s;
+  }
+  .lib-pager button:hover { border-color: var(--accent); }
+  .lib-pager button:disabled { opacity: 0.3; cursor: default; border-color: var(--border-subtle); }
+
+  .lib-pager .page-info {
+    color: var(--text-muted);
+    font-size: 0.8rem;
+  }
+
+  .lib-empty {
+    text-align: center;
+    padding: 3rem 1rem;
+    color: var(--text-muted);
+    font-size: 0.9rem;
+  }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="lib-toolbar">
+  <input type="text" class="lib-search" id="searchInput"
+         placeholder="Search title, artist, album...">
+
+  <select class="lib-select" id="categoryFilter">
+    <option value="">All categories</option>
+    {% for cat in categories %}
+    <option value="{{ cat.id }}">{{ cat.name }}</option>
+    {% endfor %}
+  </select>
+
+  <select class="lib-select" id="readyFilter">
+    <option value="">All status</option>
+    <option value="true">Ready to air</option>
+    <option value="false">Not ready</option>
+  </select>
+
+  <span class="lib-stats" id="stats"></span>
+</div>
+
+<div class="lib-table-wrap">
+  <table class="lib-table">
+    <thead>
+      <tr>
+        <th data-sort="title">Title <span class="arrow"></span></th>
+        <th data-sort="artist">Artist <span class="arrow"></span></th>
+        <th data-sort="album">Album <span class="arrow"></span></th>
+        <th data-sort="category">Category <span class="arrow"></span></th>
+        <th data-sort="duration">Duration <span class="arrow"></span></th>
+        <th>Fmt</th>
+        <th data-sort="ready2air">R2A <span class="arrow"></span></th>
+      </tr>
+    </thead>
+    <tbody id="trackBody"></tbody>
+  </table>
+</div>
+
+<div class="lib-pager">
+  <button id="prevBtn" onclick="goPage(-1)">Prev</button>
+  <span class="page-info" id="pageInfo"></span>
+  <button id="nextBtn" onclick="goPage(1)">Next</button>
+</div>
+
+<div class="lib-empty" id="emptyMsg" style="display:none;">No tracks found.</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+let currentSort = 'title';
+let currentDir = 'asc';
+let currentPage = 1;
+let totalPages = 1;
+let debounceTimer = null;
+
+function fmtDuration(sec) {
+  if (!sec && sec !== 0) return '';
+  const m = Math.floor(sec / 60);
+  const s = Math.round(sec % 60);
+  return m + ':' + String(s).padStart(2, '0');
+}
+
+function buildQuery() {
+  const params = new URLSearchParams();
+  const q = document.getElementById('searchInput').value.trim();
+  if (q) params.set('q', q);
+  const cat = document.getElementById('categoryFilter').value;
+  if (cat) params.set('category', cat);
+  const ready = document.getElementById('readyFilter').value;
+  if (ready) params.set('ready2air', ready);
+  params.set('sort', currentSort);
+  params.set('dir', currentDir);
+  params.set('page', currentPage);
+  params.set('per_page', 50);
+  return params.toString();
+}
+
+async function loadTracks() {
+  const resp = await fetch('/api/tracks/?' + buildQuery());
+  if (!resp.ok) return;
+  const data = await resp.json();
+
+  totalPages = data.pages;
+  currentPage = data.page;
+
+  const stats = document.getElementById('stats');
+  stats.textContent = data.total.toLocaleString() + ' tracks';
+
+  const body = document.getElementById('trackBody');
+  const empty = document.getElementById('emptyMsg');
+
+  if (data.items.length === 0) {
+    body.innerHTML = '';
+    empty.style.display = '';
+  } else {
+    empty.style.display = 'none';
+    body.innerHTML = data.items.map(t => `<tr>
+      <td>${esc(t.title)}</td>
+      <td>${esc(t.artist)}</td>
+      <td>${esc(t.album)}</td>
+      <td class="col-category">${esc(t.category_code)}</td>
+      <td class="col-duration">${fmtDuration(t.duration_seconds)}</td>
+      <td class="col-format">${esc(t.format)}</td>
+      <td class="col-ready">${t.ready2air
+        ? '<span class="ready-yes">&#10003;</span>'
+        : '<span class="ready-no">&mdash;</span>'}</td>
+    </tr>`).join('');
+  }
+
+  // Update sort indicators
+  document.querySelectorAll('th[data-sort]').forEach(th => {
+    const arrow = th.querySelector('.arrow');
+    if (th.dataset.sort === currentSort) {
+      th.classList.add('sorted');
+      arrow.textContent = currentDir === 'asc' ? '▲' : '▼';
+    } else {
+      th.classList.remove('sorted');
+      arrow.textContent = '';
+    }
+  });
+
+  // Update pager
+  document.getElementById('pageInfo').textContent =
+    `Page ${currentPage} of ${totalPages}`;
+  document.getElementById('prevBtn').disabled = currentPage <= 1;
+  document.getElementById('nextBtn').disabled = currentPage >= totalPages;
+}
+
+function esc(s) {
+  if (!s) return '';
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+function goPage(delta) {
+  currentPage = Math.max(1, Math.min(totalPages, currentPage + delta));
+  loadTracks();
+}
+
+// Sort on header click
+document.querySelectorAll('th[data-sort]').forEach(th => {
+  th.addEventListener('click', () => {
+    const field = th.dataset.sort;
+    if (currentSort === field) {
+      currentDir = currentDir === 'asc' ? 'desc' : 'asc';
+    } else {
+      currentSort = field;
+      currentDir = 'asc';
+    }
+    currentPage = 1;
+    loadTracks();
+  });
+});
+
+// Search with debounce
+document.getElementById('searchInput').addEventListener('input', () => {
+  clearTimeout(debounceTimer);
+  debounceTimer = setTimeout(() => {
+    currentPage = 1;
+    loadTracks();
+  }, 300);
+});
+
+// Filter changes
+document.getElementById('categoryFilter').addEventListener('change', () => {
+  currentPage = 1;
+  loadTracks();
+});
+document.getElementById('readyFilter').addEventListener('change', () => {
+  currentPage = 1;
+  loadTracks();
+});
+
+// Initial load
+loadTracks();
+</script>
+{% endblock %}
