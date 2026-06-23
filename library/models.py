@@ -94,14 +94,29 @@ class Category(models.Model):
 
 class Holiday(models.Model):
     """Holiday-themed rotation weighting with ramp-in/ramp-out."""
-    code = models.CharField(max_length=20, primary_key=True)
-    name = models.CharField(max_length=100)
-    month = models.PositiveSmallIntegerField()
-    day = models.PositiveSmallIntegerField()
-    ramp_in_days = models.PositiveSmallIntegerField(default=0)
-    ramp_out_days = models.PositiveSmallIntegerField(default=0)
-    max_share = models.DecimalField(max_digits=5, decimal_places=2, default=0)
-    max_weight_boost = models.PositiveSmallIntegerField(default=0)
+    code = models.CharField(
+        max_length=20, primary_key=True,
+        help_text="Short identifier, e.g. CHRISTMAS, JULY4TH, HALLOWEEN.",
+    )
+    name = models.CharField(max_length=100, help_text="Display name, e.g. 'Christmas', 'Independence Day'.")
+    month = models.PositiveSmallIntegerField(help_text="Month of the holiday (1-12).")
+    day = models.PositiveSmallIntegerField(help_text="Day of the month (1-31).")
+    ramp_in_days = models.PositiveSmallIntegerField(
+        default=0,
+        help_text="How many days before the holiday to start mixing in holiday content.",
+    )
+    ramp_out_days = models.PositiveSmallIntegerField(
+        default=0,
+        help_text="How many days after the holiday to keep holiday content in rotation.",
+    )
+    max_share = models.DecimalField(
+        max_digits=5, decimal_places=2, default=0,
+        help_text="Max fraction of an hour's playlist that can be holiday tracks. 0.25 = 25%, 1.00 = 100%.",
+    )
+    max_weight_boost = models.PositiveSmallIntegerField(
+        default=0,
+        help_text="Extra rotation weight added to holiday-tagged tracks during the ramp period.",
+    )
 
     class Meta:
         ordering = ["month", "day"]
