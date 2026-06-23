@@ -42,13 +42,13 @@ def parse_tags(path):
                     return str(value)
         return None
 
-    tags["title"] = first(["TIT2", "TITLE"])
-    tags["artist"] = first(["TPE1", "ARTIST"])
-    tags["album"] = first(["TALB", "ALBUM"])
-    tags["album_artist"] = first(["TPE2", "ALBUMARTIST", "ALBUM ARTIST"])
-    tags["genre"] = first(["TCON", "GENRE"])
+    tags["title"] = first(["TIT2", "TITLE", "\xa9nam"])
+    tags["artist"] = first(["TPE1", "ARTIST", "\xa9ART", "aART"])
+    tags["album"] = first(["TALB", "ALBUM", "\xa9alb"])
+    tags["album_artist"] = first(["TPE2", "ALBUMARTIST", "ALBUM ARTIST", "aART"])
+    tags["genre"] = first(["TCON", "GENRE", "\xa9gen"])
 
-    year_raw = first(["TDRC", "TYER", "YEAR"])
+    year_raw = first(["TDRC", "TYER", "YEAR", "\xa9day"])
     try:
         tags["year"] = int(str(year_raw)[:4]) if year_raw else None
     except Exception:
@@ -62,8 +62,8 @@ def parse_tags(path):
         except Exception:
             return None
 
-    tags["track_number"] = parse_num(first(["TRCK", "TRACKNUMBER"]))
-    tags["disc_number"] = parse_num(first(["TPOS", "DISCNUMBER"]))
+    tags["track_number"] = parse_num(first(["TRCK", "TRACKNUMBER", "trkn"]))
+    tags["disc_number"] = parse_num(first(["TPOS", "DISCNUMBER", "disk"]))
 
     return tags, info
 
