@@ -105,8 +105,44 @@ def get_recent_exclusions(target_datetime, artist_sep_hours, title_sep_hours,
     return exclude_track_ids, exclude_artist_ids
 
 
+DURATION_FIT_THRESHOLD = 480  # start fitting when < 8 minutes remain
+DURATION_FIT_MARGIN = 30     # acceptable overshoot in seconds
+
+
+def _pick_best_fit(qs, remaining_seconds):
+    """From a queryset of eligible tracks, pick the one whose duration
+    best fills the remaining time without overshooting too much."""
+    candidates = list(
+        qs.values_list("id", "next_start_seconds", "duration_seconds")[:200]
+    )
+    if not candidates:
+        return None
+
+    def track_dur(c):
+        return c[1] or c[2] or 0
+
+    scored = []
+    for c in candidates:
+        dur = track_dur(c)
+        diff = remaining_seconds - dur
+        if diff >= -DURATION_FIT_MARGIN:
+            scored.append((abs(diff), c[0]))
+
+    if scored:
+        scored.sort(key=lambda x: x[0])
+        best_ids = [s[1] for s in scored[:5]]
+        pick_id = random.choice(best_ids)
+    else:
+        pick_id = random.choice(candidates)[0]
+
+    return Track.objects.get(id=pick_id)
+
+
 def pick_track(category, exclude_track_ids, exclude_artist_ids,
-               artist_sep, title_sep, target_datetime, max_loosening=3):
+               artist_sep, title_sep, target_datetime,
+               remaining_seconds=None, max_loosening=3):
+    fit_mode = remaining_seconds is not None and remaining_seconds < DURATION_FIT_THRESHOLD
+
     for attempt in range(max_loosening + 1):
         qs = Track.objects.filter(category=category, ready2air=True)
 
@@ -115,7 +151,11 @@ def pick_track(category, exclude_track_ids, exclude_artist_ids,
         if exclude_artist_ids:
             qs = qs.exclude(artist_id__in=exclude_artist_ids)
 
-        track = qs.order_by("?").first()
+        if fit_mode:
+            track = _pick_best_fit(qs, remaining_seconds)
+        else:
+            track = qs.order_by("?").first()
+
         if track:
             return track
 
@@ -143,7 +183,10 @@ def pick_track(category, exclude_track_ids, exclude_artist_ids,
         exclude_track_ids = loosened_exclude_tracks
         exclude_artist_ids = loosened_exclude_artists
 
-    return Track.objects.filter(category=category, ready2air=True).order_by("?").first()
+    qs = Track.objects.filter(category=category, ready2air=True)
+    if fit_mode:
+        return _pick_best_fit(qs, remaining_seconds)
+    return qs.order_by("?").first()
 
 
 def build_hour_log(target_date, hour):
@@ -185,9 +228,11 @@ def build_hour_log(target_date, hour):
             picked_tracks, picked_artist_ids,
         )
 
+        remaining = 3600 - accumulated_seconds
         track = pick_track(
             category, exclude_track_ids, exclude_artist_ids,
             artist_sep, title_sep, target_datetime,
+            remaining_seconds=remaining,
         )
 
         if track is None:
