@@ -271,12 +271,79 @@
     flex-shrink: 0;
   }
 
+  .queue-item .qi-next-btn {
+    background: none;
+    border: 1px solid var(--border-subtle);
+    border-radius: 3px;
+    color: var(--text-muted);
+    font-size: 0.6rem;
+    padding: 0.1rem 0.3rem;
+    cursor: pointer;
+    flex-shrink: 0;
+    opacity: 0;
+    transition: opacity 0.1s;
+  }
+  .queue-item:hover .qi-next-btn { opacity: 1; }
+  .queue-item .qi-next-btn:hover { color: var(--accent); border-color: var(--accent); }
+
+  .queue-item[draggable="true"] { cursor: grab; }
+  .queue-item[draggable="true"]:active { cursor: grabbing; }
+  .queue-item.drag-over { border-top: 2px solid var(--accent); }
+  .queue-item.dragging { opacity: 0.3; }
+
   .queue-empty {
     color: var(--text-muted);
     font-size: 0.8rem;
     padding: 1rem 0;
     text-align: center;
   }
+
+  /* --- Queue search insert --- */
+  .queue-insert {
+    margin-top: 0.6rem;
+    position: relative;
+  }
+
+  .queue-insert-input {
+    width: 100%;
+    background: var(--bg-darker);
+    border: 1px solid var(--border-subtle);
+    border-radius: 6px;
+    padding: 0.4rem 0.6rem;
+    color: var(--text-main);
+    font-size: 0.78rem;
+  }
+  .queue-insert-input:focus { outline: none; border-color: var(--accent); }
+  .queue-insert-input::placeholder { color: var(--text-muted); }
+
+  .queue-insert-results {
+    position: absolute;
+    bottom: 100%;
+    left: 0;
+    right: 0;
+    background: var(--bg-dark);
+    border: 1px solid var(--border-subtle);
+    border-radius: 8px;
+    max-height: 250px;
+    overflow-y: auto;
+    display: none;
+    margin-bottom: 4px;
+    z-index: 10;
+  }
+  .queue-insert-results.visible { display: block; }
+
+  .qir-item {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 0.4rem 0.6rem;
+    cursor: pointer;
+    font-size: 0.78rem;
+    transition: background 0.1s;
+  }
+  .qir-item:hover { background: rgba(148, 163, 184, 0.1); }
+  .qir-item .qir-artist { color: var(--text-muted); font-size: 0.72rem; }
+  .qir-item .qir-dur { color: var(--text-muted); font-size: 0.7rem; margin-left: auto; }
 
   .offline-msg {
     text-align: center;
@@ -309,6 +376,11 @@
     <h3>Coming Up</h3>
     <div id="queueList">
       <div class="queue-empty">No queue data</div>
+    </div>
+    <div class="queue-insert">
+      <input type="text" class="queue-insert-input" id="queueInsertSearch"
+             placeholder="Search to add track...">
+      <div class="queue-insert-results" id="queueInsertResults"></div>
     </div>
   </div>
 </div>
@@ -548,26 +620,137 @@ function renderNowPlaying(data) {
   }
 }
 
+let currentLogId = null;
+let currentEngineIndex = 0;
+let queueItemIds = [];
+let insertDebounce = null;
+
 function renderQueue(data) {
   const list = document.getElementById('queueList');
   const queue = data.queue || [];
+  currentLogId = data.log_id;
+  currentEngineIndex = data.current_index || 0;
 
   if (!queue.length) {
     list.innerHTML = '<div class="queue-empty">No upcoming tracks</div>';
+    queueItemIds = [];
     return;
   }
 
+  queueItemIds = queue.map(q => q.item_id);
+
   list.innerHTML = queue.map((q, i) => `
-    <div class="queue-item">
+    <div class="queue-item" draggable="true" data-item-id="${q.item_id}">
       <span class="qi-pos">${i + 1}</span>
       <div class="qi-info">
         <div class="qi-title">${esc(q.title)}</div>
         <div class="qi-artist">${esc(q.artist)}</div>
       </div>
+      <button class="qi-next-btn" onclick="event.stopPropagation(); setNext(${q.item_id})">next</button>
       <span class="qi-cat">${esc(q.category)}</span>
       <span class="qi-dur">${fmtDur(q.duration)}</span>
     </div>
   `).join('');
+
+  initQueueDrag();
+}
+
+function initQueueDrag() {
+  const list = document.getElementById('queueList');
+  let dragEl = null;
+
+  list.querySelectorAll('.queue-item[draggable]').forEach(item => {
+    item.addEventListener('dragstart', () => {
+      dragEl = item;
+      item.classList.add('dragging');
+    });
+    item.addEventListener('dragend', () => {
+      item.classList.remove('dragging');
+      list.querySelectorAll('.queue-item').forEach(q => q.classList.remove('drag-over'));
+      dragEl = null;
+    });
+    item.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      list.querySelectorAll('.queue-item').forEach(q => q.classList.remove('drag-over'));
+      item.classList.add('drag-over');
+    });
+    item.addEventListener('dragleave', () => item.classList.remove('drag-over'));
+    item.addEventListener('drop', async (e) => {
+      e.preventDefault();
+      item.classList.remove('drag-over');
+      if (!dragEl || dragEl === item) return;
+      list.insertBefore(dragEl, item);
+      const order = [...list.querySelectorAll('.queue-item')].map(
+        el => parseInt(el.dataset.itemId)
+      );
+      await fetch('/api/engine/queue/reorder/', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') },
+        body: JSON.stringify({ log_id: currentLogId, order }),
+      });
+    });
+  });
+}
+
+async function setNext(itemId) {
+  await fetch('/api/engine/queue/set-next/', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') },
+    body: JSON.stringify({ item_id: itemId, current_index: currentEngineIndex }),
+  });
+  poll();
+}
+
+// --- Search to insert ---
+document.getElementById('queueInsertSearch').addEventListener('input', function() {
+  clearTimeout(insertDebounce);
+  const q = this.value.trim();
+  if (q.length < 2) {
+    document.getElementById('queueInsertResults').classList.remove('visible');
+    return;
+  }
+  insertDebounce = setTimeout(() => searchForInsert(q), 300);
+});
+
+document.getElementById('queueInsertSearch').addEventListener('blur', function() {
+  setTimeout(() => document.getElementById('queueInsertResults').classList.remove('visible'), 200);
+});
+
+async function searchForInsert(q) {
+  const resp = await fetch(`/api/tracks/?q=${encodeURIComponent(q)}&per_page=10&ready2air=true`);
+  if (!resp.ok) return;
+  const data = await resp.json();
+  const container = document.getElementById('queueInsertResults');
+
+  if (!data.items.length) {
+    container.classList.remove('visible');
+    return;
+  }
+
+  container.innerHTML = data.items.map(t => `
+    <div class="qir-item" onmousedown="insertTrack(${t.id})">
+      <span>${esc(t.title)}</span>
+      <span class="qir-artist">${esc(t.artist)}</span>
+      <span class="qir-dur">${fmtDur(t.duration_seconds)}</span>
+    </div>
+  `).join('');
+  container.classList.add('visible');
+}
+
+async function insertTrack(trackId) {
+  if (!currentLogId) return;
+  await fetch('/api/engine/queue/insert/', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') },
+    body: JSON.stringify({
+      log_id: currentLogId,
+      track_id: trackId,
+      after_index: currentEngineIndex,
+    }),
+  });
+  document.getElementById('queueInsertSearch').value = '';
+  document.getElementById('queueInsertResults').classList.remove('visible');
+  poll();
 }
 
 function updateClock() {

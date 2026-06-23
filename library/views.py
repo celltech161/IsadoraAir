@@ -10,6 +10,7 @@ from django.views.decorators.http import require_http_methods
 
 from django.core.paginator import Paginator
 from django.db.models import Q
+from django.utils import timezone
 
 from django.shortcuts import get_object_or_404
 
@@ -498,6 +499,102 @@ def api_log_reorder(request, pk):
     LogItem.objects.bulk_update(items.values(), ["position"])
 
     return JsonResponse(_log_to_dict(log))
+
+
+@require_http_methods(["POST"])
+def api_engine_queue_reorder(request):
+    try:
+        body = json.loads(request.body)
+    except (json.JSONDecodeError, ValueError):
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+
+    order = body.get("order")
+    log_id = body.get("log_id")
+    if not order or not log_id:
+        return JsonResponse({"error": "log_id and order required"}, status=400)
+
+    log = get_object_or_404(PlaylistLog, pk=log_id)
+    items = {item.id: item for item in log.items.all()}
+
+    for pos, item_id in enumerate(order):
+        if item_id in items:
+            items[item_id].position = pos
+    LogItem.objects.bulk_update(items.values(), ["position"])
+
+    return JsonResponse({"ok": True})
+
+
+@require_http_methods(["POST"])
+def api_engine_set_next(request):
+    try:
+        body = json.loads(request.body)
+    except (json.JSONDecodeError, ValueError):
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+
+    item_id = body.get("item_id")
+    current_index = body.get("current_index", 0)
+    if not item_id:
+        return JsonResponse({"error": "item_id required"}, status=400)
+
+    item = get_object_or_404(LogItem.objects.select_related("playlist_log"), pk=item_id)
+    log = item.playlist_log
+
+    all_items = list(log.items.order_by("position"))
+    target_pos = current_index + 1
+
+    src_idx = None
+    for i, li in enumerate(all_items):
+        if li.id == item_id:
+            src_idx = i
+            break
+
+    if src_idx is None or src_idx <= target_pos:
+        return JsonResponse({"ok": True})
+
+    moved = all_items.pop(src_idx)
+    all_items.insert(target_pos, moved)
+
+    for pos, li in enumerate(all_items):
+        li.position = pos
+    LogItem.objects.bulk_update(all_items, ["position"])
+
+    return JsonResponse({"ok": True})
+
+
+@require_http_methods(["POST"])
+def api_engine_insert_track(request):
+    try:
+        body = json.loads(request.body)
+    except (json.JSONDecodeError, ValueError):
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+
+    log_id = body.get("log_id")
+    track_id = body.get("track_id")
+    after_index = body.get("after_index", 0)
+
+    if not log_id or not track_id:
+        return JsonResponse({"error": "log_id and track_id required"}, status=400)
+
+    log = get_object_or_404(PlaylistLog, pk=log_id)
+    track = get_object_or_404(Track, pk=track_id)
+
+    all_items = list(log.items.order_by("position"))
+    insert_pos = after_index + 1
+
+    new_item = LogItem.objects.create(
+        playlist_log=log,
+        position=9999,
+        scheduled_time=timezone.now(),
+        track=track,
+        category=track.category,
+    )
+
+    all_items.insert(insert_pos, new_item)
+    for pos, li in enumerate(all_items):
+        li.position = pos
+    LogItem.objects.bulk_update(all_items, ["position"])
+
+    return JsonResponse({"ok": True, "item_id": new_item.id})
 
 
 @require_http_methods(["GET"])

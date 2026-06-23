@@ -41,6 +41,7 @@ class PlaybackEngine:
         self.main_pipeline = None
         self.decks = []
         self._deck_bin_map = {}
+        self._last_queue_reload = 0
         self.current_log = None
         self.log_items = []
         self.current_index = 0
@@ -276,9 +277,36 @@ class PlaybackEngine:
             return time.time() - deck.started_at
         return 0.0
 
+    def _reload_queue_if_changed(self):
+        if not self.current_log:
+            return
+        now = time.time()
+        if now - self._last_queue_reload < 3.0:
+            return
+        self._last_queue_reload = now
+
+        fresh_items = list(
+            self.current_log.items
+            .select_related("track", "track__artist", "track__album", "track__category")
+            .order_by("position")
+        )
+        current_playing_ids = {d.log_item.id for d in self.decks}
+
+        # Find where we are in the fresh list
+        new_index = 0
+        for i, item in enumerate(fresh_items):
+            if item.id in current_playing_ids:
+                new_index = i
+                break
+
+        self.log_items = fresh_items
+        self.current_index = new_index
+
     def _poll_position(self):
         if not self.running:
             return False
+
+        self._reload_queue_if_changed()
 
         with self._lock:
             if not self.decks:
@@ -420,8 +448,10 @@ class PlaybackEngine:
 
             queue = []
             for i in range(next_index + 1, min(next_index + 10, len(self.log_items))):
-                qt = self.log_items[i].track
+                qi = self.log_items[i]
+                qt = qi.track
                 queue.append({
+                    "item_id": qi.id,
                     "track_id": qt.id,
                     "title": qt.title,
                     "artist": qt.artist.name if qt.artist else "",
