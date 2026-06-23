@@ -500,7 +500,7 @@ async function loadWaveform() {
     const level = samples[i] / 255;
     const barH = level * h;
     const x = (i / n) * w;
-    ctx.fillRect(x, h - barH, Math.max(barW - 0.5, 0.5), barH);
+    ctx.fillRect(x, h - barH, Math.ceil(barW), barH);
   }
 
   // Draw cue-in marker
