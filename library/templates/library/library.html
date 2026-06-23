@@ -239,9 +239,11 @@
 </div>
 
 <div class="lib-pager">
-  <button id="prevBtn" onclick="goPage(-1)">Prev</button>
+  <button id="prev10Btn" onclick="goPage(-10)">&laquo; 10</button>
+  <button id="prevBtn" onclick="goPage(-1)">&lsaquo; Prev</button>
   <span class="page-info" id="pageInfo"></span>
-  <button id="nextBtn" onclick="goPage(1)">Next</button>
+  <button id="nextBtn" onclick="goPage(1)">Next &rsaquo;</button>
+  <button id="next10Btn" onclick="goPage(10)">10 &raquo;</button>
 </div>
 
 <div class="lib-empty" id="emptyMsg" style="display:none;">No tracks found.</div>
@@ -431,8 +433,10 @@ async function loadTracks() {
   // Update pager
   document.getElementById('pageInfo').textContent =
     `Page ${currentPage} of ${totalPages}`;
+  document.getElementById('prev10Btn').disabled = currentPage <= 10;
   document.getElementById('prevBtn').disabled = currentPage <= 1;
   document.getElementById('nextBtn').disabled = currentPage >= totalPages;
+  document.getElementById('next10Btn').disabled = currentPage + 10 > totalPages;
 
   updateBulkBar();
 }
