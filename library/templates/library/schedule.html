@@ -1,0 +1,361 @@
+{% extends "base.html" %}
+
+{% block title %}Schedule — IsadoraAir{% endblock %}
+{% block nav_schedule %}class="active"{% endblock %}
+
+{% block extra_css %}
+<style>
+  .schedule-wrap {
+    display: flex;
+    gap: 1.25rem;
+    align-items: flex-start;
+  }
+
+  /* --- Clock palette --- */
+  .clock-palette {
+    flex-shrink: 0;
+    width: 160px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .clock-palette h3 {
+    font-size: 0.8rem;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: var(--text-muted);
+    margin-bottom: 0.25rem;
+  }
+
+  .clock-btn {
+    display: block;
+    width: 100%;
+    padding: 0.45rem 0.6rem;
+    border: 2px solid transparent;
+    border-radius: 6px;
+    font-size: 0.8rem;
+    font-weight: 600;
+    color: #fff;
+    cursor: pointer;
+    text-align: left;
+    transition: border-color 0.12s, opacity 0.12s;
+    opacity: 0.85;
+  }
+
+  .clock-btn:hover { opacity: 1; }
+  .clock-btn.selected {
+    border-color: #fff;
+    opacity: 1;
+    box-shadow: 0 0 8px rgba(255,255,255,0.25);
+  }
+
+  .clock-btn.clear-btn {
+    background: rgba(100, 100, 100, 0.4);
+    border: 2px dashed var(--border-subtle);
+    color: var(--text-muted);
+    font-weight: 500;
+  }
+  .clock-btn.clear-btn.selected {
+    border-color: var(--danger);
+    color: var(--danger);
+  }
+
+  .palette-empty {
+    color: var(--text-muted);
+    font-size: 0.8rem;
+    line-height: 1.4;
+    padding: 0.5rem;
+  }
+
+  /* --- Grid --- */
+  .grid-container {
+    flex: 1;
+    overflow-x: auto;
+  }
+
+  .schedule-grid {
+    display: grid;
+    grid-template-columns: 56px repeat(24, minmax(52px, 1fr));
+    gap: 1px;
+    background: rgba(100, 116, 139, 0.15);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+
+  .grid-header {
+    background: var(--bg-dark);
+    padding: 0.4rem 0.25rem;
+    text-align: center;
+    font-size: 0.7rem;
+    font-weight: 600;
+    color: var(--text-muted);
+    user-select: none;
+  }
+
+  .grid-header.corner { background: var(--bg-darker); }
+
+  .day-label {
+    background: var(--bg-dark);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.75rem;
+    font-weight: 700;
+    color: var(--text-muted);
+    user-select: none;
+  }
+
+  .grid-cell {
+    background: rgba(15, 23, 42, 0.6);
+    padding: 0.3rem 0.2rem;
+    text-align: center;
+    font-size: 0.65rem;
+    font-weight: 600;
+    color: #fff;
+    cursor: pointer;
+    user-select: none;
+    min-height: 38px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: filter 0.1s;
+    position: relative;
+  }
+
+  .grid-cell:hover {
+    filter: brightness(1.3);
+    z-index: 1;
+    outline: 1px solid rgba(255,255,255,0.4);
+  }
+
+  .grid-cell.empty {
+    color: transparent;
+  }
+
+  .grid-cell.flash {
+    animation: cellFlash 0.3s ease;
+  }
+
+  @keyframes cellFlash {
+    0%   { filter: brightness(2); }
+    100% { filter: brightness(1); }
+  }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="schedule-wrap">
+  <div class="clock-palette">
+    <h3>Clocks</h3>
+    <button class="clock-btn clear-btn" data-clock-id="clear" onclick="selectClock(this, null, null)">
+      Clear
+    </button>
+    {% for clock in clocks %}
+    <button class="clock-btn" data-clock-id="{{ clock.id }}"
+            onclick="selectClock(this, {{ clock.id }}, '{{ clock.name|escapejs }}')">
+      {{ clock.name }}
+    </button>
+    {% empty %}
+    <p class="palette-empty">No clocks configured. Add clocks in the <a href="/admin/library/clock/" style="color:var(--accent)">admin</a>.</p>
+    {% endfor %}
+  </div>
+
+  <div class="grid-container">
+    <div class="schedule-grid" id="scheduleGrid">
+      <div class="grid-header corner"></div>
+      <!-- Hour headers -->
+      <div class="grid-header">12a</div>
+      <div class="grid-header">1a</div>
+      <div class="grid-header">2a</div>
+      <div class="grid-header">3a</div>
+      <div class="grid-header">4a</div>
+      <div class="grid-header">5a</div>
+      <div class="grid-header">6a</div>
+      <div class="grid-header">7a</div>
+      <div class="grid-header">8a</div>
+      <div class="grid-header">9a</div>
+      <div class="grid-header">10a</div>
+      <div class="grid-header">11a</div>
+      <div class="grid-header">12p</div>
+      <div class="grid-header">1p</div>
+      <div class="grid-header">2p</div>
+      <div class="grid-header">3p</div>
+      <div class="grid-header">4p</div>
+      <div class="grid-header">5p</div>
+      <div class="grid-header">6p</div>
+      <div class="grid-header">7p</div>
+      <div class="grid-header">8p</div>
+      <div class="grid-header">9p</div>
+      <div class="grid-header">10p</div>
+      <div class="grid-header">11p</div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+const DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+
+const PALETTE = [
+  '#2563eb', '#7c3aed', '#0891b2', '#059669', '#d97706',
+  '#dc2626', '#4f46e5', '#0d9488', '#ca8a04', '#9333ea',
+  '#e11d48', '#0284c7', '#16a34a', '#ea580c', '#6d28d9',
+  '#be185d',
+];
+
+let selectedClockId = null;
+let selectedClockName = null;
+
+// block ID lookup: cells[day][hour] = schedule block id (or null)
+const cells = {};
+for (let d = 0; d < 7; d++) {
+  cells[d] = {};
+  for (let h = 0; h < 24; h++) cells[d][h] = null;
+}
+
+function clockColor(clockId) {
+  return PALETTE[clockId % PALETTE.length];
+}
+
+function getCookie(name) {
+  let val = null;
+  document.cookie.split(';').forEach(c => {
+    c = c.trim();
+    if (c.startsWith(name + '='))
+      val = decodeURIComponent(c.substring(name.length + 1));
+  });
+  return val;
+}
+
+function selectClock(btn, id, name) {
+  document.querySelectorAll('.clock-btn').forEach(b => b.classList.remove('selected'));
+  btn.classList.add('selected');
+  selectedClockId = id;
+  selectedClockName = name;
+}
+
+function buildGrid() {
+  const grid = document.getElementById('scheduleGrid');
+
+  for (let d = 0; d < 7; d++) {
+    const label = document.createElement('div');
+    label.className = 'day-label';
+    label.textContent = DAYS[d];
+    grid.appendChild(label);
+
+    for (let h = 0; h < 24; h++) {
+      const cell = document.createElement('div');
+      cell.className = 'grid-cell empty';
+      cell.dataset.day = d;
+      cell.dataset.hour = h;
+      cell.addEventListener('click', () => onCellClick(d, h, cell));
+      cell.addEventListener('contextmenu', (e) => {
+        e.preventDefault();
+        onCellClear(d, h, cell);
+      });
+      grid.appendChild(cell);
+    }
+  }
+}
+
+function getCell(day, hour) {
+  return document.querySelector(`.grid-cell[data-day="${day}"][data-hour="${hour}"]`);
+}
+
+function fillCell(cell, clockId, clockName, blockId) {
+  const day = parseInt(cell.dataset.day);
+  const hour = parseInt(cell.dataset.hour);
+  cells[day][hour] = blockId;
+  cell.dataset.blockId = blockId || '';
+  cell.textContent = clockName;
+  cell.style.backgroundColor = clockColor(clockId);
+  cell.classList.remove('empty');
+}
+
+function clearCell(cell) {
+  const day = parseInt(cell.dataset.day);
+  const hour = parseInt(cell.dataset.hour);
+  cells[day][hour] = null;
+  cell.dataset.blockId = '';
+  cell.textContent = '';
+  cell.style.backgroundColor = '';
+  cell.classList.add('empty');
+}
+
+function flashCell(cell) {
+  cell.classList.remove('flash');
+  void cell.offsetWidth;
+  cell.classList.add('flash');
+}
+
+async function onCellClick(day, hour, cell) {
+  if (selectedClockId === null) {
+    // "Clear" mode
+    onCellClear(day, hour, cell);
+    return;
+  }
+
+  const resp = await fetch('/api/schedule/', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-CSRFToken': getCookie('csrftoken'),
+    },
+    body: JSON.stringify({
+      day_of_week: day,
+      hour: hour,
+      clock_id: selectedClockId,
+    }),
+  });
+
+  if (!resp.ok) return;
+
+  const data = await resp.json();
+  fillCell(cell, data.clock_id, data.clock_name, data.id);
+  flashCell(cell);
+}
+
+async function onCellClear(day, hour, cell) {
+  const blockId = cells[day][hour];
+  if (!blockId) return;
+
+  const resp = await fetch(`/api/schedule/${blockId}/`, {
+    method: 'DELETE',
+    headers: { 'X-CSRFToken': getCookie('csrftoken') },
+  });
+
+  if (!resp.ok) return;
+
+  clearCell(cell);
+  flashCell(cell);
+}
+
+async function loadSchedule() {
+  const resp = await fetch('/api/schedule/');
+  if (!resp.ok) return;
+
+  const data = await resp.json();
+  for (const block of data.blocks) {
+    const cell = getCell(block.day_of_week, block.start_hour);
+    if (cell) {
+      fillCell(cell, block.clock_id, block.clock_name, block.id);
+    }
+  }
+}
+
+// Color the palette buttons
+document.addEventListener('DOMContentLoaded', () => {
+  document.querySelectorAll('.clock-btn[data-clock-id]').forEach(btn => {
+    const id = btn.dataset.clockId;
+    if (id && id !== 'clear') {
+      btn.style.backgroundColor = clockColor(parseInt(id));
+    }
+  });
+
+  buildGrid();
+  loadSchedule();
+});
+</script>
+{% endblock %}
