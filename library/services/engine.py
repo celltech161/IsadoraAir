@@ -381,8 +381,16 @@ class PlaybackEngine:
             if trigger_point < 10.0:
                 trigger_point = next_start
 
-            if not self._next_triggered and pos >= trigger_point:
-                print(f"  Trigger: pos={pos:.1f}s >= trigger={trigger_point:.1f}s, starting next")
+            # Multiple safety checks to prevent cascade
+            with self._lock:
+                already_in_decks = any(
+                    d.log_item.id == next_item.id for d in self.decks
+                )
+
+            if (not self._next_triggered
+                    and not already_in_decks
+                    and pos >= trigger_point):
+                print(f"  Trigger: pos={pos:.1f}s >= trigger={trigger_point:.1f}s, starting next ({next_item.track.title})")
                 self._next_triggered = True
                 self._start_track(next_index)
 
