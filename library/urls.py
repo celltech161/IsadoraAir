@@ -20,4 +20,6 @@ urlpatterns = [
     path('api/log/<str:date_str>/', views.api_log_list_date, name='api-log-list-date'),
     path('api/log/<int:pk>/update/', views.api_log_update, name='api-log-update'),
     path('api/log/<int:pk>/delete/', views.api_log_delete, name='api-log-delete'),
+    path('api/log/<int:pk>/reorder/', views.api_log_reorder, name='api-log-reorder'),
+    path('api/log/item/<int:item_id>/swap/', views.api_log_item_swap, name='api-log-item-swap'),
 ]

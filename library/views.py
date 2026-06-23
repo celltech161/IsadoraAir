@@ -442,3 +442,53 @@ def api_log_update(request, pk):
 def api_log_delete(request, pk):
     deleted, _ = PlaylistLog.objects.filter(pk=pk, status="draft").delete()
     return JsonResponse({"ok": True, "deleted": deleted > 0})
+
+
+@require_http_methods(["PATCH"])
+def api_log_item_swap(request, item_id):
+    item = get_object_or_404(LogItem.objects.select_related("playlist_log"), pk=item_id)
+    if item.playlist_log.status != "draft":
+        return JsonResponse({"error": "Cannot modify an approved log"}, status=400)
+
+    try:
+        body = json.loads(request.body)
+    except (json.JSONDecodeError, ValueError):
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+
+    track_id = body.get("track_id")
+    if not track_id:
+        return JsonResponse({"error": "track_id is required"}, status=400)
+
+    try:
+        track = Track.objects.get(id=track_id)
+    except Track.DoesNotExist:
+        return JsonResponse({"error": "Track not found"}, status=404)
+
+    item.track = track
+    item.save(update_fields=["track"])
+
+    return JsonResponse(_log_to_dict(item.playlist_log))
+
+
+@require_http_methods(["POST"])
+def api_log_reorder(request, pk):
+    log = get_object_or_404(PlaylistLog, pk=pk)
+    if log.status != "draft":
+        return JsonResponse({"error": "Cannot modify an approved log"}, status=400)
+
+    try:
+        body = json.loads(request.body)
+    except (json.JSONDecodeError, ValueError):
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+
+    order = body.get("order")
+    if not order or not isinstance(order, list):
+        return JsonResponse({"error": "order (list of item IDs) is required"}, status=400)
+
+    items = {item.id: item for item in log.items.all()}
+    for pos, item_id in enumerate(order):
+        if item_id in items:
+            items[item_id].position = pos
+    LogItem.objects.bulk_update(items.values(), ["position"])
+
+    return JsonResponse(_log_to_dict(log))
