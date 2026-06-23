@@ -5,7 +5,7 @@ from pathlib import Path
 
 from django.http import JsonResponse
 from django.shortcuts import render
-from django.views.decorators.csrf import ensure_csrf_cookie
+from django.views.decorators.csrf import csrf_exempt, ensure_csrf_cookie
 from django.views.decorators.http import require_http_methods
 
 from django.core.paginator import Paginator
@@ -18,6 +18,7 @@ from .models import Artist, Album, Category, Clock, Genre, LogItem, PlaylistLog,
 from .services.log_builder import build_hour_log
 
 
+@ensure_csrf_cookie
 def dashboard_page(request):
     return render(request, "library/dashboard.html")
 
@@ -518,6 +519,7 @@ def _read_engine_current_item_id():
     return None, [], 0
 
 
+@csrf_exempt
 @require_http_methods(["POST"])
 def api_engine_set_next(request):
     try:
@@ -556,6 +558,7 @@ def api_engine_set_next(request):
     return JsonResponse({"ok": True})
 
 
+@csrf_exempt
 @require_http_methods(["POST"])
 def api_engine_insert_track(request):
     try:
@@ -591,6 +594,7 @@ def api_engine_insert_track(request):
     return JsonResponse({"ok": True, "item_id": new_item.id})
 
 
+@csrf_exempt
 @require_http_methods(["POST"])
 def api_engine_seek(request):
     try:
