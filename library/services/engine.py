@@ -55,7 +55,7 @@ class PlaybackEngine:
         if not self.log_items:
             print("No approved log for current hour. Waiting...")
         else:
-            self._start_track(0)
+            self._start_track(0, as_leading=True)
 
         self._position_timer = GLib.timeout_add(POSITION_POLL_MS, self._poll_position)
 
@@ -207,17 +207,20 @@ class PlaybackEngine:
             if deck in self.decks:
                 self.decks.remove(deck)
 
-    def _start_track(self, index):
+    def _start_track(self, index, as_leading=False):
         if index >= len(self.log_items):
             self._on_log_exhausted()
             return
 
-        self.current_index = index
+        if as_leading:
+            self.current_index = index
+
         log_item = self.log_items[index]
         deck = self._create_deck(log_item)
 
         if deck is None:
-            self._start_track(index + 1)
+            if as_leading:
+                self._start_track(index + 1, as_leading=True)
             return
 
         with self._lock:
@@ -241,46 +244,65 @@ class PlaybackEngine:
             return False
 
         with self._lock:
-            active_decks = list(self.decks)
+            if not self.decks:
+                self._write_state()
+                return True
+            leading_deck = self.decks[0]
 
-        for deck in active_decks:
-            if deck.finished:
-                continue
+        if leading_deck.finished:
+            self._write_state()
+            return True
 
-            pos = self._get_deck_position(deck)
-            track = deck.track
+        pos = self._get_deck_position(leading_deck)
+        track = leading_deck.track
 
-            next_start = track.next_start_seconds
-            if next_start is None:
-                next_start = track.duration_seconds or 0
+        next_start = track.next_start_seconds
+        if next_start is None:
+            next_start = track.duration_seconds or 0
 
-            next_index = self.current_index + 1
-            if next_index < len(self.log_items):
-                next_item = self.log_items[next_index]
-                next_cue_in = next_item.track.cue_in_seconds or 0.0
-                trigger_point = next_start - next_cue_in
+        next_index = self.current_index + 1
+        if next_index < len(self.log_items):
+            next_item = self.log_items[next_index]
+            next_cue_in = next_item.track.cue_in_seconds or 0.0
+            trigger_point = next_start - next_cue_in
 
+            with self._lock:
                 already_started = any(
                     d.log_item.id == next_item.id for d in self.decks
                 )
 
-                if not already_started and pos >= trigger_point and trigger_point > 0:
-                    self._start_track(next_index)
+            if not already_started and pos >= trigger_point and trigger_point > 0:
+                self._start_track(next_index)
 
         self._write_state()
         return True
 
     def _on_deck_eos(self, bus, message, deck):
-        GLib.idle_add(self._remove_deck, deck)
+        is_leading = self.decks and self.decks[0] is deck
+        GLib.idle_add(self._handle_deck_finished, deck, is_leading)
         return True
 
     def _on_deck_error(self, bus, message, deck):
         err, debug = message.parse_error()
         print(f"  GStreamer error on {deck.track.title}: {err} ({debug})")
-        GLib.idle_add(self._remove_deck, deck)
-        if deck.log_item == self.log_items[self.current_index]:
-            GLib.idle_add(self._start_track, self.current_index + 1)
+        is_leading = self.decks and self.decks[0] is deck
+        GLib.idle_add(self._handle_deck_finished, deck, is_leading)
         return True
+
+    def _handle_deck_finished(self, deck, was_leading):
+        self._remove_deck(deck)
+        if was_leading:
+            next_idx = self.current_index + 1
+            with self._lock:
+                already_playing = any(
+                    d.log_item.position == self.log_items[next_idx].position
+                    for d in self.decks
+                ) if next_idx < len(self.log_items) and self.decks else False
+
+            if already_playing:
+                self.current_index = next_idx
+            else:
+                self._start_track(next_idx, as_leading=True)
 
     def _on_log_exhausted(self):
         print("Log exhausted for this hour.")
@@ -288,7 +310,7 @@ class PlaybackEngine:
         next_hour = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
         self._load_log_for(next_hour.date(), next_hour.hour)
         if self.log_items:
-            self._start_track(0)
+            self._start_track(0, as_leading=True)
         else:
             print("No approved log for next hour. Waiting...")
             GLib.timeout_add_seconds(30, self._try_load_next_hour)
@@ -299,7 +321,7 @@ class PlaybackEngine:
         now = timezone.localtime()
         self._load_log_for(now.date(), now.hour)
         if self.log_items:
-            self._start_track(0)
+            self._start_track(0, as_leading=True)
             return False
         return True
 
