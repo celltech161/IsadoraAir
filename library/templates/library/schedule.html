@@ -135,6 +135,26 @@
 
   .grid-cell.empty { color: transparent; }
 
+  .grid-cell.now-playing {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+    z-index: 2;
+  }
+
+  .grid-header.now-hour {
+    color: var(--accent);
+    font-weight: 800;
+  }
+
+  .day-label.now-day {
+    color: var(--accent);
+  }
+
+  .mobile-hour-cell.now-playing {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+  }
+
   .grid-cell.flash {
     animation: cellFlash 0.3s ease;
   }
@@ -560,6 +580,35 @@ document.addEventListener('DOMContentLoaded', () => {
   buildGrid();
   buildDayPicker();
   loadSchedule();
+  highlightNow();
+  setInterval(highlightNow, 60000);
 });
+
+function highlightNow() {
+  const now = new Date();
+  const dow = (now.getDay() + 6) % 7; // JS Sunday=0 → Python Monday=0
+  const hour = now.getHours();
+
+  // Desktop grid
+  document.querySelectorAll('.grid-cell.now-playing').forEach(c => c.classList.remove('now-playing'));
+  document.querySelectorAll('.grid-header.now-hour').forEach(h => h.classList.remove('now-hour'));
+  document.querySelectorAll('.day-label.now-day').forEach(d => d.classList.remove('now-day'));
+
+  const cell = document.querySelector(`.grid-cell[data-day="${dow}"][data-hour="${hour}"]`);
+  if (cell) cell.classList.add('now-playing');
+
+  const headers = document.querySelectorAll('.schedule-grid .grid-header');
+  if (headers[hour + 1]) headers[hour + 1].classList.add('now-hour');
+
+  const dayLabels = document.querySelectorAll('.day-label');
+  if (dayLabels[dow]) dayLabels[dow].classList.add('now-day');
+
+  // Mobile
+  document.querySelectorAll('.mobile-hour-cell.now-playing').forEach(c => c.classList.remove('now-playing'));
+  if (mobileDay === dow) {
+    const mobileCell = document.querySelectorAll('.mobile-hour-cell')[hour];
+    if (mobileCell) mobileCell.classList.add('now-playing');
+  }
+}
 </script>
 {% endblock %}
