@@ -1,0 +1,425 @@
+{% extends "base.html" %}
+
+{% block title %}{{ track.title }} — IsadoraAir{% endblock %}
+{% block nav_library %}class="active"{% endblock %}
+
+{% block extra_css %}
+<style>
+  .detail-header {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    margin-bottom: 1.25rem;
+  }
+
+  .detail-header .back {
+    color: var(--text-muted);
+    text-decoration: none;
+    font-size: 1.1rem;
+    padding: 0.3rem 0.5rem;
+    border-radius: 6px;
+    transition: color 0.12s, background 0.12s;
+  }
+  .detail-header .back:hover {
+    color: var(--text-main);
+    background: rgba(148, 163, 184, 0.1);
+  }
+
+  .detail-header h1 {
+    font-size: 1.2rem;
+    font-weight: 700;
+  }
+
+  .detail-header .track-artist {
+    color: var(--text-muted);
+    font-size: 0.95rem;
+    font-weight: 400;
+  }
+
+  .detail-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1.25rem;
+  }
+
+  @media (max-width: 900px) {
+    .detail-grid { grid-template-columns: 1fr; }
+  }
+
+  .detail-section {
+    background: var(--bg-dark);
+    border: 1px solid var(--border-subtle);
+    border-radius: 10px;
+    padding: 1rem 1.25rem;
+  }
+
+  .detail-section h2 {
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: var(--text-muted);
+    margin-bottom: 0.75rem;
+  }
+
+  .field-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-bottom: 0.5rem;
+  }
+
+  .field-row label {
+    flex-shrink: 0;
+    width: 110px;
+    font-size: 0.78rem;
+    color: var(--text-muted);
+    text-align: right;
+  }
+
+  .field-row input[type="text"],
+  .field-row input[type="number"],
+  .field-row select,
+  .field-row textarea {
+    flex: 1;
+    background: var(--bg-darker);
+    border: 1px solid var(--border-subtle);
+    border-radius: 6px;
+    padding: 0.35rem 0.55rem;
+    color: var(--text-main);
+    font-size: 0.82rem;
+    font-family: inherit;
+  }
+  .field-row input:focus, .field-row select:focus, .field-row textarea:focus {
+    outline: none;
+    border-color: var(--accent);
+  }
+
+  .field-row textarea { resize: vertical; min-height: 50px; }
+
+  .field-row .field-static {
+    font-size: 0.82rem;
+    color: var(--text-main);
+  }
+
+  .field-row .field-muted {
+    font-size: 0.78rem;
+    color: var(--text-muted);
+  }
+
+  .field-row input[type="checkbox"] {
+    accent-color: var(--accent);
+    width: 16px;
+    height: 16px;
+  }
+
+  .save-bar {
+    margin-top: 1.25rem;
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+  }
+
+  .save-btn {
+    background: var(--accent);
+    border: none;
+    border-radius: 8px;
+    color: #000;
+    padding: 0.5rem 1.5rem;
+    font-size: 0.85rem;
+    font-weight: 700;
+    cursor: pointer;
+    transition: opacity 0.12s;
+  }
+  .save-btn:hover { opacity: 0.9; }
+
+  .save-msg {
+    font-size: 0.8rem;
+    color: var(--accent);
+    opacity: 0;
+    transition: opacity 0.3s;
+  }
+  .save-msg.show { opacity: 1; }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="detail-header">
+  <a href="{% url 'library:library' %}" class="back">&larr;</a>
+  <h1>{{ track.title }} <span class="track-artist">— {{ track.artist.name }}</span></h1>
+</div>
+
+<div class="detail-grid">
+  <!-- Metadata -->
+  <div class="detail-section">
+    <h2>Metadata</h2>
+    <div class="field-row">
+      <label>Title</label>
+      <input type="text" id="f_title" value="{{ track.title|escapejs }}">
+    </div>
+    <div class="field-row">
+      <label>Artist</label>
+      <input type="text" id="f_artist" value="{{ track.artist.name|escapejs }}">
+    </div>
+    <div class="field-row">
+      <label>Album</label>
+      <input type="text" id="f_album" value="{% if track.album %}{{ track.album.title|escapejs }}{% endif %}">
+    </div>
+    <div class="field-row">
+      <label>Genre</label>
+      <input type="text" id="f_genre" value="{% if track.genre %}{{ track.genre.name|escapejs }}{% endif %}">
+    </div>
+    <div class="field-row">
+      <label>Year</label>
+      <input type="number" id="f_year" value="{{ track.year|default_if_none:'' }}">
+    </div>
+    <div class="field-row">
+      <label>Composer</label>
+      <input type="text" id="f_composer" value="{{ track.composer|escapejs }}">
+    </div>
+    <div class="field-row">
+      <label>Publisher</label>
+      <input type="text" id="f_publisher" value="{{ track.publisher|escapejs }}">
+    </div>
+    <div class="field-row">
+      <label>Label</label>
+      <input type="text" id="f_record_label" value="{{ track.record_label|escapejs }}">
+    </div>
+    <div class="field-row">
+      <label>Comments</label>
+      <textarea id="f_comments">{{ track.comments }}</textarea>
+    </div>
+  </div>
+
+  <!-- Scheduling -->
+  <div class="detail-section">
+    <h2>Scheduling</h2>
+    <div class="field-row">
+      <label>Category</label>
+      <select id="f_category_id">
+        <option value="">—</option>
+        {% for cat in categories %}
+        <option value="{{ cat.id }}" {% if track.category_id == cat.id %}selected{% endif %}>{{ cat.name }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="field-row">
+      <label>Rotation Weight</label>
+      <select id="f_rotation_weight">
+        {% for i in "012345" %}
+        <option value="{{ i }}" {% if track.rotation_weight == i|add:"0" %}selected{% endif %}>{{ i }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="field-row">
+      <label>Energy</label>
+      <select id="f_energy">
+        <option value="">—</option>
+        {% for val, label in energy_choices %}
+        <option value="{{ val }}" {% if track.energy == val %}selected{% endif %}>{{ label }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="field-row">
+      <label>Vocal Type</label>
+      <select id="f_vocal_type">
+        <option value="">—</option>
+        {% for val, label in vocal_type_choices %}
+        <option value="{{ val }}" {% if track.vocal_type == val %}selected{% endif %}>{{ label }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="field-row">
+      <label>End Type</label>
+      <select id="f_end_type">
+        {% for val, label in end_type_choices %}
+        <option value="{{ val }}" {% if track.end_type == val %}selected{% endif %}>{{ label }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="field-row">
+      <label>Ready to Air</label>
+      <input type="checkbox" id="f_ready2air" {% if track.ready2air %}checked{% endif %}>
+    </div>
+    <div class="field-row">
+      <label>RBDS Override</label>
+      <input type="checkbox" id="f_alt_send_enabled" {% if track.alt_send_enabled %}checked{% endif %}>
+    </div>
+    <div class="field-row">
+      <label>RBDS Text</label>
+      <input type="text" id="f_alt_send_text" maxlength="64" value="{{ track.alt_send_text|escapejs }}">
+    </div>
+  </div>
+
+  <!-- Cue Points -->
+  <div class="detail-section">
+    <h2>Cue Points</h2>
+    <div class="field-row">
+      <label>Cue In</label>
+      <input type="number" step="0.001" id="f_cue_in_seconds" value="{{ track.cue_in_seconds|default_if_none:'' }}">
+    </div>
+    <div class="field-row">
+      <label>Cue Out</label>
+      <input type="number" step="0.001" id="f_cue_out_seconds" value="{{ track.cue_out_seconds|default_if_none:'' }}">
+    </div>
+    <div class="field-row">
+      <label>Next Start</label>
+      <input type="number" step="0.001" id="f_next_start_seconds" value="{{ track.next_start_seconds|default_if_none:'' }}">
+    </div>
+    <div class="field-row">
+      <label>Intro Until</label>
+      <input type="number" step="0.001" id="f_intro_until_seconds" value="{{ track.intro_until_seconds|default_if_none:'' }}">
+    </div>
+    <div class="field-row">
+      <label>Sweep Start</label>
+      <input type="number" step="0.001" id="f_sweep_start_seconds" value="{{ track.sweep_start_seconds|default_if_none:'' }}">
+    </div>
+    <div class="field-row">
+      <label>Outro Starts</label>
+      <input type="number" step="0.001" id="f_outro_starts_seconds" value="{{ track.outro_starts_seconds|default_if_none:'' }}">
+    </div>
+    <div class="field-row">
+      <label>Hook In</label>
+      <input type="number" step="0.001" id="f_hook_in_seconds" value="{{ track.hook_in_seconds|default_if_none:'' }}">
+    </div>
+    <div class="field-row">
+      <label>Hook Out</label>
+      <input type="number" step="0.001" id="f_hook_out_seconds" value="{{ track.hook_out_seconds|default_if_none:'' }}">
+    </div>
+  </div>
+
+  <!-- File Info (read-only) -->
+  <div class="detail-section">
+    <h2>File Info</h2>
+    <div class="field-row">
+      <label>Duration</label>
+      <span class="field-static" id="displayDuration"></span>
+    </div>
+    <div class="field-row">
+      <label>Format</label>
+      <span class="field-static">{{ track.format }}</span>
+    </div>
+    <div class="field-row">
+      <label>Sample Rate</label>
+      <span class="field-static">{% if track.sample_rate %}{{ track.sample_rate }} Hz{% endif %}</span>
+    </div>
+    <div class="field-row">
+      <label>Channels</label>
+      <span class="field-static">{{ track.channels|default_if_none:"" }}</span>
+    </div>
+    <div class="field-row">
+      <label>Bit Depth</label>
+      <span class="field-static">{% if track.bit_depth %}{{ track.bit_depth }}-bit{% endif %}</span>
+    </div>
+    <div class="field-row">
+      <label>Path</label>
+      <span class="field-muted" style="word-break:break-all;white-space:normal;">{{ track.filepath }}</span>
+    </div>
+    <div class="field-row">
+      <label>Play Count</label>
+      <span class="field-static">{{ track.play_count }}</span>
+    </div>
+    <div class="field-row">
+      <label>Last Played</label>
+      <span class="field-static">{% if track.last_played_at %}{{ track.last_played_at }}{% else %}Never{% endif %}</span>
+    </div>
+    <div class="field-row">
+      <label>Related Artists</label>
+      <span class="field-muted">{{ track.related_artists|default:"—" }}</span>
+    </div>
+  </div>
+</div>
+
+<div class="save-bar">
+  <button class="save-btn" onclick="saveTrack()">Save Changes</button>
+  <span class="save-msg" id="saveMsg">Saved</span>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+const TRACK_ID = {{ track.id }};
+
+// Format duration display
+const dur = {{ track.duration_seconds|default_if_none:"null" }};
+if (dur !== null) {
+  const m = Math.floor(dur / 60);
+  const s = Math.round(dur % 60);
+  document.getElementById('displayDuration').textContent =
+    m + ':' + String(s).padStart(2, '0');
+}
+
+function getCookie(name) {
+  let val = null;
+  document.cookie.split(';').forEach(c => {
+    c = c.trim();
+    if (c.startsWith(name + '='))
+      val = decodeURIComponent(c.substring(name.length + 1));
+  });
+  return val;
+}
+
+function getVal(id) {
+  const el = document.getElementById(id);
+  if (!el) return undefined;
+  if (el.type === 'checkbox') return el.checked;
+  if (el.type === 'number') {
+    return el.value === '' ? null : parseFloat(el.value);
+  }
+  if (el.tagName === 'SELECT') {
+    return el.value === '' ? null : el.value;
+  }
+  return el.value;
+}
+
+async function saveTrack() {
+  const body = {
+    title: getVal('f_title'),
+    artist: getVal('f_artist'),
+    album: getVal('f_album') || '',
+    genre: getVal('f_genre') || '',
+    year: getVal('f_year'),
+    composer: getVal('f_composer') || '',
+    publisher: getVal('f_publisher') || '',
+    record_label: getVal('f_record_label') || '',
+    comments: getVal('f_comments') || '',
+    category_id: getVal('f_category_id') ? parseInt(getVal('f_category_id')) : null,
+    rotation_weight: parseInt(getVal('f_rotation_weight')) || 0,
+    energy: getVal('f_energy') || '',
+    vocal_type: getVal('f_vocal_type') || '',
+    end_type: getVal('f_end_type') || 'auto',
+    ready2air: getVal('f_ready2air'),
+    alt_send_enabled: getVal('f_alt_send_enabled'),
+    alt_send_text: getVal('f_alt_send_text') || '',
+    cue_in_seconds: getVal('f_cue_in_seconds'),
+    cue_out_seconds: getVal('f_cue_out_seconds'),
+    next_start_seconds: getVal('f_next_start_seconds'),
+    intro_until_seconds: getVal('f_intro_until_seconds'),
+    sweep_start_seconds: getVal('f_sweep_start_seconds'),
+    outro_starts_seconds: getVal('f_outro_starts_seconds'),
+    hook_in_seconds: getVal('f_hook_in_seconds'),
+    hook_out_seconds: getVal('f_hook_out_seconds'),
+  };
+
+  const resp = await fetch(`/api/tracks/${TRACK_ID}/`, {
+    method: 'PATCH',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-CSRFToken': getCookie('csrftoken'),
+    },
+    body: JSON.stringify(body),
+  });
+
+  const msg = document.getElementById('saveMsg');
+  if (resp.ok) {
+    msg.textContent = 'Saved';
+    msg.style.color = 'var(--accent)';
+  } else {
+    const err = await resp.json();
+    msg.textContent = err.error || 'Save failed';
+    msg.style.color = 'var(--danger)';
+  }
+  msg.classList.add('show');
+  setTimeout(() => msg.classList.remove('show'), 2000);
+}
+</script>
+{% endblock %}

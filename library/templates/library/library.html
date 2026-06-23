@@ -10,7 +10,7 @@
     flex-wrap: wrap;
     gap: 0.6rem;
     align-items: center;
-    margin-bottom: 1rem;
+    margin-bottom: 0.5rem;
   }
 
   .lib-search {
@@ -43,6 +43,37 @@
     font-size: 0.8rem;
     margin-left: auto;
   }
+
+  /* --- Bulk action bar --- */
+  .bulk-bar {
+    display: none;
+    align-items: center;
+    gap: 0.6rem;
+    padding: 0.5rem 0.8rem;
+    margin-bottom: 0.5rem;
+    background: rgba(34, 197, 94, 0.08);
+    border: 1px solid rgba(34, 197, 94, 0.25);
+    border-radius: 8px;
+    font-size: 0.8rem;
+  }
+  .bulk-bar.visible { display: flex; }
+
+  .bulk-bar .bulk-count {
+    color: var(--accent);
+    font-weight: 600;
+  }
+
+  .bulk-btn {
+    background: var(--bg-dark);
+    border: 1px solid var(--border-subtle);
+    border-radius: 6px;
+    color: var(--text-main);
+    padding: 0.3rem 0.65rem;
+    font-size: 0.78rem;
+    cursor: pointer;
+    transition: border-color 0.12s;
+  }
+  .bulk-btn:hover { border-color: var(--accent); }
 
   /* --- Table --- */
   .lib-table-wrap {
@@ -78,6 +109,7 @@
   table.lib-table th:hover { color: var(--text-main); }
   table.lib-table th.sorted { color: var(--accent); }
   table.lib-table th .arrow { font-size: 0.65rem; margin-left: 3px; }
+  table.lib-table th.col-check { cursor: default; width: 32px; }
 
   table.lib-table td {
     padding: 0.45rem 0.7rem;
@@ -89,8 +121,12 @@
     max-width: 300px;
   }
 
+  table.lib-table tr { cursor: pointer; }
   table.lib-table tr:hover td {
     background: rgba(148, 163, 184, 0.06);
+  }
+  table.lib-table tr.selected td {
+    background: rgba(34, 197, 94, 0.08);
   }
 
   td.col-duration, td.col-format, td.col-ready {
@@ -103,8 +139,15 @@
     font-size: 0.75rem;
   }
 
+  td.col-check { text-align: center; }
+
   .ready-yes { color: var(--accent); }
   .ready-no  { color: var(--text-muted); opacity: 0.5; }
+
+  input[type="checkbox"] {
+    accent-color: var(--accent);
+    cursor: pointer;
+  }
 
   /* --- Pagination --- */
   .lib-pager {
@@ -163,10 +206,25 @@
   <span class="lib-stats" id="stats"></span>
 </div>
 
+<div class="bulk-bar" id="bulkBar">
+  <span class="bulk-count" id="bulkCount">0</span> selected
+  <button class="bulk-btn" onclick="bulkAction('ready2air_on')">Mark Ready</button>
+  <button class="bulk-btn" onclick="bulkAction('ready2air_off')">Mark Not Ready</button>
+  <select class="lib-select" id="bulkCategorySelect" style="font-size:0.78rem;">
+    <option value="">Set category...</option>
+    {% for cat in categories %}
+    <option value="{{ cat.id }}">{{ cat.name }}</option>
+    {% endfor %}
+  </select>
+  <button class="bulk-btn" onclick="bulkSetCategory()">Apply</button>
+  <button class="bulk-btn" onclick="clearSelection()" style="margin-left:auto;">Clear</button>
+</div>
+
 <div class="lib-table-wrap">
   <table class="lib-table">
     <thead>
       <tr>
+        <th class="col-check"><input type="checkbox" id="selectAll" title="Select all on page"></th>
         <th data-sort="title">Title <span class="arrow"></span></th>
         <th data-sort="artist">Artist <span class="arrow"></span></th>
         <th data-sort="album">Album <span class="arrow"></span></th>
@@ -196,12 +254,31 @@ let currentDir = 'asc';
 let currentPage = 1;
 let totalPages = 1;
 let debounceTimer = null;
+let selectedIds = new Set();
+let pageTrackIds = [];
+
+function getCookie(name) {
+  let val = null;
+  document.cookie.split(';').forEach(c => {
+    c = c.trim();
+    if (c.startsWith(name + '='))
+      val = decodeURIComponent(c.substring(name.length + 1));
+  });
+  return val;
+}
 
 function fmtDuration(sec) {
   if (!sec && sec !== 0) return '';
   const m = Math.floor(sec / 60);
   const s = Math.round(sec % 60);
   return m + ':' + String(s).padStart(2, '0');
+}
+
+function esc(s) {
+  if (!s) return '';
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
 }
 
 function buildQuery() {
@@ -219,6 +296,78 @@ function buildQuery() {
   return params.toString();
 }
 
+function updateBulkBar() {
+  const bar = document.getElementById('bulkBar');
+  const count = document.getElementById('bulkCount');
+  if (selectedIds.size > 0) {
+    bar.classList.add('visible');
+    count.textContent = selectedIds.size;
+  } else {
+    bar.classList.remove('visible');
+  }
+  document.getElementById('selectAll').checked =
+    pageTrackIds.length > 0 && pageTrackIds.every(id => selectedIds.has(id));
+}
+
+function toggleSelect(id, checkbox) {
+  if (selectedIds.has(id)) {
+    selectedIds.delete(id);
+  } else {
+    selectedIds.add(id);
+  }
+  const row = checkbox.closest('tr');
+  row.classList.toggle('selected', selectedIds.has(id));
+  updateBulkBar();
+}
+
+function clearSelection() {
+  selectedIds.clear();
+  document.querySelectorAll('#trackBody tr').forEach(tr => {
+    tr.classList.remove('selected');
+    const cb = tr.querySelector('input[type="checkbox"]');
+    if (cb) cb.checked = false;
+  });
+  updateBulkBar();
+}
+
+async function bulkAction(action) {
+  if (selectedIds.size === 0) return;
+  const resp = await fetch('/api/tracks/bulk/', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-CSRFToken': getCookie('csrftoken'),
+    },
+    body: JSON.stringify({ action, ids: [...selectedIds] }),
+  });
+  if (resp.ok) {
+    clearSelection();
+    loadTracks();
+  }
+}
+
+async function bulkSetCategory() {
+  const catId = document.getElementById('bulkCategorySelect').value;
+  if (!catId || selectedIds.size === 0) return;
+  const resp = await fetch('/api/tracks/bulk/', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-CSRFToken': getCookie('csrftoken'),
+    },
+    body: JSON.stringify({
+      action: 'set_category',
+      ids: [...selectedIds],
+      category_id: parseInt(catId),
+    }),
+  });
+  if (resp.ok) {
+    document.getElementById('bulkCategorySelect').value = '';
+    clearSelection();
+    loadTracks();
+  }
+}
+
 async function loadTracks() {
   const resp = await fetch('/api/tracks/?' + buildQuery());
   if (!resp.ok) return;
@@ -226,6 +375,7 @@ async function loadTracks() {
 
   totalPages = data.pages;
   currentPage = data.page;
+  pageTrackIds = data.items.map(t => t.id);
 
   const stats = document.getElementById('stats');
   stats.textContent = data.total.toLocaleString() + ' tracks';
@@ -238,17 +388,32 @@ async function loadTracks() {
     empty.style.display = '';
   } else {
     empty.style.display = 'none';
-    body.innerHTML = data.items.map(t => `<tr>
-      <td>${esc(t.title)}</td>
-      <td>${esc(t.artist)}</td>
-      <td>${esc(t.album)}</td>
-      <td class="col-category">${esc(t.category_code)}</td>
-      <td class="col-duration">${fmtDuration(t.duration_seconds)}</td>
-      <td class="col-format">${esc(t.format)}</td>
-      <td class="col-ready">${t.ready2air
-        ? '<span class="ready-yes">&#10003;</span>'
-        : '<span class="ready-no">&mdash;</span>'}</td>
-    </tr>`).join('');
+    body.innerHTML = data.items.map(t => {
+      const checked = selectedIds.has(t.id) ? 'checked' : '';
+      const sel = selectedIds.has(t.id) ? 'selected' : '';
+      return `<tr class="${sel}" data-id="${t.id}">
+        <td class="col-check" onclick="event.stopPropagation()">
+          <input type="checkbox" ${checked}
+                 onchange="toggleSelect(${t.id}, this)">
+        </td>
+        <td>${esc(t.title)}</td>
+        <td>${esc(t.artist)}</td>
+        <td>${esc(t.album)}</td>
+        <td class="col-category">${esc(t.category_code)}</td>
+        <td class="col-duration">${fmtDuration(t.duration_seconds)}</td>
+        <td class="col-format">${esc(t.format)}</td>
+        <td class="col-ready">${t.ready2air
+          ? '<span class="ready-yes">&#10003;</span>'
+          : '<span class="ready-no">&mdash;</span>'}</td>
+      </tr>`;
+    }).join('');
+
+    // Row click navigates to detail (unless clicking checkbox)
+    body.querySelectorAll('tr').forEach(tr => {
+      tr.addEventListener('click', () => {
+        window.location.href = '/track/' + tr.dataset.id + '/';
+      });
+    });
   }
 
   // Update sort indicators
@@ -268,19 +433,30 @@ async function loadTracks() {
     `Page ${currentPage} of ${totalPages}`;
   document.getElementById('prevBtn').disabled = currentPage <= 1;
   document.getElementById('nextBtn').disabled = currentPage >= totalPages;
-}
 
-function esc(s) {
-  if (!s) return '';
-  const d = document.createElement('div');
-  d.textContent = s;
-  return d.innerHTML;
+  updateBulkBar();
 }
 
 function goPage(delta) {
   currentPage = Math.max(1, Math.min(totalPages, currentPage + delta));
   loadTracks();
 }
+
+// Select all checkbox
+document.getElementById('selectAll').addEventListener('change', function() {
+  if (this.checked) {
+    pageTrackIds.forEach(id => selectedIds.add(id));
+  } else {
+    pageTrackIds.forEach(id => selectedIds.delete(id));
+  }
+  document.querySelectorAll('#trackBody tr').forEach(tr => {
+    const id = parseInt(tr.dataset.id);
+    const cb = tr.querySelector('input[type="checkbox"]');
+    if (cb) cb.checked = selectedIds.has(id);
+    tr.classList.toggle('selected', selectedIds.has(id));
+  });
+  updateBulkBar();
+});
 
 // Sort on header click
 document.querySelectorAll('th[data-sort]').forEach(th => {

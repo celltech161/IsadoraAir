@@ -9,7 +9,9 @@ from django.views.decorators.http import require_http_methods
 from django.core.paginator import Paginator
 from django.db.models import Q
 
-from .models import Category, Clock, ScheduleBlock, Track
+from django.shortcuts import get_object_or_404
+
+from .models import Artist, Album, Category, Clock, Genre, ScheduleBlock, Track
 
 
 @ensure_csrf_cookie
@@ -166,3 +168,152 @@ def api_track_list(request):
         "pages": paginator.num_pages,
         "per_page": per_page,
     })
+
+
+@require_http_methods(["POST"])
+def api_track_bulk(request):
+    try:
+        body = json.loads(request.body)
+    except (json.JSONDecodeError, ValueError):
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+
+    action = body.get("action")
+    ids = body.get("ids", [])
+
+    if not ids:
+        return JsonResponse({"error": "No track IDs provided"}, status=400)
+
+    qs = Track.objects.filter(id__in=ids)
+
+    if action == "ready2air_on":
+        updated = qs.update(ready2air=True)
+    elif action == "ready2air_off":
+        updated = qs.update(ready2air=False)
+    elif action == "set_category":
+        cat_id = body.get("category_id")
+        if cat_id:
+            try:
+                Category.objects.get(id=cat_id)
+            except Category.DoesNotExist:
+                return JsonResponse({"error": "Category not found"}, status=404)
+        updated = qs.update(category_id=cat_id)
+    else:
+        return JsonResponse({"error": "Unknown action"}, status=400)
+
+    return JsonResponse({"ok": True, "updated": updated})
+
+
+@ensure_csrf_cookie
+def track_detail_page(request, pk):
+    track = get_object_or_404(
+        Track.objects.select_related("artist", "album", "genre", "category"), pk=pk
+    )
+    categories = Category.objects.order_by("name")
+    return render(request, "library/track_detail.html", {
+        "track": track,
+        "categories": categories,
+        "energy_choices": Track.ENERGY_CHOICES,
+        "vocal_type_choices": Track.VOCAL_TYPE_CHOICES,
+        "end_type_choices": Track.END_TYPE_CHOICES,
+    })
+
+
+@require_http_methods(["GET", "PATCH"])
+def api_track_detail(request, pk):
+    track = get_object_or_404(
+        Track.objects.select_related("artist", "album", "genre", "category"), pk=pk
+    )
+
+    if request.method == "GET":
+        return JsonResponse(_track_to_dict(track))
+
+    try:
+        body = json.loads(request.body)
+    except (json.JSONDecodeError, ValueError):
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+
+    DIRECT_FIELDS = {
+        "title", "year", "composer", "publisher", "record_label", "comments",
+        "rotation_weight", "ready2air", "energy", "vocal_type", "end_type",
+        "cue_in_seconds", "cue_out_seconds", "next_start_seconds",
+        "intro_until_seconds", "sweep_start_seconds", "outro_starts_seconds",
+        "hook_in_seconds", "hook_out_seconds",
+        "alt_send_enabled", "alt_send_text",
+    }
+
+    for field, value in body.items():
+        if field in DIRECT_FIELDS:
+            setattr(track, field, value)
+        elif field == "artist":
+            artist_obj, _ = Artist.objects.get_or_create(name=value)
+            track.artist = artist_obj
+        elif field == "album":
+            if value:
+                album_obj, _ = Album.objects.get_or_create(
+                    title=value, defaults={"album_artist": ""}
+                )
+                track.album = album_obj
+            else:
+                track.album = None
+        elif field == "genre":
+            if value:
+                genre_obj, _ = Genre.objects.get_or_create(name=value)
+                track.genre = genre_obj
+            else:
+                track.genre = None
+        elif field == "category_id":
+            if value:
+                try:
+                    track.category = Category.objects.get(id=value)
+                except Category.DoesNotExist:
+                    return JsonResponse({"error": "Category not found"}, status=404)
+            else:
+                track.category = None
+
+    track.save()
+    track.refresh_from_db()
+    return JsonResponse(_track_to_dict(track))
+
+
+def _track_to_dict(track):
+    return {
+        "id": track.id,
+        "title": track.title,
+        "artist": track.artist.name if track.artist else "",
+        "album": track.album.title if track.album else "",
+        "genre": track.genre.name if track.genre else "",
+        "year": track.year,
+        "category_id": track.category_id,
+        "category_code": track.category.code if track.category else "",
+        "category_name": track.category.name if track.category else "",
+        "duration_seconds": track.duration_seconds,
+        "format": track.format,
+        "filepath": track.filepath,
+        "sample_rate": track.sample_rate,
+        "channels": track.channels,
+        "bit_depth": track.bit_depth,
+        "cue_in_seconds": track.cue_in_seconds,
+        "cue_out_seconds": track.cue_out_seconds,
+        "next_start_seconds": track.next_start_seconds,
+        "intro_until_seconds": track.intro_until_seconds,
+        "sweep_start_seconds": track.sweep_start_seconds,
+        "outro_starts_seconds": track.outro_starts_seconds,
+        "hook_in_seconds": track.hook_in_seconds,
+        "hook_out_seconds": track.hook_out_seconds,
+        "rotation_weight": track.rotation_weight,
+        "ready2air": track.ready2air,
+        "energy": track.energy,
+        "vocal_type": track.vocal_type,
+        "end_type": track.end_type,
+        "play_count": track.play_count,
+        "last_played_at": track.last_played_at.isoformat() if track.last_played_at else None,
+        "related_artists": track.related_artists,
+        "composer": track.composer,
+        "publisher": track.publisher,
+        "record_label": track.record_label,
+        "comments": track.comments,
+        "alt_send_enabled": track.alt_send_enabled,
+        "alt_send_text": track.alt_send_text,
+        "created_at": track.created_at.isoformat(),
+        "updated_at": track.updated_at.isoformat(),
+    }
