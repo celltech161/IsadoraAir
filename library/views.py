@@ -106,6 +106,7 @@ TRACK_SORT_FIELDS = {
     "category": "category__code",
     "duration": "duration_seconds",
     "ready2air": "ready2air",
+    "format": "format",
 }
 
 
