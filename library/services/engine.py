@@ -63,6 +63,18 @@ class PlaybackEngine:
         GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGTERM, self._handle_signal_glib)
         GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGINT, self._handle_signal_glib)
 
+        # Also set Python-level handler as fallback for pre-loop signals
+        def _force_quit(signum, frame):
+            print("\nForce quit.")
+            self.running = False
+            try:
+                self.loop.quit()
+            except Exception:
+                pass
+            sys.exit(1)
+        signal.signal(signal.SIGTERM, _force_quit)
+        signal.signal(signal.SIGINT, _force_quit)
+
         print("Engine started.")
         self.loop.run()
         self.stop()
@@ -110,6 +122,17 @@ class PlaybackEngine:
     def _load_current_hour_log(self):
         now = timezone.localtime()
         self._load_log_for(now.date(), now.hour)
+
+        if not self.log_items:
+            fallback = (
+                PlaylistLog.objects
+                .filter(date=now.date(), status="approved", hour__lte=now.hour)
+                .order_by("-hour")
+                .first()
+            )
+            if fallback:
+                print(f"No log for hour {now.hour}, falling back to hour {fallback.hour}")
+                self._load_log_for(fallback.date, fallback.hour)
 
     def _load_log_for(self, target_date, hour):
         log = (
