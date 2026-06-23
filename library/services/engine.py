@@ -60,16 +60,12 @@ class PlaybackEngine:
 
         self._position_timer = GLib.timeout_add(POSITION_POLL_MS, self._poll_position)
 
-        signal.signal(signal.SIGTERM, self._handle_signal)
-        signal.signal(signal.SIGINT, self._handle_signal)
+        GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGTERM, self._handle_signal_glib)
+        GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGINT, self._handle_signal_glib)
 
         print("Engine started.")
-        try:
-            self.loop.run()
-        except KeyboardInterrupt:
-            pass
-        finally:
-            self.stop()
+        self.loop.run()
+        self.stop()
 
     def stop(self):
         self.running = False
@@ -83,9 +79,10 @@ class PlaybackEngine:
         self._write_state(transport="STOPPED")
         print("Engine stopped.")
 
-    def _handle_signal(self, signum, frame):
-        print(f"Received signal {signum}, shutting down...")
-        GLib.idle_add(self.loop.quit)
+    def _handle_signal_glib(self):
+        print("Shutting down...")
+        self.loop.quit()
+        return GLib.SOURCE_REMOVE
 
     def _build_main_pipeline(self):
         self.main_pipeline = Gst.Pipeline.new("isadoraair")
