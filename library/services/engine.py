@@ -15,6 +15,7 @@ import django
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "isadoraair.settings")
 django.setup()
 
+from django.db import close_old_connections
 from django.utils import timezone
 from library.models import LogItem, PlaylistLog, Track
 
@@ -136,6 +137,7 @@ class PlaybackEngine:
                 self._load_log_for(fallback.date, fallback.hour)
 
     def _load_log_for(self, target_date, hour):
+        close_old_connections()
         log = (
             PlaylistLog.objects
             .filter(date=target_date, hour=hour, status="approved")
@@ -222,13 +224,16 @@ class PlaybackEngine:
         )
         deck.started_at = time.time()
 
-        log_item.played_at = timezone.now()
-        log_item.save(update_fields=["played_at"])
-
-        Track.objects.filter(id=track.id).update(
-            last_played_at=timezone.now(),
-            play_count=track.play_count + 1,
-        )
+        try:
+            close_old_connections()
+            log_item.played_at = timezone.now()
+            log_item.save(update_fields=["played_at"])
+            Track.objects.filter(id=track.id).update(
+                last_played_at=timezone.now(),
+                play_count=track.play_count + 1,
+            )
+        except Exception as exc:
+            print(f"  DB write failed (non-fatal): {exc}")
 
         print(f"  Playing: {track.artist.name if track.artist else '?'} - {track.title}")
         return deck
@@ -285,6 +290,7 @@ class PlaybackEngine:
             return
         self._last_queue_reload = now
 
+        close_old_connections()
         fresh_items = list(
             self.current_log.items
             .select_related("track", "track__artist", "track__album", "track__category")
