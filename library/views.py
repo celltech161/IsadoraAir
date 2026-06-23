@@ -17,6 +17,10 @@ from .models import Artist, Album, Category, Clock, Genre, LogItem, PlaylistLog,
 from .services.log_builder import build_hour_log
 
 
+def dashboard_page(request):
+    return render(request, "library/dashboard.html")
+
+
 @ensure_csrf_cookie
 def schedule_page(request):
     clocks = Clock.objects.all().order_by("name")

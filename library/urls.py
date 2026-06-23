@@ -5,6 +5,7 @@ from . import views
 app_name = 'library'
 
 urlpatterns = [
+    path('', views.dashboard_page, name='dashboard'),
     path('schedule/', views.schedule_page, name='schedule'),
     path('library/', views.library_page, name='library'),
     path('api/schedule/', views.api_schedule_list, name='api-schedule-list'),

@@ -128,7 +128,7 @@ class PlaybackEngine:
         self.current_log = log
         self.log_items = list(
             log.items
-            .select_related("track", "track__artist")
+            .select_related("track", "track__artist", "track__album", "track__category")
             .order_by("position")
         )
         self.current_index = 0
@@ -321,9 +321,12 @@ class PlaybackEngine:
                     "track_id": t.id,
                     "title": t.title,
                     "artist": t.artist.name if t.artist else "",
+                    "album": t.album.title if t.album else "",
                     "position": round(pos, 1),
                     "duration": t.duration_seconds or 0,
                     "next_start": t.next_start_seconds,
+                    "cue_in": t.cue_in_seconds or 0,
+                    "category": t.category.code if t.category else "",
                 }
 
             next_index = self.current_index + 1
@@ -333,13 +336,29 @@ class PlaybackEngine:
                     "track_id": nt.id,
                     "title": nt.title,
                     "artist": nt.artist.name if nt.artist else "",
+                    "album": nt.album.title if nt.album else "",
                     "duration": nt.duration_seconds or 0,
+                    "category": nt.category.code if nt.category else "",
                 }
+
+            queue = []
+            for i in range(next_index + 1, min(next_index + 10, len(self.log_items))):
+                qt = self.log_items[i].track
+                queue.append({
+                    "track_id": qt.id,
+                    "title": qt.title,
+                    "artist": qt.artist.name if qt.artist else "",
+                    "duration": qt.duration_seconds or 0,
+                    "category": qt.category.code if qt.category else "",
+                })
 
             state = {
                 "transport": transport,
                 "now_playing": now_playing,
                 "next_up": next_up,
+                "queue": queue,
+                "current_index": self.current_index,
+                "total_items": len(self.log_items),
                 "log_id": self.current_log.id if self.current_log else None,
                 "hour": self.current_log.hour if self.current_log else None,
                 "date": self.current_log.date.isoformat() if self.current_log else None,
