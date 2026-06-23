@@ -1,0 +1,16 @@
+[Unit]
+Description=IsadoraAir Playback Engine
+After=network.target postgresql.service isadoraair-gunicorn.service
+
+[Service]
+User=jreed
+Group=jreed
+WorkingDirectory=/opt/isadoraair
+ExecStart=/opt/isadoraair/venv/bin/python /opt/isadoraair/manage.py run_engine
+Restart=on-failure
+RestartSec=5
+EnvironmentFile=/opt/isadoraair/.env
+RuntimeDirectory=isadoraair
+
+[Install]
+WantedBy=multi-user.target

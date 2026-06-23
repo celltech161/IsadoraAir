@@ -1,4 +1,5 @@
 import json
+import time as time_mod
 from datetime import date as date_type, time
 from pathlib import Path
 
@@ -493,6 +494,20 @@ def api_log_reorder(request, pk):
     LogItem.objects.bulk_update(items.values(), ["position"])
 
     return JsonResponse(_log_to_dict(log))
+
+
+@require_http_methods(["GET"])
+def api_engine_status(request):
+    state_path = Path("/run/isadoraair/engine_state.json")
+    if not state_path.is_file():
+        return JsonResponse({"transport": "OFFLINE", "now_playing": None, "next_up": None})
+    try:
+        data = json.loads(state_path.read_text(encoding="utf-8"))
+        if time_mod.time() - data.get("timestamp", 0) > 10:
+            data["transport"] = "STALE"
+        return JsonResponse(data)
+    except Exception:
+        return JsonResponse({"transport": "ERROR", "now_playing": None, "next_up": None})
 
 
 @require_http_methods(["GET"])
