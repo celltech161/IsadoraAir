@@ -81,6 +81,7 @@
     <a href="/" class="brand">IsadoraAir</a>
     <div class="nav-links">
       <a href="{% url 'library:schedule' %}" {% block nav_schedule %}{% endblock %}>Schedule</a>
+      <a href="{% url 'library:logs' %}" {% block nav_logs %}{% endblock %}>Logs</a>
       <a href="#">Dashboard</a>
       <a href="{% url 'library:library' %}" {% block nav_library %}{% endblock %}>Library</a>
     </div>

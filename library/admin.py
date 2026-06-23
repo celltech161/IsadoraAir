@@ -124,8 +124,8 @@ class LogItemInline(admin.TabularInline):
 
 @admin.register(PlaylistLog)
 class PlaylistLogAdmin(admin.ModelAdmin):
-    list_display = ["date", "status", "generated_at"]
-    list_filter = ["status"]
+    list_display = ["date", "hour", "status", "generated_at"]
+    list_filter = ["status", "date"]
     inlines = [LogItemInline]
 
 

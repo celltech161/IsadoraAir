@@ -14,4 +14,10 @@ urlpatterns = [
     path('api/tracks/bulk/', views.api_track_bulk, name='api-track-bulk'),
     path('api/tracks/<int:pk>/', views.api_track_detail, name='api-track-detail'),
     path('track/<int:pk>/', views.track_detail_page, name='track-detail'),
+    path('logs/', views.logs_page, name='logs'),
+    path('api/log/build/', views.api_log_build, name='api-log-build'),
+    path('api/log/<str:date_str>/<int:hour>/', views.api_log_get, name='api-log-get'),
+    path('api/log/<str:date_str>/', views.api_log_list_date, name='api-log-list-date'),
+    path('api/log/<int:pk>/update/', views.api_log_update, name='api-log-update'),
+    path('api/log/<int:pk>/delete/', views.api_log_delete, name='api-log-delete'),
 ]

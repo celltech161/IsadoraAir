@@ -1,5 +1,5 @@
 import json
-from datetime import time
+from datetime import date as date_type, time
 
 from django.http import JsonResponse
 from django.shortcuts import render
@@ -11,7 +11,8 @@ from django.db.models import Q
 
 from django.shortcuts import get_object_or_404
 
-from .models import Artist, Album, Category, Clock, Genre, ScheduleBlock, Track
+from .models import Artist, Album, Category, Clock, Genre, LogItem, PlaylistLog, ScheduleBlock, Track
+from .services.log_builder import build_hour_log
 
 
 @ensure_csrf_cookie
@@ -317,3 +318,127 @@ def _track_to_dict(track):
         "created_at": track.created_at.isoformat(),
         "updated_at": track.updated_at.isoformat(),
     }
+
+
+# ---------------------------------------------------------------
+# Log builder
+# ---------------------------------------------------------------
+
+@ensure_csrf_cookie
+def logs_page(request):
+    return render(request, "library/logs.html")
+
+
+def _log_to_dict(log):
+    items = (
+        log.items
+        .select_related("track", "track__artist", "category")
+        .order_by("position")
+    )
+    return {
+        "id": log.id,
+        "date": log.date.isoformat(),
+        "hour": log.hour,
+        "status": log.status,
+        "generated_at": log.generated_at.isoformat(),
+        "items": [
+            {
+                "id": item.id,
+                "position": item.position,
+                "scheduled_time": item.scheduled_time.isoformat(),
+                "track_id": item.track_id,
+                "title": item.track.title,
+                "artist": item.track.artist.name if item.track.artist else "",
+                "category": item.category.code if item.category else "",
+                "duration": item.track.next_start_seconds or item.track.duration_seconds or 0,
+            }
+            for item in items
+        ],
+    }
+
+
+@require_http_methods(["POST"])
+def api_log_build(request):
+    try:
+        body = json.loads(request.body)
+    except (json.JSONDecodeError, ValueError):
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+
+    date_str = body.get("date")
+    hour = body.get("hour")
+
+    if not date_str or hour is None:
+        return JsonResponse({"error": "date and hour are required"}, status=400)
+
+    try:
+        target_date = date_type.fromisoformat(date_str)
+    except (ValueError, TypeError):
+        return JsonResponse({"error": "Invalid date format (use YYYY-MM-DD)"}, status=400)
+
+    if not (0 <= hour <= 23):
+        return JsonResponse({"error": "hour must be 0-23"}, status=400)
+
+    log, error = build_hour_log(target_date, hour)
+    if error:
+        return JsonResponse({"error": error}, status=400)
+
+    return JsonResponse(_log_to_dict(log))
+
+
+@require_http_methods(["GET"])
+def api_log_get(request, date_str, hour):
+    try:
+        target_date = date_type.fromisoformat(date_str)
+    except (ValueError, TypeError):
+        return JsonResponse({"error": "Invalid date"}, status=400)
+
+    log = PlaylistLog.objects.filter(date=target_date, hour=hour).first()
+    if not log:
+        return JsonResponse({"error": "No log for this hour"}, status=404)
+
+    return JsonResponse(_log_to_dict(log))
+
+
+@require_http_methods(["GET"])
+def api_log_list_date(request, date_str):
+    try:
+        target_date = date_type.fromisoformat(date_str)
+    except (ValueError, TypeError):
+        return JsonResponse({"error": "Invalid date"}, status=400)
+
+    logs = PlaylistLog.objects.filter(date=target_date).order_by("hour")
+    return JsonResponse({
+        "date": target_date.isoformat(),
+        "logs": [
+            {
+                "id": log.id,
+                "hour": log.hour,
+                "status": log.status,
+                "item_count": log.items.count(),
+            }
+            for log in logs
+        ],
+    })
+
+
+@require_http_methods(["PATCH"])
+def api_log_update(request, pk):
+    log = get_object_or_404(PlaylistLog, pk=pk)
+
+    try:
+        body = json.loads(request.body)
+    except (json.JSONDecodeError, ValueError):
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+
+    status = body.get("status")
+    if status and status in ("draft", "approved"):
+        log.status = status
+        log.save(update_fields=["status"])
+
+    return JsonResponse(_log_to_dict(log))
+
+
+@require_http_methods(["DELETE"])
+def api_log_delete(request, pk):
+    deleted, _ = PlaylistLog.objects.filter(pk=pk, status="draft").delete()
+    return JsonResponse({"ok": True, "deleted": deleted > 0})

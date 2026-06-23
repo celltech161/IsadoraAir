@@ -1,0 +1,496 @@
+{% extends "base.html" %}
+
+{% block title %}Log Builder — IsadoraAir{% endblock %}
+{% block nav_logs %}class="active"{% endblock %}
+
+{% block extra_css %}
+<style>
+  .log-controls {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.6rem;
+    align-items: center;
+    margin-bottom: 1.25rem;
+  }
+
+  .log-input {
+    background: var(--bg-dark);
+    border: 1px solid var(--border-subtle);
+    border-radius: 8px;
+    padding: 0.45rem 0.65rem;
+    color: var(--text-main);
+    font-size: 0.85rem;
+  }
+  .log-input:focus { outline: none; border-color: var(--accent); }
+
+  .log-select {
+    background: var(--bg-dark);
+    border: 1px solid var(--border-subtle);
+    border-radius: 8px;
+    padding: 0.45rem 0.6rem;
+    color: var(--text-main);
+    font-size: 0.85rem;
+    cursor: pointer;
+  }
+  .log-select:focus { outline: none; border-color: var(--accent); }
+
+  .build-btn {
+    background: var(--accent);
+    border: none;
+    border-radius: 8px;
+    color: #000;
+    padding: 0.5rem 1.2rem;
+    font-size: 0.85rem;
+    font-weight: 700;
+    cursor: pointer;
+    transition: opacity 0.12s;
+  }
+  .build-btn:hover { opacity: 0.9; }
+  .build-btn:disabled { opacity: 0.4; cursor: default; }
+
+  .action-btn {
+    background: var(--bg-dark);
+    border: 1px solid var(--border-subtle);
+    border-radius: 6px;
+    color: var(--text-main);
+    padding: 0.4rem 0.8rem;
+    font-size: 0.8rem;
+    cursor: pointer;
+    transition: border-color 0.12s;
+  }
+  .action-btn:hover { border-color: var(--accent); }
+  .action-btn.approve { color: var(--accent); border-color: var(--accent); }
+  .action-btn.danger { color: var(--danger); }
+  .action-btn.danger:hover { border-color: var(--danger); }
+
+  .log-msg {
+    font-size: 0.82rem;
+    color: var(--text-muted);
+    margin-left: 0.5rem;
+  }
+  .log-msg.error { color: var(--danger); }
+
+  /* --- Existing logs sidebar --- */
+  .log-layout {
+    display: grid;
+    grid-template-columns: 180px 1fr;
+    gap: 1.25rem;
+    align-items: flex-start;
+  }
+
+  @media (max-width: 800px) {
+    .log-layout { grid-template-columns: 1fr; }
+  }
+
+  .hour-list {
+    background: var(--bg-dark);
+    border: 1px solid var(--border-subtle);
+    border-radius: 10px;
+    padding: 0.75rem;
+  }
+
+  .hour-list h3 {
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: var(--text-muted);
+    margin-bottom: 0.5rem;
+  }
+
+  .hour-slot {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 0.25rem 0.4rem;
+    border-radius: 5px;
+    font-size: 0.78rem;
+    cursor: pointer;
+    transition: background 0.1s;
+  }
+  .hour-slot:hover { background: rgba(148, 163, 184, 0.1); }
+  .hour-slot.active { background: rgba(34, 197, 94, 0.12); color: var(--accent); }
+
+  .hour-slot .hour-label {
+    width: 38px;
+    font-weight: 600;
+  }
+
+  .hour-slot .hour-status {
+    font-size: 0.68rem;
+    color: var(--text-muted);
+  }
+  .hour-slot .hour-status.draft { color: #d97706; }
+  .hour-slot .hour-status.approved { color: var(--accent); }
+
+  /* --- Log detail --- */
+  .log-detail {
+    min-height: 200px;
+  }
+
+  .log-detail-header {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    margin-bottom: 0.75rem;
+  }
+
+  .log-detail-header h2 {
+    font-size: 1rem;
+    font-weight: 700;
+  }
+
+  .status-badge {
+    font-size: 0.7rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    padding: 0.15rem 0.5rem;
+    border-radius: 4px;
+  }
+  .status-badge.draft { background: rgba(217, 119, 6, 0.2); color: #d97706; }
+  .status-badge.approved { background: rgba(34, 197, 94, 0.15); color: var(--accent); }
+
+  .log-table-wrap {
+    overflow-x: auto;
+    border-radius: 8px;
+    border: 1px solid var(--border-subtle);
+  }
+
+  table.log-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.82rem;
+  }
+
+  table.log-table th {
+    background: var(--bg-dark);
+    color: var(--text-muted);
+    font-weight: 600;
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    padding: 0.5rem 0.7rem;
+    text-align: left;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+
+  table.log-table td {
+    padding: 0.4rem 0.7rem;
+    border-bottom: 1px solid rgba(148, 163, 184, 0.08);
+    color: var(--text-main);
+  }
+
+  table.log-table tr:hover td {
+    background: rgba(148, 163, 184, 0.04);
+  }
+
+  td.col-time, td.col-dur, td.col-pos { color: var(--text-muted); text-align: center; }
+  td.col-cat { color: var(--text-muted); font-size: 0.75rem; }
+
+  .total-row {
+    margin-top: 0.5rem;
+    font-size: 0.8rem;
+    color: var(--text-muted);
+    text-align: right;
+  }
+
+  .empty-state {
+    text-align: center;
+    padding: 3rem 1rem;
+    color: var(--text-muted);
+    font-size: 0.85rem;
+  }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="log-controls">
+  <input type="date" class="log-input" id="dateInput">
+  <select class="log-select" id="hourSelect">
+    <option value="" disabled selected>Hour...</option>
+  </select>
+  <button class="build-btn" id="buildBtn" onclick="buildLog()">Build</button>
+  <span class="log-msg" id="logMsg"></span>
+</div>
+
+<div class="log-layout">
+  <div class="hour-list" id="hourList">
+    <h3>Hours</h3>
+    <div id="hourSlots"></div>
+  </div>
+
+  <div class="log-detail" id="logDetail">
+    <div class="empty-state" id="emptyState">Select a date and hour, then click Build to generate a log.</div>
+  </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+let currentLogId = null;
+
+function getCookie(name) {
+  let val = null;
+  document.cookie.split(';').forEach(c => {
+    c = c.trim();
+    if (c.startsWith(name + '='))
+      val = decodeURIComponent(c.substring(name.length + 1));
+  });
+  return val;
+}
+
+function fmtDuration(sec) {
+  if (!sec && sec !== 0) return '';
+  const m = Math.floor(sec / 60);
+  const s = Math.round(sec % 60);
+  return m + ':' + String(s).padStart(2, '0');
+}
+
+function fmtTime(isoStr) {
+  const d = new Date(isoStr);
+  return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
+}
+
+function esc(s) {
+  if (!s) return '';
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+function hourLabel(h) {
+  if (h === 0) return '12:00a';
+  if (h < 12) return h + ':00a';
+  if (h === 12) return '12:00p';
+  return (h - 12) + ':00p';
+}
+
+// Populate hour select
+(function() {
+  const sel = document.getElementById('hourSelect');
+  for (let h = 0; h < 24; h++) {
+    const opt = document.createElement('option');
+    opt.value = h;
+    opt.textContent = hourLabel(h);
+    sel.appendChild(opt);
+  }
+
+  const today = new Date();
+  const yyyy = today.getFullYear();
+  const mm = String(today.getMonth() + 1).padStart(2, '0');
+  const dd = String(today.getDate()).padStart(2, '0');
+  document.getElementById('dateInput').value = `${yyyy}-${mm}-${dd}`;
+})();
+
+// Load existing logs for selected date
+document.getElementById('dateInput').addEventListener('change', loadDateLogs);
+
+async function loadDateLogs() {
+  const date = document.getElementById('dateInput').value;
+  if (!date) return;
+
+  const resp = await fetch(`/api/log/${date}/`);
+  const slots = document.getElementById('hourSlots');
+
+  if (!resp.ok) {
+    slots.innerHTML = '';
+    return;
+  }
+
+  const data = await resp.json();
+  const logsByHour = {};
+  data.logs.forEach(l => { logsByHour[l.hour] = l; });
+
+  slots.innerHTML = '';
+  for (let h = 0; h < 24; h++) {
+    const div = document.createElement('div');
+    div.className = 'hour-slot';
+    div.dataset.hour = h;
+
+    const label = document.createElement('span');
+    label.className = 'hour-label';
+    label.textContent = hourLabel(h);
+    div.appendChild(label);
+
+    if (logsByHour[h]) {
+      const status = document.createElement('span');
+      status.className = 'hour-status ' + logsByHour[h].status;
+      status.textContent = logsByHour[h].status + ' (' + logsByHour[h].item_count + ')';
+      div.appendChild(status);
+    }
+
+    div.addEventListener('click', () => {
+      document.getElementById('hourSelect').value = h;
+      loadHourLog(date, h);
+    });
+
+    slots.appendChild(div);
+  }
+
+  loadDateLogs.lastDate = date;
+}
+
+async function loadHourLog(date, hour) {
+  // Highlight active slot
+  document.querySelectorAll('.hour-slot').forEach(s => s.classList.remove('active'));
+  const activeSlot = document.querySelector(`.hour-slot[data-hour="${hour}"]`);
+  if (activeSlot) activeSlot.classList.add('active');
+
+  const resp = await fetch(`/api/log/${date}/${hour}/`);
+  const detail = document.getElementById('logDetail');
+  const empty = document.getElementById('emptyState');
+
+  if (!resp.ok) {
+    detail.innerHTML = '';
+    detail.appendChild(empty);
+    empty.style.display = '';
+    empty.textContent = 'No log for this hour. Click Build to generate one.';
+    currentLogId = null;
+    return;
+  }
+
+  const data = await resp.json();
+  renderLog(data);
+}
+
+function renderLog(data) {
+  currentLogId = data.id;
+  const detail = document.getElementById('logDetail');
+
+  let totalDur = 0;
+  data.items.forEach(i => { totalDur += (i.duration || 0); });
+
+  detail.innerHTML = `
+    <div class="log-detail-header">
+      <h2>${hourLabel(data.hour)} — ${data.date}</h2>
+      <span class="status-badge ${data.status}">${data.status}</span>
+      ${data.status === 'draft' ? `
+        <button class="action-btn approve" onclick="approveLog(${data.id})">Approve</button>
+        <button class="action-btn" onclick="rebuildLog()">Rebuild</button>
+        <button class="action-btn danger" onclick="deleteLog(${data.id})">Delete</button>
+      ` : `
+        <button class="action-btn" onclick="unapproveLog(${data.id})">Revert to Draft</button>
+      `}
+    </div>
+    <div class="log-table-wrap">
+      <table class="log-table">
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>Time</th>
+            <th>Artist</th>
+            <th>Title</th>
+            <th>Category</th>
+            <th>Duration</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${data.items.map(i => `<tr>
+            <td class="col-pos">${i.position + 1}</td>
+            <td class="col-time">${fmtTime(i.scheduled_time)}</td>
+            <td>${esc(i.artist)}</td>
+            <td>${esc(i.title)}</td>
+            <td class="col-cat">${esc(i.category)}</td>
+            <td class="col-dur">${fmtDuration(i.duration)}</td>
+          </tr>`).join('')}
+        </tbody>
+      </table>
+    </div>
+    <div class="total-row">
+      ${data.items.length} items — ${fmtDuration(totalDur)} total
+    </div>
+  `;
+}
+
+async function buildLog() {
+  const date = document.getElementById('dateInput').value;
+  const hour = document.getElementById('hourSelect').value;
+  const msg = document.getElementById('logMsg');
+
+  if (!date || hour === '') {
+    msg.textContent = 'Select a date and hour first.';
+    msg.className = 'log-msg error';
+    return;
+  }
+
+  const btn = document.getElementById('buildBtn');
+  btn.disabled = true;
+  msg.textContent = 'Building...';
+  msg.className = 'log-msg';
+
+  const resp = await fetch('/api/log/build/', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-CSRFToken': getCookie('csrftoken'),
+    },
+    body: JSON.stringify({ date, hour: parseInt(hour) }),
+  });
+
+  btn.disabled = false;
+
+  if (!resp.ok) {
+    const err = await resp.json();
+    msg.textContent = err.error || 'Build failed';
+    msg.className = 'log-msg error';
+    return;
+  }
+
+  msg.textContent = '';
+  const data = await resp.json();
+  renderLog(data);
+  loadDateLogs();
+}
+
+async function approveLog(logId) {
+  const resp = await fetch(`/api/log/${logId}/update/`, {
+    method: 'PATCH',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-CSRFToken': getCookie('csrftoken'),
+    },
+    body: JSON.stringify({ status: 'approved' }),
+  });
+  if (resp.ok) {
+    const data = await resp.json();
+    renderLog(data);
+    loadDateLogs();
+  }
+}
+
+async function unapproveLog(logId) {
+  const resp = await fetch(`/api/log/${logId}/update/`, {
+    method: 'PATCH',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-CSRFToken': getCookie('csrftoken'),
+    },
+    body: JSON.stringify({ status: 'draft' }),
+  });
+  if (resp.ok) {
+    const data = await resp.json();
+    renderLog(data);
+    loadDateLogs();
+  }
+}
+
+function rebuildLog() {
+  buildLog();
+}
+
+async function deleteLog(logId) {
+  const resp = await fetch(`/api/log/${logId}/delete/`, {
+    method: 'DELETE',
+    headers: { 'X-CSRFToken': getCookie('csrftoken') },
+  });
+  if (resp.ok) {
+    const detail = document.getElementById('logDetail');
+    detail.innerHTML = '<div class="empty-state">Log deleted.</div>';
+    currentLogId = null;
+    loadDateLogs();
+  }
+}
+
+// Load today's logs on page load
+loadDateLogs();
+</script>
+{% endblock %}

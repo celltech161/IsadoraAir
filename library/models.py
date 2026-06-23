@@ -326,15 +326,17 @@ class PlaylistLog(models.Model):
         ("approved", "Approved"),
     ]
 
-    date = models.DateField(unique=True)
-    generated_at = models.DateTimeField(auto_now_add=True)
+    date = models.DateField()
+    hour = models.PositiveSmallIntegerField(default=0)
+    generated_at = models.DateTimeField(auto_now=True)
     status = models.CharField(max_length=10, choices=STATUS_CHOICES, default="draft")
 
     class Meta:
-        ordering = ["-date"]
+        ordering = ["-date", "hour"]
+        unique_together = [("date", "hour")]
 
     def __str__(self):
-        return f"Log for {self.date} ({self.status})"
+        return f"Log for {self.date} {self.hour:02d}:00 ({self.status})"
 
 
 class LogItem(models.Model):
@@ -345,7 +347,8 @@ class LogItem(models.Model):
     position = models.PositiveIntegerField()
     scheduled_time = models.DateTimeField()
     track = models.ForeignKey(Track, on_delete=models.PROTECT, related_name="log_items")
-    played_at = models.DateTimeField(null=True, blank=True)  # actual vs scheduled_time
+    category = models.ForeignKey(Category, on_delete=models.SET_NULL, null=True, blank=True)
+    played_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         ordering = ["playlist_log", "position"]
