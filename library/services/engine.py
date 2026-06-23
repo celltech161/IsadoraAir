@@ -91,6 +91,7 @@ class PlaybackEngine:
 
         self.mixer = Gst.ElementFactory.make("audiomixer", "mixer")
         self.alsasink = Gst.ElementFactory.make("alsasink", "output")
+        self.alsasink.set_property("device", "plughw:1,0")
 
         convert = Gst.ElementFactory.make("audioconvert", "outconvert")
         resample = Gst.ElementFactory.make("audioresample", "outresample")
