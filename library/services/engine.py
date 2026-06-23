@@ -40,6 +40,7 @@ class PlaybackEngine:
         self.alsasink = None
         self.main_pipeline = None
         self.decks = []
+        self._deck_bin_map = {}
         self.current_log = None
         self.log_items = []
         self.current_index = 0
@@ -171,6 +172,20 @@ class PlaybackEngine:
 
         decode.connect("pad-added", on_pad_added)
 
+        # Block EOS from reaching audiomixer — we handle track
+        # completion via position polling instead
+        def eos_probe(pad, info):
+            event = info.get_event()
+            if event.type == Gst.EventType.EOS:
+                GLib.idle_add(self._on_deck_eos_probed, deck_bin)
+                return Gst.PadProbeReturn.DROP
+            return Gst.PadProbeReturn.OK
+
+        ghost_pad.add_probe(
+            Gst.PadProbeType.EVENT_DOWNSTREAM | Gst.PadProbeType.BLOCK,
+            eos_probe,
+        )
+
         self.main_pipeline.add(deck_bin)
 
         mixer_pad = self.mixer.request_pad_simple("sink_%u")
@@ -199,6 +214,7 @@ class PlaybackEngine:
 
     def _remove_deck(self, deck):
         with self._lock:
+            self._deck_bin_map.pop(id(deck.pipeline), None)
             deck.pipeline.set_state(Gst.State.NULL)
             deck.pipeline.get_static_pad("src").unlink(deck.mixer_pad)
             self.mixer.release_request_pad(deck.mixer_pad)
@@ -223,12 +239,13 @@ class PlaybackEngine:
                 self._start_track(index + 1, as_leading=True)
             return
 
+        self._deck_bin_map[id(deck_bin)] = deck
+
         with self._lock:
             self.decks.append(deck)
 
         bus = deck.pipeline.get_bus()
         bus.add_signal_watch()
-        bus.connect("message::eos", self._on_deck_eos, deck)
         bus.connect("message::error", self._on_deck_error, deck)
 
     def _get_deck_position(self, deck):
@@ -277,10 +294,12 @@ class PlaybackEngine:
         self._write_state()
         return True
 
-    def _on_deck_eos(self, bus, message, deck):
+    def _on_deck_eos_probed(self, deck_bin):
+        deck = self._deck_bin_map.get(id(deck_bin))
+        if not deck or deck.finished:
+            return
         is_leading = self.decks and self.decks[0] is deck
-        GLib.idle_add(self._handle_deck_finished, deck, is_leading)
-        return True
+        self._handle_deck_finished(deck, is_leading)
 
     def _on_deck_error(self, bus, message, deck):
         err, debug = message.parse_error()
