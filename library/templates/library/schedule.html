@@ -68,7 +68,7 @@
     padding: 0.5rem;
   }
 
-  /* --- Grid --- */
+  /* --- Desktop grid --- */
   .grid-container {
     flex: 1;
     overflow-x: auto;
@@ -129,9 +129,7 @@
     outline: 1px solid rgba(255,255,255,0.4);
   }
 
-  .grid-cell.empty {
-    color: transparent;
-  }
+  .grid-cell.empty { color: transparent; }
 
   .grid-cell.flash {
     animation: cellFlash 0.3s ease;
@@ -141,10 +139,97 @@
     0%   { filter: brightness(2); }
     100% { filter: brightness(1); }
   }
+
+  /* --- Mobile: day picker + vertical hour list --- */
+  .mobile-schedule { display: none; }
+
+  .day-picker {
+    display: flex;
+    gap: 2px;
+    margin-bottom: 0.75rem;
+  }
+
+  .day-picker-btn {
+    flex: 1;
+    background: var(--bg-dark);
+    border: 1px solid var(--border-subtle);
+    border-radius: 6px;
+    color: var(--text-muted);
+    padding: 0.5rem 0;
+    font-size: 0.78rem;
+    font-weight: 700;
+    cursor: pointer;
+    text-align: center;
+    transition: color 0.12s, border-color 0.12s;
+  }
+  .day-picker-btn.active {
+    color: var(--accent);
+    border-color: var(--accent);
+    background: rgba(34, 197, 94, 0.08);
+  }
+
+  .mobile-hours {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .mobile-hour-cell {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.55rem 0.75rem;
+    background: rgba(15, 23, 42, 0.6);
+    border-radius: 6px;
+    cursor: pointer;
+    transition: filter 0.1s;
+    min-height: 40px;
+  }
+  .mobile-hour-cell:hover { filter: brightness(1.3); }
+
+  .mobile-hour-cell .hour-label {
+    width: 42px;
+    font-size: 0.78rem;
+    font-weight: 700;
+    color: var(--text-muted);
+    flex-shrink: 0;
+  }
+
+  .mobile-hour-cell .clock-name {
+    font-size: 0.8rem;
+    font-weight: 600;
+    color: #fff;
+  }
+
+  .mobile-hour-cell.empty .clock-name { color: transparent; }
+
+  .mobile-palette {
+    margin-bottom: 0.75rem;
+  }
+
+  .mobile-palette-scroll {
+    display: flex;
+    gap: 4px;
+    overflow-x: auto;
+    padding-bottom: 4px;
+  }
+
+  .mobile-palette-scroll .clock-btn {
+    flex-shrink: 0;
+    width: auto;
+    padding: 0.4rem 0.7rem;
+    font-size: 0.75rem;
+  }
+
+  @media (max-width: 768px) {
+    .schedule-wrap { display: none; }
+    .mobile-schedule { display: block; }
+  }
 </style>
 {% endblock %}
 
 {% block content %}
+<!-- Desktop layout -->
 <div class="schedule-wrap">
   <div class="clock-palette">
     <h3>Clocks</h3>
@@ -164,7 +249,6 @@
   <div class="grid-container">
     <div class="schedule-grid" id="scheduleGrid">
       <div class="grid-header corner"></div>
-      <!-- Hour headers -->
       <div class="grid-header">12a</div>
       <div class="grid-header">1a</div>
       <div class="grid-header">2a</div>
@@ -192,11 +276,37 @@
     </div>
   </div>
 </div>
+
+<!-- Mobile layout -->
+<div class="mobile-schedule">
+  <div class="mobile-palette">
+    <div class="mobile-palette-scroll">
+      <button class="clock-btn clear-btn" data-clock-id="clear" onclick="selectClock(this, null, null)">
+        Clear
+      </button>
+      {% for clock in clocks %}
+      <button class="clock-btn" data-clock-id="{{ clock.id }}"
+              onclick="selectClock(this, {{ clock.id }}, '{{ clock.name|escapejs }}')">
+        {{ clock.name }}
+      </button>
+      {% endfor %}
+    </div>
+  </div>
+
+  <div class="day-picker" id="dayPicker"></div>
+  <div class="mobile-hours" id="mobileHours"></div>
+</div>
 {% endblock %}
 
 {% block extra_js %}
 <script>
 const DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+const HOUR_LABELS = [
+  '12:00a','1:00a','2:00a','3:00a','4:00a','5:00a',
+  '6:00a','7:00a','8:00a','9:00a','10:00a','11:00a',
+  '12:00p','1:00p','2:00p','3:00p','4:00p','5:00p',
+  '6:00p','7:00p','8:00p','9:00p','10:00p','11:00p',
+];
 
 const PALETTE = [
   '#2563eb', '#7c3aed', '#0891b2', '#059669', '#d97706',
@@ -207,12 +317,18 @@ const PALETTE = [
 
 let selectedClockId = null;
 let selectedClockName = null;
+let mobileDay = 0;
 
-// block ID lookup: cells[day][hour] = schedule block id (or null)
 const cells = {};
 for (let d = 0; d < 7; d++) {
   cells[d] = {};
   for (let h = 0; h < 24; h++) cells[d][h] = null;
+}
+
+// Store clock info per cell for mobile rendering
+const cellClocks = {};
+for (let d = 0; d < 7; d++) {
+  cellClocks[d] = {};
 }
 
 function clockColor(clockId) {
@@ -236,6 +352,7 @@ function selectClock(btn, id, name) {
   selectedClockName = name;
 }
 
+// --- Desktop grid ---
 function buildGrid() {
   const grid = document.getElementById('scheduleGrid');
 
@@ -268,16 +385,22 @@ function fillCell(cell, clockId, clockName, blockId) {
   const day = parseInt(cell.dataset.day);
   const hour = parseInt(cell.dataset.hour);
   cells[day][hour] = blockId;
+  cellClocks[day][hour] = { clockId, clockName };
   cell.dataset.blockId = blockId || '';
   cell.textContent = clockName;
   cell.style.backgroundColor = clockColor(clockId);
   cell.classList.remove('empty');
 }
 
+function clearCellData(day, hour) {
+  cells[day][hour] = null;
+  delete cellClocks[day][hour];
+}
+
 function clearCell(cell) {
   const day = parseInt(cell.dataset.day);
   const hour = parseInt(cell.dataset.hour);
-  cells[day][hour] = null;
+  clearCellData(day, hour);
   cell.dataset.blockId = '';
   cell.textContent = '';
   cell.style.backgroundColor = '';
@@ -292,7 +415,6 @@ function flashCell(cell) {
 
 async function onCellClick(day, hour, cell) {
   if (selectedClockId === null) {
-    // "Clear" mode
     onCellClear(day, hour, cell);
     return;
   }
@@ -313,8 +435,17 @@ async function onCellClick(day, hour, cell) {
   if (!resp.ok) return;
 
   const data = await resp.json();
-  fillCell(cell, data.clock_id, data.clock_name, data.id);
-  flashCell(cell);
+
+  // Update desktop cell
+  const desktopCell = getCell(day, hour);
+  if (desktopCell) fillCell(desktopCell, data.clock_id, data.clock_name, data.id);
+
+  // Update data for mobile
+  cells[day][hour] = data.id;
+  cellClocks[day][hour] = { clockId: data.clock_id, clockName: data.clock_name };
+  if (day === mobileDay) renderMobileHours();
+
+  if (cell) flashCell(cell);
 }
 
 async function onCellClear(day, hour, cell) {
@@ -328,21 +459,89 @@ async function onCellClear(day, hour, cell) {
 
   if (!resp.ok) return;
 
-  clearCell(cell);
-  flashCell(cell);
+  // Update desktop
+  const desktopCell = getCell(day, hour);
+  if (desktopCell) clearCell(desktopCell);
+
+  clearCellData(day, hour);
+  if (day === mobileDay) renderMobileHours();
+
+  if (cell) flashCell(cell);
 }
 
+// --- Mobile day view ---
+function buildDayPicker() {
+  const picker = document.getElementById('dayPicker');
+  DAYS.forEach((name, d) => {
+    const btn = document.createElement('button');
+    btn.className = 'day-picker-btn' + (d === mobileDay ? ' active' : '');
+    btn.textContent = name;
+    btn.addEventListener('click', () => {
+      mobileDay = d;
+      document.querySelectorAll('.day-picker-btn').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      renderMobileHours();
+    });
+    picker.appendChild(btn);
+  });
+}
+
+function renderMobileHours() {
+  const container = document.getElementById('mobileHours');
+  container.innerHTML = '';
+
+  for (let h = 0; h < 24; h++) {
+    const row = document.createElement('div');
+    row.className = 'mobile-hour-cell';
+
+    const info = cellClocks[mobileDay][h];
+    if (info) {
+      row.style.backgroundColor = clockColor(info.clockId);
+    } else {
+      row.classList.add('empty');
+    }
+
+    const label = document.createElement('span');
+    label.className = 'hour-label';
+    label.textContent = HOUR_LABELS[h];
+    row.appendChild(label);
+
+    const name = document.createElement('span');
+    name.className = 'clock-name';
+    name.textContent = info ? info.clockName : '';
+    row.appendChild(name);
+
+    row.addEventListener('click', () => {
+      if (selectedClockId === null) {
+        onCellClear(mobileDay, h, null);
+      } else {
+        onCellClick(mobileDay, h, null);
+      }
+    });
+
+    container.appendChild(row);
+  }
+}
+
+// --- Load schedule data ---
 async function loadSchedule() {
   const resp = await fetch('/api/schedule/');
   if (!resp.ok) return;
 
   const data = await resp.json();
   for (const block of data.blocks) {
-    const cell = getCell(block.day_of_week, block.start_hour);
-    if (cell) {
-      fillCell(cell, block.clock_id, block.clock_name, block.id);
+    const desktopCell = getCell(block.day_of_week, block.start_hour);
+    if (desktopCell) {
+      fillCell(desktopCell, block.clock_id, block.clock_name, block.id);
+    } else {
+      cells[block.day_of_week][block.start_hour] = block.id;
+      cellClocks[block.day_of_week][block.start_hour] = {
+        clockId: block.clock_id,
+        clockName: block.clock_name,
+      };
     }
   }
+  renderMobileHours();
 }
 
 // Color the palette buttons
@@ -355,6 +554,7 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   buildGrid();
+  buildDayPicker();
   loadSchedule();
 });
 </script>
