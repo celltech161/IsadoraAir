@@ -33,13 +33,20 @@ def parse_tags(path):
         info["bit_depth"] = getattr(audio.info, "bits_per_sample", None)
 
     def first(tag_names):
+        # mutagen's Vorbis __contains__ raises ValueError for non-Vorbis
+        # keys (e.g. ID3 "TIT2" against a FLAC); guard so a single bad
+        # key doesn't abort the whole tag lookup.
         for name in tag_names:
-            if name in audio:
+            try:
+                if name not in audio:
+                    continue
                 value = audio.get(name)
-                if isinstance(value, list) and value:
-                    return str(value[0])
-                if value is not None:
-                    return str(value)
+            except Exception:
+                continue
+            if isinstance(value, list) and value:
+                return str(value[0])
+            if value is not None:
+                return str(value)
         return None
 
     tags["title"] = first(["TIT2", "TITLE", "\xa9nam"])
