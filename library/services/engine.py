@@ -50,7 +50,7 @@ class PlaybackEngine:
         self.current_index = 0
         self.running = False
         self._position_timer = None
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
 
     def start(self):
         self.running = True
