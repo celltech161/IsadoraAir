@@ -328,8 +328,29 @@ class PlaybackEngine:
                         leading.started_at = time.time() - position
                         self._next_triggered = False
                         print(f"  Seek to {position:.1f}s")
+            elif cmd == "reload_audio_output":
+                self._apply_audio_output_device(self._resolve_studio_monitor_device())
         except Exception as exc:
             print(f"  Command error: {exc}")
+
+    def _apply_audio_output_device(self, device):
+        """Swap the alsasink output device live. alsasink's `device`
+        property is fixed once the element is in PAUSED/PLAYING, so
+        the pipeline drops to READY for the change. Brief audio
+        dropout (~tens of ms) while the device reopens."""
+        if not self.alsasink or not self.main_pipeline:
+            return False
+        try:
+            current = self.alsasink.get_property("device")
+        except Exception:
+            current = None
+        if current == device:
+            return False
+        print(f"  Switching alsasink device {current} -> {device}")
+        self.main_pipeline.set_state(Gst.State.READY)
+        self.alsasink.set_property("device", device)
+        self.main_pipeline.set_state(Gst.State.PLAYING)
+        return True
 
     def _reload_queue_if_changed(self):
         if not self.current_log:
