@@ -223,10 +223,13 @@ class Track(models.Model):
 
 
 # ---------------------------------------------------------------
-# Rotation - weighted category pools
+# Rotation - ordered hour template of Category slots
 # ---------------------------------------------------------------
 
 class Rotation(models.Model):
+    """Ordered list of Category slots that fills an hour. The log
+    builder walks slots in position order, picking one Track per slot
+    from that slot's Category (respecting recency)."""
     name = models.CharField(max_length=100, unique=True)
     description = models.TextField(blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -240,29 +243,31 @@ class Rotation(models.Model):
 
 
 class RotationSlot(models.Model):
-    """One weighted category within a Rotation's pool. The rotation
-    walker (Phase 3 build_log) picks a Category from here according to
-    weight, then a Track from that Category."""
+    """One position within a Rotation. `position` is maintained by the
+    drag-to-sort admin inline — don't set it by hand."""
     rotation = models.ForeignKey(Rotation, on_delete=models.CASCADE, related_name="slots")
+    position = models.PositiveIntegerField(default=0, db_index=True)
     category = models.ForeignKey(Category, on_delete=models.PROTECT, related_name="rotation_slots")
-    weight = models.PositiveSmallIntegerField(default=1)
-    active = models.BooleanField(default=True)
 
     class Meta:
-        ordering = ["rotation", "-weight"]
-        unique_together = [("rotation", "category")]
+        ordering = ["rotation", "position"]
+        unique_together = [("rotation", "position")]
 
     def __str__(self):
-        return f"{self.rotation} / {self.category} (w={self.weight})"
+        return f"{self.rotation} #{self.position} -> {self.category}"
 
 
 # ---------------------------------------------------------------
-# Clock - hour-long programming templates
+# Playlist - hand-curated ordered list of Tracks
 # ---------------------------------------------------------------
 
-class Clock(models.Model):
+class Playlist(models.Model):
+    """Curated ordered list of specific Tracks. The log builder copies
+    items into LogItems in position order, no recency or pool picking."""
     name = models.CharField(max_length=100, unique=True)
     description = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         ordering = ["name"]
@@ -271,38 +276,40 @@ class Clock(models.Model):
         return self.name
 
 
-class ClockSlot(models.Model):
-    """One position within a Clock's hour. Each slot points to a
-    Rotation - the rotation walker picks a Category (by weight) then a
-    Track from that Category to fill this slot at build-log time."""
-    clock = models.ForeignKey(Clock, on_delete=models.CASCADE, related_name="slots")
-    position = models.PositiveSmallIntegerField()  # order within the hour
-    rotation = models.ForeignKey(Rotation, on_delete=models.PROTECT, related_name="clock_slots")
+class PlaylistItem(models.Model):
+    """One position within a Playlist. `position` is maintained by the
+    drag-to-sort admin inline — don't set it by hand."""
+    playlist = models.ForeignKey(Playlist, on_delete=models.CASCADE, related_name="items")
+    position = models.PositiveIntegerField(default=0, db_index=True)
+    track = models.ForeignKey(Track, on_delete=models.PROTECT, related_name="playlist_items")
 
     class Meta:
-        ordering = ["clock", "position"]
-        unique_together = [("clock", "position")]
+        ordering = ["playlist", "position"]
+        unique_together = [("playlist", "position")]
 
     def __str__(self):
-        return f"{self.clock} #{self.position} -> {self.rotation}"
+        return f"{self.playlist} #{self.position} -> {self.track}"
 
 
 # ---------------------------------------------------------------
-# ScheduleBlock - maps Clocks onto real time
+# ScheduleBlock - maps a Rotation or Playlist onto real time
 # ---------------------------------------------------------------
 
 class ScheduleBlock(models.Model):
-    """Maps a Clock template onto a real time range, either as a
-    recurring weekly pattern (day_of_week set) or a one-off override for
-    a specific date (specific_date set). Exactly one of the two must be
-    set - never both, never neither.
+    """Maps either a Rotation (algorithmic, category slots) or a
+    Playlist (curated tracks) onto a real time range.
 
-    Precedence is implicit, not an explicit priority field: when
-    build_log resolves what clock applies to a given date/time, a
-    ScheduleBlock with specific_date matching that date always wins over
-    one that only matches via day_of_week. This keeps "holiday special"
-    or "remote broadcast Tuesday" overrides simple to reason about
-    without a separate priority ranking to maintain."""
+    Time matching: either recurring weekly pattern (day_of_week set) or
+    one-off override for a specific date (specific_date set). Exactly
+    one of the two must be set — never both, never neither.
+
+    Content: exactly one of (rotation, playlist) must be set — also
+    enforced by check constraint.
+
+    Precedence is implicit, not an explicit priority field: a
+    ScheduleBlock with specific_date matching that date always wins
+    over a recurring day_of_week match. Holiday specials and one-off
+    remote broadcasts just override transparently."""
     DAY_CHOICES = [
         (0, "Monday"), (1, "Tuesday"), (2, "Wednesday"), (3, "Thursday"),
         (4, "Friday"), (5, "Saturday"), (6, "Sunday"),
@@ -312,7 +319,14 @@ class ScheduleBlock(models.Model):
     specific_date = models.DateField(null=True, blank=True)
     start_time = models.TimeField()
     end_time = models.TimeField()
-    clock = models.ForeignKey(Clock, on_delete=models.PROTECT, related_name="schedule_blocks")
+    rotation = models.ForeignKey(
+        Rotation, on_delete=models.PROTECT,
+        null=True, blank=True, related_name="schedule_blocks",
+    )
+    playlist = models.ForeignKey(
+        Playlist, on_delete=models.PROTECT,
+        null=True, blank=True, related_name="schedule_blocks",
+    )
 
     class Meta:
         ordering = ["specific_date", "day_of_week", "start_time"]
@@ -324,11 +338,30 @@ class ScheduleBlock(models.Model):
                 ),
                 name="scheduleblock_exactly_one_of_day_or_date",
             ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(rotation__isnull=False, playlist__isnull=True)
+                    | models.Q(rotation__isnull=True, playlist__isnull=False)
+                ),
+                name="scheduleblock_exactly_one_of_rotation_or_playlist",
+            ),
         ]
+
+    @property
+    def content(self):
+        return self.rotation or self.playlist
+
+    @property
+    def content_kind(self):
+        if self.rotation_id:
+            return "rotation"
+        if self.playlist_id:
+            return "playlist"
+        return None
 
     def __str__(self):
         when = self.specific_date if self.specific_date is not None else self.get_day_of_week_display()
-        return f"{when} {self.start_time}-{self.end_time}: {self.clock}"
+        return f"{when} {self.start_time}-{self.end_time}: {self.content}"
 
 
 # ---------------------------------------------------------------

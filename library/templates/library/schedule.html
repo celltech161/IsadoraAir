@@ -13,8 +13,8 @@
     max-width: 100%;
   }
 
-  /* --- Clock palette --- */
-  .clock-palette {
+  /* --- Rotation palette --- */
+  .rotation-palette {
     flex-shrink: 0;
     width: 160px;
     display: flex;
@@ -22,7 +22,7 @@
     gap: 4px;
   }
 
-  .clock-palette h3 {
+  .rotation-palette h3 {
     font-size: 0.8rem;
     text-transform: uppercase;
     letter-spacing: 1px;
@@ -30,7 +30,7 @@
     margin-bottom: 0.25rem;
   }
 
-  .clock-btn {
+  .rotation-btn {
     display: block;
     width: 100%;
     padding: 0.45rem 0.6rem;
@@ -45,20 +45,20 @@
     opacity: 0.85;
   }
 
-  .clock-btn:hover { opacity: 1; }
-  .clock-btn.selected {
+  .rotation-btn:hover { opacity: 1; }
+  .rotation-btn.selected {
     border-color: #fff;
     opacity: 1;
     box-shadow: 0 0 8px rgba(255,255,255,0.25);
   }
 
-  .clock-btn.clear-btn {
+  .rotation-btn.clear-btn {
     background: rgba(100, 100, 100, 0.4);
     border: 2px dashed var(--border-subtle);
     color: var(--text-muted);
     font-weight: 500;
   }
-  .clock-btn.clear-btn.selected {
+  .rotation-btn.clear-btn.selected {
     border-color: var(--danger);
     color: var(--danger);
   }
@@ -219,13 +219,13 @@
     flex-shrink: 0;
   }
 
-  .mobile-hour-cell .clock-name {
+  .mobile-hour-cell .rotation-name {
     font-size: 0.8rem;
     font-weight: 600;
     color: #fff;
   }
 
-  .mobile-hour-cell.empty .clock-name { color: transparent; }
+  .mobile-hour-cell.empty .rotation-name { color: transparent; }
 
   .mobile-palette {
     margin-bottom: 0.75rem;
@@ -238,7 +238,7 @@
     padding-bottom: 4px;
   }
 
-  .mobile-palette-scroll .clock-btn {
+  .mobile-palette-scroll .rotation-btn {
     flex-shrink: 0;
     width: auto;
     padding: 0.4rem 0.7rem;
@@ -255,18 +255,18 @@
 {% block content %}
 <!-- Desktop layout -->
 <div class="schedule-wrap">
-  <div class="clock-palette">
-    <h3>Clocks</h3>
-    <button class="clock-btn clear-btn" data-clock-id="clear" onclick="selectClock(this, null, null)">
+  <div class="rotation-palette">
+    <h3>Rotations</h3>
+    <button class="rotation-btn clear-btn" data-rotation-id="clear" onclick="selectRotation(this, null, null)">
       Clear
     </button>
-    {% for clock in clocks %}
-    <button class="clock-btn" data-clock-id="{{ clock.id }}"
-            onclick="selectClock(this, {{ clock.id }}, '{{ clock.name|escapejs }}')">
-      {{ clock.name }}
+    {% for rotation in rotations %}
+    <button class="rotation-btn" data-rotation-id="{{ rotation.id }}"
+            onclick="selectRotation(this, {{ rotation.id }}, '{{ rotation.name|escapejs }}')">
+      {{ rotation.name }}
     </button>
     {% empty %}
-    <p class="palette-empty">No clocks configured. Add clocks in the <a href="/admin/library/clock/" style="color:var(--accent)">admin</a>.</p>
+    <p class="palette-empty">No rotations configured. Add rotations in the <a href="/admin/library/rotation/" style="color:var(--accent)">admin</a>.</p>
     {% endfor %}
   </div>
 
@@ -305,13 +305,13 @@
 <div class="mobile-schedule">
   <div class="mobile-palette">
     <div class="mobile-palette-scroll">
-      <button class="clock-btn clear-btn" data-clock-id="clear" onclick="selectClock(this, null, null)">
+      <button class="rotation-btn clear-btn" data-rotation-id="clear" onclick="selectRotation(this, null, null)">
         Clear
       </button>
-      {% for clock in clocks %}
-      <button class="clock-btn" data-clock-id="{{ clock.id }}"
-              onclick="selectClock(this, {{ clock.id }}, '{{ clock.name|escapejs }}')">
-        {{ clock.name }}
+      {% for rotation in rotations %}
+      <button class="rotation-btn" data-rotation-id="{{ rotation.id }}"
+              onclick="selectRotation(this, {{ rotation.id }}, '{{ rotation.name|escapejs }}')">
+        {{ rotation.name }}
       </button>
       {% endfor %}
     </div>
@@ -339,8 +339,8 @@ const PALETTE = [
   '#be185d',
 ];
 
-let selectedClockId = null;
-let selectedClockName = null;
+let selectedRotationId = null;
+let selectedRotationName = null;
 let mobileDay = 0;
 
 const cells = {};
@@ -349,14 +349,14 @@ for (let d = 0; d < 7; d++) {
   for (let h = 0; h < 24; h++) cells[d][h] = null;
 }
 
-// Store clock info per cell for mobile rendering
-const cellClocks = {};
+// Store rotation info per cell for mobile rendering
+const cellRotations = {};
 for (let d = 0; d < 7; d++) {
-  cellClocks[d] = {};
+  cellRotations[d] = {};
 }
 
-function clockColor(clockId) {
-  return PALETTE[clockId % PALETTE.length];
+function rotationColor(rotationId) {
+  return PALETTE[rotationId % PALETTE.length];
 }
 
 function getCookie(name) {
@@ -369,11 +369,11 @@ function getCookie(name) {
   return val;
 }
 
-function selectClock(btn, id, name) {
-  document.querySelectorAll('.clock-btn').forEach(b => b.classList.remove('selected'));
+function selectRotation(btn, id, name) {
+  document.querySelectorAll('.rotation-btn').forEach(b => b.classList.remove('selected'));
   btn.classList.add('selected');
-  selectedClockId = id;
-  selectedClockName = name;
+  selectedRotationId = id;
+  selectedRotationName = name;
 }
 
 // --- Desktop grid ---
@@ -405,20 +405,20 @@ function getCell(day, hour) {
   return document.querySelector(`.grid-cell[data-day="${day}"][data-hour="${hour}"]`);
 }
 
-function fillCell(cell, clockId, clockName, blockId) {
+function fillCell(cell, rotationId, rotationName, blockId) {
   const day = parseInt(cell.dataset.day);
   const hour = parseInt(cell.dataset.hour);
   cells[day][hour] = blockId;
-  cellClocks[day][hour] = { clockId, clockName };
+  cellRotations[day][hour] = { rotationId, rotationName };
   cell.dataset.blockId = blockId || '';
-  cell.textContent = clockName;
-  cell.style.backgroundColor = clockColor(clockId);
+  cell.textContent = rotationName;
+  cell.style.backgroundColor = rotationColor(rotationId);
   cell.classList.remove('empty');
 }
 
 function clearCellData(day, hour) {
   cells[day][hour] = null;
-  delete cellClocks[day][hour];
+  delete cellRotations[day][hour];
 }
 
 function clearCell(cell) {
@@ -438,7 +438,7 @@ function flashCell(cell) {
 }
 
 async function onCellClick(day, hour, cell) {
-  if (selectedClockId === null) {
+  if (selectedRotationId === null) {
     onCellClear(day, hour, cell);
     return;
   }
@@ -452,7 +452,7 @@ async function onCellClick(day, hour, cell) {
     body: JSON.stringify({
       day_of_week: day,
       hour: hour,
-      clock_id: selectedClockId,
+      rotation_id: selectedRotationId,
     }),
   });
 
@@ -462,11 +462,11 @@ async function onCellClick(day, hour, cell) {
 
   // Update desktop cell
   const desktopCell = getCell(day, hour);
-  if (desktopCell) fillCell(desktopCell, data.clock_id, data.clock_name, data.id);
+  if (desktopCell) fillCell(desktopCell, data.content_id, data.content_name, data.id);
 
   // Update data for mobile
   cells[day][hour] = data.id;
-  cellClocks[day][hour] = { clockId: data.clock_id, clockName: data.clock_name };
+  cellRotations[day][hour] = { rotationId: data.content_id, rotationName: data.content_name };
   if (day === mobileDay) renderMobileHours();
 
   if (cell) flashCell(cell);
@@ -518,9 +518,9 @@ function renderMobileHours() {
     const row = document.createElement('div');
     row.className = 'mobile-hour-cell';
 
-    const info = cellClocks[mobileDay][h];
+    const info = cellRotations[mobileDay][h];
     if (info) {
-      row.style.backgroundColor = clockColor(info.clockId);
+      row.style.backgroundColor = rotationColor(info.rotationId);
     } else {
       row.classList.add('empty');
     }
@@ -531,12 +531,12 @@ function renderMobileHours() {
     row.appendChild(label);
 
     const name = document.createElement('span');
-    name.className = 'clock-name';
-    name.textContent = info ? info.clockName : '';
+    name.className = 'rotation-name';
+    name.textContent = info ? info.rotationName : '';
     row.appendChild(name);
 
     row.addEventListener('click', () => {
-      if (selectedClockId === null) {
+      if (selectedRotationId === null) {
         onCellClear(mobileDay, h, null);
       } else {
         onCellClick(mobileDay, h, null);
@@ -556,12 +556,12 @@ async function loadSchedule() {
   for (const block of data.blocks) {
     const desktopCell = getCell(block.day_of_week, block.start_hour);
     if (desktopCell) {
-      fillCell(desktopCell, block.clock_id, block.clock_name, block.id);
+      fillCell(desktopCell, block.content_id, block.content_name, block.id);
     } else {
       cells[block.day_of_week][block.start_hour] = block.id;
-      cellClocks[block.day_of_week][block.start_hour] = {
-        clockId: block.clock_id,
-        clockName: block.clock_name,
+      cellRotations[block.day_of_week][block.start_hour] = {
+        rotationId: block.content_id,
+        rotationName: block.content_name,
       };
     }
   }
@@ -570,10 +570,10 @@ async function loadSchedule() {
 
 // Color the palette buttons
 document.addEventListener('DOMContentLoaded', () => {
-  document.querySelectorAll('.clock-btn[data-clock-id]').forEach(btn => {
-    const id = btn.dataset.clockId;
+  document.querySelectorAll('.rotation-btn[data-rotation-id]').forEach(btn => {
+    const id = btn.dataset.rotationId;
     if (id && id !== 'clear') {
-      btn.style.backgroundColor = clockColor(parseInt(id));
+      btn.style.backgroundColor = rotationColor(parseInt(id));
     }
   });
 

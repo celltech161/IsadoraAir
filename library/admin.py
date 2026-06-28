@@ -1,3 +1,4 @@
+from adminsortable2.admin import SortableAdminBase, SortableTabularInline
 from django.contrib import admin
 from django.db.models import Count
 from django.http import HttpResponseRedirect
@@ -9,10 +10,10 @@ from .models import (
     Artist,
     RecencyConfig,
     Category,
-    Clock,
-    ClockSlot,
     Holiday,
     LogItem,
+    Playlist,
+    PlaylistItem,
     PlaylistLog,
     Rotation,
     RotationSlot,
@@ -88,32 +89,53 @@ class TrackAdmin(admin.ModelAdmin):
     actions = [mark_ready2air, mark_not_ready2air]
 
 
-class RotationSlotInline(admin.TabularInline):
+class RotationSlotInline(SortableTabularInline):
     model = RotationSlot
     extra = 1
+    fields = ["category"]
+    autocomplete_fields = ["category"]
 
 
 @admin.register(Rotation)
-class RotationAdmin(admin.ModelAdmin):
-    list_display = ["name", "description"]
+class RotationAdmin(SortableAdminBase, admin.ModelAdmin):
+    list_display = ["name", "description", "slot_count"]
+    search_fields = ["name"]
     inlines = [RotationSlotInline]
 
+    def get_queryset(self, request):
+        return super().get_queryset(request).annotate(_slot_count=Count("slots"))
 
-class ClockSlotInline(admin.TabularInline):
-    model = ClockSlot
+    @admin.display(description="Slots", ordering="_slot_count")
+    def slot_count(self, obj):
+        return obj._slot_count
+
+
+class PlaylistItemInline(SortableTabularInline):
+    model = PlaylistItem
     extra = 1
+    fields = ["track"]
+    autocomplete_fields = ["track"]
 
 
-@admin.register(Clock)
-class ClockAdmin(admin.ModelAdmin):
-    list_display = ["name", "description"]
-    inlines = [ClockSlotInline]
+@admin.register(Playlist)
+class PlaylistAdmin(SortableAdminBase, admin.ModelAdmin):
+    list_display = ["name", "description", "item_count"]
+    search_fields = ["name"]
+    inlines = [PlaylistItemInline]
+
+    def get_queryset(self, request):
+        return super().get_queryset(request).annotate(_item_count=Count("items"))
+
+    @admin.display(description="Items", ordering="_item_count")
+    def item_count(self, obj):
+        return obj._item_count
 
 
 @admin.register(ScheduleBlock)
 class ScheduleBlockAdmin(admin.ModelAdmin):
-    list_display = ["__str__", "clock", "start_time", "end_time"]
-    list_filter = ["day_of_week", "clock"]
+    list_display = ["__str__", "rotation", "playlist", "start_time", "end_time"]
+    list_filter = ["day_of_week", "rotation", "playlist"]
+    autocomplete_fields = ["rotation", "playlist"]
 
 
 class LogItemInline(admin.TabularInline):

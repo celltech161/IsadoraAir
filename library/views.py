@@ -14,7 +14,7 @@ from django.utils import timezone
 
 from django.shortcuts import get_object_or_404
 
-from .models import Artist, Album, Category, Clock, Genre, LogItem, PlaylistLog, ScheduleBlock, Track
+from .models import Artist, Album, Category, Genre, LogItem, Playlist, PlaylistLog, Rotation, ScheduleBlock, Track
 from .services.log_builder import build_hour_log
 
 
@@ -25,8 +25,22 @@ def dashboard_page(request):
 
 @ensure_csrf_cookie
 def schedule_page(request):
-    clocks = Clock.objects.all().order_by("name")
-    return render(request, "library/schedule.html", {"clocks": clocks})
+    rotations = Rotation.objects.all().order_by("name")
+    return render(request, "library/schedule.html", {"rotations": rotations})
+
+
+def _block_to_dict(b):
+    """Serialize a ScheduleBlock, including either rotation or playlist details."""
+    content_kind = b.content_kind
+    content = b.content
+    return {
+        "id": b.id,
+        "day_of_week": b.day_of_week,
+        "start_hour": b.start_time.hour,
+        "content_kind": content_kind,
+        "content_id": content.id if content else None,
+        "content_name": content.name if content else None,
+    }
 
 
 @require_http_methods(["GET", "POST"])
@@ -35,20 +49,10 @@ def api_schedule_list(request):
         blocks = (
             ScheduleBlock.objects
             .filter(day_of_week__isnull=False)
-            .select_related("clock")
+            .select_related("rotation", "playlist")
             .order_by("day_of_week", "start_time")
         )
-        data = [
-            {
-                "id": b.id,
-                "day_of_week": b.day_of_week,
-                "start_hour": b.start_time.hour,
-                "clock_id": b.clock_id,
-                "clock_name": b.clock.name,
-            }
-            for b in blocks
-        ]
-        return JsonResponse({"blocks": data})
+        return JsonResponse({"blocks": [_block_to_dict(b) for b in blocks]})
 
     try:
         body = json.loads(request.body)
@@ -57,39 +61,46 @@ def api_schedule_list(request):
 
     day_of_week = body.get("day_of_week")
     hour = body.get("hour")
-    clock_id = body.get("clock_id")
+    # Accept either {"rotation_id": ...} or {"playlist_id": ...}. The
+    # schedule grid UI only writes rotations right now; playlist-backed
+    # blocks come from admin and are read-only via this endpoint.
+    rotation_id = body.get("rotation_id")
+    playlist_id = body.get("playlist_id")
 
-    if day_of_week is None or hour is None or clock_id is None:
-        return JsonResponse({"error": "day_of_week, hour, and clock_id are required"}, status=400)
+    if day_of_week is None or hour is None:
+        return JsonResponse({"error": "day_of_week and hour are required"}, status=400)
+    if (rotation_id is None) == (playlist_id is None):
+        return JsonResponse({"error": "exactly one of rotation_id or playlist_id is required"}, status=400)
 
     if not (0 <= day_of_week <= 6):
         return JsonResponse({"error": "day_of_week must be 0-6"}, status=400)
     if not (0 <= hour <= 23):
         return JsonResponse({"error": "hour must be 0-23"}, status=400)
 
-    try:
-        clock = Clock.objects.get(id=clock_id)
-    except Clock.DoesNotExist:
-        return JsonResponse({"error": "Clock not found"}, status=404)
+    defaults = {"end_time": time((hour + 1) % 24, 0)}
+    if rotation_id is not None:
+        try:
+            defaults["rotation"] = Rotation.objects.get(id=rotation_id)
+        except Rotation.DoesNotExist:
+            return JsonResponse({"error": "Rotation not found"}, status=404)
+        defaults["playlist"] = None
+    else:
+        try:
+            defaults["playlist"] = Playlist.objects.get(id=playlist_id)
+        except Playlist.DoesNotExist:
+            return JsonResponse({"error": "Playlist not found"}, status=404)
+        defaults["rotation"] = None
 
     block, created = ScheduleBlock.objects.update_or_create(
         day_of_week=day_of_week,
         start_time=time(hour, 0),
         specific_date=None,
-        defaults={
-            "end_time": time((hour + 1) % 24, 0),
-            "clock": clock,
-        },
+        defaults=defaults,
     )
 
-    return JsonResponse({
-        "id": block.id,
-        "day_of_week": block.day_of_week,
-        "start_hour": block.start_time.hour,
-        "clock_id": block.clock_id,
-        "clock_name": clock.name,
-        "created": created,
-    })
+    payload = _block_to_dict(block)
+    payload["created"] = created
+    return JsonResponse(payload)
 
 
 @require_http_methods(["DELETE"])
@@ -99,10 +110,17 @@ def api_schedule_delete(request, pk):
 
 
 @require_http_methods(["GET"])
-def api_clock_list(request):
-    clocks = Clock.objects.all().order_by("name")
-    data = [{"id": c.id, "name": c.name} for c in clocks]
-    return JsonResponse({"clocks": data})
+def api_rotation_list(request):
+    rotations = Rotation.objects.all().order_by("name")
+    data = [{"id": r.id, "name": r.name} for r in rotations]
+    return JsonResponse({"rotations": data})
+
+
+@require_http_methods(["GET"])
+def api_playlist_list(request):
+    playlists = Playlist.objects.all().order_by("name")
+    data = [{"id": p.id, "name": p.name} for p in playlists]
+    return JsonResponse({"playlists": data})
 
 
 def library_page(request):

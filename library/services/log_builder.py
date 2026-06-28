@@ -9,50 +9,33 @@ from library.models import (
     LogItem,
     PlaylistLog,
     RecencyConfig,
-    RotationSlot,
     ScheduleBlock,
     Track,
 )
 
 
-def resolve_clock(target_date, hour):
+def resolve_schedule_block(target_date, hour):
+    """Find the ScheduleBlock that applies to a given date+hour. A
+    specific_date match always beats a recurring day_of_week match."""
     t = time(hour, 0)
 
     block = (
         ScheduleBlock.objects
         .filter(specific_date=target_date, start_time=t)
-        .select_related("clock")
+        .select_related("rotation", "playlist")
         .first()
     )
     if block:
-        return block.clock
+        return block
 
     dow = target_date.weekday()
     block = (
         ScheduleBlock.objects
         .filter(day_of_week=dow, start_time=t, specific_date__isnull=True)
-        .select_related("clock")
+        .select_related("rotation", "playlist")
         .first()
     )
-    if block:
-        return block.clock
-
-    return None
-
-
-def weighted_pick(slots):
-    if not slots:
-        return None
-    total = sum(s.weight for s in slots)
-    if total <= 0:
-        return random.choice(slots)
-    r = random.uniform(0, total)
-    cumulative = 0
-    for slot in slots:
-        cumulative += slot.weight
-        if r <= cumulative:
-            return slot
-    return slots[-1]
+    return block
 
 
 def get_separation(category, recency_cfg):
@@ -189,16 +172,10 @@ def pick_track(category, exclude_track_ids, exclude_artist_ids,
     return qs.order_by("?").first()
 
 
-def build_hour_log(target_date, hour):
-    clock = resolve_clock(target_date, hour)
-    if clock is None:
-        return None, "No clock assigned for this hour."
-
-    clock_slots = list(
-        clock.slots.select_related("rotation").order_by("position")
-    )
-    if not clock_slots:
-        return None, f"Clock '{clock.name}' has no slots."
+def _build_from_rotation(target_date, hour, rotation):
+    slots = list(rotation.slots.select_related("category").order_by("position"))
+    if not slots:
+        return None, f"Rotation '{rotation.name}' has no slots."
 
     recency_cfg = RecencyConfig.load()
     target_datetime = timezone.make_aware(
@@ -210,17 +187,8 @@ def build_hour_log(target_date, hour):
     picked_artist_ids = []
     accumulated_seconds = 0.0
 
-    for clock_slot in clock_slots:
-        rotation = clock_slot.rotation
-        active_slots = list(
-            rotation.slots.filter(active=True).select_related("category")
-        )
-        if not active_slots:
-            continue
-
-        rot_slot = weighted_pick(active_slots)
-        category = rot_slot.category
-
+    for slot in slots:
+        category = slot.category
         artist_sep, title_sep = get_separation(category, recency_cfg)
 
         exclude_track_ids, exclude_artist_ids = get_recent_exclusions(
@@ -255,6 +223,40 @@ def build_hour_log(target_date, hour):
         if accumulated_seconds >= 3600:
             break
 
+    return _persist_log(target_date, hour, picks)
+
+
+def _build_from_playlist(target_date, hour, playlist):
+    items = list(
+        playlist.items
+        .select_related("track", "track__category")
+        .order_by("position")
+    )
+    if not items:
+        return None, f"Playlist '{playlist.name}' has no items."
+
+    target_datetime = timezone.make_aware(
+        datetime.combine(target_date, time(hour, 0))
+    )
+
+    picks = []
+    accumulated_seconds = 0.0
+    for item in items:
+        track = item.track
+        track_duration = track.next_start_seconds or track.duration_seconds or 0
+        scheduled_time = target_datetime + timedelta(seconds=accumulated_seconds)
+        picks.append({
+            "position": len(picks),
+            "scheduled_time": scheduled_time,
+            "track": track,
+            "category": track.category,
+        })
+        accumulated_seconds += track_duration
+
+    return _persist_log(target_date, hour, picks)
+
+
+def _persist_log(target_date, hour, picks):
     PlaylistLog.objects.filter(date=target_date, hour=hour).delete()
 
     log = PlaylistLog.objects.create(
@@ -263,15 +265,28 @@ def build_hour_log(target_date, hour):
         status="draft",
     )
 
-    log_items = []
-    for pick in picks:
-        log_items.append(LogItem(
+    log_items = [
+        LogItem(
             playlist_log=log,
             position=pick["position"],
             scheduled_time=pick["scheduled_time"],
             track=pick["track"],
             category=pick["category"],
-        ))
+        )
+        for pick in picks
+    ]
     LogItem.objects.bulk_create(log_items)
-
     return log, None
+
+
+def build_hour_log(target_date, hour):
+    block = resolve_schedule_block(target_date, hour)
+    if block is None:
+        return None, "No schedule block for this hour."
+
+    if block.playlist_id:
+        return _build_from_playlist(target_date, hour, block.playlist)
+    if block.rotation_id:
+        return _build_from_rotation(target_date, hour, block.rotation)
+
+    return None, "ScheduleBlock has neither rotation nor playlist."
