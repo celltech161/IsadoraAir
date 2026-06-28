@@ -17,7 +17,11 @@ django.setup()
 
 from django.db import close_old_connections
 from django.utils import timezone
+from hardware.models import AudioOutput
 from library.models import LogItem, PlaylistLog, Track
+
+STUDIO_MONITOR_NAME = "Studio Monitor"
+STUDIO_MONITOR_FALLBACK_DEVICE = "plughw:2,0"
 
 STATE_PATH = Path("/run/isadoraair/engine_state.json")
 CMD_PATH = Path("/run/isadoraair/engine_cmd.json")
@@ -100,12 +104,29 @@ class PlaybackEngine:
         self.loop.quit()
         return GLib.SOURCE_REMOVE
 
+    def _resolve_studio_monitor_device(self):
+        try:
+            configured = (
+                AudioOutput.objects
+                .filter(name=STUDIO_MONITOR_NAME)
+                .values_list("device", flat=True)
+                .first()
+            )
+        except Exception as exc:
+            print(f"  Failed to read AudioOutput config ({exc}); falling back to {STUDIO_MONITOR_FALLBACK_DEVICE}")
+            return STUDIO_MONITOR_FALLBACK_DEVICE
+        if not configured:
+            print(f"  AudioOutput '{STUDIO_MONITOR_NAME}' has no device set; falling back to {STUDIO_MONITOR_FALLBACK_DEVICE}")
+            return STUDIO_MONITOR_FALLBACK_DEVICE
+        print(f"  AudioOutput '{STUDIO_MONITOR_NAME}' -> {configured}")
+        return configured
+
     def _build_main_pipeline(self):
         self.main_pipeline = Gst.Pipeline.new("isadoraair")
 
         self.mixer = Gst.ElementFactory.make("audiomixer", "mixer")
         self.alsasink = Gst.ElementFactory.make("alsasink", "output")
-        self.alsasink.set_property("device", "plughw:1,0")
+        self.alsasink.set_property("device", self._resolve_studio_monitor_device())
 
         convert = Gst.ElementFactory.make("audioconvert", "outconvert")
         resample = Gst.ElementFactory.make("audioresample", "outresample")
