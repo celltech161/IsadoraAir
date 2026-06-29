@@ -250,7 +250,11 @@ class RotationSlot(models.Model):
     category = models.ForeignKey(Category, on_delete=models.PROTECT, related_name="rotation_slots")
 
     class Meta:
-        ordering = ["rotation", "position"]
+        # ordering[0] must be the per-parent position field, not the
+        # parent FK — django-admin-sortable2 reads ordering[0] to find
+        # the sort field. The parent rotation is implicit when an
+        # inline filters by its parent.
+        ordering = ["position"]
         unique_together = [("rotation", "position")]
 
     def __str__(self):
@@ -284,7 +288,8 @@ class PlaylistItem(models.Model):
     track = models.ForeignKey(Track, on_delete=models.PROTECT, related_name="playlist_items")
 
     class Meta:
-        ordering = ["playlist", "position"]
+        # see RotationSlot.Meta.ordering — same reason
+        ordering = ["position"]
         unique_together = [("playlist", "position")]
 
     def __str__(self):
