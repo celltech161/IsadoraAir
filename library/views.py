@@ -661,8 +661,6 @@ def api_log_item_swap(request, item_id):
 @require_http_methods(["POST"])
 def api_log_reorder(request, pk):
     log = get_object_or_404(PlaylistLog, pk=pk)
-    if log.status != "draft":
-        return JsonResponse({"error": "Cannot modify an approved log"}, status=400)
 
     try:
         body = json.loads(request.body)
@@ -673,9 +671,32 @@ def api_log_reorder(request, pk):
     if not order or not isinstance(order, list):
         return JsonResponse({"error": "order (list of item IDs) is required"}, status=400)
 
-    items_by_id = {item.id: item for item in log.items.all()}
-    ordered = [items_by_id[i] for i in order if i in items_by_id]
-    _reposition_items(ordered)
+    all_items = list(log.items.order_by("position"))
+    items_by_id = {item.id: item for item in all_items}
+    reordered = [items_by_id[i] for i in order if i in items_by_id]
+    if not reordered:
+        return JsonResponse({"error": "No matching items found"}, status=400)
+
+    # `order` may only cover part of the log (e.g. the dashboard only
+    # sends the currently-visible "coming up" slice, not the whole
+    # hour). Splice the reordered slice back into the same span of
+    # positions it came from — items before that span (already played
+    # or claimed by a deck) and after it (further out in the queue than
+    # what's currently rendered) both keep their place. Anything inside
+    # the span that wasn't in `order` (shouldn't normally happen) rides
+    # along right after the reordered items rather than being dropped.
+    reordered_ids = {item.id for item in reordered}
+    positions = [item.position for item in all_items if item.id in reordered_ids]
+    start, end = min(positions), max(positions)
+
+    before = [item for item in all_items if item.position < start]
+    after = [item for item in all_items if item.position > end]
+    stragglers = [
+        item for item in all_items
+        if start <= item.position <= end and item.id not in reordered_ids
+    ]
+
+    _reposition_items(before + reordered + stragglers + after)
 
     return JsonResponse(_log_to_dict(log))
 

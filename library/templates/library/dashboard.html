@@ -117,6 +117,7 @@
   .transport-badge.STOPPED { background: rgba(249, 115, 115, 0.15); color: var(--danger); }
   .transport-badge.OFFLINE { background: rgba(148, 163, 184, 0.15); color: var(--text-muted); }
   .transport-badge.STALE   { background: rgba(217, 119, 6, 0.2); color: #d97706; }
+  .transport-badge.UPNEXT  { background: rgba(59, 130, 246, 0.15); color: #3b82f6; }
 
   .np-meta {
     margin-bottom: 0.6rem;
@@ -262,81 +263,59 @@
     margin-bottom: 0.6rem;
   }
 
-  .queue-row {
-    display: flex;
-    gap: 0.6rem;
+  .queue-table-wrap {
     overflow-x: auto;
-    padding-bottom: 0.4rem;
-  }
-
-  .queue-item {
-    display: flex;
-    flex-direction: column;
-    gap: 0.2rem;
-    padding: 0.5rem 0.65rem;
     border-radius: 8px;
-    background: rgba(148, 163, 184, 0.06);
-    font-size: 0.8rem;
-    flex-shrink: 0;
-    width: 170px;
-    transition: background 0.1s;
+    border: 1px solid var(--border-subtle);
   }
 
-  .queue-item:hover { background: rgba(148, 163, 184, 0.1); }
-
-  .queue-item .qi-top {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
+  table.queue-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.82rem;
   }
 
-  .queue-item .qi-pos {
-    font-size: 0.68rem;
+  table.queue-table th {
+    background: var(--bg-darker);
     color: var(--text-muted);
+    font-weight: 600;
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    padding: 0.45rem 0.6rem;
+    text-align: left;
+    border-bottom: 1px solid var(--border-subtle);
   }
 
-  .queue-item .qi-next-btn {
+  table.queue-table td {
+    padding: 0.4rem 0.6rem;
+    border-bottom: 1px solid rgba(148, 163, 184, 0.08);
+    color: var(--text-main);
+  }
+
+  table.queue-table tr:hover td {
+    background: rgba(148, 163, 184, 0.05);
+  }
+
+  td.qt-pos, td.qt-dur { color: var(--text-muted); text-align: center; white-space: nowrap; }
+  td.qt-cat { color: var(--text-muted); font-size: 0.75rem; }
+
+  .qt-next-btn {
     background: none;
     border: 1px solid var(--border-subtle);
-    border-radius: 3px;
+    border-radius: 4px;
     color: var(--text-muted);
-    font-size: 0.6rem;
-    padding: 0.1rem 0.3rem;
+    font-size: 0.7rem;
+    padding: 0.15rem 0.4rem;
     cursor: pointer;
-    flex-shrink: 0;
-    opacity: 0;
-    transition: opacity 0.1s;
+    transition: color 0.12s, border-color 0.12s;
   }
-  .queue-item:hover .qi-next-btn { opacity: 1; }
-  .queue-item .qi-next-btn:hover { color: var(--accent); border-color: var(--accent); }
+  .qt-next-btn:hover { color: var(--accent); border-color: var(--accent); }
 
-  .queue-item .qi-title {
-    font-weight: 600;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-
-  .queue-item .qi-artist {
-    font-size: 0.72rem;
-    color: var(--text-muted);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-
-  .queue-item .qi-bottom {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    font-size: 0.68rem;
-    color: var(--text-muted);
-  }
-
-  .queue-item[draggable="true"] { cursor: grab; }
-  .queue-item[draggable="true"]:active { cursor: grabbing; }
-  .queue-item.drag-over { border-left: 2px solid var(--accent); }
-  .queue-item.dragging { opacity: 0.3; }
+  table.queue-table tr[draggable="true"] { cursor: grab; }
+  table.queue-table tr[draggable="true"]:active { cursor: grabbing; }
+  table.queue-table tr.drag-over td { border-top: 2px solid var(--accent); }
+  table.queue-table tr.dragging td { opacity: 0.3; }
 
   .queue-empty {
     color: var(--text-muted);
@@ -415,8 +394,23 @@
 
 <div class="queue-panel" id="queuePanel">
   <h3>Coming Up</h3>
-  <div class="queue-row" id="queueList">
-    <div class="queue-empty">No queue data</div>
+  <div class="queue-table-wrap">
+    <table class="queue-table">
+      <thead>
+        <tr>
+          <th></th>
+          <th>#</th>
+          <th>Artist</th>
+          <th>Title</th>
+          <th>Cat</th>
+          <th>Dur</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody id="queueList">
+        <tr><td colspan="7" class="queue-empty">No queue data</td></tr>
+      </tbody>
+    </table>
   </div>
   <div class="queue-insert">
     <input type="text" class="queue-insert-input" id="queueInsertSearch"
@@ -441,6 +435,7 @@ SLOTS.forEach(s => {
     lastPollTime: 0,
     deckBuilt: false,
     paused: false,
+    mode: null, // 'offline' | 'empty' | 'preview' | 'live'
   };
 });
 
@@ -582,6 +577,7 @@ function drawWaveform(slot) {
 function updatePositionIndicators() {
   SLOTS.forEach(slot => {
     const st = deckState[slot];
+    if (st.mode !== 'live') return;
     const line = document.getElementById(`posLine-${slot}`);
     if (!line || !st.localDuration) return;
 
@@ -663,26 +659,92 @@ function buildDeckDOM(slot) {
   });
 }
 
-function renderDeck(slot, deck, transport) {
-  const container = document.getElementById(`deck-${slot}`);
-  const st = deckState[slot];
-
-  if (!deck || transport === 'OFFLINE' || transport === 'STOPPED') {
-    container.innerHTML = `
-      <div class="deck-header-row">
-        <span class="deck-label">Deck ${slot}</span>
-      </div>
-      <div class="deck-empty">
-        <div class="offline-icon">${transport === 'STOPPED' ? '&#9632;' : '&#9654;'}</div>
-        ${!deck && (transport === 'PLAYING' || transport === 'STALE') ? 'Nothing loaded' : (transport === 'STOPPED' ? 'Engine stopped' : 'Engine not running')}
-      </div>
-    `;
-    st.lastTrackId = null;
-    st.deckBuilt = false;
+function renderDeck(slot, deck, transport, queue) {
+  if (transport === 'OFFLINE' || transport === 'STOPPED') {
+    renderDeckOffline(slot, transport);
     return;
   }
+  if (deck) {
+    renderDeckLive(slot, deck, transport);
+    return;
+  }
+  const previewTrack = (queue && queue.length) ? queue[0] : null;
+  if (previewTrack) {
+    renderDeckPreview(slot, previewTrack);
+  } else {
+    renderDeckEmpty(slot);
+  }
+}
 
-  if (!st.deckBuilt) buildDeckDOM(slot);
+function renderDeckOffline(slot, transport) {
+  const st = deckState[slot];
+  st.mode = 'offline';
+  st.lastTrackId = null;
+  st.deckBuilt = false;
+  document.getElementById(`deck-${slot}`).innerHTML = `
+    <div class="deck-header-row"><span class="deck-label">Deck ${slot}</span></div>
+    <div class="deck-empty">
+      <div class="offline-icon">${transport === 'STOPPED' ? '&#9632;' : '&#9654;'}</div>
+      ${transport === 'STOPPED' ? 'Engine stopped' : 'Engine not running'}
+    </div>
+  `;
+}
+
+function renderDeckEmpty(slot) {
+  const st = deckState[slot];
+  st.mode = 'empty';
+  st.lastTrackId = null;
+  st.deckBuilt = false;
+  document.getElementById(`deck-${slot}`).innerHTML = `
+    <div class="deck-header-row"><span class="deck-label">Deck ${slot}</span></div>
+    <div class="deck-empty">
+      <div class="offline-icon">&#9654;</div>
+      Nothing queued
+    </div>
+  `;
+}
+
+function renderDeckPreview(slot, track) {
+  const st = deckState[slot];
+
+  if (st.mode !== 'preview') {
+    buildDeckDOM(slot);
+    st.mode = 'preview';
+    st.lastTrackId = null;
+    document.getElementById(`playPauseBtn-${slot}`).style.display = 'none';
+    document.getElementById(`ejectBtn-${slot}`).style.display = 'none';
+    document.querySelector(`#deck-${slot} .np-timing`).style.display = 'none';
+  }
+
+  const badge = document.getElementById(`transportBadge-${slot}`);
+  badge.textContent = 'UP NEXT';
+  badge.className = 'transport-badge UPNEXT';
+
+  if (track.track_id !== st.lastTrackId) {
+    st.lastTrackId = track.track_id;
+    loadWaveform(slot, track.track_id);
+
+    document.getElementById(`npTitle-${slot}`).textContent = track.title || '';
+    document.getElementById(`npArtist-${slot}`).textContent = track.artist || '';
+    document.getElementById(`npAlbum-${slot}`).style.display = 'none';
+    const catEl = document.getElementById(`npCategory-${slot}`);
+    catEl.textContent = track.category || '';
+    catEl.style.display = track.category ? '' : 'none';
+    document.getElementById(`npTotal-${slot}`).textContent = fmtDur(track.duration);
+  }
+}
+
+function renderDeckLive(slot, deck, transport) {
+  const st = deckState[slot];
+
+  if (st.mode !== 'live') {
+    buildDeckDOM(slot);
+    st.mode = 'live';
+    st.lastTrackId = null;
+    document.getElementById(`playPauseBtn-${slot}`).style.display = '';
+    document.getElementById(`ejectBtn-${slot}`).style.display = '';
+    document.querySelector(`#deck-${slot} .np-timing`).style.display = '';
+  }
 
   if (deck.track_id !== st.lastTrackId) {
     st.lastTrackId = deck.track_id;
@@ -744,7 +806,7 @@ function renderQueue(data) {
   currentLogId = data.log_id;
 
   if (!queue.length) {
-    list.innerHTML = '<div class="queue-empty">No upcoming tracks</div>';
+    list.innerHTML = '<tr><td colspan="7" class="queue-empty">No upcoming tracks</td></tr>';
     queueItemIds = [];
     return;
   }
@@ -752,18 +814,15 @@ function renderQueue(data) {
   queueItemIds = queue.map(q => q.item_id);
 
   list.innerHTML = queue.map((q, i) => `
-    <div class="queue-item" draggable="true" data-item-id="${q.item_id}">
-      <div class="qi-top">
-        <span class="qi-pos">${i + 1}</span>
-        <button class="qi-next-btn" onclick="event.stopPropagation(); setNext(${q.item_id})">next</button>
-      </div>
-      <div class="qi-title">${esc(q.title)}</div>
-      <div class="qi-artist">${esc(q.artist)}</div>
-      <div class="qi-bottom">
-        <span>${esc(q.category)}</span>
-        <span>${fmtDur(q.duration)}</span>
-      </div>
-    </div>
+    <tr draggable="true" data-item-id="${q.item_id}">
+      <td class="qt-pos" style="cursor:grab;">&#9776;</td>
+      <td class="qt-pos">${i + 1}</td>
+      <td>${esc(q.artist)}</td>
+      <td>${esc(q.title)}</td>
+      <td class="qt-cat">${esc(q.category)}</td>
+      <td class="qt-dur">${fmtDur(q.duration)}</td>
+      <td><button class="qt-next-btn" onclick="event.stopPropagation(); setNext(${q.item_id})">next</button></td>
+    </tr>
   `).join('');
 
   initQueueDrag();
@@ -773,36 +832,41 @@ function initQueueDrag() {
   const list = document.getElementById('queueList');
   let dragEl = null;
 
-  list.querySelectorAll('.queue-item[draggable]').forEach(item => {
-    item.addEventListener('dragstart', () => {
-      dragEl = item;
-      item.classList.add('dragging');
+  list.querySelectorAll('tr[draggable]').forEach(row => {
+    row.addEventListener('dragstart', () => {
+      dragEl = row;
+      row.classList.add('dragging');
     });
-    item.addEventListener('dragend', () => {
-      item.classList.remove('dragging');
-      list.querySelectorAll('.queue-item').forEach(q => q.classList.remove('drag-over'));
+    row.addEventListener('dragend', () => {
+      row.classList.remove('dragging');
+      list.querySelectorAll('tr').forEach(r => r.classList.remove('drag-over'));
       dragEl = null;
     });
-    item.addEventListener('dragover', (e) => {
+    row.addEventListener('dragover', (e) => {
       e.preventDefault();
-      list.querySelectorAll('.queue-item').forEach(q => q.classList.remove('drag-over'));
-      item.classList.add('drag-over');
+      list.querySelectorAll('tr').forEach(r => r.classList.remove('drag-over'));
+      row.classList.add('drag-over');
     });
-    item.addEventListener('dragleave', () => item.classList.remove('drag-over'));
-    item.addEventListener('drop', async (e) => {
+    row.addEventListener('dragleave', () => row.classList.remove('drag-over'));
+    row.addEventListener('drop', async (e) => {
       e.preventDefault();
-      item.classList.remove('drag-over');
-      if (!dragEl || dragEl === item) return;
-      list.insertBefore(dragEl, item);
-      const order = [...list.querySelectorAll('.queue-item')].map(
-        el => parseInt(el.dataset.itemId)
+      row.classList.remove('drag-over');
+      if (!dragEl || dragEl === row) return;
+      list.insertBefore(dragEl, row);
+      const order = [...list.querySelectorAll('tr')].map(
+        r => parseInt(r.dataset.itemId)
       );
       if (!currentLogId) return;
+      // Resync from the server either way -- if this 400s (or the log
+      // changed underneath us), the poll puts the table back to
+      // whatever's actually true instead of leaving a reorder that
+      // looks applied but silently didn't stick.
       await fetch(`/api/log/${currentLogId}/reorder/`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') },
         body: JSON.stringify({ order }),
       });
+      poll();
     });
   });
 }
@@ -868,7 +932,8 @@ async function poll() {
   const data = await fetchStatus();
   if (!data) return;
   const decks = data.decks || {};
-  SLOTS.forEach(slot => renderDeck(slot, decks[slot], data.transport));
+  const queue = data.queue || [];
+  SLOTS.forEach(slot => renderDeck(slot, decks[slot], data.transport, queue));
   renderQueue(data);
 }
 
