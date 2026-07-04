@@ -35,4 +35,5 @@ urlpatterns = [
     path('api/engine/queue/set-next/', views.api_engine_set_next, name='api-engine-set-next'),
     path('api/engine/queue/insert/', views.api_engine_insert_track, name='api-engine-insert-track'),
     path('api/engine/seek/', views.api_engine_seek, name='api-engine-seek'),
+    path('api/engine/deck/<str:slot>/', views.api_engine_deck_command, name='api-engine-deck-command'),
 ]

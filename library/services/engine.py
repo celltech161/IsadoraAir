@@ -4,7 +4,7 @@ import signal
 import sys
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import timedelta
 from pathlib import Path
 
 import gi
@@ -29,16 +29,20 @@ CMD_PATH = Path("/run/isadoraair/engine_cmd.json")
 POSITION_POLL_MS = 500
 AUTO_BUILD_CHECK_SECONDS = 10
 NEXT_HOUR_LOOKAHEAD_SECONDS = 30
+SLOTS = ("A", "B")
 
 
 class Deck:
-    def __init__(self, track, log_item, pipeline, mixer_pad):
+    def __init__(self, slot, track, log_item, pipeline, mixer_pad):
+        self.slot = slot
         self.track = track
         self.log_item = log_item
         self.pipeline = pipeline
         self.mixer_pad = mixer_pad
         self.started_at = None
         self.finished = False
+        self.paused = False
+        self.paused_position = 0.0
 
 
 class PlaybackEngine:
@@ -48,13 +52,13 @@ class PlaybackEngine:
         self.mixer = None
         self.alsasink = None
         self.main_pipeline = None
-        self.decks = []
+        self.decks = {"A": None, "B": None}
         self._deck_bin_map = {}
         self._last_queue_reload = 0
         self._next_triggered = False
         self.current_log = None
         self.log_items = []
-        self.current_index = 0
+        self._queue_cursor = 0
         self.running = False
         self._position_timer = None
         self._lock = threading.RLock()
@@ -67,7 +71,7 @@ class PlaybackEngine:
         if not self.log_items:
             print("No approved log for current hour. Waiting...")
         else:
-            self._start_track(0, as_leading=True)
+            self._start_next_track()
 
         self._position_timer = GLib.timeout_add(POSITION_POLL_MS, self._poll_position)
         GLib.timeout_add_seconds(AUTO_BUILD_CHECK_SECONDS, self._ensure_upcoming_logs)
@@ -95,8 +99,8 @@ class PlaybackEngine:
         self.running = False
         if self.main_pipeline:
             self.main_pipeline.set_state(Gst.State.NULL)
-        for deck in self.decks:
-            if deck.pipeline:
+        for deck in self.decks.values():
+            if deck and deck.pipeline:
                 deck.pipeline.set_state(Gst.State.NULL)
         if self.loop.is_running():
             self.loop.quit()
@@ -173,7 +177,7 @@ class PlaybackEngine:
         if not log:
             self.current_log = None
             self.log_items = []
-            self.current_index = 0
+            self._queue_cursor = 0
             return
 
         self.current_log = log
@@ -182,7 +186,7 @@ class PlaybackEngine:
             .select_related("track", "track__artist", "track__album", "track__category")
             .order_by("position")
         )
-        self.current_index = 0
+        self._queue_cursor = 0
         print(f"Loaded log for {target_date} {hour:02d}:00 — {len(self.log_items)} items")
 
     def _ensure_upcoming_logs(self):
@@ -208,11 +212,11 @@ class PlaybackEngine:
         # can sit idle forever despite a perfectly good approved log
         # existing for the current hour.
         with self._lock:
-            idle = not self.decks
+            idle = self.decks["A"] is None and self.decks["B"] is None
         if idle:
             self._load_log_for(now.date(), now.hour)
             if self.log_items:
-                self._start_track(0, as_leading=True)
+                self._start_next_track()
 
         seconds_left_in_hour = 3600 - (now.minute * 60 + now.second)
         if seconds_left_in_hour <= NEXT_HOUR_LOOKAHEAD_SECONDS:
@@ -237,7 +241,82 @@ class PlaybackEngine:
         print(f"  Auto-built and approved log for {target_date} {hour:02d}:00 ({log.items.count()} items)")
         return True
 
-    def _create_deck(self, log_item):
+    # --- Slot / queue helpers ---
+
+    def _other_slot(self, slot):
+        return "B" if slot == "A" else "A"
+
+    def _free_slot(self):
+        """Whichever slot is currently empty, preferring 'A'. None if
+        both are occupied."""
+        for slot in SLOTS:
+            if self.decks[slot] is None:
+                return slot
+        return None
+
+    def _leading_deck(self):
+        """The deck whose position the crossfade trigger should watch.
+        Normally there's exactly one non-paused occupied slot; during a
+        brief crossfade overlap there can be two, in which case either
+        is a fine reference point since only one direction (finishing)
+        matters here."""
+        for slot in SLOTS:
+            deck = self.decks[slot]
+            if deck and not deck.paused:
+                return deck
+        return None
+
+    def _next_queue_item(self):
+        if self._queue_cursor >= len(self.log_items):
+            return None
+        item = self.log_items[self._queue_cursor]
+        self._queue_cursor += 1
+        return item
+
+    def _start_next_track(self, slot=None):
+        """Load the next queued item into `slot` (or whichever slot is
+        free, preferring A) and start it playing right away."""
+        if slot is None:
+            slot = self._free_slot()
+        if slot is None:
+            return
+
+        log_item = self._next_queue_item()
+        if log_item is None:
+            self._on_log_exhausted(slot)
+            return
+
+        self._next_triggered = False
+        deck = self._create_deck(slot, log_item)
+        if deck is None:
+            # File missing — move on to whatever's after it for this slot.
+            self._start_next_track(slot=slot)
+            return
+
+        with self._lock:
+            self.decks[slot] = deck
+        self._deck_bin_map[id(deck.pipeline)] = deck
+
+        bus = deck.pipeline.get_bus()
+        bus.add_signal_watch()
+        bus.connect("message::error", self._on_deck_error, deck)
+
+    def _apply_pad_offset(self, deck_bin, internal_position_ns=0):
+        """A bin linked into the already-playing audiomixer needs its
+        src pad's running-time offset corrected, or GStreamer treats
+        its buffers as already old (by however long the pipeline's
+        been running) and skips/drops through them to catch up —
+        playback becomes audible partway into the track instead of at
+        its start. `internal_position_ns` is wherever this bin's own
+        timeline is starting from — 0 for a fresh track, or the frozen
+        position when resuming a paused deck."""
+        clock = self.main_pipeline.get_clock()
+        if not clock:
+            return
+        running_time = clock.get_time() - self.main_pipeline.get_base_time()
+        deck_bin.get_static_pad("src").set_offset(running_time - internal_position_ns)
+
+    def _create_deck(self, slot, log_item, resume_position_ns=None):
         track = log_item.track
         filepath = track.filepath
 
@@ -252,7 +331,7 @@ class PlaybackEngine:
         convert = Gst.ElementFactory.make("audioconvert", None)
         resample = Gst.ElementFactory.make("audioresample", None)
 
-        bin_name = f"deck_{log_item.id}"
+        bin_name = f"deck_{slot}_{log_item.id}_{int(time.time() * 1000)}"
         deck_bin = Gst.Bin.new(bin_name)
         deck_bin.add(src)
         deck_bin.add(decode)
@@ -293,92 +372,55 @@ class PlaybackEngine:
         mixer_pad = self.mixer.request_pad_simple("sink_%u")
         deck_bin.get_static_pad("src").link(mixer_pad)
 
-        # This bin's buffers are timestamped from 0 (its own fresh
-        # segment), but the mixer's already at the pipeline's real
-        # running time. Without correcting it, GStreamer treats the new
-        # buffers as already running-time-old-by-that-much and
-        # drops/skips through them to catch up, so playback becomes
-        # audible partway into the track instead of at its start.
-        # Offsetting the bin's src pad by the pipeline's current
-        # running time fixes the reference point.
-        #
-        # This has to run unconditionally, not just when self.decks is
-        # non-empty — self.decks is empty any time the previous deck
-        # already finished and was removed before this one was created
-        # (e.g. natural EOS/error with no crossfade having triggered
-        # yet), which looks identical to "this is the very first deck"
-        # but isn't: the pipeline may have been running for minutes.
-        # Skipping the offset in that case is exactly what caused
-        # tracks to start well into the song instead of near 0. Running
-        # it for the true first deck too is harmless — running time is
-        # ~0 right after the pipeline goes PLAYING anyway.
-        clock = self.main_pipeline.get_clock()
-        if clock:
-            running_time = clock.get_time() - self.main_pipeline.get_base_time()
-            deck_bin.get_static_pad("src").set_offset(running_time)
+        self._apply_pad_offset(deck_bin, internal_position_ns=resume_position_ns or 0)
 
         deck_bin.sync_state_with_parent()
 
         deck = Deck(
+            slot=slot,
             track=track,
             log_item=log_item,
             pipeline=deck_bin,
             mixer_pad=mixer_pad,
         )
-        deck.started_at = time.time()
+        start_offset = (resume_position_ns or 0) / Gst.SECOND
+        deck.started_at = time.time() - start_offset
 
-        try:
-            close_old_connections()
-            log_item.played_at = timezone.now()
-            log_item.save(update_fields=["played_at"])
-            Track.objects.filter(id=track.id).update(
-                last_played_at=timezone.now(),
-                play_count=track.play_count + 1,
-            )
-        except Exception as exc:
-            print(f"  DB write failed (non-fatal): {exc}")
+        if resume_position_ns is None:
+            try:
+                close_old_connections()
+                log_item.played_at = timezone.now()
+                log_item.save(update_fields=["played_at"])
+                Track.objects.filter(id=track.id).update(
+                    last_played_at=timezone.now(),
+                    play_count=track.play_count + 1,
+                )
+            except Exception as exc:
+                print(f"  DB write failed (non-fatal): {exc}")
+            print(f"  [{slot}] Playing: {track.artist.name if track.artist else '?'} - {track.title}")
+        else:
+            print(f"  [{slot}] Resumed: {track.artist.name if track.artist else '?'} - {track.title} at {start_offset:.1f}s")
 
-        print(f"  Playing: {track.artist.name if track.artist else '?'} - {track.title}")
         return deck
 
     def _remove_deck(self, deck):
         with self._lock:
             self._deck_bin_map.pop(id(deck.pipeline), None)
             deck.pipeline.set_state(Gst.State.NULL)
-            deck.pipeline.get_static_pad("src").unlink(deck.mixer_pad)
-            self.mixer.release_request_pad(deck.mixer_pad)
+            try:
+                deck.pipeline.get_static_pad("src").unlink(deck.mixer_pad)
+            except Exception:
+                pass
+            if deck.mixer_pad is not None:
+                self.mixer.release_request_pad(deck.mixer_pad)
             self.main_pipeline.remove(deck.pipeline)
             deck.finished = True
-            if deck in self.decks:
-                self.decks.remove(deck)
-
-    def _start_track(self, index, as_leading=False):
-        if index >= len(self.log_items):
-            self._on_log_exhausted()
-            return
-
-        if as_leading:
-            self.current_index = index
-            self._next_triggered = False
-
-        log_item = self.log_items[index]
-        deck = self._create_deck(log_item)
-
-        if deck is None:
-            if as_leading:
-                self._start_track(index + 1, as_leading=True)
-            return
-
-        self._deck_bin_map[id(deck.pipeline)] = deck
-
-        with self._lock:
-            self.decks.append(deck)
-
-        bus = deck.pipeline.get_bus()
-        bus.add_signal_watch()
-        bus.connect("message::error", self._on_deck_error, deck)
+            if self.decks.get(deck.slot) is deck:
+                self.decks[deck.slot] = None
 
     def _get_deck_position(self, deck):
+        if deck.paused:
+            return deck.paused_position
         ok, position = deck.pipeline.query_position(Gst.Format.TIME)
         if ok:
             return position / Gst.SECOND
@@ -397,8 +439,8 @@ class PlaybackEngine:
             if cmd == "seek":
                 position = float(data.get("position", 0))
                 with self._lock:
-                    if self.decks:
-                        leading = self.decks[0]
+                    leading = self._leading_deck()
+                    if leading:
                         seek_ns = int(position * Gst.SECOND)
                         leading.pipeline.seek_simple(
                             Gst.Format.TIME,
@@ -412,8 +454,91 @@ class PlaybackEngine:
                 self._apply_audio_output_device(self._resolve_studio_monitor_device())
             elif cmd == "reload_current_log":
                 self._reload_and_restart_current_log()
+            elif cmd == "deck_pause":
+                self._pause_deck(data.get("slot"))
+            elif cmd == "deck_resume":
+                self._resume_deck(data.get("slot"))
+            elif cmd == "deck_eject":
+                self._eject_deck(data.get("slot"))
         except Exception as exc:
             print(f"  Command error: {exc}")
+
+    def _pause_deck(self, slot):
+        if slot not in SLOTS:
+            return
+        deck = self.decks.get(slot)
+        if not deck or deck.paused:
+            return
+
+        pos = self._get_deck_position(deck)
+        deck.paused_position = pos
+        deck.paused = True
+
+        # Unlink from the mixer before pausing — leaving a paused
+        # (non-producing) pad linked risks the aggregator stalling on
+        # it and blocking the other deck's audio too, not just this
+        # one's.
+        try:
+            deck.pipeline.get_static_pad("src").unlink(deck.mixer_pad)
+        except Exception as exc:
+            print(f"  [{slot}] pause: unlink failed: {exc}", flush=True)
+        if deck.mixer_pad is not None:
+            self.mixer.release_request_pad(deck.mixer_pad)
+        deck.mixer_pad = None
+
+        ret = deck.pipeline.set_state(Gst.State.PAUSED)
+        print(f"  [{slot}] Paused at {pos:.1f}s (set_state PAUSED -> {ret})", flush=True)
+
+    def _resume_deck(self, slot):
+        """Rather than reviving the exact same Gst.Bin after unlinking
+        it (that path reported PLAYING/linked=OK but the position never
+        advanced again — root cause not pinned down, and not worth
+        blocking on), tear it down and create a fresh bin for the same
+        log_item via the normal (well-proven) deck-creation path, then
+        seek it to where it was paused. Two independently-verified
+        mechanisms — track-transition creation and manual seek — doing
+        the work instead of one untested one."""
+        if slot not in SLOTS:
+            return
+        deck = self.decks.get(slot)
+        if not deck or not deck.paused:
+            return
+
+        resume_position = deck.paused_position
+        log_item = deck.log_item
+        self._remove_deck(deck)
+
+        new_deck = self._create_deck(
+            slot, log_item, resume_position_ns=int(resume_position * Gst.SECOND)
+        )
+        if new_deck is None:
+            print(f"  [{slot}] Resume failed — could not recreate deck", flush=True)
+            return
+
+        new_deck.pipeline.seek_simple(
+            Gst.Format.TIME,
+            Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT,
+            int(resume_position * Gst.SECOND),
+        )
+
+        with self._lock:
+            self.decks[slot] = new_deck
+        self._deck_bin_map[id(new_deck.pipeline)] = new_deck
+
+        bus = new_deck.pipeline.get_bus()
+        bus.add_signal_watch()
+        bus.connect("message::error", self._on_deck_error, new_deck)
+
+        print(f"  [{slot}] Resumed at {resume_position:.1f}s", flush=True)
+
+    def _eject_deck(self, slot):
+        if slot not in SLOTS:
+            return
+        deck = self.decks.get(slot)
+        if deck:
+            self._remove_deck(deck)
+        print(f"  [{slot}] Ejected")
+        self._start_next_track(slot=slot)
 
     def _reload_and_restart_current_log(self):
         """Tear down whatever's playing and switch to the current
@@ -423,7 +548,7 @@ class PlaybackEngine:
         the engine (e.g. a manual 'play this playlist now' request)."""
         close_old_connections()
         with self._lock:
-            decks_to_remove = list(self.decks)
+            decks_to_remove = [d for d in self.decks.values() if d]
         for deck in decks_to_remove:
             self._remove_deck(deck)
 
@@ -431,7 +556,7 @@ class PlaybackEngine:
         now = timezone.localtime()
         self._load_log_for(now.date(), now.hour)
         if self.log_items:
-            self._start_track(0, as_leading=True)
+            self._start_next_track()
             print(f"  Reloaded current-hour log by request — {len(self.log_items)} items")
         else:
             print("  Reload requested but no approved log for current hour")
@@ -469,17 +594,15 @@ class PlaybackEngine:
             .select_related("track", "track__artist", "track__album", "track__category")
             .order_by("position")
         )
-        current_playing_ids = {d.log_item.id for d in self.decks}
+        occupied_ids = {d.log_item.id for d in self.decks.values() if d}
 
-        # Find where we are in the fresh list
-        new_index = 0
+        new_cursor = 0
         for i, item in enumerate(fresh_items):
-            if item.id in current_playing_ids:
-                new_index = i
-                break
+            if item.id in occupied_ids:
+                new_cursor = i + 1
 
         self.log_items = fresh_items
-        self.current_index = new_index
+        self._queue_cursor = new_cursor
 
     def _poll_position(self):
         if not self.running:
@@ -488,24 +611,19 @@ class PlaybackEngine:
         self._check_commands()
         self._reload_queue_if_changed()
 
-        with self._lock:
-            if not self.decks:
-                self._write_state()
-                return True
-            leading_deck = self.decks[0]
-
-        if leading_deck.finished:
+        leading = self._leading_deck()
+        if not leading or leading.finished:
             self._write_state()
             return True
 
         # Don't check trigger until deck has been playing for at least 5 seconds
-        deck_age = time.time() - (leading_deck.started_at or time.time())
+        deck_age = time.time() - (leading.started_at or time.time())
         if deck_age < 5.0:
             self._write_state()
             return True
 
-        pos = self._get_deck_position(leading_deck)
-        track = leading_deck.track
+        pos = self._get_deck_position(leading)
+        track = leading.track
 
         next_start = track.next_start_seconds
         if next_start is None:
@@ -517,27 +635,21 @@ class PlaybackEngine:
             self._write_state()
             return True
 
-        next_index = self.current_index + 1
-        if next_index < len(self.log_items):
-            next_item = self.log_items[next_index]
+        other_slot = self._other_slot(leading.slot)
+        other_occupied = self.decks[other_slot] is not None
+
+        if not other_occupied and self._queue_cursor < len(self.log_items):
+            next_item = self.log_items[self._queue_cursor]
             next_cue_in = next_item.track.cue_in_seconds or 0.0
             trigger_point = next_start - next_cue_in
 
             if trigger_point < 10.0:
                 trigger_point = next_start
 
-            # Multiple safety checks to prevent cascade
-            with self._lock:
-                already_in_decks = any(
-                    d.log_item.id == next_item.id for d in self.decks
-                )
-
-            if (not self._next_triggered
-                    and not already_in_decks
-                    and pos >= trigger_point):
-                print(f"  Trigger: pos={pos:.1f}s >= trigger={trigger_point:.1f}s, starting next ({next_item.track.title})")
+            if not self._next_triggered and pos >= trigger_point:
+                print(f"  Trigger: pos={pos:.1f}s >= trigger={trigger_point:.1f}s, starting next ({next_item.track.title}) on deck {other_slot}")
                 self._next_triggered = True
-                self._start_track(next_index)
+                self._start_next_track(slot=other_slot)
 
         self._write_state()
         return True
@@ -546,39 +658,34 @@ class PlaybackEngine:
         deck = self._deck_bin_map.get(id(deck_bin))
         if not deck or deck.finished:
             return
-        is_leading = self.decks and self.decks[0] is deck
-        self._handle_deck_finished(deck, is_leading)
+        self._handle_deck_finished(deck)
 
     def _on_deck_error(self, bus, message, deck):
         err, debug = message.parse_error()
         print(f"  GStreamer error on {deck.track.title}: {err} ({debug})")
-        is_leading = self.decks and self.decks[0] is deck
-        GLib.idle_add(self._handle_deck_finished, deck, is_leading)
+        GLib.idle_add(self._handle_deck_finished, deck)
         return True
 
-    def _handle_deck_finished(self, deck, was_leading):
+    def _handle_deck_finished(self, deck):
+        slot = deck.slot
         self._remove_deck(deck)
-        if was_leading:
-            self._next_triggered = False
-            next_idx = self.current_index + 1
-            with self._lock:
-                already_playing = any(
-                    d.log_item.position == self.log_items[next_idx].position
-                    for d in self.decks
-                ) if next_idx < len(self.log_items) and self.decks else False
+        other_deck = self.decks[self._other_slot(slot)]
+        if other_deck is not None:
+            # The crossfade already handed off to the other slot before
+            # this one finished — nothing more to do, it's playing.
+            return
+        # Nothing had triggered yet (e.g. a track too short to ever hit
+        # the crossfade trigger) — this was the only thing playing, so
+        # start the next queued item now, in the slot that just freed up.
+        self._start_next_track(slot=slot)
 
-            if already_playing:
-                self.current_index = next_idx
-            else:
-                self._start_track(next_idx, as_leading=True)
-
-    def _on_log_exhausted(self):
-        print("Log exhausted for this hour.")
+    def _on_log_exhausted(self, slot):
+        print(f"  [{slot}] Log exhausted for this hour.")
         now = timezone.localtime()
         next_hour = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
         self._load_log_for(next_hour.date(), next_hour.hour)
         if self.log_items:
-            self._start_track(0, as_leading=True)
+            self._start_next_track(slot=slot)
         else:
             print("No approved log for next hour. Waiting...")
             GLib.timeout_add_seconds(30, self._try_load_next_hour)
@@ -589,7 +696,7 @@ class PlaybackEngine:
         now = timezone.localtime()
         self._load_log_for(now.date(), now.hour)
         if self.log_items:
-            self._start_track(0, as_leading=True)
+            self._start_next_track()
             return False
         return True
 
@@ -597,17 +704,18 @@ class PlaybackEngine:
         try:
             STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-            now_playing = None
-            next_up = None
-
             with self._lock:
-                active_decks = list(self.decks)
+                snapshot = dict(self.decks)
 
-            if active_decks:
-                current = active_decks[0]
-                pos = self._get_deck_position(current)
-                t = current.track
-                now_playing = {
+            decks_out = {}
+            for slot in SLOTS:
+                deck = snapshot[slot]
+                if not deck:
+                    decks_out[slot] = None
+                    continue
+                pos = self._get_deck_position(deck)
+                t = deck.track
+                decks_out[slot] = {
                     "track_id": t.id,
                     "title": t.title,
                     "artist": t.artist.name if t.artist else "",
@@ -617,22 +725,11 @@ class PlaybackEngine:
                     "next_start": t.next_start_seconds,
                     "cue_in": t.cue_in_seconds or 0,
                     "category": t.category.code if t.category else "",
-                }
-
-            next_index = self.current_index + 1
-            if next_index < len(self.log_items):
-                nt = self.log_items[next_index].track
-                next_up = {
-                    "track_id": nt.id,
-                    "title": nt.title,
-                    "artist": nt.artist.name if nt.artist else "",
-                    "album": nt.album.title if nt.album else "",
-                    "duration": nt.duration_seconds or 0,
-                    "category": nt.category.code if nt.category else "",
+                    "paused": deck.paused,
                 }
 
             queue = []
-            for i in range(next_index + 1, min(next_index + 10, len(self.log_items))):
+            for i in range(self._queue_cursor, min(self._queue_cursor + 10, len(self.log_items))):
                 qi = self.log_items[i]
                 qt = qi.track
                 queue.append({
@@ -646,10 +743,9 @@ class PlaybackEngine:
 
             state = {
                 "transport": transport,
-                "now_playing": now_playing,
-                "next_up": next_up,
+                "decks": decks_out,
                 "queue": queue,
-                "current_index": self.current_index,
+                "queue_cursor": self._queue_cursor,
                 "total_items": len(self.log_items),
                 "log_id": self.current_log.id if self.current_log else None,
                 "hour": self.current_log.hour if self.current_log else None,

@@ -680,21 +680,21 @@ def api_log_reorder(request, pk):
     return JsonResponse(_log_to_dict(log))
 
 
-def _read_engine_current_item_id():
-    """Read the engine state to find which LogItem is currently playing."""
+def _read_engine_queue_state():
+    """Read the engine state to find the current log's items in order,
+    and the queue cursor (position of the first not-yet-claimed item —
+    i.e. one past whatever the two decks currently hold)."""
     state_path = Path("/run/isadoraair/engine_state.json")
     try:
         data = json.loads(state_path.read_text(encoding="utf-8"))
-        np = data.get("now_playing")
-        if np and data.get("log_id"):
+        if data.get("log_id"):
             log = PlaylistLog.objects.get(id=data["log_id"])
             items = list(log.items.order_by("position"))
-            idx = data.get("current_index", 0)
-            if 0 <= idx < len(items):
-                return items[idx].id, items, idx
+            cursor = data.get("queue_cursor", len(items))
+            return items, cursor
     except Exception:
         pass
-    return None, [], 0
+    return [], 0
 
 
 @csrf_exempt
@@ -709,7 +709,7 @@ def api_engine_set_next(request):
     if not item_id:
         return JsonResponse({"error": "item_id required"}, status=400)
 
-    current_item_id, all_items, current_idx = _read_engine_current_item_id()
+    all_items, cursor = _read_engine_queue_state()
     if not all_items:
         return JsonResponse({"error": "No active log"}, status=400)
 
@@ -722,7 +722,7 @@ def api_engine_set_next(request):
     if src_idx is None:
         return JsonResponse({"error": "Item not found"}, status=404)
 
-    target_idx = current_idx + 1
+    target_idx = cursor
     if src_idx <= target_idx:
         return JsonResponse({"ok": True})
 
@@ -761,7 +761,7 @@ def api_engine_insert_track(request):
     if not track_id:
         return JsonResponse({"error": "track_id required"}, status=400)
 
-    current_item_id, all_items, current_idx = _read_engine_current_item_id()
+    all_items, cursor = _read_engine_queue_state()
     if not all_items:
         return JsonResponse({"error": "No active log"}, status=400)
 
@@ -776,7 +776,7 @@ def api_engine_insert_track(request):
         category=track.category,
     )
 
-    insert_idx = current_idx + 1
+    insert_idx = cursor
     all_items.insert(insert_idx, new_item)
     _reposition_items(all_items)
 
@@ -803,18 +803,42 @@ def api_engine_seek(request):
     return JsonResponse({"ok": True})
 
 
+@csrf_exempt
+@require_http_methods(["POST"])
+def api_engine_deck_command(request, slot):
+    slot = slot.upper()
+    if slot not in ("A", "B"):
+        return JsonResponse({"error": "slot must be A or B"}, status=400)
+
+    try:
+        body = json.loads(request.body)
+    except (json.JSONDecodeError, ValueError):
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+
+    action = body.get("action")
+    if action not in ("pause", "resume", "eject"):
+        return JsonResponse({"error": "action must be pause, resume, or eject"}, status=400)
+
+    cmd_path = Path("/run/isadoraair/engine_cmd.json")
+    cmd_path.write_text(
+        json.dumps({"command": f"deck_{action}", "slot": slot}),
+        encoding="utf-8",
+    )
+    return JsonResponse({"ok": True})
+
+
 @require_http_methods(["GET"])
 def api_engine_status(request):
     state_path = Path("/run/isadoraair/engine_state.json")
     if not state_path.is_file():
-        return JsonResponse({"transport": "OFFLINE", "now_playing": None, "next_up": None})
+        return JsonResponse({"transport": "OFFLINE", "decks": {"A": None, "B": None}, "queue": []})
     try:
         data = json.loads(state_path.read_text(encoding="utf-8"))
         if time_mod.time() - data.get("timestamp", 0) > 10:
             data["transport"] = "STALE"
         return JsonResponse(data)
     except Exception:
-        return JsonResponse({"transport": "ERROR", "now_playing": None, "next_up": None})
+        return JsonResponse({"transport": "ERROR", "decks": {"A": None, "B": None}, "queue": []})
 
 
 @require_http_methods(["GET"])
