@@ -127,6 +127,26 @@
   .pl-result .pr-artist { color: var(--text-muted); font-size: 0.75rem; width: 140px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .pl-result .pr-dur { color: var(--text-muted); width: 42px; text-align: right; }
 
+  .pl-results-header {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.3rem 0.55rem;
+    margin-bottom: 2px;
+    border-bottom: 1px solid var(--border-subtle);
+    font-size: 0.68rem;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-muted);
+  }
+  .prh-spacer { width: 24px; flex-shrink: 0; }
+  .prh-col { flex: 1; cursor: pointer; user-select: none; transition: color 0.12s; }
+  .prh-col:hover { color: var(--text-main); }
+  .prh-col.sorted { color: var(--accent); }
+  .prh-col .arrow { font-size: 0.6rem; margin-left: 2px; }
+  .prh-col.prh-artist { flex: none; width: 140px; }
+  .prh-col.prh-dur { flex: none; width: 42px; text-align: right; }
+
   .pl-add-btn {
     background: rgba(34, 197, 94, 0.12);
     border: 1px solid rgba(34, 197, 94, 0.3);
@@ -249,6 +269,12 @@
       <label class="pl-ready-toggle">
         <input type="checkbox" id="readyOnlyToggle" checked> Ready to air only
       </label>
+    </div>
+    <div class="pl-results-header">
+      <span class="prh-spacer"></span>
+      <span class="prh-col" data-sort="title">Track <span class="arrow"></span></span>
+      <span class="prh-col prh-artist" data-sort="artist">Artist <span class="arrow"></span></span>
+      <span class="prh-col prh-dur" data-sort="duration">Dur <span class="arrow"></span></span>
     </div>
     <div class="pl-results" id="searchResults">
       <div class="pl-hint">Type at least 2 characters, or pick a category, to search the library.</div>
@@ -565,6 +591,36 @@ async function addTrack(trackId) {
 // --- Track search ---
 let searchPage = 1;
 let searchTotalPages = 1;
+let searchSort = 'title';
+let searchDir = 'asc';
+
+function updateSearchSortIndicators() {
+  document.querySelectorAll('.prh-col[data-sort]').forEach(el => {
+    const arrow = el.querySelector('.arrow');
+    if (el.dataset.sort === searchSort) {
+      el.classList.add('sorted');
+      arrow.textContent = searchDir === 'asc' ? '▲' : '▼';
+    } else {
+      el.classList.remove('sorted');
+      arrow.textContent = '';
+    }
+  });
+}
+
+document.querySelectorAll('.prh-col[data-sort]').forEach(el => {
+  el.addEventListener('click', () => {
+    const field = el.dataset.sort;
+    if (searchSort === field) {
+      searchDir = searchDir === 'asc' ? 'desc' : 'asc';
+    } else {
+      searchSort = field;
+      searchDir = 'asc';
+    }
+    updateSearchSortIndicators();
+    searchTracks(true);
+  });
+});
+updateSearchSortIndicators();
 
 async function searchTracks(reset = true) {
   const q = document.getElementById('trackSearchInput').value.trim();
@@ -587,6 +643,8 @@ async function searchTracks(reset = true) {
   if (q) params.set('q', q);
   if (category) params.set('category', category);
   if (readyOnly) params.set('ready2air', 'true');
+  params.set('sort', searchSort);
+  params.set('dir', searchDir);
   params.set('per_page', 100);
   params.set('page', searchPage);
 
