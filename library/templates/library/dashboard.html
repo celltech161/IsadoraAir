@@ -44,31 +44,65 @@
   }
   .playnow-msg.error { color: var(--danger); }
 
-  .dash-grid {
+  /* --- Decks row --- */
+  .decks-row {
     display: grid;
-    grid-template-columns: 1fr 320px;
+    grid-template-columns: 1fr 1fr;
     gap: 1.25rem;
-    align-items: flex-start;
+    align-items: stretch;
+    margin-bottom: 1.25rem;
   }
 
-  @media (max-width: 900px) {
-    .dash-grid { grid-template-columns: 1fr; }
+  @media (max-width: 700px) {
+    .decks-row { grid-template-columns: 1fr; }
   }
 
-  /* --- Now Playing --- */
-  .now-playing {
+  .deck-panel {
     background: var(--bg-dark);
     border: 1px solid var(--border-subtle);
     border-radius: 12px;
-    padding: 1.25rem 1.5rem;
+    padding: 1.1rem 1.3rem;
+    min-width: 0;
   }
 
-  .np-status-row {
+  .deck-header-row {
     display: flex;
     align-items: center;
     justify-content: space-between;
     margin-bottom: 0.75rem;
   }
+
+  .deck-label {
+    font-size: 0.72rem;
+    font-weight: 800;
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+    color: var(--text-muted);
+  }
+
+  .deck-controls {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+  }
+
+  .deck-btn {
+    background: var(--bg-darker);
+    border: 1px solid var(--border-subtle);
+    border-radius: 6px;
+    color: var(--text-main);
+    width: 30px;
+    height: 26px;
+    font-size: 0.8rem;
+    cursor: pointer;
+    transition: border-color 0.12s;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .deck-btn:hover { border-color: var(--accent); }
+  .deck-btn.eject:hover { border-color: var(--danger); color: var(--danger); }
+  .deck-btn:disabled { opacity: 0.3; cursor: default; }
 
   .transport-badge {
     font-size: 0.68rem;
@@ -79,34 +113,36 @@
     border-radius: 4px;
   }
   .transport-badge.PLAYING { background: rgba(34, 197, 94, 0.15); color: var(--accent); }
+  .transport-badge.PAUSED  { background: rgba(217, 119, 6, 0.2); color: #d97706; }
   .transport-badge.STOPPED { background: rgba(249, 115, 115, 0.15); color: var(--danger); }
   .transport-badge.OFFLINE { background: rgba(148, 163, 184, 0.15); color: var(--text-muted); }
   .transport-badge.STALE   { background: rgba(217, 119, 6, 0.2); color: #d97706; }
 
-  .np-clock {
-    font-size: 0.82rem;
-    color: var(--text-muted);
-    font-variant-numeric: tabular-nums;
-  }
-
   .np-meta {
-    margin-bottom: 0.75rem;
+    margin-bottom: 0.6rem;
+    min-height: 3.6rem;
   }
 
   .np-title {
-    font-size: 1.6rem;
+    font-size: 1.3rem;
     font-weight: 800;
     line-height: 1.2;
-    margin-bottom: 0.2rem;
+    margin-bottom: 0.15rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .np-artist {
-    font-size: 1.05rem;
+    font-size: 0.95rem;
     color: var(--text-muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .np-album {
-    font-size: 0.82rem;
+    font-size: 0.78rem;
     color: var(--text-muted);
     opacity: 0.7;
     margin-top: 0.1rem;
@@ -114,7 +150,7 @@
 
   .np-category {
     display: inline-block;
-    font-size: 0.68rem;
+    font-size: 0.65rem;
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.5px;
@@ -128,12 +164,12 @@
   /* --- Waveform --- */
   .np-waveform {
     position: relative;
-    margin: 0.75rem 0;
+    margin: 0.65rem 0;
   }
 
   .np-waveform canvas {
     width: 100%;
-    height: 64px;
+    height: 56px;
     display: block;
     border-radius: 6px;
   }
@@ -151,16 +187,16 @@
   .np-timing {
     display: flex;
     align-items: center;
-    gap: 1rem;
-    margin-top: 0.5rem;
+    gap: 0.85rem;
+    margin-top: 0.4rem;
   }
 
   .np-countdown {
-    font-size: 2rem;
+    font-size: 1.6rem;
     font-weight: 800;
     font-variant-numeric: tabular-nums;
     color: var(--accent);
-    min-width: 90px;
+    min-width: 76px;
   }
 
   .np-countdown.warning { color: #d97706; }
@@ -197,52 +233,20 @@
     font-variant-numeric: tabular-nums;
   }
 
-  /* --- Next Up --- */
-  .next-up {
-    background: var(--bg-dark);
-    border: 1px solid var(--border-subtle);
-    border-radius: 10px;
-    padding: 0.85rem 1rem;
-    margin-top: 1rem;
-    display: flex;
-    align-items: center;
-    gap: 0.75rem;
-  }
-
-  .next-up-label {
-    font-size: 0.65rem;
-    font-weight: 700;
-    text-transform: uppercase;
-    letter-spacing: 1px;
+  .deck-empty {
+    text-align: center;
+    padding: 2.25rem 1rem;
     color: var(--text-muted);
-    flex-shrink: 0;
-  }
-
-  .next-up-info {
-    flex: 1;
-    min-width: 0;
-  }
-
-  .next-up-title {
     font-size: 0.9rem;
-    font-weight: 700;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
   }
 
-  .next-up-artist {
-    font-size: 0.78rem;
-    color: var(--text-muted);
+  .deck-empty .offline-icon {
+    font-size: 1.8rem;
+    margin-bottom: 0.5rem;
+    opacity: 0.4;
   }
 
-  .next-up-dur {
-    font-size: 0.78rem;
-    color: var(--text-muted);
-    flex-shrink: 0;
-  }
-
-  /* --- Sidebar queue --- */
+  /* --- Coming Up (below decks, full width, horizontal) --- */
   .queue-panel {
     background: var(--bg-dark);
     border: 1px solid var(--border-subtle);
@@ -258,59 +262,37 @@
     margin-bottom: 0.6rem;
   }
 
+  .queue-row {
+    display: flex;
+    gap: 0.6rem;
+    overflow-x: auto;
+    padding-bottom: 0.4rem;
+  }
+
   .queue-item {
     display: flex;
-    align-items: center;
-    gap: 0.5rem;
-    padding: 0.4rem 0.5rem;
-    border-radius: 5px;
-    margin-bottom: 2px;
+    flex-direction: column;
+    gap: 0.2rem;
+    padding: 0.5rem 0.65rem;
+    border-radius: 8px;
+    background: rgba(148, 163, 184, 0.06);
     font-size: 0.8rem;
+    flex-shrink: 0;
+    width: 170px;
     transition: background 0.1s;
   }
 
-  .queue-item:hover { background: rgba(148, 163, 184, 0.06); }
+  .queue-item:hover { background: rgba(148, 163, 184, 0.1); }
+
+  .queue-item .qi-top {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
 
   .queue-item .qi-pos {
-    width: 20px;
-    font-size: 0.7rem;
+    font-size: 0.68rem;
     color: var(--text-muted);
-    text-align: center;
-    flex-shrink: 0;
-  }
-
-  .queue-item .qi-info {
-    flex: 1;
-    min-width: 0;
-  }
-
-  .queue-item .qi-title {
-    font-weight: 600;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-
-  .queue-item .qi-artist {
-    font-size: 0.72rem;
-    color: var(--text-muted);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-
-  .queue-item .qi-dur {
-    font-size: 0.72rem;
-    color: var(--text-muted);
-    flex-shrink: 0;
-    font-variant-numeric: tabular-nums;
-  }
-
-  .queue-item .qi-cat {
-    font-size: 0.65rem;
-    color: var(--text-muted);
-    opacity: 0.7;
-    flex-shrink: 0;
   }
 
   .queue-item .qi-next-btn {
@@ -328,9 +310,32 @@
   .queue-item:hover .qi-next-btn { opacity: 1; }
   .queue-item .qi-next-btn:hover { color: var(--accent); border-color: var(--accent); }
 
+  .queue-item .qi-title {
+    font-weight: 600;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .queue-item .qi-artist {
+    font-size: 0.72rem;
+    color: var(--text-muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .queue-item .qi-bottom {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-size: 0.68rem;
+    color: var(--text-muted);
+  }
+
   .queue-item[draggable="true"] { cursor: grab; }
   .queue-item[draggable="true"]:active { cursor: grabbing; }
-  .queue-item.drag-over { border-top: 2px solid var(--accent); }
+  .queue-item.drag-over { border-left: 2px solid var(--accent); }
   .queue-item.dragging { opacity: 0.3; }
 
   .queue-empty {
@@ -348,6 +353,7 @@
 
   .queue-insert-input {
     width: 100%;
+    max-width: 320px;
     background: var(--bg-darker);
     border: 1px solid var(--border-subtle);
     border-radius: 6px;
@@ -360,16 +366,17 @@
 
   .queue-insert-results {
     position: absolute;
-    bottom: 100%;
+    top: 100%;
     left: 0;
     right: 0;
+    max-width: 320px;
     background: var(--bg-dark);
     border: 1px solid var(--border-subtle);
     border-radius: 8px;
     max-height: 250px;
     overflow-y: auto;
     display: none;
-    margin-bottom: 4px;
+    margin-top: 4px;
     z-index: 10;
   }
   .queue-insert-results.visible { display: block; }
@@ -386,19 +393,6 @@
   .qir-item:hover { background: rgba(148, 163, 184, 0.1); }
   .qir-item .qir-artist { color: var(--text-muted); font-size: 0.72rem; }
   .qir-item .qir-dur { color: var(--text-muted); font-size: 0.7rem; margin-left: auto; }
-
-  .offline-msg {
-    text-align: center;
-    padding: 3rem 1rem;
-    color: var(--text-muted);
-    font-size: 0.95rem;
-  }
-
-  .offline-msg .offline-icon {
-    font-size: 2rem;
-    margin-bottom: 0.5rem;
-    opacity: 0.4;
-  }
 </style>
 {% endblock %}
 
@@ -413,42 +407,47 @@
   <button class="playnow-btn" onclick="playNow()">Play Now</button>
   <span class="playnow-msg" id="playNowMsg"></span>
 </div>
-<div class="dash-grid">
-  <div>
-    <div class="now-playing" id="nowPlaying">
-      <div class="offline-msg" id="offlineMsg">
-        <div class="offline-icon">&#9654;</div>
-        Engine not running
-      </div>
-    </div>
-    <div class="next-up" id="nextUp" style="display:none;"></div>
-  </div>
 
-  <div class="queue-panel" id="queuePanel">
-    <h3>Coming Up</h3>
-    <div id="queueList">
-      <div class="queue-empty">No queue data</div>
-    </div>
-    <div class="queue-insert">
-      <input type="text" class="queue-insert-input" id="queueInsertSearch"
-             placeholder="Search to add track...">
-      <div class="queue-insert-results" id="queueInsertResults"></div>
-    </div>
+<div class="decks-row">
+  <div class="deck-panel" id="deck-A"></div>
+  <div class="deck-panel" id="deck-B"></div>
+</div>
+
+<div class="queue-panel" id="queuePanel">
+  <h3>Coming Up</h3>
+  <div class="queue-row" id="queueList">
+    <div class="queue-empty">No queue data</div>
+  </div>
+  <div class="queue-insert">
+    <input type="text" class="queue-insert-input" id="queueInsertSearch"
+           placeholder="Search to add track...">
+    <div class="queue-insert-results" id="queueInsertResults"></div>
   </div>
 </div>
 {% endblock %}
 
 {% block extra_js %}
 <script>
-let lastTrackId = null;
-let waveformSamples = null;
-let waveformCueIn = null;
-let waveformNextStart = null;
-let waveformAnalysisDuration = null;
-let localPosition = 0;
-let localDuration = 0;
-let localNextStart = 0;
-let lastPollTime = 0;
+const SLOTS = ['A', 'B'];
+
+// Per-slot mutable state, keyed by slot letter.
+const deckState = {};
+SLOTS.forEach(s => {
+  deckState[s] = {
+    lastTrackId: null,
+    localPosition: 0,
+    localDuration: 0,
+    localNextStart: 0,
+    lastPollTime: 0,
+    deckBuilt: false,
+    paused: false,
+  };
+});
+
+const waveformState = {};
+SLOTS.forEach(s => {
+  waveformState[s] = { samples: null, cueIn: null, nextStart: null, analysisDuration: null };
+});
 
 function fmtDur(sec) {
   if (!sec && sec !== 0) return '0:00';
@@ -465,6 +464,13 @@ function getCookie(name) {
       val = decodeURIComponent(c.substring(name.length + 1));
   });
   return val;
+}
+
+function esc(s) {
+  if (!s) return '';
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
 }
 
 async function playNow() {
@@ -492,13 +498,6 @@ async function playNow() {
   sel.value = '';
 }
 
-function esc(s) {
-  if (!s) return '';
-  const d = document.createElement('div');
-  d.textContent = s;
-  return d.innerHTML;
-}
-
 async function fetchStatus() {
   try {
     const resp = await fetch('/api/engine/status/');
@@ -509,24 +508,27 @@ async function fetchStatus() {
   }
 }
 
-async function loadWaveform(trackId) {
+async function loadWaveform(slot, trackId) {
   try {
     const resp = await fetch(`/api/waveform/${trackId}/`);
-    if (!resp.ok) { waveformSamples = null; return; }
+    if (!resp.ok) { waveformState[slot].samples = null; return; }
     const data = await resp.json();
-    waveformSamples = data.samples;
-    waveformCueIn = data.cue_in_seconds;
-    waveformNextStart = data.next_start;
-    waveformAnalysisDuration = data.analysis_duration;
-    drawWaveform();
+    waveformState[slot] = {
+      samples: data.samples,
+      cueIn: data.cue_in_seconds,
+      nextStart: data.next_start,
+      analysisDuration: data.analysis_duration,
+    };
+    drawWaveform(slot);
   } catch {
-    waveformSamples = null;
+    waveformState[slot].samples = null;
   }
 }
 
-function drawWaveform() {
-  const canvas = document.getElementById('npWaveform');
-  if (!canvas || !waveformSamples) return;
+function drawWaveform(slot) {
+  const canvas = document.getElementById(`npWaveform-${slot}`);
+  const wf = waveformState[slot];
+  if (!canvas || !wf.samples) return;
 
   const dpr = window.devicePixelRatio || 1;
   const rect = canvas.getBoundingClientRect();
@@ -537,23 +539,23 @@ function drawWaveform() {
 
   const w = rect.width;
   const h = rect.height;
-  const n = waveformSamples.length;
+  const n = wf.samples.length;
 
   ctx.clearRect(0, 0, w, h);
   ctx.fillStyle = 'rgba(34, 197, 94, 0.35)';
 
   for (let i = 0; i < n; i++) {
-    const level = waveformSamples[i] / 255;
+    const level = wf.samples[i] / 255;
     const barH = level * h;
     const x = (i / n) * w;
     const barW = Math.ceil(w / n);
     ctx.fillRect(x, h - barH, barW, barH);
   }
 
-  const dur = waveformAnalysisDuration || localDuration || 1;
+  const dur = wf.analysisDuration || deckState[slot].localDuration || 1;
 
-  if (waveformCueIn && waveformCueIn > 0) {
-    const x = (waveformCueIn / dur) * w;
+  if (wf.cueIn && wf.cueIn > 0) {
+    const x = (wf.cueIn / dur) * w;
     ctx.strokeStyle = '#3b82f6';
     ctx.lineWidth = 2;
     ctx.setLineDash([4, 3]);
@@ -564,8 +566,8 @@ function drawWaveform() {
     ctx.setLineDash([]);
   }
 
-  if (waveformNextStart) {
-    const x = (waveformNextStart / dur) * w;
+  if (wf.nextStart) {
+    const x = (wf.nextStart / dur) * w;
     ctx.strokeStyle = '#f97373';
     ctx.lineWidth = 2;
     ctx.setLineDash([4, 3]);
@@ -577,146 +579,162 @@ function drawWaveform() {
   }
 }
 
-function updatePositionIndicator() {
-  const line = document.getElementById('posLine');
-  if (!line || !localDuration) return;
+function updatePositionIndicators() {
+  SLOTS.forEach(slot => {
+    const st = deckState[slot];
+    const line = document.getElementById(`posLine-${slot}`);
+    if (!line || !st.localDuration) return;
 
-  const elapsed = (Date.now() - lastPollTime) / 1000;
-  const pos = localPosition + elapsed;
-  const pct = Math.min(100, (pos / localDuration) * 100);
-  line.style.left = pct + '%';
+    let pos = st.localPosition;
+    if (!st.paused) {
+      const elapsed = (Date.now() - st.lastPollTime) / 1000;
+      pos = st.localPosition + elapsed;
+    }
+    const pct = Math.min(100, (pos / st.localDuration) * 100);
+    line.style.left = pct + '%';
 
-  // Update countdown
-  const countdownEl = document.getElementById('npCountdown');
-  if (countdownEl && localNextStart) {
-    const remaining = Math.max(0, localNextStart - pos);
-    countdownEl.textContent = fmtDur(remaining);
-    countdownEl.className = 'np-countdown' +
-      (remaining < 10 ? ' critical' : remaining < 30 ? ' warning' : '');
-  }
+    const countdownEl = document.getElementById(`npCountdown-${slot}`);
+    if (countdownEl && st.localNextStart) {
+      const remaining = Math.max(0, st.localNextStart - pos);
+      countdownEl.textContent = fmtDur(remaining);
+      countdownEl.className = 'np-countdown' +
+        (remaining < 10 ? ' critical' : remaining < 30 ? ' warning' : '');
+    }
 
-  // Update progress bar
-  const fill = document.getElementById('npProgressFill');
-  if (fill) fill.style.width = pct + '%';
+    const fill = document.getElementById(`npProgressFill-${slot}`);
+    if (fill) fill.style.width = pct + '%';
 
-  // Update elapsed time
-  const elapsedEl = document.getElementById('npElapsed');
-  if (elapsedEl) elapsedEl.textContent = fmtDur(pos);
+    const elapsedEl = document.getElementById(`npElapsed-${slot}`);
+    if (elapsedEl) elapsedEl.textContent = fmtDur(pos);
+  });
 }
 
-let deckBuilt = false;
-
-function buildDeckDOM(data) {
-  const np = data.now_playing;
-  const container = document.getElementById('nowPlaying');
+function buildDeckDOM(slot) {
+  const container = document.getElementById(`deck-${slot}`);
 
   container.innerHTML = `
-    <div class="np-status-row">
-      <span class="transport-badge" id="transportBadge"></span>
-      <span class="np-clock" id="liveClock"></span>
+    <div class="deck-header-row">
+      <span class="deck-label">Deck ${slot}</span>
+      <div class="deck-controls">
+        <span class="transport-badge" id="transportBadge-${slot}"></span>
+        <button class="deck-btn" id="playPauseBtn-${slot}" title="Play/Pause">&#9654;</button>
+        <button class="deck-btn eject" id="ejectBtn-${slot}" title="Eject">&#9169;</button>
+      </div>
     </div>
     <div class="np-meta">
-      <div class="np-title" id="npTitle"></div>
-      <div class="np-artist" id="npArtist"></div>
-      <div class="np-album" id="npAlbum"></div>
-      <span class="np-category" id="npCategory"></span>
+      <div class="np-title" id="npTitle-${slot}"></div>
+      <div class="np-artist" id="npArtist-${slot}"></div>
+      <div class="np-album" id="npAlbum-${slot}"></div>
+      <span class="np-category" id="npCategory-${slot}"></span>
     </div>
     <div class="np-waveform">
-      <canvas id="npWaveform"></canvas>
-      <div class="position-line" id="posLine"></div>
+      <canvas id="npWaveform-${slot}"></canvas>
+      <div class="position-line" id="posLine-${slot}"></div>
     </div>
     <div class="np-timing">
-      <div class="np-countdown" id="npCountdown"></div>
+      <div class="np-countdown" id="npCountdown-${slot}"></div>
       <div class="np-progress-wrap">
         <div class="np-progress-bar">
-          <div class="np-progress-fill" id="npProgressFill"></div>
+          <div class="np-progress-fill" id="npProgressFill-${slot}"></div>
         </div>
         <div class="np-times">
-          <span id="npElapsed"></span>
-          <span id="npTotal"></span>
+          <span id="npElapsed-${slot}"></span>
+          <span id="npTotal-${slot}"></span>
         </div>
       </div>
     </div>
   `;
 
-  deckBuilt = true;
+  deckState[slot].deckBuilt = true;
 
-  document.getElementById('npProgressFill').parentElement.addEventListener('click', function(e) {
-    if (!localDuration) return;
+  document.getElementById(`npProgressFill-${slot}`).parentElement.addEventListener('click', function(e) {
+    if (!deckState[slot].localDuration) return;
     const rect = this.getBoundingClientRect();
     const pct = (e.clientX - rect.left) / rect.width;
-    const pos = pct * localDuration;
-    seekTo(Math.max(0, Math.min(localDuration, pos)));
+    const pos = pct * deckState[slot].localDuration;
+    seekTo(slot, Math.max(0, Math.min(deckState[slot].localDuration, pos)));
+  });
+
+  document.getElementById(`playPauseBtn-${slot}`).addEventListener('click', () => {
+    deckCommand(slot, deckState[slot].paused ? 'resume' : 'pause');
+  });
+  document.getElementById(`ejectBtn-${slot}`).addEventListener('click', () => {
+    deckCommand(slot, 'eject');
   });
 }
 
-function renderNowPlaying(data) {
-  const np = data.now_playing;
-  const container = document.getElementById('nowPlaying');
-  const nextUpEl = document.getElementById('nextUp');
+function renderDeck(slot, deck, transport) {
+  const container = document.getElementById(`deck-${slot}`);
+  const st = deckState[slot];
 
-  if (!np || data.transport === 'OFFLINE' || data.transport === 'STOPPED') {
+  if (!deck || transport === 'OFFLINE' || transport === 'STOPPED') {
     container.innerHTML = `
-      <div class="offline-msg">
-        <div class="offline-icon">${data.transport === 'STOPPED' ? '&#9632;' : '&#9654;'}</div>
-        ${data.transport === 'STOPPED' ? 'Engine stopped' : 'Engine not running'}
+      <div class="deck-header-row">
+        <span class="deck-label">Deck ${slot}</span>
+      </div>
+      <div class="deck-empty">
+        <div class="offline-icon">${transport === 'STOPPED' ? '&#9632;' : '&#9654;'}</div>
+        ${!deck && (transport === 'PLAYING' || transport === 'STALE') ? 'Nothing loaded' : (transport === 'STOPPED' ? 'Engine stopped' : 'Engine not running')}
       </div>
     `;
-    nextUpEl.style.display = 'none';
-    lastTrackId = null;
-    deckBuilt = false;
+    st.lastTrackId = null;
+    st.deckBuilt = false;
     return;
   }
 
-  // Build DOM structure once, then just update values
-  if (!deckBuilt) buildDeckDOM(data);
+  if (!st.deckBuilt) buildDeckDOM(slot);
 
-  // Update track info only on track change
-  if (np.track_id !== lastTrackId) {
-    lastTrackId = np.track_id;
-    loadWaveform(np.track_id);
+  if (deck.track_id !== st.lastTrackId) {
+    st.lastTrackId = deck.track_id;
+    loadWaveform(slot, deck.track_id);
 
-    document.getElementById('npTitle').textContent = np.title || '';
-    document.getElementById('npArtist').textContent = np.artist || '';
-    const albumEl = document.getElementById('npAlbum');
-    albumEl.textContent = np.album || '';
-    albumEl.style.display = np.album ? '' : 'none';
-    const catEl = document.getElementById('npCategory');
-    catEl.textContent = np.category || '';
-    catEl.style.display = np.category ? '' : 'none';
-    document.getElementById('npTotal').textContent = fmtDur(np.duration);
+    document.getElementById(`npTitle-${slot}`).textContent = deck.title || '';
+    document.getElementById(`npArtist-${slot}`).textContent = deck.artist || '';
+    const albumEl = document.getElementById(`npAlbum-${slot}`);
+    albumEl.textContent = deck.album || '';
+    albumEl.style.display = deck.album ? '' : 'none';
+    const catEl = document.getElementById(`npCategory-${slot}`);
+    catEl.textContent = deck.category || '';
+    catEl.style.display = deck.category ? '' : 'none';
+    document.getElementById(`npTotal-${slot}`).textContent = fmtDur(deck.duration);
   }
 
-  // Update transport badge
-  const badge = document.getElementById('transportBadge');
-  badge.textContent = data.transport;
-  badge.className = 'transport-badge ' + data.transport;
+  st.paused = !!deck.paused;
 
-  // Update position timing
-  localPosition = np.position || 0;
-  localDuration = np.duration || 0;
-  localNextStart = np.next_start || localDuration;
-  lastPollTime = Date.now();
+  const badge = document.getElementById(`transportBadge-${slot}`);
+  const badgeState = st.paused ? 'PAUSED' : transport;
+  badge.textContent = badgeState;
+  badge.className = 'transport-badge ' + badgeState;
 
-  // Next up
-  if (data.next_up) {
-    const nu = data.next_up;
-    nextUpEl.style.display = '';
-    nextUpEl.innerHTML = `
-      <span class="next-up-label">Next</span>
-      <div class="next-up-info">
-        <div class="next-up-title">${esc(nu.title)}</div>
-        <div class="next-up-artist">${esc(nu.artist)}</div>
-      </div>
-      <span class="next-up-dur">${fmtDur(nu.duration)}</span>
-    `;
-  } else {
-    nextUpEl.style.display = 'none';
-  }
+  const playPauseBtn = document.getElementById(`playPauseBtn-${slot}`);
+  if (playPauseBtn) playPauseBtn.innerHTML = st.paused ? '&#9654;' : '&#10074;&#10074;';
+
+  st.localPosition = deck.position || 0;
+  st.localDuration = deck.duration || 0;
+  st.localNextStart = deck.next_start || st.localDuration;
+  st.lastPollTime = Date.now();
+}
+
+async function deckCommand(slot, action) {
+  await fetch(`/api/engine/deck/${slot}/`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') },
+    body: JSON.stringify({ action }),
+  });
+  poll();
+}
+
+async function seekTo(slot, seconds) {
+  await fetch('/api/engine/seek/', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') },
+    body: JSON.stringify({ position: seconds }),
+  });
+  deckState[slot].localPosition = seconds;
+  deckState[slot].lastPollTime = Date.now();
 }
 
 let currentLogId = null;
-let currentEngineIndex = 0;
 let queueItemIds = [];
 let insertDebounce = null;
 
@@ -724,7 +742,6 @@ function renderQueue(data) {
   const list = document.getElementById('queueList');
   const queue = data.queue || [];
   currentLogId = data.log_id;
-  currentEngineIndex = data.current_index || 0;
 
   if (!queue.length) {
     list.innerHTML = '<div class="queue-empty">No upcoming tracks</div>';
@@ -736,14 +753,16 @@ function renderQueue(data) {
 
   list.innerHTML = queue.map((q, i) => `
     <div class="queue-item" draggable="true" data-item-id="${q.item_id}">
-      <span class="qi-pos">${i + 1}</span>
-      <div class="qi-info">
-        <div class="qi-title">${esc(q.title)}</div>
-        <div class="qi-artist">${esc(q.artist)}</div>
+      <div class="qi-top">
+        <span class="qi-pos">${i + 1}</span>
+        <button class="qi-next-btn" onclick="event.stopPropagation(); setNext(${q.item_id})">next</button>
       </div>
-      <button class="qi-next-btn" onclick="event.stopPropagation(); setNext(${q.item_id})">next</button>
-      <span class="qi-cat">${esc(q.category)}</span>
-      <span class="qi-dur">${fmtDur(q.duration)}</span>
+      <div class="qi-title">${esc(q.title)}</div>
+      <div class="qi-artist">${esc(q.artist)}</div>
+      <div class="qi-bottom">
+        <span>${esc(q.category)}</span>
+        <span>${fmtDur(q.duration)}</span>
+      </div>
     </div>
   `).join('');
 
@@ -778,10 +797,11 @@ function initQueueDrag() {
       const order = [...list.querySelectorAll('.queue-item')].map(
         el => parseInt(el.dataset.itemId)
       );
-      await fetch('/api/engine/queue/reorder/', {
+      if (!currentLogId) return;
+      await fetch(`/api/log/${currentLogId}/reorder/`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') },
-        body: JSON.stringify({ log_id: currentLogId, order }),
+        body: JSON.stringify({ order }),
       });
     });
   });
@@ -794,16 +814,6 @@ async function setNext(itemId) {
     body: JSON.stringify({ item_id: itemId }),
   });
   poll();
-}
-
-async function seekTo(seconds) {
-  await fetch('/api/engine/seek/', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') },
-    body: JSON.stringify({ position: seconds }),
-  });
-  localPosition = seconds;
-  lastPollTime = Date.now();
 }
 
 // --- Search to insert ---
@@ -853,34 +863,22 @@ async function insertTrack(trackId) {
   poll();
 }
 
-function updateClock() {
-  const el = document.getElementById('liveClock');
-  if (el) {
-    const now = new Date();
-    el.textContent = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
-  }
-}
-
 // --- Main poll loop ---
 async function poll() {
   const data = await fetchStatus();
-  if (data) {
-    renderNowPlaying(data);
-    renderQueue(data);
-  }
+  if (!data) return;
+  const decks = data.decks || {};
+  SLOTS.forEach(slot => renderDeck(slot, decks[slot], data.transport));
+  renderQueue(data);
 }
 
 // Poll engine status every 1 second
 setInterval(poll, 1000);
 
 // Update position/countdown smoothly between polls
-setInterval(updatePositionIndicator, 100);
-
-// Update clock every second
-setInterval(updateClock, 1000);
+setInterval(updatePositionIndicators, 100);
 
 // Initial load
 poll();
-updateClock();
 </script>
 {% endblock %}
