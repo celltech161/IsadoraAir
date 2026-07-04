@@ -1,0 +1,606 @@
+{% extends "base.html" %}
+
+{% block title %}Playlists — IsadoraAir{% endblock %}
+{% block nav_playlists %}class="active"{% endblock %}
+
+{% block extra_css %}
+<style>
+  .pl-toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.6rem;
+    align-items: center;
+    margin-bottom: 0.75rem;
+  }
+
+  .pl-select, .pl-input {
+    background: var(--bg-dark);
+    border: 1px solid var(--border-subtle);
+    border-radius: 8px;
+    padding: 0.45rem 0.65rem;
+    color: var(--text-main);
+    font-size: 0.85rem;
+  }
+  .pl-select:focus, .pl-input:focus { outline: none; border-color: var(--accent); }
+  .pl-select { cursor: pointer; min-width: 220px; }
+
+  .pl-btn {
+    background: var(--bg-dark);
+    border: 1px solid var(--border-subtle);
+    border-radius: 8px;
+    color: var(--text-main);
+    padding: 0.45rem 0.9rem;
+    font-size: 0.82rem;
+    cursor: pointer;
+    transition: border-color 0.12s;
+  }
+  .pl-btn:hover { border-color: var(--accent); }
+  .pl-btn.danger { color: var(--danger); }
+  .pl-btn.danger:hover { border-color: var(--danger); }
+  .pl-btn:disabled { opacity: 0.4; cursor: default; }
+
+  .pl-msg {
+    font-size: 0.8rem;
+    color: var(--text-muted);
+  }
+  .pl-msg.error { color: var(--danger); }
+
+  .pl-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.6rem;
+    margin-bottom: 1rem;
+  }
+  .pl-meta .pl-input { flex: 1; min-width: 200px; }
+  #playlistNameInput { max-width: 320px; }
+
+  .pl-empty {
+    text-align: center;
+    padding: 3rem 1rem;
+    color: var(--text-muted);
+    font-size: 0.9rem;
+  }
+
+  /* --- Two-pane layout --- */
+  .pl-wrap {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1.25rem;
+    align-items: flex-start;
+  }
+  @media (max-width: 900px) {
+    .pl-wrap { grid-template-columns: 1fr; }
+  }
+
+  .pl-pane {
+    background: var(--bg-dark);
+    border: 1px solid var(--border-subtle);
+    border-radius: 10px;
+    padding: 0.85rem;
+  }
+
+  .pl-pane h3 {
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: var(--text-muted);
+    margin-bottom: 0.6rem;
+  }
+
+  .pl-search-toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    margin-bottom: 0.6rem;
+  }
+  .pl-search-toolbar .pl-input { flex: 1; min-width: 160px; }
+
+  .pl-ready-toggle {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    font-size: 0.78rem;
+    color: var(--text-muted);
+    white-space: nowrap;
+  }
+
+  .pl-results {
+    max-height: 520px;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .pl-result {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.4rem 0.55rem;
+    border-radius: 6px;
+    font-size: 0.8rem;
+    transition: background 0.1s;
+  }
+  .pl-result:hover { background: rgba(148, 163, 184, 0.08); }
+
+  .pl-result .pr-title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pl-result .pr-artist { color: var(--text-muted); font-size: 0.75rem; width: 140px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pl-result .pr-dur { color: var(--text-muted); width: 42px; text-align: right; }
+
+  .pl-add-btn {
+    background: rgba(34, 197, 94, 0.12);
+    border: 1px solid rgba(34, 197, 94, 0.3);
+    color: var(--accent);
+    border-radius: 5px;
+    width: 24px;
+    height: 24px;
+    line-height: 1;
+    font-size: 0.9rem;
+    font-weight: 700;
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+  .pl-add-btn:hover { background: rgba(34, 197, 94, 0.22); }
+
+  .pl-hint {
+    color: var(--text-muted);
+    font-size: 0.78rem;
+    padding: 0.5rem;
+  }
+
+  /* --- Items table --- */
+  .pl-items-wrap {
+    overflow-x: auto;
+    border-radius: 8px;
+    border: 1px solid var(--border-subtle);
+    max-height: 520px;
+    overflow-y: auto;
+  }
+
+  table.pl-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.8rem;
+  }
+
+  table.pl-table th {
+    background: var(--bg-darker);
+    color: var(--text-muted);
+    font-weight: 600;
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    padding: 0.45rem 0.6rem;
+    text-align: left;
+    border-bottom: 1px solid var(--border-subtle);
+    position: sticky;
+    top: 0;
+  }
+
+  table.pl-table td {
+    padding: 0.4rem 0.6rem;
+    border-bottom: 1px solid rgba(148, 163, 184, 0.08);
+    color: var(--text-main);
+  }
+
+  table.pl-table tr[draggable="true"] { cursor: grab; }
+  table.pl-table tr[draggable="true"]:active { cursor: grabbing; }
+  table.pl-table tr.drag-over td { border-top: 2px solid var(--accent); }
+  table.pl-table tr.dragging td { opacity: 0.3; }
+
+  td.pl-col-pos, td.pl-col-dur { color: var(--text-muted); text-align: center; white-space: nowrap; }
+  td.pl-col-cat { color: var(--text-muted); font-size: 0.72rem; }
+
+  .pl-remove-btn {
+    background: none;
+    border: 1px solid var(--border-subtle);
+    border-radius: 4px;
+    color: var(--text-muted);
+    font-size: 0.7rem;
+    padding: 0.1rem 0.4rem;
+    cursor: pointer;
+    transition: color 0.12s, border-color 0.12s;
+  }
+  .pl-remove-btn:hover { color: var(--danger); border-color: var(--danger); }
+
+  .pl-total {
+    margin-top: 0.5rem;
+    font-size: 0.8rem;
+    color: var(--text-muted);
+    text-align: right;
+  }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="pl-toolbar">
+  <select class="pl-select" id="playlistSelect">
+    <option value="">Select a playlist...</option>
+  </select>
+  <button class="pl-btn" onclick="createPlaylist()">New Playlist</button>
+  <button class="pl-btn danger" id="deletePlaylistBtn" onclick="deleteCurrentPlaylist()" disabled>Delete</button>
+  <span class="pl-msg" id="playlistMsg"></span>
+</div>
+
+<div class="pl-meta" id="playlistMeta" style="display:none;">
+  <input type="text" class="pl-input" id="playlistNameInput" placeholder="Playlist name">
+  <input type="text" class="pl-input" id="playlistDescInput" placeholder="Description (optional)">
+</div>
+
+<div class="pl-empty" id="noPlaylistMsg">Select an existing playlist above, or create a new one.</div>
+
+<div class="pl-wrap" id="playlistWrap" style="display:none;">
+  <div class="pl-pane">
+    <h3>Add Tracks</h3>
+    <div class="pl-search-toolbar">
+      <input type="text" class="pl-input" id="trackSearchInput" placeholder="Search title, artist, album...">
+      <select class="pl-select" id="trackCategoryFilter" style="min-width:140px;">
+        <option value="">All categories</option>
+        {% for cat in categories %}
+        <option value="{{ cat.id }}">{{ cat.name }}</option>
+        {% endfor %}
+      </select>
+      <label class="pl-ready-toggle">
+        <input type="checkbox" id="readyOnlyToggle" checked> Ready to air only
+      </label>
+    </div>
+    <div class="pl-results" id="searchResults">
+      <div class="pl-hint">Type at least 2 characters, or pick a category, to search the library.</div>
+    </div>
+  </div>
+
+  <div class="pl-pane">
+    <h3>Playlist Items</h3>
+    <div class="pl-items-wrap">
+      <table class="pl-table">
+        <thead>
+          <tr>
+            <th></th>
+            <th>#</th>
+            <th>Artist</th>
+            <th>Title</th>
+            <th>Cat</th>
+            <th>Dur</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="itemsTbody"></tbody>
+      </table>
+    </div>
+    <div class="pl-total" id="playlistTotal"></div>
+  </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+let currentPlaylist = null;
+let searchDebounce = null;
+
+function getCookie(name) {
+  let val = null;
+  document.cookie.split(';').forEach(c => {
+    c = c.trim();
+    if (c.startsWith(name + '='))
+      val = decodeURIComponent(c.substring(name.length + 1));
+  });
+  return val;
+}
+
+function esc(s) {
+  if (!s) return '';
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+function fmtDuration(sec) {
+  if (!sec && sec !== 0) return '';
+  const m = Math.floor(sec / 60);
+  const s = Math.round(sec % 60);
+  return m + ':' + String(s).padStart(2, '0');
+}
+
+function setMsg(text, isError) {
+  const el = document.getElementById('playlistMsg');
+  el.textContent = text || '';
+  el.className = 'pl-msg' + (isError ? ' error' : '');
+}
+
+async function apiJson(url, options) {
+  const resp = await fetch(url, options);
+  let data = null;
+  try { data = await resp.json(); } catch (e) { /* no body */ }
+  return { ok: resp.ok, data };
+}
+
+// --- Playlist list / selection ---
+async function loadPlaylistList(selectId) {
+  const resp = await fetch('/api/playlists/');
+  if (!resp.ok) return;
+  const data = await resp.json();
+
+  const select = document.getElementById('playlistSelect');
+  const prevValue = selectId !== undefined ? String(selectId) : select.value;
+
+  select.innerHTML = '<option value="">Select a playlist...</option>' +
+    data.playlists.map(p =>
+      `<option value="${p.id}">${esc(p.name)} (${p.item_count})</option>`
+    ).join('');
+
+  if (prevValue && data.playlists.some(p => String(p.id) === prevValue)) {
+    select.value = prevValue;
+  }
+}
+
+document.getElementById('playlistSelect').addEventListener('change', function() {
+  if (this.value) {
+    loadPlaylistDetail(this.value);
+  } else {
+    currentPlaylist = null;
+    document.getElementById('playlistWrap').style.display = 'none';
+    document.getElementById('playlistMeta').style.display = 'none';
+    document.getElementById('noPlaylistMsg').style.display = '';
+    document.getElementById('deletePlaylistBtn').disabled = true;
+  }
+});
+
+async function createPlaylist() {
+  const name = prompt('Name for the new playlist:');
+  if (!name || !name.trim()) return;
+
+  const { ok, data } = await apiJson('/api/playlists/', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') },
+    body: JSON.stringify({ name: name.trim() }),
+  });
+
+  if (!ok) {
+    setMsg(data && data.error ? data.error : 'Could not create playlist', true);
+    return;
+  }
+
+  setMsg('');
+  await loadPlaylistList(data.id);
+  document.getElementById('playlistSelect').value = data.id;
+  loadPlaylistDetail(data.id);
+}
+
+async function deleteCurrentPlaylist() {
+  if (!currentPlaylist) return;
+  if (!confirm(`Delete playlist "${currentPlaylist.name}"? This cannot be undone.`)) return;
+
+  const { ok, data } = await apiJson(`/api/playlists/${currentPlaylist.id}/`, {
+    method: 'DELETE',
+    headers: { 'X-CSRFToken': getCookie('csrftoken') },
+  });
+
+  if (!ok) {
+    setMsg(data && data.error ? data.error : 'Could not delete playlist', true);
+    return;
+  }
+
+  setMsg('');
+  currentPlaylist = null;
+  document.getElementById('playlistWrap').style.display = 'none';
+  document.getElementById('playlistMeta').style.display = 'none';
+  document.getElementById('noPlaylistMsg').style.display = '';
+  document.getElementById('deletePlaylistBtn').disabled = true;
+  await loadPlaylistList('');
+}
+
+async function loadPlaylistDetail(id) {
+  const resp = await fetch(`/api/playlists/${id}/`);
+  if (!resp.ok) return;
+  currentPlaylist = await resp.json();
+  renderPlaylistMeta();
+  renderItems();
+
+  document.getElementById('noPlaylistMsg').style.display = 'none';
+  document.getElementById('playlistMeta').style.display = '';
+  document.getElementById('playlistWrap').style.display = '';
+  document.getElementById('deletePlaylistBtn').disabled = false;
+}
+
+function renderPlaylistMeta() {
+  document.getElementById('playlistNameInput').value = currentPlaylist.name;
+  document.getElementById('playlistDescInput').value = currentPlaylist.description || '';
+}
+
+async function savePlaylistMeta(field, value) {
+  if (!currentPlaylist) return;
+  const { ok, data } = await apiJson(`/api/playlists/${currentPlaylist.id}/`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') },
+    body: JSON.stringify({ [field]: value }),
+  });
+
+  if (!ok) {
+    setMsg(data && data.error ? data.error : 'Could not save change', true);
+    return;
+  }
+  setMsg('');
+  currentPlaylist = data;
+  await loadPlaylistList(currentPlaylist.id);
+}
+
+document.getElementById('playlistNameInput').addEventListener('blur', function() {
+  if (currentPlaylist && this.value.trim() && this.value.trim() !== currentPlaylist.name) {
+    savePlaylistMeta('name', this.value.trim());
+  }
+});
+document.getElementById('playlistDescInput').addEventListener('blur', function() {
+  if (currentPlaylist && this.value !== currentPlaylist.description) {
+    savePlaylistMeta('description', this.value);
+  }
+});
+
+// --- Playlist items ---
+function renderItems() {
+  const tbody = document.getElementById('itemsTbody');
+  const items = currentPlaylist.items;
+
+  if (items.length === 0) {
+    tbody.innerHTML = '';
+    document.getElementById('playlistTotal').textContent = 'No tracks yet.';
+    return;
+  }
+
+  tbody.innerHTML = items.map(i => `
+    <tr data-item-id="${i.id}" draggable="true">
+      <td class="pl-col-pos" style="cursor:grab;">&#9776;</td>
+      <td class="pl-col-pos">${i.position + 1}</td>
+      <td>${esc(i.artist)}</td>
+      <td>${esc(i.title)}</td>
+      <td class="pl-col-cat">${esc(i.category_code)}</td>
+      <td class="pl-col-dur">${fmtDuration(i.duration_seconds)}</td>
+      <td><button class="pl-remove-btn" onclick="removeItem(${i.id})">remove</button></td>
+    </tr>
+  `).join('');
+
+  let totalDur = 0;
+  items.forEach(i => { totalDur += (i.duration_seconds || 0); });
+  document.getElementById('playlistTotal').textContent =
+    `${items.length} track${items.length === 1 ? '' : 's'} — ${fmtDuration(totalDur)} total`;
+
+  initDragDrop();
+}
+
+function initDragDrop() {
+  const tbody = document.getElementById('itemsTbody');
+  let dragRow = null;
+
+  tbody.querySelectorAll('tr[draggable]').forEach(row => {
+    row.addEventListener('dragstart', (e) => {
+      dragRow = row;
+      row.classList.add('dragging');
+      e.dataTransfer.effectAllowed = 'move';
+    });
+
+    row.addEventListener('dragend', () => {
+      row.classList.remove('dragging');
+      tbody.querySelectorAll('tr').forEach(r => r.classList.remove('drag-over'));
+      dragRow = null;
+    });
+
+    row.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'move';
+      tbody.querySelectorAll('tr').forEach(r => r.classList.remove('drag-over'));
+      row.classList.add('drag-over');
+    });
+
+    row.addEventListener('dragleave', () => {
+      row.classList.remove('drag-over');
+    });
+
+    row.addEventListener('drop', async (e) => {
+      e.preventDefault();
+      row.classList.remove('drag-over');
+      if (!dragRow || dragRow === row) return;
+
+      tbody.insertBefore(dragRow, row);
+
+      const order = [...tbody.querySelectorAll('tr')].map(r => parseInt(r.dataset.itemId));
+
+      const { ok, data } = await apiJson(`/api/playlists/${currentPlaylist.id}/reorder/`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') },
+        body: JSON.stringify({ order }),
+      });
+
+      if (ok) {
+        currentPlaylist = data;
+        renderItems();
+      }
+    });
+  });
+}
+
+async function removeItem(itemId) {
+  const { ok, data } = await apiJson(`/api/playlists/item/${itemId}/`, {
+    method: 'DELETE',
+    headers: { 'X-CSRFToken': getCookie('csrftoken') },
+  });
+
+  if (!ok) {
+    setMsg(data && data.error ? data.error : 'Could not remove track', true);
+    return;
+  }
+
+  currentPlaylist = data;
+  renderItems();
+  loadPlaylistList(currentPlaylist.id);
+}
+
+async function addTrack(trackId) {
+  if (!currentPlaylist) return;
+
+  const { ok, data } = await apiJson(`/api/playlists/${currentPlaylist.id}/items/`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') },
+    body: JSON.stringify({ track_id: trackId }),
+  });
+
+  if (!ok) {
+    setMsg(data && data.error ? data.error : 'Could not add track', true);
+    return;
+  }
+
+  currentPlaylist = data;
+  renderItems();
+  loadPlaylistList(currentPlaylist.id);
+}
+
+// --- Track search ---
+async function searchTracks() {
+  const q = document.getElementById('trackSearchInput').value.trim();
+  const category = document.getElementById('trackCategoryFilter').value;
+  const readyOnly = document.getElementById('readyOnlyToggle').checked;
+  const container = document.getElementById('searchResults');
+
+  if (!q && !category) {
+    container.innerHTML = '<div class="pl-hint">Type at least 2 characters, or pick a category, to search the library.</div>';
+    return;
+  }
+  if (q && q.length < 2) {
+    container.innerHTML = '<div class="pl-hint">Keep typing...</div>';
+    return;
+  }
+
+  const params = new URLSearchParams();
+  if (q) params.set('q', q);
+  if (category) params.set('category', category);
+  if (readyOnly) params.set('ready2air', 'true');
+  params.set('per_page', 40);
+
+  const resp = await fetch('/api/tracks/?' + params.toString());
+  if (!resp.ok) return;
+  const data = await resp.json();
+
+  if (data.items.length === 0) {
+    container.innerHTML = '<div class="pl-hint">No matching tracks.</div>';
+    return;
+  }
+
+  container.innerHTML = data.items.map(t => `
+    <div class="pl-result">
+      <button class="pl-add-btn" onclick="addTrack(${t.id})" title="Add to playlist">+</button>
+      <span class="pr-title">${esc(t.title)}</span>
+      <span class="pr-artist">${esc(t.artist)}</span>
+      <span class="pr-dur">${fmtDuration(t.duration_seconds)}</span>
+    </div>
+  `).join('');
+}
+
+document.getElementById('trackSearchInput').addEventListener('input', () => {
+  clearTimeout(searchDebounce);
+  searchDebounce = setTimeout(searchTracks, 300);
+});
+document.getElementById('trackCategoryFilter').addEventListener('change', searchTracks);
+document.getElementById('readyOnlyToggle').addEventListener('change', searchTracks);
+
+// --- Init ---
+loadPlaylistList();
+</script>
+{% endblock %}

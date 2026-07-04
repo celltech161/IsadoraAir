@@ -135,6 +135,14 @@
 
   .grid-cell.empty { color: transparent; }
 
+  .grid-cell.kind-playlist {
+    border-left: 3px dashed rgba(255,255,255,0.6);
+  }
+
+  .mobile-hour-cell.kind-playlist {
+    border-left: 3px dashed rgba(255,255,255,0.6);
+  }
+
   .grid-cell.now-playing {
     outline: 2px solid var(--accent);
     outline-offset: -2px;
@@ -257,16 +265,26 @@
 <div class="schedule-wrap">
   <div class="rotation-palette">
     <h3>Rotations</h3>
-    <button class="rotation-btn clear-btn" data-rotation-id="clear" onclick="selectRotation(this, null, null)">
+    <button class="rotation-btn clear-btn" data-rotation-id="clear" onclick="selectContent(this, null, null, null)">
       Clear
     </button>
     {% for rotation in rotations %}
     <button class="rotation-btn" data-rotation-id="{{ rotation.id }}"
-            onclick="selectRotation(this, {{ rotation.id }}, '{{ rotation.name|escapejs }}')">
+            onclick="selectContent(this, 'rotation', {{ rotation.id }}, '{{ rotation.name|escapejs }}')">
       {{ rotation.name }}
     </button>
     {% empty %}
     <p class="palette-empty">No rotations configured. Add rotations in the <a href="/admin/library/rotation/" style="color:var(--accent)">admin</a>.</p>
+    {% endfor %}
+
+    <h3 style="margin-top: 0.75rem;">Playlists</h3>
+    {% for playlist in playlists %}
+    <button class="rotation-btn" data-playlist-id="{{ playlist.id }}"
+            onclick="selectContent(this, 'playlist', {{ playlist.id }}, '{{ playlist.name|escapejs }}')">
+      {{ playlist.name }}
+    </button>
+    {% empty %}
+    <p class="palette-empty">No playlists yet. Build one on the <a href="{% url 'library:playlists' %}" style="color:var(--accent)">Playlists</a> page.</p>
     {% endfor %}
   </div>
 
@@ -305,13 +323,19 @@
 <div class="mobile-schedule">
   <div class="mobile-palette">
     <div class="mobile-palette-scroll">
-      <button class="rotation-btn clear-btn" data-rotation-id="clear" onclick="selectRotation(this, null, null)">
+      <button class="rotation-btn clear-btn" data-rotation-id="clear" onclick="selectContent(this, null, null, null)">
         Clear
       </button>
       {% for rotation in rotations %}
       <button class="rotation-btn" data-rotation-id="{{ rotation.id }}"
-              onclick="selectRotation(this, {{ rotation.id }}, '{{ rotation.name|escapejs }}')">
+              onclick="selectContent(this, 'rotation', {{ rotation.id }}, '{{ rotation.name|escapejs }}')">
         {{ rotation.name }}
+      </button>
+      {% endfor %}
+      {% for playlist in playlists %}
+      <button class="rotation-btn" data-playlist-id="{{ playlist.id }}"
+              onclick="selectContent(this, 'playlist', {{ playlist.id }}, '{{ playlist.name|escapejs }}')">
+        {{ playlist.name }}
       </button>
       {% endfor %}
     </div>
@@ -339,8 +363,9 @@ const PALETTE = [
   '#be185d',
 ];
 
-let selectedRotationId = null;
-let selectedRotationName = null;
+let selectedKind = null;
+let selectedContentId = null;
+let selectedContentName = null;
 let mobileDay = 0;
 
 const cells = {};
@@ -349,14 +374,15 @@ for (let d = 0; d < 7; d++) {
   for (let h = 0; h < 24; h++) cells[d][h] = null;
 }
 
-// Store rotation info per cell for mobile rendering
+// Store content info per cell for mobile rendering
 const cellRotations = {};
 for (let d = 0; d < 7; d++) {
   cellRotations[d] = {};
 }
 
-function rotationColor(rotationId) {
-  return PALETTE[rotationId % PALETTE.length];
+function contentColor(kind, id) {
+  const offset = kind === 'playlist' ? 7 : 0;
+  return PALETTE[(id + offset) % PALETTE.length];
 }
 
 function getCookie(name) {
@@ -369,11 +395,12 @@ function getCookie(name) {
   return val;
 }
 
-function selectRotation(btn, id, name) {
+function selectContent(btn, kind, id, name) {
   document.querySelectorAll('.rotation-btn').forEach(b => b.classList.remove('selected'));
   btn.classList.add('selected');
-  selectedRotationId = id;
-  selectedRotationName = name;
+  selectedKind = kind;
+  selectedContentId = id;
+  selectedContentName = name;
 }
 
 // --- Desktop grid ---
@@ -405,15 +432,16 @@ function getCell(day, hour) {
   return document.querySelector(`.grid-cell[data-day="${day}"][data-hour="${hour}"]`);
 }
 
-function fillCell(cell, rotationId, rotationName, blockId) {
+function fillCell(cell, kind, contentId, contentName, blockId) {
   const day = parseInt(cell.dataset.day);
   const hour = parseInt(cell.dataset.hour);
   cells[day][hour] = blockId;
-  cellRotations[day][hour] = { rotationId, rotationName };
+  cellRotations[day][hour] = { kind, contentId, contentName };
   cell.dataset.blockId = blockId || '';
-  cell.textContent = rotationName;
-  cell.style.backgroundColor = rotationColor(rotationId);
+  cell.textContent = contentName;
+  cell.style.backgroundColor = contentColor(kind, contentId);
   cell.classList.remove('empty');
+  cell.classList.toggle('kind-playlist', kind === 'playlist');
 }
 
 function clearCellData(day, hour) {
@@ -429,6 +457,7 @@ function clearCell(cell) {
   cell.textContent = '';
   cell.style.backgroundColor = '';
   cell.classList.add('empty');
+  cell.classList.remove('kind-playlist');
 }
 
 function flashCell(cell) {
@@ -438,9 +467,16 @@ function flashCell(cell) {
 }
 
 async function onCellClick(day, hour, cell) {
-  if (selectedRotationId === null) {
+  if (selectedKind === null) {
     onCellClear(day, hour, cell);
     return;
+  }
+
+  const body = { day_of_week: day, hour: hour };
+  if (selectedKind === 'playlist') {
+    body.playlist_id = selectedContentId;
+  } else {
+    body.rotation_id = selectedContentId;
   }
 
   const resp = await fetch('/api/schedule/', {
@@ -449,11 +485,7 @@ async function onCellClick(day, hour, cell) {
       'Content-Type': 'application/json',
       'X-CSRFToken': getCookie('csrftoken'),
     },
-    body: JSON.stringify({
-      day_of_week: day,
-      hour: hour,
-      rotation_id: selectedRotationId,
-    }),
+    body: JSON.stringify(body),
   });
 
   if (!resp.ok) return;
@@ -462,11 +494,11 @@ async function onCellClick(day, hour, cell) {
 
   // Update desktop cell
   const desktopCell = getCell(day, hour);
-  if (desktopCell) fillCell(desktopCell, data.content_id, data.content_name, data.id);
+  if (desktopCell) fillCell(desktopCell, data.content_kind, data.content_id, data.content_name, data.id);
 
   // Update data for mobile
   cells[day][hour] = data.id;
-  cellRotations[day][hour] = { rotationId: data.content_id, rotationName: data.content_name };
+  cellRotations[day][hour] = { kind: data.content_kind, contentId: data.content_id, contentName: data.content_name };
   if (day === mobileDay) renderMobileHours();
 
   if (cell) flashCell(cell);
@@ -520,7 +552,8 @@ function renderMobileHours() {
 
     const info = cellRotations[mobileDay][h];
     if (info) {
-      row.style.backgroundColor = rotationColor(info.rotationId);
+      row.style.backgroundColor = contentColor(info.kind, info.contentId);
+      row.classList.toggle('kind-playlist', info.kind === 'playlist');
     } else {
       row.classList.add('empty');
     }
@@ -532,11 +565,11 @@ function renderMobileHours() {
 
     const name = document.createElement('span');
     name.className = 'rotation-name';
-    name.textContent = info ? info.rotationName : '';
+    name.textContent = info ? info.contentName : '';
     row.appendChild(name);
 
     row.addEventListener('click', () => {
-      if (selectedRotationId === null) {
+      if (selectedKind === null) {
         onCellClear(mobileDay, h, null);
       } else {
         onCellClick(mobileDay, h, null);
@@ -556,12 +589,13 @@ async function loadSchedule() {
   for (const block of data.blocks) {
     const desktopCell = getCell(block.day_of_week, block.start_hour);
     if (desktopCell) {
-      fillCell(desktopCell, block.content_id, block.content_name, block.id);
+      fillCell(desktopCell, block.content_kind, block.content_id, block.content_name, block.id);
     } else {
       cells[block.day_of_week][block.start_hour] = block.id;
       cellRotations[block.day_of_week][block.start_hour] = {
-        rotationId: block.content_id,
-        rotationName: block.content_name,
+        kind: block.content_kind,
+        contentId: block.content_id,
+        contentName: block.content_name,
       };
     }
   }
@@ -573,8 +607,12 @@ document.addEventListener('DOMContentLoaded', () => {
   document.querySelectorAll('.rotation-btn[data-rotation-id]').forEach(btn => {
     const id = btn.dataset.rotationId;
     if (id && id !== 'clear') {
-      btn.style.backgroundColor = rotationColor(parseInt(id));
+      btn.style.backgroundColor = contentColor('rotation', parseInt(id));
     }
+  });
+  document.querySelectorAll('.rotation-btn[data-playlist-id]').forEach(btn => {
+    const id = btn.dataset.playlistId;
+    btn.style.backgroundColor = contentColor('playlist', parseInt(id));
   });
 
   buildGrid();

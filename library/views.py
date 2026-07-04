@@ -9,12 +9,13 @@ from django.views.decorators.csrf import csrf_exempt, ensure_csrf_cookie
 from django.views.decorators.http import require_http_methods
 
 from django.core.paginator import Paginator
-from django.db.models import Q
+from django.db.models import Count, Q
+from django.db.models.deletion import ProtectedError
 from django.utils import timezone
 
 from django.shortcuts import get_object_or_404
 
-from .models import Artist, Album, Category, Genre, LogItem, Playlist, PlaylistLog, Rotation, ScheduleBlock, Track
+from .models import Artist, Album, Category, Genre, LogItem, Playlist, PlaylistItem, PlaylistLog, Rotation, ScheduleBlock, Track
 from .services.log_builder import build_hour_log
 
 
@@ -26,7 +27,8 @@ def dashboard_page(request):
 @ensure_csrf_cookie
 def schedule_page(request):
     rotations = Rotation.objects.all().order_by("name")
-    return render(request, "library/schedule.html", {"rotations": rotations})
+    playlists = Playlist.objects.all().order_by("name")
+    return render(request, "library/schedule.html", {"rotations": rotations, "playlists": playlists})
 
 
 def _block_to_dict(b):
@@ -116,11 +118,148 @@ def api_rotation_list(request):
     return JsonResponse({"rotations": data})
 
 
-@require_http_methods(["GET"])
+@require_http_methods(["GET", "POST"])
 def api_playlist_list(request):
-    playlists = Playlist.objects.all().order_by("name")
-    data = [{"id": p.id, "name": p.name} for p in playlists]
-    return JsonResponse({"playlists": data})
+    if request.method == "GET":
+        playlists = Playlist.objects.all().order_by("name").annotate(_item_count=Count("items"))
+        data = [
+            {"id": p.id, "name": p.name, "description": p.description, "item_count": p._item_count}
+            for p in playlists
+        ]
+        return JsonResponse({"playlists": data})
+
+    try:
+        body = json.loads(request.body)
+    except (json.JSONDecodeError, ValueError):
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+
+    name = (body.get("name") or "").strip()
+    if not name:
+        return JsonResponse({"error": "name is required"}, status=400)
+
+    if Playlist.objects.filter(name=name).exists():
+        return JsonResponse({"error": "A playlist with that name already exists"}, status=400)
+
+    playlist = Playlist.objects.create(name=name, description=body.get("description", ""))
+    return JsonResponse(_playlist_to_dict(playlist))
+
+
+def _playlist_to_dict(playlist):
+    items = (
+        playlist.items
+        .select_related("track", "track__artist", "track__category")
+        .order_by("position")
+    )
+    return {
+        "id": playlist.id,
+        "name": playlist.name,
+        "description": playlist.description,
+        "items": [
+            {
+                "id": item.id,
+                "position": item.position,
+                "track_id": item.track_id,
+                "title": item.track.title,
+                "artist": item.track.artist.name if item.track.artist else "",
+                "duration_seconds": item.track.duration_seconds,
+                "category_code": item.track.category.code if item.track.category else "",
+            }
+            for item in items
+        ],
+    }
+
+
+@require_http_methods(["GET", "PATCH", "DELETE"])
+def api_playlist_detail(request, pk):
+    playlist = get_object_or_404(Playlist, pk=pk)
+
+    if request.method == "GET":
+        return JsonResponse(_playlist_to_dict(playlist))
+
+    if request.method == "DELETE":
+        try:
+            playlist.delete()
+        except ProtectedError:
+            block_count = playlist.schedule_blocks.count()
+            return JsonResponse({
+                "error": f"Playlist is used by {block_count} schedule block(s). Remove those from the schedule first.",
+            }, status=400)
+        return JsonResponse({"ok": True})
+
+    try:
+        body = json.loads(request.body)
+    except (json.JSONDecodeError, ValueError):
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+
+    if "name" in body:
+        name = (body["name"] or "").strip()
+        if not name:
+            return JsonResponse({"error": "name cannot be blank"}, status=400)
+        playlist.name = name
+    if "description" in body:
+        playlist.description = body["description"]
+    playlist.save()
+
+    return JsonResponse(_playlist_to_dict(playlist))
+
+
+@require_http_methods(["POST"])
+def api_playlist_add_item(request, pk):
+    playlist = get_object_or_404(Playlist, pk=pk)
+
+    try:
+        body = json.loads(request.body)
+    except (json.JSONDecodeError, ValueError):
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+
+    track_id = body.get("track_id")
+    if not track_id:
+        return JsonResponse({"error": "track_id is required"}, status=400)
+
+    track = get_object_or_404(Track, pk=track_id)
+
+    next_position = playlist.items.count()
+    PlaylistItem.objects.create(playlist=playlist, position=next_position, track=track)
+
+    return JsonResponse(_playlist_to_dict(playlist))
+
+
+@require_http_methods(["DELETE"])
+def api_playlist_remove_item(request, item_id):
+    item = get_object_or_404(PlaylistItem.objects.select_related("playlist"), pk=item_id)
+    playlist = item.playlist
+    item.delete()
+
+    remaining = list(playlist.items.order_by("position"))
+    _reposition_items(remaining, model=PlaylistItem)
+
+    return JsonResponse(_playlist_to_dict(playlist))
+
+
+@require_http_methods(["POST"])
+def api_playlist_reorder(request, pk):
+    playlist = get_object_or_404(Playlist, pk=pk)
+
+    try:
+        body = json.loads(request.body)
+    except (json.JSONDecodeError, ValueError):
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+
+    order = body.get("order")
+    if not order or not isinstance(order, list):
+        return JsonResponse({"error": "order (list of item IDs) is required"}, status=400)
+
+    items_by_id = {item.id: item for item in playlist.items.all()}
+    ordered = [items_by_id[i] for i in order if i in items_by_id]
+    _reposition_items(ordered, model=PlaylistItem)
+
+    return JsonResponse(_playlist_to_dict(playlist))
+
+
+@ensure_csrf_cookie
+def playlists_page(request):
+    categories = Category.objects.order_by("name")
+    return render(request, "library/playlists.html", {"categories": categories})
 
 
 def library_page(request):
@@ -572,18 +711,19 @@ def api_engine_set_next(request):
     return JsonResponse({"ok": True})
 
 
-def _reposition_items(items):
+def _reposition_items(items, model=LogItem):
     """Two-pass position update to avoid unique constraint violations
-    when reordering LogItems within a PlaylistLog."""
+    when reordering items (LogItem or PlaylistItem) that have a
+    unique_together on (parent, position)."""
     from django.db import transaction
     OFFSET = 100000
     with transaction.atomic():
         for i, li in enumerate(items):
             li.position = i + OFFSET
-        LogItem.objects.bulk_update(items, ["position"])
+        model.objects.bulk_update(items, ["position"])
         for i, li in enumerate(items):
             li.position = i
-        LogItem.objects.bulk_update(items, ["position"])
+        model.objects.bulk_update(items, ["position"])
 
 
 @csrf_exempt
