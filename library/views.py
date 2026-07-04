@@ -16,12 +16,13 @@ from django.utils import timezone
 from django.shortcuts import get_object_or_404
 
 from .models import Artist, Album, Category, Genre, LogItem, Playlist, PlaylistItem, PlaylistLog, Rotation, ScheduleBlock, Track
-from .services.log_builder import build_hour_log
+from .services.log_builder import _build_from_playlist, build_hour_log
 
 
 @ensure_csrf_cookie
 def dashboard_page(request):
-    return render(request, "library/dashboard.html")
+    playlists = Playlist.objects.all().order_by("name")
+    return render(request, "library/dashboard.html", {"playlists": playlists})
 
 
 @ensure_csrf_cookie
@@ -254,6 +255,28 @@ def api_playlist_reorder(request, pk):
     _reposition_items(ordered, model=PlaylistItem)
 
     return JsonResponse(_playlist_to_dict(playlist))
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def api_playlist_play_now(request, pk):
+    """Force the engine to play this playlist immediately, replacing
+    whatever's assigned to the current hour rather than waiting for a
+    scheduled slot."""
+    playlist = get_object_or_404(Playlist, pk=pk)
+
+    now = timezone.localtime()
+    log, error = _build_from_playlist(now.date(), now.hour, playlist)
+    if error:
+        return JsonResponse({"error": error}, status=400)
+
+    log.status = "approved"
+    log.save(update_fields=["status"])
+
+    cmd_path = Path("/run/isadoraair/engine_cmd.json")
+    cmd_path.write_text(json.dumps({"command": "reload_current_log"}), encoding="utf-8")
+
+    return JsonResponse({"ok": True, "log_id": log.id, "item_count": log.items.count()})
 
 
 @ensure_csrf_cookie

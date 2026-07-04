@@ -199,10 +199,17 @@ class PlaybackEngine:
         close_old_connections()
         now = timezone.localtime()
 
-        built_current = self._ensure_log_approved(now.date(), now.hour)
+        self._ensure_log_approved(now.date(), now.hour)
+
+        # Checked every tick, not just the tick that built the log —
+        # otherwise if the one attempt to start playback right after a
+        # build doesn't land (or the log already existed for some
+        # other reason, e.g. a manual play-now request), the engine
+        # can sit idle forever despite a perfectly good approved log
+        # existing for the current hour.
         with self._lock:
             idle = not self.decks
-        if built_current and idle:
+        if idle:
             self._load_log_for(now.date(), now.hour)
             if self.log_items:
                 self._start_track(0, as_leading=True)
@@ -285,6 +292,21 @@ class PlaybackEngine:
 
         mixer_pad = self.mixer.request_pad_simple("sink_%u")
         deck_bin.get_static_pad("src").link(mixer_pad)
+
+        # This bin's buffers are timestamped from 0 (its own fresh
+        # segment), but the mixer's already at the pipeline's real
+        # running time — for every deck after the first, that's not 0.
+        # Without correcting it, GStreamer treats the new buffers as
+        # already running-time-old-by-that-much and drops/skips
+        # through them to catch up, so playback becomes audible
+        # partway into the track instead of at its start. Offsetting
+        # the bin's src pad by the pipeline's current running time
+        # fixes the reference point.
+        if self.decks:
+            clock = self.main_pipeline.get_clock()
+            if clock:
+                running_time = clock.get_time() - self.main_pipeline.get_base_time()
+                deck_bin.get_static_pad("src").set_offset(running_time)
 
         deck_bin.sync_state_with_parent()
 
@@ -379,8 +401,31 @@ class PlaybackEngine:
                         print(f"  Seek to {position:.1f}s")
             elif cmd == "reload_audio_output":
                 self._apply_audio_output_device(self._resolve_studio_monitor_device())
+            elif cmd == "reload_current_log":
+                self._reload_and_restart_current_log()
         except Exception as exc:
             print(f"  Command error: {exc}")
+
+    def _reload_and_restart_current_log(self):
+        """Tear down whatever's playing and switch to the current
+        hour's approved log right away, instead of waiting for the
+        natural end-of-track/end-of-hour transition. Used when
+        something just replaced the current hour's log out from under
+        the engine (e.g. a manual 'play this playlist now' request)."""
+        close_old_connections()
+        with self._lock:
+            decks_to_remove = list(self.decks)
+        for deck in decks_to_remove:
+            self._remove_deck(deck)
+
+        self._next_triggered = False
+        now = timezone.localtime()
+        self._load_log_for(now.date(), now.hour)
+        if self.log_items:
+            self._start_track(0, as_leading=True)
+            print(f"  Reloaded current-hour log by request — {len(self.log_items)} items")
+        else:
+            print("  Reload requested but no approved log for current hour")
 
     def _apply_audio_output_device(self, device):
         """Swap the alsasink output device live. alsasink's `device`

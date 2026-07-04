@@ -17,6 +17,7 @@ urlpatterns = [
     path('api/playlists/<int:pk>/items/', views.api_playlist_add_item, name='api-playlist-add-item'),
     path('api/playlists/item/<int:item_id>/', views.api_playlist_remove_item, name='api-playlist-remove-item'),
     path('api/playlists/<int:pk>/reorder/', views.api_playlist_reorder, name='api-playlist-reorder'),
+    path('api/playlists/<int:pk>/play-now/', views.api_playlist_play_now, name='api-playlist-play-now'),
     path('api/tracks/', views.api_track_list, name='api-track-list'),
     path('api/tracks/bulk/', views.api_track_bulk, name='api-track-bulk'),
     path('api/tracks/<int:pk>/', views.api_track_detail, name='api-track-detail'),

@@ -5,6 +5,45 @@
 
 {% block extra_css %}
 <style>
+  .playnow-bar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.6rem;
+    margin-bottom: 1rem;
+  }
+
+  .playnow-select {
+    background: var(--bg-dark);
+    border: 1px solid var(--border-subtle);
+    border-radius: 8px;
+    padding: 0.45rem 0.65rem;
+    color: var(--text-main);
+    font-size: 0.85rem;
+    cursor: pointer;
+    min-width: 220px;
+  }
+  .playnow-select:focus { outline: none; border-color: var(--accent); }
+
+  .playnow-btn {
+    background: var(--accent);
+    border: none;
+    border-radius: 8px;
+    color: #000;
+    padding: 0.45rem 1rem;
+    font-size: 0.85rem;
+    font-weight: 700;
+    cursor: pointer;
+    transition: opacity 0.12s;
+  }
+  .playnow-btn:hover { opacity: 0.9; }
+
+  .playnow-msg {
+    font-size: 0.8rem;
+    color: var(--text-muted);
+  }
+  .playnow-msg.error { color: var(--danger); }
+
   .dash-grid {
     display: grid;
     grid-template-columns: 1fr 320px;
@@ -364,6 +403,16 @@
 {% endblock %}
 
 {% block content %}
+<div class="playnow-bar">
+  <select class="playnow-select" id="playNowSelect">
+    <option value="">Play a playlist now...</option>
+    {% for pl in playlists %}
+    <option value="{{ pl.id }}">{{ pl.name }}</option>
+    {% endfor %}
+  </select>
+  <button class="playnow-btn" onclick="playNow()">Play Now</button>
+  <span class="playnow-msg" id="playNowMsg"></span>
+</div>
 <div class="dash-grid">
   <div>
     <div class="now-playing" id="nowPlaying">
@@ -416,6 +465,31 @@ function getCookie(name) {
       val = decodeURIComponent(c.substring(name.length + 1));
   });
   return val;
+}
+
+async function playNow() {
+  const sel = document.getElementById('playNowSelect');
+  const msg = document.getElementById('playNowMsg');
+  const id = sel.value;
+  if (!id) return;
+
+  msg.textContent = 'Starting...';
+  msg.className = 'playnow-msg';
+
+  const resp = await fetch(`/api/playlists/${id}/play-now/`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') },
+  });
+  const data = await resp.json();
+
+  if (!resp.ok) {
+    msg.textContent = data.error || 'Could not start playlist';
+    msg.className = 'playnow-msg error';
+    return;
+  }
+
+  msg.textContent = `Playing now (${data.item_count} tracks)`;
+  sel.value = '';
 }
 
 function esc(s) {
