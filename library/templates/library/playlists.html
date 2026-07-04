@@ -148,6 +148,12 @@
     padding: 0.5rem;
   }
 
+  .pl-load-more-row {
+    text-align: center;
+    padding: 0.5rem;
+  }
+  .pl-load-more-row .pl-btn { font-size: 0.78rem; padding: 0.35rem 0.8rem; }
+
   /* --- Items table --- */
   .pl-items-wrap {
     overflow-x: auto;
@@ -261,6 +267,7 @@
             <th>Title</th>
             <th>Cat</th>
             <th>Dur</th>
+            <th>Elapsed</th>
             <th></th>
           </tr>
         </thead>
@@ -446,7 +453,10 @@ function renderItems() {
     return;
   }
 
-  tbody.innerHTML = items.map(i => `
+  let elapsed = 0;
+  tbody.innerHTML = items.map(i => {
+    elapsed += (i.duration_seconds || 0);
+    return `
     <tr data-item-id="${i.id}" draggable="true">
       <td class="pl-col-pos" style="cursor:grab;">&#9776;</td>
       <td class="pl-col-pos">${i.position + 1}</td>
@@ -454,14 +464,14 @@ function renderItems() {
       <td>${esc(i.title)}</td>
       <td class="pl-col-cat">${esc(i.category_code)}</td>
       <td class="pl-col-dur">${fmtDuration(i.duration_seconds)}</td>
+      <td class="pl-col-dur">${fmtDuration(elapsed)}</td>
       <td><button class="pl-remove-btn" onclick="removeItem(${i.id})">remove</button></td>
     </tr>
-  `).join('');
+  `;
+  }).join('');
 
-  let totalDur = 0;
-  items.forEach(i => { totalDur += (i.duration_seconds || 0); });
   document.getElementById('playlistTotal').textContent =
-    `${items.length} track${items.length === 1 ? '' : 's'} — ${fmtDuration(totalDur)} total`;
+    `${items.length} track${items.length === 1 ? '' : 's'} — ${fmtDuration(elapsed)} total`;
 
   initDragDrop();
 }
@@ -553,7 +563,10 @@ async function addTrack(trackId) {
 }
 
 // --- Track search ---
-async function searchTracks() {
+let searchPage = 1;
+let searchTotalPages = 1;
+
+async function searchTracks(reset = true) {
   const q = document.getElementById('trackSearchInput').value.trim();
   const category = document.getElementById('trackCategoryFilter').value;
   const readyOnly = document.getElementById('readyOnlyToggle').checked;
@@ -568,22 +581,26 @@ async function searchTracks() {
     return;
   }
 
+  if (reset) searchPage = 1;
+
   const params = new URLSearchParams();
   if (q) params.set('q', q);
   if (category) params.set('category', category);
   if (readyOnly) params.set('ready2air', 'true');
-  params.set('per_page', 40);
+  params.set('per_page', 100);
+  params.set('page', searchPage);
 
   const resp = await fetch('/api/tracks/?' + params.toString());
   if (!resp.ok) return;
   const data = await resp.json();
+  searchTotalPages = data.pages;
 
-  if (data.items.length === 0) {
+  if (reset && data.items.length === 0) {
     container.innerHTML = '<div class="pl-hint">No matching tracks.</div>';
     return;
   }
 
-  container.innerHTML = data.items.map(t => `
+  const rowsHtml = data.items.map(t => `
     <div class="pl-result">
       <button class="pl-add-btn" onclick="addTrack(${t.id})" title="Add to playlist">+</button>
       <span class="pr-title">${esc(t.title)}</span>
@@ -591,14 +608,35 @@ async function searchTracks() {
       <span class="pr-dur">${fmtDuration(t.duration_seconds)}</span>
     </div>
   `).join('');
+
+  if (reset) {
+    container.innerHTML = rowsHtml;
+  } else {
+    const footer = container.querySelector('.pl-load-more-row');
+    if (footer) footer.remove();
+    container.insertAdjacentHTML('beforeend', rowsHtml);
+  }
+
+  const shownCount = container.querySelectorAll('.pl-result').length;
+  const footer = document.createElement('div');
+  footer.className = 'pl-load-more-row';
+  footer.innerHTML = searchPage < searchTotalPages
+    ? `<button class="pl-btn" onclick="loadMoreResults()">Load more (${shownCount} of ${data.total})</button>`
+    : `<div class="pl-hint">${shownCount} of ${data.total} track${data.total === 1 ? '' : 's'}</div>`;
+  container.appendChild(footer);
+}
+
+function loadMoreResults() {
+  searchPage += 1;
+  searchTracks(false);
 }
 
 document.getElementById('trackSearchInput').addEventListener('input', () => {
   clearTimeout(searchDebounce);
-  searchDebounce = setTimeout(searchTracks, 300);
+  searchDebounce = setTimeout(() => searchTracks(true), 300);
 });
-document.getElementById('trackCategoryFilter').addEventListener('change', searchTracks);
-document.getElementById('readyOnlyToggle').addEventListener('change', searchTracks);
+document.getElementById('trackCategoryFilter').addEventListener('change', () => searchTracks(true));
+document.getElementById('readyOnlyToggle').addEventListener('change', () => searchTracks(true));
 
 // --- Init ---
 loadPlaylistList();
