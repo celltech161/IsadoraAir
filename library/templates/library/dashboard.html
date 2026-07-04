@@ -297,8 +297,15 @@
     background: rgba(148, 163, 184, 0.05);
   }
 
-  td.qt-pos, td.qt-dur { color: var(--text-muted); text-align: center; white-space: nowrap; }
+  td.qt-pos, td.qt-dur, td.qt-time { color: var(--text-muted); text-align: center; white-space: nowrap; font-variant-numeric: tabular-nums; }
   td.qt-cat { color: var(--text-muted); font-size: 0.75rem; }
+
+  .np-startsat {
+    font-size: 0.85rem;
+    color: #3b82f6;
+    font-variant-numeric: tabular-nums;
+    margin-top: 0.5rem;
+  }
 
   .qt-next-btn {
     background: none;
@@ -404,11 +411,12 @@
           <th>Title</th>
           <th>Cat</th>
           <th>Dur</th>
+          <th>Time On</th>
           <th></th>
         </tr>
       </thead>
       <tbody id="queueList">
-        <tr><td colspan="7" class="queue-empty">No queue data</td></tr>
+        <tr><td colspan="8" class="queue-empty">No queue data</td></tr>
       </tbody>
     </table>
   </div>
@@ -449,6 +457,16 @@ function fmtDur(sec) {
   const m = Math.floor(Math.abs(sec) / 60);
   const s = Math.round(Math.abs(sec) % 60);
   return (sec < 0 ? '-' : '') + m + ':' + String(s).padStart(2, '0');
+}
+
+// serverTimestamp is the epoch seconds the state was written at;
+// etaSeconds is how far past that moment the track is expected to
+// start. Together they give a stable wall-clock estimate that doesn't
+// need per-frame interpolation -- just recomputed each poll.
+function fmtEtaClock(serverTimestamp, etaSeconds) {
+  if (serverTimestamp == null || etaSeconds == null) return '';
+  const when = new Date((serverTimestamp + etaSeconds) * 1000);
+  return when.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', second: '2-digit' });
 }
 
 function getCookie(name) {
@@ -622,6 +640,7 @@ function buildDeckDOM(slot) {
       <div class="np-artist" id="npArtist-${slot}"></div>
       <div class="np-album" id="npAlbum-${slot}"></div>
       <span class="np-category" id="npCategory-${slot}"></span>
+      <div class="np-startsat" id="npStartsAt-${slot}" style="display:none;"></div>
     </div>
     <div class="np-waveform">
       <canvas id="npWaveform-${slot}"></canvas>
@@ -659,7 +678,7 @@ function buildDeckDOM(slot) {
   });
 }
 
-function renderDeck(slot, deck, transport, queue) {
+function renderDeck(slot, deck, transport, queue, serverTimestamp) {
   if (transport === 'OFFLINE' || transport === 'STOPPED') {
     renderDeckOffline(slot, transport);
     return;
@@ -670,7 +689,7 @@ function renderDeck(slot, deck, transport, queue) {
   }
   const previewTrack = (queue && queue.length) ? queue[0] : null;
   if (previewTrack) {
-    renderDeckPreview(slot, previewTrack);
+    renderDeckPreview(slot, previewTrack, serverTimestamp);
   } else {
     renderDeckEmpty(slot);
   }
@@ -704,7 +723,7 @@ function renderDeckEmpty(slot) {
   `;
 }
 
-function renderDeckPreview(slot, track) {
+function renderDeckPreview(slot, track, serverTimestamp) {
   const st = deckState[slot];
 
   if (st.mode !== 'preview') {
@@ -714,6 +733,7 @@ function renderDeckPreview(slot, track) {
     document.getElementById(`playPauseBtn-${slot}`).style.display = 'none';
     document.getElementById(`ejectBtn-${slot}`).style.display = 'none';
     document.querySelector(`#deck-${slot} .np-timing`).style.display = 'none';
+    document.getElementById(`npStartsAt-${slot}`).style.display = '';
   }
 
   const badge = document.getElementById(`transportBadge-${slot}`);
@@ -731,6 +751,11 @@ function renderDeckPreview(slot, track) {
     catEl.textContent = track.category || '';
     catEl.style.display = track.category ? '' : 'none';
     document.getElementById(`npTotal-${slot}`).textContent = fmtDur(track.duration);
+  }
+
+  const startsAtEl = document.getElementById(`npStartsAt-${slot}`);
+  if (startsAtEl) {
+    startsAtEl.textContent = 'Starts at ' + fmtEtaClock(serverTimestamp, track.eta_seconds);
   }
 }
 
@@ -790,7 +815,7 @@ async function seekTo(slot, seconds) {
   await fetch('/api/engine/seek/', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') },
-    body: JSON.stringify({ position: seconds }),
+    body: JSON.stringify({ slot, position: seconds }),
   });
   deckState[slot].localPosition = seconds;
   deckState[slot].lastPollTime = Date.now();
@@ -799,14 +824,22 @@ async function seekTo(slot, seconds) {
 let currentLogId = null;
 let queueItemIds = [];
 let insertDebounce = null;
+let queueDragActive = false;
 
 function renderQueue(data) {
+  // The 1s poll would otherwise blow away the table's innerHTML (and
+  // the drag listeners on it) mid-gesture -- looks like dragging works
+  // since the browser still shows the drag cursor, but the drop lands
+  // on rows that got silently replaced out from under it. Just hold
+  // the current render until the drag finishes.
+  if (queueDragActive) return;
+
   const list = document.getElementById('queueList');
   const queue = data.queue || [];
   currentLogId = data.log_id;
 
   if (!queue.length) {
-    list.innerHTML = '<tr><td colspan="7" class="queue-empty">No upcoming tracks</td></tr>';
+    list.innerHTML = '<tr><td colspan="8" class="queue-empty">No upcoming tracks</td></tr>';
     queueItemIds = [];
     return;
   }
@@ -821,6 +854,7 @@ function renderQueue(data) {
       <td>${esc(q.title)}</td>
       <td class="qt-cat">${esc(q.category)}</td>
       <td class="qt-dur">${fmtDur(q.duration)}</td>
+      <td class="qt-time">${fmtEtaClock(data.timestamp, q.eta_seconds)}</td>
       <td><button class="qt-next-btn" onclick="event.stopPropagation(); setNext(${q.item_id})">next</button></td>
     </tr>
   `).join('');
@@ -835,12 +869,14 @@ function initQueueDrag() {
   list.querySelectorAll('tr[draggable]').forEach(row => {
     row.addEventListener('dragstart', () => {
       dragEl = row;
+      queueDragActive = true;
       row.classList.add('dragging');
     });
     row.addEventListener('dragend', () => {
       row.classList.remove('dragging');
       list.querySelectorAll('tr').forEach(r => r.classList.remove('drag-over'));
       dragEl = null;
+      queueDragActive = false;
     });
     row.addEventListener('dragover', (e) => {
       e.preventDefault();
@@ -866,6 +902,7 @@ function initQueueDrag() {
         headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') },
         body: JSON.stringify({ order }),
       });
+      queueDragActive = false;
       poll();
     });
   });
@@ -933,7 +970,7 @@ async function poll() {
   if (!data) return;
   const decks = data.decks || {};
   const queue = data.queue || [];
-  SLOTS.forEach(slot => renderDeck(slot, decks[slot], data.transport, queue));
+  SLOTS.forEach(slot => renderDeck(slot, decks[slot], data.transport, queue, data.timestamp));
   renderQueue(data);
 }
 

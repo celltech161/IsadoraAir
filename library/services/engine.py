@@ -438,18 +438,8 @@ class PlaybackEngine:
             cmd = data.get("command")
             if cmd == "seek":
                 position = float(data.get("position", 0))
-                with self._lock:
-                    leading = self._leading_deck()
-                    if leading:
-                        seek_ns = int(position * Gst.SECOND)
-                        leading.pipeline.seek_simple(
-                            Gst.Format.TIME,
-                            Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT,
-                            seek_ns,
-                        )
-                        leading.started_at = time.time() - position
-                        self._next_triggered = False
-                        print(f"  Seek to {position:.1f}s")
+                slot = data.get("slot")
+                self._seek_deck(slot, position)
             elif cmd == "reload_audio_output":
                 self._apply_audio_output_device(self._resolve_studio_monitor_device())
             elif cmd == "reload_current_log":
@@ -530,6 +520,56 @@ class PlaybackEngine:
         bus.connect("message::error", self._on_deck_error, new_deck)
 
         print(f"  [{slot}] Resumed at {resume_position:.1f}s", flush=True)
+
+    def _seek_deck(self, slot, position):
+        """Mirrors _resume_deck's approach: a flushing seek on a deck
+        bin that's already linked into the live mixer deadlocked in
+        testing badly enough that systemd needed a SIGKILL to recover
+        (dead air the whole time) — root cause not chased down given
+        the severity, same call as tonight's other "don't mutate the
+        live bin" fixes. Tear the deck down and recreate it fresh at
+        the target position instead of seeking in place."""
+        if slot not in SLOTS:
+            leading = self._leading_deck()
+            slot = leading.slot if leading else None
+        if slot not in SLOTS:
+            return
+        deck = self.decks.get(slot)
+        if not deck:
+            return
+
+        was_paused = deck.paused
+        log_item = deck.log_item
+        self._remove_deck(deck)
+
+        new_deck = self._create_deck(
+            slot, log_item, resume_position_ns=int(position * Gst.SECOND)
+        )
+        if new_deck is None:
+            print(f"  [{slot}] Seek failed — could not recreate deck", flush=True)
+            return
+
+        new_deck.pipeline.seek_simple(
+            Gst.Format.TIME,
+            Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT,
+            int(position * Gst.SECOND),
+        )
+
+        with self._lock:
+            self.decks[slot] = new_deck
+        self._deck_bin_map[id(new_deck.pipeline)] = new_deck
+
+        bus = new_deck.pipeline.get_bus()
+        bus.add_signal_watch()
+        bus.connect("message::error", self._on_deck_error, new_deck)
+
+        if was_paused:
+            self._pause_deck(slot)
+            new_deck.paused_position = position
+        else:
+            self._next_triggered = False
+
+        print(f"  [{slot}] Seek to {position:.1f}s", flush=True)
 
     def _eject_deck(self, slot):
         if slot not in SLOTS:
@@ -728,6 +768,27 @@ class PlaybackEngine:
                     "paused": deck.paused,
                 }
 
+            # Seconds-from-now ETA for each queue item, so the UI can
+            # show a live "time on" clock estimate. Walks forward from
+            # whatever time is left on the currently-leading deck,
+            # accumulating each subsequent track's "effective" play
+            # time (next_start_seconds if set, else full duration) —
+            # the same heuristic the crossfade trigger itself uses, so
+            # the estimate matches how handoffs actually happen.
+            leading = None
+            for slot in SLOTS:
+                d = snapshot[slot]
+                if d and not d.paused:
+                    leading = d
+                    break
+
+            eta = 0.0
+            if leading:
+                lt = leading.track
+                lpos = self._get_deck_position(leading)
+                l_effective = lt.next_start_seconds if lt.next_start_seconds is not None else (lt.duration_seconds or 0)
+                eta = max(0.0, l_effective - lpos)
+
             queue = []
             for i in range(self._queue_cursor, min(self._queue_cursor + 10, len(self.log_items))):
                 qi = self.log_items[i]
@@ -739,7 +800,10 @@ class PlaybackEngine:
                     "artist": qt.artist.name if qt.artist else "",
                     "duration": qt.duration_seconds or 0,
                     "category": qt.category.code if qt.category else "",
+                    "eta_seconds": round(eta, 1),
                 })
+                effective = qt.next_start_seconds if qt.next_start_seconds is not None else (qt.duration_seconds or 0)
+                eta += effective
 
             state = {
                 "transport": transport,

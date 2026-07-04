@@ -69,6 +69,15 @@
       background: rgba(34, 197, 94, 0.1);
     }
 
+    nav.topbar .nav-clock {
+      margin-left: auto;
+      font-size: 0.85rem;
+      font-weight: 600;
+      color: var(--text-muted);
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+    }
+
     main {
       padding: 1.25rem 1.5rem;
       max-width: 100%;
@@ -87,7 +96,16 @@
       <a href="{% url 'library:library' %}" {% block nav_library %}{% endblock %}>Library</a>
       <a href="{% url 'library:playlists' %}" {% block nav_playlists %}{% endblock %}>Playlists</a>
     </div>
+    <span class="nav-clock" id="navClock"></span>
   </nav>
+  <script>
+    function updateNavClock() {
+      const el = document.getElementById('navClock');
+      if (el) el.textContent = new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', second: '2-digit' });
+    }
+    updateNavClock();
+    setInterval(updateNavClock, 1000);
+  </script>
   <main>
     {% block content %}{% endblock %}
   </main>

@@ -816,11 +816,13 @@ def api_engine_seek(request):
     if position is None:
         return JsonResponse({"error": "position required"}, status=400)
 
+    cmd = {"command": "seek", "position": float(position)}
+    slot = body.get("slot")
+    if slot:
+        cmd["slot"] = slot.upper()
+
     cmd_path = Path("/run/isadoraair/engine_cmd.json")
-    cmd_path.write_text(
-        json.dumps({"command": "seek", "position": float(position)}),
-        encoding="utf-8",
-    )
+    cmd_path.write_text(json.dumps(cmd), encoding="utf-8")
     return JsonResponse({"ok": True})
 
 
