@@ -29,11 +29,14 @@ CMD_PATH = Path("/run/isadoraair/engine_cmd.json")
 POSITION_POLL_MS = 500
 AUTO_BUILD_CHECK_SECONDS = 10
 NEXT_HOUR_LOOKAHEAD_SECONDS = 30
+CACHE_WARM_LEAD_SECONDS = 3.0
+SILENCE_PRIME_SECONDS = 0.3
+SILENCE_PRIME_RATE = 48000
 SLOTS = ("A", "B")
 
 
 class Deck:
-    def __init__(self, slot, track, log_item, pipeline, mixer_pad):
+    def __init__(self, slot, track, log_item, pipeline, mixer_pad, silence_primed=False):
         self.slot = slot
         self.track = track
         self.log_item = log_item
@@ -43,6 +46,12 @@ class Deck:
         self.finished = False
         self.paused = False
         self.paused_position = 0.0
+        # True for decks built with a silence lead-in (see _create_deck) —
+        # query_position() isn't reliable through the internal `concat`
+        # segment-switch (can report a frozen/stale value rather than
+        # failing cleanly), so these decks track position by wall clock
+        # only instead (_get_deck_position).
+        self.silence_primed = silence_primed
 
 
 class PlaybackEngine:
@@ -57,6 +66,7 @@ class PlaybackEngine:
         self.main_pipeline = None
         self.decks = {"A": None, "B": None}
         self._deck_bin_map = {}
+        self._cache_warm_item_id = None
         self._last_queue_reload = 0
         self._next_triggered = False
         self.current_log = None
@@ -138,6 +148,11 @@ class PlaybackEngine:
         self.main_pipeline = Gst.Pipeline.new("isadoraair")
 
         self.mixer = Gst.ElementFactory.make("audiomixer", "mixer")
+        # Tried setting `latency`/`min-upstream-latency` here (to give the
+        # aggregator more patience for a newly-linked deck's decode delay)
+        # — didn't fix the clipping, and introduced a new regression: it
+        # also trimmed the *outgoing* deck's tail/outro right around the
+        # transition, which never happened before this change. Reverted.
         self.alsasink = Gst.ElementFactory.make("alsasink", "output")
         self.alsasink.set_property("device", self._resolve_studio_monitor_device())
 
@@ -499,12 +514,75 @@ class PlaybackEngine:
         ghost_pad = Gst.GhostPad.new_no_target("src", Gst.PadDirection.SRC)
         deck_bin.add_pad(ghost_pad)
 
-        def on_pad_added(element, pad):
-            if pad.get_current_caps():
-                struct = pad.get_current_caps().get_structure(0)
-                if struct.get_name().startswith("audio"):
-                    pad.link(convert.get_static_pad("sink"))
-                    ghost_pad.set_target(resample.get_static_pad("src"))
+        # Prime fresh track starts with a short burst of real silence
+        # ahead of the decoded audio, via `concat` (plays sink_0 to EOS,
+        # then seamlessly switches to sink_1 with adjacent timestamps).
+        # audiotestsrc has zero decode latency, so this segment is ready
+        # essentially instantly, giving decodebin's real file-open/demux/
+        # decode/negotiate work the whole window to finish in the
+        # background before the real audio is ever needed downstream.
+        # The pad is never paused or idle — it produces real (if silent)
+        # data continuously from the moment it's linked — so this
+        # doesn't reproduce the aggregator-stall or sync-baseline issues
+        # from two earlier attempts at this same bug.
+        #
+        # Redeployed after a stall on the first live test turned out to
+        # most likely be caused by a *different*, pre-existing risk
+        # (_seek_deck's flushing seek on a live-mixer-linked bin — see
+        # its own docstring, a documented deadlock-adjacent issue from
+        # earlier this session) used as a testing shortcut immediately
+        # before the transition, not this mechanism itself. Redeploying
+        # to test cleanly without that shortcut in the loop.
+        #
+        # Skipped for resumes/seeks (resume_position_ns set) — those
+        # already explicitly seek to an arbitrary position via a
+        # separate seek_simple() call right after creation, which would
+        # need extra bookkeeping to land correctly across a
+        # silence+real-content boundary, and this bug is specifically
+        # about fresh starts on a normal crossfade.
+        silence_primed = resume_position_ns is None
+        if silence_primed:
+            caps = Gst.Caps.from_string(f"audio/x-raw,rate={SILENCE_PRIME_RATE},channels=2")
+
+            real_caps = Gst.ElementFactory.make("capsfilter", None)
+            real_caps.set_property("caps", caps)
+
+            silence = Gst.ElementFactory.make("audiotestsrc", None)
+            silence.set_property("wave", "silence")
+            silence.set_property("samplesperbuffer", int(SILENCE_PRIME_SECONDS * SILENCE_PRIME_RATE))
+            silence.set_property("num-buffers", 1)
+            silence_caps = Gst.ElementFactory.make("capsfilter", None)
+            silence_caps.set_property("caps", caps)
+
+            concat = Gst.ElementFactory.make("concat", None)
+
+            for el in [real_caps, silence, silence_caps, concat]:
+                deck_bin.add(el)
+
+            resample.link(real_caps)
+            silence.link(silence_caps)
+            # Request silence's concat sink first so it gets sink_0
+            # (concat plays request-numbered sinks in order).
+            silence_caps.get_static_pad("src").link(concat.request_pad_simple("sink_%u"))
+            real_caps.get_static_pad("src").link(concat.request_pad_simple("sink_%u"))
+
+            # concat's src pad exists immediately (no dynamic negotiation
+            # needed, unlike decodebin's), so the ghost pad's target can
+            # be fixed right away instead of waiting for pad-added.
+            ghost_pad.set_target(concat.get_static_pad("src"))
+
+            def on_pad_added(element, pad):
+                if pad.get_current_caps():
+                    struct = pad.get_current_caps().get_structure(0)
+                    if struct.get_name().startswith("audio"):
+                        pad.link(convert.get_static_pad("sink"))
+        else:
+            def on_pad_added(element, pad):
+                if pad.get_current_caps():
+                    struct = pad.get_current_caps().get_structure(0)
+                    if struct.get_name().startswith("audio"):
+                        pad.link(convert.get_static_pad("sink"))
+                        ghost_pad.set_target(resample.get_static_pad("src"))
 
         decode.connect("pad-added", on_pad_added)
 
@@ -537,9 +615,17 @@ class PlaybackEngine:
             log_item=log_item,
             pipeline=deck_bin,
             mixer_pad=mixer_pad,
+            silence_primed=silence_primed,
         )
         start_offset = (resume_position_ns or 0) / Gst.SECOND
-        deck.started_at = time.time() - start_offset
+        # For primed decks, "position 0" (start of the real content) is
+        # SILENCE_PRIME_SECONDS after creation, not immediately — shift
+        # started_at forward to match, so the wall-clock position
+        # estimate (_get_deck_position) lines up with the real track's
+        # own timeline (what next_start_seconds/duration_seconds are
+        # computed against), not the silence-inclusive elapsed time.
+        silence_shift = SILENCE_PRIME_SECONDS if silence_primed else 0.0
+        deck.started_at = time.time() - start_offset + silence_shift
 
         if resume_position_ns is None:
             try:
@@ -557,6 +643,62 @@ class PlaybackEngine:
             print(f"  [{slot}] Resumed: {track.artist.name if track.artist else '?'} - {track.title} at {start_offset:.1f}s")
 
         return deck
+
+    def _warm_track_cache(self, log_item):
+        """Decode the upcoming track once in a fully separate, throwaway
+        Gst.Pipeline with zero connection to self.main_pipeline/the live
+        mixer — warms the OS page cache and forces any one-time codec/
+        plugin lookup ahead of time, so the real _create_deck (still the
+        normal synchronous path, unchanged) should decode faster the
+        second time, narrowing (not guaranteeing eliminating) the
+        decode-latency window that clips the start of short tracks.
+
+        Deliberately does not touch the live mixer at all — two prior
+        attempts at fixing this by manipulating the live deck/pad
+        directly (a first-buffer offset probe, then a true preroll
+        linked into the live mixer) each broke something differently;
+        this sidesteps that whole risk category by never linking
+        anything into the shared pipeline.
+
+        Idempotent — called every _poll_position tick once eligible, but
+        only does anything the first time per track."""
+        if self._cache_warm_item_id == log_item.id:
+            return
+
+        filepath = log_item.track.filepath
+        if not Path(filepath).is_file():
+            return
+        self._cache_warm_item_id = log_item.id
+
+        warm_pipeline = Gst.Pipeline.new("cache-warmer")
+        src = Gst.ElementFactory.make("filesrc", None)
+        src.set_property("location", filepath)
+        decode = Gst.ElementFactory.make("decodebin", None)
+        convert = Gst.ElementFactory.make("audioconvert", None)
+        resample = Gst.ElementFactory.make("audioresample", None)
+        sink = Gst.ElementFactory.make("fakesink", None)
+
+        for el in [src, decode, convert, resample, sink]:
+            warm_pipeline.add(el)
+
+        src.link(decode)
+        convert.link(resample)
+        resample.link(sink)
+
+        def on_pad_added(element, pad):
+            if pad.get_current_caps():
+                struct = pad.get_current_caps().get_structure(0)
+                if struct.get_name().startswith("audio"):
+                    pad.link(convert.get_static_pad("sink"))
+
+        decode.connect("pad-added", on_pad_added)
+
+        warm_pipeline.set_state(Gst.State.PLAYING)
+        GLib.timeout_add_seconds(2, self._teardown_cache_warmer, warm_pipeline)
+
+    def _teardown_cache_warmer(self, warm_pipeline):
+        warm_pipeline.set_state(Gst.State.NULL)
+        return False  # one-shot GLib timeout, don't repeat
 
     def _remove_deck(self, deck):
         with self._lock:
@@ -576,6 +718,18 @@ class PlaybackEngine:
     def _get_deck_position(self, deck):
         if deck.paused:
             return deck.paused_position
+        if deck.silence_primed:
+            # query_position() isn't reliable through concat's internal
+            # segment-switch (silence -> real content) — it can report a
+            # frozen/stale value instead of failing cleanly, so the
+            # query-then-fallback pattern below doesn't catch it. Wall
+            # clock is accurate enough for our purposes and sidesteps it
+            # entirely. started_at is already shifted by
+            # SILENCE_PRIME_SECONDS at creation time (_create_deck), so
+            # this lines up with the real track's own timeline.
+            if deck.started_at:
+                return max(0.0, time.time() - deck.started_at)
+            return 0.0
         ok, position = deck.pipeline.query_position(Gst.Format.TIME)
         if ok:
             return position / Gst.SECOND
@@ -607,6 +761,14 @@ class PlaybackEngine:
                 self._resume_deck(data.get("slot"))
             elif cmd == "deck_eject":
                 self._eject_deck(data.get("slot"))
+            elif cmd == "force_next_hour":
+                # Manual testing hook: do exactly what
+                # _ensure_upcoming_logs does naturally ~30s before top of
+                # hour, on demand instead of waiting for the real clock.
+                now = timezone.localtime()
+                next_hour = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+                self._ensure_log_approved(next_hour.date(), next_hour.hour)
+                self._advance_to_next_hour_log(next_hour.date(), next_hour.hour)
         except Exception as exc:
             print(f"  Command error: {exc}")
 
@@ -855,6 +1017,9 @@ class PlaybackEngine:
 
                 if trigger_point < 10.0:
                     trigger_point = next_start
+
+                if pos >= trigger_point - CACHE_WARM_LEAD_SECONDS:
+                    self._warm_track_cache(next_item)
 
                 if not self._next_triggered and pos >= trigger_point:
                     print(f"  Trigger: pos={pos:.1f}s >= trigger={trigger_point:.1f}s, starting next ({next_item.track.title}) on deck {other_slot}")

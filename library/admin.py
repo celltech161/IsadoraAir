@@ -336,6 +336,12 @@ class RecencyConfigAdmin(admin.ModelAdmin):
         )
 
 
+_UITHEME_COLOR_FIELDS = {
+    "bg_dark", "bg_darker", "panel_bg", "accent", "accent_soft",
+    "text_main", "text_muted", "danger", "border_subtle", "nav_clock_color",
+}
+
+
 @admin.register(UITheme)
 class UIThemeAdmin(admin.ModelAdmin):
     fieldsets = [
@@ -352,6 +358,11 @@ class UIThemeAdmin(admin.ModelAdmin):
             "fields": ["nav_clock_font_size", "nav_clock_font_weight", "nav_clock_color"],
         }),
     ]
+
+    def formfield_for_dbfield(self, db_field, request, **kwargs):
+        if db_field.name in _UITHEME_COLOR_FIELDS:
+            kwargs["widget"] = RGBAColorWidget
+        return super().formfield_for_dbfield(db_field, request, **kwargs)
 
     def has_add_permission(self, request):
         return not UITheme.objects.exists()
