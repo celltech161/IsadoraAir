@@ -295,18 +295,27 @@ class PlaybackEngine:
 
         # This bin's buffers are timestamped from 0 (its own fresh
         # segment), but the mixer's already at the pipeline's real
-        # running time — for every deck after the first, that's not 0.
-        # Without correcting it, GStreamer treats the new buffers as
-        # already running-time-old-by-that-much and drops/skips
-        # through them to catch up, so playback becomes audible
-        # partway into the track instead of at its start. Offsetting
-        # the bin's src pad by the pipeline's current running time
-        # fixes the reference point.
-        if self.decks:
-            clock = self.main_pipeline.get_clock()
-            if clock:
-                running_time = clock.get_time() - self.main_pipeline.get_base_time()
-                deck_bin.get_static_pad("src").set_offset(running_time)
+        # running time. Without correcting it, GStreamer treats the new
+        # buffers as already running-time-old-by-that-much and
+        # drops/skips through them to catch up, so playback becomes
+        # audible partway into the track instead of at its start.
+        # Offsetting the bin's src pad by the pipeline's current
+        # running time fixes the reference point.
+        #
+        # This has to run unconditionally, not just when self.decks is
+        # non-empty — self.decks is empty any time the previous deck
+        # already finished and was removed before this one was created
+        # (e.g. natural EOS/error with no crossfade having triggered
+        # yet), which looks identical to "this is the very first deck"
+        # but isn't: the pipeline may have been running for minutes.
+        # Skipping the offset in that case is exactly what caused
+        # tracks to start well into the song instead of near 0. Running
+        # it for the true first deck too is harmless — running time is
+        # ~0 right after the pipeline goes PLAYING anyway.
+        clock = self.main_pipeline.get_clock()
+        if clock:
+            running_time = clock.get_time() - self.main_pipeline.get_base_time()
+            deck_bin.get_static_pad("src").set_offset(running_time)
 
         deck_bin.sync_state_with_parent()
 
