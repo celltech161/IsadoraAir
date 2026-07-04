@@ -176,7 +176,7 @@ def pick_track(category, exclude_track_ids, exclude_artist_ids,
 MAX_FILL_TRACKS = 200  # safety cap against a runaway loop on bad data
 
 
-def _fill_remaining_hour(picks, accumulated_seconds, target_datetime):
+def fill_remaining_hour(picks, accumulated_seconds, target_datetime):
     """Top up `picks` with fallback-category tracks (admin-configured via
     LogFillConfig) until the hour is filled, or as tightly as duration-fit
     allows. Called after any build path in case it comes up short of a
@@ -281,7 +281,7 @@ def _build_from_rotation(target_date, hour, rotation):
         if accumulated_seconds >= 3600:
             break
 
-    picks, accumulated_seconds = _fill_remaining_hour(picks, accumulated_seconds, target_datetime)
+    picks, accumulated_seconds = fill_remaining_hour(picks, accumulated_seconds, target_datetime)
     return _persist_log(target_date, hour, picks)
 
 
@@ -312,7 +312,7 @@ def _build_from_playlist(target_date, hour, playlist):
         })
         accumulated_seconds += track_duration
 
-    picks, accumulated_seconds = _fill_remaining_hour(picks, accumulated_seconds, target_datetime)
+    picks, accumulated_seconds = fill_remaining_hour(picks, accumulated_seconds, target_datetime)
     return _persist_log(target_date, hour, picks)
 
 
@@ -337,6 +337,27 @@ def _persist_log(target_date, hour, picks):
     ]
     LogItem.objects.bulk_create(log_items)
     return log, None
+
+
+def append_fill_items(log, picks, start_position):
+    """Persist new LogItems appended to an *already-existing* PlaylistLog,
+    starting at `start_position` — unlike _persist_log, this does not
+    touch any existing items. Used to extend a log that's already
+    approved and live/currently-playing (see engine.py's
+    _extend_current_log_live), where deleting and recreating everything
+    would discard real played_at history driving recency avoidance."""
+    log_items = [
+        LogItem(
+            playlist_log=log,
+            position=start_position + i,
+            scheduled_time=pick["scheduled_time"],
+            track=pick["track"],
+            category=pick["category"],
+        )
+        for i, pick in enumerate(picks)
+    ]
+    LogItem.objects.bulk_create(log_items)
+    return log_items
 
 
 def build_hour_log(target_date, hour):

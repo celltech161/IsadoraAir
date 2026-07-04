@@ -345,6 +345,9 @@ _UITHEME_COLOR_FIELDS = {
 @admin.register(UITheme)
 class UIThemeAdmin(admin.ModelAdmin):
     fieldsets = [
+        ("Branding", {
+            "fields": ["logo"],
+        }),
         ("Palette", {
             "fields": [
                 "bg_dark", "bg_darker", "panel_bg",
@@ -401,10 +404,4 @@ class LogFillConfigAdmin(admin.ModelAdmin):
         obj = LogFillConfig.load()
         return HttpResponseRedirect(
             reverse("admin:library_logfillconfig_change", args=[obj.pk])
-        )
-
-    def save_model(self, request, obj, form, change):
-        super().save_model(request, obj, form, change)
-        Path("/run/isadoraair/engine_cmd.json").write_text(
-            json.dumps({"command": "reload_agc_config"}), encoding="utf-8"
         )

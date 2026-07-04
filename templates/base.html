@@ -149,7 +149,7 @@
 </head>
 <body>
   <nav class="topbar">
-    <a href="/" class="brand"><img src="{% static 'library/img/isadoraair_logo.png' %}" alt="IsadoraAir"></a>
+    <a href="/" class="brand"><img src="{% if ui_theme.logo %}{{ ui_theme.logo.url }}{% else %}{% static 'library/img/isadoraair_logo.png' %}{% endif %}" alt="IsadoraAir"></a>
     <div class="nav-links" id="navLinks">
       <a href="{% url 'library:schedule' %}" {% block nav_schedule %}{% endblock %}>Schedule</a>
       <a href="{% url 'library:logs' %}" {% block nav_logs %}{% endblock %}>Logs</a>

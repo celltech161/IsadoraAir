@@ -19,7 +19,12 @@ from django.db import close_old_connections
 from django.utils import timezone
 from hardware.models import AudioOutput
 from library.models import LogItem, PlaylistLog, Track
-from library.services.log_builder import build_hour_log
+from library.services.log_builder import (
+    DURATION_FIT_MARGIN,
+    append_fill_items,
+    build_hour_log,
+    fill_remaining_hour,
+)
 
 STUDIO_MONITOR_NAME = "Studio Monitor"
 STUDIO_MONITOR_FALLBACK_DEVICE = "plughw:2,0"
@@ -74,6 +79,7 @@ class PlaybackEngine:
         self._queue_cursor = 0
         self._next_hour_peek = None
         self._next_hour_peek_at = 0.0
+        self._last_live_extend_attempt = 0.0
         self.running = False
         self._position_timer = None
         self._lock = threading.RLock()
@@ -403,24 +409,93 @@ class PlaybackEngine:
         self._next_hour_peek_at = now
         return result
 
+    def _extend_current_log_live(self):
+        """Called when the queue is exhausted but the real next hour isn't
+        built yet — early exhaustion, e.g. a DJ skipped/ejected a few
+        tracks and burned through the hour's content faster than its
+        nominal pacing assumed. Uses the same Log Fill Configuration
+        strategy that pads a short log at build time (`fill_remaining_hour`)
+        to append more tracks to the *live, already-approved* log instead
+        of falling back to replaying it from the start (`_on_log_exhausted`'s
+        `now.hour` reload)."""
+        if not self.current_log or not self.log_items:
+            return False
+
+        close_old_connections()
+        now = timezone.localtime()
+        seconds_left = 3600 - (now.minute * 60 + now.second)
+        if seconds_left <= DURATION_FIT_MARGIN:
+            return False  # basically at the real boundary anyway
+
+        # hour_start (not `now`) is the correct reference point here: it's
+        # what `accumulated_seconds` below is measured relative to, so
+        # `scheduled_time = hour_start + accumulated_seconds` comes out to
+        # ~now for the first new pick. Recency exclusion still correctly
+        # covers everything played so far this hour because `existing_picks`
+        # (passed explicitly) already includes the whole hour's log, not
+        # just what a DB cutoff query keyed off hour_start would catch.
+        hour_start = now.replace(minute=0, second=0, microsecond=0)
+        existing_picks = [{"track": li.track, "category": li.category} for li in self.log_items]
+        original_count = len(existing_picks)
+        accumulated = 3600 - seconds_left
+        # fill_remaining_hour appends onto `existing_picks` in place and
+        # returns that same list, so the new items must be sliced off using
+        # the count captured *before* the call.
+        all_picks, _ = fill_remaining_hour(existing_picks, accumulated, hour_start)
+        new_picks = all_picks[original_count:]
+        if not new_picks:
+            return False
+
+        start_position = self.log_items[-1].position + 1
+        new_items = append_fill_items(self.current_log, new_picks, start_position)
+        self.log_items.extend(new_items)
+        print(f"  Extended live log with {len(new_items)} fill track(s) — {seconds_left:.0f}s left in the real hour")
+        return True
+
     def _roll_over_to_next_hour(self):
         """Called when the current hour's queue is exhausted. If the next
         hour's log has already been auto-built (normally true — it's
         approved NEXT_HOUR_LOOKAHEAD_SECONDS before top of hour), switch
         the engine's active log over to it so playback and the crossfade
         trigger both continue seamlessly across the boundary, instead of
-        waiting for the natural-EOS `_on_log_exhausted` path to notice."""
+        waiting for the natural-EOS `_on_log_exhausted` path to notice.
+        If the real next hour isn't built yet — early exhaustion, before
+        the actual top of hour — extend the live log instead of returning
+        False (which would fall through to `_on_log_exhausted`'s
+        replay-current-hour-from-scratch fallback)."""
         peek = self._peek_next_hour()
-        if not peek:
+        if peek:
+            log, items = peek
+            self.current_log = log
+            self.log_items = items
+            self._queue_cursor = 0
+            self._next_hour_peek = None
+            self._next_hour_peek_at = 0.0
+            print(f"  Rolled over to next hour's log: {log.date} {log.hour:02d}:00 ({len(items)} items)")
+            return True
+        return self._extend_current_log_live()
+
+    def _try_extend_live_log(self):
+        """Throttled wrapper around `_extend_current_log_live`, called from
+        the `_poll_position` lookahead (every tick, ~500ms) once the
+        current hour's queue is exhausted with no real next hour ready
+        yet. Without this, the live-extend only ever ran from
+        `_roll_over_to_next_hour` at the moment the last known track hit
+        natural EOS — too late for the crossfade trigger (which needs
+        `next_item` populated *before* `pos >= trigger_point`) to ever see
+        the freshly re-picked track, so the handoff was always a hard cut.
+        Calling this proactively, as soon as the gap is detected, gives the
+        re-pick time to land before the countdown reaches its normal
+        trigger point, so it can crossfade in like any other track.
+        Throttled to once per 5s since a persistently-empty fallback
+        category (e.g. `LogFillConfig` misconfigured) would otherwise retry
+        on every single poll tick for however long the current track has
+        left to play."""
+        now = time.time()
+        if now - self._last_live_extend_attempt < 5.0:
             return False
-        log, items = peek
-        self.current_log = log
-        self.log_items = items
-        self._queue_cursor = 0
-        self._next_hour_peek = None
-        self._next_hour_peek_at = 0.0
-        print(f"  Rolled over to next hour's log: {log.date} {log.hour:02d}:00 ({len(items)} items)")
-        return True
+        self._last_live_extend_attempt = now
+        return self._extend_current_log_live()
 
     def _next_queue_item(self):
         if self._queue_cursor >= len(self.log_items):
@@ -1010,6 +1085,12 @@ class PlaybackEngine:
                 if peek:
                     _, next_hour_items = peek
                     next_item = next_hour_items[0] if next_hour_items else None
+                elif self._try_extend_live_log():
+                    # Real next hour isn't built yet, but a Log Fill
+                    # Configuration re-pick just landed on the live log —
+                    # pick it up now so the crossfade below can trigger
+                    # into it normally instead of waiting for EOS.
+                    next_item = self.log_items[self._queue_cursor]
 
             if next_item is not None:
                 next_cue_in = next_item.track.cue_in_seconds or 0.0

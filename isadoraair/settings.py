@@ -131,6 +131,9 @@ USE_TZ = True
 STATIC_URL = 'static/'
 STATIC_ROOT = BASE_DIR / 'staticfiles'
 
+MEDIA_URL = 'media/'
+MEDIA_ROOT = BASE_DIR / 'media'
+
 LIBRARY_ROOT = config('LIBRARY_ROOT', default='/srv/isadoraair/music')
 WAVEFORMS_DIR = config('WAVEFORMS_DIR', default='/srv/isadoraair/waveforms')
 
