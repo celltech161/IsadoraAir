@@ -19,6 +19,7 @@ from django.db import close_old_connections
 from django.utils import timezone
 from hardware.models import AudioOutput
 from library.models import LogItem, PlaylistLog, Track
+from library.services.log_builder import build_hour_log
 
 STUDIO_MONITOR_NAME = "Studio Monitor"
 STUDIO_MONITOR_FALLBACK_DEVICE = "plughw:2,0"
@@ -26,6 +27,8 @@ STUDIO_MONITOR_FALLBACK_DEVICE = "plughw:2,0"
 STATE_PATH = Path("/run/isadoraair/engine_state.json")
 CMD_PATH = Path("/run/isadoraair/engine_cmd.json")
 POSITION_POLL_MS = 500
+AUTO_BUILD_CHECK_SECONDS = 10
+NEXT_HOUR_LOOKAHEAD_SECONDS = 30
 
 
 class Deck:
@@ -67,6 +70,7 @@ class PlaybackEngine:
             self._start_track(0, as_leading=True)
 
         self._position_timer = GLib.timeout_add(POSITION_POLL_MS, self._poll_position)
+        GLib.timeout_add_seconds(AUTO_BUILD_CHECK_SECONDS, self._ensure_upcoming_logs)
 
         GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGTERM, self._handle_signal_glib)
         GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGINT, self._handle_signal_glib)
@@ -180,6 +184,51 @@ class PlaybackEngine:
         )
         self.current_index = 0
         print(f"Loaded log for {target_date} {hour:02d}:00 — {len(self.log_items)} items")
+
+    def _ensure_upcoming_logs(self):
+        """No human approval step for now — auto-build (and
+        auto-approve) whatever hour needs it: the current hour, so a
+        freshly-started or catching-up engine has something to play
+        right away, and the next hour once we're within the last
+        NEXT_HOUR_LOOKAHEAD_SECONDS of the top of the hour, so a late
+        schedule-grid edit still has a chance to take effect before
+        it's locked in."""
+        if not self.running:
+            return False
+
+        close_old_connections()
+        now = timezone.localtime()
+
+        built_current = self._ensure_log_approved(now.date(), now.hour)
+        with self._lock:
+            idle = not self.decks
+        if built_current and idle:
+            self._load_log_for(now.date(), now.hour)
+            if self.log_items:
+                self._start_track(0, as_leading=True)
+
+        seconds_left_in_hour = 3600 - (now.minute * 60 + now.second)
+        if seconds_left_in_hour <= NEXT_HOUR_LOOKAHEAD_SECONDS:
+            next_hour = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+            self._ensure_log_approved(next_hour.date(), next_hour.hour)
+
+        return True
+
+    def _ensure_log_approved(self, target_date, hour):
+        """Build + approve target_date/hour's log if nothing exists yet
+        for it. Returns True if a log was built just now."""
+        if PlaylistLog.objects.filter(date=target_date, hour=hour).exists():
+            return False
+
+        log, error = build_hour_log(target_date, hour)
+        if error:
+            print(f"  Auto-build skipped for {target_date} {hour:02d}:00 — {error}")
+            return False
+
+        log.status = "approved"
+        log.save(update_fields=["status"])
+        print(f"  Auto-built and approved log for {target_date} {hour:02d}:00 ({log.items.count()} items)")
+        return True
 
     def _create_deck(self, log_item):
         track = log_item.track
