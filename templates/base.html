@@ -1,3 +1,4 @@
+{% load static %}
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -6,15 +7,15 @@
   <title>{% block title %}IsadoraAir{% endblock %}</title>
   <style>
     :root {
-      --bg-dark: #0f172a;
-      --bg-darker: #0b1120;
-      --panel-bg: rgba(15, 23, 42, 0.95);
-      --accent: #22c55e;
-      --accent-soft: #4ade80;
-      --text-main: #f9fafb;
-      --text-muted: #9ca3af;
-      --danger: #f97373;
-      --border-subtle: rgba(148, 163, 184, 0.25);
+      --bg-dark: {{ ui_theme.bg_dark }};
+      --bg-darker: {{ ui_theme.bg_darker }};
+      --panel-bg: {{ ui_theme.panel_bg }};
+      --accent: {{ ui_theme.accent }};
+      --accent-soft: {{ ui_theme.accent_soft }};
+      --text-main: {{ ui_theme.text_main }};
+      --text-muted: {{ ui_theme.text_muted }};
+      --danger: {{ ui_theme.danger }};
+      --border-subtle: {{ ui_theme.border_subtle }};
     }
 
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -27,6 +28,7 @@
     }
 
     nav.topbar {
+      position: relative;
       display: flex;
       align-items: center;
       gap: 1.5rem;
@@ -37,11 +39,15 @@
     }
 
     nav.topbar .brand {
-      font-weight: 700;
-      font-size: 1.1rem;
-      color: var(--accent);
-      text-decoration: none;
-      letter-spacing: 0.5px;
+      display: flex;
+      align-items: center;
+      flex-shrink: 0;
+    }
+
+    nav.topbar .brand img {
+      height: 34px;
+      width: auto;
+      display: block;
     }
 
     nav.topbar .nav-links {
@@ -69,13 +75,68 @@
       background: rgba(34, 197, 94, 0.1);
     }
 
-    nav.topbar .nav-clock {
+    nav.topbar .nav-right {
       margin-left: auto;
-      font-size: 0.85rem;
-      font-weight: 600;
-      color: var(--text-muted);
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+    }
+
+    nav.topbar .nav-clock {
+      font-size: {{ ui_theme.nav_clock_font_size }};
+      font-weight: {{ ui_theme.nav_clock_font_weight }};
+      color: {{ ui_theme.nav_clock_color }};
       font-variant-numeric: tabular-nums;
       white-space: nowrap;
+    }
+
+    nav.topbar .nav-toggle {
+      display: none;
+      flex-direction: column;
+      justify-content: center;
+      gap: 4px;
+      width: 32px;
+      height: 32px;
+      padding: 4px;
+      background: transparent;
+      border: none;
+      cursor: pointer;
+    }
+
+    nav.topbar .nav-toggle span {
+      display: block;
+      height: 2px;
+      width: 100%;
+      background: var(--text-main);
+      border-radius: 1px;
+    }
+
+    @media (max-width: 700px) {
+      nav.topbar .nav-links {
+        display: none;
+        position: absolute;
+        top: 52px;
+        left: 0;
+        right: 0;
+        flex-direction: column;
+        gap: 0;
+        background: var(--bg-dark);
+        border-bottom: 1px solid var(--border-subtle);
+        z-index: 100;
+      }
+
+      nav.topbar .nav-links.open {
+        display: flex;
+      }
+
+      nav.topbar .nav-links a {
+        padding: 0.75rem 1.5rem;
+        border-radius: 0;
+      }
+
+      nav.topbar .nav-toggle {
+        display: flex;
+      }
     }
 
     main {
@@ -88,15 +149,20 @@
 </head>
 <body>
   <nav class="topbar">
-    <a href="/" class="brand">IsadoraAir</a>
-    <div class="nav-links">
+    <a href="/" class="brand"><img src="{% static 'library/img/isadoraair_logo.png' %}" alt="IsadoraAir"></a>
+    <div class="nav-links" id="navLinks">
       <a href="{% url 'library:schedule' %}" {% block nav_schedule %}{% endblock %}>Schedule</a>
       <a href="{% url 'library:logs' %}" {% block nav_logs %}{% endblock %}>Logs</a>
       <a href="{% url 'library:dashboard' %}" {% block nav_dashboard %}{% endblock %}>Dashboard</a>
       <a href="{% url 'library:library' %}" {% block nav_library %}{% endblock %}>Library</a>
       <a href="{% url 'library:playlists' %}" {% block nav_playlists %}{% endblock %}>Playlists</a>
     </div>
-    <span class="nav-clock" id="navClock"></span>
+    <div class="nav-right">
+      <span class="nav-clock" id="navClock"></span>
+      <button type="button" class="nav-toggle" id="navToggle" aria-label="Toggle navigation" aria-expanded="false" aria-controls="navLinks">
+        <span></span><span></span><span></span>
+      </button>
+    </div>
   </nav>
   <script>
     function updateNavClock() {
@@ -105,6 +171,15 @@
     }
     updateNavClock();
     setInterval(updateNavClock, 1000);
+
+    const navToggle = document.getElementById('navToggle');
+    const navLinks = document.getElementById('navLinks');
+    if (navToggle && navLinks) {
+      navToggle.addEventListener('click', () => {
+        const isOpen = navLinks.classList.toggle('open');
+        navToggle.setAttribute('aria-expanded', isOpen);
+      });
+    }
   </script>
   <main>
     {% block content %}{% endblock %}

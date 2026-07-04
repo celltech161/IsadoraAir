@@ -1,8 +1,14 @@
+import json
+from pathlib import Path
+
 from django import forms
 from django.contrib import admin
 
 from .devices import list_input_devices, list_output_devices
 from .models import AudioInput, AudioOutput
+
+# Must match engine.py's STUDIO_MONITOR_NAME.
+STUDIO_MONITOR_NAME = "Studio Monitor"
 
 
 class _DeviceFieldAdmin(admin.ModelAdmin):
@@ -30,6 +36,26 @@ class _DeviceFieldAdmin(admin.ModelAdmin):
 @admin.register(AudioOutput)
 class AudioOutputAdmin(_DeviceFieldAdmin):
     _enumerate = staticmethod(list_output_devices)
+
+    def get_fieldsets(self, request, obj=None):
+        fieldsets = [(None, {"fields": ["name", "device", "sort_order"]})]
+        if obj and obj.name == STUDIO_MONITOR_NAME:
+            fieldsets.append(("AGC (Studio Monitor Leveling)", {
+                "fields": ["agc_enabled", "agc_ratio", "agc_threshold", "agc_soft_knee", "agc_makeup_gain_db"],
+                "description": "Interim leveling for this output only "
+                                "(compressor + makeup gain + safety limiter). "
+                                "Not the transmitter feed — StereoTool will "
+                                "handle that separately. Changes apply live "
+                                "on Save, no engine restart needed.",
+            }))
+        return fieldsets
+
+    def save_model(self, request, obj, form, change):
+        super().save_model(request, obj, form, change)
+        if obj.name == STUDIO_MONITOR_NAME:
+            Path("/run/isadoraair/engine_cmd.json").write_text(
+                json.dumps({"command": "reload_agc_config"}), encoding="utf-8"
+            )
 
 
 @admin.register(AudioInput)

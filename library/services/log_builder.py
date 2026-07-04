@@ -6,6 +6,7 @@ from django.utils import timezone
 
 from library.models import (
     Category,
+    LogFillConfig,
     LogItem,
     PlaylistLog,
     RecencyConfig,
@@ -172,6 +173,63 @@ def pick_track(category, exclude_track_ids, exclude_artist_ids,
     return qs.order_by("?").first()
 
 
+MAX_FILL_TRACKS = 200  # safety cap against a runaway loop on bad data
+
+
+def _fill_remaining_hour(picks, accumulated_seconds, target_datetime):
+    """Top up `picks` with fallback-category tracks (admin-configured via
+    LogFillConfig) until the hour is filled, or as tightly as duration-fit
+    allows. Called after any build path in case it comes up short of a
+    full hour (e.g. a playlist/rotation that doesn't sum to 3600s)."""
+    remaining = 3600 - accumulated_seconds
+    if remaining <= DURATION_FIT_MARGIN:
+        return picks, accumulated_seconds
+
+    cfg = LogFillConfig.load()
+    if cfg.strategy == "fixed_category":
+        category = cfg.fallback_category
+    else:
+        category = picks[-1]["category"] if picks else None
+    if category is None:
+        return picks, accumulated_seconds
+
+    recency_cfg = RecencyConfig.load()
+    picked_tracks = [p["track"] for p in picks]
+    picked_artist_ids = [p["track"].artist_id for p in picks]
+
+    for _ in range(MAX_FILL_TRACKS):
+        if remaining <= DURATION_FIT_MARGIN:
+            break
+        artist_sep, title_sep = get_separation(category, recency_cfg)
+        exclude_track_ids, exclude_artist_ids = get_recent_exclusions(
+            target_datetime, artist_sep, title_sep, picked_tracks, picked_artist_ids,
+        )
+        track = pick_track(
+            category, exclude_track_ids, exclude_artist_ids,
+            artist_sep, title_sep, target_datetime,
+            remaining_seconds=remaining,
+        )
+        if track is None:
+            break  # nothing eligible even after loosening — stop gracefully
+
+        track_duration = track.next_start_seconds or track.duration_seconds or 0
+        scheduled_time = target_datetime + timedelta(seconds=accumulated_seconds)
+        picks.append({
+            "position": len(picks),
+            "scheduled_time": scheduled_time,
+            "track": track,
+            "category": category,
+        })
+        picked_tracks.append(track)
+        picked_artist_ids.append(track.artist_id)
+        accumulated_seconds += track_duration
+        remaining = 3600 - accumulated_seconds
+        if track_duration <= 0:
+            break  # avoid infinite loop on zero-duration data
+
+    return picks, accumulated_seconds
+
+
 def _build_from_rotation(target_date, hour, rotation):
     slots = list(rotation.slots.select_related("category").order_by("position"))
     if not slots:
@@ -223,6 +281,7 @@ def _build_from_rotation(target_date, hour, rotation):
         if accumulated_seconds >= 3600:
             break
 
+    picks, accumulated_seconds = _fill_remaining_hour(picks, accumulated_seconds, target_datetime)
     return _persist_log(target_date, hour, picks)
 
 
@@ -253,6 +312,7 @@ def _build_from_playlist(target_date, hour, playlist):
         })
         accumulated_seconds += track_duration
 
+    picks, accumulated_seconds = _fill_remaining_hour(picks, accumulated_seconds, target_datetime)
     return _persist_log(target_date, hour, picks)
 
 

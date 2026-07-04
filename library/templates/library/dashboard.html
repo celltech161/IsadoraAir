@@ -38,6 +38,13 @@
   }
   .playnow-btn:hover { opacity: 0.9; }
 
+  .restart-engine-btn {
+    margin-left: auto;
+    background: transparent;
+    border: 1px solid var(--danger);
+    color: var(--danger);
+  }
+
   .playnow-msg {
     font-size: 0.8rem;
     color: var(--text-muted);
@@ -392,6 +399,7 @@
   </select>
   <button class="playnow-btn" onclick="playNow()">Play Now</button>
   <span class="playnow-msg" id="playNowMsg"></span>
+  <button class="playnow-btn restart-engine-btn" onclick="restartEngine()">Restart Engine</button>
 </div>
 
 <div class="decks-row">
@@ -509,6 +517,27 @@ async function playNow() {
 
   msg.textContent = `Playing now (${data.item_count} tracks)`;
   sel.value = '';
+}
+
+async function restartEngine() {
+  const msg = document.getElementById('playNowMsg');
+  if (!confirm('Restart the playback engine? Audio will cut out for a few seconds.')) return;
+
+  msg.textContent = 'Restarting engine...';
+  msg.className = 'playnow-msg';
+
+  const resp = await fetch('/api/engine/restart/', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') },
+  });
+
+  if (!resp.ok) {
+    msg.textContent = 'Failed to request engine restart';
+    msg.className = 'playnow-msg error';
+    return;
+  }
+
+  msg.textContent = 'Restart requested — engine should be back shortly';
 }
 
 async function fetchStatus() {
@@ -847,7 +876,7 @@ function renderQueue(data) {
   queueItemIds = queue.map(q => q.item_id);
 
   list.innerHTML = queue.map((q, i) => `
-    <tr draggable="true" data-item-id="${q.item_id}">
+    <tr draggable="true" data-item-id="${q.item_id}" style="background-color: ${q.fill_color || 'transparent'};">
       <td class="qt-pos" style="cursor:grab;">&#9776;</td>
       <td class="qt-pos">${i + 1}</td>
       <td>${esc(q.artist)}</td>

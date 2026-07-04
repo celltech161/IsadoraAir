@@ -47,17 +47,33 @@ class Genre(models.Model):
         return self.name
 
 
+class CategoryKind(models.Model):
+    """What broad kind of content a Category holds (music/imaging/spot/
+    talk, and eventually things like a remote-URL stream). Admin-managed
+    (add/remove) rather than a hardcoded choices list, since new kinds can
+    imply different playback handling down the line."""
+    code = models.CharField(max_length=20, unique=True)
+    name = models.CharField(max_length=50)
+    fill_color = models.CharField(
+        max_length=50, default="#374151",
+        help_text="Any CSS color value (hex, rgb, rgba) — background fill "
+                   "for items of this kind in the dashboard's Coming Up list.",
+    )
+    sort_order = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        ordering = ["sort_order", "name"]
+        verbose_name = "Category Kind"
+        verbose_name_plural = "Category Kinds"
+
+    def __str__(self):
+        return self.name
+
+
 class Category(models.Model):
     """Rotation category - e.g. HOT_CURR, DEEP_80S. Distinct from Genre,
     which is descriptive only; Category is what actually drives rotation
     logic (RotationSlot references this, not Genre)."""
-    KIND_CHOICES = [
-        ("music", "Music"),
-        ("imaging", "Imaging"),
-        ("spot", "Spot"),
-        ("talk", "Talk"),
-    ]
-
     RECENCY_MODE_CHOICES = [
         ("time", "Time-based"),
         ("proportional", "Proportional to category size"),
@@ -65,7 +81,7 @@ class Category(models.Model):
 
     code = models.CharField(max_length=20, unique=True)
     name = models.CharField(max_length=100)
-    kind = models.CharField(max_length=10, choices=KIND_CHOICES, default="music")
+    kind = models.ForeignKey(CategoryKind, on_delete=models.PROTECT, related_name="categories")
     description = models.TextField(blank=True)
     color = models.CharField(max_length=20, blank=True)
     sort_order = models.PositiveIntegerField(default=0)
@@ -514,4 +530,71 @@ class RecencyConfig(models.Model):
                 "title_separation": 8.0,
             },
         )
+        return obj
+
+
+class LogFillConfig(models.Model):
+    """Singleton — how to top up a built log that falls short of a full
+    hour (e.g. a playlist or rotation runs out early), so the engine never
+    has to fall back to waiting/replaying at runtime."""
+    STRATEGY_CHOICES = [
+        ("repeat_last_category", "Repeat last category"),
+        ("fixed_category", "Fixed category"),
+    ]
+    strategy = models.CharField(
+        max_length=24, choices=STRATEGY_CHOICES, default="repeat_last_category",
+        help_text="Which category to keep re-picking from when a log needs filling out.",
+    )
+    fallback_category = models.ForeignKey(
+        "Category", null=True, blank=True, on_delete=models.SET_NULL,
+        help_text="Used only when strategy is 'Fixed category'.",
+    )
+
+    class Meta:
+        verbose_name = "Log Fill Configuration"
+        verbose_name_plural = "Log Fill Configuration"
+
+    def __str__(self):
+        return "Log Fill Configuration"
+
+    def save(self, *args, **kwargs):
+        self.pk = 1
+        super().save(*args, **kwargs)
+
+    @classmethod
+    def load(cls):
+        obj, _created = cls.objects.get_or_create(pk=1)
+        return obj
+
+
+class UITheme(models.Model):
+    """Singleton — site-wide color palette and nav bar sizing, editable in admin."""
+    bg_dark = models.CharField(max_length=50, default="#0f172a", help_text="Any CSS color value (hex, rgb, rgba).")
+    bg_darker = models.CharField(max_length=50, default="#0b1120", help_text="Any CSS color value (hex, rgb, rgba).")
+    panel_bg = models.CharField(max_length=50, default="rgba(15, 23, 42, 0.95)", help_text="Any CSS color value (hex, rgb, rgba).")
+    accent = models.CharField(max_length=50, default="#22c55e", help_text="Any CSS color value (hex, rgb, rgba).")
+    accent_soft = models.CharField(max_length=50, default="#4ade80", help_text="Any CSS color value (hex, rgb, rgba).")
+    text_main = models.CharField(max_length=50, default="#f9fafb", help_text="Any CSS color value (hex, rgb, rgba).")
+    text_muted = models.CharField(max_length=50, default="#9ca3af", help_text="Any CSS color value (hex, rgb, rgba).")
+    danger = models.CharField(max_length=50, default="#f97373", help_text="Any CSS color value (hex, rgb, rgba).")
+    border_subtle = models.CharField(max_length=50, default="rgba(148, 163, 184, 0.25)", help_text="Any CSS color value (hex, rgb, rgba).")
+
+    nav_clock_font_size = models.CharField(max_length=20, default="1.25rem", help_text="Any CSS font-size value, e.g. 1.25rem.")
+    nav_clock_font_weight = models.CharField(max_length=10, default="700", help_text="Any CSS font-weight value, e.g. 400, 600, 700.")
+    nav_clock_color = models.CharField(max_length=50, default="rgba(249, 250, 251, 0.85)", help_text="Any CSS color value (hex, rgb, rgba).")
+
+    class Meta:
+        verbose_name = "UI Theme"
+        verbose_name_plural = "UI Theme"
+
+    def __str__(self):
+        return "UI Theme"
+
+    def save(self, *args, **kwargs):
+        self.pk = 1
+        super().save(*args, **kwargs)
+
+    @classmethod
+    def load(cls):
+        obj, _created = cls.objects.get_or_create(pk=1)
         return obj

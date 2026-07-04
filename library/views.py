@@ -1,4 +1,5 @@
 import json
+import subprocess
 import time as time_mod
 from datetime import date as date_type, time
 from pathlib import Path
@@ -163,6 +164,7 @@ def _playlist_to_dict(playlist):
                 "title": item.track.title,
                 "artist": item.track.artist.name if item.track.artist else "",
                 "duration_seconds": item.track.duration_seconds,
+                "next_start_seconds": item.track.next_start_seconds,
                 "category_code": item.track.category.code if item.track.category else "",
             }
             for item in items
@@ -344,6 +346,7 @@ def api_track_list(request):
             "category_code": t.category.code if t.category else "",
             "category_name": t.category.name if t.category else "",
             "duration_seconds": t.duration_seconds,
+            "next_start_seconds": t.next_start_seconds,
             "format": t.format,
             "ready2air": t.ready2air,
         }
@@ -847,6 +850,18 @@ def api_engine_deck_command(request, slot):
         json.dumps({"command": f"deck_{action}", "slot": slot}),
         encoding="utf-8",
     )
+    return JsonResponse({"ok": True})
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def api_engine_restart(request):
+    """Manual recovery button for a hung engine — restarts the
+    isadoraair-engine systemd unit. Fire-and-forget (Popen, not run):
+    if the engine is genuinely deadlocked, systemd may need the full
+    stop-timeout before SIGKILLing it, and this request shouldn't block
+    a gunicorn worker for that long."""
+    subprocess.Popen(["sudo", "systemctl", "restart", "isadoraair-engine"])
     return JsonResponse({"ok": True})
 
 

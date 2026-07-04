@@ -481,7 +481,10 @@ function renderItems() {
 
   let elapsed = 0;
   tbody.innerHTML = items.map(i => {
-    elapsed += (i.duration_seconds || 0);
+    // Effective scheduling duration: tracks crossfade out at
+    // next_start_seconds, not their full duration, so that's what
+    // actually determines how much of the hour a track consumes.
+    elapsed += (i.next_start_seconds != null ? i.next_start_seconds : (i.duration_seconds || 0));
     return `
     <tr data-item-id="${i.id}" draggable="true">
       <td class="pl-col-pos" style="cursor:grab;">&#9776;</td>
@@ -663,7 +666,7 @@ async function searchTracks(reset = true) {
       <button class="pl-add-btn" onclick="addTrack(${t.id})" title="Add to playlist">+</button>
       <span class="pr-title">${esc(t.title)}</span>
       <span class="pr-artist">${esc(t.artist)}</span>
-      <span class="pr-dur">${fmtDuration(t.duration_seconds)}</span>
+      <span class="pr-dur">${fmtDuration(t.next_start_seconds != null ? t.next_start_seconds : (t.duration_seconds || 0))}</span>
     </div>
   `).join('');
 

@@ -51,6 +51,9 @@ class PlaybackEngine:
         self.loop = GLib.MainLoop()
         self.mixer = None
         self.alsasink = None
+        self.agc_dynamic = None
+        self.agc_makeup = None
+        self.agc_limiter = None
         self.main_pipeline = None
         self.decks = {"A": None, "B": None}
         self._deck_bin_map = {}
@@ -59,6 +62,8 @@ class PlaybackEngine:
         self.current_log = None
         self.log_items = []
         self._queue_cursor = 0
+        self._next_hour_peek = None
+        self._next_hour_peek_at = 0.0
         self.running = False
         self._position_timer = None
         self._lock = threading.RLock()
@@ -142,15 +147,57 @@ class PlaybackEngine:
         caps = Gst.Caps.from_string("audio/x-raw,rate=48000,channels=2")
         capsfilter.set_property("caps", caps)
 
-        for el in [self.mixer, convert, resample, capsfilter, self.alsasink]:
+        # Interim leveling for the studio monitor only (StereoTool will
+        # handle real transmitter processing separately, elsewhere). Kept
+        # permanently in the chain rather than conditionally linked, so
+        # enabling/disabling is just a property change, never a pipeline
+        # topology change — see _apply_agc_config.
+        self.agc_dynamic = Gst.ElementFactory.make("audiodynamic", "agc_dynamic")
+        self.agc_makeup = Gst.ElementFactory.make("volume", "agc_makeup")
+        self.agc_limiter = Gst.ElementFactory.make("rglimiter", "agc_limiter")
+
+        for el in [
+            self.mixer, convert, resample, capsfilter,
+            self.agc_dynamic, self.agc_makeup, self.agc_limiter,
+            self.alsasink,
+        ]:
             self.main_pipeline.add(el)
 
         self.mixer.link(convert)
         convert.link(resample)
         resample.link(capsfilter)
-        capsfilter.link(self.alsasink)
+        capsfilter.link(self.agc_dynamic)
+        self.agc_dynamic.link(self.agc_makeup)
+        self.agc_makeup.link(self.agc_limiter)
+        self.agc_limiter.link(self.alsasink)
+
+        self._apply_agc_config()
 
         self.main_pipeline.set_state(Gst.State.PLAYING)
+
+    def _apply_agc_config(self):
+        """(Re)apply the studio monitor's AGC settings (fields on its
+        AudioOutput row — see hardware/admin.py's "AGC (Studio Monitor
+        Leveling)" fieldset) to the already-built pipeline elements.
+        `ratio`/`threshold` (audiodynamic) and `volume` are GStreamer
+        'controllable' properties — safe to set live while PLAYING, no
+        READY-state drop needed. Disabled == unity values, functionally
+        identical to not having these elements in the chain at all."""
+        close_old_connections()
+        cfg = AudioOutput.objects.filter(name=STUDIO_MONITOR_NAME).first()
+        enabled = bool(cfg and cfg.agc_enabled)
+        if enabled:
+            self.agc_dynamic.set_property("ratio", cfg.agc_ratio)
+            self.agc_dynamic.set_property("threshold", cfg.agc_threshold)
+            self.agc_dynamic.set_property("characteristics", 1 if cfg.agc_soft_knee else 0)
+            self.agc_makeup.set_property("volume", 10 ** (cfg.agc_makeup_gain_db / 20.0))
+            self.agc_limiter.set_property("enabled", True)
+        else:
+            self.agc_dynamic.set_property("ratio", 1.0)
+            self.agc_makeup.set_property("volume", 1.0)
+            self.agc_limiter.set_property("enabled", False)
+        print(f"  Applied AGC config: enabled={enabled}"
+              + (f" ratio={cfg.agc_ratio} threshold={cfg.agc_threshold} makeup_gain_db={cfg.agc_makeup_gain_db}" if cfg else " (no AudioOutput row)"))
 
     def _load_current_hour_log(self):
         now = timezone.localtime()
@@ -183,7 +230,7 @@ class PlaybackEngine:
         self.current_log = log
         self.log_items = list(
             log.items
-            .select_related("track", "track__artist", "track__album", "track__category")
+            .select_related("track", "track__artist", "track__album", "track__category", "track__category__kind")
             .order_by("position")
         )
         self._queue_cursor = 0
@@ -222,8 +269,49 @@ class PlaybackEngine:
         if seconds_left_in_hour <= NEXT_HOUR_LOOKAHEAD_SECONDS:
             next_hour = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
             self._ensure_log_approved(next_hour.date(), next_hour.hour)
+            self._advance_to_next_hour_log(next_hour.date(), next_hour.hour)
 
         return True
+
+    def _advance_to_next_hour_log(self, target_date, target_hour):
+        """Broadcast-clock behavior: once the next hour's log is already
+        approved (built above, ~NEXT_HOUR_LOOKAHEAD_SECONDS before top of
+        hour), immediately swap the engine's active queue over to it —
+        discarding whatever's left unplayed from the current hour — rather
+        than waiting for the current hour's queue to drain naturally.
+        Whatever's already playing on a deck is untouched and finishes
+        normally; only what plays *next* (via the crossfade trigger or a
+        natural EOS) changes. Idempotent — only swaps once per hour, since
+        this runs on every 10s tick during the lookahead window."""
+        if (
+            self.current_log
+            and self.current_log.date == target_date
+            and self.current_log.hour == target_hour
+        ):
+            return  # already advanced
+
+        close_old_connections()
+        log = (
+            PlaylistLog.objects
+            .filter(date=target_date, hour=target_hour, status="approved")
+            .first()
+        )
+        if not log:
+            return
+        items = list(
+            log.items
+            .select_related("track", "track__artist", "track__album", "track__category", "track__category__kind")
+            .order_by("position")
+        )
+        if not items:
+            return
+
+        self.current_log = log
+        self.log_items = items
+        self._queue_cursor = 0
+        self._next_hour_peek = None
+        self._next_hour_peek_at = 0.0
+        print(f"  Advanced active queue to next hour ahead of TOH: {log.date} {log.hour:02d}:00 ({len(items)} items)")
 
     def _ensure_log_approved(self, target_date, hour):
         """Build + approve target_date/hour's log if nothing exists yet
@@ -266,12 +354,79 @@ class PlaybackEngine:
                 return deck
         return None
 
+    def _peek_next_hour(self):
+        """Read-only look at the next hour's already-approved log (built
+        by `_ensure_upcoming_logs` ~NEXT_HOUR_LOOKAHEAD_SECONDS before top
+        of hour), without switching engine state to it. Cached briefly
+        since this can be polled every _poll_position tick (500ms) once
+        the current hour's queue is running low. Mirrors the same
+        `next_hour = (now + timedelta(hours=1)).replace(...)` pattern used
+        elsewhere in this file, so day-rollover behaves identically."""
+        now = time.time()
+        if self._next_hour_peek is not None and now - self._next_hour_peek_at < 5.0:
+            return self._next_hour_peek
+
+        close_old_connections()
+        wall_now = timezone.localtime()
+        next_hour = (wall_now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+        log = (
+            PlaylistLog.objects
+            .filter(date=next_hour.date(), hour=next_hour.hour, status="approved")
+            .first()
+        )
+        result = None
+        if log:
+            items = list(
+                log.items
+                .select_related("track", "track__artist", "track__album", "track__category", "track__category__kind")
+                .order_by("position")
+            )
+            if items:
+                result = (log, items)
+
+        self._next_hour_peek = result
+        self._next_hour_peek_at = now
+        return result
+
+    def _roll_over_to_next_hour(self):
+        """Called when the current hour's queue is exhausted. If the next
+        hour's log has already been auto-built (normally true — it's
+        approved NEXT_HOUR_LOOKAHEAD_SECONDS before top of hour), switch
+        the engine's active log over to it so playback and the crossfade
+        trigger both continue seamlessly across the boundary, instead of
+        waiting for the natural-EOS `_on_log_exhausted` path to notice."""
+        peek = self._peek_next_hour()
+        if not peek:
+            return False
+        log, items = peek
+        self.current_log = log
+        self.log_items = items
+        self._queue_cursor = 0
+        self._next_hour_peek = None
+        self._next_hour_peek_at = 0.0
+        print(f"  Rolled over to next hour's log: {log.date} {log.hour:02d}:00 ({len(items)} items)")
+        return True
+
     def _next_queue_item(self):
         if self._queue_cursor >= len(self.log_items):
-            return None
+            if not self._roll_over_to_next_hour():
+                return None
         item = self.log_items[self._queue_cursor]
         self._queue_cursor += 1
         return item
+
+    def _get_upcoming_preview(self):
+        """Every remaining item in the current hour's log — however many
+        there are, no cap — plus, once those run out, the next hour's
+        already-approved items — purely for UI preview (queue table /
+        idle-deck 'Up Next'). Read-only: does not touch
+        `self._queue_cursor` or `self.current_log`."""
+        items = list(self.log_items[self._queue_cursor:])
+        if not items:
+            peek = self._peek_next_hour()
+            if peek:
+                items = list(peek[1])
+        return items
 
     def _start_next_track(self, slot=None):
         """Load the next queued item into `slot` (or whichever slot is
@@ -442,6 +597,8 @@ class PlaybackEngine:
                 self._seek_deck(slot, position)
             elif cmd == "reload_audio_output":
                 self._apply_audio_output_device(self._resolve_studio_monitor_device())
+            elif cmd == "reload_agc_config":
+                self._apply_agc_config()
             elif cmd == "reload_current_log":
                 self._reload_and_restart_current_log()
             elif cmd == "deck_pause":
@@ -631,7 +788,7 @@ class PlaybackEngine:
         close_old_connections()
         fresh_items = list(
             self.current_log.items
-            .select_related("track", "track__artist", "track__album", "track__category")
+            .select_related("track", "track__artist", "track__album", "track__category", "track__category__kind")
             .order_by("position")
         )
         occupied_ids = {d.log_item.id for d in self.decks.values() if d}
@@ -678,18 +835,31 @@ class PlaybackEngine:
         other_slot = self._other_slot(leading.slot)
         other_occupied = self.decks[other_slot] is not None
 
-        if not other_occupied and self._queue_cursor < len(self.log_items):
-            next_item = self.log_items[self._queue_cursor]
-            next_cue_in = next_item.track.cue_in_seconds or 0.0
-            trigger_point = next_start - next_cue_in
+        if not other_occupied:
+            next_item = None
+            if self._queue_cursor < len(self.log_items):
+                next_item = self.log_items[self._queue_cursor]
+            else:
+                # Current hour's queue is exhausted — peek at the next
+                # hour's already-approved log so the last track of the
+                # hour can still crossfade into the first track of the
+                # next, instead of always hard-cutting at top of hour.
+                peek = self._peek_next_hour()
+                if peek:
+                    _, next_hour_items = peek
+                    next_item = next_hour_items[0] if next_hour_items else None
 
-            if trigger_point < 10.0:
-                trigger_point = next_start
+            if next_item is not None:
+                next_cue_in = next_item.track.cue_in_seconds or 0.0
+                trigger_point = next_start - next_cue_in
 
-            if not self._next_triggered and pos >= trigger_point:
-                print(f"  Trigger: pos={pos:.1f}s >= trigger={trigger_point:.1f}s, starting next ({next_item.track.title}) on deck {other_slot}")
-                self._next_triggered = True
-                self._start_next_track(slot=other_slot)
+                if trigger_point < 10.0:
+                    trigger_point = next_start
+
+                if not self._next_triggered and pos >= trigger_point:
+                    print(f"  Trigger: pos={pos:.1f}s >= trigger={trigger_point:.1f}s, starting next ({next_item.track.title}) on deck {other_slot}")
+                    self._next_triggered = True
+                    self._start_next_track(slot=other_slot)
 
         self._write_state()
         return True
@@ -790,8 +960,7 @@ class PlaybackEngine:
                 eta = max(0.0, l_effective - lpos)
 
             queue = []
-            for i in range(self._queue_cursor, min(self._queue_cursor + 10, len(self.log_items))):
-                qi = self.log_items[i]
+            for qi in self._get_upcoming_preview():
                 qt = qi.track
                 queue.append({
                     "item_id": qi.id,
@@ -800,6 +969,7 @@ class PlaybackEngine:
                     "artist": qt.artist.name if qt.artist else "",
                     "duration": qt.duration_seconds or 0,
                     "category": qt.category.code if qt.category else "",
+                    "fill_color": qt.category.kind.fill_color if qt.category else None,
                     "eta_seconds": round(eta, 1),
                 })
                 effective = qt.next_start_seconds if qt.next_start_seconds is not None else (qt.duration_seconds or 0)
