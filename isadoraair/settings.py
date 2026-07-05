@@ -24,7 +24,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 SECRET_KEY = config('SECRET_KEY', default='django-insecure-mgl(1gz6l^$j*(q+-8+9rp3n%2=7l0sr9$iu-lapa4^_!2%#&+')
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+DEBUG = config('DEBUG', default=False, cast=bool)
 
 ALLOWED_HOSTS = config(
     'ALLOWED_HOSTS',
@@ -46,6 +46,7 @@ INSTALLED_APPS = [
     'adminsortable2',
     'hardware',
     'library',
+    'encoders',
 ]
 
 MIDDLEWARE = [
@@ -54,9 +55,19 @@ MIDDLEWARE = [
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
+    'django.contrib.auth.middleware.LoginRequiredMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
+
+# Protects every view by default (LoginRequiredMiddleware, Django 5.1+) —
+# Django's own login/admin-login views are already exempted internally
+# (login_required=False on their view functions), so this doesn't create
+# a redirect loop. Any future view that must stay public needs the
+# @login_not_required decorator explicitly.
+LOGIN_URL = 'login'
+LOGIN_REDIRECT_URL = 'library:dashboard'
+LOGOUT_REDIRECT_URL = 'login'
 
 ROOT_URLCONF = 'isadoraair.urls'
 
@@ -151,6 +162,18 @@ CSRF_TRUSTED_ORIGINS = config(
     default='https://isadoraair,https://192.168.1.125',
     cast=lambda v: [o.strip() for o in v.split(',')],
 )
+
+# Standard Django deploy-checklist hardening (manage.py check --deploy),
+# added when this went internet-facing via oakgroveradio.dyndns.org.
+# nginx already redirects all HTTP -> HTTPS and terminates SSL, so these
+# just add defense-in-depth on top of that rather than changing behavior.
+# Deliberately NOT setting SECURE_HSTS_SECONDS — Django's own docs warn
+# it needs care, and it interacts badly with the self-signed cert this
+# box is keeping for now (a browser that caches HSTS for this host would
+# refuse to let you click through the self-signed warning at all).
+SECURE_SSL_REDIRECT = True
+SESSION_COOKIE_SECURE = True
+CSRF_COOKIE_SECURE = True
 
 # Default primary key field type
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field
