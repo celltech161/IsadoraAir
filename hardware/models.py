@@ -1,6 +1,46 @@
 from django.db import models
 
 
+class AudioPipeline(models.Model):
+    """Singleton — the sample rate the whole GStreamer pipeline runs at
+    (mixer output caps + the silence-priming burst used for fresh track
+    starts — see engine.py's _build_main_pipeline/_create_deck). Every
+    deck's own audioconvert/audioresample just negotiates to whatever
+    this is; there's no other hardcoded rate anywhere else in the
+    pipeline. Changing this is a pipeline topology/format decision, not
+    a live-adjustable property — it requires an engine restart, which
+    the admin change form prompts for and triggers on save."""
+    SAMPLE_RATE_CHOICES = [
+        (32000, "32 kHz"),
+        (44100, "44.1 kHz"),
+        (48000, "48 kHz"),
+        (88200, "88.2 kHz"),
+        (96000, "96 kHz"),
+    ]
+    sample_rate = models.PositiveIntegerField(
+        choices=SAMPLE_RATE_CHOICES, default=48000,
+        help_text="Not all audio hardware natively supports every rate — "
+                   "if in doubt, 44.1kHz matches most of the library and "
+                   "48kHz is the safest general-purpose default.",
+    )
+
+    class Meta:
+        verbose_name = "Audio Pipeline"
+        verbose_name_plural = "Audio Pipeline"
+
+    def __str__(self):
+        return "Audio Pipeline"
+
+    def save(self, *args, **kwargs):
+        self.pk = 1
+        super().save(*args, **kwargs)
+
+    @classmethod
+    def load(cls):
+        obj, _created = cls.objects.get_or_create(pk=1)
+        return obj
+
+
 class AudioOutput(models.Model):
     """Named playback sink (e.g. studio monitor). The device value is
     an ALSA path like 'plughw:2,0' chosen from what aplay -l reports at

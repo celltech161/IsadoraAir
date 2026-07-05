@@ -1,14 +1,46 @@
 import json
+import subprocess
 from pathlib import Path
 
 from django import forms
 from django.contrib import admin
+from django.http import HttpResponseRedirect
+from django.urls import reverse
 
 from .devices import list_input_devices, list_output_devices
-from .models import AudioInput, AudioOutput
+from .models import AudioInput, AudioOutput, AudioPipeline
 
 # Must match engine.py's STUDIO_MONITOR_NAME.
 STUDIO_MONITOR_NAME = "Studio Monitor"
+
+
+@admin.register(AudioPipeline)
+class AudioPipelineAdmin(admin.ModelAdmin):
+    fields = ["sample_rate"]
+
+    class Media:
+        js = ["hardware/js/audio_pipeline_confirm.js"]
+
+    def has_add_permission(self, request):
+        return not AudioPipeline.objects.exists()
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+    def changelist_view(self, request, extra_context=None):
+        obj = AudioPipeline.load()
+        return HttpResponseRedirect(
+            reverse("admin:hardware_audiopipeline_change", args=[obj.pk])
+        )
+
+    def save_model(self, request, obj, form, change):
+        super().save_model(request, obj, form, change)
+        # Sample rate is baked into the pipeline's topology at build time
+        # (the final capsfilter + silence-priming caps in engine.py) —
+        # unlike AGC, there's no live-property path for this, it needs a
+        # full engine restart. Same fire-and-forget mechanism as the
+        # dashboard's "Restart Engine" button (api_engine_restart).
+        subprocess.Popen(["sudo", "systemctl", "restart", "isadoraair-engine"])
 
 
 class _DeviceFieldAdmin(admin.ModelAdmin):

@@ -17,7 +17,7 @@ django.setup()
 
 from django.db import close_old_connections
 from django.utils import timezone
-from hardware.models import AudioOutput
+from hardware.models import AudioOutput, AudioPipeline
 from library.models import LogItem, PlaylistLog, Track
 from library.services.log_builder import (
     DURATION_FIT_MARGIN,
@@ -29,6 +29,12 @@ from library.services.log_builder import (
 STUDIO_MONITOR_NAME = "Studio Monitor"
 STUDIO_MONITOR_FALLBACK_DEVICE = "plughw:2,0"
 
+# StereoTool bridge — a raw (pre-AGC) tap off the mixer, fed to an ALSA
+# loopback device StereoTool reads from separately. Unlike Studio Monitor,
+# there's no fallback device: if this row has nothing configured, the tee
+# branch simply isn't built at all (see _build_main_pipeline).
+STEREOTOOL_OUTPUT_NAME = "Stereotool Input"
+
 STATE_PATH = Path("/run/isadoraair/engine_state.json")
 CMD_PATH = Path("/run/isadoraair/engine_cmd.json")
 POSITION_POLL_MS = 500
@@ -36,7 +42,6 @@ AUTO_BUILD_CHECK_SECONDS = 10
 NEXT_HOUR_LOOKAHEAD_SECONDS = 30
 CACHE_WARM_LEAD_SECONDS = 3.0
 SILENCE_PRIME_SECONDS = 0.3
-SILENCE_PRIME_RATE = 48000
 SLOTS = ("A", "B")
 
 
@@ -68,6 +73,8 @@ class PlaybackEngine:
         self.agc_dynamic = None
         self.agc_makeup = None
         self.agc_limiter = None
+        self.stereotool_sink = None
+        self.pipeline_sample_rate = None
         self.main_pipeline = None
         self.decks = {"A": None, "B": None}
         self._deck_bin_map = {}
@@ -150,8 +157,35 @@ class PlaybackEngine:
         print(f"  AudioOutput '{STUDIO_MONITOR_NAME}' -> {configured}")
         return configured
 
+    def _resolve_stereotool_device(self):
+        try:
+            configured = (
+                AudioOutput.objects
+                .filter(name=STEREOTOOL_OUTPUT_NAME)
+                .values_list("device", flat=True)
+                .first()
+            )
+        except Exception as exc:
+            print(f"  Failed to read AudioOutput config for '{STEREOTOOL_OUTPUT_NAME}' ({exc}); StereoTool bridge disabled")
+            return None
+        if not configured:
+            print(f"  AudioOutput '{STEREOTOOL_OUTPUT_NAME}' has no device set; StereoTool bridge disabled")
+            return None
+        print(f"  AudioOutput '{STEREOTOOL_OUTPUT_NAME}' -> {configured}")
+        return configured
+
+    def _resolve_pipeline_sample_rate(self):
+        try:
+            rate = AudioPipeline.load().sample_rate
+        except Exception as exc:
+            print(f"  Failed to read AudioPipeline config ({exc}); falling back to 48000")
+            return 48000
+        print(f"  Pipeline sample rate -> {rate}")
+        return rate
+
     def _build_main_pipeline(self):
         self.main_pipeline = Gst.Pipeline.new("isadoraair")
+        self.pipeline_sample_rate = self._resolve_pipeline_sample_rate()
 
         self.mixer = Gst.ElementFactory.make("audiomixer", "mixer")
         # Tried setting `latency`/`min-upstream-latency` here (to give the
@@ -165,7 +199,7 @@ class PlaybackEngine:
         convert = Gst.ElementFactory.make("audioconvert", "outconvert")
         resample = Gst.ElementFactory.make("audioresample", "outresample")
         capsfilter = Gst.ElementFactory.make("capsfilter", "outcaps")
-        caps = Gst.Caps.from_string("audio/x-raw,rate=48000,channels=2")
+        caps = Gst.Caps.from_string(f"audio/x-raw,rate={self.pipeline_sample_rate},channels=2")
         capsfilter.set_property("caps", caps)
 
         # Interim leveling for the studio monitor only (StereoTool will
@@ -177,17 +211,65 @@ class PlaybackEngine:
         self.agc_makeup = Gst.ElementFactory.make("volume", "agc_makeup")
         self.agc_limiter = Gst.ElementFactory.make("rglimiter", "agc_limiter")
 
-        for el in [
+        elements = [
             self.mixer, convert, resample, capsfilter,
             self.agc_dynamic, self.agc_makeup, self.agc_limiter,
             self.alsasink,
-        ]:
+        ]
+
+        # StereoTool bridge — raw (pre-AGC) tap off the mixer, split via a
+        # tee right after format normalization. Only built at all if a
+        # device is actually configured; otherwise the topology is
+        # unchanged from before (capsfilter links directly to agc_dynamic).
+        stereotool_device = self._resolve_stereotool_device()
+        self.stereotool_sink = None
+        stereotool_tee = None
+        stereotool_queue = None
+        if stereotool_device:
+            stereotool_tee = Gst.ElementFactory.make("tee", "stereotool_tee")
+            stereotool_queue = Gst.ElementFactory.make("queue", "stereotool_queue")
+            # Leaky upstream (drop oldest buffered data first) so a stalled
+            # or not-yet-listening StereoTool bridge — e.g. nothing has
+            # opened the other end of the ALSA loopback pair yet — can
+            # never back up into this queue and block the tee, which would
+            # otherwise stall the shared Studio Monitor/on-air chain too.
+            # This branch only ever drops its own audio, nothing else's.
+            stereotool_queue.set_property("leaky", 1)
+            stereotool_queue.set_property("max-size-time", 1_000_000_000)  # 1s
+            stereotool_queue.set_property("max-size-buffers", 0)
+            stereotool_queue.set_property("max-size-bytes", 0)
+            self.stereotool_sink = Gst.ElementFactory.make("alsasink", "stereotool_output")
+            self.stereotool_sink.set_property("device", stereotool_device)
+            # Critical: without these, this sink's own preroll (waiting for
+            # its first buffer) can block the *entire pipeline's* PAUSED ->
+            # PLAYING transition if the leaky queue above ever drops that
+            # first buffer — verified this stalls the real pipeline (stuck
+            # ASYNC/PAUSED forever, zero audio ever reaching this sink)
+            # despite the Studio Monitor branch appearing to work fine.
+            # `async=False` means this sink doesn't hold up the pipeline's
+            # state changes waiting to preroll; `sync=False` means it just
+            # renders buffers as they arrive rather than clock-pacing them
+            # against the *other* sink's real hardware clock (Studio
+            # Monitor's card vs this ALSA loopback's virtual one).
+            self.stereotool_sink.set_property("sync", False)
+            self.stereotool_sink.set_property("async", False)
+            elements += [stereotool_tee, stereotool_queue, self.stereotool_sink]
+
+        for el in elements:
             self.main_pipeline.add(el)
 
         self.mixer.link(convert)
         convert.link(resample)
         resample.link(capsfilter)
-        capsfilter.link(self.agc_dynamic)
+
+        if stereotool_tee:
+            capsfilter.link(stereotool_tee)
+            stereotool_tee.link(self.agc_dynamic)
+            stereotool_tee.link(stereotool_queue)
+            stereotool_queue.link(self.stereotool_sink)
+        else:
+            capsfilter.link(self.agc_dynamic)
+
         self.agc_dynamic.link(self.agc_makeup)
         self.agc_makeup.link(self.agc_limiter)
         self.agc_limiter.link(self.alsasink)
@@ -617,14 +699,14 @@ class PlaybackEngine:
         # about fresh starts on a normal crossfade.
         silence_primed = resume_position_ns is None
         if silence_primed:
-            caps = Gst.Caps.from_string(f"audio/x-raw,rate={SILENCE_PRIME_RATE},channels=2")
+            caps = Gst.Caps.from_string(f"audio/x-raw,rate={self.pipeline_sample_rate},channels=2")
 
             real_caps = Gst.ElementFactory.make("capsfilter", None)
             real_caps.set_property("caps", caps)
 
             silence = Gst.ElementFactory.make("audiotestsrc", None)
             silence.set_property("wave", "silence")
-            silence.set_property("samplesperbuffer", int(SILENCE_PRIME_SECONDS * SILENCE_PRIME_RATE))
+            silence.set_property("samplesperbuffer", int(SILENCE_PRIME_SECONDS * self.pipeline_sample_rate))
             silence.set_property("num-buffers", 1)
             silence_caps = Gst.ElementFactory.make("capsfilter", None)
             silence_caps.set_property("caps", caps)
