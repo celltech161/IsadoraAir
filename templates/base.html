@@ -153,9 +153,9 @@
     <div class="nav-links" id="navLinks">
       <a href="{% url 'library:schedule' %}" {% block nav_schedule %}{% endblock %}>Schedule</a>
       <a href="{% url 'library:logs' %}" {% block nav_logs %}{% endblock %}>Logs</a>
-      <a href="{% url 'library:dashboard' %}" {% block nav_dashboard %}{% endblock %}>Dashboard</a>
       <a href="{% url 'library:library' %}" {% block nav_library %}{% endblock %}>Library</a>
       <a href="{% url 'library:playlists' %}" {% block nav_playlists %}{% endblock %}>Playlists</a>
+      <a href="{% url 'library:rotations' %}" {% block nav_rotations %}{% endblock %}>Rotations</a>
     </div>
     <div class="nav-right">
       <span class="nav-clock" id="navClock"></span>

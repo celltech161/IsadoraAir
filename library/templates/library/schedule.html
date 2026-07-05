@@ -274,7 +274,7 @@
       {{ rotation.name }}
     </button>
     {% empty %}
-    <p class="palette-empty">No rotations configured. Add rotations in the <a href="/admin/library/rotation/" style="color:var(--accent)">admin</a>.</p>
+    <p class="palette-empty">No rotations configured. <a href="{% url 'library:rotations' %}" style="color:var(--accent)">Add a rotation</a>.</p>
     {% endfor %}
 
     <h3 style="margin-top: 0.75rem;">Playlists</h3>

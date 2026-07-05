@@ -231,7 +231,7 @@ def fill_remaining_hour(picks, accumulated_seconds, target_datetime):
 
 
 def _build_from_rotation(target_date, hour, rotation):
-    slots = list(rotation.slots.select_related("category").order_by("position"))
+    slots = list(rotation.slots.select_related("category", "track", "track__category").order_by("position"))
     if not slots:
         return None, f"Rotation '{rotation.name}' has no slots."
 
@@ -246,23 +246,33 @@ def _build_from_rotation(target_date, hour, rotation):
     accumulated_seconds = 0.0
 
     for slot in slots:
-        category = slot.category
-        artist_sep, title_sep = get_separation(category, recency_cfg)
+        if slot.track_id:
+            # Direct track insert — the hybrid rotation/playlist ask.
+            # Skips recency separation entirely on the way in, even for a
+            # music track that would otherwise violate it; the LogItem it
+            # still produces below (with a real scheduled_time) is what
+            # makes it count as "recently played" for any category slots
+            # that come after it, in this build or future ones.
+            track = slot.track
+            category = track.category
+        else:
+            category = slot.category
+            artist_sep, title_sep = get_separation(category, recency_cfg)
 
-        exclude_track_ids, exclude_artist_ids = get_recent_exclusions(
-            target_datetime, artist_sep, title_sep,
-            picked_tracks, picked_artist_ids,
-        )
+            exclude_track_ids, exclude_artist_ids = get_recent_exclusions(
+                target_datetime, artist_sep, title_sep,
+                picked_tracks, picked_artist_ids,
+            )
 
-        remaining = 3600 - accumulated_seconds
-        track = pick_track(
-            category, exclude_track_ids, exclude_artist_ids,
-            artist_sep, title_sep, target_datetime,
-            remaining_seconds=remaining,
-        )
+            remaining = 3600 - accumulated_seconds
+            track = pick_track(
+                category, exclude_track_ids, exclude_artist_ids,
+                artist_sep, title_sep, target_datetime,
+                remaining_seconds=remaining,
+            )
 
-        if track is None:
-            continue
+            if track is None:
+                continue
 
         track_duration = track.next_start_seconds or track.duration_seconds or 0
         scheduled_time = target_datetime + timedelta(seconds=accumulated_seconds)

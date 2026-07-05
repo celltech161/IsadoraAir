@@ -1,0 +1,768 @@
+{% extends "base.html" %}
+
+{% block title %}Rotations — IsadoraAir{% endblock %}
+{% block nav_rotations %}class="active"{% endblock %}
+
+{% block extra_css %}
+<style>
+  .pl-toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.6rem;
+    align-items: center;
+    margin-bottom: 0.75rem;
+  }
+
+  .pl-select, .pl-input {
+    background: var(--bg-dark);
+    border: 1px solid var(--border-subtle);
+    border-radius: 8px;
+    padding: 0.45rem 0.65rem;
+    color: var(--text-main);
+    font-size: 0.85rem;
+  }
+  .pl-select:focus, .pl-input:focus { outline: none; border-color: var(--accent); }
+  .pl-select { cursor: pointer; min-width: 220px; }
+
+  .pl-btn {
+    background: var(--bg-dark);
+    border: 1px solid var(--border-subtle);
+    border-radius: 8px;
+    color: var(--text-main);
+    padding: 0.45rem 0.9rem;
+    font-size: 0.82rem;
+    cursor: pointer;
+    transition: border-color 0.12s;
+  }
+  .pl-btn:hover { border-color: var(--accent); }
+  .pl-btn.danger { color: var(--danger); }
+  .pl-btn.danger:hover { border-color: var(--danger); }
+  .pl-btn:disabled { opacity: 0.4; cursor: default; }
+
+  .pl-msg {
+    font-size: 0.8rem;
+    color: var(--text-muted);
+  }
+  .pl-msg.error { color: var(--danger); }
+
+  .pl-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.6rem;
+    margin-bottom: 1rem;
+  }
+  .pl-meta .pl-input { flex: 1; min-width: 200px; }
+  #rotationNameInput { max-width: 320px; }
+
+  .pl-empty {
+    text-align: center;
+    padding: 3rem 1rem;
+    color: var(--text-muted);
+    font-size: 0.9rem;
+  }
+
+  /* --- Two-pane layout --- */
+  .pl-wrap {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1.25rem;
+    align-items: flex-start;
+  }
+  @media (max-width: 900px) {
+    .pl-wrap { grid-template-columns: 1fr; }
+  }
+
+  .pl-pane {
+    background: var(--bg-dark);
+    border: 1px solid var(--border-subtle);
+    border-radius: 10px;
+    padding: 0.85rem;
+  }
+
+  .pl-pane h3 {
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: var(--text-muted);
+    margin-bottom: 0.6rem;
+  }
+
+  .pl-pane h4 {
+    font-size: 0.68rem;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: var(--text-muted);
+    margin: 0.9rem 0 0.5rem;
+  }
+
+  .rot-category-add {
+    display: flex;
+    gap: 0.5rem;
+  }
+  .rot-category-add .pl-select { flex: 1; min-width: 0; }
+
+  .rot-divider {
+    border: none;
+    border-top: 1px solid var(--border-subtle);
+    margin: 0.9rem 0;
+  }
+
+  .pl-search-toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    margin-bottom: 0.6rem;
+  }
+  .pl-search-toolbar .pl-input { flex: 1; min-width: 160px; }
+
+  .pl-ready-toggle {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    font-size: 0.78rem;
+    color: var(--text-muted);
+    white-space: nowrap;
+  }
+
+  .pl-results {
+    max-height: 400px;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .pl-result {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.4rem 0.55rem;
+    border-radius: 6px;
+    font-size: 0.8rem;
+    transition: background 0.1s;
+  }
+  .pl-result:hover { background: rgba(148, 163, 184, 0.08); }
+
+  .pl-result .pr-title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pl-result .pr-artist { color: var(--text-muted); font-size: 0.75rem; width: 140px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pl-result .pr-dur { color: var(--text-muted); width: 42px; text-align: right; }
+
+  .pl-results-header {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.3rem 0.55rem;
+    margin-bottom: 2px;
+    border-bottom: 1px solid var(--border-subtle);
+    font-size: 0.68rem;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-muted);
+  }
+  .prh-spacer { width: 24px; flex-shrink: 0; }
+  .prh-col { flex: 1; cursor: pointer; user-select: none; transition: color 0.12s; }
+  .prh-col:hover { color: var(--text-main); }
+  .prh-col.sorted { color: var(--accent); }
+  .prh-col .arrow { font-size: 0.6rem; margin-left: 2px; }
+  .prh-col.prh-artist { flex: none; width: 140px; }
+  .prh-col.prh-dur { flex: none; width: 42px; text-align: right; }
+
+  .pl-add-btn {
+    background: rgba(34, 197, 94, 0.12);
+    border: 1px solid rgba(34, 197, 94, 0.3);
+    color: var(--accent);
+    border-radius: 5px;
+    width: 24px;
+    height: 24px;
+    line-height: 1;
+    font-size: 0.9rem;
+    font-weight: 700;
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+  .pl-add-btn:hover { background: rgba(34, 197, 94, 0.22); }
+
+  .pl-hint {
+    color: var(--text-muted);
+    font-size: 0.78rem;
+    padding: 0.5rem;
+  }
+
+  .pl-load-more-row {
+    text-align: center;
+    padding: 0.5rem;
+  }
+  .pl-load-more-row .pl-btn { font-size: 0.78rem; padding: 0.35rem 0.8rem; }
+
+  /* --- Slots table --- */
+  .pl-items-wrap {
+    overflow-x: auto;
+    border-radius: 8px;
+    border: 1px solid var(--border-subtle);
+    max-height: 600px;
+    overflow-y: auto;
+  }
+
+  table.pl-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.8rem;
+  }
+
+  table.pl-table th {
+    background: var(--bg-darker);
+    color: var(--text-muted);
+    font-weight: 600;
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    padding: 0.45rem 0.6rem;
+    text-align: left;
+    border-bottom: 1px solid var(--border-subtle);
+    position: sticky;
+    top: 0;
+  }
+
+  table.pl-table td {
+    padding: 0.4rem 0.6rem;
+    border-bottom: 1px solid rgba(148, 163, 184, 0.08);
+    color: var(--text-main);
+  }
+
+  table.pl-table tr[draggable="true"] { cursor: grab; }
+  table.pl-table tr[draggable="true"]:active { cursor: grabbing; }
+  table.pl-table tr.drag-over td { border-top: 2px solid var(--accent); }
+  table.pl-table tr.dragging td { opacity: 0.3; }
+
+  td.pl-col-pos { color: var(--text-muted); text-align: center; white-space: nowrap; }
+
+  .rot-badge {
+    display: inline-block;
+    font-size: 0.65rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    padding: 0.15rem 0.45rem;
+    border-radius: 4px;
+    white-space: nowrap;
+  }
+  .rot-badge-category { background: rgba(59, 130, 246, 0.15); color: #3b82f6; }
+  .rot-badge-track { background: rgba(34, 197, 94, 0.15); color: var(--accent); }
+
+  .pl-remove-btn {
+    background: none;
+    border: 1px solid var(--border-subtle);
+    border-radius: 4px;
+    color: var(--text-muted);
+    font-size: 0.7rem;
+    padding: 0.1rem 0.4rem;
+    cursor: pointer;
+    transition: color 0.12s, border-color 0.12s;
+  }
+  .pl-remove-btn:hover { color: var(--danger); border-color: var(--danger); }
+
+  .pl-total {
+    margin-top: 0.5rem;
+    font-size: 0.8rem;
+    color: var(--text-muted);
+    text-align: right;
+  }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="pl-toolbar">
+  <select class="pl-select" id="rotationSelect">
+    <option value="">Select a rotation...</option>
+  </select>
+  <button class="pl-btn" onclick="createRotation()">New Rotation</button>
+  <button class="pl-btn danger" id="deleteRotationBtn" onclick="deleteCurrentRotation()" disabled>Delete</button>
+  <span class="pl-msg" id="rotationMsg"></span>
+</div>
+
+<div class="pl-meta" id="rotationMeta" style="display:none;">
+  <input type="text" class="pl-input" id="rotationNameInput" placeholder="Rotation name">
+  <input type="text" class="pl-input" id="rotationDescInput" placeholder="Description (optional)">
+</div>
+
+<div class="pl-empty" id="noRotationMsg">Select an existing rotation above, or create a new one.</div>
+
+<div class="pl-wrap" id="rotationWrap" style="display:none;">
+  <div class="pl-pane">
+    <h3>Add to Rotation</h3>
+
+    <h4>Category Slot (auto-pick, respects recency)</h4>
+    <div class="rot-category-add">
+      <select class="pl-select" id="categorySlotSelect">
+        {% for cat in categories %}
+        <option value="{{ cat.id }}">{{ cat.name }}</option>
+        {% endfor %}
+      </select>
+      <button class="pl-btn" onclick="addCategorySlot()">Add</button>
+    </div>
+
+    <hr class="rot-divider">
+
+    <h4>Direct Track Insert (skips recency)</h4>
+    <div class="pl-search-toolbar">
+      <input type="text" class="pl-input" id="trackSearchInput" placeholder="Search title, artist, album...">
+      <select class="pl-select" id="trackCategoryFilter" style="min-width:140px;">
+        <option value="">All categories</option>
+        {% for cat in categories %}
+        <option value="{{ cat.id }}">{{ cat.name }}</option>
+        {% endfor %}
+      </select>
+      <label class="pl-ready-toggle">
+        <input type="checkbox" id="readyOnlyToggle" checked> Ready to air only
+      </label>
+    </div>
+    <div class="pl-results-header">
+      <span class="prh-spacer"></span>
+      <span class="prh-col" data-sort="title">Track <span class="arrow"></span></span>
+      <span class="prh-col prh-artist" data-sort="artist">Artist <span class="arrow"></span></span>
+      <span class="prh-col prh-dur" data-sort="duration">Dur <span class="arrow"></span></span>
+    </div>
+    <div class="pl-results" id="searchResults">
+      <div class="pl-hint">Type at least 2 characters, or pick a category, to search the library.</div>
+    </div>
+  </div>
+
+  <div class="pl-pane">
+    <h3>Rotation Slots</h3>
+    <div class="pl-items-wrap">
+      <table class="pl-table">
+        <thead>
+          <tr>
+            <th></th>
+            <th>#</th>
+            <th>Type</th>
+            <th>Slot</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="itemsTbody"></tbody>
+      </table>
+    </div>
+    <div class="pl-total" id="rotationTotal"></div>
+  </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+let currentRotation = null;
+let searchDebounce = null;
+
+function getCookie(name) {
+  let val = null;
+  document.cookie.split(';').forEach(c => {
+    c = c.trim();
+    if (c.startsWith(name + '='))
+      val = decodeURIComponent(c.substring(name.length + 1));
+  });
+  return val;
+}
+
+function esc(s) {
+  if (!s) return '';
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+function fmtDuration(sec) {
+  if (!sec && sec !== 0) return '';
+  const m = Math.floor(sec / 60);
+  const s = Math.round(sec % 60);
+  return m + ':' + String(s).padStart(2, '0');
+}
+
+function setMsg(text, isError) {
+  const el = document.getElementById('rotationMsg');
+  el.textContent = text || '';
+  el.className = 'pl-msg' + (isError ? ' error' : '');
+}
+
+async function apiJson(url, options) {
+  const resp = await fetch(url, options);
+  let data = null;
+  try { data = await resp.json(); } catch (e) { /* no body */ }
+  return { ok: resp.ok, data };
+}
+
+// --- Rotation list / selection ---
+async function loadRotationList(selectId) {
+  const resp = await fetch('/api/rotations/');
+  if (!resp.ok) return;
+  const data = await resp.json();
+
+  const select = document.getElementById('rotationSelect');
+  const prevValue = selectId !== undefined ? String(selectId) : select.value;
+
+  select.innerHTML = '<option value="">Select a rotation...</option>' +
+    data.rotations.map(r =>
+      `<option value="${r.id}">${esc(r.name)} (${r.slot_count})</option>`
+    ).join('');
+
+  if (prevValue && data.rotations.some(r => String(r.id) === prevValue)) {
+    select.value = prevValue;
+  }
+}
+
+document.getElementById('rotationSelect').addEventListener('change', function() {
+  if (this.value) {
+    loadRotationDetail(this.value);
+  } else {
+    currentRotation = null;
+    document.getElementById('rotationWrap').style.display = 'none';
+    document.getElementById('rotationMeta').style.display = 'none';
+    document.getElementById('noRotationMsg').style.display = '';
+    document.getElementById('deleteRotationBtn').disabled = true;
+  }
+});
+
+async function createRotation() {
+  const name = prompt('Name for the new rotation:');
+  if (!name || !name.trim()) return;
+
+  const { ok, data } = await apiJson('/api/rotations/', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') },
+    body: JSON.stringify({ name: name.trim() }),
+  });
+
+  if (!ok) {
+    setMsg(data && data.error ? data.error : 'Could not create rotation', true);
+    return;
+  }
+
+  setMsg('');
+  await loadRotationList(data.id);
+  document.getElementById('rotationSelect').value = data.id;
+  loadRotationDetail(data.id);
+}
+
+async function deleteCurrentRotation() {
+  if (!currentRotation) return;
+  if (!confirm(`Delete rotation "${currentRotation.name}"? This cannot be undone.`)) return;
+
+  const { ok, data } = await apiJson(`/api/rotations/${currentRotation.id}/`, {
+    method: 'DELETE',
+    headers: { 'X-CSRFToken': getCookie('csrftoken') },
+  });
+
+  if (!ok) {
+    setMsg(data && data.error ? data.error : 'Could not delete rotation', true);
+    return;
+  }
+
+  setMsg('');
+  currentRotation = null;
+  document.getElementById('rotationWrap').style.display = 'none';
+  document.getElementById('rotationMeta').style.display = 'none';
+  document.getElementById('noRotationMsg').style.display = '';
+  document.getElementById('deleteRotationBtn').disabled = true;
+  await loadRotationList('');
+}
+
+async function loadRotationDetail(id) {
+  const resp = await fetch(`/api/rotations/${id}/`);
+  if (!resp.ok) return;
+  currentRotation = await resp.json();
+  renderRotationMeta();
+  renderSlots();
+
+  document.getElementById('noRotationMsg').style.display = 'none';
+  document.getElementById('rotationMeta').style.display = '';
+  document.getElementById('rotationWrap').style.display = '';
+  document.getElementById('deleteRotationBtn').disabled = false;
+}
+
+function renderRotationMeta() {
+  document.getElementById('rotationNameInput').value = currentRotation.name;
+  document.getElementById('rotationDescInput').value = currentRotation.description || '';
+}
+
+async function saveRotationMeta(field, value) {
+  if (!currentRotation) return;
+  const { ok, data } = await apiJson(`/api/rotations/${currentRotation.id}/`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') },
+    body: JSON.stringify({ [field]: value }),
+  });
+
+  if (!ok) {
+    setMsg(data && data.error ? data.error : 'Could not save change', true);
+    return;
+  }
+  setMsg('');
+  currentRotation = data;
+  await loadRotationList(currentRotation.id);
+}
+
+document.getElementById('rotationNameInput').addEventListener('blur', function() {
+  if (currentRotation && this.value.trim() && this.value.trim() !== currentRotation.name) {
+    saveRotationMeta('name', this.value.trim());
+  }
+});
+document.getElementById('rotationDescInput').addEventListener('blur', function() {
+  if (currentRotation && this.value !== currentRotation.description) {
+    saveRotationMeta('description', this.value);
+  }
+});
+
+// --- Rotation slots ---
+function renderSlots() {
+  const tbody = document.getElementById('itemsTbody');
+  const slots = currentRotation.slots;
+
+  if (slots.length === 0) {
+    tbody.innerHTML = '';
+    document.getElementById('rotationTotal').textContent = 'No slots yet.';
+    return;
+  }
+
+  tbody.innerHTML = slots.map(s => {
+    const isTrack = s.slot_type === 'track';
+    const badge = isTrack
+      ? '<span class="rot-badge rot-badge-track">Track</span>'
+      : '<span class="rot-badge rot-badge-category">Category</span>';
+    const content = isTrack
+      ? `${esc(s.artist)} &ndash; ${esc(s.title)}`
+      : esc(s.category_name);
+    return `
+    <tr data-slot-id="${s.id}" draggable="true">
+      <td class="pl-col-pos" style="cursor:grab;">&#9776;</td>
+      <td class="pl-col-pos">${s.position + 1}</td>
+      <td>${badge}</td>
+      <td>${content}</td>
+      <td><button class="pl-remove-btn" onclick="removeSlot(${s.id})">remove</button></td>
+    </tr>
+  `;
+  }).join('');
+
+  document.getElementById('rotationTotal').textContent =
+    `${slots.length} slot${slots.length === 1 ? '' : 's'}`;
+
+  initDragDrop();
+}
+
+function initDragDrop() {
+  const tbody = document.getElementById('itemsTbody');
+  let dragRow = null;
+
+  tbody.querySelectorAll('tr[draggable]').forEach(row => {
+    row.addEventListener('dragstart', (e) => {
+      dragRow = row;
+      row.classList.add('dragging');
+      e.dataTransfer.effectAllowed = 'move';
+    });
+
+    row.addEventListener('dragend', () => {
+      row.classList.remove('dragging');
+      tbody.querySelectorAll('tr').forEach(r => r.classList.remove('drag-over'));
+      dragRow = null;
+    });
+
+    row.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'move';
+      tbody.querySelectorAll('tr').forEach(r => r.classList.remove('drag-over'));
+      row.classList.add('drag-over');
+    });
+
+    row.addEventListener('dragleave', () => {
+      row.classList.remove('drag-over');
+    });
+
+    row.addEventListener('drop', async (e) => {
+      e.preventDefault();
+      row.classList.remove('drag-over');
+      if (!dragRow || dragRow === row) return;
+
+      tbody.insertBefore(dragRow, row);
+
+      const order = [...tbody.querySelectorAll('tr')].map(r => parseInt(r.dataset.slotId));
+
+      const { ok, data } = await apiJson(`/api/rotations/${currentRotation.id}/reorder/`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') },
+        body: JSON.stringify({ order }),
+      });
+
+      if (ok) {
+        currentRotation = data;
+        renderSlots();
+      }
+    });
+  });
+}
+
+async function removeSlot(slotId) {
+  const { ok, data } = await apiJson(`/api/rotations/slot/${slotId}/`, {
+    method: 'DELETE',
+    headers: { 'X-CSRFToken': getCookie('csrftoken') },
+  });
+
+  if (!ok) {
+    setMsg(data && data.error ? data.error : 'Could not remove slot', true);
+    return;
+  }
+
+  currentRotation = data;
+  renderSlots();
+  loadRotationList(currentRotation.id);
+}
+
+async function addCategorySlot() {
+  if (!currentRotation) return;
+  const categoryId = document.getElementById('categorySlotSelect').value;
+  if (!categoryId) return;
+
+  const { ok, data } = await apiJson(`/api/rotations/${currentRotation.id}/slots/`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') },
+    body: JSON.stringify({ category_id: categoryId }),
+  });
+
+  if (!ok) {
+    setMsg(data && data.error ? data.error : 'Could not add category slot', true);
+    return;
+  }
+
+  currentRotation = data;
+  renderSlots();
+  loadRotationList(currentRotation.id);
+}
+
+async function addTrackSlot(trackId) {
+  if (!currentRotation) return;
+
+  const { ok, data } = await apiJson(`/api/rotations/${currentRotation.id}/slots/`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') },
+    body: JSON.stringify({ track_id: trackId }),
+  });
+
+  if (!ok) {
+    setMsg(data && data.error ? data.error : 'Could not add track slot', true);
+    return;
+  }
+
+  currentRotation = data;
+  renderSlots();
+  loadRotationList(currentRotation.id);
+}
+
+// --- Track search ---
+let searchPage = 1;
+let searchTotalPages = 1;
+let searchSort = 'title';
+let searchDir = 'asc';
+
+function updateSearchSortIndicators() {
+  document.querySelectorAll('.prh-col[data-sort]').forEach(el => {
+    const arrow = el.querySelector('.arrow');
+    if (el.dataset.sort === searchSort) {
+      el.classList.add('sorted');
+      arrow.textContent = searchDir === 'asc' ? '▲' : '▼';
+    } else {
+      el.classList.remove('sorted');
+      arrow.textContent = '';
+    }
+  });
+}
+
+document.querySelectorAll('.prh-col[data-sort]').forEach(el => {
+  el.addEventListener('click', () => {
+    const field = el.dataset.sort;
+    if (searchSort === field) {
+      searchDir = searchDir === 'asc' ? 'desc' : 'asc';
+    } else {
+      searchSort = field;
+      searchDir = 'asc';
+    }
+    updateSearchSortIndicators();
+    searchTracks(true);
+  });
+});
+updateSearchSortIndicators();
+
+async function searchTracks(reset = true) {
+  const q = document.getElementById('trackSearchInput').value.trim();
+  const category = document.getElementById('trackCategoryFilter').value;
+  const readyOnly = document.getElementById('readyOnlyToggle').checked;
+  const container = document.getElementById('searchResults');
+
+  if (!q && !category) {
+    container.innerHTML = '<div class="pl-hint">Type at least 2 characters, or pick a category, to search the library.</div>';
+    return;
+  }
+  if (q && q.length < 2) {
+    container.innerHTML = '<div class="pl-hint">Keep typing...</div>';
+    return;
+  }
+
+  if (reset) searchPage = 1;
+
+  const params = new URLSearchParams();
+  if (q) params.set('q', q);
+  if (category) params.set('category', category);
+  if (readyOnly) params.set('ready2air', 'true');
+  params.set('sort', searchSort);
+  params.set('dir', searchDir);
+  params.set('per_page', 100);
+  params.set('page', searchPage);
+
+  const resp = await fetch('/api/tracks/?' + params.toString());
+  if (!resp.ok) return;
+  const data = await resp.json();
+  searchTotalPages = data.pages;
+
+  if (reset && data.items.length === 0) {
+    container.innerHTML = '<div class="pl-hint">No matching tracks.</div>';
+    return;
+  }
+
+  const rowsHtml = data.items.map(t => `
+    <div class="pl-result">
+      <button class="pl-add-btn" onclick="addTrackSlot(${t.id})" title="Add as a direct track slot">+</button>
+      <span class="pr-title">${esc(t.title)}</span>
+      <span class="pr-artist">${esc(t.artist)}</span>
+      <span class="pr-dur">${fmtDuration(t.next_start_seconds != null ? t.next_start_seconds : (t.duration_seconds || 0))}</span>
+    </div>
+  `).join('');
+
+  if (reset) {
+    container.innerHTML = rowsHtml;
+  } else {
+    const footer = container.querySelector('.pl-load-more-row');
+    if (footer) footer.remove();
+    container.insertAdjacentHTML('beforeend', rowsHtml);
+  }
+
+  const shownCount = container.querySelectorAll('.pl-result').length;
+  const footer = document.createElement('div');
+  footer.className = 'pl-load-more-row';
+  footer.innerHTML = searchPage < searchTotalPages
+    ? `<button class="pl-btn" onclick="loadMoreResults()">Load more (${shownCount} of ${data.total})</button>`
+    : `<div class="pl-hint">${shownCount} of ${data.total} track${data.total === 1 ? '' : 's'}</div>`;
+  container.appendChild(footer);
+}
+
+function loadMoreResults() {
+  searchPage += 1;
+  searchTracks(false);
+}
+
+document.getElementById('trackSearchInput').addEventListener('input', () => {
+  clearTimeout(searchDebounce);
+  searchDebounce = setTimeout(() => searchTracks(true), 300);
+});
+document.getElementById('trackCategoryFilter').addEventListener('change', () => searchTracks(true));
+document.getElementById('readyOnlyToggle').addEventListener('change', () => searchTracks(true));
+
+// --- Init ---
+loadRotationList();
+</script>
+{% endblock %}

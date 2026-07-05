@@ -220,8 +220,8 @@ class TrackAdmin(admin.ModelAdmin):
 class RotationSlotInline(SortableTabularInline):
     model = RotationSlot
     extra = 1
-    fields = ["category"]
-    autocomplete_fields = ["category"]
+    fields = ["category", "track"]
+    autocomplete_fields = ["category", "track"]
 
 
 @admin.register(Rotation)

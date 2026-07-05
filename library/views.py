@@ -9,6 +9,7 @@ from django.shortcuts import render
 from django.views.decorators.csrf import csrf_exempt, ensure_csrf_cookie
 from django.views.decorators.http import require_http_methods
 
+from django.core.exceptions import ValidationError
 from django.core.paginator import Paginator
 from django.db.models import Count, Q
 from django.db.models.deletion import ProtectedError
@@ -16,7 +17,7 @@ from django.utils import timezone
 
 from django.shortcuts import get_object_or_404
 
-from .models import Artist, Album, Category, Genre, LogItem, Playlist, PlaylistItem, PlaylistLog, Rotation, ScheduleBlock, Track
+from .models import Artist, Album, Category, Genre, LogItem, Playlist, PlaylistItem, PlaylistLog, Rotation, RotationSlot, ScheduleBlock, Track
 from .services.log_builder import _build_from_playlist, build_hour_log
 
 
@@ -113,11 +114,168 @@ def api_schedule_delete(request, pk):
     return JsonResponse({"ok": True, "deleted": deleted > 0})
 
 
-@require_http_methods(["GET"])
+@require_http_methods(["GET", "POST"])
 def api_rotation_list(request):
-    rotations = Rotation.objects.all().order_by("name")
-    data = [{"id": r.id, "name": r.name} for r in rotations]
-    return JsonResponse({"rotations": data})
+    if request.method == "GET":
+        rotations = Rotation.objects.all().order_by("name").annotate(_slot_count=Count("slots"))
+        data = [
+            {"id": r.id, "name": r.name, "description": r.description, "slot_count": r._slot_count}
+            for r in rotations
+        ]
+        return JsonResponse({"rotations": data})
+
+    try:
+        body = json.loads(request.body)
+    except (json.JSONDecodeError, ValueError):
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+
+    name = (body.get("name") or "").strip()
+    if not name:
+        return JsonResponse({"error": "name is required"}, status=400)
+
+    if Rotation.objects.filter(name=name).exists():
+        return JsonResponse({"error": "A rotation with that name already exists"}, status=400)
+
+    rotation = Rotation.objects.create(name=name, description=body.get("description", ""))
+    return JsonResponse(_rotation_to_dict(rotation))
+
+
+def _rotation_to_dict(rotation):
+    slots = (
+        rotation.slots
+        .select_related("category", "track", "track__artist", "track__category")
+        .order_by("position")
+    )
+    slot_data = []
+    for slot in slots:
+        if slot.track_id:
+            slot_data.append({
+                "id": slot.id,
+                "position": slot.position,
+                "slot_type": "track",
+                "track_id": slot.track_id,
+                "title": slot.track.title,
+                "artist": slot.track.artist.name if slot.track.artist else "",
+                "category_code": slot.track.category.code if slot.track.category else "",
+            })
+        else:
+            slot_data.append({
+                "id": slot.id,
+                "position": slot.position,
+                "slot_type": "category",
+                "category_id": slot.category_id,
+                "category_code": slot.category.code,
+                "category_name": slot.category.name,
+            })
+    return {
+        "id": rotation.id,
+        "name": rotation.name,
+        "description": rotation.description,
+        "slots": slot_data,
+    }
+
+
+@require_http_methods(["GET", "PATCH", "DELETE"])
+def api_rotation_detail(request, pk):
+    rotation = get_object_or_404(Rotation, pk=pk)
+
+    if request.method == "GET":
+        return JsonResponse(_rotation_to_dict(rotation))
+
+    if request.method == "DELETE":
+        try:
+            rotation.delete()
+        except ProtectedError:
+            block_count = rotation.schedule_blocks.count()
+            return JsonResponse({
+                "error": f"Rotation is used by {block_count} schedule block(s). Remove those from the schedule first.",
+            }, status=400)
+        return JsonResponse({"ok": True})
+
+    try:
+        body = json.loads(request.body)
+    except (json.JSONDecodeError, ValueError):
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+
+    if "name" in body:
+        name = (body["name"] or "").strip()
+        if not name:
+            return JsonResponse({"error": "name cannot be blank"}, status=400)
+        rotation.name = name
+    if "description" in body:
+        rotation.description = body["description"]
+    rotation.save()
+
+    return JsonResponse(_rotation_to_dict(rotation))
+
+
+@require_http_methods(["POST"])
+def api_rotation_add_slot(request, pk):
+    rotation = get_object_or_404(Rotation, pk=pk)
+
+    try:
+        body = json.loads(request.body)
+    except (json.JSONDecodeError, ValueError):
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+
+    category_id = body.get("category_id")
+    track_id = body.get("track_id")
+    if bool(category_id) == bool(track_id):
+        return JsonResponse({"error": "Provide exactly one of category_id or track_id"}, status=400)
+
+    next_position = rotation.slots.count()
+    if track_id:
+        track = get_object_or_404(Track, pk=track_id)
+        slot = RotationSlot(rotation=rotation, position=next_position, track=track)
+    else:
+        category = get_object_or_404(Category, pk=category_id)
+        slot = RotationSlot(rotation=rotation, position=next_position, category=category)
+
+    try:
+        slot.full_clean()
+    except ValidationError as e:
+        return JsonResponse({"error": "; ".join(e.messages)}, status=400)
+    slot.save()
+
+    return JsonResponse(_rotation_to_dict(rotation))
+
+
+@require_http_methods(["DELETE"])
+def api_rotation_remove_slot(request, slot_id):
+    slot = get_object_or_404(RotationSlot.objects.select_related("rotation"), pk=slot_id)
+    rotation = slot.rotation
+    slot.delete()
+
+    remaining = list(rotation.slots.order_by("position"))
+    _reposition_items(remaining, model=RotationSlot)
+
+    return JsonResponse(_rotation_to_dict(rotation))
+
+
+@require_http_methods(["POST"])
+def api_rotation_reorder(request, pk):
+    rotation = get_object_or_404(Rotation, pk=pk)
+
+    try:
+        body = json.loads(request.body)
+    except (json.JSONDecodeError, ValueError):
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+
+    order = body.get("order")
+    if not order or not isinstance(order, list):
+        return JsonResponse({"error": "order (list of slot IDs) is required"}, status=400)
+
+    slots_by_id = {slot.id: slot for slot in rotation.slots.all()}
+    ordered = [slots_by_id[i] for i in order if i in slots_by_id]
+    _reposition_items(ordered, model=RotationSlot)
+
+    return JsonResponse(_rotation_to_dict(rotation))
+
+
+@ensure_csrf_cookie
+def rotations_page(request):
+    categories = Category.objects.order_by("name")
+    return render(request, "library/rotations.html", {"categories": categories})
 
 
 @require_http_methods(["GET", "POST"])

@@ -1,4 +1,5 @@
 from django.conf import settings
+from django.core.exceptions import ValidationError
 from django.db import models
 from django.contrib.postgres.fields import ArrayField
 
@@ -284,10 +285,24 @@ class Rotation(models.Model):
 
 class RotationSlot(models.Model):
     """One position within a Rotation. `position` is maintained by the
-    drag-to-sort admin inline — don't set it by hand."""
+    drag-to-sort admin inline — don't set it by hand.
+
+    Exactly one of `category`/`track` is set. A `category` slot is the
+    original behavior — the log builder randomly picks an eligible track
+    from that category, respecting recency separation. A `track` slot is
+    a direct insert (the hybrid rotation/playlist ask) — the log builder
+    uses that exact track every time, completely skipping recency
+    separation on the way in (even if it's a music track that would
+    otherwise violate it). The resulting LogItem still gets a real
+    scheduled_time, so it counts as "recently played" for any category
+    slots that come after it, in this build or in future ones."""
     rotation = models.ForeignKey(Rotation, on_delete=models.CASCADE, related_name="slots")
     position = models.PositiveIntegerField(default=0, db_index=True)
-    category = models.ForeignKey(Category, on_delete=models.PROTECT, related_name="rotation_slots")
+    category = models.ForeignKey(Category, on_delete=models.PROTECT, related_name="rotation_slots", null=True, blank=True)
+    track = models.ForeignKey(
+        Track, on_delete=models.PROTECT, related_name="rotation_slot_inserts", null=True, blank=True,
+        help_text="Direct track insert — bypasses category random-pick and recency checks for this slot.",
+    )
 
     class Meta:
         # ordering[0] must be the per-parent position field, not the
@@ -297,8 +312,13 @@ class RotationSlot(models.Model):
         ordering = ["position"]
         unique_together = [("rotation", "position")]
 
+    def clean(self):
+        if bool(self.category_id) == bool(self.track_id):
+            raise ValidationError("Set exactly one of category or track, not both or neither.")
+
     def __str__(self):
-        return f"{self.rotation} #{self.position} -> {self.category}"
+        target = self.category if self.category_id else f"[track] {self.track}"
+        return f"{self.rotation} #{self.position} -> {target}"
 
 
 # ---------------------------------------------------------------
