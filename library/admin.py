@@ -364,11 +364,13 @@ class UIThemeAdmin(admin.ModelAdmin):
             "fields": ["nav_clock_font_size", "nav_clock_font_weight", "nav_clock_color"],
         }),
         ("Deck Overlay (album art)", {
-            "fields": ["deck_text_shadow_color", "deck_startsat_color", "deck_pill_text_color"],
+            "fields": ["deck_text_shadow_color", "deck_startsat_color", "deck_pill_text_color", "default_album_art"],
             "description": "Deck title/artist/pills/etc. now render on top of "
                             "album art — these control the drop shadow that "
                             "keeps them readable, plus dedicated colors for "
-                            "the \"Starts at\" text and the pill row.",
+                            "the \"Starts at\" text and the pill row. "
+                            "default_album_art shows on a deck when no art is "
+                            "found anywhere in the lookup chain.",
         }),
     ]
 

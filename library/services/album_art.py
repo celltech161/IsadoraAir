@@ -6,23 +6,38 @@ Fallback chain, in order:
      effect immediately with no cache to invalidate.
   2. Cached result on `Track` (`art_url`/`art_source`/`art_checked_at`),
      if a previous lookup already resolved this track — including a cached
-     "none" (a track that had no embedded art and no Deezer/iTunes match
-     doesn't get re-queried against external APIs on every play).
+     "none" (a track that had no match anywhere doesn't get re-queried
+     against external services on every play). A cached "none" still gets
+     the current UI Theme default art substituted in live (see below).
   3. Embedded art extracted directly from the audio file (mutagen) —
-     instant and offline-safe, and the best match available for a
+     instant and offline-safe, and the best match available for an
      already-curated local library.
-  4. Deezer, via a same-origin server-side call (no browser CORS issues,
+  4. Oak Grove Radio's in-house hosted album art for mixshows/segments —
+     `https://oakgroveradio.com/player/albumart/{artist-slug}.png`, artist
+     name lowercased with spaces converted to hyphens. Checked for every
+     track regardless of category (unlike Deezer/iTunes below), since
+     this is specifically curated for exactly the syndicated non-music
+     content (mixshows, segments) that a public music catalog wouldn't
+     have anyway.
+  5. Deezer, via a same-origin server-side call (no browser CORS issues,
      one shot per track instead of a client-side multi-step chain).
-  5. iTunes, as a last external fallback.
-  6. None — cached as such, dashboard shows no art for this track.
+  6. iTunes, as a last external fallback.
+  7. None found — cached as such; the UI Theme default album art (if an
+     admin has uploaded one) is substituted in live at request time
+     rather than baked into the per-track cache, so changing the default
+     applies instantly to every track that has no real match.
 
 Ported/adapted from the Oak Grove Radio stream player's album-art lookup
 (deezer_proxy.php + client-side sanitize/fallback logic), with the
-Shoutcast-string-parsing and artist-slug-manifest pieces dropped since
-IsadoraAir already has structured artist/title/album fields per track and
-direct filesystem access to the audio itself.
+Shoutcast-string-parsing piece dropped since IsadoraAir already has
+structured artist/title/album fields per track and direct filesystem
+access to the audio itself — but the artist-slug hosted-art step is kept
+and pointed at Oak Grove's real server, since that's genuine in-house
+content for this station's own mixshows/segments, not a stand-in for
+something IsadoraAir already has a better source for.
 """
 import re
+import unicodedata
 from pathlib import Path
 
 import requests
@@ -31,6 +46,7 @@ from django.utils import timezone
 from mutagen import File as MutagenFile
 
 ART_CACHE_DIR = Path(settings.MEDIA_ROOT) / "album_art_cache"
+OAKGROVE_ALBUMART_BASE = "https://oakgroveradio.com/player/albumart/"
 
 _PRIMARY_TAG_MARKERS = ["rip", "remaster", "bit", "edit", "clean"]
 _FEAT_PATTERNS = [
@@ -63,6 +79,32 @@ def _strip_all_parens(text):
     if not text:
         return text
     return re.sub(r"\s{2,}", " ", re.sub(r"\([^)]*\)", "", text)).strip()
+
+
+def _slugify_artist(name):
+    """Matches Oak Grove Radio's own `toSlug()` exactly, since this has to
+    line up with real filenames already hosted on their server — e.g.
+    'Big Picture Science' -> 'big-picture-science'."""
+    if not name:
+        return ""
+    normalized = unicodedata.normalize("NFKD", name)
+    stripped = "".join(c for c in normalized if not unicodedata.combining(c))
+    lowered = stripped.lower()
+    cleaned = re.sub(r"[^a-z0-9\s-]", "", lowered).strip()
+    hyphenated = re.sub(r"\s+", "-", cleaned)
+    return re.sub(r"-+", "-", hyphenated)
+
+
+def _oakgrove_lookup(artist_name):
+    slug = _slugify_artist(artist_name)
+    if not slug:
+        return None
+    url = f"{OAKGROVE_ALBUMART_BASE}{slug}.png"
+    try:
+        r = requests.head(url, timeout=5, allow_redirects=True)
+        return url if r.status_code == 200 else None
+    except Exception:
+        return None
 
 
 def _extract_embedded_art_bytes(filepath):
@@ -164,6 +206,13 @@ def _itunes_search(artist, title):
         return None, None
 
 
+def _default_art_result():
+    from library.models import UITheme
+    default = UITheme.load().default_album_art
+    art = default.url if default else None
+    return {"art": art, "link": None, "source": "default" if art else "none"}
+
+
 def resolve_album_art(track):
     """Returns {"art": url_or_None, "link": url_or_None, "source": str}."""
     if track.album_id and track.album.cover_art:
@@ -172,11 +221,9 @@ def resolve_album_art(track):
         return {"art": track.artist.cover_art.url, "link": None, "source": "Artist Override"}
 
     if track.art_source:
-        return {
-            "art": track.art_url or None,
-            "link": None,
-            "source": track.art_source,
-        }
+        if track.art_source == "none":
+            return _default_art_result()
+        return {"art": track.art_url or None, "link": None, "source": track.art_source}
 
     artist_name = track.artist.name if track.artist_id else ""
     title = track.title or ""
@@ -187,18 +234,27 @@ def resolve_album_art(track):
         track.save(update_fields=["art_url", "art_source", "art_checked_at"])
         return {"art": art_url, "link": None, "source": "embedded"}
 
-    # Remote lookups are scoped to music-category tracks only — spots,
+    # Oak Grove Radio's in-house hosted art (for mixshows/segments) is
+    # checked for every track regardless of category — it's curated
+    # specifically for this station's own syndicated content, so it
+    # doesn't carry the false-match risk a public catalog search does.
+    oakgrove_art = _oakgrove_lookup(artist_name)
+    if oakgrove_art:
+        track.art_url, track.art_source, track.art_checked_at = oakgrove_art, "oakgrove", timezone.now()
+        track.save(update_fields=["art_url", "art_source", "art_checked_at"])
+        return {"art": oakgrove_art, "link": None, "source": "oakgrove"}
+
+    # Deezer/iTunes are scoped to music-category tracks only — spots,
     # legal IDs, imaging, and liners aren't "albums," and matching their
-    # title text against Deezer/iTunes risks a confident-looking but wrong
-    # cover (seen in testing: an imaging drop's title coincidentally
-    # matched an unrelated song). Embedded-art extraction above is exempt
-    # from this since it can't be a false match — it's whatever's actually
-    # tagged onto that specific file.
+    # title text against a public catalog risks a confident-looking but
+    # wrong cover (seen in testing: an imaging drop's title coincidentally
+    # matched an unrelated song). Embedded-art and Oak Grove's hosted art
+    # above are exempt from this since neither can produce a false match.
     is_music = bool(track.category_id and track.category.kind_id and track.category.kind.code == "music")
     if not is_music:
         track.art_url, track.art_source, track.art_checked_at = "", "none", timezone.now()
         track.save(update_fields=["art_url", "art_source", "art_checked_at"])
-        return {"art": None, "link": None, "source": "none"}
+        return _default_art_result()
 
     title_primary = _sanitize_primary_tags(title)
     art, link = _deezer_search(artist_name, title_primary)
@@ -222,4 +278,4 @@ def resolve_album_art(track):
 
     track.art_url, track.art_source, track.art_checked_at = "", "none", timezone.now()
     track.save(update_fields=["art_url", "art_source", "art_checked_at"])
-    return {"art": None, "link": None, "source": "none"}
+    return _default_art_result()

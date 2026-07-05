@@ -230,6 +230,7 @@ class Track(models.Model):
     # this cache, and are never written into it (see album_art.py).
     ART_SOURCE_CHOICES = [
         ("embedded", "Embedded in file"),
+        ("oakgrove", "Oak Grove Radio hosted art"),
         ("deezer", "Deezer"),
         ("itunes", "iTunes"),
         ("none", "None found"),
@@ -618,6 +619,12 @@ class UITheme(models.Model):
     )
     deck_pill_text_color = models.CharField(
         max_length=50, default="#9ca3af", help_text="Any CSS color value (hex, rgb, rgba).",
+    )
+
+    default_album_art = models.ImageField(
+        upload_to="ui_theme/", blank=True, null=True,
+        help_text="Shown on a deck when no album art is found anywhere in the lookup chain "
+                   "(embedded/Oak Grove hosted art/Deezer/iTunes). Leave blank to show no art at all.",
     )
 
     class Meta:
