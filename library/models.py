@@ -9,6 +9,10 @@ from django.contrib.postgres.fields import ArrayField
 
 class Artist(models.Model):
     name = models.CharField(max_length=255, unique=True)
+    # Manual album-art override, checked ahead of embedded/Deezer/iTunes
+    # lookup — mainly for artists whose tracks have no embedded art and no
+    # good remote match (used as a fallback when a track has no Album).
+    cover_art = models.ImageField(upload_to="artist_covers/", blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -26,6 +30,10 @@ class Album(models.Model):
     # artists (mirrors the ID3 TPE1 vs TPE2 distinction).
     album_artist = models.CharField(max_length=255, blank=True)
     year = models.PositiveIntegerField(null=True, blank=True)
+    # Manual album-art override, checked ahead of embedded/Deezer/iTunes
+    # lookup — takes priority over Artist.cover_art for tracks that have
+    # an Album.
+    cover_art = models.ImageField(upload_to="album_covers/", blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -214,6 +222,21 @@ class Track(models.Model):
     waveform_path = models.CharField(max_length=1024, blank=True)
     related_artists = models.CharField(max_length=500, blank=True)  # extracted feat./ft. credits
     remote_url = models.URLField(blank=True)  # for syndicated/remote-hosted audio, not stored locally
+
+    # --- Album art cache ---
+    # Resolved once (embedded file art / Deezer / iTunes / none) and cached
+    # here so repeat plays don't re-extract or re-query external APIs.
+    # Album/Artist manual cover_art overrides are checked live, ahead of
+    # this cache, and are never written into it (see album_art.py).
+    ART_SOURCE_CHOICES = [
+        ("embedded", "Embedded in file"),
+        ("deezer", "Deezer"),
+        ("itunes", "iTunes"),
+        ("none", "None found"),
+    ]
+    art_url = models.CharField(max_length=1024, blank=True)
+    art_source = models.CharField(max_length=20, choices=ART_SOURCE_CHOICES, blank=True)
+    art_checked_at = models.DateTimeField(null=True, blank=True)
 
     # --- RBDS override ---
     alt_send_enabled = models.BooleanField(
@@ -584,6 +607,18 @@ class UITheme(models.Model):
     nav_clock_color = models.CharField(max_length=50, default="rgba(249, 250, 251, 0.85)", help_text="Any CSS color value (hex, rgb, rgba).")
 
     logo = models.ImageField(upload_to="ui_theme/", blank=True, null=True, help_text="Nav bar logo. Leave blank to use the default IsadoraAir logo.")
+
+    # --- Deck overlay (text sitting on top of album art) ---
+    deck_text_shadow_color = models.CharField(
+        max_length=50, default="rgba(0, 0, 0, 0.6)",
+        help_text="Drop shadow behind deck title/artist/pills/etc. so text stays readable over lighter album art.",
+    )
+    deck_startsat_color = models.CharField(
+        max_length=50, default="#3b82f6", help_text="Any CSS color value (hex, rgb, rgba).",
+    )
+    deck_pill_text_color = models.CharField(
+        max_length=50, default="#9ca3af", help_text="Any CSS color value (hex, rgb, rgba).",
+    )
 
     class Meta:
         verbose_name = "UI Theme"

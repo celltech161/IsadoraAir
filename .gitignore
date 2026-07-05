@@ -7,3 +7,4 @@ db.sqlite3
 legacy/
 staticfiles/
 PROJECT_NOTES.md
+media/album_art_cache/

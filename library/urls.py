@@ -31,6 +31,7 @@ urlpatterns = [
     path('api/log/<int:pk>/reorder/', views.api_log_reorder, name='api-log-reorder'),
     path('api/log/item/<int:item_id>/swap/', views.api_log_item_swap, name='api-log-item-swap'),
     path('api/waveform/<int:track_id>/', views.api_waveform, name='api-waveform'),
+    path('api/albumart/<int:track_id>/', views.api_album_art, name='api-album-art'),
     path('api/engine/status/', views.api_engine_status, name='api-engine-status'),
     path('api/engine/queue/set-next/', views.api_engine_set_next, name='api-engine-set-next'),
     path('api/engine/queue/insert/', views.api_engine_insert_track, name='api-engine-insert-track'),

@@ -1181,6 +1181,7 @@ class PlaybackEngine:
                     "next_start": t.next_start_seconds,
                     "cue_in": t.cue_in_seconds or 0,
                     "category": t.category.code if t.category else "",
+                    "format": t.format or "",
                     "paused": deck.paused,
                 }
 
@@ -1215,6 +1216,7 @@ class PlaybackEngine:
                     "artist": qt.artist.name if qt.artist else "",
                     "duration": qt.duration_seconds or 0,
                     "category": qt.category.code if qt.category else "",
+                    "format": qt.format or "",
                     "fill_color": qt.category.kind.fill_color if qt.category else None,
                     "eta_seconds": round(eta, 1),
                 })

@@ -76,6 +76,7 @@ admin.site.__class__ = SectionedAdminSite
 class ArtistAdmin(admin.ModelAdmin):
     list_display = ["name", "created_at"]
     search_fields = ["name"]
+    fields = ["name", "cover_art"]
 
 
 @admin.register(Album)
@@ -83,6 +84,7 @@ class AlbumAdmin(admin.ModelAdmin):
     list_display = ["title", "album_artist", "year"]
     search_fields = ["title", "album_artist"]
     list_filter = ["year"]
+    fields = ["title", "album_artist", "year", "cover_art"]
 
 
 @admin.register(Genre)
@@ -339,6 +341,7 @@ class RecencyConfigAdmin(admin.ModelAdmin):
 _UITHEME_COLOR_FIELDS = {
     "bg_dark", "bg_darker", "panel_bg", "accent", "accent_soft",
     "text_main", "text_muted", "danger", "border_subtle", "nav_clock_color",
+    "deck_text_shadow_color", "deck_startsat_color", "deck_pill_text_color",
 }
 
 
@@ -359,6 +362,13 @@ class UIThemeAdmin(admin.ModelAdmin):
         }),
         ("Nav Bar Clock", {
             "fields": ["nav_clock_font_size", "nav_clock_font_weight", "nav_clock_color"],
+        }),
+        ("Deck Overlay (album art)", {
+            "fields": ["deck_text_shadow_color", "deck_startsat_color", "deck_pill_text_color"],
+            "description": "Deck title/artist/pills/etc. now render on top of "
+                            "album art — these control the drop shadow that "
+                            "keeps them readable, plus dedicated colors for "
+                            "the \"Starts at\" text and the pill row.",
         }),
     ]
 

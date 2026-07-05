@@ -5,6 +5,12 @@
 
 {% block extra_css %}
 <style>
+  :root {
+    --deck-text-shadow-color: {{ ui_theme.deck_text_shadow_color }};
+    --deck-startsat-color: {{ ui_theme.deck_startsat_color }};
+    --deck-pill-text-color: {{ ui_theme.deck_pill_text_color }};
+  }
+
   .playnow-bar {
     display: flex;
     flex-wrap: wrap;
@@ -65,11 +71,52 @@
   }
 
   .deck-panel {
+    position: relative;
+    overflow: hidden;
     background: var(--bg-dark);
     border: 1px solid var(--border-subtle);
     border-radius: 12px;
     padding: 1.1rem 1.3rem;
     min-width: 0;
+  }
+
+  .deck-art-bg {
+    position: absolute;
+    inset: 0;
+    z-index: 0;
+    background-size: cover;
+    background-position: center;
+    filter: blur(28px) brightness(0.55) saturate(1.15);
+    transform: scale(1.2);
+    opacity: 0;
+    transition: opacity 0.4s;
+    pointer-events: none;
+  }
+
+  .deck-art-bg.visible { opacity: 0.9; }
+
+  .deck-art-thumb {
+    position: absolute;
+    top: 50%;
+    right: 1.1rem;
+    transform: translateY(-50%);
+    width: 150px;
+    height: 150px;
+    object-fit: cover;
+    border-radius: 8px;
+    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45);
+    z-index: 0;
+    opacity: 0;
+    transition: opacity 0.4s;
+    display: none;
+  }
+
+  .deck-art-thumb.visible { opacity: 1; }
+
+  .deck-content {
+    position: relative;
+    z-index: 1;
+    text-shadow: 0 1px 2px var(--deck-text-shadow-color), 0 2px 8px var(--deck-text-shadow-color);
   }
 
   .deck-header-row {
@@ -156,6 +203,13 @@
     margin-top: 0.1rem;
   }
 
+  .np-pills {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    margin-top: 0.3rem;
+  }
+
   .np-category {
     display: inline-block;
     font-size: 0.65rem;
@@ -163,10 +217,23 @@
     text-transform: uppercase;
     letter-spacing: 0.5px;
     background: rgba(148, 163, 184, 0.12);
-    color: var(--text-muted);
+    color: var(--deck-pill-text-color);
     padding: 0.15rem 0.5rem;
     border-radius: 4px;
-    margin-top: 0.3rem;
+  }
+
+  .np-format {
+    display: inline-block;
+    font-size: 0.65rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    background: rgba(148, 163, 184, 0.06);
+    color: var(--deck-pill-text-color);
+    opacity: 0.75;
+    padding: 0.15rem 0.5rem;
+    border-radius: 4px;
+    border: 1px solid var(--border-subtle);
   }
 
   /* --- Waveform --- */
@@ -309,7 +376,7 @@
 
   .np-startsat {
     font-size: 0.85rem;
-    color: #3b82f6;
+    color: var(--deck-startsat-color);
     font-variant-numeric: tabular-nums;
     margin-top: 0.5rem;
   }
@@ -439,6 +506,10 @@
 {% block extra_js %}
 <script>
 const SLOTS = ['A', 'B'];
+
+// Per-slot lookup token so a slow/stale album-art fetch from a track that's
+// since been swapped out can't clobber the display for whatever's playing now.
+const deckArtLookupTokens = { A: 0, B: 0 };
 
 // Per-slot mutable state, keyed by slot letter.
 const deckState = {};
@@ -656,6 +727,9 @@ function buildDeckDOM(slot) {
   const container = document.getElementById(`deck-${slot}`);
 
   container.innerHTML = `
+    <div class="deck-art-bg" id="deckArtBg-${slot}"></div>
+    <img class="deck-art-thumb" id="deckArtThumb-${slot}" alt="">
+    <div class="deck-content">
     <div class="deck-header-row">
       <span class="deck-label">Deck ${slot}</span>
       <div class="deck-controls">
@@ -668,7 +742,10 @@ function buildDeckDOM(slot) {
       <div class="np-title" id="npTitle-${slot}"></div>
       <div class="np-artist" id="npArtist-${slot}"></div>
       <div class="np-album" id="npAlbum-${slot}"></div>
-      <span class="np-category" id="npCategory-${slot}"></span>
+      <div class="np-pills">
+        <span class="np-category" id="npCategory-${slot}"></span>
+        <span class="np-format" id="npFormat-${slot}"></span>
+      </div>
       <div class="np-startsat" id="npStartsAt-${slot}" style="display:none;"></div>
     </div>
     <div class="np-waveform">
@@ -686,6 +763,7 @@ function buildDeckDOM(slot) {
           <span id="npTotal-${slot}"></span>
         </div>
       </div>
+    </div>
     </div>
   `;
 
@@ -705,6 +783,40 @@ function buildDeckDOM(slot) {
   document.getElementById(`ejectBtn-${slot}`).addEventListener('click', () => {
     deckCommand(slot, 'eject');
   });
+}
+
+function applyDeckArt(slot, result) {
+  const bg = document.getElementById(`deckArtBg-${slot}`);
+  const thumb = document.getElementById(`deckArtThumb-${slot}`);
+  if (!bg || !thumb) return;
+
+  const art = result && result.art;
+  if (art) {
+    bg.style.backgroundImage = `url("${art}")`;
+    bg.classList.add('visible');
+    thumb.src = art;
+    thumb.style.display = 'block';
+    thumb.classList.add('visible');
+  } else {
+    bg.classList.remove('visible');
+    thumb.classList.remove('visible');
+    thumb.style.display = 'none';
+    bg.style.backgroundImage = '';
+  }
+}
+
+async function fetchDeckArt(slot, trackId) {
+  const myToken = ++deckArtLookupTokens[slot];
+  try {
+    const r = await fetch(`/api/albumart/${trackId}/`, { cache: 'no-store' });
+    if (myToken !== deckArtLookupTokens[slot]) return; // superseded by a newer track on this deck
+    const result = r.ok ? await r.json() : null;
+    if (myToken !== deckArtLookupTokens[slot]) return;
+    applyDeckArt(slot, result);
+  } catch (e) {
+    if (myToken !== deckArtLookupTokens[slot]) return;
+    applyDeckArt(slot, null);
+  }
 }
 
 function renderDeck(slot, deck, transport, queue, serverTimestamp) {
@@ -772,6 +884,7 @@ function renderDeckPreview(slot, track, serverTimestamp) {
   if (track.track_id !== st.lastTrackId) {
     st.lastTrackId = track.track_id;
     loadWaveform(slot, track.track_id);
+    fetchDeckArt(slot, track.track_id);
 
     document.getElementById(`npTitle-${slot}`).textContent = track.title || '';
     document.getElementById(`npArtist-${slot}`).textContent = track.artist || '';
@@ -779,6 +892,9 @@ function renderDeckPreview(slot, track, serverTimestamp) {
     const catEl = document.getElementById(`npCategory-${slot}`);
     catEl.textContent = track.category || '';
     catEl.style.display = track.category ? '' : 'none';
+    const fmtEl = document.getElementById(`npFormat-${slot}`);
+    fmtEl.textContent = track.format || '';
+    fmtEl.style.display = track.format ? '' : 'none';
     document.getElementById(`npTotal-${slot}`).textContent = fmtDur(track.duration);
   }
 
@@ -803,6 +919,7 @@ function renderDeckLive(slot, deck, transport) {
   if (deck.track_id !== st.lastTrackId) {
     st.lastTrackId = deck.track_id;
     loadWaveform(slot, deck.track_id);
+    fetchDeckArt(slot, deck.track_id);
 
     document.getElementById(`npTitle-${slot}`).textContent = deck.title || '';
     document.getElementById(`npArtist-${slot}`).textContent = deck.artist || '';
@@ -812,6 +929,9 @@ function renderDeckLive(slot, deck, transport) {
     const catEl = document.getElementById(`npCategory-${slot}`);
     catEl.textContent = deck.category || '';
     catEl.style.display = deck.category ? '' : 'none';
+    const fmtEl = document.getElementById(`npFormat-${slot}`);
+    fmtEl.textContent = deck.format || '';
+    fmtEl.style.display = deck.format ? '' : 'none';
     document.getElementById(`npTotal-${slot}`).textContent = fmtDur(deck.duration);
   }
 

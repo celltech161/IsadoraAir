@@ -894,3 +894,14 @@ def api_waveform(request, track_id):
         return JsonResponse({"error": "Failed to read waveform"}, status=500)
 
     return JsonResponse(data)
+
+
+@require_http_methods(["GET"])
+def api_album_art(request, track_id):
+    from library.services.album_art import resolve_album_art
+
+    track = get_object_or_404(
+        Track.objects.select_related("artist", "album", "category", "category__kind"), pk=track_id
+    )
+    result = resolve_album_art(track)
+    return JsonResponse(result)
