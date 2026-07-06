@@ -1,0 +1,502 @@
+{% extends "base.html" %}
+
+{% block title %}Monitoring — IsadoraAir{% endblock %}
+{% block nav_monitoring %}class="active"{% endblock %}
+
+{% block extra_css %}
+<style>
+  .mon-stale-banner {
+    display: none;
+    background: rgba(249, 115, 115, 0.1);
+    border: 1px solid var(--danger);
+    color: var(--danger);
+    border-radius: 8px;
+    padding: 0.6rem 0.9rem;
+    font-size: 0.85rem;
+    margin-bottom: 1rem;
+  }
+  .mon-stale-banner.show { display: block; }
+
+  .mon-group {
+    margin-bottom: 1.75rem;
+  }
+  .mon-group h2 {
+    font-size: 0.95rem;
+    font-weight: 700;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    margin-bottom: 0.6rem;
+  }
+  .mon-cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+    gap: 0.75rem;
+  }
+  .mon-card {
+    background: var(--panel-bg);
+    border: 1px solid var(--border-subtle);
+    border-radius: 10px;
+    padding: 0.85rem 1rem;
+  }
+  .mon-card-top {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+    margin-bottom: 0.5rem;
+  }
+  .mon-card-name {
+    font-size: 0.9rem;
+    font-weight: 600;
+  }
+  .mon-pill {
+    font-size: 0.72rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    padding: 0.15rem 0.55rem;
+    border-radius: 999px;
+    white-space: nowrap;
+  }
+  .mon-pill.ok { background: rgba(34, 197, 94, 0.15); color: var(--accent); }
+  .mon-pill.warning { background: rgba(245, 158, 11, 0.18); color: #f59e0b; }
+  .mon-pill.critical { background: rgba(249, 115, 115, 0.18); color: var(--danger); }
+  .mon-pill.unknown { background: rgba(148, 163, 184, 0.15); color: var(--text-muted); }
+
+  .mon-card-since {
+    font-size: 0.72rem;
+    color: var(--text-muted);
+    margin-bottom: 0.5rem;
+  }
+
+  /* --- LED + caption, for systemd services --- */
+  .mon-led-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin-bottom: 0.35rem;
+  }
+  .mon-led {
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+  .mon-led.ok { background: var(--accent); box-shadow: 0 0 6px rgba(34, 197, 94, 0.6); }
+  .mon-led.warning { background: #f59e0b; box-shadow: 0 0 6px rgba(245, 158, 11, 0.6); }
+  .mon-led.critical { background: var(--danger); box-shadow: 0 0 6px rgba(249, 115, 115, 0.6); }
+  .mon-led.unknown { background: var(--text-muted); }
+  .mon-led-caption {
+    font-size: 0.85rem;
+    font-weight: 600;
+  }
+  .mon-uptime {
+    font-size: 0.75rem;
+    color: var(--text-muted);
+  }
+
+  /* --- percent + bar, for disk/memory/cpu --- */
+  .mon-bar-row {
+    margin-bottom: 0.4rem;
+  }
+  .mon-bar-label {
+    display: flex;
+    justify-content: space-between;
+    font-size: 0.78rem;
+    color: var(--text-muted);
+    margin-bottom: 0.2rem;
+  }
+  .mon-bar-value {
+    font-weight: 700;
+    color: var(--text-main);
+  }
+  .mon-bar-track {
+    height: 8px;
+    border-radius: 4px;
+    background: rgba(148, 163, 184, 0.15);
+    overflow: hidden;
+  }
+  .mon-bar-fill {
+    height: 100%;
+    border-radius: 4px;
+    transition: width 0.3s;
+  }
+  .mon-bar-fill.ok { background: var(--accent); }
+  .mon-bar-fill.warning { background: #f59e0b; }
+  .mon-bar-fill.critical { background: var(--danger); }
+  .mon-bar-fill.unknown { background: var(--text-muted); }
+
+  /* --- plain colored value text, for transmitter readings colored by
+     a paired indicator (e.g. reverse power/VSWR/PA temp) --- */
+  .mon-value-text {
+    font-size: 1.1rem;
+    font-weight: 700;
+  }
+  .mon-value-text.ok { color: var(--accent); }
+  .mon-value-text.warning { color: #f59e0b; }
+  .mon-value-text.critical { color: var(--danger); }
+  .mon-value-text.unknown { color: var(--text-muted); }
+
+  .mon-cores-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(70px, 1fr));
+    gap: 0.35rem;
+    margin-top: 0.5rem;
+  }
+  .mon-core-label {
+    font-size: 0.68rem;
+    color: var(--text-muted);
+    margin-bottom: 0.15rem;
+  }
+
+  /* --- big reading + LED, for temperature --- */
+  .mon-reading-row {
+    display: flex;
+    align-items: baseline;
+    gap: 0.5rem;
+  }
+  .mon-reading-value {
+    font-size: 1.4rem;
+    font-weight: 700;
+  }
+
+  .mon-card-detail {
+    font-size: 0.78rem;
+    color: var(--text-muted);
+    line-height: 1.5;
+  }
+
+  .mon-logins-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.82rem;
+  }
+  .mon-logins-table th, .mon-logins-table td {
+    text-align: left;
+    padding: 0.4rem 0.6rem;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+  .mon-logins-table th {
+    color: var(--text-muted);
+    font-weight: 600;
+    font-size: 0.75rem;
+    text-transform: uppercase;
+  }
+  .mon-empty {
+    color: var(--text-muted);
+    font-size: 0.85rem;
+  }
+</style>
+{% endblock %}
+
+{% block content %}
+<div id="monStaleBanner" class="mon-stale-banner">Monitoring data hasn't updated recently — the monitoring service may be down.</div>
+
+<div id="monGroups"></div>
+
+<div class="mon-group">
+  <h2>Recent Failed Logins</h2>
+  <table class="mon-logins-table" id="monLoginsTable">
+    <thead>
+      <tr><th>Username</th><th>IP Address</th><th>Time</th><th>Failures</th></tr>
+    </thead>
+    <tbody id="monLoginsBody"></tbody>
+  </table>
+  <div class="mon-empty" id="monLoginsEmpty" style="display:none;">No failed login attempts recorded.</div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+const KIND_GROUPS = [
+  { label: "Services", kinds: ["systemd"] },
+  { label: "System", kinds: ["disk", "cpu", "memory", "temperature"] },
+  { label: "Transmitter", kinds: ["transmitter_param", "transmitter_indicator"] },
+  { label: "Audio", kinds: ["audio_silence"] },
+];
+
+function formatSince(since) {
+  if (!since) return "";
+  const seconds = Math.max(0, Date.now() / 1000 - since);
+  if (seconds < 60) return `${Math.floor(seconds)}s`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h`;
+  return `${Math.floor(seconds / 86400)}d`;
+}
+
+function pct(n) {
+  return `${(Math.round(n * 10) / 10).toFixed(1)}%`;
+}
+
+function barRow(label, value, status) {
+  const clamped = Math.max(0, Math.min(100, value));
+  return `
+    <div class="mon-bar-row">
+      <div class="mon-bar-label"><span>${label}</span><span class="mon-bar-value">${pct(value)}</span></div>
+      <div class="mon-bar-track"><div class="mon-bar-fill ${status}" style="width:${clamped}%;"></div></div>
+    </div>
+  `;
+}
+
+function renderSystemdBody(check) {
+  const uptimeSeconds = check.detail && check.detail.uptime_seconds;
+  const uptimeHours = uptimeSeconds != null ? (uptimeSeconds / 3600).toFixed(2) : null;
+  const caption = check.status === "ok" ? "Running"
+    : check.status === "unknown" ? "Unknown"
+    : "Stopped";
+  return `
+    <div class="mon-led-row">
+      <span class="mon-led ${check.status}"></span>
+      <span class="mon-led-caption">${caption}</span>
+    </div>
+    ${uptimeHours != null ? `<div class="mon-uptime">Up ${uptimeHours} hrs</div>` : ""}
+  `;
+}
+
+function renderPercentBody(check) {
+  const value = check.detail && check.detail.percent;
+  if (value == null) return "";
+  return barRow("Used", value, check.status);
+}
+
+function renderCpuBody(check) {
+  const overall = check.detail && check.detail.percent;
+  const perCpu = (check.detail && check.detail.per_cpu) || [];
+  let html = overall != null ? barRow("Overall", overall, check.status) : "";
+  if (perCpu.length) {
+    html += '<div class="mon-cores-grid">';
+    perCpu.forEach((coreValue, i) => {
+      // Per-core bars use the same overall check's thresholds -- there's
+      // no separate per-core admin config, and it's the same kind of reading.
+      html += `
+        <div title="Core ${i}: ${pct(coreValue)}">
+          <div class="mon-core-label">Core ${i}</div>
+          <div class="mon-bar-track"><div class="mon-bar-fill ${check.status}" style="width:${Math.max(0, Math.min(100, coreValue))}%;"></div></div>
+        </div>
+      `;
+    });
+    html += "</div>";
+  }
+  return html;
+}
+
+function renderTemperatureBody(check) {
+  const value = check.detail && check.detail.current;
+  if (value == null) return "";
+  let html = `
+    <div class="mon-reading-row">
+      <span class="mon-led ${check.status}"></span>
+      <span class="mon-reading-value">${value.toFixed(1)}&deg;C</span>
+    </div>
+  `;
+  const perCore = (check.detail && check.detail.per_core) || [];
+  if (perCore.length) {
+    html += '<div class="mon-cores-grid">';
+    perCore.forEach(core => {
+      // Same treatment as CPU Usage's per-core bars: scaled against the
+      // sensor's own reported critical point (not a fixed 100 like a
+      // percentage), colored by the overall check's status since there's
+      // no separate per-core admin threshold here either.
+      const critical = core.critical || 100;
+      const percent = Math.max(0, Math.min(100, (core.current / critical) * 100));
+      html += `
+        <div title="${core.label}: ${core.current.toFixed(1)}&deg;C">
+          <div class="mon-core-label">${core.label}</div>
+          <div class="mon-bar-track"><div class="mon-bar-fill ${check.status}" style="width:${percent}%;"></div></div>
+        </div>
+      `;
+    });
+    html += "</div>";
+  }
+  return html;
+}
+
+function formatGenericDetail(detail) {
+  return Object.entries(detail || {})
+    .filter(([k]) => k !== "error")
+    .map(([k, v]) => {
+      if (typeof v === "number") v = Math.round(v * 100) / 100;
+      return `${k}: ${v}`;
+    })
+    .join(" &middot; ");
+}
+
+// Which transmitter indicator check's raw value ("G"/"O"/"R"/"0"/"B")
+// colors each parameter card -- keyed on the check's own COBALT
+// parameter/indicator string (tx_ref), not its display name, so
+// renaming a check in admin doesn't silently break the pairing. The
+// indicator checks themselves stay running and alerting as normal
+// (see MonitorCheck.show_as_card) -- they're just not shown as their
+// own card anymore since their value drives one here instead.
+const TX_INDICATOR_FOR_PARAM = {
+  "psu.fwd_power": "status.indicator.rf",
+  "psu.rev_power": "status.indicator.vswr",
+  "psu.vswr": "status.indicator.vswr",
+  "psu.pa_temperature": "status.indicator.temp",
+};
+
+function indicatorColorClass(rawValue) {
+  if (rawValue === "G") return "ok";
+  if (rawValue === "O") return "warning";
+  if (rawValue === "R") return "critical";
+  return "unknown"; // "0", "B", missing, or anything unrecognized
+}
+
+function renderForwardPowerBody(check, colorClass) {
+  const value = check.detail && check.detail.value;
+  const percent = check.detail && check.detail.percent_of_max;
+  if (value == null || percent == null) return "";
+  const clamped = Math.max(0, Math.min(100, percent));
+  return `
+    <div class="mon-bar-row">
+      <div class="mon-bar-label"><span class="mon-value-text ${colorClass}">${percent.toFixed(1)}%</span><span class="mon-value-text ${colorClass}">${value.toFixed(2)} watts</span></div>
+      <div class="mon-bar-track"><div class="mon-bar-fill ${colorClass}" style="width:${clamped}%;"></div></div>
+    </div>
+  `;
+}
+
+function renderFanSpeedBody(check) {
+  const value = check.detail && check.detail.value;
+  if (value == null) return "";
+  return `<div class="mon-value-text ${check.status}">${Math.round(value)} RPM</div>`;
+}
+
+function renderInterlockBody(check) {
+  const raw = check.detail && check.detail.value;
+  const isTripped = raw === "True";
+  const colorClass = isTripped ? "critical" : "ok";
+  return `
+    <div class="mon-led-row">
+      <span class="mon-led ${colorClass}"></span>
+      <span class="mon-led-caption">${raw}</span>
+    </div>
+  `;
+}
+
+function renderReversePowerBody(check, colorClass) {
+  const value = check.detail && check.detail.value;
+  if (value == null) return "";
+  return `<div class="mon-value-text ${colorClass}">${value.toFixed(2)} watts</div>`;
+}
+
+function renderVswrBody(check, colorClass) {
+  const value = check.detail && check.detail.value;
+  if (value == null) return "";
+  const clamped = Math.max(1, Math.min(5, value));
+  const percent = (clamped - 1) / (5 - 1) * 100;
+  return `
+    <div class="mon-value-text ${colorClass}">${value.toFixed(2)}</div>
+    <div class="mon-bar-track" style="margin-top:0.35rem;"><div class="mon-bar-fill ${colorClass}" style="width:${percent}%;"></div></div>
+  `;
+}
+
+function renderPaTempBody(check, colorClass) {
+  const value = check.detail && check.detail.value;
+  if (value == null) return "";
+  return `<div class="mon-value-text ${colorClass}">${value.toFixed(2)}&deg;C</div>`;
+}
+
+function renderCardBody(check, byTxRef) {
+  const pairedIndicatorRef = TX_INDICATOR_FOR_PARAM[check.tx_ref];
+  if (pairedIndicatorRef) {
+    const indicatorCheck = byTxRef[pairedIndicatorRef];
+    const indicatorValue = indicatorCheck && indicatorCheck.detail && indicatorCheck.detail.value;
+    const colorClass = indicatorColorClass(indicatorValue);
+    if (check.tx_ref === "psu.fwd_power") return renderForwardPowerBody(check, colorClass);
+    if (check.tx_ref === "psu.rev_power") return renderReversePowerBody(check, colorClass);
+    if (check.tx_ref === "psu.vswr") return renderVswrBody(check, colorClass);
+    if (check.tx_ref === "psu.pa_temperature") return renderPaTempBody(check, colorClass);
+  }
+  if (check.tx_ref === "psu.fan_speed_measured_fan1") return renderFanSpeedBody(check);
+  if (check.tx_ref === "status.rf_interlock") return renderInterlockBody(check);
+  switch (check.kind) {
+    case "systemd": return renderSystemdBody(check);
+    case "disk": case "memory": return renderPercentBody(check);
+    case "cpu": return renderCpuBody(check);
+    case "temperature": return renderTemperatureBody(check);
+    default: return `<div class="mon-card-detail">${formatGenericDetail(check.detail)}</div>`;
+  }
+}
+
+function renderGroups(checks) {
+  const container = document.getElementById("monGroups");
+  container.innerHTML = "";
+  const byKind = {};
+  const byTxRef = {};
+  checks.forEach(c => {
+    (byKind[c.kind] = byKind[c.kind] || []).push(c);
+    if (c.tx_ref) byTxRef[c.tx_ref] = c;
+  });
+
+  KIND_GROUPS.forEach(group => {
+    // show_as_card === false -> still checked/alertable server-side
+    // (see MonitorCheck.show_as_card), just folded into a paired card
+    // instead of getting its own tile.
+    const items = group.kinds.flatMap(k => byKind[k] || []).filter(c => c.show_as_card !== false);
+    if (!items.length) return;
+    const section = document.createElement("div");
+    section.className = "mon-group";
+    section.innerHTML = `<h2>${group.label}</h2><div class="mon-cards"></div>`;
+    const cardsEl = section.querySelector(".mon-cards");
+    items.forEach(check => {
+      const card = document.createElement("div");
+      card.className = "mon-card";
+      const showPill = check.kind !== "systemd" && check.kind !== "temperature";
+      // "CPU Temperature" -> just "Temperature" -- the reading + LED
+      // already make clear what it's measuring, per the user's ask to
+      // drop the redundant "CPU" label on this specific card.
+      const displayName = check.kind === "temperature" ? check.name.replace(/^CPU\s+/i, "") : check.name;
+      card.innerHTML = `
+        <div class="mon-card-top">
+          <span class="mon-card-name">${displayName}</span>
+          ${showPill ? `<span class="mon-pill ${check.status}">${check.status}</span>` : ""}
+        </div>
+        <div class="mon-card-since">${check.since ? "for " + formatSince(check.since) : ""}</div>
+        ${renderCardBody(check, byTxRef)}
+      `;
+      cardsEl.appendChild(card);
+    });
+    container.appendChild(section);
+  });
+}
+
+async function pollStatus() {
+  try {
+    const res = await fetch("{% url 'monitoring:api-status' %}");
+    const data = await res.json();
+    document.getElementById("monStaleBanner").classList.toggle("show", !!data.stale);
+    renderGroups(data.checks || []);
+  } catch (e) {
+    document.getElementById("monStaleBanner").classList.add("show");
+  }
+}
+
+async function loadRecentLogins() {
+  try {
+    const res = await fetch("{% url 'monitoring:api-recent-logins' %}");
+    const data = await res.json();
+    const body = document.getElementById("monLoginsBody");
+    const empty = document.getElementById("monLoginsEmpty");
+    body.innerHTML = "";
+    if (!data.attempts || !data.attempts.length) {
+      empty.style.display = "block";
+      return;
+    }
+    empty.style.display = "none";
+    data.attempts.forEach(a => {
+      const tr = document.createElement("tr");
+      const time = new Date(a.attempt_time).toLocaleString();
+      tr.innerHTML = `<td>${a.username || ""}</td><td>${a.ip_address || ""}</td><td>${time}</td><td>${a.failures_since_start}</td>`;
+      body.appendChild(tr);
+    });
+  } catch (e) {
+    // non-critical widget, fail quietly
+  }
+}
+
+pollStatus();
+loadRecentLogins();
+setInterval(pollStatus, 5000);
+</script>
+{% endblock %}

@@ -47,6 +47,8 @@ INSTALLED_APPS = [
     'hardware',
     'library',
     'encoders',
+    'monitoring',
+    'axes',
 ]
 
 MIDDLEWARE = [
@@ -55,10 +57,27 @@ MIDDLEWARE = [
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
+    'axes.middleware.AxesMiddleware',
     'django.contrib.auth.middleware.LoginRequiredMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
+
+AUTHENTICATION_BACKENDS = [
+    # Must come first — axes needs first crack at authenticate() to
+    # enforce lockout before the real backend even checks the password.
+    'axes.backends.AxesStandaloneBackend',
+    'django.contrib.auth.backends.ModelBackend',
+]
+
+# Lock on the (username, IP) pair together, not either alone: pure
+# username lockout lets an attacker bypass the limit by rotating
+# User-Agent/cookies (axes' own AXES_W006 warning), but pure IP lockout
+# would risk locking out the real user right alongside any prober
+# sharing this box's one household NAT'd IP.
+AXES_FAILURE_LIMIT = 5
+AXES_COOLOFF_TIME = 1  # hours
+AXES_LOCKOUT_PARAMETERS = [["username", "ip_address"]]
 
 # Protects every view by default (LoginRequiredMiddleware, Django 5.1+) —
 # Django's own login/admin-login views are already exempted internally
@@ -174,6 +193,14 @@ CSRF_TRUSTED_ORIGINS = config(
 SECURE_SSL_REDIRECT = True
 SESSION_COOKIE_SECURE = True
 CSRF_COOKIE_SECURE = True
+
+# --- Email (Monitoring alerts) ---
+EMAIL_HOST = config('EMAIL_HOST', default='localhost')
+EMAIL_PORT = config('EMAIL_PORT', default=587, cast=int)
+EMAIL_HOST_USER = config('EMAIL_HOST_USER', default='')
+EMAIL_HOST_PASSWORD = config('EMAIL_HOST_PASSWORD', default='')
+EMAIL_USE_TLS = config('EMAIL_USE_TLS', default=True, cast=bool)
+DEFAULT_FROM_EMAIL = config('DEFAULT_FROM_EMAIL', default='isadoraair@localhost')
 
 # Default primary key field type
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field

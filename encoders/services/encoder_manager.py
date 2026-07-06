@@ -122,8 +122,41 @@ def _output_block(encoder, source_var):
 
 def build_liquidsoap_script(input_device, encoders):
     """One shared `input.alsa` (the device is only ever opened once) fanned
-    out to one output.* block per encoder that uses this device."""
-    lines = [f'source = input.alsa(device={_liq_string(input_device)})']
+    out to one output.* block per encoder that uses this device.
+
+    Also wraps the shared source in `blank.detect` and self-reports
+    silence to a small JSON state file that monitoring/services/probes.py
+    reads (see MonitorCheck kind="audio_silence") -- this is deliberately
+    NOT a second ALSA capture process. Two independent readers on the
+    same plughw device+subdevice either fail to open or silently land on
+    different, unpaired subdevices (the exact failure mode already hit
+    once with StereoTool and again with the original per-encoder
+    Liquidsoap design, see this file's own docstring) -- self-reporting
+    from inside the process that already holds the device sidesteps that
+    entirely. Verified against this box's real installed Liquidsoap
+    2.4.0+dev (`liquidsoap --list-functions-md` + a standalone --check
+    and a live short-lived run) before wiring this in live."""
+    slug = _slug(input_device)
+    state_path = f"/run/isadoraair/liquidsoap_silence_{slug}.json"
+    lines = [
+        f'source = input.alsa(device={_liq_string(input_device)})',
+        'source = blank.detect(threshold=-40.0, max_blank=20.0, min_noise=0.5, source)',
+        '',
+        'def write_silence_state(is_blank) =',
+        f'  state = json.stringify(compact=true, {{is_blank = is_blank, timestamp = time()}})',
+        f'  file.write(data=state, atomic=true, {_liq_string(state_path)})',
+        'end',
+        '',
+        'source.on_blank(synchronous=false, {write_silence_state(true)})',
+        'source.on_noise(synchronous=false, {write_silence_state(false)})',
+        # on_blank/on_noise only fire on a transition -- without this,
+        # a feed that's been continuously fine since startup would never
+        # write a state file at all, and the dashboard would show
+        # "unknown" forever instead of "ok". start_blank defaults to
+        # false, so the matching initial assumption here is "not blank".
+        'write_silence_state(false)',
+        '',
+    ]
     lines += [_output_block(encoder, "source") for encoder in encoders]
     return "\n".join(lines) + "\n"
 

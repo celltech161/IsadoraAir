@@ -51,17 +51,32 @@
     }
 
     nav.topbar .nav-links {
+      display: none;
+      position: absolute;
+      top: 52px;
+      left: 0;
+      right: 0;
+      flex-direction: column;
+      gap: 0;
+      background: var(--bg-dark);
+      border-bottom: 1px solid var(--border-subtle);
+      z-index: 100;
+    }
+
+    nav.topbar .nav-links.open {
       display: flex;
-      gap: 0.25rem;
     }
 
     nav.topbar .nav-links a {
+      display: block;
+      width: 100%;
+      text-align: left;
       color: var(--text-muted);
       text-decoration: none;
       font-size: 0.875rem;
       font-weight: 500;
-      padding: 0.4rem 0.75rem;
-      border-radius: 6px;
+      padding: 0.75rem 1.5rem;
+      border-radius: 0;
       transition: color 0.15s, background 0.15s;
     }
 
@@ -80,14 +95,17 @@
     }
 
     nav.topbar .nav-logout-btn {
+      display: block;
+      width: 100%;
+      text-align: left;
       color: var(--text-muted);
       background: none;
       border: none;
       font: inherit;
       font-size: 0.875rem;
       font-weight: 500;
-      padding: 0.4rem 0.75rem;
-      border-radius: 6px;
+      padding: 0.75rem 1.5rem;
+      border-radius: 0;
       cursor: pointer;
       transition: color 0.15s, background 0.15s;
     }
@@ -113,7 +131,7 @@
     }
 
     nav.topbar .nav-toggle {
-      display: none;
+      display: flex;
       flex-direction: column;
       justify-content: center;
       gap: 4px;
@@ -133,38 +151,6 @@
       border-radius: 1px;
     }
 
-    @media (max-width: 700px) {
-      nav.topbar .nav-links {
-        display: none;
-        position: absolute;
-        top: 52px;
-        left: 0;
-        right: 0;
-        flex-direction: column;
-        gap: 0;
-        background: var(--bg-dark);
-        border-bottom: 1px solid var(--border-subtle);
-        z-index: 100;
-      }
-
-      nav.topbar .nav-links.open {
-        display: flex;
-      }
-
-      nav.topbar .nav-links a,
-      nav.topbar .nav-logout-btn {
-        display: block;
-        width: 100%;
-        text-align: left;
-        padding: 0.75rem 1.5rem;
-        border-radius: 0;
-      }
-
-      nav.topbar .nav-toggle {
-        display: flex;
-      }
-    }
-
     main {
       padding: 1.25rem 1.5rem;
       max-width: 100%;
@@ -182,6 +168,7 @@
       <a href="{% url 'library:library' %}" {% block nav_library %}{% endblock %}>Library</a>
       <a href="{% url 'library:playlists' %}" {% block nav_playlists %}{% endblock %}>Playlists</a>
       <a href="{% url 'library:rotations' %}" {% block nav_rotations %}{% endblock %}>Rotations</a>
+      <a href="{% url 'monitoring:dashboard' %}" {% block nav_monitoring %}{% endblock %}>Monitoring</a>
       {% if user.is_authenticated %}
       <form method="post" action="{% url 'logout' %}" class="nav-logout-form">
         {% csrf_token %}
