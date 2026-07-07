@@ -96,48 +96,110 @@ class UecpCrcTests(SimpleTestCase):
 
 
 class UecpMecBuilderTests(SimpleTestCase):
+    """Every command's byte layout is checked against the SPB490 spec's
+    own literal worked example for that exact command (sections 3.1.x/
+    3.3.x), not just internal shape -- a real bug was caught this way
+    after the first version of this module shipped without DSN/PSN on
+    any command, with RT's fields in the wrong order, and with DI's
+    bits swapped, none of which shape-only tests had caught."""
+
+    def test_mec_pi_matches_spec_example(self):
+        # <01><00><01><C2><01> -- PI=C201, current data set, service 1.
+        self.assertEqual(uecp.mec_pi(0xC201, dsn=0x00, psn=0x01), bytes.fromhex("0100 01 C201".replace(" ", "")))
+
+    def test_mec_ps_matches_spec_example(self):
+        # <02><00><02><52><41><44><49><4F><20><31><20> -- current data
+        # set, service 2, PS "RADIO 1 " (spec's own OCR-mangled text
+        # decodes to this via the literal hex bytes, not the prose).
+        result = uecp.mec_ps("RADIO 1 ", dsn=0x00, psn=0x02)
+        self.assertEqual(result, bytes.fromhex("020002") + b"RADIO 1 ")
+
     def test_mec_ps_pads_and_truncates(self):
-        self.assertEqual(uecp.mec_ps("ABC"), bytes([0x02]) + b"ABC     ")
-        self.assertEqual(uecp.mec_ps("ABCDEFGHIJ"), bytes([0x02]) + b"ABCDEFGH")
+        self.assertEqual(uecp.mec_ps("ABC"), bytes([0x02, 0x00, 0x00]) + b"ABC     ")
+        self.assertEqual(uecp.mec_ps("ABCDEFGHIJ"), bytes([0x02, 0x00, 0x00]) + b"ABCDEFGH")
+
+    def test_mec_ta_tp_matches_spec_example(self):
+        # <03><00><05><02> -- current data set, service 5, TP=1 TA=0.
+        self.assertEqual(uecp.mec_ta_tp(ta=False, tp=True, dsn=0x00, psn=0x05), bytes.fromhex("03000502"))
 
     def test_mec_ta_tp_bits(self):
-        self.assertEqual(uecp.mec_ta_tp(ta=False, tp=False), bytes([0x03, 0x00]))
-        self.assertEqual(uecp.mec_ta_tp(ta=True, tp=False), bytes([0x03, 0x01]))
-        self.assertEqual(uecp.mec_ta_tp(ta=False, tp=True), bytes([0x03, 0x02]))
-        self.assertEqual(uecp.mec_ta_tp(ta=True, tp=True), bytes([0x03, 0x03]))
+        self.assertEqual(uecp.mec_ta_tp(ta=False, tp=False), bytes([0x03, 0x00, 0x00, 0x00]))
+        self.assertEqual(uecp.mec_ta_tp(ta=True, tp=False), bytes([0x03, 0x00, 0x00, 0x01]))
+        self.assertEqual(uecp.mec_ta_tp(ta=False, tp=True), bytes([0x03, 0x00, 0x00, 0x02]))
+        self.assertEqual(uecp.mec_ta_tp(ta=True, tp=True), bytes([0x03, 0x00, 0x00, 0x03]))
 
-    def test_mec_di_bits(self):
-        self.assertEqual(
-            uecp.mec_di(dynamic_pty=False, compressed=False, artificial_head=False, stereo=False),
-            bytes([0x04, 0x00]),
-        )
-        self.assertEqual(
-            uecp.mec_di(dynamic_pty=True, compressed=True, artificial_head=True, stereo=True),
-            bytes([0x04, 0x0F]),
-        )
+    def test_mec_di_matches_spec_example(self):
+        # <04><00><03><01> -- current data set, service 3, stereo=1,
+        # artificial head/compressed/dynamic-PTYI all 0.
+        result = uecp.mec_di(dynamic_pty=False, compressed=False, artificial_head=False, stereo=True,
+                              dsn=0x00, psn=0x03)
+        self.assertEqual(result, bytes.fromhex("04000301"))
 
-    def test_mec_ms(self):
-        self.assertEqual(uecp.mec_ms(music=True), bytes([0x05, 0x01]))
-        self.assertEqual(uecp.mec_ms(music=False), bytes([0x05, 0x00]))
+    def test_mec_di_bit_assignment(self):
+        # bit0=stereo, bit1=artificial head, bit2=compressed, bit3=dynamic PTYI
+        # -- confirmed against spec section 3.1.3, NOT the order used in
+        # this module's first (buggy) version.
+        self.assertEqual(uecp.mec_di(False, False, False, False)[3], 0x00)
+        self.assertEqual(uecp.mec_di(False, False, False, True)[3], 0x01)   # stereo
+        self.assertEqual(uecp.mec_di(False, False, True, False)[3], 0x02)   # artificial head
+        self.assertEqual(uecp.mec_di(False, True, False, False)[3], 0x04)   # compressed
+        self.assertEqual(uecp.mec_di(True, False, False, False)[3], 0x08)   # dynamic PTYI
+        self.assertEqual(uecp.mec_di(True, True, True, True)[3], 0x0F)
 
-    def test_mec_pty(self):
-        self.assertEqual(uecp.mec_pty(11), bytes([0x07, 0x0B]))
+    def test_mec_ms_matches_spec_example(self):
+        # <05><00><01><01> -- current data set, service 1, MS=1.
+        self.assertEqual(uecp.mec_ms(music=True, dsn=0x00, psn=0x01), bytes.fromhex("05000101"))
+
+    def test_mec_pty_matches_spec_example(self):
+        # <07><00><05><08> -- current data set, service 5, PTY=8.
+        self.assertEqual(uecp.mec_pty(8, dsn=0x00, psn=0x05), bytes.fromhex("07000508"))
+
+    def test_mec_rt_matches_spec_examples(self):
+        # <0A><00><01><04><0B><52><44><53> -- current data set, service 1,
+        # flush buffer (bits6-5=00) + toggle A/B (bit0=1) -> flags=0x01,
+        # MEL=4 (1 flags byte + 3 text chars "RDS"), text "RDS".
+        result = uecp.mec_rt("RDS", ab_flag=True, dsn=0x00, psn=0x01)
+        # This module always uses buffer-config 0b01 ("add to buffer"),
+        # not the spec example's 0b00 ("flush") -- a deliberate choice
+        # documented in mec_rt's own docstring (this engine always sends
+        # one current message, not an on-device rotating buffer), so
+        # only the DSN/PSN/MEL/text/A-B-bit portions are checked against
+        # the spec example here, not the buffer-config bits.
+        self.assertEqual(result[0:3], bytes.fromhex("0A0001"))  # MEC DSN PSN
+        self.assertEqual(result[3], 4)  # MEL = 1 + len("RDS")
+        self.assertEqual(result[4] & 0x01, 1)  # A/B toggle bit
+        self.assertEqual(result[5:], b"RDS")
 
     def test_mec_rt_ab_flag(self):
         rt_off = uecp.mec_rt("Hello", ab_flag=False)
         rt_on = uecp.mec_rt("Hello", ab_flag=True)
-        self.assertEqual(rt_off[2] & 0x01, 0)
-        self.assertEqual(rt_on[2] & 0x01, 1)
-        self.assertEqual(rt_off[3:], b"Hello")
+        self.assertEqual(rt_off[4] & 0x01, 0)
+        self.assertEqual(rt_on[4] & 0x01, 1)
+        self.assertEqual(rt_off[5:], b"Hello")
+        self.assertEqual(rt_off[3], 1 + len("Hello"))
 
-    def test_mec_af_terminator_and_codes(self):
-        # 87.6 MHz -> round((87.6-87.5)/0.1) = 1 ; 107.9 -> 204
-        result = uecp.mec_af([87.6, 107.9])
-        self.assertEqual(result, bytes([0x13, 0x00, 1, 204, 0x00]))
+    def test_mec_rt_mel_is_flags_byte_plus_text_length(self):
+        result = uecp.mec_rt("A" * 64, ab_flag=False)
+        self.assertEqual(result[3], 65)  # 1 flags byte + 64 text chars
 
     def test_freq_to_af_code(self):
         self.assertEqual(uecp.freq_to_af_code(87.6), 1)
         self.assertEqual(uecp.freq_to_af_code(107.9), 204)
+
+    def test_mec_af_envelope_has_dsn_psn_mel(self):
+        # Only the UECP envelope (MEC/DSN/PSN/MEL/start-location/
+        # terminator) is checked against the spec here -- the AF *data*
+        # content's exact list-encoding scheme is a known, documented
+        # simplification (see mec_af's own docstring) since it depends
+        # on IEC EN 62106, a separate standard this UECP spec defers to.
+        result = uecp.mec_af([87.6, 107.9], dsn=0x00, psn=0x01, start_location=0x0000)
+        self.assertEqual(result[0:3], bytes.fromhex("130001"))  # MEC DSN PSN
+        mel = result[3]
+        med = result[4:]
+        self.assertEqual(len(med), mel)
+        self.assertEqual(med[0:2], bytes.fromhex("0000"))  # start location
+        self.assertEqual(med[2:4], bytes([1, 204]))  # the two AF codes
+        self.assertEqual(med[-1], 0x00)  # terminator
 
 
 class UecpFrameTests(SimpleTestCase):

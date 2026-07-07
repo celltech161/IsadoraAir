@@ -13,17 +13,39 @@ Frame layout: STA(1B) | ADD(2B) | SQC(1B) | MFL(1B) | MSG(0-255B) | CRC(2B) | ST
   are each replaced by a 2-byte pair starting with 0xFD (0xFD->FD 00,
   0xFE->FD 01, 0xFF->FD 02).
 
-CRC verification note: the spec's own worked example (Appendix 1, both
-the 1997 v5.1 and 2006 v6.02 revisions) contains a literal typo --
-"2D111234010105ABCD123F0XXXX11069212491000320066" -- confirmed directly
-from the official PDF text, not an OCR artifact. This can't be used as a
-test vector. Instead, crc_ccitt() below was verified by (1) transliterating
-the spec's own Appendix 1 PASCAL reference implementation independently
-and confirming it agrees with this implementation across multiple inputs,
-and (2) confirming both agree with the well-known, catalogued CRC-16/
-GENIBUS standard check value for "123456789" -> 0xD64E (GENIBUS uses the
-exact same four parameters: poly 0x1021, init 0xFFFF, no reflection,
-xorout 0xFFFF). See rbds/tests.py for both checks.
+Each message element within MSG is `MEC(1B) DSN(1B) PSN(1B) [MEL(1B)]
+MED(...)` (spec section 2.3.1) -- DSN (Data Set Number, 0=current data
+set) and PSN (Programme Service Number, 0=main service) are REQUIRED for
+every command implemented here (confirmed directly against each
+command's own spec section in 3.1/3.3, not assumed) even though the
+generic message-element grammar in 2.3.1 shows them in square brackets
+as "used, as required by the specific command." A real bug was caught
+here during a later review: the first version of this module omitted
+DSN/PSN entirely from every mec_* builder, had RT's DSN/PSN/MEL/flag
+byte fields in the wrong order, and had DI's bit assignments swapped --
+none of that was caught by the original tests, which only checked
+internal shape, not real per-command byte layouts against the primary
+spec. Every builder below is now checked against the spec's own literal
+worked example for that exact command (see rbds/tests.py) -- a much
+stronger verification than shape-only assertions.
+
+This project's single-station setup has no real use for anything but
+"current data set, main service" -- dsn/psn default to 0x00/0x00
+everywhere and aren't exposed as RBDSConfig fields (see rbds/models.py
+docstrings) rather than adding config surface nothing here needs yet.
+
+CRC verification note: the spec's own worked example for the CRC
+algorithm itself (Appendix 1, both the 1997 v5.1 and 2006 v6.02
+revisions) contains a literal typo -- "2D111234010105ABCD123F0XXXX11069
+212491000320066" -- confirmed directly from the official PDF text, not
+an OCR artifact. This can't be used as a test vector. Instead,
+crc_ccitt() below was verified by (1) transliterating the spec's own
+Appendix 1 PASCAL reference implementation independently and confirming
+it agrees with this implementation across multiple inputs, and (2)
+confirming both agree with the well-known, catalogued CRC-16/GENIBUS
+standard check value for "123456789" -> 0xD64E (GENIBUS uses the exact
+same four parameters: poly 0x1021, init 0xFFFF, no reflection, xorout
+0xFFFF). See rbds/tests.py for both checks.
 """
 import struct
 
@@ -81,60 +103,92 @@ def freq_to_af_code(freq_mhz: float) -> int:
     return round((freq_mhz - 87.5) / 0.1)
 
 
-def mec_pi(pi_code: int) -> bytes:
-    """MEC 0x01 -- Program Identification, 2-byte MED."""
-    return bytes([0x01]) + struct.pack(">H", pi_code & 0xFFFF)
+def mec_pi(pi_code: int, dsn: int = 0x00, psn: int = 0x00) -> bytes:
+    """MEC 0x01 -- Program Identification. Format: MEC DSN PSN MED(2).
+    Spec example: <01><00><01><C2><01> (PI=C201)."""
+    return bytes([0x01, dsn, psn]) + struct.pack(">H", pi_code & 0xFFFF)
 
 
-def mec_ps(text: str) -> bytes:
-    """MEC 0x02 -- Program Service name, 8-byte MED, padded/truncated,
+def mec_ps(text: str, dsn: int = 0x00, psn: int = 0x00) -> bytes:
+    """MEC 0x02 -- Program Service name. Format: MEC DSN PSN MED(8),
     chars restricted to 0x20-0xFE per spec (non-conforming chars are
-    replaced with a space rather than silently sent as invalid bytes)."""
+    replaced with a space rather than silently sent as invalid bytes).
+    Spec example: <02><00><02><52><41><44><49><4F><20><31><20>."""
     padded = text[:8].ljust(8)
     med = bytes(b if 0x20 <= b <= 0xFE else 0x20 for b in padded.encode("latin-1", errors="replace"))
-    return bytes([0x02]) + med
+    return bytes([0x02, dsn, psn]) + med
 
 
-def mec_ta_tp(ta: bool, tp: bool) -> bytes:
-    """MEC 0x03 -- bit0=TA, bit1=TP."""
+def mec_ta_tp(ta: bool, tp: bool, dsn: int = 0x00, psn: int = 0x00) -> bytes:
+    """MEC 0x03 -- Format: MEC DSN PSN MED(1: bit0=TA, bit1=TP).
+    Spec example: <03><00><05><02> (TP=1, TA=0)."""
     value = (0x01 if ta else 0x00) | (0x02 if tp else 0x00)
-    return bytes([0x03, value])
+    return bytes([0x03, dsn, psn, value])
 
 
-def mec_di(dynamic_pty: bool, compressed: bool, artificial_head: bool, stereo: bool) -> bytes:
-    """MEC 0x04 -- Decoder Information: bit0=Dynamic PTY, bit1=Compressed,
-    bit2=Artificial Head, bit3=Stereo."""
+def mec_di(dynamic_pty: bool, compressed: bool, artificial_head: bool, stereo: bool,
+           dsn: int = 0x00, psn: int = 0x00) -> bytes:
+    """MEC 0x04 -- DI/PTYI. Format: MEC DSN PSN MED(1: bit0=stereo,
+    bit1=artificial head, bit2=compressed, bit3=dynamic PTYI). Spec
+    example: <04><00><03><01> (stereo=1, others 0)."""
     value = (
-        (0x01 if dynamic_pty else 0x00)
-        | (0x02 if compressed else 0x00)
-        | (0x04 if artificial_head else 0x00)
-        | (0x08 if stereo else 0x00)
+        (0x01 if stereo else 0x00)
+        | (0x02 if artificial_head else 0x00)
+        | (0x04 if compressed else 0x00)
+        | (0x08 if dynamic_pty else 0x00)
     )
-    return bytes([0x04, value])
+    return bytes([0x04, dsn, psn, value])
 
 
-def mec_ms(music: bool) -> bytes:
-    """MEC 0x05 -- Music/Speech, bit0 (1=Music, 0=Speech)."""
-    return bytes([0x05, 0x01 if music else 0x00])
+def mec_ms(music: bool, dsn: int = 0x00, psn: int = 0x00) -> bytes:
+    """MEC 0x05 -- Format: MEC DSN PSN MED(1, bit0: 1=Music, 0=Speech).
+    Spec example: <05><00><01><01>."""
+    return bytes([0x05, dsn, psn, 0x01 if music else 0x00])
 
 
-def mec_pty(pty: int) -> bytes:
-    """MEC 0x07 -- Program Type, 0-0x1F."""
-    return bytes([0x07, pty & 0x1F])
+def mec_pty(pty: int, dsn: int = 0x00, psn: int = 0x00) -> bytes:
+    """MEC 0x07 -- Format: MEC DSN PSN MED(1, 0-0x1F). Spec example:
+    <07><00><05><08>."""
+    return bytes([0x07, dsn, psn, pty & 0x1F])
 
 
-def mec_rt(text: str, ab_flag: bool) -> bytes:
-    """MEC 0x0A -- RadioText, up to 64 chars. MED byte 1's bit0 is the
-    A/B toggle flag -- must flip whenever the transmitted text actually
-    changes, so receivers know to refresh their display."""
+def mec_rt(text: str, ab_flag: bool, dsn: int = 0x00, psn: int = 0x00) -> bytes:
+    """MEC 0x0A -- RadioText. Format: MEC DSN PSN MEL MED(flags byte,
+    then up to 64 text chars). MEL = 1 (flags byte) + len(text). The
+    flags byte's bit0 is the A/B toggle flag -- must flip whenever the
+    transmitted text actually changes, so receivers know to refresh
+    their display; bits 6-5 are buffer config (0b01 = flush-then-load,
+    matches this project's single-current-message use, not a rotating
+    on-device buffer -- rotation is handled by rbds_manager.py itself).
+    Spec example: <0A><00><01><05><51><74><65><78><74> (flush+toggle
+    A/B, text 'text')."""
     text = text[:64]
-    med0 = 0x01 if ab_flag else 0x00
-    return bytes([0x0A, len(text) + 1, med0]) + text.encode("latin-1", errors="replace")
+    med0 = (0b01 << 5) | (0x01 if ab_flag else 0x00)
+    mel = 1 + len(text)
+    return bytes([0x0A, dsn, psn, mel, med0]) + text.encode("latin-1", errors="replace")
 
 
-def mec_af(frequencies_mhz: list) -> bytes:
-    """MEC 0x13 -- Alternative Frequencies, a start-location byte + AF
-    code list + 0x00 terminator (flat list only, no Method B tuning-
-    frequency-relative framing in this version)."""
+def mec_af(frequencies_mhz: list, dsn: int = 0x00, psn: int = 0x00, start_location: int = 0x0000) -> bytes:
+    """MEC 0x13 -- Alternative Frequencies. UECP envelope (MEC DSN PSN
+    MEL, 2-byte start location, then AF data, then a 0x00 terminator)
+    is confirmed directly against the spec's own section 3.1.9. The AF
+    *data* content itself is a flat list of freq_to_af_code() values
+    here -- NOT verified against the spec's own worked example
+    (<13><00><01><07><00><00><E2><15><27><CD><00>), because that
+    example's 4 data bytes (E2 15 27 CD) don't parse as 2 flat
+    frequency codes for the "2 frequencies, 89.6/91.4 MHz" it claims
+    (freq_to_af_code(89.6)=0x15 and (91.4)=0x27 DO appear, but E2/CD
+    don't correspond to any frequency in range -- they're very likely a
+    Method-A "N AFs follow" count byte / list-structuring byte defined
+    by the separate IEC EN 62106 RDS standard, which this UECP spec
+    explicitly defers to ("no distinction is made between Method A or
+    B... structured in pairs as in IEC EN 62106") rather than fully
+    define itself). Since RBDSConfig's af_frequencies_mhz is currently
+    unset/unused in production and this was already flagged out of
+    scope in the approved plan ("AF Method B framing -- flat AF list
+    only"), this flat encoding is a known, stated simplification, not
+    a verified-correct implementation of the real AF list format --
+    revisit against IEC EN 62106 directly before actually turning AF on."""
     codes = [freq_to_af_code(f) for f in frequencies_mhz]
-    return bytes([0x13, 0x00]) + bytes(codes) + bytes([0x00])
+    med = struct.pack(">H", start_location) + bytes(codes) + bytes([0x00])
+    return bytes([0x13, dsn, psn, len(med)]) + med
