@@ -30,6 +30,7 @@ class MonitorCheck(models.Model):
         ("transmitter_param", "Transmitter Parameter"),
         ("transmitter_indicator", "Transmitter Status Indicator"),
         ("audio_silence", "Audio Silence (Liquidsoap)"),
+        ("rbds", "RBDS Connection"),
     ]
 
     name = models.CharField(max_length=100, unique=True)

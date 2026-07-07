@@ -169,6 +169,7 @@
       <a href="{% url 'library:playlists' %}" {% block nav_playlists %}{% endblock %}>Playlists</a>
       <a href="{% url 'library:rotations' %}" {% block nav_rotations %}{% endblock %}>Rotations</a>
       <a href="{% url 'monitoring:dashboard' %}" {% block nav_monitoring %}{% endblock %}>Monitoring</a>
+      <a href="{% url 'rbds:dashboard' %}" {% block nav_rbds %}{% endblock %}>RBDS</a>
       {% if user.is_authenticated %}
       <form method="post" action="{% url 'logout' %}" class="nav-logout-form">
         {% csrf_token %}

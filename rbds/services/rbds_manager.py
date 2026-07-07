@@ -1,0 +1,329 @@
+"""RBDS engine -- reads Track/now-playing state and RBDSConfig/
+RBDSPSFrame/RBDSMessage rows, and sends PS/RT (+ other static RDS
+fields) to StereoTool's RDS encoder over UECP or ASCII, via TCP or UDP.
+
+Follows monitoring/services/monitor.py's reactive time.sleep() loop
+shape (not encoders/services/encoder_manager.py's subprocess-supervision
+shape -- there's no subprocess here, this process itself holds the one
+persistent connection)."""
+import datetime
+import json
+import socket
+import time
+from pathlib import Path
+
+import django
+
+django.setup()
+
+import requests  # noqa: E402
+from django.db import close_old_connections  # noqa: E402
+
+from rbds.models import RBDSConfig, RBDSMessage, RBDSPSFrame  # noqa: E402
+from rbds.services import ascii_protocol, uecp  # noqa: E402
+from rbds.services.content_fetch import ContentFetchCache  # noqa: E402
+from rbds.services.rotation import PSRotation, RTRotation  # noqa: E402
+
+POLL_SECONDS = 1
+FULL_RESEND_SECONDS = 30  # periodic full resend even if nothing changed -- RDS receivers can miss packets
+TCP_RECONNECT_BACKOFF = [1, 2, 5, 10, 30]
+FILE_URL_FETCH_TIMEOUT = 5  # seconds, bounds a slow/hanging URL source's delay on the tick it fires
+
+STATE_PATH = Path("/run/isadoraair/rbds_state.json")
+NOW_PLAYING_PATH = Path("/run/isadoraair/now_playing.json")  # read-only, owned by library/services/engine.py
+
+
+class RBDSManager:
+    def __init__(self):
+        self.running = False
+        self._ps_rotation = PSRotation()
+        self._rt_rotation = RTRotation()
+        self._content_cache = ContentFetchCache()
+        self._sock = None
+        self._sqc = 0
+        self._last_connect_attempt = 0.0
+        self._backoff_index = 0
+        self._last_sent_ps = None
+        self._last_sent_rt = None
+        self._rt_ab_flag = False
+        self._last_full_resend = 0.0
+        self._last_error = None
+        self._connected = False
+        self._connected_since = None
+        self._down_since = None
+        self._last_now_playing = {"title": "", "artist": ""}
+
+    def start(self):
+        self.running = True
+        close_old_connections()
+        STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+        import signal
+        signal.signal(signal.SIGTERM, self._handle_signal)
+        signal.signal(signal.SIGINT, self._handle_signal)
+
+        print("RBDS engine started.")
+        while self.running:
+            try:
+                self._tick()
+            except Exception as exc:
+                # Never let a bad tick kill the whole engine -- same
+                # survival model as MonitorManager's probe exceptions.
+                self._last_error = str(exc)
+            time.sleep(POLL_SECONDS)
+        self.stop()
+
+    def stop(self):
+        self.running = False
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+            self._sock = None
+        print("RBDS engine stopped.")
+
+    def _handle_signal(self, signum, frame):
+        print("\nShutting down...")
+        self.running = False
+
+    # --- Main tick ---
+
+    def _tick(self):
+        close_old_connections()
+        config = RBDSConfig.load()
+        now_playing = self._read_now_playing()
+
+        ps_frames = list(
+            RBDSPSFrame.objects.filter(enabled=True).order_by("sort_order").values_list("text", "hold_seconds")
+        )
+        target_ps = self._ps_rotation.advance(ps_frames) or config.station_ps or ""
+
+        today = datetime.date.today()
+        messages = list(RBDSMessage.objects.filter(enabled=True).order_by("sort_order"))
+        active_messages = [m for m in messages if m.is_active_today(today)]
+        active_promo_tuples = [(m.name, m.display_seconds) for m in active_messages]
+        messages_by_name = {m.name: m for m in active_messages}
+
+        rt_source, rt_source_name = self._rt_rotation.advance(active_promo_tuples)
+
+        rt_text, rt_artist, rt_title = self._resolve_rt_content(
+            config, now_playing, rt_source, rt_source_name, messages_by_name,
+        )
+
+        changed = target_ps != self._last_sent_ps or rt_text != self._last_sent_rt
+        due_for_full_resend = (time.time() - self._last_full_resend) >= FULL_RESEND_SECONDS
+
+        if rt_text != self._last_sent_rt:
+            self._rt_ab_flag = not self._rt_ab_flag
+
+        if changed or due_for_full_resend:
+            self._send(config, target_ps, rt_text, rt_artist, rt_title)
+            self._last_sent_ps = target_ps
+            self._last_sent_rt = rt_text
+            self._last_full_resend = time.time()
+
+        self._write_state(config, target_ps, rt_text, rt_source, rt_source_name)
+
+    RT_PLUS_SEPARATOR = " - "
+
+    def _resolve_rt_content(self, config, now_playing, rt_source, rt_source_name, messages_by_name):
+        """Returns (rt_text, artist_or_none, title_or_none). artist/title
+        are only returned non-None when RT+ tagging is actually going to
+        be used for this content -- in that case rt_text is built via a
+        FIXED "artist - title" join (RT_PLUS_SEPARATOR) so
+        _build_ascii_payload() can compute exact tag offsets, rather than
+        searching for substrings in an arbitrary user-configured
+        now_playing_format template (which can't safely guarantee
+        positions). now_playing_format is only honored when RT+ isn't
+        in play."""
+        if rt_source == "nowplaying":
+            title = now_playing.get("title", "") or ""
+            artist = now_playing.get("artist", "") or ""
+        else:
+            message = messages_by_name.get(rt_source_name)
+            if message is None:
+                return "", None, None
+            raw_text = self._resolve_message_text(message)
+            if message.rt_plus_delimiter and message.rt_plus_delimiter in raw_text:
+                artist, _, title = raw_text.partition(message.rt_plus_delimiter)
+                artist, title = artist.strip(), title.strip()
+            else:
+                return raw_text[:64], None, None
+
+        if not artist:
+            return title[:64], None, None
+
+        if config.protocol == "ascii" and config.use_rt_plus:
+            text = f"{artist}{self.RT_PLUS_SEPARATOR}{title}"[:64]
+            return text, artist, title
+
+        if rt_source == "nowplaying":
+            try:
+                text = config.now_playing_format.format(title=title, artist=artist)
+            except (KeyError, IndexError):
+                text = title
+        else:
+            text = f"{artist}{self.RT_PLUS_SEPARATOR}{title}"
+        return text[:64], None, None
+
+    def _resolve_message_text(self, message):
+        if message.source_type == "static":
+            return message.text or ""
+        if message.source_type == "file":
+            def fetch():
+                return Path(message.file_path).read_text(encoding="utf-8").strip()
+            return self._content_cache.get(f"msg:{message.id}", message.poll_interval_seconds, fetch)
+        if message.source_type == "url":
+            def fetch():
+                resp = requests.get(message.source_url, timeout=FILE_URL_FETCH_TIMEOUT)
+                resp.raise_for_status()
+                return resp.text.strip()
+            return self._content_cache.get(f"msg:{message.id}", message.poll_interval_seconds, fetch)
+        return ""
+
+    def _read_now_playing(self):
+        try:
+            data = json.loads(NOW_PLAYING_PATH.read_text(encoding="utf-8"))
+            self._last_now_playing = data
+        except (OSError, ValueError):
+            # Missing file, or a rare torn read of the non-atomic writer
+            # (see library/services/engine.py's _write_now_playing) --
+            # keep the previous tick's last-good value, retry next tick.
+            pass
+        return self._last_now_playing
+
+    # --- Sending ---
+
+    def _send(self, config, ps, rt, artist, title):
+        try:
+            if config.protocol == "uecp":
+                payload = self._build_uecp_payload(config, ps, rt)
+            else:
+                payload = self._build_ascii_payload(config, ps, rt, artist, title)
+            self._transmit(config, payload)
+        except Exception as exc:
+            self._last_error = str(exc)
+            self._mark_down()
+            return
+        self._mark_up()
+        self._last_error = None
+
+    def _build_uecp_payload(self, config, ps, rt):
+        self._sqc = (self._sqc % 255) + 1
+        msg = b""
+        if config.pi_code:
+            msg += uecp.mec_pi(int(config.pi_code, 16))
+        msg += uecp.mec_ps(ps)
+        msg += uecp.mec_ta_tp(ta=config.ta, tp=config.tp)
+        msg += uecp.mec_di(
+            dynamic_pty=config.di_dynamic_pty, compressed=config.di_compressed,
+            artificial_head=config.di_artificial_head, stereo=config.di_stereo,
+        )
+        msg += uecp.mec_ms(music=config.ms)
+        msg += uecp.mec_pty(config.pty)
+        msg += uecp.mec_rt(rt, ab_flag=self._rt_ab_flag)
+        if config.af_frequencies_mhz:
+            freqs = [float(f.strip()) for f in config.af_frequencies_mhz.split(",") if f.strip()]
+            if freqs:
+                msg += uecp.mec_af(freqs)
+        return uecp.build_frame(config.uecp_site_address, config.uecp_encoder_address, self._sqc, msg)
+
+    def _build_ascii_payload(self, config, ps, rt, artist, title):
+        # rt is guaranteed by _resolve_rt_content() to be exactly
+        # f"{artist}{RT_PLUS_SEPARATOR}{title}" (truncated to 64 chars)
+        # whenever artist/title are both non-None, so tag offsets are
+        # known exactly -- no substring search needed. If truncation cut
+        # into the title, len(title) may overstate what actually
+        # survived; an accepted edge-case limitation for very long text,
+        # not worth extra complexity for v1.
+        rt_plus_tags = None
+        if config.use_rt_plus and artist and title:
+            artist_start = 0
+            title_start = len(artist) + len(self.RT_PLUS_SEPARATOR)
+            rt_plus_tags = [
+                ascii_protocol.build_rt_plus_tag(ascii_protocol.RT_PLUS_ARTIST, artist_start, len(artist)),
+                ascii_protocol.build_rt_plus_tag(ascii_protocol.RT_PLUS_TITLE, title_start, len(title)),
+            ]
+        commands = ascii_protocol.build_ascii_commands(
+            pi_code=config.pi_code, ps=ps, rt=rt, pty=config.pty, music=config.ms,
+            di_dynamic_pty=config.di_dynamic_pty, di_compressed=config.di_compressed,
+            di_artificial_head=config.di_artificial_head, di_stereo=config.di_stereo,
+            rt_plus_tags=rt_plus_tags,
+        )
+        return ("\n".join(commands) + "\n").encode("utf-8")
+
+    def _transmit(self, config, payload):
+        if config.transport == "udp":
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                sock.sendto(payload, (config.host, config.port))
+            finally:
+                sock.close()
+            return
+
+        self._ensure_tcp_connected(config)
+        if self._sock is None:
+            raise ConnectionError("not connected (TCP reconnect backoff in effect)")
+        self._sock.sendall(payload)
+
+    def _ensure_tcp_connected(self, config):
+        if self._sock is not None:
+            return
+        now = time.time()
+        backoff = TCP_RECONNECT_BACKOFF[min(self._backoff_index, len(TCP_RECONNECT_BACKOFF) - 1)]
+        if now - self._last_connect_attempt < backoff:
+            return
+        self._last_connect_attempt = now
+        try:
+            sock = socket.create_connection((config.host, config.port), timeout=5)
+            self._sock = sock
+            self._backoff_index = 0
+        except OSError as exc:
+            self._backoff_index = min(self._backoff_index + 1, len(TCP_RECONNECT_BACKOFF) - 1)
+            raise ConnectionError(f"TCP connect to {config.host}:{config.port} failed: {exc}") from exc
+
+    def _mark_down(self):
+        # Set on the first failure too (not just a connected->down
+        # transition) -- otherwise a StereoTool that was never reachable
+        # even once since this engine started leaves down_since stuck at
+        # None forever, which reads as "unknown" rather than "down since
+        # the engine started trying."
+        if self._down_since is None:
+            self._down_since = time.time()
+        self._connected = False
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+            self._sock = None
+
+    def _mark_up(self):
+        if not self._connected:
+            self._connected_since = time.time()
+            self._down_since = None
+        self._connected = True
+
+    # --- State file ---
+
+    def _write_state(self, config, ps, rt, rt_source, rt_source_name):
+        state = {
+            "timestamp": time.time(),
+            "current_ps": ps,
+            "current_rt": rt,
+            "rt_source": rt_source,
+            "rt_source_name": rt_source_name,
+            "protocol": config.protocol,
+            "transport": config.transport,
+            "host": config.host,
+            "port": config.port,
+            "connected": self._connected,
+            "connected_since": self._connected_since,
+            "down_since": self._down_since,
+            "last_send_at": self._last_full_resend or None,
+            "last_error": self._last_error,
+        }
+        tmp = STATE_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+        tmp.rename(STATE_PATH)

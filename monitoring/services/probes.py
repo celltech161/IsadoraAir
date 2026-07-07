@@ -211,6 +211,31 @@ def probe_audio_silence(check):
     return "ok", {"is_blank": False, "age_seconds": age}
 
 
+def probe_rbds(check):
+    import json
+    from pathlib import Path
+
+    state_path = Path("/run/isadoraair/rbds_state.json")
+    if not state_path.is_file():
+        return "unknown", {"reason": "no state file yet -- rbds service may be disabled/not yet started"}
+    try:
+        data = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return "unknown", {"error": str(exc)}
+
+    # Unlike audio_silence's state file (only written on a silence<->noise
+    # TRANSITION, so long quiet stretches with no writes are normal), the
+    # rbds engine writes this file on every ~1s tick regardless of
+    # change -- so a short staleness bound here is the correct signal
+    # that the process itself is stuck/dead, not a false alarm.
+    age = time.time() - data.get("timestamp", 0)
+    if age > 60:
+        return "unknown", {"reason": "state file hasn't updated recently", "age_seconds": age}
+    if not data.get("connected"):
+        return "critical", {"last_error": data.get("last_error"), "down_since": data.get("down_since")}
+    return "ok", {"current_ps": data.get("current_ps"), "current_rt": data.get("current_rt")}
+
+
 PROBE_DISPATCH = {
     "systemd": probe_systemd,
     "disk": probe_disk,
@@ -220,4 +245,5 @@ PROBE_DISPATCH = {
     "transmitter_param": probe_transmitter_param,
     "transmitter_indicator": probe_transmitter_indicator,
     "audio_silence": probe_audio_silence,
+    "rbds": probe_rbds,
 }

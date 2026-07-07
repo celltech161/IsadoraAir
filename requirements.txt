@@ -8,3 +8,4 @@ psutil==7.2.2
 psycopg2-binary==2.9.12
 python-decouple==3.8
 PyGObject==3.56.2
+requests==2.32.5
