@@ -14,6 +14,7 @@ from .models import (
     RecencyConfig,
     Category,
     CategoryKind,
+    DuplicateCandidate,
     Holiday,
     LogFillConfig,
     LogItem,
@@ -208,13 +209,30 @@ def mark_not_ready2air(modeladmin, request, queryset):
 @admin.register(Track)
 class TrackAdmin(admin.ModelAdmin):
     list_display = ["title", "artist", "album", "category", "duration_seconds", "ready2air"]
-    list_filter = ["ready2air", "category", "energy", "end_type", "format"]
+    list_filter = ["ready2air", "category", "additional_categories", "energy", "end_type", "format"]
     search_fields = ["title", "artist__name", "album__title"]
     list_editable = ["ready2air", "category"]
     list_per_page = 50
     list_select_related = ["artist", "album", "category"]
     raw_id_fields = ["artist", "album", "genre"]
+    # 108 categories -- the dual-list-with-search widget is far more usable
+    # here than Django's plain multi-select for a field with this many options.
+    filter_horizontal = ["additional_categories"]
     actions = [mark_ready2air, mark_not_ready2air]
+
+
+@admin.register(DuplicateCandidate)
+class DuplicateCandidateAdmin(admin.ModelAdmin):
+    """Review-only: setting `resolution` here just records the decision --
+    nothing gets deleted until `apply_duplicate_resolutions` is run
+    separately (dry-run by default, needs --apply to actually touch
+    anything). See find_duplicate_tracks for how these get populated."""
+    list_display = ["track_a", "track_b", "confidence", "resolution", "applied", "created_at"]
+    list_editable = ["resolution"]
+    list_filter = ["confidence", "resolution", "applied"]
+    search_fields = ["track_a__title", "track_a__artist__name", "track_b__title", "track_b__artist__name"]
+    list_select_related = ["track_a", "track_a__artist", "track_b", "track_b__artist"]
+    readonly_fields = ["applied", "created_at", "resolved_at"]
 
 
 class RotationSlotInline(SortableTabularInline):

@@ -130,6 +130,7 @@ class MonitorManager:
             "id": check.id,
             "name": check.name,
             "kind": check.kind,
+            "sort_order": check.sort_order,
             "status": status,
             "detail": detail,
             "since": self._since.get(check.id),

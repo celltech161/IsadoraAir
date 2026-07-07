@@ -7,7 +7,7 @@ from mutagen import File as MutagenFile
 
 from library.models import Album, Artist, Category, Genre, Track
 
-SUPPORTED_EXT = {".mp3", ".flac", ".wav", ".m4a", ".ogg", ".oga", ".aiff", ".aif"}
+SUPPORTED_EXT = {".mp3", ".flac", ".wav", ".m4a", ".ogg", ".oga", ".aiff", ".aif", ".mp2"}
 
 
 def parse_tags(path):
@@ -189,10 +189,21 @@ class Command(BaseCommand):
 
         category_obj = None
         if category_name:
-            category_obj, _ = Category.objects.get_or_create(
-                code=category_name,
-                defaults={"name": category_name},
-            )
+            category_obj = Category.objects.filter(code=category_name).first()
+            if category_obj is None:
+                # Category.kind is a required FK (CategoryKind) that can't
+                # be inferred from a folder name alone -- silently
+                # get_or_create()-ing one here used to hit an IntegrityError
+                # on the very first file, aborting the whole run. Skip just
+                # this file/folder and keep going; `check_categories` finds
+                # folders like this proactively instead of failing mid-import.
+                self.stderr.write(
+                    f"  [WARN] Skipping {filepath}: no Category exists for "
+                    f"folder '{category_name}'. Create it in admin (with a "
+                    f"kind) first, or run `check_categories` to see all "
+                    f"folders missing a matching category."
+                )
+                return False, "skipped"
 
         defaults = {
             "filename": clean(filepath.name),

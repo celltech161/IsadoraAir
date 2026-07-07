@@ -95,6 +95,13 @@
     font-size: 0.75rem;
     color: var(--text-muted);
   }
+  /* Only applied where a status class is explicitly added (e.g. Encoder
+     Audio's "Stable for"/"Down for") -- systemd's plain "Up X hrs" caption
+     has no status class, so it keeps its default muted color. */
+  .mon-uptime.ok { color: var(--accent); }
+  .mon-uptime.warning { color: #f59e0b; }
+  .mon-uptime.critical { color: var(--danger); }
+  .mon-uptime.unknown { color: var(--text-muted); }
 
   /* --- percent + bar, for disk/memory/cpu --- */
   .mon-bar-row {
@@ -160,6 +167,10 @@
     font-size: 1.4rem;
     font-weight: 700;
   }
+  .mon-reading-value.ok { color: var(--accent); }
+  .mon-reading-value.warning { color: #f59e0b; }
+  .mon-reading-value.critical { color: var(--danger); }
+  .mon-reading-value.unknown { color: var(--text-muted); }
 
   .mon-card-detail {
     font-size: 0.78rem;
@@ -287,7 +298,7 @@ function renderTemperatureBody(check) {
   let html = `
     <div class="mon-reading-row">
       <span class="mon-led ${check.status}"></span>
-      <span class="mon-reading-value">${value.toFixed(1)}&deg;C</span>
+      <span class="mon-reading-value ${check.status}">${value.toFixed(1)}&deg;C</span>
     </div>
   `;
   const perCore = (check.detail && check.detail.per_core) || [];
@@ -366,10 +377,13 @@ function renderInterlockBody(check) {
   const raw = check.detail && check.detail.value;
   const isTripped = raw === "True";
   const colorClass = isTripped ? "critical" : "ok";
+  // Own styling rather than the shared .mon-led-caption (also used by
+  // Services cards' "Running"/"Stopped") -- matches the same size/color
+  // treatment as the other transmitter cards (Reverse Power/VSWR/PA Temp).
   return `
     <div class="mon-led-row">
       <span class="mon-led ${colorClass}"></span>
-      <span class="mon-led-caption">${raw}</span>
+      <span class="mon-value-text ${colorClass}">${raw}</span>
     </div>
   `;
 }
@@ -397,6 +411,21 @@ function renderPaTempBody(check, colorClass) {
   return `<div class="mon-value-text ${colorClass}">${value.toFixed(2)}&deg;C</div>`;
 }
 
+function renderAudioSilenceBody(check) {
+  const ageSeconds = check.detail && check.detail.age_seconds;
+  if (ageSeconds == null) {
+    // Genuinely unknown state (no state file yet, or unreadable) --
+    // there's no age to show, fall back to the reason text.
+    return `<div class="mon-card-detail">${formatGenericDetail(check.detail)}</div>`;
+  }
+  // The status pill already says ok/critical -- showing "is_blank: false"
+  // as well was redundant, so this just shows how long the current
+  // state has held, in hours instead of raw seconds.
+  const hours = (ageSeconds / 3600).toFixed(2);
+  const label = check.status === "ok" ? "Stable" : "Down";
+  return `<div class="mon-uptime ${check.status}">${label} for ${hours} hrs</div>`;
+}
+
 function renderCardBody(check, byTxRef) {
   const pairedIndicatorRef = TX_INDICATOR_FOR_PARAM[check.tx_ref];
   if (pairedIndicatorRef) {
@@ -415,6 +444,7 @@ function renderCardBody(check, byTxRef) {
     case "disk": case "memory": return renderPercentBody(check);
     case "cpu": return renderCpuBody(check);
     case "temperature": return renderTemperatureBody(check);
+    case "audio_silence": return renderAudioSilenceBody(check);
     default: return `<div class="mon-card-detail">${formatGenericDetail(check.detail)}</div>`;
   }
 }
@@ -433,7 +463,13 @@ function renderGroups(checks) {
     // show_as_card === false -> still checked/alertable server-side
     // (see MonitorCheck.show_as_card), just folded into a paired card
     // instead of getting its own tile.
-    const items = group.kinds.flatMap(k => byKind[k] || []).filter(c => c.show_as_card !== false);
+    // Sort by the admin-configured sort_order across the whole group,
+    // not by kind first -- kind order alone would always render every
+    // "cpu" card before every "memory" card regardless of what sort_order
+    // says, which isn't what admin's ordering field implies it controls.
+    const items = group.kinds.flatMap(k => byKind[k] || [])
+      .filter(c => c.show_as_card !== false)
+      .sort((a, b) => a.sort_order - b.sort_order);
     if (!items.length) return;
     const section = document.createElement("div");
     section.className = "mon-group";
@@ -443,13 +479,9 @@ function renderGroups(checks) {
       const card = document.createElement("div");
       card.className = "mon-card";
       const showPill = check.kind !== "systemd" && check.kind !== "temperature";
-      // "CPU Temperature" -> just "Temperature" -- the reading + LED
-      // already make clear what it's measuring, per the user's ask to
-      // drop the redundant "CPU" label on this specific card.
-      const displayName = check.kind === "temperature" ? check.name.replace(/^CPU\s+/i, "") : check.name;
       card.innerHTML = `
         <div class="mon-card-top">
-          <span class="mon-card-name">${displayName}</span>
+          <span class="mon-card-name">${check.name}</span>
           ${showPill ? `<span class="mon-pill ${check.status}">${check.status}</span>` : ""}
         </div>
         <div class="mon-card-since">${check.since ? "for " + formatSince(check.since) : ""}</div>

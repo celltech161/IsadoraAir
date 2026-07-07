@@ -467,15 +467,26 @@ def api_track_list(request):
 
     q = request.GET.get("q", "").strip()
     if q:
-        qs = qs.filter(
-            Q(title__icontains=q)
-            | Q(artist__name__icontains=q)
-            | Q(album__title__icontains=q)
-        )
+        # "+" joins multiple required terms, e.g. "Pink Floyd + If" ->
+        # must match "Pink Floyd" (in any field) AND "If" (in any field).
+        # Each .filter() call below ANDs onto the queryset, while the Q()
+        # combination within one call ORs across fields for that term --
+        # a plain query with no "+" is just one term, so this is fully
+        # backward compatible with the existing single-phrase search.
+        terms = [t.strip() for t in q.split("+") if t.strip()]
+        for term in terms:
+            qs = qs.filter(
+                Q(title__icontains=term)
+                | Q(artist__name__icontains=term)
+                | Q(album__title__icontains=term)
+            )
 
     cat_id = request.GET.get("category")
     if cat_id:
-        qs = qs.filter(category_id=cat_id)
+        # Matches either the track's primary category or a secondary one
+        # (additional_categories) -- distinct() guards against the M2M
+        # join duplicating a row for a track that somehow matches both.
+        qs = qs.filter(Q(category_id=cat_id) | Q(additional_categories=cat_id)).distinct()
 
     ready = request.GET.get("ready2air")
     if ready == "true":
@@ -943,6 +954,10 @@ def api_engine_insert_track(request):
     if not track_id:
         return JsonResponse({"error": "track_id required"}, status=400)
 
+    position = body.get("position", "next")
+    if position not in ("next", "end"):
+        return JsonResponse({"error": "position must be 'next' or 'end'"}, status=400)
+
     all_items, cursor = _read_engine_queue_state()
     if not all_items:
         return JsonResponse({"error": "No active log"}, status=400)
@@ -958,7 +973,7 @@ def api_engine_insert_track(request):
         category=track.category,
     )
 
-    insert_idx = cursor
+    insert_idx = cursor if position == "next" else len(all_items)
     all_items.insert(insert_idx, new_item)
     _reposition_items(all_items)
 
@@ -1063,3 +1078,143 @@ def api_album_art(request, track_id):
     )
     result = resolve_album_art(track)
     return JsonResponse(result)
+
+
+@ensure_csrf_cookie
+def library_import_page(request):
+    categories = Category.objects.select_related("kind").order_by("kind__sort_order", "name")
+    return render(request, "library/import.html", {"categories": categories})
+
+
+def _unique_destination(dest_dir, filename):
+    """If dest_dir/filename already exists, auto-suffix (song.mp3 ->
+    song (1).mp3, song (2).mp3, ...) rather than overwriting real content
+    or rejecting the upload outright -- friendliest default for a live
+    broadcast library."""
+    candidate = dest_dir / filename
+    if not candidate.exists():
+        return candidate
+    stem = Path(filename).stem
+    suffix = Path(filename).suffix
+    n = 1
+    while True:
+        candidate = dest_dir / f"{stem} ({n}){suffix}"
+        if not candidate.exists():
+            return candidate
+        n += 1
+
+
+@require_http_methods(["POST"])
+def api_library_upload(request):
+    from django.conf import settings as django_settings
+    from django.utils.text import get_valid_filename
+
+    from library.management.commands.analyze_tracks import analyze_one_track, get_waveforms_dir
+    from library.management.commands.import_songs import SUPPORTED_EXT, parse_tags
+    from library.models import AnalysisConfig
+
+    category_id = request.POST.get("category_id")
+    if not category_id:
+        return JsonResponse({"error": "category_id required"}, status=400)
+    category = get_object_or_404(Category, pk=category_id)
+
+    uploaded_files = request.FILES.getlist("files")
+    if not uploaded_files:
+        return JsonResponse({"error": "No files uploaded"}, status=400)
+
+    library_root = Path(getattr(django_settings, "LIBRARY_ROOT", "/srv/isadoraair/music"))
+    dest_dir = library_root / category.code
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    cfg = AnalysisConfig.load()
+    cfg_values = (
+        cfg.analysis_sample_rate, cfg.analysis_window_seconds, cfg.waveform_points,
+        cfg.next_start_threshold_db, cfg.cue_in_threshold_db, cfg.cue_in_min_seconds,
+        cfg.waveform_floor_db,
+    )
+    wave_dir = get_waveforms_dir()
+
+    results = []
+    for uploaded in uploaded_files:
+        # get_valid_filename strips path separators and anything else
+        # unsafe for a filesystem name -- the client-supplied name is
+        # untrusted input, this is the only thing standing between it and
+        # a path-traversal attempt.
+        safe_name = get_valid_filename(uploaded.name)
+        ext = Path(safe_name).suffix.lower()
+        if ext not in SUPPORTED_EXT:
+            results.append({"filename": uploaded.name, "ok": False, "error": f"Unsupported file type: {ext or '(none)'}"})
+            continue
+
+        dest_path = _unique_destination(dest_dir, safe_name)
+        try:
+            with open(dest_path, "wb") as f:
+                for chunk in uploaded.chunks():
+                    f.write(chunk)
+        except OSError as exc:
+            results.append({"filename": uploaded.name, "ok": False, "error": f"Failed to write file: {exc}"})
+            continue
+
+        tags, info = parse_tags(dest_path)
+
+        def clean(val):
+            return val.replace("\x00", "").strip() if val else val
+
+        title = clean(tags.get("title")) or dest_path.stem
+        artist_name = clean(tags.get("artist")) or "Unknown Artist"
+        album_title = clean(tags.get("album")) or ""
+        album_artist_name = clean(tags.get("album_artist")) or ""
+        genre_name = clean(tags.get("genre")) or ""
+
+        artist_obj, _ = Artist.objects.get_or_create(name=artist_name)
+
+        album_obj = None
+        if album_title:
+            album_obj, _ = Album.objects.get_or_create(
+                title=album_title, album_artist=album_artist_name,
+                defaults={"year": tags.get("year")},
+            )
+
+        genre_obj = None
+        if genre_name:
+            genre_obj, _ = Genre.objects.get_or_create(name=genre_name)
+
+        track = Track.objects.create(
+            filepath=str(dest_path),
+            filename=dest_path.name,
+            format=ext.lstrip("."),
+            title=clean(title),
+            artist=artist_obj,
+            album=album_obj,
+            genre=genre_obj,
+            year=tags.get("year"),
+            track_number=tags.get("track_number"),
+            disc_number=tags.get("disc_number"),
+            duration_seconds=info.get("duration_seconds"),
+            sample_rate=info.get("sample_rate"),
+            channels=info.get("channels"),
+            bit_depth=info.get("bit_depth"),
+            category=category,
+        )
+
+        # Analyze immediately (waveform + cue points) rather than leaving
+        # a freshly-uploaded track without them until someone remembers to
+        # run analyze_tracks separately -- calling the shared
+        # analyze_one_track() directly (not the bulk command) targets
+        # exactly this track, regardless of whether older unanalyzed
+        # tracks exist elsewhere in the library.
+        row = (track.id, track.filepath, track.filename, track.duration_seconds,
+               track.title, artist_obj.name, "")
+        analyzed = analyze_one_track(row, cfg_values, wave_dir, force=False)
+
+        results.append({
+            "filename": uploaded.name,
+            "ok": True,
+            "track_id": track.id,
+            "title": track.title,
+            "artist": artist_obj.name,
+            "saved_as": dest_path.name,
+            "analyzed": analyzed,
+        })
+
+    return JsonResponse({"results": results})

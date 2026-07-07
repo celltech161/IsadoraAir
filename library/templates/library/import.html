@@ -1,0 +1,186 @@
+{% extends "base.html" %}
+
+{% block title %}Import Tracks — IsadoraAir{% endblock %}
+{% block nav_library %}class="active"{% endblock %}
+
+{% block extra_css %}
+<style>
+  .imp-panel {
+    max-width: 640px;
+  }
+
+  .imp-field {
+    margin-bottom: 1rem;
+  }
+  .imp-field label {
+    display: block;
+    font-size: 0.78rem;
+    font-weight: 600;
+    color: var(--text-muted);
+    margin-bottom: 0.35rem;
+  }
+  .imp-select {
+    width: 100%;
+    background: var(--bg-dark);
+    border: 1px solid var(--border-subtle);
+    border-radius: 8px;
+    padding: 0.5rem 0.7rem;
+    color: var(--text-main);
+    font-size: 0.85rem;
+  }
+  .imp-select:focus { outline: none; border-color: var(--accent); }
+
+  .imp-dropzone {
+    border: 2px dashed var(--border-subtle);
+    border-radius: 12px;
+    padding: 2.5rem 1.5rem;
+    text-align: center;
+    color: var(--text-muted);
+    font-size: 0.9rem;
+    cursor: pointer;
+    transition: border-color 0.15s, background 0.15s;
+  }
+  .imp-dropzone.dragover {
+    border-color: var(--accent);
+    background: rgba(34, 197, 94, 0.06);
+    color: var(--text-main);
+  }
+  .imp-dropzone strong {
+    color: var(--text-main);
+  }
+
+  .imp-results {
+    margin-top: 1.25rem;
+  }
+  .imp-result-row {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    padding: 0.5rem 0.7rem;
+    border-radius: 8px;
+    font-size: 0.82rem;
+    margin-bottom: 0.4rem;
+  }
+  .imp-result-row.ok { background: rgba(34, 197, 94, 0.08); }
+  .imp-result-row.error { background: rgba(249, 115, 115, 0.08); color: var(--danger); }
+  .imp-result-icon { flex-shrink: 0; }
+  .imp-result-name { font-weight: 600; }
+  .imp-result-detail { color: var(--text-muted); font-size: 0.78rem; }
+
+  .imp-uploading {
+    color: var(--text-muted);
+    font-size: 0.85rem;
+    margin-top: 0.75rem;
+  }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="imp-panel">
+  <div class="imp-field">
+    <label for="impCategory">Category</label>
+    <select class="imp-select" id="impCategory">
+      {% regroup categories by kind as kind_list %}
+      {% for kind in kind_list %}
+      <optgroup label="{{ kind.grouper.name }}">
+        {% for cat in kind.list %}
+        <option value="{{ cat.id }}">{{ cat.name }}</option>
+        {% endfor %}
+      </optgroup>
+      {% endfor %}
+    </select>
+  </div>
+
+  <div class="imp-dropzone" id="impDropzone">
+    <div><strong>Drag audio files here</strong>, or click to browse.</div>
+    <div style="margin-top:0.35rem;">MP3, MP2, FLAC, WAV, M4A, OGG, AIFF</div>
+  </div>
+  <input type="file" id="impFileInput" multiple accept=".mp3,.mp2,.flac,.wav,.m4a,.ogg,.oga,.aiff,.aif" style="display:none;">
+
+  <div class="imp-uploading" id="impUploading" style="display:none;">Uploading and analyzing...</div>
+  <div class="imp-results" id="impResults"></div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+function getCookie(name) {
+  let val = null;
+  document.cookie.split(';').forEach(c => {
+    c = c.trim();
+    if (c.startsWith(name + '='))
+      val = decodeURIComponent(c.substring(name.length + 1));
+  });
+  return val;
+}
+
+const dropzone = document.getElementById('impDropzone');
+const fileInput = document.getElementById('impFileInput');
+const categorySelect = document.getElementById('impCategory');
+const resultsEl = document.getElementById('impResults');
+const uploadingEl = document.getElementById('impUploading');
+
+dropzone.addEventListener('click', () => fileInput.click());
+
+dropzone.addEventListener('dragover', (e) => {
+  e.preventDefault();
+  dropzone.classList.add('dragover');
+});
+dropzone.addEventListener('dragleave', () => dropzone.classList.remove('dragover'));
+dropzone.addEventListener('drop', (e) => {
+  e.preventDefault();
+  dropzone.classList.remove('dragover');
+  if (e.dataTransfer.files.length) uploadFiles(e.dataTransfer.files);
+});
+
+fileInput.addEventListener('change', () => {
+  if (fileInput.files.length) uploadFiles(fileInput.files);
+  fileInput.value = '';
+});
+
+async function uploadFiles(fileList) {
+  const formData = new FormData();
+  formData.append('category_id', categorySelect.value);
+  for (const file of fileList) formData.append('files', file);
+
+  uploadingEl.style.display = 'block';
+  try {
+    const resp = await fetch("{% url 'library:api-library-upload' %}", {
+      method: 'POST',
+      headers: { 'X-CSRFToken': getCookie('csrftoken') },
+      body: formData,
+    });
+    const data = await resp.json();
+    renderResults(data.results || []);
+  } catch (e) {
+    resultsEl.innerHTML = '<div class="imp-result-row error">Upload failed -- check your connection and try again.</div>';
+  }
+  uploadingEl.style.display = 'none';
+}
+
+function renderResults(results) {
+  resultsEl.innerHTML = results.map(r => {
+    if (r.ok) {
+      return `
+        <div class="imp-result-row ok">
+          <span class="imp-result-icon">&#10003;</span>
+          <div>
+            <div class="imp-result-name">${r.artist} &mdash; ${r.title}</div>
+            <div class="imp-result-detail">saved as ${r.saved_as}${r.analyzed ? '' : ' (analysis pending -- run analyze_tracks)'}</div>
+          </div>
+        </div>
+      `;
+    }
+    return `
+      <div class="imp-result-row error">
+        <span class="imp-result-icon">&#10007;</span>
+        <div>
+          <div class="imp-result-name">${r.filename}</div>
+          <div class="imp-result-detail">${r.error}</div>
+        </div>
+      </div>
+    `;
+  }).join('');
+}
+</script>
+{% endblock %}

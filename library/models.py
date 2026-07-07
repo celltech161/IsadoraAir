@@ -208,6 +208,13 @@ class Track(models.Model):
 
     # --- Scheduling ---
     category = models.ForeignKey(Category, on_delete=models.SET_NULL, null=True, blank=True, related_name="tracks")
+    additional_categories = models.ManyToManyField(
+        Category, blank=True, related_name="secondary_tracks",
+        help_text="Also eligible for rotation in these categories, on top of the "
+                   "primary category above -- e.g. a blues-rock song filed under "
+                   "Blues that should also play in the Rock rotation, without a "
+                   "second physical copy of the file.",
+    )
     rotation_weight = models.PositiveSmallIntegerField(default=3)  # 0-5
     ready2air = models.BooleanField(default=False)  # gate: must be human-reviewed before entering rotation
     play_hours = ArrayField(models.PositiveSmallIntegerField(), blank=True, default=list)  # 0-23
@@ -222,6 +229,11 @@ class Track(models.Model):
     last_played_at = models.DateTimeField(null=True, blank=True)
     waveform_path = models.CharField(max_length=1024, blank=True)
     related_artists = models.CharField(max_length=500, blank=True)  # extracted feat./ft. credits
+    file_hash = models.CharField(
+        max_length=64, blank=True, db_index=True,
+        help_text="SHA-256 of the audio file's bytes, computed once by find_duplicate_tracks "
+                   "-- used to detect byte-identical copies filed under different categories.",
+    )
     remote_url = models.URLField(blank=True)  # for syndicated/remote-hosted audio, not stored locally
 
     # --- Album art cache ---
@@ -261,6 +273,45 @@ class Track(models.Model):
 
     def __str__(self):
         return f"{self.artist} - {self.title}"
+
+
+# ---------------------------------------------------------------
+# DuplicateCandidate - review-only de-dup findings from find_duplicate_tracks
+# ---------------------------------------------------------------
+
+class DuplicateCandidate(models.Model):
+    """A possible duplicate pair found by find_duplicate_tracks. Never
+    deletes anything by itself -- resolution here is just a human decision
+    recorded for apply_duplicate_resolutions to act on separately (that
+    command has its own --apply flag; without it, it only reports what it
+    WOULD do)."""
+    CONFIDENCE_CHOICES = [
+        ("exact", "Exact (identical file bytes)"),
+        ("probable", "Probable (same title/artist/duration)"),
+    ]
+    RESOLUTION_CHOICES = [
+        ("unresolved", "Unresolved"),
+        ("keep_a", "Keep A, delete B"),
+        ("keep_b", "Keep B, delete A"),
+        ("keep_both", "Keep both (not actually a duplicate)"),
+    ]
+
+    track_a = models.ForeignKey(Track, on_delete=models.CASCADE, related_name="duplicate_candidates_as_a")
+    track_b = models.ForeignKey(Track, on_delete=models.CASCADE, related_name="duplicate_candidates_as_b")
+    confidence = models.CharField(max_length=10, choices=CONFIDENCE_CHOICES)
+    resolution = models.CharField(max_length=10, choices=RESOLUTION_CHOICES, default="unresolved")
+    applied = models.BooleanField(default=False, help_text="Set by apply_duplicate_resolutions once it has actually acted on this resolution.")
+    created_at = models.DateTimeField(auto_now_add=True)
+    resolved_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-confidence", "-created_at"]
+        constraints = [
+            models.UniqueConstraint(fields=["track_a", "track_b"], name="unique_duplicate_pair"),
+        ]
+
+    def __str__(self):
+        return f"{self.track_a} <-> {self.track_b} ({self.confidence})"
 
 
 # ---------------------------------------------------------------

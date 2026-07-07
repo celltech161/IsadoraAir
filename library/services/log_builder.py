@@ -1,7 +1,7 @@
 import random
 from datetime import datetime, time, timedelta
 
-from django.db.models import Count
+from django.db.models import Count, Q
 from django.utils import timezone
 
 from library.models import (
@@ -39,6 +39,18 @@ def resolve_schedule_block(target_date, hour):
     return block
 
 
+def _tracks_for_category(category):
+    """Tracks eligible for this category's rotation -- either filed here
+    as their primary category, or tagged via additional_categories (e.g.
+    a blues-rock song filed under Blues that should also play in Rock).
+    distinct() guards against a track appearing twice if it somehow
+    matches both sides of the OR for the same category."""
+    return Track.objects.filter(
+        Q(category=category) | Q(additional_categories=category),
+        ready2air=True,
+    ).distinct()
+
+
 def get_separation(category, recency_cfg):
     artist_sep = category.artist_separation
     if artist_sep is None:
@@ -49,9 +61,7 @@ def get_separation(category, recency_cfg):
         title_sep = recency_cfg.title_separation
 
     if category.recency_mode == "proportional":
-        cat_count = Track.objects.filter(
-            category=category, ready2air=True
-        ).count()
+        cat_count = _tracks_for_category(category).count()
         if cat_count > 0:
             scale = min(cat_count / 500.0, 1.0)
             artist_sep = artist_sep * scale
@@ -128,7 +138,7 @@ def pick_track(category, exclude_track_ids, exclude_artist_ids,
     fit_mode = remaining_seconds is not None and remaining_seconds < DURATION_FIT_THRESHOLD
 
     for attempt in range(max_loosening + 1):
-        qs = Track.objects.filter(category=category, ready2air=True)
+        qs = _tracks_for_category(category)
 
         if exclude_track_ids:
             qs = qs.exclude(id__in=exclude_track_ids)
@@ -167,7 +177,7 @@ def pick_track(category, exclude_track_ids, exclude_artist_ids,
         exclude_track_ids = loosened_exclude_tracks
         exclude_artist_ids = loosened_exclude_artists
 
-    qs = Track.objects.filter(category=category, ready2air=True)
+    qs = _tracks_for_category(category)
     if fit_mode:
         return _pick_best_fit(qs, remaining_seconds)
     return qs.order_by("?").first()

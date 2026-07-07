@@ -346,6 +346,12 @@
     width: 100%;
     border-collapse: collapse;
     font-size: 0.82rem;
+    /* No copy/paste or lookup use case on these rows -- without this,
+       a touch-drag reads as a long-press to mobile Safari/Chrome,
+       triggering their native text-selection magnifier mid-gesture. */
+    -webkit-touch-callout: none;
+    -webkit-user-select: none;
+    user-select: none;
   }
 
   table.queue-table th {
@@ -392,8 +398,8 @@
   }
   .qt-next-btn:hover { color: var(--accent); border-color: var(--accent); }
 
-  table.queue-table tr[draggable="true"] { cursor: grab; }
-  table.queue-table tr[draggable="true"]:active { cursor: grabbing; }
+  table.queue-table .qt-drag-handle { cursor: grab; touch-action: none; }
+  table.queue-table .qt-drag-handle:active { cursor: grabbing; }
   table.queue-table tr.drag-over td { border-top: 2px solid var(--accent); }
   table.queue-table tr.dragging td { opacity: 0.3; }
 
@@ -406,7 +412,7 @@
 
   /* --- Queue search insert --- */
   .queue-insert {
-    margin-top: 0.6rem;
+    margin-bottom: 1.25rem;
     position: relative;
   }
 
@@ -445,13 +451,24 @@
     align-items: center;
     gap: 0.4rem;
     padding: 0.4rem 0.6rem;
-    cursor: pointer;
     font-size: 0.78rem;
     transition: background 0.1s;
   }
   .qir-item:hover { background: rgba(148, 163, 184, 0.1); }
   .qir-item .qir-artist { color: var(--text-muted); font-size: 0.72rem; }
   .qir-item .qir-dur { color: var(--text-muted); font-size: 0.7rem; margin-left: auto; }
+  .qir-btn {
+    background: transparent;
+    border: 1px solid var(--border-subtle);
+    border-radius: 6px;
+    color: var(--text-muted);
+    font-size: 0.68rem;
+    padding: 0.15rem 0.45rem;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: color 0.1s, border-color 0.1s;
+  }
+  .qir-btn:hover { color: var(--accent); border-color: var(--accent); }
 </style>
 {% endblock %}
 
@@ -474,6 +491,11 @@
 </div>
 
 <div class="queue-panel" id="queuePanel">
+  <div class="queue-insert">
+    <input type="text" class="queue-insert-input" id="queueInsertSearch"
+           placeholder="Search to add track...">
+    <div class="queue-insert-results" id="queueInsertResults"></div>
+  </div>
   <h3>Coming Up</h3>
   <div class="queue-table-wrap">
     <table class="queue-table">
@@ -493,11 +515,6 @@
         <tr><td colspan="8" class="queue-empty">No queue data</td></tr>
       </tbody>
     </table>
-  </div>
-  <div class="queue-insert">
-    <input type="text" class="queue-insert-input" id="queueInsertSearch"
-           placeholder="Search to add track...">
-    <div class="queue-insert-results" id="queueInsertResults"></div>
   </div>
 </div>
 {% endblock %}
@@ -995,8 +1012,8 @@ function renderQueue(data) {
   queueItemIds = queue.map(q => q.item_id);
 
   list.innerHTML = queue.map((q, i) => `
-    <tr draggable="true" data-item-id="${q.item_id}" style="background-color: ${q.fill_color || 'transparent'};">
-      <td class="qt-pos" style="cursor:grab;">&#9776;</td>
+    <tr data-item-id="${q.item_id}" style="background-color: ${q.fill_color || 'transparent'};">
+      <td class="qt-pos qt-drag-handle">&#9776;</td>
       <td class="qt-pos">${i + 1}</td>
       <td>${esc(q.artist)}</td>
       <td>${esc(q.title)}</td>
@@ -1011,32 +1028,65 @@ function renderQueue(data) {
 }
 
 function initQueueDrag() {
+  // Pointer Events instead of native HTML5 drag-and-drop -- the native
+  // draggable="true" API never fires for touch input on any mobile
+  // browser (not a missing polyfill, the spec just doesn't wire it up),
+  // so dragging the queue to reorder it was mouse-only. Pointer Events
+  // unify mouse/touch/pen into one event stream, so this same code
+  // handles both. Drag now starts from the qt-drag-handle cell
+  // specifically (not anywhere on the row) -- necessary on touch so the
+  // rest of the row keeps behaving like normal scrollable content, and
+  // pointer capture keeps events targeting the handle even as the
+  // finger/cursor moves over other rows during the drag.
   const list = document.getElementById('queueList');
   let dragEl = null;
+  let activePointerId = null;
 
-  list.querySelectorAll('tr[draggable]').forEach(row => {
-    row.addEventListener('dragstart', () => {
+  function rowAtPoint(x, y) {
+    const el = document.elementFromPoint(x, y);
+    const row = el && el.closest('tr');
+    return (row && list.contains(row)) ? row : null;
+  }
+
+  function clearDragOver() {
+    list.querySelectorAll('tr.drag-over').forEach(r => r.classList.remove('drag-over'));
+  }
+
+  function endDrag() {
+    if (dragEl) dragEl.classList.remove('dragging');
+    clearDragOver();
+    dragEl = null;
+    activePointerId = null;
+    queueDragActive = false;
+  }
+
+  list.querySelectorAll('.qt-drag-handle').forEach(handle => {
+    handle.addEventListener('pointerdown', (e) => {
+      const row = handle.closest('tr');
+      if (!row) return;
       dragEl = row;
+      activePointerId = e.pointerId;
       queueDragActive = true;
       row.classList.add('dragging');
-    });
-    row.addEventListener('dragend', () => {
-      row.classList.remove('dragging');
-      list.querySelectorAll('tr').forEach(r => r.classList.remove('drag-over'));
-      dragEl = null;
-      queueDragActive = false;
-    });
-    row.addEventListener('dragover', (e) => {
+      handle.setPointerCapture(e.pointerId);
       e.preventDefault();
-      list.querySelectorAll('tr').forEach(r => r.classList.remove('drag-over'));
-      row.classList.add('drag-over');
     });
-    row.addEventListener('dragleave', () => row.classList.remove('drag-over'));
-    row.addEventListener('drop', async (e) => {
+
+    handle.addEventListener('pointermove', (e) => {
+      if (!dragEl || e.pointerId !== activePointerId) return;
       e.preventDefault();
-      row.classList.remove('drag-over');
-      if (!dragEl || dragEl === row) return;
-      list.insertBefore(dragEl, row);
+      const row = rowAtPoint(e.clientX, e.clientY);
+      clearDragOver();
+      if (row && row !== dragEl) row.classList.add('drag-over');
+    });
+
+    handle.addEventListener('pointerup', async (e) => {
+      if (!dragEl || e.pointerId !== activePointerId) return;
+      const dropRow = rowAtPoint(e.clientX, e.clientY);
+      const draggedEl = dragEl;
+      endDrag();
+      if (!dropRow || dropRow === draggedEl) return;
+      list.insertBefore(draggedEl, dropRow);
       const order = [...list.querySelectorAll('tr')].map(
         r => parseInt(r.dataset.itemId)
       );
@@ -1050,9 +1100,10 @@ function initQueueDrag() {
         headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') },
         body: JSON.stringify({ order }),
       });
-      queueDragActive = false;
       poll();
     });
+
+    handle.addEventListener('pointercancel', endDrag);
   });
 }
 
@@ -1081,7 +1132,11 @@ document.getElementById('queueInsertSearch').addEventListener('blur', function()
 });
 
 async function searchForInsert(q) {
-  const resp = await fetch(`/api/tracks/?q=${encodeURIComponent(q)}&per_page=10&ready2air=true`);
+  // 200 is the backend's own hard ceiling (Paginator per_page cap in
+  // api_track_list) -- effectively "all matches" for any realistic
+  // search term. Results list already scrolls (max-height + overflow-y
+  // on .queue-insert-results), so there's no separate paging UI needed.
+  const resp = await fetch(`/api/tracks/?q=${encodeURIComponent(q)}&per_page=200&ready2air=true`);
   if (!resp.ok) return;
   const data = await resp.json();
   const container = document.getElementById('queueInsertResults');
@@ -1092,20 +1147,22 @@ async function searchForInsert(q) {
   }
 
   container.innerHTML = data.items.map(t => `
-    <div class="qir-item" onmousedown="insertTrack(${t.id})">
+    <div class="qir-item">
       <span>${esc(t.title)}</span>
       <span class="qir-artist">${esc(t.artist)}</span>
       <span class="qir-dur">${fmtDur(t.duration_seconds)}</span>
+      <button class="qir-btn" onmousedown="event.preventDefault(); insertTrack(${t.id}, 'next')">Play Next</button>
+      <button class="qir-btn" onmousedown="event.preventDefault(); insertTrack(${t.id}, 'end')">Add to End</button>
     </div>
   `).join('');
   container.classList.add('visible');
 }
 
-async function insertTrack(trackId) {
+async function insertTrack(trackId, position) {
   await fetch('/api/engine/queue/insert/', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') },
-    body: JSON.stringify({ track_id: trackId }),
+    body: JSON.stringify({ track_id: trackId, position }),
   });
   document.getElementById('queueInsertSearch').value = '';
   document.getElementById('queueInsertResults').classList.remove('visible');

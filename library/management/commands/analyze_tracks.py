@@ -169,6 +169,82 @@ def extract_related_artists(artist, title, filename_stem):
     return ",".join(sorted(candidates)) if candidates else ""
 
 
+def get_waveforms_dir():
+    from django.conf import settings as django_settings
+    wave_dir = Path(getattr(django_settings, "WAVEFORMS_DIR", "/srv/isadoraair/waveforms"))
+    wave_dir.mkdir(parents=True, exist_ok=True)
+    return wave_dir
+
+
+def analyze_one_track(row, cfg_values, wave_dir, force):
+    """Analyze exactly one track (waveform + cue points + related artists),
+    writing results directly to the DB and a waveform JSON file. `row` is
+    (track_id, filepath, filename, duration, title, artist_name,
+    existing_related) -- the same shape as the bulk command's own
+    `.values_list(...)` rows, so both the command's loop and a one-off
+    caller (e.g. right after a fresh upload, see library/views.py's
+    api_library_upload) share this one code path instead of the upload
+    path needing its own copy of this logic. Returns True if analyzed,
+    False if skipped (missing file, decode failure, or empty waveform)."""
+    (sample_rate, window_seconds, target_points,
+     next_start_db, cue_in_db, cue_in_min, waveform_floor_db) = cfg_values
+    track_id, filepath, filename, duration, title, artist_name, existing_related = row
+    fp = Path(filepath)
+
+    if not fp.is_file():
+        print(f"  Missing file for track {track_id}: {filepath}")
+        return False
+
+    raw = decode_audio_to_pcm(fp, sample_rate)
+    if not raw:
+        return False
+
+    times, envelope_db, waveform = compute_envelope_and_waveform(
+        raw, sample_rate, window_seconds, target_points, waveform_floor_db,
+    )
+    if not waveform:
+        return False
+
+    analysis_duration = times[-1] if times else None
+    effective_duration = analysis_duration if analysis_duration else (
+        float(duration) if duration else None
+    )
+
+    next_start = detect_next_start(times, envelope_db, effective_duration, next_start_db)
+    cue_in = detect_cue_in(times, envelope_db, effective_duration, cue_in_db, cue_in_min)
+
+    filename_stem = Path(filename).stem if filename else fp.stem
+    if force or not existing_related:
+        related = extract_related_artists(artist_name, title, filename_stem)
+    else:
+        related = existing_related
+
+    out_path = wave_dir / f"{track_id}.json"
+    payload = {
+        "track_id": track_id,
+        "samples": waveform,
+        "next_start": next_start,
+        "cue_in_seconds": cue_in,
+        "analysis_duration": analysis_duration,
+    }
+    try:
+        out_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    except Exception as exc:
+        print(f"  Failed to write waveform for track {track_id}: {exc}")
+
+    update_fields = {
+        "next_start_seconds": next_start,
+        "cue_in_seconds": cue_in,
+        "waveform_path": str(out_path),
+        "related_artists": related,
+    }
+    if effective_duration and effective_duration != duration:
+        update_fields["duration_seconds"] = effective_duration
+
+    Track.objects.filter(id=track_id).update(**update_fields)
+    return True
+
+
 class Command(BaseCommand):
     help = "Analyze tracks: compute waveforms, detect cue-in and next-start points, extract related artists."
 
@@ -190,17 +266,13 @@ class Command(BaseCommand):
         limit = options["limit"]
 
         cfg = AnalysisConfig.load()
-        sample_rate = cfg.analysis_sample_rate
-        window_seconds = cfg.analysis_window_seconds
-        target_points = cfg.waveform_points
-        next_start_db = cfg.next_start_threshold_db
-        cue_in_db = cfg.cue_in_threshold_db
-        cue_in_min = cfg.cue_in_min_seconds
-        waveform_floor_db = cfg.waveform_floor_db
+        cfg_values = (
+            cfg.analysis_sample_rate, cfg.analysis_window_seconds, cfg.waveform_points,
+            cfg.next_start_threshold_db, cfg.cue_in_threshold_db, cfg.cue_in_min_seconds,
+            cfg.waveform_floor_db,
+        )
 
-        from django.conf import settings as django_settings
-        wave_dir = Path(getattr(django_settings, "WAVEFORMS_DIR", "/srv/isadoraair/waveforms"))
-        wave_dir.mkdir(parents=True, exist_ok=True)
+        wave_dir = get_waveforms_dir()
 
         qs = Track.objects.filter(filepath__isnull=False)
         if not force:
@@ -221,72 +293,12 @@ class Command(BaseCommand):
         skipped = 0
 
         for row in tracks:
-            track_id, filepath, filename, duration, title, artist_name, existing_related = row
-            fp = Path(filepath)
-
-            if not fp.is_file():
-                self.stderr.write(f"  Missing file for track {track_id}: {filepath}")
-                skipped += 1
-                continue
-
-            raw = decode_audio_to_pcm(fp, sample_rate)
-            if not raw:
-                skipped += 1
-                continue
-
-            times, envelope_db, waveform = compute_envelope_and_waveform(
-                raw, sample_rate, window_seconds, target_points, waveform_floor_db,
-            )
-            if not waveform:
-                skipped += 1
-                continue
-
-            analysis_duration = times[-1] if times else None
-            effective_duration = analysis_duration if analysis_duration else (
-                float(duration) if duration else None
-            )
-
-            next_start = detect_next_start(
-                times, envelope_db, effective_duration, next_start_db,
-            )
-            cue_in = detect_cue_in(
-                times, envelope_db, effective_duration, cue_in_db, cue_in_min,
-            )
-
-            filename_stem = Path(filename).stem if filename else fp.stem
-            if force or not existing_related:
-                related = extract_related_artists(artist_name, title, filename_stem)
+            if analyze_one_track(row, cfg_values, wave_dir, force):
+                analyzed += 1
             else:
-                related = existing_related
+                skipped += 1
 
-            out_path = wave_dir / f"{track_id}.json"
-            payload = {
-                "track_id": track_id,
-                "samples": waveform,
-                "next_start": next_start,
-                "cue_in_seconds": cue_in,
-                "analysis_duration": analysis_duration,
-            }
-            try:
-                out_path.write_text(
-                    json.dumps(payload, ensure_ascii=False), encoding="utf-8",
-                )
-            except Exception as exc:
-                self.stderr.write(f"  Failed to write waveform for track {track_id}: {exc}")
-
-            update_fields = {
-                "next_start_seconds": next_start,
-                "cue_in_seconds": cue_in,
-                "waveform_path": str(out_path),
-                "related_artists": related,
-            }
-            if effective_duration and effective_duration != duration:
-                update_fields["duration_seconds"] = effective_duration
-
-            Track.objects.filter(id=track_id).update(**update_fields)
-            analyzed += 1
-
-            if analyzed % 50 == 0:
+            if (analyzed + skipped) % 50 == 0:
                 self.stdout.write(
                     f"  ... analyzed={analyzed} skipped={skipped} "
                     f"remaining={total - analyzed - skipped}"

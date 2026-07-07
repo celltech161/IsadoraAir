@@ -44,6 +44,19 @@
     margin-left: auto;
   }
 
+  .lib-import-btn {
+    background: var(--bg-dark);
+    border: 1px solid var(--border-subtle);
+    border-radius: 8px;
+    color: var(--text-main);
+    padding: 0.45rem 0.75rem;
+    font-size: 0.8rem;
+    text-decoration: none;
+    white-space: nowrap;
+    transition: border-color 0.12s, color 0.12s;
+  }
+  .lib-import-btn:hover { border-color: var(--accent); color: var(--accent); }
+
   /* --- Bulk action bar --- */
   .bulk-bar {
     display: none;
@@ -202,6 +215,8 @@
     <option value="true">Ready to air</option>
     <option value="false">Not ready</option>
   </select>
+
+  <a href="{% url 'library:library-import' %}" class="lib-import-btn">+ Import Tracks</a>
 
   <span class="lib-stats" id="stats"></span>
 </div>
