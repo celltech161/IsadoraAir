@@ -1029,6 +1029,24 @@ def api_engine_deck_command(request, slot):
 
 @csrf_exempt
 @require_http_methods(["POST"])
+def api_engine_mic_ptt(request):
+    try:
+        body = json.loads(request.body)
+    except (json.JSONDecodeError, ValueError):
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+
+    active = body.get("active")
+    if not isinstance(active, bool):
+        return JsonResponse({"error": "active must be a boolean"}, status=400)
+
+    Path("/run/isadoraair/engine_cmd.json").write_text(
+        json.dumps({"command": "mic_ptt", "active": active}), encoding="utf-8",
+    )
+    return JsonResponse({"ok": True})
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
 def api_engine_restart(request):
     """Manual recovery button for a hung engine — restarts the
     isadoraair-engine systemd unit. Fire-and-forget (Popen, not run):

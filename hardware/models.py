@@ -97,6 +97,20 @@ class AudioInput(models.Model):
     )
     sort_order = models.PositiveSmallIntegerField(default=0)
 
+    gain_db = models.FloatField(
+        default=0.0,
+        help_text="Software gain applied to this input in the on-air mix, in dB. "
+                   "Independent of the hardware mixer controls below, which affect "
+                   "the analog capture stage itself.",
+    )
+    mixer_control_values = models.JSONField(
+        default=dict, blank=True,
+        help_text="Last-applied value per ALSA mixer control name for this input's "
+                   "card (e.g. {'Capture': 80, 'Mic Boost': True}). Populated/edited "
+                   "via the admin's dynamically-rendered control fields below -- not "
+                   "meant to be hand-edited as raw JSON.",
+    )
+
     class Meta:
         ordering = ["sort_order", "name"]
         verbose_name = "Audio Input"
@@ -104,3 +118,37 @@ class AudioInput(models.Model):
 
     def __str__(self):
         return self.name
+
+
+class DuckingConfig(models.Model):
+    """Singleton — ducks the combined deck output (not the mic) while
+    PTT is live, ramped smoothly (~500ms, see engine.py's
+    DUCK_RAMP_MS/_start_duck_ramp) rather than applied instantly, to
+    avoid a click. Read fresh by the engine every time PTT is toggled —
+    an edit here takes effect on the NEXT toggle, not retroactively for
+    an already-live mic."""
+    enabled = models.BooleanField(
+        default=False, help_text="Off by default -- nothing ducks until enabled.",
+    )
+    duck_level_db = models.FloatField(
+        default=-12.0,
+        help_text="How much to attenuate deck/program audio while the mic is "
+                   "live, in dB (negative = quieter, e.g. -12 = roughly quarter "
+                   "volume). Ramped over ~500ms on PTT toggle, not instant.",
+    )
+
+    class Meta:
+        verbose_name = "Ducking Config"
+        verbose_name_plural = "Ducking Config"
+
+    def __str__(self):
+        return "Ducking Config"
+
+    def save(self, *args, **kwargs):
+        self.pk = 1
+        super().save(*args, **kwargs)
+
+    @classmethod
+    def load(cls):
+        obj, _created = cls.objects.get_or_create(pk=1)
+        return obj

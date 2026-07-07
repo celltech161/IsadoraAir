@@ -163,10 +163,24 @@ def build_liquidsoap_script(input_device, encoders):
         # false, so the matching initial assumption here is "not blank".
         'write_silence_state(false)',
         '',
+        # Wrapped in try/catch: now_playing.json is written in-place (not
+        # atomic rename -- see engine.py's _write_now_playing for why),
+        # so file.watch's callback can race a write and read a
+        # truncated/incomplete file. An uncaught error here (real, hit in
+        # production -- a "Parse error" mid-write) kills this callback
+        # permanently: file.watch never fires again afterward, silently
+        # freezing the stream's metadata at whatever last parsed
+        # correctly until the encoder is restarted. Catching and skipping
+        # just that one invocation means the NEXT write (a moment later,
+        # once the file is fully written) updates normally instead.
         'def update_now_playing() =',
-        f'  content = file.contents({_liq_string(NOW_PLAYING_PATH)})',
-        '  parsed = metadata.json.parse(content)',
-        '  source.insert_metadata(new_track=true, parsed)',
+        '  try',
+        f'    content = file.contents({_liq_string(NOW_PLAYING_PATH)})',
+        '    parsed = metadata.json.parse(content)',
+        '    source.insert_metadata(new_track=true, parsed)',
+        '  catch err do',
+        '    print("update_now_playing: skipping malformed read (#{err})")',
+        '  end',
         'end',
         f'file.watch({_liq_string(NOW_PLAYING_PATH)}, update_now_playing)',
         # file.watch only fires on *changes* -- without this initial call,

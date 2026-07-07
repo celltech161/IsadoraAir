@@ -43,8 +43,18 @@
   }
   .playnow-btn:hover { opacity: 0.9; }
 
-  .restart-engine-btn {
+  .mic-ptt-btn {
     margin-left: auto;
+    border: 1px solid var(--border-subtle);
+    background: transparent;
+    color: var(--text-main);
+  }
+  .mic-ptt-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .mic-ptt-btn.active { background: var(--danger); color: #000; border-color: var(--danger); }
+  .mic-ptt-btn.pending { opacity: 0.6; }
+
+  .restart-engine-btn {
+    /* margin-left: auto removed -- .mic-ptt-btn now owns pushing this pair right */
     background: transparent;
     border: 1px solid var(--danger);
     color: var(--danger);
@@ -482,6 +492,7 @@
   </select>
   <button class="playnow-btn" onclick="playNow()">Play Now</button>
   <span class="playnow-msg" id="playNowMsg"></span>
+  <button class="playnow-btn mic-ptt-btn" id="micPttBtn" onclick="toggleMicPtt()" disabled>Mic: OFF</button>
   <button class="playnow-btn restart-engine-btn" onclick="restartEngine()">Restart Engine</button>
 </div>
 
@@ -625,6 +636,31 @@ async function restartEngine() {
   }
 
   msg.textContent = 'Restart requested — engine should be back shortly';
+}
+
+async function toggleMicPtt() {
+  const btn = document.getElementById('micPttBtn');
+  const desiredActive = !btn.classList.contains('active');
+  btn.classList.add('pending');
+  const resp = await fetch('/api/engine/mic-ptt/', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') },
+    body: JSON.stringify({ active: desiredActive }),
+  });
+  if (!resp.ok) btn.classList.remove('pending');
+  // Don't flip .active here -- wait for the next poll() to confirm
+  // mic_live from engine_state.json, so the button always reflects
+  // engine reality, never optimistic client state.
+}
+
+function renderMicPtt(data) {
+  const btn = document.getElementById('micPttBtn');
+  if (!btn) return;
+  btn.disabled = !data.mic_configured;
+  btn.classList.remove('pending');
+  btn.classList.toggle('active', !!data.mic_live);
+  btn.textContent = (data.mic_configured && data.mic_ok === false)
+    ? 'Mic: ERROR' : (data.mic_live ? 'Mic: LIVE' : 'Mic: OFF');
 }
 
 async function fetchStatus() {
@@ -1177,6 +1213,7 @@ async function poll() {
   const queue = data.queue || [];
   SLOTS.forEach(slot => renderDeck(slot, decks[slot], data.transport, queue, data.timestamp));
   renderQueue(data);
+  renderMicPtt(data);
 }
 
 // Poll engine status every 1 second

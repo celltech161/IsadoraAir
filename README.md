@@ -31,15 +31,36 @@ IsadoraAir manages the full music library, schedule programming, playlist genera
 - Pause/resume/eject/seek per deck, all live-controllable from the dashboard
 - Interim AGC (compressor + makeup gain + limiter) for the studio monitor output specifically, configured from its `AudioOutput` admin page
 
+**Live Studio Mic + PTT + Graceful Ducking**
+- Dashboard "Mic" button (click-to-toggle) gates a live studio mic input into the on-air mix via a two-mixer pipeline: the decks' summed output feeds a duck gain stage before joining the mic in a shared master mixer, so a track transition mid-talkover never causes a duck discontinuity
+- Optional ducking (admin enable/disable + level in dB) smoothly ramps program audio down/up over ~500ms on PTT toggle — no clicks from an instantaneous level change
+- Mic hardware controls (gain, preamp, etc.) are dynamically enumerated from the configured device's real ALSA mixer controls in admin — no hardcoded interface-specific fields, so it adapts to whatever's actually plugged in
+
 **Live Dashboard**
 - Dual-deck view (stacks on mobile) with waveform, live position, and transport controls for whichever deck is playing; the idle deck previews the next queued track
 - "Coming Up" queue table for the full remaining hour — drag-to-reorder, insert a track by search, color-coded by Category Kind
-- Manual "play a playlist now" override and a "Restart Engine" recovery button
+- Manual "play a playlist now" override, a "Restart Engine" recovery button, and the mic PTT toggle
+
+**Streaming Encoders** (`encoders/` app, `isadoraair-encoders` service)
+- Liquidsoap-backed relay to Icecast and Shoutcast (v1/v2) mounts, one process per shared ALSA capture device fanning out to every enabled stream (mp3/aac/vorbis) on that device
+- Live now-playing metadata pushed to each stream from the playback engine
+- Self-reported silence detection per feed (no second ALSA reader on the same device) surfaced to Monitoring
+
+**RBDS/RDS Encoder Client** (`rbds/` app, `isadoraair-rbds` service)
+- Sends station PS (with optional scrolling multi-frame rotation) and RadioText (RT/RT+) to StereoTool's RDS encoder, in either binary UECP or StereoTool's ASCII dialect
+- Promo rotation with priority-interrupt scheduling that returns to now-playing once shown; each message can source its text from a static field, a local file, or a URL
+- Read-only status dashboard; all configuration is admin-only
+
+**System Monitoring** (`monitoring/` app, `isadoraair-monitoring` service)
+- systemd/disk/CPU/memory/temperature/transmitter/audio-silence health checks, admin-configurable thresholds
+- Email (and SMS-via-carrier-gateway) alerting with per-check debounce and cooldown
+- Transmitter integration (Aquabroadcast COBALT) for forward/reverse power, VSWR, PA temperature, fan speed, and RF interlock
 
 **Admin & Configuration**
 - Django admin, organized into Library / Traffic / Config sections so unrelated models don't all pile into one bucket
 - Analysis Configuration (cue-in/next-start dBFS thresholds), Recency Configuration, Log Fill Configuration
 - UI Theme: site-wide color palette and nav clock styling, editable with a native color+opacity picker, no page reload required
+- django-axes login lockout on repeated failed sign-ins
 
 ## Architecture
 
@@ -60,13 +81,21 @@ IsadoraAir (Django 5.2 LTS)
 │   │   ├── run_engine.py        # Entry point for the playback engine service
 │   │   └── fix_unknown_artists.py
 │   └── templates/library/       # dashboard, schedule, playlists, library, logs, track detail
-├── hardware/                     # Audio device config (AudioOutput/AudioInput, incl. AGC settings)
+├── hardware/                     # Audio device config: AudioOutput/AudioInput (incl. AGC,
+│                                  # mic gain, dynamically-enumerated ALSA mixer controls),
+│                                  # AudioPipeline (sample rate), DuckingConfig
+├── encoders/                     # Icecast/Shoutcast streaming (Liquidsoap), own service
+├── monitoring/                   # System/service/transmitter/audio health checks, own service
+├── rbds/                         # RBDS/RDS client for StereoTool (UECP + ASCII), own service
 ├── templates/
 │   └── base.html                 # Dark-themed base template, mobile nav, live clock
 ├── deploy/
 │   ├── isadoraair.nginx
 │   ├── isadoraair-gunicorn.service
-│   └── isadoraair-engine.service # Playback engine systemd unit
+│   ├── isadoraair-engine.service      # Playback engine systemd unit
+│   ├── isadoraair-encoders.service    # Streaming encoders systemd unit
+│   ├── isadoraair-monitoring.service  # Monitoring poller systemd unit
+│   └── isadoraair-rbds.service        # RBDS/RDS client systemd unit
 └── legacy/                       # Original FastAPI prototype (reference only)
 ```
 
@@ -74,6 +103,8 @@ IsadoraAir (Django 5.2 LTS)
 
 - **Backend:** Django 5.2 LTS, PostgreSQL, Gunicorn
 - **Playback:** GStreamer 1.0 (PyGObject) — standalone engine process, IPC with Django via JSON files
+- **Streaming:** Liquidsoap — standalone encoders process relaying to Icecast/Shoutcast
+- **Hardware control:** ALSA (`amixer`/`arecord`/`aplay`) for device enumeration and mixer control
 - **Frontend:** Django templates, vanilla JavaScript (no framework)
 - **Web Server:** nginx with HTTPS (self-signed cert for LAN)
 - **Audio Analysis:** ffmpeg, mutagen
@@ -92,11 +123,15 @@ sudo apt install python3-gi gir1.2-gstreamer-1.0 gstreamer1.0-alsa \
   gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
   gstreamer1.0-plugins-ugly gstreamer1.0-libav
 
+# Liquidsoap (streaming encoders) and ALSA utils (mixer control enumeration
+# for the hardware admin, device listing)
+sudo apt install liquidsoap alsa-utils
+
 # Virtual environment (--system-site-packages so PyGObject/gi, which is an
 # OS package above, is visible inside the venv)
 python3 -m venv venv --system-site-packages
 source venv/bin/activate
-pip install django psycopg2-binary python-decouple mutagen gunicorn django-admin-sortable2
+pip install -r requirements.txt
 
 # Environment
 cp .env.example .env  # Edit with your database credentials
@@ -119,11 +154,18 @@ python manage.py runserver
 # Run the playback engine (separate process — this is what actually
 # outputs audio; runserver alone won't play anything)
 python manage.py run_engine
+
+# Optional separate processes — streaming, RDS, and health monitoring
+# each run independently and aren't required for basic playback
+python manage.py run_encoders
+python manage.py run_rbds
+python manage.py run_monitoring
 ```
 
-See `deploy/` for nginx and systemd service configs for production —
-`isadoraair-gunicorn.service` (web) and `isadoraair-engine.service`
-(playback) run as separate systemd units.
+See `deploy/` for nginx and systemd service configs for production — each
+process above (`isadoraair-gunicorn`, `isadoraair-engine`,
+`isadoraair-encoders`, `isadoraair-rbds`, `isadoraair-monitoring`) runs as
+its own systemd unit.
 
 ## Project Status
 
@@ -134,8 +176,10 @@ See `deploy/` for nginx and systemd service configs for production —
 | 3. Log builder | Complete |
 | 4. Playback engine | Complete — dual-deck GStreamer mixer, real crossfading, broadcast-clock hour handling, studio-monitor AGC |
 | 5. Live dashboard | Complete — dual-deck view, full-hour queue, manual overrides |
+| 6. Streaming, RDS & monitoring | Complete — Icecast/Shoutcast relay, StereoTool RBDS client, system/transmitter health checks with alerting |
+| 7. Studio mic + ducking | Complete — dashboard PTT, dynamically-enumerated hardware mixer controls, graceful ducking of program audio |
 
-Actively running end-to-end on a test box: schedule → log builder → playback engine → studio monitor output.
+Actively running end-to-end on a test box: schedule → log builder → playback engine → studio monitor output, plus live streaming, RDS, and monitoring.
 
 ## License
 

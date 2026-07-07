@@ -17,7 +17,7 @@ django.setup()
 
 from django.db import close_old_connections
 from django.utils import timezone
-from hardware.models import AudioOutput, AudioPipeline
+from hardware.models import AudioInput, AudioOutput, AudioPipeline, DuckingConfig
 from library.models import LogItem, PlaylistLog, Track
 from library.services.log_builder import (
     DURATION_FIT_MARGIN,
@@ -35,10 +35,19 @@ STUDIO_MONITOR_FALLBACK_DEVICE = "plughw:2,0"
 # branch simply isn't built at all (see _build_main_pipeline).
 STEREOTOOL_OUTPUT_NAME = "Stereotool Input"
 
+# Studio mic input, mixed in via a second (master) mixer downstream of
+# the deck mixer -- see _build_main_pipeline's duck_gain/master_mixer
+# split. No fallback device, same reasoning as StereoTool: if unset, the
+# mic bin simply isn't built at all.
+MIC_INPUT_NAME = "Studio Microphone 1"
+
+DUCK_RAMP_MS = 500
+DUCK_RAMP_STEPS = 20  # ~25ms per step -- smooth enough for a loudness fade, not sample-accurate automation
+
 STATE_PATH = Path("/run/isadoraair/engine_state.json")
 CMD_PATH = Path("/run/isadoraair/engine_cmd.json")
 NOW_PLAYING_PATH = Path("/run/isadoraair/now_playing.json")
-POSITION_POLL_MS = 500
+POSITION_POLL_MS = 250
 AUTO_BUILD_CHECK_SECONDS = 10
 NEXT_HOUR_LOOKAHEAD_SECONDS = 30
 CACHE_WARM_LEAD_SECONDS = 3.0
@@ -75,6 +84,14 @@ class PlaybackEngine:
         self.agc_makeup = None
         self.agc_limiter = None
         self.stereotool_sink = None
+        self.duck_gain = None
+        self.master_mixer = None
+        self.mic_ptt_valve = None
+        self.mic_gain = None
+        self.mic_ok = True
+        self.mic_live = False
+        self._mic_bin = None
+        self._duck_ramp_source_id = None
         self.pipeline_sample_rate = None
         self.main_pipeline = None
         self.decks = {"A": None, "B": None}
@@ -175,6 +192,137 @@ class PlaybackEngine:
         print(f"  AudioOutput '{STEREOTOOL_OUTPUT_NAME}' -> {configured}")
         return configured
 
+    def _resolve_mic_device(self):
+        try:
+            configured = (
+                AudioInput.objects
+                .filter(name=MIC_INPUT_NAME)
+                .values_list("device", flat=True)
+                .first()
+            )
+        except Exception as exc:
+            print(f"  Failed to read AudioInput config for '{MIC_INPUT_NAME}' ({exc}); mic disabled")
+            return None
+        if not configured:
+            print(f"  AudioInput '{MIC_INPUT_NAME}' has no device set; mic disabled")
+            return None
+        print(f"  AudioInput '{MIC_INPUT_NAME}' -> {configured}")
+        return configured
+
+    def _build_mic_chain(self):
+        """Builds the mic capture chain as its own Gst.Bin (not loose
+        elements directly in main_pipeline) so a bus watch can be
+        scoped to just this bin -- mirrors the deck bins' own
+        get_bus()/add_signal_watch()/message::error pattern (see
+        _start_next_track/_on_deck_error). Returns [] if no mic device
+        is configured; the caller treats an empty list exactly like
+        "mic not configured" (self.mic_ptt_valve/self.mic_gain stay
+        None). Unlike deck bins (decodebin's src pad appears
+        asynchronously after typefind/demux), every element here is
+        static, so the whole chain links and gets its ghost pad target
+        set immediately -- no deferred pad-added handling needed."""
+        mic_device = self._resolve_mic_device()
+        if not mic_device:
+            return []
+
+        src = Gst.ElementFactory.make("alsasrc", "mic_src")
+        src.set_property("device", mic_device)
+        convert = Gst.ElementFactory.make("audioconvert", "mic_convert")
+        resample = Gst.ElementFactory.make("audioresample", "mic_resample")
+        capsfilter = Gst.ElementFactory.make("capsfilter", "mic_caps")
+        caps = Gst.Caps.from_string(f"audio/x-raw,rate={self.pipeline_sample_rate},channels=2")
+        capsfilter.set_property("caps", caps)
+
+        # alsasrc is a genuinely live, hardware-clocked source feeding
+        # directly into audiomixer, unlike filesrc/decodebin's buffered
+        # pull-push hybrid -- this queue decouples ALSA capture cadence
+        # from the mixer's aggregation timing so a scheduling hiccup on
+        # one side doesn't glitch the whole mix. NOT leaky (unlike the
+        # StereoTool queue above): the mic feeds the *shared* master
+        # mixer, so silently dropping mic audio would be an audible
+        # glitch in the primary output, unlike the StereoTool branch
+        # which is only ever allowed to drop its own copy.
+        queue = Gst.ElementFactory.make("queue", "mic_queue")
+        queue.set_property("max-size-time", 200_000_000)  # 200ms
+        queue.set_property("max-size-buffers", 0)
+        queue.set_property("max-size-bytes", 0)
+
+        self.mic_gain = Gst.ElementFactory.make("volume", "mic_gain")
+        self._apply_mic_gain()
+
+        # The actual PTT gate. valve fully removes buffers from the
+        # stream when closed -- not just attenuated-to-zero-but-still-
+        # flowing samples like a volume element set to 0.0 would be --
+        # the stronger guarantee for a feature whose entire safety
+        # requirement is "must never bleed onto air when off."
+        self.mic_ptt_valve = Gst.ElementFactory.make("valve", "mic_ptt_valve")
+        self.mic_ptt_valve.set_property("drop", True)
+
+        mic_bin = Gst.Bin.new(f"mic_{int(time.time() * 1000)}")
+        for el in (src, convert, resample, capsfilter, queue, self.mic_gain, self.mic_ptt_valve):
+            mic_bin.add(el)
+        src.link(convert)
+        convert.link(resample)
+        resample.link(capsfilter)
+        capsfilter.link(queue)
+        queue.link(self.mic_gain)
+        self.mic_gain.link(self.mic_ptt_valve)
+
+        ghost_pad = Gst.GhostPad.new("src", self.mic_ptt_valve.get_static_pad("src"))
+        mic_bin.add_pad(ghost_pad)
+
+        # mic_bin is a plain Gst.Bin added into self.main_pipeline, not its
+        # own Gst.Pipeline (unlike deck.pipeline) -- a Bin has no bus of its
+        # own. Error messages from its children are forwarded up to the
+        # containing Pipeline's bus instead, so the watch is set up there
+        # (see _build_main_pipeline) and filtered to this bin.
+        self._mic_bin = mic_bin
+
+        self.mic_ok = True
+        return [mic_bin]
+
+    def _on_main_bus_error(self, bus, message):
+        # self.main_pipeline's bus isn't watched for anything else today
+        # (deck errors go through each deck's own dedicated Gst.Pipeline
+        # bus instead) -- filter to only react to errors that originate
+        # inside the mic bin, so this doesn't swallow/mishandle unrelated
+        # pipeline errors.
+        if self._mic_bin is None:
+            return True
+        obj = message.src
+        while obj is not None:
+            if obj == self._mic_bin:
+                return self._on_mic_error(bus, message)
+            obj = obj.get_parent()
+        return True
+
+    def _on_mic_error(self, bus, message):
+        err, debug = message.parse_error()
+        print(f"  Mic error: {err} ({debug})")
+        # Silence is the safe reaction to a runtime mic fault -- not
+        # mixer-pad surgery. This codebase's own seek/resume history
+        # already shows unlinking a live-mixer-linked bin mid-flight is
+        # the riskier operation, reserved for planned transitions, not
+        # error recovery.
+        self.mic_ok = False
+        self.mic_live = False
+        if self.mic_ptt_valve is not None:
+            self.mic_ptt_valve.set_property("drop", True)
+        return True
+
+    def _apply_mic_gain(self):
+        if self.mic_gain is None:
+            return
+        try:
+            gain_db = (
+                AudioInput.objects.filter(name=MIC_INPUT_NAME)
+                .values_list("gain_db", flat=True).first()
+            )
+        except Exception as exc:
+            print(f"  Failed to read AudioInput gain_db ({exc}); using 0dB")
+            gain_db = None
+        self.mic_gain.set_property("volume", 10 ** ((gain_db or 0.0) / 20.0))
+
     def _resolve_pipeline_sample_rate(self):
         try:
             rate = AudioPipeline.load().sample_rate
@@ -212,8 +360,25 @@ class PlaybackEngine:
         self.agc_makeup = Gst.ElementFactory.make("volume", "agc_makeup")
         self.agc_limiter = Gst.ElementFactory.make("rglimiter", "agc_limiter")
 
+        # Ducking + mic mixing: a second (master) mixer sits between the
+        # deck mixer and everything downstream (format normalization,
+        # StereoTool tap, AGC, Studio Monitor). Ducking the DECKS'
+        # combined output specifically -- rather than "lower everything"
+        # downstream of where the mic joins -- means a track transition
+        # mid-talkover never causes a duck discontinuity: duck_gain only
+        # ever sees "whatever the deck mixer already combined," it
+        # doesn't care which deck is leading. Both elements are always
+        # built, even with no mic/ducking configured -- same "permanent,
+        # inert unless engaged" approach already used for the AGC chain
+        # below (duck_gain's volume just sits at 1.0 if never triggered;
+        # master_mixer happily passes through a single input if no mic
+        # is ever linked, exactly like audiomixer already does today
+        # with only one deck active).
+        self.duck_gain = Gst.ElementFactory.make("volume", "duck_gain")
+        self.master_mixer = Gst.ElementFactory.make("audiomixer", "master_mixer")
+
         elements = [
-            self.mixer, convert, resample, capsfilter,
+            self.mixer, self.duck_gain, self.master_mixer, convert, resample, capsfilter,
             self.agc_dynamic, self.agc_makeup, self.agc_limiter,
             self.alsasink,
         ]
@@ -256,10 +421,39 @@ class PlaybackEngine:
             self.stereotool_sink.set_property("async", False)
             elements += [stereotool_tee, stereotool_queue, self.stereotool_sink]
 
+        # Mic input — only built if a device is actually configured;
+        # otherwise self.mic_ptt_valve/self.mic_gain stay None (same
+        # "topology simply narrower" approach as the StereoTool tee
+        # above), and _set_mic_ptt() no-ops if ever asked to toggle a
+        # mic that isn't there. Wrapped defensively: a configured-but-
+        # not-actually-present device (e.g. the Focusrite isn't plugged
+        # in yet) must never crash or block the rest of this pipeline
+        # from starting -- same "degrade gracefully" philosophy as
+        # _resolve_studio_monitor_device/_apply_audio_output_device.
+        mic_elements = []
+        try:
+            mic_elements = self._build_mic_chain()
+        except Exception as exc:
+            print(f"  Failed to build mic input ({exc}); mic disabled")
+            self.mic_ptt_valve = None
+            self.mic_gain = None
+            self._mic_bin = None
+        if mic_elements:
+            bus = self.main_pipeline.get_bus()
+            bus.add_signal_watch()
+            bus.connect("message::error", self._on_main_bus_error)
+        elements += mic_elements
+
         for el in elements:
             self.main_pipeline.add(el)
 
-        self.mixer.link(convert)
+        self.mixer.link(self.duck_gain)
+        duck_pad = self.master_mixer.request_pad_simple("sink_%u")
+        self.duck_gain.get_static_pad("src").link(duck_pad)
+        if mic_elements:
+            mic_pad = self.master_mixer.request_pad_simple("sink_%u")
+            mic_elements[-1].get_static_pad("src").link(mic_pad)
+        self.master_mixer.link(convert)
         convert.link(resample)
         resample.link(capsfilter)
 
@@ -929,8 +1123,67 @@ class PlaybackEngine:
                 next_hour = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
                 self._ensure_log_approved(next_hour.date(), next_hour.hour)
                 self._advance_to_next_hour_log(next_hour.date(), next_hour.hour)
+            elif cmd == "mic_ptt":
+                self._set_mic_ptt(bool(data.get("active")))
         except Exception as exc:
             print(f"  Command error: {exc}")
+
+    def _set_mic_ptt(self, active):
+        if self.mic_ptt_valve is None:
+            print("  mic_ptt requested but mic is not configured/available — ignoring")
+            return
+        self.mic_ptt_valve.set_property("drop", not active)
+        self.mic_live = active
+
+        # Ducking is read fresh from the DB on every toggle rather than
+        # needing its own live-reload command/signal -- unlike AGC
+        # (which must reflect changes to a continuously-running
+        # effect), ducking's configured values only ever matter at the
+        # instant of a PTT transition, so there's nothing to keep in
+        # sync between saves.
+        cfg = DuckingConfig.load()
+        target = (10 ** (cfg.duck_level_db / 20.0)) if (cfg.enabled and active) else 1.0
+        self._start_duck_ramp(target)
+        print(f"  Mic PTT: {'ON' if active else 'OFF'}")
+
+    def _start_duck_ramp(self, target):
+        """Ramps self.duck_gain's volume property smoothly toward
+        `target` over DUCK_RAMP_MS, via a plain recurring GLib timeout
+        (not Gst.Controller -- this codebase has no existing use of
+        GStreamer's timed-value-automation API anywhere, and introducing
+        it here for a single ~500ms fade would add real cognitive
+        overhead -- clock-timestamp scheduling, control-binding
+        lifecycle -- for no practical benefit over a plain imperative
+        step timer, the same style already used everywhere else in this
+        engine, e.g. _poll_position's own recurring callback). A
+        ~20-25ms step cadence is imperceptibly smooth for a loudness
+        fade -- this is not sample-accurate automation, it doesn't need
+        to be, it just needs to avoid the click an instantaneous level
+        change would cause.
+
+        Cancelling/replacing an in-flight ramp (PTT toggled again before
+        the previous ramp finished) is handled by reading duck_gain's
+        CURRENT live value as the new ramp's start point -- it smoothly
+        redirects toward the new target rather than jumping or fighting
+        a second concurrent timer."""
+        if self._duck_ramp_source_id is not None:
+            GLib.source_remove(self._duck_ramp_source_id)
+            self._duck_ramp_source_id = None
+        start = self.duck_gain.get_property("volume")
+        if abs(start - target) < 1e-4:
+            return
+        steps_done = [0]
+
+        def _step():
+            steps_done[0] += 1
+            frac = min(1.0, steps_done[0] / DUCK_RAMP_STEPS)
+            self.duck_gain.set_property("volume", start + (target - start) * frac)
+            if frac >= 1.0:
+                self._duck_ramp_source_id = None
+                return False  # stop the GLib timer
+            return True
+
+        self._duck_ramp_source_id = GLib.timeout_add(DUCK_RAMP_MS // DUCK_RAMP_STEPS, _step)
 
     def _pause_deck(self, slot):
         if slot not in SLOTS:
@@ -1363,6 +1616,14 @@ class PlaybackEngine:
                 "hour": self.current_log.hour if self.current_log else None,
                 "date": self.current_log.date.isoformat() if self.current_log else None,
                 "timestamp": time.time(),
+                # mic_configured distinguishes "never wired up" (button
+                # disabled) from "wired up but off"; mic_ok distinguishes
+                # "configured but currently erroring" from healthy;
+                # mic_live is the actual gate state -- the dashboard must
+                # reflect this, not optimistic client-side state.
+                "mic_configured": self.mic_ptt_valve is not None,
+                "mic_ok": self.mic_ok,
+                "mic_live": self.mic_live,
             }
 
             tmp = STATE_PATH.with_suffix(".tmp")
