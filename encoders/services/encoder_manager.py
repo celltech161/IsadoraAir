@@ -38,6 +38,7 @@ dying (a real crash, not a transient drop Liquidsoap already recovers
 from) and restart it, re-reading the current DB state for that device's
 group of encoders rather than reusing whatever was true when it last
 started."""
+import json
 import signal
 import subprocess
 import time
@@ -59,6 +60,12 @@ DEFAULT_INPUT_DEVICE = "plughw:3,1"
 HEALTH_CHECK_SECONDS = 5
 RESTART_DELAY_SECONDS = 10
 SCRIPT_DIR = Path("/run/isadoraair/liquidsoap")
+
+# Written by library/services/engine.py's _write_now_playing() on every
+# track change (station-wide, not per-device -- unlike the per-device
+# silence state above, "what's playing" isn't tied to a capture point).
+# Watched live by the generated Liquidsoap script via file.watch().
+NOW_PLAYING_PATH = "/run/isadoraair/now_playing.json"
 
 # shout2send-style protocol mapping doesn't apply here — Liquidsoap has
 # distinct operators instead: output.icecast for real Icecast 2 (mount
@@ -156,6 +163,18 @@ def build_liquidsoap_script(input_device, encoders):
         # false, so the matching initial assumption here is "not blank".
         'write_silence_state(false)',
         '',
+        'def update_now_playing() =',
+        f'  content = file.contents({_liq_string(NOW_PLAYING_PATH)})',
+        '  parsed = metadata.json.parse(content)',
+        '  source.insert_metadata(new_track=true, parsed)',
+        'end',
+        f'file.watch({_liq_string(NOW_PLAYING_PATH)}, update_now_playing)',
+        # file.watch only fires on *changes* -- without this initial call,
+        # a freshly (re)started encoder would carry no metadata until the
+        # next real track change (same "prime it once at startup" pattern
+        # as write_silence_state(false) above).
+        'update_now_playing()',
+        '',
     ]
     lines += [_output_block(encoder, "source") for encoder in encoders]
     return "\n".join(lines) + "\n"
@@ -205,6 +224,19 @@ class EncoderManager:
         self.running = False
 
     def _start_group(self, input_device, encoders):
+        # file.watch() in the generated script throws an uncaught runtime
+        # error if this file doesn't exist yet at the moment Liquidsoap
+        # calls it -- guarantee it exists (placeholder is fine) before the
+        # script is ever launched, not just on first-ever manager start.
+        if not Path(NOW_PLAYING_PATH).is_file():
+            # timestamp as a string, not a float -- see engine.py's
+            # _write_now_playing() for why (metadata.json.parse() requires
+            # a uniformly string-valued object).
+            Path(NOW_PLAYING_PATH).write_text(
+                json.dumps({"title": "", "artist": "", "timestamp": str(time.time())}),
+                encoding="utf-8",
+            )
+
         script = build_liquidsoap_script(input_device, encoders)
         script_path = SCRIPT_DIR / f"encoders_{_slug(input_device)}.liq"
         script_path.write_text(script, encoding="utf-8")

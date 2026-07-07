@@ -1,4 +1,5 @@
 import json
+import re
 import subprocess
 import time as time_mod
 from datetime import date as date_type, time
@@ -1218,3 +1219,99 @@ def api_library_upload(request):
         })
 
     return JsonResponse({"results": results})
+
+
+# Browser-native <audio> support varies by codec -- mp3/wav/ogg/m4a play
+# in every modern browser, flac is now broadly supported too, but aiff,
+# mp2, and alac may not play in some/most browsers even though the
+# server serves them correctly (ALAC in particular has poor native
+# browser support outside Safari, even though GStreamer's avdec_alac
+# decodes it fine for real on-air playback -- confirmed live). Not
+# something fixable without a much bigger on-the-fly transcoding
+# feature, so this just serves the real file as-is.
+_AUDIO_CONTENT_TYPES = {
+    "mp3": "audio/mpeg",
+    "mp2": "audio/mpeg",
+    "flac": "audio/flac",
+    "wav": "audio/wav",
+    "m4a": "audio/mp4",
+    "alac": "audio/mp4",
+    "ogg": "audio/ogg",
+    "oga": "audio/ogg",
+    "aiff": "audio/aiff",
+    "aif": "audio/aiff",
+}
+
+
+_RANGE_RE = re.compile(r"bytes=(\d*)-(\d*)")
+
+
+def _leading_id3_size(fp):
+    """Some FLAC files in this library have a non-standard ID3v2 tag
+    bolted onto the front (a common mistake from MP3-oriented tagging
+    tools) -- a real FLAC file must start with the literal bytes "fLaC",
+    no exceptions, so this breaks browsers' strict native FLAC decoders
+    even though GStreamer's decodebin (confirmed live, same element
+    engine.py uses for real on-air playback) and mutagen/ffprobe are all
+    lenient enough to find the audio data anyway. Affects ~12,000 of the
+    ~26,000 FLAC files in this library (confirmed via a real scan) --
+    not an on-air problem, purely a browser-preview one, so this skips
+    the bogus tag when SERVING the file rather than touching any real
+    file on disk. Returns the number of bytes to skip (0 if the file
+    already starts correctly)."""
+    with open(fp, "rb") as f:
+        header = f.read(10)
+    if header[:3] != b"ID3":
+        return 0
+    # ID3v2 size is "syncsafe": 4 bytes, each only using its low 7 bits.
+    size = ((header[6] & 0x7F) << 21) | ((header[7] & 0x7F) << 14) | ((header[8] & 0x7F) << 7) | (header[9] & 0x7F)
+    return 10 + size
+
+
+@require_http_methods(["GET"])
+def api_track_audio(request, pk):
+    from django.http import FileResponse, HttpResponse
+
+    track = get_object_or_404(Track, pk=pk)
+    fp = Path(track.filepath) if track.filepath else None
+    if not fp or not fp.is_file():
+        return JsonResponse({"error": "File not found on disk"}, status=404)
+
+    content_type = _AUDIO_CONTENT_TYPES.get(track.format, "application/octet-stream")
+    real_size = fp.stat().st_size
+    # Everything below is relative to this offset, not the real file --
+    # 0 for the ~14,000 FLAC files (and every non-FLAC format) that don't
+    # have the bogus leading tag.
+    skip = _leading_id3_size(fp) if track.format == "flac" else 0
+    file_size = real_size - skip
+
+    # Django's own FileResponse does NOT implement HTTP Range support
+    # (confirmed by reading django/http/response.py directly -- no Range
+    # handling exists there) despite that being an easy assumption to
+    # make. Without this, the browser's <audio> element can still play
+    # from the start, but seeking/scrubbing doesn't work properly and
+    # larger files take longer to become playable at all.
+    range_match = _RANGE_RE.match(request.META.get("HTTP_RANGE", ""))
+    if range_match:
+        start_str, end_str = range_match.groups()
+        start = int(start_str) if start_str else 0
+        end = int(end_str) if end_str else file_size - 1
+        end = min(end, file_size - 1)
+        length = end - start + 1
+
+        with open(fp, "rb") as f:
+            f.seek(skip + start)
+            chunk = f.read(length)
+
+        response = HttpResponse(chunk, status=206, content_type=content_type)
+        response["Content-Length"] = str(length)
+        response["Content-Range"] = f"bytes {start}-{end}/{file_size}"
+        response["Accept-Ranges"] = "bytes"
+        return response
+
+    f = open(fp, "rb")
+    f.seek(skip)
+    response = FileResponse(f, content_type=content_type)
+    response["Content-Length"] = str(file_size)
+    response["Accept-Ranges"] = "bytes"
+    return response

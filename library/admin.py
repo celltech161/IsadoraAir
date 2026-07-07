@@ -4,7 +4,7 @@ from django.contrib import admin
 from django.db.models import Count
 from django.http import HttpResponseRedirect
 from django.urls import reverse
-from django.utils.html import escape
+from django.utils.html import escape, format_html
 from django.utils.safestring import mark_safe
 
 from .models import (
@@ -219,6 +219,19 @@ class TrackAdmin(admin.ModelAdmin):
     # here than Django's plain multi-select for a field with this many options.
     filter_horizontal = ["additional_categories"]
     actions = [mark_ready2air, mark_not_ready2air]
+    readonly_fields = ["audio_preview"]
+
+    @admin.display(description="Preview")
+    def audio_preview(self, obj):
+        # Plays through the browser's own output device, not the studio
+        # monitor -- just a quick listen while reviewing, not a
+        # broadcast-chain feature. Native browser codec support varies
+        # (aiff/mp2 may not play in every browser even though the file is
+        # served correctly) -- not fixable without on-the-fly transcoding.
+        if not obj.pk or not obj.filepath:
+            return "(save first)"
+        url = reverse("library:api-track-audio", args=[obj.pk])
+        return format_html('<audio controls preload="none" src="{}"></audio>', url)
 
 
 @admin.register(DuplicateCandidate)
@@ -232,7 +245,46 @@ class DuplicateCandidateAdmin(admin.ModelAdmin):
     list_filter = ["confidence", "resolution", "applied"]
     search_fields = ["track_a__title", "track_a__artist__name", "track_b__title", "track_b__artist__name"]
     list_select_related = ["track_a", "track_a__artist", "track_b", "track_b__artist"]
-    readonly_fields = ["applied", "created_at", "resolved_at"]
+    readonly_fields = ["applied", "created_at", "resolved_at", "track_a_file_info", "track_b_file_info"]
+    # Without this, Django's default FK widget renders every Track (~29k)
+    # as a <select> option for both track_a and track_b -- confirmed live,
+    # this made the change page take 27s and return a 4.2MB response.
+    raw_id_fields = ["track_a", "track_b"]
+    fields = [
+        "track_a", "track_a_file_info",
+        "track_b", "track_b_file_info",
+        "confidence", "resolution", "applied", "created_at", "resolved_at",
+    ]
+
+    @admin.display(description="Track A directory / file size")
+    def track_a_file_info(self, obj):
+        return self._file_info(obj.track_a)
+
+    @admin.display(description="Track B directory / file size")
+    def track_b_file_info(self, obj):
+        return self._file_info(obj.track_b)
+
+    def _file_info(self, track):
+        # Real directory + size on disk, not just the DB's category
+        # assignment -- lets you tell at a glance whether two candidates
+        # are the literal same file (identical size) or different
+        # versions/encodes of the same song (different size), per the
+        # user's actual question.
+        import os
+        from pathlib import Path
+
+        if not track or not track.filepath:
+            return "(no filepath)"
+        fp = Path(track.filepath)
+        if not fp.is_file():
+            return f"{fp.parent} -- file missing on disk"
+        size = os.path.getsize(fp)
+        for unit in ("B", "KB", "MB", "GB"):
+            if size < 1024 or unit == "GB":
+                size_str = f"{size:.1f} {unit}" if unit != "B" else f"{size} {unit}"
+                break
+            size /= 1024
+        return f"{fp.parent} -- {size_str}"
 
 
 class RotationSlotInline(SortableTabularInline):

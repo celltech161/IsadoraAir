@@ -37,6 +37,7 @@ STEREOTOOL_OUTPUT_NAME = "Stereotool Input"
 
 STATE_PATH = Path("/run/isadoraair/engine_state.json")
 CMD_PATH = Path("/run/isadoraair/engine_cmd.json")
+NOW_PLAYING_PATH = Path("/run/isadoraair/now_playing.json")
 POSITION_POLL_MS = 500
 AUTO_BUILD_CHECK_SECONDS = 10
 NEXT_HOUR_LOOKAHEAD_SECONDS = 30
@@ -651,6 +652,8 @@ class PlaybackEngine:
             print(f"  File not found: {filepath}")
             return None
 
+        self._write_now_playing(track)
+
         src = Gst.ElementFactory.make("filesrc", None)
         src.set_property("location", filepath)
 
@@ -1237,6 +1240,51 @@ class PlaybackEngine:
             self._start_next_track()
             return False
         return True
+
+    def _write_now_playing(self, track):
+        """Tells the stream encoders (see encoders/services/encoder_manager.py,
+        which watches this exact file via Liquidsoap's file.watch) what's
+        currently playing, so listener apps can show real title/artist
+        instead of just the static station name. Called from
+        _create_deck() -- there's no single unambiguous "audible this
+        exact instant" moment during a crossfade (both decks are briefly
+        non-paused simultaneously), so this is a deliberate, standard-
+        practice approximation: update at deck-creation time rather than
+        chase an inherently fuzzy exact instant.
+
+        Honors Track.alt_send_enabled/alt_send_text (the RBDS RadioText
+        override) so the stream's metadata already matches whatever the
+        eventual real RBDS pipeline will send, rather than needing the
+        two to be reconciled after the fact."""
+        if track.alt_send_enabled and track.alt_send_text:
+            title, artist = track.alt_send_text, ""
+        else:
+            title = track.title
+            artist = track.artist.name if track.artist else ""
+        # timestamp must be a string, not a float -- Liquidsoap's
+        # metadata.json.parse() infers a strict type from the JSON shape
+        # (confirmed live) and insert_metadata() requires [(string*string)];
+        # a numeric field breaks parsing with "cannot be parsed as type
+        # {timestamp: string, _}".
+        payload = {"title": title, "artist": artist, "timestamp": str(time.time())}
+        # Deliberately NOT the usual atomic tmp-write-then-rename pattern
+        # (see hardware/signals.py's _write_engine_command) -- verified
+        # live that Liquidsoap's file.watch only survives the FIRST
+        # rename-replace of its watched path; every rename after that
+        # watches a dead inode and never fires again. A plain in-place
+        # write (same inode every time) fired reliably across many
+        # consecutive changes in the same live test. The tradeoff (a
+        # reader could see a half-written file) is acceptable here: the
+        # payload is a few dozen bytes (effectively a single write())
+        # and this is already a best-effort approximation, not a
+        # hard-guarantee feature.
+        try:
+            NOW_PLAYING_PATH.parent.mkdir(parents=True, exist_ok=True)
+            NOW_PLAYING_PATH.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        except OSError:
+            # /run/isadoraair not created yet -- matches
+            # hardware/signals.py's _write_engine_command's own convention.
+            pass
 
     def _write_state(self, transport="PLAYING"):
         try:

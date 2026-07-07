@@ -28,6 +28,7 @@ urlpatterns = [
     path('api/tracks/', views.api_track_list, name='api-track-list'),
     path('api/tracks/bulk/', views.api_track_bulk, name='api-track-bulk'),
     path('api/tracks/<int:pk>/', views.api_track_detail, name='api-track-detail'),
+    path('api/tracks/<int:pk>/audio/', views.api_track_audio, name='api-track-audio'),
     path('track/<int:pk>/', views.track_detail_page, name='track-detail'),
     path('logs/', views.logs_page, name='logs'),
     path('api/log/build/', views.api_log_build, name='api-log-build'),

@@ -7,7 +7,7 @@ from mutagen import File as MutagenFile
 
 from library.models import Album, Artist, Category, Genre, Track
 
-SUPPORTED_EXT = {".mp3", ".flac", ".wav", ".m4a", ".ogg", ".oga", ".aiff", ".aif", ".mp2"}
+SUPPORTED_EXT = {".mp3", ".flac", ".wav", ".m4a", ".ogg", ".oga", ".aiff", ".aif", ".mp2", ".alac"}
 
 
 def parse_tags(path):

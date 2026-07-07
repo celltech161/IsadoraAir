@@ -185,6 +185,8 @@
   <h1>{{ track.title }} <span class="track-artist">— {{ track.artist.name }}</span></h1>
 </div>
 
+<audio controls preload="none" src="{% url 'library:api-track-audio' track.pk %}" style="width:100%; max-width:420px; margin-bottom:1rem;"></audio>
+
 <div class="waveform-wrap" id="waveformWrap" style="display:none;">
   <canvas id="waveformCanvas"></canvas>
   <div class="waveform-legend">
