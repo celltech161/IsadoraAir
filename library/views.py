@@ -1083,8 +1083,14 @@ def api_album_art(request, track_id):
 
 @ensure_csrf_cookie
 def library_import_page(request):
+    from library.models import UploadConfig
+
     categories = Category.objects.select_related("kind").order_by("kind__sort_order", "name")
-    return render(request, "library/import.html", {"categories": categories})
+    upload_cfg = UploadConfig.load()
+    return render(request, "library/import.html", {
+        "categories": categories,
+        "max_batch_size_mb": upload_cfg.max_batch_size_mb,
+    })
 
 
 def _unique_destination(dest_dir, filename):
@@ -1112,7 +1118,7 @@ def api_library_upload(request):
 
     from library.management.commands.analyze_tracks import analyze_one_track, get_waveforms_dir
     from library.management.commands.import_songs import SUPPORTED_EXT, parse_tags
-    from library.models import AnalysisConfig
+    from library.models import AnalysisConfig, UploadConfig
 
     category_id = request.POST.get("category_id")
     if not category_id:
@@ -1122,6 +1128,20 @@ def api_library_upload(request):
     uploaded_files = request.FILES.getlist("files")
     if not uploaded_files:
         return JsonResponse({"error": "No files uploaded"}, status=400)
+
+    # Checked before any file is written to disk -- all files in one
+    # drag-and-drop/browse action count as a single batch, not per-track
+    # (nginx's own client_max_body_size ceiling works the same way; this
+    # is a separate, admin-configurable limit underneath it).
+    upload_cfg = UploadConfig.load()
+    max_batch_bytes = upload_cfg.max_batch_size_mb * 1024 * 1024
+    total_bytes = sum(f.size for f in uploaded_files)
+    if total_bytes > max_batch_bytes:
+        return JsonResponse({
+            "error": f"Batch too large: {total_bytes / (1024 * 1024):.1f}MB "
+                     f"exceeds the {upload_cfg.max_batch_size_mb}MB limit "
+                     f"(Config > Upload Configuration in admin).",
+        }, status=413)
 
     library_root = Path(getattr(django_settings, "LIBRARY_ROOT", "/srv/isadoraair/music"))
     dest_dir = library_root / category.code
@@ -1315,3 +1335,25 @@ def api_track_audio(request, pk):
     response["Content-Length"] = str(file_size)
     response["Accept-Ranges"] = "bytes"
     return response
+
+
+@require_http_methods(["POST"])
+def api_track_blocked_slot_toggle(request, pk):
+    track = get_object_or_404(Track, pk=pk)
+    try:
+        slot = int(json.loads(request.body)["slot"])
+    except (KeyError, ValueError, TypeError, json.JSONDecodeError):
+        return JsonResponse({"error": "Invalid slot"}, status=400)
+    if not (0 <= slot <= 167):
+        return JsonResponse({"error": "slot out of range"}, status=400)
+
+    blocked = set(track.blocked_slots)
+    if slot in blocked:
+        blocked.discard(slot)
+        now_blocked = False
+    else:
+        blocked.add(slot)
+        now_blocked = True
+    track.blocked_slots = sorted(blocked)
+    track.save(update_fields=["blocked_slots"])
+    return JsonResponse({"slot": slot, "blocked": now_blocked})

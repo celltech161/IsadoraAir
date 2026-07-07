@@ -29,6 +29,7 @@ urlpatterns = [
     path('api/tracks/bulk/', views.api_track_bulk, name='api-track-bulk'),
     path('api/tracks/<int:pk>/', views.api_track_detail, name='api-track-detail'),
     path('api/tracks/<int:pk>/audio/', views.api_track_audio, name='api-track-audio'),
+    path('api/tracks/<int:pk>/blocked-slots/toggle/', views.api_track_blocked_slot_toggle, name='api-track-blocked-slot-toggle'),
     path('track/<int:pk>/', views.track_detail_page, name='track-detail'),
     path('logs/', views.logs_page, name='logs'),
     path('api/log/build/', views.api_log_build, name='api-log-build'),

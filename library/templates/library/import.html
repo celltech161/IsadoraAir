@@ -94,6 +94,7 @@
   <div class="imp-dropzone" id="impDropzone">
     <div><strong>Drag audio files here</strong>, or click to browse.</div>
     <div style="margin-top:0.35rem;">MP3, MP2, FLAC, WAV, M4A, ALAC, OGG, AIFF</div>
+    <div style="margin-top:0.35rem;">Max {{ max_batch_size_mb }}MB per batch</div>
   </div>
   <input type="file" id="impFileInput" multiple accept=".mp3,.mp2,.flac,.wav,.m4a,.alac,.ogg,.oga,.aiff,.aif" style="display:none;">
 
@@ -138,7 +139,19 @@ fileInput.addEventListener('change', () => {
   fileInput.value = '';
 });
 
+const MAX_BATCH_SIZE_MB = {{ max_batch_size_mb }};
+
 async function uploadFiles(fileList) {
+  // Client-side check first -- purely a fast/friendly UX shortcut, the
+  // server enforces the same limit for real (see api_library_upload) since
+  // this check is trivially bypassable.
+  const totalBytes = Array.from(fileList).reduce((sum, f) => sum + f.size, 0);
+  const totalMb = totalBytes / (1024 * 1024);
+  if (totalMb > MAX_BATCH_SIZE_MB) {
+    resultsEl.innerHTML = `<div class="imp-result-row error">Batch too large: ${totalMb.toFixed(1)}MB exceeds the ${MAX_BATCH_SIZE_MB}MB limit (Config &gt; Upload Configuration in admin).</div>`;
+    return;
+  }
+
   const formData = new FormData();
   formData.append('category_id', categorySelect.value);
   for (const file of fileList) formData.append('files', file);
@@ -151,7 +164,11 @@ async function uploadFiles(fileList) {
       body: formData,
     });
     const data = await resp.json();
-    renderResults(data.results || []);
+    if (data.error && !data.results) {
+      resultsEl.innerHTML = `<div class="imp-result-row error">${data.error}</div>`;
+    } else {
+      renderResults(data.results || []);
+    }
   } catch (e) {
     resultsEl.innerHTML = '<div class="imp-result-row error">Upload failed -- check your connection and try again.</div>';
   }

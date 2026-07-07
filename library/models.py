@@ -2,6 +2,7 @@ from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.db import models
 from django.contrib.postgres.fields import ArrayField
+from django.contrib.postgres.indexes import GinIndex
 
 
 # ---------------------------------------------------------------
@@ -215,10 +216,21 @@ class Track(models.Model):
                    "Blues that should also play in the Rock rotation, without a "
                    "second physical copy of the file.",
     )
-    rotation_weight = models.PositiveSmallIntegerField(default=3)  # 0-5
+    rotation_weight = models.PositiveSmallIntegerField(
+        default=3,
+        help_text="0-5. Relative likelihood of being picked within its category "
+                   "(a 5 is ~6x as likely as a 0, not a guarantee) -- doesn't "
+                   "override recency separation. Use ready2air to exclude a "
+                   "track from rotation entirely.",
+    )
     ready2air = models.BooleanField(default=False)  # gate: must be human-reviewed before entering rotation
-    play_hours = ArrayField(models.PositiveSmallIntegerField(), blank=True, default=list)  # 0-23
-    play_days = ArrayField(models.PositiveSmallIntegerField(), blank=True, default=list)    # 0-6
+    blocked_slots = ArrayField(
+        models.PositiveSmallIntegerField(), blank=True, default=list,
+        help_text="Hour x day-of-week slots blocked from auto-rotation, "
+                   "encoded as day_of_week*24 + hour (day_of_week: Monday=0, "
+                   "matching Python's .weekday() and ScheduleBlock's own "
+                   "convention). Empty = always available.",
+    )
     energy = models.CharField(max_length=10, choices=ENERGY_CHOICES, blank=True)
     vocal_type = models.CharField(max_length=10, choices=VOCAL_TYPE_CHOICES, blank=True)
     end_type = models.CharField(max_length=10, choices=END_TYPE_CHOICES, default="auto")
@@ -269,6 +281,7 @@ class Track(models.Model):
         ordering = ["artist", "title"]
         indexes = [
             models.Index(fields=["category", "ready2air"]),
+            GinIndex(fields=["blocked_slots"]),
         ]
 
     def __str__(self):
@@ -659,6 +672,42 @@ class LogFillConfig(models.Model):
     @classmethod
     def load(cls):
         obj, _created = cls.objects.get_or_create(pk=1)
+        return obj
+
+
+class UploadConfig(models.Model):
+    """Singleton — limits for the drag-and-drop track upload page
+    (library/import/). Default (100) matches the real-world limit that
+    was already in effect before this field existed (nginx's
+    client_max_body_size), so nothing silently changes for existing
+    installs until someone deliberately raises it."""
+    max_batch_size_mb = models.PositiveIntegerField(
+        default=100,
+        verbose_name="Max batch size (MB)",
+        help_text="Maximum combined size of all files in one upload action "
+                   "(all files dragged/selected together count as one "
+                   "batch, not per individual track). Enforced by the app "
+                   "itself on top of nginx's own hard ceiling "
+                   "(client_max_body_size, set in "
+                   "/etc/nginx/sites-available/isadoraair) -- raising this "
+                   "above that nginx value has no effect, since nginx "
+                   "rejects the request before Django ever sees it.",
+    )
+
+    class Meta:
+        verbose_name = "Upload Configuration"
+        verbose_name_plural = "Upload Configuration"
+
+    def __str__(self):
+        return "Upload Configuration"
+
+    def save(self, *args, **kwargs):
+        self.pk = 1
+        super().save(*args, **kwargs)
+
+    @classmethod
+    def load(cls):
+        obj, _created = cls.objects.get_or_create(pk=1, defaults={"max_batch_size_mb": 100})
         return obj
 
 

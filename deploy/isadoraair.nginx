@@ -12,7 +12,7 @@ server {
     ssl_certificate_key /etc/ssl/isadoraair/selfsigned.key;
     ssl_protocols       TLSv1.2 TLSv1.3;
 
-    client_max_body_size 100M;
+    client_max_body_size 1G;
 
     location /static/ {
         alias /opt/isadoraair/staticfiles/;

@@ -377,6 +377,11 @@
   </div>
 </div>
 
+<div class="detail-section" style="margin-top:1.25rem;">
+  <h2>Rotation Availability</h2>
+  {% include "library/_blocked_slots_grid.html" with track_id=track.pk blocked_slots=track.blocked_slots %}
+</div>
+
 <div class="save-bar">
   <button class="save-btn" onclick="saveTrack()">Save Changes</button>
   <span class="save-msg" id="saveMsg">Saved</span>

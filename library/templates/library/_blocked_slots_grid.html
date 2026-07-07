@@ -1,0 +1,158 @@
+<div class="bslot-wrap">
+  <div class="bslot-legend">
+    <span class="bslot-legend-item"><span class="bslot-swatch bslot-avail"></span> Available</span>
+    <span class="bslot-legend-item"><span class="bslot-swatch bslot-blocked"></span> Blocked</span>
+  </div>
+  <div class="bslot-scroll">
+    <div class="bslot-grid" id="bslotGrid-{{ track_id }}">
+      <div class="bslot-header bslot-corner"></div>
+      <div class="bslot-header">12a</div>
+      <div class="bslot-header">1a</div>
+      <div class="bslot-header">2a</div>
+      <div class="bslot-header">3a</div>
+      <div class="bslot-header">4a</div>
+      <div class="bslot-header">5a</div>
+      <div class="bslot-header">6a</div>
+      <div class="bslot-header">7a</div>
+      <div class="bslot-header">8a</div>
+      <div class="bslot-header">9a</div>
+      <div class="bslot-header">10a</div>
+      <div class="bslot-header">11a</div>
+      <div class="bslot-header">12p</div>
+      <div class="bslot-header">1p</div>
+      <div class="bslot-header">2p</div>
+      <div class="bslot-header">3p</div>
+      <div class="bslot-header">4p</div>
+      <div class="bslot-header">5p</div>
+      <div class="bslot-header">6p</div>
+      <div class="bslot-header">7p</div>
+      <div class="bslot-header">8p</div>
+      <div class="bslot-header">9p</div>
+      <div class="bslot-header">10p</div>
+      <div class="bslot-header">11p</div>
+    </div>
+  </div>
+</div>
+
+<style>
+  /* Deliberately hardcoded colors, not var(--accent)/var(--danger) --
+     this partial is rendered both on the app's themed pages (base.html
+     defines those CSS vars from the admin-configurable UITheme model)
+     and raw inside a Django admin change form (which never loads
+     base.html or those vars at all). Values below match UITheme's
+     current accent/danger so it looks consistent on the themed pages
+     too, but blocked/available is a fixed semantic (red/green) like a
+     traffic light, not meant to track the site's brand accent color. */
+  .bslot-wrap { margin-top: 0.5rem; }
+  .bslot-legend {
+    display: flex;
+    gap: 1rem;
+    margin-bottom: 0.5rem;
+    font-size: 0.78rem;
+    color: rgba(156, 163, 175, 1);
+  }
+  .bslot-legend-item { display: inline-flex; align-items: center; gap: 0.35rem; }
+  .bslot-swatch {
+    display: inline-block;
+    width: 12px;
+    height: 12px;
+    border-radius: 3px;
+  }
+  .bslot-swatch.bslot-avail { background: rgba(34, 197, 94, 0.55); }
+  .bslot-swatch.bslot-blocked { background: rgba(249, 115, 115, 0.85); }
+
+  .bslot-scroll { overflow-x: auto; }
+
+  .bslot-grid {
+    display: grid;
+    grid-template-columns: 42px repeat(24, 32px);
+    width: max-content;
+    gap: 1px;
+    background: rgba(100, 116, 139, 0.15);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+
+  .bslot-header {
+    background: rgba(15, 23, 42, 1);
+    padding: 0.3rem 0.15rem;
+    text-align: center;
+    font-size: 0.62rem;
+    font-weight: 600;
+    color: rgba(156, 163, 175, 1);
+    user-select: none;
+  }
+  .bslot-header.bslot-corner { background: rgba(0, 0, 0, 1); }
+
+  .bslot-day-label {
+    background: rgba(15, 23, 42, 1);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.68rem;
+    font-weight: 700;
+    color: rgba(156, 163, 175, 1);
+    user-select: none;
+  }
+
+  .bslot-cell {
+    min-height: 26px;
+    cursor: pointer;
+    transition: filter 0.1s;
+    background: rgba(34, 197, 94, 0.55);
+  }
+  .bslot-cell:hover {
+    filter: brightness(1.3);
+    outline: 1px solid rgba(255,255,255,0.4);
+  }
+  .bslot-cell.bslot-blocked { background: rgba(249, 115, 115, 0.85); }
+</style>
+
+<script>
+(function () {
+  const DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+  const grid = document.getElementById("bslotGrid-{{ track_id }}");
+  const blocked = new Set({{ blocked_slots }});
+  const toggleUrl = "{% url 'library:api-track-blocked-slot-toggle' track_id %}";
+
+  function getCookie(name) {
+    let val = null;
+    document.cookie.split(';').forEach(c => {
+      c = c.trim();
+      if (c.startsWith(name + '='))
+        val = decodeURIComponent(c.substring(name.length + 1));
+    });
+    return val;
+  }
+
+  async function onCellClick(slot, cell) {
+    const resp = await fetch(toggleUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-CSRFToken': getCookie('csrftoken'),
+      },
+      body: JSON.stringify({ slot: slot }),
+    });
+    if (!resp.ok) return;
+    const data = await resp.json();
+    cell.classList.toggle('bslot-blocked', data.blocked);
+  }
+
+  for (let d = 0; d < 7; d++) {
+    const label = document.createElement('div');
+    label.className = 'bslot-day-label';
+    label.textContent = DAYS[d];
+    grid.appendChild(label);
+
+    for (let h = 0; h < 24; h++) {
+      const slot = d * 24 + h;
+      const cell = document.createElement('div');
+      cell.className = 'bslot-cell' + (blocked.has(slot) ? ' bslot-blocked' : '');
+      cell.dataset.slot = slot;
+      cell.addEventListener('click', () => onCellClick(slot, cell));
+      grid.appendChild(cell);
+    }
+  }
+})();
+</script>

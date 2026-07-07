@@ -3,6 +3,7 @@ from django import forms
 from django.contrib import admin
 from django.db.models import Count
 from django.http import HttpResponseRedirect
+from django.template.loader import render_to_string
 from django.urls import reverse
 from django.utils.html import escape, format_html
 from django.utils.safestring import mark_safe
@@ -27,6 +28,7 @@ from .models import (
     Genre,
     Track,
     UITheme,
+    UploadConfig,
 )
 
 
@@ -37,7 +39,7 @@ from .models import (
 # Every model keeps living in `library` underneath — only the admin UI
 # grouping changes.
 _TRAFFIC_MODELS = {"playlist", "rotation", "scheduleblock", "playlistlog"}
-_CONFIG_MODELS = {"analysisconfig", "recencyconfig", "uitheme", "logfillconfig"}
+_CONFIG_MODELS = {"analysisconfig", "recencyconfig", "uitheme", "logfillconfig", "uploadconfig"}
 
 
 class SectionedAdminSite(admin.AdminSite):
@@ -206,8 +208,62 @@ def mark_ready2air(modeladmin, request, queryset):
 def mark_not_ready2air(modeladmin, request, queryset):
     queryset.update(ready2air=False)
 
+class BlockedSlotsWidget(forms.Widget):
+    """Renders the same 7x24 grid partial used on the public track detail
+    page (library/_blocked_slots_grid.html) inline in the admin change
+    form. Each cell saves itself immediately via its own AJAX toggle
+    endpoint (api_track_blocked_slot_toggle) -- it is NOT part of the
+    surrounding form's normal POST data at all (no <input name=...> is
+    ever rendered), so value_from_datadict() below always re-reads the
+    live DB value rather than trusting the submitted form data. Without
+    that, clicking the main admin "Save" button for any unrelated reason
+    (e.g. fixing a typo in the title) would silently wipe out every
+    previously-toggled slot back to Django's default empty-list value."""
+
+    def __init__(self, track_id=None, *args, **kwargs):
+        self.track_id = track_id
+        super().__init__(*args, **kwargs)
+
+    def render(self, name, value, attrs=None, renderer=None):
+        if not self.track_id:
+            return mark_safe("<p>(save the track first)</p>")
+        # SimpleArrayField's own prepare_value() pre-stringifies the list
+        # into a comma-joined string (e.g. "10,50") before it ever reaches
+        # this widget, since that's what its default text-input widget
+        # expects -- confirmed live (the admin path produced a broken
+        # `new Set(10,50)` in the rendered JS before this normalization,
+        # while the plain track_detail.html include path, which passes
+        # the real Python list directly, never hit this).
+        if isinstance(value, str):
+            blocked_slots = [int(v) for v in value.split(",") if v.strip()]
+        else:
+            blocked_slots = list(value or [])
+        return mark_safe(render_to_string("library/_blocked_slots_grid.html", {
+            "track_id": self.track_id,
+            "blocked_slots": blocked_slots,
+        }))
+
+    def value_from_datadict(self, data, files, name):
+        if not self.track_id:
+            return []
+        return Track.objects.filter(pk=self.track_id).values_list(
+            "blocked_slots", flat=True
+        ).first() or []
+
+
+class TrackAdminForm(forms.ModelForm):
+    class Meta:
+        model = Track
+        fields = "__all__"
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.fields["blocked_slots"].widget = BlockedSlotsWidget(track_id=self.instance.pk)
+
+
 @admin.register(Track)
 class TrackAdmin(admin.ModelAdmin):
+    form = TrackAdminForm
     list_display = ["title", "artist", "album", "category", "duration_seconds", "ready2air"]
     list_filter = ["ready2air", "category", "additional_categories", "energy", "end_type", "format"]
     search_fields = ["title", "artist__name", "album__title"]
@@ -486,4 +542,29 @@ class LogFillConfigAdmin(admin.ModelAdmin):
         obj = LogFillConfig.load()
         return HttpResponseRedirect(
             reverse("admin:library_logfillconfig_change", args=[obj.pk])
+        )
+
+
+@admin.register(UploadConfig)
+class UploadConfigAdmin(admin.ModelAdmin):
+    fieldsets = [
+        ("Batch Limits", {
+            "fields": ["max_batch_size_mb"],
+            "description": "Applies to the drag-and-drop track upload page "
+                            "(/library/import/). Can't exceed nginx's own "
+                            "hard ceiling (client_max_body_size) -- see "
+                            "/etc/nginx/sites-available/isadoraair.",
+        }),
+    ]
+
+    def has_add_permission(self, request):
+        return not UploadConfig.objects.exists()
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+    def changelist_view(self, request, extra_context=None):
+        obj = UploadConfig.load()
+        return HttpResponseRedirect(
+            reverse("admin:library_uploadconfig_change", args=[obj.pk])
         )
