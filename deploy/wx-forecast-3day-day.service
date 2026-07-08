@@ -1,0 +1,11 @@
+[Unit]
+Description=3-day forecast announcer, day voice (Piper TTS -> WxForecast)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=jreed
+Group=jreed
+WorkingDirectory=/home/jreed/weather-ingest
+ExecStart=/home/jreed/weather-ingest/venv/bin/python /home/jreed/weather-ingest/wx_forecast.py --mode 3day --voice day

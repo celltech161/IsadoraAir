@@ -1,0 +1,19 @@
+[Unit]
+Description=Force a restart of the IsadoraAir Playback Engine ~50s after boot
+
+[Timer]
+# Monotonic (time-since-boot) timer, not a calendar one -- fires once,
+# 50s after this boot, then that's it (no OnUnitActiveSec, so it does
+# not repeat within the same boot). The engine's own first start (via
+# isadoraair-engine.service, ordered normally by the boot sequence) has
+# shown an intermittent cold-boot-only race that a 10s ExecStartPre
+# delay did NOT fix -- but every manual restart done well after boot,
+# once the system is fully settled, has worked every time. So instead
+# of guessing at a longer pre-start delay, this unconditionally forces
+# a second start at a fixed point after boot, mirroring the
+# always-worked manual-restart case rather than trying to dodge the
+# race on the first start.
+OnBootSec=50s
+
+[Install]
+WantedBy=multi-user.target

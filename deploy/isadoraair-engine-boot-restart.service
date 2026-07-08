@@ -1,0 +1,7 @@
+[Unit]
+Description=Restart isadoraair-engine.service (fired once by isadoraair-engine-boot-restart.timer)
+After=isadoraair-engine.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemctl restart isadoraair-engine.service

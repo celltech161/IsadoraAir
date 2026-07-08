@@ -16,9 +16,10 @@ os.environ.setdefault("DJANGO_SETTINGS_MODULE", "isadoraair.settings")
 django.setup()
 
 from django.db import close_old_connections
+from django.db.models import F
 from django.utils import timezone
 from hardware.models import AudioInput, AudioOutput, AudioPipeline, DuckingConfig
-from library.models import LogItem, PlaylistLog, Track
+from library.models import Category, LogItem, PlaylistLog, Track
 from library.services.log_builder import (
     DURATION_FIT_MARGIN,
     append_fill_items,
@@ -52,6 +53,7 @@ AUTO_BUILD_CHECK_SECONDS = 10
 NEXT_HOUR_LOOKAHEAD_SECONDS = 30
 CACHE_WARM_LEAD_SECONDS = 3.0
 SILENCE_PRIME_SECONDS = 0.3
+DECK_STUCK_TIMEOUT_SECONDS = 30  # generous margin past a track's own duration before assuming its EOS was missed
 SLOTS = ("A", "B")
 
 
@@ -1125,8 +1127,84 @@ class PlaybackEngine:
                 self._advance_to_next_hour_log(next_hour.date(), next_hour.hour)
             elif cmd == "mic_ptt":
                 self._set_mic_ptt(bool(data.get("active")))
+            elif cmd == "insert_urgent":
+                self._insert_urgent_next(data.get("category", "WxAlert"))
         except Exception as exc:
             print(f"  Command error: {exc}")
+
+    def _insert_urgent_next(self, category_code):
+        """Splice a track from `category_code` into the live queue at the
+        current cursor position, so it plays at the very next track
+        boundary — the same "load next track" path every normal
+        crossfade already goes through (_next_queue_item ->
+        _start_next_track). Deliberately does NOT touch a
+        currently-playing deck's live GStreamer state — a true mid-track
+        preempt carries real risk (see the seek-near-crossfade caveat
+        elsewhere in this file); this instead reuses the same
+        live-log-mutation pattern _extend_current_log_live already uses
+        safely, just inserting at the front of the queue instead of the
+        back.
+
+        category_code is expected to resolve to exactly one ready2air
+        track (e.g. WxAlert) — same "one file, always fresh on disk"
+        pattern as WxTemp/WxForecast/WxObs, delivered via
+        lib/delivery.py's sync_track_file call before this command is
+        ever fired."""
+        if not self.current_log or not self.log_items:
+            print("  insert_urgent: no live log loaded — ignoring")
+            return
+
+        close_old_connections()
+        category = Category.objects.filter(code=category_code).first()
+        if category is None:
+            print(f"  insert_urgent: unknown category {category_code!r}")
+            return
+        track = (
+            Track.objects.filter(category=category, ready2air=True)
+            .select_related("artist")
+            .first()
+        )
+        if track is None:
+            print(f"  insert_urgent: no ready2air track in category {category_code!r}")
+            return
+
+        insert_at = self._queue_cursor
+        now = timezone.localtime()
+
+        if insert_at < len(self.log_items):
+            # Shift every not-yet-played item's position up by 1 — in the
+            # DB and in-memory — so the new item sorts correctly on any
+            # future DB re-query without touching anything already played.
+            # Two-phase (through a disjoint offset range, then back down)
+            # because LogItem has a unique_together=("playlist_log",
+            # "position") constraint that Postgres checks per-row as a
+            # single ascending "+1" UPDATE executes — row N's shift to
+            # N+1 collides with row N+1's still-unshifted value before
+            # row N+1 gets its own turn. The offset makes every
+            # intermediate value disjoint from any remaining original one.
+            insert_position = self.log_items[insert_at].position
+            qs = LogItem.objects.filter(playlist_log=self.current_log, position__gte=insert_position)
+            qs.update(position=F("position") + 100000)
+            LogItem.objects.filter(
+                playlist_log=self.current_log, position__gte=insert_position + 100000,
+            ).update(position=F("position") - 99999)
+            for item in self.log_items[insert_at:]:
+                item.position += 1
+            new_position = insert_position
+        else:
+            new_position = (self.log_items[-1].position + 1) if self.log_items else 0
+
+        new_item = LogItem.objects.create(
+            playlist_log=self.current_log,
+            position=new_position,
+            scheduled_time=now,
+            track=track,
+            track_title=track.title,
+            track_artist=track.artist.name if track.artist_id else "",
+            category=category,
+        )
+        self.log_items.insert(insert_at, new_item)
+        print(f"  Inserted urgent track ({category_code}) at queue position {insert_at}: {track.title}")
 
     def _set_mic_ptt(self, active):
         if self.mic_ptt_valve is None:
@@ -1376,11 +1454,60 @@ class PlaybackEngine:
         self.log_items = fresh_items
         self._queue_cursor = new_cursor
 
+    def _check_stuck_decks(self):
+        """Watchdog for a deck whose EOS was never detected. Seen live: a
+        startup-timing race left both decks permanently deadlocked --
+        _poll_position's crossfade trigger only runs when the OTHER slot
+        is empty (see the `if not other_occupied` guard below), which is
+        correct for the normal case (EOS frees a slot, the survivor's own
+        trigger then fires) but has no escape if EOS never fires for
+        EITHER deck: neither slot ever frees, so neither trigger can ever
+        run, and playback silently stalls forever at the end of both
+        tracks with no error anywhere -- state-writing and command
+        handling keep ticking normally since they don't touch this path,
+        so nothing else looks wrong.
+
+        Recovery is deliberately NOT the normal-EOS teardown path
+        (_handle_deck_finished -> _remove_deck's synchronous
+        pipeline.set_state(Gst.State.NULL) / main_pipeline.remove() /
+        release_request_pad()) -- confirmed live that those GStreamer
+        calls can themselves block forever on a pipeline that's already
+        wedged (which is exactly the state a deck stuck here is in): a
+        first version of this watchdog that called _handle_deck_finished
+        hung the entire engine process so completely that even SIGTERM
+        was ignored for systemd's full 90s stop timeout, requiring
+        SIGKILL. Instead this only forgets the deck at the application
+        level, so _start_next_track can claim the slot and build a fresh
+        deck with its own new mixer pad. The old, wedged GStreamer bin is
+        deliberately leaked (stays linked into the mixer, silent, using a
+        small amount of memory) rather than risking another full hang --
+        a normal engine restart clears it. _next_triggered is reset too:
+        it's a single engine-wide flag, and it stayed pinned True for the
+        whole stuck period (set once, when the two boot decks were first
+        created), which would otherwise silently block the survivor's own
+        next trigger even after this frees its slot."""
+        for slot, deck in list(self.decks.items()):
+            if deck is None or deck.finished or deck.paused:
+                continue
+            duration = deck.track.duration_seconds or 0
+            if not duration:
+                continue
+            pos = self._get_deck_position(deck)
+            if pos > duration + DECK_STUCK_TIMEOUT_SECONDS:
+                print(f"  [{slot}] WATCHDOG: '{deck.track.title}' stuck at {pos:.1f}s "
+                      f"(duration {duration:.1f}s) with no EOS detected -- abandoning "
+                      f"this deck (leaking its pipeline rather than risking a hung "
+                      f"teardown) and freeing the slot.")
+                deck.finished = True
+                self.decks[slot] = None
+                self._next_triggered = False
+
     def _poll_position(self):
         if not self.running:
             return False
 
         self._check_commands()
+        self._check_stuck_decks()
         self._reload_queue_if_changed()
 
         leading = self._leading_deck()

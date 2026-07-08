@@ -1,0 +1,11 @@
+[Unit]
+Description=Weather data updater (pressure/alerts/sky condition/RDS)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=jreed
+Group=jreed
+WorkingDirectory=/home/jreed/weather-ingest
+ExecStart=/home/jreed/weather-ingest/venv/bin/python /home/jreed/weather-ingest/update_local_wx_data.py

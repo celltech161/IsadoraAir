@@ -1,0 +1,11 @@
+[Unit]
+Description=Run current-temperature announcer every 15 minutes
+
+[Timer]
+# Matches kogr-cron.txt exactly: */15 * * * *
+OnCalendar=*-*-* *:00/15:00
+Persistent=true
+RandomizedDelaySec=5
+
+[Install]
+WantedBy=timers.target

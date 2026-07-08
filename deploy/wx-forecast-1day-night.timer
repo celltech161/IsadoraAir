@@ -1,0 +1,11 @@
+[Unit]
+Description=Run 1-day (current observation) forecast announcer (night voice)
+
+[Timer]
+# Matches kogr-cron.txt exactly: 59 0,1,9,10,12,13,21,22 * * *
+OnCalendar=*-*-* 00,01,09,10,12,13,21,22:59:00
+Persistent=true
+RandomizedDelaySec=5
+
+[Install]
+WantedBy=timers.target

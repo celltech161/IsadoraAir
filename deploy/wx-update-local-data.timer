@@ -1,0 +1,11 @@
+[Unit]
+Description=Run weather data updater every 5 minutes
+
+[Timer]
+# Matches kogr-cron.txt exactly: */5 * * * *
+OnCalendar=*-*-* *:00/5:00
+Persistent=true
+RandomizedDelaySec=5
+
+[Install]
+WantedBy=timers.target
