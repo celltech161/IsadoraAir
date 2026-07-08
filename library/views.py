@@ -708,10 +708,10 @@ def _log_to_dict(log):
                 "position": item.position,
                 "scheduled_time": item.scheduled_time.isoformat(),
                 "track_id": item.track_id,
-                "title": item.track.title,
-                "artist": item.track.artist.name if item.track.artist else "",
+                "title": item.track.title if item.track else item.track_title,
+                "artist": (item.track.artist.name if item.track.artist else "") if item.track else item.track_artist,
                 "category": item.category.code if item.category else "",
-                "duration": item.track.next_start_seconds or item.track.duration_seconds or 0,
+                "duration": (item.track.next_start_seconds or item.track.duration_seconds or 0) if item.track else 0,
             }
             for item in items
         ],
@@ -826,7 +826,9 @@ def api_log_item_swap(request, item_id):
         return JsonResponse({"error": "Track not found"}, status=404)
 
     item.track = track
-    item.save(update_fields=["track"])
+    item.track_title = track.title
+    item.track_artist = track.artist.name if track.artist_id else ""
+    item.save(update_fields=["track", "track_title", "track_artist"])
 
     return JsonResponse(_log_to_dict(item.playlist_log))
 
@@ -971,6 +973,8 @@ def api_engine_insert_track(request):
         position=9999,
         scheduled_time=timezone.now(),
         track=track,
+        track_title=track.title,
+        track_artist=track.artist.name if track.artist_id else "",
         category=track.category,
     )
 
@@ -1375,3 +1379,58 @@ def api_track_blocked_slot_toggle(request, pk):
     track.blocked_slots = sorted(blocked)
     track.save(update_fields=["blocked_slots"])
     return JsonResponse({"slot": slot, "blocked": now_blocked})
+
+
+@require_http_methods(["POST"])
+def api_track_blocked_slot_toggle_row(request, pk):
+    """Flips an entire day-of-week row as a unit -- same master-toggle
+    convention as a "select all" checkbox header: if any hour in the row
+    is currently blocked, the click clears the whole row; if the row is
+    fully open, the click blocks the whole row. A single read-modify-
+    write, not 24 individual toggle calls, so the row updates atomically
+    in one request."""
+    track = get_object_or_404(Track, pk=pk)
+    try:
+        day_of_week = int(json.loads(request.body)["day_of_week"])
+    except (KeyError, ValueError, TypeError, json.JSONDecodeError):
+        return JsonResponse({"error": "Invalid day_of_week"}, status=400)
+    if not (0 <= day_of_week <= 6):
+        return JsonResponse({"error": "day_of_week out of range"}, status=400)
+
+    row_slots = [day_of_week * 24 + hour for hour in range(24)]
+    blocked = set(track.blocked_slots)
+    now_blocked = not any(s in blocked for s in row_slots)
+
+    if now_blocked:
+        blocked.update(row_slots)
+    else:
+        blocked.difference_update(row_slots)
+    track.blocked_slots = sorted(blocked)
+    track.save(update_fields=["blocked_slots"])
+    return JsonResponse({"day_of_week": day_of_week, "slots": row_slots, "blocked": now_blocked})
+
+
+@require_http_methods(["POST"])
+def api_track_blocked_slot_toggle_column(request, pk):
+    """Flips an entire hour-of-day column (all 7 days at that hour) as a
+    unit -- same master-toggle convention as toggle_row above, just
+    sliced the other way across the grid."""
+    track = get_object_or_404(Track, pk=pk)
+    try:
+        hour = int(json.loads(request.body)["hour"])
+    except (KeyError, ValueError, TypeError, json.JSONDecodeError):
+        return JsonResponse({"error": "Invalid hour"}, status=400)
+    if not (0 <= hour <= 23):
+        return JsonResponse({"error": "hour out of range"}, status=400)
+
+    column_slots = [dow * 24 + hour for dow in range(7)]
+    blocked = set(track.blocked_slots)
+    now_blocked = not any(s in blocked for s in column_slots)
+
+    if now_blocked:
+        blocked.update(column_slots)
+    else:
+        blocked.difference_update(column_slots)
+    track.blocked_slots = sorted(blocked)
+    track.save(update_fields=["blocked_slots"])
+    return JsonResponse({"hour": hour, "slots": column_slots, "blocked": now_blocked})

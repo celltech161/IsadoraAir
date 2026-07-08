@@ -6,30 +6,30 @@
   <div class="bslot-scroll">
     <div class="bslot-grid" id="bslotGrid-{{ track_id }}">
       <div class="bslot-header bslot-corner"></div>
-      <div class="bslot-header">12a</div>
-      <div class="bslot-header">1a</div>
-      <div class="bslot-header">2a</div>
-      <div class="bslot-header">3a</div>
-      <div class="bslot-header">4a</div>
-      <div class="bslot-header">5a</div>
-      <div class="bslot-header">6a</div>
-      <div class="bslot-header">7a</div>
-      <div class="bslot-header">8a</div>
-      <div class="bslot-header">9a</div>
-      <div class="bslot-header">10a</div>
-      <div class="bslot-header">11a</div>
-      <div class="bslot-header">12p</div>
-      <div class="bslot-header">1p</div>
-      <div class="bslot-header">2p</div>
-      <div class="bslot-header">3p</div>
-      <div class="bslot-header">4p</div>
-      <div class="bslot-header">5p</div>
-      <div class="bslot-header">6p</div>
-      <div class="bslot-header">7p</div>
-      <div class="bslot-header">8p</div>
-      <div class="bslot-header">9p</div>
-      <div class="bslot-header">10p</div>
-      <div class="bslot-header">11p</div>
+      <div class="bslot-header bslot-hour-header" data-hour="0">12a</div>
+      <div class="bslot-header bslot-hour-header" data-hour="1">1a</div>
+      <div class="bslot-header bslot-hour-header" data-hour="2">2a</div>
+      <div class="bslot-header bslot-hour-header" data-hour="3">3a</div>
+      <div class="bslot-header bslot-hour-header" data-hour="4">4a</div>
+      <div class="bslot-header bslot-hour-header" data-hour="5">5a</div>
+      <div class="bslot-header bslot-hour-header" data-hour="6">6a</div>
+      <div class="bslot-header bslot-hour-header" data-hour="7">7a</div>
+      <div class="bslot-header bslot-hour-header" data-hour="8">8a</div>
+      <div class="bslot-header bslot-hour-header" data-hour="9">9a</div>
+      <div class="bslot-header bslot-hour-header" data-hour="10">10a</div>
+      <div class="bslot-header bslot-hour-header" data-hour="11">11a</div>
+      <div class="bslot-header bslot-hour-header" data-hour="12">12p</div>
+      <div class="bslot-header bslot-hour-header" data-hour="13">1p</div>
+      <div class="bslot-header bslot-hour-header" data-hour="14">2p</div>
+      <div class="bslot-header bslot-hour-header" data-hour="15">3p</div>
+      <div class="bslot-header bslot-hour-header" data-hour="16">4p</div>
+      <div class="bslot-header bslot-hour-header" data-hour="17">5p</div>
+      <div class="bslot-header bslot-hour-header" data-hour="18">6p</div>
+      <div class="bslot-header bslot-hour-header" data-hour="19">7p</div>
+      <div class="bslot-header bslot-hour-header" data-hour="20">8p</div>
+      <div class="bslot-header bslot-hour-header" data-hour="21">9p</div>
+      <div class="bslot-header bslot-hour-header" data-hour="22">10p</div>
+      <div class="bslot-header bslot-hour-header" data-hour="23">11p</div>
     </div>
   </div>
 </div>
@@ -83,6 +83,14 @@
     user-select: none;
   }
   .bslot-header.bslot-corner { background: rgba(0, 0, 0, 1); }
+  .bslot-header.bslot-hour-header {
+    cursor: pointer;
+    transition: filter 0.1s;
+  }
+  .bslot-header.bslot-hour-header:hover {
+    filter: brightness(1.5);
+    outline: 1px solid rgba(255,255,255,0.4);
+  }
 
   .bslot-day-label {
     background: rgba(15, 23, 42, 1);
@@ -93,6 +101,12 @@
     font-weight: 700;
     color: rgba(156, 163, 175, 1);
     user-select: none;
+    cursor: pointer;
+    transition: filter 0.1s;
+  }
+  .bslot-day-label:hover {
+    filter: brightness(1.5);
+    outline: 1px solid rgba(255,255,255,0.4);
   }
 
   .bslot-cell {
@@ -110,10 +124,18 @@
 
 <script>
 (function () {
-  const DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+  // Display order is Sunday-first; the stored slot encoding
+  // (day_of_week*24+hour, Monday=0 matching Track.blocked_slots'
+  // established convention) stays unchanged -- DISPLAY_TO_DOW maps a
+  // display row position (0=Sun..6=Sat) to the real day_of_week value
+  // used when computing/storing `slot`.
+  const DAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+  const DISPLAY_TO_DOW = [6, 0, 1, 2, 3, 4, 5];
   const grid = document.getElementById("bslotGrid-{{ track_id }}");
   const blocked = new Set({{ blocked_slots }});
   const toggleUrl = "{% url 'library:api-track-blocked-slot-toggle' track_id %}";
+  const toggleRowUrl = "{% url 'library:api-track-blocked-slot-toggle-row' track_id %}";
+  const toggleColumnUrl = "{% url 'library:api-track-blocked-slot-toggle-column' track_id %}";
 
   function getCookie(name) {
     let val = null;
@@ -139,14 +161,56 @@
     cell.classList.toggle('bslot-blocked', data.blocked);
   }
 
+  async function onDayLabelClick(dow) {
+    const resp = await fetch(toggleRowUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-CSRFToken': getCookie('csrftoken'),
+      },
+      body: JSON.stringify({ day_of_week: dow }),
+    });
+    if (!resp.ok) return;
+    const data = await resp.json();
+    data.slots.forEach(slot => {
+      const cell = grid.querySelector(`.bslot-cell[data-slot="${slot}"]`);
+      if (cell) cell.classList.toggle('bslot-blocked', data.blocked);
+    });
+  }
+
+  async function onHourHeaderClick(hour) {
+    const resp = await fetch(toggleColumnUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-CSRFToken': getCookie('csrftoken'),
+      },
+      body: JSON.stringify({ hour: hour }),
+    });
+    if (!resp.ok) return;
+    const data = await resp.json();
+    data.slots.forEach(slot => {
+      const cell = grid.querySelector(`.bslot-cell[data-slot="${slot}"]`);
+      if (cell) cell.classList.toggle('bslot-blocked', data.blocked);
+    });
+  }
+
+  grid.querySelectorAll('.bslot-hour-header').forEach(header => {
+    header.title = 'Click to block/unblock this entire hour';
+    header.addEventListener('click', () => onHourHeaderClick(parseInt(header.dataset.hour, 10)));
+  });
+
   for (let d = 0; d < 7; d++) {
     const label = document.createElement('div');
     label.className = 'bslot-day-label';
     label.textContent = DAYS[d];
+    label.title = 'Click to block/unblock this entire day';
+    label.addEventListener('click', () => onDayLabelClick(DISPLAY_TO_DOW[d]));
     grid.appendChild(label);
 
+    const dow = DISPLAY_TO_DOW[d];
     for (let h = 0; h < 24; h++) {
-      const slot = d * 24 + h;
+      const slot = dow * 24 + h;
       const cell = document.createElement('div');
       cell.className = 'bslot-cell' + (blocked.has(slot) ? ' bslot-blocked' : '');
       cell.dataset.slot = slot;
