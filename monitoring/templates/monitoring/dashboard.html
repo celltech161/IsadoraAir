@@ -178,6 +178,25 @@
     line-height: 1.5;
   }
 
+  /* --- RBDS section (not MonitorCheck-driven -- its own live JSON
+     state file via rbds:api-status, same as /rbds/ used to render
+     directly before this moved here) --- */
+  .mon-rbds-ps-box {
+    font-family: monospace;
+    font-size: 1.1rem;
+    letter-spacing: 0.15em;
+    background: var(--bg-dark);
+    border: 1px solid var(--border-subtle);
+    border-radius: 6px;
+    padding: 0.4rem 0.6rem;
+    display: inline-block;
+  }
+  .mon-rbds-rt-text {
+    font-size: 0.95rem;
+    font-weight: 600;
+    word-break: break-word;
+  }
+
   .mon-logins-table {
     width: 100%;
     border-collapse: collapse;
@@ -205,6 +224,38 @@
 <div id="monStaleBanner" class="mon-stale-banner">Monitoring data hasn't updated recently — the monitoring service may be down.</div>
 
 <div id="monGroups"></div>
+
+<div class="mon-group">
+  <h2>RBDS</h2>
+  <div class="mon-cards">
+    <div class="mon-card">
+      <div class="mon-card-top"><span class="mon-card-name">Current PS</span></div>
+      <div class="mon-rbds-ps-box" id="rbdsPs">--------</div>
+    </div>
+
+    <div class="mon-card">
+      <div class="mon-card-top"><span class="mon-card-name">Current RT</span></div>
+      <div class="mon-rbds-rt-text" id="rbdsRt">&mdash;</div>
+      <div class="mon-card-detail" id="rbdsRtSource"></div>
+    </div>
+
+    <div class="mon-card">
+      <div class="mon-card-top"><span class="mon-card-name">Connection</span></div>
+      <div class="mon-led-row">
+        <span class="mon-led unknown" id="rbdsLed"></span>
+        <span class="mon-led-caption" id="rbdsLedCaption">Unknown</span>
+      </div>
+      <div class="mon-card-detail" id="rbdsSince"></div>
+      <div class="mon-card-detail" id="rbdsError" style="display:none; color:var(--danger);"></div>
+    </div>
+
+    <div class="mon-card">
+      <div class="mon-card-top"><span class="mon-card-name">Protocol</span></div>
+      <div class="mon-rbds-rt-text" id="rbdsProtocol">&mdash;</div>
+      <div class="mon-card-detail" id="rbdsLastSend"></div>
+    </div>
+  </div>
+</div>
 
 <div class="mon-group">
   <h2>Recent Failed Logins</h2>
@@ -527,8 +578,68 @@ async function loadRecentLogins() {
   }
 }
 
+function rbdsTimeAgo(ts) {
+  if (!ts) return "";
+  const secs = Math.max(0, Math.floor(Date.now() / 1000 - ts));
+  if (secs < 60) return `${secs}s ago`;
+  if (secs < 3600) return `${Math.floor(secs / 60)}m ago`;
+  return `${Math.floor(secs / 3600)}h ago`;
+}
+
+// Not MonitorCheck-driven -- RBDS has its own live state file/API
+// (moved here from the old /rbds/ dashboard, which is now config-only).
+async function pollRbdsStatus() {
+  try {
+    const res = await fetch("{% url 'rbds:api-status' %}");
+    const data = await res.json();
+
+    document.getElementById("rbdsPs").textContent = data.current_ps || "--------";
+    document.getElementById("rbdsRt").textContent = data.current_rt || "—";
+
+    const sourceLabel = data.rt_source === "promo"
+      ? `Promo: ${data.rt_source_name || ""}`
+      : "Now Playing";
+    document.getElementById("rbdsRtSource").textContent = data.current_rt ? sourceLabel : "";
+
+    const led = document.getElementById("rbdsLed");
+    const caption = document.getElementById("rbdsLedCaption");
+    const since = document.getElementById("rbdsSince");
+    if (data.connected) {
+      led.className = "mon-led ok";
+      caption.textContent = "OK";
+      since.textContent = data.connected_since ? `Connected since ${new Date(data.connected_since * 1000).toLocaleString()}` : "";
+    } else {
+      led.className = "mon-led critical";
+      caption.textContent = "DOWN";
+      since.textContent = data.down_since ? `Down since ${new Date(data.down_since * 1000).toLocaleString()}` : "";
+    }
+
+    const errorEl = document.getElementById("rbdsError");
+    if (data.last_error) {
+      errorEl.textContent = data.last_error;
+      errorEl.style.display = "block";
+    } else {
+      errorEl.style.display = "none";
+    }
+
+    document.getElementById("rbdsProtocol").textContent = data.protocol
+      ? `${data.protocol.toUpperCase()} / ${(data.transport || "").toUpperCase()} → ${data.host}:${data.port}`
+      : "—";
+    document.getElementById("rbdsLastSend").textContent = data.last_send_at ? `Last sent ${rbdsTimeAgo(data.last_send_at)}` : "";
+
+    if (data.stale) {
+      document.getElementById("monStaleBanner").classList.add("show");
+    }
+  } catch (e) {
+    // non-critical widget, fail quietly -- the main monStaleBanner is
+    // driven by pollStatus()'s own monitoring_state.json read, not this.
+  }
+}
+
 pollStatus();
 loadRecentLogins();
+pollRbdsStatus();
 setInterval(pollStatus, 5000);
+setInterval(pollRbdsStatus, 5000);
 </script>
 {% endblock %}
