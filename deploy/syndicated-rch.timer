@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Retro Cocktail Hour ingestion Fridays at 08:11
+
+[Timer]
+# Matches kogr-cron.txt exactly: 11 8 * * 5
+OnCalendar=Fri *-*-* 08:11:00
+Persistent=true
+RandomizedDelaySec=10
+
+[Install]
+WantedBy=timers.target

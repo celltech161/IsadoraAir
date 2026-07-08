@@ -1,0 +1,11 @@
+[Unit]
+Description=Run A Moment of Science ingestion weekdays at 08:06
+
+[Timer]
+# Matches kogr-cron.txt exactly: 06 8 * * 1-5
+OnCalendar=Mon..Fri *-*-* 08:06:00
+Persistent=true
+RandomizedDelaySec=10
+
+[Install]
+WantedBy=timers.target

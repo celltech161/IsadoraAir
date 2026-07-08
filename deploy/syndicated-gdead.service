@@ -1,0 +1,11 @@
+[Unit]
+Description=Syndicated ingestion: Grateful Dead Hour (fetch, tag, trim, deliver, analyze)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=jreed
+Group=jreed
+WorkingDirectory=/home/jreed/syndicated-ingest/gdead
+ExecStart=/home/jreed/syndicated-ingest/venv/bin/python /home/jreed/syndicated-ingest/gdead/get_gdead.py

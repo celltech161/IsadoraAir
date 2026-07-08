@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Democracy Now ingestion weekdays at 09:32
+
+[Timer]
+# Matches kogr-cron.txt exactly: 32 9 * * 1-5
+OnCalendar=Mon..Fri *-*-* 09:32:00
+Persistent=true
+RandomizedDelaySec=10
+
+[Install]
+WantedBy=timers.target

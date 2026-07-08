@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Live at Green Lady Lounge ingestion Tuesdays at 08:08
+
+[Timer]
+# Matches kogr-cron.txt exactly: 08 8 * * 2
+OnCalendar=Tue *-*-* 08:08:00
+Persistent=true
+RandomizedDelaySec=10
+
+[Install]
+WantedBy=timers.target

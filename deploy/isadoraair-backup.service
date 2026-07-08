@@ -1,0 +1,10 @@
+[Unit]
+Description=IsadoraAir Backup (DB dump + app tree + live configs, pushed via SFTP)
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=jreed
+Group=jreed
+ExecStart=/home/jreed/bin/backup_isadoraair.sh

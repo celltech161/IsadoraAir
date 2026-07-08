@@ -1,0 +1,10 @@
+[Unit]
+Description=Post now-playing to Bluesky every 2 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+Persistent=false
+
+[Install]
+WantedBy=timers.target

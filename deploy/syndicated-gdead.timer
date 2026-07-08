@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Grateful Dead Hour ingestion Mondays at 07:51
+
+[Timer]
+# Matches kogr-cron.txt exactly: 51 7 * * 1
+OnCalendar=Mon *-*-* 07:51:00
+Persistent=true
+RandomizedDelaySec=10
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,11 @@
+[Unit]
+Description=Syndicated ingestion: Live at Green Lady Lounge (scrape, tag, artwork, deliver, analyze)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=jreed
+Group=jreed
+WorkingDirectory=/home/jreed/syndicated-ingest/gll
+ExecStart=/home/jreed/syndicated-ingest/venv/bin/python /home/jreed/syndicated-ingest/gll/get_gll.py

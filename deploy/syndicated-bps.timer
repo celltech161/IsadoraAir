@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Big Picture Science ingestion Tuesdays at 07:31
+
+[Timer]
+# Matches kogr-cron.txt exactly: 31 7 * * 2
+OnCalendar=Tue *-*-* 07:31:00
+Persistent=true
+RandomizedDelaySec=10
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Kansas News Service ingestion Saturdays at 11:06
+
+[Timer]
+# Matches kogr-cron.txt exactly: 06 11 * * 6
+OnCalendar=Sat *-*-* 11:06:00
+Persistent=true
+RandomizedDelaySec=10
+
+[Install]
+WantedBy=timers.target

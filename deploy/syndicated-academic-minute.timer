@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Academic Minute ingestion weekdays at 08:01
+
+[Timer]
+# Matches kogr-cron.txt exactly: 01 8 * * 1-5
+OnCalendar=Mon..Fri *-*-* 08:01:00
+Persistent=true
+RandomizedDelaySec=10
+
+[Install]
+WantedBy=timers.target

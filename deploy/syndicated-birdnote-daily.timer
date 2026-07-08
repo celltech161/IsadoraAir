@@ -1,0 +1,11 @@
+[Unit]
+Description=Run BirdNote daily push every day at 04:16
+
+[Timer]
+# Matches kogr-cron.txt exactly: 16 4 * * *
+OnCalendar=*-*-* 04:16:00
+Persistent=true
+RandomizedDelaySec=10
+
+[Install]
+WantedBy=timers.target

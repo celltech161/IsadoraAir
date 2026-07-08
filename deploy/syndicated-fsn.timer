@@ -1,0 +1,11 @@
+[Unit]
+Description=Run FSN Weekend ingestion Saturdays at 08:11
+
+[Timer]
+# Matches kogr-cron.txt exactly: 11 8 * * 6
+OnCalendar=Sat *-*-* 08:11:00
+Persistent=true
+RandomizedDelaySec=10
+
+[Install]
+WantedBy=timers.target

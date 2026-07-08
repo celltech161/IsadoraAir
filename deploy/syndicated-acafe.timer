@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Acoustic Cafe ingestion Mondays at 07:16
+
+[Timer]
+# Matches kogr-cron.txt exactly: 16 7 * * 1
+OnCalendar=Mon *-*-* 07:16:00
+Persistent=true
+RandomizedDelaySec=10
+
+[Install]
+WantedBy=timers.target

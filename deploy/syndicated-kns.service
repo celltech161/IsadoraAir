@@ -1,0 +1,12 @@
+[Unit]
+Description=Syndicated ingestion: Kansas News Service (scrape, select, loudnorm, deliver, analyze)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=jreed
+Group=jreed
+WorkingDirectory=/home/jreed/syndicated-ingest/kns
+ExecStart=/home/jreed/syndicated-ingest/venv/bin/python /home/jreed/syndicated-ingest/kns/get_kns.py
+TimeoutStartSec=1800

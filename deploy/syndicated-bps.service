@@ -1,0 +1,12 @@
+[Unit]
+Description=Syndicated ingestion: Big Picture Science (show + promo variants, deliver, analyze)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=jreed
+Group=jreed
+WorkingDirectory=/home/jreed/syndicated-ingest/bps
+ExecStart=/home/jreed/syndicated-ingest/venv/bin/python /home/jreed/syndicated-ingest/bps/get_bps.py
+TimeoutStartSec=900

@@ -1,0 +1,12 @@
+[Unit]
+Description=Syndicated ingestion: BirdNote Daily monthly ZIP download+extract
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=jreed
+Group=jreed
+WorkingDirectory=/home/jreed/syndicated-ingest/birdnote
+ExecStart=/home/jreed/syndicated-ingest/venv/bin/python /home/jreed/syndicated-ingest/birdnote/dl_birdnote.py
+TimeoutStartSec=600

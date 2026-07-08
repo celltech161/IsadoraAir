@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Innovation Now ingestion weekdays at 08:03
+
+[Timer]
+# Matches kogr-cron.txt exactly: 03 8 * * 1-5
+OnCalendar=Mon..Fri *-*-* 08:03:00
+Persistent=true
+RandomizedDelaySec=10
+
+[Install]
+WantedBy=timers.target

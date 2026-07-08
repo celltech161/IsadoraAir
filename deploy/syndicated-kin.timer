@@ -1,0 +1,14 @@
+[Unit]
+Description=Run KIN syndicated ingestion hourly at :57, 05:00-17:00, Mon-Sat
+
+[Timer]
+# Mon-Sat only -- matches the real kogr-sc crontab, which has no KIN
+# entries at all on Sunday. dispatch.py also no-ops on days/hours with
+# nothing scheduled, but excluding Sunday here avoids a pointless wake
+# + no-op log line every hour on a day nothing ever runs.
+OnCalendar=Mon..Sat *-*-* 05,06,07,08,09,10,11,12,13,14,15,16,17:57:00
+Persistent=false
+RandomizedDelaySec=10
+
+[Install]
+WantedBy=timers.target

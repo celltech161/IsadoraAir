@@ -1,0 +1,11 @@
+[Unit]
+Description=Run The Local Show with Morgan ingestion Saturdays at 16:01
+
+[Timer]
+# Matches kogr-cron.txt exactly: 01 16 * * 6
+OnCalendar=Sat *-*-* 16:01:00
+Persistent=true
+RandomizedDelaySec=10
+
+[Install]
+WantedBy=timers.target

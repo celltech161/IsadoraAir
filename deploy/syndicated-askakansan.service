@@ -1,0 +1,11 @@
+[Unit]
+Description=Syndicated ingestion: Ask A Kansan (fetch, fit, tag, artwork, deliver, analyze)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=jreed
+Group=jreed
+WorkingDirectory=/home/jreed/syndicated-ingest/askakansan
+ExecStart=/home/jreed/syndicated-ingest/venv/bin/python /home/jreed/syndicated-ingest/askakansan/get_ask_a_kansan.py

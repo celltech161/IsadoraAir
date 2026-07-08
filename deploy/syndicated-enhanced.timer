@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Enhanced Sessions ingestion Fridays at 12:31
+
+[Timer]
+# Matches kogr-cron.txt exactly: 31 12 * * 5
+OnCalendar=Fri *-*-* 12:31:00
+Persistent=true
+RandomizedDelaySec=10
+
+[Install]
+WantedBy=timers.target

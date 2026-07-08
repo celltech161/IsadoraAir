@@ -95,7 +95,13 @@ IsadoraAir (Django 5.2 LTS)
 │   ├── isadoraair-engine.service      # Playback engine systemd unit
 │   ├── isadoraair-encoders.service    # Streaming encoders systemd unit
 │   ├── isadoraair-monitoring.service  # Monitoring poller systemd unit
-│   └── isadoraair-rbds.service        # RBDS/RDS client systemd unit
+│   ├── isadoraair-rbds.service        # RBDS/RDS client systemd unit
+│   ├── isadoraair-backup.service      # Nightly backup, oneshot
+│   ├── isadoraair-backup.timer        # Triggers the above at 03:30 daily
+│   ├── syndicated-kin.service         # KIN news ingestion, oneshot
+│   ├── syndicated-kin.timer           # Hourly :57, 05:00-17:00
+│   ├── syndicated-bsky-post.service   # Now-playing -> Bluesky, oneshot
+│   └── syndicated-bsky-post.timer     # Every 2 minutes
 └── legacy/                       # Original FastAPI prototype (reference only)
 ```
 
@@ -165,7 +171,14 @@ python manage.py run_monitoring
 See `deploy/` for nginx and systemd service configs for production — each
 process above (`isadoraair-gunicorn`, `isadoraair-engine`,
 `isadoraair-encoders`, `isadoraair-rbds`, `isadoraair-monitoring`) runs as
-its own systemd unit.
+its own systemd unit. `isadoraair-backup.timer` runs a nightly database
+dump + app tree + live-config backup, pushed off-box via SFTP — the
+script itself (`backup_isadoraair.sh`) lives outside the repo at
+`~/bin/`, alongside its `~/.iasboxbu.cred` remote-target credentials.
+`syndicated-kin.timer`/`syndicated-bsky-post.timer` run syndicated-show
+ingestion and Bluesky now-playing posts — those scripts live outside the
+repo at `~/syndicated-ingest/` (own venv, separate from this project's),
+with credentials in `~/.syndicated_ingest.cred`.
 
 ## Project Status
 

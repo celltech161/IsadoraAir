@@ -1,0 +1,12 @@
+[Unit]
+Description=Syndicated ingestion: Anjunachill On Air (login, scrape, tag, artwork, deliver, analyze)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=jreed
+Group=jreed
+WorkingDirectory=/home/jreed/syndicated-ingest/anjunachill
+ExecStart=/home/jreed/syndicated-ingest/venv/bin/python /home/jreed/syndicated-ingest/anjunachill/get_anjunachill.py
+TimeoutStartSec=600

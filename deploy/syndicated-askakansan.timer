@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Ask A Kansan ingestion Wednesdays at 08:08
+
+[Timer]
+# Matches kogr-cron.txt exactly: 08 8 * * 3
+OnCalendar=Wed *-*-* 08:08:00
+Persistent=true
+RandomizedDelaySec=10
+
+[Install]
+WantedBy=timers.target

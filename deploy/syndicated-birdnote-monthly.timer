@@ -1,0 +1,11 @@
+[Unit]
+Description=Run BirdNote monthly ZIP download+extract on the 1st at 04:02
+
+[Timer]
+# Matches kogr-cron.txt exactly: 02 4 1 * *
+OnCalendar=*-*-01 04:02:00
+Persistent=true
+RandomizedDelaySec=10
+
+[Install]
+WantedBy=timers.target

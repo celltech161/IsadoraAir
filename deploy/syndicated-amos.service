@@ -1,0 +1,11 @@
+[Unit]
+Description=Syndicated ingestion: A Moment of Science (fetch, tag, artwork, deliver, analyze)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=jreed
+Group=jreed
+WorkingDirectory=/home/jreed/syndicated-ingest/amos
+ExecStart=/home/jreed/syndicated-ingest/venv/bin/python /home/jreed/syndicated-ingest/amos/get_amos.py

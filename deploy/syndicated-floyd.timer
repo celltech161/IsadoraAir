@@ -1,0 +1,11 @@
+[Unit]
+Description=Run Floydian Slip ingestion Mondays at 07:41
+
+[Timer]
+# Matches kogr-cron.txt exactly: 41 7 * * 1
+OnCalendar=Mon *-*-* 07:41:00
+Persistent=true
+RandomizedDelaySec=10
+
+[Install]
+WantedBy=timers.target
