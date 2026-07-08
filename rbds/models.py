@@ -97,6 +97,17 @@ class RBDSConfig(models.Model):
                    "Valid range 87.6-107.9. Only used in UECP mode (ASCII has no AF command).",
     )
 
+    # --- Clock time (CT) ---
+    send_ct = models.BooleanField(
+        "Send Clock Time (CT)", default=False,
+        help_text="Sends the encoder's real-time clock (UECP MEC 0x0D) so receivers "
+                   "can auto-set their displayed clock. UECP mode only (no ASCII "
+                   "equivalent exists). Per spec the underlying fields are always UTC "
+                   "plus a separate local-offset field the receiver applies itself -- "
+                   "this is computed automatically from the server's configured "
+                   "timezone, not something to set here.",
+    )
+
     # --- now-playing / RT behavior ---
     now_playing_format = models.CharField(
         max_length=255, default="{artist} - {title}",
@@ -109,6 +120,15 @@ class RBDSConfig(models.Model):
         help_text="Tags artist/title within the RT string using StereoTool's RT+ ASCII "
                    "extension. Binary-UECP RT+ requires the ODA channel, out of scope "
                    "for this version -- RT+ is only ever sent when Protocol is ASCII.",
+    )
+    nowplaying_min_seconds = models.PositiveIntegerField(
+        default=20,
+        help_text="Now-playing is the default/continuous RT state -- RT Rotation "
+                   "Messages periodically interrupt it for their own Display Seconds, "
+                   "then control returns to now-playing. This is the floor on how long "
+                   "now-playing must show again before the next message is allowed to "
+                   "interrupt it. Not itself a rotation slot -- see the RT Rotation "
+                   "Messages page for the promo side of the rotation.",
     )
 
     class Meta:

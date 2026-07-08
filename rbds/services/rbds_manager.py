@@ -94,6 +94,10 @@ class RBDSManager:
         config = RBDSConfig.load()
         now_playing = self._read_now_playing()
 
+        # Re-read fresh every tick, same as RBDSMessage/RBDSPSFrame below --
+        # no engine restart needed for an admin edit to take effect.
+        self._rt_rotation._nowplaying_min_seconds = config.nowplaying_min_seconds
+
         ps_frames = list(
             RBDSPSFrame.objects.filter(enabled=True).order_by("sort_order").values_list("text", "hold_seconds")
         )
@@ -227,7 +231,27 @@ class RBDSManager:
             freqs = [float(f.strip()) for f in config.af_frequencies_mhz.split(",") if f.strip()]
             if freqs:
                 msg += uecp.mec_af(freqs)
+        if config.send_ct:
+            now_utc, offset_minutes = self._current_ct_fields()
+            msg += uecp.mec_ct(now_utc, offset_minutes)
         return uecp.build_frame(config.uecp_site_address, config.uecp_encoder_address, self._sqc, msg)
+
+    def _current_ct_fields(self):
+        """Fresh UTC time + the server's configured-timezone offset from
+        UTC, recomputed on every call (not cached) since this is only
+        ever built right before a real send. offset is local-minus-UTC
+        in minutes, positive east of UTC -- matches mec_ct()'s own
+        expected sign convention (see its docstring)."""
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
+        try:
+            from zoneinfo import ZoneInfo
+            from django.conf import settings
+            tz = ZoneInfo(settings.TIME_ZONE)
+            offset = now_utc.astimezone(tz).utcoffset()
+            offset_minutes = int(offset.total_seconds() // 60) if offset else 0
+        except Exception:
+            offset_minutes = 0
+        return now_utc, offset_minutes
 
     def _build_ascii_payload(self, config, ps, rt, artist, title):
         # rt is guaranteed by _resolve_rt_content() to be exactly

@@ -182,6 +182,32 @@ class UecpMecBuilderTests(SimpleTestCase):
         result = uecp.mec_rt("A" * 64, ab_flag=False)
         self.assertEqual(result[3], 65)  # 1 flags byte + 64 text chars
 
+    def test_mec_ct_matches_spec_example(self):
+        # <0D><5C><09><0C><0A><12><21><0F><02> -- spec section 3.3.37's
+        # own worked example: 1992-09-12 10:18:33.15 UTC, local offset +1h.
+        import datetime
+        dt = datetime.datetime(1992, 9, 12, 10, 18, 33, 150000, tzinfo=datetime.timezone.utc)
+        result = uecp.mec_ct(dt, offset_minutes=60)
+        self.assertEqual(result, bytes.fromhex("0D5C090C0A12210F02"))
+
+    def test_mec_ct_no_dsn_psn(self):
+        # Unlike every other mec_* here, CT has no DSN/PSN -- exactly 9
+        # bytes total (1 MEC + 8 MED), confirmed against the spec example.
+        import datetime
+        dt = datetime.datetime(2026, 1, 1, 0, 0, 0, tzinfo=datetime.timezone.utc)
+        result = uecp.mec_ct(dt, offset_minutes=0)
+        self.assertEqual(len(result), 9)
+        self.assertEqual(result[0], 0x0D)
+
+    def test_mec_ct_negative_offset(self):
+        # -300 minutes = -5h = -10 half-hours -> sign bit set, magnitude 10.
+        import datetime
+        dt = datetime.datetime(2026, 1, 1, 0, 0, 0, tzinfo=datetime.timezone.utc)
+        result = uecp.mec_ct(dt, offset_minutes=-300)
+        offset_byte = result[8]
+        self.assertEqual(offset_byte & 0x20, 0x20)  # sign bit = negative
+        self.assertEqual(offset_byte & 0x1F, 10)     # 5h = 10 half-hours
+
     def test_freq_to_af_code(self):
         self.assertEqual(uecp.freq_to_af_code(87.6), 1)
         self.assertEqual(uecp.freq_to_af_code(107.9), 204)

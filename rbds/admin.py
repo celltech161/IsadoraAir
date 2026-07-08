@@ -15,7 +15,8 @@ class RBDSConfigAdmin(admin.ModelAdmin):
         ("Identity", {"fields": ["pi_code", "station_ps", "pty", "tp", "ta", "ms"]}),
         ("DI Flags", {"fields": ["di_dynamic_pty", "di_compressed", "di_artificial_head", "di_stereo"]}),
         ("AF List", {"fields": ["af_frequencies_mhz"]}),
-        ("RadioText", {"fields": ["now_playing_format", "use_rt_plus"]}),
+        ("Clock Time (CT)", {"fields": ["send_ct"]}),
+        ("RadioText", {"fields": ["now_playing_format", "use_rt_plus", "nowplaying_min_seconds"]}),
     ]
 
     class Media:

@@ -168,6 +168,45 @@ def mec_rt(text: str, ab_flag: bool, dsn: int = 0x00, psn: int = 0x00) -> bytes:
     return bytes([0x0A, dsn, psn, mel, med0]) + text.encode("latin-1", errors="replace")
 
 
+def mec_ct(dt_utc, offset_minutes: int) -> bytes:
+    """MEC 0x0D -- Real Time Clock. Format: MEC MED(8: year-2digit,
+    month, date, hours, minutes, seconds, centiseconds, local-offset) --
+    confirmed directly against the spec's own section 3.3.37, including
+    its literal worked example: <0D><5C><09><0C><0A><12><21><0F><02> for
+    1992-09-12 10:18:33.15 UTC, offset +1h.
+
+    Deliberately NO dsn/psn here, unlike every other mec_* in this file
+    -- the spec's own format table for this command lists none, and the
+    worked example is exactly 9 bytes (1 MEC + 8 MED) with none present.
+    Makes sense semantically too: the encoder's clock is one global
+    system value, not addressed to a specific data set/programme service
+    the way PI/PS/RT are.
+
+    dt_utc must be a UTC datetime -- per spec, "Time of day is expressed
+    in terms of Co-ordinated Universal Time (UTC)"; sending local time
+    in these fields instead would be a spec violation and would make a
+    compliant receiver apply the offset TWICE. offset_minutes is
+    local-minus-UTC (e.g. -300 for UTC-5), rounded to the nearest half
+    hour and sign+magnitude coded per the spec's own bit table (bit 3 =
+    sign, 0=+/1=-; bits 4-8 = magnitude in half-hour units, max +-15.5h)."""
+    year_2digit = dt_utc.year % 100
+    half_hours = round(offset_minutes / 30)
+    sign_bit = 0x20 if half_hours < 0 else 0x00
+    magnitude = abs(half_hours) & 0x1F
+    offset_byte = sign_bit | magnitude
+    return bytes([
+        0x0D,
+        year_2digit,
+        dt_utc.month,
+        dt_utc.day,
+        dt_utc.hour,
+        dt_utc.minute,
+        dt_utc.second,
+        dt_utc.microsecond // 10000,
+        offset_byte,
+    ])
+
+
 def mec_af(frequencies_mhz: list, dsn: int = 0x00, psn: int = 0x00, start_location: int = 0x0000) -> bytes:
     """MEC 0x13 -- Alternative Frequencies. UECP envelope (MEC DSN PSN
     MEL, 2-byte start location, then AF data, then a 0x00 terminator)
