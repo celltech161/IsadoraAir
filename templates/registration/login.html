@@ -50,6 +50,18 @@
       margin: 0 auto 1.5rem;
     }
 
+    .login-logo.has-station-logo {
+      margin-bottom: 0.75rem;
+    }
+
+    .station-logo {
+      display: block;
+      max-width: 260px;
+      width: 100%;
+      height: auto;
+      margin: 0 auto 1.5rem;
+    }
+
     .login-field {
       margin-bottom: 1rem;
     }
@@ -107,7 +119,10 @@
 </head>
 <body>
   <div class="login-card">
-    <img class="login-logo" src="{% if ui_theme.logo %}{{ ui_theme.logo.url }}{% else %}{% static 'library/img/isadoraair_logo.png' %}{% endif %}" alt="IsadoraAir">
+    <img class="login-logo{% if ui_theme.station_logo %} has-station-logo{% endif %}" src="{% if ui_theme.logo %}{{ ui_theme.logo.url }}{% else %}{% static 'library/img/isadoraair_logo.png' %}{% endif %}" alt="IsadoraAir">
+    {% if ui_theme.station_logo %}
+    <img class="station-logo" src="{{ ui_theme.station_logo.url }}" alt="Station logo">
+    {% endif %}
 
     {% if form.errors %}
     <div class="login-error">Incorrect username or password.</div>

@@ -519,11 +519,21 @@ class PlaylistLog(models.Model):
 class LogItem(models.Model):
     """One scheduled track within a PlaylistLog, produced by the
     rotation walker: ScheduleBlock -> Clock -> ClockSlot -> Rotation ->
-    RotationSlot (by weight) -> Category -> Track."""
+    RotationSlot (by weight) -> Category -> Track.
+
+    track_title/track_artist are a snapshot of the track's identity at
+    the moment this LogItem was created -- kept independent of the live
+    Track row so a historical log entry stays readable (what actually
+    aired) even after the underlying Track/file is deleted (e.g. a
+    library reorganization). track itself is SET_NULL rather than
+    PROTECT for the same reason: old play history shouldn't block
+    deleting a track that's no longer wanted."""
     playlist_log = models.ForeignKey(PlaylistLog, on_delete=models.CASCADE, related_name="items")
     position = models.PositiveIntegerField()
     scheduled_time = models.DateTimeField()
-    track = models.ForeignKey(Track, on_delete=models.PROTECT, related_name="log_items")
+    track = models.ForeignKey(Track, on_delete=models.SET_NULL, null=True, blank=True, related_name="log_items")
+    track_title = models.CharField(max_length=255, blank=True, default="")
+    track_artist = models.CharField(max_length=255, blank=True, default="")
     category = models.ForeignKey(Category, on_delete=models.SET_NULL, null=True, blank=True)
     played_at = models.DateTimeField(null=True, blank=True)
 
@@ -532,7 +542,7 @@ class LogItem(models.Model):
         unique_together = [("playlist_log", "position")]
 
     def __str__(self):
-        return f"{self.playlist_log.date} #{self.position}: {self.track}"
+        return f"{self.playlist_log.date} #{self.position}: {self.track_title or self.track}"
 
 
 # ---------------------------------------------------------------
@@ -728,6 +738,7 @@ class UITheme(models.Model):
     nav_clock_color = models.CharField(max_length=50, default="rgba(249, 250, 251, 0.85)", help_text="Any CSS color value (hex, rgb, rgba).")
 
     logo = models.ImageField(upload_to="ui_theme/", blank=True, null=True, help_text="Nav bar logo. Leave blank to use the default IsadoraAir logo.")
+    station_logo = models.ImageField(upload_to="ui_theme/", blank=True, null=True, help_text="Station logo shown just below the IsadoraAir logo on the login screen. Leave blank to hide.")
 
     # --- Deck overlay (text sitting on top of album art) ---
     deck_text_shadow_color = models.CharField(

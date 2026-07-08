@@ -103,6 +103,10 @@ def get_recent_exclusions(target_datetime, artist_sep_hours, title_sep_hours,
     title_cutoff = target_datetime - timedelta(hours=title_sep_hours)
 
     for item in recent_items:
+        if not item.track_id:
+            # track was deleted after this LogItem aired (e.g. a library
+            # cleanup) -- nothing left to exclude by track/artist id.
+            continue
         if item.scheduled_time >= title_cutoff:
             exclude_track_ids.add(item.track_id)
         if item.scheduled_time >= artist_cutoff:
@@ -196,6 +200,8 @@ def pick_track(category, exclude_track_ids, exclude_artist_ids,
             artist_cutoff = target_datetime - timedelta(hours=artist_sep)
             title_cutoff = target_datetime - timedelta(hours=title_sep)
             for item in recent:
+                if not item.track_id:
+                    continue
                 if item.scheduled_time >= title_cutoff:
                     loosened_exclude_tracks.add(item.track_id)
                 if item.scheduled_time >= artist_cutoff:
@@ -378,6 +384,8 @@ def _persist_log(target_date, hour, picks):
             position=pick["position"],
             scheduled_time=pick["scheduled_time"],
             track=pick["track"],
+            track_title=pick["track"].title,
+            track_artist=pick["track"].artist.name if pick["track"].artist_id else "",
             category=pick["category"],
         )
         for pick in picks
@@ -399,6 +407,8 @@ def append_fill_items(log, picks, start_position):
             position=start_position + i,
             scheduled_time=pick["scheduled_time"],
             track=pick["track"],
+            track_title=pick["track"].title,
+            track_artist=pick["track"].artist.name if pick["track"].artist_id else "",
             category=pick["category"],
         )
         for i, pick in enumerate(picks)

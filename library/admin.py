@@ -1,6 +1,8 @@
+from pathlib import Path
+
 from adminsortable2.admin import SortableAdminBase, SortableTabularInline
 from django import forms
-from django.contrib import admin
+from django.contrib import admin, messages
 from django.db.models import Count
 from django.http import HttpResponseRedirect
 from django.template.loader import render_to_string
@@ -289,6 +291,31 @@ class TrackAdmin(admin.ModelAdmin):
         url = reverse("library:api-track-audio", args=[obj.pk])
         return format_html('<audio controls preload="none" src="{}"></audio>', url)
 
+    def delete_model(self, request, obj):
+        # Single-object delete (after Django's own confirmation page).
+        self._delete_file(request, obj)
+        super().delete_model(request, obj)
+
+    def delete_queryset(self, request, queryset):
+        # Bulk "Delete selected" action (after Django's own confirmation
+        # page, which already blocks the whole batch if anything in it is
+        # PROTECTed -- e.g. still referenced by an active Playlist). Same
+        # file-then-row order as apply_duplicate_resolutions.
+        for obj in queryset:
+            self._delete_file(request, obj)
+        super().delete_queryset(request, queryset)
+
+    def _delete_file(self, request, obj):
+        if not obj.filepath:
+            return
+        fp = Path(obj.filepath)
+        if not fp.is_file():
+            return
+        try:
+            fp.unlink()
+        except OSError as exc:
+            messages.error(request, f"Failed to delete file for '{obj}': {exc}")
+
 
 @admin.register(DuplicateCandidate)
 class DuplicateCandidateAdmin(admin.ModelAdmin):
@@ -396,6 +423,7 @@ class LogItemInline(admin.TabularInline):
     model = LogItem
     extra = 0
     raw_id_fields = ["track"]
+    readonly_fields = ["track_title", "track_artist"]
 
 
 @admin.register(PlaylistLog)
@@ -475,7 +503,7 @@ _UITHEME_COLOR_FIELDS = {
 class UIThemeAdmin(admin.ModelAdmin):
     fieldsets = [
         ("Branding", {
-            "fields": ["logo"],
+            "fields": ["logo", "station_logo"],
         }),
         ("Palette", {
             "fields": [
