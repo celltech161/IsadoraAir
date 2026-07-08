@@ -1,0 +1,11 @@
+[Unit]
+Description=OGRemote available-uploads poller (download/process/deliver + recall handling)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=jreed
+Group=jreed
+WorkingDirectory=/home/jreed/ogremote-ingest
+ExecStart=/home/jreed/ogremote-ingest/venv/bin/python /home/jreed/ogremote-ingest/get_available_uploads.py

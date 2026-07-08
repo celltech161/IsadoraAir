@@ -1,0 +1,10 @@
+[Unit]
+Description=Run OGRemote available-uploads poller every 2 minutes
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=2min
+Persistent=false
+
+[Install]
+WantedBy=timers.target

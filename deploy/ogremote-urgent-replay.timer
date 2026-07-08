@@ -1,0 +1,10 @@
+[Unit]
+Description=Run OGRemote urgent PA/PSA replay check every minute
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+Persistent=false
+
+[Install]
+WantedBy=timers.target
