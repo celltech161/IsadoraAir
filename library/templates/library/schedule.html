@@ -7,40 +7,61 @@
 <style>
   .schedule-wrap {
     display: flex;
-    gap: 1.25rem;
-    align-items: flex-start;
-    overflow-x: auto;
+    flex-direction: column;
+    gap: 0.85rem;
     max-width: 100%;
   }
 
-  /* --- Rotation palette --- */
-  .rotation-palette {
-    flex-shrink: 0;
-    width: 160px;
+  /* --- Rotation toolbar (horizontal, above the grid) --- */
+  .rotation-toolbar {
     display: flex;
     flex-direction: column;
-    gap: 4px;
+    gap: 0.4rem;
   }
 
-  .rotation-palette h3 {
-    font-size: 0.8rem;
+  .rotation-toolbar-top {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+
+  .rotation-filter {
+    flex: 1;
+    max-width: 260px;
+    background: var(--bg-darker);
+    border: 1px solid var(--border-subtle);
+    border-radius: 6px;
+    padding: 0.32rem 0.55rem;
+    color: var(--text-main);
+    font-size: 0.75rem;
+  }
+  .rotation-filter:focus { outline: none; border-color: var(--accent); }
+
+  .rotation-group-label {
+    font-size: 0.68rem;
     text-transform: uppercase;
     letter-spacing: 1px;
     color: var(--text-muted);
-    margin-bottom: 0.25rem;
+  }
+
+  .rotation-group {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
   }
 
   .rotation-btn {
-    display: block;
-    width: 100%;
-    padding: 0.45rem 0.6rem;
+    display: inline-block;
+    width: auto;
+    padding: 0.3rem 0.55rem;
     border: 2px solid transparent;
     border-radius: 6px;
-    font-size: 0.8rem;
+    font-size: 0.7rem;
     font-weight: 600;
     color: #fff;
     cursor: pointer;
     text-align: left;
+    white-space: nowrap;
     transition: border-color 0.12s, opacity 0.12s;
     opacity: 0.85;
   }
@@ -62,6 +83,8 @@
     border-color: var(--danger);
     color: var(--danger);
   }
+
+  .rotation-btn.hidden-by-filter { display: none; }
 
   .palette-empty {
     color: var(--text-muted);
@@ -246,20 +269,25 @@
 
   .mobile-palette {
     margin-bottom: 0.75rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
   }
 
   .mobile-palette-scroll {
     display: flex;
+    flex-wrap: wrap;
     gap: 4px;
-    overflow-x: auto;
+    max-height: 132px;
+    overflow-y: auto;
     padding-bottom: 4px;
   }
 
   .mobile-palette-scroll .rotation-btn {
     flex-shrink: 0;
     width: auto;
-    padding: 0.4rem 0.7rem;
-    font-size: 0.75rem;
+    padding: 0.32rem 0.6rem;
+    font-size: 0.72rem;
   }
 
   @media (max-width: 768px) {
@@ -272,29 +300,37 @@
 {% block content %}
 <!-- Desktop layout -->
 <div class="schedule-wrap">
-  <div class="rotation-palette">
-    <h3>Rotations</h3>
-    <button class="rotation-btn clear-btn" data-rotation-id="clear" onclick="selectContent(this, null, null, null)">
-      Clear
-    </button>
-    {% for rotation in rotations %}
-    <button class="rotation-btn" data-rotation-id="{{ rotation.id }}"
-            onclick="selectContent(this, 'rotation', {{ rotation.id }}, '{{ rotation.name|escapejs }}')">
-      {{ rotation.name }}
-    </button>
-    {% empty %}
-    <p class="palette-empty">No rotations configured. <a href="{% url 'library:rotations' %}" style="color:var(--accent)">Add a rotation</a>.</p>
-    {% endfor %}
+  <div class="rotation-toolbar">
+    <div class="rotation-toolbar-top">
+      <input type="text" class="rotation-filter" id="rotationFilterDesktop" placeholder="Filter rotations &amp; playlists…" oninput="filterPalette(this.value, 'desktop')">
+      <button class="rotation-btn clear-btn" data-rotation-id="clear" onclick="selectContent(this, null, null, null)">
+        Clear
+      </button>
+    </div>
 
-    <h3 style="margin-top: 0.75rem;">Playlists</h3>
-    {% for playlist in playlists %}
-    <button class="rotation-btn" data-playlist-id="{{ playlist.id }}"
-            onclick="selectContent(this, 'playlist', {{ playlist.id }}, '{{ playlist.name|escapejs }}')">
-      {{ playlist.name }}
-    </button>
-    {% empty %}
-    <p class="palette-empty">No playlists yet. Build one on the <a href="{% url 'library:playlists' %}" style="color:var(--accent)">Playlists</a> page.</p>
-    {% endfor %}
+    <div class="rotation-group-label">Rotations</div>
+    <div class="rotation-group">
+      {% for rotation in rotations %}
+      <button class="rotation-btn" data-rotation-id="{{ rotation.id }}"
+              onclick="selectContent(this, 'rotation', {{ rotation.id }}, '{{ rotation.name|escapejs }}')">
+        {{ rotation.name }}
+      </button>
+      {% empty %}
+      <p class="palette-empty">No rotations configured. <a href="{% url 'library:rotations' %}" style="color:var(--accent)">Add a rotation</a>.</p>
+      {% endfor %}
+    </div>
+
+    <div class="rotation-group-label">Playlists</div>
+    <div class="rotation-group">
+      {% for playlist in playlists %}
+      <button class="rotation-btn" data-playlist-id="{{ playlist.id }}"
+              onclick="selectContent(this, 'playlist', {{ playlist.id }}, '{{ playlist.name|escapejs }}')">
+        {{ playlist.name }}
+      </button>
+      {% empty %}
+      <p class="palette-empty">No playlists yet. Build one on the <a href="{% url 'library:playlists' %}" style="color:var(--accent)">Playlists</a> page.</p>
+      {% endfor %}
+    </div>
   </div>
 
   <div class="grid-container">
@@ -331,10 +367,13 @@
 <!-- Mobile layout -->
 <div class="mobile-schedule">
   <div class="mobile-palette">
-    <div class="mobile-palette-scroll">
+    <div class="rotation-toolbar-top">
+      <input type="text" class="rotation-filter" id="rotationFilterMobile" placeholder="Filter rotations &amp; playlists…" oninput="filterPalette(this.value, 'mobile')">
       <button class="rotation-btn clear-btn" data-rotation-id="clear" onclick="selectContent(this, null, null, null)">
         Clear
       </button>
+    </div>
+    <div class="mobile-palette-scroll">
       {% for rotation in rotations %}
       <button class="rotation-btn" data-rotation-id="{{ rotation.id }}"
               onclick="selectContent(this, 'rotation', {{ rotation.id }}, '{{ rotation.name|escapejs }}')">
@@ -357,7 +396,13 @@
 
 {% block extra_js %}
 <script>
-const DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+// Display order is Sunday-first; the underlying day_of_week convention
+// everywhere else (API payloads, ScheduleBlock, Track.blocked_slots,
+// Python's own .weekday()) stays Monday=0 unchanged -- DISPLAY_TO_DOW
+// maps a display column/row position (0=Sun..6=Sat) to that real
+// day_of_week value, so only rendering order changes, not stored data.
+const DAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+const DISPLAY_TO_DOW = [6, 0, 1, 2, 3, 4, 5];
 const HOUR_LABELS = [
   '12:00a','1:00a','2:00a','3:00a','4:00a','5:00a',
   '6:00a','7:00a','8:00a','9:00a','10:00a','11:00a',
@@ -415,6 +460,22 @@ function selectContent(btn, kind, id, name) {
   selectedContentName = name;
 }
 
+// 93+ rotations/playlists is too many to scan by eye alone -- a live
+// text filter narrows the wrapped button list down as you type. The
+// Clear button always stays visible regardless of the filter text.
+function filterPalette(query, scope) {
+  const q = query.trim().toLowerCase();
+  const root = scope === 'mobile'
+    ? document.querySelector('.mobile-palette-scroll')
+    : document.querySelector('.rotation-toolbar');
+  if (!root) return;
+  root.querySelectorAll('.rotation-btn').forEach(btn => {
+    if (btn.classList.contains('clear-btn')) return;
+    const name = btn.textContent.trim().toLowerCase();
+    btn.classList.toggle('hidden-by-filter', q.length > 0 && !name.includes(q));
+  });
+}
+
 // --- Desktop grid ---
 function buildGrid() {
   const grid = document.getElementById('scheduleGrid');
@@ -428,12 +489,13 @@ function buildGrid() {
     for (let h = 0; h < 24; h++) {
       const cell = document.createElement('div');
       cell.className = 'grid-cell empty';
-      cell.dataset.day = d;
+      const dow = DISPLAY_TO_DOW[d];
+      cell.dataset.day = dow;
       cell.dataset.hour = h;
-      cell.addEventListener('click', () => onCellClick(d, h, cell));
+      cell.addEventListener('click', () => onCellClick(dow, h, cell));
       cell.addEventListener('contextmenu', (e) => {
         e.preventDefault();
-        onCellClear(d, h, cell);
+        onCellClear(dow, h, cell);
       });
       grid.appendChild(cell);
     }
@@ -541,11 +603,12 @@ async function onCellClear(day, hour, cell) {
 function buildDayPicker() {
   const picker = document.getElementById('dayPicker');
   DAYS.forEach((name, d) => {
+    const dow = DISPLAY_TO_DOW[d];
     const btn = document.createElement('button');
-    btn.className = 'day-picker-btn' + (d === mobileDay ? ' active' : '');
+    btn.className = 'day-picker-btn' + (dow === mobileDay ? ' active' : '');
     btn.textContent = name;
     btn.addEventListener('click', () => {
-      mobileDay = d;
+      mobileDay = dow;
       document.querySelectorAll('.day-picker-btn').forEach(b => b.classList.remove('active'));
       btn.classList.add('active');
       renderMobileHours();
@@ -656,7 +719,8 @@ function highlightNow() {
   if (headers[hour + 1]) headers[hour + 1].classList.add('now-hour');
 
   const dayLabels = document.querySelectorAll('.day-label');
-  if (dayLabels[dow]) dayLabels[dow].classList.add('now-day');
+  const dowDisplayPos = (dow + 1) % 7; // inverse of DISPLAY_TO_DOW
+  if (dayLabels[dowDisplayPos]) dayLabels[dowDisplayPos].classList.add('now-day');
 
   // Mobile
   document.querySelectorAll('.mobile-hour-cell.now-playing').forEach(c => c.classList.remove('now-playing'));
