@@ -1,6 +1,7 @@
 Django==5.2.15
 django-admin-sortable2==2.3.1
 django-axes==8.3.1
+django-ipware==7.0.1
 gunicorn==26.0.0
 mutagen==1.47.0
 pillow==12.3.0

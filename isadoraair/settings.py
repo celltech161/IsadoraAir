@@ -49,6 +49,7 @@ INSTALLED_APPS = [
     'encoders',
     'monitoring',
     'rbds',
+    'weather',
     'axes',
 ]
 
@@ -79,6 +80,29 @@ AUTHENTICATION_BACKENDS = [
 AXES_FAILURE_LIMIT = 5
 AXES_COOLOFF_TIME = 1  # hours
 AXES_LOCKOUT_PARAMETERS = [["username", "ip_address"]]
+
+# nginx proxies to gunicorn over loopback (proxy_pass http://127.0.0.1:8000),
+# so REMOTE_ADDR is always nginx's own address, not the real client -- axes
+# needs django-ipware to pull the real IP from X-Forwarded-For instead (nginx
+# already sets this, see /etc/nginx/sites-available/isadoraair). proxy_count=0
+# (not 1) -- confirmed live: nginx's $proxy_add_x_forwarded_for only appends
+# the IMMEDIATE client's IP, not nginx's own address, so the header is a
+# single IP here, not a 2-entry chain. proxy_count=1 would (and did, in
+# testing) incorrectly expect a second hop's IP already present and return
+# None instead.
+AXES_IPWARE_PROXY_COUNT = 0
+AXES_IPWARE_META_PRECEDENCE_ORDER = ("HTTP_X_FORWARDED_FOR",)
+
+# Django admin's bulk actions (e.g. "Delete selected") POST one
+# _selected_action field per checked row -- the default cap of 1000 is a
+# DoS guard meant for public-facing forms and real bug, confirmed live:
+# selecting all 1542 tracks in a single category and choosing "Delete
+# selected" raised TooManyFieldsSent -> a bare 400 with no explanation.
+# This admin is login+axes-protected, single-operator, on a LAN -- raised
+# generously above the whole library's size (~29k tracks) rather than
+# just past today's largest category, so this doesn't recur for a bigger
+# future bulk selection either.
+DATA_UPLOAD_MAX_NUMBER_FIELDS = 50000
 
 # Protects every view by default (LoginRequiredMiddleware, Django 5.1+) —
 # Django's own login/admin-login views are already exempted internally
@@ -192,6 +216,13 @@ CSRF_TRUSTED_ORIGINS = config(
 # box is keeping for now (a browser that caches HSTS for this host would
 # refuse to let you click through the self-signed warning at all).
 SECURE_SSL_REDIRECT = True
+# The GW3000/Ecowitt weather gateway is IoT firmware that POSTs plain
+# HTTP with no TLS support at all -- exempted from the redirect so its
+# uploads reach the view instead of bouncing off a 301 it can't follow.
+# nginx also needs its own matching exemption (see deploy notes) since
+# the redirect above only fires for requests that already got past
+# nginx's own unconditional :80 -> :443 redirect.
+SECURE_REDIRECT_EXEMPT = [r'^wx/gw3000$']
 SESSION_COOKIE_SECURE = True
 CSRF_COOKIE_SECURE = True
 
