@@ -1,0 +1,10 @@
+[Unit]
+Description=Watch/warning alert beep (direct-to-ALSA, bypasses playback engine)
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=jreed
+Group=audio
+WorkingDirectory=/home/jreed/weather-ingest
+ExecStart=/home/jreed/weather-ingest/venv/bin/python /home/jreed/weather-ingest/wx_alert_beep.py

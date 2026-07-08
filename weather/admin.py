@@ -19,6 +19,13 @@ class WeatherConfigAdmin(admin.ModelAdmin):
             "fields": ["voice_schedule"],
             "description": "Day/night voice shift schedule -- see field help text for format.",
         }),
+        ("Alert Beep", {
+            "fields": ["alert_sound_enabled", "alert_sound_path", "alert_sound_device",
+                       "alert_sound_interval_seconds", "alert_sound_gain_db"],
+            "description": "Plays directly to ALSA (bypassing the playback engine) while "
+                            "a watch/warning is active -- separate from the spoken WxAlert "
+                            "statement pipeline.",
+        }),
         ("Notifications", {
             "fields": ["notify_email"],
         }),

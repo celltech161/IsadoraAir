@@ -52,6 +52,37 @@ class WeatherConfig(models.Model):
         help_text="Address for weather-pipeline failure notifications. Blank disables.",
     )
 
+    alert_sound_enabled = models.BooleanField(
+        default=True,
+        help_text="Master switch for the watch/warning alert beep. Off overrides "
+                   "everything below -- no beep plays regardless of active alert "
+                   "status. Separate from the WxAlert spoken-statement pipeline, "
+                   "which is unaffected by this switch.",
+    )
+    alert_sound_path = models.CharField(
+        max_length=255, default="/home/jreed/weather-ingest/media/weather_beeps.flac",
+        help_text="Path to the alert beep audio file, played directly to ALSA "
+                   "(not through the playback engine) while a watch/warning is active.",
+    )
+    alert_sound_device = models.CharField(
+        max_length=32, default="plughw:4,0",
+        help_text="ALSA device the beep is played to -- a dedicated loopback feeding "
+                   "StereoTool's second input, independent of the engine's own output.",
+    )
+    alert_sound_interval_seconds = models.PositiveIntegerField(
+        default=600,
+        help_text="How often the beep replays while a watch/warning remains active, "
+                   "in seconds. Re-read fresh every check -- no restart needed.",
+    )
+    alert_sound_gain_db = models.FloatField(
+        default=-12.0,
+        help_text="Gain applied to the beep before it reaches StereoTool's Input 2, "
+                   "in dB (negative = quieter, 0 = unchanged from the source file). "
+                   "The file plays at full level otherwise, which was found to drive "
+                   "the processor's AGC down hard on air -- tune this down until the "
+                   "beep sits at a normal announcement level.",
+    )
+
     class Meta:
         verbose_name = "Weather Configuration"
         verbose_name_plural = "Weather Configuration"
