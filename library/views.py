@@ -1447,6 +1447,24 @@ def api_engine_mic_ptt(request):
     return JsonResponse({"ok": True})
 
 
+@csrf_exempt
+@require_http_methods(["POST"])
+def api_engine_manual_mode(request):
+    try:
+        body = json.loads(request.body)
+    except (json.JSONDecodeError, ValueError):
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+
+    active = body.get("active")
+    if not isinstance(active, bool):
+        return JsonResponse({"error": "active must be a boolean"}, status=400)
+
+    Path("/run/isadoraair/engine_cmd.json").write_text(
+        json.dumps({"command": "set_manual_mode", "active": active}), encoding="utf-8",
+    )
+    return JsonResponse({"ok": True})
+
+
 @require_http_methods(["GET"])
 def api_engine_status(request):
     state_path = Path("/run/isadoraair/engine_state.json")

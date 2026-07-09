@@ -26,7 +26,7 @@
     color: var(--text-main);
     font-size: 0.85rem;
     cursor: pointer;
-    min-width: 220px;
+    min-width: 200px;
   }
   .playnow-select:focus { outline: none; border-color: var(--accent); }
 
@@ -43,8 +43,16 @@
   }
   .playnow-btn:hover { opacity: 0.9; }
 
-  .mic-ptt-btn {
+  .manual-mode-btn {
     margin-left: auto;
+    border: 1px solid var(--border-subtle);
+    background: transparent;
+    color: var(--text-main);
+  }
+  .manual-mode-btn.active { background: #d97706; color: #000; border-color: #d97706; }
+  .manual-mode-btn.pending { opacity: 0.6; }
+
+  .mic-ptt-btn {
     border: 1px solid var(--border-subtle);
     background: transparent;
     color: var(--text-main);
@@ -401,12 +409,29 @@
   /* --- Queue search insert --- */
   .queue-insert {
     margin-bottom: 1.25rem;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 0.75rem;
+  }
+
+  .queue-insert-search-wrap {
     position: relative;
+    flex: 1;
+    min-width: 200px;
+    max-width: 320px;
+  }
+
+  .queue-insert-playnow {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    flex-wrap: wrap;
   }
 
   .queue-insert-input {
     width: 100%;
-    max-width: 320px;
     background: var(--bg-darker);
     border: 1px solid var(--border-subtle);
     border-radius: 6px;
@@ -462,14 +487,8 @@
 
 {% block content %}
 <div class="playnow-bar">
-  <select class="playnow-select" id="playNowSelect">
-    <option value="">Play a playlist now...</option>
-    {% for pl in playlists %}
-    <option value="{{ pl.id }}">{{ pl.name }}</option>
-    {% endfor %}
-  </select>
-  <button class="playnow-btn" onclick="playNow()">Play Now</button>
-  <span class="playnow-msg" id="playNowMsg"></span>
+  <button class="playnow-btn manual-mode-btn" id="manualModeBtn" onclick="toggleManualMode()"
+          title="Manual holds the next track until you flip back to Auto -- for talking over a song's outro">Auto</button>
   <button class="playnow-btn mic-ptt-btn" id="micPttBtn" onclick="toggleMicPtt()" disabled>Mic: OFF</button>
 </div>
 
@@ -480,9 +499,21 @@
 
 <div class="queue-panel" id="queuePanel">
   <div class="queue-insert">
-    <input type="text" class="queue-insert-input" id="queueInsertSearch"
-           placeholder="Search to add track...">
-    <div class="queue-insert-results" id="queueInsertResults"></div>
+    <div class="queue-insert-search-wrap">
+      <input type="text" class="queue-insert-input" id="queueInsertSearch"
+             placeholder="Search to add track...">
+      <div class="queue-insert-results" id="queueInsertResults"></div>
+    </div>
+    <div class="queue-insert-playnow">
+      <select class="playnow-select" id="playNowSelect">
+        <option value="">Play a playlist now...</option>
+        {% for pl in playlists %}
+        <option value="{{ pl.id }}">{{ pl.name }}</option>
+        {% endfor %}
+      </select>
+      <button class="playnow-btn" onclick="playNow()">Play Now</button>
+      <span class="playnow-msg" id="playNowMsg"></span>
+    </div>
   </div>
   <h3>Coming Up</h3>
   <div class="queue-table-wrap">
@@ -627,6 +658,28 @@ function renderMicPtt(data) {
   btn.classList.toggle('active', !!data.mic_live);
   btn.textContent = (data.mic_configured && data.mic_ok === false)
     ? 'Mic: ERROR' : (data.mic_live ? 'Mic: LIVE' : 'Mic: OFF');
+}
+
+async function toggleManualMode() {
+  const btn = document.getElementById('manualModeBtn');
+  const desiredActive = !btn.classList.contains('active');
+  btn.classList.add('pending');
+  const resp = await fetch('/api/engine/manual-mode/', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') },
+    body: JSON.stringify({ active: desiredActive }),
+  });
+  if (!resp.ok) btn.classList.remove('pending');
+  // Same pattern as mic PTT -- wait for the next poll() to confirm
+  // manual_mode from engine_state.json rather than flipping optimistically.
+}
+
+function renderManualMode(data) {
+  const btn = document.getElementById('manualModeBtn');
+  if (!btn) return;
+  btn.classList.remove('pending');
+  btn.classList.toggle('active', !!data.manual_mode);
+  btn.textContent = data.manual_mode ? 'Manual' : 'Auto';
 }
 
 async function fetchStatus() {
@@ -1190,6 +1243,7 @@ async function poll() {
   SLOTS.forEach(slot => renderDeck(slot, decks[slot], data.transport, queue, data.timestamp));
   renderQueue(data);
   renderMicPtt(data);
+  renderManualMode(data);
 }
 
 // Poll engine status every 1 second
