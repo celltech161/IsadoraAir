@@ -428,3 +428,180 @@ def build_hour_log(target_date, hour):
         return _build_from_rotation(target_date, hour, block.rotation)
 
     return None, "ScheduleBlock has neither rotation nor playlist."
+
+
+def _describe_track_issues(track, prefix, issues):
+    label = f"{track.artist.name if track.artist_id else 'Unknown'} - {track.title}"
+    if not track.duration_seconds:
+        issues.append({"severity": "error", "message": f"{prefix}: '{label}' has no duration set — likely never analyzed."})
+    elif track.next_start_seconds is None:
+        issues.append({"severity": "warning", "message": f"{prefix}: '{label}' has no next-start (cue) point — will play full length with no auto-mix."})
+    if not track.waveform_path:
+        issues.append({"severity": "warning", "message": f"{prefix}: '{label}' has no waveform on file."})
+    if not track.ready2air:
+        issues.append({"severity": "warning", "message": f"{prefix}: '{label}' is not marked ready2air."})
+
+
+def preview_hour_log(target_date, hour):
+    """Read-only dry run of the same schedule-block/rotation/playlist walk
+    as build_hour_log, for health-checking a rotation or playlist without
+    touching PlaylistLog/LogItem at all -- never persists anything, so it
+    can never disturb a real (possibly already-on-air) log for this date
+    and hour. Category slots still use weighted random selection, so the
+    exact tracks picked here won't necessarily match a real build (or
+    what actually aired) -- this is for surfacing structural problems
+    (empty categories, missing analysis, an under-filled hour), not for
+    previewing an exact future log."""
+    issues = []
+    block = resolve_schedule_block(target_date, hour)
+    if block is None:
+        issues.append({"severity": "error", "message": f"No schedule block covers {target_date} hour {hour}."})
+        return {
+            "date": target_date.isoformat(), "hour": hour, "source": None,
+            "source_name": None, "items": [], "issues": issues, "total_seconds": 0,
+        }, None
+
+    target_datetime = timezone.make_aware(datetime.combine(target_date, time(hour, 0)))
+    picks = []
+    accumulated_seconds = 0.0
+    source = None
+    source_name = None
+    walked = False
+
+    if block.playlist_id:
+        source = "playlist"
+        source_name = block.playlist.name
+        items = list(
+            block.playlist.items
+            .select_related("track", "track__artist", "track__category")
+            .order_by("position")
+        )
+        if not items:
+            issues.append({"severity": "error", "message": f"Playlist '{block.playlist.name}' has no items."})
+        else:
+            walked = True
+        for item in items:
+            track = item.track
+            _describe_track_issues(track, f"Playlist position {item.position + 1}", issues)
+            track_duration = track.next_start_seconds or track.duration_seconds or 0
+            scheduled_time = target_datetime + timedelta(seconds=accumulated_seconds)
+            picks.append({
+                "position": len(picks), "scheduled_time": scheduled_time,
+                "track": track, "category": track.category,
+            })
+            accumulated_seconds += track_duration
+
+    elif block.rotation_id:
+        source = "rotation"
+        source_name = block.rotation.name
+        slots = list(
+            block.rotation.slots
+            .select_related("category", "track", "track__category", "track__artist")
+            .order_by("position")
+        )
+        if not slots:
+            issues.append({"severity": "error", "message": f"Rotation '{block.rotation.name}' has no slots."})
+        else:
+            walked = True
+
+        recency_cfg = RecencyConfig.load()
+        picked_tracks = []
+        picked_artist_ids = []
+
+        for idx, slot in enumerate(slots):
+            if slot.track_id:
+                track = slot.track
+                category = track.category
+            else:
+                category = slot.category
+                artist_sep, title_sep = get_separation(category, recency_cfg)
+                exclude_track_ids, exclude_artist_ids = get_recent_exclusions(
+                    target_datetime, artist_sep, title_sep, picked_tracks, picked_artist_ids,
+                )
+                remaining = 3600 - accumulated_seconds
+                track = pick_track(
+                    category, exclude_track_ids, exclude_artist_ids,
+                    artist_sep, title_sep, target_datetime,
+                    remaining_seconds=remaining,
+                )
+                if track is None:
+                    pool_size = _tracks_for_category(category, target_datetime=target_datetime).count()
+                    if pool_size == 0:
+                        issues.append({
+                            "severity": "error",
+                            "message": f"Slot {idx + 1}: category '{category.name}' has zero eligible tracks (empty, or none marked ready2air).",
+                        })
+                    else:
+                        issues.append({
+                            "severity": "warning",
+                            "message": f"Slot {idx + 1}: category '{category.name}' had no track survive recency separation (pool of {pool_size}).",
+                        })
+                    continue
+
+            _describe_track_issues(track, f"Slot {idx + 1} ({category.name if category else '?'})", issues)
+
+            track_duration = track.next_start_seconds or track.duration_seconds or 0
+            scheduled_time = target_datetime + timedelta(seconds=accumulated_seconds)
+            picks.append({
+                "position": len(picks), "scheduled_time": scheduled_time,
+                "track": track, "category": category,
+            })
+            picked_tracks.append(track)
+            picked_artist_ids.append(track.artist_id)
+            accumulated_seconds += track_duration
+            if accumulated_seconds >= 3600:
+                break
+
+    else:
+        issues.append({"severity": "error", "message": "Schedule block has neither rotation nor playlist configured."})
+
+    if walked:
+        picks, accumulated_seconds = fill_remaining_hour(picks, accumulated_seconds, target_datetime)
+
+        shortfall = 3600 - accumulated_seconds
+        if shortfall > DURATION_FIT_MARGIN:
+            issues.append({
+                "severity": "warning",
+                "message": f"Hour only {int(accumulated_seconds)}s of 3600s filled ({int(shortfall)}s short) — filler category may also be exhausted.",
+            })
+        elif accumulated_seconds - 3600 > 300:
+            issues.append({
+                "severity": "warning",
+                "message": f"Hour overshoots by {int(accumulated_seconds - 3600)}s.",
+            })
+
+    seen_counts = {}
+    for p in picks:
+        seen_counts[p["track"].id] = seen_counts.get(p["track"].id, 0) + 1
+    flagged_dupes = set()
+    for p in picks:
+        tid = p["track"].id
+        if seen_counts[tid] > 1 and tid not in flagged_dupes:
+            flagged_dupes.add(tid)
+            t = p["track"]
+            issues.append({
+                "severity": "warning",
+                "message": f"'{t.artist.name if t.artist_id else 'Unknown'} - {t.title}' is scheduled {seen_counts[tid]} times in this hour.",
+            })
+
+    result = {
+        "date": target_date.isoformat(),
+        "hour": hour,
+        "source": source,
+        "source_name": source_name,
+        "total_seconds": accumulated_seconds,
+        "issues": issues,
+        "items": [
+            {
+                "position": p["position"],
+                "scheduled_time": p["scheduled_time"].isoformat(),
+                "track_id": p["track"].id,
+                "title": p["track"].title,
+                "artist": p["track"].artist.name if p["track"].artist_id else "",
+                "category": p["category"].code if p["category"] else "",
+                "duration": p["track"].next_start_seconds or p["track"].duration_seconds or 0,
+            }
+            for p in picks
+        ],
+    }
+    return result, None

@@ -31,14 +31,110 @@ def decode_audio_to_pcm(filepath, sample_rate):
         return b""
 
 
-def compute_envelope_and_waveform(raw, sample_rate, window_seconds,
-                                  target_points, floor_db):
+def decode_audio_to_pcm_stereo(filepath, sample_rate):
+    """Same as decode_audio_to_pcm but keeps both channels (interleaved
+    L/R s16le) instead of downmixing to mono -- used only for the
+    optional stereo waveform display, never for cue-point detection
+    (that stays on the mono path, unchanged). A genuinely mono source
+    file just comes back with identical L/R here, which is the correct
+    behavior, not a bug."""
+    cmd = [
+        "ffmpeg",
+        "-hide_banner", "-loglevel", "error",
+        "-i", str(filepath),
+        "-ac", "2",
+        "-ar", str(sample_rate),
+        "-f", "s16le",
+        "-",
+    ]
+    try:
+        result = subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True,
+        )
+        return result.stdout
+    except subprocess.CalledProcessError as exc:
+        print(f"  ffmpeg (stereo) failed for {filepath}: {exc}", file=sys.stderr)
+        return b""
+
+
+def compute_stereo_waveform(raw_stereo, sample_rate, window_seconds, target_points):
+    """Per-channel windowed-RMS waveform (L and R separately), linear-
+    amplitude and peak-normalized against a peak SHARED across both
+    channels -- a real L/R level imbalance shows up as one side visually
+    smaller rather than getting normalized away. This is the sole
+    waveform display data stored per track (see analyze_one_track) --
+    independent decode/compute pass, never touches next_start/cue_in
+    detection, which stays on the mono envelope below."""
+    if not raw_stereo:
+        return [], []
+
+    frame_count = len(raw_stereo) // 4  # 2 channels * 2 bytes/sample
+    if frame_count == 0:
+        return [], []
+
+    window_size = max(1, int(sample_rate * window_seconds))
+    max_int16 = 32768.0
+
+    left_db, right_db = [], []
+    pos = 0
+    while pos + window_size <= frame_count:
+        window = raw_stereo[pos * 4: (pos + window_size) * 4]
+        acc_l, acc_r = 0.0, 0.0
+        for i in range(0, len(window), 4):
+            l = struct.unpack_from("<h", window, i)[0]
+            r = struct.unpack_from("<h", window, i + 2)[0]
+            norm_l = l / max_int16
+            norm_r = r / max_int16
+            acc_l += norm_l * norm_l
+            acc_r += norm_r * norm_r
+        rms_l = math.sqrt(acc_l / window_size) if window_size > 0 else 0.0
+        rms_r = math.sqrt(acc_r / window_size) if window_size > 0 else 0.0
+        left_db.append(20.0 * math.log10(rms_l) if rms_l > 0.0 else -120.0)
+        right_db.append(20.0 * math.log10(rms_r) if rms_r > 0.0 else -120.0)
+        pos += window_size
+
+    if not left_db:
+        return [], []
+
+    num_envelope = len(left_db)
+    if num_envelope <= target_points:
+        step = 1.0
+        points = num_envelope
+    else:
+        step = num_envelope / float(target_points)
+        points = target_points
+
+    left_linear = [10.0 ** (db / 20.0) if db > -120.0 else 0.0 for db in left_db]
+    right_linear = [10.0 ** (db / 20.0) if db > -120.0 else 0.0 for db in right_db]
+    max_linear = max(max(left_linear, default=0.0), max(right_linear, default=0.0))
+
+    def scale_linear(linear_envelope):
+        out = []
+        for i in range(points):
+            start = int(i * step)
+            end = int((i + 1) * step)
+            if start >= num_envelope:
+                break
+            end = max(end, start + 1)
+            end = min(end, num_envelope)
+            peak = max(linear_envelope[start:end])
+            level = int(round((peak / max_linear) * 255.0)) if max_linear > 0 else 0
+            out.append(level)
+        return out
+
+    return scale_linear(left_linear), scale_linear(right_linear)
+
+
+def compute_envelope(raw, sample_rate, window_seconds):
+    """Windowed-RMS dB envelope of a mono-decoded track -- feeds
+    next_start/cue_in detection only. No display waveform is produced
+    here; that's compute_stereo_waveform's job now."""
     if not raw:
-        return [], [], []
+        return [], []
 
     sample_count = len(raw) // 2
     if sample_count == 0:
-        return [], [], []
+        return [], []
 
     window_size = max(1, int(sample_rate * window_seconds))
     max_int16 = 32768.0
@@ -61,37 +157,7 @@ def compute_envelope_and_waveform(raw, sample_rate, window_seconds,
         times.append(t)
         pos += window_size
 
-    if not envelope_db:
-        return times, envelope_db, []
-
-    num_envelope = len(envelope_db)
-    if num_envelope <= target_points:
-        step = 1.0
-        points = num_envelope
-    else:
-        step = num_envelope / float(target_points)
-        points = target_points
-
-    waveform = []
-    for i in range(points):
-        start = int(i * step)
-        end = int((i + 1) * step)
-        if start >= num_envelope:
-            break
-        end = max(end, start + 1)
-        end = min(end, num_envelope)
-
-        max_db = max(envelope_db[start:end])
-        if max_db <= floor_db:
-            level = 0
-        else:
-            span = 0.0 - floor_db
-            norm = (max_db - floor_db) / span
-            norm = max(0.0, min(1.0, norm))
-            level = int(round(norm * 255.0))
-        waveform.append(level)
-
-    return times, envelope_db, waveform
+    return times, envelope_db
 
 
 def detect_next_start(times, envelope_db, duration, threshold_db):
@@ -185,9 +251,9 @@ def analyze_one_track(row, cfg_values, wave_dir, force):
     caller (e.g. right after a fresh upload, see library/views.py's
     api_library_upload) share this one code path instead of the upload
     path needing its own copy of this logic. Returns True if analyzed,
-    False if skipped (missing file, decode failure, or empty waveform)."""
+    False if skipped (missing file or decode failure)."""
     (sample_rate, window_seconds, target_points,
-     next_start_db, cue_in_db, cue_in_min, waveform_floor_db) = cfg_values
+     next_start_db, cue_in_db, cue_in_min) = cfg_values
     track_id, filepath, filename, duration, title, artist_name, existing_related = row
     fp = Path(filepath)
 
@@ -199,10 +265,8 @@ def analyze_one_track(row, cfg_values, wave_dir, force):
     if not raw:
         return False
 
-    times, envelope_db, waveform = compute_envelope_and_waveform(
-        raw, sample_rate, window_seconds, target_points, waveform_floor_db,
-    )
-    if not waveform:
+    times, envelope_db = compute_envelope(raw, sample_rate, window_seconds)
+    if not envelope_db:
         return False
 
     analysis_duration = times[-1] if times else None
@@ -213,6 +277,22 @@ def analyze_one_track(row, cfg_values, wave_dir, force):
     next_start = detect_next_start(times, envelope_db, effective_duration, next_start_db)
     cue_in = detect_cue_in(times, envelope_db, effective_duration, cue_in_db, cue_in_min)
 
+    # Stereo L/R linear waveform -- the sole display data stored, see
+    # compute_stereo_waveform. Independent decode pass, best-effort: any
+    # failure here is deliberately swallowed rather than propagated,
+    # since this is display-only and must never take down the mono
+    # analysis everything else (cue points, detection, rotation)
+    # depends on.
+    samples_left, samples_right = [], []
+    try:
+        raw_stereo = decode_audio_to_pcm_stereo(fp, sample_rate)
+        if raw_stereo:
+            samples_left, samples_right = compute_stereo_waveform(
+                raw_stereo, sample_rate, window_seconds, target_points,
+            )
+    except Exception as exc:
+        print(f"  Stereo waveform failed for track {track_id} (non-fatal): {exc}")
+
     filename_stem = Path(filename).stem if filename else fp.stem
     if force or not existing_related:
         related = extract_related_artists(artist_name, title, filename_stem)
@@ -222,7 +302,8 @@ def analyze_one_track(row, cfg_values, wave_dir, force):
     out_path = wave_dir / f"{track_id}.json"
     payload = {
         "track_id": track_id,
-        "samples": waveform,
+        "samples_left": samples_left,
+        "samples_right": samples_right,
         "next_start": next_start,
         "cue_in_seconds": cue_in,
         "analysis_duration": analysis_duration,
@@ -269,7 +350,6 @@ class Command(BaseCommand):
         cfg_values = (
             cfg.analysis_sample_rate, cfg.analysis_window_seconds, cfg.waveform_points,
             cfg.next_start_threshold_db, cfg.cue_in_threshold_db, cfg.cue_in_min_seconds,
-            cfg.waveform_floor_db,
         )
 
         wave_dir = get_waveforms_dir()

@@ -581,10 +581,17 @@ class AnalysisConfig(models.Model):
         verbose_name="Waveform resolution",
         help_text="Number of data points in the UI waveform.",
     )
-    waveform_floor_db = models.FloatField(
-        default=-50.0,
-        verbose_name="Waveform display floor (dBFS)",
-        help_text="Levels below this are invisible in the waveform display. Separate from detection thresholds.",
+    waveform_left_color = models.CharField(
+        max_length=7,
+        default="#22c55e",
+        verbose_name="Left channel color",
+        help_text="Waveform color for the left channel (drawn above the zero line).",
+    )
+    waveform_right_color = models.CharField(
+        max_length=7,
+        default="#38bdf8",
+        verbose_name="Right channel color",
+        help_text="Waveform color for the right channel (drawn below the zero line).",
     )
 
     class Meta:
@@ -609,7 +616,6 @@ class AnalysisConfig(models.Model):
                 "analysis_sample_rate": getattr(settings, "ANALYSIS_SAMPLE_RATE", 4410),
                 "analysis_window_seconds": getattr(settings, "ANALYSIS_WINDOW_SECONDS", 0.05),
                 "waveform_points": getattr(settings, "ANALYSIS_WAVEFORM_POINTS", 1000),
-                "waveform_floor_db": -50.0,
             },
         )
         return obj

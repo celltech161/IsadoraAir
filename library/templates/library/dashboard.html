@@ -534,6 +534,16 @@
 <script>
 const SLOTS = ['A', 'B'];
 
+const WAVEFORM_LEFT_COLOR = "{{ analysis_config.waveform_left_color|default:'#22c55e' }}";
+const WAVEFORM_RIGHT_COLOR = "{{ analysis_config.waveform_right_color|default:'#38bdf8' }}";
+
+function hexToRgba(hex, alpha) {
+  const m = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
+  if (!m) return `rgba(34, 197, 94, ${alpha})`;
+  const r = parseInt(m[1], 16), g = parseInt(m[2], 16), b = parseInt(m[3], 16);
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+}
+
 // Per-slot lookup token so a slow/stale album-art fetch from a track that's
 // since been swapped out can't clobber the display for whatever's playing now.
 const deckArtLookupTokens = { A: 0, B: 0 };
@@ -555,7 +565,7 @@ SLOTS.forEach(s => {
 
 const waveformState = {};
 SLOTS.forEach(s => {
-  waveformState[s] = { samples: null, cueIn: null, nextStart: null, analysisDuration: null };
+  waveformState[s] = { samplesLeft: null, samplesRight: null, cueIn: null, nextStart: null, analysisDuration: null };
 });
 
 function fmtDur(sec) {
@@ -676,24 +686,25 @@ async function fetchStatus() {
 async function loadWaveform(slot, trackId) {
   try {
     const resp = await fetch(`/api/waveform/${trackId}/`);
-    if (!resp.ok) { waveformState[slot].samples = null; return; }
+    if (!resp.ok) { waveformState[slot].samplesLeft = null; return; }
     const data = await resp.json();
     waveformState[slot] = {
-      samples: data.samples,
+      samplesLeft: data.samples_left,
+      samplesRight: data.samples_right,
       cueIn: data.cue_in_seconds,
       nextStart: data.next_start,
       analysisDuration: data.analysis_duration,
     };
     drawWaveform(slot);
   } catch {
-    waveformState[slot].samples = null;
+    waveformState[slot].samplesLeft = null;
   }
 }
 
 function drawWaveform(slot) {
   const canvas = document.getElementById(`npWaveform-${slot}`);
   const wf = waveformState[slot];
-  if (!canvas || !wf.samples) return;
+  if (!canvas || !wf.samplesLeft) return;
 
   const dpr = window.devicePixelRatio || 1;
   const rect = canvas.getBoundingClientRect();
@@ -704,17 +715,28 @@ function drawWaveform(slot) {
 
   const w = rect.width;
   const h = rect.height;
-  const n = wf.samples.length;
+  const n = wf.samplesLeft.length;
+  const barW = Math.ceil(w / n);
 
   ctx.clearRect(0, 0, w, h);
-  ctx.fillStyle = 'rgba(34, 197, 94, 0.35)';
 
+  // Zero-amplitude line centered, left channel drawn upward, right
+  // channel drawn downward -- same stereo-linear waveform as the track
+  // detail page, at the dashboard's own smaller scale.
+  const mid = h / 2;
+  ctx.fillStyle = hexToRgba(WAVEFORM_LEFT_COLOR, 0.35);
   for (let i = 0; i < n; i++) {
-    const level = wf.samples[i] / 255;
-    const barH = level * h;
+    const levelL = wf.samplesLeft[i] / 255;
+    const barHL = levelL * mid;
     const x = (i / n) * w;
-    const barW = Math.ceil(w / n);
-    ctx.fillRect(x, h - barH, barW, barH);
+    ctx.fillRect(x, mid - barHL, barW, barHL);
+  }
+  ctx.fillStyle = hexToRgba(WAVEFORM_RIGHT_COLOR, 0.35);
+  for (let i = 0; i < n; i++) {
+    const levelR = wf.samplesRight[i] / 255;
+    const barHR = levelR * mid;
+    const x = (i / n) * w;
+    ctx.fillRect(x, mid, barW, barHR);
   }
 
   const dur = wf.analysisDuration || deckState[slot].localDuration || 1;

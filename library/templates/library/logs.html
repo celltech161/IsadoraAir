@@ -70,6 +70,41 @@
   }
   .log-msg.error { color: var(--danger); }
 
+  /* --- Preview (dry-run) mode --- */
+  .preview-banner {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    background: rgba(245, 158, 11, 0.1);
+    border: 1px solid #d97706;
+    color: #d97706;
+    border-radius: 8px;
+    padding: 0.5rem 0.85rem;
+    font-size: 0.8rem;
+    font-weight: 700;
+    margin-bottom: 0.75rem;
+  }
+  .preview-banner span.pb-sub {
+    font-weight: 400;
+    color: var(--text-muted);
+  }
+
+  .issue-list {
+    margin-bottom: 0.85rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+  }
+  .issue-item {
+    font-size: 0.8rem;
+    padding: 0.4rem 0.65rem;
+    border-radius: 6px;
+    border: 1px solid var(--border-subtle);
+  }
+  .issue-item.error { border-color: var(--danger); color: var(--danger); background: rgba(249, 115, 115, 0.08); }
+  .issue-item.warning { border-color: #d97706; color: #d97706; background: rgba(217, 119, 6, 0.08); }
+  .issue-item .issue-label { font-weight: 700; text-transform: uppercase; font-size: 0.68rem; margin-right: 0.4rem; }
+
   /* --- Existing logs sidebar --- */
   .log-layout {
     display: grid;
@@ -309,6 +344,7 @@
     <option value="" disabled selected>Hour...</option>
   </select>
   <button class="build-btn" id="buildBtn" onclick="buildLog()">Build</button>
+  <button class="action-btn" id="previewBtn" onclick="previewLog()" title="Simulate a build without saving or affecting the real log">Test Build (Preview)</button>
   <span class="log-msg" id="logMsg"></span>
 </div>
 
@@ -683,6 +719,99 @@ async function buildLog() {
   const data = await resp.json();
   renderLog(data);
   loadDateLogs();
+}
+
+async function previewLog() {
+  const date = document.getElementById('dateInput').value;
+  const hour = document.getElementById('hourSelect').value;
+  const msg = document.getElementById('logMsg');
+
+  if (!date || hour === '') {
+    msg.textContent = 'Select a date and hour first.';
+    msg.className = 'log-msg error';
+    return;
+  }
+
+  const btn = document.getElementById('previewBtn');
+  btn.disabled = true;
+  msg.textContent = 'Simulating...';
+  msg.className = 'log-msg';
+
+  const resp = await fetch('/api/log/preview/', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-CSRFToken': getCookie('csrftoken'),
+    },
+    body: JSON.stringify({ date, hour: parseInt(hour) }),
+  });
+
+  btn.disabled = false;
+
+  if (!resp.ok) {
+    const err = await resp.json();
+    msg.textContent = err.error || 'Preview failed';
+    msg.className = 'log-msg error';
+    return;
+  }
+
+  msg.textContent = '';
+  const data = await resp.json();
+  renderPreview(data);
+}
+
+function renderPreview(data) {
+  // Not a real PlaylistLog -- no id, no approve/swap/reorder actions, and
+  // deliberately don't touch currentLogId so the sidebar's real-log
+  // actions (approve/delete/etc.) can't accidentally target it.
+  currentLogId = null;
+  currentLogData = null;
+  document.querySelectorAll('.hour-slot').forEach(s => s.classList.remove('active'));
+
+  const detail = document.getElementById('logDetail');
+  let totalDur = 0;
+  data.items.forEach(i => { totalDur += (i.duration || 0); });
+
+  const issuesHtml = data.issues.length
+    ? `<div class="issue-list">${data.issues.map(iss => `
+        <div class="issue-item ${iss.severity}"><span class="issue-label">${iss.severity}</span>${esc(iss.message)}</div>
+      `).join('')}</div>`
+    : `<div class="issue-list"><div class="issue-item" style="border-color: var(--accent); color: var(--accent);">No problems found.</div></div>`;
+
+  detail.innerHTML = `
+    <div class="preview-banner">
+      PREVIEW — not saved, not on air
+      <span class="pb-sub">${hourLabel(data.hour)} — ${data.date} ${data.source_name ? `· ${data.source} "${esc(data.source_name)}"` : ''}</span>
+    </div>
+    ${issuesHtml}
+    <div class="log-table-wrap">
+      <table class="log-table">
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>Time</th>
+            <th>Artist</th>
+            <th>Title</th>
+            <th>Category</th>
+            <th>Duration</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${data.items.map(i => `<tr>
+            <td class="col-pos">${i.position + 1}</td>
+            <td class="col-time">${fmtTime(i.scheduled_time)}</td>
+            <td>${esc(i.artist)}</td>
+            <td>${esc(i.title)}</td>
+            <td class="col-cat">${esc(i.category)}</td>
+            <td class="col-dur">${fmtDuration(i.duration)}</td>
+          </tr>`).join('')}
+        </tbody>
+      </table>
+    </div>
+    <div class="total-row">
+      ${data.items.length} items — ${fmtDuration(totalDur)} total
+    </div>
+  `;
 }
 
 async function approveLog(logId) {

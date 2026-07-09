@@ -452,10 +452,19 @@ class AnalysisConfigAdmin(admin.ModelAdmin):
         }),
         ("Waveform Display", {
             "fields": [
-                "waveform_floor_db",
+                "waveform_left_color",
+                "waveform_right_color",
             ],
+            "description": "Track detail pages show a stereo L/R split waveform "
+                            "(zero-amplitude line centered, left channel drawn "
+                            "upward, right channel drawn downward).",
         }),
     ]
+
+    def formfield_for_dbfield(self, db_field, request, **kwargs):
+        if db_field.name in ("waveform_left_color", "waveform_right_color"):
+            kwargs["widget"] = forms.TextInput(attrs={"type": "color"})
+        return super().formfield_for_dbfield(db_field, request, **kwargs)
 
     def has_add_permission(self, request):
         return not AnalysisConfig.objects.exists()

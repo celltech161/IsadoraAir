@@ -126,11 +126,58 @@
     width: 100%;
     height: 80px;
     display: block;
+    cursor: crosshair;
+  }
+
+  .cue-selector {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+    margin-bottom: 0.6rem;
+  }
+
+  .cue-selector button {
+    background: var(--bg-darker);
+    border: 1px solid var(--border-subtle);
+    border-radius: 6px;
+    padding: 0.3rem 0.6rem;
+    font-size: 0.72rem;
+    color: var(--text-muted);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    transition: border-color 0.12s, color 0.12s;
+  }
+
+  .cue-selector button:hover {
+    color: var(--text-main);
+  }
+
+  .cue-selector button.active {
+    border-color: var(--cue-color, var(--accent));
+    color: var(--text-main);
+    box-shadow: 0 0 0 1px var(--cue-color, var(--accent)) inset;
+  }
+
+  .cue-selector .swatch {
+    width: 9px;
+    height: 9px;
+    border-radius: 2px;
+    display: inline-block;
+    background: var(--cue-color);
+  }
+
+  .cue-hint {
+    font-size: 0.72rem;
+    color: var(--text-muted);
+    margin-bottom: 0.5rem;
   }
 
   .waveform-legend {
     display: flex;
-    gap: 1.25rem;
+    flex-wrap: wrap;
+    gap: 1.1rem;
     margin-top: 0.4rem;
     font-size: 0.7rem;
     color: var(--text-muted);
@@ -188,12 +235,10 @@
 <audio controls preload="none" src="{% url 'library:api-track-audio' track.pk %}" style="width:100%; max-width:420px; margin-bottom:1rem;"></audio>
 
 <div class="waveform-wrap" id="waveformWrap" style="display:none;">
+  <div class="cue-selector" id="cueSelector"></div>
+  <div class="cue-hint">Click the waveform to set the selected cue point's position.</div>
   <canvas id="waveformCanvas"></canvas>
-  <div class="waveform-legend">
-    <span class="legend-item"><span class="legend-swatch" style="background:#22c55e;"></span> Waveform</span>
-    <span class="legend-item"><span class="legend-swatch" style="background:#3b82f6;"></span> Cue In</span>
-    <span class="legend-item"><span class="legend-swatch" style="background:#f97373;"></span> Next Start</span>
-  </div>
+  <div class="waveform-legend" id="waveformLegend"></div>
 </div>
 
 <div class="detail-grid">
@@ -235,6 +280,15 @@
     <div class="field-row">
       <label>Comments</label>
       <textarea id="f_comments">{{ track.comments }}</textarea>
+    </div>
+    <div class="field-row">
+      <label></label>
+      <button type="button" class="save-btn" style="padding:0.4rem 1rem;font-size:0.78rem;" onclick="readMetadata()" id="readMetaBtn">Read Track Metadata</button>
+      <button type="button" class="save-btn" style="padding:0.4rem 1rem;font-size:0.78rem;background:var(--bg-darker);color:var(--text-main);border:1px solid var(--border-subtle);" onclick="writeMetadata()" id="writeMetaBtn">Write Track Metadata</button>
+    </div>
+    <div class="field-row">
+      <label></label>
+      <span class="save-msg" id="metaMsg">Done</span>
     </div>
   </div>
 
@@ -374,6 +428,11 @@
       <label>Related Artists</label>
       <span class="field-muted">{{ track.related_artists|default:"—" }}</span>
     </div>
+    <div class="field-row">
+      <label></label>
+      <button type="button" class="save-btn" style="padding:0.4rem 1rem;font-size:0.78rem;" onclick="reanalyzeTrack()" id="reanalyzeBtn">Reanalyze Track</button>
+      <span class="save-msg" id="reanalyzeMsg">Done</span>
+    </div>
   </div>
 </div>
 
@@ -475,19 +534,130 @@ async function saveTrack() {
   setTimeout(() => msg.classList.remove('show'), 2000);
 }
 
-// --- Waveform ---
-async function loadWaveform() {
-  const resp = await fetch(`/api/waveform/${TRACK_ID}/`);
-  if (!resp.ok) return;
+// --- File tag metadata (Read/Write Track Metadata) ---
 
-  const data = await resp.json();
-  const samples = data.samples;
-  if (!samples || !samples.length) return;
+function showMetaMsg(text, ok) {
+  const msg = document.getElementById('metaMsg');
+  msg.textContent = text;
+  msg.style.color = ok ? 'var(--accent)' : 'var(--danger)';
+  msg.classList.add('show');
+  setTimeout(() => msg.classList.remove('show'), 3000);
+}
 
-  const wrap = document.getElementById('waveformWrap');
+async function readMetadata() {
+  const btn = document.getElementById('readMetaBtn');
+  btn.disabled = true;
+  try {
+    const resp = await fetch(`/api/tracks/${TRACK_ID}/read-metadata/`, {
+      method: 'POST',
+      headers: { 'X-CSRFToken': getCookie('csrftoken') },
+    });
+    const data = await resp.json();
+    if (!resp.ok) {
+      showMetaMsg(data.error || 'Read failed', false);
+      return;
+    }
+    // Only overwrite a field if the file actually had something for it --
+    // an untagged field in the file shouldn't blank out an existing value.
+    if (data.title) document.getElementById('f_title').value = data.title;
+    if (data.artist) document.getElementById('f_artist').value = data.artist;
+    if (data.album) document.getElementById('f_album').value = data.album;
+    if (data.genre) document.getElementById('f_genre').value = data.genre;
+    if (data.year) document.getElementById('f_year').value = data.year;
+    showMetaMsg('Read from file (not yet saved -- review, then Save Changes or Write Track Metadata)', true);
+  } catch (e) {
+    showMetaMsg('Read failed', false);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function writeMetadata() {
+  const btn = document.getElementById('writeMetaBtn');
+  btn.disabled = true;
+  const body = {
+    title: getVal('f_title'),
+    artist: getVal('f_artist'),
+    album: getVal('f_album') || '',
+    genre: getVal('f_genre') || '',
+    year: getVal('f_year'),
+    composer: getVal('f_composer') || '',
+    publisher: getVal('f_publisher') || '',
+    record_label: getVal('f_record_label') || '',
+    comments: getVal('f_comments') || '',
+  };
+  try {
+    const resp = await fetch(`/api/tracks/${TRACK_ID}/write-metadata/`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-CSRFToken': getCookie('csrftoken'),
+      },
+      body: JSON.stringify(body),
+    });
+    const data = await resp.json();
+    if (!resp.ok) {
+      showMetaMsg(data.error || 'Write failed', false);
+      return;
+    }
+    const skipped = data.skipped && data.skipped.length ? ` (not writable to this file: ${data.skipped.join(', ')})` : '';
+    showMetaMsg('Written to file + saved' + skipped, true);
+  } catch (e) {
+    showMetaMsg('Write failed', false);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// --- Waveform + cue points ---
+
+// One entry per Track field that can be set by clicking the waveform.
+// color doubles as the selector button's accent and the marker's stroke.
+const CUE_FIELDS = [
+  { key: 'cue_in_seconds',       label: 'Cue In',       color: '#3b82f6', input: 'f_cue_in_seconds' },
+  { key: 'cue_out_seconds',      label: 'Cue Out',      color: '#f59e0b', input: 'f_cue_out_seconds' },
+  { key: 'next_start_seconds',   label: 'Next Start',   color: '#f97373', input: 'f_next_start_seconds' },
+  { key: 'intro_until_seconds',  label: 'Intro Until',  color: '#a855f7', input: 'f_intro_until_seconds' },
+  { key: 'sweep_start_seconds',  label: 'Sweep Start',  color: '#eab308', input: 'f_sweep_start_seconds' },
+  { key: 'outro_starts_seconds', label: 'Outro Starts', color: '#ec4899', input: 'f_outro_starts_seconds' },
+  { key: 'hook_in_seconds',      label: 'Hook In',      color: '#22d3ee', input: 'f_hook_in_seconds' },
+  { key: 'hook_out_seconds',     label: 'Hook Out',     color: '#14b8a6', input: 'f_hook_out_seconds' },
+];
+
+let activeCueKey = CUE_FIELDS[0].key;
+let waveformSamplesLeft = null;
+let waveformSamplesRight = null;
+let waveformDuration = dur || 1;
+
+const WAVEFORM_LEFT_COLOR = "{{ analysis_config.waveform_left_color|default:'#22c55e' }}";
+const WAVEFORM_RIGHT_COLOR = "{{ analysis_config.waveform_right_color|default:'#38bdf8' }}";
+
+function buildCueSelector() {
+  const bar = document.getElementById('cueSelector');
+  bar.innerHTML = '';
+  for (const f of CUE_FIELDS) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.style.setProperty('--cue-color', f.color);
+    btn.innerHTML = `<span class="swatch"></span>${f.label}`;
+    btn.addEventListener('click', () => {
+      activeCueKey = f.key;
+      buildCueSelector();
+    });
+    if (f.key === activeCueKey) btn.classList.add('active');
+    bar.appendChild(btn);
+  }
+
+  const legend = document.getElementById('waveformLegend');
+  legend.innerHTML = `<span class="legend-item"><span class="legend-swatch" style="background:${WAVEFORM_LEFT_COLOR};"></span> Left</span>`
+    + `<span class="legend-item"><span class="legend-swatch" style="background:${WAVEFORM_RIGHT_COLOR};"></span> Right</span>`
+    + CUE_FIELDS.map(f => `<span class="legend-item"><span class="legend-swatch" style="background:${f.color};"></span> ${f.label}</span>`).join('');
+}
+
+function drawWaveform() {
+  if (!waveformSamplesLeft || !waveformSamplesLeft.length) return;
+
   const canvas = document.getElementById('waveformCanvas');
-  wrap.style.display = '';
-
   const dpr = window.devicePixelRatio || 1;
   const rect = canvas.getBoundingClientRect();
   canvas.width = rect.width * dpr;
@@ -497,37 +667,46 @@ async function loadWaveform() {
 
   const w = rect.width;
   const h = rect.height;
-  const n = samples.length;
+  const n = waveformSamplesLeft.length;
   const barW = Math.max(1, w / n);
-  const duration = data.analysis_duration || dur || 1;
+  const duration = waveformDuration || 1;
 
-  // Draw waveform bars
-  ctx.fillStyle = '#22c55e';
+  ctx.clearRect(0, 0, w, h);
+
+  // Zero-amplitude line centered, left channel drawn upward, right
+  // channel drawn downward -- linear amplitude, peak-normalized jointly
+  // across both channels (see compute_stereo_waveform).
+  const mid = h / 2;
+  ctx.fillStyle = WAVEFORM_LEFT_COLOR;
   for (let i = 0; i < n; i++) {
-    const level = samples[i] / 255;
-    const barH = level * h;
+    const levelL = waveformSamplesLeft[i] / 255;
+    const barHL = levelL * mid;
     const x = (i / n) * w;
-    ctx.fillRect(x, h - barH, Math.ceil(barW), barH);
+    ctx.fillRect(x, mid - barHL, Math.ceil(barW), barHL);
   }
-
-  // Draw cue-in marker
-  if (data.cue_in_seconds && data.cue_in_seconds > 0) {
-    const x = (data.cue_in_seconds / duration) * w;
-    ctx.strokeStyle = '#3b82f6';
-    ctx.lineWidth = 2;
-    ctx.setLineDash([4, 3]);
-    ctx.beginPath();
-    ctx.moveTo(x, 0);
-    ctx.lineTo(x, h);
-    ctx.stroke();
-    ctx.setLineDash([]);
+  ctx.fillStyle = WAVEFORM_RIGHT_COLOR;
+  for (let i = 0; i < n; i++) {
+    const levelR = waveformSamplesRight[i] / 255;
+    const barHR = levelR * mid;
+    const x = (i / n) * w;
+    ctx.fillRect(x, mid, Math.ceil(barW), barHR);
   }
+  ctx.strokeStyle = 'rgba(148, 163, 184, 0.5)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(0, mid);
+  ctx.lineTo(w, mid);
+  ctx.stroke();
 
-  // Draw next-start marker
-  if (data.next_start) {
-    const x = (data.next_start / duration) * w;
-    ctx.strokeStyle = '#f97373';
-    ctx.lineWidth = 2;
+  // Cue point markers -- read live from the number inputs (not just the
+  // last-loaded/last-saved JSON), so typing a new value or clicking the
+  // canvas both reflect immediately without a round-trip to the server.
+  for (const f of CUE_FIELDS) {
+    const val = getVal(f.input);
+    if (val === null || val === undefined || val < 0) continue;
+    const x = (val / duration) * w;
+    ctx.strokeStyle = f.color;
+    ctx.lineWidth = f.key === activeCueKey ? 3 : 2;
     ctx.setLineDash([4, 3]);
     ctx.beginPath();
     ctx.moveTo(x, 0);
@@ -537,6 +716,83 @@ async function loadWaveform() {
   }
 }
 
+function onWaveformClick(evt) {
+  const canvas = document.getElementById('waveformCanvas');
+  const rect = canvas.getBoundingClientRect();
+  const x = evt.clientX - rect.left;
+  const t = Math.min(waveformDuration, Math.max(0, (x / rect.width) * waveformDuration));
+
+  const field = CUE_FIELDS.find(f => f.key === activeCueKey);
+  const input = document.getElementById(field.input);
+  input.value = t.toFixed(3);
+  drawWaveform();
+}
+
+async function loadWaveform() {
+  const resp = await fetch(`/api/waveform/${TRACK_ID}/`);
+  if (!resp.ok) return;
+
+  const data = await resp.json();
+  if (!data.samples_left || !data.samples_left.length) return;
+
+  waveformSamplesLeft = data.samples_left;
+  waveformSamplesRight = data.samples_right;
+  waveformDuration = data.analysis_duration || dur || 1;
+
+  document.getElementById('waveformWrap').style.display = '';
+  drawWaveform();
+}
+
+buildCueSelector();
+document.getElementById('waveformCanvas').addEventListener('click', onWaveformClick);
+for (const f of CUE_FIELDS) {
+  const el = document.getElementById(f.input);
+  if (el) el.addEventListener('input', drawWaveform);
+}
 loadWaveform();
+
+// --- Reanalyze ---
+async function reanalyzeTrack() {
+  const btn = document.getElementById('reanalyzeBtn');
+  const msg = document.getElementById('reanalyzeMsg');
+  btn.disabled = true;
+  const prevLabel = btn.textContent;
+  btn.textContent = 'Analyzing…';
+
+  try {
+    const resp = await fetch(`/api/tracks/${TRACK_ID}/reanalyze/`, {
+      method: 'POST',
+      headers: { 'X-CSRFToken': getCookie('csrftoken') },
+    });
+    const data = await resp.json();
+
+    if (!resp.ok) {
+      msg.textContent = data.error || 'Reanalyze failed';
+      msg.style.color = 'var(--danger)';
+    } else {
+      // Only the auto-detected fields change -- manual marks (intro,
+      // sweep, outro, hooks) are never touched by analyze_one_track.
+      document.getElementById('f_cue_in_seconds').value = data.cue_in_seconds ?? '';
+      document.getElementById('f_next_start_seconds').value = data.next_start_seconds ?? '';
+      const durEl = document.getElementById('displayDuration');
+      if (data.duration_seconds != null) {
+        const m = Math.floor(data.duration_seconds / 60);
+        const s = Math.round(data.duration_seconds % 60);
+        durEl.textContent = m + ':' + String(s).padStart(2, '0');
+      }
+      await loadWaveform();
+      msg.textContent = 'Reanalyzed';
+      msg.style.color = 'var(--accent)';
+    }
+  } catch (e) {
+    msg.textContent = 'Reanalyze failed';
+    msg.style.color = 'var(--danger)';
+  }
+
+  btn.disabled = false;
+  btn.textContent = prevLabel;
+  msg.classList.add('show');
+  setTimeout(() => msg.classList.remove('show'), 2500);
+}
 </script>
 {% endblock %}

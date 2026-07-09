@@ -19,13 +19,18 @@ from django.utils import timezone
 from django.shortcuts import get_object_or_404
 
 from .models import Artist, Album, Category, Genre, LogItem, Playlist, PlaylistItem, PlaylistLog, Rotation, RotationSlot, ScheduleBlock, Track
-from .services.log_builder import _build_from_playlist, build_hour_log
+from .services.log_builder import _build_from_playlist, build_hour_log, preview_hour_log
 
 
 @ensure_csrf_cookie
 def dashboard_page(request):
+    from library.models import AnalysisConfig
+
     playlists = Playlist.objects.all().order_by("name")
-    return render(request, "library/dashboard.html", {"playlists": playlists})
+    return render(request, "library/dashboard.html", {
+        "playlists": playlists,
+        "analysis_config": AnalysisConfig.load(),
+    })
 
 
 @ensure_csrf_cookie
@@ -567,6 +572,8 @@ def api_track_bulk(request):
 
 @ensure_csrf_cookie
 def track_detail_page(request, pk):
+    from library.models import AnalysisConfig
+
     track = get_object_or_404(
         Track.objects.select_related("artist", "album", "genre", "category"), pk=pk
     )
@@ -577,6 +584,7 @@ def track_detail_page(request, pk):
         "energy_choices": Track.ENERGY_CHOICES,
         "vocal_type_choices": Track.VOCAL_TYPE_CHOICES,
         "end_type_choices": Track.END_TYPE_CHOICES,
+        "analysis_config": AnalysisConfig.load(),
     })
 
 
@@ -681,6 +689,164 @@ def _track_to_dict(track):
     }
 
 
+@require_http_methods(["POST"])
+def api_track_reanalyze(request, pk):
+    """Force a fresh waveform + cue-point (re)analysis of exactly this
+    track -- same analyze_one_track() call api_library_upload uses right
+    after a new upload, just targeted at an existing row instead. Only
+    ever touches next_start_seconds/cue_in_seconds/waveform_path/
+    related_artists/duration_seconds -- the manually-set marks (intro,
+    sweep, outro, hooks) are never written by analyze_one_track, so this
+    can't clobber a human's own cue-point edits."""
+    from library.management.commands.analyze_tracks import analyze_one_track, get_waveforms_dir
+    from library.models import AnalysisConfig
+
+    track = get_object_or_404(Track.objects.select_related("artist"), pk=pk)
+
+    cfg = AnalysisConfig.load()
+    cfg_values = (
+        cfg.analysis_sample_rate, cfg.analysis_window_seconds, cfg.waveform_points,
+        cfg.next_start_threshold_db, cfg.cue_in_threshold_db, cfg.cue_in_min_seconds,
+    )
+    wave_dir = get_waveforms_dir()
+    row = (track.id, track.filepath, track.filename, track.duration_seconds,
+           track.title, track.artist.name if track.artist_id else "", track.related_artists)
+
+    analyzed = analyze_one_track(row, cfg_values, wave_dir, force=True)
+    if not analyzed:
+        return JsonResponse({"error": "Analysis failed -- check the file is readable by ffmpeg"}, status=400)
+
+    track.refresh_from_db()
+    return JsonResponse(_track_to_dict(track))
+
+
+@require_http_methods(["POST"])
+def api_track_read_metadata(request, pk):
+    """Read tags currently embedded in the file on disk -- NOT the DB --
+    and return them for the form to display for review. Reuses
+    import_songs.py's parse_tags(), the same multi-format (ID3/Vorbis/
+    MP4) frame-name fallback logic already proven there. Deliberately
+    does not touch the Track row itself -- the user reviews/edits in the
+    form first, then Save Changes or Write Track Metadata commits it."""
+    from library.management.commands.import_songs import parse_tags
+
+    track = get_object_or_404(Track, pk=pk)
+    fp = Path(track.filepath)
+    if not fp.is_file():
+        return JsonResponse({"error": "File not found on disk"}, status=400)
+
+    tags, _info = parse_tags(fp)
+    return JsonResponse({
+        "title": tags.get("title"),
+        "artist": tags.get("artist"),
+        "album": tags.get("album"),
+        "genre": tags.get("genre"),
+        "year": tags.get("year"),
+    })
+
+
+# DB field -> mutagen "easy" tag key. Not every field has a reliable
+# cross-format equivalent: EasyMP4 (m4a) has no composer/organization
+# key at all, "comment" is only a valid easy key on FLAC, and
+# record_label has no key of its own anywhere (ID3's TPUB is already
+# "organization"/publisher -- reusing it for both would silently
+# conflate two different DB fields). Those are simply never attempted;
+# api_track_write_metadata reports exactly which fields made it into
+# the file vs. were skipped, rather than guessing.
+_METADATA_TAG_MAP = {
+    "title": "title",
+    "artist": "artist",
+    "album": "album",
+    "genre": "genre",
+    "composer": "composer",
+    "publisher": "organization",
+    "comments": "comment",
+}
+
+
+def _write_file_tags(filepath, values):
+    import mutagen
+
+    audio = mutagen.File(str(filepath), easy=True)
+    if audio is None:
+        raise ValueError("Unrecognized or unreadable audio file")
+
+    written, skipped = [], []
+    for field, key in _METADATA_TAG_MAP.items():
+        value = values.get(field)
+        if not value:
+            continue
+        try:
+            audio[key] = str(value)
+            written.append(field)
+        except Exception:
+            skipped.append(field)
+
+    year = values.get("year")
+    if year:
+        try:
+            audio["date"] = str(year)
+            written.append("year")
+        except Exception:
+            skipped.append("year")
+
+    audio.save()
+    return written, skipped
+
+
+@require_http_methods(["POST"])
+def api_track_write_metadata(request, pk):
+    """Write the posted field values into the file's embedded tags AND
+    save them to the Track row in the same action, so the file and DB
+    can't drift apart from each other the way a file-only or DB-only
+    save would risk. record_label is always DB-only (see
+    _METADATA_TAG_MAP) -- still saved to the Track row, just never
+    written into the file."""
+    track = get_object_or_404(Track.objects.select_related("artist", "album", "genre"), pk=pk)
+    try:
+        body = json.loads(request.body)
+    except (json.JSONDecodeError, ValueError):
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+
+    fp = Path(track.filepath)
+    if not fp.is_file():
+        return JsonResponse({"error": "File not found on disk"}, status=400)
+
+    try:
+        written, skipped = _write_file_tags(fp, body)
+    except Exception as exc:
+        return JsonResponse({"error": f"Failed to write tags: {exc}"}, status=400)
+
+    if body.get("title"):
+        track.title = body["title"]
+    if body.get("artist"):
+        artist_obj, _ = Artist.objects.get_or_create(name=body["artist"])
+        track.artist = artist_obj
+    if "album" in body:
+        if body["album"]:
+            album_obj, _ = Album.objects.get_or_create(title=body["album"], defaults={"album_artist": ""})
+            track.album = album_obj
+        else:
+            track.album = None
+    if "genre" in body:
+        if body["genre"]:
+            genre_obj, _ = Genre.objects.get_or_create(name=body["genre"])
+            track.genre = genre_obj
+        else:
+            track.genre = None
+    for field in ("year", "composer", "publisher", "record_label", "comments"):
+        if field in body:
+            setattr(track, field, body[field])
+
+    track.save()
+    track.refresh_from_db()
+
+    result = _track_to_dict(track)
+    result["written"] = written
+    result["skipped"] = skipped
+    return JsonResponse(result)
+
+
 # ---------------------------------------------------------------
 # Log builder
 # ---------------------------------------------------------------
@@ -744,6 +910,38 @@ def api_log_build(request):
         return JsonResponse({"error": error}, status=400)
 
     return JsonResponse(_log_to_dict(log))
+
+
+@require_http_methods(["POST"])
+def api_log_preview(request):
+    """Dry-run build for rotation/playlist health-checking -- calls
+    preview_hour_log, which never touches PlaylistLog/LogItem, so this is
+    safe to call against any date/hour (including one that's already
+    live/approved/on-air) without side effects."""
+    try:
+        body = json.loads(request.body)
+    except (json.JSONDecodeError, ValueError):
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+
+    date_str = body.get("date")
+    hour = body.get("hour")
+
+    if not date_str or hour is None:
+        return JsonResponse({"error": "date and hour are required"}, status=400)
+
+    try:
+        target_date = date_type.fromisoformat(date_str)
+    except (ValueError, TypeError):
+        return JsonResponse({"error": "Invalid date format (use YYYY-MM-DD)"}, status=400)
+
+    if not (0 <= hour <= 23):
+        return JsonResponse({"error": "hour must be 0-23"}, status=400)
+
+    result, error = preview_hour_log(target_date, hour)
+    if error:
+        return JsonResponse({"error": error}, status=400)
+
+    return JsonResponse(result)
 
 
 @require_http_methods(["GET"])
@@ -1173,7 +1371,6 @@ def api_library_upload(request):
     cfg_values = (
         cfg.analysis_sample_rate, cfg.analysis_window_seconds, cfg.waveform_points,
         cfg.next_start_threshold_db, cfg.cue_in_threshold_db, cfg.cue_in_min_seconds,
-        cfg.waveform_floor_db,
     )
     wave_dir = get_waveforms_dir()
 

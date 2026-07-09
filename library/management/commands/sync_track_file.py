@@ -114,7 +114,6 @@ class Command(BaseCommand):
         cfg_values = (
             cfg.analysis_sample_rate, cfg.analysis_window_seconds, cfg.waveform_points,
             cfg.next_start_threshold_db, cfg.cue_in_threshold_db, cfg.cue_in_min_seconds,
-            cfg.waveform_floor_db,
         )
         wave_dir = get_waveforms_dir()
 
