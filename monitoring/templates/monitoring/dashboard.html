@@ -18,7 +18,7 @@
   .mon-stale-banner.show { display: block; }
 
   .mon-group {
-    margin-bottom: 1.75rem;
+    margin-bottom: 1.15rem;
   }
   .mon-group h2 {
     font-size: 0.95rem;
@@ -26,25 +26,25 @@
     color: var(--text-muted);
     text-transform: uppercase;
     letter-spacing: 0.04em;
-    margin-bottom: 0.6rem;
+    margin-bottom: 0.4rem;
   }
   .mon-cards {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
-    gap: 0.75rem;
+    grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+    gap: 0.55rem;
   }
   .mon-card {
     background: var(--panel-bg);
     border: 1px solid var(--border-subtle);
     border-radius: 10px;
-    padding: 0.85rem 1rem;
+    padding: 0.6rem 0.8rem;
   }
   .mon-card-top {
     display: flex;
     align-items: center;
     justify-content: space-between;
     gap: 0.5rem;
-    margin-bottom: 0.5rem;
+    margin-bottom: 0.35rem;
   }
   .mon-card-name {
     font-size: 0.9rem;
@@ -102,6 +102,24 @@
   .mon-uptime.warning { color: #f59e0b; }
   .mon-uptime.critical { color: var(--danger); }
   .mon-uptime.unknown { color: var(--text-muted); }
+
+  .mon-uptime-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+  }
+  .mon-restart-btn {
+    font-size: 0.7rem;
+    font-weight: 700;
+    padding: 0.25rem 0.6rem;
+    border-radius: 4px;
+    border: 1px solid var(--border-subtle);
+    background: transparent;
+    color: var(--text-muted);
+    cursor: pointer;
+  }
+  .mon-restart-btn:hover { border-color: var(--danger); color: var(--danger); }
 
   /* --- percent + bar, for disk/memory/cpu --- */
   .mon-bar-row {
@@ -312,8 +330,42 @@ function renderSystemdBody(check) {
       <span class="mon-led ${check.status}"></span>
       <span class="mon-led-caption">${caption}</span>
     </div>
-    ${uptimeHours != null ? `<div class="mon-uptime">Up ${uptimeHours} hrs</div>` : ""}
+    <div class="mon-uptime-row">
+      <span class="mon-uptime">${uptimeHours != null ? `Up ${uptimeHours} hrs` : ""}</span>
+      <button class="mon-restart-btn" data-check-id="${check.id}" data-check-name="${escapeHtmlAttr(check.name)}" onclick="restartService(this)">Restart</button>
+    </div>
   `;
+}
+
+function escapeHtmlAttr(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML.replace(/"/g, '&quot;');
+}
+
+function getCookie(name) {
+  let val = null;
+  document.cookie.split(';').forEach(c => {
+    c = c.trim();
+    if (c.startsWith(name + '='))
+      val = decodeURIComponent(c.substring(name.length + 1));
+  });
+  return val;
+}
+
+async function restartService(btn) {
+  const checkId = btn.dataset.checkId;
+  const name = btn.dataset.checkName;
+  if (!confirm(`Restart ${name}? This may briefly interrupt service.`)) return;
+  try {
+    const resp = await fetch(`/monitoring/api/restart/${checkId}/`, {
+      method: 'POST',
+      headers: { 'X-CSRFToken': getCookie('csrftoken') },
+    });
+    if (!resp.ok) alert(`Restart request for ${name} failed.`);
+  } catch (e) {
+    alert(`Restart request for ${name} failed.`);
+  }
 }
 
 function renderPercentBody(check) {
@@ -535,7 +587,7 @@ function renderGroups(checks) {
           <span class="mon-card-name">${check.name}</span>
           ${showPill ? `<span class="mon-pill ${check.status}">${check.status}</span>` : ""}
         </div>
-        <div class="mon-card-since">${check.since ? "for " + formatSince(check.since) : ""}</div>
+        ${check.kind !== "systemd" ? `<div class="mon-card-since">${check.since ? "for " + formatSince(check.since) : ""}</div>` : ""}
         ${renderCardBody(check, byTxRef)}
       `;
       cardsEl.appendChild(card);

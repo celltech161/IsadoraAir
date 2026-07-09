@@ -1,11 +1,14 @@
 import json
+import subprocess
 import time
 from pathlib import Path
 
 from django.http import JsonResponse
-from django.shortcuts import render
+from django.shortcuts import get_object_or_404, render
 from django.views.decorators.csrf import ensure_csrf_cookie
 from django.views.decorators.http import require_http_methods
+
+from .models import MonitorCheck
 
 STATE_PATH = Path("/run/isadoraair/monitoring_state.json")
 STATE_STALE_SECONDS = 30  # 3x the poller's 10s cadence
@@ -27,6 +30,24 @@ def api_monitoring_status(request):
     data.pop("_cooldowns", None)  # internal bookkeeping, not for the browser
     data["stale"] = (time.time() - data.get("timestamp", 0)) > STATE_STALE_SECONDS
     return JsonResponse(data)
+
+
+@require_http_methods(["POST"])
+def api_restart_check(request, check_id):
+    """Restart the systemd unit backing one MonitorCheck card. The unit
+    name always comes from the check row itself (never from the
+    request) -- the client only ever supplies a check id, so this can't
+    be used to restart an arbitrary unit on the box. Fire-and-forget
+    Popen, same as the original engine-restart button this replaces:
+    a blocking subprocess.run here would tie up a gunicorn worker for
+    the duration of the stop/start (or hang the request entirely if the
+    unit's stop-timeout is ever hit, as happened for real with the
+    playback engine earlier -- see PROJECT_NOTES.md)."""
+    check = get_object_or_404(MonitorCheck, pk=check_id, kind="systemd")
+    if not check.systemd_unit:
+        return JsonResponse({"error": "No systemd unit configured for this check"}, status=400)
+    subprocess.Popen(["sudo", "systemctl", "restart", check.systemd_unit])
+    return JsonResponse({"ok": True, "unit": check.systemd_unit})
 
 
 @require_http_methods(["GET"])
