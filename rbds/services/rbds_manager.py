@@ -121,7 +121,20 @@ class RBDSManager:
         if rt_text != self._last_sent_rt:
             self._rt_ab_flag = not self._rt_ab_flag
 
-        if changed or due_for_full_resend:
+        # While disconnected, retry every tick rather than waiting for the
+        # 30s full-resend window -- _ensure_tcp_connected()'s own
+        # TCP_RECONNECT_BACKOFF (1/2/5/10/30s) is what actually paces the
+        # real connect attempts; that backoff is dead code if this outer
+        # gate only lets _send() run once per 30s regardless of connection
+        # state; a failed attempt still stamps _last_full_resend below,
+        # which used to reset the 30s window on every failure and starve
+        # the fast early retries entirely. Confirmed live: a plain
+        # `systemctl restart isadoraair-rbds` issued while StereoTool's
+        # own TCP listener was still mid-startup left RBDS stuck for well
+        # over a minute -- a second restart happened to land after
+        # StereoTool was ready and "fixed" it, which looked like the admin
+        # save mattered but was really just a lucky retry window.
+        if changed or due_for_full_resend or not self._connected:
             self._send(config, target_ps, rt_text, rt_artist, rt_title)
             self._last_sent_ps = target_ps
             self._last_sent_rt = rt_text

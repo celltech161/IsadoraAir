@@ -37,9 +37,10 @@ class RBDSConfig(models.Model):
                    "StereoTool normally runs on this same box.",
     )
     port = models.PositiveIntegerField(
-        default=1001,
-        help_text="StereoTool's UECP/ASCII server port. This box's own StereoTool "
-                   "instance uses 1001 (StereoTool's own generic default is 4001).",
+        default=4001,
+        help_text="StereoTool's UECP/ASCII server port. 4001 is StereoTool's own "
+                   "generic default, and what this box's own StereoTool instance "
+                   "actually listens on.",
     )
     transport = models.CharField(max_length=3, choices=TRANSPORT_CHOICES, default="tcp")
     protocol = models.CharField(
