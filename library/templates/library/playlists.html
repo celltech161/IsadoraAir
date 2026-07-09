@@ -244,6 +244,7 @@
     <option value="">Select a playlist...</option>
   </select>
   <button class="pl-btn" onclick="createPlaylist()">New Playlist</button>
+  <button class="pl-btn" id="copyPlaylistBtn" onclick="copyCurrentPlaylist()" disabled>Copy to New...</button>
   <button class="pl-btn danger" id="deletePlaylistBtn" onclick="deleteCurrentPlaylist()" disabled>Delete</button>
   <span class="pl-msg" id="playlistMsg"></span>
 </div>
@@ -375,6 +376,7 @@ document.getElementById('playlistSelect').addEventListener('change', function() 
     document.getElementById('playlistMeta').style.display = 'none';
     document.getElementById('noPlaylistMsg').style.display = '';
     document.getElementById('deletePlaylistBtn').disabled = true;
+    document.getElementById('copyPlaylistBtn').disabled = true;
   }
 });
 
@@ -419,7 +421,30 @@ async function deleteCurrentPlaylist() {
   document.getElementById('playlistMeta').style.display = 'none';
   document.getElementById('noPlaylistMsg').style.display = '';
   document.getElementById('deletePlaylistBtn').disabled = true;
+  document.getElementById('copyPlaylistBtn').disabled = true;
   await loadPlaylistList('');
+}
+
+async function copyCurrentPlaylist() {
+  if (!currentPlaylist) return;
+  const name = prompt('Name for the copy:', `${currentPlaylist.name} (Copy)`);
+  if (!name || !name.trim()) return;
+
+  const { ok, data } = await apiJson(`/api/playlists/${currentPlaylist.id}/copy/`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') },
+    body: JSON.stringify({ name: name.trim() }),
+  });
+
+  if (!ok) {
+    setMsg(data && data.error ? data.error : 'Could not copy playlist', true);
+    return;
+  }
+
+  setMsg('');
+  await loadPlaylistList(data.id);
+  document.getElementById('playlistSelect').value = data.id;
+  loadPlaylistDetail(data.id);
 }
 
 async function loadPlaylistDetail(id) {
@@ -433,6 +458,7 @@ async function loadPlaylistDetail(id) {
   document.getElementById('playlistMeta').style.display = '';
   document.getElementById('playlistWrap').style.display = '';
   document.getElementById('deletePlaylistBtn').disabled = false;
+  document.getElementById('copyPlaylistBtn').disabled = false;
 }
 
 function renderPlaylistMeta() {

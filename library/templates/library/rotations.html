@@ -276,6 +276,7 @@
     <option value="">Select a rotation...</option>
   </select>
   <button class="pl-btn" onclick="createRotation()">New Rotation</button>
+  <button class="pl-btn" id="copyRotationBtn" onclick="copyCurrentRotation()" disabled>Copy to New...</button>
   <button class="pl-btn danger" id="deleteRotationBtn" onclick="deleteCurrentRotation()" disabled>Delete</button>
   <span class="pl-msg" id="rotationMsg"></span>
 </div>
@@ -418,6 +419,7 @@ document.getElementById('rotationSelect').addEventListener('change', function() 
     document.getElementById('rotationMeta').style.display = 'none';
     document.getElementById('noRotationMsg').style.display = '';
     document.getElementById('deleteRotationBtn').disabled = true;
+    document.getElementById('copyRotationBtn').disabled = true;
   }
 });
 
@@ -462,7 +464,30 @@ async function deleteCurrentRotation() {
   document.getElementById('rotationMeta').style.display = 'none';
   document.getElementById('noRotationMsg').style.display = '';
   document.getElementById('deleteRotationBtn').disabled = true;
+  document.getElementById('copyRotationBtn').disabled = true;
   await loadRotationList('');
+}
+
+async function copyCurrentRotation() {
+  if (!currentRotation) return;
+  const name = prompt('Name for the copy:', `${currentRotation.name} (Copy)`);
+  if (!name || !name.trim()) return;
+
+  const { ok, data } = await apiJson(`/api/rotations/${currentRotation.id}/copy/`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') },
+    body: JSON.stringify({ name: name.trim() }),
+  });
+
+  if (!ok) {
+    setMsg(data && data.error ? data.error : 'Could not copy rotation', true);
+    return;
+  }
+
+  setMsg('');
+  await loadRotationList(data.id);
+  document.getElementById('rotationSelect').value = data.id;
+  loadRotationDetail(data.id);
 }
 
 async function loadRotationDetail(id) {
@@ -476,6 +501,7 @@ async function loadRotationDetail(id) {
   document.getElementById('rotationMeta').style.display = '';
   document.getElementById('rotationWrap').style.display = '';
   document.getElementById('deleteRotationBtn').disabled = false;
+  document.getElementById('copyRotationBtn').disabled = false;
 }
 
 function renderRotationMeta() {

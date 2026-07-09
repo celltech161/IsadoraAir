@@ -1,0 +1,426 @@
+{% extends "base.html" %}
+
+{% block title %}Categories — IsadoraAir{% endblock %}
+{% block nav_categories %}class="active"{% endblock %}
+
+{% block extra_css %}
+<style>
+  .pl-toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.6rem;
+    align-items: center;
+    margin-bottom: 0.75rem;
+  }
+
+  .pl-select, .pl-input, .pl-textarea {
+    background: var(--bg-dark);
+    border: 1px solid var(--border-subtle);
+    border-radius: 8px;
+    padding: 0.45rem 0.65rem;
+    color: var(--text-main);
+    font-size: 0.85rem;
+    font-family: inherit;
+  }
+  .pl-select:focus, .pl-input:focus, .pl-textarea:focus { outline: none; border-color: var(--accent); }
+  .pl-select { cursor: pointer; }
+
+  .pl-btn {
+    background: var(--bg-dark);
+    border: 1px solid var(--border-subtle);
+    border-radius: 8px;
+    color: var(--text-main);
+    padding: 0.45rem 0.9rem;
+    font-size: 0.82rem;
+    cursor: pointer;
+    transition: border-color 0.12s;
+  }
+  .pl-btn:hover { border-color: var(--accent); }
+  .pl-btn.danger { color: var(--danger); }
+  .pl-btn.danger:hover { border-color: var(--danger); }
+  .pl-btn.primary { border-color: var(--accent); color: var(--accent); }
+  .pl-btn:disabled { opacity: 0.4; cursor: default; }
+
+  .pl-msg {
+    font-size: 0.8rem;
+    color: var(--text-muted);
+  }
+  .pl-msg.error { color: var(--danger); }
+
+  /* --- Two-pane layout --- */
+  .pl-wrap {
+    display: grid;
+    grid-template-columns: 1.3fr 1fr;
+    gap: 1.25rem;
+    align-items: flex-start;
+  }
+  @media (max-width: 900px) {
+    .pl-wrap { grid-template-columns: 1fr; }
+  }
+
+  .pl-pane {
+    background: var(--bg-dark);
+    border: 1px solid var(--border-subtle);
+    border-radius: 10px;
+    padding: 0.85rem;
+  }
+
+  .pl-pane h3 {
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: var(--text-muted);
+    margin-bottom: 0.6rem;
+  }
+
+  /* --- Category list table --- */
+  .pl-items-wrap {
+    overflow-x: auto;
+    border-radius: 8px;
+    border: 1px solid var(--border-subtle);
+    max-height: 640px;
+    overflow-y: auto;
+  }
+
+  table.pl-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.8rem;
+  }
+
+  table.pl-table th {
+    background: var(--bg-darker);
+    color: var(--text-muted);
+    font-weight: 600;
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    padding: 0.45rem 0.6rem;
+    text-align: left;
+    border-bottom: 1px solid var(--border-subtle);
+    position: sticky;
+    top: 0;
+  }
+
+  table.pl-table td {
+    padding: 0.4rem 0.6rem;
+    border-bottom: 1px solid rgba(148, 163, 184, 0.08);
+    color: var(--text-main);
+  }
+
+  table.pl-table tr.cat-row { cursor: pointer; transition: background 0.1s; }
+  table.pl-table tr.cat-row:hover td { background: rgba(148, 163, 184, 0.06); }
+  table.pl-table tr.cat-row.active td { background: rgba(34, 197, 94, 0.08); }
+
+  td.pl-col-num { color: var(--text-muted); text-align: right; white-space: nowrap; }
+
+  .cat-kind-badge {
+    display: inline-block;
+    font-size: 0.68rem;
+    font-weight: 600;
+    padding: 0.1rem 0.45rem;
+    border-radius: 4px;
+    white-space: nowrap;
+  }
+
+  .cat-swatch {
+    display: inline-block;
+    width: 10px;
+    height: 10px;
+    border-radius: 3px;
+    margin-right: 0.4rem;
+    vertical-align: middle;
+    border: 1px solid rgba(148, 163, 184, 0.3);
+  }
+
+  /* --- Form pane --- */
+  .cat-form-row {
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+    margin-bottom: 0.75rem;
+  }
+  .cat-form-row label {
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-muted);
+  }
+  .cat-form-row .pl-input, .cat-form-row .pl-select, .cat-form-row .pl-textarea { width: 100%; }
+  .cat-form-two {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0.75rem;
+  }
+  .cat-form-hint {
+    font-size: 0.72rem;
+    color: var(--text-muted);
+    margin-top: 0.15rem;
+  }
+  .cat-form-actions {
+    display: flex;
+    gap: 0.5rem;
+    margin-top: 1rem;
+  }
+
+  .pl-empty {
+    text-align: center;
+    padding: 2rem 1rem;
+    color: var(--text-muted);
+    font-size: 0.85rem;
+  }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="pl-toolbar">
+  <button class="pl-btn primary" onclick="newCategory()">New Category</button>
+  <span class="pl-msg" id="catMsg"></span>
+</div>
+
+<div class="pl-wrap">
+  <div class="pl-pane">
+    <h3>Categories</h3>
+    <div class="pl-items-wrap">
+      <table class="pl-table">
+        <thead>
+          <tr>
+            <th></th>
+            <th>Code</th>
+            <th>Name</th>
+            <th>Kind</th>
+            <th class="pl-col-num">Tracks</th>
+            <th class="pl-col-num">Sort</th>
+          </tr>
+        </thead>
+        <tbody id="categoryTbody"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="pl-pane">
+    <h3 id="formTitle">New Category</h3>
+    <form id="categoryForm" onsubmit="return false;">
+      <div class="cat-form-two">
+        <div class="cat-form-row">
+          <label for="fCode">Code</label>
+          <input type="text" class="pl-input" id="fCode" placeholder="e.g. HOT_CURR" maxlength="20">
+        </div>
+        <div class="cat-form-row">
+          <label for="fKind">Kind</label>
+          <select class="pl-select" id="fKind">
+            {% for k in kinds %}
+            <option value="{{ k.id }}">{{ k.name }}</option>
+            {% endfor %}
+          </select>
+        </div>
+      </div>
+
+      <div class="cat-form-row">
+        <label for="fName">Name</label>
+        <input type="text" class="pl-input" id="fName" placeholder="e.g. Hot Current" maxlength="100">
+      </div>
+
+      <div class="cat-form-row">
+        <label for="fDescription">Description</label>
+        <textarea class="pl-textarea" id="fDescription" rows="2" placeholder="Optional"></textarea>
+      </div>
+
+      <div class="cat-form-two">
+        <div class="cat-form-row">
+          <label for="fColor">Color</label>
+          <input type="text" class="pl-input" id="fColor" placeholder="Optional, e.g. #3b82f6">
+        </div>
+        <div class="cat-form-row">
+          <label for="fSortOrder">Sort Order</label>
+          <input type="number" class="pl-input" id="fSortOrder" value="0" step="1">
+        </div>
+      </div>
+
+      <div class="cat-form-row">
+        <label for="fRecencyMode">Recency Mode</label>
+        <select class="pl-select" id="fRecencyMode">
+          <option value="time">Time-based</option>
+          <option value="proportional">Proportional to category size</option>
+        </select>
+      </div>
+
+      <div class="cat-form-two">
+        <div class="cat-form-row">
+          <label for="fArtistSep">Artist Separation (hrs)</label>
+          <input type="number" class="pl-input" id="fArtistSep" placeholder="Global default" step="0.1" min="0">
+        </div>
+        <div class="cat-form-row">
+          <label for="fTitleSep">Title Separation (hrs)</label>
+          <input type="number" class="pl-input" id="fTitleSep" placeholder="Global default" step="0.1" min="0">
+        </div>
+      </div>
+      <div class="cat-form-hint">Leave separation fields blank to use the global defaults from Recency Configuration.</div>
+
+      <div class="cat-form-actions">
+        <button type="button" class="pl-btn primary" onclick="saveCategory()">Save</button>
+        <button type="button" class="pl-btn danger" id="deleteCategoryBtn" onclick="deleteCurrentCategory()" style="display:none;">Delete</button>
+        <button type="button" class="pl-btn" onclick="newCategory()">Clear</button>
+      </div>
+    </form>
+  </div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+let categories = [];
+let currentCategoryId = null;
+
+function getCookie(name) {
+  let val = null;
+  document.cookie.split(';').forEach(c => {
+    c = c.trim();
+    if (c.startsWith(name + '='))
+      val = decodeURIComponent(c.substring(name.length + 1));
+  });
+  return val;
+}
+
+function esc(s) {
+  if (!s) return '';
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+function setMsg(text, isError) {
+  const el = document.getElementById('catMsg');
+  el.textContent = text || '';
+  el.className = 'pl-msg' + (isError ? ' error' : '');
+}
+
+async function apiJson(url, options) {
+  const resp = await fetch(url, options);
+  let data = null;
+  try { data = await resp.json(); } catch (e) { /* no body */ }
+  return { ok: resp.ok, data };
+}
+
+async function loadCategories() {
+  const resp = await fetch('/api/categories/');
+  if (!resp.ok) return;
+  const data = await resp.json();
+  categories = data.categories;
+  renderCategoryTable();
+}
+
+function renderCategoryTable() {
+  const tbody = document.getElementById('categoryTbody');
+  if (!categories.length) {
+    tbody.innerHTML = '<tr><td colspan="6" class="pl-empty">No categories yet -- click "New Category" to create one.</td></tr>';
+    return;
+  }
+  tbody.innerHTML = categories.map(c => `
+    <tr class="cat-row${c.id === currentCategoryId ? ' active' : ''}" onclick="editCategory(${c.id})">
+      <td><span class="cat-swatch" style="background:${c.color || 'transparent'};"></span></td>
+      <td>${esc(c.code)}</td>
+      <td>${esc(c.name)}</td>
+      <td><span class="cat-kind-badge" style="background:rgba(148,163,184,0.15);">${esc(c.kind_name)}</span></td>
+      <td class="pl-col-num">${c.track_count}</td>
+      <td class="pl-col-num">${c.sort_order}</td>
+    </tr>
+  `).join('');
+}
+
+function newCategory() {
+  currentCategoryId = null;
+  document.getElementById('formTitle').textContent = 'New Category';
+  document.getElementById('fCode').value = '';
+  document.getElementById('fName').value = '';
+  document.getElementById('fKind').selectedIndex = 0;
+  document.getElementById('fDescription').value = '';
+  document.getElementById('fColor').value = '';
+  document.getElementById('fSortOrder').value = 0;
+  document.getElementById('fRecencyMode').value = 'time';
+  document.getElementById('fArtistSep').value = '';
+  document.getElementById('fTitleSep').value = '';
+  document.getElementById('deleteCategoryBtn').style.display = 'none';
+  setMsg('');
+  renderCategoryTable();
+}
+
+function editCategory(id) {
+  const c = categories.find(x => x.id === id);
+  if (!c) return;
+  currentCategoryId = id;
+  document.getElementById('formTitle').textContent = `Edit: ${c.code}`;
+  document.getElementById('fCode').value = c.code;
+  document.getElementById('fName').value = c.name;
+  document.getElementById('fKind').value = c.kind_id;
+  document.getElementById('fDescription').value = c.description || '';
+  document.getElementById('fColor').value = c.color || '';
+  document.getElementById('fSortOrder').value = c.sort_order;
+  document.getElementById('fRecencyMode').value = c.recency_mode;
+  document.getElementById('fArtistSep').value = c.artist_separation != null ? c.artist_separation : '';
+  document.getElementById('fTitleSep').value = c.title_separation != null ? c.title_separation : '';
+  document.getElementById('deleteCategoryBtn').style.display = '';
+  setMsg('');
+  renderCategoryTable();
+}
+
+async function saveCategory() {
+  const payload = {
+    code: document.getElementById('fCode').value.trim(),
+    name: document.getElementById('fName').value.trim(),
+    kind_id: document.getElementById('fKind').value,
+    description: document.getElementById('fDescription').value,
+    color: document.getElementById('fColor').value.trim(),
+    sort_order: parseInt(document.getElementById('fSortOrder').value) || 0,
+    recency_mode: document.getElementById('fRecencyMode').value,
+    artist_separation: document.getElementById('fArtistSep').value === '' ? null : parseFloat(document.getElementById('fArtistSep').value),
+    title_separation: document.getElementById('fTitleSep').value === '' ? null : parseFloat(document.getElementById('fTitleSep').value),
+  };
+
+  if (!payload.code || !payload.name) {
+    setMsg('Code and name are required.', true);
+    return;
+  }
+
+  const url = currentCategoryId ? `/api/categories/${currentCategoryId}/` : '/api/categories/';
+  const method = currentCategoryId ? 'PATCH' : 'POST';
+
+  const { ok, data } = await apiJson(url, {
+    method,
+    headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') },
+    body: JSON.stringify(payload),
+  });
+
+  if (!ok) {
+    setMsg(data && data.error ? data.error : 'Could not save category', true);
+    return;
+  }
+
+  setMsg(currentCategoryId ? 'Saved.' : 'Category created.');
+  await loadCategories();
+  editCategory(data.id);
+}
+
+async function deleteCurrentCategory() {
+  if (!currentCategoryId) return;
+  const c = categories.find(x => x.id === currentCategoryId);
+  if (!confirm(`Delete category "${c ? c.code : ''}"? This cannot be undone.`)) return;
+
+  const { ok, data } = await apiJson(`/api/categories/${currentCategoryId}/`, {
+    method: 'DELETE',
+    headers: { 'X-CSRFToken': getCookie('csrftoken') },
+  });
+
+  if (!ok) {
+    setMsg(data && data.error ? data.error : 'Could not delete category', true);
+    return;
+  }
+
+  setMsg('Category deleted.');
+  await loadCategories();
+  newCategory();
+}
+
+loadCategories();
+</script>
+{% endblock %}

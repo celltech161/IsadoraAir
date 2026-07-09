@@ -17,7 +17,7 @@ from django.utils import timezone
 
 from django.shortcuts import get_object_or_404
 
-from .models import Artist, Album, Category, Genre, LogItem, Playlist, PlaylistItem, PlaylistLog, Rotation, RotationSlot, ScheduleBlock, Track
+from .models import Artist, Album, Category, CategoryKind, Genre, LogItem, Playlist, PlaylistItem, PlaylistLog, Rotation, RotationSlot, ScheduleBlock, Track
 from .services.log_builder import _build_from_playlist, build_hour_log, preview_hour_log
 
 
@@ -117,6 +117,150 @@ def api_schedule_list(request):
 def api_schedule_delete(request, pk):
     deleted, _ = ScheduleBlock.objects.filter(pk=pk).delete()
     return JsonResponse({"ok": True, "deleted": deleted > 0})
+
+
+# ---------------------------------------------------------------
+# Categories
+# ---------------------------------------------------------------
+
+def _blank_to_none(value):
+    """0 is a meaningful separation-hours value (no gap required), so a
+    plain `value or None` would wrongly collapse it to None -- only an
+    actually-blank field (None/"") should mean 'use the global default'."""
+    return None if value in (None, "") else value
+
+
+def _category_to_dict(category):
+    return {
+        "id": category.id,
+        "code": category.code,
+        "name": category.name,
+        "kind_id": category.kind_id,
+        "kind_code": category.kind.code if category.kind_id else "",
+        "kind_name": category.kind.name if category.kind_id else "",
+        "description": category.description,
+        "color": category.color,
+        "sort_order": category.sort_order,
+        "recency_mode": category.recency_mode,
+        "artist_separation": category.artist_separation,
+        "title_separation": category.title_separation,
+        "track_count": getattr(category, "_track_count", None),
+    }
+
+
+@ensure_csrf_cookie
+def categories_page(request):
+    kinds = CategoryKind.objects.order_by("sort_order", "name")
+    return render(request, "library/categories.html", {"kinds": kinds})
+
+
+@require_http_methods(["GET", "POST"])
+def api_category_list(request):
+    if request.method == "GET":
+        categories = (
+            Category.objects.select_related("kind")
+            .annotate(_track_count=Count("tracks", distinct=True))
+            .order_by("sort_order", "code")
+        )
+        return JsonResponse({"categories": [_category_to_dict(c) for c in categories]})
+
+    try:
+        body = json.loads(request.body)
+    except (json.JSONDecodeError, ValueError):
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+
+    code = (body.get("code") or "").strip()
+    name = (body.get("name") or "").strip()
+    kind_id = body.get("kind_id")
+
+    if not code or not name or not kind_id:
+        return JsonResponse({"error": "code, name, and kind_id are required"}, status=400)
+
+    if Category.objects.filter(code=code).exists():
+        return JsonResponse({"error": "A category with that code already exists"}, status=400)
+
+    kind = get_object_or_404(CategoryKind, pk=kind_id)
+
+    category = Category(
+        code=code,
+        name=name,
+        kind=kind,
+        description=body.get("description", ""),
+        color=body.get("color", ""),
+        sort_order=body.get("sort_order") or 0,
+        recency_mode=body.get("recency_mode") or "time",
+        artist_separation=_blank_to_none(body.get("artist_separation")),
+        title_separation=_blank_to_none(body.get("title_separation")),
+    )
+    try:
+        category.full_clean()
+    except ValidationError as e:
+        return JsonResponse({"error": "; ".join(e.messages)}, status=400)
+    category.save()
+
+    category = Category.objects.select_related("kind").annotate(_track_count=Count("tracks", distinct=True)).get(pk=category.pk)
+    return JsonResponse(_category_to_dict(category))
+
+
+@require_http_methods(["GET", "PATCH", "DELETE"])
+def api_category_detail(request, pk):
+    category = get_object_or_404(
+        Category.objects.select_related("kind").annotate(_track_count=Count("tracks", distinct=True)),
+        pk=pk,
+    )
+
+    if request.method == "GET":
+        return JsonResponse(_category_to_dict(category))
+
+    if request.method == "DELETE":
+        try:
+            category.delete()
+        except ProtectedError:
+            slot_count = category.rotation_slots.count()
+            return JsonResponse({
+                "error": f"Category is used by {slot_count} rotation slot(s). Remove those first.",
+            }, status=400)
+        return JsonResponse({"ok": True})
+
+    try:
+        body = json.loads(request.body)
+    except (json.JSONDecodeError, ValueError):
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+
+    if "code" in body:
+        code = (body["code"] or "").strip()
+        if not code:
+            return JsonResponse({"error": "code cannot be blank"}, status=400)
+        if Category.objects.exclude(pk=category.pk).filter(code=code).exists():
+            return JsonResponse({"error": "A category with that code already exists"}, status=400)
+        category.code = code
+    if "name" in body:
+        name = (body["name"] or "").strip()
+        if not name:
+            return JsonResponse({"error": "name cannot be blank"}, status=400)
+        category.name = name
+    if "kind_id" in body:
+        category.kind = get_object_or_404(CategoryKind, pk=body["kind_id"])
+    if "description" in body:
+        category.description = body["description"]
+    if "color" in body:
+        category.color = body["color"]
+    if "sort_order" in body:
+        category.sort_order = body["sort_order"] or 0
+    if "recency_mode" in body:
+        category.recency_mode = body["recency_mode"]
+    if "artist_separation" in body:
+        category.artist_separation = _blank_to_none(body["artist_separation"])
+    if "title_separation" in body:
+        category.title_separation = _blank_to_none(body["title_separation"])
+
+    try:
+        category.full_clean()
+    except ValidationError as e:
+        return JsonResponse({"error": "; ".join(e.messages)}, status=400)
+    category.save()
+
+    return JsonResponse(_category_to_dict(category))
 
 
 @require_http_methods(["GET", "POST"])
@@ -277,6 +421,37 @@ def api_rotation_reorder(request, pk):
     return JsonResponse(_rotation_to_dict(rotation))
 
 
+@require_http_methods(["POST"])
+def api_rotation_copy(request, pk):
+    """Duplicate a rotation and all its slots under a new name -- for
+    building a variant rotation without starting from an empty slot list."""
+    source = get_object_or_404(Rotation, pk=pk)
+
+    try:
+        body = json.loads(request.body)
+    except (json.JSONDecodeError, ValueError):
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+
+    name = (body.get("name") or "").strip()
+    if not name:
+        return JsonResponse({"error": "name is required"}, status=400)
+    if Rotation.objects.filter(name=name).exists():
+        return JsonResponse({"error": "A rotation with that name already exists"}, status=400)
+
+    new_rotation = Rotation.objects.create(name=name, description=source.description)
+    RotationSlot.objects.bulk_create([
+        RotationSlot(
+            rotation=new_rotation,
+            position=slot.position,
+            category_id=slot.category_id,
+            track_id=slot.track_id,
+        )
+        for slot in source.slots.order_by("position")
+    ])
+
+    return JsonResponse(_rotation_to_dict(new_rotation))
+
+
 @ensure_csrf_cookie
 def rotations_page(request):
     categories = Category.objects.order_by("name")
@@ -420,6 +595,32 @@ def api_playlist_reorder(request, pk):
     _reposition_items(ordered, model=PlaylistItem)
 
     return JsonResponse(_playlist_to_dict(playlist))
+
+
+@require_http_methods(["POST"])
+def api_playlist_copy(request, pk):
+    """Duplicate a playlist and all its items under a new name -- for
+    building a variant playlist without starting from an empty list."""
+    source = get_object_or_404(Playlist, pk=pk)
+
+    try:
+        body = json.loads(request.body)
+    except (json.JSONDecodeError, ValueError):
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+
+    name = (body.get("name") or "").strip()
+    if not name:
+        return JsonResponse({"error": "name is required"}, status=400)
+    if Playlist.objects.filter(name=name).exists():
+        return JsonResponse({"error": "A playlist with that name already exists"}, status=400)
+
+    new_playlist = Playlist.objects.create(name=name, description=source.description)
+    PlaylistItem.objects.bulk_create([
+        PlaylistItem(playlist=new_playlist, position=item.position, track_id=item.track_id)
+        for item in source.items.order_by("position")
+    ])
+
+    return JsonResponse(_playlist_to_dict(new_playlist))
 
 
 @csrf_exempt
