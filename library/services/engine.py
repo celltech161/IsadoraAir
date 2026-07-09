@@ -89,10 +89,22 @@ class PlaybackEngine:
         self.duck_gain = None
         self.master_mixer = None
         self.mic_ptt_valve = None
+        self.mic_ptt_volume = None
         self.mic_gain = None
         self.mic_ok = True
         self.mic_live = False
         self._mic_bin = None
+        # Manual mode: DJ-controlled hold on the auto-crossfade handoff,
+        # for talking over a song's outro. The currently-playing deck is
+        # never touched -- it always finishes normally -- only the
+        # *next* deck's start is withheld. _manual_hold_pending tracks
+        # whether a handoff was actually due (trigger point reached, or
+        # the leading deck fully finished) while manual_mode was on, so
+        # flipping back to Auto only force-starts the next track when a
+        # handoff was genuinely waiting -- an early manual-on/manual-off
+        # toggle before the trigger point is a no-op, not a hard cut.
+        self.manual_mode = False
+        self._manual_hold_pending = False
         self._duck_ramp_source_id = None
         self.pipeline_sample_rate = None
         self.main_pipeline = None
@@ -252,25 +264,50 @@ class PlaybackEngine:
         self.mic_gain = Gst.ElementFactory.make("volume", "mic_gain")
         self._apply_mic_gain()
 
-        # The actual PTT gate. valve fully removes buffers from the
-        # stream when closed -- not just attenuated-to-zero-but-still-
-        # flowing samples like a volume element set to 0.0 would be --
-        # the stronger guarantee for a feature whose entire safety
-        # requirement is "must never bleed onto air when off."
-        self.mic_ptt_valve = Gst.ElementFactory.make("valve", "mic_ptt_valve")
-        self.mic_ptt_valve.set_property("drop", True)
+        # The PTT gate. Originally a `valve` element (drop=True closed,
+        # drop=False open), which fully removed buffers from the stream
+        # when closed rather than passing through zero-amplitude ones.
+        # That was the "stronger" safety guarantee for a mic-can't-leak
+        # requirement -- but in practice it directly caused a much worse
+        # failure mode: master_mixer (audiomixer/GstAggregator) needs a
+        # first buffer on every linked sink pad before it will output
+        # anything downstream, so with the valve dropping mic buffers
+        # from a cold start, the aggregator never produced its first
+        # output buffer, Studio Monitor's alsasink never prerolled, and
+        # the whole studio-monitor chain sat silent from every engine
+        # restart until a manual Mic PTT toggle happened to feed a
+        # buffer through and unblock it. Confirmed via full state-and-
+        # buffer-probe instrumentation on the live pipeline. Replaced
+        # with a volume element that just multiplies mic samples by 0
+        # (off) or 1 (on) -- audio always flows, aggregator is always
+        # satisfied, and volume=0.0 is a rock-solid mute (a
+        # multiplication by zero produces exact silence at the sample
+        # level, not just attenuated audio). Same failure mode as the
+        # valve if the wrong property gets set (drop=False vs
+        # volume=1.0), so no real safety regression, just no more dead
+        # air on cold start.
+        self.mic_ptt_volume = Gst.ElementFactory.make("volume", "mic_ptt_volume")
+        self.mic_ptt_volume.set_property("volume", 0.0)
+        # Backwards-compat alias -- other places in this file still
+        # reference `mic_ptt_valve` (e.g. _on_mic_error's defensive
+        # close, _build_main_pipeline's "mic not configured" checks).
+        # Rather than rename everywhere and risk missing one, keep the
+        # old attribute name pointing at the volume element; both
+        # `mic_ptt_valve is None` and `mic_ptt_valve.set_property(...)`
+        # continue to work.
+        self.mic_ptt_valve = self.mic_ptt_volume
 
         mic_bin = Gst.Bin.new(f"mic_{int(time.time() * 1000)}")
-        for el in (src, convert, resample, capsfilter, queue, self.mic_gain, self.mic_ptt_valve):
+        for el in (src, convert, resample, capsfilter, queue, self.mic_gain, self.mic_ptt_volume):
             mic_bin.add(el)
         src.link(convert)
         convert.link(resample)
         resample.link(capsfilter)
         capsfilter.link(queue)
         queue.link(self.mic_gain)
-        self.mic_gain.link(self.mic_ptt_valve)
+        self.mic_gain.link(self.mic_ptt_volume)
 
-        ghost_pad = Gst.GhostPad.new("src", self.mic_ptt_valve.get_static_pad("src"))
+        ghost_pad = Gst.GhostPad.new("src", self.mic_ptt_volume.get_static_pad("src"))
         mic_bin.add_pad(ghost_pad)
 
         # mic_bin is a plain Gst.Bin added into self.main_pipeline, not its
@@ -308,8 +345,8 @@ class PlaybackEngine:
         # error recovery.
         self.mic_ok = False
         self.mic_live = False
-        if self.mic_ptt_valve is not None:
-            self.mic_ptt_valve.set_property("drop", True)
+        if self.mic_ptt_volume is not None:
+            self.mic_ptt_volume.set_property("volume", 0.0)
         return True
 
     def _apply_mic_gain(self):
@@ -438,6 +475,7 @@ class PlaybackEngine:
         except Exception as exc:
             print(f"  Failed to build mic input ({exc}); mic disabled")
             self.mic_ptt_valve = None
+            self.mic_ptt_volume = None
             self.mic_gain = None
             self._mic_bin = None
         if mic_elements:
@@ -557,10 +595,16 @@ class PlaybackEngine:
         # build doesn't land (or the log already existed for some
         # other reason, e.g. a manual play-now request), the engine
         # can sit idle forever despite a perfectly good approved log
-        # existing for the current hour.
+        # existing for the current hour. Manual mode is excluded: both
+        # decks empty is the *intended* state of a manual hold (mic-only
+        # talk-over after a song ends), not a stall -- without this
+        # exclusion, this check fired every ~10s during a hold and
+        # "recovered" by reloading the hour's log from position 0,
+        # replaying its first item (almost always a Legal ID) on a loop
+        # for as long as manual mode stayed on.
         with self._lock:
             idle = self.decks["A"] is None and self.decks["B"] is None
-        if idle:
+        if idle and not self.manual_mode:
             self._load_log_for(now.date(), now.hour)
             if self.log_items:
                 self._start_next_track()
@@ -1127,6 +1171,8 @@ class PlaybackEngine:
                 self._advance_to_next_hour_log(next_hour.date(), next_hour.hour)
             elif cmd == "mic_ptt":
                 self._set_mic_ptt(bool(data.get("active")))
+            elif cmd == "set_manual_mode":
+                self._set_manual_mode(bool(data.get("active")))
             elif cmd == "insert_urgent":
                 self._insert_urgent_next(data.get("category", "WxAlert"))
         except Exception as exc:
@@ -1207,10 +1253,10 @@ class PlaybackEngine:
         print(f"  Inserted urgent track ({category_code}) at queue position {insert_at}: {track.title}")
 
     def _set_mic_ptt(self, active):
-        if self.mic_ptt_valve is None:
+        if self.mic_ptt_volume is None:
             print("  mic_ptt requested but mic is not configured/available — ignoring")
             return
-        self.mic_ptt_valve.set_property("drop", not active)
+        self.mic_ptt_volume.set_property("volume", 1.0 if active else 0.0)
         self.mic_live = active
 
         # Ducking is read fresh from the DB on every toggle rather than
@@ -1223,6 +1269,19 @@ class PlaybackEngine:
         target = (10 ** (cfg.duck_level_db / 20.0)) if (cfg.enabled and active) else 1.0
         self._start_duck_ramp(target)
         print(f"  Mic PTT: {'ON' if active else 'OFF'}")
+
+    def _set_manual_mode(self, active):
+        self.manual_mode = active
+        print(f"  Manual mode: {'ON' if active else 'OFF'}")
+        if not active and self._manual_hold_pending:
+            # A handoff was genuinely due (trigger point reached, or the
+            # leading deck fully finished) and only manual mode withheld
+            # it -- start the next track right now instead of waiting on
+            # _poll_position, which may have nothing left to poll if the
+            # leading deck already finished during the hold.
+            self._manual_hold_pending = False
+            self._next_triggered = False
+            self._start_next_track()
 
     def _start_duck_ramp(self, target):
         """Ramps self.duck_gain's volume property smoothly toward
@@ -1446,13 +1505,38 @@ class PlaybackEngine:
         )
         occupied_ids = {d.log_item.id for d in self.decks.values() if d}
 
-        new_cursor = 0
-        for i, item in enumerate(fresh_items):
-            if item.id in occupied_ids:
-                new_cursor = i + 1
+        if occupied_ids:
+            # Cursor = "position right after the last item currently on a
+            # deck" — the normal case, where decks reflect what's just
+            # about to play out.
+            new_cursor = 0
+            for i, item in enumerate(fresh_items):
+                if item.id in occupied_ids:
+                    new_cursor = i + 1
+        else:
+            # Nothing on either deck (e.g. manual-mode hold, or a brief
+            # idle window between tracks). The deck-based rule above
+            # would collapse to 0 here, which loops back to the top of
+            # the hour (usually the Legal ID) as soon as playback
+            # resumes -- so preserve the existing cursor instead. If
+            # DB-side items shifted position, follow the item that was
+            # at the old cursor to its new index; if the cursor was
+            # already past the end, keep it past the end.
+            prev_next = (
+                self.log_items[self._queue_cursor]
+                if 0 <= self._queue_cursor < len(self.log_items)
+                else None
+            )
+            if prev_next is not None:
+                new_cursor = next(
+                    (i for i, item in enumerate(fresh_items) if item.id == prev_next.id),
+                    self._queue_cursor,
+                )
+            else:
+                new_cursor = self._queue_cursor
 
         self.log_items = fresh_items
-        self._queue_cursor = new_cursor
+        self._queue_cursor = min(new_cursor, len(fresh_items))
 
     def _check_stuck_decks(self):
         """Watchdog for a deck whose EOS was never detected. Seen live: a
@@ -1568,9 +1652,16 @@ class PlaybackEngine:
                     self._warm_track_cache(next_item)
 
                 if not self._next_triggered and pos >= trigger_point:
-                    print(f"  Trigger: pos={pos:.1f}s >= trigger={trigger_point:.1f}s, starting next ({next_item.track.title}) on deck {other_slot}")
-                    self._next_triggered = True
-                    self._start_next_track(slot=other_slot)
+                    if self.manual_mode:
+                        # DJ is holding for a talk-over -- remember the
+                        # handoff was due so _set_manual_mode can fire it
+                        # immediately once flipped back to Auto, instead
+                        # of cutting off the current track early.
+                        self._manual_hold_pending = True
+                    else:
+                        print(f"  Trigger: pos={pos:.1f}s >= trigger={trigger_point:.1f}s, starting next ({next_item.track.title}) on deck {other_slot}")
+                        self._next_triggered = True
+                        self._start_next_track(slot=other_slot)
 
         self._write_state()
         return True
@@ -1594,6 +1685,12 @@ class PlaybackEngine:
         if other_deck is not None:
             # The crossfade already handed off to the other slot before
             # this one finished — nothing more to do, it's playing.
+            return
+        if self.manual_mode:
+            # DJ is holding for a talk-over and the song ran out before
+            # they flipped back to Auto -- leave the slot empty (mic-only)
+            # rather than starting the next track out from under them.
+            self._manual_hold_pending = True
             return
         # Nothing had triggered yet (e.g. a track too short to ever hit
         # the crossfade trigger) — this was the only thing playing, so
@@ -1751,6 +1848,7 @@ class PlaybackEngine:
                 "mic_configured": self.mic_ptt_valve is not None,
                 "mic_ok": self.mic_ok,
                 "mic_live": self.mic_live,
+                "manual_mode": self.manual_mode,
             }
 
             tmp = STATE_PATH.with_suffix(".tmp")
