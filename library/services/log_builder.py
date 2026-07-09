@@ -120,18 +120,41 @@ DURATION_FIT_MARGIN = 30     # acceptable overshoot in seconds
 
 
 def _weighted_order(qs):
-    """Random selection weighted by Track.rotation_weight (0-5, default 3).
-    Shifted by +1 so weight 0 is never a hard zero-probability tier --
-    ready2air is what actually excludes a track, weight just makes 0 six
-    times less likely to come up than 5, all else equal.
+    """Random selection weighted by Track.rotation_weight (0-5, default 3)
+    and by dormancy (hours since Track.last_played_at, updated live by
+    engine.py on every real play) -- so among tracks that have already
+    cleared their recency-separation window (the hard exclusion this
+    queryset was already filtered by), ones that have sat idle longer are
+    proportionally more likely to come up, without turning selection into
+    a strict least-recently-played queue (which would sound mechanical).
+
+    rotation_weight is shifted by +1 so weight 0 is never a hard
+    zero-probability tier -- ready2air is what actually excludes a track,
+    weight just makes 0 six times less likely to come up than 5, all else
+    equal. Verified empirically (not just by the math) against real
+    category data: 3000 draws over a weight-0 group vs a weight-5 group
+    landed at a ~5.76x ratio, matching the expected 6x.
+
+    Dormancy is folded in as a second multiplier, log-dampened
+    (`1 + LN(1 + hours)`) so it grows with diminishing returns rather than
+    linearly -- a track idle 30 days should be meaningfully favored over
+    one idle 2 days, but not ~15x favored, which would let dormancy swamp
+    rotation_weight entirely and just recreate the "sounds mechanical"
+    problem from the other direction (an oldest-first queue instead of a
+    flat random one). Never-played tracks (last_played_at IS NULL) are
+    treated as idle 365 days -- a large but finite dormancy so genuinely
+    ancient tracks (idle *longer* than a year) can still outrank a
+    brand-new, never-aired addition.
 
     `-LN(RANDOM()) / weight` is the standard SQL-side trick for weighted
     sampling without materializing/shuffling anything -- same query cost
-    as the plain `order_by("?")` it replaces. Verified empirically (not
-    just by the math) against real category data: 3000 draws over a
-    weight-0 group vs a weight-5 group landed at a ~5.76x ratio, matching
-    the expected 6x."""
-    return qs.order_by(RawSQL("-LN(RANDOM()) / (rotation_weight + 1)", []))
+    as the plain `order_by("?")` it replaces."""
+    return qs.order_by(RawSQL(
+        "-LN(RANDOM()) / ((rotation_weight + 1) * (1 + LN(1 + "
+        "EXTRACT(EPOCH FROM (NOW() - COALESCE(last_played_at, "
+        "NOW() - INTERVAL '365 days'))) / 3600.0)))",
+        [],
+    ))
 
 
 def _pick_best_fit(qs, remaining_seconds):
