@@ -106,9 +106,8 @@
 
   .deck-art-thumb {
     position: absolute;
-    top: 50%;
+    top: 0.9rem;
     right: 1.1rem;
-    transform: translateY(-50%);
     width: 150px;
     height: 150px;
     object-fit: cover;
@@ -131,7 +130,7 @@
   .deck-header-row {
     display: flex;
     align-items: center;
-    justify-content: space-between;
+    gap: 0.6rem;
     margin-bottom: 0.75rem;
   }
 
@@ -149,24 +148,6 @@
     gap: 0.4rem;
   }
 
-  .deck-btn {
-    background: var(--bg-darker);
-    border: 1px solid var(--border-subtle);
-    border-radius: 6px;
-    color: var(--text-main);
-    width: 30px;
-    height: 26px;
-    font-size: 0.8rem;
-    cursor: pointer;
-    transition: border-color 0.12s;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-  }
-  .deck-btn:hover { border-color: var(--accent); }
-  .deck-btn.eject:hover { border-color: var(--danger); color: var(--danger); }
-  .deck-btn:disabled { opacity: 0.3; cursor: default; }
-
   .transport-badge {
     font-size: 0.68rem;
     font-weight: 700;
@@ -181,6 +162,20 @@
   .transport-badge.OFFLINE { background: rgba(148, 163, 184, 0.15); color: var(--text-muted); }
   .transport-badge.STALE   { background: rgba(217, 119, 6, 0.2); color: #d97706; }
   .transport-badge.UPNEXT  { background: rgba(59, 130, 246, 0.15); color: #3b82f6; }
+
+  .deck-transport-btn {
+    font-size: 0.95rem;
+    font-weight: 700;
+    padding: 0.1rem 0.55rem;
+    border-radius: 4px;
+    border: 1px solid var(--border-subtle);
+    background: transparent;
+    color: var(--text-main);
+    cursor: pointer;
+    line-height: 1.4;
+  }
+  .deck-transport-btn:hover { border-color: var(--accent); }
+  .deck-transport-btn:disabled { opacity: 0.3; cursor: not-allowed; border-color: var(--border-subtle); }
 
   .np-meta {
     margin-bottom: 0.6rem;
@@ -253,9 +248,10 @@
 
   .np-waveform canvas {
     width: 100%;
-    height: 56px;
+    height: 96px;
     display: block;
     border-radius: 6px;
+    cursor: pointer;
   }
 
   .np-waveform .position-line {
@@ -291,22 +287,6 @@
     display: flex;
     flex-direction: column;
     gap: 0.2rem;
-  }
-
-  .np-progress-bar {
-    height: 6px;
-    background: rgba(148, 163, 184, 0.15);
-    border-radius: 3px;
-    overflow: hidden;
-    cursor: pointer;
-    position: relative;
-  }
-  .np-progress-bar:hover { height: 10px; }
-
-  .np-progress-fill {
-    height: 100%;
-    background: var(--accent);
-    border-radius: 3px;
   }
 
   .np-times {
@@ -789,9 +769,6 @@ function updatePositionIndicators() {
         (remaining < 10 ? ' critical' : remaining < 30 ? ' warning' : '');
     }
 
-    const fill = document.getElementById(`npProgressFill-${slot}`);
-    if (fill) fill.style.width = pct + '%';
-
     const elapsedEl = document.getElementById(`npElapsed-${slot}`);
     if (elapsedEl) elapsedEl.textContent = fmtDur(pos);
   });
@@ -808,8 +785,8 @@ function buildDeckDOM(slot) {
       <span class="deck-label">Deck ${slot}</span>
       <div class="deck-controls">
         <span class="transport-badge" id="transportBadge-${slot}"></span>
-        <button class="deck-btn" id="playPauseBtn-${slot}" title="Play/Pause">&#9654;</button>
-        <button class="deck-btn eject" id="ejectBtn-${slot}" title="Eject">&#9169;</button>
+        <button class="deck-transport-btn" id="ejectBtn-${slot}" title="Start Next" disabled>&#9197;</button>
+        <button class="deck-transport-btn" id="playPauseBtn-${slot}" title="Play/Pause" disabled>&#9654;</button>
       </div>
     </div>
     <div class="np-meta">
@@ -829,9 +806,6 @@ function buildDeckDOM(slot) {
     <div class="np-timing">
       <div class="np-countdown" id="npCountdown-${slot}"></div>
       <div class="np-progress-wrap">
-        <div class="np-progress-bar">
-          <div class="np-progress-fill" id="npProgressFill-${slot}"></div>
-        </div>
         <div class="np-times">
           <span id="npElapsed-${slot}"></span>
           <span id="npTotal-${slot}"></span>
@@ -843,7 +817,7 @@ function buildDeckDOM(slot) {
 
   deckState[slot].deckBuilt = true;
 
-  document.getElementById(`npProgressFill-${slot}`).parentElement.addEventListener('click', function(e) {
+  document.getElementById(`npWaveform-${slot}`).addEventListener('click', function(e) {
     if (!deckState[slot].localDuration) return;
     const rect = this.getBoundingClientRect();
     const pct = (e.clientX - rect.left) / rect.width;
@@ -851,12 +825,16 @@ function buildDeckDOM(slot) {
     seekTo(slot, Math.max(0, Math.min(deckState[slot].localDuration, pos)));
   });
 
-  document.getElementById(`playPauseBtn-${slot}`).addEventListener('click', () => {
-    deckCommand(slot, deckState[slot].paused ? 'resume' : 'pause');
-  });
   document.getElementById(`ejectBtn-${slot}`).addEventListener('click', () => {
     deckCommand(slot, 'eject');
   });
+  document.getElementById(`playPauseBtn-${slot}`).addEventListener('click', () => {
+    handlePlayPause(slot);
+  });
+}
+
+function handlePlayPause(slot) {
+  deckCommand(slot, deckState[slot].paused ? 'resume' : 'pause');
 }
 
 function applyDeckArt(slot, result) {
@@ -945,8 +923,8 @@ function renderDeckPreview(slot, track, serverTimestamp) {
     buildDeckDOM(slot);
     st.mode = 'preview';
     st.lastTrackId = null;
-    document.getElementById(`playPauseBtn-${slot}`).style.display = 'none';
-    document.getElementById(`ejectBtn-${slot}`).style.display = 'none';
+    document.getElementById(`playPauseBtn-${slot}`).disabled = true;
+    document.getElementById(`ejectBtn-${slot}`).disabled = true;
     document.querySelector(`#deck-${slot} .np-timing`).style.display = 'none';
     document.getElementById(`npStartsAt-${slot}`).style.display = '';
   }
@@ -985,8 +963,8 @@ function renderDeckLive(slot, deck, transport) {
     buildDeckDOM(slot);
     st.mode = 'live';
     st.lastTrackId = null;
-    document.getElementById(`playPauseBtn-${slot}`).style.display = '';
-    document.getElementById(`ejectBtn-${slot}`).style.display = '';
+    document.getElementById(`playPauseBtn-${slot}`).disabled = false;
+    document.getElementById(`ejectBtn-${slot}`).disabled = false;
     document.querySelector(`#deck-${slot} .np-timing`).style.display = '';
   }
 
