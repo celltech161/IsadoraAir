@@ -124,7 +124,21 @@ async function rdjConnect() {
 
       let stream;
       try {
-        stream = await navigator.mediaDevices.getUserMedia({audio: true});
+        // Broadcast-quality constraints -- disable Chrome/Firefox's
+        // VoIP-oriented voice processing (echo cancellation, noise
+        // suppression, auto gain control). Those default to ON, force
+        // Opus into narrowband/wideband voice mode, and produce the
+        // muffled "phone call" sound that's unacceptable for radio.
+        // With them off, browsers use Opus in fullband music mode.
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: false,
+            noiseSuppression: false,
+            autoGainControl: false,
+            channelCount: 2,
+            sampleRate: 48000,
+          },
+        });
       } catch (e) {
         rdjSetStatus('Microphone permission denied: ' + e, 'error');
         rdjDisconnect();

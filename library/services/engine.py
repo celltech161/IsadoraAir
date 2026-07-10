@@ -82,8 +82,6 @@ class RemoteDJSession:
     def __init__(self):
         self.webrtc = None
         self.ice_agent = None
-        self.concat = None
-        self.silence_sink0 = None
         self.remote_gate = None
         self.master_mixer_pad = None
         self.monitor_tee_pad = None
@@ -1435,11 +1433,18 @@ class PlaybackEngine:
 
     def _remote_dj_build_session(self, session):
         cfg = RemoteDJConfig.load()
-        pipeline_caps = self._remote_dj_pipeline_caps()
 
         session.webrtc = Gst.ElementFactory.make("webrtcbin", None)
         session.webrtc.set_property("stun-server", cfg.stun_server)
         session.webrtc.set_property("bundle-policy", GstWebRTC.WebRTCBundlePolicy.MAX_BUNDLE)
+        # rtpbin latency (the internal jitterbuffer's target buffered
+        # depth). Default is 200ms. Lower is fine for LAN-ish paths and
+        # keeps the observed inbound-mic-path latency capped -- setting
+        # this high is one path by which jitterbuffer content can
+        # accumulate. 40ms is aggressive but reasonable for the
+        # low-latency talk-over use case; if we ever see packet-loss
+        # dropouts in real-world use, raise this.
+        session.webrtc.set_property("latency", 40)
         # The port-range properties live on webrtcbin's ice-agent
         # sub-object (a GstWebRTCNice), not directly on webrtcbin itself
         # -- confirmed by introspecting a real instance's properties
@@ -1512,31 +1517,26 @@ class PlaybackEngine:
         )
         session.webrtc.emit("add-transceiver", GstWebRTC.WebRTCRTPTransceiverDirection.RECVONLY, recv_caps)
 
-        # --- Inbound: silence-primed concat, exactly the pattern already
-        # used for decodebin's async pad-added in _create_deck, reused
-        # here for webrtcbin's async pad-added on network negotiation ---
-        session.concat = Gst.ElementFactory.make("concat", None)
-        silence = Gst.ElementFactory.make("audiotestsrc", None)
-        silence.set_property("wave", "silence")
-        silence.set_property("is-live", True)
-        silence_fixate = Gst.ElementFactory.make("capsfilter", None)
-        silence_fixate.set_property("caps", pipeline_caps)
-        remote_gain = Gst.ElementFactory.make("volume", None)
-        session.remote_gate = Gst.ElementFactory.make("volume", None)
-        session.remote_gate.set_property("volume", 0.0)  # closed -- mirrors mic_ptt_volume
-        gate_conv = Gst.ElementFactory.make("audioconvert", None)
-        for el in (session.concat, silence, silence_fixate, remote_gain, session.remote_gate, gate_conv):
-            self.main_pipeline.add(el)
-            session.elements.append(el)
-        silence.link(silence_fixate)
-        session.silence_sink0 = session.concat.request_pad_simple("sink_%u")
-        silence_fixate.get_static_pad("src").link(session.silence_sink0)
-        session.concat.link(remote_gain)
-        remote_gain.link(session.remote_gate)
-        session.remote_gate.link(gate_conv)
-        session.master_mixer_pad = self.master_mixer.request_pad_simple("sink_%u")
-        gate_conv.get_static_pad("src").link(session.master_mixer_pad)
-
+        # --- Inbound: DEFERRED to _remote_dj_on_pad_added. ---
+        # Earlier design used a silence-primed `concat` (see Stage 1 in
+        # the plan) to keep master_mixer's newly-requested sink pad from
+        # starving during ICE/DTLS negotiation. That worked for the first
+        # session in an engine process but the second session in the same
+        # process consistently went silent after ~10 buffers -- concat's
+        # sink_0 EOS + still-flowing silence source + newly-active sink_1
+        # got the internal state stuck, confirmed empirically via pad-
+        # probe buffer-count instrumentation ("all three probes at
+        # concat.src / gate.src / mixer.sink got exactly N=10 buffers in
+        # session #2, ZERO after; upstream decode chain kept flowing").
+        # Simpler approach that also removes the whole "which timestamps
+        # is concat generating for the silence->real handover" problem:
+        # don't request the master_mixer sink pad until the mic RTP feed
+        # is actually decodable, i.e., after webrtcbin.pad-added has
+        # fired. No pad → no starvation. Real audio arrives, we request
+        # the pad and immediately have real content to feed it. The
+        # tradeoff: master_mixer sees a new sink pad joining "hot" (with
+        # data flowing from instant 0), but Stage 1's hot-add offline
+        # harness already validated this operation as glitch-free.
         session.webrtc.connect("on-negotiation-needed", self._remote_dj_on_negotiation_needed)
         session.webrtc.connect("on-ice-candidate", self._remote_dj_on_ice_candidate)
         session.webrtc.connect("pad-added", self._remote_dj_on_pad_added)
@@ -1617,54 +1617,46 @@ class PlaybackEngine:
         # Getting this backwards is exactly the sample-rate-mismatch
         # failure mode the offline harness flagged.
         capsfilter.set_property("caps", self._remote_dj_pipeline_caps())
-        # concat's handling of a non-active sink pad blocks synchronously
-        # on internal state for QUERIES too, not just buffers/events
-        # (confirmed via GST_DEBUG=concat:5 in the offline harness) --
-        # opusdec's very first decode call issues a caps/allocation query
-        # that would hang the instant it reaches concat's inactive sink
-        # pad, and since depay/dec/convert/resample have no thread of
-        # their own, that hang would propagate all the way back into
-        # webrtcbin's internal rtpjitterbuffer thread and silently halt
-        # all further packet processing. This queue decouples that --
-        # required, not optional (it does not by itself fix the query
-        # hang, but it stops the hang from reaching back into webrtcbin).
-        pre_concat_queue = Gst.ElementFactory.make("queue", None)
-        for el in (depay, dec, conv, resample, capsfilter, pre_concat_queue):
+        # Small queue to decouple the decode chain's thread from anything
+        # downstream. Kept in place after the concat removal since the
+        # gate volume element downstream doesn't have its own thread
+        # either, and any downstream stall (e.g. transient master_mixer
+        # pad-add negotiation) should not back up into webrtcbin's
+        # internal rtpjitterbuffer thread.
+        queue = Gst.ElementFactory.make("queue", None)
+        remote_gain = Gst.ElementFactory.make("volume", None)
+        session.remote_gate = Gst.ElementFactory.make("volume", None)
+        session.remote_gate.set_property("volume", 0.0)  # closed -- opened via remote_dj_gate command
+        gate_conv = Gst.ElementFactory.make("audioconvert", None)
+        for el in (depay, dec, conv, resample, capsfilter, queue,
+                   remote_gain, session.remote_gate, gate_conv):
             self.main_pipeline.add(el)
             session.elements.append(el)
         depay.link(dec)
         dec.link(conv)
         conv.link(resample)
         resample.link(capsfilter)
-        capsfilter.link(pre_concat_queue)
+        capsfilter.link(queue)
+        queue.link(remote_gain)
+        remote_gain.link(session.remote_gate)
+        session.remote_gate.link(gate_conv)
         pad.link(depay.get_static_pad("sink"))
 
-        sink1 = session.concat.request_pad_simple("sink_%u")
-        pre_concat_queue.get_static_pad("src").link(sink1)
+        # Request the master_mixer sink pad here (not at session-start),
+        # so master_mixer never sees an unfed sink pad. gate_conv is
+        # already linked upstream to the whole decode chain, and
+        # sync_state_with_parent below transitions everything to PLAYING
+        # so real mic buffers start flowing to the newly-requested pad
+        # within milliseconds -- no silence-priming needed.
+        session.master_mixer_pad = self.master_mixer.request_pad_simple("sink_%u")
+        gate_conv.get_static_pad("src").link(session.master_mixer_pad)
 
-        for el in (depay, dec, conv, resample, capsfilter, pre_concat_queue):
+        for el in (depay, dec, conv, resample, capsfilter, queue,
+                   remote_gain, session.remote_gate, gate_conv):
             el.sync_state_with_parent()
 
+        print("  Remote DJ: real mic audio linked to master_mixer")
         session.real_buf_seen = True
-
-        def send_handover_eos():
-            s = self.remote_dj_session
-            if s is session and session.silence_sink0 is not None:
-                session.silence_sink0.send_event(Gst.Event.new_eos())
-                print("  Remote DJ: real mic audio linked, silence handover triggered")
-            return False
-
-        # Trigger the silence->real handover as soon as the real branch
-        # is linked (pad-added already means ICE+DTLS are fully up), NOT
-        # on any signal from decoded content -- opusdec can never produce
-        # its first buffer while concat's second sink pad isn't active
-        # yet, so waiting for it deadlocks by construction (the offline
-        # harness's real, hard-won correction to the original design).
-        # Deferred via GLib.idle_add rather than called directly here:
-        # this handler runs on webrtcbin's internal thread family and can
-        # re-enter concat's same internal lock that the query hang above
-        # blocks on.
-        GLib.idle_add(send_handover_eos)
 
     def _remote_dj_on_connection_state(self, element, _pspec):
         session = self.remote_dj_session
@@ -1696,15 +1688,37 @@ class PlaybackEngine:
             session.remote_gate.set_property("volume", 0.0)
             self._apply_talk_ducking(False)
 
+        # Teardown ordering that avoids master_mixer freeze:
+        # (1) UNLINK the master_mixer sink pad from its upstream peer
+        #     BEFORE setting anything to NULL. If we set upstream to NULL
+        #     while master_mixer's sink pad is still linked to it,
+        #     master_mixer's aggregator thread can end up trying to pull
+        #     buffers from a NULL-state pad and freeze -- observed live
+        #     during Stage 6 as "disconnect kills program audio". Same
+        #     lesson _on_mic_error's docstring already flagged for the
+        #     local mic bin ("unlinking a live-mixer-linked bin mid-flight
+        #     is the riskier operation, reserved for planned transitions");
+        #     a remote-DJ hangup is one of those planned transitions but
+        #     the release half specifically needed this ordering fix.
+        # (2) Release the master_mixer sink pad next -- it's now orphaned
+        #     (unlinked upstream) so it can be released safely.
+        # (3) Same pattern for monitor_tee_pad on the outbound branch.
+        # (4) Only THEN set upstream elements to NULL and remove them.
+        if session.master_mixer_pad is not None:
+            peer = session.master_mixer_pad.get_peer()
+            if peer is not None:
+                peer.unlink(session.master_mixer_pad)
+            self.master_mixer.release_request_pad(session.master_mixer_pad)
+        if session.monitor_tee_pad is not None:
+            peer = session.monitor_tee_pad.get_peer()
+            if peer is not None:
+                session.monitor_tee_pad.unlink(peer)
+            self.remote_dj_tee.release_request_pad(session.monitor_tee_pad)
+
         for el in session.elements:
             el.set_state(Gst.State.NULL)
         for el in session.elements:
             self.main_pipeline.remove(el)
-
-        if session.master_mixer_pad is not None:
-            self.master_mixer.release_request_pad(session.master_mixer_pad)
-        if session.monitor_tee_pad is not None:
-            self.remote_dj_tee.release_request_pad(session.monitor_tee_pad)
 
         if self._remote_dj_server:
             self._remote_dj_server.disconnect_threadsafe()
