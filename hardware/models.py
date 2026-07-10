@@ -152,3 +152,41 @@ class DuckingConfig(models.Model):
     def load(cls):
         obj, _created = cls.objects.get_or_create(pk=1)
         return obj
+
+
+class RemoteDJAudioInput(models.Model):
+    """Singleton -- engine-side gain (and any future engine-side audio
+    processing) for the incoming remote-DJ mic. Separate from the local
+    AudioInput row that captures the physical studio mic, since the
+    remote mic doesn't have a physical device on this box -- it's an
+    RTP stream coming in via WebRTC. Same 'read fresh at session start'
+    contract as AudioInput.gain_db (an edit here takes effect on the
+    NEXT session connect, not retroactively for an already-live session).
+    Grouped under Hardware in the admin as its own section so anything
+    else remote-audio-input-related we add later (calibration reference,
+    limiter thresholds, whatever) has a natural home."""
+    gain_db = models.FloatField(
+        default=6.0,
+        help_text="Software gain applied to the incoming remote-DJ mic before "
+                   "it joins the on-air mix, in dB. Default is +6 dB to compensate "
+                   "for browser WebRTC's typical output level being noticeably "
+                   "lower than a locally-captured mic through the same preamp -- "
+                   "adjust after listening. Read at session start; changes take "
+                   "effect on the next Remote DJ connect.",
+    )
+
+    class Meta:
+        verbose_name = "Remote DJ Audio Input"
+        verbose_name_plural = "Remote DJ Audio Input"
+
+    def __str__(self):
+        return "Remote DJ Audio Input"
+
+    def save(self, *args, **kwargs):
+        self.pk = 1
+        super().save(*args, **kwargs)
+
+    @classmethod
+    def load(cls):
+        obj, _created = cls.objects.get_or_create(pk=1)
+        return obj

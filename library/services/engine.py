@@ -20,7 +20,7 @@ django.setup()
 from django.db import close_old_connections
 from django.db.models import F
 from django.utils import timezone
-from hardware.models import AudioInput, AudioOutput, AudioPipeline, DuckingConfig
+from hardware.models import AudioInput, AudioOutput, AudioPipeline, DuckingConfig, RemoteDJAudioInput
 from library.models import Category, LogItem, PlaylistLog, RemoteDJConfig, Track
 from library.services.log_builder import (
     DURATION_FIT_MARGIN,
@@ -1344,17 +1344,31 @@ class PlaybackEngine:
         self.log_items.insert(insert_at, new_item)
         print(f"  Inserted urgent track ({category_code}) at queue position {insert_at}: {track.title}")
 
-    def _apply_talk_ducking(self, active):
+    def _apply_talk_ducking(self):
         """Shared by local mic PTT and the remote-DJ gate -- both are
         "someone is talking" events from the same listener's perspective,
-        so both duck the decks the same way. Ducking is read fresh from
-        the DB on every toggle rather than needing its own live-reload
-        command/signal -- unlike AGC (which must reflect changes to a
-        continuously-running effect), ducking's configured values only
-        ever matter at the instant of a PTT-style transition, so there's
-        nothing to keep in sync between saves."""
+        so both duck the decks the same way. Ducks if EITHER is live --
+        both gate state fields are read fresh here rather than trusting
+        the caller's `active` arg, so a mic toggling off while the OTHER
+        is still live doesn't spuriously un-duck the decks under the
+        talker who's still going (real bug found live during Stage 6
+        testing: an operator asking "what if I gate the local PTT on
+        while the remote is also live?" would have hit exactly this on
+        the follow-up gate-off).
+
+        Ducking config is read fresh from the DB on every toggle rather
+        than needing its own live-reload command/signal -- unlike AGC
+        (which must reflect changes to a continuously-running effect),
+        ducking's configured values only ever matter at the instant of a
+        PTT-style transition, so there's nothing to keep in sync between
+        saves."""
         cfg = DuckingConfig.load()
-        target = (10 ** (cfg.duck_level_db / 20.0)) if (cfg.enabled and active) else 1.0
+        remote_live = bool(
+            self.remote_dj_session and self.remote_dj_session.remote_gate
+            and self.remote_dj_session.remote_gate.get_property("volume") > 0.0
+        )
+        any_live = self.mic_live or remote_live
+        target = (10 ** (cfg.duck_level_db / 20.0)) if (cfg.enabled and any_live) else 1.0
         self._start_duck_ramp(target)
 
     def _set_mic_ptt(self, active):
@@ -1363,7 +1377,7 @@ class PlaybackEngine:
             return
         self.mic_ptt_volume.set_property("volume", 1.0 if active else 0.0)
         self.mic_live = active
-        self._apply_talk_ducking(active)
+        self._apply_talk_ducking()
         print(f"  Mic PTT: {'ON' if active else 'OFF'}")
 
     def _set_manual_mode(self, active):
@@ -1625,6 +1639,14 @@ class PlaybackEngine:
         # internal rtpjitterbuffer thread.
         queue = Gst.ElementFactory.make("queue", None)
         remote_gain = Gst.ElementFactory.make("volume", None)
+        # Software gain to compensate for browser WebRTC's typical output
+        # being noticeably quieter than the local mic through the same
+        # preamp -- see hardware.RemoteDJAudioInput. Read fresh here at
+        # session start; changes take effect on the next connect (same
+        # contract as AudioInput.gain_db for the local mic).
+        remote_gain.set_property(
+            "volume", 10 ** (RemoteDJAudioInput.load().gain_db / 20.0)
+        )
         session.remote_gate = Gst.ElementFactory.make("volume", None)
         session.remote_gate.set_property("volume", 0.0)  # closed -- opened via remote_dj_gate command
         gate_conv = Gst.ElementFactory.make("audioconvert", None)
@@ -1673,7 +1695,7 @@ class PlaybackEngine:
             print("  remote_dj_gate requested but no session is active — ignoring")
             return
         session.remote_gate.set_property("volume", 1.0 if active else 0.0)
-        self._apply_talk_ducking(active)
+        self._apply_talk_ducking()
         print(f"  Remote DJ gate: {'ON' if active else 'OFF'}")
 
     def _remote_dj_session_stop(self):
@@ -1686,7 +1708,7 @@ class PlaybackEngine:
         # Safety first: close the gate before tearing anything down.
         if session.remote_gate is not None:
             session.remote_gate.set_property("volume", 0.0)
-            self._apply_talk_ducking(False)
+            self._apply_talk_ducking()
 
         # Teardown ordering that avoids master_mixer freeze:
         # (1) UNLINK the master_mixer sink pad from its upstream peer

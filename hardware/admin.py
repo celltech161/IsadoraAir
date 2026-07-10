@@ -9,7 +9,7 @@ from django.http import HttpResponseRedirect
 from django.urls import reverse
 
 from .devices import list_input_devices, list_mixer_controls, list_output_devices
-from .models import AudioInput, AudioOutput, AudioPipeline, DuckingConfig
+from .models import AudioInput, AudioOutput, AudioPipeline, DuckingConfig, RemoteDJAudioInput
 
 # Must match engine.py's STUDIO_MONITOR_NAME.
 STUDIO_MONITOR_NAME = "Studio Monitor"
@@ -226,4 +226,21 @@ class DuckingConfigAdmin(admin.ModelAdmin):
         obj = DuckingConfig.load()
         return HttpResponseRedirect(
             reverse("admin:hardware_duckingconfig_change", args=[obj.pk])
+        )
+
+
+@admin.register(RemoteDJAudioInput)
+class RemoteDJAudioInputAdmin(admin.ModelAdmin):
+    fields = ["gain_db"]
+
+    def has_add_permission(self, request):
+        return not RemoteDJAudioInput.objects.exists()
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+    def changelist_view(self, request, extra_context=None):
+        obj = RemoteDJAudioInput.load()
+        return HttpResponseRedirect(
+            reverse("admin:hardware_remotedjaudioinput_change", args=[obj.pk])
         )
