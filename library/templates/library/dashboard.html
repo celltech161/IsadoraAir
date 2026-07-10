@@ -67,8 +67,12 @@
   #manualModeBtn { min-width: 9.5em; margin-left: auto; }
   #manualModeBtn.active { background: #d97706; border-color: #d97706; }
 
-  #micPttBtn { min-width: 8em; }
+  #micPttBtn { min-width: 12em; }
   #micPttBtn.active { background: var(--danger); border-color: var(--danger); }
+  /* Disabled-because-you're-connected-as-remote-DJ: dim but still show
+     the LIVE color, so the remote operator can see whether the studio
+     DJ is on mic without being able to toggle it. */
+  #micPttBtn:disabled { opacity: 0.55; }
 
   #remoteDjConnectBtn { min-width: 11em; }
   #remoteDjConnectBtn.active { background: var(--accent); border-color: var(--accent); }
@@ -506,7 +510,7 @@
 <div class="playnow-bar">
   <button class="playnow-btn ops-btn" id="manualModeBtn" onclick="toggleManualMode()"
           title="Manual holds the next track until you flip back to Auto -- for talking over a song's outro. Auto-switches while any mic is live.">Auto</button>
-  <button class="playnow-btn ops-btn" id="micPttBtn" onclick="toggleMicPtt()" disabled>Mic: OFF</button>
+  <button class="playnow-btn ops-btn" id="micPttBtn" onclick="toggleMicPtt()" disabled>Studio Mic: OFF</button>
   <button class="playnow-btn ops-btn" id="remoteDjConnectBtn" onclick="toggleRemoteDjConnect()" disabled
           title="Connects THIS browser's mic into the on-air mix as the remote DJ. The Remote Mic button gates it on/off once connected.">Connect Remote</button>
   <button class="playnow-btn ops-btn" id="remoteDjGateBtn" onclick="toggleRemoteDjGate()" disabled
@@ -675,11 +679,16 @@ async function toggleMicPtt() {
 function renderMicPtt(data) {
   const btn = document.getElementById('micPttBtn');
   if (!btn) return;
-  btn.disabled = !data.mic_configured;
+  // Read-only when THIS browser is connected as the remote DJ -- the
+  // remote operator can still see whether the studio DJ has their mic
+  // live (they're on air together), but can't toggle the studio mic
+  // from a remote seat.
+  const weAreRemote = !!rdjPc;
+  btn.disabled = !data.mic_configured || weAreRemote;
   btn.classList.remove('pending');
   btn.classList.toggle('active', !!data.mic_live);
   btn.textContent = (data.mic_configured && data.mic_ok === false)
-    ? 'Mic: ERROR' : (data.mic_live ? 'Mic: LIVE' : 'Mic: OFF');
+    ? 'Studio Mic: ERROR' : (data.mic_live ? 'Studio Mic: LIVE' : 'Studio Mic: OFF');
 }
 
 async function toggleRemoteDjGate() {
