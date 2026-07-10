@@ -124,19 +124,19 @@ async function rdjConnect() {
 
       let stream;
       try {
-        // Broadcast-quality constraints -- disable Chrome/Firefox's
-        // VoIP-oriented voice processing (echo cancellation, noise
-        // suppression, auto gain control). Those default to ON, force
-        // Opus into narrowband/wideband voice mode, and produce the
-        // muffled "phone call" sound that's unacceptable for radio.
-        // With them off, browsers use Opus in fullband music mode.
+        // Broadcast-quality constraints. Using {exact: false} instead
+        // of just false -- this forces the browser to actually honor
+        // it and fail loudly if it can't, rather than silently ignore
+        // and default back to VoIP processing (a real observed problem
+        // with the plain `false` form: user reported muffled "phone
+        // call" sound persisted despite the plain constraints).
         stream = await navigator.mediaDevices.getUserMedia({
           audio: {
-            echoCancellation: false,
-            noiseSuppression: false,
-            autoGainControl: false,
-            channelCount: 2,
-            sampleRate: 48000,
+            echoCancellation: {exact: false},
+            noiseSuppression: {exact: false},
+            autoGainControl: {exact: false},
+            channelCount: {ideal: 2},
+            sampleRate: {ideal: 48000},
           },
         });
       } catch (e) {
@@ -153,7 +153,46 @@ async function rdjConnect() {
       monitorTransceiver.direction = 'recvonly';
 
       const answer = await rdjPc.createAnswer();
+      // Force high-bitrate stereo fullband Opus by rewriting the Opus
+      // fmtp line in our answer SDP. Browsers default the fmtp params
+      // to voice-optimized values (mono, aggressive VBR, low bitrate)
+      // regardless of the getUserMedia constraints, and that's a big
+      // part of why mic audio sounded muffled/phone-call-y in live
+      // testing. sprop-stereo/stereo=1 asks the encoder to send
+      // stereo; maxaveragebitrate=128000 raises the ceiling from the
+      // browser default (~40kbps for voice) to fullband music quality;
+      // useinbandfec=1 keeps forward error correction for network
+      // resilience without hurting quality.
+      answer.sdp = answer.sdp.replace(
+        /(a=fmtp:\d+ [^\r\n]*)/g,
+        (match) => {
+          if (!match.includes('minptime') && !match.includes('useinbandfec')) return match;
+          let out = match;
+          const kv = (k, v) => {
+            if (out.includes(k + '=')) {
+              out = out.replace(new RegExp(k + '=[^;\\r\\n]*'), k + '=' + v);
+            } else {
+              out += ';' + k + '=' + v;
+            }
+          };
+          kv('stereo', '1');
+          kv('sprop-stereo', '1');
+          kv('maxaveragebitrate', '128000');
+          kv('maxplaybackrate', '48000');
+          kv('sprop-maxcapturerate', '48000');
+          return out;
+        }
+      );
       await rdjPc.setLocalDescription(answer);
+      // Belt-and-suspenders: also set the sender's encoding parameters
+      // directly. Some browsers respect this even when they ignore SDP
+      // fmtp overrides.
+      try {
+        const senderParams = micTransceiver.sender.getParameters();
+        senderParams.encodings = senderParams.encodings || [{}];
+        senderParams.encodings[0].maxBitrate = 128000;
+        await micTransceiver.sender.setParameters(senderParams);
+      } catch (e) { /* not fatal -- SDP munging is the primary path */ }
       rdjWs.send(JSON.stringify({type: 'answer', sdp: rdjPc.localDescription.sdp}));
 
       document.getElementById('rdjDisconnectBtn').disabled = false;
