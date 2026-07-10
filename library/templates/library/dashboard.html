@@ -14,6 +14,7 @@
     display: flex;
     flex-wrap: wrap;
     align-items: center;
+    justify-content: flex-end;
     gap: 0.6rem;
     margin-bottom: 1rem;
   }
@@ -44,8 +45,10 @@
   .playnow-btn:hover { opacity: 0.9; }
 
   /* --- Ops bar buttons ---
-     Each button has a per-button min-width sized to its longest label so
-     the whole row never shifts horizontally as state text changes. */
+     All four buttons share a fixed flex-basis so the row never shifts
+     horizontally when a button's text changes state (Auto -> Manual,
+     Studio Mic: OFF -> Studio Mic: LIVE, etc). On mobile portrait
+     they collapse to two-per-row via a media query below. */
   .ops-btn {
     border: 1px solid var(--border-subtle);
     background: transparent;
@@ -56,31 +59,34 @@
     justify-content: center;
     text-align: center;
     height: 2rem;
-    padding: 0 0.9rem;
+    padding: 0 0.4rem;
     letter-spacing: 0.02em;
+    flex: 0 0 13em;
   }
   .ops-btn:disabled { opacity: 0.4; cursor: not-allowed; }
   .ops-btn.pending { opacity: 0.6; }
   .ops-btn.active { color: #000; }
   .ops-btn:not(:disabled):hover { opacity: 0.9; }
 
-  #manualModeBtn { min-width: 9.5em; margin-left: auto; }
   #manualModeBtn.active { background: #d97706; border-color: #d97706; }
-
-  #micPttBtn { min-width: 12em; }
   #micPttBtn.active { background: var(--danger); border-color: var(--danger); }
-  /* Disabled-because-you're-connected-as-remote-DJ: dim but still show
-     the LIVE color, so the remote operator can see whether the studio
-     DJ is on mic without being able to toggle it. */
   #micPttBtn:disabled { opacity: 0.55; }
-
-  #remoteDjConnectBtn { min-width: 11em; }
   #remoteDjConnectBtn.active { background: var(--accent); border-color: var(--accent); }
   #remoteDjConnectBtn.error { color: var(--danger); border-color: var(--danger); }
-
-  #remoteDjGateBtn { min-width: 12.5em; }
   #remoteDjGateBtn.active { background: var(--danger); border-color: var(--danger); }
   #remoteDjGateBtn:disabled { opacity: 0.5; }
+
+  /* Mobile portrait: two buttons per row, slightly smaller text so the
+     longest labels (~"Studio Mic: ERROR", "Disconnect Remote",
+     "Mic Cal: +12.5 dB") still fit inside each half-row. */
+  @media (max-width: 640px) {
+    .ops-btn {
+      flex: 0 0 calc(50% - 0.3rem);
+      font-size: 0.78rem;
+      padding: 0 0.3rem;
+    }
+    .playnow-bar { justify-content: space-between; }
+  }
 
   .playnow-msg {
     font-size: 0.8rem;
