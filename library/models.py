@@ -848,3 +848,47 @@ class NavMenuItem(models.Model):
             from django.urls import reverse
             return reverse(self.url_name)
         return self.custom_url or None
+
+
+class RemoteDJConfig(models.Model):
+    """Singleton -- master switch and WebRTC tunables for Remote DJ over
+    WebRTC (see /home/jreed/.claude/plans/warm-zooming-rose.md). Off by
+    default -- "land the code, don't flip it live," same pattern as
+    OGRemoteConfig.enabled. Landing this while disabled means engine.py's
+    pipeline topology is byte-for-byte unchanged from today (no new tee,
+    no new pads) until this is deliberately turned on."""
+    enabled = models.BooleanField(
+        default=False,
+        help_text="Master switch. While off, the engine's pipeline is "
+                   "completely unchanged (no remote-DJ tee or pads exist "
+                   "at all) and the signaling server isn't started.",
+    )
+    stun_server = models.CharField(
+        max_length=200, default="stun://stun.l.google.com:19302",
+        help_text="Public STUN server for ICE. Sufficient unless both ends "
+                   "are behind symmetric NAT -- a TURN relay (coturn) is "
+                   "deliberately not set up ahead of a real need for one.",
+    )
+    ice_udp_min_port = models.PositiveIntegerField(
+        default=40000,
+        help_text="Pinned to a small explicit range (rather than the wide "
+                   "ephemeral default) so router UDP forwarding has a known, "
+                   "small target.",
+    )
+    ice_udp_max_port = models.PositiveIntegerField(default=40010)
+
+    class Meta:
+        verbose_name = "Remote DJ Configuration"
+        verbose_name_plural = "Remote DJ Configuration"
+
+    def __str__(self):
+        return "Remote DJ Configuration"
+
+    def save(self, *args, **kwargs):
+        self.pk = 1
+        super().save(*args, **kwargs)
+
+    @classmethod
+    def load(cls):
+        obj, _created = cls.objects.get_or_create(pk=1)
+        return obj

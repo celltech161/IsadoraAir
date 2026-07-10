@@ -25,6 +25,7 @@ from .models import (
     Playlist,
     PlaylistItem,
     PlaylistLog,
+    RemoteDJConfig,
     Rotation,
     RotationSlot,
     ScheduleBlock,
@@ -42,7 +43,7 @@ from .models import (
 # Every model keeps living in `library` underneath — only the admin UI
 # grouping changes.
 _TRAFFIC_MODELS = {"playlist", "rotation", "scheduleblock", "playlistlog"}
-_CONFIG_MODELS = {"analysisconfig", "recencyconfig", "uitheme", "logfillconfig", "uploadconfig", "navmenuitem"}
+_CONFIG_MODELS = {"analysisconfig", "recencyconfig", "uitheme", "logfillconfig", "uploadconfig", "navmenuitem", "remotedjconfig"}
 
 
 class SectionedAdminSite(admin.AdminSite):
@@ -605,6 +606,35 @@ class UploadConfigAdmin(admin.ModelAdmin):
         obj = UploadConfig.load()
         return HttpResponseRedirect(
             reverse("admin:library_uploadconfig_change", args=[obj.pk])
+        )
+
+
+@admin.register(RemoteDJConfig)
+class RemoteDJConfigAdmin(admin.ModelAdmin):
+    fieldsets = [
+        (None, {
+            "fields": ["enabled"],
+            "description": "Master switch for Remote DJ over WebRTC. While "
+                            "off, engine.py's pipeline is completely "
+                            "unchanged and the signaling server doesn't "
+                            "start -- flipping this on requires an engine "
+                            "restart to take effect.",
+        }),
+        ("WebRTC/ICE", {
+            "fields": ["stun_server", "ice_udp_min_port", "ice_udp_max_port"],
+        }),
+    ]
+
+    def has_add_permission(self, request):
+        return not RemoteDJConfig.objects.exists()
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+    def changelist_view(self, request, extra_context=None):
+        obj = RemoteDJConfig.load()
+        return HttpResponseRedirect(
+            reverse("admin:library_remotedjconfig_change", args=[obj.pk])
         )
 
 
