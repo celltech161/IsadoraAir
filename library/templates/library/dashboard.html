@@ -959,8 +959,13 @@ function renderRemoteDjGate(data) {
     return;
   }
   if (data.remote_dj_connected) {
-    // PTT gate mode.
-    btn.disabled = false;
+    // PTT gate mode. Read-only for anyone OTHER than the browser that
+    // established the connection -- mirrors the Studio Mic policy
+    // ("only togglable by the mic's owner") so a second remote DJ
+    // watching the dashboard can see the gate state but can't cut in
+    // on the live DJ. The connected DJ themselves keeps self-PTT.
+    const weAreConnected = !!rdjPc;
+    btn.disabled = !weAreConnected;
     btn.textContent = data.remote_dj_live ? 'Remote Mic: LIVE' : 'Remote Mic: OFF';
   } else {
     // Calibration mode -- always clickable so the operator can (re)cal
