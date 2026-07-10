@@ -4,7 +4,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Sign in — IsadoraAir</title>
+  <title>{% block title %}IsadoraAir{% endblock %}</title>
   <style>
     :root {
       --bg-dark: {{ ui_theme.bg_dark }};
@@ -17,43 +17,34 @@
       --danger: {{ ui_theme.danger }};
       --border-subtle: {{ ui_theme.border_subtle }};
     }
-
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-
     html, body {
       min-height: 100%;
       font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       background: var(--bg-darker);
       color: var(--text-main);
     }
-
     body {
       display: flex;
       align-items: center;
       justify-content: center;
       padding: 1.5rem;
     }
-
     .login-card {
       width: 100%;
-      max-width: 340px;
+      max-width: 380px;
       background: var(--bg-dark);
       border: 1px solid var(--border-subtle);
       border-radius: 12px;
       padding: 2rem 1.75rem;
     }
-
     .login-logo {
       display: block;
       height: 44px;
       width: auto;
       margin: 0 auto 1.5rem;
     }
-
-    .login-logo.has-station-logo {
-      margin-bottom: 0.75rem;
-    }
-
+    .login-logo.has-station-logo { margin-bottom: 0.75rem; }
     .station-logo {
       display: block;
       max-width: 260px;
@@ -61,11 +52,18 @@
       height: auto;
       margin: 0 auto 1.5rem;
     }
-
-    .login-field {
-      margin-bottom: 1rem;
+    .login-title {
+      font-size: 1.05rem;
+      font-weight: 700;
+      margin-bottom: 0.4rem;
     }
-
+    .login-intro {
+      font-size: 0.85rem;
+      color: var(--text-muted);
+      margin-bottom: 1.1rem;
+      line-height: 1.4;
+    }
+    .login-field { margin-bottom: 1rem; }
     .login-field label {
       display: block;
       font-size: 0.78rem;
@@ -73,7 +71,6 @@
       color: var(--text-muted);
       margin-bottom: 0.35rem;
     }
-
     .login-field input {
       width: 100%;
       background: var(--bg-darker);
@@ -83,12 +80,7 @@
       color: var(--text-main);
       font-size: 0.9rem;
     }
-
-    .login-field input:focus {
-      outline: none;
-      border-color: var(--accent);
-    }
-
+    .login-field input:focus { outline: none; border-color: var(--accent); }
     .login-error {
       background: rgba(249, 115, 115, 0.1);
       border: 1px solid var(--danger);
@@ -98,7 +90,16 @@
       font-size: 0.82rem;
       margin-bottom: 1rem;
     }
-
+    .login-hint {
+      background: rgba(150, 150, 150, 0.06);
+      border: 1px solid var(--border-subtle);
+      border-radius: 8px;
+      padding: 0.6rem 0.75rem;
+      font-size: 0.8rem;
+      color: var(--text-muted);
+      margin-bottom: 1rem;
+      line-height: 1.45;
+    }
     .login-submit {
       width: 100%;
       background: var(--accent);
@@ -111,10 +112,19 @@
       cursor: pointer;
       transition: background 0.12s;
     }
-
-    .login-submit:hover {
-      background: var(--accent-soft);
+    .login-submit:hover { background: var(--accent-soft); }
+    .login-links {
+      display: flex;
+      justify-content: space-between;
+      gap: 0.75rem;
+      margin-top: 1rem;
+      font-size: 0.8rem;
     }
+    .login-links a {
+      color: var(--text-muted);
+      text-decoration: none;
+    }
+    .login-links a:hover { color: var(--accent); text-decoration: underline; }
   </style>
 </head>
 <body>
@@ -124,26 +134,7 @@
     <img class="station-logo" src="{{ ui_theme.station_logo.url }}" alt="Station logo">
     {% endif %}
 
-    {% if form.errors %}
-    <div class="login-error">Incorrect username or password.</div>
-    {% endif %}
-
-    <form method="post" action="{% url 'login' %}">
-      {% csrf_token %}
-      <input type="hidden" name="next" value="{{ next }}">
-      <div class="login-field">
-        <label for="id_username">Username</label>
-        <input type="text" name="username" id="id_username" autofocus autocapitalize="none" autocomplete="username" required>
-      </div>
-      <div class="login-field">
-        <label for="id_password">Password</label>
-        <input type="password" name="password" id="id_password" autocomplete="current-password" required>
-      </div>
-      <button type="submit" class="login-submit">Sign in</button>
-    </form>
-    <div style="margin-top:1rem;text-align:right;font-size:0.8rem;">
-      <a href="{% url 'password_reset' %}" style="color:var(--text-muted);text-decoration:none;">Forgot password?</a>
-    </div>
+    {% block body %}{% endblock %}
   </div>
 </body>
 </html>
