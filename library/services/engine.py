@@ -1607,19 +1607,29 @@ class PlaybackEngine:
         # AND local mic exists, so the mic branch here only fires
         # under the same condition.
         mon_mixer = Gst.ElementFactory.make("audiomixer", None)
-        # Per-input decouple queues: the tees feeding mon_mixer are
-        # ALREADY PLAYING (they live on main_pipeline, up since engine
-        # start), so the instant we link tee_src -> mon_mixer.sink they
-        # start pushing buffers into mon_mixer -- which is still NULL
-        # until sync_state_with_parent below. A queue in each input
-        # absorbs those pre-sync buffers so mon_mixer's aggregator
-        # doesn't see anything until it's actually PAUSED/PLAYING. This
-        # was the observed cause of first-session-after-engine-restart
-        # producing static in the main studio-monitor output (the
-        # broken mon_mixer state somehow reached back through the tees
-        # into shared pipeline state).
+        # Per-input decouple queues between the always-flowing tees and
+        # this session's monitor mixer. LEAKY is load-bearing here, not
+        # an optimization: until webrtcbin's ICE/DTLS negotiation
+        # completes (1-3s, longer on mobile networks), NOTHING downstream
+        # of these queues consumes audio. A non-leaky queue fills its
+        # default ~1s cap and then BLOCKS the tee feeding it -- and a
+        # blocked tee stalls ALL its branches, including remote_dj_tee's
+        # on-air branch into master_mixer. Observed live as a ~2s
+        # full-output dropout on every remote-DJ connect. Same lesson,
+        # same fix as stereotool_queue: this branch may only ever drop
+        # its own audio, never block the shared path.
         mon_decks_q = Gst.ElementFactory.make("queue", None)
-        mon_mic_q = Gst.ElementFactory.make("queue", None) if self.local_mic_tee is not None else None
+        mon_decks_q.set_property("leaky", 2)  # downstream -- drop oldest, never block the tee
+        mon_decks_q.set_property("max-size-time", REMOTE_DJ_MONITOR_QUEUE_MS * Gst.MSECOND)
+        mon_decks_q.set_property("max-size-buffers", 0)
+        mon_decks_q.set_property("max-size-bytes", 0)
+        mon_mic_q = None
+        if self.local_mic_tee is not None:
+            mon_mic_q = Gst.ElementFactory.make("queue", None)
+            mon_mic_q.set_property("leaky", 2)
+            mon_mic_q.set_property("max-size-time", REMOTE_DJ_MONITOR_QUEUE_MS * Gst.MSECOND)
+            mon_mic_q.set_property("max-size-buffers", 0)
+            mon_mic_q.set_property("max-size-bytes", 0)
         mon_q = Gst.ElementFactory.make("queue", None)
         mon_q.set_property("leaky", 1)  # upstream -- can only ever drop its own data
         mon_q.set_property("max-size-time", REMOTE_DJ_MONITOR_QUEUE_MS * Gst.MSECOND)
@@ -1637,39 +1647,15 @@ class PlaybackEngine:
             self.main_pipeline.add(el)
             session.elements.append(el)
 
-        # Sync the queues + mon_mixer to PLAYING BEFORE requesting any
-        # tee pads or linking anything to them. This is the crucial
-        # ordering step: the tees on main_pipeline are already PLAYING
-        # and will start pushing buffers into anything they get linked
-        # to. If the target queue/mixer is still NULL when we link, the
-        # first pushed buffer either gets dropped with a flow error or
-        # (worse) leaves the shared pipeline in a subtly-glitched state
-        # -- observed live as static on the currently-playing deck
-        # after the first-ever remote-DJ session start post-engine-
-        # restart, lasting until that deck's track ended and a fresh
-        # deck bin replaced it. Elements NOT fed by an
-        # already-running-tee (mon_q onward) still sync at the end,
-        # since their upstream will only start flowing once mon_mixer
-        # itself starts producing output.
-        mon_mixer.sync_state_with_parent()
-        mon_decks_q.sync_state_with_parent()
-        if mon_mic_q is not None:
-            mon_mic_q.sync_state_with_parent()
-
-        # Decks branch: tee -> queue -> mon_mixer.
-        session.monitor_tee_pad = self.remote_dj_tee.request_pad_simple("src_%u")
-        session.monitor_tee_pad.link(mon_decks_q.get_static_pad("sink"))
-        mon_mixer_decks_sink = mon_mixer.request_pad_simple("sink_%u")
-        mon_decks_q.get_static_pad("src").link(mon_mixer_decks_sink)
-
-        # Local-mic branch: tee -> queue -> mon_mixer, only if the local
-        # mic tee was built.
-        if self.local_mic_tee is not None:
-            session.local_mic_tee_pad = self.local_mic_tee.request_pad_simple("src_%u")
-            session.local_mic_tee_pad.link(mon_mic_q.get_static_pad("sink"))
-            mon_mixer_mic_sink = mon_mixer.request_pad_simple("sink_%u")
-            mon_mic_q.get_static_pad("src").link(mon_mixer_mic_sink)
-
+        # Internal monitor-chain links only. The tee pads that feed this
+        # chain are deliberately NOT requested or linked here -- that
+        # happens as the VERY LAST step of session build (see the bottom
+        # of this method), after every session element including
+        # webrtcbin has been synced to PLAYING. Linking a live tee into
+        # a chain with any still-NULL element downstream produces flow
+        # errors that propagate back through the tee into the shared
+        # on-air path -- observed live as static on the currently-
+        # playing deck that persisted until the deck's track ended.
         mon_mixer.link(mon_q)
         mon_q.link(mon_conv)
         mon_conv.link(mon_resample)
@@ -1726,6 +1712,25 @@ class PlaybackEngine:
 
         for el in session.elements:
             el.sync_state_with_parent()
+
+        # LAST step, deliberately after everything above is PLAYING:
+        # splice the live tees into the (now fully-live, leaky-buffered)
+        # monitor chain. From the instant these links land, the tees
+        # push into queues that are guaranteed to never block and whose
+        # downstream is guaranteed to never be NULL -- the two failure
+        # modes that previously reached back through the shared tees
+        # and glitched the on-air output (a ~2s dropout on connect, and
+        # earlier, static on the playing deck).
+        session.monitor_tee_pad = self.remote_dj_tee.request_pad_simple("src_%u")
+        session.monitor_tee_pad.link(mon_decks_q.get_static_pad("sink"))
+        mon_mixer_decks_sink = mon_mixer.request_pad_simple("sink_%u")
+        mon_decks_q.get_static_pad("src").link(mon_mixer_decks_sink)
+
+        if self.local_mic_tee is not None:
+            session.local_mic_tee_pad = self.local_mic_tee.request_pad_simple("src_%u")
+            session.local_mic_tee_pad.link(mon_mic_q.get_static_pad("sink"))
+            mon_mixer_mic_sink = mon_mixer.request_pad_simple("sink_%u")
+            mon_mic_q.get_static_pad("src").link(mon_mixer_mic_sink)
 
     def _remote_dj_on_negotiation_needed(self, element):
         session = self.remote_dj_session
