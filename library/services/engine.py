@@ -1832,20 +1832,41 @@ class PlaybackEngine:
         session.remote_gate.link(gate_conv)
         pad.link(depay.get_static_pad("sink"))
 
-        # Request the master_mixer sink pad here (not at session-start),
-        # so master_mixer never sees an unfed sink pad. gate_conv is
-        # already linked upstream to the whole decode chain, and
-        # sync_state_with_parent below transitions everything to PLAYING
-        # so real mic buffers start flowing to the newly-requested pad
-        # within milliseconds -- no silence-priming needed.
-        session.master_mixer_pad = self.master_mixer.request_pad_simple("sink_%u")
-        gate_conv.get_static_pad("src").link(session.master_mixer_pad)
-
         for el in (depay, dec, conv, resample, capsfilter, queue,
                    remote_gain, session.remote_gate, gate_conv):
             el.sync_state_with_parent()
 
-        print("  Remote DJ: real mic audio linked to master_mixer")
+        # Master_mixer's sink pad is requested and linked ONLY when the
+        # decode chain is ready to push its first buffer, not before.
+        # `audiomixer` (GstAggregator) refuses to output anything until
+        # every linked sink pad has produced at least one buffer -- and
+        # webrtcbin's rtpjitterbuffer + decode takes anywhere from a few
+        # hundred ms to a couple of seconds to deliver the first buffer,
+        # depending on network conditions. If we link master_mixer_pad
+        # before that first buffer is ready, the studio-monitor chain
+        # goes silent for the entire wait -- observed live as "a couple
+        # seconds of mute on connect" on mobile-network connections.
+        # Fix: install a BLOCK probe on gate_conv's src pad; the probe
+        # fires when the first real buffer is about to be pushed
+        # downstream, and only then do we request the master_mixer sink
+        # pad and link it in. The probe then removes itself so the
+        # first buffer and everything after flows normally.
+        gate_conv_src = gate_conv.get_static_pad("src")
+        def _on_first_buffer_ready(probed_pad, info, _u):
+            s = self.remote_dj_session
+            if s is not session or s.master_mixer_pad is not None:
+                # Session was already stopped or the pad was linked in a
+                # race -- either way, just unblock.
+                return Gst.PadProbeReturn.REMOVE
+            s.master_mixer_pad = self.master_mixer.request_pad_simple("sink_%u")
+            probed_pad.link(s.master_mixer_pad)
+            print("  Remote DJ: real mic audio linked to master_mixer")
+            return Gst.PadProbeReturn.REMOVE
+        gate_conv_src.add_probe(
+            Gst.PadProbeType.BLOCK_DOWNSTREAM, _on_first_buffer_ready, None,
+        )
+
+        print("  Remote DJ: decode chain wired; waiting for first buffer to link mixer")
         session.real_buf_seen = True
 
     def _remote_dj_on_connection_state(self, element, _pspec):
