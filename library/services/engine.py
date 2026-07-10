@@ -686,8 +686,29 @@ class PlaybackEngine:
             .select_related("track", "track__artist", "track__album", "track__category", "track__category__kind")
             .order_by("position")
         )
+        # Advance past anything already played -- an engine restart
+        # mid-hour must NOT replay the log from position 0, or we'd
+        # start hearing tracks that already aired. Especially bad for
+        # inserted WxAlert / OGRemote urgent tracks, which are
+        # positioned in the DB where the queue cursor was at insertion
+        # time; every restart would then replay yesterday's severe
+        # thunderstorm alert until the hour rolls over. `played_at` is
+        # set at the moment a track's deck starts (_create_deck), so
+        # "played_at set" = "started airing", which is the right
+        # granularity for skip-on-restart (a track that started but was
+        # interrupted mid-play is still skipped rather than resumed,
+        # which matches the resume-from-next-boundary contract every
+        # other restart path already uses).
         self._queue_cursor = 0
-        print(f"Loaded log for {target_date} {hour:02d}:00 — {len(self.log_items)} items")
+        for i, item in enumerate(self.log_items):
+            if item.played_at is None:
+                self._queue_cursor = i
+                break
+        else:
+            self._queue_cursor = len(self.log_items)
+        skipped = self._queue_cursor
+        print(f"Loaded log for {target_date} {hour:02d}:00 — {len(self.log_items)} items "
+              f"({'resuming at position ' + str(skipped) if skipped else 'from top'})")
 
     def _ensure_upcoming_logs(self):
         """No human approval step for now — auto-build (and
