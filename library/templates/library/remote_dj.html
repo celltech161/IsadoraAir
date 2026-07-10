@@ -35,6 +35,47 @@
   .remotedj-btn:disabled { opacity: 0.4; cursor: not-allowed; }
   .remotedj-btn.disconnect { background: var(--danger); }
   .remotedj-unauthorized { color: var(--danger); }
+
+  .remotedj-gain {
+    display: none;
+    flex-direction: column;
+    gap: 0.6rem;
+    padding: 0.9rem 1rem;
+    border: 1px solid var(--border-subtle);
+    border-radius: 8px;
+  }
+  .remotedj-gain.active { display: flex; }
+  .remotedj-gain-row {
+    display: flex; align-items: center; gap: 0.6rem;
+    font-size: 0.85rem;
+  }
+  .remotedj-gain-row label { min-width: 4.5em; color: var(--text-muted); }
+  .remotedj-gain-row .value { min-width: 4em; text-align: right; font-variant-numeric: tabular-nums; }
+  .remotedj-gain-row input[type=range] { flex: 1; }
+
+  /* Peak meter: green under -12 dBFS, yellow -12 to -3, red above.
+     A separate hold-line marks the highest peak seen recently. */
+  .remotedj-meter-wrap {
+    position: relative; height: 12px; background: var(--bg-dark);
+    border: 1px solid var(--border-subtle); border-radius: 4px; overflow: hidden;
+    flex: 1;
+  }
+  .remotedj-meter-fill {
+    position: absolute; left: 0; top: 0; bottom: 0; width: 0%;
+    background: var(--accent); transition: width 0.05s linear;
+  }
+  .remotedj-meter-fill.warn { background: #d97706; }
+  .remotedj-meter-fill.hot { background: var(--danger); }
+  .remotedj-meter-hold {
+    position: absolute; top: 0; bottom: 0; width: 2px;
+    background: var(--text-main); opacity: 0.7;
+  }
+
+  .remotedj-btn.calibrate { background: var(--accent); }
+  .remotedj-btn.calibrate.running {
+    background: transparent; color: var(--text-main);
+    border: 1px solid var(--border-subtle);
+  }
 </style>
 {% endblock %}
 
@@ -48,11 +89,34 @@
     <button id="rdjConnectBtn" class="remotedj-btn" onclick="rdjConnect()">Connect</button>
     <button id="rdjDisconnectBtn" class="remotedj-btn disconnect" onclick="rdjDisconnect()" disabled>Disconnect</button>
     <audio id="rdjMonitorAudio" autoplay></audio>
+
+    <div id="rdjGainPanel" class="remotedj-gain">
+      <div class="remotedj-gain-row">
+        <label for="rdjGainSlider">Gain</label>
+        <input id="rdjGainSlider" type="range" min="-20" max="40" step="0.5" value="0" autocomplete="off" oninput="rdjSetGain(this.value)">
+        <span class="value" id="rdjGainValue">0.0 dB</span>
+      </div>
+      <div class="remotedj-gain-row">
+        <label>Peak</label>
+        <div class="remotedj-meter-wrap">
+          <div class="remotedj-meter-fill" id="rdjMeterFill"></div>
+          <div class="remotedj-meter-hold" id="rdjMeterHold" style="left:0"></div>
+        </div>
+        <span class="value" id="rdjPeakValue">—</span>
+      </div>
+      <button id="rdjCalibrateBtn" class="remotedj-btn calibrate" onclick="rdjCalibrate()">
+        Calibrate (6s peak → −6 dBFS)
+      </button>
+    </div>
+
     <p style="font-size:0.8rem;color:var(--text-muted);">
       Connecting will ask for microphone permission. Once connected you'll
       hear the studio's live program audio (minus your own voice) so you
       can time talk-overs. The studio operator controls when your mic
-      actually joins the on-air mix.
+      actually joins the on-air mix. Adjust the gain slider so you're
+      hitting the yellow zone in normal speech; the Calibrate button
+      watches your peak for 6 seconds and sets the gain so your loudest
+      moment sits at −6 dBFS.
     </p>
   {% endif %}
 </div>
@@ -62,6 +126,15 @@
 <script>
 let rdjPc = null;
 let rdjWs = null;
+// Web Audio graph: micStream -> src -> gain -> analyser -> dest -> sent track.
+// We keep the graph across the whole session so the calibrate button
+// and gain slider can adjust it in real time without renegotiation.
+let rdjAudioCtx = null;
+let rdjGainNode = null;
+let rdjAnalyser = null;
+let rdjMeterAF = null;
+let rdjPeakHoldDb = -60;
+let rdjPeakHoldExpireAt = 0;
 
 function rdjSetStatus(text, cls) {
   const el = document.getElementById('rdjStatus');
@@ -145,12 +218,31 @@ async function rdjConnect() {
         return;
       }
 
+      // Route the raw mic through a Web Audio graph so we can apply a
+      // real-time gain and tap a peak meter. The output goes back into
+      // a MediaStreamDestination whose track is what the RTCPeerConnection
+      // actually sends -- so the calibration button + gain slider can
+      // adjust levels live without renegotiation.
+      rdjAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      const micSource = rdjAudioCtx.createMediaStreamSource(stream);
+      rdjGainNode = rdjAudioCtx.createGain();
+      rdjGainNode.gain.value = rdjDbToLin(parseFloat(document.getElementById('rdjGainSlider').value));
+      rdjAnalyser = rdjAudioCtx.createAnalyser();
+      rdjAnalyser.fftSize = 2048;
+      const rdjDestination = rdjAudioCtx.createMediaStreamDestination();
+      micSource.connect(rdjGainNode);
+      rdjGainNode.connect(rdjAnalyser);
+      rdjAnalyser.connect(rdjDestination);
+
       const transceivers = rdjPc.getTransceivers();
       const micTransceiver = transceivers[1];
       const monitorTransceiver = transceivers[0];
-      await micTransceiver.sender.replaceTrack(stream.getAudioTracks()[0]);
+      await micTransceiver.sender.replaceTrack(rdjDestination.stream.getAudioTracks()[0]);
       micTransceiver.direction = 'sendonly';
       monitorTransceiver.direction = 'recvonly';
+
+      document.getElementById('rdjGainPanel').classList.add('active');
+      rdjStartMeter();
 
       const answer = await rdjPc.createAnswer();
       // Force high-bitrate stereo fullband Opus by rewriting the Opus
@@ -219,6 +311,11 @@ async function rdjConnect() {
 function rdjDisconnect() {
   if (rdjPc) { rdjPc.close(); rdjPc = null; }
   if (rdjWs) { rdjWs.close(); rdjWs = null; }
+  if (rdjMeterAF) { cancelAnimationFrame(rdjMeterAF); rdjMeterAF = null; }
+  if (rdjAudioCtx) { rdjAudioCtx.close().catch(()=>{}); rdjAudioCtx = null; }
+  rdjGainNode = null;
+  rdjAnalyser = null;
+  document.getElementById('rdjGainPanel').classList.remove('active');
   document.getElementById('rdjConnectBtn').disabled = false;
   document.getElementById('rdjDisconnectBtn').disabled = true;
   rdjSetStatus('Disconnected.');
@@ -227,6 +324,124 @@ function rdjDisconnect() {
 function rdjGetCookie(name) {
   const match = document.cookie.match('(^|;)\\s*' + name + '\\s*=\\s*([^;]+)');
   return match ? match.pop() : '';
+}
+
+// --- Gain + peak meter + calibration ---
+
+function rdjDbToLin(db) { return Math.pow(10, db / 20); }
+function rdjLinToDb(lin) { return lin > 0 ? 20 * Math.log10(lin) : -100; }
+
+const RDJ_GAIN_STORAGE_KEY = 'isadoraair.remote_dj.gain_db';
+
+function rdjSetGain(dbStr) {
+  const db = parseFloat(dbStr);
+  document.getElementById('rdjGainValue').textContent = db.toFixed(1) + ' dB';
+  if (rdjGainNode) {
+    // Small ramp (5ms) so slider drags don't click.
+    const now = rdjAudioCtx.currentTime;
+    rdjGainNode.gain.cancelScheduledValues(now);
+    rdjGainNode.gain.setTargetAtTime(rdjDbToLin(db), now, 0.005);
+  }
+  // Persist across page reloads / navigations.
+  try { localStorage.setItem(RDJ_GAIN_STORAGE_KEY, String(db)); } catch (e) {}
+}
+
+// Restore the slider from the last persisted gain value. Runs on
+// pageshow (not just DOMContentLoaded) so it also applies when the
+// browser restores the page from its back-forward cache -- otherwise
+// the browser can put the range input back to its LAST session's DOM
+// value AFTER our initial restore ran, silently undoing us.
+function rdjRestoreGain() {
+  try {
+    const saved = localStorage.getItem(RDJ_GAIN_STORAGE_KEY);
+    if (saved === null || isNaN(parseFloat(saved))) return;
+    const slider = document.getElementById('rdjGainSlider');
+    if (!slider) return;
+    slider.value = saved;
+    const label = document.getElementById('rdjGainValue');
+    if (label) label.textContent = parseFloat(saved).toFixed(1) + ' dB';
+    if (rdjGainNode && rdjAudioCtx) {
+      const now = rdjAudioCtx.currentTime;
+      rdjGainNode.gain.cancelScheduledValues(now);
+      rdjGainNode.gain.setTargetAtTime(rdjDbToLin(parseFloat(saved)), now, 0.005);
+    }
+  } catch (e) {}
+}
+window.addEventListener('pageshow', rdjRestoreGain);
+rdjRestoreGain();
+
+function rdjStartMeter() {
+  const fill = document.getElementById('rdjMeterFill');
+  const hold = document.getElementById('rdjMeterHold');
+  const peakVal = document.getElementById('rdjPeakValue');
+  const buf = new Float32Array(rdjAnalyser.fftSize);
+  // Meter maps -60 dBFS (left) to 0 dBFS (right).
+  const dbToPct = (db) => Math.max(0, Math.min(100, (db + 60) / 60 * 100));
+  function tick() {
+    if (!rdjAnalyser) return;
+    rdjAnalyser.getFloatTimeDomainData(buf);
+    let peak = 0;
+    for (let i = 0; i < buf.length; i++) {
+      const a = Math.abs(buf[i]);
+      if (a > peak) peak = a;
+    }
+    const peakDb = rdjLinToDb(peak);
+    const pct = dbToPct(peakDb);
+    fill.style.width = pct + '%';
+    fill.classList.toggle('warn', peakDb >= -12 && peakDb < -3);
+    fill.classList.toggle('hot',  peakDb >= -3);
+    // Peak hold: latch the highest recent peak for ~1.5s so quick
+    // transients are actually visible.
+    const now = performance.now();
+    if (peakDb > rdjPeakHoldDb || now > rdjPeakHoldExpireAt) {
+      rdjPeakHoldDb = peakDb;
+      rdjPeakHoldExpireAt = now + 1500;
+    }
+    hold.style.left = dbToPct(rdjPeakHoldDb) + '%';
+    peakVal.textContent = (peakDb > -60 ? peakDb.toFixed(1) : '−∞') + ' dB';
+    rdjMeterAF = requestAnimationFrame(tick);
+  }
+  rdjMeterAF = requestAnimationFrame(tick);
+}
+
+async function rdjCalibrate() {
+  if (!rdjAnalyser || !rdjGainNode) return;
+  const btn = document.getElementById('rdjCalibrateBtn');
+  btn.classList.add('running');
+  const buf = new Float32Array(rdjAnalyser.fftSize);
+  // Watch the peak of the CURRENTLY-GAINED signal for 6 seconds; then
+  // solve for the gain that would put that peak at -6 dBFS. This matches
+  // OGRemote's behavior: "just talk at your loudest for six seconds".
+  let peak = 0;
+  const startCtxTime = rdjAudioCtx.currentTime;
+  const durationS = 6.0;
+  // Show a countdown in the button label.
+  for (let s = 6; s >= 1; s--) {
+    btn.textContent = 'Calibrating… ' + s + 's';
+    const stepEnd = startCtxTime + (6 - s + 1);
+    // Sample the peak every animation frame until this second boundary.
+    while (rdjAudioCtx.currentTime < stepEnd) {
+      rdjAnalyser.getFloatTimeDomainData(buf);
+      for (let i = 0; i < buf.length; i++) {
+        const a = Math.abs(buf[i]);
+        if (a > peak) peak = a;
+      }
+      await new Promise(r => requestAnimationFrame(r));
+    }
+  }
+  btn.classList.remove('running');
+  btn.textContent = 'Calibrate (6s peak → −6 dBFS)';
+  if (peak <= 0) return;  // no signal captured; leave gain alone
+  const currentGainDb = parseFloat(document.getElementById('rdjGainSlider').value);
+  const peakDb = rdjLinToDb(peak);
+  // Peak (post-current-gain) is at peakDb. Target is -6. Delta is how
+  // much MORE gain to add on top of what we already applied.
+  const targetDb = -6.0;
+  const deltaDb = targetDb - peakDb;
+  const newGainDb = Math.max(-20, Math.min(40, currentGainDb + deltaDb));
+  const slider = document.getElementById('rdjGainSlider');
+  slider.value = newGainDb.toFixed(1);
+  rdjSetGain(newGainDb);
 }
 </script>
 {% endblock %}

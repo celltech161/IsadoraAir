@@ -85,6 +85,7 @@ class RemoteDJSession:
         self.remote_gate = None
         self.master_mixer_pad = None
         self.monitor_tee_pad = None
+        self.local_mic_tee_pad = None  # only set if local mic exists
         # Every element this session added directly to main_pipeline
         # (monitor-return chain built at session start; inbound
         # depay/dec/convert/resample/queue chain built later, in
@@ -131,6 +132,7 @@ class PlaybackEngine:
         self.mic_gain = None
         self.mic_ok = True
         self.mic_live = False
+        self.local_mic_tee = None  # only built if remote_dj + local mic both enabled
         self._mic_bin = None
         # Remote DJ over WebRTC. remote_dj_tee only exists at all when
         # RemoteDJConfig.enabled (see _build_main_pipeline) -- while off,
@@ -151,6 +153,12 @@ class PlaybackEngine:
         # toggle before the trigger point is a no-op, not a hard cut.
         self.manual_mode = False
         self._manual_hold_pending = False
+        # True while Manual mode is being held by the mic system (any
+        # mic live) rather than by an explicit operator toggle -- so
+        # that when the last mic goes quiet, we restore Auto for them.
+        # An explicit operator toggle of manual_mode CLEARS this flag,
+        # so a manually-selected Manual survives the next mic release.
+        self._manual_from_mic = False
         self._duck_ramp_source_id = None
         self.pipeline_sample_rate = None
         self.main_pipeline = None
@@ -579,8 +587,27 @@ class PlaybackEngine:
         else:
             self.duck_gain.get_static_pad("src").link(duck_pad)
         if mic_elements:
-            mic_pad = self.master_mixer.request_pad_simple("sink_%u")
-            mic_elements[-1].get_static_pad("src").link(mic_pad)
+            if self.remote_dj_tee is not None:
+                # Tee local mic (post-PTT) so a remote-DJ session can also
+                # tap it and mix it into the remote's monitor return --
+                # this is what lets the studio operator and remote DJ
+                # actually converse; without the tap the remote's
+                # mix-minus would exclude the local mic too and only
+                # carry decks. Requested per session (in
+                # _remote_dj_build_session) so its downstream mixer only
+                # exists when there's a DJ to feed. Non-leaky and
+                # unbounded time-wise: a session can drop and re-add
+                # this tap without disturbing the always-live branch to
+                # master_mixer.
+                self.local_mic_tee = Gst.ElementFactory.make("tee", "local_mic_tee")
+                self.main_pipeline.add(self.local_mic_tee)
+                mic_elements[-1].link(self.local_mic_tee)
+                mic_onair_pad = self.local_mic_tee.request_pad_simple("src_%u")
+                mic_pad = self.master_mixer.request_pad_simple("sink_%u")
+                mic_onair_pad.link(mic_pad)
+            else:
+                mic_pad = self.master_mixer.request_pad_simple("sink_%u")
+                mic_elements[-1].get_static_pad("src").link(mic_pad)
         self.master_mixer.link(convert)
         convert.link(resample)
         resample.link(capsfilter)
@@ -1378,11 +1405,66 @@ class PlaybackEngine:
         self.mic_ptt_volume.set_property("volume", 1.0 if active else 0.0)
         self.mic_live = active
         self._apply_talk_ducking()
+        self._apply_mic_mode_hold()
         print(f"  Mic PTT: {'ON' if active else 'OFF'}")
 
-    def _set_manual_mode(self, active):
+    def _any_mic_live(self):
+        return self.mic_live or bool(
+            self.remote_dj_session and self.remote_dj_session.remote_gate
+            and self.remote_dj_session.remote_gate.get_property("volume") > 0.0
+        )
+
+    def _apply_mic_mode_hold(self):
+        """Called after any mic state change (local PTT or remote gate).
+        Ties Manual mode to "any mic live" -- matches how the operator
+        actually uses this in practice: they toggle the mic on around a
+        track transition, expecting the current track to keep playing
+        while they talk over the tail and the next track to wait until
+        they finish. Auto handles the middle-of-song voiceover case
+        naturally: mic goes on for a few seconds, mic goes off before
+        the next trigger, mode flips back to Auto in time for the
+        automatic handoff.
+
+        Semantics:
+        - Mic goes live in Auto mode -> switch to Manual, remember we
+          did that (`_manual_from_mic = True`).
+        - Mic goes live in Manual mode (operator already chose it) -> no
+          change; `_manual_from_mic` stays False so the manually-chosen
+          Manual survives the next mic release.
+        - Last mic goes quiet with `_manual_from_mic = True` -> restore
+          Auto.
+        - Last mic goes quiet with `_manual_from_mic = False` (operator
+          set Manual explicitly before/during the mic) -> stay in
+          Manual.
+
+        An explicit operator toggle of manual_mode CLEARS
+        `_manual_from_mic` (see `_set_manual_mode`), so a user override
+        during a live mic wins and doesn't get overwritten on the next
+        mic transition.
+        """
+        any_live = self._any_mic_live()
+        if any_live and not self.manual_mode:
+            self.manual_mode = True
+            self._manual_from_mic = True
+            print("  Manual mode: ON (auto -- held by mic)")
+        elif not any_live and self._manual_from_mic:
+            # Reuse _set_manual_mode(False) so a genuinely-due handoff
+            # that was withheld during the mic hold fires immediately.
+            self._set_manual_mode(False, _from_mic_release=True)
+
+    def _set_manual_mode(self, active, _from_mic_release=False):
+        """`_from_mic_release=True` is the internal path used by
+        `_apply_mic_mode_hold` to restore Auto once the last mic goes
+        quiet -- it suppresses the "operator override" flag clear that
+        an operator-initiated toggle would apply. All external command
+        dispatch (see _check_commands) uses the default form."""
         self.manual_mode = active
-        print(f"  Manual mode: {'ON' if active else 'OFF'}")
+        if not _from_mic_release:
+            # Explicit operator toggle takes ownership -- any later mic
+            # transition should NOT overwrite this.
+            self._manual_from_mic = False
+        reason = " (auto -- mic released)" if _from_mic_release else ""
+        print(f"  Manual mode: {'ON' if active else 'OFF'}{reason}")
         if not active and self._manual_hold_pending:
             # A handoff was genuinely due (trigger point reached, or the
             # leading deck fully finished) and only manual mode withheld
@@ -1486,8 +1568,37 @@ class PlaybackEngine:
         self.main_pipeline.add(session.webrtc)
         session.elements.append(session.webrtc)
 
-        # --- Outbound: monitor-return branch off remote_dj_tee, mix-minus
-        # by construction (tapped before any mic joins master_mixer) ---
+        # --- Outbound: monitor-return branch. Mix-minus by construction
+        # for the *remote* mic (never tapped here), but INCLUDES the
+        # ducked deck audio and the local studio mic post-PTT so the
+        # remote DJ can converse with the studio operator. A small
+        # per-session audiomixer at the head of this branch sums the
+        # two inputs:
+        #   - remote_dj_tee.src_%u -> ducked decks (as always)
+        #   - local_mic_tee.src_%u -> local mic post mic_ptt_volume,
+        #     so the mic is silent-flowing when the operator's PTT is
+        #     off (the mic_ptt_volume element multiplies by 0.0/1.0
+        #     rather than dropping buffers, per the same lesson that
+        #     drove `mic_ptt_valve -> mic_ptt_volume` on the main
+        #     mixer -- keeps audiomixer's per-pad-first-buffer
+        #     requirement satisfied without an operator toggle).
+        # local_mic_tee is only built when both remote_dj is enabled
+        # AND local mic exists, so the mic branch here only fires
+        # under the same condition.
+        mon_mixer = Gst.ElementFactory.make("audiomixer", None)
+        # Per-input decouple queues: the tees feeding mon_mixer are
+        # ALREADY PLAYING (they live on main_pipeline, up since engine
+        # start), so the instant we link tee_src -> mon_mixer.sink they
+        # start pushing buffers into mon_mixer -- which is still NULL
+        # until sync_state_with_parent below. A queue in each input
+        # absorbs those pre-sync buffers so mon_mixer's aggregator
+        # doesn't see anything until it's actually PAUSED/PLAYING. This
+        # was the observed cause of first-session-after-engine-restart
+        # producing static in the main studio-monitor output (the
+        # broken mon_mixer state somehow reached back through the tees
+        # into shared pipeline state).
+        mon_decks_q = Gst.ElementFactory.make("queue", None)
+        mon_mic_q = Gst.ElementFactory.make("queue", None) if self.local_mic_tee is not None else None
         mon_q = Gst.ElementFactory.make("queue", None)
         mon_q.set_property("leaky", 1)  # upstream -- can only ever drop its own data
         mon_q.set_property("max-size-time", REMOTE_DJ_MONITOR_QUEUE_MS * Gst.MSECOND)
@@ -1498,11 +1609,47 @@ class PlaybackEngine:
         mon_enc = Gst.ElementFactory.make("opusenc", None)
         mon_enc.set_property("frame-size", REMOTE_DJ_OPUS_FRAME_SIZE_MS)
         mon_pay = Gst.ElementFactory.make("rtpopuspay", None)
-        for el in (mon_q, mon_conv, mon_resample, mon_caps, mon_enc, mon_pay):
+        mon_elements = [mon_mixer, mon_decks_q, mon_q, mon_conv, mon_resample, mon_caps, mon_enc, mon_pay]
+        if mon_mic_q is not None:
+            mon_elements.append(mon_mic_q)
+        for el in mon_elements:
             self.main_pipeline.add(el)
             session.elements.append(el)
+
+        # Sync the queues + mon_mixer to PLAYING BEFORE requesting any
+        # tee pads or linking anything to them. This is the crucial
+        # ordering step: the tees on main_pipeline are already PLAYING
+        # and will start pushing buffers into anything they get linked
+        # to. If the target queue/mixer is still NULL when we link, the
+        # first pushed buffer either gets dropped with a flow error or
+        # (worse) leaves the shared pipeline in a subtly-glitched state
+        # -- observed live as static on the currently-playing deck
+        # after the first-ever remote-DJ session start post-engine-
+        # restart, lasting until that deck's track ended and a fresh
+        # deck bin replaced it. Elements NOT fed by an
+        # already-running-tee (mon_q onward) still sync at the end,
+        # since their upstream will only start flowing once mon_mixer
+        # itself starts producing output.
+        mon_mixer.sync_state_with_parent()
+        mon_decks_q.sync_state_with_parent()
+        if mon_mic_q is not None:
+            mon_mic_q.sync_state_with_parent()
+
+        # Decks branch: tee -> queue -> mon_mixer.
         session.monitor_tee_pad = self.remote_dj_tee.request_pad_simple("src_%u")
-        session.monitor_tee_pad.link(mon_q.get_static_pad("sink"))
+        session.monitor_tee_pad.link(mon_decks_q.get_static_pad("sink"))
+        mon_mixer_decks_sink = mon_mixer.request_pad_simple("sink_%u")
+        mon_decks_q.get_static_pad("src").link(mon_mixer_decks_sink)
+
+        # Local-mic branch: tee -> queue -> mon_mixer, only if the local
+        # mic tee was built.
+        if self.local_mic_tee is not None:
+            session.local_mic_tee_pad = self.local_mic_tee.request_pad_simple("src_%u")
+            session.local_mic_tee_pad.link(mon_mic_q.get_static_pad("sink"))
+            mon_mixer_mic_sink = mon_mixer.request_pad_simple("sink_%u")
+            mon_mic_q.get_static_pad("src").link(mon_mixer_mic_sink)
+
+        mon_mixer.link(mon_q)
         mon_q.link(mon_conv)
         mon_conv.link(mon_resample)
         mon_resample.link(mon_caps)
@@ -1696,6 +1843,7 @@ class PlaybackEngine:
             return
         session.remote_gate.set_property("volume", 1.0 if active else 0.0)
         self._apply_talk_ducking()
+        self._apply_mic_mode_hold()
         print(f"  Remote DJ gate: {'ON' if active else 'OFF'}")
 
     def _remote_dj_session_stop(self):
@@ -1709,6 +1857,11 @@ class PlaybackEngine:
         if session.remote_gate is not None:
             session.remote_gate.set_property("volume", 0.0)
             self._apply_talk_ducking()
+            # Also fold any mic-held Manual back to Auto now that the
+            # remote is definitively off -- session_stop is one of the
+            # implicit "gate goes off" paths where _remote_dj_set_gate
+            # isn't called.
+            self._apply_mic_mode_hold()
 
         # Teardown ordering that avoids master_mixer freeze:
         # (1) UNLINK the master_mixer sink pad from its upstream peer
@@ -1736,6 +1889,11 @@ class PlaybackEngine:
             if peer is not None:
                 session.monitor_tee_pad.unlink(peer)
             self.remote_dj_tee.release_request_pad(session.monitor_tee_pad)
+        if session.local_mic_tee_pad is not None and self.local_mic_tee is not None:
+            peer = session.local_mic_tee_pad.get_peer()
+            if peer is not None:
+                session.local_mic_tee_pad.unlink(peer)
+            self.local_mic_tee.release_request_pad(session.local_mic_tee_pad)
 
         for el in session.elements:
             el.set_state(Gst.State.NULL)
@@ -2314,6 +2472,7 @@ class PlaybackEngine:
                 "mic_ok": self.mic_ok,
                 "mic_live": self.mic_live,
                 "manual_mode": self.manual_mode,
+                "manual_from_mic": self._manual_from_mic,
                 # Same "configured vs. live" distinction as the mic fields
                 # above -- remote_dj_configured means the feature is built
                 # into this pipeline at all (RemoteDJConfig.enabled at

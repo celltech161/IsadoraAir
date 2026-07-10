@@ -1450,6 +1450,28 @@ def api_engine_mic_ptt(request):
 
 @csrf_exempt
 @require_http_methods(["POST"])
+def api_engine_remote_dj_gate(request):
+    """Operator-side gate toggle for the currently-connected remote DJ,
+    dispatched over the same engine_cmd.json channel the local mic PTT
+    uses. Mirrors api_engine_mic_ptt; the engine ignores it if no
+    remote-DJ session is active."""
+    try:
+        body = json.loads(request.body)
+    except (json.JSONDecodeError, ValueError):
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+
+    active = body.get("active")
+    if not isinstance(active, bool):
+        return JsonResponse({"error": "active must be a boolean"}, status=400)
+
+    Path("/run/isadoraair/engine_cmd.json").write_text(
+        json.dumps({"command": "remote_dj_gate", "active": active}), encoding="utf-8",
+    )
+    return JsonResponse({"ok": True})
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
 def api_engine_manual_mode(request):
     try:
         body = json.loads(request.body)

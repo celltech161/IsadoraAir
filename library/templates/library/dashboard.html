@@ -43,23 +43,40 @@
   }
   .playnow-btn:hover { opacity: 0.9; }
 
-  .manual-mode-btn {
-    margin-left: auto;
+  /* --- Ops bar buttons ---
+     Each button has a per-button min-width sized to its longest label so
+     the whole row never shifts horizontally as state text changes. */
+  .ops-btn {
     border: 1px solid var(--border-subtle);
     background: transparent;
     color: var(--text-main);
+    font-family: inherit;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    height: 2rem;
+    padding: 0 0.9rem;
+    letter-spacing: 0.02em;
   }
-  .manual-mode-btn.active { background: #d97706; color: #000; border-color: #d97706; }
-  .manual-mode-btn.pending { opacity: 0.6; }
+  .ops-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .ops-btn.pending { opacity: 0.6; }
+  .ops-btn.active { color: #000; }
+  .ops-btn:not(:disabled):hover { opacity: 0.9; }
 
-  .mic-ptt-btn {
-    border: 1px solid var(--border-subtle);
-    background: transparent;
-    color: var(--text-main);
-  }
-  .mic-ptt-btn:disabled { opacity: 0.4; cursor: not-allowed; }
-  .mic-ptt-btn.active { background: var(--danger); color: #000; border-color: var(--danger); }
-  .mic-ptt-btn.pending { opacity: 0.6; }
+  #manualModeBtn { min-width: 9.5em; margin-left: auto; }
+  #manualModeBtn.active { background: #d97706; border-color: #d97706; }
+
+  #micPttBtn { min-width: 8em; }
+  #micPttBtn.active { background: var(--danger); border-color: var(--danger); }
+
+  #remoteDjConnectBtn { min-width: 11em; }
+  #remoteDjConnectBtn.active { background: var(--accent); border-color: var(--accent); }
+  #remoteDjConnectBtn.error { color: var(--danger); border-color: var(--danger); }
+
+  #remoteDjGateBtn { min-width: 12.5em; }
+  #remoteDjGateBtn.active { background: var(--danger); border-color: var(--danger); }
+  #remoteDjGateBtn:disabled { opacity: 0.5; }
 
   .playnow-msg {
     font-size: 0.8rem;
@@ -487,10 +504,15 @@
 
 {% block content %}
 <div class="playnow-bar">
-  <button class="playnow-btn manual-mode-btn" id="manualModeBtn" onclick="toggleManualMode()"
-          title="Manual holds the next track until you flip back to Auto -- for talking over a song's outro">Auto</button>
-  <button class="playnow-btn mic-ptt-btn" id="micPttBtn" onclick="toggleMicPtt()" disabled>Mic: OFF</button>
+  <button class="playnow-btn ops-btn" id="manualModeBtn" onclick="toggleManualMode()"
+          title="Manual holds the next track until you flip back to Auto -- for talking over a song's outro. Auto-switches while any mic is live.">Auto</button>
+  <button class="playnow-btn ops-btn" id="micPttBtn" onclick="toggleMicPtt()" disabled>Mic: OFF</button>
+  <button class="playnow-btn ops-btn" id="remoteDjConnectBtn" onclick="toggleRemoteDjConnect()" disabled
+          title="Connects THIS browser's mic into the on-air mix as the remote DJ. The Remote Mic button gates it on/off once connected.">Connect Remote</button>
+  <button class="playnow-btn ops-btn" id="remoteDjGateBtn" onclick="toggleRemoteDjGate()" disabled
+          title="Opens/closes the currently-connected remote DJ's mic into the on-air mix. Disabled when no remote DJ is connected.">Remote Mic: —</button>
 </div>
+<audio id="remoteMonitorAudio" autoplay style="display: none;"></audio>
 
 <div class="decks-row">
   <div class="deck-panel" id="deck-A"></div>
@@ -660,6 +682,288 @@ function renderMicPtt(data) {
     ? 'Mic: ERROR' : (data.mic_live ? 'Mic: LIVE' : 'Mic: OFF');
 }
 
+async function toggleRemoteDjGate() {
+  // Dual-purpose: acts as gate PTT when a remote DJ is connected,
+  // otherwise runs the operator's own 6-second mic calibration --
+  // saves the calibrated gain to localStorage where the dashboard
+  // Connect Remote flow reads it, so a subsequent operator connect
+  // uses the calibrated level. Nothing on the engine cares about
+  // this; it's purely browser-local until Connect Remote fires.
+  const state = window.__rdjLastEngineState || {};
+  const btn = document.getElementById('remoteDjGateBtn');
+  if (state.remote_dj_connected) {
+    // PTT gate mode.
+    const desiredActive = !btn.classList.contains('active');
+    btn.classList.add('pending');
+    const resp = await fetch('/api/engine/remote-dj-gate/', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') },
+      body: JSON.stringify({ active: desiredActive }),
+    });
+    if (!resp.ok) btn.classList.remove('pending');
+  } else {
+    // Calibration mode.
+    if (rdjCalibrating) return;
+    await rdjRunCalibration();
+  }
+}
+
+async function rdjRunCalibration() {
+  const btn = document.getElementById('remoteDjGateBtn');
+  rdjCalibrating = true;
+  btn.disabled = true;
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: {exact: false},
+        noiseSuppression: {exact: false},
+        autoGainControl: {exact: false},
+        channelCount: {ideal: 2},
+        sampleRate: {ideal: 48000},
+      },
+    });
+  } catch (e) {
+    btn.textContent = 'Mic denied';
+    setTimeout(() => { rdjCalibrating = false; btn.disabled = false; renderRemoteDjGate(window.__rdjLastEngineState || {}); }, 2000);
+    return;
+  }
+  const ctx = new (window.AudioContext || window.webkitAudioContext)();
+  const src = ctx.createMediaStreamSource(stream);
+  const analyser = ctx.createAnalyser();
+  analyser.fftSize = 2048;
+  src.connect(analyser);
+  const buf = new Float32Array(analyser.fftSize);
+  let peak = 0;
+  const startT = ctx.currentTime;
+  // Countdown-in-button while we watch peak for 6 seconds.
+  for (let s = 6; s >= 1; s--) {
+    btn.textContent = 'Speak: ' + s + 's';
+    const stepEnd = startT + (6 - s + 1);
+    while (ctx.currentTime < stepEnd) {
+      analyser.getFloatTimeDomainData(buf);
+      for (let i = 0; i < buf.length; i++) {
+        const a = Math.abs(buf[i]);
+        if (a > peak) peak = a;
+      }
+      await new Promise(r => requestAnimationFrame(r));
+    }
+  }
+  // Compute the gain that would put this peak at -6 dBFS. We measured
+  // the RAW mic (no gain applied yet), so target - measured is the
+  // absolute gain to store.
+  let newGainDb = 0;
+  if (peak > 0) {
+    const peakDb = rdjLinToDb(peak);
+    newGainDb = Math.max(-20, Math.min(40, -6.0 - peakDb));
+    rdjSaveGainDb(newGainDb);
+  }
+  // Release the mic + audio context; calibration is one-shot.
+  stream.getTracks().forEach(t => t.stop());
+  ctx.close().catch(()=>{});
+  rdjCalibrating = false;
+  btn.disabled = false;
+  renderRemoteDjGate(window.__rdjLastEngineState || {});
+}
+
+// --- Studio-side remote-DJ connect (mirrors /remote-dj/ but embedded
+// in the dashboard so the operator can gate their own laptop mic
+// through the on-air mix without navigating away). Only lets ONE
+// connection happen from this browser -- the engine enforces
+// "one remote DJ at a time" server-side too. ---
+let rdjPc = null;
+let rdjWs = null;
+let rdjAudioCtx = null;
+let rdjGainNode = null;
+let rdjCalibrating = false;
+
+const RDJ_GAIN_STORAGE_KEY = 'isadoraair.remote_dj.gain_db';
+
+function rdjDbToLin(db) { return Math.pow(10, db / 20); }
+function rdjLinToDb(lin) { return lin > 0 ? 20 * Math.log10(lin) : -100; }
+
+function rdjGetSavedGainDb() {
+  try {
+    const saved = localStorage.getItem(RDJ_GAIN_STORAGE_KEY);
+    if (saved === null || isNaN(parseFloat(saved))) return null;
+    return parseFloat(saved);
+  } catch (e) { return null; }
+}
+
+function rdjSaveGainDb(db) {
+  try { localStorage.setItem(RDJ_GAIN_STORAGE_KEY, String(db)); } catch (e) {}
+}
+
+async function toggleRemoteDjConnect() {
+  if (rdjPc || rdjWs) { rdjDisconnect(); return; }
+  const btn = document.getElementById('remoteDjConnectBtn');
+  btn.classList.add('pending');
+  btn.classList.remove('error');
+  btn.textContent = 'Connecting…';
+
+  let token;
+  try {
+    const r = await fetch('/api/remote-dj/token/', {
+      method: 'POST',
+      headers: {'X-CSRFToken': getCookie('csrftoken')},
+    });
+    if (!r.ok) throw new Error('token ' + r.status);
+    ({token} = await r.json());
+  } catch (e) {
+    rdjConnectFail('Token failed');
+    return;
+  }
+
+  rdjWs = new WebSocket('wss://' + location.host + '/ws/remote-dj/?token=' + token);
+  rdjWs.onmessage = async (event) => {
+    const msg = JSON.parse(event.data);
+    if (msg.type === 'offer') {
+      rdjPc = new RTCPeerConnection({iceServers: []});
+      rdjPc.onicecandidate = (e) => {
+        if (e.candidate) {
+          rdjWs.send(JSON.stringify({type: 'ice', sdpMLineIndex: e.candidate.sdpMLineIndex, candidate: e.candidate.candidate}));
+        }
+      };
+      rdjPc.oniceconnectionstatechange = () => {
+        if (rdjPc && ['failed', 'disconnected', 'closed'].includes(rdjPc.iceConnectionState)) {
+          rdjDisconnect();
+        }
+      };
+      rdjPc.ontrack = (e) => { document.getElementById('remoteMonitorAudio').srcObject = e.streams[0]; };
+
+      await rdjPc.setRemoteDescription({type: 'offer', sdp: msg.sdp});
+
+      let stream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: {exact: false},
+            noiseSuppression: {exact: false},
+            autoGainControl: {exact: false},
+            channelCount: {ideal: 2},
+            sampleRate: {ideal: 48000},
+          },
+        });
+      } catch (e) { rdjConnectFail('Mic denied'); return; }
+
+      // Route mic through a Web Audio graph so the persisted calibration
+      // gain applies (set via this dashboard's own Remote Mic calibrate
+      // action -- see the toggleRemoteDjGate() dual-purpose flow).
+      rdjAudioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      const micSource = rdjAudioCtx.createMediaStreamSource(stream);
+      rdjGainNode = rdjAudioCtx.createGain();
+      const savedDb = rdjGetSavedGainDb();
+      rdjGainNode.gain.value = rdjDbToLin(savedDb !== null ? savedDb : 0);
+      const rdjDestination = rdjAudioCtx.createMediaStreamDestination();
+      micSource.connect(rdjGainNode);
+      rdjGainNode.connect(rdjDestination);
+
+      const transceivers = rdjPc.getTransceivers();
+      const monitorT = transceivers[0], micT = transceivers[1];
+      await micT.sender.replaceTrack(rdjDestination.stream.getAudioTracks()[0]);
+      micT.direction = 'sendonly';
+      monitorT.direction = 'recvonly';
+
+      const answer = await rdjPc.createAnswer();
+      // Same SDP munging as /remote-dj/ -- force stereo fullband
+      // 128 kbps Opus over the browser's voice-mode defaults.
+      answer.sdp = answer.sdp.replace(
+        /(a=fmtp:\d+ [^\r\n]*)/g,
+        (match) => {
+          if (!match.includes('minptime') && !match.includes('useinbandfec')) return match;
+          let out = match;
+          const kv = (k, v) => {
+            if (out.includes(k + '=')) {
+              out = out.replace(new RegExp(k + '=[^;\\r\\n]*'), k + '=' + v);
+            } else {
+              out += ';' + k + '=' + v;
+            }
+          };
+          kv('stereo', '1');
+          kv('sprop-stereo', '1');
+          kv('maxaveragebitrate', '128000');
+          kv('maxplaybackrate', '48000');
+          kv('sprop-maxcapturerate', '48000');
+          return out;
+        }
+      );
+      await rdjPc.setLocalDescription(answer);
+      try {
+        const senderParams = micT.sender.getParameters();
+        senderParams.encodings = senderParams.encodings || [{}];
+        senderParams.encodings[0].maxBitrate = 128000;
+        await micT.sender.setParameters(senderParams);
+      } catch (e) {}
+      rdjWs.send(JSON.stringify({type: 'answer', sdp: rdjPc.localDescription.sdp}));
+    } else if (msg.type === 'ice' && rdjPc) {
+      try { await rdjPc.addIceCandidate({sdpMLineIndex: msg.sdpMLineIndex, candidate: msg.candidate}); } catch(e){}
+    }
+  };
+  rdjWs.onerror = () => rdjConnectFail('WS error');
+  rdjWs.onclose = (e) => { if (!rdjPc) rdjConnectFail('Closed (' + e.code + ')'); };
+}
+
+function rdjDisconnect() {
+  if (rdjPc) { rdjPc.close(); rdjPc = null; }
+  if (rdjWs) { rdjWs.close(); rdjWs = null; }
+  if (rdjAudioCtx) { rdjAudioCtx.close().catch(()=>{}); rdjAudioCtx = null; }
+  rdjGainNode = null;
+  const audio = document.getElementById('remoteMonitorAudio');
+  if (audio) audio.srcObject = null;
+  // renderRemoteDjConnect() will restore the button label from state.
+}
+
+function rdjConnectFail(msg) {
+  rdjDisconnect();
+  const btn = document.getElementById('remoteDjConnectBtn');
+  btn.classList.remove('pending');
+  btn.classList.add('error');
+  btn.textContent = msg;
+  setTimeout(() => btn.classList.remove('error'), 3000);
+}
+
+function renderRemoteDjConnect(data) {
+  const btn = document.getElementById('remoteDjConnectBtn');
+  if (!btn) return;
+  const weAreConnected = !!rdjPc;
+  const someoneElseConnected = data.remote_dj_connected && !weAreConnected;
+  btn.disabled = !data.remote_dj_configured || someoneElseConnected;
+  btn.classList.toggle('active', weAreConnected);
+  if (btn.classList.contains('error')) return;  // transient error msg wins for 3s
+  btn.classList.remove('pending');
+  btn.textContent = !data.remote_dj_configured ? 'Remote: n/a'
+    : weAreConnected ? 'Disconnect Remote'
+    : someoneElseConnected ? 'Remote in use'
+    : 'Connect Remote';
+}
+
+function renderRemoteDjGate(data) {
+  const btn = document.getElementById('remoteDjGateBtn');
+  if (!btn) return;
+  window.__rdjLastEngineState = data;
+  if (rdjCalibrating) return;  // countdown owns the label during calibration
+  btn.classList.remove('pending');
+  btn.classList.toggle('active', !!data.remote_dj_live);
+  if (!data.remote_dj_configured) {
+    btn.disabled = true;
+    btn.textContent = 'Remote Mic: n/a';
+    return;
+  }
+  if (data.remote_dj_connected) {
+    // PTT gate mode.
+    btn.disabled = false;
+    btn.textContent = data.remote_dj_live ? 'Remote Mic: LIVE' : 'Remote Mic: OFF';
+  } else {
+    // Calibration mode -- always clickable so the operator can (re)cal
+    // even before connecting. Show the currently-persisted gain if any.
+    btn.disabled = false;
+    const saved = rdjGetSavedGainDb();
+    btn.textContent = saved !== null
+      ? 'Mic Cal: ' + (saved >= 0 ? '+' : '') + saved.toFixed(1) + ' dB'
+      : 'Calibrate Mic';
+  }
+}
+
 async function toggleManualMode() {
   const btn = document.getElementById('manualModeBtn');
   const desiredActive = !btn.classList.contains('active');
@@ -679,7 +983,13 @@ function renderManualMode(data) {
   if (!btn) return;
   btn.classList.remove('pending');
   btn.classList.toggle('active', !!data.manual_mode);
-  btn.textContent = data.manual_mode ? 'Manual' : 'Auto';
+  // "Manual (mic)" when Manual is being held by a live mic (auto-flipped
+  // from Auto by the local PTT or remote gate, not explicitly picked by
+  // the operator) -- so it's clear the mode will restore to Auto on
+  // its own when the mic goes quiet.
+  btn.textContent = data.manual_mode
+    ? (data.manual_from_mic ? 'Manual (mic)' : 'Manual')
+    : 'Auto';
 }
 
 async function fetchStatus() {
@@ -1243,6 +1553,8 @@ async function poll() {
   SLOTS.forEach(slot => renderDeck(slot, decks[slot], data.transport, queue, data.timestamp));
   renderQueue(data);
   renderMicPtt(data);
+  renderRemoteDjConnect(data);
+  renderRemoteDjGate(data);
   renderManualMode(data);
 }
 
