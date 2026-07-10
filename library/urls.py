@@ -60,4 +60,5 @@ urlpatterns = [
     path('api/engine/mic-ptt/', views.api_engine_mic_ptt, name='api-engine-mic-ptt'),
     path('api/engine/manual-mode/', views.api_engine_manual_mode, name='api-engine-manual-mode'),
     path('api/remote-dj/token/', views.api_remote_dj_token, name='api-remote-dj-token'),
+    path('remote-dj/', views.remote_dj_page, name='remote-dj'),
 ]

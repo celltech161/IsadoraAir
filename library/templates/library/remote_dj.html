@@ -1,0 +1,179 @@
+{% extends "base.html" %}
+
+{% block title %}Remote DJ — IsadoraAir{% endblock %}
+
+{% block extra_css %}
+<style>
+  .remotedj-wrap {
+    max-width: 480px;
+    margin: 2rem auto;
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+  }
+  .remotedj-status {
+    font-size: 0.9rem;
+    color: var(--text-muted);
+    padding: 0.75rem 1rem;
+    border: 1px solid var(--border-subtle);
+    border-radius: 8px;
+  }
+  .remotedj-status.connected { color: var(--accent); border-color: var(--accent); }
+  .remotedj-status.error { color: var(--danger); border-color: var(--danger); }
+  .remotedj-btn {
+    background: var(--accent);
+    border: none;
+    border-radius: 8px;
+    color: #000;
+    padding: 0.7rem 1.2rem;
+    font-size: 0.95rem;
+    font-weight: 700;
+    cursor: pointer;
+    transition: opacity 0.12s;
+  }
+  .remotedj-btn:hover { opacity: 0.9; }
+  .remotedj-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .remotedj-btn.disconnect { background: var(--danger); }
+  .remotedj-unauthorized { color: var(--danger); }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="remotedj-wrap">
+  <h2>Remote DJ</h2>
+  {% if not authorized %}
+    <p class="remotedj-unauthorized">Your account isn't authorized for remote DJ access.</p>
+  {% else %}
+    <div id="rdjStatus" class="remotedj-status">Not connected.</div>
+    <button id="rdjConnectBtn" class="remotedj-btn" onclick="rdjConnect()">Connect</button>
+    <button id="rdjDisconnectBtn" class="remotedj-btn disconnect" onclick="rdjDisconnect()" disabled>Disconnect</button>
+    <audio id="rdjMonitorAudio" autoplay></audio>
+    <p style="font-size:0.8rem;color:var(--text-muted);">
+      Connecting will ask for microphone permission. Once connected you'll
+      hear the studio's live program audio (minus your own voice) so you
+      can time talk-overs. The studio operator controls when your mic
+      actually joins the on-air mix.
+    </p>
+  {% endif %}
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+let rdjPc = null;
+let rdjWs = null;
+
+function rdjSetStatus(text, cls) {
+  const el = document.getElementById('rdjStatus');
+  el.textContent = text;
+  el.className = 'remotedj-status' + (cls ? ' ' + cls : '');
+}
+
+async function rdjConnect() {
+  document.getElementById('rdjConnectBtn').disabled = true;
+  rdjSetStatus('Requesting token...');
+
+  let token;
+  try {
+    const r = await fetch('/api/remote-dj/token/', {
+      method: 'POST',
+      headers: {'X-CSRFToken': rdjGetCookie('csrftoken')},
+    });
+    if (!r.ok) {
+      rdjSetStatus('Token request failed: ' + r.status, 'error');
+      document.getElementById('rdjConnectBtn').disabled = false;
+      return;
+    }
+    ({token} = await r.json());
+  } catch (e) {
+    rdjSetStatus('Token request error: ' + e, 'error');
+    document.getElementById('rdjConnectBtn').disabled = false;
+    return;
+  }
+
+  rdjSetStatus('Opening signaling connection...');
+  rdjWs = new WebSocket('wss://' + location.host + '/ws/remote-dj/?token=' + token);
+
+  rdjWs.onmessage = async (event) => {
+    const msg = JSON.parse(event.data);
+    if (msg.type === 'offer') {
+      rdjSetStatus('Negotiating...');
+      rdjPc = new RTCPeerConnection({iceServers: []});
+
+      rdjPc.onicecandidate = (e) => {
+        if (e.candidate) {
+          rdjWs.send(JSON.stringify({
+            type: 'ice',
+            sdpMLineIndex: e.candidate.sdpMLineIndex,
+            candidate: e.candidate.candidate,
+          }));
+        }
+      };
+      rdjPc.oniceconnectionstatechange = () => {
+        if (rdjPc.iceConnectionState === 'connected') {
+          rdjSetStatus('Connected. Waiting for studio operator to gate you live.', 'connected');
+        } else if (rdjPc.iceConnectionState === 'failed' || rdjPc.iceConnectionState === 'disconnected') {
+          rdjSetStatus('Connection ' + rdjPc.iceConnectionState, 'error');
+        }
+      };
+      rdjPc.ontrack = (e) => {
+        document.getElementById('rdjMonitorAudio').srcObject = e.streams[0];
+      };
+
+      await rdjPc.setRemoteDescription({type: 'offer', sdp: msg.sdp});
+
+      let stream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({audio: true});
+      } catch (e) {
+        rdjSetStatus('Microphone permission denied: ' + e, 'error');
+        rdjDisconnect();
+        return;
+      }
+
+      const transceivers = rdjPc.getTransceivers();
+      const micTransceiver = transceivers[1];
+      const monitorTransceiver = transceivers[0];
+      await micTransceiver.sender.replaceTrack(stream.getAudioTracks()[0]);
+      micTransceiver.direction = 'sendonly';
+      monitorTransceiver.direction = 'recvonly';
+
+      const answer = await rdjPc.createAnswer();
+      await rdjPc.setLocalDescription(answer);
+      rdjWs.send(JSON.stringify({type: 'answer', sdp: rdjPc.localDescription.sdp}));
+
+      document.getElementById('rdjDisconnectBtn').disabled = false;
+    } else if (msg.type === 'ice') {
+      if (rdjPc) {
+        try {
+          await rdjPc.addIceCandidate({sdpMLineIndex: msg.sdpMLineIndex, candidate: msg.candidate});
+        } catch (e) { /* ignore late candidates after teardown */ }
+      }
+    }
+  };
+
+  rdjWs.onerror = () => {
+    rdjSetStatus('Signaling connection error', 'error');
+  };
+  rdjWs.onclose = (e) => {
+    if (!rdjPc) {
+      rdjSetStatus('Connection closed: ' + e.code + ' ' + e.reason, 'error');
+      document.getElementById('rdjConnectBtn').disabled = false;
+    }
+  };
+}
+
+function rdjDisconnect() {
+  if (rdjPc) { rdjPc.close(); rdjPc = null; }
+  if (rdjWs) { rdjWs.close(); rdjWs = null; }
+  document.getElementById('rdjConnectBtn').disabled = false;
+  document.getElementById('rdjDisconnectBtn').disabled = true;
+  rdjSetStatus('Disconnected.');
+}
+
+function rdjGetCookie(name) {
+  const match = document.cookie.match('(^|;)\\s*' + name + '\\s*=\\s*([^;]+)');
+  return match ? match.pop() : '';
+}
+</script>
+{% endblock %}

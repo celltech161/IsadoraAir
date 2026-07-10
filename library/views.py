@@ -1480,6 +1480,17 @@ def api_engine_status(request):
         return JsonResponse({"transport": "ERROR", "decks": {"A": None, "B": None}, "queue": []})
 
 
+@ensure_csrf_cookie
+def remote_dj_page(request):
+    """Stage 6 connect page: lets a remote_dj-group member join a live
+    WebRTC session from their own browser (mic permission, hear the
+    mix-minus monitor return, disconnect). Separate from the studio-side
+    dashboard's future gate toggle (Stage 7) -- this is the DJ's own
+    connect UI, gated the same way as the token mint below."""
+    authorized = request.user.groups.filter(name="remote_dj").exists()
+    return render(request, "library/remote_dj.html", {"authorized": authorized})
+
+
 @csrf_exempt
 @require_http_methods(["POST"])
 def api_remote_dj_token(request):
