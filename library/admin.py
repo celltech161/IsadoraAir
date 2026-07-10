@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from adminsortable2.admin import SortableAdminBase, SortableTabularInline
+from adminsortable2.admin import SortableAdminBase, SortableAdminMixin, SortableTabularInline
 from django import forms
 from django.contrib import admin, messages
 from django.db.models import Count
@@ -21,6 +21,7 @@ from .models import (
     Holiday,
     LogFillConfig,
     LogItem,
+    NavMenuItem,
     Playlist,
     PlaylistItem,
     PlaylistLog,
@@ -41,7 +42,7 @@ from .models import (
 # Every model keeps living in `library` underneath — only the admin UI
 # grouping changes.
 _TRAFFIC_MODELS = {"playlist", "rotation", "scheduleblock", "playlistlog"}
-_CONFIG_MODELS = {"analysisconfig", "recencyconfig", "uitheme", "logfillconfig", "uploadconfig"}
+_CONFIG_MODELS = {"analysisconfig", "recencyconfig", "uitheme", "logfillconfig", "uploadconfig", "navmenuitem"}
 
 
 class SectionedAdminSite(admin.AdminSite):
@@ -605,3 +606,38 @@ class UploadConfigAdmin(admin.ModelAdmin):
         return HttpResponseRedirect(
             reverse("admin:library_uploadconfig_change", args=[obj.pk])
         )
+
+
+class NavMenuChildInline(SortableTabularInline):
+    # Self-referential inline: children of the parent NavMenuItem being
+    # edited. fk_name is required since Django can't infer which FK to
+    # NavMenuItem to use for the inline relation on a self-referential
+    # model (there's only one here, but the ORM still needs it spelled
+    # out explicitly).
+    model = NavMenuItem
+    fk_name = "parent"
+    extra = 1
+    fields = ["label", "url_name", "custom_url", "extra_active_view_names", "enabled", "open_in_new_tab"]
+
+
+@admin.register(NavMenuItem)
+class NavMenuItemAdmin(SortableAdminMixin, admin.ModelAdmin):
+    # Top-level items only -- children are managed via the sortable inline
+    # below, on their own parent's change form (same shape as
+    # RotationSlotInline/PlaylistItemInline above), not mixed into this
+    # changelist's own drag-reorder sequence.
+    list_display = ["label", "resolved_url", "enabled", "open_in_new_tab", "child_count"]
+    list_filter = ["enabled"]
+    search_fields = ["label"]
+    fields = ["label", "url_name", "custom_url", "extra_active_view_names", "enabled", "open_in_new_tab"]
+    inlines = [NavMenuChildInline]
+
+    def get_queryset(self, request):
+        return super().get_queryset(request).filter(parent__isnull=True).annotate(_child_count=Count("children"))
+
+    def get_extra_model_filters(self, request):
+        return {"parent__isnull": True}
+
+    @admin.display(description="Children", ordering="_child_count")
+    def child_count(self, obj):
+        return obj._child_count

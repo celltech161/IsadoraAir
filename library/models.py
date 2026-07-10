@@ -779,3 +779,72 @@ class UITheme(models.Model):
     def load(cls):
         obj, _created = cls.objects.get_or_create(pk=1)
         return obj
+
+
+class NavMenuItem(models.Model):
+    """A row in the site nav bar (templates/base.html), admin-editable --
+    not a singleton itself (there are many rows), but grouped into the
+    admin's Config section same as the singletons above. Supports exactly
+    one level of nesting (parent -> children, i.e. a single dropdown
+    level) -- deeper nesting isn't worth the added template/CSS complexity
+    for a site nav this size.
+
+    Exactly one of url_name/custom_url should be set for a clickable item;
+    both blank is valid too (a parent with children but no link of its
+    own, rendered as a non-clickable dropdown label)."""
+    label = models.CharField(max_length=100)
+    parent = models.ForeignKey(
+        "self", null=True, blank=True, on_delete=models.CASCADE, related_name="children",
+        limit_choices_to={"parent__isnull": True},
+        help_text="Leave blank for a top-level item. Only one level of nesting is supported.",
+    )
+    url_name = models.CharField(
+        max_length=100, blank=True,
+        help_text="A Django URL name, e.g. 'library:schedule' or 'monitoring:dashboard' -- "
+                   "resolved fresh on every render, so it stays correct even if the "
+                   "underlying URL path changes. Leave blank if using Custom URL instead.",
+    )
+    custom_url = models.CharField(
+        max_length=500, blank=True,
+        help_text="A raw URL (internal path or external site) for links not backed by a "
+                   "Django URL name. Leave blank if using URL Name instead.",
+    )
+    extra_active_view_names = models.CharField(
+        max_length=500, blank=True,
+        help_text="Comma-separated Django view names (e.g. "
+                   "'library:library-import,library:track-detail') that should ALSO "
+                   "highlight this item as active, beyond its own URL Name -- for a nav "
+                   "item that's the entry point to a whole section with sub-pages of "
+                   "their own.",
+    )
+    sort_order = models.PositiveIntegerField(default=0)
+    enabled = models.BooleanField(default=True, help_text="Uncheck to hide without deleting.")
+    open_in_new_tab = models.BooleanField(default=False)
+
+    class Meta:
+        ordering = ["sort_order"]
+        verbose_name = "Nav Menu Item"
+        verbose_name_plural = "Nav Menu"
+
+    def __str__(self):
+        return self.label
+
+    def clean(self):
+        if self.url_name and self.custom_url:
+            raise ValidationError("Set either URL Name or Custom URL, not both.")
+        if self.parent_id and self.parent.parent_id:
+            raise ValidationError("Nav items support only one level of nesting -- "
+                                   "this item's chosen parent is itself a child.")
+        if self.url_name:
+            from django.urls import NoReverseMatch, reverse
+            try:
+                reverse(self.url_name)
+            except NoReverseMatch as exc:
+                raise ValidationError({"url_name": f"Doesn't resolve: {exc}"})
+
+    @property
+    def resolved_url(self):
+        if self.url_name:
+            from django.urls import reverse
+            return reverse(self.url_name)
+        return self.custom_url or None

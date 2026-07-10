@@ -90,6 +90,31 @@
       background: rgba(34, 197, 94, 0.1);
     }
 
+    nav.topbar .nav-group {
+      display: flex;
+      flex-direction: column;
+    }
+
+    nav.topbar .nav-parent-label {
+      display: block;
+      width: 100%;
+      text-align: left;
+      color: var(--text-muted);
+      font-size: 0.875rem;
+      font-weight: 500;
+      padding: 0.75rem 1.5rem;
+      cursor: default;
+    }
+
+    nav.topbar .nav-parent-label.active {
+      color: var(--accent);
+    }
+
+    nav.topbar .nav-child {
+      padding-left: 2.5rem;
+      font-size: 0.8125rem;
+    }
+
     nav.topbar .nav-logout-form {
       display: contents;
     }
@@ -163,14 +188,22 @@
   <nav class="topbar">
     <a href="/" class="brand"><img src="{% if ui_theme.logo %}{{ ui_theme.logo.url }}{% else %}{% static 'library/img/isadoraair_logo.png' %}{% endif %}" alt="IsadoraAir"></a>
     <div class="nav-links" id="navLinks">
-      <a href="{% url 'library:schedule' %}" {% block nav_schedule %}{% endblock %}>Schedule</a>
-      <a href="{% url 'library:logs' %}" {% block nav_logs %}{% endblock %}>Logs</a>
-      <a href="{% url 'library:library' %}" {% block nav_library %}{% endblock %}>Library</a>
-      <a href="{% url 'library:playlists' %}" {% block nav_playlists %}{% endblock %}>Playlists</a>
-      <a href="{% url 'library:rotations' %}" {% block nav_rotations %}{% endblock %}>Rotations</a>
-      <a href="{% url 'library:categories' %}" {% block nav_categories %}{% endblock %}>Categories</a>
-      <a href="{% url 'monitoring:dashboard' %}" {% block nav_monitoring %}{% endblock %}>Monitoring</a>
-      <a href="{% url 'rbds:dashboard' %}" {% block nav_rbds %}{% endblock %}>RBDS</a>
+      {% for item in nav_menu_items %}
+        {% if item.children_enabled %}
+          <div class="nav-group">
+            {% if item.resolved_url %}
+              <a href="{{ item.resolved_url }}"{% if item.open_in_new_tab %} target="_blank" rel="noopener"{% endif %} class="{% if item.is_active %}active{% endif %}">{{ item.label }}</a>
+            {% else %}
+              <span class="nav-parent-label{% if item.is_active %} active{% endif %}">{{ item.label }}</span>
+            {% endif %}
+            {% for child in item.children_enabled %}
+              <a href="{{ child.resolved_url }}"{% if child.open_in_new_tab %} target="_blank" rel="noopener"{% endif %} class="nav-child{% if child.is_active %} active{% endif %}">{{ child.label }}</a>
+            {% endfor %}
+          </div>
+        {% else %}
+          <a href="{{ item.resolved_url }}"{% if item.open_in_new_tab %} target="_blank" rel="noopener"{% endif %} class="{% if item.is_active %}active{% endif %}">{{ item.label }}</a>
+        {% endif %}
+      {% endfor %}
       {% if user.is_authenticated %}
       <form method="post" action="{% url 'logout' %}" class="nav-logout-form">
         {% csrf_token %}

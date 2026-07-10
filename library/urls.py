@@ -59,4 +59,5 @@ urlpatterns = [
     path('api/engine/deck/<str:slot>/', views.api_engine_deck_command, name='api-engine-deck-command'),
     path('api/engine/mic-ptt/', views.api_engine_mic_ptt, name='api-engine-mic-ptt'),
     path('api/engine/manual-mode/', views.api_engine_manual_mode, name='api-engine-manual-mode'),
+    path('api/remote-dj/token/', views.api_remote_dj_token, name='api-remote-dj-token'),
 ]

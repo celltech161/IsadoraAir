@@ -11,6 +11,7 @@ from django.views.decorators.http import require_http_methods
 
 from django.core.exceptions import ValidationError
 from django.core.paginator import Paginator
+from django.core.signing import TimestampSigner
 from django.db.models import Count, Q
 from django.db.models.deletion import ProtectedError
 from django.utils import timezone
@@ -1479,6 +1480,25 @@ def api_engine_status(request):
         return JsonResponse({"transport": "ERROR", "decks": {"A": None, "B": None}, "queue": []})
 
 
+@csrf_exempt
+@require_http_methods(["POST"])
+def api_remote_dj_token(request):
+    """Mints a short-lived signaling token for the Remote DJ over WebRTC
+    feature (see /home/jreed/.claude/plans/warm-zooming-rose.md). Gated on
+    the "remote_dj" Group, not just being logged in -- LoginRequiredMiddleware
+    already covers "logged in" for every view, but the studio-mic-adjacent
+    capability shouldn't be handed to every dashboard account by default.
+    The token only needs to survive the signaling websocket's handshake
+    (validated with the same max_age on the other end) -- the open socket
+    itself is the session after that, not the token."""
+    if not request.user.groups.filter(name="remote_dj").exists():
+        return JsonResponse({"error": "Not authorized for remote DJ access"}, status=403)
+
+    signer = TimestampSigner()
+    token = signer.sign(str(request.user.id))
+    return JsonResponse({"token": token})
+
+
 @require_http_methods(["GET"])
 def api_waveform(request, track_id):
     from django.conf import settings as django_settings
@@ -1542,9 +1562,8 @@ def api_library_upload(request):
     from django.conf import settings as django_settings
     from django.utils.text import get_valid_filename
 
-    from library.management.commands.analyze_tracks import analyze_one_track, get_waveforms_dir
     from library.management.commands.import_songs import SUPPORTED_EXT, parse_tags
-    from library.models import AnalysisConfig, UploadConfig
+    from library.models import UploadConfig
 
     category_id = request.POST.get("category_id")
     if not category_id:
@@ -1572,13 +1591,6 @@ def api_library_upload(request):
     library_root = Path(getattr(django_settings, "LIBRARY_ROOT", "/srv/isadoraair/music"))
     dest_dir = library_root / category.code
     dest_dir.mkdir(parents=True, exist_ok=True)
-
-    cfg = AnalysisConfig.load()
-    cfg_values = (
-        cfg.analysis_sample_rate, cfg.analysis_window_seconds, cfg.waveform_points,
-        cfg.next_start_threshold_db, cfg.cue_in_threshold_db, cfg.cue_in_min_seconds,
-    )
-    wave_dir = get_waveforms_dir()
 
     results = []
     for uploaded in uploaded_files:
@@ -1643,16 +1655,18 @@ def api_library_upload(request):
             category=category,
         )
 
-        # Analyze immediately (waveform + cue points) rather than leaving
-        # a freshly-uploaded track without them until someone remembers to
-        # run analyze_tracks separately -- calling the shared
-        # analyze_one_track() directly (not the bulk command) targets
-        # exactly this track, regardless of whether older unanalyzed
-        # tracks exist elsewhere in the library.
-        row = (track.id, track.filepath, track.filename, track.duration_seconds,
-               track.title, artist_obj.name, "")
-        analyzed = analyze_one_track(row, cfg_values, wave_dir, force=False)
-
+        # Analysis (waveform + cue points, now a mono AND a stereo ffmpeg
+        # decode pass per track) deliberately does NOT run inline here
+        # anymore -- a big batch's cumulative analysis time was blowing
+        # past gunicorn's default 30s worker timeout, killing the upload
+        # request outright (files already written/tracks already created
+        # survive since there's no wrapping transaction, but the response
+        # never comes back and remaining files in the batch never get
+        # processed). A freshly-created Track naturally has
+        # next_start_seconds=None, which is exactly what the
+        # isadoraair-analyze.timer's periodic `analyze_tracks` run (no
+        # --force) already selects on -- no new flag or field needed,
+        # just leaving analysis for that pass to pick up within a minute.
         results.append({
             "filename": uploaded.name,
             "ok": True,
@@ -1660,7 +1674,7 @@ def api_library_upload(request):
             "title": track.title,
             "artist": artist_obj.name,
             "saved_as": dest_path.name,
-            "analyzed": analyzed,
+            "analyzed": False,
         })
 
     return JsonResponse({"results": results})

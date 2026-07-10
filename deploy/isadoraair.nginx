@@ -19,6 +19,22 @@ server {
         expires 1h;
     }
 
+    # Remote DJ over WebRTC signaling (SDP/ICE JSON only -- the actual
+    # RTP/RTCP/DTLS-SRTP media never touches nginx, it's a separate direct
+    # UDP flow ICE establishes once signaling completes). Proxied to the
+    # signaling server's own port, separate from gunicorn's 8000.
+    location /ws/remote-dj/ {
+        proxy_pass http://127.0.0.1:8001;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        # signaling socket sits open+idle for a whole DJ segment; default
+        # 60s would kill it mid-session.
+        proxy_read_timeout 3600s;
+    }
+
     location / {
         proxy_pass http://127.0.0.1:8000;
         proxy_set_header Host $host;

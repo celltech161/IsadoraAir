@@ -1,7 +1,6 @@
 {% extends "base.html" %}
 
 {% block title %}Import Tracks — IsadoraAir{% endblock %}
-{% block nav_library %}class="active"{% endblock %}
 
 {% block extra_css %}
 <style>
@@ -183,7 +182,7 @@ function renderResults(results) {
           <span class="imp-result-icon">&#10003;</span>
           <div>
             <div class="imp-result-name">${r.artist} &mdash; ${r.title}</div>
-            <div class="imp-result-detail">saved as ${r.saved_as}${r.analyzed ? '' : ' (analysis pending -- run analyze_tracks)'}</div>
+            <div class="imp-result-detail">saved as ${r.saved_as}${r.analyzed ? '' : ' (waveform/cue analysis runs automatically in the background within a minute or two)'}</div>
           </div>
         </div>
       `;
