@@ -32,14 +32,21 @@ IsadoraAir manages the full music library, schedule programming, playlist genera
 - Interim AGC (compressor + makeup gain + limiter) for the studio monitor output specifically, configured from its `AudioOutput` admin page
 
 **Live Studio Mic + PTT + Graceful Ducking**
-- Dashboard "Mic" button (click-to-toggle) gates a live studio mic input into the on-air mix via a two-mixer pipeline: the decks' summed output feeds a duck gain stage before joining the mic in a shared master mixer, so a track transition mid-talkover never causes a duck discontinuity
+- Dashboard "Studio Mic" button (click-to-toggle) gates a live studio mic input into the on-air mix via a two-mixer pipeline: the decks' summed output feeds a duck gain stage before joining the mic in a shared master mixer, so a track transition mid-talkover never causes a duck discontinuity
 - Optional ducking (admin enable/disable + level in dB) smoothly ramps program audio down/up over ~500ms on PTT toggle — no clicks from an instantaneous level change
 - Mic hardware controls (gain, preamp, etc.) are dynamically enumerated from the configured device's real ALSA mixer controls in admin — no hardcoded interface-specific fields, so it adapts to whatever's actually plugged in
 
+**Remote DJ over WebRTC**
+- Browser-based remote DJ console at `/remote-dj/` — a remote DJ connects from any phone or laptop, hears program audio via a WebRTC monitor-return (mix-minus so they don't hear themselves), and can talk over via a gated remote mic that mixes into the on-air chain
+- Server-side WebRTC via GStreamer's `webrtcbin` (media stays direct UDP; nginx only terminates the signaling websocket); STUN-only ICE with a pinned UDP port range for router forwarding, STUN DNS pre-warmed at engine start to shorten cellular first-connect
+- Talk gate (open/close remote mic into the on-air mix) is operator-controlled from the main dashboard; the same ducking config applies uniformly to whichever mic is live (studio local, remote, or both)
+- Full queue authority for the connected DJ — search-to-add, Play Now, drag-to-reorder, per-row force-next — so they can run their own show start to finish; track-detail links are the only console feature intentionally kept out of remote_dj mode
+- Login-gated on a dedicated `remote_dj` Django group with time-signed short-lived signaling tokens; anyone not in the group gets a minimal 'not authorized' page instead of the console
+
 **Live Dashboard**
-- Dual-deck view (stacks on mobile) with waveform, live position, and transport controls for whichever deck is playing; the idle deck previews the next queued track
-- "Coming Up" queue table for the full remaining hour — drag-to-reorder, insert a track by search, color-coded by Category Kind
-- Manual "play a playlist now" override, a "Restart Engine" recovery button, and the mic PTT toggle
+- Dual-deck view (stacks on mobile) with click-to-seek waveform, live position, and transport controls for whichever deck is playing; the idle deck previews the next queued track
+- "Coming Up" queue table for the full remaining hour — drag-to-reorder (mouse and touch, same Pointer Events code path), insert a track by search, per-row "force next" button, color-coded by Category Kind
+- Manual "play a playlist now" override, a "Restart Engine" recovery button, Studio Mic PTT, and a Remote Mic gate button that lights up when a remote DJ is connected
 
 **Streaming Encoders** (`encoders/` app, `isadoraair-encoders` service)
 - Liquidsoap-backed relay to Icecast and Shoutcast (v1/v2) mounts, one process per shared ALSA capture device fanning out to every enabled stream (mp3/aac/vorbis) on that device
@@ -57,10 +64,19 @@ IsadoraAir manages the full music library, schedule programming, playlist genera
 - Transmitter integration (Aquabroadcast COBALT) for forward/reverse power, VSWR, PA temperature, fan speed, and RF interlock
 
 **Admin & Configuration**
-- Django admin, organized into Library / Traffic / Config sections so unrelated models don't all pile into one bucket
-- Analysis Configuration (cue-in/next-start dBFS thresholds), Recency Configuration, Log Fill Configuration
+- Django admin, organized into Library / Traffic / Config / Logs sections so unrelated models don't all pile into one bucket
+- Analysis Configuration (cue-in/next-start dBFS thresholds), Recency Configuration, Log Fill Configuration, Remote DJ Configuration (STUN server, ICE UDP port range, gain)
 - UI Theme: site-wide color palette and nav clock styling, editable with a native color+opacity picker, no page reload required
+- Admin-editable navigation menu (Config → Nav Menu): labels, target URLs (Django URL name or arbitrary URL), one level of dropdown children, drag-sort, per-item active-highlighting hints — no template edits needed to reshape the top nav
+- EmailLog (Logs section): every outgoing email sent through Django's mail API — password resets, admin invites, monitoring alerts, anything — leaves a read-only row in the admin. Bodies truncated at 10k chars with a visible marker; auto-pruned after 90 days by a systemd timer (`isadoraair-prune-emaillog.timer`)
+- Password-reset flow with "Forgot password?" on the login page + an admin-side invite button for creating no-password accounts and mailing them a setup link
 - django-axes login lockout on repeated failed sign-ins
+
+**Content Ingestion & Integrations**
+- Syndicated show ingestion: 20+ shows automatically fetched, tagged, artwork-attached where available, and delivered into their rotation categories on each source's real broadcast schedule (KIN news, BirdNote Daily, Academic Minute, Big Picture Science, Acoustic Cafe, Democracy Now, Anjunachill, Grateful Dead Hour, etc.). Each show is a `syndicated-<slug>.timer`/`.service` pair matching the source-box crontab that was the original authoritative schedule
+- Weather integration: NWS-sourced current temperature, one-day and three-day forecasts feeding RadioText messages via the RBDS client, plus alert beeps for active watches/warnings played straight to a dedicated ALSA loopback into StereoTool — bypasses the playback engine so alerts still fire during a manual override or engine restart
+- Bluesky auto-poster: now-playing metadata pushed to a Bluesky account every 2 minutes, with de-duplication so an unchanged track doesn't re-post
+- Remote content polling (`ogremote`): pulls fresh content from a remote source and stages it into the library, with a separate urgent-replay path for time-sensitive drops
 
 ## Architecture
 
@@ -68,40 +84,48 @@ IsadoraAir manages the full music library, schedule programming, playlist genera
 IsadoraAir (Django 5.2 LTS)
 ├── library/                     # Main app
 │   ├── models.py                # Track, Artist, Album, Category, CategoryKind, Rotation,
-│   │                            # Playlist, ScheduleBlock, PlaylistLog, UITheme, etc.
+│   │                            # Playlist, ScheduleBlock, PlaylistLog, UITheme,
+│   │                            # NavMenuItem, RemoteDJConfig, EmailLog, etc.
 │   ├── views.py                 # Page views + JSON API endpoints
-│   ├── admin.py                 # Admin registration + Library/Traffic/Config sectioning
-│   ├── context_processors.py    # Injects UITheme into every template
+│   ├── admin.py                 # Admin registration + Library/Traffic/Config/Logs sectioning
+│   ├── auth_forms.py            # Invite-capable password-reset form (subclasses Django's stock)
+│   ├── email_backend.py         # LoggingSMTPBackend — every send leaves a row in EmailLog
+│   ├── context_processors.py    # Injects UITheme + nav_menu into every template
 │   ├── services/
 │   │   ├── log_builder.py       # Playlist generation algorithm
-│   │   └── engine.py            # GStreamer playback engine (standalone process)
+│   │   ├── engine.py            # GStreamer playback engine (standalone process)
+│   │   └── remote_dj_signaling.py  # WebRTC signaling websocket server (in-engine)
 │   ├── management/commands/
 │   │   ├── import_songs.py      # Library scanner (mutagen)
 │   │   ├── analyze_tracks.py    # Audio analysis (ffmpeg + DSP)
 │   │   ├── run_engine.py        # Entry point for the playback engine service
-│   │   └── fix_unknown_artists.py
-│   └── templates/library/       # dashboard, schedule, playlists, library, logs, track detail
+│   │   ├── prune_emaillog.py    # EmailLog retention prune (systemd timer)
+│   │   └── ...                  # duplicate finders, orphan cleanup, category checks
+│   └── templates/library/       # dashboard (shared with /remote-dj/), schedule,
+│                                # playlists, library, logs, track detail, login
 ├── hardware/                     # Audio device config: AudioOutput/AudioInput (incl. AGC,
 │                                  # mic gain, dynamically-enumerated ALSA mixer controls),
-│                                  # AudioPipeline (sample rate), DuckingConfig
+│                                  # AudioPipeline (sample rate), DuckingConfig,
+│                                  # RemoteDJAudioInput
 ├── encoders/                     # Icecast/Shoutcast streaming (Liquidsoap), own service
 ├── monitoring/                   # System/service/transmitter/audio health checks, own service
 ├── rbds/                         # RBDS/RDS client for StereoTool (UECP + ASCII), own service
+├── weather/                      # NWS ingestion + alert-beep config (feeds RBDS, own timers)
 ├── templates/
 │   └── base.html                 # Dark-themed base template, mobile nav, live clock
-├── deploy/
-│   ├── isadoraair.nginx
-│   ├── isadoraair-gunicorn.service
-│   ├── isadoraair-engine.service      # Playback engine systemd unit
-│   ├── isadoraair-encoders.service    # Streaming encoders systemd unit
-│   ├── isadoraair-monitoring.service  # Monitoring poller systemd unit
-│   ├── isadoraair-rbds.service        # RBDS/RDS client systemd unit
-│   ├── isadoraair-backup.service      # Nightly backup, oneshot
-│   ├── isadoraair-backup.timer        # Triggers the above at 03:30 daily
-│   ├── syndicated-kin.service         # KIN news ingestion, oneshot
-│   ├── syndicated-kin.timer           # Hourly :57, 05:00-17:00
-│   ├── syndicated-bsky-post.service   # Now-playing -> Bluesky, oneshot
-│   └── syndicated-bsky-post.timer     # Every 2 minutes
+├── deploy/                       # systemd units (one .service + .timer per timer-driven job)
+│   ├── isadoraair.nginx                 # nginx site config
+│   ├── isadoraair-gunicorn.service      # Web/API
+│   ├── isadoraair-engine.service        # Playback engine + remote-DJ signaling
+│   ├── isadoraair-encoders.service      # Streaming encoders (Liquidsoap)
+│   ├── isadoraair-monitoring.service    # Monitoring poller
+│   ├── isadoraair-rbds.service          # RBDS/RDS client
+│   ├── isadoraair-analyze.*             # Periodic re-analysis of newly added tracks
+│   ├── isadoraair-backup.*              # Nightly full backup (03:30)
+│   ├── isadoraair-prune-emaillog.*      # Daily EmailLog retention prune (04:15, 90d default)
+│   ├── syndicated-*.*                   # 20+ syndicated-show ingestions on their real air times
+│   ├── syndicated-bsky-post.*           # Now-playing -> Bluesky, every 2 minutes
+│   └── wx-*.*                           # Weather data + alert beep (~30s cadence check)
 └── legacy/                       # Original FastAPI prototype (reference only)
 ```
 
@@ -169,16 +193,17 @@ python manage.py run_monitoring
 ```
 
 See `deploy/` for nginx and systemd service configs for production — each
-process above (`isadoraair-gunicorn`, `isadoraair-engine`,
+long-running process above (`isadoraair-gunicorn`, `isadoraair-engine`,
 `isadoraair-encoders`, `isadoraair-rbds`, `isadoraair-monitoring`) runs as
-its own systemd unit. `isadoraair-backup.timer` runs a nightly database
-dump + app tree + live-config backup, pushed off-box via SFTP — the
-script itself (`backup_isadoraair.sh`) lives outside the repo at
+its own systemd unit; timer-driven jobs (backup, EmailLog prune,
+syndicated ingestions, weather, Bluesky poster) each ship as a
+`.service`/`.timer` pair. `isadoraair-backup.timer` runs a nightly
+database dump + app tree + live-config backup, pushed off-box via SFTP —
+the script itself (`backup_isadoraair.sh`) lives outside the repo at
 `~/bin/`, alongside its `~/.iasboxbu.cred` remote-target credentials.
-`syndicated-kin.timer`/`syndicated-bsky-post.timer` run syndicated-show
-ingestion and Bluesky now-playing posts — those scripts live outside the
-repo at `~/syndicated-ingest/` (own venv, separate from this project's),
-with credentials in `~/.syndicated_ingest.cred`.
+Syndicated ingestion and the Bluesky poster scripts also live outside
+the repo at `~/syndicated-ingest/` (own venv, separate from this
+project's), with credentials in `~/.syndicated_ingest.cred`.
 
 ## Project Status
 
@@ -188,11 +213,14 @@ with credentials in `~/.syndicated_ingest.cred`.
 | 2. Library import & analysis | Complete |
 | 3. Log builder | Complete |
 | 4. Playback engine | Complete — dual-deck GStreamer mixer, real crossfading, broadcast-clock hour handling, studio-monitor AGC |
-| 5. Live dashboard | Complete — dual-deck view, full-hour queue, manual overrides |
+| 5. Live dashboard | Complete — dual-deck view, full-hour queue with drag-reorder + force-next, click-to-seek waveform, manual overrides |
 | 6. Streaming, RDS & monitoring | Complete — Icecast/Shoutcast relay, StereoTool RBDS client, system/transmitter health checks with alerting |
 | 7. Studio mic + ducking | Complete — dashboard PTT, dynamically-enumerated hardware mixer controls, graceful ducking of program audio |
+| 8. Content ingestion | Complete — 20+ syndicated shows on real schedules, weather data + alerts, Bluesky auto-poster |
+| 9. Remote DJ over WebRTC | Complete — browser-based remote console, mix-minus monitor return, gated remote mic, full queue authority for the connected DJ |
+| 10. Email + admin infrastructure | Complete — EmailLog transport-layer capture, invite/reset flows, admin-editable nav menu, django-axes lockout |
 
-Actively running end-to-end on a test box: schedule → log builder → playback engine → studio monitor output, plus live streaming, RDS, and monitoring.
+Actively running end-to-end on a live station: schedule → log builder → playback engine → StereoTool → transmitter, plus live streaming, RDS, monitoring, remote DJ, and content ingestion.
 
 ## License
 
