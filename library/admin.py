@@ -3,7 +3,7 @@ from pathlib import Path
 from adminsortable2.admin import SortableAdminBase, SortableAdminMixin, SortableTabularInline
 from django import forms
 from django.contrib import admin, messages
-from django.contrib.auth.forms import PasswordResetForm
+from library.auth_forms import InviteCapablePasswordResetForm
 from django.contrib.auth.forms import UserChangeForm as DjangoUserChangeForm
 from django.contrib.auth.models import User
 from django.db.models import Count
@@ -777,7 +777,7 @@ class InviteCapableUserAdmin(admin.ModelAdmin):
                 level=messages.ERROR,
             )
         else:
-            form = PasswordResetForm({"email": user.email})
+            form = InviteCapablePasswordResetForm({"email": user.email})
             if form.is_valid():
                 form.save(
                     request=request,
