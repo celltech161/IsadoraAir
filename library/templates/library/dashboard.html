@@ -585,14 +585,14 @@
     <table class="queue-table">
       <thead>
         <tr>
-          {% if mode != 'remote_dj' %}<th></th>{% endif %}
+          <th></th>
           <th class="qt-th-pos">#</th>
           <th>Artist</th>
           <th>Title</th>
           <th>Cat</th>
           <th class="qt-th-dur">Dur</th>
           <th class="qt-th-time">Time On</th>
-          {% if mode != 'remote_dj' %}<th></th>{% endif %}
+          <th></th>
         </tr>
       </thead>
       <tbody id="queueList">
@@ -1467,29 +1467,34 @@ function renderQueue(data) {
 
   queueItemIds = queue.map(q => q.item_id);
 
-  list.innerHTML = queue.map((q, i) => IS_REMOTE_DJ ? `
-    <tr data-item-id="${q.item_id}" style="background-color: ${q.fill_color || 'transparent'};">
-      <td class="qt-pos">${i + 1}</td>
-      <td>${esc(q.artist)}</td>
-      <td>${esc(q.title)}</td>
-      <td class="qt-cat">${esc(q.category)}</td>
-      <td class="qt-dur">${fmtDur(q.duration)}</td>
-      <td class="qt-time">${fmtEtaClock(data.timestamp, q.eta_seconds)}</td>
-    </tr>
-  ` : `
+  list.innerHTML = queue.map((q, i) => {
+    // Drag-handle and next-button columns are present in both modes so
+    // the remote DJ can also reorder the queue and force-next a track.
+    // The one remaining split: artist/title are hyperlinks to the track
+    // detail page only in full-console mode -- a remote DJ isn't given
+    // navigation into the rest of the app, per remote_dj_page's mode
+    // docstring.
+    const artistCell = IS_REMOTE_DJ
+      ? esc(q.artist)
+      : `<a class="qt-track-link" href="/track/${q.track_id}/">${esc(q.artist)}</a>`;
+    const titleCell = IS_REMOTE_DJ
+      ? esc(q.title)
+      : `<a class="qt-track-link" href="/track/${q.track_id}/">${esc(q.title)}</a>`;
+    return `
     <tr data-item-id="${q.item_id}" style="background-color: ${q.fill_color || 'transparent'};">
       <td class="qt-pos qt-drag-handle">&#9776;</td>
       <td class="qt-pos">${i + 1}</td>
-      <td><a class="qt-track-link" href="/track/${q.track_id}/">${esc(q.artist)}</a></td>
-      <td><a class="qt-track-link" href="/track/${q.track_id}/">${esc(q.title)}</a></td>
+      <td>${artistCell}</td>
+      <td>${titleCell}</td>
       <td class="qt-cat">${esc(q.category)}</td>
       <td class="qt-dur">${fmtDur(q.duration)}</td>
       <td class="qt-time">${fmtEtaClock(data.timestamp, q.eta_seconds)}</td>
       <td><button class="qt-next-btn" onclick="event.stopPropagation(); setNext(${q.item_id})">next</button></td>
     </tr>
-  `).join('');
+  `;
+  }).join('');
 
-  if (!IS_REMOTE_DJ) initQueueDrag();
+  initQueueDrag();
 }
 
 function initQueueDrag() {

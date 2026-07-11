@@ -1507,13 +1507,14 @@ def api_engine_status(request):
 def remote_dj_page(request):
     """Remote-DJ-facing console: renders dashboard.html in `remote_dj`
     mode, which hides the operator-only controls (Studio Mic PTT,
-    queue reorder, per-track edit links, deck eject/pause, waveform
-    click-seek) and slims Deck B on mobile portrait, but keeps
-    search-to-add and Play Now available (same as the full console) --
-    a remote DJ is trusted to queue up a track or start a playlist
-    during their own show. Gated on the same `remote_dj` group the
-    WebRTC token endpoint already checks; anyone not in the group gets
-    a 'not authorized' minimal page instead of the console."""
+    per-track edit links, deck eject/pause, waveform click-seek) and
+    slims Deck B on mobile portrait, but keeps search-to-add, Play
+    Now, drag-to-reorder queue, and force-next buttons available
+    (same as the full console) -- a remote DJ is trusted to queue,
+    reorder, and jump ahead in their own show. Gated on the same
+    `remote_dj` group the WebRTC token endpoint already checks;
+    anyone not in the group gets a 'not authorized' minimal page
+    instead of the console."""
     from library.models import AnalysisConfig, Playlist
     authorized = request.user.groups.filter(name="remote_dj").exists()
     if not authorized:
