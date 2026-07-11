@@ -21,6 +21,7 @@ from .models import (
     Category,
     CategoryKind,
     DuplicateCandidate,
+    EmailLog,
     Holiday,
     LogFillConfig,
     LogItem,
@@ -47,6 +48,7 @@ from .models import (
 # grouping changes.
 _TRAFFIC_MODELS = {"playlist", "rotation", "scheduleblock", "playlistlog"}
 _CONFIG_MODELS = {"analysisconfig", "recencyconfig", "uitheme", "logfillconfig", "uploadconfig", "navmenuitem", "remotedjconfig"}
+_LOG_MODELS = {"emaillog"}
 
 
 class SectionedAdminSite(admin.AdminSite):
@@ -56,6 +58,7 @@ class SectionedAdminSite(admin.AdminSite):
         if library_app:
             traffic_app = {**library_app, "name": "Traffic", "models": []}
             config_app = {**library_app, "name": "Config", "models": []}
+            logs_app = {**library_app, "name": "Logs", "models": []}
             plain_models = []
             for model in library_app["models"]:
                 key = model["object_name"].lower()
@@ -63,6 +66,8 @@ class SectionedAdminSite(admin.AdminSite):
                     traffic_app["models"].append(model)
                 elif key in _CONFIG_MODELS:
                     config_app["models"].append(model)
+                elif key in _LOG_MODELS:
+                    logs_app["models"].append(model)
                 else:
                     plain_models.append(model)
             library_app["models"] = plain_models
@@ -72,6 +77,8 @@ class SectionedAdminSite(admin.AdminSite):
                 app_dict["library_traffic"] = traffic_app
             if config_app["models"]:
                 app_dict["library_config"] = config_app
+            if logs_app["models"]:
+                app_dict["library_logs"] = logs_app
 
         app_list = sorted(app_dict.values(), key=lambda x: x["name"].lower())
         for app in app_list:
@@ -814,3 +821,23 @@ class InviteCapableUserAdmin(admin.ModelAdmin):
     @admin.display(description="Password", boolean=True)
     def password_status(self, obj):
         return obj.has_usable_password()
+
+
+@admin.register(EmailLog)
+class EmailLogAdmin(admin.ModelAdmin):
+    # Read-only audit trail -- rows are written only by
+    # library.email_backend.LoggingSMTPBackend, never by hand.
+    list_display = ["sent_at", "to", "subject", "success"]
+    list_filter = ["success"]
+    search_fields = ["to", "subject", "body"]
+    readonly_fields = ["to", "from_email", "subject", "body", "success", "error", "sent_at"]
+    fields = readonly_fields
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False

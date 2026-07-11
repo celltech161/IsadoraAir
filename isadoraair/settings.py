@@ -230,6 +230,7 @@ SESSION_COOKIE_SECURE = True
 CSRF_COOKIE_SECURE = True
 
 # --- Email (Monitoring alerts) ---
+EMAIL_BACKEND = 'library.email_backend.LoggingSMTPBackend'
 EMAIL_HOST = config('EMAIL_HOST', default='localhost')
 EMAIL_PORT = config('EMAIL_PORT', default=587, cast=int)
 EMAIL_HOST_USER = config('EMAIL_HOST_USER', default='')

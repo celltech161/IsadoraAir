@@ -1,0 +1,14 @@
+[Unit]
+Description=IsadoraAir prune EmailLog rows past retention window
+After=postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=oneshot
+User=jreed
+Group=jreed
+WorkingDirectory=/home/jreed/isadoraair-django
+ExecStart=/home/jreed/isadoraair-django/venv/bin/python manage.py prune_emaillog --apply
+
+[Install]
+WantedBy=multi-user.target

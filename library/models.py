@@ -892,3 +892,33 @@ class RemoteDJConfig(models.Model):
     def load(cls):
         obj, _created = cls.objects.get_or_create(pk=1)
         return obj
+
+
+class EmailLog(models.Model):
+    """One row per outgoing email, written by
+    library.email_backend.LoggingSMTPBackend regardless of call site
+    (password resets, monitoring alerts, anything using Django's normal
+    mail API) -- there was previously no way to see what an email
+    actually contained after it was sent, which directly caused a real
+    incident: an admin-triggered password-reset invite went out with a
+    broken link (built from the wrong Host header) and nobody could
+    tell without re-deriving it by hand. Now every send is visible,
+    read-only, in the admin."""
+    to = models.CharField(max_length=500, help_text="Comma-separated if more than one recipient.")
+    from_email = models.CharField(max_length=255, blank=True)
+    subject = models.CharField(max_length=500, blank=True)
+    body = models.TextField(blank=True)
+    success = models.BooleanField(default=True)
+    error = models.TextField(blank=True)
+    # Indexed because both the default ordering below AND the retention
+    # prune query filter on it -- as this table grows, the index keeps
+    # both cheap without needing to revisit anything.
+    sent_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        ordering = ["-sent_at"]
+        verbose_name = "Email Log"
+        verbose_name_plural = "Email Log"
+
+    def __str__(self):
+        return f"{self.sent_at:%Y-%m-%d %H:%M} -> {self.to}: {self.subject}"
