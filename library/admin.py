@@ -4,6 +4,7 @@ from adminsortable2.admin import SortableAdminBase, SortableAdminMixin, Sortable
 from django import forms
 from django.contrib import admin, messages
 from django.contrib.auth.forms import PasswordResetForm
+from django.contrib.auth.forms import UserChangeForm as DjangoUserChangeForm
 from django.contrib.auth.models import User
 from django.db.models import Count
 from django.http import HttpResponseRedirect
@@ -690,6 +691,24 @@ class NavMenuItemAdmin(SortableAdminMixin, admin.ModelAdmin):
 admin.site.unregister(User)
 
 
+class UserAddNoPasswordForm(forms.ModelForm):
+    """Add-form for User with the password fields removed entirely --
+    the account is created with set_unusable_password() so the ONLY way
+    in is the invite email (or a future admin-triggered reset), never a
+    password someone typed into this form and then had to relay to the
+    DJ out of band."""
+    class Meta:
+        model = User
+        fields = ("username", "first_name", "last_name", "email")
+
+    def save(self, commit=True):
+        user = super().save(commit=False)
+        user.set_unusable_password()
+        if commit:
+            user.save()
+        return user
+
+
 @admin.register(User)
 class InviteCapableUserAdmin(admin.ModelAdmin):
     # Mirrors django.contrib.auth.admin.UserAdmin's shape closely enough
@@ -701,16 +720,41 @@ class InviteCapableUserAdmin(admin.ModelAdmin):
     search_fields = ["username", "first_name", "last_name", "email"]
     ordering = ["username"]
     filter_horizontal = ["groups", "user_permissions"]
+    form = DjangoUserChangeForm  # the real one -- read-only hash display + "change password" link
     fieldsets = (
         (None, {"fields": ("username", "password")}),
         ("Personal info", {"fields": ("first_name", "last_name", "email", "invite_button")}),
         ("Permissions", {"fields": ("is_active", "is_staff", "is_superuser", "groups", "user_permissions")}),
         ("Important dates", {"fields": ("last_login", "date_joined")}),
     )
+    # No password1/password2 -- add_form creates the account with
+    # set_unusable_password() instead. Plain ModelAdmin doesn't know to
+    # actually USE add_form/add_fieldsets on its own the way Django's
+    # real UserAdmin does -- get_form()/get_fieldsets() below wire that
+    # up explicitly (mirroring contrib.auth.admin.UserAdmin's own
+    # pattern). Without this override, get_fieldsets() always returns
+    # `fieldsets` regardless of add-vs-change, which made the ADD page
+    # try to render "password" and "invite_button" through fields that
+    # add_form never declared -- ModelAdmin's fieldset-driven form
+    # builder then silently synthesized a PLAIN TEXT password field
+    # from the raw model column instead of erroring, which is exactly
+    # the footgun this whole feature exists to avoid. Caught via a real
+    # Playwright add-user run before this could ship.
+    add_form = UserAddNoPasswordForm
     add_fieldsets = (
-        (None, {"classes": ("wide",), "fields": ("username", "password1", "password2")}),
+        (None, {"fields": ("username", "first_name", "last_name", "email")}),
     )
     readonly_fields = ["invite_button"]
+
+    def get_form(self, request, obj=None, **kwargs):
+        if obj is None:
+            kwargs["form"] = self.add_form
+        return super().get_form(request, obj, **kwargs)
+
+    def get_fieldsets(self, request, obj=None):
+        if obj is None:
+            return self.add_fieldsets
+        return super().get_fieldsets(request, obj)
 
     def get_urls(self):
         return [
@@ -755,7 +799,7 @@ class InviteCapableUserAdmin(admin.ModelAdmin):
 
     @admin.display(description="Password setup")
     def invite_button(self, obj):
-        if obj.pk is None:
+        if obj is None or obj.pk is None:
             return "(save the user first)"
         url = reverse("admin:auth_user_send_invite", args=[obj.pk])
         label = "Resend password setup email" if obj.has_usable_password() else "Send password setup email"
