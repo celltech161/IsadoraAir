@@ -874,7 +874,13 @@ async function toggleRemoteDjConnect() {
   rdjWs.onmessage = async (event) => {
     const msg = JSON.parse(event.data);
     if (msg.type === 'offer') {
-      rdjPc = new RTCPeerConnection({iceServers: []});
+      // Client-side STUN so the browser gathers its own srflx candidate
+      // up-front rather than waiting for the server to discover ours via
+      // peer-reflexive during the connectivity check. Materially shortens
+      // ICE completion on cellular first-connect (the vulnerable window
+      // for the earlier static-on-playing-deck race -- see
+      // engine.py::_remote_dj_build_session's history).
+      rdjPc = new RTCPeerConnection({iceServers: [{urls: 'stun:stun.l.google.com:19302'}]});
       rdjPc.onicecandidate = (e) => {
         if (e.candidate) {
           rdjWs.send(JSON.stringify({type: 'ice', sdpMLineIndex: e.candidate.sdpMLineIndex, candidate: e.candidate.candidate}));

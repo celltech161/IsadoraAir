@@ -1,6 +1,7 @@
 import json
 import os
 import signal
+import socket
 import sys
 import threading
 import time
@@ -191,6 +192,7 @@ class PlaybackEngine:
         GLib.timeout_add_seconds(AUTO_BUILD_CHECK_SECONDS, self._ensure_upcoming_logs)
 
         if RemoteDJConfig.load().enabled:
+            self._warm_stun_dns()
             self._remote_dj_server = RemoteDJSignalingServer(self)
             self._remote_dj_server.start()
 
@@ -1499,6 +1501,29 @@ class PlaybackEngine:
     # ------------------------------------------------------------------
     # Remote DJ over WebRTC (see /home/jreed/.claude/plans/warm-zooming-rose.md)
     # ------------------------------------------------------------------
+    def _warm_stun_dns(self):
+        """One-shot DNS resolve of the configured STUN host at engine
+        start. Live remote-DJ connects from cellular were exposing a
+        cold-DNS-cache first-connect stall: a fresh resolve of e.g.
+        stun.l.google.com could add hundreds of ms during pipeline
+        bring-up, and that stretched the ICE window enough to surface
+        the static-on-playing-deck race documented in
+        _remote_dj_build_session. Blocking on purpose (a broken STUN
+        DNS at boot is a real diagnostic signal); failure here is not
+        fatal, a real session start would just do its own resolve
+        anyway."""
+        url = (RemoteDJConfig.load().stun_server or "").strip()
+        if "://" in url:
+            url = url.split("://", 1)[1]
+        host = url.split(":", 1)[0].split("/", 1)[0]
+        if not host:
+            return
+        try:
+            addr = socket.gethostbyname(host)
+            print(f"  Remote DJ: warmed STUN DNS for {host} -> {addr}")
+        except Exception as exc:
+            print(f"  Remote DJ: STUN DNS warm-up failed for {host}: {exc}")
+
     def _remote_dj_pipeline_caps(self):
         """concat requires its sink pads to share genuinely IDENTICAL
         caps, not just a matching rate -- validated the hard way in the
