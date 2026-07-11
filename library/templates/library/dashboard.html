@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 
-{% block title %}Dashboard — IsadoraAir{% endblock %}
+{% block title %}{% if mode == 'remote_dj' %}Remote DJ{% else %}Dashboard{% endif %} — IsadoraAir{% endblock %}
 
 {% block extra_css %}
 <style>
@@ -105,6 +105,26 @@
 
   @media (max-width: 700px) {
     .decks-row { grid-template-columns: 1fr; }
+  }
+
+  /* Remote DJ console, mobile portrait: strip Deck B (Up Next preview)
+     down to just the text metadata -- no waveform, no album art, no
+     progress/countdown numbers. The DJ needs to see WHAT is coming up
+     and roughly WHEN, not a full preview card taking up their phone
+     screen. Deck A stays a full card so they can see now-playing detail
+     including the waveform for timing their break. */
+  @media (max-width: 640px) {
+    /* Art thumb is toggled via inline style="display: block" in JS
+       once the art image loads, so we need !important to override the
+       inline. Same defensive posture for the rest so a future JS
+       inline-style tweak doesn't silently un-hide these on mobile. */
+    .console-remote_dj #deck-B .np-waveform,
+    .console-remote_dj #deck-B .deck-art-bg,
+    .console-remote_dj #deck-B .deck-art-thumb,
+    .console-remote_dj #deck-B .np-timing {
+      display: none !important;
+    }
+    .console-remote_dj #deck-B { padding: 0.8rem 1rem; }
   }
 
   .deck-panel {
@@ -513,10 +533,13 @@
 {% endblock %}
 
 {% block content %}
+<div class="console-{{ mode|default:'full' }}">
 <div class="playnow-bar">
   <button class="playnow-btn ops-btn" id="manualModeBtn" onclick="toggleManualMode()"
           title="Manual holds the next track until you flip back to Auto -- for talking over a song's outro. Auto-switches while any mic is live.">Auto</button>
+  {% if mode != 'remote_dj' %}
   <button class="playnow-btn ops-btn" id="micPttBtn" onclick="toggleMicPtt()" disabled>Studio Mic: OFF</button>
+  {% endif %}
   <button class="playnow-btn ops-btn" id="remoteDjConnectBtn" onclick="toggleRemoteDjConnect()" disabled
           title="Connects THIS browser's mic into the on-air mix as the remote DJ. The Remote Mic button gates it on/off once connected.">Connect Remote</button>
   <button class="playnow-btn ops-btn" id="remoteDjGateBtn" onclick="toggleRemoteDjGate()" disabled
@@ -530,6 +553,7 @@
 </div>
 
 <div class="queue-panel" id="queuePanel">
+  {% if mode != 'remote_dj' %}
   <div class="queue-insert">
     <div class="queue-insert-search-wrap">
       <input type="text" class="queue-insert-input" id="queueInsertSearch"
@@ -547,19 +571,20 @@
       <span class="playnow-msg" id="playNowMsg"></span>
     </div>
   </div>
+  {% endif %}
   <h3>Coming Up</h3>
   <div class="queue-table-wrap">
     <table class="queue-table">
       <thead>
         <tr>
-          <th></th>
+          {% if mode != 'remote_dj' %}<th></th>{% endif %}
           <th class="qt-th-pos">#</th>
           <th>Artist</th>
           <th>Title</th>
           <th>Cat</th>
           <th class="qt-th-dur">Dur</th>
           <th class="qt-th-time">Time On</th>
-          <th></th>
+          {% if mode != 'remote_dj' %}<th></th>{% endif %}
         </tr>
       </thead>
       <tbody id="queueList">
@@ -568,10 +593,18 @@
     </table>
   </div>
 </div>
+</div>
 {% endblock %}
 
 {% block extra_js %}
 <script>
+// Console mode: 'full' for the studio console at /, 'remote_dj' for the
+// stripped-down /remote-dj/ variant. Behaviors that are operator-only
+// (waveform click-seek, deck eject/pause, queue drag-reorder, "next"
+// button, track detail links, search-to-add, Play Now, Studio Mic PTT)
+// gate on this value.
+const CONSOLE_MODE = '{{ mode|default:"full" }}';
+const IS_REMOTE_DJ = CONSOLE_MODE === 'remote_dj';
 const SLOTS = ['A', 'B'];
 
 const WAVEFORM_LEFT_COLOR = "{{ analysis_config.waveform_left_color|default:'#22c55e' }}";
@@ -1144,8 +1177,10 @@ function buildDeckDOM(slot) {
       <span class="deck-label">Deck ${slot}</span>
       <div class="deck-controls">
         <span class="transport-badge" id="transportBadge-${slot}"></span>
+        ${IS_REMOTE_DJ ? '' : `
         <button class="deck-transport-btn" id="ejectBtn-${slot}" title="Start Next" disabled>&#9197;</button>
         <button class="deck-transport-btn" id="playPauseBtn-${slot}" title="Play/Pause" disabled>&#9654;</button>
+        `}
       </div>
     </div>
     <div class="np-meta">
@@ -1176,20 +1211,22 @@ function buildDeckDOM(slot) {
 
   deckState[slot].deckBuilt = true;
 
-  document.getElementById(`npWaveform-${slot}`).addEventListener('click', function(e) {
-    if (!deckState[slot].localDuration) return;
-    const rect = this.getBoundingClientRect();
-    const pct = (e.clientX - rect.left) / rect.width;
-    const pos = pct * deckState[slot].localDuration;
-    seekTo(slot, Math.max(0, Math.min(deckState[slot].localDuration, pos)));
-  });
+  if (!IS_REMOTE_DJ) {
+    document.getElementById(`npWaveform-${slot}`).addEventListener('click', function(e) {
+      if (!deckState[slot].localDuration) return;
+      const rect = this.getBoundingClientRect();
+      const pct = (e.clientX - rect.left) / rect.width;
+      const pos = pct * deckState[slot].localDuration;
+      seekTo(slot, Math.max(0, Math.min(deckState[slot].localDuration, pos)));
+    });
 
-  document.getElementById(`ejectBtn-${slot}`).addEventListener('click', () => {
-    deckCommand(slot, 'eject');
-  });
-  document.getElementById(`playPauseBtn-${slot}`).addEventListener('click', () => {
-    handlePlayPause(slot);
-  });
+    document.getElementById(`ejectBtn-${slot}`).addEventListener('click', () => {
+      deckCommand(slot, 'eject');
+    });
+    document.getElementById(`playPauseBtn-${slot}`).addEventListener('click', () => {
+      handlePlayPause(slot);
+    });
+  }
 }
 
 function handlePlayPause(slot) {
@@ -1282,8 +1319,10 @@ function renderDeckPreview(slot, track, serverTimestamp) {
     buildDeckDOM(slot);
     st.mode = 'preview';
     st.lastTrackId = null;
-    document.getElementById(`playPauseBtn-${slot}`).disabled = true;
-    document.getElementById(`ejectBtn-${slot}`).disabled = true;
+    if (!IS_REMOTE_DJ) {
+      document.getElementById(`playPauseBtn-${slot}`).disabled = true;
+      document.getElementById(`ejectBtn-${slot}`).disabled = true;
+    }
     document.querySelector(`#deck-${slot} .np-timing`).style.display = 'none';
     document.getElementById(`npStartsAt-${slot}`).style.display = '';
   }
@@ -1322,8 +1361,10 @@ function renderDeckLive(slot, deck, transport) {
     buildDeckDOM(slot);
     st.mode = 'live';
     st.lastTrackId = null;
-    document.getElementById(`playPauseBtn-${slot}`).disabled = false;
-    document.getElementById(`ejectBtn-${slot}`).disabled = false;
+    if (!IS_REMOTE_DJ) {
+      document.getElementById(`playPauseBtn-${slot}`).disabled = false;
+      document.getElementById(`ejectBtn-${slot}`).disabled = false;
+    }
     document.querySelector(`#deck-${slot} .np-timing`).style.display = '';
   }
 
@@ -1406,7 +1447,16 @@ function renderQueue(data) {
 
   queueItemIds = queue.map(q => q.item_id);
 
-  list.innerHTML = queue.map((q, i) => `
+  list.innerHTML = queue.map((q, i) => IS_REMOTE_DJ ? `
+    <tr data-item-id="${q.item_id}" style="background-color: ${q.fill_color || 'transparent'};">
+      <td class="qt-pos">${i + 1}</td>
+      <td>${esc(q.artist)}</td>
+      <td>${esc(q.title)}</td>
+      <td class="qt-cat">${esc(q.category)}</td>
+      <td class="qt-dur">${fmtDur(q.duration)}</td>
+      <td class="qt-time">${fmtEtaClock(data.timestamp, q.eta_seconds)}</td>
+    </tr>
+  ` : `
     <tr data-item-id="${q.item_id}" style="background-color: ${q.fill_color || 'transparent'};">
       <td class="qt-pos qt-drag-handle">&#9776;</td>
       <td class="qt-pos">${i + 1}</td>
@@ -1419,7 +1469,7 @@ function renderQueue(data) {
     </tr>
   `).join('');
 
-  initQueueDrag();
+  if (!IS_REMOTE_DJ) initQueueDrag();
 }
 
 function initQueueDrag() {
@@ -1511,20 +1561,23 @@ async function setNext(itemId) {
   poll();
 }
 
-// --- Search to insert ---
-document.getElementById('queueInsertSearch').addEventListener('input', function() {
-  clearTimeout(insertDebounce);
-  const q = this.value.trim();
-  if (q.length < 2) {
-    document.getElementById('queueInsertResults').classList.remove('visible');
-    return;
-  }
-  insertDebounce = setTimeout(() => searchForInsert(q), 300);
-});
+// --- Search to insert (full-console only -- the DOM elements below
+// are omitted when mode == 'remote_dj', so we must not touch them). ---
+if (!IS_REMOTE_DJ) {
+  document.getElementById('queueInsertSearch').addEventListener('input', function() {
+    clearTimeout(insertDebounce);
+    const q = this.value.trim();
+    if (q.length < 2) {
+      document.getElementById('queueInsertResults').classList.remove('visible');
+      return;
+    }
+    insertDebounce = setTimeout(() => searchForInsert(q), 300);
+  });
 
-document.getElementById('queueInsertSearch').addEventListener('blur', function() {
-  setTimeout(() => document.getElementById('queueInsertResults').classList.remove('visible'), 200);
-});
+  document.getElementById('queueInsertSearch').addEventListener('blur', function() {
+    setTimeout(() => document.getElementById('queueInsertResults').classList.remove('visible'), 200);
+  });
+}
 
 async function searchForInsert(q) {
   // 200 is the backend's own hard ceiling (Paginator per_page cap in

@@ -30,6 +30,7 @@ def dashboard_page(request):
     return render(request, "library/dashboard.html", {
         "playlists": playlists,
         "analysis_config": AnalysisConfig.load(),
+        "mode": "full",
     })
 
 
@@ -1504,13 +1505,24 @@ def api_engine_status(request):
 
 @ensure_csrf_cookie
 def remote_dj_page(request):
-    """Stage 6 connect page: lets a remote_dj-group member join a live
-    WebRTC session from their own browser (mic permission, hear the
-    mix-minus monitor return, disconnect). Separate from the studio-side
-    dashboard's future gate toggle (Stage 7) -- this is the DJ's own
-    connect UI, gated the same way as the token mint below."""
+    """Remote-DJ-facing console: renders dashboard.html in `remote_dj`
+    mode, which hides the operator-only controls (Studio Mic PTT,
+    queue reorder, Play Now, search-to-add, per-track edit links, deck
+    eject/pause, waveform click-seek) and slims Deck B on mobile
+    portrait so the DJ has just what they need to be on the air --
+    Now Playing, Up Next, Coming Up, Connect Remote, Remote Mic PTT.
+    Gated on the same `remote_dj` group the WebRTC token endpoint
+    already checks; anyone not in the group gets a 'not authorized'
+    minimal page instead of the console."""
+    from library.models import AnalysisConfig, Playlist
     authorized = request.user.groups.filter(name="remote_dj").exists()
-    return render(request, "library/remote_dj.html", {"authorized": authorized})
+    if not authorized:
+        return render(request, "library/remote_dj_unauthorized.html")
+    return render(request, "library/dashboard.html", {
+        "playlists": Playlist.objects.none(),
+        "analysis_config": AnalysisConfig.load(),
+        "mode": "remote_dj",
+    })
 
 
 @csrf_exempt
