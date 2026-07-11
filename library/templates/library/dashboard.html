@@ -114,17 +114,27 @@
      screen. Deck A stays a full card so they can see now-playing detail
      including the waveform for timing their break. */
   @media (max-width: 640px) {
-    /* Art thumb is toggled via inline style="display: block" in JS
-       once the art image loads, so we need !important to override the
-       inline. Same defensive posture for the rest so a future JS
-       inline-style tweak doesn't silently un-hide these on mobile. */
-    .console-remote_dj #deck-B .np-waveform,
-    .console-remote_dj #deck-B .deck-art-bg,
-    .console-remote_dj #deck-B .deck-art-thumb,
-    .console-remote_dj #deck-B .np-timing {
+    /* Remote DJ console, mobile portrait: put whichever deck is ACTUALLY
+       PLAYING on top with its full card (waveform included, for timing
+       a talkover), and the up-next deck below it, slimmed to text only.
+       Decks swap which slot (A/B) is live constantly -- ordering and
+       styling key off the live/preview mode class set in renderDeck(),
+       not a fixed deck letter. Art thumb is toggled via inline
+       style="display: block" in JS once the image loads, so !important
+       is required to override that inline style on the preview deck. */
+    .console-remote_dj .decks-row {
+      display: flex;
+      flex-direction: column;
+    }
+    .console-remote_dj .deck-panel.deck-mode-live { order: 1; }
+    .console-remote_dj .deck-panel.deck-mode-preview { order: 2; }
+    .console-remote_dj .deck-panel.deck-mode-preview .np-waveform,
+    .console-remote_dj .deck-panel.deck-mode-preview .deck-art-bg,
+    .console-remote_dj .deck-panel.deck-mode-preview .deck-art-thumb,
+    .console-remote_dj .deck-panel.deck-mode-preview .np-timing {
       display: none !important;
     }
-    .console-remote_dj #deck-B { padding: 0.8rem 1rem; }
+    .console-remote_dj .deck-panel.deck-mode-preview { padding: 0.8rem 1rem; }
   }
 
   .deck-panel {
@@ -455,7 +465,7 @@
 
   /* --- Queue search insert --- */
   .queue-insert {
-    margin-bottom: 1.25rem;
+    margin-top: 1.25rem;
     display: flex;
     flex-wrap: wrap;
     align-items: flex-start;
@@ -553,25 +563,6 @@
 </div>
 
 <div class="queue-panel" id="queuePanel">
-  {% if mode != 'remote_dj' %}
-  <div class="queue-insert">
-    <div class="queue-insert-search-wrap">
-      <input type="text" class="queue-insert-input" id="queueInsertSearch"
-             placeholder="Search to add track...">
-      <div class="queue-insert-results" id="queueInsertResults"></div>
-    </div>
-    <div class="queue-insert-playnow">
-      <select class="playnow-select" id="playNowSelect">
-        <option value="">Play a playlist now...</option>
-        {% for pl in playlists %}
-        <option value="{{ pl.id }}">{{ pl.name }}</option>
-        {% endfor %}
-      </select>
-      <button class="playnow-btn" onclick="playNow()">Play Now</button>
-      <span class="playnow-msg" id="playNowMsg"></span>
-    </div>
-  </div>
-  {% endif %}
   <h3>Coming Up</h3>
   <div class="queue-table-wrap">
     <table class="queue-table">
@@ -592,6 +583,25 @@
       </tbody>
     </table>
   </div>
+  {% if mode != 'remote_dj' %}
+  <div class="queue-insert">
+    <div class="queue-insert-search-wrap">
+      <input type="text" class="queue-insert-input" id="queueInsertSearch"
+             placeholder="Search to add track...">
+      <div class="queue-insert-results" id="queueInsertResults"></div>
+    </div>
+    <div class="queue-insert-playnow">
+      <select class="playnow-select" id="playNowSelect">
+        <option value="">Play a playlist now...</option>
+        {% for pl in playlists %}
+        <option value="{{ pl.id }}">{{ pl.name }}</option>
+        {% endfor %}
+      </select>
+      <button class="playnow-btn" onclick="playNow()">Play Now</button>
+      <span class="playnow-msg" id="playNowMsg"></span>
+    </div>
+  </div>
+  {% endif %}
 </div>
 </div>
 {% endblock %}
@@ -1270,18 +1280,24 @@ async function fetchDeckArt(slot, trackId) {
 function renderDeck(slot, deck, transport, queue, serverTimestamp) {
   if (transport === 'OFFLINE' || transport === 'STOPPED') {
     renderDeckOffline(slot, transport);
-    return;
-  }
-  if (deck) {
+  } else if (deck) {
     renderDeckLive(slot, deck, transport);
-    return;
-  }
-  const previewTrack = (queue && queue.length) ? queue[0] : null;
-  if (previewTrack) {
-    renderDeckPreview(slot, previewTrack, serverTimestamp);
   } else {
-    renderDeckEmpty(slot);
+    const previewTrack = (queue && queue.length) ? queue[0] : null;
+    if (previewTrack) {
+      renderDeckPreview(slot, previewTrack, serverTimestamp);
+    } else {
+      renderDeckEmpty(slot);
+    }
   }
+  // Reflect deckState[slot].mode ('live'/'preview'/'offline'/'empty') as a
+  // class on the panel itself, so CSS can reorder/restyle based on
+  // "which deck is actually playing" instead of a fixed A-is-always-this
+  // assumption -- decks swap which one is live vs. up-next constantly.
+  // Used by the remote-DJ mobile layout to put the live deck on top.
+  const panel = document.getElementById(`deck-${slot}`);
+  panel.classList.remove('deck-mode-live', 'deck-mode-preview', 'deck-mode-offline', 'deck-mode-empty');
+  panel.classList.add(`deck-mode-${deckState[slot].mode}`);
 }
 
 function renderDeckOffline(slot, transport) {
