@@ -62,6 +62,7 @@ MIDDLEWARE = [
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'axes.middleware.AxesMiddleware',
     'django.contrib.auth.middleware.LoginRequiredMiddleware',
+    'library.middleware.RemoteDJRestrictMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]

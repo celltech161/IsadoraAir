@@ -3,10 +3,12 @@ from pathlib import Path
 from adminsortable2.admin import SortableAdminBase, SortableAdminMixin, SortableTabularInline
 from django import forms
 from django.contrib import admin, messages
+from django.contrib.auth.forms import PasswordResetForm
+from django.contrib.auth.models import User
 from django.db.models import Count
 from django.http import HttpResponseRedirect
 from django.template.loader import render_to_string
-from django.urls import reverse
+from django.urls import path, reverse
 from django.utils.html import escape, format_html
 from django.utils.safestring import mark_safe
 
@@ -671,3 +673,100 @@ class NavMenuItemAdmin(SortableAdminMixin, admin.ModelAdmin):
     @admin.display(description="Children", ordering="_child_count")
     def child_count(self, obj):
         return obj._child_count
+
+
+# --- Password-setup invite for the built-in User admin ---
+#
+# Onboarding a new DJ (studio or remote) means creating a User with no
+# password they know -- the admin User-add form still requires SOMETHING
+# be typed into the password fields, but that value is never handed to
+# the DJ. Instead of a manual "note the temp password down, tell them
+# over the phone" step, this adds a button on the User change form that
+# fires the exact same PasswordResetForm flow /password-reset/ uses --
+# same email templates, same signed token, same expiry -- so the DJ's
+# first-ever login is through the normal "set your password" page.
+# Safe to click on ANY user (not just brand new ones): it's the same
+# "forgot password" flow, so it just gives them a fresh way in.
+admin.site.unregister(User)
+
+
+@admin.register(User)
+class InviteCapableUserAdmin(admin.ModelAdmin):
+    # Mirrors django.contrib.auth.admin.UserAdmin's shape closely enough
+    # for this project's needs (no groups/permissions editor customization
+    # otherwise) while inserting the invite button into "Personal info"
+    # right after email, and the invite status into the changelist.
+    list_display = ["username", "email", "first_name", "last_name", "is_staff", "password_status"]
+    list_filter = ["is_staff", "is_superuser", "is_active", "groups"]
+    search_fields = ["username", "first_name", "last_name", "email"]
+    ordering = ["username"]
+    filter_horizontal = ["groups", "user_permissions"]
+    fieldsets = (
+        (None, {"fields": ("username", "password")}),
+        ("Personal info", {"fields": ("first_name", "last_name", "email", "invite_button")}),
+        ("Permissions", {"fields": ("is_active", "is_staff", "is_superuser", "groups", "user_permissions")}),
+        ("Important dates", {"fields": ("last_login", "date_joined")}),
+    )
+    add_fieldsets = (
+        (None, {"classes": ("wide",), "fields": ("username", "password1", "password2")}),
+    )
+    readonly_fields = ["invite_button"]
+
+    def get_urls(self):
+        return [
+            path(
+                "<int:user_id>/send-invite/",
+                self.admin_site.admin_view(self.send_invite_view),
+                name="auth_user_send_invite",
+            ),
+            *super().get_urls(),
+        ]
+
+    def send_invite_view(self, request, user_id):
+        user = self.get_object(request, user_id)
+        if user is None:
+            self.message_user(request, "User not found.", level=messages.ERROR)
+            return HttpResponseRedirect(reverse("admin:auth_user_changelist"))
+        if not user.email:
+            self.message_user(
+                request, f"{user.username} has no email address on file -- add one first.",
+                level=messages.ERROR,
+            )
+        else:
+            form = PasswordResetForm({"email": user.email})
+            if form.is_valid():
+                form.save(
+                    request=request,
+                    use_https=request.is_secure(),
+                    email_template_name="registration/password_reset_email.html",
+                    subject_template_name="registration/password_reset_subject.txt",
+                )
+                self.message_user(request, f"Password setup email sent to {user.email}.")
+            else:
+                # Realistically only fires if the address is malformed --
+                # PasswordResetForm.save() is a deliberate no-op (not an
+                # error) for a well-formed address with no matching user,
+                # to avoid leaking account existence.
+                self.message_user(
+                    request, f"Couldn't send: {user.email} doesn't look like a valid address.",
+                    level=messages.ERROR,
+                )
+        return HttpResponseRedirect(reverse("admin:auth_user_change", args=[user_id]))
+
+    @admin.display(description="Password setup")
+    def invite_button(self, obj):
+        if obj.pk is None:
+            return "(save the user first)"
+        url = reverse("admin:auth_user_send_invite", args=[obj.pk])
+        label = "Resend password setup email" if obj.has_usable_password() else "Send password setup email"
+        return format_html(
+            '<a class="button" href="{}">{}</a> '
+            '<span style="color:#888;font-size:0.85em;">'
+            "Sends the same link as “Forgot password?” on the login page."
+            "</span>",
+            url, label,
+        )
+
+    @admin.display(description="Password", boolean=True)
+    def password_status(self, obj):
+        return obj.has_usable_password()
