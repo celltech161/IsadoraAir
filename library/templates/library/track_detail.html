@@ -283,7 +283,6 @@
     <div class="field-row">
       <label></label>
       <button type="button" class="save-btn" style="padding:0.4rem 1rem;font-size:0.78rem;" onclick="readMetadata()" id="readMetaBtn">Read Track Metadata</button>
-      <button type="button" class="save-btn" style="padding:0.4rem 1rem;font-size:0.78rem;background:var(--bg-darker);color:var(--text-main);border:1px solid var(--border-subtle);" onclick="writeMetadata()" id="writeMetaBtn">Write Track Metadata</button>
     </div>
     <div class="field-row">
       <label></label>
@@ -511,6 +510,7 @@ async function saveTrack() {
     hook_out_seconds: getVal('f_hook_out_seconds'),
   };
 
+  const msg = document.getElementById('saveMsg');
   const resp = await fetch(`/api/tracks/${TRACK_ID}/`, {
     method: 'PATCH',
     headers: {
@@ -520,20 +520,71 @@ async function saveTrack() {
     body: JSON.stringify(body),
   });
 
-  const msg = document.getElementById('saveMsg');
-  if (resp.ok) {
-    msg.textContent = 'Saved';
-    msg.style.color = 'var(--accent)';
-  } else {
+  if (!resp.ok) {
     const err = await resp.json();
     msg.textContent = err.error || 'Save failed';
     msg.style.color = 'var(--danger)';
+    msg.classList.add('show');
+    setTimeout(() => msg.classList.remove('show'), 2000);
+    return;
   }
+
+  // DB is the source of truth for playout, so a file-tag write failure
+  // after a successful DB save is a warning, not a blocking error --
+  // the row is saved either way. Only the metadata subset is sent to
+  // the file endpoint; the file has no place for scheduling/cue fields.
+  let fileNote = '';
+  let fileOk = true;
+  try {
+    const fResp = await fetch(`/api/tracks/${TRACK_ID}/write-metadata/`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-CSRFToken': getCookie('csrftoken'),
+      },
+      body: JSON.stringify({
+        title: body.title,
+        artist: body.artist,
+        album: body.album,
+        genre: body.genre,
+        year: body.year,
+        composer: body.composer,
+        publisher: body.publisher,
+        record_label: body.record_label,
+        comments: body.comments,
+      }),
+    });
+    const fData = await fResp.json().catch(() => ({}));
+    if (!fResp.ok) {
+      fileOk = false;
+      fileNote = ` (file tags: ${fData.error || 'write failed'})`;
+    } else {
+      const skipped = fData.skipped || [];
+      const written = (fData.written || []).length;
+      // All-skipped-with-nothing-written = format has no tag support at
+      // all (WAV, etc). Reporting every attempted field as "skipped" in
+      // that case reads as alarming even though the DB save succeeded.
+      // Only the partial-skip case is worth naming fields for.
+      if (skipped.length && written === 0) {
+        fileNote = ' (file has no tag support)';
+      } else if (skipped.length) {
+        fileNote = ` (file skipped: ${skipped.join(', ')})`;
+      }
+    }
+  } catch (e) {
+    fileOk = false;
+    fileNote = ' (file tags: write failed)';
+  }
+
+  msg.textContent = 'Saved' + fileNote;
+  msg.style.color = fileOk ? 'var(--accent)' : 'var(--danger)';
   msg.classList.add('show');
-  setTimeout(() => msg.classList.remove('show'), 2000);
+  setTimeout(() => msg.classList.remove('show'), fileOk ? 2000 : 4000);
 }
 
-// --- File tag metadata (Read/Write Track Metadata) ---
+// --- File tag metadata (Read Track Metadata) ---
+// Writing to the file is handled inside saveTrack() -- Save Changes
+// commits DB + file in one action; there is no standalone Write button.
 
 function showMetaMsg(text, ok) {
   const msg = document.getElementById('metaMsg');
@@ -563,46 +614,9 @@ async function readMetadata() {
     if (data.album) document.getElementById('f_album').value = data.album;
     if (data.genre) document.getElementById('f_genre').value = data.genre;
     if (data.year) document.getElementById('f_year').value = data.year;
-    showMetaMsg('Read from file (not yet saved -- review, then Save Changes or Write Track Metadata)', true);
+    showMetaMsg('Read from file (not yet saved -- review, then Save Changes to commit to DB and file)', true);
   } catch (e) {
     showMetaMsg('Read failed', false);
-  } finally {
-    btn.disabled = false;
-  }
-}
-
-async function writeMetadata() {
-  const btn = document.getElementById('writeMetaBtn');
-  btn.disabled = true;
-  const body = {
-    title: getVal('f_title'),
-    artist: getVal('f_artist'),
-    album: getVal('f_album') || '',
-    genre: getVal('f_genre') || '',
-    year: getVal('f_year'),
-    composer: getVal('f_composer') || '',
-    publisher: getVal('f_publisher') || '',
-    record_label: getVal('f_record_label') || '',
-    comments: getVal('f_comments') || '',
-  };
-  try {
-    const resp = await fetch(`/api/tracks/${TRACK_ID}/write-metadata/`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-CSRFToken': getCookie('csrftoken'),
-      },
-      body: JSON.stringify(body),
-    });
-    const data = await resp.json();
-    if (!resp.ok) {
-      showMetaMsg(data.error || 'Write failed', false);
-      return;
-    }
-    const skipped = data.skipped && data.skipped.length ? ` (not writable to this file: ${data.skipped.join(', ')})` : '';
-    showMetaMsg('Written to file + saved' + skipped, true);
-  } catch (e) {
-    showMetaMsg('Write failed', false);
   } finally {
     btn.disabled = false;
   }
