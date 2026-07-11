@@ -246,19 +246,19 @@
     <h2>Metadata</h2>
     <div class="field-row">
       <label>Title</label>
-      <input type="text" id="f_title" value="{{ track.title|escapejs }}">
+      <input type="text" id="f_title" value="{{ track.title }}">
     </div>
     <div class="field-row">
       <label>Artist</label>
-      <input type="text" id="f_artist" value="{{ track.artist.name|escapejs }}">
+      <input type="text" id="f_artist" value="{{ track.artist.name }}">
     </div>
     <div class="field-row">
       <label>Album</label>
-      <input type="text" id="f_album" value="{% if track.album %}{{ track.album.title|escapejs }}{% endif %}">
+      <input type="text" id="f_album" value="{% if track.album %}{{ track.album.title }}{% endif %}">
     </div>
     <div class="field-row">
       <label>Genre</label>
-      <input type="text" id="f_genre" value="{% if track.genre %}{{ track.genre.name|escapejs }}{% endif %}">
+      <input type="text" id="f_genre" value="{% if track.genre %}{{ track.genre.name }}{% endif %}">
     </div>
     <div class="field-row">
       <label>Year</label>
@@ -266,15 +266,15 @@
     </div>
     <div class="field-row">
       <label>Composer</label>
-      <input type="text" id="f_composer" value="{{ track.composer|escapejs }}">
+      <input type="text" id="f_composer" value="{{ track.composer }}">
     </div>
     <div class="field-row">
       <label>Publisher</label>
-      <input type="text" id="f_publisher" value="{{ track.publisher|escapejs }}">
+      <input type="text" id="f_publisher" value="{{ track.publisher }}">
     </div>
     <div class="field-row">
       <label>Label</label>
-      <input type="text" id="f_record_label" value="{{ track.record_label|escapejs }}">
+      <input type="text" id="f_record_label" value="{{ track.record_label }}">
     </div>
     <div class="field-row">
       <label>Comments</label>
@@ -347,7 +347,7 @@
     </div>
     <div class="field-row">
       <label>RBDS Text</label>
-      <input type="text" id="f_alt_send_text" maxlength="64" value="{{ track.alt_send_text|escapejs }}">
+      <input type="text" id="f_alt_send_text" maxlength="64" value="{{ track.alt_send_text }}">
     </div>
   </div>
 
