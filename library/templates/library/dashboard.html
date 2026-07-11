@@ -583,7 +583,6 @@
       </tbody>
     </table>
   </div>
-  {% if mode != 'remote_dj' %}
   <div class="queue-insert">
     <div class="queue-insert-search-wrap">
       <input type="text" class="queue-insert-input" id="queueInsertSearch"
@@ -601,7 +600,6 @@
       <span class="playnow-msg" id="playNowMsg"></span>
     </div>
   </div>
-  {% endif %}
 </div>
 </div>
 {% endblock %}
@@ -1577,23 +1575,20 @@ async function setNext(itemId) {
   poll();
 }
 
-// --- Search to insert (full-console only -- the DOM elements below
-// are omitted when mode == 'remote_dj', so we must not touch them). ---
-if (!IS_REMOTE_DJ) {
-  document.getElementById('queueInsertSearch').addEventListener('input', function() {
-    clearTimeout(insertDebounce);
-    const q = this.value.trim();
-    if (q.length < 2) {
-      document.getElementById('queueInsertResults').classList.remove('visible');
-      return;
-    }
-    insertDebounce = setTimeout(() => searchForInsert(q), 300);
-  });
+// --- Search to insert -- available in both console modes now. ---
+document.getElementById('queueInsertSearch').addEventListener('input', function() {
+  clearTimeout(insertDebounce);
+  const q = this.value.trim();
+  if (q.length < 2) {
+    document.getElementById('queueInsertResults').classList.remove('visible');
+    return;
+  }
+  insertDebounce = setTimeout(() => searchForInsert(q), 300);
+});
 
-  document.getElementById('queueInsertSearch').addEventListener('blur', function() {
-    setTimeout(() => document.getElementById('queueInsertResults').classList.remove('visible'), 200);
-  });
-}
+document.getElementById('queueInsertSearch').addEventListener('blur', function() {
+  setTimeout(() => document.getElementById('queueInsertResults').classList.remove('visible'), 200);
+});
 
 async function searchForInsert(q) {
   // 200 is the backend's own hard ceiling (Paginator per_page cap in

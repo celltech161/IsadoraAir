@@ -23,13 +23,33 @@ _ALLOWED_PREFIXES = (
     "/api/waveform/",
     "/api/albumart/",
 )
-# Single endpoints outside the prefixes above -- the Monitoring
-# dashboard's embedded RBDS widget polls this one rbds API route
-# directly (see monitoring/templates/monitoring/dashboard.html), even
-# though the rest of /rbds/ is off-limits to this role.
+# Exact-only, not prefixes: /remote-dj/'s search-to-add and Play Now
+# controls hit these. Deliberately NOT a prefix match -- "/api/tracks/"
+# as a prefix would also open up /api/tracks/<pk>/write-metadata/,
+# /reanalyze/, /blocked-slots/toggle*/ etc., which are real library-
+# editing endpoints, not search. This role gets to search for and
+# queue a track or start a playlist, nothing more.
 _ALLOWED_EXACT = {
+    "/api/tracks/",
+    "/api/engine/queue/insert/",
+    # The Monitoring dashboard's embedded RBDS widget polls this one
+    # rbds API route directly (see monitoring/templates/monitoring/
+    # dashboard.html), even though the rest of /rbds/ is off-limits.
     "/rbds/api/status/",
 }
+
+
+def _is_playlist_play_now(path):
+    # /api/playlists/<id>/play-now/ -- can't be an exact-path entry
+    # since <id> varies. Still deliberately narrow: only this one
+    # playlist action, not the rest of /api/playlists/ (no create/
+    # edit/reorder/delete for this role).
+    parts = path.strip("/").split("/")
+    return (
+        len(parts) == 4
+        and parts[0] == "api" and parts[1] == "playlists"
+        and parts[2].isdigit() and parts[3] == "play-now"
+    )
 
 
 class RemoteDJRestrictMiddleware:
@@ -57,7 +77,11 @@ class RemoteDJRestrictMiddleware:
             and user.groups.filter(name="remote_dj").exists()
         ):
             path = request.path
-            allowed = path in _ALLOWED_EXACT or any(path.startswith(p) for p in _ALLOWED_PREFIXES)
+            allowed = (
+                path in _ALLOWED_EXACT
+                or any(path.startswith(p) for p in _ALLOWED_PREFIXES)
+                or _is_playlist_play_now(path)
+            )
             if not allowed:
                 if path.startswith("/api/") or path.startswith("/ws/"):
                     return HttpResponseForbidden("Not available for this account.")
