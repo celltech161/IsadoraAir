@@ -1851,14 +1851,17 @@ function vuInitScales() {
   const bot = document.getElementById("vuScaleBottom");
   if (!top || !bot) return;
 
-  // VU labels: -20, -10, 0 (bold), +3. dBFS = VU + VU_ZERO_DBFS.
-  // Only render a label if its corresponding dBFS lands within the
-  // current bar range.
+  // VU labels: -20, -10, 0 (bold), +6. dBFS = VU + VU_ZERO_DBFS.
+  // +6 VU = -14 dBFS, which lands in the yellow zone (between -20 and
+  // -6 dBFS transitions) -- a common upper-limit broadcast reference,
+  // and far enough from 0 VU to stay legible even at wider min scales
+  // (3 dB from 0 to +3 was cramped at min <= -50). Only render a label
+  // if its corresponding dBFS lands within the current bar range.
   const vuTicks = [
     { vu: -20, emph: false },
     { vu: -10, emph: false },
     { vu:   0, emph: true  },
-    { vu:  +3, emph: false },
+    { vu:  +6, emph: false },
   ];
   const visibleVu = vuTicks
     .map(t => ({ ...t, dbfs: t.vu + VU_ZERO_DBFS }))
