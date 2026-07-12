@@ -628,14 +628,11 @@
      bar edges and don't get clipped off. */
   .vu-scale span.vu-tick-first { transform: translateX(0); }
   .vu-scale span.vu-tick-last  { transform: translateX(-100%); }
-  /* "VU" and "dBFS" -- axis-name labels, same size as numeric ticks
-     but the top one lives in the scale row's label spacer and the
-     bottom one sits inline among the dBFS numeric ticks. Both share
-     the muted grey color of the ticks so nothing shouts. */
-  .vu-scale-row .vu-meter-label {
-    font-weight: 600;
-    color: var(--text-muted);
-  }
+  /* "VU" and "dBFS" axis-name labels are just tick-styled spans
+     positioned inline on their scale rows (see JS), same muted grey
+     as numeric ticks. VU pins its left edge to 0% (aligned with the
+     leftmost dBFS tick underneath); dBFS is centered between the
+     leftmost dBFS tick and the -20 dBFS tick. */
   /* Full meter title underneath the dBFS scale row. Even smaller than
      the numeric ticks per the label request; kept single-line, right-
      aligned to sit under the bars (the meter is already right-justified
@@ -680,7 +677,7 @@
 <div class="vu-meter" id="vuMeter" aria-label="Pre-processor output level">
   <div class="vu-meter-bars">
     <div class="vu-scale-row">
-      <span class="vu-meter-label">VU</span>
+      <span class="vu-meter-label" aria-hidden="true"></span>
       <div class="vu-scale" id="vuScaleTop" aria-label="VU scale"></div>
     </div>
     <div class="vu-meter-row">
@@ -1866,15 +1863,23 @@ function vuInitScales() {
   const visibleVu = vuTicks
     .map(t => ({ ...t, dbfs: t.vu + VU_ZERO_DBFS }))
     .filter(t => t.dbfs >= VU_MIN_DB && t.dbfs <= 0);
-  const vuHtml = visibleVu.map((t, i) => {
+  const vuTicksHtml = visibleVu.map((t, i) => {
     const label = t.vu === 0 ? "0" : (t.vu > 0 ? `+${t.vu}` : `${t.vu}`);
     const cls = ["vu-tick"];
     if (t.emph) cls.push("vu-tick-emph");
-    if (i === 0) cls.push("vu-tick-first");
     if (i === visibleVu.length - 1) cls.push("vu-tick-last");
     return `<span class="${cls.join(" ")}" style="left:${vuDbToPct(t.dbfs)}%">${label}</span>`;
   }).join("");
-  top.innerHTML = vuHtml;
+  // "VU" axis-name label pinned to the 0% position with its LEFT
+  // edge -- lines up directly under the leftmost dBFS tick below
+  // (which is also pinned to 0% via vu-tick-first). If VU_MIN_DB is
+  // set high enough that the first VU numeric tick also lands near
+  // 0% (e.g. VU_MIN_DB = -40 => -20 VU at 0%), the "VU" label and
+  // that first tick can visually overlap -- widen the scale
+  // (lower VU_MIN_DB) if that's an issue.
+  top.innerHTML =
+    `<span class="vu-tick vu-tick-first" style="left:0%">VU</span>` +
+    vuTicksHtml;
 
   // dBFS labels: left edge (VU_MIN_DB), -20 (0 VU reference), -6
   // (color transition to red), 0 (bold, clip). First and last are
