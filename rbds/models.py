@@ -117,16 +117,10 @@ class RBDSConfig(models.Model):
                    "just {title} is sent verbatim. Truncated to 64 chars (RadioText limit).",
     )
     use_rt_plus = models.BooleanField(
-        "Send RT+ tagging", default=True,
-        help_text="Tags artist/title within the RT string so RDS receivers can display "
-                   "them in dedicated fields instead of scrolling text. Works in both "
-                   "UECP and ASCII modes -- the tags travel as StereoTool inline "
-                   "markers (\\+AR<artist>\\-, \\+TI<title>\\-) embedded directly in "
-                   "the RT text, and StereoTool strips them off before emitting the "
-                   "on-air RT+ 11A group. Only sent when the current RT has both an "
-                   "artist and a title (station promos and now-playing entries missing "
-                   "metadata don't emit RT+, so a receiver never sees stale tags on "
-                   "non-track content).",
+        "Send RT+ tagging (ASCII mode only)", default=True,
+        help_text="Tags artist/title within the RT string using StereoTool's RT+ ASCII "
+                   "extension. Binary-UECP RT+ requires the ODA channel, out of scope "
+                   "for this version -- RT+ is only ever sent when Protocol is ASCII.",
     )
     nowplaying_min_seconds = models.PositiveIntegerField(
         default=20,

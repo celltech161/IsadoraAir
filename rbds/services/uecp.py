@@ -152,25 +152,17 @@ def mec_pty(pty: int, dsn: int = 0x00, psn: int = 0x00) -> bytes:
     return bytes([0x07, dsn, psn, pty & 0x1F])
 
 
-def mec_rt(text: str, ab_flag: bool, dsn: int = 0x00, psn: int = 0x00, max_chars: int = 64) -> bytes:
+def mec_rt(text: str, ab_flag: bool, dsn: int = 0x00, psn: int = 0x00) -> bytes:
     """MEC 0x0A -- RadioText. Format: MEC DSN PSN MEL MED(flags byte,
-    then up to max_chars text chars). MEL = 1 (flags byte) + len(text).
-    The flags byte's bit0 is the A/B toggle flag -- must flip whenever
-    the transmitted text actually changes, so receivers know to refresh
+    then up to 64 text chars). MEL = 1 (flags byte) + len(text). The
+    flags byte's bit0 is the A/B toggle flag -- must flip whenever the
+    transmitted text actually changes, so receivers know to refresh
     their display; bits 6-5 are buffer config (0b01 = flush-then-load,
     matches this project's single-current-message use, not a rotating
     on-device buffer -- rotation is handled by rbds_manager.py itself).
     Spec example: <0A><00><01><05><51><74><65><78><74> (flush+toggle
-    A/B, text 'text').
-
-    max_chars defaults to the RT-side 64-char limit that receivers
-    ultimately see. Callers using StereoTool's inline RT+ markers
-    (\\+AR..\\-..\\+TI..\\- -- see rbds_manager._resolve_rt_content)
-    can pass a higher value; StereoTool documents that its RT+ marker
-    chars don't count toward the on-air 64-char RT length, so the
-    raw bytes-on-the-wire can be somewhat longer without truncating
-    the visible content."""
-    text = text[:max_chars]
+    A/B, text 'text')."""
+    text = text[:64]
     med0 = (0b01 << 5) | (0x01 if ab_flag else 0x00)
     mel = 1 + len(text)
     return bytes([0x0A, dsn, psn, mel, med0]) + text.encode("latin-1", errors="replace")

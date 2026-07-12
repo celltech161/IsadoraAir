@@ -261,6 +261,16 @@ class UecpFrameTests(SimpleTestCase):
 
 
 class AsciiProtocolTests(SimpleTestCase):
+    def test_rt_plus_tag_length_minus_one(self):
+        # Matches StereoTool's own documented example exactly:
+        # "RT+=4,12,16,1,32,4" tags a 17-char artist at offset 12 and a
+        # 5-char title at offset 32 -- the third number is length MINUS
+        # ONE, a real documented gotcha.
+        artist_tag = ascii_protocol.build_rt_plus_tag(ascii_protocol.RT_PLUS_ARTIST, 12, 17)
+        title_tag = ascii_protocol.build_rt_plus_tag(ascii_protocol.RT_PLUS_TITLE, 32, 5)
+        self.assertEqual(artist_tag, "4,12,16")
+        self.assertEqual(title_tag, "1,32,4")
+
     def test_build_ascii_commands_never_includes_ta(self):
         commands = ascii_protocol.build_ascii_commands(
             pi_code="1000", ps="KOGR-LP ", rt="Now Playing", pty=11,
@@ -284,20 +294,17 @@ class AsciiProtocolTests(SimpleTestCase):
         self.assertIn("MS=1", commands)
         self.assertIn("DI=8", commands)  # stereo bit only
 
-    def test_build_ascii_commands_carries_inline_rt_plus_markers(self):
-        # RT+ tagging is embedded IN the RT value itself via StereoTool's
-        # marker syntax (\+AR..\-..\+TI..\-); build_ascii_commands has
-        # no separate RT+= command anymore and just passes the marker-
-        # bearing string through in RT=. Cap is 80 chars (not 64) so
-        # the closing \- isn't clipped from the trailing marker.
-        rt = "\\+ARFoo Band\\- - \\+TISong Name\\-"
+    def test_build_ascii_commands_with_rt_plus(self):
+        tags = [
+            ascii_protocol.build_rt_plus_tag(ascii_protocol.RT_PLUS_ARTIST, 0, 6),
+            ascii_protocol.build_rt_plus_tag(ascii_protocol.RT_PLUS_TITLE, 9, 5),
+        ]
         commands = ascii_protocol.build_ascii_commands(
-            pi_code="1000", ps="KOGR-LP ", rt=rt, pty=11,
+            pi_code="1000", ps="KOGR-LP ", rt="Artist - Title", pty=11,
             music=True, di_dynamic_pty=False, di_compressed=False,
-            di_artificial_head=False, di_stereo=True,
+            di_artificial_head=False, di_stereo=True, rt_plus_tags=tags,
         )
-        self.assertIn(f"RT={rt}", commands)
-        self.assertNotIn("RT+=", " ".join(commands))
+        self.assertIn("RT+=4,0,5,1,9,4", commands)
 
 
 class PSRotationTests(SimpleTestCase):
