@@ -164,17 +164,38 @@ class RBDSManager:
         self._write_state(config, target_ps, rt_text, rt_source, rt_source_name)
 
     RT_PLUS_SEPARATOR = " - "
+    # StereoTool's inline RT+ marker syntax: \+AR<artist>\- and \+TI<title>\-.
+    # The marker chars (`\+AR`, `\-`, `\+TI`, `\-` = 12 chars total) do NOT
+    # count toward the 64-char RT length that receivers see -- confirmed
+    # from Thimeo's own help text embedded in the StereoTool binary. We
+    # embed them in the RT text directly and pass through mec_rt / RT=;
+    # StereoTool parses them off before emitting the on-air 2A groups and
+    # translates them into an RT+ 11A group. This replaces the earlier
+    # UECP MEC-0x50/MEC-0x4A approach (which StereoTool doesn't
+    # recognize) and the ASCII `RT+=` explicit-offsets command (still
+    # supported by StereoTool but redundant when markers are embedded).
+    RT_PLUS_MARKER_START_ARTIST = "\\+AR"
+    RT_PLUS_MARKER_START_TITLE = "\\+TI"
+    RT_PLUS_MARKER_END = "\\-"
+
+    def _apply_rt_plus_markers(self, artist, title):
+        """Wrap artist/title with StereoTool's inline RT+ markers. Caller
+        is responsible for the visible-length (artist + separator + title
+        <= 64 chars, per the RT limit that receivers actually see); the
+        marker chars themselves are transparent to the length limit."""
+        return (
+            f"{self.RT_PLUS_MARKER_START_ARTIST}{artist}{self.RT_PLUS_MARKER_END}"
+            f"{self.RT_PLUS_SEPARATOR}"
+            f"{self.RT_PLUS_MARKER_START_TITLE}{title}{self.RT_PLUS_MARKER_END}"
+        )
 
     def _resolve_rt_content(self, config, now_playing, rt_source, rt_source_name, messages_by_name):
-        """Returns (rt_text, artist_or_none, title_or_none). artist/title
-        are only returned non-None when RT+ tagging is actually going to
-        be used for this content -- in that case rt_text is built via a
-        FIXED "artist - title" join (RT_PLUS_SEPARATOR) so
-        _build_ascii_payload() can compute exact tag offsets, rather than
-        searching for substrings in an arbitrary user-configured
-        now_playing_format template (which can't safely guarantee
-        positions). now_playing_format is only honored when RT+ isn't
-        in play."""
+        """Returns (rt_text, artist_or_none, title_or_none). rt_text may
+        contain StereoTool inline RT+ markers if config.use_rt_plus is
+        enabled AND artist+title are both present. The 4th return
+        component (artist/title) is only meaningful for the state file
+        and monitoring surface -- payload builders no longer use it to
+        compute byte offsets (markers replaced that path entirely)."""
         if rt_source == "nowplaying":
             title = now_playing.get("title", "") or ""
             artist = now_playing.get("artist", "") or ""
@@ -192,9 +213,16 @@ class RBDSManager:
         if not artist:
             return title[:64], None, None
 
-        if config.protocol == "ascii" and config.use_rt_plus:
-            text = f"{artist}{self.RT_PLUS_SEPARATOR}{title}"[:64]
-            return text, artist, title
+        if config.use_rt_plus and artist and title:
+            # Fit visible artist + separator + title within the 64-char
+            # RT budget. Truncate the title (not the artist) if needed
+            # -- artist is typically shorter and always shown in full.
+            max_title = 64 - len(artist) - len(self.RT_PLUS_SEPARATOR)
+            if max_title >= 1:
+                title_fit = title[:max_title]
+                return self._apply_rt_plus_markers(artist, title_fit), artist, title_fit
+            # Artist alone at/over the budget -- skip RT+ tagging for
+            # this cycle and just show artist.
 
         if rt_source == "nowplaying":
             try:
@@ -260,29 +288,16 @@ class RBDSManager:
         )
         msg += uecp.mec_ms(music=config.ms)
         msg += uecp.mec_pty(config.pty)
-        msg += uecp.mec_rt(rt, ab_flag=self._rt_ab_flag)
-        # RT+ tags (artist + title) via UECP: ODA config MEC pins the
-        # RT+ AID (0x4BD7) to group 11A, then the RT+ tag MEC carries
-        # the actual (content-type, start, length) pair. Sent alongside
-        # every RT+ payload so a StereoTool session that reset itself
-        # is guaranteed to re-learn the ODA assignment. The tag offsets
-        # match the ASCII path exactly (rt is built as
-        # f"{artist}{RT_PLUS_SEPARATOR}{title}" by _resolve_rt_content
-        # when RT+ is enabled AND artist/title are both non-None), so
-        # a receiver decoding this frame sees artist_start = 0,
-        # title_start = len(artist) + len(RT_PLUS_SEPARATOR).
-        if config.use_rt_plus and artist and title:
-            msg += uecp.mec_oda_config_rt_plus()
-            artist_start = 0
-            title_start = len(artist) + len(self.RT_PLUS_SEPARATOR)
-            msg += uecp.mec_rt_plus(
-                item_toggle=self._rt_ab_flag,
-                item_running=True,
-                content_type_1=ascii_protocol.RT_PLUS_ARTIST,
-                start_1=artist_start, length_1=len(artist),
-                content_type_2=ascii_protocol.RT_PLUS_TITLE,
-                start_2=title_start, length_2=len(title),
-            )
+        # RT+ tagging (when enabled and the current RT has a real
+        # artist+title) is carried by StereoTool's inline marker syntax
+        # embedded directly in the RT string -- not by a separate
+        # MEC. Raw wire length can go up to ~76 chars once the ~12
+        # marker chars are included, so mec_rt gets a max_chars=80
+        # override to leave the closing `\-` marker intact; the visible
+        # RT the receiver ultimately sees is still <= 64 chars because
+        # StereoTool strips markers before generating the on-air 2A
+        # groups.
+        msg += uecp.mec_rt(rt, ab_flag=self._rt_ab_flag, max_chars=80)
         if config.af_frequencies_mhz:
             freqs = [float(f.strip()) for f in config.af_frequencies_mhz.split(",") if f.strip()]
             if freqs:
@@ -343,26 +358,14 @@ class RBDSManager:
         self._transmit(config, frame)
 
     def _build_ascii_payload(self, config, ps, rt, artist, title):
-        # rt is guaranteed by _resolve_rt_content() to be exactly
-        # f"{artist}{RT_PLUS_SEPARATOR}{title}" (truncated to 64 chars)
-        # whenever artist/title are both non-None, so tag offsets are
-        # known exactly -- no substring search needed. If truncation cut
-        # into the title, len(title) may overstate what actually
-        # survived; an accepted edge-case limitation for very long text,
-        # not worth extra complexity for v1.
-        rt_plus_tags = None
-        if config.use_rt_plus and artist and title:
-            artist_start = 0
-            title_start = len(artist) + len(self.RT_PLUS_SEPARATOR)
-            rt_plus_tags = [
-                ascii_protocol.build_rt_plus_tag(ascii_protocol.RT_PLUS_ARTIST, artist_start, len(artist)),
-                ascii_protocol.build_rt_plus_tag(ascii_protocol.RT_PLUS_TITLE, title_start, len(title)),
-            ]
+        # RT+ tags travel inside rt itself via StereoTool's inline marker
+        # syntax (see _resolve_rt_content). No separate `RT+=` command
+        # here -- StereoTool parses the markers directly from the RT
+        # string, in ASCII mode as well as UECP.
         commands = ascii_protocol.build_ascii_commands(
             pi_code=config.pi_code, ps=ps, rt=rt, pty=config.pty, music=config.ms,
             di_dynamic_pty=config.di_dynamic_pty, di_compressed=config.di_compressed,
             di_artificial_head=config.di_artificial_head, di_stereo=config.di_stereo,
-            rt_plus_tags=rt_plus_tags,
         )
         return ("\n".join(commands) + "\n").encode("utf-8")
 
