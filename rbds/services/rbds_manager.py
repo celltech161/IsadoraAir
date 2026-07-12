@@ -52,6 +52,11 @@ class RBDSManager:
         self._connected_since = None
         self._down_since = None
         self._last_now_playing = {"title": "", "artist": ""}
+        # Last UTC minute we sent a CT (Clock Time) frame in, so we
+        # send exactly one CT per minute (per RBDS spec: group 4A must
+        # be transmitted at :00 seconds of the given minute). Reset to
+        # None on init so the very first tick fires an immediate CT.
+        self._last_ct_sent_minute = None
 
     def start(self):
         self.running = True
@@ -139,6 +144,22 @@ class RBDSManager:
             self._last_sent_ps = target_ps
             self._last_sent_rt = rt_text
             self._last_full_resend = time.time()
+
+        # Dedicated CT send at minute boundaries -- see _send_ct
+        # docstring for why this can't ride along with the content
+        # payload above.
+        if config.protocol == "uecp" and config.send_ct:
+            current_minute = datetime.datetime.now(datetime.timezone.utc).minute
+            if current_minute != self._last_ct_sent_minute:
+                try:
+                    self._send_ct(config)
+                    self._last_ct_sent_minute = current_minute
+                except Exception as exc:
+                    # CT is auxiliary -- don't take the tick down or
+                    # flip _connected over an isolated CT failure.
+                    # Bump _last_error so the state file surfaces the
+                    # failure without hiding the connection state.
+                    self._last_error = f"CT send failed: {exc}"
 
         self._write_state(config, target_ps, rt_text, rt_source, rt_source_name)
 
@@ -244,9 +265,11 @@ class RBDSManager:
             freqs = [float(f.strip()) for f in config.af_frequencies_mhz.split(",") if f.strip()]
             if freqs:
                 msg += uecp.mec_af(freqs)
-        if config.send_ct:
-            now_utc, offset_minutes = self._current_ct_fields()
-            msg += uecp.mec_ct(now_utc, offset_minutes)
+        # CT is deliberately NOT bundled here. It's sent as its own
+        # frame from _tick at the minute boundary, so RDS group 4A is
+        # transmitted at :00 seconds -- receivers require that (see
+        # _send_ct's docstring for the specific Sangean symptom that
+        # forced this split).
         return uecp.build_frame(config.uecp_site_address, config.uecp_encoder_address, self._sqc, msg)
 
     def _current_ct_fields(self):
@@ -265,6 +288,37 @@ class RBDSManager:
         except Exception:
             offset_minutes = 0
         return now_utc, offset_minutes
+
+    def _send_ct(self, config):
+        """CT-only UECP frame, fired from _tick once per minute at the
+        first tick that observes a minute rollover -- so the frame is
+        sent within ~1s of :00 seconds and the seconds field encoded
+        into MEC 0x0D is a small single-digit value close to 0.
+
+        Why a dedicated frame instead of piggybacking on the PS/RT
+        payload: RBDS spec requires group 4A to be transmitted at
+        :00 seconds of each minute. Sending CT MEC to StereoTool at
+        arbitrary times inside the minute (which is what the previous
+        content-payload-bundled approach did -- at the FULL_RESEND
+        30s cadence, plus every content change) caused StereoTool to
+        emit group 4A at those arbitrary times too. A live Sangean
+        receiver refused to decode CT that way; the older NextKast +
+        RDS-Magic-4 setup got minute-boundary CT and the same
+        receiver decoded fine.
+
+        The connection state (_connected / _sock) is shared with
+        _send; CT rides on whatever socket _send already established.
+        A CT failure is treated as auxiliary in _tick's catch above:
+        _last_error surfaces it but _connected doesn't flip so the
+        main content path isn't dragged down by an isolated CT
+        write."""
+        self._sqc = (self._sqc % 255) + 1
+        now_utc, offset_minutes = self._current_ct_fields()
+        msg = uecp.mec_ct(now_utc, offset_minutes)
+        frame = uecp.build_frame(
+            config.uecp_site_address, config.uecp_encoder_address, self._sqc, msg,
+        )
+        self._transmit(config, frame)
 
     def _build_ascii_payload(self, config, ps, rt, artist, title):
         # rt is guaranteed by _resolve_rt_content() to be exactly
