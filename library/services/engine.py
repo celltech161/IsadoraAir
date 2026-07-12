@@ -500,13 +500,28 @@ class PlaybackEngine:
         caps = Gst.Caps.from_string(f"audio/x-raw,rate={self.pipeline_sample_rate},channels=2")
         capsfilter.set_property("caps", caps)
 
-        # Pre-processor VU meter tap. Sits between capsfilter and the
-        # (tee | agc_dynamic) so it measures the SUMMED master output --
-        # post-mix, post-duck, post-mic, but PRE-AGC and PRE-StereoTool.
-        # That's what an operator can actually influence (fader levels,
-        # mic PTT, ducking depth), which is what a pre-processor VU is
-        # for. Emits bus messages every LEVEL_INTERVAL_MS; the handler
-        # (_on_element_message) writes them to LEVELS_PATH.
+        # Program-bus attenuation. Sits between capsfilter and the VU
+        # meter so a hot summed master (multiple decks + live mic + a
+        # remote DJ mic all summing into master_mixer) can't drive
+        # StereoTool past 0 dBFS. Read fresh from AudioPipeline at build
+        # time; changing the value requires an engine restart, same as
+        # sample_rate. A downstream volume adjustment on the Studio
+        # Monitor path (agc_makeup) can compensate for the -6dB drop if
+        # the operator wants louder studio speakers without touching the
+        # pipeline's headroom to StereoTool.
+        program_gain_db = AudioPipeline.load().program_gain_db
+        self.program_gain = Gst.ElementFactory.make("volume", "program_gain")
+        self.program_gain.set_property("volume", 10 ** (program_gain_db / 20.0))
+
+        # Pre-processor VU meter tap. Sits between program_gain and the
+        # (tee | agc_dynamic) so it measures the SUMMED master output
+        # AFTER the program-bus attenuation -- i.e. exactly the level
+        # that StereoTool sees. Post-mix, post-duck, post-mic, but
+        # PRE-AGC and PRE-StereoTool. That's what an operator can
+        # actually influence (fader levels, mic PTT, ducking depth),
+        # which is what a pre-processor VU is for. Emits bus messages
+        # every LEVEL_INTERVAL_MS; the handler (_on_element_message)
+        # writes them to LEVELS_PATH.
         self.output_level = Gst.ElementFactory.make("level", "output_level")
         self.output_level.set_property("post-messages", True)
         self.output_level.set_property("interval", LEVEL_INTERVAL_MS * Gst.MSECOND)
@@ -541,7 +556,7 @@ class PlaybackEngine:
 
         elements = [
             self.mixer, self.duck_gain, self.master_mixer, convert, resample, capsfilter,
-            self.output_level,
+            self.program_gain, self.output_level,
             self.agc_dynamic, self.agc_makeup, self.agc_limiter,
             self.alsasink,
         ]
@@ -680,7 +695,8 @@ class PlaybackEngine:
         convert.link(resample)
         resample.link(capsfilter)
 
-        capsfilter.link(self.output_level)
+        capsfilter.link(self.program_gain)
+        self.program_gain.link(self.output_level)
         if stereotool_tee:
             self.output_level.link(stereotool_tee)
             stereotool_tee.link(self.agc_dynamic)

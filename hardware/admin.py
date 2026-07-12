@@ -33,7 +33,7 @@ def _mixer_controls_for(obj):
 
 @admin.register(AudioPipeline)
 class AudioPipelineAdmin(admin.ModelAdmin):
-    fields = ["sample_rate"]
+    fields = ["sample_rate", "program_gain_db"]
 
     class Media:
         js = ["hardware/js/audio_pipeline_confirm.js"]

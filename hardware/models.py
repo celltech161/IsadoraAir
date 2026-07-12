@@ -2,14 +2,22 @@ from django.db import models
 
 
 class AudioPipeline(models.Model):
-    """Singleton — the sample rate the whole GStreamer pipeline runs at
-    (mixer output caps + the silence-priming burst used for fresh track
-    starts — see engine.py's _build_main_pipeline/_create_deck). Every
-    deck's own audioconvert/audioresample just negotiates to whatever
-    this is; there's no other hardcoded rate anywhere else in the
-    pipeline. Changing this is a pipeline topology/format decision, not
-    a live-adjustable property — it requires an engine restart, which
-    the admin change form prompts for and triggers on save."""
+    """Singleton — pipeline-wide GStreamer engine settings that don't
+    belong on any single AudioInput/AudioOutput row.
+
+    `sample_rate` is baked into the pipeline's topology (mixer output
+    caps + the silence-priming burst used for fresh track starts — see
+    engine.py's _build_main_pipeline/_create_deck).
+
+    `program_gain_db` is a summed-bus attenuation applied AFTER the
+    master mixer / duck / mic sum but BEFORE the pre-processor VU meter
+    and the tee to StereoTool + Studio Monitor. It exists to keep enough
+    headroom on the mixed program bus that a hot track + live mic + a
+    remote-DJ voice can't push the summed peak past 0 dBFS at the input
+    to StereoTool. Applied via a `volume` element in the engine chain.
+
+    Both fields require an engine restart to change — the admin change
+    form prompts for and triggers this on save."""
     SAMPLE_RATE_CHOICES = [
         (32000, "32 kHz"),
         (44100, "44.1 kHz"),
@@ -22,6 +30,14 @@ class AudioPipeline(models.Model):
         help_text="Not all audio hardware natively supports every rate — "
                    "if in doubt, 44.1kHz matches most of the library and "
                    "48kHz is the safest general-purpose default.",
+    )
+    program_gain_db = models.FloatField(
+        default=-6.0,
+        help_text="Attenuation applied to the summed master bus before "
+                   "it feeds StereoTool and the Studio Monitor. Negative "
+                   "values give StereoTool more input headroom; 0 dB is "
+                   "unity (no attenuation). Default -6 dB matches typical "
+                   "broadcast pre-processor practice.",
     )
 
     class Meta:
