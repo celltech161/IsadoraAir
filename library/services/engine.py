@@ -52,6 +52,17 @@ DUCK_RAMP_STEPS = 20  # ~25ms per step -- smooth enough for a loudness fade, not
 STATE_PATH = Path("/run/isadoraair/engine_state.json")
 CMD_PATH = Path("/run/isadoraair/engine_cmd.json")
 NOW_PLAYING_PATH = Path("/run/isadoraair/now_playing.json")
+
+# Pre-processor VU meter: values are updated by GStreamer's `level`
+# element sitting on the summed master output (post-mix, post-duck,
+# post-mic; PRE-AGC and PRE-StereoTool). Written to LEVELS_PATH at
+# LEVEL_INTERVAL_MS cadence for the dashboard's fast-cadence poll. Atomic
+# rename on each write so a mid-write read never sees a truncated file.
+LEVELS_PATH = Path("/run/isadoraair/levels.json")
+LEVELS_TMP_PATH = Path("/run/isadoraair/levels.json.tmp")
+LEVEL_INTERVAL_MS = 50
+LEVEL_PEAK_TTL_MS = 300
+LEVEL_PEAK_FALLOFF_DB_PER_SEC = 20.0
 POSITION_POLL_MS = 250
 AUTO_BUILD_CHECK_SECONDS = 10
 NEXT_HOUR_LOOKAHEAD_SECONDS = 30
@@ -382,6 +393,43 @@ class PlaybackEngine:
         self.mic_ok = True
         return [mic_bin]
 
+    def _on_element_message(self, bus, message):
+        """Element messages from the shared main-pipeline bus. Today only
+        `output_level` is watched here (see LEVELS_PATH docstring);
+        anything else is ignored so this stays cheap and can't accidentally
+        misinterpret a message from a different element that happens to
+        share a structure name."""
+        structure = message.get_structure()
+        if structure is None or structure.get_name() != "level":
+            return True
+        if message.src is not self.output_level:
+            return True
+        # rms/peak/decay each come out as a per-channel list of dBFS
+        # values. PyGObject exposes the underlying GValueArray as
+        # iterable -- list(...) unpacks it to a plain list of floats.
+        try:
+            rms = list(structure.get_value("rms")) or []
+            peak = list(structure.get_value("peak")) or []
+            decay = list(structure.get_value("decay")) or []
+        except Exception:
+            return True
+        payload = {
+            "ts": time.time(),
+            "rms": rms,
+            "peak": peak,
+            "decay": decay,
+        }
+        try:
+            LEVELS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            LEVELS_TMP_PATH.write_text(json.dumps(payload), encoding="utf-8")
+            os.replace(LEVELS_TMP_PATH, LEVELS_PATH)
+        except Exception:
+            # A single failed write is not worth crashing the pipeline
+            # over -- the next tick (LEVEL_INTERVAL_MS from now) will
+            # try again with fresh values.
+            pass
+        return True
+
     def _on_main_bus_error(self, bus, message):
         # self.main_pipeline's bus isn't watched for anything else today
         # (deck errors go through each deck's own dedicated Gst.Pipeline
@@ -452,6 +500,19 @@ class PlaybackEngine:
         caps = Gst.Caps.from_string(f"audio/x-raw,rate={self.pipeline_sample_rate},channels=2")
         capsfilter.set_property("caps", caps)
 
+        # Pre-processor VU meter tap. Sits between capsfilter and the
+        # (tee | agc_dynamic) so it measures the SUMMED master output --
+        # post-mix, post-duck, post-mic, but PRE-AGC and PRE-StereoTool.
+        # That's what an operator can actually influence (fader levels,
+        # mic PTT, ducking depth), which is what a pre-processor VU is
+        # for. Emits bus messages every LEVEL_INTERVAL_MS; the handler
+        # (_on_element_message) writes them to LEVELS_PATH.
+        self.output_level = Gst.ElementFactory.make("level", "output_level")
+        self.output_level.set_property("post-messages", True)
+        self.output_level.set_property("interval", LEVEL_INTERVAL_MS * Gst.MSECOND)
+        self.output_level.set_property("peak-ttl", LEVEL_PEAK_TTL_MS * Gst.MSECOND)
+        self.output_level.set_property("peak-falloff", LEVEL_PEAK_FALLOFF_DB_PER_SEC)
+
         # Interim leveling for the studio monitor only (StereoTool will
         # handle real transmitter processing separately, elsewhere). Kept
         # permanently in the chain rather than conditionally linked, so
@@ -480,6 +541,7 @@ class PlaybackEngine:
 
         elements = [
             self.mixer, self.duck_gain, self.master_mixer, convert, resample, capsfilter,
+            self.output_level,
             self.agc_dynamic, self.agc_makeup, self.agc_limiter,
             self.alsasink,
         ]
@@ -540,9 +602,13 @@ class PlaybackEngine:
             self.mic_ptt_volume = None
             self.mic_gain = None
             self._mic_bin = None
+        # Bus signal watch: added once so both the level-metering handler
+        # (unconditional -- output_level is always in the pipeline) and the
+        # mic error handler (only when a mic bin exists) can subscribe.
+        bus = self.main_pipeline.get_bus()
+        bus.add_signal_watch()
+        bus.connect("message::element", self._on_element_message)
         if mic_elements:
-            bus = self.main_pipeline.get_bus()
-            bus.add_signal_watch()
             bus.connect("message::error", self._on_main_bus_error)
         elements += mic_elements
 
@@ -614,13 +680,14 @@ class PlaybackEngine:
         convert.link(resample)
         resample.link(capsfilter)
 
+        capsfilter.link(self.output_level)
         if stereotool_tee:
-            capsfilter.link(stereotool_tee)
+            self.output_level.link(stereotool_tee)
             stereotool_tee.link(self.agc_dynamic)
             stereotool_tee.link(stereotool_queue)
             stereotool_queue.link(self.stereotool_sink)
         else:
-            capsfilter.link(self.agc_dynamic)
+            self.output_level.link(self.agc_dynamic)
 
         self.agc_dynamic.link(self.agc_makeup)
         self.agc_makeup.link(self.agc_limiter)

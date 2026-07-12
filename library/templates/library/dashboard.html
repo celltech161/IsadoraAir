@@ -539,11 +539,96 @@
     transition: color 0.1s, border-color 0.1s;
   }
   .qir-btn:hover { color: var(--accent); border-color: var(--accent); }
+
+  /* Pre-processor VU meter -- sits above the ops button row, right-
+     justified. Shows the SUMMED master output (post-mix, post-mic,
+     post-duck) BEFORE the studio-monitor AGC and BEFORE StereoTool --
+     which is what the operator can actually influence, and what a
+     pre-processor VU is for. Post-processor metering is StereoTool's
+     own web UI at :8085.
+     Bar fill uses the RMS value; the small vertical line is the
+     peak-with-decay (fast rise, ~20 dB/sec fall) held by the level
+     element itself, so this side just renders it. */
+  .vu-meter {
+    display: flex;
+    justify-content: flex-end;
+    align-items: center;
+    gap: 0.6rem;
+    padding: 0.35rem 0.5rem 0.15rem;
+    font-size: 0.65rem;
+    color: var(--text-muted);
+    line-height: 1;
+  }
+  .vu-meter-bars {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    width: 200px;
+  }
+  .vu-meter-row {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+  }
+  .vu-meter-label {
+    width: 0.7rem;
+    text-align: right;
+    font-weight: 600;
+  }
+  .vu-bar {
+    position: relative;
+    flex: 1;
+    height: 8px;
+    /* Full-width color scale; a right-side mask reveals only up to the
+       current RMS level. Green -40..-20, yellow -20..-6, red -6..0. */
+    background: linear-gradient(to right,
+      #22c55e 0%,  #22c55e 50%,
+      #eab308 50%, #eab308 85%,
+      #ef4444 85%, #ef4444 100%);
+    border: 1px solid var(--border-subtle);
+    border-radius: 2px;
+    overflow: hidden;
+  }
+  .vu-bar-mask {
+    position: absolute;
+    top: 0; right: 0; bottom: 0;
+    width: 100%;
+    background: var(--bg-darker);
+    transition: width 60ms linear;
+  }
+  .vu-bar-peak {
+    position: absolute;
+    top: -1px; bottom: -1px;
+    left: 0%;
+    width: 2px;
+    background: var(--text-main);
+    transition: left 80ms linear;
+    z-index: 2;
+    pointer-events: none;
+  }
 </style>
 {% endblock %}
 
 {% block content %}
 <div class="console-{{ mode|default:'full' }}">
+<div class="vu-meter" id="vuMeter" aria-label="Pre-processor output level">
+  <div class="vu-meter-bars">
+    <div class="vu-meter-row">
+      <span class="vu-meter-label">L</span>
+      <div class="vu-bar">
+        <div class="vu-bar-mask" id="vuMask0"></div>
+        <div class="vu-bar-peak" id="vuPeak0"></div>
+      </div>
+    </div>
+    <div class="vu-meter-row">
+      <span class="vu-meter-label">R</span>
+      <div class="vu-bar">
+        <div class="vu-bar-mask" id="vuMask1"></div>
+        <div class="vu-bar-peak" id="vuPeak1"></div>
+      </div>
+    </div>
+  </div>
+</div>
 <div class="playnow-bar">
   <button class="playnow-btn ops-btn" id="manualModeBtn" onclick="toggleManualMode()"
           title="Manual holds the next track until you flip back to Auto -- for talking over a song's outro. Auto-switches while any mic is live.">Auto</button>
@@ -1658,6 +1743,54 @@ setInterval(poll, 1000);
 
 // Update position/countdown smoothly between polls
 setInterval(updatePositionIndicators, 100);
+
+// --- Pre-processor VU meter --- fast-cadence poll independent of the
+// main state poll, since a meter update at 1 Hz would be unusable.
+// Engine writes /run/isadoraair/levels.json every 50ms; we poll every
+// 100ms and let CSS transitions smooth the interpolation.
+function vuDbToPct(db) {
+  // -40 dB -> 0%, 0 dB -> 100%. Anything below -40 clamps to 0.
+  if (db == null || !isFinite(db)) return 0;
+  const pct = ((db + 40) / 40) * 100;
+  return Math.max(0, Math.min(100, pct));
+}
+
+function vuRenderSilence() {
+  for (let ch = 0; ch < 2; ch++) {
+    const mask = document.getElementById(`vuMask${ch}`);
+    const peak = document.getElementById(`vuPeak${ch}`);
+    if (mask) mask.style.width = '100%';
+    if (peak) peak.style.left = '0%';
+  }
+}
+
+async function pollLevels() {
+  try {
+    const resp = await fetch('/api/engine/levels/');
+    if (!resp.ok) { vuRenderSilence(); return; }
+    const data = await resp.json();
+    const now = Date.now() / 1000;
+    const stale = !data.ts || (now - data.ts) > 0.75;
+    if (stale) { vuRenderSilence(); return; }
+    const rms = data.rms || [];
+    const decay = data.decay || [];
+    for (let ch = 0; ch < 2; ch++) {
+      const rmsDb = rms[ch];
+      const decayDb = decay[ch];
+      const fillPct = vuDbToPct(rmsDb);
+      const peakPct = vuDbToPct(decayDb);
+      const mask = document.getElementById(`vuMask${ch}`);
+      const peakEl = document.getElementById(`vuPeak${ch}`);
+      // Mask covers the RIGHT side of the bar. Fill 30% => mask 70%.
+      if (mask) mask.style.width = `${100 - fillPct}%`;
+      if (peakEl) peakEl.style.left = `${peakPct}%`;
+    }
+  } catch (e) {
+    vuRenderSilence();
+  }
+}
+setInterval(pollLevels, 100);
+pollLevels();
 
 // Initial load
 poll();

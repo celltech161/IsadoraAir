@@ -53,6 +53,7 @@ urlpatterns = [
     path('api/waveform/<int:track_id>/', views.api_waveform, name='api-waveform'),
     path('api/albumart/<int:track_id>/', views.api_album_art, name='api-album-art'),
     path('api/engine/status/', views.api_engine_status, name='api-engine-status'),
+    path('api/engine/levels/', views.api_engine_levels, name='api-engine-levels'),
     path('api/engine/queue/set-next/', views.api_engine_set_next, name='api-engine-set-next'),
     path('api/engine/queue/insert/', views.api_engine_insert_track, name='api-engine-insert-track'),
     path('api/engine/seek/', views.api_engine_seek, name='api-engine-seek'),

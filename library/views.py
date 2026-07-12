@@ -1503,6 +1503,21 @@ def api_engine_status(request):
         return JsonResponse({"transport": "ERROR", "decks": {"A": None, "B": None}, "queue": []})
 
 
+@require_http_methods(["GET"])
+def api_engine_levels(request):
+    """Serves the pre-processor VU meter payload written by the engine's
+    output_level bus handler (see engine.py::LEVELS_PATH). Polled from
+    the dashboard at ~100ms cadence; the engine emits every 50ms, so
+    the client will typically see fresh values on every poll. Returns
+    an empty {} if the file doesn't exist yet or is currently mid-write
+    (JSON parse error caught -- next poll retries)."""
+    levels_path = Path("/run/isadoraair/levels.json")
+    try:
+        return JsonResponse(json.loads(levels_path.read_text(encoding="utf-8")))
+    except (FileNotFoundError, json.JSONDecodeError, ValueError):
+        return JsonResponse({})
+
+
 @ensure_csrf_cookie
 def remote_dj_page(request):
     """Remote-DJ-facing console: renders dashboard.html in `remote_dj`
