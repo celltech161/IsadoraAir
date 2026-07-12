@@ -39,6 +39,15 @@ class AudioPipeline(models.Model):
                    "unity (no attenuation). Default -6 dB matches typical "
                    "broadcast pre-processor practice.",
     )
+    vu_meter_min_db = models.FloatField(
+        default=-40.0,
+        help_text="Bottom of the dashboard VU meter scale, in dBFS. -40 "
+                   "puts the color transitions (yellow at -20 dBFS = 0 VU, "
+                   "red at -6 dBFS) at 50% and 85% of the bar width. Lower "
+                   "values (e.g. -60) stretch the low end for finer detail "
+                   "in quiet program. Client-side display only -- takes "
+                   "effect on next dashboard reload, no engine restart.",
+    )
 
     class Meta:
         verbose_name = "Audio Pipeline"

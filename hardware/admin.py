@@ -70,7 +70,7 @@ class AudioPipelineForm(forms.ModelForm):
 
     class Meta:
         model = AudioPipeline
-        fields = ["sample_rate", "program_gain_db"]
+        fields = ["sample_rate", "program_gain_db", "vu_meter_min_db"]
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -85,11 +85,12 @@ class AudioPipelineAdmin(admin.ModelAdmin):
     form = AudioPipelineForm
     fieldsets = (
         ("Pipeline", {
-            "fields": ("sample_rate", "program_gain_db"),
+            "fields": ("sample_rate", "program_gain_db", "vu_meter_min_db"),
             "description": (
-                "Baked into the pipeline at build time -- changing anything in "
-                "this group triggers an engine restart on save (brief on-air "
-                "silence while the pipeline rebuilds)."
+                "sample_rate and program_gain_db are baked into the pipeline at "
+                "build time -- changing either triggers an engine restart on "
+                "save (brief on-air silence). vu_meter_min_db is client-side "
+                "only and takes effect on next dashboard reload; no restart."
             ),
         }),
         ("Ducking (mic on-air)", {

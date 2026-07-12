@@ -580,15 +580,54 @@
     flex: 1;
     height: 8px;
     /* Full-width color scale; a right-side mask reveals only up to the
-       current RMS level. Green -40..-20, yellow -20..-6, red -6..0. */
+       current RMS level. Green from left up to -20 dBFS (yellow start),
+       yellow up to -6 dBFS (red start), red to 0 dBFS. Transition
+       positions are set as CSS custom properties by the meter's JS
+       init based on the admin-configurable min_db, so a wider scale
+       doesn't drag the color transitions off their real dB values. */
     background: linear-gradient(to right,
-      #22c55e 0%,  #22c55e 50%,
-      #eab308 50%, #eab308 85%,
-      #ef4444 85%, #ef4444 100%);
+      #22c55e 0%,
+      #22c55e var(--vu-yellow-pos, 50%),
+      #eab308 var(--vu-yellow-pos, 50%),
+      #eab308 var(--vu-red-pos, 85%),
+      #ef4444 var(--vu-red-pos, 85%),
+      #ef4444 100%);
     border: 1px solid var(--border-subtle);
     border-radius: 2px;
     overflow: hidden;
   }
+  /* dB scales above (VU) and below (dBFS) the two bar rows. Same width
+     alignment as the bars, using an invisible label spacer so ticks
+     line up with the bar's own left/right edges. */
+  .vu-scale-row {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    height: 0.7rem;
+  }
+  .vu-scale {
+    position: relative;
+    flex: 1;
+    height: 100%;
+  }
+  .vu-scale span {
+    position: absolute;
+    top: 0;
+    transform: translateX(-50%);
+    font-size: 0.55rem;
+    line-height: 1;
+    color: var(--text-muted);
+    white-space: nowrap;
+  }
+  .vu-scale span.vu-tick-emph {
+    color: var(--text-main);
+    font-weight: 600;
+  }
+  /* First/last labels are pinned to the bar's edges rather than
+     centered on their tick position, so they don't spill past the
+     bar edges and don't get clipped off. */
+  .vu-scale span.vu-tick-first { transform: translateX(0); }
+  .vu-scale span.vu-tick-last  { transform: translateX(-100%); }
   .vu-bar-mask {
     position: absolute;
     top: 0; right: 0; bottom: 0;
@@ -613,6 +652,10 @@
 <div class="console-{{ mode|default:'full' }}">
 <div class="vu-meter" id="vuMeter" aria-label="Pre-processor output level">
   <div class="vu-meter-bars">
+    <div class="vu-scale-row">
+      <span class="vu-meter-label" aria-hidden="true"></span>
+      <div class="vu-scale" id="vuScaleTop" aria-label="VU scale"></div>
+    </div>
     <div class="vu-meter-row">
       <span class="vu-meter-label">L</span>
       <div class="vu-bar">
@@ -626,6 +669,10 @@
         <div class="vu-bar-mask" id="vuMask1"></div>
         <div class="vu-bar-peak" id="vuPeak1"></div>
       </div>
+    </div>
+    <div class="vu-scale-row">
+      <span class="vu-meter-label" aria-hidden="true"></span>
+      <div class="vu-scale" id="vuScaleBottom" aria-label="dBFS scale"></div>
     </div>
   </div>
 </div>
@@ -1748,12 +1795,78 @@ setInterval(updatePositionIndicators, 100);
 // main state poll, since a meter update at 1 Hz would be unusable.
 // Engine writes /run/isadoraair/levels.json every 50ms; we poll every
 // 100ms and let CSS transitions smooth the interpolation.
+// VU_MIN_DB is admin-configurable (AudioPipeline.vu_meter_min_db).
+const VU_MIN_DB = {{ vu_min_db|default:-40 }};
+// Reference for the VU scale above the bars. Standard SMPTE/US
+// broadcast alignment: 0 VU = -20 dBFS. This is baked in rather than
+// admin-configurable because it's a labelling convention, not a signal
+// parameter -- an operator trained on VU expects 0 VU where it is.
+const VU_ZERO_DBFS = -20;
+
 function vuDbToPct(db) {
-  // -40 dB -> 0%, 0 dB -> 100%. Anything below -40 clamps to 0.
+  // VU_MIN_DB -> 0%, 0 dBFS -> 100%. Clamped both ends.
   if (db == null || !isFinite(db)) return 0;
-  const pct = ((db + 40) / 40) * 100;
+  const range = 0 - VU_MIN_DB;
+  const pct = ((db - VU_MIN_DB) / range) * 100;
   return Math.max(0, Math.min(100, pct));
 }
+
+// Render the two scale rows once and set the gradient stop CSS custom
+// properties. Called once at page load; if VU_MIN_DB ever changes at
+// runtime this could be re-invoked, but today it's admin-set + reload.
+function vuInitScales() {
+  // Color-transition positions on the current scale.
+  document.documentElement.style.setProperty("--vu-yellow-pos", `${vuDbToPct(-20)}%`);
+  document.documentElement.style.setProperty("--vu-red-pos",    `${vuDbToPct(-6)}%`);
+
+  const top = document.getElementById("vuScaleTop");
+  const bot = document.getElementById("vuScaleBottom");
+  if (!top || !bot) return;
+
+  // VU labels: -20, -10, 0 (bold), +3. dBFS = VU + VU_ZERO_DBFS.
+  // Only render a label if its corresponding dBFS lands within the
+  // current bar range.
+  const vuTicks = [
+    { vu: -20, emph: false },
+    { vu: -10, emph: false },
+    { vu:   0, emph: true  },
+    { vu:  +3, emph: false },
+  ];
+  const vuHtml = vuTicks
+    .map(t => ({ ...t, dbfs: t.vu + VU_ZERO_DBFS }))
+    .filter(t => t.dbfs >= VU_MIN_DB && t.dbfs <= 0)
+    .map(t => {
+      const label = t.vu === 0 ? "0" : (t.vu > 0 ? `+${t.vu}` : `${t.vu}`);
+      const cls = ["vu-tick"];
+      if (t.emph) cls.push("vu-tick-emph");
+      return `<span class="${cls.join(" ")}" style="left:${vuDbToPct(t.dbfs)}%">${label}</span>`;
+    })
+    .join("");
+  top.innerHTML = vuHtml;
+
+  // dBFS labels: left edge (VU_MIN_DB), -20 (0 VU reference), -6
+  // (color transition to red), 0 (bold, clip). First and last are
+  // pinned to the bar's edge rather than centered on their tick.
+  const dbfsTicks = [
+    { db: VU_MIN_DB, emph: false, edge: "first" },
+    { db: -20,       emph: false, edge: null    },
+    { db:  -6,       emph: false, edge: null    },
+    { db:   0,       emph: true,  edge: "last"  },
+  ];
+  const dbfsHtml = dbfsTicks
+    .filter(t => t.db >= VU_MIN_DB && t.db <= 0)
+    .map(t => {
+      const label = t.db === 0 ? "0" : `${Math.round(t.db)}`;
+      const cls = ["vu-tick"];
+      if (t.emph) cls.push("vu-tick-emph");
+      if (t.edge === "first") cls.push("vu-tick-first");
+      if (t.edge === "last")  cls.push("vu-tick-last");
+      return `<span class="${cls.join(" ")}" style="left:${vuDbToPct(t.db)}%">${label}</span>`;
+    })
+    .join("");
+  bot.innerHTML = dbfsHtml;
+}
+vuInitScales();
 
 function vuRenderSilence() {
   for (let ch = 0; ch < 2; ch++) {

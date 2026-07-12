@@ -25,11 +25,13 @@ from .services.log_builder import _build_from_playlist, build_hour_log, preview_
 @ensure_csrf_cookie
 def dashboard_page(request):
     from library.models import AnalysisConfig
+    from hardware.models import AudioPipeline
 
     playlists = Playlist.objects.all().order_by("name")
     return render(request, "library/dashboard.html", {
         "playlists": playlists,
         "analysis_config": AnalysisConfig.load(),
+        "vu_min_db": AudioPipeline.load().vu_meter_min_db,
         "mode": "full",
     })
 
@@ -1531,12 +1533,14 @@ def remote_dj_page(request):
     anyone not in the group gets a 'not authorized' minimal page
     instead of the console."""
     from library.models import AnalysisConfig, Playlist
+    from hardware.models import AudioPipeline
     authorized = request.user.groups.filter(name="remote_dj").exists()
     if not authorized:
         return render(request, "library/remote_dj_unauthorized.html")
     return render(request, "library/dashboard.html", {
         "playlists": Playlist.objects.all().order_by("name"),
         "analysis_config": AnalysisConfig.load(),
+        "vu_min_db": AudioPipeline.load().vu_meter_min_db,
         "mode": "remote_dj",
     })
 
