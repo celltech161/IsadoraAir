@@ -207,6 +207,85 @@ def mec_ct(dt_utc, offset_minutes: int) -> bytes:
     ])
 
 
+# --- RT+ (RadioText Plus) --------------------------------------------
+#
+# RT+ tags identify substrings of the current RT ("here's the artist,
+# here's the title") so receivers can display them in dedicated fields
+# instead of the scrolling text. Two MECs cooperate:
+#
+# - mec_oda_config_rt_plus (MEC 0x50) declares Application ID 0x4BD7,
+#   the RT+ AID assigned by the RDS Forum, and pins it to RDS group
+#   11A -- the standard slot for RT+. Encoder needs to see this before
+#   it can accept RT+ tag messages. Sent alongside every RT+ tag frame
+#   below so a StereoTool session that reset itself (restart, config
+#   reload) is guaranteed to still be configured when the tags arrive.
+#
+# - mec_rt_plus (MEC 0x4A) carries the actual tag pair. The 7-byte MED
+#   uses a byte-per-field layout that mirrors how most UECP encoders
+#   accept RT+, and matches the field set of the RT+ 11A RDS group
+#   itself: 2 status bits + two (content-type, start, length) triples.
+#
+# An earlier note in RBDSConfig claimed UECP RT+ was out of scope
+# because "it requires the ODA channel"; RT+ IS transported via an ODA,
+# but the ODA config MEC + tag MEC pattern below is the standard
+# implementation -- confirmed working against StereoTool from the
+# prior RDS-Magic-4 setup on this station.
+
+RT_PLUS_AID = 0x4BD7
+RT_PLUS_GROUP_11A = 0x0B   # RDS group type code for 11A (0b01011)
+
+
+def mec_oda_config_rt_plus(dsn: int = 0x00, psn: int = 0x00) -> bytes:
+    """MEC 0x50 -- ODA-Configuration for RT+.
+
+    Registers AID 0x4BD7 (RT+) on RDS group 11A. Message-bits fixed
+    at 0 (unused for RT+). Format:
+
+      MEC DSN PSN MEL MED(5):
+        AID_MSB, AID_LSB, group_type_code, msg_bits_MSB, msg_bits_LSB
+    """
+    med = struct.pack(">H", RT_PLUS_AID) + bytes([RT_PLUS_GROUP_11A, 0x00, 0x00])
+    return bytes([0x50, dsn, psn, len(med)]) + med
+
+
+def mec_rt_plus(item_toggle: bool, item_running: bool,
+                content_type_1: int, start_1: int, length_1: int,
+                content_type_2: int, start_2: int, length_2: int,
+                dsn: int = 0x00, psn: int = 0x00) -> bytes:
+    """MEC 0x4A -- RT+ tag pair transmission.
+
+    Two content-type tags per message. Each tag identifies a substring
+    of the current RT by:
+      - content_type: 6-bit code (1=ITEM.TITLE, 4=ITEM.ARTIST per
+        NRSC-4-B Annex F; other codes exist but this project uses
+        title/artist)
+      - start: 6-bit offset within RT (0-63)
+      - length: 6-bit length for tag 1, 5-bit for tag 2 (per RDS
+        11A group field widths, which the encoder mirrors on-air)
+
+    item_toggle mirrors the RT A/B flag -- flip whenever the tagged
+    content changes so receivers know to refresh.
+    item_running is True whenever the tags describe a real playing
+    item (False for station promos and messages that populate RT
+    without meaningful artist/title tags).
+
+    Byte-per-field layout (7 bytes MED):
+      [flags, ct1, s1, l1, ct2, s2, l2]
+    Flags: bit 4 = item_running, bit 3 = item_toggle, others 0.
+    """
+    flags = (0x10 if item_running else 0x00) | (0x08 if item_toggle else 0x00)
+    med = bytes([
+        flags,
+        content_type_1 & 0x3F,
+        start_1 & 0x3F,
+        length_1 & 0x3F,
+        content_type_2 & 0x3F,
+        start_2 & 0x3F,
+        length_2 & 0x1F,
+    ])
+    return bytes([0x4A, dsn, psn, len(med)]) + med
+
+
 def mec_af(frequencies_mhz: list, dsn: int = 0x00, psn: int = 0x00, start_location: int = 0x0000) -> bytes:
     """MEC 0x13 -- Alternative Frequencies. UECP envelope (MEC DSN PSN
     MEL, 2-byte start location, then AF data, then a 0x00 terminator)

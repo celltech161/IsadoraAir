@@ -236,7 +236,7 @@ class RBDSManager:
     def _send(self, config, ps, rt, artist, title):
         try:
             if config.protocol == "uecp":
-                payload = self._build_uecp_payload(config, ps, rt)
+                payload = self._build_uecp_payload(config, ps, rt, artist, title)
             else:
                 payload = self._build_ascii_payload(config, ps, rt, artist, title)
             self._transmit(config, payload)
@@ -247,7 +247,7 @@ class RBDSManager:
         self._mark_up()
         self._last_error = None
 
-    def _build_uecp_payload(self, config, ps, rt):
+    def _build_uecp_payload(self, config, ps, rt, artist=None, title=None):
         self._sqc = (self._sqc % 255) + 1
         msg = b""
         if config.pi_code:
@@ -261,6 +261,28 @@ class RBDSManager:
         msg += uecp.mec_ms(music=config.ms)
         msg += uecp.mec_pty(config.pty)
         msg += uecp.mec_rt(rt, ab_flag=self._rt_ab_flag)
+        # RT+ tags (artist + title) via UECP: ODA config MEC pins the
+        # RT+ AID (0x4BD7) to group 11A, then the RT+ tag MEC carries
+        # the actual (content-type, start, length) pair. Sent alongside
+        # every RT+ payload so a StereoTool session that reset itself
+        # is guaranteed to re-learn the ODA assignment. The tag offsets
+        # match the ASCII path exactly (rt is built as
+        # f"{artist}{RT_PLUS_SEPARATOR}{title}" by _resolve_rt_content
+        # when RT+ is enabled AND artist/title are both non-None), so
+        # a receiver decoding this frame sees artist_start = 0,
+        # title_start = len(artist) + len(RT_PLUS_SEPARATOR).
+        if config.use_rt_plus and artist and title:
+            msg += uecp.mec_oda_config_rt_plus()
+            artist_start = 0
+            title_start = len(artist) + len(self.RT_PLUS_SEPARATOR)
+            msg += uecp.mec_rt_plus(
+                item_toggle=self._rt_ab_flag,
+                item_running=True,
+                content_type_1=ascii_protocol.RT_PLUS_ARTIST,
+                start_1=artist_start, length_1=len(artist),
+                content_type_2=ascii_protocol.RT_PLUS_TITLE,
+                start_2=title_start, length_2=len(title),
+            )
         if config.af_frequencies_mhz:
             freqs = [float(f.strip()) for f in config.af_frequencies_mhz.split(",") if f.strip()]
             if freqs:
