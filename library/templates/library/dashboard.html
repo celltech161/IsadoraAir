@@ -628,6 +628,33 @@
      bar edges and don't get clipped off. */
   .vu-scale span.vu-tick-first { transform: translateX(0); }
   .vu-scale span.vu-tick-last  { transform: translateX(-100%); }
+  /* "VU" and "dBFS" -- axis-name labels, same size as numeric ticks
+     but the top one lives in the scale row's label spacer and the
+     bottom one sits inline among the dBFS numeric ticks. Both share
+     the muted grey color of the ticks so nothing shouts. */
+  .vu-scale-row .vu-meter-label {
+    font-weight: 600;
+    color: var(--text-muted);
+  }
+  /* Full meter title underneath the dBFS scale row. Even smaller than
+     the numeric ticks per the label request; kept single-line, right-
+     aligned to sit under the bars (the meter is already right-justified
+     within its container). */
+  .vu-meter-title-row {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    height: 0.6rem;
+  }
+  .vu-meter-title {
+    flex: 1;
+    font-size: 0.5rem;
+    color: var(--text-muted);
+    text-align: center;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    line-height: 1;
+  }
   .vu-bar-mask {
     position: absolute;
     top: 0; right: 0; bottom: 0;
@@ -653,7 +680,7 @@
 <div class="vu-meter" id="vuMeter" aria-label="Pre-processor output level">
   <div class="vu-meter-bars">
     <div class="vu-scale-row">
-      <span class="vu-meter-label" aria-hidden="true"></span>
+      <span class="vu-meter-label">VU</span>
       <div class="vu-scale" id="vuScaleTop" aria-label="VU scale"></div>
     </div>
     <div class="vu-meter-row">
@@ -673,6 +700,10 @@
     <div class="vu-scale-row">
       <span class="vu-meter-label" aria-hidden="true"></span>
       <div class="vu-scale" id="vuScaleBottom" aria-label="dBFS scale"></div>
+    </div>
+    <div class="vu-meter-title-row">
+      <span class="vu-meter-label" aria-hidden="true"></span>
+      <div class="vu-meter-title">Program Level</div>
     </div>
   </div>
 </div>
@@ -1832,16 +1863,17 @@ function vuInitScales() {
     { vu:   0, emph: true  },
     { vu:  +3, emph: false },
   ];
-  const vuHtml = vuTicks
+  const visibleVu = vuTicks
     .map(t => ({ ...t, dbfs: t.vu + VU_ZERO_DBFS }))
-    .filter(t => t.dbfs >= VU_MIN_DB && t.dbfs <= 0)
-    .map(t => {
-      const label = t.vu === 0 ? "0" : (t.vu > 0 ? `+${t.vu}` : `${t.vu}`);
-      const cls = ["vu-tick"];
-      if (t.emph) cls.push("vu-tick-emph");
-      return `<span class="${cls.join(" ")}" style="left:${vuDbToPct(t.dbfs)}%">${label}</span>`;
-    })
-    .join("");
+    .filter(t => t.dbfs >= VU_MIN_DB && t.dbfs <= 0);
+  const vuHtml = visibleVu.map((t, i) => {
+    const label = t.vu === 0 ? "0" : (t.vu > 0 ? `+${t.vu}` : `${t.vu}`);
+    const cls = ["vu-tick"];
+    if (t.emph) cls.push("vu-tick-emph");
+    if (i === 0) cls.push("vu-tick-first");
+    if (i === visibleVu.length - 1) cls.push("vu-tick-last");
+    return `<span class="${cls.join(" ")}" style="left:${vuDbToPct(t.dbfs)}%">${label}</span>`;
+  }).join("");
   top.innerHTML = vuHtml;
 
   // dBFS labels: left edge (VU_MIN_DB), -20 (0 VU reference), -6
@@ -1864,7 +1896,13 @@ function vuInitScales() {
       return `<span class="${cls.join(" ")}" style="left:${vuDbToPct(t.db)}%">${label}</span>`;
     })
     .join("");
-  bot.innerHTML = dbfsHtml;
+  // "dBFS" axis-name label, centered between the leftmost tick
+  // (VU_MIN_DB @ 0%) and the -20 dBFS tick, per design. Rendered as
+  // a normal tick (translateX(-50%) default), so it's centered on
+  // its own position value.
+  const dbfsAxisPos = (vuDbToPct(VU_MIN_DB) + vuDbToPct(-20)) / 2;
+  bot.innerHTML = dbfsHtml +
+    `<span class="vu-tick" style="left:${dbfsAxisPos}%">dBFS</span>`;
 }
 vuInitScales();
 
