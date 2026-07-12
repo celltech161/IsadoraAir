@@ -2284,12 +2284,23 @@ class PlaybackEngine:
         occupied_ids = {d.log_item.id for d in self.decks.values() if d}
 
         if occupied_ids:
-            # Cursor = "position right after the last item currently on a
-            # deck" — the normal case, where decks reflect what's just
-            # about to play out.
+            # Cursor = "position right after the last item that has EITHER
+            # already aired (played_at set) OR is currently on a deck."
+            # The played_at half is load-bearing for short spots: e.g. a
+            # 4-second WxTemp Current Temp can finish and free its deck
+            # BEFORE the outgoing longer track hits its own crossfade
+            # trigger, at which point occupied_ids collapses back to just
+            # the outgoing track. Considering only occupied_ids at that
+            # moment walks the cursor BACKWARDS to right after the
+            # outgoing track (i.e., to the just-finished spot's own
+            # position), and the very next _poll_position tick re-fires
+            # the crossfade trigger with the same target -- an audible
+            # back-to-back double play of the same short spot. Anchoring
+            # on played_at pins the cursor forward as soon as a spot has
+            # aired, whether or not it's still on a deck.
             new_cursor = 0
             for i, item in enumerate(fresh_items):
-                if item.id in occupied_ids:
+                if item.id in occupied_ids or item.played_at is not None:
                     new_cursor = i + 1
         else:
             # Nothing on either deck (e.g. manual-mode hold, or a brief
