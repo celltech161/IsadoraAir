@@ -31,9 +31,76 @@ def _mixer_controls_for(obj):
     return list_mixer_controls(card)
 
 
+class AudioPipelineForm(forms.ModelForm):
+    """Combined form: edits AudioPipeline's own fields plus DuckingConfig
+    and RemoteDJAudioInput on one page. Those two are tiny singletons
+    (1-2 fields each) whose separate admin listings were more UI noise
+    than clarity -- consolidating them here means "all pipeline-wide
+    audio config in one place". The extra fields load from and save
+    back to their own singleton rows.
+
+    Restart discipline (see save_model): only sample_rate and
+    program_gain_db actually require an engine restart -- both are
+    baked into pipeline topology at build time. Ducking is re-read by
+    the engine on every PTT toggle (per DuckingConfig's docstring);
+    Remote DJ gain is re-read at session start (per
+    RemoteDJAudioInput's docstring). Editing only those on this page
+    should not disrupt on-air audio."""
+
+    ducking_enabled = forms.BooleanField(
+        required=False,
+        label="Ducking enabled",
+        help_text="Off = program audio is unaffected by mic PTT. On = program "
+                  "audio is attenuated to the level below whenever ANY mic (studio "
+                  "or remote) is live.",
+    )
+    duck_level_db = forms.FloatField(
+        label="Duck level (dB)",
+        help_text="How much to attenuate deck/program audio while a mic is live, "
+                  "in dB. Negative = quieter (-12 = roughly quarter volume). Ramped "
+                  "over ~500ms on PTT toggle. Takes effect on the NEXT toggle.",
+    )
+    remote_dj_gain_db = forms.FloatField(
+        label="Remote DJ mic gain (dB)",
+        help_text="Software gain applied to the incoming remote-DJ mic before it "
+                  "joins the on-air mix. Default +6 dB compensates for browser "
+                  "WebRTC's typical lower output level. Takes effect on the NEXT "
+                  "Remote DJ connect.",
+    )
+
+    class Meta:
+        model = AudioPipeline
+        fields = ["sample_rate", "program_gain_db"]
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        ducking = DuckingConfig.load()
+        self.fields["ducking_enabled"].initial = ducking.enabled
+        self.fields["duck_level_db"].initial = ducking.duck_level_db
+        self.fields["remote_dj_gain_db"].initial = RemoteDJAudioInput.load().gain_db
+
+
 @admin.register(AudioPipeline)
 class AudioPipelineAdmin(admin.ModelAdmin):
-    fields = ["sample_rate", "program_gain_db"]
+    form = AudioPipelineForm
+    fieldsets = (
+        ("Pipeline", {
+            "fields": ("sample_rate", "program_gain_db"),
+            "description": (
+                "Baked into the pipeline at build time -- changing anything in "
+                "this group triggers an engine restart on save (brief on-air "
+                "silence while the pipeline rebuilds)."
+            ),
+        }),
+        ("Ducking (mic on-air)", {
+            "fields": ("ducking_enabled", "duck_level_db"),
+            "description": "Read fresh by the engine on each PTT toggle -- no restart needed.",
+        }),
+        ("Remote DJ mic input", {
+            "fields": ("remote_dj_gain_db",),
+            "description": "Read at session start -- takes effect on the next Remote DJ connect. No restart needed.",
+        }),
+    )
 
     class Media:
         js = ["hardware/js/audio_pipeline_confirm.js"]
@@ -52,12 +119,21 @@ class AudioPipelineAdmin(admin.ModelAdmin):
 
     def save_model(self, request, obj, form, change):
         super().save_model(request, obj, form, change)
-        # Sample rate is baked into the pipeline's topology at build time
-        # (the final capsfilter + silence-priming caps in engine.py) —
-        # unlike AGC, there's no live-property path for this, it needs a
-        # full engine restart. Same fire-and-forget mechanism as the
-        # dashboard's "Restart Engine" button (api_engine_restart).
-        subprocess.Popen(["sudo", "systemctl", "restart", "isadoraair-engine"])
+        # Fold the extra fields onto their own singletons.
+        ducking = DuckingConfig.load()
+        ducking.enabled = form.cleaned_data["ducking_enabled"]
+        ducking.duck_level_db = form.cleaned_data["duck_level_db"]
+        ducking.save()
+        rdj = RemoteDJAudioInput.load()
+        rdj.gain_db = form.cleaned_data["remote_dj_gain_db"]
+        rdj.save()
+
+        # Only restart the engine if a field that actually requires it
+        # changed -- Ducking is read live per PTT, Remote DJ gain per
+        # session start, neither needs a rebuild.
+        restart_fields = {"sample_rate", "program_gain_db"}
+        if restart_fields & set(form.changed_data):
+            subprocess.Popen(["sudo", "systemctl", "restart", "isadoraair-engine"])
 
 
 class _DeviceFieldAdmin(admin.ModelAdmin):
@@ -212,35 +288,10 @@ class AudioInputAdmin(_DeviceFieldAdmin):
             obj.save(update_fields=["mixer_control_values"])
 
 
-@admin.register(DuckingConfig)
-class DuckingConfigAdmin(admin.ModelAdmin):
-    fields = ["enabled", "duck_level_db"]
-
-    def has_add_permission(self, request):
-        return not DuckingConfig.objects.exists()
-
-    def has_delete_permission(self, request, obj=None):
-        return False
-
-    def changelist_view(self, request, extra_context=None):
-        obj = DuckingConfig.load()
-        return HttpResponseRedirect(
-            reverse("admin:hardware_duckingconfig_change", args=[obj.pk])
-        )
-
-
-@admin.register(RemoteDJAudioInput)
-class RemoteDJAudioInputAdmin(admin.ModelAdmin):
-    fields = ["gain_db"]
-
-    def has_add_permission(self, request):
-        return not RemoteDJAudioInput.objects.exists()
-
-    def has_delete_permission(self, request, obj=None):
-        return False
-
-    def changelist_view(self, request, extra_context=None):
-        obj = RemoteDJAudioInput.load()
-        return HttpResponseRedirect(
-            reverse("admin:hardware_remotedjaudioinput_change", args=[obj.pk])
-        )
+# DuckingConfig and RemoteDJAudioInput used to be their own admin pages;
+# they're now edited as folded-in sections on AudioPipeline's page (see
+# AudioPipelineForm above), so their standalone registrations are gone.
+# The models themselves stay separate -- the engine reads them at
+# different lifecycles (per-PTT-toggle for ducking, per-session-start
+# for remote DJ gain), which is worth keeping distinct at the code
+# level even if the admin UI presents them together.
