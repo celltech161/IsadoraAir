@@ -238,10 +238,16 @@ class RBDSMessage(models.Model):
     )
     rt_plus_delimiter = models.CharField(
         max_length=4, blank=True,
-        help_text="If set (e.g. '|'), the text is split on its first occurrence into "
-                   "artist|title for RT+ tagging. Leave blank to send the whole text as "
-                   "plain RT with no RT+ tags -- appropriate for text that isn't "
-                   "artist/title-shaped (e.g. a weather string).",
+        help_text="Controls how this message's RT+ tags are shaped. If set "
+                   "(e.g. '|'), the text is split on its first occurrence into "
+                   "artist and title, and two RT+ tags (item.artist + item.title) are "
+                   "emitted at the corresponding character offsets -- same shape as a "
+                   "now-playing song. Leave blank to emit a single tag covering the "
+                   "whole text -- appropriate for weather, promos, station IDs, and "
+                   "any message that isn't artist/title-shaped. That single-tag path "
+                   "is what prevents receivers from applying the previous song's "
+                   "artist/title offsets on top of this message's text (which they "
+                   "will happily do if no tags are sent at all).",
     )
     enabled = models.BooleanField(default=True)
     sort_order = models.PositiveSmallIntegerField(default=0)
