@@ -168,6 +168,168 @@ def mec_rt(text: str, ab_flag: bool, dsn: int = 0x00, psn: int = 0x00) -> bytes:
     return bytes([0x0A, dsn, psn, mel, med0]) + text.encode("latin-1", errors="replace")
 
 
+def mec_rt_plus_oda_reg() -> bytes:
+    """MEC 0x24 subtype 0x06 -- ODA registration for RT+.
+
+    Declares the Open Data Application at RDS group 11A carrying
+    Application ID 0x4BD7 (the RDS Forum's assigned AID for RadioText
+    Plus). Reverse-engineered from RDS Magic 4's proven-working UECP
+    capture on 2026-07-12 -- every subtype 0x16 tag frame it emitted
+    is preceded by this fixed 6-byte MEC.
+
+    Wire format (after the 0x24 MEC byte):
+      0x06 (subtype)  0x16 (group code = 22 = 11*2 for A-version)
+      0x00 0x00 (reserved/scope bytes -- both were always zero across
+                 53 instances in the capture)  0x4B 0xD7 (RT+ AID)
+
+    No parameters; every RT+ transmitter sends exactly the same bytes.
+    """
+    return bytes([0x24, 0x06, 0x16, 0x00, 0x00, 0x4B, 0xD7])
+
+
+def mec_rt_plus_tags(artist_len: int, title_len: int) -> bytes:
+    """MEC 0x24 subtype 0x16 -- RT+ tag data (artist + title triples).
+
+    Reverse-engineered from RDS Magic 4's 2026-07-13 capture across 22
+    distinct songs and verified byte-for-byte by the
+    scratchpad/verify_layout.py harness. Assumes the RT text has the
+    project-standard shape "artist - title" (three-char " - "
+    separator), and that RDS Magic 4's convention of hardcoding
+    CT1=4 (ITEM.ARTIST at RT position 0) and CT2=1 (ITEM.TITLE at
+    RT position artist_len+3) is what StereoTool expects too --
+    those two content-type values are the entire reason for RT+
+    existing, so the hardcoding is safe.
+
+    Wire format (after the 0x24 MEC byte), 6 bytes total:
+      Byte 0: 0x16                        -- subtype
+      Byte 1: 0x08                        -- fixed "song entry" marker
+      Byte 2: bits[7:5] = 0b001           -- fragment of CT1 encoding
+              bits[4:0] = title_start>>1  -- upper 5 bits of start2
+      Byte 3: bit[7]    = title_start & 1 -- LSB of start2
+              bits[6:1] = title_len - 1   -- len2 (6-bit)
+              bit[0]    = 0
+      Byte 4: 0x20                        -- fixed CT2=title marker
+      Byte 5: bits[7:5] = 0
+              bits[4:0] = artist_len - 1  -- len1 (5-bit)
+
+    Field-width note: len1 is 5 bits so artist_len must be <= 32;
+    len2 is 6 bits so title_len must be <= 64 (which the RT text
+    limit already enforces). start2 is 6 bits, so title_start
+    (== artist_len + 3) must be <= 63. Callers should guard for
+    artist_len > 32 and skip emitting tags rather than truncate --
+    RDS Magic 4's capture had one artist_len=45 outlier that emitted
+    a DIFFERENT payload shape (probably a fallback for long artists),
+    but we don't have enough capture data to reverse that shape;
+    skipping is safer than shipping bytes we don't understand.
+    """
+    if artist_len < 1 or title_len < 1:
+        raise ValueError("mec_rt_plus_tags requires positive lengths")
+    if artist_len > 32:
+        raise ValueError(
+            f"mec_rt_plus_tags: artist_len {artist_len} > 32 (RDS Magic 4 "
+            f"used a different, un-decoded payload shape past 32; caller "
+            f"should skip RT+ for this track instead of emitting garbage)"
+        )
+    title_start = artist_len + 3
+    if title_start > 63:
+        raise ValueError(f"title_start {title_start} exceeds 6-bit field")
+    if title_len > 64:
+        title_len = 64  # RT text is capped at 64 anyway
+
+    byte1 = 0x08
+    byte2 = (0b001 << 5) | ((title_start >> 1) & 0x1F)
+    byte3 = ((title_start & 1) << 7) | (((title_len - 1) & 0x3F) << 1)
+    byte4 = 0x20
+    byte5 = (artist_len - 1) & 0x1F
+    return bytes([0x24, 0x16, byte1, byte2, byte3, byte4, byte5])
+
+
+def mec_rt_plus_tags_generic(rt_text_len: int) -> bytes:
+    """MEC 0x24 subtype 0x16 -- single-tag RT+ covering the entire RT.
+
+    Used for non-song RT frames (weather, promos, station IDs, etc.)
+    where the whole RT is one semantic unit rather than an
+    artist/title split. Reverse-engineered from RDS Magic 4's take-3
+    capture (2026-07-13) -- every weather RT change was immediately
+    followed by six to eight repeats of this exact byte pattern,
+    with only the length byte varying to match each weather text.
+
+    Confirmed byte-for-byte:
+      Weather1 "Temp: 86F..." (56 chars) -> 24 16 0b 20 6e 00 00
+      Weather2 "Wind: Southeast..." (51) -> 24 16 0b 20 64 00 00
+
+    Wire format (after the 0x24 MEC byte), 6 bytes total:
+      Byte 0: 0x16                        -- subtype
+      Byte 1: 0x0b                        -- single-tag marker
+      Byte 2: 0x20                        -- fixed (same "001" fragment
+                                             songs use; encodes part of
+                                             CT1 but the rest is fixed
+                                             for whichever CT StereoTool
+                                             applies -- info.weather /
+                                             info.other -- based on its
+                                             own template config for
+                                             this RT source)
+      Byte 3: bit[7]    = 0               -- start1 LSB (always 0, tag
+                                             covers the whole RT which
+                                             always starts at 0)
+              bits[6:1] = rt_text_len - 1 -- len1, 6-bit N-1 marker
+              bit[0]    = 0
+      Byte 4: 0x00
+      Byte 5: 0x00
+
+    Without this, receivers keep the LAST song's artist/title offsets
+    active and apply them to the current non-song RT text -- observed
+    live as "Artist: Wind: South at 4, Gusts | Title: Barome" on a
+    TEF6686 and a Uconnect Ram head unit on 2026-07-13.
+    """
+    if rt_text_len < 1:
+        raise ValueError("mec_rt_plus_tags_generic requires positive length")
+    len1 = min(rt_text_len - 1, 63)  # 6-bit cap
+    byte3 = (len1 & 0x3F) << 1  # bit 7 = 0 (start=0), bits 6-1 = len1
+    return bytes([0x24, 0x16, 0x0b, 0x20, byte3, 0x00, 0x00])
+
+
+def mec_song_info(text: str) -> bytes:
+    """MEC 0xAA -- vendor "song info" carrier for StereoTool.
+
+    Reverse-engineered byte-for-byte from a live capture of RDS Magic 4
+    -> StereoTool UECP traffic taken 2026-07-12 (scratchpad file
+    rdsmagic_capture.bin, decoded via uecp_decode.py in the same dir).
+    Every MEC 0x0A RT update RDS Magic 4 sent was paired 1:1 with a
+    MEC 0xAA carrying the same "Artist - Title" string in this exact
+    layout, and RDS Magic 4's own RT+ Encoder pane showed no other
+    RT+-related MECs ever going out. StereoTool's internal Artist=,
+    Title=, and Song= fields (see the .rc file's default values and
+    the StOArti / StOArtF / StOArtFU tokens documented inside the
+    binary) get populated from this MEC and drive StereoTool's own
+    RT+ 11A group generation -- provided (a) Advanced RDS is licensed
+    (Advanced RDS=1 in the .rc, RT+ is one of the Advanced features
+    Thimeo lists), and (b) StereoTool's Group Sequence explicitly
+    includes 3A (ODA announcement for AID 0x4BD7 -> group 11A) and
+    11A (the actual RT+ tag data) -- neither is in the default
+    sequence, so this MEC alone is not enough; the operator must
+    enable and configure Group Sequence via the GUI or .rc.
+
+    Wire format observed:
+      MEC(0xAA) length(1B) 0xF0 <text>
+    where `length` = 1 (for the 0xF0 byte) + len(text) and the outer
+    UECP MFL wraps everything as usual (see build_frame).
+
+    Unlike mec_rt this MEC has no DSN/PSN preamble in the observed
+    capture -- RDS Magic 4 emits it addressed at the encoder level
+    only. Following the same pattern here (spec-standard mec_rt has
+    those bytes; a vendor MEC follows whatever the vendor uses, which
+    in this case is the shorter form).
+
+    Text is not truncated to 64 chars -- the capture had a 56-char
+    weather message ("Temp: 86F | ... | DewPt: 69F") ride this MEC
+    intact. StereoTool doesn't display 0xAA content directly, so its
+    length is bounded only by the outer UECP frame limit."""
+    text_bytes = text.encode("latin-1", errors="replace")
+    length = 1 + len(text_bytes)
+    return bytes([0xAA, length, 0xF0]) + text_bytes
+
+
 def mec_ct(dt_utc, offset_minutes: int) -> bytes:
     """MEC 0x0D -- Real Time Clock. Format: MEC MED(8: year-2digit,
     month, date, hours, minutes, seconds, centiseconds, local-offset) --

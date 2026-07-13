@@ -26,6 +26,16 @@ from rbds.services.rotation import PSRotation, RTRotation  # noqa: E402
 
 POLL_SECONDS = 1
 FULL_RESEND_SECONDS = 30  # periodic full resend even if nothing changed -- RDS receivers can miss packets
+# RT+ tags need to be re-transmitted many times per RT slot: on-air RT+
+# rides on 11A groups whose cadence in StereoTool's group sequence is
+# much slower than 2A (the plain RT group), so a single UECP send of new
+# tags at RT-change time will land at the encoder before StereoTool's
+# next 11A slot -- but the receiver has already latched the new RT off
+# 2A and is applying the OLD tags to it. RDS Magic 4's live capture
+# emits 6-8 RT+ frame repeats per ~13s RT rotation slot; matching that
+# cadence here (~6 repeats over 13s) collapses the observed
+# stale-tag-on-new-RT window on TEF6686 / Uconnect receivers.
+RT_PLUS_RESEND_SECONDS = 2
 TCP_RECONNECT_BACKOFF = [1, 2, 5, 10, 30]
 FILE_URL_FETCH_TIMEOUT = 5  # seconds, bounds a slow/hanging URL source's delay on the tick it fires
 
@@ -47,6 +57,7 @@ class RBDSManager:
         self._last_sent_rt = None
         self._rt_ab_flag = False
         self._last_full_resend = 0.0
+        self._last_rt_plus_resend = 0.0
         self._last_error = None
         self._connected = False
         self._connected_since = None
@@ -144,6 +155,31 @@ class RBDSManager:
             self._last_sent_ps = target_ps
             self._last_sent_rt = rt_text
             self._last_full_resend = time.time()
+            # A full send just went out and includes the RT+ MECs, so
+            # count it as a fresh RT+ resend and let the 2s timer start
+            # counting from here rather than immediately re-firing.
+            self._last_rt_plus_resend = time.time()
+
+        # RT+ tag maintenance: on 2s cadence between full-sends, re-emit
+        # only the RT+ MECs (ODA reg + tags + song info). Matches RDS
+        # Magic 4's live capture (6-8 tag repeats per ~13s RT rotation
+        # slot) so StereoTool's 11A group cadence has enough fresh
+        # material to keep the receiver's RT+ display in sync with the
+        # currently-airing RT. Gated on the same conditions the main
+        # send uses -- no point sending RT+ if we can't reach StereoTool
+        # or if the operator has RT+ off, and no point on ASCII where
+        # RT+ rides RT+= in the ASCII payload rather than these MECs.
+        due_for_rt_plus = (time.time() - self._last_rt_plus_resend) >= RT_PLUS_RESEND_SECONDS
+        if (config.use_rt_plus and config.protocol == "uecp"
+                and self._connected and due_for_rt_plus):
+            try:
+                self._send_rt_plus_only(config, rt_text, rt_artist, rt_title)
+                self._last_rt_plus_resend = time.time()
+            except Exception as exc:
+                # RT+ resend is best-effort -- a failure here shouldn't
+                # trip the connection state or drown _last_error the way
+                # a main-payload failure would. Surface it quietly.
+                self._last_error = f"RT+ resend failed: {exc}"
 
         # Dedicated CT send at minute boundaries -- see _send_ct
         # docstring for why this can't ride along with the content
@@ -192,7 +228,13 @@ class RBDSManager:
         if not artist:
             return title[:64], None, None
 
-        if config.protocol == "ascii" and config.use_rt_plus:
+        if config.use_rt_plus:
+            # Same "Artist - Title" join for both protocols now. On
+            # ASCII this feeds the RT+= tag-offset math (unchanged);
+            # on UECP the artist/title get sent as a separate MEC 0xAA
+            # (StereoTool vendor "song info") in _build_uecp_payload,
+            # populating StereoTool's internal Artist=/Title=/Song=
+            # fields which its own RT+ generator reads from.
             text = f"{artist}{self.RT_PLUS_SEPARATOR}{title}"[:64]
             return text, artist, title
 
@@ -236,7 +278,7 @@ class RBDSManager:
     def _send(self, config, ps, rt, artist, title):
         try:
             if config.protocol == "uecp":
-                payload = self._build_uecp_payload(config, ps, rt)
+                payload = self._build_uecp_payload(config, ps, rt, artist, title)
             else:
                 payload = self._build_ascii_payload(config, ps, rt, artist, title)
             self._transmit(config, payload)
@@ -247,7 +289,25 @@ class RBDSManager:
         self._mark_up()
         self._last_error = None
 
-    def _build_uecp_payload(self, config, ps, rt):
+    def _send_rt_plus_only(self, config, rt, artist, title):
+        """Small UECP frame carrying only the RT+ MECs -- fired between
+        full sends to keep StereoTool's 11A group cadence saturated.
+        See _tick's RT_PLUS_RESEND_SECONDS block for the why."""
+        self._sqc = (self._sqc % 255) + 1
+        msg = uecp.mec_rt_plus_oda_reg()
+        if artist and title and len(artist) <= 32:
+            msg += uecp.mec_rt_plus_tags(len(artist), len(title))
+            msg += uecp.mec_song_info(f"{artist}{self.RT_PLUS_SEPARATOR}{title}")
+        elif rt:
+            msg += uecp.mec_rt_plus_tags_generic(len(rt))
+        else:
+            return  # nothing to (re-)send
+        frame = uecp.build_frame(
+            config.uecp_site_address, config.uecp_encoder_address, self._sqc, msg,
+        )
+        self._transmit(config, frame)
+
+    def _build_uecp_payload(self, config, ps, rt, artist=None, title=None):
         self._sqc = (self._sqc % 255) + 1
         msg = b""
         if config.pi_code:
@@ -261,6 +321,45 @@ class RBDSManager:
         msg += uecp.mec_ms(music=config.ms)
         msg += uecp.mec_pty(config.pty)
         msg += uecp.mec_rt(rt, ab_flag=self._rt_ab_flag)
+        # RT+ over UECP -- reverse-engineered from a real RDS Magic 4 ->
+        # StereoTool capture (see the scratchpad in the RT+ session
+        # notes). Three MECs go together and are only emitted when we
+        # have both artist and title:
+        #   * mec_rt_plus_oda_reg: MEC 0x24 subtype 0x06, ODA
+        #     registration -- declares "RT+ (AID 0x4BD7) lives on
+        #     group 11A". Fixed bytes.
+        #   * mec_rt_plus_tags: MEC 0x24 subtype 0x16, RT+ tag data --
+        #     (CT1=artist, start1=0, len1=artist_len-1) +
+        #     (CT2=title, start2=artist_len+3, len2=title_len-1).
+        #     Layout verified byte-for-byte against 22 captured songs.
+        #   * mec_song_info: MEC 0xAA vendor "song info" -- populates
+        #     StereoTool's internal Artist= / Title= / Song= display
+        #     fields (harmless if StereoTool's build ignores it).
+        # Weather/promo RT updates suppress this whole block on purpose:
+        # a text like "Temp: 86F | Feels Like: 90F" contains a " - "
+        # style split only if the user's now_playing_format template
+        # happens to produce one, and mis-splitting it into a
+        # (short-artist, long-title) RT+ tag pair would waste RT+
+        # channel time on garbage.
+        # Guard artist_len<=32 (see mec_rt_plus_tags docstring) --
+        # very long artists fall back to whole-RT single-tag mode.
+        if config.use_rt_plus:
+            # ODA registration always rides along on every UECP frame so
+            # a receiver that catches us mid-broadcast learns "RT+ lives
+            # on group 11A with AID 0x4BD7" within one send.
+            msg += uecp.mec_rt_plus_oda_reg()
+            if artist and title and len(artist) <= 32:
+                # Real song: two-tag payload (item.artist + item.title).
+                msg += uecp.mec_rt_plus_tags(len(artist), len(title))
+                msg += uecp.mec_song_info(f"{artist}{self.RT_PLUS_SEPARATOR}{title}")
+            elif rt:
+                # Non-song RT (weather / promo / station ID / long-
+                # artist fallback). Emit a single tag that covers the
+                # whole RT so receivers apply an appropriate content
+                # type instead of falling back to the previous song's
+                # stale artist/title offsets. Confirmed byte-for-byte
+                # against RDS Magic 4's live output on 2026-07-13.
+                msg += uecp.mec_rt_plus_tags_generic(len(rt))
         if config.af_frequencies_mhz:
             freqs = [float(f.strip()) for f in config.af_frequencies_mhz.split(",") if f.strip()]
             if freqs:
