@@ -553,6 +553,26 @@ class PlaybackEngine:
         # with only one deck active).
         self.duck_gain = Gst.ElementFactory.make("volume", "duck_gain")
         self.master_mixer = Gst.ElementFactory.make("audiomixer", "master_mixer")
+        # `audiomixer` is a `GstAggregator` and by default WAITS for a
+        # first buffer on every linked sink pad before it produces
+        # output -- a sensible default for a static mix graph but a
+        # real hazard for this specific pipeline where a Remote DJ
+        # session hot-requests a new sink pad on connect (see the
+        # BLOCK probe in `_remote_dj_on_pad_added`). There's a window
+        # between `master_mixer.request_pad_simple("sink_%u")` and the
+        # first buffer arriving on that new pad where the aggregator
+        # can stall dequeuing from the CURRENTLY-PLAYING deck's sink
+        # pad -- suspected as Mechanism B in the ladder doc for the
+        # residual ~10% static-on-playing-deck rate (see
+        # `/home/jreed/.claude/plans/remote-dj-cellular-static-fix-
+        # ladder.md`). `ignore-inactive-pads=true` tells the aggregator
+        # to treat any pad that hasn't produced a buffer within a tick
+        # as non-participating rather than waiting for it, which is
+        # exactly the semantic we want here: mic pads come and go on
+        # session start/stop, deck pads come and go across track
+        # transitions. Requires GStreamer >= 1.20 (Ubuntu 22.04+); this
+        # box is well past that.
+        self.master_mixer.set_property("ignore-inactive-pads", True)
 
         elements = [
             self.mixer, self.duck_gain, self.master_mixer, convert, resample, capsfilter,
@@ -1983,11 +2003,55 @@ class PlaybackEngine:
         queue.link(remote_gain)
         remote_gain.link(session.remote_gate)
         session.remote_gate.link(gate_conv)
-        pad.link(depay.get_static_pad("sink"))
 
+        # Sync every element and WAIT for it to actually reach PLAYING
+        # before we link webrtc's src pad into the head of the chain --
+        # same pattern (and same reasoning) as the session-build fix
+        # in `_remote_dj_build_session`, but for the second half of
+        # pipeline construction that runs on `pad-added` rather than
+        # `_remote_dj_session_start`. See ladder doc Mechanism A for
+        # the residual ~10% rate.
+        #
+        # Previous form here was fire-and-forget:
+        # `pad.link(depay.get_static_pad("sink"))` FIRST, then
+        # `sync_state_with_parent()` per element with no wait. Under
+        # a bad thread-scheduling slice webrtc's src (already live at
+        # pad-added time -- that's what raised the signal) can start
+        # pushing RTP into `depay.sink` before `depay` or a later
+        # element has finished its ASYNC transition to PLAYING, which
+        # returns GST_FLOW_FLUSHING upstream. Errors escaping back
+        # into webrtcbin have been observed to taint the shared tee
+        # pad state -- exactly the "static on the currently-playing
+        # deck that persists until track end" symptom.
+        #
+        # 500 ms per element is a soft ceiling; the actual chain here
+        # is entirely lightweight synchronous elements (depay/dec/
+        # conv/resample/capsfilter/queue/volume/volume/audioconvert)
+        # that transition in single-digit ms under normal conditions.
+        # If the ceiling ever trips, we log and keep going rather
+        # than raise: a signal-callback exception here has no clean
+        # cleanup path back to `_remote_dj_session_start`'s try/except,
+        # so best-effort with a diagnostic beats a caller-visible
+        # crash on the rare unhappy path. Any hit here in the journal
+        # is real signal (a particular element is misbehaving).
         for el in (depay, dec, conv, resample, capsfilter, queue,
                    remote_gain, session.remote_gate, gate_conv):
             el.sync_state_with_parent()
+            result, state, pending = el.get_state(500 * Gst.MSECOND)
+            if result != Gst.StateChangeReturn.SUCCESS or state != Gst.State.PLAYING:
+                print(
+                    f"  Remote DJ: mic-chain element {el.get_name()} did "
+                    f"not reach PLAYING within 500 ms "
+                    f"(result={result.value_nick} state={state.value_nick} "
+                    f"pending={pending.value_nick}); proceeding anyway -- "
+                    f"if this correlates with on-air static, raise the "
+                    f"ceiling or investigate this specific element."
+                )
+
+        # LAST step: link webrtc src to depay sink now that the whole
+        # decode chain is confirmed PLAYING. From this instant real
+        # RTP flows into a chain that's ready to consume it.
+        pad.link(depay.get_static_pad("sink"))
 
         # Master_mixer's sink pad is requested and linked ONLY when the
         # decode chain is ready to push its first buffer, not before.
