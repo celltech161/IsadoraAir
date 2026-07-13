@@ -1818,8 +1818,48 @@ class PlaybackEngine:
         session.webrtc.connect("pad-added", self._remote_dj_on_pad_added)
         session.webrtc.connect("notify::connection-state", self._remote_dj_on_connection_state)
 
-        for el in session.elements:
+        # Fix ladder [1] + [2] from
+        # remote-dj-cellular-static-fix-ladder.md: sync the fast
+        # elements first, webrtcbin last, and wait for each to actually
+        # reach PLAYING (up to 500 ms per element) before we proceed to
+        # the tee link below.
+        #
+        # The previous fire-and-forget `sync_state_with_parent()`
+        # returned control immediately, so under a stretched
+        # webrtcbin bring-up window (cellular first-connect, cold STUN
+        # DNS, etc.) a queue or resampler in this chain could still be
+        # in PAUSED at tee-link time -- and linking a live tee into a
+        # chain with any still-non-PLAYING element downstream produces
+        # a flow error that propagates back through the shared tee onto
+        # the on-air path (mechanism #1 in the ladder doc: observed
+        # live as static on the currently-playing deck that persisted
+        # until the deck's track ended and a new deck bin replaced it).
+        # Ordering webrtcbin last means every light element is
+        # definitely PLAYING before we wait on the heavy one.
+        #
+        # 500 ms is a soft ceiling: webrtcbin's own GStreamer state
+        # change is fast (its ICE/DTLS work happens asynchronously
+        # AFTER state=PLAYING, not gating it), so this timeout should
+        # never actually trigger in practice -- but if some transient
+        # bind/resolve delay does stretch a transition past half a
+        # second, we raise here and let _remote_dj_session_start's
+        # existing try/except roll the whole session back rather than
+        # link a not-yet-live chain into the shared tee and glitch
+        # the current deck. `.value_nick` on the enums renders the
+        # short human name ("success"/"async"/"playing"/etc.) so the
+        # rollback message is readable in the journal.
+        fast_elements = [el for el in session.elements if el is not session.webrtc]
+        sync_order = fast_elements + [session.webrtc]
+        for el in sync_order:
             el.sync_state_with_parent()
+            result, state, pending = el.get_state(500 * Gst.MSECOND)
+            if result != Gst.StateChangeReturn.SUCCESS or state != Gst.State.PLAYING:
+                raise RuntimeError(
+                    f"{el.get_name()} did not reach PLAYING within 500 ms "
+                    f"(result={result.value_nick} state={state.value_nick} "
+                    f"pending={pending.value_nick}); aborting session build "
+                    f"to protect on-air path"
+                )
 
         # LAST step, deliberately after everything above is PLAYING:
         # splice the live tees into the (now fully-live, leaky-buffered)
