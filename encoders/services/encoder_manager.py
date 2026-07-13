@@ -99,14 +99,87 @@ def _group_by_input_device(encoders):
 
 def _format_block(encoder):
     if encoder.format == "mp3":
-        return f"%mp3(bitrate={encoder.bitrate_kbps})"
+        # CBR at 192 kbps and up (already transparent -- CBR keeps a
+        # predictable buffer fill rate for streaming clients); LAME ABR
+        # below that where variable frame allocation buys real audible
+        # quality over CBR at the same average bitrate. Both paths sit
+        # on Ubuntu's libmp3lame (LAME 3.101) at internal_quality=0,
+        # LAME's slowest/highest-quality algorithm -- confirmed to be
+        # the %mp3 default by an md5-equal comparison of explicit vs
+        # implicit encodes.
+        br = encoder.bitrate_kbps
+        if br >= 192:
+            return f"%mp3(bitrate={br})"
+        return f"%mp3.abr(bitrate={br}, internal_quality=0)"
     if encoder.format == "aac":
-        return f'%ffmpeg(format="adts", %audio(codec="aac", b="{encoder.bitrate_kbps}k"))'
+        # Route AAC through /usr/local/bin/fdkaac (upstream nu774/fdkaac
+        # linked against upstream mstorsjo/fdk-aac 2.0.3, both installed
+        # under /usr/local from source) rather than ffmpeg's native AAC
+        # encoder or Ubuntu's Liquidsoap %fdkaac binding.
+        #
+        # Why not ffmpeg's native "aac"? LC-only, and sounds bad at low
+        # bitrates -- it exists as a fallback so ffmpeg can produce AAC
+        # out of the box, not as a serious streaming encoder.
+        #
+        # Why not Liquidsoap's %fdkaac(...) format? Ubuntu 25.10's
+        # liquidsoap package isn't built with the fdkaac OCaml binding
+        # (see --list-plugins -- no liquidsoap_fdkaac), so %fdkaac
+        # parses at check time but throws "unsupported format" at
+        # runtime.
+        #
+        # Why not Ubuntu's /usr/bin/fdkaac? Ubuntu ships libfdk-aac2
+        # with SBR (HE-AAC) and Parametric Stereo (HE-AACv2) stripped
+        # for legacy software-patent reasons -- profile=5 and
+        # profile=29 both fail with "unsupported profile".
+        #
+        # Profile chosen from bitrate at the classic Coding Technologies
+        # aacPlus crossover points: HE-AACv2 (mono core with stereo
+        # synthesized from PS side info) is the standard 24-64 kbps
+        # tier; HE-AACv1 (SBR only) is 80-96 kbps; LC takes over at
+        # 128+ where SBR's bit-budget advantage stops mattering.
+        #
+        # fdkaac flags: -R raw input, S16L stereo 44.1k matches the
+        # Liquidsoap PCM stream (header=false below); -f 2 emits ADTS
+        # framing suitable for streaming; -a 1 keeps afterburner on for
+        # extra quality at negligible CPU cost; -S silences per-frame
+        # progress writes (which would otherwise flood the encoder log).
+        br = encoder.bitrate_kbps
+        if br <= 64:
+            profile = 29  # HE-AACv2
+        elif br <= 96:
+            profile = 5   # HE-AAC
+        else:
+            profile = 2   # LC
+        cmd = (
+            "/usr/local/bin/fdkaac -R --raw-channels 2 --raw-rate 44100 "
+            f"--raw-format S16L -p {profile} -b {br * 1000} -f 2 -a 1 -S "
+            "-o - -"
+        )
+        # %external doesn't accept mime/extension params here; the MIME
+        # ("audio/aacp" -- aacPlus convention for HE-AAC, LC muxes fine
+        # under it in ADTS too) is applied downstream on
+        # output.shoutcast/output.icecast via their `format=` argument
+        # (see _output_block).
+        return f"%external(process={_liq_string(cmd)}, header=false)"
     return f"%vorbis(bitrate={encoder.bitrate_kbps})"  # vorbis
 
 
 def _output_block(encoder, source_var):
     fmt = _format_block(encoder)
+    # AAC is emitted via %external(fdkaac) which can't advertise its
+    # own MIME type, so the ICY/HTTP content-type has to come from the
+    # output.shoutcast/icecast call. mp3 and vorbis auto-advertise from
+    # their format symbol, so an explicit format= there would just be
+    # redundant.
+    # For AAC via %external, we also have to explicitly opt into
+    # in-band ICY title metadata -- Liquidsoap auto-picks it for
+    # built-in encoders (yes for mp3, no for ogg) but can't guess for
+    # an opaque external process. Shoutcast supports ICY metadata over
+    # AAC/ADTS streams, so we want it on.
+    if encoder.format == "aac":
+        format_arg = ', format="audio/aacp", send_icy_metadata=true'
+    else:
+        format_arg = ""
     common = (
         f"host={_liq_string(encoder.host)}, port={encoder.port}, "
         f"password={_liq_string(encoder.password)}, "
@@ -114,6 +187,7 @@ def _output_block(encoder, source_var):
         f"genre={_liq_string(encoder.genre)}, "
         f"url={_liq_string(encoder.url)}, "
         f"public={'true' if encoder.public else 'false'}"
+        f"{format_arg}"
     )
     if encoder.protocol == "icecast":
         return (
