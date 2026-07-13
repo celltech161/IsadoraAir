@@ -290,86 +290,97 @@ class RBDSManager:
         self._last_error = None
 
     def _send_rt_plus_only(self, config, rt, artist, title):
-        """Small UECP frame carrying only the RT+ MECs -- fired between
-        full sends to keep StereoTool's 11A group cadence saturated.
-        See _tick's RT_PLUS_RESEND_SECONDS block for the why."""
-        self._sqc = (self._sqc % 255) + 1
-        msg = uecp.mec_rt_plus_oda_reg()
+        """Small write carrying only the RT+ MECs, each in its own
+        UECP frame (see _build_uecp_payload for the why) -- fired
+        between full sends to keep StereoTool's 11A group cadence
+        saturated. See _tick's RT_PLUS_RESEND_SECONDS block."""
+        meds = [uecp.mec_rt_plus_oda_reg()]
         if artist and title and len(artist) <= 32:
-            msg += uecp.mec_rt_plus_tags(len(artist), len(title))
-            msg += uecp.mec_song_info(f"{artist}{self.RT_PLUS_SEPARATOR}{title}")
+            meds.append(uecp.mec_rt_plus_tags(len(artist), len(title)))
+            meds.append(uecp.mec_song_info(
+                f"{artist}{self.RT_PLUS_SEPARATOR}{title}"))
         elif rt:
-            msg += uecp.mec_rt_plus_tags_generic(len(rt))
+            meds.append(uecp.mec_rt_plus_tags_generic(len(rt)))
         else:
             return  # nothing to (re-)send
-        frame = uecp.build_frame(
-            config.uecp_site_address, config.uecp_encoder_address, self._sqc, msg,
-        )
-        self._transmit(config, frame)
+        self._transmit(config, self._frames_for(config, meds))
 
     def _build_uecp_payload(self, config, ps, rt, artist=None, title=None):
-        self._sqc = (self._sqc % 255) + 1
-        msg = b""
+        """Assemble the full UECP payload as ONE MEC PER UECP FRAME
+        (concatenated back-to-back for a single TCP write). Not one
+        big multi-MEC frame -- observed live behavior of RDS Magic 4
+        driving this same StereoTool build in a 2026-07-13 capture,
+        and cross-referenced against a residual on-air symptom this
+        codebase's earlier bundled-frame form exhibited: on a
+        Wind/Barometer weather slot, the receiver would render the
+        correct whole-text tag for the first part of the slot and
+        then partway through swap to the current song's
+        artist/title character pattern, as if StereoTool were
+        pulling RT+ tag data from a different bundled-frame history
+        than the RT text it was currently pushing on 2A.
+        Splitting into one-MEC-per-frame gives StereoTool discrete
+        events per RDS group's queue and lines up with the
+        proven-good reference.
+
+        Each frame gets its own SQC (per-frame counter is the
+        conservative choice -- StereoTool ignores SQC gaps, and it
+        keeps this consistent with the CT-only frame from
+        _send_ct which already uses its own SQC). CT is still
+        deliberately NOT bundled here: it rides its own dedicated
+        frame from _tick at the minute boundary so RDS group 4A is
+        transmitted at :00 seconds (see _send_ct's docstring for the
+        specific Sangean-receiver symptom that forced that split).
+        """
+        meds = []
         if config.pi_code:
-            msg += uecp.mec_pi(int(config.pi_code, 16))
-        msg += uecp.mec_ps(ps)
-        msg += uecp.mec_ta_tp(ta=config.ta, tp=config.tp)
-        msg += uecp.mec_di(
+            meds.append(uecp.mec_pi(int(config.pi_code, 16)))
+        meds.append(uecp.mec_ps(ps))
+        meds.append(uecp.mec_ta_tp(ta=config.ta, tp=config.tp))
+        meds.append(uecp.mec_di(
             dynamic_pty=config.di_dynamic_pty, compressed=config.di_compressed,
             artificial_head=config.di_artificial_head, stereo=config.di_stereo,
-        )
-        msg += uecp.mec_ms(music=config.ms)
-        msg += uecp.mec_pty(config.pty)
-        msg += uecp.mec_rt(rt, ab_flag=self._rt_ab_flag)
-        # RT+ over UECP -- reverse-engineered from a real RDS Magic 4 ->
-        # StereoTool capture (see the scratchpad in the RT+ session
-        # notes). Three MECs go together and are only emitted when we
-        # have both artist and title:
-        #   * mec_rt_plus_oda_reg: MEC 0x24 subtype 0x06, ODA
-        #     registration -- declares "RT+ (AID 0x4BD7) lives on
-        #     group 11A". Fixed bytes.
-        #   * mec_rt_plus_tags: MEC 0x24 subtype 0x16, RT+ tag data --
-        #     (CT1=artist, start1=0, len1=artist_len-1) +
-        #     (CT2=title, start2=artist_len+3, len2=title_len-1).
-        #     Layout verified byte-for-byte against 22 captured songs.
-        #   * mec_song_info: MEC 0xAA vendor "song info" -- populates
-        #     StereoTool's internal Artist= / Title= / Song= display
-        #     fields (harmless if StereoTool's build ignores it).
-        # Weather/promo RT updates suppress this whole block on purpose:
-        # a text like "Temp: 86F | Feels Like: 90F" contains a " - "
-        # style split only if the user's now_playing_format template
-        # happens to produce one, and mis-splitting it into a
-        # (short-artist, long-title) RT+ tag pair would waste RT+
-        # channel time on garbage.
-        # Guard artist_len<=32 (see mec_rt_plus_tags docstring) --
-        # very long artists fall back to whole-RT single-tag mode.
+        ))
+        meds.append(uecp.mec_ms(music=config.ms))
+        meds.append(uecp.mec_pty(config.pty))
+        meds.append(uecp.mec_rt(rt, ab_flag=self._rt_ab_flag))
         if config.use_rt_plus:
-            # ODA registration always rides along on every UECP frame so
-            # a receiver that catches us mid-broadcast learns "RT+ lives
-            # on group 11A with AID 0x4BD7" within one send.
-            msg += uecp.mec_rt_plus_oda_reg()
+            # ODA registration rides every UECP send so a receiver
+            # that catches us mid-broadcast learns "RT+ (AID 0x4BD7)
+            # lives on group 11A" within one send.
+            meds.append(uecp.mec_rt_plus_oda_reg())
             if artist and title and len(artist) <= 32:
-                # Real song: two-tag payload (item.artist + item.title).
-                msg += uecp.mec_rt_plus_tags(len(artist), len(title))
-                msg += uecp.mec_song_info(f"{artist}{self.RT_PLUS_SEPARATOR}{title}")
+                # Real song: two-tag payload (item.artist +
+                # item.title) plus vendor song info.
+                meds.append(uecp.mec_rt_plus_tags(len(artist), len(title)))
+                meds.append(uecp.mec_song_info(
+                    f"{artist}{self.RT_PLUS_SEPARATOR}{title}"))
             elif rt:
-                # Non-song RT (weather / promo / station ID / long-
-                # artist fallback). Emit a single tag that covers the
-                # whole RT so receivers apply an appropriate content
-                # type instead of falling back to the previous song's
-                # stale artist/title offsets. Confirmed byte-for-byte
-                # against RDS Magic 4's live output on 2026-07-13.
-                msg += uecp.mec_rt_plus_tags_generic(len(rt))
+                # Non-song RT (weather / promo / station ID /
+                # long-artist fallback). Emit a single tag that
+                # covers the whole RT so receivers apply an
+                # appropriate content type instead of falling back
+                # to the previous song's stale artist/title
+                # offsets. Confirmed byte-for-byte against RDS
+                # Magic 4's live output on 2026-07-13.
+                meds.append(uecp.mec_rt_plus_tags_generic(len(rt)))
         if config.af_frequencies_mhz:
             freqs = [float(f.strip()) for f in config.af_frequencies_mhz.split(",") if f.strip()]
             if freqs:
-                msg += uecp.mec_af(freqs)
-        # CT is deliberately NOT bundled here. It's sent as its own
-        # frame from _tick at the minute boundary, so RDS group 4A is
-        # transmitted at :00 seconds -- receivers require that (see
-        # _send_ct's docstring for the specific Sangean symptom that
-        # forced this split).
-        return uecp.build_frame(config.uecp_site_address, config.uecp_encoder_address, self._sqc, msg)
+                meds.append(uecp.mec_af(freqs))
+        return self._frames_for(config, meds)
+
+    def _frames_for(self, config, meds):
+        """Wrap each MEC in its own UECP frame with an incrementing
+        SQC and concatenate. One TCP write, N distinct STX..ETX
+        frames on the wire (RDS Magic 4's proven shape)."""
+        out = bytearray()
+        for med in meds:
+            self._sqc = (self._sqc % 255) + 1
+            out += uecp.build_frame(
+                config.uecp_site_address, config.uecp_encoder_address,
+                self._sqc, med,
+            )
+        return bytes(out)
 
     def _current_ct_fields(self):
         """Fresh UTC time + the server's configured-timezone offset from
