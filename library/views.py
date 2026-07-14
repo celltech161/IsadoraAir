@@ -1945,6 +1945,36 @@ def api_library_upload(request):
     return JsonResponse({"results": results})
 
 
+@require_http_methods(["GET"])
+def api_cd_detect(request):
+    """Read whatever CD is in /dev/sr0 and try to identify it via
+    MusicBrainz. Returns the disc info + editable album/track
+    metadata for the frontend to render. A 404 means the tray is
+    empty or unreadable; a 200 with mb_matched=False means the
+    disc was read but MusicBrainz has no match (frontend falls
+    back to manual entry). Never blocks the whipper subprocess --
+    this is a read-only probe."""
+    from library.cd_ripping import detect_disc, DiscNotFoundError
+    try:
+        return JsonResponse(detect_disc())
+    except DiscNotFoundError as exc:
+        return JsonResponse({"error": str(exc)}, status=404)
+    except Exception as exc:
+        return JsonResponse({"error": f"CD detect failed: {exc}"}, status=500)
+
+
+@require_http_methods(["POST"])
+def api_cd_eject(request):
+    """Open the CD tray. Idempotent -- calling it with the tray
+    already open is a no-op success."""
+    from library.cd_ripping import eject
+    try:
+        eject()
+        return JsonResponse({"ok": True})
+    except Exception as exc:
+        return JsonResponse({"error": str(exc)}, status=500)
+
+
 # Browser-native <audio> support varies by codec -- mp3/wav/ogg/m4a play
 # in every modern browser, flac is now broadly supported too, but aiff,
 # mp2, and alac may not play in some/most browsers even though the
