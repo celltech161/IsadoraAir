@@ -994,3 +994,56 @@ class CDRipJob(models.Model):
 
     def __str__(self):
         return f"CDRipJob #{self.id} ({self.state}) {self.disc_id[:12]}"
+
+
+class CDRipConfig(models.Model):
+    """Singleton -- CD drive characteristics and rip pipeline knobs.
+    Runtime-editable in admin, so operators can dial in a new drive's
+    offset without redeploying. Migration seeds it with the default
+    for the current install (hp PLDS DVDRW DU8AESH, offset +6)."""
+    device = models.CharField(
+        max_length=64, default="/dev/sr0",
+        help_text="Path to the CD drive device node (usually /dev/sr0).",
+    )
+    drive_read_offset = models.IntegerField(
+        default=6,
+        help_text="AccurateRip drive read offset in samples for THIS "
+                  "drive model. Look up your drive at "
+                  "accuraterip.com/driveoffsets.htm. Wrong offset means "
+                  "the audio bytes are shifted vs community reference "
+                  "rips, so every track gets 'AR nomatch' -- the audio "
+                  "still plays fine, but the byte-identical verification "
+                  "won't pass. Default (+6) is correct for the hp PLDS "
+                  "DVDRW DU8AESH shipped with this box.",
+    )
+    require_accurate_rip = models.BooleanField(
+        default=False,
+        help_text="If checked, tracks that don't verify against "
+                  "AccurateRip are rejected outright. If unchecked (the "
+                  "default), non-verifying tracks are still imported "
+                  "with a warning badge -- appropriate since many CD-Rs "
+                  "and older pressings aren't in the AccurateRip "
+                  "database and their rips are still perfectly usable.",
+    )
+    staging_root = models.CharField(
+        max_length=512, default="/srv/isadoraair/rip_staging",
+        help_text="Scratch directory for in-progress rips before the "
+                  "post-processor moves them into the library. Must be "
+                  "writable by the gunicorn service user.",
+    )
+
+    class Meta:
+        verbose_name = "CD Rip Configuration"
+        verbose_name_plural = "CD Rip Configuration"
+
+    def __str__(self):
+        return "CD Rip Configuration"
+
+    def save(self, *args, **kwargs):
+        self.pk = 1
+        super().save(*args, **kwargs)
+
+    @classmethod
+    def load(cls):
+        obj, _created = cls.objects.get_or_create(pk=1)
+        return obj

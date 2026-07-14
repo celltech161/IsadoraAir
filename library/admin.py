@@ -36,6 +36,7 @@ from .models import (
     Genre,
     Track,
     UITheme,
+    CDRipConfig,
     UploadConfig,
 )
 
@@ -631,6 +632,37 @@ class UploadConfigAdmin(admin.ModelAdmin):
         obj = UploadConfig.load()
         return HttpResponseRedirect(
             reverse("admin:library_uploadconfig_change", args=[obj.pk])
+        )
+
+
+@admin.register(CDRipConfig)
+class CDRipConfigAdmin(admin.ModelAdmin):
+    fieldsets = [
+        ("Drive", {
+            "fields": ["device", "drive_read_offset"],
+            "description": "The optical drive on the box, and its "
+                           "AccurateRip read offset. If you replace the "
+                           "drive, look up the new model's offset at "
+                           "accuraterip.com/driveoffsets.htm and update "
+                           "the value here -- no redeploy needed. "
+                           "This install ships with hp PLDS DVDRW "
+                           "DU8AESH which uses offset +6.",
+        }),
+        ("Rip pipeline", {
+            "fields": ["staging_root", "require_accurate_rip"],
+        }),
+    ]
+
+    def has_add_permission(self, request):
+        return not CDRipConfig.objects.exists()
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+    def changelist_view(self, request, extra_context=None):
+        obj = CDRipConfig.load()
+        return HttpResponseRedirect(
+            reverse("admin:library_cdripconfig_change", args=[obj.pk])
         )
 
 

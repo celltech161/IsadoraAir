@@ -1955,8 +1955,9 @@ def api_cd_detect(request):
     back to manual entry). Never blocks the whipper subprocess --
     this is a read-only probe."""
     from library.cd_ripping import detect_disc, DiscNotFoundError
+    from library.models import CDRipConfig
     try:
-        return JsonResponse(detect_disc())
+        return JsonResponse(detect_disc(CDRipConfig.load().device))
     except DiscNotFoundError as exc:
         return JsonResponse({"error": str(exc)}, status=404)
     except Exception as exc:
@@ -1977,14 +1978,14 @@ def api_cd_eject(request):
     already open is a no-op success. Refuses if a rip is in flight
     so the operator can't yank the disc mid-rip."""
     from library.cd_ripping import eject
-    from library.models import CDRipJob
+    from library.models import CDRipConfig, CDRipJob
     if CDRipJob.objects.filter(state__in=["pending", "running"]).exists():
         return JsonResponse(
             {"error": "A rip is in progress -- cancel it before ejecting."},
             status=409,
         )
     try:
-        eject()
+        eject(CDRipConfig.load().device)
         return JsonResponse({"ok": True})
     except Exception as exc:
         return JsonResponse({"error": str(exc)}, status=500)
@@ -2015,15 +2016,16 @@ def api_cd_rip_start(request):
     if not tracks:
         return JsonResponse({"error": "album_meta.tracks is empty"}, status=400)
 
-    from django.conf import settings as _settings
-    staging_root = Path(getattr(_settings, "CD_RIP_STAGING_ROOT", "/srv/isadoraair/rip_staging"))
+    from library.models import CDRipConfig
+    cd_cfg = CDRipConfig.load()
+    staging_root = Path(cd_cfg.staging_root)
     staging_root.mkdir(parents=True, exist_ok=True)
 
     job = CDRipJob.objects.create(
         state="pending",
         disc_id=body.get("disc_id", ""),
         mb_release_id=body.get("mb_release_id", ""),
-        device=body.get("device", "/dev/sr0"),
+        device=body.get("device", cd_cfg.device),
         category=category,
         album_meta=album_meta,
         progress_total_tracks=len(tracks),

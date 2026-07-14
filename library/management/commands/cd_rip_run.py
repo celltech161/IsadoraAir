@@ -14,7 +14,7 @@ from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
 from django.utils import timezone
 
-from library.models import Album, Artist, CDRipJob, Genre, Track
+from library.models import Album, Artist, CDRipConfig, CDRipJob, Genre, Track
 
 
 # Filesystem-unsafe on Linux or Windows. Everything else -- spaces,
@@ -146,24 +146,17 @@ class Command(BaseCommand):
         # -d DEVICE is a `whipper cd` flag, NOT a `whipper cd rip` flag
         # (subcommand ordering matters -- it goes BEFORE `rip`).
         #
-        # --offset=<n> is drive-specific and required by whipper. 0 is a
-        # safe default that works on most drives; AccurateRip
-        # verifications may not match against reference rips unless the
-        # true offset is set. Look up your drive model at
-        # http://www.accuraterip.com/driveoffsets.htm or run
-        # `whipper offset find` (needs pycdio, which isn't packaged
-        # cleanly on Ubuntu 25.10) to find the real one, then override
-        # this via the CD_RIP_OFFSET env var / settings entry.
-        from django.conf import settings as dj_settings
-        import os
-        offset = str(getattr(dj_settings, "CD_RIP_OFFSET",
-                             os.environ.get("CD_RIP_OFFSET", "0")))
+        # --offset=<n> is drive-specific and required by whipper. The
+        # value lives in the CDRipConfig singleton (Django admin) so
+        # replacing the drive doesn't need a redeploy -- see the model
+        # help_text for how to find the right offset for a new drive.
+        cd_cfg = CDRipConfig.load()
         args = [
             "whipper", "cd", "-d", job.device, "rip",
             "-O", str(whipper_out),
             "--track-template", TRACK_TEMPLATE,
             "--disc-template", DISC_TEMPLATE,
-            "--offset", offset,
+            "--offset", str(cd_cfg.drive_read_offset),
             "-U", "--cdr", "--keep-going",
         ]
         if job.mb_release_id:

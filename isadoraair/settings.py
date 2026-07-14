@@ -195,14 +195,10 @@ MEDIA_ROOT = BASE_DIR / 'media'
 LIBRARY_ROOT = config('LIBRARY_ROOT', default='/srv/isadoraair/music')
 WAVEFORMS_DIR = config('WAVEFORMS_DIR', default='/srv/isadoraair/waveforms')
 
-# --- CD ripping ---
-# whipper needs to know the drive's read offset (samples). This box's
-# drive is "hp PLDS DVDRW DU8AESH" per hdparm -- offset +6 per
-# AccurateRip's drive database (confidence 328, 100% match rate). Any
-# other drive: look up at accuraterip.com/driveoffsets.htm and override
-# via the CD_RIP_OFFSET env var.
-CD_RIP_OFFSET = config('CD_RIP_OFFSET', default=6, cast=int)
-CD_RIP_STAGING_ROOT = config('CD_RIP_STAGING_ROOT', default='/srv/isadoraair/rip_staging')
+# CD ripping configuration -- drive path, read offset, staging dir,
+# AccurateRip strictness -- lives in the CDRipConfig singleton
+# (admin: /admin/library/cdripconfig/) so replacing the drive doesn't
+# need a redeploy. See library/models.py CDRipConfig for defaults.
 
 # --- Audio analysis thresholds ---
 ANALYSIS_SAMPLE_RATE = config('ANALYSIS_SAMPLE_RATE', default=4410, cast=int)
