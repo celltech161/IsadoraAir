@@ -1744,7 +1744,27 @@ class PlaybackEngine:
         mon_conv = Gst.ElementFactory.make("audioconvert", None)
         mon_resample = Gst.ElementFactory.make("audioresample", None)
         mon_caps = Gst.ElementFactory.make("capsfilter", None)
-        mon_caps.set_property("caps", Gst.Caps.from_string(f"audio/x-raw,rate={REMOTE_DJ_OPUS_RATE}"))
+        # `channels=2` is load-bearing here, not cosmetic: without it,
+        # every element in the mon_conv -> mon_resample -> mon_caps ->
+        # mon_enc -> mon_pay chain is pass-through channel-count-wise
+        # and negotiation reverse-flows from webrtcbin's SDP offer. And
+        # for the SENDONLY transceiver (unlike the RECVONLY one below
+        # which pins `encoding-params=(string)2` explicitly) we don't
+        # set any caps -- so the SDP offer goes out with no `stereo=1`
+        # in the Opus fmtp, Chrome answers mono per RFC 7587's default,
+        # the whole chain reverse-negotiates to mono, and audioconvert
+        # cheerfully downmixes the stereo studio mix before opusenc
+        # ever sees it. Pinning stereo here at the top of the Opus
+        # chain propagates forward: opusenc encodes stereo Opus,
+        # rtpopuspay's src caps carry `encoding-params=(string)2`,
+        # webrtcbin's SDP offer includes `stereo=1;sprop-stereo=1`,
+        # Chrome accepts, and the remote DJ hears an actual stereo
+        # image instead of a mono downmix. ~40 kbps -> ~80 kbps on
+        # the outbound Opus stream, trivial on both LAN and cellular.
+        mon_caps.set_property(
+            "caps",
+            Gst.Caps.from_string(f"audio/x-raw,rate={REMOTE_DJ_OPUS_RATE},channels=2"),
+        )
         mon_enc = Gst.ElementFactory.make("opusenc", None)
         mon_enc.set_property("frame-size", REMOTE_DJ_OPUS_FRAME_SIZE_MS)
         mon_pay = Gst.ElementFactory.make("rtpopuspay", None)
