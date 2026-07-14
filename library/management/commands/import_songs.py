@@ -1,4 +1,5 @@
 import os
+import struct
 from pathlib import Path
 
 from django.conf import settings
@@ -8,6 +9,76 @@ from mutagen import File as MutagenFile
 from library.models import Album, Artist, Category, Genre, Track
 
 SUPPORTED_EXT = {".mp3", ".flac", ".wav", ".m4a", ".ogg", ".oga", ".aiff", ".aif", ".mp2", ".alac"}
+
+# WAV files can carry metadata in either an ID3 chunk (which mutagen
+# reads) OR a LIST INFO chunk (which mutagen does NOT), and some CD
+# rippers / ffmpeg -metadata write only the LIST INFO form. Without
+# this fallback, RIFF-only WAVs would land as "Unknown Artist" and
+# the auto-transcode-to-FLAC step would then bake that name into the
+# new file's tags, silently losing the operator's original metadata.
+_RIFF_INFO_KEYS = {
+    b"INAM": "title",
+    b"IART": "artist",
+    b"IPRD": "album",
+    b"IGNR": "genre",
+    b"ICRD": "year",
+    b"ITRK": "track_number",
+}
+
+
+def _read_wav_riff_info_tags(path):
+    """Read the RIFF LIST INFO chunk from a WAV file. Best-effort:
+    swallows all errors and returns whatever it managed to parse.
+    Never raises. Returns a `{title, artist, album, genre, year,
+    track_number}` dict populated only with keys that were present
+    and non-empty in the file."""
+    tags = {}
+    try:
+        with open(path, "rb") as f:
+            header = f.read(12)
+            if (len(header) < 12
+                    or header[:4] != b"RIFF"
+                    or header[8:12] != b"WAVE"):
+                return tags
+            while True:
+                chunk_hdr = f.read(8)
+                if len(chunk_hdr) < 8:
+                    break
+                chunk_id = chunk_hdr[:4]
+                chunk_size = struct.unpack("<I", chunk_hdr[4:8])[0]
+                if chunk_id == b"LIST":
+                    list_type = f.read(4)
+                    if list_type == b"INFO":
+                        end = f.tell() + chunk_size - 4
+                        while f.tell() < end:
+                            sub_hdr = f.read(8)
+                            if len(sub_hdr) < 8:
+                                break
+                            sub_id = sub_hdr[:4]
+                            sub_size = struct.unpack("<I", sub_hdr[4:8])[0]
+                            value_bytes = f.read(sub_size)
+                            # RIFF sub-chunks pad to even byte boundary.
+                            if sub_size % 2:
+                                f.read(1)
+                            if sub_id in _RIFF_INFO_KEYS:
+                                try:
+                                    val = (value_bytes
+                                           .rstrip(b"\x00")
+                                           .decode("utf-8", errors="replace")
+                                           .strip())
+                                    if val:
+                                        tags[_RIFF_INFO_KEYS[sub_id]] = val
+                                except Exception:
+                                    pass
+                        continue
+                    # Not an INFO LIST -- rewind the 4-byte type peek
+                    # so the following seek skips the whole chunk.
+                    f.seek(-4, 1)
+                # Skip chunk data + pad byte if odd.
+                f.seek(chunk_size + (chunk_size % 2), 1)
+    except Exception:
+        pass
+    return tags
 
 
 def parse_tags(path):
@@ -71,6 +142,22 @@ def parse_tags(path):
 
     tags["track_number"] = parse_num(first(["TRCK", "TRACKNUMBER", "trkn"]))
     tags["disc_number"] = parse_num(first(["TPOS", "DISCNUMBER", "disk"]))
+
+    # WAV RIFF-INFO fallback -- see _RIFF_INFO_KEYS comment.
+    if str(path).lower().endswith(".wav") and any(
+        tags.get(k) is None for k in ("title", "artist", "album", "genre", "year", "track_number")
+    ):
+        riff = _read_wav_riff_info_tags(path)
+        for key in ("title", "artist", "album", "genre"):
+            if tags.get(key) is None and key in riff:
+                tags[key] = riff[key]
+        if tags.get("year") is None and "year" in riff:
+            try:
+                tags["year"] = int(str(riff["year"])[:4])
+            except Exception:
+                pass
+        if tags.get("track_number") is None and "track_number" in riff:
+            tags["track_number"] = parse_num(riff["track_number"])
 
     return tags, info
 
