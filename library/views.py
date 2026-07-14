@@ -1012,8 +1012,17 @@ def api_track_detail(request, pk):
             track.artist = artist_obj
         elif field == "album":
             if value:
+                # Album.unique_together = (title, album_artist), so
+                # looking up by title alone crashes with
+                # MultipleObjectsReturned when two different artists
+                # released same-named albums (Buckingham Nicks vs the
+                # ~11 different "Greatest Hits" in this library, etc).
+                # Preserve the current track's album_artist so we stay
+                # on the same album row rather than getting reassigned
+                # to a same-titled album owned by someone else.
+                current_aa = track.album.album_artist if track.album else ""
                 album_obj, _ = Album.objects.get_or_create(
-                    title=value, defaults={"album_artist": ""}
+                    title=value, album_artist=current_aa,
                 )
                 track.album = album_obj
             else:
@@ -1228,7 +1237,15 @@ def api_track_write_metadata(request, pk):
         track.artist = artist_obj
     if "album" in body:
         if body["album"]:
-            album_obj, _ = Album.objects.get_or_create(title=body["album"], defaults={"album_artist": ""})
+            # See api_track_detail comment on album lookup: scope by
+            # (title, album_artist) to respect the model's
+            # unique_together, preserving the current track's
+            # album_artist so we don't jump to a different owner's
+            # same-titled album.
+            current_aa = track.album.album_artist if track.album else ""
+            album_obj, _ = Album.objects.get_or_create(
+                title=body["album"], album_artist=current_aa,
+            )
             track.album = album_obj
         else:
             track.album = None
