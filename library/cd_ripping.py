@@ -22,6 +22,30 @@ class MBLookupError(RuntimeError):
     just needs to fall back to a manual-entry tag form."""
 
 
+def _flatten_artist_credit(credit):
+    """MusicBrainz `artist-credit` is a list mixing dicts (each with a
+    `name` key AND/OR a nested `artist` dict that has its own `name`)
+    and bare strings (the join phrases like " & " or " feat. "). Some
+    dicts we've seen in the wild have `artist` but no top-level `name`,
+    or vice versa. Fall through the possibilities gracefully so a
+    single unexpected shape doesn't KeyError the whole detect flow."""
+    if not credit:
+        return ""
+    parts = []
+    for item in credit:
+        if isinstance(item, dict):
+            name = item.get("name")
+            if not name:
+                nested = item.get("artist") or {}
+                if isinstance(nested, dict):
+                    name = nested.get("name", "")
+            if name:
+                parts.append(str(name))
+        else:
+            parts.append(str(item))
+    return "".join(parts).strip()
+
+
 def _configure_mb_client():
     """MusicBrainz asks that clients set a useragent so they can
     identify traffic sources -- do it here so both the detect
@@ -74,15 +98,7 @@ def lookup_mb_release(disc):
     mbid = release.get("id")
 
     album_title = release.get("title", "")
-    album_artist = ""
-    artist_credit = release.get("artist-credit") or []
-    if artist_credit:
-        # artist-credit is a list of {name, artist:{...}} plus join
-        # phrases as bare strings -- join everything preserving order.
-        album_artist = "".join(
-            (item["name"] if isinstance(item, dict) else str(item))
-            for item in artist_credit
-        )
+    album_artist = _flatten_artist_credit(release.get("artist-credit"))
 
     year = None
     date = release.get("date") or ""
@@ -107,17 +123,28 @@ def lookup_mb_release(disc):
         for track in medium.get("track-list", []):
             recording = track.get("recording", {}) or {}
             title = recording.get("title") or track.get("title", "")
-            track_artist = ""
-            for item in recording.get("artist-credit") or []:
-                if isinstance(item, dict):
-                    track_artist += item.get("name", "")
-                else:
-                    track_artist += str(item)
-            duration_ms = int(track.get("length") or recording.get("length") or 0)
+            # Per-track artist-credit can live on either the track or
+            # the recording -- prefer the track's (it can override for
+            # split releases / features), fall back to the recording's.
+            track_ac = (track.get("artist-credit")
+                        or recording.get("artist-credit"))
+            track_artist = _flatten_artist_credit(track_ac) or album_artist
+            duration_ms = 0
+            for candidate in (track.get("length"), recording.get("length")):
+                try:
+                    duration_ms = int(candidate) if candidate else 0
+                except (TypeError, ValueError):
+                    duration_ms = 0
+                if duration_ms:
+                    break
+            try:
+                position = int(track.get("position") or track.get("number") or 0)
+            except (TypeError, ValueError):
+                position = 0
             tracks.append({
-                "position": int(track.get("position") or track.get("number") or 0),
+                "position": position,
                 "title": title,
-                "artist": track_artist or album_artist,
+                "artist": track_artist,
                 "duration_seconds": duration_ms / 1000.0 if duration_ms else None,
             })
         if matched:

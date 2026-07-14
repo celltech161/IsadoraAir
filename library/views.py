@@ -1960,7 +1960,15 @@ def api_cd_detect(request):
     except DiscNotFoundError as exc:
         return JsonResponse({"error": str(exc)}, status=404)
     except Exception as exc:
-        return JsonResponse({"error": f"CD detect failed: {exc}"}, status=500)
+        # Log full traceback so we can see WHICH field the MB parser
+        # tripped on -- the top-level `exc` message alone (e.g.
+        # KeyError('name')) doesn't say where.
+        import traceback
+        traceback.print_exc()
+        return JsonResponse(
+            {"error": f"CD detect failed: {type(exc).__name__}: {exc}"},
+            status=500,
+        )
 
 
 @require_http_methods(["POST"])
