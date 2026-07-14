@@ -137,6 +137,18 @@
     .console-remote_dj .deck-panel.deck-mode-preview { padding: 0.8rem 1rem; }
   }
 
+  /* Remote DJ view: transport buttons render on both deck panels
+     (JS builds them into both A and B unconditionally so the LIVE
+     role can move between slots without re-wiring the DOM), but we
+     only want them VISIBLE on the currently-playing deck. Hiding
+     via CSS on the preview deck means the class swap during a
+     crossfade auto-follows without any JS involvement. Not scoped
+     to a media query -- the constraint holds on both desktop and
+     mobile remote-dj layouts. */
+  .console-remote_dj .deck-panel.deck-mode-preview .deck-transport-btn {
+    display: none;
+  }
+
   .deck-panel {
     position: relative;
     overflow: hidden;
@@ -231,8 +243,8 @@
        (❚❚) for the single-glyph ⏸ (U+23F8) which draws crisply at
        any size, and pins the visible icon vertically regardless of
        the glyph's own font metrics. */
-    width: 2.2rem;
-    height: 1.7rem;
+    width: 2.0rem;
+    height: 1.5rem;
     padding: 0;
     display: inline-flex;
     align-items: center;
@@ -240,7 +252,7 @@
     /* Bumped from 0.95rem -- roughly 1.5x. With line-height: 1 and no
        padding this can't push the box larger; the fixed w/h above
        clips it. */
-    font-size: 1.35rem;
+    font-size: 1.5rem;
     font-weight: 500;
     line-height: 1;
     border-radius: 4px;
@@ -1474,10 +1486,8 @@ function buildDeckDOM(slot) {
       <span class="deck-label">Deck ${slot}</span>
       <div class="deck-controls">
         <span class="transport-badge" id="transportBadge-${slot}"></span>
-        ${IS_REMOTE_DJ ? '' : `
         <button class="deck-transport-btn" id="ejectBtn-${slot}" title="Start Next" disabled>&#x23ED;</button>
         <button class="deck-transport-btn" id="playPauseBtn-${slot}" title="Play/Pause" disabled>&#x23F5;</button>
-        `}
       </div>
     </div>
     <div class="np-meta">
@@ -1508,6 +1518,10 @@ function buildDeckDOM(slot) {
 
   deckState[slot].deckBuilt = true;
 
+  // Waveform-click scrubbing stays operator-only -- it's a bigger
+  // control action than a pause/skip and could jump the audible
+  // position by seconds mid-track, which we don't want a remote DJ
+  // to trigger by accidental tap.
   if (!IS_REMOTE_DJ) {
     document.getElementById(`npWaveform-${slot}`).addEventListener('click', function(e) {
       if (!deckState[slot].localDuration) return;
@@ -1516,14 +1530,19 @@ function buildDeckDOM(slot) {
       const pos = pct * deckState[slot].localDuration;
       seekTo(slot, Math.max(0, Math.min(deckState[slot].localDuration, pos)));
     });
-
-    document.getElementById(`ejectBtn-${slot}`).addEventListener('click', () => {
-      deckCommand(slot, 'eject');
-    });
-    document.getElementById(`playPauseBtn-${slot}`).addEventListener('click', () => {
-      handlePlayPause(slot);
-    });
   }
+
+  // Transport buttons (next / play-pause) are wired unconditionally --
+  // they render on both console and /remote-dj/, though on remote_dj
+  // mode CSS hides them on the preview deck so only the currently-
+  // playing deck exposes them (see .console-remote_dj
+  // .deck-panel.deck-mode-preview .deck-transport-btn rule).
+  document.getElementById(`ejectBtn-${slot}`).addEventListener('click', () => {
+    deckCommand(slot, 'eject');
+  });
+  document.getElementById(`playPauseBtn-${slot}`).addEventListener('click', () => {
+    handlePlayPause(slot);
+  });
 }
 
 function handlePlayPause(slot) {
@@ -1622,10 +1641,8 @@ function renderDeckPreview(slot, track, serverTimestamp) {
     buildDeckDOM(slot);
     st.mode = 'preview';
     st.lastTrackId = null;
-    if (!IS_REMOTE_DJ) {
-      document.getElementById(`playPauseBtn-${slot}`).disabled = true;
-      document.getElementById(`ejectBtn-${slot}`).disabled = true;
-    }
+    document.getElementById(`playPauseBtn-${slot}`).disabled = true;
+    document.getElementById(`ejectBtn-${slot}`).disabled = true;
     document.querySelector(`#deck-${slot} .np-timing`).style.display = 'none';
     document.getElementById(`npStartsAt-${slot}`).style.display = '';
   }
@@ -1664,10 +1681,8 @@ function renderDeckLive(slot, deck, transport) {
     buildDeckDOM(slot);
     st.mode = 'live';
     st.lastTrackId = null;
-    if (!IS_REMOTE_DJ) {
-      document.getElementById(`playPauseBtn-${slot}`).disabled = false;
-      document.getElementById(`ejectBtn-${slot}`).disabled = false;
-    }
+    document.getElementById(`playPauseBtn-${slot}`).disabled = false;
+    document.getElementById(`ejectBtn-${slot}`).disabled = false;
     document.querySelector(`#deck-${slot} .np-timing`).style.display = '';
   }
 
