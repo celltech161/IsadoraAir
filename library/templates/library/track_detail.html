@@ -173,34 +173,6 @@
     margin-bottom: 0.5rem;
   }
 
-  .waveform-legend {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 1.1rem;
-    margin-top: 0.4rem;
-    font-size: 0.7rem;
-    color: var(--text-muted);
-  }
-
-  .waveform-legend .legend-item {
-    display: flex;
-    align-items: center;
-    gap: 0.3rem;
-  }
-
-  .legend-swatch {
-    width: 10px;
-    height: 10px;
-    border-radius: 2px;
-    display: inline-block;
-  }
-
-  .save-bar {
-    margin-top: 1.25rem;
-    display: flex;
-    align-items: center;
-    gap: 0.75rem;
-  }
 
   .save-btn {
     background: var(--accent);
@@ -237,7 +209,6 @@
   <div class="cue-selector" id="cueSelector"></div>
   <div class="cue-hint" id="cueHint">Click the waveform to seek. Pick a cue name above to set that cue's position on the next click.</div>
   <canvas id="waveformCanvas"></canvas>
-  <div class="waveform-legend" id="waveformLegend"></div>
 </div>
 
 <div class="detail-grid">
@@ -428,8 +399,10 @@
     </div>
     <div class="field-row">
       <label></label>
-      <button type="button" class="save-btn" style="padding:0.4rem 1rem;font-size:0.78rem;" onclick="reanalyzeTrack()" id="reanalyzeBtn">Reanalyze Track</button>
+      <button class="save-btn" style="padding:0.4rem 1rem;font-size:0.78rem;" onclick="saveTrack()">Save Changes</button>
+      <button type="button" class="save-btn" style="padding:0.4rem 1rem;font-size:0.78rem;margin-left:0.4rem;" onclick="reanalyzeTrack()" id="reanalyzeBtn">Reanalyze Track</button>
       <button type="button" class="save-btn" style="padding:0.4rem 1rem;font-size:0.78rem;margin-left:0.4rem;" onclick="repickCuePoints()" id="repickCueBtn" title="Fast re-pick of cue-in and next-start using saved envelope data + this track's category threshold overrides (or global defaults). No audio decode.">Reset Cue Points</button>
+      <span class="save-msg" id="saveMsg" style="margin-left:0.6rem;">Saved</span>
       <span class="save-msg" id="reanalyzeMsg">Done</span>
     </div>
   </div>
@@ -438,11 +411,6 @@
 <div class="detail-section" style="margin-top:1.25rem;">
   <h2>Rotation Availability</h2>
   {% include "library/_blocked_slots_grid.html" with track_id=track.pk blocked_slots=track.blocked_slots %}
-</div>
-
-<div class="save-bar">
-  <button class="save-btn" onclick="saveTrack()">Save Changes</button>
-  <span class="save-msg" id="saveMsg">Saved</span>
 </div>
 {% endblock %}
 
@@ -685,11 +653,6 @@ function buildCueSelector() {
     if (f.key === activeCueKey) btn.classList.add('active');
     bar.appendChild(btn);
   }
-
-  const legend = document.getElementById('waveformLegend');
-  legend.innerHTML = `<span class="legend-item"><span class="legend-swatch" style="background:${WAVEFORM_LEFT_COLOR};"></span> Left</span>`
-    + `<span class="legend-item"><span class="legend-swatch" style="background:${WAVEFORM_RIGHT_COLOR};"></span> Right</span>`
-    + CUE_FIELDS.map(f => `<span class="legend-item"><span class="legend-swatch" style="background:${f.color};"></span> ${f.label}</span>`).join('');
 }
 
 function updateCueHint() {
