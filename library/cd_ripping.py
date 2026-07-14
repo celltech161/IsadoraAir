@@ -188,6 +188,27 @@ def detect_disc(device=DEFAULT_CD_DEVICE):
     return payload
 
 
+def spawn_rip_child(job_id):
+    """Fork the cd_rip_run management command as a detached
+    subprocess so the caller (a Django view) can return immediately.
+    start_new_session=True detaches the child from the gunicorn
+    worker's process group -- a worker restart / kill won't reap
+    an in-flight rip. Returns the PID."""
+    import os
+    import sys
+    manage_py = Path(__file__).resolve().parent.parent / "manage.py"
+    # Use the current interpreter -- same venv as this process.
+    proc = subprocess.Popen(
+        [sys.executable, str(manage_py), "cd_rip_run", str(job_id)],
+        cwd=str(manage_py.parent),
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,
+        env=os.environ.copy(),
+    )
+    return proc.pid
+
+
 def eject(device=DEFAULT_CD_DEVICE):
     """Open the tray. Returns None on success; raises RuntimeError
     with the stderr on failure. `eject` is idempotent on an already-

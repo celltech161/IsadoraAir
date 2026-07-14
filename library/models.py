@@ -941,3 +941,56 @@ class EmailLog(models.Model):
 
     def __str__(self):
         return f"{self.sent_at:%Y-%m-%d %H:%M} -> {self.to}: {self.subject}"
+
+
+class CDRipJob(models.Model):
+    """One CD-rip attempt. Only one is ever active at a time (there's
+    one drive), but we keep completed rows around for at least a bit
+    so the operator can see what came off recent discs. Progress is
+    written by the detached `cd_rip_run` management command; the
+    /api/cd/rip-status/ endpoint reads directly from this row."""
+    STATE_CHOICES = [
+        ("pending", "Pending"),
+        ("running", "Running"),
+        ("done", "Done"),
+        ("error", "Error"),
+        ("cancelled", "Cancelled"),
+    ]
+    state = models.CharField(max_length=12, choices=STATE_CHOICES, default="pending")
+    disc_id = models.CharField(max_length=64, blank=True)
+    mb_release_id = models.CharField(max_length=64, blank=True)
+    device = models.CharField(max_length=64, default="/dev/sr0")
+    category = models.ForeignKey(
+        Category, on_delete=models.PROTECT, related_name="+",
+        help_text="Category all ripped tracks land under.",
+    )
+    # Operator-edited album/track metadata frozen at rip-start; the
+    # detached child reads this to tag each output FLAC and to build
+    # per-track Artist/Album/etc rows. Shape matches the detect
+    # endpoint's response.
+    album_meta = models.JSONField(default=dict, blank=True)
+    staging_dir = models.CharField(max_length=512, blank=True)
+    whipper_pid = models.IntegerField(null=True, blank=True)
+    progress_current_track = models.PositiveIntegerField(default=0)
+    progress_total_tracks = models.PositiveIntegerField(default=0)
+    status_message = models.CharField(max_length=500, blank=True)
+    error_message = models.TextField(blank=True)
+    # Track ids the rip landed successfully -- lets the UI link
+    # straight to /track/<pk>/ pages for review.
+    created_track_ids = models.JSONField(default=list, blank=True)
+    accurate_rip_matches = models.JSONField(
+        default=list, blank=True,
+        help_text="Per-track AccurateRip check outcome, in track order: "
+                  "'match', 'nomatch', 'notfound', or '' for tracks that "
+                  "hadn't completed yet.",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        verbose_name = "CD Rip Job"
+        verbose_name_plural = "CD Rip Jobs"
+
+    def __str__(self):
+        return f"CDRipJob #{self.id} ({self.state}) {self.disc_id[:12]}"

@@ -1974,13 +1974,129 @@ def api_cd_detect(request):
 @require_http_methods(["POST"])
 def api_cd_eject(request):
     """Open the CD tray. Idempotent -- calling it with the tray
-    already open is a no-op success."""
+    already open is a no-op success. Refuses if a rip is in flight
+    so the operator can't yank the disc mid-rip."""
     from library.cd_ripping import eject
+    from library.models import CDRipJob
+    if CDRipJob.objects.filter(state__in=["pending", "running"]).exists():
+        return JsonResponse(
+            {"error": "A rip is in progress -- cancel it before ejecting."},
+            status=409,
+        )
     try:
         eject()
         return JsonResponse({"ok": True})
     except Exception as exc:
         return JsonResponse({"error": str(exc)}, status=500)
+
+
+@require_http_methods(["POST"])
+def api_cd_rip_start(request):
+    """Kick off a rip. Body is JSON: {category_id, disc_id,
+    mb_release_id (optional), album_meta}. Fails 409 if a rip is
+    already running -- one drive, one at a time."""
+    from library.cd_ripping import spawn_rip_child
+    from library.models import CDRipJob
+    if CDRipJob.objects.filter(state__in=["pending", "running"]).exists():
+        return JsonResponse(
+            {"error": "A rip is already in progress."},
+            status=409,
+        )
+    try:
+        body = json.loads(request.body.decode("utf-8"))
+    except Exception:
+        return JsonResponse({"error": "Invalid JSON body."}, status=400)
+    category_id = body.get("category_id")
+    if not category_id:
+        return JsonResponse({"error": "category_id required"}, status=400)
+    category = get_object_or_404(Category, pk=category_id)
+    album_meta = body.get("album_meta") or {}
+    tracks = album_meta.get("tracks") or []
+    if not tracks:
+        return JsonResponse({"error": "album_meta.tracks is empty"}, status=400)
+
+    from django.conf import settings as _settings
+    staging_root = Path(getattr(_settings, "CD_RIP_STAGING_ROOT", "/srv/isadoraair/rip_staging"))
+    staging_root.mkdir(parents=True, exist_ok=True)
+
+    job = CDRipJob.objects.create(
+        state="pending",
+        disc_id=body.get("disc_id", ""),
+        mb_release_id=body.get("mb_release_id", ""),
+        device=body.get("device", "/dev/sr0"),
+        category=category,
+        album_meta=album_meta,
+        progress_total_tracks=len(tracks),
+        status_message="Queued.",
+    )
+    job.staging_dir = str(staging_root / f"job-{job.id}")
+    job.save(update_fields=["staging_dir"])
+
+    try:
+        pid = spawn_rip_child(job.id)
+    except Exception as exc:
+        job.state = "error"
+        job.error_message = f"Failed to spawn rip child: {exc}"
+        job.finished_at = timezone.now()
+        job.save()
+        return JsonResponse({"error": str(exc)}, status=500)
+
+    return JsonResponse({"ok": True, "job_id": job.id, "pid": pid})
+
+
+@require_http_methods(["GET"])
+def api_cd_rip_status(request):
+    """Return the current rip job (whichever is most recent, whether
+    running or terminal), including progress + created track links.
+    Returns 204 if no job has ever run so the frontend can render an
+    idle state."""
+    from library.models import CDRipJob
+    job = CDRipJob.objects.order_by("-created_at").first()
+    if job is None:
+        return JsonResponse({"state": "idle"})
+    payload = {
+        "id": job.id,
+        "state": job.state,
+        "disc_id": job.disc_id,
+        "category": {"id": job.category_id, "code": job.category.code},
+        "album_title": (job.album_meta or {}).get("album_title", ""),
+        "album_artist": (job.album_meta or {}).get("album_artist", ""),
+        "progress_current_track": job.progress_current_track,
+        "progress_total_tracks": job.progress_total_tracks,
+        "status_message": job.status_message,
+        "error_message": job.error_message,
+        "created_track_ids": job.created_track_ids,
+        "accurate_rip_matches": job.accurate_rip_matches,
+        "created_at": job.created_at.isoformat(),
+        "finished_at": job.finished_at.isoformat() if job.finished_at else None,
+    }
+    return JsonResponse(payload)
+
+
+@require_http_methods(["POST"])
+def api_cd_rip_cancel(request):
+    """Cancel the currently-running rip by killing the whipper
+    subprocess. Best-effort -- if whipper has moved on to
+    post-processing, this may not stop cleanly."""
+    from library.models import CDRipJob
+    import os, signal
+    job = CDRipJob.objects.filter(state__in=["pending", "running"]).first()
+    if job is None:
+        return JsonResponse({"ok": True, "message": "No active rip."})
+    if job.whipper_pid:
+        try:
+            # Kill the whole process group (child was started with
+            # start_new_session=True, so it has its own pgid).
+            os.killpg(os.getpgid(job.whipper_pid), signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        except Exception as exc:
+            return JsonResponse({"error": f"Kill failed: {exc}"}, status=500)
+    job.state = "cancelled"
+    job.status_message = "Cancelled by operator."
+    job.finished_at = timezone.now()
+    job.save(update_fields=["state", "status_message", "finished_at"])
+    return JsonResponse({"ok": True})
 
 
 # Browser-native <audio> support varies by codec -- mp3/wav/ogg/m4a play
