@@ -222,17 +222,40 @@
   .transport-badge.UPNEXT  { background: rgba(59, 130, 246, 0.15); color: #3b82f6; }
 
   .deck-transport-btn {
-    font-size: 0.95rem;
-    font-weight: 700;
-    padding: 0.1rem 0.55rem;
+    /* Fixed dimensions so the icon can scale up freely without
+       inflating the button. Previous form let `font-size + padding`
+       drive the box, which capped the glyph size to something small
+       enough to look toy-ish next to the polished dashboard chrome
+       elsewhere.
+       inline-flex + center-both lets us drop the twin-glyph pause
+       (❚❚) for the single-glyph ⏸ (U+23F8) which draws crisply at
+       any size, and pins the visible icon vertically regardless of
+       the glyph's own font metrics. */
+    width: 2.2rem;
+    height: 1.7rem;
+    padding: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    /* Bumped from 0.95rem -- roughly 1.5x. With line-height: 1 and no
+       padding this can't push the box larger; the fixed w/h above
+       clips it. */
+    font-size: 1.35rem;
+    font-weight: 500;
+    line-height: 1;
     border-radius: 4px;
     border: 1px solid var(--border-subtle);
     background: transparent;
     color: var(--text-main);
     cursor: pointer;
-    line-height: 1.4;
   }
-  .deck-transport-btn:hover { border-color: var(--accent); }
+  .deck-transport-btn:hover:not(:disabled) {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  .deck-transport-btn:active:not(:disabled) {
+    transform: translateY(1px);
+  }
   .deck-transport-btn:disabled { opacity: 0.3; cursor: not-allowed; border-color: var(--border-subtle); }
 
   .np-meta {
@@ -1452,8 +1475,8 @@ function buildDeckDOM(slot) {
       <div class="deck-controls">
         <span class="transport-badge" id="transportBadge-${slot}"></span>
         ${IS_REMOTE_DJ ? '' : `
-        <button class="deck-transport-btn" id="ejectBtn-${slot}" title="Start Next" disabled>&#9197;</button>
-        <button class="deck-transport-btn" id="playPauseBtn-${slot}" title="Play/Pause" disabled>&#9654;</button>
+        <button class="deck-transport-btn" id="ejectBtn-${slot}" title="Start Next" disabled>&#x23ED;</button>
+        <button class="deck-transport-btn" id="playPauseBtn-${slot}" title="Play/Pause" disabled>&#x23F5;</button>
         `}
       </div>
     </div>
@@ -1675,7 +1698,10 @@ function renderDeckLive(slot, deck, transport) {
   badge.className = 'transport-badge ' + badgeState;
 
   const playPauseBtn = document.getElementById(`playPauseBtn-${slot}`);
-  if (playPauseBtn) playPauseBtn.innerHTML = st.paused ? '&#9654;' : '&#10074;&#10074;';
+  // Use the media-control block for both states (U+23F5 ⏵ and U+23F8 ⏸)
+  // so the toggle draws with matching visual weight instead of a fat
+  // triangle (U+25B6) flipping to two vertical bars (U+275A twice).
+  if (playPauseBtn) playPauseBtn.innerHTML = st.paused ? '&#x23F5;' : '&#x23F8;';
 
   st.localPosition = deck.position || 0;
   st.localDuration = deck.duration || 0;
