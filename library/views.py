@@ -276,6 +276,58 @@ def api_category_detail(request, pk):
 
 
 @require_http_methods(["POST"])
+def api_track_repick_cue_points(request, pk):
+    """Fast cue-point repick for a single track: reads the saved envelope
+    from the track's waveform JSON, applies the track's effective
+    thresholds (category overrides on top of global AnalysisConfig
+    defaults), writes the new cue_in_seconds / next_start_seconds back
+    to both the DB and the JSON. No ffmpeg decode -- seconds instead of
+    minutes.
+
+    Returns 400 when the track's waveform JSON is missing or lacks
+    envelope data (pre-envelope-persistence): the client-side handler
+    surfaces the error message so the operator knows to use "Reanalyze
+    Track" (which does the full decode + envelope pass) instead."""
+    from library.management.commands.analyze_tracks import (
+        apply_category_thresholds, repick_cue_points_from_json,
+    )
+    from library.models import AnalysisConfig
+    track = get_object_or_404(Track.objects.select_related("category"), pk=pk)
+    if not track.waveform_path or not Path(track.waveform_path).is_file():
+        return JsonResponse({
+            "error": "No waveform data for this track yet -- use \"Reanalyze "
+                     "Track\" to run a full analysis pass first.",
+        }, status=400)
+    cfg = AnalysisConfig.load()
+    _sr, _ws, _tp, ns_db, ci_db, ci_min = apply_category_thresholds(
+        (cfg.analysis_sample_rate, cfg.analysis_window_seconds, cfg.waveform_points,
+         cfg.next_start_threshold_db, cfg.cue_in_threshold_db, cfg.cue_in_min_seconds),
+        track.category.next_start_threshold_db_override if track.category_id else None,
+        track.category.cue_in_threshold_db_override if track.category_id else None,
+    )
+    try:
+        next_start, cue_in, payload = repick_cue_points_from_json(
+            track.waveform_path, ns_db, ci_db, ci_min,
+        )
+    except LookupError:
+        return JsonResponse({
+            "error": "This track's waveform JSON pre-dates envelope "
+                     "persistence -- use \"Reanalyze Track\" first to "
+                     "populate envelope data. Future repicks on it will "
+                     "then be instant.",
+        }, status=400)
+    Track.objects.filter(id=track.id).update(
+        next_start_seconds=next_start, cue_in_seconds=cue_in,
+    )
+    try:
+        Path(track.waveform_path).write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    except Exception as exc:
+        print(f"  [track repick] track {track.id} JSON write failed: {exc}")
+    track.refresh_from_db()
+    return JsonResponse(_track_to_dict(track))
+
+
+@require_http_methods(["POST"])
 def api_category_repick_cue_points(request, pk):
     """Smart cue-point refresh for every track in this category. For each
     track, fast-paths against the saved mono envelope in its waveform

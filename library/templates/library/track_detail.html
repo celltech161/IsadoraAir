@@ -429,6 +429,7 @@
     <div class="field-row">
       <label></label>
       <button type="button" class="save-btn" style="padding:0.4rem 1rem;font-size:0.78rem;" onclick="reanalyzeTrack()" id="reanalyzeBtn">Reanalyze Track</button>
+      <button type="button" class="save-btn" style="padding:0.4rem 1rem;font-size:0.78rem;margin-left:0.4rem;" onclick="repickCuePoints()" id="repickCueBtn" title="Fast re-pick of cue-in and next-start using saved envelope data + this track's category threshold overrides (or global defaults). No audio decode.">Reset Cue Points</button>
       <span class="save-msg" id="reanalyzeMsg">Done</span>
     </div>
   </div>
@@ -799,6 +800,42 @@ async function reanalyzeTrack() {
     }
   } catch (e) {
     msg.textContent = 'Reanalyze failed';
+    msg.style.color = 'var(--danger)';
+  }
+
+  btn.disabled = false;
+  btn.textContent = prevLabel;
+  msg.classList.add('show');
+  setTimeout(() => msg.classList.remove('show'), 2500);
+}
+
+// --- Fast cue-point repick (no audio decode) ---
+async function repickCuePoints() {
+  const btn = document.getElementById('repickCueBtn');
+  const msg = document.getElementById('reanalyzeMsg');
+  btn.disabled = true;
+  const prevLabel = btn.textContent;
+  btn.textContent = 'Picking…';
+
+  try {
+    const resp = await fetch(`/api/tracks/${TRACK_ID}/repick-cue-points/`, {
+      method: 'POST',
+      headers: { 'X-CSRFToken': getCookie('csrftoken') },
+    });
+    const data = await resp.json();
+
+    if (!resp.ok) {
+      msg.textContent = data.error || 'Repick failed';
+      msg.style.color = 'var(--danger)';
+    } else {
+      document.getElementById('f_cue_in_seconds').value = data.cue_in_seconds ?? '';
+      document.getElementById('f_next_start_seconds').value = data.next_start_seconds ?? '';
+      await loadWaveform();
+      msg.textContent = 'Cue points updated';
+      msg.style.color = 'var(--accent)';
+    }
+  } catch (e) {
+    msg.textContent = 'Repick failed';
     msg.style.color = 'var(--danger)';
   }
 

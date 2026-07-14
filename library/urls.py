@@ -37,6 +37,7 @@ urlpatterns = [
     path('api/tracks/<int:pk>/', views.api_track_detail, name='api-track-detail'),
     path('api/tracks/<int:pk>/audio/', views.api_track_audio, name='api-track-audio'),
     path('api/tracks/<int:pk>/reanalyze/', views.api_track_reanalyze, name='api-track-reanalyze'),
+    path('api/tracks/<int:pk>/repick-cue-points/', views.api_track_repick_cue_points, name='api-track-repick-cue-points'),
     path('api/tracks/<int:pk>/read-metadata/', views.api_track_read_metadata, name='api-track-read-metadata'),
     path('api/tracks/<int:pk>/write-metadata/', views.api_track_write_metadata, name='api-track-write-metadata'),
     path('api/tracks/<int:pk>/blocked-slots/toggle/', views.api_track_blocked_slot_toggle, name='api-track-blocked-slot-toggle'),
