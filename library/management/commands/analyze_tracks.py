@@ -47,6 +47,95 @@ def repick_cue_points_from_json(json_path, next_start_db, cue_in_db, cue_in_min)
     return next_start, cue_in, payload
 
 
+# Lossless formats without native metadata support -- normalize to
+# FLAC at analysis time so the library ends up single-format and
+# tag-friendly. Kept in sync with fix_unknown_artists.TRANSCODE_EXTS.
+TRANSCODE_TO_FLAC_EXTS = {".wav", ".aif", ".aiff"}
+
+
+def transcode_lossless_to_flac(track_id, filepath, filename):
+    """If `filepath` is a WAV/AIF/AIFF, transcode to sibling .flac,
+    copy the current DB row's artist/title/album/genre/year onto the
+    FLAC as tags, update the Track row's filepath/filename/format in
+    place, and delete the original source. Returns the (new_filepath,
+    new_filename) tuple whether or not we transcoded -- callers use
+    the returned values for the rest of the analysis pass.
+
+    On any failure returns None so the caller can skip the track and
+    let a future analyze pass retry. Never raises. Called at the top
+    of analyze_one_track so all three of its entry points (bulk
+    analyze_tracks, sync_track_file, api_track_reanalyze) inherit
+    the behavior -- fresh WAV uploads land as FLAC once the analyze
+    timer catches them (~1 min after upload), same DB row, same track
+    id, no dual-row weeding to do afterwards."""
+    src = Path(filepath)
+    if src.suffix.lower() not in TRANSCODE_TO_FLAC_EXTS:
+        return (filepath, filename)
+
+    dst = src.with_suffix(".flac")
+    if dst.exists():
+        print(f"  [transcode] track {track_id}: target FLAC already exists, "
+              f"cannot swap: {dst}")
+        return None
+
+    try:
+        subprocess.run(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
+             "-i", str(src), "-c:a", "flac", "-compression_level", "5",
+             str(dst)],
+            check=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        print(f"  [transcode] ffmpeg failed for track {track_id}: {exc}")
+        # Clean up any partial output so a retry starts clean.
+        if dst.exists():
+            try:
+                dst.unlink()
+            except Exception:
+                pass
+        return None
+
+    # Write tags into the new FLAC from the current DB row's fields.
+    # `parse_tags` already ran at upload time, so the row is the
+    # authoritative source; if an operator has since edited artist/
+    # title in the DB, this call preserves those edits into the FLAC.
+    try:
+        from mutagen.flac import FLAC
+        db_row = (Track.objects
+                  .select_related("artist", "album", "genre")
+                  .filter(id=track_id)
+                  .first())
+        if db_row:
+            audio = FLAC(str(dst))
+            audio["artist"] = db_row.artist.name
+            audio["title"] = db_row.title
+            if db_row.album:
+                audio["album"] = db_row.album.title
+            if db_row.genre:
+                audio["genre"] = db_row.genre.name
+            if db_row.year:
+                audio["date"] = str(db_row.year)
+            if db_row.track_number:
+                audio["tracknumber"] = str(db_row.track_number)
+            audio.save()
+    except Exception as exc:
+        print(f"  [transcode] tag write failed for track {track_id} "
+              f"(non-fatal, DB still authoritative): {exc}")
+
+    Track.objects.filter(id=track_id).update(
+        filepath=str(dst), filename=dst.name, format="flac",
+    )
+
+    try:
+        src.unlink()
+    except Exception as exc:
+        print(f"  [transcode] failed to delete source {src} "
+              f"(non-fatal, disk cleanup): {exc}")
+
+    print(f"  [transcode] track {track_id}: {src.name} -> {dst.name}")
+    return (str(dst), dst.name)
+
+
 def apply_category_thresholds(base_cfg_values, next_start_override, cue_in_override):
     """Overlay per-Category `next_start_threshold_db_override` and
     `cue_in_threshold_db_override` on top of the base AnalysisConfig
@@ -316,6 +405,14 @@ def analyze_one_track(row, cfg_values, wave_dir, force):
     (sample_rate, window_seconds, target_points,
      next_start_db, cue_in_db, cue_in_min) = cfg_values
     track_id, filepath, filename, duration, title, artist_name, existing_related = row
+
+    # Auto-transcode WAV/AIF/AIFF to FLAC before analysis. No-op for
+    # already-FLAC/MP3/etc tracks. Failure returns None -- skip this
+    # track and let the next analyze pass retry from a clean slate.
+    swap = transcode_lossless_to_flac(track_id, filepath, filename)
+    if swap is None:
+        return False
+    filepath, filename = swap
     fp = Path(filepath)
 
     if not fp.is_file():
