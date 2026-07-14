@@ -256,10 +256,28 @@
       </div>
       <div class="cat-form-hint">Leave separation fields blank to use the global defaults from Recency Configuration.</div>
 
+      <div class="cat-form-two">
+        <div class="cat-form-row">
+          <label for="fNextStartThresh">Next Start Threshold (dBFS)</label>
+          <input type="number" class="pl-input" id="fNextStartThresh" placeholder="Global default" step="0.5">
+        </div>
+        <div class="cat-form-row">
+          <label for="fCueInThresh">Cue In Threshold (dBFS)</label>
+          <input type="number" class="pl-input" id="fCueInThresh" placeholder="Global default" step="0.5">
+        </div>
+      </div>
+      <div class="cat-form-hint">
+        Leave threshold fields blank to use the global defaults from Analysis Configuration.
+        Use more-negative values (e.g. -35 dBFS) for programme material that sits below normal
+        broadcast level, otherwise the next-track trigger fires over the natural tail.
+      </div>
+
       <div class="cat-form-actions">
         <button type="button" class="pl-btn primary" onclick="saveCategory()">Save</button>
         <button type="button" class="pl-btn danger" id="deleteCategoryBtn" onclick="deleteCurrentCategory()" style="display:none;">Delete</button>
         <button type="button" class="pl-btn" onclick="newCategory()">Clear</button>
+        <button type="button" class="pl-btn" id="reanalyzeCategoryBtn" onclick="reanalyzeCategoryTracks()" style="display:none;"
+                title="Clears next-start on every track in this category so the analyze timer re-runs cue-point analysis using the thresholds above.">Re-analyze Tracks</button>
       </div>
     </form>
   </div>
@@ -339,7 +357,10 @@ function newCategory() {
   document.getElementById('fRecencyMode').value = 'time';
   document.getElementById('fArtistSep').value = '';
   document.getElementById('fTitleSep').value = '';
+  document.getElementById('fNextStartThresh').value = '';
+  document.getElementById('fCueInThresh').value = '';
   document.getElementById('deleteCategoryBtn').style.display = 'none';
+  document.getElementById('reanalyzeCategoryBtn').style.display = 'none';
   setMsg('');
   renderCategoryTable();
 }
@@ -358,7 +379,10 @@ function editCategory(id) {
   document.getElementById('fRecencyMode').value = c.recency_mode;
   document.getElementById('fArtistSep').value = c.artist_separation != null ? c.artist_separation : '';
   document.getElementById('fTitleSep').value = c.title_separation != null ? c.title_separation : '';
+  document.getElementById('fNextStartThresh').value = c.next_start_threshold_db_override != null ? c.next_start_threshold_db_override : '';
+  document.getElementById('fCueInThresh').value = c.cue_in_threshold_db_override != null ? c.cue_in_threshold_db_override : '';
   document.getElementById('deleteCategoryBtn').style.display = '';
+  document.getElementById('reanalyzeCategoryBtn').style.display = '';
   setMsg('');
   renderCategoryTable();
 }
@@ -374,6 +398,8 @@ async function saveCategory() {
     recency_mode: document.getElementById('fRecencyMode').value,
     artist_separation: document.getElementById('fArtistSep').value === '' ? null : parseFloat(document.getElementById('fArtistSep').value),
     title_separation: document.getElementById('fTitleSep').value === '' ? null : parseFloat(document.getElementById('fTitleSep').value),
+    next_start_threshold_db_override: document.getElementById('fNextStartThresh').value === '' ? null : parseFloat(document.getElementById('fNextStartThresh').value),
+    cue_in_threshold_db_override: document.getElementById('fCueInThresh').value === '' ? null : parseFloat(document.getElementById('fCueInThresh').value),
   };
 
   if (!payload.code || !payload.name) {
@@ -418,6 +444,35 @@ async function deleteCurrentCategory() {
   setMsg('Category deleted.');
   await loadCategories();
   newCategory();
+}
+
+async function reanalyzeCategoryTracks() {
+  if (!currentCategoryId) return;
+  const c = categories.find(x => x.id === currentCategoryId);
+  const label = c ? c.code : 'this category';
+  const trackCount = c && c.track_count != null ? c.track_count : '?';
+  if (!confirm(
+    `Re-analyze all tracks in "${label}" (${trackCount} track(s))?\n\n` +
+    `This clears next_start on every track in the category, letting the ` +
+    `analyze timer re-run cue-point analysis with the thresholds shown ` +
+    `above. Manual intro/outro/hook marks are NOT touched.`
+  )) return;
+
+  // Save first if the operator has unsaved threshold edits -- otherwise
+  // the re-analysis fires with the last-saved values, not the ones
+  // currently in the form. Simpler than trying to detect dirty state.
+  setMsg('Saving current settings first...');
+  await saveCategory();
+
+  const { ok, data } = await apiJson(`/api/categories/${currentCategoryId}/reset-analysis/`, {
+    method: 'POST',
+    headers: { 'X-CSRFToken': getCookie('csrftoken') },
+  });
+  if (!ok) {
+    setMsg(data && data.error ? data.error : 'Could not queue re-analysis', true);
+    return;
+  }
+  setMsg(data.message || `Queued ${data.queued || 0} track(s) for re-analysis.`);
 }
 
 loadCategories();

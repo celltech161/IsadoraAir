@@ -148,6 +148,8 @@ def _category_to_dict(category):
         "recency_mode": category.recency_mode,
         "artist_separation": category.artist_separation,
         "title_separation": category.title_separation,
+        "next_start_threshold_db_override": category.next_start_threshold_db_override,
+        "cue_in_threshold_db_override": category.cue_in_threshold_db_override,
         "track_count": getattr(category, "_track_count", None),
     }
 
@@ -195,6 +197,8 @@ def api_category_list(request):
         recency_mode=body.get("recency_mode") or "time",
         artist_separation=_blank_to_none(body.get("artist_separation")),
         title_separation=_blank_to_none(body.get("title_separation")),
+        next_start_threshold_db_override=_blank_to_none(body.get("next_start_threshold_db_override")),
+        cue_in_threshold_db_override=_blank_to_none(body.get("cue_in_threshold_db_override")),
     )
     try:
         category.full_clean()
@@ -257,6 +261,10 @@ def api_category_detail(request, pk):
         category.artist_separation = _blank_to_none(body["artist_separation"])
     if "title_separation" in body:
         category.title_separation = _blank_to_none(body["title_separation"])
+    if "next_start_threshold_db_override" in body:
+        category.next_start_threshold_db_override = _blank_to_none(body["next_start_threshold_db_override"])
+    if "cue_in_threshold_db_override" in body:
+        category.cue_in_threshold_db_override = _blank_to_none(body["cue_in_threshold_db_override"])
 
     try:
         category.full_clean()
@@ -265,6 +273,43 @@ def api_category_detail(request, pk):
     category.save()
 
     return JsonResponse(_category_to_dict(category))
+
+
+@require_http_methods(["POST"])
+def api_category_reset_analysis(request, pk):
+    """Clear the analysis marks (`next_start_seconds` = NULL) on every
+    track in this category so `isadoraair-analyze.timer` re-picks them
+    up within the minute and re-runs the cue-point analysis using the
+    category's current threshold overrides.
+
+    Only touches `next_start_seconds` because that's the field the
+    analyze timer's queryset filters on (`.filter(
+    next_start_seconds__isnull=True)`). analyze_one_track always
+    recomputes both `cue_in_seconds` AND `next_start_seconds` when it
+    runs, so setting one to NULL is enough to get both refreshed --
+    no need to also clear cue_in_seconds separately.
+
+    Manual cue-point edits (`intro_until_seconds`, `sweep_start_seconds`,
+    `outro_starts_seconds`, `hook_in_seconds`, `hook_out_seconds`) are
+    NEVER written by analyze_one_track and so are preserved -- an
+    operator's careful hand-tuning of a hook or outro survives a
+    category-wide re-analysis untouched.
+
+    Deliberately fires the work asynchronously (via the existing
+    analyze timer) rather than blocking the HTTP request on a
+    potentially-minutes-long re-analysis loop -- same pattern as
+    api_library_upload since 178dc70."""
+    category = get_object_or_404(Category, pk=pk)
+    from library.models import Track
+    count = Track.objects.filter(category=category).update(next_start_seconds=None)
+    return JsonResponse({
+        "ok": True,
+        "queued": count,
+        "message": (
+            f"{count} track(s) in '{category.code}' queued for re-analysis. "
+            f"The analyze timer will process them over the next minute."
+        ),
+    })
 
 
 @require_http_methods(["GET", "POST"])
@@ -902,16 +947,27 @@ def api_track_reanalyze(request, pk):
     related_artists/duration_seconds -- the manually-set marks (intro,
     sweep, outro, hooks) are never written by analyze_one_track, so this
     can't clobber a human's own cue-point edits."""
-    from library.management.commands.analyze_tracks import analyze_one_track, get_waveforms_dir
+    from library.management.commands.analyze_tracks import (
+        analyze_one_track, apply_category_thresholds, get_waveforms_dir,
+    )
     from library.models import AnalysisConfig
 
-    track = get_object_or_404(Track.objects.select_related("artist"), pk=pk)
+    track = get_object_or_404(Track.objects.select_related("artist", "category"), pk=pk)
 
     cfg = AnalysisConfig.load()
     cfg_values = (
         cfg.analysis_sample_rate, cfg.analysis_window_seconds, cfg.waveform_points,
         cfg.next_start_threshold_db, cfg.cue_in_threshold_db, cfg.cue_in_min_seconds,
     )
+    # Fold in the track's category-level threshold overrides if it has
+    # a category and that category has non-null overrides configured;
+    # otherwise the base cfg passes through untouched.
+    if track.category_id:
+        cfg_values = apply_category_thresholds(
+            cfg_values,
+            track.category.next_start_threshold_db_override,
+            track.category.cue_in_threshold_db_override,
+        )
     wave_dir = get_waveforms_dir()
     row = (track.id, track.filepath, track.filename, track.duration_seconds,
            track.title, track.artist.name if track.artist_id else "", track.related_artists)

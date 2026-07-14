@@ -11,6 +11,31 @@ from django.core.management.base import BaseCommand
 from library.models import AnalysisConfig, Track
 
 
+def apply_category_thresholds(base_cfg_values, next_start_override, cue_in_override):
+    """Overlay per-Category `next_start_threshold_db_override` and
+    `cue_in_threshold_db_override` on top of the base AnalysisConfig
+    tuple. Either override may be None (meaning "use the global"),
+    in which case the base value passes through unchanged.
+
+    Extracted as a standalone helper so all three callers of
+    analyze_one_track (this command's bulk loop, sync_track_file, and
+    api_track_reanalyze) resolve overrides the same way. Analyzer
+    itself stays domain-pure: it takes threshold values and doesn't
+    know or care where they came from.
+
+    Returns a fresh tuple in the exact shape analyze_one_track already
+    destructures (sample_rate, window_seconds, target_points,
+    next_start_db, cue_in_db, cue_in_min)."""
+    (sample_rate, window_seconds, target_points,
+     next_start_db, cue_in_db, cue_in_min) = base_cfg_values
+    if next_start_override is not None:
+        next_start_db = float(next_start_override)
+    if cue_in_override is not None:
+        cue_in_db = float(cue_in_override)
+    return (sample_rate, window_seconds, target_points,
+            next_start_db, cue_in_db, cue_in_min)
+
+
 def decode_audio_to_pcm(filepath, sample_rate):
     cmd = [
         "ffmpeg",
@@ -361,9 +386,16 @@ class Command(BaseCommand):
         if limit:
             qs = qs[:limit]
 
+        # Fetch category threshold overrides in the same query so we
+        # don't need a per-track Category round-trip inside the loop.
+        # Tracks with no category get None/None for the two extra
+        # fields and fall through to the global AnalysisConfig
+        # thresholds via apply_category_thresholds() below.
         tracks = list(qs.values_list(
             "id", "filepath", "filename", "duration_seconds",
             "title", "artist__name", "related_artists",
+            "category__next_start_threshold_db_override",
+            "category__cue_in_threshold_db_override",
         ))
 
         total = len(tracks)
@@ -372,8 +404,15 @@ class Command(BaseCommand):
         analyzed = 0
         skipped = 0
 
-        for row in tracks:
-            if analyze_one_track(row, cfg_values, wave_dir, force):
+        for full_row in tracks:
+            # Split the row: analyze_one_track takes the original 7-tuple
+            # (id, filepath, filename, duration, title, artist_name,
+            # existing_related); the trailing two entries are the
+            # category-level overrides we tacked onto values_list above.
+            analysis_row = full_row[:7]
+            ns_override, ci_override = full_row[7], full_row[8]
+            per_track_cfg = apply_category_thresholds(cfg_values, ns_override, ci_override)
+            if analyze_one_track(analysis_row, per_track_cfg, wave_dir, force):
                 analyzed += 1
             else:
                 skipped += 1

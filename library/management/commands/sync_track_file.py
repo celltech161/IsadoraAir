@@ -3,7 +3,9 @@ from pathlib import Path
 from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
 
-from library.management.commands.analyze_tracks import analyze_one_track, get_waveforms_dir
+from library.management.commands.analyze_tracks import (
+    analyze_one_track, apply_category_thresholds, get_waveforms_dir,
+)
 from library.management.commands.import_songs import parse_tags
 from library.models import AnalysisConfig, Album, Artist, Category, Genre, Track
 
@@ -115,6 +117,19 @@ class Command(BaseCommand):
             cfg.analysis_sample_rate, cfg.analysis_window_seconds, cfg.waveform_points,
             cfg.next_start_threshold_db, cfg.cue_in_threshold_db, cfg.cue_in_min_seconds,
         )
+        # Fold in the track's category-level threshold overrides if any --
+        # sync_track_file is a swap-in-place op so the new content
+        # inherits the current row's category (unchanged in defaults
+        # above), which may carry its own next-start/cue-in overrides.
+        if track.category_id:
+            category = Category.objects.only(
+                "next_start_threshold_db_override", "cue_in_threshold_db_override"
+            ).get(pk=track.category_id)
+            cfg_values = apply_category_thresholds(
+                cfg_values,
+                category.next_start_threshold_db_override,
+                category.cue_in_threshold_db_override,
+            )
         wave_dir = get_waveforms_dir()
 
         # existing_related="" forces fresh related-artist extraction --

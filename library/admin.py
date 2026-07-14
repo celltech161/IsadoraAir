@@ -199,6 +199,21 @@ class CategoryAdmin(admin.ModelAdmin):
             "fields": ["recency_mode", "artist_separation", "title_separation"],
             "description": "Leave separation fields blank to use global defaults from Recency Configuration.",
         }),
+        ("Cue-point Analysis Overrides", {
+            "fields": ["next_start_threshold_db_override", "cue_in_threshold_db_override"],
+            "description": (
+                "Per-category dBFS thresholds for the automatic cue-point "
+                "analyzer (analyze_tracks). Leave blank to use the global "
+                "defaults from Analysis Configuration. Use MORE-NEGATIVE "
+                "values (quieter, e.g. -35 dBFS instead of the default -26) "
+                "for genres that sit below normal broadcast level -- "
+                "classical, ambient, spoken word -- otherwise the "
+                "next-track trigger fires over the natural tail. Category "
+                "detail page in the frontend has a \"Re-analyze Tracks\" "
+                "button that re-runs the analysis on every track in the "
+                "category with these overrides applied."
+            ),
+        }),
     ]
 
     def get_queryset(self, request):

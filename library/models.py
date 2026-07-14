@@ -109,6 +109,25 @@ class Category(models.Model):
         max_length=12, choices=RECENCY_MODE_CHOICES, default="time",
         help_text="Time-based uses fixed hour windows. Proportional scales separation to category size.",
     )
+    next_start_threshold_db_override = models.FloatField(
+        null=True, blank=True,
+        verbose_name="Next Start Threshold (dBFS)",
+        help_text="Override: dBFS threshold analyze_tracks uses to pick the "
+                   "next-start trigger point on tracks in this category. Blank = "
+                   "use the global AnalysisConfig default. Set MORE NEGATIVE "
+                   "(quieter, e.g. -35 dBFS vs the default -26) for programme "
+                   "material that runs quiet -- classical, ambient -- so we "
+                   "don't fire the next track over the natural tail.",
+    )
+    cue_in_threshold_db_override = models.FloatField(
+        null=True, blank=True,
+        verbose_name="Cue In Threshold (dBFS)",
+        help_text="Override: dBFS threshold for the cue-in point (first "
+                   "audible content) on tracks in this category. Blank = use "
+                   "global. Same reasoning as Next Start Threshold above -- "
+                   "quiet material needs a quieter threshold, otherwise the "
+                   "cue-in lands too far into the intro.",
+    )
 
     class Meta:
         ordering = ["sort_order", "code"]
