@@ -228,3 +228,52 @@ class NotificationConfig(models.Model):
     def recipient_list(self):
         raw = self.recipients.replace(",", "\n")
         return [r.strip() for r in raw.splitlines() if r.strip()]
+
+
+class ListenerPeak(models.Model):
+    """Singleton -- highest total-listeners-across-all-streams count seen
+    since the last operator-initiated reset. Written by the monitor
+    tick's Shoutcast poll (see monitoring/services/monitor.py); read by
+    the dashboard listener widget. Reset via a double-click on the
+    widget which POSTs to a monitoring endpoint; the endpoint sets
+    peak_total to the CURRENT live total (not zero) so the next tick
+    doesn't immediately raise the number back up and make the reset
+    feel laggy.
+
+    Kept here in monitoring rather than in encoders because the poll
+    infrastructure (10 s tick, state-file writer) already lives here
+    and this is fundamentally a monitoring artifact -- how many
+    listeners are hearing the station right now."""
+
+    peak_total = models.PositiveIntegerField(
+        default=0,
+        help_text="Highest sum-of-listeners-across-all-enabled-encoders "
+                   "value seen since peak_since_at. Updated live by the "
+                   "monitor tick.",
+    )
+    peak_since_at = models.DateTimeField(
+        auto_now_add=True,
+        help_text="When the current peak-tracking window started -- either "
+                   "engine first-boot or the operator's last reset.",
+    )
+    peak_reached_at = models.DateTimeField(
+        null=True, blank=True,
+        help_text="When peak_total was last raised. Blank if we haven't "
+                   "seen anyone since the last reset.",
+    )
+
+    class Meta:
+        verbose_name = "Listener Peak"
+        verbose_name_plural = "Listener Peak"
+
+    def __str__(self):
+        return f"Listener Peak = {self.peak_total}"
+
+    def save(self, *args, **kwargs):
+        self.pk = 1
+        super().save(*args, **kwargs)
+
+    @classmethod
+    def load(cls):
+        obj, _created = cls.objects.get_or_create(pk=1)
+        return obj

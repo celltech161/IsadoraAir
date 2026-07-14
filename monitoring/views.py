@@ -8,9 +8,12 @@ from django.shortcuts import get_object_or_404, render
 from django.views.decorators.csrf import ensure_csrf_cookie
 from django.views.decorators.http import require_http_methods
 
-from .models import MonitorCheck
+from django.utils import timezone as django_tz
+
+from .models import ListenerPeak, MonitorCheck
 
 STATE_PATH = Path("/run/isadoraair/monitoring_state.json")
+LISTENER_STATE_PATH = Path("/run/isadoraair/listeners.json")
 STATE_STALE_SECONDS = 30  # 3x the poller's 10s cadence
 
 
@@ -48,6 +51,64 @@ def api_restart_check(request, check_id):
         return JsonResponse({"error": "No systemd unit configured for this check"}, status=400)
     subprocess.Popen(["sudo", "systemctl", "restart", check.systemd_unit])
     return JsonResponse({"ok": True, "unit": check.systemd_unit})
+
+
+@require_http_methods(["GET"])
+def api_listener_status(request):
+    """Return the current Shoutcast listener state written by the
+    monitor tick to `LISTENER_STATE_PATH`. On a missing/stale/malformed
+    file the dashboard just sees `stale=true` and can gray the widget
+    out without a JS error path."""
+    if not LISTENER_STATE_PATH.is_file():
+        return JsonResponse({
+            "led": "red", "current_total": 0, "peak_total": 0,
+            "peak_since_at": None, "peak_reached_at": None,
+            "encoders": [], "timestamp": 0, "stale": True,
+        })
+    try:
+        data = json.loads(LISTENER_STATE_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return JsonResponse({
+            "led": "red", "current_total": 0, "peak_total": 0,
+            "peak_since_at": None, "peak_reached_at": None,
+            "encoders": [], "timestamp": 0, "stale": True,
+        })
+    data["stale"] = (time.time() - data.get("timestamp", 0)) > STATE_STALE_SECONDS
+    return JsonResponse(data)
+
+
+@require_http_methods(["POST"])
+def api_listener_peak_reset(request):
+    """Double-click on the dashboard widget's peak count POSTs here.
+    Reset the peak to the CURRENT live total (not zero) so the next
+    monitor tick doesn't immediately raise the number and make the
+    reset feel laggy -- the operator's mental model is "start tracking
+    peak fresh from RIGHT NOW", not "zero out and race the tick."
+
+    Reads current_total from LISTENER_STATE_PATH rather than re-polling
+    Shoutcast because we're already in the request/response path and
+    an extra sync HTTP GET here would double our exposure to network
+    hiccups. Stale state is fine -- it's at most 10 seconds old."""
+    current_total = 0
+    if LISTENER_STATE_PATH.is_file():
+        try:
+            data = json.loads(LISTENER_STATE_PATH.read_text(encoding="utf-8"))
+            current_total = int(data.get("current_total", 0))
+        except (OSError, ValueError):
+            pass
+    peak = ListenerPeak.load()
+    peak.peak_total = current_total
+    peak.peak_since_at = django_tz.now()
+    # Clear peak_reached_at -- there's no "since I hit this number" for a
+    # freshly-reset window until we actually see the current_total value
+    # get exceeded (or matched, on the next tick).
+    peak.peak_reached_at = None
+    peak.save(update_fields=["peak_total", "peak_since_at", "peak_reached_at"])
+    return JsonResponse({
+        "ok": True,
+        "peak_total": peak.peak_total,
+        "peak_since_at": peak.peak_since_at.isoformat(),
+    })
 
 
 @require_http_methods(["GET"])

@@ -549,6 +549,91 @@
      Bar fill uses the RMS value; the small vertical line is the
      peak-with-decay (fast rise, ~20 dB/sec fall) held by the level
      element itself, so this side just renders it. */
+  /* Row holding the listener widget (left) and the VU meter (right)
+     above the deck cards. `space-between` puts them at the two ends
+     of the row; the VU meter's own inner `flex-end` was preserved
+     when we moved it into this wrapper so its bars still hug the
+     right edge exactly the way they used to on a standalone row. */
+  .top-status-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 1rem;
+  }
+  .listener-widget {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    padding: 0.35rem 0.5rem 0.15rem;
+    font-size: 0.65rem;
+    color: var(--text-muted);
+    line-height: 1;
+  }
+  .listener-led {
+    width: 0.85rem;
+    height: 0.85rem;
+    border-radius: 50%;
+    flex-shrink: 0;
+    /* Stateless base: dark disc with a subtle inset shadow so it looks
+       like an unlit LED. State classes below light it up. */
+    background: var(--bg-darker);
+    box-shadow: inset 0 1px 2px rgba(0,0,0,0.5), 0 0 0 1px rgba(255,255,255,0.05);
+    transition: background 200ms ease, box-shadow 200ms ease;
+  }
+  .listener-led[data-state="green"] {
+    background: #2fbf4d;
+    box-shadow: inset 0 1px 2px rgba(0,0,0,0.3), 0 0 6px rgba(47,191,77,0.55);
+  }
+  .listener-led[data-state="yellow"] {
+    background: #e6b325;
+    box-shadow: inset 0 1px 2px rgba(0,0,0,0.3), 0 0 6px rgba(230,179,37,0.55);
+  }
+  .listener-led[data-state="red"] {
+    background: #c8324f;
+    box-shadow: inset 0 1px 2px rgba(0,0,0,0.3), 0 0 6px rgba(200,50,79,0.55);
+  }
+  .listener-led[data-state="stale"] {
+    background: #555;
+    box-shadow: inset 0 1px 2px rgba(0,0,0,0.5);
+  }
+  .listener-counts {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  .listener-count-row {
+    display: flex;
+    align-items: baseline;
+    gap: 0.4rem;
+    /* Right-align the numeric column so `Listeners 3` and `Peak 12`
+       stack tidily. Fixed-width numeric font would be nicer but the
+       theme's body font is doing fine at these small sizes. */
+    min-width: 5.5rem;
+    justify-content: space-between;
+  }
+  .listener-label {
+    font-size: 0.55rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-muted);
+  }
+  .listener-value {
+    font-size: 0.9rem;
+    font-weight: 600;
+    color: var(--text-main);
+    font-variant-numeric: tabular-nums;
+  }
+  .listener-peak-value {
+    cursor: pointer;
+    /* Selection-avoidance for the double-click reset: without this,
+       a double-click highlights the text and the operator sees a
+       weird selected span rather than a clean "peak reset" flash. */
+    user-select: none;
+    -webkit-user-select: none;
+  }
+  .listener-peak-value:hover {
+    color: var(--accent, #7ec6ff);
+  }
   .vu-meter {
     display: flex;
     justify-content: flex-end;
@@ -674,6 +759,20 @@
 
 {% block content %}
 <div class="console-{{ mode|default:'full' }}">
+<div class="top-status-row">
+<div class="listener-widget" id="listenerWidget" aria-label="Live Shoutcast listener count">
+  <span class="listener-led" id="listenerLed" data-state="red" title="Stream status"></span>
+  <div class="listener-counts">
+    <div class="listener-count-row">
+      <span class="listener-label">Listeners</span>
+      <span class="listener-value" id="listenerCurrent">—</span>
+    </div>
+    <div class="listener-count-row" title="Double-click to reset peak">
+      <span class="listener-label">Peak</span>
+      <span class="listener-value listener-peak-value" id="listenerPeak" ondblclick="resetListenerPeak(event)">—</span>
+    </div>
+  </div>
+</div>
 <div class="vu-meter" id="vuMeter" aria-label="Pre-processor output level">
   <div class="vu-meter-bars">
     <div class="vu-scale-row">
@@ -704,6 +803,7 @@
     </div>
   </div>
 </div>
+</div><!-- /.top-status-row -->
 <div class="playnow-bar">
   <button class="playnow-btn ops-btn" id="manualModeBtn" onclick="toggleManualMode()"
           title="Manual holds the next track until you flip back to Auto -- for talking over a song's outro. Auto-switches while any mic is live.">Auto</button>
@@ -1950,6 +2050,68 @@ async function pollLevels() {
 }
 setInterval(pollLevels, 100);
 pollLevels();
+
+// --- Shoutcast listener widget --------------------------------------
+// The monitoring poller writes /run/isadoraair/listeners.json every ~10s;
+// we fetch its projection through /monitoring/api/listeners/ on the same
+// cadence. Double-clicking the peak POSTs to reset-peak/, which the
+// server sets to the CURRENT live total (not zero, see the endpoint's
+// docstring for why). We update the widget from the POST response
+// immediately for snappy feedback rather than waiting for the next
+// poll to reconcile.
+function applyListenerData(d) {
+  const led = document.getElementById('listenerLed');
+  const cur = document.getElementById('listenerCurrent');
+  const peak = document.getElementById('listenerPeak');
+  if (!led || !cur || !peak) return;
+  // "stale" state overrides LED color -- shows we're not getting fresh
+  // reads from the monitor poller (usually because the monitoring
+  // service is down or the state file was never written).
+  led.dataset.state = d.stale ? 'stale' : (d.led || 'red');
+  led.title = d.stale
+    ? 'Listener data is stale (monitoring poller not writing state)'
+    : ({green:'All streams up', yellow:'Some streams offline', red:'All streams offline'}[d.led] || 'Stream status');
+  cur.textContent = (d.current_total ?? '—');
+  peak.textContent = (d.peak_total ?? '—');
+  // Tooltip on peak carries when the current window started, useful
+  // when the operator wants to know how long they've been tracking.
+  if (d.peak_since_at) {
+    const since = new Date(d.peak_since_at);
+    peak.title = `Peak since ${since.toLocaleString()} — double-click to reset`;
+  } else {
+    peak.title = 'Double-click to reset peak';
+  }
+}
+async function pollListeners() {
+  try {
+    const r = await fetch('/monitoring/api/listeners/', {credentials: 'same-origin'});
+    if (r.ok) applyListenerData(await r.json());
+  } catch (_) { /* transient network -- next tick will retry */ }
+}
+async function resetListenerPeak(evt) {
+  if (evt) { evt.preventDefault(); evt.stopPropagation(); }
+  try {
+    const r = await fetch('/monitoring/api/listeners/reset-peak/', {
+      method: 'POST', credentials: 'same-origin',
+      headers: {'X-CSRFToken': getCookie('csrftoken')},
+    });
+    if (!r.ok) return;
+    const d = await r.json();
+    // Immediate widget update from the POST response so the reset feels
+    // instant. The next 10s pollListeners() call will bring the full
+    // state (LED, encoder details) back in sync with the state file.
+    const peakEl = document.getElementById('listenerPeak');
+    if (peakEl) {
+      peakEl.textContent = d.peak_total ?? '—';
+      if (d.peak_since_at) {
+        const since = new Date(d.peak_since_at);
+        peakEl.title = `Peak since ${since.toLocaleString()} — double-click to reset`;
+      }
+    }
+  } catch (_) { /* silently ignore -- operator can just double-click again */ }
+}
+setInterval(pollListeners, 10000);
+pollListeners();
 
 // Initial load
 poll();

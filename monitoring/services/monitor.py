@@ -12,6 +12,9 @@ change takes effect on the next ~10s tick with no restart needed."""
 import json
 import signal
 import time
+import urllib.request
+import xml.etree.ElementTree as ET
+from collections import defaultdict
 from pathlib import Path
 
 import django
@@ -19,14 +22,22 @@ django.setup()
 
 import psutil  # noqa: E402
 from django.db import close_old_connections  # noqa: E402
+from django.utils import timezone as django_tz  # noqa: E402
 
-from monitoring.models import MonitorCheck, TransmitterConfig  # noqa: E402
+from encoders.models import Encoder  # noqa: E402
+from monitoring.models import ListenerPeak, MonitorCheck, TransmitterConfig  # noqa: E402
 from monitoring.services.notify import maybe_notify  # noqa: E402
 from monitoring.services.probes import PROBE_DISPATCH  # noqa: E402
 from monitoring.services.transmitter_client import TransmitterClient  # noqa: E402
 
 STATE_PATH = Path("/run/isadoraair/monitoring_state.json")
+# Separate state file for the Shoutcast listener widget so its 10 s poll
+# doesn't have to piggyback on `monitoring_state.json`'s more heavyweight
+# check-status payload and vice versa. Dashboard JS fetches this via the
+# `listener_status` monitoring endpoint, not directly from disk.
+LISTENER_STATE_PATH = Path("/run/isadoraair/listeners.json")
 POLL_SECONDS = 10
+SHOUTCAST_STATS_TIMEOUT = 3.0  # seconds -- LAN localhost; anything above ~1s is a real problem
 
 _TRANSMITTER_KINDS = ("transmitter_param", "transmitter_indicator")
 
@@ -124,6 +135,165 @@ class MonitorManager:
             tx_client.__exit__(None, None, None)
 
         self._write_state(results)
+        # Separate from the check-status write above -- listener poll is
+        # independent state (dashboard widget vs. monitoring cards) and
+        # a Shoutcast unreachable shouldn't take down the check-status
+        # write path (which is what the notification cooldowns and
+        # monitoring dashboard depend on).
+        try:
+            self._poll_shoutcast_listeners()
+        except Exception as exc:
+            # Best-effort: any failure is contained and just leaves the
+            # listener JSON stale for one tick. Log once so a persistent
+            # regression shows up rather than swallowing silently.
+            print(f"  [listeners] poll failed: {exc}")
+
+    def _poll_shoutcast_listeners(self):
+        """Fetch listener counts from every distinct Shoutcast server
+        our enabled Encoder rows point at, match each encoder to its
+        stream by icy_id (Encoder.mount, stripped of any '/'), and
+        write a compact status document to LISTENER_STATE_PATH for the
+        dashboard widget to consume.
+
+        LED semantics:
+          green  -- every enabled encoder's SID appears in stats AND
+                    its STREAMSTATUS == 1
+          yellow -- at least one encoder is up, at least one is down
+          red    -- none of our encoders is up (including the case
+                    where the Shoutcast server itself is unreachable
+                    and all encoders end up "down")
+
+        Only enabled shoutcast1/shoutcast2 encoders count. Icecast
+        encoders are silently skipped -- Icecast's stats live at a
+        different endpoint (/status-json.xsl) and there aren't any
+        Icecast encoders on this station today; a follow-up can add
+        that path if the topology ever changes."""
+        encoders = list(
+            Encoder.objects.filter(
+                enabled=True, protocol__in=("shoutcast1", "shoutcast2"),
+            )
+        )
+        if not encoders:
+            # No encoders configured -- write an empty-but-well-formed
+            # state so the dashboard's fetch handler doesn't see stale
+            # data from before the last encoder was disabled.
+            self._write_listener_state([], 0, "red", 0, None, None)
+            return
+
+        # Group by (host, port). One HTTP GET per distinct server.
+        by_server = defaultdict(list)
+        for enc in encoders:
+            by_server[(enc.host, enc.port)].append(enc)
+
+        # Per-encoder status: {encoder_id: {"name":.., "sid":.., "up":bool, "listeners":int}}
+        per_encoder = []
+        for (host, port), encs_here in by_server.items():
+            stream_stats = self._fetch_shoutcast_stats(host, port)
+            for enc in encs_here:
+                sid = (enc.mount or "").strip("/") or "1"
+                s = stream_stats.get(sid)
+                if s is None:
+                    per_encoder.append({
+                        "encoder_id": enc.id, "name": enc.name, "sid": sid,
+                        "host": host, "port": port,
+                        "up": False, "listeners": 0,
+                    })
+                else:
+                    per_encoder.append({
+                        "encoder_id": enc.id, "name": enc.name, "sid": sid,
+                        "host": host, "port": port,
+                        "up": bool(s["up"]), "listeners": int(s["listeners"]),
+                    })
+
+        # LED state from per-encoder up-counts.
+        up_count = sum(1 for r in per_encoder if r["up"])
+        total_encoders = len(per_encoder)
+        if up_count == total_encoders:
+            led = "green"
+        elif up_count == 0:
+            led = "red"
+        else:
+            led = "yellow"
+
+        # Total listeners across the ones that ARE up. A "down" encoder
+        # obviously contributes zero -- we just don't count what we
+        # can't measure.
+        current_total = sum(r["listeners"] for r in per_encoder if r["up"])
+
+        # Peak singleton update. Only touch the DB when we're raising
+        # the peak; the normal case is peak_total >= current_total, no
+        # write, no autocommit noise.
+        peak = ListenerPeak.load()
+        peak_reached_at = peak.peak_reached_at
+        if current_total > peak.peak_total:
+            peak.peak_total = current_total
+            peak.peak_reached_at = django_tz.now()
+            peak.save(update_fields=["peak_total", "peak_reached_at"])
+            peak_reached_at = peak.peak_reached_at
+
+        self._write_listener_state(
+            per_encoder, current_total, led,
+            peak.peak_total, peak.peak_since_at, peak_reached_at,
+        )
+
+    def _fetch_shoutcast_stats(self, host, port):
+        """GET /statistics from a Shoutcast v2 server, return
+        {sid: {"up": bool, "listeners": int}} keyed by string SID.
+        Returns {} on any transport or parse failure -- the caller
+        treats a missing SID entry as "down"."""
+        url = f"http://{host}:{port}/statistics"
+        try:
+            with urllib.request.urlopen(url, timeout=SHOUTCAST_STATS_TIMEOUT) as resp:
+                body = resp.read()
+        except Exception as exc:
+            print(f"  [listeners] {host}:{port} unreachable: {exc}")
+            return {}
+        try:
+            root = ET.fromstring(body)
+        except ET.ParseError as exc:
+            print(f"  [listeners] {host}:{port} XML parse error: {exc}")
+            return {}
+        # Wire format observed on Shoutcast v2.6.1:
+        #   <SHOUTCASTSERVER>
+        #     <STREAMSTATS>
+        #       <TOTALSTREAMS>4</TOTALSTREAMS>       <-- server-wide totals
+        #       ...
+        #       <STREAM id="1">                      <-- STREAM lives INSIDE
+        #         <CURRENTLISTENERS>4</CURRENTLISTENERS>  STREAMSTATS, not as
+        #         <STREAMSTATUS>1</STREAMSTATUS>          a root child.
+        #         ...                                <-- 1 = active, 0 = down
+        #       </STREAM>
+        #       <STREAM id="2">...</STREAM>
+        #     </STREAMSTATS>
+        #   </SHOUTCASTSERVER>
+        # `.//STREAM` descends into any location -- robust to any future
+        # SC version that reorganizes the wrapping element.
+        out = {}
+        for stream in root.findall(".//STREAM"):
+            sid = stream.get("id", "").strip()
+            if not sid:
+                continue
+            listeners_el = stream.find("CURRENTLISTENERS")
+            status_el = stream.find("STREAMSTATUS")
+            listeners = int((listeners_el.text or "0").strip()) if listeners_el is not None else 0
+            up = (status_el is not None and (status_el.text or "").strip() == "1")
+            out[sid] = {"up": up, "listeners": listeners}
+        return out
+
+    def _write_listener_state(self, per_encoder, current_total, led,
+                              peak_total, peak_since_at, peak_reached_at):
+        state = {
+            "timestamp": time.time(),
+            "led": led,                             # "green" | "yellow" | "red"
+            "current_total": current_total,
+            "peak_total": peak_total,
+            "peak_since_at": peak_since_at.isoformat() if peak_since_at else None,
+            "peak_reached_at": peak_reached_at.isoformat() if peak_reached_at else None,
+            "encoders": per_encoder,                # per-stream detail for hover/tooltip
+        }
+        tmp = LISTENER_STATE_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+        tmp.rename(LISTENER_STATE_PATH)
 
     def _build_result(self, check, status, detail):
         return {

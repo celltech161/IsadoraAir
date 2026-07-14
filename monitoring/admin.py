@@ -2,7 +2,7 @@ from django.contrib import admin
 from django.http import HttpResponseRedirect
 from django.urls import reverse
 
-from .models import MonitorCheck, NotificationConfig, TransmitterConfig
+from .models import ListenerPeak, MonitorCheck, NotificationConfig, TransmitterConfig
 
 
 @admin.register(MonitorCheck)
@@ -63,3 +63,11 @@ class NotificationConfigAdmin(_SingletonAdmin):
     singleton_model = NotificationConfig
     change_url_name = "admin:monitoring_notificationconfig_change"
     fields = ["enabled", "recipients", "cooldown_minutes"]
+
+
+@admin.register(ListenerPeak)
+class ListenerPeakAdmin(_SingletonAdmin):
+    singleton_model = ListenerPeak
+    change_url_name = "admin:monitoring_listenerpeak_change"
+    fields = ["peak_total", "peak_since_at", "peak_reached_at"]
+    readonly_fields = ["peak_since_at", "peak_reached_at"]
