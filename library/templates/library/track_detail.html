@@ -231,11 +231,11 @@
   <h1>{{ track.title }} <span class="track-artist">— {{ track.artist.name }}</span></h1>
 </div>
 
-<audio controls preload="none" src="{% url 'library:api-track-audio' track.pk %}" style="width:100%; max-width:420px; margin-bottom:1rem;"></audio>
+<audio id="trackPlayer" controls preload="metadata" src="{% url 'library:api-track-audio' track.pk %}" style="width:100%; max-width:420px; margin-bottom:1rem;"></audio>
 
 <div class="waveform-wrap" id="waveformWrap" style="display:none;">
   <div class="cue-selector" id="cueSelector"></div>
-  <div class="cue-hint">Click the waveform to set the selected cue point's position.</div>
+  <div class="cue-hint" id="cueHint">Click the waveform to seek. Pick a cue name above to set that cue's position on the next click.</div>
   <canvas id="waveformCanvas"></canvas>
   <div class="waveform-legend" id="waveformLegend"></div>
 </div>
@@ -638,10 +638,18 @@ const CUE_FIELDS = [
   { key: 'hook_out_seconds',     label: 'Hook Out',     color: '#14b8a6', input: 'f_hook_out_seconds' },
 ];
 
-let activeCueKey = CUE_FIELDS[0].key;
+// Sentinel meaning "clicks only seek, don't touch any cue field".
+// Default state -- see cueHint below.
+const SEEK_MODE = null;
+let activeCueKey = SEEK_MODE;
 let waveformSamplesLeft = null;
 let waveformSamplesRight = null;
 let waveformDuration = dur || 1;
+
+// Playhead cursor state -- driven by the <audio> element's
+// currentTime, updated via requestAnimationFrame while playing.
+const audioEl = document.getElementById('trackPlayer');
+let playheadRAF = null;
 
 const WAVEFORM_LEFT_COLOR = "{{ analysis_config.waveform_left_color|default:'#22c55e' }}";
 const WAVEFORM_RIGHT_COLOR = "{{ analysis_config.waveform_right_color|default:'#38bdf8' }}";
@@ -649,6 +657,21 @@ const WAVEFORM_RIGHT_COLOR = "{{ analysis_config.waveform_right_color|default:'#
 function buildCueSelector() {
   const bar = document.getElementById('cueSelector');
   bar.innerHTML = '';
+
+  // Seek pseudo-option -- default active state, canvas clicks only
+  // scrub the audio, no cue field is touched.
+  const seekBtn = document.createElement('button');
+  seekBtn.type = 'button';
+  seekBtn.style.setProperty('--cue-color', '#e2e8f0');
+  seekBtn.innerHTML = '<span class="swatch"></span>Seek only';
+  seekBtn.addEventListener('click', () => {
+    activeCueKey = SEEK_MODE;
+    buildCueSelector();
+    updateCueHint();
+  });
+  if (activeCueKey === SEEK_MODE) seekBtn.classList.add('active');
+  bar.appendChild(seekBtn);
+
   for (const f of CUE_FIELDS) {
     const btn = document.createElement('button');
     btn.type = 'button';
@@ -657,6 +680,7 @@ function buildCueSelector() {
     btn.addEventListener('click', () => {
       activeCueKey = f.key;
       buildCueSelector();
+      updateCueHint();
     });
     if (f.key === activeCueKey) btn.classList.add('active');
     bar.appendChild(btn);
@@ -666,6 +690,16 @@ function buildCueSelector() {
   legend.innerHTML = `<span class="legend-item"><span class="legend-swatch" style="background:${WAVEFORM_LEFT_COLOR};"></span> Left</span>`
     + `<span class="legend-item"><span class="legend-swatch" style="background:${WAVEFORM_RIGHT_COLOR};"></span> Right</span>`
     + CUE_FIELDS.map(f => `<span class="legend-item"><span class="legend-swatch" style="background:${f.color};"></span> ${f.label}</span>`).join('');
+}
+
+function updateCueHint() {
+  const hint = document.getElementById('cueHint');
+  if (activeCueKey === SEEK_MODE) {
+    hint.textContent = "Click the waveform to seek. Pick a cue name above to set that cue's position on the next click.";
+  } else {
+    const f = CUE_FIELDS.find(c => c.key === activeCueKey);
+    hint.textContent = `Click the waveform to set "${f.label}" (and seek the player there). Pick "Seek only" to stop editing.`;
+  }
 }
 
 function drawWaveform() {
@@ -728,6 +762,49 @@ function drawWaveform() {
     ctx.stroke();
     ctx.setLineDash([]);
   }
+
+  // Live playhead -- drawn last so it sits on top of everything else.
+  // Solid vertical line + small triangles top/bottom for a "playhead"
+  // silhouette that reads even when it overlaps a cue marker.
+  const t = (audioEl && !isNaN(audioEl.currentTime)) ? audioEl.currentTime : 0;
+  if (t > 0 && duration > 0) {
+    const x = (t / duration) * w;
+    ctx.strokeStyle = '#ffffff';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(x, 0);
+    ctx.lineTo(x, h);
+    ctx.stroke();
+    // Top + bottom triangles
+    ctx.fillStyle = '#ffffff';
+    ctx.beginPath();
+    ctx.moveTo(x - 4, 0); ctx.lineTo(x + 4, 0); ctx.lineTo(x, 5); ctx.closePath();
+    ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(x - 4, h); ctx.lineTo(x + 4, h); ctx.lineTo(x, h - 5); ctx.closePath();
+    ctx.fill();
+  }
+}
+
+// Smooth 60fps playhead animation while audio is playing. The
+// timeupdate event alone only fires ~4x/sec so the cursor would look
+// steppy without an rAF loop. Stops the rAF loop on pause to save
+// battery/CPU on mobile.
+function startPlayheadLoop() {
+  if (playheadRAF) return;
+  const tick = () => {
+    drawWaveform();
+    if (!audioEl.paused && !audioEl.ended) {
+      playheadRAF = requestAnimationFrame(tick);
+    } else {
+      playheadRAF = null;
+    }
+  };
+  playheadRAF = requestAnimationFrame(tick);
+}
+function stopPlayheadLoop() {
+  if (playheadRAF) { cancelAnimationFrame(playheadRAF); playheadRAF = null; }
+  drawWaveform();
 }
 
 function onWaveformClick(evt) {
@@ -736,9 +813,18 @@ function onWaveformClick(evt) {
   const x = evt.clientX - rect.left;
   const t = Math.min(waveformDuration, Math.max(0, (x / rect.width) * waveformDuration));
 
-  const field = CUE_FIELDS.find(f => f.key === activeCueKey);
-  const input = document.getElementById(field.input);
-  input.value = t.toFixed(3);
+  // Always seek to the clicked position -- the canvas doubles as the
+  // player's scrubber. If a cue is currently selected, also record
+  // the click as that cue's new value (so operator can hear what they
+  // just marked, at the exact time they marked it).
+  if (audioEl && !isNaN(audioEl.duration)) {
+    audioEl.currentTime = t;
+  }
+  if (activeCueKey !== SEEK_MODE) {
+    const field = CUE_FIELDS.find(f => f.key === activeCueKey);
+    const input = document.getElementById(field.input);
+    input.value = t.toFixed(3);
+  }
   drawWaveform();
 }
 
@@ -758,10 +844,33 @@ async function loadWaveform() {
 }
 
 buildCueSelector();
+updateCueHint();
 document.getElementById('waveformCanvas').addEventListener('click', onWaveformClick);
 for (const f of CUE_FIELDS) {
   const el = document.getElementById(f.input);
   if (el) el.addEventListener('input', drawWaveform);
+}
+
+// Wire the audio player to the waveform's playhead cursor. On play,
+// start a rAF loop for smooth 60fps updates. On pause/seek/end, one
+// redraw to snap the cursor to the final position and stop burning
+// frames. timeupdate covers the case where a background/throttled
+// tab misses rAF ticks entirely.
+if (audioEl) {
+  audioEl.addEventListener('play',   startPlayheadLoop);
+  audioEl.addEventListener('pause',  stopPlayheadLoop);
+  audioEl.addEventListener('ended',  stopPlayheadLoop);
+  audioEl.addEventListener('seeked', drawWaveform);
+  audioEl.addEventListener('timeupdate', () => { if (!playheadRAF) drawWaveform(); });
+  audioEl.addEventListener('loadedmetadata', () => {
+    // Prefer the browser's exact duration over the analyzed one --
+    // they usually agree, but if the analyzer trimmed silence the
+    // waveform's assumed duration may lag by a fraction of a second.
+    if (!isNaN(audioEl.duration) && audioEl.duration > 0) {
+      waveformDuration = audioEl.duration;
+      drawWaveform();
+    }
+  });
 }
 loadWaveform();
 
