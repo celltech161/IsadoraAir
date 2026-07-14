@@ -7,12 +7,25 @@ IsadoraAir manages the full music library, schedule programming, playlist genera
 ## Features
 
 **Library Management**
-- Import audio files from disk with automatic tag reading (ID3, Vorbis, MP4/AAC) via mutagen
-- Audio analysis: waveform generation, auto-detection of cue-in and next-start (mix) points via ffmpeg
+- Import audio files from disk or via drag-and-drop upload at `/library/import/`; automatic tag reading (ID3, Vorbis, MP4/AAC, and RIFF LIST INFO for WAV) via mutagen
+- WAV / AIF / AIFF uploads are automatically transcoded to FLAC on their first analyze pass (same DB row, tags preserved, original file removed) so the library ends up single-format and tag-friendly
+- CD ripping directly on the box (see the CD Ripping section below)
+- Audio analysis: waveform generation, auto-detection of cue-in and next-start (mix) points via ffmpeg; per-category threshold overrides (dBFS for cue-in and next-start) let quiet material like classical music use later triggers than the global defaults
+- Fast cue-point re-pick: analyze_tracks persists the mono envelope into the waveform JSON, so re-picking cue points after a threshold tweak (per-track "Reset Cue Points" button on `/track/<pk>/`, or per-category "Update Cue Points" on `/categories/`) runs in seconds instead of the minutes a full re-decode would take
+- `fix_unknown_artists` management command: parses "Artist - Title" out of tracks whose artist is "Unknown Artist" and writes the split back to file metadata; WAV/AIF get transcoded to FLAC first (since they can't carry tags cleanly) with the original marked `ready2air=False` for manual weeding
 - 29,000+ track library with searchable/filterable frontend and full track detail editing
 - Bulk actions: mark ready-to-air, assign categories, set metadata
 - Per-track cue points, rotation weight, energy level, vocal type, end type, RBDS overrides
 - Category Kind (Music/Imaging/Spot/Talk, extensible) with an admin-manageable fill color per kind, shown on the live dashboard's queue
+
+**CD Ripping** (built into `/library/import/`)
+- Insert a CD, click "Detect CD" — libdiscid reads the disc, MusicBrainz supplies the album + track metadata, all fields land in an editable form so the operator can adjust before ripping
+- Falls back to a blank editable table when MusicBrainz has no matching release (unknown discs / rare pressings still rippable, just with manual tag entry)
+- Ripping itself is whipper (secure cdparanoia-based ripper) as a detached subprocess so a gunicorn worker restart doesn't kill an in-flight rip; per-job staging dir keeps concurrent probing safe
+- AccurateRip verification is captured per track (match / nomatch / notfound badges on the Done screen); `require_accurate_rip` config gate lets non-verifying tracks land with a warning instead of being rejected outright — appropriate since many CD-Rs and older pressings aren't in the community reference database
+- Live progress UI: subprocess stdout streams into `status_message` every second, terminal-state dispatcher rehydrates on browser refresh so a mid-rip page reload picks up where it left off
+- Drive characteristics (device path, read offset, staging root, AR strictness) live in a `CDRipConfig` singleton editable at `/admin/library/cdripconfig/` — replacing the drive doesn't need a redeploy, just an offset lookup at accuraterip.com/driveoffsets.htm
+- Each ripped track lands as `<Artist> - <Title> [Trk NN].flac` under `<library_root>/<category>/`, ready2air=False so it hits the same human-review gate as any other new import
 
 **Schedule Programming**
 - 7x24 schedule grid (responsive — day-view on mobile) assigning either a weighted Rotation or a fixed Playlist to each hour, recurring (day-of-week) or one-off (specific date)
@@ -85,9 +98,11 @@ IsadoraAir (Django 5.2 LTS)
 ├── library/                     # Main app
 │   ├── models.py                # Track, Artist, Album, Category, CategoryKind, Rotation,
 │   │                            # Playlist, ScheduleBlock, PlaylistLog, UITheme,
-│   │                            # NavMenuItem, RemoteDJConfig, EmailLog, etc.
-│   ├── views.py                 # Page views + JSON API endpoints
+│   │                            # NavMenuItem, RemoteDJConfig, EmailLog,
+│   │                            # CDRipJob, CDRipConfig, etc.
+│   ├── views.py                 # Page views + JSON API endpoints (incl. /api/cd/*)
 │   ├── admin.py                 # Admin registration + Library/Traffic/Config/Logs sectioning
+│   ├── cd_ripping.py            # libdiscid + MusicBrainz disc detection + eject/rip helpers
 │   ├── auth_forms.py            # Invite-capable password-reset form (subclasses Django's stock)
 │   ├── email_backend.py         # LoggingSMTPBackend — every send leaves a row in EmailLog
 │   ├── context_processors.py    # Injects UITheme + nav_menu into every template
@@ -96,8 +111,11 @@ IsadoraAir (Django 5.2 LTS)
 │   │   ├── engine.py            # GStreamer playback engine (standalone process)
 │   │   └── remote_dj_signaling.py  # WebRTC signaling websocket server (in-engine)
 │   ├── management/commands/
-│   │   ├── import_songs.py      # Library scanner (mutagen)
-│   │   ├── analyze_tracks.py    # Audio analysis (ffmpeg + DSP)
+│   │   ├── import_songs.py      # Library scanner (mutagen + RIFF-INFO for WAV)
+│   │   ├── analyze_tracks.py    # Audio analysis + auto-transcode WAV/AIF -> FLAC
+│   │   ├── cd_rip_run.py        # Detached whipper subprocess + post-processing (tags,
+│   │   │                        # rename, DB rows). Spawned by /api/cd/rip-start/
+│   │   ├── fix_unknown_artists.py  # Parse "Artist - Title" from title -> tags + DB
 │   │   ├── run_engine.py        # Entry point for the playback engine service
 │   │   ├── prune_emaillog.py    # EmailLog retention prune (systemd timer)
 │   │   └── ...                  # duplicate finders, orphan cleanup, category checks
@@ -156,6 +174,11 @@ sudo apt install python3-gi gir1.2-gstreamer-1.0 gstreamer1.0-alsa \
 # Liquidsoap (streaming encoders) and ALSA utils (mixer control enumeration
 # for the hardware admin, device listing)
 sudo apt install liquidsoap alsa-utils
+
+# CD ripping toolchain -- whipper drives cdparanoia + flac; libdiscid is
+# the disc-ID library the Python `discid` package binds to. Skip these
+# if the box has no optical drive.
+sudo apt install whipper cdparanoia flac
 
 # Virtual environment (--system-site-packages so PyGObject/gi, which is an
 # OS package above, is visible inside the venv)
