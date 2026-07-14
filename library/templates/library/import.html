@@ -5,12 +5,16 @@
 {% block extra_css %}
 <style>
   .imp-panel {
-    max-width: 640px;
+    max-width: 720px;
+  }
+  .imp-panel + .imp-panel { margin-top: 2rem; }
+  .imp-panel h2 {
+    font-size: 1.05rem;
+    margin: 0 0 1rem;
+    color: var(--text-main);
   }
 
-  .imp-field {
-    margin-bottom: 1rem;
-  }
+  .imp-field { margin-bottom: 1rem; }
   .imp-field label {
     display: block;
     font-size: 0.78rem;
@@ -18,7 +22,7 @@
     color: var(--text-muted);
     margin-bottom: 0.35rem;
   }
-  .imp-select {
+  .imp-select, .imp-input {
     width: 100%;
     background: var(--bg-dark);
     border: 1px solid var(--border-subtle);
@@ -27,7 +31,27 @@
     color: var(--text-main);
     font-size: 0.85rem;
   }
-  .imp-select:focus { outline: none; border-color: var(--accent); }
+  .imp-select:focus, .imp-input:focus { outline: none; border-color: var(--accent); }
+
+  .imp-row-fields {
+    display: grid; grid-template-columns: 2fr 1fr 1fr; gap: 0.6rem;
+  }
+
+  .imp-btn {
+    background: var(--bg-elevated);
+    border: 1px solid var(--border-subtle);
+    border-radius: 8px;
+    padding: 0.45rem 0.9rem;
+    color: var(--text-main);
+    font-size: 0.82rem;
+    cursor: pointer;
+    transition: background 0.12s, border-color 0.12s;
+  }
+  .imp-btn:hover { border-color: var(--accent); }
+  .imp-btn.primary { background: var(--accent); color: var(--bg-dark); border-color: var(--accent); }
+  .imp-btn.danger { background: transparent; color: var(--danger); border-color: var(--danger); }
+  .imp-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .imp-btn + .imp-btn { margin-left: 0.5rem; }
 
   .imp-dropzone {
     border: 2px dashed var(--border-subtle);
@@ -44,43 +68,170 @@
     background: rgba(34, 197, 94, 0.06);
     color: var(--text-main);
   }
-  .imp-dropzone strong {
-    color: var(--text-main);
-  }
+  .imp-dropzone strong { color: var(--text-main); }
 
-  .imp-results {
-    margin-top: 1.25rem;
-  }
+  .imp-results { margin-top: 1.25rem; }
   .imp-result-row {
-    display: flex;
-    align-items: center;
-    gap: 0.6rem;
-    padding: 0.5rem 0.7rem;
-    border-radius: 8px;
-    font-size: 0.82rem;
-    margin-bottom: 0.4rem;
+    display: flex; align-items: center; gap: 0.6rem;
+    padding: 0.5rem 0.7rem; border-radius: 8px;
+    font-size: 0.82rem; margin-bottom: 0.4rem;
   }
   .imp-result-row.ok { background: rgba(34, 197, 94, 0.08); }
   .imp-result-row.error { background: rgba(249, 115, 115, 0.08); color: var(--danger); }
   .imp-result-icon { flex-shrink: 0; }
   .imp-result-name { font-weight: 600; }
   .imp-result-detail { color: var(--text-muted); font-size: 0.78rem; }
+  .imp-uploading { color: var(--text-muted); font-size: 0.85rem; margin-top: 0.75rem; }
 
-  .imp-uploading {
-    color: var(--text-muted);
-    font-size: 0.85rem;
-    margin-top: 0.75rem;
+  /* CD rip specific */
+  .cdrip-msg { font-size: 0.82rem; color: var(--text-muted); margin-top: 0.5rem; }
+  .cdrip-msg.error { color: var(--danger); }
+  .cdrip-msg.ok { color: var(--accent); }
+
+  .cdrip-mb-status {
+    padding: 0.5rem 0.7rem; border-radius: 8px;
+    font-size: 0.78rem; margin-bottom: 1rem;
   }
+  .cdrip-mb-status.matched { background: rgba(34, 197, 94, 0.08); }
+  .cdrip-mb-status.unmatched { background: rgba(234, 179, 8, 0.08); color: var(--warn, #ffc46b); }
+
+  .cdrip-tracks {
+    width: 100%; border-collapse: collapse;
+    font-size: 0.82rem; margin-top: 0.5rem;
+  }
+  .cdrip-tracks th, .cdrip-tracks td {
+    padding: 0.35rem 0.5rem; text-align: left;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+  .cdrip-tracks th { font-weight: 600; color: var(--text-muted); font-size: 0.72rem; text-transform: uppercase; }
+  .cdrip-tracks td input {
+    width: 100%; background: transparent; border: 1px solid transparent;
+    padding: 0.25rem 0.35rem; color: var(--text-main); font-size: 0.82rem;
+    border-radius: 4px;
+  }
+  .cdrip-tracks td input:focus { outline: none; border-color: var(--accent); background: var(--bg-dark); }
+  .cdrip-tracks .num { width: 40px; color: var(--text-muted); }
+  .cdrip-tracks .dur { width: 60px; color: var(--text-muted); text-align: right; }
+
+  .cdrip-progress {
+    height: 8px; background: var(--bg-dark);
+    border-radius: 4px; overflow: hidden; margin: 0.5rem 0;
+  }
+  .cdrip-progress-fill {
+    height: 100%; background: var(--accent);
+    transition: width 0.3s ease;
+  }
+
+  .cdrip-done-row {
+    display: flex; gap: 0.5rem; align-items: center;
+    padding: 0.35rem 0.5rem;
+    border-bottom: 1px solid var(--border-subtle);
+    font-size: 0.82rem;
+  }
+  .cdrip-done-row .ar {
+    font-size: 0.7rem; padding: 0.1rem 0.4rem;
+    border-radius: 3px;
+  }
+  .cdrip-done-row .ar.match { background: rgba(34, 197, 94, 0.2); color: var(--accent); }
+  .cdrip-done-row .ar.nomatch { background: rgba(249, 115, 115, 0.2); color: var(--danger); }
+  .cdrip-done-row .ar.notfound { background: rgba(234, 179, 8, 0.15); color: var(--warn, #ffc46b); }
+  .cdrip-done-row .ar.unknown { background: var(--bg-dark); color: var(--text-muted); }
 </style>
 {% endblock %}
 
 {% block content %}
 <div class="imp-panel">
+  <h2>Rip CD</h2>
+
+  <!-- IDLE state -->
+  <div id="cdripIdle">
+    <button class="imp-btn primary" id="cdripDetectBtn" onclick="detectCD()">Detect CD</button>
+    <button class="imp-btn" onclick="ejectCD()">Eject</button>
+    <div class="cdrip-msg" id="cdripIdleMsg"></div>
+  </div>
+
+  <!-- DETECTED state: editable form -->
+  <div id="cdripDetected" style="display:none;">
+    <div class="cdrip-mb-status" id="cdripMBStatus"></div>
+    <div class="imp-row-fields">
+      <div class="imp-field">
+        <label>Album Title</label>
+        <input class="imp-input" id="cdripAlbumTitle" type="text">
+      </div>
+      <div class="imp-field">
+        <label>Album Artist</label>
+        <input class="imp-input" id="cdripAlbumArtist" type="text">
+      </div>
+      <div class="imp-field">
+        <label>Year</label>
+        <input class="imp-input" id="cdripYear" type="number" min="1900" max="2099">
+      </div>
+    </div>
+    <div class="imp-row-fields" style="grid-template-columns: 1fr 1fr;">
+      <div class="imp-field">
+        <label>Genre</label>
+        <input class="imp-input" id="cdripGenre" type="text">
+      </div>
+      <div class="imp-field">
+        <label>Category</label>
+        <select class="imp-select" id="cdripCategory">
+          {% regroup categories by kind as kind_list %}
+          {% for kind in kind_list %}
+          <optgroup label="{{ kind.grouper.name }}">
+            {% for cat in kind.list %}
+            <option value="{{ cat.id }}">{{ cat.name }}</option>
+            {% endfor %}
+          </optgroup>
+          {% endfor %}
+        </select>
+      </div>
+    </div>
+
+    <table class="cdrip-tracks">
+      <thead>
+        <tr><th class="num">#</th><th>Title</th><th>Artist</th><th class="dur">Duration</th></tr>
+      </thead>
+      <tbody id="cdripTracksBody"></tbody>
+    </table>
+
+    <div style="margin-top:1rem;">
+      <button class="imp-btn primary" id="cdripStartBtn" onclick="startRip()">Start Rip</button>
+      <button class="imp-btn" onclick="cancelDetected()">Cancel</button>
+      <span class="cdrip-msg" id="cdripDetectedMsg"></span>
+    </div>
+  </div>
+
+  <!-- RIPPING state -->
+  <div id="cdripRipping" style="display:none;">
+    <div style="font-weight:600;font-size:0.9rem;" id="cdripRippingTitle"></div>
+    <div class="cdrip-msg" id="cdripStatusMsg"></div>
+    <div class="cdrip-progress"><div class="cdrip-progress-fill" id="cdripProgressFill" style="width:0%"></div></div>
+    <div class="cdrip-msg">Track <span id="cdripProgressCur">0</span> of <span id="cdripProgressTot">0</span></div>
+    <button class="imp-btn danger" onclick="cancelRip()" style="margin-top:0.75rem;">Cancel Rip</button>
+  </div>
+
+  <!-- DONE state -->
+  <div id="cdripDone" style="display:none;">
+    <div class="cdrip-msg ok" id="cdripDoneMsg" style="font-weight:600;font-size:0.9rem;"></div>
+    <div id="cdripDoneTracks" style="margin-top:0.75rem;"></div>
+    <button class="imp-btn" onclick="ripAnother()" style="margin-top:0.75rem;">Rip Another</button>
+    <button class="imp-btn" onclick="ejectCD()">Eject</button>
+  </div>
+
+  <!-- ERROR state -->
+  <div id="cdripError" style="display:none;">
+    <div class="cdrip-msg error" id="cdripErrorMsg" style="font-weight:600;"></div>
+    <button class="imp-btn" onclick="ripAnother()" style="margin-top:0.75rem;">Reset</button>
+  </div>
+</div>
+
+<div class="imp-panel">
+  <h2>Upload Files</h2>
   <div class="imp-field">
     <label for="impCategory">Category</label>
     <select class="imp-select" id="impCategory">
-      {% regroup categories by kind as kind_list %}
-      {% for kind in kind_list %}
+      {% regroup categories by kind as kind_list2 %}
+      {% for kind in kind_list2 %}
       <optgroup label="{{ kind.grouper.name }}">
         {% for cat in kind.list %}
         <option value="{{ cat.id }}">{{ cat.name }}</option>
@@ -93,6 +244,7 @@
   <div class="imp-dropzone" id="impDropzone">
     <div><strong>Drag audio files here</strong>, or click to browse.</div>
     <div style="margin-top:0.35rem;">MP3, MP2, FLAC, WAV, M4A, ALAC, OGG, AIFF</div>
+    <div style="margin-top:0.35rem;">WAV/AIF files are auto-converted to FLAC after upload.</div>
     <div style="margin-top:0.35rem;">Max {{ max_batch_size_mb }}MB per batch</div>
   </div>
   <input type="file" id="impFileInput" multiple accept=".mp3,.mp2,.flac,.wav,.m4a,.alac,.ogg,.oga,.aiff,.aif" style="display:none;">
@@ -114,6 +266,259 @@ function getCookie(name) {
   return val;
 }
 
+// ============================================================
+// CD RIP PANEL
+// ============================================================
+let cdripPollTimer = null;
+let currentDetection = null;   // last detect payload
+let currentJobId = null;
+
+function showState(name) {
+  ['cdripIdle', 'cdripDetected', 'cdripRipping', 'cdripDone', 'cdripError'].forEach(id => {
+    document.getElementById(id).style.display = (id === 'cdrip' + name) ? '' : 'none';
+  });
+}
+
+function fmtDuration(sec) {
+  if (!sec) return '-';
+  const m = Math.floor(sec / 60), s = Math.round(sec % 60);
+  return `${m}:${String(s).padStart(2, '0')}`;
+}
+
+async function detectCD() {
+  const btn = document.getElementById('cdripDetectBtn');
+  const msg = document.getElementById('cdripIdleMsg');
+  btn.disabled = true;
+  msg.textContent = 'Reading disc + querying MusicBrainz...';
+  msg.className = 'cdrip-msg';
+  try {
+    const resp = await fetch("{% url 'library:api-cd-detect' %}");
+    if (resp.status === 404) {
+      const data = await resp.json();
+      msg.textContent = data.error || 'No disc detected. Insert a CD and try again.';
+      msg.className = 'cdrip-msg error';
+      btn.disabled = false;
+      return;
+    }
+    if (!resp.ok) {
+      const data = await resp.json();
+      msg.textContent = data.error || 'Detect failed.';
+      msg.className = 'cdrip-msg error';
+      btn.disabled = false;
+      return;
+    }
+    const data = await resp.json();
+    currentDetection = data;
+    populateDetectedForm(data);
+    showState('Detected');
+  } catch (e) {
+    msg.textContent = 'Network error -- try again.';
+    msg.className = 'cdrip-msg error';
+  }
+  btn.disabled = false;
+}
+
+function populateDetectedForm(data) {
+  const mbStatus = document.getElementById('cdripMBStatus');
+  if (data.mb_matched) {
+    mbStatus.className = 'cdrip-mb-status matched';
+    mbStatus.innerHTML = `<strong>MusicBrainz matched.</strong> Disc ID <code>${data.disc_id}</code> → release <code>${data.mbid}</code>. Edit anything below before ripping.`;
+  } else {
+    mbStatus.className = 'cdrip-mb-status unmatched';
+    mbStatus.innerHTML = `<strong>No MusicBrainz match.</strong> Disc ID <code>${data.disc_id}</code>. Fill in album + track info below manually.`;
+  }
+  document.getElementById('cdripAlbumTitle').value = data.album_title || '';
+  document.getElementById('cdripAlbumArtist').value = data.album_artist || '';
+  document.getElementById('cdripYear').value = data.year || '';
+  document.getElementById('cdripGenre').value = data.genre || '';
+
+  const tbody = document.getElementById('cdripTracksBody');
+  tbody.innerHTML = data.tracks.map((t, i) => `
+    <tr data-position="${t.position}">
+      <td class="num">${t.position}</td>
+      <td><input class="cdrip-track-title" type="text" value="${(t.title || '').replace(/"/g, '&quot;')}"></td>
+      <td><input class="cdrip-track-artist" type="text" value="${(t.artist || '').replace(/"/g, '&quot;')}"></td>
+      <td class="dur">${fmtDuration(t.duration_seconds)}</td>
+    </tr>
+  `).join('');
+}
+
+async function ejectCD() {
+  try {
+    const resp = await fetch("{% url 'library:api-cd-eject' %}", {
+      method: 'POST',
+      headers: { 'X-CSRFToken': getCookie('csrftoken') },
+    });
+    const data = await resp.json();
+    const msg = document.getElementById('cdripIdleMsg');
+    if (resp.ok) {
+      msg.textContent = 'Tray opened.';
+      msg.className = 'cdrip-msg ok';
+    } else {
+      msg.textContent = data.error || 'Eject failed.';
+      msg.className = 'cdrip-msg error';
+    }
+  } catch (e) {}
+}
+
+function cancelDetected() {
+  currentDetection = null;
+  document.getElementById('cdripIdleMsg').textContent = '';
+  showState('Idle');
+}
+
+function collectAlbumMeta() {
+  const rows = document.querySelectorAll('#cdripTracksBody tr');
+  const tracks = Array.from(rows).map(row => ({
+    position: parseInt(row.dataset.position, 10),
+    title: row.querySelector('.cdrip-track-title').value.trim(),
+    artist: row.querySelector('.cdrip-track-artist').value.trim(),
+  }));
+  return {
+    album_title: document.getElementById('cdripAlbumTitle').value.trim(),
+    album_artist: document.getElementById('cdripAlbumArtist').value.trim(),
+    year: parseInt(document.getElementById('cdripYear').value, 10) || null,
+    genre: document.getElementById('cdripGenre').value.trim(),
+    tracks: tracks,
+  };
+}
+
+async function startRip() {
+  const btn = document.getElementById('cdripStartBtn');
+  const msg = document.getElementById('cdripDetectedMsg');
+  const meta = collectAlbumMeta();
+  const missing = meta.tracks.filter(t => !t.title);
+  if (missing.length) {
+    msg.textContent = `Fill in the title for track(s) ${missing.map(t => t.position).join(', ')} first.`;
+    msg.className = 'cdrip-msg error';
+    return;
+  }
+  btn.disabled = true;
+  msg.textContent = 'Starting rip...';
+  msg.className = 'cdrip-msg';
+
+  try {
+    const resp = await fetch("{% url 'library:api-cd-rip-start' %}", {
+      method: 'POST',
+      headers: { 'X-CSRFToken': getCookie('csrftoken'), 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        category_id: document.getElementById('cdripCategory').value,
+        disc_id: currentDetection.disc_id,
+        mb_release_id: currentDetection.mbid || '',
+        album_meta: meta,
+      }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) {
+      msg.textContent = data.error || 'Start failed.';
+      msg.className = 'cdrip-msg error';
+      btn.disabled = false;
+      return;
+    }
+    currentJobId = data.job_id;
+    document.getElementById('cdripRippingTitle').textContent = `${meta.album_artist} — ${meta.album_title}`;
+    showState('Ripping');
+    startStatusPolling();
+  } catch (e) {
+    msg.textContent = 'Network error -- try again.';
+    msg.className = 'cdrip-msg error';
+    btn.disabled = false;
+  }
+}
+
+function startStatusPolling() {
+  if (cdripPollTimer) clearInterval(cdripPollTimer);
+  cdripPollTimer = setInterval(refreshStatus, 1500);
+  refreshStatus();
+}
+
+async function refreshStatus() {
+  try {
+    const resp = await fetch("{% url 'library:api-cd-rip-status' %}");
+    const data = await resp.json();
+    if (data.state === 'idle') {
+      stopStatusPolling();
+      showState('Idle');
+      return;
+    }
+    document.getElementById('cdripStatusMsg').textContent = data.status_message || '';
+    document.getElementById('cdripProgressCur').textContent = data.progress_current_track || 0;
+    document.getElementById('cdripProgressTot').textContent = data.progress_total_tracks || 0;
+    const pct = data.progress_total_tracks
+      ? Math.min(100, 100 * data.progress_current_track / data.progress_total_tracks)
+      : 0;
+    document.getElementById('cdripProgressFill').style.width = pct + '%';
+
+    if (data.state === 'done') {
+      stopStatusPolling();
+      renderDone(data);
+      showState('Done');
+    } else if (data.state === 'error' || data.state === 'cancelled') {
+      stopStatusPolling();
+      document.getElementById('cdripErrorMsg').textContent =
+        data.state === 'cancelled'
+          ? 'Rip cancelled.'
+          : ('Rip failed: ' + (data.error_message || 'unknown error'));
+      showState('Error');
+    }
+  } catch (e) {
+    // Transient network hiccup -- keep polling.
+  }
+}
+
+function stopStatusPolling() {
+  if (cdripPollTimer) { clearInterval(cdripPollTimer); cdripPollTimer = null; }
+}
+
+function renderDone(data) {
+  document.getElementById('cdripDoneMsg').textContent =
+    data.status_message || `Ripped ${data.created_track_ids.length} tracks.`;
+  const rows = data.created_track_ids.map((tid, i) => {
+    const verdict = (data.accurate_rip_matches || [])[i] || 'unknown';
+    const label = { match: 'AR match', nomatch: 'AR nomatch',
+                    notfound: 'AR notfound', '': 'AR unknown' }[verdict] || `AR ${verdict}`;
+    return `<div class="cdrip-done-row">
+      <span class="ar ${verdict || 'unknown'}">${label}</span>
+      <a href="/track/${tid}/" target="_blank">Track #${tid}</a>
+    </div>`;
+  }).join('');
+  document.getElementById('cdripDoneTracks').innerHTML = rows || '<div class="cdrip-msg">No tracks created.</div>';
+}
+
+async function cancelRip() {
+  await fetch("{% url 'library:api-cd-rip-cancel' %}", {
+    method: 'POST',
+    headers: { 'X-CSRFToken': getCookie('csrftoken') },
+  });
+  // status poll will notice the cancelled state and switch to Error UI
+}
+
+function ripAnother() {
+  currentDetection = null;
+  currentJobId = null;
+  document.getElementById('cdripIdleMsg').textContent = '';
+  showState('Idle');
+}
+
+// On page load, resume monitoring if there's an active rip.
+(async function initCDPanel() {
+  try {
+    const resp = await fetch("{% url 'library:api-cd-rip-status' %}");
+    const data = await resp.json();
+    if (data.state === 'running' || data.state === 'pending') {
+      currentJobId = data.id;
+      document.getElementById('cdripRippingTitle').textContent =
+        `${data.album_artist || ''} — ${data.album_title || ''}`;
+      showState('Ripping');
+      startStatusPolling();
+    }
+  } catch (e) {}
+})();
+
+
+// ============================================================
+// FILE UPLOAD PANEL (existing, unchanged)
+// ============================================================
 const dropzone = document.getElementById('impDropzone');
 const fileInput = document.getElementById('impFileInput');
 const categorySelect = document.getElementById('impCategory');
@@ -121,7 +526,6 @@ const resultsEl = document.getElementById('impResults');
 const uploadingEl = document.getElementById('impUploading');
 
 dropzone.addEventListener('click', () => fileInput.click());
-
 dropzone.addEventListener('dragover', (e) => {
   e.preventDefault();
   dropzone.classList.add('dragover');
@@ -132,7 +536,6 @@ dropzone.addEventListener('drop', (e) => {
   dropzone.classList.remove('dragover');
   if (e.dataTransfer.files.length) uploadFiles(e.dataTransfer.files);
 });
-
 fileInput.addEventListener('change', () => {
   if (fileInput.files.length) uploadFiles(fileInput.files);
   fileInput.value = '';
@@ -141,20 +544,15 @@ fileInput.addEventListener('change', () => {
 const MAX_BATCH_SIZE_MB = {{ max_batch_size_mb }};
 
 async function uploadFiles(fileList) {
-  // Client-side check first -- purely a fast/friendly UX shortcut, the
-  // server enforces the same limit for real (see api_library_upload) since
-  // this check is trivially bypassable.
   const totalBytes = Array.from(fileList).reduce((sum, f) => sum + f.size, 0);
   const totalMb = totalBytes / (1024 * 1024);
   if (totalMb > MAX_BATCH_SIZE_MB) {
     resultsEl.innerHTML = `<div class="imp-result-row error">Batch too large: ${totalMb.toFixed(1)}MB exceeds the ${MAX_BATCH_SIZE_MB}MB limit (Config &gt; Upload Configuration in admin).</div>`;
     return;
   }
-
   const formData = new FormData();
   formData.append('category_id', categorySelect.value);
   for (const file of fileList) formData.append('files', file);
-
   uploadingEl.style.display = 'block';
   try {
     const resp = await fetch("{% url 'library:api-library-upload' %}", {
