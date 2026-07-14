@@ -5,6 +5,31 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{% block title %}IsadoraAir{% endblock %}</title>
+
+  {# Icon set. Single 500x500 PNG at /media/ui_theme/isadoraair_icon.png #}
+  {# drives all four surfaces: browser tab, iOS home screen (via         #}
+  {# apple-touch-icon), Android home screen (via the web manifest below),#}
+  {# and desktop-PWA install. Modern browsers and both mobile OSes scale #}
+  {# a 500x500 without artifacts, so we skip the classic multi-size ico  #}
+  {# dance. Swap the file in place to change the icon; no URL change     #}
+  {# needed. #}
+  <link rel="icon" type="image/png" href="/media/ui_theme/isadoraair_icon.png">
+  <link rel="apple-touch-icon" href="/media/ui_theme/isadoraair_icon.png">
+  {# `.json` extension (not the spec's `.webmanifest`) so nginx picks up  #}
+  {# the application/json Content-Type from /etc/nginx/mime.types without #}
+  {# needing a custom per-location rule. Browsers accept the manifest by  #}
+  {# `rel="manifest"` semantics regardless of MIME.                       #}
+  <link rel="manifest" href="{% static 'library/site.manifest.json' %}">
+  {# `theme-color` sets the color of the browser chrome (mobile Safari's  #}
+  {# top bar, Android's status bar in standalone-installed mode). Matches #}
+  {# `--bg-darker` which is pure black for the current theme.             #}
+  <meta name="theme-color" content="#000000">
+  {# iOS-only meta pair: `capable=yes` opens the site in standalone mode  #}
+  {# when launched from the home screen (no Safari chrome), and           #}
+  {# `title` sets what shows underneath the icon on the home screen.      #}
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="IsadoraAir">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <style>
     :root {
       --bg-dark: {{ ui_theme.bg_dark }};
