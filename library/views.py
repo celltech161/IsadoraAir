@@ -276,6 +276,98 @@ def api_category_detail(request, pk):
 
 
 @require_http_methods(["POST"])
+def api_category_repick_cue_points(request, pk):
+    """Smart cue-point refresh for every track in this category. For each
+    track, fast-paths against the saved mono envelope in its waveform
+    JSON when present -- reads the envelope, applies the category's
+    effective thresholds (with per-category overrides folded in on top
+    of the global AnalysisConfig defaults), writes the new cue-in /
+    next-start values back to the DB and the JSON. Order of seconds
+    per hundred tracks; no ffmpeg re-decode.
+
+    Falls back to the slow path (NULL `next_start_seconds` so the
+    analyze timer re-runs analyze_one_track, which does re-decode) for
+    tracks whose JSON pre-dates envelope persistence, or is missing
+    entirely, or fails to parse. Newly-analyzed tracks after this
+    commit land with envelope data automatically -- backfill happens
+    organically as tracks cycle through the analyzer for other reasons
+    (uploads, edits, previous slow-path repicks).
+
+    Returns a per-path breakdown so the operator sees fast-path coverage
+    grow over time as the library backfills organically."""
+    from library.management.commands.analyze_tracks import (
+        apply_category_thresholds, repick_cue_points_from_json,
+    )
+    from library.models import AnalysisConfig, Track
+    category = get_object_or_404(Category, pk=pk)
+    cfg = AnalysisConfig.load()
+    _sr, _ws, _tp, ns_db, ci_db, ci_min = apply_category_thresholds(
+        (cfg.analysis_sample_rate, cfg.analysis_window_seconds, cfg.waveform_points,
+         cfg.next_start_threshold_db, cfg.cue_in_threshold_db, cfg.cue_in_min_seconds),
+        category.next_start_threshold_db_override,
+        category.cue_in_threshold_db_override,
+    )
+    tracks = list(Track.objects.filter(category=category).values_list(
+        "id", "waveform_path",
+    ))
+    repicked = 0
+    queued_full = 0
+    for track_id, waveform_path in tracks:
+        if not waveform_path or not Path(waveform_path).is_file():
+            # No JSON at all -- fall through to full analyze.
+            Track.objects.filter(id=track_id).update(next_start_seconds=None)
+            queued_full += 1
+            continue
+        try:
+            next_start, cue_in, payload = repick_cue_points_from_json(
+                waveform_path, ns_db, ci_db, ci_min,
+            )
+        except LookupError:
+            # Pre-envelope-persistence JSON -- can't fast-path this
+            # track. Queue it for the analyze timer which will land
+            # envelope data on the way through, enabling fast-path
+            # repicks in the future.
+            Track.objects.filter(id=track_id).update(next_start_seconds=None)
+            queued_full += 1
+            continue
+        except Exception as exc:
+            # Corrupt/unreadable JSON -- also fall through to slow path
+            # rather than failing the whole batch on one bad file.
+            print(f"  [repick] track {track_id} JSON error: {exc}; queuing full re-analyze")
+            Track.objects.filter(id=track_id).update(next_start_seconds=None)
+            queued_full += 1
+            continue
+        Track.objects.filter(id=track_id).update(
+            next_start_seconds=next_start, cue_in_seconds=cue_in,
+        )
+        try:
+            Path(waveform_path).write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        except Exception as exc:
+            # DB is authoritative; JSON is display cache. Log and move on.
+            print(f"  [repick] track {track_id} JSON write failed: {exc}")
+        repicked += 1
+    total = repicked + queued_full
+    if queued_full:
+        suffix = (
+            f" {queued_full} track(s) missing envelope data are queued "
+            f"for a full re-analyze (the timer will pick them up in the "
+            f"next minute) -- future repicks on those will be instant."
+        )
+    else:
+        suffix = ""
+    return JsonResponse({
+        "ok": True,
+        "repicked": repicked,
+        "queued_full_analyze": queued_full,
+        "total": total,
+        "message": (
+            f"Category '{category.code}': repicked {repicked} track(s) "
+            f"instantly from saved envelope data.{suffix}"
+        ),
+    })
+
+
+@require_http_methods(["POST"])
 def api_category_reset_analysis(request, pk):
     """Clear the analysis marks (`next_start_seconds` = NULL) on every
     track in this category so `isadoraair-analyze.timer` re-picks them

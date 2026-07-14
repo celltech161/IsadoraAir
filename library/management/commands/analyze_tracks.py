@@ -11,6 +11,42 @@ from django.core.management.base import BaseCommand
 from library.models import AnalysisConfig, Track
 
 
+def repick_cue_points_from_json(json_path, next_start_db, cue_in_db, cue_in_min):
+    """Fast-path cue-point re-evaluation: read a track's already-computed
+    envelope out of its waveform JSON and apply fresh thresholds without
+    another ffmpeg decode. Returns `(next_start, cue_in, payload)` where
+    the third value is the loaded JSON with `next_start`/`cue_in_seconds`
+    replaced in place -- callers write it back to disk so the JSON stays
+    consistent with the DB.
+
+    Raises `LookupError` when the JSON pre-dates envelope persistence
+    (older than analyze_tracks's envelope save) so the caller can decide
+    to fall back to a full re-analyze. Any other IO/parse failure raises
+    the underlying exception -- upstream should treat it as
+    "skip this track, log, keep going."
+
+    Extracted so both the /categories/repick-cue-points endpoint and a
+    future CLI command can share exactly the same
+    load-envelope-apply-thresholds pipeline -- if we drift the two
+    apart, cue points from the two paths could disagree, which would be
+    a very frustrating bug to track down."""
+    import json as _json  # local alias; module imports it at top already
+    payload = _json.loads(Path(json_path).read_text(encoding="utf-8"))
+    times = payload.get("envelope_times")
+    envelope_db = payload.get("envelope_db")
+    if not times or not envelope_db:
+        raise LookupError(
+            f"waveform JSON at {json_path} has no envelope data -- "
+            f"pre-envelope-persistence file, needs a full re-analyze"
+        )
+    duration = payload.get("analysis_duration")
+    next_start = detect_next_start(times, envelope_db, duration, next_start_db)
+    cue_in = detect_cue_in(times, envelope_db, duration, cue_in_db, cue_in_min)
+    payload["next_start"] = next_start
+    payload["cue_in_seconds"] = cue_in
+    return next_start, cue_in, payload
+
+
 def apply_category_thresholds(base_cfg_values, next_start_override, cue_in_override):
     """Overlay per-Category `next_start_threshold_db_override` and
     `cue_in_threshold_db_override` on top of the base AnalysisConfig
@@ -332,6 +368,21 @@ def analyze_one_track(row, cfg_values, wave_dir, force):
         "next_start": next_start,
         "cue_in_seconds": cue_in,
         "analysis_duration": analysis_duration,
+        # Mono envelope in dBFS at `window_seconds` resolution -- the
+        # actual signal `detect_next_start`/`detect_cue_in` walk to
+        # pick the two cue points. Persisting it means we can re-pick
+        # cue points against fresh thresholds later WITHOUT another
+        # ffmpeg decode + envelope compute pass -- the expensive parts
+        # of analysis. Consumed by `repick_cue_points_from_json` (used
+        # by /api/categories/<pk>/repick-cue-points/) to let the operator
+        # iterate on category threshold tuning in seconds instead of
+        # minutes. Roughly doubles JSON size (order of ~50 kB per typical
+        # 4-min track); acceptable trade for the workflow improvement.
+        # Existing tracks lack these fields until their next real analyze
+        # pass; the repick endpoint falls back to a full re-analyze on
+        # those (organic backfill).
+        "envelope_times": times,
+        "envelope_db": envelope_db,
     }
     try:
         out_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")

@@ -16,6 +16,7 @@ urlpatterns = [
     path('api/categories/', views.api_category_list, name='api-category-list'),
     path('api/categories/<int:pk>/', views.api_category_detail, name='api-category-detail'),
     path('api/categories/<int:pk>/reset-analysis/', views.api_category_reset_analysis, name='api-category-reset-analysis'),
+    path('api/categories/<int:pk>/repick-cue-points/', views.api_category_repick_cue_points, name='api-category-repick-cue-points'),
     path('rotations/', views.rotations_page, name='rotations'),
     path('api/rotations/', views.api_rotation_list, name='api-rotation-list'),
     path('api/rotations/<int:pk>/', views.api_rotation_detail, name='api-rotation-detail'),

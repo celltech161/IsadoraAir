@@ -277,7 +277,7 @@
         <button type="button" class="pl-btn danger" id="deleteCategoryBtn" onclick="deleteCurrentCategory()" style="display:none;">Delete</button>
         <button type="button" class="pl-btn" onclick="newCategory()">Clear</button>
         <button type="button" class="pl-btn" id="reanalyzeCategoryBtn" onclick="reanalyzeCategoryTracks()" style="display:none;"
-                title="Clears next-start on every track in this category so the analyze timer re-runs cue-point analysis using the thresholds above.">Re-analyze Tracks</button>
+                title="Fast-repicks cue points from every track's saved envelope data using the thresholds above. Any track whose JSON pre-dates envelope persistence auto-falls back to a full re-analyze via the analyze timer.">Update Cue Points</button>
       </div>
     </form>
   </div>
@@ -452,27 +452,29 @@ async function reanalyzeCategoryTracks() {
   const label = c ? c.code : 'this category';
   const trackCount = c && c.track_count != null ? c.track_count : '?';
   if (!confirm(
-    `Re-analyze all tracks in "${label}" (${trackCount} track(s))?\n\n` +
-    `This clears next_start on every track in the category, letting the ` +
-    `analyze timer re-run cue-point analysis with the thresholds shown ` +
-    `above. Manual intro/outro/hook marks are NOT touched.`
+    `Update cue points on every track in "${label}" (${trackCount} track(s))?\n\n` +
+    `Tracks with envelope data land instantly (seconds per hundred). ` +
+    `Tracks whose JSON pre-dates envelope persistence auto-queue for a ` +
+    `full re-analyze via the timer -- those catch up over the next few ` +
+    `minutes. Manual intro/outro/hook marks are NOT touched either way.`
   )) return;
 
   // Save first if the operator has unsaved threshold edits -- otherwise
-  // the re-analysis fires with the last-saved values, not the ones
-  // currently in the form. Simpler than trying to detect dirty state.
+  // the repick fires with the last-saved values, not the ones currently
+  // in the form. Simpler than trying to detect dirty state.
   setMsg('Saving current settings first...');
   await saveCategory();
 
-  const { ok, data } = await apiJson(`/api/categories/${currentCategoryId}/reset-analysis/`, {
+  setMsg('Updating cue points...');
+  const { ok, data } = await apiJson(`/api/categories/${currentCategoryId}/repick-cue-points/`, {
     method: 'POST',
     headers: { 'X-CSRFToken': getCookie('csrftoken') },
   });
   if (!ok) {
-    setMsg(data && data.error ? data.error : 'Could not queue re-analysis', true);
+    setMsg(data && data.error ? data.error : 'Could not update cue points', true);
     return;
   }
-  setMsg(data.message || `Queued ${data.queued || 0} track(s) for re-analysis.`);
+  setMsg(data.message || `Repicked ${data.repicked || 0} track(s).`);
 }
 
 loadCategories();
