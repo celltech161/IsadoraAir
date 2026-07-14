@@ -195,6 +195,15 @@ MEDIA_ROOT = BASE_DIR / 'media'
 LIBRARY_ROOT = config('LIBRARY_ROOT', default='/srv/isadoraair/music')
 WAVEFORMS_DIR = config('WAVEFORMS_DIR', default='/srv/isadoraair/waveforms')
 
+# --- CD ripping ---
+# whipper needs to know the drive's read offset (samples). This box's
+# drive is "hp PLDS DVDRW DU8AESH" per hdparm -- offset +6 per
+# AccurateRip's drive database (confidence 328, 100% match rate). Any
+# other drive: look up at accuraterip.com/driveoffsets.htm and override
+# via the CD_RIP_OFFSET env var.
+CD_RIP_OFFSET = config('CD_RIP_OFFSET', default=6, cast=int)
+CD_RIP_STAGING_ROOT = config('CD_RIP_STAGING_ROOT', default='/srv/isadoraair/rip_staging')
+
 # --- Audio analysis thresholds ---
 ANALYSIS_SAMPLE_RATE = config('ANALYSIS_SAMPLE_RATE', default=4410, cast=int)
 ANALYSIS_WINDOW_SECONDS = config('ANALYSIS_WINDOW_SECONDS', default=0.05, cast=float)

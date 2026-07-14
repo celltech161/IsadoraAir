@@ -13,9 +13,28 @@ from pathlib import Path
 from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
 from django.utils import timezone
-from django.utils.text import get_valid_filename
 
 from library.models import Album, Artist, CDRipJob, Genre, Track
+
+
+# Filesystem-unsafe on Linux or Windows. Everything else -- spaces,
+# apostrophes, parentheses, brackets, hyphens, ampersands -- passes
+# through so browsing the folder in a file manager reads naturally.
+# Django's own get_valid_filename() is too aggressive (turns spaces
+# into underscores, strips apostrophes), which was making CD-ripped
+# filenames like `B.B._King_-_3_OClock_Blues.flac` -- ugly.
+_FN_STRIP = re.compile(r'[\x00-\x1f/\\]')       # path separators + control chars
+_FN_REPLACE = re.compile(r'[:*?"<>|]')          # Windows-illegal (samba shares hit these)
+def sanitize_filename(name):
+    """Sanitize a proposed filename component -- strips path separators
+    and control chars, replaces Windows-illegal chars with underscore,
+    trims trailing dots/spaces (Windows), and collapses runs of
+    whitespace. Everything else stays. Never returns empty; falls back
+    to '_' if the input sanitizes to nothing."""
+    name = _FN_STRIP.sub("", name)
+    name = _FN_REPLACE.sub("_", name)
+    name = re.sub(r"\s+", " ", name).strip(" .")
+    return name or "_"
 
 
 # Whipper's --track-template. See `whipper cd rip --help` for the full
@@ -113,17 +132,38 @@ class Command(BaseCommand):
 
         staging = Path(job.staging_dir)
         staging.mkdir(parents=True, exist_ok=True)
+        # Whipper considers its -O directory "already a finished rip"
+        # if it finds any *.log inside -- including our own captured
+        # stdout log. Give whipper its own scratch subdir so our log
+        # sits alongside it, not inside it.
+        whipper_out = staging / "output"
+        whipper_out.mkdir(exist_ok=True)
 
         # Build whipper args. -R locks whipper into the MB release the
         # operator picked in detect (if any); -U lets it proceed on
         # unmatched discs. --cdr and --keep-going make it more tolerant
         # of stubborn discs.
+        # -d DEVICE is a `whipper cd` flag, NOT a `whipper cd rip` flag
+        # (subcommand ordering matters -- it goes BEFORE `rip`).
+        #
+        # --offset=<n> is drive-specific and required by whipper. 0 is a
+        # safe default that works on most drives; AccurateRip
+        # verifications may not match against reference rips unless the
+        # true offset is set. Look up your drive model at
+        # http://www.accuraterip.com/driveoffsets.htm or run
+        # `whipper offset find` (needs pycdio, which isn't packaged
+        # cleanly on Ubuntu 25.10) to find the real one, then override
+        # this via the CD_RIP_OFFSET env var / settings entry.
+        from django.conf import settings as dj_settings
+        import os
+        offset = str(getattr(dj_settings, "CD_RIP_OFFSET",
+                             os.environ.get("CD_RIP_OFFSET", "0")))
         args = [
-            "whipper", "cd", "rip",
-            "-d", job.device,
-            "-O", str(staging),
+            "whipper", "cd", "-d", job.device, "rip",
+            "-O", str(whipper_out),
             "--track-template", TRACK_TEMPLATE,
             "--disc-template", DISC_TEMPLATE,
+            "--offset", offset,
             "-U", "--cdr", "--keep-going",
         ]
         if job.mb_release_id:
@@ -137,29 +177,63 @@ class Command(BaseCommand):
         job.whipper_pid = proc.pid
         job.save(update_fields=["whipper_pid"])
 
-        # Capture whipper's stdout (mostly progress noise) into a log
-        # file for post-mortem. We don't try to parse individual track
-        # progress from it -- too fragile; the poll endpoint reports
-        # progress based on how many FLACs have landed in staging.
+        # Capture whipper's stdout into a log file for post-mortem,
+        # and also surface a live status message so the UI reflects
+        # what whipper is doing minute-by-minute (TOC read, subchannel
+        # scan, then per-track rip). Whipper's output has three phases
+        # we care about:
+        #   1. "Reading TOC N %"      -- initial disc scan
+        #   2. "Reading table N %"    -- subchannel scan
+        #   3. "Ripping track N ..."  -- actual audio rip
+        # Rather than try to match each variant, we just push the
+        # latest non-empty log line into status_message, and separately
+        # parse "Track N of M" when it appears for the numeric counter.
+        ansi_re = re.compile(r'\x1b\[[0-9;]*[mGKHF]')
+        cr_or_lf = re.compile(r'[\r\n]+')
         log_path = staging / "whipper.stdout.log"
+        last_status_update = 0.0
+        last_status_msg = ""
         with open(log_path, "w") as logf:
-            for line in proc.stdout:
-                logf.write(line)
-                # Cheap heuristic status update: whipper mentions
-                # 'Track N of M' lines during the rip.
-                m = re.search(r"[Tt]rack\s+(\d+)\s+of\s+(\d+)", line)
-                if m:
-                    cur, tot = int(m.group(1)), int(m.group(2))
-                    if (cur != job.progress_current_track
-                            or tot != job.progress_total_tracks):
-                        job.progress_current_track = cur
-                        job.progress_total_tracks = tot
-                        job.status_message = f"Ripping track {cur}/{tot}..."
+            # Whipper uses \r-heavy progress lines ("Reading TOC 0%\r
+            # Reading TOC 4%\r..."), so iterating with `.readline()`
+            # wouldn't split them cleanly. Read char-by-char instead
+            # and split on either newline OR carriage return.
+            buf = ""
+            while True:
+                chunk = proc.stdout.read(256)
+                if not chunk:
+                    break
+                logf.write(chunk)
+                logf.flush()
+                buf += chunk
+                # Split on any run of \r or \n
+                parts = cr_or_lf.split(buf)
+                buf = parts.pop()  # trailing (possibly incomplete) line
+                for part in parts:
+                    clean = ansi_re.sub("", part).strip()
+                    if not clean:
+                        continue
+                    # Numeric progress counter (during actual rip phase)
+                    m = re.search(r"[Tt]rack\s+(\d+)\s+of\s+(\d+)", clean)
+                    if m:
+                        cur, tot = int(m.group(1)), int(m.group(2))
+                        if cur != job.progress_current_track or tot != job.progress_total_tracks:
+                            job.progress_current_track = cur
+                            job.progress_total_tracks = tot
+                    # Rate-limit status_message updates to once per
+                    # second -- otherwise a percentage bar produces
+                    # 100+ DB updates per phase and adds nothing.
+                    import time as _t
+                    now = _t.time()
+                    if clean != last_status_msg and now - last_status_update > 1.0:
+                        job.status_message = clean[:497]
                         job.save(update_fields=[
                             "progress_current_track",
                             "progress_total_tracks",
                             "status_message",
                         ])
+                        last_status_msg = clean
+                        last_status_update = now
         proc.wait()
         if proc.returncode != 0:
             raise RuntimeError(
@@ -167,17 +241,16 @@ class Command(BaseCommand):
                 + "\n".join(log_path.read_text(errors='replace').splitlines()[-10:])
             )
 
-        # Discover output. Whipper writes to <staging>/<AlbumArtist>/
-        # <Album>/<TrackTemplate>.flac usually -- but with `-U` and
-        # unmatched discs it may write directly under staging. Recurse
-        # to find every FLAC.
-        flacs = sorted(staging.rglob("*.flac"),
+        # Discover output under whipper's -O dir. It may write directly
+        # there OR into an artist/album subtree; recurse to find every
+        # FLAC either way.
+        flacs = sorted(whipper_out.rglob("*.flac"),
                        key=lambda p: (p.parent, p.name))
         if not flacs:
-            raise RuntimeError(f"whipper finished but no FLAC files landed in {staging}")
+            raise RuntimeError(f"whipper finished but no FLAC files landed in {whipper_out}")
 
         # AccurateRip verdicts from whipper's log.
-        rip_log = next(staging.rglob("*.log"), None)
+        rip_log = next(whipper_out.rglob("*.log"), None)
         verdicts = _parse_accuraterip_from_log(rip_log, len(flacs)) if rip_log else [""] * len(flacs)
 
         # Post-process: apply operator-edited tags, move into library,
@@ -238,7 +311,9 @@ class Command(BaseCommand):
                 # for tags anyway.
                 self.stdout.write(f"  [tag] track {position} failed: {exc}")
 
-            safe_name = get_valid_filename(f"{artist_name} - {title}.flac")
+            safe_name = sanitize_filename(
+                f"{artist_name} - {title} [Trk {position:02d}].flac"
+            )
             dest_path = _unique_dest(dest_dir, safe_name)
             try:
                 shutil.move(str(src), str(dest_path))
