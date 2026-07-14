@@ -128,6 +128,50 @@
     cursor: crosshair;
   }
 
+  .wave-transport {
+    display: flex;
+    align-items: center;
+    gap: 0.9rem;
+    margin-top: 0.6rem;
+    padding-top: 0.55rem;
+    border-top: 1px solid var(--border-subtle);
+  }
+  .wave-play-btn {
+    background: var(--accent);
+    color: var(--bg-dark);
+    border: none;
+    border-radius: 999px;
+    width: 34px;
+    height: 34px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    padding: 0;
+    flex-shrink: 0;
+  }
+  .wave-play-btn:hover { filter: brightness(1.08); }
+  .wave-play-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .wave-play-btn svg { display: block; }
+  .wave-time {
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 0.82rem;
+    color: var(--text-muted);
+    min-width: 84px;
+  }
+  .wave-time span:first-child { color: var(--text-main); }
+  .wave-volume-wrap {
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    color: var(--text-muted);
+  }
+  .wave-volume-wrap input[type="range"] {
+    width: 100px;
+    accent-color: var(--accent);
+  }
+
   .cue-selector {
     display: flex;
     flex-wrap: wrap;
@@ -203,12 +247,22 @@
   <h1>{{ track.title }} <span class="track-artist">— {{ track.artist.name }}</span></h1>
 </div>
 
-<audio id="trackPlayer" controls preload="metadata" src="{% url 'library:api-track-audio' track.pk %}" style="width:100%; max-width:420px; margin-bottom:1rem;"></audio>
-
 <div class="waveform-wrap" id="waveformWrap" style="display:none;">
   <div class="cue-selector" id="cueSelector"></div>
   <div class="cue-hint" id="cueHint">Click the waveform to seek. Pick a cue name above to set that cue's position on the next click.</div>
   <canvas id="waveformCanvas"></canvas>
+  <div class="wave-transport">
+    <button type="button" class="wave-play-btn" id="wavePlayBtn" title="Play / pause (Space)">
+      <svg id="wavePlayIcon" width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
+      <svg id="wavePauseIcon" width="20" height="20" viewBox="0 0 24 24" fill="currentColor" style="display:none;"><path d="M6 5h4v14H6zm8 0h4v14h-4z"/></svg>
+    </button>
+    <div class="wave-time"><span id="waveCurTime">0:00</span> / <span id="waveDurTime">0:00</span></div>
+    <div class="wave-volume-wrap">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M3 9v6h4l5 5V4L7 9H3zm13.5 3A4.5 4.5 0 0 0 14 8.03v7.94A4.5 4.5 0 0 0 16.5 12z"/></svg>
+      <input type="range" min="0" max="1" step="0.01" value="1" id="waveVolume" title="Volume">
+    </div>
+  </div>
+  <audio id="trackPlayer" preload="metadata" src="{% url 'library:api-track-audio' track.pk %}" style="display:none;"></audio>
 </div>
 
 <div class="detail-grid">
@@ -814,17 +868,53 @@ for (const f of CUE_FIELDS) {
   if (el) el.addEventListener('input', drawWaveform);
 }
 
-// Wire the audio player to the waveform's playhead cursor. On play,
-// start a rAF loop for smooth 60fps updates. On pause/seek/end, one
-// redraw to snap the cursor to the final position and stop burning
-// frames. timeupdate covers the case where a background/throttled
-// tab misses rAF ticks entirely.
+// --- Custom transport (built to replace the native <audio controls>
+// timeline, since the waveform canvas above IS the timeline). Play/
+// pause toggle + m:ss / m:ss time display + volume slider. Space bar
+// toggles play when the focus isn't on an input.
+function fmtTime(s) {
+  if (!isFinite(s) || s < 0) return '0:00';
+  const m = Math.floor(s / 60);
+  const ss = Math.floor(s % 60);
+  return m + ':' + String(ss).padStart(2, '0');
+}
+function refreshTransport() {
+  document.getElementById('waveCurTime').textContent = fmtTime(audioEl.currentTime);
+  document.getElementById('waveDurTime').textContent = fmtTime(audioEl.duration);
+  document.getElementById('wavePlayIcon').style.display  = audioEl.paused ? '' : 'none';
+  document.getElementById('wavePauseIcon').style.display = audioEl.paused ? 'none' : '';
+}
+document.getElementById('wavePlayBtn').addEventListener('click', () => {
+  if (audioEl.paused) audioEl.play(); else audioEl.pause();
+});
+document.getElementById('waveVolume').addEventListener('input', (e) => {
+  audioEl.volume = parseFloat(e.target.value);
+});
+document.addEventListener('keydown', (e) => {
+  // Ignore spacebar when the user is typing in a form field -- otherwise
+  // every space in the Title/Artist/etc inputs would toggle playback.
+  const t = e.target;
+  const isFormField = t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable);
+  if (e.code === 'Space' && !isFormField) {
+    e.preventDefault();
+    document.getElementById('wavePlayBtn').click();
+  }
+});
+
+// Wire the audio player to the waveform's playhead cursor AND the
+// custom transport display. On play, start a rAF loop for smooth 60fps
+// updates. On pause/seek/end, one redraw to snap cursor to the final
+// position and stop burning frames. timeupdate covers the case where a
+// background/throttled tab misses rAF ticks entirely.
 if (audioEl) {
-  audioEl.addEventListener('play',   startPlayheadLoop);
-  audioEl.addEventListener('pause',  stopPlayheadLoop);
-  audioEl.addEventListener('ended',  stopPlayheadLoop);
-  audioEl.addEventListener('seeked', drawWaveform);
-  audioEl.addEventListener('timeupdate', () => { if (!playheadRAF) drawWaveform(); });
+  audioEl.addEventListener('play',   () => { refreshTransport(); startPlayheadLoop(); });
+  audioEl.addEventListener('pause',  () => { refreshTransport(); stopPlayheadLoop(); });
+  audioEl.addEventListener('ended',  () => { refreshTransport(); stopPlayheadLoop(); });
+  audioEl.addEventListener('seeked', () => { refreshTransport(); drawWaveform(); });
+  audioEl.addEventListener('timeupdate', () => {
+    refreshTransport();
+    if (!playheadRAF) drawWaveform();
+  });
   audioEl.addEventListener('loadedmetadata', () => {
     // Prefer the browser's exact duration over the analyzed one --
     // they usually agree, but if the analyzer trimmed silence the
@@ -833,7 +923,9 @@ if (audioEl) {
       waveformDuration = audioEl.duration;
       drawWaveform();
     }
+    refreshTransport();
   });
+  refreshTransport();  // In case metadata is already loaded from cache.
 }
 loadWaveform();
 
