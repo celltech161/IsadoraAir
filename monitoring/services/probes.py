@@ -247,63 +247,6 @@ def probe_rbds(check):
     return "ok", {"current_ps": data.get("current_ps"), "current_rt": data.get("current_rt")}
 
 
-def probe_log_slot_category(check):
-    """Tripwire: verify a specific log-slot position in the CURRENT
-    hour's PlaylistLog contains a track from the expected category.
-    Primary use: FCC-required legal ID at top of hour -- position=0,
-    category=Legal ID. Returns critical if the log doesn't exist, if
-    that position doesn't exist in the log, or if the item at that
-    position doesn't match the expected category."""
-    from django.utils import timezone
-    from library.models import PlaylistLog
-
-    if check.log_slot_category_id is None:
-        return "unknown", {"reason": "no target category configured on this check"}
-
-    now = timezone.localtime()
-    log = PlaylistLog.objects.filter(date=now.date(), hour=now.hour).first()
-    if log is None:
-        return "critical", {
-            "reason": f"no PlaylistLog for {now.date()} h={now.hour:02d}",
-            "position": check.log_slot_position,
-            "expected_category": check.log_slot_category.code,
-        }
-
-    item = log.items.filter(position=check.log_slot_position).select_related("track", "track__category").first()
-    if item is None:
-        return "critical", {
-            "reason": f"log has no item at position {check.log_slot_position}",
-            "position": check.log_slot_position,
-            "expected_category": check.log_slot_category.code,
-        }
-
-    track = item.track
-    if track is None:
-        return "critical", {
-            "reason": "item's track FK is NULL (track deleted from library)",
-            "position": check.log_slot_position,
-            "expected_category": check.log_slot_category.code,
-            "log_item_id": item.id,
-        }
-
-    actual_cat = track.category
-    if actual_cat is None or actual_cat.id != check.log_slot_category_id:
-        return "critical", {
-            "reason": "wrong category at this position",
-            "position": check.log_slot_position,
-            "expected_category": check.log_slot_category.code,
-            "actual_category": actual_cat.code if actual_cat else None,
-            "log_item_id": item.id,
-            "track_title": track.title,
-        }
-
-    return "ok", {
-        "position": check.log_slot_position,
-        "category": actual_cat.code,
-        "track_title": track.title,
-    }
-
-
 PROBE_DISPATCH = {
     "systemd": probe_systemd,
     "disk": probe_disk,
@@ -314,5 +257,4 @@ PROBE_DISPATCH = {
     "transmitter_indicator": probe_transmitter_indicator,
     "audio_silence": probe_audio_silence,
     "rbds": probe_rbds,
-    "log_slot_category": probe_log_slot_category,
 }
