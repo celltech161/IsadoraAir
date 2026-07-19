@@ -205,9 +205,21 @@ def probe_audio_silence(check):
     age = time.time() - data.get("timestamp", 0)
     if age > 180:
         return "unknown", {"reason": "state file hasn't updated in over 3 minutes -- liquidsoap heartbeat stopped", "age_seconds": age}
+    # `since_seconds` = how long the CURRENT is_blank has held (dashboard's
+    # "Stable for X" caption uses this). `age_seconds` is just the freshness
+    # of the last write and is only interesting for the staleness check
+    # above. Falls back to `age_seconds` when the `since` field is missing
+    # so the caption keeps working through the first heartbeat after an
+    # upgrade (state file was written by the old script).
+    since_raw = data.get("since")
+    detail = {"age_seconds": age}
+    if since_raw is not None:
+        detail["since_seconds"] = time.time() - since_raw
     if data.get("is_blank"):
-        return "critical", {"is_blank": True, "age_seconds": age}
-    return "ok", {"is_blank": False, "age_seconds": age}
+        detail["is_blank"] = True
+        return "critical", detail
+    detail["is_blank"] = False
+    return "ok", detail
 
 
 def probe_rbds(check):

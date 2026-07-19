@@ -227,10 +227,22 @@ def build_liquidsoap_script(input_device, encoders):
         # heartbeat below re-writes with the *correct* is_blank -- otherwise
         # a heartbeat during a real silence would overwrite it with `false`
         # and mask the outage from the dashboard.
+        #
+        # `since_ts` is the wall-clock time of the most recent is_blank
+        # transition (or script start), NOT the time of the last write.
+        # The dashboard's "Stable for X hrs" caption is computed against
+        # this so the heartbeat rewriting the file every 60s doesn't
+        # reset the visible counter -- only a real silence<->noise flip
+        # does. `write_silence_state` therefore takes the transition
+        # timestamp as a parameter: the on_blank/on_noise/startup call
+        # sites pass `time()` to bump it, and the heartbeat call site
+        # passes `since_ts()` to carry the current one forward unchanged.
         'last_blank = ref(false)',
-        'def write_silence_state(is_blank) =',
+        'since_ts = ref(time())',
+        'def write_silence_state(is_blank, since) =',
         '  last_blank.set(is_blank)',
-        f'  state = json.stringify(compact=true, {{is_blank = is_blank, timestamp = time()}})',
+        '  since_ts.set(since)',
+        f'  state = json.stringify(compact=true, {{is_blank = is_blank, timestamp = time(), since = since}})',
         # temp_dir must live on the same filesystem as the target for the
         # atomic rename to succeed. Without this, liquidsoap defaults temp
         # to /tmp and logs "Atomic rename failed!" on every write (harmless
@@ -239,21 +251,24 @@ def build_liquidsoap_script(input_device, encoders):
         f'  file.write(data=state, atomic=true, temp_dir="/run/isadoraair", {_liq_string(state_path)})',
         'end',
         '',
-        'source.on_blank(synchronous=false, {write_silence_state(true)})',
-        'source.on_noise(synchronous=false, {write_silence_state(false)})',
+        'source.on_blank(synchronous=false, {write_silence_state(true, time())})',
+        'source.on_noise(synchronous=false, {write_silence_state(false, time())})',
         # on_blank/on_noise only fire on a transition -- without this,
         # a feed that's been continuously fine since startup would never
         # write a state file at all, and the dashboard would show
         # "unknown" forever instead of "ok". start_blank defaults to
         # false, so the matching initial assumption here is "not blank".
-        'write_silence_state(false)',
+        'write_silence_state(false, time())',
         # Periodic heartbeat: re-touch the state file every 60s carrying
-        # the last known is_blank. Lets probe_audio_silence use a tight
-        # staleness bound as a genuine "liquidsoap wedged/dead" signal
-        # without falsely tripping on a stream that's been continuously
-        # fine (the original 24h bound was guaranteed to hit "unknown"
-        # once per day on a perfectly healthy feed -- caught live).
-        'thread.run(every=60., {write_silence_state(last_blank())})',
+        # the last known is_blank AND the last known transition timestamp
+        # (so the dashboard's stable-for counter keeps accumulating
+        # across heartbeats -- only a real transition resets it). Lets
+        # probe_audio_silence use a tight staleness bound as a genuine
+        # "liquidsoap wedged/dead" signal without falsely tripping on a
+        # stream that's been continuously fine (the original 24h bound
+        # was guaranteed to hit "unknown" once per day on a perfectly
+        # healthy feed -- caught live).
+        'thread.run(every=60., {write_silence_state(last_blank(), since_ts())})',
         '',
         # Wrapped in try/catch: now_playing.json is written in-place (not
         # atomic rename -- see engine.py's _write_now_playing for why),

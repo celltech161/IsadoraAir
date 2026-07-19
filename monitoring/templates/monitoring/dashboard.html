@@ -514,16 +514,20 @@ function renderPaTempBody(check, colorClass) {
 }
 
 function renderAudioSilenceBody(check) {
-  const ageSeconds = check.detail && check.detail.age_seconds;
-  if (ageSeconds == null) {
+  // `since_seconds` = how long the current is_blank has held (bumped only
+  // on real silence<->noise transitions). `age_seconds` = freshness of
+  // last write, which resets every 60s to the heartbeat -- meaningful
+  // only for the staleness check, not for a human-facing "Stable for" caption.
+  // Fall back to age_seconds when `since_seconds` is missing so this still
+  // reads correctly during the first heartbeat window after an upgrade.
+  const detail = check.detail || {};
+  const seconds = detail.since_seconds != null ? detail.since_seconds : detail.age_seconds;
+  if (seconds == null) {
     // Genuinely unknown state (no state file yet, or unreadable) --
-    // there's no age to show, fall back to the reason text.
-    return `<div class="mon-card-detail">${formatGenericDetail(check.detail)}</div>`;
+    // fall back to the reason text.
+    return `<div class="mon-card-detail">${formatGenericDetail(detail)}</div>`;
   }
-  // The status pill already says ok/critical -- showing "is_blank: false"
-  // as well was redundant, so this just shows how long the current
-  // state has held, in hours instead of raw seconds.
-  const hours = (ageSeconds / 3600).toFixed(2);
+  const hours = (seconds / 3600).toFixed(2);
   const label = check.status === "ok" ? "Stable" : "Down";
   return `<div class="mon-uptime ${check.status}">${label} for ${hours} hrs</div>`;
 }
