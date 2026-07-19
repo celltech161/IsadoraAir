@@ -188,17 +188,37 @@ def _pick_best_fit(qs, remaining_seconds):
 
 def pick_track(category, exclude_track_ids, exclude_artist_ids,
                artist_sep, title_sep, target_datetime,
-               remaining_seconds=None, max_loosening=3):
+               remaining_seconds=None, max_loosening=3,
+               hard_exclude_track_ids=None, hard_exclude_artist_ids=None):
+    """`exclude_*` are RECENCY-HISTORY exclusions -- they get progressively
+    dropped by the loosening loop below if no candidate can be found.
+
+    `hard_exclude_*` are "already-picked in THIS build" exclusions -- they
+    MUST hold through every loosening pass, otherwise a category with few
+    eligible tracks (or a fresh build whose picks aren't yet persisted as
+    LogItems) can pick the same track for multiple slots in the same
+    hour. Real bug caught live 2026-07-17 Floydian Slip 21:00: three
+    Local Drops slots all landed on the same "Saturdays at Noon" promo
+    because time-based sep excluded 18/19 candidates, the loose retry
+    reset `exclude_track_ids` to LogItem-history only, and the current
+    hour's picks weren't yet in LogItem so the accumulator was invisible.
+    """
     fit_mode = remaining_seconds is not None and remaining_seconds < DURATION_FIT_THRESHOLD
+    hard_exclude_track_ids = set(hard_exclude_track_ids or ())
+    hard_exclude_artist_ids = set(hard_exclude_artist_ids or ())
+
+    def _build_qs():
+        qs = _tracks_for_category(category, target_datetime=target_datetime)
+        combined_tracks = set(exclude_track_ids) | hard_exclude_track_ids
+        combined_artists = set(exclude_artist_ids) | hard_exclude_artist_ids
+        if combined_tracks:
+            qs = qs.exclude(id__in=combined_tracks)
+        if combined_artists:
+            qs = qs.exclude(artist_id__in=combined_artists)
+        return qs
 
     for attempt in range(max_loosening + 1):
-        qs = _tracks_for_category(category, target_datetime=target_datetime)
-
-        if exclude_track_ids:
-            qs = qs.exclude(id__in=exclude_track_ids)
-        if exclude_artist_ids:
-            qs = qs.exclude(artist_id__in=exclude_artist_ids)
-
+        qs = _build_qs()
         if fit_mode:
             track = _pick_best_fit(qs, remaining_seconds)
         else:
@@ -230,10 +250,17 @@ def pick_track(category, exclude_track_ids, exclude_artist_ids,
                 if item.scheduled_time >= artist_cutoff:
                     loosened_exclude_artists.add(item.track.artist_id)
 
+        # Only the recency-history part gets rebuilt; hard exclusions
+        # (caller's accumulator of already-picked-in-this-build tracks)
+        # are preserved via _build_qs() unioning them back in.
         exclude_track_ids = loosened_exclude_tracks
         exclude_artist_ids = loosened_exclude_artists
 
-    qs = _tracks_for_category(category, target_datetime=target_datetime)
+    # Final pass with no history exclusions at all -- still respects the
+    # caller's accumulator via hard_exclude_*.
+    exclude_track_ids = set()
+    exclude_artist_ids = set()
+    qs = _build_qs()
     if fit_mode:
         return _pick_best_fit(qs, remaining_seconds)
     return _weighted_order(qs).first()
@@ -274,6 +301,8 @@ def fill_remaining_hour(picks, accumulated_seconds, target_datetime):
             category, exclude_track_ids, exclude_artist_ids,
             artist_sep, title_sep, target_datetime,
             remaining_seconds=remaining,
+            hard_exclude_track_ids={t.id for t in picked_tracks},
+            hard_exclude_artist_ids=set(picked_artist_ids),
         )
         if track is None:
             break  # nothing eligible even after loosening — stop gracefully
@@ -335,6 +364,8 @@ def _build_from_rotation(target_date, hour, rotation):
                 category, exclude_track_ids, exclude_artist_ids,
                 artist_sep, title_sep, target_datetime,
                 remaining_seconds=remaining,
+                hard_exclude_track_ids={t.id for t in picked_tracks},
+                hard_exclude_artist_ids=set(picked_artist_ids),
             )
 
             if track is None:
@@ -546,6 +577,8 @@ def preview_hour_log(target_date, hour):
                     category, exclude_track_ids, exclude_artist_ids,
                     artist_sep, title_sep, target_datetime,
                     remaining_seconds=remaining,
+                    hard_exclude_track_ids={t.id for t in picked_tracks},
+                    hard_exclude_artist_ids=set(picked_artist_ids),
                 )
                 if track is None:
                     pool_size = _tracks_for_category(category, target_datetime=target_datetime).count()
