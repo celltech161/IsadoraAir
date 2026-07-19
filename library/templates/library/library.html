@@ -232,7 +232,13 @@
     <option value="{{ cat.id }}">{{ cat.name }}</option>
     {% endfor %}
   </select>
-  <button class="bulk-btn" onclick="bulkSetCategory()">Apply</button>
+  <select class="lib-select" id="bulkHolidaySelect" style="font-size:0.78rem;">
+    <option value="">Add holiday...</option>
+    {% for h in holidays %}
+    <option value="{{ h.code }}">{{ h.name }}</option>
+    {% endfor %}
+  </select>
+  <button class="bulk-btn" onclick="bulkApply()">Apply</button>
   <button class="bulk-btn danger" onclick="bulkDelete()">Delete</button>
   <button class="bulk-btn" onclick="clearSelection()" style="margin-left:auto;">Clear</button>
 </div>
@@ -415,26 +421,52 @@ async function bulkDelete() {
   loadTracks();
 }
 
-async function bulkSetCategory() {
-  const catId = document.getElementById('bulkCategorySelect').value;
-  if (!catId || selectedIds.size === 0) return;
-  const resp = await fetch('/api/tracks/bulk/', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'X-CSRFToken': getCookie('csrftoken'),
-    },
-    body: JSON.stringify({
-      action: 'set_category',
-      ids: [...selectedIds],
-      category_id: parseInt(catId),
-    }),
-  });
-  if (resp.ok) {
-    document.getElementById('bulkCategorySelect').value = '';
-    clearSelection();
-    loadTracks();
+async function bulkApply() {
+  // Combined dispatcher for both dropdowns in the bulk bar. If the
+  // operator picked a category AND a holiday, both get applied (two
+  // API calls -- one action at a time on the backend). If neither is
+  // picked, nothing happens rather than firing an empty request.
+  const catSelect = document.getElementById('bulkCategorySelect');
+  const holSelect = document.getElementById('bulkHolidaySelect');
+  const catId = catSelect.value;
+  const holCode = holSelect.value;
+  if (selectedIds.size === 0) return;
+  if (!catId && !holCode) return;
+
+  const ids = [...selectedIds];
+  const headers = {
+    'Content-Type': 'application/json',
+    'X-CSRFToken': getCookie('csrftoken'),
+  };
+
+  if (catId) {
+    const resp = await fetch('/api/tracks/bulk/', {
+      method: 'POST', headers,
+      body: JSON.stringify({ action: 'set_category', ids, category_id: parseInt(catId) }),
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      alert('Set category failed: ' + (err.error || resp.status));
+      return;
+    }
+    catSelect.value = '';
   }
+
+  if (holCode) {
+    const resp = await fetch('/api/tracks/bulk/', {
+      method: 'POST', headers,
+      body: JSON.stringify({ action: 'add_holiday', ids, holiday_code: holCode }),
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      alert('Add holiday failed: ' + (err.error || resp.status));
+      return;
+    }
+    holSelect.value = '';
+  }
+
+  clearSelection();
+  loadTracks();
 }
 
 async function loadTracks() {

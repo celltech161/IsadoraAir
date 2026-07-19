@@ -846,7 +846,11 @@ def playlists_page(request):
 
 def library_page(request):
     categories = Category.objects.order_by("name")
-    return render(request, "library/library.html", {"categories": categories})
+    holidays = Holiday.objects.order_by("month", "day")
+    return render(request, "library/library.html", {
+        "categories": categories,
+        "holidays": holidays,
+    })
 
 
 TRACK_SORT_FIELDS = {
@@ -957,6 +961,32 @@ def api_track_bulk(request):
             except Category.DoesNotExist:
                 return JsonResponse({"error": "Category not found"}, status=404)
         updated = qs.update(category_id=cat_id)
+    elif action == "add_holiday":
+        # ADD the holiday to each selected track's holidays M2M --
+        # doesn't clobber existing tags, so a Halloween-tagged track
+        # can also pick up a Christmas tag in a later bulk operation.
+        code = body.get("holiday_code")
+        if not code:
+            return JsonResponse({"error": "holiday_code required"}, status=400)
+        try:
+            holiday = Holiday.objects.get(code=code)
+        except Holiday.DoesNotExist:
+            return JsonResponse({"error": "Holiday not found"}, status=404)
+        # Bulk-add through the M2M via the through model, ignoring
+        # rows that already have the pair. Django's .add(*iterable)
+        # is per-object and would issue N INSERTs; going through
+        # bulk_create with ignore_conflicts=True lets us do one
+        # INSERT and skip existing rows silently.
+        through = Track.holidays.through
+        existing = set(
+            through.objects.filter(track_id__in=list(qs.values_list("id", flat=True)),
+                                    holiday_id=code)
+            .values_list("track_id", flat=True)
+        )
+        rows = [through(track_id=tid, holiday_id=code)
+                for tid in qs.values_list("id", flat=True) if tid not in existing]
+        through.objects.bulk_create(rows, ignore_conflicts=True)
+        updated = len(rows)
     elif action == "delete":
         # Best-effort per-track: PROTECT-FK blockers on ONE track
         # (still in a Playlist or Rotation slot) shouldn't prevent
