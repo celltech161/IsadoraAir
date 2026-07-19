@@ -215,6 +215,32 @@ def _default_art_result():
 
 def resolve_album_art(track):
     """Returns {"art": url_or_None, "link": url_or_None, "source": str}."""
+    result = _resolve_album_art_inner(track)
+    # Daily cache-buster for `oakgrove` art -- Oak Grove Radio's hosted
+    # album-art URLs are stable file paths (e.g. birdnote.png), and the
+    # daily push replaces the PNG BYTES at that URL without changing
+    # the URL. The server-side Track.art_source cache is correct
+    # (URL is still the right one), but the browser HTTP cache keys
+    # by URL and will keep serving yesterday's image bytes until its
+    # cache TTL expires -- exactly the "stuck on last week's art"
+    # symptom the user reported for BirdNote Daily.
+    #
+    # Daily granularity is intentional: the OGR image server replaces
+    # its files at push time (which is daily for BirdNote and the
+    # other self-hosted-episode-art shows), so a date-tag guarantees
+    # a fresh fetch per calendar day without invalidating browser
+    # cache mid-day for tracks whose art didn't change. Non-oakgrove
+    # sources (Deezer, iTunes, embedded, default) point at
+    # per-image hash URLs or Django media that never mutate in place,
+    # so they don't need busting.
+    if result.get("source") == "oakgrove" and result.get("art"):
+        day = timezone.localdate().isoformat()
+        sep = "&" if "?" in result["art"] else "?"
+        result["art"] = f"{result['art']}{sep}v={day}"
+    return result
+
+
+def _resolve_album_art_inner(track):
     if track.album_id and track.album.cover_art:
         return {"art": track.album.cover_art.url, "link": None, "source": "Album Override"}
     if track.artist_id and track.artist.cover_art:
