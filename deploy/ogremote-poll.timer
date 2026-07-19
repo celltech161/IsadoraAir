@@ -1,9 +1,16 @@
 [Unit]
-Description=Run OGRemote available-uploads poller every 2 minutes
+Description=Run OGRemote available-uploads poller (gated by OGRemoteConfig.poll_interval_minutes)
 
 [Timer]
+# Fires every 1 minute -- the finest granularity we ever want. The real
+# cadence is picked in Django admin (OGRemote Configuration >
+# poll_interval_minutes) and enforced inside the script via a
+# last-run-marker gate at /tmp/ogremote_get_available_uploads.last_poll.
+# Setting the timer to 1min means any interval the admin picks
+# (from 1 minute upward) is honored on the next tick without needing
+# sudo to rewrite this file or reload systemd.
 OnBootSec=1min
-OnUnitActiveSec=2min
+OnUnitActiveSec=1min
 Persistent=false
 
 [Install]

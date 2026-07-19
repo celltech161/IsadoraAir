@@ -9,6 +9,7 @@ from .models import OGRemoteCategory, OGRemoteConfig
 class OGRemoteConfigAdmin(admin.ModelAdmin):
     fieldsets = [
         ("Master Switch", {"fields": ["enabled"]}),
+        ("Polling", {"fields": ["poll_interval_minutes"]}),
         ("Urgent PA / Public Address", {"fields": ["urgent_pa_replay_interval_minutes"]}),
         ("Notifications", {"fields": ["notify_email"]}),
     ]

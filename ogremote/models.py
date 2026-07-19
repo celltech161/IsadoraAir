@@ -23,6 +23,16 @@ class OGRemoteConfig(models.Model):
                    "tight fixed cadence and re-read fresh each time -- no "
                    "restart needed after changing this.",
     )
+    poll_interval_minutes = models.PositiveIntegerField(
+        default=2,
+        help_text="How often get_available_uploads polls the OGRemote API for "
+                   "new uploads / recalls. Effective floor is 1 minute (the "
+                   "systemd timer's own cadence -- setting this lower makes "
+                   "it fire every 1 minute). kogr-sc ran this at 5 minutes; "
+                   "isadoraair ships at 2. Re-read fresh at the start of "
+                   "every poll fire, so a change here takes effect on the "
+                   "next tick with no restart needed.",
+    )
     notify_email = models.EmailField(
         blank=True, default="",
         help_text="Address for OGRemote pipeline failure notifications. Blank disables.",

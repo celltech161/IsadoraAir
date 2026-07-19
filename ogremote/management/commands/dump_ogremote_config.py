@@ -30,6 +30,7 @@ class Command(BaseCommand):
         self.stdout.write(json.dumps({
             "enabled": cfg.enabled,
             "urgent_pa_replay_interval_minutes": cfg.urgent_pa_replay_interval_minutes,
+            "poll_interval_minutes": cfg.poll_interval_minutes,
             "notify_email": cfg.notify_email,
             "categories": categories,
         }))
