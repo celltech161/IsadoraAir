@@ -36,6 +36,7 @@ class MonitorCheck(models.Model):
         ("transmitter_indicator", "Transmitter Status Indicator"),
         ("audio_silence", "Audio Silence (Liquidsoap)"),
         ("rbds", "RBDS Connection"),
+        ("log_slot_category", "Log Slot Category (top-of-hour ID tripwire)"),
     ]
 
     name = models.CharField(max_length=100, unique=True)
@@ -90,6 +91,22 @@ class MonitorCheck(models.Model):
         max_length=100, blank=True,
         help_text="Matches encoders.services.encoder_manager._slug(input_device) — "
                    "used to find /run/isadoraair/liquidsoap_silence_<slug>.json.",
+    )
+
+    # --- kind="log_slot_category" ---
+    log_slot_position = models.PositiveSmallIntegerField(
+        default=0,
+        help_text="Position (0-indexed) in the current hour's PlaylistLog to check. "
+                   "0 = top-of-hour, which is the Legal ID slot on this station.",
+    )
+    log_slot_category = models.ForeignKey(
+        "library.Category", null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="+",
+        help_text="Category the track at log_slot_position MUST belong to. "
+                   "Reports critical if the current hour's log has no item at "
+                   "that position, or if the item's track's category doesn't "
+                   "match. Primary use: FCC-required legal ID at top of hour "
+                   "-- set position=0, category=Legal ID.",
     )
 
     # --- numeric thresholds, used by disk/cpu/memory/temperature/transmitter_param ---
@@ -149,6 +166,8 @@ class MonitorCheck(models.Model):
                 errors["fault_values"] = "Required — at least one FAULT value."
         if self.kind == "audio_silence" and not self.silence_device_slug:
             errors["silence_device_slug"] = "Required for Audio Silence checks."
+        if self.kind == "log_slot_category" and self.log_slot_category is None:
+            errors["log_slot_category"] = "Required for Log Slot Category checks."
         if errors:
             raise ValidationError(errors)
 
