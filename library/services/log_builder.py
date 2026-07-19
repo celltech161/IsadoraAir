@@ -256,10 +256,23 @@ def pick_track(category, exclude_track_ids, exclude_artist_ids,
         exclude_track_ids = loosened_exclude_tracks
         exclude_artist_ids = loosened_exclude_artists
 
-    # Final pass with no history exclusions at all -- still respects the
-    # caller's accumulator via hard_exclude_*.
+    # Final pass: drop history exclusions AND hard artist separation,
+    # keep only hard TRACK exclusion. Rationale: the two hard exclusions
+    # have different priorities. "Don't play the same track twice in
+    # one hour" is a strong invariant we should never violate. "Don't
+    # play the same artist too close together" is a soft preference
+    # that should yield rather than have a slot silently skipped.
+    #
+    # Real bug this covers: WxObs (and every other single-track
+    # "Oak Grove Radio"-branded category -- Legal ID, WxTemp,
+    # WxForecast, WxAlert, imaging tags...) has one track, and after
+    # any earlier same-hour pick by the same house artist it would sit
+    # blocked forever with no way to survive. Well-populated music
+    # categories still see full artist separation on earlier attempts;
+    # only pool-of-1 branded categories reach this fallback.
     exclude_track_ids = set()
     exclude_artist_ids = set()
+    hard_exclude_artist_ids = set()
     qs = _build_qs()
     if fit_mode:
         return _pick_best_fit(qs, remaining_seconds)
