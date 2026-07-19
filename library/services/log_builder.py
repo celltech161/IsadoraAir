@@ -207,6 +207,23 @@ def pick_track(category, exclude_track_ids, exclude_artist_ids,
     hard_exclude_track_ids = set(hard_exclude_track_ids or ())
     hard_exclude_artist_ids = set(hard_exclude_artist_ids or ())
 
+    # Category-level "no separation" opt-outs. When the resolved
+    # separation for this pick is 0 (either via the category's
+    # explicit override or a global default of 0), that dimension is
+    # OFF for both the picker side and the emitter side -- see the
+    # callers, which also skip appending to picked_tracks /
+    # picked_artist_ids when the same is true. Setting title_sep=0 on
+    # e.g. WxTemp (single-track weather callout that legitimately
+    # airs multiple times per hour) makes both slots pick the same
+    # track without complaint; setting artist_sep=0 on WxObs, WxTemp,
+    # WxForecast (all voiced by the "Oak Grove Radio" house artist,
+    # same artist as Legal ID) makes them pickable in the same hour
+    # as any KOGR-LP variant.
+    if title_sep == 0:
+        hard_exclude_track_ids = set()
+    if artist_sep == 0:
+        hard_exclude_artist_ids = set()
+
     def _build_qs():
         qs = _tracks_for_category(category, target_datetime=target_datetime)
         combined_tracks = set(exclude_track_ids) | hard_exclude_track_ids
@@ -328,8 +345,14 @@ def fill_remaining_hour(picks, accumulated_seconds, target_datetime):
             "track": track,
             "category": category,
         })
-        picked_tracks.append(track)
-        picked_artist_ids.append(track.artist_id)
+        # sep==0 opts this pick out of contributing to subsequent slots'
+        # exclusions on that dimension -- see pick_track's header for
+        # the "WxTemp twice per hour" / "WxObs same-artist-as-Legal-ID"
+        # semantics.
+        if title_sep > 0:
+            picked_tracks.append(track)
+        if artist_sep > 0:
+            picked_artist_ids.append(track.artist_id)
         accumulated_seconds += track_duration
         remaining = 3600 - accumulated_seconds
         if track_duration <= 0:
@@ -365,8 +388,17 @@ def _build_from_rotation(target_date, hour, rotation):
             category = track.category
         else:
             category = slot.category
-            artist_sep, title_sep = get_separation(category, recency_cfg)
 
+        # Effective separation for THIS slot's category. Used both to
+        # gate the pick (else branch below) AND to gate this slot's
+        # contribution to subsequent slots' accumulator exclusions
+        # (bottom of the loop). Computed once regardless of branch so
+        # a direct-track slot backed by e.g. a WxTemp track with
+        # title_sep=0 also plays correctly with later WxTemp/Legal ID
+        # slots.
+        artist_sep, title_sep = get_separation(category, recency_cfg)
+
+        if not slot.track_id:
             exclude_track_ids, exclude_artist_ids = get_recent_exclusions(
                 target_datetime, artist_sep, title_sep,
                 picked_tracks, picked_artist_ids,
@@ -394,8 +426,13 @@ def _build_from_rotation(target_date, hour, rotation):
             "category": category,
         })
 
-        picked_tracks.append(track)
-        picked_artist_ids.append(track.artist_id)
+        # sep==0 on this slot's category means it doesn't participate
+        # in subsequent slots' exclusions on that dimension. See
+        # pick_track's header for the semantics.
+        if title_sep > 0:
+            picked_tracks.append(track)
+        if artist_sep > 0:
+            picked_artist_ids.append(track.artist_id)
         accumulated_seconds += track_duration
 
         if accumulated_seconds >= 3600:
@@ -581,7 +618,12 @@ def preview_hour_log(target_date, hour):
                 category = track.category
             else:
                 category = slot.category
-                artist_sep, title_sep = get_separation(category, recency_cfg)
+            # See _build_from_rotation -- effective separation for THIS
+            # slot's category, computed once per iteration and used for
+            # both the pick and the emit gate below.
+            artist_sep, title_sep = get_separation(category, recency_cfg)
+
+            if not slot.track_id:
                 exclude_track_ids, exclude_artist_ids = get_recent_exclusions(
                     target_datetime, artist_sep, title_sep, picked_tracks, picked_artist_ids,
                 )
@@ -615,8 +657,10 @@ def preview_hour_log(target_date, hour):
                 "position": len(picks), "scheduled_time": scheduled_time,
                 "track": track, "category": category,
             })
-            picked_tracks.append(track)
-            picked_artist_ids.append(track.artist_id)
+            if title_sep > 0:
+                picked_tracks.append(track)
+            if artist_sep > 0:
+                picked_artist_ids.append(track.artist_id)
             accumulated_seconds += track_duration
             if accumulated_seconds >= 3600:
                 break
