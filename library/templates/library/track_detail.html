@@ -230,6 +230,8 @@
     transition: opacity 0.12s;
   }
   .save-btn:hover { opacity: 0.9; }
+  .save-btn.danger { background: var(--danger); color: #fff; }
+  .save-btn.danger:hover { opacity: 0.85; }
 
   .save-msg {
     font-size: 0.8rem;
@@ -456,6 +458,7 @@
       <button class="save-btn" style="padding:0.4rem 1rem;font-size:0.78rem;" onclick="saveTrack()">Save Changes</button>
       <button type="button" class="save-btn" style="padding:0.4rem 1rem;font-size:0.78rem;margin-left:0.4rem;" onclick="reanalyzeTrack()" id="reanalyzeBtn">Reanalyze Track</button>
       <button type="button" class="save-btn" style="padding:0.4rem 1rem;font-size:0.78rem;margin-left:0.4rem;" onclick="repickCuePoints()" id="repickCueBtn" title="Fast re-pick of cue-in and next-start using saved envelope data + this track's category threshold overrides (or global defaults). No audio decode.">Reset Cue Points</button>
+      <button type="button" class="save-btn danger" style="padding:0.4rem 1rem;font-size:0.78rem;margin-left:0.4rem;" onclick="deleteTrack()" id="deleteTrackBtn" title="Permanently delete this track's DB row AND remove the audio file from disk. Cannot be undone.">Delete Track</button>
       <span class="save-msg" id="saveMsg" style="margin-left:0.6rem;">Saved</span>
       <span class="save-msg" id="reanalyzeMsg">Done</span>
     </div>
@@ -1007,6 +1010,48 @@ async function repickCuePoints() {
   btn.textContent = prevLabel;
   msg.classList.add('show');
   setTimeout(() => msg.classList.remove('show'), 2500);
+}
+
+// --- Delete track (row + file + waveform) ---
+const TRACK_FILEPATH = "{{ track.filepath|escapejs }}";
+async function deleteTrack() {
+  // Show title + filepath in the confirmation so the operator has a
+  // chance to catch a misclick before it's irreversible.
+  const title = document.getElementById('f_title')?.value?.trim() || '(no title)';
+  const filepathHint = TRACK_FILEPATH ? `\n     ${TRACK_FILEPATH}` : '';
+  const msg =
+    `Delete this track permanently?\n\n` +
+    `  • ${title}${filepathHint}\n\n` +
+    `This removes the DB row AND the audio file from disk. Cannot be undone.`;
+  if (!confirm(msg)) return;
+
+  const btn = document.getElementById('deleteTrackBtn');
+  btn.disabled = true;
+  const prevLabel = btn.textContent;
+  btn.textContent = 'Deleting…';
+
+  try {
+    const resp = await fetch(`/api/tracks/${TRACK_ID}/`, {
+      method: 'DELETE',
+      headers: { 'X-CSRFToken': getCookie('csrftoken') },
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      alert(data.error || `Delete failed (${resp.status})`);
+      btn.disabled = false;
+      btn.textContent = prevLabel;
+      return;
+    }
+  } catch (e) {
+    alert('Delete failed');
+    btn.disabled = false;
+    btn.textContent = prevLabel;
+    return;
+  }
+
+  // Success -- go back to the library. Deleted row is gone; the
+  // library list will re-render without it.
+  window.location.href = '/library/';
 }
 </script>
 {% endblock %}

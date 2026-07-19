@@ -957,6 +957,26 @@ def api_track_bulk(request):
             except Category.DoesNotExist:
                 return JsonResponse({"error": "Category not found"}, status=404)
         updated = qs.update(category_id=cat_id)
+    elif action == "delete":
+        # Best-effort per-track: PROTECT-FK blockers on ONE track
+        # (still in a Playlist or Rotation slot) shouldn't prevent
+        # the rest of the selection from being deleted. Report both
+        # counts and per-blocker detail so the operator sees exactly
+        # which ones need manual cleanup first.
+        deleted = 0
+        blocked = []
+        for t in qs.select_related("artist"):
+            ok, reason = _delete_track_and_file(t)
+            if ok:
+                deleted += 1
+            else:
+                blocked.append({
+                    "id": t.id,
+                    "title": t.title,
+                    "artist": t.artist.name if t.artist else "",
+                    "reason": reason,
+                })
+        return JsonResponse({"ok": True, "deleted": deleted, "blocked": blocked})
     else:
         return JsonResponse({"error": "Unknown action"}, status=400)
 
@@ -981,7 +1001,53 @@ def track_detail_page(request, pk):
     })
 
 
-@require_http_methods(["GET", "PATCH"])
+def _delete_track_and_file(track):
+    """Delete a Track's row + on-disk file + waveform cache. Returns
+    (ok, blocked_reason). blocked_reason is populated when the delete
+    is refused by a PROTECT FK (Track is still in a Playlist or
+    Rotation slot -- user has to remove it from those first). Mirrors
+    the standalone `remove_track_file` management command's cleanup
+    so the same shape works whether an operator triggers it from the
+    UI or an ingest pipeline recalls a delivered file."""
+    from django.db.models.deletion import ProtectedError
+    filepath = track.filepath
+    waveform_path = track.waveform_path
+    try:
+        track.delete()
+    except ProtectedError as exc:
+        # Django raises this when a PROTECT FK still points at this
+        # Track (Playlist.items.track and RotationSlot.track -- see
+        # library/models.py). Turn it into a user-actionable message
+        # rather than a 500. `exc.protected_objects` is the queryset of
+        # rows blocking; count is enough for a top-line, and the
+        # message names the model so the operator knows where to
+        # look.
+        protectors = list(exc.protected_objects)
+        kinds = {}
+        for p in protectors:
+            kind = type(p).__name__
+            kinds[kind] = kinds.get(kind, 0) + 1
+        parts = [f"{n} {k}" for k, n in kinds.items()]
+        return False, f"still referenced by {', '.join(parts)} -- remove from those first"
+
+    # Only clean up on-disk artifacts after the DB delete succeeded --
+    # a failed track.delete() means nothing on disk should change.
+    if waveform_path:
+        try:
+            Path(waveform_path).unlink(missing_ok=True)
+        except OSError as e:
+            # Best-effort -- the Track row is already gone, so a
+            # stranded waveform cache is a cosmetic issue at worst.
+            print(f"  [delete_track] could not remove waveform {waveform_path}: {e}")
+    if filepath:
+        try:
+            Path(filepath).unlink(missing_ok=True)
+        except OSError as e:
+            print(f"  [delete_track] could not remove file {filepath}: {e}")
+    return True, None
+
+
+@require_http_methods(["GET", "PATCH", "DELETE"])
 def api_track_detail(request, pk):
     track = get_object_or_404(
         Track.objects.select_related("artist", "album", "genre", "category"), pk=pk
@@ -989,6 +1055,12 @@ def api_track_detail(request, pk):
 
     if request.method == "GET":
         return JsonResponse(_track_to_dict(track))
+
+    if request.method == "DELETE":
+        ok, reason = _delete_track_and_file(track)
+        if not ok:
+            return JsonResponse({"error": f"Cannot delete: {reason}"}, status=409)
+        return JsonResponse({"ok": True})
 
     try:
         body = json.loads(request.body)

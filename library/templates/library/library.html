@@ -86,6 +86,8 @@
     transition: border-color 0.12s;
   }
   .bulk-btn:hover { border-color: var(--accent); }
+  .bulk-btn.danger { color: var(--danger); border-color: rgba(249, 115, 115, 0.4); }
+  .bulk-btn.danger:hover { border-color: var(--danger); background: rgba(249, 115, 115, 0.08); }
 
   /* --- Table --- */
   .lib-table-wrap {
@@ -231,6 +233,7 @@
     {% endfor %}
   </select>
   <button class="bulk-btn" onclick="bulkSetCategory()">Apply</button>
+  <button class="bulk-btn danger" onclick="bulkDelete()">Delete</button>
   <button class="bulk-btn" onclick="clearSelection()" style="margin-left:auto;">Clear</button>
 </div>
 
@@ -360,6 +363,56 @@ async function bulkAction(action) {
     clearSelection();
     loadTracks();
   }
+}
+
+async function bulkDelete() {
+  const n = selectedIds.size;
+  if (n === 0) return;
+  // Sample the titles we're about to delete so the operator can spot a
+  // misclick before it's irreversible. Cap at 5 for readability.
+  const rows = [...document.querySelectorAll('#trackBody tr')];
+  const titles = [];
+  for (const tr of rows) {
+    const id = parseInt(tr.dataset.id);
+    if (selectedIds.has(id)) {
+      // Title cell is the second <td> (index 1: after col-check).
+      const t = tr.cells[1];
+      titles.push(t ? t.textContent.trim() : `id ${id}`);
+      if (titles.length >= 5) break;
+    }
+  }
+  const preview = titles.join('\n  • ');
+  const more = n > titles.length ? `\n  … and ${n - titles.length} more` : '';
+  const msg =
+    `Delete ${n} track${n === 1 ? '' : 's'} permanently?\n\n` +
+    `This removes the DB row AND the audio file from disk. Cannot be undone.\n\n` +
+    `  • ${preview}${more}`;
+  if (!confirm(msg)) return;
+
+  const resp = await fetch('/api/tracks/bulk/', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-CSRFToken': getCookie('csrftoken'),
+    },
+    body: JSON.stringify({ action: 'delete', ids: [...selectedIds] }),
+  });
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) {
+    alert('Delete failed: ' + (data.error || resp.status));
+    return;
+  }
+  if (data.blocked && data.blocked.length) {
+    const lines = data.blocked.map(b =>
+      `  • ${b.artist ? b.artist + ' — ' : ''}${b.title}: ${b.reason}`
+    ).join('\n');
+    alert(
+      `Deleted ${data.deleted} track${data.deleted === 1 ? '' : 's'}.\n\n` +
+      `${data.blocked.length} could not be deleted:\n${lines}`
+    );
+  }
+  clearSelection();
+  loadTracks();
 }
 
 async function bulkSetCategory() {
