@@ -18,7 +18,7 @@ from django.utils import timezone
 
 from django.shortcuts import get_object_or_404
 
-from .models import Artist, Album, Category, CategoryKind, Genre, LogItem, Playlist, PlaylistItem, PlaylistLog, Rotation, RotationSlot, ScheduleBlock, Track
+from .models import Artist, Album, Category, CategoryKind, Genre, Holiday, LogItem, Playlist, PlaylistItem, PlaylistLog, Rotation, RotationSlot, ScheduleBlock, Track
 from .services.log_builder import _build_from_playlist, build_hour_log, preview_hour_log
 
 
@@ -988,12 +988,20 @@ def track_detail_page(request, pk):
     from library.models import AnalysisConfig
 
     track = get_object_or_404(
-        Track.objects.select_related("artist", "album", "genre", "category"), pk=pk
+        Track.objects.select_related("artist", "album", "genre", "category")
+        .prefetch_related("additional_categories", "holidays"),
+        pk=pk,
     )
     categories = Category.objects.order_by("name")
+    holidays = Holiday.objects.order_by("month", "day")
+    selected_additional_cat_ids = set(track.additional_categories.values_list("id", flat=True))
+    selected_holiday_codes = set(track.holidays.values_list("code", flat=True))
     return render(request, "library/track_detail.html", {
         "track": track,
         "categories": categories,
+        "holidays": holidays,
+        "selected_additional_cat_ids": selected_additional_cat_ids,
+        "selected_holiday_codes": selected_holiday_codes,
         "energy_choices": Track.ENERGY_CHOICES,
         "vocal_type_choices": Track.VOCAL_TYPE_CHOICES,
         "end_type_choices": Track.END_TYPE_CHOICES,
@@ -1115,6 +1123,31 @@ def api_track_detail(request, pk):
                 track.category = None
 
     track.save()
+
+    # M2M fields have to be set AFTER save() because they need the pk.
+    # Not part of DIRECT_FIELDS since setattr on an M2M raises. Both
+    # accept the same-shaped input the frontend already sends: a list
+    # of ids (categories) or codes (holidays). Missing key = no change;
+    # explicit empty list = clear the M2M.
+    if "additional_category_ids" in body:
+        ids = body.get("additional_category_ids") or []
+        cats = list(Category.objects.filter(id__in=ids))
+        if len(cats) != len(ids):
+            return JsonResponse({"error": "One or more additional categories not found"}, status=404)
+        # Guard against a track being listed in its own additional_categories
+        # -- that would double-count it in _tracks_for_category's OR
+        # branch. Silently drop the primary category if it snuck in.
+        if track.category_id is not None:
+            cats = [c for c in cats if c.id != track.category_id]
+        track.additional_categories.set(cats)
+
+    if "holiday_codes" in body:
+        codes = body.get("holiday_codes") or []
+        holidays = list(Holiday.objects.filter(code__in=codes))
+        if len(holidays) != len(codes):
+            return JsonResponse({"error": "One or more holidays not found"}, status=404)
+        track.holidays.set(holidays)
+
     track.refresh_from_db()
     return JsonResponse(_track_to_dict(track))
 
@@ -1160,6 +1193,8 @@ def _track_to_dict(track):
         "alt_send_text": track.alt_send_text,
         "created_at": track.created_at.isoformat(),
         "updated_at": track.updated_at.isoformat(),
+        "additional_category_ids": list(track.additional_categories.values_list("id", flat=True)),
+        "holiday_codes": list(track.holidays.values_list("code", flat=True)),
     }
 
 

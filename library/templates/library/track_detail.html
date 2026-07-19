@@ -233,6 +233,70 @@
   .save-btn.danger { background: var(--danger); color: #fff; }
   .save-btn.danger:hover { opacity: 0.85; }
 
+  /* Additional Rotation card -- two-column checkbox picker for
+     additional_categories + holidays. Scrollable so a station with
+     ~35 categories doesn't push the page down forever. */
+  .add-rotation-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1rem;
+  }
+  @media (max-width: 700px) {
+    .add-rotation-grid { grid-template-columns: 1fr; }
+  }
+  .add-rotation-label {
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--text-muted);
+    margin-bottom: 0.4rem;
+  }
+  .add-rotation-hint {
+    display: block;
+    text-transform: none;
+    letter-spacing: 0;
+    font-size: 0.7rem;
+    color: var(--text-muted);
+    opacity: 0.75;
+    margin-top: 0.1rem;
+    font-weight: 400;
+  }
+  .add-rotation-list {
+    max-height: 220px;
+    overflow-y: auto;
+    border: 1px solid var(--border-subtle);
+    border-radius: 6px;
+    padding: 0.4rem 0.5rem;
+    background: rgba(0, 0, 0, 0.15);
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0.15rem 0.6rem;
+  }
+  @media (max-width: 900px) {
+    .add-rotation-list { grid-template-columns: 1fr; }
+  }
+  .add-rotation-item {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 0.15rem 0.2rem;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.78rem;
+    color: var(--text-main);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .add-rotation-item:hover { background: rgba(148, 163, 184, 0.08); }
+  .add-rotation-item input { flex-shrink: 0; }
+  .add-rotation-item span { overflow: hidden; text-overflow: ellipsis; }
+  .add-rotation-empty {
+    color: var(--text-muted);
+    font-size: 0.8rem;
+    padding: 0.2rem 0.3rem;
+  }
+
   .save-msg {
     font-size: 0.8rem;
     color: var(--accent);
@@ -466,6 +530,43 @@
 </div>
 
 <div class="detail-section" style="margin-top:1.25rem;">
+  <h2>Additional Rotation</h2>
+  <div class="add-rotation-grid">
+    <div>
+      <div class="add-rotation-label">Additional Categories
+        <span class="add-rotation-hint">Also eligible for rotation in these, on top of the primary above</span>
+      </div>
+      <div class="add-rotation-list" id="additionalCategoriesList">
+        {% for cat in categories %}
+        <label class="add-rotation-item">
+          <input type="checkbox" value="{{ cat.id }}"
+                 {% if cat.id in selected_additional_cat_ids %}checked{% endif %}>
+          <span>{{ cat.name }}</span>
+        </label>
+        {% endfor %}
+      </div>
+    </div>
+    <div>
+      <div class="add-rotation-label">Holidays
+        <span class="add-rotation-hint">Tag for holiday ramp-in/ramp-out weighting</span>
+      </div>
+      <div class="add-rotation-list" id="holidaysList">
+        {% for h in holidays %}
+        <label class="add-rotation-item">
+          <input type="checkbox" value="{{ h.code }}"
+                 {% if h.code in selected_holiday_codes %}checked{% endif %}>
+          <span>{{ h.name }}</span>
+        </label>
+        {% endfor %}
+        {% if not holidays %}
+        <div class="add-rotation-empty">No holidays configured.</div>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="detail-section" style="margin-top:1.25rem;">
   <h2>Rotation Availability</h2>
   {% include "library/_blocked_slots_grid.html" with track_id=track.pk blocked_slots=track.blocked_slots %}
 </div>
@@ -534,6 +635,16 @@ async function saveTrack() {
     outro_starts_seconds: getVal('f_outro_starts_seconds'),
     hook_in_seconds: getVal('f_hook_in_seconds'),
     hook_out_seconds: getVal('f_hook_out_seconds'),
+    // M2M pickers in the "Additional Rotation" card. Always sent
+    // (even when empty) so the API treats them as authoritative --
+    // an unchecked-all state clears the M2M rather than leaving it
+    // untouched.
+    additional_category_ids: [...document.querySelectorAll(
+      '#additionalCategoriesList input[type="checkbox"]:checked'
+    )].map(cb => parseInt(cb.value)),
+    holiday_codes: [...document.querySelectorAll(
+      '#holidaysList input[type="checkbox"]:checked'
+    )].map(cb => cb.value),
   };
 
   const msg = document.getElementById('saveMsg');
