@@ -1,5 +1,10 @@
+import socket
+import traceback as _traceback
+from datetime import timedelta
+
 from django.core.exceptions import ValidationError
 from django.db import models
+from django.utils import timezone as _django_tz
 
 
 class MonitorCheck(models.Model):
@@ -277,3 +282,136 @@ class ListenerPeak(models.Model):
     def load(cls):
         obj, _created = cls.objects.get_or_create(pk=1)
         return obj
+
+
+class SystemEvent(models.Model):
+    """A curated, operator-facing event log for /monitoring/.
+
+    Populated by:
+
+      * The monitoring poller on every check-status TRANSITION (see
+        MonitorManager._run_cycle) -- ok/warning/critical/unknown edges
+        for every enabled MonitorCheck. This is the free-coverage
+        story: every existing and future check emits events with no
+        per-check code.
+      * The playback engine on exceptional paths -- skipped log items
+        (deleted-track or missing-file ghost), _glib_safe catches,
+        stuck-deck watchdog trips.
+      * (Future) log builder, backup, analyze, RBDS.
+
+    NOT a replacement for the systemd journal -- the journal remains
+    authoritative for full detail (multi-line tracebacks, per-tick
+    debug prints). This table is a short, structured summary a
+    part-time operator can scan on /monitoring/ without opening a
+    shell.
+
+    Retention: pruned to ~30 days by the isadoraair-prune-systemevents
+    timer (see deploy/). Nothing else depends on old rows.
+    """
+
+    LEVEL_CHOICES = [
+        ("info", "Info"),
+        ("warning", "Warning"),
+        ("error", "Error"),
+        ("critical", "Critical"),
+    ]
+
+    # Free-form category slugs -- deliberately not a choices field so a
+    # new subsystem can start emitting without a migration. Common values
+    # today: "monitor", "engine", "encoder", "builder", "backup",
+    # "analyze", "rbds".
+    category = models.CharField(max_length=32, db_index=True)
+    level = models.CharField(max_length=16, choices=LEVEL_CHOICES, default="info", db_index=True)
+
+    title = models.CharField(max_length=200)
+    detail = models.JSONField(default=dict, blank=True)
+
+    source = models.CharField(max_length=64, blank=True)
+
+    # Simple in-DB dedup: emit_event() computes a stable key from
+    # (category, level, title) unless the caller overrides it, and if
+    # the LAST row with that key was written within the coalescing
+    # window (default 60s), it bumps `repeat_count` and
+    # `last_repeated_at` on that row instead of inserting a new one. A
+    # flapping check therefore shows as one row with "x 12" rather than
+    # drowning the operator in identical repeats.
+    dedupe_key = models.CharField(max_length=200, blank=True, db_index=True)
+    repeat_count = models.PositiveIntegerField(default=1)
+
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    last_repeated_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        verbose_name = "System Event"
+        verbose_name_plural = "System Events"
+        indexes = [
+            models.Index(fields=["-created_at", "level"]),
+            models.Index(fields=["category", "-created_at"]),
+        ]
+
+    def __str__(self):
+        return f"[{self.level}] {self.category}: {self.title}"
+
+
+# Window during which a repeat of the same (category, level, title) is
+# coalesced onto the previous row rather than inserted as a new one.
+# Shorter than a normal debounced check flip (>= 10s each poll * 2
+# consecutive bad polls to fire) so real distinct events are not
+# accidentally coalesced; long enough that a genuinely flapping
+# subsystem does not spam rows.
+_EVENT_COALESCE_SECONDS = 60
+
+
+def emit_event(category, title, level="info", detail=None, source=None, dedupe_key=None):
+    """Record a SystemEvent for /monitoring/'s Recent Events feed.
+
+    Contract:
+      * Never raises. If the DB is unavailable or something else goes
+        wrong, swallow the error and print a note to stderr so the
+        calling subsystem's own reliability is not tied to the event
+        log's.
+      * Coalesces near-duplicate emissions within _EVENT_COALESCE_SECONDS.
+        Pass an explicit `dedupe_key` to override the default
+        (category+level+title).
+      * `detail` should be a JSON-serialisable dict; other types are
+        coerced.
+    """
+    try:
+        detail = dict(detail) if isinstance(detail, dict) else ({"value": detail} if detail is not None else {})
+        if "exception" in detail and isinstance(detail["exception"], BaseException):
+            detail["exception"] = "".join(_traceback.format_exception_only(type(detail["exception"]), detail["exception"])).strip()
+        if source is None:
+            try:
+                source = socket.gethostname()
+            except Exception:
+                source = ""
+        key = dedupe_key if dedupe_key is not None else f"{category}|{level}|{title}"[:200]
+        now = _django_tz.now()
+        window_start = now - timedelta(seconds=_EVENT_COALESCE_SECONDS)
+        # Lock-free coalesce: read the most recent match; if within the
+        # window, bump; otherwise insert. Rare race landing an extra row
+        # in a spam window is fine -- cheaper than SELECT FOR UPDATE on
+        # the engine hot path.
+        recent = (
+            SystemEvent.objects
+            .filter(dedupe_key=key, created_at__gte=window_start)
+            .order_by("-created_at")
+            .first()
+        )
+        if recent is not None:
+            SystemEvent.objects.filter(pk=recent.pk).update(
+                repeat_count=models.F("repeat_count") + 1,
+                last_repeated_at=now,
+                detail=detail,
+            )
+            return recent.pk
+        return SystemEvent.objects.create(
+            category=category, level=level, title=title,
+            detail=detail, source=source, dedupe_key=key,
+        ).pk
+    except Exception as exc:  # noqa: BLE001 -- event log must not break its callers
+        import sys as _sys
+        print(f"  [emit_event] failed to record event ({category}/{level}: {title}): {exc}", file=_sys.stderr)
+        return None
+

@@ -1,6 +1,7 @@
 import json
 import subprocess
 import time
+from datetime import timedelta
 from pathlib import Path
 
 from django.http import JsonResponse
@@ -10,7 +11,7 @@ from django.views.decorators.http import require_http_methods
 
 from django.utils import timezone as django_tz
 
-from .models import ListenerPeak, MonitorCheck
+from .models import ListenerPeak, MonitorCheck, SystemEvent
 
 STATE_PATH = Path("/run/isadoraair/monitoring_state.json")
 LISTENER_STATE_PATH = Path("/run/isadoraair/listeners.json")
@@ -108,6 +109,77 @@ def api_listener_peak_reset(request):
         "ok": True,
         "peak_total": peak.peak_total,
         "peak_since_at": peak.peak_since_at.isoformat(),
+    })
+
+
+# Windows the operator can pick in the Recent Events dropdown, mapped to
+# the "created_at >= now() - N" cutoff used in the query. Kept small and
+# capped -- the whole point of this feed is a glanceable summary, not a
+# deep-dive log viewer (that lives in the Django admin, one link away).
+_EVENT_WINDOWS = {
+    "1h": timedelta(hours=1),
+    "24h": timedelta(hours=24),
+    "7d": timedelta(days=7),
+}
+_EVENT_LEVELS = {"info", "warning", "error", "critical"}
+# Levels shown when the operator picks "warning+" or "error+" -- cheaper
+# to enumerate here than to build a min-level comparator in SQL over the
+# CharField.
+_EVENT_LEVEL_FILTERS = {
+    "all": ("info", "warning", "error", "critical"),
+    "warning+": ("warning", "error", "critical"),
+    "error+": ("error", "critical"),
+}
+_EVENT_LIMIT = 100
+
+
+@require_http_methods(["GET"])
+def api_recent_events(request):
+    """Recent Events feed for /monitoring/. Query params (all optional):
+      * window: 1h / 24h / 7d (default 24h)
+      * level:  all / warning+ / error+ (default all)
+      * category: exact category slug filter (e.g. "engine", "monitor")
+
+    Returns at most _EVENT_LIMIT rows, newest first. Deliberately no
+    pagination -- if the operator needs more, they go to the admin.
+    """
+    window_key = request.GET.get("window", "24h")
+    window = _EVENT_WINDOWS.get(window_key, _EVENT_WINDOWS["24h"])
+    level_key = request.GET.get("level", "all")
+    levels = _EVENT_LEVEL_FILTERS.get(level_key, _EVENT_LEVEL_FILTERS["all"])
+    category = request.GET.get("category", "").strip()
+
+    cutoff = django_tz.now() - window
+    qs = SystemEvent.objects.filter(created_at__gte=cutoff, level__in=levels)
+    if category:
+        qs = qs.filter(category=category)
+
+    events = list(qs.order_by("-created_at")[:_EVENT_LIMIT])
+    return JsonResponse({
+        "events": [
+            {
+                "id": e.id,
+                "created_at": e.created_at.isoformat(),
+                "last_repeated_at": e.last_repeated_at.isoformat() if e.last_repeated_at else None,
+                "level": e.level,
+                "category": e.category,
+                "title": e.title,
+                "detail": e.detail,
+                "source": e.source,
+                "repeat_count": e.repeat_count,
+            }
+            for e in events
+        ],
+        # Distinct category slugs currently seen in the window, so the
+        # category filter dropdown can be populated dynamically instead
+        # of hard-coding a list that goes stale as subsystems start
+        # emitting.
+        "categories": sorted(
+            SystemEvent.objects
+            .filter(created_at__gte=cutoff)
+            .values_list("category", flat=True)
+            .distinct()
+        ),
     })
 
 

@@ -2,7 +2,7 @@ from django.contrib import admin
 from django.http import HttpResponseRedirect
 from django.urls import reverse
 
-from .models import ListenerPeak, MonitorCheck, NotificationConfig, TransmitterConfig
+from .models import ListenerPeak, MonitorCheck, NotificationConfig, SystemEvent, TransmitterConfig
 
 
 @admin.register(MonitorCheck)
@@ -71,3 +71,22 @@ class ListenerPeakAdmin(_SingletonAdmin):
     change_url_name = "admin:monitoring_listenerpeak_change"
     fields = ["peak_total", "peak_since_at", "peak_reached_at"]
     readonly_fields = ["peak_since_at", "peak_reached_at"]
+
+
+@admin.register(SystemEvent)
+class SystemEventAdmin(admin.ModelAdmin):
+    list_display = ["created_at", "level", "category", "title", "repeat_count", "source"]
+    list_filter = ["level", "category", "source"]
+    search_fields = ["title", "detail", "dedupe_key"]
+    ordering = ["-created_at"]
+    date_hierarchy = "created_at"
+    # These are written by subsystems, not edited by hand; read-only in
+    # admin avoids accidental corruption when the operator is just
+    # digging through history.
+    readonly_fields = [
+        "created_at", "last_repeated_at", "category", "level", "title",
+        "detail", "source", "dedupe_key", "repeat_count",
+    ]
+
+    def has_add_permission(self, request):
+        return False

@@ -234,6 +234,91 @@
     color: var(--text-muted);
     font-size: 0.85rem;
   }
+
+  /* Recent Events section — same table shape as failed logins so the
+     two sit visually related, plus a colored level dot and category chip
+     to make scanning fast without reading every row. */
+  .mon-events-controls {
+    display: flex;
+    gap: 0.75rem;
+    align-items: center;
+    margin-bottom: 0.6rem;
+    flex-wrap: wrap;
+    font-size: 0.82rem;
+  }
+  .mon-events-controls label {
+    color: var(--text-muted);
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    margin-right: 0.25rem;
+  }
+  .mon-events-controls select {
+    background: transparent;
+    color: var(--text-main);
+    border: 1px solid var(--border-subtle);
+    border-radius: 4px;
+    padding: 0.2rem 0.4rem;
+    font-size: 0.82rem;
+  }
+  .mon-events-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.82rem;
+    table-layout: fixed;
+  }
+  .mon-events-table th, .mon-events-table td {
+    text-align: left;
+    padding: 0.4rem 0.6rem;
+    border-bottom: 1px solid var(--border-subtle);
+    vertical-align: top;
+  }
+  .mon-events-table th {
+    color: var(--text-muted);
+    font-weight: 600;
+    font-size: 0.75rem;
+    text-transform: uppercase;
+  }
+  .mon-events-time  { width: 8rem;  color: var(--text-muted); white-space: nowrap; }
+  .mon-events-level { width: 1.4rem; }
+  .mon-events-cat   { width: 6.5rem; }
+  .mon-events-count { width: 3.5rem; color: var(--text-muted); text-align: right; }
+  .mon-events-title { overflow: hidden; text-overflow: ellipsis; }
+  .mon-event-dot {
+    display: inline-block;
+    width: 0.7rem;
+    height: 0.7rem;
+    border-radius: 50%;
+    vertical-align: middle;
+  }
+  .mon-event-dot.info     { background: var(--text-muted); }
+  .mon-event-dot.warning  { background: #f59e0b; box-shadow: 0 0 6px rgba(245, 158, 11, 0.6); }
+  .mon-event-dot.error    { background: var(--danger); box-shadow: 0 0 6px rgba(249, 115, 115, 0.6); }
+  .mon-event-dot.critical { background: var(--danger); box-shadow: 0 0 8px rgba(249, 115, 115, 0.9); }
+  .mon-event-chip {
+    display: inline-block;
+    padding: 0.05rem 0.45rem;
+    border: 1px solid var(--border-subtle);
+    border-radius: 999px;
+    color: var(--text-muted);
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+  }
+  .mon-event-detail {
+    margin: 0.4rem 0 0 0;
+    padding: 0.5rem 0.7rem;
+    background: rgba(148, 163, 184, 0.08);
+    border-radius: 4px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.75rem;
+    white-space: pre-wrap;
+    word-break: break-word;
+    color: var(--text-muted);
+  }
+  .mon-events-row.expandable { cursor: pointer; }
+  .mon-events-row.expandable:hover td { background: rgba(148, 163, 184, 0.05); }
+  .mon-events-row.expanded + .mon-events-detail-row td { padding-top: 0; }
 </style>
 {% endblock %}
 
@@ -283,6 +368,39 @@
     <tbody id="monLoginsBody"></tbody>
   </table>
   <div class="mon-empty" id="monLoginsEmpty" style="display:none;">No failed login attempts recorded.</div>
+</div>
+
+<div class="mon-group">
+  <h2>Recent Events</h2>
+  <div class="mon-events-controls">
+    <label for="monEventsWindow">Window</label>
+    <select id="monEventsWindow">
+      <option value="1h">1 hour</option>
+      <option value="24h" selected>24 hours</option>
+      <option value="7d">7 days</option>
+    </select>
+    <label for="monEventsLevel">Level</label>
+    <select id="monEventsLevel">
+      <option value="all" selected>All</option>
+      <option value="warning+">Warning+</option>
+      <option value="error+">Error+</option>
+    </select>
+    <label for="monEventsCategory">Category</label>
+    <select id="monEventsCategory"><option value="">All</option></select>
+  </div>
+  <table class="mon-events-table" id="monEventsTable">
+    <thead>
+      <tr>
+        <th class="mon-events-time">Time</th>
+        <th class="mon-events-level"></th>
+        <th class="mon-events-cat">Category</th>
+        <th class="mon-events-title">Message</th>
+        <th class="mon-events-count">Count</th>
+      </tr>
+    </thead>
+    <tbody id="monEventsBody"></tbody>
+  </table>
+  <div class="mon-empty" id="monEventsEmpty" style="display:none;">No events in this window.</div>
 </div>
 {% endblock %}
 
@@ -691,10 +809,130 @@ async function pollRbdsStatus() {
   }
 }
 
+// Recent Events section --------------------------------------------------
+// Server drives filtering (window/level/category); this side just renders
+// and re-fetches on control change or on a 15s interval (events are
+// relatively rare -- a 5s cadence like the status poll would be wasted
+// churn). Rows collapse-expand to show the detail JSON so an operator can
+// see WHY without leaving the page.
+
+function relTime(iso) {
+  const ts = new Date(iso).getTime();
+  if (!ts) return "";
+  const secs = Math.max(0, Math.round((Date.now() - ts) / 1000));
+  if (secs < 60)   return `${secs}s ago`;
+  if (secs < 3600) return `${Math.floor(secs / 60)}m ago`;
+  if (secs < 86400) return `${Math.floor(secs / 3600)}h ago`;
+  return `${Math.floor(secs / 86400)}d ago`;
+}
+
+function eventControlValues() {
+  return {
+    window: document.getElementById("monEventsWindow").value,
+    level: document.getElementById("monEventsLevel").value,
+    category: document.getElementById("monEventsCategory").value,
+  };
+}
+
+function updateCategoryOptions(categories) {
+  const sel = document.getElementById("monEventsCategory");
+  const current = sel.value;
+  // Preserve the "All" option and the currently-selected value (even if
+  // it's dropped out of the window; falls back to "" next fetch).
+  const opts = [`<option value="">All</option>`]
+    .concat(categories.map(c => `<option value="${c}"${c === current ? " selected" : ""}>${c}</option>`));
+  sel.innerHTML = opts.join("");
+}
+
+function renderEventDetail(detail) {
+  if (!detail || (typeof detail === "object" && !Object.keys(detail).length)) {
+    return "<em>(no additional detail)</em>";
+  }
+  try {
+    return JSON.stringify(detail, null, 2);
+  } catch (e) {
+    return String(detail);
+  }
+}
+
+function escapeHtml(s) {
+  const d = document.createElement("div");
+  d.textContent = String(s == null ? "" : s);
+  return d.innerHTML;
+}
+
+let eventsInFlight = null;
+async function loadRecentEvents() {
+  const { window: win, level, category } = eventControlValues();
+  const params = new URLSearchParams({ window: win, level });
+  if (category) params.set("category", category);
+  if (eventsInFlight) eventsInFlight.abort();
+  const ctrl = new AbortController();
+  eventsInFlight = ctrl;
+  try {
+    const res = await fetch(`{% url 'monitoring:api-recent-events' %}?${params.toString()}`, { signal: ctrl.signal });
+    const data = await res.json();
+    updateCategoryOptions(data.categories || []);
+
+    const body = document.getElementById("monEventsBody");
+    const empty = document.getElementById("monEventsEmpty");
+    body.innerHTML = "";
+    if (!data.events || !data.events.length) {
+      empty.style.display = "block";
+      return;
+    }
+    empty.style.display = "none";
+
+    data.events.forEach(e => {
+      const tr = document.createElement("tr");
+      tr.className = "mon-events-row expandable";
+      tr.dataset.eventId = e.id;
+      const timeCell = e.last_repeated_at
+        ? `${relTime(e.last_repeated_at)}<div style="font-size:0.7rem;color:var(--text-muted);">first ${relTime(e.created_at)}</div>`
+        : relTime(e.created_at);
+      tr.innerHTML = `
+        <td class="mon-events-time" title="${escapeHtml(new Date(e.created_at).toLocaleString())}">${timeCell}</td>
+        <td class="mon-events-level"><span class="mon-event-dot ${escapeHtml(e.level)}" title="${escapeHtml(e.level)}"></span></td>
+        <td class="mon-events-cat"><span class="mon-event-chip">${escapeHtml(e.category)}</span></td>
+        <td class="mon-events-title">${escapeHtml(e.title)}</td>
+        <td class="mon-events-count">${e.repeat_count > 1 ? `× ${e.repeat_count}` : ""}</td>
+      `;
+      const detailRow = document.createElement("tr");
+      detailRow.className = "mon-events-detail-row";
+      detailRow.style.display = "none";
+      const detailCell = document.createElement("td");
+      detailCell.colSpan = 5;
+      const pre = document.createElement("pre");
+      pre.className = "mon-event-detail";
+      pre.textContent = renderEventDetail(e.detail);
+      detailCell.appendChild(pre);
+      detailRow.appendChild(detailCell);
+
+      tr.addEventListener("click", () => {
+        const expanded = tr.classList.toggle("expanded");
+        detailRow.style.display = expanded ? "" : "none";
+      });
+
+      body.appendChild(tr);
+      body.appendChild(detailRow);
+    });
+  } catch (e) {
+    if (e.name === "AbortError") return;
+    // Non-critical: leave the last rendered rows in place, don't blank
+    // the section on a transient fetch fail.
+  }
+}
+
+["monEventsWindow", "monEventsLevel", "monEventsCategory"].forEach(id => {
+  document.getElementById(id).addEventListener("change", loadRecentEvents);
+});
+
 pollStatus();
 loadRecentLogins();
 pollRbdsStatus();
+loadRecentEvents();
 setInterval(pollStatus, 5000);
 setInterval(pollRbdsStatus, 5000);
+setInterval(loadRecentEvents, 15000);
 </script>
 {% endblock %}

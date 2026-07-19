@@ -25,7 +25,7 @@ from django.db import close_old_connections  # noqa: E402
 from django.utils import timezone as django_tz  # noqa: E402
 
 from encoders.models import Encoder  # noqa: E402
-from monitoring.models import ListenerPeak, MonitorCheck, TransmitterConfig  # noqa: E402
+from monitoring.models import ListenerPeak, MonitorCheck, TransmitterConfig, emit_event  # noqa: E402
 from monitoring.services.notify import maybe_notify  # noqa: E402
 from monitoring.services.probes import PROBE_DISPATCH  # noqa: E402
 from monitoring.services.transmitter_client import TransmitterClient  # noqa: E402
@@ -124,7 +124,21 @@ class MonitorManager:
             prev_status = self._current_status.get(check.id, "ok")
             status = self._debounce(check, status)
             if status != prev_status or check.id not in self._since:
+                # `self._since` membership BEFORE we assign it here is
+                # the "have we ever observed this check before" signal
+                # -- distinguishes a real edge from the first-tick
+                # catch-up after a service restart. Only real edges get
+                # an event and (independently) a notification.
+                is_transition = check.id in self._since
                 self._since[check.id] = time.time()
+                if is_transition:
+                    # Record the transition in SystemEvent BEFORE
+                    # notifying so an operator on /monitoring/ sees it
+                    # in the Recent Events feed even if the notification
+                    # path is disabled (NotificationConfig.enabled=False)
+                    # or on cooldown. The feed's whole point is
+                    # at-a-glance visibility without email/SMS wired up.
+                    self._emit_transition_event(check, prev_status, status, detail)
                 maybe_notify(check, status, detail, prev_status, self._cooldowns)
 
             results.append(self._build_result(check, status, detail))
@@ -294,6 +308,39 @@ class MonitorManager:
         tmp = LISTENER_STATE_PATH.with_suffix(".tmp")
         tmp.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
         tmp.rename(LISTENER_STATE_PATH)
+
+    # Level of the recorded SystemEvent for each new status. Recovery
+    # (into "ok") is info; degraded is warning; failure is error; unknown
+    # is warning (a probe that stopped answering is worth surfacing but
+    # isn't a confirmed fault). Recovery-from-critical still shows as
+    # info -- the operator's eye is drawn to the earlier row, not the
+    # relief that follows.
+    _STATUS_TO_LEVEL = {
+        "ok": "info",
+        "warning": "warning",
+        "critical": "error",
+        "unknown": "warning",
+    }
+
+    def _emit_transition_event(self, check, prev_status, new_status, detail):
+        level = self._STATUS_TO_LEVEL.get(new_status, "info")
+        title = f"{check.name}: {prev_status} → {new_status}"
+        emit_event(
+            category="monitor",
+            level=level,
+            title=title,
+            detail={
+                "check_id": check.id,
+                "kind": check.kind,
+                "prev_status": prev_status,
+                "new_status": new_status,
+                "probe_detail": detail,
+            },
+            # Dedupe on the check + destination status so a flapping
+            # check collapses to one row per (check, going-to-status)
+            # inside the coalesce window instead of two rows per flap.
+            dedupe_key=f"monitor|check={check.id}|to={new_status}",
+        )
 
     def _build_result(self, check, status, detail):
         return {

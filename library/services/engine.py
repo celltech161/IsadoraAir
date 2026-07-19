@@ -25,6 +25,7 @@ from django.db.models import F
 from django.utils import timezone
 from hardware.models import AudioInput, AudioOutput, AudioPipeline, DuckingConfig, RemoteDJAudioInput
 from library.models import Category, LogItem, PlaylistLog, RemoteDJConfig, Track
+from monitoring.models import emit_event
 from library.services.log_builder import (
     DURATION_FIT_MARGIN,
     append_fill_items,
@@ -126,6 +127,12 @@ def _glib_safe(default_return=True):
     stderr write. Idle-add callbacks are one-shots and can default to
     False; the caller picks per-callsite.
 
+    Every catch is ALSO recorded as a SystemEvent (level=error,
+    category=engine) so the operator sees it on /monitoring/ instead of
+    only in journalctl -- the whole point of catching a callback bug
+    is that it stops mattering to *audio*; still needs to matter to
+    *someone*.
+
     Also refuses to swallow KeyboardInterrupt / SystemExit -- those must
     still tear down the process on Ctrl-C / SIGTERM.
     """
@@ -136,9 +143,20 @@ def _glib_safe(default_return=True):
                 return method(*args, **kwargs)
             except (KeyboardInterrupt, SystemExit):
                 raise
-            except Exception:
+            except Exception as exc:
                 print(f"  [engine] Uncaught exception in {method.__qualname__}:")
                 traceback.print_exc()
+                emit_event(
+                    category="engine",
+                    level="error",
+                    title=f"Uncaught exception in {method.__qualname__}",
+                    detail={
+                        "exception": exc,
+                        "traceback": traceback.format_exc(),
+                        "callback": method.__qualname__,
+                    },
+                    dedupe_key=f"engine|glib_safe|{method.__qualname__}",
+                )
                 return default_return
         return wrapper
     return decorator
@@ -1122,6 +1140,17 @@ class PlaybackEngine:
             if playable:
                 return item
             print(f"  Skipping log item id={item.id} pos={item.position}: {reason}")
+            emit_event(
+                category="engine",
+                level="warning",
+                title=f"Skipped log item at pos {item.position}",
+                detail={
+                    "log_item_id": item.id,
+                    "position": item.position,
+                    "reason": reason,
+                },
+                dedupe_key=f"engine|skip|item={item.id}",
+            )
             self._queue_cursor += 1
         return None
 
@@ -1143,6 +1172,17 @@ class PlaybackEngine:
             if playable:
                 return item
             print(f"  Skipping log item id={item.id} pos={item.position}: {reason}")
+            emit_event(
+                category="engine",
+                level="warning",
+                title=f"Skipped log item at pos {item.position}",
+                detail={
+                    "log_item_id": item.id,
+                    "position": item.position,
+                    "reason": reason,
+                },
+                dedupe_key=f"engine|skip|item={item.id}",
+            )
 
     def _get_upcoming_preview(self):
         """Every remaining item in the current hour's log — however many
@@ -2545,6 +2585,20 @@ class PlaybackEngine:
                       f"(duration {duration:.1f}s) with no EOS detected -- abandoning "
                       f"this deck (leaking its pipeline rather than risking a hung "
                       f"teardown) and freeing the slot.")
+                emit_event(
+                    category="engine",
+                    level="critical",
+                    title=f"Deck {slot} stuck past EOS on {deck.track.title!r}",
+                    detail={
+                        "slot": slot,
+                        "track_id": deck.track.id,
+                        "track_title": deck.track.title,
+                        "position_seconds": round(pos, 1),
+                        "duration_seconds": round(duration, 1),
+                        "overrun_seconds": round(pos - duration, 1),
+                    },
+                    dedupe_key=f"engine|stuck|slot={slot}|track={deck.track.id}",
+                )
                 deck.finished = True
                 self.decks[slot] = None
                 self._next_triggered = False
@@ -2645,6 +2699,19 @@ class PlaybackEngine:
     def _on_deck_error(self, bus, message, deck):
         err, debug = message.parse_error()
         print(f"  GStreamer error on {deck.track.title}: {err} ({debug})")
+        emit_event(
+            category="engine",
+            level="error",
+            title=f"GStreamer error on {deck.track.title!r}",
+            detail={
+                "slot": deck.slot,
+                "track_id": deck.track.id,
+                "track_title": deck.track.title,
+                "error": str(err),
+                "debug": debug,
+            },
+            dedupe_key=f"engine|gst_error|track={deck.track.id}",
+        )
         GLib.idle_add(self._handle_deck_finished, deck)
         return True
 
