@@ -194,18 +194,17 @@ def probe_audio_silence(check):
     except (OSError, ValueError) as exc:
         return "unknown", {"error": str(exc)}
 
-    # on_blank/on_noise only fire on a real silence<->noise transition
-    # (plus one unconditional write at script start) -- a feed that's
-    # been continuously fine for hours is SUPPOSED to leave this file
-    # untouched that whole time, so a short staleness window here was
-    # simply the wrong model (caught live: it showed "unknown" forever
-    # on a perfectly healthy stream). The "Stream Encoders" systemd
-    # check already independently verifies the underlying process is
-    # alive -- this generous bound is just a sanity trip-wire against a
-    # truly ancient, forgotten file (e.g. from a device no longer in use).
+    # The liquidsoap script re-touches this file every 60s via a
+    # thread.run(every=60., ...) heartbeat (see build_liquidsoap_script)
+    # even when nothing has transitioned, so a short staleness bound is
+    # now the *correct* signal that liquidsoap itself has wedged/died
+    # rather than that the audio has simply been fine. Three missed
+    # heartbeats (180s) trips "unknown". The earlier 24h bound was left
+    # over from before the heartbeat existed and was guaranteed to flip
+    # every healthy stream to "unknown" once per day.
     age = time.time() - data.get("timestamp", 0)
-    if age > 86400:
-        return "unknown", {"reason": "state file hasn't updated in over a day", "age_seconds": age}
+    if age > 180:
+        return "unknown", {"reason": "state file hasn't updated in over 3 minutes -- liquidsoap heartbeat stopped", "age_seconds": age}
     if data.get("is_blank"):
         return "critical", {"is_blank": True, "age_seconds": age}
     return "ok", {"is_blank": False, "age_seconds": age}

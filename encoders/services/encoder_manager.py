@@ -223,9 +223,20 @@ def build_liquidsoap_script(input_device, encoders):
         f'source = input.alsa(device={_liq_string(input_device)})',
         'source = blank.detect(threshold=-40.0, max_blank=20.0, min_noise=0.5, source)',
         '',
+        # `last_blank` mirrors the most recent transition state so the 60s
+        # heartbeat below re-writes with the *correct* is_blank -- otherwise
+        # a heartbeat during a real silence would overwrite it with `false`
+        # and mask the outage from the dashboard.
+        'last_blank = ref(false)',
         'def write_silence_state(is_blank) =',
+        '  last_blank.set(is_blank)',
         f'  state = json.stringify(compact=true, {{is_blank = is_blank, timestamp = time()}})',
-        f'  file.write(data=state, atomic=true, {_liq_string(state_path)})',
+        # temp_dir must live on the same filesystem as the target for the
+        # atomic rename to succeed. Without this, liquidsoap defaults temp
+        # to /tmp and logs "Atomic rename failed!" on every write (harmless
+        # -- the write still happens non-atomically -- but with the 60s
+        # heartbeat it turns into once-a-minute log spam).
+        f'  file.write(data=state, atomic=true, temp_dir="/run/isadoraair", {_liq_string(state_path)})',
         'end',
         '',
         'source.on_blank(synchronous=false, {write_silence_state(true)})',
@@ -236,6 +247,13 @@ def build_liquidsoap_script(input_device, encoders):
         # "unknown" forever instead of "ok". start_blank defaults to
         # false, so the matching initial assumption here is "not blank".
         'write_silence_state(false)',
+        # Periodic heartbeat: re-touch the state file every 60s carrying
+        # the last known is_blank. Lets probe_audio_silence use a tight
+        # staleness bound as a genuine "liquidsoap wedged/dead" signal
+        # without falsely tripping on a stream that's been continuously
+        # fine (the original 24h bound was guaranteed to hit "unknown"
+        # once per day on a perfectly healthy feed -- caught live).
+        'thread.run(every=60., {write_silence_state(last_blank())})',
         '',
         # Wrapped in try/catch: now_playing.json is written in-place (not
         # atomic rename -- see engine.py's _write_now_playing for why),
