@@ -1,5 +1,5 @@
 import random
-from datetime import datetime, time, timedelta
+from datetime import date as _date, datetime, time, timedelta
 
 from django.db.models import Count, Q
 from django.db.models.expressions import RawSQL
@@ -7,6 +7,7 @@ from django.utils import timezone
 
 from library.models import (
     Category,
+    Holiday,
     LogFillConfig,
     LogItem,
     PlaylistLog,
@@ -14,6 +15,77 @@ from library.models import (
     ScheduleBlock,
     Track,
 )
+
+
+def _active_holidays_at(target_datetime):
+    """Return Holidays currently in their ramp window for target_datetime.
+
+    Handles year wrap by checking last-year, this-year, and next-year
+    candidate dates -- Christmas with ramp_out_days=7 is still active on
+    Jan 1 (7 days after Dec 25 of the previous calendar year), and
+    should be. New Year's on Jan 1 with ramp_in_days=7 is active on
+    Dec 25 of the previous year (7 days before Jan 1 of the next).
+    """
+    target_date = target_datetime.date() if hasattr(target_datetime, 'date') else target_datetime
+    active = []
+    for h in Holiday.objects.all():
+        for year_offset in (-1, 0, 1):
+            try:
+                cand = _date(target_date.year + year_offset, h.month, h.day)
+            except ValueError:
+                # Feb 29 on a non-leap year -- rare; skip. If a station
+                # ever configures a leap-day holiday, they can set an
+                # explicit occurrence per year via specific_date on a
+                # ScheduleBlock instead, or bump to Mar 1 in the model.
+                continue
+            if cand - timedelta(days=h.ramp_in_days) <= target_date <= cand + timedelta(days=h.ramp_out_days):
+                active.append(h)
+                break
+    return active
+
+
+def _holiday_boost_expr(active_holiday_codes):
+    """Return a (sql_snippet, params) pair that resolves to the MAX
+    max_weight_boost across a track's active-holiday tags -- 0 if the
+    track isn't tagged with any active holiday. Injected into
+    _weighted_order's RawSQL so tracks tagged with a currently-ramping
+    holiday sort proportionally more likely to come up. Empty active
+    list returns ("0", []) so the caller can splice in a bare zero."""
+    if not active_holiday_codes:
+        return "0", []
+    # Holiday.pk is `code` (CharField), so the M2M through-table's
+    # holiday_id column stores code strings, not integer ids.
+    subq = (
+        "COALESCE(("
+        "  SELECT MAX(h.max_weight_boost) "
+        "  FROM library_holiday h "
+        "  INNER JOIN library_track_holidays th ON th.holiday_id = h.code "
+        "  WHERE th.track_id = library_track.id "
+        "  AND h.code = ANY(%s)"
+        "), 0)"
+    )
+    return subq, [list(active_holiday_codes)]
+
+
+def _track_active_holiday_codes(track, active_holiday_codes):
+    """Return the intersection of the track's holiday tags and the
+    currently-active set. Used by callers after a successful pick to
+    increment per-holiday counters against Holiday.max_share caps."""
+    if not active_holiday_codes:
+        return set()
+    return set(track.holidays.values_list("code", flat=True)) & set(active_holiday_codes)
+
+
+def _holiday_caps(active_holidays, total_slots):
+    """Absolute per-hour cap for each active holiday, derived from
+    Holiday.max_share * total_slots. Integer floor so a 0.4 share
+    against 20 slots yields 8, and 0.4 against 21 still yields 8
+    (not 8.4 -- caps are counts of picks, not fractional). Rounded
+    down keeps the picker conservative on partial-slot boundaries."""
+    return {
+        h.code: int(float(h.max_share) * total_slots)
+        for h in active_holidays
+    }
 
 
 def resolve_schedule_block(target_date, hour):
@@ -132,7 +204,7 @@ DURATION_FIT_THRESHOLD = 480  # start fitting when < 8 minutes remain
 DURATION_FIT_MARGIN = 30     # acceptable overshoot in seconds
 
 
-def _weighted_order(qs):
+def _weighted_order(qs, active_holiday_codes=None):
     """Random selection weighted by Track.rotation_weight (0-5, default 3)
     and by dormancy (hours since Track.last_played_at, updated live by
     engine.py on every real play) -- so among tracks that have already
@@ -161,20 +233,32 @@ def _weighted_order(qs):
 
     `-LN(RANDOM()) / weight` is the standard SQL-side trick for weighted
     sampling without materializing/shuffling anything -- same query cost
-    as the plain `order_by("?")` it replaces."""
+    as the plain `order_by("?")` it replaces.
+
+    `active_holiday_codes` (a list of Holiday.code strings currently in
+    their ramp window) adds a per-track boost to `rotation_weight` --
+    the MAX max_weight_boost across the track's active-holiday tags,
+    or 0 if the track has no active-holiday tags. So during Halloween's
+    ramp, a track tagged with Halloween (max_weight_boost=3) picks
+    with effective weight (rotation_weight+1+3) instead of just
+    (rotation_weight+1) -- ~2x more likely to come up per pick if it
+    was already at the default weight=3. See _active_holidays_at for
+    the ramp-window semantics."""
+    boost_expr, boost_params = _holiday_boost_expr(active_holiday_codes)
     return qs.order_by(RawSQL(
-        "-LN(RANDOM()) / ((rotation_weight + 1) * (1 + LN(1 + "
+        f"-LN(RANDOM()) / ((rotation_weight + 1 + {boost_expr}) * (1 + LN(1 + "
         "EXTRACT(EPOCH FROM (NOW() - COALESCE(last_played_at, "
         "NOW() - INTERVAL '365 days'))) / 3600.0)))",
-        [],
+        boost_params,
     ))
 
 
-def _pick_best_fit(qs, remaining_seconds):
+def _pick_best_fit(qs, remaining_seconds, active_holiday_codes=None):
     """From a queryset of eligible tracks, pick the one whose duration
     best fills the remaining time without overshooting too much."""
     candidates = list(
-        _weighted_order(qs).values_list("id", "next_start_seconds", "duration_seconds")[:200]
+        _weighted_order(qs, active_holiday_codes=active_holiday_codes)
+        .values_list("id", "next_start_seconds", "duration_seconds")[:200]
     )
     if not candidates:
         return None
@@ -202,7 +286,8 @@ def _pick_best_fit(qs, remaining_seconds):
 def pick_track(category, exclude_track_ids, exclude_artist_ids,
                artist_sep, title_sep, target_datetime,
                remaining_seconds=None, max_loosening=3,
-               hard_exclude_track_ids=None, hard_exclude_artist_ids=None):
+               hard_exclude_track_ids=None, hard_exclude_artist_ids=None,
+               active_holiday_codes=None, capped_holiday_codes=None):
     """`exclude_*` are RECENCY-HISTORY exclusions -- they get progressively
     dropped by the loosening loop below if no candidate can be found.
 
@@ -215,6 +300,17 @@ def pick_track(category, exclude_track_ids, exclude_artist_ids,
     because time-based sep excluded 18/19 candidates, the loose retry
     reset `exclude_track_ids` to LogItem-history only, and the current
     hour's picks weren't yet in LogItem so the accumulator was invisible.
+
+    `active_holiday_codes` (Holiday.code strings currently in their ramp
+    window) drives a per-track SQL boost inside _weighted_order --
+    tagged tracks sort proportionally more likely without changing the
+    eligible pool.
+
+    `capped_holiday_codes` (subset of active_holiday_codes) filters
+    them OUT for this pick because their per-hour max_share cap is
+    already met -- see _holiday_caps and the caller's incrementing
+    counter. Excluded via `.exclude(holidays__code__in=...)` regardless
+    of loosening: max_share is a hard hourly cap.
     """
     fit_mode = remaining_seconds is not None and remaining_seconds < DURATION_FIT_THRESHOLD
     hard_exclude_track_ids = set(hard_exclude_track_ids or ())
@@ -245,14 +341,21 @@ def pick_track(category, exclude_track_ids, exclude_artist_ids,
             qs = qs.exclude(id__in=combined_tracks)
         if combined_artists:
             qs = qs.exclude(artist_id__in=combined_artists)
+        if capped_holiday_codes:
+            # Any track tagged with a capped active-holiday code is out
+            # for this pick, regardless of loosening. Uses .distinct()
+            # implicitly (already present on _tracks_for_category) so a
+            # track tagged with multiple capped holidays isn't
+            # miscounted.
+            qs = qs.exclude(holidays__code__in=list(capped_holiday_codes))
         return qs
 
     for attempt in range(max_loosening + 1):
         qs = _build_qs()
         if fit_mode:
-            track = _pick_best_fit(qs, remaining_seconds)
+            track = _pick_best_fit(qs, remaining_seconds, active_holiday_codes=active_holiday_codes)
         else:
-            track = _weighted_order(qs).first()
+            track = _weighted_order(qs, active_holiday_codes=active_holiday_codes).first()
 
         if track:
             return track
@@ -310,18 +413,27 @@ def pick_track(category, exclude_track_ids, exclude_artist_ids,
     hard_exclude_artist_ids = set()
     qs = _build_qs()
     if fit_mode:
-        return _pick_best_fit(qs, remaining_seconds)
-    return _weighted_order(qs).first()
+        return _pick_best_fit(qs, remaining_seconds, active_holiday_codes=active_holiday_codes)
+    return _weighted_order(qs, active_holiday_codes=active_holiday_codes).first()
 
 
 MAX_FILL_TRACKS = 200  # safety cap against a runaway loop on bad data
 
 
-def fill_remaining_hour(picks, accumulated_seconds, target_datetime):
+def fill_remaining_hour(picks, accumulated_seconds, target_datetime,
+                        active_holidays=None, holiday_pick_count=None,
+                        total_slots=None):
     """Top up `picks` with fallback-category tracks (admin-configured via
     LogFillConfig) until the hour is filled, or as tightly as duration-fit
     allows. Called after any build path in case it comes up short of a
-    full hour (e.g. a playlist/rotation that doesn't sum to 3600s)."""
+    full hour (e.g. a playlist/rotation that doesn't sum to 3600s).
+
+    Holiday state (`active_holidays`, `holiday_pick_count`,
+    `total_slots`) is threaded in from the rotation build so caps
+    computed against the rotation's slot count keep their meaning here
+    -- fill tracks are also subject to max_share. Callers that don't
+    care about holidays (playlist-only path) can pass all three as None
+    and the fill runs unchanged."""
     remaining = 3600 - accumulated_seconds
     if remaining <= DURATION_FIT_MARGIN:
         return picks, accumulated_seconds
@@ -338,6 +450,22 @@ def fill_remaining_hour(picks, accumulated_seconds, target_datetime):
     picked_tracks = [p["track"] for p in picks]
     picked_artist_ids = [p["track"].artist_id for p in picks]
 
+    # If caller didn't supply holiday state, compute it here so the
+    # playlist-based build (which doesn't have a slot count) still
+    # honors holiday ramp weighting -- caps degenerate to unlimited
+    # in that path since total_slots is unknown, which is the
+    # conservative choice (no false rejects) for an already-imperfect
+    # fill-only path.
+    if active_holidays is None:
+        active_holidays = _active_holidays_at(target_datetime)
+    active_holiday_codes = [h.code for h in active_holidays]
+    if total_slots is not None:
+        caps = _holiday_caps(active_holidays, total_slots)
+    else:
+        caps = {code: 10**9 for code in active_holiday_codes}
+    if holiday_pick_count is None:
+        holiday_pick_count = {code: 0 for code in active_holiday_codes}
+
     for _ in range(MAX_FILL_TRACKS):
         if remaining <= DURATION_FIT_MARGIN:
             break
@@ -345,12 +473,15 @@ def fill_remaining_hour(picks, accumulated_seconds, target_datetime):
         exclude_track_ids, exclude_artist_ids = get_recent_exclusions(
             target_datetime, artist_sep, title_sep, picked_tracks, picked_artist_ids,
         )
+        capped_codes = {code for code, n in holiday_pick_count.items() if n >= caps[code]}
         track = pick_track(
             category, exclude_track_ids, exclude_artist_ids,
             artist_sep, title_sep, target_datetime,
             remaining_seconds=remaining,
             hard_exclude_track_ids={t.id for t in picked_tracks},
             hard_exclude_artist_ids=set(picked_artist_ids),
+            active_holiday_codes=active_holiday_codes,
+            capped_holiday_codes=capped_codes,
         )
         if track is None:
             break  # nothing eligible even after loosening — stop gracefully
@@ -371,6 +502,8 @@ def fill_remaining_hour(picks, accumulated_seconds, target_datetime):
             picked_tracks.append(track)
         if artist_sep > 0:
             picked_artist_ids.append(track.artist_id)
+        for code in _track_active_holiday_codes(track, active_holiday_codes):
+            holiday_pick_count[code] += 1
         accumulated_seconds += track_duration
         remaining = 3600 - accumulated_seconds
         if track_duration <= 0:
@@ -388,6 +521,18 @@ def _build_from_rotation(target_date, hour, rotation):
     target_datetime = timezone.make_aware(
         datetime.combine(target_date, time(hour, 0))
     )
+
+    # Holiday ramp state, computed ONCE at build start. `active_holidays`
+    # is the list of Holidays currently in their ramp window; caps is
+    # the per-holiday max count (int floor of max_share * total_slots).
+    # holiday_pick_count tracks how many picks so far are tagged with
+    # each active holiday; capped_codes derives from that on each
+    # iteration so a Christmas track picked into slot 3 tightens the
+    # cap check for slot 5 without needing to re-query the DB.
+    active_holidays = _active_holidays_at(target_datetime)
+    active_holiday_codes = [h.code for h in active_holidays]
+    caps = _holiday_caps(active_holidays, len(slots))
+    holiday_pick_count = {code: 0 for code in active_holiday_codes}
 
     picks = []
     picked_tracks = []
@@ -422,6 +567,10 @@ def _build_from_rotation(target_date, hour, rotation):
                 picked_tracks, picked_artist_ids,
             )
 
+            # Which active holidays have reached their per-hour cap
+            # right now, based on picks so far. Recomputed each slot.
+            capped_codes = {code for code, n in holiday_pick_count.items() if n >= caps[code]}
+
             remaining = 3600 - accumulated_seconds
             track = pick_track(
                 category, exclude_track_ids, exclude_artist_ids,
@@ -429,6 +578,8 @@ def _build_from_rotation(target_date, hour, rotation):
                 remaining_seconds=remaining,
                 hard_exclude_track_ids={t.id for t in picked_tracks},
                 hard_exclude_artist_ids=set(picked_artist_ids),
+                active_holiday_codes=active_holiday_codes,
+                capped_holiday_codes=capped_codes,
             )
 
             if track is None:
@@ -451,12 +602,21 @@ def _build_from_rotation(target_date, hour, rotation):
             picked_tracks.append(track)
         if artist_sep > 0:
             picked_artist_ids.append(track.artist_id)
+        # Every pick (category-random OR direct-track) that's tagged
+        # with an active holiday counts against that holiday's cap.
+        for code in _track_active_holiday_codes(track, active_holiday_codes):
+            holiday_pick_count[code] += 1
         accumulated_seconds += track_duration
 
         if accumulated_seconds >= 3600:
             break
 
-    picks, accumulated_seconds = fill_remaining_hour(picks, accumulated_seconds, target_datetime)
+    picks, accumulated_seconds = fill_remaining_hour(
+        picks, accumulated_seconds, target_datetime,
+        active_holidays=active_holidays,
+        holiday_pick_count=holiday_pick_count,
+        total_slots=len(slots),
+    )
     return _persist_log(target_date, hour, picks)
 
 
@@ -629,6 +789,10 @@ def preview_hour_log(target_date, hour):
         recency_cfg = RecencyConfig.load()
         picked_tracks = []
         picked_artist_ids = []
+        active_holidays = _active_holidays_at(target_datetime)
+        active_holiday_codes = [h.code for h in active_holidays]
+        caps = _holiday_caps(active_holidays, len(slots))
+        holiday_pick_count = {code: 0 for code in active_holiday_codes}
 
         for idx, slot in enumerate(slots):
             if slot.track_id:
@@ -645,6 +809,7 @@ def preview_hour_log(target_date, hour):
                 exclude_track_ids, exclude_artist_ids = get_recent_exclusions(
                     target_datetime, artist_sep, title_sep, picked_tracks, picked_artist_ids,
                 )
+                capped_codes = {code for code, n in holiday_pick_count.items() if n >= caps[code]}
                 remaining = 3600 - accumulated_seconds
                 track = pick_track(
                     category, exclude_track_ids, exclude_artist_ids,
@@ -652,6 +817,8 @@ def preview_hour_log(target_date, hour):
                     remaining_seconds=remaining,
                     hard_exclude_track_ids={t.id for t in picked_tracks},
                     hard_exclude_artist_ids=set(picked_artist_ids),
+                    active_holiday_codes=active_holiday_codes,
+                    capped_holiday_codes=capped_codes,
                 )
                 if track is None:
                     pool_size = _tracks_for_category(category, target_datetime=target_datetime).count()
@@ -679,6 +846,8 @@ def preview_hour_log(target_date, hour):
                 picked_tracks.append(track)
             if artist_sep > 0:
                 picked_artist_ids.append(track.artist_id)
+            for code in _track_active_holiday_codes(track, active_holiday_codes):
+                holiday_pick_count[code] += 1
             accumulated_seconds += track_duration
             if accumulated_seconds >= 3600:
                 break
@@ -687,7 +856,18 @@ def preview_hour_log(target_date, hour):
         issues.append({"severity": "error", "message": "Schedule block has neither rotation nor playlist configured."})
 
     if walked:
-        picks, accumulated_seconds = fill_remaining_hour(picks, accumulated_seconds, target_datetime)
+        # For the playlist branch (source == "playlist"), slots doesn't
+        # exist -- pass None so fill_remaining_hour degrades to
+        # unlimited caps (no false rejects on the fill-only path).
+        if source == "rotation":
+            picks, accumulated_seconds = fill_remaining_hour(
+                picks, accumulated_seconds, target_datetime,
+                active_holidays=active_holidays,
+                holiday_pick_count=holiday_pick_count,
+                total_slots=len(slots),
+            )
+        else:
+            picks, accumulated_seconds = fill_remaining_hour(picks, accumulated_seconds, target_datetime)
 
         shortfall = 3600 - accumulated_seconds
         if shortfall > DURATION_FIT_MARGIN:
