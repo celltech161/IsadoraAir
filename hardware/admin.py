@@ -10,9 +10,43 @@ from django.urls import reverse
 
 from .devices import list_input_devices, list_mixer_controls, list_output_devices
 from .models import AudioInput, AudioOutput, AudioPipeline, DuckingConfig, RemoteDJAudioInput
+from monitoring.models import emit_event
 
 # Must match engine.py's STUDIO_MONITOR_NAME.
 STUDIO_MONITOR_NAME = "Studio Monitor"
+
+
+def _alsa_store(request=None):
+    """Snapshot the kernel's live ALSA mixer state to
+    /var/lib/alsa/asound.state so a reboot restores it via the
+    stock `alsa-restore.service` (static, pulled in by sound.target
+    on any box with sound cards). Without this call, admin edits go
+    to the LIVE kernel state via `amixer sset` but are lost on any
+    hard power cut -- the persistent snapshot only updates on
+    `alsa-restore.service` ExecStop, i.e. clean shutdown. Runs once
+    per save (snapshot covers ALL cards, so per-control calls would
+    be wasted). Failure is logged but non-fatal -- the live state is
+    already correct; only the reboot survivability is at risk."""
+    try:
+        subprocess.run(
+            ["sudo", "-n", "/usr/sbin/alsactl", "store"],
+            capture_output=True, text=True, timeout=10, check=True,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as exc:
+        stderr = getattr(exc, "stderr", "") or str(exc)
+        if request is not None:
+            messages.warning(
+                request,
+                f"alsactl store failed -- live changes applied, but a reboot will "
+                f"revert them. See /monitoring/ Recent Events for detail. ({stderr[:120]})",
+            )
+        emit_event(
+            category="hardware",
+            level="warning",
+            title="alsactl store failed after mixer save (reboot persistence at risk)",
+            detail={"error": stderr[:500]},
+            dedupe_key="hardware|alsactl_store_failed",
+        )
 
 _CARD_RE = re.compile(r"plughw:(\d+),")
 
@@ -287,6 +321,11 @@ class AudioInputAdmin(_DeviceFieldAdmin):
         if changed:
             obj.mixer_control_values = values
             obj.save(update_fields=["mixer_control_values"])
+            # Persist to /var/lib/alsa/asound.state so the stock
+            # alsa-restore.service replays it at next boot. See
+            # _alsa_store's docstring for why this is once-per-save
+            # rather than once-per-control.
+            _alsa_store(request=request)
 
 
 # DuckingConfig and RemoteDJAudioInput used to be their own admin pages;
