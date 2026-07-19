@@ -1,3 +1,4 @@
+import functools
 import json
 import os
 import signal
@@ -5,6 +6,7 @@ import socket
 import sys
 import threading
 import time
+import traceback
 from datetime import timedelta
 from pathlib import Path
 
@@ -81,6 +83,65 @@ REMOTE_DJ_OPUS_FRAME_SIZE_MS = 10  # over the 20ms default, to shave latency
 # the latency-critical path the whole feature exists for; leaky-upstream
 # so it can only ever drop its own data, same reasoning as stereotool_queue.
 REMOTE_DJ_MONITOR_QUEUE_MS = 250
+
+
+def _log_item_playable(log_item):
+    """(bool, reason) -- is this queued log item something we can actually
+    hand to GStreamer? A log item can be "unplayable" for a few reasons:
+
+      * The row's Track FK was NULLed because the track was deleted from
+        the library (PlaylistLogItem.track is on_delete=SET_NULL, which
+        preserves the historical log without blocking Track deletion --
+        by design, but callers must handle the null).
+      * The Track row still exists but its `filepath` was cleared.
+      * The file was moved/deleted off disk since the log was built.
+
+    Consumers should skip unplayable items rather than crash on them --
+    an uncaught AttributeError inside a GLib callback (esp. the position
+    poller) hangs the engine off-air, since GLib silently unschedules
+    a callback that raised. See _glib_safe / _next_queue_item / etc.
+    """
+    if log_item is None:
+        return False, "log_item is None"
+    track = log_item.track
+    if track is None:
+        return False, "track deleted from library (FK set NULL)"
+    fp = track.filepath
+    if not fp:
+        return False, f"track id={track.id} has no filepath"
+    if not Path(fp).is_file():
+        return False, f"file missing on disk: {fp}"
+    return True, None
+
+
+def _glib_safe(default_return=True):
+    """Wrap a GLib timer/idle/bus callback so an unhandled exception
+    prints a traceback but doesn't silently unschedule the callback.
+
+    Timer callbacks (GLib.timeout_add*) MUST return True to stay armed
+    -- an exception counts as "returned None", i.e. "unschedule me",
+    which is exactly how a lone bug in _poll_position (e.g. dereferencing
+    a NULLed track FK on a queued log item) can hang the whole engine
+    off-air with no error surfaced anywhere except a swallowed
+    stderr write. Idle-add callbacks are one-shots and can default to
+    False; the caller picks per-callsite.
+
+    Also refuses to swallow KeyboardInterrupt / SystemExit -- those must
+    still tear down the process on Ctrl-C / SIGTERM.
+    """
+    def decorator(method):
+        @functools.wraps(method)
+        def wrapper(*args, **kwargs):
+            try:
+                return method(*args, **kwargs)
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except Exception:
+                print(f"  [engine] Uncaught exception in {method.__qualname__}:")
+                traceback.print_exc()
+                return default_return
+        return wrapper
+    return decorator
 
 
 class RemoteDJSession:
@@ -795,6 +856,7 @@ class PlaybackEngine:
         print(f"Loaded log for {target_date} {hour:02d}:00 — {len(self.log_items)} items "
               f"({'resuming at position ' + str(skipped) if skipped else 'from top'})")
 
+    @_glib_safe(default_return=True)
     def _ensure_upcoming_logs(self):
         """No human approval step for now — auto-build (and
         auto-approve) whatever hour needs it: the current hour, so a
@@ -1041,26 +1103,67 @@ class PlaybackEngine:
         self._last_live_extend_attempt = now
         return self._extend_current_log_live()
 
+    def _peek_playable_at_cursor(self):
+        """Advance `self._queue_cursor` past any leading unplayable items
+        in the current hour's log, then return the item now at the
+        cursor (WITHOUT consuming it -- cursor is left pointing AT it).
+        Returns None if the current hour has no more playable items.
+
+        Used by the crossfade look-ahead in _poll_position, which needs
+        to inspect the upcoming item's track.cue_in_seconds/etc. before
+        deciding whether to trigger -- and would AttributeError on a
+        deleted-track ghost the same way _next_queue_item would. Kept
+        separate from _next_queue_item because the poll path must NOT
+        advance the cursor over the item it's about to hand to
+        _start_next_track."""
+        while self._queue_cursor < len(self.log_items):
+            item = self.log_items[self._queue_cursor]
+            playable, reason = _log_item_playable(item)
+            if playable:
+                return item
+            print(f"  Skipping log item id={item.id} pos={item.position}: {reason}")
+            self._queue_cursor += 1
+        return None
+
     def _next_queue_item(self):
-        if self._queue_cursor >= len(self.log_items):
-            if not self._roll_over_to_next_hour():
-                return None
-        item = self.log_items[self._queue_cursor]
-        self._queue_cursor += 1
-        return item
+        # Walk forward past any unplayable items (track deleted, filepath
+        # cleared, file gone from disk) rather than blowing up on
+        # log_item.track.filepath below. Each skip is logged so the
+        # operator can see in the journal what the auto-approved log
+        # tripped over. Rolls over to the next hour's log when the
+        # current hour has nothing more to offer.
+        while True:
+            if self._queue_cursor >= len(self.log_items):
+                if not self._roll_over_to_next_hour():
+                    return None
+                continue
+            item = self.log_items[self._queue_cursor]
+            self._queue_cursor += 1
+            playable, reason = _log_item_playable(item)
+            if playable:
+                return item
+            print(f"  Skipping log item id={item.id} pos={item.position}: {reason}")
 
     def _get_upcoming_preview(self):
         """Every remaining item in the current hour's log — however many
         there are, no cap — plus, once those run out, the next hour's
         already-approved items — purely for UI preview (queue table /
         idle-deck 'Up Next'). Read-only: does not touch
-        `self._queue_cursor` or `self.current_log`."""
+        `self._queue_cursor` or `self.current_log`.
+
+        Filters unplayable items (deleted track / missing file) so the
+        state-writer downstream can't AttributeError on a NULLed track
+        FK -- _write_state runs inside the position-poll callback, and
+        an uncaught exception there hangs the whole engine (see
+        _glib_safe). The playback path skips these items independently
+        (_next_queue_item), so filtering them from the UI preview keeps
+        the two views consistent."""
         items = list(self.log_items[self._queue_cursor:])
         if not items:
             peek = self._peek_next_hour()
             if peek:
                 items = list(peek[1])
-        return items
+        return [it for it in items if _log_item_playable(it)[0]]
 
     def _start_next_track(self, slot=None):
         """Load the next queued item into `slot` (or whichever slot is
@@ -1106,12 +1209,18 @@ class PlaybackEngine:
         deck_bin.get_static_pad("src").set_offset(running_time - internal_position_ns)
 
     def _create_deck(self, slot, log_item, resume_position_ns=None):
+        # Belt-and-braces: _next_queue_item already filters unplayable
+        # items, but _create_deck is also reached from other paths
+        # (_insert_urgent_next, crossfade swap, log reload flow). One
+        # centralized check here catches all of them uniformly instead
+        # of relying on every caller to remember.
+        playable, reason = _log_item_playable(log_item)
+        if not playable:
+            item_id = log_item.id if log_item is not None else "None"
+            print(f"  Cannot create deck for log item id={item_id}: {reason}")
+            return None
         track = log_item.track
         filepath = track.filepath
-
-        if not Path(filepath).is_file():
-            print(f"  File not found: {filepath}")
-            return None
 
         self._write_now_playing(track)
 
@@ -1286,9 +1395,13 @@ class PlaybackEngine:
         if self._cache_warm_item_id == log_item.id:
             return
 
-        filepath = log_item.track.filepath
-        if not Path(filepath).is_file():
+        # Same _log_item_playable guard as the real deck creator -- a
+        # NULLed track FK or a vanished file would otherwise throw right
+        # here inside the position-poll callback path.
+        playable, _reason = _log_item_playable(log_item)
+        if not playable:
             return
+        filepath = log_item.track.filepath
         self._cache_warm_item_id = log_item.id
 
         warm_pipeline = Gst.Pipeline.new("cache-warmer")
@@ -1317,6 +1430,7 @@ class PlaybackEngine:
         warm_pipeline.set_state(Gst.State.PLAYING)
         GLib.timeout_add_seconds(2, self._teardown_cache_warmer, warm_pipeline)
 
+    @_glib_safe(default_return=False)
     def _teardown_cache_warmer(self, warm_pipeline):
         warm_pipeline.set_state(Gst.State.NULL)
         return False  # one-shot GLib timeout, don't repeat
@@ -2435,6 +2549,7 @@ class PlaybackEngine:
                 self.decks[slot] = None
                 self._next_triggered = False
 
+    @_glib_safe(default_return=True)
     def _poll_position(self):
         if not self.running:
             return False
@@ -2471,10 +2586,8 @@ class PlaybackEngine:
         other_occupied = self.decks[other_slot] is not None
 
         if not other_occupied:
-            next_item = None
-            if self._queue_cursor < len(self.log_items):
-                next_item = self.log_items[self._queue_cursor]
-            else:
+            next_item = self._peek_playable_at_cursor()
+            if next_item is None:
                 # Current hour's queue is exhausted — peek at the next
                 # hour's already-approved log so the last track of the
                 # hour can still crossfade into the first track of the
@@ -2482,13 +2595,19 @@ class PlaybackEngine:
                 peek = self._peek_next_hour()
                 if peek:
                     _, next_hour_items = peek
-                    next_item = next_hour_items[0] if next_hour_items else None
+                    # First PLAYABLE item -- if next hour's first log
+                    # item is a deleted-track ghost, look past it so
+                    # the crossfade still triggers into something real.
+                    next_item = next(
+                        (it for it in next_hour_items if _log_item_playable(it)[0]),
+                        None,
+                    )
                 elif self._try_extend_live_log():
                     # Real next hour isn't built yet, but a Log Fill
                     # Configuration re-pick just landed on the live log —
                     # pick it up now so the crossfade below can trigger
                     # into it normally instead of waiting for EOS.
-                    next_item = self.log_items[self._queue_cursor]
+                    next_item = self._peek_playable_at_cursor()
 
             if next_item is not None:
                 next_cue_in = next_item.track.cue_in_seconds or 0.0
@@ -2515,18 +2634,21 @@ class PlaybackEngine:
         self._write_state()
         return True
 
+    @_glib_safe(default_return=False)
     def _on_deck_eos_probed(self, deck_bin):
         deck = self._deck_bin_map.get(id(deck_bin))
         if not deck or deck.finished:
             return
         self._handle_deck_finished(deck)
 
+    @_glib_safe(default_return=True)
     def _on_deck_error(self, bus, message, deck):
         err, debug = message.parse_error()
         print(f"  GStreamer error on {deck.track.title}: {err} ({debug})")
         GLib.idle_add(self._handle_deck_finished, deck)
         return True
 
+    @_glib_safe(default_return=False)
     def _handle_deck_finished(self, deck):
         slot = deck.slot
         self._remove_deck(deck)
@@ -2557,6 +2679,7 @@ class PlaybackEngine:
             print("No approved log for next hour. Waiting...")
             GLib.timeout_add_seconds(30, self._try_load_next_hour)
 
+    @_glib_safe(default_return=True)
     def _try_load_next_hour(self):
         if not self.running:
             return False
