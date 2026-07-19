@@ -93,9 +93,22 @@ def get_recent_exclusions(target_datetime, artist_sep_hours, title_sep_hours,
 
     cutoff = target_datetime - timedelta(hours=max_lookback)
 
+    # played_at__isnull=False: only items that actually aired count as
+    # "played" for recency-window purposes. LogItems that were picked
+    # into an hour's log but never reached _create_deck (e.g. the hour
+    # rolled over first) DON'T contribute to the exclusion set --
+    # otherwise a track we NEVER PLAYED would still block itself from
+    # being re-picked in the next hour or two, which is exactly the
+    # opposite of what recency separation is supposed to do.
+    # _create_deck writes played_at when it commits a track to a deck,
+    # BEFORE the audio actually starts, so an in-preroll pick counts
+    # normally.
     recent_items = (
         LogItem.objects
-        .filter(scheduled_time__gte=cutoff, scheduled_time__lt=target_datetime)
+        .filter(
+            scheduled_time__gte=cutoff, scheduled_time__lt=target_datetime,
+            played_at__isnull=False,
+        )
         .select_related("track", "track__artist")
     )
 
@@ -252,9 +265,14 @@ def pick_track(category, exclude_track_ids, exclude_artist_ids,
 
         if artist_sep > 0 or title_sep > 0:
             cutoff = target_datetime - timedelta(hours=max(artist_sep, title_sep))
+            # See get_recent_exclusions for why played_at__isnull=False
+            # is on this query too -- symmetry.
             recent = (
                 LogItem.objects
-                .filter(scheduled_time__gte=cutoff, scheduled_time__lt=target_datetime)
+                .filter(
+                    scheduled_time__gte=cutoff, scheduled_time__lt=target_datetime,
+                    played_at__isnull=False,
+                )
                 .select_related("track")
             )
             artist_cutoff = target_datetime - timedelta(hours=artist_sep)
