@@ -185,6 +185,13 @@ class RemoteDJSession:
         # mirroring _remove_deck's teardown shape.
         self.elements = []
         self.real_buf_seen = False
+        # The DJ's most recent gate command. `remote_gate.volume` is the
+        # PHYSICAL gate state (may be forced to 0 during a transient
+        # WebRTC disconnect to keep static out of the mixer); this
+        # remembers what the user WANTED so we can restore it if the
+        # connection recovers without them touching anything. See
+        # _remote_dj_on_connection_state.
+        self.gate_desired = False
 
 
 class Deck:
@@ -2201,8 +2208,57 @@ class PlaybackEngine:
         if session is None or session.webrtc is not element:
             return
         state = element.props.connection_state
-        print(f"  Remote DJ connection state: {state.value_nick}")
-        if state in (GstWebRTC.WebRTCPeerConnectionState.FAILED, GstWebRTC.WebRTCPeerConnectionState.CLOSED):
+        nick = state.value_nick
+        print(f"  Remote DJ connection state: {nick}")
+        # Breadcrumb on every state edge -- rare per-session, cheap to
+        # emit, invaluable the next time a WebRTC-adjacent bug turns up
+        # in the wild and we need to reconstruct the sequence.
+        emit_event(
+            category="engine",
+            level="info",
+            title=f"Remote DJ connection: {nick}",
+            detail={"state": nick},
+            dedupe_key=f"engine|remote_dj|state={nick}",
+        )
+        if state == GstWebRTC.WebRTCPeerConnectionState.DISCONNECTED:
+            # Transient. The browser may ICE-restart back to CONNECTED
+            # (WiFi<->cellular handover is the canonical case). Don't
+            # tear down yet, but DO force the gate to 0 so any noise
+            # squeezed out of the stalled decode chain -- whether that's
+            # uninitialized-buffer memory from downstream pool
+            # allocations, clock-slave drift in webrtcbin's internal
+            # rtpjitterbuffer bursting timing-wrong frames, or
+            # Opus concealment if it ever gets turned on -- gets
+            # multiplied by zero at this stage instead of summing into
+            # master_mixer and drowning the playing deck in static.
+            # This is the "elusive noise on deck" bug the user hit
+            # infrequently on network handover mid-session. gate_desired
+            # is preserved so _remote_dj_on_connection_state's CONNECTED
+            # branch can restore the DJ's intent on recovery.
+            if session.remote_gate is not None and session.remote_gate.get_property("volume") > 0.0:
+                session.remote_gate.set_property("volume", 0.0)
+                self._apply_talk_ducking()
+                print("  Remote DJ: gate forced to 0 during transient disconnect (protecting playing deck)")
+                emit_event(
+                    category="engine",
+                    level="warning",
+                    title="Remote DJ gate forced to 0 during transient disconnect",
+                    detail={"reason": "protective mute during WebRTC DISCONNECTED"},
+                    dedupe_key="engine|remote_dj|protective_mute",
+                )
+        elif state == GstWebRTC.WebRTCPeerConnectionState.CONNECTED:
+            # Recovery path -- DJ was live and had the gate open before
+            # the blip; restore what they wanted instead of leaving them
+            # muted after ICE renegotiates. First-time CONNECTED entry
+            # doesn't reopen anything either (gate_desired starts False,
+            # gate stays at its 0.0 initial value).
+            if (session.gate_desired
+                    and session.remote_gate is not None
+                    and session.remote_gate.get_property("volume") == 0.0):
+                session.remote_gate.set_property("volume", 1.0)
+                self._apply_talk_ducking()
+                print("  Remote DJ: gate restored to 1.0 after reconnect")
+        elif state in (GstWebRTC.WebRTCPeerConnectionState.FAILED, GstWebRTC.WebRTCPeerConnectionState.CLOSED):
             self._remote_dj_session_stop()
 
     def _remote_dj_set_gate(self, active):
@@ -2210,6 +2266,12 @@ class PlaybackEngine:
         if session is None or session.remote_gate is None:
             print("  remote_dj_gate requested but no session is active — ignoring")
             return
+        # Remember the DJ's intent BEFORE touching the volume element --
+        # if the connection is currently DISCONNECTED and we're being
+        # asked to go active, we still record that intent so a later
+        # reconnect can restore it, even though the physical volume
+        # stays at 0 until the reconnect actually completes.
+        session.gate_desired = active
         session.remote_gate.set_property("volume", 1.0 if active else 0.0)
         self._apply_talk_ducking()
         self._apply_mic_mode_hold()
