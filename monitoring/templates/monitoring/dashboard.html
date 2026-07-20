@@ -328,6 +328,27 @@
 <div id="monGroups"></div>
 
 <div class="mon-group">
+  <h2>Aircheck Recording</h2>
+  <div class="mon-cards">
+    <div class="mon-card" id="aircheckCard">
+      <div class="mon-card-top">
+        <span class="mon-card-name">Aircheck</span>
+        <span class="mon-pill" id="aircheckPill">idle</span>
+      </div>
+      <div class="mon-led-row">
+        <span class="mon-led" id="aircheckLed"></span>
+        <span class="mon-led-caption" id="aircheckCaption">Not recording</span>
+      </div>
+      <div class="mon-card-detail" id="aircheckDetail" style="min-height:1.2rem;"></div>
+      <div class="mon-uptime-row" style="margin-top:0.4rem;">
+        <span class="mon-uptime" id="aircheckSize"></span>
+        <button class="mon-restart-btn" id="aircheckBtn" onclick="toggleAircheck()">Start</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="mon-group">
   <h2>RBDS</h2>
   <div class="mon-cards">
     <div class="mon-card">
@@ -927,12 +948,87 @@ async function loadRecentEvents() {
   document.getElementById(id).addEventListener("change", loadRecentEvents);
 });
 
+// Aircheck card: poll status every 3s while UI is open. Not driven
+// by monitoring_state.json -- aircheck has its own live status API,
+// same pattern as RBDS above.
+function fmtSize(bytes) {
+  if (bytes == null) return "";
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+}
+function fmtElapsed(startedIso) {
+  if (!startedIso) return "";
+  const secs = Math.max(0, Math.floor((Date.now() - new Date(startedIso).getTime()) / 1000));
+  const h = Math.floor(secs / 3600), m = Math.floor((secs % 3600) / 60), s = secs % 60;
+  return (h > 0 ? String(h).padStart(2, '0') + ':' : '')
+    + String(m).padStart(2, '0') + ':' + String(s).padStart(2, '0');
+}
+async function pollAircheck() {
+  try {
+    const r = await fetch("{% url 'aircheck:api-status' %}");
+    const data = await r.json();
+    const rec = !!data.recording;
+    const s = data.session;
+    document.getElementById('aircheckPill').textContent = rec ? 'rec' : 'idle';
+    document.getElementById('aircheckPill').className = 'mon-pill ' + (rec ? 'critical' : 'unknown');
+    document.getElementById('aircheckLed').className = 'mon-led ' + (rec ? 'critical' : 'unknown');
+    document.getElementById('aircheckCaption').textContent = rec ? 'Recording' : 'Not recording';
+    document.getElementById('aircheckBtn').textContent = rec ? 'Stop' : 'Start';
+    if (rec && s) {
+      const fmtLabel = s.audio_format.toUpperCase() + (s.bitrate ? ' ' + s.bitrate : '');
+      document.getElementById('aircheckDetail').innerHTML =
+        `${fmtLabel} • elapsed <span id="aircheckElapsed">${fmtElapsed(s.started_at)}</span>` +
+        `<div style="font-size:0.7rem;color:var(--text-muted);margin-top:0.15rem;">` +
+        `${(s.filename || '').split('/').pop()}</div>`;
+      document.getElementById('aircheckSize').textContent =
+        s.size_bytes != null ? fmtSize(s.size_bytes) : '';
+      // Tick the elapsed clock every second between polls so it looks live.
+      if (window._aircheckTick) clearInterval(window._aircheckTick);
+      window._aircheckTick = setInterval(() => {
+        const el = document.getElementById('aircheckElapsed');
+        if (el) el.textContent = fmtElapsed(s.started_at);
+      }, 1000);
+    } else {
+      document.getElementById('aircheckDetail').textContent = '';
+      document.getElementById('aircheckSize').textContent = '';
+      if (window._aircheckTick) { clearInterval(window._aircheckTick); window._aircheckTick = null; }
+    }
+  } catch (e) { /* quiet: card just doesn't update this tick */ }
+}
+async function toggleAircheck() {
+  const btn = document.getElementById('aircheckBtn');
+  const isRec = btn.textContent.trim() === 'Stop';
+  btn.disabled = true;
+  const prev = btn.textContent;
+  btn.textContent = isRec ? 'Stopping…' : 'Starting…';
+  try {
+    const url = isRec ? "{% url 'aircheck:api-stop' %}" : "{% url 'aircheck:api-start' %}";
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: { 'X-CSRFToken': getCookie('csrftoken') },
+    });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      alert((isRec ? 'Stop' : 'Start') + ' failed: ' + (data.error || r.status));
+    }
+  } catch (e) {
+    alert((isRec ? 'Stop' : 'Start') + ' failed');
+  }
+  btn.disabled = false;
+  btn.textContent = prev;
+  await pollAircheck();
+}
+
 pollStatus();
 loadRecentLogins();
 pollRbdsStatus();
 loadRecentEvents();
+pollAircheck();
 setInterval(pollStatus, 5000);
 setInterval(pollRbdsStatus, 5000);
 setInterval(loadRecentEvents, 15000);
+setInterval(pollAircheck, 3000);
 </script>
 {% endblock %}
