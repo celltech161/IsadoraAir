@@ -359,22 +359,17 @@ def pick_track(category, exclude_track_ids, exclude_artist_ids,
     hard_exclude_track_ids = set(hard_exclude_track_ids or ())
     hard_exclude_artist_ids = set(hard_exclude_artist_ids or ())
 
-    # Category-level "no separation" opt-outs. When the resolved
-    # separation for this pick is 0 (either via the category's
-    # explicit override or a global default of 0), that dimension is
-    # OFF for both the picker side and the emitter side -- see the
-    # callers, which also skip appending to picked_tracks /
-    # picked_artist_ids when the same is true. Setting title_sep=0 on
-    # e.g. WxTemp (single-track weather callout that legitimately
-    # airs multiple times per hour) makes both slots pick the same
-    # track without complaint; setting artist_sep=0 on WxObs, WxTemp,
-    # WxForecast (all voiced by the "Oak Grove Radio" house artist,
-    # same artist as Legal ID) makes them pickable in the same hour
-    # as any KOGR-LP variant.
-    if title_sep == 0:
-        hard_exclude_track_ids = set()
-    if artist_sep == 0:
-        hard_exclude_artist_ids = set()
+    # Note: sep=0 opts a category out of the RECENCY-window exclusion
+    # (via get_separation returning 0 and the loosening loop treating
+    # the window as empty), but NOT out of within-build hard exclusion.
+    # Hard exclusion is orthogonal to recency -- it's "did I already
+    # pick this track/artist in THIS hour's build" -- and it still
+    # applies here so that a category with a pool of N > 1 (e.g. Local
+    # Legends Tag with 9 tracks, sep=0) cycles through its pool within
+    # the hour instead of picking the same track repeatedly. Pool-of-1
+    # categories like WxTemp still work: their single track survives
+    # via the pool-exhaustion fallback at the bottom of this function,
+    # which drops hard_exclude_track_ids as a last resort.
 
     def _build_qs():
         # Base pool: either the caller's override (holiday-slot
@@ -443,22 +438,31 @@ def pick_track(category, exclude_track_ids, exclude_artist_ids,
         exclude_artist_ids = loosened_exclude_artists
 
     # Final pass: drop history exclusions AND hard artist separation,
-    # keep only hard TRACK exclusion. Rationale: the two hard exclusions
-    # have different priorities. "Don't play the same track twice in
-    # one hour" is a strong invariant we should never violate. "Don't
-    # play the same artist too close together" is a soft preference
-    # that should yield rather than have a slot silently skipped.
-    #
-    # Real bug this covers: WxObs (and every other single-track
-    # "Oak Grove Radio"-branded category -- Legal ID, WxTemp,
-    # WxForecast, WxAlert, imaging tags...) has one track, and after
-    # any earlier same-hour pick by the same house artist it would sit
-    # blocked forever with no way to survive. Well-populated music
-    # categories still see full artist separation on earlier attempts;
-    # only pool-of-1 branded categories reach this fallback.
+    # keep only hard TRACK exclusion. Rationale: "don't play the same
+    # track twice in one hour" is a stronger invariant than "don't play
+    # the same artist too close together" -- yield the soft one first.
     exclude_track_ids = set()
     exclude_artist_ids = set()
     hard_exclude_artist_ids = set()
+    qs = _build_qs()
+    if fit_mode:
+        track = _pick_best_fit(qs, remaining_seconds, active_holiday_codes=active_holiday_codes)
+    else:
+        track = _weighted_order(qs, active_holiday_codes=active_holiday_codes).first()
+    if track is not None:
+        return track
+
+    # Pool-exhaustion fallback: drop the hard TRACK exclusion too. This
+    # is what lets a pool-of-1 category (e.g. WxTemp, Legal ID, all the
+    # imaging tag categories) still pick its single track on a second
+    # slot in the same hour -- the hard-exclude accumulator holds it
+    # otherwise. Also what lets a small-pool category (e.g. Local
+    # Legends Tag with 9 tracks) re-cycle once every track has been
+    # picked in the current build. Reaching this fallback for a
+    # well-populated music category would mean the entire category is
+    # empty or otherwise unpickable -- returning None below is then the
+    # right answer and the caller emits a "no track survived" warning.
+    hard_exclude_track_ids = set()
     qs = _build_qs()
     if fit_mode:
         return _pick_best_fit(qs, remaining_seconds, active_holiday_codes=active_holiday_codes)
@@ -552,14 +556,11 @@ def fill_remaining_hour(picks, accumulated_seconds, target_datetime,
             "track": track,
             "category": category,
         })
-        # sep==0 opts this pick out of contributing to subsequent slots'
-        # exclusions on that dimension -- see pick_track's header for
-        # the "WxTemp twice per hour" / "WxObs same-artist-as-Legal-ID"
-        # semantics.
-        if title_sep > 0:
-            picked_tracks.append(track)
-        if artist_sep > 0:
-            picked_artist_ids.append(track.artist_id)
+        # Always accumulate for within-build hard exclusion; see the
+        # parallel comment in _build_from_rotation and pick_track's
+        # pool-exhaustion fallback.
+        picked_tracks.append(track)
+        picked_artist_ids.append(track.artist_id)
         accumulated_seconds += track_duration
         remaining = 3600 - accumulated_seconds
         if track_duration <= 0:
@@ -678,13 +679,13 @@ def _build_from_rotation(target_date, hour, rotation):
             "category": category,
         })
 
-        # sep==0 on this slot's category means it doesn't participate
-        # in subsequent slots' exclusions on that dimension. See
-        # pick_track's header for the semantics.
-        if title_sep > 0:
-            picked_tracks.append(track)
-        if artist_sep > 0:
-            picked_artist_ids.append(track.artist_id)
+        # Always accumulate for within-build hard exclusion, regardless
+        # of sep values. sep=0 opts out of the recency-window exclusion
+        # (get_separation returns 0 -> no cross-hour recency block) but
+        # NOT out of "did I already pick this in THIS build" cycling.
+        # See pick_track's header + pool-exhaustion fallback.
+        picked_tracks.append(track)
+        picked_artist_ids.append(track.artist_id)
         accumulated_seconds += track_duration
 
         if accumulated_seconds >= 3600:
@@ -936,10 +937,9 @@ def preview_hour_log(target_date, hour):
                 "position": len(picks), "scheduled_time": scheduled_time,
                 "track": track, "category": category,
             })
-            if title_sep > 0:
-                picked_tracks.append(track)
-            if artist_sep > 0:
-                picked_artist_ids.append(track.artist_id)
+            # Always accumulate; see _build_from_rotation for rationale.
+            picked_tracks.append(track)
+            picked_artist_ids.append(track.artist_id)
             accumulated_seconds += track_duration
             if accumulated_seconds >= 3600:
                 break
