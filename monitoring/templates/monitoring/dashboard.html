@@ -699,6 +699,19 @@ function renderCardBody(check, byTxRef) {
 
 function renderGroups(checks) {
   const container = document.getElementById("monGroups");
+  // BEFORE wiping the container, rescue the aircheck card back into
+  // its hidden host. On previous polls the splice step below moved
+  // the card INTO the AUDIO group (which lives inside #monGroups),
+  // so a naive innerHTML wipe destroys the card too -- and since the
+  // template's static host only holds the initial copy at page load,
+  // the card wouldn't reappear until a full page reload. Moving it
+  // back to the host first lets appendChild survive the wipe.
+  // No-op on the very first poll (card is already in the host).
+  const airCardEl = document.getElementById("aircheckCard");
+  const airHost = document.getElementById("aircheckCardHost");
+  if (airCardEl && airHost && airCardEl.parentElement !== airHost) {
+    airHost.appendChild(airCardEl);
+  }
   container.innerHTML = "";
   const byKind = {};
   const byTxRef = {};
