@@ -2192,12 +2192,45 @@ class PlaybackEngine:
                 # Session was already stopped or the pad was linked in a
                 # race -- either way, just unblock.
                 return Gst.PadProbeReturn.REMOVE
+
+            # Align this pad's running-time offset before linking into
+            # master_mixer -- same treatment _create_deck applies via
+            # _apply_pad_offset for every new deck bin, and for the same
+            # reason: the remote-DJ decode chain starts producing buffers
+            # on an internal timeline near 0 (webrtcbin's RTP arrival
+            # frame), while master_mixer's other sink pads are at
+            # running_time = N seconds. Link without an offset correction
+            # and audiomixer's aggregator sees this pad's buffers as
+            # "seconds in the past" -- it either drops samples from the
+            # other pads to force alignment or emits fresh-allocation
+            # memory as it renegotiates timelines. Either failure mode
+            # audibly turns the previously-clean deck output into static
+            # the moment the remote-DJ pad is linked, then clears when
+            # the next deck's _apply_pad_offset re-anchors the mixer.
+            # This was the "flip of a coin remote-DJ static on the
+            # playing deck" bug caught in the logs 2026-07-20 08:26.
+            #
+            # Probe is scoped to BUFFER (not BLOCK_DOWNSTREAM) so it
+            # fires on a real buffer with a real PTS -- an earlier
+            # attempt used BLOCK_DOWNSTREAM which also fires on the
+            # caps event that precedes the first buffer, causing
+            # info.get_buffer() to return None, first_pts to fall back
+            # to 0, and the offset to overshoot by the full pipeline
+            # uptime. That killed all DJ audio, deterministically.
+            buf = info.get_buffer()
+            first_pts = buf.pts if (buf and buf.pts != Gst.CLOCK_TIME_NONE) else 0
+            clock = self.main_pipeline.get_clock()
+            if clock:
+                running_time = clock.get_time() - self.main_pipeline.get_base_time()
+                probed_pad.set_offset(running_time - first_pts)
+
             s.master_mixer_pad = self.master_mixer.request_pad_simple("sink_%u")
             probed_pad.link(s.master_mixer_pad)
             print("  Remote DJ: real mic audio linked to master_mixer")
             return Gst.PadProbeReturn.REMOVE
         gate_conv_src.add_probe(
-            Gst.PadProbeType.BLOCK_DOWNSTREAM, _on_first_buffer_ready, None,
+            Gst.PadProbeType.BLOCK | Gst.PadProbeType.BUFFER,
+            _on_first_buffer_ready, None,
         )
 
         print("  Remote DJ: decode chain wired; waiting for first buffer to link mixer")
