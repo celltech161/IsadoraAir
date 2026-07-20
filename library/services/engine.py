@@ -63,12 +63,12 @@ NOW_PLAYING_PATH = Path("/run/isadoraair/now_playing.json")
 DJ_DIAG_LOG = Path("/run/isadoraair/remote_dj_diag.log")
 # Raw S16LE stereo 44100 -- can be replayed via
 # `ffplay -f s16le -ar 44100 -ac 2 /run/isadoraair/remote_dj_first_1s.pcm`
-# or examined in Audacity by importing as raw. Dumps just the first ~1s
-# after link into master_mixer, which is where the "startup weirdness"
-# hypothesis (buffer-pool reuse leaking prior Opus payload bytes) would
-# show up as clear signal in the recording.
+# or examined in Audacity by importing as raw. Continuous session-length
+# dump of every buffer that reaches master_mixer via the DJ pad. Kept the
+# `_first_1s` name for backward compatibility of any monitoring/muscle
+# memory; it now covers the whole session, but a session is usually short
+# enough that the file stays modest (~10 MB/min at S16 stereo 44100).
 DJ_DUMP_PCM = Path("/run/isadoraair/remote_dj_first_1s.pcm")
-DJ_DUMP_BYTES = 44100 * 2 * 2  # 1 second at 44.1kHz S16 stereo
 
 
 def _dj_diag(session, msg):
@@ -225,12 +225,13 @@ class RemoteDJSession:
         # session_stop. None of it affects audio behavior -- pure
         # observation.
         self.diag_fh = None            # open file handle for the diag log
-        self.dump_fh = None            # open file handle for the first-1s PCM dump
-        self.dump_bytes_remaining = 0  # counts down as bytes get written
+        self.dump_fh = None            # open file handle for the PCM dump
+        self.dump_bytes_written = 0    # running total for progress logging
+        self.dump_last_marked_bytes = 0  # when we last emitted a progress line
         self.dj_level = None           # `level` element between opusdec and audioconvert
         self.dj_mixer_pad_src = None   # gate_conv src pad for probe cleanup
         self.caps_probe_id = 0         # pad probe id for the caps-event logger
-        self.dump_probe_id = 0         # pad probe id for the first-1s buffer dump
+        self.dump_probe_id = 0         # pad probe id for the PCM dump
 
 
 class Deck:
@@ -1944,7 +1945,6 @@ class PlaybackEngine:
             print(f"  Remote DJ: could not open diag log ({exc})")
         try:
             session.dump_fh = open(DJ_DUMP_PCM, "wb")
-            session.dump_bytes_remaining = DJ_DUMP_BYTES
         except OSError as exc:
             print(f"  Remote DJ: could not open PCM dump file ({exc})")
         try:
@@ -2398,50 +2398,25 @@ class PlaybackEngine:
             Gst.PadProbeType.EVENT_DOWNSTREAM, _caps_log_probe, None,
         )
 
-        # DIAGNOSTIC PROBE 2 -- first-1s raw-PCM dump. Captures the
-        # audio the master_mixer actually sees, as raw S16LE at
-        # 44.1kHz stereo. If the dump file contains obvious Opus
-        # header bytes or looks nothing like PCM at all, the buffer-
-        # pool-reuse hypothesis (garbage bytes leaking from a
-        # recycled buffer that previously held encoded data) is
-        # confirmed. Replay via:
+        # DIAGNOSTIC PROBE 2 -- continuous raw-PCM dump of what the
+        # master_mixer actually sees, S16LE 44.1kHz stereo. Installed
+        # on the MASTER_MIXER SINK PAD (not on gate_conv src) so we
+        # get every buffer that reaches the mixer without competing
+        # with the BLOCK_DOWNSTREAM first-buffer probe on the source
+        # side -- the previous placement dumped only ~100ms because
+        # the block-and-unblock cycle appeared to interfere with the
+        # source-pad BUFFER probe firing reliably afterward. Sink-pad
+        # observation is cleaner: the mixer's sink pad only exists
+        # AFTER _on_first_buffer_ready links it, so we install the
+        # probe there in one place, at the right time.
+        #
+        # Now runs for the WHOLE session, not first 1s -- catches the
+        # bug even if it fires mid-session after the DJ opens the
+        # gate. A typical session's PCM footprint is ~176 KB/s =
+        # ~10 MB/min, fine on tmpfs.
+        # Replay via:
         #   ffplay -f s16le -ar 44100 -ac 2 /run/isadoraair/remote_dj_first_1s.pcm
-        # or import in Audacity as raw S16LE stereo 44100. Probe
-        # removes itself once DJ_DUMP_BYTES have been written.
-        # DEFENSIVELY WRAPPED for the same reason as the caps probe above.
-        def _dump_probe(probed_pad, info, _u):
-            try:
-                s = self.remote_dj_session
-                if s is not session or s.dump_fh is None or s.dump_bytes_remaining <= 0:
-                    if s and s.dump_fh:
-                        try:
-                            s.dump_fh.close()
-                        except OSError:
-                            pass
-                        s.dump_fh = None
-                        _dj_diag(s, "first_1s_dump complete")
-                    return Gst.PadProbeReturn.REMOVE
-                buf = info.get_buffer()
-                if buf is not None:
-                    ok, mapinfo = buf.map(Gst.MapFlags.READ)
-                    if ok:
-                        try:
-                            s.dump_fh.write(bytes(mapinfo.data))
-                            s.dump_bytes_remaining -= mapinfo.size
-                        except OSError:
-                            pass
-                        finally:
-                            buf.unmap(mapinfo)
-            except Exception as exc:
-                try:
-                    _dj_diag(session, f"dump_probe DISABLED after exception: {exc!r}")
-                except Exception:
-                    pass
-                return Gst.PadProbeReturn.REMOVE
-            return Gst.PadProbeReturn.OK
-        session.dump_probe_id = gate_conv_src.add_probe(
-            Gst.PadProbeType.BUFFER, _dump_probe, None,
-        )
+        # or import in Audacity as raw S16LE stereo 44100.
 
         def _on_first_buffer_ready(probed_pad, info, _u):
           try:
@@ -2486,6 +2461,57 @@ class PlaybackEngine:
             probed_pad.link(s.master_mixer_pad)
             print("  Remote DJ: real mic audio linked to master_mixer")
             _dj_diag(s, f"linked to master_mixer (running_time={running_time if clock else 'no clock'}ns, first_pts={first_pts if clock else 'n/a'}ns)")
+
+            # Install the continuous PCM dump probe on the newly-created
+            # master_mixer sink pad. Everything that reaches the mixer
+            # via this pad gets written to DJ_DUMP_PCM. Defensively
+            # wrapped -- REMOVE on first exception to protect audio.
+            # Progress logged to diag every _DUMP_LOG_EVERY_BYTES so a
+            # post-mortem can correlate file offset with wall-clock time.
+            _DUMP_LOG_EVERY_BYTES = 44100 * 2 * 2  # ~1s of stereo S16
+            def _dump_probe(probed_pad2, info2, _u2):
+                try:
+                    s2 = self.remote_dj_session
+                    if s2 is not session or s2.dump_fh is None:
+                        return Gst.PadProbeReturn.REMOVE
+                    buf = info2.get_buffer()
+                    if buf is not None:
+                        ok, mapinfo = buf.map(Gst.MapFlags.READ)
+                        if ok:
+                            try:
+                                # Prefer mapinfo.size for the actual byte
+                                # count -- some PyGObject bindings return
+                                # a memoryview from mapinfo.data whose
+                                # len() doesn't match the true size, and
+                                # writing bytes(memoryview) can either
+                                # over-count or short-write. Sizing off
+                                # mapinfo.size + slicing is reliable.
+                                s2.dump_fh.write(bytes(mapinfo.data)[:mapinfo.size])
+                                s2.dump_bytes_written = getattr(s2, "dump_bytes_written", 0) + mapinfo.size
+                                # Periodic progress line
+                                last_marked = getattr(s2, "dump_last_marked_bytes", 0)
+                                if s2.dump_bytes_written - last_marked >= _DUMP_LOG_EVERY_BYTES:
+                                    _dj_diag(s2, f"dump_progress bytes={s2.dump_bytes_written} (~{s2.dump_bytes_written/176400:.2f}s of audio)")
+                                    s2.dump_last_marked_bytes = s2.dump_bytes_written
+                            except OSError:
+                                pass
+                            finally:
+                                buf.unmap(mapinfo)
+                except Exception as exc:
+                    try:
+                        _dj_diag(session, f"dump_probe DISABLED after exception: {exc!r}")
+                    except Exception:
+                        pass
+                    return Gst.PadProbeReturn.REMOVE
+                return Gst.PadProbeReturn.OK
+            try:
+                s.dump_probe_id = s.master_mixer_pad.add_probe(
+                    Gst.PadProbeType.BUFFER, _dump_probe, None,
+                )
+                _dj_diag(s, "dump probe installed on master_mixer sink pad")
+            except Exception as exc:
+                _dj_diag(s, f"dump probe INSTALL FAILED: {exc!r}")
+
             return Gst.PadProbeReturn.REMOVE
           except Exception as exc:
             try:
