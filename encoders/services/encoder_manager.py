@@ -55,7 +55,16 @@ from encoders.models import Encoder  # noqa: E402
 # Paired with the StereoTool HD Output ALSA loopback bridge (second,
 # independent Loopback card added alongside the existing Studio Monitor
 # <-> StereoTool one — see PROJECT_NOTES.md for the exact card layout).
-DEFAULT_INPUT_DEVICE = "plughw:3,1"
+# `airtap` is the dsnoop-backed ALSA alias defined in /etc/asound.conf --
+# post-StereoTool loopback (hw:Loopback_1,1,0), locked to subdevice 0
+# (the one that actually has audio, since StereoTool writes only to
+# playback sub-0). Using the alias lets a second reader (aircheck's
+# ffmpeg) share the same capture stream via POSIX shm without landing
+# on an unpaired silent subdevice -- the "aircheck file was completely
+# silent" bug caught live 2026-07-19 after the aircheck MVP shipped.
+# Fallback for a bare plughw is still safe if an admin overrides
+# Encoder.input_device explicitly, but the default now uses the alias.
+DEFAULT_INPUT_DEVICE = "airtap"
 
 HEALTH_CHECK_SECONDS = 5
 RESTART_DELAY_SECONDS = 10

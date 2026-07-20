@@ -46,12 +46,15 @@ class AircheckConfig(models.Model):
                    "format's default (64k for HE-AAC, 320k for MP3).",
     )
     source_device = models.CharField(
-        max_length=64, default="plughw:3,1",
+        max_length=64, default="airtap",
         help_text="ALSA device the ffmpeg -i argument reads from. "
-                   "Default 'plughw:3,1' = post-StereoTool loopback "
-                   "(same source the encoders read). Change to a "
-                   "dsnoop alias if simultaneous encoder+aircheck "
-                   "reads collide.",
+                   "Default 'airtap' = dsnoop alias defined in "
+                   "/etc/asound.conf that locks to the post-StereoTool "
+                   "loopback (hw:Loopback_1,1,0) and lets encoders + "
+                   "aircheck share one capture stream. Change to "
+                   "plughw:3,1 only for diagnostics -- a bare hw open "
+                   "collides with encoders and lands on a silent "
+                   "unpaired subdevice.",
     )
     output_directory = models.CharField(
         max_length=255, default="/srv/isadoraair/aircheck",
