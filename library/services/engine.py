@@ -594,7 +594,19 @@ class PlaybackEngine:
         Errors from DJ elements land here too via message::error, but
         only get logged (not acted on) -- treating them as fatal would
         risk terminating the pipeline for what might be a benign
-        transient."""
+        transient.
+
+        Whole body wrapped in try/except -- this runs on the GLib main
+        loop and an unhandled exception here would kill the pipeline's
+        entire event dispatch. Same rule as pad probes: diagnostic
+        code must never take audio off-air."""
+        try:
+            return self._on_dj_bus_msg_inner(bus, message)
+        except Exception as exc:
+            print(f"  _on_dj_bus_msg suppressed exception: {exc!r}")
+            return True
+
+    def _on_dj_bus_msg_inner(self, bus, message):
         session = self.remote_dj_session
         if session is None or session.diag_fh is None:
             return True
@@ -2353,14 +2365,34 @@ class PlaybackEngine:
         # log will show it with the exact old->new caps -- diagnostic
         # for the "sample-format mismatch caused garbage buffer to be
         # interpreted as PCM" hypothesis.
+        #
+        # DEFENSIVELY WRAPPED: a pad-probe callback on a hot audio
+        # pad that throws will disrupt event propagation and can
+        # cascade into a not-negotiated state elsewhere in the
+        # pipeline. Learned the hard way 2026-07-20 10:15 when the
+        # initial version of this probe used the wrong parse_caps()
+        # unpack shape for this PyGObject version and killed on-air
+        # audio, requiring an engine restart. NO diagnostic probe is
+        # ever worth taking audio off-air; catch everything, log a
+        # note, and return OK.
         def _caps_log_probe(probed_pad, info, _u):
-            s = self.remote_dj_session
-            if s is not session:
+            try:
+                s = self.remote_dj_session
+                if s is not session:
+                    return Gst.PadProbeReturn.REMOVE
+                evt = info.get_event()
+                if evt is not None and evt.type == Gst.EventType.CAPS:
+                    caps = evt.parse_caps()  # returns Caps directly, NOT a tuple
+                    caps_str = caps.to_string() if caps is not None else "(none)"
+                    _dj_diag(s, f"gate_conv_src caps={caps_str}")
+            except Exception as exc:
+                # Log-once and disable this probe -- broken diagnostic
+                # is strictly worse than none.
+                try:
+                    _dj_diag(session, f"caps_log_probe DISABLED after exception: {exc!r}")
+                except Exception:
+                    pass
                 return Gst.PadProbeReturn.REMOVE
-            evt = info.get_event()
-            if evt is not None and evt.type == Gst.EventType.CAPS:
-                _, caps = evt.parse_caps()
-                _dj_diag(s, f"gate_conv_src caps={caps.to_string()}")
             return Gst.PadProbeReturn.OK
         session.caps_probe_id = gate_conv_src.add_probe(
             Gst.PadProbeType.EVENT_DOWNSTREAM, _caps_log_probe, None,
@@ -2376,34 +2408,43 @@ class PlaybackEngine:
         #   ffplay -f s16le -ar 44100 -ac 2 /run/isadoraair/remote_dj_first_1s.pcm
         # or import in Audacity as raw S16LE stereo 44100. Probe
         # removes itself once DJ_DUMP_BYTES have been written.
+        # DEFENSIVELY WRAPPED for the same reason as the caps probe above.
         def _dump_probe(probed_pad, info, _u):
-            s = self.remote_dj_session
-            if s is not session or s.dump_fh is None or s.dump_bytes_remaining <= 0:
-                if s and s.dump_fh:
-                    try:
-                        s.dump_fh.close()
-                    except OSError:
-                        pass
-                    s.dump_fh = None
-                    _dj_diag(s, "first_1s_dump complete")
+            try:
+                s = self.remote_dj_session
+                if s is not session or s.dump_fh is None or s.dump_bytes_remaining <= 0:
+                    if s and s.dump_fh:
+                        try:
+                            s.dump_fh.close()
+                        except OSError:
+                            pass
+                        s.dump_fh = None
+                        _dj_diag(s, "first_1s_dump complete")
+                    return Gst.PadProbeReturn.REMOVE
+                buf = info.get_buffer()
+                if buf is not None:
+                    ok, mapinfo = buf.map(Gst.MapFlags.READ)
+                    if ok:
+                        try:
+                            s.dump_fh.write(bytes(mapinfo.data))
+                            s.dump_bytes_remaining -= mapinfo.size
+                        except OSError:
+                            pass
+                        finally:
+                            buf.unmap(mapinfo)
+            except Exception as exc:
+                try:
+                    _dj_diag(session, f"dump_probe DISABLED after exception: {exc!r}")
+                except Exception:
+                    pass
                 return Gst.PadProbeReturn.REMOVE
-            buf = info.get_buffer()
-            if buf is not None:
-                ok, mapinfo = buf.map(Gst.MapFlags.READ)
-                if ok:
-                    try:
-                        s.dump_fh.write(bytes(mapinfo.data))
-                        s.dump_bytes_remaining -= mapinfo.size
-                    except OSError:
-                        pass
-                    finally:
-                        buf.unmap(mapinfo)
             return Gst.PadProbeReturn.OK
         session.dump_probe_id = gate_conv_src.add_probe(
             Gst.PadProbeType.BUFFER, _dump_probe, None,
         )
 
         def _on_first_buffer_ready(probed_pad, info, _u):
+          try:
             s = self.remote_dj_session
             if s is not session or s.master_mixer_pad is not None:
                 # Session was already stopped or the pad was linked in a
@@ -2445,6 +2486,13 @@ class PlaybackEngine:
             probed_pad.link(s.master_mixer_pad)
             print("  Remote DJ: real mic audio linked to master_mixer")
             _dj_diag(s, f"linked to master_mixer (running_time={running_time if clock else 'no clock'}ns, first_pts={first_pts if clock else 'n/a'}ns)")
+            return Gst.PadProbeReturn.REMOVE
+          except Exception as exc:
+            try:
+                _dj_diag(session, f"first_buffer_ready EXCEPTION (removing probe to unblock): {exc!r}")
+            except Exception:
+                pass
+            print(f"  Remote DJ first-buffer probe exception (removing to unblock): {exc}")
             return Gst.PadProbeReturn.REMOVE
         gate_conv_src.add_probe(
             Gst.PadProbeType.BLOCK | Gst.PadProbeType.BUFFER,
