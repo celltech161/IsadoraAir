@@ -327,23 +327,26 @@
 
 <div id="monGroups"></div>
 
-<div class="mon-group">
-  <h2>Aircheck Recording</h2>
-  <div class="mon-cards">
-    <div class="mon-card" id="aircheckCard">
-      <div class="mon-card-top">
-        <span class="mon-card-name">Aircheck</span>
-        <span class="mon-pill" id="aircheckPill">idle</span>
-      </div>
-      <div class="mon-led-row">
-        <span class="mon-led" id="aircheckLed"></span>
-        <span class="mon-led-caption" id="aircheckCaption">Not recording</span>
-      </div>
-      <div class="mon-card-detail" id="aircheckDetail" style="min-height:1.2rem;"></div>
-      <div class="mon-uptime-row" style="margin-top:0.4rem;">
-        <span class="mon-uptime" id="aircheckSize"></span>
-        <button class="mon-restart-btn" id="aircheckBtn" onclick="toggleAircheck()">Start</button>
-      </div>
+<!-- Aircheck lives in a hidden host and gets spliced into the AUDIO
+     group's .mon-cards container by renderGroups(). Keeping the element
+     in the DOM (not string-serialized in JS) preserves its event
+     bindings and lets the aircheck poller update it in place regardless
+     of whether the audio_silence check has flipped the AUDIO group
+     into existence yet. -->
+<div id="aircheckCardHost" style="display:none;">
+  <div class="mon-card" id="aircheckCard">
+    <div class="mon-card-top">
+      <span class="mon-card-name">Aircheck</span>
+      <span class="mon-pill" id="aircheckPill">idle</span>
+    </div>
+    <div class="mon-led-row">
+      <span class="mon-led" id="aircheckLed"></span>
+      <span class="mon-led-caption" id="aircheckCaption">Not recording</span>
+    </div>
+    <div class="mon-card-detail" id="aircheckDetail" style="min-height:1.2rem;"></div>
+    <div class="mon-uptime-row" style="margin-top:0.4rem;">
+      <span class="mon-uptime" id="aircheckSize"></span>
+      <button class="mon-restart-btn" id="aircheckBtn" onclick="toggleAircheck()">Start</button>
     </div>
   </div>
 </div>
@@ -736,6 +739,27 @@ function renderGroups(checks) {
     });
     container.appendChild(section);
   });
+
+  // Splice the static Aircheck card into the AUDIO group's .mon-cards
+  // container so the operator sees the on-air monitor and the recorder
+  // side-by-side rather than in two stacked sections. If no AUDIO
+  // group rendered (no enabled audio_silence check), promote it into
+  // its own Audio section rather than leaving it orphaned in the
+  // hidden host.
+  const airCard = document.getElementById("aircheckCard");
+  if (airCard) {
+    const audioSection = [...container.querySelectorAll(".mon-group")]
+      .find(el => el.querySelector("h2")?.textContent === "Audio");
+    if (audioSection) {
+      audioSection.querySelector(".mon-cards").appendChild(airCard);
+    } else {
+      const section = document.createElement("div");
+      section.className = "mon-group";
+      section.innerHTML = `<h2>Audio</h2><div class="mon-cards"></div>`;
+      section.querySelector(".mon-cards").appendChild(airCard);
+      container.appendChild(section);
+    }
+  }
 }
 
 async function pollStatus() {
