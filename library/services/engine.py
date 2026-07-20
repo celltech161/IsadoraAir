@@ -56,6 +56,32 @@ STATE_PATH = Path("/run/isadoraair/engine_state.json")
 CMD_PATH = Path("/run/isadoraair/engine_cmd.json")
 NOW_PLAYING_PATH = Path("/run/isadoraair/now_playing.json")
 
+# Remote DJ diagnostic instrumentation -- see class RemoteDJSession's
+# docstring and _remote_dj_on_pad_added. Truncated + reopened on every
+# session start; left in place after session stop so a post-mortem
+# can inspect the last session's data if the user reports static.
+DJ_DIAG_LOG = Path("/run/isadoraair/remote_dj_diag.log")
+# Raw S16LE stereo 44100 -- can be replayed via
+# `ffplay -f s16le -ar 44100 -ac 2 /run/isadoraair/remote_dj_first_1s.pcm`
+# or examined in Audacity by importing as raw. Dumps just the first ~1s
+# after link into master_mixer, which is where the "startup weirdness"
+# hypothesis (buffer-pool reuse leaking prior Opus payload bytes) would
+# show up as clear signal in the recording.
+DJ_DUMP_PCM = Path("/run/isadoraair/remote_dj_first_1s.pcm")
+DJ_DUMP_BYTES = 44100 * 2 * 2  # 1 second at 44.1kHz S16 stereo
+
+
+def _dj_diag(session, msg):
+    """Timestamped append to the remote-DJ diagnostic log. No-op if the
+    session's diag file couldn't be opened (permissions / disk full)."""
+    if session is None or getattr(session, "diag_fh", None) is None:
+        return
+    try:
+        session.diag_fh.write(f"{time.time():.3f} {msg}\n")
+        session.diag_fh.flush()
+    except OSError:
+        pass
+
 # Pre-processor VU meter: values are updated by GStreamer's `level`
 # element sitting on the summed master output (post-mix, post-duck,
 # post-mic; PRE-AGC and PRE-StereoTool). Written to LEVELS_PATH at
@@ -192,6 +218,19 @@ class RemoteDJSession:
         # connection recovers without them touching anything. See
         # _remote_dj_on_connection_state.
         self.gate_desired = False
+        # Diagnostic instrumentation added 2026-07-20 to trap evidence
+        # of the still-unresolved "playing deck goes to static when a
+        # remote-DJ connects" bug. Everything below is per-session
+        # state that's opened/wired at session_start and cleaned up at
+        # session_stop. None of it affects audio behavior -- pure
+        # observation.
+        self.diag_fh = None            # open file handle for the diag log
+        self.dump_fh = None            # open file handle for the first-1s PCM dump
+        self.dump_bytes_remaining = 0  # counts down as bytes get written
+        self.dj_level = None           # `level` element between opusdec and audioconvert
+        self.dj_mixer_pad_src = None   # gate_conv src pad for probe cleanup
+        self.caps_probe_id = 0         # pad probe id for the caps-event logger
+        self.dump_probe_id = 0         # pad probe id for the first-1s buffer dump
 
 
 class Deck:
@@ -480,14 +519,28 @@ class PlaybackEngine:
         return [mic_bin]
 
     def _on_element_message(self, bus, message):
-        """Element messages from the shared main-pipeline bus. Today only
-        `output_level` is watched here (see LEVELS_PATH docstring);
-        anything else is ignored so this stays cheap and can't accidentally
-        misinterpret a message from a different element that happens to
-        share a structure name."""
+        """Element messages from the shared main-pipeline bus. Handles
+        BOTH the master output_level (dashboard VU meter) AND the
+        remote-DJ session's dj_level (post-opusdec level meter, whose
+        readings are appended to DJ_DIAG_LOG for the remote-DJ static
+        post-mortem). All other element messages are ignored so this
+        stays cheap."""
         structure = message.get_structure()
         if structure is None or structure.get_name() != "level":
             return True
+
+        # Remote-DJ level meter -- log to diag file. Cheap, ~10Hz.
+        session = self.remote_dj_session
+        if session is not None and message.src is session.dj_level:
+            try:
+                peak = list(structure.get_value("peak")) or []
+                rms = list(structure.get_value("rms")) or []
+                _dj_diag(session,
+                          f"dj_level peak={['%.1f' % p for p in peak]} rms={['%.1f' % r for r in rms]}")
+            except Exception:
+                pass
+            return True
+
         if message.src is not self.output_level:
             return True
         # rms/peak/decay each come out as a per-channel list of dBFS
@@ -529,6 +582,50 @@ class PlaybackEngine:
             if obj == self._mic_bin:
                 return self._on_mic_error(bus, message)
             obj = obj.get_parent()
+        return True
+
+    def _on_dj_bus_msg(self, bus, message):
+        """Bus WARNING and INFO messages routed to the remote-DJ diag
+        log so a post-mortem can see what GStreamer was complaining
+        about at the moment of a suspect static event. Filtered to
+        messages whose src is anywhere under the current DJ session's
+        webrtcbin or the DJ session's own decode-chain elements --
+        so we don't spam the diag log with unrelated pipeline chatter.
+        Errors from DJ elements land here too via message::error, but
+        only get logged (not acted on) -- treating them as fatal would
+        risk terminating the pipeline for what might be a benign
+        transient."""
+        session = self.remote_dj_session
+        if session is None or session.diag_fh is None:
+            return True
+        # Walk up the parent chain from message.src looking for a match
+        # against our known DJ elements OR the webrtcbin. This catches
+        # WARN/INFO from webrtcbin's internal children too (rtpbin,
+        # jitterbuffer, dtls, etc.), which is exactly what we want for
+        # a WebRTC-adjacent post-mortem.
+        obj = message.src
+        matched = False
+        while obj is not None:
+            if obj is session.webrtc or obj in session.elements:
+                matched = True
+                break
+            try:
+                obj = obj.get_parent()
+            except Exception:
+                break
+        if not matched:
+            return True
+
+        mtype = message.type
+        if mtype == Gst.MessageType.WARNING:
+            err, debug = message.parse_warning()
+            _dj_diag(session, f"WARN from {message.src.get_name()}: {err} | {debug}")
+        elif mtype == Gst.MessageType.INFO:
+            err, debug = message.parse_info()
+            _dj_diag(session, f"INFO from {message.src.get_name()}: {err} | {debug}")
+        elif mtype == Gst.MessageType.ERROR:
+            err, debug = message.parse_error()
+            _dj_diag(session, f"ERROR from {message.src.get_name()}: {err} | {debug}")
         return True
 
     def _on_mic_error(self, bus, message):
@@ -730,6 +827,16 @@ class PlaybackEngine:
         bus.connect("message::element", self._on_element_message)
         if mic_elements:
             bus.connect("message::error", self._on_main_bus_error)
+        # Remote-DJ diagnostic bus watchers -- see _on_dj_bus_msg. These
+        # route WARN/INFO/ERROR messages originating from a currently-
+        # active remote-DJ session's elements (webrtcbin included) to
+        # DJ_DIAG_LOG for the still-unresolved static-on-deck bug's
+        # post-mortem. Wired once here at pipeline build time; the
+        # handler itself no-ops when no session is active, so this is
+        # zero overhead when the remote DJ isn't in use.
+        bus.connect("message::warning", self._on_dj_bus_msg)
+        bus.connect("message::info", self._on_dj_bus_msg)
+        bus.connect("message::error", self._on_dj_bus_msg)
         elements += mic_elements
 
         # Remote DJ over WebRTC monitor-return tap -- a tee inserted
@@ -1812,6 +1919,22 @@ class PlaybackEngine:
         print("  Remote DJ: session starting")
         session = RemoteDJSession()
         self.remote_dj_session = session
+        # Open the two diagnostic sinks. Truncate on each session start
+        # so a post-mortem sees only THIS session's data (the previous
+        # session's log is only interesting up until this one begins).
+        # Both opens are best-effort -- if /run/isadoraair isn't
+        # writable we skip diag entirely and let the session proceed.
+        try:
+            DJ_DIAG_LOG.parent.mkdir(parents=True, exist_ok=True)
+            session.diag_fh = open(DJ_DIAG_LOG, "w")
+            _dj_diag(session, f"session_start")
+        except OSError as exc:
+            print(f"  Remote DJ: could not open diag log ({exc})")
+        try:
+            session.dump_fh = open(DJ_DUMP_PCM, "wb")
+            session.dump_bytes_remaining = DJ_DUMP_BYTES
+        except OSError as exc:
+            print(f"  Remote DJ: could not open PCM dump file ({exc})")
         try:
             self._remote_dj_build_session(session)
         except Exception as exc:
@@ -2144,6 +2267,20 @@ class PlaybackEngine:
 
         depay = Gst.ElementFactory.make("rtpopusdepay", None)
         dec = Gst.ElementFactory.make("opusdec", None)
+        # Diagnostic level meter inserted right after opusdec so we see
+        # what the Opus decoder is actually producing BEFORE any of
+        # our downstream chain (audioconvert, resample, capsfilter,
+        # queue, gain, gate) has a chance to influence it. Peak/RMS
+        # dBFS per channel are posted as bus messages every 100ms and
+        # logged to DJ_DIAG_LOG by _on_element_message. If a
+        # deck-static event coincides with normal voice-range readings
+        # here, the noise was generated downstream of opusdec (mixer
+        # or beyond); if the readings themselves go junk (clipped
+        # peaks, nonsense values), the fault is at or upstream of the
+        # decode. Cheap -- level is designed exactly for this.
+        session.dj_level = Gst.ElementFactory.make("level", None)
+        session.dj_level.set_property("interval", 100_000_000)  # 100ms
+        session.dj_level.set_property("post-messages", True)
         conv = Gst.ElementFactory.make("audioconvert", None)
         resample = Gst.ElementFactory.make("audioresample", None)
         capsfilter = Gst.ElementFactory.make("capsfilter", None)
@@ -2171,12 +2308,13 @@ class PlaybackEngine:
         session.remote_gate = Gst.ElementFactory.make("volume", None)
         session.remote_gate.set_property("volume", 0.0)  # closed -- opened via remote_dj_gate command
         gate_conv = Gst.ElementFactory.make("audioconvert", None)
-        for el in (depay, dec, conv, resample, capsfilter, queue,
+        for el in (depay, dec, session.dj_level, conv, resample, capsfilter, queue,
                    remote_gain, session.remote_gate, gate_conv):
             self.main_pipeline.add(el)
             session.elements.append(el)
         depay.link(dec)
-        dec.link(conv)
+        dec.link(session.dj_level)
+        session.dj_level.link(conv)
         conv.link(resample)
         resample.link(capsfilter)
         capsfilter.link(queue)
@@ -2185,9 +2323,11 @@ class PlaybackEngine:
         session.remote_gate.link(gate_conv)
         pad.link(depay.get_static_pad("sink"))
 
-        for el in (depay, dec, conv, resample, capsfilter, queue,
+        for el in (depay, dec, session.dj_level, conv, resample, capsfilter, queue,
                    remote_gain, session.remote_gate, gate_conv):
             el.sync_state_with_parent()
+
+        _dj_diag(session, "decode_chain_wired")
 
         # Master_mixer's sink pad is requested and linked ONLY when the
         # decode chain is ready to push its first buffer, not before.
@@ -2205,6 +2345,64 @@ class PlaybackEngine:
         # pad and link it in. The probe then removes itself so the
         # first buffer and everything after flows normally.
         gate_conv_src = gate_conv.get_static_pad("src")
+        session.dj_mixer_pad_src = gate_conv_src
+
+        # DIAGNOSTIC PROBE 1 -- caps events. Every caps event on this
+        # pad gets timestamped and dumped to DJ_DIAG_LOG. If a caps
+        # renegotiation fires during the audible-static window, the
+        # log will show it with the exact old->new caps -- diagnostic
+        # for the "sample-format mismatch caused garbage buffer to be
+        # interpreted as PCM" hypothesis.
+        def _caps_log_probe(probed_pad, info, _u):
+            s = self.remote_dj_session
+            if s is not session:
+                return Gst.PadProbeReturn.REMOVE
+            evt = info.get_event()
+            if evt is not None and evt.type == Gst.EventType.CAPS:
+                _, caps = evt.parse_caps()
+                _dj_diag(s, f"gate_conv_src caps={caps.to_string()}")
+            return Gst.PadProbeReturn.OK
+        session.caps_probe_id = gate_conv_src.add_probe(
+            Gst.PadProbeType.EVENT_DOWNSTREAM, _caps_log_probe, None,
+        )
+
+        # DIAGNOSTIC PROBE 2 -- first-1s raw-PCM dump. Captures the
+        # audio the master_mixer actually sees, as raw S16LE at
+        # 44.1kHz stereo. If the dump file contains obvious Opus
+        # header bytes or looks nothing like PCM at all, the buffer-
+        # pool-reuse hypothesis (garbage bytes leaking from a
+        # recycled buffer that previously held encoded data) is
+        # confirmed. Replay via:
+        #   ffplay -f s16le -ar 44100 -ac 2 /run/isadoraair/remote_dj_first_1s.pcm
+        # or import in Audacity as raw S16LE stereo 44100. Probe
+        # removes itself once DJ_DUMP_BYTES have been written.
+        def _dump_probe(probed_pad, info, _u):
+            s = self.remote_dj_session
+            if s is not session or s.dump_fh is None or s.dump_bytes_remaining <= 0:
+                if s and s.dump_fh:
+                    try:
+                        s.dump_fh.close()
+                    except OSError:
+                        pass
+                    s.dump_fh = None
+                    _dj_diag(s, "first_1s_dump complete")
+                return Gst.PadProbeReturn.REMOVE
+            buf = info.get_buffer()
+            if buf is not None:
+                ok, mapinfo = buf.map(Gst.MapFlags.READ)
+                if ok:
+                    try:
+                        s.dump_fh.write(bytes(mapinfo.data))
+                        s.dump_bytes_remaining -= mapinfo.size
+                    except OSError:
+                        pass
+                    finally:
+                        buf.unmap(mapinfo)
+            return Gst.PadProbeReturn.OK
+        session.dump_probe_id = gate_conv_src.add_probe(
+            Gst.PadProbeType.BUFFER, _dump_probe, None,
+        )
+
         def _on_first_buffer_ready(probed_pad, info, _u):
             s = self.remote_dj_session
             if s is not session or s.master_mixer_pad is not None:
@@ -2246,6 +2444,7 @@ class PlaybackEngine:
             s.master_mixer_pad = self.master_mixer.request_pad_simple("sink_%u")
             probed_pad.link(s.master_mixer_pad)
             print("  Remote DJ: real mic audio linked to master_mixer")
+            _dj_diag(s, f"linked to master_mixer (running_time={running_time if clock else 'no clock'}ns, first_pts={first_pts if clock else 'n/a'}ns)")
             return Gst.PadProbeReturn.REMOVE
         gate_conv_src.add_probe(
             Gst.PadProbeType.BLOCK | Gst.PadProbeType.BUFFER,
@@ -2262,6 +2461,7 @@ class PlaybackEngine:
         state = element.props.connection_state
         nick = state.value_nick
         print(f"  Remote DJ connection state: {nick}")
+        _dj_diag(session, f"webrtc connection_state -> {nick}")
         # Breadcrumb on every state edge -- rare per-session, cheap to
         # emit, invaluable the next time a WebRTC-adjacent bug turns up
         # in the wild and we need to reconstruct the sequence.
@@ -2385,6 +2585,23 @@ class PlaybackEngine:
 
         if self._remote_dj_server:
             self._remote_dj_server.disconnect_threadsafe()
+
+        # Close diagnostic sinks -- files stay on disk (not truncated
+        # here) so a user reporting "static during that last session"
+        # has something to inspect. Next session start truncates them.
+        _dj_diag(session, "session_stop")
+        if session.diag_fh is not None:
+            try:
+                session.diag_fh.close()
+            except OSError:
+                pass
+            session.diag_fh = None
+        if session.dump_fh is not None:
+            try:
+                session.dump_fh.close()
+            except OSError:
+                pass
+            session.dump_fh = None
 
         print("  Remote DJ: session stopped")
         return False
