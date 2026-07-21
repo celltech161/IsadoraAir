@@ -1,0 +1,101 @@
+find_category_drift
+===================
+
+What it does
+------------
+Scans every Track and checks whether the file on disk actually lives
+in the folder that matches its current primary category. If not (=
+"drift"), reports it -- and, with --apply, moves the file into the
+right folder and updates Track.filepath so the DB stays in sync.
+
+Convention: files are stored at LIBRARY_ROOT/<Category.code>/<basename>
+(same rule sync_track_file.py enforces on ingest). LIBRARY_ROOT is
+"/srv/isadoraair/music" unless overridden in settings.
+
+
+When to run it
+--------------
+Whenever you've been reassigning primary categories in admin over
+some period of time and want the on-disk layout to catch up. There's
+no runtime penalty from letting drift accumulate -- the log builder
+looks up files by DB filepath, not by folder -- but a tidy layout is
+easier to browse and back up.
+
+
+How to use it
+-------------
+Dry-run (default -- read-only, reports drifts, nothing changes):
+
+    cd /home/jreed/isadoraair-django
+    venv/bin/python manage.py find_category_drift
+
+Actually move files + update DB:
+
+    venv/bin/python manage.py find_category_drift --apply
+
+Restrict to one category (safer to try live on a small category first):
+
+    venv/bin/python manage.py find_category_drift --only-category "Local Legends"
+    venv/bin/python manage.py find_category_drift --apply --only-category "Local Legends"
+
+Emit a per-track line for every track scanned, not just drifted ones
+(useful for a very small --only-category, noisy for a full scan):
+
+    venv/bin/python manage.py find_category_drift --verbose
+
+
+What it will NOT do
+-------------------
+- Overwrite an existing file at the destination. A destination
+  collision is reported ("[COLL]") and skipped. Nothing is moved for
+  that track. Rename the offender by hand and re-run.
+- Move a track that has no primary category set (Track.category is
+  NULL). Assign one first, then re-run.
+- Move a file that doesn't exist on disk. Reported and skipped.
+- Auto-remove empty folders left behind after a big sweep. Use
+  `find /srv/isadoraair/music -maxdepth 1 -type d -empty` to list
+  and manually rmdir if wanted.
+
+
+Safety
+------
+- Dry-run is the default. --apply is required to touch anything.
+- Per-track atomicity: each track's move + DB save is one unit. A
+  filesystem error on track #47 doesn't roll back the 46 that
+  succeeded before it -- partial progress is preferable to
+  all-or-nothing on a big sweep.
+- If a filesystem move succeeds but the following DB save fails, the
+  command best-effort reverts the filesystem move so disk and DB
+  stay consistent. If BOTH the save AND the revert fail, the drift
+  scan prints "DB has old=..., disk has new=..." so the operator
+  can reconcile by hand.
+- Safe to run while the engine is on-air. Linux keeps an already-
+  open file inode alive across renames (ext4), and future engine
+  queries resolve filepath fresh from the DB. A quiet-hour
+  maintenance window is still good practice for a large sweep.
+
+
+Reading the output
+------------------
+    Category drift scan (root=/srv/isadoraair/music)
+      Scanned tracks: 29483
+      Drift found: 87
+      Missing files (skipped): 0
+      No primary category (skipped): 1
+      Filepath outside LIBRARY_ROOT (skipped): 0
+
+    Drift detail:
+      [MOVE] 'EDM'                    -> "10's Rock"       — Ripped Knees.m4a
+      [MOVE] 'Blues'                  -> 'Old Blues'       — Robert Johnson - Malted Milk.flac
+      ...
+      [COLL] 'Blues'                  -> 'Old Blues'       — Ambiguous.mp3
+
+    87 moveable, 0 collisions (destination already exists -- always skipped).
+
+    Dry-run. Re-run with --apply to perform 87 moves.
+
+[MOVE] = will be (or was) moved. [COLL] = skipped because destination
+exists; needs a manual rename to unblock.
+
+
+First run: 2026-07-20 (found + moved 87 drifts, 0 errors).
