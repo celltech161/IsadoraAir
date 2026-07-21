@@ -253,16 +253,25 @@ def _aircheck_format_block(cfg):
     br = cfg.effective_bitrate() or "64k"
     br_k = int(str(br).lower().rstrip("k")) if str(br).lower().endswith("k") else int(br) // 1000
     if fmt == "he_aac":
-        # KNOWN LIMITATION (P1 aircheck-in-liquidsoap): fdkaac's -f 5 (m4a
-        # container) needs a seekable file to write the moov atom on
-        # close, but %external pipes stdout, which isn't seekable --
-        # fdkaac exits immediately with code 2. -f 2 (ADTS framing) is
-        # streamable but yields raw .aac bytes, not .m4a. Until we wire
-        # a proper fdkaac-then-remux path (or teach the aircheck output
-        # to own a temp-file-then-move dance for muxed formats), fall
-        # back to MP3 64k for aircheck. The Encoder streaming path is
-        # unaffected -- it uses -f 2 ADTS deliberately for streaming.
-        return "%mp3(bitrate=64)"
+        # fdkaac -f 2 emits ADTS-framed AAC to stdout (streamable), not
+        # -f 5 m4a (which requires seekable output to backfill the moov
+        # atom on close and thus can't be piped via %external). The
+        # aircheck recorder's stop path finalizes he_aac sessions with
+        # `ffmpeg -c copy adts.aac -> session.m4a` -- a container swap,
+        # no re-encode. Profile tiers match the streaming Encoder path:
+        # -p 29 = HE-AACv2 up through 64k, -p 5 = HE-AACv1 at 80-96k,
+        # -p 2 = LC at 128k+. -a 1 = afterburner on for extra quality.
+        if br_k <= 64:
+            profile = 29
+        elif br_k <= 96:
+            profile = 5
+        else:
+            profile = 2
+        cmd = (
+            "/usr/local/bin/fdkaac -R --raw-channels 2 --raw-rate 44100 "
+            f"--raw-format S16L -p {profile} -b {br_k * 1000} -f 2 -a 1 -S -o - -"
+        )
+        return f"%external(process={_liq_string(cmd)}, header=false)"
     if fmt == "mp3":
         if br_k >= 192:
             return f"%mp3(bitrate={br_k})"

@@ -23,9 +23,12 @@ with old rows but is always None on new sessions.
 """
 import shutil
 import socket
+import subprocess
+import threading
 from datetime import datetime
 from pathlib import Path
 
+from django.db import close_old_connections
 from django.utils import timezone
 
 from aircheck.models import AircheckConfig, AircheckSession
@@ -35,6 +38,10 @@ from encoders.services.encoder_manager import (
     AIRCHECK_TELNET_HOST,
     AIRCHECK_TELNET_PORT,
 )
+
+
+REMUX_PENDING_NOTE = "remux in progress"
+REMUX_INTERMEDIATE_DIR = Path("/run/isadoraair")
 
 
 TELNET_TIMEOUT_SECONDS = 3.0
@@ -194,8 +201,22 @@ def start_recording():
 def stop_recording():
     """Stop the currently-running session, if any. Returns
     (session, error). Triggers a fresh reopen so the working file
-    gets closed cleanly, then moves the just-closed file to the
-    session's destination path."""
+    gets closed cleanly, then finalizes the just-closed file to the
+    session's destination.
+
+    Finalization branches on format:
+      - mp3/flac/wav: synchronous shutil.move from tmpfs to disk.
+        Blocks for the duration of the copy (~1s per hundred MB on
+        a spinning disk).
+      - he_aac: fdkaac has been writing ADTS-framed AAC to the
+        working file, which is streamable but not the .m4a container
+        the session's dest expects. Move the ADTS working file to a
+        session-tagged intermediate name in /run (near-instant on
+        tmpfs), mark the session as ended with a "remux pending"
+        note, and hand off to a daemon thread that ffmpeg-remuxes
+        (ADTS -> m4a, `-c copy`, no re-encode) and updates the row
+        on completion. Stop returns to the caller within a few ms
+        rather than waiting seconds for the remux."""
     session = AircheckSession.objects.filter(still_running=True).order_by("-started_at").first()
     if session is None:
         return None, "no active session"
@@ -204,17 +225,28 @@ def stop_recording():
     try:
         _send_telnet(f"{AIRCHECK_OUTPUT_ID}.reopen")
     except TelnetError as exc:
-        # Working file may still be flushed on close by whatever's left
-        # of liquidsoap; we can still attempt the move below.
+        # Working file may still be flushed on close by whatever's
+        # left of liquidsoap; we can still attempt the finalization
+        # below.
         telnet_note = f"telnet reopen failed at Stop: {exc}; "
 
-    # After reopen, liquidsoap has closed AIRCHECK_CURRENT_PATH and
-    # begun a fresh file at the same path. Move the just-closed file
-    # to the session's declared destination. Use shutil.move (which
-    # falls back to copy+unlink across filesystems) since /run is
-    # tmpfs and the destination is typically on a spinning disk.
     working = Path(AIRCHECK_CURRENT_PATH)
     dest = Path(session.filename)
+    session.still_running = False
+    session.ended_at = timezone.now()
+
+    if session.audio_format == "he_aac":
+        _finalize_he_aac_async(session, working, dest, telnet_note)
+    else:
+        _finalize_direct_move(session, working, dest, telnet_note)
+
+    return session, None
+
+
+def _finalize_direct_move(session, working, dest, telnet_note):
+    """Move the working file straight to dest -- correct for
+    mp3/flac/wav where the container is already what we want. Blocks
+    on the copy (few hundred MB/s from tmpfs to disk)."""
     move_note = ""
     if working.is_file():
         try:
@@ -224,9 +256,6 @@ def stop_recording():
             move_note = f"move {working} -> {dest} failed: {exc}"
     else:
         move_note = f"working file {working} was missing at Stop -- no audio to move"
-
-    session.still_running = False
-    session.ended_at = timezone.now()
     if dest.is_file():
         try:
             session.size_bytes = dest.stat().st_size
@@ -234,4 +263,107 @@ def stop_recording():
             pass
     session.exit_note = (telnet_note + move_note).strip("; ") or ""
     session.save()
-    return session, None
+
+
+def _finalize_he_aac_async(session, working, dest, telnet_note):
+    """Move the working ADTS to a session-tagged intermediate name so a
+    subsequent Start's reopen doesn't clobber it, mark the row as
+    "remux pending," and hand off to a daemon thread that runs
+    `ffmpeg -c copy` to swap ADTS -> m4a container. Stop returns
+    immediately; the row's size_bytes and cleared exit_note fill in
+    when the thread completes."""
+    if not working.is_file():
+        session.exit_note = (telnet_note + f"working file {working} was missing at Stop -- no audio to remux").strip("; ")
+        session.save()
+        return
+
+    # Intermediate lives on the same tmpfs so this rename is atomic
+    # and near-instant, no matter how large the ADTS file is.
+    intermediate = REMUX_INTERMEDIATE_DIR / f"aircheck-remux-{session.id}.aac"
+    try:
+        working.rename(intermediate)
+    except OSError as exc:
+        session.exit_note = (telnet_note + f"could not stage intermediate: {exc}").strip("; ")
+        session.save()
+        return
+
+    session.exit_note = (telnet_note + REMUX_PENDING_NOTE).strip("; ")
+    session.save()
+
+    t = threading.Thread(
+        target=_remux_worker,
+        args=(session.id, str(intermediate), str(dest), telnet_note),
+        daemon=True,
+        name=f"aircheck-remux-{session.id}",
+    )
+    t.start()
+
+
+def _remux_worker(session_id, intermediate_path, dest_path, telnet_note):
+    """Runs in a daemon thread: ffmpeg-remuxes ADTS -> m4a with -c copy,
+    unlinks the intermediate on success, and updates the AircheckSession
+    row via a fresh DB connection. Failures preserve the intermediate
+    on-disk for manual recovery (an ADTS .aac file is playable directly
+    -- an operator can rename or manually remux) and record the ffmpeg
+    error in exit_note.
+
+    close_old_connections at both ends because Django's per-thread DB
+    connection cache would otherwise reuse a possibly-stale gunicorn-
+    worker connection or leak this thread's connection at exit."""
+    close_old_connections()
+    intermediate = Path(intermediate_path)
+    dest = Path(dest_path)
+    try:
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            result = subprocess.run(
+                [
+                    "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
+                    "-i", str(intermediate),
+                    "-c", "copy",
+                    str(dest),
+                ],
+                capture_output=True, text=True, timeout=600, check=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            _mark_remux_failed(session_id, telnet_note, f"ffmpeg exit {exc.returncode}: {(exc.stderr or '').strip()[:300]}")
+            return
+        except subprocess.TimeoutExpired:
+            _mark_remux_failed(session_id, telnet_note, "ffmpeg timed out after 600s")
+            return
+        except (OSError, FileNotFoundError) as exc:
+            _mark_remux_failed(session_id, telnet_note, f"ffmpeg spawn failed: {exc}")
+            return
+
+        # Success: unlink intermediate, stat dest, clear the pending
+        # note. Losing the intermediate now is safe -- the dest is a
+        # complete m4a.
+        try:
+            intermediate.unlink()
+        except OSError:
+            pass
+        try:
+            size = dest.stat().st_size if dest.is_file() else None
+        except OSError:
+            size = None
+        try:
+            s = AircheckSession.objects.get(id=session_id)
+            s.size_bytes = size
+            s.exit_note = telnet_note.strip("; ") or ""
+            s.save(update_fields=["size_bytes", "exit_note"])
+        except AircheckSession.DoesNotExist:
+            pass
+    finally:
+        close_old_connections()
+
+
+def _mark_remux_failed(session_id, telnet_note, err):
+    """Record an ffmpeg-side failure on the session row without touching
+    the intermediate on disk -- the ADTS file stays put for manual
+    recovery."""
+    try:
+        s = AircheckSession.objects.get(id=session_id)
+        s.exit_note = (telnet_note + f"remux failed: {err}").strip("; ")
+        s.save(update_fields=["exit_note"])
+    except AircheckSession.DoesNotExist:
+        pass
