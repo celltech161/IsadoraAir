@@ -1,142 +1,161 @@
-"""Aircheck recorder -- spawn/kill ffmpeg for on-demand recording.
+"""Aircheck recorder -- telnet client to the liquidsoap-hosted
+output.file (see encoders/services/encoder_manager.py's
+_aircheck_block).
 
-Design: Django API views call start_recording() / stop_recording() /
-current_session() directly; there's no separate daemon. ffmpeg runs as
-a detached subprocess (start_new_session=True) so a gunicorn worker
-restart while a recording is in progress does not kill the recording.
-The AircheckSession row is the authoritative record of what's running;
-the ffmpeg_pid on the row is how a subsequent worker (or a different
-worker in the same restart) locates the running process.
+Design shift from the original ffmpeg-per-session subprocess model:
+liquidsoap owns a single always-running output.file that consumes the
+same in-process source the icecast/shoutcast outputs do. This module
+just tells liquidsoap to cut a fresh working file (via
+`aircheck.reopen` over telnet), and moves that working file to the
+session's real destination on Stop. No subprocess ownership; no
+dsnoop contention with the encoders.
 
-Format choices map to ffmpeg encoder args here. HE-AAC uses libfdk_aac
-(the fdkaac binary the encoders' liquidsoap also depends on -- see
-encoders/services/encoder_manager.py). MP3 uses libmp3lame. FLAC/WAV
-skip bitrate entirely.
+Fixed-path-then-move (rather than a runtime-controlled getter): tried
+the getter approach live -- output.file's .reopen() does not
+re-invoke its filename getter on this liquidsoap version; writes stop
+entirely after the first reopen. The working-file approach sidesteps
+that whole class of issue -- liquidsoap always writes to one path,
+and this module is responsible for shuffling files into their final
+homes.
+
+ffmpeg_pid is preserved on AircheckSession for backward compatibility
+with old rows but is always None on new sessions.
 """
-import os
-import signal
-import subprocess
+import shutil
+import socket
 from datetime import datetime
 from pathlib import Path
 
 from django.utils import timezone
 
 from aircheck.models import AircheckConfig, AircheckSession
+from encoders.services.encoder_manager import (
+    AIRCHECK_CURRENT_PATH,
+    AIRCHECK_OUTPUT_ID,
+    AIRCHECK_TELNET_HOST,
+    AIRCHECK_TELNET_PORT,
+)
 
 
-def _process_alive(pid):
-    if not pid:
-        return False
+TELNET_TIMEOUT_SECONDS = 3.0
+# Liquidsoap's telnet server terminates every response with CRLF -- the
+# marker really is "END\r\n", not "END\n". Missing the \r locks the
+# reader in recv() until it hits the socket timeout.
+TELNET_TERMINATOR = b"END\r\n"
+
+
+class TelnetError(RuntimeError):
+    pass
+
+
+def _send_telnet(*commands):
+    """Send one or more line-terminated commands to liquidsoap's telnet
+    server and return the concatenated response text (with END markers
+    stripped). Raises TelnetError on connection failure or timeout.
+
+    Uses a fresh socket per call rather than pooling -- liquidsoap
+    handles connect/close cleanly, telnet commands are cheap, and a
+    per-call socket avoids the "connection went stale after encoders
+    restarted" problem entirely."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(TELNET_TIMEOUT_SECONDS)
     try:
-        os.kill(pid, 0)
-    except OSError:
-        return False
-    return True
+        try:
+            sock.connect((AIRCHECK_TELNET_HOST, AIRCHECK_TELNET_PORT))
+        except (ConnectionRefusedError, TimeoutError, OSError) as exc:
+            # ECONNREFUSED = encoders service down; ENETUNREACH = wrong
+            # host somehow. Either way the operator sees the encoders
+            # need to come up before aircheck can work.
+            raise TelnetError(
+                f"cannot reach liquidsoap telnet ({AIRCHECK_TELNET_HOST}:"
+                f"{AIRCHECK_TELNET_PORT}): {exc}"
+            )
+
+        responses = []
+        for cmd in commands:
+            payload = (cmd.rstrip("\n") + "\n").encode("utf-8")
+            try:
+                sock.sendall(payload)
+            except OSError as exc:
+                raise TelnetError(f"telnet send failed: {exc}")
+            responses.append(_recv_until_end(sock))
+
+        # Bye is best-effort -- if it fails, response is already collected.
+        try:
+            sock.sendall(b"quit\n")
+        except OSError:
+            pass
+        return "\n".join(responses).strip()
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
+def _recv_until_end(sock):
+    """Read from the socket until the b'END\\n' line terminator, return
+    the response body (everything before END, trailing newline stripped).
+    Raises TelnetError on timeout or unexpected disconnect."""
+    buf = b""
+    while TELNET_TERMINATOR not in buf:
+        try:
+            chunk = sock.recv(4096)
+        except TimeoutError:
+            raise TelnetError("telnet read timed out")
+        except OSError as exc:
+            raise TelnetError(f"telnet read failed: {exc}")
+        if not chunk:
+            raise TelnetError("telnet closed before END marker")
+        buf += chunk
+    body = buf.split(TELNET_TERMINATOR, 1)[0]
+    return body.decode("utf-8", errors="replace").rstrip("\n")
 
 
 def _reap_stale_running_session():
-    """If a session row is marked still_running but its ffmpeg PID is
-    dead (worker crash mid-record, host reboot, kill from outside),
-    close the row so a new session can start cleanly. Called at the
-    top of start_recording() to avoid the "already recording" gate
-    tripping on a ghost."""
+    """Close any AircheckSession row still marked still_running when
+    we know the recording is over. Called ONLY from start_recording
+    (never from current_session, which would race the monitoring
+    dashboard's poll and silently close just-started sessions).
+
+    We can't ask liquidsoap "is a session in progress" cleanly in the
+    fixed-path design -- the working file is always being written
+    regardless. Any still_running=True row we see at Start time was
+    left open by a Django crash or an out-of-band interrupt, so
+    reaping is safe. If a file exists at the row's declared
+    destination, record its size; otherwise leave size_bytes null.
+    """
     stale = AircheckSession.objects.filter(still_running=True)
     for s in stale:
-        if not _process_alive(s.ffmpeg_pid):
-            s.still_running = False
-            s.ended_at = timezone.now()
-            s.exit_note = f"reaped stale row (pid {s.ffmpeg_pid} not alive)"
-            if s.filename and Path(s.filename).is_file():
-                try:
-                    s.size_bytes = Path(s.filename).stat().st_size
-                except OSError:
-                    pass
-            s.save()
+        s.still_running = False
+        s.ended_at = timezone.now()
+        s.exit_note = "reaped stale row at Start (django crash or out-of-band interrupt)"
+        if s.filename and Path(s.filename).is_file():
+            try:
+                s.size_bytes = Path(s.filename).stat().st_size
+            except OSError:
+                pass
+        s.save()
 
 
 def current_session():
-    """Return the currently-running AircheckSession or None. Runs the
-    stale-reaper first so a caller polling status doesn't see a ghost."""
-    _reap_stale_running_session()
+    """Return the currently-running AircheckSession or None. Pure DB
+    read -- no reaper -- because this is called on every dashboard
+    status poll and a reaper race would silently close a just-started
+    session. Reconciliation with liquidsoap happens in start_recording."""
     return AircheckSession.objects.filter(still_running=True).order_by("-started_at").first()
 
 
-def _bitrate_to_bps(bitrate):
-    """'64k' -> 64000, '320k' -> 320000, '128000' -> 128000. fdkaac
-    takes raw bps on the CLI; ffmpeg takes '64k' shorthand. This
-    normalizes the config value for fdkaac."""
-    if not bitrate:
-        return 64000
-    s = str(bitrate).strip().lower()
-    if s.endswith("k"):
-        return int(s[:-1]) * 1000
-    return int(s)
-
-
-def _spawn_recorder(cfg, out_path):
-    """Spawn the recording process(es) and return (pid_to_track, err).
-    For he_aac we pipe ffmpeg's raw PCM into /usr/local/bin/fdkaac
-    (Ubuntu ffmpeg is not built with libfdk_aac; the standalone
-    fdkaac binary is the same one the encoders' liquidsoap uses --
-    see encoders/services/encoder_manager.py's %external fdkaac
-    process). The pipeline is spawned via `sh -c` in a new session
-    so killing the session leader signals both ffmpeg and fdkaac
-    cleanly -- stop_recording targets the process GROUP, not a
-    single PID.
-
-    For mp3/flac/wav a plain ffmpeg suffices."""
-    if cfg.audio_format == "he_aac":
-        bps = _bitrate_to_bps(cfg.effective_bitrate())
-        # -p 29 = HE-AAC v1 (SBR), same profile the shoutcast HE-AAC
-        # stream uses. -f 5 = MP4 container (m4a). -a 1 = afterburner
-        # on for higher quality at low bitrates. -S = silent.
-        cmd = (
-            f"ffmpeg -hide_banner -nostats -loglevel warning "
-            f"-f alsa -ac 2 -ar 44100 -i {_shell_quote(cfg.source_device)} "
-            f"-f s16le -ar 44100 -ac 2 - "
-            f"| /usr/local/bin/fdkaac -R --raw-channels 2 --raw-rate 44100 "
-            f"--raw-format S16L -p 29 -a 1 -S -b {bps} "
-            f"-o {_shell_quote(str(out_path))} -"
-        )
-        argv = ["sh", "-c", cmd]
-    else:
-        argv = [
-            "ffmpeg", "-hide_banner", "-nostats", "-loglevel", "warning",
-            "-f", "alsa", "-ac", "2", "-ar", "44100", "-i", cfg.source_device,
-        ]
-        if cfg.audio_format == "mp3":
-            argv += ["-c:a", "libmp3lame", "-b:a", cfg.effective_bitrate()]
-        elif cfg.audio_format == "flac":
-            argv += ["-c:a", "flac"]
-        elif cfg.audio_format == "wav":
-            argv += ["-c:a", "pcm_s16le"]
-        argv += [str(out_path)]
-
-    try:
-        proc = subprocess.Popen(
-            argv,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
-    except (OSError, ValueError) as exc:
-        return None, f"failed to spawn recorder: {exc}"
-    return proc.pid, None
-
-
-def _shell_quote(s):
-    """Minimal safe shell quoting for ALSA device names / paths that
-    might contain spaces or special chars. Not a substitute for shlex
-    in general, but fine for the constrained inputs here."""
-    return "'" + str(s).replace("'", "'\\''") + "'"
-
-
 def start_recording():
-    """Start a new aircheck session using the singleton AircheckConfig.
-    Returns (session, error) -- one is None. Idempotent-ish: if a
-    session is already running the caller gets it back with a note,
-    not an error."""
+    """Start a new aircheck session. Returns (session, error) with one
+    being None. Idempotent-ish: if a session is already running the
+    caller gets it back with a note, not an error.
+
+    Triggers `aircheck.reopen` over telnet -- liquidsoap closes its
+    current working file (AIRCHECK_CURRENT_PATH) and starts a fresh
+    one at the same path. The session row records the INTENDED final
+    destination; the actual file lives at AIRCHECK_CURRENT_PATH until
+    Stop moves it there."""
     _reap_stale_running_session()
     existing = AircheckSession.objects.filter(still_running=True).order_by("-started_at").first()
     if existing:
@@ -152,22 +171,21 @@ def start_recording():
     stamp = timezone.localtime().strftime(cfg.filename_template)
     out_path = out_dir / f"{stamp}.{cfg.file_extension()}"
 
-    # Guard: don't clobber a file at the same path (rare -- only if the
-    # operator hit Start twice within the same second and the template
-    # doesn't include sub-second granularity).
+    # Guard against second-precision collisions on rapid Start clicks.
     if out_path.exists():
         out_path = out_dir / f"{stamp}-{datetime.now().microsecond}.{cfg.file_extension()}"
 
-    pid, err = _spawn_recorder(cfg, out_path)
-    if pid is None:
-        return None, err
+    try:
+        _send_telnet(f"{AIRCHECK_OUTPUT_ID}.reopen")
+    except TelnetError as exc:
+        return None, f"liquidsoap telnet: {exc}"
 
     session = AircheckSession.objects.create(
         filename=str(out_path),
         audio_format=cfg.audio_format,
         bitrate=cfg.effective_bitrate(),
         source_device=cfg.source_device,
-        ffmpeg_pid=pid,
+        ffmpeg_pid=None,  # legacy field, always None on new sessions
         still_running=True,
     )
     return session, None
@@ -175,53 +193,45 @@ def start_recording():
 
 def stop_recording():
     """Stop the currently-running session, if any. Returns
-    (session, error). Sends SIGINT so ffmpeg finalizes container
-    trailer + closes the file cleanly; SIGKILL as fallback if ffmpeg
-    doesn't respect the SIGINT within a short deadline."""
+    (session, error). Triggers a fresh reopen so the working file
+    gets closed cleanly, then moves the just-closed file to the
+    session's destination path."""
     session = AircheckSession.objects.filter(still_running=True).order_by("-started_at").first()
     if session is None:
         return None, "no active session"
 
-    if _process_alive(session.ffmpeg_pid):
-        # For HE-AAC we start ffmpeg | fdkaac in a `sh -c` inside a
-        # new session -- the ffmpeg_pid is the shell's PID, but we
-        # want to signal BOTH the shell's ffmpeg AND fdkaac child.
-        # Targeting the process GROUP catches both. Falls back to
-        # the single PID if the group lookup fails (defensive; the
-        # start-time start_new_session=True should guarantee a group
-        # equal to the PID).
-        try:
-            pgid = os.getpgid(session.ffmpeg_pid)
-        except OSError:
-            pgid = session.ffmpeg_pid
-        # SIGTERM (not SIGINT) -- ffmpeg's SIGINT handler expects a TTY
-        # and can miss the signal when stdin=DEVNULL, whereas SIGTERM
-        # is caught by its shutdown hook reliably. Also gives the
-        # pipeline enough time to flush -- for HE-AAC the moov atom
-        # write during fdkaac's SIGPIPE handshake can take a beat.
-        try:
-            os.killpg(pgid, signal.SIGTERM)
-        except OSError as exc:
-            session.exit_note = f"SIGTERM failed: {exc}"
+    telnet_note = ""
+    try:
+        _send_telnet(f"{AIRCHECK_OUTPUT_ID}.reopen")
+    except TelnetError as exc:
+        # Working file may still be flushed on close by whatever's left
+        # of liquidsoap; we can still attempt the move below.
+        telnet_note = f"telnet reopen failed at Stop: {exc}; "
 
-        import time
-        for _ in range(60):  # up to ~6s
-            if not _process_alive(session.ffmpeg_pid):
-                break
-            time.sleep(0.1)
-        else:
-            try:
-                os.killpg(pgid, signal.SIGKILL)
-                session.exit_note = (session.exit_note + "; " if session.exit_note else "") + "SIGKILL after SIGTERM timeout"
-            except OSError:
-                pass
+    # After reopen, liquidsoap has closed AIRCHECK_CURRENT_PATH and
+    # begun a fresh file at the same path. Move the just-closed file
+    # to the session's declared destination. Use shutil.move (which
+    # falls back to copy+unlink across filesystems) since /run is
+    # tmpfs and the destination is typically on a spinning disk.
+    working = Path(AIRCHECK_CURRENT_PATH)
+    dest = Path(session.filename)
+    move_note = ""
+    if working.is_file():
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(working), str(dest))
+        except OSError as exc:
+            move_note = f"move {working} -> {dest} failed: {exc}"
+    else:
+        move_note = f"working file {working} was missing at Stop -- no audio to move"
 
     session.still_running = False
     session.ended_at = timezone.now()
-    if Path(session.filename).is_file():
+    if dest.is_file():
         try:
-            session.size_bytes = Path(session.filename).stat().st_size
+            session.size_bytes = dest.stat().st_size
         except OSError:
             pass
+    session.exit_note = (telnet_note + move_note).strip("; ") or ""
     session.save()
     return session, None
