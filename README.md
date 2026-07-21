@@ -10,7 +10,7 @@ IsadoraAir manages the full music library, schedule programming, playlist genera
 
 ![Dashboard](docs/screenshots/dashboard.png)
 
-**Library** — 29,000+ tracks, searchable/filterable/sortable, with bulk actions and an import + CD-rip page under the same roof.
+**Library** — searchable/filterable/sortable, with bulk actions and an import + CD-rip page under the same roof. Runs comfortably at tens of thousands of tracks on modest hardware — the KOGR-LP production install pictured here holds ~30k rows, and the underlying Postgres + indexed queries scale well beyond that for anyone with a bigger collection.
 
 ![Library](docs/screenshots/library.png)
 
@@ -23,7 +23,7 @@ IsadoraAir manages the full music library, schedule programming, playlist genera
 - Audio analysis: waveform generation, auto-detection of cue-in and next-start (mix) points via ffmpeg; per-category threshold overrides (dBFS for cue-in and next-start) let quiet material like classical music use later triggers than the global defaults
 - Fast cue-point re-pick: analyze_tracks persists the mono envelope into the waveform JSON, so re-picking cue points after a threshold tweak (per-track "Reset Cue Points" button on `/track/<pk>/`, or per-category "Update Cue Points" on `/categories/`) runs in seconds instead of the minutes a full re-decode would take
 - `fix_unknown_artists` management command: parses "Artist - Title" out of tracks whose artist is "Unknown Artist" and writes the split back to file metadata; WAV/AIF get transcoded to FLAC first (since they can't carry tags cleanly) with the original marked `ready2air=False` for manual weeding
-- 29,000+ track library with searchable/filterable frontend and full track detail editing
+- Searchable/filterable frontend with full track detail editing; comfortably handles libraries in the tens of thousands of tracks on modest hardware (Postgres + indexed queries scale further for anyone with a bigger collection)
 - Bulk actions: mark ready-to-air, assign categories, set metadata
 - Per-track cue points, rotation weight, energy level, vocal type, end type, RBDS overrides
 - Category Kind (Music/Imaging/Spot/Talk, extensible) with an admin-manageable fill color per kind, shown on the live dashboard's queue
