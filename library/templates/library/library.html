@@ -232,6 +232,12 @@
     <option value="{{ cat.id }}">{{ cat.name }}</option>
     {% endfor %}
   </select>
+  <select class="lib-select" id="bulkAdditionalCategorySelect" style="font-size:0.78rem;">
+    <option value="">Set additional category...</option>
+    {% for cat in categories %}
+    <option value="{{ cat.id }}">{{ cat.name }}</option>
+    {% endfor %}
+  </select>
   <select class="lib-select" id="bulkHolidaySelect" style="font-size:0.78rem;">
     <option value="">Add holiday...</option>
     {% for h in holidays %}
@@ -422,16 +428,18 @@ async function bulkDelete() {
 }
 
 async function bulkApply() {
-  // Combined dispatcher for both dropdowns in the bulk bar. If the
-  // operator picked a category AND a holiday, both get applied (two
-  // API calls -- one action at a time on the backend). If neither is
-  // picked, nothing happens rather than firing an empty request.
+  // Combined dispatcher for all three dropdowns in the bulk bar. Any
+  // combination of primary category / additional category / holiday
+  // can be applied together (one API call per action). If none picked,
+  // nothing happens rather than firing an empty request.
   const catSelect = document.getElementById('bulkCategorySelect');
+  const addCatSelect = document.getElementById('bulkAdditionalCategorySelect');
   const holSelect = document.getElementById('bulkHolidaySelect');
   const catId = catSelect.value;
+  const addCatId = addCatSelect.value;
   const holCode = holSelect.value;
   if (selectedIds.size === 0) return;
-  if (!catId && !holCode) return;
+  if (!catId && !addCatId && !holCode) return;
 
   const ids = [...selectedIds];
   const headers = {
@@ -450,6 +458,19 @@ async function bulkApply() {
       return;
     }
     catSelect.value = '';
+  }
+
+  if (addCatId) {
+    const resp = await fetch('/api/tracks/bulk/', {
+      method: 'POST', headers,
+      body: JSON.stringify({ action: 'add_additional_category', ids, category_id: parseInt(addCatId) }),
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      alert('Set additional category failed: ' + (err.error || resp.status));
+      return;
+    }
+    addCatSelect.value = '';
   }
 
   if (holCode) {

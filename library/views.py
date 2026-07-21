@@ -961,6 +961,34 @@ def api_track_bulk(request):
             except Category.DoesNotExist:
                 return JsonResponse({"error": "Category not found"}, status=404)
         updated = qs.update(category_id=cat_id)
+    elif action == "add_additional_category":
+        # ADD (not replace) the category to each selected track's
+        # additional_categories M2M -- same non-destructive semantics
+        # as add_holiday. A track that's already tagged with this cat
+        # as an additional (or has it as primary) is skipped silently
+        # via ignore_conflicts + the same-as-primary guard used in
+        # track_update. Bulk replace would be a foot-gun; if that's
+        # ever wanted it needs its own action.
+        cat_id = body.get("category_id")
+        if not cat_id:
+            return JsonResponse({"error": "category_id required"}, status=400)
+        try:
+            Category.objects.get(id=cat_id)
+        except Category.DoesNotExist:
+            return JsonResponse({"error": "Category not found"}, status=404)
+        # Exclude tracks whose PRIMARY category is already this cat --
+        # M2M row for (track, cat) makes no sense when the FK already
+        # points there, and the track_update path guards the same way.
+        target_ids = list(qs.exclude(category_id=cat_id).values_list("id", flat=True))
+        through = Track.additional_categories.through
+        existing = set(
+            through.objects.filter(track_id__in=target_ids, category_id=cat_id)
+            .values_list("track_id", flat=True)
+        )
+        rows = [through(track_id=tid, category_id=cat_id)
+                for tid in target_ids if tid not in existing]
+        through.objects.bulk_create(rows, ignore_conflicts=True)
+        updated = len(rows)
     elif action == "add_holiday":
         # ADD the holiday to each selected track's holidays M2M --
         # doesn't clobber existing tags, so a Halloween-tagged track
