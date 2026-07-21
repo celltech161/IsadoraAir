@@ -102,6 +102,18 @@ class AudioOutput(models.Model):
         help_text="Gain applied after compression, in dB, to bring the leveled signal back up.",
     )
 
+    # Same shape as AudioInput.mixer_control_values -- populated/edited via
+    # the admin's dynamically-rendered controls, not hand-edited. Populated
+    # only with OUTPUT-role controls (Master, Headphone, Speaker, IEC958,
+    # etc.) for this output's card -- see hardware/admin.py's role classifier.
+    mixer_control_values = models.JSONField(
+        default=dict, blank=True,
+        help_text="Last-applied value per ALSA output-side mixer control for this "
+                   "output's card (e.g. {'Master,0': 90, 'Headphone,0': 100}). "
+                   "Populated via the admin's dynamically-rendered fields, not "
+                   "meant to be hand-edited as raw JSON.",
+    )
+
     class Meta:
         ordering = ["sort_order", "name"]
         verbose_name = "Audio Output"
