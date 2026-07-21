@@ -53,18 +53,24 @@ from django.db import close_old_connections  # noqa: E402
 from encoders.models import Encoder  # noqa: E402
 
 # Paired with the StereoTool HD Output ALSA loopback bridge (second,
-# independent Loopback card added alongside the existing Studio Monitor
-# <-> StereoTool one — see PROJECT_NOTES.md for the exact card layout).
-# `airtap` is the dsnoop-backed ALSA alias defined in /etc/asound.conf --
-# post-StereoTool loopback (hw:Loopback_1,1,0), locked to subdevice 0
-# (the one that actually has audio, since StereoTool writes only to
-# playback sub-0). Using the alias lets a second reader (aircheck's
-# ffmpeg) share the same capture stream via POSIX shm without landing
-# on an unpaired silent subdevice -- the "aircheck file was completely
-# silent" bug caught live 2026-07-19 after the aircheck MVP shipped.
-# Fallback for a bare plughw is still safe if an admin overrides
-# Encoder.input_device explicitly, but the default now uses the alias.
-DEFAULT_INPUT_DEVICE = "airtap"
+# independent Loopback card -- see PROJECT_NOTES.md for the card layout).
+# Directly opens post-StereoTool loopback subdevice 0 (the one that
+# actually has audio; StereoTool writes only to playback sub-0).
+#
+# History: this was `airtap` (a dsnoop alias) while aircheck ran as a
+# separate ffmpeg subprocess that also needed to read this loopback --
+# dsnoop was the standard "two ALSA readers of one stream" answer. Once
+# aircheck moved in-process with encoders (aircheck/services/recorder.py
+# is now a telnet client to the same liquidsoap process rather than an
+# independent capture), liquidsoap is the ONLY reader again and dsnoop
+# just adds a user-space ring buffer that can overrun under load. Going
+# back to plughw is the pre-aircheck config that "just worked" -- the
+# kernel-side ALSA ring self-tunes and there's no second reader to
+# arbitrate with. The `airtap` dsnoop alias stays in /etc/asound.conf
+# unused for now, as a safety net (belt-and-braces -- an admin who
+# overrides Encoder.input_device to "airtap" for diagnostic reasons
+# still gets a functioning capture).
+DEFAULT_INPUT_DEVICE = "plughw:Loopback_1,1,0"
 
 HEALTH_CHECK_SECONDS = 5
 RESTART_DELAY_SECONDS = 10
@@ -353,7 +359,17 @@ def build_liquidsoap_script(input_device, encoders, host_aircheck=False):
         # time, and some settings are read-only once sources exist).
         lines += _telnet_server_block()
     lines += [
-        f'source = input.alsa(device={_liq_string(input_device)})',
+        # buffer_size=1.0s: input.alsa defaults to `null` (= one frame
+        # duration = ~20ms = 882 samples), which the raw plughw driver
+        # honors literally -- with that little headroom any scheduler
+        # jitter (a competing icecast reconnect burst, an fdkaac cache
+        # miss, GC) causes an "Overrun! ... trying to recover" and a
+        # 100-200ms glitch on the stream. dsnoop used to silently
+        # upgrade to 16384 samples on our behalf, which is why the
+        # airtap variant never showed this. 1.0s = comfortable
+        # headroom on a broadcast pipeline that's already
+        # downstream-latency-dominated.
+        f'source = input.alsa(buffer_size=1.0, device={_liq_string(input_device)})',
         'source = blank.detect(threshold=-40.0, max_blank=20.0, min_noise=0.5, source)',
         '',
         # `last_blank` mirrors the most recent transition state so the 60s
