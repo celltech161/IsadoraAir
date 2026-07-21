@@ -12,7 +12,7 @@ from weather import services
 @csrf_exempt
 @require_http_methods(["POST"])
 def api_gw3000_ingest(request):
-    """Ported from /home/jreed/wx_scripts/app.py's /weather route. Public
+    """Public webhook endpoint for a GW3000/Ecowitt weather gateway.
     (login_not_required) because the caller is the physical Ecowitt/GW3000
     gateway hardware, which can't authenticate -- same reasoning as any
     other hardware-facing webhook. Ecowitt gateways POST form-encoded

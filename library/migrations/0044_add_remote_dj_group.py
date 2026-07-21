@@ -1,6 +1,6 @@
 from django.db import migrations
 
-# Remote DJ over WebRTC (see /home/jreed/.claude/plans/warm-zooming-rose.md):
+# Remote DJ over WebRTC:
 # remote DJs authenticate with their own real Django account, but the
 # studio-mic-adjacent capability shouldn't be handed to every dashboard
 # login by default -- api_remote_dj_token gates on membership in this

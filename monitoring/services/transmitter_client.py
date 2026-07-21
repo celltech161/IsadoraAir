@@ -1,9 +1,9 @@
 """Raw ASCII TCP client for the Aquabroadcast COBALT transmitter's
-control protocol (confirmed from the user's own manual,
-/home/jreed/c300/cobalt_usermanual_v116.pdf, pages 62-63) -- NOT
-telnetlib (removed entirely in this box's Python 3.14 anyway).
+control protocol (see the Cobalt user manual, pages 62-63 in the
+v1.16 revision) -- NOT telnetlib (removed entirely in Python 3.14
+anyway).
 
-Verified live against the real unit (192.168.1.116:23) that this is NOT
+Verified live against the real unit at KOGR-LP that this is NOT
 "plain ASCII, no real telnet" as the manual's command list alone
 suggested -- the device sends a genuine RFC854 IAC negotiation
 (`\\xff\\xfd\\x18`, i.e. IAC DO TERMINAL-TYPE) immediately on connect,

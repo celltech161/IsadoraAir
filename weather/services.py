@@ -1,16 +1,16 @@
 """GW3000/Ecowitt weather-gateway ingestion + wind smoothing.
 
-Ported from /home/jreed/wx_scripts/app.py (Flask receiver) and
-wind_smoother.py (kicked as a subprocess on every POST). Folded into
-Django as plain function calls instead of a second web service + a
-subprocess-per-POST: both are cheap, pure-Python, sub-millisecond
+Ported from a Flask receiver + wind-smoother subprocess pair. Folded
+into Django as plain function calls instead of a second web service +
+a subprocess-per-POST: both are cheap, pure-Python, sub-millisecond
 operations over small JSON files, so there's nothing here that
 benefits from a separate process the way Piper/ffmpeg-based work does.
 
-Data files live under DATA_DIR, read/written by both this module (via
-the Django view, running as the gunicorn user) and the standalone
-cron scripts under /home/jreed/weather-ingest/ (running as the same
-user) -- same shared-directory convention as syndicated-ingest/lib.
+Data files live under DATA_DIR (settings.WEATHER_DATA_DIR), read and
+written by both this module (via the Django view, running as the
+gunicorn user) and the standalone cron scripts of the companion
+`weather-ingest` project (running as the same user) -- same
+shared-directory convention as syndicated-ingest/lib.
 """
 
 import json
@@ -20,7 +20,9 @@ import threading
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
-DATA_DIR = Path("/home/jreed/weather-ingest/data")
+from django.conf import settings
+
+DATA_DIR = Path(getattr(settings, "WEATHER_DATA_DIR", "/var/lib/isadoraair/weather"))
 
 LATEST_WEATHER_FILE = DATA_DIR / "latest_weather.json"
 WIND_HISTORY_FILE = DATA_DIR / "wind_history.json"

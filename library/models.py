@@ -871,7 +871,7 @@ class NavMenuItem(models.Model):
 
 class RemoteDJConfig(models.Model):
     """Singleton -- master switch and WebRTC tunables for Remote DJ over
-    WebRTC (see /home/jreed/.claude/plans/warm-zooming-rose.md). Off by
+    WebRTC. Off by
     default -- "land the code, don't flip it live," same pattern as
     OGRemoteConfig.enabled. Landing this while disabled means engine.py's
     pipeline topology is byte-for-byte unchanged from today (no new tee,

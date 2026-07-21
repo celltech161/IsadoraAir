@@ -1931,7 +1931,7 @@ def remote_dj_page(request):
 @require_http_methods(["POST"])
 def api_remote_dj_token(request):
     """Mints a short-lived signaling token for the Remote DJ over WebRTC
-    feature (see /home/jreed/.claude/plans/warm-zooming-rose.md). Gated on
+    feature. Gated on
     the "remote_dj" Group, not just being logged in -- LoginRequiredMiddleware
     already covers "logged in" for every view, but the studio-mic-adjacent
     capability shouldn't be handed to every dashboard account by default.

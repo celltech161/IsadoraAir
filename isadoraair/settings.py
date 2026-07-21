@@ -196,6 +196,11 @@ MEDIA_ROOT = BASE_DIR / 'media'
 LIBRARY_ROOT = config('LIBRARY_ROOT', default='/srv/isadoraair/music')
 WAVEFORMS_DIR = config('WAVEFORMS_DIR', default='/srv/isadoraair/waveforms')
 
+# Where the GW3000/Ecowitt weather receiver writes latest_weather.json,
+# wind_history.json, and smoothed_wind.json -- read by the /wx/ views and
+# the companion `weather-ingest` cron scripts. The two sides must agree.
+WEATHER_DATA_DIR = config('WEATHER_DATA_DIR', default='/var/lib/isadoraair/weather')
+
 # CD ripping configuration -- drive path, read offset, staging dir,
 # AccurateRip strictness -- lives in the CDRipConfig singleton
 # (admin: /admin/library/cdripconfig/) so replacing the drive doesn't

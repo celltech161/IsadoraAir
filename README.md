@@ -4,6 +4,16 @@ Django-based radio automation system built for [Oak Grove Radio](https://oakgrov
 
 IsadoraAir manages the full music library, schedule programming, playlist generation, and live on-air playback for a broadcast radio station — from importing and analyzing a track to actually mixing it out through the studio monitor. It replaces a previous FastAPI/mpv prototype with a proper Django application backed by PostgreSQL, plus a standalone GStreamer playback engine.
 
+## Screenshots
+
+**On-air console** — twin waveform decks with album art, VU meter, listener count, mic controls, and the coming-up queue.
+
+![Dashboard](docs/screenshots/dashboard.png)
+
+**Library** — 29,000+ tracks, searchable/filterable/sortable, with bulk actions and an import + CD-rip page under the same roof.
+
+![Library](docs/screenshots/library.png)
+
 ## Features
 
 **Library Management**
@@ -228,6 +238,17 @@ Syndicated ingestion and the Bluesky poster scripts also live outside
 the repo at `~/syndicated-ingest/` (own venv, separate from this
 project's), with credentials in `~/.syndicated_ingest.cred`.
 
+**Note on the `deploy/` unit files:** every unit ships with the paths of
+the live KOGR-LP install (`/home/jreed/isadoraair-django/venv/…`,
+`/home/jreed/syndicated-ingest/…`, etc.) hardcoded — they're the exact
+files running on the real box, published as reference rather than as a
+paramaterized template. If you deploy under a different path (or a
+different user), search-and-replace those literals before enabling any
+unit. `/opt/isadoraair` on the live box is a symlink to
+`/home/jreed/isadoraair-django`, which is why the `WorkingDirectory=`
+lines look inconsistent with the `ExecStart=` paths — same target, two
+names.
+
 ## Project Status
 
 | Phase | Status |
@@ -245,6 +266,12 @@ project's), with credentials in `~/.syndicated_ingest.cred`.
 
 Actively running end-to-end on a live station: schedule → log builder → playback engine → StereoTool → transmitter, plus live streaming, RDS, monitoring, remote DJ, and content ingestion.
 
+## Security
+
+For security concerns, see [SECURITY.md](SECURITY.md). Please report privately rather than opening a public issue.
+
 ## License
 
-Private project. Not open source.
+Licensed under the **GNU Affero General Public License v3.0** — see [LICENSE](LICENSE) for the full text.
+
+The AGPL is a strong copyleft. In short: you can use, modify, and redistribute this software (including for commercial purposes), but any modified version you run as a network-accessible service must have its source publicly available to the users of that service. That fits the community-broadcast ethos of this project — a broadcast automation stack that stays open even when it's deployed as a station's operational tool.

@@ -74,7 +74,7 @@ SILENCE_PRIME_SECONDS = 0.3
 DECK_STUCK_TIMEOUT_SECONDS = 30  # generous margin past a track's own duration before assuming its EOS was missed
 SLOTS = ("A", "B")
 
-# Remote DJ over WebRTC (see /home/jreed/.claude/plans/warm-zooming-rose.md).
+# Remote DJ over WebRTC.
 # Opus's RTP payload mandates 48kHz per RFC 7587 regardless of
 # AudioPipeline.sample_rate -- this is NOT the same as pipeline_sample_rate
 # and must not be confused with it.
@@ -1743,7 +1743,7 @@ class PlaybackEngine:
             self._start_next_track()
 
     # ------------------------------------------------------------------
-    # Remote DJ over WebRTC (see /home/jreed/.claude/plans/warm-zooming-rose.md)
+    # Remote DJ over WebRTC
     # ------------------------------------------------------------------
     def _warm_stun_dns(self):
         """One-shot DNS resolve of the configured STUN host at engine

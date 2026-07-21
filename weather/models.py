@@ -60,9 +60,12 @@ class WeatherConfig(models.Model):
                    "which is unaffected by this switch.",
     )
     alert_sound_path = models.CharField(
-        max_length=255, default="/home/jreed/weather-ingest/media/weather_beeps.flac",
+        max_length=255, default="",
         help_text="Path to the alert beep audio file, played directly to ALSA "
-                   "(not through the playback engine) while a watch/warning is active.",
+                   "(not through the playback engine) while a watch/warning is "
+                   "active. Blank disables the beep entirely -- the beep file is "
+                   "operator-supplied and station-specific (WEA-style pattern or "
+                   "otherwise); set this to its absolute path once it exists.",
     )
     alert_sound_device = models.CharField(
         max_length=32, default="plughw:4,0",
