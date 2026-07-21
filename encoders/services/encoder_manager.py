@@ -76,6 +76,27 @@ SCRIPT_DIR = Path("/run/isadoraair/liquidsoap")
 # Watched live by the generated Liquidsoap script via file.watch().
 NOW_PLAYING_PATH = "/run/isadoraair/now_playing.json"
 
+# Aircheck-in-liquidsoap: this liquidsoap process hosts a single
+# output.file that always writes to AIRCHECK_CURRENT_PATH (a tmpfs
+# working file), with reopen wired to telnet so a Start/Stop cycle
+# just cuts a fresh file at the same path. aircheck.services.recorder
+# is a telnet client that (Start) triggers reopen and remembers the
+# session's intended final destination, then (Stop) triggers another
+# reopen and moves the just-closed working file to that destination.
+#
+# Why the fixed path (rather than a runtime-controlled getter)?
+# Tried the getter form live 2026-07-20 -- output.file's `.reopen()`
+# closes the current file but does NOT re-invoke its filename getter
+# on this liquidsoap version; writes silently stop entirely after
+# the first reopen. Fixed path + rename dance sidesteps that.
+#
+# Only ONE liquidsoap group per manager runs telnet+aircheck -- two
+# processes binding the same port would clash. See _start_group.
+AIRCHECK_TELNET_HOST = "127.0.0.1"
+AIRCHECK_TELNET_PORT = 1234
+AIRCHECK_CURRENT_PATH = "/run/isadoraair/aircheck-current.audio"
+AIRCHECK_OUTPUT_ID = "aircheck"
+
 # shout2send-style protocol mapping doesn't apply here — Liquidsoap has
 # distinct operators instead: output.icecast for real Icecast 2 (mount
 # path based), output.shoutcast for Shoutcast 1/2 (icy_id based, no real
@@ -210,7 +231,104 @@ def _output_block(encoder, source_var):
     return f"output.shoutcast({fmt}, {common}, {source_var})"  # shoutcast1
 
 
-def build_liquidsoap_script(input_device, encoders):
+def _aircheck_format_block(cfg):
+    """Format for the aircheck output.file, driven by AircheckConfig.
+    Format changes require an encoder-manager restart to take effect
+    (the format bakes into the script at build time). Bitrate changes
+    also require a restart. Path/directory/filename_template changes do
+    NOT require a restart -- those are resolved at Start button press
+    time by aircheck.services.recorder from the config's current values.
+
+    Kept parallel to _format_block (encoder streaming) rather than
+    factored together on purpose: aircheck may want lossless (flac/wav)
+    options that make no sense for a streaming encoder, and streaming
+    may want CBR/ABR quality knobs that aren't meaningful for archival."""
+    fmt = cfg.audio_format
+    br = cfg.effective_bitrate() or "64k"
+    br_k = int(str(br).lower().rstrip("k")) if str(br).lower().endswith("k") else int(br) // 1000
+    if fmt == "he_aac":
+        # KNOWN LIMITATION (P1 aircheck-in-liquidsoap): fdkaac's -f 5 (m4a
+        # container) needs a seekable file to write the moov atom on
+        # close, but %external pipes stdout, which isn't seekable --
+        # fdkaac exits immediately with code 2. -f 2 (ADTS framing) is
+        # streamable but yields raw .aac bytes, not .m4a. Until we wire
+        # a proper fdkaac-then-remux path (or teach the aircheck output
+        # to own a temp-file-then-move dance for muxed formats), fall
+        # back to MP3 64k for aircheck. The Encoder streaming path is
+        # unaffected -- it uses -f 2 ADTS deliberately for streaming.
+        return "%mp3(bitrate=64)"
+    if fmt == "mp3":
+        if br_k >= 192:
+            return f"%mp3(bitrate={br_k})"
+        return f"%mp3.abr(bitrate={br_k}, internal_quality=0)"
+    if fmt == "flac":
+        return "%flac"
+    if fmt == "wav":
+        return "%wav"
+    return "%mp3(bitrate=192)"  # defensive fallback
+
+
+def _aircheck_block():
+    """Liquidsoap fragment: single output.file that always writes the
+    live air source to AIRCHECK_CURRENT_PATH (on tmpfs). Session Start
+    calls `aircheck.reopen` over telnet -- that closes the current
+    working file and opens a fresh one at the same path. Session Stop
+    calls reopen again and then aircheck.services.recorder moves the
+    working file to the session's final destination.
+
+    Design note: we ALWAYS encode, even when idle. On this box the mp3
+    pipe is ~1% of one core so this is a fine trade for zero-glitch
+    session-start (no encoder spin-up latency).
+
+    reopen_delay defaults to 120s in liquidsoap, which would silently
+    swallow a Stop-then-quick-Start. We drop it to 0 so back-to-back
+    session toggles work.
+
+    flush=true forces a write-through on every encoded chunk so the
+    Stop-then-move sequence sees a complete file instead of a
+    still-buffered tail."""
+    from aircheck.models import AircheckConfig  # lazy to avoid import cycle at module load
+    cfg = AircheckConfig.load()
+    fmt_block = _aircheck_format_block(cfg)
+    return [
+        '',
+        '# --- Aircheck output.file (Start/Stop cut files via telnet reopen) ---',
+        f'aircheck_output = output.file(',
+        f'  id={_liq_string(AIRCHECK_OUTPUT_ID)},',
+        f'  fallible=true,',
+        f'  flush=true,',
+        f'  reopen_delay={{0.}},',
+        f'  {fmt_block},',
+        f'  {_liq_string(AIRCHECK_CURRENT_PATH)},',
+        f'  source',
+        f')',
+        # server.register exposes the output's .reopen() method as a
+        # telnet command. Callback signature is (string) -> string;
+        # arg is ignored, return value is echoed to the caller.
+        'def aircheck_reopen_handler(_) =',
+        '  aircheck_output.reopen()',
+        '  "reopened"',
+        'end',
+        f'server.register(namespace={_liq_string(AIRCHECK_OUTPUT_ID)}, "reopen", aircheck_reopen_handler)',
+    ]
+
+
+def _telnet_server_block():
+    """Liquidsoap fragment enabling the local telnet control server so
+    aircheck.services.recorder can toggle aircheck_path + call
+    aircheck.reopen without an encoder restart. Bound to localhost
+    only -- no external exposure. Only injected on the main-air group
+    (see EncoderManager._start_group) because two liquidsoap processes
+    binding the same port would clash."""
+    return [
+        f'settings.server.telnet.set(true)',
+        f'settings.server.telnet.bind_addr.set({_liq_string(AIRCHECK_TELNET_HOST)})',
+        f'settings.server.telnet.port.set({AIRCHECK_TELNET_PORT})',
+        '',
+    ]
+
+
+def build_liquidsoap_script(input_device, encoders, host_aircheck=False):
     """One shared `input.alsa` (the device is only ever opened once) fanned
     out to one output.* block per encoder that uses this device.
 
@@ -228,7 +346,13 @@ def build_liquidsoap_script(input_device, encoders):
     and a live short-lived run) before wiring this in live."""
     slug = _slug(input_device)
     state_path = f"/run/isadoraair/liquidsoap_silence_{slug}.json"
-    lines = [
+    lines = []
+    if host_aircheck:
+        # Telnet server must be configured BEFORE any source/output
+        # definitions (liquidsoap parses `settings.*` at script-eval
+        # time, and some settings are read-only once sources exist).
+        lines += _telnet_server_block()
+    lines += [
         f'source = input.alsa(device={_liq_string(input_device)})',
         'source = blank.detect(threshold=-40.0, max_blank=20.0, min_noise=0.5, source)',
         '',
@@ -307,6 +431,8 @@ def build_liquidsoap_script(input_device, encoders):
         '',
     ]
     lines += [_output_block(encoder, "source") for encoder in encoders]
+    if host_aircheck:
+        lines += _aircheck_block()
     return "\n".join(lines) + "\n"
 
 
@@ -367,7 +493,13 @@ class EncoderManager:
                 encoding="utf-8",
             )
 
-        script = build_liquidsoap_script(input_device, encoders)
+        # Attach the aircheck output.file + telnet server only to the
+        # main-air group (the one whose input_device matches
+        # DEFAULT_INPUT_DEVICE). Rationale: two liquidsoap processes
+        # can't bind the same telnet port, and aircheck records what
+        # goes to air -- that's the DEFAULT_INPUT_DEVICE tap.
+        host_aircheck = input_device == DEFAULT_INPUT_DEVICE
+        script = build_liquidsoap_script(input_device, encoders, host_aircheck=host_aircheck)
         script_path = SCRIPT_DIR / f"encoders_{_slug(input_device)}.liq"
         script_path.write_text(script, encoding="utf-8")
         try:
