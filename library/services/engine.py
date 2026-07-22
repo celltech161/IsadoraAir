@@ -188,19 +188,68 @@ def _glib_safe(default_return=True):
     return decorator
 
 
+# Number of concurrent remote-DJ slots the pipeline is built to
+# support. Hardcoded to 1 today; the audio-path structure (per-slot
+# persistent selector + silence source + gate + gain + master_mixer
+# pad) is a list so bumping to N is a constant change plus signaling/
+# UI/policy work that lives outside engine.py. Do NOT flip this to
+# >1 without matching signaling-server work; the engine will happily
+# build the slots but only one WebRTC session can be active at a time
+# with the current signaling protocol.
+MAX_DJ_SLOTS = 1
+
+
+class RemoteDJSlot:
+    """Persistent per-slot audio-path state, allocated ONCE at engine
+    startup in _build_main_pipeline and never released until the
+    engine process exits. The mixer:src use-after-free class of bug
+    that manifested as static-on-connect (kernel-confirmed SEGVs
+    2026-07-14 00:07 in orcexec / 2026-07-22 07:57 in libc memcpy,
+    both on master_mixer:src thread) came from calling
+    master_mixer.request_pad_simple at RUNTIME on a live aggregator.
+    Persistent-slot design eliminates that race by construction:
+    the slot's master_mixer pad is requested here at startup and
+    never mutated for the pipeline's lifetime; DJ connect/disconnect
+    only flips this slot's input-selector active-pad between the
+    silence source (idle) and the WebRTC decode chain (live), which
+    is a plain property set with no aggregator-state impact."""
+
+    def __init__(self, slot_id, selector, silence_pad, webrtc_pad,
+                 remote_gain, remote_gate, master_mixer_pad, silence_src):
+        self.slot_id = slot_id
+        self.selector = selector             # GstInputSelector element
+        self.silence_pad = silence_pad       # selector's sink_0 (silence path)
+        self.webrtc_pad = webrtc_pad         # selector's sink_1 (WebRTC path, pre-allocated)
+        self.remote_gain = remote_gain       # volume element (persistent, applied per-session gain)
+        self.remote_gate = remote_gate       # volume element (persistent, 0.0 or 1.0)
+        self.master_mixer_pad = master_mixer_pad  # never released
+        self.silence_src = silence_src       # audiotestsrc wave=silence
+        self.session = None                  # the RemoteDJSession currently occupying this slot, or None
+
+
 class RemoteDJSession:
     """Holds every GStreamer element reference for the one active
     remote-DJ WebRTC session -- mirrors the Deck class's role for a
     playback slot (a thin data holder; the actual lifecycle logic lives
     in PlaybackEngine's _remote_dj_* methods, same split as
-    Deck/_create_deck/_remove_deck). "One remote DJ at a time" is a
-    confirmed design decision -- self.remote_dj_session is a single slot,
-    not a dict/pool."""
+    Deck/_create_deck/_remove_deck).
+
+    Slot bookkeeping (2026-07-22 refactor): the DJ audio-path pieces
+    that must be persistent for the pipeline's whole lifetime -- the
+    input-selector, its two sink pads, the gain/gate volume elements,
+    and the master_mixer pad -- live on a RemoteDJSlot allocated at
+    engine startup, NOT here. This session tracks only which slot it
+    took (session.slot_id) plus its ephemeral webrtcbin + decode
+    subchain that gets linked into the slot's selector.sink_1 at
+    connect and torn down at disconnect. The slot itself is
+    unaffected by session lifecycle.
+
+    MAX_DJ_SLOTS is 1 today; the shape is generalizable to N."""
     def __init__(self):
         self.webrtc = None
         self.ice_agent = None
-        self.remote_gate = None
-        self.master_mixer_pad = None
+        self.slot_id = None            # which self.dj_slots[] index this session took
+        self.master_mixer_pad = None   # legacy field, unused in the new design (kept so old teardown paths don't NPE if reached)
         self.monitor_tee_pad = None
         self.local_mic_tee_pad = None  # only set if local mic exists
         # Every element this session added directly to main_pipeline
@@ -279,6 +328,13 @@ class PlaybackEngine:
         # remote DJ at a time" is a confirmed design decision).
         self.remote_dj_tee = None
         self.remote_dj_session = None
+        # Populated in _build_main_pipeline when RemoteDJConfig.enabled
+        # is true. MAX_DJ_SLOTS entries; each holds a persistent audio
+        # subchain that owns its own master_mixer sink pad for the
+        # engine process's whole lifetime. Empty list when the feature
+        # is disabled -- no slots, no persistent silence sources burning
+        # cycles for nothing.
+        self.dj_slots = []
         self._remote_dj_server = None
         # Manual mode: DJ-controlled hold on the auto-crossfade handoff,
         # for talking over a song's outro. The currently-playing deck is
@@ -421,6 +477,128 @@ class PlaybackEngine:
             return None
         print(f"  AudioInput '{MIC_INPUT_NAME}' -> {configured}")
         return configured
+
+    def _build_dj_slots(self, n_slots):
+        """Build `n_slots` persistent DJ subchains, each terminating in a
+        dedicated master_mixer sink pad requested HERE at engine startup
+        and never released. See RemoteDJSlot's docstring for the class of
+        bug this eliminates (mixer:src use-after-free from dynamic pad
+        add/remove on the running aggregator).
+
+        Per-slot shape:
+
+            [audiotestsrc wave=silence]
+                    │
+                    ▼
+            [capsfilter S16LE 44.1k stereo]
+                    │
+                    ▼
+            input-selector  ← sink_0 (silence path, active by default)
+                            ← sink_1 (WebRTC path, pre-allocated,
+                                       upstream linked at session start)
+                    │
+                    ▼
+            [audioconvert] → [volume gain] → [volume gate] → [audioconvert]
+                    │
+                    ▼
+            master_mixer's dedicated pad for this slot
+
+        The gate defaults to 0 (closed); it opens to 1 only while the DJ
+        is actually broadcasting, same semantics as the pre-refactor
+        session.remote_gate. Gain reads RemoteDJAudioInput.load().gain_db
+        at connect time (see _remote_dj_on_pad_added), same as before.
+
+        Silence source uses samplesperbuffer matched to ~23 ms at 44.1k,
+        keeping the input-selector fed with steady periodic buffers that
+        are well-timed for the switchover to WebRTC input. is-live=true
+        so the source produces at wall-clock rate rather than as fast as
+        possible."""
+        pipe_caps = Gst.Caps.from_string(
+            f"audio/x-raw,format=S16LE,rate={self.pipeline_sample_rate},"
+            f"channels=2,layout=interleaved"
+        )
+        for slot_id in range(n_slots):
+            silence_src = Gst.ElementFactory.make("audiotestsrc", f"dj_slot_{slot_id}_silence")
+            # wave=4 = "silence" per the GstAudioTestSrcWave enum.
+            silence_src.set_property("wave", 4)
+            silence_src.set_property("is-live", True)
+            silence_src.set_property("samplesperbuffer", 1024)  # ~23ms at 44.1k
+            silence_caps = Gst.ElementFactory.make("capsfilter", f"dj_slot_{slot_id}_silence_caps")
+            silence_caps.set_property("caps", pipe_caps)
+
+            selector = Gst.ElementFactory.make("input-selector", f"dj_slot_{slot_id}_selector")
+            # Each input has its own timeline (silence is live at wall
+            # clock; WebRTC decoded audio has its own rtpjitterbuffer-
+            # driven timing). sync-streams=false tells the selector not
+            # to try to time-align across inputs; the mixer downstream
+            # is what actually re-times to the master clock.
+            selector.set_property("sync-streams", False)
+
+            post_conv = Gst.ElementFactory.make("audioconvert", f"dj_slot_{slot_id}_post_conv")
+            remote_gain = Gst.ElementFactory.make("volume", f"dj_slot_{slot_id}_gain")
+            remote_gain.set_property("volume", 1.0)  # updated per-session from RemoteDJAudioInput.gain_db
+            remote_gate = Gst.ElementFactory.make("volume", f"dj_slot_{slot_id}_gate")
+            remote_gate.set_property("volume", 0.0)  # closed by default; opened via remote_dj_gate command
+            out_conv = Gst.ElementFactory.make("audioconvert", f"dj_slot_{slot_id}_out_conv")
+
+            for el in (silence_src, silence_caps, selector, post_conv,
+                       remote_gain, remote_gate, out_conv):
+                self.main_pipeline.add(el)
+
+            # Silence path: source → caps → selector.sink_0
+            silence_src.link(silence_caps)
+            silence_sink = selector.request_pad_simple("sink_%u")
+            silence_caps.get_static_pad("src").link(silence_sink)
+
+            # WebRTC path: pre-allocate selector.sink_1 (empty upstream
+            # at startup; _remote_dj_on_pad_added links a decode chain
+            # into this pad when a session goes live, and unlinks at
+            # session_stop). Pre-allocating this pad here at startup
+            # means the selector's pad list is set-in-stone at the
+            # moment the pipeline goes PLAYING -- the SAME "never
+            # mutate a running element's pad list at runtime" invariant
+            # we're enforcing on master_mixer, applied belt-and-braces
+            # to input-selector too.
+            webrtc_sink = selector.request_pad_simple("sink_%u")
+
+            # Selector starts on the silence path.
+            selector.set_property("active-pad", silence_sink)
+
+            # Downstream: selector → post_conv → gain → gate → out_conv
+            selector.link(post_conv)
+            post_conv.link(remote_gain)
+            remote_gain.link(remote_gate)
+            remote_gate.link(out_conv)
+
+            # THE pad that would otherwise be mutated at runtime by the
+            # old dynamic-add code. Requested ONCE, right here, at
+            # engine startup, on a mixer that hasn't yet entered
+            # PLAYING. Zero race window.
+            master_mixer_pad = self.master_mixer.request_pad_simple("sink_%u")
+            out_conv.get_static_pad("src").link(master_mixer_pad)
+
+            self.dj_slots.append(RemoteDJSlot(
+                slot_id=slot_id,
+                selector=selector,
+                silence_pad=silence_sink,
+                webrtc_pad=webrtc_sink,
+                remote_gain=remote_gain,
+                remote_gate=remote_gate,
+                master_mixer_pad=master_mixer_pad,
+                silence_src=silence_src,
+            ))
+            print(f"  Remote DJ slot {slot_id}: persistent audio subchain built + master_mixer pad allocated")
+
+    def _dj_slot_available(self):
+        """Return the first slot whose session is None, or None if all
+        slots are occupied. With MAX_DJ_SLOTS=1 today this is either
+        slot 0 or the caller falls through to 'already recording'
+        semantics -- but the shape is right for N slots when we bump
+        the constant."""
+        for slot in self.dj_slots:
+            if slot.session is None:
+                return slot
+        return None
 
     def _build_mic_chain(self):
         """Builds the mic capture chain as its own Gst.Bin (not loose
@@ -916,6 +1094,14 @@ class PlaybackEngine:
             else:
                 mic_pad = self.master_mixer.request_pad_simple("sink_%u")
                 mic_elements[-1].get_static_pad("src").link(mic_pad)
+
+        # Persistent DJ slot pool (see RemoteDJSlot's docstring for why).
+        # Only built when the feature is enabled; otherwise self.dj_slots
+        # stays empty and no cycles are spent generating silence for a
+        # slot no one will ever occupy.
+        if RemoteDJConfig.load().enabled:
+            self._build_dj_slots(MAX_DJ_SLOTS)
+
         self.master_mixer.link(convert)
         convert.link(resample)
         resample.link(capsfilter)
@@ -1929,8 +2115,28 @@ class PlaybackEngine:
             print("  Remote DJ session start requested but the feature isn't built (RemoteDJConfig.enabled was off at pipeline build time) — ignoring")
             return False
 
-        print("  Remote DJ: session starting")
+        # Claim a persistent DJ slot. With MAX_DJ_SLOTS=1 today this is
+        # equivalent to "one at a time" -- the check above already
+        # rejects a second attempt, but this belt-and-braces enforces
+        # slot-pool semantics so multi-slot (future) won't need this
+        # code re-shaped.
+        slot = self._dj_slot_available()
+        if slot is None:
+            print("  Remote DJ session start requested but all DJ slots are occupied — ignoring")
+            return False
+
+        print(f"  Remote DJ: session starting (claiming slot {slot.slot_id})")
         session = RemoteDJSession()
+        session.slot_id = slot.slot_id
+        slot.session = session
+        # Update the slot's gain from the current RemoteDJAudioInput
+        # config now (fresh read at session start; changes take effect
+        # on the next connect, same contract as before). Gate stays at
+        # 0 until the DJ explicitly opens it via _remote_dj_set_gate.
+        slot.remote_gain.set_property(
+            "volume", 10 ** (RemoteDJAudioInput.load().gain_db / 20.0)
+        )
+        slot.remote_gate.set_property("volume", 0.0)
         self.remote_dj_session = session
         # Open the two diagnostic sinks. Truncate on each session start
         # so a post-mortem sees only THIS session's data (the previous
@@ -1959,12 +2165,25 @@ class PlaybackEngine:
             # already isolates exceptions from crashing the main loop.
             print(f"  Remote DJ session start failed, rolling back: {exc}")
             self.remote_dj_session = None
+            # Persistent-slot refactor: rollback releases the slot back
+            # to the pool but NEVER touches master_mixer (the slot's
+            # master_mixer pad is persistent). Reset the slot's gate to
+            # 0 defensively in case anything mid-build had already
+            # opened it, and switch the selector to silence in case any
+            # partial link left it pointing at a WebRTC pad with no
+            # upstream.
+            if session.slot_id is not None:
+                slot_rb = self.dj_slots[session.slot_id]
+                slot_rb.session = None
+                slot_rb.remote_gate.set_property("volume", 0.0)
+                slot_rb.selector.set_property("active-pad", slot_rb.silence_pad)
+                peer = slot_rb.webrtc_pad.get_peer()
+                if peer is not None:
+                    peer.unlink(slot_rb.webrtc_pad)
             for el in session.elements:
                 el.set_state(Gst.State.NULL)
                 if el.get_parent() is self.main_pipeline:
                     self.main_pipeline.remove(el)
-            if session.master_mixer_pad is not None:
-                self.master_mixer.release_request_pad(session.master_mixer_pad)
             if session.monitor_tee_pad is not None:
                 self.remote_dj_tee.release_request_pad(session.monitor_tee_pad)
             if self._remote_dj_server:
@@ -2276,52 +2495,35 @@ class PlaybackEngine:
         session = self.remote_dj_session
         if session is None or session.webrtc is not element:
             return
+        if session.slot_id is None or session.slot_id >= len(self.dj_slots):
+            print("  Remote DJ pad-added but no slot claimed on the session — ignoring")
+            return
+        slot = self.dj_slots[session.slot_id]
 
+        # Persistent-slot refactor: the DJ subchain now ends at the
+        # slot's pre-allocated selector.sink_1 -- everything downstream
+        # (post_conv, gain, gate, out_conv, master_mixer pad) already
+        # exists and has been PLAYING silence since engine startup.
+        # This function builds ONLY the ephemeral piece: the webrtcbin
+        # -fed opus decode + resample + capsfilter chain that hands
+        # PCM into the selector. On disconnect this chain is torn down
+        # and the selector reverts to silence.
         depay = Gst.ElementFactory.make("rtpopusdepay", None)
         dec = Gst.ElementFactory.make("opusdec", None)
-        # Diagnostic level meter inserted right after opusdec so we see
-        # what the Opus decoder is actually producing BEFORE any of
-        # our downstream chain (audioconvert, resample, capsfilter,
-        # queue, gain, gate) has a chance to influence it. Peak/RMS
-        # dBFS per channel are posted as bus messages every 100ms and
-        # logged to DJ_DIAG_LOG by _on_element_message. If a
-        # deck-static event coincides with normal voice-range readings
-        # here, the noise was generated downstream of opusdec (mixer
-        # or beyond); if the readings themselves go junk (clipped
-        # peaks, nonsense values), the fault is at or upstream of the
-        # decode. Cheap -- level is designed exactly for this.
+        # Diagnostic level meter kept in place -- still useful (cheap;
+        # confirms what the Opus decoder is actually producing).
         session.dj_level = Gst.ElementFactory.make("level", None)
         session.dj_level.set_property("interval", 100_000_000)  # 100ms
         session.dj_level.set_property("post-messages", True)
         conv = Gst.ElementFactory.make("audioconvert", None)
         resample = Gst.ElementFactory.make("audioresample", None)
         capsfilter = Gst.ElementFactory.make("capsfilter", None)
-        # opusdec's own output is always 48kHz (Opus is 48kHz-native) --
-        # this resamples DOWN to the pipeline's own fixated rate, not up.
-        # Getting this backwards is exactly the sample-rate-mismatch
-        # failure mode the offline harness flagged.
+        # opusdec's output is 48kHz-native; resample DOWN to the
+        # pipeline rate here. Match the selector's other input (silence)
+        # exactly on caps so the switch is seamless.
         capsfilter.set_property("caps", self._remote_dj_pipeline_caps())
-        # Small queue to decouple the decode chain's thread from anything
-        # downstream. Kept in place after the concat removal since the
-        # gate volume element downstream doesn't have its own thread
-        # either, and any downstream stall (e.g. transient master_mixer
-        # pad-add negotiation) should not back up into webrtcbin's
-        # internal rtpjitterbuffer thread.
         queue = Gst.ElementFactory.make("queue", None)
-        remote_gain = Gst.ElementFactory.make("volume", None)
-        # Software gain to compensate for browser WebRTC's typical output
-        # being noticeably quieter than the local mic through the same
-        # preamp -- see hardware.RemoteDJAudioInput. Read fresh here at
-        # session start; changes take effect on the next connect (same
-        # contract as AudioInput.gain_db for the local mic).
-        remote_gain.set_property(
-            "volume", 10 ** (RemoteDJAudioInput.load().gain_db / 20.0)
-        )
-        session.remote_gate = Gst.ElementFactory.make("volume", None)
-        session.remote_gate.set_property("volume", 0.0)  # closed -- opened via remote_dj_gate command
-        gate_conv = Gst.ElementFactory.make("audioconvert", None)
-        for el in (depay, dec, session.dj_level, conv, resample, capsfilter, queue,
-                   remote_gain, session.remote_gate, gate_conv):
+        for el in (depay, dec, session.dj_level, conv, resample, capsfilter, queue):
             self.main_pipeline.add(el)
             session.elements.append(el)
         depay.link(dec)
@@ -2330,34 +2532,33 @@ class PlaybackEngine:
         conv.link(resample)
         resample.link(capsfilter)
         capsfilter.link(queue)
-        queue.link(remote_gain)
-        remote_gain.link(session.remote_gate)
-        session.remote_gate.link(gate_conv)
+        # Link the queue's src to the slot's pre-allocated webrtc_pad on
+        # the input-selector. This is a plain pad-to-pad link on an
+        # already-existing pad -- no request_pad_simple on the mixer,
+        # no aggregator-state mutation, no race.
+        queue.get_static_pad("src").link(slot.webrtc_pad)
         pad.link(depay.get_static_pad("sink"))
 
-        for el in (depay, dec, session.dj_level, conv, resample, capsfilter, queue,
-                   remote_gain, session.remote_gate, gate_conv):
+        for el in (depay, dec, session.dj_level, conv, resample, capsfilter, queue):
             el.sync_state_with_parent()
 
-        _dj_diag(session, "decode_chain_wired")
+        _dj_diag(session, "decode_chain_wired (linked to slot.webrtc_pad)")
 
-        # Master_mixer's sink pad is requested and linked ONLY when the
-        # decode chain is ready to push its first buffer, not before.
-        # `audiomixer` (GstAggregator) refuses to output anything until
-        # every linked sink pad has produced at least one buffer -- and
-        # webrtcbin's rtpjitterbuffer + decode takes anywhere from a few
-        # hundred ms to a couple of seconds to deliver the first buffer,
-        # depending on network conditions. If we link master_mixer_pad
-        # before that first buffer is ready, the studio-monitor chain
-        # goes silent for the entire wait -- observed live as "a couple
-        # seconds of mute on connect" on mobile-network connections.
-        # Fix: install a BLOCK probe on gate_conv's src pad; the probe
-        # fires when the first real buffer is about to be pushed
-        # downstream, and only then do we request the master_mixer sink
-        # pad and link it in. The probe then removes itself so the
-        # first buffer and everything after flows normally.
-        gate_conv_src = gate_conv.get_static_pad("src")
-        session.dj_mixer_pad_src = gate_conv_src
+        # Post-refactor: master_mixer's sink pad is already linked (via
+        # the persistent slot chain that has been streaming silence
+        # since engine startup), so there is NO "wait for first buffer
+        # before linking mixer" gating step here anymore -- that whole
+        # class of race is structurally gone. All we need is to flip
+        # the selector's active-pad from silence to webrtc-audio the
+        # moment the decode chain has real audio to deliver. A BUFFER
+        # probe on the queue's src pad detects the first real buffer
+        # and does exactly that. If we flipped immediately here instead
+        # of waiting, the selector would switch to sink_1 before it has
+        # produced any data, and the momentary underrun would surface
+        # as ~few-ms of drift while opusdec spins up -- the probe
+        # eliminates it.
+        queue_src = queue.get_static_pad("src")
+        session.dj_mixer_pad_src = queue_src
 
         # DIAGNOSTIC PROBE 1 -- caps events. Every caps event on this
         # pad gets timestamped and dumped to DJ_DIAG_LOG. If a caps
@@ -2394,7 +2595,7 @@ class PlaybackEngine:
                     pass
                 return Gst.PadProbeReturn.REMOVE
             return Gst.PadProbeReturn.OK
-        session.caps_probe_id = gate_conv_src.add_probe(
+        session.caps_probe_id = queue_src.add_probe(
             Gst.PadProbeType.EVENT_DOWNSTREAM, _caps_log_probe, None,
         )
 
@@ -2419,113 +2620,76 @@ class PlaybackEngine:
         # or import in Audacity as raw S16LE stereo 44100.
 
         def _on_first_buffer_ready(probed_pad, info, _u):
-          try:
-            s = self.remote_dj_session
-            if s is not session or s.master_mixer_pad is not None:
-                # Session was already stopped or the pad was linked in a
-                # race -- either way, just unblock.
-                return Gst.PadProbeReturn.REMOVE
-
-            # Align this pad's running-time offset before linking into
-            # master_mixer -- same treatment _create_deck applies via
-            # _apply_pad_offset for every new deck bin, and for the same
-            # reason: the remote-DJ decode chain starts producing buffers
-            # on an internal timeline near 0 (webrtcbin's RTP arrival
-            # frame), while master_mixer's other sink pads are at
-            # running_time = N seconds. Link without an offset correction
-            # and audiomixer's aggregator sees this pad's buffers as
-            # "seconds in the past" -- it either drops samples from the
-            # other pads to force alignment or emits fresh-allocation
-            # memory as it renegotiates timelines. Either failure mode
-            # audibly turns the previously-clean deck output into static
-            # the moment the remote-DJ pad is linked, then clears when
-            # the next deck's _apply_pad_offset re-anchors the mixer.
-            # This was the "flip of a coin remote-DJ static on the
-            # playing deck" bug caught in the logs 2026-07-20 08:26.
-            #
-            # Probe is scoped to BUFFER (not BLOCK_DOWNSTREAM) so it
-            # fires on a real buffer with a real PTS -- an earlier
-            # attempt used BLOCK_DOWNSTREAM which also fires on the
-            # caps event that precedes the first buffer, causing
-            # info.get_buffer() to return None, first_pts to fall back
-            # to 0, and the offset to overshoot by the full pipeline
-            # uptime. That killed all DJ audio, deterministically.
-            buf = info.get_buffer()
-            first_pts = buf.pts if (buf and buf.pts != Gst.CLOCK_TIME_NONE) else 0
-            clock = self.main_pipeline.get_clock()
-            if clock:
-                running_time = clock.get_time() - self.main_pipeline.get_base_time()
-                probed_pad.set_offset(running_time - first_pts)
-
-            s.master_mixer_pad = self.master_mixer.request_pad_simple("sink_%u")
-            probed_pad.link(s.master_mixer_pad)
-            print("  Remote DJ: real mic audio linked to master_mixer")
-            _dj_diag(s, f"linked to master_mixer (running_time={running_time if clock else 'no clock'}ns, first_pts={first_pts if clock else 'n/a'}ns)")
-
-            # Install the continuous PCM dump probe on the newly-created
-            # master_mixer sink pad. Everything that reaches the mixer
-            # via this pad gets written to DJ_DUMP_PCM. Defensively
-            # wrapped -- REMOVE on first exception to protect audio.
-            # Progress logged to diag every _DUMP_LOG_EVERY_BYTES so a
-            # post-mortem can correlate file offset with wall-clock time.
-            _DUMP_LOG_EVERY_BYTES = 44100 * 2 * 2  # ~1s of stereo S16
-            def _dump_probe(probed_pad2, info2, _u2):
-                try:
-                    s2 = self.remote_dj_session
-                    if s2 is not session or s2.dump_fh is None:
-                        return Gst.PadProbeReturn.REMOVE
-                    buf = info2.get_buffer()
-                    if buf is not None:
-                        ok, mapinfo = buf.map(Gst.MapFlags.READ)
-                        if ok:
-                            try:
-                                # Prefer mapinfo.size for the actual byte
-                                # count -- some PyGObject bindings return
-                                # a memoryview from mapinfo.data whose
-                                # len() doesn't match the true size, and
-                                # writing bytes(memoryview) can either
-                                # over-count or short-write. Sizing off
-                                # mapinfo.size + slicing is reliable.
-                                s2.dump_fh.write(bytes(mapinfo.data)[:mapinfo.size])
-                                s2.dump_bytes_written = getattr(s2, "dump_bytes_written", 0) + mapinfo.size
-                                # Periodic progress line
-                                last_marked = getattr(s2, "dump_last_marked_bytes", 0)
-                                if s2.dump_bytes_written - last_marked >= _DUMP_LOG_EVERY_BYTES:
-                                    _dj_diag(s2, f"dump_progress bytes={s2.dump_bytes_written} (~{s2.dump_bytes_written/176400:.2f}s of audio)")
-                                    s2.dump_last_marked_bytes = s2.dump_bytes_written
-                            except OSError:
-                                pass
-                            finally:
-                                buf.unmap(mapinfo)
-                except Exception as exc:
-                    try:
-                        _dj_diag(session, f"dump_probe DISABLED after exception: {exc!r}")
-                    except Exception:
-                        pass
+            """Fires when opusdec's first decoded buffer reaches the
+            end of the ephemeral decode chain. All this does now is
+            flip the slot's input-selector active-pad from silence to
+            the WebRTC path. No master_mixer touching, no pad request,
+            no offset math, no aggregator-state mutation -- the whole
+            class of bug that this function used to be structured
+            around is gone."""
+            try:
+                s = self.remote_dj_session
+                if s is not session or s.slot_id is None:
                     return Gst.PadProbeReturn.REMOVE
-                return Gst.PadProbeReturn.OK
-            try:
-                s.dump_probe_id = s.master_mixer_pad.add_probe(
-                    Gst.PadProbeType.BUFFER, _dump_probe, None,
-                )
-                _dj_diag(s, "dump probe installed on master_mixer sink pad")
+                slot2 = self.dj_slots[s.slot_id]
+                slot2.selector.set_property("active-pad", slot2.webrtc_pad)
+                print("  Remote DJ: slot selector switched from silence to WebRTC audio")
+                _dj_diag(s, f"slot {slot2.slot_id} selector switched to webrtc_pad (silence -> live)")
             except Exception as exc:
-                _dj_diag(s, f"dump probe INSTALL FAILED: {exc!r}")
-
+                try:
+                    _dj_diag(session, f"first_buffer_ready EXCEPTION (removing probe): {exc!r}")
+                except Exception:
+                    pass
+                print(f"  Remote DJ first-buffer probe exception (removing): {exc}")
             return Gst.PadProbeReturn.REMOVE
-          except Exception as exc:
-            try:
-                _dj_diag(session, f"first_buffer_ready EXCEPTION (removing probe to unblock): {exc!r}")
-            except Exception:
-                pass
-            print(f"  Remote DJ first-buffer probe exception (removing to unblock): {exc}")
-            return Gst.PadProbeReturn.REMOVE
-        gate_conv_src.add_probe(
+        queue_src.add_probe(
             Gst.PadProbeType.BLOCK | Gst.PadProbeType.BUFFER,
             _on_first_buffer_ready, None,
         )
 
-        print("  Remote DJ: decode chain wired; waiting for first buffer to link mixer")
+        # Continuous PCM dump probe -- unchanged intent (post-mortem of
+        # what audio actually flowed during this session) but now
+        # installed on queue_src (last element before the selector)
+        # rather than on a master_mixer sink pad that doesn't exist
+        # in the new design. Data is what the slot's selector sees on
+        # its webrtc_pad, which is what actually mixes into the master.
+        _DUMP_LOG_EVERY_BYTES = 44100 * 2 * 2  # ~1s of stereo S16
+        def _dump_probe(probed_pad2, info2, _u2):
+            try:
+                s2 = self.remote_dj_session
+                if s2 is not session or s2.dump_fh is None:
+                    return Gst.PadProbeReturn.REMOVE
+                buf = info2.get_buffer()
+                if buf is not None:
+                    ok, mapinfo = buf.map(Gst.MapFlags.READ)
+                    if ok:
+                        try:
+                            s2.dump_fh.write(bytes(mapinfo.data)[:mapinfo.size])
+                            s2.dump_bytes_written = getattr(s2, "dump_bytes_written", 0) + mapinfo.size
+                            last_marked = getattr(s2, "dump_last_marked_bytes", 0)
+                            if s2.dump_bytes_written - last_marked >= _DUMP_LOG_EVERY_BYTES:
+                                _dj_diag(s2, f"dump_progress bytes={s2.dump_bytes_written} (~{s2.dump_bytes_written/176400:.2f}s of audio)")
+                                s2.dump_last_marked_bytes = s2.dump_bytes_written
+                        except OSError:
+                            pass
+                        finally:
+                            buf.unmap(mapinfo)
+            except Exception as exc:
+                try:
+                    _dj_diag(session, f"dump_probe DISABLED after exception: {exc!r}")
+                except Exception:
+                    pass
+                return Gst.PadProbeReturn.REMOVE
+            return Gst.PadProbeReturn.OK
+        try:
+            session.dump_probe_id = queue_src.add_probe(
+                Gst.PadProbeType.BUFFER, _dump_probe, None,
+            )
+            _dj_diag(session, "dump probe installed on queue src (feeding slot selector)")
+        except Exception as exc:
+            _dj_diag(session, f"dump probe INSTALL FAILED: {exc!r}")
+
+        print("  Remote DJ: decode chain wired; waiting for first buffer to flip slot selector")
         session.real_buf_seen = True
 
     def _remote_dj_on_connection_state(self, element, _pspec):
@@ -2561,8 +2725,9 @@ class PlaybackEngine:
             # infrequently on network handover mid-session. gate_desired
             # is preserved so _remote_dj_on_connection_state's CONNECTED
             # branch can restore the DJ's intent on recovery.
-            if session.remote_gate is not None and session.remote_gate.get_property("volume") > 0.0:
-                session.remote_gate.set_property("volume", 0.0)
+            slot_dc = self.dj_slots[session.slot_id] if session.slot_id is not None else None
+            if slot_dc is not None and slot_dc.remote_gate.get_property("volume") > 0.0:
+                slot_dc.remote_gate.set_property("volume", 0.0)
                 self._apply_talk_ducking()
                 print("  Remote DJ: gate forced to 0 during transient disconnect (protecting playing deck)")
                 emit_event(
@@ -2578,10 +2743,10 @@ class PlaybackEngine:
             # muted after ICE renegotiates. First-time CONNECTED entry
             # doesn't reopen anything either (gate_desired starts False,
             # gate stays at its 0.0 initial value).
-            if (session.gate_desired
-                    and session.remote_gate is not None
-                    and session.remote_gate.get_property("volume") == 0.0):
-                session.remote_gate.set_property("volume", 1.0)
+            slot_rc = self.dj_slots[session.slot_id] if session.slot_id is not None else None
+            if (session.gate_desired and slot_rc is not None
+                    and slot_rc.remote_gate.get_property("volume") == 0.0):
+                slot_rc.remote_gate.set_property("volume", 1.0)
                 self._apply_talk_ducking()
                 print("  Remote DJ: gate restored to 1.0 after reconnect")
         elif state in (GstWebRTC.WebRTCPeerConnectionState.FAILED, GstWebRTC.WebRTCPeerConnectionState.CLOSED):
@@ -2589,16 +2754,17 @@ class PlaybackEngine:
 
     def _remote_dj_set_gate(self, active):
         session = self.remote_dj_session
-        if session is None or session.remote_gate is None:
+        if session is None or session.slot_id is None:
             print("  remote_dj_gate requested but no session is active — ignoring")
             return
+        slot = self.dj_slots[session.slot_id]
         # Remember the DJ's intent BEFORE touching the volume element --
         # if the connection is currently DISCONNECTED and we're being
         # asked to go active, we still record that intent so a later
         # reconnect can restore it, even though the physical volume
         # stays at 0 until the reconnect actually completes.
         session.gate_desired = active
-        session.remote_gate.set_property("volume", 1.0 if active else 0.0)
+        slot.remote_gate.set_property("volume", 1.0 if active else 0.0)
         self._apply_talk_ducking()
         self._apply_mic_mode_hold()
         print(f"  Remote DJ gate: {'ON' if active else 'OFF'}")
@@ -2610,9 +2776,14 @@ class PlaybackEngine:
         print("  Remote DJ: session stopping")
         self.remote_dj_session = None
 
-        # Safety first: close the gate before tearing anything down.
-        if session.remote_gate is not None:
-            session.remote_gate.set_property("volume", 0.0)
+        slot = self.dj_slots[session.slot_id] if session.slot_id is not None else None
+
+        # Safety first: close the gate before tearing anything down. In
+        # the persistent-slot design the gate is a slot property, not a
+        # session property, so it survives session teardown -- just set
+        # it back to 0 so the next session opens with the DJ muted.
+        if slot is not None:
+            slot.remote_gate.set_property("volume", 0.0)
             self._apply_talk_ducking()
             # Also fold any mic-held Manual back to Auto now that the
             # remote is definitively off -- session_stop is one of the
@@ -2620,27 +2791,26 @@ class PlaybackEngine:
             # isn't called.
             self._apply_mic_mode_hold()
 
-        # Teardown ordering that avoids master_mixer freeze:
-        # (1) UNLINK the master_mixer sink pad from its upstream peer
-        #     BEFORE setting anything to NULL. If we set upstream to NULL
-        #     while master_mixer's sink pad is still linked to it,
-        #     master_mixer's aggregator thread can end up trying to pull
-        #     buffers from a NULL-state pad and freeze -- observed live
-        #     during Stage 6 as "disconnect kills program audio". Same
-        #     lesson _on_mic_error's docstring already flagged for the
-        #     local mic bin ("unlinking a live-mixer-linked bin mid-flight
-        #     is the riskier operation, reserved for planned transitions");
-        #     a remote-DJ hangup is one of those planned transitions but
-        #     the release half specifically needed this ordering fix.
-        # (2) Release the master_mixer sink pad next -- it's now orphaned
-        #     (unlinked upstream) so it can be released safely.
-        # (3) Same pattern for monitor_tee_pad on the outbound branch.
-        # (4) Only THEN set upstream elements to NULL and remove them.
-        if session.master_mixer_pad is not None:
-            peer = session.master_mixer_pad.get_peer()
+        # Persistent-slot teardown -- structurally simpler than the
+        # pre-refactor path:
+        # (1) Flip the slot's input-selector active-pad back to the
+        #     silence path FIRST. From this instant the slot's
+        #     downstream chain is fed by the always-running silence
+        #     source rather than the WebRTC decode chain we're about
+        #     to tear down. No underrun window for master_mixer.
+        # (2) Unlink the ephemeral WebRTC decode chain from the slot's
+        #     webrtc_pad. The pad itself stays -- pre-allocated,
+        #     ready for the next session.
+        # (3) THEN set the ephemeral elements to NULL and remove them.
+        # (4) Same monitor-tee handling as before.
+        # NOTE: no master_mixer touching at any point. The slot's
+        # master_mixer pad has never been released and never will be
+        # for the pipeline's lifetime.
+        if slot is not None:
+            slot.selector.set_property("active-pad", slot.silence_pad)
+            peer = slot.webrtc_pad.get_peer()
             if peer is not None:
-                peer.unlink(session.master_mixer_pad)
-            self.master_mixer.release_request_pad(session.master_mixer_pad)
+                peer.unlink(slot.webrtc_pad)
         if session.monitor_tee_pad is not None:
             peer = session.monitor_tee_pad.get_peer()
             if peer is not None:
@@ -2656,6 +2826,15 @@ class PlaybackEngine:
             el.set_state(Gst.State.NULL)
         for el in session.elements:
             self.main_pipeline.remove(el)
+
+        # Release the slot back to the pool -- the ONLY per-session
+        # bookkeeping we do on the persistent audio path. The slot's
+        # elements (silence source, selector, gain, gate, master_mixer
+        # pad) stay intact; they'll continue driving silence into the
+        # mixer until the next session claims this slot.
+        if slot is not None:
+            slot.session = None
+            _dj_diag(session, f"slot {slot.slot_id} released back to pool")
 
         if self._remote_dj_server:
             self._remote_dj_server.disconnect_threadsafe()
