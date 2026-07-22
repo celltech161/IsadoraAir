@@ -1,7 +1,9 @@
 [Unit]
-Description=Restart isadoraair-engine.service (fired once by isadoraair-engine-boot-restart.timer)
-After=isadoraair-engine.service
+Description=Restart isadoraair-engine.service if silence is detected (fired once by isadoraair-engine-boot-restart.timer)
+# Depends on encoders because the silence-detector state file we read
+# is written by liquidsoap's blank.detect inside that service.
+After=isadoraair-engine.service isadoraair-encoders.service
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/systemctl restart isadoraair-engine.service
+ExecStart=/usr/local/bin/isadoraair-engine-boot-restart.sh
