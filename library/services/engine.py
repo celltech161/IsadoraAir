@@ -683,6 +683,25 @@ class PlaybackEngine:
             # Monitor's card vs this ALSA loopback's virtual one).
             self.stereotool_sink.set_property("sync", False)
             self.stereotool_sink.set_property("async", False)
+            # Enlarged ALSA ring on this sink specifically -- the Studio
+            # Monitor sink stays at the driver default. Rationale: clicks
+            # were being heard on the FM output and on the streams (both
+            # fed downstream of StereoTool) but NOT on the studio monitor,
+            # localizing the fault to this loopback-fed segment. Kernel
+            # xrun counters were all zero at the times of audible clicks
+            # -- consistent with StereoTool covering brief input starves
+            # with its last-frame pad rather than surfacing an error.
+            # Widening the writer-side ALSA ring here from the driver
+            # default (~43 ms at the 5-period × 8.7-ms loopback default)
+            # to ~200 ms gives ~4.6x more runway before a scheduler stall
+            # on the engine's master_mixer:src thread starves the read
+            # side. latency-time=20000 keeps ~10 periods per buffer so
+            # ALSA still wakes the writer roughly every 20 ms. Cost is
+            # ~160 ms extra one-way latency between the engine and
+            # StereoTool -- inconsequential for a broadcast chain, the
+            # studio-monitor branch is unaffected.
+            self.stereotool_sink.set_property("buffer-time", 200000)
+            self.stereotool_sink.set_property("latency-time", 20000)
             elements += [stereotool_tee, stereotool_queue, self.stereotool_sink]
 
         # Mic input — only built if a device is actually configured;
