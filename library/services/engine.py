@@ -1983,12 +1983,24 @@ class PlaybackEngine:
         saves."""
         cfg = DuckingConfig.load()
         remote_live = bool(
-            self.remote_dj_session and self.remote_dj_session.remote_gate
-            and self.remote_dj_session.remote_gate.get_property("volume") > 0.0
+            self._remote_dj_gate_open()  # persistent-slot accessor
         )
         any_live = self.mic_live or remote_live
         target = (10 ** (cfg.duck_level_db / 20.0)) if (cfg.enabled and any_live) else 1.0
         self._start_duck_ramp(target)
+
+    def _remote_dj_gate_open(self):
+        """True iff a DJ session is currently active AND its slot's
+        gate volume is nonzero -- i.e., the remote DJ is broadcasting
+        on-air right now. Post-refactor accessor: the gate lives on
+        the persistent slot, not on the session (see RemoteDJSlot).
+        Callers just want "is a remote mic live?" for ducking and
+        mic-mode-hold decisions; this hides the slot lookup and
+        None-checks in one place."""
+        s = self.remote_dj_session
+        if s is None or s.slot_id is None or s.slot_id >= len(self.dj_slots):
+            return False
+        return self.dj_slots[s.slot_id].remote_gate.get_property("volume") > 0.0
 
     def _set_mic_ptt(self, active):
         if self.mic_ptt_volume is None:
@@ -2002,8 +2014,7 @@ class PlaybackEngine:
 
     def _any_mic_live(self):
         return self.mic_live or bool(
-            self.remote_dj_session and self.remote_dj_session.remote_gate
-            and self.remote_dj_session.remote_gate.get_property("volume") > 0.0
+            self._remote_dj_gate_open()  # persistent-slot accessor
         )
 
     def _apply_mic_mode_hold(self):
@@ -3480,10 +3491,7 @@ class PlaybackEngine:
                 # connected right now, remote_dj_live is the gate state.
                 "remote_dj_configured": self.remote_dj_tee is not None,
                 "remote_dj_connected": self.remote_dj_session is not None,
-                "remote_dj_live": bool(
-                    self.remote_dj_session and self.remote_dj_session.remote_gate
-                    and self.remote_dj_session.remote_gate.get_property("volume") > 0.0
-                ),
+                "remote_dj_live": self._remote_dj_gate_open(),
             }
 
             tmp = STATE_PATH.with_suffix(".tmp")
