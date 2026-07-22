@@ -1,0 +1,27 @@
+[Unit]
+Description=IsadoraAir CPU frequency floor (raises intel_pstate min_perf_pct)
+Documentation=man:intel_pstate(7)
+# intel_pstate creates its sysfs tree before basic.target, so this is fine.
+After=basic.target
+ConditionPathExists=/sys/devices/system/cpu/intel_pstate/min_perf_pct
+
+[Service]
+# Boots the min_perf_pct value to reduce the CPU frequency-scaling
+# dead zone. Default 17 lets cores idle down to ~800 MHz, and the
+# reactive ramp back up to turbo (5-20 ms) was contributing to
+# sporadic audio clicks in the on-air chain between the playback
+# engine and StereoTool. See commit de63a15 (the sink-buffer widen)
+# and its follow-up for the diagnosis. 35 gives a nominal ~1.6 GHz
+# floor; enough headroom that no ramp is ever a "cold start" but
+# still lets the box back off from full boost when idle.
+# Bump to 50 (~2.3 GHz floor) if clicks ever return under heavy
+# background load.
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'echo 35 > /sys/devices/system/cpu/intel_pstate/min_perf_pct'
+# Nice to have: revert to the vendor default on stop, so `systemctl
+# stop isadoraair-cpu-floor` is a clean rollback.
+ExecStop=/bin/sh -c 'echo 17 > /sys/devices/system/cpu/intel_pstate/min_perf_pct'
+
+[Install]
+WantedBy=multi-user.target
