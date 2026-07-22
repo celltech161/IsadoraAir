@@ -1291,9 +1291,23 @@ class PlaybackEngine:
         print(f"  Advanced active queue to next hour ahead of TOH: {log.date} {log.hour:02d}:00 ({len(items)} items)")
 
     def _ensure_log_approved(self, target_date, hour):
-        """Build + approve target_date/hour's log if nothing exists yet
-        for it. Returns True if a log was built just now."""
-        if PlaylistLog.objects.filter(date=target_date, hour=hour).exists():
+        """Build + approve target_date/hour's log if no APPROVED log
+        exists for it yet. A leftover DRAFT does not count -- draft
+        means "not committed for on-air" and must never block auto-
+        build, or a user who built a preview and forgot to approve/
+        discard it silently starves the scheduler at that hour's TOH.
+        (Caught live 2026-07-22: 1pm draft existed unapproved from an
+        earlier demo, engine's advance-to-next-hour couldn't find an
+        approved log at 12:59, and playback fell back to the previous
+        approved hour (12pm news repeated).) Returns True if a log was
+        built just now.
+
+        No need to delete the draft explicitly: build_hour_log's
+        _persist_log call already runs
+        `PlaylistLog.objects.filter(date, hour).delete()` before
+        creating the fresh row (unique_together on (date, hour) makes
+        that mandatory anyway)."""
+        if PlaylistLog.objects.filter(date=target_date, hour=hour, status="approved").exists():
             return False
 
         log, error = build_hour_log(target_date, hour)
