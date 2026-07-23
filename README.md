@@ -91,6 +91,8 @@ IsadoraAir manages the full music library, schedule programming, playlist genera
 - Analysis Configuration (cue-in/next-start dBFS thresholds), Recency Configuration, Log Fill Configuration, Remote DJ Configuration (STUN server, ICE UDP port range, gain)
 - UI Theme: site-wide color palette and nav clock styling, editable with a native color+opacity picker, no page reload required
 - Admin-editable navigation menu (Config → Nav Menu): labels, target URLs (Django URL name or arbitrary URL), one level of dropdown children, drag-sort, per-item active-highlighting hints — no template edits needed to reshape the top nav
+- Group-based access control: non-staff/superuser users are gated to the union of allowed paths for their Django groups, admin-editable via a `GroupAccess` model (Groups → access inline) — no code edit to grant a group a new URL prefix. Ships seeded with a `remote_dj` group (Remote DJ console + read-only library + track detail) and a `Contributor` group (library browse + upload their own tracks, no editing others'). Cached in-process and invalidated on save so an admin change takes effect on the very next request
+- Station timezone (Config → Station Time): every displayed time on the site (dashboard clocks, schedule current-hour highlight, log timestamps, Coming Up ETAs) is pinned to the admin-selected IANA zone regardless of the viewer's device timezone. Applies to server-side render + client-side JS clocks alike, no restart
 - EmailLog (Logs section): every outgoing email sent through Django's mail API — password resets, admin invites, monitoring alerts, anything — leaves a read-only row in the admin. Bodies truncated at 10k chars with a visible marker; auto-pruned after 90 days by a systemd timer (`isadoraair-prune-emaillog.timer`)
 - Password-reset flow with "Forgot password?" on the login page + an admin-side invite button for creating no-password accounts and mailing them a setup link
 - django-axes login lockout on repeated failed sign-ins
@@ -269,6 +271,20 @@ Actively running end-to-end on a live station: schedule → log builder → play
 ## Security
 
 For security concerns, see [SECURITY.md](SECURITY.md). Please report privately rather than opening a public issue.
+
+## Support & Community
+
+Ground rules for the GitHub side of this project — please read before opening an issue.
+
+**Issues are for bona fide code defects only.** Reproducible bugs, crashes, factual errors in documentation, and security concerns (report those privately — see above) are on-topic. A minimal reproduction, the exact command that failed, and the full traceback / log line are what turn a report into something actionable.
+
+**Support requests, "how do I set this up," "what's the right config for my station," and general help-me questions will be closed.** IsadoraAir is a working piece of software published for others to learn from, adapt, and run themselves — it is not a supported product. The code is open, the README is thorough, the Django / GStreamer / Liquidsoap / nginx upstream docs are excellent, and reading them is the expected first step.
+
+**There is no official Discord, Slack, IRC channel, subreddit, mailing list, or forum for IsadoraAir.** If one appears, it is unaffiliated with this project; nothing said there is guidance from the maintainer, and no advice found there should be treated as authoritative.
+
+**Response times are best-effort, as time permits.** This project is maintained around actually running a radio station; issues and pull requests are looked at when there's time between transmitter maintenance, on-air work, and everything else a small station requires. Silence on an issue is not disinterest, but it is also not a promise of eventual reply. If you rely on IsadoraAir in production, plan to be able to read and patch the code yourself.
+
+**Pull requests are welcome and are the fastest path to seeing a change land.** A PR with a working patch (and, where relevant, a note on how you tested it) will get looked at before a feature-request issue with no code. Small, focused PRs land faster than large sweeping ones.
 
 ## License
 
