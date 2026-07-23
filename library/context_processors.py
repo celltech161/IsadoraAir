@@ -1,4 +1,9 @@
-from .middleware import get_group_access_map, get_station_timezone, user_is_contributor
+from .middleware import (
+    get_group_access_map,
+    get_station_timezone,
+    user_is_contributor,
+    user_is_library_read_only,
+)
 from .models import NavMenuItem, UITheme
 
 
@@ -28,9 +33,19 @@ def access_flags(request):
       is_contributor -- current user is in the Contributor group AND
                         not staff/superuser (so a staff account in
                         the Contributor group -- unusual, but possible
-                        -- still gets the full-privileges view)."""
+                        -- still gets the full-privileges view).
+      is_library_read_only -- current user is a non-staff/superuser
+                        library-viewer role: Contributor OR remote_dj.
+                        Templates use this to hide mutation UI
+                        (save/delete/bulk-actions) across library.html
+                        and track_detail.html so the same read-only
+                        layout serves both roles without duplicating
+                        guards."""
     user = getattr(request, "user", None)
-    return {"is_contributor": user_is_contributor(user)}
+    return {
+        "is_contributor": user_is_contributor(user),
+        "is_library_read_only": user_is_library_read_only(user),
+    }
 
 
 def nav_menu(request):

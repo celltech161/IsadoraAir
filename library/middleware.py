@@ -78,6 +78,21 @@ def user_is_contributor(user):
     )
 
 
+def user_is_library_read_only(user):
+    """True for any authenticated non-staff/non-superuser whose group
+    membership grants library READ access but not write. Currently
+    that's Contributor OR remote_dj. Used by both view-side gating
+    (api_track_detail 403s writes) and template-side UX (hide save/
+    delete/bulk-action UI). Staff/superuser bypass this check --
+    they get the full editor. Introducing a new read-only-viewer
+    group later is a data change plus one added group name here."""
+    return bool(
+        user and user.is_authenticated
+        and not user.is_staff and not user.is_superuser
+        and user.groups.filter(name__in=("Contributor", "remote_dj")).exists()
+    )
+
+
 class GroupBasedAccessMiddleware:
     """Restricts non-staff/non-superuser authenticated users to the
     union of their recognized groups' allowed paths, as configured in

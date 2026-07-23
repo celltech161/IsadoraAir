@@ -1129,7 +1129,7 @@ def _delete_track_and_file(track):
 
 @require_http_methods(["GET", "PATCH", "DELETE"])
 def api_track_detail(request, pk):
-    from library.middleware import user_is_contributor
+    from library.middleware import user_is_contributor, user_is_library_read_only
 
     track = get_object_or_404(
         Track.objects.select_related("artist", "album", "genre", "category"), pk=pk
@@ -1138,18 +1138,22 @@ def api_track_detail(request, pk):
     if request.method == "GET":
         return JsonResponse(_track_to_dict(track))
 
-    # Contributors are read-only on every track EXCEPT they may DELETE
-    # their own not-yet-reviewed uploads. All other write operations
-    # (PUT, PATCH, POST, or DELETE on a not-owned or already-reviewed
-    # track) get 403'd. Staff/superuser bypass this check.
-    if user_is_contributor(request.user):
-        is_own_upload = (
-            track.uploaded_by_id == request.user.id
-            and track.ready2air is False
-        )
-        if request.method == "DELETE" and not is_own_upload:
-            return JsonResponse({"error": "You can only delete your own not-yet-approved uploads."}, status=403)
-        if request.method not in ("GET", "DELETE"):
+    # Library-read-only roles (Contributor OR remote_dj) are blocked from
+    # every write EXCEPT one Contributor-specific carve-out: a Contributor
+    # may DELETE their own not-yet-reviewed upload. remote_dj is fully
+    # read-only -- they can only ever GET here. Staff/superuser bypass.
+    if user_is_library_read_only(request.user):
+        if user_is_contributor(request.user):
+            is_own_upload = (
+                track.uploaded_by_id == request.user.id
+                and track.ready2air is False
+            )
+            if request.method == "DELETE" and not is_own_upload:
+                return JsonResponse({"error": "You can only delete your own not-yet-approved uploads."}, status=403)
+            if request.method not in ("GET", "DELETE"):
+                return JsonResponse({"error": "Read-only for this account."}, status=403)
+        else:
+            # remote_dj (or any future non-Contributor read-only role)
             return JsonResponse({"error": "Read-only for this account."}, status=403)
 
     if request.method == "DELETE":
