@@ -1,4 +1,6 @@
 .env
+.env.*
+*.bak
 __pycache__/
 *.pyc
 venv/
@@ -8,3 +10,4 @@ legacy/
 staticfiles/
 PROJECT_NOTES.md
 media/album_art_cache/
+media/ui_theme/
