@@ -523,7 +523,17 @@ function ripAnother() {
   showState('Idle');
 }
 
-// On page load, resume monitoring if there's an active rip.
+{% if not is_contributor %}
+// On page load, resume monitoring if there's an active rip. Gated
+// behind is_contributor to match the CD panel HTML (which is only
+// rendered for non-Contributor roles). Without this gate the fetch
+// still fires for Contributors -- middleware 403s it, the try/catch
+// swallows the JSON parse error, and no visible harm is done, but
+// the access log fills with spurious 403 rows and access-log alerting
+// eventually cries wolf. The rest of the CD-panel JS (detectCD,
+// showState, etc.) stays defined for everyone since it's inert
+// without the panel's buttons to invoke it, and gating each function
+// individually would multiply the noise.
 (async function initCDPanel() {
   try {
     const resp = await fetch("{% url 'library:api-cd-rip-status' %}");
@@ -537,6 +547,7 @@ function ripAnother() {
     }
   } catch (e) {}
 })();
+{% endif %}
 
 
 // ============================================================
