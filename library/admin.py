@@ -50,7 +50,7 @@ from .models import (
 # Every model keeps living in `library` underneath — only the admin UI
 # grouping changes.
 _TRAFFIC_MODELS = {"playlist", "rotation", "scheduleblock", "playlistlog"}
-_CONFIG_MODELS = {"analysisconfig", "recencyconfig", "uitheme", "logfillconfig", "uploadconfig", "navmenuitem", "remotedjconfig"}
+_CONFIG_MODELS = {"analysisconfig", "recencyconfig", "uitheme", "logfillconfig", "uploadconfig", "navmenuitem", "remotedjconfig", "stationtimeconfig"}
 _LOG_MODELS = {"emaillog"}
 
 
@@ -624,6 +624,18 @@ class UploadConfigAdmin(admin.ModelAdmin):
         }),
     ]
 
+    def has_add_permission(self, request):
+        return not UploadConfig.objects.exists()
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+    def changelist_view(self, request, extra_context=None):
+        obj = UploadConfig.load()
+        return HttpResponseRedirect(
+            reverse("admin:library_uploadconfig_change", args=[obj.pk])
+        )
+
 
 @admin.register(StationTimeConfig)
 class StationTimeConfigAdmin(admin.ModelAdmin):
@@ -656,18 +668,6 @@ class StationTimeConfigAdmin(admin.ModelAdmin):
         obj = StationTimeConfig.load()
         return HttpResponseRedirect(
             reverse("admin:library_stationtimeconfig_change", args=[obj.pk])
-        )
-
-    def has_add_permission(self, request):
-        return not UploadConfig.objects.exists()
-
-    def has_delete_permission(self, request, obj=None):
-        return False
-
-    def changelist_view(self, request, extra_context=None):
-        obj = UploadConfig.load()
-        return HttpResponseRedirect(
-            reverse("admin:library_uploadconfig_change", args=[obj.pk])
         )
 
 
