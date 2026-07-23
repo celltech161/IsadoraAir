@@ -28,7 +28,7 @@ DEBUG = config('DEBUG', default=False, cast=bool)
 
 ALLOWED_HOSTS = config(
     'ALLOWED_HOSTS',
-    default='localhost,127.0.0.1,isadoraair,192.168.1.125',
+    default='localhost,127.0.0.1,isadoraair',
     cast=lambda v: [h.strip() for h in v.split(',')],
 )
 
@@ -209,6 +209,12 @@ WEATHER_DATA_DIR = config('WEATHER_DATA_DIR', default='/var/lib/isadoraair/weath
 # (admin: /admin/library/cdripconfig/) so replacing the drive doesn't
 # need a redeploy. See library/models.py CDRipConfig for defaults.
 
+# MusicBrainz asks callers of its API to identify themselves via a
+# useragent contact string (see https://musicbrainz.org/doc/MusicBrainz_API/Rate_Limiting)
+# so they can reach out if a client misbehaves. Set this to an email
+# address the station operator actually reads.
+MUSICBRAINZ_CONTACT = config('MUSICBRAINZ_CONTACT', default='')
+
 # --- Audio analysis thresholds ---
 ANALYSIS_SAMPLE_RATE = config('ANALYSIS_SAMPLE_RATE', default=4410, cast=int)
 ANALYSIS_WINDOW_SECONDS = config('ANALYSIS_WINDOW_SECONDS', default=0.05, cast=float)
@@ -220,7 +226,7 @@ CUE_IN_MIN_SECONDS = config('CUE_IN_MIN_SECONDS', default=0.1, cast=float)
 SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
 CSRF_TRUSTED_ORIGINS = config(
     'CSRF_TRUSTED_ORIGINS',
-    default='https://isadoraair,https://192.168.1.125',
+    default='https://isadoraair,https://127.0.0.1',
     cast=lambda v: [o.strip() for o in v.split(',')],
 )
 

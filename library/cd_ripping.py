@@ -49,12 +49,16 @@ def _flatten_artist_credit(credit):
 def _configure_mb_client():
     """MusicBrainz asks that clients set a useragent so they can
     identify traffic sources -- do it here so both the detect
-    endpoint and the rip job use the same string."""
+    endpoint and the rip job use the same string. Contact email
+    comes from settings.MUSICBRAINZ_CONTACT (env: MUSICBRAINZ_CONTACT);
+    empty is legal but MusicBrainz rate-limits harder for anonymous
+    callers."""
     import musicbrainzngs
+    from django.conf import settings
     musicbrainzngs.set_useragent(
         app="IsadoraAir",
         version="1.0",
-        contact="kansasaerial@gmail.com",
+        contact=getattr(settings, "MUSICBRAINZ_CONTACT", "") or "unset@example.invalid",
     )
 
 

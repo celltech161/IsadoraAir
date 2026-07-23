@@ -71,6 +71,11 @@ IsadoraAir manages the full music library, schedule programming, playlist genera
 - "Coming Up" queue table for the full remaining hour — drag-to-reorder (mouse and touch, same Pointer Events code path), insert a track by search, per-row "force next" button, color-coded by Category Kind
 - Manual "play a playlist now" override, a "Restart Engine" recovery button, Studio Mic PTT, and a Remote Mic gate button that lights up when a remote DJ is connected
 
+**Aircheck Recording** (`aircheck/` app)
+- Captures what actually went out over the air, on demand, from any dashboard — start/stop button, session list with duration + file size + status
+- Backed by a persistent liquidsoap `output.file` block driven over telnet (`aircheck.reopen`), so no per-session ffmpeg subprocess is spawned and no ALSA device is contended with the encoders — the same in-process source that feeds Icecast/Shoutcast is what gets written to disk
+- HE-AAC encodes are remuxed async on stop for compact archival (~1/10th the size of FLAC) without blocking the session state, so a "did I really air that ad?" question a week later is a browser click away
+
 **Streaming Encoders** (`encoders/` app, `isadoraair-encoders` service)
 - Liquidsoap-backed relay to Icecast and Shoutcast (v1/v2) mounts, one process per shared ALSA capture device fanning out to every enabled stream (mp3/aac/vorbis) on that device
 - Live now-playing metadata pushed to each stream from the playback engine
@@ -265,6 +270,17 @@ ogremote-ingest companion projects.
 | 10. Email + admin infrastructure | Complete — EmailLog transport-layer capture, invite/reset flows, admin-editable nav menu, django-axes lockout |
 
 Actively running end-to-end on a live station: schedule → log builder → playback engine → StereoTool → transmitter, plus live streaming, RDS, monitoring, remote DJ, and content ingestion.
+
+## Roadmap and current scope
+
+Things a station operator might expect that IsadoraAir doesn't ship today. Some are on the near-term roadmap, some are permanent non-goals; both are called out so you know what you're getting:
+
+- **EAS (Emergency Alert System)** — permanently external. Compliant EAS is always a hardware ENDEC (Sage/DASDEC/Trilithic) that inserts into the audio chain physically upstream of automation, so the alert reaches air even if the automation box is down. Vendor-side software EAS exists in development form but has no FCC approval as of this writing; when a software path becomes a compliant option, IsadoraAir intends to be an early adopter.
+- **Voice tracking** — pre-recorded DJ segments dropped between specific tracks so an automated hour sounds hosted. Planned, not yet implemented.
+- **Royalty / SoundExchange reporting** — statutory-license logs for non-commercial webcasters. `PlaylistLog` already captures what played and when; the export side is the near-term next feature.
+- **Commercial-style traffic** — underwriting spot scheduling, affidavit reports, PSA rotation tracking. The current "Traffic" admin section is programming-side (Rotations, Playlists, ScheduleBlocks), not spot-side. Planned.
+- **Cart wall / instant hot keys** — one-click drops/stingers/jingles for live-assist. Planned.
+- **Automatic backup-audio failover** — if the playback engine dies mid-song, `isadoraair-engine-boot-restart.timer` catches silence and force-restarts the service, but there is no hot-swap to a redundant source. Streaming has Liquidsoap fallback logic; the FM side does not (yet).
 
 ## Security
 
