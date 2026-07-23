@@ -1,4 +1,4 @@
-from .middleware import get_group_access_map, user_is_contributor
+from .middleware import get_group_access_map, get_station_timezone, user_is_contributor
 from .models import NavMenuItem, UITheme
 
 
@@ -7,19 +7,14 @@ def ui_theme(request):
 
 
 def station_timezone(request):
-    """Expose Django's TIME_ZONE setting as a template variable so
+    """Expose the current station timezone as a template variable so
     client-side JS can render every displayed time in the station's
-    timezone regardless of the viewer's device timezone. Live-caught
-    on a vacation-away-from-home trip in 2026 -- the operator's phone
-    (running on Mountain Time) showed the /schedule/ current-hour
-    highlight one hour off from what was actually playing, and the
-    dashboard's Coming Up clock displayed local-to-phone times. All
-    of that came from the default `new Date().toLocaleTimeString()`
-    behavior which uses the viewer's OS timezone. Now every such call
-    is passed { timeZone: STATION_TIMEZONE } and the schedule's
-    getHours()/getDay() logic runs against the station's timezone."""
-    from django.conf import settings
-    return {"station_timezone": settings.TIME_ZONE}
+    zone regardless of the viewer's device timezone. Source of truth
+    is the admin-editable StationTimeConfig singleton (Config >
+    Station Time), cached in library.middleware.get_station_timezone
+    and invalidated on save. See StationTimeConfig's docstring for
+    the vacation-Mountain-Time bug that motivated this."""
+    return {"station_timezone": get_station_timezone()}
 
 
 def access_flags(request):

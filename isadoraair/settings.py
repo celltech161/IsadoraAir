@@ -64,6 +64,7 @@ MIDDLEWARE = [
     'axes.middleware.AxesMiddleware',
     'django.contrib.auth.middleware.LoginRequiredMiddleware',
     'library.middleware.GroupBasedAccessMiddleware',
+    'library.middleware.StationTimeActivateMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]

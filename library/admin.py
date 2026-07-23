@@ -35,6 +35,7 @@ from .models import (
     RotationSlot,
     ScheduleBlock,
     Genre,
+    StationTimeConfig,
     Track,
     UITheme,
     CDRipConfig,
@@ -622,6 +623,40 @@ class UploadConfigAdmin(admin.ModelAdmin):
                             "/etc/nginx/sites-available/isadoraair.",
         }),
     ]
+
+
+@admin.register(StationTimeConfig)
+class StationTimeConfigAdmin(admin.ModelAdmin):
+    """Singleton: the station's operating timezone. Picks from every
+    IANA zone the running Python knows about (~400+). Applied to
+    every UI clock, the /schedule/ current-hour highlight, Coming Up
+    ETAs, and event timestamps. Takes effect on the very next
+    request -- no code edit, no gunicorn restart."""
+    fieldsets = [
+        (None, {
+            "fields": ["timezone"],
+            "description": (
+                "Displayed times across the site are pinned to this "
+                "timezone regardless of a viewer's device timezone. "
+                "Stored data in the database stays UTC; only display "
+                "shifts."
+            ),
+        }),
+    ]
+
+    def has_add_permission(self, request):
+        return not StationTimeConfig.objects.exists()
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+    def changelist_view(self, request, extra_context=None):
+        from django.http import HttpResponseRedirect
+        from django.urls import reverse
+        obj = StationTimeConfig.load()
+        return HttpResponseRedirect(
+            reverse("admin:library_stationtimeconfig_change", args=[obj.pk])
+        )
 
     def has_add_permission(self, request):
         return not UploadConfig.objects.exists()

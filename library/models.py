@@ -816,6 +816,90 @@ class UITheme(models.Model):
         return obj
 
 
+def _timezone_choices():
+    """All IANA timezones the running Python knows about, alphabetized.
+    Called lazily (not at import time) so a system with a corrupted
+    tzdata install still lets the migration path run to the point of
+    a diagnostic error instead of failing at model definition.
+    Wrapped defensively -- `available_timezones()` requires a working
+    IANA database. On the vanishingly unlikely event that fails, we
+    fall back to a small canonical shortlist that at least covers the
+    US market this project targets by default."""
+    try:
+        from zoneinfo import available_timezones
+        return sorted((tz, tz) for tz in available_timezones())
+    except Exception:
+        return [
+            ("America/Chicago", "America/Chicago"),
+            ("America/New_York", "America/New_York"),
+            ("America/Denver", "America/Denver"),
+            ("America/Los_Angeles", "America/Los_Angeles"),
+            ("America/Anchorage", "America/Anchorage"),
+            ("Pacific/Honolulu", "Pacific/Honolulu"),
+            ("UTC", "UTC"),
+        ]
+
+
+class StationTimeConfig(models.Model):
+    """Singleton -- the station's operating timezone, displayed in every
+    UI surface regardless of the viewing device's local timezone. Live-
+    caught 2026 on a Mountain Time vacation: the operator's phone-side
+    time rendering (schedule current-hour highlight, dashboard clocks)
+    disagreed with what was actually playing back at the studio.
+
+    The commit that first fixed this read Django's settings.TIME_ZONE
+    directly (compile-time; requires a code edit + gunicorn restart).
+    Moving the source of truth to this admin-editable singleton means
+    a fresh deploy in any timezone just picks it from the dropdown --
+    no code touch, no restart.
+
+    Implementation note: Django's settings.TIME_ZONE is baked at process
+    startup and can't be swapped at runtime. What CAN be swapped is the
+    ACTIVE timezone (django.utils.timezone.activate), the officially-
+    supported per-request timezone control mechanism Django exposes.
+    library.middleware.StationTimeActivateMiddleware activates this
+    singleton's value at the start of every request; all
+    django.utils.timezone calls, template date/time filters, and
+    admin datetime renders respect that automatically. Stored
+    timestamps stay UTC (USE_TZ=True default); only display shifts.
+
+    If this row doesn't exist yet on a very fresh install (before the
+    seed migration runs), load() falls back to settings.TIME_ZONE
+    itself -- never a broken state."""
+    timezone = models.CharField(
+        max_length=64,
+        choices=_timezone_choices,
+        default="America/Chicago",
+        verbose_name="Station timezone",
+        help_text="The station's operating timezone. Every UI clock, "
+                   "the /schedule/ current-hour highlight, Coming Up "
+                   "queue ETAs, and event timestamps render in this "
+                   "zone regardless of the viewing device's local "
+                   "timezone. Applied at request time via "
+                   "django.utils.timezone.activate; stored DB timestamps "
+                   "stay UTC and are unchanged by edits here.",
+    )
+
+    class Meta:
+        verbose_name = "Station Time"
+        verbose_name_plural = "Station Time"
+
+    def __str__(self):
+        return f"Station Time ({self.timezone})"
+
+    def save(self, *args, **kwargs):
+        self.pk = 1
+        super().save(*args, **kwargs)
+
+    @classmethod
+    def load(cls):
+        from django.conf import settings
+        obj, _created = cls.objects.get_or_create(
+            pk=1, defaults={"timezone": getattr(settings, "TIME_ZONE", "UTC")},
+        )
+        return obj
+
+
 class GroupAccess(models.Model):
     """Per-group access rules for the site's URL surface. Middleware
     (library.middleware.GroupBasedAccessMiddleware) reads this table

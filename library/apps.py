@@ -12,8 +12,12 @@ class LibraryConfig(AppConfig):
         # case where it's imported before AppConfig.ready runs, e.g.
         # inline test setup), and post_save.connect is idempotent
         # with weak=False plus the same receiver identity.
-        from library.middleware import _wire_signals
+        from library.middleware import _wire_signals, _wire_station_tz_signals
         try:
             _wire_signals()
+        except Exception:
+            pass
+        try:
+            _wire_station_tz_signals()
         except Exception:
             pass

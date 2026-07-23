@@ -4,6 +4,7 @@ from django.db.models.signals import post_delete, post_save
 from django.dispatch import receiver
 from django.http import HttpResponseForbidden
 from django.shortcuts import redirect
+from django.utils import timezone as dj_timezone
 
 
 # Paths always allowed for any authenticated user, regardless of group
@@ -183,3 +184,86 @@ except Exception:
 # Backward-compat alias. Nothing in-tree still imports this, but any
 # out-of-tree deploy pinned to the old name keeps working.
 RemoteDJRestrictMiddleware = GroupBasedAccessMiddleware
+
+
+# Module-level cache of the current station timezone string. Read from
+# the StationTimeConfig singleton lazily; invalidated by the same
+# signal pattern GroupAccess uses so an admin edit lands in the very
+# next request without a gunicorn restart.
+_STATION_TZ_CACHE = None
+
+
+def _load_station_timezone():
+    """Read the singleton StationTimeConfig row and return its
+    timezone string. Falls back to settings.TIME_ZONE if the row
+    doesn't exist yet (very fresh install pre-seed) or the DB isn't
+    reachable during a management command that runs before
+    migrate."""
+    from django.conf import settings
+    try:
+        from library.models import StationTimeConfig
+        return StationTimeConfig.load().timezone
+    except Exception:
+        return getattr(settings, "TIME_ZONE", "UTC")
+
+
+def get_station_timezone():
+    """Public accessor used by both the middleware and the
+    station_timezone context processor -- one source of truth so JS
+    and Python renders can never drift."""
+    global _STATION_TZ_CACHE
+    if _STATION_TZ_CACHE is None:
+        _STATION_TZ_CACHE = _load_station_timezone()
+    return _STATION_TZ_CACHE
+
+
+def _invalidate_station_tz_cache(*_a, **_kw):
+    global _STATION_TZ_CACHE
+    _STATION_TZ_CACHE = None
+
+
+class StationTimeActivateMiddleware:
+    """Activates the station-configured timezone at the start of every
+    request so django.utils.timezone.now(), template date/time
+    filters, admin datetime widgets, and everything else in Django
+    that respects the ACTIVE timezone render in station-local time
+    -- regardless of the viewing device's OS timezone.
+
+    Uses django.utils.timezone.activate (officially-supported per-
+    request TZ control mechanism). Stored data stays UTC in the DB
+    (Django default with USE_TZ=True); only display shifts. Cached
+    result flipped by a post_save signal wired to StationTimeConfig
+    so an admin edit takes effect on the very next request without
+    a restart.
+
+    Runs after AuthenticationMiddleware -- placement in the MIDDLEWARE
+    list doesn't strictly matter functionally (this only calls
+    timezone.activate; the effect is process-thread-local from that
+    point until the response is fully rendered), but keeping it
+    grouped with our other custom middleware in library.middleware
+    means one file to reason about."""
+
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        try:
+            dj_timezone.activate(get_station_timezone())
+        except Exception:
+            # An invalid or unknown timezone string in the DB should
+            # NEVER take the site down. Fall back to Django's default
+            # settings.TIME_ZONE (deactivate() -> use default).
+            dj_timezone.deactivate()
+        return self.get_response(request)
+
+
+def _wire_station_tz_signals():
+    from library.models import StationTimeConfig
+    post_save.connect(_invalidate_station_tz_cache, sender=StationTimeConfig, weak=False)
+    post_delete.connect(_invalidate_station_tz_cache, sender=StationTimeConfig, weak=False)
+
+
+try:
+    _wire_station_tz_signals()
+except Exception:
+    pass
