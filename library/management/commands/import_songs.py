@@ -146,8 +146,17 @@ def parse_tags(path):
     # atom (----:com.apple.iTunes:ISRC) with a different value shape --
     # not tried here; those tracks stay empty and can be backfilled via
     # `backfill_isrc` (mutagen direct) or Phase 5 MusicBrainz lookup.
-    isrc_raw = first(["TSRC", "ISRC"])
-    tags["isrc"] = str(isrc_raw).strip().upper().replace("-", "") if isrc_raw else ""
+    # Validated against ISO 3901: 2 alpha country + 3 alphanumeric
+    # registrant + 7 digits. Non-conforming values (sloppy taggers,
+    # garbage appended past a newline, wrapper-type stringifications)
+    # fall through to empty rather than into the DB.
+    import re as _re
+    _isrc_raw = first(["TSRC", "ISRC"])
+    if _isrc_raw:
+        _isrc_norm = _re.sub(r"[\s\-]+", "", str(_isrc_raw)).upper()
+        tags["isrc"] = _isrc_norm if _re.match(r"^[A-Z]{2}[A-Z0-9]{3}\d{7}$", _isrc_norm) else ""
+    else:
+        tags["isrc"] = ""
 
     # WAV RIFF-INFO fallback -- see _RIFF_INFO_KEYS comment.
     if str(path).lower().endswith(".wav") and any(

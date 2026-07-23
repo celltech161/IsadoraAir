@@ -3,11 +3,19 @@
 Reads the file at each Track.filepath with mutagen, extracts the ISRC
 from ID3 TSRC (MP3 / id3-tagged FLAC / WAV+ID3) or Vorbis ISRC (FLAC /
 OGG native), normalizes to canonical 12-char uppercase form (strip
-hyphens/whitespace), and writes it to Track.isrc.
+hyphens/whitespace/newlines), validates the format, and writes it to
+Track.isrc.
 
-Idempotent. Skips tracks that already have an ISRC unless --overwrite is
-passed. Skips tracks whose file is missing or unreadable (prints one
-line per skip, no crash).
+Validation: the ISO 3901 ISRC format is exactly 12 characters --
+2-char country code (letters), 3-char registrant (alphanumeric),
+2-digit year, 5-digit designation code. Anything else after
+normalization is discarded rather than truncated -- e.g. a sloppy
+tagger writing 'USEE10170188\\n55B' (real ISRC + accidental appendage)
+falls through to empty instead of corrupting the field.
+
+Idempotent. Skips tracks that already have an ISRC unless --overwrite
+is passed. Skips tracks whose file is missing or unreadable (prints
+one line per skip, no crash).
 
 Usage:
     python manage.py backfill_isrc                 # only tracks with empty isrc
@@ -19,6 +27,7 @@ This does NOT hit MusicBrainz -- it's tag-only. For tracks whose file
 carries no ISRC tag, the Phase 5 `backfill_isrc_musicbrainz` command
 (coming later) will query MusicBrainz by artist + title + album +
 duration."""
+import re
 from pathlib import Path
 
 from django.core.management.base import BaseCommand
@@ -30,11 +39,15 @@ from library.models import Track
 
 ISRC_TAG_KEYS = ("TSRC", "ISRC")
 
+# Canonical ISRC: 12 chars, 2 alpha country + 3 alphanumeric registrant
+# + 7 digits (2-digit year + 5-digit designation code). Per ISO 3901.
+ISRC_RE = re.compile(r"^[A-Z]{2}[A-Z0-9]{3}\d{7}$")
+
 
 def _extract_isrc(filepath):
     """Return the canonical 12-char uppercase ISRC or empty string.
-    Never raises -- unreadable files / missing files / broken tags
-    all become an empty return."""
+    Never raises -- unreadable files, missing files, broken tags, or
+    non-conforming tag values all become an empty return."""
     try:
         audio = MutagenFile(str(filepath))
     except Exception:
@@ -53,8 +66,12 @@ def _extract_isrc(filepath):
             value = value[0]
         if value is None:
             continue
-        normalized = str(value).strip().upper().replace("-", "").replace(" ", "")
-        if normalized:
+        # Strip every category of whitespace + hyphens. Anything left
+        # that doesn't match the ISO 3901 shape is rejected outright;
+        # we'd rather leave the field empty for a Phase-5 MusicBrainz
+        # lookup than corrupt the DB with an ambiguous value.
+        normalized = re.sub(r"[\s\-]+", "", str(value)).upper()
+        if ISRC_RE.match(normalized):
             return normalized
     return ""
 
