@@ -244,9 +244,63 @@
     </div>
   </nav>
   <script>
+    // Station timezone from Django settings.TIME_ZONE, exposed via
+    // the station_timezone context processor. All client-side date/time
+    // rendering in this app is pinned to this timezone so an
+    // operator's local device timezone (a laptop on vacation, a phone
+    // in a different state) never causes UI to disagree with what's
+    // actually playing at the studio. Live-caught 2026 when the
+    // schedule's current-hour highlight was one hour off during a
+    // trip to Mountain Time.
+    window.STATION_TIMEZONE = "{{ station_timezone|escapejs }}";
+
+    // Return the current instant broken into station-local fields.
+    // Uses Intl.DateTimeFormat.formatToParts so we can pull each
+    // component out reliably (some browsers emit '24' for midnight;
+    // that gets normalized to 0). Weekday is 0..6, Monday-first --
+    // matching the shift the /schedule/ page already applies. Cheap
+    // to call; no need to cache.
+    window.stationNowParts = function () {
+      const parts = new Intl.DateTimeFormat('en-US', {
+        timeZone: window.STATION_TIMEZONE,
+        year: 'numeric', month: '2-digit', day: '2-digit',
+        hour: '2-digit', minute: '2-digit', second: '2-digit',
+        hour12: false, weekday: 'short',
+      }).formatToParts(new Date());
+      const p = {};
+      for (const {type, value} of parts) p[type] = value;
+      const dowMap = { Mon: 0, Tue: 1, Wed: 2, Thu: 3, Fri: 4, Sat: 5, Sun: 6 };
+      let hour = parseInt(p.hour, 10);
+      if (hour === 24) hour = 0;
+      return {
+        year: parseInt(p.year, 10),
+        month: parseInt(p.month, 10),
+        day: parseInt(p.day, 10),
+        hour: hour,
+        minute: parseInt(p.minute, 10),
+        second: parseInt(p.second, 10),
+        weekday: dowMap[p.weekday],
+      };
+    };
+
+    // Convenience: format an existing Date (any origin -- server ts,
+    // API-returned ISO string, etc.) as a station-local time string.
+    // Extra options let callers add seconds, hour12, weekday, etc.
+    window.stationFormatTime = function (dateOrEpochMs, opts) {
+      const d = dateOrEpochMs instanceof Date ? dateOrEpochMs : new Date(dateOrEpochMs);
+      return d.toLocaleTimeString([], Object.assign(
+        { timeZone: window.STATION_TIMEZONE, hour: 'numeric', minute: '2-digit', second: '2-digit' },
+        opts || {},
+      ));
+    };
+    window.stationFormatString = function (dateOrEpochMs, opts) {
+      const d = dateOrEpochMs instanceof Date ? dateOrEpochMs : new Date(dateOrEpochMs);
+      return d.toLocaleString([], Object.assign({ timeZone: window.STATION_TIMEZONE }, opts || {}));
+    };
+
     function updateNavClock() {
       const el = document.getElementById('navClock');
-      if (el) el.textContent = new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', second: '2-digit' });
+      if (el) el.textContent = window.stationFormatTime(new Date());
     }
     updateNavClock();
     setInterval(updateNavClock, 1000);

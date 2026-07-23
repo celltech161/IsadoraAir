@@ -6,6 +6,22 @@ def ui_theme(request):
     return {"ui_theme": UITheme.load()}
 
 
+def station_timezone(request):
+    """Expose Django's TIME_ZONE setting as a template variable so
+    client-side JS can render every displayed time in the station's
+    timezone regardless of the viewer's device timezone. Live-caught
+    on a vacation-away-from-home trip in 2026 -- the operator's phone
+    (running on Mountain Time) showed the /schedule/ current-hour
+    highlight one hour off from what was actually playing, and the
+    dashboard's Coming Up clock displayed local-to-phone times. All
+    of that came from the default `new Date().toLocaleTimeString()`
+    behavior which uses the viewer's OS timezone. Now every such call
+    is passed { timeZone: STATION_TIMEZONE } and the schedule's
+    getHours()/getDay() logic runs against the station's timezone."""
+    from django.conf import settings
+    return {"station_timezone": settings.TIME_ZONE}
+
+
 def access_flags(request):
     """Expose per-request role flags to every template so pages can
     conditionally render mutation UI (edit inputs, delete buttons,

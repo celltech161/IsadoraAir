@@ -391,7 +391,7 @@ function fmtDuration(sec) {
 
 function fmtTime(isoStr) {
   const d = new Date(isoStr);
-  return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
+  return window.stationFormatTime(d, { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
 }
 
 function esc(s) {

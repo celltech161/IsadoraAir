@@ -800,7 +800,7 @@ async function loadRecentLogins() {
     empty.style.display = "none";
     data.attempts.forEach(a => {
       const tr = document.createElement("tr");
-      const time = new Date(a.attempt_time).toLocaleString();
+      const time = window.stationFormatString(a.attempt_time);
       tr.innerHTML = `<td>${a.username || ""}</td><td>${a.ip_address || ""}</td><td>${time}</td><td>${a.failures_since_start}</td>`;
       body.appendChild(tr);
     });
@@ -838,11 +838,11 @@ async function pollRbdsStatus() {
     if (data.connected) {
       led.className = "mon-led ok";
       caption.textContent = "OK";
-      since.textContent = data.connected_since ? `Connected since ${new Date(data.connected_since * 1000).toLocaleString()}` : "";
+      since.textContent = data.connected_since ? `Connected since ${window.stationFormatString(data.connected_since * 1000)}` : "";
     } else {
       led.className = "mon-led critical";
       caption.textContent = "DOWN";
-      since.textContent = data.down_since ? `Down since ${new Date(data.down_since * 1000).toLocaleString()}` : "";
+      since.textContent = data.down_since ? `Down since ${window.stationFormatString(data.down_since * 1000)}` : "";
     }
 
     const errorEl = document.getElementById("rbdsError");
@@ -949,7 +949,7 @@ async function loadRecentEvents() {
         ? `${relTime(e.last_repeated_at)}<div style="font-size:0.7rem;color:var(--text-muted);">first ${relTime(e.created_at)}</div>`
         : relTime(e.created_at);
       tr.innerHTML = `
-        <td class="mon-events-time" title="${escapeHtml(new Date(e.created_at).toLocaleString())}">${timeCell}</td>
+        <td class="mon-events-time" title="${escapeHtml(window.stationFormatString(e.created_at))}">${timeCell}</td>
         <td class="mon-events-level"><span class="mon-event-dot ${escapeHtml(e.level)}" title="${escapeHtml(e.level)}"></span></td>
         <td class="mon-events-cat"><span class="mon-event-chip">${escapeHtml(e.category)}</span></td>
         <td class="mon-events-title">${escapeHtml(e.title)}</td>

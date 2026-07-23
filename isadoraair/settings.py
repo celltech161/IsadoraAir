@@ -131,6 +131,7 @@ TEMPLATES = [
                 'library.context_processors.ui_theme',
                 'library.context_processors.nav_menu',
                 'library.context_processors.access_flags',
+                'library.context_processors.station_timezone',
             ],
         },
     },

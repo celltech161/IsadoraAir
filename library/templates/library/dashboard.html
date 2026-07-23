@@ -958,7 +958,7 @@ function fmtDur(sec) {
 function fmtEtaClock(serverTimestamp, etaSeconds) {
   if (serverTimestamp == null || etaSeconds == null) return '';
   const when = new Date((serverTimestamp + etaSeconds) * 1000);
-  return when.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', second: '2-digit' });
+  return window.stationFormatTime(when);
 }
 
 function getCookie(name) {
@@ -2118,7 +2118,7 @@ function applyListenerData(d) {
   // when the operator wants to know how long they've been tracking.
   if (d.peak_since_at) {
     const since = new Date(d.peak_since_at);
-    peak.title = `Peak since ${since.toLocaleString()} — double-click to reset`;
+    peak.title = `Peak since ${window.stationFormatString(since)} — double-click to reset`;
   } else {
     peak.title = 'Double-click to reset peak';
   }
@@ -2146,7 +2146,7 @@ async function resetListenerPeak(evt) {
       peakEl.textContent = d.peak_total ?? '—';
       if (d.peak_since_at) {
         const since = new Date(d.peak_since_at);
-        peakEl.title = `Peak since ${since.toLocaleString()} — double-click to reset`;
+        peakEl.title = `Peak since ${window.stationFormatString(since)} — double-click to reset`;
       }
     }
   } catch (_) { /* silently ignore -- operator can just double-click again */ }

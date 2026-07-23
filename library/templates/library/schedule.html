@@ -422,7 +422,9 @@ let selectedContentName = null;
 // Default to today's day-of-week (Monday=0, matching the grid's convention —
 // same conversion highlightNow() uses) so mobile opens on the current day
 // instead of always Monday.
-let mobileDay = (new Date().getDay() + 6) % 7;
+// window.stationNowParts().weekday is already Monday=0 (see base.html);
+// no +6 shift needed like the JS Date().getDay() (Sunday=0) form did.
+let mobileDay = window.stationNowParts().weekday;
 
 const cells = {};
 for (let d = 0; d < 7; d++) {
@@ -702,9 +704,13 @@ document.addEventListener('DOMContentLoaded', () => {
 });
 
 function highlightNow() {
-  const now = new Date();
-  const dow = (now.getDay() + 6) % 7; // JS Sunday=0 → Python Monday=0
-  const hour = now.getHours();
+  // Pin to station-local time -- the whole reason for this refactor.
+  // A viewer on Mountain Time would otherwise see the current-hour
+  // highlight land one hour off from what's actually playing at the
+  // studio (bug caught live on a 2026 vacation trip).
+  const now = window.stationNowParts();
+  const dow = now.weekday;  // Monday=0 already; no shift needed
+  const hour = now.hour;
 
   // Desktop grid
   document.querySelectorAll('.grid-cell.now-playing').forEach(c => c.classList.remove('now-playing'));
