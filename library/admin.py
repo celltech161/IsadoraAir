@@ -27,12 +27,14 @@ from .models import (
     LogFillConfig,
     LogItem,
     NavMenuItem,
+    PlayEvent,
     Playlist,
     PlaylistItem,
     PlaylistLog,
     RemoteDJConfig,
     Rotation,
     RotationSlot,
+    RoyaltyReport,
     ScheduleBlock,
     Genre,
     StationTimeConfig,
@@ -51,7 +53,7 @@ from .models import (
 # grouping changes.
 _TRAFFIC_MODELS = {"playlist", "rotation", "scheduleblock", "playlistlog"}
 _CONFIG_MODELS = {"analysisconfig", "recencyconfig", "uitheme", "logfillconfig", "uploadconfig", "navmenuitem", "remotedjconfig", "stationtimeconfig"}
-_LOG_MODELS = {"emaillog"}
+_LOG_MODELS = {"emaillog", "playevent", "royaltyreport"}
 
 
 class SectionedAdminSite(admin.AdminSite):
@@ -987,3 +989,66 @@ class EmailLogAdmin(admin.ModelAdmin):
 
     def has_delete_permission(self, request, obj=None):
         return False
+
+
+@admin.register(PlayEvent)
+class PlayEventAdmin(admin.ModelAdmin):
+    """Read-only view of the airplay ledger. Rows are written by the
+    engine at deck creation/removal; the admin must never mutate them
+    (per PlayEvent's docstring -- historical integrity for statutory
+    reporting)."""
+
+    list_display = ("started_at", "category_kind", "track_artist",
+                    "track_title", "isrc", "duration_played_seconds", "source")
+    list_filter = ("category_kind", "source")
+    search_fields = ("track_title", "track_artist", "isrc", "album_title")
+    date_hierarchy = "started_at"
+    ordering = ("-started_at",)
+
+    readonly_fields = (
+        "track", "track_title", "track_artist", "album_title", "record_label",
+        "isrc", "category_kind", "source",
+        "started_at", "ended_at", "duration_played_seconds",
+    )
+    fields = readonly_fields
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+
+@admin.register(RoyaltyReport)
+class RoyaltyReportAdmin(admin.ModelAdmin):
+    """Read-only listing of generated royalty reports. Reports are
+    generated via /reports/ (or the CLI command); this admin exists so
+    a staff user can also see them from the sidebar without visiting
+    the frontend page. Downloads still go through the /reports/
+    endpoint so the auth check is enforced on the file bytes."""
+
+    list_display = ("period_start", "format", "total_plays", "unique_tracks",
+                    "isrc_percent", "generated_at", "generated_by")
+    list_filter = ("format",)
+    ordering = ("-period_start", "-generated_at")
+    readonly_fields = (
+        "period_start", "period_end", "format",
+        "generated_at", "generated_by",
+        "total_plays", "unique_tracks", "unique_artists", "plays_with_isrc",
+        "file",
+    )
+    fields = readonly_fields
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        # Reports can be regenerated from PlayEvent -- allowing delete
+        # is safe (no info lost), and useful for tidying test rows.
+        return True
