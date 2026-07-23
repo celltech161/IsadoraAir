@@ -56,6 +56,7 @@ GROUP_ACCESS_MAP = {
             "/api/engine/status/",
             "/api/engine/manual-mode/",
             "/api/engine/remote-dj-gate/",
+            "/api/engine/levels/",  # 100ms VU-meter poll on /remote-dj/'s dashboard render
             "/api/waveform/",
             "/api/albumart/",
         ),
