@@ -82,6 +82,15 @@
   .imp-result-name { font-weight: 600; }
   .imp-result-detail { color: var(--text-muted); font-size: 0.78rem; }
   .imp-uploading { color: var(--text-muted); font-size: 0.85rem; margin-top: 0.75rem; }
+  .imp-progress {
+    height: 8px; background: var(--bg-dark);
+    border-radius: 4px; overflow: hidden; margin: 0.4rem 0 0 0;
+  }
+  .imp-progress-fill {
+    height: 100%; background: var(--accent);
+    transition: width 0.15s linear;
+    width: 0%;
+  }
 
   /* CD rip specific */
   .cdrip-msg { font-size: 0.82rem; color: var(--text-muted); margin-top: 0.5rem; }
@@ -260,7 +269,10 @@
   </div>
   <input type="file" id="impFileInput" multiple accept=".mp3,.mp2,.flac,.wav,.m4a,.alac,.ogg,.oga,.aiff,.aif" style="display:none;">
 
-  <div class="imp-uploading" id="impUploading" style="display:none;">Uploading and analyzing...</div>
+  <div class="imp-uploading" id="impUploading" style="display:none;">
+    <div id="impProgressText">Uploading...</div>
+    <div class="imp-progress"><div class="imp-progress-fill" id="impProgressFill"></div></div>
+  </div>
   <div class="imp-results" id="impResults"></div>
 </div>
 {% endblock %}
@@ -582,21 +594,63 @@ async function uploadFiles(fileList) {
   // we don't blow up looking up a null element.
   if (categorySelect) formData.append('category_id', categorySelect.value);
   for (const file of fileList) formData.append('files', file);
+
+  const progressText = document.getElementById('impProgressText');
+  const progressFill = document.getElementById('impProgressFill');
+  progressFill.style.width = '0%';
+  const fileWord = fileList.length === 1 ? 'file' : 'files';
+  progressText.textContent = `Uploading ${fileList.length} ${fileWord} (${totalMb.toFixed(1)}MB)...`;
   uploadingEl.style.display = 'block';
+
+  // XMLHttpRequest (not fetch) because fetch has no upload-progress
+  // event -- there's no reliable API to observe outbound byte count
+  // on a fetch() call. XHR's upload.onprogress covers the client ->
+  // server byte transfer; xhr.upload's own `load` event fires when
+  // the last body byte hits the wire, at which point we switch the
+  // UI into "server processing" mode (tag reads, disk writes, DB
+  // inserts) until xhr.onload delivers the actual JSON response.
   try {
-    const resp = await fetch("{% url 'library:api-library-upload' %}", {
-      method: 'POST',
-      headers: { 'X-CSRFToken': getCookie('csrftoken') },
-      body: formData,
+    const data = await new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', "{% url 'library:api-library-upload' %}");
+      xhr.setRequestHeader('X-CSRFToken', getCookie('csrftoken'));
+      xhr.upload.addEventListener('progress', (e) => {
+        if (!e.lengthComputable) return;
+        const pct = (e.loaded / e.total) * 100;
+        progressFill.style.width = pct.toFixed(1) + '%';
+        const loadedMb = e.loaded / (1024 * 1024);
+        const totalMbNum = e.total / (1024 * 1024);
+        progressText.textContent = `Uploading... ${loadedMb.toFixed(1)}MB of ${totalMbNum.toFixed(1)}MB (${pct.toFixed(0)}%)`;
+      });
+      xhr.upload.addEventListener('load', () => {
+        // Last byte of the request body has crossed the wire; server
+        // is now iterating the files (parse_tags + disk write + DB
+        // row per file). Waveform + cue analysis is deferred to the
+        // analyze_tracks systemd timer so the response comes back
+        // once the metadata pass is done -- not instant, but faster
+        // than a full audio decode.
+        progressFill.style.width = '100%';
+        progressText.textContent = 'Processing on server (tag reads + file writes)...';
+      });
+      xhr.onload = () => {
+        try {
+          resolve(JSON.parse(xhr.responseText));
+        } catch (parseErr) {
+          reject(new Error(`server returned HTTP ${xhr.status} with non-JSON body`));
+        }
+      };
+      xhr.onerror = () => reject(new Error('network error'));
+      xhr.onabort = () => reject(new Error('upload aborted'));
+      xhr.send(formData);
     });
-    const data = await resp.json();
+
     if (data.error && !data.results) {
       resultsEl.innerHTML = `<div class="imp-result-row error">${data.error}</div>`;
     } else {
       renderResults(data.results || []);
     }
   } catch (e) {
-    resultsEl.innerHTML = '<div class="imp-result-row error">Upload failed -- check your connection and try again.</div>';
+    resultsEl.innerHTML = `<div class="imp-result-row error">Upload failed -- ${e.message || 'check your connection and try again.'}</div>`;
   }
   uploadingEl.style.display = 'none';
 }
