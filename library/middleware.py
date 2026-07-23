@@ -70,11 +70,29 @@ GROUP_ACCESS_MAP = {
         }),
         "extras": (_is_playlist_play_now,),
     },
-    # Placeholder for future groups. Contributor (Part B) will land as
-    # its own entry once the read-only library + own-uploads access set
-    # is finalized. Any group added here without a matching landing-
-    # page redirect in the class below just falls back to /welcome/,
-    # which is safe.
+    "Contributor": {
+        # Contributors get read-only access to the WHOLE library
+        # (including their own not-yet-approved uploads) plus the
+        # upload flow scoped to their own username-matched category
+        # (that scoping is enforced VIEW-side; the middleware just
+        # opens the URL). The specific write endpoints they need are
+        # /api/library/upload/ (POST -- creates their track) and the
+        # per-track detail endpoint (view-side gates PUT/DELETE to
+        # their own not-yet-approved rows). Read endpoints for the
+        # browser player, waveform display, album art, and category
+        # filter are all in.
+        "prefixes": (
+            "/library/",
+            "/track/",
+            "/api/tracks/",
+            "/api/library/upload/",
+            "/api/categories/",
+            "/api/waveform/",
+            "/api/albumart/",
+        ),
+        "exact": frozenset(),
+        "extras": (),
+    },
 }
 
 
@@ -151,9 +169,24 @@ class GroupBasedAccessMiddleware:
         # Page-shaped -- redirect to a landing page appropriate for
         # whichever group they belong to. Future groups can add their
         # own landing here; unmatched fall to /welcome/.
+        if "Contributor" in recognized:
+            return redirect("library:library")
         if "remote_dj" in recognized:
             return redirect("library:remote-dj")
         return redirect("library:welcome")
+
+
+# Public helper for view code that needs to know whether the current
+# user is limited to Contributor privileges (i.e., is a Contributor
+# and NOT also staff/superuser). Kept next to GROUP_ACCESS_MAP so a
+# view importing it doesn't need to duplicate the "not staff, not
+# superuser, is in group X" boilerplate.
+def user_is_contributor(user):
+    return bool(
+        user and user.is_authenticated
+        and not user.is_staff and not user.is_superuser
+        and user.groups.filter(name="Contributor").exists()
+    )
 
 
 # Backward-compat alias. settings.py's MIDDLEWARE list still references

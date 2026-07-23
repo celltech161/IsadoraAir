@@ -222,6 +222,7 @@
   <span class="lib-stats" id="stats"></span>
 </div>
 
+{% if not is_contributor %}
 <div class="bulk-bar" id="bulkBar">
   <span class="bulk-count" id="bulkCount">0</span> selected
   <button class="bulk-btn" onclick="bulkAction('ready2air_on')">Mark Ready</button>
@@ -248,12 +249,15 @@
   <button class="bulk-btn danger" onclick="bulkDelete()">Delete</button>
   <button class="bulk-btn" onclick="clearSelection()" style="margin-left:auto;">Clear</button>
 </div>
+{% endif %}
 
 <div class="lib-table-wrap">
   <table class="lib-table">
     <thead>
       <tr>
+        {% if not is_contributor %}
         <th class="col-check"><input type="checkbox" id="selectAll" title="Select all on page"></th>
+        {% endif %}
         <th data-sort="title">Title <span class="arrow"></span></th>
         <th data-sort="artist">Artist <span class="arrow"></span></th>
         <th data-sort="album">Album <span class="arrow"></span></th>
@@ -514,10 +518,12 @@ async function loadTracks() {
       const checked = selectedIds.has(t.id) ? 'checked' : '';
       const sel = selectedIds.has(t.id) ? 'selected' : '';
       return `<tr class="${sel}" data-id="${t.id}">
+        {% if not is_contributor %}
         <td class="col-check" onclick="event.stopPropagation()">
           <input type="checkbox" ${checked}
                  onchange="toggleSelect(${t.id}, this)">
         </td>
+        {% endif %}
         <td>${esc(t.title)}</td>
         <td>${esc(t.artist)}</td>
         <td>${esc(t.album)}</td>

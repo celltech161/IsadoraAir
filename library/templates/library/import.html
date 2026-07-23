@@ -140,6 +140,7 @@
 {% endblock %}
 
 {% block content %}
+{% if not is_contributor %}
 <div class="imp-panel">
   <h2>Rip CD</h2>
 
@@ -224,9 +225,18 @@
     <button class="imp-btn" onclick="ripAnother()" style="margin-top:0.75rem;">Reset</button>
   </div>
 </div>
+{% endif %}
 
 <div class="imp-panel">
   <h2>Upload Files</h2>
+  {% if is_contributor %}
+  <div class="imp-field">
+    <label>Category</label>
+    <div style="padding:0.55rem 0.7rem; background: var(--bg-darker); border:1px solid var(--border-subtle); border-radius:8px; color: var(--text-muted); font-size:0.9rem;">
+      Uploads go to your assigned category ({{ request.user.username|lower }}). Server auto-fills; no dropdown for this account.
+    </div>
+  </div>
+  {% else %}
   <div class="imp-field">
     <label for="impCategory">Category</label>
     <select class="imp-select" id="impCategory">
@@ -240,6 +250,7 @@
       {% endfor %}
     </select>
   </div>
+  {% endif %}
 
   <div class="imp-dropzone" id="impDropzone">
     <div><strong>Drag audio files here</strong>, or click to browse.</div>
@@ -551,7 +562,10 @@ async function uploadFiles(fileList) {
     return;
   }
   const formData = new FormData();
-  formData.append('category_id', categorySelect.value);
+  // For Contributors the category dropdown isn't rendered (server
+  // auto-fills from the user's username-matched category). Guard so
+  // we don't blow up looking up a null element.
+  if (categorySelect) formData.append('category_id', categorySelect.value);
   for (const file of fileList) formData.append('files', file);
   uploadingEl.style.display = 'block';
   try {

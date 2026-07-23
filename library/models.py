@@ -293,6 +293,22 @@ class Track(models.Model):
         help_text="Alternate RadioText sent to RBDS when alt_send_enabled is checked (64-char RBDS RadioText limit).",
     )
 
+    # Populated by api_library_upload when a user in the Contributor
+    # group (or any other future upload-capable role) submits a track.
+    # NULL for historical tracks and for tracks imported via
+    # management commands / CD ripping / syndicated ingest -- i.e.
+    # anything that predates the Contributor feature. Displayed on
+    # /track/<pk>/ so the reviewing operator can see who to follow up
+    # with, and used by the middleware/view gating to enforce
+    # "Contributors can delete their own not-yet-approved uploads."
+    # SET_NULL on user delete so removing a former Contributor leaves
+    # their contributed tracks in the library instead of cascading
+    # them out.
+    uploaded_by = models.ForeignKey(
+        "auth.User", null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="uploaded_tracks",
+    )
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

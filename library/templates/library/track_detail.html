@@ -517,6 +517,7 @@
       <label>Related Artists</label>
       <span class="field-muted">{{ track.related_artists|default:"—" }}</span>
     </div>
+    {% if not is_contributor %}
     <div class="field-row">
       <label></label>
       <button class="save-btn" style="padding:0.4rem 1rem;font-size:0.78rem;" onclick="saveTrack()">Save Changes</button>
@@ -526,6 +527,14 @@
       <span class="save-msg" id="saveMsg" style="margin-left:0.6rem;">Saved</span>
       <span class="save-msg" id="reanalyzeMsg">Done</span>
     </div>
+    {% else %}
+    <div class="field-row">
+      <label></label>
+      <span class="save-msg" style="color: var(--text-muted); font-size:0.85rem;">
+        Read-only view. Contact the station operator to request changes to this track.
+      </span>
+    </div>
+    {% endif %}
   </div>
 </div>
 

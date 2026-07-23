@@ -1,5 +1,6 @@
 import json
 import re
+import shutil
 import time as time_mod
 from datetime import date as date_type, time
 from pathlib import Path
@@ -1128,12 +1129,28 @@ def _delete_track_and_file(track):
 
 @require_http_methods(["GET", "PATCH", "DELETE"])
 def api_track_detail(request, pk):
+    from library.middleware import user_is_contributor
+
     track = get_object_or_404(
         Track.objects.select_related("artist", "album", "genre", "category"), pk=pk
     )
 
     if request.method == "GET":
         return JsonResponse(_track_to_dict(track))
+
+    # Contributors are read-only on every track EXCEPT they may DELETE
+    # their own not-yet-reviewed uploads. All other write operations
+    # (PUT, PATCH, POST, or DELETE on a not-owned or already-reviewed
+    # track) get 403'd. Staff/superuser bypass this check.
+    if user_is_contributor(request.user):
+        is_own_upload = (
+            track.uploaded_by_id == request.user.id
+            and track.ready2air is False
+        )
+        if request.method == "DELETE" and not is_own_upload:
+            return JsonResponse({"error": "You can only delete your own not-yet-approved uploads."}, status=403)
+        if request.method not in ("GET", "DELETE"):
+            return JsonResponse({"error": "Read-only for this account."}, status=403)
 
     if request.method == "DELETE":
         ok, reason = _delete_track_and_file(track)
@@ -1192,6 +1209,45 @@ def api_track_detail(request, pk):
                     return JsonResponse({"error": "Category not found"}, status=404)
             else:
                 track.category = None
+
+    # Auto-relocate the file if primary category changed (Part D).
+    # Same convention as find_category_drift: files live at
+    # LIBRARY_ROOT/<Category.code>/<basename>. Runs BEFORE save() so a
+    # filesystem-side failure aborts the DB update too, keeping the
+    # two in sync. If the move fails, return an error and DON'T save
+    # the field change -- otherwise the DB says one thing and disk
+    # says another and every future load hits a MISSING file. Save
+    # only succeeds when disk is in the new place.
+    from django.conf import settings as django_settings
+    from library.middleware import user_is_contributor as _uic
+    if track.pk and track.category_id:
+        old_track = Track.objects.filter(pk=track.pk).only("filepath", "category_id").first()
+        if old_track and old_track.category_id != track.category_id:
+            library_root = Path(getattr(django_settings, "LIBRARY_ROOT", "/srv/isadoraair/music")).resolve()
+            old_path = Path(track.filepath) if track.filepath else None
+            if old_path and old_path.is_file():
+                try:
+                    old_path.resolve().relative_to(library_root)
+                    inside_root = True
+                except ValueError:
+                    inside_root = False
+                if inside_root:
+                    new_dir = library_root / track.category.code
+                    new_path = new_dir / old_path.name
+                    if new_path.exists() and new_path != old_path:
+                        return JsonResponse(
+                            {"error": f"Cannot relocate: destination already exists ({new_path.name} in {track.category.code}). Rename the existing file first."},
+                            status=409,
+                        )
+                    try:
+                        new_dir.mkdir(parents=True, exist_ok=True)
+                        shutil.move(str(old_path), str(new_path))
+                        track.filepath = str(new_path)
+                    except OSError as exc:
+                        return JsonResponse(
+                            {"error": f"Failed to relocate file: {exc}"},
+                            status=500,
+                        )
 
     track.save()
 
@@ -2023,12 +2079,36 @@ def api_library_upload(request):
     from django.utils.text import get_valid_filename
 
     from library.management.commands.import_songs import SUPPORTED_EXT, parse_tags
+    from library.middleware import user_is_contributor
     from library.models import UploadConfig
 
-    category_id = request.POST.get("category_id")
-    if not category_id:
-        return JsonResponse({"error": "category_id required"}, status=400)
-    category = get_object_or_404(Category, pk=category_id)
+    is_contributor = user_is_contributor(request.user)
+
+    if is_contributor:
+        # Contributors' category is always their username-matched
+        # category, regardless of what the client posts. This is BOTH
+        # a UX shortcut (the /library/import/ page auto-fills the
+        # dropdown for them, so no user action needed) AND a security
+        # enforcement (a Contributor can't drop tracks into someone
+        # else's category by tampering with the form). Case-insensitive
+        # match on Category.code, per the design decision -- the
+        # Category must exist ahead of time (the operator creates it
+        # when adding the Contributor to the group; there's no auto-
+        # creation), and its code must equal the Contributor's
+        # lowercased username.
+        target_username = (request.user.username or "").lower()
+        category = Category.objects.filter(code__iexact=target_username).first()
+        if category is None:
+            return JsonResponse({
+                "error": f"No category is configured for your account. "
+                         f"Ask the station operator to create a Category "
+                         f"with code '{target_username}'.",
+            }, status=403)
+    else:
+        category_id = request.POST.get("category_id")
+        if not category_id:
+            return JsonResponse({"error": "category_id required"}, status=400)
+        category = get_object_or_404(Category, pk=category_id)
 
     uploaded_files = request.FILES.getlist("files")
     if not uploaded_files:
@@ -2113,6 +2193,7 @@ def api_library_upload(request):
             channels=info.get("channels"),
             bit_depth=info.get("bit_depth"),
             category=category,
+            uploaded_by=request.user if request.user.is_authenticated else None,
         )
 
         # Analysis (waveform + cue points, now a mono AND a stereo ffmpeg
@@ -2137,7 +2218,53 @@ def api_library_upload(request):
             "analyzed": False,
         })
 
+    if is_contributor:
+        _notify_contributor_upload(request.user, category, results)
+
     return JsonResponse({"results": results})
+
+
+def _notify_contributor_upload(user, category, results):
+    """Email the station operator about a successful Contributor
+    upload batch. Delivery is best-effort: an SMTP failure logs a
+    console line and returns without raising -- an upload succeeding
+    on disk + in the DB must not be walked back just because the
+    notification email couldn't send. Uses the same notification-
+    recipient list the /monitoring/ alerts use (NotificationConfig)
+    so there's a single place to change the reviewing address."""
+    from django.conf import settings
+    from django.core.mail import send_mail
+    from monitoring.models import NotificationConfig
+
+    ok_results = [r for r in results if r.get("ok")]
+    if not ok_results:
+        return
+
+    recipients = NotificationConfig.load().recipient_list()
+    if not recipients:
+        return
+
+    subject = f"[IsadoraAir] {user.username} uploaded {len(ok_results)} track(s)"
+    lines = [
+        f"Contributor: {user.username}",
+        f"Category:    {category.code} ({category.name})",
+        f"Uploaded:    {len(ok_results)} track(s)",
+        "",
+        "Tracks:",
+    ]
+    for r in ok_results:
+        lines.append(f"  - {r.get('artist','?')} — {r.get('title','?')}   [track id {r.get('track_id')}]")
+    lines.append("")
+    lines.append("These land with ready2air=False; review in the library and mark ready when approved.")
+
+    try:
+        send_mail(
+            subject, "\n".join(lines),
+            settings.DEFAULT_FROM_EMAIL, recipients,
+            fail_silently=False,
+        )
+    except Exception as exc:
+        print(f"  [notify] Contributor-upload email failed for {user.username}: {exc}")
 
 
 @require_http_methods(["GET"])

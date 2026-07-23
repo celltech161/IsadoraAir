@@ -1,9 +1,25 @@
-from .middleware import GROUP_ACCESS_MAP
+from .middleware import GROUP_ACCESS_MAP, user_is_contributor
 from .models import NavMenuItem, UITheme
 
 
 def ui_theme(request):
     return {"ui_theme": UITheme.load()}
+
+
+def access_flags(request):
+    """Expose per-request role flags to every template so pages can
+    conditionally render mutation UI (edit inputs, delete buttons,
+    bulk-action bars, CD-rip sections, etc.) without repeating the
+    "not staff and not superuser and in group X" boilerplate in
+    every template.
+
+    Available flags:
+      is_contributor -- current user is in the Contributor group AND
+                        not staff/superuser (so a staff account in
+                        the Contributor group -- unusual, but possible
+                        -- still gets the full-privileges view)."""
+    user = getattr(request, "user", None)
+    return {"is_contributor": user_is_contributor(user)}
 
 
 def nav_menu(request):
