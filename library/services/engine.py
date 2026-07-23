@@ -24,7 +24,7 @@ from django.db import close_old_connections
 from django.db.models import F
 from django.utils import timezone
 from hardware.models import AudioInput, AudioOutput, AudioPipeline, DuckingConfig, RemoteDJAudioInput
-from library.models import Category, LogItem, PlaylistLog, RemoteDJConfig, Track
+from library.models import Category, LogItem, PlayEvent, PlaylistLog, RemoteDJConfig, Track
 from monitoring.models import emit_event
 from library.services.log_builder import (
     DURATION_FIT_MARGIN,
@@ -300,6 +300,12 @@ class Deck:
         # failing cleanly), so these decks track position by wall clock
         # only instead (_get_deck_position).
         self.silence_primed = silence_primed
+        # PlayEvent row id written at _create_deck; closed out (ended_at
+        # + duration_played_seconds) at _remove_deck. None if the write
+        # failed at deck creation -- in which case no close-out attempt
+        # is made either, avoiding a spurious update against a row that
+        # doesn't exist.
+        self.play_event_id = None
 
 
 class PlaybackEngine:
@@ -1754,6 +1760,40 @@ class PlaybackEngine:
                 )
             except Exception as exc:
                 print(f"  DB write failed (non-fatal): {exc}")
+            # Append-only PlayEvent ledger for royalty / SoundExchange
+            # reporting -- distinct from LogItem.played_at because it
+            # snapshots ISRC / album / label / category_kind that a
+            # future Track edit or LogItem prune could otherwise wipe.
+            # Best-effort: any DB failure here is logged and dropped --
+            # missing a PlayEvent row for a single spin is preferable to
+            # failing the deck-creation path and dropping the track.
+            try:
+                close_old_connections()
+                # position >= 9999 is api_engine_insert_track's marker
+                # for a manual / remote-DJ insert. Playlist-play-now
+                # rebuilds a whole PlaylistLog and looks like a normal
+                # scheduled hour from here, so it also reads as
+                # "scheduled" -- fine for royalty reporting (SoundExchange
+                # doesn't distinguish), and if we later want the split we
+                # can add a `source` field to LogItem itself.
+                pe_source = "insert" if getattr(log_item, "position", 0) >= 9999 else "scheduled"
+                pe_category_kind = ""
+                if log_item.category_id and log_item.category and log_item.category.kind_id:
+                    pe_category_kind = log_item.category.kind.name
+                pe = PlayEvent.objects.create(
+                    track=track,
+                    track_title=track.title or "",
+                    track_artist=(track.artist.name if track.artist else ""),
+                    album_title=(track.album.title if track.album else ""),
+                    record_label=track.record_label or "",
+                    isrc=getattr(track, "isrc", "") or "",
+                    category_kind=pe_category_kind,
+                    source=pe_source,
+                    started_at=timezone.now(),
+                )
+                deck.play_event_id = pe.id
+            except Exception as exc:
+                print(f"  PlayEvent write failed (non-fatal): {exc}")
             print(f"  [{slot}] Playing: {track.artist.name if track.artist else '?'} - {track.title}")
         else:
             print(f"  [{slot}] Resumed: {track.artist.name if track.artist else '?'} - {track.title} at {start_offset:.1f}s")
@@ -1822,6 +1862,32 @@ class PlaybackEngine:
         return False  # one-shot GLib timeout, don't repeat
 
     def _remove_deck(self, deck):
+        # Close out the PlayEvent row (if one was written at
+        # _create_deck) BEFORE we drop the lock -- ended_at and
+        # duration_played_seconds are set from the row's own
+        # started_at, so this is safe against clock skew. Best-effort;
+        # a DB failure here is logged and dropped, same policy as the
+        # create-side write. Report-time query drops rows whose
+        # duration is below the SoundExchange 30s threshold, so a
+        # spurious short close-out here still gets filtered on export.
+        if deck.play_event_id:
+            try:
+                close_old_connections()
+                now = timezone.now()
+                pe = PlayEvent.objects.filter(id=deck.play_event_id).only(
+                    "id", "started_at"
+                ).first()
+                if pe is not None:
+                    duration = None
+                    if pe.started_at:
+                        duration = max(0.0, (now - pe.started_at).total_seconds())
+                    PlayEvent.objects.filter(id=pe.id).update(
+                        ended_at=now,
+                        duration_played_seconds=duration,
+                    )
+            except Exception as exc:
+                print(f"  PlayEvent close-out failed (non-fatal): {exc}")
+
         with self._lock:
             self._deck_bin_map.pop(id(deck.pipeline), None)
             deck.pipeline.set_state(Gst.State.NULL)

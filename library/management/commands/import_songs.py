@@ -142,6 +142,12 @@ def parse_tags(path):
 
     tags["track_number"] = parse_num(first(["TRCK", "TRACKNUMBER", "trkn"]))
     tags["disc_number"] = parse_num(first(["TPOS", "DISCNUMBER", "disk"]))
+    # ISRC: TSRC in ID3v2, ISRC in Vorbis/FLAC. MP4 uses a freeform
+    # atom (----:com.apple.iTunes:ISRC) with a different value shape --
+    # not tried here; those tracks stay empty and can be backfilled via
+    # `backfill_isrc` (mutagen direct) or Phase 5 MusicBrainz lookup.
+    isrc_raw = first(["TSRC", "ISRC"])
+    tags["isrc"] = str(isrc_raw).strip().upper().replace("-", "") if isrc_raw else ""
 
     # WAV RIFF-INFO fallback -- see _RIFF_INFO_KEYS comment.
     if str(path).lower().endswith(".wav") and any(
@@ -308,6 +314,12 @@ class Command(BaseCommand):
             "bit_depth": info.get("bit_depth"),
             "category": category_obj,
         }
+        # Only overwrite isrc if the file actually carries one -- a
+        # re-import of a file whose ISRC tag has been stripped must
+        # NOT wipe a MusicBrainz backfill or a manual admin entry
+        # already sitting in the DB.
+        if tags.get("isrc"):
+            defaults["isrc"] = tags["isrc"]
 
         _obj, created = Track.objects.update_or_create(
             filepath=str(filepath),

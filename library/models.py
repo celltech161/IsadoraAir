@@ -208,6 +208,15 @@ class Track(models.Model):
     composer = models.CharField(max_length=255, blank=True)
     publisher = models.CharField(max_length=255, blank=True)
     record_label = models.CharField(max_length=255, blank=True)
+    isrc = models.CharField(
+        max_length=15, blank=True, default="",
+        help_text="International Standard Recording Code (12 chars, format "
+                    "CC-XXX-YY-NNNNN). Required by SoundExchange for royalty "
+                    "reporting; falls back to album + record label when missing. "
+                    "Auto-populated from ID3 TSRC / Vorbis ISRC at import if "
+                    "present in the file's tags; can be filled in later via "
+                    "the backfill_isrc management command or edited by hand.",
+    )
     comments = models.TextField(blank=True)
 
     # --- Audio technical ---
@@ -1216,3 +1225,73 @@ class CDRipConfig(models.Model):
     def load(cls):
         obj, _created = cls.objects.get_or_create(pk=1)
         return obj
+
+
+class PlayEvent(models.Model):
+    """Append-only ledger of every track that actually hit the mixer.
+    Written by the playback engine at _create_deck (started_at + all
+    snapshot fields set) and updated at _remove_deck (ended_at +
+    duration_played_seconds set). Distinct from LogItem.played_at
+    because retention differs -- programming logs (PlaylistLog /
+    LogItem) may be pruned to save space, but play evidence must be
+    retained for statutory-license reporting audits (SoundExchange
+    NCE etc), typically for the greater of the statute of
+    limitations and the licensor's own retention requirement.
+
+    Snapshot fields (track_title, track_artist, album_title,
+    record_label, isrc, category_kind) are captured at write time and
+    never mutated by application code -- so a later admin rename, a
+    Track deletion, or a CategoryKind edit cannot corrupt historical
+    rows. `track` FK is SET_NULL for audit-lookup convenience only;
+    the snapshot fields are the load-bearing reporting data.
+
+    Not admin-editable (see PlayEventAdmin has_add/change/delete_perm
+    overrides) -- read-only from the outside.
+
+    The 30-second SoundExchange threshold is applied at REPORT time
+    (query filter on duration_played_seconds), not at write time --
+    that way short-cut plays still exist as evidence for the
+    operator's own bookkeeping and only get excluded from the PRO
+    export."""
+
+    SOURCE_CHOICES = [
+        ("scheduled", "Scheduled"),
+        ("insert", "Manual insert / remote-DJ"),
+        ("playlist_play_now", "Playlist Play Now"),
+    ]
+
+    track = models.ForeignKey(
+        Track, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="play_events",
+    )
+
+    # Snapshot fields -- immutable once written. Kept independent of
+    # live Track / Artist / Album / Category so history stays intact
+    # through any downstream rename or delete.
+    track_title = models.CharField(max_length=255, blank=True, default="")
+    track_artist = models.CharField(max_length=255, blank=True, default="")
+    album_title = models.CharField(max_length=255, blank=True, default="")
+    record_label = models.CharField(max_length=255, blank=True, default="")
+    isrc = models.CharField(max_length=15, blank=True, default="")
+    category_kind = models.CharField(max_length=64, blank=True, default="")
+
+    source = models.CharField(
+        max_length=32, choices=SOURCE_CHOICES, default="scheduled",
+    )
+
+    started_at = models.DateTimeField(db_index=True)
+    ended_at = models.DateTimeField(null=True, blank=True)
+    duration_played_seconds = models.FloatField(null=True, blank=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=["started_at", "category_kind"]),
+        ]
+        ordering = ["-started_at"]
+
+    def __str__(self):
+        return (
+            f"{self.started_at:%Y-%m-%d %H:%M:%S} "
+            f"[{self.category_kind or 'none'}] "
+            f"{self.track_artist} -- {self.track_title}"
+        )
