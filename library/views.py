@@ -5,8 +5,9 @@ import time as time_mod
 from datetime import date as date_type, time
 from pathlib import Path
 
-from django.http import JsonResponse
+from django.http import JsonResponse, HttpResponseForbidden, HttpResponseNotFound
 from django.shortcuts import render
+from django.urls import reverse
 from django.views.decorators.csrf import csrf_exempt, ensure_csrf_cookie
 from django.views.decorators.http import require_http_methods
 
@@ -2598,3 +2599,127 @@ def api_track_blocked_slot_toggle_column(request, pk):
     track.blocked_slots = sorted(blocked)
     track.save(update_fields=["blocked_slots"])
     return JsonResponse({"hour": hour, "slots": column_slots, "blocked": now_blocked})
+
+
+# ---------------------------------------------------------------------
+# Royalty reports (SoundExchange NCE etc.)
+# ---------------------------------------------------------------------
+def _reports_permission_check(request):
+    """Reports carry statutory-license implications -- keep the surface
+    tight. Staff or superuser only. If we later add a Treasurer group
+    with its own GroupAccess row that gates /reports/, this check will
+    still succeed for them (staff/superuser bypasses the group middleware
+    but the group middleware ALSO gates /reports/ for non-privileged
+    users). Returns HttpResponseForbidden or None."""
+    user = getattr(request, "user", None)
+    if not (user and user.is_authenticated and (user.is_staff or user.is_superuser)):
+        return HttpResponseForbidden("Reports are staff-only.")
+    return None
+
+
+@ensure_csrf_cookie
+def reports_page(request):
+    denied = _reports_permission_check(request)
+    if denied:
+        return denied
+
+    from library.models import RoyaltyReport
+    from library.services.royalty_reports import GENERATORS
+
+    reports = RoyaltyReport.objects.select_related("generated_by").order_by(
+        "-period_start", "-generated_at"
+    )[:200]
+
+    # Default the month picker to last month -- most reports are
+    # generated 1-2 weeks into the following month.
+    today = timezone.localdate()
+    if today.month == 1:
+        default_month = f"{today.year - 1}-12"
+    else:
+        default_month = f"{today.year}-{today.month - 1:02d}"
+
+    return render(request, "library/reports.html", {
+        "reports": reports,
+        "default_month": default_month,
+        "format_choices": [(k, GENERATORS[k].__doc__.strip().split(chr(10))[0] if GENERATORS[k].__doc__ else k)
+                            for k in GENERATORS.keys()],
+        "format_display": dict(RoyaltyReport.FORMAT_CHOICES),
+    })
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def api_reports_generate(request):
+    denied = _reports_permission_check(request)
+    if denied:
+        return denied
+
+    import calendar
+    from django.core.files.base import ContentFile
+    from django.http import HttpResponseForbidden
+    from django.urls import reverse
+    from library.models import RoyaltyReport
+    from library.services.royalty_reports import GENERATORS, compute_stats, generate
+
+    try:
+        body = json.loads(request.body)
+    except (json.JSONDecodeError, ValueError):
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+
+    month = body.get("month", "")
+    fmt = body.get("format", "")
+    if fmt not in GENERATORS:
+        return JsonResponse({"error": f"Unknown format: {fmt!r}"}, status=400)
+    try:
+        year, mo = month.split("-")
+        year, mo = int(year), int(mo)
+        period_start = date_type(year, mo, 1)
+        period_end = date_type(year, mo, calendar.monthrange(year, mo)[1])
+    except (ValueError, IndexError):
+        return JsonResponse({"error": "month must be YYYY-MM"}, status=400)
+
+    content, ext = generate(period_start, period_end, fmt)
+    stats = compute_stats(period_start, period_end)
+
+    rr = RoyaltyReport(
+        period_start=period_start,
+        period_end=period_end,
+        format=fmt,
+        generated_by=request.user,
+        total_plays=stats["total_plays"],
+        unique_tracks=stats["unique_tracks"],
+        unique_artists=stats["unique_artists"],
+        plays_with_isrc=stats["plays_with_isrc"],
+    )
+    fname = f"{period_start:%Y-%m}-{fmt}.{ext}"
+    rr.file.save(fname, ContentFile(content.encode("utf-8")), save=False)
+    rr.save()
+
+    return JsonResponse({
+        "ok": True,
+        "id": rr.id,
+        "download_url": reverse("library:reports-download", args=[rr.id]),
+        "total_plays": stats["total_plays"],
+        "unique_tracks": stats["unique_tracks"],
+        "plays_with_isrc": stats["plays_with_isrc"],
+    })
+
+
+def reports_download(request, pk):
+    """Serves a persisted report file through Django (not directly by
+    nginx) so the access check is enforced -- an accidentally-shared
+    /media/royalty_reports/... URL would bypass auth if we served it
+    statically."""
+    denied = _reports_permission_check(request)
+    if denied:
+        return denied
+
+    from django.http import FileResponse
+    from library.models import RoyaltyReport
+
+    rr = get_object_or_404(RoyaltyReport, pk=pk)
+    if not rr.file:
+        return HttpResponseNotFound("Report file no longer exists on disk.")
+
+    fname = f"{rr.period_start:%Y-%m}-{rr.format}.{rr.file.name.rsplit('.', 1)[-1]}"
+    return FileResponse(rr.file.open("rb"), as_attachment=True, filename=fname)

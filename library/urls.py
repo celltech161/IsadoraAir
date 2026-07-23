@@ -72,4 +72,7 @@ urlpatterns = [
     path('api/engine/manual-mode/', views.api_engine_manual_mode, name='api-engine-manual-mode'),
     path('api/remote-dj/token/', views.api_remote_dj_token, name='api-remote-dj-token'),
     path('remote-dj/', views.remote_dj_page, name='remote-dj'),
+    path('reports/', views.reports_page, name='reports'),
+    path('reports/<int:pk>/download/', views.reports_download, name='reports-download'),
+    path('api/reports/generate/', views.api_reports_generate, name='api-reports-generate'),
 ]

@@ -1295,3 +1295,68 @@ class PlayEvent(models.Model):
             f"[{self.category_kind or 'none'}] "
             f"{self.track_artist} -- {self.track_title}"
         )
+
+
+class RoyaltyReport(models.Model):
+    """Metadata + persisted output file for one generated royalty
+    report. Written both by the management command (when invoked with
+    --persist) and the /reports/ web UI. Kept out of the PlayEvent
+    ledger deliberately -- PlayEvents are the raw evidence, this is a
+    derivative snapshot from that evidence at a specific moment. If
+    PlayEvents change (they shouldn't, but the schema doesn't forbid
+    an admin from bulk-deleting old rows) the report file stays
+    accurate to what was submitted to the licensor.
+
+    Files land in MEDIA_ROOT/royalty_reports/. Filename is
+    <period_start>-<format>.<ext>, e.g. 2026-07-01-soundexchange_nce.csv.
+    Access-gated (view side only allows staff/superuser to see or
+    generate); the underlying file is served through the view, not
+    directly by nginx, so an accidentally-leaked URL doesn't bypass
+    the auth check."""
+
+    FORMAT_CHOICES = [
+        ("soundexchange_nce", "SoundExchange NCE (Report of Use)"),
+        ("summary", "Summary (human-readable stats)"),
+        ("raw_csv", "Raw CSV (every PlayEvent, all snapshot fields)"),
+    ]
+
+    period_start = models.DateField(
+        help_text="First day of the reporting period (typically the 1st of the month).",
+    )
+    period_end = models.DateField(
+        help_text="Last day of the reporting period (last day of the month).",
+    )
+    format = models.CharField(max_length=32, choices=FORMAT_CHOICES)
+
+    generated_at = models.DateTimeField(auto_now_add=True)
+    generated_by = models.ForeignKey(
+        "auth.User", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="royalty_reports_generated",
+    )
+
+    # Snapshotted stats -- lets the /reports/ list page render without
+    # a full PlayEvent re-scan per row. Same rationale as the snapshot
+    # fields on PlayEvent itself.
+    total_plays = models.PositiveIntegerField(default=0)
+    unique_tracks = models.PositiveIntegerField(default=0)
+    unique_artists = models.PositiveIntegerField(default=0)
+    plays_with_isrc = models.PositiveIntegerField(default=0)
+
+    file = models.FileField(upload_to="royalty_reports/", blank=True, null=True)
+
+    class Meta:
+        ordering = ["-period_start", "-generated_at"]
+        verbose_name = "Royalty Report"
+        verbose_name_plural = "Royalty Reports"
+
+    def __str__(self):
+        return (
+            f"{self.period_start:%Y-%m} {self.get_format_display()} "
+            f"({self.total_plays} plays, generated {self.generated_at:%Y-%m-%d})"
+        )
+
+    @property
+    def isrc_percent(self):
+        if not self.total_plays:
+            return 0.0
+        return 100.0 * self.plays_with_isrc / self.total_plays

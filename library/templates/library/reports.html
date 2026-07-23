@@ -1,0 +1,197 @@
+{% extends "base.html" %}
+{% block title %}Reports{% endblock %}
+
+{% block extra_css %}
+<style>
+  .rpt-panel {
+    background: var(--bg-mid);
+    border-radius: 10px;
+    padding: 1.25rem;
+    margin-bottom: 1.25rem;
+    border: 1px solid var(--border-subtle);
+  }
+  .rpt-panel h2 { margin: 0 0 0.75rem 0; font-size: 1.05rem; }
+  .rpt-form {
+    display: flex; flex-wrap: wrap; gap: 0.6rem; align-items: end;
+  }
+  .rpt-form label {
+    display: block; font-size: 0.75rem; color: var(--text-muted);
+    margin-bottom: 0.2rem;
+  }
+  .rpt-input, .rpt-select {
+    background: var(--bg-darker);
+    border: 1px solid var(--border-subtle);
+    color: var(--text-main);
+    padding: 0.45rem 0.6rem;
+    border-radius: 6px;
+    font-size: 0.85rem;
+    font-family: inherit;
+  }
+  .rpt-btn {
+    background: var(--accent);
+    color: var(--bg-darkest);
+    border: none;
+    padding: 0.5rem 1rem;
+    border-radius: 6px;
+    font-weight: 600;
+    cursor: pointer;
+    font-size: 0.85rem;
+  }
+  .rpt-btn[disabled] { opacity: 0.5; cursor: default; }
+  .rpt-btn:hover:not([disabled]) { filter: brightness(1.1); }
+  .rpt-hint {
+    color: var(--text-muted); font-size: 0.78rem; margin-top: 0.5rem;
+  }
+  .rpt-status {
+    margin-top: 0.75rem; font-size: 0.85rem;
+    display: none;
+  }
+  .rpt-status.ok    { color: var(--accent); }
+  .rpt-status.err   { color: #f88; }
+
+  .rpt-table {
+    width: 100%; border-collapse: collapse; font-size: 0.85rem;
+  }
+  .rpt-table th, .rpt-table td {
+    text-align: left; padding: 0.45rem 0.6rem;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+  .rpt-table th {
+    background: var(--bg-darker); font-weight: 600;
+    color: var(--text-muted); font-size: 0.72rem;
+    text-transform: uppercase; letter-spacing: 0.03em;
+  }
+  .rpt-table tbody tr:hover { background: var(--bg-darker); }
+  .rpt-table .num { text-align: right; font-variant-numeric: tabular-nums; }
+  .rpt-empty {
+    color: var(--text-muted); font-size: 0.9rem;
+    padding: 1rem 0.6rem;
+  }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="rpt-panel">
+  <h2>Generate report</h2>
+  <div class="rpt-form">
+    <div>
+      <label for="rptMonth">Month</label>
+      <input class="rpt-input" id="rptMonth" type="month" value="{{ default_month }}">
+    </div>
+    <div>
+      <label for="rptFormat">Format</label>
+      <select class="rpt-select" id="rptFormat">
+        {% for code, label in format_display.items %}
+        <option value="{{ code }}">{{ label }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div>
+      <button class="rpt-btn" id="rptGenerateBtn" onclick="generateReport()">Generate</button>
+    </div>
+  </div>
+  <div class="rpt-hint">
+    SoundExchange NCE and Summary formats filter to Music-category-kind plays only, at the 30-second SoundExchange threshold. Raw CSV includes every PlayEvent in the period with no filter -- audit source only, not for submission.
+  </div>
+  <div class="rpt-status" id="rptStatus"></div>
+</div>
+
+<div class="rpt-panel">
+  <h2>Past reports</h2>
+  {% if reports %}
+  <table class="rpt-table">
+    <thead>
+      <tr>
+        <th>Period</th>
+        <th>Format</th>
+        <th>Generated</th>
+        <th>By</th>
+        <th class="num">Plays</th>
+        <th class="num">Unique tracks</th>
+        <th class="num">ISRC %</th>
+        <th>Download</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for r in reports %}
+      <tr>
+        <td>{{ r.period_start|date:"Y-m" }}</td>
+        <td>{{ r.get_format_display }}</td>
+        <td>{{ r.generated_at|date:"Y-m-d H:i" }}</td>
+        <td>{{ r.generated_by.username|default:"—" }}</td>
+        <td class="num">{{ r.total_plays }}</td>
+        <td class="num">{{ r.unique_tracks }}</td>
+        <td class="num">{{ r.isrc_percent|floatformat:1 }}%</td>
+        <td>
+          {% if r.file %}
+          <a href="{% url 'library:reports-download' r.id %}">Download</a>
+          {% else %}
+          <span class="rpt-hint">no file</span>
+          {% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <div class="rpt-empty">No reports generated yet. Use the form above to make one.</div>
+  {% endif %}
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+function getCookie(name) {
+  let val = null;
+  document.cookie.split(';').forEach(c => {
+    c = c.trim();
+    if (c.startsWith(name + '=')) val = decodeURIComponent(c.substring(name.length + 1));
+  });
+  return val;
+}
+
+async function generateReport() {
+  const btn = document.getElementById('rptGenerateBtn');
+  const status = document.getElementById('rptStatus');
+  const month = document.getElementById('rptMonth').value;
+  const fmt = document.getElementById('rptFormat').value;
+  if (!month) {
+    status.className = 'rpt-status err';
+    status.textContent = 'Pick a month first.';
+    status.style.display = 'block';
+    return;
+  }
+  btn.disabled = true;
+  status.className = 'rpt-status';
+  status.style.display = 'block';
+  status.textContent = 'Generating (scanning PlayEvent rows, aggregating, writing CSV)...';
+  try {
+    const resp = await fetch("{% url 'library:api-reports-generate' %}", {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-CSRFToken': getCookie('csrftoken'),
+      },
+      body: JSON.stringify({ month, format: fmt }),
+    });
+    const data = await resp.json();
+    if (!resp.ok || data.error) {
+      status.className = 'rpt-status err';
+      status.textContent = 'Error: ' + (data.error || `HTTP ${resp.status}`);
+      btn.disabled = false;
+      return;
+    }
+    status.className = 'rpt-status ok';
+    status.innerHTML =
+      `Generated: ${data.total_plays} plays, ${data.unique_tracks} unique tracks, ${data.plays_with_isrc} with ISRC. ` +
+      `<a href="${data.download_url}">Download now</a> or reload the page to see it in the list below.`;
+    // Reload to show the new row in the past-reports table.
+    setTimeout(() => window.location.reload(), 1500);
+  } catch (e) {
+    status.className = 'rpt-status err';
+    status.textContent = 'Network error: ' + e.message;
+    btn.disabled = false;
+  }
+}
+</script>
+{% endblock %}
