@@ -844,6 +844,19 @@ def playlists_page(request):
     return render(request, "library/playlists.html", {"categories": categories})
 
 
+def welcome_page(request):
+    """Landing page for authenticated users who don't belong to any
+    recognized group -- shown instead of the studio-operator dashboard
+    they'd otherwise land on. Content is intentionally minimal: the
+    station's brand, a short "you don't have privileges" message, and
+    contact details so the user can reach out if that's unexpected.
+
+    Also reachable directly by anyone (staff/superuser included) via
+    /welcome/ -- there's no reason to hide it, and a superuser can use
+    the URL to preview what an unprivileged user would see."""
+    return render(request, "library/welcome.html", {})
+
+
 def library_page(request):
     categories = Category.objects.order_by("name")
     holidays = Holiday.objects.order_by("month", "day")

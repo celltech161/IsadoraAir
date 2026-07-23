@@ -6,6 +6,7 @@ app_name = 'library'
 
 urlpatterns = [
     path('', views.dashboard_page, name='dashboard'),
+    path('welcome/', views.welcome_page, name='welcome'),
     path('schedule/', views.schedule_page, name='schedule'),
     path('library/', views.library_page, name='library'),
     path('library/import/', views.library_import_page, name='library-import'),

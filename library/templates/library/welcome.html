@@ -1,0 +1,165 @@
+{% load static %}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Welcome — IsadoraAir</title>
+  <link rel="icon" type="image/png" href="/media/ui_theme/isadoraair_icon.png">
+  <link rel="apple-touch-icon" href="/media/ui_theme/isadoraair_icon.png">
+  <style>
+    :root {
+      --bg-dark: {{ ui_theme.bg_dark }};
+      --bg-darker: {{ ui_theme.bg_darker }};
+      --panel-bg: {{ ui_theme.panel_bg }};
+      --accent: {{ ui_theme.accent }};
+      --accent-soft: {{ ui_theme.accent_soft }};
+      --text-main: {{ ui_theme.text_main }};
+      --text-muted: {{ ui_theme.text_muted }};
+      --danger: {{ ui_theme.danger }};
+      --border-subtle: {{ ui_theme.border_subtle }};
+    }
+
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    html, body {
+      min-height: 100%;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: var(--bg-darker);
+      color: var(--text-main);
+    }
+
+    body {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 1.5rem;
+    }
+
+    .welcome-card {
+      width: 100%;
+      max-width: 420px;
+      background: var(--bg-dark);
+      border: 1px solid var(--border-subtle);
+      border-radius: 12px;
+      padding: 2rem 1.75rem;
+      text-align: center;
+    }
+
+    .welcome-logo {
+      display: block;
+      height: 44px;
+      width: auto;
+      margin: 0 auto 1.5rem;
+    }
+
+    .welcome-logo.has-station-logo {
+      margin-bottom: 0.75rem;
+    }
+
+    .station-logo {
+      display: block;
+      max-width: 260px;
+      width: 100%;
+      height: auto;
+      margin: 0 auto 1.5rem;
+    }
+
+    .welcome-message {
+      color: var(--text-main);
+      font-size: 0.95rem;
+      line-height: 1.55;
+      margin-bottom: 1.25rem;
+      text-align: left;
+    }
+
+    .contact-block {
+      background: var(--bg-darker);
+      border: 1px solid var(--border-subtle);
+      border-radius: 8px;
+      padding: 0.9rem 1rem;
+      margin-bottom: 1.5rem;
+      text-align: left;
+    }
+
+    .contact-line {
+      font-size: 0.9rem;
+      color: var(--text-main);
+      margin-bottom: 0.35rem;
+    }
+
+    .contact-line:last-child {
+      margin-bottom: 0;
+    }
+
+    .contact-line .label {
+      display: inline-block;
+      min-width: 3.2rem;
+      color: var(--text-muted);
+      font-weight: 600;
+    }
+
+    .contact-line a {
+      color: var(--accent);
+      text-decoration: none;
+    }
+
+    .contact-line a:hover {
+      text-decoration: underline;
+    }
+
+    .logout-form {
+      margin: 0;
+    }
+
+    .logout-button {
+      display: inline-block;
+      background: transparent;
+      border: 1px solid var(--border-subtle);
+      border-radius: 8px;
+      padding: 0.5rem 1.2rem;
+      color: var(--text-muted);
+      font-size: 0.85rem;
+      cursor: pointer;
+      transition: color 0.12s, border-color 0.12s;
+      font-family: inherit;
+    }
+
+    .logout-button:hover {
+      color: var(--text-main);
+      border-color: var(--accent);
+    }
+  </style>
+</head>
+<body>
+  <div class="welcome-card">
+    <img class="welcome-logo{% if ui_theme.station_logo %} has-station-logo{% endif %}"
+         src="{% if ui_theme.logo %}{{ ui_theme.logo.url }}{% else %}{% static 'library/img/isadoraair_logo.png' %}{% endif %}"
+         alt="IsadoraAir">
+    {% if ui_theme.station_logo %}
+    <img class="station-logo" src="{{ ui_theme.station_logo.url }}" alt="Station logo">
+    {% endif %}
+
+    <p class="welcome-message">
+      You currently have no privileges assigned to your user profile.
+      If you believe this is in error contact:
+    </p>
+
+    <div class="contact-block">
+      <div class="contact-line">
+        <span class="label">Phone:</span>
+        <a href="tel:+17854077145">(785) 407-7145</a>
+      </div>
+      <div class="contact-line">
+        <span class="label">E-mail:</span>
+        <a href="mailto:oakgroveradio@gmail.com">oakgroveradio@gmail.com</a>
+      </div>
+    </div>
+
+    <form method="post" action="{% url 'logout' %}" class="logout-form">
+      {% csrf_token %}
+      <button type="submit" class="logout-button">Sign out</button>
+    </form>
+  </div>
+</body>
+</html>
