@@ -5,6 +5,6 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-User=jreed
-Group=jreed
-ExecStart=/home/jreed/bin/backup_isadoraair.sh
+User=@@ISA_USER@@
+Group=@@ISA_USER@@
+ExecStart=@@ISA_HOME@@/bin/backup_isadoraair.sh

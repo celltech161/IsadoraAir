@@ -5,8 +5,8 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-User=jreed
-Group=jreed
-WorkingDirectory=/home/jreed/syndicated-ingest/acafe
-ExecStart=/home/jreed/syndicated-ingest/venv/bin/python /home/jreed/syndicated-ingest/acafe/get_acafe.py
+User=@@ISA_USER@@
+Group=@@ISA_USER@@
+WorkingDirectory=@@SYNDICATED_ROOT@@/acafe
+ExecStart=@@SYNDICATED_ROOT@@/venv/bin/python @@SYNDICATED_ROOT@@/acafe/get_acafe.py
 TimeoutStartSec=900

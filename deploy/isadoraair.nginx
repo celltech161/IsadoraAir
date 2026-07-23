@@ -15,7 +15,7 @@ server {
     client_max_body_size 1G;
 
     location /static/ {
-        alias /opt/isadoraair/staticfiles/;
+        alias @@ISA_ROOT@@/staticfiles/;
         expires 1h;
     }
 

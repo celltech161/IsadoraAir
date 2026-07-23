@@ -4,7 +4,7 @@ After=network-online.target
 
 [Service]
 Type=oneshot
-User=jreed
-Group=jreed
-WorkingDirectory=/home/jreed/ogremote-ingest
-ExecStart=/home/jreed/ogremote-ingest/venv/bin/python /home/jreed/ogremote-ingest/urgent_pa.py --periodic
+User=@@ISA_USER@@
+Group=@@ISA_USER@@
+WorkingDirectory=@@OGREMOTE_ROOT@@
+ExecStart=@@OGREMOTE_ROOT@@/venv/bin/python @@OGREMOTE_ROOT@@/urgent_pa.py --periodic

@@ -5,8 +5,8 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-User=jreed
-Group=jreed
-WorkingDirectory=/home/jreed/syndicated-ingest/rch
-ExecStart=/home/jreed/syndicated-ingest/venv/bin/python /home/jreed/syndicated-ingest/rch/get_rch.py
+User=@@ISA_USER@@
+Group=@@ISA_USER@@
+WorkingDirectory=@@SYNDICATED_ROOT@@/rch
+ExecStart=@@SYNDICATED_ROOT@@/venv/bin/python @@SYNDICATED_ROOT@@/rch/get_rch.py
 TimeoutStartSec=1800

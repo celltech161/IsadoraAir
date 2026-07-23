@@ -240,16 +240,14 @@ Syndicated ingestion and the Bluesky poster scripts also live outside
 the repo at `~/syndicated-ingest/` (own venv, separate from this
 project's), with credentials in `~/.syndicated_ingest.cred`.
 
-**Note on the `deploy/` unit files:** every unit ships with the paths of
-the live KOGR-LP install (`/home/jreed/isadoraair-django/venv/…`,
-`/home/jreed/syndicated-ingest/…`, etc.) hardcoded — they're the exact
-files running on the real box, published as reference rather than as a
-paramaterized template. If you deploy under a different path (or a
-different user), search-and-replace those literals before enabling any
-unit. `/opt/isadoraair` on the live box is a symlink to
-`/home/jreed/isadoraair-django`, which is why the `WorkingDirectory=`
-lines look inconsistent with the `ExecStart=` paths — same target, two
-names.
+**Note on the `deploy/` unit files:** paths and the run-as user are
+`@@PLACEHOLDER@@` tokens (`@@ISA_USER@@`, `@@ISA_ROOT@@`, etc). See
+[`deploy/README.md`](deploy/README.md) for the full placeholder table
+and a copy-pastable install snippet that renders + drops each unit
+into `/etc/systemd/system/`. Six variables cover the whole set;
+`ISA_USER` and `ISA_ROOT` are the only two that matter for a
+minimal install without the syndicated-ingest / weather-ingest /
+ogremote-ingest companion projects.
 
 ## Project Status
 

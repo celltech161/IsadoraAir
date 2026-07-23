@@ -5,7 +5,7 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-User=jreed
-Group=jreed
-WorkingDirectory=/home/jreed/syndicated-ingest/gdead
-ExecStart=/home/jreed/syndicated-ingest/venv/bin/python /home/jreed/syndicated-ingest/gdead/get_gdead.py
+User=@@ISA_USER@@
+Group=@@ISA_USER@@
+WorkingDirectory=@@SYNDICATED_ROOT@@/gdead
+ExecStart=@@SYNDICATED_ROOT@@/venv/bin/python @@SYNDICATED_ROOT@@/gdead/get_gdead.py

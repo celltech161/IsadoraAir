@@ -5,7 +5,7 @@ Wants=isadoraair-engine.service
 
 [Service]
 Type=oneshot
-User=jreed
-Group=jreed
-WorkingDirectory=/home/jreed/syndicated-ingest/bsky
-ExecStart=/home/jreed/syndicated-ingest/venv/bin/python /home/jreed/syndicated-ingest/bsky/post_now_playing.py
+User=@@ISA_USER@@
+Group=@@ISA_USER@@
+WorkingDirectory=@@SYNDICATED_ROOT@@/bsky
+ExecStart=@@SYNDICATED_ROOT@@/venv/bin/python @@SYNDICATED_ROOT@@/bsky/post_now_playing.py

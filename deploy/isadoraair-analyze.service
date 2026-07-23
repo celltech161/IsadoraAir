@@ -4,8 +4,8 @@ After=network.target postgresql.service
 
 [Service]
 Type=oneshot
-User=jreed
-Group=jreed
-WorkingDirectory=/opt/isadoraair
-ExecStart=/opt/isadoraair/venv/bin/python /opt/isadoraair/manage.py analyze_tracks
-EnvironmentFile=/opt/isadoraair/.env
+User=@@ISA_USER@@
+Group=@@ISA_USER@@
+WorkingDirectory=@@ISA_ROOT@@
+ExecStart=@@ISA_ROOT@@/venv/bin/python @@ISA_ROOT@@/manage.py analyze_tracks
+EnvironmentFile=@@ISA_ROOT@@/.env

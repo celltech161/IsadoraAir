@@ -3,13 +3,13 @@ Description=IsadoraAir Stream Encoders (Icecast/Shoutcast)
 After=network.target postgresql.service isadoraair-gunicorn.service stereotool.service
 
 [Service]
-User=jreed
-Group=jreed
-WorkingDirectory=/opt/isadoraair
-ExecStart=/opt/isadoraair/venv/bin/python /opt/isadoraair/manage.py run_encoders
+User=@@ISA_USER@@
+Group=@@ISA_USER@@
+WorkingDirectory=@@ISA_ROOT@@
+ExecStart=@@ISA_ROOT@@/venv/bin/python @@ISA_ROOT@@/manage.py run_encoders
 Restart=on-failure
 RestartSec=5
-EnvironmentFile=/opt/isadoraair/.env
+EnvironmentFile=@@ISA_ROOT@@/.env
 
 [Install]
 WantedBy=multi-user.target
