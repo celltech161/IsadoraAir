@@ -266,6 +266,9 @@
     <div style="margin-top:0.35rem;">MP3, MP2, FLAC, WAV, M4A, ALAC, OGG, AIFF</div>
     <div style="margin-top:0.35rem;">WAV/AIF files are auto-converted to FLAC after upload.</div>
     <div style="margin-top:0.35rem;">Max {{ max_batch_size_mb }}MB per batch</div>
+    <div style="margin-top:0.6rem; font-size:0.75rem; color: var(--text-muted); border-top: 1px dashed var(--border-subtle); padding-top:0.5rem;">
+      If drag-and-drop doesn't work: click the box above to browse instead. Snap-packaged Firefox on Ubuntu / Zorin / Mint / Pop!_OS silently blocks file drops from the file manager because of sandboxing, but the file picker always works.
+    </div>
   </div>
   <input type="file" id="impFileInput" multiple accept=".mp3,.mp2,.flac,.wav,.m4a,.alac,.ogg,.oga,.aiff,.aif" style="display:none;">
 
@@ -560,6 +563,14 @@ const resultsEl = document.getElementById('impResults');
 const uploadingEl = document.getElementById('impUploading');
 
 dropzone.addEventListener('click', () => fileInput.click());
+// preventDefault on BOTH dragenter and dragover -- Firefox has been
+// historically strict about needing dragenter cancelled as well as
+// dragover, and without it certain drag sources drop the whole
+// sequence before the drop event ever fires. Chrome doesn't need
+// this but doesn't mind it.
+dropzone.addEventListener('dragenter', (e) => {
+  e.preventDefault();
+});
 dropzone.addEventListener('dragover', (e) => {
   e.preventDefault();
   dropzone.classList.add('dragover');
