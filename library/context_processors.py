@@ -1,4 +1,4 @@
-from .middleware import GROUP_ACCESS_MAP, user_is_contributor
+from .middleware import get_group_access_map, user_is_contributor
 from .models import NavMenuItem, UITheme
 
 
@@ -61,12 +61,13 @@ def nav_menu(request):
     # LoginRequiredMiddleware bounces them away before they can click
     # anything anyway.
     if user and user.is_authenticated and not user.is_staff and not user.is_superuser:
-        recognized = set(user.groups.values_list("name", flat=True)) & set(GROUP_ACCESS_MAP.keys())
+        access_map = get_group_access_map()
+        recognized = set(user.groups.values_list("name", flat=True)) & set(access_map.keys())
         if recognized:
             allowed_prefixes = tuple(
                 prefix
                 for group_name in recognized
-                for prefix in GROUP_ACCESS_MAP[group_name]["prefixes"]
+                for prefix in access_map[group_name]["prefixes"]
             )
             items = [i for i in items if i.resolved_url and i.resolved_url.startswith(allowed_prefixes)]
         else:

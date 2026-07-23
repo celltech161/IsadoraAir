@@ -22,6 +22,7 @@ from .models import (
     CategoryKind,
     DuplicateCandidate,
     EmailLog,
+    GroupAccess,
     Holiday,
     LogFillConfig,
     LogItem,
@@ -705,6 +706,69 @@ class NavMenuChildInline(SortableTabularInline):
     fk_name = "parent"
     extra = 1
     fields = ["label", "url_name", "custom_url", "extra_active_view_names", "enabled", "open_in_new_tab"]
+
+
+@admin.register(GroupAccess)
+class GroupAccessAdmin(admin.ModelAdmin):
+    """Standalone Group Access admin. ALSO surfaced as an inline on
+    the auth.Group admin below (GroupAccessInline + GroupAdmin) so a
+    fresh deployment can wire up permissions in one obvious place --
+    edit the Group, configure access on the same page."""
+    list_display = ("group", "priority", "landing_url")
+    list_editable = ("priority", "landing_url")
+    ordering = ("priority", "group__name")
+    fieldsets = (
+        (None, {
+            "fields": ("group", "priority", "landing_url"),
+            "description": (
+                "Which auth.Group this row configures, where its members "
+                "land after login (raw URL path, e.g. /library/), and "
+                "how it competes with other groups for the landing choice "
+                "(lower priority number wins)."
+            ),
+        }),
+        ("Allowed request paths", {
+            "fields": ("allowed_prefixes", "allowed_exact", "allowed_regex"),
+            "description": (
+                "One entry per line in each of the three lists. "
+                "A member of this group can reach any request path in "
+                "the UNION of the three lists. Middleware caches the "
+                "computed set and invalidates on save."
+            ),
+        }),
+    )
+
+
+class GroupAccessInline(admin.StackedInline):
+    """Inline GroupAccess on the auth.Group admin page. Optional
+    -- a Group without a GroupAccess row is treated as 'not a
+    recognized group' by the middleware (its members fall to the
+    welcome page). Adding this inline row is how you grant a Group
+    any privileges at all."""
+    model = GroupAccess
+    can_delete = True
+    max_num = 1
+    fields = ("priority", "landing_url", "allowed_prefixes", "allowed_exact", "allowed_regex")
+
+
+# Re-register auth.Group's admin with our inline attached. Django ships
+# a default GroupAdmin; we unregister and register a subclass so the
+# access rows show up on the standard Groups page in admin. Uses import-
+# time try/except so a fresh install that hasn't loaded auth yet doesn't
+# blow up (auth is core to Django though; in practice this always runs).
+try:
+    from django.contrib.auth.admin import GroupAdmin
+    from django.contrib.auth.models import Group as AuthGroup
+
+    class GroupAdminWithAccess(GroupAdmin):
+        inlines = [GroupAccessInline]
+
+    admin.site.unregister(AuthGroup)
+    admin.site.register(AuthGroup, GroupAdminWithAccess)
+except Exception:
+    # Django admin not fully wired yet -- next request will import
+    # this module again after apps are ready. No blocking failure.
+    pass
 
 
 @admin.register(NavMenuItem)

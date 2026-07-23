@@ -816,6 +816,75 @@ class UITheme(models.Model):
         return obj
 
 
+class GroupAccess(models.Model):
+    """Per-group access rules for the site's URL surface. Middleware
+    (library.middleware.GroupBasedAccessMiddleware) reads this table
+    and unions the entries for every recognized group a user belongs
+    to; any request path in the union is permitted. Staff/superuser
+    bypass this table entirely.
+
+    Designed to be admin-editable (inline on the standard auth.Group
+    admin page) so a fresh deployment can wire up its own group
+    scheme without touching code -- names, allowed paths, landing
+    pages are all data. Default configurations for `remote_dj` and
+    `Contributor` ship as a data migration.
+
+    Three parallel path-list fields (one URL per line):
+      allowed_prefixes -- request.path.startswith(one_of_these)
+      allowed_exact    -- request.path == one_of_these literally
+      allowed_regex    -- re.match(one_of_these, request.path)
+
+    A group's total allowed set is the union across all three lists.
+    Leave any field blank if not needed.
+    """
+    group = models.OneToOneField(
+        "auth.Group", on_delete=models.CASCADE, related_name="access",
+        help_text="The Django auth Group this access set applies to.",
+    )
+    allowed_prefixes = models.TextField(
+        blank=True,
+        help_text="One path prefix per line. A request whose path startswith any listed prefix is allowed. Example lines: /library/  /api/tracks/",
+    )
+    allowed_exact = models.TextField(
+        blank=True,
+        help_text="One exact path per line. The request path must equal the listed value literally (no startswith). Example lines: /api/tracks/  /api/engine/queue/insert/",
+    )
+    allowed_regex = models.TextField(
+        blank=True,
+        help_text="One Python regex per line, matched via re.match against the request path. For parameterized URLs a plain prefix or exact match can't cover. Example: ^/api/playlists/\\d+/play-now/$",
+    )
+    landing_url = models.CharField(
+        max_length=200, blank=True,
+        help_text="Where members of this group are redirected on '/' or on a denied page (page-shaped requests only; APIs still 403). Raw URL path, e.g. '/library/'. Blank = redirect to /welcome/.",
+    )
+    priority = models.IntegerField(
+        default=100,
+        help_text="Lower number wins when a user in multiple groups needs a landing page. Ties broken by group name (alphabetical).",
+    )
+
+    class Meta:
+        verbose_name = "Group Access"
+        verbose_name_plural = "Group Access"
+        ordering = ["priority", "group__name"]
+
+    def __str__(self):
+        return f"Access for {self.group.name}"
+
+    @staticmethod
+    def _lines(text):
+        return tuple(ln.strip() for ln in (text or "").splitlines() if ln.strip())
+
+    def prefix_list(self):
+        return self._lines(self.allowed_prefixes)
+
+    def exact_set(self):
+        return frozenset(self._lines(self.allowed_exact))
+
+    def regex_list(self):
+        import re
+        return tuple(re.compile(p) for p in self._lines(self.allowed_regex))
+
+
 class NavMenuItem(models.Model):
     """A row in the site nav bar (templates/base.html), admin-editable --
     not a singleton itself (there are many rows), but grouped into the
