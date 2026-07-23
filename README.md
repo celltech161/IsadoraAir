@@ -103,10 +103,10 @@ IsadoraAir manages the full music library, schedule programming, playlist genera
 - django-axes login lockout on repeated failed sign-ins
 
 **Content Ingestion & Integrations**
-- Syndicated show ingestion: 20+ shows automatically fetched, tagged, artwork-attached where available, and delivered into their rotation categories on each source's real broadcast schedule (KIN news, BirdNote Daily, Academic Minute, Big Picture Science, Acoustic Cafe, Democracy Now, Anjunachill, Grateful Dead Hour, etc.). Each show is a `syndicated-<slug>.timer`/`.service` pair matching the source-box crontab that was the original authoritative schedule
+- Syndicated program ingestion framework: any external audio program can be pulled from its source, tagged (with artwork where available), and delivered into a rotation category on its own broadcast schedule. Each show is a `syndicated-<slug>.timer`/`.service` pair paired with a small per-source fetcher script; the framework handles metadata, categorization, file placement, and the ready2air gate. Per-source fetchers live outside this repo since they typically carry feed URLs, credentials, or scraping logic specific to each provider. The KOGR-LP install runs 20+ syndicated shows through this framework
 - Weather integration: NWS-sourced current temperature, one-day and three-day forecasts feeding RadioText messages via the RBDS client, plus alert beeps for active watches/warnings played straight to a dedicated ALSA loopback into StereoTool — bypasses the playback engine so alerts still fire during a manual override or engine restart
-- Bluesky auto-poster: now-playing metadata pushed to a Bluesky account every 2 minutes, with de-duplication so an unchanged track doesn't re-post
-- Remote content polling (`ogremote`): pulls fresh content from a remote source and stages it into the library, with a separate urgent-replay path for time-sensitive drops
+- Bluesky auto-poster: now-playing metadata pushed to a configured Bluesky account every 2 minutes, with de-duplication so an unchanged track doesn't re-post
+- `ogremote` receiver: **ogremote is a separate newsgathering / voiceover tool that is not part of this project** — it runs on its own box and produces content to be aired. IsadoraAir ships only the receiving-side integration: polls for available uploads and dispatches urgent-replay drops into the library. Optional; disable the two `ogremote-*.timer` units if you're not running ogremote upstream
 
 ## Architecture
 
@@ -280,7 +280,6 @@ Things a station operator might expect that IsadoraAir doesn't ship today. Some 
 - **Royalty / SoundExchange reporting** — statutory-license logs for non-commercial webcasters. `PlaylistLog` already captures what played and when; the export side is the near-term next feature.
 - **Commercial-style traffic** — underwriting spot scheduling, affidavit reports, PSA rotation tracking. The current "Traffic" admin section is programming-side (Rotations, Playlists, ScheduleBlocks), not spot-side. Planned.
 - **Cart wall / instant hot keys** — one-click drops/stingers/jingles for live-assist. Planned.
-- **Automatic backup-audio failover** — if the playback engine dies mid-song, `isadoraair-engine-boot-restart.timer` catches silence and force-restarts the service, but there is no hot-swap to a redundant source. Streaming has Liquidsoap fallback logic; the FM side does not (yet).
 
 ## Security
 
