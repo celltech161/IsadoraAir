@@ -545,7 +545,22 @@ dropzone.addEventListener('dragleave', () => dropzone.classList.remove('dragover
 dropzone.addEventListener('drop', (e) => {
   e.preventDefault();
   dropzone.classList.remove('dragover');
-  if (e.dataTransfer.files.length) uploadFiles(e.dataTransfer.files);
+  if (e.dataTransfer.files.length) {
+    uploadFiles(e.dataTransfer.files);
+  } else {
+    // Zero-file drops happen when the source produces URIs or app-
+    // specific MIME types instead of real File objects -- browser
+    // tabs, streaming apps (Spotify/YouTube), cloud-drive UIs, or
+    // partially-downloaded files the OS hasn't materialized yet.
+    // Without this branch the drop silently no-ops and looks like
+    // "nothing happened" -- a real report from wavebuff.
+    resultsEl.innerHTML =
+      '<div class="imp-result-row error">' +
+      '<span class="imp-result-icon">&#10007;</span>' +
+      '<div><div class="imp-result-name">That drop had no files</div>' +
+      '<div class="imp-result-detail">Drag audio files from your file manager (Files, Finder, Explorer, etc). Drags from browser tabs or streaming apps do not contain real files.</div>' +
+      '</div></div>';
+  }
 });
 fileInput.addEventListener('change', () => {
   if (fileInput.files.length) uploadFiles(fileInput.files);
