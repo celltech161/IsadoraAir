@@ -79,6 +79,14 @@ IsadoraAir manages the full music library, schedule programming, playlist genera
 - Audio path: persistent FX sub-mixer + single permanent pad on the master mixer — no pad churn on the main audio path, so a fire (or a spam of them) can never destabilize the on-air chain. A permanent silent source keeps the mixer / alsasink continuously hot so the first fire after idle doesn't lose its leading edge to a cold-start
 - `FXBusConfig` singleton (Config → FX Bus): global bus volume (live-adjustable) + polyphony cap (max simultaneous fires; over-cap fires are dropped)
 
+**Voice Tracking**
+- Two DJ voice-overs per song — one for the outro (fires at the outgoing track's `outro_starts_seconds`) and one for the intro (fires before the incoming track's `intro_until_seconds`). Track-bound, so "That was Dolly Parton's 1978 hit…" is recorded once and plays every rotation of that song
+- Browser recording via `MediaRecorder`, WebM/Opus captured client-side, transcoded to 16-bit PCM WAV in the browser (`audioBufferToWav`) and uploaded — no server-side ffmpeg dependency, works on any device with a mic. All three DSP passes (AGC, noise suppression, echo cancellation) are forced OFF via `{exact: false}` constraints so the raw take reaches the on-air chain untouched by Chrome's speech-optimized guessing
+- In-browser audio editor with waveform display (mono / stereo aware L/R lanes), keep/delete trim modes with in-session undo stack, peak normalize (0.95 target), zoom on mousewheel + Alt-drag pan + click-to-seek. Destructive Save-and-close writes a fresh WAV via atomic tmpfile-then-rename, so a crash mid-write can't corrupt the airable file
+- Playback engine sequencing: at outgoing outro_starts, the state machine enters VT mode, fires the outro-VT with a configurable duck ramp on the deck bus, plays outgoing to natural end, holds for outro-VT to finish, waits `min_gap_ms`, fires intro-VT, and computes an incoming-deck start delay so the intro-VT ends exactly at the incoming track's `intro_until_seconds` — with music underlap when needed. Dedicated `vt_duck_gain` element upstream of the mic duck so VT ducking and mic ducking can be tuned independently
+- Gated on `intro_until_seconds` and `outro_starts_seconds` markers being set (per SoundExchange-adjacent design: no VT should ever land in a track's vocal window). Record buttons enable in real time as the operator types marker values and auto-save the track before opening the recording modal, so no "click Save first, wait, then record" ceremony
+- `/voicetracks/` index page (staff + remote_dj) lists every VT with track / artist / position / duration / edit / delete; Track detail page (`/track/<id>/`) has an inline recording modal for intro + outro slots. `VoiceTrackConfig` singleton (Config → Voice Track Config) tunes the global duck depth, ramp, and inter-VT gap
+
 **Aircheck Recording** (`aircheck/` app)
 - Captures what actually went out over the air, on demand, from any dashboard — start/stop button, session list with duration + file size + status
 - Backed by a persistent liquidsoap `output.file` block driven over telnet (`aircheck.reopen`), so no per-session ffmpeg subprocess is spawned and no ALSA device is contended with the encoders — the same in-process source that feeds Icecast/Shoutcast is what gets written to disk
@@ -287,6 +295,7 @@ ogremote-ingest companion projects.
 | 10. Email + admin infrastructure | Complete — EmailLog transport-layer capture, invite/reset flows, admin-editable nav menu, django-axes lockout |
 | 11. Royalty reporting | Complete — PlayEvent evidence ledger, SoundExchange NCE / summary / raw-CSV generators, /reports/ frontend, ISRC auto-populate from tags + MusicBrainz backfill, ATH computed from Icecast/Shoutcast listener samples with manual override, 3-year retention prune |
 | 12. FX carts / hotkeys | Complete — one-shot buttons with drag-drop file upload, RGBA colors, per-cart retrigger modes (restart/ignore/stop), keyboard shortcuts, mobile-collapsible panel, persistent FX sub-mixer with one permanent pad on the master mixer and always-on silence to keep the audio path hot |
+| 13. Voice tracking | Complete — per-track intro + outro VT slots, browser recording with DSP forced off, in-browser waveform editor with keep/delete trim + peak normalize + undo, engine state machine sequences outro-VT → gap → intro-VT with computed underlap-delay so intro-VT ends exactly at incoming intro_until, dedicated vt_duck_gain in the pipeline, auto-resume on engine restart preserves position |
 
 Actively running end-to-end on a live station: schedule → log builder → playback engine → StereoTool → transmitter, plus live streaming, RDS, monitoring, remote DJ, and content ingestion.
 
@@ -295,7 +304,6 @@ Actively running end-to-end on a live station: schedule → log builder → play
 Things a station operator might expect that IsadoraAir doesn't ship today. Some are on the near-term roadmap, some are permanent non-goals; both are called out so you know what you're getting:
 
 - **EAS (Emergency Alert System)** — permanently external. Compliant EAS is always a hardware ENDEC (Sage/DASDEC/Trilithic) that inserts into the audio chain physically upstream of automation, so the alert reaches air even if the automation box is down. Vendor-side software EAS exists in development form but has no FCC approval as of this writing; when a software path becomes a compliant option, IsadoraAir intends to be an early adopter (SAGE-- If you're reading this hit us up!).
-- **Voice tracking** — pre-recorded DJ segments dropped between specific tracks so an automated hour sounds hosted. Planned, not yet implemented.
 - **Commercial-style traffic** — underwriting spot scheduling, affidavit reports, PSA rotation tracking. The current "Traffic" admin section is programming-side (Rotations, Playlists, ScheduleBlocks), not spot-side. Planned.
 
 ## Security
