@@ -322,7 +322,17 @@
     color: var(--text-muted); font-size: 0.75rem; margin-top: 0.35rem;
   }
   .vt-existing-actions, .vt-empty {
-    display: flex; gap: 0.4rem; margin-top: 0.5rem;
+    display: flex; gap: 0.4rem; margin-top: 0.5rem; flex-wrap: wrap;
+  }
+  .vt-dropzone {
+    padding: 0.6rem;
+    border: 1px dashed var(--border-subtle);
+    border-radius: 6px;
+    transition: background 0.1s ease, border-color 0.1s ease;
+  }
+  .vt-dropzone.dragover {
+    background: rgba(59, 130, 246, 0.08);
+    border-color: var(--accent);
   }
   .vt-btn {
     background: var(--bg-mid); border: 1px solid var(--border-subtle);
@@ -556,18 +566,24 @@
           <audio controls preload="none" src="{% url 'library:api-voicetrack-audio' voicetracks.intro.id %}" style="width:100%;"></audio>
           <div class="vt-existing-meta">
             {{ voicetracks.intro.duration_seconds|floatformat:2 }}s ·
+            {{ voicetracks.intro.get_source_display }} ·
             {{ voicetracks.intro.recorded_by.username|default:"anon" }} ·
             {{ voicetracks.intro.edited_at|date:"Y-m-d H:i"|default:voicetracks.intro.recorded_at|date:"Y-m-d H:i" }}
           </div>
           <div class="vt-existing-actions">
             <button type="button" id="vtRecordBtnIntro" class="vt-btn" onclick="vtRecord('intro')">Re-record</button>
+            <button type="button" class="vt-btn" onclick="document.getElementById('vtImportIntro').click()">Import file</button>
+            <input type="file" id="vtImportIntro" style="display:none;" accept=".mp3,.mp2,.flac,.wav,.m4a,.alac,.ogg,.oga,.aiff,.aif" onchange="vtImportFile('intro', this.files[0])">
             <button type="button" class="vt-btn" onclick="vtEditorOpen({{ voicetracks.intro.id }}, '{% url 'library:api-voicetrack-audio' voicetracks.intro.id %}', '{{ track.title|escapejs }} — intro VT', function () { window.location.reload(); })">Edit</button>
             <button type="button" class="vt-btn danger" onclick="vtDelete({{ voicetracks.intro.id }})">Delete</button>
           </div>
         </div>
         {% else %}
-        <div class="vt-empty">
+        <div class="vt-empty vt-dropzone" data-position="intro" ondragover="vtDzOver(event)" ondragleave="vtDzLeave(event)" ondrop="vtDzDrop(event, 'intro')">
           <button type="button" id="vtRecordBtnIntro" class="vt-btn primary" onclick="vtRecord('intro')">Record Intro VT</button>
+          <button type="button" class="vt-btn" onclick="document.getElementById('vtImportIntro').click()">Import file</button>
+          <input type="file" id="vtImportIntro" style="display:none;" accept=".mp3,.mp2,.flac,.wav,.m4a,.alac,.ogg,.oga,.aiff,.aif" onchange="vtImportFile('intro', this.files[0])">
+          <div style="font-size:0.7rem; color:var(--text-muted); grid-column:1/-1; margin-top:0.3rem;">…or drop an audio file here</div>
         </div>
         {% endif %}
       </div>
@@ -586,18 +602,24 @@
           <audio controls preload="none" src="{% url 'library:api-voicetrack-audio' voicetracks.outro.id %}" style="width:100%;"></audio>
           <div class="vt-existing-meta">
             {{ voicetracks.outro.duration_seconds|floatformat:2 }}s ·
+            {{ voicetracks.outro.get_source_display }} ·
             {{ voicetracks.outro.recorded_by.username|default:"anon" }} ·
             {{ voicetracks.outro.edited_at|date:"Y-m-d H:i"|default:voicetracks.outro.recorded_at|date:"Y-m-d H:i" }}
           </div>
           <div class="vt-existing-actions">
             <button type="button" id="vtRecordBtnOutro" class="vt-btn" onclick="vtRecord('outro')">Re-record</button>
+            <button type="button" class="vt-btn" onclick="document.getElementById('vtImportOutro').click()">Import file</button>
+            <input type="file" id="vtImportOutro" style="display:none;" accept=".mp3,.mp2,.flac,.wav,.m4a,.alac,.ogg,.oga,.aiff,.aif" onchange="vtImportFile('outro', this.files[0])">
             <button type="button" class="vt-btn" onclick="vtEditorOpen({{ voicetracks.outro.id }}, '{% url 'library:api-voicetrack-audio' voicetracks.outro.id %}', '{{ track.title|escapejs }} — outro VT', function () { window.location.reload(); })">Edit</button>
             <button type="button" class="vt-btn danger" onclick="vtDelete({{ voicetracks.outro.id }})">Delete</button>
           </div>
         </div>
         {% else %}
-        <div class="vt-empty">
+        <div class="vt-empty vt-dropzone" data-position="outro" ondragover="vtDzOver(event)" ondragleave="vtDzLeave(event)" ondrop="vtDzDrop(event, 'outro')">
           <button type="button" id="vtRecordBtnOutro" class="vt-btn primary" onclick="vtRecord('outro')">Record Outro VT</button>
+          <button type="button" class="vt-btn" onclick="document.getElementById('vtImportOutro').click()">Import file</button>
+          <input type="file" id="vtImportOutro" style="display:none;" accept=".mp3,.mp2,.flac,.wav,.m4a,.alac,.ogg,.oga,.aiff,.aif" onchange="vtImportFile('outro', this.files[0])">
+          <div style="font-size:0.7rem; color:var(--text-muted); grid-column:1/-1; margin-top:0.3rem;">…or drop an audio file here</div>
         </div>
         {% endif %}
       </div>
@@ -966,6 +988,52 @@ function vtModalClose() {
   const preview = document.getElementById('vtPreviewAudio');
   if (preview.src) URL.revokeObjectURL(preview.src);
   preview.src = '';
+}
+
+// Drop-zone handlers (visual state + file drop dispatch to vtImportFile).
+function vtDzOver(e) {
+  e.preventDefault();
+  e.currentTarget.classList.add('dragover');
+}
+function vtDzLeave(e) {
+  e.currentTarget.classList.remove('dragover');
+}
+function vtDzDrop(e, position) {
+  e.preventDefault();
+  e.currentTarget.classList.remove('dragover');
+  if (!e.dataTransfer.files.length) return;
+  vtImportFile(position, e.dataTransfer.files[0]);
+}
+
+async function vtImportFile(position, file) {
+  if (!file) return;
+  // Same auto-save-marker-if-dirty guard the recording flow uses.
+  if (!await vtEnsureMarkerCommitted(position)) return;
+  const fd = new FormData();
+  fd.append('file', file, file.name);
+  fd.append('track_id', TRACK_ID);
+  fd.append('position', position);
+  fd.append('source', 'import');
+  // Repurpose the recording modal's status line as an in-page toast so
+  // the operator sees progress without a separate widget. Modal itself
+  // stays hidden.
+  const status = document.getElementById('vtModalStatus');
+  status.textContent = `Importing ${file.name} (${(file.size/1024).toFixed(1)} KB)...`;
+  try {
+    const resp = await fetch("{% url 'library:api-voicetrack-upload' %}", {
+      method: 'POST',
+      headers: { 'X-CSRFToken': getCookie('csrftoken') },
+      body: fd,
+    });
+    const data = await resp.json();
+    if (!resp.ok || data.error) {
+      alert('Import failed: ' + (data.error || `HTTP ${resp.status}`));
+      return;
+    }
+    window.location.reload();
+  } catch (e) {
+    alert('Import failed: ' + e.message);
+  }
 }
 
 async function vtDelete(vtId) {

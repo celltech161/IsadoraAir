@@ -2063,10 +2063,23 @@ def voicetracks_page(request):
 @csrf_exempt
 @require_http_methods(["POST"])
 def api_voicetrack_upload(request):
-    """Save an audio blob as a voice-track for a specific (track,
-    position) pair. Destructive: overwrites any existing VT at that
-    slot. Called by the browser recording UI on /track/<pk>/ after
-    MediaRecorder + audioBufferToWav produces a WAV client-side."""
+    """Save an audio file as a voice-track for a specific (track,
+    position) pair. Handles two upload flavors:
+
+      source='browser' (default) -- WAV blob from the browser's
+        MediaRecorder + audioBufferToWav path. Saved as .wav.
+      source='import' -- an arbitrary audio file the operator dropped
+        onto the slot. Any format the library normally accepts
+        (mp3/mp2/flac/wav/m4a/alac/ogg/aiff), preserved with its
+        original extension so decodebin can handle it at fire time.
+
+    Destructive overwrite either way -- one file per (track,
+    position) slot. If the previous take had a different extension
+    (e.g. was a browser recording .wav and the operator now imports
+    a .flac), the previous file is deleted after the new one is
+    written to avoid orphan bytes on disk.
+    """
+    from library.management.commands.import_songs import SUPPORTED_EXT
     from library.models import Track, VoiceTrack
 
     if not _can_edit_voicetracks(request.user):
@@ -2083,53 +2096,92 @@ def api_voicetrack_upload(request):
     if position not in ("intro", "outro"):
         return JsonResponse({"error": "position must be 'intro' or 'outro'"}, status=400)
 
+    source = request.POST.get("source", "browser")
+    if source not in ("browser", "import"):
+        source = "browser"
+
     track = get_object_or_404(Track, pk=track_id)
 
     # Enforce the design constraint: outro-VT requires the outgoing
     # track have outro_starts_seconds set; intro-VT requires the
-    # incoming track have intro_until_seconds. Reject at record time
-    # so an operator can't produce a VT that will never fire.
+    # incoming track have intro_until_seconds. Reject at record/import
+    # time so an operator can't produce a VT that will never fire.
     if position == "outro" and track.outro_starts_seconds is None:
         return JsonResponse({
             "error": "Track has no outro_starts marker set. Set it on the track detail "
-                        "page (or during analysis) before recording an outro VT.",
+                        "page (or during analysis) before recording / importing an outro VT.",
         }, status=400)
     if position == "intro" and track.intro_until_seconds is None:
         return JsonResponse({
             "error": "Track has no intro_until marker set. Set it on the track detail "
-                        "page (or during analysis) before recording an intro VT.",
+                        "page (or during analysis) before recording / importing an intro VT.",
         }, status=400)
 
-    # Filesystem layout: /srv/isadoraair/voicetracks/<track_id>/<position>.wav
-    # One file per (track, position). Overwriting is deliberate: the
-    # editor's undo stack is session-only; when the operator hits
-    # Save-and-return, the current file becomes the airable version and
-    # any previous take is replaced. Prevents an accidental stale take
-    # slipping to air just because someone forgot which version was
-    # current.
+    # Extension handling. Browser recordings are always .wav (the
+    # client-side audioBufferToWav path). Imports get whatever the
+    # user dropped, validated against the library's SUPPORTED_EXT so
+    # a stray .png or .txt can't sneak in. Unknown extensions on
+    # imports return 400.
+    if source == "browser":
+        ext = ".wav"
+    else:
+        original_name = f.name or ""
+        ext = Path(original_name).suffix.lower()
+        if ext not in SUPPORTED_EXT:
+            return JsonResponse({
+                "error": f"Unsupported extension {ext!r}. Allowed: {sorted(SUPPORTED_EXT)}",
+            }, status=400)
+
     dest_dir = VOICETRACK_UPLOAD_DIR / str(track_id)
     dest_dir.mkdir(parents=True, exist_ok=True)
-    dest = dest_dir / f"{position}.wav"
-    with open(dest, "wb") as out:
+    dest = dest_dir / f"{position}{ext}"
+
+    # If the previous take exists AND at a different path (different
+    # extension), remove it after the new file writes cleanly. Same
+    # tmpfile-then-rename atomic pattern the editor's save-edited
+    # path uses -- can't leave a half-written file where the engine
+    # might read it.
+    try:
+        prev_vt = VoiceTrack.objects.get(track=track, position=position)
+        prev_filepath = prev_vt.filepath or ""
+    except VoiceTrack.DoesNotExist:
+        prev_vt = None
+        prev_filepath = ""
+
+    tmp = dest.with_suffix(dest.suffix + ".uploading")
+    with open(tmp, "wb") as out:
         for chunk in f.chunks():
             out.write(chunk)
+    tmp.replace(dest)
 
-    vt, _ = VoiceTrack.objects.get_or_create(
-        track=track, position=position,
-        defaults={"filepath": str(dest), "recorded_by": request.user},
-    )
-    # If the row already existed, update fields (destructive overwrite).
-    vt.filepath = str(dest)
-    vt.source = "browser"
-    if request.user and request.user.is_authenticated:
-        vt.recorded_by = request.user
-    vt.edited_at = timezone.now()
-    vt.save()  # save() re-populates duration_seconds via mutagen
+    if prev_filepath and prev_filepath != str(dest):
+        try:
+            Path(prev_filepath).unlink(missing_ok=True)
+        except OSError:
+            # Orphan file is cheap; the row and the new file are what
+            # matters.
+            pass
+
+    if prev_vt is None:
+        vt = VoiceTrack.objects.create(
+            track=track, position=position,
+            filepath=str(dest), source=source,
+            recorded_by=request.user if request.user.is_authenticated else None,
+        )
+    else:
+        vt = prev_vt
+        vt.filepath = str(dest)
+        vt.source = source
+        if request.user and request.user.is_authenticated:
+            vt.recorded_by = request.user
+        vt.edited_at = timezone.now()
+        vt.save()  # save() re-populates duration_seconds via mutagen
 
     return JsonResponse({
         "ok": True,
         "voicetrack_id": vt.id,
         "duration_seconds": vt.duration_seconds,
+        "source": vt.source,
         "audio_url": reverse("library:api-voicetrack-audio", args=[vt.id]),
     })
 
