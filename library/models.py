@@ -1457,6 +1457,144 @@ class FXBusConfig(models.Model):
         return obj
 
 
+class VoiceTrack(models.Model):
+    """A DJ voice-over associated with a specific Track's intro or outro.
+    At scheduled play time, the engine fires the outgoing track's
+    outro-VT at outro_starts_seconds, then the incoming track's
+    intro-VT so it ends by intro_until_seconds -- delaying the incoming
+    deck's start when needed so the VT never overshoots the incoming's
+    vocal entry (see engine VT transition logic).
+
+    Track-bound (not LogItem-bound), unique per (track, position). "That
+    was Dolly's 1978 hit..." is metadata about the song, true every time
+    the song airs -- so one recording per song per position is enough,
+    and every future rotation of that song plays the same VT
+    automatically. If the operator records after the current hour's log
+    is already built, the change picks up on the next play with no
+    log-regeneration required (association is by track, not LogItem).
+
+    Editing is destructive but undoable within the editor session --
+    Save-and-return writes a fresh file with trims baked in; the editor
+    keeps an undo stack while open, but nothing on disk survives
+    Discard except the original recording. Deliberate: a slip-up in an
+    edited take shouldn't be able to reach air just because the operator
+    forgot which version was current."""
+
+    POSITION_CHOICES = [
+        ("outro", "Outro (plays after outgoing track's outro_starts)"),
+        ("intro", "Intro (plays before incoming track's intro_until)"),
+    ]
+    SOURCE_CHOICES = [
+        ("browser", "Browser recording (MediaRecorder + upload)"),
+        ("studio", "Studio input recording (Phase 2)"),
+        ("import", "Imported / manually placed file"),
+    ]
+
+    track = models.ForeignKey(
+        Track, on_delete=models.CASCADE, related_name="voicetracks",
+    )
+    position = models.CharField(max_length=5, choices=POSITION_CHOICES)
+
+    filepath = models.CharField(
+        max_length=512,
+        help_text="Absolute path to the audio file (typically under /srv/isadoraair/voicetracks/).",
+    )
+    duration_seconds = models.FloatField(
+        null=True, blank=True, editable=False,
+        help_text="Auto-populated from mutagen at save. Drives the engine's underlap-delay "
+                    "math for the intro-VT fit calculation.",
+    )
+    gain_db = models.FloatField(
+        default=0.0,
+        help_text="Per-VT gain trim, dB. Applied at fire time on top of the FX bus volume. "
+                    "Range roughly -12 to +6 -- for a specific VT that's noticeably quieter "
+                    "or louder than typical; adjust program_duck_db in VoiceTrackConfig if "
+                    "the music-under-VT balance is systemically off across all VTs.",
+    )
+
+    recorded_by = models.ForeignKey(
+        "auth.User", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="voicetracks_recorded",
+    )
+    recorded_at = models.DateTimeField(auto_now_add=True)
+    edited_at = models.DateTimeField(null=True, blank=True)
+    source = models.CharField(
+        max_length=10, choices=SOURCE_CHOICES, default="browser",
+    )
+
+    class Meta:
+        unique_together = [("track", "position")]
+        ordering = ["track", "position"]
+        verbose_name = "Voice Track"
+        verbose_name_plural = "Voice Tracks"
+
+    def __str__(self):
+        return f"{self.track.title} [{self.position}] by {self.recorded_by or 'unknown'}"
+
+    def save(self, *args, **kwargs):
+        # Same mutagen auto-populate as FXCart -- non-fatal if the file
+        # is missing or unreadable.
+        if self.filepath:
+            from pathlib import Path
+            if Path(self.filepath).is_file():
+                try:
+                    from mutagen import File as MutagenFile
+                    audio = MutagenFile(self.filepath)
+                    if audio is not None and audio.info is not None:
+                        self.duration_seconds = float(audio.info.length)
+                except Exception:
+                    self.duration_seconds = None
+        super().save(*args, **kwargs)
+
+    @property
+    def file_exists(self):
+        from pathlib import Path
+        return bool(self.filepath and Path(self.filepath).is_file())
+
+
+class VoiceTrackConfig(models.Model):
+    """Global config for the voice-track playback path. Singleton
+    (Config > Voice Tracks). Volume / ramp changes take effect on the
+    next engine tick via the reload_voicetrack_config command; ducking
+    depth is applied per-fire so a live change reflects immediately on
+    the next VT."""
+
+    program_duck_db = models.FloatField(
+        default=-6.0,
+        help_text="dB to duck the deck bus (music) while a VT is playing. "
+                    "Negative attenuates; 0 = no duck. Applied to a dedicated "
+                    "vt_duck_gain element in the pipeline, distinct from the "
+                    "mic/remote-DJ duck_gain so VT ducking and mic ducking "
+                    "can be tuned independently.",
+    )
+    duck_ramp_ms = models.PositiveIntegerField(
+        default=300,
+        help_text="Ramp duration for the duck attack (VT fires) and release "
+                    "(VT ends). 300ms is a comfortable radio-transition ramp.",
+    )
+    min_gap_ms = models.PositiveIntegerField(
+        default=200,
+        help_text="Silence between outro-VT ending and intro-VT starting, so "
+                    "the two VTs don't audibly bump into each other.",
+    )
+
+    class Meta:
+        verbose_name = "Voice Track Config"
+        verbose_name_plural = "Voice Track Config"
+
+    def __str__(self):
+        return f"VoiceTrackConfig (duck {self.program_duck_db:+.1f} dB, ramp {self.duck_ramp_ms}ms)"
+
+    def save(self, *args, **kwargs):
+        self.pk = 1
+        super().save(*args, **kwargs)
+
+    @classmethod
+    def load(cls):
+        obj, _ = cls.objects.get_or_create(pk=1)
+        return obj
+
+
 class TuneInConfig(models.Model):
     """Credentials + state for the TuneIn AIR now-playing API. Editable
     admin singleton (Config > TuneIn AIR); pushed by

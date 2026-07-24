@@ -40,6 +40,8 @@ from .models import (
     FXBusConfig,
     FXCart,
     StationInfo,
+    VoiceTrack,
+    VoiceTrackConfig,
     StationTimeConfig,
     TuneInConfig,
     Track,
@@ -56,7 +58,7 @@ from .models import (
 # Every model keeps living in `library` underneath — only the admin UI
 # grouping changes.
 _TRAFFIC_MODELS = {"playlist", "rotation", "scheduleblock", "playlistlog"}
-_CONFIG_MODELS = {"analysisconfig", "recencyconfig", "uitheme", "logfillconfig", "uploadconfig", "navmenuitem", "remotedjconfig", "stationtimeconfig", "stationinfo", "tuneinconfig", "fxbusconfig", "fxcart"}
+_CONFIG_MODELS = {"analysisconfig", "recencyconfig", "uitheme", "logfillconfig", "uploadconfig", "navmenuitem", "remotedjconfig", "stationtimeconfig", "stationinfo", "tuneinconfig", "fxbusconfig", "fxcart", "voicetrackconfig"}
 _LOG_MODELS = {"emaillog", "playevent", "royaltyreport"}
 
 
@@ -1226,4 +1228,65 @@ class FXBusConfigAdmin(admin.ModelAdmin):
         obj = FXBusConfig.load()
         return HttpResponseRedirect(
             reverse("admin:library_fxbusconfig_change", args=[obj.pk])
+        )
+
+
+@admin.register(VoiceTrack)
+class VoiceTrackAdmin(admin.ModelAdmin):
+    """VT rows -- read-mostly. Primary create/edit path is the browser
+    recording + editor UI on /track/<pk>/ (and /voicetracks/ index).
+    Admin visibility here is for one-off inspection and delete;
+    admin-side add is allowed but the recorder UI is where the flow
+    naturally lives."""
+
+    list_display = ["_badge", "track", "position", "duration_seconds",
+                    "recorded_by", "recorded_at", "source"]
+    list_filter = ["position", "source"]
+    search_fields = ["track__title", "track__artist__name", "filepath"]
+    raw_id_fields = ["track"]
+    readonly_fields = ["duration_seconds", "recorded_at", "edited_at"]
+    ordering = ["-recorded_at"]
+
+    @admin.display(description="")
+    def _badge(self, obj):
+        if not obj.filepath:
+            return format_html('<span title="No file path" style="color:#e67;">&#9888;</span>')
+        if not obj.file_exists:
+            return format_html(
+                '<span title="File not found at {}" style="color:#e67;">&#9888;</span>',
+                obj.filepath,
+            )
+        return format_html('<span title="File OK" style="color:#6c6;">&#9679;</span>')
+
+
+@admin.register(VoiceTrackConfig)
+class VoiceTrackConfigAdmin(admin.ModelAdmin):
+    """Singleton (Config > Voice Track Config). Applies to every VT
+    airing; per-VT overrides can be added later if a specific song
+    needs a different duck depth."""
+
+    fieldsets = [
+        (None, {
+            "fields": ["program_duck_db", "duck_ramp_ms", "min_gap_ms"],
+            "description": (
+                "Duck depth is the dB attenuation applied to the deck-mixer "
+                "(music) bus while a VT is playing. -6 dB is a comfortable "
+                "default for hearing the VT over most master-limited mixes; "
+                "increase (more negative) for a starker duck, 0 for no duck."
+            ),
+        }),
+    ]
+
+    def has_add_permission(self, request):
+        return not VoiceTrackConfig.objects.exists()
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+    def changelist_view(self, request, extra_context=None):
+        from django.http import HttpResponseRedirect
+        from django.urls import reverse
+        obj = VoiceTrackConfig.load()
+        return HttpResponseRedirect(
+            reverse("admin:library_voicetrackconfig_change", args=[obj.pk])
         )
