@@ -945,10 +945,23 @@ class PlaybackEngine:
         # the sequence completes. See _vt_ramp_duck / _vt_apply_duck.
         self.vt_duck_gain = Gst.ElementFactory.make("volume", "vt_duck_gain")
         self.vt_duck_gain.set_property("volume", 1.0)
+        # program_fx_mixer sums the (post-duck) deck bus with the FX bus
+        # BEFORE the remote-DJ mix-minus tap, so FX carts and voice
+        # tracks -- both fired through the FX submixer -- are audible
+        # in the remote DJ's monitor return. Before this element
+        # existed, FX joined master_mixer directly (downstream of the
+        # remote_dj_tee), which meant the studio monitor heard the FX
+        # but the remote DJ didn't. Reported live 2026-07-24 by the
+        # user: "Test Drop plays through studio but not through the
+        # connected remote-DJ session." Same routing fixes VT audio
+        # over the mix-minus (which was invisible for the same
+        # structural reason).
+        self.program_fx_mixer = Gst.ElementFactory.make("audiomixer", "program_fx_mixer")
         self.master_mixer = Gst.ElementFactory.make("audiomixer", "master_mixer")
 
         elements = [
-            self.mixer, self.vt_duck_gain, self.duck_gain, self.master_mixer, convert, resample, capsfilter,
+            self.mixer, self.vt_duck_gain, self.duck_gain,
+            self.program_fx_mixer, self.master_mixer, convert, resample, capsfilter,
             self.program_gain, self.output_level,
             self.agc_dynamic, self.agc_makeup, self.agc_limiter,
             self.alsasink,
@@ -1084,14 +1097,24 @@ class PlaybackEngine:
 
         self.mixer.link(self.vt_duck_gain)
         self.vt_duck_gain.link(self.duck_gain)
-        duck_pad = self.master_mixer.request_pad_simple("sink_%u")
+
+        # duck_gain feeds one pad on program_fx_mixer; fx_bus_gain will
+        # join the OTHER pad when _fx_setup runs a few lines below.
+        # The program_fx_mixer's output is what gets tee'd to the
+        # remote-DJ monitor return (mix-minus) AND forwarded to
+        # master_mixer. Naming the sink var deck_bus_pad so a later
+        # reader doesn't confuse it with a duck-related pad.
+        deck_bus_pad = self.program_fx_mixer.request_pad_simple("sink_%u")
+        self.duck_gain.get_static_pad("src").link(deck_bus_pad)
+
+        program_fx_pad = self.master_mixer.request_pad_simple("sink_%u")
         if self.remote_dj_tee:
-            self.duck_gain.get_static_pad("src").link(remote_dj_fixate_caps.get_static_pad("sink"))
+            self.program_fx_mixer.get_static_pad("src").link(remote_dj_fixate_caps.get_static_pad("sink"))
             remote_dj_fixate_caps.link(self.remote_dj_tee)
             onair_pad = self.remote_dj_tee.request_pad_simple("src_%u")
-            onair_pad.link(duck_pad)
+            onair_pad.link(program_fx_pad)
         else:
-            self.duck_gain.get_static_pad("src").link(duck_pad)
+            self.program_fx_mixer.get_static_pad("src").link(program_fx_pad)
         if mic_elements:
             if self.remote_dj_tee is not None:
                 # Tee local mic (post-PTT) so a remote-DJ session can also
@@ -2016,7 +2039,13 @@ class PlaybackEngine:
         self.main_pipeline.add(self.fx_bus_gain)
 
         self.fx_submix.link(self.fx_bus_gain)
-        fx_pad = self.master_mixer.request_pad_simple("sink_%u")
+        # FX bus joins the program_fx_mixer, NOT master_mixer directly.
+        # See _build_main_pipeline's program_fx_mixer comment for the
+        # reason -- FX has to sit UPSTREAM of the remote-DJ tee to be
+        # audible in the remote DJ's monitor return. program_fx_mixer's
+        # output feeds either the remote_dj_tee (when configured) or
+        # master_mixer directly.
+        fx_pad = self.program_fx_mixer.request_pad_simple("sink_%u")
         self.fx_bus_gain.get_static_pad("src").link(fx_pad)
 
         # Permanent silence source into fx_submix. Without this, the
