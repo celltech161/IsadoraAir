@@ -275,7 +275,7 @@ class Command(BaseCommand):
             self.stdout.write(f"  [{status}] {filepath}")
             return True, status
 
-        artist_obj, _ = Artist.objects.get_or_create(name=artist_name)
+        artist_obj, _ = Artist.get_or_create_ci(artist_name)
 
         album_obj = None
         if album_title:

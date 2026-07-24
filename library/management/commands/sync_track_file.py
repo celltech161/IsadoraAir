@@ -67,7 +67,7 @@ class Command(BaseCommand):
         genre_name = clean(tags.get("genre")) or ""
         fmt = filepath.suffix.lstrip(".").lower()
 
-        artist_obj, _ = Artist.objects.get_or_create(name=artist_name)
+        artist_obj, _ = Artist.get_or_create_ci(artist_name)
 
         album_obj = None
         if album_title:

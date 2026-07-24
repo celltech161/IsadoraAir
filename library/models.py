@@ -24,6 +24,31 @@ class Artist(models.Model):
     def __str__(self):
         return self.name
 
+    @classmethod
+    def get_or_create_ci(cls, name):
+        """Case-insensitive get_or_create. Returns (artist, created).
+        Same signature as Artist.objects.get_or_create(name=name), but
+        treats 'CoshiKi' and 'Coshiki' as the same artist -- the
+        second-seen casing maps back to the first-seen row instead of
+        creating a duplicate row with the alternate case.
+
+        Why we care: the recency check in log_builder excludes recently-
+        played artists by artist_id (FK). Two case-variant Artist rows
+        have DIFFERENT ids, so neither excludes the other, and both
+        end up in the same hour's rotation. Reported live 2026-07-24
+        after CoshiKi + Coshiki both landed in the same hour.
+
+        Use this everywhere Artist rows are created from
+        untrusted-case input (tag reads, CD rip metadata, API PATCH
+        bodies, MusicBrainz responses, etc). The first-seen casing
+        is preserved; if the operator later wants a specific
+        capitalization they can rename in the admin (which updates
+        the single row and every reference automatically)."""
+        existing = cls.objects.filter(name__iexact=name).first()
+        if existing is not None:
+            return existing, False
+        return cls.objects.get_or_create(name=name)
+
 
 class Album(models.Model):
     title = models.CharField(max_length=255)

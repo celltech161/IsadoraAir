@@ -1188,7 +1188,7 @@ def api_track_detail(request, pk):
         if field in DIRECT_FIELDS:
             setattr(track, field, value)
         elif field == "artist":
-            artist_obj, _ = Artist.objects.get_or_create(name=value)
+            artist_obj, _ = Artist.get_or_create_ci(value)
             track.artist = artist_obj
         elif field == "album":
             if value:
@@ -1479,7 +1479,7 @@ def api_track_write_metadata(request, pk):
     if body.get("title"):
         track.title = body["title"]
     if body.get("artist"):
-        artist_obj, _ = Artist.objects.get_or_create(name=body["artist"])
+        artist_obj, _ = Artist.get_or_create_ci(body["artist"])
         track.artist = artist_obj
     if "album" in body:
         if body["album"]:
@@ -2542,7 +2542,7 @@ def api_library_upload(request):
         album_artist_name = clean(tags.get("album_artist")) or ""
         genre_name = clean(tags.get("genre")) or ""
 
-        artist_obj, _ = Artist.objects.get_or_create(name=artist_name)
+        artist_obj, _ = Artist.get_or_create_ci(artist_name)
 
         album_obj = None
         if album_title:

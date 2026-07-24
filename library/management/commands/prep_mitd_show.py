@@ -275,7 +275,7 @@ class Command(BaseCommand):
     # ----- DB --------------------------------------------------------------
 
     def _update_db(self, meta):
-        artist, _ = Artist.objects.get_or_create(name="Midnight in the Desert")
+        artist, _ = Artist.get_or_create_ci("Midnight in the Desert")
         album, _ = Album.objects.get_or_create(
             title=f"MITD {meta['date']}",
             album_artist="Midnight in the Desert",

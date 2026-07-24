@@ -280,7 +280,7 @@ class Command(BaseCommand):
             op = op_tracks.get(position, {})
             title = op.get("title") or src.stem.split(". ", 1)[-1]
             artist_name = op.get("artist") or album_artist
-            artist_obj, _ = Artist.objects.get_or_create(name=artist_name)
+            artist_obj, _ = Artist.get_or_create_ci(artist_name)
 
             # Write our tags (may overwrite whipper's own MB-derived
             # tags -- intentional: operator edits are authoritative).

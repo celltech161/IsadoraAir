@@ -186,9 +186,7 @@ class Command(BaseCommand):
                     try:
                         write_tags(str(path), artist_name, new_title)
                         with transaction.atomic():
-                            artist_obj, _ = Artist.objects.get_or_create(
-                                name=artist_name,
-                            )
+                            artist_obj, _ = Artist.get_or_create_ci(artist_name)
                             Track.objects.filter(id=track.id).update(
                                 artist=artist_obj, title=new_title,
                             )
@@ -218,9 +216,7 @@ class Command(BaseCommand):
                         flac_path = transcode_to_flac(str(path))
                         write_tags(str(flac_path), artist_name, new_title)
                         with transaction.atomic():
-                            artist_obj, _ = Artist.objects.get_or_create(
-                                name=artist_name,
-                            )
+                            artist_obj, _ = Artist.get_or_create_ci(artist_name)
                             new_track = Track.objects.create(
                                 filepath=str(flac_path),
                                 filename=flac_path.name,
