@@ -299,9 +299,9 @@ class TrackAdminForm(forms.ModelForm):
 @admin.register(Track)
 class TrackAdmin(admin.ModelAdmin):
     form = TrackAdminForm
-    list_display = ["title", "artist", "album", "category", "duration_seconds", "ready2air"]
+    list_display = ["title", "artist", "album", "category", "duration_seconds", "isrc", "ready2air"]
     list_filter = ["ready2air", "category", "additional_categories", "energy", "end_type", "format"]
-    search_fields = ["title", "artist__name", "album__title"]
+    search_fields = ["title", "artist__name", "album__title", "isrc"]
     list_editable = ["ready2air", "category"]
     list_per_page = 50
     list_select_related = ["artist", "album", "category"]
