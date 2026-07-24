@@ -71,6 +71,14 @@ IsadoraAir manages the full music library, schedule programming, playlist genera
 - "Coming Up" queue table for the full remaining hour — drag-to-reorder (mouse and touch, same Pointer Events code path), insert a track by search, per-row "force next" button, color-coded by Category Kind
 - Manual "play a playlist now" override, a "Restart Engine" recovery button, Studio Mic PTT, and a Remote Mic gate button that lights up when a remote DJ is connected
 
+**FX Carts / Hotkeys**
+- Grid of one-shot audio buttons (drops, stingers, jingles, ID sweepers, sound effects) always visible on the main dashboard + remote-DJ console; first 8 in a compact row, "More…" expands the full grid. Mobile-portrait: collapsed behind a single "FX Carts (N) ▼" toggle with ~50% button size so the panel doesn't eat the deck view
+- Each cart is a `FXCart` admin row (Config → FX Carts) with configurable name, audio file, per-cart gain trim, retrigger mode (Restart / Ignore / Stop for click-to-play/stop long beds), keyboard shortcut (single key; unique across all carts; focus-aware so typing into search doesn't fire them), and RGBA idle + playing colors via the same color+opacity picker UI Theme uses
+- **Button IS the progress bar** — as the audio plays, the button's playing color sweeps left-to-right over the file's actual duration, then snaps back to idle
+- File upload: drag-drop an audio file straight onto the cart admin change form; server places it under `/srv/isadoraair/carts/` and fills in the filepath field. Hard-coded paths still work — the two entry methods coexist. File-existence badge (green ● / red ⚠) in the admin list view catches "file was deleted but the row is still here" mistakes at a glance
+- Audio path: persistent FX sub-mixer + single permanent pad on the master mixer — no pad churn on the main audio path, so a fire (or a spam of them) can never destabilize the on-air chain. A permanent silent source keeps the mixer / alsasink continuously hot so the first fire after idle doesn't lose its leading edge to a cold-start
+- `FXBusConfig` singleton (Config → FX Bus): global bus volume (live-adjustable) + polyphony cap (max simultaneous fires; over-cap fires are dropped)
+
 **Aircheck Recording** (`aircheck/` app)
 - Captures what actually went out over the air, on demand, from any dashboard — start/stop button, session list with duration + file size + status
 - Backed by a persistent liquidsoap `output.file` block driven over telnet (`aircheck.reopen`), so no per-session ffmpeg subprocess is spawned and no ALSA device is contended with the encoders — the same in-process source that feeds Icecast/Shoutcast is what gets written to disk
@@ -278,6 +286,7 @@ ogremote-ingest companion projects.
 | 9. Remote DJ over WebRTC | Complete — browser-based remote console, mix-minus monitor return, gated remote mic, full queue authority for the connected DJ |
 | 10. Email + admin infrastructure | Complete — EmailLog transport-layer capture, invite/reset flows, admin-editable nav menu, django-axes lockout |
 | 11. Royalty reporting | Complete — PlayEvent evidence ledger, SoundExchange NCE / summary / raw-CSV generators, /reports/ frontend, ISRC auto-populate from tags + MusicBrainz backfill, ATH computed from Icecast/Shoutcast listener samples with manual override, 3-year retention prune |
+| 12. FX carts / hotkeys | Complete — one-shot buttons with drag-drop file upload, RGBA colors, per-cart retrigger modes (restart/ignore/stop), keyboard shortcuts, mobile-collapsible panel, persistent FX sub-mixer with one permanent pad on the master mixer and always-on silence to keep the audio path hot |
 
 Actively running end-to-end on a live station: schedule → log builder → playback engine → StereoTool → transmitter, plus live streaming, RDS, monitoring, remote DJ, and content ingestion.
 
@@ -288,7 +297,6 @@ Things a station operator might expect that IsadoraAir doesn't ship today. Some 
 - **EAS (Emergency Alert System)** — permanently external. Compliant EAS is always a hardware ENDEC (Sage/DASDEC/Trilithic) that inserts into the audio chain physically upstream of automation, so the alert reaches air even if the automation box is down. Vendor-side software EAS exists in development form but has no FCC approval as of this writing; when a software path becomes a compliant option, IsadoraAir intends to be an early adopter (SAGE-- If you're reading this hit us up!).
 - **Voice tracking** — pre-recorded DJ segments dropped between specific tracks so an automated hour sounds hosted. Planned, not yet implemented.
 - **Commercial-style traffic** — underwriting spot scheduling, affidavit reports, PSA rotation tracking. The current "Traffic" admin section is programming-side (Rotations, Playlists, ScheduleBlocks), not spot-side. Planned.
-- **Cart wall / instant hot keys** — one-click drops/stingers/jingles for live-assist. Planned.
 
 ## Security
 
