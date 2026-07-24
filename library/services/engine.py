@@ -2052,6 +2052,14 @@ class PlaybackEngine:
         self._fx_next_id = 1
         self._fx_lock = threading.Lock()
 
+        # VT state machine. See _vt_maybe_enter for the shape of the
+        # dict when a VT sequence is active. 'idle' means we're in the
+        # normal crossfade regime; everything else means the sequence
+        # is mid-flight and the normal next-track trigger should stay
+        # suppressed.
+        self._vt = {"phase": "idle"}
+        self._vt_lock = threading.Lock()
+
     def _fx_apply_volume(self):
         """Refreshed by the reload_fx_config command -- reads FXBusConfig
         and updates the fx_bus_gain volume live. Volume changes take
@@ -2220,6 +2228,15 @@ class PlaybackEngine:
                     state["resample"], state["gain"])
         if src not in our_srcs:
             return
+
+        # If this was a VT fire, advance the VT state machine BEFORE
+        # tearing down (the state read needs the fire_id to still be
+        # in _fx_fires so _vt_handle_outgoing_ended can see the
+        # in-flight fire correctly).
+        vt_kind = state.get("vt_kind")
+        if vt_kind:
+            self._vt_on_fire_eos(vt_kind, fire_id)
+
         self._fx_stop(fire_id)
 
     def _fx_stop(self, fire_id):
@@ -2244,6 +2261,263 @@ class PlaybackEngine:
                 self.main_pipeline.remove(el)
         except Exception as exc:
             print(f"  FX teardown fire {fire_id} failed: {exc}")
+
+    # ------------------------------------------------------------------
+    # VT state machine (voice-track sequenced transition)
+    # ------------------------------------------------------------------
+    def _vt_ramp_duck_to_db(self, target_db, duration_ms):
+        """Linear ramp vt_duck_gain to the target dB value over
+        duration_ms. Simple stepper on GLib.timeout_add -- 20ms per
+        step, so a 300ms ramp uses 15 steps. Cheap enough not to
+        matter versus the audio interrupt rate."""
+        if getattr(self, "vt_duck_gain", None) is None:
+            return
+        start_vol = self.vt_duck_gain.get_property("volume")
+        if target_db is None or target_db == 0.0:
+            target_vol = 1.0
+        else:
+            target_vol = 10 ** (target_db / 20.0)
+        steps = max(1, int(duration_ms / 20))
+        step_dur = max(1, int(duration_ms / steps))
+        step_delta = (target_vol - start_vol) / steps
+        step_counter = [0]
+
+        def _do_step():
+            step_counter[0] += 1
+            new_vol = max(0.0, start_vol + step_delta * step_counter[0])
+            self.vt_duck_gain.set_property("volume", new_vol)
+            return step_counter[0] < steps
+        GLib.timeout_add(step_dur, _do_step)
+
+    def _vt_fire_file(self, filepath, gain_db, kind):
+        """Fire an audio file through the FX submix bus. Same pipeline
+        pattern as _fx_fire but takes a filepath directly (VTs don't
+        have cart_ids) and tags the fire state with vt_kind so the
+        EOS dispatcher can advance the VT state machine. Returns
+        fire_id (or None on failure)."""
+        if not Path(filepath).is_file():
+            print(f"  VT fire: file missing {filepath!r}")
+            return None
+        with self._fx_lock:
+            fire_id = self._fx_next_id
+            self._fx_next_id += 1
+
+        filesrc = Gst.ElementFactory.make("filesrc", f"vt_filesrc_{fire_id}")
+        decodebin = Gst.ElementFactory.make("decodebin", f"vt_decodebin_{fire_id}")
+        convert = Gst.ElementFactory.make("audioconvert", f"vt_convert_{fire_id}")
+        resample = Gst.ElementFactory.make("audioresample", f"vt_resample_{fire_id}")
+        vt_caps = Gst.ElementFactory.make("capsfilter", f"vt_caps_{fire_id}")
+        vt_caps.set_property("caps", Gst.Caps.from_string(
+            f"audio/x-raw,rate={self.pipeline_sample_rate},channels=2"
+        ))
+        gain = Gst.ElementFactory.make("volume", f"vt_gain_{fire_id}")
+        filesrc.set_property("location", filepath)
+        gain.set_property("volume", 10 ** ((gain_db or 0.0) / 20.0))
+
+        for el in (filesrc, decodebin, convert, resample, vt_caps, gain):
+            self.main_pipeline.add(el)
+        filesrc.link(decodebin)
+        convert.link(resample)
+        resample.link(vt_caps)
+        vt_caps.link(gain)
+        fx_pad = self.fx_submix.request_pad_simple("sink_%u")
+        gain.get_static_pad("src").link(fx_pad)
+        clock = self.main_pipeline.get_clock()
+        if clock:
+            running_time = clock.get_time() - self.main_pipeline.get_base_time()
+            gain.get_static_pad("src").set_offset(running_time)
+
+        state = {
+            "cart_id": None,
+            "vt_kind": kind,   # 'outro' | 'intro' -- key for dispatch
+            "filesrc": filesrc, "decodebin": decodebin,
+            "convert": convert, "resample": resample,
+            "fx_caps": vt_caps, "gain": gain, "fx_pad": fx_pad,
+            "started_at": time.time(),
+        }
+        with self._fx_lock:
+            self._fx_fires[fire_id] = state
+
+        def _on_pad_added(el, new_pad, fire_id=fire_id):
+            caps = new_pad.get_current_caps() or new_pad.query_caps(None)
+            if caps and caps.get_size():
+                if not caps.get_structure(0).get_name().startswith("audio"):
+                    return
+            convert_sink = convert.get_static_pad("sink")
+            if convert_sink.is_linked():
+                return
+            new_pad.link(convert_sink)
+        decodebin.connect("pad-added", _on_pad_added)
+
+        bus = self.main_pipeline.get_bus()
+        bus.add_signal_watch()
+        bus.connect("message::eos", self._fx_on_eos, fire_id)
+        for el in (filesrc, decodebin, convert, resample, vt_caps, gain):
+            el.sync_state_with_parent()
+
+        print(f"  VT fire {fire_id} ({kind}): {Path(filepath).name}")
+        return fire_id
+
+    def _vt_maybe_enter(self, outgoing_deck):
+        """Called from _poll_position when outgoing hits outro_starts.
+        Looks up VTs for the outgoing and incoming tracks; if either
+        exists, enters VT mode, suppresses the normal next-track
+        trigger, fires the outro-VT if one exists, and ramps the duck
+        attack. If NO VTs exist, this is a no-op and the caller
+        continues into the normal crossfade path."""
+        try:
+            close_old_connections()
+            outgoing_vt = VoiceTrack.objects.filter(
+                track=outgoing_deck.track, position="outro",
+            ).first()
+            next_item = self._peek_playable_at_cursor() if hasattr(self, "_peek_playable_at_cursor") else None
+            incoming_vt = None
+            incoming_track = None
+            if next_item is not None:
+                incoming_track = next_item.track
+                incoming_vt = VoiceTrack.objects.filter(
+                    track=incoming_track, position="intro",
+                ).first()
+        except Exception as exc:
+            print(f"  VT lookup failed: {exc}")
+            return False
+
+        if outgoing_vt is None and incoming_vt is None:
+            return False   # no VTs; fall through to normal crossfade
+
+        cfg = VoiceTrackConfig.load()
+        with self._vt_lock:
+            self._vt = {
+                "phase": "outro_playing",
+                "outgoing_track_id": outgoing_deck.track.id,
+                "outgoing_vt_filepath": outgoing_vt.filepath if outgoing_vt else None,
+                "outgoing_vt_gain": outgoing_vt.gain_db if outgoing_vt else 0.0,
+                "outgoing_vt_fire_id": None,
+                "outgoing_ended": False,
+                "incoming_track_id": incoming_track.id if incoming_track else None,
+                "incoming_track": incoming_track,
+                "incoming_vt_filepath": incoming_vt.filepath if incoming_vt else None,
+                "incoming_vt_gain": incoming_vt.gain_db if incoming_vt else 0.0,
+                "incoming_vt_duration": incoming_vt.duration_seconds if incoming_vt else 0.0,
+                "incoming_vt_fire_id": None,
+                "incoming_intro_until": (incoming_track.intro_until_seconds or 0.0) if incoming_track else 0.0,
+                "incoming_started": False,
+            }
+        # Suppress normal next-track trigger for the remainder of this
+        # transition; _vt_start_incoming_now flips it back and calls
+        # _start_next_track explicitly at the right moment.
+        self._next_triggered = True
+
+        print(f"  VT enter: outgoing track_id={outgoing_deck.track.id} "
+                f"outro_vt={'yes' if outgoing_vt else 'no'} "
+                f"intro_vt={'yes' if incoming_vt else 'no'}")
+
+        self._vt_ramp_duck_to_db(cfg.program_duck_db, cfg.duck_ramp_ms)
+
+        if outgoing_vt is not None:
+            fire_id = self._vt_fire_file(
+                outgoing_vt.filepath, outgoing_vt.gain_db, "outro",
+            )
+            with self._vt_lock:
+                self._vt["outgoing_vt_fire_id"] = fire_id
+        # else: state stays outro_playing; outgoing deck end will
+        # trigger the transition to inter_gap without firing anything.
+
+        return True
+
+    def _vt_on_fire_eos(self, kind, fire_id):
+        """Called from _fx_on_eos when a VT fire ends. Advances the
+        state machine according to which VT (outro or intro) just
+        finished."""
+        with self._vt_lock:
+            phase = self._vt.get("phase", "idle")
+
+        if kind == "outro":
+            with self._vt_lock:
+                self._vt["outgoing_vt_fire_id"] = None
+            if phase == "outro_tail":
+                # Outgoing already ended and we were waiting on outro-VT
+                self._vt_advance_to_intro_gap()
+            # else: still 'outro_playing' -- outgoing deck end will drive
+            # the next transition. If outgoing ends and outro-VT already
+            # finished, _handle_deck_finished's VT branch will advance
+            # immediately.
+        elif kind == "intro":
+            with self._vt_lock:
+                self._vt["incoming_vt_fire_id"] = None
+            self._vt_complete()
+
+    def _vt_handle_outgoing_ended(self):
+        """Called from _handle_deck_finished when the outgoing deck
+        ends while we're in VT mode. Advances to outro_tail if the
+        outro-VT is still going, else straight to inter_gap."""
+        with self._vt_lock:
+            self._vt["outgoing_ended"] = True
+            outro_fire_id = self._vt.get("outgoing_vt_fire_id")
+        outro_still_going = False
+        if outro_fire_id is not None:
+            with self._fx_lock:
+                outro_still_going = outro_fire_id in self._fx_fires
+        if outro_still_going:
+            with self._vt_lock:
+                self._vt["phase"] = "outro_tail"
+        else:
+            self._vt_advance_to_intro_gap()
+
+    def _vt_advance_to_intro_gap(self):
+        with self._vt_lock:
+            self._vt["phase"] = "inter_gap"
+        cfg = VoiceTrackConfig.load()
+        GLib.timeout_add(max(1, cfg.min_gap_ms), self._vt_start_intro_phase)
+
+    def _vt_start_intro_phase(self):
+        with self._vt_lock:
+            filepath = self._vt.get("incoming_vt_filepath")
+            gain_db = self._vt.get("incoming_vt_gain") or 0.0
+            vt_duration = self._vt.get("incoming_vt_duration") or 0.0
+            intro_until = self._vt.get("incoming_intro_until") or 0.0
+            self._vt["phase"] = "intro_playing"
+
+        if filepath and Path(filepath).is_file():
+            fire_id = self._vt_fire_file(filepath, gain_db, "intro")
+            with self._vt_lock:
+                self._vt["incoming_vt_fire_id"] = fire_id
+        else:
+            fire_id = None
+
+        # Timing: if the intro-VT is longer than the incoming track's
+        # intro window, delay the deck start so intro-VT ends exactly
+        # at intro_until. If it's shorter (or absent), start the deck
+        # now -- either intro-VT plays over the incoming intro without
+        # overshooting, or there's no VT at all.
+        if fire_id is not None and vt_duration > intro_until:
+            delay_ms = int((vt_duration - intro_until) * 1000)
+        else:
+            delay_ms = 0
+        GLib.timeout_add(max(1, delay_ms), self._vt_start_incoming_now)
+        return False   # single-shot timeout
+
+    def _vt_start_incoming_now(self):
+        # Reset _next_triggered so _start_next_track can fire naturally.
+        self._next_triggered = False
+        slot = self._free_slot()
+        if slot is not None:
+            self._start_next_track(slot=slot)
+        with self._vt_lock:
+            self._vt["incoming_started"] = True
+            no_intro = self._vt.get("incoming_vt_fire_id") is None
+        if no_intro:
+            # No intro-VT was fired -- the transition is functionally
+            # complete once incoming starts. Un-duck now.
+            self._vt_complete()
+        return False   # single-shot
+
+    def _vt_complete(self):
+        cfg = VoiceTrackConfig.load()
+        self._vt_ramp_duck_to_db(0.0, cfg.duck_ramp_ms)   # back to unity
+        with self._vt_lock:
+            self._vt = {"phase": "idle"}
+        print("  VT complete (duck released)")
 
     def _get_deck_position(self, deck):
         if deck.paused:
@@ -3708,6 +3982,20 @@ class PlaybackEngine:
                 if pos >= trigger_point - CACHE_WARM_LEAD_SECONDS:
                     self._warm_track_cache(next_item)
 
+                # VT check runs BEFORE the normal trigger since
+                # outro_starts typically comes earlier than
+                # (next_start - next_cue_in). _vt_maybe_enter sets
+                # _next_triggered=True on entry, which suppresses the
+                # normal trigger below for the remainder of the
+                # transition.
+                outro_start = deck.track.outro_starts_seconds
+                if (outro_start is not None
+                        and pos >= outro_start
+                        and self._vt.get("phase") == "idle"
+                        and not self._next_triggered
+                        and not self.manual_mode):
+                    self._vt_maybe_enter(deck)
+
                 if not self._next_triggered and pos >= trigger_point:
                     if self.manual_mode:
                         # DJ is holding for a talk-over -- remember the
@@ -3753,6 +4041,20 @@ class PlaybackEngine:
     @_glib_safe(default_return=False)
     def _handle_deck_finished(self, deck):
         slot = deck.slot
+
+        # VT mode: if the deck ending is the outgoing one in a VT
+        # sequence, run the VT branch instead of the normal path. VT
+        # takes ownership of "what starts next" via the state machine
+        # (see _vt_start_incoming_now), so don't call _start_next_track
+        # here.
+        vt_phase = self._vt.get("phase")
+        vt_outgoing_track_id = self._vt.get("outgoing_track_id")
+        if (vt_phase in ("outro_playing", "outro_tail")
+                and deck.track.id == vt_outgoing_track_id):
+            self._remove_deck(deck)
+            self._vt_handle_outgoing_ended()
+            return
+
         self._remove_deck(deck)
         other_deck = self.decks[self._other_slot(slot)]
         if other_deck is not None:
