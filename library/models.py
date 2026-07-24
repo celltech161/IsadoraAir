@@ -1297,6 +1297,166 @@ class PlayEvent(models.Model):
         )
 
 
+class FXCart(models.Model):
+    """One-shot audio cart -- a labeled button on the dashboard + remote-DJ
+    console that fires a short audio file (drops, stingers, jingles,
+    sound effects) into the on-air mix. Plays through a persistent FX
+    sub-mixer parallel to the main deck output, so cart audio never
+    interrupts music playback.
+
+    Retrigger modes:
+      restart -- clicking again while a fire is in progress cancels
+                 the current fire and starts fresh from zero (radio
+                 convention; muscle memory expects this)
+      ignore  -- second click during playback is silently dropped
+      stop    -- second click halts the currently-playing fire and
+                 leaves the button idle. Useful for longer beds/spots
+                 where the operator wants to end them early.
+
+    Colors are stored as rgba() strings via RGBAColorWidget (same
+    admin widget UITheme uses) so the operator can pick from any color
+    they want plus tune opacity for softer looks. idle_color is the
+    button's resting fill; playing_color is what the elapsed portion
+    of the button fills with as the fire progresses (button IS the
+    progress bar). Both fall back to sensible defaults if left blank.
+
+    Keyboard shortcut is a single character (1-9 or A-Z) captured on
+    the dashboard when the browser tab has focus; validated unique
+    across all carts so two buttons can't share a key. Blank = no
+    shortcut for this cart, click-only."""
+
+    RETRIGGER_CHOICES = [
+        ("restart", "Restart (cancel and re-fire)"),
+        ("ignore", "Ignore (drop second click)"),
+        ("stop",   "Stop (halt current fire)"),
+    ]
+
+    name = models.CharField(
+        max_length=40,
+        help_text="Button label shown on the dashboard + remote-DJ. Keep it short (~15 chars renders cleanly).",
+    )
+    filepath = models.CharField(
+        max_length=512,
+        help_text="Absolute path to the audio file (e.g. /srv/isadoraair/carts/laugh.wav). Any format the "
+                    "engine can decode (mp3/flac/wav/m4a/ogg/aiff).",
+    )
+    gain_db = models.FloatField(
+        default=0.0,
+        help_text="Per-cart trim, dB. Applied on top of the global FX Bus volume. "
+                    "Range roughly -12 to +6 -- go bigger only if you know why.",
+    )
+    idle_color = models.CharField(
+        max_length=50, default="rgba(55, 65, 81, 1.00)",
+        help_text="Button color when idle (RGBA). Any CSS color works.",
+    )
+    playing_color = models.CharField(
+        max_length=50, default="rgba(59, 130, 246, 1.00)",
+        help_text="Fill color that sweeps left->right across the button as the cart plays.",
+    )
+    retrigger_mode = models.CharField(
+        max_length=10, choices=RETRIGGER_CHOICES, default="restart",
+    )
+    keyboard_shortcut = models.CharField(
+        max_length=1, blank=True, default="",
+        help_text="Optional single character (1-9 or A-Z) that fires this cart when the browser tab has focus. "
+                    "Blank = click-only. Unique across all carts.",
+    )
+    sort_order = models.PositiveIntegerField(default=0)
+    enabled = models.BooleanField(default=True)
+    # Auto-populated from mutagen at save time when filepath points at a
+    # readable audio file. Drives the client-side progress-bar animation
+    # duration on the dashboard/remote-DJ cart buttons -- JS transitions
+    # the fill from left to right over exactly this many seconds. Null =
+    # unknown (missing/unreadable file), UI falls back to a fixed 2s
+    # animation.
+    duration_seconds = models.FloatField(null=True, blank=True, editable=False)
+
+    class Meta:
+        ordering = ["sort_order", "name"]
+        verbose_name = "FX Cart"
+        verbose_name_plural = "FX Carts"
+
+    def __str__(self):
+        return self.name
+
+    def save(self, *args, **kwargs):
+        if self.filepath:
+            from pathlib import Path
+            if Path(self.filepath).is_file():
+                try:
+                    from mutagen import File as MutagenFile
+                    audio = MutagenFile(self.filepath)
+                    if audio is not None and audio.info is not None:
+                        self.duration_seconds = float(audio.info.length)
+                except Exception:
+                    self.duration_seconds = None
+        super().save(*args, **kwargs)
+
+    def clean(self):
+        # Keyboard shortcut uniqueness -- guard at model level so any
+        # save path (admin, shell, management command) enforces it.
+        if self.keyboard_shortcut:
+            key = self.keyboard_shortcut.upper()
+            if not (key.isdigit() or key.isalpha()) or len(key) != 1:
+                raise ValidationError({"keyboard_shortcut": "Must be a single digit (0-9) or letter (A-Z)."})
+            clash = FXCart.objects.filter(
+                keyboard_shortcut__iexact=key,
+            ).exclude(pk=self.pk)
+            if clash.exists():
+                raise ValidationError({
+                    "keyboard_shortcut": f"Already in use by '{clash.first().name}'."
+                })
+            self.keyboard_shortcut = key
+
+    @property
+    def file_exists(self):
+        """Best-effort check for admin display + UI badge -- cheap enough
+        to call on every list render (a stat() call per cart, and cart
+        counts are small)."""
+        from pathlib import Path
+        return bool(self.filepath and Path(self.filepath).is_file())
+
+
+class FXBusConfig(models.Model):
+    """Global config for the FX sub-mixer. Singleton -- there's exactly
+    one FX bus on the engine. Volume changes take effect on the next
+    engine tick without a restart (engine polls this via the same
+    command-file mechanism used elsewhere).
+
+    volume_db is a straight linear gain on the FX sub-mixer's output
+    into the main mixer. 0.0 = unity (typical). Negative for softer,
+    positive for hotter. Deliberate limit: [-24, +6] since going
+    beyond +6 into the shared master mixer starts to compete with
+    program audio."""
+
+    volume_db = models.FloatField(
+        default=0.0,
+        help_text="FX bus output volume in dB. Applied to the sub-mixer output before it joins the main mixer. "
+                    "0.0 = unity, negative for softer, positive for hotter. Range -24 to +6.",
+    )
+    polyphony_cap = models.PositiveSmallIntegerField(
+        default=4,
+        help_text="Maximum simultaneous fires. A 5th click while 4 fires are still in flight is dropped. "
+                    "Range 1-8; higher values just increase potential CPU on the engine.",
+    )
+
+    class Meta:
+        verbose_name = "FX Bus"
+        verbose_name_plural = "FX Bus"
+
+    def __str__(self):
+        return f"FX Bus (volume {self.volume_db:+.1f} dB, cap {self.polyphony_cap})"
+
+    def save(self, *args, **kwargs):
+        self.pk = 1
+        super().save(*args, **kwargs)
+
+    @classmethod
+    def load(cls):
+        obj, _ = cls.objects.get_or_create(pk=1)
+        return obj
+
+
 class TuneInConfig(models.Model):
     """Credentials + state for the TuneIn AIR now-playing API. Editable
     admin singleton (Config > TuneIn AIR); pushed by

@@ -26,15 +26,17 @@ from .services.log_builder import _build_from_playlist, build_hour_log, preview_
 
 @ensure_csrf_cookie
 def dashboard_page(request):
-    from library.models import AnalysisConfig
+    from library.models import AnalysisConfig, FXCart
     from hardware.models import AudioPipeline
 
     playlists = Playlist.objects.all().order_by("name")
+    fx_carts = FXCart.objects.filter(enabled=True).order_by("sort_order", "name")
     return render(request, "library/dashboard.html", {
         "playlists": playlists,
         "analysis_config": AnalysisConfig.load(),
         "vu_min_db": AudioPipeline.load().vu_meter_min_db,
         "mode": "full",
+        "fx_carts": fx_carts,
     })
 
 
@@ -1988,7 +1990,7 @@ def remote_dj_page(request):
     `remote_dj` group the WebRTC token endpoint already checks;
     anyone not in the group gets a 'not authorized' minimal page
     instead of the console."""
-    from library.models import AnalysisConfig, Playlist
+    from library.models import AnalysisConfig, FXCart, Playlist
     from hardware.models import AudioPipeline
     authorized = request.user.groups.filter(name="remote_dj").exists()
     if not authorized:
@@ -1998,6 +2000,50 @@ def remote_dj_page(request):
         "analysis_config": AnalysisConfig.load(),
         "vu_min_db": AudioPipeline.load().vu_meter_min_db,
         "mode": "remote_dj",
+        "fx_carts": FXCart.objects.filter(enabled=True).order_by("sort_order", "name"),
+    })
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def api_fx_fire(request):
+    """Fires an FXCart into the on-air mix. Access-controlled: reached
+    only by users whose group grants /api/fx/, which today means staff/
+    superuser (via bypass) and remote_dj (via GroupAccess seed). Contributor
+    doesn't get here because it lacks the dashboard/remote-dj prefixes
+    already.
+
+    Retrigger / polyphony / access are enforced engine-side (single source
+    of truth). This view just relays cart_id via the engine command file --
+    an engine restart would drop any in-flight fires the same way it drops
+    everything else, which is acceptable for one-shot audio."""
+    from library.models import FXCart
+    try:
+        body = json.loads(request.body)
+    except (json.JSONDecodeError, ValueError):
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+    cart_id = body.get("cart_id")
+    if not cart_id:
+        return JsonResponse({"error": "cart_id required"}, status=400)
+    cart = FXCart.objects.filter(id=cart_id, enabled=True).only(
+        "id", "duration_seconds", "retrigger_mode"
+    ).first()
+    if cart is None:
+        return JsonResponse({"error": "cart not found or disabled"}, status=404)
+
+    cmd_path = Path("/run/isadoraair/engine_cmd.json")
+    try:
+        cmd_path.write_text(
+            json.dumps({"command": "fx_fire", "cart_id": int(cart_id)}),
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        return JsonResponse({"error": f"engine command dispatch failed: {exc}"}, status=500)
+    return JsonResponse({
+        "ok": True,
+        "cart_id": cart_id,
+        "duration_seconds": cart.duration_seconds,
+        "retrigger_mode": cart.retrigger_mode,
     })
 
 

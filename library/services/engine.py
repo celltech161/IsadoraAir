@@ -24,7 +24,7 @@ from django.db import close_old_connections
 from django.db.models import F
 from django.utils import timezone
 from hardware.models import AudioInput, AudioOutput, AudioPipeline, DuckingConfig, RemoteDJAudioInput
-from library.models import Category, LogItem, PlayEvent, PlaylistLog, RemoteDJConfig, Track
+from library.models import Category, FXBusConfig, FXCart, LogItem, PlayEvent, PlaylistLog, RemoteDJConfig, Track
 from monitoring.models import emit_event
 from library.services.log_builder import (
     DURATION_FIT_MARGIN,
@@ -1108,6 +1108,15 @@ class PlaybackEngine:
         if RemoteDJConfig.load().enabled:
             self._build_dj_slots(MAX_DJ_SLOTS)
 
+        # FX bus (one-shot audio carts / hotkeys). Persistent sub-mixer
+        # + volume attached via a SINGLE permanent pad on master_mixer.
+        # Individual fire chains request pads on the sub-mixer, not on
+        # master_mixer, so the main audio path is untouched by fire
+        # churn -- the mistake we're deliberately avoiding was the
+        # historical RemoteDJ pattern of live master_mixer.request_pad
+        # calls at runtime. See FXCart / FXBusConfig docstrings.
+        self._fx_setup(convert=None)
+
         self.master_mixer.link(convert)
         convert.link(resample)
         resample.link(capsfilter)
@@ -1902,6 +1911,199 @@ class PlaybackEngine:
             if self.decks.get(deck.slot) is deck:
                 self.decks[deck.slot] = None
 
+    # ------------------------------------------------------------------
+    # FX bus (one-shot audio carts / hotkeys)
+    # ------------------------------------------------------------------
+    def _fx_setup(self, convert):
+        """Build the persistent FX sub-mixer and attach it to master_mixer
+        via one permanent pad. Called during _build_main_pipeline. Fires
+        (individual one-shot chains) are added/removed against
+        self.fx_submix at runtime; this method never touches master_mixer
+        past its first request_pad. self._fx_fires is the live-fires
+        registry: {fire_id: {cart_id, pipeline, pad, ...}}."""
+        self.fx_submix = Gst.ElementFactory.make("audiomixer", "fx_submix")
+        self.fx_bus_gain = Gst.ElementFactory.make("volume", "fx_bus_gain")
+
+        try:
+            cfg = FXBusConfig.load()
+            self.fx_bus_gain.set_property("volume", 10 ** (cfg.volume_db / 20.0))
+        except Exception as exc:
+            print(f"  FXBusConfig read failed at pipeline build: {exc}")
+            self.fx_bus_gain.set_property("volume", 1.0)
+
+        self.main_pipeline.add(self.fx_submix)
+        self.main_pipeline.add(self.fx_bus_gain)
+
+        self.fx_submix.link(self.fx_bus_gain)
+        fx_pad = self.master_mixer.request_pad_simple("sink_%u")
+        self.fx_bus_gain.get_static_pad("src").link(fx_pad)
+
+        self._fx_fires = {}   # fire_id -> {cart_id, filesrc, decodebin, convert, resample, pad, started_at, duration}
+        self._fx_next_id = 1
+        self._fx_lock = threading.Lock()
+
+    def _fx_apply_volume(self):
+        """Refreshed by the reload_fx_config command -- reads FXBusConfig
+        and updates the fx_bus_gain volume live. Volume changes take
+        effect on the next audio sample without any element churn."""
+        try:
+            cfg = FXBusConfig.load()
+            self.fx_bus_gain.set_property("volume", 10 ** (cfg.volume_db / 20.0))
+        except Exception as exc:
+            print(f"  FX volume reload failed: {exc}")
+
+    def _fx_active_count(self):
+        with self._fx_lock:
+            return len(self._fx_fires)
+
+    def _fx_fires_for_cart(self, cart_id):
+        with self._fx_lock:
+            return [fid for fid, f in self._fx_fires.items() if f["cart_id"] == cart_id]
+
+    def _fx_fire(self, cart_id):
+        """Play one FXCart. Honors retrigger_mode + polyphony cap. Returns
+        True if a new fire was started, False otherwise (dropped by cap
+        or ignored by retrigger)."""
+        try:
+            close_old_connections()
+            cart = FXCart.objects.filter(id=cart_id, enabled=True).first()
+        except Exception as exc:
+            print(f"  fx_fire: DB read failed for cart {cart_id}: {exc}")
+            return False
+        if cart is None:
+            print(f"  fx_fire: cart {cart_id} not found or disabled")
+            return False
+        if not cart.filepath or not Path(cart.filepath).is_file():
+            print(f"  fx_fire: cart {cart_id} file missing at {cart.filepath!r}")
+            return False
+
+        # Retrigger handling. 'restart' stops any existing fire for this
+        # cart before starting fresh; 'ignore' drops the second click;
+        # 'stop' halts the current fire and returns without starting a
+        # new one -- makes the button a click-to-play, click-to-stop
+        # toggle.
+        existing = self._fx_fires_for_cart(cart_id)
+        mode = cart.retrigger_mode
+        if existing:
+            if mode == "ignore":
+                return False
+            for fire_id in existing:
+                self._fx_stop(fire_id)
+            if mode == "stop":
+                return False
+            # 'restart' -> fall through to start a new fire below
+
+        # Polyphony cap. After honoring retrigger (which may have freed
+        # slots via stop) check the live count. A 5th simultaneous fire
+        # from different carts gets dropped rather than kicking any
+        # existing one -- less surprising to the operator.
+        try:
+            cap = FXBusConfig.load().polyphony_cap
+        except Exception:
+            cap = 4
+        if self._fx_active_count() >= cap:
+            print(f"  fx_fire: polyphony cap ({cap}) hit; dropping cart {cart_id}")
+            return False
+
+        # Build the fire chain: filesrc -> decodebin -> audioconvert ->
+        # audioresample -> per-cart gain -> fx_submix pad. Same shape as
+        # _create_deck but scoped to the FX sub-mixer -- pad churn stays
+        # confined here and can't cross-affect the main audio chain.
+        with self._fx_lock:
+            fire_id = self._fx_next_id
+            self._fx_next_id += 1
+
+        filesrc = Gst.ElementFactory.make("filesrc", f"fx_filesrc_{fire_id}")
+        decodebin = Gst.ElementFactory.make("decodebin", f"fx_decodebin_{fire_id}")
+        convert = Gst.ElementFactory.make("audioconvert", f"fx_convert_{fire_id}")
+        resample = Gst.ElementFactory.make("audioresample", f"fx_resample_{fire_id}")
+        gain = Gst.ElementFactory.make("volume", f"fx_gain_{fire_id}")
+        filesrc.set_property("location", cart.filepath)
+        gain.set_property("volume", 10 ** ((cart.gain_db or 0.0) / 20.0))
+
+        for el in (filesrc, decodebin, convert, resample, gain):
+            self.main_pipeline.add(el)
+
+        filesrc.link(decodebin)
+        convert.link(resample)
+        resample.link(gain)
+
+        fx_pad = self.fx_submix.request_pad_simple("sink_%u")
+        gain.get_static_pad("src").link(fx_pad)
+
+        state = {
+            "cart_id": cart_id,
+            "filesrc": filesrc, "decodebin": decodebin,
+            "convert": convert, "resample": resample, "gain": gain,
+            "fx_pad": fx_pad,
+            "started_at": time.time(),
+        }
+        with self._fx_lock:
+            self._fx_fires[fire_id] = state
+
+        # decodebin's src pad only exists once it's had a chance to
+        # sniff the file. Wire it into convert here rather than
+        # pre-linking (which would fail with "no matching template").
+        def _on_decodebin_pad_added(decodebin_el, new_pad, fire_id=fire_id):
+            if not new_pad.get_current_caps():
+                new_pad.query_caps(None)
+            convert_sink = convert.get_static_pad("sink")
+            if convert_sink.is_linked():
+                return
+            new_pad.link(convert_sink)
+
+        decodebin.connect("pad-added", _on_decodebin_pad_added)
+
+        # Wire an EOS handler by watching the bus for messages from THIS
+        # fire's elements. The bus is shared, so we filter by src.
+        bus = self.main_pipeline.get_bus()
+        bus.add_signal_watch()   # idempotent -- safe to call again
+        bus.connect("message::eos", self._fx_on_eos, fire_id)
+
+        # State: PLAYING. Same order as _create_deck's sync_state pattern.
+        for el in (filesrc, decodebin, convert, resample, gain):
+            el.sync_state_with_parent()
+
+        print(f"  FX fire {fire_id}: cart {cart_id} ({cart.name!r})")
+        return True
+
+    def _fx_on_eos(self, bus, message, fire_id):
+        with self._fx_lock:
+            state = self._fx_fires.get(fire_id)
+        if state is None:
+            return
+        # EOS from any element on the main pipeline reaches this handler;
+        # filter by checking the src is one of ours.
+        src = message.src
+        our_srcs = (state["filesrc"], state["decodebin"], state["convert"],
+                    state["resample"], state["gain"])
+        if src not in our_srcs:
+            return
+        self._fx_stop(fire_id)
+
+    def _fx_stop(self, fire_id):
+        """Teardown a fire's chain and release its sub-mixer pad. Safe to
+        call for a stale fire_id (silent no-op). Called by both EOS and
+        retrigger-mode-stop paths."""
+        with self._fx_lock:
+            state = self._fx_fires.pop(fire_id, None)
+        if state is None:
+            return
+        try:
+            for el in (state["filesrc"], state["decodebin"], state["convert"],
+                        state["resample"], state["gain"]):
+                el.set_state(Gst.State.NULL)
+            try:
+                state["gain"].get_static_pad("src").unlink(state["fx_pad"])
+            except Exception:
+                pass
+            self.fx_submix.release_request_pad(state["fx_pad"])
+            for el in (state["gain"], state["resample"], state["convert"],
+                        state["decodebin"], state["filesrc"]):
+                self.main_pipeline.remove(el)
+        except Exception as exc:
+            print(f"  FX teardown fire {fire_id} failed: {exc}")
+
     def _get_deck_position(self, deck):
         if deck.paused:
             return deck.paused_position
@@ -1966,6 +2168,14 @@ class PlaybackEngine:
                 self._remote_dj_set_gate(bool(data.get("active")))
             elif cmd == "remote_dj_disconnect":
                 self._remote_dj_session_stop()
+            elif cmd == "fx_fire":
+                cart_id = data.get("cart_id")
+                if cart_id:
+                    self._fx_fire(int(cart_id))
+            elif cmd == "reload_fx_config":
+                # Volume-only reload; polyphony cap changes need a restart
+                # because the fx_submix pool sizing is set at build.
+                self._fx_apply_volume()
         except Exception as exc:
             print(f"  Command error: {exc}")
 

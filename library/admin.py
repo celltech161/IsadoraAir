@@ -37,6 +37,8 @@ from .models import (
     RoyaltyReport,
     ScheduleBlock,
     Genre,
+    FXBusConfig,
+    FXCart,
     StationInfo,
     StationTimeConfig,
     TuneInConfig,
@@ -54,7 +56,7 @@ from .models import (
 # Every model keeps living in `library` underneath — only the admin UI
 # grouping changes.
 _TRAFFIC_MODELS = {"playlist", "rotation", "scheduleblock", "playlistlog"}
-_CONFIG_MODELS = {"analysisconfig", "recencyconfig", "uitheme", "logfillconfig", "uploadconfig", "navmenuitem", "remotedjconfig", "stationtimeconfig", "stationinfo", "tuneinconfig"}
+_CONFIG_MODELS = {"analysisconfig", "recencyconfig", "uitheme", "logfillconfig", "uploadconfig", "navmenuitem", "remotedjconfig", "stationtimeconfig", "stationinfo", "tuneinconfig", "fxbusconfig", "fxcart"}
 _LOG_MODELS = {"emaillog", "playevent", "royaltyreport"}
 
 
@@ -1132,3 +1134,87 @@ class RoyaltyReportAdmin(admin.ModelAdmin):
         # Reports can be regenerated from PlayEvent -- allowing delete
         # is safe (no info lost), and useful for tidying test rows.
         return True
+
+
+@admin.register(FXCart)
+class FXCartAdmin(admin.ModelAdmin):
+    """One-shot cart definitions. Each row becomes a button on both the
+    main dashboard and the remote-DJ console, ordered by sort_order.
+    File-existence badge in the list view catches "file was deleted
+    but the row is still here" mistakes at a glance."""
+
+    list_display = ["_badge", "name", "sort_order", "keyboard_shortcut",
+                    "retrigger_mode", "gain_db", "enabled"]
+    list_editable = ["sort_order", "enabled"]
+    list_filter = ["enabled", "retrigger_mode"]
+    search_fields = ["name", "filepath"]
+    ordering = ["sort_order", "name"]
+    fieldsets = [
+        (None, {
+            "fields": ["name", "filepath", "sort_order", "enabled"],
+        }),
+        ("Behavior", {
+            "fields": ["retrigger_mode", "keyboard_shortcut", "gain_db"],
+            "description": (
+                "retrigger_mode picks what happens when the button is pressed while "
+                "it's already playing (restart is the radio-convention default). "
+                "keyboard_shortcut is optional; blank = click-only."
+            ),
+        }),
+        ("Appearance", {
+            "fields": ["idle_color", "playing_color"],
+            "description": (
+                "Button color when idle vs. the fill color that sweeps left-to-right "
+                "across the button as the cart plays. RGBA -- pick any color, tune "
+                "opacity for softer looks."
+            ),
+        }),
+    ]
+
+    @admin.display(description="")
+    def _badge(self, obj):
+        if not obj.filepath:
+            return format_html('<span title="No file path" style="color:#e67;">&#9888;</span>')
+        if not obj.file_exists:
+            return format_html(
+                '<span title="File not found at {}" style="color:#e67;">&#9888;</span>',
+                obj.filepath,
+            )
+        return format_html('<span title="File OK" style="color:#6c6;">&#9679;</span>')
+
+    def formfield_for_dbfield(self, db_field, request, **kwargs):
+        # RGBAColorWidget on both color fields, same as UITheme/CategoryKind.
+        if db_field.name in ("idle_color", "playing_color"):
+            kwargs["widget"] = RGBAColorWidget
+        return super().formfield_for_dbfield(db_field, request, **kwargs)
+
+
+@admin.register(FXBusConfig)
+class FXBusConfigAdmin(admin.ModelAdmin):
+    """Singleton config for the FX sub-mixer. Volume + polyphony cap."""
+
+    fieldsets = [
+        (None, {
+            "fields": ["volume_db", "polyphony_cap"],
+            "description": (
+                "FX bus output gain into the master mixer plus a cap on simultaneous "
+                "fires. Volume takes effect on the next engine command tick (no "
+                "restart). Polyphony cap requires an engine restart to re-provision "
+                "the sub-mixer's slot count."
+            ),
+        }),
+    ]
+
+    def has_add_permission(self, request):
+        return not FXBusConfig.objects.exists()
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+    def changelist_view(self, request, extra_context=None):
+        from django.http import HttpResponseRedirect
+        from django.urls import reverse
+        obj = FXBusConfig.load()
+        return HttpResponseRedirect(
+            reverse("admin:library_fxbusconfig_change", args=[obj.pk])
+        )

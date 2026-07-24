@@ -71,6 +71,7 @@ urlpatterns = [
     path('api/engine/remote-dj-gate/', views.api_engine_remote_dj_gate, name='api-engine-remote-dj-gate'),
     path('api/engine/manual-mode/', views.api_engine_manual_mode, name='api-engine-manual-mode'),
     path('api/remote-dj/token/', views.api_remote_dj_token, name='api-remote-dj-token'),
+    path('api/fx/fire/', views.api_fx_fire, name='api-fx-fire'),
     path('remote-dj/', views.remote_dj_page, name='remote-dj'),
     path('reports/', views.reports_page, name='reports'),
     path('reports/<int:pk>/download/', views.reports_download, name='reports-download'),

@@ -522,6 +522,92 @@
     flex-wrap: wrap;
   }
 
+  /* --- FX carts (one-shot hotkeys) --- */
+  .fx-panel {
+    margin: 0 0 1.25rem 0;
+    padding: 0.5rem;
+    background: var(--bg-mid);
+    border: 1px solid var(--border-subtle);
+    border-radius: 8px;
+  }
+  .fx-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+  }
+  .fx-row-extra { margin-top: 0.4rem; }
+  .fx-cart {
+    /* button IS the progress bar. Idle color fills from --fx-idle;
+       when firing, a linear-gradient sweeps --fx-playing across from
+       left to right over the audio's duration. --fx-progress is set
+       from JS as the fire proceeds. Non-firing state = --fx-progress:0%. */
+    position: relative;
+    flex: 1 1 auto;
+    min-width: 90px;
+    max-width: 160px;
+    height: 44px;
+    padding: 0 0.5rem;
+    border: 1px solid var(--border-subtle);
+    border-radius: 6px;
+    color: var(--text-main);
+    font-family: inherit;
+    font-size: 0.82rem;
+    font-weight: 600;
+    cursor: pointer;
+    overflow: hidden;
+    text-align: center;
+    background:
+      linear-gradient(to right,
+        var(--fx-playing, var(--accent)) 0%,
+        var(--fx-playing, var(--accent)) var(--fx-progress, 0%),
+        var(--fx-idle, var(--bg-darker)) var(--fx-progress, 0%),
+        var(--fx-idle, var(--bg-darker)) 100%);
+    transition: filter 0.1s ease;
+  }
+  .fx-cart:hover:not(.fx-firing) {
+    filter: brightness(1.15);
+  }
+  .fx-cart.fx-firing {
+    /* Once JS sets fx-firing, transition --fx-progress smoothly from 0
+       to 100 over the audio duration (JS sets the CSS variable via
+       an inline style + transition-duration). */
+    transition: none;
+  }
+  .fx-cart-label {
+    position: relative;   /* stack above the linear-gradient fill */
+    z-index: 1;
+    text-shadow: 0 1px 2px rgba(0,0,0,0.5);
+    pointer-events: none;
+  }
+  .fx-cart-shortcut {
+    display: inline-block;
+    margin-left: 0.25rem;
+    padding: 0 4px;
+    border-radius: 3px;
+    background: rgba(0,0,0,0.35);
+    font-size: 0.7em;
+    font-weight: 700;
+    opacity: 0.85;
+  }
+  .fx-more {
+    background: var(--bg-darker);
+    color: var(--text-muted);
+    border: 1px dashed var(--border-subtle);
+    border-radius: 6px;
+    height: 44px;
+    padding: 0 0.75rem;
+    font-family: inherit;
+    font-size: 0.75rem;
+    cursor: pointer;
+    align-self: stretch;
+  }
+  .fx-more:hover { color: var(--text-main); }
+  .fx-more.fx-more-active {
+    background: var(--accent);
+    color: var(--bg-darkest);
+    border-style: solid;
+  }
+
   .queue-insert-input {
     width: 100%;
     background: var(--bg-darker);
@@ -875,6 +961,43 @@
       <span class="playnow-msg" id="playNowMsg"></span>
     </div>
   </div>
+
+  {% if fx_carts %}
+  <div class="fx-panel" id="fxPanel">
+    <div class="fx-row" id="fxRowTop">
+      {% for cart in fx_carts|slice:":8" %}
+      <button class="fx-cart" data-cart-id="{{ cart.id }}"
+              data-duration="{{ cart.duration_seconds|default_if_none:'0' }}"
+              data-retrigger="{{ cart.retrigger_mode }}"
+              data-shortcut="{{ cart.keyboard_shortcut|upper }}"
+              style="--fx-idle: {{ cart.idle_color }}; --fx-playing: {{ cart.playing_color }};"
+              onclick="fireFxCart(this)"
+              title="{{ cart.name }}{% if cart.keyboard_shortcut %} [{{ cart.keyboard_shortcut|upper }}]{% endif %}">
+        <span class="fx-cart-label">{{ cart.name }}{% if cart.keyboard_shortcut %} <span class="fx-cart-shortcut">{{ cart.keyboard_shortcut|upper }}</span>{% endif %}</span>
+      </button>
+      {% endfor %}
+      {% if fx_carts.count > 8 %}
+      <button class="fx-more" id="fxMoreBtn" onclick="toggleFxMore()" title="Show/hide additional carts">More…</button>
+      {% endif %}
+    </div>
+    {% if fx_carts.count > 8 %}
+    <div class="fx-row fx-row-extra" id="fxRowExtra" style="display:none;">
+      {% for cart in fx_carts|slice:"8:" %}
+      <button class="fx-cart" data-cart-id="{{ cart.id }}"
+              data-duration="{{ cart.duration_seconds|default_if_none:'0' }}"
+              data-retrigger="{{ cart.retrigger_mode }}"
+              data-shortcut="{{ cart.keyboard_shortcut|upper }}"
+              style="--fx-idle: {{ cart.idle_color }}; --fx-playing: {{ cart.playing_color }};"
+              onclick="fireFxCart(this)"
+              title="{{ cart.name }}{% if cart.keyboard_shortcut %} [{{ cart.keyboard_shortcut|upper }}]{% endif %}">
+        <span class="fx-cart-label">{{ cart.name }}{% if cart.keyboard_shortcut %} <span class="fx-cart-shortcut">{{ cart.keyboard_shortcut|upper }}</span>{% endif %}</span>
+      </button>
+      {% endfor %}
+    </div>
+    {% endif %}
+  </div>
+  {% endif %}
+
   <h3>Coming Up</h3>
   <div class="queue-table-wrap">
     <table class="queue-table">
@@ -1002,6 +1125,108 @@ async function playNow() {
   msg.textContent = `Playing now (${data.item_count} tracks)`;
   sel.value = '';
 }
+
+// ============================================================
+// FX carts (one-shot hotkeys)
+// ============================================================
+function toggleFxMore() {
+  const extra = document.getElementById('fxRowExtra');
+  const btn = document.getElementById('fxMoreBtn');
+  if (!extra) return;
+  const isOpen = extra.style.display !== 'none';
+  extra.style.display = isOpen ? 'none' : 'flex';
+  btn.classList.toggle('fx-more-active', !isOpen);
+  btn.textContent = isOpen ? 'More…' : 'Fewer';
+}
+
+// Track live fires client-side so retrigger visual + keyboard shortcuts
+// can behave symmetrically to the server's authoritative state. This is
+// UX only; the server enforces polyphony + retrigger for real.
+// Key = cart_id string, value = { timeoutId, endsAt }
+const _fxLive = {};
+
+function _fxStopVisual(btn, cartId) {
+  btn.classList.remove('fx-firing');
+  btn.style.setProperty('--fx-progress', '0%');
+  btn.style.transitionProperty = '';
+  btn.style.transitionDuration = '';
+  btn.style.transitionTimingFunction = '';
+  if (_fxLive[cartId] && _fxLive[cartId].timeoutId) {
+    clearTimeout(_fxLive[cartId].timeoutId);
+  }
+  delete _fxLive[cartId];
+}
+
+function _fxStartVisual(btn, cartId, durationSec) {
+  btn.classList.add('fx-firing');
+  // Set --fx-progress to 0% first, then to 100% on the next frame so
+  // the transition actually runs (setting-then-setting in the same
+  // synchronous block collapses to just the final value).
+  btn.style.setProperty('--fx-progress', '0%');
+  btn.style.transitionProperty = '--fx-progress';
+  btn.style.transitionDuration = durationSec + 's';
+  btn.style.transitionTimingFunction = 'linear';
+  requestAnimationFrame(() => {
+    btn.style.setProperty('--fx-progress', '100%');
+  });
+  const timeoutId = setTimeout(() => _fxStopVisual(btn, cartId), Math.max(50, durationSec * 1000));
+  _fxLive[cartId] = { timeoutId, endsAt: Date.now() + durationSec * 1000 };
+}
+
+async function fireFxCart(btn) {
+  const cartId = btn.dataset.cartId;
+  const retriggerMode = btn.dataset.retrigger || 'restart';
+  const durationHint = parseFloat(btn.dataset.duration) || 2.0;
+  // Handle retrigger visuals client-side so the button responds
+  // immediately without waiting for the round-trip.
+  if (_fxLive[cartId]) {
+    if (retriggerMode === 'ignore') {
+      return;
+    }
+    _fxStopVisual(btn, cartId);
+    if (retriggerMode === 'stop') {
+      // Fire the API anyway so the engine stops the audio. Server
+      // will decide whether to actually stop or ignore.
+      try {
+        await fetch("{% url 'library:api-fx-fire' %}", {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') },
+          body: JSON.stringify({ cart_id: parseInt(cartId, 10) }),
+        });
+      } catch (e) {}
+      return;
+    }
+    // 'restart' -> visual reset done, fall through to fire fresh
+  }
+  try {
+    const resp = await fetch("{% url 'library:api-fx-fire' %}", {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') },
+      body: JSON.stringify({ cart_id: parseInt(cartId, 10) }),
+    });
+    if (!resp.ok) return;
+    const data = await resp.json();
+    const duration = data.duration_seconds || durationHint;
+    _fxStartVisual(btn, cartId, duration);
+  } catch (e) {}
+}
+
+// Keyboard shortcuts. Skip when focus is in a text-input-like element
+// (typing "3" into the search box shouldn't fire cart 3). Skip
+// auto-repeat so holding a key doesn't spam the button.
+document.addEventListener('keydown', function (e) {
+  if (e.repeat) return;
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
+  const t = e.target;
+  if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable)) return;
+  const key = (e.key || '').toUpperCase();
+  if (!/^[0-9A-Z]$/.test(key)) return;
+  const btn = document.querySelector('.fx-cart[data-shortcut="' + key + '"]');
+  if (btn) {
+    e.preventDefault();
+    fireFxCart(btn);
+  }
+});
 
 async function toggleMicPtt() {
   const btn = document.getElementById('micPttBtn');
