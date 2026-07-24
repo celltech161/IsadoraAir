@@ -1297,6 +1297,59 @@ class PlayEvent(models.Model):
         )
 
 
+class TuneInConfig(models.Model):
+    """Credentials + state for the TuneIn AIR now-playing API. Editable
+    admin singleton (Config > TuneIn AIR); pushed by
+    isadoraair-tunein-push.timer every ~30s, but only when the current
+    PlayEvent id differs from last_pushed_play_event_id -- one HTTP
+    request per song change, matching TuneIn's explicit
+    "submit only once at the start of the song" rule.
+
+    Values arrive via a station-registration email from TuneIn:
+      station_id     -- 's######' form (must include the 's' prefix)
+      partner_id     -- opaque short token
+      partner_key    -- opaque secret; treat as a password
+
+    disabled=False allows a quick pause without deleting the row --
+    e.g. during a syndicated show where different metadata is
+    desired, or while diagnosing a rate-limit issue on TuneIn's
+    side."""
+
+    station_id = models.CharField(
+        max_length=32, blank=True, default="",
+        help_text="TuneIn Station ID, format 's123456' (must include the leading s).",
+    )
+    partner_id = models.CharField(max_length=64, blank=True, default="")
+    partner_key = models.CharField(
+        max_length=128, blank=True, default="",
+        help_text="Sensitive -- treat as a password. Admin-only visibility "
+                    "(this admin surface is superuser-gated by default).",
+    )
+    enabled = models.BooleanField(
+        default=False,
+        help_text="Uncheck to pause pushes without deleting the credentials.",
+    )
+    last_pushed_play_event_id = models.PositiveIntegerField(null=True, blank=True)
+    last_pushed_at = models.DateTimeField(null=True, blank=True)
+    last_push_status = models.CharField(max_length=200, blank=True, default="")
+
+    class Meta:
+        verbose_name = "TuneIn AIR"
+        verbose_name_plural = "TuneIn AIR"
+
+    def __str__(self):
+        return f"TuneIn AIR ({self.station_id or 'unset'}, {'enabled' if self.enabled else 'disabled'})"
+
+    def save(self, *args, **kwargs):
+        self.pk = 1
+        super().save(*args, **kwargs)
+
+    @classmethod
+    def load(cls):
+        obj, _ = cls.objects.get_or_create(pk=1)
+        return obj
+
+
 class StationInfo(models.Model):
     """Station-identifying strings used by outbound licensor-facing
     outputs -- primarily the SoundExchange NCE Report of Use header

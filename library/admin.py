@@ -39,6 +39,7 @@ from .models import (
     Genre,
     StationInfo,
     StationTimeConfig,
+    TuneInConfig,
     Track,
     UITheme,
     CDRipConfig,
@@ -53,7 +54,7 @@ from .models import (
 # Every model keeps living in `library` underneath — only the admin UI
 # grouping changes.
 _TRAFFIC_MODELS = {"playlist", "rotation", "scheduleblock", "playlistlog"}
-_CONFIG_MODELS = {"analysisconfig", "recencyconfig", "uitheme", "logfillconfig", "uploadconfig", "navmenuitem", "remotedjconfig", "stationtimeconfig", "stationinfo"}
+_CONFIG_MODELS = {"analysisconfig", "recencyconfig", "uitheme", "logfillconfig", "uploadconfig", "navmenuitem", "remotedjconfig", "stationtimeconfig", "stationinfo", "tuneinconfig"}
 _LOG_MODELS = {"emaillog", "playevent", "royaltyreport"}
 
 
@@ -671,6 +672,50 @@ class StationTimeConfigAdmin(admin.ModelAdmin):
         obj = StationTimeConfig.load()
         return HttpResponseRedirect(
             reverse("admin:library_stationtimeconfig_change", args=[obj.pk])
+        )
+
+
+@admin.register(TuneInConfig)
+class TuneInConfigAdmin(admin.ModelAdmin):
+    """Singleton: TuneIn AIR now-playing API credentials + push state.
+    See TuneInConfig docstring; obtained by emailing TuneIn per
+    https://tunein.com/broadcasters/api/. Pushes are driven by the
+    isadoraair-tunein-push.timer (every 30s, no-op when nothing has
+    changed since the last successful push)."""
+    fieldsets = [
+        ("Credentials", {
+            "fields": ["station_id", "partner_id", "partner_key", "enabled"],
+            "description": (
+                "Values from TuneIn's registration email. station_id must "
+                "start with 's' (e.g. 's339896'). Uncheck `enabled` to pause "
+                "pushes without deleting the credentials -- useful during "
+                "diagnosis or a syndicated block."
+            ),
+        }),
+        ("Push state (read-only)", {
+            "fields": ["last_pushed_play_event_id", "last_pushed_at", "last_push_status"],
+            "description": (
+                "Updated by the timer. last_pushed_play_event_id bumps only "
+                "on a successful HTTP 2xx from TuneIn -- a transient failure "
+                "leaves this alone so the next timer fire retries the same "
+                "PlayEvent."
+            ),
+        }),
+    ]
+    readonly_fields = ["last_pushed_play_event_id", "last_pushed_at", "last_push_status"]
+
+    def has_add_permission(self, request):
+        return not TuneInConfig.objects.exists()
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+    def changelist_view(self, request, extra_context=None):
+        from django.http import HttpResponseRedirect
+        from django.urls import reverse
+        obj = TuneInConfig.load()
+        return HttpResponseRedirect(
+            reverse("admin:library_tuneinconfig_change", args=[obj.pk])
         )
 
 

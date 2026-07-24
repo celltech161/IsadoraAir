@@ -1,0 +1,11 @@
+[Unit]
+Description=IsadoraAir TuneIn AIR now-playing pusher (once per PlayEvent id change)
+After=network.target postgresql.service
+
+[Service]
+Type=oneshot
+User=@@ISA_USER@@
+Group=@@ISA_USER@@
+WorkingDirectory=@@ISA_ROOT@@
+ExecStart=@@ISA_ROOT@@/venv/bin/python @@ISA_ROOT@@/manage.py push_tunein_nowplaying
+EnvironmentFile=@@ISA_ROOT@@/.env

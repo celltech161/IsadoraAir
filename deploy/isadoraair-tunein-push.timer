@@ -1,0 +1,10 @@
+[Unit]
+Description=Push now-playing to TuneIn AIR when the current PlayEvent changes
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=30s
+Persistent=false
+
+[Install]
+WantedBy=timers.target
