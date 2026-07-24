@@ -560,14 +560,14 @@
             {{ voicetracks.intro.edited_at|date:"Y-m-d H:i"|default:voicetracks.intro.recorded_at|date:"Y-m-d H:i" }}
           </div>
           <div class="vt-existing-actions">
-            <button type="button" class="vt-btn" onclick="vtRecord('intro')" {% if track.intro_until_seconds is None %}disabled{% endif %}>Re-record</button>
+            <button type="button" id="vtRecordBtnIntro" class="vt-btn" onclick="vtRecord('intro')">Re-record</button>
             <button type="button" class="vt-btn" onclick="vtEditorOpen({{ voicetracks.intro.id }}, '{% url 'library:api-voicetrack-audio' voicetracks.intro.id %}', '{{ track.title|escapejs }} — intro VT', function () { window.location.reload(); })">Edit</button>
             <button type="button" class="vt-btn danger" onclick="vtDelete({{ voicetracks.intro.id }})">Delete</button>
           </div>
         </div>
         {% else %}
         <div class="vt-empty">
-          <button type="button" class="vt-btn primary" onclick="vtRecord('intro')" {% if track.intro_until_seconds is None %}disabled{% endif %}>Record Intro VT</button>
+          <button type="button" id="vtRecordBtnIntro" class="vt-btn primary" onclick="vtRecord('intro')">Record Intro VT</button>
         </div>
         {% endif %}
       </div>
@@ -590,14 +590,14 @@
             {{ voicetracks.outro.edited_at|date:"Y-m-d H:i"|default:voicetracks.outro.recorded_at|date:"Y-m-d H:i" }}
           </div>
           <div class="vt-existing-actions">
-            <button type="button" class="vt-btn" onclick="vtRecord('outro')" {% if track.outro_starts_seconds is None %}disabled{% endif %}>Re-record</button>
+            <button type="button" id="vtRecordBtnOutro" class="vt-btn" onclick="vtRecord('outro')">Re-record</button>
             <button type="button" class="vt-btn" onclick="vtEditorOpen({{ voicetracks.outro.id }}, '{% url 'library:api-voicetrack-audio' voicetracks.outro.id %}', '{{ track.title|escapejs }} — outro VT', function () { window.location.reload(); })">Edit</button>
             <button type="button" class="vt-btn danger" onclick="vtDelete({{ voicetracks.outro.id }})">Delete</button>
           </div>
         </div>
         {% else %}
         <div class="vt-empty">
-          <button type="button" class="vt-btn primary" onclick="vtRecord('outro')" {% if track.outro_starts_seconds is None %}disabled{% endif %}>Record Outro VT</button>
+          <button type="button" id="vtRecordBtnOutro" class="vt-btn primary" onclick="vtRecord('outro')">Record Outro VT</button>
         </div>
         {% endif %}
       </div>
@@ -744,7 +744,97 @@ let vtAudioContext = null;
 let vtTimerId = null;
 let vtStartTs = 0;
 
-function vtRecord(position) {
+// Initial (server-rendered) marker values. Used at record-click time
+// to decide whether to auto-save the form -- if the field value
+// differs from initial, the server's copy of the marker is stale and
+// the VT upload would 400 unless we save first.
+const VT_INITIAL_INTRO_UNTIL  = {% if track.intro_until_seconds is None %}null{% else %}{{ track.intro_until_seconds }}{% endif %};
+const VT_INITIAL_OUTRO_STARTS = {% if track.outro_starts_seconds is None %}null{% else %}{{ track.outro_starts_seconds }}{% endif %};
+
+function vtIsValidNumber(str) {
+  if (str === null || str === undefined || str === '') return false;
+  const n = parseFloat(str);
+  return isFinite(n) && n >= 0;
+}
+
+// Enable / disable the two record buttons based on the CURRENT
+// (client-side) marker field values, and refresh the hint text on
+// each slot. Called on page load, on every keystroke in the marker
+// fields, and after saveTrack completes.
+function vtRefreshSlotStates() {
+  const introVal = document.getElementById('f_intro_until_seconds').value;
+  const outroVal = document.getElementById('f_outro_starts_seconds').value;
+
+  const cases = [
+    { position: 'intro', value: introVal, btnId: 'vtRecordBtnIntro',
+      marker: 'intro_until',
+      liveText: (v) => `Fits within ${v.toFixed(1)}s intro window`,
+      emptyText: 'No intro_until marker — set it above before recording' },
+    { position: 'outro', value: outroVal, btnId: 'vtRecordBtnOutro',
+      marker: 'outro_starts',
+      liveText: (v) => `Fires at ${v.toFixed(1)}s`,
+      emptyText: 'No outro_starts marker — set it above before recording' },
+  ];
+
+  for (const c of cases) {
+    const btn = document.getElementById(c.btnId);
+    if (!btn) continue;
+    const ok = vtIsValidNumber(c.value);
+    btn.disabled = !ok;
+    const slot = document.querySelector(`.vt-slot[data-position="${c.position}"]`);
+    if (slot) {
+      const hint = slot.querySelector('.vt-slot-warn, .vt-slot-hint');
+      if (hint) {
+        if (ok) {
+          hint.textContent = c.liveText(parseFloat(c.value));
+          hint.className = 'vt-slot-hint';
+        } else {
+          hint.textContent = c.emptyText;
+          hint.className = 'vt-slot-warn';
+        }
+      }
+    }
+  }
+}
+
+// Wire input listeners + initial refresh on DOM ready.
+document.addEventListener('DOMContentLoaded', function () {
+  vtRefreshSlotStates();
+  ['f_intro_until_seconds', 'f_outro_starts_seconds'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.addEventListener('input', vtRefreshSlotStates);
+  });
+});
+
+async function vtEnsureMarkerCommitted(position) {
+  // If the marker for this position differs from what the server
+  // rendered, silently call saveTrack() so the row is up-to-date
+  // before the upload endpoint's marker check runs. Returns true on
+  // success (or no-op), false if the save failed.
+  const fieldId = position === 'intro' ? 'f_intro_until_seconds' : 'f_outro_starts_seconds';
+  const initial  = position === 'intro' ? VT_INITIAL_INTRO_UNTIL   : VT_INITIAL_OUTRO_STARTS;
+  const currentStr = document.getElementById(fieldId).value;
+  const current = vtIsValidNumber(currentStr) ? parseFloat(currentStr) : null;
+  if (current === initial) return true;
+  // Fire saveTrack() -- it's async and shows its own "Saved" toast.
+  // If saveTrack itself throws, catch and return false so the caller
+  // can bail cleanly without opening a broken modal.
+  try {
+    await saveTrack();
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+async function vtRecord(position) {
+  // Auto-commit the marker if the operator typed a value but hasn't
+  // clicked Save Changes yet -- otherwise the upload endpoint's
+  // "marker required" check would 400 on stale server state. This
+  // is a silent side-effect save (saveTrack shows its own toast).
+  // If save fails we bail out of opening the modal.
+  if (!await vtEnsureMarkerCommitted(position)) return;
+
   vtCurrentPosition = position;
   vtChunks = [];
   vtBlob = null;
