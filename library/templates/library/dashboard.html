@@ -613,6 +613,56 @@
     border-style: solid;
   }
 
+  /* Mobile: hide the always-visible row behind a single toggle button
+     -- FX carts are meant to be a targeted-use tool, not eat vertical
+     space on phones. When open, use ~50% button size so the whole
+     grid fits. Same rule for /remote-dj (which uses this template).
+     Breakpoint matches the other mobile rules already in this file. */
+  .fx-toggle-mobile { display: none; }
+  @media (max-width: 640px) {
+    .fx-panel .fx-row { display: none !important; }
+    .fx-panel.fx-mobile-open .fx-row { display: flex !important; }
+    .fx-toggle-mobile {
+      display: block;
+      width: 100%;
+      padding: 0.5rem;
+      background: var(--bg-darker);
+      color: var(--text-muted);
+      border: 1px solid var(--border-subtle);
+      border-radius: 6px;
+      font-family: inherit;
+      font-size: 0.85rem;
+      font-weight: 600;
+      cursor: pointer;
+      text-align: left;
+    }
+    .fx-panel.fx-mobile-open .fx-toggle-mobile {
+      border-bottom-left-radius: 0;
+      border-bottom-right-radius: 0;
+      margin-bottom: 0.35rem;
+    }
+    .fx-cart {
+      /* ~50% of desktop size */
+      min-width: 60px;
+      max-width: 100px;
+      height: 26px;
+      padding: 0 0.35rem;
+      font-size: 0.7rem;
+    }
+    .fx-cart-shortcut {
+      /* Shortcut chip usually shrinks off phones (there's no keyboard),
+         hide to buy label space. */
+      display: none;
+    }
+    .fx-more {
+      /* "More…" is redundant on mobile -- the toggle already gates
+         everything, and once open we show the full grid. */
+      display: none;
+    }
+    /* Show the extra row alongside the top row when mobile-open. */
+    .fx-panel.fx-mobile-open .fx-row-extra { display: flex !important; }
+  }
+
   .queue-insert-input {
     width: 100%;
     background: var(--bg-darker);
@@ -951,6 +1001,9 @@
 <div class="queue-panel" id="queuePanel">
   {% if fx_carts %}
   <div class="fx-panel" id="fxPanel">
+    <button type="button" class="fx-toggle-mobile" onclick="toggleFxPanelMobile()">
+      <span id="fxToggleMobileLabel">FX Carts ({{ fx_carts.count }}) ▼</span>
+    </button>
     <div class="fx-row" id="fxRowTop">
       {% for cart in fx_carts|slice:":8" %}
       <button class="fx-cart" data-cart-id="{{ cart.id }}"
@@ -1142,6 +1195,14 @@ function toggleFxMore() {
   extra.style.display = isOpen ? 'none' : 'flex';
   btn.classList.toggle('fx-more-active', !isOpen);
   btn.textContent = isOpen ? 'More…' : 'Fewer';
+}
+
+function toggleFxPanelMobile() {
+  const panel = document.getElementById('fxPanel');
+  const label = document.getElementById('fxToggleMobileLabel');
+  const open = panel.classList.toggle('fx-mobile-open');
+  const count = panel.querySelectorAll('.fx-cart').length;
+  label.textContent = 'FX Carts (' + count + ') ' + (open ? '▲' : '▼');
 }
 
 // Track live fires client-side so retrigger visual + keyboard shortcuts

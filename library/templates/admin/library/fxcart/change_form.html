@@ -1,0 +1,129 @@
+{% extends "admin/change_form.html" %}
+{% load static %}
+
+{# Override just to inject a drag-drop upload widget above the standard
+   change form. Drops POST to /api/fx/cart-upload/ which saves under
+   /srv/isadoraair/carts/ and returns the resulting path. The JS fills
+   that path into the #id_filepath input so a normal save writes it. #}
+
+{% block field_sets %}
+<div id="fxUploadPanel" style="margin-bottom:1.25rem; padding:0.75rem;
+     border:2px dashed #6b7280; border-radius:8px; text-align:center;
+     background:#1f2937; color:#e5e7eb; font-size:0.9rem;">
+  <div id="fxUploadPrompt">
+    <strong>Drag an audio file here</strong> to upload it into
+    <code>/srv/isadoraair/carts/</code>, or click to browse.<br>
+    <span style="opacity:0.7; font-size:0.85em;">
+      The path field below will fill in automatically. Save the form to keep it.
+      Supports MP3, MP2, FLAC, WAV, M4A, ALAC, OGG, AIFF.
+    </span>
+    <br><br>
+    <button type="button" id="fxUploadPickBtn"
+            style="padding:0.4rem 1rem; border:1px solid #6b7280;
+                    border-radius:6px; background:#374151; color:#e5e7eb;
+                    cursor:pointer; font-size:0.85rem;">
+      Choose file…
+    </button>
+    <input type="file" id="fxUploadInput" style="display:none;"
+           accept=".mp3,.mp2,.flac,.wav,.m4a,.alac,.ogg,.oga,.aiff,.aif">
+  </div>
+  <div id="fxUploadStatus" style="display:none; margin-top:0.4rem;"></div>
+</div>
+
+<script>
+(function () {
+  function getCookie(name) {
+    let val = null;
+    document.cookie.split(';').forEach(function (c) {
+      c = c.trim();
+      if (c.startsWith(name + '=')) val = decodeURIComponent(c.substring(name.length + 1));
+    });
+    return val;
+  }
+
+  const panel = document.getElementById('fxUploadPanel');
+  const promptEl = document.getElementById('fxUploadPrompt');
+  const statusEl = document.getElementById('fxUploadStatus');
+  const pickBtn = document.getElementById('fxUploadPickBtn');
+  const fileInput = document.getElementById('fxUploadInput');
+  const filepathInput = document.getElementById('id_filepath');
+
+  function say(html, colour) {
+    statusEl.style.display = 'block';
+    statusEl.style.color = colour || '#e5e7eb';
+    statusEl.innerHTML = html;
+  }
+
+  function bytesToKb(n) {
+    if (n < 1024) return n + ' B';
+    if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+    return (n / (1024 * 1024)).toFixed(2) + ' MB';
+  }
+
+  async function upload(file) {
+    if (!filepathInput) {
+      say('Cannot find the filepath field on this page.', '#f87171');
+      return;
+    }
+    say(`Uploading <strong>${file.name}</strong> (${bytesToKb(file.size)})…`);
+    const fd = new FormData();
+    fd.append('file', file);
+    try {
+      const resp = await fetch("/api/fx/cart-upload/", {
+        method: 'POST',
+        headers: { 'X-CSRFToken': getCookie('csrftoken') },
+        body: fd,
+      });
+      const data = await resp.json();
+      if (!resp.ok || data.error) {
+        say('Upload failed: ' + (data.error || `HTTP ${resp.status}`), '#f87171');
+        return;
+      }
+      filepathInput.value = data.filepath;
+      // Trigger change so any JS listening on the field runs.
+      filepathInput.dispatchEvent(new Event('change', {bubbles: true}));
+      say(
+        `Uploaded to <code>${data.filepath}</code> (${bytesToKb(data.size_bytes)}). ` +
+        `Click <strong>Save</strong> to persist.`,
+        '#86efac'
+      );
+    } catch (e) {
+      say('Network error: ' + e.message, '#f87171');
+    }
+  }
+
+  panel.addEventListener('click', function (e) {
+    if (e.target === pickBtn || e.target.closest('#fxUploadPickBtn')) {
+      fileInput.click();
+    }
+  });
+  panel.addEventListener('dragover', function (e) {
+    e.preventDefault();
+    panel.style.borderColor = '#60a5fa';
+    panel.style.background = '#111827';
+  });
+  panel.addEventListener('dragleave', function () {
+    panel.style.borderColor = '#6b7280';
+    panel.style.background = '#1f2937';
+  });
+  panel.addEventListener('drop', function (e) {
+    e.preventDefault();
+    panel.style.borderColor = '#6b7280';
+    panel.style.background = '#1f2937';
+    if (e.dataTransfer.files.length) {
+      upload(e.dataTransfer.files[0]);
+    } else {
+      say('That drop had no files. Drag from your file manager, not from a browser tab.', '#fbbf24');
+    }
+  });
+  fileInput.addEventListener('change', function () {
+    if (fileInput.files.length) {
+      upload(fileInput.files[0]);
+      fileInput.value = '';
+    }
+  });
+})();
+</script>
+
+{{ block.super }}
+{% endblock %}

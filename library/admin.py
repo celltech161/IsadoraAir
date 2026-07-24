@@ -1141,7 +1141,16 @@ class FXCartAdmin(admin.ModelAdmin):
     """One-shot cart definitions. Each row becomes a button on both the
     main dashboard and the remote-DJ console, ordered by sort_order.
     File-existence badge in the list view catches "file was deleted
-    but the row is still here" mistakes at a glance."""
+    but the row is still here" mistakes at a glance.
+
+    Change form is customized (admin/library/fxcart/change_form.html) to
+    surface a drag-drop upload widget above the standard fields --
+    dropped files land under /srv/isadoraair/carts/ via
+    /api/fx/cart-upload/ and the JS fills in the filepath input. Hard-
+    coded paths (typed into filepath directly) still work; the two
+    input methods coexist and neither is destructive to the other."""
+
+    change_form_template = "admin/library/fxcart/change_form.html"
 
     list_display = ["_badge", "name", "sort_order", "keyboard_shortcut",
                     "retrigger_mode", "gain_db", "enabled"]

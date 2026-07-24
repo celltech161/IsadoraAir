@@ -2004,6 +2004,66 @@ def remote_dj_page(request):
     })
 
 
+FX_CART_UPLOAD_DIR = Path("/srv/isadoraair/carts")
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def api_fx_cart_upload(request):
+    """Accept a single audio file, save it under FX_CART_UPLOAD_DIR
+    with a filesystem-safe name, and return the absolute path so the
+    admin form's drag-drop widget can drop it into FXCart.filepath.
+
+    Staff/superuser only -- placing files anywhere on the filesystem
+    is not something Contributor or remote_dj should be able to do.
+    Multiple uploads with the same name auto-suffix (' (1)', ' (2)',
+    ...) same as the /library/import/ pattern -- friendlier than
+    overwriting a cart that's already in rotation.
+
+    Format check is extension-only (no magic-byte sniff) since the
+    server has to trust its own admin-authorized uploaders anyway,
+    and mutagen at FXCart.save() time is the real validity gate for
+    'will this play' (bad files fail duration_seconds population and
+    show a ⚠ badge in the list view).
+    """
+    from library.management.commands.import_songs import SUPPORTED_EXT
+    if not (request.user.is_authenticated and (request.user.is_staff or request.user.is_superuser)):
+        return HttpResponseForbidden("Admin only.")
+    f = request.FILES.get("file")
+    if f is None:
+        return JsonResponse({"error": "No file uploaded"}, status=400)
+
+    from django.utils.text import get_valid_filename
+    original = get_valid_filename(f.name) or "cart.audio"
+    ext = Path(original).suffix.lower()
+    if ext not in SUPPORTED_EXT:
+        return JsonResponse({
+            "error": f"Unsupported extension {ext!r}. Allowed: {sorted(SUPPORTED_EXT)}",
+        }, status=400)
+
+    FX_CART_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    dest = FX_CART_UPLOAD_DIR / original
+    if dest.exists():
+        stem = Path(original).stem
+        n = 1
+        while True:
+            dest = FX_CART_UPLOAD_DIR / f"{stem} ({n}){ext}"
+            if not dest.exists():
+                break
+            n += 1
+
+    with open(dest, "wb") as out:
+        for chunk in f.chunks():
+            out.write(chunk)
+
+    return JsonResponse({
+        "ok": True,
+        "filepath": str(dest),
+        "filename": dest.name,
+        "size_bytes": dest.stat().st_size,
+    })
+
+
 @csrf_exempt
 @require_http_methods(["POST"])
 def api_fx_fire(request):
