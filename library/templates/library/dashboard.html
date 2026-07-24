@@ -537,10 +537,12 @@
   }
   .fx-row-extra { margin-top: 0.4rem; }
   .fx-cart {
-    /* button IS the progress bar. Idle color fills from --fx-idle;
-       when firing, a linear-gradient sweeps --fx-playing across from
-       left to right over the audio's duration. --fx-progress is set
-       from JS as the fire proceeds. Non-firing state = --fx-progress:0%. */
+    /* Button IS the progress bar. Background is idle color; a ::before
+       pseudo-element carries the playing color and grows from 0% width
+       to 100% width over the audio duration. `width` IS animatable
+       (unlike a CSS variable used inside a gradient stop, which needs
+       @property to interpolate). --fx-duration is set from JS so the
+       transition matches the file's real length. */
     position: relative;
     flex: 1 1 auto;
     min-width: 90px;
@@ -556,22 +558,25 @@
     cursor: pointer;
     overflow: hidden;
     text-align: center;
-    background:
-      linear-gradient(to right,
-        var(--fx-playing, var(--accent)) 0%,
-        var(--fx-playing, var(--accent)) var(--fx-progress, 0%),
-        var(--fx-idle, var(--bg-darker)) var(--fx-progress, 0%),
-        var(--fx-idle, var(--bg-darker)) 100%);
+    background: var(--fx-idle, var(--bg-darker));
     transition: filter 0.1s ease;
+  }
+  .fx-cart::before {
+    content: "";
+    position: absolute;
+    left: 0; top: 0; bottom: 0;
+    width: 0%;
+    background: var(--fx-playing, var(--accent));
+    z-index: 0;
+    pointer-events: none;
+    transition: width 0s linear;
+  }
+  .fx-cart.fx-firing::before {
+    width: 100%;
+    transition: width var(--fx-duration, 2s) linear;
   }
   .fx-cart:hover:not(.fx-firing) {
     filter: brightness(1.15);
-  }
-  .fx-cart.fx-firing {
-    /* Once JS sets fx-firing, transition --fx-progress smoothly from 0
-       to 100 over the audio duration (JS sets the CSS variable via
-       an inline style + transition-duration). */
-    transition: none;
   }
   .fx-cart-label {
     position: relative;   /* stack above the linear-gradient fill */
@@ -1146,11 +1151,12 @@ function toggleFxMore() {
 const _fxLive = {};
 
 function _fxStopVisual(btn, cartId) {
+  // Snap the ::before width back to 0% instantly. Removing the
+  // .fx-firing class also removes the "transition: width Ns linear"
+  // rule, and the base ::before rule uses `transition: width 0s linear`
+  // -- so the snapback is immediate rather than easing back down.
   btn.classList.remove('fx-firing');
-  btn.style.setProperty('--fx-progress', '0%');
-  btn.style.transitionProperty = '';
-  btn.style.transitionDuration = '';
-  btn.style.transitionTimingFunction = '';
+  btn.style.removeProperty('--fx-duration');
   if (_fxLive[cartId] && _fxLive[cartId].timeoutId) {
     clearTimeout(_fxLive[cartId].timeoutId);
   }
@@ -1158,16 +1164,13 @@ function _fxStopVisual(btn, cartId) {
 }
 
 function _fxStartVisual(btn, cartId, durationSec) {
-  btn.classList.add('fx-firing');
-  // Set --fx-progress to 0% first, then to 100% on the next frame so
-  // the transition actually runs (setting-then-setting in the same
-  // synchronous block collapses to just the final value).
-  btn.style.setProperty('--fx-progress', '0%');
-  btn.style.transitionProperty = '--fx-progress';
-  btn.style.transitionDuration = durationSec + 's';
-  btn.style.transitionTimingFunction = 'linear';
+  // Set duration first, then flip on the class in the next animation
+  // frame. Without the rAF, the browser can batch both changes into a
+  // single style recalc and skip the transition entirely -- classic
+  // "changed too fast" gotcha with CSS transitions.
+  btn.style.setProperty('--fx-duration', durationSec + 's');
   requestAnimationFrame(() => {
-    btn.style.setProperty('--fx-progress', '100%');
+    btn.classList.add('fx-firing');
   });
   const timeoutId = setTimeout(() => _fxStopVisual(btn, cartId), Math.max(50, durationSec * 1000));
   _fxLive[cartId] = { timeoutId, endsAt: Date.now() + durationSec * 1000 };
