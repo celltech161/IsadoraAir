@@ -375,6 +375,19 @@
   .np-countdown.warning { color: #d97706; }
   .np-countdown.critical { color: var(--danger); }
 
+  /* Preview deck: countdown shows effective airtime for the queued
+     track in the muted colour so it reads as standby -- looks the
+     same as the live countdown so the DJ's eye lands in the same
+     spot, but the different colour makes it obvious the number is
+     "will be" not "is now". Progress-bar row hidden (no elapsed
+     to display for a track that hasn't started yet). */
+  .deck-panel.deck-mode-preview .np-countdown {
+    color: var(--text-muted);
+  }
+  .deck-panel.deck-mode-preview .np-progress-wrap {
+    display: none;
+  }
+
   .np-progress-wrap {
     flex: 1;
     display: flex;
@@ -1932,8 +1945,15 @@ function renderDeckPreview(slot, track, serverTimestamp) {
     st.lastTrackId = null;
     document.getElementById(`playPauseBtn-${slot}`).disabled = true;
     document.getElementById(`ejectBtn-${slot}`).disabled = true;
-    document.querySelector(`#deck-${slot} .np-timing`).style.display = 'none';
+    // .np-timing stays visible in preview mode so the countdown slot
+    // can display effective airtime. Progress-wrap under the number
+    // is CSS-hidden for preview -- see .deck-mode-preview rule.
+    document.querySelector(`#deck-${slot} .np-timing`).style.display = '';
     document.getElementById(`npStartsAt-${slot}`).style.display = '';
+    // Countdown level classes carry over from a prior live state on
+    // the same slot -- strip them so the muted colour rule applies
+    // cleanly without warning/critical overriding it.
+    document.getElementById(`npCountdown-${slot}`).classList.remove('warning', 'critical');
   }
 
   const badge = document.getElementById(`transportBadge-${slot}`);
@@ -1956,6 +1976,14 @@ function renderDeckPreview(slot, track, serverTimestamp) {
     fmtEl.style.display = track.format ? '' : 'none';
     document.getElementById(`npTotal-${slot}`).textContent = fmtDur(track.duration);
   }
+
+  // Countdown shows effective airtime (next_start - cue_in). Falls
+  // back to full duration when the API didn't send airtime_seconds
+  // (older engine, or a track with no cue markers set at all).
+  const airtime = (track.airtime_seconds != null && track.airtime_seconds > 0)
+    ? track.airtime_seconds
+    : (track.duration || 0);
+  document.getElementById(`npCountdown-${slot}`).textContent = fmtDur(airtime);
 
   const startsAtEl = document.getElementById(`npStartsAt-${slot}`);
   if (startsAtEl) {

@@ -4305,19 +4305,28 @@ class PlaybackEngine:
             queue = []
             for qi in self._get_upcoming_preview():
                 qt = qi.track
+                # "Effective airtime" = the number of seconds a listener
+                # will actually hear this track for, from cue_in to
+                # next_start (or duration if next_start is unset). Same
+                # number the countdown on the Playing deck decays down
+                # from when this track goes live, so the preview deck
+                # UI can show the identical figure to prime the DJ.
+                q_effective_end = qt.next_start_seconds if qt.next_start_seconds is not None else (qt.duration_seconds or 0)
+                q_cue_in = qt.cue_in_seconds or 0
+                q_airtime = max(0.0, q_effective_end - q_cue_in)
                 queue.append({
                     "item_id": qi.id,
                     "track_id": qt.id,
                     "title": qt.title,
                     "artist": qt.artist.name if qt.artist else "",
                     "duration": qt.duration_seconds or 0,
+                    "airtime_seconds": round(q_airtime, 1),
                     "category": qt.category.code if qt.category else "",
                     "format": qt.format or "",
                     "fill_color": qt.category.kind.fill_color if qt.category else None,
                     "eta_seconds": round(eta, 1),
                 })
-                effective = qt.next_start_seconds if qt.next_start_seconds is not None else (qt.duration_seconds or 0)
-                eta += effective
+                eta += q_effective_end
 
             state = {
                 "transport": transport,
