@@ -379,6 +379,11 @@ class PlaybackEngine:
 
     def start(self):
         self.running = True
+        # Bookmark from previous instance MUST be read BEFORE the first
+        # _create_deck call (via _start_next_track), otherwise the deck
+        # gets built without the auto-resume seek and only a subsequent
+        # deck load (much later, at track boundary) picks up the hint.
+        self._read_resume_hint()
         self._build_main_pipeline()
         self._load_current_hour_log()
 
@@ -1625,6 +1630,23 @@ class PlaybackEngine:
 
         self._write_now_playing(track)
 
+        # Auto-resume: if the previous engine instance was mid-play on
+        # the same track (see _read_resume_hint), seek the fresh deck
+        # to that position after creation. Hint is consumed once --
+        # clearing on match OR mismatch so future deck loads follow
+        # their normal path. Unlike the pause-resume path (which sets
+        # resume_position_ns to skip silence prime), auto-resume keeps
+        # the silence prime intact and just seeks after the deck is
+        # linked -- matches what happens when we manually issue a seek
+        # from the /api/engine/seek/ endpoint against a running deck.
+        _auto_resume_position_ns = None
+        if resume_position_ns is None and getattr(self, "_resume_hint", None):
+            hint = self._resume_hint
+            if hint["track_id"] == track.id:
+                _auto_resume_position_ns = int(hint["position"] * Gst.SECOND)
+                print(f"  Auto-resuming deck [{slot}] at {hint['position']:.1f}s (track match)")
+            self._resume_hint = None
+
         src = Gst.ElementFactory.make("filesrc", None)
         src.set_property("location", filepath)
 
@@ -1807,6 +1829,23 @@ class PlaybackEngine:
         else:
             print(f"  [{slot}] Resumed: {track.artist.name if track.artist else '?'} - {track.title} at {start_offset:.1f}s")
 
+        # Auto-resume seek: fresh deck was just linked into the mixer,
+        # do the actual seek now that the pipeline can accept it. Uses
+        # FLUSH so any pre-decoded buffers get dropped -- otherwise we'd
+        # hear a tiny chunk from position 0 before the seek lands.
+        if _auto_resume_position_ns is not None:
+            try:
+                deck.pipeline.seek_simple(
+                    Gst.Format.TIME,
+                    Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT,
+                    _auto_resume_position_ns,
+                )
+                # started_at drives _get_deck_position; adjust it so
+                # UI position readouts line up with the audio.
+                deck.started_at = time.time() - (_auto_resume_position_ns / Gst.SECOND)
+            except Exception as exc:
+                print(f"  Auto-resume seek failed (non-fatal): {exc}")
+
         return deck
 
     def _warm_track_cache(self, log_item):
@@ -1910,6 +1949,39 @@ class PlaybackEngine:
             deck.finished = True
             if self.decks.get(deck.slot) is deck:
                 self.decks[deck.slot] = None
+
+    def _read_resume_hint(self):
+        """Look for a bookmark file left by the PREVIOUS engine instance
+        (STATE_PATH survives a service restart because it lives on the
+        tmpfs /run, which is only cleared on reboot). If it's fresh
+        (< 90s old), record the (track_id, position) of whatever was
+        playing so the FIRST matching deck load in _create_deck can
+        seek back to that spot -- turning an engine restart mid-song
+        into a ~1-2s dead-air gap instead of a "start next track from
+        scratch" jump.
+
+        Only bookmarks positions > 5s (a track that JUST started
+        doesn't need a seek), and only takes the first-found deck (in
+        practice only one deck is playing between crossfades)."""
+        self._resume_hint = None
+        try:
+            if not STATE_PATH.is_file():
+                return
+            age = time.time() - STATE_PATH.stat().st_mtime
+            if age > 90:
+                return
+            data = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+            for slot in ("A", "B"):
+                deck = (data.get("decks") or {}).get(slot)
+                if deck and deck.get("track_id") and deck.get("position", 0) > 5:
+                    self._resume_hint = {
+                        "track_id": deck["track_id"],
+                        "position": float(deck["position"]),
+                    }
+                    print(f"  Resume hint: track {deck['track_id']} at {deck['position']:.1f}s (age {age:.1f}s)")
+                    return
+        except Exception as exc:
+            print(f"  Resume hint read failed (non-fatal): {exc}")
 
     # ------------------------------------------------------------------
     # FX bus (one-shot audio carts / hotkeys)
@@ -2017,16 +2089,27 @@ class PlaybackEngine:
         decodebin = Gst.ElementFactory.make("decodebin", f"fx_decodebin_{fire_id}")
         convert = Gst.ElementFactory.make("audioconvert", f"fx_convert_{fire_id}")
         resample = Gst.ElementFactory.make("audioresample", f"fx_resample_{fire_id}")
+        # Force pipeline_sample_rate + stereo before joining the fx_submix.
+        # Without this capsfilter, audiomixer sees mismatched input caps
+        # (a mono 22050 Hz drop against a stereo 44100 Hz mixer output)
+        # and silently drops the input -- confirmed as the reason cart
+        # fires produced no audio during the first live test. Same pattern
+        # decks use to force stereo output before the master mixer.
+        fx_caps = Gst.ElementFactory.make("capsfilter", f"fx_caps_{fire_id}")
+        fx_caps.set_property("caps", Gst.Caps.from_string(
+            f"audio/x-raw,rate={self.pipeline_sample_rate},channels=2"
+        ))
         gain = Gst.ElementFactory.make("volume", f"fx_gain_{fire_id}")
         filesrc.set_property("location", cart.filepath)
         gain.set_property("volume", 10 ** ((cart.gain_db or 0.0) / 20.0))
 
-        for el in (filesrc, decodebin, convert, resample, gain):
+        for el in (filesrc, decodebin, convert, resample, fx_caps, gain):
             self.main_pipeline.add(el)
 
         filesrc.link(decodebin)
         convert.link(resample)
-        resample.link(gain)
+        resample.link(fx_caps)
+        fx_caps.link(gain)
 
         fx_pad = self.fx_submix.request_pad_simple("sink_%u")
         gain.get_static_pad("src").link(fx_pad)
@@ -2034,7 +2117,8 @@ class PlaybackEngine:
         state = {
             "cart_id": cart_id,
             "filesrc": filesrc, "decodebin": decodebin,
-            "convert": convert, "resample": resample, "gain": gain,
+            "convert": convert, "resample": resample,
+            "fx_caps": fx_caps, "gain": gain,
             "fx_pad": fx_pad,
             "started_at": time.time(),
         }
@@ -2044,13 +2128,20 @@ class PlaybackEngine:
         # decodebin's src pad only exists once it's had a chance to
         # sniff the file. Wire it into convert here rather than
         # pre-linking (which would fail with "no matching template").
+        # Filter for audio pads specifically -- matches the deck
+        # pattern; a video-carrying container (mp4 with cover art)
+        # would otherwise produce a non-audio pad we'd wrongly link.
         def _on_decodebin_pad_added(decodebin_el, new_pad, fire_id=fire_id):
-            if not new_pad.get_current_caps():
-                new_pad.query_caps(None)
+            caps = new_pad.get_current_caps() or new_pad.query_caps(None)
+            if caps and caps.get_size():
+                struct_name = caps.get_structure(0).get_name()
+                if not struct_name.startswith("audio"):
+                    return
             convert_sink = convert.get_static_pad("sink")
             if convert_sink.is_linked():
                 return
             new_pad.link(convert_sink)
+            print(f"  FX fire {fire_id}: decodebin linked ({struct_name if caps else 'unknown caps'})")
 
         decodebin.connect("pad-added", _on_decodebin_pad_added)
 
@@ -2061,7 +2152,7 @@ class PlaybackEngine:
         bus.connect("message::eos", self._fx_on_eos, fire_id)
 
         # State: PLAYING. Same order as _create_deck's sync_state pattern.
-        for el in (filesrc, decodebin, convert, resample, gain):
+        for el in (filesrc, decodebin, convert, resample, fx_caps, gain):
             el.sync_state_with_parent()
 
         print(f"  FX fire {fire_id}: cart {cart_id} ({cart.name!r})")
@@ -2091,15 +2182,15 @@ class PlaybackEngine:
             return
         try:
             for el in (state["filesrc"], state["decodebin"], state["convert"],
-                        state["resample"], state["gain"]):
+                        state["resample"], state["fx_caps"], state["gain"]):
                 el.set_state(Gst.State.NULL)
             try:
                 state["gain"].get_static_pad("src").unlink(state["fx_pad"])
             except Exception:
                 pass
             self.fx_submix.release_request_pad(state["fx_pad"])
-            for el in (state["gain"], state["resample"], state["convert"],
-                        state["decodebin"], state["filesrc"]):
+            for el in (state["gain"], state["fx_caps"], state["resample"],
+                        state["convert"], state["decodebin"], state["filesrc"]):
                 self.main_pipeline.remove(el)
         except Exception as exc:
             print(f"  FX teardown fire {fire_id} failed: {exc}")
