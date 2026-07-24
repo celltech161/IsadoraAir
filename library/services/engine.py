@@ -2114,6 +2114,18 @@ class PlaybackEngine:
         fx_pad = self.fx_submix.request_pad_simple("sink_%u")
         gain.get_static_pad("src").link(fx_pad)
 
+        # Running-time offset: the FX submixer has been alive since
+        # engine start (running for minutes/hours). A brand-new file
+        # source's buffers are timestamped starting at 0, which the
+        # mixer sees as "arrived way in the past" and drops entirely.
+        # Same fix _apply_pad_offset uses for decks -- set the src
+        # pad's offset to the pipeline's current running time so the
+        # mixer sees the buffers as "now" instead of ancient.
+        clock = self.main_pipeline.get_clock()
+        if clock:
+            running_time = clock.get_time() - self.main_pipeline.get_base_time()
+            gain.get_static_pad("src").set_offset(running_time)
+
         state = {
             "cart_id": cart_id,
             "filesrc": filesrc, "decodebin": decodebin,
