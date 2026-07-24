@@ -944,24 +944,6 @@
 </div>
 
 <div class="queue-panel" id="queuePanel">
-  <div class="queue-insert">
-    <div class="queue-insert-search-wrap">
-      <input type="text" class="queue-insert-input" id="queueInsertSearch"
-             placeholder="Search to add track...">
-      <div class="queue-insert-results" id="queueInsertResults"></div>
-    </div>
-    <div class="queue-insert-playnow">
-      <select class="playnow-select" id="playNowSelect">
-        <option value="">Play a playlist now...</option>
-        {% for pl in playlists %}
-        <option value="{{ pl.id }}">{{ pl.name }}</option>
-        {% endfor %}
-      </select>
-      <button class="playnow-btn" onclick="playNow()">Play Now</button>
-      <span class="playnow-msg" id="playNowMsg"></span>
-    </div>
-  </div>
-
   {% if fx_carts %}
   <div class="fx-panel" id="fxPanel">
     <div class="fx-row" id="fxRowTop">
@@ -997,6 +979,24 @@
     {% endif %}
   </div>
   {% endif %}
+
+  <div class="queue-insert">
+    <div class="queue-insert-search-wrap">
+      <input type="text" class="queue-insert-input" id="queueInsertSearch"
+             placeholder="Search to add track...">
+      <div class="queue-insert-results" id="queueInsertResults"></div>
+    </div>
+    <div class="queue-insert-playnow">
+      <select class="playnow-select" id="playNowSelect">
+        <option value="">Play a playlist now...</option>
+        {% for pl in playlists %}
+        <option value="{{ pl.id }}">{{ pl.name }}</option>
+        {% endfor %}
+      </select>
+      <button class="playnow-btn" onclick="playNow()">Play Now</button>
+      <span class="playnow-msg" id="playNowMsg"></span>
+    </div>
+  </div>
 
   <h3>Coming Up</h3>
   <div class="queue-table-wrap">
