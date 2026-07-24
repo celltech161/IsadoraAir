@@ -1,0 +1,10 @@
+[Unit]
+Description=Sample Icecast listener counts every minute for royalty-report ATH
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+Persistent=false
+
+[Install]
+WantedBy=timers.target

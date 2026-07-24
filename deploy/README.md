@@ -83,6 +83,7 @@ Timer-driven jobs (fire on a schedule, exit):
 | Unit | Runs |
 |---|---|
 | `isadoraair-analyze.timer` | Every minute — waveforms + cue points for new tracks |
+| `isadoraair-sample-icecast.timer` | Every minute — samples streaming-server listener counts for royalty-report ATH baseline (Icecast + Shoutcast 2). No-op if no enabled outbound encoders. |
 | `isadoraair-backup.timer` | Nightly full backup (03:30) — needs the `backup_isadoraair.sh` script and remote-target creds outside the repo |
 | `isadoraair-prune-emaillog.timer` | Daily (04:15) EmailLog retention prune, 90-day default |
 | `isadoraair-prune-systemevents.timer` | Daily (04:24) SystemEvent retention prune |

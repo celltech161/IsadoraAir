@@ -1,0 +1,11 @@
+[Unit]
+Description=IsadoraAir Icecast listener sampler (per-minute snapshot for royalty-report ATH baseline)
+After=network.target postgresql.service isadoraair-encoders.service
+
+[Service]
+Type=oneshot
+User=@@ISA_USER@@
+Group=@@ISA_USER@@
+WorkingDirectory=@@ISA_ROOT@@
+ExecStart=@@ISA_ROOT@@/venv/bin/python @@ISA_ROOT@@/manage.py sample_icecast_listeners
+EnvironmentFile=@@ISA_ROOT@@/.env

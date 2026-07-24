@@ -27,6 +27,7 @@ from django.core.management.base import BaseCommand, CommandError
 from library.models import RoyaltyReport
 from library.services.royalty_reports import (
     GENERATORS,
+    compute_ath,
     compute_stats,
     generate,
 )
@@ -45,6 +46,9 @@ class Command(BaseCommand):
                              help="Write to this file path in addition to stdout. Skip to write to stdout only.")
         parser.add_argument("--persist", action="store_true",
                              help="Save a RoyaltyReport row + a copy of the file for the /reports/ web page.")
+        parser.add_argument("--ath-override", type=float, default=None,
+                             help="Manual Aggregate Tuning Hours value for the NCE header. "
+                                  "If omitted, computed from IcecastSample rows in the period.")
 
     def handle(self, *args, **opts):
         try:
@@ -57,7 +61,8 @@ class Command(BaseCommand):
         last_day = calendar.monthrange(year, month)[1]
         period_end = datetime.date(year, month, last_day)
 
-        content, ext = generate(period_start, period_end, opts["format"])
+        ath_override = opts["ath_override"]
+        content, ext = generate(period_start, period_end, opts["format"], ath_override=ath_override)
 
         if opts["output"]:
             Path(opts["output"]).write_text(content, encoding="utf-8")
@@ -67,6 +72,8 @@ class Command(BaseCommand):
 
         if opts["persist"]:
             stats = compute_stats(period_start, period_end)
+            ath_computed = compute_ath(period_start, period_end)
+            ath_used = ath_override if ath_override is not None else ath_computed
             rr = RoyaltyReport(
                 period_start=period_start,
                 period_end=period_end,
@@ -75,6 +82,9 @@ class Command(BaseCommand):
                 unique_tracks=stats["unique_tracks"],
                 unique_artists=stats["unique_artists"],
                 plays_with_isrc=stats["plays_with_isrc"],
+                ath_computed=ath_computed,
+                ath_override=ath_override,
+                ath_used=ath_used,
             )
             fname = f"{period_start:%Y-%m}-{opts['format']}.{ext}"
             rr.file.save(fname, ContentFile(content.encode("utf-8")), save=False)

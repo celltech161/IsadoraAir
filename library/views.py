@@ -2678,8 +2678,23 @@ def api_reports_generate(request):
     except (ValueError, IndexError):
         return JsonResponse({"error": "month must be YYYY-MM"}, status=400)
 
-    content, ext = generate(period_start, period_end, fmt)
+    # ATH override (optional). Only meaningful for the NCE format,
+    # but pass through -- generate() ignores it for the others.
+    ath_override = body.get("ath_override")
+    if ath_override is not None:
+        try:
+            ath_override = float(ath_override)
+            if ath_override < 0:
+                raise ValueError("negative")
+        except (TypeError, ValueError):
+            return JsonResponse({"error": "ath_override must be a non-negative number"}, status=400)
+
+    content, ext = generate(period_start, period_end, fmt, ath_override=ath_override)
     stats = compute_stats(period_start, period_end)
+
+    from library.services.royalty_reports import compute_ath
+    ath_computed = compute_ath(period_start, period_end)
+    ath_used = ath_override if ath_override is not None else ath_computed
 
     rr = RoyaltyReport(
         period_start=period_start,
@@ -2690,6 +2705,9 @@ def api_reports_generate(request):
         unique_tracks=stats["unique_tracks"],
         unique_artists=stats["unique_artists"],
         plays_with_isrc=stats["plays_with_isrc"],
+        ath_computed=ath_computed,
+        ath_override=ath_override,
+        ath_used=ath_used,
     )
     fname = f"{period_start:%Y-%m}-{fmt}.{ext}"
     rr.file.save(fname, ContentFile(content.encode("utf-8")), save=False)

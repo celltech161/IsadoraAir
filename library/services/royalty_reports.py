@@ -87,17 +87,50 @@ def compute_stats(period_start, period_end):
     }
 
 
-def generate_soundexchange_nce(period_start, period_end):
+def compute_ath(period_start, period_end):
+    """Aggregate Tuning Hours derived from IcecastSample rows in the
+    period. Integrates listeners * dt across the period, where dt is
+    the actual time between consecutive samples (with a 1h cap to
+    defend against sampler outages). Returns 0.0 if there are no
+    samples at all in the period.
+
+    Not called if the operator supplies ath_override on the report
+    form -- the override wins."""
+    from library.models import IcecastSample
+    start, end = _period_bounds(period_start, period_end)
+    samples = list(
+        IcecastSample.objects
+        .filter(sampled_at__gte=start, sampled_at__lte=end)
+        .order_by("sampled_at")
+        .only("sampled_at", "listeners_total")
+    )
+    if not samples:
+        return 0.0
+    ath_seconds = 0.0
+    for i, s in enumerate(samples):
+        if i + 1 < len(samples):
+            dt = (samples[i + 1].sampled_at - s.sampled_at).total_seconds()
+        else:
+            dt = (end - s.sampled_at).total_seconds()
+        # Cap dt so a long gap (sampler outage, systemd stopped) can't
+        # inflate ATH from one over-weighted sample.
+        dt = min(max(dt, 0.0), 3600.0)
+        ath_seconds += s.listeners_total * dt
+    return ath_seconds / 3600.0
+
+
+def generate_soundexchange_nce(period_start, period_end, ath_override=None):
     """Return (text, extension) for a SoundExchange NCE Report of Use.
 
-    Real SoundExchange templates carry a header block identifying the
-    service, then aggregated per-track rows -- one line per unique
-    (title, artist, isrc-or-album+label) with a spin count. NCE
-    reporters using the ATH shortcut don't need per-listener
-    performances; a play frequency + total ATH is sufficient. ATH
-    integration (Phase 4) will add the header ATH line; today's
-    version emits '' in that slot so the operator can fill it in
-    manually until the Icecast pull lands."""
+    Header block: service provider, call letters, transmission
+    category, period, ATH, channel/program name. Body: per-unique-
+    track spin counts.
+
+    ATH source of truth: if ath_override is passed (from the /reports/
+    form's manual entry), that wins. Otherwise compute_ath() integrates
+    IcecastSample rows over the period. Zero if no samples exist
+    (fresh install pre-sampling, or a period before samples started).
+    """
 
     buf = io.StringIO()
     writer = csv.writer(buf)
@@ -107,6 +140,11 @@ def generate_soundexchange_nce(period_start, period_end):
     # closely follows the sample templates on soundexchange.com and
     # what small NCE stations report in practice. Adjust to the exact
     # template SoundExchange provides at registration time.
+    if ath_override is not None:
+        ath_value = float(ath_override)
+    else:
+        ath_value = compute_ath(period_start, period_end)
+
     writer.writerow([
         "Service Provider",
         "Call Letters",
@@ -122,7 +160,7 @@ def generate_soundexchange_nce(period_start, period_end):
         "C",  # C = noncommercial simulcast under 17 CFR 380
         period_start.isoformat(),
         period_end.isoformat(),
-        "",  # ATH -- filled by Phase 4 Icecast integration
+        f"{ath_value:.2f}" if ath_value else "",
         getattr(settings, "STATION_STREAM_NAME", ""),
     ])
     writer.writerow([])  # blank separator row
@@ -202,6 +240,17 @@ def generate_summary(period_start, period_end):
     seconds_qs = qs.values_list("duration_played_seconds", flat=True)
     total_seconds = sum(s for s in seconds_qs if s)
     lines.append(f"Total music airtime: {total_seconds/3600:.1f} hours")
+
+    ath = compute_ath(period_start, period_end)
+    from library.models import IcecastSample
+    sample_count = IcecastSample.objects.filter(
+        sampled_at__gte=_period_bounds(period_start, period_end)[0],
+        sampled_at__lte=_period_bounds(period_start, period_end)[1],
+    ).count()
+    lines.append(
+        f"Aggregate Tuning Hours (Icecast, {sample_count} samples): {ath:.2f}"
+        + (" -- no samples yet, sampler timer not running?" if not sample_count else "")
+    )
     lines.append("")
 
     # Under-threshold rows (short plays, skips) -- surfaced separately
@@ -285,8 +334,12 @@ GENERATORS = {
 }
 
 
-def generate(period_start, period_end, fmt):
-    """Dispatch entry point. Returns (content_text, file_extension)."""
+def generate(period_start, period_end, fmt, ath_override=None):
+    """Dispatch entry point. Returns (content_text, file_extension).
+    ath_override is only consumed by the soundexchange_nce generator;
+    other formats ignore it."""
     if fmt not in GENERATORS:
         raise ValueError(f"Unknown format: {fmt!r}. Choices: {list(GENERATORS)}")
+    if fmt == "soundexchange_nce":
+        return GENERATORS[fmt](period_start, period_end, ath_override=ath_override)
     return GENERATORS[fmt](period_start, period_end)

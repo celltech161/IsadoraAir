@@ -87,11 +87,15 @@
       </select>
     </div>
     <div>
+      <label for="rptAth">ATH override <span style="color:var(--text-muted); font-weight:normal;">(NCE only, optional)</span></label>
+      <input class="rpt-input" id="rptAth" type="number" step="0.01" min="0" placeholder="auto (Icecast samples)" style="width:11rem;">
+    </div>
+    <div>
       <button class="rpt-btn" id="rptGenerateBtn" onclick="generateReport()">Generate</button>
     </div>
   </div>
   <div class="rpt-hint">
-    SoundExchange NCE and Summary formats filter to Music-category-kind plays only, at the 30-second SoundExchange threshold. Raw CSV includes every PlayEvent in the period with no filter -- audit source only, not for submission.
+    SoundExchange NCE and Summary formats filter to Music-category-kind plays only, at the 30-second SoundExchange threshold. Raw CSV includes every PlayEvent in the period with no filter -- audit source only, not for submission. Aggregate Tuning Hours defaults to the value integrated from Icecast listener samples over the period; enter a manual override only if you're reconciling against Icecast's own admin panel or covering a period the sampler didn't run for.
   </div>
   <div class="rpt-status" id="rptStatus"></div>
 </div>
@@ -109,6 +113,7 @@
         <th class="num">Plays</th>
         <th class="num">Unique tracks</th>
         <th class="num">ISRC %</th>
+        <th class="num">ATH</th>
         <th>Download</th>
       </tr>
     </thead>
@@ -122,6 +127,13 @@
         <td class="num">{{ r.total_plays }}</td>
         <td class="num">{{ r.unique_tracks }}</td>
         <td class="num">{{ r.isrc_percent|floatformat:1 }}%</td>
+        <td class="num">
+          {% if r.ath_used is not None %}
+          {{ r.ath_used|floatformat:2 }}{% if r.ath_override is not None %}<span title="Manual override" style="color:var(--text-muted);">*</span>{% endif %}
+          {% else %}
+          <span class="rpt-hint">—</span>
+          {% endif %}
+        </td>
         <td>
           {% if r.file %}
           <a href="{% url 'library:reports-download' r.id %}">Download</a>
@@ -155,6 +167,18 @@ async function generateReport() {
   const status = document.getElementById('rptStatus');
   const month = document.getElementById('rptMonth').value;
   const fmt = document.getElementById('rptFormat').value;
+  const athRaw = document.getElementById('rptAth').value.trim();
+  const body = { month, format: fmt };
+  if (athRaw !== '') {
+    const athNum = parseFloat(athRaw);
+    if (!isFinite(athNum) || athNum < 0) {
+      status.className = 'rpt-status err';
+      status.textContent = 'ATH must be a non-negative number, or blank to auto-compute.';
+      status.style.display = 'block';
+      return;
+    }
+    body.ath_override = athNum;
+  }
   if (!month) {
     status.className = 'rpt-status err';
     status.textContent = 'Pick a month first.';
@@ -172,7 +196,7 @@ async function generateReport() {
         'Content-Type': 'application/json',
         'X-CSRFToken': getCookie('csrftoken'),
       },
-      body: JSON.stringify({ month, format: fmt }),
+      body: JSON.stringify(body),
     });
     const data = await resp.json();
     if (!resp.ok || data.error) {

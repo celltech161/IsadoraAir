@@ -1297,6 +1297,46 @@ class PlayEvent(models.Model):
         )
 
 
+class IcecastSample(models.Model):
+    """One point-in-time sample of Icecast listener counts, for
+    Aggregate Tuning Hours computation on royalty reports.
+
+    Written every minute by the sample_icecast_listeners management
+    command via isadoraair-sample-icecast.timer. One row per sample
+    (not per-mount) -- `listeners_by_mount` is a JSONField so a whole
+    server's mount table lands in a single row rather than N rows
+    every minute; per-mount rollups happen at report time.
+
+    ATH computation (library/services/royalty_reports.py compute_ath)
+    integrates listeners * dt across the reporting period, treating
+    each sample as instantaneous and its `listeners_total` as
+    representative until the next sample. Handles irregular sampling
+    gracefully by using the actual dt between consecutive samples,
+    capped at 1h to prevent a single sample from dominating after a
+    sampler outage. Missing samples for the full period returns 0.
+
+    Not admin-editable (would corrupt the ATH baseline).
+    Auto-pruned after 18 months by isadoraair-prune-icecast.timer --
+    same rationale as the EmailLog retention window; SoundExchange
+    audit lookback is typically 3 years but we snapshot the derived
+    ATH into each RoyaltyReport row at generation time, so the
+    underlying samples become disposable once a report is generated
+    for the period. Keep the timer disabled until we're comfortable
+    with the derived report accuracy."""
+
+    sampled_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    listeners_total = models.PositiveIntegerField(default=0)
+    listeners_by_mount = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        ordering = ["-sampled_at"]
+        verbose_name = "Icecast Listener Sample"
+        verbose_name_plural = "Icecast Listener Samples"
+
+    def __str__(self):
+        return f"{self.sampled_at:%Y-%m-%d %H:%M:%S} total={self.listeners_total}"
+
+
 class RoyaltyReport(models.Model):
     """Metadata + persisted output file for one generated royalty
     report. Written both by the management command (when invoked with
@@ -1341,6 +1381,17 @@ class RoyaltyReport(models.Model):
     unique_tracks = models.PositiveIntegerField(default=0)
     unique_artists = models.PositiveIntegerField(default=0)
     plays_with_isrc = models.PositiveIntegerField(default=0)
+
+    # Aggregate Tuning Hours embedded in the NCE report header. Either
+    # computed from IcecastSample rows in the period (ath_computed),
+    # or manually overridden by the operator on the /reports/ form
+    # (ath_override). If both present, override wins and ath_used
+    # reflects that. Kept as separate fields (not just one "ath")
+    # so an operator later checking a submitted report can see WHAT
+    # value went out and WHY -- was it computed or overridden?
+    ath_computed = models.FloatField(null=True, blank=True)
+    ath_override = models.FloatField(null=True, blank=True)
+    ath_used = models.FloatField(null=True, blank=True)
 
     file = models.FileField(upload_to="royalty_reports/", blank=True, null=True)
 
