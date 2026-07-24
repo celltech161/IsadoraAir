@@ -854,10 +854,21 @@ async function vtModalRecord() {
   const status = document.getElementById('vtModalStatus');
   try {
     const stream = await navigator.mediaDevices.getUserMedia({
+      // All three DSP passes forced OFF via the strict {exact: false}
+      // form. Browsers can silently ignore a plain `false` on an
+      // audio constraint and enable the DSP anyway ("we know better
+      // than you do"); {exact: false} is the strict-constraint form
+      // that forces them to honor it. Same pattern the remote-DJ
+      // mic capture on dashboard.html uses. Rationale: VT audio is
+      // going straight into the on-air chain -- automatic gain
+      // reshaping mid-take produces pumping, noise suppression
+      // gates sibilants unpredictably, and echo cancellation
+      // strips low-frequency room tone. Anything the operator
+      // wants adjusted is done deliberately in the editor.
       audio: {
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: false,   // keep raw levels; we can normalize at editor time
+        echoCancellation: { exact: false },
+        noiseSuppression: { exact: false },
+        autoGainControl:  { exact: false },
       },
     });
     vtMediaRecorder = new MediaRecorder(stream);
