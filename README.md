@@ -204,7 +204,7 @@ IsadoraAir (Django 5.2 LTS)
 
 ```bash
 # Clone
-git clone git@github.com:celltech161/isadoraair.git /opt/isadoraair
+git clone git@github.com:celltech161/IsadoraAir.git /opt/isadoraair
 cd /opt/isadoraair
 
 # System packages the playback engine needs (GStreamer + PyGObject bindings,
