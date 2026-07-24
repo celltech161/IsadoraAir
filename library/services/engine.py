@@ -24,7 +24,7 @@ from django.db import close_old_connections
 from django.db.models import F
 from django.utils import timezone
 from hardware.models import AudioInput, AudioOutput, AudioPipeline, DuckingConfig, RemoteDJAudioInput
-from library.models import Category, FXBusConfig, FXCart, LogItem, PlayEvent, PlaylistLog, RemoteDJConfig, Track
+from library.models import Category, FXBusConfig, FXCart, LogItem, PlayEvent, PlaylistLog, RemoteDJConfig, Track, VoiceTrack, VoiceTrackConfig
 from monitoring.models import emit_event
 from library.services.log_builder import (
     DURATION_FIT_MARGIN,
@@ -937,10 +937,18 @@ class PlaybackEngine:
         # is ever linked, exactly like audiomixer already does today
         # with only one deck active).
         self.duck_gain = Gst.ElementFactory.make("volume", "duck_gain")
+        # vt_duck_gain sits between the deck bus (mixer) and duck_gain
+        # -- a dedicated volume element for VT-driven ducking, distinct
+        # from the mic/remote-DJ duck_gain so the two ducking policies
+        # can be tuned independently. Starts at unity (1.0); the VT
+        # state machine ramps it down when a VT fires and back up when
+        # the sequence completes. See _vt_ramp_duck / _vt_apply_duck.
+        self.vt_duck_gain = Gst.ElementFactory.make("volume", "vt_duck_gain")
+        self.vt_duck_gain.set_property("volume", 1.0)
         self.master_mixer = Gst.ElementFactory.make("audiomixer", "master_mixer")
 
         elements = [
-            self.mixer, self.duck_gain, self.master_mixer, convert, resample, capsfilter,
+            self.mixer, self.vt_duck_gain, self.duck_gain, self.master_mixer, convert, resample, capsfilter,
             self.program_gain, self.output_level,
             self.agc_dynamic, self.agc_makeup, self.agc_limiter,
             self.alsasink,
@@ -1074,7 +1082,8 @@ class PlaybackEngine:
         for el in elements:
             self.main_pipeline.add(el)
 
-        self.mixer.link(self.duck_gain)
+        self.mixer.link(self.vt_duck_gain)
+        self.vt_duck_gain.link(self.duck_gain)
         duck_pad = self.master_mixer.request_pad_simple("sink_%u")
         if self.remote_dj_tee:
             self.duck_gain.get_static_pad("src").link(remote_dj_fixate_caps.get_static_pad("sink"))
@@ -2308,6 +2317,15 @@ class PlaybackEngine:
                 # Volume-only reload; polyphony cap changes need a restart
                 # because the fx_submix pool sizing is set at build.
                 self._fx_apply_volume()
+            elif cmd == "reload_voicetrack_config":
+                # Duck depth / ramp / gap reads happen at fire time, so
+                # a config change lands on the very next VT sequence
+                # without a restart. This handler is a no-op today --
+                # kept for API symmetry with reload_fx_config and to
+                # give the admin form a Save button that isn't
+                # misleading. Behavior belongs in _vt_* helpers (Phase
+                # 1d-ii).
+                pass
         except Exception as exc:
             print(f"  Command error: {exc}")
 
