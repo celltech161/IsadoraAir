@@ -285,7 +285,7 @@ Actively running end-to-end on a live station: schedule → log builder → play
 
 Things a station operator might expect that IsadoraAir doesn't ship today. Some are on the near-term roadmap, some are permanent non-goals; both are called out so you know what you're getting:
 
-- **EAS (Emergency Alert System)** — permanently external. Compliant EAS is always a hardware ENDEC (Sage/DASDEC/Trilithic) that inserts into the audio chain physically upstream of automation, so the alert reaches air even if the automation box is down. Vendor-side software EAS exists in development form but has no FCC approval as of this writing; when a software path becomes a compliant option, IsadoraAir intends to be an early adopter.
+- **EAS (Emergency Alert System)** — permanently external. Compliant EAS is always a hardware ENDEC (Sage/DASDEC/Trilithic) that inserts into the audio chain physically upstream of automation, so the alert reaches air even if the automation box is down. Vendor-side software EAS exists in development form but has no FCC approval as of this writing; when a software path becomes a compliant option, IsadoraAir intends to be an early adopter (SAGE-- If you're reading this hit us up!).
 - **Voice tracking** — pre-recorded DJ segments dropped between specific tracks so an automated hour sounds hosted. Planned, not yet implemented.
 - **Commercial-style traffic** — underwriting spot scheduling, affidavit reports, PSA rotation tracking. The current "Traffic" admin section is programming-side (Rotations, Playlists, ScheduleBlocks), not spot-side. Planned.
 - **Cart wall / instant hot keys** — one-click drops/stingers/jingles for live-assist. Planned.
