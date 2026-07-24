@@ -91,6 +91,14 @@ IsadoraAir manages the full music library, schedule programming, playlist genera
 - Email (and SMS-via-carrier-gateway) alerting with per-check debounce and cooldown
 - Transmitter integration (Aquabroadcast COBALT) for forward/reverse power, VSWR, PA temperature, fan speed, and RF interlock
 
+**Royalty Reporting** (Reports frontend + `royalty_report` command)
+- SoundExchange NCE Report of Use generator — per-unique-track spin counts with ISRC, album, marketing label, aggregate tuning hours, and a service-identifier header block. Music-category-kind plays only, 30-second SoundExchange threshold applied at query time. Also produces a human-readable summary format for eyeballing before submission, and a raw-CSV audit dump of every PlayEvent.
+- Append-only `PlayEvent` evidence ledger — written by the playback engine at deck creation and closed out at deck removal. Snapshotted fields (title, artist, album, label, ISRC, category kind) are immutable once written so a downstream track rename or delete can't corrupt historical rows. Retention: 3 years by default (SoundExchange's typical audit lookback), auto-pruned by `isadoraair-prune-royalty-ledger.timer`.
+- `Track.isrc` field auto-populated from ID3 TSRC / Vorbis ISRC tags at import; the `backfill_isrc` command re-reads existing library files; the `backfill_isrc_musicbrainz` command queries MusicBrainz for tracks with no tag ISRC using artist + title + album + duration matching (single-candidate confidence required unless `--allow-ambiguous` is passed).
+- Aggregate Tuning Hours computed automatically from per-minute Icecast / Shoutcast listener samples (`isadoraair-sample-icecast.timer`) integrated across the reporting period with irregular-sample handling and outage caps. Manual override supported for reconciliation against a stream host's own admin panel.
+- `/reports/` web page (staff-only) with a month picker, format selector, ATH-override input, and a table of past reports showing ATH, ISRC coverage, and one-click download. Persisted `RoyaltyReport` archive lives on disk forever with a metadata row for audit trail.
+- Station identity for the NCE header row lives in a `StationInfo` admin singleton (Config → Station Info) — legal name, call letters, stream/program name. TuneIn credentials likewise in a `TuneInConfig` singleton (Config → TuneIn AIR). No `.env` editing required to change either.
+
 **Admin & Configuration**
 - Django admin, organized into Library / Traffic / Config / Logs sections so unrelated models don't all pile into one bucket
 - Analysis Configuration (cue-in/next-start dBFS thresholds), Recency Configuration, Log Fill Configuration, Remote DJ Configuration (STUN server, ICE UDP port range, gain)
@@ -106,6 +114,7 @@ IsadoraAir manages the full music library, schedule programming, playlist genera
 - Syndicated program ingestion framework: any external audio program can be pulled from its source, tagged (with artwork where available), and delivered into a rotation category on its own broadcast schedule. Each show is a `syndicated-<slug>.timer`/`.service` pair paired with a small per-source fetcher script; the framework handles metadata, categorization, file placement, and the ready2air gate. Per-source fetchers live outside this repo since they typically carry feed URLs, credentials, or scraping logic specific to each provider. The KOGR-LP install runs 20+ syndicated shows through this framework
 - Weather integration: NWS-sourced current temperature, one-day and three-day forecasts feeding RadioText messages via the RBDS client, plus alert beeps for active watches/warnings played straight to a dedicated ALSA loopback into StereoTool — bypasses the playback engine so alerts still fire during a manual override or engine restart
 - Bluesky auto-poster: now-playing metadata pushed to a configured Bluesky account every 2 minutes, with de-duplication so an unchanged track doesn't re-post
+- TuneIn AIR now-playing pusher: hits TuneIn's broadcaster metadata API on every track change with one HTTP call per song start (respects their explicit "do not use a timer to submit a song" rule by deduping on PlayEvent id — the timer fires every 30s but only makes an outbound call when the current PlayEvent id differs from the last successful push). `commercial=true` set automatically for Spot-category plays. Credentials in Config → TuneIn AIR
 - `ogremote` receiver: **ogremote is a separate newsgathering / voiceover tool that is not part of this project** — it runs on its own box and produces content to be aired. IsadoraAir ships only the receiving-side integration: polls for available uploads and dispatches urgent-replay drops into the library. Optional; disable the two `ogremote-*.timer` units if you're not running ogremote upstream
 
 ## Architecture
@@ -265,9 +274,10 @@ ogremote-ingest companion projects.
 | 5. Live dashboard | Complete — dual-deck view, full-hour queue with drag-reorder + force-next, click-to-seek waveform, manual overrides |
 | 6. Streaming, RDS & monitoring | Complete — Icecast/Shoutcast relay, StereoTool RBDS client, system/transmitter health checks with alerting |
 | 7. Studio mic + ducking | Complete — dashboard PTT, dynamically-enumerated hardware mixer controls, graceful ducking of program audio |
-| 8. Content ingestion | Complete — 20+ syndicated shows on real schedules, weather data + alerts, Bluesky auto-poster |
+| 8. Content ingestion | Complete — 20+ syndicated shows on real schedules, weather data + alerts, Bluesky auto-poster, TuneIn AIR now-playing push |
 | 9. Remote DJ over WebRTC | Complete — browser-based remote console, mix-minus monitor return, gated remote mic, full queue authority for the connected DJ |
 | 10. Email + admin infrastructure | Complete — EmailLog transport-layer capture, invite/reset flows, admin-editable nav menu, django-axes lockout |
+| 11. Royalty reporting | Complete — PlayEvent evidence ledger, SoundExchange NCE / summary / raw-CSV generators, /reports/ frontend, ISRC auto-populate from tags + MusicBrainz backfill, ATH computed from Icecast/Shoutcast listener samples with manual override, 3-year retention prune |
 
 Actively running end-to-end on a live station: schedule → log builder → playback engine → StereoTool → transmitter, plus live streaming, RDS, monitoring, remote DJ, and content ingestion.
 
@@ -277,7 +287,6 @@ Things a station operator might expect that IsadoraAir doesn't ship today. Some 
 
 - **EAS (Emergency Alert System)** — permanently external. Compliant EAS is always a hardware ENDEC (Sage/DASDEC/Trilithic) that inserts into the audio chain physically upstream of automation, so the alert reaches air even if the automation box is down. Vendor-side software EAS exists in development form but has no FCC approval as of this writing; when a software path becomes a compliant option, IsadoraAir intends to be an early adopter.
 - **Voice tracking** — pre-recorded DJ segments dropped between specific tracks so an automated hour sounds hosted. Planned, not yet implemented.
-- **Royalty / SoundExchange reporting** — statutory-license logs for non-commercial webcasters. `PlaylistLog` already captures what played and when; the export side is the near-term next feature.
 - **Commercial-style traffic** — underwriting spot scheduling, affidavit reports, PSA rotation tracking. The current "Traffic" admin section is programming-side (Rotations, Playlists, ScheduleBlocks), not spot-side. Planned.
 - **Cart wall / instant hot keys** — one-click drops/stingers/jingles for live-assist. Planned.
 
