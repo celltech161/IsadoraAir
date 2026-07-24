@@ -3988,13 +3988,13 @@ class PlaybackEngine:
                 # _next_triggered=True on entry, which suppresses the
                 # normal trigger below for the remainder of the
                 # transition.
-                outro_start = deck.track.outro_starts_seconds
+                outro_start = leading.track.outro_starts_seconds
                 if (outro_start is not None
                         and pos >= outro_start
                         and self._vt.get("phase") == "idle"
                         and not self._next_triggered
                         and not self.manual_mode):
-                    self._vt_maybe_enter(deck)
+                    self._vt_maybe_enter(leading)
 
                 if not self._next_triggered and pos >= trigger_point:
                     if self.manual_mode:
