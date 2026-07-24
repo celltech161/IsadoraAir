@@ -77,6 +77,7 @@ urlpatterns = [
     path('api/voicetrack/upload/', views.api_voicetrack_upload, name='api-voicetrack-upload'),
     path('api/voicetrack/<int:pk>/audio/', views.api_voicetrack_audio, name='api-voicetrack-audio'),
     path('api/voicetrack/<int:pk>/delete/', views.api_voicetrack_delete, name='api-voicetrack-delete'),
+    path('api/voicetrack/<int:pk>/save-edited/', views.api_voicetrack_save_edited, name='api-voicetrack-save-edited'),
     path('remote-dj/', views.remote_dj_page, name='remote-dj'),
     path('reports/', views.reports_page, name='reports'),
     path('reports/<int:pk>/download/', views.reports_download, name='reports-download'),

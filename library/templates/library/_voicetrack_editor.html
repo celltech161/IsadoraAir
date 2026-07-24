@@ -1,0 +1,733 @@
+{# Reusable VT editor modal + shared JS. Included by voicetracks.html and
+   track_detail.html. Both pages call vtEditorOpen(id, audioUrl, title). #}
+
+<style>
+  .vted-modal {
+    position: fixed; inset: 0; z-index: 1050;
+    background: rgba(0,0,0,0.85);
+    display: flex; align-items: center; justify-content: center;
+    padding: 1rem;
+  }
+  .vted-panel {
+    background: var(--bg-mid);
+    border: 1px solid var(--border-subtle);
+    border-radius: 12px;
+    padding: 1rem;
+    width: 100%;
+    max-width: 900px;
+    box-shadow: 0 30px 80px rgba(0,0,0,0.6);
+    display: flex; flex-direction: column; gap: 0.75rem;
+  }
+  .vted-header {
+    display: flex; justify-content: space-between; align-items: baseline;
+  }
+  .vted-title { font-size: 1.05rem; font-weight: 600; }
+  .vted-chip {
+    font-size: 0.72rem; padding: 2px 8px; border-radius: 999px;
+    background: var(--bg-darker); color: var(--text-muted);
+    text-transform: uppercase; letter-spacing: 0.04em;
+  }
+  .vted-chip.dirty { background: rgba(251, 191, 36, 0.25); color: #fbbf24; }
+  .vted-chip.playing { background: rgba(34, 197, 94, 0.25); color: #86efac; }
+
+  .vted-canvas-wrap {
+    position: relative;
+    background: var(--bg-darker);
+    border: 1px solid var(--border-subtle);
+    border-radius: 6px;
+    height: 200px;
+    overflow: hidden;
+    cursor: crosshair;
+  }
+  .vted-canvas-wrap.panning { cursor: grabbing; }
+  .vted-canvas { position: absolute; inset: 0; width: 100%; height: 100%; }
+  .vted-status {
+    color: var(--text-muted); font-size: 0.78rem;
+    text-align: center;
+  }
+
+  .vted-transport {
+    display: flex; gap: 0.4rem; justify-content: center; align-items: center;
+    padding: 0.4rem 0;
+  }
+  .vted-btn {
+    background: var(--bg-darker);
+    border: 1px solid var(--border-subtle);
+    color: var(--text-main);
+    font-family: inherit;
+    font-size: 0.85rem;
+    padding: 0.4rem 0.85rem;
+    border-radius: 5px;
+    cursor: pointer;
+  }
+  .vted-btn:hover:not([disabled]) { filter: brightness(1.15); }
+  .vted-btn[disabled] { opacity: 0.4; cursor: not-allowed; }
+  .vted-btn.primary { background: var(--accent); color: var(--bg-darkest); border-color: transparent; font-weight: 600; }
+  .vted-btn.danger { color: #f88; }
+  .vted-btn.warn  { color: #fbbf24; }
+
+  .vted-times {
+    display: flex; justify-content: space-between;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 0.8rem; color: var(--text-muted);
+  }
+
+  .vted-trim-row {
+    display: grid;
+    grid-template-columns: 100px 1fr;
+    gap: 0.5rem 0.6rem;
+    align-items: center;
+    padding: 0.4rem;
+    background: var(--bg-darker);
+    border-radius: 6px;
+  }
+  .vted-trim-row label {
+    font-size: 0.75rem; color: var(--text-muted);
+  }
+  .vted-trim-row input[type=range] {
+    width: 100%;
+  }
+  .vted-trim-controls { display: flex; gap: 0.4rem; justify-content: center; }
+
+  .vted-footer {
+    display: flex; justify-content: space-between; align-items: center;
+    padding-top: 0.5rem; border-top: 1px solid var(--border-subtle);
+  }
+  .vted-footer .actions { display: flex; gap: 0.4rem; }
+</style>
+
+<div class="vted-modal" id="vtedModal" style="display:none;">
+  <div class="vted-panel">
+    <div class="vted-header">
+      <div>
+        <div class="vted-title" id="vtedTitle">Voice Track Editor</div>
+        <div class="vted-status" id="vtedStatus">Loading...</div>
+      </div>
+      <div>
+        <span class="vted-chip" id="vtedStateChip">ready</span>
+      </div>
+    </div>
+
+    <div class="vted-canvas-wrap" id="vtedCanvasWrap">
+      <canvas class="vted-canvas" id="vtedCanvas"></canvas>
+    </div>
+
+    <div class="vted-times">
+      <span>Playhead: <span id="vtedPlayhead">00:00.000</span></span>
+      <span>View: <span id="vtedView">—</span></span>
+      <span>Length: <span id="vtedLength">00:00.000</span></span>
+    </div>
+
+    <div class="vted-transport">
+      <button type="button" class="vted-btn" onclick="vtedPlay()">▶ Play</button>
+      <button type="button" class="vted-btn" onclick="vtedPause()">❚❚ Pause</button>
+      <button type="button" class="vted-btn" onclick="vtedStop()">■ Stop</button>
+      <button type="button" class="vted-btn" onclick="vtedZoomReset()" title="Fit whole clip">Zoom Fit</button>
+    </div>
+
+    <div class="vted-trim-row">
+      <label for="vtedTrimStart">Trim start</label>
+      <input type="range" id="vtedTrimStart" min="0" max="1000" value="0" step="1">
+      <label for="vtedTrimEnd">Trim end</label>
+      <input type="range" id="vtedTrimEnd" min="0" max="1000" value="1000" step="1">
+      <div style="grid-column: 1 / -1;" class="vted-trim-controls">
+        <button type="button" class="vted-btn" id="vtedTrimModeBtn" onclick="vtedToggleTrimMode()">Mode: Keep selection</button>
+        <button type="button" class="vted-btn primary" onclick="vtedApplyTrim()">Apply trim</button>
+        <button type="button" class="vted-btn" id="vtedUndoBtn" onclick="vtedUndo()" disabled>Undo</button>
+        <button type="button" class="vted-btn warn" onclick="vtedNormalize()">Normalize</button>
+      </div>
+    </div>
+
+    <div class="vted-footer">
+      <div class="vted-status">
+        <span id="vtedFooterMsg">Zoom: mousewheel. Pan: Alt+drag. Click waveform to move playhead.</span>
+      </div>
+      <div class="actions">
+        <button type="button" class="vted-btn" onclick="vtedDiscardAndClose()">Discard</button>
+        <button type="button" class="vted-btn primary" onclick="vtedSaveAndClose()">Save &amp; Close</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+// ============================================================
+// Voice Track Editor
+// Ported patterns from OGRemote's editor.html: mono/stereo aware
+// waveform, keep/delete trim modes, undo stack, peak normalize,
+// audioBufferToWav for upload. Simplified: destructive save (no
+// separate "return to caller" handoff since we live in a modal on
+// the same page).
+// ============================================================
+(function () {
+  const state = {
+    vtId: null,
+    onSaved: null,          // callback (newDurationSec) => void
+    ctx: null,
+    buffer: null,           // current AudioBuffer
+    undoStack: [],           // buffers we can pop back to (cap 5)
+    audioEl: null,
+    blobUrl: null,
+    playing: false,
+    dirty: false,
+    canvas: null,
+    canvasCtx: null,
+    playhead: 0,             // seconds
+    trimStart: 0,            // seconds (yellow)
+    trimEnd: null,           // seconds (orange); null = end-of-clip
+    trimMode: 'keep',
+    viewStart: 0,            // seconds visible left edge
+    viewEnd: null,           // seconds visible right edge (null = end-of-clip)
+    panning: false,
+    panLastX: 0,
+    pinchLastDist: null,
+  };
+
+  const UNDO_CAP = 5;
+
+  function fmt(t) {
+    if (!isFinite(t) || t < 0) return '00:00.000';
+    const m = Math.floor(t / 60);
+    const s = Math.floor(t % 60);
+    const ms = Math.floor((t - Math.floor(t)) * 1000);
+    return String(m).padStart(2, '0') + ':' + String(s).padStart(2, '0') + '.' + String(ms).padStart(3, '0');
+  }
+  function ensureCtx() {
+    if (!state.ctx) state.ctx = new (window.AudioContext || window.webkitAudioContext)();
+    return state.ctx;
+  }
+
+  window.vtEditorOpen = async function (vtId, audioUrl, title, onSavedCb) {
+    state.vtId = vtId;
+    state.onSaved = onSavedCb || null;
+    state.undoStack = [];
+    state.playing = false;
+    state.dirty = false;
+    state.viewStart = 0;
+    state.viewEnd = null;
+    state.trimStart = 0;
+    state.trimEnd = null;
+    state.playhead = 0;
+    state.trimMode = 'keep';
+    document.getElementById('vtedTitle').textContent = title || 'Voice Track Editor';
+    document.getElementById('vtedStatus').textContent = 'Loading audio...';
+    document.getElementById('vtedModal').style.display = 'flex';
+    setStateChip('loading', 'loading');
+
+    state.canvas = document.getElementById('vtedCanvas');
+    state.canvasCtx = state.canvas.getContext('2d');
+    resizeCanvas();
+    window.addEventListener('resize', resizeCanvas);
+
+    if (!state.audioEl) {
+      state.audioEl = new Audio();
+      state.audioEl.addEventListener('play', () => { state.playing = true; setStateChip('playing', 'playing'); tickAnim(); });
+      state.audioEl.addEventListener('pause', () => { state.playing = false; setStateChip('ready', state.dirty ? 'dirty' : 'ready'); });
+      state.audioEl.addEventListener('ended', () => {
+        state.playing = false;
+        state.playhead = 0;
+        setStateChip('ready', state.dirty ? 'dirty' : 'ready');
+        render();
+      });
+      state.audioEl.addEventListener('timeupdate', () => {
+        // Stop at trim_end if a keep-selection is armed and playing
+        if (state.trimEnd !== null && state.audioEl.currentTime >= state.trimEnd) {
+          state.audioEl.pause();
+          state.audioEl.currentTime = state.trimEnd;
+        }
+        state.playhead = state.audioEl.currentTime;
+      });
+    }
+
+    try {
+      const resp = await fetch(audioUrl);
+      const buf = await resp.arrayBuffer();
+      const ac = ensureCtx();
+      state.buffer = await ac.decodeAudioData(buf.slice(0));
+      state.trimEnd = state.buffer.duration;
+      state.viewEnd = state.buffer.duration;
+      updateSliderRange();
+      refreshAudioEl();
+      document.getElementById('vtedStatus').textContent = 'Ready. Trim / normalize / preview / save.';
+      document.getElementById('vtedLength').textContent = fmt(state.buffer.duration);
+      setStateChip('ready', 'ready');
+      render();
+    } catch (e) {
+      document.getElementById('vtedStatus').textContent = 'Load failed: ' + e.message;
+      setStateChip('error', 'dirty');
+    }
+  };
+
+  function setStateChip(text, cls) {
+    const el = document.getElementById('vtedStateChip');
+    el.textContent = text;
+    el.classList.remove('dirty', 'playing');
+    if (cls === 'dirty') el.classList.add('dirty');
+    if (cls === 'playing') el.classList.add('playing');
+  }
+
+  function resizeCanvas() {
+    if (!state.canvas) return;
+    const wrap = state.canvas.parentElement;
+    const dpr = window.devicePixelRatio || 1;
+    state.canvas.width = wrap.clientWidth * dpr;
+    state.canvas.height = wrap.clientHeight * dpr;
+    state.canvas.style.width = wrap.clientWidth + 'px';
+    state.canvas.style.height = wrap.clientHeight + 'px';
+    state.canvasCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    render();
+  }
+
+  function updateSliderRange() {
+    if (!state.buffer) return;
+    const ts = document.getElementById('vtedTrimStart');
+    const te = document.getElementById('vtedTrimEnd');
+    // Sliders are 0..1000 for smooth resolution regardless of duration.
+    ts.value = Math.round((state.trimStart / state.buffer.duration) * 1000);
+    te.value = Math.round((state.trimEnd / state.buffer.duration) * 1000);
+    ts.oninput = () => {
+      state.trimStart = (parseInt(ts.value, 10) / 1000) * state.buffer.duration;
+      if (state.trimStart >= state.trimEnd) state.trimStart = Math.max(0, state.trimEnd - 0.01);
+      render();
+    };
+    te.oninput = () => {
+      state.trimEnd = (parseInt(te.value, 10) / 1000) * state.buffer.duration;
+      if (state.trimEnd <= state.trimStart) state.trimEnd = state.trimStart + 0.01;
+      render();
+    };
+  }
+
+  function refreshAudioEl() {
+    if (state.blobUrl) URL.revokeObjectURL(state.blobUrl);
+    const wav = audioBufferToWav(state.buffer);
+    state.blobUrl = URL.createObjectURL(wav);
+    state.audioEl.src = state.blobUrl;
+  }
+
+  function markDirty() {
+    state.dirty = true;
+    setStateChip('edited', 'dirty');
+    document.getElementById('vtedUndoBtn').disabled = state.undoStack.length === 0;
+  }
+
+  function pushUndo() {
+    // Snapshot a copy of the current buffer's PCM. AudioBuffer isn't
+    // structuredClone-friendly, so we copy channel data manually.
+    const b = state.buffer;
+    if (!b) return;
+    const ac = ensureCtx();
+    const snap = ac.createBuffer(b.numberOfChannels, b.length, b.sampleRate);
+    for (let ch = 0; ch < b.numberOfChannels; ch++) {
+      snap.getChannelData(ch).set(b.getChannelData(ch));
+    }
+    state.undoStack.push(snap);
+    if (state.undoStack.length > UNDO_CAP) state.undoStack.shift();
+    document.getElementById('vtedUndoBtn').disabled = false;
+  }
+
+  window.vtedUndo = function () {
+    if (state.undoStack.length === 0) return;
+    state.buffer = state.undoStack.pop();
+    state.trimEnd = state.buffer.duration;
+    state.trimStart = 0;
+    state.viewStart = 0;
+    state.viewEnd = state.buffer.duration;
+    updateSliderRange();
+    refreshAudioEl();
+    render();
+    document.getElementById('vtedUndoBtn').disabled = state.undoStack.length === 0;
+    document.getElementById('vtedLength').textContent = fmt(state.buffer.duration);
+    if (state.undoStack.length === 0) {
+      state.dirty = false;
+      setStateChip('ready', 'ready');
+    }
+  };
+
+  window.vtedToggleTrimMode = function () {
+    state.trimMode = state.trimMode === 'keep' ? 'delete' : 'keep';
+    document.getElementById('vtedTrimModeBtn').textContent =
+      'Mode: ' + (state.trimMode === 'keep' ? 'Keep selection' : 'Delete selection');
+    render();
+  };
+
+  window.vtedApplyTrim = function () {
+    if (!state.buffer) return;
+    pushUndo();
+    const b = state.buffer;
+    const sr = b.sampleRate;
+    const startIdx = Math.max(0, Math.floor(state.trimStart * sr));
+    const endIdx = Math.min(b.length, Math.floor(state.trimEnd * sr));
+    if (startIdx >= endIdx) return;
+
+    let newBuf;
+    const ac = ensureCtx();
+    if (state.trimMode === 'keep') {
+      const len = endIdx - startIdx;
+      newBuf = ac.createBuffer(b.numberOfChannels, len, sr);
+      for (let ch = 0; ch < b.numberOfChannels; ch++) {
+        const dst = newBuf.getChannelData(ch);
+        const src = b.getChannelData(ch);
+        for (let i = 0; i < len; i++) dst[i] = src[startIdx + i];
+      }
+    } else {
+      // Delete mode: keep [0..startIdx) + [endIdx..b.length)
+      const leftLen = startIdx;
+      const rightLen = b.length - endIdx;
+      const newLen = leftLen + rightLen;
+      if (newLen <= 0) return;
+      newBuf = ac.createBuffer(b.numberOfChannels, newLen, sr);
+      for (let ch = 0; ch < b.numberOfChannels; ch++) {
+        const dst = newBuf.getChannelData(ch);
+        const src = b.getChannelData(ch);
+        for (let i = 0; i < leftLen; i++) dst[i] = src[i];
+        for (let i = 0; i < rightLen; i++) dst[leftLen + i] = src[endIdx + i];
+      }
+    }
+    state.buffer = newBuf;
+    state.trimStart = 0;
+    state.trimEnd = newBuf.duration;
+    state.viewStart = 0;
+    state.viewEnd = newBuf.duration;
+    state.playhead = 0;
+    updateSliderRange();
+    refreshAudioEl();
+    document.getElementById('vtedLength').textContent = fmt(state.buffer.duration);
+    markDirty();
+    render();
+  };
+
+  window.vtedNormalize = function () {
+    if (!state.buffer) return;
+    // Peak-based normalize to 0.95 target. Same rule OGRemote uses.
+    let peak = 0;
+    for (let ch = 0; ch < state.buffer.numberOfChannels; ch++) {
+      const data = state.buffer.getChannelData(ch);
+      for (let i = 0; i < data.length; i++) {
+        const a = Math.abs(data[i]);
+        if (a > peak) peak = a;
+      }
+    }
+    if (peak <= 0 || peak >= 0.94) {
+      // Already loud enough (or silent) -- avoid a pointless snapshot.
+      document.getElementById('vtedFooterMsg').textContent = 'Normalize skipped: peak already at ' + peak.toFixed(3);
+      return;
+    }
+    pushUndo();
+    const scale = 0.95 / peak;
+    for (let ch = 0; ch < state.buffer.numberOfChannels; ch++) {
+      const data = state.buffer.getChannelData(ch);
+      for (let i = 0; i < data.length; i++) data[i] *= scale;
+    }
+    refreshAudioEl();
+    document.getElementById('vtedFooterMsg').textContent = 'Normalized: scaled by ' + scale.toFixed(3);
+    markDirty();
+    render();
+  };
+
+  window.vtedPlay = function () {
+    if (!state.buffer || !state.audioEl) return;
+    // If trim window is armed (either mode) audition just that region.
+    if (state.trimMode === 'keep') {
+      if (state.audioEl.currentTime < state.trimStart || state.audioEl.currentTime >= state.trimEnd) {
+        state.audioEl.currentTime = state.trimStart;
+      }
+    }
+    state.audioEl.play().catch(() => {});
+  };
+  window.vtedPause = function () {
+    if (state.audioEl) state.audioEl.pause();
+  };
+  window.vtedStop = function () {
+    if (state.audioEl) {
+      state.audioEl.pause();
+      state.audioEl.currentTime = 0;
+      state.playhead = 0;
+      render();
+    }
+  };
+  window.vtedZoomReset = function () {
+    if (!state.buffer) return;
+    state.viewStart = 0;
+    state.viewEnd = state.buffer.duration;
+    render();
+  };
+
+  window.vtedSaveAndClose = async function () {
+    if (!state.buffer || state.vtId === null) return;
+    document.getElementById('vtedStatus').textContent = 'Saving...';
+    setStateChip('saving', 'dirty');
+    try {
+      const wav = audioBufferToWav(state.buffer);
+      const fd = new FormData();
+      fd.append('file', wav, 'voicetrack.wav');
+      const resp = await fetch('/api/voicetrack/' + state.vtId + '/save-edited/', {
+        method: 'POST',
+        headers: { 'X-CSRFToken': getCookie('csrftoken') },
+        body: fd,
+      });
+      const data = await resp.json();
+      if (!resp.ok || data.error) {
+        document.getElementById('vtedStatus').textContent = 'Save failed: ' + (data.error || 'HTTP ' + resp.status);
+        setStateChip('error', 'dirty');
+        return;
+      }
+      document.getElementById('vtedStatus').textContent = 'Saved (' + data.duration_seconds.toFixed(2) + 's).';
+      const cb = state.onSaved;
+      // Clear dirty BEFORE closeInternal so the beforeunload guard
+      // doesn't false-alarm on the next tab close/reload.
+      state.dirty = false;
+      closeInternal();
+      if (cb) cb(data.duration_seconds);
+    } catch (e) {
+      document.getElementById('vtedStatus').textContent = 'Save failed: ' + e.message;
+      setStateChip('error', 'dirty');
+    }
+  };
+  window.vtedDiscardAndClose = function () {
+    if (state.dirty && !confirm('Discard all edits and close?')) return;
+    // Operator has confirmed; clear dirty so beforeunload doesn't
+    // second-guess them.
+    state.dirty = false;
+    closeInternal();
+  };
+  function closeInternal() {
+    if (state.audioEl) { state.audioEl.pause(); state.audioEl.src = ''; }
+    if (state.blobUrl) { URL.revokeObjectURL(state.blobUrl); state.blobUrl = null; }
+    state.buffer = null;
+    state.undoStack = [];
+    document.getElementById('vtedModal').style.display = 'none';
+  }
+
+  // Waveform render with lightweight direct sampling. Not OGRemote's
+  // full overview cache -- keeps the code manageable at MVP; may add
+  // caching later if long clips feel slow to zoom.
+  function render() {
+    if (!state.buffer || !state.canvasCtx) return;
+    const ctx = state.canvasCtx;
+    const b = state.buffer;
+    const wrap = state.canvas.parentElement;
+    const w = wrap.clientWidth;
+    const h = wrap.clientHeight;
+    ctx.clearRect(0, 0, w, h);
+
+    const nCh = b.numberOfChannels;
+    const laneHeight = h / nCh;
+    const visStart = state.viewStart;
+    const visEnd = state.viewEnd == null ? b.duration : state.viewEnd;
+    const visSpan = Math.max(0.001, visEnd - visStart);
+
+    // Background of view window
+    ctx.fillStyle = 'rgba(255,255,255,0.02)';
+    ctx.fillRect(0, 0, w, h);
+
+    // Draw each channel lane
+    for (let ch = 0; ch < nCh; ch++) {
+      const data = b.getChannelData(ch);
+      const sr = b.sampleRate;
+      const sampleStart = Math.max(0, Math.floor(visStart * sr));
+      const sampleEnd = Math.min(data.length, Math.floor(visEnd * sr));
+      const samplesPerPixel = Math.max(1, Math.floor((sampleEnd - sampleStart) / w));
+      const centerY = laneHeight * ch + laneHeight / 2;
+      const maxAmp = laneHeight / 2 * 0.9;
+
+      ctx.strokeStyle = 'rgba(100, 200, 255, 0.75)';
+      ctx.beginPath();
+      for (let x = 0; x < w; x++) {
+        const idxA = sampleStart + x * samplesPerPixel;
+        const idxB = Math.min(sampleEnd, idxA + samplesPerPixel);
+        let mn = 1, mx = -1;
+        for (let i = idxA; i < idxB; i++) {
+          const s = data[i];
+          if (s < mn) mn = s;
+          if (s > mx) mx = s;
+        }
+        const yTop = centerY + mn * maxAmp;
+        const yBot = centerY + mx * maxAmp;
+        ctx.moveTo(x + 0.5, yTop);
+        ctx.lineTo(x + 0.5, yBot);
+      }
+      ctx.stroke();
+
+      // Zero line
+      ctx.strokeStyle = 'rgba(255,255,255,0.1)';
+      ctx.beginPath();
+      ctx.moveTo(0, centerY);
+      ctx.lineTo(w, centerY);
+      ctx.stroke();
+
+      // Channel label for stereo
+      if (nCh === 2) {
+        ctx.fillStyle = 'rgba(255,255,255,0.4)';
+        ctx.font = '10px sans-serif';
+        ctx.fillText(ch === 0 ? 'L' : 'R', 4, laneHeight * ch + 12);
+      }
+    }
+
+    // Trim markers
+    const trimStartX = ((state.trimStart - visStart) / visSpan) * w;
+    const trimEndX = ((state.trimEnd - visStart) / visSpan) * w;
+
+    // Trim shading -- keep or delete visual
+    if (state.trimMode === 'keep') {
+      ctx.fillStyle = 'rgba(0,0,0,0.4)';
+      if (trimStartX > 0) ctx.fillRect(0, 0, trimStartX, h);
+      if (trimEndX < w)   ctx.fillRect(trimEndX, 0, w - trimEndX, h);
+    } else {
+      // Delete: the middle is what will be removed; shade it red.
+      ctx.fillStyle = 'rgba(248, 113, 113, 0.25)';
+      ctx.fillRect(Math.max(0, trimStartX), 0, Math.min(w, trimEndX) - Math.max(0, trimStartX), h);
+    }
+    ctx.strokeStyle = '#fbbf24';
+    ctx.beginPath(); ctx.moveTo(trimStartX + 0.5, 0); ctx.lineTo(trimStartX + 0.5, h); ctx.stroke();
+    ctx.strokeStyle = '#fb923c';
+    ctx.beginPath(); ctx.moveTo(trimEndX + 0.5, 0); ctx.lineTo(trimEndX + 0.5, h); ctx.stroke();
+
+    // Playhead
+    const phX = ((state.playhead - visStart) / visSpan) * w;
+    ctx.strokeStyle = '#ffffff';
+    ctx.beginPath(); ctx.moveTo(phX + 0.5, 0); ctx.lineTo(phX + 0.5, h); ctx.stroke();
+
+    // HUD text
+    document.getElementById('vtedPlayhead').textContent = fmt(state.playhead);
+    document.getElementById('vtedView').textContent = fmt(visStart) + ' → ' + fmt(visEnd);
+  }
+
+  function tickAnim() {
+    if (!state.playing) return;
+    render();
+    requestAnimationFrame(tickAnim);
+  }
+
+  // --- Canvas interactions ---
+  document.addEventListener('DOMContentLoaded', function () {
+    const wrap = document.getElementById('vtedCanvasWrap');
+    if (!wrap) return;
+
+    function xToTime(clientX) {
+      const rect = wrap.getBoundingClientRect();
+      const w = rect.width;
+      const frac = Math.max(0, Math.min(1, (clientX - rect.left) / w));
+      const visStart = state.viewStart;
+      const visEnd = state.viewEnd == null ? (state.buffer ? state.buffer.duration : 0) : state.viewEnd;
+      return visStart + frac * (visEnd - visStart);
+    }
+    wrap.addEventListener('click', function (e) {
+      if (!state.buffer) return;
+      const t = xToTime(e.clientX);
+      state.playhead = t;
+      if (state.audioEl) state.audioEl.currentTime = t;
+      render();
+    });
+    wrap.addEventListener('mousedown', function (e) {
+      if (e.altKey) {
+        state.panning = true;
+        state.panLastX = e.clientX;
+        wrap.classList.add('panning');
+        e.preventDefault();
+      }
+    });
+    window.addEventListener('mouseup', function () {
+      state.panning = false;
+      wrap.classList.remove('panning');
+    });
+    window.addEventListener('mousemove', function (e) {
+      if (!state.panning || !state.buffer) return;
+      const rect = wrap.getBoundingClientRect();
+      const dx = e.clientX - state.panLastX;
+      state.panLastX = e.clientX;
+      const visStart = state.viewStart;
+      const visEnd = state.viewEnd == null ? state.buffer.duration : state.viewEnd;
+      const span = visEnd - visStart;
+      const dSec = -(dx / rect.width) * span;
+      let ns = visStart + dSec;
+      let ne = visEnd + dSec;
+      if (ns < 0) { ne -= ns; ns = 0; }
+      if (ne > state.buffer.duration) { ns -= (ne - state.buffer.duration); ne = state.buffer.duration; }
+      state.viewStart = ns; state.viewEnd = ne;
+      render();
+    });
+    wrap.addEventListener('wheel', function (e) {
+      if (!state.buffer) return;
+      e.preventDefault();
+      const rect = wrap.getBoundingClientRect();
+      const anchor = xToTime(e.clientX);
+      const visStart = state.viewStart;
+      const visEnd = state.viewEnd == null ? state.buffer.duration : state.viewEnd;
+      const span = visEnd - visStart;
+      const factor = e.deltaY < 0 ? 0.8 : 1.25;
+      let newSpan = span * factor;
+      newSpan = Math.max(0.02, Math.min(state.buffer.duration, newSpan));
+      // Keep the point under the mouse stable
+      let frac = (anchor - visStart) / span;
+      let ns = anchor - frac * newSpan;
+      let ne = ns + newSpan;
+      if (ns < 0) { ne -= ns; ns = 0; }
+      if (ne > state.buffer.duration) { ns -= (ne - state.buffer.duration); ne = state.buffer.duration; }
+      state.viewStart = ns; state.viewEnd = ne;
+      render();
+    }, { passive: false });
+  });
+
+  // Prevent accidental navigation with unsaved edits.
+  window.addEventListener('beforeunload', function (e) {
+    if (state.dirty) {
+      e.preventDefault();
+      e.returnValue = '';
+      return '';
+    }
+  });
+
+  // WAV encoder (16-bit PCM), ported from OGRemote's editor.
+  function audioBufferToWav(buffer) {
+    const numChannels = buffer.numberOfChannels;
+    const sampleRate = buffer.sampleRate;
+    const length = buffer.length;
+    const bytesPerSample = 2;
+    const blockAlign = numChannels * bytesPerSample;
+    const byteRate = sampleRate * blockAlign;
+    const dataSize = length * blockAlign;
+    const bufferLength = 44 + dataSize;
+    const arrayBuffer = new ArrayBuffer(bufferLength);
+    const view = new DataView(arrayBuffer);
+    function writeString(offset, str) {
+      for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
+    }
+    let offset = 0;
+    writeString(offset, 'RIFF'); offset += 4;
+    view.setUint32(offset, 36 + dataSize, true); offset += 4;
+    writeString(offset, 'WAVE'); offset += 4;
+    writeString(offset, 'fmt '); offset += 4;
+    view.setUint32(offset, 16, true); offset += 4;
+    view.setUint16(offset, 1, true); offset += 2;
+    view.setUint16(offset, numChannels, true); offset += 2;
+    view.setUint32(offset, sampleRate, true); offset += 4;
+    view.setUint32(offset, byteRate, true); offset += 4;
+    view.setUint16(offset, blockAlign, true); offset += 2;
+    view.setUint16(offset, 16, true); offset += 2;
+    writeString(offset, 'data'); offset += 4;
+    view.setUint32(offset, dataSize, true); offset += 4;
+    const channelData = [];
+    for (let ch = 0; ch < numChannels; ch++) channelData.push(buffer.getChannelData(ch));
+    let writeOffset = offset;
+    for (let sampleIndex = 0; sampleIndex < length; sampleIndex++) {
+      for (let channelIndex = 0; channelIndex < numChannels; channelIndex++) {
+        let sample = channelData[channelIndex][sampleIndex];
+        sample = Math.max(-1, Math.min(1, sample));
+        const intSample = sample < 0 ? sample * 0x8000 : sample * 0x7FFF;
+        view.setInt16(writeOffset, intSample, true);
+        writeOffset += 2;
+      }
+    }
+    return new Blob([arrayBuffer], { type: 'audio/wav' });
+  }
+
+  function getCookie(name) {
+    let val = null;
+    document.cookie.split(';').forEach(c => {
+      c = c.trim();
+      if (c.startsWith(name + '=')) val = decodeURIComponent(c.substring(name.length + 1));
+    });
+    return val;
+  }
+})();
+</script>

@@ -561,6 +561,7 @@
           </div>
           <div class="vt-existing-actions">
             <button type="button" class="vt-btn" onclick="vtRecord('intro')" {% if track.intro_until_seconds is None %}disabled{% endif %}>Re-record</button>
+            <button type="button" class="vt-btn" onclick="vtEditorOpen({{ voicetracks.intro.id }}, '{% url 'library:api-voicetrack-audio' voicetracks.intro.id %}', '{{ track.title|escapejs }} — intro VT', function () { window.location.reload(); })">Edit</button>
             <button type="button" class="vt-btn danger" onclick="vtDelete({{ voicetracks.intro.id }})">Delete</button>
           </div>
         </div>
@@ -590,6 +591,7 @@
           </div>
           <div class="vt-existing-actions">
             <button type="button" class="vt-btn" onclick="vtRecord('outro')" {% if track.outro_starts_seconds is None %}disabled{% endif %}>Re-record</button>
+            <button type="button" class="vt-btn" onclick="vtEditorOpen({{ voicetracks.outro.id }}, '{% url 'library:api-voicetrack-audio' voicetracks.outro.id %}', '{{ track.title|escapejs }} — outro VT', function () { window.location.reload(); })">Edit</button>
             <button type="button" class="vt-btn danger" onclick="vtDelete({{ voicetracks.outro.id }})">Delete</button>
           </div>
         </div>
@@ -726,6 +728,7 @@
 {% endblock %}
 
 {% block extra_js %}
+{% if can_edit_voicetracks %}{% include "library/_voicetrack_editor.html" %}{% endif %}
 <script>
 const TRACK_ID = {{ track.id }};
 

@@ -130,6 +130,7 @@
         <td>{{ vt.edited_at|date:"Y-m-d H:i"|default:vt.recorded_at|date:"Y-m-d H:i" }}</td>
         <td><audio controls preload="none" src="{% url 'library:api-voicetrack-audio' vt.id %}" style="height:24px; max-width:180px;"></audio></td>
         <td class="vt-actions">
+          <button type="button" onclick="vtEditorOpen({{ vt.id }}, '{% url 'library:api-voicetrack-audio' vt.id %}', '{{ vt.track.title|escapejs }} — {{ vt.position }} VT', function () { window.location.reload(); })">Edit</button>
           <button type="button" class="danger" onclick="vtDeleteRow({{ vt.id }}, this)">Delete</button>
         </td>
       </tr>
@@ -162,6 +163,7 @@
 {% endblock %}
 
 {% block extra_js %}
+{% include "library/_voicetrack_editor.html" %}
 <script>
 function getCookie(name) {
   let val = null;

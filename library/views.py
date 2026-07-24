@@ -2155,6 +2155,52 @@ def api_voicetrack_audio(request, pk):
 
 @csrf_exempt
 @require_http_methods(["POST"])
+def api_voicetrack_save_edited(request, pk):
+    """Replace a VT's audio file with an edited WAV blob (from the
+    in-browser editor). Destructive per the design conversation: the
+    original file is overwritten and the row's edited_at is bumped.
+    The editor keeps an undo stack in-session; when this endpoint
+    lands, the operator has committed to the current take.
+
+    Same access model as upload/delete (staff/superuser/remote_dj).
+    Row must exist; if the caller sends an edit for a VT that got
+    deleted between the editor opening and Save, we 404 rather than
+    creating a stray file."""
+    from library.models import VoiceTrack
+    if not _can_edit_voicetracks(request.user):
+        return HttpResponseForbidden("Not authorized.")
+    vt = get_object_or_404(VoiceTrack, pk=pk)
+    f = request.FILES.get("file")
+    if f is None:
+        return JsonResponse({"error": "No file uploaded"}, status=400)
+
+    dest = Path(vt.filepath) if vt.filepath else None
+    if dest is None:
+        return JsonResponse({"error": "VoiceTrack has no filepath"}, status=500)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    # Write to a sidecar tempfile then atomic-rename over the target
+    # so a crash mid-write can't leave a half-written file where the
+    # engine is going to try reading. Same pattern the Django FileField
+    # save() uses under the hood.
+    tmp = dest.with_suffix(dest.suffix + ".editing")
+    with open(tmp, "wb") as out:
+        for chunk in f.chunks():
+            out.write(chunk)
+    tmp.replace(dest)
+
+    vt.edited_at = timezone.now()
+    vt.save()   # re-populates duration_seconds via mutagen
+    return JsonResponse({
+        "ok": True,
+        "voicetrack_id": vt.id,
+        "duration_seconds": vt.duration_seconds,
+        "audio_url": reverse("library:api-voicetrack-audio", args=[vt.id]),
+    })
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
 def api_voicetrack_delete(request, pk):
     """Delete a VT row + its file. Same access as upload."""
     from library.models import VoiceTrack
