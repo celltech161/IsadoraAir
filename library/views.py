@@ -1060,7 +1060,7 @@ def api_track_bulk(request):
 
 @ensure_csrf_cookie
 def track_detail_page(request, pk):
-    from library.models import AnalysisConfig
+    from library.models import AnalysisConfig, VoiceTrack
 
     track = get_object_or_404(
         Track.objects.select_related("artist", "album", "genre", "category")
@@ -1071,12 +1071,17 @@ def track_detail_page(request, pk):
     holidays = Holiday.objects.order_by("month", "day")
     selected_additional_cat_ids = set(track.additional_categories.values_list("id", flat=True))
     selected_holiday_codes = set(track.holidays.values_list("code", flat=True))
+    voicetracks = {
+        vt.position: vt for vt in VoiceTrack.objects.filter(track=track)
+    }
     return render(request, "library/track_detail.html", {
         "track": track,
         "categories": categories,
         "holidays": holidays,
         "selected_additional_cat_ids": selected_additional_cat_ids,
         "selected_holiday_codes": selected_holiday_codes,
+        "voicetracks": voicetracks,
+        "can_edit_voicetracks": _can_edit_voicetracks(request.user),
         "energy_choices": Track.ENERGY_CHOICES,
         "vocal_type_choices": Track.VOCAL_TYPE_CHOICES,
         "end_type_choices": Track.END_TYPE_CHOICES,
@@ -2005,6 +2010,134 @@ def remote_dj_page(request):
 
 
 FX_CART_UPLOAD_DIR = Path("/srv/isadoraair/carts")
+VOICETRACK_UPLOAD_DIR = Path("/srv/isadoraair/voicetracks")
+
+
+def _can_edit_voicetracks(user):
+    """Staff, superuser, or a remote_dj group member. Contributor is
+    library-management, not on-air, so no VT recording. Matches the
+    design conversation."""
+    if not (user and user.is_authenticated):
+        return False
+    if user.is_staff or user.is_superuser:
+        return True
+    return user.groups.filter(name="remote_dj").exists()
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def api_voicetrack_upload(request):
+    """Save an audio blob as a voice-track for a specific (track,
+    position) pair. Destructive: overwrites any existing VT at that
+    slot. Called by the browser recording UI on /track/<pk>/ after
+    MediaRecorder + audioBufferToWav produces a WAV client-side."""
+    from library.models import Track, VoiceTrack
+
+    if not _can_edit_voicetracks(request.user):
+        return HttpResponseForbidden("Voice-track recording requires staff or remote_dj.")
+
+    f = request.FILES.get("file")
+    if f is None:
+        return JsonResponse({"error": "No file uploaded"}, status=400)
+    try:
+        track_id = int(request.POST.get("track_id", ""))
+    except (TypeError, ValueError):
+        return JsonResponse({"error": "track_id required"}, status=400)
+    position = request.POST.get("position", "")
+    if position not in ("intro", "outro"):
+        return JsonResponse({"error": "position must be 'intro' or 'outro'"}, status=400)
+
+    track = get_object_or_404(Track, pk=track_id)
+
+    # Enforce the design constraint: outro-VT requires the outgoing
+    # track have outro_starts_seconds set; intro-VT requires the
+    # incoming track have intro_until_seconds. Reject at record time
+    # so an operator can't produce a VT that will never fire.
+    if position == "outro" and track.outro_starts_seconds is None:
+        return JsonResponse({
+            "error": "Track has no outro_starts marker set. Set it on the track detail "
+                        "page (or during analysis) before recording an outro VT.",
+        }, status=400)
+    if position == "intro" and track.intro_until_seconds is None:
+        return JsonResponse({
+            "error": "Track has no intro_until marker set. Set it on the track detail "
+                        "page (or during analysis) before recording an intro VT.",
+        }, status=400)
+
+    # Filesystem layout: /srv/isadoraair/voicetracks/<track_id>/<position>.wav
+    # One file per (track, position). Overwriting is deliberate: the
+    # editor's undo stack is session-only; when the operator hits
+    # Save-and-return, the current file becomes the airable version and
+    # any previous take is replaced. Prevents an accidental stale take
+    # slipping to air just because someone forgot which version was
+    # current.
+    dest_dir = VOICETRACK_UPLOAD_DIR / str(track_id)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / f"{position}.wav"
+    with open(dest, "wb") as out:
+        for chunk in f.chunks():
+            out.write(chunk)
+
+    vt, _ = VoiceTrack.objects.get_or_create(
+        track=track, position=position,
+        defaults={"filepath": str(dest), "recorded_by": request.user},
+    )
+    # If the row already existed, update fields (destructive overwrite).
+    vt.filepath = str(dest)
+    vt.source = "browser"
+    if request.user and request.user.is_authenticated:
+        vt.recorded_by = request.user
+    vt.edited_at = timezone.now()
+    vt.save()  # save() re-populates duration_seconds via mutagen
+
+    return JsonResponse({
+        "ok": True,
+        "voicetrack_id": vt.id,
+        "duration_seconds": vt.duration_seconds,
+        "audio_url": reverse("library:api-voicetrack-audio", args=[vt.id]),
+    })
+
+
+@require_http_methods(["GET"])
+def api_voicetrack_audio(request, pk):
+    """Serve a voice-track file for preview. Streams through Django (not
+    directly by nginx) so the access check is enforced -- an
+    accidentally-shared /media/... URL wouldn't apply, but the file lives
+    under /srv/ anyway, not under /media/. Access matches upload:
+    staff/superuser/remote_dj."""
+    from django.http import FileResponse
+    from library.models import VoiceTrack
+
+    if not _can_edit_voicetracks(request.user):
+        return HttpResponseForbidden("Not authorized.")
+
+    vt = get_object_or_404(VoiceTrack, pk=pk)
+    if not vt.file_exists:
+        return HttpResponseNotFound("Voice-track file missing on disk.")
+    return FileResponse(open(vt.filepath, "rb"), content_type="audio/wav")
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+def api_voicetrack_delete(request, pk):
+    """Delete a VT row + its file. Same access as upload."""
+    from library.models import VoiceTrack
+    if not _can_edit_voicetracks(request.user):
+        return HttpResponseForbidden("Not authorized.")
+    vt = get_object_or_404(VoiceTrack, pk=pk)
+    fp = vt.filepath
+    vt.delete()
+    if fp:
+        try:
+            Path(fp).unlink(missing_ok=True)
+        except OSError as exc:
+            # Row's already gone; a leftover file is cheap to clean up
+            # later. Log and continue.
+            return JsonResponse({
+                "ok": True,
+                "warning": f"Row deleted but file cleanup failed: {exc}",
+            })
+    return JsonResponse({"ok": True})
 
 
 @csrf_exempt
