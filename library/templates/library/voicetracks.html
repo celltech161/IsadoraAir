@@ -1,0 +1,191 @@
+{% extends "base.html" %}
+{% block title %}Voice Tracks — IsadoraAir{% endblock %}
+
+{% block extra_css %}
+<style>
+  .vt-page {
+    background: var(--bg-mid);
+    border: 1px solid var(--border-subtle);
+    border-radius: 10px;
+    padding: 1.25rem;
+  }
+  .vt-page h1 {
+    margin: 0 0 0.5rem 0;
+    font-size: 1.1rem;
+    display: flex; justify-content: space-between; align-items: baseline;
+  }
+  .vt-page h1 .count {
+    color: var(--text-muted); font-size: 0.78rem; font-weight: 400;
+  }
+  .vt-filters {
+    display: flex; gap: 0.5rem; align-items: end;
+    margin-bottom: 1rem; flex-wrap: wrap;
+  }
+  .vt-filters label {
+    display: block; font-size: 0.72rem; color: var(--text-muted); margin-bottom: 0.2rem;
+  }
+  .vt-filters input, .vt-filters select {
+    background: var(--bg-darker);
+    border: 1px solid var(--border-subtle);
+    color: var(--text-main);
+    padding: 0.4rem 0.6rem;
+    border-radius: 5px;
+    font-family: inherit;
+    font-size: 0.85rem;
+  }
+  .vt-filters .btn {
+    background: var(--accent); color: var(--bg-darkest);
+    padding: 0.5rem 0.9rem; border: none; border-radius: 5px;
+    font-weight: 600; cursor: pointer; font-size: 0.85rem;
+  }
+
+  .vt-table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+  .vt-table th, .vt-table td {
+    padding: 0.45rem 0.6rem; text-align: left;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+  .vt-table th {
+    background: var(--bg-darker); color: var(--text-muted);
+    font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.03em;
+    font-weight: 600;
+  }
+  .vt-table td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .vt-table tbody tr:hover { background: var(--bg-darker); }
+  .vt-position {
+    display: inline-block; padding: 1px 6px; border-radius: 3px;
+    font-size: 0.7rem; font-weight: 600; text-transform: uppercase;
+  }
+  .vt-position.intro { background: rgba(34, 197, 94, 0.2); color: #86efac; }
+  .vt-position.outro { background: rgba(59, 130, 246, 0.2); color: #93c5fd; }
+  .vt-empty { color: var(--text-muted); padding: 1rem; font-size: 0.9rem; }
+  .vt-actions button {
+    background: none; border: 1px solid var(--border-subtle);
+    color: var(--text-main); padding: 0.25rem 0.6rem;
+    font-size: 0.75rem; border-radius: 4px; cursor: pointer;
+    font-family: inherit;
+  }
+  .vt-actions button.danger:hover { color: #f88; border-color: #f88; }
+
+  .vt-paginator {
+    display: flex; gap: 0.5rem; margin-top: 0.75rem; align-items: center;
+    font-size: 0.85rem; color: var(--text-muted);
+  }
+  .vt-paginator a { color: var(--accent); text-decoration: none; }
+  .vt-paginator a:hover { text-decoration: underline; }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="vt-page">
+  <h1>
+    Voice Tracks
+    <span class="count">{{ total_count }} total</span>
+  </h1>
+
+  <form class="vt-filters" method="get">
+    <div>
+      <label for="vtQ">Search track / artist</label>
+      <input type="text" id="vtQ" name="q" value="{{ q }}" placeholder="Dolly Parton..." style="min-width:220px;">
+    </div>
+    <div>
+      <label for="vtPos">Position</label>
+      <select id="vtPos" name="position">
+        <option value="" {% if not position_filter %}selected{% endif %}>Any</option>
+        <option value="intro" {% if position_filter == 'intro' %}selected{% endif %}>Intro</option>
+        <option value="outro" {% if position_filter == 'outro' %}selected{% endif %}>Outro</option>
+      </select>
+    </div>
+    <div>
+      <button type="submit" class="btn">Filter</button>
+    </div>
+    {% if q or position_filter %}
+    <div>
+      <a href="{% url 'library:voicetracks' %}" style="color:var(--text-muted); font-size:0.8rem;">Clear</a>
+    </div>
+    {% endif %}
+  </form>
+
+  {% if voicetracks %}
+  <table class="vt-table">
+    <thead>
+      <tr>
+        <th>Track</th>
+        <th>Artist</th>
+        <th>Pos</th>
+        <th class="num">Duration</th>
+        <th>Recorded by</th>
+        <th>Recorded</th>
+        <th>Preview</th>
+        <th></th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for vt in voicetracks %}
+      <tr>
+        <td><a href="{% url 'library:track-detail' vt.track.id %}" style="color:var(--accent);">{{ vt.track.title }}</a></td>
+        <td>{{ vt.track.artist.name|default:"—" }}</td>
+        <td><span class="vt-position {{ vt.position }}">{{ vt.position }}</span></td>
+        <td class="num">{{ vt.duration_seconds|floatformat:2 }}s</td>
+        <td>{{ vt.recorded_by.username|default:"—" }}</td>
+        <td>{{ vt.edited_at|date:"Y-m-d H:i"|default:vt.recorded_at|date:"Y-m-d H:i" }}</td>
+        <td><audio controls preload="none" src="{% url 'library:api-voicetrack-audio' vt.id %}" style="height:24px; max-width:180px;"></audio></td>
+        <td class="vt-actions">
+          <button type="button" class="danger" onclick="vtDeleteRow({{ vt.id }}, this)">Delete</button>
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+
+  {% if voicetracks.has_other_pages %}
+  <div class="vt-paginator">
+    {% if voicetracks.has_previous %}
+    <a href="?{% if q %}q={{ q }}&{% endif %}{% if position_filter %}position={{ position_filter }}&{% endif %}page={{ voicetracks.previous_page_number }}">← Previous</a>
+    {% endif %}
+    <span>Page {{ voicetracks.number }} of {{ voicetracks.paginator.num_pages }}</span>
+    {% if voicetracks.has_next %}
+    <a href="?{% if q %}q={{ q }}&{% endif %}{% if position_filter %}position={{ position_filter }}&{% endif %}page={{ voicetracks.next_page_number }}">Next →</a>
+    {% endif %}
+  </div>
+  {% endif %}
+
+  {% else %}
+  <div class="vt-empty">
+    {% if q or position_filter %}
+      No voice tracks match your filter.
+    {% else %}
+      No voice tracks yet. Open any track's detail page and record intro or outro VTs from there.
+    {% endif %}
+  </div>
+  {% endif %}
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+function getCookie(name) {
+  let val = null;
+  document.cookie.split(';').forEach(c => {
+    c = c.trim();
+    if (c.startsWith(name + '=')) val = decodeURIComponent(c.substring(name.length + 1));
+  });
+  return val;
+}
+
+async function vtDeleteRow(id, btn) {
+  if (!confirm('Delete this voice track? The audio file will be removed too.')) return;
+  btn.disabled = true;
+  const resp = await fetch(`/api/voicetrack/${id}/delete/`, {
+    method: 'POST',
+    headers: { 'X-CSRFToken': getCookie('csrftoken') },
+  });
+  if (!resp.ok) {
+    alert('Delete failed: HTTP ' + resp.status);
+    btn.disabled = false;
+    return;
+  }
+  const row = btn.closest('tr');
+  row.parentNode.removeChild(row);
+}
+</script>
+{% endblock %}

@@ -2024,6 +2024,42 @@ def _can_edit_voicetracks(user):
     return user.groups.filter(name="remote_dj").exists()
 
 
+@ensure_csrf_cookie
+def voicetracks_page(request):
+    """All-voicetracks index. Same access as VT recording (staff or
+    remote_dj); Contributor gets redirected by the group middleware
+    before reaching here since /voicetracks/ isn't in their access
+    prefixes."""
+    from library.models import VoiceTrack
+    if not _can_edit_voicetracks(request.user):
+        return HttpResponseForbidden("Voice-track management requires staff or remote_dj.")
+
+    qs = (
+        VoiceTrack.objects
+        .select_related("track", "track__artist", "recorded_by")
+        .order_by("-recorded_at")
+    )
+
+    q = (request.GET.get("q") or "").strip()
+    if q:
+        qs = qs.filter(
+            Q(track__title__icontains=q) |
+            Q(track__artist__name__icontains=q)
+        )
+    position = request.GET.get("position", "")
+    if position in ("intro", "outro"):
+        qs = qs.filter(position=position)
+
+    paginator = Paginator(qs, 100)
+    page = paginator.get_page(request.GET.get("page"))
+    return render(request, "library/voicetracks.html", {
+        "voicetracks": page,
+        "q": q,
+        "position_filter": position,
+        "total_count": paginator.count,
+    })
+
+
 @csrf_exempt
 @require_http_methods(["POST"])
 def api_voicetrack_upload(request):
