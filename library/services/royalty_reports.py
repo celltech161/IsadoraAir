@@ -154,14 +154,17 @@ def generate_soundexchange_nce(period_start, period_end, ath_override=None):
         "Aggregate Tuning Hours",
         "Channel or Program Name",
     ])
+    from library.models import StationInfo
+    info = StationInfo.load()
+
     writer.writerow([
-        getattr(settings, "STATION_LEGAL_NAME", ""),
-        getattr(settings, "STATION_CALL_LETTERS", ""),
+        info.legal_name,
+        info.call_letters,
         "C",  # C = noncommercial simulcast under 17 CFR 380
         period_start.isoformat(),
         period_end.isoformat(),
         f"{ath_value:.2f}" if ath_value else "",
-        getattr(settings, "STATION_STREAM_NAME", ""),
+        info.stream_name,
     ])
     writer.writerow([])  # blank separator row
 

@@ -67,10 +67,27 @@
     color: var(--text-muted); font-size: 0.9rem;
     padding: 1rem 0.6rem;
   }
+
+  .rpt-sampler {
+    display: flex; align-items: center; gap: 0.5rem;
+    font-size: 0.82rem; color: var(--text-muted);
+    margin-bottom: 1rem;
+  }
+  .rpt-sampler-dot {
+    display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+  }
+  .rpt-sampler-dot.healthy { background: #6c6; }
+  .rpt-sampler-dot.stale   { background: #dc6; }
+  .rpt-sampler-dot.dead    { background: #d55; }
 </style>
 {% endblock %}
 
 {% block content %}
+<div class="rpt-sampler">
+  <span class="rpt-sampler-dot {{ sampler_status }}"></span>
+  <span><strong>Listener sampler:</strong> {{ sampler_msg }}</span>
+</div>
+
 <div class="rpt-panel">
   <h2>Generate report</h2>
   <div class="rpt-form">

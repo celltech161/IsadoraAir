@@ -1297,6 +1297,56 @@ class PlayEvent(models.Model):
         )
 
 
+class StationInfo(models.Model):
+    """Station-identifying strings used by outbound licensor-facing
+    outputs -- primarily the SoundExchange NCE Report of Use header
+    row. Not read by the audio path; feel free to leave blank on a
+    dev/test install.
+
+    Singleton (pk=1), same pattern as StationTimeConfig / UITheme /
+    RemoteDJConfig. Editable via Django admin at Config > Station Info;
+    changes take effect on the next report generation with no restart.
+
+    Moved here (Phase 4b) from the previous env-var location
+    (STATION_LEGAL_NAME etc in settings.py) so the operator can edit
+    without a .env edit + gunicorn restart. The seed migration copies
+    existing settings values into the row on first apply so pre-existing
+    installs don't lose their identity."""
+
+    legal_name = models.CharField(
+        max_length=200, blank=True, default="",
+        help_text="Station legal / organizational name for regulatory paperwork "
+                    "(e.g. 'Oak Grove Radio'). Appears in the SoundExchange NCE "
+                    "report as Service Provider.",
+    )
+    call_letters = models.CharField(
+        max_length=20, blank=True, default="",
+        help_text="FCC call sign (e.g. 'KOGR-LP'). Appears in the SoundExchange NCE "
+                    "report as Call Letters.",
+    )
+    stream_name = models.CharField(
+        max_length=200, blank=True, default="",
+        help_text="Public-facing stream name (e.g. 'KOGR-LP Stream'). Appears in "
+                    "the SoundExchange NCE report as Channel / Program Name.",
+    )
+
+    class Meta:
+        verbose_name = "Station Info"
+        verbose_name_plural = "Station Info"
+
+    def __str__(self):
+        return f"Station Info ({self.call_letters or 'unset'})"
+
+    def save(self, *args, **kwargs):
+        self.pk = 1
+        super().save(*args, **kwargs)
+
+    @classmethod
+    def load(cls):
+        obj, _ = cls.objects.get_or_create(pk=1)
+        return obj
+
+
 class IcecastSample(models.Model):
     """One point-in-time sample of Icecast listener counts, for
     Aggregate Tuning Hours computation on royalty reports.

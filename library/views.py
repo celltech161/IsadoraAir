@@ -2623,7 +2623,8 @@ def reports_page(request):
     if denied:
         return denied
 
-    from library.models import RoyaltyReport
+    from datetime import timedelta
+    from library.models import IcecastSample, RoyaltyReport
     from library.services.royalty_reports import GENERATORS
 
     reports = RoyaltyReport.objects.select_related("generated_by").order_by(
@@ -2638,12 +2639,49 @@ def reports_page(request):
     else:
         default_month = f"{today.year}-{today.month - 1:02d}"
 
+    # Sampler health: healthy if we've had a sample within the last
+    # 5 minutes (timer fires every minute; 5 min is enough slack for
+    # a missed fire without crying wolf). Stale = last 5-60 min.
+    # Dead = >1h. Also counts samples in the last hour so the operator
+    # sees the actual cadence, not just the last-time.
+    now = timezone.now()
+    latest = IcecastSample.objects.order_by("-sampled_at").first()
+    last_hour_count = IcecastSample.objects.filter(
+        sampled_at__gte=now - timedelta(hours=1)
+    ).count()
+    if latest is None:
+        sampler_status = "dead"
+        sampler_msg = "No samples ever. Is isadoraair-sample-icecast.timer enabled?"
+    else:
+        age_minutes = (now - latest.sampled_at).total_seconds() / 60.0
+        if age_minutes <= 5:
+            sampler_status = "healthy"
+            sampler_msg = (
+                f"{last_hour_count} sample(s) in the last hour, "
+                f"last at {timezone.localtime(latest.sampled_at):%H:%M:%S} "
+                f"(total listeners then: {latest.listeners_total})"
+            )
+        elif age_minutes <= 60:
+            sampler_status = "stale"
+            sampler_msg = (
+                f"Last sample {age_minutes:.0f} min ago -- sampler timer may have "
+                f"missed a fire. Check `systemctl status isadoraair-sample-icecast.timer`."
+            )
+        else:
+            sampler_status = "dead"
+            sampler_msg = (
+                f"Last sample {age_minutes/60:.1f}h ago. "
+                f"isadoraair-sample-icecast.timer is likely stopped."
+            )
+
     return render(request, "library/reports.html", {
         "reports": reports,
         "default_month": default_month,
         "format_choices": [(k, GENERATORS[k].__doc__.strip().split(chr(10))[0] if GENERATORS[k].__doc__ else k)
                             for k in GENERATORS.keys()],
         "format_display": dict(RoyaltyReport.FORMAT_CHOICES),
+        "sampler_status": sampler_status,
+        "sampler_msg": sampler_msg,
     })
 
 

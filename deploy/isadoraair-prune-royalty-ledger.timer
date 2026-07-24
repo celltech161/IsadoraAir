@@ -1,0 +1,10 @@
+[Unit]
+Description=Run IsadoraAir royalty-ledger prune daily (PlayEvent + IcecastSample past retention)
+
+[Timer]
+OnCalendar=*-*-* 04:35:00
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

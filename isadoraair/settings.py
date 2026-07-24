@@ -215,12 +215,8 @@ WEATHER_DATA_DIR = config('WEATHER_DATA_DIR', default='/var/lib/isadoraair/weath
 # address the station operator actually reads.
 MUSICBRAINZ_CONTACT = config('MUSICBRAINZ_CONTACT', default='')
 
-# Station identity, used by the SoundExchange NCE royalty report
-# header row and other outbound licensor-facing outputs. Not read by
-# the audio path; feel free to leave blank on a dev install.
-STATION_LEGAL_NAME = config('STATION_LEGAL_NAME', default='')
-STATION_CALL_LETTERS = config('STATION_CALL_LETTERS', default='')
-STATION_STREAM_NAME = config('STATION_STREAM_NAME', default='')
+# Station identity for NCE reports moved to library.models.StationInfo
+# (admin: Config > Station Info) in migration 0062. No .env keys.
 
 # --- Audio analysis thresholds ---
 ANALYSIS_SAMPLE_RATE = config('ANALYSIS_SAMPLE_RATE', default=4410, cast=int)

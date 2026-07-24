@@ -1,0 +1,14 @@
+[Unit]
+Description=IsadoraAir prune PlayEvent + IcecastSample rows past retention window
+After=postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=oneshot
+User=@@ISA_USER@@
+Group=@@ISA_USER@@
+WorkingDirectory=@@ISA_ROOT@@
+ExecStart=@@ISA_ROOT@@/venv/bin/python manage.py prune_royalty_ledger --apply
+
+[Install]
+WantedBy=multi-user.target

@@ -37,6 +37,7 @@ from .models import (
     RoyaltyReport,
     ScheduleBlock,
     Genre,
+    StationInfo,
     StationTimeConfig,
     Track,
     UITheme,
@@ -52,7 +53,7 @@ from .models import (
 # Every model keeps living in `library` underneath — only the admin UI
 # grouping changes.
 _TRAFFIC_MODELS = {"playlist", "rotation", "scheduleblock", "playlistlog"}
-_CONFIG_MODELS = {"analysisconfig", "recencyconfig", "uitheme", "logfillconfig", "uploadconfig", "navmenuitem", "remotedjconfig", "stationtimeconfig"}
+_CONFIG_MODELS = {"analysisconfig", "recencyconfig", "uitheme", "logfillconfig", "uploadconfig", "navmenuitem", "remotedjconfig", "stationtimeconfig", "stationinfo"}
 _LOG_MODELS = {"emaillog", "playevent", "royaltyreport"}
 
 
@@ -670,6 +671,40 @@ class StationTimeConfigAdmin(admin.ModelAdmin):
         obj = StationTimeConfig.load()
         return HttpResponseRedirect(
             reverse("admin:library_stationtimeconfig_change", args=[obj.pk])
+        )
+
+
+@admin.register(StationInfo)
+class StationInfoAdmin(admin.ModelAdmin):
+    """Singleton: station-identifying strings used in SoundExchange NCE
+    reports. Empty is allowed (the NCE header row will just carry
+    blanks), but you'll want to fill it in before submitting a real
+    report. Editable without a restart -- next report generation
+    picks up the new values."""
+    fieldsets = [
+        (None, {
+            "fields": ["legal_name", "call_letters", "stream_name"],
+            "description": (
+                "These strings appear in the header row of the SoundExchange "
+                "NCE Report of Use (Reports page -> Generate). Not read by the "
+                "playback engine or streaming encoders -- purely licensor-"
+                "facing paperwork."
+            ),
+        }),
+    ]
+
+    def has_add_permission(self, request):
+        return not StationInfo.objects.exists()
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+    def changelist_view(self, request, extra_context=None):
+        from django.http import HttpResponseRedirect
+        from django.urls import reverse
+        obj = StationInfo.load()
+        return HttpResponseRedirect(
+            reverse("admin:library_stationinfo_change", args=[obj.pk])
         )
 
 
