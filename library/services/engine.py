@@ -386,6 +386,13 @@ class PlaybackEngine:
         self._read_resume_hint()
         self._build_main_pipeline()
         self._load_current_hour_log()
+        # If the resume hint carries a log_item_id that lives in the
+        # just-loaded queue, back the cursor up so that item loads
+        # first -- otherwise a mid-crossfade snapshot would resume at
+        # the deck-B item (cursor was already advanced past deck A's
+        # item at crossfade-time) and deck A's remaining audio would
+        # be skipped. See _apply_resume_hint_queue_rewind.
+        self._apply_resume_hint_queue_rewind()
 
         if not self.log_items:
             print("No approved log for current hour. Waiting...")
@@ -1986,15 +1993,34 @@ class PlaybackEngine:
         """Look for a bookmark file left by the PREVIOUS engine instance
         (STATE_PATH survives a service restart because it lives on the
         tmpfs /run, which is only cleared on reboot). If it's fresh
-        (< 90s old), record the (track_id, position) of whatever was
-        playing so the FIRST matching deck load in _create_deck can
-        seek back to that spot -- turning an engine restart mid-song
-        into a ~1-2s dead-air gap instead of a "start next track from
-        scratch" jump.
+        (< 90s old), record the (track_id, position, log_item_id) of
+        whatever was playing so the FIRST matching deck load in
+        _create_deck can seek back to that spot -- turning an engine
+        restart mid-song into a ~1-2s dead-air gap instead of a "start
+        next track from scratch" jump.
 
         Only bookmarks positions > 5s (a track that JUST started
-        doesn't need a seek), and only takes the first-found deck (in
-        practice only one deck is playing between crossfades)."""
+        doesn't need a seek).
+
+        Prefers the deck with the OLDEST-known log_item_id when both
+        slots are populated (a mid-crossfade snapshot). Rationale: the
+        queue cursor advances the moment a new deck is created, so at
+        any mid-crossfade moment the cursor is already past whatever
+        deck A is on -- if we pick deck B's hint, the next
+        _load_current_hour_log will resume-at-cursor which is already
+        past deck A's LogItem, and the next _start_next_track will
+        load deck B's item, and deck B's audio (which is what the
+        listener actually hears LATER in the crossfade) resumes
+        correctly. But the outgoing (deck A) audio gets restarted from
+        zero as it re-enters as the next-item after cursor advance --
+        same on-air artefact the 09:48 restart produced (Cannons
+        loaded from 0 while Glen Campbell's remaining ~4 minutes were
+        skipped).
+
+        Fix: pick the deck whose log_item_id is OLDEST in queue order
+        (i.e. the outgoing deck), and later in _create_deck we rewind
+        the queue cursor to that item so IT loads first. Deck A hint
+        is preferred; if only B is populated we take that instead."""
         self._resume_hint = None
         try:
             if not STATE_PATH.is_file():
@@ -2003,17 +2029,62 @@ class PlaybackEngine:
             if age > 90:
                 return
             data = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+            # Collect candidates from both slots.
+            candidates = []
             for slot in ("A", "B"):
                 deck = (data.get("decks") or {}).get(slot)
                 if deck and deck.get("track_id") and deck.get("position", 0) > 5:
-                    self._resume_hint = {
+                    candidates.append({
+                        "slot": slot,
                         "track_id": deck["track_id"],
                         "position": float(deck["position"]),
-                    }
-                    print(f"  Resume hint: track {deck['track_id']} at {deck['position']:.1f}s (age {age:.1f}s)")
-                    return
+                        "log_item_id": deck.get("log_item_id"),
+                    })
+            if not candidates:
+                return
+            # Sort by log_item_id ascending so the OLDEST (outgoing)
+            # LogItem wins when a mid-crossfade snapshot has both
+            # slots populated. Missing log_item_id sinks to the end
+            # (older state files without the field still match on
+            # track_id at deck creation time -- pre-fix behavior).
+            candidates.sort(key=lambda c: (c["log_item_id"] is None, c["log_item_id"] or 0))
+            hint = candidates[0]
+            self._resume_hint = {
+                "track_id": hint["track_id"],
+                "position": hint["position"],
+                "log_item_id": hint["log_item_id"],
+            }
+            print(
+                f"  Resume hint: track {hint['track_id']} at {hint['position']:.1f}s "
+                f"(log_item {hint['log_item_id']}, slot {hint['slot']}, age {age:.1f}s)"
+            )
         except Exception as exc:
             print(f"  Resume hint read failed (non-fatal): {exc}")
+
+    def _apply_resume_hint_queue_rewind(self):
+        """Called AFTER _load_current_hour_log. If we have a resume
+        hint carrying a log_item_id, walk the queue and back the
+        cursor up to that item so it loads first when
+        _start_next_track fires. If the hint's LogItem isn't in the
+        current-hour queue (e.g. the log was regenerated across the
+        restart), leave the cursor alone and let the normal flow
+        proceed; the resume-hint's track_id match in _create_deck
+        won't fire, and playback starts fresh -- same as pre-fix."""
+        hint = getattr(self, "_resume_hint", None)
+        if not hint or not hint.get("log_item_id"):
+            return
+        if not hasattr(self, "log_items") or not self.log_items:
+            return
+        target = hint["log_item_id"]
+        for idx, item in enumerate(self.log_items):
+            if item.id == target:
+                # Only rewind (never advance) -- the cursor may already
+                # be at target from _load_current_hour_log's own
+                # resume-at logic; leave it alone in that case.
+                if getattr(self, "_queue_cursor", 0) > idx:
+                    print(f"  Resume queue cursor: rewinding {self._queue_cursor} -> {idx}")
+                    self._queue_cursor = idx
+                return
 
     # ------------------------------------------------------------------
     # FX bus (one-shot audio carts / hotkeys)
@@ -4185,6 +4256,19 @@ class PlaybackEngine:
                 t = deck.track
                 decks_out[slot] = {
                     "track_id": t.id,
+                    # log_item_id is the auto-resume key. The queue
+                    # cursor advances past a LogItem the moment its
+                    # deck is created, so at any mid-crossfade
+                    # moment the cursor is already past whatever
+                    # deck A is playing. On restart, _read_resume_hint
+                    # uses this to back the cursor UP to whichever
+                    # LogItem the crossfading track was on -- so the
+                    # correct LogItem loads first and its track_id
+                    # matches the hint for the seek. Without this,
+                    # a mid-crossfade restart correctly captures the
+                    # hint but the wrong LogItem loads first, no
+                    # match, no seek.
+                    "log_item_id": deck.log_item.id if deck.log_item else None,
                     "title": t.title,
                     "artist": t.artist.name if t.artist else "",
                     "album": t.album.title if t.album else "",
