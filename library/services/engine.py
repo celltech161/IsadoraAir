@@ -2010,6 +2010,35 @@ class PlaybackEngine:
         fx_pad = self.master_mixer.request_pad_simple("sink_%u")
         self.fx_bus_gain.get_static_pad("src").link(fx_pad)
 
+        # Permanent silence source into fx_submix. Without this, the
+        # FX sub-mixer has no upstream data when no fire is active,
+        # and the downstream chain (master_mixer -> alsasink) drifts
+        # into a cold state -- the first fire after idle then loses
+        # its leading edge while the path spins back up. Live silence
+        # keeps the mixer/sink continuously producing buffers so a
+        # fresh fire's audio hits a hot path from buffer 0. Same
+        # pattern the RemoteDJ persistent subchain and the deck
+        # silence prime already use for the same underlying reason.
+        fx_silence_src = Gst.ElementFactory.make("audiotestsrc", "fx_silence_src")
+        fx_silence_src.set_property("wave", "silence")
+        # is-live tells downstream this is a real-time source producing
+        # per-clock-tick, so the mixer treats its timestamps as "now"
+        # instead of racing them.
+        fx_silence_src.set_property("is-live", True)
+        fx_silence_caps = Gst.ElementFactory.make("capsfilter", "fx_silence_caps")
+        fx_silence_caps.set_property("caps", Gst.Caps.from_string(
+            f"audio/x-raw,rate={self.pipeline_sample_rate},channels=2"
+        ))
+        self.main_pipeline.add(fx_silence_src)
+        self.main_pipeline.add(fx_silence_caps)
+        fx_silence_src.link(fx_silence_caps)
+        silence_pad = self.fx_submix.request_pad_simple("sink_%u")
+        fx_silence_caps.get_static_pad("src").link(silence_pad)
+        # Retain refs so nothing gets GC'd; never released.
+        self._fx_silence_src = fx_silence_src
+        self._fx_silence_caps = fx_silence_caps
+        self._fx_silence_pad = silence_pad
+
         self._fx_fires = {}   # fire_id -> {cart_id, filesrc, decodebin, convert, resample, pad, started_at, duration}
         self._fx_next_id = 1
         self._fx_lock = threading.Lock()
