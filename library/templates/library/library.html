@@ -601,9 +601,54 @@ document.querySelectorAll('th[data-sort]').forEach(th => {
       currentDir = 'asc';
     }
     currentPage = 1;
+    saveFilters();
     loadTracks();
   });
 });
+
+// --- Filter persistence -------------------------------------------
+// Category, ready-to-air, sort column, and sort direction are saved
+// to localStorage so returning to /library/ from anywhere brings back
+// the last-used view. Search text is deliberately NOT persisted --
+// operators typing "let it be" today probably don't want to reopen
+// tomorrow filtered to that; a fresh search box on load matches
+// most people's expectation.
+const LIBRARY_FILTER_KEY = 'isadoraair.library.filters.v1';
+
+function saveFilters() {
+  try {
+    localStorage.setItem(LIBRARY_FILTER_KEY, JSON.stringify({
+      category: document.getElementById('categoryFilter').value,
+      ready:    document.getElementById('readyFilter').value,
+      sort:     currentSort,
+      dir:      currentDir,
+    }));
+  } catch (e) { /* private mode / disabled -- silent no-op */ }
+}
+
+function loadFilters() {
+  try {
+    const raw = localStorage.getItem(LIBRARY_FILTER_KEY);
+    if (!raw) return;
+    const state = JSON.parse(raw);
+    if (state.category) {
+      const el = document.getElementById('categoryFilter');
+      // Only apply if the value still exists as an option -- a
+      // category might have been renamed/deleted since last visit.
+      if ([...el.options].some(o => o.value === state.category)) {
+        el.value = state.category;
+      }
+    }
+    if (state.ready) {
+      const el = document.getElementById('readyFilter');
+      if ([...el.options].some(o => o.value === state.ready)) {
+        el.value = state.ready;
+      }
+    }
+    if (state.sort) currentSort = state.sort;
+    if (state.dir)  currentDir  = state.dir;
+  } catch (e) { /* malformed / disabled -- fall through to defaults */ }
+}
 
 // Search with debounce
 document.getElementById('searchInput').addEventListener('input', () => {
@@ -617,14 +662,18 @@ document.getElementById('searchInput').addEventListener('input', () => {
 // Filter changes
 document.getElementById('categoryFilter').addEventListener('change', () => {
   currentPage = 1;
+  saveFilters();
   loadTracks();
 });
 document.getElementById('readyFilter').addEventListener('change', () => {
   currentPage = 1;
+  saveFilters();
   loadTracks();
 });
 
-// Initial load
+// Initial load -- restore saved filter state first so loadTracks
+// picks up the last-used view.
+loadFilters();
 loadTracks();
 </script>
 {% endblock %}
