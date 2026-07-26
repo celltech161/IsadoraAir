@@ -11,6 +11,7 @@ https://docs.djangoproject.com/en/5.2/ref/settings/
 """
 
 from decouple import config
+from django.core.exceptions import ImproperlyConfigured
 from pathlib import Path
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
@@ -20,11 +21,28 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/5.2/howto/deployment/checklist/
 
-# SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = config('SECRET_KEY', default='django-insecure-mgl(1gz6l^$j*(q+-8+9rp3n%2=7l0sr9$iu-lapa4^_!2%#&+')
-
 # SECURITY WARNING: don't run with debug turned on in production!
+# Parsed BEFORE SECRET_KEY so we can require a real key in production.
 DEBUG = config('DEBUG', default=False, cast=bool)
+
+# SECURITY WARNING: keep the secret key used in production secret!
+# In development (DEBUG=True) a hardcoded dev-only fallback keeps
+# fresh checkouts runnable without editing .env first. In production
+# (DEBUG=False) SECRET_KEY MUST come from the environment -- silently
+# falling back to the shared dev key would let a broken .env boot
+# a "working" server whose session cookies, password reset tokens,
+# and CSRF tokens are all forgeable by anyone with a git clone.
+_SECRET_KEY_DEV_FALLBACK = 'django-insecure-mgl(1gz6l^$j*(q+-8+9rp3n%2=7l0sr9$iu-lapa4^_!2%#&+'
+SECRET_KEY = config('SECRET_KEY', default='') or (
+    _SECRET_KEY_DEV_FALLBACK if DEBUG else ''
+)
+if not SECRET_KEY:
+    raise ImproperlyConfigured(
+        "SECRET_KEY is required when DEBUG=False. Set it in .env "
+        "(generate one with: "
+        "python -c 'from django.core.management.utils import get_random_secret_key; "
+        "print(get_random_secret_key())')."
+    )
 
 ALLOWED_HOSTS = config(
     'ALLOWED_HOSTS',

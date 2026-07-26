@@ -202,73 +202,284 @@ IsadoraAir (Django 5.2 LTS)
 
 ## Setup
 
-```bash
-# Clone
-git clone git@github.com:celltech161/IsadoraAir.git /opt/isadoraair
-cd /opt/isadoraair
+Ubuntu 26.04 LTS is the tested target. Any modern Debian/Ubuntu should work
+with equivalent package names. This walkthrough goes from a fresh box to
+audible playback.
 
-# System packages the playback engine needs (GStreamer + PyGObject bindings,
-# ALSA output, plus a decoder set covering the library's actual formats)
+### 1. System packages
+
+```bash
+# Postgres (server + Python client build headers) and web server
+sudo apt install postgresql postgresql-contrib libpq-dev nginx
+
+# Python + build essentials for pip wheels that need to compile
+sudo apt install python3 python3-venv python3-dev build-essential
+
+# GStreamer (playback engine core) with a decoder set covering the
+# formats a real library actually contains
 sudo apt install python3-gi gir1.2-gstreamer-1.0 gstreamer1.0-alsa \
   gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
   gstreamer1.0-plugins-ugly gstreamer1.0-libav
 
-# Liquidsoap (streaming encoders) and ALSA utils (mixer control enumeration
-# for the hardware admin, device listing)
-sudo apt install liquidsoap alsa-utils
+# Liquidsoap (streaming encoders), ALSA utils (mixer control enumeration
+# for the hardware admin, device listing), ffmpeg (waveform + cue-point
+# analysis, syndicated-show processing)
+sudo apt install liquidsoap alsa-utils ffmpeg
 
 # CD ripping toolchain -- whipper drives cdparanoia + flac; libdiscid is
 # the disc-ID library the Python `discid` package binds to. Skip these
 # if the box has no optical drive.
-sudo apt install whipper cdparanoia flac
+sudo apt install whipper cdparanoia flac libdiscid0
+```
 
-# Virtual environment (--system-site-packages so PyGObject/gi, which is an
-# OS package above, is visible inside the venv)
+### 2. ALSA loopback module (only if using StereoTool or a similar
+external processor)
+
+IsadoraAir's engine can feed a virtual ALSA loopback device that
+StereoTool reads from -- the "canonical digital mix out to processor,
+processed audio back in" path. If you're not running an external
+processor, skip this step and send the engine straight to your real
+sound card.
+
+```bash
+# Enable snd-aloop at boot
+echo snd-aloop | sudo tee /etc/modules-load.d/snd-aloop.conf
+sudo modprobe snd-aloop
+```
+
+### 3. PostgreSQL — create the database and user
+
+```bash
+sudo -u postgres psql <<'SQL'
+CREATE USER isadoraair WITH PASSWORD 'change-me-in-.env';
+CREATE DATABASE isadoraair OWNER isadoraair;
+GRANT ALL PRIVILEGES ON DATABASE isadoraair TO isadoraair;
+SQL
+```
+
+Whatever password you set here goes into `.env` in step 6.
+
+### 4. Runtime directories
+
+IsadoraAir writes to a few paths outside the repo. Create them with the
+right ownership before the engine tries to use them:
+
+```bash
+sudo mkdir -p /srv/isadoraair/music /srv/isadoraair/waveforms
+sudo mkdir -p /var/lib/isadoraair/weather
+# Replace 'youruser' with whichever account will run the services
+sudo chown -R youruser:youruser /srv/isadoraair /var/lib/isadoraair
+```
+
+`/run/isadoraair/` (used for the engine's live state JSON) is created
+automatically by the tmpfiles config in `deploy/` — no manual step
+needed if you install the systemd units.
+
+### 5. Clone + Python environment
+
+```bash
+git clone https://github.com/celltech161/IsadoraAir.git /opt/isadoraair
+cd /opt/isadoraair
+
+# --system-site-packages so PyGObject/gi (installed above as an OS
+# package) is visible inside the venv
 python3 -m venv venv --system-site-packages
 source venv/bin/activate
 pip install -r requirements.txt
-
-# Environment
-cp .env.example .env  # Edit with your database credentials
-
-# Database
-python manage.py migrate
-
-# Create admin user
-python manage.py createsuperuser
-
-# Import music library
-python manage.py import_songs /path/to/music
-
-# Analyze tracks (waveforms, cue points)
-python manage.py analyze_tracks
-
-# Run the web app
-python manage.py runserver
-
-# Run the playback engine (separate process — this is what actually
-# outputs audio; runserver alone won't play anything)
-python manage.py run_engine
-
-# Optional separate processes — streaming, RDS, and health monitoring
-# each run independently and aren't required for basic playback
-python manage.py run_encoders
-python manage.py run_rbds
-python manage.py run_monitoring
 ```
 
-See `deploy/` for nginx and systemd service configs for production — each
-long-running process above (`isadoraair-gunicorn`, `isadoraair-engine`,
-`isadoraair-encoders`, `isadoraair-rbds`, `isadoraair-monitoring`) runs as
-its own systemd unit; timer-driven jobs (backup, EmailLog prune,
-syndicated ingestions, weather, Bluesky poster) each ship as a
-`.service`/`.timer` pair. `isadoraair-backup.timer` runs a nightly
-database dump + app tree + live-config backup, pushed off-box via SFTP —
-the script itself (`backup_isadoraair.sh`) lives outside the repo at
-`~/bin/`, alongside its `~/.iasboxbu.cred` remote-target credentials.
-Syndicated ingestion and the Bluesky poster scripts also live outside
-the repo at `~/syndicated-ingest/` (own venv, separate from this
-project's), with credentials in `~/.syndicated_ingest.cred`.
+### 6. Environment file
+
+```bash
+cp .env.example .env
+```
+
+Edit `.env` and set at least:
+
+- `SECRET_KEY` — required in production (DEBUG=False will refuse to
+  start without one). Generate a fresh key:
+  ```bash
+  python -c "from django.core.management.utils import get_random_secret_key; print(get_random_secret_key())"
+  ```
+- `DB_PASSWORD` — the password you set in step 3.
+- `MUSICBRAINZ_CONTACT` — an email address MusicBrainz can reach you
+  at. Their API requires it in every request's User-Agent; leaving the
+  default `unset@example.invalid` will get your ISRC backfills
+  rate-limited or blocked.
+- `LIBRARY_ROOT` — the path where the music library lives (probably
+  `/srv/isadoraair/music` from step 4).
+
+### 7. Database migrations + admin user
+
+```bash
+python manage.py migrate
+python manage.py createsuperuser
+```
+
+### 8. Import your music library
+
+Point `import_songs` at a directory tree of audio files. It walks
+recursively, reads tags via mutagen, and populates the Track / Artist
+/ Album / Category tables. Category is taken from the top-level folder
+name under `LIBRARY_ROOT`:
+
+```
+/srv/isadoraair/music/
+    Rock/
+        Artist Name/
+            Album Title/
+                01 Track.mp3
+    Country/
+        ...
+    Enhanced/        <- syndicated show category
+        enhanced.flac
+```
+
+```bash
+python manage.py import_songs /srv/isadoraair/music
+python manage.py check_categories   # flags folders whose Category is not created yet
+```
+
+Categories need to exist in the DB before import — create them at
+`/admin/library/category/` first, or run `check_categories` and it
+will tell you which folders are missing.
+
+### 9. Analyze tracks (waveforms, cue points)
+
+```bash
+python manage.py analyze_tracks
+```
+
+Generates waveform PNGs and preliminary cue-in / cue-out / intro-until
+/ outro-starts markers for every track. Runs in the background if
+you install the systemd timer; the initial pass on a large library
+can take hours.
+
+### 10. Run the web app and playback engine
+
+For a first-run smoke test, run them in the foreground in two shells:
+
+```bash
+# Shell 1 — web UI on http://localhost:8000
+python manage.py runserver 0.0.0.0:8000
+
+# Shell 2 — the playback engine (this is what actually produces audio;
+# runserver alone plays nothing)
+python manage.py run_engine
+```
+
+Open `http://<your-box>:8000/`, log in as the superuser you created,
+and follow the dashboard from there. The engine will start
+auto-playing whatever is scheduled the moment you build a log.
+
+### 11. Optional: streaming, RDS, monitoring
+
+Each of these is a separate long-running process. None is required
+for basic playback:
+
+```bash
+python manage.py run_encoders    # Icecast/Shoutcast relay
+python manage.py run_rbds        # RDS text to the transmitter
+python manage.py run_monitoring  # System + transmitter health checks
+```
+
+### 12. Production: systemd units + nginx
+
+See `deploy/` for the full production setup — every long-running
+process above (`isadoraair-gunicorn`, `isadoraair-engine`,
+`isadoraair-encoders`, `isadoraair-rbds`, `isadoraair-monitoring`)
+runs as its own systemd unit. Timer-driven jobs (backup, EmailLog
+prune, syndicated ingestions, weather, Bluesky poster) each ship as
+a `.service`/`.timer` pair. `isadoraair-backup.timer` runs a nightly
+database dump + app tree + live-config backup, pushed off-box via
+SFTP — the script itself (`backup_isadoraair.sh`) lives outside the
+repo at `~/bin/`, alongside its `~/.iasboxbu.cred` remote-target
+credentials. Syndicated ingestion and the Bluesky poster scripts
+also live outside the repo at `~/syndicated-ingest/` (own venv,
+separate from this project's), with credentials in
+`~/.syndicated_ingest.cred`.
+
+## Migrating from NextKast, Rivendell, or another automation system
+
+Some things worth knowing if you're coming from an existing station
+running something else. This isn't an import tool — it's a
+lay-of-the-land so you know what maps to what.
+
+**Your existing music library moves with you.** IsadoraAir doesn't care
+what created the audio files. Point `import_songs` at the directory
+tree you already have; the mutagen-based tag reader handles MP3,
+FLAC, WAV (both ID3 and RIFF LIST-INFO), M4A, Ogg, MP2, AIFF, and
+ALAC. Category comes from the top-level folder name, so a Rivendell
+`Group`-style organization already carries over if your folders are
+grouped that way. If they're not, restructuring the folder tree is a
+one-time `mv` operation before import.
+
+**ISRC codes auto-populate from tags.** If your existing library
+already has ISRC written into the ID3v2 TSRC or Vorbis ISRC frame,
+`import_songs` picks them up and stores them for royalty reporting.
+Whatever's missing can be filled in overnight by the MusicBrainz
+backfill command (`backfill_isrc_musicbrainz`) — expect ~10% hit
+rate on typical station music, more on well-catalogued genres.
+
+**Rotations and Playlists are separate concepts** — this parallels
+Rivendell's Clocks vs Log approach.
+- A `Rotation` is an ordered list of category slots (or specific
+  tracks) that the log builder walks to fill an hour. Category
+  slots pick randomly from that category respecting recency
+  separation, exactly like Rivendell's scheduler.
+- A `Playlist` is a curated ordered list of specific tracks that
+  the log builder copies verbatim, in order, no random picking.
+- A `ScheduleBlock` maps either a Rotation or Playlist onto real
+  time — recurring weekly patterns (day-of-week / hour) OR one-off
+  overrides for a specific date.
+
+**There's no separate workstation install per operator.** Everything
+is web-based. Any operator with a browser and login credentials can
+do anything they have permission for from anywhere — including live
+DJ shifts via the WebRTC Remote DJ console. A NextKast admin
+juggling three separate machine installs will find this a large
+quality-of-life improvement.
+
+**Audio quality is codec-discipline, not framework.** IsadoraAir uses
+GStreamer where NextKast uses BASS and Rivendell uses libsndfile;
+the audible result is the same when you avoid unnecessary format
+conversions between decode and encode. Everything decodes into a
+canonical 44100/2/s16 (or float, depending on the pipeline stage)
+program bus, gets mixed once, and encoded once per destination — no
+cascaded re-encoding.
+
+**Commercial-style traffic (underwriting, affidavits, spot rotation)
+is not in the current release.** If your station runs a heavy
+underwriting schedule and needs affidavit-quality proof-of-play
+reports for sponsors today, that piece is on the near-term roadmap
+but not shipped yet. Community stations that only track
+music/programming rotations are fully covered.
+
+**No commercial license fee, no per-workstation seat.** IsadoraAir is
+AGPLv3 — you can run it commercially, modify it, redistribute it.
+The AGPL's network-service clause means if you host a modified
+version as a public web service, that modified source has to be
+available to the service's users. For an on-air station running an
+unmodified copy internally, this changes nothing.
+
+**Rough feature parity check** — most of what NextKast or Rivendell
+does day-to-day is present:
+
+| Feature | IsadoraAir |
+|---|---|
+| Multi-deck crossfade | Yes — dual-deck GStreamer mixer |
+| Category/rotation scheduler | Yes — see Rotations above |
+| Voice tracks | Yes — browser recorder, in-browser editor, engine state-machine handoff |
+| Live assist / manual mode | Yes — dashboard override |
+| Web request handling | Not yet |
+| Remote DJ | Yes — WebRTC, full queue authority, mix-minus monitor return |
+| Icecast/Shoutcast streaming | Yes — Liquidsoap-based relay |
+| RDS/RBDS to transmitter | Yes — StereoTool RDS client |
+| CD ripping | Yes — whipper + MusicBrainz metadata lookup |
+| Waveform display + cue points | Yes — auto-analyzed on import |
+| Multiple simultaneous encoders | Via Liquidsoap; not first-class in the admin yet |
+| Traffic (underwriting/affidavits) | Not yet — planned |
+| EAS integration | Permanently external (hardware ENDEC upstream) |
 
 **Note on the `deploy/` unit files:** paths and the run-as user are
 `@@PLACEHOLDER@@` tokens (`@@ISA_USER@@`, `@@ISA_ROOT@@`, etc). See
