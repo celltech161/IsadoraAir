@@ -4,6 +4,8 @@ from django.db import models
 from django.contrib.postgres.fields import ArrayField
 from django.contrib.postgres.indexes import GinIndex
 
+from library.storage import royalty_report_storage
+
 
 # ---------------------------------------------------------------
 # Lookup / supporting models
@@ -1773,12 +1775,12 @@ class RoyaltyReport(models.Model):
     an admin from bulk-deleting old rows) the report file stays
     accurate to what was submitted to the licensor.
 
-    Files land in MEDIA_ROOT/royalty_reports/. Filename is
-    <period_start>-<format>.<ext>, e.g. 2026-07-01-soundexchange_nce.csv.
-    Access-gated (view side only allows staff/superuser to see or
-    generate); the underlying file is served through the view, not
-    directly by nginx, so an accidentally-leaked URL doesn't bypass
-    the auth check."""
+    Files land in REPORTS_ROOT (default /var/lib/isadoraair/reports/,
+    overridable via .env). Filename is <period_start>-<format>.<ext>,
+    e.g. 2026-07-01-soundexchange_nce.csv. Access-gated (view side
+    only allows staff/superuser to see or generate); the underlying
+    file is served through the view, not directly by nginx, so an
+    accidentally-leaked URL doesn't bypass the auth check."""
 
     FORMAT_CHOICES = [
         ("soundexchange_nce", "SoundExchange NCE (Report of Use)"),
@@ -1819,7 +1821,12 @@ class RoyaltyReport(models.Model):
     ath_override = models.FloatField(null=True, blank=True)
     ath_used = models.FloatField(null=True, blank=True)
 
-    file = models.FileField(upload_to="royalty_reports/", blank=True, null=True)
+    file = models.FileField(
+        storage=royalty_report_storage,
+        upload_to="",
+        blank=True,
+        null=True,
+    )
 
     class Meta:
         ordering = ["-period_start", "-generated_at"]

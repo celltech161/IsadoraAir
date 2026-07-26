@@ -266,10 +266,21 @@ right ownership before the engine tries to use them:
 
 ```bash
 sudo mkdir -p /srv/isadoraair/music /srv/isadoraair/waveforms
-sudo mkdir -p /var/lib/isadoraair/weather
+sudo mkdir -p /var/lib/isadoraair/weather /var/lib/isadoraair/reports
 # Replace 'youruser' with whichever account will run the services
 sudo chown -R youruser:youruser /srv/isadoraair /var/lib/isadoraair
 ```
+
+Purposes:
+- `/srv/isadoraair/music` — audio library root (matches `LIBRARY_ROOT`
+  in `.env`).
+- `/srv/isadoraair/waveforms` — pre-analyzed waveform PNGs (generated
+  by `analyze_tracks` in step 9).
+- `/var/lib/isadoraair/weather` — cached forecasts + alerts polled by
+  the weather-ingest timer.
+- `/var/lib/isadoraair/reports` — generated royalty / SoundExchange
+  filings (persisted from the `/reports/` web page; overridable via
+  the `REPORTS_ROOT` env var).
 
 `/run/isadoraair/` (used for the engine's live state JSON) is created
 automatically by the tmpfiles config in `deploy/` — no manual step

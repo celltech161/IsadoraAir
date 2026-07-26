@@ -8,10 +8,10 @@ Usage:
     python manage.py royalty_report --month 2026-07 --output /tmp/nce-2026-07.csv
 
 Default writes the generated content to stdout for shell redirection.
---persist saves a RoyaltyReport row + copy of the file to
-MEDIA_ROOT/royalty_reports/ so the /reports/ web page can list and
-re-download it later. --output writes to a specific path in addition
-to (or instead of) stdout.
+--persist saves a RoyaltyReport row + copy of the file to REPORTS_ROOT
+(default /var/lib/isadoraair/reports/, override via .env) so the
+/reports/ web page can list and re-download it later. --output writes
+to a specific path in addition to (or instead of) stdout.
 
 Filter policy: Music-category-kind plays only, 30-second SoundExchange
 threshold applied at query time. Raw CSV format ignores both filters

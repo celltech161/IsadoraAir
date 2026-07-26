@@ -3157,9 +3157,10 @@ def api_reports_generate(request):
 
 def reports_download(request, pk):
     """Serves a persisted report file through Django (not directly by
-    nginx) so the access check is enforced -- an accidentally-shared
-    /media/royalty_reports/... URL would bypass auth if we served it
-    statically."""
+    nginx) so the access check is enforced. Files live outside the
+    web-served MEDIA_ROOT tree entirely (REPORTS_ROOT, default
+    /var/lib/isadoraair/reports/) -- there is no direct static URL
+    that could be leaked, so this view is the only path in."""
     denied = _reports_permission_check(request)
     if denied:
         return denied

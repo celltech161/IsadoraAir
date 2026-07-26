@@ -214,6 +214,14 @@ STATIC_ROOT = BASE_DIR / 'staticfiles'
 MEDIA_URL = 'media/'
 MEDIA_ROOT = BASE_DIR / 'media'
 
+# Royalty reports live OUTSIDE MEDIA_ROOT because they're operational
+# data (station's own generated regulatory filings) and don't belong
+# in the repo tree or the media/ URL space. Overridable via .env so
+# a fresh box can put them somewhere else if needed. The directory
+# must exist and be writable by the service user before the /reports/
+# page is used; see README step 4.
+REPORTS_ROOT = config('REPORTS_ROOT', default='/var/lib/isadoraair/reports')
+
 LIBRARY_ROOT = config('LIBRARY_ROOT', default='/srv/isadoraair/music')
 WAVEFORMS_DIR = config('WAVEFORMS_DIR', default='/srv/isadoraair/waveforms')
 
