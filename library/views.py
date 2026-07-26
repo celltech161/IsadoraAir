@@ -1098,6 +1098,7 @@ def _delete_track_and_file(track):
     so the same shape works whether an operator triggers it from the
     UI or an ingest pipeline recalls a delivered file."""
     from django.db.models.deletion import ProtectedError
+    from library.models import PlaylistItem, RotationSlot
     filepath = track.filepath
     waveform_path = track.waveform_path
     try:
@@ -1106,16 +1107,36 @@ def _delete_track_and_file(track):
         # Django raises this when a PROTECT FK still points at this
         # Track (Playlist.items.track and RotationSlot.track -- see
         # library/models.py). Turn it into a user-actionable message
-        # rather than a 500. `exc.protected_objects` is the queryset of
-        # rows blocking; count is enough for a top-line, and the
-        # message names the model so the operator knows where to
-        # look.
-        protectors = list(exc.protected_objects)
-        kinds = {}
-        for p in protectors:
-            kind = type(p).__name__
-            kinds[kind] = kinds.get(kind, 0) + 1
-        parts = [f"{n} {k}" for k, n in kinds.items()]
+        # rather than a 500, naming the specific parent Rotation /
+        # Playlist so the operator can jump straight to it instead of
+        # hunting through every rotation for the offending slot.
+        rotations = set()
+        playlists = set()
+        other = {}
+        for p in exc.protected_objects:
+            if isinstance(p, RotationSlot):
+                if p.rotation_id:
+                    rotations.add(p.rotation.name)
+            elif isinstance(p, PlaylistItem):
+                if p.playlist_id:
+                    playlists.add(p.playlist.name)
+            else:
+                kind = type(p).__name__
+                other[kind] = other.get(kind, 0) + 1
+
+        def _joined(kind_singular, names):
+            names = sorted(names)
+            label = kind_singular if len(names) == 1 else kind_singular + "s"
+            quoted = ", ".join(f"'{n}'" for n in names)
+            return f"{label} {quoted}"
+
+        parts = []
+        if rotations:
+            parts.append(_joined("rotation", rotations))
+        if playlists:
+            parts.append(_joined("playlist", playlists))
+        for kind, n in other.items():
+            parts.append(f"{n} {kind}")
         return False, f"still referenced by {', '.join(parts)} -- remove from those first"
 
     # Only clean up on-disk artifacts after the DB delete succeeded --
