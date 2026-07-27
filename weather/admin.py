@@ -2,7 +2,7 @@ from django.contrib import admin
 from django.http import HttpResponseRedirect
 from django.urls import reverse
 
-from .models import WeatherConfig
+from .models import AmberAlertConfig, WeatherConfig
 
 
 @admin.register(WeatherConfig)
@@ -41,4 +41,42 @@ class WeatherConfigAdmin(admin.ModelAdmin):
         obj = WeatherConfig.load()
         return HttpResponseRedirect(
             reverse("admin:weather_weatherconfig_change", args=[obj.pk])
+        )
+
+
+@admin.register(AmberAlertConfig)
+class AmberAlertConfigAdmin(admin.ModelAdmin):
+    fieldsets = [
+        ("Master Switch", {
+            "fields": ["enabled"],
+            "description": "OFF by default. Nothing polls, speaks, or inserts until this is on. "
+                            "Read the CAP event-code and area-filter settings below before you flip it.",
+        }),
+        ("IPAWS Feed", {
+            "fields": ["ipaws_base_url", "poll_cadence_minutes"],
+        }),
+        ("What to Include", {
+            "fields": ["event_codes", "same_codes"],
+            "description": "Event codes are CAP/SAME 3-letter mnemonics (BLU/CAE/MEP by default). "
+                            "SAME area codes are 6-digit state+county FIPS -- 020000 for a whole "
+                            "state, 020139 for Ottawa County KS specifically.",
+        }),
+        ("Speech Formatting", {
+            "fields": ["include_instruction_in_forecast"],
+            "description": "Unlike weather safety instructions, the 'instruction' field on "
+                            "AMBER alerts is usually the tip-line phone number -- typically "
+                            "worth repeating on every scheduled forecast, not just the urgent insert.",
+        }),
+    ]
+
+    def has_add_permission(self, request):
+        return not AmberAlertConfig.objects.exists()
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+    def changelist_view(self, request, extra_context=None):
+        obj = AmberAlertConfig.load()
+        return HttpResponseRedirect(
+            reverse("admin:weather_amberalertconfig_change", args=[obj.pk])
         )

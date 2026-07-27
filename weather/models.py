@@ -1,6 +1,21 @@
 from django.db import models
 
 
+DEFAULT_AMBER_EVENT_CODES = "BLU,CAE,MEP"
+
+DEFAULT_AMBER_SAME_CODES = ",".join([
+    "020027",  # Clay, KS
+    "020029",  # Cloud, KS
+    "020041",  # Dickinson, KS
+    "020053",  # Ellsworth, KS
+    "020105",  # Lincoln, KS
+    "020123",  # Mitchell, KS
+    "020139",  # Ottawa, KS
+    "020169",  # Saline, KS
+    "020000",  # Kansas statewide -- also match state-scoped alerts
+])
+
+
 class WeatherConfig(models.Model):
     """Singleton -- station location, NWS lookup parameters, and the
     day/night voice schedule for the weather announcer pipeline. These
@@ -104,3 +119,123 @@ class WeatherConfig(models.Model):
             obj.voice_schedule = [["day", 3, 8], ["night", 9, 14], ["day", 15, 20], ["night", 21, 2]]
             obj.save()
         return obj
+
+
+class AmberAlertConfig(models.Model):
+    """Singleton -- IPAWS OPEN configuration for AMBER (Child Abduction
+    Emergency), Blue Alert (law-enforcement-officer down), and Missing
+    and Endangered Persons alerts. FCC does NOT mandate these on a
+    small-station license; radio stations carry them as a community-
+    service voluntary broadcast. This config lets the operator opt in
+    per event code, and filter to a specific area of interest so a
+    Miami AMBER doesn't air on a Kansas station.
+
+    Data flows through the same shape as the weather alert pipeline:
+
+      IPAWS OPEN /rest/feed  (Atom summaries)
+              -> filter by event code + statefips
+              -> follow each entry's link for the full CAP 1.2 XML
+              -> filter by SAME area code overlap
+              -> fingerprint the surviving set
+      change  -> synthesize with the on-duty Kokoro voice
+              -> deliver + insert_urgent (analog to wx_alert.py)
+      active  -> append text_core to the next scheduled forecast
+
+    Signature verification is deliberately NOT implemented -- HTTPS to
+    apps.fema.gov is the trust anchor, per operator decision. If that
+    posture changes, wire in FEMA's IdenTrust cert bundle + XML DSig
+    validation before the fingerprint check.
+    """
+
+    enabled = models.BooleanField(
+        default=False,
+        help_text=(
+            "Master switch. When off, the pipeline never polls IPAWS "
+            "and never speaks or inserts anything. Everything else in "
+            "this form is inert while off. Off by default so a fresh "
+            "install doesn't start airing AMBER Alerts before the "
+            "operator has reviewed the terms and area filters."
+        ),
+    )
+
+    ipaws_base_url = models.URLField(
+        max_length=200,
+        default="https://apps.fema.gov/IPAWSOPEN_EAS_SERVICE",
+        help_text=(
+            "IPAWS OPEN service root. The poller reads /rest/feed under "
+            "this base for the Atom summary and /rest/eas/{id} for each "
+            "full CAP message. Only change this if FEMA moves the "
+            "endpoint or if you're pointing at a private mirror for "
+            "testing."
+        ),
+    )
+
+    event_codes = models.CharField(
+        max_length=200,
+        default=DEFAULT_AMBER_EVENT_CODES,
+        help_text=(
+            "Comma-separated CAP/SAME event codes to include. Defaults "
+            "cover the three we care about: BLU (Blue Alert -- law "
+            "enforcement officer down), CAE (Child Abduction Emergency "
+            "-- AMBER), MEP (Missing and Endangered Persons)."
+        ),
+    )
+
+    same_codes = models.CharField(
+        max_length=500,
+        default=DEFAULT_AMBER_SAME_CODES,
+        help_text=(
+            "Comma-separated 6-digit SAME area codes to include. First "
+            "two digits are the state FIPS (Kansas = 20), last four "
+            "are the county FIPS (000 for statewide). Defaults cover "
+            "the eight KS counties in the KOGR-LP listening area plus "
+            "020000 for state-scoped alerts."
+        ),
+    )
+
+    poll_cadence_minutes = models.PositiveIntegerField(
+        default=5,
+        help_text=(
+            "How often the poller checks the IPAWS feed. 5 minutes "
+            "matches the general practice for voluntary broadcasters "
+            "and stays under FEMA's rate ceiling. Lower is more "
+            "responsive but more API load; higher risks delayed "
+            "broadcast of a time-sensitive alert."
+        ),
+    )
+
+    include_instruction_in_forecast = models.BooleanField(
+        default=True,
+        help_text=(
+            "For AMBER-family alerts, the 'instruction' field is "
+            "usually the tip-line phone number -- the whole point of "
+            "the broadcast. Default ON means it's included in BOTH "
+            "the urgent insert AND the forecast append (unlike weather "
+            "safety instructions, which we drop from the forecast). "
+            "Turn off if you want the forecast to summarize only."
+        ),
+    )
+
+    class Meta:
+        verbose_name = "AMBER Alert Configuration"
+        verbose_name_plural = "AMBER Alert Configuration"
+
+    def __str__(self):
+        return f"AMBER Alert Configuration ({'enabled' if self.enabled else 'disabled'})"
+
+    def save(self, *args, **kwargs):
+        self.pk = 1
+        super().save(*args, **kwargs)
+
+    @classmethod
+    def load(cls):
+        obj, _ = cls.objects.get_or_create(pk=1)
+        return obj
+
+    @property
+    def event_codes_set(self):
+        return {c.strip().upper() for c in self.event_codes.split(",") if c.strip()}
+
+    @property
+    def same_codes_set(self):
+        return {c.strip() for c in self.same_codes.split(",") if c.strip()}
