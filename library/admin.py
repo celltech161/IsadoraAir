@@ -185,8 +185,8 @@ class RGBAColorWidget(forms.TextInput):
 
 @admin.register(CategoryKind)
 class CategoryKindAdmin(admin.ModelAdmin):
-    list_display = ["name", "code", "fill_color", "sort_order"]
-    list_editable = ["fill_color", "sort_order"]
+    list_display = ["name", "code", "fill_color", "sort_order", "send_to_tunein_air"]
+    list_editable = ["fill_color", "sort_order", "send_to_tunein_air"]
     ordering = ["sort_order", "name"]
 
     def formfield_for_dbfield(self, db_field, request, **kwargs):

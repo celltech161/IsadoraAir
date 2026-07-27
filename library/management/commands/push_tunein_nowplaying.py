@@ -43,7 +43,7 @@ class Command(BaseCommand):
                              help="Push even if the latest PlayEvent id matches last_pushed_play_event_id.")
 
     def handle(self, *args, **opts):
-        from library.models import PlayEvent, TuneInConfig
+        from library.models import CategoryKind, PlayEvent, TuneInConfig
 
         cfg = TuneInConfig.load()
         if not cfg.enabled:
@@ -58,6 +58,29 @@ class Command(BaseCommand):
 
         if not opts["force"] and latest.id == cfg.last_pushed_play_event_id:
             return  # already told TuneIn about this one
+
+        # Per-CategoryKind opt-in: only push kinds explicitly enabled at
+        # /admin/library/categorykind/. Do NOT bump
+        # last_pushed_play_event_id on skip -- when the next
+        # push-enabled kind airs, we still detect it as new. Compare
+        # case-insensitively because PlayEvent.category_kind is a
+        # snapshot of the human-facing name (e.g. "Mix Show") while
+        # CategoryKind.code is a lower-case slug ("mixshow"); the code
+        # is what we filter on. We resolve the code by name for
+        # robustness, then check its enabled flag.
+        kind_snapshot = (latest.category_kind or "").strip()
+        if kind_snapshot:
+            kind_row = CategoryKind.objects.filter(name__iexact=kind_snapshot).only(
+                "send_to_tunein_air", "code"
+            ).first()
+            if kind_row is not None and not kind_row.send_to_tunein_air:
+                return  # kind exists but is opted out -- silent no-op
+            if kind_row is None:
+                # A snapshot that no longer matches any live kind (kind was
+                # renamed since this PlayEvent was recorded). Play it safe
+                # and skip -- opting into an unknown kind shouldn't be
+                # automatic.
+                return
 
         # Blank title = nothing worth reporting (unusual, but engine
         # instrumentation could produce it during an odd deck fail).

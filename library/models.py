@@ -97,6 +97,17 @@ class CategoryKind(models.Model):
                    "for items of this kind in the dashboard's Coming Up list.",
     )
     sort_order = models.PositiveIntegerField(default=0)
+    send_to_tunein_air = models.BooleanField(
+        default=False,
+        verbose_name="Send to TuneIn AIR",
+        help_text=(
+            "Whether tracks of this kind are pushed to TuneIn's now-playing API "
+            "when they air. Turn OFF for kinds you don't want listeners to see "
+            "on TuneIn (imaging jingles, spots, station IDs). New kinds default "
+            "to OFF so an unexpected content category never pushes to TuneIn "
+            "until the operator explicitly opts it in."
+        ),
+    )
 
     class Meta:
         ordering = ["sort_order", "name"]
