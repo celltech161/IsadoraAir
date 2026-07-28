@@ -109,6 +109,15 @@ def mec_pi(pi_code: int, dsn: int = 0x00, psn: int = 0x00) -> bytes:
     return bytes([0x01, dsn, psn]) + struct.pack(">H", pi_code & 0xFFFF)
 
 
+def mec_ecc(ecc: int, dsn: int = 0x00, psn: int = 0x00) -> bytes:
+    """MEC 0x2E -- Extended Country Code. Transmitted by the exciter in
+    RDS group 1A, block 3 upper byte, variant 0. Fully qualifies the
+    country half of the PI code (leading nibble of PI + ECC = unique
+    country identifier per NRSC-4-B / EN 62106 Annex D).
+    Format: MEC DSN PSN MED(1). USA = 0xA0."""
+    return bytes([0x2E, dsn, psn, ecc & 0xFF])
+
+
 def mec_ps(text: str, dsn: int = 0x00, psn: int = 0x00) -> bytes:
     """MEC 0x02 -- Program Service name. Format: MEC DSN PSN MED(8),
     chars restricted to 0x20-0xFE per spec (non-conforming chars are

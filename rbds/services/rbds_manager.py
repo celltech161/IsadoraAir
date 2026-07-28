@@ -334,6 +334,12 @@ class RBDSManager:
         meds = []
         if config.pi_code:
             meds.append(uecp.mec_pi(int(config.pi_code, 16)))
+        if config.ecc:
+            # Rides right after PI so a receiver acquiring in the middle
+            # of a UECP send sees the two country-identifying elements
+            # together in the same frame -- max chance of a coherent
+            # (PI, ECC) tuple before the next frame boundary.
+            meds.append(uecp.mec_ecc(int(config.ecc, 16)))
         meds.append(uecp.mec_ps(ps))
         meds.append(uecp.mec_ta_tp(ta=config.ta, tp=config.tp))
         meds.append(uecp.mec_di(

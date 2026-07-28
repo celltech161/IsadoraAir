@@ -65,6 +65,20 @@ class RBDSConfig(models.Model):
         help_text="1-4 hex digit Program Identification code, e.g. 1000. Raw hex entry "
                    "only -- no callsign-to-PI calculator in this version.",
     )
+    ecc = models.CharField(
+        "ECC (Extended Country Code)",
+        max_length=2, blank=True, default="A0",
+        help_text="Two-hex-digit ECC transmitted in RDS group 1A variant 0 to fully "
+                   "qualify the PI's country. A0 for the USA (all NRSC-4-B / RBDS "
+                   "stations). Leave blank to omit -- receivers then fall back to the "
+                   "PI's leading nibble for country inference, which works for US "
+                   "stations because PI codes starting with 1..3 are unambiguously "
+                   "US, but doesn't help Euro-style receivers or diagnostic tools. "
+                   "UECP-only feature: StereoTool's ASCII dialect has no ECC command, "
+                   "so this field is silently ignored when Protocol is ASCII mode "
+                   "(the value is kept regardless so switching back to UECP doesn't "
+                   "lose it).",
+    )
     station_ps = models.CharField(
         max_length=8, blank=True,
         help_text="Static 8-character PS (Program Service name) shown when no dynamic "
@@ -148,6 +162,8 @@ class RBDSConfig(models.Model):
         errors = {}
         if self.pi_code and not re.fullmatch(r"[0-9A-Fa-f]{1,4}", self.pi_code):
             errors["pi_code"] = "Enter 1-4 hex digits, e.g. 1000."
+        if self.ecc and not re.fullmatch(r"[0-9A-Fa-f]{2}", self.ecc):
+            errors["ecc"] = "Enter exactly 2 hex digits, e.g. A0, or leave blank."
         if self.af_frequencies_mhz:
             for raw in self.af_frequencies_mhz.split(","):
                 raw = raw.strip()
