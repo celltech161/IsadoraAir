@@ -99,6 +99,8 @@ IsadoraAir manages the full music library, schedule programming, playlist genera
 
 **RBDS/RDS Encoder Client** (`rbds/` app, `isadoraair-rbds` service)
 - Sends station PS (with optional scrolling multi-frame rotation) and RadioText (RT/RT+) to StereoTool's RDS encoder, in either binary UECP or StereoTool's ASCII dialect
+- Extended Country Code (ECC) transmitted via UECP's Slow Labelling Codes command (RDS group 1A, variant 0) so receivers can fully qualify the PI code's country instead of inferring it from the PI's leading nibble alone — UECP only, StereoTool's ASCII dialect has no ECC command
+- Per-Category RBDS PTY (Program Type) override with an optional 8-character PTYN (Program Type Name) — lets a specific rotation category broadcast a different PTY than the station-wide default while its tracks are airing (e.g. a Sunday jazz block sending PTY=Jazz on top of an otherwise Rock station), configurable per category in Django admin or the `/categories/` frontend page; PTY override applies on both protocols, PTYN is UECP-only (no ASCII equivalent)
 - Promo rotation with priority-interrupt scheduling that returns to now-playing once shown; each message can source its text from a static field, a local file, or a URL
 - Read-only status dashboard; all configuration is admin-only
 
