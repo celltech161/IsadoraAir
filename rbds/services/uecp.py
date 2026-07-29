@@ -109,13 +109,66 @@ def mec_pi(pi_code: int, dsn: int = 0x00, psn: int = 0x00) -> bytes:
     return bytes([0x01, dsn, psn]) + struct.pack(">H", pi_code & 0xFFFF)
 
 
-def mec_ecc(ecc: int, dsn: int = 0x00, psn: int = 0x00) -> bytes:
-    """MEC 0x2E -- Extended Country Code. Transmitted by the exciter in
-    RDS group 1A, block 3 upper byte, variant 0. Fully qualifies the
-    country half of the PI code (leading nibble of PI + ECC = unique
-    country identifier per NRSC-4-B / EN 62106 Annex D).
-    Format: MEC DSN PSN MED(1). USA = 0xA0."""
-    return bytes([0x2E, dsn, psn, ecc & 0xFF])
+def mec_slow_labelling(variant: int, data: int, dsn: int = 0x00) -> bytes:
+    """MEC 0x1A -- Slow labelling codes. Edits RDS group 1A, block 3
+    (spec section 3.3.12). NO PSN field for this command -- confirmed
+    directly against the spec's own format table, which lists only
+    MEC/DSN/MED/MED (unlike PI/PS/etc, which all carry PSN too).
+
+    variant: 3-bit variant code (0-7) selecting which sub-field of
+        group 1A block 3 this data applies to (0 = Extended Country
+        Code, others cover PIN/language/TMC id per the RDS standard
+        itself -- the UECP spec defers per-variant field MEANINGS to
+        CENELEC prEN 50067, it only defines the wire format below).
+    data: 12-bit payload (0-0xFFF) specific to that variant.
+
+    Format: MEC(1) DSN(1) MED(1)[bit7=reserved=0, bits6-4=variant,
+    bits3-0=data MSB nibble] MED(1)[data LSB byte].
+    Spec example: <1A><04><00><E2> -- data set 4, variant 0, data=0x0E2."""
+    if not (0 <= variant <= 7):
+        raise ValueError("variant must be 0-7 (3 bits)")
+    if not (0 <= data <= 0xFFF):
+        raise ValueError("data must be 0-0xFFF (12 bits)")
+    med1 = ((variant & 0x7) << 4) | ((data >> 8) & 0xF)
+    med2 = data & 0xFF
+    return bytes([0x1A, dsn, med1, med2])
+
+
+def mec_ecc(ecc: int, dsn: int = 0x00) -> bytes:
+    """Extended Country Code, sent via Slow Labelling Codes (MEC 0x1A),
+    variant 0. Fully qualifies the country half of the PI code (leading
+    nibble of PI + ECC = unique country identifier per NRSC-4-B /
+    EN 62106 Annex D). USA = 0xA0.
+
+    ECC occupies the low 8 bits of variant 0's 12-bit data field --
+    confirmed via multiple independent secondary sources (RDS Forum
+    glossary, Silicon Labs AN243) since the primary UECP spec (section
+    3.3.12) documents the general Slow Labelling Codes wire format but
+    explicitly defers per-variant field meanings to the RDS standard
+    itself (CENELEC prEN 50067), not to this protocol document.
+
+    CORRECTION (2026-07-28): an earlier version of this function sent
+    MEC 0x2E, which the spec's OWN section 3.3.13 defines as "Linkage
+    information" -- an unrelated feature. That was never actually
+    setting the station's ECC on air. Verified against the spec text
+    directly before landing this fix; see rbds/tests.py for the byte-
+    level check against section 3.3.12's literal worked example."""
+    if not (0 <= ecc <= 0xFF):
+        raise ValueError("ecc must be 0-255 (8 bits)")
+    return mec_slow_labelling(variant=0, data=ecc, dsn=dsn)
+
+
+def mec_ptyn(text: str, dsn: int = 0x00, psn: int = 0x00) -> bytes:
+    """MEC 0x3E -- Programme Type Name (spec section 3.3.8). Further
+    describes the current PTY with a free-text label the broadcaster
+    controls (e.g. PTY=Sport, PTYN="Football"). Fixed 8 characters --
+    NO length (MEL) byte, same shape as mec_ps -- chars restricted to
+    0x20-0xFE per spec (same convention as PS).
+    Spec example: <3E><00><02><46><6F><6F><74><62><61><6C><6C> --
+    current data set, service 2, PTYN="Football"."""
+    padded = text[:8].ljust(8)
+    med = bytes(b if 0x20 <= b <= 0xFE else 0x20 for b in padded.encode("latin-1", errors="replace"))
+    return bytes([0x3E, dsn, psn]) + med
 
 
 def mec_ps(text: str, dsn: int = 0x00, psn: int = 0x00) -> bytes:

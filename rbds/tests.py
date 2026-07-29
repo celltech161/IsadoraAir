@@ -227,6 +227,51 @@ class UecpMecBuilderTests(SimpleTestCase):
         self.assertEqual(med[2:4], bytes([1, 204]))  # the two AF codes
         self.assertEqual(med[-1], 0x00)  # terminator
 
+    def test_mec_slow_labelling_matches_spec_example(self):
+        # <1A><04><00><E2> -- spec section 3.3.12's own worked example:
+        # data set 4, variant code 0, data set to 0x0E2.
+        self.assertEqual(
+            uecp.mec_slow_labelling(variant=0, data=0x0E2, dsn=0x04),
+            bytes.fromhex("1A0400E2"),
+        )
+
+    def test_mec_slow_labelling_no_psn(self):
+        # Confirmed against the spec's own format table for this
+        # command: MEC DSN MED MED only, no PSN -- 4 bytes total.
+        result = uecp.mec_slow_labelling(variant=0, data=0, dsn=0x00)
+        self.assertEqual(len(result), 4)
+        self.assertEqual(result[0], 0x1A)
+
+    def test_mec_slow_labelling_variant_and_data_packed_correctly(self):
+        # variant=5 (0b101), data=0xABC -> MED1 = 0b0101_1010 = 0x5A,
+        # MED2 = 0xBC.
+        result = uecp.mec_slow_labelling(variant=5, data=0xABC, dsn=0x00)
+        self.assertEqual(result[2], 0x5A)
+        self.assertEqual(result[3], 0xBC)
+
+    def test_mec_slow_labelling_rejects_out_of_range(self):
+        with self.assertRaises(ValueError):
+            uecp.mec_slow_labelling(variant=8, data=0)
+        with self.assertRaises(ValueError):
+            uecp.mec_slow_labelling(variant=0, data=0x1000)
+
+    def test_mec_ecc_is_variant_0_of_slow_labelling(self):
+        # ECC=0xA0 (USA) -> variant 0, data=0x0A0 -> MED1=0x00, MED2=0xA0.
+        self.assertEqual(uecp.mec_ecc(0xA0, dsn=0x00), bytes.fromhex("1A0000A0"))
+        # Same value must equal calling mec_slow_labelling directly --
+        # mec_ecc is a thin convenience wrapper, not a separate command.
+        self.assertEqual(uecp.mec_ecc(0xA0), uecp.mec_slow_labelling(variant=0, data=0xA0))
+
+    def test_mec_ptyn_matches_spec_example(self):
+        # <3E><00><02><46><6F><6F><74><62><61><6C><6C> -- current data
+        # set, service 2, PTYN="Football" (8 chars exactly).
+        result = uecp.mec_ptyn("Football", dsn=0x00, psn=0x02)
+        self.assertEqual(result, bytes.fromhex("3E0002") + b"Football")
+
+    def test_mec_ptyn_pads_and_truncates(self):
+        self.assertEqual(uecp.mec_ptyn("SPORT"), bytes([0x3E, 0x00, 0x00]) + b"SPORT   ")
+        self.assertEqual(uecp.mec_ptyn("ABCDEFGHIJ"), bytes([0x3E, 0x00, 0x00]) + b"ABCDEFGH")
+
 
 class UecpFrameTests(SimpleTestCase):
     def test_build_frame_structure(self):
