@@ -154,14 +154,21 @@ def _category_to_dict(category):
         "title_separation": category.title_separation,
         "next_start_threshold_db_override": category.next_start_threshold_db_override,
         "cue_in_threshold_db_override": category.cue_in_threshold_db_override,
+        "rbds_pty_override": category.rbds_pty_override,
+        "rbds_ptyn": category.rbds_ptyn,
         "track_count": getattr(category, "_track_count", None),
     }
 
 
 @ensure_csrf_cookie
 def categories_page(request):
+    from rbds.services.rbds_pty import CATEGORY_PTY_OVERRIDE_CHOICES
+
     kinds = CategoryKind.objects.order_by("sort_order", "name")
-    return render(request, "library/categories.html", {"kinds": kinds})
+    return render(request, "library/categories.html", {
+        "kinds": kinds,
+        "pty_choices": CATEGORY_PTY_OVERRIDE_CHOICES,
+    })
 
 
 @require_http_methods(["GET", "POST"])
@@ -203,6 +210,8 @@ def api_category_list(request):
         title_separation=_blank_to_none(body.get("title_separation")),
         next_start_threshold_db_override=_blank_to_none(body.get("next_start_threshold_db_override")),
         cue_in_threshold_db_override=_blank_to_none(body.get("cue_in_threshold_db_override")),
+        rbds_pty_override=_blank_to_none(body.get("rbds_pty_override")),
+        rbds_ptyn=body.get("rbds_ptyn", ""),
     )
     try:
         category.full_clean()
@@ -269,6 +278,10 @@ def api_category_detail(request, pk):
         category.next_start_threshold_db_override = _blank_to_none(body["next_start_threshold_db_override"])
     if "cue_in_threshold_db_override" in body:
         category.cue_in_threshold_db_override = _blank_to_none(body["cue_in_threshold_db_override"])
+    if "rbds_pty_override" in body:
+        category.rbds_pty_override = _blank_to_none(body["rbds_pty_override"])
+    if "rbds_ptyn" in body:
+        category.rbds_ptyn = body["rbds_ptyn"]
 
     try:
         category.full_clean()

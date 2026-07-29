@@ -41,6 +41,13 @@ FILE_URL_FETCH_TIMEOUT = 5  # seconds, bounds a slow/hanging URL source's delay 
 
 STATE_PATH = Path("/run/isadoraair/rbds_state.json")
 NOW_PLAYING_PATH = Path("/run/isadoraair/now_playing.json")  # read-only, owned by library/services/engine.py
+# Read-only, owned by library/services/engine.py's _write_rbds_category_state()
+# -- the currently-playing track's Category RBDS PTY/PTYN override,
+# resolved by the engine at deck-creation time. Deliberately a separate
+# file from NOW_PLAYING_PATH (see that constant's own comment and the
+# engine-side docstring) -- not consumed by Liquidsoap, so this one IS
+# written atomically on the engine side, and is read here by plain poll.
+RBDS_CATEGORY_STATE_PATH = Path("/run/isadoraair/rbds_category_state.json")
 
 
 class RBDSManager:
@@ -63,6 +70,7 @@ class RBDSManager:
         self._connected_since = None
         self._down_since = None
         self._last_now_playing = {"title": "", "artist": ""}
+        self._last_category_state = {"pty_override": None, "ptyn": ""}
         # Last UTC minute we sent a CT (Clock Time) frame in, so we
         # send exactly one CT per minute (per RBDS spec: group 4A must
         # be transmitted at :00 seconds of the given minute). Reset to
@@ -151,7 +159,8 @@ class RBDSManager:
         # StereoTool was ready and "fixed" it, which looked like the admin
         # save mattered but was really just a lucky retry window.
         if changed or due_for_full_resend or not self._connected:
-            self._send(config, target_ps, rt_text, rt_artist, rt_title)
+            effective_pty, effective_ptyn = self._effective_pty_ptyn(config)
+            self._send(config, target_ps, rt_text, rt_artist, rt_title, effective_pty, effective_ptyn)
             self._last_sent_ps = target_ps
             self._last_sent_rt = rt_text
             self._last_full_resend = time.time()
@@ -273,14 +282,42 @@ class RBDSManager:
             pass
         return self._last_now_playing
 
+    def _read_category_state(self):
+        try:
+            data = json.loads(RBDS_CATEGORY_STATE_PATH.read_text(encoding="utf-8"))
+            self._last_category_state = data
+        except (OSError, ValueError):
+            # Missing file (nothing played yet since engine start, or
+            # /run/isadoraair not created) -- keep the previous tick's
+            # last-good value, retry next tick. Since this file IS
+            # written atomically (unlike now_playing.json), a torn read
+            # should never actually happen here.
+            pass
+        return self._last_category_state
+
+    def _effective_pty_ptyn(self, config):
+        """Resolves the currently-playing track's Category PTY/PTYN
+        override against the station-wide RBDS Config default. Returns
+        (effective_pty, effective_ptyn) -- ptyn is '' when there's no
+        override (callers space-pad it themselves at the MEC layer, or
+        simply don't send a PTYN MEC for '', per each protocol's own
+        convention)."""
+        state = self._read_category_state()
+        pty_override = state.get("pty_override")
+        effective_pty = pty_override if pty_override is not None else config.pty
+        effective_ptyn = state.get("ptyn") or ""
+        return effective_pty, effective_ptyn
+
     # --- Sending ---
 
-    def _send(self, config, ps, rt, artist, title):
+    def _send(self, config, ps, rt, artist, title, pty=None, ptyn=""):
+        if pty is None:
+            pty = config.pty
         try:
             if config.protocol == "uecp":
-                payload = self._build_uecp_payload(config, ps, rt, artist, title)
+                payload = self._build_uecp_payload(config, ps, rt, artist, title, pty, ptyn)
             else:
-                payload = self._build_ascii_payload(config, ps, rt, artist, title)
+                payload = self._build_ascii_payload(config, ps, rt, artist, title, pty)
             self._transmit(config, payload)
         except Exception as exc:
             self._last_error = str(exc)
@@ -305,7 +342,7 @@ class RBDSManager:
             return  # nothing to (re-)send
         self._transmit(config, self._frames_for(config, meds))
 
-    def _build_uecp_payload(self, config, ps, rt, artist=None, title=None):
+    def _build_uecp_payload(self, config, ps, rt, artist=None, title=None, pty=None, ptyn=""):
         """Assemble the full UECP payload as ONE MEC PER UECP FRAME
         (concatenated back-to-back for a single TCP write). Not one
         big multi-MEC frame -- observed live behavior of RDS Magic 4
@@ -347,7 +384,13 @@ class RBDSManager:
             artificial_head=config.di_artificial_head, stereo=config.di_stereo,
         ))
         meds.append(uecp.mec_ms(music=config.ms))
-        meds.append(uecp.mec_pty(config.pty))
+        meds.append(uecp.mec_pty(pty if pty is not None else config.pty))
+        # PTYN rides right after PTY, same cadence -- always sent (blank
+        # meaning "8 spaces", which actively clears any name left over
+        # from a previous track's category override) rather than only
+        # sent when non-blank, so a stale PTYN never lingers into a
+        # category with no override of its own.
+        meds.append(uecp.mec_ptyn(ptyn))
         meds.append(uecp.mec_rt(rt, ab_flag=self._rt_ab_flag))
         if config.use_rt_plus:
             # ODA registration rides every UECP send so a receiver
@@ -436,7 +479,7 @@ class RBDSManager:
         )
         self._transmit(config, frame)
 
-    def _build_ascii_payload(self, config, ps, rt, artist, title):
+    def _build_ascii_payload(self, config, ps, rt, artist, title, pty=None):
         # rt is guaranteed by _resolve_rt_content() to be exactly
         # f"{artist}{RT_PLUS_SEPARATOR}{title}" (truncated to 64 chars)
         # whenever artist/title are both non-None, so tag offsets are
@@ -453,7 +496,8 @@ class RBDSManager:
                 ascii_protocol.build_rt_plus_tag(ascii_protocol.RT_PLUS_TITLE, title_start, len(title)),
             ]
         commands = ascii_protocol.build_ascii_commands(
-            pi_code=config.pi_code, ps=ps, rt=rt, pty=config.pty, music=config.ms,
+            pi_code=config.pi_code, ps=ps, rt=rt,
+            pty=pty if pty is not None else config.pty, music=config.ms,
             di_dynamic_pty=config.di_dynamic_pty, di_compressed=config.di_compressed,
             di_artificial_head=config.di_artificial_head, di_stereo=config.di_stereo,
             rt_plus_tags=rt_plus_tags,

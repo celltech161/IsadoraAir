@@ -15,3 +15,14 @@ RBDS_PTY_CHOICES = [
     (26, "Hip Hop"), (27, "Unassigned"), (28, "Unassigned"), (29, "Weather"),
     (30, "Emergency Test"), (31, "Emergency"),
 ]
+
+# Used by Category.rbds_pty_override -- same table as RBDS_PTY_CHOICES
+# above but with the numeric code folded into the label (per-category
+# override needs the number visible so an operator picking "5" for a
+# specific rotation isn't just reading a name), plus a leading
+# "-- Default --" entry (value None) meaning "fall back to whatever
+# RBDSConfig.pty is set to station-wide." None is a valid choice value
+# here because the model field is nullable.
+CATEGORY_PTY_OVERRIDE_CHOICES = [(None, "-- Default (use RBDS Config) --")] + [
+    (code, f"{code} - {name}") for code, name in RBDS_PTY_CHOICES
+]

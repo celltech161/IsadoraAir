@@ -5,6 +5,7 @@ from django.contrib.postgres.fields import ArrayField
 from django.contrib.postgres.indexes import GinIndex
 
 from library.storage import royalty_report_storage
+from rbds.services.rbds_pty import CATEGORY_PTY_OVERRIDE_CHOICES
 
 
 # ---------------------------------------------------------------
@@ -165,6 +166,31 @@ class Category(models.Model):
                    "global. Same reasoning as Next Start Threshold above -- "
                    "quiet material needs a quieter threshold, otherwise the "
                    "cue-in lands too far into the intro.",
+    )
+    rbds_pty_override = models.PositiveSmallIntegerField(
+        null=True, blank=True, default=None,
+        choices=CATEGORY_PTY_OVERRIDE_CHOICES,
+        verbose_name="RBDS PTY override",
+        help_text="Overrides the station-wide PTY (Program Type) from RBDS "
+                   "Config while a track from this category is playing. "
+                   "'-- Default --' uses whatever PTY is set at "
+                   "/admin/rbds/rbdsconfig/1/change/. Takes effect the "
+                   "moment a track from this category starts (checked at "
+                   "deck creation, not polled).",
+    )
+    rbds_ptyn = models.CharField(
+        "RBDS PTYN", max_length=8, blank=True, default="",
+        help_text="Optional 8-character Program Type Name sent alongside "
+                   "the PTY while a track from this category is playing "
+                   "(e.g. 'CLASSIC' or 'LOCAL'). Longer text is truncated "
+                   "to 8 characters. Blank clears any PTYN from the "
+                   "previous track rather than leaving a stale one on air. "
+                   "UECP-only: StereoTool's ASCII dialect has no PTYN "
+                   "command, so this field is silently ignored when "
+                   "Protocol is ASCII mode at /admin/rbds/rbdsconfig/1/ "
+                   "change/ (the value is kept regardless so switching "
+                   "back to UECP doesn't lose it). The PTY override above "
+                   "still applies in both protocols.",
     )
 
     class Meta:

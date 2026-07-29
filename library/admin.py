@@ -225,6 +225,15 @@ class CategoryAdmin(admin.ModelAdmin):
                 "category with these overrides applied."
             ),
         }),
+        ("RBDS Overrides", {
+            "fields": ["rbds_pty_override", "rbds_ptyn"],
+            "description": (
+                "Overrides the station-wide RBDS PTY (see "
+                "/admin/rbds/rbdsconfig/1/change/) while a track from this "
+                "category is playing. PTYN is a free-text label sent "
+                "alongside PTY, e.g. PTY=Rock with PTYN='CLASSIC'."
+            ),
+        }),
     ]
 
     def get_queryset(self, request):

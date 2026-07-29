@@ -55,6 +55,16 @@ DUCK_RAMP_STEPS = 20  # ~25ms per step -- smooth enough for a loudness fade, not
 STATE_PATH = Path("/run/isadoraair/engine_state.json")
 CMD_PATH = Path("/run/isadoraair/engine_cmd.json")
 NOW_PLAYING_PATH = Path("/run/isadoraair/now_playing.json")
+# Deliberately a SEPARATE file from NOW_PLAYING_PATH above, not an
+# extra key folded into that JSON -- NOW_PLAYING_PATH is also consumed
+# by the stream encoders' Liquidsoap file.watch() (see
+# _write_now_playing's own docstring: it's written in-place, non-
+# atomically, because file.watch() only survives the FIRST rename-
+# replace of its watched path). Keeping RBDS's own state in its own
+# file means this feature can never risk that fragile mechanism, and
+# RBDS reads it by plain poll (once per its own 1s tick), not
+# file.watch, so it doesn't need the same in-place-write care.
+RBDS_CATEGORY_STATE_PATH = Path("/run/isadoraair/rbds_category_state.json")
 
 # Remote DJ diagnostic instrumentation -- see class RemoteDJSession's
 # docstring and _remote_dj_on_pad_added. Truncated + reopened on every
@@ -1668,6 +1678,7 @@ class PlaybackEngine:
         filepath = track.filepath
 
         self._write_now_playing(track)
+        self._write_rbds_category_state(track)
 
         # Auto-resume: if the previous engine instance was mid-play on
         # the same track (see _read_resume_hint), seek the fresh deck
@@ -4237,6 +4248,32 @@ class PlaybackEngine:
         except OSError:
             # /run/isadoraair not created yet -- matches
             # hardware/signals.py's _write_engine_command's own convention.
+            pass
+
+    def _write_rbds_category_state(self, track):
+        """Resolves the currently-playing track's Category RBDS PTY/PTYN
+        override and writes it to RBDS_CATEGORY_STATE_PATH for
+        rbds/services/rbds_manager.py to pick up on its next tick.
+        Called from _create_deck() alongside _write_now_playing() --
+        same "deck creation is the approximation point" reasoning
+        applies here (see that method's own docstring).
+
+        Resolving here (rather than having the RBDS process do its own
+        Category lookup) mirrors this method's own existing precedent
+        of pre-resolving Track.alt_send_enabled/alt_send_text for the
+        stream metadata -- one place decides what the "effective"
+        broadcast values are, every consumer just reads the answer."""
+        category = track.category
+        payload = {
+            "pty_override": category.rbds_pty_override if category else None,
+            "ptyn": (category.rbds_ptyn if category else "") or "",
+        }
+        try:
+            RBDS_CATEGORY_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = RBDS_CATEGORY_STATE_PATH.with_suffix(".json.tmp")
+            tmp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            tmp_path.replace(RBDS_CATEGORY_STATE_PATH)
+        except OSError:
             pass
 
     def _write_state(self, transport="PLAYING"):

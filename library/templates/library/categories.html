@@ -272,6 +272,26 @@
         broadcast level, otherwise the next-track trigger fires over the natural tail.
       </div>
 
+      <div class="cat-form-two">
+        <div class="cat-form-row">
+          <label for="fRbdsPty">RBDS PTY Override</label>
+          <select class="pl-select" id="fRbdsPty">
+            {% for value, label in pty_choices %}
+            <option value="{{ value|default_if_none:'' }}">{{ label }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="cat-form-row">
+          <label for="fRbdsPtyn">RBDS PTYN</label>
+          <input type="text" class="pl-input" id="fRbdsPtyn" placeholder="Optional, e.g. CLASSIC" maxlength="8">
+        </div>
+      </div>
+      <div class="cat-form-hint">
+        PTY override replaces the station-wide RBDS PTY while a track from this category plays --
+        "-- Default --" uses whatever's set at RBDS Config. PTYN is an optional 8-character label
+        sent alongside it (e.g. PTY=Rock, PTYN=CLASSIC).
+      </div>
+
       <div class="cat-form-actions">
         <button type="button" class="pl-btn primary" onclick="saveCategory()">Save</button>
         <button type="button" class="pl-btn danger" id="deleteCategoryBtn" onclick="deleteCurrentCategory()" style="display:none;">Delete</button>
@@ -359,6 +379,8 @@ function newCategory() {
   document.getElementById('fTitleSep').value = '';
   document.getElementById('fNextStartThresh').value = '';
   document.getElementById('fCueInThresh').value = '';
+  document.getElementById('fRbdsPty').value = '';
+  document.getElementById('fRbdsPtyn').value = '';
   document.getElementById('deleteCategoryBtn').style.display = 'none';
   document.getElementById('reanalyzeCategoryBtn').style.display = 'none';
   setMsg('');
@@ -381,6 +403,8 @@ function editCategory(id) {
   document.getElementById('fTitleSep').value = c.title_separation != null ? c.title_separation : '';
   document.getElementById('fNextStartThresh').value = c.next_start_threshold_db_override != null ? c.next_start_threshold_db_override : '';
   document.getElementById('fCueInThresh').value = c.cue_in_threshold_db_override != null ? c.cue_in_threshold_db_override : '';
+  document.getElementById('fRbdsPty').value = c.rbds_pty_override != null ? c.rbds_pty_override : '';
+  document.getElementById('fRbdsPtyn').value = c.rbds_ptyn || '';
   document.getElementById('deleteCategoryBtn').style.display = '';
   document.getElementById('reanalyzeCategoryBtn').style.display = '';
   setMsg('');
@@ -400,6 +424,8 @@ async function saveCategory() {
     title_separation: document.getElementById('fTitleSep').value === '' ? null : parseFloat(document.getElementById('fTitleSep').value),
     next_start_threshold_db_override: document.getElementById('fNextStartThresh').value === '' ? null : parseFloat(document.getElementById('fNextStartThresh').value),
     cue_in_threshold_db_override: document.getElementById('fCueInThresh').value === '' ? null : parseFloat(document.getElementById('fCueInThresh').value),
+    rbds_pty_override: document.getElementById('fRbdsPty').value === '' ? null : parseInt(document.getElementById('fRbdsPty').value),
+    rbds_ptyn: document.getElementById('fRbdsPtyn').value.trim(),
   };
 
   if (!payload.code || !payload.name) {
