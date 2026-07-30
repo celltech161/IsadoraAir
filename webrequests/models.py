@@ -151,11 +151,32 @@ class SongRequest(models.Model):
     submitted_at = models.DateTimeField()
     fetched_at = models.DateTimeField(auto_now_add=True)
     fulfilled_at = models.DateTimeField(null=True, blank=True)
+    resolved_at = models.DateTimeField(
+        null=True, blank=True,
+        help_text="Set the moment status moves into ANY terminal value "
+                   "(fulfilled / expired / unavailable) -- distinct from "
+                   "fulfilled_at, which only covers the fulfilled case. "
+                   "Drives the status-push safety window: a terminal "
+                   "status keeps getting reported for a while after "
+                   "resolved_at, not just once, so a single dropped push "
+                   "can't leave the public site showing stale status.",
+    )
 
     log_item = models.ForeignKey(
         "library.LogItem", on_delete=models.SET_NULL, null=True, blank=True,
         related_name="fulfilled_song_request",
         help_text="The specific LogItem this request was swapped into, once fulfilled.",
+    )
+    estimated_play_time = models.DateTimeField(
+        null=True, blank=True,
+        help_text="Best-guess air time, recomputed every "
+                   "refresh_song_request_statuses cycle from a FIFO pass over "
+                   "the upcoming open, music-kind LogItems (capped per hour by "
+                   "max_fulfilled_per_hour). Advisory only, for showing the "
+                   "requester a guess -- the actual fulfillment decision "
+                   "happens at engine queue-advance time and can land in a "
+                   "different slot than this estimate. Null while status is "
+                   "no_slot_soon or any terminal status.",
     )
 
     class Meta:
