@@ -5,9 +5,9 @@ from datetime import timedelta
 from django.core.management.base import BaseCommand
 from django.utils import timezone
 
-from library.models import LogItem
+from library.models import LogItem, RecencyConfig
 from webrequests.models import SongRequest, WebRequestConfig
-from webrequests.services import maybe_fulfill_song_request
+from webrequests.services import is_track_eligible_at, maybe_fulfill_song_request
 
 
 class Command(BaseCommand):
@@ -33,12 +33,18 @@ class Command(BaseCommand):
          for this pass to have caught it yet. Idempotent between the
          two callers and across repeated runs of this command.
       4. Everything still left over (couldn't be fulfilled above) is
-         FIFO-matched (oldest submitted_at first) against remaining
-         open, music-kind LogItems within lookahead_warning_minutes,
-         capped per hour by max_fulfilled_per_hour (minus whatever's
-         now actually fulfilled into that hour) -- giving each a
-         pending/no_slot_soon status plus an advisory
-         estimated_play_time. This part is only ever a preview --
+         matched (oldest submitted_at first) against remaining open,
+         music-kind LogItems within lookahead_warning_minutes, capped
+         per hour by max_fulfilled_per_hour (minus whatever's now
+         actually fulfilled into that hour) -- giving each a pending/
+         no_slot_soon status plus an advisory estimated_play_time.
+         Each candidate slot is checked with the SAME eligibility+
+         recency test (is_track_eligible_at) real fulfillment uses,
+         evaluated against that slot's own scheduled_time rather than
+         "now" -- a request whose track is recency-blocked right now
+         (e.g. the same artist just aired) is skipped past to a later
+         slot instead of being handed a near-term estimate recency
+         would never actually let it keep. Still only ever a preview:
          since a real fulfillment can happen for any request at any
          later cycle, an advisory estimate can end up not matching
          which slot a request actually lands in."""
@@ -127,21 +133,33 @@ class Command(BaseCommand):
         for playlist_log_id, count in already_fulfilled_per_hour.items():
             remaining_capacity[playlist_log_id] = max(0, cfg.max_fulfilled_per_hour - count)
 
-        slot_pool = []
-        used_per_hour = defaultdict(int)
+        open_candidates = []
         for item in candidates:
             local_dt = timezone.localtime(item.scheduled_time)
             slot = local_dt.weekday() * 24 + local_dt.hour
-            if slot not in open_slots:
-                continue
-            if used_per_hour[item.playlist_log_id] >= remaining_capacity[item.playlist_log_id]:
-                continue
-            used_per_hour[item.playlist_log_id] += 1
-            slot_pool.append(item.scheduled_time)
+            if slot in open_slots:
+                open_candidates.append(item)
 
-        slot_iter = iter(slot_pool)
+        recency_cfg = RecencyConfig.load()
+        claimed_item_ids = set()
+        used_per_hour = defaultdict(int)
+        slots_offered = 0
+
         for req in still_pending:
-            estimate = next(slot_iter, None)
+            estimate = None
+            for item in open_candidates:
+                if item.id in claimed_item_ids:
+                    continue
+                if used_per_hour[item.playlist_log_id] >= remaining_capacity[item.playlist_log_id]:
+                    continue
+                if req.track is None or not is_track_eligible_at(req.track, item.scheduled_time, recency_cfg):
+                    continue
+                estimate = item.scheduled_time
+                claimed_item_ids.add(item.id)
+                used_per_hour[item.playlist_log_id] += 1
+                slots_offered += 1
+                break
+
             new_status = "pending" if estimate is not None else "no_slot_soon"
             if new_status != req.status or estimate != req.estimated_play_time:
                 req.status = new_status
@@ -153,5 +171,5 @@ class Command(BaseCommand):
             "resolved": resolved_count,
             "fulfilled_now": fulfilled_now_count,
             "still_pending": len(still_pending),
-            "slots_available": len(slot_pool),
+            "slots_available": slots_offered,
         }))

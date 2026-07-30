@@ -10,6 +10,34 @@ from monitoring.models import emit_event
 from .models import SongRequest, WebRequestConfig
 
 
+def is_track_eligible_at(track, target_datetime, recency_cfg):
+    """Would `track` actually be allowed to air at `target_datetime`
+    right now -- ready2air, still filed under a music-kind category, its
+    file still on disk, and not recency-blocked (get_separation/
+    get_recent_exclusions, the same functions log_builder itself uses
+    for a normal rotation pick, evaluated relative to target_datetime
+    rather than always "now" -- a track blocked at the current moment
+    can still be legitimately eligible at a slot far enough in the
+    future). Shared between maybe_fulfill_song_request (real
+    fulfillment, always checked against "now") and
+    refresh_song_request_statuses' advisory estimate pass (checked
+    against each candidate future slot's own time, so the estimate it
+    shows a requester doesn't promise a slot recency would actually
+    block)."""
+    if not track.ready2air:
+        return False
+    if track.category_id is None or track.category.kind.code != "music":
+        return False
+    if not track.filepath or not Path(track.filepath).is_file():
+        return False
+
+    artist_sep, title_sep = get_separation(track.category, recency_cfg)
+    exclude_track_ids, exclude_artist_ids = get_recent_exclusions(
+        target_datetime, artist_sep, title_sep, set(), set(),
+    )
+    return track.id not in exclude_track_ids and track.artist_id not in exclude_artist_ids
+
+
 def maybe_fulfill_song_request(log_item):
     """Web Requests fulfillment. If `log_item` is a music-kind slot in
     an open request hour and there's an eligible pending request, swap
@@ -89,19 +117,8 @@ def maybe_fulfill_song_request(log_item):
             )
             for candidate in candidates:
                 track = candidate.track
-                if not track.ready2air:
-                    continue
-                if track.category_id is None or track.category.kind.code != "music":
-                    continue
-                if not track.filepath or not Path(track.filepath).is_file():
-                    continue
-
-                artist_sep, title_sep = get_separation(track.category, recency_cfg)
-                exclude_track_ids, exclude_artist_ids = get_recent_exclusions(
-                    local_now, artist_sep, title_sep, set(), set(),
-                )
-                if track.id in exclude_track_ids or track.artist_id in exclude_artist_ids:
-                    continue  # recency-blocked right now -- leave pending for a later slot
+                if not is_track_eligible_at(track, local_now, recency_cfg):
+                    continue  # ineligible or recency-blocked right now -- leave pending for a later slot
 
                 log_item.track = track
                 log_item.track_title = track.title
