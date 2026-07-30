@@ -30,16 +30,14 @@ class Command(BaseCommand):
             Q(status__in=SongRequest.NON_TERMINAL_STATUSES) | Q(resolved_at__gte=cutoff)
         )
 
-        payload = {
-            "statuses": [
-                {
-                    "id": req.external_request_id,
-                    "status": req.status,
-                    "estimated_play_time": (
-                        req.estimated_play_time.isoformat() if req.estimated_play_time else None
-                    ),
-                }
-                for req in requests
-            ]
-        }
-        self.stdout.write(json.dumps(payload))
+        updates = []
+        for req in requests:
+            update = {
+                "external_request_id": req.external_request_id,
+                "status": req.status,
+            }
+            if req.estimated_play_time:
+                update["estimated_play_time"] = req.estimated_play_time.isoformat()
+            updates.append(update)
+
+        self.stdout.write(json.dumps({"updates": updates}))

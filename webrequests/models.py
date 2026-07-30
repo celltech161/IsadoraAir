@@ -69,6 +69,10 @@ class WebRequestConfig(models.Model):
                    "slot within this many hours of submission is marked "
                    "'expired' and stops being retried.",
     )
+    notify_email = models.EmailField(
+        blank=True, default="",
+        help_text="Address for web-requests-ingest pipeline failure notifications. Blank disables.",
+    )
 
     class Meta:
         verbose_name = "Web Request Configuration"

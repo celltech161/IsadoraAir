@@ -31,7 +31,11 @@ class Command(BaseCommand):
         skipped = 0
 
         for item in payload.get("requests", []):
-            external_id = item["id"]
+            # external_request_id comes back as a bare integer (the
+            # site's own PK) -- str() it since our field is a CharField
+            # (kept as a string rather than assuming their id scheme is
+            # a plain integer forever).
+            external_id = str(item["external_request_id"])
             if SongRequest.objects.filter(external_request_id=external_id).exists():
                 skipped += 1
                 continue
@@ -43,8 +47,8 @@ class Command(BaseCommand):
             req = SongRequest.objects.create(
                 external_request_id=external_id,
                 track=track,
-                requester_name=item.get("requester_name", ""),
-                dedication_message=item.get("dedication_message", ""),
+                requester_name=item.get("requester_name") or "",
+                dedication_message=item.get("dedication_message") or "",
                 submitted_at=parse_datetime(item["submitted_at"]),
             )
             if track is None:

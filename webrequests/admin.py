@@ -21,6 +21,9 @@ class WebRequestConfigAdmin(admin.ModelAdmin):
         ("Rate & Timing", {
             "fields": ["max_fulfilled_per_hour", "lookahead_warning_minutes", "expire_after_hours"],
         }),
+        ("Notifications", {
+            "fields": ["notify_email"],
+        }),
     ]
 
     def has_add_permission(self, request):
@@ -53,7 +56,8 @@ class SongRequestAdmin(admin.ModelAdmin):
 
     readonly_fields = [
         "external_request_id", "track", "requester_name", "dedication_message",
-        "submitted_at", "fetched_at", "fulfilled_at", "log_item",
+        "submitted_at", "fetched_at", "fulfilled_at", "resolved_at",
+        "estimated_play_time", "log_item",
     ]
 
     def has_add_permission(self, request):
