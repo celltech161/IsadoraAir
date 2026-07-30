@@ -7,7 +7,7 @@ from django.utils import timezone
 
 from library.models import LogItem, RecencyConfig
 from webrequests.models import SongRequest, WebRequestConfig
-from webrequests.services import is_track_eligible_at, maybe_fulfill_song_request
+from webrequests.services import estimate_air_time, is_track_eligible_at, maybe_fulfill_song_request
 
 
 class Command(BaseCommand):
@@ -154,7 +154,7 @@ class Command(BaseCommand):
                     continue
                 if req.track is None or not is_track_eligible_at(req.track, item.scheduled_time, recency_cfg):
                     continue
-                estimate = item.scheduled_time
+                estimate = estimate_air_time(item)
                 claimed_item_ids.add(item.id)
                 used_per_hour[item.playlist_log_id] += 1
                 slots_offered += 1
@@ -165,6 +165,20 @@ class Command(BaseCommand):
                 req.status = new_status
                 req.estimated_play_time = estimate
                 req.save(update_fields=["status", "estimated_play_time"])
+
+        # Fulfilled-but-not-yet-aired requests: keep estimated_play_time
+        # live-accurate as real playback drifts from the schedule it was
+        # built with, instead of freezing it at whatever the engine's
+        # ETA happened to be the moment fulfillment occurred.
+        still_airing = (
+            SongRequest.objects.filter(status="fulfilled", log_item__played_at__isnull=True)
+            .select_related("log_item")
+        )
+        for req in still_airing:
+            live_estimate = estimate_air_time(req.log_item)
+            if live_estimate != req.estimated_play_time:
+                req.estimated_play_time = live_estimate
+                req.save(update_fields=["estimated_play_time"])
 
         self.stdout.write(json.dumps({
             "checked": len(pending),

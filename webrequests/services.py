@@ -1,3 +1,6 @@
+import json
+import time
+from datetime import timedelta
 from pathlib import Path
 
 from django.db import close_old_connections
@@ -8,6 +11,56 @@ from library.services.log_builder import get_recent_exclusions, get_separation
 from monitoring.models import emit_event
 
 from .models import SongRequest, WebRequestConfig
+
+# Same path engine.py's STATE_PATH writes to -- redefined here rather
+# than imported, since library.services.engine imports FROM this module
+# (maybe_fulfill_song_request) and importing engine.py back would be
+# circular. Just a plain path constant, safe to duplicate.
+ENGINE_STATE_PATH = Path("/run/isadoraair/engine_state.json")
+# If the engine hasn't written a fresh state in this long, don't trust
+# it (crashed/hung) -- fall back to the static schedule instead.
+STATE_STALENESS_SECONDS = 30
+
+
+def _live_eta_datetime(log_item_id):
+    """Real-world air time for `log_item_id`, from the running engine's
+    own drift-corrected eta_seconds (engine_state.json, written by
+    _write_state every poll tick) rather than the static
+    LogItem.scheduled_time baked in when the hour's log was built. Real
+    playback drifts from that original plan over a broadcast hour
+    (crossfade points and actual track durations don't line up exactly
+    with the built schedule) -- exactly the gap an operator caught live
+    comparing this feature's estimate against the real "Coming Up"
+    dashboard, which already computes its "Time On" column this same
+    way. Returns None (caller falls back to scheduled_time) if the
+    engine isn't running, the state is stale, or the item isn't in its
+    current preview (e.g. a later hour the engine hasn't loaded yet)."""
+    try:
+        state = json.loads(ENGINE_STATE_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+    if time.time() - state.get("timestamp", 0) > STATE_STALENESS_SECONDS:
+        return None
+
+    for deck in state.get("decks", {}).values():
+        if deck and deck.get("log_item_id") == log_item_id:
+            return timezone.now()  # already airing
+
+    for item in state.get("queue", []):
+        if item.get("item_id") == log_item_id:
+            return timezone.now() + timedelta(seconds=item.get("eta_seconds", 0))
+
+    return None
+
+
+def estimate_air_time(log_item):
+    """Best available air-time estimate for `log_item` -- the running
+    engine's live, drift-corrected ETA when available, else the static
+    scheduled_time it was built with. Shared by both fulfillment sites
+    so a requester sees the same kind of number the real dashboard
+    shows, not the log-build-time plan."""
+    return _live_eta_datetime(log_item.id) or log_item.scheduled_time
 
 
 def is_track_eligible_at(track, target_datetime, recency_cfg):
@@ -76,10 +129,11 @@ def maybe_fulfill_song_request(log_item):
     earlier call to this function) already queued a song someone
     requested".
 
-    Sets estimated_play_time to the log_item's actual scheduled_time on
-    fulfillment (real and certain now, not a guess) -- a fulfilled
-    request shouldn't just say "fulfilled" with no time attached when
-    the real air time is already known.
+    Sets estimated_play_time on fulfillment via estimate_air_time (the
+    running engine's live, drift-corrected ETA when available, else the
+    log_item's static scheduled_time) -- a fulfilled request shouldn't
+    just say "fulfilled" with no time attached when the real air time
+    is already knowable.
 
     played_at/last_played_at/play_count/PlayEvent are all still written
     by engine.py's _create_deck at actual airtime as normal -- nothing
@@ -135,7 +189,7 @@ def maybe_fulfill_song_request(log_item):
                 candidate.log_item = log_item
                 candidate.fulfilled_at = now
                 candidate.resolved_at = now
-                candidate.estimated_play_time = log_item.scheduled_time
+                candidate.estimated_play_time = estimate_air_time(log_item)
                 candidate.save(update_fields=[
                     "status", "log_item", "fulfilled_at", "resolved_at", "estimated_play_time",
                 ])
@@ -147,7 +201,7 @@ def maybe_fulfill_song_request(log_item):
             status__in=SongRequest.NON_TERMINAL_STATUSES, track_id=log_item.track_id,
         ).update(
             status="fulfilled", log_item=log_item, fulfilled_at=now, resolved_at=now,
-            estimated_play_time=log_item.scheduled_time,
+            estimated_play_time=estimate_air_time(log_item),
         )
     except Exception as exc:
         print(f"  Web request fulfillment check failed (non-fatal): {exc}")
