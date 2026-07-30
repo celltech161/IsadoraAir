@@ -1,0 +1,159 @@
+{% extends "base.html" %}
+
+{% block title %}Web Requests — IsadoraAir{% endblock %}
+
+{% block extra_css %}
+<style>
+  .wr-pane {
+    background: var(--bg-panel);
+    border: 1px solid var(--border-subtle);
+    border-radius: 10px;
+    padding: 1rem;
+    margin-bottom: 1rem;
+    max-width: 720px;
+  }
+  .wr-toggle-row {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    margin-bottom: 0.75rem;
+  }
+  .wr-form-two {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 0.75rem;
+  }
+  @media (max-width: 640px) {
+    .wr-form-two { grid-template-columns: 1fr; }
+  }
+  .wr-form-row label {
+    display: block;
+    font-size: 0.8rem;
+    color: var(--text-muted);
+    margin-bottom: 0.25rem;
+  }
+  .wr-hint {
+    font-size: 0.78rem;
+    color: var(--text-muted);
+    margin-top: 0.5rem;
+  }
+  .wr-msg {
+    margin-top: 0.6rem;
+    font-size: 0.85rem;
+  }
+  .wr-msg.error { color: var(--danger, #f97171); }
+</style>
+{% endblock %}
+
+{% block content %}
+<h2>Web Requests</h2>
+<p class="wr-hint">
+  Controls the public-site song-request feature end to end: whether it's
+  on at all, which hours accept requests, and the rate/timeout knobs that
+  govern how a request gets fulfilled. See also Django admin
+  (Config &gt; Web Request Configuration) for the same non-grid fields.
+</p>
+
+<div class="wr-pane">
+  <div class="wr-toggle-row">
+    <label style="display:flex; align-items:center; gap:0.5rem; margin:0;">
+      <input type="checkbox" id="fEnabled" {% if config.enabled %}checked{% endif %}>
+      <strong>Enabled</strong>
+    </label>
+  </div>
+  <div class="wr-hint">
+    Off by default. Nothing syncs to the public site, nothing is polled,
+    nothing is fulfilled, until this is on.
+  </div>
+</div>
+
+<div class="wr-pane">
+  <h3 style="margin-top:0;">Availability Grid</h3>
+  <p class="wr-hint">
+    Which hours accept requests, station-local time. Click a cell, an hour
+    header, or a day label. Empty (all closed) is the default for a reason
+    -- mixshow/talk hours with no music-kind rotation slots should stay
+    closed here.
+  </p>
+  {% include "webrequests/_open_slots_grid.html" with open_slots=config.open_slots %}
+</div>
+
+<div class="wr-pane">
+  <h3 style="margin-top:0;">Rate &amp; Timing</h3>
+  <form id="wrConfigForm" onsubmit="return false;">
+    <div class="wr-form-two">
+      <div class="wr-form-row">
+        <label for="fMaxPerHour">Max fulfilled / hour</label>
+        <input type="number" class="pl-input" id="fMaxPerHour" min="0" step="1"
+               value="{{ config.max_fulfilled_per_hour }}">
+      </div>
+      <div class="wr-form-row">
+        <label for="fLookahead">Lookahead warning (min)</label>
+        <input type="number" class="pl-input" id="fLookahead" min="1" step="1"
+               value="{{ config.lookahead_warning_minutes }}">
+      </div>
+      <div class="wr-form-row">
+        <label for="fExpireHours">Expire after (hours)</label>
+        <input type="number" class="pl-input" id="fExpireHours" min="1" step="1"
+               value="{{ config.expire_after_hours }}">
+      </div>
+    </div>
+    <div class="wr-hint">
+      Requests beyond the per-hour cap stay pending and roll into the next
+      hour's budget rather than being rejected. A request with no eligible
+      slot within the lookahead window is reported as "no slot soon"
+      (still queued, still eligible) instead of a plain "pending".
+    </div>
+    <button type="button" class="pl-btn primary" style="margin-top:0.75rem;" onclick="saveConfig()">Save</button>
+    <div id="wrMsg" class="wr-msg"></div>
+  </form>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+function getCookie(name) {
+  let val = null;
+  document.cookie.split(';').forEach(c => {
+    c = c.trim();
+    if (c.startsWith(name + '='))
+      val = decodeURIComponent(c.substring(name.length + 1));
+  });
+  return val;
+}
+
+document.getElementById('fEnabled').addEventListener('change', async (e) => {
+  await patchConfig({ enabled: e.target.checked });
+});
+
+async function saveConfig() {
+  await patchConfig({
+    max_fulfilled_per_hour: parseInt(document.getElementById('fMaxPerHour').value, 10) || 0,
+    lookahead_warning_minutes: parseInt(document.getElementById('fLookahead').value, 10) || 1,
+    expire_after_hours: parseInt(document.getElementById('fExpireHours').value, 10) || 1,
+  });
+}
+
+async function patchConfig(payload) {
+  const msg = document.getElementById('wrMsg');
+  try {
+    const resp = await fetch("{% url 'webrequests:api-config' %}", {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') },
+      body: JSON.stringify(payload),
+    });
+    const data = await resp.json();
+    if (!resp.ok) {
+      msg.textContent = data.error || 'Could not save.';
+      msg.classList.add('error');
+      return;
+    }
+    msg.textContent = 'Saved.';
+    msg.classList.remove('error');
+  } catch (e) {
+    msg.textContent = 'Network error.';
+    msg.classList.add('error');
+  }
+}
+</script>
+{% endblock %}

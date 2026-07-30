@@ -36,6 +36,7 @@ urlpatterns = [
     path('monitoring/', include('monitoring.urls')),
     path('rbds/', include('rbds.urls')),
     path('wx/', include('weather.urls')),
+    path('', include('webrequests.urls')),
     path('', include('aircheck.urls')),
     path('', include('library.urls')),
 ]

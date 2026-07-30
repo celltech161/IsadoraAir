@@ -1,0 +1,218 @@
+<div class="oslot-wrap">
+  <div class="oslot-legend">
+    <span class="oslot-legend-item"><span class="oslot-swatch oslot-open"></span> Open for requests</span>
+    <span class="oslot-legend-item"><span class="oslot-swatch oslot-closed"></span> Closed</span>
+  </div>
+  <div class="oslot-scroll">
+    <div class="oslot-grid" id="oslotGrid">
+      <div class="oslot-header oslot-corner"></div>
+      <div class="oslot-header oslot-hour-header" data-hour="0">12a</div>
+      <div class="oslot-header oslot-hour-header" data-hour="1">1a</div>
+      <div class="oslot-header oslot-hour-header" data-hour="2">2a</div>
+      <div class="oslot-header oslot-hour-header" data-hour="3">3a</div>
+      <div class="oslot-header oslot-hour-header" data-hour="4">4a</div>
+      <div class="oslot-header oslot-hour-header" data-hour="5">5a</div>
+      <div class="oslot-header oslot-hour-header" data-hour="6">6a</div>
+      <div class="oslot-header oslot-hour-header" data-hour="7">7a</div>
+      <div class="oslot-header oslot-hour-header" data-hour="8">8a</div>
+      <div class="oslot-header oslot-hour-header" data-hour="9">9a</div>
+      <div class="oslot-header oslot-hour-header" data-hour="10">10a</div>
+      <div class="oslot-header oslot-hour-header" data-hour="11">11a</div>
+      <div class="oslot-header oslot-hour-header" data-hour="12">12p</div>
+      <div class="oslot-header oslot-hour-header" data-hour="13">1p</div>
+      <div class="oslot-header oslot-hour-header" data-hour="14">2p</div>
+      <div class="oslot-header oslot-hour-header" data-hour="15">3p</div>
+      <div class="oslot-header oslot-hour-header" data-hour="16">4p</div>
+      <div class="oslot-header oslot-hour-header" data-hour="17">5p</div>
+      <div class="oslot-header oslot-hour-header" data-hour="18">6p</div>
+      <div class="oslot-header oslot-hour-header" data-hour="19">7p</div>
+      <div class="oslot-header oslot-hour-header" data-hour="20">8p</div>
+      <div class="oslot-header oslot-hour-header" data-hour="21">9p</div>
+      <div class="oslot-header oslot-hour-header" data-hour="22">10p</div>
+      <div class="oslot-header oslot-hour-header" data-hour="23">11p</div>
+    </div>
+  </div>
+</div>
+
+<style>
+  /* Same "hardcoded, not var(--accent)" reasoning as library's own
+     _blocked_slots_grid.html partial this was adapted from -- open/
+     closed is a fixed semantic (green/red), not meant to track the
+     site's brand accent color. Class names are oslot-* (not bslot-*)
+     so this can never collide with the track-level grid if both ever
+     render on the same page. */
+  .oslot-wrap { margin-top: 0.5rem; }
+  .oslot-legend {
+    display: flex;
+    gap: 1rem;
+    margin-bottom: 0.5rem;
+    font-size: 0.78rem;
+    color: rgba(156, 163, 175, 1);
+  }
+  .oslot-legend-item { display: inline-flex; align-items: center; gap: 0.35rem; }
+  .oslot-swatch {
+    display: inline-block;
+    width: 12px;
+    height: 12px;
+    border-radius: 3px;
+  }
+  .oslot-swatch.oslot-open { background: rgba(34, 197, 94, 0.55); }
+  .oslot-swatch.oslot-closed { background: rgba(249, 115, 115, 0.85); }
+
+  .oslot-scroll { overflow-x: auto; }
+
+  .oslot-grid {
+    display: grid;
+    grid-template-columns: 42px repeat(24, 32px);
+    width: max-content;
+    gap: 1px;
+    background: rgba(100, 116, 139, 0.15);
+    border-radius: 8px;
+    overflow: hidden;
+  }
+
+  .oslot-header {
+    background: rgba(15, 23, 42, 1);
+    padding: 0.3rem 0.15rem;
+    text-align: center;
+    font-size: 0.62rem;
+    font-weight: 600;
+    color: rgba(156, 163, 175, 1);
+    user-select: none;
+  }
+  .oslot-header.oslot-corner { background: rgba(0, 0, 0, 1); }
+  .oslot-header.oslot-hour-header {
+    cursor: pointer;
+    transition: filter 0.1s;
+  }
+  .oslot-header.oslot-hour-header:hover {
+    filter: brightness(1.5);
+    outline: 1px solid rgba(255,255,255,0.4);
+  }
+
+  .oslot-day-label {
+    background: rgba(15, 23, 42, 1);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.68rem;
+    font-weight: 700;
+    color: rgba(156, 163, 175, 1);
+    user-select: none;
+    cursor: pointer;
+    transition: filter 0.1s;
+  }
+  .oslot-day-label:hover {
+    filter: brightness(1.5);
+    outline: 1px solid rgba(255,255,255,0.4);
+  }
+
+  /* Default (no class) = closed -- matches WebRequestConfig.open_slots'
+     "empty = nothing open" safe default. Opposite base-state from the
+     track grid's bslot-cell, which defaults to available/green. */
+  .oslot-cell {
+    min-height: 26px;
+    cursor: pointer;
+    transition: filter 0.1s;
+    background: rgba(249, 115, 115, 0.85);
+  }
+  .oslot-cell:hover {
+    filter: brightness(1.3);
+    outline: 1px solid rgba(255,255,255,0.4);
+  }
+  .oslot-cell.oslot-open { background: rgba(34, 197, 94, 0.55); }
+</style>
+
+<script>
+(function () {
+  const DAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+  const DISPLAY_TO_DOW = [6, 0, 1, 2, 3, 4, 5];
+  const grid = document.getElementById("oslotGrid");
+  const openSlots = new Set({{ open_slots }});
+  const toggleUrl = "{% url 'webrequests:api-open-slot-toggle' %}";
+  const toggleRowUrl = "{% url 'webrequests:api-open-slot-toggle-row' %}";
+  const toggleColumnUrl = "{% url 'webrequests:api-open-slot-toggle-column' %}";
+
+  function getCookie(name) {
+    let val = null;
+    document.cookie.split(';').forEach(c => {
+      c = c.trim();
+      if (c.startsWith(name + '='))
+        val = decodeURIComponent(c.substring(name.length + 1));
+    });
+    return val;
+  }
+
+  async function onCellClick(slot, cell) {
+    const resp = await fetch(toggleUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-CSRFToken': getCookie('csrftoken'),
+      },
+      body: JSON.stringify({ slot: slot }),
+    });
+    if (!resp.ok) return;
+    const data = await resp.json();
+    cell.classList.toggle('oslot-open', data.open);
+  }
+
+  async function onDayLabelClick(dow) {
+    const resp = await fetch(toggleRowUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-CSRFToken': getCookie('csrftoken'),
+      },
+      body: JSON.stringify({ day_of_week: dow }),
+    });
+    if (!resp.ok) return;
+    const data = await resp.json();
+    data.slots.forEach(slot => {
+      const cell = grid.querySelector(`.oslot-cell[data-slot="${slot}"]`);
+      if (cell) cell.classList.toggle('oslot-open', data.open);
+    });
+  }
+
+  async function onHourHeaderClick(hour) {
+    const resp = await fetch(toggleColumnUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-CSRFToken': getCookie('csrftoken'),
+      },
+      body: JSON.stringify({ hour: hour }),
+    });
+    if (!resp.ok) return;
+    const data = await resp.json();
+    data.slots.forEach(slot => {
+      const cell = grid.querySelector(`.oslot-cell[data-slot="${slot}"]`);
+      if (cell) cell.classList.toggle('oslot-open', data.open);
+    });
+  }
+
+  grid.querySelectorAll('.oslot-hour-header').forEach(header => {
+    header.title = 'Click to open/close this entire hour for requests';
+    header.addEventListener('click', () => onHourHeaderClick(parseInt(header.dataset.hour, 10)));
+  });
+
+  for (let d = 0; d < 7; d++) {
+    const label = document.createElement('div');
+    label.className = 'oslot-day-label';
+    label.textContent = DAYS[d];
+    label.title = 'Click to open/close this entire day for requests';
+    label.addEventListener('click', () => onDayLabelClick(DISPLAY_TO_DOW[d]));
+    grid.appendChild(label);
+
+    const dow = DISPLAY_TO_DOW[d];
+    for (let h = 0; h < 24; h++) {
+      const slot = dow * 24 + h;
+      const cell = document.createElement('div');
+      cell.className = 'oslot-cell' + (openSlots.has(slot) ? ' oslot-open' : '');
+      cell.dataset.slot = slot;
+      cell.addEventListener('click', () => onCellClick(slot, cell));
+      grid.appendChild(cell);
+    }
+  }
+})();
+</script>
