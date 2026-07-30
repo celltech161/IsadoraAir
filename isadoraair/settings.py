@@ -69,6 +69,7 @@ INSTALLED_APPS = [
     'rbds',
     'weather',
     'ogremote',
+    'webrequests',
     'aircheck',
     'axes',
 ]
