@@ -76,6 +76,11 @@ def maybe_fulfill_song_request(log_item):
     earlier call to this function) already queued a song someone
     requested".
 
+    Sets estimated_play_time to the log_item's actual scheduled_time on
+    fulfillment (real and certain now, not a guess) -- a fulfilled
+    request shouldn't just say "fulfilled" with no time attached when
+    the real air time is already known.
+
     played_at/last_played_at/play_count/PlayEvent are all still written
     by engine.py's _create_deck at actual airtime as normal -- nothing
     here duplicates that; this only ever touches the LogItem/
@@ -130,14 +135,20 @@ def maybe_fulfill_song_request(log_item):
                 candidate.log_item = log_item
                 candidate.fulfilled_at = now
                 candidate.resolved_at = now
-                candidate.save(update_fields=["status", "log_item", "fulfilled_at", "resolved_at"])
+                candidate.estimated_play_time = log_item.scheduled_time
+                candidate.save(update_fields=[
+                    "status", "log_item", "fulfilled_at", "resolved_at", "estimated_play_time",
+                ])
                 print(f"  Web request fulfilled: {track.artist.name if track.artist_id else '?'} - {track.title} (request id={candidate.external_request_id})")
                 break
 
         now = timezone.now()
         SongRequest.objects.filter(
             status__in=SongRequest.NON_TERMINAL_STATUSES, track_id=log_item.track_id,
-        ).update(status="fulfilled", log_item=log_item, fulfilled_at=now, resolved_at=now)
+        ).update(
+            status="fulfilled", log_item=log_item, fulfilled_at=now, resolved_at=now,
+            estimated_play_time=log_item.scheduled_time,
+        )
     except Exception as exc:
         print(f"  Web request fulfillment check failed (non-fatal): {exc}")
         emit_event(

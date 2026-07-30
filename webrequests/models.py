@@ -173,14 +173,15 @@ class SongRequest(models.Model):
     )
     estimated_play_time = models.DateTimeField(
         null=True, blank=True,
-        help_text="Best-guess air time, recomputed every "
-                   "refresh_song_request_statuses cycle from a FIFO pass over "
-                   "the upcoming open, music-kind LogItems (capped per hour by "
-                   "max_fulfilled_per_hour). Advisory only, for showing the "
-                   "requester a guess -- the actual fulfillment decision "
-                   "happens at engine queue-advance time and can land in a "
-                   "different slot than this estimate. Null while status is "
-                   "no_slot_soon or any terminal status.",
+        help_text="While pending: a best-guess air time, recomputed every "
+                   "refresh_song_request_statuses cycle by checking each "
+                   "upcoming open, music-kind LogItem for real eligibility "
+                   "(recency included) rather than just chronological order. "
+                   "Advisory only until fulfilled -- the actual fulfillment "
+                   "can land in a different slot than a given cycle's guess. "
+                   "Once fulfilled: the real, certain scheduled_time of the "
+                   "LogItem it landed in, not a guess. Null while status is "
+                   "no_slot_soon, expired, or unavailable.",
     )
 
     class Meta:
