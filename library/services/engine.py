@@ -20,7 +20,7 @@ import django
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "isadoraair.settings")
 django.setup()
 
-from django.db import close_old_connections
+from django.db import close_old_connections, connection
 from django.db.models import F
 from django.utils import timezone
 from hardware.models import AudioInput, AudioOutput, AudioPipeline, DuckingConfig, RemoteDJAudioInput
@@ -28,8 +28,9 @@ from library.models import Category, FXBusConfig, FXCart, LogItem, PlayEvent, Pl
 from monitoring.models import emit_event
 from library.services.log_builder import (
     DURATION_FIT_MARGIN,
+    LOCK_CONTENDED,
     append_fill_items,
-    build_hour_log,
+    build_and_approve_hour_log_locked,
     fill_remaining_hour,
 )
 from library.services.remote_dj_signaling import RemoteDJSignalingServer
@@ -387,6 +388,7 @@ class PlaybackEngine:
         self.running = False
         self._position_timer = None
         self._lock = threading.RLock()
+        self._building_hours = set()  # {(date, hour)} currently being async-built -- guarded by self._lock
 
     def start(self):
         self.running = True
@@ -1284,14 +1286,64 @@ class PlaybackEngine:
         right away, and the next hour once we're within the last
         NEXT_HOUR_LOOKAHEAD_SECONDS of the top of the hour, so a late
         schedule-grid edit still has a chance to take effect before
-        it's locked in."""
+        it's locked in.
+
+        Never runs build_hour_log synchronously, under any condition --
+        deck-idle state alone doesn't prove the engine has no live
+        audio or latency-sensitive activity (studio mic, a Remote DJ
+        session, FX carts/voice tracks, GStreamer bus/signaling
+        callbacks all still need this same single thread serviced
+        promptly). All missing-log work goes through _ensure_log_building,
+        which builds off-thread and hands the result back via
+        GLib.idle_add (see _build_hour_log_worker/_install_built_hour)."""
         if not self.running:
             return False
 
         close_old_connections()
         now = timezone.localtime()
 
-        self._ensure_log_approved(now.date(), now.hour)
+        with self._lock:
+            idle = self.decks["A"] is None and self.decks["B"] is None
+
+        # Monitoring: distinguish "rolled over late" (current_log is
+        # set but stale relative to wall-clock time -- a genuine missed
+        # top-of-hour transition) from "no log at all yet" (e.g. an
+        # ordinary mid-hour cold start, which is NOT a missed rollover
+        # and must not be reported as one). Deduplicated per (date,
+        # hour) via emit_event's own dedupe_key so a persistent
+        # condition doesn't re-alert every 10s tick.
+        if self.current_log is not None and (
+            self.current_log.date != now.date() or self.current_log.hour != now.hour
+        ):
+            if not PlaylistLog.objects.filter(date=now.date(), hour=now.hour, status="approved").exists():
+                with self._lock:
+                    build_in_progress = (now.date(), now.hour) in self._building_hours
+                emit_event(
+                    category="engine", level="warning",
+                    title="Current hour's log not ready after rollover",
+                    detail={
+                        "target_date": str(now.date()), "target_hour": now.hour,
+                        "build_in_progress": build_in_progress,
+                        "active_log_date": str(self.current_log.date), "active_log_hour": self.current_log.hour,
+                    },
+                    dedupe_key=f"engine|late-hour-log|{now.date()}|{now.hour}",
+                )
+        elif self.current_log is None:
+            if not PlaylistLog.objects.filter(date=now.date(), hour=now.hour, status="approved").exists():
+                with self._lock:
+                    build_in_progress = (now.date(), now.hour) in self._building_hours
+                emit_event(
+                    category="engine", level="warning",
+                    title="No approved log for current hour",
+                    detail={
+                        "target_date": str(now.date()), "target_hour": now.hour,
+                        "build_in_progress": build_in_progress,
+                        "active_log_date": None, "active_log_hour": None,
+                    },
+                    dedupe_key=f"engine|no-current-log|{now.date()}|{now.hour}",
+                )
+
+        self._ensure_log_building(now.date(), now.hour)
 
         # Checked every tick, not just the tick that built the log —
         # otherwise if the one attempt to start playback right after a
@@ -1304,9 +1356,9 @@ class PlaybackEngine:
         # exclusion, this check fired every ~10s during a hold and
         # "recovered" by reloading the hour's log from position 0,
         # replaying its first item (almost always a Legal ID) on a loop
-        # for as long as manual mode stayed on.
-        with self._lock:
-            idle = self.decks["A"] is None and self.decks["B"] is None
+        # for as long as manual mode stayed on. This part is unchanged
+        # from before -- _load_log_for is a single indexed query, not
+        # the slow build, so it was never the source of the stall.
         if idle and not self.manual_mode:
             self._load_log_for(now.date(), now.hour)
             if self.log_items:
@@ -1315,7 +1367,7 @@ class PlaybackEngine:
         seconds_left_in_hour = 3600 - (now.minute * 60 + now.second)
         if seconds_left_in_hour <= NEXT_HOUR_LOOKAHEAD_SECONDS:
             next_hour = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
-            self._ensure_log_approved(next_hour.date(), next_hour.hour)
+            self._ensure_log_building(next_hour.date(), next_hour.hour)
             self._advance_to_next_hour_log(next_hour.date(), next_hour.hour)
 
         return True
@@ -1360,35 +1412,97 @@ class PlaybackEngine:
         self._next_hour_peek_at = 0.0
         print(f"  Advanced active queue to next hour ahead of TOH: {log.date} {log.hour:02d}:00 ({len(items)} items)")
 
-    def _ensure_log_approved(self, target_date, hour):
-        """Build + approve target_date/hour's log if no APPROVED log
-        exists for it yet. A leftover DRAFT does not count -- draft
-        means "not committed for on-air" and must never block auto-
-        build, or a user who built a preview and forgot to approve/
-        discard it silently starves the scheduler at that hour's TOH.
-        (Caught live 2026-07-22: 1pm draft existed unapproved from an
-        earlier demo, engine's advance-to-next-hour couldn't find an
-        approved log at 12:59, and playback fell back to the previous
-        approved hour (12pm news repeated).) Returns True if a log was
-        built just now.
+    def _ensure_log_building(self, target_date, target_hour):
+        """Kick off an async build for (target_date, target_hour) if no
+        approved log exists yet and one isn't already in flight for
+        this exact hour in this process. The "approved already exists"
+        check here is a cheap fast-path only (true ~59 out of every 60
+        minutes in steady state) -- the real, race-free guarantee is
+        the advisory lock inside build_and_approve_hour_log_locked,
+        which _building_hours doesn't replace, just avoids redundantly
+        spawning a thread for.
 
-        No need to delete the draft explicitly: build_hour_log's
-        _persist_log call already runs
-        `PlaylistLog.objects.filter(date, hour).delete()` before
-        creating the fresh row (unique_together on (date, hour) makes
-        that mandatory anyway)."""
-        if PlaylistLog.objects.filter(date=target_date, hour=hour, status="approved").exists():
+        A leftover DRAFT does not count as approved -- draft means "not
+        committed for on-air" and must never block auto-build, or a
+        user who built a preview and forgot to approve/discard it
+        silently starves the scheduler at that hour's TOH. (Caught live
+        2026-07-22: 1pm draft existed unapproved from an earlier demo,
+        engine's advance-to-next-hour couldn't find an approved log at
+        12:59, and playback fell back to the previous approved hour
+        (12pm news repeated).)"""
+        if PlaylistLog.objects.filter(date=target_date, hour=target_hour, status="approved").exists():
+            return
+        key = (target_date, target_hour)
+        with self._lock:
+            if key in self._building_hours:
+                return
+            self._building_hours.add(key)
+        threading.Thread(
+            target=self._build_hour_log_worker, args=(target_date, target_hour),
+            daemon=True,
+        ).start()
+
+    def _build_hour_log_worker(self, target_date, target_hour):
+        """Runs on a background thread -- touches only the Django ORM,
+        never self.log_items/self.current_log/self._queue_cursor or any
+        GStreamer object. build_and_approve_hour_log_locked holds a
+        Postgres advisory lock across the whole persist-then-approve
+        sequence, so a concurrent build from a different process (a
+        manual admin rebuild, force_next_hour) can't delete this row out
+        from under the approve step. Hands the result back to the main
+        thread via GLib.idle_add -- see _install_built_hour -- rather
+        than touching engine state directly from this thread."""
+        try:
+            close_old_connections()
+            log, error = build_and_approve_hour_log_locked(target_date, target_hour)
+            if error == LOCK_CONTENDED:
+                print(f"  Async build deferred for {target_date} {target_hour:02d}:00 -- already being built elsewhere")
+                return
+            if error:
+                print(f"  Auto-build (async) skipped for {target_date} {target_hour:02d}:00 -- {error}")
+                emit_event(
+                    category="engine", level="warning", title="Async hour-log build failed",
+                    detail={"date": str(target_date), "hour": target_hour, "error": error},
+                )
+                return
+            print(f"  Auto-built and approved log (async) for {target_date} {target_hour:02d}:00 ({log.items.count()} items)")
+            if self.running:  # don't schedule queue mutations mid-teardown
+                GLib.idle_add(self._install_built_hour, target_date, target_hour)
+        except Exception as exc:
+            print(f"  Async hour-log build crashed (non-fatal): {exc}")
+            emit_event(
+                category="engine", level="error", title="Async hour-log build crashed",
+                detail={
+                    "date": str(target_date), "hour": target_hour,
+                    "exception": repr(exc), "traceback": traceback.format_exc(),
+                },
+            )
+        finally:
+            # Independent cleanup steps -- one raising must not skip the other.
+            try:
+                connection.close()  # don't leak a per-thread DB connection over a long engine uptime
+            finally:
+                with self._lock:
+                    self._building_hours.discard((target_date, target_hour))
+
+    @_glib_safe(default_return=False)
+    def _install_built_hour(self, target_date, target_hour):
+        """One-shot GLib.idle_add callback -- runs on the main thread,
+        so it's safe to touch engine state here. _advance_to_next_hour_log
+        is already idempotent and installs immediately regardless of how
+        late this fires relative to the actual hour boundary. It never
+        itself calls _start_next_track (it only swaps the queue), so a
+        genuine cold start needs this callback to also perform the
+        idle-recovery check -- otherwise a fully built-and-approved log
+        would sit silently unplayed until the next 10s tick noticed."""
+        if not self.running:
             return False
-
-        log, error = build_hour_log(target_date, hour)
-        if error:
-            print(f"  Auto-build skipped for {target_date} {hour:02d}:00 — {error}")
-            return False
-
-        log.status = "approved"
-        log.save(update_fields=["status"])
-        print(f"  Auto-built and approved log for {target_date} {hour:02d}:00 ({log.items.count()} items)")
-        return True
+        self._advance_to_next_hour_log(target_date, target_hour)
+        with self._lock:
+            idle = self.decks["A"] is None and self.decks["B"] is None
+        if idle and not self.manual_mode and self.log_items:
+            self._start_next_track()
+        return False
 
     # --- Slot / queue helpers ---
 
@@ -1490,6 +1604,19 @@ class PlaybackEngine:
         new_items = append_fill_items(self.current_log, new_picks, start_position)
         self.log_items.extend(new_items)
         print(f"  Extended live log with {len(new_items)} fill track(s) — {seconds_left:.0f}s left in the real hour")
+        # Informational, lower severity than the "log not ready" warnings
+        # in _ensure_upcoming_logs -- this path fires for two different
+        # reasons (ordinary early exhaustion mid-hour, e.g. a DJ skipped
+        # ahead of schedule; or the real next hour's async build running
+        # long/failing) and this event alone doesn't distinguish them,
+        # it's just visibility that the fallback engaged at all.
+        emit_event(
+            category="engine", level="info", title="Live log extension activated",
+            detail={
+                "date": str(self.current_log.date), "hour": self.current_log.hour,
+                "items_added": len(new_items), "seconds_left_in_hour": round(seconds_left, 1),
+            },
+        )
         return True
 
     def _roll_over_to_next_hour(self):
@@ -2694,9 +2821,20 @@ class PlaybackEngine:
                 # Manual testing hook: do exactly what
                 # _ensure_upcoming_logs does naturally ~30s before top of
                 # hour, on demand instead of waiting for the real clock.
+                # Deliberately synchronous/blocking -- unlike the
+                # recurring auto-build, an operator invoking this
+                # expects it to be done by the time it returns.
                 now = timezone.localtime()
                 next_hour = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
-                self._ensure_log_approved(next_hour.date(), next_hour.hour)
+                log, error = build_and_approve_hour_log_locked(next_hour.date(), next_hour.hour)
+                if error and error != LOCK_CONTENDED:
+                    print(f"  force_next_hour build failed for {next_hour.date()} {next_hour.hour:02d}:00 -- {error}")
+                    emit_event(
+                        category="engine", level="warning", title="force_next_hour build failed",
+                        detail={"date": str(next_hour.date()), "hour": next_hour.hour, "error": error},
+                    )
+                elif error == LOCK_CONTENDED:
+                    print(f"  force_next_hour deferred for {next_hour.date()} {next_hour.hour:02d}:00 -- already being built elsewhere")
                 self._advance_to_next_hour_log(next_hour.date(), next_hour.hour)
             elif cmd == "mic_ptt":
                 self._set_mic_ptt(bool(data.get("active")))

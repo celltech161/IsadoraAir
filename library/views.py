@@ -21,7 +21,7 @@ from django.utils import timezone
 from django.shortcuts import get_object_or_404
 
 from .models import Artist, Album, Category, CategoryKind, Genre, Holiday, LogItem, Playlist, PlaylistItem, PlaylistLog, Rotation, RotationSlot, ScheduleBlock, Track
-from .services.log_builder import _build_from_playlist, build_hour_log, preview_hour_log
+from .services.log_builder import LOCK_CONTENDED, _build_from_playlist, build_hour_log_for_admin, preview_hour_log
 
 
 @ensure_csrf_cookie
@@ -1606,7 +1606,9 @@ def api_log_build(request):
     if not (0 <= hour <= 23):
         return JsonResponse({"error": "hour must be 0-23"}, status=400)
 
-    log, error = build_hour_log(target_date, hour)
+    log, error = build_hour_log_for_admin(target_date, hour)
+    if error == LOCK_CONTENDED:
+        return JsonResponse({"error": "This hour is currently being built by the engine -- try again shortly"}, status=409)
     if error:
         return JsonResponse({"error": error}, status=400)
 

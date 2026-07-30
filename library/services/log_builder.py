@@ -1,6 +1,8 @@
 import random
+from contextlib import contextmanager
 from datetime import date as _date, datetime, time, timedelta
 
+from django.db import connection
 from django.db.models import Count, Q
 from django.db.models.expressions import RawSQL
 from django.utils import timezone
@@ -789,6 +791,86 @@ def build_hour_log(target_date, hour):
         return _build_from_rotation(target_date, hour, block.rotation)
 
     return None, "ScheduleBlock has neither rotation nor playlist."
+
+
+@contextmanager
+def _advisory_lock_for_hour(target_date, hour):
+    """Non-blocking Postgres advisory lock keyed by (target_date, hour),
+    serializing every LIVE build_hour_log call across all processes --
+    the engine's async worker, force_next_hour, api_log_build. Uses the
+    native two-integer form (pg_try_advisory_lock(key1, key2)) rather
+    than hashing a string key, avoiding even the theoretical 32-bit
+    hash-collision false-contention risk of hashtext(). Session-scoped
+    to this DB connection -- acquire/release happen on the same
+    connection since both run inside one `with` block. Yields True if
+    acquired, False if contended (caller must check and bail out
+    without proceeding)."""
+    key1, key2 = target_date.toordinal(), hour
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT pg_try_advisory_lock(%s, %s)", [key1, key2])
+        acquired = cursor.fetchone()[0]
+    try:
+        yield acquired
+    finally:
+        if acquired:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT pg_advisory_unlock(%s, %s)", [key1, key2])
+
+
+# Distinct sentinel: "someone else is handling it, retry later" -- not
+# a genuine build failure. Callers must not log/alert on this the same
+# way as a real error string from build_hour_log itself.
+LOCK_CONTENDED = "lock_contention"
+
+
+def build_and_approve_hour_log_locked(target_date, hour):
+    """Engine auto-build semantics: skip rebuilding if an approved log
+    already exists; otherwise build + approve, holding the advisory
+    lock for the WHOLE persist-then-approve sequence so a concurrent
+    builder (a different process) can't delete this row between
+    persist and approve -- releasing the lock right after persisting
+    and approving separately as a caller-side step would reopen the
+    exact same race just one line later. For "ensure this hour is on
+    air" callers only: the engine's async build worker and the manual
+    force_next_hour command. NOT for admin rebuild-on-demand behavior
+    (see build_hour_log_for_admin) -- that has different semantics
+    (always rebuilds, never auto-approves) that this would silently
+    break."""
+    with _advisory_lock_for_hour(target_date, hour) as acquired:
+        if not acquired:
+            return None, LOCK_CONTENDED
+        existing = PlaylistLog.objects.filter(date=target_date, hour=hour, status="approved").first()
+        if existing:
+            return existing, None
+        log, error = build_hour_log(target_date, hour)
+        if error:
+            return log, error
+        log.status = "approved"
+        log.save(update_fields=["status"])
+        return log, None
+
+
+def build_hour_log_for_admin(target_date, hour):
+    """api_log_build's semantics: ALWAYS rebuilds -- matches the
+    existing admin behavior exactly (_persist_log's delete-then-
+    recreate replaces whatever was there, draft or approved) -- and
+    does NOT auto-approve, leaving the result as a draft for human
+    review, same as today. Only adds cross-process serialization on
+    top of the existing behavior, so a concurrent engine auto-build for
+    the same hour can't race it.
+
+    Known, pre-existing caveat (not introduced by this lock): if this
+    creates a draft for an hour the engine is also trying to
+    auto-build, and the draft is never approved, the engine's own
+    auto-build will find no *approved* row and will delete-and-rebuild
+    this hour on its own the next time it checks -- same "approved
+    existence only" semantics as before, just lock-serialized instead
+    of racing. "Draft for human review" is not itself protection from
+    the engine's auto-build."""
+    with _advisory_lock_for_hour(target_date, hour) as acquired:
+        if not acquired:
+            return None, LOCK_CONTENDED
+        return build_hour_log(target_date, hour)
 
 
 def _describe_track_issues(track, prefix, issues):
