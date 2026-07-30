@@ -24,15 +24,18 @@ from django.db import close_old_connections
 from django.db.models import F
 from django.utils import timezone
 from hardware.models import AudioInput, AudioOutput, AudioPipeline, DuckingConfig, RemoteDJAudioInput
-from library.models import Category, FXBusConfig, FXCart, LogItem, PlayEvent, PlaylistLog, RemoteDJConfig, Track, VoiceTrack, VoiceTrackConfig
+from library.models import Category, FXBusConfig, FXCart, LogItem, PlayEvent, PlaylistLog, RecencyConfig, RemoteDJConfig, Track, VoiceTrack, VoiceTrackConfig
 from monitoring.models import emit_event
 from library.services.log_builder import (
     DURATION_FIT_MARGIN,
     append_fill_items,
     build_hour_log,
     fill_remaining_hour,
+    get_recent_exclusions,
+    get_separation,
 )
 from library.services.remote_dj_signaling import RemoteDJSignalingServer
+from webrequests.models import SongRequest, WebRequestConfig
 
 STUDIO_MONITOR_NAME = "Studio Monitor"
 STUDIO_MONITOR_FALLBACK_DEVICE = "plughw:2,0"
@@ -1620,6 +1623,113 @@ class PlaybackEngine:
                 items = list(peek[1])
         return [it for it in items if _log_item_playable(it)[0]]
 
+    def _maybe_fulfill_song_request(self, log_item):
+        """Web Requests fulfillment hook. If `log_item` is a music-kind
+        slot in an open request hour and there's an eligible pending
+        request, swap the track in-place (mutating log_item.track /
+        track_title / track_artist, both in memory and via a DB save)
+        so _create_deck plays the requested song instead of whatever
+        rotation had picked. Called right before _create_deck, on
+        whatever item _next_queue_item just handed back -- this only
+        ever substitutes the content of a slot already at the front of
+        the queue, never splices ahead of it, so a request can
+        structurally never preempt an _insert_urgent_next alert (those
+        always land at the cursor first; by the time this runs on that
+        same item, its category is the alert's own, not music, and the
+        gate below skips it).
+
+        Recency rules are honored exactly as they are for a normal
+        rotation pick (get_separation/get_recent_exclusions, same
+        functions log_builder itself uses) -- a request for a title or
+        artist that's currently too recent just keeps waiting, same as
+        the user's own sketch answer for this ("we honor recency
+        rules"). "Collapse to one play" (another explicit requirement):
+        regardless of whether a swap happens here, every OTHER pending/
+        no_slot_soon request for whatever track ends up in this slot
+        rides along on this one play instead of separately waiting for
+        its own turn -- covers both "we swapped this song in" and "
+        rotation happened to already queue a song someone requested".
+
+        played_at/last_played_at/play_count/PlayEvent are all still
+        written by _create_deck as normal immediately after this
+        returns -- nothing here needs to duplicate that.
+
+        Wrapped in a blanket try/except: a bug in this brand-new
+        feature must never be able to stop a track from starting."""
+        try:
+            if log_item is None or log_item.track_id is None:
+                return
+            if log_item.category_id is None or not log_item.category.kind_id:
+                return
+            if log_item.category.kind.code != "music":
+                return
+
+            close_old_connections()
+            cfg = WebRequestConfig.load()
+            if not cfg.enabled:
+                return
+
+            local_now = timezone.localtime()
+            slot_index = local_now.weekday() * 24 + local_now.hour
+            if slot_index not in cfg.open_slots:
+                return
+
+            fulfilled_this_hour = SongRequest.objects.filter(
+                status="fulfilled", log_item__playlist_log_id=log_item.playlist_log_id,
+            ).count()
+
+            if fulfilled_this_hour < cfg.max_fulfilled_per_hour:
+                recency_cfg = RecencyConfig.load()
+                candidates = (
+                    SongRequest.objects
+                    .filter(status__in=SongRequest.NON_TERMINAL_STATUSES)
+                    .exclude(track__isnull=True)
+                    .select_related("track", "track__artist", "track__category", "track__category__kind")
+                    .order_by("submitted_at")
+                )
+                for candidate in candidates:
+                    track = candidate.track
+                    if not track.ready2air:
+                        continue
+                    if track.category_id is None or track.category.kind.code != "music":
+                        continue
+                    if not track.filepath or not Path(track.filepath).is_file():
+                        continue
+
+                    artist_sep, title_sep = get_separation(track.category, recency_cfg)
+                    exclude_track_ids, exclude_artist_ids = get_recent_exclusions(
+                        local_now, artist_sep, title_sep, set(), set(),
+                    )
+                    if track.id in exclude_track_ids or track.artist_id in exclude_artist_ids:
+                        continue  # recency-blocked right now -- leave pending for a later slot
+
+                    log_item.track = track
+                    log_item.track_title = track.title
+                    log_item.track_artist = track.artist.name if track.artist_id else ""
+                    log_item.save(update_fields=["track", "track_title", "track_artist"])
+
+                    now = timezone.now()
+                    candidate.status = "fulfilled"
+                    candidate.log_item = log_item
+                    candidate.fulfilled_at = now
+                    candidate.resolved_at = now
+                    candidate.save(update_fields=["status", "log_item", "fulfilled_at", "resolved_at"])
+                    print(f"  Web request fulfilled: {track.artist.name if track.artist_id else '?'} - {track.title} (request id={candidate.external_request_id})")
+                    break
+
+            now = timezone.now()
+            SongRequest.objects.filter(
+                status__in=SongRequest.NON_TERMINAL_STATUSES, track_id=log_item.track_id,
+            ).update(status="fulfilled", log_item=log_item, fulfilled_at=now, resolved_at=now)
+        except Exception as exc:
+            print(f"  Web request fulfillment check failed (non-fatal): {exc}")
+            emit_event(
+                category="engine", level="warning",
+                title="Web request fulfillment check failed",
+                detail={"error": str(exc), "log_item_id": getattr(log_item, "id", None)},
+                dedupe_key="engine|webrequest-fulfill-error",
+            )
+
     def _start_next_track(self, slot=None):
         """Load the next queued item into `slot` (or whichever slot is
         free, preferring A) and start it playing right away."""
@@ -1632,6 +1742,8 @@ class PlaybackEngine:
         if log_item is None:
             self._on_log_exhausted(slot)
             return
+
+        self._maybe_fulfill_song_request(log_item)
 
         self._next_triggered = False
         deck = self._create_deck(slot, log_item)
