@@ -1634,7 +1634,18 @@ class PlaybackEngine:
             self._on_log_exhausted(slot)
             return
 
-        maybe_fulfill_song_request(log_item)
+        # Skip request-fulfillment on the resume path: the LogItem
+        # about to be handed to _create_deck is one _apply_resume_hint_
+        # queue_rewind already rewound the cursor to, meant to CONTINUE
+        # from a mid-play position -- not an "open request slot." A
+        # swap here would replace log_item.track with a different track,
+        # which then wouldn't match hint["track_id"] in _create_deck,
+        # silently disable the auto-resume seek, and leave the UI cursor
+        # at the resumed position with audio starting from zero. Guard
+        # is on _resume_hint (not just first-track-after-restart) so it
+        # holds until _create_deck actually consumes and clears it.
+        if not getattr(self, "_resume_hint", None):
+            maybe_fulfill_song_request(log_item)
 
         self._next_triggered = False
         deck = self._create_deck(slot, log_item)
