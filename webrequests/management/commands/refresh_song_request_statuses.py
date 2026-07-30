@@ -7,30 +7,41 @@ from django.utils import timezone
 
 from library.models import LogItem
 from webrequests.models import SongRequest, WebRequestConfig
+from webrequests.services import maybe_fulfill_song_request
 
 
 class Command(BaseCommand):
     """Re-evaluates every non-terminal SongRequest on a timer (systemd),
-    independent of both the polling scripts and the live engine:
+    independent of the polling scripts:
 
       1. unavailable -- track disappeared or fell out of eligibility
          (deleted, ready2air flipped off, recategorized out of music)
          since the request was made.
       2. expired -- sitting past WebRequestConfig.expire_after_hours
          with no track-level problem, just never got a turn.
-      3. Everything left over is FIFO-matched (oldest submitted_at
-         first) against upcoming open, music-kind LogItems within
-         lookahead_warning_minutes, capped per hour by
-         max_fulfilled_per_hour (minus whatever's already fulfilled
-         into that hour) -- giving each a pending/no_slot_soon status
-         plus an advisory estimated_play_time.
-
-    This is purely a read of already-built PlaylistLog/LogItem rows and
-    a write to SongRequest -- it never touches the running engine, and
-    the FIFO match here is only ever a preview. The actual
-    slot-claiming happens at engine queue-advance time (a separate,
-    not-yet-built piece) and can land a request in a different slot
-    than this estimate guessed."""
+      3. Proactively fulfills: walks every upcoming open, music-kind,
+         not-yet-played LogItem in order and tries to swap in the
+         oldest eligible request via webrequests.services.
+         maybe_fulfill_song_request. This is what makes a fulfilled
+         request show up in "Up Next" right away instead of only at
+         the literal moment it airs -- the running engine's own
+         _reload_queue_if_changed() (engine.py) picks up this DB-side
+         swap within a few seconds. The engine calls the same function
+         itself too, once, right before a slot actually plays -- a
+         last-second safety net for anything that became eligible too
+         recently (recency window just cleared, a slot just opened)
+         for this pass to have caught it yet. Idempotent between the
+         two callers and across repeated runs of this command.
+      4. Everything still left over (couldn't be fulfilled above) is
+         FIFO-matched (oldest submitted_at first) against remaining
+         open, music-kind LogItems within lookahead_warning_minutes,
+         capped per hour by max_fulfilled_per_hour (minus whatever's
+         now actually fulfilled into that hour) -- giving each a
+         pending/no_slot_soon status plus an advisory
+         estimated_play_time. This part is only ever a preview --
+         since a real fulfillment can happen for any request at any
+         later cycle, an advisory estimate can end up not matching
+         which slot a request actually lands in."""
 
     help = "Re-evaluate pending SongRequest statuses (unavailable/expired/pending/no_slot_soon) and estimated_play_time."
 
@@ -73,6 +84,29 @@ class Command(BaseCommand):
                 still_pending.append(req)
 
         lookahead_cutoff = now + timedelta(minutes=cfg.lookahead_warning_minutes)
+
+        fulfillment_candidates = (
+            LogItem.objects.filter(
+                scheduled_time__gte=now, scheduled_time__lt=lookahead_cutoff,
+                played_at__isnull=True, category__kind__code="music",
+            )
+            .order_by("scheduled_time")
+        )
+        for item in fulfillment_candidates:
+            maybe_fulfill_song_request(item)
+
+        # Re-check: the proactive pass above may have just fulfilled
+        # some of these.
+        still_pending_ids = [req.id for req in still_pending]
+        still_pending = list(
+            SongRequest.objects.filter(
+                id__in=still_pending_ids, status__in=SongRequest.NON_TERMINAL_STATUSES,
+            )
+            .select_related("track", "track__category", "track__category__kind")
+            .order_by("submitted_at")
+        )
+        fulfilled_now_count = len(still_pending_ids) - len(still_pending)
+
         candidates = (
             LogItem.objects.filter(
                 scheduled_time__gte=now, scheduled_time__lt=lookahead_cutoff,
@@ -117,6 +151,7 @@ class Command(BaseCommand):
         self.stdout.write(json.dumps({
             "checked": len(pending),
             "resolved": resolved_count,
+            "fulfilled_now": fulfilled_now_count,
             "still_pending": len(still_pending),
             "slots_available": len(slot_pool),
         }))
