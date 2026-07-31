@@ -1305,19 +1305,33 @@ class PlaybackEngine:
         with self._lock:
             idle = self.decks["A"] is None and self.decks["B"] is None
 
-        # Monitoring: distinguish "rolled over late" (current_log is
-        # set but stale relative to wall-clock time -- a genuine missed
-        # top-of-hour transition) from "no log at all yet" (e.g. an
-        # ordinary mid-hour cold start, which is NOT a missed rollover
-        # and must not be reported as one). Deduplicated per (date,
-        # hour) via emit_event's own dedupe_key so a persistent
-        # condition doesn't re-alert every 10s tick.
-        if self.current_log is not None and (
-            self.current_log.date != now.date() or self.current_log.hour != now.hour
-        ):
+        # Kick off (or no-op if already approved/in-flight) BEFORE the
+        # monitoring check below, so a first-tick "no log yet" event
+        # accurately reports build_in_progress=True rather than False
+        # for the instant before the NEXT tick would otherwise have
+        # been the first to notice the worker it just started.
+        self._ensure_log_building(now.date(), now.hour)
+
+        # Monitoring: distinguish a genuine missed/late rollover (the
+        # active log is BEHIND wall-clock time) from two states that
+        # must NOT be reported as one: an ordinary mid-hour cold start
+        # (no active log at all yet) and an intentional early rollover
+        # (the active log is AHEAD of wall-clock time -- _roll_over_to_
+        # next_hour deliberately installs the next hour's log a little
+        # early to avoid dead air when the current hour's queue runs
+        # out first; that's expected station policy, not a warning
+        # condition). Ordering (active_key < / == / > now_key), not a
+        # plain inequality -- "!=" would also fire for the early-
+        # rollover case, which is the opposite of what's intended.
+        # Deduplicated per (date, hour) via emit_event's own dedupe_key
+        # so a persistent condition doesn't re-alert every 10s tick.
+        now_key = (now.date(), now.hour)
+        active_key = (self.current_log.date, self.current_log.hour) if self.current_log else None
+
+        if active_key is not None and active_key < now_key:
             if not PlaylistLog.objects.filter(date=now.date(), hour=now.hour, status="approved").exists():
                 with self._lock:
-                    build_in_progress = (now.date(), now.hour) in self._building_hours
+                    build_in_progress = now_key in self._building_hours
                 emit_event(
                     category="engine", level="warning",
                     title="Current hour's log not ready after rollover",
@@ -1328,10 +1342,10 @@ class PlaybackEngine:
                     },
                     dedupe_key=f"engine|late-hour-log|{now.date()}|{now.hour}",
                 )
-        elif self.current_log is None:
+        elif active_key is None:
             if not PlaylistLog.objects.filter(date=now.date(), hour=now.hour, status="approved").exists():
                 with self._lock:
-                    build_in_progress = (now.date(), now.hour) in self._building_hours
+                    build_in_progress = now_key in self._building_hours
                 emit_event(
                     category="engine", level="warning",
                     title="No approved log for current hour",
@@ -1342,8 +1356,7 @@ class PlaybackEngine:
                     },
                     dedupe_key=f"engine|no-current-log|{now.date()}|{now.hour}",
                 )
-
-        self._ensure_log_building(now.date(), now.hour)
+        # active_key > now_key: intentional early rollover -- not a warning condition.
 
         # Checked every tick, not just the tick that built the log —
         # otherwise if the one attempt to start playback right after a
@@ -1381,13 +1394,31 @@ class PlaybackEngine:
         Whatever's already playing on a deck is untouched and finishes
         normally; only what plays *next* (via the crossfade trigger or a
         natural EOS) changes. Idempotent — only swaps once per hour, since
-        this runs on every 10s tick during the lookahead window."""
-        if (
-            self.current_log
-            and self.current_log.date == target_date
-            and self.current_log.hour == target_hour
-        ):
-            return  # already advanced
+        this runs on every 10s tick during the lookahead window.
+
+        Monotonic: never installs a target OLDER than whatever's already
+        active. Without this, two async builds racing (e.g. the current
+        hour's build and the next hour's build both in flight near a
+        boundary) can have the newer one install first and the older,
+        slower one install second -- moving the live queue BACKWARD to
+        stale content. The advisory lock in build_and_approve_hour_log_
+        locked only serializes builders for the SAME (date, hour); it
+        does nothing for two different hours racing each other here.
+        Forward progress (target > active) is always allowed, including
+        installing a next-hour log a little early -- that's the
+        intentional early-rollover behavior _roll_over_to_next_hour
+        already relies on to avoid dead air, not a bug to guard against."""
+        if self.current_log:
+            active_key = (self.current_log.date, self.current_log.hour)
+            target_key = (target_date, target_hour)
+            if target_key == active_key:
+                return  # already advanced
+            if target_key < active_key:
+                print(
+                    f"  Ignoring stale completed hour-log build for {target_date} {target_hour:02d}:00 "
+                    f"-- active log is already {self.current_log.date} {self.current_log.hour:02d}:00"
+                )
+                return
 
         close_old_connections()
         log = (
@@ -1489,12 +1520,18 @@ class PlaybackEngine:
     def _install_built_hour(self, target_date, target_hour):
         """One-shot GLib.idle_add callback -- runs on the main thread,
         so it's safe to touch engine state here. _advance_to_next_hour_log
-        is already idempotent and installs immediately regardless of how
-        late this fires relative to the actual hour boundary. It never
-        itself calls _start_next_track (it only swaps the queue), so a
-        genuine cold start needs this callback to also perform the
-        idle-recovery check -- otherwise a fully built-and-approved log
-        would sit silently unplayed until the next 10s tick noticed."""
+        is idempotent AND monotonic -- it installs immediately regardless
+        of how late this fires relative to the actual hour boundary
+        (intentional early-rollover installs are always allowed, since
+        target > active), but silently refuses to move the active queue
+        BACKWARD if some other, newer build already installed ahead of
+        this one finishing (target < active -- e.g. this hour's own
+        build ran unusually long and a next-hour build finished first).
+        _advance_to_next_hour_log never itself calls _start_next_track
+        (it only swaps the queue), so a genuine cold start needs this
+        callback to also perform the idle-recovery check -- otherwise a
+        fully built-and-approved log would sit silently unplayed until
+        the next 10s tick noticed."""
         if not self.running:
             return False
         self._advance_to_next_hour_log(target_date, target_hour)
