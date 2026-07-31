@@ -7,6 +7,18 @@ class Migration(migrations.Migration):
 
     dependencies = [
         ('hardware', '0001_initial'),
+        # hardware.0001_initial creates AudioOutput as state-only
+        # (SeparateDatabaseAndState, no real SQL) -- the actual
+        # hardware_audiooutput table only exists once library's
+        # ALTER TABLE RENAME runs. Without this dependency, nothing
+        # forces that rename to happen before this migration's
+        # AddField calls, so building a database fresh (rather than
+        # applying migrations incrementally as they were written, as
+        # happened historically in production) can pick an ordering
+        # where this runs first and fails with "relation
+        # hardware_audiooutput does not exist". No-op against the
+        # already-migrated production database.
+        ('library', '0009_move_audio_models_to_hardware_app'),
     ]
 
     operations = [

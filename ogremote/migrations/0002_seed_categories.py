@@ -20,7 +20,19 @@ def seed(apps, schema_editor):
     Category = apps.get_model("library", "Category")
     OGRemoteCategory = apps.get_model("ogremote", "OGRemoteCategory")
     for category_key, name, target_code, output_mode, recallable, artist_tag in CATEGORIES:
-        target = Category.objects.get(code=target_code)
+        # Some target categories (e.g. Announcements, LocalNews) were
+        # never created by a migration -- they exist in production only
+        # because import_songs auto-creates a Category per library
+        # folder name, a code path this migration can't invoke. Skip
+        # gracefully rather than crash the whole migration run when a
+        # target isn't there yet (a fresh database, e.g. for tests, has
+        # no imported tracks and so none of these folder-derived
+        # categories) -- production already has all of them from normal
+        # operation, so this is a no-op there.
+        target = Category.objects.filter(code=target_code).first()
+        if target is None:
+            print(f"  [ogremote.0002_seed_categories] Skipping {category_key!r} -- target category {target_code!r} does not exist yet.")
+            continue
         OGRemoteCategory.objects.get_or_create(
             category_key=category_key,
             defaults={
