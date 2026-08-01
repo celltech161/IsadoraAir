@@ -4749,6 +4749,45 @@ class PlaybackEngine:
         deck = self._deck_bin_map.get(id(deck_bin))
         if not deck or deck.finished:
             return
+
+        # A flushing seek into compressed audio -- the auto-resume seek
+        # on an engine restart, or a manual seek from the wave-canvas UI
+        # (_seek_deck/_resume_deck use the identical FLUSH|KEY_UNIT
+        # pattern) -- can land on a byte offset the parser can't cleanly
+        # resync from. Observed live (2026-07-31/08-01): a
+        # `gst_base_parse_finish_frame: assertion 'size > 0 ||
+        # frame->out_buffer' failed` right after the seek, immediately
+        # followed by a spurious EOS through this exact probe. eos_probe
+        # already drops the EOS before it reaches the live mixer, so
+        # nothing audible happens from GStreamer's side -- but blindly
+        # trusting it here tore the deck down and rebuilt it from
+        # position 0, discarding the resume/seek position that had just
+        # been applied. A genuine EOS always arrives with position close
+        # to the track's own duration; one that arrives far short of it
+        # is almost certainly this parser artifact, not a real end of
+        # stream, and is safe to ignore -- GStreamer's own pipeline
+        # keeps decoding past the hiccup on its own, since nothing was
+        # torn down to prevent that. Same DECK_STUCK_TIMEOUT_SECONDS
+        # margin _check_stuck_decks already uses for the opposite
+        # direction (past duration with no EOS), reused here as "how
+        # much slop around the expected duration is plausible" either way.
+        duration = deck.track.duration_seconds or 0
+        if duration:
+            pos = self._get_deck_position(deck)
+            if pos < duration - DECK_STUCK_TIMEOUT_SECONDS:
+                print(f"  [{deck.slot}] Ignoring implausible EOS at {pos:.1f}s "
+                      f"(duration {duration:.1f}s) on {deck.track.title!r} -- "
+                      f"likely a post-seek parser hiccup, not a real end of stream")
+                emit_event(
+                    category="engine", level="warning", title="Ignored implausible EOS",
+                    detail={
+                        "slot": deck.slot, "track_id": deck.track.id, "track_title": deck.track.title,
+                        "position_seconds": round(pos, 1), "duration_seconds": round(duration, 1),
+                    },
+                    dedupe_key=f"engine|implausible-eos|slot={deck.slot}|track={deck.track.id}",
+                )
+                return
+
         self._handle_deck_finished(deck)
 
     @_glib_safe(default_return=True)
