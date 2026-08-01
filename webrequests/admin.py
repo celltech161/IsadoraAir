@@ -1,6 +1,7 @@
 from django.contrib import admin
 from django.http import HttpResponseRedirect
 from django.urls import reverse
+from django.utils import timezone
 
 from .models import SongRequest, WebRequestConfig
 
@@ -42,23 +43,45 @@ class WebRequestConfigAdmin(admin.ModelAdmin):
 @admin.register(SongRequest)
 class SongRequestAdmin(admin.ModelAdmin):
     """Mostly a read-only audit trail -- rows are created by the
-    requests-poller script and mutated by the engine's own fulfillment
-    logic. status is left editable for manual troubleshooting (e.g.
-    force-expiring a stuck row); everything else that pins the request
-    to a specific track/log_item is readonly so an admin edit can't
-    desync the pairing IsadoraAir and the public site both think they
-    agree on."""
+    requests-poller script and mutated by the engine's own scheduling/
+    fulfillment logic. status is left editable for manual
+    troubleshooting (e.g. force-expiring a stuck row); everything else
+    that pins the request to a specific track/log_item is readonly so
+    an admin edit can't desync the pairing IsadoraAir and the public
+    site both think they agree on.
 
-    list_display = ["status", "requester_name", "track", "submitted_at", "fulfilled_at"]
+    save_model bumps status_updated_at on every save regardless of what
+    changed -- it's no longer auto_now (see the model docstring), so a
+    plain admin save would otherwise leave it stale, and the public
+    site rejects anything not strictly newer than what it already has,
+    silently swallowing a real manual correction. It also clears
+    log_item/scheduled_at/fulfilled_at/resolved_at/estimated_play_time
+    whenever the saved status ends up in WAITING_STATUSES, so a manual
+    status correction can't leave contradictory sibling fields behind
+    -- every other code path that moves a request back to waiting
+    already clears these explicitly via .update(); this is the one
+    path (a plain .save()) that bypasses those."""
+
+    list_display = ["status", "requester_name", "track", "submitted_at", "scheduled_at", "fulfilled_at"]
     list_filter = ["status"]
     search_fields = ["requester_name", "external_request_id", "track__title", "track__artist__name"]
     ordering = ["-submitted_at"]
 
     readonly_fields = [
         "external_request_id", "track", "requester_name", "dedication_message",
-        "submitted_at", "fetched_at", "fulfilled_at", "resolved_at",
-        "estimated_play_time", "log_item",
+        "submitted_at", "fetched_at", "scheduled_at", "fulfilled_at", "resolved_at",
+        "estimated_play_time", "log_item", "status_updated_at",
     ]
 
     def has_add_permission(self, request):
         return False
+
+    def save_model(self, request, obj, form, change):
+        obj.status_updated_at = timezone.now()
+        if obj.status in SongRequest.WAITING_STATUSES:
+            obj.log_item = None
+            obj.scheduled_at = None
+            obj.fulfilled_at = None
+            obj.resolved_at = None
+            obj.estimated_play_time = None
+        super().save_model(request, obj, form, change)

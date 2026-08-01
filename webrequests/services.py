@@ -3,10 +3,11 @@ import time
 from datetime import timedelta
 from pathlib import Path
 
-from django.db import close_old_connections
+from django.db import close_old_connections, connection, transaction
+from django.db.utils import OperationalError
 from django.utils import timezone
 
-from library.models import RecencyConfig
+from library.models import LogItem, PlaylistLog, RecencyConfig
 from library.services.log_builder import get_recent_exclusions, get_separation
 from monitoring.models import emit_event
 
@@ -14,12 +15,41 @@ from .models import SongRequest, WebRequestConfig
 
 # Same path engine.py's STATE_PATH writes to -- redefined here rather
 # than imported, since library.services.engine imports FROM this module
-# (maybe_fulfill_song_request) and importing engine.py back would be
+# (maybe_schedule_song_request) and importing engine.py back would be
 # circular. Just a plain path constant, safe to duplicate.
 ENGINE_STATE_PATH = Path("/run/isadoraair/engine_state.json")
 # If the engine hasn't written a fresh state in this long, don't trust
 # it (crashed/hung) -- fall back to the static schedule instead.
 STATE_STALENESS_SECONDS = 30
+
+# Postgres SQLSTATE for "lock not available" -- fired identically
+# whether contention is immediate (NOWAIT) or a bounded lock_timeout
+# expires, so one check covers both acquisition strategies below.
+_LOCK_NOT_AVAILABLE = "55P03"
+
+# Distinct sentinel maybe_schedule_song_request can return instead of a
+# LogItem: "we genuinely don't know if this row's data is current right
+# now -- do not use ANY version of it for playback." Deliberately not a
+# fresh unlocked read (see maybe_schedule_song_request's docstring) --
+# an unlocked read while another transaction is still uncommitted would
+# just return the same pre-contention data, offering no real guarantee.
+SCHEDULING_CONTENDED = object()
+
+
+def _read_engine_state():
+    """Parses engine_state.json if it exists and is fresh; None
+    otherwise (missing, unparseable, or the engine hasn't written a
+    fresh tick in STATE_STALENESS_SECONDS -- crashed/hung). Shared by
+    every function below that needs to know what the running engine is
+    actually doing right now, so there's exactly one definition of
+    "trustworthy state" across all of them."""
+    try:
+        state = json.loads(ENGINE_STATE_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if time.time() - state.get("timestamp", 0) > STATE_STALENESS_SECONDS:
+        return None
+    return state
 
 
 def _live_eta_datetime(log_item_id):
@@ -35,12 +65,8 @@ def _live_eta_datetime(log_item_id):
     way. Returns None (caller falls back to scheduled_time) if the
     engine isn't running, the state is stale, or the item isn't in its
     current preview (e.g. a later hour the engine hasn't loaded yet)."""
-    try:
-        state = json.loads(ENGINE_STATE_PATH.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-
-    if time.time() - state.get("timestamp", 0) > STATE_STALENESS_SECONDS:
+    state = _read_engine_state()
+    if state is None:
         return None
 
     for deck in state.get("decks", {}).values():
@@ -57,31 +83,43 @@ def _live_eta_datetime(log_item_id):
 def estimate_air_time(log_item):
     """Best available air-time estimate for `log_item` -- the running
     engine's live, drift-corrected ETA when available, else the static
-    scheduled_time it was built with. Shared by both fulfillment sites
+    scheduled_time it was built with. Shared by both scheduling sites
     so a requester sees the same kind of number the real dashboard
     shows, not the log-build-time plan."""
     return _live_eta_datetime(log_item.id) or log_item.scheduled_time
 
 
-def is_track_eligible_at(track, target_datetime, recency_cfg):
-    """Would `track` actually be allowed to air at `target_datetime`
-    right now -- ready2air, still filed under a music-kind category, its
-    file still on disk, and not recency-blocked (get_separation/
-    get_recent_exclusions, the same functions log_builder itself uses
-    for a normal rotation pick, evaluated relative to target_datetime
-    rather than always "now" -- a track blocked at the current moment
-    can still be legitimately eligible at a slot far enough in the
-    future). Shared between maybe_fulfill_song_request (real
-    fulfillment, always checked against "now") and
-    refresh_song_request_statuses' advisory estimate pass (checked
-    against each candidate future slot's own time, so the estimate it
-    shows a requester doesn't promise a slot recency would actually
-    block)."""
-    if not track.ready2air:
+def track_is_available(track):
+    """Ready to air right now, independent of recency: deleted,
+    ready2air flipped off, recategorized out of music, or its file gone
+    are permanent-until-fixed problems -- unlike recency, which is
+    temporary and time-shifting and shouldn't invalidate an
+    already-committed schedule slot the same way. Factored out of
+    is_track_eligible_at's first three checks so both real scheduling
+    and reconciliation's "is this still airable" check share one
+    definition instead of two that could drift apart."""
+    if track is None or not track.ready2air:
         return False
     if track.category_id is None or track.category.kind.code != "music":
         return False
-    if not track.filepath or not Path(track.filepath).is_file():
+    return bool(track.filepath) and Path(track.filepath).is_file()
+
+
+def is_track_eligible_at(track, target_datetime, recency_cfg):
+    """Would `track` actually be allowed to air at `target_datetime`
+    right now -- available (see track_is_available) and not
+    recency-blocked (get_separation/get_recent_exclusions, the same
+    functions log_builder itself uses for a normal rotation pick,
+    evaluated relative to target_datetime rather than always "now" -- a
+    track blocked at the current moment can still be legitimately
+    eligible at a slot far enough in the future). Shared between
+    maybe_schedule_song_request (real scheduling, checked against
+    max(now, the target slot's own scheduled_time) -- see its
+    docstring) and refresh_song_request_statuses' advisory estimate
+    pass (checked against each candidate future slot's own time, so the
+    estimate it shows a requester doesn't promise a slot recency would
+    actually block)."""
+    if not track_is_available(track):
         return False
 
     artist_sep, title_sep = get_separation(track.category, recency_cfg)
@@ -91,123 +129,291 @@ def is_track_eligible_at(track, target_datetime, recency_cfg):
     return track.id not in exclude_track_ids and track.artist_id not in exclude_artist_ids
 
 
-def maybe_fulfill_song_request(log_item):
-    """Web Requests fulfillment. If `log_item` is a music-kind slot in
-    an open request hour and there's an eligible pending request, swap
-    the track in-place (mutating log_item.track / track_title /
-    track_artist, both via a DB save) so whatever ends up airing this
-    slot is the requested song, not whatever rotation had picked.
+def classify_log_item(log_item, state):
+    """Classifies one LogItem against a single engine_state.json
+    snapshot (the caller reads it ONCE per command run and passes the
+    same `state` to every call in that run, so every request/candidate
+    considered in one run is judged against the same reality instead of
+    a torn snapshot from a mid-run rewrite by the engine):
+
+      AIRING   -- present on a deck right now.
+      QUEUED   -- present in the engine's live upcoming queue.
+      FUTURE   -- belongs to an hour strictly newer than the engine's
+                  current active hour -- the engine hasn't loaded it
+                  yet, but nothing says it's invalid (e.g. an admin
+                  built and approved it well ahead of time).
+      STRANDED -- log_item is None, its PlaylistLog isn't approved (so
+                  the engine will never load it as-is), or it belongs
+                  to the active hour or an OLDER one but isn't airing
+                  or queued -- the engine's active queue has already
+                  moved past it without ever playing it.
+      UNKNOWN  -- state is missing/stale, and none of the
+                  state-independent checks above already resolved it.
+                  Callers must NOT treat this as stranded -- only skip
+                  and recheck next cycle."""
+    if log_item is None:
+        return "STRANDED"
+    if log_item.playlist_log.status != "approved":
+        return "STRANDED"
+    if state is None:
+        return "UNKNOWN"
+
+    for deck in state.get("decks", {}).values():
+        if deck and deck.get("log_item_id") == log_item.id:
+            return "AIRING"
+    if any(item.get("item_id") == log_item.id for item in state.get("queue", [])):
+        return "QUEUED"
+
+    if state.get("date") is None or state.get("hour") is None:
+        return "UNKNOWN"
+    active_key = (state["date"], state["hour"])
+    item_key = (log_item.playlist_log.date.isoformat(), log_item.playlist_log.hour)
+    return "FUTURE" if item_key > active_key else "STRANDED"
+
+
+def mark_song_requests_aired(log_item, aired_at):
+    """Promotes every SongRequest scheduled into log_item to fulfilled,
+    the instant it actually starts playing -- called from engine.py's
+    _create_deck right after LogItem.played_at itself is successfully
+    written (and only then; see _create_deck's played_at_written guard
+    -- this must not fire off a failed or skipped played_at write).
+
+    Filtered on BOTH log_item_id and track_id: if the LogItem's track
+    changed again after this request was scheduled into it (a
+    concurrent re-swap, a manual admin edit), this correctly declines
+    to credit the request with a song that isn't actually what aired.
+    A bulk .update() rather than a single row's .save() so multiple
+    requests collapsed onto the same track (see maybe_schedule_song_
+    request's collapse step) all promote together, same as scheduling."""
+    SongRequest.objects.filter(
+        status="scheduled", log_item_id=log_item.id, track_id=log_item.track_id,
+    ).update(
+        status="fulfilled", fulfilled_at=aired_at, resolved_at=aired_at,
+        estimated_play_time=aired_at, status_updated_at=aired_at,
+    )
+
+
+def maybe_schedule_song_request(log_item):
+    """Web Requests scheduling. If `log_item` is a music-kind slot in
+    an open request hour and there's an eligible waiting request, swaps
+    the track in-place (mutating track / track_title / track_artist)
+    and marks that request `scheduled` -- NOT `fulfilled`: fulfillment
+    now only happens once the track actually starts airing (see
+    mark_song_requests_aired, called from engine.py's _create_deck).
 
     Called from two places:
       1. refresh_song_request_statuses (every ~20s, on every upcoming
          open/eligible LogItem within the lookahead window) -- this is
-         the one that makes a fulfilled request show up in "Up Next"
-         well before it airs, since the running engine's own
-         _reload_queue_if_changed() picks up the DB-side swap within a
-         few seconds and refreshes its in-memory queue from it.
+         the one that makes a scheduled request show up in "Up Next"
+         well before it airs.
       2. engine.py's _start_next_track, right before _create_deck, as a
          last-second safety net for a request that only became
-         eligible in the last few seconds (recency just cleared, a
-         slot just opened) -- too late for the periodic refresh to
-         have caught it yet. Idempotent with #1: a LogItem already
-         swapped, or a request already fulfilled, is simply not a
-         candidate anymore by the time this runs again.
+         eligible in the last few seconds.
 
-    Never preempts an _insert_urgent_next alert (AMBER/weather): those
-    always land at the front of the queue as a brand-new, non-music-
-    kind LogItem, so the music-kind gate below skips them regardless of
-    which caller reaches them first.
+    Returns the LogItem the caller must use from here on -- almost
+    always a DIFFERENT Python object than the one passed in, since
+    locking (below) requires a fresh database fetch. A caller that
+    ignores this and keeps using its original object (as the old,
+    pre-locking version of this function allowed, since it mutated the
+    caller's object in place) can end up handing a stale, unswapped
+    track to _create_deck while the database and public site correctly
+    show the requested one -- the engine's call site MUST do
+    `log_item = maybe_schedule_song_request(log_item) or log_item`.
 
-    Recency rules are honored exactly as they are for a normal rotation
-    pick (get_separation/get_recent_exclusions, the same functions
-    log_builder itself uses) -- a request for a title or artist that's
-    currently too recent just keeps waiting. "Collapse to one play":
-    regardless of whether a swap happens here, every OTHER pending/
-    no_slot_soon request for whatever track ends up in this slot rides
-    along on this one play instead of separately waiting for its own
-    turn -- covers both "we swapped this song in" and "rotation (or an
-    earlier call to this function) already queued a song someone
-    requested".
+    On genuine lock contention that doesn't clear within a short bounded
+    wait, returns the SCHEDULING_CONTENDED sentinel instead of any
+    LogItem at all -- see the SCHEDULING_CONTENDED docstring above for
+    why a fallback read can't safely stand in here. The engine's call
+    site must treat that exactly like its existing "couldn't play this
+    one" path: skip _create_deck for this item entirely and move on to
+    whatever's queued next. The skipped item's played_at simply stays
+    NULL, same as any other unplayed item -- whatever request was
+    concurrently being scheduled into it by the other transaction is
+    unaffected, and reconciliation (refresh_song_request_statuses) will
+    correctly pick up from wherever things land.
 
-    Sets estimated_play_time on fulfillment via estimate_air_time (the
-    running engine's live, drift-corrected ETA when available, else the
-    log_item's static scheduled_time) -- a fulfilled request shouldn't
-    just say "fulfilled" with no time attached when the real air time
-    is already knowable.
+    Locks the target PlaylistLog row (not just the LogItem) before
+    counting used capacity, so two concurrent calls targeting DIFFERENT
+    LogItems in the SAME hour can't each read a stale capacity count and
+    both schedule past the cap -- locking only the target LogItem would
+    serialize calls to that one item but do nothing for that broader
+    race. Lock order is always PlaylistLog then LogItem.
 
-    played_at/last_played_at/play_count/PlayEvent are all still written
-    by engine.py's _create_deck at actual airtime as normal -- nothing
-    here duplicates that; this only ever touches the LogItem/
-    SongRequest rows themselves.
+    Capacity ("max_fulfilled_per_hour") is spent by the DISTINCT LogItem
+    being reserved, not by request rows: an already-reserved LogItem
+    (whether reserved via a fresh swap or because rotation had already
+    organically picked the same song some other pending request wants)
+    lets any number of OTHER waiting requests for that same track
+    collapse onto it for free -- N listeners requesting one song still
+    costs exactly one slot. A LogItem being reserved for the FIRST time,
+    whether via a fresh swap or as the first organic-match collapse,
+    consumes exactly one unit either way -- both the primary pick and
+    the collapse step are gated on the same capacity check for that
+    reason (an earlier draft let collapse run completely uncapped,
+    which was internally inconsistent under either possible capacity
+    policy, not just imprecise under one of them).
+
+    Recency and open_slots are checked against the TARGET SLOT's own
+    hour/time (max(now, log_item.scheduled_time)), not against "now" --
+    this function can be called for a LogItem well ahead of the current
+    hour, and checking "now"'s open_slots membership or recency state
+    against a future item's own hour was wrong.
 
     Wrapped in a blanket try/except: a bug in this feature must never
     be able to stop a track from starting (engine caller) or wedge the
-    periodic refresh cycle (management-command caller)."""
+    periodic refresh cycle (management-command caller). That outer
+    handler returns the ORIGINAL log_item unchanged (not the
+    SCHEDULING_CONTENDED sentinel, which is reserved specifically for
+    the "we don't know if this row is current" case) -- an unexpected
+    error doesn't mean the row's existing data is untrustworthy, so
+    falling back to "play what was already there" remains the safer
+    non-fatal default."""
     try:
         if log_item is None or log_item.track_id is None:
-            return
+            return log_item
         if log_item.category_id is None or not log_item.category.kind_id:
-            return
+            return log_item
         if log_item.category.kind.code != "music":
-            return
+            return log_item
 
         close_old_connections()
         cfg = WebRequestConfig.load()
         if not cfg.enabled:
-            return
+            return log_item
 
-        local_now = timezone.localtime()
-        slot_index = local_now.weekday() * 24 + local_now.hour
-        if slot_index not in cfg.open_slots:
-            return
-
-        fulfilled_this_hour = SongRequest.objects.filter(
-            status="fulfilled", log_item__playlist_log_id=log_item.playlist_log_id,
-        ).count()
-
-        if fulfilled_this_hour < cfg.max_fulfilled_per_hour:
-            recency_cfg = RecencyConfig.load()
-            candidates = (
-                SongRequest.objects
-                .filter(status__in=SongRequest.NON_TERMINAL_STATUSES)
-                .exclude(track__isnull=True)
-                .select_related("track", "track__artist", "track__category", "track__category__kind")
-                .order_by("submitted_at")
-            )
-            for candidate in candidates:
-                track = candidate.track
-                if not is_track_eligible_at(track, local_now, recency_cfg):
-                    continue  # ineligible or recency-blocked right now -- leave pending for a later slot
-
-                log_item.track = track
-                log_item.track_title = track.title
-                log_item.track_artist = track.artist.name if track.artist_id else ""
-                log_item.save(update_fields=["track", "track_title", "track_artist"])
-
-                now = timezone.now()
-                candidate.status = "fulfilled"
-                candidate.log_item = log_item
-                candidate.fulfilled_at = now
-                candidate.resolved_at = now
-                candidate.estimated_play_time = estimate_air_time(log_item)
-                candidate.save(update_fields=[
-                    "status", "log_item", "fulfilled_at", "resolved_at", "estimated_play_time",
-                ])
-                print(f"  Web request fulfilled: {track.artist.name if track.artist_id else '?'} - {track.title} (request id={candidate.external_request_id})")
-                break
-
+        recency_cfg = RecencyConfig.load()
         now = timezone.now()
-        SongRequest.objects.filter(
-            status__in=SongRequest.NON_TERMINAL_STATUSES, track_id=log_item.track_id,
-        ).update(
-            status="fulfilled", log_item=log_item, fulfilled_at=now, resolved_at=now,
-            estimated_play_time=estimate_air_time(log_item),
-        )
+
+        try:
+            with transaction.atomic():
+                with connection.cursor() as cur:
+                    # Bounded wait rather than NOWAIT: gives a
+                    # genuinely concurrent, short transaction (the
+                    # common case) a real chance to finish and be seen,
+                    # instead of failing instantly -- while still
+                    # keeping the engine's playback thread from ever
+                    # blocking unboundedly.
+                    cur.execute("SET LOCAL lock_timeout = '250ms'")
+
+                locked_log = PlaylistLog.objects.select_for_update().get(
+                    pk=log_item.playlist_log_id, status="approved",
+                )
+                # of=("self",): lock only the LogItem row itself, not
+                # the joined category/category__kind rows -- Postgres
+                # refuses FOR UPDATE across a LEFT OUTER JOIN on a
+                # nullable FK ("FOR UPDATE cannot be applied to the
+                # nullable side of an outer join"), and category is
+                # nullable here.
+                locked_item = (
+                    LogItem.objects.select_for_update(of=("self",))
+                    .select_related("category", "category__kind")
+                    .get(pk=log_item.pk)
+                )
+
+                # Re-validate against the FRESH, locked row -- the
+                # caller's object (checked above) may be stale by the
+                # time the lock is actually acquired.
+                if (
+                    locked_item.played_at is not None
+                    or locked_item.track_id is None
+                    or locked_item.category_id is None
+                    or locked_item.category.kind.code != "music"
+                ):
+                    return locked_item
+
+                slot_time = timezone.localtime(locked_item.scheduled_time)
+                if slot_time.weekday() * 24 + slot_time.hour not in cfg.open_slots:
+                    return locked_item
+                eligibility_time = max(now, locked_item.scheduled_time)
+
+                already_reserved = SongRequest.objects.filter(
+                    status="scheduled", log_item_id=locked_item.id,
+                ).exists()
+                used_slots = (
+                    SongRequest.objects.filter(
+                        status__in=("scheduled", "fulfilled"),
+                        log_item__playlist_log_id=locked_log.id,
+                        log_item_id__isnull=False,
+                    )
+                    .values("log_item_id").distinct().count()
+                )
+                capacity_available = already_reserved or used_slots < cfg.max_fulfilled_per_hour
+
+                if capacity_available and not already_reserved:
+                    # Same of=("self",) reasoning as locked_item above --
+                    # track/track__category are both nullable FKs, so an
+                    # unrestricted FOR UPDATE here hits the same Postgres
+                    # outer-join restriction.
+                    candidates = (
+                        SongRequest.objects.select_for_update(skip_locked=True, of=("self",))
+                        .filter(status__in=SongRequest.WAITING_STATUSES)
+                        .exclude(track__isnull=True)
+                        .select_related("track", "track__artist", "track__category", "track__category__kind")
+                        .order_by("submitted_at")
+                    )
+                    for candidate in candidates:
+                        track = candidate.track
+                        if not is_track_eligible_at(track, eligibility_time, recency_cfg):
+                            continue  # ineligible or recency-blocked right now -- leave waiting for a later slot
+
+                        locked_item.track = track
+                        locked_item.track_title = track.title
+                        locked_item.track_artist = track.artist.name if track.artist_id else ""
+                        locked_item.save(update_fields=["track", "track_title", "track_artist"])
+
+                        candidate.status = "scheduled"
+                        candidate.log_item = locked_item
+                        candidate.scheduled_at = now
+                        candidate.fulfilled_at = None
+                        candidate.resolved_at = None
+                        candidate.estimated_play_time = estimate_air_time(locked_item)
+                        candidate.status_updated_at = now
+                        candidate.save(update_fields=[
+                            "status", "log_item", "scheduled_at", "fulfilled_at",
+                            "resolved_at", "estimated_play_time", "status_updated_at",
+                        ])
+                        print(f"  Web request scheduled: {track.artist.name if track.artist_id else '?'} - {track.title} (request id={candidate.external_request_id})")
+                        break
+
+                if capacity_available:
+                    # Collapse: any OTHER still-waiting request for
+                    # whatever track locked_item now holds (whether
+                    # just swapped above, or already there via ordinary
+                    # rotation) rides along on this same slot --
+                    # unconditional given capacity_available, since it
+                    # doesn't consume a SECOND unit of capacity (see
+                    # docstring). select_for_update(skip_locked=True)
+                    # first, then update only the ids actually locked,
+                    # so this can't block waiting on a row a DIFFERENT
+                    # concurrent scheduling attempt holds -- the
+                    # bounded-wait guarantee for the engine's caller
+                    # must hold end-to-end, not just for the primary pick.
+                    collapse_ids = list(
+                        SongRequest.objects.select_for_update(skip_locked=True)
+                        .filter(status__in=SongRequest.WAITING_STATUSES, track_id=locked_item.track_id)
+                        .values_list("id", flat=True)
+                    )
+                    if collapse_ids:
+                        SongRequest.objects.filter(id__in=collapse_ids).update(
+                            status="scheduled", log_item=locked_item, scheduled_at=now,
+                            fulfilled_at=None, resolved_at=None,
+                            estimated_play_time=estimate_air_time(locked_item),
+                            status_updated_at=now,
+                        )
+
+                return locked_item
+        except OperationalError as exc:
+            pgcode = getattr(getattr(exc, "__cause__", None), "pgcode", None)
+            if pgcode != _LOCK_NOT_AVAILABLE:
+                raise  # a real DB error -- must not be silently swallowed as "just contention"
+            print(f"  Web request scheduling contended for log_item={log_item.id} -- skipping this cycle")
+            return SCHEDULING_CONTENDED
     except Exception as exc:
-        print(f"  Web request fulfillment check failed (non-fatal): {exc}")
+        print(f"  Web request scheduling check failed (non-fatal): {exc}")
         emit_event(
             category="engine", level="warning",
-            title="Web request fulfillment check failed",
+            title="Web request scheduling check failed",
             detail={"error": str(exc), "log_item_id": getattr(log_item, "id", None)},
             dedupe_key="engine|webrequest-fulfill-error",
         )
+        return log_item

@@ -34,7 +34,7 @@ from library.services.log_builder import (
     fill_remaining_hour,
 )
 from library.services.remote_dj_signaling import RemoteDJSignalingServer
-from webrequests.services import maybe_fulfill_song_request
+from webrequests.services import SCHEDULING_CONTENDED, maybe_schedule_song_request, mark_song_requests_aired
 
 STUDIO_MONITOR_NAME = "Studio Monitor"
 STUDIO_MONITOR_FALLBACK_DEVICE = "plughw:2,0"
@@ -1798,7 +1798,7 @@ class PlaybackEngine:
             self._on_log_exhausted(slot)
             return
 
-        # Skip request-fulfillment on the resume path: the LogItem
+        # Skip request-scheduling on the resume path: the LogItem
         # about to be handed to _create_deck is one _apply_resume_hint_
         # queue_rewind already rewound the cursor to, meant to CONTINUE
         # from a mid-play position -- not an "open request slot." A
@@ -1809,7 +1809,20 @@ class PlaybackEngine:
         # is on _resume_hint (not just first-track-after-restart) so it
         # holds until _create_deck actually consumes and clears it.
         if not getattr(self, "_resume_hint", None):
-            maybe_fulfill_song_request(log_item)
+            result = maybe_schedule_song_request(log_item)
+            if result is SCHEDULING_CONTENDED:
+                # Another transaction is mid-write to this exact
+                # LogItem and didn't resolve within the bounded wait --
+                # its data can't be trusted either way right now. Don't
+                # guess: skip this item entirely rather than risk
+                # playing a stale track while the database ends up
+                # showing something else. played_at stays NULL, same
+                # as any other unplayed item; whatever was being
+                # scheduled into it resolves on its own once that other
+                # transaction commits.
+                self._start_next_track(slot=slot)
+                return
+            log_item = result or log_item
 
         self._next_triggered = False
         deck = self._create_deck(slot, log_item)
@@ -2009,16 +2022,31 @@ class PlaybackEngine:
         deck.started_at = time.time() - start_offset + silence_shift
 
         if resume_position_ns is None:
+            aired_at = timezone.now()
+            played_at_written = False
             try:
                 close_old_connections()
-                log_item.played_at = timezone.now()
+                log_item.played_at = aired_at
                 log_item.save(update_fields=["played_at"])
+                played_at_written = True
                 Track.objects.filter(id=track.id).update(
-                    last_played_at=timezone.now(),
+                    last_played_at=aired_at,
                     play_count=track.play_count + 1,
                 )
             except Exception as exc:
                 print(f"  DB write failed (non-fatal): {exc}")
+            # Web Requests fulfillment is gated on played_at ITSELF
+            # having succeeded, independent of whether the Track
+            # counter update above (a separate statement, same
+            # try/except) also succeeded -- must not mark a request
+            # fulfilled when played_at never actually saved, and must
+            # not skip marking it fulfilled just because an unrelated
+            # counter update happened to fail.
+            if played_at_written:
+                try:
+                    mark_song_requests_aired(log_item, aired_at)
+                except Exception as exc:
+                    print(f"  Web request air-time update failed (non-fatal): {exc}")
             # Append-only PlayEvent ledger for royalty / SoundExchange
             # reporting -- distinct from LogItem.played_at because it
             # snapshots ISRC / album / label / category_kind that a

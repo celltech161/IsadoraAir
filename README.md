@@ -134,6 +134,7 @@ IsadoraAir manages the full music library, schedule programming, playlist genera
 - Bluesky auto-poster: now-playing metadata pushed to a configured Bluesky account every 2 minutes, with de-duplication so an unchanged track doesn't re-post
 - TuneIn AIR now-playing pusher: hits TuneIn's broadcaster metadata API on every track change with one HTTP call per song start (respects their explicit "do not use a timer to submit a song" rule by deduping on PlayEvent id — the timer fires every 30s but only makes an outbound call when the current PlayEvent id differs from the last successful push). `commercial=true` set automatically for Spot-category plays. Credentials in Config → TuneIn AIR
 - `ogremote` receiver: **ogremote is a separate newsgathering / voiceover tool that is not part of this project** — it runs on its own box and produces content to be aired. IsadoraAir ships only the receiving-side integration: polls for available uploads and dispatches urgent-replay drops into the library. Optional; disable the two `ogremote-*.timer` units if you're not running ogremote upstream
+- Web song requests (`webrequests` app): **the request form itself lives on a separate public-facing website, not part of this project** — IsadoraAir ships the receiving-side integration a site like that talks to. Three pieces run on a timer against a small HTTP API (`/api/isadoraair/...`, key-authenticated): a 15-minute catalog sync pushes every ready2air music-kind track plus a 168-cell weekly availability grid so the site knows what's requestable and when; a ~20s poll pulls newly submitted requests (song + optional requester name/dedication message) and pushes back each request's live status with an ETA sourced from the running engine's actual queue, not the static build-time schedule. Lifecycle is `pending` / `no_slot_soon` → `scheduled` → `fulfilled` (plus terminal `expired` / `unavailable`) — `scheduled` means the track has been swapped in place into an open, recency-clear music slot (never inserted, so a request can never preempt an `insert_urgent` weather/AMBER alert or resize the hour); `fulfilled` is set only once the engine actually starts playing it, from the same real air-start event that drives recency/royalty logging. If an assigned slot gets swept away by an hour-boundary rollover before its turn, the request is automatically detected and requeued rather than left stuck — concurrency-safe against the engine's own last-second scheduling via row-level Postgres locking. Multiple requests for the same song collapse onto a single play, counted as one slot against the hourly cap regardless of how many listeners asked for it. Per-station config (master on/off, which hours accept requests, requests-per-hour cap, no-slot-soon lookahead, expiry) lives at `/web-request/` (staff-only) plus a matching `WebRequestConfig` admin singleton. On-air dedication announcements (spoken intro via TTS ahead of the requested track) are captured today but not yet wired up — planned. External poller/sync scripts live outside this repo (`~/web-requests-ingest/`), same convention as weather-ingest/ogremote-ingest, since they carry the shared API key
 
 ## Architecture
 
@@ -484,7 +485,7 @@ does day-to-day is present:
 | Category/rotation scheduler | Yes — see Rotations above |
 | Voice tracks | Yes — browser recorder, in-browser editor, engine state-machine handoff |
 | Live assist / manual mode | Yes — dashboard override |
-| Web request handling | Not yet |
+| Web request handling | Yes — public-site catalog sync + live queue fulfillment, see Content Ingestion & Integrations |
 | Remote DJ | Yes — WebRTC, full queue authority, mix-minus monitor return |
 | Icecast/Shoutcast streaming | Yes — Liquidsoap-based relay |
 | RDS/RBDS to transmitter | Yes — StereoTool RDS client |
@@ -501,7 +502,7 @@ and a copy-pastable install snippet that renders + drops each unit
 into `/etc/systemd/system/`. Six variables cover the whole set;
 `ISA_USER` and `ISA_ROOT` are the only two that matter for a
 minimal install without the syndicated-ingest / weather-ingest /
-ogremote-ingest companion projects.
+ogremote-ingest / web-requests-ingest companion projects.
 
 ## Project Status
 
@@ -520,6 +521,7 @@ ogremote-ingest companion projects.
 | 11. Royalty reporting | Complete — PlayEvent evidence ledger, SoundExchange NCE / summary / raw-CSV generators, /reports/ frontend, ISRC auto-populate from tags + MusicBrainz backfill, ATH computed from Icecast/Shoutcast listener samples with manual override, 3-year retention prune |
 | 12. FX carts / hotkeys | Complete — one-shot buttons with drag-drop file upload, RGBA colors, per-cart retrigger modes (restart/ignore/stop), keyboard shortcuts, mobile-collapsible panel, persistent FX sub-mixer with one permanent pad on the master mixer and always-on silence to keep the audio path hot |
 | 13. Voice tracking | Complete — per-track intro + outro VT slots, browser recording with DSP forced off, in-browser waveform editor with keep/delete trim + peak normalize + undo, engine state machine sequences outro-VT → gap → intro-VT with computed underlap-delay so intro-VT ends exactly at incoming intro_until, dedicated vt_duck_gain in the pipeline, auto-resume on engine restart preserves position |
+| 14. Web song requests | Complete — public-site catalog/availability sync, request polling + live status/ETA push, in-place recency-aware queue fulfillment that can't preempt urgent alerts or resize the hour. On-air spoken dedication announcements planned, not yet wired up |
 
 Actively running end-to-end on a live station: schedule → log builder → playback engine → StereoTool → transmitter, plus live streaming, RDS, monitoring, remote DJ, and content ingestion.
 

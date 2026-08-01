@@ -1,6 +1,7 @@
 from django.contrib.postgres.fields import ArrayField
 from django.contrib.postgres.indexes import GinIndex
 from django.db import models
+from django.utils import timezone
 
 
 class WebRequestConfig(models.Model):
@@ -114,12 +115,30 @@ class SongRequest(models.Model):
                       the last check. NOT terminal -- re-evaluated every
                       cycle, flips back to pending if a slot enters the
                       lookahead window.
-      fulfilled    -- swapped into a LogItem; log_item is set.
+      scheduled    -- assigned to a specific LogItem and expected to air;
+                      log_item is set. NOT terminal -- a scheduled slot
+                      can still be lost (an hour-boundary rollover can
+                      discard it before it plays), in which case
+                      refresh_song_request_statuses reverts it back to
+                      pending/no_slot_soon rather than leaving it stuck.
+      fulfilled    -- the track has ACTUALLY started playing (set from
+                      the engine's real air-start event, LogItem.played_at
+                      -- see library.services.engine._create_deck /
+                      webrequests.services.mark_song_requests_aired).
+                      log_item is (usually still) set. This is
+                      deliberately NOT the same moment as scheduling --
+                      an earlier version of this feature conflated the
+                      two, which meant the public site could be told a
+                      request was "fulfilled" minutes before the song
+                      actually aired, or -- if the assigned slot got
+                      discarded by an hour rollover before its turn --
+                      never at all.
       unavailable  -- track became ineligible before its turn came up
                       (deleted, ready2air flipped off, recategorized out
-                      of music, etc.) -- distinct from expired because
-                      the reason is different and the public site should
-                      say something different to the requester.
+                      of music, its file went missing, etc.) -- distinct
+                      from expired because the reason is different and
+                      the public site should say something different to
+                      the requester.
       expired      -- sat unfulfilled past WebRequestConfig.expire_after_hours
                       with no track-level problem -- just never got a
                       turn.
@@ -133,12 +152,22 @@ class SongRequest(models.Model):
     STATUS_CHOICES = [
         ("pending", "Pending"),
         ("no_slot_soon", "No slot soon"),
+        ("scheduled", "Scheduled"),
         ("fulfilled", "Fulfilled"),
         ("unavailable", "Unavailable"),
         ("expired", "Expired"),
     ]
 
-    NON_TERMINAL_STATUSES = ("pending", "no_slot_soon")
+    # Three explicit groups, replacing the old NON_TERMINAL_STATUSES --
+    # that single constant used to get reused for both "still eligible
+    # to be assigned a slot" (must exclude scheduled, or an
+    # already-scheduled request could be double-booked) and "should
+    # still be reported to the public site" (must include scheduled).
+    # Candidate-selection code must always use WAITING_STATUSES;
+    # reporting/ETA-refresh code uses ACTIVE_STATUSES.
+    WAITING_STATUSES = ("pending", "no_slot_soon")
+    ACTIVE_STATUSES = WAITING_STATUSES + ("scheduled",)
+    TERMINAL_STATUSES = ("fulfilled", "unavailable", "expired")
 
     external_request_id = models.CharField(max_length=64, unique=True, db_index=True)
     track = models.ForeignKey(
@@ -154,7 +183,19 @@ class SongRequest(models.Model):
     # time math and expire_after_hours both anchor off this.
     submitted_at = models.DateTimeField()
     fetched_at = models.DateTimeField(auto_now_add=True)
-    fulfilled_at = models.DateTimeField(null=True, blank=True)
+    scheduled_at = models.DateTimeField(
+        null=True, blank=True,
+        help_text="Set the moment this request was assigned a specific "
+                   "LogItem (status became scheduled). Retained as "
+                   "history even after fulfillment; cleared whenever the "
+                   "request returns to pending/no_slot_soon/unavailable.",
+    )
+    fulfilled_at = models.DateTimeField(
+        null=True, blank=True,
+        help_text="Set the moment the track ACTUALLY started airing "
+                   "(status became fulfilled) -- not when it was merely "
+                   "assigned a slot. See scheduled_at for that.",
+    )
     resolved_at = models.DateTimeField(
         null=True, blank=True,
         help_text="Set the moment status moves into ANY terminal value "
@@ -165,11 +206,23 @@ class SongRequest(models.Model):
                    "resolved_at, not just once, so a single dropped push "
                    "can't leave the public site showing stale status.",
     )
+    status_updated_at = models.DateTimeField(
+        default=timezone.now,
+        help_text="Version/ordering timestamp the public site uses to "
+                   "reject an out-of-order or delayed status push -- "
+                   "bumped explicitly by every code path that changes "
+                   "status OR estimated_play_time (deliberately NOT "
+                   "auto_now: that fires on QuerySet.update() not at "
+                   "all, which is how nearly every transition here "
+                   "writes for concurrency safety, and silently "
+                   "overrides an explicitly-assigned value on .save(), "
+                   "so it added a footgun with no actual benefit here).",
+    )
 
     log_item = models.ForeignKey(
         "library.LogItem", on_delete=models.SET_NULL, null=True, blank=True,
         related_name="fulfilled_song_request",
-        help_text="The specific LogItem this request was swapped into, once fulfilled.",
+        help_text="The specific LogItem this request was assigned to, once scheduled.",
     )
     estimated_play_time = models.DateTimeField(
         null=True, blank=True,
@@ -177,11 +230,13 @@ class SongRequest(models.Model):
                    "refresh_song_request_statuses cycle by checking each "
                    "upcoming open, music-kind LogItem for real eligibility "
                    "(recency included) rather than just chronological order. "
-                   "Advisory only until fulfilled -- the actual fulfillment "
+                   "Advisory only until scheduled -- the actual assignment "
                    "can land in a different slot than a given cycle's guess. "
-                   "Once fulfilled: the real, certain scheduled_time of the "
-                   "LogItem it landed in, not a guess. Null while status is "
-                   "no_slot_soon, expired, or unavailable.",
+                   "Once scheduled: the real, certain scheduled_time (or "
+                   "live drift-corrected ETA) of the LogItem it landed in. "
+                   "Once fulfilled: the real air timestamp, matching "
+                   "fulfilled_at. Null while status is no_slot_soon, "
+                   "expired, or unavailable.",
     )
 
     class Meta:
