@@ -61,6 +61,8 @@ sudo systemctl enable --now isadoraair-gunicorn isadoraair-engine \
   isadoraair-encoders isadoraair-monitoring isadoraair-rbds
 sudo systemctl enable --now isadoraair-analyze.timer \
   isadoraair-prune-emaillog.timer isadoraair-prune-systemevents.timer
+# Only needed if Web Requests is in use (WebRequestConfig.enabled):
+sudo systemctl enable --now isadoraair-generate-dedication-intros.timer
 # Optional: sudo systemctl enable --now isadoraair-backup.timer
 # Optional: sudo systemctl enable --now 'syndicated-*.timer' 'wx-*.timer'
 sudo systemctl reload nginx
@@ -86,6 +88,7 @@ Timer-driven jobs (fire on a schedule, exit):
 | `isadoraair-sample-icecast.timer` | Every minute — samples streaming-server listener counts for royalty-report ATH baseline (Icecast + Shoutcast 2). No-op if no enabled outbound encoders. |
 | `isadoraair-prune-royalty-ledger.timer` | Daily (04:35) — prunes PlayEvent + IcecastSample rows past retention (default 3 years each). RoyaltyReport rows and their generated files are kept forever. |
 | `isadoraair-tunein-push.timer` | Every 30s — pushes now-playing to TuneIn's AIR API when the current PlayEvent id differs from the last successful push. No-op until credentials are entered at Config > TuneIn AIR and `enabled` is checked. |
+| `isadoraair-generate-dedication-intros.timer` | Every 15s — synthesizes spoken dedication intros (Kokoro) for scheduled web song requests. `Nice=19`, independent of the 20s web-requests-ingest poll cycle (Kokoro+ffmpeg can take tens of seconds). Only relevant if Web Requests is enabled. |
 | `isadoraair-backup.timer` | Nightly full backup (03:30) — needs the `backup_isadoraair.sh` script and remote-target creds outside the repo |
 | `isadoraair-prune-emaillog.timer` | Daily (04:15) EmailLog retention prune, 90-day default |
 | `isadoraair-prune-systemevents.timer` | Daily (04:24) SystemEvent retention prune |

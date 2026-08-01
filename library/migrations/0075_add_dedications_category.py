@@ -8,7 +8,12 @@ from django.db import migrations
 # engine.py's dedication-splice machinery (_maybe_insert_dedication_
 # intro and friends), never played on a schedule. Unlike WxAlert's
 # single-reused-file pattern, this is accumulating -- one Track per
-# rendered dedication, same shape as UrgentPA.
+# rendered dedication, same shape as UrgentPA. Unlike 0041/0042's
+# reverse (a plain delete, safe there since WxAlert/UrgentPA only ever
+# have one reused Track), reversing THIS migration is a no-op --
+# Track.category is SET_NULL, so deleting the category on a rollback
+# would silently strip it off every accumulated historical dedication
+# Track rather than failing loudly. Doesn't affect forward deployment.
 
 
 def create_category(apps, schema_editor):
@@ -21,11 +26,6 @@ def create_category(apps, schema_editor):
     )
 
 
-def reverse_delete(apps, schema_editor):
-    Category = apps.get_model("library", "Category")
-    Category.objects.filter(code="Dedications").delete()
-
-
 class Migration(migrations.Migration):
 
     dependencies = [
@@ -33,5 +33,5 @@ class Migration(migrations.Migration):
     ]
 
     operations = [
-        migrations.RunPython(create_category, reverse_delete),
+        migrations.RunPython(create_category, migrations.RunPython.noop),
     ]

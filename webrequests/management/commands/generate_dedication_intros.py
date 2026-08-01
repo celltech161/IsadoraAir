@@ -77,10 +77,9 @@ class Command(BaseCommand):
                 continue  # already synthesized on a prior cycle
             if processed >= 5:  # cap per run -- a sudden burst drains across several cycles
                 break
-            synthesize_dedication_intro(req)
+            success = synthesize_dedication_intro(req)
             processed += 1
-            req.refresh_from_db(fields=["intro_track"])
-            if req.intro_track_id is not None:
+            if success:
                 synthesized += 1
 
         self.stdout.write(f"Checked {len(seen_log_item_ids)} slot(s), attempted {processed}, synthesized {synthesized}.")

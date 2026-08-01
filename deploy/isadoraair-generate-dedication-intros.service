@@ -4,6 +4,7 @@ After=network.target postgresql.service
 
 [Service]
 Type=oneshot
+Nice=19
 User=@@ISA_USER@@
 Group=@@ISA_USER@@
 WorkingDirectory=@@ISA_ROOT@@

@@ -12,6 +12,7 @@ Description=Synthesize spoken dedication intros for scheduled web requests
 # overlapping firing just exits immediately rather than racing itself.
 OnBootSec=30s
 OnUnitActiveSec=15s
+AccuracySec=1s
 Persistent=false
 
 [Install]

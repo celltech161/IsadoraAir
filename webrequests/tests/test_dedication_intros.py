@@ -985,6 +985,52 @@ class DedicationRestartRecoveryTests(DedicationFixtureMixin, TransactionTestCase
 
         self.assertFalse(result)
 
+    def test_restore_followup_returns_false_when_song_file_missing(self):
+        """Regression: confirming the SongRequest row exists isn't
+        enough -- the paired song must actually be playable, or an
+        intro could air with no playable song behind it (the row
+        exists, is correctly paired, but the Track's file is gone from
+        disk)."""
+        log = self.make_log(date(2027, 5, 8), 10)
+        missing_path = str(Path(self._tmpdir.name) / "missing-song.mp3")
+        track = self.make_track(filepath=missing_path)
+        song_item = self.make_item(log, 1, track=track)
+        intro_track = self.make_dedication_track()
+        intro_item = self.make_dedication_item(log, 0, intro_track)
+        self.make_request(track, status="scheduled", log_item=song_item,
+                           intro_track=intro_track, intro_log_item=intro_item)
+
+        stand_in = make_engine_stand_in()
+        result = eng_module.PlaybackEngine._restore_followup_for_intro(stand_in, intro_item)
+
+        self.assertFalse(result, "an unplayable paired song must not protect the intro")
+        self.assertEqual(stand_in._forced_next_items, [])
+
+    def test_missing_song_file_intro_skipped_never_reaches_create_deck(self):
+        """Same scenario as above, exercised through the real
+        _start_next_track call site (unmocked _restore_followup_for_intro)
+        -- the intro must be skipped entirely, never handed to
+        _create_deck, rather than airing with no playable song behind it."""
+        log = self.make_log(date(2027, 5, 8), 11)
+        missing_path = str(Path(self._tmpdir.name) / "missing-song-2.mp3")
+        track = self.make_track(filepath=missing_path)
+        song_item = self.make_item(log, 1, track=track)
+        intro_track = self.make_dedication_track()
+        intro_item = self.make_dedication_item(log, 0, intro_track)
+        self.make_request(track, status="scheduled", log_item=song_item,
+                           intro_track=intro_track, intro_log_item=intro_item)
+
+        stand_in = make_engine_stand_in()
+        stand_in._next_queue_item = MagicMock(side_effect=[(intro_item, False), (None, False)])
+        stand_in._create_deck = MagicMock(return_value=MagicMock())
+        stand_in._on_log_exhausted = MagicMock()
+
+        with patch.object(eng_module, "maybe_schedule_song_request", side_effect=lambda li: li):
+            eng_module.PlaybackEngine._start_next_track(stand_in, slot="A")
+
+        stand_in._create_deck.assert_not_called()
+        stand_in._on_log_exhausted.assert_called_once_with("A")
+
     def test_start_next_track_skips_unpaired_intro_via_synchronous_recursion(self):
         stand_in = make_engine_stand_in()
         dedication_category = Category.objects.get(code="Dedications")

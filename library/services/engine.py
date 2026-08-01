@@ -3340,6 +3340,24 @@ class PlaybackEngine:
 
         if req is None:
             return False
+
+        # Confirming the SongRequest row exists isn't enough -- "protected"
+        # means the song can actually be handed to _create_deck. Without
+        # this, a file that goes missing between splice and dequeue would
+        # still return True here, the intro would air, and only THEN would
+        # _next_queue_item's own playability check (reached when the
+        # forced song is popped) discover the problem and skip it --
+        # exactly the orphaned-intro case this function exists to prevent.
+        playable, reason = _log_item_playable(req.log_item)
+        if not playable:
+            print(f"  Dedication follow-up unplayable for intro_item={intro_item.id}: {reason}")
+            emit_event(
+                category="webrequests", level="warning", title="Dedication follow-up is unplayable",
+                detail={"intro_log_item_id": intro_item.id, "song_log_item_id": req.log_item_id, "reason": reason},
+                dedupe_key=f"webrequests|dedication-followup-unplayable|{intro_item.id}",
+            )
+            return False
+
         if not any(i.id == req.log_item_id for i in self._forced_next_items):
             self._forced_next_items.append(req.log_item)
         return True

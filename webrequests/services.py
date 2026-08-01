@@ -472,7 +472,13 @@ def synthesize_dedication_intro(req):
     OUT of refresh_song_request_statuses, which must stay fast and
     reliable; Kokoro+ffmpeg together can take tens of seconds worst
     case). Whole body in one try/except: a failure on one request must
-    not stop the command's loop over the others."""
+    not stop the command's loop over the others.
+
+    Returns True iff req.intro_track actually got set -- callers should
+    use this return value rather than a follow-up refresh_from_db() (a
+    deleted request or a DB hiccup right at that moment would otherwise
+    raise OUTSIDE this function's own exception boundary and abort the
+    caller's whole loop over the remaining candidates)."""
     try:
         track = req.track  # the REQUEST's own stable FK, not log_item.track,
         # which can in principle change during the several seconds synthesis takes
@@ -554,6 +560,9 @@ def synthesize_dedication_intro(req):
                     final_path.unlink()
                 except FileNotFoundError:
                     pass
+            return False
+
+        return True
     except Exception as exc:
         print(f"  Dedication intro synthesis failed for request {req.id} (non-fatal, retried next cycle): {exc}")
         emit_event(
@@ -572,3 +581,4 @@ def synthesize_dedication_intro(req):
                 final_path.unlink()
         except Exception:
             pass  # already in the outer failure handler -- never let cleanup itself raise
+        return False
