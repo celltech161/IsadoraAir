@@ -444,7 +444,7 @@ class EngineCallSiteTests(TransactionTestCase):
         stand_in = make_engine_stand_in()
         original_item = MagicMock(id=1)
         returned_item = MagicMock(id=1)
-        stand_in._next_queue_item = MagicMock(return_value=original_item)
+        stand_in._next_queue_item = MagicMock(return_value=(original_item, False))
         stand_in._create_deck = MagicMock(return_value=MagicMock())
 
         with patch.object(eng_module, "maybe_schedule_song_request", return_value=returned_item):
@@ -455,7 +455,7 @@ class EngineCallSiteTests(TransactionTestCase):
     def test_scheduling_contended_skips_create_deck_and_retries_next_item(self):
         stand_in = make_engine_stand_in()
         contended_item = MagicMock(id=1)
-        stand_in._next_queue_item = MagicMock(side_effect=[contended_item, None])
+        stand_in._next_queue_item = MagicMock(side_effect=[(contended_item, False), (None, False)])
         stand_in._create_deck = MagicMock()
         stand_in._on_log_exhausted = MagicMock()
 

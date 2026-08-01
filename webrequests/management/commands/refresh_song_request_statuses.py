@@ -129,6 +129,7 @@ class Command(BaseCommand):
                 SongRequest.objects.filter(id=req.id, status="scheduled", log_item_id=req.log_item_id).update(
                     status="pending", log_item=None, scheduled_at=None, fulfilled_at=None,
                     resolved_at=None, estimated_play_time=None, status_updated_at=heal_now,
+                    intro_log_item=None,  # abandoning this assignment -- keep intro_track (reusable), clear the marker
                 )
 
         # --- Reconciliation pass 2: track-availability + stranding
@@ -143,6 +144,7 @@ class Command(BaseCommand):
                 SongRequest.objects.filter(id=req.id, status="scheduled", log_item_id=req.log_item_id).update(
                     status="unavailable", log_item=None, scheduled_at=None, fulfilled_at=None,
                     estimated_play_time=None, resolved_at=recon_now, status_updated_at=recon_now,
+                    intro_log_item=None,
                 )
                 continue
             classification = classify_log_item(req.log_item, state)
@@ -151,6 +153,7 @@ class Command(BaseCommand):
                 updated = SongRequest.objects.filter(id=req.id, status="scheduled", log_item_id=req.log_item_id).update(
                     status="pending", log_item=None, scheduled_at=None, fulfilled_at=None,
                     resolved_at=None, estimated_play_time=None, status_updated_at=recon_now,
+                    intro_log_item=None,
                 )
                 if updated:
                     requeued_count += 1

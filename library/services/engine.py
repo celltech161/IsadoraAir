@@ -20,12 +20,16 @@ import django
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "isadoraair.settings")
 django.setup()
 
-from django.db import close_old_connections, connection
+from contextlib import contextmanager
+
+from django.db import close_old_connections, connection, transaction
 from django.db.models import F
+from django.db.utils import OperationalError
 from django.utils import timezone
 from hardware.models import AudioInput, AudioOutput, AudioPipeline, DuckingConfig, RemoteDJAudioInput
 from library.models import Category, FXBusConfig, FXCart, LogItem, PlayEvent, PlaylistLog, RemoteDJConfig, Track, VoiceTrack, VoiceTrackConfig
 from monitoring.models import emit_event
+from webrequests.models import SongRequest
 from library.services.log_builder import (
     DURATION_FIT_MARGIN,
     LOCK_CONTENDED,
@@ -389,6 +393,12 @@ class PlaybackEngine:
         self._position_timer = None
         self._lock = threading.RLock()
         self._building_hours = set()  # {(date, hour)} currently being async-built -- guarded by self._lock
+        # Web-request dedication intros: items that must play next
+        # regardless of self.log_items/rollover -- see
+        # _maybe_insert_dedication_intro/_restore_followup_for_intro.
+        # Checked by _next_queue_item BEFORE normal cursor logic.
+        self._forced_next_items = []
+        self._urgent_retry_counts = {}  # {category_code: count} -- per-category, not shared
 
     def start(self):
         self.running = True
@@ -406,8 +416,9 @@ class PlaybackEngine:
         # item at crossfade-time) and deck A's remaining audio would
         # be skipped. See _apply_resume_hint_queue_rewind.
         self._apply_resume_hint_queue_rewind()
+        self._restore_dedication_sequence_from_resume_hint()
 
-        if not self.log_items:
+        if not self.log_items and not self._forced_next_items:
             print("No approved log for current hour. Waiting...")
         else:
             self._start_next_track()
@@ -1251,7 +1262,15 @@ class PlaybackEngine:
         self.current_log = log
         self.log_items = list(
             log.items
-            .select_related("track", "track__artist", "track__album", "track__category", "track__category__kind")
+            .select_related(
+                "track", "track__artist", "track__album", "track__category", "track__category__kind",
+                # LogItem's own (denormalized) category -- distinct from
+                # track__category above -- is read directly by dedication
+                # logic (log_item.category.kind.code); select_related it
+                # here too or that becomes a surprise lazy query on the
+                # engine's single GLib thread.
+                "category", "category__kind",
+            )
             .order_by("position")
         )
         # Advance past anything already played -- an engine restart
@@ -1430,7 +1449,10 @@ class PlaybackEngine:
             return
         items = list(
             log.items
-            .select_related("track", "track__artist", "track__album", "track__category", "track__category__kind")
+            .select_related(
+                "track", "track__artist", "track__album", "track__category", "track__category__kind",
+                "category", "category__kind",  # LogItem's own category, read directly by dedication logic
+            )
             .order_by("position")
         )
         if not items:
@@ -1590,7 +1612,10 @@ class PlaybackEngine:
         if log:
             items = list(
                 log.items
-                .select_related("track", "track__artist", "track__album", "track__category", "track__category__kind")
+                .select_related(
+                "track", "track__artist", "track__album", "track__category", "track__category__kind",
+                "category", "category__kind",  # LogItem's own category, read directly by dedication logic
+            )
                 .order_by("position")
             )
             if items:
@@ -1713,7 +1738,17 @@ class PlaybackEngine:
         deleted-track ghost the same way _next_queue_item would. Kept
         separate from _next_queue_item because the poll path must NOT
         advance the cursor over the item it's about to hand to
-        _start_next_track."""
+        _start_next_track.
+
+        A pending dedication follow-up (self._forced_next_items) must be
+        surfaced here FIRST -- this drives crossfade timing/cache
+        warming/VT lookahead, and once a follow-up is armed it's what's
+        actually going to play next regardless of what self.log_items
+        currently contains (which may be a different hour entirely, if
+        rollover happened while a dedication intro was on a deck)."""
+        for item in self._forced_next_items:
+            if _log_item_playable(item)[0]:
+                return item
         while self._queue_cursor < len(self.log_items):
             item = self.log_items[self._queue_cursor]
             playable, reason = _log_item_playable(item)
@@ -1735,6 +1770,41 @@ class PlaybackEngine:
         return None
 
     def _next_queue_item(self):
+        """Returns (item, is_forced). is_forced is True when item came
+        from self._forced_next_items (a dedication follow-up or an
+        urgent alert that arrived while one was pending) rather than the
+        normal cursor/rollover walk -- the caller (_start_next_track)
+        uses this to skip web-request scheduling/dedication-insertion
+        for an item that's already been through that decision."""
+        # Forced items are checked FIRST, unconditionally -- see
+        # _maybe_insert_dedication_intro/_restore_followup_for_intro for
+        # why this is what makes a dedication's song survive an hour
+        # rollover that happens while the intro is playing.
+        while self._forced_next_items:
+            item = self._forced_next_items.pop(0)
+            playable, reason = _log_item_playable(item)
+            if not playable:
+                print(f"  Skipping forced log item id={item.id}: {reason}")
+                emit_event(
+                    category="engine", level="warning", title="Skipped forced log item",
+                    detail={"log_item_id": item.id, "reason": reason},
+                    dedupe_key=f"engine|skip-forced|item={item.id}",
+                )
+                continue
+            if (
+                self.current_log and item.playlist_log_id == self.current_log.id
+                and self._queue_cursor < len(self.log_items)
+                and self.log_items[self._queue_cursor].id == item.id
+            ):
+                # Still the same hour, and the normal cursor happens to
+                # be sitting on this exact item too -- advance past it
+                # so the normal path doesn't hand it out a second time
+                # later. If rollover already replaced current_log,
+                # there's nothing to adjust -- the new hour's cursor is
+                # unrelated to this item.
+                self._queue_cursor += 1
+            return item, True
+
         # Walk forward past any unplayable items (track deleted, filepath
         # cleared, file gone from disk) rather than blowing up on
         # log_item.track.filepath below. Each skip is logged so the
@@ -1744,13 +1814,13 @@ class PlaybackEngine:
         while True:
             if self._queue_cursor >= len(self.log_items):
                 if not self._roll_over_to_next_hour():
-                    return None
+                    return None, False
                 continue
             item = self.log_items[self._queue_cursor]
             self._queue_cursor += 1
             playable, reason = _log_item_playable(item)
             if playable:
-                return item
+                return item, False
             print(f"  Skipping log item id={item.id} pos={item.position}: {reason}")
             emit_event(
                 category="engine",
@@ -1777,13 +1847,24 @@ class PlaybackEngine:
         an uncaught exception there hangs the whole engine (see
         _glib_safe). The playback path skips these items independently
         (_next_queue_item), so filtering them from the UI preview keeps
-        the two views consistent."""
+        the two views consistent.
+
+        Forced items (a pending dedication follow-up) are prepended
+        first, deduplicated against whatever's also still sitting in
+        self.log_items -- this is what engine_state.json's "queue"
+        reflects, which the web-request reconciliation command reads to
+        decide deck/queue membership. Without this, a protected
+        follow-up song would look STRANDED to that reconciliation the
+        moment rollover swaps self.log_items to a different hour, even
+        though it's guaranteed to actually play next."""
+        forced = [it for it in self._forced_next_items if _log_item_playable(it)[0]]
+        forced_ids = {it.id for it in forced}
         items = list(self.log_items[self._queue_cursor:])
         if not items:
             peek = self._peek_next_hour()
             if peek:
                 items = list(peek[1])
-        return [it for it in items if _log_item_playable(it)[0]]
+        return forced + [it for it in items if it.id not in forced_ids and _log_item_playable(it)[0]]
 
     def _start_next_track(self, slot=None):
         """Load the next queued item into `slot` (or whichever slot is
@@ -1793,22 +1874,25 @@ class PlaybackEngine:
         if slot is None:
             return
 
-        log_item = self._next_queue_item()
+        log_item, is_forced = self._next_queue_item()
         if log_item is None:
             self._on_log_exhausted(slot)
             return
 
-        # Skip request-scheduling on the resume path: the LogItem
-        # about to be handed to _create_deck is one _apply_resume_hint_
-        # queue_rewind already rewound the cursor to, meant to CONTINUE
-        # from a mid-play position -- not an "open request slot." A
-        # swap here would replace log_item.track with a different track,
-        # which then wouldn't match hint["track_id"] in _create_deck,
-        # silently disable the auto-resume seek, and leave the UI cursor
-        # at the resumed position with audio starting from zero. Guard
-        # is on _resume_hint (not just first-track-after-restart) so it
-        # holds until _create_deck actually consumes and clears it.
-        if not getattr(self, "_resume_hint", None):
+        # Skip request-scheduling AND dedication-splicing for a forced
+        # item (already-committed intro/follow-up pair placed by an
+        # earlier splice, or an urgent alert) and on the resume path --
+        # the LogItem about to be handed to _create_deck is one
+        # _apply_resume_hint_queue_rewind already rewound the cursor to,
+        # meant to CONTINUE from a mid-play position -- not an "open
+        # request slot." A swap here would replace log_item.track with a
+        # different track, which then wouldn't match hint["track_id"] in
+        # _create_deck, silently disable the auto-resume seek, and leave
+        # the UI cursor at the resumed position with audio starting from
+        # zero. Guard is on _resume_hint (not just first-track-after-
+        # restart) so it holds until _create_deck actually consumes and
+        # clears it.
+        if not is_forced and not getattr(self, "_resume_hint", None):
             result = maybe_schedule_song_request(log_item)
             if result is SCHEDULING_CONTENDED:
                 # Another transaction is mid-write to this exact
@@ -1823,6 +1907,21 @@ class PlaybackEngine:
                 self._start_next_track(slot=slot)
                 return
             log_item = result or log_item
+            log_item = self._maybe_insert_dedication_intro(log_item)
+
+        if log_item.category_id and log_item.category.code == "Dedications":
+            # Whether reached via a fresh splice (log_item is the intro
+            # _maybe_insert_dedication_intro just returned) or via the
+            # ordinary cursor walk / forced list after a restart, never
+            # air a Dedications item without positively re-confirming its
+            # paired song first -- synchronous recursive call so the GLib
+            # loop never regains control in the gap, same reasoning as
+            # the SCHEDULING_CONTENDED skip above (rollover cannot
+            # intervene mid-call).
+            if not self._restore_followup_for_intro(log_item):
+                print(f"  Skipping unpaired dedication intro log_item={log_item.id}")
+                self._start_next_track(slot=slot)
+                return
 
         self._next_triggered = False
         deck = self._create_deck(slot, log_item)
@@ -2054,33 +2153,44 @@ class PlaybackEngine:
             # Best-effort: any DB failure here is logged and dropped --
             # missing a PlayEvent row for a single spin is preferable to
             # failing the deck-creation path and dropping the track.
-            try:
-                close_old_connections()
-                # position >= 9999 is api_engine_insert_track's marker
-                # for a manual / remote-DJ insert. Playlist-play-now
-                # rebuilds a whole PlaylistLog and looks like a normal
-                # scheduled hour from here, so it also reads as
-                # "scheduled" -- fine for royalty reporting (SoundExchange
-                # doesn't distinguish), and if we later want the split we
-                # can add a `source` field to LogItem itself.
-                pe_source = "insert" if getattr(log_item, "position", 0) >= 9999 else "scheduled"
-                pe_category_kind = ""
-                if log_item.category_id and log_item.category and log_item.category.kind_id:
-                    pe_category_kind = log_item.category.kind.name
-                pe = PlayEvent.objects.create(
-                    track=track,
-                    track_title=track.title or "",
-                    track_artist=(track.artist.name if track.artist else ""),
-                    album_title=(track.album.title if track.album else ""),
-                    record_label=track.record_label or "",
-                    isrc=getattr(track, "isrc", "") or "",
-                    category_kind=pe_category_kind,
-                    source=pe_source,
-                    started_at=timezone.now(),
-                )
-                deck.play_event_id = pe.id
-            except Exception as exc:
-                print(f"  PlayEvent write failed (non-fatal): {exc}")
+            #
+            # Dedications-category plays are excluded entirely -- a
+            # spoken intro isn't a performance of a recording, and
+            # counting it would double-count a spin (the requested song
+            # right behind it gets its own PlayEvent normally).
+            # LogItem.played_at is still written above regardless,
+            # unaffected -- this exclusion only skips the PlayEvent row.
+            is_dedication_play = bool(
+                log_item.category_id and log_item.category and log_item.category.code == "Dedications"
+            )
+            if not is_dedication_play:
+                try:
+                    close_old_connections()
+                    # position >= 9999 is api_engine_insert_track's marker
+                    # for a manual / remote-DJ insert. Playlist-play-now
+                    # rebuilds a whole PlaylistLog and looks like a normal
+                    # scheduled hour from here, so it also reads as
+                    # "scheduled" -- fine for royalty reporting (SoundExchange
+                    # doesn't distinguish), and if we later want the split we
+                    # can add a `source` field to LogItem itself.
+                    pe_source = "insert" if getattr(log_item, "position", 0) >= 9999 else "scheduled"
+                    pe_category_kind = ""
+                    if log_item.category_id and log_item.category and log_item.category.kind_id:
+                        pe_category_kind = log_item.category.kind.name
+                    pe = PlayEvent.objects.create(
+                        track=track,
+                        track_title=track.title or "",
+                        track_artist=(track.artist.name if track.artist else ""),
+                        album_title=(track.album.title if track.album else ""),
+                        record_label=track.record_label or "",
+                        isrc=getattr(track, "isrc", "") or "",
+                        category_kind=pe_category_kind,
+                        source=pe_source,
+                        started_at=timezone.now(),
+                    )
+                    deck.play_event_id = pe.id
+                except Exception as exc:
+                    print(f"  PlayEvent write failed (non-fatal): {exc}")
             print(f"  [{slot}] Playing: {track.artist.name if track.artist else '?'} - {track.title}")
         else:
             print(f"  [{slot}] Resumed: {track.artist.name if track.artist else '?'} - {track.title} at {start_offset:.1f}s")
@@ -2237,7 +2347,17 @@ class PlaybackEngine:
         Fix: pick the deck whose log_item_id is OLDEST in queue order
         (i.e. the outgoing deck), and later in _create_deck we rewind
         the queue cursor to that item so IT loads first. Deck A hint
-        is preferred; if only B is populated we take that instead."""
+        is preferred; if only B is populated we take that instead.
+
+        A Dedications-category deck is ALWAYS a candidate regardless of
+        the 5s position floor, and always sorts first regardless of the
+        oldest-log_item-id tiebreak above -- a spoken intro is only a
+        few seconds long, so it would almost never clear the floor, and
+        even when it did, would lose the crossfade tiebreak to the
+        (older-log_item-id) outgoing music track every time. Without
+        this, a crash while a dedication intro was on-air would
+        essentially never produce a correct resume hint, silently
+        defeating _restore_dedication_sequence_from_resume_hint below."""
         self._resume_hint = None
         try:
             if not STATE_PATH.is_file():
@@ -2250,21 +2370,27 @@ class PlaybackEngine:
             candidates = []
             for slot in ("A", "B"):
                 deck = (data.get("decks") or {}).get(slot)
-                if deck and deck.get("track_id") and deck.get("position", 0) > 5:
+                if not deck or not deck.get("track_id"):
+                    continue
+                is_dedication = deck.get("category") == "Dedications"
+                position = float(deck.get("position", 0))
+                if position > 5 or is_dedication:
                     candidates.append({
                         "slot": slot,
                         "track_id": deck["track_id"],
-                        "position": float(deck["position"]),
+                        "position": position,
                         "log_item_id": deck.get("log_item_id"),
+                        "is_dedication": is_dedication,
                     })
             if not candidates:
                 return
-            # Sort by log_item_id ascending so the OLDEST (outgoing)
-            # LogItem wins when a mid-crossfade snapshot has both
-            # slots populated. Missing log_item_id sinks to the end
-            # (older state files without the field still match on
-            # track_id at deck creation time -- pre-fix behavior).
-            candidates.sort(key=lambda c: (c["log_item_id"] is None, c["log_item_id"] or 0))
+            # Dedications sort first regardless of age; otherwise, sort
+            # by log_item_id ascending so the OLDEST (outgoing) LogItem
+            # wins when a mid-crossfade snapshot has both slots
+            # populated. Missing log_item_id sinks to the end (older
+            # state files without the field still match on track_id at
+            # deck creation time -- pre-fix behavior).
+            candidates.sort(key=lambda c: (not c["is_dedication"], c["log_item_id"] is None, c["log_item_id"] or 0))
             hint = candidates[0]
             self._resume_hint = {
                 "track_id": hint["track_id"],
@@ -2695,6 +2821,18 @@ class PlaybackEngine:
                 incoming_vt = VoiceTrack.objects.filter(
                     track=incoming_track, position="intro",
                 ).first()
+                # A pending dedication supersedes the requested song's own
+                # incoming intro VT for this specific play -- the outgoing
+                # track's own outro VT, if any, is unaffected and still
+                # fires below as normal. Without this, a freshly-spliced
+                # dedication intro and a configured intro VT cart could
+                # both start at once, talking over each other.
+                has_dedication = SongRequest.objects.filter(
+                    status="scheduled", log_item_id=next_item.id,
+                    intro_track__isnull=False, intro_track__ready2air=True, intro_log_item__isnull=True,
+                ).exists()
+                if has_dedication:
+                    incoming_vt = None
         except Exception as exc:
             print(f"  VT lookup failed: {exc}")
             return False
@@ -2931,6 +3069,56 @@ class PlaybackEngine:
         except Exception as exc:
             print(f"  Command error: {exc}")
 
+    def _splice_log_item_db_at(self, insert_at, track, category):
+        """DB-only half of a queue splice -- caller must already be
+        inside transaction.atomic(). Shifts every not-yet-played item's
+        position up by 1 in the DB (two-phase, through a disjoint offset
+        range then back down, since LogItem's unique_together=
+        ("playlist_log","position") constraint would collide on a
+        single ascending "+1" UPDATE), creates the new LogItem, and
+        returns it. Caller applies the matching in-memory mutation
+        separately via _apply_log_item_insert, ONLY after the
+        transaction creating this row has actually committed -- so a
+        failure anywhere in that transaction (including something the
+        caller does after this call, like a SongRequest claim) rolls
+        back cleanly with no in-memory/DB state ever having diverged."""
+        if insert_at < len(self.log_items):
+            insert_position = self.log_items[insert_at].position
+            LogItem.objects.filter(playlist_log=self.current_log, position__gte=insert_position).update(position=F("position") + 100000)
+            LogItem.objects.filter(playlist_log=self.current_log, position__gte=insert_position + 100000).update(position=F("position") - 99999)
+            new_position = insert_position
+        else:
+            new_position = (self.log_items[-1].position + 1) if self.log_items else 0
+        return LogItem.objects.create(
+            playlist_log=self.current_log, position=new_position, scheduled_time=timezone.localtime(),
+            track=track, track_title=track.title, track_artist=track.artist.name if track.artist_id else "",
+            category=category,
+        )
+
+    def _apply_log_item_insert(self, insert_at, new_item):
+        """In-memory half -- call ONLY after the transaction that
+        created new_item (via _splice_log_item_db_at) has committed."""
+        if insert_at < len(self.log_items):
+            for item in self.log_items[insert_at:]:
+                item.position += 1
+        self.log_items.insert(insert_at, new_item)
+
+    @contextmanager
+    def _locked_playlist_log(self):
+        """Bounded-wait PlaylistLog lock -- same 250ms lock_timeout
+        contract as webrequests.services.maybe_schedule_song_request's
+        own lock, and for the same reason: this runs on the engine's
+        single GLib audio thread, and an unbounded wait here (e.g. if
+        refresh_song_request_statuses briefly holds the same row) would
+        stall the entire audio engine, not just this one operation.
+        Raises OperationalError with SQLSTATE 55P03 on timeout; callers
+        decide how to degrade (never propagate unhandled onto the audio
+        thread)."""
+        with connection.cursor() as cur:
+            cur.execute("SET LOCAL lock_timeout = '250ms'")
+        PlaylistLog.objects.select_for_update().get(pk=self.current_log.id)
+        yield
+
     def _insert_urgent_next(self, category_code):
         """Splice a track from `category_code` into the live queue at the
         current cursor position, so it plays at the very next track
@@ -2948,62 +3136,258 @@ class PlaybackEngine:
         track (e.g. WxAlert) — same "one file, always fresh on disk"
         pattern as WxTemp/WxForecast/WxObs, delivered via
         lib/delivery.py's sync_track_file call before this command is
-        ever fired."""
-        if not self.current_log or not self.log_items:
-            print("  insert_urgent: no live log loaded — ignoring")
-            return
+        ever fired.
 
+        Thin wrapper: the ENTIRE operation, including the Category/Track
+        lookups (not just the splice itself), is wrapped so nothing here
+        can propagate to _check_commands' outer except-and-print, which
+        runs AFTER the command file has already been deleted -- a
+        genuine DB error escaping here would mean the alert is silently
+        gone for good, exactly the wrong degradation for a weather/AMBER
+        feature. Any failure routes to a bounded retry instead."""
+        try:
+            self._insert_urgent_next_inner(category_code)
+        except Exception as exc:
+            self._schedule_urgent_retry(category_code, exc)
+
+    def _insert_urgent_next_inner(self, category_code):
+        if not self.current_log or not self.log_items:
+            raise RuntimeError("No live log loaded")
         close_old_connections()
-        category = Category.objects.filter(code=category_code).first()
-        if category is None:
-            print(f"  insert_urgent: unknown category {category_code!r}")
-            return
+        category = Category.objects.get(code=category_code)
         track = (
             Track.objects.filter(category=category, ready2air=True)
             .select_related("artist")
             .first()
         )
         if track is None:
-            print(f"  insert_urgent: no ready2air track in category {category_code!r}")
-            return
+            raise RuntimeError(f"No ready2air track in category {category_code!r}")
 
-        insert_at = self._queue_cursor
-        now = timezone.localtime()
+        with transaction.atomic():
+            with self._locked_playlist_log():
+                if self._forced_next_items:
+                    # A dedication follow-up (or another urgent item) is
+                    # already queued ahead of the normal cursor --
+                    # _next_queue_item() won't consult self.log_items
+                    # again until that list drains, so splicing into it
+                    # via the normal insert_at wouldn't actually change
+                    # what plays next. Splice at the cursor as usual (so
+                    # the LogItem exists and is positioned correctly for
+                    # if/when the forced list ever does drain back to
+                    # normal cursor logic), but the urgent item's actual
+                    # PLAY ORDER is controlled by prepending to the
+                    # forced list below, safety-first ahead of whatever
+                    # was already there.
+                    insert_at = self._queue_cursor
+                else:
+                    insert_at = self._queue_cursor
+                urgent_item = self._splice_log_item_db_at(insert_at, track, category)
 
-        if insert_at < len(self.log_items):
-            # Shift every not-yet-played item's position up by 1 — in the
-            # DB and in-memory — so the new item sorts correctly on any
-            # future DB re-query without touching anything already played.
-            # Two-phase (through a disjoint offset range, then back down)
-            # because LogItem has a unique_together=("playlist_log",
-            # "position") constraint that Postgres checks per-row as a
-            # single ascending "+1" UPDATE executes — row N's shift to
-            # N+1 collides with row N+1's still-unshifted value before
-            # row N+1 gets its own turn. The offset makes every
-            # intermediate value disjoint from any remaining original one.
-            insert_position = self.log_items[insert_at].position
-            qs = LogItem.objects.filter(playlist_log=self.current_log, position__gte=insert_position)
-            qs.update(position=F("position") + 100000)
-            LogItem.objects.filter(
-                playlist_log=self.current_log, position__gte=insert_position + 100000,
-            ).update(position=F("position") - 99999)
-            for item in self.log_items[insert_at:]:
-                item.position += 1
-            new_position = insert_position
-        else:
-            new_position = (self.log_items[-1].position + 1) if self.log_items else 0
-
-        new_item = LogItem.objects.create(
-            playlist_log=self.current_log,
-            position=new_position,
-            scheduled_time=now,
-            track=track,
-            track_title=track.title,
-            track_artist=track.artist.name if track.artist_id else "",
-            category=category,
-        )
-        self.log_items.insert(insert_at, new_item)
+        self._apply_log_item_insert(insert_at, urgent_item)
+        if self._forced_next_items:
+            self._queue_cursor += 1
+            self._forced_next_items.insert(0, urgent_item)  # safety-first: ahead of a pending dedication follow-up
         print(f"  Inserted urgent track ({category_code}) at queue position {insert_at}: {track.title}")
+        self._urgent_retry_counts[category_code] = 0
+
+    def _schedule_urgent_retry(self, category_code, exc):
+        """Per-category retry count/timer -- not one shared counter, so
+        two different alert categories contending around the same time
+        can't reset or mis-attribute each other's retry/failure
+        accounting."""
+        pgcode = getattr(getattr(exc, "__cause__", None), "pgcode", None)
+        reason = "contended" if pgcode == "55P03" else f"failed ({exc})"
+        print(f"  insert_urgent {reason}, retrying shortly ({category_code})")
+        count = self._urgent_retry_counts.get(category_code, 0) + 1
+        self._urgent_retry_counts[category_code] = count
+        if count > 5:
+            emit_event(
+                category="engine", level="error", title="Urgent insert repeatedly failed",
+                detail={"category": category_code, "last_error": str(exc)},
+                dedupe_key=f"engine|urgent-contended|{category_code}",
+            )
+            self._urgent_retry_counts[category_code] = 0
+            return
+        GLib.timeout_add_seconds(1, lambda: self._insert_urgent_next(category_code) or False)
+
+    def _maybe_insert_dedication_intro(self, log_item):
+        """Thin, blanket-fail-open wrapper matching maybe_schedule_song_
+        request's own established shape exactly -- a bug in this feature
+        must never be able to stop the requested song from starting.
+        Every failure, not just lock contention, is caught here: the two
+        lookup queries inside the inner function run BEFORE the locked
+        block and are just as capable of raising as anything inside it."""
+        try:
+            return self._maybe_insert_dedication_intro_inner(log_item)
+        except OperationalError as exc:
+            pgcode = getattr(getattr(exc, "__cause__", None), "pgcode", None)
+            message = "Dedication splice lock contended" if pgcode == "55P03" else "Dedication splice database failure"
+            print(f"  {message} for log_item={log_item.id}; playing song plainly")
+            emit_event(
+                category="webrequests", level="warning" if pgcode == "55P03" else "error",
+                title=message, detail={"log_item_id": log_item.id, "error": str(exc), "pgcode": pgcode},
+                dedupe_key=f"webrequests|dedication-splice|{log_item.id}|{pgcode}",
+            )
+            return log_item
+        except Exception as exc:
+            print(f"  Dedication splice failed for log_item={log_item.id}; playing song plainly: {exc}")
+            emit_event(
+                category="webrequests", level="error", title="Dedication splice failed",
+                detail={"log_item_id": log_item.id, "error": repr(exc)},
+                dedupe_key=f"webrequests|dedication-splice-error|{log_item.id}",
+            )
+            return log_item
+
+    def _maybe_insert_dedication_intro_inner(self, log_item):
+        if log_item is None or log_item.category_id is None or log_item.category.kind.code != "music":
+            return log_item
+
+        close_old_connections()
+        already_spliced = SongRequest.objects.filter(
+            status="scheduled", log_item_id=log_item.id, intro_log_item__isnull=False,
+        ).exists()
+        if already_spliced:
+            return log_item
+
+        candidate = (
+            SongRequest.objects.filter(
+                log_item_id=log_item.id, status="scheduled",
+                intro_track__isnull=False, intro_track__ready2air=True,
+            )
+            .order_by("submitted_at").first()
+        )
+        if candidate is None:
+            # Covers "not yet synthesized" and "scheduled by the engine's
+            # own last-second safety net, no lead time at all" alike --
+            # both correctly fall through to plain playback, per the
+            # explicit best-effort delivery policy.
+            return log_item
+
+        insert_at = self._queue_cursor - 1
+        with transaction.atomic():
+            with self._locked_playlist_log():
+                locked = (
+                    # of=("self",) -- same fix as webrequests.services.
+                    # maybe_schedule_song_request's own lock: Postgres
+                    # refuses FOR UPDATE across an outer join, and
+                    # intro_track (SET_NULL, nullable) makes the
+                    # select_related below exactly that once combined
+                    # with select_for_update.
+                    SongRequest.objects.select_for_update(of=("self",))
+                    .filter(id=candidate.id, status="scheduled", log_item_id=log_item.id, track_id=log_item.track_id)
+                    .select_related("intro_track", "intro_track__category")
+                    .first()
+                )
+                if locked is None or locked.intro_log_item_id is not None:
+                    return log_item
+                intro_item = self._splice_log_item_db_at(insert_at, locked.intro_track, locked.intro_track.category)
+                # Slot-wide claim: protects EVERY collapsed request sharing
+                # this log_item, not just `locked` -- a listener whose
+                # request collapsed into someone else's slot is still
+                # covered when the song comes back around as a forced
+                # follow-up.
+                claimed = SongRequest.objects.filter(
+                    status="scheduled", log_item_id=log_item.id, track_id=log_item.track_id,
+                ).update(intro_log_item=intro_item, status_updated_at=timezone.now())
+                if claimed == 0:
+                    # Shouldn't happen given the lock above matched `locked`
+                    # moments earlier -- but if a stale/manual inconsistency
+                    # somehow means nothing takes the claim, raising here
+                    # rolls back BOTH the position shift and the just-
+                    # created intro LogItem automatically (still inside the
+                    # transaction) -- far better than committing an intro
+                    # no SongRequest points back to, invisible to restart
+                    # recovery.
+                    raise RuntimeError(f"Dedication splice created no request claim for log_item={log_item.id}")
+
+        self._apply_log_item_insert(insert_at, intro_item)
+        self._queue_cursor = insert_at + 1
+        self._forced_next_items.append(log_item)
+        return intro_item
+
+    def _restore_followup_for_intro(self, intro_item):
+        """Called unconditionally for ANY Dedications item about to
+        play, regardless of which path got it there (forced list,
+        ordinary cursor walk after a restart, resume-hint recovery).
+        Fail-safe and returns a boolean -- an existing Dedications item
+        should not air at all unless its paired song can be positively
+        identified and protected here. Playing an orphaned announcement
+        (no way to tell what it was introducing, or a DB error while
+        checking) is worse than skipping straight to whatever's
+        genuinely next."""
+        try:
+            close_old_connections()
+            req = (
+                SongRequest.objects.filter(
+                    intro_log_item_id=intro_item.id, status="scheduled",
+                    log_item__isnull=False, log_item__played_at__isnull=True,
+                )
+                .select_related(
+                    "log_item", "log_item__track", "log_item__track__artist",
+                    "log_item__track__category", "log_item__track__category__kind",
+                    "log_item__category", "log_item__category__kind",
+                )
+                .first()
+            )
+        except Exception as exc:
+            print(f"  Dedication follow-up lookup failed for intro_item={intro_item.id}: {exc}")
+            emit_event(
+                category="webrequests", level="error", title="Dedication follow-up lookup failed",
+                detail={"intro_log_item_id": intro_item.id, "error": repr(exc)},
+                dedupe_key=f"webrequests|dedication-followup-error|{intro_item.id}",
+            )
+            return False
+
+        if req is None:
+            return False
+        if not any(i.id == req.log_item_id for i in self._forced_next_items):
+            self._forced_next_items.append(req.log_item)
+        return True
+
+    def _restore_dedication_sequence_from_resume_hint(self):
+        """Startup-only -- called from start(), right after
+        _apply_resume_hint_queue_rewind(). Blanket try/except: an
+        unhandled exception here would prevent the engine from starting
+        at all over an optional recovery feature failing, categorically
+        worse than just not recovering the pairing this one time.
+
+        Covers the case _restore_followup_for_intro alone can't: a crash
+        while the intro was actively on a deck at the moment of the
+        crash (identified via the saved engine_state.json resume hint),
+        including across an hour boundary -- distinct from, not
+        redundant with, _restore_followup_for_intro's own coverage of
+        "crash after the splice commits but before the intro's own deck
+        is ever created," reached via the ordinary cursor walk."""
+        hint = getattr(self, "_resume_hint", None)
+        if not hint or not hint.get("log_item_id"):
+            return
+        try:
+            req = (
+                SongRequest.objects.filter(
+                    intro_log_item_id=hint["log_item_id"], status="scheduled",
+                    log_item__isnull=False, log_item__played_at__isnull=True,
+                )
+                .select_related(
+                    "intro_log_item", "intro_log_item__track", "intro_log_item__track__artist",
+                    "intro_log_item__track__category", "intro_log_item__track__category__kind",
+                    "intro_log_item__category", "intro_log_item__category__kind",
+                    "log_item", "log_item__track", "log_item__track__artist",
+                    "log_item__track__category", "log_item__track__category__kind",
+                    "log_item__category", "log_item__category__kind",
+                )
+                .first()
+            )
+            if req is None:
+                return
+            existing_ids = {i.id for i in self._forced_next_items}
+            restored = [i for i in (req.intro_log_item, req.log_item) if i.id not in existing_ids]
+            self._forced_next_items = restored + self._forced_next_items
+        except Exception as exc:
+            print(f"  Dedication sequence restore failed at startup (non-fatal): {exc}")
+            emit_event(
+                category="webrequests", level="error", title="Dedication sequence restore failed at startup",
+                detail={"error": repr(exc)}, dedupe_key="webrequests|dedication-startup-restore-error",
+            )
 
     def _apply_talk_ducking(self):
         """Shared by local mic PTT and the remote-DJ gate -- both are
@@ -4129,7 +4513,10 @@ class PlaybackEngine:
         close_old_connections()
         fresh_items = list(
             self.current_log.items
-            .select_related("track", "track__artist", "track__album", "track__category", "track__category__kind")
+            .select_related(
+                "track", "track__artist", "track__album", "track__category", "track__category__kind",
+                "category", "category__kind",  # LogItem's own category, read directly by dedication logic
+            )
             .order_by("position")
         )
         occupied_ids = {d.log_item.id for d in self.decks.values() if d}

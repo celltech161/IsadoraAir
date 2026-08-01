@@ -143,11 +143,17 @@ class SongRequest(models.Model):
                       with no track-level problem -- just never got a
                       turn.
 
-    dedication_message is captured now (phase 1) but not acted on yet --
-    phase 2 formats it with requester_name, synthesizes it via Kokoro,
-    and inserts it as a one-off spoken intro ahead of the requested
-    track. That mechanism is intentionally not built yet; this field is
-    just making sure the data exists when it's time to build it."""
+    dedication_message, together with requester_name and the requested
+    track, is formatted into a spoken intro synthesized via Kokoro
+    (voice am_fenrir) and spliced immediately ahead of the requested
+    track once it airs -- see intro_track/intro_log_item below,
+    webrequests.services.build_dedication_intro_text/synthesize_
+    dedication_intro, and library.services.engine's dedication-splice
+    machinery (_maybe_insert_dedication_intro and friends). Delivery is
+    best-effort: a song can air with no intro (synthesis not ready in
+    time, contention, the engine's own last-second scheduling safety
+    net), but once an intro starts airing its song is guaranteed to
+    follow -- never the reverse."""
 
     STATUS_CHOICES = [
         ("pending", "Pending"),
@@ -223,6 +229,26 @@ class SongRequest(models.Model):
         "library.LogItem", on_delete=models.SET_NULL, null=True, blank=True,
         related_name="fulfilled_song_request",
         help_text="The specific LogItem this request was assigned to, once scheduled.",
+    )
+    intro_track = models.ForeignKey(
+        "library.Track", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="dedication_intro_requests",
+        help_text="The synthesized spoken-intro clip for this request, once "
+                   "rendered. Never cleared by reconciliation regardless of "
+                   "status -- reusable if the request reschedules, and a "
+                   "clean audit trail even for a terminal request.",
+    )
+    intro_log_item = models.ForeignKey(
+        "library.LogItem", on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="dedication_intro_for_request",
+        help_text="Set the moment intro_track is actually spliced into the "
+                   "live queue ahead of log_item -- the reinsertion guard "
+                   "(an intro is only ever spliced once per song "
+                   "assignment) and the restart-recovery key. Cleared "
+                   "whenever the request's assignment is abandoned "
+                   "(pending/no_slot_soon/unavailable/expired); retained "
+                   "on fulfilled as historical evidence the pairing aired "
+                   "correctly.",
     )
     estimated_play_time = models.DateTimeField(
         null=True, blank=True,

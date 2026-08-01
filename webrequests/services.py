@@ -1,17 +1,31 @@
 import json
+import os
+import subprocess
 import time
 from datetime import timedelta
 from pathlib import Path
 
+from django.conf import settings
 from django.db import close_old_connections, connection, transaction
 from django.db.utils import OperationalError
 from django.utils import timezone
 
-from library.models import LogItem, PlaylistLog, RecencyConfig
+from library.models import Category, LogItem, PlaylistLog, RecencyConfig, Track
 from library.services.log_builder import get_recent_exclusions, get_separation
 from monitoring.models import emit_event
 
 from .models import SongRequest, WebRequestConfig
+
+# Kokoro CLI wrapper -- same binary/argument shape weather-ingest's
+# lib/voices.py already uses successfully in production
+# (`[binary, "--model", model, "--output_file", wav_path]`, verified
+# directly against the installed wrapper's --help too). am_fenrir is the
+# voice earmarked in PROJECT_NOTES.md for exactly this kind of
+# machine-driven announcement -- distinct enough from the weather
+# personas (Claira/Max) that a listener won't mistake one for the other.
+KOKORO_BINARY = "/home/jreed/kokoro/bin/kokoro_synth"
+DEDICATION_VOICE = "am_fenrir"
+DEDICATION_ROOT = Path(settings.LIBRARY_ROOT) / "Dedications"
 
 # Same path engine.py's STATE_PATH writes to -- redefined here rather
 # than imported, since library.services.engine imports FROM this module
@@ -417,3 +431,144 @@ def maybe_schedule_song_request(log_item):
             dedupe_key="engine|webrequest-fulfill-error",
         )
         return log_item
+
+
+def build_dedication_intro_text(track, requester_name, dedication_message):
+    """'Now here's TITLE by ARTIST[, dedication text]. Thanks NAME for
+    your dedication/request.' requester_name is required on the public
+    site (client+server validated there), so the no-name case isn't
+    expected here -- handled defensively anyway (drop the closing
+    sentence) for consistency with how the site's own live preview
+    resolves the same edge case. Track.artist is a non-nullable FK, so
+    no defensive empty-string branch is needed there."""
+    sentence = f"Now here's {track.title} by {track.artist.name}"
+    dedication_message = " ".join((dedication_message or "").split())  # collapse newlines/whitespace
+    if dedication_message:
+        sentence += f", {dedication_message}"
+    if not sentence.endswith((".", "!", "?")):
+        sentence += "."
+    requester_name = (requester_name or "").strip()
+    if requester_name:
+        kind = "dedication" if dedication_message else "request"
+        sentence += f" Thanks {requester_name} for your {kind}."
+    return sentence
+
+
+def _probe_duration(path):
+    """Same ffprobe pattern as library/management/commands/
+    prep_mitd_show.py's _probe_duration -- duration in seconds as a float."""
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=nw=1:nk=1", str(path)],
+        check=True, capture_output=True, text=True, timeout=15,
+    )
+    return float(out.stdout.strip())
+
+
+def synthesize_dedication_intro(req):
+    """Renders req's spoken intro via Kokoro, converts to FLAC, and
+    attaches it as req.intro_track -- called from the standalone
+    generate_dedication_intros command (its own timer, deliberately kept
+    OUT of refresh_song_request_statuses, which must stay fast and
+    reliable; Kokoro+ffmpeg together can take tens of seconds worst
+    case). Whole body in one try/except: a failure on one request must
+    not stop the command's loop over the others."""
+    try:
+        track = req.track  # the REQUEST's own stable FK, not log_item.track,
+        # which can in principle change during the several seconds synthesis takes
+        text = build_dedication_intro_text(track, req.requester_name, req.dedication_message)
+
+        DEDICATION_ROOT.mkdir(parents=True, exist_ok=True)
+        final_path = DEDICATION_ROOT / f"request-{req.id}.flac"  # LOCAL pk only --
+        # external_request_id is an opaque string from a system we don't
+        # control, never trusted unsanitized in a filesystem path
+        tmp_wav = DEDICATION_ROOT / f".request-{req.id}.{os.getpid()}.tmp.wav"
+        tmp_flac = DEDICATION_ROOT / f".request-{req.id}.{os.getpid()}.tmp.flac"
+        try:
+            subprocess.run(
+                [KOKORO_BINARY, "--model", DEDICATION_VOICE, "--output_file", str(tmp_wav)],
+                input=text.encode("utf-8"), check=True, timeout=30,
+            )
+            subprocess.run(["ffmpeg", "-y", "-i", str(tmp_wav), str(tmp_flac)],
+                            check=True, timeout=30, capture_output=True)
+            duration = _probe_duration(tmp_flac)
+            os.replace(tmp_flac, final_path)  # atomic -- no reader ever sees a partial file
+        finally:
+            for p in (tmp_wav, tmp_flac):
+                try:
+                    p.unlink()
+                except FileNotFoundError:
+                    pass
+
+        with transaction.atomic():
+            # Metadata mirrors the REQUESTED SONG -- _create_deck() calls
+            # _write_now_playing(track) for every fresh deck, so stream
+            # metadata, RBDS, and the engine dashboard correctly show
+            # "Free Fallin' - Tom Petty" from the moment the intro
+            # starts, not an internal id. TuneIn specifically is
+            # DIFFERENT -- it's driven by the PlayEvent ledger (dedupes
+            # on PlayEvent id), not _write_now_playing, and
+            # Dedications-category plays deliberately don't create a
+            # PlayEvent (see _create_deck) -- so TuneIn correctly keeps
+            # showing the previous song through the announcement and
+            # only updates once the requested song's own PlayEvent is
+            # created a few seconds later. That's correct, not a gap:
+            # driven by the same royalty-safe ledger as everything else,
+            # rather than updating early off an announcement that isn't
+            # itself a performance.
+            intro_track, _ = Track.objects.update_or_create(
+                filepath=str(final_path),
+                defaults=dict(
+                    filename=final_path.name, format="flac",
+                    title=track.title, artist=track.artist,
+                    duration_seconds=duration, cue_in_seconds=0,
+                    # Explicit non-null next_start_seconds opts OUT of
+                    # isadoraair-analyze.timer's periodic sweep (only
+                    # re-analyzes next_start_seconds__isnull=True rows)
+                    # -- that sweep's envelope-threshold cue-point
+                    # detection is built for music, not a few seconds of
+                    # speech, and risks firing the crossfade mid-sentence.
+                    next_start_seconds=duration,
+                    category=Category.objects.get(code="Dedications"),
+                    ready2air=True,
+                ),
+            )
+            updated = SongRequest.objects.filter(
+                id=req.id, status="scheduled", track_id=req.track_id, intro_track__isnull=True,
+            ).update(intro_track=intro_track)
+
+        if not updated:
+            # Request resolved to something else while synthesis ran, or
+            # a concurrent run already attached this same Track (the
+            # deterministic path + update_or_create means both runs
+            # converge on the SAME row). Only clean up if NOTHING still
+            # references it -- a SongRequest FK or a LogItem (already
+            # spliced/aired).
+            still_referenced = (
+                SongRequest.objects.filter(intro_track=intro_track).exists()
+                or LogItem.objects.filter(track=intro_track).exists()
+            )
+            if not still_referenced:
+                intro_track.delete()
+                try:
+                    final_path.unlink()
+                except FileNotFoundError:
+                    pass
+    except Exception as exc:
+        print(f"  Dedication intro synthesis failed for request {req.id} (non-fatal, retried next cycle): {exc}")
+        emit_event(
+            category="webrequests", level="warning", title="Dedication intro synthesis failed",
+            detail={"request_id": req.external_request_id, "error": str(exc)},
+            dedupe_key=f"webrequests|dedication-synth-failed|{req.id}",
+        )
+        # The FLAC write happens BEFORE the DB transaction -- if that
+        # transaction is what failed (Track never got committed), the
+        # file is now a true orphan (not just "unattached," genuinely
+        # unowned). Best-effort, conservative cleanup: only remove it if
+        # no Track row claims this exact path.
+        try:
+            final_path = DEDICATION_ROOT / f"request-{req.id}.flac"
+            if final_path.exists() and not Track.objects.filter(filepath=str(final_path)).exists():
+                final_path.unlink()
+        except Exception:
+            pass  # already in the outer failure handler -- never let cleanup itself raise

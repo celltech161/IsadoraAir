@@ -60,7 +60,10 @@ class SongRequestAdmin(admin.ModelAdmin):
     status correction can't leave contradictory sibling fields behind
     -- every other code path that moves a request back to waiting
     already clears these explicitly via .update(); this is the one
-    path (a plain .save()) that bypasses those."""
+    path (a plain .save()) that bypasses those. Same reasoning for
+    intro_log_item, cleared whenever status isn't scheduled or
+    fulfilled -- intro_track is deliberately NEVER cleared here (or
+    anywhere in reconciliation), reusable if the request reschedules."""
 
     list_display = ["status", "requester_name", "track", "submitted_at", "scheduled_at", "fulfilled_at"]
     list_filter = ["status"]
@@ -71,6 +74,7 @@ class SongRequestAdmin(admin.ModelAdmin):
         "external_request_id", "track", "requester_name", "dedication_message",
         "submitted_at", "fetched_at", "scheduled_at", "fulfilled_at", "resolved_at",
         "estimated_play_time", "log_item", "status_updated_at",
+        "intro_track", "intro_log_item",
     ]
 
     def has_add_permission(self, request):
@@ -84,4 +88,6 @@ class SongRequestAdmin(admin.ModelAdmin):
             obj.fulfilled_at = None
             obj.resolved_at = None
             obj.estimated_play_time = None
+        if obj.status not in ("scheduled", "fulfilled"):
+            obj.intro_log_item = None
         super().save_model(request, obj, form, change)
