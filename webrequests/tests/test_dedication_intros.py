@@ -149,6 +149,38 @@ class DedicationTextTemplateTests(WebRequestFixtureMixin, TransactionTestCase):
         text = build_dedication_intro_text(track, "Justin", "   ")
         self.assertEqual(text, "Now here's Test Song by Test Artist. Thanks Justin for your request.")
 
+    def test_feat_in_title_normalized_to_featuring(self):
+        track = self.make_track(title="Free Fallin' (feat. Stevie Nicks)")
+        text = build_dedication_intro_text(track, "Justin", "")
+        self.assertIn("Free Fallin' (featuring Stevie Nicks)", text)
+        self.assertNotIn("feat.", text)
+
+    def test_feat_in_artist_normalized_to_featuring(self):
+        artist = Artist.objects.create(name="Tom Petty feat. Stevie Nicks")
+        track = Track.objects.create(
+            title="Free Fallin'", artist=artist, category=self.category,
+            ready2air=True, filepath=str(Path(self._tmpdir.name) / "feat-artist.mp3"),
+            duration_seconds=180.0,
+        )
+        Path(track.filepath).touch()
+        text = build_dedication_intro_text(track, "Justin", "")
+        self.assertIn("by Tom Petty featuring Stevie Nicks", text)
+
+    def test_feat_normalization_is_case_insensitive_and_no_period_variant_untouched(self):
+        track = self.make_track(title="Song (Feat. Someone)")
+        text = build_dedication_intro_text(track, "Justin", "")
+        self.assertIn("(featuring Someone)", text)
+
+        track2 = self.make_track(title="Incredible Feat")
+        text2 = build_dedication_intro_text(track2, "Justin", "")
+        self.assertIn("Incredible Feat", text2, "bare word \"Feat\" (no period) must not be touched")
+
+    def test_already_spelled_out_featuring_not_doubled(self):
+        track = self.make_track(title="Song featuring Someone")
+        text = build_dedication_intro_text(track, "Justin", "")
+        self.assertIn("Song featuring Someone", text)
+        self.assertNotIn("featuringing", text)
+
 
 # ---------------------------------------------------------------------
 # 2, 3, 4, 20. Synthesis: winner-selection, advisory lock, CAS cleanup,

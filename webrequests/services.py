@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import subprocess
 import time
 from datetime import timedelta
@@ -26,6 +27,15 @@ from .models import SongRequest, WebRequestConfig
 KOKORO_BINARY = "/home/jreed/kokoro/bin/kokoro_synth"
 DEDICATION_VOICE = "am_fenrir"
 DEDICATION_ROOT = Path(settings.LIBRARY_ROOT) / "Dedications"
+
+# "feat." (any case, with the period -- requiring it is what keeps this
+# from also mangling "feat" used as an actual word, e.g. a title like
+# "Incredible Feat") gets spoken by Kokoro as the rhyming word ("feet")
+# rather than expanded to "featuring". Word-boundary on the left only,
+# so it matches both "(feat. X)" and "feat. X" but never touches
+# "featuring" itself (which the same \bfeat\. pattern can't match --
+# "feat" there is followed by "u", not a period).
+_FEATURED_ARTIST_ABBREV_RE = re.compile(r"\bfeat\.", re.IGNORECASE)
 
 # Same path engine.py's STATE_PATH writes to -- redefined here rather
 # than imported, since library.services.engine imports FROM this module
@@ -440,8 +450,14 @@ def build_dedication_intro_text(track, requester_name, dedication_message):
     expected here -- handled defensively anyway (drop the closing
     sentence) for consistency with how the site's own live preview
     resolves the same edge case. Track.artist is a non-nullable FK, so
-    no defensive empty-string branch is needed there."""
-    sentence = f"Now here's {track.title} by {track.artist.name}"
+    no defensive empty-string branch is needed there.
+
+    Title/artist go through the "feat." normalization below -- their
+    display value in the DB/tags is untouched, only the string handed
+    to Kokoro."""
+    title = _FEATURED_ARTIST_ABBREV_RE.sub("featuring", track.title)
+    artist_name = _FEATURED_ARTIST_ABBREV_RE.sub("featuring", track.artist.name)
+    sentence = f"Now here's {title} by {artist_name}"
     dedication_message = " ".join((dedication_message or "").split())  # collapse newlines/whitespace
     if dedication_message:
         sentence += f", {dedication_message}"
