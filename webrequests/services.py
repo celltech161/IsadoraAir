@@ -562,6 +562,45 @@ def synthesize_dedication_intro(req):
                     pass
             return False
 
+        # Waveform display data (samples_left/right + waveform_path) --
+        # the same analyze_one_track() call api_library_upload and
+        # sync_track_file already use for a fresh Track outside the
+        # normal timer sweep (see library/views.py). Needed here for
+        # the same reason those call sites need it: next_start_seconds
+        # being pre-set above (deliberately, to opt OUT of
+        # isadoraair-analyze.timer's periodic sweep) means that sweep's
+        # own `next_start_seconds__isnull=True` filter would otherwise
+        # never pick this row up, leaving it with no waveform in the UI
+        # at all, forever. Own try/except: a failure here must not
+        # undo the intro_track attachment that already succeeded above,
+        # or report this call as a failure -- the only thing that
+        # actually matters (the request having a playable intro) is
+        # already done regardless.
+        try:
+            from library.management.commands.analyze_tracks import analyze_one_track, get_waveforms_dir
+            from library.models import AnalysisConfig
+            cfg = AnalysisConfig.load()
+            cfg_values = (
+                cfg.analysis_sample_rate, cfg.analysis_window_seconds, cfg.waveform_points,
+                cfg.next_start_threshold_db, cfg.cue_in_threshold_db, cfg.cue_in_min_seconds,
+            )
+            row = (
+                intro_track.id, intro_track.filepath, intro_track.filename,
+                intro_track.duration_seconds, intro_track.title,
+                intro_track.artist.name if intro_track.artist_id else "", "",
+            )
+            analyze_one_track(row, cfg_values, get_waveforms_dir(), force=True)
+            # analyze_one_track's own envelope-threshold next_start/cue_in
+            # detection is built for music, not a few seconds of speech --
+            # re-assert the deliberate values from above regardless of
+            # whatever it guessed, same reasoning as the comment on
+            # next_start_seconds up in the update_or_create call.
+            Track.objects.filter(id=intro_track.id).update(
+                next_start_seconds=duration, cue_in_seconds=0,
+            )
+        except Exception as exc:
+            print(f"  Dedication waveform generation failed for request {req.id} (non-fatal): {exc}")
+
         return True
     except Exception as exc:
         print(f"  Dedication intro synthesis failed for request {req.id} (non-fatal, retried next cycle): {exc}")

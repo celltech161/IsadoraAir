@@ -178,6 +178,17 @@ class DedicationSynthesisTests(DedicationFixtureMixin, TransactionTestCase):
         duration_patcher.start()
         self.addCleanup(duration_patcher.stop)
 
+        # Default no-op for the waveform-generation step -- fake_run
+        # above also intercepts analyze_tracks.py's OWN ffmpeg decode
+        # calls (same "ffmpeg" argv[0]), which would otherwise choke on
+        # garbage mock PCM data and litter the cwd with a stray file
+        # named "-" (argv[-1] for a decode-to-stdout command) every run.
+        # The two tests specifically about this step override this with
+        # their own `with patch(...)` block, which correctly shadows it.
+        analyze_patcher = patch("library.management.commands.analyze_tracks.analyze_one_track", return_value=True)
+        analyze_patcher.start()
+        self.addCleanup(analyze_patcher.stop)
+
     def test_synthesis_attaches_intro_track_with_song_metadata(self):
         track = self.make_track(title="Free Fallin'")
         log = self.make_log(date(2027, 5, 1), 5)
@@ -191,6 +202,64 @@ class DedicationSynthesisTests(DedicationFixtureMixin, TransactionTestCase):
         self.assertEqual(req.intro_track.title, track.title)
         self.assertEqual(req.intro_track.artist_id, track.artist_id)
         self.assertEqual(req.intro_track.category_id, self.dedication_category.id)
+        self.assertEqual(req.intro_track.next_start_seconds, req.intro_track.duration_seconds)
+
+    def test_synthesis_generates_waveform_and_reasserts_cue_points(self):
+        """next_start_seconds is pre-set specifically to opt this Track
+        OUT of isadoraair-analyze.timer's periodic sweep (that sweep's
+        envelope-threshold detection is wrong for a few seconds of
+        speech) -- but that also means the sweep would never generate a
+        waveform for it either. synthesize_dedication_intro calls
+        analyze_one_track directly instead, then re-asserts the
+        deliberate cue points regardless of whatever it guessed."""
+        track = self.make_track(title="Free Fallin'")
+        log = self.make_log(date(2027, 5, 1), 12)
+        item = self.make_item(log, 0, track=track)
+        req = self.make_request(track, status="scheduled", log_item=item)
+
+        def fake_analyze_one_track(row, cfg_values, wave_dir, force):
+            track_id = row[0]
+            # Simulate what the real envelope detector would wrongly
+            # guess for speech -- something short of the full duration.
+            Track.objects.filter(id=track_id).update(
+                waveform_path=f"/srv/isadoraair/waveforms/{track_id}.json",
+                next_start_seconds=1.0, cue_in_seconds=0.5,
+            )
+            return True
+
+        with patch(
+            "library.management.commands.analyze_tracks.analyze_one_track",
+            side_effect=fake_analyze_one_track,
+        ) as mock_analyze:
+            synthesize_dedication_intro(req)
+
+        mock_analyze.assert_called_once()
+        called_row = mock_analyze.call_args[0][0]
+        req.refresh_from_db()
+        self.assertEqual(called_row[0], req.intro_track_id)
+
+        req.intro_track.refresh_from_db()
+        self.assertTrue(req.intro_track.waveform_path, "waveform_path should now be set")
+        self.assertEqual(req.intro_track.next_start_seconds, req.intro_track.duration_seconds,
+                          "must be re-asserted to the full clip length, not the envelope detector's guess")
+        self.assertEqual(req.intro_track.cue_in_seconds, 0,
+                          "must be re-asserted to 0, not the envelope detector's guess")
+
+    def test_waveform_generation_failure_does_not_fail_synthesis(self):
+        track = self.make_track(title="Free Fallin'")
+        log = self.make_log(date(2027, 5, 1), 13)
+        item = self.make_item(log, 0, track=track)
+        req = self.make_request(track, status="scheduled", log_item=item)
+
+        with patch(
+            "library.management.commands.analyze_tracks.analyze_one_track",
+            side_effect=RuntimeError("ffmpeg exploded"),
+        ):
+            result = synthesize_dedication_intro(req)
+
+        self.assertTrue(result, "the intro attachment succeeded -- a cosmetic waveform failure must not undo that")
+        req.refresh_from_db()
+        self.assertIsNotNone(req.intro_track_id)
         self.assertEqual(req.intro_track.next_start_seconds, req.intro_track.duration_seconds)
 
     def test_winner_selection_survives_across_two_command_runs(self):
