@@ -228,12 +228,20 @@
     color: var(--text-main);
   }
 
-  table.pl-table tr[draggable="true"] { cursor: grab; }
-  table.pl-table tr[draggable="true"]:active { cursor: grabbing; }
   table.pl-table tr.drag-over td { border-top: 2px solid var(--accent); }
   table.pl-table tr.dragging td { opacity: 0.3; }
 
   td.pl-col-pos { color: var(--text-muted); text-align: center; white-space: nowrap; }
+  /* touch-action:none stops the browser's own scroll gesture from
+     racing the touchstart/touchmove handlers below -- without it,
+     preventDefault() alone isn't reliable on all mobile browsers.
+     user-select/-webkit-touch-callout:none stop iOS's press-and-hold
+     text-selection popup from interrupting a drag gesture. */
+  td.pl-drag-handle {
+    touch-action: none;
+    user-select: none;
+    -webkit-touch-callout: none;
+  }
 
   .rot-badge {
     display: inline-block;
@@ -556,8 +564,8 @@ function renderSlots() {
       ? `${esc(s.artist)} &ndash; ${esc(s.title)}`
       : esc(s.category_name);
     return `
-    <tr data-slot-id="${s.id}" draggable="true">
-      <td class="pl-col-pos" style="cursor:grab;">&#9776;</td>
+    <tr data-slot-id="${s.id}">
+      <td class="pl-col-pos pl-drag-handle" style="cursor:grab;">&#9776;</td>
       <td class="pl-col-pos">${s.position + 1}</td>
       <td>${badge}</td>
       <td>${content}</td>
@@ -573,53 +581,105 @@ function renderSlots() {
 }
 
 function initDragDrop() {
+  // Pointer Events instead of native HTML5 drag-and-drop -- same fix,
+  // same reasoning, as the queue-reorder drag on the engine dashboard
+  // (dashboard.html's initQueueDrag): native draggable="true" never
+  // fires for touch input on any mobile browser. Pointer Events unify
+  // mouse/touch/pen into one event stream, so this one implementation
+  // handles both. Drag starts from the drag-handle cell specifically
+  // (not anywhere on the row), and pointer capture keeps events
+  // targeting the handle even as the finger/cursor moves over other
+  // rows during the drag.
   const tbody = document.getElementById('itemsTbody');
-  let dragRow = null;
+  let dragEl = null;
+  let activePointerId = null;
+  let scrollTimer = null;
 
-  tbody.querySelectorAll('tr[draggable]').forEach(row => {
-    row.addEventListener('dragstart', (e) => {
-      dragRow = row;
+  function rowAtPoint(x, y) {
+    const el = document.elementFromPoint(x, y);
+    const row = el && el.closest('tr');
+    return (row && tbody.contains(row)) ? row : null;
+  }
+
+  function clearDragOver() {
+    tbody.querySelectorAll('tr.drag-over').forEach(r => r.classList.remove('drag-over'));
+  }
+
+  function stopAutoScroll() {
+    if (scrollTimer) {
+      clearInterval(scrollTimer);
+      scrollTimer = null;
+    }
+  }
+
+  // Scrolls the whole page (not just the items list's own scroll box)
+  // when a drag is held near the top/bottom edge of the VIEWPORT --
+  // on a phone the table's max-height box might not even be the thing
+  // that needs to scroll to reach an item below the fold.
+  function maybeAutoScroll(clientY) {
+    const edge = 60;
+    stopAutoScroll();
+    if (clientY < edge) {
+      scrollTimer = setInterval(() => window.scrollBy(0, -12), 16);
+    } else if (clientY > window.innerHeight - edge) {
+      scrollTimer = setInterval(() => window.scrollBy(0, 12), 16);
+    }
+  }
+
+  function endDrag() {
+    if (dragEl) dragEl.classList.remove('dragging');
+    clearDragOver();
+    stopAutoScroll();
+    dragEl = null;
+    activePointerId = null;
+  }
+
+  async function commitReorder() {
+    const order = [...tbody.querySelectorAll('tr')].map(r => parseInt(r.dataset.slotId));
+
+    const { ok, data } = await apiJson(`/api/rotations/${currentRotation.id}/reorder/`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') },
+      body: JSON.stringify({ order }),
+    });
+
+    if (ok) {
+      currentRotation = data;
+      renderSlots();
+    }
+  }
+
+  tbody.querySelectorAll('.pl-drag-handle').forEach(handle => {
+    handle.addEventListener('pointerdown', (e) => {
+      const row = handle.closest('tr');
+      if (!row) return;
+      dragEl = row;
+      activePointerId = e.pointerId;
       row.classList.add('dragging');
-      e.dataTransfer.effectAllowed = 'move';
-    });
-
-    row.addEventListener('dragend', () => {
-      row.classList.remove('dragging');
-      tbody.querySelectorAll('tr').forEach(r => r.classList.remove('drag-over'));
-      dragRow = null;
-    });
-
-    row.addEventListener('dragover', (e) => {
+      handle.setPointerCapture(e.pointerId);
       e.preventDefault();
-      e.dataTransfer.dropEffect = 'move';
-      tbody.querySelectorAll('tr').forEach(r => r.classList.remove('drag-over'));
-      row.classList.add('drag-over');
     });
 
-    row.addEventListener('dragleave', () => {
-      row.classList.remove('drag-over');
-    });
-
-    row.addEventListener('drop', async (e) => {
+    handle.addEventListener('pointermove', (e) => {
+      if (!dragEl || e.pointerId !== activePointerId) return;
       e.preventDefault();
-      row.classList.remove('drag-over');
-      if (!dragRow || dragRow === row) return;
-
-      tbody.insertBefore(dragRow, row);
-
-      const order = [...tbody.querySelectorAll('tr')].map(r => parseInt(r.dataset.slotId));
-
-      const { ok, data } = await apiJson(`/api/rotations/${currentRotation.id}/reorder/`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') },
-        body: JSON.stringify({ order }),
-      });
-
-      if (ok) {
-        currentRotation = data;
-        renderSlots();
-      }
+      const row = rowAtPoint(e.clientX, e.clientY);
+      clearDragOver();
+      if (row && row !== dragEl) row.classList.add('drag-over');
+      maybeAutoScroll(e.clientY);
     });
+
+    handle.addEventListener('pointerup', async (e) => {
+      if (!dragEl || e.pointerId !== activePointerId) return;
+      const dropRow = rowAtPoint(e.clientX, e.clientY);
+      const draggedEl = dragEl;
+      endDrag();
+      if (!dropRow || dropRow === draggedEl) return;
+      tbody.insertBefore(draggedEl, dropRow);
+      await commitReorder();
+    });
+
+    handle.addEventListener('pointercancel', endDrag);
   });
 }
 
