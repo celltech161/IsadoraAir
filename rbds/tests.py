@@ -1154,3 +1154,79 @@ class RBDSAfRuntimeBlockTests(SimpleTestCase):
         frames = _split_uecp_frames(payload)
         self.assertIsNotNone(_find_mec(frames, 0x02))  # PS
         self.assertIsNotNone(_find_mec(frames, 0x0A))  # RT
+
+
+class EffectiveDynamicPtyTests(TestCase):
+    """RBDSConfig.di_dynamic_pty was a fully independent static flag,
+    never derived from whether Category.rbds_pty_override can actually
+    make PTY vary track-to-track -- a station using category overrides
+    could transmit PTY changes while DI told receivers "PTY is
+    static." 2026-08-02 fix: _effective_dynamic_pty() auto-derives
+    True whenever any category has an override configured, OR'd with
+    (never replacing) the admin's own manual setting."""
+
+    def setUp(self):
+        self.mgr = RBDSManager()
+        from library.models import Category, CategoryKind
+        # A real "music" CategoryKind is already seeded by a data
+        # migration in this project's DB -- use an isolated test-only
+        # code so this test never collides with (or is confused for)
+        # real seeded/production data.
+        self.kind = CategoryKind.objects.create(code="__rbds_test_kind__", name="RBDS Test Kind")
+
+    def test_no_overrides_no_manual_flag_is_false(self):
+        from library.models import Category
+        Category.objects.create(code="__rbds_test_a__", name="Test A", kind=self.kind, rbds_pty_override=None)
+        config = mock.Mock(di_dynamic_pty=False)
+        self.assertFalse(self.mgr._effective_dynamic_pty(config))
+
+    def test_no_overrides_manual_flag_true_is_respected(self):
+        from library.models import Category
+        Category.objects.create(code="__rbds_test_a__", name="Test A", kind=self.kind, rbds_pty_override=None)
+        config = mock.Mock(di_dynamic_pty=True)
+        self.assertTrue(self.mgr._effective_dynamic_pty(config))
+
+    def test_any_category_override_forces_true_even_if_manual_flag_false(self):
+        from library.models import Category
+        Category.objects.create(code="__rbds_test_a__", name="Test A", kind=self.kind, rbds_pty_override=None)
+        Category.objects.create(code="__rbds_test_wx__", name="Test Weather", kind=self.kind, rbds_pty_override=29)
+        config = mock.Mock(di_dynamic_pty=False)
+        self.assertTrue(self.mgr._effective_dynamic_pty(config))
+
+    def test_category_override_and_manual_flag_both_true(self):
+        from library.models import Category
+        Category.objects.create(code="__rbds_test_wx__", name="Test Weather", kind=self.kind, rbds_pty_override=29)
+        config = mock.Mock(di_dynamic_pty=True)
+        self.assertTrue(self.mgr._effective_dynamic_pty(config))
+
+    @mock.patch("rbds.services.rbds_manager.close_old_connections", new=lambda: None)
+    def test_tick_resolves_and_sends_the_effective_value(self):
+        # _effective_dynamic_pty() is only ever called from _tick()
+        # (builders take a plain dynamic_pty parameter, no DB query
+        # buried inside them -- see _send's own docstring) -- so the
+        # real regression to guard against is a future _tick() call
+        # site reverting to config.di_dynamic_pty directly. Drives an
+        # actual tick and inspects the transmitted MEC 0x04, the same
+        # way RBDSManagerOneShotToggleTests exercises _tick().
+        from library.models import Category
+        Category.objects.create(code="__rbds_test_wx__", name="Test Weather", kind=self.kind, rbds_pty_override=29)
+
+        config = RBDSConfig.load()
+        config.protocol = "uecp"
+        config.use_rt_plus = False
+        config.send_ct = False
+        config.di_dynamic_pty = False  # manual flag says static...
+        config.save()
+
+        sent_payloads = []
+        self.mgr._transmit = mock.Mock(side_effect=lambda cfg, payload: sent_payloads.append(payload))
+        self.mgr._read_now_playing = mock.Mock(return_value={"title": "Song", "artist": ""})
+        self.mgr._read_category_state = mock.Mock(return_value={"pty_override": None, "ptyn": ""})
+        self.mgr._last_send_ct_state = False
+
+        self.mgr._tick()
+
+        self.assertEqual(len(sent_payloads), 1)
+        di_mec = _find_mec(_split_uecp_frames(sent_payloads[0]), 0x04)
+        self.assertIsNotNone(di_mec)
+        self.assertEqual(di_mec[3] & 0x08, 0x08, "dynamic-PTY bit must be set: a category override exists")

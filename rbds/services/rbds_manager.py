@@ -175,8 +175,9 @@ class RBDSManager:
         # save mattered but was really just a lucky retry window.
         if changed or due_for_full_resend or not self._connected:
             effective_pty, effective_ptyn = self._effective_pty_ptyn(config)
+            effective_dynamic_pty = self._effective_dynamic_pty(config)
             send_ok = self._send(config, target_ps, rt_text, rt_artist, rt_title, effective_pty, effective_ptyn,
-                                  rt_ab_toggle=rt_changed)
+                                  rt_ab_toggle=rt_changed, dynamic_pty=effective_dynamic_pty)
             # Only commit "what we last sent" on an actual successful
             # transmission (2026-08-02 fix) -- see _send's own
             # docstring. A failed send leaves _last_sent_ps/_last_sent_rt
@@ -387,9 +388,41 @@ class RBDSManager:
         effective_ptyn = state.get("ptyn") or ""
         return effective_pty, effective_ptyn
 
+    def _effective_dynamic_pty(self, config):
+        """Whether the DI "Dynamic PTY Indicator" bit should read True.
+
+        Confirmed gap (2026-08-02 review): RBDSConfig.di_dynamic_pty
+        was a fully independent static flag, default False, never
+        derived from whether Category-level PTY overrides (see
+        Category.rbds_pty_override) can actually make PTY vary from
+        one track to the next -- meaning a station using category
+        overrides could transmit PTY changes while DI told receivers
+        "PTY is static," which is exactly backwards.
+
+        True whenever ANY category has an override configured --
+        this describes the SERVICE's general PTY behavior (does this
+        station's PTY assignment scheme vary by category at all),
+        matching the DI bit's own documented purpose, not whether an
+        override happens to be active on the literal current track --
+        so it's deliberately NOT keyed off _read_category_state()'s
+        current-track snapshot the way _effective_pty_ptyn is. Still
+        OR'd with the admin's own manual setting, not a hard
+        replacement -- an operator can force it True with no
+        overrides configured (e.g. anticipating future use), but
+        can't leave it False while overrides genuinely make PTY
+        dynamic, which was the actual bug.
+
+        Whether song-by-song PTY changes are desirable in the first
+        place (vs. limiting overrides to whole programs/shows) is a
+        station-policy call this project isn't making unilaterally --
+        see Category.rbds_pty_override's own admin-facing choices,
+        left exactly as configured."""
+        from library.models import Category
+        return config.di_dynamic_pty or Category.objects.filter(rbds_pty_override__isnull=False).exists()
+
     # --- Sending ---
 
-    def _send(self, config, ps, rt, artist, title, pty=None, ptyn="", rt_ab_toggle=False):
+    def _send(self, config, ps, rt, artist, title, pty=None, ptyn="", rt_ab_toggle=False, dynamic_pty=None):
         """Returns True only if the payload actually reached
         _transmit() successfully. Callers MUST gate their own "what we
         last sent" bookkeeping (_last_sent_ps/_last_sent_rt/etc.) on
@@ -406,14 +439,25 @@ class RBDSManager:
         isn't a hard guarantee every byte landed -- but treating any
         exception as failure and preserving the pending edge is still
         strictly better than the prior unconditional-success
-        assumption."""
+        assumption.
+
+        dynamic_pty defaults to config.di_dynamic_pty (the raw manual
+        flag, no DB query) when not given -- _tick() is the one place
+        that resolves the real, category-override-aware effective
+        value (see _effective_dynamic_pty) and passes it in explicitly.
+        Builders stay query-free/pure; the DB lookup lives in exactly
+        one place, not buried inside a payload builder every caller
+        (including tests) would otherwise silently trigger."""
         if pty is None:
             pty = config.pty
+        if dynamic_pty is None:
+            dynamic_pty = config.di_dynamic_pty
         try:
             if config.protocol == "uecp":
-                payload = self._build_uecp_payload(config, ps, rt, artist, title, pty, ptyn, rt_ab_toggle)
+                payload = self._build_uecp_payload(config, ps, rt, artist, title, pty, ptyn, rt_ab_toggle,
+                                                     dynamic_pty)
             else:
-                payload = self._build_ascii_payload(config, ps, rt, artist, title, pty)
+                payload = self._build_ascii_payload(config, ps, rt, artist, title, pty, dynamic_pty)
             self._transmit(config, payload)
         except Exception as exc:
             self._last_error = str(exc)
@@ -448,7 +492,7 @@ class RBDSManager:
         self._transmit(config, self._frames_for(config, meds))
 
     def _build_uecp_payload(self, config, ps, rt, artist=None, title=None, pty=None, ptyn="",
-                             rt_ab_toggle=False):
+                             rt_ab_toggle=False, dynamic_pty=None):
         """Assemble the full UECP payload as ONE MEC PER UECP FRAME
         (concatenated back-to-back for a single TCP write). Not one
         big multi-MEC frame -- observed live behavior of RDS Magic 4
@@ -486,7 +530,8 @@ class RBDSManager:
         meds.append(uecp.mec_ps(ps))
         meds.append(uecp.mec_ta_tp(ta=config.ta, tp=config.tp))
         meds.append(uecp.mec_di(
-            dynamic_pty=config.di_dynamic_pty, compressed=config.di_compressed,
+            dynamic_pty=config.di_dynamic_pty if dynamic_pty is None else dynamic_pty,
+            compressed=config.di_compressed,
             artificial_head=config.di_artificial_head, stereo=config.di_stereo,
         ))
         meds.append(uecp.mec_ms(music=config.ms))
@@ -617,7 +662,7 @@ class RBDSManager:
         )
         self._transmit(config, frame)
 
-    def _build_ascii_payload(self, config, ps, rt, artist, title, pty=None):
+    def _build_ascii_payload(self, config, ps, rt, artist, title, pty=None, dynamic_pty=None):
         # rt is guaranteed by _resolve_rt_content()/_build_rt_plus_text()
         # to be exactly f"{artist}{RT_PLUS_SEPARATOR}{title}" (truncated
         # to 64 chars) whenever artist/title are both non-empty, and
@@ -639,7 +684,8 @@ class RBDSManager:
         commands = ascii_protocol.build_ascii_commands(
             pi_code=config.pi_code, ps=ps, rt=rt,
             pty=pty if pty is not None else config.pty, music=config.ms,
-            di_dynamic_pty=config.di_dynamic_pty, di_compressed=config.di_compressed,
+            di_dynamic_pty=config.di_dynamic_pty if dynamic_pty is None else dynamic_pty,
+            di_compressed=config.di_compressed,
             di_artificial_head=config.di_artificial_head, di_stereo=config.di_stereo,
             rt_plus_tags=rt_plus_tags,
         )

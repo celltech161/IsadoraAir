@@ -100,7 +100,14 @@ class RBDSConfig(models.Model):
     ms = models.BooleanField(
         "Music/Speech", default=True, help_text="Checked = Music, unchecked = Speech.",
     )
-    di_dynamic_pty = models.BooleanField("DI: Dynamic PTY", default=False)
+    di_dynamic_pty = models.BooleanField(
+        "DI: Dynamic PTY", default=False,
+        help_text="Tells receivers PTY may change from one track to the next. Automatically "
+                   "treated as True (regardless of this checkbox) whenever any Category has an "
+                   "RBDS PTY override configured at /admin/library/category/ -- PTY genuinely can "
+                   "vary in that case, so the indicator should say so. Enable manually here only "
+                   "to force it True with no category overrides configured.",
+    )
     di_compressed = models.BooleanField("DI: Compressed", default=False)
     di_artificial_head = models.BooleanField("DI: Artificial Head", default=False)
     di_stereo = models.BooleanField("DI: Stereo", default=True)
