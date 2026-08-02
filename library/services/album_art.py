@@ -13,7 +13,7 @@ Fallback chain, in order:
      instant and offline-safe, and the best match available for an
      already-curated local library.
   4. Oak Grove Radio's in-house hosted album art for mixshows/segments —
-     `https://oakgroveradio.com/player/albumart/{artist-slug}.png`, artist
+     `https://artwork.oakgroveradio.com/{artist-slug}.png`, artist
      name lowercased with spaces converted to hyphens. Checked for every
      track regardless of category (unlike Deezer/iTunes below), since
      this is specifically curated for exactly the syndicated non-music
@@ -46,7 +46,7 @@ from django.utils import timezone
 from mutagen import File as MutagenFile
 
 ART_CACHE_DIR = Path(settings.MEDIA_ROOT) / "album_art_cache"
-OAKGROVE_ALBUMART_BASE = "https://oakgroveradio.com/player/albumart/"
+OAKGROVE_ALBUMART_BASE = "https://artwork.oakgroveradio.com/"
 
 _PRIMARY_TAG_MARKERS = ["rip", "remaster", "bit", "edit", "clean"]
 _FEAT_PATTERNS = [
