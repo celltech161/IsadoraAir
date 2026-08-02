@@ -5,9 +5,16 @@ Latin-1 and NOT UTF-8 -- dozens of byte values mean something different
 in each. Concrete, verified examples (byte value -> G0 meaning vs.
 Latin-1 meaning for that SAME byte):
     0x24: G0 "¤" (generic currency sign)   Latin-1 "$"
-    0xA0: G0 "á" (a-acute)                 Latin-1 NBSP
-    0xAA: G0 "£" (pound sign)               Latin-1 "ª" (ordinal indicator)
-    0xC9: G0 "Ú" (U-acute)                  Latin-1 "É" (E-acute)
+    0x80: G0 "á" (a-acute)                 Latin-1 control code (unassigned)
+    0xAA: G0 "£" (pound sign)              Latin-1 "ª" (ordinal indicator)
+    0xC9: G0 "Ù" (U-grave)                 Latin-1 "É" (E-acute)
+(Corrected 2026-08-02: an earlier revision of this docstring cited
+0xA0 and 0xC9 for the á/Ú examples above -- those were transcription
+slips in the docstring text only, not in RDS_G0_DECODE itself or in
+any shipped/tested byte value; encode_rds_g0() and its test suite
+were always correct. 0xA0 is actually G0 "ª"; Ú is at 0xC8, Ù at
+0xC9. Verified directly against RDS_G0_DECODE below before writing
+this correction, not re-asserted from memory.)
 Sending Python's Latin-1 byte value for '$' (0x24) is received by a
 real RDS decoder as a currency symbol, not a dollar sign -- this isn't
 a cosmetic difference, it's a different glyph on the same wire byte.

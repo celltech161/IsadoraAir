@@ -218,6 +218,20 @@ class UecpMecBuilderTests(SimpleTestCase):
         self.assertEqual(offset_byte & 0x20, 0x20)  # sign bit = negative
         self.assertEqual(offset_byte & 0x1F, 10)     # 5h = 10 half-hours
 
+    def test_mec_song_info_still_uses_latin1_not_g0(self):
+        # 2026-08-02 second-opinion review correction: an earlier fix
+        # switched this reverse-engineered vendor MEC to the verified
+        # G0 table too, but the capture that established this MEC's
+        # byte layout only ever carried plain ASCII -- extending an
+        # unverified encoding choice to an unverified vendor channel
+        # is the same mistake this whole module is otherwise careful
+        # to avoid. Locks in the revert back to Latin-1 (unchanged
+        # pending a real StereoTool bench test).
+        result = uecp.mec_song_info("café")
+        self.assertEqual(result, bytes([0xAA, 5, 0xF0]) + b"caf\xE9")  # Latin-1 é = 0xE9
+        self.assertEqual(result[-1], 0xE9)
+        self.assertNotEqual(result[-1], 0x82)  # G0's é is 0x82 -- must NOT be used here
+
     def test_mec_ct_on_off_matches_spec_example(self):
         # <19><01> -- spec section 3.3.39's own worked example: "enable
         # transmission of type 4A group." Confirmed 2026-08-02: MEC
@@ -972,3 +986,152 @@ class RBDSPSFrameValidationTests(SimpleTestCase):
     def test_hold_seconds_at_floor_accepted(self):
         frame = RBDSPSFrame(text="TEST", hold_seconds=4)
         frame.clean()  # must not raise
+
+
+class RtNormalizationGapTests(SimpleTestCase):
+    """Artist/title/message text are normalized before use, but two
+    spots were missed: the FINAL formatted now_playing_format result,
+    and admin-configured PTYN/RT+-delimiter fields that never pass
+    through _resolve_rt_content at all. 2026-08-02 second-opinion
+    review fix."""
+
+    def setUp(self):
+        self.mgr = RBDSManager()
+
+    def test_now_playing_format_final_result_is_normalized(self):
+        # The template string itself (not just artist/title) can
+        # contain a raw newline or smart-punctuation character typed
+        # directly into the admin field -- normalizing artist/title
+        # alone doesn't sanitize that.
+        config = mock.Mock(use_rt_plus=False, now_playing_format="{artist}\n{title}…")
+        now_playing = {"title": "Song", "artist": "Artist"}
+        rt_text, artist, title = self.mgr._resolve_rt_content(config, now_playing, "nowplaying", None, {})
+        self.assertNotIn("\n", rt_text)
+        self.assertEqual(rt_text, "Artist Song...")
+
+    def test_ptyn_smart_quote_normalizes_to_a_real_g0_character(self):
+        # Without normalizing first, encode_rds_g0 would fall back to
+        # a space for the unsupported curly apostrophe -- G0 DOES have
+        # a real code point for a plain one.
+        result = uecp.mec_ptyn(charset.normalize_text("DJ’s"))
+        self.assertEqual(result, bytes([0x3E, 0x00, 0x00]) + b"DJ's    ")
+
+    def test_rt_plus_delimiter_with_smart_dash_still_splits(self):
+        # A stale, un-normalized "–" delimiter would never match
+        # raw_text after raw_text's OWN normalization already
+        # collapsed "–" to "-", silently defeating the split.
+        message = mock.Mock(source_type="static", text="Artist – Title", rt_plus_delimiter="–")
+        config = mock.Mock(use_rt_plus=False)
+        rt_text, artist, title = self.mgr._resolve_rt_content(config, {}, "promo", "msg", {"msg": message})
+        self.assertEqual(rt_text, "Artist - Title")
+
+
+@mock.patch("rbds.services.rbds_manager.close_old_connections", new=lambda: None)
+class RBDSManagerFailedSendPreservesToggleTests(TestCase):
+    """A failed transmission must not be recorded as if it succeeded
+    -- 2026-08-02 second-opinion fix. The original one-shot A/B fix
+    updated _last_sent_ps/_last_sent_rt unconditionally right after
+    calling _send(), even though _send() swallows its own
+    transmission exceptions. A failed send of a real RT change was
+    therefore recorded as "sent"; the next tick's retry computed
+    rt_changed=False for a change the encoder never actually
+    received, and the eventual successful retry silently ate the A/B
+    toggle for it."""
+
+    def setUp(self):
+        self.mgr = RBDSManager()
+        self.sent_payloads = []
+        self.fail_next = False
+
+        def transmit(config, payload):
+            if self.fail_next:
+                self.fail_next = False
+                raise ConnectionError("simulated TCP failure")
+            self.sent_payloads.append(payload)
+
+        self.mgr._transmit = mock.Mock(side_effect=transmit)
+        self.mgr._read_category_state = mock.Mock(return_value={"pty_override": None, "ptyn": ""})
+        # Not testing CT here -- see RBDSManagerCtOnOffTests.
+        self.mgr._last_send_ct_state = False
+        config = RBDSConfig.load()
+        config.protocol = "uecp"
+        config.use_rt_plus = False
+        config.send_ct = False
+        config.save()
+
+    def _set_now_playing(self, title):
+        self.mgr._read_now_playing = mock.Mock(return_value={"title": title, "artist": ""})
+
+    def _last_rt_ab_bit(self):
+        frames = _split_uecp_frames(self.sent_payloads[-1])
+        rt = _find_mec(frames, 0x0A)
+        self.assertIsNotNone(rt)
+        return rt[4] & 0x01
+
+    def test_failed_first_send_then_successful_retry_still_toggles(self):
+        self._set_now_playing("First Song")
+        self.fail_next = True
+        self.mgr._tick()
+        self.assertEqual(self.sent_payloads, [], "a failed transmit must not be recorded as sent")
+
+        self.mgr._tick()  # retry, same pending RT change
+        self.assertEqual(len(self.sent_payloads), 1)
+        self.assertEqual(self._last_rt_ab_bit(), 1, "the pending change must still toggle A/B on the retry")
+
+    def test_last_sent_rt_does_not_advance_on_failure(self):
+        self._set_now_playing("Some Song")
+        self.fail_next = True
+        self.mgr._tick()
+        self.assertIsNone(self.mgr._last_sent_rt)
+
+    def test_last_full_resend_does_not_advance_on_failure(self):
+        self._set_now_playing("Some Song")
+        self.fail_next = True
+        before = self.mgr._last_full_resend
+        self.mgr._tick()
+        self.assertEqual(self.mgr._last_full_resend, before)
+
+    def test_initial_engine_send_fails_then_retry_succeeds(self):
+        # Engine just started (_last_sent_rt is still None) and the
+        # very first send fails -- the subsequent successful retry
+        # must still be treated as the "first" transmission (toggle=1),
+        # not silently skipped.
+        self._set_now_playing("Startup Song")
+        self.fail_next = True
+        self.mgr._tick()
+        self.assertEqual(self.sent_payloads, [])
+        self.mgr._tick()
+        self.assertEqual(len(self.sent_payloads), 1)
+        self.assertEqual(self._last_rt_ab_bit(), 1)
+
+
+class RBDSAfRuntimeBlockTests(SimpleTestCase):
+    """RBDSConfig.clean() blocks AF at the admin/form layer, but
+    Django's save() doesn't call clean() automatically -- a direct ORM
+    write, or a value already stored before validation existed, could
+    otherwise still reach the runtime payload. _build_uecp_payload
+    must independently refuse to ever emit the AF MEC, regardless of
+    whether clean() ran. 2026-08-02 second-opinion fix."""
+
+    def setUp(self):
+        self.mgr = RBDSManager()
+        self.config = mock.Mock(
+            pi_code="", ecc="", ta=False, tp=False,
+            di_dynamic_pty=False, di_compressed=False, di_artificial_head=False, di_stereo=True,
+            ms=True, pty=0, use_rt_plus=False,
+            af_frequencies_mhz="89.5, 91.3",  # bypasses clean() entirely -- a bare mock, not a real .save()
+            uecp_site_address=1, uecp_encoder_address=0,
+        )
+
+    def test_af_never_reaches_the_wire_even_when_configured(self):
+        payload = self.mgr._build_uecp_payload(self.config, "PS      ", "RT text")
+        frames = _split_uecp_frames(payload)
+        self.assertIsNone(_find_mec(frames, 0x13), "AF (MEC 0x13) must never be transmitted")
+
+    def test_other_content_still_sends_when_af_is_set(self):
+        # A stray/legacy AF value must not take down the rest of the
+        # payload -- only AF itself is skipped.
+        payload = self.mgr._build_uecp_payload(self.config, "TESTPS  ", "Test RT")
+        frames = _split_uecp_frames(payload)
+        self.assertIsNotNone(_find_mec(frames, 0x02))  # PS
+        self.assertIsNotNone(_find_mec(frames, 0x0A))  # RT

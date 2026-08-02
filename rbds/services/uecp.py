@@ -34,7 +34,7 @@ This project's single-station setup has no real use for anything but
 everywhere and aren't exposed as RBDSConfig fields (see rbds/models.py
 docstrings) rather than adding config surface nothing here needs yet.
 
-Text fields (PS/PTYN/RT/song-info) are encoded via
+Standards-defined text fields (PS/PTYN/RT) are encoded via
 rbds/services/charset.py's encode_rds_g0() -- the real RDS G0 table,
 NOT Latin-1. Confirmed via direct primary-source review (2026-08-02):
 the two are NOT the same encoding (e.g. G0 byte 0x24 is a generic
@@ -43,6 +43,12 @@ examples) -- an earlier version of this module used
 `.encode("latin-1", errors="replace")`, which would have sent the
 wrong glyph for every accented character and silently dropped anything
 outside Latin-1 entirely (curly quotes, em dashes, degree signs, etc).
+
+mec_song_info (MEC 0xAA) is the one exception, deliberately left on
+Latin-1 -- it's a reverse-engineered StereoTool vendor channel, not a
+standards-defined field, and switching IT to G0 too would be the same
+kind of unverified guess this file is otherwise careful to avoid. See
+that function's own docstring for the full reasoning.
 
 CRC verification note: the spec's own worked example for the CRC
 algorithm itself (Appendix 1, both the 1997 v5.1 and 2006 v6.02
@@ -434,8 +440,28 @@ def mec_song_info(text: str) -> bytes:
     Text is not truncated to 64 chars -- the capture had a 56-char
     weather message ("Temp: 86F | ... | DewPt: 69F") ride this MEC
     intact. StereoTool doesn't display 0xAA content directly, so its
-    length is bounded only by the outer UECP frame limit."""
-    text_bytes = encode_rds_g0(text)
+    length is bounded only by the outer UECP frame limit.
+
+    ENCODING (2026-08-02 review correction): still Latin-1, NOT the
+    verified RDS G0 table used everywhere else in this file. An
+    earlier revision of this fix switched this to encode_rds_g0()
+    too, on the reasoning that "it's an RDS-adjacent text field, so
+    the RDS encoding must be right" -- but that's exactly the kind of
+    unverified extension the rest of this module is careful to avoid:
+    the 2026-07-12 capture that established this MEC's byte layout
+    only ever carried plain ASCII (identical under G0/Latin-1/UTF-8
+    alike), so it provides zero evidence either way for non-ASCII
+    bytes. If anything, this MEC populating StereoTool's *internal
+    GUI-facing* Artist=/Title=/Song= fields (per this docstring's own
+    claim above) makes a display-oriented encoding MORE plausible
+    than raw G0 wire bytes, not less -- G0 is what StereoTool itself
+    should produce at the final on-air-bits stage, not necessarily
+    what it expects to receive into a text field. Left unchanged
+    pending a real bench test (per the outer review's explicit ask:
+    values whose G0/Latin-1/UTF-8 bytes actually differ, e.g. 'Ke$ha',
+    'Beyoncé', '75°F', observing StereoTool's internal fields and the
+    resulting on-air RT+), not guessed at a second time."""
+    text_bytes = text.encode("latin-1", errors="replace")
     length = 1 + len(text_bytes)
     return bytes([0xAA, length, 0xF0]) + text_bytes
 

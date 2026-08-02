@@ -175,15 +175,23 @@ class RBDSManager:
         # save mattered but was really just a lucky retry window.
         if changed or due_for_full_resend or not self._connected:
             effective_pty, effective_ptyn = self._effective_pty_ptyn(config)
-            self._send(config, target_ps, rt_text, rt_artist, rt_title, effective_pty, effective_ptyn,
-                       rt_ab_toggle=rt_changed)
-            self._last_sent_ps = target_ps
-            self._last_sent_rt = rt_text
-            self._last_full_resend = time.time()
-            # A full send just went out and includes the RT+ MECs, so
-            # count it as a fresh RT+ resend and let the 2s timer start
-            # counting from here rather than immediately re-firing.
-            self._last_rt_plus_resend = time.time()
+            send_ok = self._send(config, target_ps, rt_text, rt_artist, rt_title, effective_pty, effective_ptyn,
+                                  rt_ab_toggle=rt_changed)
+            # Only commit "what we last sent" on an actual successful
+            # transmission (2026-08-02 fix) -- see _send's own
+            # docstring. A failed send leaves _last_sent_ps/_last_sent_rt
+            # untouched so rt_changed still computes True on the next
+            # tick's retry, preserving the pending A/B toggle instead
+            # of silently discarding it.
+            if send_ok:
+                self._last_sent_ps = target_ps
+                self._last_sent_rt = rt_text
+                self._last_full_resend = time.time()
+                # A full send just went out and includes the RT+ MECs,
+                # so count it as a fresh RT+ resend and let the 2s
+                # timer start counting from here rather than
+                # immediately re-firing.
+                self._last_rt_plus_resend = time.time()
 
         # RT+ tag maintenance: on 2s cadence between full-sends, re-emit
         # only the RT+ MECs (ODA reg + tags + song info). Matches RDS
@@ -260,8 +268,13 @@ class RBDSManager:
             if message is None:
                 return "", None, None
             raw_text = normalize_text(self._resolve_message_text(message))
-            if message.rt_plus_delimiter and message.rt_plus_delimiter in raw_text:
-                artist, _, title = raw_text.partition(message.rt_plus_delimiter)
+            # Normalize the delimiter too, not just raw_text (2026-08-02
+            # fix) -- an admin could configure a smart-dash/quote
+            # delimiter that raw_text's own normalization would already
+            # have collapsed away, silently defeating the split.
+            delimiter = normalize_text(message.rt_plus_delimiter)
+            if delimiter and delimiter in raw_text:
+                artist, _, title = raw_text.partition(delimiter)
                 artist, title = artist.strip(), title.strip()
             else:
                 return raw_text[:64], None, None
@@ -285,7 +298,13 @@ class RBDSManager:
                 text = title
         else:
             text = f"{artist}{self.RT_PLUS_SEPARATOR}{title}"
-        return text[:64], None, None
+        # now_playing_format is an admin-configured template, not
+        # external content -- but artist/title being normalized
+        # doesn't make the FORMATTED RESULT safe if the template
+        # string itself contains a raw newline or smart-punctuation
+        # character typed directly into the admin field (2026-08-02
+        # fix). Re-normalize after formatting, not just before.
+        return normalize_text(text)[:64], None, None
 
     def _build_rt_plus_text(self, artist, title):
         """Builds the joined "artist - title" RT string AND the
@@ -371,6 +390,23 @@ class RBDSManager:
     # --- Sending ---
 
     def _send(self, config, ps, rt, artist, title, pty=None, ptyn="", rt_ab_toggle=False):
+        """Returns True only if the payload actually reached
+        _transmit() successfully. Callers MUST gate their own "what we
+        last sent" bookkeeping (_last_sent_ps/_last_sent_rt/etc.) on
+        this return value (2026-08-02 fix) -- _tick() previously
+        updated that bookkeeping unconditionally, so a failed send
+        (e.g. TCP down) still recorded the NEW rt_text as
+        "last sent." The next tick would then compute rt_changed=False
+        for a change the encoder never actually received, and the
+        eventual successful retry would send it with rt_ab_toggle=False
+        -- silently eating the A/B toggle for a real RT change.
+
+        Note: sendall() can still partially write a multi-frame UECP
+        payload before failing, so "reached _transmit() successfully"
+        isn't a hard guarantee every byte landed -- but treating any
+        exception as failure and preserving the pending edge is still
+        strictly better than the prior unconditional-success
+        assumption."""
         if pty is None:
             pty = config.pty
         try:
@@ -382,9 +418,10 @@ class RBDSManager:
         except Exception as exc:
             self._last_error = str(exc)
             self._mark_down()
-            return
+            return False
         self._mark_up()
         self._last_error = None
+        return True
 
     def _send_rt_plus_only(self, config, rt, artist, title):
         """Small write carrying only the RT+ MECs, each in its own
@@ -459,7 +496,12 @@ class RBDSManager:
         # from a previous track's category override) rather than only
         # sent when non-blank, so a stale PTYN never lingers into a
         # category with no override of its own.
-        meds.append(uecp.mec_ptyn(ptyn))
+        # normalize_text() first (2026-08-02 fix) -- an admin-typed
+        # Category.rbds_ptyn is never run through _resolve_rt_content,
+        # so without this a smart quote/dash in PTYN would fall
+        # through encode_rds_g0's unsupported-character space fallback
+        # instead of the plain-ASCII equivalent G0 actually supports.
+        meds.append(uecp.mec_ptyn(normalize_text(ptyn)))
         meds.append(uecp.mec_rt(rt, ab_flag=rt_ab_toggle))
         if config.use_rt_plus:
             # ODA registration rides every UECP send so a receiver
@@ -485,9 +527,22 @@ class RBDSManager:
                 # landing here (2026-08-02 fix, findings #4/#5).
                 meds.append(uecp.mec_rt_plus_tags_generic(len(rt)))
         if config.af_frequencies_mhz:
-            freqs = [float(f.strip()) for f in config.af_frequencies_mhz.split(",") if f.strip()]
-            if freqs:
-                meds.append(uecp.mec_af(freqs))
+            # Hard runtime block, not just RBDSConfig.clean() (which
+            # only guards the admin form) -- Django's save() doesn't
+            # call clean()/full_clean() on its own, so a direct ORM
+            # write or a pre-2026-08-02 stored value could otherwise
+            # still reach mec_af()'s known-incomplete AF list encoding
+            # on air. Skip only the AF MEC, not the whole payload --
+            # raising here would also drop the PS/RT/PTY/etc MECs
+            # already queued above for an unrelated config mistake in
+            # a field nothing currently uses.
+            from monitoring.models import emit_event
+            emit_event(
+                category="rbds", level="warning", title="AF transmission blocked",
+                detail={"af_frequencies_mhz": config.af_frequencies_mhz,
+                        "reason": "AF list encoding is not yet spec-conformant; see uecp.mec_af's docstring"},
+                dedupe_key="rbds|af-blocked",
+            )
         return self._frames_for(config, meds)
 
     def _frames_for(self, config, meds):
