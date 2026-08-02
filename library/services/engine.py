@@ -114,6 +114,15 @@ NEXT_HOUR_LOOKAHEAD_SECONDS = 30
 CACHE_WARM_LEAD_SECONDS = 3.0
 SILENCE_PRIME_SECONDS = 0.3
 DECK_STUCK_TIMEOUT_SECONDS = 30  # generous margin past a track's own duration before assuming its EOS was missed
+# How long after an actual seek (auto-resume or manual) an EOS is
+# treated with suspicion by _on_deck_eos_probed. Empirically measured
+# via an isolated throwaway-pipeline reproduction of the 2026-08-01
+# incident: a flushing KEY_UNIT seek into this station's compressed
+# library can trigger a transient gst_base_parse_finish_frame parser
+# hiccup, but the pipeline consistently finished renegotiating and
+# resumed normal real-time decoding within ~2.7s across 5/5 repro
+# runs -- 3.0s leaves a small margin over that observed settle time.
+SEEK_EOS_GUARD_SECONDS = 3.0
 SLOTS = ("A", "B")
 
 # Remote DJ over WebRTC.
@@ -316,6 +325,13 @@ class Deck:
         # failing cleanly), so these decks track position by wall clock
         # only instead (_get_deck_position).
         self.silence_primed = silence_primed
+        # time.time() of the most recently applied seek (auto-resume in
+        # _create_deck, or a manual _seek_deck/_resume_deck), or None if
+        # this deck has never been seeked. Read by _on_deck_eos_probed
+        # to scope its post-seek EOS-plausibility check to a short
+        # window right after an actual seek, rather than distrusting
+        # EOS for the deck's whole lifetime.
+        self.seeked_at = None
         # PlayEvent row id written at _create_deck; closed out (ended_at
         # + duration_played_seconds) at _remove_deck. None if the write
         # failed at deck creation -- in which case no close-out attempt
@@ -2201,14 +2217,35 @@ class PlaybackEngine:
         # hear a tiny chunk from position 0 before the seek lands.
         if _auto_resume_position_ns is not None:
             try:
-                deck.pipeline.seek_simple(
+                seek_ok = deck.pipeline.seek_simple(
                     Gst.Format.TIME,
                     Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT,
                     _auto_resume_position_ns,
                 )
-                # started_at drives _get_deck_position; adjust it so
-                # UI position readouts line up with the audio.
-                deck.started_at = time.time() - (_auto_resume_position_ns / Gst.SECOND)
+                if not seek_ok:
+                    # Confirmed via isolated repro of the 2026-08-01
+                    # incident that this does NOT catch the transient
+                    # post-seek parser hiccup (seek_simple still
+                    # returns True there) -- this path is for an
+                    # outright-rejected seek instead (e.g. wrong
+                    # pipeline state), a different, rarer failure mode
+                    # worth its own visibility.
+                    print(f"  [{slot}] Auto-resume seek to {_auto_resume_position_ns / Gst.SECOND:.1f}s rejected")
+                    emit_event(
+                        category="engine", level="error", title="Deck seek rejected",
+                        detail={"slot": slot, "track_id": track.id,
+                                "target_seconds": _auto_resume_position_ns / Gst.SECOND},
+                        dedupe_key=f"engine|seek-rejected|slot={slot}|track={track.id}",
+                    )
+                else:
+                    deck.seeked_at = time.time()
+                    # started_at drives _get_deck_position; adjust it
+                    # so UI position readouts line up with the audio.
+                    # Only when the seek actually succeeded -- a
+                    # rejected seek leaves the deck genuinely at 0,
+                    # and started_at was already set correctly for
+                    # that by the code above.
+                    deck.started_at = time.time() - (_auto_resume_position_ns / Gst.SECOND)
             except Exception as exc:
                 print(f"  Auto-resume seek failed (non-fatal): {exc}")
 
@@ -4405,11 +4442,20 @@ class PlaybackEngine:
             print(f"  [{slot}] Resume failed — could not recreate deck", flush=True)
             return
 
-        new_deck.pipeline.seek_simple(
+        seek_ok = new_deck.pipeline.seek_simple(
             Gst.Format.TIME,
             Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT,
             int(resume_position * Gst.SECOND),
         )
+        if seek_ok:
+            new_deck.seeked_at = time.time()
+        else:
+            print(f"  [{slot}] Resume seek to {resume_position:.1f}s rejected", flush=True)
+            emit_event(
+                category="engine", level="error", title="Deck seek rejected",
+                detail={"slot": slot, "track_id": new_deck.track.id, "target_seconds": resume_position},
+                dedupe_key=f"engine|seek-rejected|slot={slot}|track={new_deck.track.id}",
+            )
 
         with self._lock:
             self.decks[slot] = new_deck
@@ -4449,11 +4495,20 @@ class PlaybackEngine:
             print(f"  [{slot}] Seek failed — could not recreate deck", flush=True)
             return
 
-        new_deck.pipeline.seek_simple(
+        seek_ok = new_deck.pipeline.seek_simple(
             Gst.Format.TIME,
             Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT,
             int(position * Gst.SECOND),
         )
+        if seek_ok:
+            new_deck.seeked_at = time.time()
+        else:
+            print(f"  [{slot}] Seek to {position:.1f}s rejected", flush=True)
+            emit_event(
+                category="engine", level="error", title="Deck seek rejected",
+                detail={"slot": slot, "track_id": new_deck.track.id, "target_seconds": position},
+                dedupe_key=f"engine|seek-rejected|slot={slot}|track={new_deck.track.id}",
+            )
 
         with self._lock:
             self.decks[slot] = new_deck
@@ -4762,31 +4817,48 @@ class PlaybackEngine:
         # nothing audible happens from GStreamer's side -- but blindly
         # trusting it here tore the deck down and rebuilt it from
         # position 0, discarding the resume/seek position that had just
-        # been applied. A genuine EOS always arrives with position close
-        # to the track's own duration; one that arrives far short of it
-        # is almost certainly this parser artifact, not a real end of
-        # stream, and is safe to ignore -- GStreamer's own pipeline
-        # keeps decoding past the hiccup on its own, since nothing was
-        # torn down to prevent that. Same DECK_STUCK_TIMEOUT_SECONDS
-        # margin _check_stuck_decks already uses for the opposite
-        # direction (past duration with no EOS), reused here as "how
-        # much slop around the expected duration is plausible" either way.
-        duration = deck.track.duration_seconds or 0
-        if duration:
-            pos = self._get_deck_position(deck)
-            if pos < duration - DECK_STUCK_TIMEOUT_SECONDS:
-                print(f"  [{deck.slot}] Ignoring implausible EOS at {pos:.1f}s "
-                      f"(duration {duration:.1f}s) on {deck.track.title!r} -- "
-                      f"likely a post-seek parser hiccup, not a real end of stream")
-                emit_event(
-                    category="engine", level="warning", title="Ignored implausible EOS",
-                    detail={
-                        "slot": deck.slot, "track_id": deck.track.id, "track_title": deck.track.title,
-                        "position_seconds": round(pos, 1), "duration_seconds": round(duration, 1),
-                    },
-                    dedupe_key=f"engine|implausible-eos|slot={deck.slot}|track={deck.track.id}",
-                )
-                return
+        # been applied.
+        #
+        # Deliberately scoped to a short window right after an ACTUAL
+        # seek (deck.seeked_at), not the deck's whole lifetime -- an
+        # unseeked deck's EOS is trusted exactly as it always was.
+        # Reproduced this in isolation (throwaway pipeline, zero
+        # connection to the live engine, same file/seek offset as the
+        # incident): the parser assertion is 100% deterministic for
+        # that seek, but the pipeline itself recovered cleanly and
+        # resumed normal real-time decoding every single time (5/5
+        # runs), settling within ~2.7s -- SEEK_EOS_GUARD_SECONDS. That
+        # supports "ignore it" as reasonable for the reproduced case,
+        # but the real incident's full pipeline topology (linked into
+        # the live mixer, carrying this exact probe, under real
+        # concurrent engine-startup load) wasn't and can't safely be
+        # replicated in an isolated script -- if a deck genuinely goes
+        # silent after this fires, that's the next thing to chase.
+        recent_seek = deck.seeked_at is not None and (time.time() - deck.seeked_at) <= SEEK_EOS_GUARD_SECONDS
+        if recent_seek:
+            duration = deck.track.duration_seconds or 0
+            if duration:
+                # min(...) keeps the threshold from going negative (and
+                # so silently disabling the whole check) for anything
+                # shorter than DECK_STUCK_TIMEOUT_SECONDS -- station
+                # IDs, sweepers, WxAlert/UrgentPA inserts, dedication
+                # intros are ALL shorter than that 30s margin.
+                margin = min(DECK_STUCK_TIMEOUT_SECONDS, duration / 2)
+                pos = self._get_deck_position(deck)
+                if pos < duration - margin:
+                    print(f"  [{deck.slot}] Ignoring implausible post-seek EOS at {pos:.1f}s "
+                          f"(duration {duration:.1f}s) on {deck.track.title!r} -- "
+                          f"likely a post-seek parser hiccup, not a real end of stream")
+                    emit_event(
+                        category="engine", level="warning", title="Ignored implausible post-seek EOS",
+                        detail={
+                            "slot": deck.slot, "track_id": deck.track.id, "track_title": deck.track.title,
+                            "position_seconds": round(pos, 1), "duration_seconds": round(duration, 1),
+                            "seconds_since_seek": round(time.time() - deck.seeked_at, 1),
+                        },
+                        dedupe_key=f"engine|implausible-eos|slot={deck.slot}|track={deck.track.id}",
+                    )
+                    return
 
         self._handle_deck_finished(deck)
 
