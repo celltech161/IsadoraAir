@@ -1,7 +1,12 @@
-from django.test import SimpleTestCase
+from unittest import mock
 
-from rbds.services import ascii_protocol, uecp
+from django.core.exceptions import ValidationError
+from django.test import SimpleTestCase, TestCase
+
+from rbds.models import RBDSConfig, RBDSMessage, RBDSPSFrame
+from rbds.services import ascii_protocol, charset, uecp
 from rbds.services.content_fetch import ContentFetchCache
+from rbds.services.rbds_manager import RBDSManager
 from rbds.services.rotation import PSRotation, RTRotation
 
 
@@ -154,27 +159,32 @@ class UecpMecBuilderTests(SimpleTestCase):
         # <07><00><05><08> -- current data set, service 5, PTY=8.
         self.assertEqual(uecp.mec_pty(8, dsn=0x00, psn=0x05), bytes.fromhex("07000508"))
 
-    def test_mec_rt_matches_spec_examples(self):
-        # <0A><00><01><04><0B><52><44><53> -- current data set, service 1,
-        # flush buffer (bits6-5=00) + toggle A/B (bit0=1) -> flags=0x01,
-        # MEL=4 (1 flags byte + 3 text chars "RDS"), text "RDS".
-        result = uecp.mec_rt("RDS", ab_flag=True, dsn=0x00, psn=0x01)
-        # This module always uses buffer-config 0b01 ("add to buffer"),
-        # not the spec example's 0b00 ("flush") -- a deliberate choice
-        # documented in mec_rt's own docstring (this engine always sends
-        # one current message, not an on-device rotating buffer), so
-        # only the DSN/PSN/MEL/text/A-B-bit portions are checked against
-        # the spec example here, not the buffer-config bits.
-        self.assertEqual(result[0:3], bytes.fromhex("0A0001"))  # MEC DSN PSN
-        self.assertEqual(result[3], 4)  # MEL = 1 + len("RDS")
-        self.assertEqual(result[4] & 0x01, 1)  # A/B toggle bit
-        self.assertEqual(result[5:], b"RDS")
+    def test_mec_rt_matches_spec_example_full_flags_byte(self):
+        # <0A><00><01><04><00><52><44><53> -- current data set, service
+        # 1, buffer config = flush-then-load (bits6-5=00, confirmed
+        # directly against SPB490 p.31-32's own bit table 2026-08-02;
+        # 01/11 are RESERVED, 10 is "add to cyclic buffer" -- neither
+        # applies here since this engine sends one current message and
+        # does its own rotation in Python, not an on-device buffer),
+        # A/B toggle=0 (bit0), MEL=4 (1 flags byte + 3 text chars
+        # "RDS"), text "RDS". Checks the COMPLETE flags byte (not
+        # masked) -- a prior version of this module sent the RESERVED
+        # value 0b01 in bits 6-5, which byte-masked tests never caught.
+        result = uecp.mec_rt("RDS", ab_flag=False, dsn=0x00, psn=0x01)
+        self.assertEqual(result, bytes.fromhex("0A000104" "00" "524453"))
+
+    def test_mec_rt_flags_byte_never_reserved(self):
+        for text, ab in [("A", True), ("B", False), ("", True), ("x" * 64, False)]:
+            with self.subTest(text=text, ab=ab):
+                flags = uecp.mec_rt(text, ab_flag=ab)[4]
+                self.assertEqual(flags & 0x60, 0x00, "bits 6-5 must be 00 (flush); 01/11 are reserved")
+                self.assertEqual(flags & 0x9E, 0x00, "only bit0 may be set")
 
     def test_mec_rt_ab_flag(self):
         rt_off = uecp.mec_rt("Hello", ab_flag=False)
         rt_on = uecp.mec_rt("Hello", ab_flag=True)
-        self.assertEqual(rt_off[4] & 0x01, 0)
-        self.assertEqual(rt_on[4] & 0x01, 1)
+        self.assertEqual(rt_off[4], 0x00)
+        self.assertEqual(rt_on[4], 0x01)
         self.assertEqual(rt_off[5:], b"Hello")
         self.assertEqual(rt_off[3], 1 + len("Hello"))
 
@@ -207,6 +217,14 @@ class UecpMecBuilderTests(SimpleTestCase):
         offset_byte = result[8]
         self.assertEqual(offset_byte & 0x20, 0x20)  # sign bit = negative
         self.assertEqual(offset_byte & 0x1F, 10)     # 5h = 10 half-hours
+
+    def test_mec_ct_on_off_matches_spec_example(self):
+        # <19><01> -- spec section 3.3.39's own worked example: "enable
+        # transmission of type 4A group." Confirmed 2026-08-02: MEC
+        # 0x0D only sets the clock VALUE, this distinct command is what
+        # actually enables/disables 4A transmission.
+        self.assertEqual(uecp.mec_ct_on_off(True), bytes.fromhex("1901"))
+        self.assertEqual(uecp.mec_ct_on_off(False), bytes.fromhex("1900"))
 
     def test_freq_to_af_code(self):
         self.assertEqual(uecp.freq_to_af_code(87.6), 1)
@@ -529,3 +547,428 @@ class ContentFetchCacheTests(SimpleTestCase):
         cache = ContentFetchCache(clock=clock)
         self.assertEqual(cache.get("a", 30, lambda: "text A"), "text A")
         self.assertEqual(cache.get("b", 30, lambda: "text B"), "text B")
+
+
+class CharsetTests(SimpleTestCase):
+    """RDS's G0 character table (EN 50067:1998 Annex E) is NOT Latin-1
+    and NOT UTF-8 -- confirmed 2026-08-02 against redsea's reference
+    decode table (an independent, working RDS decoder implementation;
+    see charset.py's own docstring). These lock in the specific,
+    verified byte positions so a future edit can't silently drift back
+    to a Latin-1/ASCII assumption."""
+
+    def test_normalize_smart_quotes(self):
+        self.assertEqual(charset.normalize_text("‘Rock’ “n” Roll"), "'Rock' \"n\" Roll")
+
+    def test_normalize_dashes(self):
+        self.assertEqual(charset.normalize_text("A–B—C―D"), "A-B-C-D")
+
+    def test_normalize_ellipsis_expands_length(self):
+        # Deliberately changes string length -- this is why
+        # normalize_text() must run BEFORE any 64/8-char truncation or
+        # RT+ offset math, never after.
+        self.assertEqual(charset.normalize_text("Wait…"), "Wait...")
+        self.assertEqual(len(charset.normalize_text("…")), 3)
+
+    def test_normalize_strips_control_chars(self):
+        self.assertEqual(charset.normalize_text("Line1\r\nLine2\tTab\x00Nul"), "Line1  Line2 Tab Nul")
+
+    def test_normalize_embedded_newline_cannot_survive_to_ascii_command_injection(self):
+        # The concrete injection scenario finding #9 describes: a
+        # file/URL source's content contains an embedded newline that
+        # would otherwise inject a spurious extra "KEY=value" line
+        # into StereoTool's newline-delimited ASCII command stream.
+        malicious = "Normal Text\nPI=FFFF"
+        normalized = charset.normalize_text(malicious)
+        self.assertNotIn("\n", normalized)
+        self.assertEqual(normalized, "Normal Text PI=FFFF")
+
+    def test_encode_rds_g0_dollar_sign_is_not_ascii_byte(self):
+        # G0 byte 0x24 is the generic currency sign "¤", NOT '$' --
+        # '$' has its own distinct G0 code at 0xAB. Sending the naive
+        # ASCII/Latin-1 byte for '$' would render as "¤" on a real
+        # RDS receiver.
+        self.assertEqual(charset.encode_rds_g0("$"), bytes([0xAB]))
+        self.assertNotEqual(charset.encode_rds_g0("$"), bytes([0x24]))
+        self.assertEqual(charset.encode_rds_g0("¤"), bytes([0x24]))
+
+    def test_encode_rds_g0_accented_characters(self):
+        self.assertEqual(charset.encode_rds_g0("á"), bytes([0x80]))
+        self.assertEqual(charset.encode_rds_g0("Ñ"), bytes([0x8A]))
+        self.assertEqual(charset.encode_rds_g0("ñ"), bytes([0x9A]))
+        self.assertEqual(charset.encode_rds_g0("Café"), bytes([0x43, 0x61, 0x66, 0x82]))
+
+    def test_encode_rds_g0_euro_pound_degree(self):
+        self.assertEqual(charset.encode_rds_g0("€"), bytes([0xA9]))
+        self.assertEqual(charset.encode_rds_g0("£"), bytes([0xAA]))
+        self.assertEqual(charset.encode_rds_g0("75°F"), bytes([0x37, 0x35, 0xBB, 0x46]))
+
+    def test_encode_rds_g0_ampersand_and_plain_ascii_passthrough(self):
+        self.assertEqual(charset.encode_rds_g0("Rock & Roll 123"), b"Rock & Roll 123")
+
+    def test_encode_rds_g0_unsupported_chars_fall_back_predictably(self):
+        # Emoji / non-Latin scripts have no G0 representation --
+        # must become a predictable fallback byte (space, matching
+        # mec_ps/mec_ptyn's existing non-conforming-byte convention),
+        # never be silently dropped (dropping would shift every RT+
+        # offset computed against this same string).
+        self.assertEqual(charset.encode_rds_g0("A\U0001F600B"), b"A B")
+        self.assertEqual(charset.encode_rds_g0("日本語"), b"   ")
+
+    def test_encode_rds_g0_is_length_preserving(self):
+        for text in ["", "plain", "á€$日\U0001F600", "Wait..."]:
+            with self.subTest(text=text):
+                self.assertEqual(len(charset.encode_rds_g0(text)), len(text))
+
+    def test_space_encodes_to_real_space_byte(self):
+        # Several codes < 0x20 render as " " in the DECODE table
+        # purely as control-code display artifacts -- a literal space
+        # character must still map to the real space code 0x20, not
+        # one of those (the encode table deliberately excludes codes
+        # < 0x20 from consideration; see charset.py's own comment).
+        self.assertEqual(charset.encode_rds_g0(" "), bytes([0x20]))
+
+
+def _split_uecp_frames(payload):
+    """Splits a concatenated multi-frame UECP payload (as produced by
+    RBDSManager._frames_for -- one MEC per frame) into a list of raw,
+    unstuffed, CRC-verified MSG byte blocks, one per frame. General
+    frame parser (handles byte-stuffing properly, unlike a raw
+    substring search) so RBDSManager-level tests can decode exactly
+    what was queued for transmission."""
+    def unstuff(data):
+        out = bytearray()
+        i = 0
+        while i < len(data):
+            if data[i] == 0xFD:
+                marker = data[i + 1]
+                out.append({0x00: 0xFD, 0x01: 0xFE, 0x02: 0xFF}[marker])
+                i += 2
+            else:
+                out.append(data[i])
+                i += 1
+        return bytes(out)
+
+    frames = []
+    i = 0
+    while i < len(payload):
+        assert payload[i] == uecp.STA
+        j = i + 1
+        while payload[j] != uecp.STP:
+            j += 1
+        inner = unstuff(payload[i + 1:j])
+        core, crc = inner[:-2], inner[-2:]
+        assert uecp.crc_ccitt(core) == crc
+        mfl = core[3]
+        frames.append(core[4:4 + mfl])
+        i = j + 1
+    return frames
+
+
+def _find_mec(frames, mec, subtype=None):
+    """subtype disambiguates MEC 0x24, which carries both the RT+ ODA
+    registration (subtype byte 0x06) and RT+ tag data (subtype byte
+    0x16) as two DIFFERENT frames sharing the same outer MEC value."""
+    for msg in frames:
+        if msg and msg[0] == mec and (subtype is None or (len(msg) > 1 and msg[1] == subtype)):
+            return msg
+    return None
+
+
+class RtPlusTextBoundaryTests(SimpleTestCase):
+    """_build_rt_plus_text computes the final "artist - title" RT
+    string AND the artist/title substrings actually surviving
+    truncation to the 64-char RadioText limit FROM THAT SAME STRING --
+    the 2026-08-02 fix for findings #5 (offsets computed from
+    pre-truncation lengths could point past the end of the real
+    transmitted text)."""
+
+    def setUp(self):
+        self.mgr = RBDSManager()
+
+    def test_short_text_unaffected(self):
+        text, artist, title = self.mgr._build_rt_plus_text("Rush", "Tom Sawyer")
+        self.assertEqual(text, "Rush - Tom Sawyer")
+        self.assertEqual(artist, "Rush")
+        self.assertEqual(title, "Tom Sawyer")
+
+    def test_artist_nearly_filling_rt(self):
+        artist = "A" * 60
+        text, out_artist, out_title = self.mgr._build_rt_plus_text(artist, "X")
+        self.assertEqual(len(text), 64)
+        self.assertEqual(out_artist, artist)
+        self.assertEqual(out_title, "X")
+        self.assertTrue(text.startswith(out_artist))
+        self.assertTrue(text.endswith(out_title))
+
+    def test_title_partially_truncated(self):
+        artist = "A" * 10
+        title = "B" * 60
+        text, out_artist, out_title = self.mgr._build_rt_plus_text(artist, title)
+        self.assertEqual(len(text), 64)
+        self.assertEqual(out_artist, artist)
+        # 64 - 10 - len(" - ") = 51 chars of title survive.
+        self.assertEqual(out_title, "B" * 51)
+        self.assertEqual(text, artist + " - " + "B" * 51)
+        # Every start+length must remain inside the final text.
+        self.assertIn(out_artist, text)
+        self.assertIn(out_title, text)
+
+    def test_separator_truncated_omits_rt_plus(self):
+        artist = "A" * 63  # leaves only 1 char of " - " before the 64-char cap
+        text, out_artist, out_title = self.mgr._build_rt_plus_text(artist, "Title")
+        self.assertEqual(len(text), 64)
+        # Nothing meaningful survives for the title side -- omit
+        # rather than emit a broken/zero-length tag.
+        self.assertEqual(out_artist, "")
+        self.assertEqual(out_title, "")
+
+    def test_empty_surviving_title_omits(self):
+        artist = "A" * 61  # exactly fills through the separator, 0 chars of title survive
+        text, out_artist, out_title = self.mgr._build_rt_plus_text(artist, "Title")
+        self.assertEqual(out_artist, "")
+        self.assertEqual(out_title, "")
+
+    def test_omit_sentinel_is_empty_string_not_none(self):
+        # Distinguishable from "never had an artist/title concept"
+        # (None) -- see _build_rt_plus_text's own docstring for why
+        # this distinction matters (finding #4: don't let a degenerate
+        # song fall back to the generic non-song RT+ tag).
+        _, out_artist, out_title = self.mgr._build_rt_plus_text("A" * 63, "Title")
+        self.assertIsNotNone(out_artist)
+        self.assertIsNotNone(out_title)
+
+
+class RtPlusOmitVsGenericTests(SimpleTestCase):
+    """A real song whose artist doesn't fit the two-tag format (either
+    >32 chars, or "" after truncation defeated the split) must omit
+    RT+ entirely, NOT fall back to mec_rt_plus_tags_generic -- that tag
+    is reserved for genuinely non-song RT (weather/promo/station-ID/
+    file/url), and reusing it for a song mislabels it (finding #4)."""
+
+    def setUp(self):
+        self.mgr = RBDSManager()
+        self.config = mock.Mock(
+            pi_code="", ecc="", ta=False, tp=False,
+            di_dynamic_pty=False, di_compressed=False, di_artificial_head=False, di_stereo=True,
+            ms=True, pty=0, use_rt_plus=True, af_frequencies_mhz="",
+            uecp_site_address=1, uecp_encoder_address=0,
+        )
+
+    def _rt_plus_frames(self, rt, artist, title):
+        payload = self.mgr._build_uecp_payload(self.config, "PS      ", rt, artist, title)
+        return _split_uecp_frames(payload)
+
+    def test_normal_song_gets_two_tag_format(self):
+        frames = self._rt_plus_frames("Rush - Tom Sawyer", "Rush", "Tom Sawyer")
+        self.assertIsNotNone(_find_mec(frames, 0xAA))  # vendor song info
+        tags = _find_mec(frames, 0x24, subtype=0x16)
+        self.assertEqual(tags[2], 0x08)  # two-tag "song entry" marker
+
+    def test_long_artist_song_omits_rt_plus_entirely(self):
+        artist = "A" * 40  # exceeds the 32-char field limit
+        rt = f"{artist} - Title"
+        frames = self._rt_plus_frames(rt, artist, "Title")
+        self.assertIsNone(_find_mec(frames, 0xAA))
+        # Only the ODA registration MEC (0x24 subtype 0x06) may still
+        # ride along -- no tag data (subtype 0x16) for this send.
+        for msg in frames:
+            if msg and msg[0] == 0x24:
+                self.assertEqual(msg[1], 0x06, "no RT+ tag data may be sent for an omitted song")
+
+    def test_truncation_degenerated_song_omits_rt_plus_entirely(self):
+        # artist/title arrive here as "" (not None) -- the sentinel
+        # _build_rt_plus_text uses when truncation ate the split.
+        frames = self._rt_plus_frames("A" * 64, "", "")
+        self.assertIsNone(_find_mec(frames, 0xAA))
+        for msg in frames:
+            if msg and msg[0] == 0x24:
+                self.assertEqual(msg[1], 0x06)
+
+    def test_genuine_non_song_rt_gets_generic_tag(self):
+        # artist/title are None -- weather/promo/station-ID shape.
+        frames = self._rt_plus_frames("Temp: 86F, Wind: SE", None, None)
+        self.assertIsNone(_find_mec(frames, 0xAA))
+        tags = _find_mec(frames, 0x24, subtype=0x16)
+        self.assertIsNotNone(tags)
+        self.assertEqual(tags[2], 0x0B)  # single-tag "generic" marker
+
+
+@mock.patch("rbds.services.rbds_manager.close_old_connections", new=lambda: None)
+class RBDSManagerOneShotToggleTests(TestCase):
+    """SPB490 p.31: RT flags bit0 is a ONE-SHOT TOGGLE COMMAND ("0=do
+    not toggle, 1=toggle"), not a persistent state bit -- confirmed via
+    primary-source review 2026-08-02. rt_changed must be computed fresh
+    each tick and never re-sent as True for a resend of unchanged
+    text (the pre-fix behavior: a stored, flipped boolean kept getting
+    resent on every subsequent send, spuriously toggling A/B on every
+    receiver on every unconditional 30s full-resend of unchanged RT).
+
+    close_old_connections() is patched to a no-op for this whole class
+    -- calling the real one mid-_tick() closes the connection Django's
+    TestCase wraps in an atomic block, which is fine/intended in the
+    real long-running engine process but breaks the test transaction
+    here; it's pure connection-pool hygiene with no bearing on what
+    these tests actually verify."""
+
+    def setUp(self):
+        self.mgr = RBDSManager()
+        self.sent_payloads = []
+        self.mgr._transmit = mock.Mock(side_effect=lambda config, payload: self.sent_payloads.append(payload))
+        self.mgr._read_category_state = mock.Mock(return_value={"pty_override": None, "ptyn": ""})
+        config = RBDSConfig.load()
+        config.protocol = "uecp"
+        config.use_rt_plus = False
+        config.send_ct = False
+        config.save()
+        # Pre-seed so the (correct, separately-tested) CT On/Off
+        # first-tick send doesn't add an extra non-RT payload to
+        # self.sent_payloads and confuse "last payload sent" here --
+        # this class isn't testing CT at all (see RBDSManagerCtOnOffTests).
+        self.mgr._last_send_ct_state = False
+
+    def _set_now_playing(self, title, artist=""):
+        self.mgr._read_now_playing = mock.Mock(return_value={"title": title, "artist": artist})
+
+    def _last_rt_ab_bit(self):
+        frames = _split_uecp_frames(self.sent_payloads[-1])
+        rt = _find_mec(frames, 0x0A)
+        self.assertIsNotNone(rt, "expected an RT MEC in the last transmitted payload")
+        return rt[4] & 0x01
+
+    def test_first_new_rt_toggles(self):
+        self._set_now_playing("First Song")
+        self.mgr._tick()
+        self.assertEqual(self._last_rt_ab_bit(), 1)
+
+    def test_second_different_rt_also_toggles(self):
+        self._set_now_playing("First Song")
+        self.mgr._tick()
+        self._set_now_playing("Second Song")
+        self.mgr._tick()
+        self.assertEqual(self._last_rt_ab_bit(), 1)
+
+    def test_unchanged_periodic_full_resend_does_not_toggle(self):
+        self._set_now_playing("Same Song")
+        self.mgr._tick()
+        self.assertEqual(self._last_rt_ab_bit(), 1)
+        # Force the 30s full-resend gate open without waiting 30s and
+        # without changing now-playing at all.
+        self.mgr._last_full_resend = 0.0
+        self.mgr._tick()
+        self.assertEqual(len(self.sent_payloads), 2, "the forced full-resend must still have sent")
+        self.assertEqual(self._last_rt_ab_bit(), 0, "unchanged RT resend must NOT toggle A/B")
+
+    def test_reconnect_resend_of_unchanged_rt_does_not_toggle(self):
+        self._set_now_playing("Same Song")
+        self.mgr._tick()
+        self.assertEqual(self._last_rt_ab_bit(), 1)
+        # Simulate "just reconnected" -- _connected is False, forcing
+        # a send even though nothing (including RT) changed.
+        self.mgr._connected = False
+        self.mgr._tick()
+        self.assertEqual(len(self.sent_payloads), 2)
+        self.assertEqual(self._last_rt_ab_bit(), 0, "reconnect resend of unchanged RT must NOT toggle A/B")
+
+
+@mock.patch("rbds.services.rbds_manager.close_old_connections", new=lambda: None)
+class RBDSManagerCtOnOffTests(TestCase):
+    """MEC 0x19 (CT On/Off) is distinct from MEC 0x0D (Real time clock,
+    value only) -- confirmed via primary-source review 2026-08-02 (see
+    uecp.mec_ct_on_off's docstring). RBDSManager must send the explicit
+    enable/disable whenever the operator's send_ct setting changes."""
+
+    def setUp(self):
+        self.mgr = RBDSManager()
+        self.sent = []
+        self.mgr._transmit = mock.Mock(side_effect=lambda config, payload: self.sent.append(payload))
+        self.mgr._read_now_playing = mock.Mock(return_value={"title": "", "artist": ""})
+        self.mgr._read_category_state = mock.Mock(return_value={"pty_override": None, "ptyn": ""})
+        self.config = RBDSConfig.load()
+        self.config.protocol = "uecp"
+        self.config.use_rt_plus = False
+
+    def _ct_on_off_values_sent(self):
+        values = []
+        for payload in self.sent:
+            for msg in _split_uecp_frames(payload):
+                if msg and msg[0] == 0x19:
+                    values.append(msg[1])
+        return values
+
+    def test_enabling_send_ct_sends_enable(self):
+        self.config.send_ct = True
+        self.config.save()
+        self.mgr._tick()
+        self.assertEqual(self._ct_on_off_values_sent(), [0x01])
+
+    def test_disabling_after_enabled_sends_disable(self):
+        self.config.send_ct = True
+        self.config.save()
+        self.mgr._tick()
+        self.config.send_ct = False
+        self.config.save()
+        self.mgr._tick()
+        self.assertEqual(self._ct_on_off_values_sent(), [0x01, 0x00])
+
+    def test_unchanged_send_ct_does_not_resend_on_off(self):
+        self.config.send_ct = True
+        self.config.save()
+        self.mgr._tick()
+        self.mgr._last_full_resend = 0.0  # force an unrelated full resend
+        self.mgr._tick()
+        self.assertEqual(self._ct_on_off_values_sent(), [0x01], "on/off must only send on an actual state change")
+
+
+class RBDSConfigValidationTests(SimpleTestCase):
+    def test_af_frequencies_blocked(self):
+        config = RBDSConfig(af_frequencies_mhz="89.5, 91.3")
+        with self.assertRaises(ValidationError):
+            config.clean()
+
+    def test_blank_af_frequencies_ok(self):
+        config = RBDSConfig(af_frequencies_mhz="", pi_code="", ecc="")
+        config.clean()  # must not raise
+
+    def test_uecp_site_address_out_of_range_rejected(self):
+        config = RBDSConfig(uecp_site_address=1024, uecp_encoder_address=0)
+        with self.assertRaises(ValidationError):
+            config.clean()
+
+    def test_uecp_encoder_address_out_of_range_rejected(self):
+        config = RBDSConfig(uecp_site_address=1, uecp_encoder_address=64)
+        with self.assertRaises(ValidationError):
+            config.clean()
+
+    def test_valid_addresses_accepted(self):
+        config = RBDSConfig(uecp_site_address=1023, uecp_encoder_address=63, pi_code="", ecc="")
+        config.clean()  # must not raise
+
+    def test_ta_without_tp_rejected(self):
+        config = RBDSConfig(ta=True, tp=False, pi_code="", ecc="")
+        with self.assertRaises(ValidationError):
+            config.clean()
+
+    def test_ta_with_tp_accepted(self):
+        config = RBDSConfig(ta=True, tp=True, pi_code="", ecc="")
+        config.clean()  # must not raise
+
+    def test_ta_false_never_requires_tp(self):
+        config = RBDSConfig(ta=False, tp=False, pi_code="", ecc="")
+        config.clean()  # must not raise
+
+
+class RBDSPSFrameValidationTests(SimpleTestCase):
+    def test_hold_seconds_below_floor_rejected(self):
+        frame = RBDSPSFrame(text="TEST", hold_seconds=1)
+        with self.assertRaises(ValidationError):
+            frame.clean()
+
+    def test_hold_seconds_zero_rejected(self):
+        frame = RBDSPSFrame(text="TEST", hold_seconds=0)
+        with self.assertRaises(ValidationError):
+            frame.clean()
+
+    def test_hold_seconds_at_floor_accepted(self):
+        frame = RBDSPSFrame(text="TEST", hold_seconds=4)
+        frame.clean()  # must not raise

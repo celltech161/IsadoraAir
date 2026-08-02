@@ -21,6 +21,7 @@ from django.db import close_old_connections  # noqa: E402
 
 from rbds.models import RBDSConfig, RBDSMessage, RBDSPSFrame  # noqa: E402
 from rbds.services import ascii_protocol, uecp  # noqa: E402
+from rbds.services.charset import normalize_text  # noqa: E402
 from rbds.services.content_fetch import ContentFetchCache  # noqa: E402
 from rbds.services.rotation import PSRotation, RTRotation  # noqa: E402
 
@@ -62,7 +63,6 @@ class RBDSManager:
         self._backoff_index = 0
         self._last_sent_ps = None
         self._last_sent_rt = None
-        self._rt_ab_flag = False
         self._last_full_resend = 0.0
         self._last_rt_plus_resend = 0.0
         self._last_error = None
@@ -76,6 +76,13 @@ class RBDSManager:
         # be transmitted at :00 seconds of the given minute). Reset to
         # None on init so the very first tick fires an immediate CT.
         self._last_ct_sent_minute = None
+        # Tracks the last CT On/Off (MEC 0x19) state actually sent, so
+        # a config change (either direction) gets the explicit enable/
+        # disable command once, immediately -- not just inferred from
+        # whether mec_ct itself happens to still be sent. None on init
+        # so the very first tick always sends an explicit state
+        # rather than assuming the encoder's own prior state.
+        self._last_send_ct_state = None
 
     def start(self):
         self.running = True
@@ -125,7 +132,7 @@ class RBDSManager:
         ps_frames = list(
             RBDSPSFrame.objects.filter(enabled=True).order_by("sort_order").values_list("text", "hold_seconds")
         )
-        target_ps = self._ps_rotation.advance(ps_frames) or config.station_ps or ""
+        target_ps = normalize_text(self._ps_rotation.advance(ps_frames) or config.station_ps or "")
 
         today = datetime.date.today()
         messages = list(RBDSMessage.objects.filter(enabled=True).order_by("sort_order"))
@@ -139,11 +146,19 @@ class RBDSManager:
             config, now_playing, rt_source, rt_source_name, messages_by_name,
         )
 
-        changed = target_ps != self._last_sent_ps or rt_text != self._last_sent_rt
+        # rt_changed drives the RT A/B toggle bit as a ONE-SHOT EDGE
+        # SIGNAL (SPB490 p.31: bit0 = "toggle now", not "the flag's
+        # resulting state" -- confirmed via primary-source review
+        # 2026-08-02). It must be computed fresh here and passed
+        # straight through to _send() rather than stored as a flipped
+        # persistent boolean -- the prior version's stored
+        # self._rt_ab_flag stayed True across every subsequent send
+        # once flipped, so the unconditional 30s full-resend below
+        # (and every RT+ maintenance resend) kept re-toggling A/B on
+        # every receiver even when RT hadn't changed at all.
+        rt_changed = rt_text != self._last_sent_rt
+        changed = target_ps != self._last_sent_ps or rt_changed
         due_for_full_resend = (time.time() - self._last_full_resend) >= FULL_RESEND_SECONDS
-
-        if rt_text != self._last_sent_rt:
-            self._rt_ab_flag = not self._rt_ab_flag
 
         # While disconnected, retry every tick rather than waiting for the
         # 30s full-resend window -- _ensure_tcp_connected()'s own
@@ -160,7 +175,8 @@ class RBDSManager:
         # save mattered but was really just a lucky retry window.
         if changed or due_for_full_resend or not self._connected:
             effective_pty, effective_ptyn = self._effective_pty_ptyn(config)
-            self._send(config, target_ps, rt_text, rt_artist, rt_title, effective_pty, effective_ptyn)
+            self._send(config, target_ps, rt_text, rt_artist, rt_title, effective_pty, effective_ptyn,
+                       rt_ab_toggle=rt_changed)
             self._last_sent_ps = target_ps
             self._last_sent_rt = rt_text
             self._last_full_resend = time.time()
@@ -189,6 +205,22 @@ class RBDSManager:
                 # trip the connection state or drown _last_error the way
                 # a main-payload failure would. Surface it quietly.
                 self._last_error = f"RT+ resend failed: {exc}"
+
+        # MEC 0x0D ("Real time clock") only SETS the clock value -- it
+        # is a distinct command from MEC 0x19 ("CT On/Off"), which is
+        # what actually enables/disables type 4A group transmission
+        # (SPB490 section 3.3.39, confirmed via primary-source review
+        # 2026-08-02). Send the explicit enable/disable whenever the
+        # operator's setting changes, so turning Send Clock Time off
+        # actually stops 4A instead of just stopping this engine's own
+        # periodic 0x0D sends (which alone says nothing about whether
+        # the encoder should still be transmitting 4A on its own).
+        if config.protocol == "uecp" and config.send_ct != self._last_send_ct_state:
+            try:
+                self._send_ct_on_off(config, config.send_ct)
+                self._last_send_ct_state = config.send_ct
+            except Exception as exc:
+                self._last_error = f"CT on/off send failed: {exc}"
 
         # Dedicated CT send at minute boundaries -- see _send_ct
         # docstring for why this can't ride along with the content
@@ -221,13 +253,13 @@ class RBDSManager:
         positions). now_playing_format is only honored when RT+ isn't
         in play."""
         if rt_source == "nowplaying":
-            title = now_playing.get("title", "") or ""
-            artist = now_playing.get("artist", "") or ""
+            title = normalize_text(now_playing.get("title", "") or "")
+            artist = normalize_text(now_playing.get("artist", "") or "")
         else:
             message = messages_by_name.get(rt_source_name)
             if message is None:
                 return "", None, None
-            raw_text = self._resolve_message_text(message)
+            raw_text = normalize_text(self._resolve_message_text(message))
             if message.rt_plus_delimiter and message.rt_plus_delimiter in raw_text:
                 artist, _, title = raw_text.partition(message.rt_plus_delimiter)
                 artist, title = artist.strip(), title.strip()
@@ -244,8 +276,7 @@ class RBDSManager:
             # (StereoTool vendor "song info") in _build_uecp_payload,
             # populating StereoTool's internal Artist=/Title=/Song=
             # fields which its own RT+ generator reads from.
-            text = f"{artist}{self.RT_PLUS_SEPARATOR}{title}"[:64]
-            return text, artist, title
+            return self._build_rt_plus_text(artist, title)
 
         if rt_source == "nowplaying":
             try:
@@ -255,6 +286,35 @@ class RBDSManager:
         else:
             text = f"{artist}{self.RT_PLUS_SEPARATOR}{title}"
         return text[:64], None, None
+
+    def _build_rt_plus_text(self, artist, title):
+        """Builds the joined "artist - title" RT string AND the
+        artist/title substrings that actually survive truncation to
+        the 64-char RadioText limit -- both computed from the SAME
+        final string (2026-08-02 fix). The prior version truncated
+        `text` but still handed the ORIGINAL, untruncated artist/title
+        lengths to the RT+ tag builders, which could produce a tag
+        whose start+length pointed past the end of what was actually
+        transmitted.
+
+        Returns (text, artist, title) normally. If truncation defeats
+        the split entirely (separator cut away, or nothing survives
+        for one side), returns (text, "", "") -- empty strings, NOT
+        None -- so callers can tell "was a song but truncation ate it"
+        (via `is ""`, omit RT+ entirely) apart from "never had an
+        artist/title concept to begin with" (via `is None`, e.g.
+        weather/promo text -- safe to use the generic whole-RT tag
+        instead). See mec_rt_plus_tags_generic's docstring for why
+        conflating those two cases would be wrong."""
+        full = f"{artist}{self.RT_PLUS_SEPARATOR}{title}"
+        text = full[:64]
+        sep_start = len(artist)
+        sep_end = sep_start + len(self.RT_PLUS_SEPARATOR)
+        surviving_artist = text[:sep_start]
+        surviving_title = text[sep_end:]
+        if not surviving_artist or not surviving_title:
+            return text, "", ""
+        return text, surviving_artist, surviving_title
 
     def _resolve_message_text(self, message):
         if message.source_type == "static":
@@ -310,12 +370,12 @@ class RBDSManager:
 
     # --- Sending ---
 
-    def _send(self, config, ps, rt, artist, title, pty=None, ptyn=""):
+    def _send(self, config, ps, rt, artist, title, pty=None, ptyn="", rt_ab_toggle=False):
         if pty is None:
             pty = config.pty
         try:
             if config.protocol == "uecp":
-                payload = self._build_uecp_payload(config, ps, rt, artist, title, pty, ptyn)
+                payload = self._build_uecp_payload(config, ps, rt, artist, title, pty, ptyn, rt_ab_toggle)
             else:
                 payload = self._build_ascii_payload(config, ps, rt, artist, title, pty)
             self._transmit(config, payload)
@@ -336,13 +396,22 @@ class RBDSManager:
             meds.append(uecp.mec_rt_plus_tags(len(artist), len(title)))
             meds.append(uecp.mec_song_info(
                 f"{artist}{self.RT_PLUS_SEPARATOR}{title}"))
-        elif rt:
+        elif artist is None and title is None and rt:
+            # Genuinely non-song RT (weather/promo/station-ID/file/url)
+            # -- see mec_rt_plus_tags_generic's docstring. A song whose
+            # split degenerated to "" (truncation defeated it) or
+            # whose artist exceeded the 32-char field limit falls
+            # through here on purpose and sends NOTHING, rather than
+            # borrowing this non-song tag for it (2026-08-02 fix,
+            # findings #4/#5 -- `artist`/`title` are "" not None in
+            # that case, see _build_rt_plus_text's docstring).
             meds.append(uecp.mec_rt_plus_tags_generic(len(rt)))
         else:
             return  # nothing to (re-)send
         self._transmit(config, self._frames_for(config, meds))
 
-    def _build_uecp_payload(self, config, ps, rt, artist=None, title=None, pty=None, ptyn=""):
+    def _build_uecp_payload(self, config, ps, rt, artist=None, title=None, pty=None, ptyn="",
+                             rt_ab_toggle=False):
         """Assemble the full UECP payload as ONE MEC PER UECP FRAME
         (concatenated back-to-back for a single TCP write). Not one
         big multi-MEC frame -- observed live behavior of RDS Magic 4
@@ -391,7 +460,7 @@ class RBDSManager:
         # sent when non-blank, so a stale PTYN never lingers into a
         # category with no override of its own.
         meds.append(uecp.mec_ptyn(ptyn))
-        meds.append(uecp.mec_rt(rt, ab_flag=self._rt_ab_flag))
+        meds.append(uecp.mec_rt(rt, ab_flag=rt_ab_toggle))
         if config.use_rt_plus:
             # ODA registration rides every UECP send so a receiver
             # that catches us mid-broadcast learns "RT+ (AID 0x4BD7)
@@ -403,14 +472,17 @@ class RBDSManager:
                 meds.append(uecp.mec_rt_plus_tags(len(artist), len(title)))
                 meds.append(uecp.mec_song_info(
                     f"{artist}{self.RT_PLUS_SEPARATOR}{title}"))
-            elif rt:
-                # Non-song RT (weather / promo / station ID /
-                # long-artist fallback). Emit a single tag that
-                # covers the whole RT so receivers apply an
-                # appropriate content type instead of falling back
-                # to the previous song's stale artist/title
-                # offsets. Confirmed byte-for-byte against RDS
-                # Magic 4's live output on 2026-07-13.
+            elif artist is None and title is None and rt:
+                # Genuinely non-song RT (weather / promo / station ID /
+                # file / url content). Emit a single tag that covers
+                # the whole RT so receivers don't fall back to the
+                # previous song's stale artist/title offsets -- see
+                # mec_rt_plus_tags_generic's own docstring for what
+                # this does and does NOT confirm about its content
+                # type. A song whose artist didn't fit (>32 chars, or
+                # "" after truncation defeated the split -- see
+                # _build_rt_plus_text) omits RT+ entirely instead of
+                # landing here (2026-08-02 fix, findings #4/#5).
                 meds.append(uecp.mec_rt_plus_tags_generic(len(rt)))
         if config.af_frequencies_mhz:
             freqs = [float(f.strip()) for f in config.af_frequencies_mhz.split(",") if f.strip()]
@@ -479,14 +551,28 @@ class RBDSManager:
         )
         self._transmit(config, frame)
 
+    def _send_ct_on_off(self, config, enabled):
+        """MEC 0x19 -- distinct from _send_ct's MEC 0x0D, see _tick's
+        call site for why both exist. Own frame/SQC, same connection
+        as everything else in this class."""
+        self._sqc = (self._sqc % 255) + 1
+        msg = uecp.mec_ct_on_off(enabled)
+        frame = uecp.build_frame(
+            config.uecp_site_address, config.uecp_encoder_address, self._sqc, msg,
+        )
+        self._transmit(config, frame)
+
     def _build_ascii_payload(self, config, ps, rt, artist, title, pty=None):
-        # rt is guaranteed by _resolve_rt_content() to be exactly
-        # f"{artist}{RT_PLUS_SEPARATOR}{title}" (truncated to 64 chars)
-        # whenever artist/title are both non-None, so tag offsets are
-        # known exactly -- no substring search needed. If truncation cut
-        # into the title, len(title) may overstate what actually
-        # survived; an accepted edge-case limitation for very long text,
-        # not worth extra complexity for v1.
+        # rt is guaranteed by _resolve_rt_content()/_build_rt_plus_text()
+        # to be exactly f"{artist}{RT_PLUS_SEPARATOR}{title}" (truncated
+        # to 64 chars) whenever artist/title are both non-empty, and
+        # artist/title themselves are already the POST-truncation
+        # survivors (2026-08-02 fix) -- so tag offsets computed below
+        # are always within the actual transmitted `rt`, never past its
+        # end. `artist`/`title` are "" (not None) rather than falsy-and-
+        # absent when a song's split was truncated away entirely (see
+        # _build_rt_plus_text's docstring), which the `if artist and
+        # title:` check below already correctly treats as "omit."
         rt_plus_tags = None
         if config.use_rt_plus and artist and title:
             artist_start = 0
@@ -502,6 +588,16 @@ class RBDSManager:
             di_artificial_head=config.di_artificial_head, di_stereo=config.di_stereo,
             rt_plus_tags=rt_plus_tags,
         )
+        # UTF-8 here (unlike the UECP path's now-verified RDS G0
+        # encoding, see charset.py) is a deliberate scope limit, not
+        # an oversight: whether StereoTool's ASCII-mode parser expects
+        # UTF-8 text (converting to G0 internally) or literal G0 bytes
+        # over this same socket is genuinely unverified from this box
+        # -- production runs UECP, not ASCII, so there's no live
+        # behavior to observe either. Text IS still run through
+        # normalize_text() upstream (smart quotes/dashes/ellipsis/
+        # control chars) regardless of final byte encoding -- see
+        # rbds_manager.py's _resolve_rt_content and _tick.
         return ("\n".join(commands) + "\n").encode("utf-8")
 
     def _transmit(self, config, payload):

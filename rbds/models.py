@@ -165,18 +165,33 @@ class RBDSConfig(models.Model):
         if self.ecc and not re.fullmatch(r"[0-9A-Fa-f]{2}", self.ecc):
             errors["ecc"] = "Enter exactly 2 hex digits, e.g. A0, or leave blank."
         if self.af_frequencies_mhz:
-            for raw in self.af_frequencies_mhz.split(","):
-                raw = raw.strip()
-                if not raw:
-                    continue
-                try:
-                    freq = float(raw)
-                except ValueError:
-                    errors["af_frequencies_mhz"] = f"'{raw}' isn't a number."
-                    break
-                if not (87.6 <= freq <= 107.9):
-                    errors["af_frequencies_mhz"] = f"{freq} MHz is out of range (87.6-107.9)."
-                    break
+            # mec_af()'s AF *data* encoding is a known, documented
+            # simplification (flat frequency-code list) that does NOT
+            # match the real Method A list structure confirmed against
+            # SPB490's own worked example (2026-08-02 primary-source
+            # review: that example's data bytes decode as [count-byte]
+            # [freq][freq][filler], not a flat list) -- sending it as-is
+            # risks a malformed AF list on air. Blocked here until the
+            # real Method A framing is implemented and verified; see
+            # rbds/services/uecp.py's mec_af docstring for the detail.
+            errors["af_frequencies_mhz"] = (
+                "AF is not currently sendable: the AF list encoding in "
+                "this version doesn't match the real RDS Method A frame "
+                "structure and would likely produce a malformed AF list "
+                "on air. Leave blank until this is implemented and "
+                "verified against a real receiver/decoder."
+            )
+        if not (0 <= self.uecp_site_address <= 1023):
+            errors["uecp_site_address"] = "UECP site address must be 0-1023 (10 bits)."
+        if not (0 <= self.uecp_encoder_address <= 63):
+            errors["uecp_encoder_address"] = "UECP encoder address must be 0-63 (6 bits)."
+        if self.ta and not self.tp:
+            # TA is only meaningful on a Traffic Programme service --
+            # per RDS/RBDS convention a receiver's TA-triggered
+            # traffic-announcement switching logic is scoped to TP
+            # services; TA=1 on a non-TP service is a contradiction,
+            # not merely unusual.
+            errors["ta"] = "Traffic Announcement requires Traffic Programme (TP) to also be set."
         if errors:
             raise ValidationError(errors)
 
@@ -206,13 +221,26 @@ class RBDSPSFrame(models.Model):
     enabled = models.BooleanField(default=True)
     sort_order = models.PositiveSmallIntegerField(default=0)
     hold_seconds = models.PositiveSmallIntegerField(
-        default=8, help_text="How long this frame stays on-air before rotating to the next.",
+        default=8, help_text="How long this frame stays on-air before rotating to the next "
+                              "(minimum 4 seconds).",
     )
+
+    MIN_HOLD_SECONDS = 4  # PositiveSmallIntegerField alone allows 0 -- a
+    # near-0 hold would rotate PS almost every tick, which most
+    # receivers' own PS-refresh/decode timing can't track cleanly.
+    # No specific NRSC minimum is cited here (none found) -- 4s is a
+    # conservative floor, not a standards citation.
 
     class Meta:
         ordering = ["sort_order", "id"]
         verbose_name = "PS Rotation Frame"
         verbose_name_plural = "PS Rotation Frames"
+
+    def clean(self):
+        if self.hold_seconds < self.MIN_HOLD_SECONDS:
+            raise ValidationError({
+                "hold_seconds": f"Must be at least {self.MIN_HOLD_SECONDS} seconds.",
+            })
 
     def __str__(self):
         return self.text

@@ -34,6 +34,16 @@ This project's single-station setup has no real use for anything but
 everywhere and aren't exposed as RBDSConfig fields (see rbds/models.py
 docstrings) rather than adding config surface nothing here needs yet.
 
+Text fields (PS/PTYN/RT/song-info) are encoded via
+rbds/services/charset.py's encode_rds_g0() -- the real RDS G0 table,
+NOT Latin-1. Confirmed via direct primary-source review (2026-08-02):
+the two are NOT the same encoding (e.g. G0 byte 0x24 is a generic
+currency sign, not '$'; see charset.py's own docstring for more
+examples) -- an earlier version of this module used
+`.encode("latin-1", errors="replace")`, which would have sent the
+wrong glyph for every accented character and silently dropped anything
+outside Latin-1 entirely (curly quotes, em dashes, degree signs, etc).
+
 CRC verification note: the spec's own worked example for the CRC
 algorithm itself (Appendix 1, both the 1997 v5.1 and 2006 v6.02
 revisions) contains a literal typo -- "2D111234010105ABCD123F0XXXX11069
@@ -48,6 +58,8 @@ same four parameters: poly 0x1021, init 0xFFFF, no reflection, xorout
 0xFFFF). See rbds/tests.py for both checks.
 """
 import struct
+
+from rbds.services.charset import encode_rds_g0
 
 STA = 0xFE
 STP = 0xFF
@@ -167,8 +179,7 @@ def mec_ptyn(text: str, dsn: int = 0x00, psn: int = 0x00) -> bytes:
     Spec example: <3E><00><02><46><6F><6F><74><62><61><6C><6C> --
     current data set, service 2, PTYN="Football"."""
     padded = text[:8].ljust(8)
-    med = bytes(b if 0x20 <= b <= 0xFE else 0x20 for b in padded.encode("latin-1", errors="replace"))
-    return bytes([0x3E, dsn, psn]) + med
+    return bytes([0x3E, dsn, psn]) + encode_rds_g0(padded)
 
 
 def mec_ps(text: str, dsn: int = 0x00, psn: int = 0x00) -> bytes:
@@ -177,8 +188,7 @@ def mec_ps(text: str, dsn: int = 0x00, psn: int = 0x00) -> bytes:
     replaced with a space rather than silently sent as invalid bytes).
     Spec example: <02><00><02><52><41><44><49><4F><20><31><20>."""
     padded = text[:8].ljust(8)
-    med = bytes(b if 0x20 <= b <= 0xFE else 0x20 for b in padded.encode("latin-1", errors="replace"))
-    return bytes([0x02, dsn, psn]) + med
+    return bytes([0x02, dsn, psn]) + encode_rds_g0(padded)
 
 
 def mec_ta_tp(ta: bool, tp: bool, dsn: int = 0x00, psn: int = 0x00) -> bytes:
@@ -216,18 +226,32 @@ def mec_pty(pty: int, dsn: int = 0x00, psn: int = 0x00) -> bytes:
 
 def mec_rt(text: str, ab_flag: bool, dsn: int = 0x00, psn: int = 0x00) -> bytes:
     """MEC 0x0A -- RadioText. Format: MEC DSN PSN MEL MED(flags byte,
-    then up to 64 text chars). MEL = 1 (flags byte) + len(text). The
-    flags byte's bit0 is the A/B toggle flag -- must flip whenever the
-    transmitted text actually changes, so receivers know to refresh
-    their display; bits 6-5 are buffer config (0b01 = flush-then-load,
-    matches this project's single-current-message use, not a rotating
-    on-device buffer -- rotation is handled by rbds_manager.py itself).
-    Spec example: <0A><00><01><05><51><74><65><78><74> (flush+toggle
-    A/B, text 'text')."""
+    then up to 64 text chars). MEL = 1 (flags byte) + len(text).
+
+    Flags byte, confirmed directly against SPB490 p.31-32's own bit
+    table (2026-08-02 primary-source review):
+      bit 0: A/B flag status control -- 0=do not toggle, 1=toggle.
+        This is a ONE-SHOT EDGE COMMAND, not "the flag's resulting
+        value" -- callers must pass True only on the exact send where
+        the transmitted text actually changed, never on a periodic
+        resend of unchanged text (that would spuriously toggle A/B on
+        every receiver for no reason). See rbds_manager.py's
+        `rt_changed` computation, which is the sole source of this
+        parameter -- no persistent stored toggle state exists anymore.
+      bits 6-5: buffer configuration -- 00=flush the buffer then load
+        this message, 01/11=reserved, 10=add to a cyclic on-device
+        buffer. This project sends exactly one current message and
+        does its own rotation in Python (rbds_manager.py), so 00 is
+        the only correct value; the code previously sent the RESERVED
+        value 01, an outright standards violation with genuinely
+        undefined receiver-side behavior (fixed 2026-08-02).
+    Spec example: <0A><00><01><04><0B><52><44><53> -- flush (00) +
+    toggle A/B (bit0=1) -> flags=0x01, MEL=4 (1 flags byte + 3 text
+    chars "RDS"), text "RDS"."""
     text = text[:64]
-    med0 = (0b01 << 5) | (0x01 if ab_flag else 0x00)
+    med0 = 0x01 if ab_flag else 0x00  # bits 6-5 = 00 (flush-then-load)
     mel = 1 + len(text)
-    return bytes([0x0A, dsn, psn, mel, med0]) + text.encode("latin-1", errors="replace")
+    return bytes([0x0A, dsn, psn, mel, med0]) + encode_rds_g0(text)
 
 
 def mec_rt_plus_oda_reg() -> bytes:
@@ -320,6 +344,30 @@ def mec_rt_plus_tags_generic(rt_text_len: int) -> bytes:
       Weather1 "Temp: 86F..." (56 chars) -> 24 16 0b 20 6e 00 00
       Weather2 "Wind: Southeast..." (51) -> 24 16 0b 20 64 00 00
 
+    CAUTION (2026-08-02 primary-source review): the exact RT+ content
+    type this actually produces on air is NOT independently confirmed.
+    MEC 0x24 here is not a real UECP command -- SPB490 defines 0x24 as
+    a generic "free-format group" carrier; StereoTool/RDS Magic 4 have
+    repurposed it as an undocumented private channel that doesn't
+    mirror the real on-air 11A bit layout, so these bytes can't be
+    decoded against the actual RT+ content-type table (confirmed:
+    class 4=ITEM.ARTIST, 1=ITEM.TITLE, 25=INFO.WEATHER, per RDS Forum
+    doc R05/036_1) without a real on-air capture. Do NOT assume this
+    equals INFO.WEATHER -- that was this module's own prior guess, not
+    a confirmed fact. What IS confirmed by design (see the docstring
+    paragraph above and rbds_manager.py's call sites): this exists to
+    stop a receiver from misapplying a STALE song's artist/title
+    offsets to unrelated text, not to assert a specific semantic
+    label. It is deliberately reused byte-for-byte across every kind
+    of non-song RT (weather/promo/station-ID/file/url) for exactly
+    that reason -- an intentional, still-unresolved simplification,
+    not new as of this note. See the module-level PROJECT_NOTES-style
+    caveat in rbds_manager.py's RT+ send sites for the current
+    resolution: a real song whose artist is too long for the two-tag
+    format (>32 chars) now omits RT+ entirely instead of borrowing
+    this tag (closer to a song than to unrelated content, and
+    "omit rather than guess" is the safer failure mode either way).
+
     Wire format (after the 0x24 MEC byte), 6 bytes total:
       Byte 0: 0x16                        -- subtype
       Byte 1: 0x0b                        -- single-tag marker
@@ -387,7 +435,7 @@ def mec_song_info(text: str) -> bytes:
     weather message ("Temp: 86F | ... | DewPt: 69F") ride this MEC
     intact. StereoTool doesn't display 0xAA content directly, so its
     length is bounded only by the outer UECP frame limit."""
-    text_bytes = text.encode("latin-1", errors="replace")
+    text_bytes = encode_rds_g0(text)
     length = 1 + len(text_bytes)
     return bytes([0xAA, length, 0xF0]) + text_bytes
 
@@ -429,6 +477,21 @@ def mec_ct(dt_utc, offset_minutes: int) -> bytes:
         dt_utc.microsecond // 10000,
         offset_byte,
     ])
+
+
+def mec_ct_on_off(enabled: bool) -> bytes:
+    """MEC 0x19 -- CT On/Off. Format: MEC MED(1: 00=disable, 01=enable
+    transmission of type 4A group). Confirmed directly against the
+    spec's own section 3.3.39 (2026-08-02 primary-source review):
+    "To enable/disable the transmission of type 4A group... '01'
+    enables the transmission of type 4A groups and '00' disables it.
+    The time is set with the Real Time Clock Command." -- i.e. this is
+    a DISTINCT command from mec_ct (0x0D): 0x0D only sets the clock
+    VALUE, 0x19 is what actually turns 4A transmission on or off. No
+    dsn/psn, matching mec_ct's own convention and the spec's format
+    table for this command (MEC MED only).
+    Spec example: <19><01> -- enable transmission of type 4A group."""
+    return bytes([0x19, 0x01 if enabled else 0x00])
 
 
 def mec_af(frequencies_mhz: list, dsn: int = 0x00, psn: int = 0x00, start_location: int = 0x0000) -> bytes:
