@@ -26,7 +26,20 @@ Root cause verified via an isolated throwaway-pipeline reproduction
 incident) rather than guessed: the gst_base_parse_finish_frame
 assertion is 100% deterministic for that seek, but the pipeline itself
 recovered cleanly every time (5/5 runs) and resumed normal real-time
-decoding within ~2.7s -- the basis for SEEK_EOS_GUARD_SECONDS=3.0."""
+decoding within ~2.7s. SEEK_EOS_GUARD_SECONDS=5.0 deliberately pads
+past that observed floor -- the isolated repro carried none of a real
+restart's concurrent startup load, so it likely underestimates the
+real settle time.
+
+Also covers a second bug caught in the same review round:
+_create_deck sets Deck.started_at from resume_position_ns
+unconditionally, as presentation bookkeeping -- it never itself seeks
+for that path, the caller (_resume_deck/_seek_deck) does, afterward.
+If that caller's own seek is rejected, started_at (and, for a
+was-paused _seek_deck call, paused_position) must be corrected back to
+reflect the deck's real, unseeked position -- otherwise the dashboard,
+crossfade timing, and pause/resume state all keep reporting a target
+the deck never actually reached."""
 import inspect
 import threading
 import time
@@ -272,3 +285,37 @@ class SeekRejectionHandlingTests(TransactionTestCase):
         rejection_branch = src[start:end]
         self.assertNotIn("deck.started_at = time.time() - (_auto_resume_position_ns", rejection_branch)
         self.assertIn("deck.seeked_at = time.time()", src[end:end + 200])
+
+    def test_resume_deck_resets_started_at_on_rejected_seek(self):
+        """_create_deck sets Deck.started_at from resume_position_ns as
+        presentation bookkeeping BEFORE this function's own seek_simple
+        call ever runs -- if that seek is rejected, started_at must be
+        corrected back to reflect the deck's real (unseeked) position,
+        or _get_deck_position (dashboard, crossfade timing) keeps
+        reporting a target the deck never reached."""
+        src = inspect.getsource(eng_module.PlaybackEngine._resume_deck)
+        start = src.index("if seek_ok:")
+        end = src.index("with self._lock:", start)
+        seek_result_block = src[start:end]
+        self.assertIn("new_deck.seeked_at = time.time()", seek_result_block)
+        self.assertIn("new_deck.started_at = time.time()", seek_result_block)
+
+    def test_seek_deck_resets_started_at_on_rejected_seek(self):
+        src = inspect.getsource(eng_module.PlaybackEngine._seek_deck)
+        start = src.index("if seek_ok:")
+        end = src.index("with self._lock:", start)
+        seek_result_block = src[start:end]
+        self.assertIn("new_deck.seeked_at = time.time()", seek_result_block)
+        self.assertIn("new_deck.started_at = time.time()", seek_result_block)
+
+    def test_seek_deck_does_not_clobber_paused_position_on_rejected_seek(self):
+        """The was_paused branch used to unconditionally overwrite
+        paused_position with the seek TARGET after _pause_deck already
+        derived a real value -- if the seek was rejected, that target
+        was never actually reached, so the overwrite must be
+        conditional on seek_ok."""
+        src = inspect.getsource(eng_module.PlaybackEngine._seek_deck)
+        start = src.index("if was_paused:")
+        was_paused_block = src[start:start + 300]
+        self.assertIn("if seek_ok:", was_paused_block)
+        self.assertIn("new_deck.paused_position = position", was_paused_block)

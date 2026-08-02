@@ -121,8 +121,14 @@ DECK_STUCK_TIMEOUT_SECONDS = 30  # generous margin past a track's own duration b
 # library can trigger a transient gst_base_parse_finish_frame parser
 # hiccup, but the pipeline consistently finished renegotiating and
 # resumed normal real-time decoding within ~2.7s across 5/5 repro
-# runs -- 3.0s leaves a small margin over that observed settle time.
-SEEK_EOS_GUARD_SECONDS = 3.0
+# runs. 5.0s (not just ~2.7s + a hair) deliberately: that reproduction
+# was an isolated pipeline with none of a real engine restart's
+# concurrent startup load (StereoTool sink, AGC, RemoteDJ slot setup
+# all building around the same time), so it likely underestimates the
+# real settle time -- the extra margin costs nothing (an unrelated
+# genuine EOS inside this window still only gets scrutinized, not
+# blocked, if its position is actually near the track's real end).
+SEEK_EOS_GUARD_SECONDS = 5.0
 SLOTS = ("A", "B")
 
 # Remote DJ over WebRTC.
@@ -4450,12 +4456,23 @@ class PlaybackEngine:
         if seek_ok:
             new_deck.seeked_at = time.time()
         else:
-            print(f"  [{slot}] Resume seek to {resume_position:.1f}s rejected", flush=True)
+            # _create_deck already set started_at as though playback
+            # began at resume_position_ns -- that's presentation
+            # bookkeeping based on the PARAMETER, not a real seek
+            # _create_deck itself never performs. The actual seek is
+            # this call, made by the caller (us) after _create_deck
+            # returns; if GStreamer rejects it, the deck's real audio
+            # is still wherever decodebin naturally started (position
+            # 0), and started_at must reflect that or _get_deck_position
+            # (dashboard, crossfade timing) would keep reporting the
+            # unreached target indefinitely.
+            print(f"  [{slot}] Resume seek to {resume_position:.1f}s rejected -- playing from 0 instead", flush=True)
             emit_event(
                 category="engine", level="error", title="Deck seek rejected",
                 detail={"slot": slot, "track_id": new_deck.track.id, "target_seconds": resume_position},
                 dedupe_key=f"engine|seek-rejected|slot={slot}|track={new_deck.track.id}",
             )
+            new_deck.started_at = time.time()
 
         with self._lock:
             self.decks[slot] = new_deck
@@ -4503,12 +4520,17 @@ class PlaybackEngine:
         if seek_ok:
             new_deck.seeked_at = time.time()
         else:
-            print(f"  [{slot}] Seek to {position:.1f}s rejected", flush=True)
+            # Same reasoning as _resume_deck: _create_deck already set
+            # started_at as though playback began at the target -- if
+            # GStreamer rejects this seek, the deck's real audio is
+            # still at position 0, and started_at must say so.
+            print(f"  [{slot}] Seek to {position:.1f}s rejected -- playing from 0 instead", flush=True)
             emit_event(
                 category="engine", level="error", title="Deck seek rejected",
                 detail={"slot": slot, "track_id": new_deck.track.id, "target_seconds": position},
                 dedupe_key=f"engine|seek-rejected|slot={slot}|track={new_deck.track.id}",
             )
+            new_deck.started_at = time.time()
 
         with self._lock:
             self.decks[slot] = new_deck
@@ -4520,7 +4542,12 @@ class PlaybackEngine:
 
         if was_paused:
             self._pause_deck(slot)
-            new_deck.paused_position = position
+            if seek_ok:
+                new_deck.paused_position = position
+            # else: _pause_deck already derived paused_position from a
+            # real _get_deck_position() query against the deck's TRUE
+            # (unseeked, now-corrected-to-0) state -- don't clobber
+            # that with the target the deck never actually reached.
         else:
             self._next_triggered = False
 
