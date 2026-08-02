@@ -1016,6 +1016,25 @@ class RtNormalizationGapTests(SimpleTestCase):
         result = uecp.mec_ptyn(charset.normalize_text("DJ’s"))
         self.assertEqual(result, bytes([0x3E, 0x00, 0x00]) + b"DJ's    ")
 
+    def test_manager_normalizes_ptyn_at_the_actual_call_site(self):
+        # The test above only proves normalize_text()+mec_ptyn()
+        # compose correctly -- it doesn't exercise
+        # _build_uecp_payload() itself, so it wouldn't catch a future
+        # accidental removal of normalize_text(ptyn) from that actual
+        # call site. This one does, by building the real payload with
+        # a raw (un-normalized) ptyn and inspecting the resulting
+        # MEC 0x3E bytes.
+        config = mock.Mock(
+            pi_code="", ecc="", ta=False, tp=False,
+            di_dynamic_pty=False, di_compressed=False, di_artificial_head=False, di_stereo=True,
+            ms=True, pty=0, use_rt_plus=False, af_frequencies_mhz="",
+            uecp_site_address=1, uecp_encoder_address=0,
+        )
+        payload = self.mgr._build_uecp_payload(config, "PS      ", "RT text", ptyn="DJ’s")
+        ptyn_mec = _find_mec(_split_uecp_frames(payload), 0x3E)
+        self.assertIsNotNone(ptyn_mec)
+        self.assertEqual(ptyn_mec, bytes([0x3E, 0x00, 0x00]) + b"DJ's    ")
+
     def test_rt_plus_delimiter_with_smart_dash_still_splits(self):
         # A stale, un-normalized "–" delimiter would never match
         # raw_text after raw_text's OWN normalization already
