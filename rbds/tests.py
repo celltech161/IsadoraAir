@@ -1,3 +1,4 @@
+import time
 from unittest import mock
 
 from django.core.exceptions import ValidationError
@@ -835,20 +836,54 @@ class RBDSManagerOneShotToggleTests(TestCase):
         config.use_rt_plus = False
         config.send_ct = False
         config.save()
-        # Pre-seed so the (correct, separately-tested) CT On/Off
-        # first-tick send doesn't add an extra non-RT payload to
-        # self.sent_payloads and confuse "last payload sent" here --
-        # this class isn't testing CT at all (see RBDSManagerCtOnOffTests).
+        # Pre-seed so the (correct, separately-tested) CT On/Off logic
+        # doesn't add extra non-RT payloads and confuse "how many/which
+        # payload" here -- this class isn't testing CT at all (see
+        # RBDSManagerCtOnOffTests). ALL FOUR of these need seeding
+        # (2026-08-03 fix): CT reassertion now also fires on
+        # due_for_full_resend (a fresh manager's _last_full_resend
+        # starts at 0.0, making due_for_full_resend unconditionally
+        # True on the very first tick) AND on a fresh reconnect (a
+        # fresh manager's very first successful send is itself a
+        # connected-state transition, which would otherwise also read
+        # as "just reconnected"). Pretending the manager was already
+        # connected, in the same episode _last_ct_synced_connected_since
+        # already reflects, suppresses that first-tick reconnect signal
+        # the same way the other three seeds suppress their triggers.
         self.mgr._last_send_ct_state = False
+        self.mgr._last_full_resend = time.time()
+        self.mgr._connected = True
+        self.mgr._connected_since = 1.0
+        self.mgr._last_ct_synced_connected_since = 1.0
 
     def _set_now_playing(self, title, artist=""):
         self.mgr._read_now_playing = mock.Mock(return_value={"title": title, "artist": artist})
 
+    def _main_content_payloads(self):
+        """Payloads that carry an RT MEC -- i.e. an actual main
+        content send, not an auxiliary CT on/off (0x19) or CT value
+        (0x0D) frame. A full-resend or reconnect tick can now
+        legitimately also emit a separate CT reassertion payload
+        alongside the main content payload (2026-08-03 fix), so a raw
+        len(self.sent_payloads) is no longer the same thing as "how
+        many main content sends happened," which is what these tests
+        actually care about."""
+        return [p for p in self.sent_payloads if _find_mec(_split_uecp_frames(p), 0x0A) is not None]
+
     def _last_rt_ab_bit(self):
-        frames = _split_uecp_frames(self.sent_payloads[-1])
-        rt = _find_mec(frames, 0x0A)
-        self.assertIsNotNone(rt, "expected an RT MEC in the last transmitted payload")
-        return rt[4] & 0x01
+        # Searches backward for the last payload that actually CARRIES
+        # an RT MEC, rather than assuming it's simply the last payload
+        # transmitted -- a full-resend or reconnect tick can now
+        # legitimately also emit a separate CT on/off reassertion
+        # payload (2026-08-03 fix) alongside the main content payload,
+        # so "last payload" and "last RT-bearing payload" are no
+        # longer always the same thing.
+        for payload in reversed(self.sent_payloads):
+            frames = _split_uecp_frames(payload)
+            rt = _find_mec(frames, 0x0A)
+            if rt is not None:
+                return rt[4] & 0x01
+        self.fail("expected an RT MEC in some transmitted payload")
 
     def test_first_new_rt_toggles(self):
         self._set_now_playing("First Song")
@@ -867,10 +902,13 @@ class RBDSManagerOneShotToggleTests(TestCase):
         self.mgr._tick()
         self.assertEqual(self._last_rt_ab_bit(), 1)
         # Force the 30s full-resend gate open without waiting 30s and
-        # without changing now-playing at all.
+        # without changing now-playing at all. This now also
+        # legitimately reasserts CT state (2026-08-03 fix) alongside
+        # the main content resend, hence checking main-content sends
+        # specifically rather than the raw payload count.
         self.mgr._last_full_resend = 0.0
         self.mgr._tick()
-        self.assertEqual(len(self.sent_payloads), 2, "the forced full-resend must still have sent")
+        self.assertEqual(len(self._main_content_payloads()), 2, "the forced full-resend must still have sent")
         self.assertEqual(self._last_rt_ab_bit(), 0, "unchanged RT resend must NOT toggle A/B")
 
     def test_reconnect_resend_of_unchanged_rt_does_not_toggle(self):
@@ -878,10 +916,12 @@ class RBDSManagerOneShotToggleTests(TestCase):
         self.mgr._tick()
         self.assertEqual(self._last_rt_ab_bit(), 1)
         # Simulate "just reconnected" -- _connected is False, forcing
-        # a send even though nothing (including RT) changed.
+        # a send even though nothing (including RT) changed. This now
+        # also legitimately reasserts CT state (2026-08-03 fix), hence
+        # checking main-content sends specifically.
         self.mgr._connected = False
         self.mgr._tick()
-        self.assertEqual(len(self.sent_payloads), 2)
+        self.assertEqual(len(self._main_content_payloads()), 2)
         self.assertEqual(self._last_rt_ab_bit(), 0, "reconnect resend of unchanged RT must NOT toggle A/B")
 
 
@@ -890,7 +930,18 @@ class RBDSManagerCtOnOffTests(TestCase):
     """MEC 0x19 (CT On/Off) is distinct from MEC 0x0D (Real time clock,
     value only) -- confirmed via primary-source review 2026-08-02 (see
     uecp.mec_ct_on_off's docstring). RBDSManager must send the explicit
-    enable/disable whenever the operator's send_ct setting changes."""
+    enable/disable whenever the operator's send_ct setting changes --
+    AND reassert it idempotently on startup, on every periodic full
+    resend, and on a fresh reconnect, not just on that local config
+    change. Edge-trigger-only tracking was a confirmed defect: the
+    remote encoder (StereoTool) can reset its own group-4A-enable
+    state independently (e.g. a preset switch), with config.send_ct
+    never changing on this side at all -- silently stopping 4A with
+    nothing here to notice or correct it. A live restart experiment
+    (2026-08-03, CT_RESTART_EXPERIMENT_RESULT.md in the RBDS bench
+    scratch area) confirmed a fresh process (which resets
+    _last_send_ct_state to None) restores 4A with no config change --
+    this test class is the regression coverage for that fix."""
 
     def setUp(self):
         self.mgr = RBDSManager()
@@ -910,12 +961,22 @@ class RBDSManagerCtOnOffTests(TestCase):
                     values.append(msg[1])
         return values
 
+    # 1. Fresh manager sends MEC 0x19 on first eligible tick -- even
+    # when send_ct is the (default False) unchanged value, since the
+    # desired STATE, not just "enabled," must be asserted on startup.
+    def test_fresh_manager_asserts_ct_state_on_first_tick_even_when_disabled(self):
+        self.config.save()  # send_ct left at its default (False)
+        self.mgr._tick()
+        self.assertEqual(self._ct_on_off_values_sent(), [0x00])
+        self.assertEqual(self.mgr._last_send_ct_state, False)
+
     def test_enabling_send_ct_sends_enable(self):
         self.config.send_ct = True
         self.config.save()
         self.mgr._tick()
         self.assertEqual(self._ct_on_off_values_sent(), [0x01])
 
+    # 5/6. Config change in either direction sends the matching state.
     def test_disabling_after_enabled_sends_disable(self):
         self.config.send_ct = True
         self.config.save()
@@ -925,13 +986,114 @@ class RBDSManagerCtOnOffTests(TestCase):
         self.mgr._tick()
         self.assertEqual(self._ct_on_off_values_sent(), [0x01, 0x00])
 
-    def test_unchanged_send_ct_does_not_resend_on_off(self):
+    # 2. Ordinary unchanged ticks (no config change, not due for full
+    # resend, no reconnect) must not repeatedly spam MEC 0x19.
+    def test_ordinary_unchanged_tick_does_not_resend(self):
         self.config.send_ct = True
         self.config.save()
         self.mgr._tick()
-        self.mgr._last_full_resend = 0.0  # force an unrelated full resend
+        self.mgr._tick()  # nothing changed, not due for full resend
+        self.assertEqual(self._ct_on_off_values_sent(), [0x01], "an ordinary unchanged tick must not resend")
+
+    # 3. The existing periodic full-state resend must include MEC 0x19
+    # even when send_ct itself is unchanged -- this is the corrected
+    # behavior; the old edge-trigger-only version deliberately did NOT
+    # do this, which is exactly the confirmed defect being fixed here.
+    def test_periodic_full_resend_reasserts_ct_state_even_when_unchanged(self):
+        self.config.send_ct = True
+        self.config.save()
         self.mgr._tick()
-        self.assertEqual(self._ct_on_off_values_sent(), [0x01], "on/off must only send on an actual state change")
+        self.assertEqual(self._ct_on_off_values_sent(), [0x01])
+        self.mgr._last_full_resend = 0.0  # force the existing full-resend gate open
+        self.mgr._tick()
+        self.assertEqual(self._ct_on_off_values_sent(), [0x01, 0x01],
+                          "a full resend must reassert CT state even though the cached value already matches")
+
+    # 9. The disabled state is a first-class value too -- a full
+    # resend must reassert send_ct=False just as it reasserts True.
+    def test_periodic_full_resend_reasserts_disabled_state_too(self):
+        self.config.save()  # send_ct stays False
+        self.mgr._tick()
+        self.assertEqual(self._ct_on_off_values_sent(), [0x00])
+        self.mgr._last_full_resend = 0.0
+        self.mgr._tick()
+        self.assertEqual(self._ct_on_off_values_sent(), [0x00, 0x00])
+
+    # 4. A fresh reconnect (an actual _connected_since transition, not
+    # just any ordinary tick) must reassert CT state.
+    def test_reconnect_forces_ct_reassertion(self):
+        self.config.send_ct = True
+        self.config.save()
+        self.mgr._tick()
+        self.assertEqual(self._ct_on_off_values_sent(), [0x01])
+        # Simulate a real disconnect/reconnect cycle, same pattern
+        # already established in RBDSManagerOneShotToggleTests: force
+        # _connected False so _send()'s own "not self._connected" gate
+        # fires and _mark_up() runs for real, producing a genuinely
+        # new _connected_since -- not just re-ticking the same episode.
+        self.mgr._connected = False
+        self.mgr._connected_since = None
+        time.sleep(0.01)  # guarantee a distinguishable time.time() from the first _mark_up()
+        self.mgr._tick()
+        self.assertEqual(self._ct_on_off_values_sent(), [0x01, 0x01],
+                          "a fresh reconnect must reassert CT state even though the value is unchanged")
+
+    # 7/8. Failed send leaves the desired state pending (not committed
+    # as "last sent"); the next eligible tick retries it, and only a
+    # successful transmission commits _last_send_ct_state.
+    def test_failed_ct_send_does_not_update_last_state_and_is_retried(self):
+        self.config.send_ct = True
+        self.config.save()
+
+        def fail_on_ct(config, payload):
+            frames = _split_uecp_frames(payload)
+            if _find_mec(frames, 0x19) is not None:
+                raise ConnectionError("simulated TCP failure for CT on/off")
+            self.sent.append(payload)
+
+        self.mgr._transmit = mock.Mock(side_effect=fail_on_ct)
+        self.mgr._tick()
+        self.assertEqual(self._ct_on_off_values_sent(), [], "the failed CT send must not appear as sent")
+        self.assertIsNone(self.mgr._last_send_ct_state, "a failed send must not commit the desired state")
+        self.assertIn("CT on/off send failed", self.mgr._last_error)
+
+        # Next eligible tick (still "unsynced" since _last_send_ct_state
+        # is still None) retries automatically, now with a transmit
+        # that succeeds.
+        self.mgr._transmit = mock.Mock(side_effect=lambda config, payload: self.sent.append(payload))
+        self.mgr._tick()
+        self.assertEqual(self._ct_on_off_values_sent(), [0x01], "the retry must succeed and be recorded")
+        self.assertEqual(self.mgr._last_send_ct_state, True, "a successful retry must commit the state")
+
+    # 10. MEC 0x0D minute-value sending must be unaffected by any of
+    # the on/off reassertion logic above -- still gated purely on the
+    # minute-rollover check, once per minute, independent of full
+    # resends/reconnects/on-off retries.
+    def test_mec_0d_minute_send_cadence_unaffected_by_on_off_changes(self):
+        def mec_0d_count():
+            count = 0
+            for payload in self.sent:
+                for msg in _split_uecp_frames(payload):
+                    if msg and msg[0] == 0x0D:
+                        count += 1
+            return count
+
+        self.config.send_ct = True
+        self.config.save()
+        self.mgr._tick()
+        self.assertEqual(mec_0d_count(), 1, "the first tick must send exactly one CT value frame")
+        # More ticks in the SAME minute (including a forced full
+        # resend and a forced reconnect) must not send another 0x0D.
+        self.mgr._last_full_resend = 0.0
+        self.mgr._tick()
+        self.mgr._connected = False
+        self.mgr._connected_since = None
+        self.mgr._tick()
+        self.assertEqual(mec_0d_count(), 1, "0x0D must stay gated on minute rollover, not on/off reassertion")
+        # A genuine minute rollover still sends exactly one more.
+        self.mgr._last_ct_sent_minute = (self.mgr._last_ct_sent_minute - 1) % 60
+        self.mgr._tick()
+        self.assertEqual(mec_0d_count(), 2, "a real minute rollover must still send CT value")
 
 
 class RBDSConfigValidationTests(SimpleTestCase):
@@ -1070,8 +1232,19 @@ class RBDSManagerFailedSendPreservesToggleTests(TestCase):
 
         self.mgr._transmit = mock.Mock(side_effect=transmit)
         self.mgr._read_category_state = mock.Mock(return_value={"pty_override": None, "ptyn": ""})
-        # Not testing CT here -- see RBDSManagerCtOnOffTests.
+        # Not testing CT here -- see RBDSManagerCtOnOffTests. ALL FOUR
+        # of these need seeding (2026-08-03 fix): CT reassertion now
+        # also fires on due_for_full_resend (a fresh manager's
+        # _last_full_resend starts at 0.0, unconditionally True on the
+        # first tick) and on a fresh reconnect (a fresh manager's own
+        # first successful send, or -- relevant to this class
+        # specifically -- a fail_next-triggered mark_down/mark_up
+        # cycle on retry, both read as "just reconnected" otherwise).
         self.mgr._last_send_ct_state = False
+        self.mgr._last_full_resend = time.time()
+        self.mgr._connected = True
+        self.mgr._connected_since = 1.0
+        self.mgr._last_ct_synced_connected_since = 1.0
         config = RBDSConfig.load()
         config.protocol = "uecp"
         config.use_rt_plus = False
@@ -1081,11 +1254,23 @@ class RBDSManagerFailedSendPreservesToggleTests(TestCase):
     def _set_now_playing(self, title):
         self.mgr._read_now_playing = mock.Mock(return_value={"title": title, "artist": ""})
 
+    def _main_content_payloads(self):
+        """See RBDSManagerOneShotToggleTests's identical helper -- a
+        retry-after-failure tick is itself a mark_down/mark_up
+        transition, which now (correctly) also reasserts CT state
+        (2026-08-03 fix), so raw sent-payload counts no longer equal
+        "how many main content sends happened.\""""
+        return [p for p in self.sent_payloads if _find_mec(_split_uecp_frames(p), 0x0A) is not None]
+
     def _last_rt_ab_bit(self):
-        frames = _split_uecp_frames(self.sent_payloads[-1])
-        rt = _find_mec(frames, 0x0A)
-        self.assertIsNotNone(rt)
-        return rt[4] & 0x01
+        # Searches backward for the RT-bearing payload -- see
+        # RBDSManagerOneShotToggleTests's identical helper for why.
+        for payload in reversed(self.sent_payloads):
+            frames = _split_uecp_frames(payload)
+            rt = _find_mec(frames, 0x0A)
+            if rt is not None:
+                return rt[4] & 0x01
+        self.fail("expected an RT MEC in some transmitted payload")
 
     def test_failed_first_send_then_successful_retry_still_toggles(self):
         self._set_now_playing("First Song")
@@ -1094,7 +1279,7 @@ class RBDSManagerFailedSendPreservesToggleTests(TestCase):
         self.assertEqual(self.sent_payloads, [], "a failed transmit must not be recorded as sent")
 
         self.mgr._tick()  # retry, same pending RT change
-        self.assertEqual(len(self.sent_payloads), 1)
+        self.assertEqual(len(self._main_content_payloads()), 1)
         self.assertEqual(self._last_rt_ab_bit(), 1, "the pending change must still toggle A/B on the retry")
 
     def test_last_sent_rt_does_not_advance_on_failure(self):
@@ -1120,7 +1305,7 @@ class RBDSManagerFailedSendPreservesToggleTests(TestCase):
         self.mgr._tick()
         self.assertEqual(self.sent_payloads, [])
         self.mgr._tick()
-        self.assertEqual(len(self.sent_payloads), 1)
+        self.assertEqual(len(self._main_content_payloads()), 1)
         self.assertEqual(self._last_rt_ab_bit(), 1)
 
 
@@ -1222,7 +1407,15 @@ class EffectiveDynamicPtyTests(TestCase):
         self.mgr._transmit = mock.Mock(side_effect=lambda cfg, payload: sent_payloads.append(payload))
         self.mgr._read_now_playing = mock.Mock(return_value={"title": "Song", "artist": ""})
         self.mgr._read_category_state = mock.Mock(return_value={"pty_override": None, "ptyn": ""})
+        # All four need seeding -- see RBDSManagerOneShotToggleTests
+        # .setUp for why (2026-08-03 fix: CT reassertion now also
+        # fires on due_for_full_resend and on a fresh reconnect, not
+        # just on a config.send_ct change).
         self.mgr._last_send_ct_state = False
+        self.mgr._last_full_resend = time.time()
+        self.mgr._connected = True
+        self.mgr._connected_since = 1.0
+        self.mgr._last_ct_synced_connected_since = 1.0
 
         self.mgr._tick()
 

@@ -76,13 +76,24 @@ class RBDSManager:
         # be transmitted at :00 seconds of the given minute). Reset to
         # None on init so the very first tick fires an immediate CT.
         self._last_ct_sent_minute = None
-        # Tracks the last CT On/Off (MEC 0x19) state actually sent, so
-        # a config change (either direction) gets the explicit enable/
-        # disable command once, immediately -- not just inferred from
-        # whether mec_ct itself happens to still be sent. None on init
-        # so the very first tick always sends an explicit state
-        # rather than assuming the encoder's own prior state.
+        # Last CT On/Off (MEC 0x19) state actually, successfully
+        # transmitted -- None on init so the very first tick always
+        # sends an explicit state rather than assuming the encoder's
+        # own prior state. Reasserted (not just sent on change) on
+        # every periodic full resend and every fresh reconnect too --
+        # see _tick's CT on/off block for why an edge-triggered-only
+        # version of this was a confirmed bug (2026-08-03 restart
+        # experiment, CT_RESTART_EXPERIMENT_RESULT.md): the REMOTE
+        # encoder can reset its own group-4A-enable state independently
+        # of this config ever changing, and nothing was left to notice.
         self._last_send_ct_state = None
+        # Which connection episode (see _connected_since) CT enable-
+        # state was last successfully synced during -- lets _tick tell
+        # "this is a fresh reconnect" apart from "still the same
+        # connection as last tick" using the manager's own existing
+        # connection-state bookkeeping, rather than a new parallel
+        # state machine. None on init (no episode synced yet).
+        self._last_ct_synced_connected_since = None
 
     def start(self):
         self.running = True
@@ -219,17 +230,48 @@ class RBDSManager:
         # is a distinct command from MEC 0x19 ("CT On/Off"), which is
         # what actually enables/disables type 4A group transmission
         # (SPB490 section 3.3.39, confirmed via primary-source review
-        # 2026-08-02). Send the explicit enable/disable whenever the
-        # operator's setting changes, so turning Send Clock Time off
-        # actually stops 4A instead of just stopping this engine's own
-        # periodic 0x0D sends (which alone says nothing about whether
-        # the encoder should still be transmitting 4A on its own).
-        if config.protocol == "uecp" and config.send_ct != self._last_send_ct_state:
+        # 2026-08-02).
+        #
+        # Sending 0x19 only on a LOCAL config.send_ct change (the
+        # original version of this block) is not enough: the REMOTE
+        # encoder can reset its own group-4A-enable state on its own
+        # (e.g. a StereoTool preset switch), with config.send_ct never
+        # changing on this side at all -- silently stopping 4A with
+        # nothing here to notice or correct it. Confirmed live
+        # 2026-08-03 (CT_RESTART_EXPERIMENT_RESULT.md): only a full
+        # process restart, which happened to reset _last_send_ct_state
+        # to None, forced a fresh 0x19 and restored 4A. So the desired
+        # state is reasserted idempotently -- on startup, on every
+        # periodic full resend, and on an actual fresh reconnect -- not
+        # just on a local config change, reusing the same
+        # due_for_full_resend/_connected/_connected_since bookkeeping
+        # _tick already maintains for the main PS/RT payload rather
+        # than a new parallel state machine.
+        just_reconnected = (
+            self._connected and self._connected_since != self._last_ct_synced_connected_since
+        )
+        should_send_ct_state = (
+            self._last_send_ct_state is None
+            or config.send_ct != self._last_send_ct_state
+            or due_for_full_resend
+            or just_reconnected
+        )
+        if config.protocol == "uecp" and should_send_ct_state:
             try:
                 self._send_ct_on_off(config, config.send_ct)
-                self._last_send_ct_state = config.send_ct
             except Exception as exc:
+                # Only commit "what we last synced" on an actual
+                # successful transmission -- same principle _send()
+                # already uses for _last_sent_ps/_last_sent_rt. A
+                # failed send leaves the desired state (and, via
+                # _last_ct_synced_connected_since staying stale too,
+                # the reconnect signal) pending so the next eligible
+                # tick retries it, rather than assuming the encoder
+                # received a command it never got.
                 self._last_error = f"CT on/off send failed: {exc}"
+            else:
+                self._last_send_ct_state = config.send_ct
+                self._last_ct_synced_connected_since = self._connected_since
 
         # Dedicated CT send at minute boundaries -- see _send_ct
         # docstring for why this can't ride along with the content
