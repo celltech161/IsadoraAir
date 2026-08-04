@@ -37,7 +37,16 @@ FULL_RESEND_SECONDS = 30  # periodic full resend even if nothing changed -- RDS 
 # cadence here (~6 repeats over 13s) collapses the observed
 # stale-tag-on-new-RT window on TEF6686 / Uconnect receivers.
 RT_PLUS_RESEND_SECONDS = 2
-TCP_RECONNECT_BACKOFF = [1, 2, 5, 10, 30]
+TCP_RECONNECT_BACKOFF = (1, 2, 5)  # first failure: 1s, second: 2s, third and every
+# subsequent failure: 5s repeating indefinitely (never 10 or 30 -- capped
+# 2026-08-03 per the reconnect state-reconstruction experiment, which
+# measured 14.7s/27.3s of pure backoff wait after StereoTool's UECP
+# listener was already back up, dwarfing the ~6-12s actual content-
+# recovery time once reconnected -- see
+# scratchpad/rbds_bench/reconnect_experiment/RBDS_RECONNECT_STATE_RECONSTRUCTION_REPORT.md.
+# The existing min(self._backoff_index, len(...)-1) clamp already
+# implements "repeat the final entry forever" -- shortening this tuple
+# is the entire fix, no other logic changes needed.
 FILE_URL_FETCH_TIMEOUT = 5  # seconds, bounds a slow/hanging URL source's delay on the tick it fires
 
 # --- RT+ architecture (2026-08-04, settled after a controlled 5-mode
@@ -82,8 +91,19 @@ class RBDSManager:
         self._content_cache = ContentFetchCache()
         self._sock = None
         self._sqc = 0
-        self._last_connect_attempt = 0.0
+        # monotonic, not wall-clock -- a wall-clock jump (NTP step, manual
+        # clock change) could otherwise make `now - last_attempt` go
+        # negative and stall reconnection attempts indefinitely.
+        self._last_connect_attempt_monotonic = 0.0
         self._backoff_index = 0
+        # Telemetry only, surfaced in rbds_state.json -- _backoff_index
+        # above stays clamped to len(TCP_RECONNECT_BACKOFF)-1 for array
+        # indexing; _reconnect_attempt is an unclamped running count of
+        # consecutive failures so a long outage's state file shows "we've
+        # tried 47 times", not just "index 2".
+        self._reconnect_attempt = 0
+        self._reconnect_next_at = None
+        self._reconnect_delay_seconds = None
         self._last_sent_ps = None
         self._last_sent_rt = None
         self._last_full_resend = 0.0
@@ -196,8 +216,9 @@ class RBDSManager:
 
         # While disconnected, retry every tick rather than waiting for the
         # 30s full-resend window -- _ensure_tcp_connected()'s own
-        # TCP_RECONNECT_BACKOFF (1/2/5/10/30s) is what actually paces the
-        # real connect attempts; that backoff is dead code if this outer
+        # TCP_RECONNECT_BACKOFF (1/2/5s, then 5s repeating) is what
+        # actually paces the real connect attempts; that backoff is dead
+        # code if this outer
         # gate only lets _send() run once per 30s regardless of connection
         # state; a failed attempt still stamps _last_full_resend below,
         # which used to reset the 30s window on every failure and starve
@@ -787,19 +808,42 @@ class RBDSManager:
         self._sock.sendall(payload)
 
     def _ensure_tcp_connected(self, config):
+        """Gated, single-threaded reconnect attempt -- this whole manager
+        runs on one thread (see module docstring), so there is no
+        concurrency concern here: a re-entrant call within the same tick
+        either sees `self._sock is not None` (already reconnected earlier
+        in this tick) and returns immediately, or is still correctly
+        gated by the same monotonic deadline. No locking needed.
+
+        Gates on `self._reconnect_delay_seconds` itself (the delay
+        computed and stored by the PREVIOUS failure), not by
+        recomputing TCP_RECONNECT_BACKOFF[self._backoff_index] fresh --
+        `_backoff_index` has already been advanced for the *next*
+        failure by that point, and reading it directly here would gate
+        every attempt one step ahead of the intended sequence (e.g. the
+        very first retry would wait 2s, not 1s). `_reconnect_delay_seconds
+        is None` (only true before any failure has ever happened) means
+        "no gate yet" -- the first-ever attempt always proceeds
+        immediately, same guarantee the previous wall-clock sentinel gave."""
         if self._sock is not None:
             return
-        now = time.time()
-        backoff = TCP_RECONNECT_BACKOFF[min(self._backoff_index, len(TCP_RECONNECT_BACKOFF) - 1)]
-        if now - self._last_connect_attempt < backoff:
+        now_monotonic = time.monotonic()
+        if (self._reconnect_delay_seconds is not None
+                and now_monotonic - self._last_connect_attempt_monotonic < self._reconnect_delay_seconds):
             return
-        self._last_connect_attempt = now
+        self._last_connect_attempt_monotonic = now_monotonic
         try:
             sock = socket.create_connection((config.host, config.port), timeout=5)
             self._sock = sock
             self._backoff_index = 0
+            self._reconnect_attempt = 0
+            self._reconnect_next_at = None
+            self._reconnect_delay_seconds = None
         except OSError as exc:
+            self._reconnect_delay_seconds = TCP_RECONNECT_BACKOFF[min(self._backoff_index, len(TCP_RECONNECT_BACKOFF) - 1)]
             self._backoff_index = min(self._backoff_index + 1, len(TCP_RECONNECT_BACKOFF) - 1)
+            self._reconnect_attempt += 1
+            self._reconnect_next_at = time.time() + self._reconnect_delay_seconds
             raise ConnectionError(f"TCP connect to {config.host}:{config.port} failed: {exc}") from exc
 
     def _mark_down(self):
@@ -842,6 +886,9 @@ class RBDSManager:
             "down_since": self._down_since,
             "last_send_at": self._last_full_resend or None,
             "last_error": self._last_error,
+            "reconnect_attempt": self._reconnect_attempt,
+            "reconnect_next_at": self._reconnect_next_at,
+            "reconnect_delay_seconds": self._reconnect_delay_seconds,
         }
         tmp = STATE_PATH.with_suffix(".tmp")
         tmp.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")

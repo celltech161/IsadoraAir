@@ -1531,3 +1531,138 @@ class EffectiveDynamicPtyTests(TestCase):
         di_mec = _find_mec(_split_uecp_frames(sent_payloads[0]), 0x04)
         self.assertIsNotNone(di_mec)
         self.assertEqual(di_mec[3] & 0x08, 0x08, "dynamic-PTY bit must be set: a category override exists")
+
+
+class RBDSManagerReconnectBackoffTests(SimpleTestCase):
+    """Covers the 2026-08-04 backoff cap (TCP_RECONNECT_BACKOFF: (1, 2, 5, 10,
+    30) -> (1, 2, 5), monotonic-clock-based). _ensure_tcp_connected is
+    exercised directly rather than through _tick()/_send() -- every other
+    test in this file mocks _transmit() itself and never reaches the real
+    socket/backoff logic at all.
+
+    Items 11 (failed-send state preservation) and 12/13 (reconnect
+    triggers full content resend / CT MEC 0x19 reassertion) from the
+    required test list are already covered by
+    RBDSManagerFailedSendPreservesToggleTests and RBDSManagerCtOnOffTests
+    respectively -- this class's changes (only __init__, _ensure_tcp_
+    connected, and _write_state) don't touch any of that logic, and the
+    full suite run below confirms nothing there regressed."""
+
+    def setUp(self):
+        self.mgr = RBDSManager()
+        self.config = mock.Mock(host="127.0.0.1", port=4000, protocol="uecp", transport="tcp")
+
+    def _attempt(self, monotonic_now, create_connection_result):
+        """create_connection_result: an exception instance to raise, or a
+        truthy value (e.g. mock.Mock()) to return as a successful socket."""
+        with mock.patch.object(rbds_manager.time, "monotonic", return_value=monotonic_now), \
+             mock.patch.object(rbds_manager.socket, "create_connection") as create_conn:
+            if isinstance(create_connection_result, Exception):
+                create_conn.side_effect = create_connection_result
+            else:
+                create_conn.return_value = create_connection_result
+            try:
+                self.mgr._ensure_tcp_connected(self.config)
+                return True
+            except ConnectionError:
+                return False
+
+    def test_first_retry_delay_is_1_second(self):
+        self.assertFalse(self._attempt(0.0, OSError("refused")))
+        self.assertEqual(self.mgr._reconnect_delay_seconds, 1)
+        # too soon -- gated, must not even try to connect
+        with mock.patch.object(rbds_manager.time, "monotonic", return_value=0.99), \
+             mock.patch.object(rbds_manager.socket, "create_connection") as create_conn:
+            self.mgr._ensure_tcp_connected(self.config)
+            create_conn.assert_not_called()
+        self.assertEqual(self.mgr._reconnect_attempt, 1, "the too-soon call above must not itself count as an attempt")
+
+    def test_second_retry_delay_is_2_seconds(self):
+        self._attempt(0.0, OSError("refused"))  # attempt 1 (unconditional) fails -> delay=1s for the next one
+        self._attempt(1.0, OSError("refused"))  # elapsed 1s >= 1s -> attempt 2 proceeds, fails -> delay=2s
+        self.assertEqual(self.mgr._reconnect_delay_seconds, 2)
+
+    def test_third_and_later_delays_stay_at_5_seconds(self):
+        self._attempt(0.0, OSError("refused"))    # -> delay 1s
+        self._attempt(1.0, OSError("refused"))    # -> delay 2s
+        self._attempt(3.0, OSError("refused"))    # -> delay 5s
+        self.assertEqual(self.mgr._reconnect_delay_seconds, 5)
+        self._attempt(8.0, OSError("refused"))    # 4th failure -- must stay 5s, not jump to 10
+        self.assertEqual(self.mgr._reconnect_delay_seconds, 5)
+        self._attempt(13.0, OSError("refused"))   # 5th failure -- still 5s, not 30
+        self.assertEqual(self.mgr._reconnect_delay_seconds, 5)
+        self.assertEqual(self.mgr._reconnect_attempt, 5)
+
+    def test_no_attempt_before_deadline(self):
+        self.assertFalse(self._attempt(0.0, OSError("refused")))
+        with mock.patch.object(rbds_manager.time, "monotonic", return_value=0.5), \
+             mock.patch.object(rbds_manager.socket, "create_connection") as create_conn:
+            self.mgr._ensure_tcp_connected(self.config)  # too soon -- gated, must not call socket at all
+            create_conn.assert_not_called()
+
+    def test_attempt_occurs_at_or_after_deadline(self):
+        self._attempt(0.0, OSError("refused"))
+        with mock.patch.object(rbds_manager.time, "monotonic", return_value=1.0), \
+             mock.patch.object(rbds_manager.socket, "create_connection") as create_conn:
+            create_conn.side_effect = OSError("refused")
+            with self.assertRaises(ConnectionError):
+                self.mgr._ensure_tcp_connected(self.config)
+            create_conn.assert_called_once()
+
+    def test_successful_reconnect_resets_sequence(self):
+        self._attempt(0.0, OSError("refused"))
+        self._attempt(1.0, OSError("refused"))
+        self.assertEqual(self.mgr._backoff_index, 2)
+        fake_sock = mock.Mock()
+        self.assertTrue(self._attempt(3.0, fake_sock))
+        self.assertEqual(self.mgr._backoff_index, 0)
+        self.assertEqual(self.mgr._reconnect_attempt, 0)
+        self.assertIsNone(self.mgr._reconnect_next_at)
+        self.assertIsNone(self.mgr._reconnect_delay_seconds)
+        self.assertIs(self.mgr._sock, fake_sock)
+
+    def test_second_independent_outage_restarts_at_1_second(self):
+        self._attempt(0.0, OSError("refused"))
+        self._attempt(1.0, OSError("refused"))
+        self._attempt(3.0, mock.Mock())  # reconnects, resets
+        self.mgr._sock = None  # simulate the connection later dropping again
+        self.assertFalse(self._attempt(100.0, OSError("refused")))
+        self.assertEqual(self.mgr._reconnect_delay_seconds, 1, "a new, independent outage must start the sequence over")
+
+    def test_prolonged_outage_does_not_busy_loop(self):
+        # 20 consecutive failures, one per second of monotonic time --
+        # every attempt after the third must be gated to exactly 5s
+        # apart, i.e. at most 4 real connection attempts in 20 "seconds"
+        # (0, 1, 3, 8, 13, 18 -- 6 real attempts), never one per tick.
+        attempts = 0
+        t = 0.0
+        for _ in range(20):
+            with mock.patch.object(rbds_manager.time, "monotonic", return_value=t), \
+                 mock.patch.object(rbds_manager.socket, "create_connection") as create_conn:
+                create_conn.side_effect = OSError("refused")
+                try:
+                    self.mgr._ensure_tcp_connected(self.config)
+                except ConnectionError:
+                    pass
+                if create_conn.called:
+                    attempts += 1
+            t += 1.0
+        self.assertLessEqual(attempts, 6, "must not attempt a real connection every single second")
+        self.assertEqual(self.mgr._reconnect_delay_seconds, 5)
+
+    def test_connection_errors_remain_visible_in_state(self):
+        self.assertFalse(self._attempt(0.0, OSError("connection refused")))
+        self.assertEqual(self.mgr._reconnect_attempt, 1)
+        self.assertEqual(self.mgr._reconnect_delay_seconds, 1)
+        self.assertIsNotNone(self.mgr._reconnect_next_at)
+        # _write_state must surface these without raising
+        self.mgr._write_state(self.config, "PS", "RT", "nowplaying", None)
+
+    def test_backoff_constant_is_capped_at_5(self):
+        self.assertEqual(rbds_manager.TCP_RECONNECT_BACKOFF, (1, 2, 5))
+
+    def test_no_concurrent_reconnect_attempt_when_already_connected(self):
+        self.mgr._sock = mock.Mock()
+        with mock.patch.object(rbds_manager.socket, "create_connection") as create_conn:
+            self.mgr._ensure_tcp_connected(self.config)
+            create_conn.assert_not_called()
