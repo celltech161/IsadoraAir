@@ -282,6 +282,34 @@ class UecpMecBuilderTests(SimpleTestCase):
         # mec_ecc is a thin convenience wrapper, not a separate command.
         self.assertEqual(uecp.mec_ecc(0xA0), uecp.mec_slow_labelling(variant=0, data=0xA0))
 
+    def test_mec_language_code_is_variant_3_of_slow_labelling(self):
+        # English=9 -> variant 3, data=0x009 -> MED1=0x30, MED2=0x09.
+        self.assertEqual(uecp.mec_language_code(9, dsn=0x00), bytes.fromhex("1A003009"))
+        # Thin convenience wrapper, not a separate command -- same
+        # relationship mec_ecc() has to mec_slow_labelling().
+        self.assertEqual(uecp.mec_language_code(9), uecp.mec_slow_labelling(variant=3, data=9))
+
+    def test_mec_language_code_unknown_is_defined_clear_value(self):
+        # Code 0 ("Unknown") is a real table entry, not an error --
+        # this is what IsadoraAir sends as its own "clear" command.
+        self.assertEqual(uecp.mec_language_code(0), bytes.fromhex("1A003000"))
+
+    def test_mec_language_code_rejects_out_of_range(self):
+        with self.assertRaises(ValueError):
+            uecp.mec_language_code(256)
+        with self.assertRaises(ValueError):
+            uecp.mec_language_code(-1)
+
+    def test_mec_language_code_does_not_alter_ecc_bytes(self):
+        # Two independent slow-label variants, sent as two independent
+        # MEC elements -- confirms neither builder's output depends on
+        # or mutates the other's.
+        ecc_bytes = uecp.mec_ecc(0xA0)
+        lic_bytes = uecp.mec_language_code(9)
+        self.assertEqual(ecc_bytes, bytes.fromhex("1A0000A0"))
+        self.assertEqual(lic_bytes, bytes.fromhex("1A003009"))
+        self.assertNotEqual(ecc_bytes, lic_bytes)
+
     def test_mec_ptyn_matches_spec_example(self):
         # <3E><00><02><46><6F><6F><74><62><61><6C><6C> -- current data
         # set, service 2, PTYN="Football" (8 chars exactly).
@@ -751,7 +779,7 @@ class RtPlusOmitVsGenericTests(SimpleTestCase):
     def setUp(self):
         self.mgr = RBDSManager()
         self.config = mock.Mock(
-            pi_code="", ecc="", ta=False, tp=False,
+            pi_code="", ecc="", language_code=None, ta=False, tp=False,
             di_dynamic_pty=False, di_compressed=False, di_artificial_head=False, di_stereo=True,
             ms=True, pty=0, use_rt_plus=True, af_frequencies_mhz="",
             uecp_site_address=1, uecp_encoder_address=0,
@@ -1102,7 +1130,7 @@ class RtPlusMecCompositionTests(SimpleTestCase):
     def setUp(self):
         self.mgr = RBDSManager()
         self.config = mock.Mock(
-            pi_code="", ecc="", ta=False, tp=False,
+            pi_code="", ecc="", language_code=None, ta=False, tp=False,
             di_dynamic_pty=False, di_compressed=False, di_artificial_head=False, di_stereo=True,
             ms=True, pty=0, use_rt_plus=True, af_frequencies_mhz="",
             uecp_site_address=1, uecp_encoder_address=0,
@@ -1295,7 +1323,7 @@ class RtNormalizationGapTests(SimpleTestCase):
         # a raw (un-normalized) ptyn and inspecting the resulting
         # MEC 0x3E bytes.
         config = mock.Mock(
-            pi_code="", ecc="", ta=False, tp=False,
+            pi_code="", ecc="", language_code=None, ta=False, tp=False,
             di_dynamic_pty=False, di_compressed=False, di_artificial_head=False, di_stereo=True,
             ms=True, pty=0, use_rt_plus=False, af_frequencies_mhz="",
             uecp_site_address=1, uecp_encoder_address=0,
@@ -1428,7 +1456,7 @@ class RBDSAfRuntimeBlockTests(SimpleTestCase):
     def setUp(self):
         self.mgr = RBDSManager()
         self.config = mock.Mock(
-            pi_code="", ecc="", ta=False, tp=False,
+            pi_code="", ecc="", language_code=None, ta=False, tp=False,
             di_dynamic_pty=False, di_compressed=False, di_artificial_head=False, di_stereo=True,
             ms=True, pty=0, use_rt_plus=False,
             af_frequencies_mhz="89.5, 91.3",  # bypasses clean() entirely -- a bare mock, not a real .save()
@@ -1531,6 +1559,175 @@ class EffectiveDynamicPtyTests(TestCase):
         di_mec = _find_mec(_split_uecp_frames(sent_payloads[0]), 0x04)
         self.assertIsNotNone(di_mec)
         self.assertEqual(di_mec[3] & 0x08, 0x08, "dynamic-PTY bit must be set: a category override exists")
+
+
+def _slow_label_value(msg, variant):
+    """Extracts the 12-bit data value from a raw MEC 0x1A frame if its
+    variant nibble matches, else None. msg format: MEC(1A) DSN MED1 MED2,
+    MED1 bits 6-4 = variant, bits 3-0 = data MSB, MED2 = data LSB."""
+    if not msg or msg[0] != 0x1A or len(msg) < 4:
+        return None
+    if ((msg[2] >> 4) & 0x7) != variant:
+        return None
+    return ((msg[2] & 0xF) << 8) | msg[3]
+
+
+class RBDSManagerLicTests(TestCase):
+    """Legacy Language Identification Code (LIC), MEC 0x1A variant 3 --
+    same MEC family as ECC (variant 0), sent as part of the main full
+    UECP payload (not a dedicated cadence like CT), so it inherits the
+    existing, already-tested change/full-resend/reconnect triggers for
+    free. The one piece of state this class owns is the explicit
+    clear-to-"Unknown" behavior when language_code is disabled after
+    having been set -- see rbds_manager.py's _last_sent_language_code."""
+
+    def setUp(self):
+        # _tick()'s own close_old_connections() call closes the shared
+        # connection out from under this TestCase's wrapping atomic
+        # block in this environment (autocommit-state mismatch trips
+        # BaseDatabaseWrapper.close_if_unusable_or_obsolete's very first
+        # check) -- production _tick() never runs inside an atomic
+        # block at all, so this is a test-harness-only interaction, not
+        # a real behavior difference. Confirmed by bisection: every
+        # RBDSConfig.load() call inside _tick() failed with
+        # "connection already closed" until this was patched out;
+        # after patching, only genuine assertion failures remained.
+        patcher = mock.patch("rbds.services.rbds_manager.close_old_connections")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.mgr = RBDSManager()
+        self.sent = []
+        self.mgr._transmit = mock.Mock(side_effect=lambda config, payload: self.sent.append(payload))
+        self.mgr._read_now_playing = mock.Mock(return_value={"title": "", "artist": ""})
+        self.mgr._read_category_state = mock.Mock(return_value={"pty_override": None, "ptyn": ""})
+        self.config = RBDSConfig.load()
+        self.config.protocol = "uecp"
+        self.config.use_rt_plus = False
+        self.config.ecc = "A0"
+
+    def _lic_values_sent(self):
+        values = []
+        for payload in self.sent:
+            for msg in _split_uecp_frames(payload):
+                v = _slow_label_value(msg, variant=3)
+                if v is not None:
+                    values.append(v)
+        return values
+
+    def _ecc_values_sent(self):
+        values = []
+        for payload in self.sent:
+            for msg in _split_uecp_frames(payload):
+                v = _slow_label_value(msg, variant=0)
+                if v is not None:
+                    values.append(v)
+        return values
+
+    # 1. Blank default emits no LIC MEC.
+    def test_blank_default_emits_no_lic(self):
+        self.config.save()  # language_code left at its default (None)
+        self.mgr._tick()
+        self.assertEqual(self._lic_values_sent(), [])
+
+    # 2/5. English emits exact bytes; startup includes it.
+    def test_english_emits_exact_bytes_on_startup(self):
+        self.config.language_code = 9
+        self.config.save()
+        self.mgr._tick()
+        frames = _split_uecp_frames(self.sent[0])
+        lic_frame = next(m for m in frames if m and m[0] == 0x1A and (m[2] >> 4) & 0x7 == 3)
+        self.assertEqual(bytes(lic_frame), bytes.fromhex("1A003009"))
+
+    # 3. LIC appears in the main full payload exactly once per send.
+    def test_lic_appears_exactly_once_per_full_payload(self):
+        self.config.language_code = 9
+        self.config.save()
+        self.mgr._tick()
+        frames = _split_uecp_frames(self.sent[0])
+        lic_frames = [m for m in frames if _slow_label_value(m, variant=3) is not None]
+        self.assertEqual(len(lic_frames), 1)
+
+    # 4. LIC does not appear in RT+-only maintenance sends.
+    def test_lic_absent_from_rt_plus_only_maintenance_send(self):
+        # _send_rt_plus_only transmits directly rather than returning a
+        # payload -- call it the same way _tick() does and inspect what
+        # actually got queued.
+        self.config.use_rt_plus = True
+        self.sent.clear()
+        self.mgr._send_rt_plus_only(self.config, "Rush - Tom Sawyer", "Rush", "Tom Sawyer")
+        for payload in self.sent:
+            for msg in _split_uecp_frames(payload):
+                self.assertNotEqual(msg[0] if msg else None, 0x1A, "MEC 0x1A must never ride the RT+-only send")
+
+    # 6. Periodic full resend reasserts LIC even though the value is unchanged.
+    def test_periodic_full_resend_reasserts_lic(self):
+        self.config.language_code = 9
+        self.config.save()
+        self.mgr._tick()
+        self.mgr._last_full_resend = 0.0  # force the full-resend gate open
+        self.mgr._tick()
+        self.assertEqual(self._lic_values_sent(), [9, 9])
+
+    # 7. A fresh reconnect (genuine _connected_since transition) reasserts LIC.
+    def test_reconnect_reasserts_lic(self):
+        self.config.language_code = 9
+        self.config.save()
+        self.mgr._tick()
+        self.mgr._connected = False
+        self.mgr._connected_since = None
+        time.sleep(0.01)
+        self.mgr._tick()
+        self.assertEqual(self._lic_values_sent(), [9, 9])
+
+    # 8. Language-code change sends the new value.
+    def test_language_code_change_sends_new_value(self):
+        self.config.language_code = 9
+        self.config.save()
+        self.mgr._tick()
+        self.config.language_code = 8  # German
+        self.config.save()
+        self.mgr._tick()
+        self.assertEqual(self._lic_values_sent(), [9, 8])
+
+    # 9. Failed send preserves pending language state.
+    def test_failed_send_preserves_pending_language_state(self):
+        self.config.language_code = 9
+        self.config.save()
+        self.mgr._transmit = mock.Mock(side_effect=ConnectionError("simulated failure"))
+        self.mgr._tick()
+        self.assertIsNone(self.mgr._last_sent_language_code, "a failed send must not commit the desired state")
+        # Next tick, now succeeding, must still send 9 (not silently dropped).
+        self.mgr._transmit = mock.Mock(side_effect=lambda config, payload: self.sent.append(payload))
+        self.mgr._tick()
+        self.assertEqual(self._lic_values_sent(), [9])
+
+    # 10. Disable-after-enable sends the standards-defined clear
+    # ("Unknown", code 0) exactly once, then stops.
+    def test_disable_after_enable_sends_unknown_clear_once(self):
+        self.config.language_code = 9
+        self.config.save()
+        self.mgr._tick()
+        self.config.language_code = None
+        self.config.save()
+        self.mgr._tick()
+        self.assertEqual(self._lic_values_sent(), [9, 0])
+        self.assertIsNone(self.mgr._last_sent_language_code)
+        # A further ordinary tick (nothing changed, not yet due for
+        # full resend) must NOT re-send the clear -- it already landed.
+        self.mgr._tick()
+        self.assertEqual(self._lic_values_sent(), [9, 0])
+
+    # 12/13. ECC bytes are unaffected by LIC, and both ride the same payload.
+    def test_ecc_unchanged_and_coexists_with_lic_in_same_payload(self):
+        self.config.language_code = 9
+        self.config.save()
+        self.mgr._tick()
+        self.assertEqual(self._ecc_values_sent(), [0xA0])
+        self.assertEqual(self._lic_values_sent(), [9])
+        frames = _split_uecp_frames(self.sent[0])
+        ecc_frame = next(m for m in frames if _slow_label_value(m, variant=0) is not None)
+        lic_frame = next(m for m in frames if _slow_label_value(m, variant=3) is not None)
+        self.assertNotEqual(bytes(ecc_frame), bytes(lic_frame))
 
 
 class RBDSManagerReconnectBackoffTests(SimpleTestCase):

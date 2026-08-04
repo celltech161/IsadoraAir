@@ -170,6 +170,34 @@ def mec_ecc(ecc: int, dsn: int = 0x00) -> bytes:
     return mec_slow_labelling(variant=0, data=ecc, dsn=dsn)
 
 
+def mec_language_code(code: int, dsn: int = 0x00) -> bytes:
+    """Legacy RDS Language Identification Code (LIC), sent via Slow
+    Labelling Codes (MEC 0x1A), variant 3 -- same command family as
+    mec_ecc() (variant 0), same rationale: the primary UECP spec
+    (section 3.3.12) documents the general Slow Labelling Codes wire
+    format but explicitly defers per-variant field meanings to the RDS
+    standard itself.
+
+    Variant 3 = Language is corroborated here via redsea's own group-1A
+    decoder (src/station.cc:390-391: `case 3: out["language"] =
+    getLanguageString(...)`), the same class of secondary corroboration
+    already used and documented for ECC's variant 0 (RDS Forum glossary
+    / Silicon Labs AN243) -- see
+    scratchpad/rbds_bench/lic_group1a_rtplus/00_LIC_SOURCE_MAP.md for
+    the full derivation, including redsea's complete 128-entry language
+    table extracted programmatically (not hand-transcribed) to confirm
+    code 9 = English.
+
+    Language occupies the low 8 bits of variant 3's 12-bit data field --
+    identical convention to mec_ecc(), whose own low-8-bits-of-12
+    layout this mirrors exactly. Code 0 = "Unknown" is itself a defined
+    table entry (not an error/gap), usable as an explicit on-air clear
+    value -- see rbds/services/rbds_language.py's own module docstring."""
+    if not (0 <= code <= 0xFF):
+        raise ValueError("language code must be 0-255 (8 bits)")
+    return mec_slow_labelling(variant=3, data=code, dsn=dsn)
+
+
 def mec_ptyn(text: str, dsn: int = 0x00, psn: int = 0x00) -> bytes:
     """MEC 0x3E -- Programme Type Name (spec section 3.3.8). Further
     describes the current PTY with a free-text label the broadcaster

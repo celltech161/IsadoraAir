@@ -3,6 +3,7 @@ import re
 from django.core.exceptions import ValidationError
 from django.db import models
 
+from rbds.services.rbds_language import RBDS_LANGUAGE_CONFIG_CHOICES
 from rbds.services.rbds_pty import RBDS_PTY_CHOICES
 
 PROTOCOL_CHOICES = [
@@ -78,6 +79,17 @@ class RBDSConfig(models.Model):
                    "so this field is silently ignored when Protocol is ASCII mode "
                    "(the value is kept regardless so switching back to UECP doesn't "
                    "lose it).",
+    )
+    language_code = models.PositiveSmallIntegerField(
+        "Language (LIC)",
+        null=True, blank=True, default=None, choices=RBDS_LANGUAGE_CONFIG_CHOICES,
+        help_text="Optional legacy RDS Language Identification Code transmitted in "
+                   "group 1A through UECP. English is code 9. This is retained for "
+                   "receiver compatibility and is distinct from Long PS. Leave "
+                   "'Disabled' to not send LIC at all -- this is the default so "
+                   "existing installations don't suddenly start transmitting it. "
+                   "UECP-only feature, same as ECC: silently ignored when Protocol "
+                   "is ASCII mode (the value is kept regardless).",
     )
     station_ps = models.CharField(
         max_length=8, blank=True,

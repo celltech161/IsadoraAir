@@ -12,7 +12,7 @@ class RBDSConfigAdmin(admin.ModelAdmin):
     fieldsets = [
         ("Connection", {"fields": ["host", "port", "transport", "protocol"]}),
         ("UECP Addressing", {"fields": ["uecp_site_address", "uecp_encoder_address"]}),
-        ("Identity", {"fields": ["pi_code", "ecc", "station_ps", "pty", "tp", "ta", "ms"]}),
+        ("Identity", {"fields": ["pi_code", "ecc", "language_code", "station_ps", "pty", "tp", "ta", "ms"]}),
         ("DI Flags", {"fields": ["di_dynamic_pty", "di_compressed", "di_artificial_head", "di_stereo"]}),
         ("AF List", {"fields": ["af_frequencies_mhz"]}),
         ("Clock Time (CT)", {"fields": ["send_ct"]}),

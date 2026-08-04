@@ -106,6 +106,10 @@ class RBDSManager:
         self._reconnect_delay_seconds = None
         self._last_sent_ps = None
         self._last_sent_rt = None
+        # None means "nothing sent yet" (same convention as _last_sent_ps/
+        # _last_sent_rt), NOT "language code 0/Unknown was sent" -- those
+        # are different states, see _build_uecp_payload's LIC block.
+        self._last_sent_language_code = None
         self._last_full_resend = 0.0
         self._last_rt_plus_resend = 0.0
         self._last_error = None
@@ -211,7 +215,8 @@ class RBDSManager:
         # (and every RT+ maintenance resend) kept re-toggling A/B on
         # every receiver even when RT hadn't changed at all.
         rt_changed = rt_text != self._last_sent_rt
-        changed = target_ps != self._last_sent_ps or rt_changed
+        language_changed = config.language_code != self._last_sent_language_code
+        changed = target_ps != self._last_sent_ps or rt_changed or language_changed
         due_for_full_resend = (time.time() - self._last_full_resend) >= FULL_RESEND_SECONDS
 
         # While disconnected, retry every tick rather than waiting for the
@@ -242,6 +247,7 @@ class RBDSManager:
             if send_ok:
                 self._last_sent_ps = target_ps
                 self._last_sent_rt = rt_text
+                self._last_sent_language_code = config.language_code
                 self._last_full_resend = time.time()
                 # A full send just went out and includes the RT+ MECs,
                 # so count it as a fresh RT+ resend and let the 2s
@@ -616,6 +622,20 @@ class RBDSManager:
             # together in the same frame -- max chance of a coherent
             # (PI, ECC) tuple before the next frame boundary.
             meds.append(uecp.mec_ecc(int(config.ecc, 16)))
+        if config.language_code is not None:
+            # Same MEC family as ECC (0x1A), different variant (3) --
+            # each is its own independent MEC element/frame, so neither
+            # can overwrite the other at the UECP layer (see
+            # mec_language_code's own docstring).
+            meds.append(uecp.mec_language_code(config.language_code))
+        elif self._last_sent_language_code is not None:
+            # Was configured, now disabled -- send the standards-defined
+            # "Unknown" clear value (code 0, a real table entry, not a
+            # gap) rather than silently leaving StereoTool's last-cached
+            # language stale forever. Only fires once (until re-enabled)
+            # since _last_sent_language_code itself becomes None right
+            # after this successfully lands -- see _tick()'s send_ok block.
+            meds.append(uecp.mec_language_code(0))
         meds.append(uecp.mec_ps(ps))
         meds.append(uecp.mec_ta_tp(ta=config.ta, tp=config.tp))
         meds.append(uecp.mec_di(
