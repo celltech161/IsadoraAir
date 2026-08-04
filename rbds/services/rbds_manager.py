@@ -8,6 +8,7 @@ shape -- there's no subprocess here, this process itself holds the one
 persistent connection)."""
 import datetime
 import json
+import os
 import socket
 import time
 from pathlib import Path
@@ -39,6 +40,26 @@ FULL_RESEND_SECONDS = 30  # periodic full resend even if nothing changed -- RDS 
 RT_PLUS_RESEND_SECONDS = 2
 TCP_RECONNECT_BACKOFF = [1, 2, 5, 10, 30]
 FILE_URL_FETCH_TIMEOUT = 5  # seconds, bounds a slow/hanging URL source's delay on the tick it fires
+
+# --- RT+ MEC 0x24 vs vendor MEC 0xAA authority-isolation diagnostic ---
+# (2026-08-04, see scratchpad/rbds_bench/rtplus_isolation_experiment/
+# RTPLUS_0X24_0XAA_ISOLATION_REPORT.md). Temporary, narrowly-scoped
+# bench control -- NOT a RBDSConfig/DB field, NOT operator-facing.
+# Independently gates whether MEC 0x24 (ODA registration + tag-geometry
+# frames) and vendor MEC 0xAA (StereoTool "song info") get included in
+# the RT+ portion of a UECP send, so the two can be isolated on air to
+# determine which one StereoTool actually uses to generate group 3A/
+# 11A. Read once at process start; changing either requires an
+# isadoraair-rbds.service restart, same as any other module-level
+# constant in this file -- there is no hot-reload path for this and
+# none is being added, since this is meant to be removed (or replaced
+# by a real design) once the experiment concludes, not kept as a live
+# runtime toggle. Defaults to both True (current production behavior)
+# so this is a complete no-op with either env var unset -- ordinary
+# operation, including every existing test, is unaffected unless a
+# test explicitly overrides these.
+RT_PLUS_MEC_0X24_ENABLED = os.environ.get("RBDS_DIAG_RT_PLUS_0X24", "1") != "0"
+RT_PLUS_MEC_0XAA_ENABLED = os.environ.get("RBDS_DIAG_RT_PLUS_0XAA", "1") != "0"
 
 STATE_PATH = Path("/run/isadoraair/rbds_state.json")
 NOW_PLAYING_PATH = Path("/run/isadoraair/now_playing.json")  # read-only, owned by library/services/engine.py
@@ -513,12 +534,23 @@ class RBDSManager:
         """Small write carrying only the RT+ MECs, each in its own
         UECP frame (see _build_uecp_payload for the why) -- fired
         between full sends to keep StereoTool's 11A group cadence
-        saturated. See _tick's RT_PLUS_RESEND_SECONDS block."""
-        meds = [uecp.mec_rt_plus_oda_reg()]
+        saturated. See _tick's RT_PLUS_RESEND_SECONDS block.
+
+        Each MEC's inclusion is additionally gated by the module-level
+        RT_PLUS_MEC_0X24_ENABLED / RT_PLUS_MEC_0XAA_ENABLED diagnostic
+        flags (both default True -- see their definitions). This is
+        the same gating _build_uecp_payload applies; kept as two
+        separate `if` checks rather than a shared helper since the two
+        call sites build different MED lists around them."""
+        meds = []
+        if RT_PLUS_MEC_0X24_ENABLED:
+            meds.append(uecp.mec_rt_plus_oda_reg())
         if artist and title and len(artist) <= 32:
-            meds.append(uecp.mec_rt_plus_tags(len(artist), len(title)))
-            meds.append(uecp.mec_song_info(
-                f"{artist}{self.RT_PLUS_SEPARATOR}{title}"))
+            if RT_PLUS_MEC_0X24_ENABLED:
+                meds.append(uecp.mec_rt_plus_tags(len(artist), len(title)))
+            if RT_PLUS_MEC_0XAA_ENABLED:
+                meds.append(uecp.mec_song_info(
+                    f"{artist}{self.RT_PLUS_SEPARATOR}{title}"))
         elif artist is None and title is None and rt:
             # Genuinely non-song RT (weather/promo/station-ID/file/url)
             # -- see mec_rt_plus_tags_generic's docstring. A song whose
@@ -527,10 +559,17 @@ class RBDSManager:
             # through here on purpose and sends NOTHING, rather than
             # borrowing this non-song tag for it (2026-08-02 fix,
             # findings #4/#5 -- `artist`/`title` are "" not None in
-            # that case, see _build_rt_plus_text's docstring).
-            meds.append(uecp.mec_rt_plus_tags_generic(len(rt)))
+            # that case, see _build_rt_plus_text's docstring). Note:
+            # mec_song_info (0xAA) is never sent for non-song content
+            # in this codebase regardless of RT_PLUS_MEC_0XAA_ENABLED
+            # -- that asymmetry is pre-existing, not introduced by
+            # this diagnostic (see 00_SOURCE_MAP.md).
+            if RT_PLUS_MEC_0X24_ENABLED:
+                meds.append(uecp.mec_rt_plus_tags_generic(len(rt)))
         else:
             return  # nothing to (re-)send
+        if not meds:
+            return  # both diagnostic flags off (or nothing eligible) -- no RT+ MEC to send this cycle
         self._transmit(config, self._frames_for(config, meds))
 
     def _build_uecp_payload(self, config, ps, rt, artist=None, title=None, pty=None, ptyn="",
@@ -594,13 +633,24 @@ class RBDSManager:
             # ODA registration rides every UECP send so a receiver
             # that catches us mid-broadcast learns "RT+ (AID 0x4BD7)
             # lives on group 11A" within one send.
-            meds.append(uecp.mec_rt_plus_oda_reg())
+            #
+            # Each MEC's inclusion below is additionally gated by the
+            # module-level RT_PLUS_MEC_0X24_ENABLED /
+            # RT_PLUS_MEC_0XAA_ENABLED diagnostic flags (both default
+            # True -- see their definitions near the top of this file,
+            # and RTPLUS_0X24_0XAA_ISOLATION_REPORT.md for why). With
+            # both at their default, every `if` below is a no-op and
+            # this block behaves exactly as before.
+            if RT_PLUS_MEC_0X24_ENABLED:
+                meds.append(uecp.mec_rt_plus_oda_reg())
             if artist and title and len(artist) <= 32:
                 # Real song: two-tag payload (item.artist +
                 # item.title) plus vendor song info.
-                meds.append(uecp.mec_rt_plus_tags(len(artist), len(title)))
-                meds.append(uecp.mec_song_info(
-                    f"{artist}{self.RT_PLUS_SEPARATOR}{title}"))
+                if RT_PLUS_MEC_0X24_ENABLED:
+                    meds.append(uecp.mec_rt_plus_tags(len(artist), len(title)))
+                if RT_PLUS_MEC_0XAA_ENABLED:
+                    meds.append(uecp.mec_song_info(
+                        f"{artist}{self.RT_PLUS_SEPARATOR}{title}"))
             elif artist is None and title is None and rt:
                 # Genuinely non-song RT (weather / promo / station ID /
                 # file / url content). Emit a single tag that covers
@@ -611,8 +661,13 @@ class RBDSManager:
                 # type. A song whose artist didn't fit (>32 chars, or
                 # "" after truncation defeated the split -- see
                 # _build_rt_plus_text) omits RT+ entirely instead of
-                # landing here (2026-08-02 fix, findings #4/#5).
-                meds.append(uecp.mec_rt_plus_tags_generic(len(rt)))
+                # landing here (2026-08-02 fix, findings #4/#5). Note:
+                # mec_song_info (0xAA) is never sent for non-song
+                # content regardless of RT_PLUS_MEC_0XAA_ENABLED --
+                # pre-existing asymmetry, not introduced by this
+                # diagnostic (see 00_SOURCE_MAP.md).
+                if RT_PLUS_MEC_0X24_ENABLED:
+                    meds.append(uecp.mec_rt_plus_tags_generic(len(rt)))
         if config.af_frequencies_mhz:
             # Hard runtime block, not just RBDSConfig.clean() (which
             # only guards the admin form) -- Django's save() doesn't

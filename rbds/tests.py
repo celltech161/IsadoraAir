@@ -6,6 +6,7 @@ from django.test import SimpleTestCase, TestCase
 
 from rbds.models import RBDSConfig, RBDSMessage, RBDSPSFrame
 from rbds.services import ascii_protocol, charset, uecp
+from rbds.services import rbds_manager
 from rbds.services.content_fetch import ContentFetchCache
 from rbds.services.rbds_manager import RBDSManager
 from rbds.services.rotation import PSRotation, RTRotation
@@ -1094,6 +1095,159 @@ class RBDSManagerCtOnOffTests(TestCase):
         self.mgr._last_ct_sent_minute = (self.mgr._last_ct_sent_minute - 1) % 60
         self.mgr._tick()
         self.assertEqual(mec_0d_count(), 2, "a real minute rollover must still send CT value")
+
+
+class RtPlusMecIsolationDiagnosticTests(SimpleTestCase):
+    """Regression coverage for the temporary RT+ MEC 0x24 vs vendor MEC
+    0xAA authority-isolation diagnostic (RT_PLUS_MEC_0X24_ENABLED /
+    RT_PLUS_MEC_0XAA_ENABLED module constants in rbds_manager.py) --
+    see RTPLUS_0X24_0XAA_ISOLATION_REPORT.md. Proves each of the four
+    mode combinations produces the expected UECP frame set, that
+    ordinary RT (0x0A) is never affected, and that the untouched
+    defaults reproduce production (Mode A) behavior exactly."""
+
+    def setUp(self):
+        self.mgr = RBDSManager()
+        self.config = mock.Mock(
+            pi_code="", ecc="", ta=False, tp=False,
+            di_dynamic_pty=False, di_compressed=False, di_artificial_head=False, di_stereo=True,
+            ms=True, pty=0, use_rt_plus=True, af_frequencies_mhz="",
+            uecp_site_address=1, uecp_encoder_address=0,
+        )
+
+    def _song_frames(self):
+        payload = self.mgr._build_uecp_payload(
+            self.config, "PS      ", "Rush - Tom Sawyer", "Rush", "Tom Sawyer",
+        )
+        return _split_uecp_frames(payload)
+
+    def _nonsong_frames(self):
+        payload = self.mgr._build_uecp_payload(
+            self.config, "PS      ", "Temp: 86F, Wind: SE", None, None,
+        )
+        return _split_uecp_frames(payload)
+
+    def _patched(self, mec_0x24, mec_0xaa):
+        return mock.patch.multiple(
+            rbds_manager,
+            RT_PLUS_MEC_0X24_ENABLED=mec_0x24,
+            RT_PLUS_MEC_0XAA_ENABLED=mec_0xaa,
+        )
+
+    # --- Mode A: both enabled (production default) ---
+
+    def test_mode_a_both_enabled_song_has_oda_tags_and_song_info(self):
+        with self._patched(True, True):
+            frames = self._song_frames()
+        self.assertIsNotNone(_find_mec(frames, 0x24, subtype=0x06), "ODA registration must be present")
+        self.assertIsNotNone(_find_mec(frames, 0x24, subtype=0x16), "song tag geometry must be present")
+        self.assertIsNotNone(_find_mec(frames, 0xAA), "vendor song info must be present")
+        self.assertIsNotNone(_find_mec(frames, 0x0A), "ordinary RT must always be present")
+
+    def test_untouched_defaults_match_mode_a(self):
+        # No mock.patch at all -- proves the real, unmodified module
+        # constants (as loaded from the environment at process start,
+        # both unset) reproduce Mode A exactly.
+        frames = self._song_frames()
+        self.assertIsNotNone(_find_mec(frames, 0x24, subtype=0x06))
+        self.assertIsNotNone(_find_mec(frames, 0x24, subtype=0x16))
+        self.assertIsNotNone(_find_mec(frames, 0xAA))
+        self.assertIsNotNone(_find_mec(frames, 0x0A))
+
+    # --- Mode B: 0x24 only ---
+
+    def test_mode_b_0x24_only_song_has_oda_and_tags_but_not_song_info(self):
+        with self._patched(True, False):
+            frames = self._song_frames()
+        self.assertIsNotNone(_find_mec(frames, 0x24, subtype=0x06))
+        self.assertIsNotNone(_find_mec(frames, 0x24, subtype=0x16))
+        self.assertIsNone(_find_mec(frames, 0xAA), "0xAA must be absent in Mode B")
+        self.assertIsNotNone(_find_mec(frames, 0x0A))
+
+    # --- Mode C: 0xAA only ---
+
+    def test_mode_c_0xaa_only_song_has_song_info_but_not_oda_or_tags(self):
+        with self._patched(False, True):
+            frames = self._song_frames()
+        self.assertIsNone(_find_mec(frames, 0x24, subtype=0x06), "ODA registration must be absent in Mode C")
+        self.assertIsNone(_find_mec(frames, 0x24, subtype=0x16), "tag geometry must be absent in Mode C")
+        self.assertIsNotNone(_find_mec(frames, 0xAA), "0xAA must still be present in Mode C")
+        self.assertIsNotNone(_find_mec(frames, 0x0A))
+
+    def test_mode_c_nonsong_has_no_rt_plus_mec_at_all(self):
+        # Pre-existing asymmetry: mec_song_info is never sent for
+        # non-song content regardless of RT_PLUS_MEC_0XAA_ENABLED, so
+        # Mode C carries ZERO RT+ MECs for non-song RT specifically --
+        # this is the exact case the isolation report flags.
+        with self._patched(False, True):
+            frames = self._nonsong_frames()
+        self.assertIsNone(_find_mec(frames, 0x24, subtype=0x16))
+        self.assertIsNone(_find_mec(frames, 0xAA))
+        self.assertIsNotNone(_find_mec(frames, 0x0A), "ordinary RT must still be present")
+
+    # --- Mode D: neither ---
+
+    def test_mode_d_neither_song_has_no_rt_plus_mec_at_all(self):
+        with self._patched(False, False):
+            frames = self._song_frames()
+        self.assertIsNone(_find_mec(frames, 0x24, subtype=0x06))
+        self.assertIsNone(_find_mec(frames, 0x24, subtype=0x16))
+        self.assertIsNone(_find_mec(frames, 0xAA))
+        self.assertIsNotNone(_find_mec(frames, 0x0A), "Mode D must still transmit ordinary RT")
+
+    def test_mode_d_nonsong_has_no_rt_plus_mec_at_all(self):
+        with self._patched(False, False):
+            frames = self._nonsong_frames()
+        self.assertIsNone(_find_mec(frames, 0x24, subtype=0x16))
+        self.assertIsNone(_find_mec(frames, 0xAA))
+        self.assertIsNotNone(_find_mec(frames, 0x0A))
+
+    # --- non-song generic tag, Mode A/B for completeness ---
+
+    def test_mode_a_nonsong_gets_generic_tag_never_song_info(self):
+        with self._patched(True, True):
+            frames = self._nonsong_frames()
+        tags = _find_mec(frames, 0x24, subtype=0x16)
+        self.assertIsNotNone(tags)
+        self.assertEqual(tags[2], 0x0B)  # single-tag "generic" marker
+        self.assertIsNone(_find_mec(frames, 0xAA), "0xAA is never sent for non-song content, any mode")
+
+    def test_mode_b_nonsong_gets_generic_tag(self):
+        with self._patched(True, False):
+            frames = self._nonsong_frames()
+        tags = _find_mec(frames, 0x24, subtype=0x16)
+        self.assertIsNotNone(tags)
+        self.assertEqual(tags[2], 0x0B)
+
+    # --- _send_rt_plus_only (the 2s maintenance resend) gets the same gating ---
+
+    def test_send_rt_plus_only_mode_d_sends_nothing(self):
+        sent = []
+        self.mgr._transmit = mock.Mock(side_effect=lambda config, payload: sent.append(payload))
+        with self._patched(False, False):
+            self.mgr._send_rt_plus_only(self.config, "Rush - Tom Sawyer", "Rush", "Tom Sawyer")
+        self.assertEqual(sent, [], "Mode D must not transmit anything from the RT+-only resend")
+
+    def test_send_rt_plus_only_mode_a_sends_all_three_frames(self):
+        sent = []
+        self.mgr._transmit = mock.Mock(side_effect=lambda config, payload: sent.append(payload))
+        with self._patched(True, True):
+            self.mgr._send_rt_plus_only(self.config, "Rush - Tom Sawyer", "Rush", "Tom Sawyer")
+        self.assertEqual(len(sent), 1)
+        frames = _split_uecp_frames(sent[0])
+        self.assertIsNotNone(_find_mec(frames, 0x24, subtype=0x06))
+        self.assertIsNotNone(_find_mec(frames, 0x24, subtype=0x16))
+        self.assertIsNotNone(_find_mec(frames, 0xAA))
+
+    def test_send_rt_plus_only_mode_b_omits_song_info(self):
+        sent = []
+        self.mgr._transmit = mock.Mock(side_effect=lambda config, payload: sent.append(payload))
+        with self._patched(True, False):
+            self.mgr._send_rt_plus_only(self.config, "Rush - Tom Sawyer", "Rush", "Tom Sawyer")
+        self.assertEqual(len(sent), 1)
+        frames = _split_uecp_frames(sent[0])
+        self.assertIsNotNone(_find_mec(frames, 0x24, subtype=0x16))
+        self.assertIsNone(_find_mec(frames, 0xAA))
 
 
 class RBDSConfigValidationTests(SimpleTestCase):
