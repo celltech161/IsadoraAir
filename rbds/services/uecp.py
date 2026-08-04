@@ -44,12 +44,6 @@ examples) -- an earlier version of this module used
 wrong glyph for every accented character and silently dropped anything
 outside Latin-1 entirely (curly quotes, em dashes, degree signs, etc).
 
-mec_song_info (MEC 0xAA) is the one exception, deliberately left on
-Latin-1 -- it's a reverse-engineered StereoTool vendor channel, not a
-standards-defined field, and switching IT to G0 too would be the same
-kind of unverified guess this file is otherwise careful to avoid. See
-that function's own docstring for the full reasoning.
-
 CRC verification note: the spec's own worked example for the CRC
 algorithm itself (Appendix 1, both the 1997 v5.1 and 2006 v6.02
 revisions) contains a literal typo -- "2D111234010105ABCD123F0XXXX11069
@@ -350,29 +344,31 @@ def mec_rt_plus_tags_generic(rt_text_len: int) -> bytes:
       Weather1 "Temp: 86F..." (56 chars) -> 24 16 0b 20 6e 00 00
       Weather2 "Wind: Southeast..." (51) -> 24 16 0b 20 64 00 00
 
-    CAUTION (2026-08-02 primary-source review): the exact RT+ content
-    type this actually produces on air is NOT independently confirmed.
-    MEC 0x24 here is not a real UECP command -- SPB490 defines 0x24 as
-    a generic "free-format group" carrier; StereoTool/RDS Magic 4 have
-    repurposed it as an undocumented private channel that doesn't
-    mirror the real on-air 11A bit layout, so these bytes can't be
-    decoded against the actual RT+ content-type table (confirmed:
-    class 4=ITEM.ARTIST, 1=ITEM.TITLE, 25=INFO.WEATHER, per RDS Forum
-    doc R05/036_1) without a real on-air capture. Do NOT assume this
-    equals INFO.WEATHER -- that was this module's own prior guess, not
-    a confirmed fact. What IS confirmed by design (see the docstring
-    paragraph above and rbds_manager.py's call sites): this exists to
-    stop a receiver from misapplying a STALE song's artist/title
-    offsets to unrelated text, not to assert a specific semantic
-    label. It is deliberately reused byte-for-byte across every kind
-    of non-song RT (weather/promo/station-ID/file/url) for exactly
-    that reason -- an intentional, still-unresolved simplification,
-    not new as of this note. See the module-level PROJECT_NOTES-style
-    caveat in rbds_manager.py's RT+ send sites for the current
-    resolution: a real song whose artist is too long for the two-tag
-    format (>32 chars) now omits RT+ entirely instead of borrowing
-    this tag (closer to a song than to unrelated content, and
-    "omit rather than guess" is the safer failure mode either way).
+    ON-AIR CONFIRMATION (2026-08-04, controlled bench isolation
+    experiment -- see scratchpad/rbds_bench/rtplus_isolation_experiment/
+    RTPLUS_0X24_0XAA_ISOLATION_REPORT.md): a real TEF6686 capture,
+    decoded with redsea, showed this exact byte pattern rendering on
+    air as `content-type: info.weather` for a deliberately-injected
+    non-song test message ("Test Weather Information"), with no
+    stale song artist/title tags visible during that segment. This
+    resolves the previous "not independently confirmed" caution for
+    THAT tested case. It does NOT establish that every kind of
+    non-song RT this function is used for (promo/station-ID/file/url,
+    not just weather) renders with the same content-type -- only a
+    weather-labeled message was tested, and this function's bytes are
+    identical regardless of the actual semantic content (see below),
+    so a promo or station-ID message might decode differently, or
+    identically, on the same StereoTool build; that was not tested and
+    should not be assumed either way. What remains confirmed by design
+    regardless of content-type: this exists to stop a receiver from
+    misapplying a STALE song's artist/title offsets to unrelated text,
+    and is deliberately reused byte-for-byte across every kind of
+    non-song RT (weather/promo/station-ID/file/url) for exactly that
+    reason. See rbds_manager.py's RT+ send sites for the related,
+    already-resolved case: a real song whose artist is too long for
+    the two-tag format (>32 chars) omits RT+ entirely instead of
+    borrowing this tag (closer to a song than to unrelated content,
+    and "omit rather than guess" is the safer failure mode either way).
 
     Wire format (after the 0x24 MEC byte), 6 bytes total:
       Byte 0: 0x16                        -- subtype
@@ -403,67 +399,6 @@ def mec_rt_plus_tags_generic(rt_text_len: int) -> bytes:
     len1 = min(rt_text_len - 1, 63)  # 6-bit cap
     byte3 = (len1 & 0x3F) << 1  # bit 7 = 0 (start=0), bits 6-1 = len1
     return bytes([0x24, 0x16, 0x0b, 0x20, byte3, 0x00, 0x00])
-
-
-def mec_song_info(text: str) -> bytes:
-    """MEC 0xAA -- vendor "song info" carrier for StereoTool.
-
-    Reverse-engineered byte-for-byte from a live capture of RDS Magic 4
-    -> StereoTool UECP traffic taken 2026-07-12 (scratchpad file
-    rdsmagic_capture.bin, decoded via uecp_decode.py in the same dir).
-    Every MEC 0x0A RT update RDS Magic 4 sent was paired 1:1 with a
-    MEC 0xAA carrying the same "Artist - Title" string in this exact
-    layout, and RDS Magic 4's own RT+ Encoder pane showed no other
-    RT+-related MECs ever going out. StereoTool's internal Artist=,
-    Title=, and Song= fields (see the .rc file's default values and
-    the StOArti / StOArtF / StOArtFU tokens documented inside the
-    binary) get populated from this MEC and drive StereoTool's own
-    RT+ 11A group generation -- provided (a) Advanced RDS is licensed
-    (Advanced RDS=1 in the .rc, RT+ is one of the Advanced features
-    Thimeo lists), and (b) StereoTool's Group Sequence explicitly
-    includes 3A (ODA announcement for AID 0x4BD7 -> group 11A) and
-    11A (the actual RT+ tag data) -- neither is in the default
-    sequence, so this MEC alone is not enough; the operator must
-    enable and configure Group Sequence via the GUI or .rc.
-
-    Wire format observed:
-      MEC(0xAA) length(1B) 0xF0 <text>
-    where `length` = 1 (for the 0xF0 byte) + len(text) and the outer
-    UECP MFL wraps everything as usual (see build_frame).
-
-    Unlike mec_rt this MEC has no DSN/PSN preamble in the observed
-    capture -- RDS Magic 4 emits it addressed at the encoder level
-    only. Following the same pattern here (spec-standard mec_rt has
-    those bytes; a vendor MEC follows whatever the vendor uses, which
-    in this case is the shorter form).
-
-    Text is not truncated to 64 chars -- the capture had a 56-char
-    weather message ("Temp: 86F | ... | DewPt: 69F") ride this MEC
-    intact. StereoTool doesn't display 0xAA content directly, so its
-    length is bounded only by the outer UECP frame limit.
-
-    ENCODING (2026-08-02 review correction): still Latin-1, NOT the
-    verified RDS G0 table used everywhere else in this file. An
-    earlier revision of this fix switched this to encode_rds_g0()
-    too, on the reasoning that "it's an RDS-adjacent text field, so
-    the RDS encoding must be right" -- but that's exactly the kind of
-    unverified extension the rest of this module is careful to avoid:
-    the 2026-07-12 capture that established this MEC's byte layout
-    only ever carried plain ASCII (identical under G0/Latin-1/UTF-8
-    alike), so it provides zero evidence either way for non-ASCII
-    bytes. If anything, this MEC populating StereoTool's *internal
-    GUI-facing* Artist=/Title=/Song= fields (per this docstring's own
-    claim above) makes a display-oriented encoding MORE plausible
-    than raw G0 wire bytes, not less -- G0 is what StereoTool itself
-    should produce at the final on-air-bits stage, not necessarily
-    what it expects to receive into a text field. Left unchanged
-    pending a real bench test (per the outer review's explicit ask:
-    values whose G0/Latin-1/UTF-8 bytes actually differ, e.g. 'Ke$ha',
-    'Beyoncé', '75°F', observing StereoTool's internal fields and the
-    resulting on-air RT+), not guessed at a second time."""
-    text_bytes = text.encode("latin-1", errors="replace")
-    length = 1 + len(text_bytes)
-    return bytes([0xAA, length, 0xF0]) + text_bytes
 
 
 def mec_ct(dt_utc, offset_minutes: int) -> bytes:
