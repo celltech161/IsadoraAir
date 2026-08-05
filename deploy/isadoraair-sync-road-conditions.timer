@@ -1,0 +1,31 @@
+[Unit]
+Description=Run IsadoraAir KDOT CARS road-conditions sync (cadence enforced by the command itself)
+
+[Timer]
+# Fires every ~1 minute -- the finest granularity we ever want. The
+# REAL cadence is picked in Django admin (Road Conditions Configuration >
+# poll_cadence_minutes, 15 min by default) and enforced inside
+# sync_road_conditions itself via a last-attempt check against
+# RoadConditionsConfiguration.last_fetch_attempted_at -- same idiom as
+# OGRemoteConfig.poll_interval_minutes (see ogremote-poll.timer). A
+# "not due yet" tick exits immediately, writes nothing, and is not
+# logged as any kind of run (see sync_road_conditions.py's _run()).
+# Setting the timer to 1min means any cadence the admin picks (from a
+# few minutes upward) is honored on the next tick without needing sudo
+# to rewrite this file or reload systemd.
+#
+# The live CARS API has no pagination and no ETag/Last-Modified/
+# conditional-request support -- every actual sync re-downloads the
+# COMPLETE current dataset (~8MB at reconnaissance time), so the real
+# cadence matters for bandwidth: at 5min that's ~69GB/month, at 15min
+# ~23GB/month. The command's own Postgres advisory lock
+# (ROAD_CONDITIONS_LOCK_KEY in sync_road_conditions.py) means an
+# overlapping firing (a slow ~8MB fetch still in flight) just exits
+# immediately rather than running two syncs concurrently -- same
+# overlap-safety idiom as isadoraair-generate-dedication-intros.timer.
+OnBootSec=1min
+OnUnitActiveSec=1min
+Persistent=false
+
+[Install]
+WantedBy=timers.target

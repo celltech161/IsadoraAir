@@ -67,6 +67,7 @@ INSTALLED_APPS = [
     'encoders',
     'monitoring',
     'rbds',
+    'road_conditions',
     'weather',
     'ogremote',
     'webrequests',
@@ -244,6 +245,17 @@ MUSICBRAINZ_CONTACT = config('MUSICBRAINZ_CONTACT', default='')
 
 # Station identity for NCE reports moved to library.models.StationInfo
 # (admin: Config > Station Info) in migration 0062. No .env keys.
+
+# Kansas DOT CARS API (road conditions/construction): no credential
+# settings here. The live API's Swagger spec declares HTTP Basic on
+# every endpoint, but anonymous access was verified working for every
+# endpoint this project uses (2026-08-04 reconnaissance), and there's
+# no concrete reason yet to expose unused settings for a "first
+# version." road_conditions.api.CarsApiClient still accepts
+# username/password directly (and is tested doing so) if a future
+# round needs to wire real settings back in once KDOT requires auth.
+# The admin-editable RoadConditionsConfiguration model holds the
+# (non-secret) base URL, poll cadence, and filters.
 
 # --- Audio analysis thresholds ---
 ANALYSIS_SAMPLE_RATE = config('ANALYSIS_SAMPLE_RATE', default=4410, cast=int)

@@ -1,0 +1,188 @@
+{
+  "event-id": "CARS5-TEST-UNKNOWN-ENUM",
+  "headline": {
+    "category": "futureNewCategory",
+    "code": "a brand new code KDOT hasn't used yet"
+  },
+  "description": "US 81 in both directions: Construction work. Between KS 18 and KS 41 (1 mile south of the Minneapolis area). Look out for construction work.",
+  "creator": {
+    "contact-id": "jane.doe",
+    "email-address": "jane.doe@example.invalid"
+  },
+  "editor": {
+    "editor-identifier": "jane.doe",
+    "description": "jane.doe"
+  },
+  "message-number": 11556,
+  "message-type-version": 0,
+  "priority": 6,
+  "sender": {
+    "organization-id": "CARS5",
+    "center-id": "agency",
+    "contacts": [
+      {
+        "contact-id": "jane.doe",
+        "email-address": "jane.doe@example.invalid",
+        "organization-name": "KDOT",
+        "person-name": "Jane Doe",
+        "phone-number": "7855550100"
+      }
+    ]
+  },
+  "update-number": 1,
+  "update-time": {
+    "time": 1776355653519,
+    "nanos": 519467000,
+    "timeZoneId": "America/Chicago",
+    "utcOffset": -18000000
+  },
+  "update-expiry-time": {
+    "time": 1896690000000,
+    "timeZoneId": "America/Chicago",
+    "utcOffset": -21600000
+  },
+  "status": "SOME_NEW_STATUS_VALUE",
+  "details": [
+    {
+      "access": "PUBLIC_DOMAIN",
+      "duration-was-specified": true,
+      "duration": 2005573,
+      "element-id": 1,
+      "end-time": {
+        "time": 1896690000000,
+        "timeZoneId": "America/Chicago",
+        "utcOffset": -21600000
+      },
+      "update-time": {
+        "time": 1776355653519,
+        "nanos": 519467000,
+        "timeZoneId": "America/Chicago",
+        "utcOffset": -18000000
+      },
+      "start-time": {
+        "time": 1776690000000,
+        "timeZoneId": "America/Chicago",
+        "utcOffset": -18000000
+      },
+      "source": {
+        "organization-id": "CARS5",
+        "center-id": "agency",
+        "contacts": [
+          {
+            "contact-id": "jane.doe",
+            "email-address": "jane.doe@example.invalid",
+            "organization-name": "KDOT",
+            "person-name": "Jane Doe",
+            "phone-number": "7855550100"
+          }
+        ]
+      },
+      "descriptions": [
+        {
+          "description-type": "PhraseDescription",
+          "is-cause": false,
+          "kind": {
+            "category": "roadwork",
+            "code": "construction work"
+          }
+        }
+      ],
+      "locations": [
+        {
+          "location-type": "LinkLocation",
+          "link-direction": "BOTH_DIRECTIONS",
+          "link-ownership": "Kansas",
+          "primary-location": {
+            "geo-location": {
+              "location-type": "GeoLocation",
+              "latitude": 39.11173473368899,
+              "longitude": -97.66069999839544
+            },
+            "linear-reference": 168.7590830196437
+          },
+          "route-designator": "US 81",
+          "linear-reference-version": 1,
+          "secondary-location": {
+            "geo-location": {
+              "location-type": "GeoLocation",
+              "latitude": 39.122879254826316,
+              "longitude": -97.66891232360105
+            },
+            "linear-reference": 169.7391178233938
+          }
+        }
+      ]
+    }
+  ],
+  "geometry": {
+    "type": "LineString",
+    "coordinates": [
+      [
+        -97.6607,
+        39.111735
+      ],
+      [
+        -97.663348,
+        39.113923
+      ],
+      [
+        -97.663838,
+        39.114332
+      ],
+      [
+        -97.665586,
+        39.116051
+      ],
+      [
+        -97.666291,
+        39.116895
+      ],
+      [
+        -97.66682,
+        39.117639
+      ],
+      [
+        -97.667078,
+        39.118047
+      ],
+      [
+        -97.667699,
+        39.119199
+      ],
+      [
+        -97.667967,
+        39.119736
+      ],
+      [
+        -97.668158,
+        39.120221
+      ],
+      [
+        -97.668531,
+        39.121196
+      ],
+      [
+        -97.668607,
+        39.121477
+      ],
+      [
+        -97.668668,
+        39.121718
+      ],
+      [
+        -97.668838,
+        39.122473
+      ],
+      [
+        -97.668912,
+        39.122879
+      ]
+    ]
+  },
+  "counties": [
+    "Ottawa"
+  ],
+  "districts": [
+    "DISTRICT 2"
+  ]
+}

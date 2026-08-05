@@ -1,0 +1,222 @@
+{
+  "event-id": "CARS5-11605",
+  "headline": {
+    "category": "closure",
+    "code": "closed"
+  },
+  "description": "KS 15: Road closed. Between KS 18 and Clay County Line/Dickinson County Line (14 to 15 miles north of the Abilene area). The road is closed due to bridge construction work. Please follow the Kansas DOT-recommended detour around the closure. See map for detour(s).",
+  "creator": {
+    "contact-id": "jane.doe",
+    "email-address": "jane.doe@example.invalid"
+  },
+  "editor": {
+    "editor-identifier": "jane.doe",
+    "description": "jane.doe"
+  },
+  "message-number": 11605,
+  "message-type-version": 0,
+  "priority": 1,
+  "sender": {
+    "organization-id": "CARS5",
+    "center-id": "agency",
+    "contacts": [
+      {
+        "contact-id": "jane.doe",
+        "email-address": "jane.doe@example.invalid",
+        "organization-name": "KDOT",
+        "person-name": "Jane Doe",
+        "phone-number": "7855550100"
+      }
+    ]
+  },
+  "update-number": 3,
+  "update-time": {
+    "time": 1778250705974,
+    "nanos": 974871000,
+    "timeZoneId": "America/Chicago",
+    "utcOffset": -18000000
+  },
+  "update-expiry-time": {
+    "time": 1898250705974,
+    "nanos": 974871000,
+    "timeZoneId": "America/Chicago",
+    "utcOffset": -21600000
+  },
+  "next-update-time": {
+    "time": 1809095460000,
+    "timeZoneId": "America/Chicago",
+    "utcOffset": -18000000
+  },
+  "status": "UPDATED",
+  "details": [
+    {
+      "access": "PUBLIC_DOMAIN",
+      "duration-was-specified": true,
+      "duration": 2000000,
+      "element-id": 1,
+      "end-time": {
+        "time": 1898250705974,
+        "nanos": 974871000,
+        "timeZoneId": "America/Chicago",
+        "utcOffset": -21600000
+      },
+      "update-time": {
+        "time": 1778250705974,
+        "nanos": 974871000,
+        "timeZoneId": "America/Chicago",
+        "utcOffset": -18000000
+      },
+      "start-time": {
+        "time": 1776891600000,
+        "timeZoneId": "America/Chicago",
+        "utcOffset": -18000000
+      },
+      "source": {
+        "organization-id": "CARS5",
+        "center-id": "agency",
+        "contacts": [
+          {
+            "contact-id": "jane.doe",
+            "email-address": "jane.doe@example.invalid",
+            "organization-name": "KDOT",
+            "person-name": "Jane Doe",
+            "phone-number": "7855550100"
+          }
+        ]
+      },
+      "descriptions": [
+        {
+          "description-type": "PhraseDescription",
+          "is-cause": false,
+          "kind": {
+            "category": "closure",
+            "code": "closed"
+          }
+        },
+        {
+          "description-type": "PhraseDescription",
+          "is-cause": true,
+          "kind": {
+            "category": "roadwork",
+            "code": "bridge construction"
+          }
+        },
+        {
+          "description-type": "DetourDescription",
+          "detour-type": "PROPOSED_ALTERNATE_ROUTE",
+          "locations-on-detour": [
+            {
+              "location-type": "LinkLocation",
+              "link-direction": "BOTH_DIRECTIONS",
+              "link-ownership": "local road",
+              "primary-location": {
+                "geo-location": {
+                  "location-type": "GeoLocation",
+                  "latitude": 39.1442691,
+                  "longitude": -97.12884179999999
+                }
+              },
+              "route-designator": "unknown local road"
+            },
+            {
+              "location-type": "LinkLocation",
+              "link-direction": "BOTH_DIRECTIONS",
+              "link-ownership": "local road",
+              "primary-location": {
+                "geo-location": {
+                  "location-type": "GeoLocation",
+                  "latitude": 39.144270000000006,
+                  "longitude": -97.12884000000001
+                }
+              },
+              "route-designator": "unknown local road"
+            },
+            {
+              "location-type": "LinkLocation",
+              "link-direction": "BOTH_DIRECTIONS",
+              "link-ownership": "local road",
+              "primary-location": {
+                "geo-location": {
+                  "location-type": "GeoLocation",
+                  "latitude": 39.14428,
+                  "longitude": -97.12884000000001
+                }
+              },
+              "route-designator": "unknown local road"
+            },
+            {
+              "location-type": "LinkLocation",
+              "link-direction": "BOTH_DIRECTIONS",
+              "link-ownership": "local road",
+              "primary-location": {
+                "geo-location": {
+                  "location-type": "GeoLocation",
+                  "latitude": 39.145630000000004,
+                  "longitude": -97.12884000000001
+                }
+              },
+              "route-designator": "unknown local road"
+            },
+            {
+              "location-type": "LinkLocation",
+              "link-direction": "BOTH_DIRECTIONS",
+              "link-ownership": "local road",
+              "primary-location": {
+                "geo-location": {
+                  "location-type": "GeoLocation",
+                  "latitude": 39.145810000000004,
+                  "longitude": -97.12884000000001
+                }
+              },
+              "route-designator": "unknown local road"
+            }
+          ]
+        }
+      ],
+      "locations": [
+        {
+          "location-type": "LinkLocation",
+          "link-direction": "NOT_DIRECTIONAL",
+          "link-ownership": "Kansas",
+          "primary-location": {
+            "geo-location": {
+              "location-type": "GeoLocation",
+              "latitude": 39.0909176729694,
+              "longitude": -97.1298728084715
+            },
+            "linear-reference": 185.99258191438457
+          },
+          "route-designator": "KS 15",
+          "linear-reference-version": 1,
+          "secondary-location": {
+            "geo-location": {
+              "location-type": "GeoLocation",
+              "latitude": 39.09624574388075,
+              "longitude": -97.12991601844911
+            },
+            "linear-reference": 186.3607589071924
+          }
+        }
+      ]
+    }
+  ],
+  "geometry": {
+    "type": "LineString",
+    "coordinates": [
+      [
+        -97.129873,
+        39.090918
+      ],
+      [
+        -97.129916,
+        39.096246
+      ]
+    ]
+  },
+  "counties": [
+    "Dickinson"
+  ],
+  "districts": [
+    "DISTRICT 2"
+  ]
+}

@@ -1,0 +1,170 @@
+{
+  "event-id": "CARS5-11216",
+  "headline": {
+    "category": "roadwork",
+    "code": "bridge construction"
+  },
+  "description": "I-70: Bridge construction. Between US 183 Bypass and US 183 Bypass (near Hays). Bridge construction work is in progress. Automated traffic signals are in place. The roadway is reduced to one lane. Expect 5 - min delays. Until August 14, 2026 at about 11:59PM CDT. Comment: Bridge construction in progress on Hall Street Overpass Bridge over I-70. Roadway is reduced to one lane. Traffic signals are in use. Width restriction on Hall St is 11 ft. Construction will be in progress from May 26 to August 14, 2026.",
+  "creator": {
+    "contact-id": "jane.doe",
+    "email-address": "jane.doe@example.invalid"
+  },
+  "editor": {
+    "editor-identifier": "jane.doe",
+    "description": "jane.doe"
+  },
+  "message-number": 11216,
+  "message-type-version": 0,
+  "priority": 5,
+  "sender": {
+    "organization-id": "CARS5",
+    "center-id": "agency",
+    "contacts": [
+      {
+        "contact-id": "jane.doe",
+        "email-address": "jane.doe@example.invalid",
+        "organization-name": "KDOT",
+        "person-name": "Jane Doe"
+      },
+      {
+        "contact-id": "jane.doe",
+        "email-address": "jane.doe@example.invalid",
+        "organization-name": "KDOT",
+        "person-name": "Jane Doe"
+      },
+      {
+        "contact-id": "jane.doe"
+      }
+    ]
+  },
+  "update-number": 7,
+  "update-time": {
+    "time": 1785503441541,
+    "nanos": 541468000,
+    "timeZoneId": "America/Chicago",
+    "utcOffset": -18000000
+  },
+  "update-expiry-time": {
+    "time": 1786769999999,
+    "nanos": 999000000,
+    "timeZoneId": "America/Chicago",
+    "utcOffset": -18000000
+  },
+  "next-update-time": {
+    "time": 1786712940000,
+    "timeZoneId": "America/Chicago",
+    "utcOffset": -18000000
+  },
+  "status": "UPDATED",
+  "details": [
+    {
+      "access": "PUBLIC_DOMAIN",
+      "duration-was-specified": false,
+      "element-id": 1,
+      "end-time": {
+        "time": 1786769999999,
+        "nanos": 999000000,
+        "timeZoneId": "America/Chicago",
+        "utcOffset": -18000000
+      },
+      "update-time": {
+        "time": 1785503441541,
+        "nanos": 541468000,
+        "timeZoneId": "America/Chicago",
+        "utcOffset": -18000000
+      },
+      "start-time": {
+        "time": 1779771600000,
+        "timeZoneId": "America/Chicago",
+        "utcOffset": -18000000
+      },
+      "source": {
+        "organization-id": "CARS5",
+        "center-id": "agency",
+        "contacts": [
+          {
+            "contact-id": "jane.doe",
+            "email-address": "jane.doe@example.invalid",
+            "organization-name": "KDOT",
+            "person-name": "Jane Doe"
+          },
+          {
+            "contact-id": "jane.doe",
+            "email-address": "jane.doe@example.invalid",
+            "organization-name": "KDOT",
+            "person-name": "Jane Doe"
+          }
+        ]
+      },
+      "descriptions": [
+        {
+          "description-type": "PhraseDescription",
+          "is-cause": false,
+          "kind": {
+            "category": "roadwork",
+            "code": "bridge construction"
+          }
+        },
+        {
+          "description-type": "PhraseDescription",
+          "is-cause": false,
+          "kind": {
+            "category": "device-status",
+            "code": "automated traffic signals"
+          }
+        },
+        {
+          "description-type": "PhraseDescription",
+          "is-cause": false,
+          "kind": {
+            "category": "closure",
+            "code": "reduced to one lane"
+          }
+        },
+        {
+          "description-type": "AdditionalTextDescription",
+          "description": "Audio Text: Bridge construction in progress on Hall Street Overpass Bridge over I-70. Roadway is reduced to one lane. Traffic signals are in use. Width restriction on Hall St is 11 ft. Construction will be in progress from May 26 to August 14, 2026."
+        },
+        {
+          "description-type": "AdditionalTextDescription",
+          "description": "Bridge construction in progress on Hall Street Overpass Bridge over I-70. Roadway is reduced to one lane. Traffic signals are in use. Width restriction on Hall St is 11 ft. Construction will be in progress from May 26 to August 14, 2026."
+        },
+        {
+          "description-type": "NumericQuantityDescription",
+          "kind": "QUANTITY_LINK_STATE_DELAY",
+          "numeric-value": 299.99998435378154
+        }
+      ],
+      "locations": [
+        {
+          "location-type": "LinkLocation",
+          "link-direction": "NOT_DIRECTIONAL",
+          "link-ownership": "Kansas",
+          "primary-location": {
+            "geo-location": {
+              "location-type": "GeoLocation",
+              "latitude": 38.90556747142224,
+              "longitude": -99.33578812965425
+            },
+            "linear-reference": 158.23019863060642
+          },
+          "route-designator": "I-70",
+          "linear-reference-version": 1
+        }
+      ]
+    }
+  ],
+  "geometry": {
+    "type": "Point",
+    "coordinates": [
+      -99.335788,
+      38.905567
+    ]
+  },
+  "counties": [
+    "Ellis"
+  ],
+  "districts": [
+    "DISTRICT 3"
+  ]
+}

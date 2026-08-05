@@ -1,0 +1,12 @@
+[Unit]
+Description=IsadoraAir KDOT CARS road-conditions sync
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=@@ISA_USER@@
+Group=@@ISA_USER@@
+WorkingDirectory=@@ISA_ROOT@@
+ExecStart=@@ISA_ROOT@@/venv/bin/python @@ISA_ROOT@@/manage.py sync_road_conditions
+EnvironmentFile=@@ISA_ROOT@@/.env
