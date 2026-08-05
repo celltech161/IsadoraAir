@@ -533,7 +533,29 @@ def build_liquidsoap_script(input_device, encoders, host_aircheck=False, generat
         # headroom on a broadcast pipeline that's already
         # downstream-latency-dominated.
         f'source = input.alsa(buffer_size=1.0, device={_liq_string(input_device)})',
-        'source = blank.detect(threshold=-40.0, max_blank=20.0, min_noise=0.5, source)',
+        # start_blank=true (2026-08-06 post-deployment investigation):
+        # blank.detect's own documented default is start_blank=false --
+        # it ASSUMES noise, not silence, from the very first frame.
+        # on_noise only fires on a blank->noise TRANSITION, so a
+        # restart landing on an input that's already continuously
+        # non-silent (the normal case -- the DJ/automation chain is
+        # almost never actually silent at the moment of an encoder
+        # restart) has no transition to fire on and NEVER calls
+        # on_noise, no matter how long real audio keeps flowing.
+        # Confirmed empirically with an isolated synthetic script
+        # (sine-wave source, same blank.detect params, no live
+        # service touched): 8+ seconds of continuous tone with
+        # start_blank left at its default never fired on_noise; adding
+        # start_blank=true fired it in well under a second, and
+        # on_blank/on_noise both continued firing correctly across
+        # later real transitions and multiple transitions in a row.
+        # start_blank=true makes blank.detect assume silence at
+        # startup instead -- matching this script's own honest
+        # "starting"/is_blank=null startup semantic below -- so ANY
+        # real audio observed after start is a genuine transition and
+        # correctly fires on_noise, regardless of whether the input
+        # happens to already be "hot" the instant the source opens.
+        'source = blank.detect(threshold=-40.0, max_blank=20.0, min_noise=0.5, start_blank=true, source)',
         '',
         f'generation = {_liq_string(generation)}',
         f'input_device_str = {_liq_string(input_device)}',
@@ -838,6 +860,37 @@ class EncoderManager:
         script_path.write_text(script, encoding="utf-8")
 
         launched_at = time.time()
+
+        # Invalidate any stale audio-state file a PREVIOUS generation
+        # left behind BEFORE spawning -- not after. (2026-08-06
+        # post-deployment investigation: moved from after Popen() to
+        # before it. The previous ordering left a real, if apparently
+        # never-yet-triggered, window open: Popen() returning does not
+        # mean the child has done anything yet, but this write used to
+        # happen AFTER Popen() -- so if the child ever managed to open
+        # its ALSA source and fire on_noise fast enough to publish its
+        # OWN "audio_ok" for this exact generation before the line
+        # below ran, that legitimate child-published state would have
+        # been silently clobbered back to "starting"/null, and -- since
+        # blank.detect only re-fires on a further TRANSITION, not on
+        # continuously-unchanged noise -- would never self-correct
+        # except via the child's own 60s heartbeat (which mirrors its
+        # own in-memory belief, not this file, so it WOULD eventually
+        # self-heal, just not for up to 60s). Writing this BEFORE
+        # Popen() removes the window entirely rather than narrowing it:
+        # the file already reflects the new generation before the
+        # child exists to race against. pid is null here -- not yet
+        # known -- and filled in below only if the child hasn't already
+        # overtaken this placeholder.
+        try:
+            _atomic_write_json(_audio_state_path(input_device), {
+                "status": "starting", "is_blank": None, "audio_observed": False,
+                "input_device": input_device, "pid": None, "generation": generation,
+                "started_at": launched_at, "since": launched_at, "timestamp": launched_at,
+            })
+        except Exception as exc:
+            self._log(input_device, f"Failed to pre-invalidate previous audio-state file: {exc}", force=True)
+
         try:
             proc = subprocess.Popen(["liquidsoap", str(script_path)])
         except Exception as exc:
@@ -854,39 +907,35 @@ class EncoderManager:
                 dedupe_key=f"encoder|launch-failed|{input_device}",
             )
             self._write_group_state(input_device)
+            # No child was ever spawned -- the "starting" placeholder
+            # written moments ago (still pid=null) is now actively
+            # misleading (it implies a launch is in flight when it has
+            # already failed). Flip it to "dead" rather than leaving
+            # "starting" to linger until the NEXT retry's own pre-spawn
+            # write eventually overwrites it, possibly minutes from now
+            # under backoff.
+            self._mark_audio_state_dead(input_device)
             return False
 
-        # Invalidate any stale audio-state file a PREVIOUS generation
-        # left behind BEFORE returning control to the health-check loop
-        # -- closes the real window between this Popen() call returning
-        # and the script's own first line (which also writes "starting")
-        # actually executing. A monitoring poll landing in that gap
-        # must never see an earlier generation's possibly-"audio_ok"
-        # content (Phase 8 req #2/#7).
-        #
-        # Deliberately best-effort (2026-08-05 pre-deploy review found
-        # this call was NOT wrapped): by this point Popen() has already
-        # succeeded and a real Liquidsoap process is running. Letting an
-        # OSError here (a full tmpfs, a permissions problem) propagate
-        # uncaught would skip every line below -- self._procs[input_device]
-        # never gets set, leaking the just-spawned process untracked and
-        # unkillable by this manager, AND the exception would climb out
-        # of _start_group entirely into a caller that doesn't catch it
-        # either, crashing the WHOLE manager process and taking down
-        # every OTHER group's supervision along with it. A failed
-        # invalidation write is a real, worth-logging degradation (the
-        # stale-state race window stays open a little longer than
-        # intended) -- never a reason to lose track of a child we
-        # already own or bring down groups that have nothing to do with
-        # this one.
-        try:
-            _atomic_write_json(_audio_state_path(input_device), {
-                "status": "starting", "is_blank": None, "audio_observed": False,
-                "input_device": input_device, "pid": proc.pid, "generation": generation,
-                "started_at": launched_at, "since": launched_at, "timestamp": launched_at,
-            })
-        except Exception as exc:
-            self._log(input_device, f"Failed to invalidate previous audio-state file: {exc}", force=True)
+        # Popen() succeeded -- record the real pid now that we have it.
+        # CONDITIONAL, not a blind overwrite: only fill in the pid if
+        # the file still holds OUR OWN just-written "starting"
+        # placeholder for this exact generation (pid still null). If
+        # the child has already advanced past it for the SAME
+        # generation (published its own audio_ok/silent, complete with
+        # its own process.pid()), that state is authoritative and must
+        # not be regressed back to "starting" -- the entire point of
+        # this investigation.
+        current = self._read_audio_state(input_device)
+        if current.get("generation") == generation and current.get("pid") is None:
+            try:
+                _atomic_write_json(_audio_state_path(input_device), {**current, "pid": proc.pid, "timestamp": time.time()})
+            except Exception as exc:
+                self._log(input_device, f"Failed to record child pid on audio-state file: {exc}", force=True)
+        # else: the child already published its own state (every
+        # write_state() call in the generated script bakes in
+        # process.pid() itself, see build_liquidsoap_script) -- nothing
+        # to do here.
 
         self._procs[input_device] = proc
         self._scripts[input_device] = script_path

@@ -69,6 +69,17 @@ class BuildLiquidsoapScriptTests(TestCase):
         self.assertIn('write_state("silent", true, time())', script)
         self.assertIn('write_state("audio_ok", false, time())', script)
 
+    def test_blank_detect_starts_assuming_silence(self):
+        """2026-08-06 post-deployment investigation: blank.detect's own
+        documented default is start_blank=false (assumes NOISE from the
+        first frame), so a restart landing on already-continuously-
+        non-silent audio -- confirmed empirically via an isolated
+        synthetic Liquidsoap script -- never fires on_noise at all,
+        since there's no blank->noise transition to observe. Must be
+        explicitly overridden to true."""
+        script = em.build_liquidsoap_script("airtap", [make_encoder()], generation="g")
+        self.assertIn("start_blank=true", script)
+
     def test_aircheck_and_telnet_gated_together(self):
         with_aircheck = em.build_liquidsoap_script("airtap", [make_encoder()], host_aircheck=True, generation="g")
         without_aircheck = em.build_liquidsoap_script("airtap", [make_encoder()], host_aircheck=False, generation="g")
@@ -226,6 +237,110 @@ class LaunchTests(EncoderManagerFixtureMixin, TransactionTestCase):
         audio_state = self.read_audio_state()
         self.assertEqual(audio_state["status"], "starting")
         self.assertNotEqual(audio_state["generation"], "old-gen")
+
+
+class PostSpawnOverwriteRaceTests(EncoderManagerFixtureMixin, TransactionTestCase):
+    """2026-08-05 post-deployment investigation: does _start_group()'s
+    post-Popen() audio-state "invalidation" write (lines ~882-887)
+    unconditionally clobber state the CHILD itself may have already
+    published, for the SAME generation/pid, by the time that write
+    executes? Popen() is mocked to simulate the absolute worst case --
+    the child publishing its own state as a side effect of the Popen()
+    call returning, before _start_group() reaches its own invalidation
+    write -- modeling the child winning the race entirely.
+
+    Real-world likelihood, per the accompanying investigation report:
+    live observation during the 2026-08-05 deployment showed
+    Liquidsoap's own 60s heartbeat (driven by ITS OWN in-memory
+    last_status/last_is_blank refs -- see build_liquidsoap_script,
+    never read back from this JSON file) still reporting "starting"/
+    null a full 60+ seconds after a real launch. A race would
+    self-heal at the very next heartbeat, since the heartbeat's source
+    of truth lives in Liquidsoap's own process memory, untouched by
+    this file ever being overwritten externally -- so the real
+    incident was NOT this race. This test class exists because the
+    CODE-LEVEL race is real and unconditional regardless of how
+    reliably real-world timing has, so far, avoided triggering it --
+    worth closing on its own merits."""
+
+    def _popen_with_child_write(self, child_state):
+        """Popen side_effect that spawns a normal fake proc AND
+        immediately writes `child_state` to the audio-state file,
+        using the REAL generation _start_group() just baked into the
+        script file (recovered from the script text itself, not
+        guessed) and the fake pid -- simulating the child publishing
+        its own state before _start_group()'s own post-Popen code
+        runs."""
+        fake_pid = 424242
+
+        def fake_popen(cmd, **kwargs):
+            script_text = Path(cmd[1]).read_text(encoding="utf-8")
+            gen_line = next(l for l in script_text.splitlines() if l.startswith("generation = "))
+            generation = gen_line.split('"')[1]
+
+            state = dict(child_state)
+            state["pid"] = fake_pid
+            state["generation"] = generation
+            em._atomic_write_json(em._audio_state_path_for_slug("airtap"), state)
+
+            proc = MagicMock()
+            proc.pid = fake_pid
+            proc.poll.return_value = None
+            proc.returncode = None
+            return proc
+
+        return fake_popen
+
+    def test_child_published_audio_ok_is_not_clobbered_back_to_starting(self):
+        manager = em.EncoderManager()
+        now = time.time()
+        child_state = {
+            "status": "audio_ok", "is_blank": False, "audio_observed": True,
+            "input_device": "airtap", "started_at": now, "since": now, "timestamp": now,
+        }
+        with patch.object(em.subprocess, "Popen", side_effect=self._popen_with_child_write(child_state)):
+            ok = manager._start_group("airtap", [make_encoder()])
+        self.assertTrue(ok)
+
+        audio_state = self.read_audio_state()
+        self.assertEqual(audio_state["status"], "audio_ok")
+        self.assertFalse(audio_state["is_blank"])
+        self.assertTrue(audio_state["audio_observed"])
+
+    def test_child_published_silent_is_not_clobbered_back_to_starting(self):
+        manager = em.EncoderManager()
+        now = time.time()
+        child_state = {
+            "status": "silent", "is_blank": True, "audio_observed": True,
+            "input_device": "airtap", "started_at": now, "since": now, "timestamp": now,
+        }
+        with patch.object(em.subprocess, "Popen", side_effect=self._popen_with_child_write(child_state)):
+            ok = manager._start_group("airtap", [make_encoder()])
+        self.assertTrue(ok)
+
+        audio_state = self.read_audio_state()
+        self.assertEqual(audio_state["status"], "silent")
+        self.assertTrue(audio_state["is_blank"])
+
+    def test_child_published_newer_timestamp_for_same_generation_is_preserved(self):
+        """Even independent of status/is_blank -- a state the child
+        already wrote with a NEWER timestamp than the manager's own
+        about-to-be-issued invalidation write must not be regressed to
+        an older effective timestamp (which would falsely make freshly
+        -published state look immediately stale to a probe)."""
+        manager = em.EncoderManager()
+        future_ts = time.time() + 5  # deliberately ahead of the manager's own launched_at
+        child_state = {
+            "status": "audio_ok", "is_blank": False, "audio_observed": True,
+            "input_device": "airtap", "started_at": future_ts, "since": future_ts,
+            "timestamp": future_ts,
+        }
+        with patch.object(em.subprocess, "Popen", side_effect=self._popen_with_child_write(child_state)):
+            ok = manager._start_group("airtap", [make_encoder()])
+        self.assertTrue(ok)
+
+        audio_state = self.read_audio_state()
+        self.assertGreaterEqual(audio_state["timestamp"], future_ts)
 
 
 class StabilizationTests(EncoderManagerFixtureMixin, TransactionTestCase):
@@ -651,3 +766,22 @@ class AtomicWriteJsonTests(SimpleTestCase):
         mode = self.path.stat().st_mode
         self.assertTrue(mode & 0o400, "owner-read bit must be set")
         self.assertEqual(json.loads(self.path.read_text()), {"a": 1})
+
+
+# ---------------------------------------------------------------------
+# Deploy template -- 2026-08-06 post-deployment investigation, item 9
+# ---------------------------------------------------------------------
+class EncodersUnitTemplateTests(SimpleTestCase):
+    """The missing wrapper log lines made the 2026-08-06 live incident
+    meaningfully harder to diagnose (Liquidsoap's own subprocess output
+    flushed promptly; the Python wrapper's print()/self._log() calls
+    sat in a full stdout buffer for the entire session). Asserts the
+    fix stays in the checked-in deploy template -- this does not touch
+    the actually-installed unit file on this box, only the repo's
+    source of truth for future deploys."""
+
+    def test_pythonunbuffered_is_set(self):
+        from django.conf import settings
+
+        template = (settings.BASE_DIR / "deploy" / "isadoraair-encoders.service").read_text(encoding="utf-8")
+        self.assertIn("PYTHONUNBUFFERED=1", template)

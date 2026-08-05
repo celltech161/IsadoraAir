@@ -9,6 +9,17 @@ WorkingDirectory=@@ISA_ROOT@@
 ExecStart=@@ISA_ROOT@@/venv/bin/python @@ISA_ROOT@@/manage.py run_encoders
 Restart=on-failure
 RestartSec=5
+# Python's stdout is fully block-buffered (not line-buffered) when it
+# isn't attached to a TTY -- which journald's own capture of this
+# service's stdout is not. Without this, print()/self._log() output
+# from encoder_manager.py can sit unflushed for a long time and only
+# appear in `journalctl` in bursts (confirmed live during the
+# 2026-08-06 deployment: the wrapper's own "Started (Liquidsoap
+# pid=..., generation=...)" lines never showed up at all during a live
+# restart, only Liquidsoap's own subprocess output -- which does its
+# own flushing -- appeared promptly). This made diagnosing a live
+# incident meaningfully harder than it needed to be.
+Environment=PYTHONUNBUFFERED=1
 EnvironmentFile=@@ISA_ROOT@@/.env
 
 [Install]
