@@ -12,8 +12,6 @@ change takes effect on the next ~10s tick with no restart needed."""
 import json
 import signal
 import time
-import urllib.request
-import xml.etree.ElementTree as ET
 from collections import defaultdict
 from pathlib import Path
 
@@ -28,6 +26,7 @@ from encoders.models import Encoder  # noqa: E402
 from monitoring.models import ListenerPeak, MonitorCheck, TransmitterConfig, emit_event  # noqa: E402
 from monitoring.services.notify import maybe_notify  # noqa: E402
 from monitoring.services.probes import PROBE_DISPATCH  # noqa: E402
+from monitoring.services.shoutcast import fetch_shoutcast_stats  # noqa: E402
 from monitoring.services.transmitter_client import TransmitterClient  # noqa: E402
 
 STATE_PATH = Path("/run/isadoraair/monitoring_state.json")
@@ -165,9 +164,15 @@ class MonitorManager:
     def _poll_shoutcast_listeners(self):
         """Fetch listener counts from every distinct Shoutcast server
         our enabled Encoder rows point at, match each encoder to its
-        stream by icy_id (Encoder.mount, stripped of any '/'), and
+        stream by Encoder.shoutcast_sid (the same normalized value
+        Liquidsoap was given as icy_id -- see encoders/models.py), and
         write a compact status document to LISTENER_STATE_PATH for the
-        dashboard widget to consume.
+        dashboard widget to consume. Uses the shared
+        monitoring.services.shoutcast.fetch_shoutcast_stats fetcher --
+        the same one probe_encoder_group (probes.py) uses for its own,
+        separate per-SID health determination, so there is exactly one
+        piece of code that understands the Shoutcast /statistics wire
+        format.
 
         LED semantics:
           green  -- every enabled encoder's SID appears in stats AND
@@ -202,9 +207,9 @@ class MonitorManager:
         # Per-encoder status: {encoder_id: {"name":.., "sid":.., "up":bool, "listeners":int}}
         per_encoder = []
         for (host, port), encs_here in by_server.items():
-            stream_stats = self._fetch_shoutcast_stats(host, port)
+            stream_stats = fetch_shoutcast_stats(host, port, timeout=SHOUTCAST_STATS_TIMEOUT)
             for enc in encs_here:
-                sid = (enc.mount or "").strip("/") or "1"
+                sid = enc.shoutcast_sid
                 s = stream_stats.get(sid)
                 if s is None:
                     per_encoder.append({
@@ -249,50 +254,6 @@ class MonitorManager:
             per_encoder, current_total, led,
             peak.peak_total, peak.peak_since_at, peak_reached_at,
         )
-
-    def _fetch_shoutcast_stats(self, host, port):
-        """GET /statistics from a Shoutcast v2 server, return
-        {sid: {"up": bool, "listeners": int}} keyed by string SID.
-        Returns {} on any transport or parse failure -- the caller
-        treats a missing SID entry as "down"."""
-        url = f"http://{host}:{port}/statistics"
-        try:
-            with urllib.request.urlopen(url, timeout=SHOUTCAST_STATS_TIMEOUT) as resp:
-                body = resp.read()
-        except Exception as exc:
-            print(f"  [listeners] {host}:{port} unreachable: {exc}")
-            return {}
-        try:
-            root = ET.fromstring(body)
-        except ET.ParseError as exc:
-            print(f"  [listeners] {host}:{port} XML parse error: {exc}")
-            return {}
-        # Wire format observed on Shoutcast v2.6.1:
-        #   <SHOUTCASTSERVER>
-        #     <STREAMSTATS>
-        #       <TOTALSTREAMS>4</TOTALSTREAMS>       <-- server-wide totals
-        #       ...
-        #       <STREAM id="1">                      <-- STREAM lives INSIDE
-        #         <CURRENTLISTENERS>4</CURRENTLISTENERS>  STREAMSTATS, not as
-        #         <STREAMSTATUS>1</STREAMSTATUS>          a root child.
-        #         ...                                <-- 1 = active, 0 = down
-        #       </STREAM>
-        #       <STREAM id="2">...</STREAM>
-        #     </STREAMSTATS>
-        #   </SHOUTCASTSERVER>
-        # `.//STREAM` descends into any location -- robust to any future
-        # SC version that reorganizes the wrapping element.
-        out = {}
-        for stream in root.findall(".//STREAM"):
-            sid = stream.get("id", "").strip()
-            if not sid:
-                continue
-            listeners_el = stream.find("CURRENTLISTENERS")
-            status_el = stream.find("STREAMSTATUS")
-            listeners = int((listeners_el.text or "0").strip()) if listeners_el is not None else 0
-            up = (status_el is not None and (status_el.text or "").strip() == "1")
-            out[sid] = {"up": up, "listeners": listeners}
-        return out
 
     def _write_listener_state(self, per_encoder, current_total, led,
                               peak_total, peak_since_at, peak_reached_at):

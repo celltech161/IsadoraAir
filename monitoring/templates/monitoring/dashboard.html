@@ -434,7 +434,7 @@ const KIND_GROUPS = [
   { label: "Services", kinds: ["systemd"] },
   { label: "System", kinds: ["disk", "cpu", "memory", "temperature"] },
   { label: "Transmitter", kinds: ["transmitter_param", "transmitter_indicator"] },
-  { label: "Audio", kinds: ["audio_silence"] },
+  { label: "Audio", kinds: ["audio_silence", "encoder_group"] },
 ];
 
 function formatSince(since) {
@@ -674,6 +674,36 @@ function renderAudioSilenceBody(check) {
   return `<div class="mon-uptime ${check.status}">${label} for ${hours} hrs</div>`;
 }
 
+function renderEncoderGroupBody(check) {
+  // The truthful-aggregate check (2026-08-05 hardening) -- `reason`
+  // is always populated by probe_encoder_group regardless of status,
+  // so this card can lead with the SAME human-readable explanation an
+  // operator would otherwise have to go find in the journal (e.g.
+  // "Liquidsoap exited 11 times in a row -- last: ..." or "SID 4
+  // (64 kbps HE-AAC): STREAMSTATUS=0"). Falls back to the generic
+  // formatter for anything without a `reason` (shouldn't normally
+  // happen, but a probe error path still has SOME detail worth showing).
+  const detail = check.detail || {};
+  const parts = [];
+  if (detail.reason) {
+    parts.push(`<div class="mon-card-detail">${detail.reason}</div>`);
+  } else {
+    parts.push(`<div class="mon-card-detail">${formatGenericDetail(detail)}</div>`);
+  }
+  if (Array.isArray(detail.destinations) && detail.destinations.length) {
+    const rows = detail.destinations.map(d => {
+      const cls = d.up ? "ok" : "critical";
+      const label = d.up ? "up" : (d.present ? "down" : "absent");
+      return `<div class="mon-card-detail"><span class="mon-pill ${cls}" style="margin-right:0.4rem;">${label}</span>${d.name} (SID ${d.sid})</div>`;
+    });
+    parts.push(...rows);
+  }
+  if (typeof detail.consecutive_failures === "number" && detail.consecutive_failures > 0) {
+    parts.push(`<div class="mon-card-detail">Consecutive failures: ${detail.consecutive_failures}</div>`);
+  }
+  return parts.join("");
+}
+
 function renderCardBody(check, byTxRef) {
   const pairedIndicatorRef = TX_INDICATOR_FOR_PARAM[check.tx_ref];
   if (pairedIndicatorRef) {
@@ -693,6 +723,7 @@ function renderCardBody(check, byTxRef) {
     case "cpu": return renderCpuBody(check);
     case "temperature": return renderTemperatureBody(check);
     case "audio_silence": return renderAudioSilenceBody(check);
+    case "encoder_group": return renderEncoderGroupBody(check);
     default: return `<div class="mon-card-detail">${formatGenericDetail(check.detail)}</div>`;
   }
 }

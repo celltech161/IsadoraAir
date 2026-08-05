@@ -35,6 +35,7 @@ class MonitorCheck(models.Model):
         ("transmitter_param", "Transmitter Parameter"),
         ("transmitter_indicator", "Transmitter Status Indicator"),
         ("audio_silence", "Audio Silence (Liquidsoap)"),
+        ("encoder_group", "Encoder Stream Health"),
         ("rbds", "RBDS Connection"),
     ]
 
@@ -90,6 +91,33 @@ class MonitorCheck(models.Model):
         max_length=100, blank=True,
         help_text="Matches encoders.services.encoder_manager._slug(input_device) — "
                    "used to find /run/isadoraair/liquidsoap_silence_<slug>.json.",
+    )
+
+    # --- kind="encoder_group" ---
+    encoder_group_slug = models.CharField(
+        max_length=100, blank=True,
+        help_text="Matches encoders.services.encoder_manager._slug(input_device) — "
+                   "used to find both /run/isadoraair/liquidsoap_silence_<slug>.json "
+                   "(Liquidsoap's own self-report) and "
+                   "/run/isadoraair/encoder_group_<slug>.json (the encoder manager's "
+                   "own process-supervision state). Same slug convention as "
+                   "silence_device_slug above -- a separate field rather than reusing "
+                   "that one, since this is a genuinely different check kind (the "
+                   "truthful AGGREGATE across manager/child/audio/Shoutcast signals, "
+                   "not audio silence alone) that an operator may or may not want "
+                   "configured alongside the existing Audio Silence check for the "
+                   "same group. Added 2026-08-05 after a real production outage where "
+                   "neither the existing systemd check nor the existing audio_silence "
+                   "check caught a Liquidsoap crash-loop -- see probe_encoder_group.",
+    )
+    encoder_group_systemd_unit = models.CharField(
+        max_length=100, blank=True,
+        help_text="Systemd unit backing the encoder manager itself, e.g. "
+                   "isadoraair-encoders.service — checked directly (reusing "
+                   "probe_systemd's own logic) as one of several signals this kind "
+                   "combines. Separate from the plain 'Systemd Service' kind's own "
+                   "systemd_unit field above so this check's config is self-contained "
+                   "rather than depending on another MonitorCheck row existing.",
     )
 
     # --- numeric thresholds, used by disk/cpu/memory/temperature/transmitter_param ---
@@ -149,6 +177,11 @@ class MonitorCheck(models.Model):
                 errors["fault_values"] = "Required — at least one FAULT value."
         if self.kind == "audio_silence" and not self.silence_device_slug:
             errors["silence_device_slug"] = "Required for Audio Silence checks."
+        if self.kind == "encoder_group":
+            if not self.encoder_group_slug:
+                errors["encoder_group_slug"] = "Required for Encoder Stream Health checks."
+            if not self.encoder_group_systemd_unit:
+                errors["encoder_group_systemd_unit"] = "Required for Encoder Stream Health checks."
         if errors:
             raise ValidationError(errors)
 

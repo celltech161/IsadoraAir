@@ -215,11 +215,247 @@ def probe_audio_silence(check):
     detail = {"age_seconds": age}
     if since_raw is not None:
         detail["since_seconds"] = time.time() - since_raw
-    if data.get("is_blank"):
-        detail["is_blank"] = True
+
+    # Three real states (2026-08-05 hardening), not a boolean --
+    # is_blank is `null` while Liquidsoap is still starting up and
+    # hasn't verified any real audio yet, which is NOT the same as
+    # "confirmed not blank." The previous version of this probe used
+    # `if data.get("is_blank"):`, a truthiness test under which `None`
+    # is falsy -- exactly the same falsy value as `False` -- so a
+    # freshly-(re)started, about-to-crash Liquidsoap process re-writing
+    # its own honest "not yet verified" `null` was silently read as
+    # "confirmed fine." That was the actual root cause of a real
+    # production outage staying green throughout: a crash-looping
+    # encoder respawns every 15-20s, each instance re-asserting this
+    # same "null" a moment before dying, always beating the 180s
+    # staleness window above. Explicit three-way check now.
+    is_blank = data.get("is_blank")
+    detail["is_blank"] = is_blank
+    if is_blank is None:
+        detail["reason"] = f"{data.get('status', 'starting')} -- no audio verified yet"
+        return "unknown", detail
+    if is_blank:
         return "critical", detail
-    detail["is_blank"] = False
     return "ok", detail
+
+
+# --- kind="encoder_group" timing constants (2026-08-05 hardening) ---
+# How long a fresh child gets to prove itself before "still starting"
+# becomes "critical -- something's actually wrong." Matches the
+# suggested range from the incident review.
+ENCODER_STARTUP_ALLOWANCE_SECONDS = 30
+# The encoder manager refreshes its own group-state file on every
+# _check_health() tick (every HEALTH_CHECK_SECONDS=5s -- see
+# encoders/services/encoder_manager.py) regardless of whether anything
+# changed, specifically so this can be a TIGHT staleness bound (a
+# genuine "the manager's own supervision loop is stuck" signal, not
+# just "nothing happened lately") -- 6x the actual write cadence, a
+# comfortable margin against scheduling jitter without being loose
+# enough to miss a real stall for long.
+ENCODER_GROUP_STALE_SECONDS = 30
+# Matches probe_audio_silence's own established 180s bound exactly (3x
+# Liquidsoap's 60s heartbeat) -- same file, same convention, not a
+# second independently-tuned threshold for the same signal.
+AUDIO_STATE_STALE_SECONDS = 180
+
+
+def probe_encoder_group(check):
+    """The truthful aggregate for one encoder input-device group,
+    combining every signal a single systemd/audio_silence check could
+    not, on its own, tell apart during the real 2026-08-05 outage:
+
+      1. Is the encoder-manager systemd service itself active?
+      2. Is there a LIVE Liquidsoap child for this group (not just "a
+         process object exists somewhere," but the CURRENT generation,
+         matched by pid+generation between the manager's own state
+         file and Liquidsoap's self-report)?
+      3. Has that child actually observed real, non-blank audio?
+      4. Is every enabled Encoder in this group's Shoutcast SID
+         actually connected (STREAMSTATUS=1), not just "the process
+         that would send it hasn't crashed"?
+
+    None of these four proves the station is on the air by itself --
+    see the module-level docstring in encoders/services/encoder_manager.py
+    and PROJECT_NOTES.md's 2026-08-05 incident writeup for exactly how
+    each one alone stayed green while the stream was actually down.
+
+    Deliberately reuses existing code rather than re-implementing it:
+    probe_systemd for the manager's own ActiveState, and
+    monitoring.services.shoutcast.fetch_shoutcast_stats (also used by
+    MonitorManager's listener poll) for the real, external Shoutcast
+    connection state -- the same signal that actually proved the
+    station was down during the incident, independent of anything this
+    project's own monitoring reported."""
+    import json
+    from collections import defaultdict
+    from types import SimpleNamespace
+
+    from encoders.models import Encoder
+    from encoders.services.encoder_manager import (
+        DEFAULT_INPUT_DEVICE, STABILIZATION_SECONDS, _audio_state_path_for_slug,
+        _effective_input_device, _group_state_path_for_slug, _slug,
+    )
+    from monitoring.services.shoutcast import fetch_shoutcast_stats
+
+    slug = check.encoder_group_slug
+    detail = {"input_device_slug": slug}
+
+    # 1. Which enabled encoders actually belong to this group -- same
+    # grouping logic the manager itself uses (_effective_input_device
+    # falls back to DEFAULT_INPUT_DEVICE for a blank Encoder.input_device),
+    # so this can never disagree with what the manager actually launched.
+    encoders = [
+        e for e in Encoder.objects.filter(enabled=True)
+        if _slug(_effective_input_device(e)) == slug
+    ]
+    if not encoders:
+        return "unknown", {**detail, "reason": "no enabled encoders configured for this input device group"}
+
+    # 2. Manager systemd unit -- reuse probe_systemd's own logic
+    # exactly rather than re-parsing `systemctl show` output here too.
+    systemd_status, systemd_detail = probe_systemd(SimpleNamespace(systemd_unit=check.encoder_group_systemd_unit))
+    detail["manager_systemd"] = systemd_detail
+    if systemd_status != "ok":
+        return "critical", {**detail, "reason": f"encoder-manager service ({check.encoder_group_systemd_unit}) is not active"}
+
+    # 3. Manager-owned process-supervision state.
+    group_state_path = _group_state_path_for_slug(slug)
+    if not group_state_path.is_file():
+        return "critical", {**detail, "reason": "no group-state file yet -- encoder manager may not have started this group"}
+    try:
+        group_state = json.loads(group_state_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return "unknown", {**detail, "error": f"group-state file unreadable: {exc}"}
+
+    now = time.time()
+    group_age = now - group_state.get("timestamp", 0)
+    if group_age > ENCODER_GROUP_STALE_SECONDS:
+        return "critical", {
+            **detail,
+            "reason": "encoder manager not reporting -- its own supervision loop may be stuck",
+            "group_state_age_seconds": group_age,
+        }
+
+    consecutive_failures = group_state.get("consecutive_failures", 0)
+    detail.update({
+        "consecutive_failures": consecutive_failures,
+        "last_failure_message": group_state.get("last_failure_message", ""),
+        "last_exit_code": group_state.get("last_exit_code"),
+        "next_retry_at": group_state.get("next_retry_at"),
+    })
+    if consecutive_failures >= 3:
+        return "critical", {
+            **detail,
+            "reason": (
+                f"Liquidsoap exited {consecutive_failures} times in a row -- "
+                f"last: {group_state.get('last_failure_message') or 'unknown'}"
+            ),
+        }
+
+    manager_pid = group_state.get("pid")
+    manager_generation = group_state.get("generation")
+    if manager_pid is None or manager_generation is None:
+        return "critical", {**detail, "reason": "no live child process for this group"}
+
+    # 4. Liquidsoap's own self-report -- MUST be the same generation the
+    # manager currently considers live (Phase 8's core hardening point:
+    # a stale file from an earlier, already-superseded process must
+    # never be mistaken for the current one).
+    audio_state_path = _audio_state_path_for_slug(slug)
+    if not audio_state_path.is_file():
+        return "critical", {**detail, "reason": "no audio-state file yet for the current child"}
+    try:
+        audio_state = json.loads(audio_state_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return "unknown", {**detail, "error": f"audio-state file unreadable: {exc}"}
+
+    if audio_state.get("generation") != manager_generation or audio_state.get("pid") != manager_pid:
+        return "critical", {
+            **detail,
+            "reason": "audio-state file is stale -- belongs to a previous process, not the current one",
+            "audio_state_generation": audio_state.get("generation"),
+            "expected_generation": manager_generation,
+        }
+
+    audio_age = now - audio_state.get("timestamp", 0)
+    if audio_age > AUDIO_STATE_STALE_SECONDS:
+        return "unknown", {**detail, "reason": "liquidsoap heartbeat stopped", "audio_state_age_seconds": audio_age}
+
+    status = audio_state.get("status", "starting")
+    is_blank = audio_state.get("is_blank")
+    detail["liquidsoap_status"] = status
+    detail["is_blank"] = is_blank
+
+    launched_at = group_state.get("launched_at")
+    startup_elapsed = (now - launched_at) if launched_at else None
+    detail["startup_elapsed_seconds"] = startup_elapsed
+
+    if status == "starting" or is_blank is None:
+        if startup_elapsed is not None and startup_elapsed > ENCODER_STARTUP_ALLOWANCE_SECONDS:
+            return "critical", {
+                **detail,
+                "reason": f"startup allowance ({ENCODER_STARTUP_ALLOWANCE_SECONDS}s) expired without real audio",
+            }
+        return "warning", {**detail, "reason": "starting"}
+
+    if is_blank:
+        return "critical", {**detail, "reason": "silent -- no audio detected"}
+
+    # 5. Real, external Shoutcast destination status -- the signal that
+    # actually caught the 2026-08-05 outage, independent of anything
+    # this project's own monitoring reported. Listener count never
+    # participates -- a stream with zero listeners can still be healthy.
+    by_server = defaultdict(list)
+    for enc in encoders:
+        by_server[(enc.host, enc.port)].append(enc)
+
+    sid_results = []
+    server_unreachable = False
+    for (host, port), encs_here in by_server.items():
+        stats = fetch_shoutcast_stats(host, port)
+        if not stats:
+            server_unreachable = True
+        for enc in encs_here:
+            sid = enc.shoutcast_sid
+            s = stats.get(sid)
+            sid_results.append({
+                "encoder_id": enc.id, "name": enc.name, "sid": sid,
+                "up": bool(s and s["up"]), "present": s is not None,
+            })
+    detail["destinations"] = sid_results
+
+    down = [r for r in sid_results if not r["up"]]
+    if down:
+        if server_unreachable:
+            # A single unreachable poll can't distinguish "genuinely
+            # down" from "couldn't ask right now" -- warning, not an
+            # immediate critical, gives it one cycle to recover before
+            # MonitorManager's own consecutive-failure debounce (a
+            # SEPARATE, coarser mechanism upstream) escalates a
+            # persistent outage on its own.
+            return "warning", {**detail, "reason": "Shoutcast server unreachable -- destination status unknown"}
+        parts = [
+            f"SID {r['sid']} ({r['name']}): {'absent' if not r['present'] else 'STREAMSTATUS=0'}"
+            for r in down
+        ]
+        return "critical", {**detail, "reason": "destination(s) down -- " + "; ".join(parts)}
+
+    # 6. Stabilization gate -- everything above is momentarily green,
+    # but has it been true for long enough to trust? `since` on the
+    # audio-state file (when the current is_blank=false began) is the
+    # one continuous-truth timestamp available -- Shoutcast has no
+    # per-poll equivalent of its own, so audio's own transition clock
+    # gates the WHOLE aggregate. Same STABILIZATION_SECONDS value
+    # encoders/services/encoder_manager.py's own backoff-reset check
+    # uses -- one shared "how long is long enough" concept, not two
+    # independently-tuned ones that could disagree.
+    since = audio_state.get("since")
+    stable_seconds = (now - since) if since is not None else 0
+    detail["stable_seconds"] = stable_seconds
+    if stable_seconds < STABILIZATION_SECONDS:
+        return "warning", {**detail, "reason": f"stabilizing ({stable_seconds:.0f}s of {STABILIZATION_SECONDS}s)"}
+
+    return "ok", {**detail, "reason": "healthy"}
 
 
 def probe_rbds(check):
@@ -256,5 +492,6 @@ PROBE_DISPATCH = {
     "transmitter_param": probe_transmitter_param,
     "transmitter_indicator": probe_transmitter_indicator,
     "audio_silence": probe_audio_silence,
+    "encoder_group": probe_encoder_group,
     "rbds": probe_rbds,
 }

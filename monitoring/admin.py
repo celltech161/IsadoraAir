@@ -23,6 +23,10 @@ class MonitorCheckAdmin(admin.ModelAdmin):
             "classes": ["collapse"],
         }),
         ("Audio Silence", {"fields": ["silence_device_slug"], "classes": ["collapse"]}),
+        ("Encoder Stream Health", {
+            "fields": ["encoder_group_slug", "encoder_group_systemd_unit"],
+            "classes": ["collapse"],
+        }),
         ("Thresholds", {"fields": ["warning_threshold", "critical_threshold", "threshold_direction"]}),
         ("Alerting", {"fields": ["consecutive_failures_required", "notify_on_warning", "notify_on_critical"]}),
     ]

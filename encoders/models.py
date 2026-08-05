@@ -70,5 +70,32 @@ class Encoder(models.Model):
                 "carried MP3) — use Icecast or Shoutcast 2."
             )
 
+    @property
+    def shoutcast_sid(self):
+        """Normalized Shoutcast Stream ID, e.g. "/4" -> "4" -- the exact
+        same value passed to Liquidsoap's `icy_id` param (see
+        encoders/services/encoder_manager.py's _output_block) and looked
+        up against a live Shoutcast server's /statistics STREAM[@id]
+        (see monitoring/services/shoutcast.py). Single source of truth
+        for this normalization -- it used to be duplicated inline in
+        both of those call sites, a real risk given the two MUST agree
+        (a drift here would make monitoring check the wrong SID and
+        silently misreport a stream's real status).
+
+        Shoutcast 1 is single-stream with no real SID concept -- always
+        "1" (matching Liquidsoap's own default icy_id), regardless of
+        whatever `mount` happens to hold. `mount`'s own help text
+        already documents it as "Not used for Shoutcast 1"; a stray
+        value there (an admin left something in the field, or a row
+        was switched from Shoutcast 2 without clearing it) must not
+        silently change which SID monitoring checks. None for Icecast,
+        which addresses by mount path, not SID -- callers must not
+        treat a None SID as "stream 1"."""
+        if self.protocol == "shoutcast1":
+            return "1"
+        if self.protocol != "shoutcast2":
+            return None
+        return (self.mount or "").strip("/") or "1"
+
     def __str__(self):
         return self.name
