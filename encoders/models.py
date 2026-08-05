@@ -5,12 +5,22 @@ BITRATE_CHOICES = [(k, f"{k} kbps") for k in (64, 96, 128, 160, 192, 224, 256, 3
 
 
 class Encoder(models.Model):
-    """One outbound stream connection (Icecast/Shoutcast). Each enabled
-    row gets its own independent Liquidsoap subprocess in the
-    isadoraair-encoders service — see encoders/services/encoder_manager.py.
-    Adding/editing/removing a row is a topology change for that process
-    (not a live-adjustable property), so admin restarts the service on
-    every save/delete — see encoders/admin.py."""
+    """One outbound stream connection (Icecast/Shoutcast). Enabled rows
+    are grouped by input_device into shared Liquidsoap subprocesses in
+    the isadoraair-encoders service — one process per distinct
+    input_device, each carrying every enabled row that reads from it —
+    see encoders/services/encoder_manager.py.
+
+    Adding, deleting, or changing a row's runtime-affecting fields
+    (encoders/admin.py's RUNTIME_AFFECTING_FIELDS) is a topology change
+    for that process, not a live-adjustable property, so the admin
+    restarts isadoraair-encoders after such a change commits -- but
+    only when the row is, was, or becomes `enabled`; a disabled row
+    was never part of the running topology, so adding/deleting/editing
+    one that stays disabled restarts nothing. Fields outside
+    RUNTIME_AFFECTING_FIELDS (e.g. sort_order, or the display-only
+    `name`) never restart anything regardless of `enabled` — see
+    encoders/admin.py."""
     PROTOCOL_CHOICES = [
         ("icecast", "Icecast"),
         ("shoutcast1", "Shoutcast 1"),
