@@ -1967,36 +1967,36 @@ class RbdsCharacterSanitizationTests(SimpleTestCase):
         # char "X" survives since it's within the 8-char width.
         self.assertEqual(result[3:], b"LOCAL  X")
 
-    def test_nfd_decomposed_accented_character_is_not_canonicalized(self):
-        # Discovered by accident while drafting this test file (a
-        # decomposed "o" + combining-diaeresis pasted where a
-        # precomposed "ö" was intended -- caught because it broke an
-        # exact byte-equality assertion). Worth a deliberate,
-        # documented test: encode_rds_g0/normalize_text perform NO
-        # Unicode normalization (NFC/NFD canonicalization) before G0
-        # lookup. A decomposed "ö" (base "o" U+006F + combining
-        # diaeresis U+0308, two Python characters) is NOT the same
-        # input as precomposed "ö" (U+00F6, one character) even though
-        # they render identically and are canonically equivalent per
-        # Unicode. Current, empirically confirmed behavior: the base
-        # letter encodes correctly (it's plain ASCII); the orphaned
-        # combining mark has no G0 representation and falls back to a
-        # space, per the same uniform replacement policy every other
-        # unsupported character gets. This does NOT violate the RT+
-        # geometry invariant (offsets still correctly address whatever
-        # text actually got encoded) and does NOT crash -- it just
-        # doesn't visually render the accent for this specific input
-        # form. Documented as a real characteristic, not fixed this
-        # round -- see the final report's recommended next action.
-        precomposed = unicodedata.normalize("NFC", "ö")  # 'ö', 1 char
-        decomposed = "o" + chr(0x0308)  # base "o" + combining diaeresis, 2 chars
-        self.assertEqual(unicodedata.normalize("NFC", decomposed), precomposed)
+    def test_nfd_decomposed_accented_character_is_canonicalized(self):
+        # Originally documented the OPPOSITE: this project's prior
+        # hardening round found (by accident, from its own test typo)
+        # that a decomposed "o" + combining-diaeresis pasted where a
+        # precomposed accented character was intended did NOT
+        # canonicalize -- the base letter encoded fine but the orphaned
+        # combining mark fell back to a space. Fixed by adding NFC
+        # normalization to normalize_text() (see
+        # RBDS_NFC_NORMALIZATION_REPORT.md) -- this test now asserts
+        # the CORRECTED end-to-end behavior through the real pipeline
+        # (normalize_text() -> encode_rds_g0()), not encode_rds_g0()
+        # called in isolation (which still performs no normalization of
+        # its own by design -- normalize_text() is the single, narrow
+        # insertion point).
+        precomposed = unicodedata.normalize("NFC", chr(0x6F) + chr(0x0308))  # NFC-composed 'o' + combining diaeresis
+        decomposed = chr(0x6F) + chr(0x0308)  # base "o" U+006F + combining diaeresis U+0308, 2 chars
         self.assertNotEqual(decomposed, precomposed, "sanity: these are genuinely different code-point sequences")
-        self.assertEqual(uecp.encode_rds_g0(precomposed), bytes([0x97]))  # single G0 code for precomposed accented char
-        self.assertEqual(uecp.encode_rds_g0(decomposed), b"o ")  # base letter + fallback space for the orphaned mark
-        self.assertEqual(len(uecp.encode_rds_g0(decomposed)), len(decomposed), "still length-preserving")
-
-    # --- RT: 64 chars, truncated (no padding -- MEL reflects actual length) ---
+        normalized_precomposed = charset.normalize_text(precomposed)
+        normalized_decomposed = charset.normalize_text(decomposed)
+        self.assertEqual(normalized_decomposed, normalized_precomposed,
+                          "normalize_text() must canonicalize both forms to the same string")
+        self.assertEqual(uecp.encode_rds_g0(normalized_precomposed), bytes([0x97]))
+        self.assertEqual(uecp.encode_rds_g0(normalized_decomposed), bytes([0x97]),
+                          "decomposed input must now produce the SAME single G0 byte as precomposed, not a fallback space")
+        # encode_rds_g0() itself is unchanged and performs no
+        # normalization of its own -- calling it directly on the raw
+        # decomposed form (bypassing normalize_text()) still shows the
+        # old byte-per-codepoint behavior, confirming the fix lives
+        # exactly where it should, not duplicated into encode_rds_g0().
+        self.assertEqual(uecp.encode_rds_g0(decomposed), b"o ")
 
     def test_rt_empty_string(self):
         result = uecp.mec_rt("", ab_flag=False)
@@ -2610,3 +2610,272 @@ class RtPlusManagerGoldenPayloadTests(SimpleTestCase):
         decoded = decode_rt_plus_tag_bytes(bytes(tags))
         self.assertEqual(decoded["tag2_content_type"], RT_PLUS_CT_ITEM_ARTIST)
         self.assertEqual(decoded["tag1_content_type"], RT_PLUS_CT_ITEM_TITLE)
+
+
+class NfcNormalizationTests(SimpleTestCase):
+    """Test-first coverage for NFC Unicode normalization in
+    normalize_text() (see RBDS_NFC_NORMALIZATION_REPORT.md). Written
+    BEFORE the production change -- these fail against the pre-NFC
+    normalize_text() for the expected reason (canonically-equivalent
+    precomposed/decomposed input produces different results), then
+    pass once NFC normalization is added at the top of the function.
+
+    All accented characters are constructed via unicodedata.normalize
+    (NFC from a codepoint-built base string, NFD from that) rather
+    than typed as literals, to avoid any risk of an editor/tool
+    silently normalizing a pasted character (exactly the class of bug
+    that produced the prior round's own test typo -- see the updated
+    test_nfd_decomposed_accented_character_is_canonicalized above)."""
+
+    def _precomposed_and_decomposed(self, text):
+        """Returns (nfc_form, nfd_form) for a plain-ASCII-plus-real-
+        accents string, both derived from the SAME starting string via
+        unicodedata itself -- never two independently-typed literals
+        that might already disagree."""
+        nfc = unicodedata.normalize("NFC", text)
+        nfd = unicodedata.normalize("NFD", nfc)
+        return nfc, nfd
+
+    # --- 1: direct normalizer equivalence ---
+
+    def test_direct_normalizer_equivalence_motley_crue(self):
+        precomposed, decomposed = self._precomposed_and_decomposed("Motley Crue".replace("o", chr(0xF6), 1).replace("u", chr(0xFC), 1))
+        # Sanity: this really is "Mötley Crüe" and the two forms really differ.
+        self.assertEqual(precomposed, "M" + chr(0xF6) + "tley Cr" + chr(0xFC) + "e")
+        self.assertNotEqual(decomposed, precomposed)
+        self.assertEqual(len(decomposed), len(precomposed) + 2, "NFD adds one combining mark per composed accent")
+        self.assertEqual(charset.normalize_text(decomposed), charset.normalize_text(precomposed))
+
+    # --- 2: G0 byte equivalence ---
+
+    def test_g0_byte_equivalence(self):
+        precomposed, decomposed = self._precomposed_and_decomposed(chr(0xF6) + chr(0xFC))  # "öü"
+        self.assertEqual(
+            uecp.encode_rds_g0(charset.normalize_text(decomposed)),
+            uecp.encode_rds_g0(charset.normalize_text(precomposed)),
+        )
+        self.assertEqual(uecp.encode_rds_g0(charset.normalize_text(precomposed)), bytes([0x97, 0x99]))
+
+    # --- 3: PS boundary ---
+
+    def test_ps_precomposed_and_decomposed_produce_identical_bytes_near_boundary(self):
+        # 8 visual characters either way: "Caf" + é + "1234" (5 ASCII + 1 accent + wait -- build exactly 8.
+        precomposed, decomposed = self._precomposed_and_decomposed("Caf" + chr(0xE9) + "1234")  # "Café1234", 8 chars precomposed
+        self.assertEqual(len(precomposed), 8)
+        self.assertEqual(len(decomposed), 9, "decomposed form has 9 code points before normalization")
+        ps_from_precomposed = uecp.mec_ps(charset.normalize_text(precomposed))
+        ps_from_decomposed = uecp.mec_ps(charset.normalize_text(decomposed))
+        self.assertEqual(ps_from_precomposed, ps_from_decomposed)
+        self.assertEqual(ps_from_precomposed[3:], b"Caf" + bytes([0x82]) + b"1234")
+        self.assertNotIn(b" ", ps_from_precomposed[3:], "no fallback space where the accent belongs")
+
+    def test_ps_normalization_occurs_before_truncation(self):
+        # 9-code-point decomposed input that normalizes down to exactly
+        # 8 -- if truncation ran BEFORE normalization, this would lose
+        # a real character or leave an orphaned combining mark at the
+        # cut; confirm neither happens.
+        precomposed, decomposed = self._precomposed_and_decomposed("Caf" + chr(0xE9) + "1234")
+        self.assertEqual(len(charset.normalize_text(decomposed)), 8)
+        result = uecp.mec_ps(charset.normalize_text(decomposed)[:8])
+        self.assertEqual(result[3:], b"Caf" + bytes([0x82]) + b"1234")
+
+    # --- 4: PTYN ---
+
+    def test_ptyn_decomposed_accent_byte_equality(self):
+        precomposed, decomposed = self._precomposed_and_decomposed("Cl" + chr(0xE1) + "sico")  # "Clásico", 7 chars
+        self.assertEqual(len(precomposed), 7)
+        ptyn_from_precomposed = uecp.mec_ptyn(charset.normalize_text(precomposed))
+        ptyn_from_decomposed = uecp.mec_ptyn(charset.normalize_text(decomposed))
+        self.assertEqual(ptyn_from_precomposed, ptyn_from_decomposed)
+        self.assertEqual(ptyn_from_precomposed, bytes([0x3E, 0, 0]) + b"Cl" + bytes([0x80]) + b"sico ")
+
+    # --- 5: RadioText ---
+
+    def test_radiotext_multiple_decomposed_accents(self):
+        precomposed, decomposed = self._precomposed_and_decomposed(
+            "S" + chr(0xE9) + "n" + chr(0xE9) + "ad Connor - Caf" + chr(0xE9) + " " + chr(0xC5) + "lborg"
+        )
+        normalized = charset.normalize_text(decomposed)
+        self.assertEqual(normalized, precomposed, "sanitized/decoded text must equal the NFC form")
+        rt_from_precomposed = uecp.mec_rt(charset.normalize_text(precomposed), ab_flag=False)
+        rt_from_decomposed = uecp.mec_rt(normalized, ab_flag=False)
+        self.assertEqual(rt_from_precomposed, rt_from_decomposed)
+        # MEL (byte index 3) must reflect the NORMALIZED character count.
+        self.assertEqual(rt_from_precomposed[3], 1 + len(precomposed))
+
+    # --- 6: RT+ song geometry ---
+
+    def test_rt_plus_song_geometry_decomposed_artist_and_title(self):
+        mgr = RBDSManager()
+        artist_precomposed, artist_decomposed = self._precomposed_and_decomposed("Bj" + chr(0xF6) + "rk")
+        title_precomposed, title_decomposed = self._precomposed_and_decomposed(chr(0xC9) + "clipse")
+
+        text_pre, out_artist_pre, out_title_pre = mgr._build_rt_plus_text(
+            charset.normalize_text(artist_precomposed), charset.normalize_text(title_precomposed),
+        )
+        text_dec, out_artist_dec, out_title_dec = mgr._build_rt_plus_text(
+            charset.normalize_text(artist_decomposed), charset.normalize_text(title_decomposed),
+        )
+        self.assertEqual(text_pre, text_dec)
+        self.assertEqual(out_artist_pre, out_artist_dec)
+        self.assertEqual(out_title_pre, out_title_dec)
+
+        med_pre = uecp.mec_rt_plus_tags(len(out_artist_pre), len(out_title_pre))
+        med_dec = uecp.mec_rt_plus_tags(len(out_artist_dec), len(out_title_dec))
+        self.assertEqual(med_pre, med_dec, "precomposed and decomposed input must produce byte-identical MEC 0x24 tag geometry")
+
+        decoded = decode_rt_plus_tag_bytes(med_pre)
+        self.assertEqual(decoded["tag2_length"], len(artist_precomposed))
+        self.assertEqual(decoded["tag1_length"], len(title_precomposed))
+        # Decoded tag slices identify exactly the intended artist/title text.
+        encoded_full = uecp.encode_rds_g0(text_pre)
+        artist_bytes = encoded_full[:len(out_artist_pre)]
+        self.assertEqual(artist_bytes, uecp.encode_rds_g0(out_artist_pre))
+
+    # --- 7: RT+ generic geometry ---
+
+    def test_rt_plus_generic_geometry_decomposed_near_boundary(self):
+        base = "Temp: 76" + chr(0xB0) + "F " + chr(0xE9)  # includes a real accent + degree symbol
+        precomposed, decomposed = self._precomposed_and_decomposed(base)
+        normalized_pre = charset.normalize_text(precomposed)
+        normalized_dec = charset.normalize_text(decomposed)
+        self.assertEqual(normalized_pre, normalized_dec)
+        med_pre = uecp.mec_rt_plus_tags_generic(len(normalized_pre))
+        med_dec = uecp.mec_rt_plus_tags_generic(len(normalized_dec))
+        self.assertEqual(med_pre, med_dec)
+        decoded = decode_rt_plus_tag_bytes(med_pre)
+        self.assertEqual(decoded["tag1_length"], len(precomposed))
+
+    # --- 8: weather delimiter path ---
+
+    def test_weather_delimiter_path_decomposed_accent_in_title_half(self):
+        mgr = RBDSManager()
+        precomposed_temp, decomposed_temp = self._precomposed_and_decomposed("Temp: 75" + chr(0xB0))
+        precomposed_hum, decomposed_hum = self._precomposed_and_decomposed("Humidit" + chr(0xE9) + ": 60%")
+        text_precomposed = f"{precomposed_temp} | {precomposed_hum}"
+        text_decomposed = f"{decomposed_temp} | {decomposed_hum}"
+
+        message_pre = mock.Mock(source_type="static", text=text_precomposed, rt_plus_delimiter="|")
+        message_dec = mock.Mock(source_type="static", text=text_decomposed, rt_plus_delimiter="|")
+        config = _mock_rbds_config(use_rt_plus=True)
+
+        rt_pre, artist_pre, title_pre = mgr._resolve_rt_content(config, {}, "promo", "msg", {"msg": message_pre})
+        rt_dec, artist_dec, title_dec = mgr._resolve_rt_content(config, {}, "promo", "msg", {"msg": message_dec})
+
+        self.assertEqual(artist_pre, precomposed_temp)
+        self.assertEqual(artist_dec, precomposed_temp, "decomposed source must resolve to the same NFC artist")
+        self.assertEqual(title_pre, precomposed_hum)
+        self.assertEqual(title_dec, precomposed_hum)
+        self.assertEqual(rt_pre, rt_dec)
+
+        payload_pre = mgr._build_uecp_payload(config, "PS      ", rt_pre, artist_pre, title_pre)
+        payload_dec = mgr._build_uecp_payload(config, "PS      ", rt_dec, artist_dec, title_dec)
+        tags_pre = _find_mec(_split_uecp_frames(payload_pre), 0x24, subtype=0x16)
+        tags_dec = _find_mec(_split_uecp_frames(payload_dec), 0x24, subtype=0x16)
+        self.assertEqual(tags_pre, tags_dec)
+        self.assertEqual(tags_pre[2], 0x08, "weather delimiter path must still select the two-tag builder, unchanged")
+
+    # --- 9: truncation-collapse boundary ---
+
+    def test_truncation_applies_to_nfc_normalized_string_not_raw_decomposed(self):
+        # Construct a decomposed string whose RAW code-point count
+        # exceeds 8, but whose NFC-normalized form is exactly 8 -- if
+        # truncation ran on the raw (pre-normalization) string, the
+        # result would differ from truncating the normalized string.
+        precomposed = "1234" + chr(0xE9) + chr(0xE8) + chr(0xEA) + chr(0xEB)  # 8 chars: "1234éèêë"
+        decomposed = unicodedata.normalize("NFD", precomposed)  # 12 code points raw
+        self.assertEqual(len(precomposed), 8)
+        self.assertEqual(len(decomposed), 12)
+
+        # Truncating the RAW decomposed string at 8 would cut into the
+        # middle of a combining sequence and produce a DIFFERENT result
+        # than truncating the normalized string.
+        raw_truncated_then_normalized = unicodedata.normalize("NFC", decomposed[:8])
+        normalized_then_truncated = charset.normalize_text(decomposed)[:8]
+        self.assertNotEqual(raw_truncated_then_normalized, normalized_then_truncated,
+                             "sanity: truncate-then-normalize and normalize-then-truncate must genuinely differ for this input")
+        self.assertEqual(normalized_then_truncated, precomposed,
+                          "normalize_text() must normalize BEFORE any truncation happens downstream")
+
+    # --- 10: unsupported combining sequence ---
+
+    def test_unsupported_combining_sequence_stays_safe(self):
+        # A combining sequence NFC genuinely cannot compose into a
+        # single code point at all -- 'g' has no precomposed form with
+        # either a ring-above or a tilde in Unicode, so both combining
+        # marks must remain separate code points after normalization
+        # and fall through to the ordinary per-character G0/fallback
+        # policy without crashing or corrupting anything.
+        #
+        # (An earlier draft of this test used "A" + combining acute +
+        # combining circumflex, assuming NFC couldn't compose any of
+        # it -- wrong: NFC composes what it CAN even in a multi-mark
+        # sequence, so that input actually became "Á" (composed) plus
+        # a still-orphaned circumflex, not "A" plus two orphaned marks.
+        # Caught by this test's own first run against the real
+        # implementation, not assumed -- see
+        # RBDS_NFC_NORMALIZATION_REPORT.md.)
+        text = "g" + chr(0x030A) + chr(0x0303)  # 'g' + combining ring above + combining tilde
+        normalized = charset.normalize_text(text)
+        self.assertEqual(len(normalized), 3, "sanity: NFC must NOT compose any of this -- no such precomposed character exists")
+        # Must not raise, must still be length-preserving at the encode stage.
+        encoded = uecp.encode_rds_g0(normalized)
+        self.assertEqual(len(encoded), len(normalized))
+        self.assertEqual(encoded[0], ord("g"))
+        # Neither combining mark has a direct G0 code -- both fall back to space.
+        self.assertEqual(encoded[1:], b"  ")
+
+    # --- 11: regression equality ---
+
+    def test_regression_plain_ascii_unchanged(self):
+        text = "Oak Grove Radio 98.5"
+        self.assertEqual(charset.normalize_text(text), text)
+
+    def test_regression_already_precomposed_accented_latin_unchanged(self):
+        text = unicodedata.normalize("NFC", "Beyonc" + chr(0xE9))
+        self.assertEqual(charset.normalize_text(text), text)
+
+    def test_regression_smart_quotes_unchanged(self):
+        self.assertEqual(charset.normalize_text(chr(0x2018) + "Rock" + chr(0x2019)), "'Rock'")
+
+    def test_regression_em_dash_unchanged(self):
+        self.assertEqual(charset.normalize_text("A" + chr(0x2014) + "B"), "A-B")
+
+    def test_regression_degree_symbol_unchanged(self):
+        text = "75" + chr(0xB0) + "F"
+        self.assertEqual(charset.normalize_text(text), text)
+        self.assertEqual(uecp.encode_rds_g0(text), bytes([0x37, 0x35, 0xBB, 0x46]))
+
+    def test_regression_emoji_unchanged(self):
+        text = "A" + chr(0x1F600) + "B"
+        self.assertEqual(charset.normalize_text(text), text)
+        self.assertEqual(uecp.encode_rds_g0(charset.normalize_text(text)), b"A B")
+
+    def test_regression_cjk_unchanged(self):
+        text = chr(0x65E5) + chr(0x672C) + chr(0x8A9E)  # "日本語"
+        self.assertEqual(charset.normalize_text(text), text)
+        self.assertEqual(uecp.encode_rds_g0(charset.normalize_text(text)), b"   ")
+
+    def test_regression_c0_controls_unchanged(self):
+        text = "Line1\r\nLine2\tTab\x00Nul"
+        self.assertEqual(charset.normalize_text(text), "Line1  Line2 Tab Nul")
+
+    def test_regression_full_existing_matrix_byte_identical(self):
+        # Re-run every case from the prior round's own end-to-end
+        # stress matrix and confirm NFC changes NOTHING about any of
+        # them -- the new normalization step must be a strict no-op
+        # for input that was already in NFC form or contains no
+        # composable combining sequences.
+        cases = [
+            "Oak Grove Radio",
+            "It's 5 o'clock",
+            "en dash " + chr(0x2013) + " em dash " + chr(0x2014),
+            "ellipsis" + chr(0x2026),
+            unicodedata.normalize("NFC", "Beyonc" + chr(0xE9)),
+            "75" + chr(0xB0) + "F",
+            chr(0x6771) + chr(0x4EAC),  # "東京"
+            chr(0x1F3B5),
+        ]
+        for text in cases:
+            with self.subTest(text=text):
+                self.assertEqual(charset.normalize_text(text), charset.normalize_text(unicodedata.normalize("NFC", text)))

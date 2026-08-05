@@ -32,7 +32,25 @@ so normalize_text() must run BEFORE any length-based truncation or
 RT+ start/length-marker arithmetic (it can change string length via
 multi-char replacements like the ellipsis), while encode_rds_g0() is
 strictly length-preserving (one output byte per input character) so
-it's always safe to run AFTER those are finalized."""
+it's always safe to run AFTER those are finalized.
+
+normalize_text() also NFC-canonicalizes its input first, before any of
+the above (2026-08-05 fix). A canonically-equivalent decomposed
+sequence (e.g. base "o" U+006F + combining diaeresis U+0308) is NOT
+the same Python string as its precomposed form (U+00F6 "o with
+diaeresis") even though Unicode treats them as the same character and
+they render identically -- without NFC first, the base letter would
+encode fine but the orphaned combining mark has no G0 representation
+of its own and would fall back to a space, silently losing the accent
+for that input form only. NFC (not NFKC/NFKD) specifically: it composes
+canonically-equivalent sequences into their precomposed form without
+the lossy compatibility folding NFKC/NFKD also apply (e.g. collapsing
+ligatures or width variants) -- this project's own G0 table already
+has real single-code-point slots for the composed forms this fixes, so
+plain canonical composition is sufficient and doesn't reach for
+anything broader than the actual problem."""
+
+import unicodedata
 
 # 256-entry RDS G0 DECODE table (byte -> char), EN 50067:1998 Annex E.
 RDS_G0_DECODE = (
@@ -81,16 +99,19 @@ _SMART_PUNCTUATION = {
 
 
 def normalize_text(text):
-    """Collapses smart quotes/dashes/ellipses to plain-ASCII
-    equivalents and replaces CR, LF, NUL, tab, and other C0/DEL
-    control characters with a plain space. Must run BEFORE any
-    length-based truncation or RT+ offset arithmetic -- the ellipsis
-    collapse ("…" -> "...") changes string length. Also closes
-    the ASCII-transport command-injection path (an embedded newline
-    surviving into a StereoTool ASCII RT=/PS= command could otherwise
-    inject an extra command line -- see ascii_protocol.py)."""
+    """NFC-canonicalizes, then collapses smart quotes/dashes/ellipses
+    to plain-ASCII equivalents, then replaces CR, LF, NUL, tab, and
+    other C0/DEL control characters with a plain space. Must run
+    BEFORE any length-based truncation or RT+ offset arithmetic -- both
+    the NFC pass (a decomposed sequence collapsing to one precomposed
+    character) and the ellipsis collapse ("…" -> "...") can change
+    string length. Also closes the ASCII-transport command-injection
+    path (an embedded newline surviving into a StereoTool ASCII RT=/
+    PS= command could otherwise inject an extra command line -- see
+    ascii_protocol.py)."""
     if not text:
         return ""
+    text = unicodedata.normalize("NFC", text)
     for smart, plain in _SMART_PUNCTUATION.items():
         text = text.replace(smart, plain)
     return text.translate(_CONTROL_TRANSLATION)
