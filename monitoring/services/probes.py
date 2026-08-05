@@ -182,6 +182,46 @@ def probe_transmitter_indicator(check, tx_client):
     return "ok", {"value": raw}
 
 
+# Reasonable tolerance for a state-file "timestamp" field to sit in the
+# FUTURE relative to this process's own clock. Every writer and reader of
+# these state files runs on the same box (see PROJECT_NOTES.md), so there
+# is no real cross-host NTP skew to accommodate here -- this margin exists
+# purely to distinguish ordinary scheduling jitter between a writer's
+# time.time() call and this probe's own time.time() call a moment later
+# from a genuinely corrupted or clock-jumped timestamp. It is deliberately
+# generous in the "how far future is still plausible" direction without
+# weakening any of the staleness (too OLD) checks below, which are
+# unaffected by this constant.
+CLOCK_SKEW_TOLERANCE_SECONDS = 60
+
+
+def _state_freshness(data, now):
+    """Shared malformed/future-timestamp guard for every probe that reads
+    one of the manager's or liquidsoap's JSON state files and computes
+    "how old is this."
+
+    Returns (age_seconds, is_valid). is_valid is False -- and callers MUST
+    treat the state as untrustworthy, never as fresh -- when "timestamp" is
+    missing, not a real number, or implausibly far in the future (more than
+    CLOCK_SKEW_TOLERANCE_SECONDS ahead of `now`). Without this guard, a
+    missing timestamp defaults harmlessly via .get(..., 0) (reads as
+    ancient -- correctly stale), but a malformed one (e.g. an explicit None,
+    or a corrupted non-numeric write) would raise TypeError out of a bare
+    subtraction, and a future-dated one would produce a negative age that
+    silently never trips any `age > THRESHOLD` check -- i.e. treated as
+    indefinitely fresh. Both are exactly backwards for a safety check whose
+    entire job is "do not trust unverifiable data as healthy.\""""
+    raw = data.get("timestamp")
+    try:
+        ts = float(raw)
+    except (TypeError, ValueError):
+        return None, False
+    age = now - ts
+    if age < -CLOCK_SKEW_TOLERANCE_SECONDS:
+        return age, False
+    return age, True
+
+
 def probe_audio_silence(check):
     import json
     from pathlib import Path
@@ -202,7 +242,9 @@ def probe_audio_silence(check):
     # heartbeats (180s) trips "unknown". The earlier 24h bound was left
     # over from before the heartbeat existed and was guaranteed to flip
     # every healthy stream to "unknown" once per day.
-    age = time.time() - data.get("timestamp", 0)
+    age, age_valid = _state_freshness(data, time.time())
+    if not age_valid:
+        return "unknown", {"reason": "state file has a missing or implausible timestamp", "age_seconds": age}
     if age > 180:
         return "unknown", {"reason": "state file hasn't updated in over 3 minutes -- liquidsoap heartbeat stopped", "age_seconds": age}
     # `since_seconds` = how long the CURRENT is_blank has held (dashboard's
@@ -328,7 +370,13 @@ def probe_encoder_group(check):
         return "unknown", {**detail, "error": f"group-state file unreadable: {exc}"}
 
     now = time.time()
-    group_age = now - group_state.get("timestamp", 0)
+    group_age, group_age_valid = _state_freshness(group_state, now)
+    if not group_age_valid:
+        return "critical", {
+            **detail,
+            "reason": "group-state file has a missing or implausible timestamp",
+            "group_state_age_seconds": group_age,
+        }
     if group_age > ENCODER_GROUP_STALE_SECONDS:
         return "critical", {
             **detail,
@@ -377,7 +425,20 @@ def probe_encoder_group(check):
             "expected_generation": manager_generation,
         }
 
-    audio_age = now - audio_state.get("timestamp", 0)
+    audio_age, audio_age_valid = _state_freshness(audio_state, now)
+    if not audio_age_valid:
+        # Same severity as the plain-staleness branch immediately below
+        # (both mean "cannot confirm the audio-state file is current"),
+        # not the "critical" used for a missing group-state file or a
+        # generation mismatch -- this file parses fine and its generation
+        # already matched the manager's, so the failure mode here is
+        # squarely "unverifiable freshness," the same epistemic state as
+        # an ordinary stale heartbeat.
+        return "unknown", {
+            **detail,
+            "reason": "audio-state file has a missing or implausible timestamp",
+            "audio_state_age_seconds": audio_age,
+        }
     if audio_age > AUDIO_STATE_STALE_SECONDS:
         return "unknown", {**detail, "reason": "liquidsoap heartbeat stopped", "audio_state_age_seconds": audio_age}
 

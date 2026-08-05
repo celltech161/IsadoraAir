@@ -293,6 +293,35 @@ class StabilizationTests(EncoderManagerFixtureMixin, TransactionTestCase):
         manager._start_group("airtap", [make_encoder()])
         self.assertEqual(manager._retry_index["airtap"], 3)  # unchanged by the launch itself
 
+    def test_successful_popen_alone_does_not_reset_persisted_consecutive_failures(self):
+        """Item 4 of the 2026-08-05 pre-deploy review: the sibling gap
+        to the test above -- that one only checks the in-memory
+        _retry_index (which schedule step a retry would use), not the
+        persisted group-state field probe_encoder_group actually reads
+        to decide crash-loop-critical. Build a REAL failure history via
+        _handle_exit (the same path a dying child takes in production),
+        then launch successfully, and confirm consecutive_failures in
+        the state file the monitoring probe sees stays elevated -- only
+        _check_stabilization (proven by test_resets_backoff_after_
+        sustained_health) is allowed to clear it."""
+        manager = em.EncoderManager()
+        encoders = [make_encoder()]
+        manager._start_group("airtap", encoders)
+        for _ in range(2):
+            self.exit_current_child(manager, "airtap", returncode=1)
+            manager._handle_exit("airtap", 1)
+            manager._retry_at["airtap"] = 0
+            manager._start_group("airtap", encoders)
+        self.assertEqual(self.read_group_state()["consecutive_failures"], 2)
+
+        # One more clean successful Popen() on top of that history --
+        # the bug this test guards against would be _start_group's
+        # success path zeroing the counter just because Popen() worked.
+        manager._retry_at["airtap"] = 0
+        ok = manager._start_group("airtap", encoders)
+        self.assertTrue(ok)
+        self.assertEqual(self.read_group_state()["consecutive_failures"], 2)
+
 
 class CrashLoopRegressionTests(EncoderManagerFixtureMixin, TransactionTestCase):
     """The exact scenario required by the hardening spec: Liquidsoap
@@ -341,6 +370,37 @@ class CrashLoopRegressionTests(EncoderManagerFixtureMixin, TransactionTestCase):
         self.assertEqual(final_audio["status"], "starting")
         self.assertIsNone(final_audio["is_blank"])
         self.assertFalse(final_audio["audio_observed"])
+
+    def test_repeated_real_crashes_before_stabilization_increase_retry_delay(self):
+        """Item 4 of the 2026-08-05 pre-deploy review: BackoffTests
+        proves _schedule_retry's own progression in isolation, and the
+        test above proves consecutive_failures accumulates -- but
+        neither exercises the real _handle_exit -> _schedule_retry
+        integration across actual repeated crash/relaunch cycles. This
+        confirms next_retry_at spacing (what's actually persisted for
+        the monitoring dashboard) grows in step with the real
+        RETRY_BACKOFF_SECONDS schedule as each real crash is handled,
+        not just that _schedule_retry does the right thing if called
+        directly."""
+        manager = em.EncoderManager()
+        encoders = [make_encoder()]
+        manager._start_group("airtap", encoders)
+
+        observed_delays = []
+        for _ in range(3):
+            before = time.time()
+            self.exit_current_child(manager, "airtap", returncode=1)
+            manager._handle_exit("airtap", 1)
+            next_retry_at = self.read_group_state()["next_retry_at"]
+            observed_delays.append(next_retry_at - before)
+            manager._retry_at["airtap"] = 0  # force the next attempt to fire now
+            manager._start_group("airtap", encoders)
+
+        self.assertAlmostEqual(observed_delays[0], em.RETRY_BACKOFF_SECONDS[0], delta=2)
+        self.assertAlmostEqual(observed_delays[1], em.RETRY_BACKOFF_SECONDS[1], delta=2)
+        self.assertAlmostEqual(observed_delays[2], em.RETRY_BACKOFF_SECONDS[2], delta=2)
+        self.assertLess(observed_delays[0], observed_delays[1])
+        self.assertLess(observed_delays[1], observed_delays[2])
 
     def test_consecutive_failures_reaching_three_reads_as_crash_looping(self):
         """Cross-check against the monitoring probe's own decision
@@ -440,6 +500,40 @@ class StopTests(EncoderManagerFixtureMixin, TransactionTestCase):
         manager.stop()
         proc.terminate.assert_called_once()
 
+    def test_stop_does_not_touch_failure_bookkeeping_or_schedule_a_retry(self):
+        """Item 4 of the 2026-08-05 pre-deploy review: stop() is a
+        structurally separate code path from _handle_exit -- it never
+        calls _handle_exit or _schedule_retry (confirmed by source
+        inspection), so an intentional shutdown must never look like a
+        crash to anything reading consecutive_failures/next_retry_at
+        afterward. Removing the group-state file outright (the existing
+        test_stop_marks_audio_state_dead_and_removes_group_state
+        assertion) already makes this true for probe_encoder_group, but
+        the in-memory bookkeeping stop() leaves behind matters too --
+        it's what a subsequent, unrelated call to _check_health would
+        see if the process is ever restarted with this manager object
+        still resident."""
+        manager = em.EncoderManager()
+        encoders = [make_encoder()]
+        manager._start_group("airtap", encoders)
+        self.exit_current_child(manager, "airtap", returncode=1)
+        manager._handle_exit("airtap", 1)  # one real prior crash, for a non-trivial starting point
+        manager._retry_at["airtap"] = 0
+        manager._start_group("airtap", encoders)
+        failures_before_stop = manager._group_meta("airtap")["consecutive_failures"]
+        retry_index_before_stop = manager._retry_index.get("airtap")
+        # Clear the harness's own manual override above so anything
+        # found in _retry_at afterward is unambiguously stop()'s doing,
+        # not leftover test setup -- _start_group itself never touches
+        # this dict (confirmed by source inspection).
+        manager._retry_at.pop("airtap", None)
+
+        manager.stop()
+
+        self.assertEqual(manager._group_meta("airtap")["consecutive_failures"], failures_before_stop)
+        self.assertEqual(manager._retry_index.get("airtap"), retry_index_before_stop)
+        self.assertNotIn("airtap", manager._retry_at)  # no retry was scheduled by stop()
+
 
 class ExitHandlingTests(EncoderManagerFixtureMixin, TransactionTestCase):
     def test_exit_marks_audio_state_dead_immediately(self):
@@ -464,3 +558,96 @@ class ExitHandlingTests(EncoderManagerFixtureMixin, TransactionTestCase):
                 manager._start_group("airtap", encoders)
         levels = [call.kwargs.get("level") for call in mock_emit.call_args_list]
         self.assertIn("error", levels)
+
+
+# ---------------------------------------------------------------------
+# _atomic_write_json -- pre-deploy safety review, 2026-08-05
+# ---------------------------------------------------------------------
+class AtomicWriteJsonTests(SimpleTestCase):
+    def setUp(self):
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.path = Path(self._tmpdir.name) / "state.json"
+
+    def test_round_trips_valid_json(self):
+        em._atomic_write_json(self.path, {"a": 1, "b": None, "c": False})
+        self.assertEqual(json.loads(self.path.read_text()), {"a": 1, "b": None, "c": False})
+
+    def test_no_temp_file_left_behind_after_success(self):
+        em._atomic_write_json(self.path, {"a": 1})
+        leftovers = list(Path(self._tmpdir.name).glob("*.tmp"))
+        self.assertEqual(leftovers, [])
+
+    def test_uses_os_replace_not_copy(self):
+        """Confirms the actual mechanism is a single atomic rename, not
+        a read-modify-write or copy+delete sequence that could expose
+        a partial file to a concurrent reader."""
+        with patch.object(em.os, "replace", wraps=em.os.replace) as mock_replace:
+            em._atomic_write_json(self.path, {"a": 1})
+        mock_replace.assert_called_once()
+        called_src, called_dst = mock_replace.call_args[0]
+        self.assertEqual(str(called_dst), str(self.path))
+
+    def test_reader_never_sees_a_half_written_document(self):
+        """Simulates a reader landing exactly at the moment of the
+        atomic rename by making os.replace itself the trigger point:
+        before the call, only the OLD complete file (or nothing) is
+        visible under the real name; after it returns, only the NEW
+        complete file is. There is no observable window in between --
+        write() only ever touches the .tmp path, never `self.path`."""
+        em._atomic_write_json(self.path, {"version": "old", "complete": True})
+
+        original_replace = em.os.replace
+        seen_during_write = {}
+
+        def spying_replace(src, dst):
+            # Right before the swap: destination must still be the
+            # fully-intact OLD document, never a partial new one.
+            seen_during_write["before"] = json.loads(Path(dst).read_text())
+            return original_replace(src, dst)
+
+        with patch.object(em.os, "replace", side_effect=spying_replace):
+            em._atomic_write_json(self.path, {"version": "new", "complete": True})
+
+        self.assertEqual(seen_during_write["before"], {"version": "old", "complete": True})
+        self.assertEqual(json.loads(self.path.read_text()), {"version": "new", "complete": True})
+
+    def test_failed_write_does_not_destroy_last_complete_state(self):
+        em._atomic_write_json(self.path, {"version": "good", "complete": True})
+        good_bytes = self.path.read_bytes()
+
+        with patch.object(em.os, "fsync", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                em._atomic_write_json(self.path, {"version": "bad"})
+
+        self.assertEqual(self.path.read_bytes(), good_bytes)
+
+    def test_failed_write_cleans_up_its_own_temp_file(self):
+        with patch.object(em.os, "fsync", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                em._atomic_write_json(self.path, {"a": 1})
+        leftovers = list(Path(self._tmpdir.name).glob("*.tmp"))
+        self.assertEqual(leftovers, [])
+
+    def test_non_serializable_data_also_cleans_up_and_raises(self):
+        """json.dumps raises TypeError, not OSError -- confirms the
+        cleanup path catches both, not just I/O failures."""
+        with self.assertRaises(TypeError):
+            em._atomic_write_json(self.path, {"bad": object()})
+        leftovers = list(Path(self._tmpdir.name).glob("*.tmp"))
+        self.assertEqual(leftovers, [])
+
+    def test_written_file_is_readable_by_the_same_user(self):
+        """Both isadoraair-encoders.service and isadoraair-monitoring.service
+        run as the same User=/Group= (confirmed live in both unit
+        files) -- so the only real requirement is that a plain,
+        default-umask write is actually readable back, no special
+        permission bits needed. Documents that fact rather than
+        exercising cross-user permissions, which aren't meaningfully
+        testable without actually running as two different users."""
+        em._atomic_write_json(self.path, {"a": 1})
+        # Readable and, per the default umask on a normal deployment,
+        # not unusually restricted (owner read/write at minimum).
+        mode = self.path.stat().st_mode
+        self.assertTrue(mode & 0o400, "owner-read bit must be set")
+        self.assertEqual(json.loads(self.path.read_text()), {"a": 1})

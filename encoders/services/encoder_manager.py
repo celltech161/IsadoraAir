@@ -39,6 +39,7 @@ from) and restart it, re-reading the current DB state for that device's
 group of encoders rather than reusing whatever was true when it last
 started."""
 import json
+import os
 import signal
 import subprocess
 import time
@@ -205,13 +206,52 @@ def _group_state_path(input_device):
 
 
 def _atomic_write_json(path, data):
-    """Write-tmp-then-rename -- same idiom already used by
-    monitoring/services/monitor.py's _write_state/_write_listener_state.
+    """Write-tmp-then-atomic-replace -- same idiom already used by
+    monitoring/services/monitor.py's _write_state/_write_listener_state,
+    strengthened here (2026-08-05 pre-deploy review) with an explicit
+    flush+fsync on the temp file before the rename, os.replace() rather
+    than Path.rename(), and cleanup of the temp file on ANY failure.
+
     No reader (a monitoring poll landing mid-write) can ever observe a
-    partially-written or truncated state file."""
+    partially-written or truncated state file -- the destination path
+    is never touched until the single atomic replace call, and that
+    call either fully succeeds (new complete document visible) or
+    fully fails (old complete document, or nothing, still there).
+
+    os.replace() vs. the old Path.rename(): equivalent in practice on
+    this project's only real deployment target (Linux -- POSIX
+    rename(2) already atomically replaces an existing destination) --
+    switched to os.replace() anyway since it's the API that's
+    *guaranteed* to have that behavior on every platform, not just
+    this one, making the intent unambiguous at the call site rather
+    than relying on a platform-specific guarantee.
+
+    fsync is on the TEMP FILE's own descriptor, before the rename --
+    these files live on tmpfs (/run/isadoraair has no on-disk
+    durability to guarantee regardless of fsync), so this isn't a
+    crash-durability claim; it just guarantees the write is fully out
+    of any buffering layer before the name swap that makes it visible,
+    same spirit as the flush() this already implied.
+
+    On any failure (a full tmpfs, a permissions problem, a caller
+    passing non-JSON-serializable data) the half-written .tmp file is
+    removed before re-raising -- repeated failures (e.g. every 5s from
+    the manager's own heartbeat) must never accumulate stray fragments
+    on tmpfs, and the caller still learns the write failed rather than
+    this function silently swallowing it."""
     tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-    tmp.rename(path)
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(json.dumps(data, ensure_ascii=False))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 def _effective_input_device(encoder):
@@ -717,7 +757,7 @@ class EncoderManager:
                 "input_device": input_device, "timestamp": time.time(),
             })
             _atomic_write_json(_audio_state_path(input_device), data)
-        except OSError:
+        except Exception:
             pass
 
     def _write_group_state(self, input_device, next_retry_at=None):
@@ -743,7 +783,7 @@ class EncoderManager:
         }
         try:
             _atomic_write_json(_group_state_path(input_device), state)
-        except OSError as exc:
+        except Exception as exc:
             print(f"  [{input_device}] Failed to write group state: {exc}")
 
     def _schedule_retry(self, input_device):
@@ -823,11 +863,30 @@ class EncoderManager:
         # actually executing. A monitoring poll landing in that gap
         # must never see an earlier generation's possibly-"audio_ok"
         # content (Phase 8 req #2/#7).
-        _atomic_write_json(_audio_state_path(input_device), {
-            "status": "starting", "is_blank": None, "audio_observed": False,
-            "input_device": input_device, "pid": proc.pid, "generation": generation,
-            "started_at": launched_at, "since": launched_at, "timestamp": launched_at,
-        })
+        #
+        # Deliberately best-effort (2026-08-05 pre-deploy review found
+        # this call was NOT wrapped): by this point Popen() has already
+        # succeeded and a real Liquidsoap process is running. Letting an
+        # OSError here (a full tmpfs, a permissions problem) propagate
+        # uncaught would skip every line below -- self._procs[input_device]
+        # never gets set, leaking the just-spawned process untracked and
+        # unkillable by this manager, AND the exception would climb out
+        # of _start_group entirely into a caller that doesn't catch it
+        # either, crashing the WHOLE manager process and taking down
+        # every OTHER group's supervision along with it. A failed
+        # invalidation write is a real, worth-logging degradation (the
+        # stale-state race window stays open a little longer than
+        # intended) -- never a reason to lose track of a child we
+        # already own or bring down groups that have nothing to do with
+        # this one.
+        try:
+            _atomic_write_json(_audio_state_path(input_device), {
+                "status": "starting", "is_blank": None, "audio_observed": False,
+                "input_device": input_device, "pid": proc.pid, "generation": generation,
+                "started_at": launched_at, "since": launched_at, "timestamp": launched_at,
+            })
+        except Exception as exc:
+            self._log(input_device, f"Failed to invalidate previous audio-state file: {exc}", force=True)
 
         self._procs[input_device] = proc
         self._scripts[input_device] = script_path

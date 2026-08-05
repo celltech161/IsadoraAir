@@ -59,3 +59,31 @@ class ProbeAudioSilenceTests(TestCase):
         status, detail = probes.probe_audio_silence(make_check())
         self.assertEqual(status, "unknown")
         self.assertIn("error", detail)
+
+    def test_timestamp_far_in_the_future_is_unknown_not_fresh(self):
+        """Item 3 of the 2026-08-05 pre-deploy review: a negative age
+        (timestamp implausibly ahead of this process's clock -- a
+        corrupted write or clock jump) must not silently pass the
+        `age > 180` staleness check, which a plain subtraction never
+        would trip for a negative value."""
+        self.write(is_blank=False, timestamp=time.time() + 10_000, since=time.time())
+        status, detail = probes.probe_audio_silence(make_check())
+        self.assertEqual(status, "unknown")
+        self.assertIn("implausible", detail["reason"])
+
+    def test_timestamp_slightly_ahead_within_clock_skew_tolerance_still_passes(self):
+        self.write(is_blank=False, timestamp=time.time() + 5, since=time.time())
+        status, detail = probes.probe_audio_silence(make_check())
+        self.assertEqual(status, "ok")
+
+    def test_missing_timestamp_is_unknown_not_fresh(self):
+        self.write(is_blank=False, since=time.time())
+        status, detail = probes.probe_audio_silence(make_check())
+        self.assertEqual(status, "unknown")
+        self.assertIn("implausible", detail["reason"])
+
+    def test_malformed_timestamp_is_unknown_not_raised(self):
+        self.write(is_blank=False, timestamp="not-a-number", since=time.time())
+        status, detail = probes.probe_audio_silence(make_check())
+        self.assertEqual(status, "unknown")
+        self.assertIn("implausible", detail["reason"])
