@@ -113,6 +113,11 @@ RETRY_BACKOFF_SECONDS = [5, 10, 30, 60, 300]
 # that could disagree with each other.
 STABILIZATION_SECONDS = 25
 
+# Shared with the startup classifier's own dB_levels() comparison in
+# build_liquidsoap_script (2026-08-06) -- ONE threshold literal, not
+# two independently-maintained copies that could silently drift apart.
+BLANK_DETECT_THRESHOLD_DB = -40.0
+
 # Written by library/services/engine.py's _write_now_playing() on every
 # track change (station-wide, not per-device -- unlike the per-device
 # silence state above, "what's playing" isn't tied to a capture point).
@@ -533,29 +538,22 @@ def build_liquidsoap_script(input_device, encoders, host_aircheck=False, generat
         # headroom on a broadcast pipeline that's already
         # downstream-latency-dominated.
         f'source = input.alsa(buffer_size=1.0, device={_liq_string(input_device)})',
-        # start_blank=true (2026-08-06 post-deployment investigation):
-        # blank.detect's own documented default is start_blank=false --
-        # it ASSUMES noise, not silence, from the very first frame.
-        # on_noise only fires on a blank->noise TRANSITION, so a
-        # restart landing on an input that's already continuously
-        # non-silent (the normal case -- the DJ/automation chain is
-        # almost never actually silent at the moment of an encoder
-        # restart) has no transition to fire on and NEVER calls
-        # on_noise, no matter how long real audio keeps flowing.
-        # Confirmed empirically with an isolated synthetic script
-        # (sine-wave source, same blank.detect params, no live
-        # service touched): 8+ seconds of continuous tone with
-        # start_blank left at its default never fired on_noise; adding
-        # start_blank=true fired it in well under a second, and
-        # on_blank/on_noise both continued firing correctly across
-        # later real transitions and multiple transitions in a row.
-        # start_blank=true makes blank.detect assume silence at
-        # startup instead -- matching this script's own honest
-        # "starting"/is_blank=null startup semantic below -- so ANY
-        # real audio observed after start is a genuine transition and
-        # correctly fires on_noise, regardless of whether the input
-        # happens to already be "hot" the instant the source opens.
-        'source = blank.detect(threshold=-40.0, max_blank=20.0, min_noise=0.5, start_blank=true, source)',
+        # start_blank left at its documented default (false = assume
+        # noise, not silence, from the first frame) -- DELIBERATELY not
+        # overridden. 2026-08-06 post-deployment investigation, round 2:
+        # start_blank=true (this file's own prior fix) turned out to
+        # have a worse, opposite bug -- confirmed empirically with an
+        # isolated synthetic script, a genuinely continuously-SILENT
+        # source spuriously fired on_noise (a FALSE "audio_ok") within
+        # ~0.05s, every time, reproducibly. That's a false-positive
+        # "healthy" report for real silence -- exactly the failure mode
+        # this whole project exists to eliminate, and worse than the
+        # original bug (which only ever left state stuck "unknown",
+        # never falsely "healthy"). Neither start_blank value alone
+        # correctly resolves BOTH cold-start shapes (continuous audio,
+        # continuous silence) -- see the one-shot startup classifier
+        # below, which does, without depending on either default.
+        f'source = blank.detect(threshold={BLANK_DETECT_THRESHOLD_DB}, max_blank=20.0, min_noise=0.5, source)',
         '',
         f'generation = {_liq_string(generation)}',
         f'input_device_str = {_liq_string(input_device)}',
@@ -584,27 +582,79 @@ def build_liquidsoap_script(input_device, encoders, host_aircheck=False, generat
         'last_is_blank = ref(null)',
         'audio_observed = ref(false)',
         'since_ts = ref(time())',
+        # Generation CAS guard lives HERE, centrally, so EVERY write
+        # site (this script's own initial write, on_blank, on_noise,
+        # the 60s heartbeat, and the startup classifier below) is
+        # uniformly protected against a lingering, already-superseded
+        # process still writing into a file a NEWER generation now
+        # owns -- 2026-08-06 post-deployment investigation, round 2.
+        # Confirmed empirically this matters beyond just the
+        # classifier: thread.run(every=X) with no explicit delay=
+        # defaults delay=0.0, meaning the 60s heartbeat's FIRST tick
+        # fires almost immediately at script start, not after the
+        # first 60s interval -- so an old, still-alive process's own
+        # heartbeat (not just its classifier) can race a newer
+        # generation's takeover of the same file within roughly the
+        # first second of the old process still being alive. A single
+        # guard inside write_state() closes that for every caller at
+        # once, rather than requiring each call site to reimplement
+        # its own check (the classifier's first draft did exactly
+        # that, redundantly, before this consolidation).',
         'def write_state(status, is_blank, since) =',
-        '  last_status.set(status)',
-        '  last_is_blank.set(is_blank)',
-        '  since_ts.set(since)',
-        '  state = json.stringify(compact=true, {',
-        '    status = status,',
-        '    is_blank = is_blank,',
-        '    audio_observed = audio_observed(),',
-        '    input_device = input_device_str,',
-        '    pid = process.pid(),',
-        '    generation = generation,',
-        '    started_at = started_at,',
-        '    since = since,',
-        '    timestamp = time(),',
-        '  })',
+        f'  file_ok = if file.exists({_liq_string(audio_state_path)}) then',
+        '    (try',
+        f'      current_text = file.contents({_liq_string(audio_state_path)})',
+        # Checked separately, deliberately -- NOT one combined
+        # substring, because this file has TWO different writers with
+        # two different JSON formatters: this script's own
+        # json.stringify(compact=true, ...) (no space after ":") for
+        # every write AFTER the first, but the Python-side
+        # _atomic_write_json (encoder_manager.py, plain json.dumps(),
+        # default separators) writes the PRE-SPAWN placeholder every
+        # generation starts from -- WITH a space after ":". A single
+        # exact-substring check tuned to only one of those two formats
+        # would silently fail open against whichever format it wasn't
+        # tuned for (caught empirically: an earlier version of this
+        # guard, checked only against the no-space format, always
+        # treated a real Python-written value as "no generation key
+        # present at all" and let every write through regardless of
+        # whether the generation actually matched -- exactly the
+        # scenario this guard exists to catch). "Does the key exist"
+        # doesn't need this distinction (":" itself is never preceded
+        # by a space in valid JSON from either writer); only the
+        # value-match check does.
+        '      has_generation_key = string.contains(substring="\\"generation\\":", current_text)',
+        '      matches_ours = string.contains(substring="\\"generation\\":\\"#{generation}\\"", current_text)',
+        '        or string.contains(substring="\\"generation\\": \\"#{generation}\\"", current_text)',
+        '      matches_ours or (not has_generation_key)',
+        '    catch _ do',
+        '      true',  # unreadable, not a generation mismatch -- fail open, matching this file's existing "never lose track of state over a read hiccup" precedent elsewhere
+        '    end : bool)',
+        '  else',
+        '    true',
+        '  end',
+        '  if file_ok then',
+        '    last_status.set(status)',
+        '    last_is_blank.set(is_blank)',
+        '    since_ts.set(since)',
+        '    state = json.stringify(compact=true, {',
+        '      status = status,',
+        '      is_blank = is_blank,',
+        '      audio_observed = audio_observed(),',
+        '      input_device = input_device_str,',
+        '      pid = process.pid(),',
+        '      generation = generation,',
+        '      started_at = started_at,',
+        '      since = since,',
+        '      timestamp = time(),',
+        '    })',
         # temp_dir must live on the same filesystem as the target for the
         # atomic rename to succeed. Without this, liquidsoap defaults temp
         # to /tmp and logs "Atomic rename failed!" on every write (harmless
         # -- the write still happens non-atomically -- but with the 60s
         # heartbeat it turns into once-a-minute log spam).
-        f'  file.write(data=state, atomic=true, temp_dir="/run/isadoraair", {_liq_string(audio_state_path)})',
+        f'    file.write(data=state, atomic=true, temp_dir="/run/isadoraair", {_liq_string(audio_state_path)})',
+        '  end',
         'end',
         '',
         # is_blank=null on the transition writes below would be WRONG --
@@ -612,8 +662,19 @@ def build_liquidsoap_script(input_device, encoders, host_aircheck=False, generat
         # observed something real, so null (meaning "not yet verified")
         # never belongs on either of these two lines, only on the
         # startup line further down.
-        'source.on_blank(synchronous=false, {write_state("silent", true, time())})',
+        # real_transition_seen is set ONLY by a genuine blank.detect
+        # transition callback firing -- deliberately a separate flag
+        # from last_status, which the startup classifier below ALSO
+        # writes through (see that block's own comment for why
+        # conflating the two would break the classifier's ability to
+        # keep re-measuring after its own first write).
+        'real_transition_seen = ref(false)',
+        'source.on_blank(synchronous=false, {',
+        '  real_transition_seen.set(true)',
+        '  write_state("silent", true, time())',
+        '})',
         'source.on_noise(synchronous=false, {',
+        '  real_transition_seen.set(true)',
         '  audio_observed.set(true)',
         '  write_state("audio_ok", false, time())',
         '})',
@@ -625,6 +686,89 @@ def build_liquidsoap_script(input_device, encoders, host_aircheck=False, generat
         # "starting"/null record as the last thing it ever wrote --
         # correctly unresolved, not a false all-clear.
         'write_state("starting", null, time())',
+        '',
+        # Startup classifier (2026-08-06 post-deployment investigation,
+        # round 2). Neither blank.detect start_blank value alone
+        # resolves BOTH cold-start shapes correctly: start_blank=false
+        # (the default, used above) never fires on_noise for audio
+        # that's already continuous from frame one (no blank->noise
+        # transition to observe -- the ORIGINAL bug); start_blank=true
+        # was tried and reverted -- confirmed empirically to spuriously
+        # fire on_noise within ~0.05s for genuinely continuous SILENCE
+        # too (a false "audio_ok", worse than the original bug).
+        # Rather than depend on either, this independently measures the
+        # real, current dB level via blank.detect's own `dB_levels()`
+        # method (confirmed empirically to be an accurate, real-time
+        # measurement, unlike `is_blank()`, which just mirrors the same
+        # transition-state-machine the callbacks use and is exactly as
+        # stale).
+        #
+        # Deliberately keeps RE-measuring (not a single fire-once
+        # classification) for its whole retry window: blank.detect's
+        # own transition machinery needs a FULL max_blank (20s) of
+        # continuous silence before it can register a blank->noise
+        # transition at all, so a brief, transient silence at startup
+        # shorter than that -- immediately followed by real audio --
+        # would otherwise leave the classifier's first (correct, at the
+        # time) "silent" snapshot stuck with nothing left to ever
+        # correct it (confirmed empirically: this exact shape was caught
+        # by this file's own test suite before landing). Re-measuring
+        # only WRITES when the classification actually changes (never
+        # on every tick), so it doesn't spuriously reset the dashboard's
+        # "stable for" clock the way an unconditional re-write would.
+        #
+        # Safety properties (see encoders/tests/test_encoder_manager.py
+        # StartupClassifierScriptTests / the synthetic investigation
+        # for the empirical proof of each):
+        #   - A real on_blank/on_noise transition always supersedes:
+        #     gated on real_transition_seen(), a flag ONLY the genuine
+        #     callbacks above ever set -- never the classifier itself,
+        #     so the classifier keeps working (and immediately stops
+        #     the moment a real transition fires) without being
+        #     confused by its own prior writes into last_status.
+        #   - Never writes an optimistic default -- only ever writes
+        #     once it has an ACTUAL non-null level measurement, and
+        #     only when that measurement's classification differs from
+        #     what it last wrote.
+        #   - Retries every 0.5s (bounded to 20 attempts, 10s total)
+        #     rather than a single fixed delay, so it isn't sensitive
+        #     to real-world ALSA/dsnoop open latency (input.alsa can
+        #     take over a second to start delivering frames) the way a
+        #     single guess at a delay would be.
+        #   - Generation-guarded against a lingering old-generation
+        #     process's classifier firing late and clobbering a NEWER
+        #     generation's already-current state: write_state() itself
+        #     now carries this guard (see its own comment above) --
+        #     the classifier doesn't need its own copy. A stale write
+        #     from a superseded generation is silently dropped there,
+        #     never applied, and classify_last_status still advances
+        #     regardless (a superseded generation's file can never
+        #     become "ours" again, so there's nothing useful a retry
+        #     would accomplish).
+        'classify_last_status = ref("")',
+        'classify_attempts = ref(0)',
+        'def classify_startup() =',
+        '  if (not real_transition_seen()) and (classify_attempts() < 20) then',
+        '    classify_attempts.set(classify_attempts() + 1)',
+        '    levels = source.dB_levels()',
+        '    if levels != null then',
+        '      lv = null.get(levels)',
+        '      max_level = list.fold(fun (acc, x) -> if x > acc then x else acc end, -1000.0, lv)',
+        f'      new_status = if max_level > {BLANK_DETECT_THRESHOLD_DB} then "audio_ok" else "silent" end',
+        '      if new_status != classify_last_status() then',
+        '        classify_last_status.set(new_status)',
+        '        if new_status == "audio_ok" then',
+        '          audio_observed.set(true)',
+        '          write_state("audio_ok", false, time())',
+        '        else',
+        '          write_state("silent", true, time())',
+        '        end',
+        '      end',
+        '    end',
+        '  end',
+        'end',
+        'thread.run(delay=1.0, every=0.5, classify_startup)',
+        '',
         # Periodic heartbeat: re-touch the state file every 60s carrying
         # the last known status/is_blank AND the last known transition
         # timestamp (so the dashboard's stable-for counter keeps

@@ -69,16 +69,24 @@ class BuildLiquidsoapScriptTests(TestCase):
         self.assertIn('write_state("silent", true, time())', script)
         self.assertIn('write_state("audio_ok", false, time())', script)
 
-    def test_blank_detect_starts_assuming_silence(self):
-        """2026-08-06 post-deployment investigation: blank.detect's own
-        documented default is start_blank=false (assumes NOISE from the
-        first frame), so a restart landing on already-continuously-
-        non-silent audio -- confirmed empirically via an isolated
-        synthetic Liquidsoap script -- never fires on_noise at all,
-        since there's no blank->noise transition to observe. Must be
-        explicitly overridden to true."""
+    def test_blank_detect_left_at_default_start_blank(self):
+        """2026-08-06 post-deployment investigation, round 2:
+        blank.detect's own documented default is start_blank=false
+        (assumes NOISE from the first frame), so a restart landing on
+        already-continuously-non-silent audio never fires on_noise at
+        all (no blank->noise transition to observe) -- confirmed
+        empirically via an isolated synthetic Liquidsoap script.
+        start_blank=true was tried as the fix and reverted: also
+        confirmed empirically to spuriously fire on_noise within
+        ~0.05s for genuinely continuous SILENCE (a false "audio_ok",
+        worse than the original bug). Neither value is safe to rely on
+        alone -- the startup classifier (see StartupClassifierScriptTests)
+        resolves both cold-start shapes correctly without needing
+        either override, so start_blank is deliberately left
+        unspecified (Liquidsoap's own default, false)."""
         script = em.build_liquidsoap_script("airtap", [make_encoder()], generation="g")
-        self.assertIn("start_blank=true", script)
+        self.assertNotIn("start_blank", script)
+        self.assertIn("classify_startup", script)
 
     def test_aircheck_and_telnet_gated_together(self):
         with_aircheck = em.build_liquidsoap_script("airtap", [make_encoder()], host_aircheck=True, generation="g")
@@ -121,6 +129,228 @@ class BuildLiquidsoapScriptRealSyntaxTests(TestCase):
                 capture_output=True, text=True, timeout=30,
             )
         self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+
+
+class StartupClassifierScriptTests(TestCase):
+    # TestCase: build_liquidsoap_script's host_aircheck path (unused
+    # here, host_aircheck=False throughout) would read AircheckConfig;
+    # kept as TestCase for consistency with the other real-syntax class.
+    """2026-08-06 post-deployment investigation, round 2: real, timed
+    runs of the ACTUAL generated script (not a hand-written mockup) --
+    same "live-verify Liquidsoap behavior, don't just assert on text"
+    convention as BuildLiquidsoapScriptRealSyntaxTests above. Skipped
+    cleanly if liquidsoap isn't on PATH.
+
+    Every run substitutes ONLY the `input.alsa(...)` line for a
+    synthetic source (sine()/blank()) -- everything else, including the
+    exact startup classifier under test, is the real generated code.
+    Encoder host/port are ALWAYS 127.0.0.1:1 (nothing listens there --
+    an immediate, safe local connection-refused) and input_device is a
+    unique per-test slug, so these runs can never reach the real
+    Shoutcast server or collide with the live encoder's own state file
+    at /run/isadoraair/liquidsoap_silence_airtap.json. State files are
+    always cleaned up, including on failure."""
+
+    SAFE_ENCODER_KWARGS = dict(host="127.0.0.1", port=1, mount="/1", station_name="t", genre="t", url="http://example.invalid")
+
+    def _run(self, input_device, source_expr, generation, timeout=4):
+        if shutil.which("liquidsoap") is None:
+            self.skipTest("liquidsoap not installed on this box")
+        state_path = em._audio_state_path(input_device)
+        self.addCleanup(lambda: state_path.unlink(missing_ok=True))
+        script = em.build_liquidsoap_script(input_device, [make_encoder(**self.SAFE_ENCODER_KWARGS)], generation=generation)
+        alsa_line = f'source = input.alsa(buffer_size=1.0, device="{input_device}")'
+        self.assertIn(alsa_line, script, "test fixture assumption broken -- can't safely substitute the source")
+        script = script.replace(alsa_line, f"source = {source_expr}", 1)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            script_path = Path(tmpdir) / "test.liq"
+            script_path.write_text(script, encoding="utf-8")
+            try:
+                subprocess.run(["liquidsoap", str(script_path)], capture_output=True, text=True, timeout=timeout)
+            except subprocess.TimeoutExpired:
+                pass  # expected -- these scripts run forever until killed
+        if not state_path.is_file():
+            return None
+        return json.loads(state_path.read_text(encoding="utf-8"))
+
+    def test_startup_into_continuous_audio(self):
+        state = self._run("classifiertest-a", "sine(440.0)", "gen-a", timeout=3)
+        self.assertIsNotNone(state, "classifier never wrote a resolution")
+        self.assertEqual(state["status"], "audio_ok")
+        self.assertFalse(state["is_blank"])
+        self.assertTrue(state["audio_observed"])
+        self.assertEqual(state["generation"], "gen-a")
+
+    def test_startup_into_continuous_silence(self):
+        """The scenario this round of investigation was specifically
+        about: without the classifier, this would stay "starting"/null
+        forever (max_blank=20.0, far past any reasonable test/real
+        startup-allowance window)."""
+        state = self._run("classifiertest-b", "blank(duration=-1.0)", "gen-b", timeout=3)
+        self.assertIsNotNone(state, "classifier never wrote a resolution")
+        self.assertEqual(state["status"], "silent")
+        self.assertTrue(state["is_blank"])
+        self.assertFalse(state["audio_observed"])
+        self.assertEqual(state["generation"], "gen-b")
+
+    def test_silence_then_audio(self):
+        """Classifier resolves the cold start to silent; a later GENUINE
+        transition (blank.detect's own on_noise, not the classifier --
+        classify_resolved is one-shot) then correctly fires."""
+        state = self._run(
+            "classifiertest-c",
+            'sequence(merge=true, [blank(duration=2.0), sine(440.0)])',
+            "gen-c", timeout=5,
+        )
+        self.assertIsNotNone(state)
+        self.assertEqual(state["status"], "audio_ok")
+        self.assertFalse(state["is_blank"])
+
+    def test_audio_then_silence(self):
+        state = self._run(
+            "classifiertest-d",
+            'sequence(merge=true, [sine(440.0, duration=2.0), blank(duration=10.0)])',
+            "gen-d", timeout=5,
+        )
+        self.assertIsNotNone(state)
+        self.assertEqual(state["status"], "silent")
+        self.assertTrue(state["is_blank"])
+
+    def test_callback_wins_race_against_classifier(self):
+        """A genuine on_blank transition must supersede the classifier
+        entirely -- structurally guaranteed by the classifier's own
+        outer `if not real_transition_seen()` guard, checked before it
+        ever measures or writes anything (see build_liquidsoap_script).
+        max_blank=20.0 -> max_blank=0.05 for THIS test only (a timing
+        knob): the real script's own production value makes a genuine
+        on_blank transition take a full 20 real seconds to fire, far
+        too slow for a unit test, without changing what's being
+        tested -- whether a real transition wins the race, not how
+        long blank.detect's own transition takes in production.
+
+        Runs well past BOTH the shortened max_blank AND the classifier's
+        own normal delay=1.0 window, then confirms the resolution
+        timestamp reflects the EARLY on_blank transition, not a later
+        classifier write -- if the classifier's outer guard were
+        broken, its own (redundant, since the source genuinely is
+        silent either way) write at ~1.0s would bump `since` well past
+        the ~0.05s the real callback used."""
+        if shutil.which("liquidsoap") is None:
+            self.skipTest("liquidsoap not installed on this box")
+        input_device = "classifiertest-e"
+        state_path = em._audio_state_path(input_device)
+        self.addCleanup(lambda: state_path.unlink(missing_ok=True))
+        script = em.build_liquidsoap_script(input_device, [make_encoder(**self.SAFE_ENCODER_KWARGS)], generation="gen-e")
+        alsa_line = f'source = input.alsa(buffer_size=1.0, device="{input_device}")'
+        blank_detect_line = f'source = blank.detect(threshold={em.BLANK_DETECT_THRESHOLD_DB}, max_blank=20.0, min_noise=0.5, source)'
+        self.assertIn(alsa_line, script)
+        self.assertIn(blank_detect_line, script, "test fixture assumption broken -- can't safely shorten max_blank")
+        script = script.replace(alsa_line, "source = blank(duration=-1.0)", 1)
+        script = script.replace(blank_detect_line, blank_detect_line.replace("max_blank=20.0", "max_blank=0.05"), 1)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            script_path = Path(tmpdir) / "test.liq"
+            script_path.write_text(script, encoding="utf-8")
+            start = time.time()
+            try:
+                subprocess.run(["liquidsoap", str(script_path)], capture_output=True, text=True, timeout=2.5)
+            except subprocess.TimeoutExpired:
+                pass  # expected -- runs until killed, well past both windows
+        elapsed = time.time() - start
+
+        self.assertTrue(state_path.is_file(), "on_blank never resolved this")
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(state["status"], "silent")
+        self.assertTrue(state["is_blank"])
+        # The resolution's own transition timestamp (`since`) must sit
+        # close to script start, not close to when the run ended --
+        # proves the EARLY on_blank write is what's in the file, not a
+        # later classifier write bumping `since` forward.
+        self.assertLess(state["since"] - state["started_at"], 0.5, "since is too far from started_at -- looks like the classifier wrote this, not the early on_blank callback")
+
+    def test_old_generation_delayed_resolution_cannot_alter_current_state(self):
+        """Simulates a lingering old-generation process (its classifier,
+        its heartbeat, or in principle a genuine callback) still writing
+        AFTER a newer generation has already taken over the SAME file --
+        confirms the CAS guard now centralized inside write_state()
+        itself (not just the classifier -- see that function's own
+        comment) drops every such stale write rather than applying it.
+
+        This test's own history is part of why the guard ended up
+        centralized: an earlier version raced the injection against the
+        classifier's own delay=1.0 and was genuinely flaky -- not
+        because the classifier's guard was wrong, but because
+        thread.run(every=X) with no explicit delay= defaults delay=0.0,
+        so this script's 60s heartbeat fires almost immediately at
+        startup too (confirmed empirically), and it had NO guard of its
+        own before this write_state()-level fix. No special timing is
+        needed anymore: injecting the newer generation at any point
+        after the old process's own initial write, then letting it run
+        for several seconds (long enough for its heartbeat AND its
+        classifier to have each had multiple chances to write), is
+        sufficient -- if the guard works, NOTHING from the old process
+        can ever get through, regardless of exactly when."""
+        if shutil.which("liquidsoap") is None:
+            self.skipTest("liquidsoap not installed on this box")
+        input_device = "classifiertest-f"
+        state_path = em._audio_state_path(input_device)
+        self.addCleanup(lambda: state_path.unlink(missing_ok=True))
+        script = em.build_liquidsoap_script(input_device, [make_encoder(**self.SAFE_ENCODER_KWARGS)], generation="gen-f-OLD")
+        alsa_line = f'source = input.alsa(buffer_size=1.0, device="{input_device}")'
+        script = script.replace(alsa_line, "source = sine(440.0)", 1)  # continuous audio -- if the CAS guard fails, this would visibly write "audio_ok" under the OLD generation
+        with tempfile.TemporaryDirectory() as tmpdir:
+            script_path = Path(tmpdir) / "test.liq"
+            script_path.write_text(script, encoding="utf-8")
+            proc = subprocess.Popen(["liquidsoap", str(script_path)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            try:
+                # Wait for the file to STABILIZE (no further changes for
+                # a full second), not just first appear -- the old
+                # process's own initial write is followed by an
+                # ALMOST-IMMEDIATE heartbeat tick (thread.run(every=X)
+                # with no explicit delay= defaults delay=0.0, confirmed
+                # empirically -- see write_state()'s own comment).
+                # Injecting into a genuinely quiet gap (both of the old
+                # process's own early writes already complete) avoids a
+                # narrow, real TOCTOU window this design does not fully
+                # close: write_state()'s own read-check-then-write isn't
+                # a true atomic compare-and-swap, so an external writer
+                # landing in the microsecond gap between another
+                # writer's check and its write could still slip through.
+                # That residual is accepted -- it requires an already-
+                # pathological precondition (an old process still alive
+                # at all after a newer generation exists, which the real
+                # deployment path structurally prevents) stacked with
+                # adversarial sub-millisecond timing -- but this test
+                # doesn't need to (and shouldn't try to) hit that exact
+                # window to prove the guard does its job.
+                last_seen = None
+                stable_since = None
+                deadline = time.time() + 10
+                while time.time() < deadline:
+                    if state_path.is_file():
+                        current = state_path.read_text(encoding="utf-8")
+                        if current != last_seen:
+                            last_seen = current
+                            stable_since = time.time()
+                        elif time.time() - stable_since > 1.0:
+                            break
+                    time.sleep(0.02)
+                else:
+                    self.fail("old-generation process's state file never stabilized")
+                self.assertEqual(json.loads(last_seen).get("generation"), "gen-f-OLD")
+
+                em._atomic_write_json(state_path, {
+                    "status": "starting", "is_blank": None, "generation": "gen-f-NEW", "timestamp": time.time(),
+                })
+                time.sleep(4.0)  # past several heartbeat ticks and several classifier ticks
+            finally:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+
+        final = json.loads(state_path.read_text(encoding="utf-8"))
+        self.assertEqual(final["generation"], "gen-f-NEW", "the OLD generation's write_state() calls (heartbeat, classifier, or a real callback) must not have overwritten the newer generation's state")
 
 
 # ---------------------------------------------------------------------
