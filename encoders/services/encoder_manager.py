@@ -54,23 +54,36 @@ from encoders.models import Encoder  # noqa: E402
 
 # Paired with the StereoTool HD Output ALSA loopback bridge (second,
 # independent Loopback card -- see PROJECT_NOTES.md for the card layout).
-# Directly opens post-StereoTool loopback subdevice 0 (the one that
-# actually has audio; StereoTool writes only to playback sub-0).
+# Reads via the `airtap` dsnoop alias (/etc/asound.conf), not a direct
+# `plughw:Loopback_1,1,0` open.
 #
-# History: this was `airtap` (a dsnoop alias) while aircheck ran as a
-# separate ffmpeg subprocess that also needed to read this loopback --
-# dsnoop was the standard "two ALSA readers of one stream" answer. Once
-# aircheck moved in-process with encoders (aircheck/services/recorder.py
-# is now a telnet client to the same liquidsoap process rather than an
-# independent capture), liquidsoap is the ONLY reader again and dsnoop
-# just adds a user-space ring buffer that can overrun under load. Going
-# back to plughw is the pre-aircheck config that "just worked" -- the
-# kernel-side ALSA ring self-tunes and there's no second reader to
-# arbitrate with. The `airtap` dsnoop alias stays in /etc/asound.conf
-# unused for now, as a safety net (belt-and-braces -- an admin who
-# overrides Encoder.input_device to "airtap" for diagnostic reasons
-# still gets a functioning capture).
-DEFAULT_INPUT_DEVICE = "plughw:Loopback_1,1,0"
+# History: this WAS a direct plughw open (see the "belt-and-braces"
+# framing this comment used to have, with airtap as an unused fallback)
+# from when aircheck moved in-process with encoders and there was only
+# ever one ALSA reader of this loopback again, making dsnoop's userspace
+# ring buffer look like unneeded overhead. Reverted back to `airtap`
+# 2026-08-05 after a real production incident: an OS update (most likely
+# the `alsa-ucm-conf` bump, NOT the kernel -- both were tried in
+# isolation live) changed how `plughw:` negotiates buffer/period geometry
+# against `snd_aloop`. Liquidsoap's `input.alsa` started asking for an
+# absurd 980 periods and getting back "Alsa error: Input/output error"
+# on every single attempt, crash-looping the encoder process indefinitely
+# with the station off the air the whole time -- while `arecord` reading
+# the exact same raw device worked fine, proving the loopback/StereoTool
+# side was never the problem, only Liquidsoap's plughw negotiation was.
+# `airtap` pins a fixed period_size=16384/buffer_size=131072 that
+# `snd_aloop` accepts regardless of that negotiation, so it's the more
+# robust choice going forward even without dsnoop's original multi-
+# reader justification -- a few hundred KB of extra kernel ring buffer
+# is a trivial cost against another silent, monitoring-invisible dead-air
+# incident. If this DEFAULT_INPUT_DEVICE is ever changed again, remember
+# `_start_group`'s `host_aircheck = input_device == DEFAULT_INPUT_DEVICE`
+# match is a literal string compare -- an Encoder row whose input_device
+# doesn't match this constant silently loses aircheck + the telnet
+# server, not just its own capture (confirmed hit live during this same
+# incident: switching the DB rows to "airtap" without updating this
+# constant dropped aircheck from the generated script with no error).
+DEFAULT_INPUT_DEVICE = "airtap"
 
 HEALTH_CHECK_SECONDS = 5
 RESTART_DELAY_SECONDS = 10
