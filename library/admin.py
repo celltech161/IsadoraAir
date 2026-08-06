@@ -582,6 +582,13 @@ class UIThemeAdmin(admin.ModelAdmin):
                             "default_album_art shows on a deck when no art is "
                             "found anywhere in the lookup chain.",
         }),
+        ("Deck Transport Buttons", {
+            "fields": ["deck_transport_disabled_opacity"],
+            "description": "Eject/play/pause buttons on each deck panel. Icon "
+                            "color follows Palette's text_main (accent on "
+                            "hover) above; this only controls how faded they "
+                            "look while disabled.",
+        }),
     ]
 
     def formfield_for_dbfield(self, db_field, request, **kwargs):

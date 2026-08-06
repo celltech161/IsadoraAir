@@ -872,6 +872,15 @@ class UITheme(models.Model):
                    "(embedded/Oak Grove hosted art/Deezer/iTunes). Leave blank to show no art at all.",
     )
 
+    # --- Deck transport buttons (eject/play/pause) ---
+    deck_transport_disabled_opacity = models.FloatField(
+        default=0.3,
+        help_text="Opacity of the eject/play/pause buttons on a deck panel while "
+                   "disabled (e.g. Deck B before it's live). 0 = invisible, 1 = "
+                   "fully opaque, same as enabled. Icon color itself follows "
+                   "text_main (and accent on hover) above, not this field.",
+    )
+
     class Meta:
         verbose_name = "UI Theme"
         verbose_name_plural = "UI Theme"

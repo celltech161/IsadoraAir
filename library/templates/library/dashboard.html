@@ -8,6 +8,7 @@
     --deck-text-shadow-color: {{ ui_theme.deck_text_shadow_color }};
     --deck-startsat-color: {{ ui_theme.deck_startsat_color }};
     --deck-pill-text-color: {{ ui_theme.deck_pill_text_color }};
+    --deck-transport-disabled-opacity: {{ ui_theme.deck_transport_disabled_opacity }};
   }
 
   .playnow-bar {
@@ -235,31 +236,28 @@
 
   .deck-transport-btn {
     /* Fixed dimensions so the icon can scale up freely without
-       inflating the button. Previous form let `font-size + padding`
-       drive the box, which capped the glyph size to something small
-       enough to look toy-ish next to the polished dashboard chrome
-       elsewhere.
-       inline-flex + center-both lets us drop the twin-glyph pause
-       (❚❚) for the single-glyph ⏸ (U+23F8) which draws crisply at
-       any size, and pins the visible icon vertically regardless of
-       the glyph's own font metrics. */
+       inflating the button. inline-flex + center-both centers the SVG
+       precisely regardless of button size -- unlike the Unicode
+       dingbats this replaced (U+23F5/23F8/23ED), whose glyph metrics
+       (internal padding, baseline) vary enough by platform/font that
+       they never centered reliably across devices. SVG path geometry
+       is fixed, so this centers correctly everywhere. */
     width: 2.0rem;
     height: 1.5rem;
     padding: 0;
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    /* Bumped from 0.95rem -- roughly 1.5x. With line-height: 1 and no
-       padding this can't push the box larger; the fixed w/h above
-       clips it. */
-    font-size: 1.5rem;
-    font-weight: 500;
-    line-height: 1;
     border-radius: 4px;
     border: 1px solid var(--border-subtle);
     background: transparent;
     color: var(--text-main);
     cursor: pointer;
+  }
+  .deck-transport-btn svg {
+    width: 1.1rem;
+    height: 1.1rem;
+    display: block;
   }
   .deck-transport-btn:hover:not(:disabled) {
     border-color: var(--accent);
@@ -268,7 +266,7 @@
   .deck-transport-btn:active:not(:disabled) {
     transform: translateY(1px);
   }
-  .deck-transport-btn:disabled { opacity: 0.3; cursor: not-allowed; border-color: var(--border-subtle); }
+  .deck-transport-btn:disabled { opacity: var(--deck-transport-disabled-opacity); cursor: not-allowed; border-color: var(--border-subtle); }
 
   .np-meta {
     margin-bottom: 0.6rem;
@@ -1107,6 +1105,19 @@ const SLOTS = ['A', 'B'];
 const WAVEFORM_LEFT_COLOR = "{{ analysis_config.waveform_left_color|default:'#22c55e' }}";
 const WAVEFORM_RIGHT_COLOR = "{{ analysis_config.waveform_right_color|default:'#38bdf8' }}";
 
+// Deck transport icons. Inlined (not <img src="...">) so fill="currentColor"
+// picks up the button's own text color -- including its :hover color swap
+// to var(--accent) -- which follows this station's UITheme config; a
+// static <img> can't do that. Kept in sync by hand with the canonical
+// asset files at library/static/library/img/icon-{play,pause,eject}.svg,
+// which are the source of truth for the artwork (edit those, then mirror
+// the <path> here). Replaced the old Unicode dingbats (U+23F5/23F8/23ED)
+// because their glyph metrics vary enough by platform/font that they
+// never centered reliably in the fixed-size button box across devices.
+const ICON_PLAY = '<svg viewBox="0 0 36 36" fill="currentColor" aria-hidden="true"><path d="M8 7l22 11L8 29z"/></svg>';
+const ICON_PAUSE = '<svg viewBox="0 0 36 36" fill="currentColor" aria-hidden="true"><path d="M20 7h5v22h-5zm-9 0h5v22h-5z"/></svg>';
+const ICON_EJECT = '<svg viewBox="0 0 36 36" fill="currentColor" aria-hidden="true"><path d="M6 29v-5h24v5zM18 6L6 20h24z"/></svg>';
+
 function hexToRgba(hex, alpha) {
   const m = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
   if (!m) return `rgba(34, 197, 94, ${alpha})`;
@@ -1788,8 +1799,8 @@ function buildDeckDOM(slot) {
       <span class="deck-label">Deck ${slot}</span>
       <div class="deck-controls">
         <span class="transport-badge" id="transportBadge-${slot}"></span>
-        <button class="deck-transport-btn" id="ejectBtn-${slot}" title="Start Next" disabled>&#x23ED;</button>
-        <button class="deck-transport-btn" id="playPauseBtn-${slot}" title="Play/Pause" disabled>&#x23F5;</button>
+        <button class="deck-transport-btn" id="ejectBtn-${slot}" title="Start Next" disabled>${ICON_EJECT}</button>
+        <button class="deck-transport-btn" id="playPauseBtn-${slot}" title="Play/Pause" disabled>${ICON_PLAY}</button>
       </div>
     </div>
     <div class="np-meta">
@@ -2030,10 +2041,7 @@ function renderDeckLive(slot, deck, transport) {
   badge.className = 'transport-badge ' + badgeState;
 
   const playPauseBtn = document.getElementById(`playPauseBtn-${slot}`);
-  // Use the media-control block for both states (U+23F5 ⏵ and U+23F8 ⏸)
-  // so the toggle draws with matching visual weight instead of a fat
-  // triangle (U+25B6) flipping to two vertical bars (U+275A twice).
-  if (playPauseBtn) playPauseBtn.innerHTML = st.paused ? '&#x23F5;' : '&#x23F8;';
+  if (playPauseBtn) playPauseBtn.innerHTML = st.paused ? ICON_PLAY : ICON_PAUSE;
 
   st.localPosition = deck.position || 0;
   st.localDuration = deck.duration || 0;
