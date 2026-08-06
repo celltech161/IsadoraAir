@@ -250,7 +250,19 @@
     justify-content: center;
     border-radius: 4px;
     border: 1px solid var(--border-subtle);
-    background: transparent;
+    /* A transparent button here reads as "behind" whatever's under it --
+       the deck-art-thumb and blurred deck-art-bg both sit right where
+       these buttons render (deck-header-row overlaps the art thumb's
+       footprint once the deck panel goes full-width, e.g. phone
+       portrait), and a see-through icon over bright/busy album art is
+       nearly illegible. A translucent scrim keeps the icon readable
+       over any artwork regardless of viewport width. rgba() first as a
+       fallback for anything without color-mix() support; the
+       color-mix() line overrides it on everything that does, tying the
+       scrim to this station's own bg_darker (UITheme) rather than a
+       hardcoded color. */
+    background: rgba(15, 23, 42, 0.6);
+    background: color-mix(in srgb, var(--bg-darker) 65%, transparent);
     color: var(--text-main);
     cursor: pointer;
   }
