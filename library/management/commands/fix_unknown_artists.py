@@ -1,4 +1,3 @@
-import re
 import subprocess
 from pathlib import Path
 
@@ -6,44 +5,17 @@ from django.core.management.base import BaseCommand
 from django.db import transaction
 
 from library.models import Artist, Track
-
-
-# Any of ASCII hyphen, en dash, em dash, with optional surrounding
-# whitespace. Split on the FIRST such delimiter.
-SPLIT_PATTERN = re.compile(r'\s*[-–—]\s*')
-
-# Skip syndicated-show style titles like "2015-07-30 MITD Part 1" -- the
-# leading token is a date, not an artist.
-DATE_PREFIX = re.compile(r'^\d{4}[-–—]\d{2}[-–—]\d{2}\b')
-
-# "01 " prefix on ripped-from-album titles ("01 The Lumineers - ...").
-LEADING_TRACK_NUM_SPACE = re.compile(r'^\d+\s+')
-# "05 - " prefix ("05 - Sugar Moth - ...") -- second pass after the
-# first has run, so a two-digit-plus-space wasn't already stripped.
-LEADING_TRACK_NUM_DASH = re.compile(r'^\d+\s*[-–—]\s*')
+# parse_artist_title used to be defined here; it's now the single
+# shared implementation in related_artists.py (also used by the
+# upload/import fallback-metadata path) -- re-imported under the same
+# name so the rest of this file, and anything else that referenced
+# fix_unknown_artists.parse_artist_title, is unaffected.
+from library.services.related_artists import humanize_filename_stem, parse_artist_title
 
 # Formats we can tag directly with mutagen.
 TAGGABLE_EXTS = {'.flac', '.mp3', '.m4a', '.ogg', '.oga'}
 # Formats without native tag support -- transcode to FLAC first.
 TRANSCODE_EXTS = {'.wav', '.aif', '.aiff'}
-
-
-def parse_artist_title(source):
-    """Parse "Artist - Title" out of a source string. Skips
-    date-formatted prefixes and strips a leading track number token.
-    Returns (artist, title) tuple, or (None, None) if no clean split
-    is found."""
-    if DATE_PREFIX.match(source):
-        return None, None
-    cleaned = LEADING_TRACK_NUM_SPACE.sub('', source, count=1)
-    cleaned = LEADING_TRACK_NUM_DASH.sub('', cleaned, count=1)
-    parts = SPLIT_PATTERN.split(cleaned, maxsplit=1)
-    if len(parts) == 2:
-        artist = parts[0].strip()
-        title = parts[1].strip()
-        if artist and title:
-            return artist, title
-    return None, None
 
 
 def write_tags(path, artist, title):
@@ -152,7 +124,14 @@ class Command(BaseCommand):
 
         processed = 0
         for track in qs.iterator():
-            artist_name, new_title = parse_artist_title(track.title)
+            # Humanize before parsing so a legacy underscore-laden
+            # fallback title (from before the upload/import paths
+            # derived fallback metadata from the ORIGINAL filename --
+            # e.g. "Pink_Floyd_-_Time", saved back when the sanitized
+            # on-disk stem was used instead) is interpreted the same
+            # way a normal "Pink Floyd - Time" title would be. A
+            # no-underscore title passes through unchanged.
+            artist_name, new_title = parse_artist_title(humanize_filename_stem(track.title))
             if not artist_name:
                 counts["skipped_nomatch"] += 1
                 continue

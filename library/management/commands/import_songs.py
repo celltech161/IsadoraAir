@@ -7,6 +7,7 @@ from django.core.management.base import BaseCommand
 from mutagen import File as MutagenFile
 
 from library.models import Album, Artist, Category, Genre, Track
+from library.services.related_artists import resolve_fallback_metadata
 
 SUPPORTED_EXT = {".mp3", ".flac", ".wav", ".m4a", ".ogg", ".oga", ".aiff", ".aif", ".mp2", ".alac"}
 
@@ -258,8 +259,15 @@ class Command(BaseCommand):
         def clean(val):
             return val.replace("\x00", "").strip() if val else val
 
-        title = clean(tags.get("title")) or filepath.stem
-        artist_name = clean(tags.get("artist")) or "Unknown Artist"
+        # filepath.stem here is the file's real on-disk name (this
+        # command imports an existing directory tree, no upload-time
+        # sanitization step), but it can still be underscore-laden if
+        # that's simply how the file arrived on disk -- humanize it
+        # before using it as fallback metadata, same as every other
+        # ingest path.
+        title, artist_name = resolve_fallback_metadata(
+            filepath.stem, clean(tags.get("title")), clean(tags.get("artist")),
+        )
         album_title = clean(tags.get("album")) or ""
         album_artist_name = clean(tags.get("album_artist")) or ""
         genre_name = clean(tags.get("genre")) or ""

@@ -1,6 +1,5 @@
 import json
 import math
-import re
 import struct
 import subprocess
 import sys
@@ -9,6 +8,14 @@ from pathlib import Path
 from django.core.management.base import BaseCommand
 
 from library.models import AnalysisConfig, Track
+from library.services.related_artists import extract_credited_artists, merge_related_artists
+# Aliased on import: this file uses `existing_artist_names_casefolded`
+# as a parameter/local-variable name everywhere below (analyze_one_
+# track's own signature), so importing the loader under the SAME name
+# would shadow it -- `existing_artist_names_casefolded()` inside the
+# `if existing_artist_names_casefolded is None:` branch would then try
+# to call None (or raise UnboundLocalError), not the loader function.
+from library.services.related_artists import existing_artist_names_casefolded as load_existing_artist_names_casefolded
 
 
 def repick_cue_points_from_json(json_path, next_start_db, cue_in_db, cue_in_min):
@@ -355,36 +362,6 @@ def detect_cue_in(times, envelope_db, duration, threshold_db, min_seconds):
     return float(t)
 
 
-def extract_related_artists(artist, title, filename_stem):
-    sources = []
-    if artist:
-        sources.append(str(artist))
-    if title:
-        sources.append(str(title))
-    if filename_stem:
-        sources.append(str(filename_stem))
-    if not sources:
-        return ""
-
-    text = " ### ".join(sources)
-    candidates = set()
-
-    pattern = re.compile(
-        r"(feat\.?|ft\.?|featuring|with)\s+(.+?)(?=$|\s*###|\)|\]|\}| - | -- | / )",
-        re.IGNORECASE,
-    )
-    for match in pattern.finditer(text):
-        tail = match.group(2).strip().strip(" .;:-_")
-        parts = re.split(r"[,&/]| and |\+", tail)
-        for part in parts:
-            name = part.strip().strip(" '\"")
-            name = re.sub(r"\s+", " ", name)
-            if name:
-                candidates.add(name)
-
-    return ",".join(sorted(candidates)) if candidates else ""
-
-
 def get_waveforms_dir():
     from django.conf import settings as django_settings
     wave_dir = Path(getattr(django_settings, "WAVEFORMS_DIR", "/srv/isadoraair/waveforms"))
@@ -392,7 +369,7 @@ def get_waveforms_dir():
     return wave_dir
 
 
-def analyze_one_track(row, cfg_values, wave_dir, force):
+def analyze_one_track(row, cfg_values, wave_dir, force, existing_artist_names_casefolded=None):
     """Analyze exactly one track (waveform + cue points + related artists),
     writing results directly to the DB and a waveform JSON file. `row` is
     (track_id, filepath, filename, duration, title, artist_name,
@@ -401,7 +378,13 @@ def analyze_one_track(row, cfg_values, wave_dir, force):
     caller (e.g. right after a fresh upload, see library/views.py's
     api_library_upload) share this one code path instead of the upload
     path needing its own copy of this logic. Returns True if analyzed,
-    False if skipped (missing file or decode failure)."""
+    False if skipped (missing file or decode failure).
+
+    `existing_artist_names_casefolded` gates extract_credited_artists's
+    bare '&'/'and' split -- pass the bulk-loaded set when calling this
+    in a loop (see this command's handle()); a single-track caller
+    (api_track_reanalyze, sync_track_file) can leave it None and this
+    loads it itself with one extra query, which is fine off a hot loop."""
     (sample_rate, window_seconds, target_points,
      next_start_db, cue_in_db, cue_in_min) = cfg_values
     track_id, filepath, filename, duration, title, artist_name, existing_related = row
@@ -451,9 +434,28 @@ def analyze_one_track(row, cfg_values, wave_dir, force):
     except Exception as exc:
         print(f"  Stereo waveform failed for track {track_id} (non-fatal): {exc}")
 
-    filename_stem = Path(filename).stem if filename else fp.stem
+    # Deliberately no filename-based extraction here -- once a track
+    # has human-readable title/artist (either genuinely tagged, or
+    # already backfilled by the upload/import fallback-metadata path;
+    # see related_artists.resolve_fallback_metadata), those DB fields
+    # are the only extraction source. Inspecting the filename here too
+    # would be a second, potentially-conflicting source of truth for a
+    # normally-tagged track.
+    #
+    # force controls whether we RE-RUN discovery, never whether a
+    # discovery is allowed to REPLACE what's already there --
+    # merge_related_artists only ever appends, so a forced reanalyze
+    # (or the /track/<pk>/ Reanalyze Track action, which calls this
+    # with force=True) can never erase a manually-entered related
+    # artist, even one this extractor wouldn't have found on its own.
     if force or not existing_related:
-        related = extract_related_artists(artist_name, title, filename_stem)
+        if existing_artist_names_casefolded is None:
+            existing_artist_names_casefolded = load_existing_artist_names_casefolded()
+        discovered = extract_credited_artists(
+            artist_name, title, artist_name,
+            existing_artist_names_casefolded=existing_artist_names_casefolded,
+        )
+        related = merge_related_artists(existing_related, discovered, primary_artist_name=artist_name)
     else:
         related = existing_related
 
@@ -527,6 +529,10 @@ class Command(BaseCommand):
 
         wave_dir = get_waveforms_dir()
 
+        # Loaded once for the whole run, not once per track -- see
+        # extract_credited_artists's bare '&'/'and' gate.
+        existing_artist_names_casefolded = load_existing_artist_names_casefolded()
+
         qs = Track.objects.filter(filepath__isnull=False)
         if not force:
             qs = qs.filter(next_start_seconds__isnull=True)
@@ -560,7 +566,8 @@ class Command(BaseCommand):
             analysis_row = full_row[:7]
             ns_override, ci_override = full_row[7], full_row[8]
             per_track_cfg = apply_category_thresholds(cfg_values, ns_override, ci_override)
-            if analyze_one_track(analysis_row, per_track_cfg, wave_dir, force):
+            if analyze_one_track(analysis_row, per_track_cfg, wave_dir, force,
+                                  existing_artist_names_casefolded=existing_artist_names_casefolded):
                 analyzed += 1
             else:
                 skipped += 1

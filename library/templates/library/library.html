@@ -55,6 +55,8 @@
     transition: border-color 0.12s, color 0.12s;
   }
   .lib-import-btn:hover { border-color: var(--accent); color: var(--accent); }
+  .lib-import-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .lib-import-btn:disabled:hover { border-color: var(--border-subtle); color: var(--text-main); }
 
   /* --- Bulk action bar --- */
   .bulk-bar {
@@ -219,6 +221,10 @@
 
   {% if is_contributor or not is_library_read_only %}
   <a href="{% url 'library:library-import' %}" class="lib-import-btn">+ Import Tracks</a>
+  {% endif %}
+
+  {% if not is_library_read_only %}
+  <button type="button" class="lib-import-btn" id="autofillRelatedArtistsBtn" onclick="autofillRelatedArtists()">Auto-fill Related Artists</button>
   {% endif %}
 
   <span class="lib-stats" id="stats"></span>
@@ -431,6 +437,63 @@ async function bulkDelete() {
   }
   clearSelection();
   loadTracks();
+}
+
+async function autofillRelatedArtists() {
+  const btn = document.getElementById('autofillRelatedArtistsBtn');
+  if (btn.disabled) return;  // belt-and-suspenders against a double-click race
+
+  const q = document.getElementById('searchInput').value.trim();
+  const category = document.getElementById('categoryFilter').value;
+  const ready2air = document.getElementById('readyFilter').value;
+  const filterDesc = [
+    q ? `search "${q}"` : null,
+    category ? document.querySelector(`#categoryFilter option[value="${category}"]`).textContent : null,
+    ready2air ? (ready2air === 'true' ? 'Ready to air' : 'Not ready') : null,
+  ].filter(Boolean).join(', ') || 'all tracks (no filter set)';
+
+  const msg =
+    `Scan every track matching the current filter (${filterDesc}) for related-artist credits?\n\n` +
+    `Existing Related Artists values are preserved -- only new, deduplicated discoveries are appended. ` +
+    `This may take a while for a large filter.`;
+  if (!confirm(msg)) return;
+
+  btn.disabled = true;
+  const originalLabel = btn.textContent;
+  btn.textContent = 'Scanning…';
+
+  try {
+    const resp = await fetch('/api/tracks/autofill-related-artists/', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-CSRFToken': getCookie('csrftoken'),
+      },
+      body: JSON.stringify({ q, category, ready2air }),
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      alert('Auto-fill failed: ' + (data.error || resp.status));
+      return;
+    }
+    const errNote = data.errors ? ` (${data.errors} error${data.errors === 1 ? '' : 's'})` : '';
+    // unchanged_overflow: tracks where a discovery existed but every one of
+    // it wouldn't fit in the 500-char field -- existing values were left
+    // untouched, not truncated. Worth surfacing since it means a track needs
+    // a manual look (trim an entry, or accept the automatic ones it does have).
+    const overflowNote = data.unchanged_overflow
+      ? ` ${data.unchanged_overflow} track${data.unchanged_overflow === 1 ? '' : 's'} hit the 500-character limit and were left unchanged (${data.overflow_skipped} name${data.overflow_skipped === 1 ? '' : 's'} skipped).`
+      : '';
+    alert(
+      `Scanned ${data.scanned.toLocaleString()} tracks; ` +
+      `updated ${data.changed.toLocaleString()}; ` +
+      `appended ${data.appended.toLocaleString()} artist${data.appended === 1 ? '' : 's'}.${errNote}${overflowNote}`
+    );
+    loadTracks();
+  } finally {
+    btn.disabled = false;
+    btn.textContent = originalLabel;
+  }
 }
 
 async function bulkApply() {

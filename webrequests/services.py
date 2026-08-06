@@ -13,6 +13,7 @@ from django.utils import timezone
 
 from library.models import Category, LogItem, PlaylistLog, RecencyConfig, Track
 from library.services.log_builder import get_recent_exclusions, get_separation
+from library.services.related_artists import track_identity_keys
 from monitoring.models import emit_event
 
 from .models import SongRequest, WebRequestConfig
@@ -147,10 +148,21 @@ def is_track_eligible_at(track, target_datetime, recency_cfg):
         return False
 
     artist_sep, title_sep = get_separation(track.category, recency_cfg)
-    exclude_track_ids, exclude_artist_ids = get_recent_exclusions(
+    # get_recent_exclusions' second return value is a set of normalized
+    # IDENTITY KEYS (log_builder's related_artists integration), not
+    # artist ids -- a track conflicts if its own identity set (primary
+    # artist + related artists) intersects the excluded set, same
+    # mutual semantics the real rotation picker uses. See
+    # related_artists.track_identity_keys.
+    exclude_track_ids, exclude_identity_keys = get_recent_exclusions(
         target_datetime, artist_sep, title_sep, set(), set(),
     )
-    return track.id not in exclude_track_ids and track.artist_id not in exclude_artist_ids
+    if track.id in exclude_track_ids:
+        return False
+    track_keys = track_identity_keys(
+        track.artist.name if track.artist_id else None, track.related_artists,
+    )
+    return not (track_keys & exclude_identity_keys)
 
 
 def classify_log_item(log_item, state):

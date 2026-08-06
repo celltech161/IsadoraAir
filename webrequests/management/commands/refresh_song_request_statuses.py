@@ -228,7 +228,11 @@ class Command(BaseCommand):
             SongRequest.objects.filter(
                 id__in=still_pending_ids, status__in=SongRequest.WAITING_STATUSES,
             )
-            .select_related("track", "track__category", "track__category__kind")
+            # track__artist: is_track_eligible_at (below, in the
+            # per-request loop) now needs the artist name for
+            # identity-set comparison -- without this, that's a lazy
+            # per-request query.
+            .select_related("track", "track__artist", "track__category", "track__category__kind")
             .order_by("submitted_at")
         )
         scheduled_now_count = len(still_pending_ids) - len(still_pending)

@@ -503,6 +503,14 @@
       <label>RBDS Text</label>
       <input type="text" id="f_alt_send_text" maxlength="64" value="{{ track.alt_send_text }}">
     </div>
+    <div class="field-row">
+      <label>Related Artists</label>
+      <input type="text" id="f_related_artists" value="{{ track.related_artists }}" placeholder="e.g. David Gilmour, Roger Waters">
+    </div>
+    <div class="field-row">
+      <label></label>
+      <span class="field-muted">Comma-separated artists treated as the same artist for rotation separation.</span>
+    </div>
   </div>
 
   <!-- Cue Points -->
@@ -680,10 +688,6 @@
     <div class="field-row">
       <label>Last Played</label>
       <span class="field-static">{% if track.last_played_at %}{{ track.last_played_at }}{% else %}Never{% endif %}</span>
-    </div>
-    <div class="field-row">
-      <label>Related Artists</label>
-      <span class="field-muted">{{ track.related_artists|default:"—" }}</span>
     </div>
     {% if not is_library_read_only %}
     <div class="field-row">
@@ -1156,6 +1160,10 @@ async function saveTrack() {
     ready2air: getVal('f_ready2air'),
     alt_send_enabled: getVal('f_alt_send_enabled'),
     alt_send_text: getVal('f_alt_send_text') || '',
+    // Canonicalized server-side (whitespace/comma-space cleanup,
+    // case-insensitive dedupe, primary-artist exclusion) -- sent as
+    // raw text here, same as every other free-text field on this form.
+    related_artists: getVal('f_related_artists') || '',
     cue_in_seconds: getVal('f_cue_in_seconds'),
     cue_out_seconds: getVal('f_cue_out_seconds'),
     next_start_seconds: getVal('f_next_start_seconds'),

@@ -22,6 +22,11 @@ from django.shortcuts import get_object_or_404
 
 from .models import Artist, Album, Category, CategoryKind, Genre, Holiday, LogItem, Playlist, PlaylistItem, PlaylistLog, Rotation, RotationSlot, ScheduleBlock, Track
 from .services.log_builder import LOCK_CONTENDED, _build_from_playlist, build_hour_log_for_admin, preview_hour_log
+from .services.related_artists import (
+    autofill_related_artists_for_queryset, canonicalize_related_artists,
+    format_related_artists, resolve_fallback_metadata,
+)
+from .services.track_filters import filter_tracks
 
 
 @ensure_csrf_cookie
@@ -899,33 +904,13 @@ def api_track_list(request):
     qs = Track.objects.select_related("artist", "album", "category")
 
     q = request.GET.get("q", "").strip()
-    if q:
-        # "+" joins multiple required terms, e.g. "Pink Floyd + If" ->
-        # must match "Pink Floyd" (in any field) AND "If" (in any field).
-        # Each .filter() call below ANDs onto the queryset, while the Q()
-        # combination within one call ORs across fields for that term --
-        # a plain query with no "+" is just one term, so this is fully
-        # backward compatible with the existing single-phrase search.
-        terms = [t.strip() for t in q.split("+") if t.strip()]
-        for term in terms:
-            qs = qs.filter(
-                Q(title__icontains=term)
-                | Q(artist__name__icontains=term)
-                | Q(album__title__icontains=term)
-            )
-
     cat_id = request.GET.get("category")
-    if cat_id:
-        # Matches either the track's primary category or a secondary one
-        # (additional_categories) -- distinct() guards against the M2M
-        # join duplicating a row for a track that somehow matches both.
-        qs = qs.filter(Q(category_id=cat_id) | Q(additional_categories=cat_id)).distinct()
-
     ready = request.GET.get("ready2air")
-    if ready == "true":
-        qs = qs.filter(ready2air=True)
-    elif ready == "false":
-        qs = qs.filter(ready2air=False)
+    ready2air = True if ready == "true" else False if ready == "false" else None
+    # Shared with the related-artists autofill endpoint/command -- see
+    # track_filters.filter_tracks's docstring for exactly what "+" and
+    # category_id mean here.
+    qs = filter_tracks(qs, q=q, category_id=cat_id, ready2air=ready2air)
 
     sort_field = request.GET.get("sort", "title")
     sort_dir = request.GET.get("dir", "asc")
@@ -1069,6 +1054,56 @@ def api_track_bulk(request):
         return JsonResponse({"error": "Unknown action"}, status=400)
 
     return JsonResponse({"ok": True, "updated": updated})
+
+
+@require_http_methods(["POST"])
+def api_track_autofill_related_artists(request):
+    """/library/'s "Auto-fill Related Artists" toolbar action. Applies
+    automatic related-artist discovery to the COMPLETE queryset
+    matching the posted filter (search/category/ready2air) -- not a
+    page, not a selection, the same filter_tracks() helper
+    api_track_list uses so this always matches what the operator sees
+    filtered to. Calls the shared related_artists service directly
+    (no subprocess, no manage.py invocation) -- the exact same function
+    the autofill_related_artists management command's --apply path
+    calls, so the two can never drift apart in behavior.
+
+    Always applies (apply=True) -- the frontend's own confirm() dialog
+    is this endpoint's "are you sure", there's no separate dry-run mode
+    over HTTP (that's what the management command is for)."""
+    from library.middleware import user_is_library_read_only
+
+    # Same explicit check api_track_detail uses for every other write
+    # -- the toolbar button being hidden for read-only users is a UX
+    # nicety, not the actual protection.
+    if user_is_library_read_only(request.user):
+        return JsonResponse({"error": "Read-only for this account."}, status=403)
+
+    try:
+        body = json.loads(request.body) if request.body else {}
+    except (json.JSONDecodeError, ValueError):
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+
+    q = (body.get("q") or "").strip()
+    cat_id = body.get("category") or None
+    ready_raw = body.get("ready2air")
+    ready2air = True if ready_raw == "true" else False if ready_raw == "false" else None
+
+    qs = filter_tracks(Track.objects.all(), q=q, category_id=cat_id, ready2air=ready2air)
+    result = autofill_related_artists_for_queryset(qs, apply=True)
+
+    return JsonResponse({
+        "ok": True,
+        "scanned": result["scanned"],
+        "changed": result["changed"],
+        "appended": result["appended"],
+        "unchanged_no_discoveries": result["unchanged_no_discoveries"],
+        "unchanged_already_current": result["unchanged_already_current"],
+        "unchanged_overflow": result["unchanged_overflow"],
+        "overflow_skipped": result["overflow_skipped"],
+        "errors": result["errors"],
+        "samples": result["samples"],
+    })
 
 
 @ensure_csrf_cookie
@@ -1218,9 +1253,17 @@ def api_track_detail(request, pk):
         "alt_send_enabled", "alt_send_text",
     }
 
+    # Captured, not applied immediately -- canonicalizing needs the
+    # FINAL track.artist (which "artist" in this same request body may
+    # still change below), so it's applied once after the loop instead
+    # of depending on JSON key order.
+    pending_related_artists = None
+
     for field, value in body.items():
         if field in DIRECT_FIELDS:
             setattr(track, field, value)
+        elif field == "related_artists":
+            pending_related_artists = value
         elif field == "artist":
             artist_obj, _ = Artist.get_or_create_ci(value)
             track.artist = artist_obj
@@ -1255,6 +1298,40 @@ def api_track_detail(request, pk):
                     return JsonResponse({"error": "Category not found"}, status=404)
             else:
                 track.category = None
+
+    if pending_related_artists is not None:
+        # Canonicalized through the same formatter every automatic path
+        # uses (whitespace/comma-space cleanup, case-insensitive dedupe,
+        # drop an entry that exactly duplicates the primary artist) --
+        # applied AFTER track.artist is fully resolved above, so a PATCH
+        # that changes both artist and related_artists in the same
+        # request excludes against the NEW artist, not the stale one.
+        canonical_related = format_related_artists(
+            canonicalize_related_artists(
+                pending_related_artists,
+                primary_artist_name=track.artist.name if track.artist_id else None,
+            )
+        )
+        # Track.related_artists is a real DB varchar(500) -- an
+        # over-limit manual value would otherwise reach track.save()
+        # below and raise an unhandled django.db.utils.DataError (a
+        # bare 500), not a clean validation response. Checked BEFORE
+        # any of the below (file-relocation side effects, save()) so a
+        # too-long value never has a partial effect -- request is
+        # rejected outright, nothing is written or moved.
+        max_related_len = Track._meta.get_field("related_artists").max_length
+        if len(canonical_related) > max_related_len:
+            return JsonResponse(
+                {
+                    "error": (
+                        f"Related Artists is too long ({len(canonical_related)} characters "
+                        f"after cleanup; the limit is {max_related_len}). Remove an entry "
+                        f"and try again."
+                    )
+                },
+                status=400,
+            )
+        track.related_artists = canonical_related
 
     # Auto-relocate the file if primary category changed (Part D).
     # Same convention as find_category_drift: files live at
@@ -2572,8 +2649,18 @@ def api_library_upload(request):
         def clean(val):
             return val.replace("\x00", "").strip() if val else val
 
-        title = clean(tags.get("title")) or dest_path.stem
-        artist_name = clean(tags.get("artist")) or "Unknown Artist"
+        # Fallback metadata comes from the ORIGINAL client filename
+        # (uploaded.name), not dest_path.stem -- dest_path went through
+        # get_valid_filename() for on-disk safety, which replaces
+        # spaces with underscores; using it as a metadata fallback
+        # would land literal underscores in the DB (e.g.
+        # "Pink_Floyd_-_Time" instead of "Pink Floyd" / "Time"). The
+        # saved file's actual name is unaffected either way -- this
+        # only changes what fills the title/artist fields when tags
+        # are missing.
+        title, artist_name = resolve_fallback_metadata(
+            Path(uploaded.name).stem, clean(tags.get("title")), clean(tags.get("artist")),
+        )
         album_title = clean(tags.get("album")) or ""
         album_artist_name = clean(tags.get("album_artist")) or ""
         genre_name = clean(tags.get("genre")) or ""
@@ -2595,7 +2682,7 @@ def api_library_upload(request):
             filepath=str(dest_path),
             filename=dest_path.name,
             format=ext.lstrip("."),
-            title=clean(title),
+            title=title,
             artist=artist_obj,
             album=album_obj,
             genre=genre_obj,

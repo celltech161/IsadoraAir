@@ -8,6 +8,7 @@ from library.management.commands.analyze_tracks import (
 )
 from library.management.commands.import_songs import parse_tags
 from library.models import AnalysisConfig, Album, Artist, Category, Genre, Track
+from library.services.related_artists import resolve_fallback_metadata
 
 
 class Command(BaseCommand):
@@ -60,8 +61,12 @@ class Command(BaseCommand):
         def clean(val):
             return val.replace("\x00", "").strip() if val else val
 
-        title = clean(tags.get("title")) or filepath.stem
-        artist_name = clean(tags.get("artist")) or "Unknown Artist"
+        # Same fallback-metadata humanization as every other ingest
+        # path -- this pipeline's delivered filenames aren't
+        # necessarily any better-formed than a manual upload's.
+        title, artist_name = resolve_fallback_metadata(
+            filepath.stem, clean(tags.get("title")), clean(tags.get("artist")),
+        )
         album_title = clean(tags.get("album")) or ""
         album_artist_name = clean(tags.get("album_artist")) or ""
         genre_name = clean(tags.get("genre")) or ""

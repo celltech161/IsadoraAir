@@ -17,6 +17,55 @@ from library.models import (
     ScheduleBlock,
     Track,
 )
+from library.services.related_artists import track_identity_keys
+
+
+class TrackIdentityCache:
+    """Per-build cache of track_id -> frozenset(identity keys) --
+    normalized primary artist name plus every normalized related-artist
+    entry (see related_artists.track_identity_keys). Exists so repeated
+    pick_track() calls against the same pool within one build (multiple
+    slots of the same category in one hour's rotation, or
+    fill_remaining_hour's own loop) load that pool's artist/
+    related_artists data ONCE instead of once per call -- the N+1
+    pattern this whole cache exists to avoid.
+
+    Keyed by an opaque `pool_key` the caller chooses -- a plain
+    category pool uses ("category", category_id); a holiday-injection
+    pool (see _music_holiday_pool) uses ("holiday", <sorted holiday
+    codes tuple>), since the underlying queryset object's own identity
+    changes on every call even for the same holiday-code combination.
+    NOT keyed by the queryset itself for that reason.
+
+    Deliberately build-scoped, never a module-global: one instance is
+    created per build_hour_log/fill_remaining_hour/preview_hour_log
+    call and threaded through every pick_track() call in that build.
+    A module-global would leak stale pool data across builds and,
+    under gunicorn's worker process reuse, across unrelated requests."""
+
+    def __init__(self):
+        self._pools = {}
+
+    def _load_pool(self, pool_key, base_qs):
+        if pool_key not in self._pools:
+            rows = base_qs.values_list("id", "artist__name", "related_artists")
+            self._pools[pool_key] = {
+                track_id: track_identity_keys(artist_name, related)
+                for track_id, artist_name, related in rows
+            }
+        return self._pools[pool_key]
+
+    def conflicting_track_ids(self, pool_key, base_qs, banned_identity_keys):
+        """Track ids within the pool (loaded/cached under `pool_key`
+        from `base_qs`, the UNNARROWED category/holiday pool -- not
+        whatever partially-excluded queryset a caller happens to be
+        mid-build with) whose identity set intersects
+        `banned_identity_keys`. Empty banned set short-circuits to
+        avoid loading the pool at all when nothing is excluded."""
+        if not banned_identity_keys:
+            return set()
+        pool = self._load_pool(pool_key, base_qs)
+        return {tid for tid, keys in pool.items() if keys & banned_identity_keys}
 
 
 def _active_holidays_at(target_datetime):
@@ -197,13 +246,21 @@ def get_separation(category, recency_cfg):
 
 
 def get_recent_exclusions(target_datetime, artist_sep_hours, title_sep_hours,
-                          already_picked_tracks, already_picked_artists):
+                          already_picked_tracks, already_picked_identity_keys):
+    """`already_picked_identity_keys` is a set of normalized identity
+    keys (see related_artists.track_identity_keys) -- NOT artist ids.
+    Using identity keys instead of Track.artist_id here (and
+    throughout this module) is what makes a related-artist entry
+    actually participate in separation: two tracks conflict whenever
+    their identity sets intersect, which artist_id equality alone
+    can't express (see log_builder's related_artists integration
+    notes below pick_track)."""
     exclude_track_ids = set(t.id for t in already_picked_tracks)
-    exclude_artist_ids = set(a_id for a_id in already_picked_artists)
+    exclude_identity_keys = set(already_picked_identity_keys)
 
     max_lookback = max(artist_sep_hours, title_sep_hours)
     if max_lookback <= 0:
-        return exclude_track_ids, exclude_artist_ids
+        return exclude_track_ids, exclude_identity_keys
 
     cutoff = target_datetime - timedelta(hours=max_lookback)
 
@@ -232,14 +289,19 @@ def get_recent_exclusions(target_datetime, artist_sep_hours, title_sep_hours,
     for item in recent_items:
         if not item.track_id:
             # track was deleted after this LogItem aired (e.g. a library
-            # cleanup) -- nothing left to exclude by track/artist id.
+            # cleanup) -- nothing left to exclude by track/identity.
             continue
         if item.scheduled_time >= title_cutoff:
             exclude_track_ids.add(item.track_id)
         if item.scheduled_time >= artist_cutoff:
-            exclude_artist_ids.add(item.track.artist_id)
+            # track/track__artist are already select_related above --
+            # no extra query per item.
+            exclude_identity_keys |= track_identity_keys(
+                item.track.artist.name if item.track.artist_id else None,
+                item.track.related_artists,
+            )
 
-    return exclude_track_ids, exclude_artist_ids
+    return exclude_track_ids, exclude_identity_keys
 
 
 DURATION_FIT_THRESHOLD = 480  # start fitting when < 8 minutes remain
@@ -325,12 +387,13 @@ def _pick_best_fit(qs, remaining_seconds, active_holiday_codes=None):
     return Track.objects.get(id=pick_id)
 
 
-def pick_track(category, exclude_track_ids, exclude_artist_ids,
+def pick_track(category, exclude_track_ids, exclude_identity_keys,
                artist_sep, title_sep, target_datetime,
                remaining_seconds=None, max_loosening=3,
-               hard_exclude_track_ids=None, hard_exclude_artist_ids=None,
+               hard_exclude_track_ids=None, hard_exclude_identity_keys=None,
                active_holiday_codes=None,
-               pool_override_qs=None, exclude_holiday_codes=None):
+               pool_override_qs=None, exclude_holiday_codes=None,
+               identity_cache=None, pool_key=None):
     """`exclude_*` are RECENCY-HISTORY exclusions -- they get progressively
     dropped by the loosening loop below if no candidate can be found.
 
@@ -339,6 +402,23 @@ def pick_track(category, exclude_track_ids, exclude_artist_ids,
     eligible tracks (or a fresh build whose picks aren't yet persisted as
     LogItems) can pick the same track for multiple slots in the same
     hour.
+
+    `exclude_identity_keys`/`hard_exclude_identity_keys` are sets of
+    NORMALIZED IDENTITY KEYS (related_artists.track_identity_keys),
+    not artist ids -- a candidate conflicts if its own identity set
+    (primary artist + related artists) intersects the banned set. This
+    is what makes related_artists actually participate in separation,
+    fully mutually: if track B's primary artist appears in track A's
+    related_artists, A's identity set contains B's key, so A is
+    excluded once B has been picked/played recently -- and because set
+    intersection is symmetric, the reverse (B excluded once A has been
+    picked) also holds with no separate code path. Resolving "which
+    pool track ids conflict with a banned key set" is delegated to
+    `identity_cache` (a TrackIdentityCache) so the pool's identity data
+    is loaded once per build, not once per pick_track call -- see that
+    class's docstring. A caller that doesn't pass one gets a
+    throwaway per-call cache (correct, just without the cross-call
+    reuse benefit).
 
     `active_holiday_codes` drives the SQL boost inside _weighted_order:
     a track tagged with any currently-ramping Holiday sorts more likely
@@ -349,7 +429,9 @@ def pick_track(category, exclude_track_ids, exclude_artist_ids,
     pool. Used by _build_from_rotation when a music-kind slot's
     per-holiday dice roll came up "yes" -- the pool becomes a
     station-wide music-kind holiday queryset instead of THIS slot's
-    normal category. See _music_holiday_pool.
+    normal category. See _music_holiday_pool. `pool_key` should be
+    passed alongside it (see TrackIdentityCache) so the holiday pool's
+    identity data is cached correctly.
 
     `exclude_holiday_codes` excludes tracks tagged with any of those
     codes from whichever pool is in play. Used when the dice roll came
@@ -359,7 +441,22 @@ def pick_track(category, exclude_track_ids, exclude_artist_ids,
     """
     fit_mode = remaining_seconds is not None and remaining_seconds < DURATION_FIT_THRESHOLD
     hard_exclude_track_ids = set(hard_exclude_track_ids or ())
-    hard_exclude_artist_ids = set(hard_exclude_artist_ids or ())
+    hard_exclude_identity_keys = set(hard_exclude_identity_keys or ())
+    identity_cache = identity_cache if identity_cache is not None else TrackIdentityCache()
+
+    # Effective cache key for THIS pool -- stable across every
+    # _build_qs() call within this one pick_track invocation (the
+    # loosening loop never changes category/pool_override_qs), so
+    # computed once here rather than inside _build_qs(). Falls back to
+    # a guaranteed-unique key (no cross-call cache reuse, but still
+    # correct) when the caller didn't pass one for a holiday pool --
+    # every real call site in this module does pass one.
+    if pool_key is not None:
+        effective_pool_key = pool_key
+    elif pool_override_qs is None and category is not None:
+        effective_pool_key = ("category", category.id)
+    else:
+        effective_pool_key = object()
 
     # Note: sep=0 opts a category out of the RECENCY-window exclusion
     # (via get_separation returning 0 and the loosening loop treating
@@ -373,19 +470,26 @@ def pick_track(category, exclude_track_ids, exclude_artist_ids,
     # via the pool-exhaustion fallback at the bottom of this function,
     # which drops hard_exclude_track_ids as a last resort.
 
-    def _build_qs():
+    def _base_pool_qs():
         # Base pool: either the caller's override (holiday-slot
-        # injection) or the slot's normal category pool.
+        # injection) or the slot's normal category pool. Kept
+        # UNNARROWED (no excludes applied) -- this is exactly what
+        # TrackIdentityCache should load/cache for `effective_pool_key`.
         if pool_override_qs is not None:
-            qs = pool_override_qs
-        else:
-            qs = _tracks_for_category(category, target_datetime=target_datetime)
+            return pool_override_qs
+        return _tracks_for_category(category, target_datetime=target_datetime)
+
+    def _build_qs():
+        base_qs = _base_pool_qs()
+        qs = base_qs
         combined_tracks = set(exclude_track_ids) | hard_exclude_track_ids
-        combined_artists = set(exclude_artist_ids) | hard_exclude_artist_ids
+        combined_identity_keys = set(exclude_identity_keys) | hard_exclude_identity_keys
+        identity_conflict_ids = identity_cache.conflicting_track_ids(
+            effective_pool_key, base_qs, combined_identity_keys,
+        )
+        combined_tracks = combined_tracks | identity_conflict_ids
         if combined_tracks:
             qs = qs.exclude(id__in=combined_tracks)
-        if combined_artists:
-            qs = qs.exclude(artist_id__in=combined_artists)
         if exclude_holiday_codes:
             # Non-holiday-slot mode: pull holiday-tagged tracks OUT so
             # they can't leak into an ordinary music slot through their
@@ -409,7 +513,7 @@ def pick_track(category, exclude_track_ids, exclude_artist_ids,
         title_sep = title_sep / 2.0
 
         loosened_exclude_tracks = set()
-        loosened_exclude_artists = set()
+        loosened_exclude_identity_keys = set()
 
         if artist_sep > 0 or title_sep > 0:
             cutoff = target_datetime - timedelta(hours=max(artist_sep, title_sep))
@@ -421,7 +525,7 @@ def pick_track(category, exclude_track_ids, exclude_artist_ids,
                     scheduled_time__gte=cutoff, scheduled_time__lt=target_datetime,
                     played_at__isnull=False,
                 )
-                .select_related("track")
+                .select_related("track", "track__artist")
             )
             artist_cutoff = target_datetime - timedelta(hours=artist_sep)
             title_cutoff = target_datetime - timedelta(hours=title_sep)
@@ -431,21 +535,28 @@ def pick_track(category, exclude_track_ids, exclude_artist_ids,
                 if item.scheduled_time >= title_cutoff:
                     loosened_exclude_tracks.add(item.track_id)
                 if item.scheduled_time >= artist_cutoff:
-                    loosened_exclude_artists.add(item.track.artist_id)
+                    # Related-artist history loosens at the same point
+                    # and by the same amount as ordinary artist
+                    # history -- it's folded into the same
+                    # artist_sep-gated branch, not a separate schedule.
+                    loosened_exclude_identity_keys |= track_identity_keys(
+                        item.track.artist.name if item.track.artist_id else None,
+                        item.track.related_artists,
+                    )
 
         # Only the recency-history part gets rebuilt; hard exclusions
         # (caller's accumulator of already-picked-in-this-build tracks)
         # are preserved via _build_qs() unioning them back in.
         exclude_track_ids = loosened_exclude_tracks
-        exclude_artist_ids = loosened_exclude_artists
+        exclude_identity_keys = loosened_exclude_identity_keys
 
     # Final pass: drop history exclusions AND hard artist separation,
     # keep only hard TRACK exclusion. Rationale: "don't play the same
     # track twice in one hour" is a stronger invariant than "don't play
     # the same artist too close together" -- yield the soft one first.
     exclude_track_ids = set()
-    exclude_artist_ids = set()
-    hard_exclude_artist_ids = set()
+    exclude_identity_keys = set()
+    hard_exclude_identity_keys = set()
     qs = _build_qs()
     if fit_mode:
         track = _pick_best_fit(qs, remaining_seconds, active_holiday_codes=active_holiday_codes)
@@ -474,18 +585,49 @@ def pick_track(category, exclude_track_ids, exclude_artist_ids,
 MAX_FILL_TRACKS = 200  # safety cap against a runaway loop on bad data
 
 
+def _identity_keys_for_picks(picks):
+    """Bulk-loaded (single query, regardless of how many picks) union
+    of identity keys for every track already in `picks` -- avoids
+    relying on `track.artist` being preloaded on whatever produced
+    these Track objects (pick_track's own Track.objects.get(), a
+    playlist item, or a rotation slot's direct-track insert may not
+    have select_related('artist')), which would otherwise be one lazy
+    query per pick for a fully-populated hour (~15-20 items)."""
+    track_ids = [p["track"].id for p in picks]
+    if not track_ids:
+        return set()
+    rows = Track.objects.filter(id__in=track_ids).values_list("id", "artist__name", "related_artists")
+    by_id = {tid: track_identity_keys(name, related) for tid, name, related in rows}
+    keys = set()
+    for tid in track_ids:
+        keys |= by_id.get(tid, frozenset())
+    return keys
+
+
 def fill_remaining_hour(picks, accumulated_seconds, target_datetime,
-                        active_holiday_codes=None, daily_shares=None):
+                        active_holiday_codes=None, daily_shares=None,
+                        identity_cache=None):
     """Top up `picks` with fallback-category tracks (admin-configured via
     LogFillConfig) until the hour is filled, or as tightly as duration-fit
     allows. Called after any build path in case it comes up short of a
     full hour (e.g. a playlist/rotation that doesn't sum to 3600s).
 
+    `picks` may already contain explicit playlist items or rotation
+    picks -- their identity sets (primary + related artists) are
+    seeded into this function's own hard-exclusion accumulator below,
+    so an explicit playlist/rotation item still blocks a same-identity
+    fill pick even though it was never itself chosen via pick_track().
+
     Holiday injection: caller passes `active_holiday_codes` (list of
     codes currently in ramp) and `daily_shares` (dict of code -> [0..1]
     linear-tent share for today). Each fill pick rolls per-holiday dice
     the same way _build_from_rotation does. Callers that don't want
-    holiday behavior pass both as None."""
+    holiday behavior pass both as None.
+
+    `identity_cache`: pass the same TrackIdentityCache the caller's
+    other pick_track() calls in this build are using, so the fallback
+    category's pool data is reused rather than reloaded. Defaults to a
+    fresh one if not given."""
     remaining = 3600 - accumulated_seconds
     if remaining <= DURATION_FIT_MARGIN:
         return picks, accumulated_seconds
@@ -498,9 +640,10 @@ def fill_remaining_hour(picks, accumulated_seconds, target_datetime,
     if category is None:
         return picks, accumulated_seconds
 
+    identity_cache = identity_cache if identity_cache is not None else TrackIdentityCache()
     recency_cfg = RecencyConfig.load()
     picked_tracks = [p["track"] for p in picks]
-    picked_artist_ids = [p["track"].artist_id for p in picks]
+    picked_identity_keys = _identity_keys_for_picks(picks)
 
     # Playlist branch and other callers may not thread state through --
     # compute a best-effort default here.
@@ -520,8 +663,8 @@ def fill_remaining_hour(picks, accumulated_seconds, target_datetime,
         if remaining <= DURATION_FIT_MARGIN:
             break
         artist_sep, title_sep = get_separation(category, recency_cfg)
-        exclude_track_ids, exclude_artist_ids = get_recent_exclusions(
-            target_datetime, artist_sep, title_sep, picked_tracks, picked_artist_ids,
+        exclude_track_ids, exclude_identity_keys = get_recent_exclusions(
+            target_datetime, artist_sep, title_sep, picked_tracks, picked_identity_keys,
         )
 
         # Same per-holiday dice roll as the main rotation loop.
@@ -531,21 +674,25 @@ def fill_remaining_hour(picks, accumulated_seconds, target_datetime,
                 if random.random() < share:
                     chosen_holiday_codes.append(code)
         pool_override_qs = None
+        pool_key = None
         exclude_holiday_codes = None
         if chosen_holiday_codes:
             pool_override_qs = _music_holiday_pool(chosen_holiday_codes, target_datetime)
+            pool_key = ("holiday", tuple(sorted(chosen_holiday_codes)))
         elif is_music_fill and active_holiday_codes:
             exclude_holiday_codes = active_holiday_codes
 
         track = pick_track(
-            category, exclude_track_ids, exclude_artist_ids,
+            category, exclude_track_ids, exclude_identity_keys,
             artist_sep, title_sep, target_datetime,
             remaining_seconds=remaining,
             hard_exclude_track_ids={t.id for t in picked_tracks},
-            hard_exclude_artist_ids=set(picked_artist_ids),
+            hard_exclude_identity_keys=set(picked_identity_keys),
             active_holiday_codes=active_holiday_codes,
             pool_override_qs=pool_override_qs,
             exclude_holiday_codes=exclude_holiday_codes,
+            identity_cache=identity_cache,
+            pool_key=pool_key,
         )
         if track is None:
             break  # nothing eligible even after loosening — stop gracefully
@@ -562,7 +709,9 @@ def fill_remaining_hour(picks, accumulated_seconds, target_datetime,
         # parallel comment in _build_from_rotation and pick_track's
         # pool-exhaustion fallback.
         picked_tracks.append(track)
-        picked_artist_ids.append(track.artist_id)
+        picked_identity_keys |= track_identity_keys(
+            track.artist.name if track.artist_id else None, track.related_artists,
+        )
         accumulated_seconds += track_duration
         remaining = 3600 - accumulated_seconds
         if track_duration <= 0:
@@ -572,7 +721,11 @@ def fill_remaining_hour(picks, accumulated_seconds, target_datetime,
 
 
 def _build_from_rotation(target_date, hour, rotation):
-    slots = list(rotation.slots.select_related("category__kind", "track", "track__category__kind").order_by("position"))
+    slots = list(
+        rotation.slots
+        .select_related("category__kind", "track", "track__category__kind", "track__artist")
+        .order_by("position")
+    )
     if not slots:
         return None, f"Rotation '{rotation.name}' has no slots."
 
@@ -601,9 +754,10 @@ def _build_from_rotation(target_date, hour, rotation):
         for h in active_holidays
     }
 
+    identity_cache = TrackIdentityCache()
     picks = []
     picked_tracks = []
-    picked_artist_ids = []
+    picked_identity_keys = set()
     accumulated_seconds = 0.0
 
     for slot in slots:
@@ -629,9 +783,9 @@ def _build_from_rotation(target_date, hour, rotation):
         artist_sep, title_sep = get_separation(category, recency_cfg)
 
         if not slot.track_id:
-            exclude_track_ids, exclude_artist_ids = get_recent_exclusions(
+            exclude_track_ids, exclude_identity_keys = get_recent_exclusions(
                 target_datetime, artist_sep, title_sep,
-                picked_tracks, picked_artist_ids,
+                picked_tracks, picked_identity_keys,
             )
 
             # Per-slot dice roll: independent draw per active holiday.
@@ -646,9 +800,11 @@ def _build_from_rotation(target_date, hour, rotation):
                         chosen_holiday_codes.append(code)
 
             pool_override_qs = None
+            pool_key = None
             exclude_holiday_codes = None
             if chosen_holiday_codes:
                 pool_override_qs = _music_holiday_pool(chosen_holiday_codes, target_datetime)
+                pool_key = ("holiday", tuple(sorted(chosen_holiday_codes)))
             elif is_music_slot and active_holiday_codes:
                 # Non-holiday slot on a holiday day: keep the normal
                 # category pool but strip out active-holiday-tagged
@@ -658,14 +814,16 @@ def _build_from_rotation(target_date, hour, rotation):
 
             remaining = 3600 - accumulated_seconds
             track = pick_track(
-                category, exclude_track_ids, exclude_artist_ids,
+                category, exclude_track_ids, exclude_identity_keys,
                 artist_sep, title_sep, target_datetime,
                 remaining_seconds=remaining,
                 hard_exclude_track_ids={t.id for t in picked_tracks},
-                hard_exclude_artist_ids=set(picked_artist_ids),
+                hard_exclude_identity_keys=set(picked_identity_keys),
                 active_holiday_codes=active_holiday_codes,
                 pool_override_qs=pool_override_qs,
                 exclude_holiday_codes=exclude_holiday_codes,
+                identity_cache=identity_cache,
+                pool_key=pool_key,
             )
 
             if track is None:
@@ -687,7 +845,9 @@ def _build_from_rotation(target_date, hour, rotation):
         # NOT out of "did I already pick this in THIS build" cycling.
         # See pick_track's header + pool-exhaustion fallback.
         picked_tracks.append(track)
-        picked_artist_ids.append(track.artist_id)
+        picked_identity_keys |= track_identity_keys(
+            track.artist.name if track.artist_id else None, track.related_artists,
+        )
         accumulated_seconds += track_duration
 
         if accumulated_seconds >= 3600:
@@ -697,6 +857,7 @@ def _build_from_rotation(target_date, hour, rotation):
         picks, accumulated_seconds, target_datetime,
         active_holiday_codes=active_holiday_codes,
         daily_shares=daily_shares,
+        identity_cache=identity_cache,
     )
     return _persist_log(target_date, hour, picks)
 
@@ -704,7 +865,7 @@ def _build_from_rotation(target_date, hour, rotation):
 def _build_from_playlist(target_date, hour, playlist):
     items = list(
         playlist.items
-        .select_related("track", "track__category")
+        .select_related("track", "track__category", "track__artist")
         .order_by("position")
     )
     if not items:
@@ -948,8 +1109,9 @@ def preview_hour_log(target_date, hour):
             walked = True
 
         recency_cfg = RecencyConfig.load()
+        identity_cache = TrackIdentityCache()
         picked_tracks = []
-        picked_artist_ids = []
+        picked_identity_keys = set()
         active_holidays = _active_holidays_at(target_datetime)
         active_holiday_codes = [h.code for h in active_holidays]
         daily_shares = {
@@ -969,8 +1131,8 @@ def preview_hour_log(target_date, hour):
             artist_sep, title_sep = get_separation(category, recency_cfg)
 
             if not slot.track_id:
-                exclude_track_ids, exclude_artist_ids = get_recent_exclusions(
-                    target_datetime, artist_sep, title_sep, picked_tracks, picked_artist_ids,
+                exclude_track_ids, exclude_identity_keys = get_recent_exclusions(
+                    target_datetime, artist_sep, title_sep, picked_tracks, picked_identity_keys,
                 )
 
                 is_music_slot = category is not None and category.kind.code == "music"
@@ -980,22 +1142,26 @@ def preview_hour_log(target_date, hour):
                         if random.random() < share:
                             chosen_holiday_codes.append(code)
                 pool_override_qs = None
+                pool_key = None
                 exclude_holiday_codes = None
                 if chosen_holiday_codes:
                     pool_override_qs = _music_holiday_pool(chosen_holiday_codes, target_datetime)
+                    pool_key = ("holiday", tuple(sorted(chosen_holiday_codes)))
                 elif is_music_slot and active_holiday_codes:
                     exclude_holiday_codes = active_holiday_codes
 
                 remaining = 3600 - accumulated_seconds
                 track = pick_track(
-                    category, exclude_track_ids, exclude_artist_ids,
+                    category, exclude_track_ids, exclude_identity_keys,
                     artist_sep, title_sep, target_datetime,
                     remaining_seconds=remaining,
                     hard_exclude_track_ids={t.id for t in picked_tracks},
-                    hard_exclude_artist_ids=set(picked_artist_ids),
+                    hard_exclude_identity_keys=set(picked_identity_keys),
                     active_holiday_codes=active_holiday_codes,
                     pool_override_qs=pool_override_qs,
                     exclude_holiday_codes=exclude_holiday_codes,
+                    identity_cache=identity_cache,
+                    pool_key=pool_key,
                 )
                 if track is None:
                     pool_size = _tracks_for_category(category, target_datetime=target_datetime).count()
@@ -1021,7 +1187,9 @@ def preview_hour_log(target_date, hour):
             })
             # Always accumulate; see _build_from_rotation for rationale.
             picked_tracks.append(track)
-            picked_artist_ids.append(track.artist_id)
+            picked_identity_keys |= track_identity_keys(
+                track.artist.name if track.artist_id else None, track.related_artists,
+            )
             accumulated_seconds += track_duration
             if accumulated_seconds >= 3600:
                 break
@@ -1037,6 +1205,7 @@ def preview_hour_log(target_date, hour):
                 picks, accumulated_seconds, target_datetime,
                 active_holiday_codes=active_holiday_codes,
                 daily_shares=daily_shares,
+                identity_cache=identity_cache,
             )
         else:
             picks, accumulated_seconds = fill_remaining_hour(picks, accumulated_seconds, target_datetime)
