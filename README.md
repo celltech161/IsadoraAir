@@ -23,6 +23,7 @@ IsadoraAir manages the full music library, schedule programming, playlist genera
 - Audio analysis: waveform generation, auto-detection of cue-in and next-start (mix) points via ffmpeg; per-category threshold overrides (dBFS for cue-in and next-start) let quiet material like classical music use later triggers than the global defaults
 - Fast cue-point re-pick: analyze_tracks persists the mono envelope into the waveform JSON, so re-picking cue points after a threshold tweak (per-track "Reset Cue Points" button on `/track/<pk>/`, or per-category "Update Cue Points" on `/categories/`) runs in seconds instead of the minutes a full re-decode would take
 - `fix_unknown_artists` management command: parses "Artist - Title" out of tracks whose artist is "Unknown Artist" and writes the split back to file metadata; WAV/AIF get transcoded to FLAC first (since they can't carry tags cleanly) with the original marked `ready2air=False` for manual weeding
+- Related Artists: a per-track, comma-separated free-text field (editable on `/track/<pk>/`) naming other artists that should count as "the same artist" for rotation separation. A shared conservative parser auto-discovers feat./ft./featuring/with credits and bare "&"/"and" collaborations (only split when both resulting names already exist as Artist rows) from the artist/title fields and appends newly-found names — never replacing a manually entered value, even on forced reanalysis. The `autofill_related_artists` management command (dry-run by default, `--query`/`--category`/`--ready2air` filters) and a matching "Auto-fill Related Artists" button on `/library/` apply the same discovery across a whole filtered set of tracks in one pass
 - Searchable/filterable frontend with full track detail editing; comfortably handles libraries in the tens of thousands of tracks on modest hardware (Postgres + indexed queries scale further for anyone with a bigger collection)
 - Bulk actions: mark ready-to-air, assign categories, set metadata
 - Per-track cue points, rotation weight, energy level, vocal type, end type, RBDS overrides
@@ -46,6 +47,7 @@ IsadoraAir manages the full music library, schedule programming, playlist genera
 - Generates each hour's playlist automatically from its ScheduleBlock (Rotation → Category → Track, or Playlist → PlaylistItem directly), auto-approved with no manual gate
 - Recency avoidance with configurable artist/title separation windows (global defaults + per-category overrides), time-based or proportional-to-category-size
 - Duration-aware track selection near end of hour, progressive constraint loosening when eligible tracks are exhausted
+- Related-artist separation: a track's artist identity is its primary Artist plus every name in its Related Artists field, and two tracks are treated as the same artist for recency purposes whenever those identity sets overlap — so a solo cut and a feature/duet involving the same performer won't air back-to-back even when neither track's primary Artist field matches the other's. Applies everywhere ordinary artist separation does — recent-play history, same-hour picks, fixed rotation slots, playlist fills, and holiday injection pools — and to Web Request slot-eligibility checks
 - Log Fill Configuration: tops a short hour up from a fallback category (repeat-last or fixed) so a short playlist/rotation never leaves the engine short
 
 **Playback Engine** (`library/services/engine.py`, runs as its own `isadoraair-engine` service)
@@ -154,6 +156,7 @@ IsadoraAir (Django 5.2 LTS)
 │   ├── services/
 │   │   ├── log_builder.py       # Playlist generation algorithm
 │   │   ├── engine.py            # GStreamer playback engine (standalone process)
+│   │   ├── related_artists.py   # Shared credit parser + artist-identity separation logic
 │   │   └── remote_dj_signaling.py  # WebRTC signaling websocket server (in-engine)
 │   ├── management/commands/
 │   │   ├── import_songs.py      # Library scanner (mutagen + RIFF-INFO for WAV)
