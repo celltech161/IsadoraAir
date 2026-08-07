@@ -3170,6 +3170,8 @@ def reports_page(request):
                 f"isadoraair-sample-icecast.timer is likely stopped."
             )
 
+    from .forms import HiddenTrackDetectionForm
+
     return render(request, "library/reports.html", {
         "reports": reports,
         "default_month": default_month,
@@ -3178,6 +3180,13 @@ def reports_page(request):
         "format_display": dict(RoyaltyReport.FORMAT_CHOICES),
         "sampler_status": sampler_status,
         "sampler_msg": sampler_msg,
+        # Hidden Track Detection tab (see api_hidden_track_scan below).
+        # Unbound form here just supplies field defaults/help text for
+        # the initial page render -- the actual scan is a separate POST
+        # the page's own JS fires and renders results from, matching
+        # the royalty-report "Generate" button's existing pattern.
+        "hidden_track_form": HiddenTrackDetectionForm(),
+        "hidden_track_categories": Category.objects.order_by("name").values("code", "name"),
     })
 
 
@@ -3276,3 +3285,133 @@ def reports_download(request, pk):
 
     fname = f"{rr.period_start:%Y-%m}-{rr.format}.{rr.file.name.rsplit('.', 1)[-1]}"
     return FileResponse(rr.file.open("rb"), as_attachment=True, filename=fname)
+
+
+# ---------------------------------------------------------------------
+# Hidden Track Detection -- Phase 1 (diagnostic only, no persistence).
+# See library/services/hidden_track_detection.py's module docstring
+# for the full algorithm/schema notes. This view is strictly a thin
+# adapter: validate the form, build a filtered queryset FROM TRACK
+# ROWS ONLY (never a caller-supplied filesystem path), call the
+# service for ONE BOUNDED BATCH, return JSON. No DB writes, no audio
+# decode, no subprocess.
+#
+# Batched, not a single synchronous full-library call: a real-library
+# measurement (read-only, this station's actual ~29.6k-track
+# ready2air/music-kind scope) took 49.1s wall-clock end to end --
+# comfortably over gunicorn's own 30s default worker timeout (deploy/
+# isadoraair-gunicorn.service sets no --timeout override), and by a
+# wide enough margin that no reasonable per-request budget would make
+# one request safe. The browser instead calls this endpoint repeatedly
+# with an increasing `cursor` (see scan_for_hidden_tracks_batch) until
+# `is_last_batch` comes back true, accumulating results client-side.
+# Every batch call independently re-validates the form and re-checks
+# permissions/CSRF -- there is no server-side scan state between
+# calls, matching the "no persistence" contract this feature keeps
+# throughout (no scan-run model, no candidate cache).
+# ---------------------------------------------------------------------
+@require_http_methods(["POST"])
+def api_hidden_track_scan(request):
+    """Same staff/superuser gate as every other /reports/ action (see
+    _reports_permission_check) -- Track ID filtering below still only
+    ever narrows within that same staff-only visibility, so a Track ID
+    filter can't be used to see a track a staff user couldn't already
+    view directly at /track/<pk>/. CSRF protection is NOT exempted
+    here (unlike api_reports_generate above, an existing, unrelated
+    choice this view deliberately does not copy) -- the frontend sends
+    the standard X-CSRFToken header, same convention as
+    autofillRelatedArtists() in library.html."""
+    denied = _reports_permission_check(request)
+    if denied:
+        return denied
+
+    from .forms import HiddenTrackDetectionForm
+    from .services.hidden_track_detection import DetectionSettings, scan_for_hidden_tracks_batch
+
+    form = HiddenTrackDetectionForm(request.POST)
+    if not form.is_valid():
+        return JsonResponse({"ok": False, "errors": form.errors.get_json_data()}, status=400)
+
+    # `cursor`: the highest track pk already processed by a PRIOR batch
+    # in this same scan, or absent/blank for the first call. Not a
+    # form field (it's protocol state driven by the browser's own
+    # batch loop, not an operator-editable setting) -- validated by
+    # hand instead. Never anything but a pk__gt boundary WITHIN the
+    # filtered queryset built below, so it can't be used to select an
+    # arbitrary/unauthorized track: a bogus value just yields a
+    # different (still fully filtered, still permission-scoped) slice
+    # of the SAME authorized queryset, never something outside it.
+    cursor_raw = (request.POST.get("cursor") or "").strip()
+    cursor = None
+    if cursor_raw:
+        try:
+            cursor = int(cursor_raw)
+        except ValueError:
+            return JsonResponse(
+                {"ok": False, "errors": {"cursor": [{"message": "cursor must be an integer.", "code": "invalid"}]}},
+                status=400,
+            )
+
+    data = form.cleaned_data
+    qs = Track.objects.all()
+
+    track_id = data.get("track_id")
+    if track_id:
+        # Individual-track mode overrides the other filters entirely --
+        # a focused single-row scan for debugging one suspect track.
+        qs = qs.filter(id=track_id)
+    else:
+        ready2air = data.get("ready2air") or "yes"
+        if ready2air == "yes":
+            qs = qs.filter(ready2air=True)
+        elif ready2air == "no":
+            qs = qs.filter(ready2air=False)
+        # "all" -> no ready2air filter.
+
+        category_code = (data.get("category") or "").strip()
+        if category_code:
+            try:
+                category = Category.objects.get(code=category_code)
+            except Category.DoesNotExist:
+                return JsonResponse(
+                    {"ok": False, "errors": {"category": [{"message": f"No category with code {category_code!r}.", "code": "invalid"}]}},
+                    status=400,
+                )
+            # Primary OR additional category, same convention as
+            # track_filters.filter_tracks and log_builder's pool
+            # queries -- .distinct() guards the M2M-join double-count.
+            qs = qs.filter(Q(category=category) | Q(additional_categories=category)).distinct()
+        else:
+            # Default: "all music-appropriate categories" -- same
+            # Category.kind.code == "music" gate log_builder's holiday
+            # pool uses, not a hardcoded category list.
+            qs = qs.filter(
+                Q(category__kind__code="music") | Q(additional_categories__kind__code="music")
+            ).distinct()
+
+    # Cheap indexed COUNT -- lets the browser show "X of Y processed"
+    # progress without a separate round trip. Computed on every batch
+    # (not cached server-side, since nothing is persisted between
+    # requests -- see the module's "No persistence" contract); this is
+    # the one query in this view that isn't already bounded by the
+    # batch size, but a COUNT is orders of magnitude cheaper than
+    # actually reading the matching rows' waveform JSON.
+    total_eligible = qs.count()
+
+    settings_obj = DetectionSettings(**form.settings_kwargs())
+    results, summary, next_cursor, is_last_batch = scan_for_hidden_tracks_batch(
+        qs, settings_obj, cursor=cursor,
+    )
+
+    for r in results:
+        r["track_url"] = reverse("library:track-detail", args=[r["track_id"]])
+
+    return JsonResponse({
+        "ok": True,
+        "results": results,
+        "summary": summary,
+        "settings": form.settings_kwargs(),
+        "total_eligible": total_eligible,
+        "next_cursor": next_cursor,
+        "is_last_batch": is_last_batch,
+    })

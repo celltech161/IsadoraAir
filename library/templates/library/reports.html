@@ -79,10 +79,56 @@
   .rpt-sampler-dot.healthy { background: #6c6; }
   .rpt-sampler-dot.stale   { background: #dc6; }
   .rpt-sampler-dot.dead    { background: #d55; }
+
+  /* --- Reports hub tabs --- */
+  .rpt-tabs {
+    display: flex; gap: 0.4rem; margin-bottom: 1rem;
+    border-bottom: 1px solid var(--border-subtle);
+  }
+  .rpt-tab {
+    background: none; border: none; cursor: pointer;
+    color: var(--text-muted); font-size: 0.88rem; font-weight: 600;
+    padding: 0.6rem 0.9rem; border-bottom: 2px solid transparent;
+    font-family: inherit;
+  }
+  .rpt-tab:hover { color: var(--text-main); }
+  .rpt-tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+  .rpt-tab-panel { display: none; }
+  .rpt-tab-panel.active { display: block; }
+
+  .rpt-form-grid {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(13rem, 1fr));
+    gap: 0.75rem 1rem; margin-bottom: 0.75rem;
+  }
+  .rpt-field-error {
+    color: #f88; font-size: 0.72rem; margin-top: 0.2rem; display: none;
+  }
+  .rpt-field-error.show { display: block; }
+  .rpt-input.field-invalid { border-color: #f88; }
+
+  .rpt-strength {
+    display: inline-block; padding: 0.1rem 0.5rem; border-radius: 4px;
+    font-size: 0.72rem; font-weight: 700; text-transform: uppercase;
+  }
+  .rpt-strength.high   { background: rgba(220,80,80,0.18); color: #e88; }
+  .rpt-strength.medium { background: rgba(220,180,80,0.18); color: #dc6; }
+
+  .rpt-summary-grid {
+    display: grid; grid-template-columns: repeat(auto-fill, minmax(9rem, 1fr));
+    gap: 0.5rem 1rem; margin: 0.75rem 0; font-size: 0.82rem;
+  }
+  .rpt-summary-grid .val { font-weight: 700; font-size: 1.1rem; color: var(--text-main); }
+  .rpt-summary-grid .lbl { color: var(--text-muted); font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.03em; }
 </style>
 {% endblock %}
 
 {% block content %}
+<div class="rpt-tabs">
+  <button type="button" class="rpt-tab active" id="tabBtnRoyalty" onclick="switchReportTab('royalty')">Royalty Reporting</button>
+  <button type="button" class="rpt-tab" id="tabBtnHidden" onclick="switchReportTab('hidden')">Hidden Track Detection</button>
+</div>
+
+<div id="tabPanelRoyalty" class="rpt-tab-panel active">
 <div class="rpt-sampler">
   <span class="rpt-sampler-dot {{ sampler_status }}"></span>
   <span><strong>Listener sampler:</strong> {{ sampler_msg }}</span>
@@ -166,6 +212,96 @@
   <div class="rpt-empty">No reports generated yet. Use the form above to make one.</div>
   {% endif %}
 </div>
+</div>
+<!-- /tabPanelRoyalty -->
+
+<div id="tabPanelHidden" class="rpt-tab-panel">
+  <div class="rpt-panel">
+    <h2>Hidden Track Detection</h2>
+    <div class="rpt-hint" style="margin-top:0; margin-bottom:0.9rem;">
+      Diagnostic scan only -- suspected tracks are listed for human verification, nothing is changed.
+      This reads each track's already-computed waveform analysis; it does not decode audio, and it never
+      edits cue points, playout markers, or any Track row. Use the link on each result to open the track's
+      existing detail/waveform page and confirm before doing anything else.
+    </div>
+
+    <form id="hiddenTrackForm" onsubmit="return false;">
+      <div class="rpt-form-grid">
+        <div>
+          <label for="ht_silence_threshold_db">Silence threshold (dBFS)</label>
+          <input class="rpt-input" style="width:100%;" type="number" step="0.1" id="ht_silence_threshold_db" value="{{ hidden_track_form.silence_threshold_db.value }}">
+          <div class="rpt-field-error" id="err_silence_threshold_db"></div>
+        </div>
+        <div>
+          <label for="ht_min_silence_seconds">Minimum silent gap (sec)</label>
+          <input class="rpt-input" style="width:100%;" type="number" step="0.1" min="0.1" id="ht_min_silence_seconds" value="{{ hidden_track_form.min_silence_seconds.value }}">
+          <div class="rpt-field-error" id="err_min_silence_seconds"></div>
+        </div>
+        <div>
+          <label for="ht_resumed_audio_threshold_db">Resumed-audio threshold (dBFS)</label>
+          <input class="rpt-input" style="width:100%;" type="number" step="0.1" id="ht_resumed_audio_threshold_db" value="{{ hidden_track_form.resumed_audio_threshold_db.value }}">
+          <div class="rpt-field-error" id="err_resumed_audio_threshold_db"></div>
+        </div>
+        <div>
+          <label for="ht_min_resumed_audio_seconds">Min. resumed-audio duration (sec)</label>
+          <input class="rpt-input" style="width:100%;" type="number" step="0.1" min="0.1" id="ht_min_resumed_audio_seconds" value="{{ hidden_track_form.min_resumed_audio_seconds.value }}">
+          <div class="rpt-field-error" id="err_min_resumed_audio_seconds"></div>
+        </div>
+        <div>
+          <label for="ht_required_active_ratio_percent">Required active-audio ratio (%)</label>
+          <input class="rpt-input" style="width:100%;" type="number" step="1" min="0" max="100" id="ht_required_active_ratio_percent" value="{{ hidden_track_form.required_active_ratio_percent.value }}">
+          <div class="rpt-field-error" id="err_required_active_ratio_percent"></div>
+        </div>
+        <div>
+          <label for="ht_min_position_seconds">Minimum position in track (sec)</label>
+          <input class="rpt-input" style="width:100%;" type="number" step="0.1" min="0" id="ht_min_position_seconds" value="{{ hidden_track_form.min_position_seconds.value }}">
+          <div class="rpt-field-error" id="err_min_position_seconds"></div>
+        </div>
+      </div>
+      <div class="rpt-hint" style="margin-top:-0.3rem;">
+        Audio at or below the silence threshold is treated as silence; audio must rise above the (higher)
+        resumed-audio threshold, and stay credible for the required ratio of windows, before a return counts
+        as a real hidden track rather than a click or low-level noise.
+      </div>
+
+      <div class="rpt-form-grid" style="margin-top:1rem;">
+        <div>
+          <label for="ht_ready2air">Ready to air</label>
+          <select class="rpt-select" style="width:100%;" id="ht_ready2air">
+            <option value="yes" selected>Yes</option>
+            <option value="no">No</option>
+            <option value="all">All</option>
+          </select>
+        </div>
+        <div>
+          <label for="ht_category">Category</label>
+          <select class="rpt-select" style="width:100%;" id="ht_category">
+            <option value="">All music-appropriate categories</option>
+            {% for c in hidden_track_categories %}
+            <option value="{{ c.code }}">{{ c.name }}</option>
+            {% endfor %}
+          </select>
+          <div class="rpt-field-error" id="err_category"></div>
+        </div>
+        <div>
+          <label for="ht_track_id">Track ID <span style="font-weight:normal;">(optional, overrides other filters)</span></label>
+          <input class="rpt-input" style="width:100%;" type="number" min="1" id="ht_track_id" placeholder="e.g. 11138">
+          <div class="rpt-field-error" id="err_track_id"></div>
+        </div>
+      </div>
+
+      <button type="button" class="rpt-btn" id="htScanBtn" onclick="runHiddenTrackScan()">Scan for hidden tracks</button>
+      <div class="rpt-status" id="htStatus"></div>
+    </form>
+  </div>
+
+  <div class="rpt-panel" id="htResultsPanel" style="display:none;">
+    <h2>Scan results</h2>
+    <div class="rpt-summary-grid" id="htSummaryGrid"></div>
+    <div id="htResultsTableWrap"></div>
+  </div>
+</div>
+<!-- /tabPanelHidden -->
 {% endblock %}
 
 {% block extra_js %}
@@ -233,6 +369,244 @@ async function generateReport() {
     status.textContent = 'Network error: ' + e.message;
     btn.disabled = false;
   }
+}
+
+// ---------------------------------------------------------------
+// Reports hub tabs
+// ---------------------------------------------------------------
+function switchReportTab(which) {
+  const isRoyalty = which === 'royalty';
+  document.getElementById('tabPanelRoyalty').classList.toggle('active', isRoyalty);
+  document.getElementById('tabPanelHidden').classList.toggle('active', !isRoyalty);
+  document.getElementById('tabBtnRoyalty').classList.toggle('active', isRoyalty);
+  document.getElementById('tabBtnHidden').classList.toggle('active', !isRoyalty);
+}
+
+// ---------------------------------------------------------------
+// Hidden Track Detection
+// ---------------------------------------------------------------
+function fmtTime(seconds) {
+  if (seconds === null || seconds === undefined || !isFinite(seconds)) return '—';
+  if (seconds < 60) return seconds.toFixed(1) + ' sec';
+  const m = Math.floor(seconds / 60);
+  const s = Math.round(seconds % 60);
+  return String(m).padStart(2, '0') + ':' + String(s).padStart(2, '0');
+}
+
+function clearHiddenTrackFieldErrors() {
+  document.querySelectorAll('#hiddenTrackForm .rpt-field-error').forEach(el => {
+    el.textContent = '';
+    el.classList.remove('show');
+  });
+  document.querySelectorAll('#hiddenTrackForm .field-invalid').forEach(el => {
+    el.classList.remove('field-invalid');
+  });
+}
+
+function showHiddenTrackFieldErrors(errors) {
+  for (const [field, msgs] of Object.entries(errors || {})) {
+    const errEl = document.getElementById('err_' + field);
+    const inputEl = document.getElementById('ht_' + field);
+    const text = msgs.map(m => m.message || m).join(' ');
+    if (errEl) {
+      errEl.textContent = text;
+      errEl.classList.add('show');
+    }
+    if (inputEl) inputEl.classList.add('field-invalid');
+  }
+}
+
+function hiddenTrackResultSortKey(r) {
+  // Mirrors _sort_results_strongest_first in library/services/hidden_
+  // track_detection.py exactly -- must match server-side ordering so
+  // the final combined (cross-batch) sort here is the same result the
+  // server would produce for a single, unbatched pass.
+  return [r.strength !== 'high' ? 1 : 0, -r.silence_duration, -r.resumed_duration, -r.representative_level_db];
+}
+
+function compareHiddenTrackResults(a, b) {
+  const ka = hiddenTrackResultSortKey(a), kb = hiddenTrackResultSortKey(b);
+  for (let i = 0; i < ka.length; i++) {
+    if (ka[i] !== kb[i]) return ka[i] - kb[i];
+  }
+  return 0;
+}
+
+async function runHiddenTrackScan() {
+  const btn = document.getElementById('htScanBtn');
+  const status = document.getElementById('htStatus');
+  const resultsPanel = document.getElementById('htResultsPanel');
+  if (btn.disabled) return; // guard against a double-submit race
+
+  clearHiddenTrackFieldErrors();
+  status.className = 'rpt-status';
+  status.style.display = 'block';
+  btn.disabled = true;
+  const originalLabel = btn.textContent;
+  btn.textContent = 'Scanning…';
+  resultsPanel.style.display = 'none';
+
+  // Snapshot the filter fields ONCE for the whole scan -- every batch
+  // request resends this exact same body (plus an advancing cursor),
+  // so the filter can never drift between batches of one scan.
+  const baseParams = {
+    silence_threshold_db: document.getElementById('ht_silence_threshold_db').value,
+    min_silence_seconds: document.getElementById('ht_min_silence_seconds').value,
+    resumed_audio_threshold_db: document.getElementById('ht_resumed_audio_threshold_db').value,
+    min_resumed_audio_seconds: document.getElementById('ht_min_resumed_audio_seconds').value,
+    required_active_ratio_percent: document.getElementById('ht_required_active_ratio_percent').value,
+    min_position_seconds: document.getElementById('ht_min_position_seconds').value,
+    ready2air: document.getElementById('ht_ready2air').value,
+    category: document.getElementById('ht_category').value,
+    track_id: document.getElementById('ht_track_id').value,
+  };
+  const categorySelect = document.getElementById('ht_category');
+  const filterDesc = baseParams.track_id
+    ? `track ID ${baseParams.track_id} only`
+    : (baseParams.category
+        ? categorySelect.options[categorySelect.selectedIndex].textContent
+        : 'the ENTIRE ready-to-air music library (no category filter set)');
+
+  // Accumulated across every batch -- rendered once at the very end,
+  // not per batch, so the final table is always shown fully sorted
+  // strongest-first rather than growing/reordering under the operator.
+  let allResults = [];
+  const mergedSummary = {
+    tracks_considered: 0, waveforms_scanned: 0, suspects_found: 0,
+    skipped: {}, skipped_total: 0, scan_seconds: 0, total_seconds: 0,
+  };
+  let cursor = null;
+  let totalEligible = null;
+
+  try {
+    while (true) {
+      const params = new URLSearchParams(baseParams);
+      if (cursor !== null) params.set('cursor', String(cursor));
+
+      const resp = await fetch("{% url 'library:api-hidden-track-scan' %}", {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded',
+          'X-CSRFToken': getCookie('csrftoken'),
+        },
+        body: params.toString(),
+      });
+      const data = await resp.json();
+      if (!resp.ok || !data.ok) {
+        if (data.errors) {
+          showHiddenTrackFieldErrors(data.errors);
+          status.className = 'rpt-status err';
+          status.textContent = 'Fix the highlighted field(s) and try again.';
+        } else {
+          status.className = 'rpt-status err';
+          status.textContent = 'Error: ' + (data.error || `HTTP ${resp.status}`);
+        }
+        return;
+      }
+
+      totalEligible = data.total_eligible;
+      allResults = allResults.concat(data.results);
+      mergedSummary.tracks_considered += data.summary.tracks_considered;
+      mergedSummary.waveforms_scanned += data.summary.waveforms_scanned;
+      mergedSummary.suspects_found += data.summary.suspects_found;
+      mergedSummary.skipped_total += data.summary.skipped_total;
+      mergedSummary.scan_seconds += data.summary.scan_seconds;
+      mergedSummary.total_seconds += data.summary.total_seconds;
+      for (const [label, count] of Object.entries(data.summary.skipped || {})) {
+        mergedSummary.skipped[label] = (mergedSummary.skipped[label] || 0) + count;
+      }
+
+      status.textContent =
+        `Scanning ${filterDesc}… ${mergedSummary.tracks_considered} of ${totalEligible} tracks processed, ` +
+        `${mergedSummary.suspects_found} suspect(s) found so far.`;
+
+      if (data.is_last_batch) break;
+      cursor = data.next_cursor;
+    }
+
+    mergedSummary.avg_ms_per_scanned_track = mergedSummary.waveforms_scanned
+      ? Math.round((mergedSummary.scan_seconds / mergedSummary.waveforms_scanned) * 1000 * 100) / 100
+      : 0.0;
+    allResults.sort(compareHiddenTrackResults);
+
+    status.className = 'rpt-status ok';
+    status.textContent =
+      `Done in ${mergedSummary.total_seconds.toFixed(1)}s -- ` +
+      `${mergedSummary.waveforms_scanned} of ${mergedSummary.tracks_considered} tracks scanned, ` +
+      `${mergedSummary.suspects_found} suspect(s) found.`;
+    renderHiddenTrackResults({ results: allResults, summary: mergedSummary });
+  } catch (e) {
+    status.className = 'rpt-status err';
+    status.textContent = 'Network error: ' + e.message;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = originalLabel;
+  }
+}
+
+function renderHiddenTrackResults(data) {
+  const panel = document.getElementById('htResultsPanel');
+  const summaryGrid = document.getElementById('htSummaryGrid');
+  const tableWrap = document.getElementById('htResultsTableWrap');
+  const s = data.summary;
+
+  const skippedTotal = s.skipped_total || 0;
+  const skippedBreakdown = Object.entries(s.skipped || {})
+    .map(([label, count]) => `${label}: ${count}`).join(', ');
+
+  summaryGrid.innerHTML = `
+    <div><div class="val">${s.tracks_considered}</div><div class="lbl">Considered</div></div>
+    <div><div class="val">${s.waveforms_scanned}</div><div class="lbl">Scanned OK</div></div>
+    <div><div class="val">${skippedTotal}</div><div class="lbl">Skipped</div></div>
+    <div><div class="val">${s.suspects_found}</div><div class="lbl">Suspects</div></div>
+    <div><div class="val">${s.total_seconds.toFixed(1)}s</div><div class="lbl">Elapsed</div></div>
+    <div><div class="val">${s.avg_ms_per_scanned_track}ms</div><div class="lbl">Avg / track</div></div>
+  ` + (skippedBreakdown ? `<div style="grid-column:1/-1;" class="rpt-hint">Skipped breakdown: ${skippedBreakdown}</div>` : '');
+
+  if (!data.results.length) {
+    tableWrap.innerHTML = '<div class="rpt-empty">No suspected hidden tracks found with these settings.</div>';
+  } else {
+    const rows = data.results.map(r => `
+      <tr>
+        <td><span class="rpt-strength ${r.strength}">${r.strength}</span></td>
+        <td><a href="${r.track_url}">${escapeHtml(r.artist || 'Unknown Artist')} — ${escapeHtml(r.title || '(untitled)')}</a></td>
+        <td>${escapeHtml(r.album || '—')}</td>
+        <td class="num">${fmtTime(r.duration_seconds)}</td>
+        <td class="num">${fmtTime(r.silence_start)}</td>
+        <td class="num">${fmtTime(r.silence_end)}</td>
+        <td class="num">${fmtTime(r.silence_duration)}</td>
+        <td class="num">${fmtTime(r.resumed_start)}</td>
+        <td class="num">${fmtTime(r.resumed_duration)}</td>
+        <td class="num">${r.other_gap_count > 0 ? '+' + r.other_gap_count : '—'}</td>
+      </tr>
+    `).join('');
+    tableWrap.innerHTML = `
+      <table class="rpt-table">
+        <thead>
+          <tr>
+            <th>Strength</th>
+            <th>Track</th>
+            <th>Album</th>
+            <th class="num">Duration</th>
+            <th class="num">Gap start</th>
+            <th class="num">Gap end</th>
+            <th class="num">Gap length</th>
+            <th class="num">Resumed at</th>
+            <th class="num">Hidden section</th>
+            <th class="num">Other gaps</th>
+          </tr>
+        </thead>
+        <tbody>${rows}</tbody>
+      </table>
+    `;
+  }
+  panel.style.display = 'block';
+}
+
+function escapeHtml(s) {
+  const div = document.createElement('div');
+  div.textContent = s;
+  return div.innerHTML;
 }
 </script>
 {% endblock %}
