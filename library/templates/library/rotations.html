@@ -591,6 +591,7 @@ function initDragDrop() {
   // targeting the handle even as the finger/cursor moves over other
   // rows during the drag.
   const tbody = document.getElementById('itemsTbody');
+  const scrollBox = tbody.closest('.pl-items-wrap');
   let dragEl = null;
   let activePointerId = null;
   let scrollTimer = null;
@@ -612,17 +613,32 @@ function initDragDrop() {
     }
   }
 
-  // Scrolls the whole page (not just the items list's own scroll box)
-  // when a drag is held near the top/bottom edge of the VIEWPORT --
-  // on a phone the table's max-height box might not even be the thing
-  // that needs to scroll to reach an item below the fold.
+  // Scrolls the items list's own scroll box first -- .pl-items-wrap is
+  // capped at max-height + overflow-y:auto, so any list taller than
+  // that scrolls INSIDE the box, not the page, and that's the edge a
+  // drag actually needs when reaching for a row above/below the fold.
+  // Falls back to scrolling the whole page once the box has nothing
+  // left to give in that direction (or for a short list that never
+  // grew its own scrollbar) -- on a phone the page itself can still be
+  // the thing that needs to move.
   function maybeAutoScroll(clientY) {
     const edge = 60;
     stopAutoScroll();
-    if (clientY < edge) {
-      scrollTimer = setInterval(() => window.scrollBy(0, -12), 16);
-    } else if (clientY > window.innerHeight - edge) {
-      scrollTimer = setInterval(() => window.scrollBy(0, 12), 16);
+    const rect = scrollBox.getBoundingClientRect();
+    const boxTop = Math.max(rect.top, 0);
+    const boxBottom = Math.min(rect.bottom, window.innerHeight);
+
+    if (clientY < boxTop + edge) {
+      scrollTimer = setInterval(() => {
+        if (scrollBox.scrollTop > 0) scrollBox.scrollBy(0, -12);
+        else window.scrollBy(0, -12);
+      }, 16);
+    } else if (clientY > boxBottom - edge) {
+      scrollTimer = setInterval(() => {
+        const atEnd = scrollBox.scrollTop + scrollBox.clientHeight >= scrollBox.scrollHeight - 1;
+        if (!atEnd) scrollBox.scrollBy(0, 12);
+        else window.scrollBy(0, 12);
+      }, 16);
     }
   }
 
