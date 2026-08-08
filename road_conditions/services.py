@@ -319,15 +319,71 @@ def normalize_event(raw):
     }
 
 
-def _matches_scope(normalized, counties_filter, routes_filter, config, now):
+def _matches_scope(normalized, counties_filter, routes_filter, corridor_rules, config, now):
     """Does this normalized event currently match
     RoadConditionsConfiguration's coverage filters? Populates
     RoadEvent.in_scope -- see that field's docstring. Distinct from
     whether the record parsed at all (EventParseError) or whether
-    KDOT still lists it (RoadEvent.source_active)."""
-    if counties_filter and not (set(normalized["counties"]) & counties_filter):
-        return False
-    if routes_filter and not (set(normalized["routes"]) & routes_filter):
+    KDOT still lists it (RoadEvent.source_active).
+
+    Geographic scope is `normal_match OR corridor_match`:
+
+      * `normal_match` is the original counties_filter/routes_filter
+        AND-combined behavior, completely unchanged -- blank
+        counties_filter means no county restriction, blank
+        routes_filter means no route restriction, and when both are
+        set an event must match both (see RoadConditionsConfiguration.
+        routes' help_text for why this is intentionally AND, not OR).
+      * `corridor_rules` (RoadConditionsConfiguration.
+        additional_route_coverage_rules, already parsed by the caller
+        -- parsing deliberately stays out of this function) ADDS
+        coverage on top: {route: {county, ...}}, and an event matches
+        a rule if it has that exact route AND at least one of that
+        rule's counties. This can only WIDEN scope relative to
+        normal_match, never narrow it -- an event that already passes
+        normal_match doesn't need a corridor rule too.
+
+    KNOWN LIMITATION -- corridor matching is EVENT-level, not
+    per-segment: `route in event_routes` and `event_counties & rule_
+    counties` are checked independently against the event's COMPLETE
+    routes/counties sets (normalized["routes"]/normalized["counties"]),
+    not against a verified route-to-county pairing for one specific
+    location. The source schema has no such pairing to check against
+    in the first place -- confirmed by inspecting both the live CARS
+    API's own swagger schema (top-level CARSEvent.counties; neither
+    Detail nor any Location variant carries a county) and
+    normalize_event()'s own extraction (RoadEvent.locations stores
+    location_type/route_designator/direction/lat/lon per location,
+    deliberately no county -- there is none to store). So an event
+    with routes={"US 81","KS 9"} and counties={"Ottawa","Cloud"} would
+    match a "US 81: Cloud" rule even if, in reality, US 81 is the
+    segment in Ottawa and KS 9 is the one in Cloud -- this function
+    cannot tell the two apart and does not claim to. In practice this
+    is a narrow theoretical gap, not an observed one: in a real 231-
+    event capture (2026-08-04 reconnaissance), 44 events had multiple
+    counties (a single route spanning a county line) but ZERO had more
+    than one distinct route -- see test_sync.py's
+    KnownLimitationEventLevelCorridorMatchingTests for a constructed
+    (not live) regression case that documents this explicitly, so it's
+    never mistaken later for verified per-segment correlation.
+
+    Every filter below this point (min_priority/max_event_age_days/
+    lookahead_days) still applies normally regardless of which of the
+    two (or both) matched -- a corridor rule only ever affects
+    geographic scope, never exempts an event from anything else."""
+    normal_match = (
+        (not counties_filter or (set(normalized["counties"]) & counties_filter))
+        and (not routes_filter or (set(normalized["routes"]) & routes_filter))
+    )
+    corridor_match = False
+    if corridor_rules and not normal_match:
+        event_routes = set(normalized["routes"])
+        event_counties = set(normalized["counties"])
+        corridor_match = any(
+            route in event_routes and (event_counties & counties)
+            for route, counties in corridor_rules.items()
+        )
+    if not (normal_match or corridor_match):
         return False
     priority = normalized["priority"]
     if priority is not None and priority < config.min_priority:
@@ -448,6 +504,7 @@ def sync_events(config, *, dry_run=False, event_classifications_filter=None, cou
     classifications = event_classifications_filter if event_classifications_filter is not None else config.event_classifications_list
     counties_filter = {county_filter} if county_filter else config.counties_set
     routes_filter = config.routes_set
+    corridor_rules = config.additional_route_coverage_rules
 
     started_at = dj_timezone.now()
     result = dict(fetched_count=0, relevant_count=0, created_count=0, updated_count=0,
@@ -525,7 +582,7 @@ def sync_events(config, *, dry_run=False, event_classifications_filter=None, cou
             continue
         seen_in_this_run.add(normalized["external_id"])
 
-        if _matches_scope(normalized, counties_filter, routes_filter, config, now):
+        if _matches_scope(normalized, counties_filter, routes_filter, corridor_rules, config, now):
             result["relevant_count"] += 1
             in_scope_batch.append(normalized)
             if config.debug_logging:

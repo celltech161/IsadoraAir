@@ -1,9 +1,10 @@
 from datetime import timedelta
 
+from django.core.exceptions import ValidationError
 from django.test import TestCase
 from django.utils import timezone
 
-from road_conditions.models import RoadConditionsConfiguration
+from road_conditions.models import RoadConditionsConfiguration, parse_additional_route_coverage
 
 
 class RoadConditionsConfigurationSingletonTests(TestCase):
@@ -63,6 +64,136 @@ class RoadConditionsConfigurationPropertyTests(TestCase):
         # regression guard against the two configs silently drifting apart.
         self.assertIn("Ottawa", self.config.counties_set)
         self.assertIn("Saline", self.config.counties_set)
+
+
+class AdditionalRouteCoverageParsingTests(TestCase):
+    """parse_additional_route_coverage() -- pure function, no DB needed."""
+
+    def test_blank_text_produces_no_rules_and_no_errors(self):
+        rules, errors = parse_additional_route_coverage("")
+        self.assertEqual(rules, {})
+        self.assertEqual(errors, [])
+
+    def test_single_rule(self):
+        rules, errors = parse_additional_route_coverage("US 81: Saline,Cloud")
+        self.assertEqual(rules, {"US 81": {"Saline", "Cloud"}})
+        self.assertEqual(errors, [])
+
+    def test_multiple_rules(self):
+        text = "US 81: Saline,Cloud\nI-70: Saline,Dickinson\nUS 24: Mitchell,Cloud"
+        rules, errors = parse_additional_route_coverage(text)
+        self.assertEqual(rules, {
+            "US 81": {"Saline", "Cloud"},
+            "I-70": {"Saline", "Dickinson"},
+            "US 24": {"Mitchell", "Cloud"},
+        })
+        self.assertEqual(errors, [])
+
+    def test_blank_lines_ignored(self):
+        rules, errors = parse_additional_route_coverage("\nUS 81: Saline,Cloud\n\n\n")
+        self.assertEqual(rules, {"US 81": {"Saline", "Cloud"}})
+        self.assertEqual(errors, [])
+
+    def test_whitespace_around_route_and_counties_is_trimmed(self):
+        rules, errors = parse_additional_route_coverage(" US 81 : Saline, Cloud ")
+        self.assertEqual(rules, {"US 81": {"Saline", "Cloud"}})
+        self.assertEqual(errors, [])
+
+    def test_equivalent_to_tightly_formatted_version(self):
+        loose = parse_additional_route_coverage(" US 81 : Saline, Cloud \n")[0]
+        tight = parse_additional_route_coverage("US 81: Saline,Cloud")[0]
+        self.assertEqual(loose, tight)
+
+    def test_duplicate_route_lines_merge_counties(self):
+        text = "US 81: Saline\nUS 81: Cloud"
+        rules, errors = parse_additional_route_coverage(text)
+        self.assertEqual(rules, {"US 81": {"Saline", "Cloud"}})
+        self.assertEqual(errors, [])
+
+    def test_missing_colon_is_malformed_and_produces_no_rule(self):
+        rules, errors = parse_additional_route_coverage("US 81")
+        self.assertEqual(rules, {})
+        self.assertEqual(len(errors), 1)
+        self.assertIn("line 1", errors[0])
+
+    def test_empty_route_before_colon_is_malformed_and_produces_no_rule(self):
+        rules, errors = parse_additional_route_coverage(": Saline")
+        self.assertEqual(rules, {})
+        self.assertEqual(len(errors), 1)
+
+    def test_empty_county_list_is_malformed_and_produces_no_rule(self):
+        rules, errors = parse_additional_route_coverage("US 81:")
+        self.assertEqual(rules, {})
+        self.assertEqual(len(errors), 1)
+
+    def test_county_list_of_only_commas_is_malformed(self):
+        rules, errors = parse_additional_route_coverage("US 81: , ,")
+        self.assertEqual(rules, {})
+        self.assertEqual(len(errors), 1)
+
+    def test_one_malformed_line_does_not_block_other_valid_lines(self):
+        text = "US 81: Saline,Cloud\nbogus line\nI-70: Dickinson"
+        rules, errors = parse_additional_route_coverage(text)
+        self.assertEqual(rules, {"US 81": {"Saline", "Cloud"}, "I-70": {"Dickinson"}})
+        self.assertEqual(len(errors), 1)
+
+    def test_malformed_line_never_broadens_to_statewide_route_rule(self):
+        # "US 81" alone must NOT become "US 81 matches everywhere" --
+        # it must simply be dropped.
+        rules, _errors = parse_additional_route_coverage("US 81")
+        self.assertNotIn("US 81", rules)
+
+    def test_malformed_line_never_broadens_to_all_route_county_rule(self):
+        # ": Saline" must NOT become "any route in Saline" -- dropped.
+        rules, _errors = parse_additional_route_coverage(": Saline")
+        self.assertEqual(rules, {})
+
+
+class AdditionalRouteCoverageModelTests(TestCase):
+    def setUp(self):
+        self.config = RoadConditionsConfiguration.load()
+
+    def test_additional_route_coverage_rules_property_parses(self):
+        self.config.additional_route_coverage = "US 81: Saline,Cloud"
+        self.assertEqual(self.config.additional_route_coverage_rules, {"US 81": {"Saline", "Cloud"}})
+
+    def test_additional_route_coverage_rules_property_blank_by_default(self):
+        self.assertEqual(self.config.additional_route_coverage, "")
+        self.assertEqual(self.config.additional_route_coverage_rules, {})
+
+    def test_additional_route_coverage_rules_property_silently_drops_malformed_lines(self):
+        # Same safety guarantee as parse_additional_route_coverage() itself --
+        # the property never raises, and a malformed line never yields a rule,
+        # even though clean() (used by admin saves) would reject this text.
+        self.config.additional_route_coverage = "US 81"
+        self.assertEqual(self.config.additional_route_coverage_rules, {})
+
+    def test_clean_accepts_blank(self):
+        self.config.additional_route_coverage = ""
+        self.config.clean()  # must not raise
+
+    def test_clean_accepts_well_formed_rules(self):
+        self.config.additional_route_coverage = "US 81: Saline,Cloud\nI-70: Dickinson"
+        self.config.clean()  # must not raise
+
+    def test_clean_rejects_malformed_rule(self):
+        self.config.additional_route_coverage = "US 81"
+        with self.assertRaises(ValidationError) as ctx:
+            self.config.clean()
+        self.assertIn("additional_route_coverage", ctx.exception.message_dict)
+
+    def test_clean_rejects_route_only_colon(self):
+        self.config.additional_route_coverage = ": Saline"
+        with self.assertRaises(ValidationError):
+            self.config.clean()
+
+    def test_full_clean_via_admin_style_save_rejects_malformed_text(self):
+        # Mirrors what ModelForm._post_clean does on every admin save
+        # (Model.save() alone does NOT call full_clean() -- this is
+        # specifically checking the admin-save enforcement path).
+        self.config.additional_route_coverage = "US 81"
+        with self.assertRaises(ValidationError):
+            self.config.full_clean()
 
 
 class RoadConditionsConfigurationStalenessTests(TestCase):

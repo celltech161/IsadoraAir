@@ -55,6 +55,57 @@ class RoadConditionsAdminTests(TestCase):
         self.assertContains(response, 'name="transition_sound_enabled"')
         self.assertContains(response, 'name="transition_sound_path"')
 
+    def test_config_change_form_includes_additional_route_coverage_field(self):
+        RoadConditionsConfiguration.load()
+        response = self.client.get(reverse("admin:road_conditions_roadconditionsconfiguration_change", args=[1]))
+        self.assertContains(response, 'name="additional_route_coverage"')
+
+    def _config_post_data(self, obj, **overrides):
+        """Minimal valid POST body for the singleton config change form --
+        every non-readonly field needs SOME value or Django's own
+        required-field validation fires first and masks whatever this
+        test is actually trying to check."""
+        data = {
+            "enabled": "on" if obj.enabled else "",
+            "report_preamble": obj.report_preamble,
+            "report_postamble": obj.report_postamble,
+            "transition_sound_enabled": "on" if obj.transition_sound_enabled else "",
+            "transition_sound_path": obj.transition_sound_path,
+            "api_base_url": obj.api_base_url,
+            "request_timeout_seconds": obj.request_timeout_seconds,
+            "poll_cadence_minutes": obj.poll_cadence_minutes,
+            "event_classifications": obj.event_classifications,
+            "counties": obj.counties,
+            "routes": obj.routes,
+            "additional_route_coverage": obj.additional_route_coverage,
+            "min_priority": obj.min_priority,
+            "max_event_age_days": obj.max_event_age_days,
+            "lookahead_days": obj.lookahead_days,
+            "stale_data_threshold_minutes": obj.stale_data_threshold_minutes,
+            "debug_logging": "on" if obj.debug_logging else "",
+        }
+        data.update(overrides)
+        return data
+
+    def test_config_save_accepts_well_formed_additional_route_coverage(self):
+        obj = RoadConditionsConfiguration.load()
+        data = self._config_post_data(obj, additional_route_coverage="US 81: Saline,Cloud")
+        response = self.client.post(reverse("admin:road_conditions_roadconditionsconfiguration_change", args=[1]), data)
+        self.assertEqual(response.status_code, 302)  # redirect on successful save
+        obj.refresh_from_db()
+        self.assertEqual(obj.additional_route_coverage, "US 81: Saline,Cloud")
+
+    def test_config_save_rejects_malformed_additional_route_coverage(self):
+        obj = RoadConditionsConfiguration.load()
+        original = obj.additional_route_coverage
+        data = self._config_post_data(obj, additional_route_coverage="US 81")
+        response = self.client.post(reverse("admin:road_conditions_roadconditionsconfiguration_change", args=[1]), data)
+        self.assertEqual(response.status_code, 200)  # re-renders the form with errors, no redirect
+        self.assertContains(response, "errorlist")
+        self.assertContains(response, "missing")  # from parse_additional_route_coverage's error text
+        obj.refresh_from_db()
+        self.assertEqual(obj.additional_route_coverage, original)  # nothing was saved
+
     def test_config_add_is_blocked_once_it_exists(self):
         RoadConditionsConfiguration.load()
         response = self.client.get(reverse("admin:road_conditions_roadconditionsconfiguration_add"))

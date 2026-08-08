@@ -1,3 +1,4 @@
+from django.core.exceptions import ValidationError
 from django.db import models
 
 
@@ -24,6 +25,51 @@ DEFAULT_EVENT_CLASSIFICATIONS = "constructionReports,roadReports,winterDriving,w
 # only shows up buried in a couple of unused nested schema objects the
 # live API never actually populates).
 DEFAULT_COUNTIES = "Ottawa,Saline,Cloud,Lincoln,Mitchell,Clay,Dickinson,Ellsworth"
+
+
+def parse_additional_route_coverage(text):
+    """Parses RoadConditionsConfiguration.additional_route_coverage's
+    one-rule-per-line `ROUTE: County,County` format (see that field's
+    help_text for the exact contract). Returns (rules, errors):
+
+      * `rules` -- {route: {county, ...}}, one entry per syntactically
+        well-formed nonblank line. Two lines for the same route merge
+        their county sets rather than the later line silently
+        overwriting the earlier one.
+      * `errors` -- a human-readable string per nonblank line that
+        could NOT be parsed as a well-formed rule (no ':', blank route
+        before it, or zero usable counties after it, e.g. bare "US 81"
+        or ": Saline"). Used by RoadConditionsConfiguration.clean() to
+        reject the config at admin save time -- see that method.
+
+    A malformed line NEVER contributes a rule to `rules`, independent
+    of `errors` -- callers that only want the parsed rules (see
+    RoadConditionsConfiguration.additional_route_coverage_rules) can
+    safely ignore `errors` and still never get broader matching than
+    intended, even if malformed text somehow ends up saved outside the
+    admin's own clean()-enforced path (e.g. loaddata, a direct ORM/
+    shell edit -- Model.save() does not call full_clean() on its own).
+    """
+    rules = {}
+    errors = []
+    for lineno, raw_line in enumerate((text or "").splitlines(), start=1):
+        line = raw_line.strip()
+        if not line:
+            continue
+        if ":" not in line:
+            errors.append(f"line {lineno}: missing ':' -- expected 'ROUTE: County,County' (got {raw_line!r})")
+            continue
+        route_part, counties_part = line.split(":", 1)
+        route = route_part.strip()
+        counties = {c.strip() for c in counties_part.split(",") if c.strip()}
+        if not route:
+            errors.append(f"line {lineno}: no route given before ':' (got {raw_line!r})")
+            continue
+        if not counties:
+            errors.append(f"line {lineno}: no counties listed for route {route!r} (got {raw_line!r})")
+            continue
+        rules.setdefault(route, set()).update(counties)
+    return rules, errors
 
 
 class RoadConditionsConfiguration(models.Model):
@@ -228,6 +274,37 @@ class RoadConditionsConfiguration(models.Model):
             "lets multiple routes be configured at once."
         ),
     )
+    additional_route_coverage = models.TextField(
+        blank=True, default="",
+        help_text=(
+            "Optional exceptions to the Counties/Routes coverage above, one "
+            "rule per line, in the form 'ROUTE: County,County' -- e.g. "
+            "'US 81: Saline,Cloud'. Counties above define the normal "
+            "coverage area; Routes above, if also set, further RESTRICTS "
+            "Counties (an event must match both). This field instead ADDS "
+            "coverage: an event is also kept if it matches the exact route "
+            "on a line here AND is in one of that line's listed counties -- "
+            "regardless of whether it would otherwise pass Counties/Routes "
+            "above. Each line only ever adds that one route in those exact "
+            "counties, never statewide. Blank means no additional coverage "
+            "(current behavior, unchanged). All other filters (event "
+            "classifications, minimum priority, event age/lookahead) still "
+            "apply normally to anything matched here -- this field only "
+            "widens geographic scope, nothing else. Malformed lines (no "
+            "':', no route, or no counties listed) are rejected when this "
+            "configuration is saved rather than silently broadening "
+            "coverage. Known limitation: matching is EVENT-level, not "
+            "per-segment -- the source API gives no route-to-county "
+            "association for an event with more than one route (e.g. an "
+            "event listing both US 81 and KS 9 with counties Ottawa and "
+            "Cloud doesn't say which route is in which county), so a rule "
+            "matches whenever its route and one of its counties both "
+            "appear ANYWHERE on the event. Harmless for the vast majority "
+            "of real events (each has exactly one route in practice; see "
+            "services._matches_scope()'s docstring), but worth knowing for "
+            "the rare event that genuinely spans multiple distinct routes."
+        ),
+    )
 
     min_priority = models.PositiveSmallIntegerField(
         default=1,
@@ -290,6 +367,21 @@ class RoadConditionsConfiguration(models.Model):
         self.pk = 1
         super().save(*args, **kwargs)
 
+    def clean(self):
+        """Rejects a malformed additional_route_coverage at save time
+        (called by ModelForm._post_clean -- i.e. any admin save -- via
+        Model.full_clean(); NOT called by a plain .save(), same as
+        Django generally). Per-line errors are attached to the field
+        itself so the admin shows them right where the operator needs
+        to fix them, not as a generic non-field error. See
+        parse_additional_route_coverage() for exactly what counts as
+        malformed (e.g. bare 'US 81' with no ':', or ': Saline' with
+        no route)."""
+        super().clean()
+        _rules, errors = parse_additional_route_coverage(self.additional_route_coverage)
+        if errors:
+            raise ValidationError({"additional_route_coverage": errors})
+
     @classmethod
     def load(cls):
         obj, _ = cls.objects.get_or_create(pk=1)
@@ -306,6 +398,18 @@ class RoadConditionsConfiguration(models.Model):
     @property
     def routes_set(self):
         return {r.strip() for r in self.routes.split(",") if r.strip()}
+
+    @property
+    def additional_route_coverage_rules(self):
+        """{route: {county, ...}} parsed from additional_route_coverage --
+        see parse_additional_route_coverage()'s docstring. Malformed
+        lines are silently dropped here (never contribute a rule,
+        never raise) -- clean() below is what stops malformed text from
+        being saved via the admin in the first place; this property
+        stays safe on its own regardless, since Model.save() alone
+        does not enforce that."""
+        rules, _errors = parse_additional_route_coverage(self.additional_route_coverage)
+        return rules
 
     @property
     def is_stale(self):

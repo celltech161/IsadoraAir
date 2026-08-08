@@ -67,6 +67,27 @@ def make_non_dict_raw_entry():
     return "this is not an event object"
 
 
+def make_multi_location_event(event_id, counties, routes):
+    """Builds a real, normalize_event()-compatible CARSEvent with
+    MULTIPLE counties and MULTIPLE distinct route locations -- for
+    proving corridor/scope matching considers the complete
+    routes/counties sets (RoadEvent.routes/counties), not just
+    primary_route or a single county, exactly as normalize_event()
+    itself does. `routes` becomes one location per route designator,
+    all attached to the same single detail (mirrors a real multi-
+    segment event)."""
+    raw = copy.deepcopy(load_fixture("event_construction.json"))
+    raw["event-id"] = event_id
+    raw["counties"] = list(counties)
+    template_location = raw["details"][0]["locations"][0]
+    raw["details"][0]["locations"] = []
+    for route in routes:
+        loc = copy.deepcopy(template_location)
+        loc["route-designator"] = route
+        raw["details"][0]["locations"].append(loc)
+    return raw
+
+
 class FakeCarsClient:
     def __init__(self, events=None, error=None):
         self.events = events if events is not None else []
@@ -754,3 +775,341 @@ class DuplicateEventIdTests(TestCase):
         ]))
         self.assertEqual(result["deactivated_count"], 1)
         self.assertFalse(RoadEvent.objects.get(external_id="CARS5-WILLVANISH").source_active)
+
+
+class ExistingScopeSemanticsUnchangedTests(TestCase):
+    """additional_route_coverage regression guard, part 1: the
+    pre-existing counties/routes AND-combined behavior must be exactly
+    unchanged now that _matches_scope() also considers corridor rules."""
+
+    def setUp(self):
+        self.config = RoadConditionsConfiguration.load()
+
+    def test_county_only_configuration_still_includes_all_matching_routes(self):
+        self.config.counties = "Ottawa"
+        self.config.routes = ""
+        self.config.save()
+        client = FakeCarsClient(events=[
+            make_event("CARS5-A", county="Ottawa", route="KS 18"),
+            make_event("CARS5-B", county="Ottawa", route="US 81"),
+        ])
+        result = sync_events(self.config, client=client)
+        self.assertEqual(result["relevant_count"], 2)
+
+    def test_route_only_configuration_still_matches_without_county_restriction(self):
+        self.config.counties = ""
+        self.config.routes = "US 81"
+        self.config.save()
+        client = FakeCarsClient(events=[
+            make_event("CARS5-A", county="Sedgwick", route="US 81"),
+            make_event("CARS5-B", county="Ottawa", route="US 81"),
+        ])
+        result = sync_events(self.config, client=client)
+        self.assertEqual(result["relevant_count"], 2)
+
+    def test_county_and_route_configuration_still_uses_and_semantics(self):
+        self.config.counties = "Ottawa"
+        self.config.routes = "US 81"
+        self.config.save()
+        client = FakeCarsClient(events=[
+            make_event("CARS5-MATCH", county="Ottawa", route="US 81"),
+            make_event("CARS5-WRONG-ROUTE", county="Ottawa", route="KS 18"),
+            make_event("CARS5-WRONG-COUNTY", county="Saline", route="US 81"),
+        ])
+        result = sync_events(self.config, client=client)
+        self.assertEqual(result["relevant_count"], 1)
+        self.assertTrue(RoadEvent.objects.filter(external_id="CARS5-MATCH").exists())
+
+    def test_blank_additional_route_coverage_is_identical_to_current_behavior(self):
+        self.config.counties = "Ottawa"
+        self.config.routes = ""
+        self.config.additional_route_coverage = ""
+        self.config.save()
+        client = FakeCarsClient(events=[
+            make_event("CARS5-IN", county="Ottawa", route="KS 18"),
+            make_event("CARS5-OUT", county="Saline", route="US 81"),
+        ])
+        result = sync_events(self.config, client=client)
+        self.assertEqual(result["relevant_count"], 1)
+        self.assertTrue(RoadEvent.objects.filter(external_id="CARS5-IN").exists())
+        self.assertFalse(RoadEvent.objects.filter(external_id="CARS5-OUT").exists())
+
+
+class AdditionalRouteCoverageScopeTests(TestCase):
+    """The immediate real-world configuration from the feature request:
+    counties=Ottawa, routes=blank, additional_route_coverage=
+    'US 81: Saline,Cloud' -- verifying every INCLUDE/EXCLUDE case
+    called out explicitly."""
+
+    def setUp(self):
+        self.config = RoadConditionsConfiguration.load()
+        self.config.counties = "Ottawa"
+        self.config.routes = ""
+        self.config.additional_route_coverage = "US 81: Saline,Cloud"
+        self.config.save()
+
+    def _relevant(self, event_id, county, route):
+        result = sync_events(self.config, client=FakeCarsClient(events=[make_event(event_id, county=county, route=route)]))
+        return result["relevant_count"] == 1 and RoadEvent.objects.filter(external_id=event_id).exists()
+
+    def test_ottawa_ks18_included(self):
+        self.assertTrue(self._relevant("CARS5-1", "Ottawa", "KS 18"))
+
+    def test_ottawa_us81_included_via_normal_county_coverage(self):
+        self.assertTrue(self._relevant("CARS5-2", "Ottawa", "US 81"))
+
+    def test_saline_us81_included_via_corridor(self):
+        self.assertTrue(self._relevant("CARS5-3", "Saline", "US 81"))
+
+    def test_cloud_us81_included_via_corridor(self):
+        self.assertTrue(self._relevant("CARS5-4", "Cloud", "US 81"))
+
+    def test_saline_i70_excluded(self):
+        self.assertFalse(self._relevant("CARS5-5", "Saline", "I-70"))
+
+    def test_saline_ks140_excluded(self):
+        self.assertFalse(self._relevant("CARS5-6", "Saline", "KS 140"))
+
+    def test_cloud_us24_excluded(self):
+        self.assertFalse(self._relevant("CARS5-7", "Cloud", "US 24"))
+
+    def test_cloud_ks9_excluded(self):
+        self.assertFalse(self._relevant("CARS5-8", "Cloud", "KS 9"))
+
+    def test_us81_outside_ottawa_saline_cloud_excluded(self):
+        self.assertFalse(self._relevant("CARS5-9", "Dickinson", "US 81"))
+
+    def test_all_cases_together_in_one_sync(self):
+        # Same scenario as above, but as a single fetch -- proves the
+        # per-event outcomes hold simultaneously, not just in isolation.
+        events = [
+            make_event("CARS5-INC-1", county="Ottawa", route="KS 18"),
+            make_event("CARS5-INC-2", county="Ottawa", route="US 81"),
+            make_event("CARS5-INC-3", county="Saline", route="US 81"),
+            make_event("CARS5-INC-4", county="Cloud", route="US 81"),
+            make_event("CARS5-EXC-1", county="Saline", route="I-70"),
+            make_event("CARS5-EXC-2", county="Saline", route="KS 140"),
+            make_event("CARS5-EXC-3", county="Cloud", route="US 24"),
+            make_event("CARS5-EXC-4", county="Cloud", route="KS 9"),
+            make_event("CARS5-EXC-5", county="Dickinson", route="US 81"),
+        ]
+        result = sync_events(self.config, client=FakeCarsClient(events=events))
+        self.assertEqual(result["relevant_count"], 4)
+        for event_id in ("CARS5-INC-1", "CARS5-INC-2", "CARS5-INC-3", "CARS5-INC-4"):
+            self.assertTrue(RoadEvent.objects.filter(external_id=event_id).exists(), event_id)
+        for event_id in ("CARS5-EXC-1", "CARS5-EXC-2", "CARS5-EXC-3", "CARS5-EXC-4", "CARS5-EXC-5"):
+            self.assertFalse(RoadEvent.objects.filter(external_id=event_id).exists(), event_id)
+
+
+class MultipleCorridorRulesTests(TestCase):
+    """Two independent corridor rules -- each must be evaluated on its
+    own; a route matching one rule's counties must not leak coverage
+    into an unrelated rule/route/county combination."""
+
+    def setUp(self):
+        self.config = RoadConditionsConfiguration.load()
+        # A county that appears on none of these test events -- blank
+        # counties means NO county restriction at all (matches
+        # everything), so isolating corridor behavior from normal
+        # county/route coverage requires a normal filter that's
+        # guaranteed to never match, not an empty one.
+        self.config.counties = "Nonexistent County"
+        self.config.routes = ""
+        self.config.additional_route_coverage = "US 81: Saline,Cloud\nI-70: Dickinson"
+        self.config.save()
+
+    def _relevant(self, event_id, county, route):
+        result = sync_events(self.config, client=FakeCarsClient(events=[make_event(event_id, county=county, route=route)]))
+        return result["relevant_count"] == 1
+
+    def test_us81_saline_included(self):
+        self.assertTrue(self._relevant("CARS5-1", "Saline", "US 81"))
+
+    def test_us81_cloud_included(self):
+        self.assertTrue(self._relevant("CARS5-2", "Cloud", "US 81"))
+
+    def test_i70_dickinson_included(self):
+        self.assertTrue(self._relevant("CARS5-3", "Dickinson", "I-70"))
+
+    def test_i70_saline_excluded(self):
+        # I-70's rule only lists Dickinson -- Saline must not leak in
+        # just because Saline is a county on the OTHER rule (US 81's).
+        self.assertFalse(self._relevant("CARS5-4", "Saline", "I-70"))
+
+    def test_us81_dickinson_excluded(self):
+        # Symmetric case: US 81's rule only lists Saline/Cloud --
+        # Dickinson must not leak in from I-70's rule.
+        self.assertFalse(self._relevant("CARS5-5", "Dickinson", "US 81"))
+
+    def test_unrelated_route_and_county_excluded(self):
+        self.assertFalse(self._relevant("CARS5-6", "Sedgwick", "KS 4"))
+
+
+class MultiRouteMultiCountyEventScopeTests(TestCase):
+    """A real CARS event can carry multiple routes/counties at once
+    (RoadEvent.routes/counties, populated from EVERY detail location --
+    see services.all_routes()). A corridor rule must match if ANY of
+    the event's routes matches the rule's route AND ANY of the event's
+    counties is in the rule's county set -- never relying only on
+    primary_route (the first location) or a single county."""
+
+    def setUp(self):
+        self.config = RoadConditionsConfiguration.load()
+        # Same reasoning as MultipleCorridorRulesTests.setUp -- blank
+        # counties means unrestricted, so use a never-matching sentinel
+        # to actually isolate corridor behavior.
+        self.config.counties = "Nonexistent County"
+        self.config.routes = ""
+        self.config.additional_route_coverage = "US 81: Saline,Cloud"
+        self.config.save()
+
+    def test_matches_when_us81_is_a_secondary_route_not_primary(self):
+        # KS 18 is the FIRST (primary) location; US 81 is a second,
+        # later one on the same event -- primary_route alone would miss
+        # this, RoadEvent.routes must not.
+        raw = make_multi_location_event("CARS5-1", counties=["Saline"], routes=["KS 18", "US 81"])
+        result = sync_events(self.config, client=FakeCarsClient(events=[raw]))
+        self.assertEqual(result["relevant_count"], 1)
+
+    def test_matches_when_matching_county_is_not_the_first_county(self):
+        raw = make_multi_location_event("CARS5-2", counties=["Sedgwick", "Cloud"], routes=["US 81"])
+        result = sync_events(self.config, client=FakeCarsClient(events=[raw]))
+        self.assertEqual(result["relevant_count"], 1)
+
+    def test_excluded_when_no_county_matches_despite_route_matching(self):
+        raw = make_multi_location_event("CARS5-3", counties=["Sedgwick", "Dickinson"], routes=["US 81"])
+        result = sync_events(self.config, client=FakeCarsClient(events=[raw]))
+        self.assertEqual(result["relevant_count"], 0)
+
+    def test_excluded_when_no_route_matches_despite_county_matching(self):
+        raw = make_multi_location_event("CARS5-4", counties=["Saline"], routes=["KS 18", "I-70"])
+        result = sync_events(self.config, client=FakeCarsClient(events=[raw]))
+        self.assertEqual(result["relevant_count"], 0)
+
+
+class KnownLimitationEventLevelCorridorMatchingTests(TestCase):
+    """Documents a deliberate, accepted limitation -- NOT a bug --
+    raised in review: corridor matching checks `route in event.routes`
+    and `event.counties & rule.counties` independently against an
+    event's COMPLETE routes/counties sets, not a verified route-to-
+    county pairing for one specific segment. This is not a shortcut
+    taken for convenience -- the source CARS API genuinely has no such
+    pairing to check against:
+
+      * confirmed via the live API's own swagger schema
+        (scratchpad/road_conditions/cars-api-swagger.json, not
+        committed): `counties` is a top-level CARSEvent property,
+        sibling to `geometry`/`recipients`/etc; neither the `Detail`
+        schema nor any `Location` variant (`LinkLocation`/`GeoLocation`/
+        `RestAreaLocation`) has a county field at all;
+      * confirmed via normalize_event()'s own extraction:
+        RoadEvent.locations stores location_type/route_designator/
+        direction/latitude/longitude per location -- deliberately no
+        county, because the source never provides one to store.
+
+    So a constructed event with routes={"US 81","KS 9"} and
+    counties={"Ottawa","Cloud"} matches a "US 81: Cloud" rule below
+    even though, hypothetically, the real-world correspondence could
+    be US 81<->Ottawa and KS 9<->Cloud -- _matches_scope() has no way
+    to tell the two apart and does not claim to (see its own
+    docstring's "KNOWN LIMITATION" section).
+
+    Per a real 231-event live capture (2026-08-04 reconnaissance,
+    scratchpad/road_conditions/live_probes/events_all.json, not
+    committed): 44 events had multiple counties (a single route
+    spanning a county line -- no ambiguity, since there's only one
+    route), but ZERO had more than one distinct route. This gap is
+    real per the schema but has not been observed in practice."""
+
+    def setUp(self):
+        self.config = RoadConditionsConfiguration.load()
+        self.config.counties = "Nonexistent County"
+        self.config.routes = ""
+        self.config.additional_route_coverage = "US 81: Cloud"
+        self.config.save()
+
+    def test_documents_cross_route_county_match_despite_no_verified_pairing(self):
+        # US 81 and Cloud both appear somewhere on this event -- current,
+        # documented behavior matches it, even though the fixture makes
+        # no claim (and the source data COULD NOT make a claim) that the
+        # US 81 segment specifically is the one located in Cloud County.
+        raw = make_multi_location_event("CARS5-AMBIGUOUS", counties=["Ottawa", "Cloud"], routes=["US 81", "KS 9"])
+        result = sync_events(self.config, client=FakeCarsClient(events=[raw]))
+        self.assertEqual(result["relevant_count"], 1)
+        self.assertTrue(RoadEvent.objects.filter(external_id="CARS5-AMBIGUOUS").exists())
+
+    def test_documents_match_even_when_hypothetical_true_pairing_would_be_the_other_way(self):
+        # Same event shape, but with the routes/counties order reversed
+        # in the source lists -- proves the match doesn't depend on
+        # position/order (there's no per-position pairing to depend on).
+        raw = make_multi_location_event("CARS5-REVERSED", counties=["Cloud", "Ottawa"], routes=["KS 9", "US 81"])
+        result = sync_events(self.config, client=FakeCarsClient(events=[raw]))
+        self.assertEqual(result["relevant_count"], 1)
+
+
+class CorridorMatchStillObeysGlobalFiltersTests(TestCase):
+    """A corridor rule only ever widens GEOGRAPHIC scope -- it must
+    never exempt a matched event from min_priority/max_event_age_days/
+    lookahead_days."""
+
+    def setUp(self):
+        self.config = RoadConditionsConfiguration.load()
+        self.config.counties = "Ottawa"
+        self.config.routes = ""
+        self.config.additional_route_coverage = "US 81: Saline,Cloud"
+        self.config.save()
+
+    def test_corridor_match_still_excluded_by_min_priority(self):
+        self.config.min_priority = 8
+        self.config.save()
+        low_priority = make_event("CARS5-LOW", county="Saline", route="US 81", priority=3)
+        result = sync_events(self.config, client=FakeCarsClient(events=[low_priority]))
+        self.assertEqual(result["relevant_count"], 0)
+
+    def test_corridor_match_included_when_priority_is_sufficient(self):
+        self.config.min_priority = 8
+        self.config.save()
+        high_priority = make_event("CARS5-HIGH", county="Saline", route="US 81", priority=9)
+        result = sync_events(self.config, client=FakeCarsClient(events=[high_priority]))
+        self.assertEqual(result["relevant_count"], 1)
+
+    def test_corridor_match_still_excluded_by_max_event_age_days(self):
+        self.config.max_event_age_days = 3
+        self.config.save()
+        old_event = make_event("CARS5-OLD", county="Cloud", route="US 81", end_days_from_now=-30)
+        result = sync_events(self.config, client=FakeCarsClient(events=[old_event]))
+        self.assertEqual(result["relevant_count"], 0)
+
+    def test_corridor_match_still_excluded_by_lookahead_days(self):
+        self.config.lookahead_days = 30
+        self.config.save()
+        far_future = make_event("CARS5-FAR", county="Cloud", route="US 81", start_days_from_now=365)
+        result = sync_events(self.config, client=FakeCarsClient(events=[far_future]))
+        self.assertEqual(result["relevant_count"], 0)
+
+
+class MalformedAdditionalRouteCoverageDoesNotBroadenSyncTests(TestCase):
+    """Belt-and-suspenders alongside AdditionalRouteCoverageParsingTests
+    (test_config.py) -- proves malformed corridor text never widens
+    matching during an actual sync, even if it somehow got saved
+    without going through RoadConditionsConfiguration.clean() (e.g.
+    direct ORM/shell access, which does not call full_clean())."""
+
+    def setUp(self):
+        self.config = RoadConditionsConfiguration.load()
+        self.config.counties = "Ottawa"
+        self.config.routes = ""
+
+    def test_bare_route_with_no_colon_matches_nothing_statewide(self):
+        self.config.additional_route_coverage = "US 81"
+        self.config.save()
+        client = FakeCarsClient(events=[make_event("CARS5-1", county="Sedgwick", route="US 81")])
+        result = sync_events(self.config, client=client)
+        self.assertEqual(result["relevant_count"], 0)
+
+    def test_county_only_line_matches_no_route(self):
+        self.config.additional_route_coverage = ": Saline"
+        self.config.save()
+        client = FakeCarsClient(events=[make_event("CARS5-1", county="Saline", route="KS 4")])
+        result = sync_events(self.config, client=client)
+        self.assertEqual(result["relevant_count"], 0)

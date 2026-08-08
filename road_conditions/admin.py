@@ -46,9 +46,15 @@ class RoadConditionsConfigurationAdmin(admin.ModelAdmin):
             "fields": ["api_base_url", "request_timeout_seconds", "poll_cadence_minutes"],
         }),
         ("Coverage Area", {
-            "fields": ["event_classifications", "counties", "routes", "min_priority"],
+            "fields": ["event_classifications", "counties", "routes", "additional_route_coverage", "min_priority"],
             "description": "There is no bounding-box/radius filter -- the live CARS API has none. "
                             "Counties and routes are matched against the exact strings KDOT's API returns. "
+                            "Counties/Routes define the normal coverage area (Routes further restricts Counties "
+                            "when both are set, i.e. county AND route). Additional Route Coverage adds "
+                            "exceptions on top -- one 'ROUTE: County,County' rule per line, e.g. 'US 81: "
+                            "Saline,Cloud' -- each rule means that exact route in those counties only, kept "
+                            "even if it wouldn't otherwise match Counties/Routes above. Malformed lines are "
+                            "rejected when this page is saved rather than silently broadening coverage. "
                             "Changing any of these only affects RoadEvent.in_scope on the NEXT complete sync -- "
                             "existing rows are re-scoped then, not retroactively deleted or hidden immediately.",
         }),
