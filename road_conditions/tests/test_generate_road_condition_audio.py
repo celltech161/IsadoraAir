@@ -532,9 +532,14 @@ class TextFilePersistenceCommandTests(KanDriveSynthesisFixtureMixin, Transaction
         call_command("generate_road_condition_audio", "--voice", "day", stdout=StringIO())
         good_text = road_report_text_path().read_text(encoding="utf-8")
 
+        # --regenerate forces past the fingerprint dedup skip -- without
+        # it, this second call would now be a genuinely unchanged report
+        # (same event, same config) and would correctly be SKIPPED
+        # before ever reaching Kokoro (see FingerprintSkipBehaviorTests),
+        # never exercising the failure path this test means to check.
         self._kokoro_should_fail = True
         with self.assertRaises(CommandError):
-            call_command("generate_road_condition_audio", "--voice", "day", stdout=StringIO())
+            call_command("generate_road_condition_audio", "--voice", "day", "--regenerate", stdout=StringIO())
 
         self.assertEqual(road_report_text_path().read_text(encoding="utf-8"), good_text)
 
@@ -712,3 +717,479 @@ class TransitionSoundEndToEndCommandTests(KanDriveSynthesisFixtureMixin, Transac
             make_road_event(external_id="C", headline_category="warning", description="Event three.")
             call_command("generate_road_condition_audio", "--voice", "day", stdout=StringIO())
         self.assertEqual(self._kokoro_call_count, 3)
+
+
+# ---------------------------------------------------------------------
+# Change-detection / fingerprinting -- generate_road_condition_audio
+# skips the expensive Kokoro/ffmpeg/analysis pipeline when the report
+# is genuinely unchanged AND the existing artifacts are still healthy.
+# All real synthesize_road_report() calls below (Kokoro/ffmpeg faked
+# only at the subprocess boundary via KanDriveSynthesisFixtureMixin),
+# not mocked at the command's own import point -- the skip decision
+# reads real filesystem/DB state (FLAC/Track/road_report.txt), so a
+# genuine first generation is needed before a second call can
+# meaningfully prove the skip (or forced-regeneration) behavior.
+# ---------------------------------------------------------------------
+
+class FingerprintSkipBehaviorTests(KanDriveSynthesisFixtureMixin, TransactionTestCase):
+    def setUp(self):
+        super().setUp()
+        make_fresh_config()
+
+    def test_first_successful_generation_synthesizes_and_stores_fingerprint_and_time(self):
+        make_road_event(external_id="A", headline_category="closure", description="Road closed.")
+        config = RoadConditionsConfiguration.load()
+        self.assertEqual(config.last_report_fingerprint, "")
+        self.assertIsNone(config.last_report_generated_at)
+
+        call_command("generate_road_condition_audio", "--voice", "day", stdout=StringIO())
+
+        self.assertEqual(self._kokoro_call_count, 1)
+        config.refresh_from_db()
+        self.assertEqual(len(config.last_report_fingerprint), 64)
+        self.assertIsNotNone(config.last_report_generated_at)
+
+    def test_second_identical_generation_skips_synthesis(self):
+        make_road_event(external_id="A", headline_category="closure", description="Road closed.")
+        call_command("generate_road_condition_audio", "--voice", "day", stdout=StringIO())
+        self.assertEqual(self._kokoro_call_count, 1)
+
+        with patch(f"{CMD}.synthesize_road_report") as mock_synth:
+            out = StringIO()
+            call_command("generate_road_condition_audio", "--voice", "day", stdout=out)
+            mock_synth.assert_not_called()
+        self.assertIn("unchanged since last successful generation", out.getvalue())
+
+    def test_skipped_run_does_not_update_last_report_generated_at(self):
+        make_road_event(external_id="A", headline_category="closure", description="Road closed.")
+        call_command("generate_road_condition_audio", "--voice", "day", stdout=StringIO())
+        config = RoadConditionsConfiguration.load()
+        first_timestamp = config.last_report_generated_at
+        first_fingerprint = config.last_report_fingerprint
+
+        call_command("generate_road_condition_audio", "--voice", "day", stdout=StringIO())
+        config.refresh_from_db()
+        self.assertEqual(config.last_report_generated_at, first_timestamp)
+        self.assertEqual(config.last_report_fingerprint, first_fingerprint)
+
+    def test_skipped_run_does_not_rewrite_road_report_text(self):
+        make_road_event(external_id="A", headline_category="closure", description="Road closed.")
+        call_command("generate_road_condition_audio", "--voice", "day", stdout=StringIO())
+
+        with patch(f"{CMD}.write_road_report_text") as mock_write:
+            call_command("generate_road_condition_audio", "--voice", "day", stdout=StringIO())
+            mock_write.assert_not_called()
+
+    def test_skipped_run_does_not_run_track_analysis(self):
+        # synthesize_road_report is what calls _run_full_analysis --
+        # already proven not-called above, but this asserts the
+        # analysis step specifically, in case that internal wiring
+        # ever changes independently of the outer synthesis call.
+        make_road_event(external_id="A", headline_category="closure", description="Road closed.")
+        call_command("generate_road_condition_audio", "--voice", "day", stdout=StringIO())
+
+        from road_conditions import synthesis as synthesis_module
+        with patch.object(synthesis_module, "_run_full_analysis") as mock_analysis:
+            call_command("generate_road_condition_audio", "--voice", "day", stdout=StringIO())
+            mock_analysis.assert_not_called()
+
+    def test_skipped_run_exits_successfully(self):
+        make_road_event(external_id="A", headline_category="closure", description="Road closed.")
+        call_command("generate_road_condition_audio", "--voice", "day", stdout=StringIO())
+        # A second, skipped call must not raise -- a successful no-op,
+        # not an error (nothing here is wrapped in assertRaises).
+        call_command("generate_road_condition_audio", "--voice", "day", stdout=StringIO())
+
+
+class ArtifactHealthGuardTests(KanDriveSynthesisFixtureMixin, TransactionTestCase):
+    """A matching fingerprint alone is NOT enough to skip -- every
+    listed artifact-health condition must independently force
+    regeneration even though the fingerprint would otherwise match."""
+
+    def setUp(self):
+        super().setUp()
+        make_fresh_config()
+        make_road_event(external_id="A", headline_category="closure", description="Road closed.")
+
+    def _generate_once(self):
+        call_command("generate_road_condition_audio", "--voice", "day", stdout=StringIO())
+
+    def test_missing_flac_forces_regeneration(self):
+        self._generate_once()
+        road_report_path().unlink()
+
+        call_command("generate_road_condition_audio", "--voice", "day", stdout=StringIO())
+        self.assertEqual(self._kokoro_call_count, 2)
+        self.assertTrue(road_report_path().exists())
+
+    def test_missing_track_forces_regeneration(self):
+        self._generate_once()
+        Track.objects.filter(filepath=str(road_report_path())).delete()
+
+        call_command("generate_road_condition_audio", "--voice", "day", stdout=StringIO())
+        self.assertEqual(self._kokoro_call_count, 2)
+        self.assertTrue(Track.objects.filter(filepath=str(road_report_path())).exists())
+
+    def test_ready2air_false_forces_regeneration(self):
+        self._generate_once()
+        Track.objects.filter(filepath=str(road_report_path())).update(ready2air=False)
+
+        call_command("generate_road_condition_audio", "--voice", "day", stdout=StringIO())
+        self.assertEqual(self._kokoro_call_count, 2)
+        self.assertTrue(Track.objects.get(filepath=str(road_report_path())).ready2air)
+
+    def test_missing_text_file_forces_regeneration(self):
+        self._generate_once()
+        road_report_text_path().unlink()
+
+        call_command("generate_road_condition_audio", "--voice", "day", stdout=StringIO())
+        self.assertEqual(self._kokoro_call_count, 2)
+        self.assertTrue(road_report_text_path().exists())
+
+    def test_mismatched_text_file_forces_regeneration(self):
+        self._generate_once()
+        road_report_text_path().write_text("Some tampered/mismatched content.", encoding="utf-8")
+
+        call_command("generate_road_condition_audio", "--voice", "day", stdout=StringIO())
+        self.assertEqual(self._kokoro_call_count, 2)
+
+
+class RetirementRecoveryRegressionTests(KanDriveSynthesisFixtureMixin, TransactionTestCase):
+    """The exact scenario called out in the fingerprinting task:
+
+      12:00 report generated (fingerprint=ABC, Track ready2air=True)
+      12:30 source feed fails -- report retired (ready2air=False)
+      13:00 source recovers -- road conditions themselves never
+            changed, so the fingerprint is STILL ABC
+
+    The 13:00 run MUST regenerate/reactivate the report rather than
+    skip merely because the hash matches."""
+
+    def test_stale_retirement_then_fresh_recovery_regenerates_not_skips(self):
+        make_road_event(external_id="A", headline_category="closure", description="Road closed.")
+        config = make_fresh_config()
+
+        # 12:00 -- real generation.
+        call_command("generate_road_condition_audio", "--voice", "day", stdout=StringIO())
+        self.assertEqual(self._kokoro_call_count, 1)
+        fingerprint_after_first_generation = RoadConditionsConfiguration.load().last_report_fingerprint
+        self.assertNotEqual(fingerprint_after_first_generation, "")
+
+        # 12:30 -- feed goes stale; report retired. Reload first --
+        # `config` above is stale in memory (its own
+        # last_report_fingerprint is still "" from before the 12:00
+        # generation wrote it) -- a plain .save() with the old in-memory
+        # object would silently blow away the fingerprint the real
+        # generation just persisted, which would invalidate this whole
+        # regression test.
+        config = RoadConditionsConfiguration.load()
+        config.last_error = ""
+        config.last_fetch_succeeded_at = dj_timezone.now() - timedelta(days=5)
+        config.stale_data_threshold_minutes = 60
+        config.save()
+        call_command("generate_road_condition_audio", stdout=StringIO())  # retires, does not generate
+        self.assertEqual(self._kokoro_call_count, 1)  # still just the one real call
+        self.assertFalse(Track.objects.get(filepath=str(road_report_path())).ready2air)
+        # Retirement never touches the fingerprint -- it's still ABC.
+        self.assertEqual(RoadConditionsConfiguration.load().last_report_fingerprint, fingerprint_after_first_generation)
+
+        # 13:00 -- feed recovers; the underlying RoadEvent never
+        # changed, so a naive fingerprint-only check would still match.
+        config = RoadConditionsConfiguration.load()
+        config.last_error = ""
+        config.last_fetch_succeeded_at = dj_timezone.now()
+        config.save()
+        out = StringIO()
+        call_command("generate_road_condition_audio", "--voice", "day", stdout=out)
+
+        self.assertEqual(self._kokoro_call_count, 2)  # regenerated, NOT skipped
+        self.assertNotIn("unchanged since last successful generation", out.getvalue())
+        self.assertTrue(Track.objects.get(filepath=str(road_report_path())).ready2air)
+
+
+class FailureLifecycleFingerprintTests(KanDriveSynthesisFixtureMixin, TransactionTestCase):
+    def setUp(self):
+        super().setUp()
+        make_fresh_config()
+        make_road_event(external_id="A", headline_category="closure", description="Road closed.")
+
+    def test_synthesis_failure_does_not_update_fingerprint_or_time(self):
+        self._kokoro_should_fail = True
+        with self.assertRaises(CommandError):
+            call_command("generate_road_condition_audio", "--voice", "day", stdout=StringIO())
+        config = RoadConditionsConfiguration.load()
+        self.assertEqual(config.last_report_fingerprint, "")
+        self.assertIsNone(config.last_report_generated_at)
+
+    def test_analysis_failure_does_not_update_fingerprint_or_time(self):
+        from road_conditions import synthesis as synthesis_module
+        with patch.object(synthesis_module, "_run_full_analysis", return_value=False):
+            with self.assertRaises(CommandError):
+                call_command("generate_road_condition_audio", "--voice", "day", stdout=StringIO())
+        config = RoadConditionsConfiguration.load()
+        self.assertEqual(config.last_report_fingerprint, "")
+        self.assertIsNone(config.last_report_generated_at)
+
+    def test_text_file_write_failure_does_not_update_fingerprint_or_time(self):
+        with patch(f"{CMD}.write_road_report_text", side_effect=OSError("disk full")):
+            with self.assertRaises(CommandError):
+                call_command("generate_road_condition_audio", "--voice", "day", stdout=StringIO())
+        config = RoadConditionsConfiguration.load()
+        self.assertEqual(config.last_report_fingerprint, "")
+        self.assertIsNone(config.last_report_generated_at)
+
+    def test_previous_successful_fingerprint_remains_intact_after_failed_newer_attempt(self):
+        call_command("generate_road_condition_audio", "--voice", "day", stdout=StringIO())
+        good_config = RoadConditionsConfiguration.load()
+        good_fingerprint = good_config.last_report_fingerprint
+        good_time = good_config.last_report_generated_at
+
+        # A DIFFERENT preamble so a coincidental identical fingerprint
+        # can't mask a regression -- same idiom this file already uses
+        # for the text-file equivalent (see
+        # test_waveform_analysis_failure_leaves_previous_text_file_untouched).
+        config = RoadConditionsConfiguration.load()
+        config.report_preamble = "A DIFFERENT PREAMBLE FOR THE FAILING RUN."
+        config.save()
+
+        self._kokoro_should_fail = True
+        with self.assertRaises(CommandError):
+            call_command("generate_road_condition_audio", "--voice", "day", stdout=StringIO())
+
+        config.refresh_from_db()
+        self.assertEqual(config.last_report_fingerprint, good_fingerprint)
+        self.assertEqual(config.last_report_generated_at, good_time)
+
+
+class RegenerateAndForceCliOptionTests(KanDriveSynthesisFixtureMixin, TransactionTestCase):
+    def setUp(self):
+        super().setUp()
+        make_fresh_config()
+        make_road_event(external_id="A", headline_category="closure", description="Road closed.")
+
+    def test_regenerate_forces_synthesis_when_fingerprint_matches(self):
+        call_command("generate_road_condition_audio", "--voice", "day", stdout=StringIO())
+        self.assertEqual(self._kokoro_call_count, 1)
+
+        out = StringIO()
+        call_command("generate_road_condition_audio", "--voice", "day", "--regenerate", stdout=out)
+        self.assertEqual(self._kokoro_call_count, 2)  # regenerated, not skipped
+        self.assertNotIn("unchanged since last successful generation", out.getvalue())
+
+    def test_regenerate_does_not_bypass_freshness_safety(self):
+        config = RoadConditionsConfiguration.load()
+        config.last_error = "boom"  # feed failed
+        config.save()
+
+        out = StringIO()
+        call_command("generate_road_condition_audio", "--regenerate", stdout=out)
+        self.assertEqual(self._kokoro_call_count, 0)  # never reached synthesis -- retired instead
+        self.assertIn("failed", out.getvalue().lower())
+
+    def test_force_alone_still_skips_an_unchanged_healthy_report(self):
+        # --force only bypasses the freshness gate -- fingerprint dedup
+        # behaves normally unless --regenerate is ALSO given.
+        call_command("generate_road_condition_audio", "--voice", "day", stdout=StringIO())
+        self.assertEqual(self._kokoro_call_count, 1)
+
+        out = StringIO()
+        call_command("generate_road_condition_audio", "--voice", "day", "--force", stdout=out)
+        self.assertEqual(self._kokoro_call_count, 1)  # still skipped
+        self.assertIn("unchanged since last successful generation", out.getvalue())
+
+    def test_force_and_regenerate_combo_bypasses_both(self):
+        config = RoadConditionsConfiguration.load()
+        config.last_error = "boom"  # feed failed -- never recovers in this test
+        config.save()
+
+        call_command("generate_road_condition_audio", "--voice", "day", "--force", stdout=StringIO())
+        self.assertEqual(self._kokoro_call_count, 1)
+
+        out = StringIO()
+        call_command("generate_road_condition_audio", "--voice", "day", "--force", "--regenerate", stdout=out)
+        self.assertEqual(self._kokoro_call_count, 2)  # bypassed BOTH freshness and fingerprint dedup
+        self.assertNotIn("unchanged since last successful generation", out.getvalue())
+
+
+class DryRunFingerprintReportingTests(KanDriveSynthesisFixtureMixin, TransactionTestCase):
+    def setUp(self):
+        super().setUp()
+        make_fresh_config()
+        make_road_event(external_id="A", headline_category="closure", description="Road closed.")
+
+    def test_dry_run_reports_fingerprint_lines(self):
+        out = StringIO()
+        call_command("generate_road_condition_audio", "--dry-run", "--voice", "day", stdout=out)
+        output = out.getvalue()
+        self.assertIn("[DRY RUN] Report fingerprint:", output)
+        self.assertIn("[DRY RUN] Existing successful fingerprint:", output)
+        self.assertIn("[DRY RUN] Would skip generation:", output)
+        self.assertEqual(self._kokoro_call_count, 0)
+
+    def test_dry_run_would_skip_no_when_nothing_generated_yet(self):
+        out = StringIO()
+        call_command("generate_road_condition_audio", "--dry-run", "--voice", "day", stdout=out)
+        self.assertIn("Would skip generation: no", out.getvalue())
+        self.assertIn("Existing successful fingerprint: (none)", out.getvalue())
+
+    def test_dry_run_would_skip_yes_when_unchanged_and_healthy(self):
+        call_command("generate_road_condition_audio", "--voice", "day", stdout=StringIO())
+        out = StringIO()
+        call_command("generate_road_condition_audio", "--dry-run", "--voice", "day", stdout=out)
+        self.assertIn("Would skip generation: yes", out.getvalue())
+        self.assertEqual(self._kokoro_call_count, 1)  # dry run never actually synthesizes
+
+    def test_dry_run_would_skip_no_when_changed(self):
+        call_command("generate_road_condition_audio", "--voice", "day", stdout=StringIO())
+        config = RoadConditionsConfiguration.load()
+        config.report_preamble = "A CHANGED PREAMBLE."
+        config.save()
+
+        out = StringIO()
+        call_command("generate_road_condition_audio", "--dry-run", "--voice", "day", stdout=out)
+        self.assertIn("Would skip generation: no", out.getvalue())
+
+    def test_dry_run_would_skip_no_when_regenerate_passed(self):
+        call_command("generate_road_condition_audio", "--voice", "day", stdout=StringIO())
+        out = StringIO()
+        call_command("generate_road_condition_audio", "--dry-run", "--voice", "day", "--regenerate", stdout=out)
+        self.assertIn("Would skip generation: no", out.getvalue())
+
+    def test_dry_run_never_writes_config_fingerprint_fields(self):
+        call_command("generate_road_condition_audio", "--voice", "day", stdout=StringIO())
+        good_config = RoadConditionsConfiguration.load()
+        fingerprint_before = good_config.last_report_fingerprint
+        time_before = good_config.last_report_generated_at
+
+        call_command("generate_road_condition_audio", "--dry-run", "--voice", "day", stdout=StringIO())
+
+        config = RoadConditionsConfiguration.load()
+        self.assertEqual(config.last_report_fingerprint, fingerprint_before)
+        self.assertEqual(config.last_report_generated_at, time_before)
+
+
+class TextOnlyIgnoresFingerprintDedupTests(KanDriveSynthesisFixtureMixin, TransactionTestCase):
+    def setUp(self):
+        super().setUp()
+        make_fresh_config()
+
+    def test_text_only_still_prints_full_text_even_when_report_is_unchanged(self):
+        make_road_event(external_id="A", headline_category="closure", description="Road closed.")
+        call_command("generate_road_condition_audio", "--voice", "day", stdout=StringIO())
+
+        out = StringIO()
+        call_command("generate_road_condition_audio", "--text-only", "--voice", "day", stdout=out)
+        self.assertIn("Road closed.", out.getvalue())
+        self.assertNotIn("unchanged since last successful generation", out.getvalue())
+
+    def test_text_only_never_updates_fingerprint_state(self):
+        make_road_event(external_id="A", headline_category="closure", description="Road closed.")
+        call_command("generate_road_condition_audio", "--voice", "day", stdout=StringIO())
+        fingerprint_before = RoadConditionsConfiguration.load().last_report_fingerprint
+
+        call_command("generate_road_condition_audio", "--text-only", "--voice", "day", stdout=StringIO())
+        self.assertEqual(RoadConditionsConfiguration.load().last_report_fingerprint, fingerprint_before)
+
+
+class EventIdOutsideFingerprintTests(KanDriveSynthesisFixtureMixin, TransactionTestCase):
+    def setUp(self):
+        super().setUp()
+        make_fresh_config()
+
+    def test_event_id_never_touches_fingerprint_state(self):
+        make_road_event(external_id="A", headline_category="closure", description="Road closed.")
+        call_command("generate_road_condition_audio", "--voice", "day", stdout=StringIO())
+        fingerprint_before = RoadConditionsConfiguration.load().last_report_fingerprint
+
+        call_command("generate_road_condition_audio", "--event-id", "A", "--text-only", stdout=StringIO())
+        self.assertEqual(RoadConditionsConfiguration.load().last_report_fingerprint, fingerprint_before)
+
+
+class FramingAndVoiceChangeForcesRegenerationTests(KanDriveSynthesisFixtureMixin, TransactionTestCase):
+    def setUp(self):
+        super().setUp()
+        make_fresh_config()
+        make_road_event(external_id="A", headline_category="closure", description="Road closed.")
+
+    def test_editing_preamble_forces_regeneration(self):
+        call_command("generate_road_condition_audio", "--voice", "day", stdout=StringIO())
+        self.assertEqual(self._kokoro_call_count, 1)
+
+        config = RoadConditionsConfiguration.load()
+        config.report_preamble = "A BRAND NEW PREAMBLE."
+        config.save()
+
+        out = StringIO()
+        call_command("generate_road_condition_audio", "--voice", "day", stdout=out)
+        self.assertEqual(self._kokoro_call_count, 2)
+        self.assertNotIn("unchanged since last successful generation", out.getvalue())
+
+    def test_editing_postamble_forces_regeneration(self):
+        call_command("generate_road_condition_audio", "--voice", "day", stdout=StringIO())
+        self.assertEqual(self._kokoro_call_count, 1)
+
+        config = RoadConditionsConfiguration.load()
+        config.report_postamble = "A BRAND NEW POSTAMBLE."
+        config.save()
+
+        call_command("generate_road_condition_audio", "--voice", "day", stdout=StringIO())
+        self.assertEqual(self._kokoro_call_count, 2)
+
+    def test_voice_model_change_forces_regeneration(self):
+        # Same slot/name, different model -- the model behind an
+        # announcer name changing must still force regeneration (see
+        # report.compute_report_fingerprint()'s own docstring).
+        voice_v1 = {"engine": "kokoro", "model": "af_jessica", "name": "Claira", "full_name": "Claira Sky"}
+        voice_v2 = {"engine": "kokoro", "model": "af_jessica_v2", "name": "Claira", "full_name": "Claira Sky"}
+
+        with patch(f"{CMD}.resolve_voice", return_value=("day", voice_v1)):
+            call_command("generate_road_condition_audio", stdout=StringIO())
+        self.assertEqual(self._kokoro_call_count, 1)
+
+        with patch(f"{CMD}.resolve_voice", return_value=("day", voice_v2)):
+            out = StringIO()
+            call_command("generate_road_condition_audio", stdout=out)
+        self.assertEqual(self._kokoro_call_count, 2)
+        self.assertNotIn("unchanged since last successful generation", out.getvalue())
+
+
+class PlannedEventTransitionFingerprintTests(KanDriveSynthesisFixtureMixin, TransactionTestCase):
+    """report.py's own planned/future-event wording (see
+    report._planned_prefix()) can change the final composed text purely
+    because wall-clock time crosses an event's start_time -- even
+    though KDOT's own record (and therefore RoadEvent.payload_checksum)
+    never changed. The fingerprint is based on the actual generated
+    final text, so this must force regeneration rather than being
+    optimized away by a source-level checksum."""
+
+    def test_same_stored_event_before_and_after_start_time_forces_regeneration(self):
+        reference = dj_timezone.now()
+        start_time = reference + timedelta(hours=2)
+        make_road_event(
+            external_id="CARS5-PLANNED", headline_category="roadwork",
+            description="Lane closure ahead.", start_time=start_time,
+        )
+        config = make_fresh_config()
+        # Tolerate the multi-hour mocked time jump below without the
+        # feed itself looking stale -- unrelated to what this test
+        # actually checks.
+        config.stale_data_threshold_minutes = 24 * 60
+        config.save()
+
+        with patch("django.utils.timezone.now", return_value=reference):
+            call_command("generate_road_condition_audio", "--voice", "day", stdout=StringIO())
+        self.assertEqual(self._kokoro_call_count, 1)
+        text_before = road_report_text_path().read_text(encoding="utf-8")
+        self.assertIn("Beginning", text_before)  # planned-work wording
+        fingerprint_before = RoadConditionsConfiguration.load().last_report_fingerprint
+
+        after_start = start_time + timedelta(hours=1)
+        with patch("django.utils.timezone.now", return_value=after_start):
+            out = StringIO()
+            call_command("generate_road_condition_audio", "--voice", "day", stdout=out)
+
+        self.assertEqual(self._kokoro_call_count, 2)  # regenerated, NOT skipped
+        self.assertNotIn("unchanged since last successful generation", out.getvalue())
+        text_after = road_report_text_path().read_text(encoding="utf-8")
+        self.assertNotIn("Beginning", text_after)  # no longer planned -- now in effect
+        self.assertNotEqual(RoadConditionsConfiguration.load().last_report_fingerprint, fingerprint_before)

@@ -356,6 +356,44 @@ class RoadConditionsConfiguration(models.Model):
     last_error = models.TextField(blank=True, editable=False)
     last_record_count = models.PositiveIntegerField(null=True, blank=True, editable=False)
 
+    # Report-generation change-detection state -- see report.py's
+    # compute_report_fingerprint() for what's hashed and why (the
+    # final composed script, resolved voice identity, and actual
+    # transition-sound behavior -- deliberately NOT just RoadEvent.
+    # payload_checksum, which can't capture a preamble edit, a voice
+    # model change, or an event's own wording changing purely because
+    # wall-clock time crossed its start_time). Both fields represent
+    # the LAST generation cycle that completed successfully start to
+    # finish (Kokoro synthesis, FLAC installation, Track update, AND
+    # waveform analysis) -- generate_road_condition_audio.py only ever
+    # writes these together, via a single targeted
+    # save(update_fields=[...]), after that entire cycle has already
+    # succeeded. Never written by --dry-run, --text-only, --event-id,
+    # a skipped/unchanged cycle, a stale/failed/disabled retirement,
+    # or any failed cycle -- see that command's own comment at its
+    # write site.
+    last_report_fingerprint = models.CharField(
+        max_length=64, blank=True, editable=False,
+        help_text=(
+            "SHA-256 hex digest of the effective on-air artifact from the last "
+            "generate_road_condition_audio cycle that completed synthesis, FLAC "
+            "installation, Track update, AND waveform analysis -- see report.py's "
+            "compute_report_fingerprint(). Read-only. A later run compares its own "
+            "freshly-computed fingerprint against this (plus a live health check on "
+            "the existing FLAC/Track/text file) to decide whether the report is "
+            "genuinely unchanged and synthesis can be skipped."
+        ),
+    )
+    last_report_generated_at = models.DateTimeField(
+        null=True, blank=True, editable=False,
+        help_text=(
+            "When last_report_fingerprint above was last set -- i.e. the last time "
+            "generate_road_condition_audio actually completed a full synthesis "
+            "cycle, not merely the last time the command RAN (a skipped-because-"
+            "unchanged run, or --dry-run/--text-only/--event-id, never updates this)."
+        ),
+    )
+
     class Meta:
         verbose_name = "Road Conditions Configuration"
         verbose_name_plural = "Road Conditions Configuration"

@@ -60,6 +60,27 @@ class RoadConditionsAdminTests(TestCase):
         response = self.client.get(reverse("admin:road_conditions_roadconditionsconfiguration_change", args=[1]))
         self.assertContains(response, 'name="additional_route_coverage"')
 
+    def test_config_change_form_shows_no_report_generation_yet_by_default(self):
+        RoadConditionsConfiguration.load()
+        response = self.client.get(reverse("admin:road_conditions_roadconditionsconfiguration_change", args=[1]))
+        self.assertContains(response, "No successful report generation recorded yet.")
+        # Read-only display -- never an editable input for either field.
+        self.assertNotIn(b'name="last_report_fingerprint"', response.content)
+        self.assertNotIn(b'name="last_report_generated_at"', response.content)
+
+    def test_config_change_form_shows_shortened_fingerprint_when_present(self):
+        obj = RoadConditionsConfiguration.load()
+        obj.last_report_fingerprint = "a" * 64
+        obj.last_report_generated_at = timezone.now()
+        obj.save()
+        response = self.client.get(reverse("admin:road_conditions_roadconditionsconfiguration_change", args=[1]))
+        self.assertContains(response, "Last generated:")
+        self.assertContains(response, "a" * 12)  # shortened prefix shown
+        # The full 64-char value is what's stored, even though only a
+        # shortened prefix is displayed.
+        obj.refresh_from_db()
+        self.assertEqual(obj.last_report_fingerprint, "a" * 64)
+
     def _config_post_data(self, obj, **overrides):
         """Minimal valid POST body for the singleton config change form --
         every non-readonly field needs SOME value or Django's own

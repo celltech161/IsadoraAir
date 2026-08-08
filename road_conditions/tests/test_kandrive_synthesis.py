@@ -12,9 +12,9 @@ from django.test import TestCase, TransactionTestCase
 from library.models import Artist, Category, CategoryKind, Track
 from road_conditions import synthesis as synthesis_module
 from road_conditions.synthesis import (
-    LOUDNORM_TARGETS, SynthesisError, _parse_loudnorm_output, build_loudnorm_string,
-    retire_road_report, road_report_path, road_report_text_path,
-    synthesize_road_report, write_road_report_text,
+    AUDIO_FORMAT_VERSION, LOUDNORM_TARGETS, SynthesisError, _parse_loudnorm_output,
+    build_loudnorm_string, existing_report_is_healthy, hash_file_sha256, retire_road_report,
+    road_report_path, road_report_text_path, synthesize_road_report, write_road_report_text,
 )
 
 DAY_VOICE = {"engine": "kokoro", "model": "af_jessica", "name": "Claira"}
@@ -513,6 +513,125 @@ class WriteRoadReportTextHelperTests(KanDriveSynthesisFixtureMixin, TransactionT
         Path(self._tmpdir.name).rmdir()
         write_road_report_text("Text after a fresh mkdir.")
         self.assertEqual(road_report_text_path().read_text(encoding="utf-8"), "Text after a fresh mkdir.")
+
+
+class HashFileSha256Tests(TestCase):
+    """hash_file_sha256() -- pure filesystem helper, no Track/DB
+    involvement at all."""
+
+    def test_returns_64_char_hex_digest(self):
+        with tempfile.NamedTemporaryFile() as f:
+            f.write(b"some content")
+            f.flush()
+            digest = hash_file_sha256(f.name)
+        self.assertEqual(len(digest), 64)
+        int(digest, 16)  # raises ValueError if not valid hex
+
+    def test_identical_content_hashes_identically(self):
+        with tempfile.NamedTemporaryFile() as f1, tempfile.NamedTemporaryFile() as f2:
+            f1.write(b"identical bytes")
+            f1.flush()
+            f2.write(b"identical bytes")
+            f2.flush()
+            self.assertEqual(hash_file_sha256(f1.name), hash_file_sha256(f2.name))
+
+    def test_different_content_hashes_differently(self):
+        with tempfile.NamedTemporaryFile() as f1, tempfile.NamedTemporaryFile() as f2:
+            f1.write(b"content A")
+            f1.flush()
+            f2.write(b"content B")
+            f2.flush()
+            self.assertNotEqual(hash_file_sha256(f1.name), hash_file_sha256(f2.name))
+
+    def test_in_place_content_replacement_at_same_path_changes_hash(self):
+        with tempfile.NamedTemporaryFile() as f:
+            f.write(b"original content")
+            f.flush()
+            original_hash = hash_file_sha256(f.name)
+            f.seek(0)
+            f.truncate()
+            f.write(b"replaced content, same pathname")
+            f.flush()
+            replaced_hash = hash_file_sha256(f.name)
+        self.assertNotEqual(original_hash, replaced_hash)
+
+    def test_missing_file_raises_oserror(self):
+        with self.assertRaises(OSError):
+            hash_file_sha256("/nonexistent/path/to/a/file.wav")
+
+
+class ExistingReportIsHealthyTests(KanDriveSynthesisFixtureMixin, TransactionTestCase):
+    """existing_report_is_healthy() -- the companion artifact-health
+    check used alongside a fingerprint match (see the management
+    command's own skip decision). Exercises the real filesystem/DB
+    state this function reads, via real synthesize_road_report()/
+    write_road_report_text()/retire_road_report() calls (all faked at
+    the Kokoro/ffmpeg subprocess boundary only, via
+    KanDriveSynthesisFixtureMixin) rather than hand-constructing state,
+    so this proves the function agrees with what those real functions
+    actually produce."""
+
+    def test_healthy_when_flac_track_ready2air_and_text_all_match(self):
+        text = "The real final script."
+        synthesize_road_report(text, "day", DAY_VOICE)
+        write_road_report_text(text)
+        self.assertTrue(existing_report_is_healthy(text))
+
+    def test_unhealthy_when_no_flac_exists_yet(self):
+        self.assertFalse(existing_report_is_healthy("Some expected text."))
+
+    def test_unhealthy_when_flac_exists_but_no_track_row(self):
+        text = "The real final script."
+        synthesize_road_report(text, "day", DAY_VOICE)
+        write_road_report_text(text)
+        Track.objects.filter(filepath=str(road_report_path())).delete()
+        self.assertFalse(existing_report_is_healthy(text))
+
+    def test_unhealthy_when_track_is_not_ready2air(self):
+        # The stale-feed-retirement scenario: retire_road_report()
+        # flips ready2air False without touching the FLAC or text file
+        # at all -- existing_report_is_healthy() must still say False.
+        text = "The real final script."
+        synthesize_road_report(text, "day", DAY_VOICE)
+        write_road_report_text(text)
+        retire_road_report()
+        self.assertFalse(existing_report_is_healthy(text))
+
+    def test_unhealthy_when_text_file_missing(self):
+        text = "The real final script."
+        synthesize_road_report(text, "day", DAY_VOICE)
+        # Deliberately never call write_road_report_text() here.
+        self.assertFalse(existing_report_is_healthy(text))
+
+    def test_unhealthy_when_text_file_content_does_not_match(self):
+        text = "The real final script."
+        synthesize_road_report(text, "day", DAY_VOICE)
+        write_road_report_text("A completely different script.")
+        self.assertFalse(existing_report_is_healthy(text))
+
+    def test_healthy_check_never_writes_or_modifies_anything(self):
+        # Pure read -- calling it (even repeatedly, even when it
+        # returns False) must never itself change DB or filesystem
+        # state; regeneration through the normal pipeline is the only
+        # sanctioned way to fix an unhealthy report.
+        text = "The real final script."
+        synthesize_road_report(text, "day", DAY_VOICE)
+        write_road_report_text(text)
+        track = Track.objects.get(filepath=str(road_report_path()))
+        before_ready2air = track.ready2air
+        before_text = road_report_text_path().read_text(encoding="utf-8")
+
+        existing_report_is_healthy(text)
+        existing_report_is_healthy("mismatched text")  # even a False-returning call
+
+        track.refresh_from_db()
+        self.assertEqual(track.ready2air, before_ready2air)
+        self.assertEqual(road_report_text_path().read_text(encoding="utf-8"), before_text)
+
+
+class AudioFormatVersionTests(TestCase):
+    def test_is_a_plain_integer(self):
+        self.assertIsInstance(AUDIO_FORMAT_VERSION, int)
 
 
 class RetireRoadReportTests(KanDriveSynthesisFixtureMixin, TransactionTestCase):

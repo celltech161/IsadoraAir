@@ -56,12 +56,26 @@ raising RoadConditionsConfiguration.min_priority, or shortening
 max_event_age_days/lookahead_days) -- all already-existing, already-
 configurable knobs -- rather than a new report-side length cap.
 """
+import hashlib
+import json
 from datetime import timedelta
 
 from django.utils import timezone as dj_timezone
 
 from .models import RoadConditionsConfiguration, RoadEvent
+from .synthesis import AUDIO_FORMAT_VERSION
 from .text_normalize import normalize_for_speech, normalize_route_notation
+
+# Schema/pipeline version for compute_report_fingerprint()'s own
+# payload shape -- separate from synthesis.AUDIO_FORMAT_VERSION (which
+# versions the actual audio-encoding pipeline; see that constant's own
+# comment). Bump THIS one when what's fingerprinted, or how it's
+# interpreted, materially changes (e.g. a new field is added/removed
+# from the payload, or an existing field's meaning changes) -- that
+# forces every existing "unchanged" report to regenerate on its next
+# cycle, deliberately, without needing an actual source/text/voice
+# change to trigger it. Never derived from a git commit or timestamp.
+REPORT_FINGERPRINT_VERSION = 1
 
 # device-status ("automated traffic signals" etc.) is infrastructure/
 # administrative status, not something a motorist needs to plan a
@@ -403,3 +417,91 @@ def compose_report_segments(body_pieces, config, announcer_name=""):
     if postamble:
         segments = [*segments[:-1], f"{segments[-1]} {postamble}"] if segments else [postamble]
     return segments
+
+
+def compute_report_fingerprint(text, voice_slot, voice, transition_active,
+                                transition_sound_fingerprint=None, segment_count=None):
+    """SHA-256 hex digest of a deterministic, canonical JSON payload
+    representing the effective on-air artifact this generation cycle
+    would produce -- used by generate_road_condition_audio.py to skip
+    the expensive Kokoro/ffmpeg/analysis pipeline when nothing that
+    actually affects the resulting audio has changed since the last
+    successful generation (see RoadConditionsConfiguration.
+    last_report_fingerprint / last_report_generated_at).
+
+    Deliberately fingerprints the FINAL, fully-resolved generation
+    inputs -- never RoadEvent.payload_checksum or any raw KDOT
+    response -- because the on-air result can change for reasons a
+    source checksum alone can't capture: preamble/postamble edits,
+    {announcer_name} resolution, voice slot/model changes, an event's
+    own wording changing purely because wall-clock time crossed its
+    start_time (planned -> in-effect -- see report._planned_prefix()),
+    and transition-sound state. This is also why callers must compute
+    the fingerprint only AFTER event selection, text composition,
+    voice resolution, AND transition-sound resolution have all
+    already happened -- moving the skip decision any earlier would
+    mean deciding "unchanged" without having actually looked at
+    everything that determines the final audio.
+
+    `text` must be the EXACT final composed script (after event
+    selection/ordering, no-events handling, and preamble/postamble/
+    {announcer_name} resolution) -- see compose_report_script()/
+    compose_report_segments() above.
+
+    `voice_slot`/`voice['engine']`/`voice['model']` identify the
+    SYNTHESIS identity, not the listener-facing announcer name -- the
+    model behind an announcer name could change without the name
+    itself changing, and that must still force regeneration. `slot` is
+    kept as its own field (not folded into the model string) so a
+    schedule change that resolves the same model under a different
+    slot name is still an explicit, visible difference here.
+
+    `transition_active`/`transition_sound_fingerprint`/`segment_count`
+    must reflect the ACTUAL behavior this run would produce, not
+    merely the config's own enabled/path settings -- a configured-but-
+    currently-unusable (missing/unreadable) transition sound must be
+    passed here as `transition_active=False`, exactly matching the
+    plain-synthesis fallback the caller actually performs in that case
+    (see generate_road_condition_audio.py's own transition-sound
+    decision block, which runs BEFORE this function and is what the
+    two arguments here are computed from). `transition_sound_fingerprint`
+    is the transition file's own content hash (see synthesis.
+    hash_file_sha256()) -- content, not pathname, so replacing the
+    file in place while keeping the same configured path still changes
+    the fingerprint. `segment_count` (the number of separately-
+    synthesized, transition-spliced pieces) is included so that a
+    theoretical case where two DIFFERENT event selections happen to
+    join into byte-identical final `text` (extremely unlikely in
+    practice -- every real event script includes its own route/county/
+    KDOT description specifics) still can't produce an identical
+    fingerprint if it would actually insert a different number of
+    transition sounds; irrelevant, and therefore ignored, whenever
+    transition_active is False, since item/segment count has zero
+    effect on a single-Kokoro-call synthesis.
+
+    `version` is REPORT_FINGERPRINT_VERSION and `audio_format_version`
+    is synthesis.AUDIO_FORMAT_VERSION -- two independent counters (see
+    each constant's own comment) a future change can bump to
+    deliberately force every existing "unchanged" report to regenerate,
+    without needing an actual source/text/voice change to trigger it.
+
+    Canonical serialization: sort_keys=True, compact separators
+    (no incidental whitespace), UTF-8 -- so byte-identical inputs
+    always hash identically regardless of dict insertion order."""
+    payload = {
+        "version": REPORT_FINGERPRINT_VERSION,
+        "text": text,
+        "voice": {
+            "slot": voice_slot,
+            "engine": voice.get("engine"),
+            "model": voice.get("model"),
+        },
+        "transition": {
+            "active": bool(transition_active),
+            "sound_fingerprint": transition_sound_fingerprint if transition_active else None,
+            "segment_count": segment_count if transition_active else None,
+        },
+        "audio_format_version": AUDIO_FORMAT_VERSION,
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()

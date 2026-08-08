@@ -10,11 +10,11 @@ from road_conditions.models import RoadConditionsConfiguration, RoadEvent
 from road_conditions.report import (
     ReportBuildError, build_event_script, build_event_scripts,
     build_no_events_message, compose_report_script, compose_report_segments,
-    feed_freshness, select_events,
+    compute_report_fingerprint, feed_freshness, select_events,
 )
 from road_conditions.synthesis import (
-    SynthesisError, retire_road_report, road_report_path, synthesize_road_report,
-    write_road_report_text,
+    SynthesisError, existing_report_is_healthy, hash_file_sha256, retire_road_report,
+    road_report_path, synthesize_road_report, write_road_report_text,
 )
 from road_conditions.voice import VoiceResolutionError, resolve_voice
 
@@ -69,6 +69,19 @@ class Command(BaseCommand):
                 "trusted as current -- see feed_freshness() in report.py). "
                 "For manual verification only; a real generation cycle "
                 "should never need this."
+            ),
+        )
+        parser.add_argument(
+            "--regenerate", action="store_true",
+            help=(
+                "Rebuild the report even though its freshly-computed fingerprint "
+                "matches RoadConditionsConfiguration.last_report_fingerprint and the "
+                "existing FLAC/Track/road_report.txt are otherwise healthy -- i.e. "
+                "bypass ONLY the fingerprint-based dedup skip (see report.py's "
+                "compute_report_fingerprint()). Independent of --force: this does "
+                "NOT bypass the stale/failed/disabled freshness gate below -- combine "
+                "with --force for that. Normal production runs omit this; unchanged-"
+                "report skipping is the default, intended behavior."
             ),
         )
         parser.add_argument(
@@ -223,6 +236,57 @@ class Command(BaseCommand):
                     "generating without it."
                 ))
 
+        # transition_active reflects what this run would ACTUALLY do,
+        # not merely config.transition_sound_enabled -- already true of
+        # transition_sound_path above (None when the file's missing),
+        # but re-derived explicitly here (rather than just truthiness-
+        # testing transition_sound_path again below) so the fingerprint
+        # payload's own field names read clearly at the call site.
+        # Hashed fresh every run the feature is actually active for --
+        # see synthesis.hash_file_sha256()'s own docstring on why this
+        # is cheap enough not to need mtime/size caching. A race where
+        # the file vanishes between the os.path.exists() check above
+        # and this hash (vanishingly unlikely for a static local sound
+        # effect file) degrades the same way a missing file already
+        # does: fall back to plain synthesis rather than raising over a
+        # fingerprinting concern.
+        transition_active = bool(transition_sound_path)
+        transition_sound_fingerprint = None
+        if transition_active:
+            try:
+                transition_sound_fingerprint = hash_file_sha256(transition_sound_path)
+            except OSError as exc:
+                self.stdout.write(self.style.WARNING(
+                    f"Transition sound became unreadable ({exc}) -- generating without it."
+                ))
+                transition_active = False
+                transition_sound_path = None
+                segments = None
+
+        # Fingerprint calculated only now -- immediately before the
+        # skip decision, after event selection, text composition, voice
+        # resolution, AND transition-sound resolution have all already
+        # happened. Moving this earlier would mean deciding "unchanged"
+        # without having looked at everything that actually determines
+        # the resulting audio (see report.compute_report_fingerprint()'s
+        # own docstring).
+        fingerprint = compute_report_fingerprint(
+            text, slot, voice, transition_active,
+            transition_sound_fingerprint=transition_sound_fingerprint,
+            segment_count=len(segments) if transition_active else None,
+        )
+        existing_fingerprint = config.last_report_fingerprint
+        fingerprint_matches = bool(existing_fingerprint) and existing_fingerprint == fingerprint
+        # existing_report_is_healthy() touches the filesystem and DB --
+        # only bother when the cheap checks already indicate a skip is
+        # even possible (fingerprint matches AND --regenerate wasn't
+        # passed); a matching fingerprint alone is NEVER sufficient to
+        # skip on its own (see that function's own docstring -- notably
+        # the stale-feed-retirement-then-recovery case, where the
+        # fingerprint can still match but the Track is no longer
+        # ready2air, and regeneration must happen anyway).
+        would_skip = fingerprint_matches and not options["regenerate"] and existing_report_is_healthy(text)
+
         final_path = road_report_path()
 
         if dry_run:
@@ -243,8 +307,18 @@ class Command(BaseCommand):
                 )
             else:
                 self.stdout.write("[DRY RUN] No existing KanDrive Track -- would create a new one.")
+            self.stdout.write(f"[DRY RUN] Report fingerprint: {fingerprint}")
+            self.stdout.write(f"[DRY RUN] Existing successful fingerprint: {existing_fingerprint or '(none)'}")
+            self.stdout.write(f"[DRY RUN] Would skip generation: {'yes' if would_skip else 'no'}")
             self.stdout.write("[DRY RUN] Final script:")
             self.stdout.write(text)
+            return
+
+        if would_skip:
+            self.stdout.write(
+                "KanDrive report unchanged since last successful generation; "
+                "skipping synthesis and analysis."
+            )
             return
 
         try:
@@ -279,6 +353,37 @@ class Command(BaseCommand):
             raise CommandError(
                 f"KanDrive audio generated successfully (track id={track.id}) but failed to "
                 f"write the companion road_report.txt: {exc}"
+            )
+
+        # Fingerprint/timestamp persisted ONLY here -- after synthesis,
+        # FLAC installation, Track update, waveform analysis, AND the
+        # road_report.txt write have ALL already succeeded. A failure
+        # at any earlier point above returns/raises before this line is
+        # ever reached, so last_report_fingerprint/last_report_
+        # generated_at can never come to describe a cycle that didn't
+        # actually complete successfully (same invariant already
+        # established for road_report.txt itself -- see this file's own
+        # comment above and synthesize_road_report()'s docstring).
+        config.last_report_fingerprint = fingerprint
+        config.last_report_generated_at = dj_timezone.now()
+        try:
+            config.save(update_fields=["last_report_fingerprint", "last_report_generated_at"])
+        except Exception as exc:
+            # The audio and text ARE correct and live at this point --
+            # only the change-detection bookkeeping for the NEXT run
+            # failed to persist. Surfaced as a real CommandError (same
+            # shape as the road_report.txt failure just above) rather
+            # than silently continuing and claiming full success, since
+            # the caller must not be told the generation state was
+            # successfully recorded when it wasn't -- but this is a
+            # narrower failure than either of the two above: the worst
+            # consequence is the next run's fingerprint check incorrectly
+            # missing (a false-negative cache, causing one unnecessary
+            # regeneration), never stale or incorrect on-air audio.
+            raise CommandError(
+                f"KanDrive audio generated successfully (track id={track.id}) and "
+                f"road_report.txt written, but failed to persist the generation "
+                f"fingerprint: {exc}"
             )
 
         self.stdout.write(

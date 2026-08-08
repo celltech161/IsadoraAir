@@ -68,6 +68,7 @@ moves to tmpfs, and every temp file (there or at KANDRIVE_ROOT) is
 unlinked in synthesize_road_report()'s own `finally` block once the
 final file has been written (or on failure) -- see that function.
 """
+import hashlib
 import os
 import re
 import subprocess
@@ -104,6 +105,20 @@ TMP_AUDIO_ROOT = Path("/dev/shm/isadoraair-kandrive")
 # so KanDrive's spoken reports sit at the same on-air loudness as
 # everything else, not a KanDrive-specific guess.
 LOUDNORM_TARGETS = {"I": -16.0, "TP": -1.0, "LRA": 5.0}
+
+# A separate counter from report.REPORT_FINGERPRINT_VERSION (see that
+# module's compute_report_fingerprint()) -- this one versions the
+# actual AUDIO ENCODING pipeline (loudnorm targets, sample format/rate,
+# FLAC compression settings, the Kokoro invocation shape itself), not
+# the fingerprint payload's own schema. Bump this alone when a change
+# here would produce materially different audio bytes for byte-
+# identical `text`/voice/transition inputs (e.g. changing
+# LOUDNORM_TARGETS, or the ffmpeg filter chain) -- that forces every
+# existing "unchanged" report to regenerate on its next cycle without
+# also needing to touch report.py's fingerprint schema. Never derived
+# from a git commit or timestamp -- a plain, deliberately-incremented
+# integer, same spirit as REPORT_FINGERPRINT_VERSION.
+AUDIO_FORMAT_VERSION = 1
 
 # Companion audit/debug text file -- see write_road_report_text()'s own
 # docstring for exactly when this is (and isn't) updated.
@@ -175,6 +190,71 @@ def write_road_report_text(text):
             tmp_text.unlink()
         except FileNotFoundError:
             pass
+
+
+def hash_file_sha256(path):
+    """SHA-256 hex digest of a file's exact bytes -- used by report
+    fingerprinting (see report.compute_report_fingerprint()) to detect
+    an in-place content change to the configured transition-sound file
+    even though its pathname hasn't changed (a bare pathname string
+    would miss that entirely). The transition sound is a short chime/
+    sting, not a full track, so hashing it fresh on every generation
+    cycle this feature is active is cheap -- no mtime/size caching,
+    which would be one more thing that could silently drift from the
+    file's real content."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def existing_report_is_healthy(expected_text):
+    """True only if EVERY on-air artifact the current KanDrive report
+    depends on is present and consistent with a generation cycle that
+    already completed successfully:
+
+      * road_report.flac exists on disk;
+      * its corresponding KanDrive Track row exists;
+      * that Track is ready2air=True (not pulled out of rotation by
+        retire_road_report() during a stale/failed/disabled cycle);
+      * road_report.txt exists and is readable;
+      * road_report.txt's content exactly equals `expected_text` --
+        the CURRENT cycle's own final composed script, not merely
+        "some text file exists".
+
+    Used ONLY alongside a fingerprint match (RoadConditionsConfiguration.
+    last_report_fingerprint) when deciding whether generate_road_
+    condition_audio can skip synthesis for an unchanged report -- see
+    that command's own skip decision. A matching fingerprint by itself
+    says "the INPUTS are unchanged since the last successful cycle";
+    this says "the OUTPUT of that cycle is still actually in place and
+    healthy". Both must be true to skip -- this is what correctly
+    forces regeneration after e.g. a stale-feed retirement flips
+    ready2air to False even though the underlying report content
+    (and therefore its fingerprint) never changed.
+
+    Deliberately does NOT attempt to repair any unhealthy condition it
+    finds (e.g. flipping ready2air back on, or rewriting a missing
+    text file) -- regeneration through the normal synthesis pipeline
+    is the conservative, already-established behavior for a report
+    artifact that isn't verifiably healthy; silently patching DB/file
+    state here would risk marking something ready2air/current that
+    was never actually verified end-to-end this cycle."""
+    final_path = road_report_path()
+    if not final_path.exists():
+        return False
+    track = Track.objects.filter(filepath=str(final_path)).first()
+    if track is None or not track.ready2air:
+        return False
+    text_path = road_report_text_path()
+    if not text_path.exists():
+        return False
+    try:
+        existing_text = text_path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return existing_text == expected_text
 
 
 def _probe_duration(path):

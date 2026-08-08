@@ -62,10 +62,11 @@ class RoadConditionsConfigurationAdmin(admin.ModelAdmin):
             "fields": ["max_event_age_days", "lookahead_days"],
         }),
         ("Diagnostics", {
-            "fields": ["stale_data_threshold_minutes", "debug_logging", "status_display"],
+            "fields": ["stale_data_threshold_minutes", "debug_logging", "status_display",
+                       "report_generation_status_display"],
         }),
     ]
-    readonly_fields = ["status_display"]
+    readonly_fields = ["status_display", "report_generation_status_display"]
 
     def has_add_permission(self, request):
         return not RoadConditionsConfiguration.objects.exists()
@@ -100,6 +101,29 @@ class RoadConditionsConfigurationAdmin(admin.ModelAdmin):
             lines.append(format_html('<strong style="color:#b45309">Data is stale (older than the configured threshold, or never succeeded).</strong>'))
         if obj.last_error:
             lines.append(format_html('<span style="color:#b91c1c">Last error: {}</span>', obj.last_error))
+        return mark_safe("<br>".join(lines))
+
+    @admin.display(description="Last report generation")
+    def report_generation_status_display(self, obj):
+        # Distinct from status_display above -- that's about the CARS
+        # API FETCH; this is about generate_road_condition_audio's own
+        # change-detection state (see report.py's compute_report_
+        # fingerprint() and RoadConditionsConfiguration.last_report_
+        # fingerprint/last_report_generated_at). Shows a shortened
+        # fingerprint prefix only -- the full 64-char value is always
+        # what's actually stored and compared; this is purely a
+        # display convenience, and the field itself stays out of
+        # readonly_fields' editable form entirely (see status_display's
+        # own comment on why raw values are never f-string-interpolated
+        # directly into HTML).
+        if not obj.last_report_generated_at:
+            return format_html("No successful report generation recorded yet.")
+        lines = [format_html(
+            "Last generated: {}",
+            timezone.localtime(obj.last_report_generated_at).strftime("%Y-%m-%d %H:%M:%S"),
+        )]
+        if obj.last_report_fingerprint:
+            lines.append(format_html("Fingerprint: <code>{}…</code>", obj.last_report_fingerprint[:12]))
         return mark_safe("<br>".join(lines))
 
 

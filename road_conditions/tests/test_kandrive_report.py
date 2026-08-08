@@ -13,6 +13,7 @@ from django.utils import timezone as dj_timezone
 
 from road_conditions.models import RoadConditionsConfiguration, RoadEvent
 from road_conditions.report import (
+    REPORT_FINGERPRINT_VERSION,
     ReportBuildError,
     build_event_script,
     build_event_scripts,
@@ -20,10 +21,12 @@ from road_conditions.report import (
     build_no_events_message,
     compose_report_script,
     compose_report_segments,
+    compute_report_fingerprint,
     feed_freshness,
     has_detour,
     select_events,
 )
+from road_conditions.synthesis import AUDIO_FORMAT_VERSION
 
 
 def make_road_event(external_id="CARS5-TEST-1", headline_category="roadwork",
@@ -479,3 +482,128 @@ class ComposeReportScriptTests(TestCase):
         self.assertTrue(result.startswith("Now here's the current and upcoming road report"))
         self.assertIn("BODY.", result)
         self.assertTrue(result.endswith("I'm Claira."))
+
+
+DAY_VOICE = {"engine": "kokoro", "model": "af_jessica", "name": "Claira"}
+NIGHT_VOICE = {"engine": "kokoro", "model": "am_liam", "name": "Max"}
+
+
+class ComputeReportFingerprintTests(TestCase):
+    """compute_report_fingerprint() -- pure function, no DB needed.
+    Determinism/discrimination coverage: identical inputs must hash
+    identically; every input that can change the resulting on-air
+    audio must change the hash; inputs that DON'T affect the audio
+    (this function never even receives a raw timestamp/sync-run-id/
+    last_seen_at -- callers only ever pass it the final resolved
+    text/voice/transition state) can't accidentally affect it either."""
+
+    def test_identical_inputs_produce_identical_fingerprint(self):
+        fp1 = compute_report_fingerprint("Same text.", "day", DAY_VOICE, False)
+        fp2 = compute_report_fingerprint("Same text.", "day", DAY_VOICE, False)
+        self.assertEqual(fp1, fp2)
+
+    def test_fingerprint_is_a_64_char_hex_sha256_digest(self):
+        fp = compute_report_fingerprint("Some text.", "day", DAY_VOICE, False)
+        self.assertEqual(len(fp), 64)
+        int(fp, 16)  # raises ValueError if not valid hex -- no exception is the assertion
+
+    def test_changed_final_text_changes_fingerprint(self):
+        fp1 = compute_report_fingerprint("Text one.", "day", DAY_VOICE, False)
+        fp2 = compute_report_fingerprint("Text two.", "day", DAY_VOICE, False)
+        self.assertNotEqual(fp1, fp2)
+
+    def test_changed_voice_model_changes_fingerprint(self):
+        # Same slot/name, different model -- proves the SYNTHESIS
+        # identity (model), not just the listener-facing name, is what
+        # drives the hash (per the task's own explicit requirement).
+        other_model_voice = {"engine": "kokoro", "model": "af_different_model", "name": "Claira"}
+        fp1 = compute_report_fingerprint("Same text.", "day", DAY_VOICE, False)
+        fp2 = compute_report_fingerprint("Same text.", "day", other_model_voice, False)
+        self.assertNotEqual(fp1, fp2)
+
+    def test_changed_voice_slot_changes_fingerprint(self):
+        # Same model/engine, different slot -- slot is deliberately its
+        # own payload field (see compute_report_fingerprint's docstring).
+        fp1 = compute_report_fingerprint("Same text.", "day", DAY_VOICE, False)
+        fp2 = compute_report_fingerprint("Same text.", "night", DAY_VOICE, False)
+        self.assertNotEqual(fp1, fp2)
+
+    def test_transition_off_vs_on_changes_fingerprint(self):
+        fp_off = compute_report_fingerprint("Same text.", "day", DAY_VOICE, False)
+        fp_on = compute_report_fingerprint(
+            "Same text.", "day", DAY_VOICE, True,
+            transition_sound_fingerprint="abc123", segment_count=2,
+        )
+        self.assertNotEqual(fp_off, fp_on)
+
+    def test_replacing_transition_wav_contents_at_same_pathname_changes_fingerprint(self):
+        # The pathname itself is never part of the payload -- only the
+        # file's own content hash -- so this proves an in-place content
+        # swap (same configured path) is detected.
+        fp_old = compute_report_fingerprint(
+            "Same text.", "day", DAY_VOICE, True,
+            transition_sound_fingerprint="old-content-hash", segment_count=2,
+        )
+        fp_new = compute_report_fingerprint(
+            "Same text.", "day", DAY_VOICE, True,
+            transition_sound_fingerprint="new-content-hash", segment_count=2,
+        )
+        self.assertNotEqual(fp_old, fp_new)
+
+    def test_inactive_transition_ignores_sound_fingerprint_and_segment_count(self):
+        # A configured-but-inactive transition (e.g. disabled, or only
+        # 0/1 events) must not leak its sound_fingerprint/segment_count
+        # into the hash -- two runs with transition_active=False but
+        # different (irrelevant) sound_fingerprint/segment_count values
+        # must still match, since NEITHER actually affects the audio
+        # when inactive.
+        fp1 = compute_report_fingerprint(
+            "Same text.", "day", DAY_VOICE, False,
+            transition_sound_fingerprint="some-hash", segment_count=5,
+        )
+        fp2 = compute_report_fingerprint(
+            "Same text.", "day", DAY_VOICE, False,
+            transition_sound_fingerprint="different-hash", segment_count=99,
+        )
+        self.assertEqual(fp1, fp2)
+
+    def test_changed_segment_count_with_transition_active_changes_fingerprint(self):
+        # Same text/voice/sound content, different segment count (a
+        # theoretical case where two different event selections produce
+        # byte-identical final text -- see this function's own
+        # docstring) -- must still be distinguishable when active.
+        fp1 = compute_report_fingerprint(
+            "Same text.", "day", DAY_VOICE, True,
+            transition_sound_fingerprint="abc", segment_count=2,
+        )
+        fp2 = compute_report_fingerprint(
+            "Same text.", "day", DAY_VOICE, True,
+            transition_sound_fingerprint="abc", segment_count=3,
+        )
+        self.assertNotEqual(fp1, fp2)
+
+    def test_volatile_timestamps_do_not_affect_fingerprint(self):
+        # compute_report_fingerprint() has no timestamp/now/sync-run-id
+        # parameter at all -- this test documents that fact structurally:
+        # calling it twice, with nothing but wall-clock time having
+        # passed between calls, must always match.
+        import time
+        fp1 = compute_report_fingerprint("Same text.", "day", DAY_VOICE, False)
+        time.sleep(0.01)
+        fp2 = compute_report_fingerprint("Same text.", "day", DAY_VOICE, False)
+        self.assertEqual(fp1, fp2)
+
+    def test_version_constants_are_plain_incrementable_integers(self):
+        # Regression guard against a future accidental switch to a
+        # git-commit-hash or timestamp-derived version -- the task
+        # explicitly requires a deliberately-incremented integer.
+        self.assertIsInstance(REPORT_FINGERPRINT_VERSION, int)
+        self.assertIsInstance(AUDIO_FORMAT_VERSION, int)
+
+    def test_missing_voice_engine_or_model_keys_do_not_raise(self):
+        # Defensive: compute_report_fingerprint uses voice.get(), not
+        # voice[...], for engine/model -- a malformed/incomplete voice
+        # dict degrades to None fields rather than raising KeyError.
+        sparse_voice = {"name": "Claira"}
+        fp = compute_report_fingerprint("Text.", "day", sparse_voice, False)  # must not raise
+        self.assertEqual(len(fp), 64)
