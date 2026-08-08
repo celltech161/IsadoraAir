@@ -7,12 +7,13 @@ import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
-from django.test import TransactionTestCase
+from django.test import TestCase, TransactionTestCase
 
 from library.models import Artist, Category, CategoryKind, Track
 from road_conditions import synthesis as synthesis_module
 from road_conditions.synthesis import (
-    SynthesisError, retire_road_report, road_report_path, road_report_text_path,
+    LOUDNORM_TARGETS, SynthesisError, _parse_loudnorm_output, build_loudnorm_string,
+    retire_road_report, road_report_path, road_report_text_path,
     synthesize_road_report, write_road_report_text,
 )
 
@@ -37,10 +38,30 @@ class KanDriveSynthesisFixtureMixin:
         root_patcher = patch.object(synthesis_module, "KANDRIVE_ROOT", Path(self._tmpdir.name))
         root_patcher.start()
         self.addCleanup(root_patcher.stop)
+        # TMP_AUDIO_ROOT (real /dev/shm in production -- see synthesis.py's
+        # own module docstring) is pointed at the SAME tmpdir as
+        # KANDRIVE_ROOT here, not a separate one -- that way the existing
+        # "no temp files left behind" tests (which scan
+        # Path(self._tmpdir.name).iterdir()) stay meaningful for BOTH the
+        # final FLAC's own temp file and the intermediate WAV(s), which
+        # now live under a different constant, without needing a second
+        # leftover-file check.
+        tmp_audio_patcher = patch.object(synthesis_module, "TMP_AUDIO_ROOT", Path(self._tmpdir.name))
+        tmp_audio_patcher.start()
+        self.addCleanup(tmp_audio_patcher.stop)
 
         self._kokoro_should_fail = False
         self._ffmpeg_should_fail = False
         self._kokoro_call_count = 0
+        # loudnorm's own two-pass analysis call (ends "-f null -", no
+        # real output file -- see _run_loudnorm_two_pass) is tracked and
+        # faked separately from the encode/concat call below, since it
+        # has a genuinely different shape (discards its output) and a
+        # genuinely different failure-tolerance contract (a failed/empty
+        # analysis falls back to conservative defaults rather than
+        # raising -- see _run_loudnorm_two_pass's own docstring).
+        self._loudnorm_analyze_call_count = 0
+        self._loudnorm_analysis_should_be_empty = False
 
         def fake_run(cmd, **kwargs):
             import subprocess as _sp
@@ -49,13 +70,35 @@ class KanDriveSynthesisFixtureMixin:
                 if self._kokoro_should_fail:
                     raise _sp.CalledProcessError(1, cmd, output=b"", stderr=b"kokoro exploded")
                 Path(cmd[cmd.index("--output_file") + 1]).write_bytes(b"FAKE-WAV-CONTENT")
+                return _sp.CompletedProcess(cmd, 0)
             elif cmd[0] == "ffmpeg":
+                if cmd[-3:] == ["-f", "null", "-"]:
+                    # loudnorm analysis pass -- never writes a real file
+                    # (discarded via -f null), so it's never subject to
+                    # _ffmpeg_should_fail (which simulates the ENCODE
+                    # pass genuinely failing); a failed/garbled real
+                    # analysis pass would just return empty/unparseable
+                    # stderr, which _loudnorm_analysis_should_be_empty
+                    # simulates directly.
+                    self._loudnorm_analyze_call_count += 1
+                    if self._loudnorm_analysis_should_be_empty:
+                        return _sp.CompletedProcess(cmd, 1, stdout="", stderr="")
+                    fake_json = (
+                        '[Parsed_loudnorm_0 @ 0x0] \n{\n'
+                        '\t"input_i" : "-18.50",\n'
+                        '\t"input_tp" : "-3.20",\n'
+                        '\t"input_lra" : "4.10",\n'
+                        '\t"input_thresh" : "-29.00",\n'
+                        '\t"target_offset" : "0.50"\n}\n'
+                    )
+                    return _sp.CompletedProcess(cmd, 0, stdout="", stderr=fake_json)
+                # Encode/concat pass -- produces the real output file.
                 if self._ffmpeg_should_fail:
                     raise _sp.CalledProcessError(1, cmd, output=b"", stderr=b"ffmpeg exploded")
                 Path(cmd[-1]).write_bytes(b"FAKE-FLAC-CONTENT")
+                return _sp.CompletedProcess(cmd, 0)
             else:
                 raise AssertionError(f"unexpected subprocess call: {cmd}")
-            return _sp.CompletedProcess(cmd, 0)
 
         run_patcher = patch.object(synthesis_module.subprocess, "run", side_effect=fake_run)
         run_patcher.start()
@@ -126,6 +169,95 @@ class SynthesizeRoadReportTests(KanDriveSynthesisFixtureMixin, TransactionTestCa
         with patch.object(synthesis_module, "_run_full_analysis", return_value=False):
             with self.assertRaises(SynthesisError):
                 synthesize_road_report("Test report text.", "day", DAY_VOICE)
+
+
+class LoudnormHelperTests(TestCase):
+    """build_loudnorm_string()/_parse_loudnorm_output() -- pure
+    functions, no subprocess/filesystem involved. LOUDNORM_TARGETS
+    itself is checked against the exact numbers requested (matching
+    the KNS show ingest script's own target for every other syndicated
+    show)."""
+
+    def test_loudnorm_targets_match_kns(self):
+        self.assertEqual(LOUDNORM_TARGETS, {"I": -16.0, "TP": -1.0, "LRA": 5.0})
+
+    def test_build_loudnorm_string_no_extra_args(self):
+        self.assertEqual(build_loudnorm_string(), "loudnorm=I=-16.0:TP=-1.0:LRA=5.0")
+
+    def test_build_loudnorm_string_with_extra_args(self):
+        result = build_loudnorm_string("print_format=json")
+        self.assertEqual(result, "loudnorm=I=-16.0:TP=-1.0:LRA=5.0:print_format=json")
+
+    def test_parse_loudnorm_output_quoted_json_form(self):
+        text = (
+            '[Parsed_loudnorm_0 @ 0x0] \n{\n'
+            '\t"input_i" : "-18.50",\n'
+            '\t"input_tp" : "-3.20",\n'
+            '\t"input_lra" : "4.10",\n'
+            '\t"input_thresh" : "-29.00",\n'
+            '\t"target_offset" : "0.50"\n}\n'
+        )
+        analysis = _parse_loudnorm_output(text)
+        self.assertEqual(analysis, {
+            "input_i": "-18.50", "input_tp": "-3.20", "input_lra": "4.10",
+            "input_thresh": "-29.00", "target_offset": "0.50",
+        })
+
+    def test_parse_loudnorm_output_missing_fields_returns_partial(self):
+        analysis = _parse_loudnorm_output("nothing useful here")
+        self.assertEqual(analysis, {})
+
+
+class LoudnormTwoPassSynthesisTests(KanDriveSynthesisFixtureMixin, TransactionTestCase):
+    """The two-pass loudnorm integration inside synthesize_road_report()
+    itself -- both the plain (single Kokoro call) and transition-sound
+    (multi-segment concat) paths route their encode step through
+    _run_loudnorm_two_pass, which fake_run's `-f null -` special case
+    (see KanDriveSynthesisFixtureMixin) lets these tests observe
+    without needing a real ffmpeg/loudnorm build."""
+
+    def test_plain_path_runs_analyze_then_encode(self):
+        synthesize_road_report("Test report text.", "day", DAY_VOICE)
+        self.assertEqual(self._loudnorm_analyze_call_count, 1)
+
+    def test_transition_path_analyzes_once_for_whole_concatenated_program(self):
+        # Not once per segment -- loudnorm measures/corrects the WHOLE
+        # finished program together, exactly like KNS measures its own
+        # bumper+stories+wooshes as one unit, not each piece separately.
+        synthesize_road_report(
+            "unused when segments given", "day", DAY_VOICE,
+            segments=["first item.", "second item.", "third item."],
+            transition_sound_path="/fake/path/woosh.wav",
+        )
+        self.assertEqual(self._loudnorm_analyze_call_count, 1)
+        self.assertEqual(self._kokoro_call_count, 3)
+
+    def test_empty_analysis_falls_back_to_defaults_and_still_succeeds(self):
+        self._loudnorm_analysis_should_be_empty = True
+        track = synthesize_road_report("Test report text.", "day", DAY_VOICE)
+        self.assertTrue(Path(track.filepath).exists())
+        self.assertEqual(Path(track.filepath).read_bytes(), b"FAKE-FLAC-CONTENT")
+
+    def test_encode_pass_failure_still_raises_synthesis_error(self):
+        # The analyze pass succeeding doesn't matter if the ENCODE pass
+        # (the one that actually produces output) fails -- unlike the
+        # analyze pass, this is not forgiving.
+        self._ffmpeg_should_fail = True
+        with self.assertRaises(SynthesisError):
+            synthesize_road_report("Test report text.", "day", DAY_VOICE)
+
+class TmpAudioRootProductionValueTests(TestCase):
+    """Deliberately does NOT use KanDriveSynthesisFixtureMixin (which
+    patches TMP_AUDIO_ROOT to a tmpdir for the rest of this file) --
+    checks the REAL, unpatched production value of the constant itself:
+    genuine tmpfs, and genuinely distinct from KANDRIVE_ROOT's real
+    disk path, matching the module docstring's own claim."""
+
+    def test_tmp_audio_root_is_under_dev_shm(self):
+        self.assertEqual(str(synthesis_module.TMP_AUDIO_ROOT.parent), "/dev/shm")
+
+    def test_tmp_audio_root_differs_from_kandrive_root(self):
+        self.assertNotEqual(synthesis_module.TMP_AUDIO_ROOT, synthesis_module.KANDRIVE_ROOT)
 
 
 class TransitionSoundSynthesisTests(KanDriveSynthesisFixtureMixin, TransactionTestCase):

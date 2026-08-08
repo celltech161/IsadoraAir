@@ -43,8 +43,33 @@ completely written and its duration probed), same temp-file naming and
 cleanup. A failure at any point in synthesis leaves the existing
 final_path (and its Track row) completely untouched -- the last
 known-good report keeps airing rather than going silent or corrupt.
+
+Loudness normalization: the final spoken audio (whether one Kokoro
+call or several spliced with a transition sound -- see
+_synthesize_with_transitions()) is run through the SAME two-pass EBU
+R128 loudnorm target the KNS show ingest script applies to every other
+syndicated show (get_kns.py's own LOUDNORM_TARGETS/build_loudnorm_
+string/two-pass analyze-then-encode structure, duplicated here rather
+than cross-imported -- same reasoning as KOKORO_BINARY above). True
+two-pass loudnorm structurally can't run as a single streaming pass
+over a pipe -- the second pass's linear correction needs the first
+pass's COMPLETE measurement before it can correctly apply anything
+starting from sample 0 -- so this needs a real, re-readable file for
+Kokoro's raw output (and, on the transition-sound path, each segment's
+own WAV). Kokoro's own writer (see kokoro_synth's _kokoro_synth.py)
+uses Python's `wave` module, which seeks back to patch the RIFF header
+on close and so also can't write to a pipe/stdout regardless. Given
+both constraints, the closest thing to "no disk I/O for this scratch
+audio" is a tmpfs (RAM-backed, not real disk) directory -- see
+TMP_AUDIO_ROOT below -- rather than true zero-file streaming, which
+isn't possible here. The FINAL FLAC still lands on real disk at
+KANDRIVE_ROOT, same as always; only the throwaway intermediate audio
+moves to tmpfs, and every temp file (there or at KANDRIVE_ROOT) is
+unlinked in synthesize_road_report()'s own `finally` block once the
+final file has been written (or on failure) -- see that function.
 """
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -63,6 +88,22 @@ KOKORO_BINARY = "/home/jreed/kokoro/bin/kokoro_synth"
 
 KANDRIVE_ROOT = Path(settings.LIBRARY_ROOT) / "KanDrive"
 KANDRIVE_FILENAME = "road_report.flac"
+
+# Scratch directory for Kokoro's own raw WAV output (and, on the
+# transition-sound path, each segment's WAV) -- /dev/shm is a real,
+# POSIX-standard tmpfs (RAM-backed, not the real disk KANDRIVE_ROOT
+# lives on) on this box, verified via `mount` (tmpfs on /dev/shm).
+# Kept as its own subdirectory (not written directly into /dev/shm's
+# own root, which is world-writable/shared) purely for tidiness --
+# nothing here is sensitive. See the module docstring above for why
+# this can't just be an in-process pipe instead.
+TMP_AUDIO_ROOT = Path("/dev/shm/isadoraair-kandrive")
+
+# The exact same EBU R128 targets the KNS show ingest script applies
+# to every other syndicated show (get_kns.py's own LOUDNORM_TARGETS) --
+# so KanDrive's spoken reports sit at the same on-air loudness as
+# everything else, not a KanDrive-specific guess.
+LOUDNORM_TARGETS = {"I": -16.0, "TP": -1.0, "LRA": 5.0}
 
 # Companion audit/debug text file -- see write_road_report_text()'s own
 # docstring for exactly when this is (and isn't) updated.
@@ -148,20 +189,104 @@ def _probe_duration(path):
     return float(out.stdout.strip())
 
 
+def build_loudnorm_string(extra_args=""):
+    """Same construction as the KNS show ingest script's own
+    build_loudnorm_string() (get_kns.py) -- duplicated here rather
+    than cross-imported, matching this module's existing convention
+    for KOKORO_BINARY. Uses LOUDNORM_TARGETS, the same numbers KNS
+    applies to every other syndicated show."""
+    base = "loudnorm=I={I}:TP={TP}:LRA={LRA}".format(**LOUDNORM_TARGETS)
+    return f"{base}:{extra_args}" if extra_args else base
+
+
+def _parse_loudnorm_output(ffmpeg_output_text):
+    """Same regex-based parse as get_kns.py's own
+    _parse_loudnorm_output -- loudnorm's analysis pass prints its
+    measurements as JSON to stderr (via av_log at AV_LOG_INFO); this
+    pulls out the five fields the encode pass needs, falling back to a
+    looser numeric regex if the quoted-JSON form isn't found (matches
+    the original)."""
+    keys = ["input_i", "input_tp", "input_lra", "input_thresh", "target_offset"]
+    analysis = {}
+    for k in keys:
+        m = re.search(rf'"{k}"\s*:\s*"([^"]+)"', ffmpeg_output_text)
+        if m:
+            analysis[k] = m.group(1)
+        else:
+            lm = re.search(rf'{k}[^-\d]*([-\d.]+)', ffmpeg_output_text, re.I)
+            if lm:
+                analysis[k] = lm.group(1)
+    return analysis
+
+
+def _run_loudnorm_two_pass(build_filter_args, tmp_flac):
+    """Two-pass EBU R128 loudnorm, matching the KNS show ingest
+    script's own analyze-then-encode structure exactly (get_kns.py's
+    merge_audio_files): pass 1 measures the COMPLETE finished audio
+    (whatever filter graph `build_filter_args` produces, with loudnorm
+    applied as `print_format=json`, discarded via `-f null -`); pass 2
+    re-runs the SAME graph with `measured_*`/`linear=true`/
+    `print_format=summary` and writes the real FLAC output. See this
+    module's own docstring for why a single streaming pass can't do
+    this (pass 2's linear correction needs pass 1's complete
+    measurement before it can correctly apply anything from the very
+    first sample).
+
+    `build_filter_args(loudnorm_filter_str)` must return the full
+    ffmpeg argv up to (but not including) the final output-format/path
+    arguments -- called twice, once per pass, with a different
+    loudnorm filter string each time, against the SAME already-
+    synthesized input file(s) (no re-synthesis between passes).
+
+    A failed/incomplete analysis pass (rare -- a very short or unusual
+    clip) falls back to the same conservative defaults KNS itself uses
+    (get_kns.py's own fallback) rather than failing the whole cycle
+    over a measurement quirk -- matching KNS's own `check=False`
+    treatment of its analysis pass. The ENCODE pass is not forgiving:
+    its failure (CalledProcessError/TimeoutExpired) propagates
+    normally to the caller's existing except clause, same as every
+    other ffmpeg call in this module."""
+    analyze_filter = build_loudnorm_string("print_format=json")
+    try:
+        proc1 = subprocess.run(
+            build_filter_args(analyze_filter) + ["-f", "null", "-"],
+            capture_output=True, text=True, timeout=60,
+        )
+        analysis = _parse_loudnorm_output((proc1.stdout or "") + (proc1.stderr or ""))
+    except (subprocess.TimeoutExpired, OSError):
+        analysis = {}
+
+    if not analysis or len(analysis) < 5:
+        analysis = dict(input_i="-20", input_tp="-2", input_lra="6", input_thresh="-30", target_offset="0")
+
+    encode_filter = build_loudnorm_string(
+        f"measured_I={analysis['input_i']}:measured_TP={analysis['input_tp']}:"
+        f"measured_LRA={analysis['input_lra']}:measured_thresh={analysis['input_thresh']}:"
+        f"offset={analysis['target_offset']}:linear=true:print_format=summary"
+    )
+    # Generous but bounded -- this is encoding already-synthesized
+    # short WAVs, not a sized estimate.
+    subprocess.run(
+        build_filter_args(encode_filter) + [
+            "-ar", "44100", "-ac", "2", "-c:a", "flac", "-sample_fmt", "s16",
+            "-compression_level", "5", str(tmp_flac),
+        ],
+        check=True, timeout=120, capture_output=True,
+    )
+
+
 def _synthesize_with_transitions(segments, voice, transition_sound_path, tmp_flac, pid, cleanup_paths):
-    """One Kokoro call per entry in `segments`, concatenated via a
-    single ffmpeg filter_complex pass with `transition_sound_path`
-    spliced in strictly BETWEEN consecutive segments -- never before
-    the first or after the last. Mirrors the KNS show ingest script's
-    own woosh-between-stories concat (get_kns.py's
-    _build_merge_ffmpeg_args/_canonical_input_chain) but simplified:
-    no loudnorm/highpass/tempo ladder, since (unlike KNS's mixed
-    external audio sources) Kokoro's own output across separate calls
-    with the same voice/model needs no such correction -- just format
-    normalization (sample rate/format/channel layout) so ffmpeg's
-    concat filter is happy splicing dissimilarly-encoded inputs
-    together. Writes directly to `tmp_flac`. Returns the resulting
-    duration in seconds.
+    """One Kokoro call per entry in `segments` (written to TMP_AUDIO_ROOT,
+    not KANDRIVE_ROOT -- see the module docstring), concatenated via
+    two-pass loudnorm (_run_loudnorm_two_pass above) with
+    `transition_sound_path` spliced in strictly BETWEEN consecutive
+    segments -- never before the first or after the last. Mirrors the
+    KNS show ingest script's own woosh-between-stories concat
+    (get_kns.py's _build_merge_ffmpeg_args/_canonical_input_chain) and
+    its two-pass loudnorm, applied to the whole concatenated program
+    (not each item individually) exactly as KNS applies it to its own
+    bumper+stories+wooshes together. Writes directly to `tmp_flac`.
+    Returns the resulting duration in seconds.
 
     Every per-segment WAV this creates is appended to `cleanup_paths`
     (the caller's own `finally` unlinks them all, success or failure) --
@@ -176,9 +301,10 @@ def _synthesize_with_transitions(segments, voice, transition_sound_path, tmp_fla
     right now" (see generate_road_condition_audio.py's own check,
     which is what decides whether transition_sound_path is passed in
     as non-None at all)."""
+    TMP_AUDIO_ROOT.mkdir(parents=True, exist_ok=True)
     segment_wavs = []
     for i, segment_text in enumerate(segments):
-        seg_wav = KANDRIVE_ROOT / f".{KANDRIVE_FILENAME}.{pid}.seg{i}.tmp.wav"
+        seg_wav = TMP_AUDIO_ROOT / f".{KANDRIVE_FILENAME}.{pid}.seg{i}.tmp.wav"
         cleanup_paths.append(seg_wav)
         subprocess.run(
             [KOKORO_BINARY, "--model", voice["model"], "--output_file", str(seg_wav)],
@@ -186,32 +312,29 @@ def _synthesize_with_transitions(segments, voice, transition_sound_path, tmp_fla
         )
         segment_wavs.append(seg_wav)
 
-    inputs, parts, concat_labels = [], [], []
-    idx = 0
-    for i, seg_wav in enumerate(segment_wavs):
-        inputs.extend(["-i", str(seg_wav)])
-        parts.append(f"[{idx}:a]aresample=44100,aformat=sample_fmts=s16:channel_layouts=stereo[s{i}]")
-        concat_labels.append(f"[s{i}]")
-        idx += 1
-        if i < len(segment_wavs) - 1:
-            inputs.extend(["-i", str(transition_sound_path)])
-            parts.append(f"[{idx}:a]aresample=44100,aformat=sample_fmts=s16:channel_layouts=stereo[w{i}]")
-            concat_labels.append(f"[w{i}]")
+    def build_filter_args(loudnorm_filter_str):
+        inputs, parts, concat_labels = [], [], []
+        idx = 0
+        for i, seg_wav in enumerate(segment_wavs):
+            inputs.extend(["-i", str(seg_wav)])
+            parts.append(f"[{idx}:a]aresample=44100,aformat=sample_fmts=s16:channel_layouts=stereo[s{i}]")
+            concat_labels.append(f"[s{i}]")
             idx += 1
+            if i < len(segment_wavs) - 1:
+                inputs.extend(["-i", str(transition_sound_path)])
+                parts.append(f"[{idx}:a]aresample=44100,aformat=sample_fmts=s16:channel_layouts=stereo[w{i}]")
+                concat_labels.append(f"[w{i}]")
+                idx += 1
+        segment_count = len(concat_labels)
+        parts.append(f"{''.join(concat_labels)}concat=n={segment_count}:v=0:a=1,{loudnorm_filter_str}[final]")
+        filter_complex = ";".join(parts)
+        return (
+            ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-y"]
+            + inputs
+            + ["-filter_complex", filter_complex, "-map", "[final]"]
+        )
 
-    segment_count = len(concat_labels)
-    parts.append(f"{''.join(concat_labels)}concat=n={segment_count}:v=0:a=1[final]")
-    filter_complex = ";".join(parts)
-
-    # Generous but bounded -- concatenating already-synthesized short
-    # WAVs (no loudnorm analysis pass, unlike KNS) is fast; this is
-    # headroom for a slow disk/large event count, not a sized estimate.
-    subprocess.run(
-        ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-y"]
-        + inputs
-        + ["-filter_complex", filter_complex, "-map", "[final]", str(tmp_flac)],
-        check=True, timeout=180, capture_output=True,
-    )
+    _run_loudnorm_two_pass(build_filter_args, tmp_flac)
     return _probe_duration(tmp_flac)
 
 
@@ -299,7 +422,8 @@ def synthesize_road_report(text, voice_slot, voice, segments=None, transition_so
                     segments, voice, transition_sound_path, tmp_flac, pid, cleanup_paths,
                 )
             else:
-                tmp_wav = KANDRIVE_ROOT / f".{KANDRIVE_FILENAME}.{pid}.tmp.wav"
+                TMP_AUDIO_ROOT.mkdir(parents=True, exist_ok=True)
+                tmp_wav = TMP_AUDIO_ROOT / f".{KANDRIVE_FILENAME}.{pid}.tmp.wav"
                 cleanup_paths.append(tmp_wav)
                 # Timeout, NOT copied from webrequests/services.py's 30s
                 # -- that value is sized for a several-second dedication
@@ -317,13 +441,12 @@ def synthesize_road_report(text, voice_slot, voice, segments=None, transition_so
                     [KOKORO_BINARY, "--model", voice["model"], "--output_file", str(tmp_wav)],
                     input=text.encode("utf-8"), check=True, timeout=600,
                 )
-                # WAV->FLAC conversion is comfortably faster than
-                # realtime; 120s is generous headroom, not a sized
-                # estimate.
-                subprocess.run(
-                    ["ffmpeg", "-y", "-i", str(tmp_wav), str(tmp_flac)],
-                    check=True, timeout=120, capture_output=True,
-                )
+
+                def build_filter_args(loudnorm_filter_str):
+                    filter_str = f"aresample=44100,aformat=sample_fmts=s16:channel_layouts=stereo,{loudnorm_filter_str}"
+                    return ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-y", "-i", str(tmp_wav), "-af", filter_str]
+
+                _run_loudnorm_two_pass(build_filter_args, tmp_flac)
                 duration = _probe_duration(tmp_flac)
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, ValueError) as exc:
             raise SynthesisError(f"Kokoro/ffmpeg synthesis failed: {exc}") from exc
