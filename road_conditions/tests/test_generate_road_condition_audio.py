@@ -347,6 +347,13 @@ class ReportFramingTests(TestCase):
         self.assertTrue(spoken_text.endswith("POSTAMBLE MARKER, I'm Claira."))
 
     def test_day_voice_yields_correct_announcer_name(self):
+        # Full on-air name ("Claira Sky"), not just the short voice['name']
+        # ("Claira") used for internal bookkeeping (ID3 titles, log lines)
+        # -- see voice.py's shared VOICES dict (full_name) and this
+        # command's own comment on why. Uses the REAL, unmocked
+        # resolve_voice() -- this test environment has live access to
+        # weather-ingest's shared voice module (see other tests in this
+        # file, e.g. DryRunZeroWritesTests, that already rely on this).
         make_road_event(external_id="A", headline_category="closure", description="Road closed.")
         config = RoadConditionsConfiguration.load()
         config.report_preamble = ""
@@ -354,7 +361,7 @@ class ReportFramingTests(TestCase):
         config.save()
         out = StringIO()
         call_command("generate_road_condition_audio", "--text-only", "--voice", "day", stdout=out)
-        self.assertIn("I'm Claira.", out.getvalue())
+        self.assertIn("I'm Claira Sky.", out.getvalue())
 
     def test_night_voice_yields_correct_announcer_name(self):
         make_road_event(external_id="A", headline_category="closure", description="Road closed.")
@@ -364,7 +371,22 @@ class ReportFramingTests(TestCase):
         config.save()
         out = StringIO()
         call_command("generate_road_condition_audio", "--text-only", "--voice", "night", stdout=out)
-        self.assertIn("I'm Max.", out.getvalue())
+        self.assertIn("I'm Max Weatherly.", out.getvalue())
+
+    def test_announcer_name_falls_back_to_short_name_when_full_name_missing(self):
+        # Defensive fallback (voice.get("full_name") or voice["name"])
+        # for a hypothetical voice slot that hasn't been given a
+        # full_name yet in weather-ingest's shared VOICES dict --
+        # must not raise, must not print a literal "None".
+        make_road_event(external_id="A", headline_category="closure", description="Road closed.")
+        config = RoadConditionsConfiguration.load()
+        config.report_preamble = ""
+        config.report_postamble = "I'm {announcer_name}."
+        config.save()
+        with patch(f"{CMD}.resolve_voice", return_value=("day", {"engine": "kokoro", "model": "af_jessica", "name": "Claira"})):
+            out = StringIO()
+            call_command("generate_road_condition_audio", "--text-only", "--voice", "day", stdout=out)
+        self.assertIn("I'm Claira.", out.getvalue())
 
     def test_text_only_prints_fully_resolved_script(self):
         make_road_event(external_id="A", headline_category="closure", description="Road closed.")

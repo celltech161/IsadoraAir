@@ -27,8 +27,9 @@ class RoadConditionsConfigurationAdmin(admin.ModelAdmin):
                             "road-condition report body (or the no-current-events message) -- see "
                             "generate_road_condition_audio. Either field may be left blank to omit that "
                             "piece entirely. Both support the literal token {announcer_name}, replaced "
-                            "with the listener-facing name of whichever voice (day/night) is currently "
-                            "selected for this report. There is no separate announcer-name setting here "
+                            "with the FULL on-air name (e.g. 'Claira Sky', not just 'Claira') of "
+                            "whichever voice (day/night) is currently selected for this report. There "
+                            "is no separate announcer-name setting here "
                             "on purpose -- that voice metadata (see the Weather Configuration voice "
                             "schedule) is already the single source of truth for the name.",
         }),

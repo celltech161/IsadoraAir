@@ -71,9 +71,13 @@ class RoadConditionsConfiguration(models.Model):
     # report (road_conditions/voice.py's resolve_voice()); there is
     # deliberately no separate announcer-name config field here, since
     # that voice metadata is already the single source of truth for the
-    # listener-facing name (currently "Claira"/"Max" -- see voice.py's
-    # module docstring), and a second, independently-editable copy of
-    # that name would just be one more way for the two to drift apart.
+    # name (currently "Claira Sky"/"Max Weatherly" -- the FULL on-air
+    # name, same as weather's own scripts use for their own spoken
+    # sign-off, e.g. wx_forecast.py's "I'm Claira Sky." -- not just the
+    # short "Claira"/"Max" used for internal bookkeeping like ID3
+    # titles; see voice.py's module docstring), and a second,
+    # independently-editable copy of that name here would just be one
+    # more way for the two to drift apart.
     report_preamble = models.TextField(
         blank=True,
         default="Now here's the current and upcoming road report for the Oak Grove Radio listening area.",
@@ -81,8 +85,9 @@ class RoadConditionsConfiguration(models.Model):
             "Spoken immediately BEFORE the generated road-condition report "
             "body (or the no-current-events message), every time. Optional -- "
             "blank means no preamble at all. May include the literal token "
-            "{announcer_name}, replaced with the listener-facing name of "
-            "whichever voice is currently selected for this report."
+            "{announcer_name}, replaced with the full listener-facing name "
+            "(e.g. 'Claira Sky') of whichever voice is currently selected "
+            "for this report."
         ),
     )
     report_postamble = models.TextField(

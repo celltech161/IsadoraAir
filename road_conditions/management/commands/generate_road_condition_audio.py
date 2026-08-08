@@ -179,7 +179,17 @@ class Command(BaseCommand):
             raise CommandError(f"Voice resolution failed: {exc}")
 
         config = RoadConditionsConfiguration.load()
-        text = compose_report_script(body, config, announcer_name=voice["name"])
+        # Full on-air name ("Claira Sky", not just "Claira") -- matches
+        # how weather's own scripts identify the announcer (wx_forecast.py
+        # splices in voice['signoff'], e.g. "I'm Claira Sky."), rather
+        # than the short voice['name'] used for internal bookkeeping
+        # (ID3 titles, log messages -- see this command's own success
+        # message below, and voice.py's docstring on why `name` exists).
+        # Falls back to the short name if a voice slot is ever missing
+        # full_name (e.g. a future third slot not yet updated in
+        # weather-ingest's lib/voices.py) rather than raising.
+        announcer_name = voice.get("full_name") or voice["name"]
+        text = compose_report_script(body, config, announcer_name=announcer_name)
 
         if text_only:
             self.stdout.write(text)
