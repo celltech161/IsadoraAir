@@ -118,13 +118,11 @@ class RoadConditionsConfiguration(models.Model):
         default=False,
         help_text=(
             "Insert a short transition sound effect between individual "
-            "road-condition items when the report speaks more than one -- "
-            "the same 'woosh' sting the KNS show ingest script already "
-            "plays between stories. Off by default. Requires "
-            "transition_sound_path below to point at a real, readable "
-            "audio file at generation time; if it doesn't, the report is "
-            "generated WITHOUT the transition sound rather than failing "
-            "the whole cycle."
+            "road-condition items when the report speaks more than one. "
+            "Off by default. Requires transition_sound_path below to "
+            "point at a real, readable audio file at generation time; if "
+            "it doesn't, the report is generated WITHOUT the transition "
+            "sound rather than failing the whole cycle."
         ),
     )
     transition_sound_path = models.CharField(
@@ -132,8 +130,7 @@ class RoadConditionsConfiguration(models.Model):
         default="/home/jreed/syndicated-ingest/kns/woosh.wav",
         help_text=(
             "Absolute filesystem path to the transition sound effect "
-            "audio file. Defaults to the same woosh.wav the KNS show "
-            "ingest script already uses between stories. Only read when "
+            "audio file (e.g. a short chime or sting). Only read when "
             "transition_sound_enabled above is on. If this path is "
             "blank, missing, or unreadable at generation time, the "
             "report is generated without the transition sound (a "
