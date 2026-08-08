@@ -64,6 +64,10 @@ KOKORO_BINARY = "/home/jreed/kokoro/bin/kokoro_synth"
 KANDRIVE_ROOT = Path(settings.LIBRARY_ROOT) / "KanDrive"
 KANDRIVE_FILENAME = "road_report.flac"
 
+# Companion audit/debug text file -- see write_road_report_text()'s own
+# docstring for exactly when this is (and isn't) updated.
+KANDRIVE_TEXT_FILENAME = "road_report.txt"
+
 # "Oak Grove Radio" -- the exact artist string already used on every
 # other spoken-segment Track this project generates (WxForecast,
 # WxObs, WxTemp; verified live via the database). Reused, not
@@ -87,6 +91,49 @@ def road_report_path():
 
 def _final_path():
     return road_report_path()
+
+
+def road_report_text_path():
+    """Public accessor for the companion audit/debug text file, sitting
+    alongside road_report_path()'s own FLAC -- same KANDRIVE_ROOT."""
+    return KANDRIVE_ROOT / KANDRIVE_TEXT_FILENAME
+
+
+def write_road_report_text(text):
+    """Atomically updates road_report.txt to contain the exact final
+    script -- an audit/debug copy of exactly what the system last
+    generated for air, kept alongside road_report.flac. Same tmp-file +
+    os.replace() atomic pattern already used for the FLAC itself (and
+    webrequests/services.py's synthesize_dedication_intro before that):
+    no reader ever observes a partially-written file, and a failure
+    here (e.g. a full disk) leaves whatever text file already existed
+    completely untouched -- it is never truncated or opened for
+    in-place writing.
+
+    NOT called from anywhere inside this module -- the caller
+    (generate_road_condition_audio.py's _run()) calls this only AFTER
+    synthesize_road_report() has returned successfully (FLAC written,
+    Track row created/updated, AND waveform analysis has succeeded),
+    so road_report.txt only ever comes to describe a generation cycle
+    that completed successfully start to finish -- never a FLAC that
+    was written but then the cycle went on to fail at the Track DB
+    write or analysis step. See that command's own comment at the call
+    site. Never called at all from a --dry-run, --text-only, or
+    --event-id path, nor from the stale/failed/disabled retirement
+    path -- those never reach a successful synthesize_road_report()
+    call in the first place."""
+    KANDRIVE_ROOT.mkdir(parents=True, exist_ok=True)
+    final_text_path = road_report_text_path()
+    pid = os.getpid()
+    tmp_text = KANDRIVE_ROOT / f".{KANDRIVE_TEXT_FILENAME}.{pid}.tmp.txt"
+    try:
+        tmp_text.write_text(text, encoding="utf-8")
+        os.replace(tmp_text, final_text_path)
+    finally:
+        try:
+            tmp_text.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def _probe_duration(path):
@@ -120,6 +167,15 @@ def synthesize_road_report(text, voice_slot, voice):
     (Step 9's "individual event formatting failures... must not
     silently produce misleading audio" applies just as much to a
     synthesis-level failure).
+
+    Does NOT itself write road_report.txt -- that's the caller's job
+    (generate_road_condition_audio.py calls write_road_report_text(text)
+    only after this function has returned successfully), so the
+    companion text file only ever comes to describe a generation cycle
+    that completed successfully start to finish, including waveform
+    analysis -- not merely a FLAC that was written before a later
+    Track/analysis failure. See write_road_report_text()'s own
+    docstring.
 
     Returns the Track instance on success."""
     if voice.get("engine") != "kokoro":
@@ -169,6 +225,18 @@ def synthesize_road_report(text, voice_slot, voice):
         # final_path. This is also the single point of no return: only
         # after this line has the last known-good report actually been
         # replaced.
+        #
+        # road_report.txt is deliberately NOT written here. An earlier
+        # revision of this function wrote it immediately after this
+        # os.replace() -- but that meant a LATER failure in this same
+        # function (the Track DB write below, or waveform analysis)
+        # would still raise SynthesisError while road_report.txt had
+        # already been overwritten, leaving the text file describing a
+        # generation cycle that never actually completed successfully.
+        # write_road_report_text(text) is now called by the caller
+        # (generate_road_condition_audio.py) ONLY after this whole
+        # function returns a Track without raising -- see that
+        # function's own docstring.
         os.replace(tmp_flac, final_path)
     finally:
         for p in (tmp_wav, tmp_flac):

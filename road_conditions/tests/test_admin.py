@@ -41,6 +41,13 @@ class RoadConditionsAdminTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertContains(response, "Road Conditions Configuration")
 
+    def test_config_change_form_includes_report_framing_fields(self):
+        RoadConditionsConfiguration.load()
+        response = self.client.get(reverse("admin:road_conditions_roadconditionsconfiguration_change", args=[1]))
+        self.assertContains(response, "On-Air Report Framing")
+        self.assertContains(response, 'name="report_preamble"')
+        self.assertContains(response, 'name="report_postamble"')
+
     def test_config_add_is_blocked_once_it_exists(self):
         RoadConditionsConfiguration.load()
         response = self.client.get(reverse("admin:road_conditions_roadconditionsconfiguration_add"))

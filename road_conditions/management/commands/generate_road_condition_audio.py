@@ -4,13 +4,14 @@ from django.utils import timezone as dj_timezone
 
 from library.models import Track
 from monitoring.models import emit_event
-from road_conditions.models import RoadEvent
+from road_conditions.models import RoadConditionsConfiguration, RoadEvent
 from road_conditions.report import (
     ReportBuildError, build_event_script, build_full_report,
-    build_no_events_message, feed_freshness, select_events,
+    build_no_events_message, compose_report_script, feed_freshness, select_events,
 )
 from road_conditions.synthesis import (
     SynthesisError, retire_road_report, road_report_path, synthesize_road_report,
+    write_road_report_text,
 )
 from road_conditions.voice import VoiceResolutionError, resolve_voice
 
@@ -156,7 +157,7 @@ class Command(BaseCommand):
                 )
 
         try:
-            text = build_full_report(events, now) if events else build_no_events_message()
+            body = build_full_report(events, now) if events else build_no_events_message()
         except ReportBuildError as exc:
             emit_event(
                 category="road_conditions", level="error", title="KanDrive report text generation failed",
@@ -164,14 +165,25 @@ class Command(BaseCommand):
             )
             raise CommandError(str(exc))
 
-        if text_only:
-            self.stdout.write(text)
-            return
-
+        # Voice resolved BEFORE final composition (not after, as an
+        # earlier revision of this command did) -- the final script can
+        # now contain {announcer_name}, so --text-only needs the real
+        # voice to print the exact script that would actually be spoken,
+        # not just the un-framed report body. This does mean --text-only
+        # now depends on voice resolution succeeding too, which is
+        # correct: a preview that can't resolve the real voice can't
+        # show the real final script either.
         try:
             slot, voice = resolve_voice(slot_override=options["voice"], now=now)
         except VoiceResolutionError as exc:
             raise CommandError(f"Voice resolution failed: {exc}")
+
+        config = RoadConditionsConfiguration.load()
+        text = compose_report_script(body, config, announcer_name=voice["name"])
+
+        if text_only:
+            self.stdout.write(text)
+            return
 
         final_path = road_report_path()
 
@@ -200,6 +212,29 @@ class Command(BaseCommand):
                 detail={"error": str(exc)}, dedupe_key="road_conditions|kandrive-synthesis-failed",
             )
             raise CommandError(str(exc))
+
+        # road_report.txt is written HERE, only now that
+        # synthesize_road_report() has returned a Track without raising
+        # -- i.e. the FLAC was written, the Track row was created/
+        # updated, AND waveform analysis succeeded. This is deliberately
+        # NOT inside synthesize_road_report() itself (see that
+        # function's own docstring): writing it there, right after the
+        # FLAC's own os.replace(), meant a LATER failure in that same
+        # function (the Track DB write, or analysis) could still raise
+        # SynthesisError while road_report.txt had already been
+        # overwritten -- leaving the text file describing a generation
+        # cycle that never actually completed successfully. Calling it
+        # only here means the text file always describes a cycle that
+        # completed successfully start to finish, matching the intended
+        # "represents the last generation that completed successfully"
+        # semantics exactly.
+        try:
+            write_road_report_text(text)
+        except OSError as exc:
+            raise CommandError(
+                f"KanDrive audio generated successfully (track id={track.id}) but failed to "
+                f"write the companion road_report.txt: {exc}"
+            )
 
         self.stdout.write(
             f"Generated KanDrive report: track id={track.id}, {len(events)} event(s), "

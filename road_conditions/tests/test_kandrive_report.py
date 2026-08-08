@@ -17,6 +17,7 @@ from road_conditions.report import (
     build_event_script,
     build_full_report,
     build_no_events_message,
+    compose_report_script,
     feed_freshness,
     has_detour,
     select_events,
@@ -281,3 +282,98 @@ class FeedFreshnessTests(TestCase):
         config.last_fetch_succeeded_at = dj_timezone.now() - timedelta(days=30)
         config.save()
         self.assertEqual(feed_freshness(config), "failed")
+
+
+class ComposeReportScriptTests(TestCase):
+    """compose_report_script() -- station framing assembly, kept
+    entirely separate from build_event_script()/build_full_report()/
+    build_no_events_message(), which know nothing about it (see
+    report.py's own module docstring and compose_report_script's)."""
+
+    def setUp(self):
+        self.config = RoadConditionsConfiguration.load()
+
+    def test_preamble_appears_before_the_body(self):
+        self.config.report_preamble = "PREAMBLE TEXT."
+        self.config.report_postamble = ""
+        result = compose_report_script("BODY TEXT.", self.config)
+        self.assertTrue(result.startswith("PREAMBLE TEXT."))
+        self.assertLess(result.index("PREAMBLE TEXT."), result.index("BODY TEXT."))
+
+    def test_postamble_appears_after_the_body(self):
+        self.config.report_preamble = ""
+        self.config.report_postamble = "POSTAMBLE TEXT."
+        result = compose_report_script("BODY TEXT.", self.config)
+        self.assertTrue(result.endswith("POSTAMBLE TEXT."))
+        self.assertLess(result.index("BODY TEXT."), result.index("POSTAMBLE TEXT."))
+
+    def test_announcer_name_resolves_in_postamble(self):
+        self.config.report_preamble = ""
+        self.config.report_postamble = "I'm {announcer_name}."
+        result = compose_report_script("BODY.", self.config, announcer_name="Claira")
+        self.assertIn("I'm Claira.", result)
+        self.assertNotIn("{announcer_name}", result)
+
+    def test_announcer_name_resolves_in_preamble_too(self):
+        # Not just the postamble -- the config help text doesn't scope
+        # the token to one field, so an operator using it in the
+        # preamble (e.g. "Hi, I'm {announcer_name} with...") must work
+        # identically.
+        self.config.report_preamble = "Hi, I'm {announcer_name}."
+        self.config.report_postamble = ""
+        result = compose_report_script("BODY.", self.config, announcer_name="Max")
+        self.assertIn("Hi, I'm Max.", result)
+        self.assertNotIn("{announcer_name}", result)
+
+    def test_blank_preamble_omits_that_piece(self):
+        self.config.report_preamble = ""
+        self.config.report_postamble = "POSTAMBLE."
+        result = compose_report_script("BODY.", self.config)
+        self.assertEqual(result, "BODY. POSTAMBLE.")
+
+    def test_blank_postamble_omits_that_piece(self):
+        self.config.report_preamble = "PREAMBLE."
+        self.config.report_postamble = ""
+        result = compose_report_script("BODY.", self.config)
+        self.assertEqual(result, "PREAMBLE. BODY.")
+
+    def test_both_blank_produces_just_the_body_no_stray_whitespace(self):
+        self.config.report_preamble = ""
+        self.config.report_postamble = ""
+        result = compose_report_script("BODY.", self.config)
+        self.assertEqual(result, "BODY.")
+        self.assertFalse(result.startswith(" "))
+        self.assertFalse(result.endswith(" "))
+        self.assertNotIn("  ", result)
+
+    def test_whitespace_only_fields_treated_as_blank(self):
+        self.config.report_preamble = "   \n  "
+        self.config.report_postamble = "  "
+        result = compose_report_script("BODY.", self.config)
+        self.assertEqual(result, "BODY.")
+
+    def test_ordinary_unrelated_braces_pass_through_unchanged(self):
+        # Must never be routed through str.format() -- an operator's
+        # own text (a typo'd brace, a pasted URL query string, etc.)
+        # must never raise or otherwise be treated as a format spec.
+        self.config.report_preamble = "Braces like {this} and {0} are just text."
+        self.config.report_postamble = ""
+        result = compose_report_script("BODY.", self.config)
+        self.assertIn("{this}", result)
+        self.assertIn("{0}", result)
+
+    def test_unmatched_brace_does_not_raise(self):
+        self.config.report_preamble = "An unmatched brace: { oops"
+        self.config.report_postamble = "another one: } oops"
+        result = compose_report_script("BODY.", self.config)  # must not raise
+        self.assertIn("{ oops", result)
+        self.assertIn("} oops", result)
+
+    def test_default_config_values_compose_the_documented_example(self):
+        # Regression guard on the suggested defaults themselves --
+        # RoadConditionsConfiguration.load() returns a fresh singleton
+        # with report_preamble/report_postamble already set.
+        result = compose_report_script("BODY.", self.config, announcer_name="Claira")
+        self.assertTrue(result.startswith("Now here's the current and upcoming road report"))
+        self.assertIn("BODY.", result)
+        self.assertTrue(result.endswith("I'm Claira."))

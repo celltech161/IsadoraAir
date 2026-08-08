@@ -305,3 +305,37 @@ def build_no_events_message():
         "As of the latest KanDrive update, KDOT is not reporting any "
         "significant road conditions for the north-central Kansas area."
     )
+
+
+def compose_report_script(body, config, announcer_name=""):
+    """Assembles the final on-air script: [preamble] + [body] + [postamble].
+
+    Station framing is kept entirely separate from event/body generation
+    on purpose -- build_event_script()/build_full_report()/
+    build_no_events_message() know nothing about Oak Grove Radio's own
+    on-air branding, and this function knows nothing about KDOT events;
+    it only assembles already-built text. `body` is normally the return
+    value of build_full_report() or build_no_events_message(), but this
+    function doesn't care which -- either way it's just "the middle."
+
+    `{announcer_name}` is the one supported substitution token, applied
+    to BOTH config.report_preamble and config.report_postamble (not just
+    the postamble) so an operator can freely use it in either admin
+    field -- the config help text doesn't restrict it to one field, and
+    there's no reason it should be silently unsupported in the other.
+    Deliberately a plain, explicit str.replace() rather than Python's
+    own str.format(): admin-entered text must never be treated as a
+    format string, so an unrelated/unmatched literal '{' or '}' a
+    station manager types or pastes into either field can never raise a
+    KeyError/IndexError or otherwise misbehave -- it just passes through
+    unchanged, exactly like any other character.
+
+    A blank preamble or postamble (after stripping whitespace) simply
+    omits that piece -- only the genuinely nonblank pieces are joined,
+    with a single space between them, so two blank fields plus a body
+    produce just the body, with no stray leading/trailing whitespace or
+    doubled-up spacing."""
+    preamble = (config.report_preamble or "").strip().replace("{announcer_name}", announcer_name)
+    postamble = (config.report_postamble or "").strip().replace("{announcer_name}", announcer_name)
+    pieces = [piece for piece in (preamble, body, postamble) if piece]
+    return " ".join(pieces)

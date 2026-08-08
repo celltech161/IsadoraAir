@@ -12,7 +12,8 @@ from django.test import TransactionTestCase
 from library.models import Artist, Category, CategoryKind, Track
 from road_conditions import synthesis as synthesis_module
 from road_conditions.synthesis import (
-    SynthesisError, retire_road_report, road_report_path, synthesize_road_report,
+    SynthesisError, retire_road_report, road_report_path, road_report_text_path,
+    synthesize_road_report, write_road_report_text,
 )
 
 DAY_VOICE = {"engine": "kokoro", "model": "af_jessica", "name": "Claira"}
@@ -174,6 +175,89 @@ class LastKnownGoodPreservationTests(KanDriveSynthesisFixtureMixin, TransactionT
         # The file WAS replaced (os.replace already happened by the time
         # analysis runs) -- this documents that fact rather than hiding it.
         self.assertEqual(Path(road_report_path()).read_bytes(), b"FAKE-FLAC-CONTENT")
+
+
+class SynthesizeRoadReportNeverWritesTextFileTests(KanDriveSynthesisFixtureMixin, TransactionTestCase):
+    """synthesize_road_report() itself must NEVER write or touch
+    road_report.txt -- that responsibility belongs entirely to the
+    CALLER (generate_road_condition_audio.py), which calls
+    write_road_report_text(text) only after synthesize_road_report()
+    has already returned a Track without raising (see this module's own
+    comment at the os.replace() call site). This is what makes
+    road_report.txt represent only a generation cycle that completed
+    successfully start to finish, INCLUDING waveform analysis -- not
+    merely a FLAC that was written before a later Track/analysis
+    failure. An earlier revision of this function wrote the text file
+    itself, immediately after the FLAC's own os.replace() -- these
+    tests replace that revision's own (now-wrong) assertions."""
+
+    def test_successful_synthesis_does_not_create_text_file(self):
+        synthesize_road_report("Good report.", "day", DAY_VOICE)
+        self.assertFalse(road_report_text_path().exists())
+
+    def test_repeated_successful_synthesis_still_never_writes_text_file(self):
+        synthesize_road_report("First.", "day", DAY_VOICE)
+        synthesize_road_report("Second.", "night", NIGHT_VOICE)
+        self.assertFalse(road_report_text_path().exists())
+
+    def test_kokoro_failure_leaves_existing_text_file_untouched(self):
+        write_road_report_text("Pre-existing text.")
+        self._kokoro_should_fail = True
+        with self.assertRaises(SynthesisError):
+            synthesize_road_report("This one fails.", "day", DAY_VOICE)
+        self.assertEqual(road_report_text_path().read_text(encoding="utf-8"), "Pre-existing text.")
+
+    def test_ffmpeg_failure_leaves_existing_text_file_untouched(self):
+        write_road_report_text("Pre-existing text.")
+        self._ffmpeg_should_fail = True
+        with self.assertRaises(SynthesisError):
+            synthesize_road_report("This one fails.", "day", DAY_VOICE)
+        self.assertEqual(road_report_text_path().read_text(encoding="utf-8"), "Pre-existing text.")
+
+    def test_analysis_failure_leaves_existing_text_file_untouched(self):
+        # The specific scenario this hardening round exists to fix: the
+        # FLAC IS successfully replaced before analysis ever runs (see
+        # test_analysis_failure_does_not_leave_partial_file_content_
+        # mismatched above), but synthesize_road_report() must still
+        # never touch road_report.txt regardless of where inside it a
+        # failure occurs -- only a genuinely successful RETURN, checked
+        # by the caller, ever triggers a text-file write.
+        write_road_report_text("Pre-existing text.")
+        with patch.object(synthesis_module, "_run_full_analysis", return_value=False):
+            with self.assertRaises(SynthesisError):
+                synthesize_road_report("New content despite analysis failure.", "day", DAY_VOICE)
+        self.assertEqual(road_report_text_path().read_text(encoding="utf-8"), "Pre-existing text.")
+
+
+class WriteRoadReportTextHelperTests(KanDriveSynthesisFixtureMixin, TransactionTestCase):
+    """Direct, filesystem-only tests of write_road_report_text() itself
+    -- atomic replacement behavior without going through full Kokoro/
+    ffmpeg synthesis, and without overengineered failure-injection
+    mocks (a real os.replace() against a real temp directory already
+    exercises the actual code path)."""
+
+    def test_creates_file_with_exact_content(self):
+        write_road_report_text("Hello, KanDrive.")
+        self.assertEqual(road_report_text_path().read_text(encoding="utf-8"), "Hello, KanDrive.")
+
+    def test_second_write_atomically_replaces_the_first(self):
+        write_road_report_text("First.")
+        write_road_report_text("Second.")
+        self.assertEqual(road_report_text_path().read_text(encoding="utf-8"), "Second.")
+
+    def test_no_temp_file_left_behind(self):
+        write_road_report_text("Some text.")
+        leftovers = [p for p in Path(self._tmpdir.name).iterdir() if p.name.startswith(".")]
+        self.assertEqual(leftovers, [])
+
+    def test_creates_kandrive_root_if_missing(self):
+        # KanDriveSynthesisFixtureMixin points KANDRIVE_ROOT at a real
+        # tmpdir that already exists -- remove it to prove
+        # write_road_report_text() creates it fresh, matching
+        # synthesize_road_report()'s own KANDRIVE_ROOT.mkdir() call.
+        Path(self._tmpdir.name).rmdir()
+        write_road_report_text("Text after a fresh mkdir.")
+        self.assertEqual(road_report_text_path().read_text(encoding="utf-8"), "Text after a fresh mkdir.")
 
 
 class RetireRoadReportTests(KanDriveSynthesisFixtureMixin, TransactionTestCase):

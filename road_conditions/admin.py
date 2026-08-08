@@ -21,6 +21,17 @@ class RoadConditionsConfigurationAdmin(admin.ModelAdmin):
             "fields": ["enabled"],
             "description": "Off by default. Nothing polls or writes RoadEvent rows until this is on.",
         }),
+        ("On-Air Report Framing", {
+            "fields": ["report_preamble", "report_postamble"],
+            "description": "Optional station branding spoken immediately before/after the generated "
+                            "road-condition report body (or the no-current-events message) -- see "
+                            "generate_road_condition_audio. Either field may be left blank to omit that "
+                            "piece entirely. Both support the literal token {announcer_name}, replaced "
+                            "with the listener-facing name of whichever voice (day/night) is currently "
+                            "selected for this report. There is no separate announcer-name setting here "
+                            "on purpose -- that voice metadata (see the Weather Configuration voice "
+                            "schedule) is already the single source of truth for the name.",
+        }),
         ("CARS API", {
             "fields": ["api_base_url", "request_timeout_seconds", "poll_cadence_minutes"],
         }),

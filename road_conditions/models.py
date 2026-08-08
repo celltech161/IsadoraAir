@@ -60,6 +60,42 @@ class RoadConditionsConfiguration(models.Model):
         ),
     )
 
+    # On-air station framing -- kept entirely separate from the actual
+    # road-condition report body (see report.py's compose_report_script(),
+    # which is the only place these two fields are ever read). Both are
+    # plain TextFields, blank-allowed: an operator who wants no preamble
+    # or no postamble at all just clears the field, and that piece is
+    # simply omitted rather than leaving a stray blank sentence on air.
+    # {announcer_name} is the one supported substitution token in either
+    # field -- resolved from the SAME voice already selected for this
+    # report (road_conditions/voice.py's resolve_voice()); there is
+    # deliberately no separate announcer-name config field here, since
+    # that voice metadata is already the single source of truth for the
+    # listener-facing name (currently "Claira"/"Max" -- see voice.py's
+    # module docstring), and a second, independently-editable copy of
+    # that name would just be one more way for the two to drift apart.
+    report_preamble = models.TextField(
+        blank=True,
+        default="Now here's the current and upcoming road report for the Oak Grove Radio listening area.",
+        help_text=(
+            "Spoken immediately BEFORE the generated road-condition report "
+            "body (or the no-current-events message), every time. Optional -- "
+            "blank means no preamble at all. May include the literal token "
+            "{announcer_name}, replaced with the listener-facing name of "
+            "whichever voice is currently selected for this report."
+        ),
+    )
+    report_postamble = models.TextField(
+        blank=True,
+        default="For more information visit KanDrive dot gov. That's the Oak Grove Radio road report, I'm {announcer_name}.",
+        help_text=(
+            "Spoken immediately AFTER the generated road-condition report "
+            "body (or the no-current-events message), every time. Optional -- "
+            "blank means no postamble at all. Same {announcer_name} "
+            "substitution support as report_preamble above."
+        ),
+    )
+
     api_base_url = models.URLField(
         max_length=200,
         default="https://kscars.kandrive.gov/carsapi_v1/api",
