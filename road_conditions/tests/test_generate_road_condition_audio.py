@@ -1,11 +1,12 @@
 """generate_road_condition_audio management command tests -- CLI wiring,
 output format, exit codes, the advisory-lock overlap guard, and the
 freshness gate's generate-vs-retire branching. report.select_events()/
-build_full_report()/synthesis.synthesize_road_report()/retire_road_report()
+build_event_scripts()/synthesis.synthesize_road_report()/retire_road_report()
 are exercised through light mocking at the command's own import points
 (their own real behavior is covered exhaustively in
 test_kandrive_report.py and test_kandrive_synthesis.py) -- no live
 Kokoro or CARS API calls anywhere here."""
+import tempfile
 from datetime import timedelta
 from io import StringIO
 from unittest.mock import MagicMock, patch
@@ -24,7 +25,7 @@ from road_conditions.management.commands.generate_road_condition_audio import (
 from road_conditions.management.commands.sync_road_conditions import ROAD_CONDITIONS_LOCK_KEY
 from road_conditions.models import RoadConditionsConfiguration, RoadEvent
 from road_conditions.report import ReportBuildError
-from road_conditions.synthesis import SynthesisError, road_report_text_path
+from road_conditions.synthesis import SynthesisError, road_report_path, road_report_text_path
 from road_conditions.tests.test_kandrive_report import make_road_event
 from road_conditions.tests.test_kandrive_synthesis import KanDriveSynthesisFixtureMixin
 
@@ -277,7 +278,12 @@ class FailureReportingTests(TestCase):
         make_road_event(external_id="A", headline_category="closure", description="Road closed.")
 
     def test_report_build_error_becomes_command_error_naming_the_event(self):
-        with patch(f"{CMD}.build_full_report", side_effect=ReportBuildError("Failed to build script for event 'A': boom")):
+        # The command builds the report body via build_event_scripts()
+        # directly now (not build_full_report(), which it no longer
+        # imports at all -- see the command's own comment on avoiding
+        # redundant per-event script recomputation for the transition-
+        # sound path).
+        with patch(f"{CMD}.build_event_scripts", side_effect=ReportBuildError("Failed to build script for event 'A': boom")):
             with self.assertRaises(CommandError) as ctx:
                 call_command("generate_road_condition_audio", stdout=StringIO())
         self.assertIn("'A'", str(ctx.exception))
@@ -560,3 +566,149 @@ class TextFilePersistenceCommandTests(KanDriveSynthesisFixtureMixin, Transaction
         current_text = road_report_text_path().read_text(encoding="utf-8")
         self.assertEqual(current_text, good_text)
         self.assertNotIn("DIFFERENT PREAMBLE FOR THE FAILING RUN.", current_text)
+
+
+class TransitionSoundDecisionTests(TestCase):
+    """Unit-level: mocked synthesize_road_report, confirming the command
+    correctly decides WHAT to pass for segments/transition_sound_path
+    (or None/None) under every combination of enabled/disabled, file
+    present/missing, and event count."""
+
+    def setUp(self):
+        make_fresh_config()
+
+    def test_disabled_by_default_passes_none(self):
+        make_road_event(external_id="A", headline_category="closure", description="First.")
+        make_road_event(external_id="B", headline_category="roadwork", description="Second.")
+        with patch(f"{CMD}.synthesize_road_report", return_value=fake_track()) as mock_synth:
+            call_command("generate_road_condition_audio", stdout=StringIO())
+        self.assertIsNone(mock_synth.call_args.kwargs.get("segments"))
+        self.assertIsNone(mock_synth.call_args.kwargs.get("transition_sound_path"))
+
+    def test_enabled_with_missing_file_falls_back_with_warning(self):
+        config = RoadConditionsConfiguration.load()
+        config.transition_sound_enabled = True
+        config.transition_sound_path = "/nonexistent/path/woosh.wav"
+        config.save()
+        make_road_event(external_id="A", headline_category="closure", description="First.")
+        make_road_event(external_id="B", headline_category="roadwork", description="Second.")
+        with patch(f"{CMD}.synthesize_road_report", return_value=fake_track()) as mock_synth:
+            out = StringIO()
+            call_command("generate_road_condition_audio", stdout=out)
+        self.assertIsNone(mock_synth.call_args.kwargs.get("segments"))
+        self.assertIsNone(mock_synth.call_args.kwargs.get("transition_sound_path"))
+        self.assertIn("not found/readable", out.getvalue())
+
+    def test_enabled_with_real_file_and_two_events_passes_segments(self):
+        with tempfile.NamedTemporaryFile(suffix=".wav") as f:
+            config = RoadConditionsConfiguration.load()
+            config.transition_sound_enabled = True
+            config.transition_sound_path = f.name
+            config.save()
+            make_road_event(external_id="A", headline_category="closure", description="First.")
+            make_road_event(external_id="B", headline_category="roadwork", description="Second.")
+            with patch(f"{CMD}.synthesize_road_report", return_value=fake_track()) as mock_synth:
+                call_command("generate_road_condition_audio", stdout=StringIO())
+            self.assertEqual(mock_synth.call_args.kwargs.get("transition_sound_path"), f.name)
+            segments = mock_synth.call_args.kwargs.get("segments")
+            self.assertEqual(len(segments), 2)
+
+    def test_enabled_with_one_event_passes_none(self):
+        # No boundary to insert a transition at with only one item.
+        with tempfile.NamedTemporaryFile(suffix=".wav") as f:
+            config = RoadConditionsConfiguration.load()
+            config.transition_sound_enabled = True
+            config.transition_sound_path = f.name
+            config.save()
+            make_road_event(external_id="A", headline_category="closure", description="Only event.")
+            with patch(f"{CMD}.synthesize_road_report", return_value=fake_track()) as mock_synth:
+                call_command("generate_road_condition_audio", stdout=StringIO())
+            self.assertIsNone(mock_synth.call_args.kwargs.get("segments"))
+            self.assertIsNone(mock_synth.call_args.kwargs.get("transition_sound_path"))
+
+    def test_enabled_with_zero_events_passes_none(self):
+        with tempfile.NamedTemporaryFile(suffix=".wav") as f:
+            config = RoadConditionsConfiguration.load()
+            config.transition_sound_enabled = True
+            config.transition_sound_path = f.name
+            config.save()
+            with patch(f"{CMD}.synthesize_road_report", return_value=fake_track()) as mock_synth:
+                call_command("generate_road_condition_audio", stdout=StringIO())
+            self.assertIsNone(mock_synth.call_args.kwargs.get("segments"))
+
+    def test_dry_run_shows_transition_sound_line_when_applicable(self):
+        with tempfile.NamedTemporaryFile(suffix=".wav") as f:
+            config = RoadConditionsConfiguration.load()
+            config.transition_sound_enabled = True
+            config.transition_sound_path = f.name
+            config.save()
+            make_road_event(external_id="A", headline_category="closure", description="First.")
+            make_road_event(external_id="B", headline_category="roadwork", description="Second.")
+            with patch(f"{CMD}.synthesize_road_report") as mock_synth:
+                out = StringIO()
+                call_command("generate_road_condition_audio", "--dry-run", "--voice", "day", stdout=out)
+                mock_synth.assert_not_called()
+            self.assertIn("Transition sound:", out.getvalue())
+            self.assertIn(f.name, out.getvalue())
+
+    def test_dry_run_omits_transition_sound_line_when_not_applicable(self):
+        make_road_event(external_id="A", headline_category="closure", description="Only event.")
+        with patch(f"{CMD}.synthesize_road_report") as mock_synth:
+            out = StringIO()
+            call_command("generate_road_condition_audio", "--dry-run", "--voice", "day", stdout=out)
+            mock_synth.assert_not_called()
+        self.assertNotIn("Transition sound:", out.getvalue())
+
+
+class TransitionSoundEndToEndCommandTests(KanDriveSynthesisFixtureMixin, TransactionTestCase):
+    """Real synthesize_road_report, fake Kokoro/ffmpeg subprocess calls
+    (via KanDriveSynthesisFixtureMixin) -- proves the whole chain
+    (config -> command decision -> report.py segment building ->
+    synthesis.py per-segment Kokoro calls) actually wires together, not
+    just that the command passes the right mocked arguments."""
+
+    def setUp(self):
+        super().setUp()
+        make_fresh_config()
+
+    def test_enabled_with_two_events_makes_multiple_kokoro_calls(self):
+        with tempfile.NamedTemporaryFile(suffix=".wav") as f:
+            config = RoadConditionsConfiguration.load()
+            config.transition_sound_enabled = True
+            config.transition_sound_path = f.name
+            config.save()
+            make_road_event(external_id="A", headline_category="closure", description="First event.")
+            make_road_event(external_id="B", headline_category="roadwork", description="Second event.")
+            call_command("generate_road_condition_audio", "--voice", "day", stdout=StringIO())
+        self.assertEqual(self._kokoro_call_count, 2)
+        self.assertTrue(road_report_path().exists())
+
+    def test_disabled_makes_a_single_kokoro_call_even_with_two_events(self):
+        make_road_event(external_id="A", headline_category="closure", description="First event.")
+        make_road_event(external_id="B", headline_category="roadwork", description="Second event.")
+        call_command("generate_road_condition_audio", "--voice", "day", stdout=StringIO())
+        self.assertEqual(self._kokoro_call_count, 1)
+
+    def test_enabled_with_missing_file_makes_a_single_kokoro_call(self):
+        config = RoadConditionsConfiguration.load()
+        config.transition_sound_enabled = True
+        config.transition_sound_path = "/nonexistent/woosh.wav"
+        config.save()
+        make_road_event(external_id="A", headline_category="closure", description="First event.")
+        make_road_event(external_id="B", headline_category="roadwork", description="Second event.")
+        out = StringIO()
+        call_command("generate_road_condition_audio", "--voice", "day", stdout=out)
+        self.assertEqual(self._kokoro_call_count, 1)
+        self.assertIn("not found/readable", out.getvalue())
+
+    def test_enabled_with_three_events_makes_three_kokoro_calls(self):
+        with tempfile.NamedTemporaryFile(suffix=".wav") as f:
+            config = RoadConditionsConfiguration.load()
+            config.transition_sound_enabled = True
+            config.transition_sound_path = f.name
+            config.save()
+            make_road_event(external_id="A", headline_category="closure", description="Event one.")
+            make_road_event(external_id="B", headline_category="roadwork", description="Event two.")
+            make_road_event(external_id="C", headline_category="warning", description="Event three.")
+            call_command("generate_road_condition_audio", "--voice", "day", stdout=StringIO())
+        self.assertEqual(self._kokoro_call_count, 3)

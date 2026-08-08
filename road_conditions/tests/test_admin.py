@@ -48,6 +48,13 @@ class RoadConditionsAdminTests(TestCase):
         self.assertContains(response, 'name="report_preamble"')
         self.assertContains(response, 'name="report_postamble"')
 
+    def test_config_change_form_includes_transition_sound_fields(self):
+        RoadConditionsConfiguration.load()
+        response = self.client.get(reverse("admin:road_conditions_roadconditionsconfiguration_change", args=[1]))
+        self.assertContains(response, "Item Transition Sound")
+        self.assertContains(response, 'name="transition_sound_enabled"')
+        self.assertContains(response, 'name="transition_sound_path"')
+
     def test_config_add_is_blocked_once_it_exists(self):
         RoadConditionsConfiguration.load()
         response = self.client.get(reverse("admin:road_conditions_roadconditionsconfiguration_add"))

@@ -33,6 +33,16 @@ class RoadConditionsConfigurationAdmin(admin.ModelAdmin):
                             "on purpose -- that voice metadata (see the Weather Configuration voice "
                             "schedule) is already the single source of truth for the name.",
         }),
+        ("Item Transition Sound", {
+            "fields": ["transition_sound_enabled", "transition_sound_path"],
+            "description": "Optional short sound effect (e.g. a 'woosh') inserted strictly BETWEEN "
+                            "individual road-condition items when the report speaks more than one -- "
+                            "never before the first item or after the last, and never possible at all "
+                            "with 0 or 1 items. Reuses the same file the KNS show ingest script already "
+                            "plays between stories by default. If the configured path is missing or "
+                            "unreadable at generation time, the report is generated without the "
+                            "transition sound rather than failing.",
+        }),
         ("CARS API", {
             "fields": ["api_base_url", "request_timeout_seconds", "poll_cadence_minutes"],
         }),

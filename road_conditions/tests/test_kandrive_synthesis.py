@@ -128,6 +128,129 @@ class SynthesizeRoadReportTests(KanDriveSynthesisFixtureMixin, TransactionTestCa
                 synthesize_road_report("Test report text.", "day", DAY_VOICE)
 
 
+class TransitionSoundSynthesisTests(KanDriveSynthesisFixtureMixin, TransactionTestCase):
+    """synthesize_road_report()'s `segments`/`transition_sound_path`
+    parameters -- the item-transition-sound path. fake_run (see
+    KanDriveSynthesisFixtureMixin) already handles both an arbitrary
+    number of Kokoro calls and either ffmpeg invocation shape (plain
+    two-arg convert, or the filter_complex concat used here) generically
+    -- both write their output to whatever path is last in the argv --
+    so no fixture changes were needed for this class. transition_sound_path
+    itself doesn't need to exist on disk for these tests: ffmpeg is
+    mocked, so nothing ever actually reads it."""
+
+    FAKE_WOOSH = "/fake/path/woosh.wav"
+
+    def test_multiple_segments_makes_one_kokoro_call_per_segment(self):
+        synthesize_road_report(
+            "unused when segments given", "day", DAY_VOICE,
+            segments=["first item.", "second item.", "third item."],
+            transition_sound_path=self.FAKE_WOOSH,
+        )
+        self.assertEqual(self._kokoro_call_count, 3)
+
+    def test_single_segment_falls_back_to_plain_path(self):
+        # Only one item -- no boundary to insert a transition at, so
+        # this must behave exactly like the plain (no-segments) path:
+        # exactly one Kokoro call, using `text` (not `segments[0]`).
+        synthesize_road_report(
+            "the actual text sent", "day", DAY_VOICE,
+            segments=["only item"], transition_sound_path=self.FAKE_WOOSH,
+        )
+        self.assertEqual(self._kokoro_call_count, 1)
+
+    def test_none_transition_sound_path_falls_back_to_plain_path_even_with_segments(self):
+        synthesize_road_report(
+            "the actual text sent", "day", DAY_VOICE,
+            segments=["first item.", "second item."], transition_sound_path=None,
+        )
+        self.assertEqual(self._kokoro_call_count, 1)
+
+    def test_none_segments_falls_back_to_plain_path(self):
+        synthesize_road_report(
+            "the actual text sent", "day", DAY_VOICE,
+            segments=None, transition_sound_path=self.FAKE_WOOSH,
+        )
+        self.assertEqual(self._kokoro_call_count, 1)
+
+    def test_transition_path_still_creates_track_with_expected_metadata(self):
+        track = synthesize_road_report(
+            "unused when segments given", "day", DAY_VOICE,
+            segments=["first item.", "second item."], transition_sound_path=self.FAKE_WOOSH,
+        )
+        self.assertEqual(track.filepath, str(road_report_path()))
+        self.assertEqual(track.format, "flac")
+        self.assertEqual(track.title, "KanDrive Road Report (Claira)")
+        self.assertTrue(track.ready2air)
+        self.assertEqual(track.duration_seconds, 300.0)  # from the mocked _probe_duration
+
+    def test_transition_path_file_actually_written_to_final_path(self):
+        track = synthesize_road_report(
+            "unused when segments given", "day", DAY_VOICE,
+            segments=["first item.", "second item."], transition_sound_path=self.FAKE_WOOSH,
+        )
+        self.assertTrue(Path(track.filepath).exists())
+        self.assertEqual(Path(track.filepath).read_bytes(), b"FAKE-FLAC-CONTENT")
+
+    def test_no_temp_files_left_behind_after_segmented_success(self):
+        synthesize_road_report(
+            "unused when segments given", "day", DAY_VOICE,
+            segments=["a", "b", "c"], transition_sound_path=self.FAKE_WOOSH,
+        )
+        leftovers = [p for p in Path(self._tmpdir.name).iterdir() if p.name.startswith(".")]
+        self.assertEqual(leftovers, [])
+
+    def test_kokoro_failure_on_any_segment_raises_synthesis_error(self):
+        self._kokoro_should_fail = True
+        with self.assertRaises(SynthesisError):
+            synthesize_road_report(
+                "unused when segments given", "day", DAY_VOICE,
+                segments=["a", "b"], transition_sound_path=self.FAKE_WOOSH,
+            )
+
+    def test_concat_ffmpeg_failure_raises_synthesis_error(self):
+        self._ffmpeg_should_fail = True
+        with self.assertRaises(SynthesisError):
+            synthesize_road_report(
+                "unused when segments given", "day", DAY_VOICE,
+                segments=["a", "b"], transition_sound_path=self.FAKE_WOOSH,
+            )
+
+    def test_no_temp_files_left_behind_after_segmented_failure(self):
+        self._ffmpeg_should_fail = True
+        with self.assertRaises(SynthesisError):
+            synthesize_road_report(
+                "unused when segments given", "day", DAY_VOICE,
+                segments=["a", "b"], transition_sound_path=self.FAKE_WOOSH,
+            )
+        leftovers = [p for p in Path(self._tmpdir.name).iterdir() if p.name.startswith(".")]
+        self.assertEqual(leftovers, [])
+
+    def test_segmented_failure_preserves_last_known_good_file_and_track(self):
+        good = synthesize_road_report("Good, plain report.", "day", DAY_VOICE)
+        good_bytes = Path(good.filepath).read_bytes()
+
+        self._ffmpeg_should_fail = True
+        with self.assertRaises(SynthesisError):
+            synthesize_road_report(
+                "unused when segments given", "night", NIGHT_VOICE,
+                segments=["a", "b"], transition_sound_path=self.FAKE_WOOSH,
+            )
+
+        self.assertEqual(Path(good.filepath).read_bytes(), good_bytes)
+        good.refresh_from_db()
+        self.assertEqual(good.title, "KanDrive Road Report (Claira)")  # NOT overwritten to the failed run's voice
+
+    def test_existing_call_sites_unaffected_by_new_optional_parameters(self):
+        # Backward-compatibility guard: every pre-existing call site in
+        # this test file (and the real command) calls
+        # synthesize_road_report(text, slot, voice) with no segments/
+        # transition_sound_path at all -- confirms that 3-positional-arg
+        # form still behaves identically (one Kokoro call).
+        synthesize_road_report("Plain text, old-style call.", "day", DAY_VOICE)
+        self.assertEqual(self._kokoro_call_count, 1)
+
+
 class LastKnownGoodPreservationTests(KanDriveSynthesisFixtureMixin, TransactionTestCase):
     def test_kokoro_failure_preserves_last_known_good_file_and_track(self):
         good = synthesize_road_report("Good report.", "day", DAY_VOICE)

@@ -272,11 +272,16 @@ class ReportBuildError(Exception):
     reportable and actionable, not a bare traceback."""
 
 
-def build_full_report(events, now=None):
-    """Concatenates every event's script, in the already-sorted order.
-    Returns "" for an empty list -- callers decide separately whether
-    that means "retire the existing audio" or "speak a no-advisory
-    message" (see build_no_events_message() / feed_freshness()).
+def build_event_scripts(events, now=None):
+    """Every event's own script, in the already-sorted order -- the same
+    per-event pieces build_full_report() joins into one string, exposed
+    separately for callers that need the individual audio-segment
+    boundaries (e.g. inserting a transition sound effect between items --
+    see synthesis.py's synthesize_road_report() `segments` argument and
+    compose_report_segments() below). Kept as the single place this
+    per-event loop and its error isolation live, so build_full_report()
+    and any segment-aware caller can never drift on what "one event's
+    script" means or how a per-event failure is reported.
 
     Raises ReportBuildError (naming the specific event) rather than
     letting a per-event formatting bug propagate as a bare, unattributed
@@ -293,7 +298,18 @@ def build_full_report(events, now=None):
             raise ReportBuildError(
                 f"Failed to build script for event {event.external_id!r}: {exc!r}"
             ) from exc
-    return " ".join(scripts)
+    return scripts
+
+
+def build_full_report(events, now=None):
+    """Concatenates every event's script, in the already-sorted order.
+    Returns "" for an empty list -- callers decide separately whether
+    that means "retire the existing audio" or "speak a no-advisory
+    message" (see build_no_events_message() / feed_freshness()).
+
+    Raises ReportBuildError (naming the specific event) -- see
+    build_event_scripts(), which this is a thin wrapper around."""
+    return " ".join(build_event_scripts(events, now))
 
 
 def build_no_events_message():
@@ -335,7 +351,55 @@ def compose_report_script(body, config, announcer_name=""):
     with a single space between them, so two blank fields plus a body
     produce just the body, with no stray leading/trailing whitespace or
     doubled-up spacing."""
-    preamble = (config.report_preamble or "").strip().replace("{announcer_name}", announcer_name)
-    postamble = (config.report_postamble or "").strip().replace("{announcer_name}", announcer_name)
+    preamble, postamble = _resolve_framing(config, announcer_name)
     pieces = [piece for piece in (preamble, body, postamble) if piece]
     return " ".join(pieces)
+
+
+def _resolve_framing(config, announcer_name):
+    """Trim + {announcer_name}-substitute config.report_preamble/
+    report_postamble -- the one piece of logic compose_report_script()
+    (single combined string) and compose_report_segments() (per-item
+    audio-segment list, below) share, so the two can never define
+    "blank" or handle {announcer_name} differently. See
+    compose_report_script()'s own docstring for why this is a plain
+    str.replace() rather than str.format()."""
+    preamble = (config.report_preamble or "").strip().replace("{announcer_name}", announcer_name)
+    postamble = (config.report_postamble or "").strip().replace("{announcer_name}", announcer_name)
+    return preamble, postamble
+
+
+def compose_report_segments(body_pieces, config, announcer_name=""):
+    """Like compose_report_script(), but for a caller that needs the
+    report as a LIST of separately-synthesizable segments instead of
+    one joined string -- specifically, synthesize_road_report()'s
+    transition-sound path (see synthesis.py), which needs a real
+    audio-level boundary between each road-condition item to insert a
+    sound effect at. `body_pieces` is normally build_event_scripts()'s
+    own return value (one piece per item).
+
+    The preamble is folded into the FIRST piece and the postamble into
+    the LAST -- never their own separate pieces -- so a transition
+    sound is only ever inserted strictly BETWEEN two items, never
+    between the preamble and the first item or between the last item
+    and the postamble (matching the KNS show ingest script's own
+    woosh-between-stories convention: never immediately next to the
+    bumper either). Concatenating the returned list with a single
+    space joiner reproduces compose_report_script()'s own output
+    exactly, given the same body joined with spaces as `body` there --
+    the two share `_resolve_framing()` specifically so this equivalence
+    can't drift.
+
+    Blank pieces in `body_pieces` are dropped entirely (nothing to
+    synthesize). If every piece is blank, returns a single-element list
+    containing just the nonblank preamble/postamble (space-joined), or
+    an empty list if those are blank too -- callers should treat a
+    length-0 or length-1 result as "no meaningful segment boundary",
+    i.e. no transition sound is possible."""
+    preamble, postamble = _resolve_framing(config, announcer_name)
+    segments = [piece for piece in body_pieces if piece]
+    if preamble:
+        segments = [f"{preamble} {segments[0]}", *segments[1:]] if segments else [preamble]
+    if postamble:
+        segments = [*segments[:-1], f"{segments[-1]} {postamble}"] if segments else [postamble]
+    return segments

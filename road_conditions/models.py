@@ -101,6 +101,49 @@ class RoadConditionsConfiguration(models.Model):
         ),
     )
 
+    # Item transition sound effect -- reuses the same "woosh" audio file
+    # the Kansas News Service show ingest script (get_kns.py) already
+    # plays between stories, spliced in between individual road-
+    # condition items the same way (see report.py's
+    # compose_report_segments() and synthesis.py's
+    # _synthesize_with_transitions()). Off by default -- a fresh
+    # install/upgrade shouldn't start doing extra per-item Kokoro calls
+    # and ffmpeg concat work until an operator opts in. Never inserted
+    # before the first item or after the last (i.e. never between the
+    # preamble/postamble and the adjacent item, matching the KNS
+    # script's own convention of never wooshing next to its bumper) --
+    # and never possible at all with 0 or 1 items, since there's no
+    # boundary to insert it at.
+    transition_sound_enabled = models.BooleanField(
+        default=False,
+        help_text=(
+            "Insert a short transition sound effect between individual "
+            "road-condition items when the report speaks more than one -- "
+            "the same 'woosh' sting the KNS show ingest script already "
+            "plays between stories. Off by default. Requires "
+            "transition_sound_path below to point at a real, readable "
+            "audio file at generation time; if it doesn't, the report is "
+            "generated WITHOUT the transition sound rather than failing "
+            "the whole cycle."
+        ),
+    )
+    transition_sound_path = models.CharField(
+        max_length=1024, blank=True,
+        default="/home/jreed/syndicated-ingest/kns/woosh.wav",
+        help_text=(
+            "Absolute filesystem path to the transition sound effect "
+            "audio file. Defaults to the same woosh.wav the KNS show "
+            "ingest script already uses between stories. Only read when "
+            "transition_sound_enabled above is on. If this path is "
+            "blank, missing, or unreadable at generation time, the "
+            "report is generated without the transition sound (a "
+            "warning is printed) rather than failing -- if the file "
+            "itself is present but corrupt/unplayable, ffmpeg will fail "
+            "and the whole generation cycle is reported as failed, same "
+            "as any other synthesis error."
+        ),
+    )
+
     api_base_url = models.URLField(
         max_length=200,
         default="https://kscars.kandrive.gov/carsapi_v1/api",

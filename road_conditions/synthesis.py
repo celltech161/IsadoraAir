@@ -148,12 +148,104 @@ def _probe_duration(path):
     return float(out.stdout.strip())
 
 
-def synthesize_road_report(text, voice_slot, voice):
+def _synthesize_with_transitions(segments, voice, transition_sound_path, tmp_flac, pid, cleanup_paths):
+    """One Kokoro call per entry in `segments`, concatenated via a
+    single ffmpeg filter_complex pass with `transition_sound_path`
+    spliced in strictly BETWEEN consecutive segments -- never before
+    the first or after the last. Mirrors the KNS show ingest script's
+    own woosh-between-stories concat (get_kns.py's
+    _build_merge_ffmpeg_args/_canonical_input_chain) but simplified:
+    no loudnorm/highpass/tempo ladder, since (unlike KNS's mixed
+    external audio sources) Kokoro's own output across separate calls
+    with the same voice/model needs no such correction -- just format
+    normalization (sample rate/format/channel layout) so ffmpeg's
+    concat filter is happy splicing dissimilarly-encoded inputs
+    together. Writes directly to `tmp_flac`. Returns the resulting
+    duration in seconds.
+
+    Every per-segment WAV this creates is appended to `cleanup_paths`
+    (the caller's own `finally` unlinks them all, success or failure) --
+    this function itself never cleans up, matching the rest of
+    synthesize_road_report()'s established pattern of one shared
+    cleanup list/block rather than each step managing its own.
+
+    Raises SynthesisError on any Kokoro/ffmpeg failure, same as the
+    plain single-call path -- a bad transition-sound file (corrupt,
+    wrong format) surfaces here as an ffmpeg failure, not silently
+    skipped; only a MISSING file is treated as "feature not usable
+    right now" (see generate_road_condition_audio.py's own check,
+    which is what decides whether transition_sound_path is passed in
+    as non-None at all)."""
+    segment_wavs = []
+    for i, segment_text in enumerate(segments):
+        seg_wav = KANDRIVE_ROOT / f".{KANDRIVE_FILENAME}.{pid}.seg{i}.tmp.wav"
+        cleanup_paths.append(seg_wav)
+        subprocess.run(
+            [KOKORO_BINARY, "--model", voice["model"], "--output_file", str(seg_wav)],
+            input=segment_text.encode("utf-8"), check=True, timeout=600,
+        )
+        segment_wavs.append(seg_wav)
+
+    inputs, parts, concat_labels = [], [], []
+    idx = 0
+    for i, seg_wav in enumerate(segment_wavs):
+        inputs.extend(["-i", str(seg_wav)])
+        parts.append(f"[{idx}:a]aresample=44100,aformat=sample_fmts=s16:channel_layouts=stereo[s{i}]")
+        concat_labels.append(f"[s{i}]")
+        idx += 1
+        if i < len(segment_wavs) - 1:
+            inputs.extend(["-i", str(transition_sound_path)])
+            parts.append(f"[{idx}:a]aresample=44100,aformat=sample_fmts=s16:channel_layouts=stereo[w{i}]")
+            concat_labels.append(f"[w{i}]")
+            idx += 1
+
+    segment_count = len(concat_labels)
+    parts.append(f"{''.join(concat_labels)}concat=n={segment_count}:v=0:a=1[final]")
+    filter_complex = ";".join(parts)
+
+    # Generous but bounded -- concatenating already-synthesized short
+    # WAVs (no loudnorm analysis pass, unlike KNS) is fast; this is
+    # headroom for a slow disk/large event count, not a sized estimate.
+    subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-y"]
+        + inputs
+        + ["-filter_complex", filter_complex, "-map", "[final]", str(tmp_flac)],
+        check=True, timeout=180, capture_output=True,
+    )
+    return _probe_duration(tmp_flac)
+
+
+def synthesize_road_report(text, voice_slot, voice, segments=None, transition_sound_path=None):
     """Renders `text` via Kokoro (using the already-resolved `voice`
     dict -- see road_conditions/voice.py's resolve_voice(), which is
     the ONLY place a voice should be chosen; this function just plays
     whatever it's handed), converts to FLAC, and attaches it as the
     single KanDrive Track via filepath-keyed update_or_create.
+
+    `segments` and `transition_sound_path` are both optional and both
+    default to None -- every existing caller passing just (text,
+    voice_slot, voice) is completely unaffected and still gets the
+    exact single-Kokoro-call behavior this function has always had.
+    When BOTH are given, `segments` has 2+ entries, AND
+    transition_sound_path is a real, existing file, this instead
+    synthesizes each entry in `segments` as its OWN Kokoro call and
+    concatenates them via ffmpeg with the transition sound file spliced
+    in strictly BETWEEN consecutive segments -- see
+    _synthesize_with_transitions() below, which mirrors the KNS show
+    ingest script's own woosh-between-stories concat (get_kns.py's
+    _build_merge_ffmpeg_args). `text` itself is not used for synthesis
+    in that case (only `segments` is actually sent to Kokoro) -- it
+    still identifies what the caller considers the human-readable full
+    script (used for road_report.txt; see that call site), which by
+    construction (report.py's compose_report_segments(), sharing
+    _resolve_framing() with compose_report_script()) is exactly
+    " ".join(segments).
+
+    Any single segment with fewer than 2 real entries can't have a
+    transition inserted anywhere (there's no boundary), so it silently
+    falls back to the plain single-call path using `text` -- this is
+    what makes a 0- or 1-event report, or the feature being disabled,
+    behave identically to before this parameter existed.
 
     Raises SynthesisError on any Kokoro/ffmpeg/duration-probe failure
     -- the final path and any existing Track row are left completely
@@ -187,36 +279,52 @@ def synthesize_road_report(text, voice_slot, voice):
             f"synthesize_road_report only supports the kokoro engine, got {voice.get('engine')!r}"
         )
 
+    use_transitions = bool(segments) and len(segments) > 1 and bool(transition_sound_path)
+
     KANDRIVE_ROOT.mkdir(parents=True, exist_ok=True)
     final_path = _final_path()
     pid = os.getpid()
-    tmp_wav = KANDRIVE_ROOT / f".{KANDRIVE_FILENAME}.{pid}.tmp.wav"
     tmp_flac = KANDRIVE_ROOT / f".{KANDRIVE_FILENAME}.{pid}.tmp.flac"
+    # Every temp file this call creates (the plain path's one tmp_wav,
+    # or the transition path's per-segment WAVs) is appended here so
+    # the single `finally` below cleans up either way, success or
+    # failure -- same "always attempt, ignore FileNotFoundError"
+    # pattern already established for tmp_flac itself.
+    cleanup_paths = [tmp_flac]
 
     try:
         try:
-            # Timeout, NOT copied from webrequests/services.py's 30s --
-            # that value is sized for a several-second dedication intro.
-            # A KanDrive report is a full multi-event round-up (~780
-            # words / ~5-6 minutes of speech on the live dataset at
-            # reconnaissance time); kokoro_synth's own header comment
-            # documents ~1.5-2x realtime throughput on this hardware
-            # (a 30s forecast takes ~15-20s wall time), so a report this
-            # length could reasonably take several minutes of wall time
-            # to synthesize. 600s gives real headroom above that without
-            # being unbounded -- a genuinely hung Kokoro process still
-            # gets killed, just not mistaken for one on a long report.
-            subprocess.run(
-                [KOKORO_BINARY, "--model", voice["model"], "--output_file", str(tmp_wav)],
-                input=text.encode("utf-8"), check=True, timeout=600,
-            )
-            # WAV->FLAC conversion is comfortably faster than realtime;
-            # 120s is generous headroom, not a sized estimate.
-            subprocess.run(
-                ["ffmpeg", "-y", "-i", str(tmp_wav), str(tmp_flac)],
-                check=True, timeout=120, capture_output=True,
-            )
-            duration = _probe_duration(tmp_flac)
+            if use_transitions:
+                duration = _synthesize_with_transitions(
+                    segments, voice, transition_sound_path, tmp_flac, pid, cleanup_paths,
+                )
+            else:
+                tmp_wav = KANDRIVE_ROOT / f".{KANDRIVE_FILENAME}.{pid}.tmp.wav"
+                cleanup_paths.append(tmp_wav)
+                # Timeout, NOT copied from webrequests/services.py's 30s
+                # -- that value is sized for a several-second dedication
+                # intro. A KanDrive report is a full multi-event round-up
+                # (~780 words / ~5-6 minutes of speech on the live
+                # dataset at reconnaissance time); kokoro_synth's own
+                # header comment documents ~1.5-2x realtime throughput on
+                # this hardware (a 30s forecast takes ~15-20s wall time),
+                # so a report this length could reasonably take several
+                # minutes of wall time to synthesize. 600s gives real
+                # headroom above that without being unbounded -- a
+                # genuinely hung Kokoro process still gets killed, just
+                # not mistaken for one on a long report.
+                subprocess.run(
+                    [KOKORO_BINARY, "--model", voice["model"], "--output_file", str(tmp_wav)],
+                    input=text.encode("utf-8"), check=True, timeout=600,
+                )
+                # WAV->FLAC conversion is comfortably faster than
+                # realtime; 120s is generous headroom, not a sized
+                # estimate.
+                subprocess.run(
+                    ["ffmpeg", "-y", "-i", str(tmp_wav), str(tmp_flac)],
+                    check=True, timeout=120, capture_output=True,
+                )
+                duration = _probe_duration(tmp_flac)
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, ValueError) as exc:
             raise SynthesisError(f"Kokoro/ffmpeg synthesis failed: {exc}") from exc
 
@@ -239,7 +347,7 @@ def synthesize_road_report(text, voice_slot, voice):
         # function's own docstring.
         os.replace(tmp_flac, final_path)
     finally:
-        for p in (tmp_wav, tmp_flac):
+        for p in cleanup_paths:
             try:
                 p.unlink()
             except FileNotFoundError:

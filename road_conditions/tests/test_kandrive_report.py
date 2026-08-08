@@ -15,9 +15,11 @@ from road_conditions.models import RoadConditionsConfiguration, RoadEvent
 from road_conditions.report import (
     ReportBuildError,
     build_event_script,
+    build_event_scripts,
     build_full_report,
     build_no_events_message,
     compose_report_script,
+    compose_report_segments,
     feed_freshness,
     has_detour,
     select_events,
@@ -232,6 +234,106 @@ class NoEventsMessageTests(TestCase):
     def test_no_events_message_is_static_and_non_alarming(self):
         message = build_no_events_message()
         self.assertIn("not reporting any significant road conditions", message)
+
+
+class BuildEventScriptsTests(TestCase):
+    """build_event_scripts() -- the per-event LIST build_full_report()
+    is now a thin wrapper around, exposed separately for callers that
+    need real audio-segment boundaries (e.g. inserting a transition
+    sound effect between items -- see synthesis.py)."""
+
+    def test_returns_one_script_per_event_in_order(self):
+        a = make_road_event(external_id="A", headline_category="closure", description="Closed.")
+        b = make_road_event(external_id="B", headline_category="roadwork", description="Construction.")
+        scripts = build_event_scripts([a, b])
+        self.assertEqual(len(scripts), 2)
+        self.assertIn("Closed.", scripts[0])
+        self.assertIn("Construction.", scripts[1])
+
+    def test_empty_events_returns_empty_list(self):
+        self.assertEqual(build_event_scripts([]), [])
+
+    def test_equivalent_to_build_full_report_when_joined(self):
+        a = make_road_event(external_id="A", headline_category="closure", description="Closed.")
+        b = make_road_event(external_id="B", headline_category="roadwork", description="Construction.")
+        now = dj_timezone.now()
+        self.assertEqual(" ".join(build_event_scripts([a, b], now)), build_full_report([a, b], now))
+
+    def test_individual_event_failure_names_the_event_and_raises(self):
+        good = make_road_event(external_id="GOOD-2", description="Fine.")
+        bad = make_road_event(external_id="BAD-2", description="Also fine.")
+        RoadEvent.objects.filter(external_id="BAD-2").update(counties=123)
+        bad.refresh_from_db()
+
+        with self.assertRaises(ReportBuildError) as ctx:
+            build_event_scripts([good, bad])
+        self.assertIn("BAD-2", str(ctx.exception))
+
+
+class ComposeReportSegmentsTests(TestCase):
+    """compose_report_segments() -- the per-item audio-segment-list
+    counterpart to compose_report_script(), used by the transition-
+    sound path (synthesis.py's synthesize_road_report(segments=...))."""
+
+    def setUp(self):
+        self.config = RoadConditionsConfiguration.load()
+
+    def test_preamble_folded_into_first_segment_only(self):
+        self.config.report_preamble = "PREAMBLE."
+        self.config.report_postamble = ""
+        segments = compose_report_segments(["one", "two", "three"], self.config)
+        self.assertEqual(segments, ["PREAMBLE. one", "two", "three"])
+
+    def test_postamble_folded_into_last_segment_only(self):
+        self.config.report_preamble = ""
+        self.config.report_postamble = "POSTAMBLE."
+        segments = compose_report_segments(["one", "two", "three"], self.config)
+        self.assertEqual(segments, ["one", "two", "three POSTAMBLE."])
+
+    def test_both_preamble_and_postamble(self):
+        self.config.report_preamble = "PRE."
+        self.config.report_postamble = "POST."
+        segments = compose_report_segments(["one", "two", "three"], self.config)
+        self.assertEqual(segments, ["PRE. one", "two", "three POST."])
+
+    def test_segment_count_matches_input_when_both_blank(self):
+        self.config.report_preamble = ""
+        self.config.report_postamble = ""
+        segments = compose_report_segments(["one", "two", "three"], self.config)
+        self.assertEqual(segments, ["one", "two", "three"])
+
+    def test_announcer_name_substitution(self):
+        self.config.report_preamble = ""
+        self.config.report_postamble = "I'm {announcer_name}."
+        segments = compose_report_segments(["one", "two"], self.config, announcer_name="Claira Sky")
+        self.assertEqual(segments[-1], "two I'm Claira Sky.")
+
+    def test_single_item_with_framing_produces_single_segment(self):
+        # Exactly the case that must NOT get a transition sound
+        # inserted -- there's no second item to insert one before.
+        self.config.report_preamble = "PRE."
+        self.config.report_postamble = "POST."
+        segments = compose_report_segments(["only item"], self.config)
+        self.assertEqual(segments, ["PRE. only item POST."])
+
+    def test_empty_body_pieces_with_framing(self):
+        self.config.report_preamble = "PRE."
+        self.config.report_postamble = "POST."
+        segments = compose_report_segments([], self.config)
+        self.assertEqual(segments, ["PRE. POST."])
+
+    def test_empty_body_pieces_no_framing_returns_empty_list(self):
+        self.config.report_preamble = ""
+        self.config.report_postamble = ""
+        self.assertEqual(compose_report_segments([], self.config), [])
+
+    def test_joined_result_matches_compose_report_script(self):
+        self.config.report_preamble = "PRE {announcer_name}."
+        self.config.report_postamble = "POST {announcer_name}."
+        pieces = ["alpha", "beta", "gamma"]
+        segments = compose_report_segments(pieces, self.config, announcer_name="Max Weatherly")
+        single = compose_report_script(" ".join(pieces), self.config, announcer_name="Max Weatherly")
+        self.assertEqual(" ".join(segments), single)
 
 
 class FeedFreshnessTests(TestCase):

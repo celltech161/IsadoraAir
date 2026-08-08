@@ -1,3 +1,5 @@
+import os
+
 from django.core.management.base import BaseCommand, CommandError
 from django.db import connection
 from django.utils import timezone as dj_timezone
@@ -6,8 +8,9 @@ from library.models import Track
 from monitoring.models import emit_event
 from road_conditions.models import RoadConditionsConfiguration, RoadEvent
 from road_conditions.report import (
-    ReportBuildError, build_event_script, build_full_report,
-    build_no_events_message, compose_report_script, feed_freshness, select_events,
+    ReportBuildError, build_event_script, build_event_scripts,
+    build_no_events_message, compose_report_script, compose_report_segments,
+    feed_freshness, select_events,
 )
 from road_conditions.synthesis import (
     SynthesisError, retire_road_report, road_report_path, synthesize_road_report,
@@ -157,7 +160,12 @@ class Command(BaseCommand):
                 )
 
         try:
-            body = build_full_report(events, now) if events else build_no_events_message()
+            if events:
+                event_scripts = build_event_scripts(events, now)
+                body = " ".join(event_scripts)
+            else:
+                event_scripts = []
+                body = build_no_events_message()
         except ReportBuildError as exc:
             emit_event(
                 category="road_conditions", level="error", title="KanDrive report text generation failed",
@@ -195,6 +203,26 @@ class Command(BaseCommand):
             self.stdout.write(text)
             return
 
+        # Item transition sound -- only meaningful with 2+ events (no
+        # boundary to insert one at with 0 or 1). A missing/unreadable
+        # file degrades gracefully to plain synthesis (same shape as
+        # the KNS show ingest script's own woosh handling) rather than
+        # failing the whole cycle; a present-but-corrupt file instead
+        # surfaces later as an ordinary SynthesisError from ffmpeg,
+        # same as any other synthesis failure.
+        segments = None
+        transition_sound_path = None
+        if len(events) >= 2 and config.transition_sound_enabled:
+            candidate = (config.transition_sound_path or "").strip()
+            if candidate and os.path.exists(candidate):
+                transition_sound_path = candidate
+                segments = compose_report_segments(event_scripts, config, announcer_name=announcer_name)
+            else:
+                self.stdout.write(self.style.WARNING(
+                    f"Transition sound enabled but not found/readable at {candidate!r} -- "
+                    "generating without it."
+                ))
+
         final_path = road_report_path()
 
         if dry_run:
@@ -202,6 +230,11 @@ class Command(BaseCommand):
             self.stdout.write(f"[DRY RUN] Voice: slot={slot!r} model={voice['model']!r} name={voice['name']!r}")
             self.stdout.write("[DRY RUN] Intended category: KanDrive")
             self.stdout.write(f"[DRY RUN] Intended output file: {final_path}")
+            if transition_sound_path:
+                self.stdout.write(
+                    f"[DRY RUN] Transition sound: {transition_sound_path} "
+                    f"(between {len(segments)} items, {len(segments) - 1} insertion(s))"
+                )
             existing = Track.objects.filter(filepath=str(final_path)).first()
             if existing:
                 self.stdout.write(
@@ -215,7 +248,9 @@ class Command(BaseCommand):
             return
 
         try:
-            track = synthesize_road_report(text, slot, voice)
+            track = synthesize_road_report(
+                text, slot, voice, segments=segments, transition_sound_path=transition_sound_path,
+            )
         except SynthesisError as exc:
             emit_event(
                 category="road_conditions", level="error", title="KanDrive audio generation failed",
