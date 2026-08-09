@@ -1,0 +1,154 @@
+{
+  "event-id": "CARS5-12342",
+  "headline": {
+    "category": "device-status",
+    "code": "automated traffic signals"
+  },
+  "description": "KS 18: Automated traffic signals are in place. Between KS 15 and Dickinson County Line/Geary County Line (7 to 8 miles west of the Junction City area). Automated traffic signals are in place because a lane is closed and due to bridge construction work. Width limit 12'0\".",
+  "creator": {
+    "contact-id": "jane.doe",
+    "email-address": "jane.doe@example.invalid"
+  },
+  "editor": {
+    "editor-identifier": "jane.doe",
+    "description": "jane.doe"
+  },
+  "message-number": 12342,
+  "message-type-version": 0,
+  "priority": 5,
+  "sender": {
+    "organization-id": "CARS5",
+    "center-id": "agency",
+    "contacts": [
+      {
+        "contact-id": "jane.doe",
+        "email-address": "jane.doe@example.invalid",
+        "organization-name": "KDOT",
+        "person-name": "Jane Doe",
+        "phone-number": "7855550100"
+      }
+    ]
+  },
+  "update-number": 1,
+  "update-time": {
+    "time": 1784065260737,
+    "nanos": 737340000,
+    "timeZoneId": "America/Chicago",
+    "utcOffset": -18000000
+  },
+  "update-expiry-time": {
+    "time": 1904065260737,
+    "nanos": 737340000,
+    "timeZoneId": "America/Chicago",
+    "utcOffset": -21600000
+  },
+  "status": "UPDATED",
+  "details": [
+    {
+      "access": "PUBLIC_DOMAIN",
+      "duration-was-specified": true,
+      "duration": 2000000,
+      "element-id": 1,
+      "end-time": {
+        "time": 1904065260737,
+        "nanos": 737340000,
+        "timeZoneId": "America/Chicago",
+        "utcOffset": -21600000
+      },
+      "update-time": {
+        "time": 1784065260737,
+        "nanos": 737340000,
+        "timeZoneId": "America/Chicago",
+        "utcOffset": -18000000
+      },
+      "source": {
+        "organization-id": "CARS5",
+        "center-id": "agency",
+        "contacts": [
+          {
+            "contact-id": "jane.doe",
+            "email-address": "jane.doe@example.invalid",
+            "organization-name": "KDOT",
+            "person-name": "Jane Doe",
+            "phone-number": "7855550100"
+          }
+        ]
+      },
+      "descriptions": [
+        {
+          "description-type": "PhraseDescription",
+          "is-cause": false,
+          "kind": {
+            "category": "device-status",
+            "code": "automated traffic signals"
+          }
+        },
+        {
+          "description-type": "PhraseDescription",
+          "is-cause": true,
+          "kind": {
+            "category": "closure",
+            "code": "lane is closed"
+          }
+        },
+        {
+          "description-type": "PhraseDescription",
+          "is-cause": true,
+          "kind": {
+            "category": "roadwork",
+            "code": "bridge construction"
+          }
+        },
+        {
+          "description-type": "NumericQuantityDescription",
+          "kind": "QUANTITY_LINK_RESTRICTIONS_RESTRICTION_WIDTH",
+          "numeric-value": 365.7600082843782
+        }
+      ],
+      "locations": [
+        {
+          "location-type": "LinkLocation",
+          "link-direction": "NOT_DIRECTIONAL",
+          "link-ownership": "Kansas",
+          "primary-location": {
+            "geo-location": {
+              "location-type": "GeoLocation",
+              "latitude": 39.03126925473757,
+              "longitude": -97.05196892545483
+            },
+            "linear-reference": 156.9030561723272
+          },
+          "route-designator": "KS 18",
+          "linear-reference-version": 1,
+          "secondary-location": {
+            "geo-location": {
+              "location-type": "GeoLocation",
+              "latitude": 39.03105294994708,
+              "longitude": -97.03119978210958
+            },
+            "linear-reference": 158.02000399764302
+          }
+        }
+      ]
+    }
+  ],
+  "geometry": {
+    "type": "LineString",
+    "coordinates": [
+      [
+        -97.051969,
+        39.031269
+      ],
+      [
+        -97.031200,
+        39.031053
+      ]
+    ]
+  },
+  "counties": [
+    "Dickinson"
+  ],
+  "districts": [
+    "DISTRICT 2"
+  ]
+}

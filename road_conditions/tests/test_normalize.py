@@ -12,6 +12,7 @@ from road_conditions.services import (
     _MAX_LIST_ITEMS_IN_STORED_PAYLOAD,
     _parse_zoned_datetime,
     compute_checksum,
+    extract_cause_categories,
     normalize_event,
     sanitize_payload_for_storage,
 )
@@ -461,3 +462,115 @@ class ParseZonedDatetimeTests(SimpleTestCase):
         result = _parse_zoned_datetime(zdt)
         self.assertIsNotNone(result.tzinfo)
         self.assertEqual(result.tzinfo, timezone.utc)
+
+
+class NormalizeDeviceStatusWithCauseEventTests(SimpleTestCase):
+    """CARS5-12342 -- real live event whose top-level headline is
+    'automated traffic signals'/'device-status' (the EFFECT) but whose
+    details[].descriptions[] records the real is-cause reasons
+    underneath: 'lane is closed'/'closure' and 'bridge construction'/
+    'roadwork'. This is the exact event that motivated adding
+    cause_categories -- see report.py's _effective_category()."""
+
+    def setUp(self):
+        self.raw = load_fixture("event_device_status_with_cause.json")
+        self.normalized = normalize_event(self.raw)
+
+    def test_top_level_headline_is_still_device_status(self):
+        # cause_categories is ADDITIVE -- headline_category/headline_code
+        # still faithfully reflect KDOT's own top-level summary, unchanged.
+        self.assertEqual(self.normalized["headline_category"], "device-status")
+        self.assertEqual(self.normalized["headline_code"], "automated traffic signals")
+
+    def test_cause_categories_surfaces_the_real_underlying_reasons(self):
+        self.assertEqual(self.normalized["cause_categories"], ["closure", "roadwork"])
+
+
+class ExtractCauseCategoriesTests(SimpleTestCase):
+    """extract_cause_categories() in isolation -- hand-built payload
+    shapes covering the parsing rules precisely, plus the two real
+    fixtures that already exist for other purposes."""
+
+    def test_no_details_returns_empty_list(self):
+        self.assertEqual(extract_cause_categories({}), [])
+
+    def test_is_cause_false_entries_are_excluded(self):
+        raw = {"details": [{"descriptions": [
+            {"description-type": "PhraseDescription", "is-cause": False, "kind": {"category": "roadwork", "code": "x"}},
+        ]}]}
+        self.assertEqual(extract_cause_categories(raw), [])
+
+    def test_is_cause_true_phrase_description_is_included(self):
+        raw = {"details": [{"descriptions": [
+            {"description-type": "PhraseDescription", "is-cause": True, "kind": {"category": "closure", "code": "x"}},
+        ]}]}
+        self.assertEqual(extract_cause_categories(raw), ["closure"])
+
+    def test_numeric_quantity_description_is_skipped_not_crashed_on(self):
+        # A NumericQuantityDescription's own "kind" is a bare enum
+        # STRING (e.g. "QUANTITY_LINK_RESTRICTIONS_RESTRICTION_WIDTH"),
+        # not a {code, category} object -- must not raise, must not be
+        # mistaken for a category.
+        raw = {"details": [{"descriptions": [
+            {"description-type": "NumericQuantityDescription", "kind": "QUANTITY_LINK_RESTRICTIONS_RESTRICTION_WIDTH", "numeric-value": 12.0},
+        ]}]}
+        self.assertEqual(extract_cause_categories(raw), [])
+
+    def test_detour_description_is_skipped_not_crashed_on(self):
+        # A DetourDescription has no "kind"/"is-cause" at all.
+        raw = {"details": [{"descriptions": [
+            {"description-type": "DetourDescription", "detour-type": "PROPOSED_ALTERNATE_ROUTE", "locations-on-detour": []},
+        ]}]}
+        self.assertEqual(extract_cause_categories(raw), [])
+
+    def test_multiple_details_are_merged_and_deduped(self):
+        raw = {"details": [
+            {"descriptions": [{"description-type": "PhraseDescription", "is-cause": True, "kind": {"category": "closure", "code": "x"}}]},
+            {"descriptions": [{"description-type": "PhraseDescription", "is-cause": True, "kind": {"category": "closure", "code": "y"}}]},
+            {"descriptions": [{"description-type": "PhraseDescription", "is-cause": True, "kind": {"category": "roadwork", "code": "z"}}]},
+        ]}
+        self.assertEqual(extract_cause_categories(raw), ["closure", "roadwork"])
+
+    def test_result_is_sorted(self):
+        raw = {"details": [{"descriptions": [
+            {"description-type": "PhraseDescription", "is-cause": True, "kind": {"category": "warning", "code": "x"}},
+            {"description-type": "PhraseDescription", "is-cause": True, "kind": {"category": "closure", "code": "y"}},
+        ]}]}
+        self.assertEqual(extract_cause_categories(raw), ["closure", "warning"])
+
+    def test_malformed_descriptions_do_not_raise(self):
+        raw = {"details": [{"descriptions": [
+            "not a dict",
+            {"description-type": "PhraseDescription", "is-cause": True},  # missing "kind" entirely
+            {"description-type": "PhraseDescription", "is-cause": True, "kind": "not a dict"},
+            {"description-type": "PhraseDescription", "is-cause": True, "kind": {"category": 12345}},  # non-str category
+            {"description-type": "PhraseDescription", "is-cause": True, "kind": {}},  # missing category
+        ]}]}
+        self.assertEqual(extract_cause_categories(raw), [])  # must not raise
+
+    def test_malformed_details_do_not_raise(self):
+        self.assertEqual(extract_cause_categories({"details": "not a list"}), [])
+        self.assertEqual(extract_cause_categories({"details": ["not a dict"]}), [])
+        self.assertEqual(extract_cause_categories({"details": [{"descriptions": "not a list"}]}), [])
+
+    # No "non-dict top-level raw" case here on purpose -- same as its
+    # siblings all_routes()/_extract_all_locations(), this function is
+    # only ever called from inside normalize_event() AFTER that
+    # function's own `isinstance(raw, dict)` guard (which raises
+    # EventParseError first) -- a bare top-level raw.get(...) crash on
+    # a non-dict `raw` is consistent, established behavior across this
+    # whole family of extraction helpers, not a gap unique to this one.
+
+    def test_real_construction_fixture_has_no_cause_categories(self):
+        # event_construction.json's own single description is
+        # is-cause=false -- the top-level headline already IS the real
+        # reason, nothing hidden underneath.
+        raw = load_fixture("event_construction.json")
+        self.assertEqual(extract_cause_categories(raw), [])
+
+    def test_real_closure_fixture_has_roadwork_as_the_cause(self):
+        # event_closure.json's own descriptions: "closure" is-cause=false
+        # (it's the headline itself), "roadwork" is-cause=true (the real
+        # reason the closure exists).
+        raw = load_fixture("event_closure.json")
+        self.assertEqual(extract_cause_categories(raw), ["roadwork"])

@@ -4,9 +4,13 @@ wording (closure/restriction/construction/planned/detour), missing
 optional fields, multi-county/multi-route formatting, feed_freshness's
 four states, and ReportBuildError isolation. Uses real RoadEvent model
 instances built by a small local factory -- no CARS API fixtures needed
-here (those belong to services.py/normalize_event's own tests); this
-module operates entirely on already-normalized RoadEvent rows."""
+here (those belong to services.py/normalize_event's own tests) EXCEPT
+for DeviceStatusCauseCategoriesSeverityTests's own end-to-end regression,
+which deliberately runs a real fixture through normalize_event() to
+prove the whole chain, not just report.py's own logic in isolation."""
+import json
 from datetime import timedelta
+from pathlib import Path
 
 from django.test import TestCase
 from django.utils import timezone as dj_timezone
@@ -26,14 +30,17 @@ from road_conditions.report import (
     has_detour,
     select_events,
 )
+from road_conditions.services import normalize_event
 from road_conditions.synthesis import AUDIO_FORMAT_VERSION
+
+FIXTURES = Path(__file__).parent / "fixtures"
 
 
 def make_road_event(external_id="CARS5-TEST-1", headline_category="roadwork",
                      description="Test event description.", priority=5,
                      counties=None, routes=None, primary_route=None,
                      source_active=True, in_scope=True, start_time=None,
-                     raw_payload=None, now=None):
+                     raw_payload=None, cause_categories=None, now=None):
     now = now or dj_timezone.now()
     if routes is None:
         routes = [primary_route] if primary_route else ["US 81"]
@@ -51,6 +58,7 @@ def make_road_event(external_id="CARS5-TEST-1", headline_category="roadwork",
         source_active=source_active,
         in_scope=in_scope,
         raw_payload=raw_payload if raw_payload is not None else {},
+        cause_categories=cause_categories if cause_categories is not None else [],
         payload_checksum="test-checksum",
     )
 
@@ -86,6 +94,38 @@ class EventSelectionTests(TestCase):
     def test_device_status_headline_category_excluded(self):
         make_road_event(external_id="A", headline_category="device-status")
         self.assertEqual(select_events(), [])
+
+    def test_device_status_with_no_real_cause_still_excluded(self):
+        # cause_categories present but empty -- the common case (no
+        # is-cause PhraseDescription entries in the source at all).
+        make_road_event(external_id="A", headline_category="device-status", cause_categories=[])
+        self.assertEqual(select_events(), [])
+
+    def test_device_status_with_real_closure_cause_is_included(self):
+        # The real live scenario this feature exists for: top-level
+        # headline is device-status, but the source's own is-cause
+        # breakdown says this is actually a closure.
+        make_road_event(external_id="A", headline_category="device-status", cause_categories=["closure"])
+        self.assertEqual([e.external_id for e in select_events()], ["A"])
+
+    def test_device_status_with_real_roadwork_cause_is_included(self):
+        make_road_event(external_id="A", headline_category="device-status", cause_categories=["roadwork"])
+        self.assertEqual([e.external_id for e in select_events()], ["A"])
+
+    def test_device_status_cause_that_is_itself_device_status_stays_excluded(self):
+        # A cause_categories entry that duplicates the excluded category
+        # itself must not count as "a real cause" -- there needs to be
+        # something OUTSIDE the excluded set to justify inclusion.
+        make_road_event(external_id="A", headline_category="device-status", cause_categories=["device-status"])
+        self.assertEqual(select_events(), [])
+
+    def test_non_excluded_headline_with_cause_categories_is_unaffected(self):
+        # cause_categories is irrelevant noise for an event whose own
+        # top-level headline was never excluded in the first place --
+        # _effective_category() must not let it override a real,
+        # already-eligible headline_category.
+        make_road_event(external_id="A", headline_category="closure", cause_categories=["roadwork"])
+        self.assertEqual([e.external_id for e in select_events()], ["A"])
 
     def test_blank_description_excluded(self):
         make_road_event(external_id="A", description="")
@@ -130,6 +170,65 @@ class SeverityOrderingTests(TestCase):
         self.assertEqual(ordered[-1], "future-start")
         self.assertIn("past-start", ordered[:-1])
         self.assertIn("no-start", ordered[:-1])
+
+
+class DeviceStatusCauseCategoriesSeverityTests(TestCase):
+    """A device-status event that survives select_events() because of a
+    real is-cause reason (see EventSelectionTests) must also sort by
+    THAT real cause's severity tier, not fall into the generic
+    "unrecognized category" routine-construction bucket _severity_tier()
+    would otherwise give it."""
+
+    def test_device_status_with_closure_cause_sorts_as_a_closure(self):
+        make_road_event(external_id="device-status-closure", headline_category="device-status",
+                         cause_categories=["closure"], priority=1)
+        make_road_event(external_id="plain-warning", headline_category="warning", priority=9)
+        ordered = [e.external_id for e in select_events()]
+        # Closure tier beats the serious (warning/restriction) tier
+        # regardless of priority -- proves the device-status event is
+        # really being treated as TIER_CLOSURE, not just "included".
+        self.assertEqual(ordered, ["device-status-closure", "plain-warning"])
+
+    def test_device_status_with_only_roadwork_cause_sorts_as_construction(self):
+        make_road_event(external_id="device-status-roadwork", headline_category="device-status",
+                         cause_categories=["roadwork"], priority=9)
+        make_road_event(external_id="plain-closure", headline_category="closure", priority=1)
+        ordered = [e.external_id for e in select_events()]
+        # A closure still outranks even a high-priority roadwork cause.
+        self.assertEqual(ordered, ["plain-closure", "device-status-roadwork"])
+
+    def test_device_status_with_both_closure_and_roadwork_causes_prefers_closure(self):
+        # The real live CARS5-12342 shape: both a closure AND a
+        # roadwork is-cause entry -- closure (more severe) must win.
+        make_road_event(external_id="device-status-both", headline_category="device-status",
+                         cause_categories=["closure", "roadwork"], priority=1)
+        make_road_event(external_id="plain-warning", headline_category="warning", priority=9)
+        ordered = [e.external_id for e in select_events()]
+        self.assertEqual(ordered, ["device-status-both", "plain-warning"])
+
+    def test_device_status_with_unrecognized_cause_still_included_in_routine_bucket(self):
+        # A cause category this module doesn't otherwise special-case
+        # (KDOT could introduce one at any time) -- still spoken, in
+        # the same defensive "routine, not dropped" fallback
+        # _severity_tier() already uses for any unrecognized category.
+        make_road_event(external_id="device-status-unknown-cause", headline_category="device-status",
+                         cause_categories=["some-future-category"], priority=5)
+        self.assertEqual([e.external_id for e in select_events()], ["device-status-unknown-cause"])
+
+    def test_real_fixture_derived_event_is_included_and_prioritized_correctly(self):
+        # End-to-end regression using the exact real production shape
+        # (CARS5-12342) that motivated this feature: device-status
+        # headline, closure + roadwork is-cause reasons.
+        raw = json.loads((FIXTURES / "event_device_status_with_cause.json").read_text())
+        normalized = normalize_event(raw)
+        now = dj_timezone.now()
+        RoadEvent.objects.create(
+            **normalized, last_seen_at=now, source_active=True, in_scope=True,
+        )
+        make_road_event(external_id="plain-warning", headline_category="warning", priority=9)
+
+        ordered = [e.external_id for e in select_events(now)]
+        self.assertEqual(ordered, ["CARS5-12342", "plain-warning"])
 
 
 class ScriptWordingTests(TestCase):

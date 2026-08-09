@@ -79,10 +79,17 @@ REPORT_FINGERPRINT_VERSION = 1
 
 # device-status ("automated traffic signals" etc.) is infrastructure/
 # administrative status, not something a motorist needs to plan a
-# drive around -- excluded from selection entirely. Every other real
+# drive around -- excluded from selection entirely, UNLESS the event
+# also carries a real is-cause reason underneath (see
+# RoadEvent.cause_categories / _effective_category() below) -- a real
+# live example has a top-level "automated traffic signals"/
+# "device-status" headline but records "lane is closed"/"closure" and
+# "bridge construction"/"roadwork" as the actual is-cause reasons, and
+# that content must not be silently dropped just because of what KDOT
+# chose as the record's own top-level summary. Every other real
 # headline_category observed live (closure, roadwork, restriction,
-# warning, mobile-situation, special-event) carries genuine motorist-
-# relevant content and is eligible.
+# warning, mobile-situation, special-event) already carries genuine
+# motorist-relevant content directly and is eligible as-is.
 EXCLUDED_HEADLINE_CATEGORIES = {"device-status"}
 
 # Coarse severity tiers, matching the task's own suggested order
@@ -138,11 +145,13 @@ def select_events(now=None):
     min_priority/max_event_age_days/lookahead_days) as of the last
     complete sync -- nothing here re-applies or second-guesses those.
 
-    Excludes device-status/administrative records (no motorist action
-    to take) and any record with a blank description (nothing to
-    speak, and normalize_event() guarantees this is rare/anomalous,
-    not the normal case -- 231/231 live events carried one at
-    reconnaissance time).
+    Excludes device-status/administrative records with no real is-cause
+    reason underneath (see _effective_category() -- a device-status
+    record that DOES carry a genuine closure/roadwork/etc. cause is
+    kept) and any record with a blank description (nothing to speak,
+    and normalize_event() guarantees this is rare/anomalous, not the
+    normal case -- 231/231 live events carried one at reconnaissance
+    time).
 
     Does not attempt cross-event "same real-world condition, different
     event-id" deduplication -- the schema provides no reliable signal
@@ -155,12 +164,50 @@ def select_events(now=None):
     qs = (
         RoadEvent.objects
         .filter(source_active=True, in_scope=True)
-        .exclude(headline_category__in=EXCLUDED_HEADLINE_CATEGORIES)
         .exclude(description="")
     )
-    events = list(qs)
+    # Not filtered at the queryset level (unlike the old plain
+    # .exclude(headline_category__in=...)) -- excluding correctly now
+    # depends on _effective_category(), which also has to look at
+    # cause_categories, not just the indexed headline_category column.
+    # Dataset size here is small (low hundreds of rows at reconnaissance
+    # time), so a Python-level filter is not a real cost.
+    events = [e for e in qs if _effective_category(e) not in EXCLUDED_HEADLINE_CATEGORIES]
     events.sort(key=lambda e: (_severity_tier(e, now), -(e.priority or 0), e.external_id))
     return events
+
+
+def _effective_category(event):
+    """The category to use for BOTH inclusion (select_events()) and
+    severity-tiering (_severity_tier()) decisions. Normally just the
+    event's own top-level headline_category -- but for an event whose
+    headline_category is itself excluded (see EXCLUDED_HEADLINE_
+    CATEGORIES) AND that carries a real is-cause reason underneath
+    (RoadEvent.cause_categories -- see services.extract_cause_
+    categories()), the most severe of those real causes is used
+    instead. This is what lets a record whose top-level headline is
+    "automated traffic signals"/"device-status" but whose actual
+    is-cause reason is "lane is closed"/"closure" both (a) survive
+    select_events()'s exclusion and (b) sort into the CLOSURE tier it
+    actually deserves, rather than either being dropped entirely or
+    accidentally landing in the routine-construction fallback tier
+    _severity_tier() used to give any unrecognized category.
+
+    When cause_categories has more than one real cause, the most
+    severe wins (same tier ordering _severity_tier() itself uses) --
+    an event that's both a closure and roadwork cause is a closure
+    first. An is-cause category this module doesn't otherwise
+    recognize falls back to a stable, deterministic (sorted) choice
+    rather than being silently dropped from consideration."""
+    if event.headline_category not in EXCLUDED_HEADLINE_CATEGORIES:
+        return event.headline_category
+    causes = set(event.cause_categories or []) - EXCLUDED_HEADLINE_CATEGORIES
+    if not causes:
+        return event.headline_category  # no real cause found -- stays excluded, unchanged
+    for candidate in ("closure", "warning", "restriction", "roadwork", "mobile-situation", "special-event"):
+        if candidate in causes:
+            return candidate
+    return sorted(causes)[0]  # an is-cause category we don't otherwise recognize
 
 
 def _is_planned(event, now):
@@ -170,7 +217,7 @@ def _is_planned(event, now):
 def _severity_tier(event, now):
     if _is_planned(event, now):
         return _TIER_PLANNED
-    category = event.headline_category
+    category = _effective_category(event)
     if category == "closure":
         return _TIER_CLOSURE
     if category in ("warning", "restriction"):

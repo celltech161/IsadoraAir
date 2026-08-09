@@ -214,6 +214,51 @@ def all_routes(raw):
     return sorted(routes)
 
 
+def extract_cause_categories(raw):
+    """Every distinct `kind.category` across this event's own
+    details[].descriptions[], restricted to entries where
+    description-type is "PhraseDescription" AND "is-cause" is true
+    (sorted) -- see RoadEvent.cause_categories's help_text for why
+    this exists: KDOT's own top-level `headline` object (promoted to
+    RoadEvent.headline_category/headline_code) is sometimes NOT the
+    real reason an event is happening. A real live example: an event
+    whose top-level headline is "automated traffic signals"/
+    "device-status" (the EFFECT -- signals were deployed) can still
+    carry `is-cause: true` PhraseDescription entries underneath for
+    "lane is closed"/"closure" and "bridge construction"/"roadwork"
+    (the actual CAUSE) -- confirmed against two real live events at
+    verification time (CARS5-11053, CARS5-12342), not a hypothetical
+    schema corner case.
+
+    Only "PhraseDescription" entries are considered -- a
+    "NumericQuantityDescription" entry's own `kind` is a bare enum
+    string (e.g. "QUANTITY_LINK_RESTRICTIONS_RESTRICTION_WIDTH"), not a
+    {code, category} object, and a "DetourDescription" entry has no
+    `kind`/`is-cause` at all (see has_detour() in report.py, which
+    reads that description-type directly for its own, separate
+    purpose). Both are silently skipped here, never raise."""
+    categories = set()
+    for detail in _iter_details(raw):
+        if not isinstance(detail, dict):
+            continue
+        descriptions = detail.get("descriptions")
+        if not isinstance(descriptions, list):
+            continue
+        for desc in descriptions:
+            if not isinstance(desc, dict):
+                continue
+            if desc.get("description-type") != "PhraseDescription":
+                continue
+            if not desc.get("is-cause"):
+                continue
+            kind = desc.get("kind")
+            if isinstance(kind, dict):
+                category = kind.get("category")
+                if isinstance(category, str) and category:
+                    categories.add(category)
+    return sorted(categories)
+
+
 def _first_point(coords):
     # GeoJSon Point coordinates: [lon, lat]. LineString/MultiPoint:
     # [[lon,lat], ...]. Polygon/MultiLineString: [[[lon,lat], ...], ...].
@@ -266,6 +311,16 @@ def normalize_event(raw):
     unrecognized value should be stored and kept filterable/
     searchable, not treated as an error.
 
+    `cause_categories` (see extract_cause_categories()) is a similar
+    "don't trust only the convenience/top-level field" case: the
+    top-level `headline` object (headline_category/headline_code
+    above) is KDOT's own chosen SUMMARY for the record, and is not
+    always the real underlying reason it exists -- report.py's
+    select_events()/_severity_tier() consult cause_categories so a
+    real lane closure isn't dropped or under-prioritized just because
+    KDOT's top-level headline for that record was something like
+    "automated traffic signals"/"device-status".
+
     Multi-location events are preserved completely in `routes`/
     `locations` (see those fields' help_text) -- primary_route/
     primary_direction/latitude/longitude are convenience copies of the
@@ -304,6 +359,7 @@ def normalize_event(raw):
         "primary_route": primary_route,
         "primary_direction": primary_direction,
         "routes": all_routes(raw),
+        "cause_categories": extract_cause_categories(raw),
         "locations": locations,
         "latitude": latitude,
         "longitude": longitude,

@@ -530,6 +530,22 @@ class RoadEvent(models.Model):
         max_length=128, blank=True,
         help_text="Source 'headline.code' -- this event's own coded subtype, e.g. 'construction work', 'lane is closed', 'width restriction'.",
     )
+    cause_categories = models.JSONField(
+        default=list, blank=True,
+        help_text=(
+            "Every distinct category from this event's own details[].descriptions[] "
+            "entries marked is-cause=true (sorted), e.g. [\"closure\", \"roadwork\"] -- "
+            "see services.extract_cause_categories(). Distinct from headline_category "
+            "above: KDOT's own top-level headline is sometimes the EFFECT rather than "
+            "the cause (confirmed on real live events: a headline of 'automated traffic "
+            "signals'/'device-status' with 'closure'/'roadwork' recorded here as the "
+            "real is-cause reason). report.py's select_events()/_severity_tier() use "
+            "this so a genuine lane closure isn't dropped or under-prioritized just "
+            "because of what KDOT chose as the record's top-level headline. Empty for "
+            "the common case where the source provided no is-cause PhraseDescription "
+            "entries (i.e. the top-level headline already IS the real reason)."
+        ),
+    )
     description = models.TextField(
         blank=True,
         help_text="Source top-level 'description' -- KDOT's own plain-English summary. The primary field for listener-facing text.",

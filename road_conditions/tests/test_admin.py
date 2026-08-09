@@ -157,8 +157,18 @@ class RoadConditionsAdminTests(TestCase):
         # editable widgets.
         content = response.content.decode()
         for field_name in ("external_id", "description", "primary_route", "raw_payload",
-                            "source_active", "in_scope"):
+                            "source_active", "in_scope", "cause_categories"):
             self.assertNotIn(f'name="{field_name}"', content)
+
+    def test_road_event_change_form_shows_cause_categories(self):
+        raw = json.loads((FIXTURES / "event_device_status_with_cause.json").read_text())
+        normalized = normalize_event(raw)
+        now = timezone.now()
+        obj = RoadEvent.objects.create(**normalized, last_seen_at=now, last_changed_at=now,
+                                        source_active=True, in_scope=True)
+        response = self.client.get(reverse("admin:road_conditions_roadevent_change", args=[obj.pk]))
+        self.assertContains(response, "closure")
+        self.assertContains(response, "roadwork")
 
     def test_road_event_has_no_action_that_writes_state(self):
         # RoadEvent is fully source-managed -- there is deliberately no

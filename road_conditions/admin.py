@@ -175,10 +175,15 @@ class RoadEventAdmin(admin.ModelAdmin):
             "fields": ["external_id", "is_current_display", "source_active", "in_scope", "deactivated_at"],
         }),
         ("Classification", {
-            "fields": ["headline_category", "headline_code", "priority", "source_status"],
-            "description": "This event's OWN taxonomy (from the source 'headline' object) -- "
-                            "distinct from Road Conditions Configuration's event_classifications, "
-                            "which is the separate API query-level filter.",
+            "fields": ["headline_category", "headline_code", "cause_categories", "priority", "source_status"],
+            "description": "headline_category/headline_code are this event's OWN taxonomy (from the "
+                            "source 'headline' object) -- distinct from Road Conditions Configuration's "
+                            "event_classifications, which is the separate API query-level filter. "
+                            "cause_categories is the separate is-cause breakdown from this event's own "
+                            "details[].descriptions[] -- report.py's select_events()/_severity_tier() use "
+                            "it so a record whose top-level headline is e.g. 'automated traffic signals'/"
+                            "'device-status' but whose real is-cause reason is a closure/roadwork isn't "
+                            "silently dropped or under-prioritized.",
         }),
         ("Listener-Facing Text", {
             "fields": ["description"],
@@ -206,7 +211,7 @@ class RoadEventAdmin(admin.ModelAdmin):
     ]
     readonly_fields = [
         "external_id", "is_current_display", "source_active", "in_scope", "deactivated_at",
-        "headline_category", "headline_code", "priority", "source_status", "description",
+        "headline_category", "headline_code", "cause_categories", "priority", "source_status", "description",
         "primary_route", "primary_direction", "latitude", "longitude", "routes", "locations",
         "counties", "districts", "geometry_display", "start_time", "end_time",
         "source_update_time", "source_next_update_time", "source_update_expiry_time", "update_number",
