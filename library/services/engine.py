@@ -2565,6 +2565,58 @@ class PlaybackEngine:
         with self._fx_lock:
             return [fid for fid, f in self._fx_fires.items() if f["cart_id"] == cart_id]
 
+    def _fx_fires_state(self):
+        """Serializable snapshot of currently-active FX fires, for the
+        dashboard's authoritative-state reconciliation (see
+        dashboard.html's reconcileFxFires/_fxSyncButton). Read by
+        _write_state and exposed verbatim through /api/engine/status/,
+        same pass-through pattern that file already uses for deck/
+        queue state.
+
+        Each entry is {"cart_id": int, "elapsed_seconds": float}.
+        VT fires (cart_id is None -- see _vt_fire_file) are excluded:
+        they're not cart-button-driven and have no dashboard element to
+        match against.
+
+        elapsed_seconds is computed HERE, server-side, at write time --
+        the same "elapsed-at-write-time" convention _write_state already
+        uses for deck position (self._get_deck_position, rounded and
+        embedded directly rather than a raw start timestamp). This
+        deliberately avoids ever serializing the engine's own
+        wall-clock started_at for the browser to diff against its own
+        Date.now() -- a different process/clock domain. The browser
+        only ever needs "how far into playback is this, as of the
+        state snapshot whose overall staleness state["timestamp"]
+        already governs" -- not an absolute instant to reconcile
+        against its own clock.
+
+        Deliberately does NOT include duration_seconds: each dashboard
+        button already carries its own FXCart.duration_seconds via
+        data-duration (rendered server-side at page load, from the
+        exact same field) -- serializing it a second time here would
+        just be a second, no-fresher copy of the same value to keep in
+        sync for no benefit, since a stale page reload already picks up
+        the current duration on its own.
+
+        Multiple simultaneous fires of the SAME cart_id are returned as
+        separate list entries, not collapsed -- _fx_fire's own
+        retrigger handling (see its 'ignore'/'stop'/'restart' branches)
+        happens to make >1 concurrent fire per cart_id impossible today
+        for any retrigger mode, but this function doesn't assume that;
+        it's the caller (dashboard JS, which has exactly one button per
+        cart) that reduces this down, not the wire format."""
+        with self._fx_lock:
+            fires = list(self._fx_fires.values())
+        now = time.time()
+        out = []
+        for f in fires:
+            cart_id = f.get("cart_id")
+            if cart_id is None:
+                continue
+            elapsed = max(0.0, now - f["started_at"])
+            out.append({"cart_id": cart_id, "elapsed_seconds": round(elapsed, 1)})
+        return out
+
     def _fx_fire(self, cart_id):
         """Play one FXCart. Honors retrigger_mode + polyphony cap. Returns
         True if a new fire was started, False otherwise (dropped by cap
@@ -5291,6 +5343,13 @@ class PlaybackEngine:
                 "remote_dj_configured": self.remote_dj_tee is not None,
                 "remote_dj_connected": self.remote_dj_session is not None,
                 "remote_dj_live": self._remote_dj_gate_open(),
+                # Authoritative FX Cart playback state -- see
+                # _fx_fires_state's own docstring. Drives the dashboard's
+                # progress-bar reconciliation regardless of what
+                # initiated the fire (manual click, keyboard shortcut,
+                # another open dashboard/remote-DJ session, or an
+                # external trigger like the weather beep bridge).
+                "fx_fires": self._fx_fires_state(),
             }
 
             tmp = STATE_PATH.with_suffix(".tmp")

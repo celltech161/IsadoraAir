@@ -588,7 +588,13 @@
     content: "";
     position: absolute;
     left: 0; top: 0; bottom: 0;
-    width: 0%;
+    /* --fx-start-pct lets JS resume the sweep from wherever the
+       engine's authoritative elapsed time says it actually is (e.g.
+       a fire discovered mid-play through a poll, or opening the
+       dashboard partway through an external fire) instead of always
+       restarting the animation from empty. Defaults to 0% for the
+       normal case -- a fresh click/keypress. See _fxSyncButton. */
+    width: var(--fx-start-pct, 0%);
     background: var(--fx-playing, var(--accent));
     z-index: 0;
     pointer-events: none;
@@ -1294,11 +1300,39 @@ function toggleFxPanelMobile() {
   label.textContent = 'FX Carts (' + count + ') ' + (open ? '▲' : '▼');
 }
 
-// Track live fires client-side so retrigger visual + keyboard shortcuts
-// can behave symmetrically to the server's authoritative state. This is
-// UX only; the server enforces polyphony + retrigger for real.
-// Key = cart_id string, value = { timeoutId, endsAt }
+// --- FX Cart progress: engine-authoritative, with optimistic local
+// feedback on click ------------------------------------------------
+//
+// The engine is the single source of truth for "is this cart actually
+// playing" -- it reports every currently-active fire (however it was
+// triggered: this browser's click, a keyboard shortcut, another open
+// dashboard/remote-DJ session, or an external process like the
+// weather beep bridge) through the normal /api/engine/status/ poll
+// (data.fx_fires, written by engine.py's _fx_fires_state -- see its
+// docstring for why elapsed_seconds is pre-computed server-side
+// rather than a raw timestamp). reconcileFxFires() runs on every
+// existing 1s poll tick and drives the button visuals from that.
+//
+// A click still gets an immediate LOCAL optimistic animation for
+// tactile responsiveness (_fxStartVisual) -- but it's provisional:
+// the very next poll either confirms it (engine agrees the cart is
+// playing -- _fxSyncButton corrects any small timing discrepancy and
+// promotes it to 'engine'-sourced) or reverses it (engine doesn't
+// list it -- rejected by retrigger/polyphony, or it was simply too
+// short to ever be caught by a 1s-cadence poll -- reconcileFxFires
+// stops it). _fxLive never remains an independent competing source of
+// truth past that first reconciliation.
+//
+// Key = cart_id string. Value shape:
+//   { timeoutId, source: 'optimistic' | 'engine',
+//     syncElapsedSeconds, syncWallClockMs }
+// (syncElapsedSeconds/syncWallClockMs are only set once source is
+// 'engine' -- they're what the drift-tolerance check in
+// _fxSyncButton predicts forward from, so a routine poll that's
+// still consistent with the already-running CSS transition doesn't
+// restart it and cause a visible hiccup.)
 const _fxLive = {};
+const FX_DRIFT_TOLERANCE_SECONDS = 0.5;
 
 function _fxStopVisual(btn, cartId) {
   // Snap the ::before width back to 0% instantly. Removing the
@@ -1307,6 +1341,7 @@ function _fxStopVisual(btn, cartId) {
   // -- so the snapback is immediate rather than easing back down.
   btn.classList.remove('fx-firing');
   btn.style.removeProperty('--fx-duration');
+  btn.style.removeProperty('--fx-start-pct');
   if (_fxLive[cartId] && _fxLive[cartId].timeoutId) {
     clearTimeout(_fxLive[cartId].timeoutId);
   }
@@ -1314,16 +1349,106 @@ function _fxStopVisual(btn, cartId) {
 }
 
 function _fxStartVisual(btn, cartId, durationSec) {
+  // Optimistic, click-driven, always from 0% -- see fireFxCart. Not
+  // authoritative; reconcileFxFires corrects or reverses this on the
+  // very next poll.
+  btn.style.removeProperty('--fx-start-pct');  // in case a previous engine-sync left this nonzero
+  btn.style.setProperty('--fx-duration', durationSec + 's');
   // Set duration first, then flip on the class in the next animation
   // frame. Without the rAF, the browser can batch both changes into a
   // single style recalc and skip the transition entirely -- classic
   // "changed too fast" gotcha with CSS transitions.
-  btn.style.setProperty('--fx-duration', durationSec + 's');
   requestAnimationFrame(() => {
     btn.classList.add('fx-firing');
   });
+  if (_fxLive[cartId] && _fxLive[cartId].timeoutId) {
+    clearTimeout(_fxLive[cartId].timeoutId);
+  }
   const timeoutId = setTimeout(() => _fxStopVisual(btn, cartId), Math.max(50, durationSec * 1000));
-  _fxLive[cartId] = { timeoutId, endsAt: Date.now() + durationSec * 1000 };
+  _fxLive[cartId] = { timeoutId, source: 'optimistic' };
+}
+
+function _fxSyncButton(btn, cartId, engineElapsedSeconds) {
+  // Authoritative (re)sync from the engine's own state -- discovery of
+  // an externally-triggered fire, promotion of an optimistic click
+  // once the engine confirms it, or correcting drift on an
+  // already-engine-synced button.
+  const live = _fxLive[cartId];
+  if (live && live.source === 'engine') {
+    // Already engine-synced: only restart the CSS transition if the
+    // running animation has drifted from what the engine now reports
+    // by more than a small tolerance. Re-triggering every single 1s
+    // poll tick (even when nothing meaningful changed) would visibly
+    // hitch an otherwise-smooth sweep -- the whole point of leaving
+    // this a CSS transition between polls rather than driving it from
+    // JS every tick.
+    const predictedElapsed = live.syncElapsedSeconds + (Date.now() - live.syncWallClockMs) / 1000;
+    if (Math.abs(predictedElapsed - engineElapsedSeconds) < FX_DRIFT_TOLERANCE_SECONDS) {
+      return;
+    }
+  }
+  // Same duration source (and same 2.0s fallback) fireFxCart already
+  // uses -- there's exactly one place a cart's duration is known
+  // client-side, its own button dataset (rendered from FXCart.
+  // duration_seconds at page load). The engine deliberately doesn't
+  // re-send it; see _fx_fires_state's docstring.
+  const duration = parseFloat(btn.dataset.duration) || 2.0;
+  const remaining = duration - engineElapsedSeconds;
+  if (remaining <= 0.05) {
+    // Engine says it's effectively done (or our only duration figure
+    // is a stale/fallback guess that's already elapsed) -- don't
+    // start a backwards or zero-length transition.
+    _fxStopVisual(btn, cartId);
+    return;
+  }
+  const startPct = Math.min(100, Math.max(0, (engineElapsedSeconds / duration) * 100));
+  if (live && live.timeoutId) {
+    clearTimeout(live.timeoutId);
+  }
+  btn.classList.remove('fx-firing');
+  btn.style.setProperty('--fx-start-pct', startPct + '%');
+  // Force a style flush so the instant jump to startPct (under the
+  // base rule's `transition: width 0s linear`) commits BEFORE we
+  // re-enable the real transition below -- same "changed too fast"
+  // reasoning _fxStartVisual's rAF comment already documents, just
+  // via a synchronous reflow instead since this jump must be instant,
+  // not itself animated.
+  void btn.offsetWidth;
+  btn.style.setProperty('--fx-duration', remaining + 's');
+  requestAnimationFrame(() => {
+    btn.classList.add('fx-firing');
+  });
+  const timeoutId = setTimeout(() => _fxStopVisual(btn, cartId), Math.max(50, remaining * 1000));
+  _fxLive[cartId] = {
+    timeoutId, source: 'engine',
+    syncElapsedSeconds: engineElapsedSeconds, syncWallClockMs: Date.now(),
+  };
+}
+
+function reconcileFxFires(fxFires) {
+  // Build cart_id -> elapsed_seconds from the engine's authoritative
+  // list. A duplicate cart_id (not possible today -- _fx_fire's own
+  // retrigger handling caps any cart at one concurrent fire in every
+  // mode -- but the wire format doesn't assume that) just keeps the
+  // last entry seen; harmless, since the UI has exactly one button
+  // per cart to reconcile onto regardless.
+  const activeByCart = new Map();
+  (fxFires || []).forEach(f => {
+    if (f && f.cart_id != null) activeByCart.set(String(f.cart_id), f.elapsed_seconds);
+  });
+
+  document.querySelectorAll('.fx-cart[data-cart-id]').forEach(btn => {
+    const cartId = btn.dataset.cartId;
+    if (activeByCart.has(cartId)) {
+      _fxSyncButton(btn, cartId, activeByCart.get(cartId));
+    } else if (_fxLive[cartId]) {
+      // Engine no longer reports this cart as active -- it finished
+      // normally, OR an optimistic click never actually took (dropped
+      // by retrigger 'ignore'/'stop' or the polyphony cap). Either
+      // way, authoritative state wins over any lingering local guess.
+      _fxStopVisual(btn, cartId);
+    }
+  });
 }
 
 async function fireFxCart(btn) {
@@ -2342,6 +2467,7 @@ async function poll() {
   renderRemoteDjConnect(data);
   renderRemoteDjGate(data);
   renderManualMode(data);
+  reconcileFxFires(data.fx_fires);
 }
 
 // Poll engine status every 1 second

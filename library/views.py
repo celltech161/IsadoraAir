@@ -2071,14 +2071,14 @@ def api_engine_manual_mode(request):
 def api_engine_status(request):
     state_path = Path("/run/isadoraair/engine_state.json")
     if not state_path.is_file():
-        return JsonResponse({"transport": "OFFLINE", "decks": {"A": None, "B": None}, "queue": []})
+        return JsonResponse({"transport": "OFFLINE", "decks": {"A": None, "B": None}, "queue": [], "fx_fires": []})
     try:
         data = json.loads(state_path.read_text(encoding="utf-8"))
         if time_mod.time() - data.get("timestamp", 0) > 10:
             data["transport"] = "STALE"
         return JsonResponse(data)
     except Exception:
-        return JsonResponse({"transport": "ERROR", "decks": {"A": None, "B": None}, "queue": []})
+        return JsonResponse({"transport": "ERROR", "decks": {"A": None, "B": None}, "queue": [], "fx_fires": []})
 
 
 @require_http_methods(["GET"])
