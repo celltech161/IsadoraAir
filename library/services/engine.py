@@ -2742,11 +2742,12 @@ class PlaybackEngine:
 
         decodebin.connect("pad-added", _on_decodebin_pad_added)
 
-        # Wire an EOS handler by watching the bus for messages from THIS
-        # fire's elements. The bus is shared, so we filter by src.
-        bus = self.main_pipeline.get_bus()
-        bus.add_signal_watch()   # idempotent -- safe to call again
-        bus.connect("message::eos", self._fx_on_eos, fire_id)
+        # Branch-local completion signal -- deliberately NOT the shared
+        # pipeline bus. See _fx_install_completion_probe's own
+        # docstring for why message::eos never reaches the bus for a
+        # branch feeding fx_submix, verified empirically rather than
+        # assumed.
+        self._fx_install_completion_probe(gain.get_static_pad("src"), fire_id)
 
         # State: PLAYING. Same order as _create_deck's sync_state pattern.
         for el in (filesrc, decodebin, convert, resample, fx_caps, gain):
@@ -2755,28 +2756,92 @@ class PlaybackEngine:
         print(f"  FX fire {fire_id}: cart {cart_id} ({cart.name!r})")
         return True
 
-    def _fx_on_eos(self, bus, message, fire_id):
+    def _fx_install_completion_probe(self, pad, fire_id):
+        """Installs a branch-local EOS probe on `pad` -- the last real
+        element's src pad before it joins fx_submix (see _fx_fire's
+        `gain` element / _vt_fire_file's own) -- that detects THIS
+        branch's own natural completion, independent of the shared
+        main pipeline ever reaching a pipeline-wide EOS.
+
+        Why not the pipeline bus (this file used to watch
+        "message::eos" there via _fx_on_eos, now removed): fx_submix
+        is a live GstAggregator with other permanently-running inputs
+        (including its own permanent silence branch -- see _fx_setup).
+        A GstAggregator only posts a pipeline-level EOS once EVERY
+        sink pad has seen its own EOS, which for a mixer with an
+        always-live input can structurally never happen. This isn't
+        theoretical -- it's exactly the live bug this method fixes: a
+        fired cart's own state entry was confirmed (2026-08 live
+        verification) to sit in self._fx_fires indefinitely, well past
+        its real duration, because _fx_on_eos's bus watch simply never
+        fired. _create_deck's own eos_probe (ghost_pad, feeding
+        self.mixer) already solves the identical problem the identical
+        way for decks -- this is the same idiom, applied to the FX/VT
+        submix path, confirmed via an isolated offline harness
+        matching this exact topology (live audiomixer + permanent
+        silence input + one-shot filesrc branch) before touching this
+        code: the branch-local pad probe reliably observes the EOS
+        that never reaches the bus, and clean teardown immediately
+        afterward (set NULL, unlink, release_request_pad, remove from
+        pipeline) leaves the mixer/pipeline running normally.
+
+        Drops the EOS event here (Gst.PadProbeReturn.DROP) rather than
+        letting it continue into fx_submix's request pad -- same
+        choice _create_deck's own eos_probe already makes, for the
+        same reason, and reconfirmed safe here via that same offline
+        harness.
+
+        Streaming-thread safety: this probe callback runs on
+        GStreamer's own streaming thread, NOT the GLib main-loop
+        thread. It must never itself perform destructive teardown
+        (set_state(NULL), pipeline.remove(), release_request_pad()) --
+        it only schedules _fx_fire_completed via GLib.idle_add (
+        documented safe to call from any thread), which does the
+        actual teardown on the main loop, same handoff pattern
+        _on_deck_eos_probed's own installation already uses."""
+        def _completion_probe(pad, info, fire_id=fire_id):
+            event = info.get_event()
+            if event.type == Gst.EventType.EOS:
+                GLib.idle_add(self._fx_fire_completed, fire_id)
+                return Gst.PadProbeReturn.DROP
+            return Gst.PadProbeReturn.OK
+
+        pad.add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM, _completion_probe)
+
+    @_glib_safe(default_return=False)
+    def _fx_fire_completed(self, fire_id):
+        """Shared branch-completion path for an FX/VT fire reaching its
+        own natural end -- scheduled via GLib.idle_add from
+        _fx_install_completion_probe's pad probe, never called
+        directly from a streaming thread. Replaces the old
+        _fx_on_eos (bus-watch based, removed -- see
+        _fx_install_completion_probe's docstring for why it never
+        actually fired).
+
+        Looks the fire up fresh rather than trusting the caller still
+        has a live reference: a retrigger-triggered _fx_stop() (main-
+        thread, synchronous, e.g. an operator's "restart" click) may
+        already have torn this exact fire down by the time this idle
+        callback runs. A missing fire_id is a silent, safe no-op --
+        the same pop-or-None idempotency _fx_stop() itself already
+        relies on, which is also what makes a duplicate/late-scheduled
+        completion for the same fire_id harmless (whichever runs
+        first wins; the second finds nothing to do).
+
+        Ordering preserved exactly as the old _fx_on_eos had it: for a
+        VT fire, advance the VT state machine BEFORE tearing down --
+        _vt_handle_outgoing_ended needs to see the in-flight fire_id
+        still present in self._fx_fires while it decides whether the
+        outro-VT is still going."""
         with self._fx_lock:
             state = self._fx_fires.get(fire_id)
         if state is None:
-            return
-        # EOS from any element on the main pipeline reaches this handler;
-        # filter by checking the src is one of ours.
-        src = message.src
-        our_srcs = (state["filesrc"], state["decodebin"], state["convert"],
-                    state["resample"], state["gain"])
-        if src not in our_srcs:
-            return
-
-        # If this was a VT fire, advance the VT state machine BEFORE
-        # tearing down (the state read needs the fire_id to still be
-        # in _fx_fires so _vt_handle_outgoing_ended can see the
-        # in-flight fire correctly).
+            return False
         vt_kind = state.get("vt_kind")
         if vt_kind:
             self._vt_on_fire_eos(vt_kind, fire_id)
-
         self._fx_stop(fire_id)
+        return False
 
     def _fx_stop(self, fire_id):
         """Teardown a fire's chain and release its sub-mixer pad. Safe to
@@ -2888,9 +2953,11 @@ class PlaybackEngine:
             new_pad.link(convert_sink)
         decodebin.connect("pad-added", _on_pad_added)
 
-        bus = self.main_pipeline.get_bus()
-        bus.add_signal_watch()
-        bus.connect("message::eos", self._fx_on_eos, fire_id)
+        # Same branch-local completion signal _fx_fire uses -- see
+        # _fx_install_completion_probe's docstring. VTs go through the
+        # identical fx_submix-feeding topology, so they had the exact
+        # same "message::eos never reaches the bus" bug.
+        self._fx_install_completion_probe(gain.get_static_pad("src"), fire_id)
         for el in (filesrc, decodebin, convert, resample, vt_caps, gain):
             el.sync_state_with_parent()
 
@@ -2977,7 +3044,7 @@ class PlaybackEngine:
         return True
 
     def _vt_on_fire_eos(self, kind, fire_id):
-        """Called from _fx_on_eos when a VT fire ends. Advances the
+        """Called from _fx_fire_completed when a VT fire ends. Advances the
         state machine according to which VT (outro or intro) just
         finished."""
         with self._vt_lock:
