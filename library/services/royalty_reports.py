@@ -119,6 +119,147 @@ def compute_ath(period_start, period_end):
     return ath_seconds / 3600.0
 
 
+def _encoder_label_map():
+    """Map each live-sample key ("host:port/mount", as constructed by
+    sample_icecast_listeners.py) to its Encoder's display name --
+    ENABLED encoders only. This is also the exclusion filter: the
+    Icecast/Shoutcast servers this station samples can carry OTHER
+    stations' streams alongside this station's own on the same shared
+    box (observed live on this install: SIDs 1 and 3 are this
+    station's configured Encoders, SIDs 2 and 4 belong to a different
+    station sharing the same physical Shoutcast server). IcecastSample
+    itself has no concept of "ours" -- listeners_by_mount just mirrors
+    whatever the server reports -- so compute_listener_series treats
+    any key with no entry here as not this station's and drops it
+    entirely, rather than showing it under its raw key.
+
+    Reconstructs the key the exact same way the sampler does rather
+    than duplicating that logic a second time: Icecast uses the
+    Encoder's own `mount` verbatim (required non-blank by Encoder.
+    clean() for icecast/shoutcast2), Shoutcast 1/2 use `shoutcast_sid`
+    (the same normalized-SID property monitoring's own probe already
+    relies on) as "/<sid>".
+
+    A disabled Encoder is deliberately excluded, not just unlabeled --
+    this map is rebuilt fresh on every call (not cached, not FK-
+    backed against IcecastSample), so disabling a stream in admin
+    removes it from this report on the very next request. That matches
+    "configured and enabled on this box" as the live definition of
+    "ours," at the cost of a disabled-then-re-enabled stream's
+    in-between history simply not existing in the chart -- acceptable
+    for a listener-trend view, not an audit trail."""
+    from encoders.models import Encoder
+    labels = {}
+    for enc in Encoder.objects.filter(enabled=True):
+        if enc.protocol == "icecast":
+            mount = enc.mount if enc.mount.startswith("/") else f"/{enc.mount}"
+        else:
+            sid = enc.shoutcast_sid
+            mount = f"/{sid}" if sid else None
+        if not mount:
+            continue
+        labels[f"{enc.host}:{enc.port}{mount}"] = enc.name
+    return labels
+
+
+def compute_listener_series(period_start, period_end):
+    """Bucketed listener time series from IcecastSample rows in the
+    period, for the /reports/ Listener Stats tab.
+
+    Bucket width adapts to the requested range so a chart never has to
+    render more than a few hundred points per series regardless of
+    whether the operator picked a day or a year:
+      <= 3 days   -> 15-minute buckets
+      <= 60 days  -> 1-hour buckets
+      else        -> 1-day buckets
+    Buckets are fixed-width in epoch time, anchored to the period's
+    (station-local) start -- for the daily-bucket case this can drift
+    by up to an hour across a DST transition inside the period; not
+    worth the complexity of calendar-aware day-walking for a trend
+    chart.
+
+    Only streams belonging to a currently enabled Encoder on this box
+    are included -- see _encoder_label_map. Any other key in a
+    sample's listeners_by_mount (another station sharing the same
+    physical Icecast/Shoutcast server, or a stream this box no longer
+    has configured) is dropped entirely, not shown under its raw key.
+    "total" is therefore NOT the sampler's raw listeners_total field
+    (which counts every stream the server reports, foreign or not) --
+    it's recomputed per sample as the sum of only this station's
+    streams, so the aggregate line can never include another
+    station's listeners.
+
+    Each stream's value in a bucket is the mean of that stream's
+    listener count across every sample IN that bucket that reported
+    it at all -- a stream absent from every sample in a bucket (its
+    Encoder was disabled, or the whole box was unreachable) is left
+    out of that bucket's "streams" dict entirely, so the chart renders
+    a gap rather than a fabricated zero. "total" is the mean, across
+    the bucket's samples, of each sample's own owned-streams sum
+    (including samples that owned-summed to zero, e.g. a fetch
+    failure that reported no streams at all that cycle).
+
+    Returns a dict with "bucket_seconds", "points" (chronological list
+    of {"t": isoformat, "total": float, "streams": {label: float}}),
+    "stream_labels" (sorted, stable ordering for the chart legend/
+    colors), and "sample_count" (raw IcecastSample rows in range, so
+    the UI can tell "no data" from "range not sampled yet")."""
+    from library.models import IcecastSample
+    start, end = _period_bounds(period_start, period_end)
+    span_days = (end - start).total_seconds() / 86400.0
+    if span_days <= 3:
+        bucket_seconds = 900
+    elif span_days <= 60:
+        bucket_seconds = 3600
+    else:
+        bucket_seconds = 86400
+
+    samples = list(
+        IcecastSample.objects
+        .filter(sampled_at__gte=start, sampled_at__lte=end)
+        .order_by("sampled_at")
+        .only("sampled_at", "listeners_by_mount")
+    )
+
+    labels = _encoder_label_map()
+    epoch0 = start.timestamp()
+    buckets = {}
+    for s in samples:
+        idx = int((s.sampled_at.timestamp() - epoch0) // bucket_seconds)
+        b = buckets.setdefault(idx, {"total": [], "streams": {}})
+        owned_total = 0
+        for key, count in (s.listeners_by_mount or {}).items():
+            label = labels.get(key)
+            if label is None:
+                continue  # not a currently enabled Encoder on this box -- excluded
+            b["streams"].setdefault(label, []).append(count)
+            owned_total += count
+        b["total"].append(owned_total)
+
+    points = []
+    for idx in sorted(buckets):
+        b = buckets[idx]
+        bucket_dt = timezone.datetime.fromtimestamp(
+            epoch0 + idx * bucket_seconds, tz=start.tzinfo,
+        )
+        points.append({
+            "t": bucket_dt.isoformat(),
+            "total": round(sum(b["total"]) / len(b["total"]), 2),
+            "streams": {
+                label: round(sum(vals) / len(vals), 2)
+                for label, vals in b["streams"].items()
+            },
+        })
+
+    stream_labels = sorted({label for p in points for label in p["streams"]})
+    return {
+        "bucket_seconds": bucket_seconds,
+        "points": points,
+        "stream_labels": stream_labels,
+        "sample_count": len(samples),
+    }
+
+
 def generate_soundexchange_nce(period_start, period_end, ath_override=None):
     """Return (text, extension) for a SoundExchange NCE Report of Use.
 

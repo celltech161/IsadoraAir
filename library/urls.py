@@ -84,4 +84,5 @@ urlpatterns = [
     path('reports/<int:pk>/download/', views.reports_download, name='reports-download'),
     path('api/reports/generate/', views.api_reports_generate, name='api-reports-generate'),
     path('api/reports/hidden-track-scan/', views.api_hidden_track_scan, name='api-hidden-track-scan'),
+    path('api/reports/listener-stats/', views.api_reports_listener_stats, name='api-reports-listener-stats'),
 ]

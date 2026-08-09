@@ -3187,6 +3187,11 @@ def reports_page(request):
         # the royalty-report "Generate" button's existing pattern.
         "hidden_track_form": HiddenTrackDetectionForm(),
         "hidden_track_categories": Category.objects.order_by("name").values("code", "name"),
+        # Listener Stats tab (see api_reports_listener_stats below) --
+        # defaults to the current calendar month, station-local, same
+        # "today" used for default_month above.
+        "listener_stats_default_start": today.replace(day=1).isoformat(),
+        "listener_stats_default_end": today.isoformat(),
     })
 
 
@@ -3285,6 +3290,45 @@ def reports_download(request, pk):
 
     fname = f"{rr.period_start:%Y-%m}-{rr.format}.{rr.file.name.rsplit('.', 1)[-1]}"
     return FileResponse(rr.file.open("rb"), as_attachment=True, filename=fname)
+
+
+@require_http_methods(["GET"])
+def api_reports_listener_stats(request):
+    """Bucketed listener-count time series for the /reports/ Listener
+    Stats tab -- per-stream lines plus an aggregate line, over an
+    operator-chosen date range (defaults to the current calendar
+    month, station-local, matching listener_stats_default_start/_end
+    in reports_page above).
+
+    Read-only, GET (unlike the other /api/reports/ endpoints, which
+    mutate or generate a file) -- query params `start`/`end`
+    (YYYY-MM-DD, inclusive), both optional. All aggregation happens in
+    compute_listener_series; this view is just param parsing +
+    permission check + JSON shaping."""
+    denied = _reports_permission_check(request)
+    if denied:
+        return denied
+
+    from library.services.royalty_reports import compute_listener_series
+
+    today = timezone.localdate()
+    start_raw = request.GET.get("start", "").strip()
+    end_raw = request.GET.get("end", "").strip()
+    try:
+        period_start = date_type.fromisoformat(start_raw) if start_raw else today.replace(day=1)
+        period_end = date_type.fromisoformat(end_raw) if end_raw else today
+    except ValueError:
+        return JsonResponse({"error": "start/end must be YYYY-MM-DD"}, status=400)
+    if period_start > period_end:
+        return JsonResponse({"error": "start must not be after end"}, status=400)
+
+    series = compute_listener_series(period_start, period_end)
+    return JsonResponse({
+        "ok": True,
+        "start": period_start.isoformat(),
+        "end": period_end.isoformat(),
+        **series,
+    })
 
 
 # ---------------------------------------------------------------------

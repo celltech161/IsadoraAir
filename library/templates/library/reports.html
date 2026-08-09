@@ -119,6 +119,29 @@
   }
   .rpt-summary-grid .val { font-weight: 700; font-size: 1.1rem; color: var(--text-main); }
   .rpt-summary-grid .lbl { color: var(--text-muted); font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.03em; }
+
+  .ls-chart-wrap {
+    position: relative; width: 100%; height: 360px;
+  }
+  #lsCanvas { width: 100%; height: 100%; display: block; }
+  .ls-tooltip {
+    position: absolute; pointer-events: none; display: none;
+    background: var(--bg-darkest); border: 1px solid var(--border-subtle);
+    border-radius: 6px; padding: 0.4rem 0.6rem; font-size: 0.78rem;
+    color: var(--text-main); white-space: nowrap; z-index: 5;
+  }
+  .ls-legend {
+    display: flex; flex-wrap: wrap; gap: 0.4rem 1rem; margin-top: 0.9rem;
+    font-size: 0.8rem;
+  }
+  .ls-legend label {
+    display: flex; align-items: center; gap: 0.35rem; cursor: pointer;
+    color: var(--text-main); user-select: none;
+  }
+  .ls-swatch {
+    display: inline-block; width: 0.85rem; height: 0.85rem; border-radius: 3px;
+    flex-shrink: 0;
+  }
 </style>
 {% endblock %}
 
@@ -126,6 +149,7 @@
 <div class="rpt-tabs">
   <button type="button" class="rpt-tab active" id="tabBtnRoyalty" onclick="switchReportTab('royalty')">Royalty Reporting</button>
   <button type="button" class="rpt-tab" id="tabBtnHidden" onclick="switchReportTab('hidden')">Hidden Track Detection</button>
+  <button type="button" class="rpt-tab" id="tabBtnListeners" onclick="switchReportTab('listeners')">Listener Stats</button>
 </div>
 
 <div id="tabPanelRoyalty" class="rpt-tab-panel active">
@@ -302,6 +326,45 @@
   </div>
 </div>
 <!-- /tabPanelHidden -->
+
+<div id="tabPanelListeners" class="rpt-tab-panel">
+  <div class="rpt-panel">
+    <h2>Listener Stats</h2>
+    <div class="rpt-hint" style="margin-top:0; margin-bottom:0.9rem;">
+      Per-stream and aggregate listener counts over time, from the same per-minute
+      Icecast/Shoutcast samples the ATH figure above is computed from
+      (<code>isadoraair-sample-icecast.timer</code>). Points are averaged into buckets
+      (15 min / 1 hour / 1 day, chosen automatically from the date range) so a wide
+      range still renders as a readable line rather than tens of thousands of raw points.
+      A stream with no samples in a bucket (disabled, or unreachable) shows as a gap in
+      its line rather than a false zero. Only streams configured and enabled on this
+      station's own Encoder admin are shown -- other stations sharing the same physical
+      Icecast/Shoutcast server are excluded from both the per-stream lines and the
+      aggregate.
+    </div>
+    <div class="rpt-form">
+      <div>
+        <label for="lsStart">Start</label>
+        <input class="rpt-input" id="lsStart" type="date" value="{{ listener_stats_default_start }}">
+      </div>
+      <div>
+        <label for="lsEnd">End</label>
+        <input class="rpt-input" id="lsEnd" type="date" value="{{ listener_stats_default_end }}">
+      </div>
+      <div>
+        <button class="rpt-btn" id="lsLoadBtn" onclick="loadListenerStats()">Load</button>
+      </div>
+    </div>
+    <div class="rpt-status" id="lsStatus"></div>
+
+    <div class="ls-chart-wrap" id="lsChartWrap" style="display:none; margin-top:1rem;">
+      <canvas id="lsCanvas"></canvas>
+      <div class="ls-tooltip" id="lsTooltip"></div>
+    </div>
+    <div class="ls-legend" id="lsLegend"></div>
+  </div>
+</div>
+<!-- /tabPanelListeners -->
 {% endblock %}
 
 {% block extra_js %}
@@ -374,12 +437,23 @@ async function generateReport() {
 // ---------------------------------------------------------------
 // Reports hub tabs
 // ---------------------------------------------------------------
+const REPORT_TABS = ['royalty', 'hidden', 'listeners'];
 function switchReportTab(which) {
-  const isRoyalty = which === 'royalty';
-  document.getElementById('tabPanelRoyalty').classList.toggle('active', isRoyalty);
-  document.getElementById('tabPanelHidden').classList.toggle('active', !isRoyalty);
-  document.getElementById('tabBtnRoyalty').classList.toggle('active', isRoyalty);
-  document.getElementById('tabBtnHidden').classList.toggle('active', !isRoyalty);
+  for (const tab of REPORT_TABS) {
+    const isActive = tab === which;
+    const cap = tab.charAt(0).toUpperCase() + tab.slice(1);
+    document.getElementById('tabPanel' + cap).classList.toggle('active', isActive);
+    document.getElementById('tabBtn' + cap).classList.toggle('active', isActive);
+  }
+  // Lazy-load: fetch listener stats the first time the tab is opened,
+  // not on page load (matches Hidden Track Detection's own "nothing
+  // runs until the operator asks for it" pattern) -- and not measured
+  // until the panel is actually display:block, since the canvas needs
+  // a real clientWidth to size itself correctly.
+  if (which === 'listeners' && !_lsLoadedOnce) {
+    _lsLoadedOnce = true;
+    loadListenerStats();
+  }
 }
 
 // ---------------------------------------------------------------
@@ -608,5 +682,253 @@ function escapeHtml(s) {
   div.textContent = s;
   return div.innerHTML;
 }
+
+// ---------------------------------------------------------------
+// Listener Stats
+// ---------------------------------------------------------------
+let _lsLoadedOnce = false;
+let _lsData = null;              // last-fetched API response, cached for resize/toggle redraws
+let _lsHidden = new Set();       // series labels currently toggled off via the legend
+const LS_COLORS = ['#60a5fa', '#f59e0b', '#34d399', '#f87171', '#a78bfa', '#fb923c', '#22d3ee', '#eab308', '#f472b6', '#4ade80'];
+const LS_TOTAL_LABEL = 'Aggregate (this station)';
+const LS_TOTAL_COLOR = '#e5e7eb';
+
+function lsColorFor(label, allLabels) {
+  if (label === LS_TOTAL_LABEL) return LS_TOTAL_COLOR;
+  const idx = allLabels.indexOf(label);
+  return LS_COLORS[idx % LS_COLORS.length];
+}
+
+async function loadListenerStats() {
+  const btn = document.getElementById('lsLoadBtn');
+  const status = document.getElementById('lsStatus');
+  const chartWrap = document.getElementById('lsChartWrap');
+  const start = document.getElementById('lsStart').value;
+  const end = document.getElementById('lsEnd').value;
+
+  if (!start || !end) {
+    status.className = 'rpt-status err';
+    status.textContent = 'Pick both a start and end date.';
+    status.style.display = 'block';
+    return;
+  }
+  if (start > end) {
+    status.className = 'rpt-status err';
+    status.textContent = 'Start must not be after end.';
+    status.style.display = 'block';
+    return;
+  }
+
+  btn.disabled = true;
+  status.className = 'rpt-status';
+  status.style.display = 'block';
+  status.textContent = 'Loading…';
+  chartWrap.style.display = 'none';
+
+  try {
+    const params = new URLSearchParams({ start, end });
+    const resp = await fetch(`{% url 'library:api-reports-listener-stats' %}?${params.toString()}`);
+    const data = await resp.json();
+    if (!resp.ok || data.error) {
+      status.className = 'rpt-status err';
+      status.textContent = 'Error: ' + (data.error || `HTTP ${resp.status}`);
+      return;
+    }
+    _lsData = data;
+    _lsHidden = new Set();
+
+    if (!data.points.length) {
+      status.className = 'rpt-status';
+      status.textContent = data.sample_count
+        ? 'No samples fell inside this exact range.'
+        : 'No listener samples recorded in this range yet -- is isadoraair-sample-icecast.timer running?';
+      document.getElementById('lsLegend').innerHTML = '';
+      return;
+    }
+
+    const bucketDesc = data.bucket_seconds >= 86400 ? 'daily' : (data.bucket_seconds >= 3600 ? 'hourly' : '15-minute');
+    status.className = 'rpt-status ok';
+    status.textContent = `${data.points.length} ${bucketDesc} point(s) from ${data.sample_count} raw sample(s).`;
+
+    renderListenerLegend(data);
+    chartWrap.style.display = 'block';
+    renderListenerChart();
+  } catch (e) {
+    status.className = 'rpt-status err';
+    status.textContent = 'Network error: ' + e.message;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function renderListenerLegend(data) {
+  const legend = document.getElementById('lsLegend');
+  const allLabels = [LS_TOTAL_LABEL, ...data.stream_labels];
+  legend.innerHTML = allLabels.map(label => `
+    <label>
+      <input type="checkbox" checked data-ls-label="${escapeHtml(label)}" onchange="lsToggleSeries(this)">
+      <span class="ls-swatch" style="background:${lsColorFor(label, data.stream_labels)}"></span>
+      ${escapeHtml(label)}
+    </label>
+  `).join('');
+}
+
+function lsToggleSeries(checkbox) {
+  const label = checkbox.dataset.lsLabel;
+  if (checkbox.checked) _lsHidden.delete(label);
+  else _lsHidden.add(label);
+  renderListenerChart();
+}
+
+function lsSeriesValues(data, label) {
+  // One value per point, or null where that series has no data for
+  // that bucket (encoder disabled/unreachable for the whole bucket) --
+  // null breaks the drawn line into a visible gap rather than a lie.
+  return data.points.map(p => {
+    if (label === LS_TOTAL_LABEL) return p.total;
+    return Object.prototype.hasOwnProperty.call(p.streams, label) ? p.streams[label] : null;
+  });
+}
+
+function renderListenerChart() {
+  const data = _lsData;
+  if (!data || !data.points.length) return;
+  const canvas = document.getElementById('lsCanvas');
+  const wrap = document.getElementById('lsChartWrap');
+  const dpr = window.devicePixelRatio || 1;
+  const cssWidth = wrap.clientWidth;
+  const cssHeight = wrap.clientHeight;
+  if (cssWidth <= 0 || cssHeight <= 0) return; // panel not visible yet
+  canvas.width = cssWidth * dpr;
+  canvas.height = cssHeight * dpr;
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, cssWidth, cssHeight);
+
+  const style = getComputedStyle(document.documentElement);
+  const textMuted = style.getPropertyValue('--text-muted').trim() || '#888';
+  const borderSubtle = style.getPropertyValue('--border-subtle').trim() || '#333';
+
+  const allLabels = [LS_TOTAL_LABEL, ...data.stream_labels];
+  const visibleLabels = allLabels.filter(l => !_lsHidden.has(l));
+  const seriesByLabel = {};
+  let maxVal = 0;
+  for (const label of visibleLabels) {
+    const vals = lsSeriesValues(data, label);
+    seriesByLabel[label] = vals;
+    for (const v of vals) if (v !== null && v > maxVal) maxVal = v;
+  }
+  const yMax = Math.max(maxVal * 1.15, 5);
+
+  const padL = 44, padR = 12, padT = 12, padB = 28;
+  const plotW = Math.max(cssWidth - padL - padR, 10);
+  const plotH = Math.max(cssHeight - padT - padB, 10);
+
+  const times = data.points.map(p => new Date(p.t).getTime());
+  const tMin = times[0], tMax = times[times.length - 1];
+  const tSpan = Math.max(tMax - tMin, 1);
+  const xFor = i => padL + (plotW * (times[i] - tMin) / tSpan);
+  const yFor = v => padT + plotH - (plotH * (v / yMax));
+
+  // Y gridlines + labels.
+  ctx.strokeStyle = borderSubtle;
+  ctx.fillStyle = textMuted;
+  ctx.font = '11px inherit';
+  ctx.textAlign = 'right';
+  ctx.textBaseline = 'middle';
+  const yTicks = 4;
+  for (let i = 0; i <= yTicks; i++) {
+    const v = (yMax / yTicks) * i;
+    const y = yFor(v);
+    ctx.globalAlpha = 0.5;
+    ctx.beginPath();
+    ctx.moveTo(padL, y);
+    ctx.lineTo(padL + plotW, y);
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+    ctx.fillText(Math.round(v).toString(), padL - 8, y);
+  }
+
+  // X labels: a handful of evenly spaced timestamps across the range.
+  const bucketSeconds = data.bucket_seconds;
+  const fmtTick = ms => {
+    const d = new Date(ms);
+    if (bucketSeconds >= 86400) {
+      return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+    }
+    return d.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: bucketSeconds < 3600 ? '2-digit' : undefined });
+  };
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'top';
+  const xTicks = Math.min(6, data.points.length);
+  for (let i = 0; i < xTicks; i++) {
+    const frac = xTicks === 1 ? 0 : i / (xTicks - 1);
+    const ms = tMin + frac * tSpan;
+    ctx.fillText(fmtTick(ms), padL + plotW * frac, padT + plotH + 8);
+  }
+
+  // Series lines -- aggregate drawn last (on top) so it isn't buried
+  // under individual stream lines when they're close in value.
+  const drawOrder = visibleLabels.slice().sort((a, b) => (a === LS_TOTAL_LABEL ? 1 : 0) - (b === LS_TOTAL_LABEL ? 1 : 0));
+  for (const label of drawOrder) {
+    const vals = seriesByLabel[label];
+    const isTotal = label === LS_TOTAL_LABEL;
+    ctx.strokeStyle = lsColorFor(label, data.stream_labels);
+    ctx.lineWidth = isTotal ? 2.5 : 1.75;
+    ctx.beginPath();
+    let started = false;
+    for (let i = 0; i < vals.length; i++) {
+      if (vals[i] === null) { started = false; continue; }
+      const x = xFor(i), y = yFor(vals[i]);
+      if (!started) { ctx.moveTo(x, y); started = true; }
+      else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+  }
+
+  // Hover crosshair + tooltip.
+  canvas.onmousemove = (evt) => lsHandleHover(evt, canvas, data, visibleLabels, seriesByLabel, times, padL, plotW);
+  canvas.onmouseleave = () => { document.getElementById('lsTooltip').style.display = 'none'; };
+}
+
+function lsHandleHover(evt, canvas, data, visibleLabels, seriesByLabel, times, padL, plotW) {
+  const tooltip = document.getElementById('lsTooltip');
+  const rect = canvas.getBoundingClientRect();
+  const mouseX = evt.clientX - rect.left;
+  if (mouseX < padL || mouseX > padL + plotW) { tooltip.style.display = 'none'; return; }
+
+  const tMin = times[0], tMax = times[times.length - 1];
+  const tSpan = Math.max(tMax - tMin, 1);
+  const targetT = tMin + tSpan * ((mouseX - padL) / plotW);
+  let nearest = 0, nearestDiff = Infinity;
+  for (let i = 0; i < times.length; i++) {
+    const diff = Math.abs(times[i] - targetT);
+    if (diff < nearestDiff) { nearestDiff = diff; nearest = i; }
+  }
+
+  const lines = visibleLabels.map(label => {
+    const v = seriesByLabel[label][nearest];
+    return `<div><span class="ls-swatch" style="background:${lsColorFor(label, data.stream_labels)}"></span> ${escapeHtml(label)}: <strong>${v === null ? '—' : v}</strong></div>`;
+  }).join('');
+  const when = new Date(times[nearest]).toLocaleString();
+  tooltip.innerHTML = `<div style="margin-bottom:0.25rem; color:var(--text-muted);">${when}</div>${lines}`;
+  tooltip.style.display = 'block';
+  const wrap = document.getElementById('lsChartWrap');
+  const wrapRect = wrap.getBoundingClientRect();
+  let left = evt.clientX - wrapRect.left + 14;
+  if (left + tooltip.offsetWidth > wrap.clientWidth) left = evt.clientX - wrapRect.left - tooltip.offsetWidth - 14;
+  tooltip.style.left = left + 'px';
+  tooltip.style.top = (evt.clientY - wrapRect.top - 10) + 'px';
+}
+
+let _lsResizeTimer = null;
+window.addEventListener('resize', () => {
+  clearTimeout(_lsResizeTimer);
+  _lsResizeTimer = setTimeout(() => {
+    if (_lsData && document.getElementById('tabPanelListeners').classList.contains('active')) {
+      renderListenerChart();
+    }
+  }, 150);
+});
 </script>
 {% endblock %}
