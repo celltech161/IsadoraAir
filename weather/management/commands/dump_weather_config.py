@@ -27,8 +27,6 @@ class Command(BaseCommand):
             "voice_schedule": cfg.voice_schedule,
             "notify_email": cfg.notify_email,
             "alert_sound_enabled": cfg.alert_sound_enabled,
-            "alert_sound_path": cfg.alert_sound_path,
-            "alert_sound_device": cfg.alert_sound_device,
+            "alert_sound_cart_id": cfg.alert_sound_cart_id,
             "alert_sound_interval_seconds": cfg.alert_sound_interval_seconds,
-            "alert_sound_gain_db": cfg.alert_sound_gain_db,
         }))

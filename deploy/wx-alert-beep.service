@@ -1,10 +1,9 @@
 [Unit]
-Description=Watch/warning alert beep (direct-to-ALSA, bypasses playback engine)
+Description=Watch/warning alert beep (fires an IsadoraAir FX Cart through the playback engine)
 After=network-online.target
 
 [Service]
 Type=oneshot
 User=@@ISA_USER@@
-Group=audio
 WorkingDirectory=@@WEATHER_ROOT@@
 ExecStart=@@WEATHER_ROOT@@/venv/bin/python @@WEATHER_ROOT@@/wx_alert_beep.py

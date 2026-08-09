@@ -20,11 +20,13 @@ class WeatherConfigAdmin(admin.ModelAdmin):
             "description": "Day/night voice shift schedule -- see field help text for format.",
         }),
         ("Alert Beep", {
-            "fields": ["alert_sound_enabled", "alert_sound_path", "alert_sound_device",
-                       "alert_sound_interval_seconds", "alert_sound_gain_db"],
-            "description": "Plays directly to ALSA (bypassing the playback engine) while "
-                            "a watch/warning is active -- separate from the spoken WxAlert "
-                            "statement pipeline.",
+            "fields": ["alert_sound_enabled", "alert_sound_cart", "alert_sound_interval_seconds"],
+            "description": "Fires the selected FX Cart while a watch/warning is active, "
+                            "through IsadoraAir's normal FX/program bus -- present on air "
+                            "and in studio/remote-DJ monitoring, same as any other cart "
+                            "fire. Separate from the spoken WxAlert statement pipeline. "
+                            "The cart's own filepath, gain, and retrigger mode are set on "
+                            "the FX Cart itself (Library -> FX Carts), not here.",
         }),
         ("Notifications", {
             "fields": ["notify_email"],

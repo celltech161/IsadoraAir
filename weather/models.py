@@ -74,31 +74,24 @@ class WeatherConfig(models.Model):
                    "status. Separate from the WxAlert spoken-statement pipeline, "
                    "which is unaffected by this switch.",
     )
-    alert_sound_path = models.CharField(
-        max_length=255, default="",
-        help_text="Path to the alert beep audio file, played directly to ALSA "
-                   "(not through the playback engine) while a watch/warning is "
-                   "active. Blank disables the beep entirely -- the beep file is "
-                   "operator-supplied and station-specific (WEA-style pattern or "
-                   "otherwise); set this to its absolute path once it exists.",
-    )
-    alert_sound_device = models.CharField(
-        max_length=32, default="plughw:4,0",
-        help_text="ALSA device the beep is played to -- a dedicated loopback feeding "
-                   "StereoTool's second input, independent of the engine's own output.",
+    alert_sound_cart = models.ForeignKey(
+        "library.FXCart",
+        null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="weather_alert_configs",
+        verbose_name="Alert FX Cart",
+        help_text="The FX Cart fired while a qualifying watch/warning remains "
+                   "active. Playback travels through IsadoraAir's normal FX/"
+                   "program bus (same path as any other cart fire), so it's "
+                   "present on air and in studio/remote-DJ monitoring -- not a "
+                   "separate weather-only audio path. The cart's own filepath, "
+                   "gain, and retrigger mode apply as usual; nothing here "
+                   "overrides them. Blank/deleted cart disables the beep, same "
+                   "as leaving alert_sound_enabled off.",
     )
     alert_sound_interval_seconds = models.PositiveIntegerField(
         default=600,
         help_text="How often the beep replays while a watch/warning remains active, "
                    "in seconds. Re-read fresh every check -- no restart needed.",
-    )
-    alert_sound_gain_db = models.FloatField(
-        default=-12.0,
-        help_text="Gain applied to the beep before it reaches StereoTool's Input 2, "
-                   "in dB (negative = quieter, 0 = unchanged from the source file). "
-                   "The file plays at full level otherwise, which was found to drive "
-                   "the processor's AGC down hard on air -- tune this down until the "
-                   "beep sits at a normal announcement level.",
     )
 
     class Meta:
