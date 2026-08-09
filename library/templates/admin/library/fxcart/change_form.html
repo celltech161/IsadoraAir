@@ -30,6 +30,8 @@
   <div id="fxUploadStatus" style="display:none; margin-top:0.4rem;"></div>
 </div>
 
+{{ block.super }}
+
 <script>
 (function () {
   function getCookie(name) {
@@ -46,7 +48,9 @@
   const statusEl = document.getElementById('fxUploadStatus');
   const pickBtn = document.getElementById('fxUploadPickBtn');
   const fileInput = document.getElementById('fxUploadInput');
-  const filepathInput = document.getElementById('id_filepath');
+  // Not cached here: resolved fresh in upload() so this doesn't hold a
+  // stale/null reference if the admin template's field markup ever
+  // changes shape again in the future.
 
   function say(html, colour) {
     statusEl.style.display = 'block';
@@ -61,6 +65,7 @@
   }
 
   async function upload(file) {
+    const filepathInput = document.getElementById('id_filepath');
     if (!filepathInput) {
       say('Cannot find the filepath field on this page.', '#f87171');
       return;
@@ -124,6 +129,4 @@
   });
 })();
 </script>
-
-{{ block.super }}
 {% endblock %}
