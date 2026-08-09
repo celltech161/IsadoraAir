@@ -120,6 +120,36 @@ class StripInternalAdminTextTests(SimpleTestCase):
         text = "Until November 13, 2026 at about 11:59 PM CDT."
         self.assertEqual(strip_internal_admin_text(text), text)
 
+    def test_strips_more_info_reference_exact_live_text(self):
+        # The exact real, verified live shape (CARS5-12342) -- a
+        # broken/truncated HTML anchor-tag remnant, not a usable link.
+        text = (
+            "KS 18: Automated traffic signals are in place because a lane is closed "
+            "and due to bridge construction work. Width limit 12'0\". More Info: '>"
+        )
+        result = strip_internal_admin_text(text)
+        self.assertNotIn("More Info", result)
+        self.assertEqual(result, "KS 18: Automated traffic signals are in place because a lane is closed and due to bridge construction work. Width limit 12'0\".")
+
+    def test_strips_more_info_reference_with_a_real_looking_url(self):
+        # Even when a real-looking URL survives intact, it's still
+        # redundant with the station's own postamble and not something
+        # a driving listener can act on -- stripped the same way.
+        text = "KS 4: Bridge work. More Info: https://example.invalid/some-detail-page"
+        result = strip_internal_admin_text(text)
+        self.assertEqual(result, "KS 4: Bridge work.")
+
+    def test_more_info_marker_is_case_insensitive(self):
+        text = "KS 4: Bridge work. more info: something"
+        result = strip_internal_admin_text(text)
+        self.assertEqual(result, "KS 4: Bridge work.")
+
+    def test_does_not_strip_unrelated_text_mentioning_information(self):
+        # Must not misfire on ordinary prose that happens to contain
+        # the word "information" without the exact "More Info:" marker.
+        text = "For additional information, contact the district office."
+        self.assertEqual(strip_internal_admin_text(text), text)
+
 
 class DedupeSimilarSentencesTests(SimpleTestCase):
     def test_exact_duplicate_short_sentence_removed(self):
@@ -220,6 +250,21 @@ class FullPipelineIntegrationTests(SimpleTestCase):
             "Kansas Highway 14: Bridge construction. Between Lincoln County Line and Mitchell County Line "
             "and U.S. 24 (Beloit). Bridge construction work is in progress. Width limit 12'0\"",
         )
+
+    def test_real_cars5_12342_more_info_fragment_fully_normalized(self):
+        """The exact real, verified live description (CARS5-12342) that
+        motivated the More Info stripper, run through the whole pipeline."""
+        raw = (
+            "KS 18: Automated traffic signals are in place. Between KS 15 and "
+            "Dickinson County Line/Geary County Line (7 to 8 miles west of the "
+            "Junction City area). Automated traffic signals are in place because "
+            "a lane is closed and due to bridge construction work. Width limit "
+            "12'0\". More Info: '>"
+        )
+        result = normalize_for_speech(raw)
+        self.assertNotIn("More Info", result)
+        self.assertNotIn("'>", result)
+        self.assertTrue(result.endswith("Width limit 12'0\"."))
 
     def test_empty_and_none_input(self):
         self.assertEqual(normalize_for_speech(""), "")

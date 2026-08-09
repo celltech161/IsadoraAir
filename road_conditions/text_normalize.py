@@ -119,6 +119,26 @@ _NEXT_UPDATE_TIME_RE = re.compile(
 # plausibly have it mid-sentence with more real content following.
 _SEE_MAP_RE = re.compile(r"\s*See map for detour\(s\)\.?", re.IGNORECASE)
 
+# KDOT's own description text sometimes ends with a "More Info: ..."
+# clause pointing to an external reference -- verified live on a real
+# event (CARS5-12342: '...Width limit 12\'0". More Info: \'>'), where
+# what actually survives on KDOT's own end is a broken/truncated HTML
+# anchor-tag remnant, not a usable link at all. Redundant even when a
+# real URL DOES survive intact: RoadConditionsConfiguration's own
+# report_postamble already gives listeners a single, station-controlled
+# "for more information" pointer once, at the end of the WHOLE report
+# (see report.py's compose_report_script()) -- a second, per-event
+# "more info" clause buried in the middle of the report adds nothing a
+# listener can act on, and a bare link fragment is exactly the "avoid
+# raw URLs" case _SEE_MAP_RE above already exists for. Anchored to the
+# literal "More Info:" marker -- a KDOT-specific label, not a generic
+# English phrase -- and strips it plus everything after: unlike
+# _SEE_MAP_RE's short, self-contained phrase, "More Info:" introduces a
+# reference of unknown/variable length, and every real occurrence
+# observed live has it as the description's own final clause (matching
+# _NEXT_UPDATE_TIME_RE's same trailing-clause shape above).
+_MORE_INFO_RE = re.compile(r"\s*More Info:.*$", re.IGNORECASE | re.DOTALL)
+
 
 def normalize_route_notation(text):
     """I-70/I 70/I70 -> Interstate 70, US 81 -> U.S. 81, KS 15 -> Kansas
@@ -154,13 +174,22 @@ def strip_internal_admin_text(text):
     """Removes KDOT-internal record-keeping/self-reference text that
     carries no actionable information for a motorist listening while
     driving: a trailing "Next update time ..." clause (see
-    _NEXT_UPDATE_TIME_RE) and any "See map for detour(s)." reference
-    (see _SEE_MAP_RE). Applied before other normalization since
+    _NEXT_UPDATE_TIME_RE), any "See map for detour(s)." reference (see
+    _SEE_MAP_RE), and any trailing "More Info: ..." reference (see
+    _MORE_INFO_RE). Applied before other normalization since
     _NEXT_UPDATE_TIME_RE operates on the ORIGINAL date/time formatting
     (H:MM AM/PM), not the AM/PM-spaced form normalize_time_and_misc
-    produces."""
+    produces. Order matters for the other two as well: _MORE_INFO_RE
+    strips from its marker to the end of the string, so it runs LAST --
+    if a future event ever had both a "Next update time ..." clause and
+    a trailing "More Info: ..." clause, running _MORE_INFO_RE first
+    could swallow the "Next update time" clause along with it (arguably
+    harmless either way, since both are being removed, but this keeps
+    each pattern's own removal independently verifiable/explainable
+    rather than accidentally depending on the other)."""
     text = _NEXT_UPDATE_TIME_RE.sub("", text)
     text = _SEE_MAP_RE.sub("", text)
+    text = _MORE_INFO_RE.sub("", text)
     return text
 
 
