@@ -14,7 +14,8 @@ import gi
 gi.require_version("Gst", "1.0")
 gi.require_version("GstWebRTC", "1.0")
 gi.require_version("GstSdp", "1.0")
-from gi.repository import Gst, GLib, GstSdp, GstWebRTC
+gi.require_version("GstBase", "1.0")
+from gi.repository import Gst, GLib, GstBase, GstSdp, GstWebRTC
 
 import django
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "isadoraair.settings")
@@ -3691,6 +3692,28 @@ class PlaybackEngine:
     def _remote_dj_build_session(self, session):
         cfg = RemoteDJConfig.load()
 
+        # Monitor-mixer timeline diagnostics -- see the mon_mixer
+        # start-time-selection comment below for the bug this
+        # instruments. `_mon_diag_wall_start` anchors the "elapsed wall
+        # time to first monitor output buffer" figure logged by the
+        # one-shot probes installed near the end of this method;
+        # `pipeline_running_time_at_session_build` is the pipeline's
+        # own running time AT THIS MOMENT, i.e. exactly what a
+        # dynamically-created audiomixer's start-time-selection=ZERO
+        # default would ignore (and start its own output segment at 0
+        # instead of). Best-effort -- a clock query only ever fails if
+        # main_pipeline has no clock at all, which would mean nothing
+        # is playing anyway.
+        _mon_diag_wall_start = time.time()
+        _mon_diag_clock = self.main_pipeline.get_clock()
+        if _mon_diag_clock:
+            _mon_diag_running_time_ns = _mon_diag_clock.get_time() - self.main_pipeline.get_base_time()
+            _dj_diag(
+                session,
+                f"monitor_mixer_diag pipeline_running_time_at_session_build="
+                f"{_mon_diag_running_time_ns / Gst.SECOND:.3f}s",
+            )
+
         session.webrtc = Gst.ElementFactory.make("webrtcbin", None)
         session.webrtc.set_property("stun-server", cfg.stun_server)
         session.webrtc.set_property("bundle-policy", GstWebRTC.WebRTCBundlePolicy.MAX_BUNDLE)
@@ -3747,6 +3770,52 @@ class PlaybackEngine:
         # AND local mic exists, so the mic branch here only fires
         # under the same condition.
         mon_mixer = Gst.ElementFactory.make("audiomixer", None)
+        # start-time-selection: FIRST, not the inherited default (ZERO).
+        #
+        # Unlike self.mixer / self.master_mixer / self.program_fx_mixer /
+        # self.fx_submix -- all built once in _build_main_pipeline (and
+        # _fx_setup, itself called from _build_main_pipeline) BEFORE
+        # main_pipeline is ever set to PLAYING -- mon_mixer is created
+        # HERE, dynamically, per Remote DJ connection, and added into a
+        # pipeline that may already have been PLAYING for hours. Those
+        # other mixers all start their own output segment at running-time
+        # 0 together with everything else at engine startup, which is
+        # correct for them; mon_mixer inheriting that same ZERO default
+        # is not: GstAggregator's "zero" start-time-selection makes THIS
+        # mixer declare its own output segment starting at running-time
+        # 0 regardless of how long the pipeline has already been running,
+        # but its real inputs -- remote_dj_tee / local_mic_tee, both
+        # flowing continuously since engine startup -- arrive timestamped
+        # in the pipeline's CURRENT running-time domain. The aggregator
+        # then has to generate silence gap-fill to advance its own
+        # zero-rooted output timeline up to the real, already-elapsed
+        # running time before any real audio reaches WebRTC -- a
+        # catch-up window that grows with engine uptime.
+        #
+        # Root-caused live 2026-08 (Remote DJ monitor return producing a
+        # steadily growing stretch of pure-silence Opus RTP -- confirmed
+        # via Firefox getStats(): totalAudioEnergy=0 despite tens of
+        # thousands of packetsReceived, each a fixed 3 bytes -- an empty
+        # Opus DTX/CNG-equivalent silence frame) and reproduced offline
+        # in an isolated GstAggregator harness, not just inferred from
+        # the live symptom (see
+        # library/tests/test_remote_dj_monitor_mixer_timeline.py): with
+        # the inherited ZERO default, a freshly-created audiomixer 2s
+        # into a running parent pipeline's life emitted a PTS=0,
+        # GAP-flagged (silent) first output buffer -- a ~2s misalignment
+        # matching this bug's own signature exactly, scaled down from
+        # hours to seconds. With FIRST, the same mixer's first output
+        # buffer already carried real, non-silent signal at the correct
+        # ~2s running time, no catch-up gap at all.
+        #
+        # FIRST -- not the newer NOW selection some GStreamer versions
+        # also offer -- aligns the mixer's start time to when its first
+        # real buffer actually arrives, which is the media-driven
+        # behavior actually wanted here (NOW would instead use the wall
+        # clock at mixer-creation time, a real but subtly different
+        # thing), and FIRST is available on older, already-deployed
+        # gst-plugins-base versions this project has to keep working on.
+        mon_mixer.set_property("start-time-selection", GstBase.AggregatorStartTimeSelection.FIRST)
         # Per-input decouple queues between the always-flowing tees and
         # this session's monitor mixer. LEAKY is load-bearing here, not
         # an optimization: until webrtcbin's ICE/DTLS negotiation
@@ -3921,16 +3990,85 @@ class PlaybackEngine:
         # modes that previously reached back through the shared tees
         # and glitched the on-air output (a ~2s dropout on connect, and
         # earlier, static on the playing deck).
+        #
+        # Every pad link below goes through _link_monitor_pad rather
+        # than a bare .link() call. PyGObject's own Gst.Pad.link()
+        # override already raises gi.repository.Gst.LinkError whenever
+        # the underlying Gst.PadLinkReturn isn't OK (verified against
+        # the installed bindings: unlike the raw C API, a Python caller
+        # here never gets a failed return value it could silently fail
+        # to check) -- so a failed link here was ALREADY propagating as
+        # an exception, and _remote_dj_session_start's existing
+        # try/except around this whole method was ALREADY catching it
+        # and rolling the session back safely (releasing the slot,
+        # tearing down every element built so far, releasing the tee
+        # pad if one was claimed -- see that method's rollback branch).
+        # _link_monitor_pad below adds only a clear, this-link-specific
+        # message in place of a bare `LinkError: -3` -- genuinely useful
+        # for diagnosing which of these four links failed and why,
+        # without changing whether a failure is caught or how rollback
+        # happens.
+        def _link_monitor_pad(src_pad, sink_pad, description):
+            try:
+                src_pad.link(sink_pad)
+            except Gst.LinkError as exc:
+                raise RuntimeError(
+                    f"Remote DJ monitor-return link failed ({description}): "
+                    f"{src_pad.get_name()!r} -> {sink_pad.get_name()!r}: {exc}"
+                ) from exc
+
+        # One-shot monitor-mixer timeline diagnostics -- see mon_mixer's
+        # start-time-selection comment above for the bug this proves
+        # stays fixed. Logs the first buffer's own PTS (this session's
+        # audio is a simple, linear-rate live chain, so a buffer's own
+        # PTS is a fair diagnostic stand-in for its running time --
+        # diagnostic only, never used for a control decision) and, on
+        # the mixer's own output, whether GstAggregator marked it a
+        # synthesized GAP buffer -- the same flag confirmed present on
+        # the reproduced pre-fix silence in
+        # test_remote_dj_monitor_mixer_timeline.py. Fires once per pad
+        # then removes itself; defensively wrapped like every other
+        # Remote DJ diagnostic probe in this method -- a broken
+        # diagnostic must never touch the audio path.
+        def _install_first_buffer_diag_probe(pad, label):
+            def _probe(probed_pad, info, _u):
+                try:
+                    s = self.remote_dj_session
+                    if s is not session:
+                        return Gst.PadProbeReturn.REMOVE
+                    buf = info.get_buffer()
+                    if buf is not None:
+                        pts = buf.pts
+                        pts_str = f"{pts / Gst.SECOND:.3f}s" if pts != Gst.CLOCK_TIME_NONE else "none"
+                        is_gap = bool(buf.get_flags() & Gst.BufferFlags.GAP)
+                        elapsed = time.time() - _mon_diag_wall_start
+                        _dj_diag(
+                            s,
+                            f"monitor_mixer_diag {label} pts={pts_str} gap={is_gap} "
+                            f"elapsed_wall_since_session_build={elapsed:.3f}s",
+                        )
+                except Exception as exc:
+                    try:
+                        _dj_diag(session, f"monitor_mixer_diag {label} probe DISABLED after exception: {exc!r}")
+                    except Exception:
+                        pass
+                return Gst.PadProbeReturn.REMOVE
+            pad.add_probe(Gst.PadProbeType.BUFFER, _probe, None)
+
+        _install_first_buffer_diag_probe(mon_mixer.get_static_pad("src"), "mixer_output")
+
         session.monitor_tee_pad = self.remote_dj_tee.request_pad_simple("src_%u")
-        session.monitor_tee_pad.link(mon_decks_q.get_static_pad("sink"))
+        _link_monitor_pad(session.monitor_tee_pad, mon_decks_q.get_static_pad("sink"), "remote_dj_tee -> mon_decks_q")
         mon_mixer_decks_sink = mon_mixer.request_pad_simple("sink_%u")
-        mon_decks_q.get_static_pad("src").link(mon_mixer_decks_sink)
+        _link_monitor_pad(mon_decks_q.get_static_pad("src"), mon_mixer_decks_sink, "mon_decks_q -> mon_mixer (decks)")
+        _install_first_buffer_diag_probe(mon_mixer_decks_sink, "program_monitor_input")
 
         if self.local_mic_tee is not None:
             session.local_mic_tee_pad = self.local_mic_tee.request_pad_simple("src_%u")
-            session.local_mic_tee_pad.link(mon_mic_q.get_static_pad("sink"))
+            _link_monitor_pad(session.local_mic_tee_pad, mon_mic_q.get_static_pad("sink"), "local_mic_tee -> mon_mic_q")
             mon_mixer_mic_sink = mon_mixer.request_pad_simple("sink_%u")
-            mon_mic_q.get_static_pad("src").link(mon_mixer_mic_sink)
+            _link_monitor_pad(mon_mic_q.get_static_pad("src"), mon_mixer_mic_sink, "mon_mic_q -> mon_mixer (local mic)")
+            _install_first_buffer_diag_probe(mon_mixer_mic_sink, "local_mic_monitor_input")
 
     def _remote_dj_on_negotiation_needed(self, element):
         session = self.remote_dj_session
