@@ -64,6 +64,7 @@ def api_listener_status(request):
         return JsonResponse({
             "led": "red", "current_total": 0, "peak_total": 0,
             "peak_since_at": None, "peak_reached_at": None,
+            "tlh_hours": 0.0, "tlh_since_at": None,
             "encoders": [], "timestamp": 0, "stale": True,
         })
     try:
@@ -72,6 +73,7 @@ def api_listener_status(request):
         return JsonResponse({
             "led": "red", "current_total": 0, "peak_total": 0,
             "peak_since_at": None, "peak_reached_at": None,
+            "tlh_hours": 0.0, "tlh_since_at": None,
             "encoders": [], "timestamp": 0, "stale": True,
         })
     data["stale"] = (time.time() - data.get("timestamp", 0)) > STATE_STALE_SECONDS
@@ -109,6 +111,27 @@ def api_listener_peak_reset(request):
         "ok": True,
         "peak_total": peak.peak_total,
         "peak_since_at": peak.peak_since_at.isoformat(),
+    })
+
+
+@require_http_methods(["POST"])
+def api_listener_tlh_reset(request):
+    """Double-click on the dashboard widget's TLH count POSTs here, for
+    a manual mid-cycle reset -- MonitorManager also resets TLH
+    automatically at midnight on the 1st of each month (see
+    _maybe_reset_tlh_for_new_month in monitoring/services/monitor.py),
+    this endpoint just lets the operator start a fresh window early.
+    Unlike peak (reset to the current live total), TLH is a cumulative
+    SUM with no "current value" to reset to -- resetting means starting
+    the running total fresh at 0.0 hours from right now."""
+    tlh = ListenerPeak.load()
+    tlh.tlh_hours = 0.0
+    tlh.tlh_since_at = django_tz.now()
+    tlh.save(update_fields=["tlh_hours", "tlh_since_at"])
+    return JsonResponse({
+        "ok": True,
+        "tlh_hours": tlh.tlh_hours,
+        "tlh_since_at": tlh.tlh_since_at.isoformat(),
     })
 
 

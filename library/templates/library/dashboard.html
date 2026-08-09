@@ -636,6 +636,14 @@
     border-style: solid;
   }
 
+  /* Desktop/tablet card label -- mirrors .queue-panel h3's styling
+     automatically (it's a descendant h3, same rule applies) so this
+     reads exactly like "Coming Up"'s own label. Hidden on mobile
+     (below), where .fx-toggle-mobile's own inline "FX Carts (N)" text
+     already serves as the label -- the two are never visible at the
+     same time. */
+  .fx-panel-label { margin-top: 0; }
+
   /* Mobile: hide the always-visible row behind a single toggle button
      -- FX carts are meant to be a targeted-use tool, not eat vertical
      space on phones. When open, use ~50% button size so the whole
@@ -643,6 +651,7 @@
      Breakpoint matches the other mobile rules already in this file. */
   .fx-toggle-mobile { display: none; }
   @media (max-width: 640px) {
+    .fx-panel-label { display: none; }
     .fx-panel .fx-row { display: none !important; }
     .fx-panel.fx-mobile-open .fx-row { display: flex !important; }
     .fx-toggle-mobile {
@@ -684,6 +693,41 @@
     }
     /* Show the extra row alongside the top row when mobile-open. */
     .fx-panel.fx-mobile-open .fx-row-extra { display: flex !important; }
+  }
+
+  /* --- Large-display layout: FX Carts card to the right of Coming Up ---
+     Below this breakpoint (including tablets and anything narrower),
+     layout is untouched: FX Carts panel stacks above Coming Up in plain
+     block flow exactly as it always has, down through the <640px
+     mobile collapse-behind-toggle behavior above. 1100px is picked to
+     land on 16:9-or-wider desktop/laptop viewports (1280/1366/1920px-
+     class windows) while narrower windows and tablets keep the stacked
+     flow -- comfortably wide enough that the "Coming Up" table's own
+     columns aren't starved by a sidebar next to them.
+
+     Grid areas (not flex `order`) so the FX panel can render visually
+     to the right while staying EARLIER in the DOM/tab order (it's
+     still the first thing after decks-row) -- keyboard/tab navigation
+     and the mobile source order both stay exactly as they are.
+
+     Only applied when .has-fx-carts is present (set server-side,
+     conditional on the fx_carts queryset being non-empty) -- with no
+     carts configured there's nothing to put in a second column, so
+     Coming Up should just take the full width, same as it already
+     does today. */
+  @media (min-width: 1100px) {
+    .queue-panel.has-fx-carts {
+      display: grid;
+      grid-template-columns: 1fr 300px;
+      grid-template-areas:
+        "insert insert"
+        "comingup fx";
+      align-items: start;
+      gap: 1rem 1.25rem;
+    }
+    .queue-panel.has-fx-carts .queue-insert { grid-area: insert; margin-bottom: 0; }
+    .queue-panel.has-fx-carts .coming-up-card { grid-area: comingup; min-width: 0; }
+    .queue-panel.has-fx-carts .fx-panel { grid-area: fx; margin: 0; }
   }
 
   .queue-insert-input {
@@ -822,7 +866,8 @@
     color: var(--text-main);
     font-variant-numeric: tabular-nums;
   }
-  .listener-peak-value {
+  .listener-peak-value,
+  .listener-tlh-value {
     cursor: pointer;
     /* Selection-avoidance for the double-click reset: without this,
        a double-click highlights the text and the operator sees a
@@ -830,7 +875,8 @@
     user-select: none;
     -webkit-user-select: none;
   }
-  .listener-peak-value:hover {
+  .listener-peak-value:hover,
+  .listener-tlh-value:hover {
     color: var(--accent, #7ec6ff);
   }
   .vu-meter {
@@ -970,6 +1016,10 @@
       <span class="listener-label">Peak</span>
       <span class="listener-value listener-peak-value" id="listenerPeak" ondblclick="resetListenerPeak(event)">—</span>
     </div>
+    <div class="listener-count-row" title="Double-click to reset TLH">
+      <span class="listener-label">TLH</span>
+      <span class="listener-value listener-tlh-value" id="listenerTlh" ondblclick="resetListenerTlh(event)">—</span>
+    </div>
   </div>
 </div>
 <div class="vu-meter" id="vuMeter" aria-label="Pre-processor output level">
@@ -1021,9 +1071,10 @@
   <div class="deck-panel" id="deck-B"></div>
 </div>
 
-<div class="queue-panel" id="queuePanel">
+<div class="queue-panel{% if fx_carts %} has-fx-carts{% endif %}" id="queuePanel">
   {% if fx_carts %}
   <div class="fx-panel" id="fxPanel">
+    <h3 class="fx-panel-label">FX Carts</h3>
     <button type="button" class="fx-toggle-mobile" onclick="toggleFxPanelMobile()">
       <span id="fxToggleMobileLabel">FX Carts ({{ fx_carts.count }}) ▼</span>
     </button>
@@ -1079,25 +1130,27 @@
     </div>
   </div>
 
-  <h3>Coming Up</h3>
-  <div class="queue-table-wrap">
-    <table class="queue-table">
-      <thead>
-        <tr>
-          <th></th>
-          <th class="qt-th-pos">#</th>
-          <th>Artist</th>
-          <th>Title</th>
-          <th>Cat</th>
-          <th class="qt-th-dur">Dur</th>
-          <th class="qt-th-time">Time On</th>
-          <th></th>
-        </tr>
-      </thead>
-      <tbody id="queueList">
-        <tr><td colspan="8" class="queue-empty">No queue data</td></tr>
-      </tbody>
-    </table>
+  <div class="coming-up-card" id="comingUpCard">
+    <h3>Coming Up</h3>
+    <div class="queue-table-wrap">
+      <table class="queue-table">
+        <thead>
+          <tr>
+            <th></th>
+            <th class="qt-th-pos">#</th>
+            <th>Artist</th>
+            <th>Title</th>
+            <th>Cat</th>
+            <th class="qt-th-dur">Dur</th>
+            <th class="qt-th-time">Time On</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="queueList">
+          <tr><td colspan="8" class="queue-empty">No queue data</td></tr>
+        </tbody>
+      </table>
+    </div>
   </div>
 </div>
 </div>
@@ -2437,11 +2490,15 @@ pollLevels();
 // docstring for why). We update the widget from the POST response
 // immediately for snappy feedback rather than waiting for the next
 // poll to reconcile.
+function formatTlh(hours) {
+  return hours == null ? '—' : Number(hours).toFixed(1);
+}
 function applyListenerData(d) {
   const led = document.getElementById('listenerLed');
   const cur = document.getElementById('listenerCurrent');
   const peak = document.getElementById('listenerPeak');
-  if (!led || !cur || !peak) return;
+  const tlh = document.getElementById('listenerTlh');
+  if (!led || !cur || !peak || !tlh) return;
   // "stale" state overrides LED color -- shows we're not getting fresh
   // reads from the monitor poller (usually because the monitoring
   // service is down or the state file was never written).
@@ -2451,13 +2508,20 @@ function applyListenerData(d) {
     : ({green:'All streams up', yellow:'Some streams offline', red:'All streams offline'}[d.led] || 'Stream status');
   cur.textContent = (d.current_total ?? '—');
   peak.textContent = (d.peak_total ?? '—');
-  // Tooltip on peak carries when the current window started, useful
+  tlh.textContent = formatTlh(d.tlh_hours);
+  // Tooltip on peak/TLH carries when the current window started, useful
   // when the operator wants to know how long they've been tracking.
   if (d.peak_since_at) {
     const since = new Date(d.peak_since_at);
     peak.title = `Peak since ${window.stationFormatString(since)} — double-click to reset`;
   } else {
     peak.title = 'Double-click to reset peak';
+  }
+  if (d.tlh_since_at) {
+    const since = new Date(d.tlh_since_at);
+    tlh.title = `Total Listening Hours since ${window.stationFormatString(since)} — double-click to reset`;
+  } else {
+    tlh.title = 'Double-click to reset TLH';
   }
 }
 async function pollListeners() {
@@ -2484,6 +2548,26 @@ async function resetListenerPeak(evt) {
       if (d.peak_since_at) {
         const since = new Date(d.peak_since_at);
         peakEl.title = `Peak since ${window.stationFormatString(since)} — double-click to reset`;
+      }
+    }
+  } catch (_) { /* silently ignore -- operator can just double-click again */ }
+}
+async function resetListenerTlh(evt) {
+  if (evt) { evt.preventDefault(); evt.stopPropagation(); }
+  try {
+    const r = await fetch('/monitoring/api/listeners/reset-tlh/', {
+      method: 'POST', credentials: 'same-origin',
+      headers: {'X-CSRFToken': getCookie('csrftoken')},
+    });
+    if (!r.ok) return;
+    const d = await r.json();
+    // Same immediate-update-from-response pattern as resetListenerPeak.
+    const tlhEl = document.getElementById('listenerTlh');
+    if (tlhEl) {
+      tlhEl.textContent = formatTlh(d.tlh_hours);
+      if (d.tlh_since_at) {
+        const since = new Date(d.tlh_since_at);
+        tlhEl.title = `Total Listening Hours since ${window.stationFormatString(since)} — double-click to reset`;
       }
     }
   } catch (_) { /* silently ignore -- operator can just double-click again */ }

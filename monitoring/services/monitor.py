@@ -161,6 +161,32 @@ class MonitorManager:
             # regression shows up rather than swallowing silently.
             print(f"  [listeners] poll failed: {exc}")
 
+    @staticmethod
+    def _maybe_reset_tlh_for_new_month(peak, now):
+        """Automatic TLH reset: midnight on the 1st of the month, in the
+        station's own local time (settings.TIME_ZONE), per operator
+        request. Implemented as "has a calendar-month boundary passed
+        since tlh_since_at" rather than a precise wall-clock trigger --
+        checked on every ~POLL_SECONDS tick, so the reset fires on
+        whichever tick first notices the new month (within one poll
+        interval of midnight in the common case) and still catches up
+        correctly if a tick was missed right around the boundary
+        (process restart, poll hiccup) instead of silently carrying the
+        old month's total forward indefinitely.
+
+        Mutates `peak` in place (tlh_hours/tlh_since_at) and returns
+        whether a reset happened, so the caller knows to include those
+        fields in its save(). Does not save() itself -- stays consistent
+        with the rest of _poll_shoutcast_listeners' single-combined-save
+        pattern."""
+        since_local = django_tz.localtime(peak.tlh_since_at)
+        now_local = django_tz.localtime(now)
+        if (now_local.year, now_local.month) == (since_local.year, since_local.month):
+            return False
+        peak.tlh_hours = 0.0
+        peak.tlh_since_at = now
+        return True
+
     def _poll_shoutcast_listeners(self):
         """Fetch listener counts from every distinct Shoutcast server
         our enabled Encoder rows point at, match each encoder to its
@@ -195,8 +221,17 @@ class MonitorManager:
         if not encoders:
             # No encoders configured -- write an empty-but-well-formed
             # state so the dashboard's fetch handler doesn't see stale
-            # data from before the last encoder was disabled.
-            self._write_listener_state([], 0, "red", 0, None, None)
+            # data from before the last encoder was disabled. Peak/TLH
+            # are still whatever's persisted (not zeroed) -- disabling
+            # the last encoder doesn't erase history, it just means
+            # nothing is being measured right now.
+            peak = ListenerPeak.load()
+            if self._maybe_reset_tlh_for_new_month(peak, django_tz.now()):
+                peak.save(update_fields=["tlh_hours", "tlh_since_at"])
+            self._write_listener_state(
+                [], 0, "red", peak.peak_total, peak.peak_since_at, None,
+                peak.tlh_hours, peak.tlh_since_at,
+            )
             return
 
         # Group by (host, port). One HTTP GET per distinct server.
@@ -239,24 +274,53 @@ class MonitorManager:
         # can't measure.
         current_total = sum(r["listeners"] for r in per_encoder if r["up"])
 
-        # Peak singleton update. Only touch the DB when we're raising
-        # the peak; the normal case is peak_total >= current_total, no
-        # write, no autocommit noise.
+        # Peak + TLH singleton update, combined into one save() when
+        # either changes so a normal tick (peak unchanged, listeners
+        # present) still costs only a single UPDATE, not two.
+        #
+        # Peak: only touch the DB when we're raising the peak; the
+        # normal case is peak_total >= current_total, no write.
+        #
+        # TLH (Total Listening Hours): unlike peak, this is a running
+        # SUM, not a snapshot -- it genuinely changes (goes up) on
+        # every tick with at least one listener, so it can't be
+        # deferred the same way. Each tick contributes
+        # current_total * (POLL_SECONDS / 3600) hours -- a Riemann-sum
+        # integration of listener-count over time at the poll's own
+        # resolution. Skipped entirely (no write) when current_total
+        # is 0 -- adding zero can't change the total, so there's no
+        # reason to touch the row. Checked for an automatic monthly
+        # reset BEFORE accumulating this tick's contribution, so a
+        # reset and a fresh accumulation in the same tick compose
+        # correctly (zero, then add) rather than the reset wiping out
+        # what this tick just measured.
         peak = ListenerPeak.load()
         peak_reached_at = peak.peak_reached_at
+        now = django_tz.now()
+        update_fields = []
         if current_total > peak.peak_total:
             peak.peak_total = current_total
-            peak.peak_reached_at = django_tz.now()
-            peak.save(update_fields=["peak_total", "peak_reached_at"])
+            peak.peak_reached_at = now
             peak_reached_at = peak.peak_reached_at
+            update_fields += ["peak_total", "peak_reached_at"]
+        if self._maybe_reset_tlh_for_new_month(peak, now):
+            update_fields += ["tlh_hours", "tlh_since_at"]
+        if current_total > 0:
+            peak.tlh_hours = (peak.tlh_hours or 0.0) + current_total * (POLL_SECONDS / 3600.0)
+            if "tlh_hours" not in update_fields:
+                update_fields.append("tlh_hours")
+        if update_fields:
+            peak.save(update_fields=update_fields)
 
         self._write_listener_state(
             per_encoder, current_total, led,
             peak.peak_total, peak.peak_since_at, peak_reached_at,
+            peak.tlh_hours, peak.tlh_since_at,
         )
 
     def _write_listener_state(self, per_encoder, current_total, led,
-                              peak_total, peak_since_at, peak_reached_at):
+                              peak_total, peak_since_at, peak_reached_at,
+                              tlh_hours, tlh_since_at):
         state = {
             "timestamp": time.time(),
             "led": led,                             # "green" | "yellow" | "red"
@@ -264,6 +328,8 @@ class MonitorManager:
             "peak_total": peak_total,
             "peak_since_at": peak_since_at.isoformat() if peak_since_at else None,
             "peak_reached_at": peak_reached_at.isoformat() if peak_reached_at else None,
+            "tlh_hours": tlh_hours,
+            "tlh_since_at": tlh_since_at.isoformat() if tlh_since_at else None,
             "encoders": per_encoder,                # per-stream detail for hover/tooltip
         }
         tmp = LISTENER_STATE_PATH.with_suffix(".tmp")

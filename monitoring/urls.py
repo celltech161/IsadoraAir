@@ -12,4 +12,5 @@ urlpatterns = [
     path("api/recent-events/", views.api_recent_events, name="api-recent-events"),
     path("api/listeners/", views.api_listener_status, name="api-listener-status"),
     path("api/listeners/reset-peak/", views.api_listener_peak_reset, name="api-listener-peak-reset"),
+    path("api/listeners/reset-tlh/", views.api_listener_tlh_reset, name="api-listener-tlh-reset"),
 ]

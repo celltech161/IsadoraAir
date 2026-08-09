@@ -270,18 +270,23 @@ class NotificationConfig(models.Model):
 
 class ListenerPeak(models.Model):
     """Singleton -- highest total-listeners-across-all-streams count seen
-    since the last operator-initiated reset. Written by the monitor
-    tick's Shoutcast poll (see monitoring/services/monitor.py); read by
-    the dashboard listener widget. Reset via a double-click on the
-    widget which POSTs to a monitoring endpoint; the endpoint sets
-    peak_total to the CURRENT live total (not zero) so the next tick
-    doesn't immediately raise the number back up and make the reset
-    feel laggy.
+    since the last operator-initiated reset, PLUS the running Total
+    Listening Hours (TLH) figure, since both are maintained by the same
+    monitor tick's Shoutcast poll (see monitoring/services/monitor.py)
+    and read by the same dashboard listener widget. Peak resets via a
+    double-click on the widget which POSTs to a monitoring endpoint;
+    the endpoint sets peak_total to the CURRENT live total (not zero)
+    so the next tick doesn't immediately raise the number back up and
+    make the reset feel laggy. TLH resets to 0.0 both automatically
+    (midnight on the 1st of each month, station-local time -- see
+    MonitorManager._maybe_reset_tlh_for_new_month) and on its own
+    double-click for a manual mid-cycle reset (a cumulative sum has no
+    equivalent "current value" to reset to the way peak does).
 
     Kept here in monitoring rather than in encoders because the poll
     infrastructure (10 s tick, state-file writer) already lives here
     and this is fundamentally a monitoring artifact -- how many
-    listeners are hearing the station right now."""
+    listeners are hearing the station right now, and for how long."""
 
     peak_total = models.PositiveIntegerField(
         default=0,
@@ -298,6 +303,21 @@ class ListenerPeak(models.Model):
         null=True, blank=True,
         help_text="When peak_total was last raised. Blank if we haven't "
                    "seen anyone since the last reset.",
+    )
+    tlh_hours = models.FloatField(
+        default=0.0,
+        help_text="Total Listening Hours: running sum, in hours, of "
+                   "sum-of-listeners-across-all-enabled-encoders x sample "
+                   "interval, accumulated every monitor tick since "
+                   "tlh_since_at. A cumulative measure, not a snapshot -- "
+                   "unlike peak_total, this only ever goes up between resets.",
+    )
+    tlh_since_at = models.DateTimeField(
+        auto_now_add=True,
+        help_text="When the current TLH accumulation window started -- "
+                   "engine first-boot, the operator's last manual reset, or "
+                   "the last automatic monthly rollover (midnight on the "
+                   "1st, station-local time).",
     )
 
     class Meta:
