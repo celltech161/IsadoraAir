@@ -302,6 +302,25 @@ AUDIO_STATE_STALE_SECONDS = 180
 
 
 def probe_encoder_group(check):
+    """PROBE_DISPATCH entry point for kind="encoder_group" -- thin
+    wrapper around evaluate_encoder_group_health (below): derives the
+    enabled-encoder list for this MonitorCheck's configured slug (same
+    grouping logic the manager itself uses, so this can never disagree
+    with what the manager actually launched) and delegates. See
+    evaluate_encoder_group_health's own docstring for the actual
+    aggregate-health logic and why it's factored out separately."""
+    from encoders.models import Encoder
+    from encoders.services.encoder_manager import _effective_input_device, _slug
+
+    slug = check.encoder_group_slug
+    encoders = [
+        e for e in Encoder.objects.filter(enabled=True)
+        if _slug(_effective_input_device(e)) == slug
+    ]
+    return evaluate_encoder_group_health(slug, encoders, check.encoder_group_systemd_unit)
+
+
+def evaluate_encoder_group_health(slug, encoders, systemd_unit):
     """The truthful aggregate for one encoder input-device group,
     combining every signal a single systemd/audio_silence check could
     not, on its own, tell apart during the real 2026-08-05 outage:
@@ -327,38 +346,37 @@ def probe_encoder_group(check):
     MonitorManager's listener poll) for the real, external Shoutcast
     connection state -- the same signal that actually proved the
     station was down during the incident, independent of anything this
-    project's own monitoring reported."""
+    project's own monitoring reported.
+
+    Extracted (Phase 2 hardening, 2026-08-10) from probe_encoder_group
+    below so encoders/services/encoder_manager.py's candidate-
+    qualification loop can call the EXACT same aggregate-health logic
+    the dashboard/monitoring probe uses, rather than a parallel
+    reimplementation that could silently disagree with it. Takes
+    plain values (slug, an explicit encoders list, systemd_unit)
+    instead of a MonitorCheck row so it has no dependency on a
+    MonitorCheck existing at all -- qualification must work even on an
+    install that hasn't configured an "Encoder Stream Health" check."""
     import json
     from collections import defaultdict
     from types import SimpleNamespace
 
-    from encoders.models import Encoder
     from encoders.services.encoder_manager import (
-        DEFAULT_INPUT_DEVICE, STABILIZATION_SECONDS, _audio_state_path_for_slug,
-        _effective_input_device, _group_state_path_for_slug, _slug,
+        STABILIZATION_SECONDS, _audio_state_path_for_slug, _group_state_path_for_slug,
     )
     from monitoring.services.shoutcast import fetch_shoutcast_stats
 
-    slug = check.encoder_group_slug
     detail = {"input_device_slug": slug}
 
-    # 1. Which enabled encoders actually belong to this group -- same
-    # grouping logic the manager itself uses (_effective_input_device
-    # falls back to DEFAULT_INPUT_DEVICE for a blank Encoder.input_device),
-    # so this can never disagree with what the manager actually launched.
-    encoders = [
-        e for e in Encoder.objects.filter(enabled=True)
-        if _slug(_effective_input_device(e)) == slug
-    ]
     if not encoders:
         return "unknown", {**detail, "reason": "no enabled encoders configured for this input device group"}
 
     # 2. Manager systemd unit -- reuse probe_systemd's own logic
     # exactly rather than re-parsing `systemctl show` output here too.
-    systemd_status, systemd_detail = probe_systemd(SimpleNamespace(systemd_unit=check.encoder_group_systemd_unit))
+    systemd_status, systemd_detail = probe_systemd(SimpleNamespace(systemd_unit=systemd_unit))
     detail["manager_systemd"] = systemd_detail
     if systemd_status != "ok":
-        return "critical", {**detail, "reason": f"encoder-manager service ({check.encoder_group_systemd_unit}) is not active"}
+        return "critical", {**detail, "reason": f"encoder-manager service ({systemd_unit}) is not active"}
 
     # 3. Manager-owned process-supervision state.
     group_state_path = _group_state_path_for_slug(slug)

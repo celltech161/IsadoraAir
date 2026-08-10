@@ -13,9 +13,11 @@ wraps each test in a transaction that is rolled back at the end, so
 transaction.on_commit() callbacks registered by the admin (or directly,
 in the coalescing unit tests) do not fire on their own without it.
 """
+import json
 import re
+import tempfile
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from django.contrib.auth.models import User
 from django.db import transaction
@@ -26,12 +28,23 @@ from django.urls import reverse
 from encoders import admin as encoders_admin
 from encoders.admin import RUNTIME_AFFECTING_FIELDS, EncoderAdmin, dispatch_encoder_restart, mark_encoder_restart_needed
 from encoders.models import Encoder
+from encoders.services import encoder_manager as em
+from encoders.services import lkg as lkg_module
+from encoders.services import preflight as preflight_module
 
 DEFAULT_FIELDS = dict(
     name="test-encoder", enabled=True, protocol="shoutcast2",
     host="192.168.1.112", port=8000, mount="/4", username="source",
     password="secret", format="mp3", bitrate_kbps=192, input_device="",
-    station_name="", genre="", description="", url="", public=False,
+    # station_name non-blank: Phase 2 hardening's centralized validation
+    # (encoders/services/validation.py) now enforces this for Shoutcast
+    # rows -- matches the real, already-documented production incident
+    # in encoder_manager.py's own module docstring (SC2's validator
+    # rejecting an empty icy-name header). These tests are about admin
+    # restart-dispatch behavior, not station_name policy, so the
+    # fixture just needs to be a VALID row, same as test_encoder_manager
+    # .py's own make_encoder() already supplies.
+    station_name="Test Station", genre="", description="", url="", public=False,
     sort_order=0,
 )
 FORM_FIELDS = [
@@ -152,6 +165,15 @@ class EncoderAdminHttpRestartTests(TestCase):
     def setUp(self):
         self.staff = User.objects.create_superuser("admin", "admin@example.invalid", "password")
         self.client.force_login(self.staff)
+        # These tests are about restart-dispatch coalescing, not the
+        # pre-dispatch preflight gate itself (see PredispatchPreflight*
+        # test classes below) -- without this, every test here that
+        # actually saves an enabled Encoder row would hit the REAL
+        # /run and /var/lib paths and spawn a real `liquidsoap --check`
+        # subprocess as an unintended side effect of the new gate.
+        patcher = patch.object(encoders_admin, "_run_predispatch_preflight", return_value=(True, []))
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def _add_url(self):
         return reverse("admin:encoders_encoder_add")
@@ -430,6 +452,9 @@ class EncoderAdminDispatchFailureMessageTests(TransactionTestCase):
     def setUp(self):
         self.staff = User.objects.create_superuser("admin", "admin@example.invalid", "password")
         self.client.force_login(self.staff)
+        patcher = patch.object(encoders_admin, "_run_predispatch_preflight", return_value=(True, []))
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_dispatch_failure_shows_admin_visible_error_and_keeps_db_change(self):
         obj = make_encoder()
@@ -441,6 +466,279 @@ class EncoderAdminDispatchFailureMessageTests(TransactionTestCase):
         self.assertContains(response, "unable to launch")
         obj.refresh_from_db()
         self.assertEqual(obj.host, "192.168.1.201")
+
+
+# ---------------------------------------------------------------------
+# Phase 2M: desired (database) vs accepted (last-known-good) surfacing.
+# encoders/admin.py._describe_group_status reads two on-disk artifacts
+# the encoder manager (a separate systemd-managed process) writes --
+# the group-state JSON and the LKG metadata sidecar -- rather than any
+# in-process link, since gunicorn (this admin) and isadoraair-encoders
+# never share memory. Patches STATE_DIR/CANDIDATE_DIR/LKG_DIR to temp
+# dirs so nothing here touches real /run or /var/lib paths.
+# ---------------------------------------------------------------------
+class GroupStatusFixtureMixin:
+    def setUp(self):
+        super().setUp()
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        base = Path(tmpdir.name)
+        for patcher in (
+            patch.object(em, "STATE_DIR", base / "run"),
+            patch.object(lkg_module, "CANDIDATE_DIR", base / "candidate"),
+            patch.object(lkg_module, "LKG_DIR", base / "lkg"),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def write_group_state(self, input_device, **fields):
+        """Writes a group-state JSON matching what EncoderManager.
+        _write_group_state would (only the fields _describe_group_status
+        actually reads are required, defaulted to the "healthy, nothing
+        to report" shape)."""
+        path = em._group_state_path_for_slug(em._slug(input_device))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        state = {"input_device": input_device, "launch_kind": "accepted", "critical_stopped": False}
+        state.update(fields)
+        path.write_text(json.dumps(state), encoding="utf-8")
+
+
+class DescribeGroupStatusTests(GroupStatusFixtureMixin, TestCase):
+    def test_no_lkg_reports_bootstrap_info(self):
+        obj = make_encoder(input_device="airtap")
+        status = encoders_admin._describe_group_status(em._slug("airtap"), "airtap", [obj])
+        self.assertEqual(status["level"], "info")
+        self.assertIn("no last-known-good", status["message"])
+
+    def test_matching_fingerprint_reports_nothing(self):
+        obj = make_encoder(input_device="airtap")
+        fp = lkg_module.compute_fingerprint("airtap", [obj])
+        lkg_module.write_lkg(em._slug("airtap"), 'generation = "g"\n', {"fingerprint": fp})
+        status = encoders_admin._describe_group_status(em._slug("airtap"), "airtap", [obj])
+        self.assertIsNone(status["level"])
+
+    def test_mismatched_fingerprint_reports_warning(self):
+        obj = make_encoder(input_device="airtap")
+        lkg_module.write_lkg(em._slug("airtap"), 'generation = "g"\n', {"fingerprint": "different-fp"})
+        status = encoders_admin._describe_group_status(em._slug("airtap"), "airtap", [obj])
+        self.assertEqual(status["level"], "warning")
+        self.assertIn("does not match", status["message"])
+
+    def test_candidate_launch_kind_reports_probation_warning(self):
+        obj = make_encoder(input_device="airtap")
+        self.write_group_state("airtap", launch_kind="candidate")
+        status = encoders_admin._describe_group_status(em._slug("airtap"), "airtap", [obj])
+        self.assertEqual(status["level"], "warning")
+        self.assertIn("PROBATION", status["message"])
+
+    def test_rollback_launch_kind_reports_warning(self):
+        obj = make_encoder(input_device="airtap")
+        self.write_group_state("airtap", launch_kind="rollback")
+        status = encoders_admin._describe_group_status(em._slug("airtap"), "airtap", [obj])
+        self.assertEqual(status["level"], "warning")
+        self.assertIn("rolled back", status["message"])
+
+    def test_critical_stopped_reports_error_even_when_launch_kind_accepted(self):
+        obj = make_encoder(input_device="airtap")
+        self.write_group_state("airtap", launch_kind="accepted", critical_stopped=True)
+        status = encoders_admin._describe_group_status(em._slug("airtap"), "airtap", [obj])
+        self.assertEqual(status["level"], "error")
+        self.assertIn("STOPPED", status["message"])
+
+    def test_critical_stopped_takes_priority_over_candidate_kind(self):
+        """Defensive: critical_stopped should never leave launch_kind
+        as "candidate"/"rollback" in practice (_on_rollback_failed
+        always resets it to "accepted" first) -- but the priority order
+        itself is still worth pinning down explicitly."""
+        obj = make_encoder(input_device="airtap")
+        self.write_group_state("airtap", launch_kind="candidate", critical_stopped=True)
+        status = encoders_admin._describe_group_status(em._slug("airtap"), "airtap", [obj])
+        self.assertEqual(status["level"], "error")
+
+    def test_corrupt_group_state_file_falls_back_to_accepted_not_a_crash(self):
+        obj = make_encoder(input_device="airtap")
+        fp = lkg_module.compute_fingerprint("airtap", [obj])
+        lkg_module.write_lkg(em._slug("airtap"), 'generation = "g"\n', {"fingerprint": fp})
+        path = em._group_state_path_for_slug(em._slug("airtap"))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{not valid json", encoding="utf-8")
+        status = encoders_admin._describe_group_status(em._slug("airtap"), "airtap", [obj])
+        self.assertIsNone(status["level"])  # falls back to "accepted", matches -> nothing to report
+
+    def test_missing_group_state_file_falls_back_to_accepted(self):
+        """Fresh install / group has never run yet -- no group-state
+        file exists at all. Must not be mistaken for candidate/
+        rollback/critical-stopped."""
+        obj = make_encoder(input_device="airtap")
+        fp = lkg_module.compute_fingerprint("airtap", [obj])
+        lkg_module.write_lkg(em._slug("airtap"), 'generation = "g"\n', {"fingerprint": fp})
+        status = encoders_admin._describe_group_status(em._slug("airtap"), "airtap", [obj])
+        self.assertIsNone(status["level"])
+
+
+@override_settings(SECURE_SSL_REDIRECT=False)
+class ChangelistGroupStatusMessageTests(GroupStatusFixtureMixin, TestCase):
+    def setUp(self):
+        super().setUp()
+        self.staff = User.objects.create_superuser("admin-groupstatus", "admin-gs@example.invalid", "password")
+        self.client.force_login(self.staff)
+
+    def test_mismatched_group_shows_warning_banner_on_changelist(self):
+        make_encoder(input_device="airtap", enabled=True)
+        lkg_module.write_lkg(em._slug("airtap"), 'generation = "g"\n', {"fingerprint": "some-other-fp"})
+        response = self.client.get(reverse("admin:encoders_encoder_changelist"))
+        self.assertContains(response, "does not match")
+
+    def test_matching_group_shows_no_banner(self):
+        obj = make_encoder(input_device="airtap", enabled=True)
+        fp = lkg_module.compute_fingerprint("airtap", [obj])
+        lkg_module.write_lkg(em._slug("airtap"), 'generation = "g"\n', {"fingerprint": fp})
+        response = self.client.get(reverse("admin:encoders_encoder_changelist"))
+        self.assertNotContains(response, "does not match")
+
+    def test_disabled_only_group_produces_no_banner(self):
+        make_encoder(input_device="airtap", enabled=False)
+        response = self.client.get(reverse("admin:encoders_encoder_changelist"))
+        self.assertEqual(response.status_code, 200)
+        self.assertNotContains(response, "last-known-good")
+
+    def test_no_encoders_at_all_does_not_crash_changelist(self):
+        response = self.client.get(reverse("admin:encoders_encoder_changelist"))
+        self.assertEqual(response.status_code, 200)
+
+    def test_critical_stopped_shows_error_banner(self):
+        make_encoder(input_device="airtap", enabled=True)
+        self.write_group_state("airtap", launch_kind="accepted", critical_stopped=True)
+        response = self.client.get(reverse("admin:encoders_encoder_changelist"))
+        self.assertContains(response, "STOPPED")
+
+
+# ---------------------------------------------------------------------
+# Phase 2 review fix #1: the admin used to dispatch `systemctl restart
+# isadoraair-encoders` unconditionally on any runtime-affecting save --
+# meaning a bad admin edit would kill the currently-healthy process
+# BEFORE the manager's own Phase 2 validation/preflight ever got a
+# chance to reject it (the LKG would still recover the stream, but
+# only after an unnecessary interruption). _run_predispatch_preflight
+# runs the same validate -> render -> preflight sequence the manager
+# uses, BEFORE dispatch, so the admin can refuse to restart at all
+# when it already knows the change would fail.
+# ---------------------------------------------------------------------
+class PredispatchPreflightUnitTests(GroupStatusFixtureMixin, TestCase):
+    def test_no_enabled_encoders_passes_trivially(self):
+        ok, failures = encoders_admin._run_predispatch_preflight()
+        self.assertTrue(ok)
+        self.assertEqual(failures, [])
+
+    def test_valid_group_passes_with_mocked_preflight(self):
+        make_encoder(input_device="airtap", enabled=True)
+        with patch.object(preflight_module, "run_preflight", return_value=preflight_module.PreflightResult(ok=True)):
+            ok, failures = encoders_admin._run_predispatch_preflight()
+        self.assertTrue(ok)
+        self.assertEqual(failures, [])
+
+    def test_validation_failure_reported_without_calling_preflight(self):
+        """protocol=shoutcast1 + format=vorbis passes Django's own
+        per-row model field choices (both are individually legal
+        FORMAT_CHOICES/PROTOCOL_CHOICES values) but fails Phase 2A's
+        protocol/format compatibility matrix -- validate_full_
+        configuration must catch it before preflight (liquidsoap) is
+        ever invoked."""
+        make_encoder(input_device="airtap", enabled=True, protocol="shoutcast1", format="vorbis")
+        mock_preflight = MagicMock()
+        with patch.object(preflight_module, "run_preflight", mock_preflight):
+            ok, failures = encoders_admin._run_predispatch_preflight()
+        self.assertFalse(ok)
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(failures[0][0], "airtap")
+        mock_preflight.assert_not_called()
+
+    def test_preflight_failure_reported(self):
+        make_encoder(input_device="airtap", enabled=True)
+        with patch.object(preflight_module, "run_preflight", return_value=preflight_module.PreflightResult(ok=False, reason="liquidsoap --check failed")):
+            ok, failures = encoders_admin._run_predispatch_preflight()
+        self.assertFalse(ok)
+        self.assertIn("liquidsoap --check failed", failures[0][1])
+
+    def test_predispatch_leaves_no_stray_candidate_files(self):
+        make_encoder(input_device="airtap", enabled=True)
+        with patch.object(preflight_module, "run_preflight", return_value=preflight_module.PreflightResult(ok=True)):
+            encoders_admin._run_predispatch_preflight()
+        leftovers = list(lkg_module.CANDIDATE_DIR.glob("*.liq")) if lkg_module.CANDIDATE_DIR.exists() else []
+        self.assertEqual(leftovers, [])
+
+    def test_one_bad_group_is_reported_even_though_another_group_is_fine(self):
+        """Whole-service gate, not per-group: a bad group still shows
+        up in `failures` on its own -- _restart_encoders_and_report is
+        what turns "any failures at all" into "no restart dispatched,"
+        covered separately below."""
+        make_encoder(name="good", input_device="airtap", enabled=True)
+        make_encoder(name="bad", input_device="other-device", enabled=True, protocol="shoutcast1", format="vorbis")
+        with patch.object(preflight_module, "run_preflight", return_value=preflight_module.PreflightResult(ok=True)):
+            ok, failures = encoders_admin._run_predispatch_preflight()
+        self.assertFalse(ok)
+        failed_devices = [f[0] for f in failures]
+        self.assertIn("other-device", failed_devices)
+        self.assertNotIn("airtap", failed_devices)
+
+
+@override_settings(SECURE_SSL_REDIRECT=False)
+class PredispatchPreflightHttpTests(GroupStatusFixtureMixin, TransactionTestCase):
+    # TransactionTestCase, matching EncoderAdminDispatchFailureMessageTests
+    # above: messages.error() added inside the on_commit callback needs a
+    # REAL commit during request handling to land in this response.
+    def setUp(self):
+        super().setUp()
+        self.staff = User.objects.create_superuser("admin-predispatch", "admin-pd@example.invalid", "password")
+        self.client.force_login(self.staff)
+
+    def test_group_level_duplicate_destination_blocks_restart(self):
+        """A duplicate destination across two DIFFERENT rows is a
+        group-level failure Django's own per-row form validation
+        cannot catch (each row is individually fine) -- exactly the
+        kind of check this admin-level gate exists to add."""
+        make_encoder(name="existing")  # DEFAULT_FIELDS: shoutcast2, host/port/mount all default
+        data = encoder_post_data(name="duplicate")  # same host/port/mount -> same destination
+        with patch.object(preflight_module, "run_preflight", return_value=preflight_module.PreflightResult(ok=True)):
+            with patch.object(encoders_admin, "dispatch_encoder_restart", return_value=True) as mock_dispatch:
+                response = self.client.post(reverse("admin:encoders_encoder_add"), data, follow=True)
+        mock_dispatch.assert_not_called()
+        self.assertContains(response, "failed pre-restart checks")
+        # The DB write itself still happened -- desired config stays
+        # visible for diagnosis, never silently discarded.
+        self.assertTrue(Encoder.objects.filter(name="duplicate").exists())
+
+    def test_valid_change_still_dispatches_restart(self):
+        with patch.object(preflight_module, "run_preflight", return_value=preflight_module.PreflightResult(ok=True)):
+            with patch.object(encoders_admin, "dispatch_encoder_restart", return_value=True) as mock_dispatch:
+                self.client.post(reverse("admin:encoders_encoder_add"), encoder_post_data(name="fine"), follow=True)
+        mock_dispatch.assert_called_once()
+
+    def test_rejected_predispatch_does_not_touch_currently_running_process(self):
+        """The whole point of this fix: no restart command is ever
+        launched for a rejected desired config -- dispatch_encoder_
+        restart (the only thing that would touch the live process) is
+        never called at all.
+
+        Popen is only intercepted for the RESTART command specifically
+        -- the add-view's own get_form() also shells out (`arecord -l`,
+        via hardware.devices.list_input_devices) to populate the
+        input_device dropdown, and that real call must be left alone."""
+        make_encoder(name="existing")
+        data = encoder_post_data(name="duplicate")
+        restart_calls = []
+        real_popen = encoders_admin.subprocess.Popen
+
+        def selective_popen(cmd, *args, **kwargs):
+            if cmd == encoders_admin.RESTART_COMMAND:
+                restart_calls.append(cmd)
+                return MagicMock()
+            return real_popen(cmd, *args, **kwargs)
+
+        with patch.object(preflight_module, "run_preflight", return_value=preflight_module.PreflightResult(ok=True)):
+            with patch.object(encoders_admin.subprocess, "Popen", side_effect=selective_popen):
+                self.client.post(reverse("admin:encoders_encoder_add"), data, follow=True)
+        self.assertEqual(restart_calls, [])
 
 
 # ---------------------------------------------------------------------

@@ -3,6 +3,27 @@ from django.db import models
 
 BITRATE_CHOICES = [(k, f"{k} kbps") for k in (64, 96, 128, 160, 192, 224, 256, 320)]
 
+# Fields whose change is runtime-affecting -- feeds the generated Liquidsoap
+# script directly, or changes which input_device group a row belongs to.
+# Originally lived only in encoders/admin.py (restart-dispatch decision);
+# moved here (2026-08-10, Phase 2 hardening) to be the single shared
+# source of truth for TWO independently-important decisions that must
+# never be allowed to drift apart: "does this change need a restart"
+# (admin.py) and "does this change the configuration fingerprint"
+# (encoders/services/validation.py's compute_fingerprint) -- both are
+# fundamentally the same question ("does this affect the running
+# script"), so one field list answers both. `name` and `sort_order` are
+# deliberately EXCLUDED: neither is read anywhere in encoder_manager.py's
+# build_liquidsoap_script/_output_block (confirmed by source inspection --
+# `name` only ever appears in the manager's own log line, `sort_order`
+# only affects admin/queryset ordering). `description` is ALSO excluded
+# for the same reason -- not read by encoder_manager.py.
+RUNTIME_AFFECTING_FIELDS = frozenset({
+    "enabled", "protocol", "host", "port", "mount", "username", "password",
+    "format", "bitrate_kbps", "input_device", "station_name", "genre",
+    "url", "public",
+})
+
 
 class Encoder(models.Model):
     """One outbound stream connection (Icecast/Shoutcast). Enabled rows
@@ -72,25 +93,48 @@ class Encoder(models.Model):
         verbose_name_plural = "Encoders"
 
     def clean(self):
-        if self.protocol in ("icecast", "shoutcast2") and not self.mount:
-            raise ValidationError("Mount point is required for Icecast/Shoutcast 2.")
-        if self.format == "aac" and self.protocol == "shoutcast1":
-            raise ValidationError(
-                "AAC isn't supported over Shoutcast 1 (ICY protocol only ever "
-                "carried MP3) — use Icecast or Shoutcast 2."
-            )
+        # Delegates to the centralized validation layer (Phase 2
+        # hardening, 2026-08-10) rather than duplicating rules here --
+        # encoders/services/validation.py is now the ONE place every
+        # protocol/format/connection-field rule lives, since a direct
+        # ORM write (fixture, migration, shell one-liner) bypasses this
+        # method entirely and must be caught by that same layer at
+        # candidate-render time regardless. Local import: encoders/
+        # services/validation.py imports encoders.models at its own
+        # module level (for FORMAT_CHOICES/PROTOCOL_CHOICES labels and
+        # the default Encoder.objects queryset), so a top-level import
+        # here would be circular.
+        from encoders.services.validation import validate_single_encoder
+        errors = validate_single_encoder(self)
+        if errors:
+            raise ValidationError(errors)
 
     @property
     def shoutcast_sid(self):
-        """Normalized Shoutcast Stream ID, e.g. "/4" -> "4" -- the exact
-        same value passed to Liquidsoap's `icy_id` param (see
-        encoders/services/encoder_manager.py's _output_block) and looked
-        up against a live Shoutcast server's /statistics STREAM[@id]
-        (see monitoring/services/shoutcast.py). Single source of truth
-        for this normalization -- it used to be duplicated inline in
-        both of those call sites, a real risk given the two MUST agree
-        (a drift here would make monitoring check the wrong SID and
-        silently misreport a stream's real status).
+        """Normalized Shoutcast Stream ID, e.g. "/4" -> "4", as a STRING
+        -- for MATCHING against a live Shoutcast server's /statistics
+        STREAM[@id] (see monitoring/services/shoutcast.py, whose XML-
+        parsed SIDs are strings), not for script generation. Lenient by
+        design: falls back to "1" on a blank/malformed mount rather than
+        raising, because monitoring must still be ABLE to ask "is SID 1
+        up?" even for a row that centralized validation would reject --
+        an invalid row is exactly the case operators most need
+        monitoring to keep functioning for, not the case to make this
+        property throw.
+
+        For SCRIPT GENERATION specifically, encoders/services/
+        encoder_manager.py's _output_block uses
+        encoders.services.validation.normalize_shoutcast_sid() instead
+        -- strict, raises on anything that isn't a clean positive
+        integer, and returns an int (never a string substituted
+        directly into `icy_id=`). Two different contracts for two
+        different consumers: monitoring needs a best-effort string that
+        never raises, script generation needs a verified integer or an
+        explicit failure. Single source of truth for this normalization
+        used to be duplicated inline in both call sites, a real risk
+        given the two MUST agree (a drift here would make monitoring
+        check the wrong SID and silently misreport a stream's real
+        status).
 
         Shoutcast 1 is single-stream with no real SID concept -- always
         "1" (matching Liquidsoap's own default icy_id), regardless of

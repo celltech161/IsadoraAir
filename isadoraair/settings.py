@@ -232,6 +232,15 @@ WAVEFORMS_DIR = config('WAVEFORMS_DIR', default='/srv/isadoraair/waveforms')
 # the companion `weather-ingest` cron scripts. The two sides must agree.
 WEATHER_DATA_DIR = config('WEATHER_DATA_DIR', default='/var/lib/isadoraair/weather')
 
+# Persistent (survives reboot, unlike /run's tmpfs) last-known-good
+# encoder configuration state -- see encoders/services/lkg.py. Contains
+# the exact rendered Liquidsoap script (with credentials embedded, since
+# Liquidsoap needs them to run) that last passed live health
+# qualification, so a bad candidate configuration can always be rolled
+# back to something already proven to work. Directory and files are
+# permission-locked (0700/0600) by lkg.py itself, not by this setting.
+ENCODER_STATE_ROOT = config('ENCODER_STATE_ROOT', default='/var/lib/isadoraair/encoders')
+
 # CD ripping configuration -- drive path, read offset, staging dir,
 # AccurateRip strictness -- lives in the CDRipConfig singleton
 # (admin: /admin/library/cdripconfig/) so replacing the drive doesn't
