@@ -239,8 +239,7 @@ sudo apt install liquidsoap alsa-utils ffmpeg
 sudo apt install whipper cdparanoia flac libdiscid0
 ```
 
-### 2. ALSA loopback module (only if using StereoTool or a similar
-external processor)
+### 2. ALSA loopback module (only if using StereoTool or a similar external processor)
 
 IsadoraAir's engine can feed a virtual ALSA loopback device that
 StereoTool reads from -- the "canonical digital mix out to processor,
