@@ -8,7 +8,7 @@ listener widget next to Listeners/Peak.
 fetch_shoutcast_stats is always mocked here -- no live Shoutcast server
 involved, matching monitoring/tests/test_probe_encoder_group.py's own
 approach for the same underlying fetcher."""
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -122,10 +122,40 @@ class MaybeResetTlhForNewMonthTests(TestCase):
 
     def test_same_month_no_reset(self):
         now = django_tz.now()
-        peak = ListenerPeak(tlh_hours=12.5, tlh_since_at=now.replace(day=1))
+        # Build tlh_since_at from the station's LOCAL calendar day, not
+        # a naive now.replace(day=1) on the UTC-side datetime. The
+        # latter looks like "the 1st" but isn't -- in America/Chicago
+        # (UTC-5/-6), a UTC timestamp of day=1 at an early UTC hour
+        # (00:00-04:59, i.e. 7pm-11:59pm Central the day before)
+        # converts to the LAST day of the PREVIOUS local month, which
+        # made this test time-of-day flaky: it failed for roughly 5
+        # hours out of every 24, independent of the function under
+        # test being correct. See test_utc_day_one_can_be_previous_
+        # local_month below for the case where that mismatch is the
+        # (correct) expected behavior.
+        since_local = django_tz.localtime(now).replace(
+            day=1, hour=12, minute=0, second=0, microsecond=0
+        )
+        peak = ListenerPeak(tlh_hours=12.5, tlh_since_at=since_local)
         changed = monitor_module.MonitorManager._maybe_reset_tlh_for_new_month(peak, now)
         self.assertFalse(changed)
         self.assertEqual(peak.tlh_hours, 12.5)  # untouched
+
+    def test_utc_day_one_can_be_previous_local_month(self):
+        # Regression/documentation for the mechanism behind the flaky
+        # fixture fixed above: a tlh_since_at that is literally "day 1,
+        # 02:00 UTC" is, once converted to America/Chicago, actually
+        # ~21:00 on the LAST day of the PREVIOUS month. The reset must
+        # still fire here -- _maybe_reset_tlh_for_new_month compares
+        # local calendar months (the station's own TIME_ZONE, per its
+        # docstring), not UTC ones, so this is correct behavior, not a
+        # bug: don't "fix" the function to compare UTC months instead.
+        now = datetime(2026, 8, 11, 2, 0, 0, tzinfo=timezone.utc)
+        since = now.replace(day=1)  # Aug 1 02:00 UTC -> Jul 31 ~21:00 Chicago
+        peak = ListenerPeak(tlh_hours=12.5, tlh_since_at=since)
+        changed = monitor_module.MonitorManager._maybe_reset_tlh_for_new_month(peak, now)
+        self.assertTrue(changed)
+        self.assertEqual(peak.tlh_hours, 0.0)
 
     def test_previous_calendar_month_resets(self):
         now = django_tz.now()
