@@ -5,14 +5,17 @@ BITRATE_CHOICES = [(k, f"{k} kbps") for k in (64, 96, 128, 160, 192, 224, 256, 3
 
 # Fields whose change is runtime-affecting -- feeds the generated Liquidsoap
 # script directly, or changes which input_device group a row belongs to.
-# Originally lived only in encoders/admin.py (restart-dispatch decision);
-# moved here (2026-08-10, Phase 2 hardening) to be the single shared
-# source of truth for TWO independently-important decisions that must
-# never be allowed to drift apart: "does this change need a restart"
-# (admin.py) and "does this change the configuration fingerprint"
-# (encoders/services/validation.py's compute_fingerprint) -- both are
-# fundamentally the same question ("does this affect the running
-# script"), so one field list answers both. `name` and `sort_order` are
+# Originally lived only in encoders/admin.py (Phase 2's restart-dispatch
+# decision); moved here (2026-08-10, Phase 2 hardening) to be the single
+# shared source of truth for TWO independently-important decisions that
+# must never be allowed to drift apart: "does this change need the encoder
+# manager to reconcile this row's group" (admin.py's own informational
+# messaging -- Phase 3 replaced the restart dispatch itself with the
+# manager discovering the change on its own) and "does this change the
+# configuration fingerprint" (encoders/services/lkg.py's
+# compute_fingerprint) -- both are fundamentally the same question ("does
+# this affect the running script"), so one field list answers both.
+# `name` and `sort_order` are
 # deliberately EXCLUDED: neither is read anywhere in encoder_manager.py's
 # build_liquidsoap_script/_output_block (confirmed by source inspection --
 # `name` only ever appears in the manager's own log line, `sort_order`
@@ -34,13 +37,18 @@ class Encoder(models.Model):
 
     Adding, deleting, or changing a row's runtime-affecting fields
     (encoders/admin.py's RUNTIME_AFFECTING_FIELDS) is a topology change
-    for that process, not a live-adjustable property, so the admin
-    restarts isadoraair-encoders after such a change commits -- but
-    only when the row is, was, or becomes `enabled`; a disabled row
-    was never part of the running topology, so adding/deleting/editing
-    one that stays disabled restarts nothing. Fields outside
+    for that row's input_device group, not a live-adjustable property.
+    Since Phase 3 (2026-08-10), the admin no longer restarts anything
+    itself -- it just commits the change; the running EncoderManager
+    process discovers the drift on its own (encoders/services/
+    encoder_manager.py's _reconcile) and replaces ONLY that group's
+    live child, after re-validating and re-preflighting it, leaving
+    every other group's process completely untouched -- but only when
+    the row is, was, or becomes `enabled`; a disabled row was never
+    part of the running topology, so adding/deleting/editing one that
+    stays disabled triggers no reconciliation. Fields outside
     RUNTIME_AFFECTING_FIELDS (e.g. sort_order, or the display-only
-    `name`) never restart anything regardless of `enabled` — see
+    `name`) never trigger reconciliation regardless of `enabled` — see
     encoders/admin.py."""
     PROTOCOL_CHOICES = [
         ("icecast", "Icecast"),

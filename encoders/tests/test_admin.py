@@ -1,36 +1,48 @@
-"""EncoderAdmin restart-hardening tests (Encoder hardening Item #1):
-transaction-safe, coalesced (one restart per logical admin operation),
-limited to runtime-affecting field changes, and observable on
-immediate dispatch failure. See encoders/admin.py's module docstring-
-level comments for the design this verifies.
+"""EncoderAdmin Phase 3A tests: the admin no longer dispatches
+`systemctl restart isadoraair-encoders` (or anything else privileged)
+for a routine Encoder edit -- it commits the desired configuration and
+shows an informational message; the running EncoderManager discovers
+the change itself on its own reconciliation cadence (see
+encoders/services/encoder_manager.py's _reconcile). This file verifies:
 
-dispatch_encoder_restart (or, at the subprocess.Popen layer, for the
-dispatch-behavior tests) is patched in every test -- nothing here ever
-touches real sudo/systemctl.
+  * the old restart-dispatch surface (RESTART_COMMAND,
+    dispatch_encoder_restart, _run_predispatch_preflight,
+    _restart_encoders_and_report, mark_encoder_restart_needed) is
+    genuinely gone, not just unused;
+  * admin.py imports no subprocess/sudo-adjacent machinery at all;
+  * a save always commits the desired configuration regardless of
+    whether it's runtime-affecting;
+  * the "will reconcile automatically" info message appears exactly
+    under the same runtime-affecting-field-and-enabled conditions the
+    old restart dispatch used to, coalesced once per logical admin
+    operation (not once per row in a bulk edit);
+  * _describe_group_status's desired-vs-running-vs-accepted banner
+    (Phase 2M, extended for Phase 3O's reconcile_status/last_reconcile_
+    * fields).
 
-Uses TestCase.captureOnCommitCallbacks() throughout: Django's TestCase
-wraps each test in a transaction that is rolled back at the end, so
-transaction.on_commit() callbacks registered by the admin (or directly,
-in the coalescing unit tests) do not fire on their own without it.
+Group-level duplicate-destination / cross-group-collision rejection is
+no longer something this admin can pre-check synchronously (that
+required a whole-service restart-dispatch gate that no longer exists)
+-- it's now caught by the encoder manager's own reconciliation
+(encoders/services/encoder_manager.py's _reconcile_changed_group /
+_static_check_candidate), covered in encoders/tests/
+test_encoder_manager.py's reconciliation test suite, not here.
 """
 import json
 import re
 import tempfile
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 from django.contrib.auth.models import User
-from django.db import transaction
-from django.http import HttpRequest
 from django.test import TestCase, TransactionTestCase, override_settings
 from django.urls import reverse
 
 from encoders import admin as encoders_admin
-from encoders.admin import RUNTIME_AFFECTING_FIELDS, EncoderAdmin, dispatch_encoder_restart, mark_encoder_restart_needed
+from encoders.admin import RUNTIME_AFFECTING_FIELDS, EncoderAdmin
 from encoders.models import Encoder
 from encoders.services import encoder_manager as em
 from encoders.services import lkg as lkg_module
-from encoders.services import preflight as preflight_module
 
 DEFAULT_FIELDS = dict(
     name="test-encoder", enabled=True, protocol="shoutcast2",
@@ -41,9 +53,8 @@ DEFAULT_FIELDS = dict(
     # rows -- matches the real, already-documented production incident
     # in encoder_manager.py's own module docstring (SC2's validator
     # rejecting an empty icy-name header). These tests are about admin
-    # restart-dispatch behavior, not station_name policy, so the
-    # fixture just needs to be a VALID row, same as test_encoder_manager
-    # .py's own make_encoder() already supplies.
+    # save/notification behavior, not station_name policy, so the
+    # fixture just needs to be a VALID row.
     station_name="Test Station", genre="", description="", url="", public=False,
     sort_order=0,
 )
@@ -53,6 +64,8 @@ FORM_FIELDS = [
     "genre", "description", "url",
 ]
 BOOL_FIELDS = ["enabled", "public"]
+
+RECONCILE_MESSAGE_SNIPPET = b"encoder manager will reconcile"
 
 
 def make_encoder(**overrides):
@@ -108,72 +121,37 @@ def changelist_formset_data(objs, row_overrides=None):
 
 
 # ---------------------------------------------------------------------
-# 1-3: transaction behavior (direct, no HTTP round trip needed)
+# The old restart-dispatch surface is genuinely gone, not just unused.
 # ---------------------------------------------------------------------
-class CoalescingTransactionTests(TestCase):
-    def test_restart_registered_does_not_execute_before_commit(self):
-        request = HttpRequest()
-        with patch.object(encoders_admin, "dispatch_encoder_restart") as mock_dispatch:
-            with self.captureOnCommitCallbacks(execute=True):
-                with transaction.atomic():
-                    mark_encoder_restart_needed(request)
-                    mock_dispatch.assert_not_called()
+class NoPrivilegedDispatchTests(TestCase):
+    def test_restart_dispatch_functions_no_longer_exist(self):
+        for name in (
+            "RESTART_COMMAND", "dispatch_encoder_restart", "_run_predispatch_preflight",
+            "_restart_encoders_and_report", "mark_encoder_restart_needed",
+        ):
+            self.assertFalse(hasattr(encoders_admin, name), f"encoders.admin.{name} still exists")
 
-    def test_restart_executes_after_successful_commit(self):
-        request = HttpRequest()
-        with patch.object(encoders_admin, "dispatch_encoder_restart") as mock_dispatch:
-            with self.captureOnCommitCallbacks(execute=True):
-                with transaction.atomic():
-                    mark_encoder_restart_needed(request)
-            mock_dispatch.assert_called_once()
-
-    def test_rolled_back_transaction_causes_no_restart(self):
-        request = HttpRequest()
-        with patch.object(encoders_admin, "dispatch_encoder_restart") as mock_dispatch:
-            with self.captureOnCommitCallbacks(execute=True):
-                try:
-                    with transaction.atomic():
-                        mark_encoder_restart_needed(request)
-                        raise RuntimeError("force rollback")
-                except RuntimeError:
-                    pass
-            mock_dispatch.assert_not_called()
-
-    def test_repeated_registration_within_one_request_coalesces(self):
-        """Directly exercises the coalescing guard itself: calling
-        mark_encoder_restart_needed() more than once on the same request
-        must not register more than one on_commit callback -- registering
-        the same callback repeatedly is not automatically deduplicated by
-        transaction.on_commit() itself, so this is the behavior the
-        request-attribute guard exists to provide."""
-        request = HttpRequest()
-        with patch.object(encoders_admin, "dispatch_encoder_restart") as mock_dispatch:
-            with self.captureOnCommitCallbacks(execute=True):
-                with transaction.atomic():
-                    mark_encoder_restart_needed(request)
-                    mark_encoder_restart_needed(request)
-                    mark_encoder_restart_needed(request)
-            mock_dispatch.assert_called_once()
+    def test_admin_module_imports_no_subprocess_or_transaction(self):
+        # subprocess: nothing in this module ever shells out anymore.
+        # transaction: nothing here defers to on_commit() anymore --
+        # there's no dispatch left to race the DB write becoming
+        # visible; the manager only ever reads fully-committed state on
+        # its own independent schedule.
+        self.assertFalse(hasattr(encoders_admin, "subprocess"))
+        self.assertFalse(hasattr(encoders_admin, "transaction"))
 
 
 # ---------------------------------------------------------------------
-# 4-13: admin HTTP behavior -- field changes, delete, changelist bulk edit
+# Admin save behavior: always commits; shows the reconciliation-pending
+# info message under exactly the same runtime-affecting-field-and-
+# enabled conditions the old restart dispatch used to gate on.
 # ---------------------------------------------------------------------
 @override_settings(SECURE_SSL_REDIRECT=False)  # project-wide prod setting; the
 # plain-HTTP Django test client would otherwise get a 301 on every request
-class EncoderAdminHttpRestartTests(TestCase):
+class EncoderAdminSaveTests(TestCase):
     def setUp(self):
         self.staff = User.objects.create_superuser("admin", "admin@example.invalid", "password")
         self.client.force_login(self.staff)
-        # These tests are about restart-dispatch coalescing, not the
-        # pre-dispatch preflight gate itself (see PredispatchPreflight*
-        # test classes below) -- without this, every test here that
-        # actually saves an enabled Encoder row would hit the REAL
-        # /run and /var/lib paths and spawn a real `liquidsoap --check`
-        # subprocess as an unintended side effect of the new gate.
-        patcher = patch.object(encoders_admin, "_run_predispatch_preflight", return_value=(True, []))
-        patcher.start()
-        self.addCleanup(patcher.stop)
 
     def _add_url(self):
         return reverse("admin:encoders_encoder_add")
@@ -188,291 +166,159 @@ class EncoderAdminHttpRestartTests(TestCase):
         return reverse("admin:encoders_encoder_changelist")
 
     def _post(self, url, data, **kwargs):
-        with self.captureOnCommitCallbacks(execute=True):
-            return self.client.post(url, data, **kwargs)
+        return self.client.post(url, data, follow=True, **kwargs)
 
-    # 4. Adding an enabled encoder requests one restart.
-    def test_add_enabled_encoder_requests_one_restart(self):
-        data = encoder_post_data(name="new-encoder")
-        with patch.object(encoders_admin, "dispatch_encoder_restart", return_value=True) as mock_dispatch:
-            response = self._post(self._add_url(), data)
-        self.assertEqual(response.status_code, 302)
+    def test_add_enabled_encoder_commits_and_notifies(self):
+        response = self._post(self._add_url(), encoder_post_data(name="new-encoder"))
         self.assertTrue(Encoder.objects.filter(name="new-encoder").exists())
-        mock_dispatch.assert_called_once()
+        self.assertEqual(response.content.count(RECONCILE_MESSAGE_SNIPPET), 1)
 
-    # 5. Changing a runtime-affecting field requests one restart.
-    def test_changing_runtime_affecting_field_requests_one_restart(self):
+    def test_changing_runtime_affecting_field_notifies(self):
         obj = make_encoder()
-        data = encoder_post_data_from(obj, host="192.168.1.200")
-        with patch.object(encoders_admin, "dispatch_encoder_restart", return_value=True) as mock_dispatch:
-            response = self._post(self._change_url(obj), data)
-        self.assertEqual(response.status_code, 302)
+        response = self._post(self._change_url(obj), encoder_post_data_from(obj, host="192.168.1.200"))
         obj.refresh_from_db()
         self.assertEqual(obj.host, "192.168.1.200")
-        mock_dispatch.assert_called_once()
+        self.assertEqual(response.content.count(RECONCILE_MESSAGE_SNIPPET), 1)
 
-    # 6. Enabling or disabling an encoder requests one restart.
-    def test_disabling_encoder_requests_one_restart(self):
+    def test_disabling_encoder_notifies(self):
         obj = make_encoder(enabled=True)
-        data = encoder_post_data_from(obj, enabled=False)
-        with patch.object(encoders_admin, "dispatch_encoder_restart", return_value=True) as mock_dispatch:
-            self._post(self._change_url(obj), data)
+        response = self._post(self._change_url(obj), encoder_post_data_from(obj, enabled=False))
         obj.refresh_from_db()
         self.assertFalse(obj.enabled)
-        mock_dispatch.assert_called_once()
+        self.assertEqual(response.content.count(RECONCILE_MESSAGE_SNIPPET), 1)
 
-    # 7. Changing only sort_order requests no restart.
-    def test_sort_order_only_change_requests_no_restart(self):
+    def test_sort_order_only_change_commits_no_notification(self):
         obj = make_encoder(sort_order=0)
-        data = encoder_post_data_from(obj, sort_order=5)
-        with patch.object(encoders_admin, "dispatch_encoder_restart", return_value=True) as mock_dispatch:
-            self._post(self._change_url(obj), data)
+        response = self._post(self._change_url(obj), encoder_post_data_from(obj, sort_order=5))
         obj.refresh_from_db()
         self.assertEqual(obj.sort_order, 5)
-        mock_dispatch.assert_not_called()
+        self.assertNotIn(RECONCILE_MESSAGE_SNIPPET, response.content)
 
-    # 8. Saving with no effective change requests no restart.
-    def test_no_effective_change_requests_no_restart(self):
+    def test_no_effective_change_no_notification(self):
         obj = make_encoder()
-        data = encoder_post_data_from(obj)
-        with patch.object(encoders_admin, "dispatch_encoder_restart", return_value=True) as mock_dispatch:
-            self._post(self._change_url(obj), data)
-        mock_dispatch.assert_not_called()
+        response = self._post(self._change_url(obj), encoder_post_data_from(obj))
+        self.assertNotIn(RECONCILE_MESSAGE_SNIPPET, response.content)
 
-    # 9. Deleting one encoder requests one restart after commit.
-    def test_deleting_one_encoder_requests_one_restart(self):
+    def test_deleting_one_encoder_notifies(self):
         obj = make_encoder()
-        with patch.object(encoders_admin, "dispatch_encoder_restart", return_value=True) as mock_dispatch:
-            self._post(self._delete_url(obj), {"post": "yes"})
+        response = self._post(self._delete_url(obj), {"post": "yes"})
         self.assertFalse(Encoder.objects.filter(pk=obj.pk).exists())
-        mock_dispatch.assert_called_once()
+        self.assertEqual(response.content.count(RECONCILE_MESSAGE_SNIPPET), 1)
 
-    # 10. Bulk deleting multiple encoders requests exactly one restart.
-    def test_bulk_delete_multiple_encoders_requests_one_restart(self):
+    def test_bulk_delete_multiple_encoders_notifies_once(self):
         a = make_encoder(name="a")
         b = make_encoder(name="b")
         data = {"action": "delete_selected", "_selected_action": [a.pk, b.pk], "post": "yes"}
-        with patch.object(encoders_admin, "dispatch_encoder_restart", return_value=True) as mock_dispatch:
-            self._post(self._changelist_url(), data)
+        response = self._post(self._changelist_url(), data)
         self.assertEqual(Encoder.objects.count(), 0)
-        mock_dispatch.assert_called_once()
+        self.assertEqual(response.content.count(RECONCILE_MESSAGE_SNIPPET), 1)
 
-    # 11. Editing multiple runtime-affecting rows in one changelist
-    # request requests exactly one restart.
-    def test_editing_multiple_runtime_affecting_rows_requests_one_restart(self):
+    def test_editing_multiple_runtime_affecting_rows_notifies_once(self):
+        """Coalescing: a changelist bulk-save calls save_model() once
+        per changed row -- must still show the reconciliation-pending
+        message exactly once for the whole logical operation, not once
+        per row."""
         a = make_encoder(name="a", enabled=True)
         b = make_encoder(name="b", enabled=True)
         data = changelist_formset_data([a, b], {a.pk: {"enabled": False}, b.pk: {"enabled": False}})
-        with patch.object(encoders_admin, "dispatch_encoder_restart", return_value=True) as mock_dispatch:
-            self._post(self._changelist_url(), data)
+        response = self._post(self._changelist_url(), data)
         a.refresh_from_db()
         b.refresh_from_db()
         self.assertFalse(a.enabled)
         self.assertFalse(b.enabled)
-        mock_dispatch.assert_called_once()
+        self.assertEqual(response.content.count(RECONCILE_MESSAGE_SNIPPET), 1)
 
-    # 12. Editing only sort_order values in one changelist request
-    # requests no restart.
-    def test_editing_only_sort_order_in_changelist_requests_no_restart(self):
+    def test_editing_only_sort_order_in_changelist_no_notification(self):
         a = make_encoder(name="a", sort_order=0)
         b = make_encoder(name="b", sort_order=1)
         data = changelist_formset_data([a, b], {a.pk: {"sort_order": 5}, b.pk: {"sort_order": 6}})
-        with patch.object(encoders_admin, "dispatch_encoder_restart", return_value=True) as mock_dispatch:
-            self._post(self._changelist_url(), data)
+        response = self._post(self._changelist_url(), data)
         a.refresh_from_db()
         b.refresh_from_db()
         self.assertEqual(a.sort_order, 5)
         self.assertEqual(b.sort_order, 6)
-        mock_dispatch.assert_not_called()
+        self.assertNotIn(RECONCILE_MESSAGE_SNIPPET, response.content)
 
-    # 13. A mixed changelist update (sort_order + at least one
-    # runtime-affecting change) requests exactly one restart.
-    def test_mixed_changelist_update_requests_one_restart(self):
+    def test_mixed_changelist_update_notifies_once(self):
         a = make_encoder(name="a", sort_order=0, enabled=True)
         b = make_encoder(name="b", sort_order=1, enabled=True)
         data = changelist_formset_data([a, b], {a.pk: {"sort_order": 9}, b.pk: {"enabled": False}})
-        with patch.object(encoders_admin, "dispatch_encoder_restart", return_value=True) as mock_dispatch:
-            self._post(self._changelist_url(), data)
+        response = self._post(self._changelist_url(), data)
         a.refresh_from_db()
         b.refresh_from_db()
         self.assertEqual(a.sort_order, 9)
         self.assertFalse(b.enabled)
-        mock_dispatch.assert_called_once()
+        self.assertEqual(response.content.count(RECONCILE_MESSAGE_SNIPPET), 1)
 
-    # --- Enabled-state gating (review round 2) -------------------------
+    # --- Enabled-state gating (unchanged invariant from Phase 2) -------
     # A disabled row was never part of the running Liquidsoap topology,
     # so an operation that only ever touches a disabled row -- add,
-    # delete, or an edit that leaves it disabled -- must not restart
-    # anything, even if a runtime-affecting field is involved.
+    # delete, or an edit that leaves it disabled -- must not notify,
+    # even if a runtime-affecting field is involved.
 
-    def test_adding_disabled_encoder_requests_no_restart(self):
-        data = encoder_post_data(name="new-disabled-encoder", enabled=False)
-        with patch.object(encoders_admin, "dispatch_encoder_restart", return_value=True) as mock_dispatch:
-            response = self._post(self._add_url(), data)
-        self.assertEqual(response.status_code, 302)
+    def test_adding_disabled_encoder_no_notification(self):
+        response = self._post(self._add_url(), encoder_post_data(name="new-disabled-encoder", enabled=False))
         self.assertTrue(Encoder.objects.filter(name="new-disabled-encoder", enabled=False).exists())
-        mock_dispatch.assert_not_called()
+        self.assertNotIn(RECONCILE_MESSAGE_SNIPPET, response.content)
 
-    def test_deleting_disabled_encoder_requests_no_restart(self):
+    def test_deleting_disabled_encoder_no_notification(self):
         obj = make_encoder(enabled=False)
-        with patch.object(encoders_admin, "dispatch_encoder_restart", return_value=True) as mock_dispatch:
-            self._post(self._delete_url(obj), {"post": "yes"})
+        response = self._post(self._delete_url(obj), {"post": "yes"})
         self.assertFalse(Encoder.objects.filter(pk=obj.pk).exists())
-        mock_dispatch.assert_not_called()
+        self.assertNotIn(RECONCILE_MESSAGE_SNIPPET, response.content)
 
-    def test_editing_runtime_fields_on_disabled_encoder_remains_disabled_requests_no_restart(self):
+    def test_editing_runtime_fields_on_disabled_encoder_remains_disabled_no_notification(self):
         obj = make_encoder(enabled=False, host="192.168.1.112", port=8000, bitrate_kbps=192)
         data = encoder_post_data_from(obj, host="192.168.1.250", port=8010, bitrate_kbps=256)
-        with patch.object(encoders_admin, "dispatch_encoder_restart", return_value=True) as mock_dispatch:
-            self._post(self._change_url(obj), data)
+        response = self._post(self._change_url(obj), data)
         obj.refresh_from_db()
         self.assertEqual(obj.host, "192.168.1.250")
         self.assertEqual(obj.port, 8010)
         self.assertEqual(obj.bitrate_kbps, 256)
         self.assertFalse(obj.enabled)
-        mock_dispatch.assert_not_called()
+        self.assertNotIn(RECONCILE_MESSAGE_SNIPPET, response.content)
 
-    def test_changing_only_description_requests_no_restart(self):
+    def test_changing_only_description_no_notification(self):
         # description was removed from RUNTIME_AFFECTING_FIELDS --
         # encoder_manager.py doesn't read it, so it can't affect the
-        # running script (see admin.py's RUNTIME_AFFECTING_FIELDS comment).
+        # rendered script (see admin.py's RUNTIME_AFFECTING_FIELDS comment).
         obj = make_encoder(enabled=True, description="old description")
-        data = encoder_post_data_from(obj, description="new description")
-        with patch.object(encoders_admin, "dispatch_encoder_restart", return_value=True) as mock_dispatch:
-            self._post(self._change_url(obj), data)
+        response = self._post(self._change_url(obj), encoder_post_data_from(obj, description="new description"))
         obj.refresh_from_db()
         self.assertEqual(obj.description, "new description")
-        mock_dispatch.assert_not_called()
+        self.assertNotIn(RECONCILE_MESSAGE_SNIPPET, response.content)
 
-    def test_enabling_disabled_encoder_requests_one_restart(self):
+    def test_enabling_disabled_encoder_notifies(self):
         obj = make_encoder(enabled=False)
-        data = encoder_post_data_from(obj, enabled=True)
-        with patch.object(encoders_admin, "dispatch_encoder_restart", return_value=True) as mock_dispatch:
-            self._post(self._change_url(obj), data)
+        response = self._post(self._change_url(obj), encoder_post_data_from(obj, enabled=True))
         obj.refresh_from_db()
         self.assertTrue(obj.enabled)
-        mock_dispatch.assert_called_once()
+        self.assertEqual(response.content.count(RECONCILE_MESSAGE_SNIPPET), 1)
 
-    def test_bulk_delete_only_disabled_encoders_requests_no_restart(self):
+    def test_bulk_delete_only_disabled_encoders_no_notification(self):
         a = make_encoder(name="a", enabled=False)
         b = make_encoder(name="b", enabled=False)
         data = {"action": "delete_selected", "_selected_action": [a.pk, b.pk], "post": "yes"}
-        with patch.object(encoders_admin, "dispatch_encoder_restart", return_value=True) as mock_dispatch:
-            self._post(self._changelist_url(), data)
+        response = self._post(self._changelist_url(), data)
         self.assertEqual(Encoder.objects.count(), 0)
-        mock_dispatch.assert_not_called()
+        self.assertNotIn(RECONCILE_MESSAGE_SNIPPET, response.content)
 
-    def test_bulk_delete_mixture_with_one_enabled_requests_one_restart(self):
+    def test_bulk_delete_mixture_with_one_enabled_notifies_once(self):
         a = make_encoder(name="a", enabled=False)
         b = make_encoder(name="b", enabled=True)
         c = make_encoder(name="c", enabled=False)
         data = {"action": "delete_selected", "_selected_action": [a.pk, b.pk, c.pk], "post": "yes"}
-        with patch.object(encoders_admin, "dispatch_encoder_restart", return_value=True) as mock_dispatch:
-            self._post(self._changelist_url(), data)
+        response = self._post(self._changelist_url(), data)
         self.assertEqual(Encoder.objects.count(), 0)
-        mock_dispatch.assert_called_once()
-
-    def test_changelist_edit_of_disabled_rows_only_requests_no_restart(self):
-        a = make_encoder(name="a", enabled=False, sort_order=0)
-        b = make_encoder(name="b", enabled=False, sort_order=1)
-        # sort_order changes; each row's "enabled" is resubmitted
-        # unchanged (still False) -- no runtime-affecting delta at all.
-        data = changelist_formset_data([a, b], {a.pk: {"sort_order": 5}, b.pk: {"sort_order": 6}})
-        with patch.object(encoders_admin, "dispatch_encoder_restart", return_value=True) as mock_dispatch:
-            self._post(self._changelist_url(), data)
-        a.refresh_from_db()
-        b.refresh_from_db()
-        self.assertEqual(a.sort_order, 5)
-        self.assertEqual(b.sort_order, 6)
-        self.assertFalse(a.enabled)
-        self.assertFalse(b.enabled)
-        mock_dispatch.assert_not_called()
-
-    def test_mixed_changelist_disabled_and_active_row_change_requests_one_restart(self):
-        a = make_encoder(name="a", enabled=False, sort_order=0)
-        b = make_encoder(name="b", enabled=True, sort_order=1)
-        # a: stays disabled, only sort_order changes -- no restart on its own.
-        # b: enabled -> disabled -- a genuine runtime change on a
-        # previously-enabled row, so exactly one restart overall.
-        data = changelist_formset_data([a, b], {a.pk: {"sort_order": 9}, b.pk: {"enabled": False}})
-        with patch.object(encoders_admin, "dispatch_encoder_restart", return_value=True) as mock_dispatch:
-            self._post(self._changelist_url(), data)
-        a.refresh_from_db()
-        b.refresh_from_db()
-        self.assertEqual(a.sort_order, 9)
-        self.assertFalse(b.enabled)
-        mock_dispatch.assert_called_once()
+        self.assertEqual(response.content.count(RECONCILE_MESSAGE_SNIPPET), 1)
 
 
 # ---------------------------------------------------------------------
-# 14-15, 17: dispatch helper behavior (pure function, no admin/HTTP)
-# ---------------------------------------------------------------------
-class DispatchEncoderRestartTests(TestCase):
-    # 14. Invokes exactly the restart command, no shell=True.
-    def test_invokes_exact_restart_command_without_shell(self):
-        with patch.object(encoders_admin.subprocess, "Popen") as mock_popen:
-            result = dispatch_encoder_restart()
-        mock_popen.assert_called_once_with(["sudo", "systemctl", "restart", "isadoraair-encoders"])
-        self.assertNotIn("shell", mock_popen.call_args.kwargs)
-        self.assertTrue(result)
-
-    # 15. An immediate Popen() failure is caught, not propagated.
-    def test_popen_oserror_is_caught_not_raised(self):
-        with patch.object(encoders_admin.subprocess, "Popen", side_effect=OSError("no such file")):
-            result = dispatch_encoder_restart()  # must not raise
-        self.assertFalse(result)
-
-    # 17. No password or other encoder credentials appear in the
-    # error/event detail.
-    def test_dispatch_failure_event_detail_has_no_credentials(self):
-        with patch.object(encoders_admin.subprocess, "Popen", side_effect=OSError("boom")):
-            with patch.object(encoders_admin, "emit_event") as mock_emit:
-                dispatch_encoder_restart()
-        mock_emit.assert_called_once()
-        detail = mock_emit.call_args.kwargs["detail"]
-        self.assertEqual(detail, {"error": "boom"})
-
-
-# ---------------------------------------------------------------------
-# 16: immediate dispatch failure -> admin-visible error.
-#
-# Deliberately a TransactionTestCase, not TestCase+captureOnCommitCallbacks:
-# captureOnCommitCallbacks only runs queued on_commit callbacks at its
-# `with` block's __exit__, which is AFTER self.client.post() has already
-# built and returned its response -- messages.error() added that late
-# can't land in that response's rendered HTML even though, in real
-# production request handling, the admin's transaction.atomic() commits
-# (firing on_commit synchronously) before response_change() builds the
-# response at all. TransactionTestCase performs a real commit during
-# request handling, matching production ordering, so this is the correct
-# tool for this specific assertion.
-# ---------------------------------------------------------------------
-@override_settings(SECURE_SSL_REDIRECT=False)
-class EncoderAdminDispatchFailureMessageTests(TransactionTestCase):
-    def setUp(self):
-        self.staff = User.objects.create_superuser("admin", "admin@example.invalid", "password")
-        self.client.force_login(self.staff)
-        patcher = patch.object(encoders_admin, "_run_predispatch_preflight", return_value=(True, []))
-        patcher.start()
-        self.addCleanup(patcher.stop)
-
-    def test_dispatch_failure_shows_admin_visible_error_and_keeps_db_change(self):
-        obj = make_encoder()
-        data = encoder_post_data_from(obj, host="192.168.1.201")
-        with patch.object(encoders_admin, "dispatch_encoder_restart", return_value=False):
-            response = self.client.post(
-                reverse("admin:encoders_encoder_change", args=[obj.pk]), data, follow=True,
-            )
-        self.assertContains(response, "unable to launch")
-        obj.refresh_from_db()
-        self.assertEqual(obj.host, "192.168.1.201")
-
-
-# ---------------------------------------------------------------------
-# Phase 2M: desired (database) vs accepted (last-known-good) surfacing.
-# encoders/admin.py._describe_group_status reads two on-disk artifacts
-# the encoder manager (a separate systemd-managed process) writes --
-# the group-state JSON and the LKG metadata sidecar -- rather than any
+# Phase 2M, extended for Phase 3O: desired (database) vs running vs
+# accepted (last-known-good) surfacing. encoders/admin.py.
+# _describe_group_status reads two on-disk artifacts the encoder
+# manager (a separate systemd-managed process) writes -- the
+# group-state JSON and the LKG metadata sidecar -- rather than any
 # in-process link, since gunicorn (this admin) and isadoraair-encoders
 # never share memory. Patches STATE_DIR/CANDIDATE_DIR/LKG_DIR to temp
 # dirs so nothing here touches real /run or /var/lib paths.
@@ -523,6 +369,33 @@ class DescribeGroupStatusTests(GroupStatusFixtureMixin, TestCase):
         status = encoders_admin._describe_group_status(em._slug("airtap"), "airtap", [obj])
         self.assertEqual(status["level"], "warning")
         self.assertIn("does not match", status["message"])
+        self.assertIn("automatically", status["message"])
+
+    def test_mismatched_fingerprint_with_sticky_rejection_reports_error(self):
+        """Phase 3O: a mismatch caused by a sticky rejection (won't be
+        auto-retried) is a materially different situation from "still
+        being reconciled" -- the message must say so distinctly."""
+        obj = make_encoder(input_device="airtap")
+        lkg_module.write_lkg(em._slug("airtap"), 'generation = "g"\n', {"fingerprint": "different-fp"})
+        self.write_group_state(
+            "airtap", last_reconcile_result="static_validation_rejected",
+            last_reconcile_error="Host is required.",
+        )
+        status = encoders_admin._describe_group_status(em._slug("airtap"), "airtap", [obj])
+        self.assertEqual(status["level"], "error")
+        self.assertIn("rejected", status["message"])
+        self.assertIn("Host is required.", status["message"])
+
+    def test_mismatched_fingerprint_with_cross_group_collision_reports_warning(self):
+        obj = make_encoder(input_device="airtap")
+        lkg_module.write_lkg(em._slug("airtap"), 'generation = "g"\n', {"fingerprint": "different-fp"})
+        self.write_group_state(
+            "airtap", last_reconcile_result="blocked_cross_group_collision",
+            last_reconcile_error="('icecast', '1.2.3.4', 8000, '/x') already in use by group 'other' ('e')",
+        )
+        status = encoders_admin._describe_group_status(em._slug("airtap"), "airtap", [obj])
+        self.assertEqual(status["level"], "warning")
+        self.assertIn("already in use by another encoder group", status["message"])
 
     def test_candidate_launch_kind_reports_probation_warning(self):
         obj = make_encoder(input_device="airtap")
@@ -614,161 +487,6 @@ class ChangelistGroupStatusMessageTests(GroupStatusFixtureMixin, TestCase):
 
 
 # ---------------------------------------------------------------------
-# Phase 2 review fix #1: the admin used to dispatch `systemctl restart
-# isadoraair-encoders` unconditionally on any runtime-affecting save --
-# meaning a bad admin edit would kill the currently-healthy process
-# BEFORE the manager's own Phase 2 validation/preflight ever got a
-# chance to reject it (the LKG would still recover the stream, but
-# only after an unnecessary interruption). _run_predispatch_preflight
-# runs the same validate -> render -> preflight sequence the manager
-# uses, BEFORE dispatch, so the admin can refuse to restart at all
-# when it already knows the change would fail.
-# ---------------------------------------------------------------------
-class PredispatchPreflightUnitTests(GroupStatusFixtureMixin, TestCase):
-    def test_no_enabled_encoders_passes_trivially(self):
-        ok, failures = encoders_admin._run_predispatch_preflight()
-        self.assertTrue(ok)
-        self.assertEqual(failures, [])
-
-    def test_candidate_write_failure_is_reported_not_raised(self):
-        """Phase 2 review-fix pass 2, Issue 3: a filesystem failure
-        while writing the candidate script (ENOSPC, EACCES, ...) must
-        become an ordinary rejection -- restart not dispatched, current
-        stream untouched, admin error displayed -- never an exception
-        escaping this function (it runs inside transaction.on_commit(),
-        with nothing above it to catch a stray exception before it
-        reaches the response cycle)."""
-        make_encoder(input_device="airtap", enabled=True)
-        with patch.object(lkg_module, "write_candidate", side_effect=OSError(28, "No space left on device")):
-            ok, failures = encoders_admin._run_predispatch_preflight()  # must not raise
-        self.assertFalse(ok)
-        self.assertEqual(len(failures), 1)
-        self.assertIn("failed to write candidate script", failures[0][1])
-
-    def test_valid_group_passes_with_mocked_preflight(self):
-        make_encoder(input_device="airtap", enabled=True)
-        with patch.object(preflight_module, "run_preflight", return_value=preflight_module.PreflightResult(ok=True)):
-            ok, failures = encoders_admin._run_predispatch_preflight()
-        self.assertTrue(ok)
-        self.assertEqual(failures, [])
-
-    def test_validation_failure_reported_without_calling_preflight(self):
-        """protocol=shoutcast1 + format=vorbis passes Django's own
-        per-row model field choices (both are individually legal
-        FORMAT_CHOICES/PROTOCOL_CHOICES values) but fails Phase 2A's
-        protocol/format compatibility matrix -- validate_full_
-        configuration must catch it before preflight (liquidsoap) is
-        ever invoked."""
-        make_encoder(input_device="airtap", enabled=True, protocol="shoutcast1", format="vorbis")
-        mock_preflight = MagicMock()
-        with patch.object(preflight_module, "run_preflight", mock_preflight):
-            ok, failures = encoders_admin._run_predispatch_preflight()
-        self.assertFalse(ok)
-        self.assertEqual(len(failures), 1)
-        self.assertEqual(failures[0][0], "airtap")
-        mock_preflight.assert_not_called()
-
-    def test_preflight_failure_reported(self):
-        make_encoder(input_device="airtap", enabled=True)
-        with patch.object(preflight_module, "run_preflight", return_value=preflight_module.PreflightResult(ok=False, reason="liquidsoap --check failed")):
-            ok, failures = encoders_admin._run_predispatch_preflight()
-        self.assertFalse(ok)
-        self.assertIn("liquidsoap --check failed", failures[0][1])
-
-    def test_predispatch_leaves_no_stray_candidate_files(self):
-        make_encoder(input_device="airtap", enabled=True)
-        with patch.object(preflight_module, "run_preflight", return_value=preflight_module.PreflightResult(ok=True)):
-            encoders_admin._run_predispatch_preflight()
-        leftovers = list(lkg_module.CANDIDATE_DIR.glob("*.liq")) if lkg_module.CANDIDATE_DIR.exists() else []
-        self.assertEqual(leftovers, [])
-
-    def test_one_bad_group_is_reported_even_though_another_group_is_fine(self):
-        """Whole-service gate, not per-group: a bad group still shows
-        up in `failures` on its own -- _restart_encoders_and_report is
-        what turns "any failures at all" into "no restart dispatched,"
-        covered separately below."""
-        make_encoder(name="good", input_device="airtap", enabled=True)
-        make_encoder(name="bad", input_device="other-device", enabled=True, protocol="shoutcast1", format="vorbis")
-        with patch.object(preflight_module, "run_preflight", return_value=preflight_module.PreflightResult(ok=True)):
-            ok, failures = encoders_admin._run_predispatch_preflight()
-        self.assertFalse(ok)
-        failed_devices = [f[0] for f in failures]
-        self.assertIn("other-device", failed_devices)
-        self.assertNotIn("airtap", failed_devices)
-
-
-@override_settings(SECURE_SSL_REDIRECT=False)
-class PredispatchPreflightHttpTests(GroupStatusFixtureMixin, TransactionTestCase):
-    # TransactionTestCase, matching EncoderAdminDispatchFailureMessageTests
-    # above: messages.error() added inside the on_commit callback needs a
-    # REAL commit during request handling to land in this response.
-    def setUp(self):
-        super().setUp()
-        self.staff = User.objects.create_superuser("admin-predispatch", "admin-pd@example.invalid", "password")
-        self.client.force_login(self.staff)
-
-    def test_group_level_duplicate_destination_blocks_restart(self):
-        """A duplicate destination across two DIFFERENT rows is a
-        group-level failure Django's own per-row form validation
-        cannot catch (each row is individually fine) -- exactly the
-        kind of check this admin-level gate exists to add."""
-        make_encoder(name="existing")  # DEFAULT_FIELDS: shoutcast2, host/port/mount all default
-        data = encoder_post_data(name="duplicate")  # same host/port/mount -> same destination
-        with patch.object(preflight_module, "run_preflight", return_value=preflight_module.PreflightResult(ok=True)):
-            with patch.object(encoders_admin, "dispatch_encoder_restart", return_value=True) as mock_dispatch:
-                response = self.client.post(reverse("admin:encoders_encoder_add"), data, follow=True)
-        mock_dispatch.assert_not_called()
-        self.assertContains(response, "failed pre-restart checks")
-        # The DB write itself still happened -- desired config stays
-        # visible for diagnosis, never silently discarded.
-        self.assertTrue(Encoder.objects.filter(name="duplicate").exists())
-
-    def test_valid_change_still_dispatches_restart(self):
-        with patch.object(preflight_module, "run_preflight", return_value=preflight_module.PreflightResult(ok=True)):
-            with patch.object(encoders_admin, "dispatch_encoder_restart", return_value=True) as mock_dispatch:
-                self.client.post(reverse("admin:encoders_encoder_add"), encoder_post_data(name="fine"), follow=True)
-        mock_dispatch.assert_called_once()
-
-    def test_candidate_write_failure_shows_error_no_restart_no_exception(self):
-        """Phase 2 review-fix pass 2, Issue 3, at the full HTTP level:
-        a filesystem failure writing the candidate script must not
-        dispatch a restart, must not raise (500), and must show the
-        operator a clear error -- exactly like an ordinary validation/
-        preflight rejection."""
-        with patch.object(lkg_module, "write_candidate", side_effect=OSError(28, "No space left on device")):
-            with patch.object(encoders_admin, "dispatch_encoder_restart", return_value=True) as mock_dispatch:
-                response = self.client.post(reverse("admin:encoders_encoder_add"), encoder_post_data(name="fine"), follow=True)
-        mock_dispatch.assert_not_called()
-        self.assertContains(response, "failed pre-restart checks")
-
-    def test_rejected_predispatch_does_not_touch_currently_running_process(self):
-        """The whole point of this fix: no restart command is ever
-        launched for a rejected desired config -- dispatch_encoder_
-        restart (the only thing that would touch the live process) is
-        never called at all.
-
-        Popen is only intercepted for the RESTART command specifically
-        -- the add-view's own get_form() also shells out (`arecord -l`,
-        via hardware.devices.list_input_devices) to populate the
-        input_device dropdown, and that real call must be left alone."""
-        make_encoder(name="existing")
-        data = encoder_post_data(name="duplicate")
-        restart_calls = []
-        real_popen = encoders_admin.subprocess.Popen
-
-        def selective_popen(cmd, *args, **kwargs):
-            if cmd == encoders_admin.RESTART_COMMAND:
-                restart_calls.append(cmd)
-                return MagicMock()
-            return real_popen(cmd, *args, **kwargs)
-
-        with patch.object(preflight_module, "run_preflight", return_value=preflight_module.PreflightResult(ok=True)):
-            with patch.object(encoders_admin.subprocess, "Popen", side_effect=selective_popen):
-                self.client.post(reverse("admin:encoders_encoder_add"), data, follow=True)
-        self.assertEqual(restart_calls, [])
-
-
-# ---------------------------------------------------------------------
 # JS confirmation: static-content regression guard. No browser-testing
 # framework exists in this project (Python/Django tests only) -- per
 # the task's own allowance, this checks the file's content directly
@@ -787,6 +505,11 @@ class EncoderConfirmJsTests(TestCase):
 
     def test_js_no_longer_unconditionally_claims_every_save_restarts(self):
         self.assertNotIn("Saving this will restart the IsadoraAir encoders service, ", self.js_source)
+        self.assertNotIn("briefly dropping all active streams", self.js_source)
+
+    def test_js_describes_per_group_reconciliation_not_whole_service_restart(self):
+        self.assertIn("encoder manager", self.js_source)
+        self.assertIn("not affected", self.js_source)
 
     def test_encoder_admin_still_includes_confirm_js(self):
         self.assertIn("encoders/js/encoder_confirm.js", EncoderAdmin.Media.js)

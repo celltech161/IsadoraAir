@@ -172,8 +172,9 @@ def compute_fingerprint(input_device, encoders):
 
     Uses RUNTIME_AFFECTING_FIELDS (encoders/models.py) as the exact
     field set -- the SAME fields that already determine "does this
-    change need a restart" (encoders/admin.py) also determine "is this
-    a different configuration," which is the correct relationship:
+    change need the encoder manager to reconcile this row's group"
+    (encoders/admin.py) also determine "is this a different
+    configuration," which is the correct relationship:
     nothing outside that set can affect the rendered script at all.
     `enabled` is excluded (fingerprints are only ever computed over an
     already-filtered enabled set, so it would always be a constant
@@ -507,15 +508,27 @@ def destinations_from_lkg_meta(lkg_meta):
     rejected configuration a rollback exists to recover from.
 
     Returns a list of SimpleNamespace(id, name, host, port,
-    shoutcast_sid) -- exactly the attributes evaluate_encoder_group_
-    health's Shoutcast-destination check reads off each "encoder" (see
-    monitoring/services/probes.py). Returns [] if lkg_meta is falsy or
-    predates this field (an LKG promoted before it existed) --
-    evaluate_encoder_group_health treats an empty encoders list as
-    status "unknown" (see its own docstring), never a false "ok," so a
-    group whose destinations can't be reconstructed simply never
-    qualifies/reports healthy rather than being silently checked
-    against the wrong SIDs."""
+    shoutcast_sid, protocol, mount) -- exactly the attributes
+    evaluate_encoder_group_health's Shoutcast-destination check (host/
+    port/shoutcast_sid) AND encoders.services.validation.
+    normalized_destination_key (protocol/host/port/mount) each read off
+    an "encoder"-like object (see monitoring/services/probes.py and
+    encoder_manager.py's _cross_group_destination_conflicts). Returns
+    [] if lkg_meta is falsy or predates the "destinations" field
+    entirely (an LKG promoted before it existed) -- evaluate_encoder_
+    group_health treats an empty encoders list as status "unknown"
+    (see its own docstring), never a false "ok," so a group whose
+    destinations can't be reconstructed simply never qualifies/reports
+    healthy rather than being silently checked against the wrong SIDs.
+
+    `protocol`/`mount` (Phase 3M) are themselves individually optional
+    per entry -- an LKG promoted before those two fields were added to
+    _promote_candidate's metadata (encoder_manager.py) has entries
+    without them; the resulting stand-in's .protocol/.mount are simply
+    None, which normalized_destination_key already treats as "can't
+    normalize this row, no collision key" rather than a false match --
+    a safe degrade, not a crash, resolved automatically at that
+    group's next promotion."""
     if not lkg_meta:
         return []
     destinations = lkg_meta.get("destinations") or []
@@ -523,6 +536,7 @@ def destinations_from_lkg_meta(lkg_meta):
         SimpleNamespace(
             id=d.get("encoder_id"), name=d.get("name"),
             host=d.get("host"), port=d.get("port"), shoutcast_sid=d.get("shoutcast_sid"),
+            protocol=d.get("protocol"), mount=d.get("mount"),
         )
         for d in destinations
     ]

@@ -566,6 +566,36 @@ class DestinationsFromLkgMetaTests(SimpleTestCase):
         self.assertEqual(result[0].port, 8000)
         self.assertEqual(result[0].shoutcast_sid, "1")
 
+    def test_reconstructs_protocol_and_mount_phase3(self):
+        """Phase 3M: protocol/mount are the two additional fields
+        encoders.services.validation.normalized_destination_key needs
+        beyond host/port/SID -- without them a cross-group collision
+        check can't tell two different Icecast mounts on the same
+        host:port apart."""
+        meta = {"destinations": [{
+            "encoder_id": 5, "name": "n", "host": "h", "port": 8000,
+            "shoutcast_sid": None, "protocol": "icecast", "mount": "/stream1",
+        }]}
+        result = lkg.destinations_from_lkg_meta(meta)
+        self.assertEqual(result[0].protocol, "icecast")
+        self.assertEqual(result[0].mount, "/stream1")
+
+    def test_legacy_metadata_without_protocol_or_mount_degrades_to_none(self):
+        """An LKG promoted before this field existed -- must not raise,
+        just leave .protocol/.mount as None (normalized_destination_key
+        already treats that as "can't normalize this row," never a
+        false match)."""
+        meta = {"destinations": [{"encoder_id": 5, "name": "n", "host": "h", "port": 8000, "shoutcast_sid": "1"}]}
+        result = lkg.destinations_from_lkg_meta(meta)
+        self.assertIsNone(result[0].protocol)
+        self.assertIsNone(result[0].mount)
+
+    def test_legacy_stand_in_is_not_normalizable_not_a_false_collision_match(self):
+        from encoders.services.validation import normalized_destination_key
+        meta = {"destinations": [{"encoder_id": 5, "name": "n", "host": "h", "port": 8000, "shoutcast_sid": "1"}]}
+        stand_in = lkg.destinations_from_lkg_meta(meta)[0]
+        self.assertIsNone(normalized_destination_key(stand_in))
+
 
 class ResolveExpectedDestinationsTests(LkgDirFixtureMixin, SimpleTestCase):
     def _lkg_meta_with_destinations(self, sid="1", host="10.0.0.5", port=8000):

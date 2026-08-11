@@ -138,17 +138,56 @@ class LaunchGroupDecisionTests(CandidateFixtureMixin, TransactionTestCase):
         self.assertTrue(ok)
         self.assertEqual(manager._launch_kind["airtap"], "candidate")  # not silently skipped
 
-    def test_critical_stopped_launches_lkg_only(self):
+    def test_critical_stopped_and_rejected_fingerprint_launches_lkg_only(self):
+        """critical_stopped + a fingerprint that's ALSO already been
+        rejected: still LKG-only, no candidate pipeline -- the
+        rejected-fingerprint check alone already covers this case
+        (see the two tests below for why critical_stopped is no
+        longer, by itself, a separate blocking condition)."""
         manager = em.EncoderManager()
         encoders = [make_encoder()]
+        fp = lkg_module.compute_fingerprint("airtap", encoders)
         lkg_module.write_lkg(em._slug("airtap"), FAKE_LKG_SCRIPT, {"fingerprint": "whatever"})
         manager._critical_stopped["airtap"] = True
+        manager._rejected_fingerprints["airtap"] = {fp}
         mock_preflight = MagicMock()
         with patch.object(preflight_module, "run_preflight", mock_preflight):
             ok = manager._launch_group("airtap", encoders)
         self.assertTrue(ok)
         self.assertEqual(manager._launch_kind["airtap"], "accepted")
         mock_preflight.assert_not_called()
+
+    def test_critical_stopped_with_never_tried_fingerprint_gets_a_fresh_attempt(self):
+        """Phase 3 fix: critical_stopped ALONE must NOT permanently
+        block a genuinely new (never-rejected) desired fingerprint --
+        under Phase 2 this was unreachable in practice (the only way
+        to clear critical_stopped was a full process restart, which
+        always cleared it fresh in the same breath); Phase 3
+        reconciliation can keep a process alive for a long time across
+        many DB edits while critical_stopped, so the admin's own
+        promised recovery path ("fix the underlying problem, then save
+        a corrected configuration to try again") must actually be
+        true, not silently ignored until an operator restarts the
+        whole service."""
+        manager = em.EncoderManager()
+        encoders = [make_encoder()]
+        lkg_module.write_lkg(em._slug("airtap"), FAKE_LKG_SCRIPT, {"fingerprint": "whatever"})
+        manager._critical_stopped["airtap"] = True
+        with patch.object(preflight_module, "run_preflight", return_value=preflight_module.PreflightResult(ok=True)):
+            ok = manager._launch_group("airtap", encoders)
+        self.assertTrue(ok)
+        self.assertEqual(manager._launch_kind["airtap"], "candidate")
+
+    def test_critical_stopped_clears_on_successful_promotion_of_new_fingerprint(self):
+        manager = em.EncoderManager()
+        encoders = [make_encoder()]
+        lkg_module.write_lkg(em._slug("airtap"), FAKE_LKG_SCRIPT, {"fingerprint": "whatever"})
+        manager._critical_stopped["airtap"] = True
+        with patch.object(preflight_module, "run_preflight", return_value=preflight_module.PreflightResult(ok=True)):
+            manager._launch_group("airtap", encoders)
+            self.qualify_ok(manager, "airtap")
+        self.assertEqual(manager._launch_kind["airtap"], "accepted")
+        self.assertNotIn("airtap", manager._critical_stopped)
 
     def test_critical_stopped_no_lkg_returns_false(self):
         manager = em.EncoderManager()
@@ -652,6 +691,10 @@ class RollbackQualificationExpectedEncodersTests(CandidateFixtureMixin, Transact
         self.assertEqual(dest["port"], 8000)
         self.assertEqual(dest["shoutcast_sid"], "1")
         self.assertEqual(dest["name"], "lkg-enc")
+        # Phase 3M: protocol/mount are needed by normalized_destination_key
+        # for cross-group collision checks -- must round-trip too.
+        self.assertEqual(dest["protocol"], "shoutcast2")
+        self.assertEqual(dest["mount"], "/1")
 
     def test_legacy_lkg_metadata_without_destinations_fails_closed_not_wrong(self):
         """An LKG promoted before this fix existed (or with corrupt
@@ -878,13 +921,23 @@ class FilesystemFailureContainmentTests(CandidateFixtureMixin, TransactionTestCa
         exception raised while processing ONE group's qualification
         check must not prevent a DIFFERENT, healthy group's state
         heartbeat from still being written in the SAME _check_health()
-        tick."""
+        tick.
+
+        Persisted (not just in-memory) Encoder rows -- Phase 3's own
+        _reconcile() now runs first in _check_health() and queries the
+        DB for real; an unsaved row would make it correctly (per
+        Phase 3C) treat these as "removed" and stop them before the
+        qualification-check loop this test cares about ever runs."""
         manager = em.EncoderManager()
-        manager._start_group("airtap", [make_encoder(name="a")])
-        manager._start_group("plughw:3,1", [make_encoder(name="b", input_device="plughw:3,1")])
+        encoder_a = make_encoder(name="a")
+        encoder_a.save()
+        encoder_b = make_encoder(name="b", input_device="plughw:3,1")
+        encoder_b.save()
+        manager._start_group("airtap", [encoder_a])
+        manager._start_group("plughw:3,1", [encoder_b])
         manager._launch_kind["airtap"] = "candidate"  # so _check_candidate_qualification does real work for it
         manager._qualify_generation["airtap"] = manager._current["airtap"]["generation"]
-        manager._qualify_expected["airtap"] = [make_encoder(name="a")]
+        manager._qualify_expected["airtap"] = [encoder_a]
         manager._qualify_deadline["airtap"] = None
 
         with patch("monitoring.services.probes.evaluate_encoder_group_health", side_effect=RuntimeError("boom")):
@@ -896,10 +949,12 @@ class FilesystemFailureContainmentTests(CandidateFixtureMixin, TransactionTestCa
 
     def test_check_health_guarded_exception_emits_event_not_silence(self):
         manager = em.EncoderManager()
-        manager._start_group("airtap", [make_encoder(name="a")])
+        encoder_a = make_encoder(name="a")
+        encoder_a.save()  # see comment above -- Phase 3's _reconcile() reads the real DB
+        manager._start_group("airtap", [encoder_a])
         manager._launch_kind["airtap"] = "candidate"
         manager._qualify_generation["airtap"] = manager._current["airtap"]["generation"]
-        manager._qualify_expected["airtap"] = [make_encoder(name="a")]
+        manager._qualify_expected["airtap"] = [encoder_a]
         manager._qualify_deadline["airtap"] = None
 
         with patch("monitoring.services.probes.evaluate_encoder_group_health", side_effect=RuntimeError("boom")):

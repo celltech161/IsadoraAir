@@ -46,6 +46,24 @@ class ProbeEncoderGroupFixtureMixin:
         patcher = patch.object(em, "STATE_DIR", Path(self._tmpdir.name))
         patcher.start()
         self.addCleanup(patcher.stop)
+        # Phase 3 test-isolation fix: this file never patched lkg_module.
+        # LKG_DIR, only encoder_manager.STATE_DIR -- harmless as long as
+        # no REAL last-known-good has ever been promoted on whatever box
+        # runs these tests (lkg.read_lkg("airtap") then correctly finds
+        # nothing and every test's own group-state/audio-state fixture is
+        # the only signal). Once this project's own first real production
+        # LKG was promoted (2026-08-10, Phase 2 deployment), probe_
+        # encoder_group's own resolve_expected_destinations call started
+        # silently preferring that REAL on-disk LKG's destinations over
+        # each test's own fabricated single encoder for every launch_kind
+        # other than "candidate" (see lkg.resolve_expected_destinations) --
+        # a genuine, pre-existing test-isolation gap, invisible until
+        # production state on the actual dev box changed, unrelated to
+        # any Phase 3 code change. Patched here the same way STATE_DIR
+        # already is.
+        lkg_patcher = patch.object(lkg_module, "LKG_DIR", Path(self._tmpdir.name) / "lkg")
+        lkg_patcher.start()
+        self.addCleanup(lkg_patcher.stop)
         self.check = make_check()
         self.now = time.time()
 

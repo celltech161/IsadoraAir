@@ -1000,6 +1000,57 @@ class EncoderManager:
         # already-proven snapshot is trustworthy here.
         self._qualify_expected = {}
 
+        # --- Phase 3 hardening: per-input-device reconciliation ---------
+        # input_device -> fingerprint (encoders.services.lkg.
+        # compute_fingerprint) of whatever configuration this group's
+        # CURRENT live child actually represents -- set explicitly at
+        # every successful launch call site (never re-derived by
+        # guessing from launch_kind, and never computed by hashing
+        # _running_encoders directly: an "accepted"-via-LKG-fallback or
+        # "rollback" launch's encoders are lightweight LKG-metadata
+        # stand-ins that don't carry every RUNTIME_AFFECTING_FIELDS
+        # attribute compute_fingerprint needs -- the LKG's OWN recorded
+        # fingerprint is what's actually running in that case, and each
+        # call site already knows it). Cleared to None (via .pop)
+        # everywhere self._current is also cleared -- "no live child"
+        # must mean "no running fingerprint" too, never a stale value.
+        # This is THE reconciliation signal: _reconcile() compares this
+        # against a freshly-computed desired fingerprint every tick, so
+        # "has this group's desired configuration actually changed
+        # relative to what's REALLY running right now" never has to
+        # guess from launch_kind alone (see this module's Phase 3
+        # docstring addendum below for why launch_kind alone isn't
+        # enough once rapid DB edits during a candidate's probation are
+        # a normal, expected occurrence rather than a rare manual-shell
+        # edge case).
+        self._running_fingerprint = {}
+        # input_device -> the exact encoder-like objects (real Encoder
+        # rows, or destinations_from_lkg_meta stand-ins) that were
+        # passed to the launch that produced the CURRENT live child --
+        # set generically inside _start_group itself (the one place
+        # that already receives exactly this list for every launch
+        # kind), cleared alongside _running_fingerprint. Used ONLY for
+        # Phase 3M cross-group destination-collision checks (via
+        # encoders.services.validation.normalized_destination_key) --
+        # never for qualification (see _qualify_expected above, a
+        # separate, narrower-scoped dict for that).
+        self._running_encoders = {}
+        # input_device -> the persisted LKG's own fingerprint, cached
+        # in-memory to avoid a disk read on every 5s heartbeat tick.
+        # Refreshed at every _launch_group call (which already reads
+        # the LKG fresh for its own fast-path comparison, at zero extra
+        # I/O cost) and at every successful _promote_candidate -- this
+        # process is the ONLY writer of the LKG, so the cache can never
+        # actually go stale relative to what's on disk.
+        self._accepted_fingerprint = {}
+        # input_device -> the fingerprint of the current enabled DB
+        # configuration, refreshed every reconciliation tick (see
+        # _reconcile) for every desired group, including unchanged
+        # ones -- purely a read-through cache so _write_group_state's
+        # heartbeat always has a fresh value without recomputing it
+        # itself.
+        self._desired_fingerprint = {}
+
     def start(self):
         self.running = True
         close_old_connections()
@@ -1039,6 +1090,8 @@ class EncoderManager:
         for input_device, script_path in list(self._scripts.items()):
             script_path.unlink(missing_ok=True)
             self._mark_audio_state_dead(input_device)
+            self._running_fingerprint.pop(input_device, None)
+            self._running_encoders.pop(input_device, None)
             try:
                 _group_state_path(input_device).unlink(missing_ok=True)
             except OSError:
@@ -1057,6 +1110,10 @@ class EncoderManager:
         return self._meta.setdefault(input_device, {
             "consecutive_failures": 0, "last_failure_message": "",
             "last_successful_start": None, "last_exit_at": None, "last_exit_code": None,
+            # Phase 3: eventual-apply-outcome fields for the group-state
+            # JSON's own last_reconcile_* trio -- see
+            # _record_reconcile_outcome.
+            "last_reconcile_result": "", "last_reconcile_error": "", "last_reconcile_at": None,
         })
 
     def _log(self, input_device, message, force=False):
@@ -1129,12 +1186,52 @@ class EncoderManager:
             "next_retry_at": next_retry_at,
             "launch_kind": self._launch_kind.get(input_device, "accepted"),
             "critical_stopped": bool(self._critical_stopped.get(input_device)),
+            # Phase 3B: desired/running/accepted, non-secret (fingerprints
+            # are one-way hashes; see lkg.compute_fingerprint) -- the
+            # channel a SEPARATE process (admin, monitoring) reads to
+            # surface reconciliation status without guessing from
+            # launch_kind alone.
+            "desired_fingerprint": self._desired_fingerprint.get(input_device),
+            "running_fingerprint": self._running_fingerprint.get(input_device),
+            "accepted_fingerprint": self._accepted_fingerprint.get(input_device),
+            "reconcile_status": self._reconcile_status(input_device),
+            "last_reconcile_at": meta["last_reconcile_at"],
+            "last_reconcile_result": meta["last_reconcile_result"],
+            "last_reconcile_error": meta["last_reconcile_error"],
             "timestamp": time.time(),
         }
         try:
             _atomic_write_json(_group_state_path(input_device), state)
         except Exception as exc:
             print(f"  [{input_device}] Failed to write group state: {exc}")
+
+    def _reconcile_status(self, input_device):
+        """Phase 3O: a single, admin-readable summary of this group's
+        current desired-vs-running-vs-accepted state, derived purely
+        from already-tracked in-memory state (no extra I/O) -- one
+        vocabulary shared by every reader instead of each one
+        re-deriving its own interpretation of the raw fingerprint
+        fields. See encoders/admin.py's _describe_group_status for how
+        this is turned into an operator-facing message."""
+        if self._critical_stopped.get(input_device):
+            return "critical_stopped"
+        kind = self._launch_kind.get(input_device, "accepted")
+        if kind == "candidate":
+            return "candidate_probation"
+        if kind == "rollback":
+            return "rollback_probation"
+        desired = self._desired_fingerprint.get(input_device)
+        running = self._running_fingerprint.get(input_device)
+        if desired is None:
+            # Not currently a desired group at all (mid-removal, or a
+            # tick before this group's first-ever _reconcile() pass) --
+            # not itself an error state, just nothing to compare yet.
+            return "unknown"
+        if desired == running:
+            return "in_sync"
+        if desired in self._rejected_fingerprints.get(input_device, set()):
+            return "rejected"
+        return "reconcile_pending"
 
     def _schedule_retry(self, input_device):
         """Advance (never reset except by _check_health's stabilization
@@ -1279,6 +1376,18 @@ class EncoderManager:
         self._scripts[input_device] = script_path
         self._current[input_device] = {"generation": generation, "pid": proc.pid, "launched_at": launched_at}
         self._stabilized[input_device] = False
+        # Phase 3M: the exact encoder-like objects this launch
+        # represents -- real Encoder rows or destinations_from_lkg_meta
+        # stand-ins alike, whichever `encoders` the caller passed for
+        # THIS launch. Single choke point: every _start_group call site
+        # already receives exactly the right list for whatever it's
+        # launching, so recording it generically here (rather than at
+        # each of the several call sites) can't drift from what's
+        # actually running. Used only for cross-group destination-
+        # collision checks (_cross_group_destination_conflicts) --
+        # never for qualification (_qualify_expected is separate and
+        # narrower-scoped).
+        self._running_encoders[input_device] = encoders
         self._write_group_state(input_device)
         names = ", ".join(e.name for e in encoders)
         self._log(input_device, f"Started (Liquidsoap pid={proc.pid}, generation={generation}) -> {names}", force=True)
@@ -1299,6 +1408,8 @@ class EncoderManager:
         meta["last_exit_at"] = time.time()
         meta["last_exit_code"] = None
         self._current.pop(input_device, None)
+        self._running_fingerprint.pop(input_device, None)
+        self._running_encoders.pop(input_device, None)
         self._log(input_device, f"Failed to start: {context}: {exc} (failure #{meta['consecutive_failures']} in a row)", force=True)
         emit_event(
             category="encoder", level="error",
@@ -1351,6 +1462,8 @@ class EncoderManager:
         meta["last_exit_code"] = returncode
         meta["last_failure_message"] = f"Liquidsoap exited with code {returncode}"
         self._current.pop(input_device, None)  # no live child -- Phase 3 req #4: mark dead immediately
+        self._running_fingerprint.pop(input_device, None)
+        self._running_encoders.pop(input_device, None)
 
         self._mark_audio_state_dead(input_device)
 
@@ -1466,22 +1579,30 @@ class EncoderManager:
              automatically (Phase 2K: never silently retry a rejected
              candidate forever).
           3. Manager is in critical-stopped state for this group (both
-             a candidate AND its rollback already failed) -> LKG-only
+             a candidate AND its rollback already failed) AND the
+             desired fingerprint has ALREADY been rejected -> LKG-only
              relaunches via the ordinary retry/backoff loop (infra
-             recovery only), no further automatic configuration
-             switching, until the DB fingerprint changes to something
-             not already rejected.
+             recovery only). A critical-stopped group whose desired
+             fingerprint is genuinely NEW (never attempted) still gets
+             a fresh candidate attempt below (Phase 3 fix -- see this
+             module's Phase 3 docstring addendum: under Phase 2 this
+             was unreachable in practice, since the only way to clear
+             critical_stopped was a full process restart, which always
+             cleared it fresh; Phase 3 reconciliation can keep a
+             process alive for a long time across many DB edits while
+             critical_stopped, so "save a corrected configuration to
+             try again" -- the admin's own existing promise -- must
+             actually be true).
           4. Otherwise -> full candidate pipeline: validate, render,
              preflight (never touching the active/LKG paths or
              opening the live ALSA device), and only then launch on
              probation for live qualification."""
         from . import lkg as lkg_module
-        from . import preflight as preflight_module
-        from .validation import validate_full_configuration
 
         close_old_connections()
         slug = _slug(input_device)
         desired_fp = lkg_module.compute_fingerprint(input_device, encoders)
+        self._desired_fingerprint[input_device] = desired_fp
         try:
             lkg_script, lkg_meta = lkg_module.read_lkg(slug)
         except OSError as exc:
@@ -1501,19 +1622,37 @@ class EncoderManager:
             )
             lkg_script, lkg_meta = None, None
         lkg_fp = (lkg_meta or {}).get("fingerprint")
+        # Read-through cache (see __init__) -- this process is the only
+        # LKG writer, so this is always ground truth, no extra I/O for
+        # _write_group_state's heartbeat to pay later.
+        self._accepted_fingerprint[input_device] = lkg_fp
         rejected = self._rejected_fingerprints.get(input_device, set())
 
         if lkg_script is not None and desired_fp == lkg_fp:
             self._launch_kind[input_device] = "accepted"
             self._clear_qualification_tracking(input_device)
-            return self._start_group(input_device, encoders)
+            ok = self._start_group(input_device, encoders)
+            if ok:
+                self._running_fingerprint[input_device] = desired_fp
+            return ok
 
-        if lkg_script is not None and (desired_fp in rejected or self._critical_stopped.get(input_device)):
-            reason = "was previously rejected" if desired_fp in rejected else "automatic configuration switching is stopped (previous rollback failed)"
-            self._log(input_device, f"Desired configuration (fingerprint {desired_fp[:12]}) {reason} -- launching last-known-good instead.", force=True)
+        if lkg_script is not None and desired_fp in rejected:
+            self._log(input_device, f"Desired configuration (fingerprint {desired_fp[:12]}) was previously rejected -- launching last-known-good instead.", force=True)
             self._launch_kind[input_device] = "accepted"
             self._clear_qualification_tracking(input_device)
-            return self._start_group(input_device, encoders, script_override=lkg_script)
+            # Phase 3 review-fix pass, Issue 1: `encoders` here is the
+            # REJECTED desired rows, not what's actually about to run
+            # (the LKG script) -- record the LKG's own frozen
+            # destination identity instead, exactly like
+            # _start_rollback and _fallback_after_rejected_prelaunch_
+            # candidate already do, so a rejected/differing DB edit
+            # can never masquerade as this group's real running
+            # identity for Phase 3M cross-group collision purposes.
+            lkg_expected = lkg_module.destinations_from_lkg_meta(lkg_meta)
+            ok = self._start_group(input_device, lkg_expected, script_override=lkg_script)
+            if ok:
+                self._running_fingerprint[input_device] = lkg_fp
+            return ok
 
         if lkg_script is None and self._critical_stopped.get(input_device):
             # Nothing safe to launch and no further automatic
@@ -1521,34 +1660,26 @@ class EncoderManager:
             # keeps trying (matches bootstrap-with-no-LKG behavior).
             return False
 
-        # Full candidate pipeline.
-        errors = validate_full_configuration(encoders)
-        if errors:
-            self._reject_prelaunch_candidate(input_device, encoders, desired_fp, "validation", "; ".join(errors))
-            return self._fallback_after_rejected_prelaunch_candidate(input_device, encoders, lkg_script)
+        # Full candidate pipeline -- reached for a genuinely new (never
+        # rejected) desired fingerprint, whether or not this group is
+        # critical-stopped from an earlier, unrelated incident.
+        ok, candidate_script, failure_kind, reason, detail = self._static_check_candidate(input_device, encoders)
+        if not ok:
+            self._reject_prelaunch_candidate(input_device, encoders, desired_fp, failure_kind, reason, detail=detail)
+            return self._fallback_after_rejected_prelaunch_candidate(input_device, encoders, lkg_script, lkg_meta)
 
-        host_aircheck = input_device == DEFAULT_INPUT_DEVICE
-        candidate_script = build_liquidsoap_script(input_device, encoders, host_aircheck=host_aircheck, generation="preflight-check")
-        try:
-            candidate_path = lkg_module.write_candidate(slug, candidate_script)
-        except OSError as exc:
-            # Same failure class as an ordinary preflight rejection --
-            # the candidate could not even be rendered to disk to be
-            # checked. Never let this propagate and crash the
-            # supervisor (Phase 2 review-fix pass 2, Issue 3).
-            self._reject_prelaunch_candidate(input_device, encoders, desired_fp, "preflight", f"failed to write candidate script: {exc}")
-            return self._fallback_after_rejected_prelaunch_candidate(input_device, encoders, lkg_script)
-        try:
-            result = preflight_module.run_preflight(candidate_path, encoders)
-        finally:
-            lkg_module.cleanup_candidate(candidate_path)
+        if self._cross_group_collision_blocked(input_device, encoders, desired_fp):
+            # Deliberately NOT added to _rejected_fingerprints -- see
+            # _cross_group_collision_blocked's own comment: re-evaluated
+            # fresh every attempt so it self-heals once the other
+            # group relinquishes the destination, unlike a genuine
+            # validation/preflight failure.
+            return self._fallback_after_rejected_prelaunch_candidate(input_device, encoders, lkg_script, lkg_meta)
 
-        if not result.ok:
-            self._reject_prelaunch_candidate(input_device, encoders, desired_fp, "preflight", result.reason, detail=result.detail)
-            return self._fallback_after_rejected_prelaunch_candidate(input_device, encoders, lkg_script)
-
-        # Validation + preflight both passed -- launch for real, on probation.
-        ok = self._start_group(input_device, encoders)
+        # Every static check passed -- launch for real, on probation,
+        # the EXACT script text that was just checked (never re-render
+        # after the fact -- Phase 3E).
+        ok = self._start_group(input_device, encoders, script_override=candidate_script)
         if ok:
             self._launch_kind[input_device] = "candidate"
             self._candidate_fingerprint[input_device] = desired_fp
@@ -1558,6 +1689,7 @@ class EncoderManager:
             # just-validated/preflighted Encoder rows are exactly what
             # qualification should check.
             self._qualify_expected[input_device] = encoders
+            self._running_fingerprint[input_device] = desired_fp
             self._start_qualification_clock(input_device)
             # _start_group's own internal state write happened a moment
             # ago with launch_kind still defaulting to "accepted" (it
@@ -1580,6 +1712,54 @@ class EncoderManager:
             )
         return ok
 
+    def _static_check_candidate(self, input_device, encoders, generation_label="preflight-check"):
+        """Validate -> render -> write to CANDIDATE_DIR -> liquidsoap
+        --check, the exact sequence a configuration must pass before it
+        may ever be launched -- shared by cold-bootstrap (_launch_group,
+        above) and Phase 3 reconciliation (_reconcile_changed_group,
+        below) so there is exactly ONE implementation of this sequence,
+        never two that could silently disagree. Never touches the
+        live/active script path or opens the ALSA device -- see
+        preflight.py's own module docstring for why `liquidsoap --check`
+        is safe to run this way even while a healthy child holds the
+        real device.
+
+        Returns (ok, candidate_script_or_None, failure_kind_or_None,
+        reason_or_None, detail_dict). `failure_kind` is "validation" or
+        "preflight", matching _reject_prelaunch_candidate's own
+        vocabulary. `candidate_script` is the EXACT text that passed --
+        a caller that goes on to launch it must launch this exact
+        string (via _start_group's script_override), never re-render,
+        so the configuration that was checked is provably the
+        configuration that runs (Phase 3E)."""
+        from . import lkg as lkg_module
+        from . import preflight as preflight_module
+        from .validation import validate_full_configuration
+
+        errors = validate_full_configuration(encoders)
+        if errors:
+            return False, None, "validation", "; ".join(errors), {}
+
+        slug = _slug(input_device)
+        host_aircheck = input_device == DEFAULT_INPUT_DEVICE
+        script = build_liquidsoap_script(input_device, encoders, host_aircheck=host_aircheck, generation=generation_label)
+        try:
+            candidate_path = lkg_module.write_candidate(slug, script)
+        except OSError as exc:
+            # Same failure class as an ordinary preflight rejection --
+            # the candidate could not even be rendered to disk to be
+            # checked. Never let this propagate and crash the
+            # supervisor (Phase 2 review-fix pass 2, Issue 3).
+            return False, None, "preflight", f"failed to write candidate script: {exc}", {}
+        try:
+            result = preflight_module.run_preflight(candidate_path, encoders)
+        finally:
+            lkg_module.cleanup_candidate(candidate_path)
+
+        if not result.ok:
+            return False, None, "preflight", result.reason, result.detail
+        return True, script, None, None, {}
+
     def _reject_prelaunch_candidate(self, input_device, encoders, fingerprint, failure_kind, reason, detail=None):
         """A candidate failed validation or preflight -- BEFORE ever
         being Popen()'d. Nothing was launched, nothing running was
@@ -1601,7 +1781,7 @@ class EncoderManager:
             dedupe_key=f"encoder|candidate-{failure_kind}-failed|{input_device}",
         )
 
-    def _fallback_after_rejected_prelaunch_candidate(self, input_device, encoders, lkg_script):
+    def _fallback_after_rejected_prelaunch_candidate(self, input_device, encoders, lkg_script, lkg_meta=None):
         """After a pre-launch rejection: if an LKG exists, launch it
         directly (trusted immediately, no re-qualification -- it's
         already-proven content, not a new configuration) so the group
@@ -1610,12 +1790,29 @@ class EncoderManager:
         there is nothing safe to launch; the caller's own retry/
         backoff is what keeps re-checking (each retry re-reads current
         DB state fresh, so an operator's fix is picked up automatically
-        without needing a separate no-retry mechanism)."""
+        without needing a separate no-retry mechanism).
+
+        Phase 3 review-fix pass, Issue 1: `encoders` here is the
+        REJECTED candidate's own rows -- exactly the values Issue 1
+        found being wrongly recorded as "what's actually running"
+        (self._running_encoders, used for Phase 3M cross-group
+        collision checks) when the LKG script itself is what's
+        actually launched. Reconstructs the LKG's own frozen
+        destination identity from `lkg_meta` (same
+        destinations_from_lkg_meta helper _start_rollback already
+        uses, for the same reason) and records THAT, never the
+        rejected `encoders`, as this group's running identity."""
         if lkg_script is not None:
+            from . import lkg as lkg_module
+
             self._log(input_device, "Launching last-known-good instead.", force=True)
             self._launch_kind[input_device] = "accepted"
             self._clear_qualification_tracking(input_device)
-            return self._start_group(input_device, encoders, script_override=lkg_script)
+            lkg_expected = lkg_module.destinations_from_lkg_meta(lkg_meta)
+            ok = self._start_group(input_device, lkg_expected, script_override=lkg_script)
+            if ok:
+                self._running_fingerprint[input_device] = (lkg_meta or {}).get("fingerprint")
+            return ok
         return False
 
     def _reject_live_candidate(self, input_device, reason):
@@ -1709,6 +1906,8 @@ class EncoderManager:
             # backoff from here) rather than silently stopping.
             self._on_rollback_failed(input_device, "failed to launch rollback process")
             return
+        self._running_fingerprint[input_device] = (lkg_meta or {}).get("fingerprint")
+        self._accepted_fingerprint[input_device] = (lkg_meta or {}).get("fingerprint")
         self._launch_kind[input_device] = "rollback"
         # Deliberately lkg_expected here, WITHOUT the `or encoders`
         # fallback used for the log line above: an empty list makes
@@ -1811,9 +2010,23 @@ class EncoderManager:
             # the lenient property (same one evaluate_encoder_group_
             # health itself reads), computed once now from rows just
             # proven to work rather than recomputed later from rows
-            # that might not be.
+            # that might not be. `protocol`/`mount` (Phase 3M) are the
+            # two additional fields encoders.services.validation.
+            # normalized_destination_key needs beyond host/port/SID --
+            # without them an Icecast destination's stand-in can't be
+            # told apart from a different mount on the SAME host:port,
+            # so a group running via LKG fallback/rollback couldn't be
+            # correctly checked for a cross-group collision. A legacy
+            # LKG promoted before this field existed simply won't have
+            # them (destinations_from_lkg_meta below degrades to None,
+            # which normalized_destination_key already treats as
+            # "can't normalize, no collision key" -- never a false
+            # match) until its next promotion.
             "destinations": [
-                {"encoder_id": e.id, "name": e.name, "host": e.host, "port": e.port, "shoutcast_sid": e.shoutcast_sid}
+                {
+                    "encoder_id": e.id, "name": e.name, "host": e.host, "port": e.port,
+                    "shoutcast_sid": e.shoutcast_sid, "protocol": e.protocol, "mount": e.mount,
+                }
                 for e in encoders
             ],
         }
@@ -1839,6 +2052,7 @@ class EncoderManager:
         self._rejected_fingerprints.pop(input_device, None)
         self._critical_stopped.pop(input_device, None)
         self._launch_kind[input_device] = "accepted"
+        self._accepted_fingerprint[input_device] = fingerprint
         self._clear_qualification_tracking(input_device)
         self._write_group_state(input_device)  # launch_kind just changed -- refresh the admin-visible snapshot
         self._log(input_device, f"Candidate qualified and promoted to last-known-good (generation={current.get('generation')}).", force=True)
@@ -1883,6 +2097,8 @@ class EncoderManager:
         self._unlink_script_best_effort(input_device, script_path)
         self._stabilized.pop(input_device, None)
         self._current.pop(input_device, None)
+        self._running_fingerprint.pop(input_device, None)
+        self._running_encoders.pop(input_device, None)
         self._mark_audio_state_dead(input_device)
         self._clear_qualification_tracking(input_device)
 
@@ -1956,6 +2172,532 @@ class EncoderManager:
         else:
             self._on_rollback_succeeded(input_device, detail)
 
+    # ------------------------------------------------------------------
+    # Phase 3 hardening: per-input-device reconciliation. Replaces the
+    # Django admin's whole-service `systemctl restart isadoraair-
+    # encoders` for routine Encoder edits -- this manager discovers DB
+    # drift itself, on its own existing 5s health-tick cadence (see
+    # _check_health), and reconciles ONLY the input-device group(s)
+    # that actually changed. Every actual launch/promotion/rollback
+    # still goes through the exact same Phase 2 primitives above
+    # (_launch_group, _start_group, _start_rollback,
+    # _check_candidate_qualification, _promote_candidate) -- nothing
+    # here duplicates that machinery, it only decides WHEN to invoke it
+    # for an already-running group, which Phase 2 never needed to do.
+    # ------------------------------------------------------------------
+
+    def _record_reconcile_outcome(self, input_device, result, error=""):
+        """Phase 3O: the eventual-apply-outcome trio surfaced in
+        group-state JSON (last_reconcile_result/_error/_at). `result`
+        is a short machine-readable label (e.g. "candidate_launched",
+        "static_validation_rejected", "blocked_cross_group_collision",
+        "removed") -- NOT a duplicate of the SystemEvent stream (see
+        each call site's own emit_event, where one exists); this is
+        purely the compact, always-current snapshot admin/monitoring
+        read without having to replay events.
+
+        Phase 3 review-fix pass, Issue 2 (found while adding the
+        desired-vs-desired collision check): always persists via
+        _write_group_state -- most call sites already have a live
+        child whose OWN heartbeat would eventually write this same
+        tick anyway, but a "new" group blocked before it EVER
+        launches (no live child, ever, for either the running-vs-
+        desired or desired-vs-desired collision checks) has no other
+        write path at all, and would otherwise stay invisible to
+        admin/monitoring (a separate process, on-disk state only)
+        despite genuinely being blocked."""
+        meta = self._group_meta(input_device)
+        meta["last_reconcile_result"] = result
+        meta["last_reconcile_error"] = error or ""
+        meta["last_reconcile_at"] = time.time()
+        self._write_group_state(input_device)
+
+    def _cross_group_destination_conflicts(self, input_device, encoders):
+        """Phase 3M: does `encoders` (a candidate about to be checked/
+        launched for `input_device`) want any real destination that
+        ANOTHER group is currently, actually running? Reuses
+        encoders.services.validation.normalized_destination_key --
+        the SAME protocol-aware (Icecast mount / Shoutcast1 host:port /
+        Shoutcast2 host:port:SID) identity validate_group() already
+        uses for WITHIN-group duplicate checking -- rather than a
+        second, parallel notion of "same destination."
+
+        Checked only against self._running_encoders -- what's
+        genuinely live right now, the real collision risk (two
+        processes racing for one ALSA/network/telnet resource) -- not
+        against every other group's LKG regardless of whether it's
+        currently running; a group with no live child holds nothing to
+        collide with. Returns a list of (destination_key, other_
+        input_device, other_encoder_name) tuples, empty if clear."""
+        from .validation import normalized_destination_key
+
+        desired_keys = {}
+        for e in encoders:
+            key = normalized_destination_key(e)
+            if key is not None:
+                desired_keys.setdefault(key, e)
+
+        conflicts = []
+        for other_device, other_encoders in self._running_encoders.items():
+            if other_device == input_device:
+                continue
+            for e in other_encoders:
+                key = normalized_destination_key(e)
+                if key in desired_keys:
+                    conflicts.append((key, other_device, getattr(e, "name", "?")))
+        return conflicts
+
+    def _cross_group_collision_blocked(self, input_device, encoders, desired_fp):
+        """Checks _cross_group_destination_conflicts and, if any exist,
+        reports them (log, emit_event, _record_reconcile_outcome) in
+        exactly one place -- reused by every call site that must
+        refuse to launch a colliding configuration: cold-bootstrap/
+        retry (_launch_group), and reconciliation's own pre-dispatch
+        filter and per-group replacement path (_reconcile_inner,
+        _reconcile_changed_group). Returns True if blocked (nothing
+        should be launched), False if clear.
+
+        Deliberately NEVER added to _rejected_fingerprints -- re-
+        evaluated fresh on every attempt so it self-heals the moment
+        the other group relinquishes the destination, unlike a genuine
+        validation/preflight failure (which IS sticky -- see
+        _reject_prelaunch_candidate)."""
+        conflicts = self._cross_group_destination_conflicts(input_device, encoders)
+        if not conflicts:
+            return False
+        reason = "; ".join(f"{key} already in use by group {other!r} ({name!r})" for key, other, name in conflicts)
+        self._log(input_device, f"Blocked by cross-group destination collision: {reason}", force=True)
+        emit_event(
+            category="encoder", level="warning",
+            title=f"Encoder group '{input_device}' configuration blocked by cross-group destination collision",
+            detail={
+                "input_device": input_device, "fingerprint": desired_fp,
+                "conflicts": [{"destination": key, "other_group": other, "other_encoder": name} for key, other, name in conflicts],
+            },
+            dedupe_key=f"encoder|cross-group-collision|{input_device}",
+        )
+        self._record_reconcile_outcome(input_device, "blocked_cross_group_collision", reason)
+        return True
+
+    def _desired_vs_desired_conflicts(self, desired_groups):
+        """Phase 3 review-fix pass, Issue 2: does any pair of DESIRED
+        groups (no running/live state involved at all -- purely the
+        current DB read) claim the same normalized destination? This
+        is an intrinsically ambiguous topology, not something
+        reconciliation order should ever get to silently resolve by
+        picking whichever one happens to launch first.
+
+        Returns {input_device: {other_device, ...}} for every device
+        involved in at least one such conflict -- empty dict if none.
+        Deliberately does NOT consult self._running_encoders/
+        _running_fingerprint at all: a legitimate input-device move
+        (Encoder.input_device changing) can only ever leave the moved
+        row in ONE group's desired set at a time, so it structurally
+        cannot produce a desired-vs-desired overlap -- only two
+        genuinely independent rows configured with the same
+        destination can. Reuses validation.normalized_destination_key
+        -- the identical protocol-aware identity every other collision
+        check in this file already uses, never a second notion of
+        "same destination"."""
+        from .validation import normalized_destination_key
+
+        keys_by_device = {}
+        for device, encoders in desired_groups.items():
+            keys = set()
+            for e in encoders:
+                key = normalized_destination_key(e)
+                if key is not None:
+                    keys.add(key)
+            keys_by_device[device] = keys
+
+        conflicts = {}
+        devices = list(desired_groups)
+        for i, a in enumerate(devices):
+            for b in devices[i + 1:]:
+                if keys_by_device[a] & keys_by_device[b]:
+                    conflicts.setdefault(a, set()).add(b)
+                    conflicts.setdefault(b, set()).add(a)
+        return conflicts
+
+    def _report_desired_conflict(self, input_device, other_devices):
+        """Reports (log, emit_event, _record_reconcile_outcome) an
+        Issue-2-style desired-vs-desired collision for ONE side of it
+        -- called once per involved device (see _reconcile_inner) so
+        every group sharing the ambiguous destination is independently
+        visible in its own group-state/events, regardless of which
+        side an operator happens to be looking at."""
+        others = ", ".join(sorted(other_devices))
+        reason = f"desired configuration also claims a destination desired by: {others}"
+        self._log(input_device, f"Blocked by desired-vs-desired destination collision: {reason}", force=True)
+        emit_event(
+            category="encoder", level="warning",
+            title=f"Encoder group '{input_device}' desired configuration conflicts with another group's desired configuration",
+            detail={"input_device": input_device, "conflicting_groups": sorted(other_devices)},
+            dedupe_key=f"encoder|desired-collision|{input_device}",
+        )
+        self._record_reconcile_outcome(input_device, "blocked_desired_collision", reason)
+
+    def _stop_group_intentionally(self, input_device, reason):
+        """Phase 3F: safely stop a group's CURRENT live child as a
+        deliberate act (about to be replaced or removed) -- distinct
+        from _handle_exit's crash path in every way that matters:
+        never increments consecutive_failures, never records a
+        last_exit_code/last_failure_message as if something went
+        wrong, never schedules ordinary retry/backoff, never emits a
+        child-crash-shaped event. Only ever touches `input_device`'s
+        own bookkeeping.
+
+        Bounded terminate -> wait -> kill -> wait, exactly like
+        _on_qualification_failed's existing termination sequence, plus
+        one more confirmation: if the process STILL can't be confirmed
+        gone after SIGKILL, this refuses to proceed (returns False)
+        rather than risk a second process racing the first for the
+        same ALSA device, Shoutcast destination, or aircheck telnet
+        port (Phase 3F's hard requirement). That is a deliberately
+        conservative, rare-case failure mode -- NOTHING is cleared in
+        that case (self._current/_procs/_running_fingerprint/etc. are
+        left exactly as they were, still describing the presumed-
+        still-alive old child, since that is the most accurate
+        available picture of reality), and no candidate is launched.
+        The group goes dark from this manager's own automatic
+        replacement machinery until an operator intervenes (a manual
+        `systemctl restart isadoraair-encoders` remains the recovery
+        path, per this project's own established precedent), rather
+        than the alternative of possibly running two competing
+        processes against the same device. Returns True once the old
+        child is confirmed gone (or there was none to begin with) --
+        only then is any state actually cleared, below."""
+        proc = self._procs.get(input_device)
+        if proc is not None:
+            pid = getattr(proc, "pid", None)
+            confirmed_gone = False
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+                confirmed_gone = True
+            except subprocess.TimeoutExpired:
+                try:
+                    proc.kill()
+                    proc.wait(timeout=5)
+                    confirmed_gone = True
+                except subprocess.TimeoutExpired:
+                    confirmed_gone = False
+                except (ProcessLookupError, OSError):
+                    confirmed_gone = True
+            except (ProcessLookupError, OSError):
+                confirmed_gone = True
+
+            if not confirmed_gone and pid is not None:
+                # Last-resort liveness check, independent of proc.wait()
+                # -- os.kill(pid, 0) raises ProcessLookupError if the
+                # pid is genuinely gone even if something else made
+                # wait() itself unreliable.
+                try:
+                    os.kill(pid, 0)
+                    confirmed_gone = False
+                except ProcessLookupError:
+                    confirmed_gone = True
+                except OSError:
+                    confirmed_gone = False
+
+            if not confirmed_gone:
+                self._log(input_device, f"Could not confirm prior Liquidsoap process (pid={pid}) had stopped -- refusing to launch a replacement.", force=True)
+                emit_event(
+                    category="encoder", level="critical",
+                    title=f"Encoder group '{input_device}' could not confirm prior process stopped",
+                    detail={"input_device": input_device, "pid": pid, "reason": reason},
+                    dedupe_key=f"encoder|intentional-stop-unconfirmed|{input_device}",
+                )
+                return False
+
+        self._procs.pop(input_device, None)
+        script_path = self._scripts.pop(input_device, None)
+        self._unlink_script_best_effort(input_device, script_path)
+        self._stabilized.pop(input_device, None)
+        self._current.pop(input_device, None)
+        self._running_fingerprint.pop(input_device, None)
+        self._running_encoders.pop(input_device, None)
+        self._clear_qualification_tracking(input_device)
+        self._mark_audio_state_dead(input_device)
+        self._write_group_state(input_device)
+        self._log(input_device, f"Intentionally stopped ({reason}).", force=True)
+        emit_event(
+            category="encoder", level="info",
+            title=f"Encoder group '{input_device}' intentionally stopped",
+            detail={"input_device": input_device, "reason": reason},
+            dedupe_key=f"encoder|intentional-stop|{input_device}",
+        )
+        return True
+
+    def _remove_group_intentionally(self, input_device):
+        """Phase 3C "removed": no enabled Encoder rows remain for a
+        currently-known group. Stops its live child if it has one
+        (via _stop_group_intentionally -- same non-crash bookkeeping),
+        then discards EVERY piece of this group's retry/qualification/
+        rejection bookkeeping so a later re-enable starts completely
+        fresh rather than resuming mid-escalation from a sequence
+        that's since become meaningless. Its persistent LKG is
+        deliberately left on disk (no safety reason to delete it; a
+        re-enable of the identical configuration gets its fast path
+        back immediately). Also used by _retry_group's own "no enabled
+        encoders left" branch (replacing what used to be separate,
+        near-identical inline cleanup there) -- one implementation of
+        "forget about this group" instead of two."""
+        if input_device in self._procs:
+            self._stop_group_intentionally(input_device, reason="no enabled encoders remain for this input device")
+        self._retry_index.pop(input_device, None)
+        self._retry_at.pop(input_device, None)
+        self._meta.pop(input_device, None)
+        self._launch_kind.pop(input_device, None)
+        self._critical_stopped.pop(input_device, None)
+        self._rejected_fingerprints.pop(input_device, None)
+        self._candidate_fingerprint.pop(input_device, None)
+        self._candidate_encoders.pop(input_device, None)
+        self._running_fingerprint.pop(input_device, None)
+        self._running_encoders.pop(input_device, None)
+        self._accepted_fingerprint.pop(input_device, None)
+        self._desired_fingerprint.pop(input_device, None)
+        self._clear_qualification_tracking(input_device)
+        self._log(input_device, "No enabled encoders left for this device, not restarting.", force=True)
+        emit_event(
+            category="encoder", level="info",
+            title=f"Encoder group '{input_device}' removed",
+            detail={"input_device": input_device},
+            dedupe_key=f"encoder|group-removed|{input_device}",
+        )
+        try:
+            _group_state_path(input_device).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def _reconcile_changed_group(self, input_device, desired_encoders, desired_fp):
+        """Phase 3D-G: replace an ALREADY-RUNNING group's child with a
+        newly-desired configuration, without ever double-launching
+        against the same input_device. Every static check (rejected-
+        fingerprint short-circuit, cross-group destination collision,
+        validation, preflight) runs BEFORE the current healthy child
+        is touched -- only once every one of them passes is the old
+        child intentionally stopped and the EXACT preflighted
+        candidate script launched (via _static_check_candidate +
+        script_override, same discipline _launch_group's own candidate
+        pipeline now follows), handing off to the unmodified Phase 2
+        qualification/promotion/rollback machinery from there."""
+        rejected = self._rejected_fingerprints.get(input_device, set())
+        if desired_fp in rejected:
+            # Known-bad -- do nothing. Unlike _launch_group's bootstrap
+            # case, there is no "must launch SOMETHING" pressure here:
+            # the group is already running its current accepted/LKG
+            # configuration, which simply stays as-is.
+            return
+
+        if self._cross_group_collision_blocked(input_device, desired_encoders, desired_fp):
+            return  # re-evaluated fresh next tick -- not sticky (see _cross_group_collision_blocked)
+
+        ok, candidate_script, failure_kind, reason, detail = self._static_check_candidate(input_device, desired_encoders)
+        if not ok:
+            self._reject_prelaunch_candidate(input_device, desired_encoders, desired_fp, failure_kind, reason, detail=detail)
+            self._record_reconcile_outcome(input_device, f"static_{failure_kind}_rejected", reason)
+            return
+
+        self._record_reconcile_outcome(input_device, "replacement_started")
+        if not self._stop_group_intentionally(input_device, reason=f"replacing with newly-preflighted configuration (fingerprint {desired_fp[:12]})"):
+            # Phase 3F: could not confirm the old process is gone --
+            # already logged/emitted critical inside
+            # _stop_group_intentionally; refuse to launch a second
+            # process against the same device.
+            self._record_reconcile_outcome(input_device, "candidate_failed", "could not confirm prior process had stopped")
+            return
+
+        ok = self._start_group(input_device, desired_encoders, script_override=candidate_script)
+        if not ok:
+            # Phase 3G: a Popen() failure here happens AFTER the old
+            # proven child is already gone -- this is NOT an ordinary
+            # retry condition. Immediately fall back to Phase 2
+            # rollback (exact reuse, same function _reject_live_
+            # candidate already calls for a live qualification
+            # failure).
+            self._record_reconcile_outcome(input_device, "candidate_failed", "failed to launch replacement candidate")
+            self._start_rollback(input_device, desired_encoders, "failed to launch replacement candidate immediately after intentional stop during reconciliation")
+            return
+
+        self._launch_kind[input_device] = "candidate"
+        self._candidate_fingerprint[input_device] = desired_fp
+        self._candidate_encoders[input_device] = desired_encoders
+        self._qualify_expected[input_device] = desired_encoders
+        self._running_fingerprint[input_device] = desired_fp
+        self._start_qualification_clock(input_device)
+        self._write_group_state(input_device)
+        self._record_reconcile_outcome(input_device, "candidate_launched")
+        self._log(input_device, f"Reconciliation: replacement candidate launched (fingerprint={desired_fp[:12]}), qualification in progress.", force=True)
+        emit_event(
+            category="encoder", level="info",
+            title=f"Encoder group '{input_device}' replacement candidate launched",
+            detail={
+                "input_device": input_device, "fingerprint": desired_fp,
+                "generation": self._current[input_device]["generation"],
+                "encoder_names": [e.name for e in desired_encoders],
+            },
+            dedupe_key=f"encoder|reconcile-candidate-launched|{input_device}",
+        )
+
+    def _reconcile(self):
+        """Phase 3P: the reconciliation scan itself -- cheap (one
+        queryset, grouping, in-memory fingerprint comparisons), called
+        every _check_health() tick (same 5s cadence as everything
+        else). Qualification of anything it launches remains entirely
+        tick-driven exactly as Phase 2 already does it (see
+        _check_candidate_qualification, unmodified and unaware of how
+        a candidate came to be launched) -- this method itself never
+        blocks waiting for health.
+
+        Has its own top-level exception containment (unlike the
+        per-device actions below, which _check_health wraps via
+        _guarded) because the desired-topology query/classification
+        that precedes any single device's action isn't itself
+        per-device -- a failure there (e.g. a DB connectivity blip)
+        must not crash the supervisor any more than a per-device
+        failure would."""
+        try:
+            self._reconcile_inner()
+        except Exception as exc:
+            print(f"  [reconcile] Unexpected error during reconciliation scan: {exc}")
+            emit_event(
+                category="encoder", level="critical",
+                title="Encoder reconciliation scan failed unexpectedly",
+                detail={"error": repr(exc)},
+                dedupe_key="encoder|reconciliation-scan-error",
+            )
+
+    def _reconcile_inner(self):
+        from . import lkg as lkg_module
+        from .validation import normalized_destination_key
+
+        close_old_connections()
+        desired_groups = _group_by_input_device(Encoder.objects.filter(enabled=True))
+        known_devices = (
+            set(self._procs) | set(self._retry_at) | set(self._meta)
+            | set(self._current) | set(self._launch_kind)
+        )
+
+        # Phase 3C "removed" -- instant and safe regardless of any
+        # other group's in-flight transition; never resurrect these.
+        for input_device in sorted(known_devices - set(desired_groups)):
+            self._guarded(input_device, "reconciliation (removed group)", lambda d=input_device: self._remove_group_intentionally(d))
+
+        known_devices = (
+            set(self._procs) | set(self._retry_at) | set(self._meta)
+            | set(self._current) | set(self._launch_kind)
+        )
+
+        # Phase 3K: at most one topology REPLACEMENT in flight at a
+        # time -- derived for free from launch_kind rather than a
+        # separate lock: a group currently "candidate" or "rollback"
+        # IS a transition in progress, and _check_candidate_
+        # qualification (unaffected by any of this) keeps driving it
+        # to completion every tick regardless. While any group is
+        # transitioning, no NEW replacement/bootstrap starts this
+        # tick; ordinary health/crash-retry supervision of every other
+        # group continues completely unaffected (it lives in
+        # _check_health's other, unconditional loops).
+        transitioning = {d for d, k in self._launch_kind.items() if k in ("candidate", "rollback")}
+
+        # Phase 3 review-fix pass, Issue 2: an intrinsically ambiguous
+        # DESIRED topology (two groups' current desired rows both
+        # claiming the same normalized destination) must be caught
+        # BEFORE either one is ever dispatched -- otherwise
+        # reconciliation order (the priority sort below) would let
+        # whichever one launches first silently "win," with the other
+        # then blocked only by the SEPARATE running-state collision
+        # check on a later tick. Computed purely from `desired_groups`
+        # (no running/live state involved at all), which is exactly
+        # what makes it structurally incapable of misfiring on a
+        # legitimate input-device move: a moved Encoder row can only
+        # ever appear in ONE group's desired set at a time (its
+        # input_device is a single value), so desired(old) and
+        # desired(new) never actually overlap once the move has
+        # committed to the DB -- only two genuinely independent rows
+        # configured with the same destination produce a real conflict
+        # here.
+        desired_conflicts = self._desired_vs_desired_conflicts(desired_groups)
+        for input_device, other_devices in sorted(desired_conflicts.items()):
+            self._guarded(
+                input_device, "reconciliation (desired collision)",
+                lambda d=input_device, others=other_devices: self._report_desired_conflict(d, others),
+            )
+
+        candidates = []
+        for input_device, encoders in desired_groups.items():
+            desired_fp = lkg_module.compute_fingerprint(input_device, encoders)
+            self._desired_fingerprint[input_device] = desired_fp
+            if input_device in desired_conflicts:
+                # Ambiguous desired topology -- neither side may be
+                # dispatched until the operator resolves it (Issue 2).
+                # Unrelated groups (not part of any conflict) are
+                # completely unaffected and remain eligible below.
+                continue
+            if input_device not in known_devices:
+                candidates.append(("new", input_device, encoders, desired_fp))
+                continue
+            if input_device in self._retry_at:
+                # Already on the ordinary retry/backoff schedule --
+                # that path's own _launch_group call already re-reads
+                # DB state fresh each attempt, so it naturally picks up
+                # the latest desired configuration on its own timer.
+                # No separate reconciliation action needed (and
+                # starting one here would just fight the backoff).
+                continue
+            running_fp = self._running_fingerprint.get(input_device)
+            if running_fp is not None and desired_fp == running_fp:
+                # Phase 3 review-fix pass, Issue 1: self-heal a stale/
+                # incomplete _running_encoders cache (e.g. left over
+                # from a rollback whose LKG metadata predates protocol/
+                # mount -- see lkg.destinations_from_lkg_meta) the
+                # instant desired is PROVEN to match what's running
+                # again. desired_fp == running_fp is itself the proof:
+                # identical fingerprints mean `encoders` (the DB rows
+                # just fetched fresh, above) describe the exact same
+                # runtime-affecting configuration already running --
+                # never a rejected/differing one, which would produce a
+                # different fingerprint by construction. Cheap (an
+                # in-memory list swap, the DB read already happened for
+                # this tick) and closes the legacy-metadata cross-group-
+                # collision blind spot without ever touching the LKG
+                # file or trusting DB values for anything but this
+                # exact proven-matching case -- still Phase 3C's
+                # "otherwise do absolutely nothing": no launch, no
+                # generation change, no state churn beyond this cache.
+                cached = self._running_encoders.get(input_device)
+                if cached and not all(getattr(e, "protocol", None) is not None for e in cached):
+                    self._running_encoders[input_device] = encoders
+                continue  # Phase 3C "unchanged" -- do absolutely nothing
+            candidates.append(("changed", input_device, encoders, desired_fp))
+
+        if not candidates or transitioning:
+            return
+
+        def priority(item):
+            _kind, input_device, encoders, _fp = item
+            desired_keys = {k for k in (normalized_destination_key(e) for e in encoders) if k is not None}
+            running_keys = {
+                k for k in (normalized_destination_key(e) for e in self._running_encoders.get(input_device, []))
+                if k is not None
+            }
+            return (len(desired_keys - running_keys), input_device)
+
+        candidates.sort(key=priority)
+
+        for kind, input_device, encoders, desired_fp in candidates:
+            if self._cross_group_collision_blocked(input_device, encoders, desired_fp):
+                continue  # try the next candidate this tick; this one waits for the colliding group to relinquish first
+            if kind == "new":
+                def start_new(d=input_device, e=encoders):
+                    if not self._launch_group(d, e):
+                        self._schedule_retry(d)
+                self._guarded(input_device, "reconciliation (new group)", start_new)
+            else:
+                self._guarded(input_device, "reconciliation (changed group)", lambda d=input_device, e=encoders, fp=desired_fp: self._reconcile_changed_group(d, e, fp))
+            break  # Phase 3K: only one transition starts per tick
+
     def _guarded(self, input_device, context, fn):
         """Defense-in-depth safety net (Phase 2 review-fix pass 2,
         Issue 3): runs `fn()`, catching and logging/reporting ANY
@@ -1985,6 +2727,14 @@ class EncoderManager:
 
     def _check_health(self):
         now_mono = time.monotonic()
+
+        # Phase 3: reconciliation scan first -- topology decisions
+        # (removed/new/changed groups) before this tick's per-process
+        # health details, so e.g. a just-removed group's proc isn't
+        # also processed by the stabilization/qualification loops
+        # below in the same tick. Has its own internal exception
+        # containment (see _reconcile's own docstring).
+        self._reconcile()
 
         # Dead processes -- handle each independently; with multiple
         # device groups, blocking here on one would delay noticing the
@@ -2035,19 +2785,15 @@ class EncoderManager:
         groups = _group_by_input_device(Encoder.objects.filter(enabled=True))
         encoders = groups.get(input_device)
         if not encoders:
-            # Phase 7 req #10/#11: a group with no enabled encoders
-            # left must not be resurrected -- and its retry/backoff
-            # bookkeeping is dropped entirely, not just skipped this
-            # once, so a LATER re-enable starts the backoff schedule
-            # fresh rather than resuming mid-escalation from a retry
-            # sequence that's since become meaningless.
-            self._log(input_device, "No enabled encoders left for this device, not restarting.", force=True)
-            self._retry_index.pop(input_device, None)
-            self._meta.pop(input_device, None)
-            try:
-                _group_state_path(input_device).unlink(missing_ok=True)
-            except OSError:
-                pass
+            # Phase 7 req #10/#11 / Phase 3C "removed": a group with no
+            # enabled encoders left must not be resurrected -- and its
+            # retry/backoff bookkeeping is dropped entirely, not just
+            # skipped this once, so a LATER re-enable starts the
+            # backoff schedule fresh rather than resuming mid-
+            # escalation from a retry sequence that's since become
+            # meaningless. Shared with _reconcile_inner's own
+            # "removed" classification -- one implementation.
+            self._remove_group_intentionally(input_device)
             return
         self._log(input_device, "Retrying...", force=True)
         if not self._launch_group(input_device, encoders):

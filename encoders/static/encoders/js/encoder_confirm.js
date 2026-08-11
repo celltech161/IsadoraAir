@@ -1,13 +1,17 @@
-// Warns before an encoder admin submit that is likely to restart
-// isadoraair-encoders (briefly dropping all active streams). This is a
-// convenience heads-up only -- the server decides whether to actually
-// restart (see encoders/admin.py's RUNTIME_AFFECTING_FIELDS /
-// save_model / delete_model / delete_queryset), and that decision is
-// authoritative regardless of what this file guesses. Mirrored here so
-// the warning is accurate enough not to fire on a plain sort_order (or
-// other non-runtime-affecting) edit -- if this list and the server's
-// drift apart, the worst case is a wrong/missing confirmation dialog,
-// never a wrong restart.
+// Warns before an encoder admin submit that is likely to cause the
+// encoder manager to reconcile (replace) this specific group's live
+// child -- briefly interrupting streams that share ITS input device
+// only, never the whole isadoraair-encoders service or any OTHER
+// group (Phase 3: the manager reconciles per input-device group on
+// its own, the admin no longer restarts anything -- see encoders/
+// admin.py's RUNTIME_AFFECTING_FIELDS / save_model / delete_model /
+// delete_queryset). This is a convenience heads-up only -- the server
+// decides what actually happens, and that decision is authoritative
+// regardless of what this file guesses. Mirrored here so the warning
+// is accurate enough not to fire on a plain sort_order (or other
+// non-runtime-affecting) edit -- if this list and the server's drift
+// apart, the worst case is a wrong/missing confirmation dialog, never
+// a wrong outcome.
 var RUNTIME_AFFECTING_FIELDS = [
   'enabled', 'protocol', 'host', 'port', 'mount', 'username', 'password',
   'format', 'bitrate_kbps', 'input_device', 'station_name', 'genre',
@@ -55,11 +59,12 @@ document.addEventListener('DOMContentLoaded', function () {
       // matching the server (encoders/admin.py's save_model). For an
       // edit, only warn if a field the server actually restarts for
       // looks changed; a sort_order-only edit gets no dialog.
-      var likelyRestart = isAdd || anyRuntimeFieldChanged(form, '');
-      if (!likelyRestart) return;
+      var likelyReplace = isAdd || anyRuntimeFieldChanged(form, '');
+      if (!likelyReplace) return;
       var ok = confirm(
-        'Saving this will likely restart the IsadoraAir encoders service, ' +
-        'briefly dropping all active streams. Continue?'
+        'Saving this will cause the encoder manager to validate and replace this ' +
+        'group\'s configuration, briefly interrupting streams that share its input ' +
+        'device. Other encoder groups are not affected. Continue?'
       );
       if (!ok) e.preventDefault();
     });
@@ -83,8 +88,9 @@ document.addEventListener('DOMContentLoaded', function () {
       // correctly silent here.
       if (!anyRuntimeFieldChanged(changelistForm, '-')) return;
       var ok = confirm(
-        'Saving will likely restart the IsadoraAir encoders service for ' +
-        'at least one changed row, briefly dropping all active streams. Continue?'
+        'Saving will cause the encoder manager to validate and replace the ' +
+        'configuration for at least one changed group, briefly interrupting streams ' +
+        'that share its input device. Unrelated encoder groups are not affected. Continue?'
       );
       if (!ok) e.preventDefault();
     });
