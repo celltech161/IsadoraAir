@@ -3,6 +3,7 @@ import traceback as _traceback
 from datetime import timedelta
 
 from django.core.exceptions import ValidationError
+from django.core.validators import EmailValidator
 from django.db import models
 from django.utils import timezone as _django_tz
 
@@ -253,6 +254,32 @@ class NotificationConfig(models.Model):
 
     def __str__(self):
         return "Notification Config"
+
+    def clean(self):
+        # Authoritative recipient validation (SMTP + Django-admin
+        # diagnostics pass) -- runs the SAME parsing recipient_list()
+        # itself does (one email per line or comma-separated) so a
+        # value that validates here behaves identically at send time,
+        # then checks each parsed entry with Django's own EmailValidator
+        # rather than a hand-rolled regex. Deliberately does NOT
+        # validate against recipient_list() directly (that method has
+        # no reason to raise -- it's called from the notification hot
+        # path) -- clean() is the one gate a save must pass through
+        # (admin's ModelForm calls full_clean() before saving), so a
+        # malformed address is caught at edit time, not silently
+        # swallowed or, worse, discovered only when a real alert fails
+        # to send. `5551234567@vtext.com`-style SMS-gateway addresses
+        # (see the field's own help_text) are valid email syntax and
+        # pass this check the same as any other address.
+        errors = []
+        validator = EmailValidator()
+        for address in self.recipient_list():
+            try:
+                validator(address)
+            except ValidationError:
+                errors.append(f"{address!r} is not a valid email address.")
+        if errors:
+            raise ValidationError({"recipients": errors})
 
     def save(self, *args, **kwargs):
         self.pk = 1
