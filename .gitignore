@@ -11,3 +11,5 @@ staticfiles/
 PROJECT_NOTES.md
 media/album_art_cache/
 media/ui_theme/
+road_conditions/media/
+scratchpad/
