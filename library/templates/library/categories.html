@@ -168,6 +168,27 @@
     color: var(--text-muted);
     font-size: 0.85rem;
   }
+
+  /* --- Used-by-rotations section --- */
+  .cat-usage-section {
+    margin-top: 1.25rem;
+    padding-top: 1rem;
+    border-top: 1px solid var(--border-subtle);
+  }
+  .cat-usage-list {
+    list-style: none;
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+  }
+  .cat-usage-list a {
+    color: var(--accent);
+    text-decoration: none;
+    font-size: 0.85rem;
+  }
+  .cat-usage-list a:hover {
+    text-decoration: underline;
+  }
 </style>
 {% endblock %}
 
@@ -300,6 +321,11 @@
                 title="Fast-repicks cue points from every track's saved envelope data using the thresholds above. Any track whose JSON pre-dates envelope persistence auto-falls back to a full re-analyze via the analyze timer.">Update Cue Points</button>
       </div>
     </form>
+
+    <div class="cat-usage-section" id="catUsageSection" style="display:none;">
+      <h3>Used by rotations</h3>
+      <div id="catUsageList"></div>
+    </div>
   </div>
 </div>
 {% endblock %}
@@ -308,6 +334,7 @@
 <script>
 let categories = [];
 let currentCategoryId = null;
+const ROTATIONS_URL = "{% url 'library:rotations' %}";
 
 function getCookie(name) {
   let val = null;
@@ -383,6 +410,7 @@ function newCategory() {
   document.getElementById('fRbdsPtyn').value = '';
   document.getElementById('deleteCategoryBtn').style.display = 'none';
   document.getElementById('reanalyzeCategoryBtn').style.display = 'none';
+  document.getElementById('catUsageSection').style.display = 'none';
   setMsg('');
   renderCategoryTable();
 }
@@ -409,6 +437,34 @@ function editCategory(id) {
   document.getElementById('reanalyzeCategoryBtn').style.display = '';
   setMsg('');
   renderCategoryTable();
+  loadCategoryUsage(id);
+}
+
+async function loadCategoryUsage(id) {
+  const section = document.getElementById('catUsageSection');
+  const list = document.getElementById('catUsageList');
+  section.style.display = '';
+  list.innerHTML = '<div class="cat-form-hint">Loading...</div>';
+
+  const resp = await fetch(`/api/categories/${id}/`);
+  if (id !== currentCategoryId) return;  // operator already switched categories -- drop this stale response
+  if (!resp.ok) {
+    list.innerHTML = '<div class="cat-form-hint">Could not load rotation usage.</div>';
+    return;
+  }
+  const data = await resp.json();
+  if (id !== currentCategoryId) return;
+
+  const rotations = data.used_by_rotations || [];
+  if (!rotations.length) {
+    list.innerHTML = '<div class="cat-form-hint">Not used by any rotations.</div>';
+    return;
+  }
+  list.innerHTML = '<ul class="cat-usage-list">' +
+    rotations.map(r =>
+      `<li><a href="${ROTATIONS_URL}?rotation=${r.id}">${esc(r.name)}</a></li>`
+    ).join('') +
+    '</ul>';
 }
 
 async function saveCategory() {

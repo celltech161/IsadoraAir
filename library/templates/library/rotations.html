@@ -864,6 +864,33 @@ document.getElementById('trackCategoryFilter').addEventListener('change', () => 
 document.getElementById('readyOnlyToggle').addEventListener('change', () => searchTracks(true));
 
 // --- Init ---
-loadRotationList();
+// Supports a "?rotation=<id>" deep link (used by the Category edit
+// pane's "Used by rotations" links) to land directly on that rotation
+// instead of the blank picker -- same select-then-load-detail sequence
+// createRotation()/copyCurrentRotation() already use elsewhere on this
+// page. With no query param this is unchanged from before: a plain
+// loadRotationList() with nothing preselected.
+const deepLinkRotationId = new URLSearchParams(window.location.search).get('rotation');
+if (deepLinkRotationId) {
+  loadRotationList(deepLinkRotationId).then(() => {
+    // loadRotationList only actually selects the option if
+    // deepLinkRotationId still matches a rotation in the freshly-
+    // fetched list (see its own prevValue check) -- so a stale link
+    // (e.g. a bookmark for a since-deleted Rotation) leaves the
+    // select on its default blank placeholder rather than a
+    // selectedIndex=-1 non-match. Only load the detail pane if the
+    // select actually landed on our id; otherwise fall through to the
+    // normal "Select an existing rotation above..." empty state --
+    // no fetch against a rotation id we already know is gone, and no
+    // risk of the page getting stuck showing a stale/empty detail
+    // pane for an id that no longer resolves.
+    const select = document.getElementById('rotationSelect');
+    if (select.value === deepLinkRotationId) {
+      loadRotationDetail(deepLinkRotationId);
+    }
+  });
+} else {
+  loadRotationList();
+}
 </script>
 {% endblock %}

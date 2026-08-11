@@ -236,7 +236,23 @@ def api_category_detail(request, pk):
     )
 
     if request.method == "GET":
-        return JsonResponse(_category_to_dict(category))
+        data = _category_to_dict(category)
+        # Roadmap 4.2: which Rotations currently reference this Category,
+        # for the "Used by rotations" section on the Category edit pane.
+        # Deliberately only computed here (the single-category detail
+        # fetch), not folded into _category_to_dict itself -- that
+        # function is also used by api_category_list's per-row dict for
+        # EVERY category, where adding this query per row would be an
+        # N+1. Rotation.slots is the real (only) ownership relationship
+        # -- a RotationSlot referencing this Category -- so .distinct()
+        # collapses a Rotation that uses the Category in multiple slots
+        # down to one entry, matching Rotation's own default `name`
+        # ordering (Rotation.Meta.ordering) for a stable list.
+        data["used_by_rotations"] = [
+            {"id": r.id, "name": r.name}
+            for r in Rotation.objects.filter(slots__category=category).distinct()
+        ]
+        return JsonResponse(data)
 
     if request.method == "DELETE":
         try:
