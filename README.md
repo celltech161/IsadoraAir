@@ -424,6 +424,30 @@ also live outside the repo at `~/syndicated-ingest/` (own venv,
 separate from this project's), with credentials in
 `~/.syndicated_ingest.cred`.
 
+## Running tests
+
+```bash
+PYTHONUNBUFFERED=1 python manage.py test
+```
+
+Always set `PYTHONUNBUFFERED=1` (equivalently, `python -u manage.py test`)
+when a run's output is being redirected to a file or piped rather than
+watched live in a terminal. Without it, Python fully buffers `stdout`
+once it isn't attached to a terminal, while `unittest`'s own progress
+dots and final `Ran N tests` / `OK` summary go to `stderr`, which
+flushes immediately. Application code throughout this project uses
+plain `print()` for operational logging, exercised extensively by the
+test suite — with stdout buffered, all of that output queues up and
+gets dumped in one block only when the process exits, landing *after*
+the already-flushed summary in the captured log. On a large run, piping
+through `tail -N` can then miss the summary entirely, making a fully
+healthy, passing run look like a silent hang or crash with no
+traceback. `PYTHONUNBUFFERED=1` keeps everything in true chronological
+order instead.
+
+Run a subset the normal Django way, e.g. `python manage.py test
+webrequests` or `python manage.py test webrequests.tests.test_dedication_intros`.
+
 ## Migrating from NextKast, Rivendell, or another automation system
 
 Some things worth knowing if you're coming from an existing station
