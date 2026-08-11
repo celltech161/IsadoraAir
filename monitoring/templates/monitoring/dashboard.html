@@ -32,6 +32,14 @@
     grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
     gap: 0.55rem;
   }
+  /* Services cards are short on content (LED + uptime + restart button)
+     -- narrower than the shared 210px default so a typical desktop
+     width fits all of them (7 as of this row's addition) on one line
+     instead of wrapping to a second row. Other groups' cards (bars,
+     readings, RBDS text boxes) keep the wider default. */
+  .mon-group-services .mon-cards {
+    grid-template-columns: repeat(auto-fill, minmax(175px, 1fr));
+  }
   .mon-card {
     background: var(--panel-bg);
     border: 1px solid var(--border-subtle);
@@ -168,6 +176,22 @@
     gap: 0.35rem;
     margin-top: 0.5rem;
   }
+  /* Collapsed by default (see expandedCoreCards in the JS below) --
+     per-core/per-sensor detail is what was making the CPU Usage/CPU
+     Temperature cards tall enough to stretch the whole System row. */
+  .mon-cores-grid.mon-cores-hidden { display: none; }
+  .mon-expand-btn {
+    font-size: 0.7rem;
+    font-weight: 600;
+    padding: 0.15rem 0.5rem;
+    border-radius: 4px;
+    border: 1px solid var(--border-subtle);
+    background: transparent;
+    color: var(--text-muted);
+    cursor: pointer;
+    margin-top: 0.4rem;
+  }
+  .mon-expand-btn:hover { border-color: var(--text-main); color: var(--text-main); }
   .mon-core-label {
     font-size: 0.68rem;
     color: var(--text-muted);
@@ -437,6 +461,27 @@ const KIND_GROUPS = [
   { label: "Audio", kinds: ["audio_silence", "encoder_group"] },
 ];
 
+// renderGroups() wipes and rebuilds #monGroups from scratch every poll
+// (every 5s) -- a plain DOM class toggle for "cores expanded" would get
+// reset on the very next poll. Persisting expanded check ids here, and
+// consulting the set when re-rendering, is what makes the toggle
+// survive a refresh instead of silently snapping shut a few seconds
+// after you open it.
+const expandedCoreCards = new Set();
+
+function toggleCores(btn, checkId) {
+  const grid = btn.nextElementSibling;
+  if (!grid || !grid.classList.contains("mon-cores-grid")) return;
+  const nowHidden = grid.classList.toggle("mon-cores-hidden");
+  if (nowHidden) {
+    expandedCoreCards.delete(checkId);
+    btn.textContent = "Show cores";
+  } else {
+    expandedCoreCards.add(checkId);
+    btn.textContent = "Hide cores";
+  }
+}
+
 function formatSince(since) {
   if (!since) return "";
   const seconds = Math.max(0, Date.now() / 1000 - since);
@@ -520,7 +565,11 @@ function renderCpuBody(check) {
   const perCpu = (check.detail && check.detail.per_cpu) || [];
   let html = overall != null ? barRow("Overall", overall, check.status) : "";
   if (perCpu.length) {
-    html += '<div class="mon-cores-grid">';
+    // Collapsed by default -- only the Overall bar above counts toward
+    // the System row's card height unless the operator asks for more.
+    const expanded = expandedCoreCards.has(check.id);
+    html += `<button class="mon-expand-btn" onclick="toggleCores(this, ${check.id})">${expanded ? "Hide cores" : "Show cores"}</button>`;
+    html += `<div class="mon-cores-grid${expanded ? "" : " mon-cores-hidden"}">`;
     perCpu.forEach((coreValue, i) => {
       // Per-core bars use the same overall check's thresholds -- there's
       // no separate per-core admin config, and it's the same kind of reading.
@@ -547,7 +596,10 @@ function renderTemperatureBody(check) {
   `;
   const perCore = (check.detail && check.detail.per_core) || [];
   if (perCore.length) {
-    html += '<div class="mon-cores-grid">';
+    // Collapsed by default, same rationale/mechanism as renderCpuBody.
+    const expanded = expandedCoreCards.has(check.id);
+    html += `<button class="mon-expand-btn" onclick="toggleCores(this, ${check.id})">${expanded ? "Hide sensors" : "Show sensors"}</button>`;
+    html += `<div class="mon-cores-grid${expanded ? "" : " mon-cores-hidden"}">`;
     perCore.forEach(core => {
       // Same treatment as CPU Usage's per-core bars: scaled against the
       // sensor's own reported critical point (not a fixed 100 like a
@@ -764,7 +816,7 @@ function renderGroups(checks) {
       .sort((a, b) => a.sort_order - b.sort_order);
     if (!items.length) return;
     const section = document.createElement("div");
-    section.className = "mon-group";
+    section.className = `mon-group mon-group-${group.label.toLowerCase()}`;
     section.innerHTML = `<h2>${group.label}</h2><div class="mon-cards"></div>`;
     const cardsEl = section.querySelector(".mon-cards");
     items.forEach(check => {
