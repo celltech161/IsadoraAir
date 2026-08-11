@@ -102,7 +102,18 @@ def _run_predispatch_preflight():
         slug = _slug(input_device)
         host_aircheck = input_device == DEFAULT_INPUT_DEVICE
         script = build_liquidsoap_script(input_device, encoders, host_aircheck=host_aircheck, generation="admin-predispatch-check")
-        candidate_path = lkg_module.write_candidate(slug, script)
+        try:
+            candidate_path = lkg_module.write_candidate(slug, script)
+        except OSError as exc:
+            # Phase 2 review-fix pass 2, Issue 3: a filesystem failure
+            # here (ENOSPC, EACCES, ...) must become an ordinary
+            # rejection -- no restart dispatched, current stream
+            # untouched, admin error displayed -- never an exception
+            # escaping the request (this runs inside transaction.
+            # on_commit(), with nothing above it to catch a stray
+            # exception before it reaches the response cycle).
+            failures.append((input_device, f"failed to write candidate script: {exc}"))
+            continue
         try:
             result = preflight_module.run_preflight(candidate_path, encoders)
         finally:

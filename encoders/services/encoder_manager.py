@@ -47,7 +47,6 @@ import time
 import uuid
 from collections import defaultdict
 from pathlib import Path
-from types import SimpleNamespace
 
 import django
 django.setup()
@@ -244,44 +243,6 @@ def _substitute_generation(script_text, new_generation):
         )
     return _GENERATION_LINE_PATTERN.sub(f'generation = {_liq_string(new_generation)}', script_text, count=1)
 
-
-def _lkg_destinations_to_expected(lkg_meta):
-    """Reconstructs lightweight, health-check-only stand-ins for the
-    LKG's own destinations from its non-secret metadata sidecar (see
-    _promote_candidate's "destinations" field) -- used exclusively by
-    EncoderManager._start_rollback to tell evaluate_encoder_group_
-    health what to actually check during rollback qualification.
-
-    Deliberately NEVER re-fetched from the live DB by encoder_id: the
-    DB may hold exactly the rejected desired configuration a rollback
-    is recovering FROM (SID 1 -> SID 5 edited in place on the SAME
-    row, for example) -- re-fetching by ID would silently return the
-    REJECTED values again, reproducing the exact bug this function
-    exists to close. Only the LKG's own frozen snapshot, captured at
-    the moment it was actually proven healthy, is trustworthy here.
-
-    Returns a list of SimpleNamespace(id, name, host, port,
-    shoutcast_sid) -- exactly the attributes evaluate_encoder_group_
-    health's Shoutcast-destination check reads off each "encoder" (see
-    monitoring/services/probes.py). Returns [] if lkg_meta is falsy or
-    predates this field (an LKG promoted before this fix existed) --
-    evaluate_encoder_group_health treats an empty encoders list as
-    status "unknown" (see its own docstring), never a false "ok", so a
-    rollback whose destinations can't be reconstructed simply never
-    qualifies rather than being silently checked against the wrong
-    SIDs; it eventually hits the qualification deadline and is treated
-    as an ordinary rollback failure -- conservative by construction,
-    not a crash or a silent false-positive."""
-    if not lkg_meta:
-        return []
-    destinations = lkg_meta.get("destinations") or []
-    return [
-        SimpleNamespace(
-            id=d.get("encoder_id"), name=d.get("name"),
-            host=d.get("host"), port=d.get("port"), shoutcast_sid=d.get("shoutcast_sid"),
-        )
-        for d in destinations
-    ]
 
 
 def _slug(device):
@@ -1212,24 +1173,37 @@ class EncoderManager:
         launch path that could drift from this one. `encoders` is
         still required even when overriding -- used for the log line
         and as the state-tracking record of what SHOULD be running,
-        exactly as it always has been."""
+        exactly as it always has been.
+
+        Every filesystem write in this method (Phase 2 review-fix
+        pass 2, Issue 3) is contained -- a disk/permission failure here
+        must become an ordinary launch failure (False return, same
+        retry/backoff/event machinery as a Popen() failure always
+        used), never an exception escaping to the supervisor loop."""
+        meta = self._group_meta(input_device)
+
         # file.watch() in the generated script throws an uncaught runtime
         # error if this file doesn't exist yet at the moment Liquidsoap
         # calls it -- guarantee it exists (placeholder is fine) before the
         # script is ever launched, not just on first-ever manager start.
-        if not Path(NOW_PLAYING_PATH).is_file():
-            # timestamp as a string, not a float -- see engine.py's
-            # _write_now_playing() for why (metadata.json.parse() requires
-            # a uniformly string-valued object).
-            Path(NOW_PLAYING_PATH).write_text(
-                json.dumps({"title": "", "artist": "", "timestamp": str(time.time())}),
-                encoding="utf-8",
-            )
+        try:
+            if not Path(NOW_PLAYING_PATH).is_file():
+                # timestamp as a string, not a float -- see engine.py's
+                # _write_now_playing() for why (metadata.json.parse() requires
+                # a uniformly string-valued object).
+                Path(NOW_PLAYING_PATH).write_text(
+                    json.dumps({"title": "", "artist": "", "timestamp": str(time.time())}),
+                    encoding="utf-8",
+                )
+        except OSError as exc:
+            return self._record_launch_failure(input_device, meta, exc, "failed to initialize now-playing placeholder")
 
-        meta = self._group_meta(input_device)
         generation = uuid.uuid4().hex[:12]
         if script_override is not None:
-            script = _substitute_generation(script_override, generation)
+            try:
+                script = _substitute_generation(script_override, generation)
+            except ValueError as exc:
+                return self._record_launch_failure(input_device, meta, exc, "failed to prepare rollback script")
         else:
             # Attach the aircheck output.file + telnet server only to the
             # main-air group (the one whose input_device matches
@@ -1239,7 +1213,10 @@ class EncoderManager:
             host_aircheck = input_device == DEFAULT_INPUT_DEVICE
             script = build_liquidsoap_script(input_device, encoders, host_aircheck=host_aircheck, generation=generation)
         script_path = SCRIPT_DIR / f"encoders_{_slug(input_device)}.liq"
-        script_path.write_text(script, encoding="utf-8")
+        try:
+            script_path.write_text(script, encoding="utf-8")
+        except OSError as exc:
+            return self._record_launch_failure(input_device, meta, exc, "failed to write encoder script")
 
         launched_at = time.time()
 
@@ -1276,28 +1253,7 @@ class EncoderManager:
         try:
             proc = subprocess.Popen(["liquidsoap", str(script_path)])
         except Exception as exc:
-            meta["consecutive_failures"] += 1
-            meta["last_failure_message"] = f"Popen failed: {exc}"
-            meta["last_exit_at"] = launched_at
-            meta["last_exit_code"] = None
-            self._current.pop(input_device, None)
-            self._log(input_device, f"Failed to start: {exc} (failure #{meta['consecutive_failures']} in a row)", force=True)
-            emit_event(
-                category="encoder", level="error",
-                title=f"Encoder group '{input_device}' failed to launch",
-                detail={"input_device": input_device, "error": str(exc), "consecutive_failures": meta["consecutive_failures"]},
-                dedupe_key=f"encoder|launch-failed|{input_device}",
-            )
-            self._write_group_state(input_device)
-            # No child was ever spawned -- the "starting" placeholder
-            # written moments ago (still pid=null) is now actively
-            # misleading (it implies a launch is in flight when it has
-            # already failed). Flip it to "dead" rather than leaving
-            # "starting" to linger until the NEXT retry's own pre-spawn
-            # write eventually overwrites it, possibly minutes from now
-            # under backoff.
-            self._mark_audio_state_dead(input_device)
-            return False
+            return self._record_launch_failure(input_device, meta, exc, "Popen failed")
 
         # Popen() succeeded -- record the real pid now that we have it.
         # CONDITIONAL, not a blind overwrite: only fill in the pid if
@@ -1328,6 +1284,53 @@ class EncoderManager:
         self._log(input_device, f"Started (Liquidsoap pid={proc.pid}, generation={generation}) -> {names}", force=True)
         return True
 
+    def _record_launch_failure(self, input_device, meta, exc, context):
+        """Shared failure bookkeeping for every way _start_group can
+        fail to produce a live child -- Popen() itself, or (Phase 2
+        review-fix pass 2, Issue 3) an earlier filesystem write (the
+        now-playing placeholder, the encoder script itself) or a
+        malformed rollback script. Same event/counter/state-file
+        machinery every time, so a filesystem failure is reported and
+        retried exactly like every other launch failure already was --
+        never a special, less-safe path. Always returns False, so call
+        sites can `return self._record_launch_failure(...)` directly."""
+        meta["consecutive_failures"] += 1
+        meta["last_failure_message"] = f"{context}: {exc}"
+        meta["last_exit_at"] = time.time()
+        meta["last_exit_code"] = None
+        self._current.pop(input_device, None)
+        self._log(input_device, f"Failed to start: {context}: {exc} (failure #{meta['consecutive_failures']} in a row)", force=True)
+        emit_event(
+            category="encoder", level="error",
+            title=f"Encoder group '{input_device}' failed to launch",
+            detail={"input_device": input_device, "error": str(exc), "consecutive_failures": meta["consecutive_failures"]},
+            dedupe_key=f"encoder|launch-failed|{input_device}",
+        )
+        self._write_group_state(input_device)
+        # No child was ever spawned -- any "starting" placeholder
+        # written moments ago (still pid=null) is now actively
+        # misleading (it implies a launch is in flight when it has
+        # already failed). Flip it to "dead" rather than leaving
+        # "starting" to linger until the NEXT retry's own pre-spawn
+        # write eventually overwrites it, possibly minutes from now
+        # under backoff.
+        self._mark_audio_state_dead(input_device)
+        return False
+
+    def _unlink_script_best_effort(self, input_device, script_path):
+        """Best-effort removal of a no-longer-live child's script file
+        -- shared by _handle_exit and _on_qualification_failed. Never
+        raises (Phase 2 review-fix pass 2, Issue 3): a failure to
+        delete a stale script file is, at worst, a small filesystem
+        leak, never a reason to let an exception escape the supervisor
+        mid-cleanup."""
+        if not script_path:
+            return
+        try:
+            script_path.unlink(missing_ok=True)
+        except OSError as exc:
+            self._log(input_device, f"Failed to remove stale script file {script_path}: {exc}")
+
     def _handle_exit(self, input_device, returncode):
         # Captured BEFORE any state is cleared below -- decides which
         # branch this exit takes (Phase 2J: a crash during candidate/
@@ -1338,8 +1341,7 @@ class EncoderManager:
 
         self._procs.pop(input_device, None)
         script_path = self._scripts.pop(input_device, None)
-        if script_path:
-            script_path.unlink(missing_ok=True)
+        self._unlink_script_best_effort(input_device, script_path)
         self._stabilized.pop(input_device, None)
         self._clear_qualification_tracking(input_device)
 
@@ -1480,7 +1482,24 @@ class EncoderManager:
         close_old_connections()
         slug = _slug(input_device)
         desired_fp = lkg_module.compute_fingerprint(input_device, encoders)
-        lkg_script, lkg_meta = lkg_module.read_lkg(slug)
+        try:
+            lkg_script, lkg_meta = lkg_module.read_lkg(slug)
+        except OSError as exc:
+            # Phase 2 review-fix pass 2, Issue 3: never let a
+            # filesystem failure escape and crash the supervisor.
+            # Degrades to "treat as if no LKG exists" -- worse
+            # (a needless full candidate re-validation instead of the
+            # fast path) but never unsafe: the full candidate pipeline
+            # below still validates/preflights/qualifies before
+            # anything is trusted.
+            self._log(input_device, f"Failed to read last-known-good state ({exc}) -- treating as bootstrap.", force=True)
+            emit_event(
+                category="encoder", level="error",
+                title=f"Encoder group '{input_device}' failed to read last-known-good state",
+                detail={"input_device": input_device, "error": str(exc)},
+                dedupe_key=f"encoder|lkg-read-failed|{input_device}",
+            )
+            lkg_script, lkg_meta = None, None
         lkg_fp = (lkg_meta or {}).get("fingerprint")
         rejected = self._rejected_fingerprints.get(input_device, set())
 
@@ -1510,7 +1529,15 @@ class EncoderManager:
 
         host_aircheck = input_device == DEFAULT_INPUT_DEVICE
         candidate_script = build_liquidsoap_script(input_device, encoders, host_aircheck=host_aircheck, generation="preflight-check")
-        candidate_path = lkg_module.write_candidate(slug, candidate_script)
+        try:
+            candidate_path = lkg_module.write_candidate(slug, candidate_script)
+        except OSError as exc:
+            # Same failure class as an ordinary preflight rejection --
+            # the candidate could not even be rendered to disk to be
+            # checked. Never let this propagate and crash the
+            # supervisor (Phase 2 review-fix pass 2, Issue 3).
+            self._reject_prelaunch_candidate(input_device, encoders, desired_fp, "preflight", f"failed to write candidate script: {exc}")
+            return self._fallback_after_rejected_prelaunch_candidate(input_device, encoders, lkg_script)
         try:
             result = preflight_module.run_preflight(candidate_path, encoders)
         finally:
@@ -1618,12 +1645,14 @@ class EncoderManager:
         LKG exists at all, there is structurally nothing to roll back
         to (Phase 2L bootstrap case); falls through to the existing
         bounded retry/backoff, reported critical, with no invented
-        rollback target.
+        rollback target. A filesystem failure while reading the LKG
+        (Phase 2 review-fix pass 2, Issue 3) is treated identically --
+        there is equally nothing safe to relaunch either way.
 
         `encoders` here is the REJECTED CANDIDATE's own list (passed
         through from _reject_live_candidate) -- used ONLY as a log-line
         fallback below if the LKG's own metadata predates
-        _lkg_destinations_to_expected (see that function). It must
+        lkg.destinations_from_lkg_meta (see that function). It must
         NEVER be used to decide what the rollback's OWN health
         qualification checks -- see _qualify_expected's docstring in
         __init__ for why (post-review fix: an earlier draft did exactly
@@ -1633,13 +1662,22 @@ class EncoderManager:
         from . import lkg as lkg_module
 
         slug = _slug(input_device)
-        lkg_script, lkg_meta = lkg_module.read_lkg(slug)
+        try:
+            lkg_script, lkg_meta = lkg_module.read_lkg(slug)
+        except OSError as exc:
+            self._log(input_device, f"Failed to read last-known-good state for rollback: {exc}", force=True)
+            lkg_script, lkg_meta = None, None
+            lkg_problem = f"last-known-good state could not be read: {exc}"
+        else:
+            lkg_problem = lkg_module.describe_lkg_problem(slug) if lkg_script is None else ""
+
         if lkg_script is None:
-            self._log(input_device, "Candidate rejected and no last-known-good exists to roll back to.", force=True)
+            reason = lkg_problem or "no last-known-good configuration exists to roll back to"
+            self._log(input_device, f"Candidate rejected and {reason}.", force=True)
             emit_event(
                 category="encoder", level="critical",
-                title=f"Encoder group '{input_device}' has no last-known-good configuration",
-                detail={"input_device": input_device, "reason": candidate_failure_reason},
+                title=f"Encoder group '{input_device}' has no usable last-known-good configuration",
+                detail={"input_device": input_device, "reason": candidate_failure_reason, "lkg_problem": reason},
                 dedupe_key=f"encoder|no-lkg-for-rollback|{input_device}",
             )
             self._launch_kind[input_device] = "accepted"
@@ -1648,11 +1686,11 @@ class EncoderManager:
 
         # The LKG's OWN destination identity, reconstructed from its
         # frozen metadata -- NEVER re-derived from the current DB (see
-        # _lkg_destinations_to_expected's own docstring for why). This
+        # lkg.destinations_from_lkg_meta's own docstring for why). This
         # is what qualification must check, and (falling back to the
         # candidate's names only for a legacy/metadata-less LKG, purely
         # cosmetic) what the launch log line describes as running.
-        lkg_expected = _lkg_destinations_to_expected(lkg_meta)
+        lkg_expected = lkg_module.destinations_from_lkg_meta(lkg_meta)
 
         emit_event(
             category="encoder", level="warning",
@@ -1724,7 +1762,24 @@ class EncoderManager:
         active script path, unchanged since this generation launched)
         rather than re-rendering, so the LKG is guaranteed to be
         byte-identical to what was actually proven, not a fresh
-        render that could theoretically differ."""
+        render that could theoretically differ.
+
+        Phase 2 review-fix pass 2, Issue 3: writing the LKG can fail
+        (ENOSPC, EACCES, EROFS, a genuine I/O error, ...). The
+        candidate at this point is proven-healthy, running, and
+        carrying real audio -- a persistence failure must NEVER stop
+        it, and must NEVER be allowed to propagate out of this method
+        (the caller is _check_candidate_qualification, itself called
+        from the supervisor's own main loop with nothing above it to
+        catch an escaping exception -- see encoder_manager.py's own
+        module docstring addendum). On failure: the candidate is left
+        exactly as it is (launch_kind stays "candidate", qualification
+        tracking is deliberately NOT cleared) -- which means the very
+        next health tick, seeing the SAME already-elapsed qualified
+        duration, retries this exact promotion automatically, with no
+        new state machinery needed. The OLD LKG (if any) is completely
+        untouched, and the candidate is explicitly NOT considered
+        durably accepted until a promotion actually succeeds."""
         from . import lkg as lkg_module
 
         slug = _slug(input_device)
@@ -1747,20 +1802,40 @@ class EncoderManager:
             "qualification_duration_seconds": CANDIDATE_QUALIFICATION_SECONDS,
             # Frozen destination identity (host/port/SID) for THIS
             # proven-healthy set -- consumed by
-            # _lkg_destinations_to_expected at a future rollback, so
-            # that rollback's own qualification checks what was
-            # ACTUALLY relaunched rather than whatever the DB currently
-            # holds (which may, by then, be a rejected edit of these
-            # very rows). shoutcast_sid uses the lenient property (same
-            # one evaluate_encoder_group_health itself reads), computed
-            # once now from rows just proven to work rather than
-            # recomputed later from rows that might not be.
+            # lkg.destinations_from_lkg_meta at a future rollback (or
+            # by the ordinary dashboard probe, via lkg.resolve_
+            # expected_destinations), so that health-checking always
+            # asks about what was ACTUALLY relaunched rather than
+            # whatever the DB currently holds (which may, by then, be
+            # a rejected edit of these very rows). shoutcast_sid uses
+            # the lenient property (same one evaluate_encoder_group_
+            # health itself reads), computed once now from rows just
+            # proven to work rather than recomputed later from rows
+            # that might not be.
             "destinations": [
                 {"encoder_id": e.id, "name": e.name, "host": e.host, "port": e.port, "shoutcast_sid": e.shoutcast_sid}
                 for e in encoders
             ],
         }
-        lkg_module.write_lkg(slug, script_text, meta)
+        try:
+            lkg_module.write_lkg(slug, script_text, meta)
+        except OSError as exc:
+            # NOT force=True: this can legitimately retry every health
+            # tick if persistence stays broken -- _log's own 30s
+            # identical-message throttle keeps the journal sane; emit_
+            # event's existing dedupe_key coalescing does the same for
+            # the dashboard-facing record. Deliberately does NOT touch
+            # launch_kind/qualification tracking/rejected_fingerprints/
+            # critical_stopped -- the candidate stays exactly as it was,
+            # already healthy, simply not yet durably accepted.
+            self._log(input_device, f"Candidate qualified but last-known-good persistence FAILED ({exc}) -- leaving candidate running, will retry.")
+            emit_event(
+                category="encoder", level="critical",
+                title=f"Encoder group '{input_device}' qualified but could not persist last-known-good",
+                detail={"input_device": input_device, "fingerprint": fingerprint, "error": str(exc)},
+                dedupe_key=f"encoder|promotion-persist-failed|{input_device}",
+            )
+            return
         self._rejected_fingerprints.pop(input_device, None)
         self._critical_stopped.pop(input_device, None)
         self._launch_kind[input_device] = "accepted"
@@ -1786,15 +1861,26 @@ class EncoderManager:
         routes exactly like a crash during probation would."""
         proc = self._procs.get(input_device)
         if proc is not None:
-            proc.terminate()
             try:
+                proc.terminate()
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                proc.kill()
+                try:
+                    proc.kill()
+                except (ProcessLookupError, OSError) as exc:
+                    self._log(input_device, f"Process already gone while killing candidate/rollback child: {exc}")
+            except (ProcessLookupError, OSError) as exc:
+                # A narrow, real race: the child could have already
+                # exited (and been reaped, e.g. by _check_health's own
+                # poll() loop) between being read into `proc` above and
+                # this terminate() call. Nothing left to signal --
+                # continue with cleanup exactly as if termination
+                # succeeded (Phase 2 review-fix pass 2, Issue 3: never
+                # let this escape and crash the supervisor).
+                self._log(input_device, f"Process already gone while terminating candidate/rollback child: {exc}")
         self._procs.pop(input_device, None)
         script_path = self._scripts.pop(input_device, None)
-        if script_path:
-            script_path.unlink(missing_ok=True)
+        self._unlink_script_best_effort(input_device, script_path)
         self._stabilized.pop(input_device, None)
         self._current.pop(input_device, None)
         self._mark_audio_state_dead(input_device)
@@ -1870,6 +1956,33 @@ class EncoderManager:
         else:
             self._on_rollback_succeeded(input_device, detail)
 
+    def _guarded(self, input_device, context, fn):
+        """Defense-in-depth safety net (Phase 2 review-fix pass 2,
+        Issue 3): runs `fn()`, catching and logging/reporting ANY
+        exception rather than letting it propagate out of
+        _check_health(). Every specific, expected failure mode this
+        pass identified already has its own precise, contained handling
+        deeper in the call stack (see _launch_group, _start_group,
+        _promote_candidate, _start_rollback, _on_qualification_failed);
+        this is the outer backstop for whatever wasn't anticipated --
+        _check_health's own main loop has NOTHING above it catching
+        exceptions (EncoderManager.start()'s `while self.running: ...`
+        has no try/except, and neither does run_encoders.py's own
+        handle()), so an escape here would take down the entire
+        supervisor and everything it's currently running. One group's
+        unexpected failure must never prevent this same tick from
+        still checking every OTHER group."""
+        try:
+            fn()
+        except Exception as exc:
+            self._log(input_device, f"Unexpected error during {context}: {exc}", force=True)
+            emit_event(
+                category="encoder", level="critical",
+                title=f"Encoder group '{input_device}' unexpected error during {context}",
+                detail={"input_device": input_device, "context": context, "error": repr(exc)},
+                dedupe_key=f"encoder|unexpected-error|{input_device}|{context}",
+            )
+
     def _check_health(self):
         now_mono = time.monotonic()
 
@@ -1878,7 +1991,7 @@ class EncoderManager:
         # others (Phase 7 req #4/#12).
         for input_device, proc in list(self._procs.items()):
             if proc.poll() is not None:
-                self._handle_exit(input_device, proc.returncode)
+                self._guarded(input_device, "exit handling", lambda d=input_device, rc=proc.returncode: self._handle_exit(d, rc))
 
         # Retries whose backoff has elapsed -- re-read the current DB
         # state rather than reusing the encoder list from whenever this
@@ -1887,39 +2000,19 @@ class EncoderManager:
             if now_mono < at:
                 continue
             del self._retry_at[input_device]
-            close_old_connections()
-            groups = _group_by_input_device(Encoder.objects.filter(enabled=True))
-            encoders = groups.get(input_device)
-            if not encoders:
-                # Phase 7 req #10/#11: a group with no enabled encoders
-                # left must not be resurrected -- and its retry/backoff
-                # bookkeeping is dropped entirely, not just skipped this
-                # once, so a LATER re-enable starts the backoff schedule
-                # fresh rather than resuming mid-escalation from a retry
-                # sequence that's since become meaningless.
-                self._log(input_device, "No enabled encoders left for this device, not restarting.", force=True)
-                self._retry_index.pop(input_device, None)
-                self._meta.pop(input_device, None)
-                try:
-                    _group_state_path(input_device).unlink(missing_ok=True)
-                except OSError:
-                    pass
-                continue
-            self._log(input_device, "Retrying...", force=True)
-            if not self._launch_group(input_device, encoders):
-                self._schedule_retry(input_device)
+            self._guarded(input_device, "retry", lambda d=input_device: self._retry_group(d))
 
         # Stabilization check for every currently-running child (Phase 1
         # backoff-reset -- unchanged, audio-only, applies regardless of
         # launch_kind).
         for input_device in list(self._procs.keys()):
-            self._check_stabilization(input_device)
+            self._guarded(input_device, "stabilization check", lambda d=input_device: self._check_stabilization(d))
 
         # Candidate qualification check (Phase 2H/2I) -- only meaningful
         # for a group currently on probation ("candidate" or "rollback");
         # a no-op read for an "accepted" group.
         for input_device in list(self._procs.keys()):
-            self._check_candidate_qualification(input_device)
+            self._guarded(input_device, "candidate qualification check", lambda d=input_device: self._check_candidate_qualification(d))
 
         # Heartbeat: refresh every currently-tracked group's state file
         # on every tick, not just when something changed -- this file's
@@ -1927,6 +2020,35 @@ class EncoderManager:
         # itself alive and still supervising this group" signal
         # monitoring relies on (Phase 8 req #4). A long, uneventful
         # healthy run must not let it go stale just because nothing
-        # happened.
+        # happened. (_write_group_state already contains its own
+        # exceptions internally; _guarded here is pure defense in depth.)
         for input_device in list(self._procs.keys()):
-            self._write_group_state(input_device)
+            self._guarded(input_device, "state heartbeat", lambda d=input_device: self._write_group_state(d))
+
+    def _retry_group(self, input_device):
+        """One retry-loop iteration's worth of work, extracted from
+        _check_health so _guarded (above) can wrap it as a single unit
+        -- re-reads current DB state fresh (in case rows changed since
+        this group last started) rather than reusing whatever encoder
+        list was true at an earlier launch."""
+        close_old_connections()
+        groups = _group_by_input_device(Encoder.objects.filter(enabled=True))
+        encoders = groups.get(input_device)
+        if not encoders:
+            # Phase 7 req #10/#11: a group with no enabled encoders
+            # left must not be resurrected -- and its retry/backoff
+            # bookkeeping is dropped entirely, not just skipped this
+            # once, so a LATER re-enable starts the backoff schedule
+            # fresh rather than resuming mid-escalation from a retry
+            # sequence that's since become meaningless.
+            self._log(input_device, "No enabled encoders left for this device, not restarting.", force=True)
+            self._retry_index.pop(input_device, None)
+            self._meta.pop(input_device, None)
+            try:
+                _group_state_path(input_device).unlink(missing_ok=True)
+            except OSError:
+                pass
+            return
+        self._log(input_device, "Retrying...", force=True)
+        if not self._launch_group(input_device, encoders):
+            self._schedule_retry(input_device)

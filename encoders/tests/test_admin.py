@@ -630,6 +630,21 @@ class PredispatchPreflightUnitTests(GroupStatusFixtureMixin, TestCase):
         self.assertTrue(ok)
         self.assertEqual(failures, [])
 
+    def test_candidate_write_failure_is_reported_not_raised(self):
+        """Phase 2 review-fix pass 2, Issue 3: a filesystem failure
+        while writing the candidate script (ENOSPC, EACCES, ...) must
+        become an ordinary rejection -- restart not dispatched, current
+        stream untouched, admin error displayed -- never an exception
+        escaping this function (it runs inside transaction.on_commit(),
+        with nothing above it to catch a stray exception before it
+        reaches the response cycle)."""
+        make_encoder(input_device="airtap", enabled=True)
+        with patch.object(lkg_module, "write_candidate", side_effect=OSError(28, "No space left on device")):
+            ok, failures = encoders_admin._run_predispatch_preflight()  # must not raise
+        self.assertFalse(ok)
+        self.assertEqual(len(failures), 1)
+        self.assertIn("failed to write candidate script", failures[0][1])
+
     def test_valid_group_passes_with_mocked_preflight(self):
         make_encoder(input_device="airtap", enabled=True)
         with patch.object(preflight_module, "run_preflight", return_value=preflight_module.PreflightResult(ok=True)):
@@ -713,6 +728,18 @@ class PredispatchPreflightHttpTests(GroupStatusFixtureMixin, TransactionTestCase
             with patch.object(encoders_admin, "dispatch_encoder_restart", return_value=True) as mock_dispatch:
                 self.client.post(reverse("admin:encoders_encoder_add"), encoder_post_data(name="fine"), follow=True)
         mock_dispatch.assert_called_once()
+
+    def test_candidate_write_failure_shows_error_no_restart_no_exception(self):
+        """Phase 2 review-fix pass 2, Issue 3, at the full HTTP level:
+        a filesystem failure writing the candidate script must not
+        dispatch a restart, must not raise (500), and must show the
+        operator a clear error -- exactly like an ordinary validation/
+        preflight rejection."""
+        with patch.object(lkg_module, "write_candidate", side_effect=OSError(28, "No space left on device")):
+            with patch.object(encoders_admin, "dispatch_encoder_restart", return_value=True) as mock_dispatch:
+                response = self.client.post(reverse("admin:encoders_encoder_add"), encoder_post_data(name="fine"), follow=True)
+        mock_dispatch.assert_not_called()
+        self.assertContains(response, "failed pre-restart checks")
 
     def test_rejected_predispatch_does_not_touch_currently_running_process(self):
         """The whole point of this fix: no restart command is ever

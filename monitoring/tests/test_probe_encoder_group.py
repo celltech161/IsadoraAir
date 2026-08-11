@@ -15,6 +15,7 @@ from django.test import TestCase
 
 import encoders.services.encoder_manager as em
 from encoders.models import Encoder
+from encoders.services import lkg as lkg_module
 from monitoring.models import MonitorCheck
 from monitoring.services import probes
 
@@ -490,3 +491,131 @@ class RestartStaleStateRegressionTests(ProbeEncoderGroupFixtureMixin, TestCase):
         untouched = json.loads(em._group_state_path_for_slug("plughw_3_1").read_text())
         self.assertEqual(untouched["generation"], "OTHER-GEN")
         self.assertEqual(untouched["pid"], 77)
+
+
+# ---------------------------------------------------------------------
+# Phase 2 review-fix pass 2, Issue 1: after a rollback (or any time the
+# DB's desired configuration has drifted from what's actually accepted/
+# running), the ordinary dashboard probe must check the LKG's own
+# frozen destinations, never the DB's rejected/not-yet-applied ones.
+# ---------------------------------------------------------------------
+class PostRollbackDestinationResolutionTests(ProbeEncoderGroupFixtureMixin, TestCase):
+    def setUp(self):
+        super().setUp()
+        lkg_tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(lkg_tmpdir.cleanup)
+        base = Path(lkg_tmpdir.name)
+        for patcher in (
+            patch.object(lkg_module, "CANDIDATE_DIR", base / "candidate"),
+            patch.object(lkg_module, "LKG_DIR", base / "lkg"),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _write_lkg_sid1(self, host="10.0.0.5", port=8000):
+        lkg_module.write_lkg("airtap", 'generation = "lkg-gen"\n', {
+            "fingerprint": "lkg-fp",
+            "destinations": [{"encoder_id": 1, "name": "lkg-enc", "host": host, "port": port, "shoutcast_sid": "1"}],
+        })
+
+    def test_a_rollback_group_checks_lkg_sid_not_rejected_db_sid(self):
+        """Test A from the review: LKG SID 1, DB desired SID 5, SID 1
+        up, SID 5 down. EXPECTED: healthy, and the destination checked
+        is SID 1, not SID 5."""
+        make_encoder(name="desired-bad", mount="/5")  # the rejected DB row
+        self._write_lkg_sid1()
+        self.write_group_state(launch_kind="accepted")
+        self.write_audio_state(since=self.now - em.STABILIZATION_SECONDS - 5)
+
+        status, detail = self.run_probe(shoutcast_stats={"1": {"up": True, "listeners": 2}, "5": {"up": False, "listeners": 0}})
+
+        self.assertEqual(status, "ok")
+        self.assertEqual([d["sid"] for d in detail["destinations"]], ["1"])
+
+    def test_b_rollback_group_does_not_false_green_off_the_rejected_sid(self):
+        """Test B from the review: LKG SID 1 down, DB desired SID 5
+        (rejected) up. EXPECTED: critical -- must NOT report healthy
+        just because the rejected SID happens to be reachable; it is
+        not what's actually running."""
+        make_encoder(name="desired-bad", mount="/5")
+        self._write_lkg_sid1()
+        self.write_group_state(launch_kind="accepted")
+        self.write_audio_state(since=self.now - em.STABILIZATION_SECONDS - 5)
+
+        status, detail = self.run_probe(shoutcast_stats={"1": {"up": False, "listeners": 0}, "5": {"up": True, "listeners": 9}})
+
+        self.assertEqual(status, "critical")
+        self.assertEqual([d["sid"] for d in detail["destinations"]], ["1"])
+
+    def test_rollback_launch_kind_also_checks_lkg_not_db(self):
+        """launch_kind="rollback" (still mid-requalification, not yet
+        settled back to "accepted") must resolve the same way."""
+        make_encoder(name="desired-bad", mount="/5")
+        self._write_lkg_sid1()
+        self.write_group_state(launch_kind="rollback")
+        self.write_audio_state(since=self.now - em.STABILIZATION_SECONDS - 5)
+
+        status, detail = self.run_probe(shoutcast_stats={"1": {"up": True, "listeners": 2}})
+
+        self.assertEqual(status, "ok")
+        self.assertEqual([d["sid"] for d in detail["destinations"]], ["1"])
+
+    def test_candidate_launch_kind_checks_db_rows_directly(self):
+        """The complementary case: while a group is actively proving a
+        NEW candidate (launch_kind="candidate"), the DB's desired rows
+        ARE what's running -- the probe must check THOSE, not a stale
+        LKG left over from a previous, different configuration."""
+        make_encoder(name="new-candidate", mount="/9")
+        self._write_lkg_sid1()  # a DIFFERENT, still-valid old LKG
+        self.write_group_state(launch_kind="candidate")
+        self.write_audio_state(since=self.now - em.STABILIZATION_SECONDS - 5)
+
+        status, detail = self.run_probe(shoutcast_stats={"9": {"up": True, "listeners": 1}})
+
+        self.assertEqual(status, "ok")
+        self.assertEqual([d["sid"] for d in detail["destinations"]], ["9"])
+
+    def test_host_port_change_scenario(self):
+        """Host/port variant of Test A/B, per the review's explicit
+        ask -- a server migration, not just a SID edit."""
+        make_encoder(name="desired-bad", host="10.0.0.99", port=9000, mount="/1")
+        self._write_lkg_sid1(host="10.0.0.5", port=8000)
+        self.write_group_state(launch_kind="accepted")
+        self.write_audio_state(since=self.now - em.STABILIZATION_SECONDS - 5)
+
+        def fake_fetch(host, port, timeout=3.0):
+            if (host, port) == ("10.0.0.5", 8000):
+                return {"1": {"up": True, "listeners": 4}}
+            return {}  # the rejected/abandoned server -- must never be consulted
+
+        with patch.object(probes, "probe_systemd", return_value=("ok", {})), \
+             patch("monitoring.services.shoutcast.fetch_shoutcast_stats", side_effect=fake_fetch):
+            status, detail = probes.probe_encoder_group(self.check)
+
+        self.assertEqual(status, "ok")
+
+    def test_no_lkg_bootstrap_still_checks_db_rows(self):
+        """No LKG exists at all (fresh install / never promoted) --
+        must fall back to the DB's own desired rows, matching this
+        group's pre-Phase-2 (and pre-first-promotion) behavior."""
+        make_encoder(name="only-config", mount="/3")
+        self.write_group_state(launch_kind="accepted")
+        self.write_audio_state(since=self.now - em.STABILIZATION_SECONDS - 5)
+
+        status, detail = self.run_probe(shoutcast_stats={"3": {"up": True, "listeners": 1}})
+
+        self.assertEqual(status, "ok")
+        self.assertEqual([d["sid"] for d in detail["destinations"]], ["3"])
+
+    def test_missing_group_state_file_falls_back_to_db_rows_via_accepted_default(self):
+        """No group-state file at all -- _read_group_launch_kind
+        defaults to "accepted", and with no LKG either, resolve_
+        expected_destinations' own bootstrap fallback applies. (A
+        missing group-state file is ALSO independently caught earlier,
+        by evaluate_encoder_group_health's own "no group-state file
+        yet" critical check -- this test only confirms the destination-
+        resolution step itself doesn't error out before reaching that.)"""
+        make_encoder(name="only-config", mount="/3")
+        status, detail = self.run_probe(shoutcast_stats={"3": {"up": True, "listeners": 1}})
+        self.assertEqual(status, "critical")
+        self.assertIn("no group-state file", detail["reason"])

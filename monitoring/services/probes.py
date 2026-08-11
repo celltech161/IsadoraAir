@@ -308,8 +308,32 @@ def probe_encoder_group(check):
     grouping logic the manager itself uses, so this can never disagree
     with what the manager actually launched) and delegates. See
     evaluate_encoder_group_health's own docstring for the actual
-    aggregate-health logic and why it's factored out separately."""
+    aggregate-health logic and why it's factored out separately.
+
+    Phase 2 review-fix pass 2, Issue 1: the destinations actually
+    passed to evaluate_encoder_group_health are NOT simply the DB's
+    desired `encoders` rows -- they're resolved through encoders.
+    services.lkg.resolve_expected_destinations, which asks "what is
+    this group's manager process ACTUALLY running right now" (via the
+    on-disk launch_kind, the only channel available -- this probe runs
+    in a separate process from the encoder manager, no shared memory).
+    Without this, a group running its last-known-good configuration
+    after a rollback (desired DB config != accepted/running LKG, the
+    normal state whenever an operator's edit was rejected) would have
+    this probe check the DB's rejected destinations instead of what's
+    actually on air -- silently reporting false-green if the rejected
+    SID happens to be down while the real one is healthy, or worse,
+    false-green against a stream that isn't even the one running if
+    the rejected SID happens to be up.
+
+    The `if not encoders:` short-circuit deliberately happens BEFORE
+    any LKG substitution -- an empty DESIRED configuration is a
+    distinct signal ("this group doesn't exist / was fully disabled"),
+    preserved exactly as evaluate_encoder_group_health's own first-line
+    behavior already handled it; LKG substitution only ever applies
+    once there's a genuine group to disambiguate."""
     from encoders.models import Encoder
+    from encoders.services import lkg as lkg_module
     from encoders.services.encoder_manager import _effective_input_device, _slug
 
     slug = check.encoder_group_slug
@@ -317,7 +341,34 @@ def probe_encoder_group(check):
         e for e in Encoder.objects.filter(enabled=True)
         if _slug(_effective_input_device(e)) == slug
     ]
-    return evaluate_encoder_group_health(slug, encoders, check.encoder_group_systemd_unit)
+    if not encoders:
+        return evaluate_encoder_group_health(slug, encoders, check.encoder_group_systemd_unit)
+    launch_kind = _read_group_launch_kind(slug)
+    expected = lkg_module.resolve_expected_destinations(slug, encoders, launch_kind)
+    return evaluate_encoder_group_health(slug, expected, check.encoder_group_systemd_unit)
+
+
+def _read_group_launch_kind(slug):
+    """Best-effort read of the manager-owned group-state file's
+    launch_kind field -- see encoder_manager.py's EncoderManager.
+    _write_group_state and encoders/admin.py's _describe_group_status
+    (the same pattern, same reasoning: this probe runs in a separate
+    process from the encoder manager, so on-disk state is the only
+    channel). Defaults to "accepted" for a missing/corrupt/legacy file
+    -- matches encoders/services/lkg.py's own resolve_expected_
+    destinations default, and is the safe default either way (prefers
+    the LKG's own destinations over the DB's whenever an LKG exists)."""
+    import json
+
+    from encoders.services.encoder_manager import _group_state_path_for_slug
+
+    path = _group_state_path_for_slug(slug)
+    if not path.is_file():
+        return "accepted"
+    try:
+        return json.loads(path.read_text(encoding="utf-8")).get("launch_kind", "accepted")
+    except (OSError, ValueError):
+        return "accepted"
 
 
 def evaluate_encoder_group_health(slug, encoders, systemd_unit):

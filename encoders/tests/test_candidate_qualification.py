@@ -744,3 +744,167 @@ class RealPreflightIntegrationTests(TransactionTestCase):
         bad = make_encoder(protocol="shoutcast1", format="vorbis")
         errors = validation.validate_full_configuration([bad])
         self.assertTrue(errors)
+
+
+# ---------------------------------------------------------------------
+# Phase 2 review-fix pass 2, Issue 3: a filesystem failure anywhere in
+# the candidate/LKG persistence path must never escape and crash
+# EncoderManager -- confirmed as a real, live risk during review: the
+# supervisor's own main loop (EncoderManager.start()'s `while self.
+# running: ...`) and run_encoders.py's handle() both have NOTHING
+# above them catching an escaping exception, so an unhandled OSError
+# from e.g. _promote_candidate's write_lkg() call would take down the
+# entire process -- orphaning whatever Liquidsoap children were
+# healthy and running at the time (never cleanly stopped, since
+# self.stop() sits after the crashed while loop and never runs).
+# ---------------------------------------------------------------------
+class FilesystemFailureContainmentTests(CandidateFixtureMixin, TransactionTestCase):
+    def test_promotion_persist_failure_leaves_candidate_running_not_accepted(self):
+        """The core Issue 3 scenario: candidate is proven-healthy and
+        running, but write_lkg() fails. The candidate must NOT be
+        killed, must NOT be marked accepted, and the manager must not
+        crash."""
+        manager = em.EncoderManager()
+        with patch.object(preflight_module, "run_preflight", return_value=preflight_module.PreflightResult(ok=True)):
+            manager._launch_group("airtap", [make_encoder(name="healthy-candidate")])
+        self.assertEqual(manager._launch_kind["airtap"], "candidate")
+        pid_before = manager._current["airtap"]["pid"]
+
+        with patch.object(lkg_module, "write_lkg", side_effect=OSError(28, "No space left on device")):
+            self.qualify_ok(manager, "airtap")  # must not raise
+
+        # Candidate is untouched: still running, same pid, not promoted.
+        self.assertEqual(manager._launch_kind["airtap"], "candidate")
+        self.assertEqual(manager._current["airtap"]["pid"], pid_before)
+        self.assertFalse(lkg_module.lkg_exists(em._slug("airtap")))
+
+    def test_promotion_persist_failure_does_not_touch_old_lkg(self):
+        manager = em.EncoderManager()
+        old_script = em.build_liquidsoap_script("airtap", [make_encoder(name="old-lkg")], generation="old-gen")
+        lkg_module.write_lkg(em._slug("airtap"), old_script, {"fingerprint": "old-fp"})
+
+        with patch.object(preflight_module, "run_preflight", return_value=preflight_module.PreflightResult(ok=True)):
+            manager._launch_group("airtap", [make_encoder(name="new-candidate", mount="/9")])
+
+        with patch.object(lkg_module, "write_lkg", side_effect=OSError("simulated disk failure")):
+            self.qualify_ok(manager, "airtap")
+
+        script, meta = lkg_module.read_lkg(em._slug("airtap"))
+        self.assertEqual(meta["fingerprint"], "old-fp")  # completely unchanged
+
+    def test_promotion_retries_automatically_on_next_tick_after_transient_failure(self):
+        """Qualification tracking is deliberately NOT cleared on a
+        persist failure -- the very next health tick, seeing the same
+        already-sustained health, retries the promotion with no new
+        state machinery. Once the transient failure clears, promotion
+        succeeds without a fresh candidate launch."""
+        manager = em.EncoderManager()
+        with patch.object(preflight_module, "run_preflight", return_value=preflight_module.PreflightResult(ok=True)):
+            manager._launch_group("airtap", [make_encoder(name="healthy-candidate")])
+
+        with patch.object(lkg_module, "write_lkg", side_effect=OSError("simulated transient failure")):
+            self.qualify_ok(manager, "airtap")
+        self.assertFalse(lkg_module.lkg_exists(em._slug("airtap")))
+        self.assertEqual(manager._launch_kind["airtap"], "candidate")  # still armed
+
+        # Failure clears -- next qualification tick (real write_lkg, no
+        # patch) succeeds without relaunching anything.
+        pid_before = manager._current["airtap"]["pid"]
+        with patch("monitoring.services.probes.evaluate_encoder_group_health", return_value=("ok", {})):
+            manager._check_candidate_qualification("airtap")
+        self.assertTrue(lkg_module.lkg_exists(em._slug("airtap")))
+        self.assertEqual(manager._launch_kind["airtap"], "accepted")
+        self.assertEqual(manager._current["airtap"]["pid"], pid_before)  # never relaunched
+
+    def test_promotion_persist_failure_emits_critical_event_not_silence(self):
+        manager = em.EncoderManager()
+        with patch.object(preflight_module, "run_preflight", return_value=preflight_module.PreflightResult(ok=True)):
+            manager._launch_group("airtap", [make_encoder(name="healthy-candidate")])
+
+        with patch.object(lkg_module, "write_lkg", side_effect=OSError("simulated disk failure")):
+            with patch("encoders.services.encoder_manager.emit_event") as mock_emit:
+                self.qualify_ok(manager, "airtap")
+
+        titles = [call.kwargs.get("title", "") for call in mock_emit.call_args_list]
+        self.assertTrue(any("could not persist" in t for t in titles))
+
+    def test_launch_group_read_lkg_failure_degrades_to_bootstrap_not_crash(self):
+        manager = em.EncoderManager()
+        with patch.object(lkg_module, "read_lkg", side_effect=OSError("simulated read failure")):
+            with patch.object(preflight_module, "run_preflight", return_value=preflight_module.PreflightResult(ok=True)):
+                ok = manager._launch_group("airtap", [make_encoder(name="new-config")])
+        self.assertTrue(ok)  # degrades to the full candidate pipeline, still launches
+        self.assertEqual(manager._launch_kind["airtap"], "candidate")
+
+    def test_launch_group_write_candidate_failure_falls_back_to_lkg(self):
+        manager = em.EncoderManager()
+        old_script = em.build_liquidsoap_script("airtap", [make_encoder(name="old-lkg")], generation="old-gen")
+        lkg_module.write_lkg(em._slug("airtap"), old_script, {"fingerprint": "old-fp"})
+
+        with patch.object(lkg_module, "write_candidate", side_effect=OSError("simulated disk failure")):
+            ok = manager._launch_group("airtap", [make_encoder(name="new-candidate", mount="/9")])
+
+        self.assertTrue(ok)  # still launches SOMETHING -- the LKG
+        self.assertEqual(manager._launch_kind["airtap"], "accepted")
+
+    def test_launch_group_write_candidate_failure_no_lkg_returns_false_not_crash(self):
+        manager = em.EncoderManager()
+        with patch.object(lkg_module, "write_candidate", side_effect=OSError("simulated disk failure")):
+            ok = manager._launch_group("airtap", [make_encoder(name="new-config")])
+        self.assertFalse(ok)  # nothing safe to launch -- caller's own retry/backoff continues
+
+    def test_admin_style_candidate_write_failure_never_crashes_pipeline(self):
+        """Mirrors what encoders/admin.py's own _run_predispatch_
+        preflight must do with the same failure -- covered directly
+        there in test_admin.py; this confirms the manager's OWN
+        candidate pipeline degrades the identical way for the same
+        underlying failure."""
+        manager = em.EncoderManager()
+        with patch.object(lkg_module, "write_candidate", side_effect=PermissionError("simulated EACCES")):
+            ok = manager._launch_group("airtap", [make_encoder(name="new-config")])
+        self.assertFalse(ok)
+        fp = lkg_module.compute_fingerprint("airtap", [make_encoder(name="new-config")])
+        self.assertIn(fp, manager._rejected_fingerprints.get("airtap", set()))
+
+    def test_start_group_script_write_failure_returns_false_not_raise(self):
+        manager = em.EncoderManager()
+        with patch.object(em, "SCRIPT_DIR", Path("/nonexistent-directory-for-test/sub")):
+            ok = manager._start_group("airtap", [make_encoder()])
+        self.assertFalse(ok)
+        self.assertNotIn("airtap", manager._current)
+
+    def test_check_health_one_groups_exception_does_not_block_another_groups_heartbeat(self):
+        """The outer _guarded defense-in-depth backstop: an unexpected
+        exception raised while processing ONE group's qualification
+        check must not prevent a DIFFERENT, healthy group's state
+        heartbeat from still being written in the SAME _check_health()
+        tick."""
+        manager = em.EncoderManager()
+        manager._start_group("airtap", [make_encoder(name="a")])
+        manager._start_group("plughw:3,1", [make_encoder(name="b", input_device="plughw:3,1")])
+        manager._launch_kind["airtap"] = "candidate"  # so _check_candidate_qualification does real work for it
+        manager._qualify_generation["airtap"] = manager._current["airtap"]["generation"]
+        manager._qualify_expected["airtap"] = [make_encoder(name="a")]
+        manager._qualify_deadline["airtap"] = None
+
+        with patch("monitoring.services.probes.evaluate_encoder_group_health", side_effect=RuntimeError("boom")):
+            manager._check_health()  # must not raise
+
+        # The OTHER group's heartbeat still ran this same tick.
+        other_state = self.read_group_state("plughw_3_1")
+        self.assertIsNotNone(other_state["pid"])
+
+    def test_check_health_guarded_exception_emits_event_not_silence(self):
+        manager = em.EncoderManager()
+        manager._start_group("airtap", [make_encoder(name="a")])
+        manager._launch_kind["airtap"] = "candidate"
+        manager._qualify_generation["airtap"] = manager._current["airtap"]["generation"]
+        manager._qualify_expected["airtap"] = [make_encoder(name="a")]
+        manager._qualify_deadline["airtap"] = None
+
+        with patch("monitoring.services.probes.evaluate_encoder_group_health", side_effect=RuntimeError("boom")):
+            with patch("encoders.services.encoder_manager.emit_event") as mock_emit:
+                manager._check_health()
+
+        titles = [call.kwargs.get("title", "") for call in mock_emit.call_args_list]
+        self.assertTrue(any("unexpected error" in t for t in titles))
