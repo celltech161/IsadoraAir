@@ -1,0 +1,100 @@
+{% extends "admin/base_site.html" %}
+{% load i18n %}
+
+{# SMTP transport settings, stored in .env (not the database) --
+   see isadoraair/env_config.py and monitoring/admin.py's
+   NotificationConfigAdmin.smtp_env_view. Deliberately a standalone
+   page/form, not nested inside NotificationConfig's own changeform --
+   Django admin's own change_form.html wraps everything in a single
+   <form>, and a second, separately-actioned <form> can't validly nest
+   inside it. #}
+
+{% block breadcrumbs %}
+<div class="breadcrumbs">
+<a href="{% url 'admin:index' %}">{% translate 'Home' %}</a>
+&rsaquo; <a href="{% url 'admin:app_list' app_label=opts.app_label %}">{{ opts.app_config.verbose_name }}</a>
+&rsaquo; <a href="{{ change_url }}">{{ opts.verbose_name }}</a>
+&rsaquo; SMTP settings
+</div>
+{% endblock %}
+
+{% block content %}
+<div id="content-main">
+
+<p>
+  These six values are stored in <code>.env</code>, not this database record --
+  saving here does not touch Notification Config's own recipients/cooldown
+  fields, and saving those does not touch these. Editable, allowlisted keys
+  only: this is not a general environment-file editor.
+</p>
+
+{% if env_error %}
+  <p class="errornote">{{ env_error }}</p>
+  <p>Fix the .env file directly on the server, then reload this page.</p>
+{% else %}
+
+  {% if restart_required %}
+    <p class="errornote" style="background:#fff3cd;border-color:#ffe69c;color:#664d03;">
+      Saved configuration differs from the currently running configuration.
+      Restart required for these changes to take effect. {{ services_note }}
+    </p>
+  {% else %}
+    <p style="color:#2e7d32;">Running configuration matches saved configuration.</p>
+  {% endif %}
+
+  <form method="post">
+    {% csrf_token %}
+    <fieldset class="module aligned">
+      {% for field in fields %}
+        <div class="form-row">
+          <div>
+            <label for="id_{{ field.name }}">{{ field.label }}:</label>
+            {% if field.key == "EMAIL_USE_TLS" %}
+              <input type="checkbox" id="id_{{ field.name }}" name="{{ field.name }}" {% if field.checked %}checked{% endif %}>
+            {% elif field.key == "EMAIL_PORT" %}
+              <input type="text" id="id_{{ field.name }}" name="{{ field.name }}" value="{{ field.value }}" size="10">
+            {% else %}
+              <input type="text" id="id_{{ field.name }}" name="{{ field.name }}" value="{{ field.value }}" size="50">
+            {% endif %}
+            {% if not field.matches %}
+              <span style="color:#b45309;font-size:0.85em;"> (saved value differs from running)</span>
+            {% endif %}
+          </div>
+        </div>
+      {% endfor %}
+
+      <div class="form-row">
+        <div>
+          <label for="id_email_host_password">SMTP password:</label>
+          <input type="password" id="id_email_host_password" name="email_host_password" value="" size="50"
+                 autocomplete="new-password">
+          <span style="color:#888;font-size:0.85em;">
+            Currently {% if password_configured %}configured{% else %}not configured{% endif %}.
+            {% if not password_matches %}Saved value differs from running.{% endif %}
+            Leave blank to keep the current password unchanged.
+          </span>
+        </div>
+      </div>
+      <div class="form-row">
+        <div>
+          <label for="id_clear_email_host_password">
+            <input type="checkbox" id="id_clear_email_host_password" name="clear_email_host_password">
+            Clear stored SMTP password
+          </label>
+          <span style="color:#888;font-size:0.85em;">
+            Only way to intentionally remove a saved password -- leaving the field above
+            blank never clears it by accident.
+          </span>
+        </div>
+      </div>
+    </fieldset>
+
+    <div class="submit-row">
+      <input type="submit" value="Save SMTP settings" class="default">
+      <a href="{{ change_url }}" class="button cancel-link">Back to Notification Config</a>
+    </div>
+  </form>
+{% endif %}
+
+</div>
+{% endblock %}
