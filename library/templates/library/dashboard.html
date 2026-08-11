@@ -67,7 +67,28 @@
   .ops-btn:disabled { opacity: 0.4; cursor: not-allowed; }
   .ops-btn.pending { opacity: 0.6; }
   .ops-btn.active { color: #000; }
-  .ops-btn:not(:disabled):hover { opacity: 0.9; }
+  /* Hover treatment unified with the deck transport buttons (see
+     .deck-transport-btn:hover:not(:disabled) below) -- same border/
+     accent-text swap instead of the old opacity-only fade, so the
+     button row and deck controls read as one consistent control
+     language. Scoped off .active/.error: those already carry their
+     own solid/colored border+text meaning (amber "holding manual",
+     red "live"/"error"), and swapping to accent green on hover would
+     mask that meaning -- they keep the previous opacity-only hover
+     instead, same as before this change. Overrides .playnow-btn:hover's
+     opacity fade back to 1 so this is a crisp border/text swap like the
+     deck buttons', not that fade plus a color change layered together.
+     Doesn't touch outline, so :focus-visible's default ring stays
+     exactly as visible on hover as off it. */
+  .ops-btn:not(:disabled):not(.active):not(.error):hover {
+    opacity: 1;
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  .ops-btn.active:hover,
+  .ops-btn.error:hover {
+    opacity: 0.9;
+  }
 
   #manualModeBtn.active { background: #d97706; border-color: #d97706; }
   #micPttBtn.active { background: var(--danger); border-color: var(--danger); }
