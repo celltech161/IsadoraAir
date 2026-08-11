@@ -130,6 +130,14 @@ class NotificationConfigAdmin(_SingletonAdmin):
 
     # -- SMTP environment sub-form (Phase 1) -----------------------------
     _SMTP_FIELD_KEYS = ["EMAIL_HOST", "EMAIL_PORT", "EMAIL_HOST_USER", "EMAIL_USE_TLS", "DEFAULT_FROM_EMAIL"]
+    # All six SMTP keys, including the secret one -- the explicit scope
+    # for this page's own saved-vs-running/duplicate-key checks. Must
+    # NOT be list(env_config.MANAGED_SETTINGS): now that Phase 2 has
+    # registered library/weather/reports keys in the same shared
+    # registry, that would incorrectly pull an unrelated key's mismatch
+    # (or a duplicate-definition error) into THIS page's restart banner,
+    # audit event, and error state.
+    _ALL_SMTP_KEYS = _SMTP_FIELD_KEYS + ["EMAIL_HOST_PASSWORD"]
 
     def smtp_env_view(self, request):
         """GET renders the sub-form pre-filled with the SAVED (on-disk)
@@ -186,7 +194,7 @@ class NotificationConfigAdmin(_SingletonAdmin):
             return
 
         try:
-            comparisons = env_config.compare_to_running(list(env_config.MANAGED_SETTINGS))
+            comparisons = env_config.compare_to_running(self._ALL_SMTP_KEYS)
             restart_required = any(not c.matches for c in comparisons.values())
         except env_config.EnvConfigError:
             restart_required = True  # unknown -- err toward the more visible warning
@@ -213,7 +221,7 @@ class NotificationConfigAdmin(_SingletonAdmin):
         )
 
     def _smtp_env_context(self, request, config):
-        keys = list(env_config.MANAGED_SETTINGS)
+        keys = self._ALL_SMTP_KEYS
         env_error = None
         saved = {}
         comparisons = {}

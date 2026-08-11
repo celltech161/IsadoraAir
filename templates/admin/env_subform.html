@@ -1,0 +1,99 @@
+{% extends "admin/base_site.html" %}
+{% load i18n %}
+
+{# Shared shell for a Phase 1/2 managed-.env-settings sub-page --
+   introduced in Phase 2 for library/weather/reports settings, reusing
+   the same standalone-page approach Phase 1 established for SMTP
+   (monitoring/admin.py keeps its own bespoke template -- not
+   retrofitted onto this one, to avoid regression risk on already-
+   shipped code). See isadoraair/env_admin.py for the context this
+   renders: `fields` (list of {key, name, label, value, matches,
+   services_note, preflight}), `env_error`, `restart_required`,
+   `notices` (list of {level, text} shown above the form),
+   `change_url`, `title`. #}
+
+{% block breadcrumbs %}
+<div class="breadcrumbs">
+<a href="{% url 'admin:index' %}">{% translate 'Home' %}</a>
+&rsaquo; <a href="{% url 'admin:app_list' app_label=opts.app_label %}">{{ opts.app_config.verbose_name }}</a>
+&rsaquo; <a href="{{ change_url }}">{{ opts.verbose_name }}</a>
+&rsaquo; {{ title }}
+</div>
+{% endblock %}
+
+{% block content %}
+<div id="content-main">
+
+<p>
+  These values are stored in <code>.env</code>, not this database record --
+  saving here does not touch this page's own database fields, and saving
+  those does not touch these. Editable, allowlisted keys only.
+</p>
+
+{% for notice in notices %}
+  {% if notice.level == "warning" %}
+    <p class="errornote" style="background:#fff3cd;border-color:#ffe69c;color:#664d03;">{{ notice.text }}</p>
+  {% else %}
+    <p style="border:1px solid var(--border-color, #ccc);border-radius:4px;padding:0.6em 0.9em;color:#888;font-size:0.9em;">{{ notice.text }}</p>
+  {% endif %}
+{% endfor %}
+
+{% if env_error %}
+  <p class="errornote">{{ env_error }}</p>
+  <p>Fix the .env file directly on the server, then reload this page.</p>
+{% else %}
+
+  {% if restart_required %}
+    <p class="errornote" style="background:#fff3cd;border-color:#ffe69c;color:#664d03;">
+      Saved configuration differs from the currently running configuration.
+      Restart required for these changes to take effect.
+    </p>
+  {% else %}
+    <p style="color:#2e7d32;">Running configuration matches saved configuration.</p>
+  {% endif %}
+
+  <form method="post">
+    {% csrf_token %}
+    <fieldset class="module aligned">
+      {% for field in fields %}
+        <div class="form-row">
+          <div>
+            <label for="id_{{ field.name }}">{{ field.label }}:</label>
+            <input type="text" id="id_{{ field.name }}" name="{{ field.name }}" value="{{ field.value }}" size="60">
+            {% if not field.matches %}
+              <span style="color:#b45309;font-size:0.85em;"> (saved value differs from running)</span>
+            {% endif %}
+            {% if field.services_note %}
+              <div style="color:#888;font-size:0.82em;margin-top:0.15em;">{{ field.services_note }}</div>
+            {% endif %}
+            {% if field.preflight %}
+              <div style="font-size:0.82em;margin-top:0.3em;">
+                {% if field.preflight.error %}
+                  <span style="color:var(--danger, #d32f2f);">{{ field.preflight.error }}</span>
+                {% elif not field.preflight.exists %}
+                  <span style="color:#b45309;">Does not exist yet{% if not field.preflight.parent_exists %} (parent directory doesn't exist either){% elif not field.preflight.parent_traversable %} (parent directory not traversable by this process){% endif %}.</span>
+                {% elif not field.preflight.is_directory %}
+                  <span style="color:var(--danger, #d32f2f);">Exists but is not a directory.</span>
+                {% else %}
+                  <span style="color:#888;">
+                    Exists.
+                    {% if field.preflight.readable %}Readable.{% else %}Not readable by this process.{% endif %}
+                    {% if field.preflight.writable %}Writable.{% else %}Not writable by this process.{% endif %}
+                  </span>
+                {% endif %}
+              </div>
+            {% endif %}
+          </div>
+        </div>
+      {% endfor %}
+    </fieldset>
+
+    <div class="submit-row">
+      <input type="submit" value="Save" class="default">
+      <a href="{{ change_url }}" class="button cancel-link">Back</a>
+    </div>
+  </form>
+{% endif %}
+
+</div>
+{% endblock %}

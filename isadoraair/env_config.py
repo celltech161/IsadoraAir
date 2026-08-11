@@ -237,6 +237,88 @@ def validate_allow_blank_text(key, value):
     _reject_control_chars(key, value)
 
 
+def validate_email_or_blank(key, value):
+    """Phase 2's MUSICBRAINZ_CONTACT: blank is explicitly allowed --
+    library/cd_ripping.py's own _configure_mb_client() already treats
+    an unset contact as legal (falls back to a placeholder address,
+    MusicBrainz just rate-limits anonymous callers harder) -- otherwise
+    validated the same way as validate_email_address."""
+    _reject_control_chars(key, value)
+    if not value.strip():
+        return
+    from django.core.exceptions import ValidationError as DjangoValidationError
+    from django.core.validators import validate_email as django_validate_email
+
+    try:
+        django_validate_email(value.strip())
+    except DjangoValidationError:
+        raise InvalidValueError(key, "must be blank or a valid email address") from None
+
+
+def validate_absolute_directory_path(key, value):
+    """Used for the four Phase 2 filesystem-root settings (LIBRARY_ROOT,
+    WAVEFORMS_DIR, WEATHER_DATA_DIR, REPORTS_ROOT). Hard-errors only on
+    genuinely unsafe/invalid states -- not absolute, control characters,
+    or a target that already exists but is a plain file (unambiguously
+    wrong for a setting that must be a directory). Deliberately does
+    NOT hard-fail on "doesn't exist yet" / "not readable or writable
+    right now" -- saving a path in advance of the directory actually
+    being prepared (or before a permissions fix) is a legitimate
+    workflow; see path_preflight() below for the non-blocking status
+    surfaced to the admin UI instead."""
+    _reject_control_chars(key, value)
+    if not value.strip():
+        raise InvalidValueError(key, "must not be blank")
+    if value != value.strip():
+        raise InvalidValueError(key, "must not have leading or trailing whitespace")
+    if not Path(value).is_absolute():
+        raise InvalidValueError(key, "must be an absolute path (starting with /)")
+    if Path(value).is_file():
+        raise InvalidValueError(key, "exists but is a regular file, not a directory")
+
+
+@dataclass(frozen=True)
+class PathPreflightStatus:
+    """Cheap, non-destructive, read-only filesystem inspection for a
+    directory setting -- no recursive scan, no directory creation, no
+    probe files written. Purely for admin-UI display (warnings), never
+    raises and never blocks a save on its own; policy (hard error vs
+    warning) is decided by the caller. `error` is set only for a
+    genuinely broken target (e.g. a plain file where a directory is
+    expected) -- the same condition validate_absolute_directory_path()
+    already hard-rejects at save time, surfaced here too so a
+    PRE-EXISTING bad value (already on disk before Phase 2 shipped)
+    still shows a clear status on the read side, not just on save."""
+    exists: bool
+    is_directory: bool
+    readable: bool
+    writable: bool
+    parent_exists: bool
+    parent_traversable: bool
+    error: str = ""
+
+
+def path_preflight(raw_path):
+    try:
+        p = Path(raw_path)
+    except (TypeError, ValueError):
+        return PathPreflightStatus(False, False, False, False, False, False, "not a valid path")
+    if not p.is_absolute():
+        return PathPreflightStatus(False, False, False, False, False, False, "not an absolute path")
+
+    exists = p.exists()
+    is_file = p.is_file() if exists else False
+    is_directory = p.is_dir() if exists else False
+    readable = os.access(p, os.R_OK) if exists else False
+    writable = os.access(p, os.W_OK) if exists else False
+    parent = p.parent
+    parent_exists = parent.exists()
+    parent_traversable = os.access(parent, os.X_OK) if parent_exists else False
+
+    error = "exists but is a regular file, not a directory" if is_file else ""
+    return PathPreflightStatus(exists, is_directory, readable, writable, parent_exists, parent_traversable, error)
+
+
 # ---------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------
@@ -250,6 +332,7 @@ class ManagedSetting:
     cast: Callable[[str], object] = str
     validate: Callable[[str, str], None] = field(default=lambda key, value: None)
     services_note: str = ""
+    is_path: bool = False
 
 
 MANAGED_SETTINGS: dict = {}
@@ -292,6 +375,81 @@ register_setting(ManagedSetting(
 register_setting(ManagedSetting(
     key="DEFAULT_FROM_EMAIL", label="Default From address", category="smtp", default="isadoraair@localhost",
     validate=validate_email_address, services_note=_GUNICORN_AND_MONITORING_NOTE,
+))
+
+# ---------------------------------------------------------------------
+# Phase 2 (2026-08-11): library/CD-ripping, weather, and reporting
+# filesystem/metadata settings. Consumers verified by direct source
+# inspection (grep + import-graph tracing), not assumed -- see each
+# services_note. Notably: none of these five are read by
+# isadoraair-monitoring, isadoraair-encoders, or isadoraair-rbds at
+# all (none import library.models/library.storage/webrequests.services
+# /weather.services/road_conditions.synthesis), so those three services
+# are never named below.
+# ---------------------------------------------------------------------
+register_setting(ManagedSetting(
+    key="MUSICBRAINZ_CONTACT", label="MusicBrainz contact email", category="library", default="",
+    validate=validate_email_or_blank,
+    services_note=(
+        "No persistent service reads this at all -- library/cd_ripping.py's "
+        "_configure_mb_client() (used by the detached cd_rip_run command each "
+        "CD-ripping admin fires) and the one-shot backfill_isrc_musicbrainz "
+        "command both read it fresh via django.conf.settings at the moment "
+        "they run. No restart needed for a saved change to take effect on "
+        "the next rip or backfill run."
+    ),
+))
+register_setting(ManagedSetting(
+    key="LIBRARY_ROOT", label="Library root", category="library",
+    default="/srv/isadoraair/music", validate=validate_absolute_directory_path, is_path=True,
+    services_note=(
+        "isadoraair-gunicorn (track upload/relocate in library/views.py) and "
+        "isadoraair-engine (webrequests/services.py's module-level "
+        "DEDICATION_ROOT, imported by the engine for dedication-intro "
+        "storage) both hold this in memory for their whole process "
+        "lifetime -- restart both to pick up a change. One-shot commands "
+        "(import_songs, check_categories, find_category_drift, "
+        "sync_track_file, cd_rip_run, generate_dedication_intros, "
+        "refresh_song_request_statuses, generate_road_condition_audio) read "
+        "it fresh each run and need no restart."
+    ),
+))
+register_setting(ManagedSetting(
+    key="WAVEFORMS_DIR", label="Waveforms directory", category="library",
+    default="/srv/isadoraair/waveforms", validate=validate_absolute_directory_path, is_path=True,
+    services_note=(
+        "isadoraair-gunicorn (the waveform API view) holds this in memory -- "
+        "restart to pick up a change. The one-shot analyze_tracks command "
+        "(isadoraair-analyze.timer) reads it fresh each run, and will "
+        "automatically create the directory and regenerate each track's "
+        "waveform file there the next time it runs -- no manual migration "
+        "needed, just a wait for the next analyze pass (or run it manually)."
+    ),
+))
+register_setting(ManagedSetting(
+    key="WEATHER_DATA_DIR", label="Weather data directory", category="weather",
+    default="/var/lib/isadoraair/weather", validate=validate_absolute_directory_path, is_path=True,
+    services_note=(
+        "isadoraair-gunicorn (the GW3000/Ecowitt ingest webhook and weather "
+        "views, via weather/services.py's module-level DATA_DIR) holds this "
+        "in memory -- restart to pick up a change. IMPORTANT: the separate "
+        "weather-ingest companion project (its own repo/venv, not part of "
+        "IsadoraAir) reads/writes the SAME directory independently and has "
+        "its OWN configuration -- saving a new path here does not change "
+        "where that external project looks. Update its configuration "
+        "separately (and move any files it owns) if the shared directory "
+        "moves."
+    ),
+))
+register_setting(ManagedSetting(
+    key="REPORTS_ROOT", label="Reports storage directory", category="reports",
+    default="/var/lib/isadoraair/reports", validate=validate_absolute_directory_path, is_path=True,
+    services_note=(
+        "isadoraair-gunicorn (royalty report generation and download views, "
+        "via library/storage.py's module-level royalty_report_storage) "
+        "holds this in memory -- restart to pick up a change. The one-shot "
+        "royalty_report --persist command reads it fresh each run."
+    ),
 ))
 
 

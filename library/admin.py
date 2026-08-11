@@ -9,9 +9,12 @@ from django.contrib.auth.models import User
 from django.db.models import Count
 from django.http import HttpResponseRedirect
 from django.template.loader import render_to_string
+from django.template.response import TemplateResponse
 from django.urls import path, reverse
 from django.utils.html import escape, format_html
 from django.utils.safestring import mark_safe
+
+from isadoraair import env_admin, env_config
 
 from .models import (
     Album,
@@ -751,7 +754,16 @@ class StationInfoAdmin(admin.ModelAdmin):
     reports. Empty is allowed (the NCE header row will just carry
     blanks), but you'll want to fill it in before submitting a real
     report. Editable without a restart -- next report generation
-    picks up the new values."""
+    picks up the new values.
+
+    reports_env_link/reports_env_view (Phase 2, 2026-08-11): Reports
+    storage directory (REPORTS_ROOT) is a separate, .env-backed setting
+    surfaced here as the closest existing "system/station config" home
+    -- this model already carries the licensor-facing metadata that
+    feeds into generated reports. Same separate-sub-page pattern as
+    CDRipConfigAdmin's library storage settings and monitoring/admin.py's
+    Phase 1 SMTP settings; not injected into this ModelAdmin's own
+    save_model()."""
     fieldsets = [
         (None, {
             "fields": ["legal_name", "call_letters", "stream_name"],
@@ -762,7 +774,13 @@ class StationInfoAdmin(admin.ModelAdmin):
                 "facing paperwork."
             ),
         }),
+        ("Reports storage", {
+            "fields": ["reports_env_link"],
+            "description": "Where generated royalty/SoundExchange report files are "
+                            "stored on disk -- stored in .env, not this database record.",
+        }),
     ]
+    readonly_fields = ["reports_env_link"]
 
     def has_add_permission(self, request):
         return not StationInfo.objects.exists()
@@ -778,9 +796,79 @@ class StationInfoAdmin(admin.ModelAdmin):
             reverse("admin:library_stationinfo_change", args=[obj.pk])
         )
 
+    def get_urls(self):
+        return [
+            path(
+                "reports-settings/",
+                self.admin_site.admin_view(self.reports_env_view),
+                name="library_stationinfo_reports_env",
+            ),
+            *super().get_urls(),
+        ]
+
+    @admin.display(description="Reports storage settings")
+    def reports_env_link(self, obj):
+        if obj is None or obj.pk is None:
+            return "(save the configuration first)"
+        url = reverse("admin:library_stationinfo_reports_env")
+        return format_html(
+            '<a class="button" href="{}">Edit reports storage settings</a> '
+            '<span style="color:#888;font-size:0.85em;">Where generated report files live on disk.</span>',
+            url,
+        )
+
+    def reports_env_view(self, request):
+        obj = StationInfo.load()
+        change_url = reverse("admin:library_stationinfo_change", args=[obj.pk])
+        if request.method == "POST":
+            self._handle_reports_env_post(request)
+            return HttpResponseRedirect(reverse("admin:library_stationinfo_reports_env"))
+
+        notices = []
+        if RoyaltyReport.objects.exists():
+            notices.append({
+                "level": "warning",
+                "text": (
+                    "Existing reports are found by database row, not by scanning the "
+                    "directory -- each report's file reference stays pointed at its "
+                    "ORIGINAL location on disk. Changing Reports storage directory does "
+                    "not move those files: previously generated reports will stop being "
+                    "downloadable through the Reports page until their files are moved to "
+                    "the new directory by hand. Reports generated after this change are "
+                    "written to the new location."
+                ),
+            })
+        context = env_admin.env_subform_context(
+            request, ["REPORTS_ROOT"],
+            title="Reports storage settings", change_url=change_url,
+            admin_site=self.admin_site, model=self.model,
+            extra={"notices": notices},
+        )
+        return TemplateResponse(request, "admin/env_subform.html", context)
+
+    def _handle_reports_env_post(self, request):
+        values = {"REPORTS_ROOT": request.POST.get("reports_root", "").strip()}
+        env_admin.handle_env_subform_post(
+            request, self.message_user, values,
+            audit_title="Reports environment configuration updated",
+            audit_category="library",
+            dedupe_key="library|reports-env-updated",
+            restart_check_keys=["REPORTS_ROOT"],
+        )
+
+
+_LIBRARY_ENV_KEYS = ["MUSICBRAINZ_CONTACT", "LIBRARY_ROOT", "WAVEFORMS_DIR"]
+
 
 @admin.register(CDRipConfig)
 class CDRipConfigAdmin(admin.ModelAdmin):
+    """library_env_link/library_env_view (Phase 2, 2026-08-11): MusicBrainz
+    contact, Library root, and Waveforms directory are stored in .env
+    (isadoraair/env_config.py), not on this model -- surfaced here via a
+    separate sub-page (isadoraair/env_admin.py's shared helper, same
+    pattern as monitoring/admin.py's Phase 1 SMTP sub-page) rather than
+    injected into this ModelAdmin's own save_model(), so a DB save and
+    an .env write are never conflated into one false-atomic operation."""
     fieldsets = [
         ("Drive", {
             "fields": ["device", "drive_read_offset"],
@@ -795,7 +883,13 @@ class CDRipConfigAdmin(admin.ModelAdmin):
         ("Rip pipeline", {
             "fields": ["staging_root", "require_accurate_rip"],
         }),
+        ("Library storage", {
+            "fields": ["library_env_link"],
+            "description": "MusicBrainz contact, Library root, and Waveforms "
+                            "directory -- stored in .env, not this database record.",
+        }),
     ]
+    readonly_fields = ["library_env_link"]
 
     def has_add_permission(self, request):
         return not CDRipConfig.objects.exists()
@@ -807,6 +901,74 @@ class CDRipConfigAdmin(admin.ModelAdmin):
         obj = CDRipConfig.load()
         return HttpResponseRedirect(
             reverse("admin:library_cdripconfig_change", args=[obj.pk])
+        )
+
+    def get_urls(self):
+        return [
+            path(
+                "library-settings/",
+                self.admin_site.admin_view(self.library_env_view),
+                name="library_cdripconfig_library_env",
+            ),
+            *super().get_urls(),
+        ]
+
+    @admin.display(description="Library storage settings")
+    def library_env_link(self, obj):
+        if obj is None or obj.pk is None:
+            return "(save the configuration first)"
+        url = reverse("admin:library_cdripconfig_library_env")
+        return format_html(
+            '<a class="button" href="{}">Edit library storage settings</a> '
+            '<span style="color:#888;font-size:0.85em;">'
+            "MusicBrainz contact, Library root, and Waveforms directory."
+            "</span>",
+            url,
+        )
+
+    def library_env_view(self, request):
+        obj = CDRipConfig.load()
+        change_url = reverse("admin:library_cdripconfig_change", args=[obj.pk])
+        if request.method == "POST":
+            self._handle_library_env_post(request)
+            return HttpResponseRedirect(reverse("admin:library_cdripconfig_library_env"))
+
+        notices = []
+        if Track.objects.exists():
+            notices.append({
+                "level": "warning",
+                "text": (
+                    "Track.filepath already stores each track's own full absolute path -- "
+                    "changing Library root does NOT move or break existing tracks' playback; "
+                    "each row still points at wherever its file already is. It DOES mean: "
+                    "newly imported or uploaded files land under the NEW root while existing "
+                    "files stay under the old one (a split library across two trees going "
+                    "forward), and library-maintenance tools that scan Library root "
+                    "(check_categories, find_category_drift, the CD-rip destination) will "
+                    "only see files under the NEW root -- everything still under the old root "
+                    "becomes invisible to those tools, even though it still plays fine."
+                ),
+            })
+        context = env_admin.env_subform_context(
+            request, _LIBRARY_ENV_KEYS,
+            title="Library storage settings", change_url=change_url,
+            admin_site=self.admin_site, model=self.model,
+            extra={"notices": notices},
+        )
+        return TemplateResponse(request, "admin/env_subform.html", context)
+
+    def _handle_library_env_post(self, request):
+        values = {
+            "MUSICBRAINZ_CONTACT": request.POST.get("musicbrainz_contact", "").strip(),
+            "LIBRARY_ROOT": request.POST.get("library_root", "").strip(),
+            "WAVEFORMS_DIR": request.POST.get("waveforms_dir", "").strip(),
+        }
+        env_admin.handle_env_subform_post(
+            request, self.message_user, values,
+            audit_title="Library environment configuration updated",
+            audit_category="library",
+            dedupe_key="library|env-updated",
+            restart_check_keys=_LIBRARY_ENV_KEYS,
         )
 
 

@@ -854,3 +854,246 @@ class ProductionInventoryRegressionTests(TempEnvMixin, TestCase):
         self.write_env(PRODUCTION_INVENTORY_FIXTURE)
         self.update_managed({"EMAIL_PORT": "465"})
         self.assertEqual(self.backup_path.read_text(encoding="utf-8"), PRODUCTION_INVENTORY_FIXTURE)
+
+
+# ---------------------------------------------------------------------
+# Phase 2 (2026-08-11): library/CD-ripping, weather, and reporting
+# filesystem/metadata settings -- registry, validators, path preflight.
+# ---------------------------------------------------------------------
+class Phase2RegistryTests(TestCase):
+    PHASE2_KEYS = ["MUSICBRAINZ_CONTACT", "LIBRARY_ROOT", "WAVEFORMS_DIR", "WEATHER_DATA_DIR", "REPORTS_ROOT"]
+
+    def test_all_five_phase2_keys_registered(self):
+        for key in self.PHASE2_KEYS:
+            self.assertIn(key, env_config.MANAGED_SETTINGS)
+
+    def test_four_path_keys_flagged_is_path(self):
+        for key in ["LIBRARY_ROOT", "WAVEFORMS_DIR", "WEATHER_DATA_DIR", "REPORTS_ROOT"]:
+            self.assertTrue(env_config.MANAGED_SETTINGS[key].is_path, key)
+
+    def test_musicbrainz_contact_not_flagged_is_path(self):
+        self.assertFalse(env_config.MANAGED_SETTINGS["MUSICBRAINZ_CONTACT"].is_path)
+
+    def test_none_of_the_five_are_secret(self):
+        for key in self.PHASE2_KEYS:
+            self.assertFalse(env_config.MANAGED_SETTINGS[key].secret, key)
+
+    def test_defaults_match_settings_py(self):
+        self.assertEqual(env_config.MANAGED_SETTINGS["MUSICBRAINZ_CONTACT"].default, "")
+        self.assertEqual(env_config.MANAGED_SETTINGS["LIBRARY_ROOT"].default, "/srv/isadoraair/music")
+        self.assertEqual(env_config.MANAGED_SETTINGS["WAVEFORMS_DIR"].default, "/srv/isadoraair/waveforms")
+        self.assertEqual(env_config.MANAGED_SETTINGS["WEATHER_DATA_DIR"].default, "/var/lib/isadoraair/weather")
+        self.assertEqual(env_config.MANAGED_SETTINGS["REPORTS_ROOT"].default, "/var/lib/isadoraair/reports")
+
+    def test_dangerous_bootstrap_keys_remain_unregistered(self):
+        dangerous = [
+            "DB_NAME", "DB_USER", "DB_PASSWORD", "DB_HOST", "DB_PORT",
+            "SECRET_KEY", "DEBUG", "ALLOWED_HOSTS", "CSRF_TRUSTED_ORIGINS",
+        ]
+        for key in dangerous:
+            self.assertNotIn(key, env_config.MANAGED_SETTINGS, key)
+
+    def test_dangerous_keys_cannot_be_read_through_this_module(self):
+        for key in ["DB_PASSWORD", "SECRET_KEY", "DEBUG", "ALLOWED_HOSTS"]:
+            with self.assertRaises(env_config.UnregisteredKeyError):
+                env_config.read_managed_values([key])
+
+    def test_dangerous_keys_cannot_be_written_through_this_module(self):
+        for key in ["DB_PASSWORD", "SECRET_KEY", "DEBUG", "ALLOWED_HOSTS", "CSRF_TRUSTED_ORIGINS"]:
+            with self.assertRaises(env_config.UnregisteredKeyError):
+                env_config.update_managed_values({key: "anything"})
+
+    def test_arbitrary_unknown_key_still_rejected(self):
+        """Not just the specific named dangerous keys -- the allowlist
+        is authoritative against ANY unregistered key, per Phase 1's
+        own guarantee, still true after Phase 2's additions."""
+        with self.assertRaises(env_config.UnregisteredKeyError):
+            env_config.update_managed_values({"SOME_RANDOM_UNREGISTERED_KEY": "x"})
+
+
+class MusicBrainzContactValidationTests(TempEnvMixin, TestCase):
+    def test_valid_email_accepted(self):
+        self.update_managed({"MUSICBRAINZ_CONTACT": "ops@example.com"})
+
+    def test_blank_accepted(self):
+        self.update_managed({"MUSICBRAINZ_CONTACT": ""})
+
+    def test_malformed_rejected(self):
+        with self.assertRaises(env_config.InvalidValueError):
+            self.update_managed({"MUSICBRAINZ_CONTACT": "not-an-email"})
+
+    def test_newline_rejected(self):
+        with self.assertRaises(env_config.InvalidValueError):
+            self.update_managed({"MUSICBRAINZ_CONTACT": "a@example.com\nEVIL=1"})
+
+    def test_nul_rejected(self):
+        with self.assertRaises(env_config.InvalidValueError):
+            self.update_managed({"MUSICBRAINZ_CONTACT": "a@example.com\x00"})
+
+    def test_saved_vs_running_mismatch_detected(self):
+        self.write_env("MUSICBRAINZ_CONTACT=disk@example.com\n")
+        with patch.object(env_config.django_settings, "MUSICBRAINZ_CONTACT", "running@example.com"):
+            results = env_config.compare_to_running(["MUSICBRAINZ_CONTACT"], env_path=self.env_path)
+        self.assertFalse(results["MUSICBRAINZ_CONTACT"].matches)
+
+
+class AbsoluteDirectoryPathValidationTests(TempEnvMixin, TestCase):
+    """validate_absolute_directory_path() directly -- shared by all four
+    Phase 2 path settings (LIBRARY_ROOT, WAVEFORMS_DIR, WEATHER_DATA_DIR,
+    REPORTS_ROOT), so exercised once here rather than once per key."""
+
+    def test_absolute_path_accepted(self):
+        env_config.validate_absolute_directory_path("LIBRARY_ROOT", "/srv/isadoraair/music")
+
+    def test_relative_path_rejected(self):
+        with self.assertRaises(env_config.InvalidValueError):
+            env_config.validate_absolute_directory_path("LIBRARY_ROOT", "srv/isadoraair/music")
+
+    def test_blank_rejected(self):
+        with self.assertRaises(env_config.InvalidValueError):
+            env_config.validate_absolute_directory_path("LIBRARY_ROOT", "")
+
+    def test_newline_rejected(self):
+        with self.assertRaises(env_config.InvalidValueError):
+            env_config.validate_absolute_directory_path("LIBRARY_ROOT", "/srv/music\n/etc")
+
+    def test_nul_rejected(self):
+        with self.assertRaises(env_config.InvalidValueError):
+            env_config.validate_absolute_directory_path("LIBRARY_ROOT", "/srv/music\x00")
+
+    def test_leading_trailing_whitespace_rejected(self):
+        with self.assertRaises(env_config.InvalidValueError):
+            env_config.validate_absolute_directory_path("LIBRARY_ROOT", "  /srv/isadoraair/music  ")
+
+    def test_target_exists_as_a_regular_file_is_a_hard_error(self):
+        f = self.tmp_path / "not_a_directory.txt"
+        f.write_text("x", encoding="utf-8")
+        with self.assertRaises(env_config.InvalidValueError) as ctx:
+            env_config.validate_absolute_directory_path("LIBRARY_ROOT", str(f))
+        self.assertIn("regular file", str(ctx.exception))
+
+    def test_nonexistent_target_is_not_a_hard_error(self):
+        """Per the "warnings vs hard errors" policy -- doesn't exist yet
+        is a legitimate forward-looking save, not a blocking condition."""
+        nonexistent = self.tmp_path / "does" / "not" / "exist" / "yet"
+        env_config.validate_absolute_directory_path("LIBRARY_ROOT", str(nonexistent))  # must not raise
+
+    def test_applies_uniformly_to_all_four_path_keys_via_update_managed_values(self):
+        for key, default in [
+            ("LIBRARY_ROOT", "/srv/isadoraair/music"),
+            ("WAVEFORMS_DIR", "/srv/isadoraair/waveforms"),
+            ("WEATHER_DATA_DIR", "/var/lib/isadoraair/weather"),
+            ("REPORTS_ROOT", "/var/lib/isadoraair/reports"),
+        ]:
+            with self.subTest(key=key):
+                with self.assertRaises(env_config.InvalidValueError):
+                    self.update_managed({key: "relative/path"})
+
+    def test_valid_absolute_path_round_trips_for_each_path_key(self):
+        for key in ["LIBRARY_ROOT", "WAVEFORMS_DIR", "WEATHER_DATA_DIR", "REPORTS_ROOT"]:
+            with self.subTest(key=key):
+                target = self.tmp_path / key.lower()
+                target.mkdir()
+                self.write_env(f"{key}=/old/value\n")
+                self.update_managed({key: str(target)})
+                self.assertIn(f"{key}={target}", self.read_env())
+
+
+class PathPreflightTests(TempEnvMixin, TestCase):
+    """env_config.path_preflight() -- cheap, non-destructive, read-only
+    filesystem inspection. Never raises, never creates anything, never
+    writes a probe file."""
+
+    def test_nonexistent_path(self):
+        target = self.tmp_path / "does-not-exist"
+        status = env_config.path_preflight(str(target))
+        self.assertFalse(status.exists)
+        self.assertFalse(status.is_directory)
+        self.assertEqual(status.error, "")
+
+    def test_nonexistent_path_with_nonexistent_parent(self):
+        target = self.tmp_path / "missing_parent" / "child"
+        status = env_config.path_preflight(str(target))
+        self.assertFalse(status.exists)
+        self.assertFalse(status.parent_exists)
+
+    def test_existing_readable_writable_directory(self):
+        target = self.tmp_path / "real_dir"
+        target.mkdir()
+        status = env_config.path_preflight(str(target))
+        self.assertTrue(status.exists)
+        self.assertTrue(status.is_directory)
+        self.assertTrue(status.readable)
+        self.assertTrue(status.writable)
+        self.assertEqual(status.error, "")
+
+    def test_target_is_a_regular_file_reports_error(self):
+        target = self.tmp_path / "a_file.txt"
+        target.write_text("x", encoding="utf-8")
+        status = env_config.path_preflight(str(target))
+        self.assertTrue(status.exists)
+        self.assertFalse(status.is_directory)
+        self.assertNotEqual(status.error, "")
+
+    def test_unwritable_directory_reports_not_writable(self):
+        target = self.tmp_path / "readonly_dir"
+        target.mkdir()
+        os.chmod(target, 0o500)
+        try:
+            status = env_config.path_preflight(str(target))
+            self.assertTrue(status.exists)
+            self.assertTrue(status.readable)
+            self.assertFalse(status.writable)
+        finally:
+            os.chmod(target, 0o700)
+
+    def test_relative_path_reports_not_a_valid_target(self):
+        status = env_config.path_preflight("relative/path")
+        self.assertFalse(status.exists)
+        self.assertNotEqual(status.error, "")
+
+    def test_never_creates_anything(self):
+        target = self.tmp_path / "should_stay_absent"
+        env_config.path_preflight(str(target))
+        self.assertFalse(target.exists())
+        # And no stray probe files left in the parent either.
+        self.assertEqual(list(self.tmp_path.iterdir()), [])
+
+
+class Phase2ProductionInventoryRegressionTests(TempEnvMixin, TestCase):
+    """Editing the five Phase 2 keys must preserve every unrelated line
+    (DB/SECRET_KEY/paths-not-being-changed/SMTP block) byte for byte --
+    the mirror image of ProductionInventoryRegressionTests' own SMTP-
+    focused coverage, using the same production-shaped fixture."""
+
+    def _non_phase2_lines(self, text):
+        phase2_keys = {"MUSICBRAINZ_CONTACT", "LIBRARY_ROOT", "WAVEFORMS_DIR", "WEATHER_DATA_DIR", "REPORTS_ROOT"}
+        out = []
+        for line in text.split("\n"):
+            stripped = line.strip()
+            key = stripped.split("=", 1)[0].strip() if "=" in stripped and not stripped.startswith("#") else None
+            if key is None or key not in phase2_keys:
+                out.append(line)
+        return out
+
+    def test_editing_all_five_phase2_keys_preserves_everything_else(self):
+        self.write_env(PRODUCTION_INVENTORY_FIXTURE)
+        before = self._non_phase2_lines(PRODUCTION_INVENTORY_FIXTURE)
+
+        with_new_dirs = {
+            "MUSICBRAINZ_CONTACT": "newcontact@example.com",
+            "LIBRARY_ROOT": "/srv/newmusic",
+            "WAVEFORMS_DIR": "/srv/newwaveforms",
+            "WEATHER_DATA_DIR": "/var/lib/newweather",
+            "REPORTS_ROOT": "/var/lib/newreports",
+        }
+        self.update_managed(with_new_dirs)
+
+        after = self.read_env()
+        self.assertEqual(before, self._non_phase2_lines(after))
+        for key, value in with_new_dirs.items():
+            self.assertIn(f"{key}={value}", after)
+        # And the SMTP block plus DB/SECRET_KEY untouched.
+        self.assertIn("SECRET_KEY=synthetic-not-a-real-secret-key-value", after)
+        self.assertIn("DB_PASSWORD=synthetic-not-a-real-secret", after)
+        self.assertIn("EMAIL_HOST=localhost", after)
