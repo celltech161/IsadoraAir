@@ -531,9 +531,22 @@ class PostRollbackDestinationResolutionTests(ProbeEncoderGroupFixtureMixin, Test
             self.addCleanup(patcher.stop)
 
     def _write_lkg_sid1(self, host="10.0.0.5", port=8000):
+        # protocol="shoutcast2" (roadmap 3.10): real production LKG
+        # metadata has carried this since Phase 3M, well before provider
+        # presets existed -- included here so these SID-resolution tests
+        # keep routing through the external Shoutcast DNAS /statistics
+        # probe they're actually testing, rather than the new generic
+        # Liquidsoap destination-connection signal reserved for
+        # Icecast/non-generic-provider destinations (see monitoring/
+        # services/probes.py's _uses_shoutcast_dnas_probe). `provider`
+        # is deliberately left OUT -- exercising destinations_from_lkg_
+        # meta's legacy "no provider recorded" -> "generic" default.
         lkg_module.write_lkg("airtap", 'generation = "lkg-gen"\n', {
             "fingerprint": "lkg-fp",
-            "destinations": [{"encoder_id": 1, "name": "lkg-enc", "host": host, "port": port, "shoutcast_sid": "1"}],
+            "destinations": [{
+                "encoder_id": 1, "name": "lkg-enc", "host": host, "port": port,
+                "shoutcast_sid": "1", "protocol": "shoutcast2",
+            }],
         })
 
     def test_a_rollback_group_checks_lkg_sid_not_rejected_db_sid(self):
@@ -637,3 +650,339 @@ class PostRollbackDestinationResolutionTests(ProbeEncoderGroupFixtureMixin, Test
         status, detail = self.run_probe(shoutcast_stats={"3": {"up": True, "listeners": 1}})
         self.assertEqual(status, "critical")
         self.assertIn("no group-state file", detail["reason"])
+
+
+# ---------------------------------------------------------------------
+# Roadmap 3.10 -- generic Liquidsoap destination connection-state signal
+# (the audio-state file's own "destinations" list, written by
+# encoder_manager.py's build_liquidsoap_script via each output's
+# on_connect/on_disconnect). Routed by _uses_shoutcast_dnas_probe:
+# provider=="generic" Shoutcast 1/2 keeps the external DNAS
+# /statistics probe (unchanged, covered above); everything else
+# (Icecast of any provider, Radio.co) uses this signal instead.
+# ---------------------------------------------------------------------
+class GenericDestinationConnectionStateTests(ProbeEncoderGroupFixtureMixin, TestCase):
+    def _fetch_stats_must_not_be_called(self, host, port, timeout=3.0):
+        raise AssertionError(
+            f"fetch_shoutcast_stats({host!r}, {port!r}) was called -- a non-DNAS "
+            "destination must never be routed through the external Shoutcast "
+            "/statistics probe."
+        )
+
+    def run_probe_no_dnas(self, systemd_status="ok"):
+        """Like ProbeEncoderGroupFixtureMixin.run_probe, but asserts the
+        external Shoutcast stats fetcher is never even called -- for
+        scenarios where every configured destination should route
+        through the generic connection-state signal instead."""
+        with patch.object(probes, "probe_systemd", return_value=(systemd_status, {})), \
+             patch("monitoring.services.shoutcast.fetch_shoutcast_stats", side_effect=self._fetch_stats_must_not_be_called):
+            return probes.probe_encoder_group(self.check)
+
+    def test_connected_icecast_destination_qualifies(self):
+        enc = make_encoder(name="icecast-1", protocol="icecast", provider="generic", mount="/stream", username="source")
+        self.write_group_state(launch_kind="accepted")
+        self.write_audio_state(
+            since=self.now - em.STABILIZATION_SECONDS - 5,
+            destinations=[{"id": str(enc.id), "connected": True, "since": self.now - 200}],
+        )
+        status, detail = self.run_probe_no_dnas()
+        self.assertEqual(status, "ok")
+        self.assertEqual(detail["generic_destinations"], [
+            {"encoder_id": enc.id, "name": "icecast-1", "connected": True, "reporting": True},
+        ])
+        # And the (DNAS-only) "destinations" key stays empty -- nothing
+        # here was ever a Shoutcast DNAS candidate.
+        self.assertEqual(detail["destinations"], [])
+
+    def test_disconnected_icecast_destination_cannot_qualify(self):
+        enc = make_encoder(name="icecast-1", protocol="icecast", provider="generic", mount="/stream", username="source")
+        self.write_group_state(launch_kind="accepted")
+        self.write_audio_state(
+            since=self.now - em.STABILIZATION_SECONDS - 5,
+            destinations=[{"id": str(enc.id), "connected": False, "since": self.now - 5}],
+        )
+        status, detail = self.run_probe_no_dnas()
+        self.assertEqual(status, "critical")
+        self.assertIn("not connected", detail["reason"])
+
+    def test_never_reported_destination_cannot_qualify(self):
+        """No "destinations" key at all in the audio-state file (e.g. a
+        generation launched before this feature existed) -- must fail
+        closed, never read as healthy just because nothing explicitly
+        said "false.\""""
+        make_encoder(name="icecast-1", protocol="icecast", provider="generic", mount="/stream", username="source")
+        self.write_group_state(launch_kind="accepted")
+        self.write_audio_state(since=self.now - em.STABILIZATION_SECONDS - 5)  # no "destinations" override at all
+        status, detail = self.run_probe_no_dnas()
+        self.assertEqual(status, "critical")
+        self.assertIn("not yet reported", detail["reason"])
+
+    def test_stale_old_generation_connected_state_cannot_qualify_new_child(self):
+        """A "destinations": connected=true entry belonging to a
+        SUPERSEDED generation must not make a brand-new child look
+        healthy -- covered generically by evaluate_encoder_group_
+        health's existing generation/pid cross-check (which runs before
+        the destinations logic at all, so it protects the WHOLE
+        audio-state document, this new field included, with no
+        additional code) -- this test locks that in explicitly for the
+        new field specifically."""
+        enc = make_encoder(name="icecast-1", protocol="icecast", provider="generic", mount="/stream", username="source")
+        self.write_group_state(launch_kind="accepted", generation="NEW-GEN", pid=999)
+        self.write_audio_state(
+            generation="OLD-GEN", pid=555,  # stale -- doesn't match group_state's generation/pid
+            since=self.now - em.STABILIZATION_SECONDS - 5,
+            destinations=[{"id": str(enc.id), "connected": True, "since": self.now - 200}],
+        )
+        status, detail = self.run_probe_no_dnas()
+        self.assertEqual(status, "critical")
+        self.assertIn("stale", detail["reason"])
+
+    def test_multiple_destinations_all_must_be_connected(self):
+        e1 = make_encoder(name="icecast-1", protocol="icecast", provider="generic", mount="/one", username="source")
+        e2 = make_encoder(name="icecast-2", protocol="icecast", provider="generic", mount="/two", username="source")
+        self.write_group_state(launch_kind="accepted")
+        self.write_audio_state(
+            since=self.now - em.STABILIZATION_SECONDS - 5,
+            destinations=[
+                {"id": str(e1.id), "connected": True, "since": self.now - 200},
+                {"id": str(e2.id), "connected": False, "since": self.now - 5},
+            ],
+        )
+        status, detail = self.run_probe_no_dnas()
+        self.assertEqual(status, "critical")
+        self.assertIn(f"icecast-2 (id={e2.id})", detail["reason"])
+        self.assertNotIn(f"icecast-1 (id={e1.id})", detail["reason"])
+
+        # Now both connected -- must qualify.
+        self.write_audio_state(
+            since=self.now - em.STABILIZATION_SECONDS - 5,
+            destinations=[
+                {"id": str(e1.id), "connected": True, "since": self.now - 200},
+                {"id": str(e2.id), "connected": True, "since": self.now - 200},
+            ],
+        )
+        status, detail = self.run_probe_no_dnas()
+        self.assertEqual(status, "ok")
+
+    def test_live365_icecast_destination_not_routed_through_dnas(self):
+        enc = make_encoder(name="live365-1", protocol="icecast", provider="live365", mount="/live", username="source", format="mp3")
+        self.write_group_state(launch_kind="accepted")
+        self.write_audio_state(
+            since=self.now - em.STABILIZATION_SECONDS - 5,
+            destinations=[{"id": str(enc.id), "connected": True, "since": self.now - 200}],
+        )
+        status, detail = self.run_probe_no_dnas()
+        self.assertEqual(status, "ok")
+        self.assertEqual(detail["destinations"], [])
+
+    def test_radio_co_shoutcast1_destination_not_routed_through_dnas(self):
+        """Radio.co uses protocol=="shoutcast1" -- the SAME protocol a
+        generic Shoutcast 1 row would use -- but must NOT be assumed to
+        expose a normal DNAS /statistics endpoint just because the wire
+        protocol matches."""
+        enc = make_encoder(name="radio-co-1", protocol="shoutcast1", provider="radio_co", mount="")
+        self.write_group_state(launch_kind="accepted")
+        self.write_audio_state(
+            since=self.now - em.STABILIZATION_SECONDS - 5,
+            destinations=[{"id": str(enc.id), "connected": True, "since": self.now - 200}],
+        )
+        status, detail = self.run_probe_no_dnas()
+        self.assertEqual(status, "ok")
+        self.assertEqual(detail["destinations"], [])
+        self.assertEqual(detail["generic_destinations"], [
+            {"encoder_id": enc.id, "name": "radio-co-1", "connected": True, "reporting": True},
+        ])
+
+    def test_generic_shoutcast_sibling_still_uses_dnas_alongside_generic_icecast(self):
+        """A mixed group -- one generic Shoutcast 2 destination (DNAS)
+        and one Live365 Icecast destination (generic signal) -- both
+        must independently qualify for the group to be "ok", and each
+        must be checked through its OWN correct path."""
+        sc = make_encoder(name="generic-sc", protocol="shoutcast2", provider="generic", mount="/1")
+        ic = make_encoder(name="live365-ic", protocol="icecast", provider="live365", mount="/live", username="source")
+        self.write_group_state(launch_kind="accepted")
+        self.write_audio_state(
+            since=self.now - em.STABILIZATION_SECONDS - 5,
+            destinations=[{"id": str(ic.id), "connected": True, "since": self.now - 200}],
+        )
+        with patch.object(probes, "probe_systemd", return_value=("ok", {})), \
+             patch("monitoring.services.shoutcast.fetch_shoutcast_stats", return_value={"1": {"up": True, "listeners": 2}}) as mock_fetch:
+            status, detail = probes.probe_encoder_group(self.check)
+        self.assertEqual(status, "ok")
+        mock_fetch.assert_called_once()
+        self.assertEqual([d["sid"] for d in detail["destinations"]], ["1"])
+        self.assertEqual([d["connected"] for d in detail["generic_destinations"]], [True])
+
+        # Break ONLY the generic Icecast side -- group must go critical
+        # even though the Shoutcast DNAS side is still fine.
+        self.write_audio_state(
+            since=self.now - em.STABILIZATION_SECONDS - 5,
+            destinations=[{"id": str(ic.id), "connected": False, "since": self.now - 5}],
+        )
+        with patch.object(probes, "probe_systemd", return_value=("ok", {})), \
+             patch("monitoring.services.shoutcast.fetch_shoutcast_stats", return_value={"1": {"up": True, "listeners": 2}}):
+            status, detail = probes.probe_encoder_group(self.check)
+        self.assertEqual(status, "critical")
+
+    def test_mixed_group_live365_healthy_generic_shoutcast_streamstatus_down(self):
+        """The mirror image of the sibling test above -- Live365's own
+        generic signal is fine, but the generic Shoutcast side's real
+        DNAS STREAMSTATUS is down. Group must still be critical; a
+        healthy Icecast/generic-signal destination must never mask a
+        genuinely down Shoutcast destination."""
+        sc = make_encoder(name="generic-sc", protocol="shoutcast2", provider="generic", mount="/1")
+        ic = make_encoder(name="live365-ic", protocol="icecast", provider="live365", mount="/live", username="source")
+        self.write_group_state(launch_kind="accepted")
+        self.write_audio_state(
+            since=self.now - em.STABILIZATION_SECONDS - 5,
+            destinations=[{"id": str(ic.id), "connected": True, "since": self.now - 200}],
+        )
+        with patch.object(probes, "probe_systemd", return_value=("ok", {})), \
+             patch("monitoring.services.shoutcast.fetch_shoutcast_stats", return_value={"1": {"up": False, "listeners": 0}}):
+            status, detail = probes.probe_encoder_group(self.check)
+        self.assertEqual(status, "critical")
+        self.assertIn("destination(s) down", detail["reason"])
+        self.assertEqual([d["connected"] for d in detail["generic_destinations"]], [True])
+        self.assertEqual([d["up"] for d in detail["destinations"]], [False])
+
+    def test_mixed_generic_shoutcast_and_radio_co_only_generic_queried_via_dnas(self):
+        """Three-provider-shape mix: generic Shoutcast2 (DNAS-eligible)
+        alongside Radio.co (Shoutcast1, explicitly NOT DNAS-eligible
+        despite sharing the Shoutcast wire protocol). Spy on the fetcher
+        to prove exactly one call was made, for exactly the generic
+        Shoutcast destination's own host:port -- never Radio.co's."""
+        sc = make_encoder(name="generic-sc", protocol="shoutcast2", provider="generic",
+                           host="10.0.0.1", port=8010, mount="/1")
+        rc = make_encoder(name="radio-co-1", protocol="shoutcast1", provider="radio_co",
+                           host="listen.radio.co", port=8000, mount="")
+        self.write_group_state(launch_kind="accepted")
+        self.write_audio_state(
+            since=self.now - em.STABILIZATION_SECONDS - 5,
+            destinations=[{"id": str(rc.id), "connected": True, "since": self.now - 200}],
+        )
+        with patch.object(probes, "probe_systemd", return_value=("ok", {})), \
+             patch("monitoring.services.shoutcast.fetch_shoutcast_stats", return_value={"1": {"up": True, "listeners": 2}}) as mock_fetch:
+            status, detail = probes.probe_encoder_group(self.check)
+        self.assertEqual(status, "ok")
+        mock_fetch.assert_called_once_with("10.0.0.1", 8010)
+        self.assertEqual([d["sid"] for d in detail["destinations"]], ["1"])
+        self.assertEqual([d["connected"] for d in detail["generic_destinations"]], [True])
+
+    def test_multiple_hosted_provider_destinations_all_must_be_connected(self):
+        """Multiple hosted-provider destinations (Live365 + Radio.co)
+        sharing one group -- every one of them must independently be
+        connected; one being fine never covers for another being
+        down."""
+        live365 = make_encoder(name="live365-1", protocol="icecast", provider="live365",
+                                mount="/live", username="source", host="stream.live365.com")
+        radio_co = make_encoder(name="radio-co-1", protocol="shoutcast1", provider="radio_co",
+                                 mount="", host="listen.radio.co")
+        self.write_group_state(launch_kind="accepted")
+        self.write_audio_state(
+            since=self.now - em.STABILIZATION_SECONDS - 5,
+            destinations=[
+                {"id": str(live365.id), "connected": True, "since": self.now - 200},
+                {"id": str(radio_co.id), "connected": False, "since": self.now - 5},
+            ],
+        )
+        status, detail = self.run_probe_no_dnas()
+        self.assertEqual(status, "critical")
+        self.assertIn(f"radio-co-1 (id={radio_co.id})", detail["reason"])
+
+        self.write_audio_state(
+            since=self.now - em.STABILIZATION_SECONDS - 5,
+            destinations=[
+                {"id": str(live365.id), "connected": True, "since": self.now - 200},
+                {"id": str(radio_co.id), "connected": True, "since": self.now - 200},
+            ],
+        )
+        status, detail = self.run_probe_no_dnas()
+        self.assertEqual(status, "ok")
+        self.assertEqual(detail["destinations"], [])  # neither ever queried via DNAS
+
+    def test_destination_state_cooperates_with_stabilization_gate(self):
+        """All destinations connected, but not yet stable long enough --
+        must still be "warning", not "ok". The generic destination
+        signal doesn't bypass the existing stabilization requirement."""
+        enc = make_encoder(name="icecast-1", protocol="icecast", provider="generic", mount="/stream", username="source")
+        self.write_group_state(launch_kind="accepted")
+        self.write_audio_state(
+            since=self.now - 2,  # well under STABILIZATION_SECONDS
+            destinations=[{"id": str(enc.id), "connected": True, "since": self.now - 200}],
+        )
+        status, detail = self.run_probe_no_dnas()
+        self.assertEqual(status, "warning")
+        self.assertIn("stabilizing", detail["reason"])
+
+    def test_generic_destination_detail_never_contains_password(self):
+        """Credential redaction: evaluate_encoder_group_health's own
+        detail dict (surfaced to the dashboard and to emitted
+        monitoring events) must never carry a destination's password --
+        the new generic_destinations/destinations detail entries only
+        ever hold id/name/connected/reporting, never a raw Encoder
+        field dump."""
+        secret = "sUp3rS3cr3tPassw0rd!!"
+        enc = make_encoder(name="icecast-1", protocol="icecast", provider="generic", mount="/stream", username="source", password=secret)
+        self.write_group_state(launch_kind="accepted")
+        self.write_audio_state(
+            since=self.now - em.STABILIZATION_SECONDS - 5,
+            destinations=[{"id": str(enc.id), "connected": False, "since": self.now - 5}],
+        )
+        status, detail = self.run_probe_no_dnas()
+        self.assertEqual(status, "critical")
+        self.assertNotIn(secret, json.dumps(detail))
+
+    def test_destination_state_cooperates_with_blank_audio_check(self):
+        """Silent audio must still short-circuit to critical BEFORE the
+        destination-connection check is ever consulted, regardless of
+        what the destinations list says."""
+        enc = make_encoder(name="icecast-1", protocol="icecast", provider="generic", mount="/stream", username="source")
+        self.write_group_state(launch_kind="accepted")
+        self.write_audio_state(
+            is_blank=True,
+            since=self.now - em.STABILIZATION_SECONDS - 5,
+            destinations=[{"id": str(enc.id), "connected": True, "since": self.now - 200}],
+        )
+        status, detail = self.run_probe_no_dnas()
+        self.assertEqual(status, "critical")
+        self.assertIn("silent", detail["reason"])
+
+
+# ---------------------------------------------------------------------
+# Roadmap 3.10 pre-commit review, item 7 -- the ENCODER_CONFIG_FORMAT_
+# VERSION 1 -> 2 transition. A pre-existing v1 LKG script (rendered
+# before this feature existed) structurally never writes a
+# "destinations" key into its audio-state file at all -- proves the
+# REAL evaluate_encoder_group_health against that exact legacy shape,
+# for a generic Shoutcast2 destination (the real, current production
+# topology), independent of test_reconciliation.py's own
+# ReconciliationFixtureMixin (which mocks this function for its whole
+# test body by design and so can't exercise the real thing here).
+# ---------------------------------------------------------------------
+class LegacyPreV2AudioStateDnasStillWorksTests(ProbeEncoderGroupFixtureMixin, TestCase):
+    def test_missing_destinations_key_entirely_does_not_block_dnas_qualification(self):
+        enc = make_encoder(name="generic-sc", protocol="shoutcast2", provider="generic", mount="/1")
+        self.write_group_state(launch_kind="rollback")
+        # No "destinations" override at all -- write_audio_state's own
+        # defaults don't include one either, exactly matching what a
+        # legacy pre-3.10 Liquidsoap script's write_state() has always
+        # produced (the field didn't exist before this feature).
+        self.write_audio_state(since=self.now - em.STABILIZATION_SECONDS - 5)
+        status, detail = self.run_probe(shoutcast_stats={"1": {"up": True, "listeners": 4}})
+        self.assertEqual(status, "ok")
+        self.assertEqual([d["sid"] for d in detail["destinations"]], ["1"])
+        # The (empty, absent-key) generic side never even factors in --
+        # this destination was never generic-signal-eligible to begin
+        # with (provider="generic" + protocol="shoutcast2").
+        self.assertEqual(detail["generic_destinations"], [])
+
+    def test_missing_destinations_key_with_dnas_down_is_still_correctly_critical(self):
+        """Companion negative case -- absence of the new field must not
+        accidentally soften a REAL Shoutcast outage either; DNAS is
+        still the authoritative, independent signal it always was."""
+        make_encoder(name="generic-sc", protocol="shoutcast2", provider="generic", mount="/1")
+        self.write_group_state(launch_kind="rollback")
+        self.write_audio_state(since=self.now - em.STABILIZATION_SECONDS - 5)
+        status, detail = self.run_probe(shoutcast_stats={"1": {"up": False, "listeners": 0}})
+        self.assertEqual(status, "critical")
+        self.assertIn("destination(s) down", detail["reason"])

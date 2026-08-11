@@ -366,8 +366,20 @@ def _format_block(encoder):
         # LAME's slowest/highest-quality algorithm -- confirmed to be
         # the %mp3 default by an md5-equal comparison of explicit vs
         # implicit encodes.
+        #
+        # Roadmap 3.10: mp3_rate_mode ("auto"/"cbr"/"abr") lets an
+        # operator (or a provider preset's validation, e.g. Live365/
+        # Radio.co requiring effective CBR) override the bitrate-based
+        # default below. effective_mp3_rate_mode (encoders/services/
+        # validation.py) is the ONE place that resolves "auto" -- reused
+        # here rather than re-implementing the >=192 threshold a second
+        # time, so the renderer and validate_provider_policy's CBR check
+        # can never silently disagree about what "auto" actually renders
+        # for a given bitrate. "cbr"/"abr" bypass the threshold entirely,
+        # exactly per the roadmap's stated semantics.
+        from .validation import effective_mp3_rate_mode
         br = encoder.bitrate_kbps
-        if br >= 192:
+        if effective_mp3_rate_mode(encoder) == "cbr":
             return f"%mp3(bitrate={br})"
         return f"%mp3.abr(bitrate={br}, internal_quality=0)"
     if encoder.format == "aac":
@@ -423,7 +435,62 @@ def _format_block(encoder):
     return f"%vorbis(bitrate={encoder.bitrate_kbps})"  # vorbis
 
 
-def _output_block(encoder, source_var):
+def _dest_key(encoder, index):
+    """Stable-enough per-destination identifier for the connection-state
+    tracking wired up below -- used both as a Liquidsoap identifier
+    fragment (dest_connected_<key>, output_<key>, ...) and, stringified,
+    as the "id" written into the audio-state JSON's "destinations" list
+    (matched back by monitoring.services.probes.evaluate_encoder_group_
+    health against str(Encoder.id)).
+
+    Falls back to a positional index only when encoder.id is None (an
+    in-memory Encoder(...) never saved to the DB) -- exercised by this
+    project's own test suite, which builds unsaved instances directly to
+    check the renderer's output shape. Every REAL launch (_start_group,
+    always fed Encoder.objects.filter(...) rows -- script_override/
+    rollback bypasses build_liquidsoap_script entirely and never calls
+    this) has a real pk by construction, so this fallback never actually
+    matters for a running destination-health decision."""
+    return encoder.id if encoder.id is not None else f"idx{index}"
+
+
+def _destinations_snapshot_expr(dest_keys):
+    """A Liquidsoap list-of-records EXPRESSION (a string of Liquidsoap
+    source code, not a Python value) snapshotting every destination's
+    CURRENT dest_connected_<key>/dest_since_<key> ref pair -- embedded
+    into write_state's own body (see build_liquidsoap_script) so every
+    write (a real on_connect/on_disconnect transition, the periodic
+    heartbeat, or the startup classifier) carries every destination's
+    latest known state, not just whichever one just changed.
+
+    `id` is ALWAYS rendered as a Liquidsoap STRING (via _liq_string),
+    even for the common case where dest_key is a real integer Encoder
+    id -- deliberately, so a single script mixing a real-pk encoder
+    with a fallback "idxN" key (only possible via this project's own
+    test suite building unsaved Encoder(...) instances, see _dest_key)
+    never produces a Liquidsoap list-literal TYPE ERROR from mixing int
+    and string entries for the same record field; every real production
+    launch only ever has real integer ids anyway, so this costs nothing
+    there. monitoring.services.probes.evaluate_encoder_group_health
+    matches back via str(Encoder.id), the same convention Encoder.
+    shoutcast_sid already established for exactly this kind of
+    cross-language (Python int <-> Liquidsoap/JSON) matching.
+
+    Falls back to an explicitly-typed empty list (confirmed live via a
+    standalone json.stringify probe during this feature's development
+    -- an untyped `[]` alone risks Liquidsoap being unable to resolve
+    its element type) for the (production-impossible, test-only) case
+    of a zero-encoder group."""
+    if not dest_keys:
+        return "([] : [{id: string, connected: bool?, since: float?}])"
+    entries = ", ".join(
+        f'{{id = {_liq_string(str(key))}, connected = dest_connected_{key}(), since = dest_since_{key}()}}'
+        for key in dest_keys
+    )
+    return f"[{entries}]"
+
+
+def _output_block(encoder, source_var, dest_key):
     fmt = _format_block(encoder)
     # AAC is emitted via %external(fdkaac) which can't advertise its
     # own MIME type, so the ICY/HTTP content-type has to come from the
@@ -449,12 +516,12 @@ def _output_block(encoder, source_var):
         f"{format_arg}"
     )
     if encoder.protocol == "icecast":
-        return (
+        output_expr = (
             f"output.icecast({fmt}, {common}, "
             f"mount={_liq_string(encoder.mount)}, "
             f"user={_liq_string(encoder.username)}, {source_var})"
         )
-    if encoder.protocol == "shoutcast2":
+    elif encoder.protocol == "shoutcast2":
         # Phase 2 hardening: icy_id must come from a PARSED integer, never
         # raw DB text substituted directly into the script -- normalize_
         # shoutcast_sid() raises ConfigValidationError for anything that
@@ -469,8 +536,84 @@ def _output_block(encoder, source_var):
         # fallback.
         from .validation import normalize_shoutcast_sid
         sid = normalize_shoutcast_sid(encoder.mount)
-        return f"output.shoutcast({fmt}, {common}, icy_id={sid}, {source_var})"
-    return f"output.shoutcast({fmt}, {common}, {source_var})"  # shoutcast1
+        output_expr = f"output.shoutcast({fmt}, {common}, icy_id={sid}, {source_var})"
+    else:
+        output_expr = f"output.shoutcast({fmt}, {common}, {source_var})"  # shoutcast1
+
+    # Roadmap 3.10: generic Liquidsoap destination connection-state
+    # signal -- one per output, regardless of protocol/provider (Icecast,
+    # Shoutcast 1/2, any provider preset on top). This is what lets
+    # monitoring/services/probes.py's evaluate_encoder_group_health tell
+    # "process alive + audio present" apart from "...and this specific
+    # destination has actually established its connection" for Icecast/
+    # Live365/Radio.co destinations, which have no external DNAS
+    # /statistics interface to independently verify against (see that
+    # function's own docstring). `.on_connect`/`.on_disconnect` are
+    # output.icecast/output.shoutcast SOURCE METHODS (confirmed live via
+    # `liquidsoap --list-functions-md` against this box's installed
+    # 2.4.0+dev, and against a synthetic full script via
+    # `liquidsoap --check` -- NOT the deprecated same-named constructor
+    # arguments) -- same synchronous=false + named-handler-function shape
+    # already established by source.on_blank/source.on_noise above, and
+    # each handler re-invokes write_state() so a connect/disconnect
+    # transition is reflected in the SAME generation-CAS-guarded state
+    # file immediately, not just at the next 60s heartbeat. Initialized
+    # to ref(null) -- "not yet observed," matching this file's existing
+    # is_blank three-state philosophy -- never an optimistic default;
+    # never connected at all (a wrong password, say) correctly stays
+    # null/false forever, never silently reads as healthy.
+    # No initial-connect race despite output.icecast/output.shoutcast's
+    # default start=true and the callbacks being registered on the NEXT
+    # lines, after the output value already exists (2026-08-11 pre-
+    # commit review): confirmed EMPIRICALLY, not assumed, with two
+    # isolated smoke tests against this box's real installed 2.4.0+dev
+    # (synthetic noise() source, no ALSA device or production process
+    # touched) -- neither is committed, both are reproducible from this
+    # comment's description. Test 1: an output.icecast targeting a
+    # guaranteed-closed local port, with a `setup_done` ref set as the
+    # LAST line after this SAME output's on_connect/on_disconnect/
+    # on_error registration. Liquidsoap's own log confirms the ordering
+    # directly: "Evaluating main script" completes and "Starting
+    # top-level clock" only happens AFTER that -- i.e. no output's
+    # clock ticks (and nothing can attempt to connect) until the ENTIRE
+    # script has finished evaluating, which is strictly after every
+    # output's own callback registration (ordinary sequential
+    # statements in the same synchronous evaluation pass). The
+    # subsequent connection attempt's on_error fired with setup_done
+    # already true. Test 2: a full connect -> disconnect -> reconnect
+    # lifecycle against a real local TCP listener completed exactly as
+    # expected (initial connected=false -> on_connect fires,
+    # connected=true -> listener killed -> on_disconnect fires,
+    # connected=false -> listener restarted -> on_connect fires again,
+    # connected=true), with zero missed transitions. This generalizes
+    # to N outputs in one script (this function's own multi-encoder
+    # case): since evaluation is single-threaded and sequential, and
+    # ALL outputs share the one global "clock start" event that only
+    # fires after the complete script has evaluated, every output's
+    # on_connect/on_disconnect is registered before ANY output's clock
+    # can tick, regardless of how many destinations are in this group.
+    # See test_output_block_registers_callbacks_immediately_after_
+    # output_construction in encoders/tests/test_encoder_manager.py,
+    # which locks in the ORDERING this proof depends on (output
+    # construction immediately followed by ITS OWN callback wiring,
+    # never deferred past a later destination's own construction).
+    out_var = f"output_{dest_key}"
+    return [
+        f'{out_var} = {output_expr}',
+        f'def dest_connect_{dest_key}() =',
+        f'  dest_connected_{dest_key}.set(true)',
+        f'  dest_since_{dest_key}.set(time())',
+        f'  write_state(last_status(), last_is_blank(), since_ts())',
+        'end',
+        f'def dest_disconnect_{dest_key}() =',
+        f'  dest_connected_{dest_key}.set(false)',
+        f'  dest_since_{dest_key}.set(time())',
+        f'  write_state(last_status(), last_is_blank(), since_ts())',
+        'end',
+        f'{out_var}.on_connect(synchronous=false, dest_connect_{dest_key})',
+        f'{out_var}.on_disconnect(synchronous=false, dest_disconnect_{dest_key})',
+        '',
+    ]
 
 
 def _aircheck_format_block(cfg):
@@ -619,6 +762,13 @@ def build_liquidsoap_script(input_device, encoders, host_aircheck=False, generat
     once blank.detect has actually observed something) rather than a
     boolean that could only ever lie in the direction of "healthy" when
     unset."""
+    # Materialized once, up front -- dest_keys (below) and the final
+    # output-block loop both iterate `encoders` independently, and a
+    # QuerySet re-iterating is fine but a one-shot generator would not
+    # be; every real caller already passes a list (or a QuerySet, which
+    # list() below simply snapshots), so this is a defensive no-op in
+    # practice, not a behavior change.
+    encoders = list(encoders)
     audio_state_path = str(_audio_state_path(input_device))
     lines = []
     if host_aircheck:
@@ -662,6 +812,35 @@ def build_liquidsoap_script(input_device, encoders, host_aircheck=False, generat
         # timestamp, which would be measured slightly before this
         # process even exec'd.
         'started_at = time()',
+        '',
+    ]
+    # Roadmap 3.10: one pair of per-destination connection-state refs per
+    # encoder in this group, declared here -- BEFORE write_state's own
+    # definition below, since its body reads them to build the
+    # "destinations" snapshot on every write. Liquidsoap resolves names
+    # lexically at the point a `def`/`let` appears, same as every other
+    # forward-reference constraint already respected elsewhere in this
+    # function (e.g. write_state itself must be defined before on_blank/
+    # on_noise/the classifier/the heartbeat, all of which call it) --
+    # the ACTUAL output.icecast()/output.shoutcast() objects and their
+    # .on_connect/.on_disconnect wiring (_output_block) can and do stay
+    # in their existing position at the very end of the script; they only
+    # need write_state and these refs to already be in scope, not the
+    # other way around.
+    #
+    # ref(null) (untyped-until-first-.set, same idiom as last_is_blank
+    # above and confirmed live via a standalone json.stringify probe
+    # during this feature's own development) -- "not yet observed,"
+    # never an optimistic default; a destination that never connects
+    # correctly stays null/false in the state file forever, never reads
+    # as healthy just because nothing failed loudly.
+    dest_keys = [_dest_key(enc, i) for i, enc in enumerate(encoders)]
+    for key in dest_keys:
+        lines += [
+            f'dest_connected_{key} = ref(null)',
+            f'dest_since_{key} = ref(null)',
+        ]
+    lines += [
         '',
         # `last_status`/`last_is_blank` mirror the most recent transition
         # so the 60s heartbeat below re-writes with the *correct*
@@ -737,6 +916,7 @@ def build_liquidsoap_script(input_device, encoders, host_aircheck=False, generat
         '    last_status.set(status)',
         '    last_is_blank.set(is_blank)',
         '    since_ts.set(since)',
+        f'    destinations = {_destinations_snapshot_expr(dest_keys)}',
         '    state = json.stringify(compact=true, {',
         '      status = status,',
         '      is_blank = is_blank,',
@@ -747,6 +927,7 @@ def build_liquidsoap_script(input_device, encoders, host_aircheck=False, generat
         '      started_at = started_at,',
         '      since = since,',
         '      timestamp = time(),',
+        '      destinations = destinations,',
         '    })',
         # temp_dir must live on the same filesystem as the target for the
         # atomic rename to succeed. Without this, liquidsoap defaults temp
@@ -907,7 +1088,8 @@ def build_liquidsoap_script(input_device, encoders, host_aircheck=False, generat
         'update_now_playing()',
         '',
     ]
-    lines += [_output_block(encoder, "source") for encoder in encoders]
+    for encoder, key in zip(encoders, dest_keys):
+        lines += _output_block(encoder, "source", key)
     if host_aircheck:
         lines += _aircheck_block()
     return "\n".join(lines) + "\n"
@@ -2064,6 +2246,21 @@ class EncoderManager:
                 {
                     "encoder_id": e.id, "name": e.name, "host": e.host, "port": e.port,
                     "shoutcast_sid": e.shoutcast_sid, "protocol": e.protocol, "mount": e.mount,
+                    # Roadmap 3.10: frozen alongside protocol/mount for the
+                    # exact same reason those two were added (Phase 3M) --
+                    # rollback/monitoring health-checking needs to know a
+                    # reconstructed destination's PROVIDER too, e.g. so a
+                    # "shoutcast1" stand-in that's actually Radio.co is
+                    # never routed through the external Shoutcast DNAS
+                    # /statistics probe (see monitoring/services/probes.py's
+                    # _uses_shoutcast_dnas_probe). getattr with a "generic"
+                    # default: `e` here is always a real Encoder row (this
+                    # dict is built fresh at promotion time from
+                    # self._candidate_encoders, never from LKG stand-ins),
+                    # so the field is always present in practice -- the
+                    # default only guards a stray non-Encoder object ever
+                    # reaching this code path.
+                    "provider": getattr(e, "provider", "generic"),
                 }
                 for e in encoders
             ],

@@ -353,6 +353,112 @@ class QualificationPromotionTests(CandidateFixtureMixin, TransactionTestCase):
             manager._check_candidate_qualification("airtap")
         mock_health.assert_not_called()
 
+    def test_destination_disconnected_then_connects_late_still_requires_full_continuous_window(self):
+        """Roadmap 3.10 pre-commit review, item 5: audio can be healthy
+        while a destination stays disconnected for a while -- the
+        candidate must not accumulate ANY qualification credit during
+        that window. evaluate_encoder_group_health's aggregate "ok" now
+        genuinely depends on destination connection (see monitoring/
+        services/probes.py), so this falls out of the EXISTING
+        CANDIDATE_QUALIFICATION_SECONDS continuous-health mechanism
+        with NO new/duplicate timer -- this test proves it end to end
+        against the REAL evaluate_encoder_group_health (not mocked),
+        not just via design reasoning."""
+        manager = em.EncoderManager()
+        encoder = Encoder.objects.create(
+            name="live365-enc", protocol="icecast", provider="live365",
+            host="stream.live365.com", port=8000, mount="/a1", username="source",
+            password="secret", format="mp3", bitrate_kbps=192, mp3_rate_mode="cbr",
+            station_name="Station",
+        )
+        self._launch_candidate(manager, encoders=[encoder])
+        slug = em._slug("airtap")
+        current = manager._current["airtap"]
+
+        def write_audio_state(connected):
+            now = time.time()
+            em._atomic_write_json(em._audio_state_path_for_slug(slug), {
+                "status": "audio_ok", "is_blank": False, "audio_observed": True,
+                "input_device": "airtap", "pid": current["pid"], "generation": current["generation"],
+                "started_at": now - 60, "since": now - 60, "timestamp": now,
+                "destinations": [{"id": str(encoder.id), "connected": connected, "since": now - 60}],
+            })
+
+        with patch.object(probes_module, "probe_systemd", return_value=("ok", {})):
+            # Audio healthy but destination disconnected -- must never
+            # start accumulating qualification credit.
+            write_audio_state(connected=False)
+            for _ in range(3):
+                manager._check_candidate_qualification("airtap")
+                time.sleep(0.02)
+            self.assertIsNone(manager._qualify_started_at.get("airtap"))
+            self.assertFalse(lkg_module.lkg_exists(slug))
+
+            # Destination finally connects -- the qualification clock
+            # starts NOW, not retroactively, and this same tick alone
+            # must not promote.
+            write_audio_state(connected=True)
+            manager._check_candidate_qualification("airtap")
+            self.assertIsNotNone(manager._qualify_started_at.get("airtap"))
+            self.assertFalse(lkg_module.lkg_exists(slug))
+
+            # A full CANDIDATE_QUALIFICATION_SECONDS of CONTINUOUS "ok"
+            # (destination still connected throughout) is required
+            # before promotion -- same mechanism as any other signal.
+            for _ in range(3):
+                time.sleep(0.02)
+                manager._check_candidate_qualification("airtap")
+            self.assertTrue(lkg_module.lkg_exists(slug))
+            meta = lkg_module.read_lkg_meta(slug)
+            self.assertEqual(meta["destinations"][0]["provider"], "live365")
+
+    def test_destination_disconnect_mid_qualification_resets_clock(self):
+        """Companion to the above -- a destination that WAS connected
+        (qualification clock running) and then disconnects mid-window
+        must reset the clock, same as any other health blip
+        (test_intermittent_ok_does_not_accumulate_across_gaps already
+        proves this generically via a mocked health function; this
+        proves the SAME orchestration behaves correctly when driven by
+        the real destination-connection signal specifically)."""
+        manager = em.EncoderManager()
+        encoder = Encoder.objects.create(
+            name="live365-enc", protocol="icecast", provider="live365",
+            host="stream.live365.com", port=8000, mount="/a1", username="source",
+            password="secret", format="mp3", bitrate_kbps=192, mp3_rate_mode="cbr",
+            station_name="Station",
+        )
+        self._launch_candidate(manager, encoders=[encoder])
+        slug = em._slug("airtap")
+        current = manager._current["airtap"]
+
+        def write_audio_state(connected):
+            now = time.time()
+            em._atomic_write_json(em._audio_state_path_for_slug(slug), {
+                "status": "audio_ok", "is_blank": False, "audio_observed": True,
+                "input_device": "airtap", "pid": current["pid"], "generation": current["generation"],
+                "started_at": now - 60, "since": now - 60, "timestamp": now,
+                "destinations": [{"id": str(encoder.id), "connected": connected, "since": now - 60}],
+            })
+
+        with patch.object(probes_module, "probe_systemd", return_value=("ok", {})):
+            write_audio_state(connected=True)
+            manager._check_candidate_qualification("airtap")
+            self.assertIsNotNone(manager._qualify_started_at.get("airtap"))
+            time.sleep(0.03)
+
+            write_audio_state(connected=False)  # blip mid-window
+            manager._check_candidate_qualification("airtap")
+            self.assertIsNone(manager._qualify_started_at.get("airtap"))
+            self.assertFalse(lkg_module.lkg_exists(slug))
+
+            write_audio_state(connected=True)  # reconnects -- clock restarts here
+            manager._check_candidate_qualification("airtap")
+            self.assertIsNotNone(manager._qualify_started_at.get("airtap"))
+            # Only one tick since the restart -- not enough elapsed
+            # time yet regardless (CANDIDATE_QUALIFICATION_SECONDS is
+            # 0.05s; no sleep happened since the restart tick).
+            self.assertFalse(lkg_module.lkg_exists(slug))
+
     def test_zero_listeners_still_qualifies(self):
         """evaluate_encoder_group_health's own "ok" status never
         depends on listener count (see monitoring/tests/
@@ -695,6 +801,34 @@ class RollbackQualificationExpectedEncodersTests(CandidateFixtureMixin, Transact
         # for cross-group collision checks -- must round-trip too.
         self.assertEqual(dest["protocol"], "shoutcast2")
         self.assertEqual(dest["mount"], "/1")
+
+    def test_promoted_lkg_metadata_includes_provider(self):
+        """Roadmap 3.10: LKG promotion must freeze `provider` alongside
+        protocol/mount, for the same reason -- rollback/monitoring
+        health-checking needs to know a reconstructed destination's
+        provider (e.g. so a shoutcast1 stand-in that's actually Radio.co
+        is never routed through the external Shoutcast DNAS probe)."""
+        manager = em.EncoderManager()
+        live365_enc = make_encoder(
+            name="live365-enc", protocol="icecast", provider="live365",
+            host="stream.live365.com", port=8000, mount="/a12345", username="source",
+            format="mp3", bitrate_kbps=128, mp3_rate_mode="cbr",
+        )
+        self._promote_real_lkg(manager, [live365_enc])
+        meta = lkg_module.read_lkg_meta(em._slug("airtap"))
+        dest = meta["destinations"][0]
+        self.assertEqual(dest["provider"], "live365")
+
+    def test_promoted_lkg_metadata_generic_provider_recorded_explicitly(self):
+        """The complementary case -- an ordinary generic-provider row's
+        LKG metadata must explicitly say "generic", not omit the field
+        (only a LEGACY, pre-3.10 LKG omits it -- see lkg.destinations_
+        from_lkg_meta's own legacy-default test in test_lkg.py)."""
+        manager = em.EncoderManager()
+        self._promote_real_lkg(manager, [make_encoder(name="generic-enc", mount="/1")])
+        meta = lkg_module.read_lkg_meta(em._slug("airtap"))
+        dest = meta["destinations"][0]
+        self.assertEqual(dest["provider"], "generic")
 
     def test_legacy_lkg_metadata_without_destinations_fails_closed_not_wrong(self):
         """An LKG promoted before this fix existed (or with corrupt

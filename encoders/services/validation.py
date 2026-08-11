@@ -93,6 +93,31 @@ class ConfigValidationError(Exception):
     error plumbing."""
 
 
+# --- MP3 rate mode -------------------------------------------------------
+
+def effective_mp3_rate_mode(encoder):
+    """Resolves Encoder.mp3_rate_mode ("auto"/"cbr"/"abr") to the actual
+    "cbr"/"abr" that will be rendered -- the ONE place this resolution
+    rule lives, shared by encoder_manager.py's _format_block (so the
+    renderer never disagrees with what validation just approved) and by
+    validate_provider_policy below (so e.g. "Live365 requires MP3 to be
+    CBR" is checked against what will ACTUALLY be rendered, not just
+    the raw mp3_rate_mode field value).
+
+    "auto" reproduces this project's original, pre-3.10 behavior EXACTLY
+    (encoder_manager.py's _format_block, before mp3_rate_mode existed):
+    bitrate < 192 kbps -> abr, >= 192 kbps -> cbr. "cbr"/"abr" always
+    return themselves regardless of bitrate -- an explicit operator
+    choice, not a default to second-guess.
+
+    Not meaningful for a non-MP3 encoder (AAC/Vorbis have no CBR/ABR
+    concept here) -- callers only ever call this for format=="mp3"."""
+    mode = getattr(encoder, "mp3_rate_mode", "auto") or "auto"
+    if mode in ("cbr", "abr"):
+        return mode
+    return "cbr" if encoder.bitrate_kbps >= 192 else "abr"
+
+
 # --- Protocol / format compatibility ------------------------------------
 
 # Verified against this project's actual targeted Liquidsoap (2.4.0+dev,
@@ -228,14 +253,113 @@ def validate_connection_fields(encoder):
     return errors
 
 
+# --- Provider policy (roadmap 3.10) --------------------------------------
+#
+# Provider != Protocol. Live365 and Radio.co are NOT additional
+# `protocol` values -- Live365 is fundamentally an Icecast source
+# destination, Radio.co is fundamentally a Shoutcast-1-style source
+# destination. This section only ever NARROWS what validate_protocol_
+# format/validate_connection_fields above already accept for an
+# already-generic-valid row -- it never substitutes for them, and a
+# "generic" provider row is completely unaffected (every check below is
+# a no-op for provider=="generic", preserving 100% of pre-3.10
+# behavior). Layered on, called from validate_single_encoder alongside
+# the existing checks, so a direct ORM write (bypassing Encoder.clean())
+# is caught here exactly like every other rule in this module.
+
+_LIVE365_ALLOWED_FORMATS = {"mp3", "aac"}
+
+
+def validate_provider_policy(encoder):
+    """Returns list[str] (empty if compatible). Dispatches on
+    Encoder.provider; unknown values (shouldn't happen -- it's a
+    choices field -- but a stale in-memory instance or a direct ORM
+    write with a stray string is possible) are reported rather than
+    silently treated as generic."""
+    provider = getattr(encoder, "provider", "generic") or "generic"
+    if provider == "generic":
+        return []
+    if provider == "live365":
+        return _validate_live365(encoder)
+    if provider == "radio_co":
+        return _validate_radio_co(encoder)
+    return [f"Unknown provider {provider!r}."]
+
+
+def _format_label(fmt):
+    return dict(encoders_models.Encoder.FORMAT_CHOICES).get(fmt, fmt)
+
+
+def _protocol_label(protocol):
+    return dict(encoders_models.Encoder.PROTOCOL_CHOICES).get(protocol, protocol)
+
+
+def _validate_live365(encoder):
+    """Live365 = an Icecast source destination, MP3 or AAC only, MP3
+    must be effective CBR (Live365's own current guidance for constant-
+    bitrate MP3 source audio). Host/port/mount/username/password
+    "required" checks are intentionally NOT duplicated here --
+    protocol=="icecast" already makes validate_connection_fields
+    enforce all of those (with its own, already-clear wording); Live365
+    just needs the row to actually BE an Icecast row for those checks
+    to apply at all, which is exactly what the protocol check below
+    guarantees."""
+    errors = []
+    if encoder.protocol != "icecast":
+        errors.append(
+            f"Live365 requires Icecast as the connection protocol (this row is set to "
+            f"{_protocol_label(encoder.protocol)} -- Live365 is fundamentally an Icecast "
+            f"source destination)."
+        )
+    if encoder.format not in _LIVE365_ALLOWED_FORMATS:
+        errors.append(
+            f"Live365 does not support {_format_label(encoder.format)} -- only MP3 and AAC "
+            f"are supported for the Live365 provider preset."
+        )
+    elif encoder.format == "mp3" and effective_mp3_rate_mode(encoder) != "cbr":
+        errors.append(
+            "Live365 requires MP3 to use CBR (set MP3 Rate Mode to CBR, or leave it on Auto "
+            "with a bitrate of 192 kbps or higher)."
+        )
+    return errors
+
+
+def _validate_radio_co(encoder):
+    """Radio.co = a Shoutcast-1-style external-broadcaster source
+    connection, MP3 only, always effective CBR. No mount/username
+    requirement -- Shoutcast 1 has no mount concept and
+    validate_connection_fields already never requires either for it,
+    matching Radio.co's own documented external-broadcaster fields
+    (host/port/password only)."""
+    errors = []
+    if encoder.protocol != "shoutcast1":
+        errors.append(
+            f"Radio.co requires Shoutcast 1 as the connection protocol (this row is set to "
+            f"{_protocol_label(encoder.protocol)} -- Radio.co is fundamentally a Shoutcast-1-"
+            f"style source destination)."
+        )
+    if encoder.format != "mp3":
+        errors.append(
+            f"Radio.co only supports MP3 for external broadcaster source connections -- "
+            f"{_format_label(encoder.format)} is not supported."
+        )
+    elif effective_mp3_rate_mode(encoder) != "cbr":
+        errors.append(
+            "Radio.co requires MP3 to use CBR (set MP3 Rate Mode to CBR, or leave it on Auto "
+            "with a bitrate of 192 kbps or higher)."
+        )
+    return errors
+
+
 def validate_single_encoder(encoder):
     """Full single-row validation: protocol/format compatibility +
-    connection fields. Returns list[str] (empty = valid). This is what
-    Encoder.clean() delegates to (see encoders/models.py) and what
-    encoder_manager.py calls per-row before ever including a row in a
-    candidate script."""
+    connection fields + provider policy. Returns list[str] (empty =
+    valid). This is what Encoder.clean() delegates to (see
+    encoders/models.py) and what encoder_manager.py calls per-row
+    before ever including a row in a candidate script."""
     errors = list(validate_protocol_format(encoder.protocol, encoder.format))
     errors += validate_connection_fields(encoder)
+    errors += validate_provider_policy(encoder)
     return errors
 
 

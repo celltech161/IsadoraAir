@@ -24,8 +24,23 @@ BITRATE_CHOICES = [(k, f"{k} kbps") for k in (64, 96, 128, 160, 192, 224, 256, 3
 RUNTIME_AFFECTING_FIELDS = frozenset({
     "enabled", "protocol", "host", "port", "mount", "username", "password",
     "format", "bitrate_kbps", "input_device", "station_name", "genre",
-    "url", "public",
+    "url", "public", "provider", "mp3_rate_mode",
 })
+# `provider` and `mp3_rate_mode` (roadmap 3.10, 2026-08-11) are included
+# even though `provider` alone never changes the literal output.icecast()/
+# output.shoutcast() call syntax build_liquidsoap_script renders -- a
+# provider change still changes VALIDATION semantics (encoders/services/
+# validation.py's validate_provider_policy), supported-format policy, and
+# which destination-health path monitoring/services/probes.py's
+# evaluate_encoder_group_health takes for this row (the new generic
+# Liquidsoap connection-state signal vs. the external Shoutcast DNAS
+# /statistics probe -- see that function's own docstring). A provider
+# edit that silently kept the OLD accepted fingerprint would let a row
+# skip re-validation against its new provider's rules and skip
+# re-qualification under its new health-check path entirely -- exactly
+# what this set exists to prevent. `mp3_rate_mode` is a literal renderer
+# input (_format_block) and obviously belongs here for the same reason
+# every other rendered field does.
 
 
 class Encoder(models.Model):
@@ -60,6 +75,34 @@ class Encoder(models.Model):
         ("aac", "AAC"),
         ("vorbis", "Ogg Vorbis"),
     ]
+    # Roadmap 3.10: provider PRESETS layered on top of the generic
+    # protocol/format model -- deliberately NOT a parallel protocol
+    # ("live365"/"radio_co" are never valid `protocol` values). Live365
+    # is an Icecast source destination; Radio.co is a Shoutcast-1-style
+    # source destination. `provider` only ever narrows what
+    # encoders/services/validation.py's validate_provider_policy accepts
+    # for an already-generic-valid row, and selects which destination-
+    # health path monitoring/services/probes.py's
+    # evaluate_encoder_group_health takes (see that function's own
+    # docstring) -- it never changes what Liquidsoap operator
+    # encoder_manager.py's _output_block renders (still exactly
+    # output.icecast()/output.shoutcast() either way).
+    PROVIDER_CHOICES = [
+        ("generic", "Generic"),
+        ("live365", "Live365"),
+        ("radio_co", "Radio.co"),
+    ]
+    # MP3 rate-mode policy, generic (not a Radio.co/Live365-only hack --
+    # any Encoder row, provider or not, can opt into an explicit CBR/ABR
+    # policy instead of the bitrate-threshold-based default). See
+    # encoders/services/validation.py's effective_mp3_rate_mode() for the
+    # exact "auto" resolution rule, shared by both the renderer
+    # (encoder_manager.py's _format_block) and provider validation.
+    MP3_RATE_MODE_CHOICES = [
+        ("auto", "Auto (bitrate-based, current default behavior)"),
+        ("cbr", "Constant bitrate (CBR)"),
+        ("abr", "Average bitrate (ABR)"),
+    ]
 
     name = models.CharField(max_length=64, unique=True)
     enabled = models.BooleanField(default=True)
@@ -84,6 +127,22 @@ class Encoder(models.Model):
                    "but MP3 in practice).",
     )
     bitrate_kbps = models.PositiveIntegerField(choices=BITRATE_CHOICES, default=128)
+    provider = models.CharField(
+        max_length=10, choices=PROVIDER_CHOICES, default="generic",
+        help_text="Generic: manually configured Icecast/Shoutcast destination. Live365/"
+                   "Radio.co: provider presets layered on top of the same generic Icecast/"
+                   "Shoutcast transport -- selecting one narrows which protocol/format/"
+                   "MP3 rate-mode combinations are accepted and how destination health is "
+                   "verified, it does not add a new streaming protocol.",
+    )
+    mp3_rate_mode = models.CharField(
+        max_length=4, choices=MP3_RATE_MODE_CHOICES, default="auto",
+        help_text="Auto preserves the existing behavior exactly: bitrates below 192 kbps "
+                   "use LAME ABR, 192 kbps and up use CBR. CBR/ABR force that choice "
+                   "regardless of bitrate. Some providers (e.g. Live365, Radio.co) require "
+                   "an effective CBR MP3 stream -- Auto at 192 kbps or higher already "
+                   "satisfies that without changing this field.",
+    )
     input_device = models.CharField(
         max_length=100, blank=True,
         help_text="ALSA capture device. Defaults to the StereoTool HD Output bridge.",

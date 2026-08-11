@@ -15,7 +15,7 @@
 var RUNTIME_AFFECTING_FIELDS = [
   'enabled', 'protocol', 'host', 'port', 'mount', 'username', 'password',
   'format', 'bitrate_kbps', 'input_device', 'station_name', 'genre',
-  'url', 'public'
+  'url', 'public', 'provider', 'mp3_rate_mode'
 ];
 
 // True if a form field's live value differs from what the browser

@@ -138,9 +138,27 @@ class EncoderAdmin(admin.ModelAdmin):
     ordering = ["sort_order", "name"]
 
     fieldsets = [
-        ("Basic", {"fields": ["name", "enabled", "protocol", "sort_order"]}),
+        ("Basic", {"fields": ["name", "enabled", "provider", "protocol", "sort_order"], "description": (
+            "<p><strong>Provider</strong> is a preset layered on top of the generic Icecast/"
+            "Shoutcast fields below -- it narrows which Protocol/Format/MP3 Rate Mode "
+            "combinations are accepted and how IsadoraAir verifies this destination is "
+            "actually connected, it does not add a new streaming protocol.</p>"
+            "<p><strong>Live365</strong>: fundamentally an Icecast source destination. Set "
+            "Protocol to Icecast. Get Host/Port/Mount/Username/Password from your Live365 "
+            "LiveDJ/source credentials (Live365 dashboard -> Broadcasting/Source setup). "
+            "MP3 or AAC only, and MP3 must be CBR (MP3 Rate Mode = CBR, or Auto at 192 kbps "
+            "or higher). Match the configured Bitrate to what your Live365 account expects.</p>"
+            "<p><strong>Radio.co</strong>: fundamentally a Shoutcast-1-style external-"
+            "broadcaster source connection. Set Protocol to Shoutcast 1. Get Host/Port/"
+            "Password from your Radio.co station's external broadcaster / source settings "
+            "(no mount or username needed for Shoutcast 1). MP3 only, always CBR. Your "
+            "Radio.co station must be configured to permit this external source -- typically "
+            "a Live DJ event, or Live Anytime for continuous IsadoraAir operation. IsadoraAir "
+            "remains the schedule/automation authority; Radio.co is downstream distribution/"
+            "fallback, not a mirrored schedule.</p>"
+        )}),
         ("Connection", {"fields": ["host", "port", "mount", "username", "password"]}),
-        ("Encoding", {"fields": ["format", "bitrate_kbps", "input_device"]}),
+        ("Encoding", {"fields": ["format", "bitrate_kbps", "mp3_rate_mode", "input_device"]}),
         ("Stream Info", {"fields": ["station_name", "genre", "description", "url", "public"]}),
     ]
 

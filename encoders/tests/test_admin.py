@@ -57,11 +57,19 @@ DEFAULT_FIELDS = dict(
     # fixture just needs to be a VALID row.
     station_name="Test Station", genre="", description="", url="", public=False,
     sort_order=0,
+    # provider/mp3_rate_mode (roadmap 3.10): "generic"/"auto" match the
+    # model's own defaults exactly -- these tests are about the
+    # reconcile-notification/desired-vs-accepted plumbing, not provider
+    # policy, so the fixture just needs a plain generic-provider row
+    # (provider IS in RUNTIME_AFFECTING_FIELDS, so accidentally varying
+    # it between DEFAULT_FIELDS and an override would itself trigger a
+    # notification these tests don't expect).
+    provider="generic", mp3_rate_mode="auto",
 )
 FORM_FIELDS = [
     "name", "protocol", "sort_order", "host", "port", "mount", "username",
     "password", "format", "bitrate_kbps", "input_device", "station_name",
-    "genre", "description", "url",
+    "genre", "description", "url", "provider", "mp3_rate_mode",
 ]
 BOOL_FIELDS = ["enabled", "public"]
 
@@ -500,7 +508,12 @@ class EncoderConfirmJsTests(TestCase):
     def test_js_runtime_fields_list_matches_server_set(self):
         match = re.search(r"RUNTIME_AFFECTING_FIELDS\s*=\s*\[(.*?)\]", self.js_source, re.S)
         self.assertIsNotNone(match, "RUNTIME_AFFECTING_FIELDS array not found in encoder_confirm.js")
-        js_fields = set(re.findall(r"'([a-z_]+)'", match.group(1)))
+        # [a-z0-9_]+, not just [a-z_]+ -- 'mp3_rate_mode' (roadmap 3.10)
+        # is the first field name in this list to contain a digit; the
+        # narrower pattern silently matched zero characters of it rather
+        # than raising, which would have made this "server vs JS" check
+        # blind to exactly the kind of drift it exists to catch.
+        js_fields = set(re.findall(r"'([a-z0-9_]+)'", match.group(1)))
         self.assertEqual(js_fields, RUNTIME_AFFECTING_FIELDS)
 
     def test_js_no_longer_unconditionally_claims_every_save_restarts(self):

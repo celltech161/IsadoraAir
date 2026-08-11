@@ -104,6 +104,102 @@ class BuildLiquidsoapScriptTests(TestCase):
         self.assertEqual(script.count("source = input.alsa"), 1)
         self.assertEqual(script.count("output.shoutcast"), 2)
 
+    def test_dest_refs_declared_before_write_state_definition(self):
+        """Roadmap 3.10: dest_connected_<id>/dest_since_<id> refs must
+        be declared BEFORE write_state's own def -- its body reads them
+        to build the "destinations" JSON snapshot on every write.
+        Liquidsoap resolves names lexically at the point they're used;
+        a ref declared AFTER write_state's def would be an unbound-
+        variable error the moment write_state's body is type-checked."""
+        script = em.build_liquidsoap_script("airtap", [make_encoder()], generation="g")
+        ref_decl_pos = script.index("dest_connected_")
+        write_state_def_pos = script.index("def write_state(")
+        self.assertLess(ref_decl_pos, write_state_def_pos)
+
+    def test_write_state_snapshot_includes_every_destination_regardless_of_trigger(self):
+        """write_state's own "destinations" snapshot is rebuilt from
+        EVERY destination's current ref values on every single call --
+        an audio-only transition (on_blank/on_noise/heartbeat/
+        classifier) or a connect/disconnect on just ONE destination
+        must still write accurate state for every OTHER destination
+        too, never just the one that triggered this particular write.
+        Two encoders sharing a group -> both dest_connected_<id> refs
+        must appear in the snapshot expression embedded in write_state's
+        body, not just whichever encoder's own on_connect/on_disconnect
+        triggered a given write."""
+        script = em.build_liquidsoap_script(
+            "airtap",
+            [make_encoder(name="a", mount="/1"), make_encoder(name="b", mount="/2")],
+            generation="g",
+        )
+        write_state_start = script.index("def write_state(")
+        write_state_end = script.index("\nend\n", write_state_start)
+        write_state_body = script[write_state_start:write_state_end]
+        # Both destinations' refs are read inside write_state's OWN
+        # body (the snapshot line), not just declared somewhere earlier
+        # in the script.
+        dest_ref_names = [line.split(" = ref(")[0] for line in script.splitlines() if line.startswith("dest_connected_")]
+        self.assertEqual(len(dest_ref_names), 2)
+        for ref_name in dest_ref_names:
+            self.assertIn(f"{ref_name}()", write_state_body)
+
+    def test_dest_connect_and_disconnect_pass_through_last_known_audio_state(self):
+        """dest_connect_<id>/dest_disconnect_<id> must call write_state
+        with the LAST KNOWN status/is_blank/since -- i.e. they preserve
+        whatever the audio side last established, exactly the same
+        pattern the pre-existing 60s heartbeat already uses -- never a
+        hardcoded/invented status that could clobber a real "silent"
+        reading with an optimistic default."""
+        script = em.build_liquidsoap_script("airtap", [make_encoder()], generation="g")
+        self.assertIn("write_state(last_status(), last_is_blank(), since_ts())", script)
+        # Appears at least twice: once for the pre-existing heartbeat,
+        # once more for this destination's connect/disconnect handlers
+        # (a 3rd count, since both dest_connect and dest_disconnect use
+        # the identical call).
+        self.assertGreaterEqual(
+            script.count("write_state(last_status(), last_is_blank(), since_ts())"), 3,
+        )
+
+    def test_output_block_registers_callbacks_immediately_after_output_construction(self):
+        """Locks in the exact ordering this file's own destination-
+        connection-state race analysis (see _output_block's own
+        comment, and the 2026-08-11 pre-commit safety review) depends
+        on: EVERY output's on_connect/on_disconnect registration must
+        appear immediately after THAT SAME output's own construction
+        line, never deferred past a later destination's construction.
+        Confirmed empirically (two isolated Liquidsoap smoke tests
+        against a real local listener, not committed here) that no
+        output's connection attempt can begin until the ENTIRE script
+        has finished evaluating -- so this ordering isn't itself what
+        prevents a race (nothing races at all, structurally), but
+        locking it in keeps the generated script's own internal
+        structure easy to reason about and catches any future
+        refactor that accidentally interleaves output construction
+        and callback wiring across multiple destinations."""
+        script = em.build_liquidsoap_script(
+            "airtap",
+            [make_encoder(name="a", mount="/1"), make_encoder(name="b", mount="/2")],
+            generation="g",
+        )
+        lines = script.splitlines()
+
+        def _index_of_line_containing(needle, start=0):
+            for i in range(start, len(lines)):
+                if needle in lines[i]:
+                    return i
+            raise AssertionError(f"{needle!r} not found in generated script")
+
+        out_a = _index_of_line_containing(" = output.shoutcast(")
+        connect_a = _index_of_line_containing(".on_connect(", start=out_a)
+        disconnect_a = _index_of_line_containing(".on_disconnect(", start=out_a)
+        out_b = _index_of_line_containing(" = output.shoutcast(", start=connect_a + 1)
+
+        # Both callback registrations for output A appear strictly
+        # between A's own construction and B's construction -- never
+        # after B has already been declared.
+        self.assertTrue(out_a < connect_a < out_b)
+        self.assertTrue(out_a < disconnect_a < out_b)
+
 
 class BuildLiquidsoapScriptRealSyntaxTests(TestCase):
     # TestCase: host_aircheck=True below reads AircheckConfig.

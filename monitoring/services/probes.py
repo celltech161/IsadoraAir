@@ -371,6 +371,41 @@ def _read_group_launch_kind(slug):
         return "accepted"
 
 
+def _uses_shoutcast_dnas_probe(enc):
+    """True only for a provider=="generic" Shoutcast 1/2 destination --
+    the one case where an external Shoutcast DNAS /statistics endpoint
+    is actually known to exist and be valid to poll (this project's own
+    real, currently-deployed encoders, confirmed shoutcast2/mp3 and
+    shoutcast2/aac). Everything else routes through the generic
+    Liquidsoap destination-connection signal instead (see
+    evaluate_encoder_group_health's own docstring):
+
+      - Icecast (any provider, including Live365 -- fundamentally an
+        Icecast source destination) has no Shoutcast DNAS concept at
+        all; Encoder.shoutcast_sid is already None for it, which used
+        to silently make fetch_shoutcast_stats(...).get(None) read as
+        "absent" -- i.e. always critical -- a real, if never-yet-hit
+        (no Icecast rows have been deployed), pre-existing gap this
+        capability check closes generically for every future Icecast
+        row, not just Live365's.
+      - Radio.co is a Shoutcast-1-STYLE external-broadcaster ingest, but
+        its hosted endpoint is NOT assumed to expose a normal Shoutcast
+        DNAS /statistics interface just because the wire protocol
+        matches -- provider=="radio_co" is excluded even though
+        protocol=="shoutcast1" would otherwise qualify.
+
+    `getattr` with a "generic" default: real Encoder rows always have
+    `.provider` (roadmap 3.10 model field), but the LKG-metadata-derived
+    SimpleNamespace stand-ins used for rollback health-checking
+    (encoders.services.lkg.destinations_from_lkg_meta) only carry it
+    from a promotion recorded after this feature shipped -- a legacy
+    stand-in without it degrades to "generic," matching this project's
+    established legacy-LKG-metadata compatibility pattern elsewhere in
+    that same module."""
+    provider = getattr(enc, "provider", "generic") or "generic"
+    return provider == "generic" and enc.protocol in ("shoutcast1", "shoutcast2")
+
+
 def evaluate_encoder_group_health(slug, encoders, systemd_unit):
     """The truthful aggregate for one encoder input-device group,
     combining every signal a single systemd/audio_silence check could
@@ -531,12 +566,42 @@ def evaluate_encoder_group_health(slug, encoders, systemd_unit):
     if is_blank:
         return "critical", {**detail, "reason": "silent -- no audio detected"}
 
-    # 5. Real, external Shoutcast destination status -- the signal that
-    # actually caught the 2026-08-05 outage, independent of anything
-    # this project's own monitoring reported. Listener count never
-    # participates -- a stream with zero listeners can still be healthy.
+    # 5. Destination connection status -- TWO complementary signals,
+    # routed per-encoder by capability/provider semantics (roadmap 3.10),
+    # never by scattered hostname special-casing:
+    #
+    #   a) Real, external Shoutcast /statistics destination status -- the
+    #      signal that actually caught the 2026-08-05 outage, independent
+    #      of anything this project's own monitoring reported. Reserved
+    #      for provider=="generic" Shoutcast 1/2 destinations, i.e. a
+    #      normal Shoutcast DNAS endpoint where this probe is known
+    #      valid -- see _uses_shoutcast_dnas_probe below.
+    #
+    #   b) The generic Liquidsoap output connection-state signal (the
+    #      audio-state file's own "destinations" list, written by
+    #      encoder_manager.py's build_liquidsoap_script via each
+    #      output.*'s .on_connect/.on_disconnect) -- everything else:
+    #      Icecast of any provider (including Live365, which is
+    #      fundamentally an Icecast source destination), and Radio.co
+    #      (fundamentally a Shoutcast-1-style source destination, but
+    #      NOT assumed to expose a normal Shoutcast DNAS /statistics
+    #      interface just because the wire protocol is Shoutcast).
+    #      Fail-closed: missing/null/false all read as "not connected" --
+    #      a wrong password that reconnects forever must never read as
+    #      healthy just because nothing raised an exception. This is
+    #      POSITIVE evidence of an established connection, never
+    #      softened to a "warning" the way an unreachable external
+    #      Shoutcast poll is below -- a group's own self-reported
+    #      destination state is never "temporarily unknowable" the way
+    #      an external HTTP fetch can be.
+    #
+    # In neither case does listener count participate -- a stream with
+    # zero listeners can still be healthy.
+    dnas_encoders = [e for e in encoders if _uses_shoutcast_dnas_probe(e)]
+    generic_encoders = [e for e in encoders if not _uses_shoutcast_dnas_probe(e)]
+
     by_server = defaultdict(list)
-    for enc in encoders:
+    for enc in dnas_encoders:
         by_server[(enc.host, enc.port)].append(enc)
 
     sid_results = []
@@ -554,8 +619,36 @@ def evaluate_encoder_group_health(slug, encoders, systemd_unit):
             })
     detail["destinations"] = sid_results
 
-    down = [r for r in sid_results if not r["up"]]
-    if down:
+    # Generic destinations are matched against the audio-state file's own
+    # "destinations" list (see build_liquidsoap_script/_output_block) by
+    # str(id) -- the SAME string-typed matching convention Encoder.
+    # shoutcast_sid already established, so a real integer Encoder.id on
+    # one side and a JSON-string "id" on the other never silently fail
+    # to match on a type technicality.
+    generic_state_by_id = {str(d.get("id")): d for d in (audio_state.get("destinations") or [])}
+    generic_results = []
+    for enc in generic_encoders:
+        entry = generic_state_by_id.get(str(enc.id))
+        connected = entry.get("connected") if entry else None
+        generic_results.append({
+            "encoder_id": enc.id, "name": enc.name,
+            "connected": bool(connected) if connected is not None else None,
+            "reporting": entry is not None,
+        })
+    detail["generic_destinations"] = generic_results
+
+    down_generic = [r for r in generic_results if not r["connected"]]
+    if down_generic:
+        # Never softened to "warning" -- see the comment block above.
+        parts = [
+            f"{r['name']} (id={r['encoder_id']}): "
+            + ("destination connection not yet reported" if not r["reporting"] else "not connected -- reconnecting or failed")
+            for r in down_generic
+        ]
+        return "critical", {**detail, "reason": "destination(s) not connected -- " + "; ".join(parts)}
+
+    down_dnas = [r for r in sid_results if not r["up"]]
+    if down_dnas:
         if server_unreachable:
             # A single unreachable poll can't distinguish "genuinely
             # down" from "couldn't ask right now" -- warning, not an
@@ -566,7 +659,7 @@ def evaluate_encoder_group_health(slug, encoders, systemd_unit):
             return "warning", {**detail, "reason": "Shoutcast server unreachable -- destination status unknown"}
         parts = [
             f"SID {r['sid']} ({r['name']}): {'absent' if not r['present'] else 'STREAMSTATUS=0'}"
-            for r in down
+            for r in down_dnas
         ]
         return "critical", {**detail, "reason": "destination(s) down -- " + "; ".join(parts)}
 

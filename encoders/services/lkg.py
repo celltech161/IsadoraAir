@@ -118,7 +118,24 @@ _KEEP_VERSIONS = 2
 # manual and obvious (see compute_fingerprint's own docstring for why
 # this is NOT derived by hashing source files). Cross-referenced at
 # build_liquidsoap_script's own definition in encoder_manager.py.
-ENCODER_CONFIG_FORMAT_VERSION = 1
+#
+# 1 -> 2 (roadmap 3.10, 2026-08-11): build_liquidsoap_script now wires a
+# generic Liquidsoap destination connection-state signal (per-encoder
+# on_connect/on_disconnect -> the audio-state file's "destinations"
+# list) into every rendered script, and monitoring/services/probes.py's
+# evaluate_encoder_group_health now requires that signal for any
+# destination not using the external Shoutcast DNAS /statistics probe
+# (see _uses_shoutcast_dnas_probe) -- both the RENDERED SCRIPT and the
+# HEALTH-CHECK CONTRACT changed for the exact same DB rows. A
+# pre-existing accepted fingerprint computed under version 1 must not
+# be trusted as still-proven under version 2's different runtime
+# contract -- bumping this forces every group to re-validate,
+# re-preflight, and re-qualify (candidate probation) its current
+# configuration once, through the new contract, before being trusted
+# as last-known-good again. This is the intended, one-time effect of
+# deploying this change, not a bug -- see this feature's own completion
+# report for what to expect immediately after deploy.
+ENCODER_CONFIG_FORMAT_VERSION = 2
 
 
 def _ensure_dir(path, mode):
@@ -537,6 +554,17 @@ def destinations_from_lkg_meta(lkg_meta):
             id=d.get("encoder_id"), name=d.get("name"),
             host=d.get("host"), port=d.get("port"), shoutcast_sid=d.get("shoutcast_sid"),
             protocol=d.get("protocol"), mount=d.get("mount"),
+            # Roadmap 3.10: defaults to "generic" for an LKG promoted
+            # before `provider` existed in this metadata -- every
+            # currently-deployed historical Encoder is effectively
+            # generic, matching the exact compatibility pattern
+            # `protocol`/`mount` already established here (Phase 3M).
+            # Consumed by monitoring/services/probes.py's
+            # _uses_shoutcast_dnas_probe to decide whether this
+            # reconstructed destination should be checked via the
+            # external Shoutcast DNAS /statistics probe or the generic
+            # Liquidsoap destination-connection signal.
+            provider=d.get("provider") or "generic",
         )
         for d in destinations
     ]

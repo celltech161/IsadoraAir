@@ -20,6 +20,7 @@ qualification/promotion/rollback machinery Phase 2 already has tests
 for; this file is about WHEN/WHETHER that machinery gets invoked for an
 already-running group, not a second implementation of qualification
 itself."""
+import json
 import subprocess
 import time
 from unittest.mock import MagicMock, patch
@@ -32,6 +33,7 @@ from encoders.services import lkg as lkg_module
 from encoders.services import preflight as preflight_module
 from encoders.services import validation as validation_module
 from encoders.tests.test_candidate_qualification import CandidateFixtureMixin
+from monitoring.services import probes as probes_module
 
 
 def make_saved_encoder(name="test-mp3", **overrides):
@@ -1283,3 +1285,295 @@ class IntentionalStopSafetyTests(ReconciliationFixtureMixin, TransactionTestCase
                 manager._check_health()
         titles = [call.kwargs.get("title", "") for call in mock_emit.call_args_list]
         self.assertTrue(any("reconciliation scan failed" in t for t in titles))
+
+
+# ---------------------------------------------------------------------
+# Roadmap 3.10 -- provider/mp3_rate_mode are RUNTIME_AFFECTING_FIELDS,
+# so editing either alone (with every other field held fixed) must
+# reconcile exactly like editing host/bitrate/etc. already does --
+# only the changed group, real candidate probation, unrelated groups
+# completely untouched. Mirrors ChangedAmongTwoTests/
+# StaticFailureLeavesRunningGroupUntouchedTests' own patterns exactly,
+# just varying the field that changed.
+# ---------------------------------------------------------------------
+class ProviderFieldReconciliationTests(ReconciliationFixtureMixin, TransactionTestCase):
+    def test_provider_only_change_reconciles_group_leaves_other_group_untouched(self):
+        manager = em.EncoderManager()
+        encoder_a = make_saved_encoder(
+            name="a", host="10.0.0.1", protocol="icecast", mount="/stream",
+            username="source", format="mp3", bitrate_kbps=192, provider="generic",
+        )
+        encoder_b = make_saved_encoder(name="b", host="10.0.0.2", input_device="plughw:3,1")
+        pid_a_before, gen_a_before = self.bootstrap_accepted(manager, "airtap", encoder_a)
+        pid_b, gen_b = self.bootstrap_accepted(manager, "plughw:3,1", encoder_b)
+        proc_b = self._live_procs[pid_b]
+
+        # provider ONLY -- nothing else about the row changes, and it's
+        # still a fully valid Live365 row (icecast/mp3/192kbps=effective
+        # CBR/mount+username+password all present).
+        encoder_a.provider = "live365"
+        encoder_a.save()
+
+        with patch.object(preflight_module, "run_preflight", return_value=preflight_module.PreflightResult(ok=True)):
+            manager._check_health()
+
+        self.assertEqual(manager._launch_kind["airtap"], "candidate")
+        self.assertNotEqual(manager._current["airtap"]["generation"], gen_a_before)
+        self.assertEqual(manager._current["plughw:3,1"]["pid"], pid_b)
+        self.assertEqual(manager._current["plughw:3,1"]["generation"], gen_b)
+        proc_b.terminate.assert_not_called()
+
+        self.qualify_via_check_health(manager)
+
+        self.assertEqual(manager._launch_kind["airtap"], "accepted")
+        self.assertEqual(manager._current["plughw:3,1"]["pid"], pid_b)
+        self.assertEqual(manager._current["plughw:3,1"]["generation"], gen_b)
+        proc_b.terminate.assert_not_called()
+
+        meta = lkg_module.read_lkg_meta(em._slug("airtap"))
+        self.assertEqual(meta["destinations"][0]["provider"], "live365")
+
+    def test_mp3_rate_mode_only_change_reconciles_group(self):
+        manager = em.EncoderManager()
+        encoder = make_saved_encoder(mp3_rate_mode="auto", bitrate_kbps=128)
+        pid_before, gen_before = self.bootstrap_accepted(manager, "airtap", encoder)
+
+        encoder.mp3_rate_mode = "cbr"
+        encoder.save()
+
+        with patch.object(preflight_module, "run_preflight", return_value=preflight_module.PreflightResult(ok=True)):
+            manager._check_health()
+
+        self.assertEqual(manager._launch_kind["airtap"], "candidate")
+        self.assertNotEqual(manager._current["airtap"]["generation"], gen_before)
+
+        self.qualify_via_check_health(manager)
+        self.assertEqual(manager._launch_kind["airtap"], "accepted")
+
+    def test_invalid_provider_candidate_never_replaces_accepted_child(self):
+        """Changing provider to Live365 while leaving the row's protocol
+        at Shoutcast 2 (Live365 requires Icecast) fails centralized
+        provider validation -- the accepted child and its LKG must stay
+        completely untouched, same as any other static-validation
+        rejection."""
+        manager = em.EncoderManager()
+        encoder = make_saved_encoder(protocol="shoutcast2", mount="/1")
+        pid_before, gen_before = self.bootstrap_accepted(manager, "airtap", encoder)
+        proc = self._live_procs[pid_before]
+        lkg_before, meta_before = lkg_module.read_lkg(em._slug("airtap"))
+
+        encoder.provider = "live365"  # still protocol=shoutcast2 -- invalid combo
+        encoder.save()
+
+        manager._check_health()
+
+        proc.terminate.assert_not_called()
+        self.assertEqual(manager._current["airtap"]["pid"], pid_before)
+        self.assertEqual(manager._current["airtap"]["generation"], gen_before)
+        lkg_after, meta_after = lkg_module.read_lkg(em._slug("airtap"))
+        self.assertEqual(lkg_after, lkg_before)
+        self.assertEqual(meta_after["fingerprint"], meta_before["fingerprint"])
+
+        state = self.read_group_state("airtap")
+        self.assertEqual(state["last_reconcile_result"], "static_validation_rejected")
+        self.assertIn("Live365", state["last_reconcile_error"])
+
+    def test_failed_provider_candidate_rolls_back_to_lkg(self):
+        """A provider edit that PASSES static validation/preflight (a
+        genuinely valid Live365 row) but whose live child then crashes
+        during probation must roll back to the last-known-good
+        configuration -- same as any other live-qualification failure,
+        just triggered by a provider-preset row this time."""
+        manager = em.EncoderManager()
+        encoder = make_saved_encoder(
+            protocol="icecast", mount="/stream", username="source",
+            format="mp3", bitrate_kbps=192, provider="generic",
+        )
+        self.bootstrap_accepted(manager, "airtap", encoder)
+        lkg_before, meta_before = lkg_module.read_lkg(em._slug("airtap"))
+
+        encoder.provider = "live365"  # still a fully valid Live365 row
+        encoder.save()
+        with patch.object(preflight_module, "run_preflight", return_value=preflight_module.PreflightResult(ok=True)):
+            manager._check_health()
+        self.assertEqual(manager._launch_kind["airtap"], "candidate")
+
+        self.exit_current_child(manager, "airtap", returncode=1)
+        manager._check_health()  # observes the crash -> _reject_live_candidate -> _start_rollback
+
+        self.qualify_via_check_health(manager)
+
+        self.assertEqual(manager._launch_kind["airtap"], "accepted")
+        lkg_after, meta_after = lkg_module.read_lkg(em._slug("airtap"))
+        self.assertEqual(meta_after["fingerprint"], meta_before["fingerprint"])
+        self.assertEqual(meta_after["destinations"][0]["provider"], "generic")
+
+    def test_corrected_provider_configuration_can_be_tried_fresh(self):
+        """After a provider edit is rejected by static validation, the
+        SAME group must accept a later, corrected edit -- a rejected
+        fingerprint blocks retrying the EXACT same bad configuration,
+        never a structurally different (fixed) one."""
+        manager = em.EncoderManager()
+        encoder = make_saved_encoder(protocol="shoutcast2", mount="/1")
+        self.bootstrap_accepted(manager, "airtap", encoder)
+
+        encoder.provider = "live365"  # invalid -- still protocol=shoutcast2
+        encoder.save()
+        manager._check_health()
+        self.assertEqual(manager._launch_kind["airtap"], "accepted")  # rejected, untouched
+
+        # Now actually fix it -- a DIFFERENT (valid) fingerprint.
+        encoder.protocol = "icecast"
+        encoder.mount = "/stream"
+        encoder.username = "source"
+        encoder.save()
+        with patch.object(preflight_module, "run_preflight", return_value=preflight_module.PreflightResult(ok=True)):
+            manager._check_health()
+        self.assertEqual(manager._launch_kind["airtap"], "candidate")
+
+        self.qualify_via_check_health(manager)
+        self.assertEqual(manager._launch_kind["airtap"], "accepted")
+        meta = lkg_module.read_lkg_meta(em._slug("airtap"))
+        self.assertEqual(meta["destinations"][0]["provider"], "live365")
+        self.assertEqual(meta["destinations"][0]["protocol"], "icecast")
+
+    def test_promoted_lkg_metadata_never_contains_password_even_with_provider(self):
+        manager = em.EncoderManager()
+        secret = "sUp3rS3cr3tPassw0rd!!"
+        encoder = make_saved_encoder(
+            protocol="icecast", mount="/stream", username="source",
+            provider="live365", format="mp3", bitrate_kbps=192,
+            password=secret,
+        )
+        self.bootstrap_accepted(manager, "airtap", encoder)
+        meta = lkg_module.read_lkg_meta(em._slug("airtap"))
+        self.assertNotIn(secret, json.dumps(meta))
+
+
+# ---------------------------------------------------------------------
+# Roadmap 3.10 pre-commit review, item 7 -- the v1 -> v2
+# ENCODER_CONFIG_FORMAT_VERSION transition this feature's own deploy
+# triggers (see lkg.py's ENCODER_CONFIG_FORMAT_VERSION docstring).
+# Walks the EXACT real-production scenario explicitly: existing
+# provider="generic"/mp3_rate_mode="auto" Shoutcast2 rows, an LKG
+# persisted under the OLD format version, with metadata that predates
+# "provider" entirely and a script whose text structurally lacks the
+# new destination-connection-state instrumentation.
+# ---------------------------------------------------------------------
+class LegacyV1ToV2ConfigFormatTransitionTests(ReconciliationFixtureMixin, TransactionTestCase):
+    def _write_v1_lkg(self, input_device, encoders, script='generation = "g"\n'):
+        """A promoted LKG exactly as it would have looked before this
+        feature existed: fingerprint computed under format version 1,
+        metadata with no "provider" key at all, and a script whose
+        text never mentions on_connect/on_disconnect/"destinations" --
+        real pre-deploy shape, not a simplified stand-in."""
+        with patch.object(lkg_module, "ENCODER_CONFIG_FORMAT_VERSION", 1):
+            fp = lkg_module.compute_fingerprint(input_device, encoders)
+        meta = {
+            "fingerprint": fp, "input_device": input_device,
+            "encoder_ids": [e.id for e in encoders], "encoder_names": [e.name for e in encoders],
+            "destinations": [
+                {
+                    "encoder_id": e.id, "name": e.name, "host": e.host, "port": e.port,
+                    "shoutcast_sid": e.shoutcast_sid, "protocol": e.protocol, "mount": e.mount,
+                    # deliberately NO "provider" key -- predates the field entirely
+                }
+                for e in encoders
+            ],
+        }
+        lkg_module.write_lkg(em._slug(input_device), script, meta)
+        return fp
+
+    def test_version_bump_alone_forces_reconciliation_of_unchanged_generic_row(self):
+        """Walkthrough items 1-2: an otherwise completely unchanged
+        generic/shoutcast2/auto row must NOT take the accepted fast
+        path once ENCODER_CONFIG_FORMAT_VERSION has moved on -- Phase 3
+        (here, cold-bootstrap _launch_group, the same code path start()
+        itself calls) must treat it as a new candidate to re-validate/
+        re-qualify under the new runtime contract, not silently keep
+        trusting the old fingerprint."""
+        encoder = make_saved_encoder(provider="generic", mp3_rate_mode="auto")
+        v1_fp = self._write_v1_lkg("airtap", [encoder])
+        current_fp = lkg_module.compute_fingerprint("airtap", [encoder])
+        self.assertNotEqual(v1_fp, current_fp)  # the version bump alone changed it
+
+        manager = em.EncoderManager()
+        with patch.object(preflight_module, "run_preflight", return_value=preflight_module.PreflightResult(ok=True)):
+            manager._launch_group("airtap", [encoder])  # exactly what start() does per group
+
+        # NOT the fast path -- a candidate on probation, not "accepted"
+        # silently reusing the old v1 script.
+        self.assertEqual(manager._launch_kind["airtap"], "candidate")
+        self.assertEqual(manager._candidate_fingerprint["airtap"], current_fp)
+
+    def test_v1_lkg_remains_usable_for_rollback_and_qualifies_via_dnas(self):
+        """Walkthrough items 3-6: if the fresh v2 candidate fails to
+        qualify, the OLD v1 LKG script must still be usable as rollback
+        protection -- and for this REAL production shape (generic
+        Shoutcast2), rollback qualification goes through the EXTERNAL
+        DNAS probe exactly as it always did, completely independent of
+        the new destination-connection signal the old script
+        structurally cannot produce (it predates that instrumentation
+        entirely -- its audio-state file will never contain a
+        "destinations" key at all, not even an empty one). Missing
+        "provider" in the old metadata resolves safely to "generic",
+        which is exactly what routes this destination through DNAS
+        instead of the unavailable generic signal -- proven directly
+        against the real _uses_shoutcast_dnas_probe, not just implied."""
+        encoder = make_saved_encoder(provider="generic", mp3_rate_mode="auto", host="10.0.0.5", port=8010, mount="/1")
+        self._write_v1_lkg("airtap", [encoder])
+
+        manager = em.EncoderManager()
+        with patch.object(preflight_module, "run_preflight", return_value=preflight_module.PreflightResult(ok=True)):
+            manager._launch_group("airtap", [encoder])
+        self.assertEqual(manager._launch_kind["airtap"], "candidate")
+
+        # The fresh v2 candidate crashes during probation.
+        self.exit_current_child(manager, "airtap", returncode=1)
+        manager._check_health()  # -> _reject_live_candidate -> _start_rollback (relaunches the v1 script)
+        self.assertEqual(manager._launch_kind["airtap"], "rollback")
+
+        # The reconstructed rollback stand-in resolves to "generic"
+        # (item 7's #4) and is therefore DNAS-eligible (item 7's #5/#6)
+        # despite the old script never having written a "destinations"
+        # JSON field at all -- proven directly against the real
+        # _uses_shoutcast_dnas_probe/destinations_from_lkg_meta, not
+        # just implied. (evaluate_encoder_group_health's own end-to-end
+        # behavior against a genuinely legacy-shaped audio-state file --
+        # no "destinations" key at all -- is proven separately, in
+        # monitoring/tests/test_probe_encoder_group.py's
+        # LegacyPreV2AudioStateDnasStillWorksTests: this file's own
+        # ReconciliationFixtureMixin mocks evaluate_encoder_group_health
+        # for its whole test body by design, same as every other test
+        # here, so it isn't the right place to exercise the real
+        # function -- only the orchestration around it.)
+        expected = manager._qualify_expected["airtap"]
+        self.assertEqual(len(expected), 1)
+        self.assertEqual(getattr(expected[0], "provider", None), "generic")
+        self.assertTrue(probes_module._uses_shoutcast_dnas_probe(expected[0]))
+
+        # Rollback still reaches "accepted" through the ordinary
+        # qualification mechanism -- nothing about the legacy stand-in
+        # trips up the orchestration itself.
+        self.qualify_via_check_health(manager)
+        self.assertEqual(manager._launch_kind["airtap"], "accepted")
+
+    def test_successful_v2_candidate_promotion_replaces_accepted_lkg_normally(self):
+        """Walkthrough item 7: the complementary, ordinary-success case
+        -- once the fresh v2 candidate DOES qualify, it replaces the
+        old v1 LKG exactly like any other promotion, now recording
+        "provider" going forward."""
+        encoder = make_saved_encoder(provider="generic", mp3_rate_mode="auto")
+        self._write_v1_lkg("airtap", [encoder])
+
+        manager = em.EncoderManager()
+        with patch.object(preflight_module, "run_preflight", return_value=preflight_module.PreflightResult(ok=True)):
+            manager._launch_group("airtap", [encoder])
+        self.assertEqual(manager._launch_kind["airtap"], "candidate")
+
+        self.qualify_via_check_health(manager)
+
+        self.assertEqual(manager._launch_kind["airtap"], "accepted")
+        meta = lkg_module.read_lkg_meta(em._slug("airtap"))
+        self.assertEqual(meta["destinations"][0]["provider"], "generic")
+        self.assertEqual(meta["fingerprint"], lkg_module.compute_fingerprint("airtap", [encoder]))

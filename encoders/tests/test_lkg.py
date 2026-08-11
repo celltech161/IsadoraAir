@@ -128,6 +128,21 @@ class ComputeFingerprintTests(SimpleTestCase):
             lkg.compute_fingerprint("airtap", tied_different),
         )
 
+    def test_provider_change_changes_fingerprint(self):
+        """Roadmap 3.10: provider is in RUNTIME_AFFECTING_FIELDS even
+        though it never changes the literal output.icecast()/
+        output.shoutcast() syntax rendered -- it changes validation
+        semantics and which destination-health path this row uses, so
+        it must force a fresh fingerprint like every other field here."""
+        a = lkg.compute_fingerprint("airtap", [make_encoder(protocol="icecast", mount="/s", provider="generic")])
+        b = lkg.compute_fingerprint("airtap", [make_encoder(protocol="icecast", mount="/s", provider="live365")])
+        self.assertNotEqual(a, b)
+
+    def test_mp3_rate_mode_change_changes_fingerprint(self):
+        a = lkg.compute_fingerprint("airtap", [make_encoder(mp3_rate_mode="auto")])
+        b = lkg.compute_fingerprint("airtap", [make_encoder(mp3_rate_mode="cbr")])
+        self.assertNotEqual(a, b)
+
     def test_empty_encoder_list_is_deterministic(self):
         a = lkg.compute_fingerprint("airtap", [])
         b = lkg.compute_fingerprint("airtap", [])
@@ -595,6 +610,24 @@ class DestinationsFromLkgMetaTests(SimpleTestCase):
         meta = {"destinations": [{"encoder_id": 5, "name": "n", "host": "h", "port": 8000, "shoutcast_sid": "1"}]}
         stand_in = lkg.destinations_from_lkg_meta(meta)[0]
         self.assertIsNone(normalized_destination_key(stand_in))
+
+    def test_reconstructs_provider_field(self):
+        meta = {"destinations": [{
+            "encoder_id": 5, "name": "n", "host": "h", "port": 8000,
+            "shoutcast_sid": None, "protocol": "icecast", "mount": "/live", "provider": "live365",
+        }]}
+        result = lkg.destinations_from_lkg_meta(meta)
+        self.assertEqual(result[0].provider, "live365")
+
+    def test_legacy_metadata_without_provider_degrades_to_generic(self):
+        """Roadmap 3.10: every currently-deployed historical Encoder is
+        effectively generic -- an LKG promoted before `provider` existed
+        in this metadata must degrade to "generic", not None/KeyError,
+        matching the exact compatibility pattern protocol/mount already
+        established (Phase 3M) rather than a new, different fallback."""
+        meta = {"destinations": [{"encoder_id": 5, "name": "n", "host": "h", "port": 8000, "shoutcast_sid": "1"}]}
+        result = lkg.destinations_from_lkg_meta(meta)
+        self.assertEqual(result[0].provider, "generic")
 
 
 class ResolveExpectedDestinationsTests(LkgDirFixtureMixin, SimpleTestCase):
