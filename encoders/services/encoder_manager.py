@@ -2442,9 +2442,30 @@ class EncoderManager:
         back immediately). Also used by _retry_group's own "no enabled
         encoders left" branch (replacing what used to be separate,
         near-identical inline cleanup there) -- one implementation of
-        "forget about this group" instead of two."""
+        "forget about this group" instead of two.
+
+        Post-commit review-fix: _stop_group_intentionally's own safety
+        contract is "if the old child's death can't be confirmed,
+        change NOTHING -- leave reality exactly as it was" (see its own
+        docstring). This function used to ignore that return value
+        entirely and unconditionally forget the group's state and
+        announce it removed regardless -- exactly the "preserve
+        reality" contract it's supposed to honor, silently violated by
+        its own caller. Now aborts before touching ANY bookkeeping if
+        the stop wasn't confirmed: no retry/rejection/fingerprint
+        state cleared, no "removed" event, no group-state deletion --
+        the group stays fully intact and eligible to have removal
+        retried on a later reconciliation tick, never silently
+        forgotten while a process might still be alive. Returns True
+        on successful removal, False if aborted."""
         if input_device in self._procs:
-            self._stop_group_intentionally(input_device, reason="no enabled encoders remain for this input device")
+            if not self._stop_group_intentionally(input_device, reason="no enabled encoders remain for this input device"):
+                # Already logged/emitted critical inside
+                # _stop_group_intentionally; record the removal-level
+                # outcome too, but change nothing else -- this group
+                # is NOT removed, its state is NOT forgotten.
+                self._record_reconcile_outcome(input_device, "remove_failed", "could not confirm prior process had stopped")
+                return False
         self._retry_index.pop(input_device, None)
         self._retry_at.pop(input_device, None)
         self._meta.pop(input_device, None)
@@ -2469,6 +2490,7 @@ class EncoderManager:
             _group_state_path(input_device).unlink(missing_ok=True)
         except OSError:
             pass
+        return True
 
     def _reconcile_changed_group(self, input_device, desired_encoders, desired_fp):
         """Phase 3D-G: replace an ALREADY-RUNNING group's child with a

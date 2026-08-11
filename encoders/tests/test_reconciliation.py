@@ -1087,6 +1087,80 @@ class IntentionalStopSafetyTests(ReconciliationFixtureMixin, TransactionTestCase
         # No replacement was ever launched for this device.
         self.assertEqual(self.popen_call_count(), calls_before)
 
+    def test_removed_group_with_unconfirmable_stop_is_not_forgotten(self):
+        """Post-commit review-fix: _remove_group_intentionally() used
+        to ignore _stop_group_intentionally's False return and forget
+        the group's state (clear bookkeeping, emit "removed", delete
+        the group-state file) regardless -- contradicting the exact
+        safety contract _stop_group_intentionally exists to provide.
+        Removal happens at the very start of every reconciliation
+        pass, so this is checked first, before any other collision/
+        replacement logic even runs."""
+        manager = em.EncoderManager()
+        encoder = make_saved_encoder()
+        pid_before, gen_before = self.bootstrap_accepted(manager, "airtap", encoder)
+        proc = self._live_procs[pid_before]
+        proc.wait.side_effect = subprocess.TimeoutExpired(cmd="liquidsoap", timeout=5)
+        running_encoders_before = manager._running_encoders["airtap"]
+        running_fp_before = manager._running_fingerprint["airtap"]
+        calls_before = self.popen_call_count()
+        self.assertTrue(em._group_state_path_for_slug("airtap").exists())
+
+        # The group's only enabled encoder disappears -- this is now a
+        # "removed" group.
+        encoder.enabled = False
+        encoder.save()
+
+        with patch("os.kill") as mock_kill:  # last-resort liveness check also says "still alive"
+            mock_kill.return_value = None
+            with patch("encoders.services.encoder_manager.emit_event") as mock_emit:
+                manager._check_health()
+
+        # The child was never forgotten -- still tracked exactly as it was.
+        self.assertIn("airtap", manager._procs)
+        self.assertIs(manager._procs["airtap"], proc)
+        self.assertEqual(manager._current["airtap"]["pid"], pid_before)
+        self.assertEqual(manager._current["airtap"]["generation"], gen_before)
+        self.assertEqual(manager._running_fingerprint["airtap"], running_fp_before)
+        self.assertEqual(manager._running_encoders["airtap"], running_encoders_before)
+        # A stop WAS attempted, but never confirmed -- and critically,
+        # no replacement/second process was ever spawned in its place.
+        proc.terminate.assert_called()
+        self.assertEqual(self.popen_call_count(), calls_before)
+
+        # No "removed" outcome anywhere.
+        titles = [call.kwargs.get("title", "") for call in mock_emit.call_args_list]
+        self.assertFalse(any("removed" in t.lower() and "could not confirm" not in t.lower() for t in titles))
+        self.assertTrue(any("could not confirm prior process stopped" in t for t in titles))
+
+        # Group-state was NOT deleted, and correctly reports the
+        # remove-failed outcome while still describing the (presumed
+        # live) old process.
+        self.assertTrue(em._group_state_path_for_slug("airtap").exists())
+        state = self.read_group_state("airtap")
+        self.assertEqual(state["last_reconcile_result"], "remove_failed")
+        self.assertEqual(state["pid"], pid_before)
+        self.assertEqual(state["generation"], gen_before)
+
+        # A later tick may retry removal -- still refusing to die, it
+        # must STILL never be forgotten (not a one-shot bug).
+        with patch("os.kill") as mock_kill:
+            mock_kill.return_value = None
+            manager._check_health()
+        self.assertIn("airtap", manager._procs)
+        self.assertEqual(manager._current["airtap"]["pid"], pid_before)
+        self.assertTrue(em._group_state_path_for_slug("airtap").exists())
+
+        # Once the process genuinely stops responding to kill (a real
+        # death, simulated here by letting wait() succeed), the SAME
+        # retry mechanism correctly completes the removal.
+        proc.wait.side_effect = None
+        proc.wait.return_value = 0
+        manager._check_health()
+        self.assertNotIn("airtap", manager._procs)
+        self.assertNotIn("airtap", manager._current)
+        self.assertFalse(em._group_state_path_for_slug("airtap").exists())
+
     def test_reconcile_scan_exception_does_not_crash_check_health(self):
         manager = em.EncoderManager()
         make_saved_encoder()
