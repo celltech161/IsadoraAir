@@ -87,51 +87,21 @@ def compute_stats(period_start, period_end):
     }
 
 
-def compute_ath(period_start, period_end):
-    """Aggregate Tuning Hours derived from IcecastSample rows in the
-    period. Integrates listeners * dt across the period, where dt is
-    the actual time between consecutive samples (with a 1h cap to
-    defend against sampler outages). Returns 0.0 if there are no
-    samples at all in the period.
-
-    Not called if the operator supplies ath_override on the report
-    form -- the override wins."""
-    from library.models import IcecastSample
-    start, end = _period_bounds(period_start, period_end)
-    samples = list(
-        IcecastSample.objects
-        .filter(sampled_at__gte=start, sampled_at__lte=end)
-        .order_by("sampled_at")
-        .only("sampled_at", "listeners_total")
-    )
-    if not samples:
-        return 0.0
-    ath_seconds = 0.0
-    for i, s in enumerate(samples):
-        if i + 1 < len(samples):
-            dt = (samples[i + 1].sampled_at - s.sampled_at).total_seconds()
-        else:
-            dt = (end - s.sampled_at).total_seconds()
-        # Cap dt so a long gap (sampler outage, systemd stopped) can't
-        # inflate ATH from one over-weighted sample.
-        dt = min(max(dt, 0.0), 3600.0)
-        ath_seconds += s.listeners_total * dt
-    return ath_seconds / 3600.0
-
-
 def _encoder_label_map():
     """Map each live-sample key ("host:port/mount", as constructed by
     sample_icecast_listeners.py) to its Encoder's display name --
-    ENABLED encoders only. This is also the exclusion filter: the
-    Icecast/Shoutcast servers this station samples can carry OTHER
-    stations' streams alongside this station's own on the same shared
-    box (observed live on this install: SIDs 1 and 3 are this
-    station's configured Encoders, SIDs 2 and 4 belong to a different
-    station sharing the same physical Shoutcast server). IcecastSample
-    itself has no concept of "ours" -- listeners_by_mount just mirrors
-    whatever the server reports -- so compute_listener_series treats
-    any key with no entry here as not this station's and drops it
-    entirely, rather than showing it under its raw key.
+    ENABLED encoders only. This is also the exclusion filter -- and,
+    via _owned_listener_total below, the SAME exclusion filter every
+    consumer of IcecastSample listener data uses: the Icecast/
+    Shoutcast servers this station samples can carry OTHER stations'
+    streams alongside this station's own on the same shared box
+    (observed live on this install: SIDs 1 and 3 are this station's
+    configured Encoders, SIDs 2 and 4 belong to a different station
+    sharing the same physical Shoutcast server). IcecastSample itself
+    has no concept of "ours" -- listeners_by_mount just mirrors
+    whatever the server reports -- so every caller here treats any key
+    with no entry in this map as not this station's and drops it
+    entirely, rather than showing/counting it under its raw key.
 
     Reconstructs the key the exact same way the sampler does rather
     than duplicating that logic a second time: Icecast uses the
@@ -143,11 +113,13 @@ def _encoder_label_map():
     A disabled Encoder is deliberately excluded, not just unlabeled --
     this map is rebuilt fresh on every call (not cached, not FK-
     backed against IcecastSample), so disabling a stream in admin
-    removes it from this report on the very next request. That matches
-    "configured and enabled on this box" as the live definition of
-    "ours," at the cost of a disabled-then-re-enabled stream's
-    in-between history simply not existing in the chart -- acceptable
-    for a listener-trend view, not an audit trail."""
+    removes it from every report using this map on the very next
+    request/generation. That matches "configured and enabled on this
+    box" as the live definition of "ours," at the cost of a disabled-
+    then-re-enabled stream's in-between history simply not existing --
+    acceptable for a listener-trend view and for ATH (there being no
+    historical Encoder-ownership ledger is a deliberate scope
+    boundary, not an oversight), not an audit trail."""
     from encoders.models import Encoder
     labels = {}
     for enc in Encoder.objects.filter(enabled=True):
@@ -160,6 +132,75 @@ def _encoder_label_map():
             continue
         labels[f"{enc.host}:{enc.port}{mount}"] = enc.name
     return labels
+
+
+def _owned_listener_total(listeners_by_mount, owned_map):
+    """Sum of listener counts in one IcecastSample's listeners_by_mount
+    dict, counting only keys present in `owned_map` (as returned by
+    _encoder_label_map() -- i.e. belonging to a currently enabled
+    Encoder). Any other key -- another station sharing the same
+    physical Icecast/Shoutcast server, or a stream this box no longer
+    has configured -- contributes nothing, and a missing/empty
+    listeners_by_mount (the sampler couldn't reach the server that
+    cycle) correctly sums to 0 rather than falling back to any raw
+    server-wide total.
+
+    This is the ONE definition of "this station's listeners" shared by
+    compute_listener_series (per-bucket chart total) and compute_ath
+    (SoundExchange ATH integration) -- the two are structurally unable
+    to drift apart on what counts as "ours" as long as both call this
+    (and _encoder_label_map for `owned_map`) instead of each computing
+    it independently."""
+    return sum(count for key, count in (listeners_by_mount or {}).items() if key in owned_map)
+
+
+def compute_ath(period_start, period_end):
+    """Aggregate Tuning Hours derived from IcecastSample rows in the
+    period.
+
+    Source of truth: `listeners_by_mount`, filtered through
+    _owned_listener_total/_encoder_label_map to streams belonging to a
+    CURRENTLY ENABLED IsadoraAir Encoder row -- never the sample's raw
+    `listeners_total`, which is the whole server's listener count and
+    can include another station's streams when this station shares a
+    physical Icecast/Shoutcast server with one. A sample whose
+    listeners_by_mount is empty/missing contributes 0 for the interval
+    it represents, never a fallback to listeners_total (that fallback
+    would silently reintroduce the exact bug this exists to prevent,
+    precisely when structured per-stream data is unavailable).
+
+    Integrates owned-listeners * dt across the period, where dt is the
+    actual time between consecutive samples, capped at 1h so a long
+    gap (sampler outage, systemd stopped) can't inflate ATH from one
+    over-weighted sample. The final sample's dt runs to the period
+    end. Negative dt (clock skew / out-of-order rows) is clamped to 0.
+    Returns 0.0 if there are no samples at all in the period.
+
+    Not called if the operator supplies ath_override on the report
+    form -- the override wins, unconditionally (see
+    generate_soundexchange_nce)."""
+    from library.models import IcecastSample
+    start, end = _period_bounds(period_start, period_end)
+    samples = list(
+        IcecastSample.objects
+        .filter(sampled_at__gte=start, sampled_at__lte=end)
+        .order_by("sampled_at")
+        .only("sampled_at", "listeners_by_mount")
+    )
+    if not samples:
+        return 0.0
+    owned_map = _encoder_label_map()  # one query, reused across every sample below
+    ath_seconds = 0.0
+    for i, s in enumerate(samples):
+        if i + 1 < len(samples):
+            dt = (samples[i + 1].sampled_at - s.sampled_at).total_seconds()
+        else:
+            dt = (end - s.sampled_at).total_seconds()
+        # Cap dt so a long gap (sampler outage, systemd stopped) can't
+        # inflate ATH from one over-weighted sample.
+        dt = min(max(dt, 0.0), 3600.0)
+        ath_seconds += _owned_listener_total(s.listeners_by_mount, owned_map) * dt
+    return ath_seconds / 3600.0
 
 
 def compute_listener_series(period_start, period_end):
@@ -227,14 +268,15 @@ def compute_listener_series(period_start, period_end):
     for s in samples:
         idx = int((s.sampled_at.timestamp() - epoch0) // bucket_seconds)
         b = buckets.setdefault(idx, {"total": [], "streams": {}})
-        owned_total = 0
         for key, count in (s.listeners_by_mount or {}).items():
             label = labels.get(key)
             if label is None:
                 continue  # not a currently enabled Encoder on this box -- excluded
             b["streams"].setdefault(label, []).append(count)
-            owned_total += count
-        b["total"].append(owned_total)
+        # Same ownership sum compute_ath uses (_owned_listener_total) --
+        # not the loop above's per-label bookkeeping recomputed by hand,
+        # so this can't silently drift from what ATH counts as "ours."
+        b["total"].append(_owned_listener_total(s.listeners_by_mount, labels))
 
     points = []
     for idx in sorted(buckets):

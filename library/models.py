@@ -1862,9 +1862,20 @@ class IcecastSample(models.Model):
     server's mount table lands in a single row rather than N rows
     every minute; per-mount rollups happen at report time.
 
+    `listeners_total` is the RAW server-wide count -- every stream the
+    sampled Icecast/Shoutcast server reports, including another
+    station's, if this station shares a physical server with one (see
+    library/services/royalty_reports.py's module-level notes). It's
+    kept as observation/debugging data (e.g. the /reports/ sampler-
+    health line) but is NOT what ATH or Listener Stats use for "this
+    station's listeners" -- that's always `listeners_by_mount` filtered
+    to currently-enabled Encoder rows (_encoder_label_map /
+    _owned_listener_total), so a foreign stream sharing the server
+    never counts toward this station's SoundExchange reporting.
+
     ATH computation (library/services/royalty_reports.py compute_ath)
-    integrates listeners * dt across the reporting period, treating
-    each sample as instantaneous and its `listeners_total` as
+    integrates owned-listeners * dt across the reporting period,
+    treating each sample as instantaneous and its owned total as
     representative until the next sample. Handles irregular sampling
     gracefully by using the actual dt between consecutive samples,
     capped at 1h to prevent a single sample from dominating after a
