@@ -12,13 +12,15 @@ Fallback chain, in order:
   3. Embedded art extracted directly from the audio file (mutagen) —
      instant and offline-safe, and the best match available for an
      already-curated local library.
-  4. Oak Grove Radio's in-house hosted album art for mixshows/segments —
-     `https://artwork.oakgroveradio.com/{artist-slug}.png`, artist
-     name lowercased with spaces converted to hyphens. Checked for every
-     track regardless of category (unlike Deezer/iTunes below), since
-     this is specifically curated for exactly the syndicated non-music
-     content (mixshows, segments) that a public music catalog wouldn't
-     have anyway.
+  4. Optional station-hosted album artwork — `{base}/{artist-slug}.png`,
+     where `{base}` is `UITheme.load().hosted_album_art_base_url` (admin-
+     configured, blank by default/disabled) and the slug matches
+     `_slugify_artist()` below. Checked for every track regardless of
+     category (unlike Deezer/iTunes below), since this is meant for a
+     station's own in-house/syndicated content (mixshows, segments) that
+     a public music catalog wouldn't have anyway. A blank base URL means
+     this step is skipped entirely — no network request, straight
+     through to Deezer/iTunes/default.
   5. Deezer, via a same-origin server-side call (no browser CORS issues,
      one shot per track instead of a client-side multi-step chain).
   6. iTunes, as a last external fallback.
@@ -31,14 +33,18 @@ Ported/adapted from the Oak Grove Radio stream player's album-art lookup
 (deezer_proxy.php + client-side sanitize/fallback logic), with the
 Shoutcast-string-parsing piece dropped since IsadoraAir already has
 structured artist/title/album fields per track and direct filesystem
-access to the audio itself — but the artist-slug hosted-art step is kept
-and pointed at Oak Grove's real server, since that's genuine in-house
-content for this station's own mixshows/segments, not a stand-in for
-something IsadoraAir already has a better source for.
+access to the audio itself — but the artist-slug hosted-art step is kept,
+generalized into an admin-configurable base URL (`UITheme.
+hosted_album_art_base_url`) rather than a hard-coded Oak Grove Radio
+hostname, so a fresh IsadoraAir install doesn't default to querying
+someone else's infrastructure. Oak Grove Radio's own deployment configures
+its real server (`https://artwork.oakgroveradio.com/`) as that setting's
+value, same as any other station would configure its own.
 """
 import re
 import unicodedata
 from pathlib import Path
+from urllib.parse import urljoin
 
 import requests
 from django.conf import settings
@@ -46,7 +52,6 @@ from django.utils import timezone
 from mutagen import File as MutagenFile
 
 ART_CACHE_DIR = Path(settings.MEDIA_ROOT) / "album_art_cache"
-OAKGROVE_ALBUMART_BASE = "https://artwork.oakgroveradio.com/"
 
 _PRIMARY_TAG_MARKERS = ["rip", "remaster", "bit", "edit", "clean"]
 _FEAT_PATTERNS = [
@@ -95,11 +100,40 @@ def _slugify_artist(name):
     return re.sub(r"-+", "-", hyphenated)
 
 
-def _oakgrove_lookup(artist_name):
+def _build_hosted_art_url(base_url, slug):
+    """Joins a configured hosted-art base URL with an artist slug's PNG
+    filename, tolerant of whether the operator included a trailing
+    slash, and preserving any URL path prefix (e.g.
+    'https://example.org/isadora/art/').
+
+    Uses `urljoin` rather than raw string concatenation, but with one
+    important adjustment: `urljoin` treats a base URL's last path
+    segment as a "file" to be replaced unless the base already ends in
+    '/' -- e.g. urljoin('https://x/isadora/art', 'birdnote.png') would
+    otherwise silently drop 'art' and produce 'https://x/isadora/
+    birdnote.png'. Normalizing the base to always end in '/' first
+    (a no-op if it already does) sidesteps that footgun entirely and
+    makes both trailing-slash and no-trailing-slash operator input
+    resolve identically."""
+    if not base_url:
+        return None
+    normalized_base = base_url if base_url.endswith("/") else f"{base_url}/"
+    return urljoin(normalized_base, f"{slug}.png")
+
+
+def _hosted_art_lookup(artist_name, base_url):
+    """HEAD-checks the station-hosted artwork server configured via
+    UITheme.hosted_album_art_base_url. `base_url` is passed in
+    (rather than read here) so this stays a pure, easily-testable
+    function -- the caller is responsible for reading the current
+    dynamic UITheme value. A blank/falsy base_url means hosted lookup
+    is disabled: returns None immediately, no network request."""
+    if not base_url:
+        return None
     slug = _slugify_artist(artist_name)
     if not slug:
         return None
-    url = f"{OAKGROVE_ALBUMART_BASE}{slug}.png"
+    url = _build_hosted_art_url(base_url, slug)
     try:
         r = requests.head(url, timeout=5, allow_redirects=True)
         return url if r.status_code == 200 else None
@@ -215,25 +249,31 @@ def _default_art_result():
 
 def resolve_album_art(track):
     """Returns {"art": url_or_None, "link": url_or_None, "source": str}."""
+    from library.models import HOSTED_ART_SOURCES
+
     result = _resolve_album_art_inner(track)
-    # Daily cache-buster for `oakgrove` art -- Oak Grove Radio's hosted
-    # album-art URLs are stable file paths (e.g. birdnote.png), and the
-    # daily push replaces the PNG BYTES at that URL without changing
-    # the URL. The server-side Track.art_source cache is correct
-    # (URL is still the right one), but the browser HTTP cache keys
-    # by URL and will keep serving yesterday's image bytes until its
-    # cache TTL expires -- exactly the "stuck on last week's art"
-    # symptom the user reported for BirdNote Daily.
+    # Daily cache-buster for hosted-source art -- a station-hosted
+    # artwork server typically serves stable file paths (e.g.
+    # birdnote.png), and a daily content push there replaces the PNG
+    # BYTES at that URL without changing the URL itself. The server-
+    # side Track.art_source cache is correct (URL is still the right
+    # one), but the browser HTTP cache keys by URL and will keep
+    # serving yesterday's image bytes until its cache TTL expires --
+    # exactly the "stuck on last week's art" symptom this was
+    # originally built to fix for Oak Grove Radio's own BirdNote Daily.
     #
-    # Daily granularity is intentional: the OGR image server replaces
-    # its files at push time (which is daily for BirdNote and the
-    # other self-hosted-episode-art shows), so a date-tag guarantees
-    # a fresh fetch per calendar day without invalidating browser
-    # cache mid-day for tracks whose art didn't change. Non-oakgrove
-    # sources (Deezer, iTunes, embedded, default) point at
-    # per-image hash URLs or Django media that never mutate in place,
-    # so they don't need busting.
-    if result.get("source") == "oakgrove" and result.get("art"):
+    # Daily granularity is intentional: a hosted-art server that
+    # replaces files at push time (as Oak Grove Radio's does, daily,
+    # for BirdNote and its other self-hosted-episode-art shows) only
+    # needs a date-tag to guarantee a fresh fetch per calendar day,
+    # without invalidating browser cache mid-day for tracks whose art
+    # didn't change. Non-hosted sources (Deezer, iTunes, embedded,
+    # default) point at per-image hash URLs or Django media that never
+    # mutate in place, so they don't need busting. Both "hosted" (new
+    # resolutions) and "oakgrove" (pre-existing cached rows from before
+    # this setting was configurable -- see HOSTED_ART_SOURCES) get the
+    # same treatment.
+    if result.get("source") in HOSTED_ART_SOURCES and result.get("art"):
         day = timezone.localdate().isoformat()
         sep = "&" if "?" in result["art"] else "?"
         result["art"] = f"{result['art']}{sep}v={day}"
@@ -260,22 +300,30 @@ def _resolve_album_art_inner(track):
         track.save(update_fields=["art_url", "art_source", "art_checked_at"])
         return {"art": art_url, "link": None, "source": "embedded"}
 
-    # Oak Grove Radio's in-house hosted art (for mixshows/segments) is
-    # checked for every track regardless of category — it's curated
-    # specifically for this station's own syndicated content, so it
-    # doesn't carry the false-match risk a public catalog search does.
-    oakgrove_art = _oakgrove_lookup(artist_name)
-    if oakgrove_art:
-        track.art_url, track.art_source, track.art_checked_at = oakgrove_art, "oakgrove", timezone.now()
+    # Optional station-hosted art (for mixshows/segments) is checked
+    # for every track regardless of category, same as embedded art
+    # above — it's meant for a station's own curated/syndicated
+    # content, so it doesn't carry the false-match risk a public
+    # catalog search does. A blank hosted_album_art_base_url disables
+    # this step entirely (_hosted_art_lookup returns None immediately,
+    # no network request). Read fresh from UITheme every call (not
+    # cached at module import time) so an admin's edit takes effect on
+    # the very next lookup, no restart needed.
+    from library.models import UITheme
+
+    hosted_base_url = UITheme.load().hosted_album_art_base_url
+    hosted_art = _hosted_art_lookup(artist_name, hosted_base_url)
+    if hosted_art:
+        track.art_url, track.art_source, track.art_checked_at = hosted_art, "hosted", timezone.now()
         track.save(update_fields=["art_url", "art_source", "art_checked_at"])
-        return {"art": oakgrove_art, "link": None, "source": "oakgrove"}
+        return {"art": hosted_art, "link": None, "source": "hosted"}
 
     # Deezer/iTunes are scoped to music-category tracks only — spots,
     # legal IDs, imaging, and liners aren't "albums," and matching their
     # title text against a public catalog risks a confident-looking but
     # wrong cover (seen in testing: an imaging drop's title coincidentally
-    # matched an unrelated song). Embedded-art and Oak Grove's hosted art
-    # above are exempt from this since neither can produce a false match.
+    # matched an unrelated song). Embedded-art and hosted art above are
+    # exempt from this since neither can produce a false match.
     is_music = bool(track.category_id and track.category.kind_id and track.category.kind.code == "music")
     if not is_music:
         track.art_url, track.art_source, track.art_checked_at = "", "none", timezone.now()

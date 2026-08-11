@@ -1,11 +1,43 @@
 from django.conf import settings
 from django.core.exceptions import ValidationError
-from django.db import models
+from django.core.validators import URLValidator
+from django.db import models, transaction
 from django.contrib.postgres.fields import ArrayField
 from django.contrib.postgres.indexes import GinIndex
 
 from library.storage import royalty_report_storage
 from rbds.services.rbds_pty import CATEGORY_PTY_OVERRIDE_CHOICES
+
+
+# Track.art_source values that mean "resolved via an admin-configured
+# station-hosted artwork server" (UITheme.hosted_album_art_base_url),
+# as opposed to embedded/Deezer/iTunes/none. "oakgrove" is the
+# historical token from when this lookup was hard-coded to Oak Grove
+# Radio's own server; "hosted" is the generic token new resolutions
+# write going forward (see library/services/album_art.py's module
+# docstring for the full rationale). Both are recognized everywhere
+# "was this hosted-sourced?" matters for DISPLAY purposes -- daily
+# cache-busting -- so existing "oakgrove" rows keep working correctly
+# with no data migration required.
+HOSTED_ART_SOURCES = {"oakgrove", "hosted"}
+
+# Track.art_source values that must be invalidated when
+# hosted_album_art_base_url actually changes (see UITheme.save()
+# below) -- a STRICTLY BROADER set than HOSTED_ART_SOURCES above.
+# "none" is deliberately included here even though a "none" result
+# didn't itself come FROM the hosted source: it's a conclusion drawn
+# by exhausting the WHOLE chain (including hosted) under whatever
+# hosted config was active AT THE TIME. That conclusion stops being
+# trustworthy the moment the config changes -- blank->URL means a
+# previously-unresolved track never got a real hosted check at all
+# and deserves one now; URL A->URL B means a track absent on A might
+# genuinely exist on B. Leaving "none" rows uninvalidated would
+# silently and permanently strand them on default art after an admin
+# enables or repoints hosted lookup, exactly the kind of surprising,
+# hard-to-notice bug this feature must not introduce. embedded/
+# deezer/itunes are excluded -- those results don't depend on the
+# hosted config at all and remain valid regardless.
+HOSTED_ART_INVALIDATION_SOURCES = HOSTED_ART_SOURCES | {"none"}
 
 
 # ---------------------------------------------------------------
@@ -347,7 +379,11 @@ class Track(models.Model):
     # this cache, and are never written into it (see album_art.py).
     ART_SOURCE_CHOICES = [
         ("embedded", "Embedded in file"),
-        ("oakgrove", "Oak Grove Radio hosted art"),
+        ("hosted", "Station-hosted artwork"),
+        ("oakgrove", "Oak Grove Radio hosted art (legacy)"),  # pre-UITheme-
+        # config rows; see HOSTED_ART_SOURCES above -- kept only so old
+        # cached rows keep a friendly admin label, never written by new
+        # resolutions.
         ("deezer", "Deezer"),
         ("itunes", "iTunes"),
         ("none", "None found"),
@@ -869,7 +905,20 @@ class UITheme(models.Model):
     default_album_art = models.ImageField(
         upload_to="ui_theme/", blank=True, null=True,
         help_text="Shown on a deck when no album art is found anywhere in the lookup chain "
-                   "(embedded/Oak Grove hosted art/Deezer/iTunes). Leave blank to show no art at all.",
+                   "(embedded/station-hosted/Deezer/iTunes). Leave blank to show no art at all.",
+    )
+    hosted_album_art_base_url = models.URLField(
+        blank=True,
+        validators=[URLValidator(schemes=["http", "https"])],
+        verbose_name="Hosted Album Art Base URL",
+        help_text="Optional base URL for station-hosted album artwork (e.g. your own "
+                   "mixshows/segments that public catalogs wouldn't have). IsadoraAir "
+                   "looks for {artist-slug}.png at this location -- checked for every "
+                   "track, music or not -- before Deezer/iTunes. Trailing slash optional; "
+                   "a path prefix (e.g. https://example.org/isadora/art/) is preserved. "
+                   "Leave blank to disable hosted-art lookup entirely. Changing this value "
+                   "invalidates cached hosted-art results so the next lookup uses the new "
+                   "URL; no restart required.",
     )
 
     # --- Deck transport buttons (eject/play/pause) ---
@@ -890,7 +939,39 @@ class UITheme(models.Model):
 
     def save(self, *args, **kwargs):
         self.pk = 1
-        super().save(*args, **kwargs)
+        # Cache invalidation for hosted album art: a Track's cached
+        # art_url/art_source is only ever correct for the hosted
+        # config that was active at resolution time. If an admin edit
+        # is about to change (or clear) hosted_album_art_base_url,
+        # every Track whose cached result depended on the OLD config
+        # must be given a chance to re-resolve against whatever's
+        # configured now -- see HOSTED_ART_INVALIDATION_SOURCES above
+        # for exactly which art_source values that includes and why
+        # "none" is deliberately part of that set, not just "oakgrove"/
+        # "hosted" themselves. Reads the DB's current value first
+        # (never `self`'s pre-save state, which could already reflect
+        # an in-memory-only change from an earlier failed attempt) so
+        # this only fires on an ACTUAL persisted change -- not on
+        # ordinary `UITheme.load()` reads, which never reach this
+        # method at all once the singleton row exists (see `load()`
+        # below), and not on a save that leaves this field untouched
+        # (e.g. an edit to an unrelated color field). get_or_create's
+        # very first row creation has no "previous" row to compare
+        # against, so it correctly never invalidates anything on
+        # initial creation either.
+        previous_hosted_url = (
+            UITheme.objects.filter(pk=1)
+            .values_list("hosted_album_art_base_url", flat=True)
+            .first()
+        )
+        with transaction.atomic():
+            super().save(*args, **kwargs)
+            if previous_hosted_url is not None and previous_hosted_url != self.hosted_album_art_base_url:
+                # Track is defined earlier in this same module -- a
+                # plain module-level reference, no import needed.
+                Track.objects.filter(art_source__in=HOSTED_ART_INVALIDATION_SOURCES).update(
+                    art_url="", art_source="", art_checked_at=None,
+                )
 
     @classmethod
     def load(cls):
