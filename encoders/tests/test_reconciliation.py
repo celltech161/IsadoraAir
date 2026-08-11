@@ -430,6 +430,109 @@ class RollbackConvergenceTests(ReconciliationFixtureMixin, TransactionTestCase):
 
 
 # ---------------------------------------------------------------------
+# Observability follow-up: last_reconcile_result must track the
+# EVENTUAL outcome of a reconciliation-triggered candidate/rollback
+# lifecycle (not stay stuck at the transient "candidate_launched"),
+# gated by _reconcile_origin so an ordinary Phase 2 cold-boot/retry
+# promotion -- which shares these exact same completion functions --
+# never gets misattributed as reconciliation history that never
+# actually happened.
+# ---------------------------------------------------------------------
+class ReconcileOutcomeTrackingTests(ReconciliationFixtureMixin, TransactionTestCase):
+    def test_reconciliation_candidate_promotion_records_candidate_promoted(self):
+        manager = em.EncoderManager()
+        encoder = make_saved_encoder()
+        self.bootstrap_accepted(manager, "airtap", encoder)
+
+        encoder.bitrate_kbps = 256
+        encoder.save()
+        with patch.object(preflight_module, "run_preflight", return_value=preflight_module.PreflightResult(ok=True)):
+            manager._check_health()
+        self.assertEqual(manager._launch_kind["airtap"], "candidate")
+        self.assertTrue(manager._reconcile_origin.get("airtap"))
+        state = self.read_group_state("airtap")
+        self.assertEqual(state["last_reconcile_result"], "candidate_launched")
+
+        self.qualify_via_check_health(manager)
+
+        self.assertEqual(manager._launch_kind["airtap"], "accepted")
+        state = self.read_group_state("airtap")
+        self.assertEqual(state["last_reconcile_result"], "candidate_promoted")
+        self.assertNotIn("airtap", manager._reconcile_origin)  # popped on conclusion
+
+    def test_reconciliation_rollback_success_records_rollback_succeeded(self):
+        manager = em.EncoderManager()
+        encoder = make_saved_encoder()
+        self.bootstrap_accepted(manager, "airtap", encoder)
+
+        encoder.bitrate_kbps = 256
+        encoder.save()
+        with patch.object(preflight_module, "run_preflight", return_value=preflight_module.PreflightResult(ok=True)):
+            manager._check_health()
+        self.assertEqual(manager._launch_kind["airtap"], "candidate")
+
+        self.exit_current_child(manager, "airtap", returncode=1)
+        manager._check_health()  # crash observed -> candidate_failed, rollback launched
+        self.assertEqual(manager._launch_kind["airtap"], "rollback")
+        state = self.read_group_state("airtap")
+        self.assertEqual(state["last_reconcile_result"], "rollback_started")
+        self.assertTrue(manager._reconcile_origin.get("airtap"))  # still in flight, not popped yet
+
+        self.qualify_via_check_health(manager)
+
+        self.assertEqual(manager._launch_kind["airtap"], "accepted")
+        state = self.read_group_state("airtap")
+        self.assertEqual(state["last_reconcile_result"], "rollback_succeeded")
+        self.assertNotIn("airtap", manager._reconcile_origin)
+
+    def test_reconciliation_rollback_failure_records_rollback_failed(self):
+        manager = em.EncoderManager()
+        encoder = make_saved_encoder()
+        self.bootstrap_accepted(manager, "airtap", encoder)
+
+        encoder.bitrate_kbps = 256
+        encoder.save()
+        with patch.object(preflight_module, "run_preflight", return_value=preflight_module.PreflightResult(ok=True)):
+            manager._check_health()
+        self.assertEqual(manager._launch_kind["airtap"], "candidate")
+
+        self.exit_current_child(manager, "airtap", returncode=1)
+        manager._check_health()  # crash observed -> rollback launched
+        self.assertEqual(manager._launch_kind["airtap"], "rollback")
+
+        self.exit_current_child(manager, "airtap", returncode=1)
+        manager._check_health()  # rollback ALSO crashes -> _on_rollback_failed
+
+        self.assertTrue(manager._critical_stopped.get("airtap"))
+        self.assertEqual(manager._launch_kind["airtap"], "accepted")  # no longer an active rollback attempt
+        state = self.read_group_state("airtap")
+        self.assertEqual(state["last_reconcile_result"], "rollback_failed")
+        self.assertNotIn("airtap", manager._reconcile_origin)
+
+    def test_ordinary_bootstrap_promotion_does_not_record_phase3_outcome(self):
+        """A cold-boot/retry promotion driven directly through
+        _launch_group -- NEVER routed through _reconcile_changed_group
+        -- must not leave last_reconcile_result looking like
+        reconciliation happened. Without the _reconcile_origin gate,
+        _promote_candidate's shared completion code would otherwise
+        stamp "candidate_promoted" here too, fabricating reconciliation
+        history for an ordinary startup that never occurred."""
+        manager = em.EncoderManager()
+        encoder = make_saved_encoder()
+        with patch.object(preflight_module, "run_preflight", return_value=preflight_module.PreflightResult(ok=True)):
+            ok = manager._launch_group("airtap", [encoder])
+            self.assertTrue(ok)
+            self.assertNotIn("airtap", manager._reconcile_origin)
+            self.qualify_ok(manager, "airtap")
+
+        self.assertEqual(manager._launch_kind["airtap"], "accepted")
+        self.assertNotIn("airtap", manager._reconcile_origin)
+        state = self.read_group_state("airtap")
+        self.assertNotEqual(state["last_reconcile_result"], "candidate_promoted")
+        self.assertEqual(state["last_reconcile_result"], "")
+
+
+# ---------------------------------------------------------------------
 # New group: bootstraps without disturbing an existing group.
 # ---------------------------------------------------------------------
 class NewGroupTests(ReconciliationFixtureMixin, TransactionTestCase):

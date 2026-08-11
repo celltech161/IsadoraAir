@@ -1050,6 +1050,25 @@ class EncoderManager:
         # heartbeat always has a fresh value without recomputing it
         # itself.
         self._desired_fingerprint = {}
+        # input_device -> True while the CURRENT candidate/rollback in
+        # flight for this group was launched by Phase 3 reconciliation
+        # (_reconcile_changed_group), never for an ordinary Phase 2
+        # cold-boot/retry candidate (_launch_group, called from
+        # start()/_retry_group as well as reconciliation's own "new"-
+        # group dispatch). Set ONLY at the one _reconcile_changed_group
+        # launch site; read (and cleared) at the promotion/rollback
+        # completion points below to decide whether THIS lifecycle's
+        # eventual outcome belongs in the group-state JSON's
+        # last_reconcile_result -- without this, an ordinary Phase 2
+        # bootstrap promotion would silently inherit whatever stale
+        # "candidate_launched"/etc. a PRIOR, unrelated reconciliation
+        # attempt last wrote, misrepresenting reconciliation history
+        # that never actually happened. Explicitly cleared (never left
+        # to go stale) anywhere a candidate/rollback is torn down
+        # outside its own normal promote/rollback-succeeded/rollback-
+        # failed conclusion -- see _stop_group_intentionally and
+        # _remove_group_intentionally.
+        self._reconcile_origin = {}
 
     def start(self):
         self.running = True
@@ -1833,6 +1852,12 @@ class EncoderManager:
             },
             dedupe_key=f"encoder|candidate-qualification-failed|{input_device}",
         )
+        if self._reconcile_origin.get(input_device):
+            # Peek only (do not pop) -- _start_rollback below still
+            # needs to see this flag to correctly attribute whatever it
+            # decides next (rollback_started, or rollback_failed if
+            # there's no usable LKG at all).
+            self._record_reconcile_outcome(input_device, "candidate_failed", reason)
         self._start_rollback(input_device, encoders, reason)
 
     def _start_rollback(self, input_device, encoders, candidate_failure_reason):
@@ -1878,6 +1903,10 @@ class EncoderManager:
                 dedupe_key=f"encoder|no-lkg-for-rollback|{input_device}",
             )
             self._launch_kind[input_device] = "accepted"
+            if self._reconcile_origin.pop(input_device, False):
+                # Terminal for this reconciliation attempt -- there is
+                # nothing left to roll back to, so pop rather than peek.
+                self._record_reconcile_outcome(input_device, "rollback_failed", reason)
             self._schedule_retry(input_device)
             return
 
@@ -1918,6 +1947,11 @@ class EncoderManager:
         # the wrong (candidate's) SIDs.
         self._qualify_expected[input_device] = lkg_expected
         self._start_qualification_clock(input_device)
+        if self._reconcile_origin.get(input_device):
+            # Peek only -- not terminal yet, rollback still has to
+            # qualify. _on_rollback_succeeded/_on_rollback_failed below
+            # will pop this flag when this attempt actually concludes.
+            self._record_reconcile_outcome(input_device, "rollback_started")
         self._write_group_state(input_device)  # same reasoning as the candidate-launch site above
 
     def _on_rollback_failed(self, input_device, reason, health_detail=None):
@@ -1930,6 +1964,8 @@ class EncoderManager:
         backoff for whatever infrastructure recovery is possible."""
         self._critical_stopped[input_device] = True
         self._launch_kind[input_device] = "accepted"
+        if self._reconcile_origin.pop(input_device, False):
+            self._record_reconcile_outcome(input_device, "rollback_failed", reason)
         self._log(input_device, f"Rollback failed: {reason}. Automatic configuration switching stopped -- infrastructure retry only.", force=True)
         emit_event(
             category="encoder", level="critical",
@@ -1945,6 +1981,8 @@ class EncoderManager:
         self._retry_index[input_device] = 0
         meta = self._group_meta(input_device)
         meta["consecutive_failures"] = 0
+        if self._reconcile_origin.pop(input_device, False):
+            self._record_reconcile_outcome(input_device, "rollback_succeeded")
         self._write_group_state(input_device)  # launch_kind just changed -- refresh the admin-visible snapshot
         self._log(input_device, "Rollback qualified -- last-known-good restored and healthy.", force=True)
         emit_event(
@@ -2054,6 +2092,13 @@ class EncoderManager:
         self._launch_kind[input_device] = "accepted"
         self._accepted_fingerprint[input_device] = fingerprint
         self._clear_qualification_tracking(input_device)
+        if self._reconcile_origin.pop(input_device, False):
+            # This promotion concludes a candidate launched by Phase 3
+            # reconciliation (_reconcile_changed_group), not an ordinary
+            # Phase 2 cold-boot/retry promotion -- record the eventual
+            # outcome. _write_group_state below picks up last_reconcile_*
+            # in the same write as launch_kind.
+            self._record_reconcile_outcome(input_device, "candidate_promoted")
         self._write_group_state(input_device)  # launch_kind just changed -- refresh the admin-visible snapshot
         self._log(input_device, f"Candidate qualified and promoted to last-known-good (generation={current.get('generation')}).", force=True)
         emit_event(
@@ -2418,6 +2463,14 @@ class EncoderManager:
         self._running_fingerprint.pop(input_device, None)
         self._running_encoders.pop(input_device, None)
         self._clear_qualification_tracking(input_device)
+        # Defense in depth: an intentional stop tears down whatever
+        # candidate/rollback was in flight (e.g. this group is being
+        # removed mid-probation) without going through that lifecycle's
+        # own promote/rollback-succeeded/rollback-failed conclusion --
+        # drop the flag here too so it can never survive to misattribute
+        # a later, unrelated ordinary Phase 2 launch as reconciliation-
+        # originated.
+        self._reconcile_origin.pop(input_device, None)
         self._mark_audio_state_dead(input_device)
         self._write_group_state(input_device)
         self._log(input_device, f"Intentionally stopped ({reason}).", force=True)
@@ -2478,6 +2531,7 @@ class EncoderManager:
         self._running_encoders.pop(input_device, None)
         self._accepted_fingerprint.pop(input_device, None)
         self._desired_fingerprint.pop(input_device, None)
+        self._reconcile_origin.pop(input_device, None)
         self._clear_qualification_tracking(input_device)
         self._log(input_device, "No enabled encoders left for this device, not restarting.", force=True)
         emit_event(
@@ -2529,6 +2583,17 @@ class EncoderManager:
             # process against the same device.
             self._record_reconcile_outcome(input_device, "candidate_failed", "could not confirm prior process had stopped")
             return
+
+        # From this point on, the old proven child is confirmed gone and
+        # we are committed to a candidate/rollback lifecycle for this
+        # input device -- mark it as reconciliation-originated so the
+        # Phase 2 promotion/rollback completion paths below (shared
+        # verbatim with ordinary cold-boot/retry) know this particular
+        # in-flight attempt's eventual outcome belongs in
+        # last_reconcile_result. Set here (not only on launch success)
+        # so the immediate-Popen-failure-then-rollback branch right
+        # below is covered too, not just the launch-succeeded tail.
+        self._reconcile_origin[input_device] = True
 
         ok = self._start_group(input_device, desired_encoders, script_override=candidate_script)
         if not ok:
