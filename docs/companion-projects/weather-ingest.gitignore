@@ -1,0 +1,19 @@
+# Candidate .gitignore for /home/jreed/weather-ingest/ -- see
+# docs/companion-projects/README.md for the audit this was derived from.
+# NOT yet applied to that project; drop this in as .gitignore when the
+# controlled git-init pass happens.
+
+venv/
+__pycache__/
+*.pyc
+
+# Cached/polled weather state -- runtime bookkeeping, not source.
+data/*.json
+data/*.txt
+
+# Logs.
+*.log
+
+# Deliberately NOT excluded -- media/weather_beeps.flac is a small,
+# fixed, intentional audio asset the alert-beep script plays, not
+# generated output. Keep it tracked.

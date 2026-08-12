@@ -1,0 +1,27 @@
+# Candidate .gitignore for /home/jreed/ogremote-ingest/ -- see
+# docs/companion-projects/README.md for the audit this was derived from.
+# NOT yet applied to that project; drop this in as .gitignore when the
+# controlled git-init pass happens.
+
+venv/
+__pycache__/
+*.pyc
+
+# Per-run state tracking -- runtime bookkeeping, not source.
+data/*.json
+
+# Logs, including the rotated numbered forms already observed
+# (get_available_uploads.log.1, .log.2, ...).
+*.log
+*.log.[0-9]*
+
+# Transient staging area for incoming content -- empty by design
+# between processing runs.
+incoming/*
+!incoming/.gitkeep
+
+# Deliberately NOT excluded -- media/ contains small, fixed,
+# intentional bed-music/stinger audio assets the processors use
+# (stinger.mp3, usd239min_bed.wav, 3min_ctr/bg_music.wav,
+# news_item/news_bg.wav, cal_events/bg_60sec.wav), not generated
+# output. Keep these tracked.

@@ -1,0 +1,39 @@
+# Candidate .gitignore for /home/jreed/syndicated-ingest/ -- see
+# docs/companion-projects/README.md for the audit this was derived from.
+# NOT yet applied to that project; drop this in as .gitignore when the
+# controlled git-init pass happens.
+
+venv/
+__pycache__/
+*.pyc
+
+# Downloaded/cached show audio -- re-fetchable from each show's own
+# upstream source, not source code. The specific directory names
+# observed per-show (adjust if a new show uses a different name):
+audio_cache/
+zip_cache/
+episodes/
+
+# Per-run state/tracking JSON -- runtime bookkeeping, not source.
+downloaded.json
+state.json
+manifest.json
+scrape_debug.json
+
+# Logs, including rotated forms.
+*.log
+*.log.[0-9]*
+
+# One-off backup file found during the audit -- probably safe to just
+# delete instead of versioning; kept as a gitignore entry rather than
+# deciding for you.
+*.bak
+
+# Deliberately NOT excluded -- small, fixed, intentional assets that
+# look like inputs the scripts use, not outputs they produce. Review
+# before the first commit rather than letting a broader *.wav/*.mp3/
+# *.png rule silently drop them:
+#   kns/woosh.wav
+#   kns/satp_intro.wav
+#   amos/a-moment-of-science-default.png
+#   (and any other small per-show art/stinger files found at commit time)

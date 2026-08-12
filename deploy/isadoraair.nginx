@@ -1,45 +1,47 @@
 server {
     listen 80;
     server_name isadoraair 192.168.1.125;
-    return 301 https://$host$request_uri;
-}
 
-server {
-    listen 443 ssl;
-    server_name isadoraair 192.168.1.125;
-
-    ssl_certificate     /etc/ssl/isadoraair/selfsigned.crt;
-    ssl_certificate_key /etc/ssl/isadoraair/selfsigned.key;
-    ssl_protocols       TLSv1.2 TLSv1.3;
-
-    client_max_body_size 1G;
-
-    location /static/ {
-        alias @@ISA_ROOT@@/staticfiles/;
-        expires 1h;
-    }
-
-    # Remote DJ over WebRTC signaling (SDP/ICE JSON only -- the actual
-    # RTP/RTCP/DTLS-SRTP media never touches nginx, it's a separate direct
-    # UDP flow ICE establishes once signaling completes). Proxied to the
-    # signaling server's own port, separate from gunicorn's 8000.
-    location /ws/remote-dj/ {
-        proxy_pass http://127.0.0.1:8001;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_set_header Host $http_host;
-        proxy_set_header X-Real-IP $remote_addr;
-        # signaling socket sits open+idle for a whole DJ segment; default
-        # 60s would kill it mid-session.
-        proxy_read_timeout 3600s;
-    }
-
-    location / {
+    # GW3000/Ecowitt weather gateway is IoT firmware with no TLS support --
+    # this one path is proxied plain-HTTP instead of hitting the
+    # unconditional redirect below. nginx matches the most specific
+    # location block regardless of file order, so this takes precedence
+    # over the catch-all redirect even though it's listed first here.
+    # Harmless if you're not using the weather app's GW3000 ingest
+    # (weather/urls.py's `gw3000` route, exempted from HTTPS redirect in
+    # settings.py's SECURE_REDIRECT_EXEMPT) -- nothing hits it.
+    location /wx/gw3000 {
         proxy_pass http://127.0.0.1:8000;
         proxy_set_header Host $http_host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
     }
+
+    location / {
+        return 301 https://$host$request_uri;
+    }
 }
+
+server {
+    listen 443 ssl default_server;
+    server_name isadoraair 192.168.1.125;
+
+    ssl_certificate     /etc/ssl/isadoraair/selfsigned.crt;
+    ssl_certificate_key /etc/ssl/isadoraair/selfsigned.key;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+
+    include snippets/isadoraair-locations.conf;
+}
+
+# Optional: serving a real public domain name with a Let's Encrypt
+# certificate (station-specific, not part of a default install) --
+# add a SEPARATE `listen 443 ssl;` server block for that hostname, with
+# its own `server_name` and its own `ssl_certificate`/`ssl_certificate_key`
+# paths (e.g. from certbot or acme.sh), also `include`-ing
+# snippets/isadoraair-locations.conf so both vhosts stay in sync. Leave
+# the self-signed block above marked `default_server` (as it already is)
+# so any TLS request whose SNI doesn't match your public hostname still
+# falls through to it, rather than being rejected. See deploy/README.md's
+# "Public HTTPS with your own domain" section for the exact shape this
+# takes in production, worked as an example rather than a repo default.

@@ -49,7 +49,16 @@ for f in deploy/*.service deploy/*.timer deploy/*.conf; do
     "$f" | sudo tee "/etc/systemd/system/$(basename "$f")" > /dev/null
 done
 
-# 3. nginx site (adjust server_name inside first if needed)
+# 3. nginx site (adjust server_name inside first if needed) + its shared
+# location-block snippet -- isadoraair.nginx `include`s this, so both
+# files need to land in nginx's config tree, not just the site file.
+# sites-enabled MUST be a symlink to sites-available, never a second
+# copy of the file -- see this file's own "One authoritative nginx
+# config" note below for why that matters.
+sudo mkdir -p /etc/nginx/snippets
+sed \
+  -e "s|@@ISA_ROOT@@|$ISA_ROOT|g" \
+  deploy/isadoraair-locations.conf | sudo tee /etc/nginx/snippets/isadoraair-locations.conf > /dev/null
 sed \
   -e "s|@@ISA_ROOT@@|$ISA_ROOT|g" \
   deploy/isadoraair.nginx | sudo tee /etc/nginx/sites-available/isadoraair > /dev/null
@@ -103,10 +112,58 @@ Drop-in configs (installed as-is, no per-install variation apart from the ones a
 
 | File | Where it goes |
 |---|---|
-| `isadoraair.nginx` | `/etc/nginx/sites-available/isadoraair` |
+| `isadoraair.nginx` | `/etc/nginx/sites-available/isadoraair`, symlinked from `sites-enabled/isadoraair` |
+| `isadoraair-locations.conf` | `/etc/nginx/snippets/isadoraair-locations.conf` — shared location blocks `include`d by every HTTPS server block in `isadoraair.nginx` |
 | `isadoraair-tmpfiles.conf` | `/etc/tmpfiles.d/isadoraair.conf` — creates `/run/isadoraair` on boot with the right owner |
 | `needrestart-isadoraair.conf` | `/etc/needrestart/conf.d/isadoraair.conf` — auto-restarts services on library upgrades so a matplotlib/psycopg2 refresh doesn't leave the engine on the old shared object |
 | `asound.conf` | `/etc/asound.conf` — ALSA loopback / dsnoop config for the studio + streaming feeds |
+| `stereotool.service.example` | `/etc/systemd/system/stereotool.service` — **only if** you run StereoTool (or a similar external processor) as a supervised systemd service; see its own header comment. Not installed by the loop in step 2 (`.example` isn't matched by `deploy/*.service`) — copy and rename it deliberately. |
+
+### One authoritative nginx config
+
+`sites-enabled/isadoraair` must be a **symlink** to `sites-available/isadoraair`,
+never a second copy of the file. If the two ever diverge (someone edits
+`sites-enabled` directly, e.g. under time pressure during an incident),
+whichever one nginx is actually serving from silently becomes the only
+correct copy, and anything that backs up or version-controls the *other*
+one is protecting the wrong file. Confirmed to have happened for real
+here — the disaster-recovery Phase 1 audit (2026-08-12) found the two
+files had diverged (`sites-enabled` had picked up a second HTTPS vhost
+for a public domain name + Let's Encrypt cert that `sites-available` — the
+one the nightly backup was actually reading — never had), reconciled in
+Phase 2 by making `sites-enabled` a proper symlink again. `nginx -t`
+after any manual edit, before reloading, catches syntax errors but
+**not** this kind of split — only `diff <(readlink -f sites-enabled/X)
+<(echo sites-available/X)`-style checks (or just never breaking the
+symlink in the first place) catch that.
+
+### Public HTTPS with your own domain
+
+The `isadoraair.nginx` template ships with one HTTPS server block, on
+the self-signed cert, marked `default_server`. If you also want a real
+public hostname (Let's Encrypt or any other CA), add a **second**
+`listen 443 ssl;` block rather than replacing the first one — this
+keeps LAN/legacy access on the self-signed cert working via SNI fallback
+to the `default_server` block:
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name your.public.hostname.example;
+
+    ssl_certificate     /path/to/your/fullchain.pem;
+    ssl_certificate_key /path/to/your/privkey.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+
+    include snippets/isadoraair-locations.conf;
+}
+```
+
+Production here uses this exact pattern with a Let's Encrypt cert issued
+by `acme.sh` via DNS-01 (cron-driven, entirely outside this repo — see
+`PROJECT_NOTES.md`/the disaster-recovery documentation for the station's
+own specifics). Whatever ACME client or CA you use, the cert/key paths
+are yours to choose; nothing in this repo assumes a particular one.
 
 ## Subsystems outside this repo
 

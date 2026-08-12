@@ -1,0 +1,78 @@
+# Reference/template systemd unit for supervising an external audio
+# processor (StereoTool, or similar) as a systemd service, matching how
+# production actually runs it. StereoTool itself is proprietary/licensed
+# and does NOT ship with IsadoraAir -- this file documents how IsadoraAir
+# EXPECTS such a processor to be supervised (startup ordering, realtime
+# scheduling) so a bare-machine restore can reproduce that supervision
+# without the repo implying StereoTool is bundled software.
+#
+# Not installed by deploy/README.md's install loop (`.example`, not
+# `.service`, deliberately not matched by `deploy/*.service`) -- copy it
+# to /etc/systemd/system/stereotool.service, fill in the placeholders
+# below, and enable it deliberately if you're running an external
+# processor this way.
+#
+# Placeholders (not part of the repo-wide @@ISA_USER@@ etc. set in this
+# directory's other files, since the user/paths running your external
+# processor may differ from the user running IsadoraAir itself):
+#   @@STEREOTOOL_USER@@   Unix user to run the processor as
+#   @@STEREOTOOL_GROUP@@  Primary/supplementary group -- needs to be (or
+#                          include) whichever group owns your ALSA
+#                          devices, typically `audio`
+#   @@STEREOTOOL_ROOT@@   Directory containing the processor binary
+#                          (also its WorkingDirectory)
+#   @@STEREOTOOL_BIN@@    The actual binary to run, relative to
+#                          @@STEREOTOOL_ROOT@@ -- e.g. StereoTool ships
+#                          several build variants (plain/GUI/JACK); pick
+#                          the one matching your setup
+#
+# 2026-08-12 disaster-recovery Phase 2: promoted from a host-only unit
+# (found only in `/etc/systemd/system/stereotool.service`, absent from
+# this repo) into this reference template -- the Phase 1 audit flagged
+# this as a real gap because isadoraair-rbds.service and
+# isadoraair-encoders.service both explicitly order themselves
+# `After=stereotool.service`, so its *existence and its realtime
+# parameters* are load-bearing for on-air audio even though the binary
+# itself stays external. The actual station-specific unit content (real
+# user, real paths, real -w/-p flags) is preserved separately as backup/
+# DR evidence, not committed here -- see docs/DISASTER_RECOVERY.md.
+
+[Unit]
+Description=External audio processor (StereoTool or equivalent)
+After=sound.target
+Wants=sound.target
+
+[Service]
+Type=simple
+User=@@STEREOTOOL_USER@@
+Group=@@STEREOTOOL_GROUP@@
+SupplementaryGroups=@@STEREOTOOL_GROUP@@
+WorkingDirectory=@@STEREOTOOL_ROOT@@
+# StereoTool's own flags vary by build/version -- production runs its
+# GUI binary in embedded-web-server mode (a -p port for its own local
+# web UI, a -w CIDR restricting who can reach it). Adjust for your
+# binary and needs; consult your processor's own documentation for
+# flag meaning, and its own settings/profile file for anything beyond
+# what's passed on the command line (production loads its processing
+# profile via the tool's own state/GUI, not a command-line flag -- if
+# yours accepts one, this is where you'd add it).
+ExecStart=@@STEREOTOOL_ROOT@@/@@STEREOTOOL_BIN@@ -p 8085 -w 192.168/16
+Restart=on-failure
+RestartSec=2
+
+# Realtime scheduling -- required for glitch-free audio through the
+# on-air processing chain. Confirmed load-bearing in production
+# (PROJECT_NOTES.md's CPU-floor/click-diagnosis history): reactive
+# scheduling ramp-up/down was contributing to audible clicks before
+# these were set.
+LimitRTPRIO=95
+LimitMEMLOCK=infinity
+CapabilityBoundingSet=CAP_SYS_NICE
+AmbientCapabilities=CAP_SYS_NICE
+CPUSchedulingPolicy=fifo
+CPUSchedulingPriority=80
+IOSchedulingClass=realtime
+IOSchedulingPriority=2
+
+[Install]
+WantedBy=multi-user.target
