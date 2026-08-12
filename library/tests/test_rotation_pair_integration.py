@@ -10,6 +10,7 @@ integration" category specifically -- the real _build_from_rotation()
 walk, not the algorithms in isolation."""
 import random
 from datetime import date
+from unittest.mock import patch
 
 from django.test import TestCase
 from django.utils import timezone as django_timezone
@@ -18,8 +19,10 @@ from library.models import (
     Artist, Category, CategoryKind, LogItem, PlaylistLog, Rotation, RotationSlot, Track,
 )
 from library.services.log_builder import (
+    DURATION_FIT_MARGIN,
     EXACT_FIT_THRESHOLD_SECONDS,
     PAIR_LANDING_THRESHOLD_SECONDS,
+    SelectionDiagnostics,
     _build_from_rotation,
     _pick_best_fit,
     fill_remaining_hour,
@@ -125,46 +128,160 @@ class LandingPairConsumesTwoSlotsTests(TestCase):
         self.assertNotEqual(items[0].track_id, items[1].track_id)
 
 
+def _find_healthy_diagnostics_print(mock_print):
+    """Scans a mocked library.services.log_builder.print's call args for
+    the healthy-diagnostics line (two positional args: a prefix string
+    and the raw diagnostics detail dict) and returns the dict. Monitoring
+    noise suppression (1.1 follow-up) means a healthy build no longer
+    creates a SystemEvent -- the full payload is still always printed
+    (visible in the journal for engineering/debug purposes), so tests
+    that need to inspect a HEALTHY build's diagnostic values read it
+    from here instead of from SystemEvent.objects.get(...)."""
+    for call in mock_print.call_args_list:
+        args = call.args
+        if len(args) == 2 and isinstance(args[0], str) and "selection diagnostics" in args[0] and "healthy" in args[0]:
+            return args[1]
+    raise AssertionError("no healthy selection-diagnostics print call found")
+
+
 class SelectionDiagnosticsEventTests(TestCase):
-    """_build_from_rotation must emit a SystemEvent summarizing which
-    selection modes ran -- the forward-compatible diagnostics extension
-    point, not a full advanced-rule surface."""
+    """1.1 follow-up (Monitoring noise suppression): a normal, healthy
+    hour build must NOT create a Monitoring/SystemEvent -- the full
+    SelectionDiagnostics payload is still always printed to the
+    application log. Only a build SelectionDiagnostics.needs_operator_
+    attention() flags as abnormal (a slot came up completely empty, or
+    a landing pair missed its target by more than DURATION_FIT_MARGIN)
+    raises an event, and that event still carries the full structured
+    detail plus a "reasons" list."""
 
     def setUp(self):
         self.category = make_category("DIAGEVENT")
         for i in range(4):
             make_track(f"Diag Track {i}", f"Diag Artist {i}", self.category, 190)
 
-    def test_diagnostics_event_emitted_with_expected_shape(self):
+    def test_healthy_build_creates_no_monitoring_event_but_logs_full_detail(self):
         rotation = Rotation.objects.create(name="Diagnostics Rotation")
         RotationSlot.objects.create(rotation=rotation, position=0, category=self.category)
 
         random.seed(7)
         target_date, hour = date(2027, 4, 3), 7
-        log, error = _build_from_rotation(target_date, hour, rotation, target_duration_seconds=3600)
+        with patch("library.services.log_builder.print") as mock_print:
+            log, error = _build_from_rotation(target_date, hour, rotation, target_duration_seconds=3600)
         self.assertIsNone(error)
 
-        event = SystemEvent.objects.get(dedupe_key=f"library|selection-diagnostics|{target_date.isoformat()}|{hour}")
-        self.assertEqual(event.category, "library")
+        self.assertFalse(
+            SystemEvent.objects.filter(dedupe_key=f"library|selection-diagnostics|{target_date.isoformat()}|{hour}").exists(),
+            "a healthy build must not occupy the Monitoring Recent Events feed",
+        )
+        detail = _find_healthy_diagnostics_print(mock_print)
         for key in (
             "normal_picks", "landing_pairs", "landing_pair_fallbacks", "exact_fit_picks",
             "direct_track_inserts", "pool_exhausted_picks", "landing_errors",
             "target_duration_seconds", "late_offset_seconds",
         ):
-            self.assertIn(key, event.detail)
-        self.assertEqual(event.detail["target_duration_seconds"], 3600)
-        self.assertEqual(event.detail["late_offset_seconds"], 0)
+            self.assertIn(key, detail)
+        self.assertEqual(detail["target_duration_seconds"], 3600)
+        self.assertEqual(detail["late_offset_seconds"], 0)
 
-    def test_late_offset_seconds_reflects_shortened_target(self):
+    def test_late_offset_seconds_from_ordinary_clock_drift_recovery_is_not_abnormal(self):
+        """A shortened target_duration_seconds purely because ordinary
+        clock-drift recovery is working must NOT, by itself, generate a
+        Monitoring event -- this is expected, healthy behavior. This
+        mirrors the real production example from the review (a
+        target_duration_seconds of 3425, i.e. late_offset_seconds=175)."""
         rotation = Rotation.objects.create(name="Diagnostics Rotation Late")
         RotationSlot.objects.create(rotation=rotation, position=0, category=self.category)
 
         random.seed(7)
         target_date, hour = date(2027, 4, 4), 8
-        _build_from_rotation(target_date, hour, rotation, target_duration_seconds=3400)
+        with patch("library.services.log_builder.print") as mock_print:
+            _build_from_rotation(target_date, hour, rotation, target_duration_seconds=3400)
+
+        self.assertFalse(
+            SystemEvent.objects.filter(dedupe_key=f"library|selection-diagnostics|{target_date.isoformat()}|{hour}").exists(),
+        )
+        detail = _find_healthy_diagnostics_print(mock_print)
+        self.assertEqual(detail["late_offset_seconds"], 200)
+
+    def test_real_production_example_creates_no_noise(self):
+        """The exact shape from the review's real production example --
+        landing_pairs=1, landing_errors=[0], pool_exhausted_picks=0,
+        landing_pair_fallbacks=3, late_offset_seconds=175,
+        target_duration_seconds=3425 -- must not create a Monitoring
+        event merely because those values are present. Checked directly
+        against SelectionDiagnostics.needs_operator_attention() (the
+        exact predicate), not by reconstructing a full build, since the
+        point is the PREDICATE's behavior on this exact payload shape."""
+        diagnostics = SelectionDiagnostics(
+            normal_picks=21, landing_pairs=1, landing_errors=[0],
+            exact_fit_picks=4, late_offset_seconds=175, direct_track_inserts=0,
+            pool_exhausted_picks=0, landing_pair_fallbacks=3, target_duration_seconds=3425,
+        )
+        self.assertFalse(diagnostics.needs_operator_attention())
+
+    def test_pool_exhaustion_is_abnormal_and_creates_an_event(self):
+        diagnostics = SelectionDiagnostics(pool_exhausted_picks=1)
+        self.assertTrue(diagnostics.needs_operator_attention())
+
+    def test_excessive_landing_error_is_abnormal_and_creates_an_event(self):
+        diagnostics = SelectionDiagnostics(landing_errors=[DURATION_FIT_MARGIN + 0.1])
+        self.assertTrue(diagnostics.needs_operator_attention())
+
+    def test_landing_error_within_tolerance_is_not_abnormal(self):
+        diagnostics = SelectionDiagnostics(landing_errors=[DURATION_FIT_MARGIN])
+        self.assertFalse(diagnostics.needs_operator_attention())
+
+    def test_isolated_landing_pair_fallback_that_resolves_is_not_a_failure(self):
+        """A fallback is not inherently a failure -- if matched-pair
+        search can't be used and duration-aware exact-fit succeeds,
+        that's expected, healthy behavior, however many times it
+        happens in one build."""
+        diagnostics = SelectionDiagnostics(landing_pair_fallbacks=3, exact_fit_picks=3, landing_errors=[])
+        self.assertFalse(diagnostics.needs_operator_attention())
+
+    def test_abnormal_event_preserves_structured_detail_and_reasons(self):
+        """An empty category (zero eligible tracks) forces
+        pool_exhausted_picks > 0 -- a genuinely abnormal build. The
+        resulting event must carry the full diagnostic payload plus a
+        human-readable reason, not just a bare title."""
+        empty_category = make_category("DIAGEVENTEMPTY")
+        rotation = Rotation.objects.create(name="Diagnostics Rotation Abnormal")
+        RotationSlot.objects.create(rotation=rotation, position=0, category=empty_category)
+
+        target_date, hour = date(2027, 4, 20), 12
+        log, error = _build_from_rotation(target_date, hour, rotation, target_duration_seconds=3600)
+        self.assertIsNone(error)
 
         event = SystemEvent.objects.get(dedupe_key=f"library|selection-diagnostics|{target_date.isoformat()}|{hour}")
-        self.assertEqual(event.detail["late_offset_seconds"], 200)
+        self.assertEqual(event.category, "library")
+        self.assertEqual(event.level, "warning")
+        self.assertEqual(event.title, "Hour log selection needs attention")
+        self.assertEqual(event.detail["pool_exhausted_picks"], 1)
+        self.assertTrue(event.detail["reasons"])
+        self.assertIn("slot", event.detail["reasons"][0])
+
+    def test_recovery_clamp_visibility_is_already_covered_by_a_separate_engine_event(self):
+        """Clock recovery hitting MAX_CLOCK_RECOVERY_SECONDS is already
+        reported by engine.py's own "Clock-drift target clamped" event
+        (_project_upcoming_hour_target_duration), emitted BEFORE the
+        already-clamped target_duration_seconds is ever handed to
+        log_builder.py -- see test_clock_drift_recovery.py's
+        test_offset_clamped_to_max_and_event_emitted, unmodified by
+        this pass. Deliberately NOT duplicated in SelectionDiagnostics'
+        own predicate: log_builder.py has no reliable way to tell
+        "value is 0 because there was no drift" apart from "value is 0
+        because it was already clamped down to 0" without importing
+        MAX_CLOCK_RECOVERY_SECONDS from engine.py, which imports FROM
+        this module -- a real circular-import risk this pass avoids by
+        design (see effective_airtime_seconds's own docstring for the
+        established, safe one-way import direction)."""
+        import library.services.engine as eng_module
+        self.assertTrue(hasattr(eng_module, "MAX_CLOCK_RECOVERY_SECONDS"))
+        # engine.py -> log_builder.py is a real, established, one-way
+        # import (DURATION_FIT_MARGIN, effective_airtime_seconds, etc.);
+        # the reverse does not exist.
+        import library.services.log_builder as lb_module
+        self.assertFalse(hasattr(lb_module, "MAX_CLOCK_RECOVERY_SECONDS"))
 
 
 class ModeThresholdBoundaryTests(TestCase):
@@ -180,7 +297,13 @@ class ModeThresholdBoundaryTests(TestCase):
 
     def test_exactly_at_landing_threshold_is_not_normal_mode(self):
         """remaining == PAIR_LANDING_THRESHOLD_SECONDS must NOT take the
-        normal-mode branch (normal is remaining > threshold, strictly)."""
+        normal-mode branch (normal is remaining > threshold, strictly).
+        This fixture's 6 identical-180s-duration tracks can only ever
+        land a pair at 360s against a 720s target (landing_error=360,
+        an artifact of the fixture, not a real scheduling failure) --
+        that's well past DURATION_FIT_MARGIN, so this build IS abnormal
+        under the new predicate and an event still fires; unlike the
+        other tests in this module, no rework was needed here."""
         rotation = Rotation.objects.create(name="Boundary Rotation A")
         RotationSlot.objects.create(rotation=rotation, position=0, category=self.category)
         RotationSlot.objects.create(rotation=rotation, position=1, category=self.category)
@@ -194,17 +317,26 @@ class ModeThresholdBoundaryTests(TestCase):
 
     def test_exactly_at_exact_fit_threshold_is_exact_fit_mode(self):
         """remaining == EXACT_FIT_THRESHOLD_SECONDS must take the
-        exact-fit branch (exact-fit is remaining <= threshold)."""
+        exact-fit branch (exact-fit is remaining <= threshold). A
+        single-slot pick from 6 eligible same-category tracks always
+        succeeds (no pool exhaustion) and involves no landing-pair
+        search at all (landing_errors stays empty) -- healthy, so this
+        build creates no event; read the mode-dispatch counts from the
+        printed detail instead."""
         rotation = Rotation.objects.create(name="Boundary Rotation B")
         RotationSlot.objects.create(rotation=rotation, position=0, category=self.category)
 
         random.seed(3)
         target_date, hour = date(2027, 4, 6), 10
-        _build_from_rotation(target_date, hour, rotation, target_duration_seconds=EXACT_FIT_THRESHOLD_SECONDS)
+        with patch("library.services.log_builder.print") as mock_print:
+            _build_from_rotation(target_date, hour, rotation, target_duration_seconds=EXACT_FIT_THRESHOLD_SECONDS)
 
-        event = SystemEvent.objects.get(dedupe_key=f"library|selection-diagnostics|{target_date.isoformat()}|{hour}")
-        self.assertEqual(event.detail["landing_pairs"], 0)
-        self.assertEqual(event.detail["normal_picks"], 0)
+        self.assertFalse(
+            SystemEvent.objects.filter(dedupe_key=f"library|selection-diagnostics|{target_date.isoformat()}|{hour}").exists(),
+        )
+        detail = _find_healthy_diagnostics_print(mock_print)
+        self.assertEqual(detail["landing_pairs"], 0)
+        self.assertEqual(detail["normal_picks"], 0)
 
 
 class FillRemainingHourPairingTests(TestCase):

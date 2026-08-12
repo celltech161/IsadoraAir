@@ -432,13 +432,90 @@ def _weighted_order(qs, active_holiday_codes=None):
     return qs.order_by(RawSQL(f"-LN(RANDOM()) / ({weight_sql})", weight_params))
 
 
+def _effective_airtime(next_start, duration, cue_in):
+    """Shared arithmetic core for effective_airtime_seconds -- pulled out
+    as a pure function of raw scalar values (not a Track/FitCandidate
+    object) so _extract_fit_candidates, which deliberately reads raw
+    columns via .values_list() rather than materializing full Track
+    rows (see its own docstring -- avoiding an N+1 there is the whole
+    point), can compute the IDENTICAL number as every call site that
+    does have a real track object, instead of a parallel, driftable
+    copy of the same formula. effective_airtime_seconds() below is the
+    one-object-argument convenience wrapper every other caller should
+    use.
+
+    1.1 second-pass correction (listener-audible-start semantics):
+    confirmed by a full engine trace that a fresh deck is NEVER seeked
+    to cue_in_seconds on a normal start -- _create_deck plays every
+    track from real file position 0, and _get_deck_position measures
+    elapsed time from that same position-0 reference, not from
+    cue_in. A track's own audible content therefore only begins
+    cue_in_seconds AFTER its deck was created. Stacking successive
+    tracks' spans end-to-end (which is what every accumulation loop in
+    this module does) means the correct per-track contribution is the
+    span from THIS track's own audible start to the NEXT track's
+    audible start -- and working through the crossfade trigger's own
+    math (_poll_position: trigger_point = next_start_current -
+    cue_in_next, engine.py) shows that span collapses to exactly
+    `next_start_seconds - cue_in_seconds` of the SAME track, in the
+    ordinary (unclamped) case. See effective_airtime_seconds's
+    docstring for the one case this does NOT capture (the engine's
+    10-second trigger-point clamp, which needs the NEXT track's own
+    cue_in and is out of scope for a single-track helper).
+
+    Explicit `is not None` checks throughout -- next_start_seconds is
+    nullable with no default, so an explicit 0.0 (a deliberately
+    near-instant crossfade point, e.g. a very short sweeper/ID) is a
+    real, meaningful value and must not be silently replaced by
+    duration_seconds the way a bare `or` chain would. cue_in_seconds is
+    never None at the DB level (default=0, not nullable) but is
+    defended the same way for robustness against any caller passing a
+    lightweight stand-in that doesn't enforce that constraint (e.g. a
+    test fixture)."""
+    if next_start is not None:
+        end_point = next_start
+    elif duration is not None:
+        end_point = duration
+    else:
+        return 0.0
+    cue_in = cue_in if cue_in is not None else 0.0
+    return max(0.0, end_point - cue_in)
+
+
+def effective_airtime_seconds(track):
+    """THE authoritative definition of a track's listener-facing
+    broadcast-clock contribution -- how much wall-clock time separates
+    this track's own audible start from the next track's audible
+    start, in the ordinary (unclamped) crossfade case. Every place in
+    this module that means "how much of the hour does this track
+    consume" must route through this function (or _effective_airtime,
+    its raw-values equivalent used only by _extract_fit_candidates)
+    rather than reading next_start_seconds/duration_seconds directly,
+    so scheduling math can never silently drift between build modes
+    again. See _effective_airtime's docstring for the full derivation
+    and the one known gap (the engine's 10-second clamp; see
+    test_log_builder_selection.py's documented clamp-limitation test).
+
+    Deliberately NOT used for engine.py's own position/trigger
+    comparisons -- next_start_seconds alone remains correct there,
+    since those compare two values already expressed in the same
+    absolute-file-position coordinate frame. This function is only for
+    scheduling/accounting math that represents elapsed broadcast
+    timeline (log_builder's own accumulation, remaining-runway, and
+    fit/landing calculations)."""
+    return _effective_airtime(track.next_start_seconds, track.duration_seconds, track.cue_in_seconds)
+
+
 @dataclass(frozen=True)
 class FitCandidate:
     """Lightweight, DB-independent stand-in for a Track during exact-fit/
     pair-planning scoring -- so scoring a whole pool never touches a
     real Track/Artist row per candidate (no N+1), only after a winner is
     chosen. `identity_keys` is the same normalized frozenset
-    related_artists.track_identity_keys returns."""
+    related_artists.track_identity_keys returns. `duration_seconds` is
+    actually effective airtime (see effective_airtime_seconds) despite
+    the field's name -- kept as-is to avoid a churny rename across
+    every pair/exact-fit scoring function that already reads it."""
     track_id: int
     identity_keys: frozenset
     duration_seconds: float
@@ -456,16 +533,16 @@ def _extract_fit_candidates(qs, active_holiday_codes=None):
     random SQL-side draw happened to surface."""
     boost_expr, boost_params = _holiday_boost_expr(active_holiday_codes)
     rows = qs.annotate(_fit_holiday_boost=RawSQL(boost_expr, boost_params)).values_list(
-        "id", "next_start_seconds", "duration_seconds", "rotation_weight",
+        "id", "next_start_seconds", "duration_seconds", "cue_in_seconds", "rotation_weight",
         "last_played_at", "artist__name", "related_artists", "_fit_holiday_boost",
     )
     now = timezone.now()
     candidates = []
-    for track_id, next_start, duration, rotation_weight, last_played_at, artist_name, related_artists, holiday_boost in rows:
+    for track_id, next_start, duration, cue_in, rotation_weight, last_played_at, artist_name, related_artists, holiday_boost in rows:
         candidates.append(FitCandidate(
             track_id=track_id,
             identity_keys=track_identity_keys(artist_name, related_artists),
-            duration_seconds=next_start if next_start is not None else (duration or 0),
+            duration_seconds=_effective_airtime(next_start, duration, cue_in),
             effective_weight=compute_effective_weight(rotation_weight, holiday_boost or 0, last_played_at, now=now),
         ))
     return candidates
@@ -717,6 +794,54 @@ class SelectionDiagnostics:
             "target_duration_seconds": round(self.target_duration_seconds, 1),
             "late_offset_seconds": round(self.late_offset_seconds, 1),
         }
+
+    def needs_operator_attention(self):
+        """Monitoring philosophy (1.1 follow-up): Monitoring should tell
+        the operator when the scheduler needs attention; ordinary logs
+        explain what it did. A normal successful hour build -- one or
+        more landing-pair fallbacks that resolved via exact-fit,
+        clock-drift recovery shortening the target, a small/acceptable
+        landing error, direct tracks inserted normally -- is NOT by
+        itself abnormal and must not occupy the Monitoring Recent
+        Events feed.
+
+        Deliberately narrow, explicit predicate rather than "emit
+        whenever any field is nonzero": a slot that came up completely
+        empty (pool_exhausted_picks) or a landing pair that missed its
+        target by more than the station's own configured fit tolerance
+        (DURATION_FIT_MARGIN -- the same tolerance single-track exact-
+        fit already uses, reused here rather than inventing a second,
+        unrelated threshold) are the two conditions this module can
+        currently detect that mean the intended hour plan genuinely
+        could not be achieved.
+
+        Two other conditions from the review are intentionally NOT
+        checked here, because they already have their own, separate,
+        pre-existing visibility and duplicating them here would need a
+        backwards import from engine.py (a real circular-import risk --
+        engine.py imports extensively FROM this module):
+          - clock recovery hitting MAX_CLOCK_RECOVERY_SECONDS: already
+            reported by engine.py's own "Clock-drift target clamped"
+            event at the point the clamp is actually applied, before
+            target_duration_seconds ever reaches this module.
+          - build/persistence failure: already reported by engine.py's
+            "Async hour-log build failed"/"...crashed" events, and a
+            failure during selection itself never reaches this point at
+            all (the exception propagates before this function's
+            caller can call it).
+
+        Pair-solver-budget exhaustion (find_matched_pair's
+        PAIR_SOLVER_BUDGET_MS deadline) is NOT currently instrumented
+        anywhere -- deliberately left uninstrumented in this pass
+        rather than threading a new out-parameter through
+        find_matched_pair's signature and every caller, which would be
+        exactly the "large schema redesign" this pass is meant to
+        avoid. A worthwhile small follow-up, not done here."""
+        if self.pool_exhausted_picks > 0:
+            return True
+        if self.landing_errors and max(self.landing_errors) > DURATION_FIT_MARGIN:
+            return True
+        return False
 
 
 def _resolve_slot_pool_context(category, target_datetime, recency_cfg, active_holiday_codes, daily_shares):
@@ -1086,7 +1211,7 @@ def fill_remaining_hour(picks, accumulated_seconds, target_datetime,
 
     def _append_fill_pick(track):
         nonlocal accumulated_seconds, remaining
-        track_duration = track.next_start_seconds or track.duration_seconds or 0
+        track_duration = effective_airtime_seconds(track)
         scheduled_time = target_datetime + timedelta(seconds=accumulated_seconds)
         picks.append({
             "position": len(picks),
@@ -1243,7 +1368,7 @@ def _build_from_rotation(target_date, hour, rotation, target_duration_seconds=NO
 
     def _append_pick(track, category):
         nonlocal accumulated_seconds
-        track_duration = track.next_start_seconds or track.duration_seconds or 0
+        track_duration = effective_airtime_seconds(track)
         scheduled_time = target_datetime + timedelta(seconds=accumulated_seconds)
         picks.append({
             "position": len(picks),
@@ -1442,11 +1567,34 @@ def _build_from_rotation(target_date, hour, rotation, target_duration_seconds=NO
         target_duration_seconds=target_duration_seconds,
     )
 
-    emit_event(
-        category="library", level="info", title="Hour log selection diagnostics",
-        detail={"date": target_date.isoformat(), "hour": hour, **diagnostics.as_detail()},
-        dedupe_key=f"library|selection-diagnostics|{target_date.isoformat()}|{hour}",
-    )
+    # Monitoring philosophy (1.1 follow-up): Monitoring tells the
+    # operator when the scheduler needs attention; ordinary application
+    # logs explain what it did. The full diagnostic payload is always
+    # printed (visible in the systemd journal for engineering/debug
+    # purposes) -- only an ABNORMAL build additionally raises a
+    # Monitoring/SystemEvent. See SelectionDiagnostics.needs_operator_
+    # attention's docstring for the exact predicate and why the other
+    # candidate conditions from the review are deliberately not
+    # duplicated here (they already have their own separate visibility,
+    # or would require a large schema change to instrument).
+    diagnostics_detail = {"date": target_date.isoformat(), "hour": hour, **diagnostics.as_detail()}
+    if diagnostics.needs_operator_attention():
+        reasons = []
+        if diagnostics.pool_exhausted_picks > 0:
+            reasons.append(f"{diagnostics.pool_exhausted_picks} slot(s) had no eligible track survive selection")
+        if diagnostics.landing_errors and max(diagnostics.landing_errors) > DURATION_FIT_MARGIN:
+            reasons.append(
+                f"worst landing error {max(diagnostics.landing_errors):.1f}s exceeds "
+                f"the {DURATION_FIT_MARGIN}s fit tolerance"
+            )
+        print(f"  Hour log selection needs attention for {target_date} {hour:02d}:00:", diagnostics_detail)
+        emit_event(
+            category="library", level="warning", title="Hour log selection needs attention",
+            detail={**diagnostics_detail, "reasons": reasons},
+            dedupe_key=f"library|selection-diagnostics|{target_date.isoformat()}|{hour}",
+        )
+    else:
+        print(f"  Hour log selection diagnostics for {target_date} {hour:02d}:00 (healthy, no monitoring event needed):", diagnostics_detail)
 
     return _persist_log(target_date, hour, picks)
 
@@ -1468,7 +1616,7 @@ def _build_from_playlist(target_date, hour, playlist, target_duration_seconds=NO
     accumulated_seconds = 0.0
     for item in items:
         track = item.track
-        track_duration = track.next_start_seconds or track.duration_seconds or 0
+        track_duration = effective_airtime_seconds(track)
         scheduled_time = target_datetime + timedelta(seconds=accumulated_seconds)
         picks.append({
             "position": len(picks),
@@ -1701,7 +1849,7 @@ def preview_hour_log(target_date, hour, target_duration_seconds=NOMINAL_HOUR_SEC
         for item in items:
             track = item.track
             _describe_track_issues(track, f"Playlist position {item.position + 1}", issues)
-            track_duration = track.next_start_seconds or track.duration_seconds or 0
+            track_duration = effective_airtime_seconds(track)
             scheduled_time = target_datetime + timedelta(seconds=accumulated_seconds)
             picks.append({
                 "position": len(picks), "scheduled_time": scheduled_time,
@@ -1793,7 +1941,7 @@ def preview_hour_log(target_date, hour, target_duration_seconds=NOMINAL_HOUR_SEC
 
             _describe_track_issues(track, f"Slot {idx + 1} ({category.name if category else '?'})", issues)
 
-            track_duration = track.next_start_seconds or track.duration_seconds or 0
+            track_duration = effective_airtime_seconds(track)
             scheduled_time = target_datetime + timedelta(seconds=accumulated_seconds)
             picks.append({
                 "position": len(picks), "scheduled_time": scheduled_time,
@@ -1869,7 +2017,7 @@ def preview_hour_log(target_date, hour, target_duration_seconds=NOMINAL_HOUR_SEC
                 "title": p["track"].title,
                 "artist": p["track"].artist.name if p["track"].artist_id else "",
                 "category": p["category"].code if p["category"] else "",
-                "duration": p["track"].next_start_seconds or p["track"].duration_seconds or 0,
+                "duration": effective_airtime_seconds(p["track"]),
             }
             for p in picks
         ],

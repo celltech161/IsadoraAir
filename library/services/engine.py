@@ -37,6 +37,7 @@ from library.services.log_builder import (
     NOMINAL_HOUR_SECONDS,
     append_fill_items,
     build_and_approve_hour_log_locked,
+    effective_airtime_seconds,
     fill_remaining_hour,
 )
 from library.services.remote_dj_signaling import RemoteDJSignalingServer
@@ -5599,6 +5600,69 @@ class PlaybackEngine:
             )
             return NOMINAL_HOUR_SECONDS
 
+    def _compute_queue_eta_state(self, snapshot):
+        """Builds the live queue list with listener-audible-start
+        eta_seconds/airtime_seconds for each upcoming item -- factored
+        out of _write_state so it's directly testable without needing
+        to stand up the rest of the engine (mic, remote DJ, FX fires,
+        etc.). Feeds /run/isadoraair/engine_state.json's "queue" array,
+        which the dashboard's Coming Up list and webrequests.services.
+        estimate_air_time (via _live_eta_datetime) both read for their
+        own "Starts at"/air-time estimates.
+
+        1.1 airtime-correction follow-up -- listener-audible-start
+        semantics, not raw file-position next_start_seconds:
+
+        The FIRST offset (`eta`, below) is fundamentally different from
+        every offset after it: it's the REMAINING runway on the deck
+        that's already mid-playback right now, from its CURRENT source
+        position forward to the next audible handoff.
+        _leading_deck_eta_seconds already computes exactly that
+        (next_start_current - current_position) -- the leading deck's
+        own cue_in has already happened and played out, so it must NOT
+        be subtracted again here (that would double-count it). This is
+        precisely why _leading_deck_eta_seconds was correctly left
+        unchanged by the airtime-correction pass; nothing about it
+        needs to change for this fix either.
+
+        Every SUBSEQUENT queued item, by contrast, is a full future
+        track that hasn't started yet -- its contribution is the same
+        listener-facing effective_airtime_seconds() log_builder.py's
+        own build-time scheduling now uses (next_start_seconds -
+        cue_in_seconds, with the same explicit is-not-None/duration-
+        fallback semantics), reused here rather than re-implemented, so
+        the two can never silently drift apart again. Previously this
+        loop computed the correct cue-in-adjusted value into a local
+        for the per-item DISPLAY field but advanced the running total
+        with the UNADJUSTED raw value instead -- silently overcounting
+        every future queued track's contribution to "Starts at" by its
+        own cue-in, even though the per-item "airtime_seconds" figure
+        right next to it was already correct. Fixed: both now use the
+        same value."""
+        eta = self._leading_deck_eta_seconds(snapshot=snapshot)
+
+        queue = []
+        for qi in self._get_upcoming_preview():
+            qt = qi.track
+            # Same number the countdown on the Playing deck decays
+            # down from once this track goes live, so the preview
+            # deck UI shows the identical figure to prime the DJ.
+            q_airtime = effective_airtime_seconds(qt)
+            queue.append({
+                "item_id": qi.id,
+                "track_id": qt.id,
+                "title": qt.title,
+                "artist": qt.artist.name if qt.artist else "",
+                "duration": qt.duration_seconds or 0,
+                "airtime_seconds": round(q_airtime, 1),
+                "category": qt.category.code if qt.category else "",
+                "format": qt.format or "",
+                "fill_color": qt.category.kind.fill_color if qt.category else None,
+                "eta_seconds": round(eta, 1),
+            })
+            eta += q_airtime
+        return queue
+
     def _write_state(self, transport="PLAYING"):
         try:
             STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -5642,39 +5706,12 @@ class PlaybackEngine:
                 }
 
             # Seconds-from-now ETA for each queue item, so the UI can
-            # show a live "time on" clock estimate. Walks forward from
-            # whatever time is left on the currently-leading deck,
-            # accumulating each subsequent track's "effective" play
-            # time (next_start_seconds if set, else full duration) —
-            # the same heuristic the crossfade trigger itself uses, so
-            # the estimate matches how handoffs actually happen.
-            eta = self._leading_deck_eta_seconds(snapshot=snapshot)
-
-            queue = []
-            for qi in self._get_upcoming_preview():
-                qt = qi.track
-                # "Effective airtime" = the number of seconds a listener
-                # will actually hear this track for, from cue_in to
-                # next_start (or duration if next_start is unset). Same
-                # number the countdown on the Playing deck decays down
-                # from when this track goes live, so the preview deck
-                # UI can show the identical figure to prime the DJ.
-                q_effective_end = qt.next_start_seconds if qt.next_start_seconds is not None else (qt.duration_seconds or 0)
-                q_cue_in = qt.cue_in_seconds or 0
-                q_airtime = max(0.0, q_effective_end - q_cue_in)
-                queue.append({
-                    "item_id": qi.id,
-                    "track_id": qt.id,
-                    "title": qt.title,
-                    "artist": qt.artist.name if qt.artist else "",
-                    "duration": qt.duration_seconds or 0,
-                    "airtime_seconds": round(q_airtime, 1),
-                    "category": qt.category.code if qt.category else "",
-                    "format": qt.format or "",
-                    "fill_color": qt.category.kind.fill_color if qt.category else None,
-                    "eta_seconds": round(eta, 1),
-                })
-                eta += q_effective_end
+            # show a live "time on" clock estimate -- listener-audible-
+            # start semantics; see _compute_queue_eta_state's own
+            # docstring for the full derivation (1.1 airtime-correction
+            # follow-up) and why the current-deck and future-queue
+            # offsets use deliberately different formulas.
+            queue = self._compute_queue_eta_state(snapshot)
 
             state = {
                 "transport": transport,
