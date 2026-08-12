@@ -1,11 +1,17 @@
+import bisect
+import math
 import random
 from contextlib import contextmanager
+from dataclasses import dataclass, field
 from datetime import date as _date, datetime, time, timedelta
+from time import monotonic
 
-from django.db import connection
+from django.db import connection, transaction
 from django.db.models import Count, Q
 from django.db.models.expressions import RawSQL
 from django.utils import timezone
+
+from monitoring.models import emit_event
 
 from library.models import (
     Category,
@@ -304,18 +310,45 @@ def get_recent_exclusions(target_datetime, artist_sep_hours, title_sep_hours,
     return exclude_track_ids, exclude_identity_keys
 
 
+# Historical single-tier fit threshold -- superseded by
+# EXACT_FIT_THRESHOLD_SECONDS (see below pick_track's fit_mode
+# computation) as of the 1.1 spec's three-mode split. Left defined
+# (unreferenced) rather than removed, in case anything external still
+# imports it.
 DURATION_FIT_THRESHOLD = 480  # start fitting when < 8 minutes remain
-DURATION_FIT_MARGIN = 30     # acceptable overshoot in seconds
+DURATION_FIT_MARGIN = 30     # acceptable overshoot in seconds, both single-track and pair modes
+
+# Additional dormancy bonus (1.1 spec): a track that has never aired, or
+# hasn't aired in over a year, gets an extra flat multiplier on top of
+# the existing log-dampened dormancy factor -- ADDITIONAL to, not a
+# replacement for, the finite-365-day COALESCE treatment those tracks
+# already get for the log-dampened factor itself (which they still need,
+# so they sort among other long-idle tracks instead of as an unbounded
+# special case). See _effective_weight_sql / compute_effective_weight.
+DORMANT_WEIGHT_BONUS_DAYS = 365
+DORMANT_WEIGHT_BONUS = 2.0
+
+# Nominal hour length in seconds -- the default target_duration_seconds
+# for every build path. Admin rebuild/preview always use this default;
+# the engine's own auto-build can pass a shorter computed target when it
+# knows (via clock-drift recovery, see engine.py) that the upcoming hour
+# will actually start late. Never longer than this -- see
+# MAX_CLOCK_RECOVERY_SECONDS in engine.py for the one-way-only rationale.
+NOMINAL_HOUR_SECONDS = 3600
 
 
-def _weighted_order(qs, active_holiday_codes=None):
-    """Random selection weighted by Track.rotation_weight (0-5, default 3)
-    and by dormancy (hours since Track.last_played_at, updated live by
-    engine.py on every real play) -- so among tracks that have already
-    cleared their recency-separation window (the hard exclusion this
-    queryset was already filtered by), ones that have sat idle longer are
-    proportionally more likely to come up, without turning selection into
-    a strict least-recently-played queue (which would sound mechanical).
+def _effective_weight_sql(active_holiday_codes=None):
+    """The deterministic per-track effective-weight SQL expression --
+    shared by _weighted_order's weighted-random draw formula and by any
+    test/caller that wants the same NUMERIC weight without an actual
+    randomized draw (used to prove SQL/Python equivalence against
+    compute_effective_weight, the Python-side version pair/exact-fit
+    mode uses when it materializes candidates outside SQL). Returns
+    (sql_expression, params) for splicing into RawSQL/.annotate().
+
+    effective_weight = (rotation_weight + 1 + holiday_boost)
+                      * (1 + LN(1 + hours_since_last_played))
+                      * dormancy_bonus
 
     rotation_weight is shifted by +1 so weight 0 is never a hard
     zero-probability tier -- ready2air is what actually excludes a track,
@@ -331,13 +364,16 @@ def _weighted_order(qs, active_holiday_codes=None):
     rotation_weight entirely and just recreate the "sounds mechanical"
     problem from the other direction (an oldest-first queue instead of a
     flat random one). Never-played tracks (last_played_at IS NULL) are
-    treated as idle 365 days -- a large but finite dormancy so genuinely
-    ancient tracks (idle *longer* than a year) can still outrank a
-    brand-new, never-aired addition.
+    treated as idle 365 days for THIS factor -- a large but finite
+    dormancy so genuinely ancient tracks (idle *longer* than a year) can
+    still outrank a brand-new, never-aired addition.
 
-    `-LN(RANDOM()) / weight` is the standard SQL-side trick for weighted
-    sampling without materializing/shuffling anything -- same query cost
-    as the plain `order_by("?")` it replaces.
+    `dormancy_bonus` is a THIRD, separate multiplier (DORMANT_WEIGHT_
+    BONUS, additional to the log-dampened factor above, not a
+    replacement for it): tracks that have never aired, or haven't aired
+    in over DORMANT_WEIGHT_BONUS_DAYS, get an extra flat boost -- these
+    are exactly the tracks the log-dampening otherwise under-favors
+    relative to how rarely they actually come up in practice.
 
     `active_holiday_codes` (a list of Holiday.code strings currently in
     their ramp window) adds a per-track boost to `rotation_weight` --
@@ -349,42 +385,406 @@ def _weighted_order(qs, active_holiday_codes=None):
     was already at the default weight=3. See _active_holidays_at for
     the ramp-window semantics."""
     boost_expr, boost_params = _holiday_boost_expr(active_holiday_codes)
-    return qs.order_by(RawSQL(
-        f"-LN(RANDOM()) / ((rotation_weight + 1 + {boost_expr}) * (1 + LN(1 + "
-        "EXTRACT(EPOCH FROM (NOW() - COALESCE(last_played_at, "
-        "NOW() - INTERVAL '365 days'))) / 3600.0)))",
-        boost_params,
-    ))
+    sql = (
+        f"(rotation_weight + 1 + {boost_expr}) "
+        "* (1 + LN(1 + EXTRACT(EPOCH FROM (NOW() - COALESCE(last_played_at, "
+        "NOW() - INTERVAL '365 days'))) / 3600.0)) "
+        "* (CASE WHEN last_played_at IS NULL OR last_played_at < NOW() - (%s * INTERVAL '1 day') "
+        "THEN %s ELSE 1.0 END)"
+    )
+    params = boost_params + [DORMANT_WEIGHT_BONUS_DAYS, DORMANT_WEIGHT_BONUS]
+    return sql, params
+
+
+def compute_effective_weight(rotation_weight, holiday_boost, last_played_at, now=None):
+    """Python-side equivalent of _effective_weight_sql's deterministic
+    per-track weight -- used by pair/exact-fit mode (FitCandidate
+    scoring), which materializes candidates in Python instead of doing a
+    SQL-side weighted-random draw. Must stay mathematically identical to
+    the SQL expression for the same inputs; see
+    test_log_builder_selection.py's equivalence tests, which compute
+    both for a range of last_played_at values against a real DB row and
+    assert they match within floating-point tolerance.
+
+    play_count is deliberately never used here or in the SQL version --
+    this project weights by rotation_weight and recency of play only."""
+    now = now or timezone.now()
+    if last_played_at is None:
+        reference = now - timedelta(days=DORMANT_WEIGHT_BONUS_DAYS)
+        is_dormant = True
+    else:
+        reference = last_played_at
+        is_dormant = last_played_at < now - timedelta(days=DORMANT_WEIGHT_BONUS_DAYS)
+    hours_since = max(0.0, (now - reference).total_seconds() / 3600.0)
+    dormancy_factor = 1 + math.log(1 + hours_since)
+    bonus = DORMANT_WEIGHT_BONUS if is_dormant else 1.0
+    return (rotation_weight + 1 + holiday_boost) * dormancy_factor * bonus
+
+
+def _weighted_order(qs, active_holiday_codes=None):
+    """Random selection weighted by _effective_weight_sql -- see that
+    function's docstring for the full formula and rationale.
+
+    `-LN(RANDOM()) / weight` is the standard SQL-side trick for weighted
+    sampling without materializing/shuffling anything -- same query cost
+    as the plain `order_by("?")` it replaces."""
+    weight_sql, weight_params = _effective_weight_sql(active_holiday_codes)
+    return qs.order_by(RawSQL(f"-LN(RANDOM()) / ({weight_sql})", weight_params))
+
+
+@dataclass(frozen=True)
+class FitCandidate:
+    """Lightweight, DB-independent stand-in for a Track during exact-fit/
+    pair-planning scoring -- so scoring a whole pool never touches a
+    real Track/Artist row per candidate (no N+1), only after a winner is
+    chosen. `identity_keys` is the same normalized frozenset
+    related_artists.track_identity_keys returns."""
+    track_id: int
+    identity_keys: frozenset
+    duration_seconds: float
+    effective_weight: float
+
+
+def _extract_fit_candidates(qs, active_holiday_codes=None):
+    """Full-pool extraction (1.1 spec) -- every eligible track in `qs`
+    becomes a FitCandidate, in ONE query (annotated with the same
+    holiday-boost subquery _weighted_order uses), no top-200
+    truncation and no N+1s. Replaces the historical top-200 weighted-
+    random pre-slice that used to feed _pick_best_fit; full-pool
+    extraction is what lets exact-fit mode actually find the best
+    duration match instead of only searching whatever 200 rows a
+    random SQL-side draw happened to surface."""
+    boost_expr, boost_params = _holiday_boost_expr(active_holiday_codes)
+    rows = qs.annotate(_fit_holiday_boost=RawSQL(boost_expr, boost_params)).values_list(
+        "id", "next_start_seconds", "duration_seconds", "rotation_weight",
+        "last_played_at", "artist__name", "related_artists", "_fit_holiday_boost",
+    )
+    now = timezone.now()
+    candidates = []
+    for track_id, next_start, duration, rotation_weight, last_played_at, artist_name, related_artists, holiday_boost in rows:
+        candidates.append(FitCandidate(
+            track_id=track_id,
+            identity_keys=track_identity_keys(artist_name, related_artists),
+            duration_seconds=next_start if next_start is not None else (duration or 0),
+            effective_weight=compute_effective_weight(rotation_weight, holiday_boost or 0, last_played_at, now=now),
+        ))
+    return candidates
+
+
+# How many of the closest-duration candidates compete via weighted-random
+# choice in exact-fit mode -- mirrors the historical top-200-then-best-5
+# behavior's "best 5" width, just now drawn from the full pool and
+# weighted by effective_weight instead of picked uniformly.
+FIT_NEAR_MATCH_COUNT = 5
+
+
+def _weighted_choice_by(items, weight_fn):
+    """Weighted-random choice over `items` using weight_fn(item) as each
+    item's relative probability. Falls back to a uniform choice if every
+    weight is non-positive (shouldn't happen given compute_effective_
+    weight's >=1 floor, but never crash on it)."""
+    weights = [max(0.0, weight_fn(item)) for item in items]
+    if sum(weights) <= 0:
+        return random.choice(items)
+    return random.choices(items, weights=weights, k=1)[0]
 
 
 def _pick_best_fit(qs, remaining_seconds, active_holiday_codes=None):
-    """From a queryset of eligible tracks, pick the one whose duration
-    best fills the remaining time without overshooting too much."""
-    candidates = list(
-        _weighted_order(qs, active_holiday_codes=active_holiday_codes)
-        .values_list("id", "next_start_seconds", "duration_seconds")[:200]
-    )
+    """Exact-fit selection (1.1 spec): from the FULL pool of eligible
+    tracks (no top-200 truncation), weighted-random choice among the
+    FIT_NEAR_MATCH_COUNT closest-duration candidates that don't
+    overshoot `remaining_seconds` by more than DURATION_FIT_MARGIN.
+    Weighting by effective_weight here is an intentional improvement
+    over the historical uniform-random-among-best-5 behavior: rotation_
+    weight/dormancy now matter even in fit mode, not just in normal
+    weighted-random mode.
+
+    Second-pass correction: if NOTHING clears the overshoot margin,
+    this now returns None (graceful stop) instead of the original
+    draft's behavior of force-picking the closest-of-everything
+    regardless of how badly it overshoots. That original "dead air is
+    worse than a duration mismatch" reasoning doesn't hold for THIS
+    mode: exact-fit only engages when remaining_seconds is already
+    small (near a real wall-clock boundary, live-fill or the tail of a
+    build), so forcing e.g. a 7-minute track into a 2-minute gap
+    doesn't avoid dead air, it just knowingly creates a large,
+    undisclosed top-of-hour overrun -- exactly what clock-drift
+    recovery exists to avoid causing in the first place. Callers
+    (pick_track's loosening ladder, _build_from_rotation,
+    fill_remaining_hour) already treat None gracefully -- loosen
+    further, skip the slot, or stop the fill loop -- so this is a safe,
+    already-supported return value, not a new failure mode."""
+    candidates = _extract_fit_candidates(qs, active_holiday_codes=active_holiday_codes)
     if not candidates:
         return None
 
-    def track_dur(c):
-        return c[1] or c[2] or 0
+    scored = [(abs(remaining_seconds - c.duration_seconds), c) for c in candidates]
+    within_margin = [(diff, c) for diff, c in scored if remaining_seconds - c.duration_seconds >= -DURATION_FIT_MARGIN]
+    if not within_margin:
+        return None
+    within_margin.sort(key=lambda pair: pair[0])
+    finalists = [c for _, c in within_margin[:FIT_NEAR_MATCH_COUNT]]
+
+    chosen = _weighted_choice_by(finalists, lambda c: c.effective_weight)
+    return Track.objects.get(id=chosen.track_id)
+
+
+# Selection-mode thresholds (1.1 spec) -- defaults, not sacred values;
+# tune per station preference. Landing mode (two-slot matched-pair
+# planning) engages when MORE than EXACT_FIT_THRESHOLD_SECONDS but no
+# more than PAIR_LANDING_THRESHOLD_SECONDS remain; exact-fit (full-pool
+# single-track fitting) engages at or below EXACT_FIT_THRESHOLD_SECONDS,
+# or whenever only one slot remains (a pair is structurally impossible
+# with one slot). Above PAIR_LANDING_THRESHOLD_SECONDS, normal
+# (unmodified) sequential weighted-random picking continues.
+PAIR_LANDING_THRESHOLD_SECONDS = 720  # ~12 minutes
+EXACT_FIT_THRESHOLD_SECONDS = 360     # ~6 minutes
+
+# How many duration-adjacent candidates from the SECOND pool get examined
+# per candidate from the first pool during the bisect search below.
+PAIR_DURATION_NEIGHBORS = 8
+# Cap on retained scored pairs before the final weighted-random choice
+# (spec's suggested range is 25-100 finalists; 50 sits in the middle).
+PAIR_FINALIST_LIMIT = 50
+# Soft wall-clock ceiling on the pair search itself (not a CI timing
+# assertion -- see the benchmark command for that). Protects against a
+# pathologically large pool without needing a hard candidate-count cap.
+PAIR_SOLVER_BUDGET_MS = 500
+# landing_quality = 1 / (1 + landing_error / this) -- larger values make
+# landing_quality decay more gently with distance from a perfect fit.
+PAIR_LANDING_QUALITY_DIVISOR = 15.0
+
+
+@dataclass(frozen=True)
+class PairResult:
+    """A single scored two-track landing candidate. Exposed (not just
+    used internally) so SelectionDiagnostics can report the winning
+    pair's landing_error/pair_score for operator visibility."""
+    candidate_a: FitCandidate
+    candidate_b: FitCandidate
+    pair_score: float
+    landing_error: float
+
+
+def _pair_valid(a, b):
+    """A pair is invalid if it's literally the same track twice, or if
+    the two tracks mutually conflict via related-artist identity keys.
+    Both invariants matter here even though sequential per-slot hard-
+    exclusion (which normally prevents these) doesn't apply -- the two
+    tracks in a pair are chosen JOINTLY, neither one first."""
+    if a.track_id == b.track_id:
+        return False
+    if a.identity_keys & b.identity_keys:
+        return False
+    return True
+
+
+def _score_pair(a, b, remaining_seconds):
+    """pair_score = effective_weight_a * effective_weight_b *
+    landing_quality (the 1.1 spec's formula).
+
+    Second-pass review corrected an earlier draft here: that draft
+    multiplied in a fourth "remainder_quality" factor defined as a
+    duration-BALANCE measure (penalizing a lopsided split like 7:00 +
+    3:00 relative to 5:00 + 5:00 at the same combined duration). On
+    review that wasn't the intended concept and had no basis --
+    there's no requirement that matched songs be similar in length,
+    and landing_quality already expresses everything presently
+    available about whether a pair is a good choice (how close its
+    combined duration lands to the remaining runway). A separate
+    "is the remainder usefully fillable" signal would be redundant
+    with landing_quality (a large landing_error already means a large,
+    poorly-absorbed remainder either way), so it's removed rather than
+    redefined -- three factors, matching the spec's own formula."""
+    total_duration = a.duration_seconds + b.duration_seconds
+    landing_error = abs(remaining_seconds - total_duration)
+    landing_quality = 1.0 / (1.0 + landing_error / PAIR_LANDING_QUALITY_DIVISOR)
+    pair_score = a.effective_weight * b.effective_weight * landing_quality
+    return PairResult(candidate_a=a, candidate_b=b, pair_score=pair_score, landing_error=landing_error)
+
+
+def find_matched_pair(candidates_a, candidates_b, remaining_seconds, rng=None):
+    """Duration-indexed bisect search (1.1 spec) for a two-track
+    "landing" pair whose combined duration lands close to
+    `remaining_seconds` -- explicitly NOT a Cartesian product (that
+    would be O(M*N), and the spec calls this out by name as the thing
+    to avoid). Sorts pool B once by duration (O(N log N)), then for
+    each candidate in pool A (M items) bisects into pool B's sorted
+    durations to find where a perfectly-complementary duration would
+    fall and examines only the PAIR_DURATION_NEIGHBORS candidates
+    around that point -- O(M log N) for the search itself. Overall
+    O(M log N + N log N), matching the spec's target complexity
+    (stated there as O(M log M + N log M); the two are the same shape).
+
+    `candidates_a`/`candidates_b` may be the SAME pool object (typical
+    case: two consecutive slots of the same category) -- self-pairing
+    and mutual related-artist identity conflicts are filtered out
+    explicitly (see _pair_valid), since sequential per-slot hard-
+    exclusion doesn't apply when both tracks are chosen jointly rather
+    than one after the other.
+
+    Retains up to PAIR_FINALIST_LIMIT highest-pair_score valid pairs,
+    then makes a WEIGHTED-RANDOM choice among them by pair_score --
+    deliberately never deterministically the single closest-landing
+    pair (see _score_pair). `rng` accepts a seeded random.Random for
+    reproducible tests; defaults to the module-level `random`.
+
+    Bounded by PAIR_SOLVER_BUDGET_MS: if pool sizes are large enough
+    that scanning is taking unexpectedly long, stops examining further
+    pool-A candidates and proceeds to select among whatever's already
+    been collected -- never returns nothing purely because of the
+    budget, only because no valid pair existed in what was scanned.
+
+    Returns a PairResult, or None if no valid pair exists (e.g. one
+    pool is empty, or degenerate down to nothing but self/identity
+    conflicts)."""
+    rng = rng if rng is not None else random
+
+    if not candidates_a or not candidates_b:
+        return None
+
+    sorted_b = sorted(candidates_b, key=lambda c: c.duration_seconds)
+    durations_b = [c.duration_seconds for c in sorted_b]
 
     scored = []
-    for c in candidates:
-        dur = track_dur(c)
-        diff = remaining_seconds - dur
-        if diff >= -DURATION_FIT_MARGIN:
-            scored.append((abs(diff), c[0]))
+    deadline = monotonic() + (PAIR_SOLVER_BUDGET_MS / 1000.0)
+    half_window = max(1, PAIR_DURATION_NEIGHBORS // 2)
 
-    if scored:
-        scored.sort(key=lambda x: x[0])
-        best_ids = [s[1] for s in scored[:5]]
-        pick_id = random.choice(best_ids)
-    else:
-        pick_id = random.choice(candidates)[0]
+    for i, a in enumerate(candidates_a):
+        if i % 200 == 0 and i > 0 and monotonic() > deadline:
+            break
+        target_b_duration = remaining_seconds - a.duration_seconds
+        idx = bisect.bisect_left(durations_b, target_b_duration)
+        lo = max(0, idx - half_window)
+        hi = min(len(sorted_b), idx + half_window)
+        for b in sorted_b[lo:hi]:
+            if not _pair_valid(a, b):
+                continue
+            scored.append(_score_pair(a, b, remaining_seconds))
 
-    return Track.objects.get(id=pick_id)
+    if not scored:
+        return None
+
+    scored.sort(key=lambda pr: pr.pair_score, reverse=True)
+    finalists = scored[:PAIR_FINALIST_LIMIT]
+
+    weights = [max(0.0, pr.pair_score) for pr in finalists]
+    if sum(weights) <= 0:
+        return rng.choice(finalists)
+    return rng.choices(finalists, weights=weights, k=1)[0]
+
+
+@dataclass
+class SelectionDiagnostics:
+    """Forward-compatible structured summary of how a build's category-
+    random slots were filled (1.1 spec) -- NOT full advanced-rule
+    support, just enough for an operator to see (via the SystemEvent
+    _build_from_rotation emits) which selection mode ran where and how
+    well landing pairs landed. Extend with more fields as future rule
+    work needs them; this is deliberately a plain, mutable, JSON-
+    serializable-via-as_detail() summary, not a persisted model."""
+    normal_picks: int = 0
+    landing_pairs: int = 0
+    # Landing zone reached (EXACT_FIT_THRESHOLD_SECONDS < remaining <=
+    # PAIR_LANDING_THRESHOLD_SECONDS) but no pair was actually used --
+    # either structurally blocked (direct-track slot next, or no next
+    # slot at all) or find_matched_pair found no valid pair. Each
+    # fallback still produces exactly one exact_fit_picks entry.
+    landing_pair_fallbacks: int = 0
+    exact_fit_picks: int = 0
+    direct_track_inserts: int = 0
+    pool_exhausted_picks: int = 0  # pick_track returned None (slot skipped)
+    landing_errors: list = field(default_factory=list)  # seconds, one per successful landing pair
+    target_duration_seconds: float = NOMINAL_HOUR_SECONDS
+    # How much shorter than a nominal hour this build's target was --
+    # derived, not independently supplied; a genuine 0 and "no clock-
+    # drift recovery attempted" are indistinguishable here by design,
+    # since log_builder.py has no live-engine state of its own. The
+    # engine emits its OWN separate diagnostic event for the clock-drift
+    # PROJECTION itself (offset computation, MAX_CLOCK_RECOVERY_SECONDS
+    # clamping) -- see engine.py.
+    late_offset_seconds: float = 0.0
+
+    def as_detail(self):
+        return {
+            "normal_picks": self.normal_picks,
+            "landing_pairs": self.landing_pairs,
+            "landing_pair_fallbacks": self.landing_pair_fallbacks,
+            "exact_fit_picks": self.exact_fit_picks,
+            "direct_track_inserts": self.direct_track_inserts,
+            "pool_exhausted_picks": self.pool_exhausted_picks,
+            "landing_errors": [round(e, 1) for e in self.landing_errors],
+            "target_duration_seconds": round(self.target_duration_seconds, 1),
+            "late_offset_seconds": round(self.late_offset_seconds, 1),
+        }
+
+
+def _resolve_slot_pool_context(category, target_datetime, recency_cfg, active_holiday_codes, daily_shares):
+    """Per-slot setup shared by sequential single-track picking and
+    landing-mode pair candidate extraction: effective recency
+    separation, plus an INDEPENDENT per-slot holiday dice roll -- each
+    slot's roll must never be merged with another slot's (1.1 spec's
+    per-slot-independent-holiday-resolution invariant). Mirrors the
+    holiday-injection logic _build_from_rotation has always used
+    inline; factored out here so landing mode can resolve TWO slots'
+    contexts independently without duplicating the dice-roll logic.
+
+    Returns (artist_sep, title_sep, pool_override_qs, pool_key,
+    exclude_holiday_codes) -- pool_key always resolves to a usable
+    TrackIdentityCache key (holiday tuple, category id, or a fresh
+    unique object as a last resort), matching pick_track's own
+    effective_pool_key semantics exactly."""
+    artist_sep, title_sep = get_separation(category, recency_cfg)
+
+    is_music_slot = category is not None and category.kind.code == "music"
+    chosen_holiday_codes = []
+    if is_music_slot and active_holiday_codes:
+        for code, share in daily_shares.items():
+            if random.random() < share:
+                chosen_holiday_codes.append(code)
+
+    pool_override_qs = None
+    pool_key = None
+    exclude_holiday_codes = None
+    if chosen_holiday_codes:
+        pool_override_qs = _music_holiday_pool(chosen_holiday_codes, target_datetime)
+        pool_key = ("holiday", tuple(sorted(chosen_holiday_codes)))
+    elif is_music_slot and active_holiday_codes:
+        exclude_holiday_codes = active_holiday_codes
+
+    if pool_key is None:
+        pool_key = ("category", category.id) if category is not None else object()
+
+    return artist_sep, title_sep, pool_override_qs, pool_key, exclude_holiday_codes
+
+
+def _landing_slot_candidates(category, target_datetime, pool_override_qs, exclude_holiday_codes,
+                              exclude_track_ids, exclude_identity_keys,
+                              hard_exclude_track_ids, hard_exclude_identity_keys,
+                              identity_cache, pool_key, active_holiday_codes):
+    """Builds the eligible-track pool for ONE slot's landing-mode
+    candidate extraction and returns it as FitCandidates. Mirrors pick_
+    track's own private pool-building (base pool -> exclude hard+
+    history+identity-conflicting track ids -> exclude active-holiday-
+    tagged tracks if requested) intentionally -- kept as a parallel,
+    clearly-documented implementation rather than a shared refactor of
+    pick_track's closures, since landing mode needs BOTH slots' full
+    candidate pools up front (to hand to find_matched_pair) rather than
+    picking one Track at a time the way pick_track's loosening loop
+    does."""
+    base_qs = pool_override_qs if pool_override_qs is not None else _tracks_for_category(category, target_datetime=target_datetime)
+    combined_tracks = set(exclude_track_ids) | set(hard_exclude_track_ids)
+    combined_identity_keys = set(exclude_identity_keys) | set(hard_exclude_identity_keys)
+    identity_conflict_ids = identity_cache.conflicting_track_ids(pool_key, base_qs, combined_identity_keys)
+    combined_tracks = combined_tracks | identity_conflict_ids
+
+    qs = base_qs
+    if combined_tracks:
+        qs = qs.exclude(id__in=combined_tracks)
+    if exclude_holiday_codes:
+        qs = qs.exclude(holidays__code__in=list(exclude_holiday_codes))
+
+    return _extract_fit_candidates(qs, active_holiday_codes=active_holiday_codes)
 
 
 def pick_track(category, exclude_track_ids, exclude_identity_keys,
@@ -393,9 +793,24 @@ def pick_track(category, exclude_track_ids, exclude_identity_keys,
                hard_exclude_track_ids=None, hard_exclude_identity_keys=None,
                active_holiday_codes=None,
                pool_override_qs=None, exclude_holiday_codes=None,
-               identity_cache=None, pool_key=None):
+               identity_cache=None, pool_key=None, force_fit_mode=False):
     """`exclude_*` are RECENCY-HISTORY exclusions -- they get progressively
     dropped by the loosening loop below if no candidate can be found.
+
+    `force_fit_mode` (1.1 spec, second-pass correction): engages
+    duration-aware exact-fit selection regardless of remaining_seconds'
+    own relationship to EXACT_FIT_THRESHOLD_SECONDS. Used specifically
+    by the landing-mode-pair-search-failed fallback in
+    _build_from_rotation/fill_remaining_hour: once a build has already
+    decided it's trying to land against a nearby wall-clock boundary
+    (remaining_seconds is in the landing zone, well above
+    EXACT_FIT_THRESHOLD_SECONDS) and a matched pair couldn't be found,
+    the single-track fallback must STILL be duration-aware -- degrading
+    to ordinary unconstrained weighted selection at that point would
+    silently abandon the landing attempt entirely, picking essentially
+    any track regardless of fit. Ordinary unconstrained selection
+    remains correct and intentional everywhere remaining_seconds
+    reflects genuine plentiful runway.
 
     `hard_exclude_*` are "already-picked in THIS build" exclusions -- they
     MUST hold through every loosening pass, otherwise a category with few
@@ -439,7 +854,13 @@ def pick_track(category, exclude_track_ids, exclude_identity_keys,
     tagged tracks from leaking through the SLOT'S normal category
     filing and inflating the effective share beyond the target.
     """
-    fit_mode = remaining_seconds is not None and remaining_seconds < DURATION_FIT_THRESHOLD
+    # EXACT_FIT_THRESHOLD_SECONDS (1.1 spec) supersedes the historical
+    # single-tier DURATION_FIT_THRESHOLD as the exact-fit engagement
+    # point -- DURATION_FIT_THRESHOLD is kept defined (DURATION_FIT_
+    # MARGIN, its sibling, is still used by _pick_best_fit's overshoot
+    # tolerance) but no longer drives this decision. force_fit_mode
+    # (see docstring above) engages it unconditionally.
+    fit_mode = force_fit_mode or (remaining_seconds is not None and remaining_seconds < EXACT_FIT_THRESHOLD_SECONDS)
     hard_exclude_track_ids = set(hard_exclude_track_ids or ())
     hard_exclude_identity_keys = set(hard_exclude_identity_keys or ())
     identity_cache = identity_cache if identity_cache is not None else TrackIdentityCache()
@@ -606,11 +1027,15 @@ def _identity_keys_for_picks(picks):
 
 def fill_remaining_hour(picks, accumulated_seconds, target_datetime,
                         active_holiday_codes=None, daily_shares=None,
-                        identity_cache=None):
+                        identity_cache=None, target_duration_seconds=NOMINAL_HOUR_SECONDS):
     """Top up `picks` with fallback-category tracks (admin-configured via
-    LogFillConfig) until the hour is filled, or as tightly as duration-fit
-    allows. Called after any build path in case it comes up short of a
-    full hour (e.g. a playlist/rotation that doesn't sum to 3600s).
+    LogFillConfig) until `target_duration_seconds` is filled, or as
+    tightly as duration-fit allows. Called after any build path in case
+    it comes up short (e.g. a playlist/rotation that doesn't sum to the
+    target on its own). `target_duration_seconds` defaults to a full
+    nominal hour (3600s); the engine's own auto-build passes a shorter
+    computed target when clock-drift recovery says the upcoming hour will
+    start late -- see engine.py.
 
     `picks` may already contain explicit playlist items or rotation
     picks -- their identity sets (primary + related artists) are
@@ -628,7 +1053,7 @@ def fill_remaining_hour(picks, accumulated_seconds, target_datetime,
     other pick_track() calls in this build are using, so the fallback
     category's pool data is reused rather than reloaded. Defaults to a
     fresh one if not given."""
-    remaining = 3600 - accumulated_seconds
+    remaining = target_duration_seconds - accumulated_seconds
     if remaining <= DURATION_FIT_MARGIN:
         return picks, accumulated_seconds
 
@@ -659,6 +1084,27 @@ def fill_remaining_hour(picks, accumulated_seconds, target_datetime,
 
     is_music_fill = category is not None and category.kind.code == "music"
 
+    def _append_fill_pick(track):
+        nonlocal accumulated_seconds, remaining
+        track_duration = track.next_start_seconds or track.duration_seconds or 0
+        scheduled_time = target_datetime + timedelta(seconds=accumulated_seconds)
+        picks.append({
+            "position": len(picks),
+            "scheduled_time": scheduled_time,
+            "track": track,
+            "category": category,
+        })
+        # Always accumulate for within-build hard exclusion; see the
+        # parallel comment in _build_from_rotation and pick_track's
+        # pool-exhaustion fallback.
+        picked_tracks.append(track)
+        picked_identity_keys.update(track_identity_keys(
+            track.artist.name if track.artist_id else None, track.related_artists,
+        ))
+        accumulated_seconds += track_duration
+        remaining = target_duration_seconds - accumulated_seconds
+        return track_duration
+
     for _ in range(MAX_FILL_TRACKS):
         if remaining <= DURATION_FIT_MARGIN:
             break
@@ -667,7 +1113,12 @@ def fill_remaining_hour(picks, accumulated_seconds, target_datetime,
             target_datetime, artist_sep, title_sep, picked_tracks, picked_identity_keys,
         )
 
-        # Same per-holiday dice roll as the main rotation loop.
+        # Same per-holiday dice roll as the main rotation loop -- only
+        # ONE roll per iteration here (not two independent ones like
+        # _build_from_rotation's landing-mode pairing), since a fill
+        # pair always draws both tracks from this same repeating
+        # category, unlike two distinct rotation slots that could
+        # differ in category.
         chosen_holiday_codes = []
         if is_music_fill and active_holiday_codes:
             for code, share in daily_shares.items():
@@ -682,6 +1133,47 @@ def fill_remaining_hour(picks, accumulated_seconds, target_datetime,
         elif is_music_fill and active_holiday_codes:
             exclude_holiday_codes = active_holiday_codes
 
+        # Landing zone (1.1 spec problem #3/#5: fill_remaining_hour
+        # didn't jointly optimize fill pairs) -- try pairing two tracks
+        # from this SAME category pool before falling back to a single
+        # exact-fit pick. Mirrors _build_from_rotation's landing-mode
+        # branch, adapted for one repeating pool instead of two
+        # independently-resolved rotation slots.
+        if EXACT_FIT_THRESHOLD_SECONDS < remaining <= PAIR_LANDING_THRESHOLD_SECONDS:
+            hard_exclude_track_ids = {t.id for t in picked_tracks}
+            hard_exclude_identity_keys = set(picked_identity_keys)
+            candidates = _landing_slot_candidates(
+                category, target_datetime, pool_override_qs, exclude_holiday_codes,
+                exclude_track_ids, exclude_identity_keys,
+                hard_exclude_track_ids, hard_exclude_identity_keys,
+                identity_cache, pool_key, active_holiday_codes,
+            )
+            pair_result = find_matched_pair(candidates, candidates, remaining_seconds=remaining)
+            if pair_result is not None:
+                resolved = {
+                    t.id: t for t in Track.objects.select_related("artist", "category").filter(
+                        id__in=[pair_result.candidate_a.track_id, pair_result.candidate_b.track_id],
+                    )
+                }
+                track_a = resolved.get(pair_result.candidate_a.track_id)
+                track_b = resolved.get(pair_result.candidate_b.track_id)
+                if track_a is not None and track_b is not None:
+                    _append_fill_pick(track_a)
+                    _append_fill_pick(track_b)
+                    continue
+                # Resolved ids vanished between selection and lookup --
+                # fall through to the single-track fallback below.
+
+        # force_fit_mode whenever remaining is at or below the landing
+        # threshold -- covers both the direct exact-fit case (remaining
+        # <= EXACT_FIT_THRESHOLD_SECONDS, where pick_track's own
+        # internal check would already trigger fit_mode; forcing it
+        # here too is redundant but harmless) AND, critically, the
+        # landing-zone-pair-search-just-failed fallback reached from
+        # above: `remaining` there is still > EXACT_FIT_THRESHOLD_
+        # SECONDS, so without forcing, this call would silently use
+        # ordinary unconstrained weighted selection instead of staying
+        # duration-aware (second-pass correction).
         track = pick_track(
             category, exclude_track_ids, exclude_identity_keys,
             artist_sep, title_sep, target_datetime,
@@ -693,34 +1185,19 @@ def fill_remaining_hour(picks, accumulated_seconds, target_datetime,
             exclude_holiday_codes=exclude_holiday_codes,
             identity_cache=identity_cache,
             pool_key=pool_key,
+            force_fit_mode=remaining <= PAIR_LANDING_THRESHOLD_SECONDS,
         )
         if track is None:
             break  # nothing eligible even after loosening — stop gracefully
 
-        track_duration = track.next_start_seconds or track.duration_seconds or 0
-        scheduled_time = target_datetime + timedelta(seconds=accumulated_seconds)
-        picks.append({
-            "position": len(picks),
-            "scheduled_time": scheduled_time,
-            "track": track,
-            "category": category,
-        })
-        # Always accumulate for within-build hard exclusion; see the
-        # parallel comment in _build_from_rotation and pick_track's
-        # pool-exhaustion fallback.
-        picked_tracks.append(track)
-        picked_identity_keys |= track_identity_keys(
-            track.artist.name if track.artist_id else None, track.related_artists,
-        )
-        accumulated_seconds += track_duration
-        remaining = 3600 - accumulated_seconds
+        track_duration = _append_fill_pick(track)
         if track_duration <= 0:
             break  # avoid infinite loop on zero-duration data
 
     return picks, accumulated_seconds
 
 
-def _build_from_rotation(target_date, hour, rotation):
+def _build_from_rotation(target_date, hour, rotation, target_duration_seconds=NOMINAL_HOUR_SECONDS):
     slots = list(
         rotation.slots
         .select_related("category__kind", "track", "track__category__kind", "track__artist")
@@ -759,98 +1236,202 @@ def _build_from_rotation(target_date, hour, rotation):
     picked_tracks = []
     picked_identity_keys = set()
     accumulated_seconds = 0.0
+    diagnostics = SelectionDiagnostics(
+        target_duration_seconds=target_duration_seconds,
+        late_offset_seconds=max(0.0, NOMINAL_HOUR_SECONDS - target_duration_seconds),
+    )
 
-    for slot in slots:
-        if slot.track_id:
-            # Direct track insert — the hybrid rotation/playlist ask.
-            # Skips recency separation entirely on the way in, even for a
-            # music track that would otherwise violate it; the LogItem it
-            # still produces below (with a real scheduled_time) is what
-            # makes it count as "recently played" for any category slots
-            # that come after it, in this build or future ones.
-            track = slot.track
-            category = track.category
-        else:
-            category = slot.category
-
-        # Effective separation for THIS slot's category. Used both to
-        # gate the pick (else branch below) AND to gate this slot's
-        # contribution to subsequent slots' accumulator exclusions
-        # (bottom of the loop). Computed once regardless of branch so
-        # a direct-track slot backed by e.g. a WxTemp track with
-        # title_sep=0 also plays correctly with later WxTemp/Legal ID
-        # slots.
-        artist_sep, title_sep = get_separation(category, recency_cfg)
-
-        if not slot.track_id:
-            exclude_track_ids, exclude_identity_keys = get_recent_exclusions(
-                target_datetime, artist_sep, title_sep,
-                picked_tracks, picked_identity_keys,
-            )
-
-            # Per-slot dice roll: independent draw per active holiday.
-            # Only applies to music-kind slots -- Legal ID / imaging /
-            # weather / talk slots never get holiday-tagged music
-            # sprinkled in.
-            is_music_slot = category is not None and category.kind.code == "music"
-            chosen_holiday_codes = []
-            if is_music_slot and active_holiday_codes:
-                for code, share in daily_shares.items():
-                    if random.random() < share:
-                        chosen_holiday_codes.append(code)
-
-            pool_override_qs = None
-            pool_key = None
-            exclude_holiday_codes = None
-            if chosen_holiday_codes:
-                pool_override_qs = _music_holiday_pool(chosen_holiday_codes, target_datetime)
-                pool_key = ("holiday", tuple(sorted(chosen_holiday_codes)))
-            elif is_music_slot and active_holiday_codes:
-                # Non-holiday slot on a holiday day: keep the normal
-                # category pool but strip out active-holiday-tagged
-                # tracks so they can't leak in via their filed
-                # category (would push actual share above target).
-                exclude_holiday_codes = active_holiday_codes
-
-            remaining = 3600 - accumulated_seconds
-            track = pick_track(
-                category, exclude_track_ids, exclude_identity_keys,
-                artist_sep, title_sep, target_datetime,
-                remaining_seconds=remaining,
-                hard_exclude_track_ids={t.id for t in picked_tracks},
-                hard_exclude_identity_keys=set(picked_identity_keys),
-                active_holiday_codes=active_holiday_codes,
-                pool_override_qs=pool_override_qs,
-                exclude_holiday_codes=exclude_holiday_codes,
-                identity_cache=identity_cache,
-                pool_key=pool_key,
-            )
-
-            if track is None:
-                continue
-
+    def _append_pick(track, category):
+        nonlocal accumulated_seconds
         track_duration = track.next_start_seconds or track.duration_seconds or 0
         scheduled_time = target_datetime + timedelta(seconds=accumulated_seconds)
-
         picks.append({
             "position": len(picks),
             "scheduled_time": scheduled_time,
             "track": track,
             "category": category,
         })
-
         # Always accumulate for within-build hard exclusion, regardless
         # of sep values. sep=0 opts out of the recency-window exclusion
         # (get_separation returns 0 -> no cross-hour recency block) but
         # NOT out of "did I already pick this in THIS build" cycling.
         # See pick_track's header + pool-exhaustion fallback.
         picked_tracks.append(track)
-        picked_identity_keys |= track_identity_keys(
+        picked_identity_keys.update(track_identity_keys(
             track.artist.name if track.artist_id else None, track.related_artists,
-        )
+        ))
         accumulated_seconds += track_duration
 
-        if accumulated_seconds >= 3600:
+    def _sequential_pick(category, artist_sep, title_sep, pool_override_qs, pool_key,
+                          exclude_holiday_codes, remaining, force_fit_mode=False):
+        """Single-track pick via pick_track -- used for NORMAL mode
+        (remaining_seconds simply reported for logging; pick_track's own
+        fit_mode only engages below EXACT_FIT_THRESHOLD_SECONDS) and for
+        EXACT-FIT mode (direct, or as landing mode's fallback when a
+        pair can't be formed -- that call site passes force_fit_mode=
+        True, since remaining is still in the landing zone, well above
+        EXACT_FIT_THRESHOLD_SECONDS, and must stay duration-aware rather
+        than falling through to pick_track's own ordinary unconstrained
+        dispatch for that range)."""
+        exclude_track_ids, exclude_identity_keys = get_recent_exclusions(
+            target_datetime, artist_sep, title_sep, picked_tracks, picked_identity_keys,
+        )
+        return pick_track(
+            category, exclude_track_ids, exclude_identity_keys,
+            artist_sep, title_sep, target_datetime,
+            remaining_seconds=remaining,
+            hard_exclude_track_ids={t.id for t in picked_tracks},
+            hard_exclude_identity_keys=set(picked_identity_keys),
+            active_holiday_codes=active_holiday_codes,
+            pool_override_qs=pool_override_qs,
+            exclude_holiday_codes=exclude_holiday_codes,
+            identity_cache=identity_cache,
+            pool_key=pool_key,
+            force_fit_mode=force_fit_mode,
+        )
+
+    idx = 0
+    while idx < len(slots):
+        slot = slots[idx]
+
+        if slot.track_id:
+            # Direct track insert — the hybrid rotation/playlist ask.
+            # Skips recency separation entirely on the way in, even for a
+            # music track that would otherwise violate it; the LogItem it
+            # still produces below (with a real scheduled_time) is what
+            # makes it count as "recently played" for any category slots
+            # that come after it, in this build or future ones. NEVER
+            # replaced/reordered/skipped/treated-as-a-candidate-pool by
+            # pair planning -- it is never eligible to be slot A or slot
+            # B of a landing pair (see the landing-zone branch below,
+            # which only ever looks at slots[idx+1] to decide whether a
+            # pair is even attemptable, and always falls back to a plain
+            # single pick if that neighbor is direct-track).
+            _append_pick(slot.track, slot.track.category)
+            diagnostics.direct_track_inserts += 1
+            idx += 1
+            if accumulated_seconds >= target_duration_seconds:
+                break
+            continue
+
+        category = slot.category
+        remaining = target_duration_seconds - accumulated_seconds
+
+        if remaining > PAIR_LANDING_THRESHOLD_SECONDS:
+            # Normal mode: unchanged sequential weighted-random picking.
+            mode = "normal"
+        elif remaining <= EXACT_FIT_THRESHOLD_SECONDS:
+            mode = "exact_fit"
+        else:
+            mode = "landing"
+
+        if mode in ("normal", "exact_fit"):
+            artist_sep, title_sep, pool_override_qs, pool_key, exclude_holiday_codes = (
+                _resolve_slot_pool_context(category, target_datetime, recency_cfg, active_holiday_codes, daily_shares)
+            )
+            track = _sequential_pick(category, artist_sep, title_sep, pool_override_qs, pool_key,
+                                      exclude_holiday_codes, remaining)
+            if track is None:
+                diagnostics.pool_exhausted_picks += 1
+                idx += 1
+                continue
+            _append_pick(track, category)
+            if mode == "normal":
+                diagnostics.normal_picks += 1
+            else:
+                diagnostics.exact_fit_picks += 1
+            idx += 1
+
+        else:
+            # Landing zone: EXACT_FIT_THRESHOLD_SECONDS < remaining <=
+            # PAIR_LANDING_THRESHOLD_SECONDS. Attempt a two-slot matched
+            # pair with the IMMEDIATELY next slot -- never skip past a
+            # direct-track slot to reach a category-random one further
+            # ahead (that slot's own turn comes next iteration,
+            # untouched by this decision).
+            ctx_a = _resolve_slot_pool_context(category, target_datetime, recency_cfg, active_holiday_codes, daily_shares)
+            artist_sep_a, title_sep_a, pool_override_qs_a, pool_key_a, exclude_holiday_codes_a = ctx_a
+
+            next_slot = slots[idx + 1] if idx + 1 < len(slots) else None
+            pair_result = None
+
+            if next_slot is not None and not next_slot.track_id:
+                category_b = next_slot.category
+                ctx_b = _resolve_slot_pool_context(category_b, target_datetime, recency_cfg, active_holiday_codes, daily_shares)
+                artist_sep_b, title_sep_b, pool_override_qs_b, pool_key_b, exclude_holiday_codes_b = ctx_b
+
+                hard_exclude_track_ids = {t.id for t in picked_tracks}
+                hard_exclude_identity_keys = set(picked_identity_keys)
+
+                exclude_track_ids_a, exclude_identity_keys_a = get_recent_exclusions(
+                    target_datetime, artist_sep_a, title_sep_a, picked_tracks, picked_identity_keys,
+                )
+                exclude_track_ids_b, exclude_identity_keys_b = get_recent_exclusions(
+                    target_datetime, artist_sep_b, title_sep_b, picked_tracks, picked_identity_keys,
+                )
+
+                candidates_a = _landing_slot_candidates(
+                    category, target_datetime, pool_override_qs_a, exclude_holiday_codes_a,
+                    exclude_track_ids_a, exclude_identity_keys_a,
+                    hard_exclude_track_ids, hard_exclude_identity_keys,
+                    identity_cache, pool_key_a, active_holiday_codes,
+                )
+                candidates_b = _landing_slot_candidates(
+                    category_b, target_datetime, pool_override_qs_b, exclude_holiday_codes_b,
+                    exclude_track_ids_b, exclude_identity_keys_b,
+                    hard_exclude_track_ids, hard_exclude_identity_keys,
+                    identity_cache, pool_key_b, active_holiday_codes,
+                )
+
+                pair_result = find_matched_pair(candidates_a, candidates_b, remaining_seconds=remaining)
+
+            if pair_result is not None:
+                # Batch-resolve BOTH chosen ids to real Track objects in
+                # one query -- never one .get() per candidate scored.
+                resolved = {
+                    t.id: t for t in Track.objects.select_related("artist", "category").filter(
+                        id__in=[pair_result.candidate_a.track_id, pair_result.candidate_b.track_id],
+                    )
+                }
+                track_a = resolved.get(pair_result.candidate_a.track_id)
+                track_b = resolved.get(pair_result.candidate_b.track_id)
+                if track_a is not None and track_b is not None:
+                    _append_pick(track_a, category)
+                    _append_pick(track_b, category_b)
+                    diagnostics.landing_pairs += 1
+                    diagnostics.landing_errors.append(pair_result.landing_error)
+                    idx += 2
+                    if accumulated_seconds >= target_duration_seconds:
+                        break
+                    continue
+                # Resolved ids vanished between selection and lookup
+                # (e.g. deleted mid-build) -- fall through to the
+                # single-track fallback below rather than silently
+                # dropping the slot.
+
+            # No pair formed (structurally blocked, or find_matched_pair
+            # found nothing, or the rare resolve-race above) -- fall
+            # back to a single DURATION-AWARE (force_fit_mode=True) pick
+            # for slot A alone, reusing its already-resolved context (no
+            # re-rolling its holiday dice a second time). Second-pass
+            # correction: `remaining` here is still in the landing zone
+            # (> EXACT_FIT_THRESHOLD_SECONDS), so without forcing fit
+            # mode this would silently fall through to pick_track's
+            # ordinary unconstrained weighted selection -- exactly the
+            # "immediately degrade to unconstrained normal selection"
+            # behavior the pair-window fallback hierarchy must avoid.
+            diagnostics.landing_pair_fallbacks += 1
+            track = _sequential_pick(category, artist_sep_a, title_sep_a, pool_override_qs_a, pool_key_a,
+                                      exclude_holiday_codes_a, remaining, force_fit_mode=True)
+            if track is None:
+                diagnostics.pool_exhausted_picks += 1
+                idx += 1
+                continue
+            _append_pick(track, category)
+            diagnostics.exact_fit_picks += 1
+            idx += 1
+
+        if accumulated_seconds >= target_duration_seconds:
             break
 
     picks, accumulated_seconds = fill_remaining_hour(
@@ -858,11 +1439,19 @@ def _build_from_rotation(target_date, hour, rotation):
         active_holiday_codes=active_holiday_codes,
         daily_shares=daily_shares,
         identity_cache=identity_cache,
+        target_duration_seconds=target_duration_seconds,
     )
+
+    emit_event(
+        category="library", level="info", title="Hour log selection diagnostics",
+        detail={"date": target_date.isoformat(), "hour": hour, **diagnostics.as_detail()},
+        dedupe_key=f"library|selection-diagnostics|{target_date.isoformat()}|{hour}",
+    )
+
     return _persist_log(target_date, hour, picks)
 
 
-def _build_from_playlist(target_date, hour, playlist):
+def _build_from_playlist(target_date, hour, playlist, target_duration_seconds=NOMINAL_HOUR_SECONDS):
     items = list(
         playlist.items
         .select_related("track", "track__category", "track__artist")
@@ -889,32 +1478,43 @@ def _build_from_playlist(target_date, hour, playlist):
         })
         accumulated_seconds += track_duration
 
-    picks, accumulated_seconds = fill_remaining_hour(picks, accumulated_seconds, target_datetime)
+    picks, accumulated_seconds = fill_remaining_hour(
+        picks, accumulated_seconds, target_datetime,
+        target_duration_seconds=target_duration_seconds,
+    )
     return _persist_log(target_date, hour, picks)
 
 
 def _persist_log(target_date, hour, picks):
-    PlaylistLog.objects.filter(date=target_date, hour=hour).delete()
+    """Delete-then-recreate is only safe as one atomic unit -- an
+    exception (or a concurrent process crash) between the delete and the
+    bulk_create used to be able to leave an hour with NO PlaylistLog row
+    at all, a state _install_built_hour/_ensure_log_building have no
+    recovery path for short of the next AUTO_BUILD_CHECK_SECONDS tick
+    rebuilding from scratch. Wrapping in transaction.atomic() makes the
+    whole delete+create+bulk_create sequence all-or-nothing."""
+    with transaction.atomic():
+        PlaylistLog.objects.filter(date=target_date, hour=hour).delete()
 
-    log = PlaylistLog.objects.create(
-        date=target_date,
-        hour=hour,
-        status="draft",
-    )
-
-    log_items = [
-        LogItem(
-            playlist_log=log,
-            position=pick["position"],
-            scheduled_time=pick["scheduled_time"],
-            track=pick["track"],
-            track_title=pick["track"].title,
-            track_artist=pick["track"].artist.name if pick["track"].artist_id else "",
-            category=pick["category"],
+        log = PlaylistLog.objects.create(
+            date=target_date,
+            hour=hour,
+            status="draft",
         )
-        for pick in picks
-    ]
-    LogItem.objects.bulk_create(log_items)
+
+        log_items = [
+            LogItem(
+                playlist_log=log,
+                position=pick["position"],
+                scheduled_time=pick["scheduled_time"],
+                track=pick["track"],
+                track_title=pick["track"].title,
+                track_artist=pick["track"].artist.name if pick["track"].artist_id else "",
+                category=pick["category"],
+            )
+            for pick in picks
+        ]
+        LogItem.objects.bulk_create(log_items)
     return log, None
 
 
@@ -922,34 +1522,40 @@ def append_fill_items(log, picks, start_position):
     """Persist new LogItems appended to an *already-existing* PlaylistLog,
     starting at `start_position` — unlike _persist_log, this does not
     touch any existing items. Used to extend a log that's already
-    approved and live/currently-playing (see engine.py's
-    _extend_current_log_live), where deleting and recreating everything
-    would discard real played_at history driving recency avoidance."""
-    log_items = [
-        LogItem(
-            playlist_log=log,
-            position=start_position + i,
-            scheduled_time=pick["scheduled_time"],
-            track=pick["track"],
-            track_title=pick["track"].title,
-            track_artist=pick["track"].artist.name if pick["track"].artist_id else "",
-            category=pick["category"],
-        )
-        for i, pick in enumerate(picks)
-    ]
-    LogItem.objects.bulk_create(log_items)
+    approved and live/currently-playing (see engine.py's async live-fill
+    worker), where deleting and recreating everything would discard real
+    played_at history driving recency avoidance.
+
+    Wrapped in transaction.atomic() so a caller can rely on "either all
+    of `picks` landed in the DB, or none did" -- the engine's install
+    callback must not extend self.log_items in memory unless this
+    fully succeeded."""
+    with transaction.atomic():
+        log_items = [
+            LogItem(
+                playlist_log=log,
+                position=start_position + i,
+                scheduled_time=pick["scheduled_time"],
+                track=pick["track"],
+                track_title=pick["track"].title,
+                track_artist=pick["track"].artist.name if pick["track"].artist_id else "",
+                category=pick["category"],
+            )
+            for i, pick in enumerate(picks)
+        ]
+        LogItem.objects.bulk_create(log_items)
     return log_items
 
 
-def build_hour_log(target_date, hour):
+def build_hour_log(target_date, hour, target_duration_seconds=NOMINAL_HOUR_SECONDS):
     block = resolve_schedule_block(target_date, hour)
     if block is None:
         return None, "No schedule block for this hour."
 
     if block.playlist_id:
-        return _build_from_playlist(target_date, hour, block.playlist)
+        return _build_from_playlist(target_date, hour, block.playlist, target_duration_seconds=target_duration_seconds)
     if block.rotation_id:
-        return _build_from_rotation(target_date, hour, block.rotation)
+        return _build_from_rotation(target_date, hour, block.rotation, target_duration_seconds=target_duration_seconds)
 
     return None, "ScheduleBlock has neither rotation nor playlist."
 
@@ -984,7 +1590,7 @@ def _advisory_lock_for_hour(target_date, hour):
 LOCK_CONTENDED = "lock_contention"
 
 
-def build_and_approve_hour_log_locked(target_date, hour):
+def build_and_approve_hour_log_locked(target_date, hour, target_duration_seconds=NOMINAL_HOUR_SECONDS):
     """Engine auto-build semantics: skip rebuilding if an approved log
     already exists; otherwise build + approve, holding the advisory
     lock for the WHOLE persist-then-approve sequence so a concurrent
@@ -996,14 +1602,22 @@ def build_and_approve_hour_log_locked(target_date, hour):
     force_next_hour command. NOT for admin rebuild-on-demand behavior
     (see build_hour_log_for_admin) -- that has different semantics
     (always rebuilds, never auto-approves) that this would silently
-    break."""
+    break.
+
+    `target_duration_seconds` defaults to a full nominal hour; the
+    engine's async build worker passes a shorter computed target when
+    clock-drift recovery projects the upcoming hour will actually start
+    late (see engine.py's _project_upcoming_hour_start). Only applied
+    when this call actually builds -- the "existing approved log" fast
+    path returns whatever was already built/approved, target unchanged,
+    since re-targeting an already-approved log isn't this function's job."""
     with _advisory_lock_for_hour(target_date, hour) as acquired:
         if not acquired:
             return None, LOCK_CONTENDED
         existing = PlaylistLog.objects.filter(date=target_date, hour=hour, status="approved").first()
         if existing:
             return existing, None
-        log, error = build_hour_log(target_date, hour)
+        log, error = build_hour_log(target_date, hour, target_duration_seconds=target_duration_seconds)
         if error:
             return log, error
         log.status = "approved"
@@ -1011,7 +1625,7 @@ def build_and_approve_hour_log_locked(target_date, hour):
         return log, None
 
 
-def build_hour_log_for_admin(target_date, hour):
+def build_hour_log_for_admin(target_date, hour, target_duration_seconds=NOMINAL_HOUR_SECONDS):
     """api_log_build's semantics: ALWAYS rebuilds -- matches the
     existing admin behavior exactly (_persist_log's delete-then-
     recreate replaces whatever was there, draft or approved) -- and
@@ -1031,7 +1645,7 @@ def build_hour_log_for_admin(target_date, hour):
     with _advisory_lock_for_hour(target_date, hour) as acquired:
         if not acquired:
             return None, LOCK_CONTENDED
-        return build_hour_log(target_date, hour)
+        return build_hour_log(target_date, hour, target_duration_seconds=target_duration_seconds)
 
 
 def _describe_track_issues(track, prefix, issues):
@@ -1046,7 +1660,7 @@ def _describe_track_issues(track, prefix, issues):
         issues.append({"severity": "warning", "message": f"{prefix}: '{label}' is not marked ready2air."})
 
 
-def preview_hour_log(target_date, hour):
+def preview_hour_log(target_date, hour, target_duration_seconds=NOMINAL_HOUR_SECONDS):
     """Read-only dry run of the same schedule-block/rotation/playlist walk
     as build_hour_log, for health-checking a rotation or playlist without
     touching PlaylistLog/LogItem at all -- never persists anything, so it
@@ -1150,7 +1764,7 @@ def preview_hour_log(target_date, hour):
                 elif is_music_slot and active_holiday_codes:
                     exclude_holiday_codes = active_holiday_codes
 
-                remaining = 3600 - accumulated_seconds
+                remaining = target_duration_seconds - accumulated_seconds
                 track = pick_track(
                     category, exclude_track_ids, exclude_identity_keys,
                     artist_sep, title_sep, target_datetime,
@@ -1191,7 +1805,7 @@ def preview_hour_log(target_date, hour):
                 track.artist.name if track.artist_id else None, track.related_artists,
             )
             accumulated_seconds += track_duration
-            if accumulated_seconds >= 3600:
+            if accumulated_seconds >= target_duration_seconds:
                 break
 
     else:
@@ -1206,20 +1820,24 @@ def preview_hour_log(target_date, hour):
                 active_holiday_codes=active_holiday_codes,
                 daily_shares=daily_shares,
                 identity_cache=identity_cache,
+                target_duration_seconds=target_duration_seconds,
             )
         else:
-            picks, accumulated_seconds = fill_remaining_hour(picks, accumulated_seconds, target_datetime)
+            picks, accumulated_seconds = fill_remaining_hour(
+                picks, accumulated_seconds, target_datetime,
+                target_duration_seconds=target_duration_seconds,
+            )
 
-        shortfall = 3600 - accumulated_seconds
+        shortfall = target_duration_seconds - accumulated_seconds
         if shortfall > DURATION_FIT_MARGIN:
             issues.append({
                 "severity": "warning",
-                "message": f"Hour only {int(accumulated_seconds)}s of 3600s filled ({int(shortfall)}s short) — filler category may also be exhausted.",
+                "message": f"Hour only {int(accumulated_seconds)}s of {int(target_duration_seconds)}s filled ({int(shortfall)}s short) — filler category may also be exhausted.",
             })
-        elif accumulated_seconds - 3600 > 300:
+        elif accumulated_seconds - target_duration_seconds > 300:
             issues.append({
                 "severity": "warning",
-                "message": f"Hour overshoots by {int(accumulated_seconds - 3600)}s.",
+                "message": f"Hour overshoots by {int(accumulated_seconds - target_duration_seconds)}s.",
             })
 
     seen_counts = {}

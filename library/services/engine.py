@@ -34,6 +34,7 @@ from webrequests.models import SongRequest
 from library.services.log_builder import (
     DURATION_FIT_MARGIN,
     LOCK_CONTENDED,
+    NOMINAL_HOUR_SECONDS,
     append_fill_items,
     build_and_approve_hour_log_locked,
     fill_remaining_hour,
@@ -112,6 +113,14 @@ LEVEL_PEAK_FALLOFF_DB_PER_SEC = 20.0
 POSITION_POLL_MS = 250
 AUTO_BUILD_CHECK_SECONDS = 10
 NEXT_HOUR_LOOKAHEAD_SECONDS = 30
+# Clock-drift recovery (1.1 spec): one-way cap on how much shorter than a
+# nominal hour the upcoming build's target_duration_seconds can be
+# shrunk to compensate for a projected-late takeover. Protects against a
+# wildly-off projection (e.g. a stuck/paused deck making the leading-
+# deck ETA read as much larger than reality) shrinking the built hour
+# to nothing -- a default, not a sacred value. See
+# _project_upcoming_hour_target_duration.
+MAX_CLOCK_RECOVERY_SECONDS = 600
 CACHE_WARM_LEAD_SECONDS = 3.0
 SILENCE_PRIME_SECONDS = 0.3
 DECK_STUCK_TIMEOUT_SECONDS = 30  # generous margin past a track's own duration before assuming its EOS was missed
@@ -412,6 +421,8 @@ class PlaybackEngine:
         self._next_hour_peek = None
         self._next_hour_peek_at = 0.0
         self._last_live_extend_attempt = 0.0
+        self._live_fill_in_progress = False  # guarded by self._lock -- see _try_extend_live_log_async
+        self._live_fill_generation = 0  # guarded by self._lock -- bumped on every dispatch, see _try_extend_live_log_async
         self.running = False
         self._position_timer = None
         self._lock = threading.RLock()
@@ -1422,7 +1433,15 @@ class PlaybackEngine:
         seconds_left_in_hour = 3600 - (now.minute * 60 + now.second)
         if seconds_left_in_hour <= NEXT_HOUR_LOOKAHEAD_SECONDS:
             next_hour = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
-            self._ensure_log_building(next_hour.date(), next_hour.hour)
+            # Clock-drift recovery (1.1 spec): project the upcoming
+            # hour's REAL takeover time from live queue/deck state
+            # before kicking off its build, so a track already known to
+            # be running past nominal_start doesn't get a target that
+            # assumes a full, on-time hour. Only meaningful here, the
+            # actual next-hour lookahead build -- NOT the current-hour
+            # catch-up call above, which is a startup/recovery scenario.
+            target_duration_seconds = self._project_upcoming_hour_target_duration(next_hour)
+            self._ensure_log_building(next_hour.date(), next_hour.hour, target_duration_seconds=target_duration_seconds)
             self._advance_to_next_hour_log(next_hour.date(), next_hour.hour)
 
         return True
@@ -1488,7 +1507,7 @@ class PlaybackEngine:
         self._next_hour_peek_at = 0.0
         print(f"  Advanced active queue to next hour ahead of TOH: {log.date} {log.hour:02d}:00 ({len(items)} items)")
 
-    def _ensure_log_building(self, target_date, target_hour):
+    def _ensure_log_building(self, target_date, target_hour, target_duration_seconds=NOMINAL_HOUR_SECONDS):
         """Kick off an async build for (target_date, target_hour) if no
         approved log exists yet and one isn't already in flight for
         this exact hour in this process. The "approved already exists"
@@ -1505,7 +1524,13 @@ class PlaybackEngine:
         2026-07-22: 1pm draft existed unapproved from an earlier demo,
         engine's advance-to-next-hour couldn't find an approved log at
         12:59, and playback fell back to the previous approved hour
-        (12pm news repeated).)"""
+        (12pm news repeated).)
+
+        `target_duration_seconds` defaults to a full nominal hour --
+        _ensure_upcoming_logs passes a shorter, clock-drift-projected
+        value for the NEXT hour's lookahead build only; the current-
+        hour catch-up build (a startup/recovery scenario, not "predict
+        the future") always uses the default."""
         if PlaylistLog.objects.filter(date=target_date, hour=target_hour, status="approved").exists():
             return
         key = (target_date, target_hour)
@@ -1514,11 +1539,11 @@ class PlaybackEngine:
                 return
             self._building_hours.add(key)
         threading.Thread(
-            target=self._build_hour_log_worker, args=(target_date, target_hour),
+            target=self._build_hour_log_worker, args=(target_date, target_hour, target_duration_seconds),
             daemon=True,
         ).start()
 
-    def _build_hour_log_worker(self, target_date, target_hour):
+    def _build_hour_log_worker(self, target_date, target_hour, target_duration_seconds=NOMINAL_HOUR_SECONDS):
         """Runs on a background thread -- touches only the Django ORM,
         never self.log_items/self.current_log/self._queue_cursor or any
         GStreamer object. build_and_approve_hour_log_locked holds a
@@ -1530,7 +1555,7 @@ class PlaybackEngine:
         than touching engine state directly from this thread."""
         try:
             close_old_connections()
-            log, error = build_and_approve_hour_log_locked(target_date, target_hour)
+            log, error = build_and_approve_hour_log_locked(target_date, target_hour, target_duration_seconds=target_duration_seconds)
             if error == LOCK_CONTENDED:
                 print(f"  Async build deferred for {target_date} {target_hour:02d}:00 -- already being built elsewhere")
                 return
@@ -1648,47 +1673,206 @@ class PlaybackEngine:
         self._next_hour_peek_at = now
         return result
 
-    def _extend_current_log_live(self):
-        """Called when the queue is exhausted but the real next hour isn't
-        built yet — early exhaustion, e.g. a DJ skipped/ejected a few
-        tracks and burned through the hour's content faster than its
-        nominal pacing assumed. Uses the same Log Fill Configuration
-        strategy that pads a short log at build time (`fill_remaining_hour`)
-        to append more tracks to the *live, already-approved* log instead
-        of falling back to replaying it from the start (`_on_log_exhausted`'s
-        `now.hour` reload)."""
-        if not self.current_log or not self.log_items:
+    def _try_extend_live_log_async(self):
+        """Throttled DISPATCH of an async live-log-fill worker -- called
+        both proactively (from `_poll_position`'s crossfade lookahead,
+        every ~250ms, once the current hour's queue is exhausted with no
+        real next hour ready yet) and reactively (from
+        `_roll_over_to_next_hour`, at the moment the last known track
+        hits natural EOS with nothing queued to follow it). 1.1 spec:
+        moved off the GLib thread -- the actual DB work used to run
+        synchronously, inline, on this thread. The worker
+        (`_live_fill_worker`) is READ-ONLY -- it computes a PROPOSAL
+        only and never touches PlaylistLog/LogItem; the DB write and
+        the in-memory queue extension both happen later, only after
+        `_install_live_fill` re-validates the proposal is still current
+        (see that function's docstring for the full staleness-check
+        list). A stale worker result must be completely side-effect-
+        free -- this is what makes that guarantee hold even under a
+        rollover/newer-dispatch/shutdown race.
+
+        Always returns False -- unlike the historical synchronous
+        version, this never has a result to report the SAME tick it's
+        called; a valid fill lands a little later via
+        `_install_live_fill`, which (mirroring `_install_built_hour`'s
+        own idle-recovery check) starts playback immediately if a slot
+        is sitting idle waiting for it.
+
+        Throttled to once per 5s (`self._last_live_extend_attempt`)
+        since a persistently-empty fallback category (e.g. `LogFill
+        Config` misconfigured) would otherwise dispatch a new worker on
+        every single poll tick for however long the current track has
+        left to play. Also guarded by `self._live_fill_in_progress` so
+        the reactive and proactive call sites can't both dispatch at
+        once. `self._live_fill_generation` is bumped on every dispatch
+        (even a throttled-away one doesn't bump it, only a REAL
+        dispatch does) so `_install_live_fill` can detect and discard a
+        proposal superseded by a newer dispatch, even though only one
+        worker is ever in flight at a time -- the guard is cleared by
+        the WORKER's own completion, not by the (possibly delayed)
+        GLib idle callback, so a second dispatch can start before the
+        first one's install callback has actually run."""
+        now = time.time()
+        if now - self._last_live_extend_attempt < 5.0:
+            return False
+        self._last_live_extend_attempt = now
+
+        with self._lock:
+            if self._live_fill_in_progress:
+                return False
+            if not self.current_log or not self.log_items:
+                return False
+            self._live_fill_in_progress = True
+            self._live_fill_generation += 1
+            generation = self._live_fill_generation
+
+        wall_now = timezone.localtime()
+        seconds_left = 3600 - (wall_now.minute * 60 + wall_now.second)
+        if seconds_left <= DURATION_FIT_MARGIN:
+            # Basically at the real boundary anyway -- clear the guard
+            # we just took, since no worker is being dispatched.
+            with self._lock:
+                self._live_fill_in_progress = False
             return False
 
-        close_old_connections()
-        now = timezone.localtime()
-        seconds_left = 3600 - (now.minute * 60 + now.second)
-        if seconds_left <= DURATION_FIT_MARGIN:
-            return False  # basically at the real boundary anyway
-
-        # hour_start (not `now`) is the correct reference point here: it's
-        # what `accumulated_seconds` below is measured relative to, so
-        # `scheduled_time = hour_start + accumulated_seconds` comes out to
-        # ~now for the first new pick. Recency exclusion still correctly
-        # covers everything played so far this hour because `existing_picks`
-        # (passed explicitly) already includes the whole hour's log, not
-        # just what a DB cutoff query keyed off hour_start would catch.
-        hour_start = now.replace(minute=0, second=0, microsecond=0)
+        # Capture an IMMUTABLE snapshot of everything the worker needs --
+        # never hand the worker thread self.current_log/self.log_items
+        # directly, since a rollover on this (the main) thread could
+        # replace either while the worker is still running.
+        log_id = self.current_log.id
+        hour_start = wall_now.replace(minute=0, second=0, microsecond=0)
         existing_picks = [{"track": li.track, "category": li.category} for li in self.log_items]
         original_count = len(existing_picks)
         accumulated = 3600 - seconds_left
-        # fill_remaining_hour appends onto `existing_picks` in place and
-        # returns that same list, so the new items must be sliced off using
-        # the count captured *before* the call.
-        all_picks, _ = fill_remaining_hour(existing_picks, accumulated, hour_start)
-        new_picks = all_picks[original_count:]
-        if not new_picks:
+        start_position = self.log_items[-1].position + 1
+
+        threading.Thread(
+            target=self._live_fill_worker,
+            args=(log_id, generation, existing_picks, original_count, accumulated, hour_start, start_position),
+            daemon=True,
+        ).start()
+        return False
+
+    def _live_fill_worker(self, log_id, generation, existing_picks, original_count, accumulated, hour_start, start_position):
+        """Runs on a background thread -- READ-ONLY with respect to the
+        database. Computes a PROPOSED set of fill picks via
+        fill_remaining_hour (which issues real SELECT queries, e.g.
+        pick_track's candidate pools, but never writes) and hands the
+        proposal back to the main thread via GLib.idle_add. Never calls
+        append_fill_items or otherwise inserts/updates/deletes
+        PlaylistLog/LogItem rows itself, and never touches
+        self.log_items/self.current_log/self._queue_cursor or any
+        GStreamer object -- the DB write and the in-memory extension
+        both happen only in _install_live_fill, and only after that
+        callback re-validates the proposal is still current on the
+        main thread. A stale worker (its result superseded by a
+        rollover, a newer dispatch, the gap already being filled by
+        something else, or plain shutdown) is therefore automatically
+        side-effect-free -- it simply computed something nobody used."""
+        try:
+            close_old_connections()
+            # fill_remaining_hour appends onto `existing_picks` in place
+            # and returns that same list, so the new items must be
+            # sliced off using the count captured *before* the call.
+            all_picks, _ = fill_remaining_hour(existing_picks, accumulated, hour_start)
+            new_picks = all_picks[original_count:]
+            if not new_picks:
+                return
+            if self.running:  # don't schedule queue mutations mid-teardown
+                GLib.idle_add(self._install_live_fill, log_id, generation, new_picks, original_count, start_position)
+        except Exception as exc:
+            print(f"  Live-fill worker crashed (non-fatal): {exc}")
+            emit_event(
+                category="engine", level="error", title="Live-fill worker crashed",
+                detail={"log_id": log_id, "exception": repr(exc), "traceback": traceback.format_exc()},
+            )
+        finally:
+            try:
+                connection.close()  # don't leak a per-thread DB connection over a long engine uptime
+            finally:
+                with self._lock:
+                    self._live_fill_in_progress = False
+
+    @_glib_safe(default_return=False)
+    def _install_live_fill(self, log_id, generation, new_picks, expected_prior_count, start_position):
+        """One-shot GLib.idle_add callback -- runs on the main thread,
+        so it's safe to touch engine state here, and is the ONLY place
+        a live-fill proposal is allowed to touch the database. A stale
+        proposal is discarded with ZERO side effects -- no DB write, no
+        self.log_items mutation -- before any of that happens. Checked,
+        in order:
+
+          1. self.running -- mid-teardown, no queue mutations at all.
+          2. self.current_log still exists and its id matches log_id --
+             an hour rollover (or a different admin/engine rebuild)
+             while the worker ran means this proposal is for an hour
+             that's no longer live.
+          3. `generation` matches self._live_fill_generation -- a newer
+             dispatch has already superseded this one (the guard is
+             cleared by worker completion, not by this callback
+             actually running, so a second dispatch CAN start before
+             this one's callback fires).
+          4. len(self.log_items) still equals the count captured at
+             dispatch time -- something else (a different install, a
+             manual admin action) already changed the queue since this
+             proposal was computed; appending on top of an assumption
+             that's no longer true risks either duplicating coverage or
+             mis-positioning items.
+          5. Real wall-clock "seconds left in the real hour" is
+             recomputed fresh (not reused from dispatch time) and must
+             still be above DURATION_FIT_MARGIN -- a slow worker or a
+             delayed idle-callback scheduling could have carried us
+             past the real hour boundary (or close enough that the gap
+             this proposal was computed for no longer exists) even if
+             current_log/log_items look unchanged.
+
+        Only once every check passes does the DB append
+        (append_fill_items, transactional) happen, and only after that
+        succeeds does self.log_items get extended -- DB before memory,
+        never the reverse, and never at all for a stale proposal.
+
+        Mirrors _install_built_hour's own idle-recovery check: a slot
+        sitting empty specifically because it was waiting on this fill
+        must resume immediately, not wait for the next _poll_position
+        tick or (worse) _on_log_exhausted's 30s retry timer."""
+        if not self.running:
+            return False
+        if not self.current_log or self.current_log.id != log_id:
+            print(f"  Discarding stale live-fill proposal for log id={log_id} -- active log has since changed")
+            return False
+        if generation != self._live_fill_generation:
+            print(f"  Discarding stale live-fill proposal for log id={log_id} -- superseded by a newer live-fill")
+            return False
+        if len(self.log_items) != expected_prior_count:
+            print(f"  Discarding stale live-fill proposal for log id={log_id} -- queue already changed since dispatch")
             return False
 
-        start_position = self.log_items[-1].position + 1
-        new_items = append_fill_items(self.current_log, new_picks, start_position)
+        wall_now = timezone.localtime()
+        seconds_left_now = 3600 - (wall_now.minute * 60 + wall_now.second)
+        if seconds_left_now <= DURATION_FIT_MARGIN:
+            print(f"  Discarding stale live-fill proposal for log id={log_id} -- real hour boundary reached since dispatch")
+            return False
+
+        close_old_connections()
+        try:
+            with transaction.atomic():
+                log = PlaylistLog.objects.get(id=log_id)
+                new_items = append_fill_items(log, new_picks, start_position)
+        except PlaylistLog.DoesNotExist:
+            print(f"  Discarding live-fill proposal for log id={log_id} -- PlaylistLog no longer exists")
+            return False
+        except Exception as exc:
+            print(f"  Live-fill DB append failed (non-fatal): {exc}")
+            emit_event(
+                category="engine", level="error", title="Live-fill DB append failed",
+                detail={"log_id": log_id, "exception": repr(exc), "traceback": traceback.format_exc()},
+            )
+            return False
+
+        # DB succeeded -- only NOW extend the in-memory queue.
         self.log_items.extend(new_items)
-        print(f"  Extended live log with {len(new_items)} fill track(s) — {seconds_left:.0f}s left in the real hour")
+        print(f"  Installed {len(new_items)} live-filled track(s) onto the active queue "
+              f"({seconds_left_now:.0f}s left in the real hour)")
         # Informational, lower severity than the "log not ready" warnings
         # in _ensure_upcoming_logs -- this path fires for two different
         # reasons (ordinary early exhaustion mid-hour, e.g. a DJ skipped
@@ -1698,11 +1882,16 @@ class PlaybackEngine:
         emit_event(
             category="engine", level="info", title="Live log extension activated",
             detail={
-                "date": str(self.current_log.date), "hour": self.current_log.hour,
-                "items_added": len(new_items), "seconds_left_in_hour": round(seconds_left, 1),
+                "log_id": log_id, "date": str(log.date), "hour": log.hour,
+                "items_added": len(new_items), "seconds_left_in_hour": round(seconds_left_now, 1),
             },
         )
-        return True
+
+        with self._lock:
+            idle = self.decks["A"] is None and self.decks["B"] is None
+        if idle and not self.manual_mode:
+            self._start_next_track()
+        return False
 
     def _roll_over_to_next_hour(self):
         """Called when the current hour's queue is exhausted. If the next
@@ -1712,9 +1901,17 @@ class PlaybackEngine:
         trigger both continue seamlessly across the boundary, instead of
         waiting for the natural-EOS `_on_log_exhausted` path to notice.
         If the real next hour isn't built yet — early exhaustion, before
-        the actual top of hour — extend the live log instead of returning
-        False (which would fall through to `_on_log_exhausted`'s
-        replay-current-hour-from-scratch fallback)."""
+        the actual top of hour — dispatch an async live-fill instead of
+        returning False outright (which would fall through to
+        `_on_log_exhausted`'s replay-current-hour-from-scratch
+        fallback). The dispatch itself never completes synchronously
+        (see `_try_extend_live_log_async`), so this still returns
+        False on that path -- `_on_log_exhausted`'s own recovery
+        (immediate next-hour check, then a 30s retry poll) covers the
+        gap until `_install_live_fill` lands, which in the common case
+        (proactive dispatch already well underway from `_poll_position`
+        before actual exhaustion) has already happened by the time
+        this reactive path is even reached."""
         peek = self._peek_next_hour()
         if peek:
             log, items = peek
@@ -1725,29 +1922,8 @@ class PlaybackEngine:
             self._next_hour_peek_at = 0.0
             print(f"  Rolled over to next hour's log: {log.date} {log.hour:02d}:00 ({len(items)} items)")
             return True
-        return self._extend_current_log_live()
-
-    def _try_extend_live_log(self):
-        """Throttled wrapper around `_extend_current_log_live`, called from
-        the `_poll_position` lookahead (every tick, ~500ms) once the
-        current hour's queue is exhausted with no real next hour ready
-        yet. Without this, the live-extend only ever ran from
-        `_roll_over_to_next_hour` at the moment the last known track hit
-        natural EOS — too late for the crossfade trigger (which needs
-        `next_item` populated *before* `pos >= trigger_point`) to ever see
-        the freshly re-picked track, so the handoff was always a hard cut.
-        Calling this proactively, as soon as the gap is detected, gives the
-        re-pick time to land before the countdown reaches its normal
-        trigger point, so it can crossfade in like any other track.
-        Throttled to once per 5s since a persistently-empty fallback
-        category (e.g. `LogFillConfig` misconfigured) would otherwise retry
-        on every single poll tick for however long the current track has
-        left to play."""
-        now = time.time()
-        if now - self._last_live_extend_attempt < 5.0:
-            return False
-        self._last_live_extend_attempt = now
-        return self._extend_current_log_live()
+        self._try_extend_live_log_async()
+        return False
 
     def _peek_playable_at_cursor(self):
         """Advance `self._queue_cursor` past any leading unplayable items
@@ -3291,9 +3467,9 @@ class PlaybackEngine:
         currently-playing deck's live GStreamer state — a true mid-track
         preempt carries real risk (see the seek-near-crossfade caveat
         elsewhere in this file); this instead reuses the same
-        live-log-mutation pattern _extend_current_log_live already uses
-        safely, just inserting at the front of the queue instead of the
-        back.
+        live-log-mutation pattern _install_live_fill already uses
+        safely (append to self.log_items on the main thread only), just
+        inserting at the front of the queue instead of the back.
 
         category_code is expected to resolve to exactly one ready2air
         track (e.g. WxAlert) — same "one file, always fresh on disk"
@@ -5037,12 +5213,15 @@ class PlaybackEngine:
                         (it for it in next_hour_items if _log_item_playable(it)[0]),
                         None,
                     )
-                elif self._try_extend_live_log():
-                    # Real next hour isn't built yet, but a Log Fill
-                    # Configuration re-pick just landed on the live log —
-                    # pick it up now so the crossfade below can trigger
-                    # into it normally instead of waiting for EOS.
-                    next_item = self._peek_playable_at_cursor()
+                else:
+                    # Real next hour isn't built yet -- dispatch an
+                    # async live-fill (1.1 spec: the DB work no longer
+                    # runs inline on this thread, so nothing is
+                    # available to pick up THIS tick; _install_live_fill
+                    # extends self.log_items once the worker finishes,
+                    # which a later poll tick's _peek_playable_at_cursor
+                    # call picks up normally).
+                    self._try_extend_live_log_async()
 
             if next_item is not None:
                 next_cue_in = next_item.track.cue_in_seconds or 0.0
@@ -5293,6 +5472,133 @@ class PlaybackEngine:
         except OSError:
             pass
 
+    def _leading_deck_eta_seconds(self, snapshot=None):
+        """Seconds remaining before the SOONEST-to-finish currently-
+        playing (unpaused) deck reaches its own crossfade/next-start
+        trigger point -- i.e. how soon a new track could actually
+        start. This is what _write_state uses to seed the queue's live
+        ETA (see webrequests.services.estimate_air_time, the operator-
+        facing "Starts at" estimate) and what clock-drift recovery
+        (_project_upcoming_hour_target_duration) uses to project the
+        upcoming hour's real takeover time -- both need the deck that
+        actually governs the NEXT queue-start decision.
+
+        Deliberately NOT the same tie-break as _leading_deck() (used
+        elsewhere for position-polling/stuck-deck-watchdog purposes,
+        where its own docstring notes "either [occupied unpaused deck]
+        is fine" -- true THERE because _poll_position's trigger-point
+        check is skipped entirely once both slots are occupied, so
+        which one _leading_deck() picks during an overlap never
+        actually matters to that caller). It matters here: during a
+        brief crossfade overlap, the INCOMING deck (just started,
+        nearly its full duration left) and the OUTGOING/finishing deck
+        (about to free up) are both unpaused simultaneously, and only
+        the finishing one governs when a NEW track could next start.
+        Taking the MINIMUM projected ETA across every occupied,
+        unpaused deck always selects the finishing one, regardless of
+        which slot it happens to be in -- not "whichever is encountered
+        first in SLOTS order", which could select the incoming deck.
+
+        Fails safe to 0.0 (no projected lateness -- the caller falls
+        back to a nominal full-hour target) on ANY unexpected error
+        reading an individual deck (missing track, a pipeline query
+        raising, etc.) rather than risk shortening an upcoming hour off
+        an unreliable read; a bad reading from one deck doesn't discard
+        a good reading from the other.
+
+        `snapshot` lets a caller that already holds a fresh
+        dict(self.decks) (like _write_state) pass it in and skip a
+        redundant lock/copy; omitted, this takes its own snapshot.
+        Returns 0.0 if no deck is currently eligible (both empty, or
+        both paused -- a frozen/paused deck's remaining time is not a
+        trustworthy prediction of when automation will resume, so
+        paused decks are excluded from consideration entirely, same as
+        _leading_deck())."""
+        if snapshot is None:
+            with self._lock:
+                snapshot = dict(self.decks)
+
+        etas = []
+        for slot in SLOTS:
+            d = snapshot[slot]
+            if not d or d.paused:
+                continue
+            try:
+                lt = d.track
+                if lt is None:
+                    continue
+                lpos = self._get_deck_position(d)
+                l_effective = lt.next_start_seconds if lt.next_start_seconds is not None else (lt.duration_seconds or 0)
+                etas.append(max(0.0, l_effective - lpos))
+            except Exception as exc:
+                print(f"  _leading_deck_eta_seconds: failed reading deck {slot} (non-fatal, skipping): {exc}")
+                continue
+
+        if not etas:
+            return 0.0
+        return min(etas)
+
+    def _project_upcoming_hour_target_duration(self, nominal_start):
+        """Clock-drift recovery (1.1 spec): projects the REAL takeover
+        time for the upcoming hour using the same authoritative
+        projection semantics as the operator-facing "Starts at"
+        estimate (see _leading_deck_eta_seconds) -- NOT the static
+        nominal top-of-hour boundary. _advance_to_next_hour_log's queue
+        swap only changes what plays NEXT; whatever's already playing
+        on a deck finishes normally, so if THAT track's own crossfade
+        trigger point falls after `nominal_start`, the new hour's first
+        track won't actually start until then -- this is the real
+        source of "clock drift" this feature compensates for, not the
+        current hour somehow running past the top of the hour with
+        unplayed content (the engine always forcibly cuts over at
+        nominal_start regardless; see _advance_to_next_hour_log).
+
+        late_offset_seconds = max(0, projected_start - nominal_start) --
+        ONE-WAY only: an early projection (leading deck about to finish
+        before nominal_start) never LENGTHENS the target, it's clamped
+        to 0 first. Clamped to MAX_CLOCK_RECOVERY_SECONDS so a wildly-
+        off projection (e.g. a stuck/paused deck) can't shrink the
+        built hour to nothing; clamping is reported via emit_event so
+        it's visible to an operator, not silently absorbed.
+
+        Wrapped in a fail-safe try/except: ANY unexpected error in this
+        projection (not just a per-deck read failure, which
+        _leading_deck_eta_seconds already contains) falls back to
+        NOMINAL_HOUR_SECONDS -- "do not shorten an upcoming hour using
+        an unreliable projection" holds even against a bug in this
+        function itself, not just the deck-reading helper it calls.
+
+        Returns target_duration_seconds (NOMINAL_HOUR_SECONDS minus the
+        clamped late_offset_seconds)."""
+        try:
+            eta_seconds = self._leading_deck_eta_seconds()
+            now = timezone.localtime()
+            projected_start = now + timedelta(seconds=eta_seconds)
+            late_offset_seconds = max(0.0, (projected_start - nominal_start).total_seconds())
+
+            if late_offset_seconds > MAX_CLOCK_RECOVERY_SECONDS:
+                emit_event(
+                    category="engine", level="warning", title="Clock-drift recovery offset clamped",
+                    detail={
+                        "nominal_start": nominal_start.isoformat(),
+                        "projected_start": projected_start.isoformat(),
+                        "unclamped_late_offset_seconds": round(late_offset_seconds, 1),
+                        "clamped_to_seconds": MAX_CLOCK_RECOVERY_SECONDS,
+                    },
+                    dedupe_key=f"engine|clock-drift-clamped|{nominal_start.isoformat()}",
+                )
+                late_offset_seconds = MAX_CLOCK_RECOVERY_SECONDS
+
+            return NOMINAL_HOUR_SECONDS - late_offset_seconds
+        except Exception as exc:
+            print(f"  Clock-drift projection failed (non-fatal, using nominal target): {exc}")
+            emit_event(
+                category="engine", level="error", title="Clock-drift projection failed",
+                detail={"nominal_start": nominal_start.isoformat(), "exception": repr(exc), "traceback": traceback.format_exc()},
+                dedupe_key=f"engine|clock-drift-projection-failed|{nominal_start.isoformat()}",
+            )
+            return NOMINAL_HOUR_SECONDS
+
     def _write_state(self, transport="PLAYING"):
         try:
             STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -5342,19 +5648,7 @@ class PlaybackEngine:
             # time (next_start_seconds if set, else full duration) —
             # the same heuristic the crossfade trigger itself uses, so
             # the estimate matches how handoffs actually happen.
-            leading = None
-            for slot in SLOTS:
-                d = snapshot[slot]
-                if d and not d.paused:
-                    leading = d
-                    break
-
-            eta = 0.0
-            if leading:
-                lt = leading.track
-                lpos = self._get_deck_position(leading)
-                l_effective = lt.next_start_seconds if lt.next_start_seconds is not None else (lt.duration_seconds or 0)
-                eta = max(0.0, l_effective - lpos)
+            eta = self._leading_deck_eta_seconds(snapshot=snapshot)
 
             queue = []
             for qi in self._get_upcoming_preview():

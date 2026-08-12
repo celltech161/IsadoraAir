@@ -64,12 +64,14 @@ def make_stand_in(running=True):
     return obj
 
 
-def fake_build_hour_log(target_date, target_hour):
+def fake_build_hour_log(target_date, target_hour, target_duration_seconds=None):
     """Stand-in for log_builder.build_hour_log that skips the real
     rotation-picking algorithm (and the Track/ScheduleBlock fixtures
     it would need) but mirrors _persist_log's delete-then-recreate
     behavior so repeated calls for the same (date, hour) don't hit the
-    PlaylistLog unique_together constraint."""
+    PlaylistLog unique_together constraint. Accepts (and ignores)
+    target_duration_seconds -- build_and_approve_hour_log_locked always
+    passes it through by keyword now."""
     PlaylistLog.objects.filter(date=target_date, hour=target_hour).delete()
     log = PlaylistLog.objects.create(date=target_date, hour=target_hour, status="draft")
     LogItem.objects.create(playlist_log=log, position=0, scheduled_time=timezone.now())
@@ -243,7 +245,7 @@ class AdvisoryLockTests(TransactionTestCase):
         hour = 6
         build_calls = []
 
-        def counting_build(target_date, target_hour):
+        def counting_build(target_date, target_hour, target_duration_seconds=None):
             build_calls.append(1)
             return fake_build_hour_log(target_date, target_hour)
 
@@ -330,7 +332,7 @@ class NeverSynchronousTests(TransactionTestCase):
 
         main_thread_calls = []
 
-        def spy_build(target_date, target_hour):
+        def spy_build(target_date, target_hour, target_duration_seconds=None):
             main_thread_calls.append(threading.current_thread() is threading.main_thread())
             return (None, "no schedule block")
 

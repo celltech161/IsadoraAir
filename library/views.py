@@ -28,6 +28,14 @@ from .services.related_artists import (
 )
 from .services.track_filters import filter_tracks
 
+# _read_engine_state (not the whole module) -- webrequests.services
+# already defines the one shared "is the running engine's state fresh
+# enough to trust" reader; duplicating that staleness logic here would
+# be exactly the kind of drift-prone parallel reimplementation the rest
+# of this codebase avoids. No circularity: webrequests.services imports
+# from library.models/library.services.*, never from library.views.
+from webrequests.services import _read_engine_state
+
 
 @ensure_csrf_cookie
 def dashboard_page(request):
@@ -1678,6 +1686,37 @@ def _log_to_dict(log):
     }
 
 
+def _is_active_or_imminent_hour(target_date, hour):
+    """Narrow guardrail (1.1 spec -- the relevant slice of roadmap item
+    1.7, not the full feature): true if (target_date, hour) is the hour
+    currently on air, or the hour the engine has already advanced its
+    active queue to ahead of the real top-of-hour (early rollover --
+    see engine.py's _advance_to_next_hour_log). No override workflow,
+    no broader "imminent" lookahead window beyond what the engine
+    itself has already committed to -- just enough to stop a
+    destructive delete-and-rebuild (build_hour_log_for_admin always
+    rebuilds, discarding whatever's there) from landing under a log
+    that's actually on air right now.
+
+    Falls back to comparing against wall-clock "now" when engine_state.
+    json is missing/stale (engine down or hasn't ticked recently) --
+    still refuses to rebuild the CURRENT wall-clock hour even with no
+    live engine state to consult, since that hour is the one that
+    SHOULD be on air regardless of whether the engine is currently
+    reporting in."""
+    now = timezone.localtime()
+    if (target_date, hour) == (now.date(), now.hour):
+        return True
+    state = _read_engine_state()
+    if state and state.get("date") and state.get("hour") is not None:
+        try:
+            active_date = date_type.fromisoformat(state["date"])
+        except (ValueError, TypeError):
+            return False
+        return (target_date, hour) == (active_date, state["hour"])
+    return False
+
+
 @require_http_methods(["POST"])
 def api_log_build(request):
     try:
@@ -1698,6 +1737,13 @@ def api_log_build(request):
 
     if not (0 <= hour <= 23):
         return JsonResponse({"error": "hour must be 0-23"}, status=400)
+
+    if _is_active_or_imminent_hour(target_date, hour):
+        return JsonResponse(
+            {"error": "This hour is currently active/on-air -- rebuilding it would destroy the live log. "
+                      "Wait until it's no longer the current hour before rebuilding."},
+            status=409,
+        )
 
     log, error = build_hour_log_for_admin(target_date, hour)
     if error == LOCK_CONTENDED:
