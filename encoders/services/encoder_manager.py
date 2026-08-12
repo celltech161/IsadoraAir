@@ -55,6 +55,7 @@ from django.db import close_old_connections  # noqa: E402
 
 from encoders.models import Encoder  # noqa: E402
 from monitoring.models import emit_event  # noqa: E402
+from isadoraair.version_info import capture_runtime_commit  # noqa: E402
 
 # Paired with the StereoTool HD Output ALSA loopback bridge (second,
 # independent Loopback card -- see PROJECT_NOTES.md for the card layout).
@@ -1097,6 +1098,16 @@ def build_liquidsoap_script(input_device, encoders, host_aircheck=False, generat
 
 class EncoderManager:
     def __init__(self):
+        # Release/version-skew visibility (1.7 roadmap item): captured
+        # exactly ONCE, here, at process construction -- see
+        # isadoraair/version_info.py's own docstring for why this must
+        # never be recomputed later. There is no manager-level/process-
+        # wide heartbeat file for this service (only the per-group files
+        # written by _write_group_state below), so this same value is
+        # stamped redundantly into every group's state file -- they all
+        # describe this one process, so any one of them is sufficient
+        # for the monitoring side to read.
+        self._runtime_commit = capture_runtime_commit()
         self.running = False
         self._procs = {}          # input_device -> subprocess.Popen
         self._scripts = {}        # input_device -> Path
@@ -1400,6 +1411,10 @@ class EncoderManager:
             "last_reconcile_result": meta["last_reconcile_result"],
             "last_reconcile_error": meta["last_reconcile_error"],
             "timestamp": time.time(),
+            # 1.7 release/version-skew visibility -- fixed at process
+            # start (see __init__), None if git was unavailable then.
+            # Redundant across groups by design (see __init__ comment).
+            "runtime_commit": self._runtime_commit,
         }
         try:
             _atomic_write_json(_group_state_path(input_device), state)

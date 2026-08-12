@@ -1,5 +1,8 @@
+import json
+import tempfile
 import time
 import unicodedata
+from pathlib import Path
 from unittest import mock
 
 from django.core.exceptions import ValidationError
@@ -2879,3 +2882,48 @@ class NfcNormalizationTests(SimpleTestCase):
         for text in cases:
             with self.subTest(text=text):
                 self.assertEqual(charset.normalize_text(text), charset.normalize_text(unicodedata.normalize("NFC", text)))
+
+
+class RuntimeCommitStateTests(SimpleTestCase):
+    """1.7 release/version-skew visibility -- RBDSManager captures its
+    own runtime commit exactly once, at construction, and stamps it into
+    every _write_state() call (see isadoraair/version_info.py). STATE_PATH
+    is redirected to a temp file for every test here -- unlike some other
+    tests in this file, this class never writes to the real
+    /run/isadoraair/rbds_state.json the live isadoraair-rbds.service is
+    also writing to."""
+
+    def setUp(self):
+        self.tmp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp_dir.cleanup)
+        self.state_path = Path(self.tmp_dir.name) / "rbds_state.json"
+        patcher = mock.patch.object(rbds_manager, "STATE_PATH", self.state_path)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.config = mock.Mock(host="127.0.0.1", port=4000, protocol="uecp", transport="tcp")
+
+    def test_runtime_commit_captured_once_and_written(self):
+        with mock.patch.object(rbds_manager, "capture_runtime_commit", return_value="a" * 40):
+            mgr = RBDSManager()
+        self.assertEqual(mgr._runtime_commit, "a" * 40)
+        mgr._write_state(self.config, "PS", "RT", "nowplaying", None)
+        state = json.loads(self.state_path.read_text())
+        self.assertEqual(state["runtime_commit"], "a" * 40)
+
+    def test_capture_not_repeated_after_construction(self):
+        """Every _write_state() call must reuse the SAME captured value
+        -- never re-shell to git on each tick (see version_info.py's own
+        docstring for why re-calling capture_runtime_commit() per tick
+        would defeat this feature's purpose)."""
+        with mock.patch.object(rbds_manager, "capture_runtime_commit", return_value="b" * 40) as mock_capture:
+            mgr = RBDSManager()
+            mgr._write_state(self.config, "PS", "RT", "nowplaying", None)
+            mgr._write_state(self.config, "PS", "RT", "nowplaying", None)
+        mock_capture.assert_called_once()
+
+    def test_git_unavailable_writes_none_not_a_crash(self):
+        with mock.patch.object(rbds_manager, "capture_runtime_commit", return_value=None):
+            mgr = RBDSManager()
+        mgr._write_state(self.config, "PS", "RT", "nowplaying", None)
+        state = json.loads(self.state_path.read_text())
+        self.assertIsNone(state["runtime_commit"])

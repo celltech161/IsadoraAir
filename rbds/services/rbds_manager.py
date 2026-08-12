@@ -24,6 +24,7 @@ from rbds.services import ascii_protocol, uecp  # noqa: E402
 from rbds.services.charset import normalize_text  # noqa: E402
 from rbds.services.content_fetch import ContentFetchCache  # noqa: E402
 from rbds.services.rotation import PSRotation, RTRotation  # noqa: E402
+from isadoraair.version_info import capture_runtime_commit  # noqa: E402
 
 POLL_SECONDS = 1
 FULL_RESEND_SECONDS = 30  # periodic full resend even if nothing changed -- RDS receivers can miss packets
@@ -85,6 +86,12 @@ RBDS_CATEGORY_STATE_PATH = Path("/run/isadoraair/rbds_category_state.json")
 
 class RBDSManager:
     def __init__(self):
+        # Release/version-skew visibility (1.7 roadmap item): captured
+        # exactly ONCE, here, at process construction -- see
+        # isadoraair/version_info.py's own docstring for why this must
+        # never be recomputed later. Written into every _write_state()
+        # tick below.
+        self._runtime_commit = capture_runtime_commit()
         self.running = False
         self._ps_rotation = PSRotation()
         self._rt_rotation = RTRotation()
@@ -909,6 +916,9 @@ class RBDSManager:
             "reconnect_attempt": self._reconnect_attempt,
             "reconnect_next_at": self._reconnect_next_at,
             "reconnect_delay_seconds": self._reconnect_delay_seconds,
+            # 1.7 release/version-skew visibility -- fixed at process
+            # start (see __init__), None if git was unavailable then.
+            "runtime_commit": self._runtime_commit,
         }
         tmp = STATE_PATH.with_suffix(".tmp")
         tmp.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")

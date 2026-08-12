@@ -28,6 +28,7 @@ from monitoring.services.notify import maybe_notify  # noqa: E402
 from monitoring.services.probes import PROBE_DISPATCH  # noqa: E402
 from monitoring.services.shoutcast import fetch_shoutcast_stats  # noqa: E402
 from monitoring.services.transmitter_client import TransmitterClient  # noqa: E402
+from isadoraair.version_info import capture_runtime_commit  # noqa: E402
 
 STATE_PATH = Path("/run/isadoraair/monitoring_state.json")
 # Separate state file for the Shoutcast listener widget so its 10 s poll
@@ -43,6 +44,12 @@ _TRANSMITTER_KINDS = ("transmitter_param", "transmitter_indicator")
 
 class MonitorManager:
     def __init__(self):
+        # Release/version-skew visibility (1.7 roadmap item): captured
+        # exactly ONCE, here, at process construction -- see
+        # isadoraair/version_info.py's own docstring for why this must
+        # never be recomputed later. Written into every _write_state()
+        # tick below.
+        self._runtime_commit = capture_runtime_commit()
         self.running = False
         self._consecutive_bad = {}   # check.id -> int
         self._since = {}             # check.id -> timestamp status last changed
@@ -385,6 +392,14 @@ class MonitorManager:
             # card it colors, without depending on display names (which
             # an admin could rename).
             "tx_ref": check.transmitter_parameter or check.transmitter_indicator or None,
+            # 1.7 release/version-skew visibility -- lets the view's
+            # release_status merge step match this check to a known
+            # first-party service's runtime-commit lookup without
+            # depending on display names (which an admin could rename).
+            # Empty string for non-systemd checks and third-party units
+            # (nginx, StereoTool) alike; the merge step only looks up
+            # units it actually knows about either way.
+            "systemd_unit": check.systemd_unit or None,
         }
 
     def _debounce(self, check, raw_status):
@@ -414,6 +429,9 @@ class MonitorManager:
             "timestamp": time.time(),
             "checks": results,
             "_cooldowns": self._cooldowns,
+            # 1.7 release/version-skew visibility -- fixed at process
+            # start (see __init__), None if git was unavailable then.
+            "runtime_commit": self._runtime_commit,
         }
         tmp = STATE_PATH.with_suffix(".tmp")
         tmp.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")

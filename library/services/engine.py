@@ -42,6 +42,7 @@ from library.services.log_builder import (
 )
 from library.services.remote_dj_signaling import RemoteDJSignalingServer
 from webrequests.services import SCHEDULING_CONTENDED, maybe_schedule_song_request, mark_song_requests_aired
+from isadoraair.version_info import capture_runtime_commit
 
 STUDIO_MONITOR_NAME = "Studio Monitor"
 STUDIO_MONITOR_FALLBACK_DEVICE = "plughw:2,0"
@@ -359,6 +360,14 @@ class Deck:
 
 class PlaybackEngine:
     def __init__(self):
+        # Release/version-skew visibility (1.7 roadmap item): captured
+        # exactly ONCE, here, at process construction -- fixed for this
+        # engine process's entire lifetime regardless of later checkout
+        # changes. Written into every _write_state() tick so
+        # /monitoring/'s Playback Engine card can compare it against
+        # the CURRENT checkout and show a compact mismatch indicator
+        # without ever re-deriving it live. See isadoraair/version_info.py.
+        self._runtime_commit = capture_runtime_commit()
         Gst.init(None)
         self.loop = GLib.MainLoop()
         self.mixer = None
@@ -5748,6 +5757,10 @@ class PlaybackEngine:
                 # another open dashboard/remote-DJ session, or an
                 # external trigger like the weather beep bridge).
                 "fx_fires": self._fx_fires_state(),
+                # 1.7 release/version-skew visibility -- fixed at process
+                # start (see __init__), not re-derived here. None if git
+                # was unavailable when this process started.
+                "runtime_commit": self._runtime_commit,
             }
 
             tmp = STATE_PATH.with_suffix(".tmp")

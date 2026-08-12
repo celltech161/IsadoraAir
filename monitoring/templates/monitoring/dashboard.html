@@ -16,6 +16,28 @@
   }
   .mon-stale-banner.show { display: block; }
 
+  /* --- 1.7 release/version-skew visibility: one compact page-level
+     checkout-identity line, plus a small per-service badge inside the
+     existing systemd cards (see .mon-version below). Deliberately no
+     new card/panel/table -- see PROJECT_NOTES.md roadmap item 1.7. */
+  .mon-release-line {
+    font-size: 0.72rem;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    color: var(--text-muted);
+    margin-bottom: 0.6rem;
+  }
+  .mon-release-line.dirty { color: #f59e0b; }
+
+  .mon-version {
+    font-size: 0.68rem;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    color: var(--text-muted);
+    margin-top: 0.2rem;
+  }
+  .mon-version.ok { color: var(--text-muted); }
+  .mon-version.stale { color: #f59e0b; }
+  .mon-version.unknown { color: var(--text-muted); }
+
   .mon-group {
     margin-bottom: 1.15rem;
   }
@@ -348,6 +370,7 @@
 
 {% block content %}
 <div id="monStaleBanner" class="mon-stale-banner">Monitoring data hasn't updated recently — the monitoring service may be down.</div>
+<div id="monRelease" class="mon-release-line"></div>
 
 <div id="monGroups"></div>
 
@@ -469,6 +492,13 @@ const KIND_GROUPS = [
 // after you open it.
 const expandedCoreCards = new Set();
 
+// 1.7 release/version-skew visibility. Updated once per poll (see
+// pollStatus), read by renderVersionBadge() while rendering each systemd
+// card -- kept as shared page state rather than duplicated onto every
+// check's own "version" payload from the server, since it's the same
+// single value for the whole page.
+let currentCheckout = { commit: null, short_commit: null, dirty: null };
+
 function toggleCores(btn, checkId) {
   const grid = btn.nextElementSibling;
   if (!grid || !grid.classList.contains("mon-cores-grid")) return;
@@ -520,7 +550,64 @@ function renderSystemdBody(check) {
       <span class="mon-uptime">${uptimeHours != null ? `Up ${uptimeHours} hrs` : ""}</span>
       <button class="mon-restart-btn" data-check-id="${check.id}" data-check-name="${escapeHtmlAttr(check.name)}" onclick="restartService(this)">Restart</button>
     </div>
+    ${renderVersionBadge(check)}
   `;
+}
+
+// 1.7 release/version-skew visibility -- a small secondary line under
+// the existing Running/Stopped LED + uptime row, NOT a new card/panel.
+// Never affects check.status/the LED above: a version mismatch is a
+// DEPLOYMENT signal ("this running process needs a restart to pick up
+// the latest checkout"), not a HEALTH signal -- a stale-but-running
+// service still shows "Running" with a green LED, exactly as it should.
+function renderVersionBadge(check) {
+  const v = check.version;
+  if (!v) return ""; // not one of the 5 covered first-party services
+  // (nginx/StereoTool are third-party, RBDS Connection isn't a systemd
+  // check) -- no badge at all rather than a misleading "unknown" on a
+  // service this feature was never wired to identify in the first place.
+  if (v.state === "current") {
+    return `<div class="mon-version ok" title="Running commit ${escapeHtmlAttr(v.runtime_commit || '')}">${v.runtime_short} ✓</div>`;
+  }
+  if (v.state === "indeterminate") {
+    // SHA matches the checkout, but the checkout has uncommitted changes
+    // -- commit equality alone can't prove this process reflects the
+    // CURRENT filesystem state, only the commit it started from. Reuses
+    // the neutral "unknown" styling (most compact existing treatment --
+    // no new CSS) rather than inventing a fourth color: this isn't a
+    // confirmed-good state (no checkmark) and isn't a real mismatch
+    // needing a restart either (no warning triangle). Text pattern
+    // matches the page-level release line's own "· modified" wording.
+    return `<div class="mon-version unknown" title="Running commit ${escapeHtmlAttr(v.runtime_commit || '')} matches the checkout, but the checkout has uncommitted changes -- can't confirm this process reflects them.">${v.runtime_short} · modified</div>`;
+  }
+  if (v.state === "stale") {
+    const target = currentCheckout.short_commit || "?";
+    return `<div class="mon-version stale" title="Running ${escapeHtmlAttr(v.runtime_commit || '')}, checkout is now ${escapeHtmlAttr(currentCheckout.commit || '')}">⚠ ${v.runtime_short} → ${target}</div>`;
+  }
+  // state === "unknown" -- either this process hasn't captured a
+  // runtime commit (e.g. running outside git, or hasn't written a
+  // heartbeat yet) or the current checkout itself is unknown. Never
+  // guess/claim a match either way (rollout-backward-compatibility --
+  // an older running process's state file may not carry runtime_commit
+  // at all yet, right after this feature first deploys).
+  return `<div class="mon-version unknown">? version</div>`;
+}
+
+// 1.7 release/version-skew visibility -- one compact page-level
+// checkout-identity indicator, reusing the existing #monStaleBanner
+// region rather than a new "Release Information" card.
+function renderReleaseLine(checkout) {
+  currentCheckout = checkout || { commit: null, short_commit: null, dirty: null };
+  const el = document.getElementById("monRelease");
+  if (!el) return;
+  if (!currentCheckout.short_commit) {
+    el.textContent = "checkout: unknown";
+    el.classList.remove("dirty");
+    return;
+  }
+  const dirty = currentCheckout.dirty === true;
+  el.textContent = dirty ? `${currentCheckout.short_commit} · modified` : currentCheckout.short_commit;
+  el.classList.toggle("dirty", dirty);
 }
 
 function escapeHtmlAttr(s) {
@@ -863,6 +950,7 @@ async function pollStatus() {
     const res = await fetch("{% url 'monitoring:api-status' %}");
     const data = await res.json();
     document.getElementById("monStaleBanner").classList.toggle("show", !!data.stale);
+    renderReleaseLine(data.checkout);
     renderGroups(data.checks || []);
   } catch (e) {
     document.getElementById("monStaleBanner").classList.add("show");

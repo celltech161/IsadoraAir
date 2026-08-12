@@ -12,6 +12,7 @@ from django.views.decorators.http import require_http_methods
 from django.utils import timezone as django_tz
 
 from .models import ListenerPeak, MonitorCheck, SystemEvent
+from .services.release_status import get_release_status
 
 STATE_PATH = Path("/run/isadoraair/monitoring_state.json")
 LISTENER_STATE_PATH = Path("/run/isadoraair/listeners.json")
@@ -33,6 +34,23 @@ def api_monitoring_status(request):
         return JsonResponse({"checks": [], "timestamp": 0, "stale": True})
     data.pop("_cooldowns", None)  # internal bookkeeping, not for the browser
     data["stale"] = (time.time() - data.get("timestamp", 0)) > STATE_STALE_SECONDS
+
+    # 1.7 release/version-skew visibility. `data` here IS the monitoring
+    # poller's own state dict (it already carries its own runtime_commit,
+    # written by MonitorManager._write_state) -- pass it through so
+    # get_release_status doesn't need to read monitoring_state.json a
+    # second time. Never raises: any git/file-read failure inside
+    # resolves to "unknown" fields, never a 500 for the whole dashboard.
+    try:
+        checkout, version_lookup = get_release_status(monitoring_state=data)
+    except Exception:
+        checkout, version_lookup = {"commit": None, "short_commit": None, "dirty": None}, {}
+    data["checkout"] = checkout
+    for check in data.get("checks", []):
+        unit = check.get("systemd_unit")
+        if unit and unit in version_lookup:
+            check["version"] = version_lookup[unit]
+
     return JsonResponse(data)
 
 
