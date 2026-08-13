@@ -1,0 +1,104 @@
+# Authoritative Ubuntu 26.04 apt package manifest -- IsadoraAir 1.2
+# Phase 3 (2026-08-12). Everything a clean machine needs installed
+# BEFORE the Python venv can be created and IsadoraAir's own
+# requirements.txt can be pip-installed.
+#
+# Derived from: production's actual `dpkg -l`, cross-checked against
+# what IsadoraAir's own code genuinely uses (docs/GSTREAMER_ELEMENT_INVENTORY.md's
+# element-by-element audit, HE-AAC build requirements, README.md's
+# documented install steps) -- NOT a dump of every package installed
+# on production. Format: one package per line, grouped into sourceable
+# bash arrays so a future install script can `source` this file
+# directly (`source deploy/packages-ubuntu-26.04.txt; sudo apt install
+# "${CORE[@]}" "${AUDIO_GSTREAMER[@]}" ...`) rather than re-copying the
+# list by hand.
+#
+# Version pinning policy (see docs/RUNTIME_BASELINE.md for the full
+# reasoning): package names below, not versions -- Ubuntu 26.04 LTS
+# itself is the pin; ordinary apt packages track whatever that release
+# ships/patches, which is the intended "OS-managed/current-for-release"
+# behavior. PostgreSQL's major version (18) and GStreamer's minor
+# series (1.28.x) are the two exceptions IsadoraAir's own code assumes
+# something about -- see docs/RUNTIME_BASELINE.md.
+
+# ---- core -------------------------------------------------------------
+# NOTE: the main README.md's own fresh-install walkthrough additionally
+# lists postgresql-contrib and libpq-dev -- verified NOT actually
+# needed and NOT installed on production (checked 2026-08-12):
+#   - psycopg2-binary (the pip package IsadoraAir actually uses) bundles
+#     its own libpq.so inside the wheel -- confirmed via `ldd` on the
+#     installed .so, it links psycopg2_binary.libs/libpq-*.so, never
+#     the system library. libpq-dev only matters if switching to the
+#     non-binary `psycopg2` package (source build).
+#   - `\dx` on the live database shows only the always-present
+#     `plpgsql` extension -- nothing from postgresql-contrib is used by
+#     any migration or model.
+# Left out here as "not a direct requirement" per this file's own
+# stated policy; harmless to also install if you'd rather match
+# README.md's slightly more conservative list.
+CORE=(
+  python3
+  python3-venv
+  python3-dev
+  build-essential
+  git
+  nginx
+  postgresql
+)
+
+# ---- audio / GStreamer (playback engine + Remote DJ WebRTC) ----------
+# Full element-by-element justification for every package here:
+# docs/GSTREAMER_ELEMENT_INVENTORY.md. gstreamer1.0-nice was a real gap
+# found by that audit -- webrtcbin needs it for ICE at runtime even
+# though no IsadoraAir code names it directly.
+AUDIO_GSTREAMER=(
+  python3-gi
+  gir1.2-gstreamer-1.0
+  gstreamer1.0-tools
+  gstreamer1.0-alsa
+  gstreamer1.0-plugins-base
+  gstreamer1.0-plugins-good
+  gstreamer1.0-plugins-bad
+  gstreamer1.0-libav
+  gstreamer1.0-nice
+  alsa-utils
+  ffmpeg
+  liquidsoap
+)
+
+# ---- build-only: HE-AAC (deploy/build_fdkaac.sh) ----------------------
+# Not needed at runtime once /usr/local/bin/fdkaac + libfdk-aac.so.2
+# exist -- only while actually running that build script.
+BUILD_HEAAC=(
+  autoconf
+  automake
+  libtool
+  pkg-config
+  # gcc/g++/make/git already covered by CORE's build-essential + git
+)
+
+# ---- optional: CD ripping (skip if the box has no optical drive) -----
+OPTIONAL_CD_RIP=(
+  whipper
+  cdparanoia
+  flac
+  libdiscid0
+)
+
+# ---- optional: Kokoro TTS phonemization -------------------------------
+# Only needed if Kokoro is installed/used -- see docs/KOKORO_PROVENANCE.md.
+# Piper needs nothing from apt (self-contained, see docs/PIPER_PROVENANCE.md).
+OPTIONAL_KOKORO_TTS=(
+  espeak-ng
+)
+
+# ---- optional: companion-project Selenium-driven shows ----------------
+# Only needed if syndicated-ingest's radiopush-backed shows (Anjunachill
+# On Air, Enhanced Sessions) or rch/get_rch.py are enabled -- see
+# syndicated-ingest/README.md's "Native/system prerequisites" section.
+# Not an IsadoraAir-repo package (this project's own deploy/ target),
+# listed here for completeness of "what this station's full stack needs".
+OPTIONAL_SYNDICATED_SELENIUM=(
+  chromium-browser
+  chromium-chromedriver
+)

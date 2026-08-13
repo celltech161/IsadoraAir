@@ -117,6 +117,7 @@ Drop-in configs (installed as-is, no per-install variation apart from the ones a
 | `isadoraair-tmpfiles.conf` | `/etc/tmpfiles.d/isadoraair.conf` — creates `/run/isadoraair` on boot with the right owner |
 | `needrestart-isadoraair.conf` | `/etc/needrestart/conf.d/isadoraair.conf` — auto-restarts services on library upgrades so a matplotlib/psycopg2 refresh doesn't leave the engine on the old shared object |
 | `asound.conf` | `/etc/asound.conf` — ALSA loopback / dsnoop config for the studio + streaming feeds |
+| `isadoraair-aloop.conf` | `/etc/modprobe.d/isadoraair-aloop.conf` — pins `snd-aloop` to three loopback cards at fixed indices 0/3/4, which `asound.conf`'s `airtap`/`airtap_ds` aliases (and StereoTool's configured device) depend on by exact card number. Also requires `/etc/modules-load.d/snd-aloop.conf` containing the single line `snd-aloop` (`echo snd-aloop \| sudo tee /etc/modules-load.d/snd-aloop.conf`) so the module loads at boot at all -- see the main `README.md`'s "ALSA loopback module" step and this file's own header comment for the full reasoning. |
 | `stereotool.service.example` | `/etc/systemd/system/stereotool.service` — **only if** you run StereoTool (or a similar external processor) as a supervised systemd service; see its own header comment. Not installed by the loop in step 2 (`.example` isn't matched by `deploy/*.service`) — copy and rename it deliberately. |
 
 ### One authoritative nginx config

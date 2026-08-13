@@ -255,10 +255,25 @@ processed audio back in" path. If you're not running an external
 processor, skip this step and send the engine straight to your real
 sound card.
 
+**Two files are required, not just `modprobe snd-aloop`** -- the
+default single auto-numbered loopback instance is not enough; the
+studio config (`deploy/asound.conf`) and StereoTool's own configured
+device both reference specific card indices, which only exist if
+`snd-aloop` is told to create three instances at those exact indices:
+
 ```bash
-# Enable snd-aloop at boot
+# 1. Load the module at boot at all
 echo snd-aloop | sudo tee /etc/modules-load.d/snd-aloop.conf
+
+# 2. Pin it to three instances at fixed indices (see
+# deploy/isadoraair-aloop.conf's own header comment for exactly which
+# card each one is for and why the indices must be pinned, not
+# auto-assigned)
+sudo cp deploy/isadoraair-aloop.conf /etc/modprobe.d/isadoraair-aloop.conf
+
 sudo modprobe snd-aloop
+# Verify: `cat /proc/asound/cards` should show three "Loopback" entries
+# at indices 0, 3, 4 alongside your real hardware.
 ```
 
 ### 3. PostgreSQL — create the database and user

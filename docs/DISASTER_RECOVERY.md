@@ -155,6 +155,29 @@ follows.
 
 ## Database restore
 
+**Package baseline** (IsadoraAir 1.2 Phase 3, verified 2026-08-12):
+`postgresql` (meta-package `18+290ubuntu1`) pulls in `postgresql-18`
+(server, `18.4-0ubuntu0.26.04.1`), `postgresql-client-18`, and
+`postgresql-client-common` — all from Ubuntu 26.04's own repos, no
+third-party APT source (unlike some distros' PGDG-repo convention).
+Major version (`18`) should be treated as **pinned** — IsadoraAir's
+schema/migrations are only verified against PostgreSQL 18; minor patch
+version is OS-managed/current-for-release. `apt install postgresql
+postgresql-contrib libpq-dev` (already documented in the main
+`README.md`'s fresh-install walkthrough) is the correct, complete
+package set.
+
+**Encoding/locale assumptions**: the live `isadoraair` database is
+`UTF8` encoding, `libc` locale provider, `en_US.UTF-8` collate/ctype —
+Postgres' own installation defaults on a standard Ubuntu box with the
+`en_US.UTF-8` system locale generated (`locale -a` should list it; if
+not, `sudo locale-gen en_US.UTF-8` before `initdb`/first cluster
+creation). Not explicitly forced by any `CREATE DATABASE` flag in the
+restore commands below — if a target box's default locale differs,
+add `ENCODING 'UTF8' LC_COLLATE 'en_US.UTF-8' LC_CTYPE 'en_US.UTF-8'
+TEMPLATE template0` to the `CREATE DATABASE` statement rather than
+relying on the cluster default matching.
+
 The nightly `pg_dump -Fc` captures the database's data completely, but a
 **bare-metal restore needs manual bootstrap first** — `pg_dump` alone
 does not capture roles/ownership:
