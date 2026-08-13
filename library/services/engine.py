@@ -1683,6 +1683,68 @@ class PlaybackEngine:
         self._next_hour_peek_at = now
         return result
 
+    def _committed_future_runway_seconds(self):
+        """Authoritative "how much airtime is already committed to play
+        between NOW and whatever finishes last in the current queue" --
+        used by _try_extend_live_log_async to decide whether a live-fill
+        dispatch is even warranted.
+
+        Split cleanly into two independent parts, mirroring
+        _compute_queue_eta_state's own listener-audible-start semantics
+        (see that function's docstring for the full derivation of why
+        the first offset is fundamentally different from every one
+        after it):
+
+          1. Remaining playout on the LEADING deck (the soonest-to-
+             finish, unpaused, occupied deck): its own next_start
+             minus its CURRENT source position. Its cue_in already
+             happened, so must NOT be re-subtracted. Delegates to
+             `_leading_deck_eta_seconds` -- the same function that
+             seeds the operator-facing "Starts at" queue ETA, so
+             these two numbers can never silently drift apart.
+
+          2. FUTURE queued items only: everything at
+             self.log_items[self._queue_cursor:], accumulated via
+             log_builder's own effective_airtime_seconds() (imported
+             at module top). Explicitly does NOT sum the entire
+             log_items list -- an already-played item (index below
+             the cursor) has already contributed its airtime to the
+             hour and must never be counted again toward remaining
+             runway. Same reason a substitute/skipped item (which
+             _next_queue_item advances past) is naturally excluded:
+             the cursor has already moved beyond it, so it never
+             enters this sum.
+
+        Deliberately does NOT include forced items
+        (self._forced_next_items) even though _compute_queue_eta_state's
+        preview does. Forced items are spliced IN FRONT of the normal
+        queue at play time, replacing what the cursor would otherwise
+        return; counting both would double-book the same time. In the
+        common case forced items either aren't present or are dedication
+        intros that displace far more time than they add (a 4-second
+        intro pushed in front of a 3-minute song is trivial compared to
+        the honest deficit calculation this method is used for). If a
+        future forced-item feature ever pushes multi-minute content,
+        this can be revisited -- for the false-deficit-suppression
+        purpose here, ignoring them is safe (biases slightly toward
+        under-estimating committed runway, i.e. toward LETTING a fill
+        happen rather than suppressing one that shouldn't).
+
+        Returns 0.0 if there's nothing playing and nothing queued -- a
+        genuine "queue empty" state that a live-fill IS legitimately
+        for."""
+        runway = self._leading_deck_eta_seconds()
+        cursor = self._queue_cursor
+        for item in self.log_items[cursor:]:
+            track = item.track
+            if track is None:
+                # Deleted-track ghost -- _next_queue_item will skip it,
+                # so it contributes zero real airtime. Same reason
+                # _get_upcoming_preview filters these out of the UI queue.
+                continue
+            runway += effective_airtime_seconds(track)
+        return runway
+
     def _try_extend_live_log_async(self):
         """Throttled DISPATCH of an async live-log-fill worker -- called
         both proactively (from `_poll_position`'s crossfade lookahead,
@@ -1721,7 +1783,34 @@ class PlaybackEngine:
         worker is ever in flight at a time -- the guard is cleared by
         the WORKER's own completion, not by the (possibly delayed)
         GLib idle callback, so a second dispatch can start before the
-        first one's install callback has actually run."""
+        first one's install callback has actually run.
+
+        False-deficit suppression (2026-08-12 fix): the old version
+        conflated "the cursor reached the end of self.log_items" with
+        "no runway remains before TOH" -- true when the last-queued
+        item is short, dramatically false when it's a long mixshow
+        segment (a real live production case appended ~26 minutes of
+        PSAs while a ~26.5-minute Grateful Dead Hour Part 2 was still
+        playing and about to naturally carry the hour to TOH). The
+        cursor reaches the end of log_items the instant the LAST
+        item is dequeued for playback, not when that item finishes,
+        so a proactive `_try_extend_live_log_async` call from
+        `_poll_position` fires almost the entire item's duration
+        before the actual end. Fix: compute an authoritative
+        committed_runway (see _committed_future_runway_seconds --
+        remaining playout of the leading deck + effective airtime of
+        every FUTURE queued item, cursor-aware), compare to
+        wall-clock-remaining-in-hour, and dispatch only when the
+        deficit is genuinely positive beyond DURATION_FIT_MARGIN. TOH
+        itself is the authoritative target ceiling here regardless of
+        the built hour's clock-drift-adjusted target -- rollover at
+        _advance_to_next_hour_log's ~30s-before-TOH mark discards
+        whatever's left unplayed anyway, so scheduling PAST TOH is
+        pointless (and passing target_duration_seconds=wall_remaining
+        into the worker below makes fill_remaining_hour target that
+        real remaining window, not a hardcoded 3600, closing the
+        secondary "flat 3600" issue as a side effect of the same
+        computation)."""
         now = time.time()
         if now - self._last_live_extend_attempt < 5.0:
             return False
@@ -1745,6 +1834,24 @@ class PlaybackEngine:
                 self._live_fill_in_progress = False
             return False
 
+        # Authoritative committed-runway check (see this function's
+        # own docstring for the full "false-deficit suppression"
+        # rationale). Even if the cursor has "run out" of log_items,
+        # the LEADING deck may still have most of a long track left
+        # to play, which counts. Skip dispatch entirely when the
+        # deficit is not genuinely positive beyond the standard fit
+        # margin -- do NOT dispatch a worker just to have it compute
+        # a proposal that would then be discarded downstream, since
+        # a proposal that actually adds nothing would go
+        # unrepresented and a proposal that adds "just a little" is
+        # exactly the false-fill case this suppresses.
+        committed_runway = self._committed_future_runway_seconds()
+        deficit = seconds_left - committed_runway
+        if deficit <= DURATION_FIT_MARGIN:
+            with self._lock:
+                self._live_fill_in_progress = False
+            return False
+
         # Capture an IMMUTABLE snapshot of everything the worker needs --
         # never hand the worker thread self.current_log/self.log_items
         # directly, since a rollover on this (the main) thread could
@@ -1753,17 +1860,29 @@ class PlaybackEngine:
         hour_start = wall_now.replace(minute=0, second=0, microsecond=0)
         existing_picks = [{"track": li.track, "category": li.category} for li in self.log_items]
         original_count = len(existing_picks)
-        accumulated = 3600 - seconds_left
+        # accumulated + target_duration_seconds together tell
+        # fill_remaining_hour "there's `deficit` seconds left to fill"
+        # -- expressed in its own (target - accumulated) contract. The
+        # exact absolute values don't matter as long as their
+        # difference equals the real deficit, so target=deficit +
+        # DURATION_FIT_MARGIN, accumulated=0 keeps the math trivial
+        # and self-documenting. (The old bug was accumulated = 3600 -
+        # seconds_left with target defaulted to NOMINAL_HOUR_SECONDS,
+        # which computed `remaining = seconds_left` -- WALL clock, not
+        # deficit, so a big-committed-but-empty-queue state got
+        # tricked into over-filling.)
+        accumulated = 0.0
+        target_duration_seconds = deficit
         start_position = self.log_items[-1].position + 1
 
         threading.Thread(
             target=self._live_fill_worker,
-            args=(log_id, generation, existing_picks, original_count, accumulated, hour_start, start_position),
+            args=(log_id, generation, existing_picks, original_count, accumulated, hour_start, start_position, target_duration_seconds),
             daemon=True,
         ).start()
         return False
 
-    def _live_fill_worker(self, log_id, generation, existing_picks, original_count, accumulated, hour_start, start_position):
+    def _live_fill_worker(self, log_id, generation, existing_picks, original_count, accumulated, hour_start, start_position, target_duration_seconds=NOMINAL_HOUR_SECONDS):
         """Runs on a background thread -- READ-ONLY with respect to the
         database. Computes a PROPOSED set of fill picks via
         fill_remaining_hour (which issues real SELECT queries, e.g.
@@ -1778,13 +1897,26 @@ class PlaybackEngine:
         main thread. A stale worker (its result superseded by a
         rollover, a newer dispatch, the gap already being filled by
         something else, or plain shutdown) is therefore automatically
-        side-effect-free -- it simply computed something nobody used."""
+        side-effect-free -- it simply computed something nobody used.
+
+        `target_duration_seconds` defaults to NOMINAL_HOUR_SECONDS for
+        backward compatibility with any older test that constructs a
+        worker call directly, but the real dispatcher
+        (`_try_extend_live_log_async`) always passes the authoritative
+        deficit computed from current engine state (see that function's
+        docstring for the "false-deficit suppression" derivation) --
+        NOT a hardcoded 3600. This is what makes fill_remaining_hour
+        target the real remaining window rather than assuming a full
+        hour is empty."""
         try:
             close_old_connections()
             # fill_remaining_hour appends onto `existing_picks` in place
             # and returns that same list, so the new items must be
             # sliced off using the count captured *before* the call.
-            all_picks, _ = fill_remaining_hour(existing_picks, accumulated, hour_start)
+            all_picks, _ = fill_remaining_hour(
+                existing_picks, accumulated, hour_start,
+                target_duration_seconds=target_duration_seconds,
+            )
             new_picks = all_picks[original_count:]
             if not new_picks:
                 return

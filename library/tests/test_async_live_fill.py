@@ -143,7 +143,15 @@ class DispatchGuardTests(LiveFillFixtureMixin, TransactionTestCase):
         def fake_worker(*args, **kwargs):
             captured["args"] = args
 
-        with patch.object(stand_in, "_live_fill_worker", side_effect=fake_worker):
+        # Pinned wall clock to early-in-hour so the false-deficit
+        # suppression check (added by the 2026-08-12 fix) sees a
+        # large positive deficit (short 180s fixture item at :05:00
+        # = ~3120s deficit, well above DURATION_FIT_MARGIN) and
+        # dispatches -- this test's own contract is "dispatch DID
+        # happen", separate from the suppression check tests below.
+        fake_now = timezone.make_aware(timezone.datetime(2027, 3, 1, 6, 5, 0))
+        with patch.object(eng_module.timezone, "localtime", return_value=fake_now), \
+             patch.object(stand_in, "_live_fill_worker", side_effect=fake_worker):
             result = stand_in._try_extend_live_log_async()
 
         deadline = time.time() + 5
@@ -152,12 +160,21 @@ class DispatchGuardTests(LiveFillFixtureMixin, TransactionTestCase):
 
         self.assertFalse(result)
         self.assertIn("args", captured)
-        log_id, generation, existing_picks, original_count, accumulated, hour_start, start_position = captured["args"]
+        (log_id, generation, existing_picks, original_count, accumulated,
+         hour_start, start_position, target_duration_seconds) = captured["args"]
         self.assertEqual(log_id, log.id)
         self.assertEqual(generation, 1)
         self.assertEqual(stand_in._live_fill_generation, 1)
         self.assertEqual(original_count, 1)
         self.assertEqual(start_position, 1)
+        # New contract (2026-08-12 fix): target_duration_seconds is the
+        # authoritative deficit computed from real engine state, not
+        # NOMINAL_HOUR_SECONDS.
+        self.assertGreater(target_duration_seconds, 0)
+        self.assertLess(target_duration_seconds, eng_module.NOMINAL_HOUR_SECONDS,
+                        "target_duration_seconds must be the DEFICIT, not a full hour")
+        self.assertEqual(accumulated, 0.0,
+                         "accumulated is now always 0 -- the deficit lives in target_duration_seconds")
 
     def test_each_dispatch_bumps_generation(self):
         stand_in = make_stand_in()
@@ -166,13 +183,18 @@ class DispatchGuardTests(LiveFillFixtureMixin, TransactionTestCase):
         stand_in.current_log = log
         stand_in.log_items = items
 
-        with patch.object(stand_in, "_live_fill_worker"):
+        # See test_successful_dispatch_... above for why the wall-clock
+        # pin is needed for a dispatch-happens assertion.
+        fake_now = timezone.make_aware(timezone.datetime(2027, 3, 1, 6, 5, 0))
+        with patch.object(eng_module.timezone, "localtime", return_value=fake_now), \
+             patch.object(stand_in, "_live_fill_worker"):
             stand_in._try_extend_live_log_async()
         self.assertEqual(stand_in._live_fill_generation, 1)
 
         stand_in._live_fill_in_progress = False
         stand_in._last_live_extend_attempt = 0.0  # bypass throttle for the test
-        with patch.object(stand_in, "_live_fill_worker"):
+        with patch.object(eng_module.timezone, "localtime", return_value=fake_now), \
+             patch.object(stand_in, "_live_fill_worker"):
             stand_in._try_extend_live_log_async()
         self.assertEqual(stand_in._live_fill_generation, 2)
 
