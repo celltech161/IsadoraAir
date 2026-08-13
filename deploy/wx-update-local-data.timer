@@ -2,8 +2,14 @@
 Description=Run weather data updater every 5 minutes
 
 [Timer]
-# Matches kogr-cron.txt exactly: */5 * * * *
-OnCalendar=*-*-* *:00/5:00
+# Originally ported verbatim from kogr-cron.txt (*/5 * * * *) for legacy
+# migration fidelity only -- not an IsadoraAir functional requirement.
+# Shifted the whole cadence +30s (2026-08) alongside the wx-forecast-*
+# timers moving to :00:00: this keeps the top-of-hour data-update run
+# from landing exactly on top of the forecast timers and the next hour's
+# log build, both now dispatching right at :00:00. This output is less
+# consequential right at TOH, so the 30s delay is an acceptable tradeoff.
+OnCalendar=*-*-* *:00/5:30
 Persistent=true
 RandomizedDelaySec=5
 

@@ -2,8 +2,14 @@
 Description=Run 1-day (current observation) forecast announcer (day voice)
 
 [Timer]
-# Matches kogr-cron.txt exactly: 59 3,4,6,7,15,16,18,19 * * *
-OnCalendar=*-*-* 03,04,06,07,15,16,18,19:59:00
+# Originally ported verbatim from kogr-cron.txt (59 3,4,6,7,15,16,18,19 * * *)
+# for legacy migration fidelity only -- not an IsadoraAir functional
+# requirement. Moved from :59:00 to :00:00 (2026-08) because Kokoro's
+# speech synthesis for this forecast was running concurrently with the
+# next hour's log build (which also dispatches around :59:xx), causing
+# observed CPU contention spikes. Synthesis has ample time to finish
+# before this announcement is actually due to air.
+OnCalendar=*-*-* 04,05,07,08,16,17,19,20:00:00
 Persistent=true
 RandomizedDelaySec=5
 
