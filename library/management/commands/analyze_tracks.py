@@ -9,6 +9,7 @@ from django.core.management.base import BaseCommand
 
 from library.models import AnalysisConfig, Track
 from library.services.related_artists import extract_credited_artists, merge_related_artists
+from monitoring.models import emit_event
 # Aliased on import: this file uses `existing_artist_names_casefolded`
 # as a parameter/local-variable name everywhere below (analyze_one_
 # track's own signature), so importing the loader under the SAME name
@@ -420,13 +421,61 @@ def analyze_one_track(row, cfg_values, wave_dir, force, existing_artist_names_ca
 
     # Stereo L/R linear waveform -- the sole display data stored, see
     # compute_stereo_waveform. Independent decode pass, best-effort: any
-    # failure here is deliberately swallowed rather than propagated,
-    # since this is display-only and must never take down the mono
-    # analysis everything else (cue points, detection, rotation)
-    # depends on.
+    # unexpected exception here is deliberately swallowed rather than
+    # propagated, since this is display-only and must never take down
+    # the mono analysis everything else (cue points, detection,
+    # rotation) depends on.
+    #
+    # Move-during-analysis recovery (2026-08 hardening): the ffmpeg
+    # stereo decode can legitimately return empty if the file was moved
+    # between the mono decode above and this call -- api_track_update in
+    # views.py does an atomic shutil.move + `track.filepath = new_path`
+    # + `track.save()` when the operator recategorizes a track through
+    # the UI, and the analyze timer running against a stale
+    # `.values_list("filepath", ...)` snapshot from before the move will
+    # try the old path and get ENOENT. When that happens, re-read the
+    # Track's current filepath from the DB and retry once with the new
+    # path. Without this recovery the mono cue-point work already
+    # persisted (`next_start_seconds`, etc.) means the track is no
+    # longer "unanalyzed" and won't be re-picked by the timer's default
+    # filter -- leaving a permanently empty waveform display until a
+    # manual reanalyze.
     samples_left, samples_right = [], []
     try:
         raw_stereo = decode_audio_to_pcm_stereo(fp, sample_rate)
+        if not raw_stereo:
+            current_filepath = (
+                Track.objects.filter(id=track_id)
+                .values_list("filepath", flat=True)
+                .first()
+            )
+            if current_filepath and current_filepath != filepath:
+                new_fp = Path(current_filepath)
+                if new_fp.is_file():
+                    print(
+                        f"  Track {track_id} moved mid-analysis "
+                        f"({filepath!r} -> {current_filepath!r}); "
+                        f"retrying stereo decode with new path"
+                    )
+                    raw_stereo = decode_audio_to_pcm_stereo(new_fp, sample_rate)
+                    if raw_stereo:
+                        # Adopt the new path so the payload write and
+                        # any subsequent DB writes below reference
+                        # reality; the mono-derived cue points are
+                        # unaffected (same audio content, unchanged).
+                        fp = new_fp
+                        filepath = current_filepath
+                        filename = new_fp.name
+                        emit_event(
+                            category="library", level="info",
+                            title="Track waveform recovered after mid-analysis move",
+                            detail={
+                                "track_id": track_id,
+                                "old_filepath": row[1],
+                                "new_filepath": current_filepath,
+                            },
+                            dedupe_key=f"library|analyze-waveform-recover|{track_id}",
+                        )
         if raw_stereo:
             samples_left, samples_right = compute_stereo_waveform(
                 raw_stereo, sample_rate, window_seconds, target_points,
