@@ -1,4 +1,6 @@
+import json
 import subprocess
+from pathlib import Path
 
 from django.contrib import admin
 from django.http import HttpResponseRedirect
@@ -7,6 +9,37 @@ from django.utils.html import format_html, format_html_join
 
 from .models import RBDSConfig, RBDSMessage, RBDSPSFrame
 from .services import dynamic_ps
+
+# Same path RBDSManager's own NOW_PLAYING_PATH points at (rbds_manager.py,
+# read-only, owned by library/services/engine.py) -- deliberately a
+# SEPARATE constant, not imported from rbds_manager.py, so this admin
+# module never pulls in that whole daemon module (which calls
+# django.setup() unconditionally at import time, being meant to run as a
+# standalone process -- see its own module docstring) just for a preview
+# read. See _read_current_now_playing()'s own docstring for why this
+# preview intentionally does NOT reuse RBDSManager's last-good-value
+# caching either.
+_NOW_PLAYING_PATH = Path("/run/isadoraair/now_playing.json")
+
+
+def _read_current_now_playing():
+    """Best-effort, ONE-SHOT read for the server-rendered Generated PS
+    preview only ([P1] 2.3E) -- deliberately NOT the same code path as
+    RBDSManager._read_now_playing(), which the live engine tick uses and
+    which has its own last-good-value caching ACROSS TICKS so a
+    momentarily-missing/torn file degrades to whatever it last saw, not
+    to blank (see that method's own docstring). A one-off admin page
+    render has no "previous tick" to fall back to and no live on-air
+    state to protect -- "current now-playing was unavailable" is a
+    perfectly fine, clearly-labeled preview answer that the live engine
+    could never accept. Returns None on any read/parse failure (missing
+    file, torn non-atomic write -- see NOW_PLAYING_PATH's own comment in
+    rbds_manager.py), never raises. Does not instantiate RBDSManager and
+    does not touch or weaken its caching behavior in any way."""
+    try:
+        return json.loads(_NOW_PLAYING_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
 
 
 @admin.register(RBDSConfig)
@@ -26,7 +59,7 @@ class RBDSConfigAdmin(admin.ModelAdmin):
         ("UECP Addressing", {"fields": ["uecp_site_address", "uecp_encoder_address"]}),
         ("Program Service (PS)", {
             "fields": [
-                "station_ps", "ps_mode", "dynamic_ps_text",
+                "station_ps", "ps_mode", "dynamic_ps_text", "dynamic_ps_format",
                 "dynamic_ps_mode", "dynamic_ps_frame_seconds", "generated_ps_preview",
             ],
             "description": (
@@ -38,10 +71,25 @@ class RBDSConfigAdmin(admin.ModelAdmin):
                 "<b>Manual PS Frames</b>: rotates the enabled records from the "
                 "PS Rotation Frames admin page -- Station PS is only used as a "
                 "fail-safe fallback if zero frames there are enabled.<br>"
-                "<b>Generated Rotating PS</b>: converts Dynamic PS Text into a "
-                "sequence of 8-character frames per Dynamic PS Mode (0-3) -- "
-                "see the live preview below, which uses the real frame "
-                "generator, not a separate reimplementation."
+                "<b>Generated Rotating PS</b>: combines Dynamic PS Text with "
+                "live now-playing information per Dynamic PS Format, then "
+                "converts the result into a sequence of 8-character frames per "
+                "Dynamic PS Mode (0-3) -- see the live preview below, which "
+                "uses the real composer and frame generator, not a separate "
+                "reimplementation.<br><br>"
+                "<b>Dynamic PS Format</b> tokens: <code>{text}</code> = Dynamic "
+                "PS Text; <code>{now_playing}</code> = current Artist - Title "
+                "(recommended -- falls back cleanly to just Dynamic PS Text "
+                "when nothing is playing); <code>{artist}</code>/"
+                "<code>{title}</code> = the individual fields, blank when "
+                "unknown, no special fallback. Default <code>{text}</code> "
+                "preserves the original, now-playing-free behavior exactly. "
+                "Examples: <code>{text}</code> or "
+                "<code>{text} | Now Playing: {now_playing}</code>. Sourced only "
+                "from the actual currently-playing track -- never from "
+                "RadioText, RT+ promos, weather, or any other RBDS message "
+                "content (those keep rotating completely independently, see "
+                "the RadioText fieldset below)."
             ),
         }),
         ("Identity", {"fields": ["pi_code", "ecc", "language_code", "pty", "tp", "ta", "ms"]}),
@@ -69,22 +117,42 @@ class RBDSConfigAdmin(admin.ModelAdmin):
     def generated_ps_preview(self, obj):
         """Read-only preview of what Generated Rotating PS would
         actually transmit -- calls the real
-        rbds.services.dynamic_ps.generate_ps_frames() (the same
-        function rbds_manager.py's live PS resolution calls), never a
-        second implementation. Reflects the object's last-SAVED state,
-        not in-progress unsaved form edits -- a plain server-rendered
-        read-only field is sufficient here, no JS live-preview.
-        Never raises: any condition that would prevent a meaningful
-        preview (mode not Generated, blank text, an unexpected
-        generation failure) is shown as a concise status line instead."""
+        rbds.services.dynamic_ps.compose_dynamic_ps_source() and
+        generate_ps_frames() (the same two functions rbds_manager.py's
+        live PS resolution calls, in the same order, [P1] 2.3E), never a
+        second implementation of either. Reflects the object's
+        last-SAVED state, not in-progress unsaved form edits -- a plain
+        server-rendered read-only field is sufficient here, no JS
+        live-preview. Never raises: any condition that would prevent a
+        meaningful preview (mode not Generated, blank text, an
+        unexpected generation failure) is shown as a concise status line
+        instead.
+
+        Uses a CURRENT now-playing reading when one is safely available
+        (_read_current_now_playing(), a one-shot read that does NOT
+        instantiate RBDSManager or touch its own last-good-value
+        caching -- see that function's own docstring) so the preview can
+        show real Artist/Title composition, not just the {text}-only
+        case. If the file can't be safely read right now, the preview
+        clearly says so and falls back to composing with no now-playing
+        data at all (which is also exactly what the live engine itself
+        would do if it hit the same read failure on a given tick)."""
         if obj is None or obj.pk is None:
             return "(save the config first to preview)"
         if obj.ps_mode != "generated":
             return "Not applicable — PS Mode is not Generated Rotating PS."
         if not obj.dynamic_ps_text.strip():
             return "Not applicable — Dynamic PS Text is blank."
+
+        now_playing = _read_current_now_playing()
+        header = ""
+        if now_playing is None:
+            header = "(current now-playing unavailable — composing with no now-playing data)\n\n"
+            now_playing = {"title": "", "artist": ""}
+
         try:
-            frames = dynamic_ps.generate_ps_frames(obj.dynamic_ps_text, obj.dynamic_ps_mode)
+            source = dynamic_ps.compose_dynamic_ps_source(obj.dynamic_ps_format, obj.dynamic_ps_text, now_playing)
+            frames = dynamic_ps.generate_ps_frames(source, obj.dynamic_ps_mode)
         except ValueError as exc:
             return f"Cannot preview: {exc}"
         if not frames:
@@ -96,7 +164,10 @@ class RBDSConfigAdmin(admin.ModelAdmin):
             "\n", "[{}] |{}|",
             ((f"{i + 1:>2}", frame) for i, frame in enumerate(frames)),
         )
-        return format_html('<pre style="margin:0;font-family:monospace">{}</pre>', lines)
+        return format_html(
+            '<pre style="margin:0;font-family:monospace">{}Resolved source:\n{}\n\nFrames:\n{}</pre>',
+            header, source, lines,
+        )
     generated_ps_preview.short_description = "Generated frame preview"
 
     def save_model(self, request, obj, form, change):

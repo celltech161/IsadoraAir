@@ -203,7 +203,13 @@ class RBDSManager:
         # no engine restart needed for an admin edit to take effect.
         self._rt_rotation._nowplaying_min_seconds = config.nowplaying_min_seconds
 
-        target_ps = self._resolve_target_ps(config)
+        # Same now_playing snapshot this tick already read for RT below --
+        # PS resolution must NOT re-read now_playing.json a second time
+        # (see _resolve_target_ps()'s own docstring, [P1] 2.3E) so PS and
+        # RT always see one coherent reading per tick, never two racing
+        # reads of a non-atomically-written file a fraction of a second
+        # apart.
+        target_ps = self._resolve_target_ps(config, now_playing)
 
         today = datetime.date.today()
         messages = list(RBDSMessage.objects.filter(enabled=True).order_by("sort_order"))
@@ -354,7 +360,7 @@ class RBDSManager:
 
         self._write_state(config, target_ps, rt_text, rt_source, rt_source_name)
 
-    def _resolve_target_ps(self, config):
+    def _resolve_target_ps(self, config, now_playing):
         """Resolves the current 8-char target PS per config.ps_mode
         (2026-08-18, [P1] 2.3C) -- Static PS / Manual PS Frames /
         Generated Rotating PS, exactly ONE of the three, never
@@ -375,13 +381,40 @@ class RBDSManager:
         single Manual frame that happens to equal Generated mode's own
         first frame+duration) and advance() alone has no way to tell
         those apart -- an explicit mode-change signal does. Changes to
-        the CONTENT feeding one mode (dynamic_ps_text/dynamic_ps_mode/
-        dynamic_ps_frame_seconds while still in Generated mode; which
-        RBDSPSFrame rows are enabled while still in Manual mode) are
-        deliberately NOT handled here -- PSRotation.advance()'s
-        existing frame-list-key comparison already restarts rotation
-        correctly for those on its own, with no extra bookkeeping
-        needed."""
+        the CONTENT feeding one mode (dynamic_ps_text/dynamic_ps_format/
+        dynamic_ps_mode/dynamic_ps_frame_seconds while still in
+        Generated mode; which RBDSPSFrame rows are enabled while still
+        in Manual mode) are deliberately NOT handled here --
+        PSRotation.advance()'s existing frame-list-key comparison
+        already restarts rotation correctly for those on its own, with
+        no extra bookkeeping needed -- this is exactly what makes a
+        now-playing TRACK CHANGE promptly restart Generated mode's
+        rotation too (2026-08-18, [P1] 2.3E): the composed source string
+        changes, so the frame list (and therefore its key) changes, and
+        advance() restarts on its own with no new reset-tracking code
+        needed here, the same as any other content edit in this mode
+        always has.
+
+        `now_playing` is the SAME snapshot _tick() already read once
+        this tick (never re-read here) -- only Generated mode ever
+        looks at it, and only to feed dynamic_ps.compose_dynamic_ps_source()
+        BEFORE generate_ps_frames() ever runs; see that function's own
+        docstring for the {now_playing}/{artist}/{title} placeholder
+        contract and the empty-now-playing fallback. Static and Manual
+        modes ignore `now_playing` (and dynamic_ps_format) completely --
+        neither one has any Dynamic-PS-flavored concept to compose.
+
+        Why this stays independent from RT/RT+ (see _resolve_rt_content
+        just below): that method's own `now_playing` argument feeds a
+        COMPLETELY SEPARATE rotation (RTRotation, promo-interrupt
+        model) that can and does substitute in weather/promo/message
+        text for now-playing per its own nowplaying_min_seconds timing.
+        Generated PS's composition here reads ONLY the raw `now_playing`
+        dict -- never rt_text, never rt_source, never anything
+        RTRotation decided -- so an active RT promo can never leak into
+        {now_playing}/{artist}/{title}. The two displays are allowed to
+        show genuinely different things at the same moment; that's
+        deliberate, not a gap to reconcile."""
         if config.ps_mode != self._last_ps_mode:
             self._ps_rotation.reset()
             self._last_ps_mode = config.ps_mode
@@ -403,7 +436,10 @@ class RBDSManager:
             return normalize_text(self._ps_rotation.advance(ps_frames) or config.station_ps or "")
 
         if config.ps_mode == "generated":
-            generated = dynamic_ps.generate_ps_frames(config.dynamic_ps_text, config.dynamic_ps_mode)
+            source = dynamic_ps.compose_dynamic_ps_source(
+                config.dynamic_ps_format, config.dynamic_ps_text, now_playing,
+            )
+            generated = dynamic_ps.generate_ps_frames(source, config.dynamic_ps_mode)
             ps_frames = [(frame, config.dynamic_ps_frame_seconds) for frame in generated]
             return normalize_text(self._ps_rotation.advance(ps_frames) or config.station_ps or "")
 
@@ -1018,8 +1054,10 @@ class RBDSManager:
             # only, matching current_ps's own "the value, not the whole
             # source" convention. dynamic_ps_mode is included only when
             # it's actually the relevant setting (ps_mode == generated);
-            # the full dynamic_ps_text source string and the generated
-            # frame list are deliberately never dumped here -- current_ps
+            # the raw dynamic_ps_text, the [P1] 2.3E composed source
+            # string (dynamic_ps_text + now-playing per
+            # dynamic_ps_format), song metadata, and the generated frame
+            # list are all deliberately never dumped here -- current_ps
             # already answers "what's on air right now," and dumping the
             # whole source/frame-list on every tick would bloat this
             # file for no diagnostic benefit this phase needs.

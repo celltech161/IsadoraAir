@@ -966,6 +966,214 @@ class DynamicPsFrameGeneratorTests(SimpleTestCase):
         self.assertEqual(len(results), 1)
 
 
+class DynamicPsFormatValidationTests(SimpleTestCase):
+    """dynamic_ps.validate_dynamic_ps_format() -- IsadoraAir roadmap
+    [P1] 2.3E (2026-08-18). Pure syntax validation, no DB/model
+    involvement -- RBDSConfigDynamicPsFormatFieldTests below covers the
+    model.clean() wiring on top of this."""
+
+    def test_default_text_only_is_valid(self):
+        dynamic_ps.validate_dynamic_ps_format("{text}")  # must not raise
+
+    def test_combined_now_playing_is_valid(self):
+        dynamic_ps.validate_dynamic_ps_format("{text} | Now Playing: {now_playing}")
+
+    def test_now_playing_leading_is_valid(self):
+        dynamic_ps.validate_dynamic_ps_format("Now Playing: {now_playing} | {text}")
+
+    def test_artist_and_title_tokens_valid(self):
+        dynamic_ps.validate_dynamic_ps_format("{artist} - {title}")
+
+    def test_all_four_fields_together_valid(self):
+        dynamic_ps.validate_dynamic_ps_format("{text} | {artist} | {title} | {now_playing}")
+
+    def test_plain_literal_text_with_no_fields_valid(self):
+        dynamic_ps.validate_dynamic_ps_format("Oak Grove Radio")
+
+    def test_escaped_literal_braces_valid(self):
+        dynamic_ps.validate_dynamic_ps_format("{{always shown}} {text}")
+
+    def test_unknown_placeholder_rejected(self):
+        with self.assertRaises(ValueError):
+            dynamic_ps.validate_dynamic_ps_format("{bogus}")
+
+    def test_unknown_placeholder_message_names_the_field(self):
+        with self.assertRaisesMessage(ValueError, "bogus"):
+            dynamic_ps.validate_dynamic_ps_format("{bogus}")
+
+    def test_attribute_access_rejected(self):
+        with self.assertRaises(ValueError):
+            dynamic_ps.validate_dynamic_ps_format("{text.upper}")
+
+    def test_indexing_rejected(self):
+        with self.assertRaises(ValueError):
+            dynamic_ps.validate_dynamic_ps_format("{text[0]}")
+
+    def test_conversion_specifier_rejected(self):
+        with self.assertRaises(ValueError):
+            dynamic_ps.validate_dynamic_ps_format("{text!r}")
+
+    def test_format_spec_rejected(self):
+        with self.assertRaises(ValueError):
+            dynamic_ps.validate_dynamic_ps_format("{text:>10}")
+
+    def test_bare_positional_placeholder_rejected(self):
+        with self.assertRaises(ValueError):
+            dynamic_ps.validate_dynamic_ps_format("{}")
+
+    def test_malformed_unmatched_brace_rejected(self):
+        with self.assertRaises(ValueError):
+            dynamic_ps.validate_dynamic_ps_format("{text")
+
+    def test_does_not_use_eval(self):
+        """Structural guard, not just behavioral -- validate_dynamic_ps_format
+        must never contain a call to eval() or exec()."""
+        import inspect
+        source = inspect.getsource(dynamic_ps.validate_dynamic_ps_format)
+        self.assertNotIn("eval(", source)
+        self.assertNotIn("exec(", source)
+
+
+class DynamicPsSourceCompositionTests(SimpleTestCase):
+    """dynamic_ps.compose_dynamic_ps_source() -- IsadoraAir roadmap
+    [P1] 2.3E (2026-08-18). Pure composition logic: no DB/network/
+    clock/filesystem access, deterministic. now_playing is always a
+    plain dict here, the same shape RBDSManager._read_now_playing()
+    returns -- never a file path or a mock of file I/O, since this
+    function never touches a file itself."""
+
+    def test_default_format_returns_text_verbatim(self):
+        result = dynamic_ps.compose_dynamic_ps_source("{text}", "Oak Grove Radio 98.5", {"artist": "", "title": ""})
+        self.assertEqual(result, "Oak Grove Radio 98.5")
+
+    def test_combined_format_both_artist_and_title(self):
+        result = dynamic_ps.compose_dynamic_ps_source(
+            "{text} | Now Playing: {now_playing}", "Oak Grove Radio 98.5",
+            {"artist": "John Prine", "title": "Angel From Montgomery"},
+        )
+        self.assertEqual(result, "Oak Grove Radio 98.5 | Now Playing: John Prine - Angel From Montgomery")
+
+    def test_now_playing_title_only(self):
+        result = dynamic_ps.compose_dynamic_ps_source(
+            "{text} | {now_playing}", "X", {"artist": "", "title": "Solo Title"},
+        )
+        self.assertEqual(result, "X | Solo Title")
+
+    def test_now_playing_artist_only(self):
+        result = dynamic_ps.compose_dynamic_ps_source(
+            "{text} | {now_playing}", "X", {"artist": "Solo Artist", "title": ""},
+        )
+        self.assertEqual(result, "X | Solo Artist")
+
+    def test_now_playing_neither_falls_back_to_text_alone(self):
+        """The example from the roadmap spec, verbatim: no dangling
+        'Oak Grove Radio 98.5 | Now Playing: ' when nothing is playing."""
+        result = dynamic_ps.compose_dynamic_ps_source(
+            "{text} | Now Playing: {now_playing}", "Oak Grove Radio 98.5", {"artist": "", "title": ""},
+        )
+        self.assertEqual(result, "Oak Grove Radio 98.5")
+
+    def test_now_playing_whitespace_only_counts_as_blank(self):
+        result = dynamic_ps.compose_dynamic_ps_source(
+            "{text} | Now Playing: {now_playing}", "Oak Grove Radio 98.5", {"artist": "   ", "title": "  "},
+        )
+        self.assertEqual(result, "Oak Grove Radio 98.5")
+
+    def test_artist_token_directly_blank_when_absent(self):
+        """{artist}/{title} used directly (not via {now_playing}) do
+        NOT get the collapse-to-text-alone fallback -- they simply
+        substitute as blank, per spec."""
+        result = dynamic_ps.compose_dynamic_ps_source("{text} | {artist}", "X", {"artist": "", "title": ""})
+        self.assertEqual(result, "X | ")
+
+    def test_title_token_directly_blank_when_absent(self):
+        result = dynamic_ps.compose_dynamic_ps_source("{text} | {title}", "X", {"artist": "", "title": ""})
+        self.assertEqual(result, "X | ")
+
+    def test_artist_and_title_tokens_combination(self):
+        result = dynamic_ps.compose_dynamic_ps_source(
+            "{artist} - {title}", "X", {"artist": "Rush", "title": "Tom Sawyer"},
+        )
+        self.assertEqual(result, "Rush - Tom Sawyer")
+
+    def test_all_four_fields_together(self):
+        result = dynamic_ps.compose_dynamic_ps_source(
+            "{text} | {artist} | {title} | {now_playing}", "STATION",
+            {"artist": "Rush", "title": "Tom Sawyer"},
+        )
+        self.assertEqual(result, "STATION | Rush | Tom Sawyer | Rush - Tom Sawyer")
+
+    def test_literal_surrounding_text_preserved(self):
+        result = dynamic_ps.compose_dynamic_ps_source(
+            "PREFIX>>{text}<<SUFFIX", "MID", {"artist": "", "title": ""},
+        )
+        self.assertEqual(result, "PREFIX>>MID<<SUFFIX")
+
+    def test_escaped_literal_braces_render_as_literal_braces(self):
+        result = dynamic_ps.compose_dynamic_ps_source("{{fixed}} {text}", "X", {"artist": "", "title": ""})
+        self.assertEqual(result, "{fixed} X")
+
+    def test_missing_now_playing_keys_treated_as_blank(self):
+        """A now_playing dict missing 'artist'/'title' keys entirely
+        (not just empty strings) must not raise. Uses {artist} directly
+        (not {now_playing}) since {now_playing} would trigger the
+        collapse-to-text-alone fallback for a fully-blank now_playing --
+        this test is specifically about missing KEYS being tolerated,
+        not about that fallback (see test_now_playing_neither_falls_back_to_text_alone
+        for that)."""
+        result = dynamic_ps.compose_dynamic_ps_source("{text} | {artist}", "X", {})
+        self.assertEqual(result, "X | ")
+
+    def test_deterministic_same_input_same_output(self):
+        args = ("{text} | Now Playing: {now_playing}", "Oak Grove Radio 98.5",
+                 {"artist": "John Prine", "title": "Angel From Montgomery"})
+        results = {dynamic_ps.compose_dynamic_ps_source(*args) for _ in range(5)}
+        self.assertEqual(len(results), 1)
+
+    def test_no_io_structurally(self):
+        """dynamic_ps.py as a whole must never import filesystem/
+        network/clock modules -- module-level structural guard,
+        covers both the pre-existing frame generator and the new
+        composition helpers added in [P1] 2.3E."""
+        import inspect
+        source = inspect.getsource(dynamic_ps)
+        for forbidden in ("import os", "import socket", "import requests", "open(", "import time", "import datetime"):
+            self.assertNotIn(forbidden, source)
+
+    def test_malformed_format_falls_back_to_text_alone_not_raise(self):
+        """Only reachable by bypassing admin validation (e.g. a direct
+        ORM write) -- see the function's own docstring. Must never
+        raise; falls back to dynamic_text."""
+        result = dynamic_ps.compose_dynamic_ps_source("{text", "Oak Grove Radio 98.5", {"artist": "", "title": ""})
+        self.assertEqual(result, "Oak Grove Radio 98.5")
+
+    def test_unknown_placeholder_in_format_falls_back_to_text_alone(self):
+        result = dynamic_ps.compose_dynamic_ps_source("{bogus}", "Oak Grove Radio 98.5", {"artist": "", "title": ""})
+        self.assertEqual(result, "Oak Grove Radio 98.5")
+
+    def test_composition_happens_before_frame_normalization_boundaries(self):
+        """Normalization-order guard: compose THEN generate_ps_frames()
+        -- boundaries are computed on the FINAL composed string, not on
+        dynamic_text or now-playing values separately. A smart
+        ellipsis in now-playing text expands (see charset.py) only
+        AFTER composition, and only generate_ps_frames() ever performs
+        that expansion -- so composing first and then generating frames
+        from the result must match manually normalizing the already-
+        composed string and chunking it, with no separate/competing
+        normalization anywhere in between."""
+        from rbds.services.charset import normalize_text
+        source = dynamic_ps.compose_dynamic_ps_source(
+            "{text} {now_playing}", "A", {"artist": "", "title": "B…C"},  # smart ellipsis
+        )
+        frames = dynamic_ps.generate_ps_frames(source, dynamic_ps.MODE_FIXED_CELLS)
+        expected_normalized = normalize_text(source)
+        self.assertEqual("".join(frames)[:len(expected_normalized)], expected_normalized)
+        # The raw composed source (pre-normalization) must still contain
+        # the literal ellipsis character -- confirms compose_dynamic_ps_source()
+        # itself did NOT normalize anything.
+        self.assertIn("…", source)
+
+
 class RTRotationTests(SimpleTestCase):
     def test_no_promos_stays_nowplaying(self):
         clock = FakeClock()
@@ -1658,44 +1866,44 @@ class RBDSManagerPsModeResolutionTests(TestCase):
     def test_static_ignores_enabled_manual_frames(self):
         RBDSPSFrame.objects.create(text="MANUAL1 ", enabled=True, hold_seconds=4)
         self.config.ps_mode = "static"
-        self.assertEqual(self.mgr._resolve_target_ps(self.config), "KOGR-LP ")
+        self.assertEqual(self.mgr._resolve_target_ps(self.config, {"title": "", "artist": ""}), "KOGR-LP ")
 
     def test_static_ignores_generated_settings(self):
         self.config.ps_mode = "static"
         self.config.dynamic_ps_text = "SHOULD NOT APPEAR"
-        self.assertEqual(self.mgr._resolve_target_ps(self.config), "KOGR-LP ")
+        self.assertEqual(self.mgr._resolve_target_ps(self.config, {"title": "", "artist": ""}), "KOGR-LP ")
 
     def test_static_sends_station_ps(self):
         self.config.ps_mode = "static"
         self.config.station_ps = "TESTPS  "
-        self.assertEqual(self.mgr._resolve_target_ps(self.config), "TESTPS  ")
+        self.assertEqual(self.mgr._resolve_target_ps(self.config, {"title": "", "artist": ""}), "TESTPS  ")
 
     # ---- Manual ----
 
     def test_manual_uses_enabled_rbdspsframe_rows(self):
         RBDSPSFrame.objects.create(text="FRAME1  ", enabled=True, hold_seconds=4, sort_order=0)
         self.config.ps_mode = "manual"
-        self.assertEqual(self.mgr._resolve_target_ps(self.config), "FRAME1  ")
+        self.assertEqual(self.mgr._resolve_target_ps(self.config, {"title": "", "artist": ""}), "FRAME1  ")
 
     def test_manual_preserves_per_row_hold_seconds(self):
         RBDSPSFrame.objects.create(text="FRAME1  ", enabled=True, hold_seconds=4, sort_order=0)
         RBDSPSFrame.objects.create(text="FRAME2  ", enabled=True, hold_seconds=6, sort_order=1)
         self.config.ps_mode = "manual"
-        self.assertEqual(self.mgr._resolve_target_ps(self.config), "FRAME1  ")
+        self.assertEqual(self.mgr._resolve_target_ps(self.config, {"title": "", "artist": ""}), "FRAME1  ")
         self.clock.advance(4)  # FRAME1's own 4s hold elapsed
-        self.assertEqual(self.mgr._resolve_target_ps(self.config), "FRAME2  ")
+        self.assertEqual(self.mgr._resolve_target_ps(self.config, {"title": "", "artist": ""}), "FRAME2  ")
         self.clock.advance(5)  # < FRAME2's own 6s hold
-        self.assertEqual(self.mgr._resolve_target_ps(self.config), "FRAME2  ")
+        self.assertEqual(self.mgr._resolve_target_ps(self.config, {"title": "", "artist": ""}), "FRAME2  ")
         self.clock.advance(1.1)  # now >= 6s
-        self.assertEqual(self.mgr._resolve_target_ps(self.config), "FRAME1  ")  # wrapped
+        self.assertEqual(self.mgr._resolve_target_ps(self.config, {"title": "", "artist": ""}), "FRAME1  ")  # wrapped
 
     def test_manual_disabled_rows_ignored(self):
         RBDSPSFrame.objects.create(text="ENABLED ", enabled=True, hold_seconds=4, sort_order=0)
         RBDSPSFrame.objects.create(text="DISABLED", enabled=False, hold_seconds=4, sort_order=1)
         self.config.ps_mode = "manual"
-        result1 = self.mgr._resolve_target_ps(self.config)
+        result1 = self.mgr._resolve_target_ps(self.config, {"title": "", "artist": ""})
         self.clock.advance(100)
-        result2 = self.mgr._resolve_target_ps(self.config)
+        result2 = self.mgr._resolve_target_ps(self.config, {"title": "", "artist": ""})
         self.assertEqual(result1, "ENABLED ")
         self.assertEqual(result2, "ENABLED ")  # only one enabled frame -- never advances away
 
@@ -1703,7 +1911,7 @@ class RBDSManagerPsModeResolutionTests(TestCase):
         RBDSPSFrame.objects.create(text="DISABLED", enabled=False, hold_seconds=4)
         self.config.ps_mode = "manual"
         self.config.station_ps = "FALLBACK"
-        self.assertEqual(self.mgr._resolve_target_ps(self.config), "FALLBACK")
+        self.assertEqual(self.mgr._resolve_target_ps(self.config, {"title": "", "artist": ""}), "FALLBACK")
 
     # ---- Generated ----
 
@@ -1712,41 +1920,41 @@ class RBDSManagerPsModeResolutionTests(TestCase):
         self.config.dynamic_ps_text = "HELLO WORLD"
         self.config.dynamic_ps_mode = 2
         self.config.dynamic_ps_frame_seconds = 4
-        self.assertEqual(self.mgr._resolve_target_ps(self.config), "HELLO   ")
+        self.assertEqual(self.mgr._resolve_target_ps(self.config, {"title": "", "artist": ""}), "HELLO   ")
 
     def test_generated_feeds_sequence_into_ps_rotation_with_common_interval(self):
         self.config.ps_mode = "generated"
         self.config.dynamic_ps_text = "HELLO WORLD"
         self.config.dynamic_ps_mode = 2
         self.config.dynamic_ps_frame_seconds = 4
-        self.assertEqual(self.mgr._resolve_target_ps(self.config), "HELLO   ")
+        self.assertEqual(self.mgr._resolve_target_ps(self.config, {"title": "", "artist": ""}), "HELLO   ")
         self.clock.advance(3.9)
-        self.assertEqual(self.mgr._resolve_target_ps(self.config), "HELLO   ")  # not due yet
+        self.assertEqual(self.mgr._resolve_target_ps(self.config, {"title": "", "artist": ""}), "HELLO   ")  # not due yet
         self.clock.advance(0.2)  # total 4.1s
-        self.assertEqual(self.mgr._resolve_target_ps(self.config), "WORLD   ")
+        self.assertEqual(self.mgr._resolve_target_ps(self.config, {"title": "", "artist": ""}), "WORLD   ")
 
     def test_generated_text_edit_restarts_at_frame_zero(self):
         self.config.ps_mode = "generated"
         self.config.dynamic_ps_text = "HELLO WORLD"
         self.config.dynamic_ps_mode = 2
         self.config.dynamic_ps_frame_seconds = 4
-        self.assertEqual(self.mgr._resolve_target_ps(self.config), "HELLO   ")
+        self.assertEqual(self.mgr._resolve_target_ps(self.config, {"title": "", "artist": ""}), "HELLO   ")
         self.clock.advance(4)
-        self.assertEqual(self.mgr._resolve_target_ps(self.config), "WORLD   ")
+        self.assertEqual(self.mgr._resolve_target_ps(self.config, {"title": "", "artist": ""}), "WORLD   ")
         # Text changed mid-rotation -- must restart at the NEW
         # sequence's own frame 0, not continue at whatever index the
         # OLD sequence was on.
         self.config.dynamic_ps_text = "GOODBYE"
-        self.assertEqual(self.mgr._resolve_target_ps(self.config), "GOODBYE ")
+        self.assertEqual(self.mgr._resolve_target_ps(self.config, {"title": "", "artist": ""}), "GOODBYE ")
 
     def test_generated_mode_edit_restarts_at_frame_zero(self):
         self.config.ps_mode = "generated"
         self.config.dynamic_ps_text = "AAAA BBBB"
         self.config.dynamic_ps_mode = 2  # word-aligned -> ["AAAA    ", "BBBB    "]
         self.config.dynamic_ps_frame_seconds = 4
-        self.assertEqual(self.mgr._resolve_target_ps(self.config), "AAAA    ")
+        self.assertEqual(self.mgr._resolve_target_ps(self.config, {"title": "", "artist": ""}), "AAAA    ")
         self.clock.advance(4)
-        self.assertEqual(self.mgr._resolve_target_ps(self.config), "BBBB    ")  # now at index 1
+        self.assertEqual(self.mgr._resolve_target_ps(self.config, {"title": "", "artist": ""}), "BBBB    ")  # now at index 1
 
         # Switch to Mode 0 (fixed 8-char cells) -- "AAAA BBBB" (9 chars)
         # -> ["AAAA BBB", "B       "], a frame-0 that matches NEITHER
@@ -1754,23 +1962,23 @@ class RBDSManagerPsModeResolutionTests(TestCase):
         # restarted at the NEW sequence's frame 0 rather than
         # continuing at Mode 2's index 1.
         self.config.dynamic_ps_mode = 0
-        self.assertEqual(self.mgr._resolve_target_ps(self.config), "AAAA BBB")
+        self.assertEqual(self.mgr._resolve_target_ps(self.config, {"title": "", "artist": ""}), "AAAA BBB")
 
     def test_generated_interval_edit_restarts_timing_appropriately(self):
         self.config.ps_mode = "generated"
         self.config.dynamic_ps_text = "HELLO WORLD"
         self.config.dynamic_ps_mode = 2
         self.config.dynamic_ps_frame_seconds = 4
-        self.assertEqual(self.mgr._resolve_target_ps(self.config), "HELLO   ")
+        self.assertEqual(self.mgr._resolve_target_ps(self.config, {"title": "", "artist": ""}), "HELLO   ")
         self.clock.advance(3)  # 3s elapsed under the OLD 4s interval -- not yet due
         self.config.dynamic_ps_frame_seconds = 3  # shortened (still >=3, valid for Mode 2)
         # Immediately after the edit (0s elapsed under the NEW timer),
         # must still be frame 0 -- proves the timer restarted from THIS
         # moment rather than treating the 3s already elapsed under the
         # OLD interval as already satisfying the NEW, shorter one.
-        self.assertEqual(self.mgr._resolve_target_ps(self.config), "HELLO   ")
+        self.assertEqual(self.mgr._resolve_target_ps(self.config, {"title": "", "artist": ""}), "HELLO   ")
         self.clock.advance(3)  # 3s since the interval-edit moment
-        self.assertEqual(self.mgr._resolve_target_ps(self.config), "WORLD   ")
+        self.assertEqual(self.mgr._resolve_target_ps(self.config, {"title": "", "artist": ""}), "WORLD   ")
 
 
 class RBDSManagerPsModeSwitchingTests(TestCase):
@@ -1795,52 +2003,283 @@ class RBDSManagerPsModeSwitchingTests(TestCase):
 
     def test_static_to_generated_begins_at_frame_zero(self):
         self.config.ps_mode = "static"
-        self.assertEqual(self.mgr._resolve_target_ps(self.config), "STATIC  ")
+        self.assertEqual(self.mgr._resolve_target_ps(self.config, {"title": "", "artist": ""}), "STATIC  ")
         self.config.ps_mode = "generated"
         expected_first = dynamic_ps.generate_ps_frames(self.config.dynamic_ps_text, self.config.dynamic_ps_mode)[0]
-        self.assertEqual(self.mgr._resolve_target_ps(self.config), expected_first)
+        self.assertEqual(self.mgr._resolve_target_ps(self.config, {"title": "", "artist": ""}), expected_first)
 
     def test_generated_to_static_immediately_returns_station_ps(self):
         self.config.ps_mode = "generated"
-        self.mgr._resolve_target_ps(self.config)
+        self.mgr._resolve_target_ps(self.config, {"title": "", "artist": ""})
         self.clock.advance(4)
-        self.mgr._resolve_target_ps(self.config)  # now on generated frame index 1
+        self.mgr._resolve_target_ps(self.config, {"title": "", "artist": ""})  # now on generated frame index 1
         self.config.ps_mode = "static"
-        self.assertEqual(self.mgr._resolve_target_ps(self.config), "STATIC  ")
+        self.assertEqual(self.mgr._resolve_target_ps(self.config, {"title": "", "artist": ""}), "STATIC  ")
 
     def test_generated_to_manual_begins_at_frame_zero(self):
         RBDSPSFrame.objects.create(text="MANUAL1 ", enabled=True, hold_seconds=4, sort_order=0)
         RBDSPSFrame.objects.create(text="MANUAL2 ", enabled=True, hold_seconds=4, sort_order=1)
         self.config.ps_mode = "generated"
-        self.mgr._resolve_target_ps(self.config)
+        self.mgr._resolve_target_ps(self.config, {"title": "", "artist": ""})
         self.clock.advance(4)
-        self.mgr._resolve_target_ps(self.config)  # generated frame index 1
+        self.mgr._resolve_target_ps(self.config, {"title": "", "artist": ""})  # generated frame index 1
         self.config.ps_mode = "manual"
-        self.assertEqual(self.mgr._resolve_target_ps(self.config), "MANUAL1 ")
+        self.assertEqual(self.mgr._resolve_target_ps(self.config, {"title": "", "artist": ""}), "MANUAL1 ")
 
     def test_manual_to_generated_begins_at_frame_zero(self):
         RBDSPSFrame.objects.create(text="MANUAL1 ", enabled=True, hold_seconds=4, sort_order=0)
         RBDSPSFrame.objects.create(text="MANUAL2 ", enabled=True, hold_seconds=4, sort_order=1)
         self.config.ps_mode = "manual"
-        self.mgr._resolve_target_ps(self.config)
+        self.mgr._resolve_target_ps(self.config, {"title": "", "artist": ""})
         self.clock.advance(4)
-        self.mgr._resolve_target_ps(self.config)  # manual frame index 1
+        self.mgr._resolve_target_ps(self.config, {"title": "", "artist": ""})  # manual frame index 1
         self.config.ps_mode = "generated"
         expected_first = dynamic_ps.generate_ps_frames(self.config.dynamic_ps_text, self.config.dynamic_ps_mode)[0]
-        self.assertEqual(self.mgr._resolve_target_ps(self.config), expected_first)
+        self.assertEqual(self.mgr._resolve_target_ps(self.config, {"title": "", "artist": ""}), expected_first)
 
     def test_switching_away_and_back_does_not_resume_stale_state(self):
         self.config.ps_mode = "generated"
-        first = self.mgr._resolve_target_ps(self.config)
+        first = self.mgr._resolve_target_ps(self.config, {"title": "", "artist": ""})
         self.clock.advance(4)
-        second = self.mgr._resolve_target_ps(self.config)
+        second = self.mgr._resolve_target_ps(self.config, {"title": "", "artist": ""})
         self.assertNotEqual(first, second)  # confirm real progress happened
         self.config.ps_mode = "static"
-        self.mgr._resolve_target_ps(self.config)
+        self.mgr._resolve_target_ps(self.config, {"title": "", "artist": ""})
         self.config.ps_mode = "generated"
         # Must restart at the SAME first frame as originally -- not
         # resume at `second`, wherever it was before switching away.
-        self.assertEqual(self.mgr._resolve_target_ps(self.config), first)
+        self.assertEqual(self.mgr._resolve_target_ps(self.config, {"title": "", "artist": ""}), first)
+
+
+class RBDSManagerGeneratedPsNowPlayingCompositionTests(TestCase):
+    """Manager-level integration for dynamic_ps_format/now-playing
+    composition in Generated Rotating PS -- IsadoraAir roadmap [P1]
+    2.3E (2026-08-18). Exercises the real _resolve_target_ps() ->
+    dynamic_ps.compose_dynamic_ps_source() -> dynamic_ps.generate_ps_frames()
+    -> PSRotation.advance() chain with a FakeClock, same pattern as
+    RBDSManagerPsModeResolutionTests. now_playing is always passed
+    explicitly here -- this class is entirely about WHICH composed
+    source gets rotated through, not about now_playing.json file I/O
+    (see RBDSManagerTickNowPlayingSnapshotTests below for that)."""
+
+    def setUp(self):
+        self.clock = FakeClock()
+        self.mgr = RBDSManager()
+        self.mgr._ps_rotation = PSRotation(clock=self.clock)
+        self.config = RBDSConfig.load()
+        self.config.ps_mode = "generated"
+        self.config.dynamic_ps_text = "Oak Grove Radio 98.5"
+        self.config.dynamic_ps_format = "{text} | Now Playing: {now_playing}"
+        self.config.dynamic_ps_mode = 2  # word-aligned
+        self.config.dynamic_ps_frame_seconds = 4
+        self.config.station_ps = "KOGR-LP "
+        self.config.save()
+        self.now_playing = {"artist": "John Prine", "title": "Angel From Montgomery"}
+
+    def _expected_frames(self, mode=None, now_playing=None):
+        mode = self.config.dynamic_ps_mode if mode is None else mode
+        now_playing = self.now_playing if now_playing is None else now_playing
+        source = dynamic_ps.compose_dynamic_ps_source(self.config.dynamic_ps_format, self.config.dynamic_ps_text,
+                                                        now_playing)
+        return dynamic_ps.generate_ps_frames(source, mode)
+
+    # ---- Static/Manual ignore now-playing and format entirely ----
+
+    def test_static_mode_ignores_now_playing_and_format(self):
+        self.config.ps_mode = "static"
+        self.config.station_ps = "STATIC  "
+        result = self.mgr._resolve_target_ps(self.config, self.now_playing)
+        self.assertEqual(result, "STATIC  ")
+
+    def test_manual_mode_ignores_now_playing_and_format(self):
+        RBDSPSFrame.objects.create(text="MANUAL1 ", enabled=True, hold_seconds=4, sort_order=0)
+        self.config.ps_mode = "manual"
+        result = self.mgr._resolve_target_ps(self.config, self.now_playing)
+        self.assertEqual(result, "MANUAL1 ")
+
+    # ---- Generated mode composes and rotates the result ----
+
+    def test_generated_uses_composed_source(self):
+        expected = self._expected_frames()
+        result = self.mgr._resolve_target_ps(self.config, self.now_playing)
+        self.assertEqual(result, expected[0])
+        # Confirms composition actually happened -- the composed
+        # source (dynamic_ps_text + now-playing) is longer than
+        # dynamic_ps_text alone, so it must produce MORE frames.
+        # (Frame 0 itself is "Oak     " either way, since Mode 2 chunks
+        # word-by-word and "Oak" is the first word regardless of what
+        # follows -- not a meaningful comparison point on its own.)
+        text_only = dynamic_ps.generate_ps_frames(self.config.dynamic_ps_text, self.config.dynamic_ps_mode)
+        self.assertGreater(len(expected), len(text_only))
+
+    def test_composed_source_goes_through_mode_0(self):
+        self.config.dynamic_ps_mode = 0
+        expected = self._expected_frames(mode=0)
+        result = self.mgr._resolve_target_ps(self.config, self.now_playing)
+        self.assertEqual(result, expected[0])
+
+    def test_composed_source_goes_through_mode_1(self):
+        self.config.dynamic_ps_mode = 1
+        self.config.dynamic_ps_frame_seconds = 1
+        expected = self._expected_frames(mode=1)
+        result = self.mgr._resolve_target_ps(self.config, self.now_playing)
+        self.assertEqual(result, expected[0])
+
+    def test_composed_source_goes_through_mode_2(self):
+        self.config.dynamic_ps_mode = 2
+        expected = self._expected_frames(mode=2)
+        result = self.mgr._resolve_target_ps(self.config, self.now_playing)
+        self.assertEqual(result, expected[0])
+
+    def test_composed_source_goes_through_mode_3(self):
+        self.config.dynamic_ps_mode = 3
+        self.config.dynamic_ps_frame_seconds = 1
+        expected = self._expected_frames(mode=3)
+        result = self.mgr._resolve_target_ps(self.config, self.now_playing)
+        self.assertEqual(result, expected[0])
+
+    def test_frame_seconds_unchanged_for_composed_source(self):
+        expected = self._expected_frames()
+        self.assertGreater(len(expected), 1)  # sanity: real multi-frame sequence
+        first = self.mgr._resolve_target_ps(self.config, self.now_playing)
+        self.assertEqual(first, expected[0])
+        self.clock.advance(3.9)
+        self.assertEqual(self.mgr._resolve_target_ps(self.config, self.now_playing), expected[0])  # not due yet
+        self.clock.advance(0.2)  # total 4.1s -- config.dynamic_ps_frame_seconds unchanged at 4
+        self.assertEqual(self.mgr._resolve_target_ps(self.config, self.now_playing), expected[1])
+
+    # ---- Track change / reset behavior ----
+
+    def test_now_playing_change_restarts_rotation_at_frame_zero(self):
+        first_track = self.now_playing
+        second_track = {"artist": "New Artist", "title": "New Title"}
+        self.assertEqual(
+            self.mgr._resolve_target_ps(self.config, first_track), self._expected_frames(now_playing=first_track)[0],
+        )
+        self.clock.advance(4)
+        self.assertEqual(
+            self.mgr._resolve_target_ps(self.config, first_track), self._expected_frames(now_playing=first_track)[1],
+        )  # now at index 1 of the FIRST track's composed sequence
+
+        # New track arrives -- must restart at index 0 of the NEW
+        # composed sequence, not continue at index 1 of the old one.
+        expected_second = self._expected_frames(now_playing=second_track)
+        result = self.mgr._resolve_target_ps(self.config, second_track)
+        self.assertEqual(result, expected_second[0])
+        self.assertNotEqual(result, expected_second[1] if len(expected_second) > 1 else None)
+
+    def test_unchanged_now_playing_does_not_restart_mid_rotation(self):
+        """A no-op re-resolution with the IDENTICAL now_playing dict
+        (simulating consecutive ticks where nothing changed) must not
+        reset progress -- same principle as PSRotation.advance()'s own
+        frame-list-key comparison already guarantees for any other
+        unchanged content."""
+        expected = self._expected_frames()
+        self.mgr._resolve_target_ps(self.config, self.now_playing)
+        self.clock.advance(4)
+        second = self.mgr._resolve_target_ps(self.config, dict(self.now_playing))  # equal but NOT the same object
+        self.assertEqual(second, expected[1])
+        third = self.mgr._resolve_target_ps(self.config, dict(self.now_playing))
+        self.assertEqual(third, expected[1])  # still index 1 -- no reset from the repeated identical read
+
+    def test_empty_now_playing_falls_back_to_dynamic_ps_text_cleanly(self):
+        empty = {"artist": "", "title": ""}
+        expected = dynamic_ps.generate_ps_frames(self.config.dynamic_ps_text, self.config.dynamic_ps_mode)
+        result = self.mgr._resolve_target_ps(self.config, empty)
+        self.assertEqual(result, expected[0])
+
+    def test_title_only_now_playing(self):
+        title_only = {"artist": "", "title": "Solo Title"}
+        expected = self._expected_frames(now_playing=title_only)
+        result = self.mgr._resolve_target_ps(self.config, title_only)
+        self.assertEqual(result, expected[0])
+
+    def test_artist_only_now_playing(self):
+        artist_only = {"artist": "Solo Artist", "title": ""}
+        expected = self._expected_frames(now_playing=artist_only)
+        result = self.mgr._resolve_target_ps(self.config, artist_only)
+        self.assertEqual(result, expected[0])
+
+    # ---- PS/RT independence ----
+
+    def test_rt_promo_active_does_not_leak_into_ps_now_playing(self):
+        """[P1] 2.3E regression, explicitly required by the roadmap:
+        Generated PS's {now_playing} composition must read ONLY the raw
+        now_playing dict passed into _resolve_target_ps() -- never
+        anything RTRotation/_resolve_rt_content() decided, even while an
+        RT promo is actively overriding RadioText at the same moment."""
+        self.config.dynamic_ps_mode = 0  # fixed cells -- simplest to reason about frame 0
+        self.config.dynamic_ps_format = "{text}|{now_playing}"
+        self.config.dynamic_ps_text = "STATION"
+        self.config.save()
+        now_playing = {"artist": "Rush", "title": "Tom Sawyer"}
+
+        message = RBDSMessage.objects.create(
+            name="Weather", source_type="static", text="SEVERE WEATHER WARNING",
+            enabled=True, display_seconds=10,
+        )
+        rt_text, _artist, _title = self.mgr._resolve_rt_content(
+            self.config, now_playing, "promo", "Weather", {"Weather": message},
+        )
+        self.assertEqual(rt_text, "SEVERE WEATHER WARNING")  # sanity: RT really is showing the promo
+
+        expected_first_frame = self._expected_frames(mode=0, now_playing=now_playing)[0]
+        ps = self.mgr._resolve_target_ps(self.config, now_playing)
+        self.assertEqual(ps, expected_first_frame)
+        self.assertNotIn("WEATHER", ps)
+        self.assertNotIn("SEVERE", ps)
+
+
+@mock.patch("rbds.services.rbds_manager.close_old_connections", new=lambda: None)
+class RBDSManagerTickNowPlayingSnapshotTests(TestCase):
+    """_tick() must read now_playing.json exactly ONCE per tick and
+    hand that SAME snapshot to both RT and PS resolution -- IsadoraAir
+    roadmap [P1] 2.3E (2026-08-18). Runs a real (mocked-transport)
+    _tick() rather than calling _resolve_target_ps() directly, since
+    the double-read regression this guards against can only happen at
+    the _tick() orchestration level.
+
+    close_old_connections() is patched to a no-op for this whole class
+    -- calling the real one mid-_tick() closes the connection Django's
+    TestCase wraps in an atomic block (see RBDSManagerOneShotToggleTests'
+    own docstring for the full explanation); pure connection-pool
+    hygiene with no bearing on what these tests actually verify."""
+
+    def setUp(self):
+        self.mgr = RBDSManager()
+        self.mgr._transmit = mock.Mock()
+        self.mgr._read_category_state = mock.Mock(return_value={"pty_override": None, "ptyn": ""})
+        self.tmpdir = tempfile.mkdtemp(prefix="isadoraair-rbds-tick-test-")
+        self.addCleanup(shutil.rmtree, self.tmpdir, ignore_errors=True)
+        self.state_path = Path(self.tmpdir) / "rbds_state.json"
+        patcher = mock.patch.object(rbds_manager, "STATE_PATH", self.state_path)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+        self.config = RBDSConfig.load()
+        self.config.ps_mode = "generated"
+        self.config.dynamic_ps_text = "Oak Grove Radio 98.5"
+        self.config.dynamic_ps_format = "{text} | {now_playing}"
+        self.config.dynamic_ps_mode = 0
+        self.config.dynamic_ps_frame_seconds = 4
+        self.config.send_ct = False
+        self.config.save()
+
+    def test_read_now_playing_called_exactly_once_per_tick(self):
+        self.mgr._read_now_playing = mock.Mock(return_value={"title": "Angel From Montgomery", "artist": "John Prine"})
+        self.mgr._tick()
+        self.mgr._read_now_playing.assert_called_once()
+
+    def test_ps_reflects_the_same_snapshot_rt_used(self):
+        now_playing = {"title": "Angel From Montgomery", "artist": "John Prine"}
+        self.mgr._read_now_playing = mock.Mock(return_value=now_playing)
+        self.mgr._tick()
+        state = json.loads(self.state_path.read_text())
+        expected = dynamic_ps.compose_dynamic_ps_source(self.config.dynamic_ps_format, self.config.dynamic_ps_text,
+                                                          now_playing)
+        expected_first_frame = dynamic_ps.generate_ps_frames(expected, self.config.dynamic_ps_mode)[0]
+        self.assertEqual(state["current_ps"], expected_first_frame)
+        self.assertEqual(state["current_rt"], "John Prine - Angel From Montgomery")
 
 
 class GeneratedPsReachesExistingTransportPathTests(TestCase):
@@ -1869,7 +2308,7 @@ class GeneratedPsReachesExistingTransportPathTests(TestCase):
 
     def test_generated_frame_reaches_uecp_mec_ps_unchanged(self):
         self.mgr._ps_rotation = PSRotation(clock=FakeClock())
-        target_ps = self.mgr._resolve_target_ps(self.config)
+        target_ps = self.mgr._resolve_target_ps(self.config, {"title": "", "artist": ""})
         self.assertEqual(target_ps, "TESTFRAM")  # Mode 0, first 8 of "TESTFRAME"
 
         ok = self.mgr._send(self.config, target_ps, "some rt", None, None)
@@ -1888,7 +2327,7 @@ class GeneratedPsReachesExistingTransportPathTests(TestCase):
         self.config.protocol = "ascii"
         self.config.save()
         self.mgr._ps_rotation = PSRotation(clock=FakeClock())
-        target_ps = self.mgr._resolve_target_ps(self.config)
+        target_ps = self.mgr._resolve_target_ps(self.config, {"title": "", "artist": ""})
 
         ok = self.mgr._send(self.config, target_ps, "some rt", None, None)
         self.assertTrue(ok)
@@ -2018,6 +2457,14 @@ class RBDSConfigAdminRestartScopingTests(TestCase):
         self._save(["ps_mode"])
         mock_popen.assert_not_called()
 
+    def test_dynamic_ps_format_edit_does_not_restart(self, mock_popen):
+        """[P1] 2.3E regression, explicitly required by the roadmap:
+        dynamic_ps_format is content configuration, same as
+        dynamic_ps_text/dynamic_ps_mode above -- saving it alone must
+        never restart isadoraair-rbds."""
+        self._save(["dynamic_ps_format"])
+        mock_popen.assert_not_called()
+
     def test_no_fields_changed_does_not_restart(self, mock_popen):
         self._save([])
         mock_popen.assert_not_called()
@@ -2087,6 +2534,122 @@ class RBDSConfigAdminGeneratedPsPreviewTests(TestCase):
     def test_preview_never_raises_on_none_object(self):
         result = self.model_admin.generated_ps_preview(None)
         self.assertIsInstance(result, str)
+
+
+class RBDSConfigAdminGeneratedPsFormatPreviewTests(TestCase):
+    """generated_ps_preview()'s [P1] 2.3E additions (2026-08-18): shows
+    the resolved SOURCE (not just frames) using the real
+    dynamic_ps.compose_dynamic_ps_source(), and handles a
+    now-playing-unavailable read gracefully. rbds.admin._read_current_now_playing
+    is mocked directly (a plain module-level function, not an
+    RBDSManager method) -- never RBDSManager itself, matching the
+    spec's explicit "do not instantiate RBDSManager" constraint."""
+
+    def setUp(self):
+        self.site = django_admin.AdminSite()
+        self.model_admin = RBDSConfigAdmin(RBDSConfig, self.site)
+        self.config = RBDSConfig.load()
+        self.config.ps_mode = "generated"
+        self.config.dynamic_ps_text = "Oak Grove Radio 98.5"
+        self.config.dynamic_ps_format = "{text} | Now Playing: {now_playing}"
+        self.config.dynamic_ps_mode = 2
+        self.config.save()
+
+    def test_dynamic_ps_format_field_in_fieldset(self):
+        ps_fieldset = next(fs for name, fs in self.model_admin.fieldsets if name == "Program Service (PS)")
+        self.assertIn("dynamic_ps_format", ps_fieldset["fields"])
+        # Logically placed right after Dynamic PS Text, per spec.
+        fields = ps_fieldset["fields"]
+        self.assertEqual(fields.index("dynamic_ps_format"), fields.index("dynamic_ps_text") + 1)
+
+    def test_preview_shows_resolved_source_using_real_composer(self):
+        with mock.patch("rbds.admin._read_current_now_playing",
+                         return_value={"artist": "Rush", "title": "Tom Sawyer"}):
+            rendered = str(self.model_admin.generated_ps_preview(self.config))
+        expected_source = dynamic_ps.compose_dynamic_ps_source(
+            self.config.dynamic_ps_format, self.config.dynamic_ps_text, {"artist": "Rush", "title": "Tom Sawyer"},
+        )
+        self.assertIn(expected_source, rendered)
+        self.assertIn("Resolved source", rendered)
+
+    def test_preview_shows_frames_of_the_composed_source_not_raw_text(self):
+        with mock.patch("rbds.admin._read_current_now_playing",
+                         return_value={"artist": "Rush", "title": "Tom Sawyer"}):
+            rendered = str(self.model_admin.generated_ps_preview(self.config))
+        expected_source = dynamic_ps.compose_dynamic_ps_source(
+            self.config.dynamic_ps_format, self.config.dynamic_ps_text, {"artist": "Rush", "title": "Tom Sawyer"},
+        )
+        expected_frames = dynamic_ps.generate_ps_frames(expected_source, self.config.dynamic_ps_mode)
+        self.assertIn(f"|{expected_frames[0]}|", rendered)
+        # Confirms composition actually ran -- frames must differ from
+        # what dynamic_ps_text ALONE would have produced.
+        text_only_frames = dynamic_ps.generate_ps_frames(self.config.dynamic_ps_text, self.config.dynamic_ps_mode)
+        self.assertNotEqual(expected_frames, text_only_frames)
+
+    def test_preview_handles_unavailable_now_playing_gracefully(self):
+        with mock.patch("rbds.admin._read_current_now_playing", return_value=None):
+            rendered = str(self.model_admin.generated_ps_preview(self.config))
+        self.assertIn("unavailable", rendered.lower())
+        self.assertNotIn("Traceback", rendered)
+        # Falls back to composing with no now-playing data -- for this
+        # format, that's dynamic_ps_text alone (empty-now-playing
+        # fallback, same rule compose_dynamic_ps_source() always uses).
+        self.assertIn(self.config.dynamic_ps_text, rendered)
+
+    def test_preview_uses_default_text_only_format_unaffected_by_now_playing(self):
+        self.config.dynamic_ps_format = "{text}"
+        self.config.save()
+        with mock.patch("rbds.admin._read_current_now_playing",
+                         return_value={"artist": "Rush", "title": "Tom Sawyer"}):
+            rendered = str(self.model_admin.generated_ps_preview(self.config))
+        self.assertIn("Oak Grove Radio 98.5", rendered)
+        self.assertNotIn("Rush", rendered)
+
+    def test_preview_never_raises_on_invalid_format_bypassing_admin_validation(self):
+        """Direct ORM write bypassing clean() (e.g. a stale fixture) --
+        the preview must show a concise error, never a traceback."""
+        RBDSConfig.objects.filter(pk=self.config.pk).update(dynamic_ps_format="{bogus}")
+        self.config.refresh_from_db()
+        with mock.patch("rbds.admin._read_current_now_playing", return_value={"artist": "", "title": ""}):
+            rendered = str(self.model_admin.generated_ps_preview(self.config))
+        self.assertIsInstance(rendered, str)
+        self.assertNotIn("Traceback", rendered)
+
+
+class AdminReadCurrentNowPlayingTests(SimpleTestCase):
+    """rbds.admin._read_current_now_playing() itself -- IsadoraAir
+    roadmap [P1] 2.3E (2026-08-18). A one-shot read with no last-good
+    caching (unlike RBDSManager._read_now_playing()) -- see that
+    function's own docstring. _NOW_PLAYING_PATH is redirected to a temp
+    location for every test here, never the real
+    /run/isadoraair/now_playing.json."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp(prefix="isadoraair-admin-nowplaying-test-")
+        self.addCleanup(shutil.rmtree, self.tmpdir, ignore_errors=True)
+        self.path = Path(self.tmpdir) / "now_playing.json"
+        patcher = mock.patch("rbds.admin._NOW_PLAYING_PATH", self.path)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_missing_file_returns_none(self):
+        from rbds.admin import _read_current_now_playing
+        self.assertIsNone(_read_current_now_playing())
+
+    def test_torn_invalid_json_returns_none(self):
+        from rbds.admin import _read_current_now_playing
+        self.path.write_text("{not valid json", encoding="utf-8")
+        self.assertIsNone(_read_current_now_playing())
+
+    def test_valid_file_returns_parsed_dict(self):
+        from rbds.admin import _read_current_now_playing
+        self.path.write_text(json.dumps({"artist": "Rush", "title": "Tom Sawyer"}), encoding="utf-8")
+        self.assertEqual(_read_current_now_playing(), {"artist": "Rush", "title": "Tom Sawyer"})
+
+    def test_never_raises_on_permission_error(self):
+        from rbds.admin import _read_current_now_playing
+        with mock.patch("rbds.admin.Path.read_text", side_effect=PermissionError("denied")):
+            self.assertIsNone(_read_current_now_playing())
 
 
 class RtPlusMecCompositionTests(SimpleTestCase):
@@ -2345,6 +2908,93 @@ class RBDSConfigDynamicPsFieldsTests(SimpleTestCase):
         config = RBDSConfig(ps_mode="generated", dynamic_ps_text="X", dynamic_ps_mode=3, dynamic_ps_frame_seconds=0)
         with self.assertRaises(ValidationError):
             config.clean()
+
+
+class RBDSConfigDynamicPsFormatFieldTests(SimpleTestCase):
+    """RBDSConfig.dynamic_ps_format -- IsadoraAir roadmap [P1] 2.3E
+    (2026-08-18). Model-level default/clean() wiring on top of
+    dynamic_ps.validate_dynamic_ps_format() (see
+    DynamicPsFormatValidationTests for the pure syntax-rule tests this
+    class does not re-litigate). No DB access needed -- clean() is a
+    pure in-memory check, same pattern as RBDSConfigDynamicPsFieldsTests
+    above."""
+
+    def test_default_is_bare_text_placeholder(self):
+        """THE critical backward-compatibility default -- see
+        DynamicPsFormatBackwardCompatibilityTests for the full
+        before/after-migration behavioral proof."""
+        self.assertEqual(RBDSConfig().dynamic_ps_format, "{text}")
+
+    def test_default_passes_clean(self):
+        config = RBDSConfig(ps_mode="generated", dynamic_ps_text="X")
+        config.clean()  # must not raise
+
+    def test_valid_combined_format_passes_clean(self):
+        config = RBDSConfig(
+            ps_mode="generated", dynamic_ps_text="X",
+            dynamic_ps_format="{text} | Now Playing: {now_playing}",
+        )
+        config.clean()  # must not raise
+
+    def test_unknown_placeholder_rejected_by_clean(self):
+        config = RBDSConfig(ps_mode="generated", dynamic_ps_text="X", dynamic_ps_format="{bogus}")
+        with self.assertRaises(ValidationError):
+            config.clean()
+
+    def test_unknown_placeholder_error_keyed_to_dynamic_ps_format_field(self):
+        config = RBDSConfig(ps_mode="generated", dynamic_ps_text="X", dynamic_ps_format="{bogus}")
+        with self.assertRaises(ValidationError) as ctx:
+            config.clean()
+        self.assertIn("dynamic_ps_format", ctx.exception.message_dict)
+
+    def test_malformed_format_rejected_by_clean(self):
+        config = RBDSConfig(ps_mode="generated", dynamic_ps_text="X", dynamic_ps_format="{text")
+        with self.assertRaises(ValidationError):
+            config.clean()
+
+    def test_format_validated_even_when_ps_mode_is_static(self):
+        """Unlike dynamic_ps_text's non-blank requirement (only
+        enforced while Generated mode is active), the FORMAT SYNTAX is
+        always validated -- there's no legitimate reason to ever
+        persist a broken template regardless of which mode is active."""
+        config = RBDSConfig(ps_mode="static", dynamic_ps_format="{bogus}")
+        with self.assertRaises(ValidationError):
+            config.clean()
+
+    def test_static_mode_permits_default_format_with_blank_text(self):
+        config = RBDSConfig(ps_mode="static", dynamic_ps_text="")
+        config.clean()  # must not raise
+
+
+class DynamicPsFormatBackwardCompatibilityTests(SimpleTestCase):
+    """Explicit before/after-migration behavioral proof -- IsadoraAir
+    roadmap [P1] 2.3E (2026-08-18): an existing Generated Rotating PS
+    configuration (dynamic_ps_format not yet set, defaulting to
+    '{text}') must produce EXACTLY the same composed source, and
+    therefore exactly the same generated frames, as the pre-2.3E
+    behavior of feeding dynamic_ps_text straight into
+    generate_ps_frames() with no composition step at all."""
+
+    def test_default_format_composition_matches_pre_2_3e_frames(self):
+        now_playing = {"artist": "Some Artist", "title": "Some Title"}  # must be IGNORED by the default format
+        text = "Oak Grove Radio 98.5"
+        pre_2_3e_frames = dynamic_ps.generate_ps_frames(text, dynamic_ps.MODE_WORD_ALIGNED)
+
+        config = RBDSConfig()  # dynamic_ps_format left at its default
+        source = dynamic_ps.compose_dynamic_ps_source(config.dynamic_ps_format, text, now_playing)
+        post_migration_frames = dynamic_ps.generate_ps_frames(source, dynamic_ps.MODE_WORD_ALIGNED)
+
+        self.assertEqual(post_migration_frames, pre_2_3e_frames)
+
+    def test_default_format_ignores_now_playing_entirely(self):
+        source_with_song = dynamic_ps.compose_dynamic_ps_source(
+            "{text}", "Oak Grove Radio 98.5", {"artist": "John Prine", "title": "Angel From Montgomery"},
+        )
+        source_without_song = dynamic_ps.compose_dynamic_ps_source(
+            "{text}", "Oak Grove Radio 98.5", {"artist": "", "title": ""},
+        )
+        self.assertEqual(source_with_song, source_without_song)
+        self.assertEqual(source_with_song, "Oak Grove Radio 98.5")
 
 
 class DataMigrationSetsPsModeFromExistingFramesTests(TestCase):

@@ -3,6 +3,7 @@ import re
 from django.core.exceptions import ValidationError
 from django.db import models
 
+from rbds.services import dynamic_ps
 from rbds.services.rbds_language import RBDS_LANGUAGE_CONFIG_CHOICES
 from rbds.services.rbds_pty import RBDS_PTY_CHOICES
 
@@ -130,13 +131,33 @@ class RBDSConfig(models.Model):
     dynamic_ps_text = models.CharField(
         "Dynamic PS text", max_length=255, blank=True, default="",
         help_text="Operator-entered source text for Generated Rotating PS mode -- "
-                   "converted into a sequence of 8-character PS frames according to "
-                   "Dynamic PS Mode below (see rbds.services.dynamic_ps for the exact "
-                   "per-mode algorithm). May be left blank while PS Mode above is not "
-                   "Generated Rotating PS; must contain non-whitespace content when it "
-                   "is. Operator-entered text only in this version -- not sourced from "
-                   "now-playing/artist/title (RT/RT+ remain the authoritative "
-                   "current-title mechanism for that).",
+                   "combined with live now-playing information per Dynamic PS Format "
+                   "below (default: used verbatim, unchanged from pre-2.3E behavior), "
+                   "then converted into a sequence of 8-character PS frames according "
+                   "to Dynamic PS Mode below (see rbds.services.dynamic_ps for the "
+                   "exact per-mode algorithm). May be left blank while PS Mode above is "
+                   "not Generated Rotating PS; must contain non-whitespace content when "
+                   "it is -- this stays the safe branding/fallback source even for "
+                   "formats built mainly around now-playing.",
+    )
+    dynamic_ps_format = models.CharField(
+        "Dynamic PS format", max_length=255, default="{text}",
+        help_text="Template combining Dynamic PS Text with live now-playing "
+                   "information into the source string Dynamic PS Mode below actually "
+                   "generates frames from. Supported placeholders: {text} = Dynamic PS "
+                   "Text above; {now_playing} = current Artist - Title (just the title "
+                   "or artist alone if only one is known, blank if neither is -- the "
+                   "recommended token for a friendly, gap-free result); {artist} and "
+                   "{title} = the individual now-playing fields, blank when unknown, no "
+                   "special fallback handling (use {now_playing} instead if a clean "
+                   "fallback matters). Default '{text}' preserves the original, "
+                   "now-playing-free behavior exactly. Example: '{text} | Now Playing: "
+                   "{now_playing}'. Sourced ONLY from the currently-playing track -- "
+                   "never from RadioText, RT+ promos, weather, or any other RBDS "
+                   "message content, which continue rotating completely independently "
+                   "(see the RadioText fieldset below). No Python attribute/index "
+                   "access, conversion (!r), or format-spec (:...) syntax -- plain "
+                   "{field} placeholders only.",
     )
     dynamic_ps_mode = models.PositiveSmallIntegerField(
         "Dynamic PS mode", choices=DYNAMIC_PS_MODE_CHOICES, default=2,
@@ -264,6 +285,15 @@ class RBDSConfig(models.Model):
             # services; TA=1 on a non-TP service is a contradiction,
             # not merely unusual.
             errors["ta"] = "Traffic Announcement requires Traffic Programme (TP) to also be set."
+        # Validated unconditionally (not gated on ps_mode == "generated"
+        # the way dynamic_ps_text's non-blank requirement is) -- there's
+        # no legitimate reason to ever persist a syntactically broken
+        # template, active mode or not, and the default '{text}' always
+        # passes trivially so this adds no friction for the common case.
+        try:
+            dynamic_ps.validate_dynamic_ps_format(self.dynamic_ps_format)
+        except ValueError as exc:
+            errors["dynamic_ps_format"] = str(exc)
         if self.ps_mode == "generated":
             # dynamic_ps_text/frame_seconds are only REQUIRED to be
             # meaningful while Generated mode is actually the active
