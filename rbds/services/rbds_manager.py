@@ -20,7 +20,7 @@ import requests  # noqa: E402
 from django.db import close_old_connections  # noqa: E402
 
 from rbds.models import RBDSConfig, RBDSMessage, RBDSPSFrame  # noqa: E402
-from rbds.services import ascii_protocol, uecp  # noqa: E402
+from rbds.services import ascii_protocol, dynamic_ps, uecp  # noqa: E402
 from rbds.services.charset import normalize_text  # noqa: E402
 from rbds.services.content_fetch import ContentFetchCache  # noqa: E402
 from rbds.services.rotation import PSRotation, RTRotation  # noqa: E402
@@ -113,6 +113,15 @@ class RBDSManager:
         self._reconnect_delay_seconds = None
         self._last_sent_ps = None
         self._last_sent_rt = None
+        # Last-seen short-PS operating mode (Static/Manual/Generated,
+        # 2026-08-18) -- None on init so the very first tick's mode
+        # resolution always treats itself as "just switched," which is
+        # harmless (PSRotation already starts fresh) but keeps the
+        # semantics uniform with every later real mode transition. See
+        # _resolve_target_ps()'s own docstring for why an explicit
+        # reset() is needed here rather than relying solely on
+        # PSRotation.advance()'s own frame-list-change detection.
+        self._last_ps_mode = None
         # None means "nothing sent yet" (same convention as _last_sent_ps/
         # _last_sent_rt), NOT "language code 0/Unknown was sent" -- those
         # are different states, see _build_uecp_payload's LIC block.
@@ -194,10 +203,7 @@ class RBDSManager:
         # no engine restart needed for an admin edit to take effect.
         self._rt_rotation._nowplaying_min_seconds = config.nowplaying_min_seconds
 
-        ps_frames = list(
-            RBDSPSFrame.objects.filter(enabled=True).order_by("sort_order").values_list("text", "hold_seconds")
-        )
-        target_ps = normalize_text(self._ps_rotation.advance(ps_frames) or config.station_ps or "")
+        target_ps = self._resolve_target_ps(config)
 
         today = datetime.date.today()
         messages = list(RBDSMessage.objects.filter(enabled=True).order_by("sort_order"))
@@ -347,6 +353,65 @@ class RBDSManager:
                     self._last_error = f"CT send failed: {exc}"
 
         self._write_state(config, target_ps, rt_text, rt_source, rt_source_name)
+
+    def _resolve_target_ps(self, config):
+        """Resolves the current 8-char target PS per config.ps_mode
+        (2026-08-18, [P1] 2.3C) -- Static PS / Manual PS Frames /
+        Generated Rotating PS, exactly ONE of the three, never
+        combined. The final normalize_text() wrap at the end of every
+        branch is the same one this code always applied to whatever
+        came out of rotation-or-station_ps -- normalize_text() is
+        idempotent (see charset.py), so re-applying it to text
+        dynamic_ps.generate_ps_frames() already normalized internally
+        is harmless, not a double-normalization bug; it's still
+        necessary for the Static/Manual paths, whose text (station_ps /
+        an RBDSPSFrame row) is never pre-normalized anywhere else.
+
+        Switching MODES restarts rotation deterministically via
+        PSRotation.reset() -- tracked here via self._last_ps_mode
+        rather than relying solely on PSRotation.advance()'s own
+        frame-list-change detection, because two DIFFERENT modes'
+        frame lists could in principle produce the same key (e.g. a
+        single Manual frame that happens to equal Generated mode's own
+        first frame+duration) and advance() alone has no way to tell
+        those apart -- an explicit mode-change signal does. Changes to
+        the CONTENT feeding one mode (dynamic_ps_text/dynamic_ps_mode/
+        dynamic_ps_frame_seconds while still in Generated mode; which
+        RBDSPSFrame rows are enabled while still in Manual mode) are
+        deliberately NOT handled here -- PSRotation.advance()'s
+        existing frame-list-key comparison already restarts rotation
+        correctly for those on its own, with no extra bookkeeping
+        needed."""
+        if config.ps_mode != self._last_ps_mode:
+            self._ps_rotation.reset()
+            self._last_ps_mode = config.ps_mode
+
+        if config.ps_mode == "static":
+            # No rotation at all -- PSRotation is left untouched (not
+            # even reset() beyond the mode-change handling above) so a
+            # later switch back to Manual/Generated has nothing stale
+            # of ITS OWN to worry about; static mode never advances it.
+            return normalize_text(config.station_ps or "")
+
+        if config.ps_mode == "manual":
+            ps_frames = list(
+                RBDSPSFrame.objects.filter(enabled=True)
+                .order_by("sort_order").values_list("text", "hold_seconds")
+            )
+            # Zero enabled rows -> advance() returns None -> station_ps
+            # fallback, same fail-safe this code has always had.
+            return normalize_text(self._ps_rotation.advance(ps_frames) or config.station_ps or "")
+
+        if config.ps_mode == "generated":
+            generated = dynamic_ps.generate_ps_frames(config.dynamic_ps_text, config.dynamic_ps_mode)
+            ps_frames = [(frame, config.dynamic_ps_frame_seconds) for frame in generated]
+            return normalize_text(self._ps_rotation.advance(ps_frames) or config.station_ps or "")
+
+        # Shouldn't happen -- ps_mode is a choices field -- but fail
+        # safe to the same station_ps fallback rather than raising
+        # mid-tick over an unexpected stored value and taking the
+        # whole engine loop down with it.
+        return normalize_text(config.station_ps or "")
 
     RT_PLUS_SEPARATOR = " - "
 
@@ -949,6 +1014,17 @@ class RBDSManager:
         state = {
             "timestamp": time.time(),
             "current_ps": ps,
+            # Short-PS operating mode (2026-08-18) -- concise context
+            # only, matching current_ps's own "the value, not the whole
+            # source" convention. dynamic_ps_mode is included only when
+            # it's actually the relevant setting (ps_mode == generated);
+            # the full dynamic_ps_text source string and the generated
+            # frame list are deliberately never dumped here -- current_ps
+            # already answers "what's on air right now," and dumping the
+            # whole source/frame-list on every tick would bloat this
+            # file for no diagnostic benefit this phase needs.
+            "ps_mode": config.ps_mode,
+            **({"dynamic_ps_mode": config.dynamic_ps_mode} if config.ps_mode == "generated" else {}),
             "current_rt": rt,
             "rt_source": rt_source,
             "rt_source_name": rt_source_name,

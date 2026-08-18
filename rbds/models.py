@@ -19,6 +19,27 @@ SOURCE_TYPE_CHOICES = [
     ("file", "Local file"),
     ("url", "URL"),
 ]
+# Short-PS operating mode (IsadoraAir roadmap [P1] 2.3C, 2026-08-18) --
+# controls ONLY the ordinary 8-character PS service. Long PS is a
+# separate, later RDS service and is deliberately NOT a value here, so
+# it can eventually coexist with any of these three rather than being
+# mutually exclusive with them.
+PS_MODE_CHOICES = [
+    ("static", "Static PS"),
+    ("manual", "Manual PS Frames"),
+    ("generated", "Generated Rotating PS"),
+]
+# Mirrors rbds.services.dynamic_ps's MODE_* constants (0-3) -- kept as
+# plain integers here (not that module's names) so this file has no
+# import-time dependency on dynamic_ps.py; the numeric VALUES are the
+# actual contract between the two, verified by
+# RBDSConfigDynamicPsFieldsTests.
+DYNAMIC_PS_MODE_CHOICES = [
+    (0, "Mode 0 — Fixed 8-character cells (no scrolling)"),
+    (1, "Mode 1 — Scroll by 1 character"),
+    (2, "Mode 2 — Word-aligned scrolling"),
+    (3, "Mode 3 — Scroll by 1 character, blank spacing at start/end"),
+]
 
 
 class RBDSConfig(models.Model):
@@ -93,9 +114,41 @@ class RBDSConfig(models.Model):
     )
     station_ps = models.CharField(
         max_length=8, blank=True,
-        help_text="Static 8-character PS (Program Service name) shown when no dynamic "
-                   "PS frame is configured below, e.g. 'KOGR-LP '. Padded/truncated to "
-                   "8 chars automatically at send time.",
+        help_text="Static 8-character PS (Program Service name), e.g. 'KOGR-LP '. "
+                   "Padded/truncated to 8 chars automatically at send time. Sent "
+                   "directly when PS Mode below is Static PS; also the fail-safe "
+                   "fallback for Manual PS Frames mode when zero frames are enabled.",
+    )
+
+    # --- Short PS mode + Generated Rotating PS settings (2.3C) ---
+    ps_mode = models.CharField(
+        "Short PS mode", max_length=9, choices=PS_MODE_CHOICES, default="static",
+        help_text="Controls only the ordinary 8-character PS service -- see the "
+                   "Program Service fieldset for the full explanation of each choice. "
+                   "Long PS (a separate, later RDS service) is not one of these values.",
+    )
+    dynamic_ps_text = models.CharField(
+        "Dynamic PS text", max_length=255, blank=True, default="",
+        help_text="Operator-entered source text for Generated Rotating PS mode -- "
+                   "converted into a sequence of 8-character PS frames according to "
+                   "Dynamic PS Mode below (see rbds.services.dynamic_ps for the exact "
+                   "per-mode algorithm). May be left blank while PS Mode above is not "
+                   "Generated Rotating PS; must contain non-whitespace content when it "
+                   "is. Operator-entered text only in this version -- not sourced from "
+                   "now-playing/artist/title (RT/RT+ remain the authoritative "
+                   "current-title mechanism for that).",
+    )
+    dynamic_ps_mode = models.PositiveSmallIntegerField(
+        "Dynamic PS mode", choices=DYNAMIC_PS_MODE_CHOICES, default=2,
+        help_text="Which of the four frame-generation algorithms to apply to Dynamic "
+                   "PS Text. Only used when PS Mode is Generated Rotating PS. Default "
+                   "is Mode 2 (word-aligned).",
+    )
+    dynamic_ps_frame_seconds = models.PositiveIntegerField(
+        "Dynamic PS frame seconds", default=4,
+        help_text="How long each generated frame stays on-air before advancing to the "
+                   "next. Modes 0 and 2 require at least 3 seconds per frame; Modes 1 "
+                   "and 3 (one-character scrolling) allow as little as 1 second.",
     )
     pty = models.PositiveSmallIntegerField(
         choices=RBDS_PTY_CHOICES, default=0,
@@ -211,6 +264,25 @@ class RBDSConfig(models.Model):
             # services; TA=1 on a non-TP service is a contradiction,
             # not merely unusual.
             errors["ta"] = "Traffic Announcement requires Traffic Programme (TP) to also be set."
+        if self.ps_mode == "generated":
+            # dynamic_ps_text/frame_seconds are only REQUIRED to be
+            # meaningful while Generated mode is actually the active
+            # ps_mode -- blank/short values are fine to leave sitting in
+            # the DB otherwise (e.g. switching back to Static shouldn't
+            # force clearing them, so they're ready again if the operator
+            # switches back to Generated later).
+            if not self.dynamic_ps_text.strip():
+                errors["dynamic_ps_text"] = (
+                    "Required (non-blank) when PS Mode is Generated Rotating PS."
+                )
+            if self.dynamic_ps_mode in (0, 2) and self.dynamic_ps_frame_seconds < 3:
+                errors["dynamic_ps_frame_seconds"] = (
+                    "Modes 0 and 2 require at least 3 seconds per frame."
+                )
+            elif self.dynamic_ps_mode in (1, 3) and self.dynamic_ps_frame_seconds < 1:
+                errors["dynamic_ps_frame_seconds"] = (
+                    "Modes 1 and 3 require at least 1 second per frame."
+                )
         if errors:
             raise ValidationError(errors)
 

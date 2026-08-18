@@ -40,6 +40,24 @@ class PSRotation:
 
         return frames[self._index][0]
 
+    def reset(self):
+        """Explicitly restarts rotation state -- the next advance()
+        call behaves exactly as a brand-new PSRotation instance would,
+        regardless of whether the frame list it's given happens to be
+        unchanged. advance() already restarts on its own whenever the
+        frame list itself changes (see the `key != self._frames_key`
+        check above); this method exists for the case that alone can't
+        catch -- e.g. RBDSManager switching between entirely different
+        PS SOURCES (Static/Manual/Generated -- 2026-08-18) whose frame
+        lists could coincidentally produce the same key. A
+        service/engine restart also naturally lands here (a fresh
+        PSRotation() already starts at index 0), so this method adds
+        no persistence of its own -- there's deliberately nothing to
+        persist."""
+        self._frames_key = None
+        self._index = 0
+        self._frame_started_at = None
+
 
 class RTRotation:
     """Priority-interrupt model: now-playing is the default/continuous

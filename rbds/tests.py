@@ -1,4 +1,6 @@
+import importlib
 import json
+import shutil
 import tempfile
 import time
 import unicodedata
@@ -6,9 +8,12 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+from django.apps import apps as django_apps
+from django.contrib import admin as django_admin
 from django.core.exceptions import ValidationError
 from django.test import SimpleTestCase, TestCase
 
+from rbds.admin import RBDSConfigAdmin
 from rbds.models import RBDSConfig, RBDSMessage, RBDSPSFrame
 from rbds.services import ascii_protocol, charset, dynamic_ps, uecp
 from rbds.services import rbds_manager
@@ -609,6 +614,53 @@ class PSRotationTests(SimpleTestCase):
         # Admin edit: a new frame list entirely
         new_frames = [("NEWFRAME", 5)]
         self.assertEqual(rotation.advance(new_frames), "NEWFRAME")
+
+
+class PSRotationResetTests(SimpleTestCase):
+    """PSRotation.reset() -- IsadoraAir roadmap [P1] 2.3C (2026-08-18),
+    added so RBDSManager can restart rotation deterministically on a
+    short-PS MODE change (Static/Manual/Generated), a case
+    advance()'s own frame-list-change detection alone can't always
+    catch (two different modes' frame lists could coincidentally
+    produce the same key). advance()'s existing frame-list-change
+    behavior itself is untouched -- see PSRotationTests above, not
+    modified by this class."""
+
+    def test_reset_returns_to_frame_zero(self):
+        clock = FakeClock()
+        rotation = PSRotation(clock=clock)
+        frames = [("FRAME1  ", 4), ("FRAME2  ", 4)]
+        self.assertEqual(rotation.advance(frames), "FRAME1  ")
+        clock.advance(4)
+        self.assertEqual(rotation.advance(frames), "FRAME2  ")
+        rotation.reset()
+        # Same frame list, and no time has passed since the last call --
+        # without reset() this would just keep returning FRAME2.
+        # reset() must force it back to index 0 regardless.
+        self.assertEqual(rotation.advance(frames), "FRAME1  ")
+
+    def test_reset_resets_timing_state(self):
+        clock = FakeClock()
+        rotation = PSRotation(clock=clock)
+        frames = [("FRAME1  ", 4), ("FRAME2  ", 4)]
+        rotation.advance(frames)  # frame_started_at = 0
+        clock.advance(10)  # far past the original 4s hold
+        rotation.reset()
+        # If frame_started_at were NOT actually cleared by reset(), the
+        # elapsed time since the ORIGINAL start (now 10s) would already
+        # exceed the 4s hold, and this call would incorrectly jump
+        # straight to FRAME2 instead of restarting fresh at FRAME1.
+        self.assertEqual(rotation.advance(frames), "FRAME1  ")
+        clock.advance(3.9)  # 3.9s since the RESET-time restart -- not yet due
+        self.assertEqual(rotation.advance(frames), "FRAME1  ")
+        clock.advance(0.2)  # total 4.1s since reset -- now due
+        self.assertEqual(rotation.advance(frames), "FRAME2  ")
+
+    def test_reset_on_a_fresh_never_advanced_rotation_is_a_safe_no_op(self):
+        rotation = PSRotation(clock=FakeClock())
+        rotation.reset()  # must not raise
+        frames = [("FRAME1  ", 4)]
+        self.assertEqual(rotation.advance(frames), "FRAME1  ")
 
 
 class DynamicPsFrameGeneratorTests(SimpleTestCase):
@@ -1582,6 +1634,461 @@ class RBDSManagerCtOnOffTests(TestCase):
         self.assertEqual(mec_0d_count(), 2, "a real minute rollover must still send CT value")
 
 
+class RBDSManagerPsModeResolutionTests(TestCase):
+    """RBDSManager._resolve_target_ps() -- IsadoraAir roadmap [P1] 2.3C
+    (2026-08-18): mode-aware PS resolution for Static / Manual PS
+    Frames / Generated Rotating PS. Exercises _resolve_target_ps()
+    directly (a real DB-backed RBDSConfig row is needed since Manual
+    mode genuinely queries RBDSPSFrame) with a FakeClock-driven
+    PSRotation -- never touches _transmit()/sockets; this class is
+    entirely about WHICH text gets chosen, not how it's sent (see
+    GeneratedPsReachesExistingTransportPathTests below for that)."""
+
+    def setUp(self):
+        self.clock = FakeClock()
+        self.mgr = RBDSManager()
+        self.mgr._ps_rotation = PSRotation(clock=self.clock)
+        self.config = RBDSConfig.load()
+        self.config.station_ps = "KOGR-LP "
+        self.config.ps_mode = "static"
+        self.config.save()
+
+    # ---- Static ----
+
+    def test_static_ignores_enabled_manual_frames(self):
+        RBDSPSFrame.objects.create(text="MANUAL1 ", enabled=True, hold_seconds=4)
+        self.config.ps_mode = "static"
+        self.assertEqual(self.mgr._resolve_target_ps(self.config), "KOGR-LP ")
+
+    def test_static_ignores_generated_settings(self):
+        self.config.ps_mode = "static"
+        self.config.dynamic_ps_text = "SHOULD NOT APPEAR"
+        self.assertEqual(self.mgr._resolve_target_ps(self.config), "KOGR-LP ")
+
+    def test_static_sends_station_ps(self):
+        self.config.ps_mode = "static"
+        self.config.station_ps = "TESTPS  "
+        self.assertEqual(self.mgr._resolve_target_ps(self.config), "TESTPS  ")
+
+    # ---- Manual ----
+
+    def test_manual_uses_enabled_rbdspsframe_rows(self):
+        RBDSPSFrame.objects.create(text="FRAME1  ", enabled=True, hold_seconds=4, sort_order=0)
+        self.config.ps_mode = "manual"
+        self.assertEqual(self.mgr._resolve_target_ps(self.config), "FRAME1  ")
+
+    def test_manual_preserves_per_row_hold_seconds(self):
+        RBDSPSFrame.objects.create(text="FRAME1  ", enabled=True, hold_seconds=4, sort_order=0)
+        RBDSPSFrame.objects.create(text="FRAME2  ", enabled=True, hold_seconds=6, sort_order=1)
+        self.config.ps_mode = "manual"
+        self.assertEqual(self.mgr._resolve_target_ps(self.config), "FRAME1  ")
+        self.clock.advance(4)  # FRAME1's own 4s hold elapsed
+        self.assertEqual(self.mgr._resolve_target_ps(self.config), "FRAME2  ")
+        self.clock.advance(5)  # < FRAME2's own 6s hold
+        self.assertEqual(self.mgr._resolve_target_ps(self.config), "FRAME2  ")
+        self.clock.advance(1.1)  # now >= 6s
+        self.assertEqual(self.mgr._resolve_target_ps(self.config), "FRAME1  ")  # wrapped
+
+    def test_manual_disabled_rows_ignored(self):
+        RBDSPSFrame.objects.create(text="ENABLED ", enabled=True, hold_seconds=4, sort_order=0)
+        RBDSPSFrame.objects.create(text="DISABLED", enabled=False, hold_seconds=4, sort_order=1)
+        self.config.ps_mode = "manual"
+        result1 = self.mgr._resolve_target_ps(self.config)
+        self.clock.advance(100)
+        result2 = self.mgr._resolve_target_ps(self.config)
+        self.assertEqual(result1, "ENABLED ")
+        self.assertEqual(result2, "ENABLED ")  # only one enabled frame -- never advances away
+
+    def test_manual_zero_enabled_rows_falls_back_to_station_ps(self):
+        RBDSPSFrame.objects.create(text="DISABLED", enabled=False, hold_seconds=4)
+        self.config.ps_mode = "manual"
+        self.config.station_ps = "FALLBACK"
+        self.assertEqual(self.mgr._resolve_target_ps(self.config), "FALLBACK")
+
+    # ---- Generated ----
+
+    def test_generated_uses_generate_ps_frames(self):
+        self.config.ps_mode = "generated"
+        self.config.dynamic_ps_text = "HELLO WORLD"
+        self.config.dynamic_ps_mode = 2
+        self.config.dynamic_ps_frame_seconds = 4
+        self.assertEqual(self.mgr._resolve_target_ps(self.config), "HELLO   ")
+
+    def test_generated_feeds_sequence_into_ps_rotation_with_common_interval(self):
+        self.config.ps_mode = "generated"
+        self.config.dynamic_ps_text = "HELLO WORLD"
+        self.config.dynamic_ps_mode = 2
+        self.config.dynamic_ps_frame_seconds = 4
+        self.assertEqual(self.mgr._resolve_target_ps(self.config), "HELLO   ")
+        self.clock.advance(3.9)
+        self.assertEqual(self.mgr._resolve_target_ps(self.config), "HELLO   ")  # not due yet
+        self.clock.advance(0.2)  # total 4.1s
+        self.assertEqual(self.mgr._resolve_target_ps(self.config), "WORLD   ")
+
+    def test_generated_text_edit_restarts_at_frame_zero(self):
+        self.config.ps_mode = "generated"
+        self.config.dynamic_ps_text = "HELLO WORLD"
+        self.config.dynamic_ps_mode = 2
+        self.config.dynamic_ps_frame_seconds = 4
+        self.assertEqual(self.mgr._resolve_target_ps(self.config), "HELLO   ")
+        self.clock.advance(4)
+        self.assertEqual(self.mgr._resolve_target_ps(self.config), "WORLD   ")
+        # Text changed mid-rotation -- must restart at the NEW
+        # sequence's own frame 0, not continue at whatever index the
+        # OLD sequence was on.
+        self.config.dynamic_ps_text = "GOODBYE"
+        self.assertEqual(self.mgr._resolve_target_ps(self.config), "GOODBYE ")
+
+    def test_generated_mode_edit_restarts_at_frame_zero(self):
+        self.config.ps_mode = "generated"
+        self.config.dynamic_ps_text = "AAAA BBBB"
+        self.config.dynamic_ps_mode = 2  # word-aligned -> ["AAAA    ", "BBBB    "]
+        self.config.dynamic_ps_frame_seconds = 4
+        self.assertEqual(self.mgr._resolve_target_ps(self.config), "AAAA    ")
+        self.clock.advance(4)
+        self.assertEqual(self.mgr._resolve_target_ps(self.config), "BBBB    ")  # now at index 1
+
+        # Switch to Mode 0 (fixed 8-char cells) -- "AAAA BBBB" (9 chars)
+        # -> ["AAAA BBB", "B       "], a frame-0 that matches NEITHER
+        # of Mode 2's own two frames, so landing on it proves rotation
+        # restarted at the NEW sequence's frame 0 rather than
+        # continuing at Mode 2's index 1.
+        self.config.dynamic_ps_mode = 0
+        self.assertEqual(self.mgr._resolve_target_ps(self.config), "AAAA BBB")
+
+    def test_generated_interval_edit_restarts_timing_appropriately(self):
+        self.config.ps_mode = "generated"
+        self.config.dynamic_ps_text = "HELLO WORLD"
+        self.config.dynamic_ps_mode = 2
+        self.config.dynamic_ps_frame_seconds = 4
+        self.assertEqual(self.mgr._resolve_target_ps(self.config), "HELLO   ")
+        self.clock.advance(3)  # 3s elapsed under the OLD 4s interval -- not yet due
+        self.config.dynamic_ps_frame_seconds = 3  # shortened (still >=3, valid for Mode 2)
+        # Immediately after the edit (0s elapsed under the NEW timer),
+        # must still be frame 0 -- proves the timer restarted from THIS
+        # moment rather than treating the 3s already elapsed under the
+        # OLD interval as already satisfying the NEW, shorter one.
+        self.assertEqual(self.mgr._resolve_target_ps(self.config), "HELLO   ")
+        self.clock.advance(3)  # 3s since the interval-edit moment
+        self.assertEqual(self.mgr._resolve_target_ps(self.config), "WORLD   ")
+
+
+class RBDSManagerPsModeSwitchingTests(TestCase):
+    """Mode-TRANSITION tests -- IsadoraAir roadmap [P1] 2.3C: switching
+    between Static / Manual / Generated must restart rotation
+    deterministically, never resuming stale index/timing state from a
+    previously-active mode. See PSRotation.reset() and
+    RBDSManager._resolve_target_ps()'s own docstring for why this needs
+    explicit self._last_ps_mode tracking, not just PSRotation.advance()'s
+    own frame-list-change detection."""
+
+    def setUp(self):
+        self.clock = FakeClock()
+        self.mgr = RBDSManager()
+        self.mgr._ps_rotation = PSRotation(clock=self.clock)
+        self.config = RBDSConfig.load()
+        self.config.station_ps = "STATIC  "
+        self.config.dynamic_ps_text = "GENERATED TEXT"
+        self.config.dynamic_ps_mode = 2
+        self.config.dynamic_ps_frame_seconds = 4
+        self.config.save()
+
+    def test_static_to_generated_begins_at_frame_zero(self):
+        self.config.ps_mode = "static"
+        self.assertEqual(self.mgr._resolve_target_ps(self.config), "STATIC  ")
+        self.config.ps_mode = "generated"
+        expected_first = dynamic_ps.generate_ps_frames(self.config.dynamic_ps_text, self.config.dynamic_ps_mode)[0]
+        self.assertEqual(self.mgr._resolve_target_ps(self.config), expected_first)
+
+    def test_generated_to_static_immediately_returns_station_ps(self):
+        self.config.ps_mode = "generated"
+        self.mgr._resolve_target_ps(self.config)
+        self.clock.advance(4)
+        self.mgr._resolve_target_ps(self.config)  # now on generated frame index 1
+        self.config.ps_mode = "static"
+        self.assertEqual(self.mgr._resolve_target_ps(self.config), "STATIC  ")
+
+    def test_generated_to_manual_begins_at_frame_zero(self):
+        RBDSPSFrame.objects.create(text="MANUAL1 ", enabled=True, hold_seconds=4, sort_order=0)
+        RBDSPSFrame.objects.create(text="MANUAL2 ", enabled=True, hold_seconds=4, sort_order=1)
+        self.config.ps_mode = "generated"
+        self.mgr._resolve_target_ps(self.config)
+        self.clock.advance(4)
+        self.mgr._resolve_target_ps(self.config)  # generated frame index 1
+        self.config.ps_mode = "manual"
+        self.assertEqual(self.mgr._resolve_target_ps(self.config), "MANUAL1 ")
+
+    def test_manual_to_generated_begins_at_frame_zero(self):
+        RBDSPSFrame.objects.create(text="MANUAL1 ", enabled=True, hold_seconds=4, sort_order=0)
+        RBDSPSFrame.objects.create(text="MANUAL2 ", enabled=True, hold_seconds=4, sort_order=1)
+        self.config.ps_mode = "manual"
+        self.mgr._resolve_target_ps(self.config)
+        self.clock.advance(4)
+        self.mgr._resolve_target_ps(self.config)  # manual frame index 1
+        self.config.ps_mode = "generated"
+        expected_first = dynamic_ps.generate_ps_frames(self.config.dynamic_ps_text, self.config.dynamic_ps_mode)[0]
+        self.assertEqual(self.mgr._resolve_target_ps(self.config), expected_first)
+
+    def test_switching_away_and_back_does_not_resume_stale_state(self):
+        self.config.ps_mode = "generated"
+        first = self.mgr._resolve_target_ps(self.config)
+        self.clock.advance(4)
+        second = self.mgr._resolve_target_ps(self.config)
+        self.assertNotEqual(first, second)  # confirm real progress happened
+        self.config.ps_mode = "static"
+        self.mgr._resolve_target_ps(self.config)
+        self.config.ps_mode = "generated"
+        # Must restart at the SAME first frame as originally -- not
+        # resume at `second`, wherever it was before switching away.
+        self.assertEqual(self.mgr._resolve_target_ps(self.config), first)
+
+
+class GeneratedPsReachesExistingTransportPathTests(TestCase):
+    """Confirms a Generated Rotating PS frame flows through the EXACT
+    SAME existing PS transport path as any other PS string --
+    IsadoraAir roadmap [P1] 2.3C added no ps_mode-awareness anywhere
+    below _resolve_target_ps(); this is a regression guard that it
+    stays that way. Not a retest of 2.3A's UDP one-frame-per-datagram
+    packetization (unchanged, untouched here -- see
+    RBDSManagerTransmitTransportTests)."""
+
+    def setUp(self):
+        self.mgr = RBDSManager()
+        self.sent_payloads = []
+        self.mgr._transmit = mock.Mock(side_effect=lambda config, payload: self.sent_payloads.append(payload))
+        self.mgr._read_category_state = mock.Mock(return_value={"pty_override": None, "ptyn": ""})
+        self.config = RBDSConfig.load()
+        self.config.protocol = "uecp"
+        self.config.use_rt_plus = False
+        self.config.send_ct = False
+        self.config.ps_mode = "generated"
+        self.config.dynamic_ps_text = "TESTFRAME"
+        self.config.dynamic_ps_mode = 0
+        self.config.dynamic_ps_frame_seconds = 4
+        self.config.save()
+
+    def test_generated_frame_reaches_uecp_mec_ps_unchanged(self):
+        self.mgr._ps_rotation = PSRotation(clock=FakeClock())
+        target_ps = self.mgr._resolve_target_ps(self.config)
+        self.assertEqual(target_ps, "TESTFRAM")  # Mode 0, first 8 of "TESTFRAME"
+
+        ok = self.mgr._send(self.config, target_ps, "some rt", None, None)
+        self.assertTrue(ok)
+        self.assertEqual(len(self.sent_payloads), 1)
+        frames = _split_uecp_frames(self.sent_payloads[0])
+        ps_mec = _find_mec(frames, 0x02)
+        self.assertIsNotNone(ps_mec)
+        # Directly compare against the real uecp.mec_ps()'s own output
+        # for this exact text -- confirms the generated frame landed
+        # in the ordinary PS MEC byte-for-byte identically to how any
+        # other 8-char PS string would, no special-casing anywhere.
+        self.assertEqual(ps_mec, uecp.mec_ps(target_ps))
+
+    def test_generated_frame_reaches_ascii_ps_command_unchanged(self):
+        self.config.protocol = "ascii"
+        self.config.save()
+        self.mgr._ps_rotation = PSRotation(clock=FakeClock())
+        target_ps = self.mgr._resolve_target_ps(self.config)
+
+        ok = self.mgr._send(self.config, target_ps, "some rt", None, None)
+        self.assertTrue(ok)
+        self.assertEqual(len(self.sent_payloads), 1)
+        commands = self.sent_payloads[0].decode("utf-8")
+        self.assertIn(f"PS={target_ps}", commands)
+
+
+class RBDSManagerPsStateFileTests(TestCase):
+    """rbds_state.json's ps_mode/dynamic_ps_mode additions -- IsadoraAir
+    roadmap [P1] 2.3C (2026-08-18). Calls _write_state() directly
+    (bypassing the full _tick() orchestration, which is unrelated to
+    what this covers) against a temp-directory STATE_PATH -- the real
+    /run/isadoraair/rbds_state.json is never touched by this suite."""
+
+    def setUp(self):
+        self.mgr = RBDSManager()
+        self.config = RBDSConfig.load()
+        self.tmpdir = tempfile.mkdtemp(prefix="isadoraair-rbds-state-test-")
+        self.addCleanup(shutil.rmtree, self.tmpdir, ignore_errors=True)
+        self.state_path = Path(self.tmpdir) / "rbds_state.json"
+
+    def _write_and_read(self, ps="TESTPS  "):
+        with mock.patch("rbds.services.rbds_manager.STATE_PATH", self.state_path):
+            self.mgr._write_state(self.config, ps, "some rt", "nowplaying", None)
+        return json.loads(self.state_path.read_text())
+
+    def test_current_ps_remains_correct(self):
+        state = self._write_and_read(ps="ABCDEFGH")
+        self.assertEqual(state["current_ps"], "ABCDEFGH")
+
+    def test_ps_mode_exposed(self):
+        self.config.ps_mode = "manual"
+        state = self._write_and_read()
+        self.assertEqual(state["ps_mode"], "manual")
+
+    def test_dynamic_ps_mode_exposed_when_generated(self):
+        self.config.ps_mode = "generated"
+        self.config.dynamic_ps_mode = 3
+        state = self._write_and_read()
+        self.assertEqual(state["dynamic_ps_mode"], 3)
+
+    def test_dynamic_ps_mode_absent_when_static(self):
+        self.config.ps_mode = "static"
+        state = self._write_and_read()
+        self.assertNotIn("dynamic_ps_mode", state)
+
+    def test_dynamic_ps_mode_absent_when_manual(self):
+        self.config.ps_mode = "manual"
+        state = self._write_and_read()
+        self.assertNotIn("dynamic_ps_mode", state)
+
+    def test_full_source_text_never_dumped(self):
+        self.config.ps_mode = "generated"
+        self.config.dynamic_ps_text = "SOME LONG SOURCE TEXT THAT SHOULD NEVER APPEAR"
+        state = self._write_and_read()
+        self.assertNotIn("SOME LONG SOURCE TEXT", json.dumps(state))
+
+    def test_generated_frame_list_never_dumped(self):
+        self.config.ps_mode = "generated"
+        self.config.dynamic_ps_text = "UNIQUEMARKERTEXT"
+        self.config.dynamic_ps_mode = 0
+        state = self._write_and_read()
+        self.assertNotIn("UNIQUEMARKERTEXT", json.dumps(state))
+        self.assertNotIn("frames", state)
+        self.assertNotIn("dynamic_ps_text", state)
+
+
+@mock.patch("rbds.admin.subprocess.Popen")
+class RBDSConfigAdminRestartScopingTests(TestCase):
+    """2026-08-18 restart-scoping fix -- RBDSConfigAdmin.save_model()
+    must restart isadoraair-rbds only when an actual connection-
+    TOPOLOGY field changed (host/port/transport/protocol/
+    uecp_site_address/uecp_encoder_address), never for station
+    identity/content edits -- PS settings among them, the exact
+    scenario that made the OLD unconditional-restart-on-every-save
+    behavior unacceptable (see this admin's own updated comment).
+
+    save_model() only ever reads form.changed_data (never any other
+    form internals), so a minimal stand-in object with just that one
+    attribute exercises the real save_model() logic precisely, without
+    needing full ModelForm/HTTP request machinery -- and Django's own
+    base ModelAdmin.save_model() (called via super()) only does
+    obj.save(), so passing request=None is safe too."""
+
+    def setUp(self):
+        self.site = django_admin.AdminSite()
+        self.model_admin = RBDSConfigAdmin(RBDSConfig, self.site)
+        self.config = RBDSConfig.load()
+
+    def _save(self, changed_fields, change=True):
+        fake_form = SimpleNamespace(changed_data=list(changed_fields))
+        self.model_admin.save_model(request=None, obj=self.config, form=fake_form, change=change)
+
+    def test_topology_field_edit_restarts(self, mock_popen):
+        self._save(["host"])
+        mock_popen.assert_called_once()
+
+    def test_each_topology_field_alone_restarts(self, mock_popen):
+        for field in RBDSConfigAdmin.RESTART_TOPOLOGY_FIELDS:
+            with self.subTest(field=field):
+                mock_popen.reset_mock()
+                self._save([field])
+                mock_popen.assert_called_once()
+
+    def test_multiple_fields_including_one_topology_field_restarts(self, mock_popen):
+        self._save(["station_ps", "port"])
+        mock_popen.assert_called_once()
+
+    def test_generated_ps_text_edit_does_not_restart(self, mock_popen):
+        self._save(["dynamic_ps_text"])
+        mock_popen.assert_not_called()
+
+    def test_generated_ps_mode_edit_does_not_restart(self, mock_popen):
+        self._save(["dynamic_ps_mode"])
+        mock_popen.assert_not_called()
+
+    def test_generated_ps_interval_edit_does_not_restart(self, mock_popen):
+        self._save(["dynamic_ps_frame_seconds"])
+        mock_popen.assert_not_called()
+
+    def test_station_ps_edit_does_not_restart(self, mock_popen):
+        self._save(["station_ps"])
+        mock_popen.assert_not_called()
+
+    def test_ps_mode_selector_edit_does_not_restart(self, mock_popen):
+        self._save(["ps_mode"])
+        mock_popen.assert_not_called()
+
+    def test_no_fields_changed_does_not_restart(self, mock_popen):
+        self._save([])
+        mock_popen.assert_not_called()
+
+    def test_new_object_creation_restarts_even_with_no_topology_change(self, mock_popen):
+        """change=False (a brand-new singleton row -- has_add_permission()
+        blocks a second one from ever existing) restarts unconditionally,
+        since there is no previously-running config to compare against
+        and the engine may not even be started yet -- explicitly
+        acceptable per spec."""
+        self._save([], change=False)
+        mock_popen.assert_called_once()
+
+
+class RBDSConfigAdminGeneratedPsPreviewTests(TestCase):
+    """RBDSConfigAdmin.generated_ps_preview() -- IsadoraAir roadmap
+    [P1] 2.3C (2026-08-18). Calls the real
+    rbds.services.dynamic_ps.generate_ps_frames(), never a second
+    reimplementation."""
+
+    def setUp(self):
+        self.site = django_admin.AdminSite()
+        self.model_admin = RBDSConfigAdmin(RBDSConfig, self.site)
+        self.config = RBDSConfig.load()
+
+    def test_preview_uses_real_generate_ps_frames(self):
+        self.config.ps_mode = "generated"
+        self.config.dynamic_ps_text = "AB"
+        self.config.dynamic_ps_mode = 0
+        self.config.save()
+        rendered = str(self.model_admin.generated_ps_preview(self.config))
+        expected_frame = dynamic_ps.generate_ps_frames("AB", 0)[0]
+        self.assertIn(expected_frame, rendered)
+
+    def test_preview_exposes_frame_boundaries(self):
+        self.config.ps_mode = "generated"
+        self.config.dynamic_ps_text = "HELLO WORLD"
+        self.config.dynamic_ps_mode = 2
+        self.config.save()
+        rendered = str(self.model_admin.generated_ps_preview(self.config))
+        # Pipe-delimited so a leading/trailing space is visually
+        # unambiguous, never swallowed by HTML whitespace collapsing.
+        self.assertIn("|HELLO   |", rendered)
+        self.assertIn("|WORLD   |", rendered)
+        self.assertIn("[ 1]", rendered)
+        self.assertIn("[ 2]", rendered)
+
+    def test_preview_shows_concise_status_when_not_generated_mode(self):
+        self.config.ps_mode = "static"
+        self.config.save()
+        rendered = str(self.model_admin.generated_ps_preview(self.config))
+        self.assertIn("Not applicable", rendered)
+        self.assertNotIn("Traceback", rendered)
+
+    def test_preview_shows_concise_status_when_text_blank(self):
+        self.config.ps_mode = "generated"
+        self.config.dynamic_ps_text = "   "  # whitespace-only
+        self.config.save()
+        rendered = str(self.model_admin.generated_ps_preview(self.config))
+        self.assertIn("blank", rendered.lower())
+
+    def test_preview_never_raises_on_unsaved_object(self):
+        new_obj = RBDSConfig(ps_mode="generated", dynamic_ps_text="X")  # pk is None, never saved
+        result = self.model_admin.generated_ps_preview(new_obj)
+        self.assertIsInstance(result, str)
+
+    def test_preview_never_raises_on_none_object(self):
+        result = self.model_admin.generated_ps_preview(None)
+        self.assertIsInstance(result, str)
+
+
 class RtPlusMecCompositionTests(SimpleTestCase):
     """Permanent regression coverage for the settled RT+ architecture
     (2026-08-04, after a controlled 5-mode bench isolation experiment
@@ -1752,6 +2259,156 @@ class RBDSPSFrameValidationTests(SimpleTestCase):
     def test_hold_seconds_at_floor_accepted(self):
         frame = RBDSPSFrame(text="TEST", hold_seconds=4)
         frame.clean()  # must not raise
+
+
+class RBDSConfigDynamicPsFieldsTests(SimpleTestCase):
+    """RBDSConfig's short-PS-mode + Generated Rotating PS fields --
+    IsadoraAir roadmap [P1] 2.3C (2026-08-18): choices/defaults and
+    clean()'s validation rules. No DB access needed -- clean() is a
+    pure in-memory check, same pattern as RBDSConfigValidationTests
+    above."""
+
+    def test_ps_mode_default_is_static(self):
+        self.assertEqual(RBDSConfig().ps_mode, "static")
+
+    def test_ps_mode_has_exactly_the_three_specified_choices(self):
+        values = [choice for choice, _label in RBDSConfig._meta.get_field("ps_mode").choices]
+        self.assertEqual(values, ["static", "manual", "generated"])
+
+    def test_dynamic_ps_mode_default_is_mode_2_word_aligned(self):
+        self.assertEqual(RBDSConfig().dynamic_ps_mode, 2)
+
+    def test_dynamic_ps_mode_has_choices_0_through_3(self):
+        values = [choice for choice, _label in RBDSConfig._meta.get_field("dynamic_ps_mode").choices]
+        self.assertEqual(values, [0, 1, 2, 3])
+
+    def test_dynamic_ps_frame_seconds_default_is_4(self):
+        self.assertEqual(RBDSConfig().dynamic_ps_frame_seconds, 4)
+
+    def test_dynamic_ps_text_default_is_blank(self):
+        self.assertEqual(RBDSConfig().dynamic_ps_text, "")
+
+    def test_generated_mode_requires_non_blank_text(self):
+        config = RBDSConfig(ps_mode="generated", dynamic_ps_text="   ")  # whitespace-only
+        with self.assertRaises(ValidationError):
+            config.clean()
+
+    def test_generated_mode_with_valid_text_passes(self):
+        config = RBDSConfig(
+            ps_mode="generated", dynamic_ps_text="HELLO", dynamic_ps_mode=2, dynamic_ps_frame_seconds=4,
+        )
+        config.clean()  # must not raise
+
+    def test_static_mode_permits_blank_generated_text(self):
+        """dynamic_ps_text is only REQUIRED to be meaningful while
+        Generated mode is actually active -- leaving it blank/short
+        while some other ps_mode is selected must not block saving."""
+        config = RBDSConfig(ps_mode="static", dynamic_ps_text="")
+        config.clean()  # must not raise
+
+    def test_manual_mode_permits_blank_generated_text(self):
+        config = RBDSConfig(ps_mode="manual", dynamic_ps_text="")
+        config.clean()  # must not raise
+
+    def test_mode_0_rejects_interval_below_3(self):
+        config = RBDSConfig(ps_mode="generated", dynamic_ps_text="X", dynamic_ps_mode=0, dynamic_ps_frame_seconds=2)
+        with self.assertRaises(ValidationError):
+            config.clean()
+
+    def test_mode_2_rejects_interval_below_3(self):
+        config = RBDSConfig(ps_mode="generated", dynamic_ps_text="X", dynamic_ps_mode=2, dynamic_ps_frame_seconds=2)
+        with self.assertRaises(ValidationError):
+            config.clean()
+
+    def test_mode_0_accepts_interval_of_exactly_3(self):
+        config = RBDSConfig(ps_mode="generated", dynamic_ps_text="X", dynamic_ps_mode=0, dynamic_ps_frame_seconds=3)
+        config.clean()  # must not raise
+
+    def test_mode_2_accepts_interval_of_exactly_3(self):
+        config = RBDSConfig(ps_mode="generated", dynamic_ps_text="X", dynamic_ps_mode=2, dynamic_ps_frame_seconds=3)
+        config.clean()  # must not raise
+
+    def test_mode_1_accepts_interval_of_1(self):
+        config = RBDSConfig(ps_mode="generated", dynamic_ps_text="X", dynamic_ps_mode=1, dynamic_ps_frame_seconds=1)
+        config.clean()  # must not raise -- the >=3 restriction is deliberately NOT applied to Modes 1/3
+
+    def test_mode_3_accepts_interval_of_1(self):
+        config = RBDSConfig(ps_mode="generated", dynamic_ps_text="X", dynamic_ps_mode=3, dynamic_ps_frame_seconds=1)
+        config.clean()  # must not raise
+
+    def test_mode_1_rejects_interval_of_0(self):
+        config = RBDSConfig(ps_mode="generated", dynamic_ps_text="X", dynamic_ps_mode=1, dynamic_ps_frame_seconds=0)
+        with self.assertRaises(ValidationError):
+            config.clean()
+
+    def test_mode_3_rejects_interval_of_0(self):
+        config = RBDSConfig(ps_mode="generated", dynamic_ps_text="X", dynamic_ps_mode=3, dynamic_ps_frame_seconds=0)
+        with self.assertRaises(ValidationError):
+            config.clean()
+
+
+class DataMigrationSetsPsModeFromExistingFramesTests(TestCase):
+    """rbds/migrations/0012_set_ps_mode_from_existing_frames.py --
+    2026-08-18. Runs the ACTUAL migration function (imported directly
+    via importlib, never reimplemented here) against a real, fully-
+    migrated test database, proving it preserves each installation's
+    pre-2.3C implicit PS precedence (enabled RBDSPSFrame rows rotate;
+    otherwise station_ps is static) by translating it into an explicit
+    ps_mode value on the singleton RBDSConfig row."""
+
+    @staticmethod
+    def _run_migration():
+        module = importlib.import_module("rbds.migrations.0012_set_ps_mode_from_existing_frames")
+        # schema_editor is genuinely unused by this migration's body
+        # (a pure RunPython data migration) -- None is safe to pass.
+        module.set_ps_mode_from_existing_frames(django_apps, None)
+
+    def test_selects_manual_when_enabled_frames_exist(self):
+        RBDSPSFrame.objects.create(text="FRAME1  ", enabled=True)
+        config = RBDSConfig.load()
+        config.ps_mode = "static"  # simulate the field's own pre-migration default
+        config.save()
+        self._run_migration()
+        config.refresh_from_db()
+        self.assertEqual(config.ps_mode, "manual")
+
+    def test_selects_static_when_only_disabled_frames_exist(self):
+        RBDSPSFrame.objects.create(text="FRAME1  ", enabled=False)
+        config = RBDSConfig.load()
+        config.ps_mode = "manual"  # simulate a stale/incorrect starting value
+        config.save()
+        self._run_migration()
+        config.refresh_from_db()
+        self.assertEqual(config.ps_mode, "static")
+
+    def test_selects_static_when_zero_frames_exist_at_all(self):
+        config = RBDSConfig.load()
+        config.ps_mode = "manual"
+        config.save()
+        self._run_migration()
+        config.refresh_from_db()
+        self.assertEqual(config.ps_mode, "static")
+
+    def test_no_config_row_is_a_safe_no_op(self):
+        """Fresh installs have no RBDSConfig row at migration time
+        (RBDSConfig.load()'s get_or_create only ever runs at real
+        engine/admin runtime, never during `migrate`) -- the field's
+        own default ("static") covers that case once the row is
+        eventually created; this migration must not create one itself
+        or raise."""
+        self.assertFalse(RBDSConfig.objects.exists())
+        self._run_migration()  # must not raise
+        self.assertFalse(RBDSConfig.objects.exists())
+
+    def test_never_touches_rbdspsframe_rows(self):
+        frame = RBDSPSFrame.objects.create(text="FRAME1  ", enabled=True, hold_seconds=7, sort_order=3)
+        RBDSConfig.load()
+        self._run_migration()
+        frame.refresh_from_db()
+        self.assertTrue(frame.enabled)
+        self.assertEqual(frame.text, "FRAME1  ")
+        self.assertEqual(frame.hold_seconds, 7)
+        self.assertEqual(frame.sort_order, 3)
 
 
 class RtNormalizationGapTests(SimpleTestCase):
@@ -2215,7 +2872,9 @@ class RBDSManagerReconnectBackoffTests(SimpleTestCase):
 
     def setUp(self):
         self.mgr = RBDSManager()
-        self.config = mock.Mock(host="127.0.0.1", port=4000, protocol="uecp", transport="tcp")
+        self.config = mock.Mock(
+            host="127.0.0.1", port=4000, protocol="uecp", transport="tcp", ps_mode="static",
+        )
 
     def _attempt(self, monotonic_now, create_connection_result):
         """create_connection_result: an exception instance to raise, or a
@@ -3364,7 +4023,9 @@ class RuntimeCommitStateTests(SimpleTestCase):
         patcher = mock.patch.object(rbds_manager, "STATE_PATH", self.state_path)
         patcher.start()
         self.addCleanup(patcher.stop)
-        self.config = mock.Mock(host="127.0.0.1", port=4000, protocol="uecp", transport="tcp")
+        self.config = mock.Mock(
+            host="127.0.0.1", port=4000, protocol="uecp", transport="tcp", ps_mode="static",
+        )
 
     def test_runtime_commit_captured_once_and_written(self):
         with mock.patch.object(rbds_manager, "capture_runtime_commit", return_value="a" * 40):
