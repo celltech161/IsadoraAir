@@ -92,6 +92,19 @@ OPTIONAL_KOKORO_TTS=(
   espeak-ng
 )
 
+# ---- optional: nightly backup encrypted recovery-credential preservation
+# Only needed if BACKUP_RECOVERY_AGE_RECIPIENT(_FILE) is configured --
+# deploy/backup_isadoraair.sh's/encrypt_recovery_credentials.sh's age-
+# encryption step for the three companion-project credential files.
+# Ordinary backups (no encryption configured, the default) don't need
+# this package at all -- verified 2026-08-18: `age` is a genuine Ubuntu
+# 26.04 universe package (1.2.1-1build1 as of this writing), no PPA or
+# source build needed, matching this file's own "OS-managed/current-for-
+# release" pin policy for ordinary packages.
+OPTIONAL_BACKUP_ENCRYPTION=(
+  age
+)
+
 # ---- optional: companion-project Selenium-driven shows ----------------
 # Only needed if syndicated-ingest's radiopush-backed shows (Anjunachill
 # On Air, Enhanced Sessions) or rch/get_rch.py are enabled -- see

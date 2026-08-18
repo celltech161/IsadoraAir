@@ -23,6 +23,11 @@
 #     reprovisioned, see docs/DISASTER_RECOVERY.md).
 #   - Small, operator-created /srv/isadoraair content (FX Cart audio,
 #     voicetracks) and royalty/SoundExchange report filings, if present.
+#   - If configured (BACKUP_RECOVERY_AGE_RECIPIENT/_FILE): age-encrypted
+#     copies of ~/.iasboxbu.cred, ~/.syndicated_ingest.cred, and
+#     ~/.ogremote_ingest.cred, under recovery-credentials/*.age — see the
+#     2026-08-18 note below and deploy/encrypt_recovery_credentials.sh.
+#     Disabled by default; never included in plaintext either way.
 #
 # Deliberately excluded — see docs/DISASTER_RECOVERY.md for the full,
 # explicit policy this was derived from:
@@ -72,6 +77,29 @@
 # docs/DISASTER_RECOVERY.md's "Known deployment follow-up, resolved"
 # section for the full history.
 #
+# 2026-08-18 disaster-recovery Phase 4.5 final follow-up: encrypted
+# preservation of the three companion-project credential files
+# (~/.iasboxbu.cred, ~/.syndicated_ingest.cred, ~/.ogremote_ingest.cred)
+# that were previously deliberately excluded entirely (see "Secrets NOT
+# included" in the manifest below). These now get an age-encrypted copy
+# under recovery-credentials/*.age in the archive -- see
+# deploy/encrypt_recovery_credentials.sh (the standalone helper this
+# script calls for the actual encryption) for the full security model.
+# In short: only a PUBLIC age recipient is ever configured on this host
+# (BACKUP_RECOVERY_AGE_RECIPIENT/_FILE below); the matching PRIVATE key
+# is never generated or stored here, so compromising this host or any
+# backup archive it produces does not grant decryption capability.
+# Disabled by default (neither env var set) -- a fresh generic install
+# backs up exactly as before, with no new failure mode, until an
+# operator deliberately opts in. Once opted in, failure is closed: see
+# encrypt_recovery_credentials.sh's own header for the exact conditions
+# that abort this backup before any upload. See
+# docs/DISASTER_RECOVERY_RESTORE.md's "Encrypted recovery-credential
+# preservation" section for the full operator-facing design and the
+# manual decrypt-on-restore procedure (deliberately NOT automated here
+# -- the private key must never be handled by anything running on this
+# host).
+#
 # Pushes the result via SFTP to a remote target configured in
 # ~/.iasboxbu.cred (BAK_HOST, BAK_USER, BAK_PORT, BAK_PATH, BAK_PASS) —
 # never hardcoded here; this file has no station-specific secrets in it.
@@ -102,10 +130,15 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # Bump when backup coverage or the archive layout changes -- recorded in
 # the manifest inside every archive, so a restore always knows exactly
-# what shape of backup it's looking at.
-SCRIPT_VERSION="2.0.0"
+# what shape of backup it's looking at. 2.1.0: added the optional
+# recovery-credentials/*.age directory (additive, backward compatible --
+# an archive with encryption disabled or absent is still a fully valid
+# 2.0.0-shaped backup in every other respect).
+SCRIPT_VERSION="2.1.0"
 
 # See the DRY_RUN note in the header comment above.
 DRY_RUN="${DRY_RUN:-0}"
@@ -376,6 +409,50 @@ else
   echo "  (none found at $REPORTS_DIR)"
 fi
 
+echo "Encrypting recovery credentials (if configured)..."
+# See deploy/encrypt_recovery_credentials.sh's own header for the full
+# security model and failure policy. Run unconditionally (including under
+# DRY_RUN) -- DRY_RUN's own contract is "no SFTP connection", not "skip
+# every filesystem operation"; exercising this step locally under DRY_RUN
+# is exactly how an operator proves the mechanism works before trusting it
+# on a real nightly run. This step never touches ~/.iasboxbu.cred's SFTP
+# credentials (BAK_HOST etc.) -- it only ever reads the file's raw bytes
+# as an opaque blob to encrypt, the same as the other two credential
+# files, never parsing/using any value from it.
+RECOVERY_CRED_DIR="$WORKDIR/recovery-credentials"
+RECOVERY_CRED_STATUS_OUTPUT=""
+if ! RECOVERY_CRED_STATUS_OUTPUT=$("$SCRIPT_DIR/encrypt_recovery_credentials.sh" "$RECOVERY_CRED_DIR"); then
+  echo "Error: encrypted recovery-credential preservation is configured but failed -- see output above. Aborting before upload rather than producing a backup that appears to protect recovery credentials when it does not." >&2
+  echo "$RECOVERY_CRED_STATUS_OUTPUT" >&2
+  exit 1
+fi
+RECOVERY_CRED_ENABLED=0
+RECOVERY_CRED_LINES=""
+while IFS= read -r line; do
+  case "$line" in
+    STATUS=enabled) RECOVERY_CRED_ENABLED=1 ;;
+    STATUS=disabled) RECOVERY_CRED_ENABLED=0 ;;
+    "CRED "*) RECOVERY_CRED_LINES="${RECOVERY_CRED_LINES}${line}"$'\n' ;;
+  esac
+done <<< "$RECOVERY_CRED_STATUS_OUTPUT"
+if [ "$RECOVERY_CRED_ENABLED" -eq 1 ]; then
+  echo "  enabled -- see manifest for per-file inclusion status"
+  RECOVERY_CRED_MANIFEST_BLOCK="Recovery credential encryption: enabled
+Recovery credential cipher: age"
+  while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    # "CRED iasboxbu included" -> "Recovery credential iasboxbu: included"
+    name="${line#CRED }"; name="${name% *}"
+    status="${line##* }"
+    RECOVERY_CRED_MANIFEST_BLOCK="${RECOVERY_CRED_MANIFEST_BLOCK}
+Recovery credential ${name}: ${status}"
+  done <<< "$RECOVERY_CRED_LINES"
+else
+  echo "  disabled (BACKUP_RECOVERY_AGE_RECIPIENT/_FILE not configured) -- ~/.iasboxbu.cred, ~/.syndicated_ingest.cred, ~/.ogremote_ingest.cred are NOT included in this archive, same as every backup before this feature existed"
+  RECOVERY_CRED_MANIFEST_BLOCK="Recovery credential encryption: disabled (BACKUP_RECOVERY_AGE_RECIPIENT/_FILE not configured)"
+fi
+echo
+
 echo "Writing backup manifest..."
 GIT_SHA="unknown"
 if command -v git >/dev/null 2>&1 && [ -d "$PROJECT_DIR/.git" ]; then
@@ -400,6 +477,7 @@ Contents of this archive:
   srv-content/carts/                     FX Cart audio (operator-uploaded)
   srv-content/voicetracks/               recorded voicetrack audio (operator-created)
   reports/                               SoundExchange/royalty report filings (if present)
+  recovery-credentials/*.age             age-encrypted companion credential copies (if configured -- see below; NEVER plaintext)
 
 Deliberately EXCLUDED from this backup (see docs/DISASTER_RECOVERY.md):
   /srv/isadoraair/music        717+ GB audio library -- separate storage-resilience task
@@ -410,12 +488,21 @@ Deliberately EXCLUDED from this backup (see docs/DISASTER_RECOVERY.md):
   .git/, venv/, __pycache__/, staticfiles/, media/album_art_cache/
   .env.bak, .env.lock                    stray local files, not restore-relevant (.env itself IS included)
 
-Secrets NOT included -- must be reprovisioned from elsewhere on restore
-(see docs/DISASTER_RECOVERY.md "Secret reprovisioning boundary"):
-  ~/.iasboxbu.cred (this backup's own upload credentials -- avoids circularity)
-  ~/.syndicated_ingest.cred, weather-ingest/ogremote-ingest credentials
+${RECOVERY_CRED_MANIFEST_BLOCK}
+NOTE: an "included" recovery credential above is ciphertext only, decryptable
+solely with the age PRIVATE key held externally (never on this host) --
+see docs/DISASTER_RECOVERY_RESTORE.md "Encrypted recovery-credential
+preservation". It is NOT a bootstrap source for retrieving this archive
+in the first place -- ~/.iasboxbu.cred's own external off-host copy is
+still what a recovery starts from; this encrypted copy is for keeping
+that (and the other two) current/authoritative going forward and for
+restoring them once the archive is already in hand.
+
+Secrets NEVER included in ANY form, even encrypted -- must be
+reprovisioned from elsewhere on restore (see docs/DISASTER_RECOVERY.md
+"Secret reprovisioning boundary"):
   acme.sh / Let's Encrypt DNS-01 provider credentials
-  StereoTool license
+  StereoTool license (not a Phase 5 blocker -- see docs/DISASTER_RECOVERY_RESTORE.md; StereoTool runs unlicensed with only an occasional watermark until manually relicensed post-restore)
 MANIFEST
 
 echo "Building final archive..."

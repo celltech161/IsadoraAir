@@ -12,4 +12,18 @@ Group=@@ISA_USER@@
 # copy the operator supplies separately. Only the credential file
 # (@@ISA_HOME@@/.iasboxbu.cred, read by the script itself, never by this
 # unit) is external -- see deploy/README.md and docs/DISASTER_RECOVERY.md.
+#
+# Optional (2026-08-18, disaster-recovery Phase 4.5 final follow-up):
+# encrypted preservation of the companion-project credential files inside
+# the nightly archive -- disabled unless one of these is set. The value
+# is a PUBLIC age recipient, never secret, but still configured here
+# rather than hardcoded in the script -- see
+# deploy/encrypt_recovery_credentials.sh and
+# docs/DISASTER_RECOVERY_RESTORE.md's "Encrypted recovery-credential
+# preservation" section for the full design and the production
+# activation steps. Uncomment ONE line below once a recovery keypair has
+# been generated OFF this host and its public recipient is ready to
+# configure here:
+#Environment=BACKUP_RECOVERY_AGE_RECIPIENT_FILE=@@ISA_HOME@@/.isadoraair-backup-recovery-recipient.pub
+#Environment=BACKUP_RECOVERY_AGE_RECIPIENT=age1...
 ExecStart=@@ISA_ROOT@@/deploy/backup_isadoraair.sh

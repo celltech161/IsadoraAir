@@ -296,6 +296,18 @@ station-specific unit is protected as backup/DR evidence via the
 `stereotool.service` entry in `deploy/backup_isadoraair.sh`'s live-unit
 loop.
 
+**License is not a Phase 5 blocker (confirmed operational behavior,
+2026-08-18)**: StereoTool runs and processes audio without a license
+entered at all. The unlicensed penalty for the feature set in use here
+is an occasional audio watermark every few hours — an accepted tradeoff
+during disaster recovery, not something this project works around.
+Entering the real license key once the system is operational again is a
+roughly one-minute manual step, done post-restore, not a restore
+prerequisite. This does **not** mean the license itself is backed up or
+vendor-recoverable — that remains unverified (see the table below) —
+only that its absence during recovery is tolerable, so it doesn't gate
+Phase 5.
+
 ## Companion projects
 
 `syndicated-ingest/`, `weather-ingest/`, and `ogremote-ingest/`
@@ -310,24 +322,33 @@ done here). See each project's own git-readiness notes under
 
 ## Secret reprovisioning boundary
 
-Every secret below is intentionally **not** in any backup or the repo.
-For each: where production expects it, whether the backup contains it,
-and where a human retrieves/recreates it if this box is lost.
+Every secret below is intentionally **not** in the repo. For each: where
+production expects it, whether the backup contains it (and in what
+form), and where a human retrieves/recreates it if this box is lost.
+This table predates the A/B/C classification scheme
+`docs/DISASTER_RECOVERY_RESTORE.md`'s "Secrets and credentials
+inventory" section now uses — that's the canonical, fuller version
+(also states which restore stage each item blocks); this table is kept
+in sync with it, not a competing source of truth.
 
 | Secret | Purpose | Production location | In backup? | Reprovision from |
 |---|---|---|---|---|
-| `~/.iasboxbu.cred` | This backup script's own SFTP upload credentials | `$HOME/.iasboxbu.cred`, mode 0600 | No (intentionally — avoids circularity: it can't back up the credentials it needs to reach the backup destination) | **External reprovision source must be established** — not currently documented anywhere this audit found |
-| `~/.syndicated_ingest.cred` | Syndicated-show fetch credentials, Bluesky app password | Companion project's own cred file | No | **External reprovision source must be established** |
-| weather-ingest credentials | GW3000/weather API access | Companion project's own config | No | **External reprovision source must be established** |
-| ogremote-ingest credentials | Remote-content polling auth | Companion project's own config | No | **External reprovision source must be established** |
-| acme.sh / DNS-01 provider credentials | Let's Encrypt cert issuance for `radio.oakgroveradio.com` (IONOS DNS-01) | `~/.acme.sh/account.conf` / `acme.sh.env` | No | **External reprovision source must be established** — falls back to the self-signed cert (already backed up as part of the nginx config) if unavailable, so this isn't a hard blocker, just degraded HTTPS on the public hostname |
-| StereoTool license | Unlocks the processor beyond any trial/demo limits | Bundled with the StereoTool install itself, not separately extracted/inspected by this audit | No | **External reprovision source must be established** — contact the vendor |
+| `~/.iasboxbu.cred` | This backup script's own SFTP upload credentials | `$HOME/.iasboxbu.cred`, mode 0600 | Age-encrypted copy, if configured (2026-08-18 — see "Encrypted recovery-credential preservation" in `docs/DISASTER_RECOVERY_RESTORE.md`); never in plaintext. **Still not the bootstrap source** — an encrypted copy inside the backup cannot be used to retrieve the backup that contains it | **Resolved (2026-08-18)** — operator-maintained off-host recovery copy on local PC. This off-host copy remains the actual bootstrap source regardless of whether encrypted preservation is configured |
+| `~/.syndicated_ingest.cred` | Syndicated-show fetch credentials, Bluesky app password | Companion project's own cred file, mode 0600 | Age-encrypted copy, if configured — same mechanism as above | **Resolved (2026-08-18)** — operator-maintained off-host recovery copy on local PC |
+| weather-ingest credentials | GW3000/weather API access | **Not a file** — lives in IsadoraAir's own database (`WeatherConfig`/`AmberAlertConfig` admin singletons) | **Yes, implicitly** — restored as part of the ordinary `pg_dump`, no separate mechanism needed | N/A unless the database restore itself is unavailable, in which case re-enter manually |
+| `~/.ogremote_ingest.cred` | Remote-content polling auth (`API_KEY`) | Companion project's own cred file, mode 0600 | Age-encrypted copy, if configured — same mechanism as above | **Resolved (2026-08-18)** — operator-maintained off-host recovery copy on local PC |
+| acme.sh / DNS-01 provider credentials | Let's Encrypt cert issuance for `radio.oakgroveradio.com` (IONOS DNS-01) | `~/.acme.sh/account.conf` / `acme.sh.env` | No | **Safely reprovisionable** — these are IONOS Developer Portal API credentials (DNS scope); a fresh pair can be reissued from that portal, no dependency on the original value surviving, provided the operator retains their own IONOS account login. Falls back to the self-signed cert (already backed up as part of the nginx config) if unavailable either way — degraded HTTPS on the public hostname, never a hard blocker |
+| StereoTool license | Unlocks the processor beyond any trial/demo limits | Bundled with the StereoTool install itself, not separately extracted/inspected by this audit | No | **Not a Phase 5 blocker (2026-08-18)** — StereoTool runs and processes audio without the license entered; the unlicensed penalty (an occasional audio watermark every few hours) is an accepted tradeoff during disaster recovery. Entering the license key manually once the system is operational again takes about a minute — see the "StereoTool" section above and `docs/DISASTER_RECOVERY_RESTORE.md`'s own StereoTool section |
 | `.env` secrets (`SECRET_KEY`, `DB_PASSWORD`, email credentials) | Django/DB/email auth | `.env`, mode 0600 | **Yes** — inside the app tar, as part of the normal backup | N/A unless the backup itself is unavailable, in which case: `SECRET_KEY` can be freshly generated (invalidates existing sessions, otherwise harmless), `DB_PASSWORD` must match whatever the restored/recreated PostgreSQL role actually has |
+| GitHub SSH access (all 4 private repos) | Cloning code during restore | Operator's own `~/.ssh/`, outside this repo entirely | N/A (not a backup-covered secret) | **Safely reprovisionable** — see `docs/DISASTER_RECOVERY_RESTORE.md`'s "GitHub access" section for the verified per-repo-deploy-key-scoping finding and the fresh-key reprovisioning path |
 
-None of the "external reprovision source must be established" rows above
-were resolved by this audit — they're recorded as open items rather than
-guessed at, per the instruction not to invent a source that isn't
-actually known.
+As of 2026-08-18, every row above has either a verified external recovery
+source or a verified safe reprovisioning workflow, or (StereoTool) is
+confirmed not to block Phase 5 at all — none were resolved by *guessing*;
+each reflects either an operator decision (the three credential files,
+StereoTool's license posture) or a concretely verified vendor/provider
+mechanism (GitHub, IONOS), per the same discipline the original audit
+established: don't invent a source that isn't actually known.
 
 ## HE-AAC / fdkaac provenance
 

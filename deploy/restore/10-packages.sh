@@ -18,7 +18,11 @@
 #   --with-cd-rip              OPTIONAL_CD_RIP (whipper, cdparanoia, flac, libdiscid0)
 #   --with-kokoro-tts          OPTIONAL_KOKORO_TTS (espeak-ng)
 #   --with-syndicated-selenium OPTIONAL_SYNDICATED_SELENIUM (chromium-browser, chromium-chromedriver)
-#   --with-all-optional        all three of the above
+#   --with-backup-encryption   OPTIONAL_BACKUP_ENCRYPTION (age) -- only needed
+#                              if BACKUP_RECOVERY_AGE_RECIPIENT(_FILE) will be
+#                              configured on this install; see
+#                              deploy/encrypt_recovery_credentials.sh
+#   --with-all-optional        all four of the above
 #
 # --skip-heaac-build            omit BUILD_HEAAC even from the default set
 #
@@ -41,13 +45,15 @@ set -- "${RESTORE_REMAINING_ARGS[@]}"
 WITH_CD_RIP=0
 WITH_KOKORO_TTS=0
 WITH_SYNDICATED_SELENIUM=0
+WITH_BACKUP_ENCRYPTION=0
 SKIP_HEAAC_BUILD=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --with-cd-rip) WITH_CD_RIP=1; shift ;;
     --with-kokoro-tts) WITH_KOKORO_TTS=1; shift ;;
     --with-syndicated-selenium) WITH_SYNDICATED_SELENIUM=1; shift ;;
-    --with-all-optional) WITH_CD_RIP=1; WITH_KOKORO_TTS=1; WITH_SYNDICATED_SELENIUM=1; shift ;;
+    --with-backup-encryption) WITH_BACKUP_ENCRYPTION=1; shift ;;
+    --with-all-optional) WITH_CD_RIP=1; WITH_KOKORO_TTS=1; WITH_SYNDICATED_SELENIUM=1; WITH_BACKUP_ENCRYPTION=1; shift ;;
     --skip-heaac-build) SKIP_HEAAC_BUILD=1; shift ;;
     *) log_error "10-packages.sh: unrecognized argument: $1"; exit 2 ;;
   esac
@@ -80,9 +86,13 @@ if [ "$WITH_SYNDICATED_SELENIUM" -eq 1 ]; then
   RESOLVED+=("${OPTIONAL_SYNDICATED_SELENIUM[@]}")
   RESOLVED_LABEL="$RESOLVED_LABEL + OPTIONAL_SYNDICATED_SELENIUM"
 fi
+if [ "$WITH_BACKUP_ENCRYPTION" -eq 1 ]; then
+  RESOLVED+=("${OPTIONAL_BACKUP_ENCRYPTION[@]}")
+  RESOLVED_LABEL="$RESOLVED_LABEL + OPTIONAL_BACKUP_ENCRYPTION"
+fi
 
 log_info "Package groups selected: $RESOLVED_LABEL"
-log_info "Skipped (opt-in, not requested): $( [ "$WITH_CD_RIP" -eq 0 ] && echo -n 'OPTIONAL_CD_RIP ' )$( [ "$WITH_KOKORO_TTS" -eq 0 ] && echo -n 'OPTIONAL_KOKORO_TTS ' )$( [ "$WITH_SYNDICATED_SELENIUM" -eq 0 ] && echo -n 'OPTIONAL_SYNDICATED_SELENIUM' )"
+log_info "Skipped (opt-in, not requested): $( [ "$WITH_CD_RIP" -eq 0 ] && echo -n 'OPTIONAL_CD_RIP ' )$( [ "$WITH_KOKORO_TTS" -eq 0 ] && echo -n 'OPTIONAL_KOKORO_TTS ' )$( [ "$WITH_SYNDICATED_SELENIUM" -eq 0 ] && echo -n 'OPTIONAL_SYNDICATED_SELENIUM ' )$( [ "$WITH_BACKUP_ENCRYPTION" -eq 0 ] && echo -n 'OPTIONAL_BACKUP_ENCRYPTION' )"
 
 ALREADY=()
 MISSING=()

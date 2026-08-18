@@ -267,3 +267,218 @@ class InspectBackupFunctionalTests(SimpleTestCase):
         )
         self.assertEqual(result.returncode, 2)
         self.assertIn("Usage:", result.stderr)
+
+    # ---- 2026-08-18 Phase 4.5 final follow-up: encrypted recovery-
+    # credential preservation checks. These build small synthetic archives
+    # entirely under self.tmpdir -- never real credential content, never a
+    # real age keypair (the archive inspector never needs one; it only
+    # confirms ciphertext presence/non-emptiness, per its own documented
+    # "no private key needed to inspect" contract).
+
+    def _minimal_valid_workdir(self, workdir: Path):
+        """Same minimally-valid shape as test_valid_minimal_archive_passes,
+        factored out so the recovery-credential tests don't have to repeat
+        it and can focus on just the new checks."""
+        workdir.mkdir()
+        (workdir / "MANIFEST.txt").write_text(
+            "IsadoraAir disaster-recovery backup manifest\n"
+            "Backup script version: 2.1.0\n"
+            "Created (UTC):          2026-08-18T00:00:00+00:00\n"
+            "IsadoraAir Git SHA:     deadbeefcafebabe0000000000000000000000\n"
+        )
+        (workdir / "database.dump").write_bytes(b"PGDMP" + b"\x00" * 100)
+        app_dir = self.tmpdir / "app_build" / "isadoraair"
+        app_dir.mkdir(parents=True)
+        (app_dir / "manage.py").write_text("#!/usr/bin/env python\n")
+        (app_dir / ".env").write_text("SECRET_KEY=test\n")
+        app_tar = workdir / "app.tar.gz"
+        with tarfile.open(app_tar, "w:gz") as tf:
+            tf.add(app_dir, arcname="isadoraair")
+
+    def _append_manifest(self, workdir: Path, extra_text: str):
+        manifest = workdir / "MANIFEST.txt"
+        manifest.write_text(manifest.read_text() + extra_text)
+
+    def test_plaintext_credential_file_present_fails_regardless_of_manifest(self):
+        """The plaintext-leak check is unconditional -- it must fire even
+        on an archive whose manifest never mentions recovery-credential
+        encryption at all (the worst case: something copied a real
+        credential file in by accident, completely outside this
+        feature)."""
+        workdir = self.tmpdir / "work"
+        self._minimal_valid_workdir(workdir)
+        (workdir / ".iasboxbu.cred").write_text("BAK_HOST=example.test\nBAK_PASS=oops\n")
+
+        archive_path = self.tmpdir / "test-backup.tar.gz"
+        self._build_archive(workdir, archive_path)
+
+        result = self._run_inspect(archive_path)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("OVERALL: FAIL", result.stdout)
+        self.assertIn("Plaintext credential check", result.stdout)
+        self.assertIn(".iasboxbu.cred", result.stdout)
+        # The fixture's fake secret value must never appear in the tool's
+        # own output either.
+        self.assertNotIn("oops", result.stdout)
+
+    def test_plaintext_credential_file_at_nested_path_still_fails(self):
+        """Matches at any path, not just top-level -- an accidental `cp`
+        into the wrong place should still be caught."""
+        workdir = self.tmpdir / "work"
+        self._minimal_valid_workdir(workdir)
+        nested = workdir / "recovery-credentials"
+        nested.mkdir()
+        (nested / ".syndicated_ingest.cred").write_text("SMTP_PASSWORD=oops\n")
+
+        archive_path = self.tmpdir / "test-backup.tar.gz"
+        self._build_archive(workdir, archive_path)
+
+        result = self._run_inspect(archive_path)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Plaintext credential check", result.stdout)
+        self.assertIn(".syndicated_ingest.cred", result.stdout)
+
+    def test_old_format_archive_with_no_recovery_credential_manifest_line_passes(self):
+        """Backward compatibility: an archive produced before this
+        feature existed (no "Recovery credential encryption:" line in
+        MANIFEST.txt at all) must still pass overall -- treated as "not
+        applicable", never a failure."""
+        workdir = self.tmpdir / "work"
+        self._minimal_valid_workdir(workdir)
+        archive_path = self.tmpdir / "test-backup.tar.gz"
+        self._build_archive(workdir, archive_path)
+
+        result = self._run_inspect(archive_path)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("OVERALL: PASS", result.stdout)
+        self.assertIn("Recovery credential encryption", result.stdout)
+        self.assertIn("not applicable", result.stdout)
+
+    def test_recovery_credential_encryption_disabled_manifest_line_passes(self):
+        workdir = self.tmpdir / "work"
+        self._minimal_valid_workdir(workdir)
+        self._append_manifest(
+            workdir,
+            "\nRecovery credential encryption: disabled (BACKUP_RECOVERY_AGE_RECIPIENT/_FILE not configured)\n",
+        )
+        archive_path = self.tmpdir / "test-backup.tar.gz"
+        self._build_archive(workdir, archive_path)
+
+        result = self._run_inspect(archive_path)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("OVERALL: PASS", result.stdout)
+        self.assertIn("disabled for this backup", result.stdout)
+
+    def test_recovery_credential_encryption_enabled_with_valid_ciphertext_passes(self):
+        """A well-formed new-format archive: manifest claims one included
+        credential, and a real (synthetic, non-empty) ciphertext-shaped
+        file exists at the expected path -- inspection must confirm
+        presence/size only, never attempt to decrypt it."""
+        workdir = self.tmpdir / "work"
+        self._minimal_valid_workdir(workdir)
+        self._append_manifest(
+            workdir,
+            "\nRecovery credential encryption: enabled\n"
+            "Recovery credential cipher: age\n"
+            "Recovery credential iasboxbu: included\n"
+            "Recovery credential syndicated_ingest: absent\n"
+            "Recovery credential ogremote_ingest: absent\n",
+        )
+        recovery_dir = workdir / "recovery-credentials"
+        recovery_dir.mkdir()
+        # Not real age ciphertext -- inspection never parses/decrypts the
+        # bytes, only confirms the file exists and is non-empty, so a
+        # synthetic placeholder is sufficient and appropriate here.
+        (recovery_dir / "iasboxbu.cred.age").write_bytes(b"age-encryption.org/v1\n" + b"\x00" * 64)
+
+        archive_path = self.tmpdir / "test-backup.tar.gz"
+        self._build_archive(workdir, archive_path)
+
+        result = self._run_inspect(archive_path)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("OVERALL: PASS", result.stdout)
+        self.assertIn("Recovery credential: iasboxbu", result.stdout)
+        self.assertIn("bytes ciphertext", result.stdout)
+        # syndicated_ingest/ogremote_ingest are "absent" in the manifest,
+        # not "included" -- must not be checked for a matching file at all.
+        self.assertNotIn("Recovery credential: syndicated_ingest", result.stdout)
+        self.assertNotIn("Recovery credential: ogremote_ingest", result.stdout)
+
+    def test_recovery_credential_enabled_but_file_missing_fails(self):
+        """The exact "looks protected but isn't" failure mode this
+        feature exists to prevent: manifest claims inclusion, but the
+        archive genuinely has no matching .age file."""
+        workdir = self.tmpdir / "work"
+        self._minimal_valid_workdir(workdir)
+        self._append_manifest(
+            workdir,
+            "\nRecovery credential encryption: enabled\n"
+            "Recovery credential cipher: age\n"
+            "Recovery credential iasboxbu: included\n",
+        )
+        # Deliberately no recovery-credentials/ directory at all.
+        archive_path = self.tmpdir / "test-backup.tar.gz"
+        self._build_archive(workdir, archive_path)
+
+        result = self._run_inspect(archive_path)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("OVERALL: FAIL", result.stdout)
+        self.assertIn("Recovery credential: iasboxbu", result.stdout)
+        self.assertIn("missing from the archive", result.stdout)
+
+    def test_recovery_credential_enabled_but_ciphertext_empty_fails(self):
+        workdir = self.tmpdir / "work"
+        self._minimal_valid_workdir(workdir)
+        self._append_manifest(
+            workdir,
+            "\nRecovery credential encryption: enabled\n"
+            "Recovery credential cipher: age\n"
+            "Recovery credential ogremote_ingest: included\n",
+        )
+        recovery_dir = workdir / "recovery-credentials"
+        recovery_dir.mkdir()
+        (recovery_dir / "ogremote_ingest.cred.age").write_bytes(b"")
+
+        archive_path = self.tmpdir / "test-backup.tar.gz"
+        self._build_archive(workdir, archive_path)
+
+        result = self._run_inspect(archive_path)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("OVERALL: FAIL", result.stdout)
+        self.assertIn("Recovery credential: ogremote_ingest", result.stdout)
+        self.assertIn("EMPTY", result.stdout)
+
+    def test_recovery_credential_enabled_all_three_included_and_valid_passes(self):
+        workdir = self.tmpdir / "work"
+        self._minimal_valid_workdir(workdir)
+        self._append_manifest(
+            workdir,
+            "\nRecovery credential encryption: enabled\n"
+            "Recovery credential cipher: age\n"
+            "Recovery credential iasboxbu: included\n"
+            "Recovery credential syndicated_ingest: included\n"
+            "Recovery credential ogremote_ingest: included\n",
+        )
+        recovery_dir = workdir / "recovery-credentials"
+        recovery_dir.mkdir()
+        for name in ("iasboxbu", "syndicated_ingest", "ogremote_ingest"):
+            (recovery_dir / f"{name}.cred.age").write_bytes(b"age-encryption.org/v1\n" + name.encode() + b"\x00" * 32)
+
+        archive_path = self.tmpdir / "test-backup.tar.gz"
+        self._build_archive(workdir, archive_path)
+
+        result = self._run_inspect(archive_path)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("OVERALL: PASS", result.stdout)
+        for name in ("iasboxbu", "syndicated_ingest", "ogremote_ingest"):
+            self.assertIn(f"Recovery credential: {name}", result.stdout)
+
+    def test_inspection_never_invokes_age_or_requires_a_private_key(self):
+        """The archive inspector must not shell out to `age` at all --
+        confirming ciphertext presence/size is enough; decrypting is
+        explicitly out of scope (no private key exists to inspect with,
+        by design)."""
+        text = (RESTORE_DIR / "inspect_backup.sh").read_text(encoding="utf-8")
+        self.assertNotIn("age --decrypt", text)
+        self.assertNotIn("age -d", text)
+        self.assertNotRegex(text, r"\bage\s+-i\b")

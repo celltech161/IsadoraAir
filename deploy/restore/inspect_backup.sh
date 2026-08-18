@@ -191,6 +191,69 @@ check_optional_dir "StereoTool profile (.sts)"     'stereotool/.*\.sts$'
 check_optional_dir "Station content (srv-content)" 'srv-content/'
 check_optional_dir "Reports"                       'reports/'
 
+# ---- 8. Plaintext credential leak check (REQUIRED, every archive, every
+#         format -- old backups never had these at all, so this can never
+#         legitimately fire on a pre-encryption-feature archive either).
+#         Runs regardless of manifest content -- this is the actual
+#         security backstop, not merely a manifest-consistency check.
+#         Matches the bare filename at ANY path in the archive, not just
+#         top-level -- an accidental `cp` into the wrong place should still
+#         be caught. ------------------------------------------------------
+PLAINTEXT_CRED_HITS=$(printf '%s\n' "$LISTING" | grep -E '(^|/)\.(iasboxbu|syndicated_ingest|ogremote_ingest)\.cred$' || true)
+if [ -n "$PLAINTEXT_CRED_HITS" ]; then
+  fail "Plaintext credential check" "FOUND plaintext credential file(s) in archive -- this must never happen: $(printf '%s' "$PLAINTEXT_CRED_HITS" | tr '\n' ' ')"
+else
+  pass "Plaintext credential check" "no plaintext .iasboxbu.cred/.syndicated_ingest.cred/.ogremote_ingest.cred found anywhere in archive"
+fi
+
+# ---- 9. Encrypted recovery-credential preservation (2026-08-18,
+#         backward-compatible -- an archive from before this feature
+#         existed has no "Recovery credential encryption:" manifest line
+#         at all, which is treated as "not applicable", never a failure).
+# --------------------------------------------------------------------------
+NOTE_RECOVERY_CRED_STATUS=""
+if [ -n "$MANIFEST_CONTENT" ]; then
+  NOTE_RECOVERY_CRED_STATUS=$(printf '%s\n' "$MANIFEST_CONTENT" | grep -E '^Recovery credential encryption:' | sed -E 's/^Recovery credential encryption:\s*//' || true)
+fi
+case "$NOTE_RECOVERY_CRED_STATUS" in
+  "")
+    warn "Recovery credential encryption" "manifest predates this feature (or MANIFEST.txt missing) -- not applicable, not a failure"
+    ;;
+  disabled*)
+    pass "Recovery credential encryption" "disabled for this backup (not configured at the time) -- expected, not a failure"
+    ;;
+  enabled)
+    pass "Recovery credential encryption" "enabled -- checking per-file ciphertext below"
+    # Every "Recovery credential <name>: included" line in the manifest
+    # must correspond to a real, non-empty recovery-credentials/<name>.cred.age
+    # entry in the archive -- a manifest claiming inclusion with no
+    # matching (or empty) ciphertext file is exactly the "looks protected
+    # but isn't" failure mode this whole feature exists to prevent.
+    while IFS= read -r credline; do
+      cname=$(sed -E 's/^Recovery credential ([a-z_]+): included$/\1/' <<< "$credline")
+      [ "$cname" = "$credline" ] && continue  # line didn't match the pattern at all
+      agefile="recovery-credentials/${cname}.cred.age"
+      if ! has_entry "recovery-credentials/${cname}\\.cred\\.age"; then
+        fail "Recovery credential: ${cname}" "manifest says included but ${agefile} is missing from the archive"
+        continue
+      fi
+      # Stream the ciphertext out and count bytes -- same extract-to-stdout
+      # discipline as every other check here, never writes it to disk, and
+      # never attempts to decrypt it (no private key available or needed
+      # just to confirm it's a non-empty file).
+      CIPHERTEXT_SIZE=$(tar -xzO -f "$ARCHIVE" "./${agefile}" 2>/dev/null | wc -c || echo 0)
+      if [ "$CIPHERTEXT_SIZE" -gt 0 ]; then
+        pass "Recovery credential: ${cname}" "${agefile} present, ${CIPHERTEXT_SIZE} bytes ciphertext"
+      else
+        fail "Recovery credential: ${cname}" "${agefile} is present but EMPTY -- not a valid encrypted credential"
+      fi
+    done <<< "$(printf '%s\n' "$MANIFEST_CONTENT" | grep -E '^Recovery credential [a-z_]+: included$' || true)"
+    ;;
+  *)
+    warn "Recovery credential encryption" "unrecognized status in manifest: '${NOTE_RECOVERY_CRED_STATUS}'"
+    ;;
+esac
+
 echo
 if [ -n "$NOTE_GIT_SHA" ]; then
   echo "Git SHA:              $NOTE_GIT_SHA"

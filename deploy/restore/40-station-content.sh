@@ -210,9 +210,17 @@ else
 fi
 
 # ---- StereoTool manual-checkpoint checklist (Phase 4 spec section 16) ----
-# The binary and license are NEVER part of this backup or this repo --
-# proprietary, externally reprovisioned. This is a read-only informational
-# checklist, not a gate that blocks this stage.
+# The binary is NEVER part of this backup or this repo -- proprietary,
+# externally reprovisioned. This is a read-only informational checklist,
+# not a gate that blocks this stage.
+#
+# 2026-08-18 disaster-recovery Phase 4.5 final follow-up: the license
+# item below is deliberately NOT a log_warn -- confirmed operational
+# behavior is that StereoTool runs and processes audio with no license
+# entered at all (an occasional audio watermark every few hours is the
+# only unlicensed penalty for the feature set in use), so its absence
+# here is expected and non-blocking, not a gap to flag. See
+# docs/DISASTER_RECOVERY_RESTORE.md's "StereoTool" section.
 log_info "StereoTool readiness checklist (manual items are NOT automated by this tooling):"
 if [ "$RESTORE_MODE" = "apply" ] && [ -n "$(ls -A "$STEREOTOOL_DIR" 2>/dev/null)" ]; then
   log_info "  [x] Profile (.sts) restored -- see $STEREOTOOL_DIR"
@@ -224,7 +232,7 @@ if [ -n "$STEREOTOOL_BIN" ] && [ -x "$STEREOTOOL_BIN" ]; then
 else
   log_warn "  [ ] Binary installed -- NOT verified (pass --stereotool-bin PATH to check, or confirm manually). StereoTool's binary is proprietary and must be obtained/installed outside this tooling."
 fi
-log_warn "  [ ] License/config present -- cannot be checked automatically; confirm manually per the vendor's own instructions."
+log_info "  [ ] License entered -- NOT a blocker; StereoTool runs unlicensed (occasional watermark) until entered manually post-restore, ~1 minute once the system is operational. Not automated or checked by this tooling."
 log_warn "  [ ] Service unit valid -- installed and syntax-checked by 90-system-config.sh, not this stage; run that stage next."
 log_info "See docs/DISASTER_RECOVERY_RESTORE.md's 'StereoTool' section for the full manual handoff procedure."
 
