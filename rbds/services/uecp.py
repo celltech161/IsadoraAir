@@ -109,6 +109,57 @@ def build_frame(site_address: int, encoder_address: int, sqc: int, msg: bytes) -
     return bytes([STA]) + stuffed + bytes([STP])
 
 
+def split_frames(payload: bytes) -> list:
+    """Splits a byte string holding one or more complete, back-to-back
+    UECP frames (as produced by concatenating build_frame() calls --
+    see rbds_manager.py's _frames_for()) into a list of individual
+    frame byte strings, each a complete STA..STP frame, in original
+    order.
+
+    Exists for transports that are datagram-bounded rather than
+    stream-bounded (UDP) -- see rbds_manager.py's _transmit(), the
+    only production caller. A TCP stream write does NOT need this:
+    the concatenated form is already correct as a single sendall().
+
+    Safe with respect to byte-stuffing: build_frame()'s own
+    byte_stuff() step guarantees every literal 0xFD/0xFE/0xFF byte
+    within a frame's ADD..CRC span is escaped into a 2-byte,
+    0xFD-prefixed sequence before the frame is assembled (see
+    byte_stuff()'s docstring) -- so a literal, UNESCAPED 0xFE or 0xFF
+    byte can only ever occur at exactly two positions in a well-formed
+    frame: its own leading STA and trailing STP. This function relies
+    on that guarantee to find frame boundaries with a plain linear
+    scan for STA/STP bytes -- it does not need to track byte-stuffing
+    state, parse MFL, or verify CRC to split correctly. (Contrast
+    rbds/tests.py's own _split_uecp_frames, a separate test-only
+    helper that DOES unstuff/verify each frame, because test
+    assertions need the decoded MEC contents, not just frame
+    boundaries.)
+
+    Raises ValueError if `payload` is not a clean, complete
+    concatenation of frames (missing/misplaced STA, or a frame whose
+    STP is never reached) -- this indicates a bug in frame
+    construction upstream, not a real transmission-time condition, so
+    callers should let it propagate as a send failure rather than
+    silently transmitting a partial or malformed frame."""
+    frames = []
+    i = 0
+    n = len(payload)
+    while i < n:
+        if payload[i] != STA:
+            raise ValueError(
+                f"split_frames: expected STA (0x{STA:02X}) at offset {i}, found 0x{payload[i]:02X}"
+            )
+        end = payload.find(bytes([STP]), i + 1)
+        if end == -1:
+            raise ValueError(
+                f"split_frames: no STP (0x{STP:02X}) found for frame starting at offset {i}"
+            )
+        frames.append(payload[i:end + 1])
+        i = end + 1
+    return frames
+
+
 def freq_to_af_code(freq_mhz: float) -> int:
     """AF code per spec: round((freq_mhz - 87.5) / 0.1). Valid station
     frequencies 87.6-107.9 MHz map to codes 1-204."""

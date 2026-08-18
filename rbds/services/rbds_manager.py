@@ -595,9 +595,13 @@ class RBDSManager:
 
     def _build_uecp_payload(self, config, ps, rt, artist=None, title=None, pty=None, ptyn="",
                              rt_ab_toggle=False, dynamic_pty=None):
-        """Assemble the full UECP payload as ONE MEC PER UECP FRAME
-        (concatenated back-to-back for a single TCP write). Not one
-        big multi-MEC frame -- observed live behavior of RDS Magic 4
+        """Assemble the full UECP payload as ONE MEC PER UECP FRAME,
+        concatenated back-to-back into a single bytes object (see
+        _frames_for()). This concatenated form is written as one TCP
+        stream write when transport=TCP; for UDP, _transmit() splits
+        it back into one datagram per frame before sending -- see that
+        method's own docstring for why. Not one big multi-MEC frame
+        either way -- observed live behavior of RDS Magic 4
         driving this same StereoTool build in a 2026-07-13 capture,
         and cross-referenced against a residual on-air symptom this
         codebase's earlier bundled-frame form exhibited: on a
@@ -711,8 +715,14 @@ class RBDSManager:
 
     def _frames_for(self, config, meds):
         """Wrap each MEC in its own UECP frame with an incrementing
-        SQC and concatenate. One TCP write, N distinct STX..ETX
-        frames on the wire (RDS Magic 4's proven shape)."""
+        SQC and concatenate into one bytes payload -- always N
+        distinct STX..ETX frames (RDS Magic 4's proven shape),
+        regardless of transport. What actually reaches the wire per
+        call depends on _transmit(): TCP writes this concatenation as
+        one stream write (sendall()); UDP splits it back into N
+        separate datagrams, one frame each -- see _transmit()'s own
+        docstring for why UDP can't use the concatenated form
+        directly the way TCP can."""
         out = bytearray()
         for med in meds:
             self._sqc = (self._sqc % 255) + 1
@@ -821,10 +831,44 @@ class RBDSManager:
         return ("\n".join(commands) + "\n").encode("utf-8")
 
     def _transmit(self, config, payload):
+        """Writes `payload` to the configured destination.
+
+        TCP: one sendall() of the full byte string, unchanged -- a
+        stream write, so a payload holding multiple concatenated UECP
+        frames (see _frames_for()) arrives at the far end as one
+        continuous byte sequence exactly as before this method's UDP
+        handling below existed.
+
+        UDP + UECP: `payload` may be N concatenated complete UECP
+        frames (one per MEC, see _frames_for()). UDP is
+        datagram-bounded, not stream-bounded -- a real field bug
+        (BW TX300 V3 transmitter, confirmed 2026-08-18) showed that at
+        least one real UECP/UDP receiver only processes the frame(s)
+        near the START of a multi-frame datagram and silently drops
+        the rest, which is exactly why RadioText (built late in a
+        normal full-resend payload) went out blank while PI/PS/etc.
+        (built earlier in the same payload) kept working. Sent here as
+        one sendto() PER FRAME instead, in original order, via
+        uecp.split_frames() -- a splitter that's safe against UECP's
+        own byte-stuffing (see that function's own docstring), not a
+        naive substring search. Any sendto() failure raises
+        immediately and is never swallowed here -- callers (_send())
+        must not treat earlier successful frames as a completed send;
+        the next normal retry/full-resend cycle re-sends the complete
+        current state from scratch using its own existing bookkeeping.
+
+        UDP + ASCII: unframed line-based text, not a concatenation of
+        discrete protocol frames -- nothing to split here, and no
+        evidence of the same failure mode. Sent as the single datagram
+        it already was, unchanged."""
         if config.transport == "udp":
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             try:
-                sock.sendto(payload, (config.host, config.port))
+                if config.protocol == "uecp":
+                    for frame in uecp.split_frames(payload):
+                        sock.sendto(frame, (config.host, config.port))
+                else:
+                    sock.sendto(payload, (config.host, config.port))
             finally:
                 sock.close()
             return
@@ -832,6 +876,10 @@ class RBDSManager:
         self._ensure_tcp_connected(config)
         if self._sock is None:
             raise ConnectionError("not connected (TCP reconnect backoff in effect)")
+        # TCP is a byte stream, not datagram-bounded -- the concatenated
+        # multi-frame payload is written in one sendall() exactly as
+        # before; see the UDP branch above for why UDP cannot use the
+        # same approach.
         self._sock.sendall(payload)
 
     def _ensure_tcp_connected(self, config):

@@ -3,6 +3,7 @@ import tempfile
 import time
 import unicodedata
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from django.core.exceptions import ValidationError
@@ -355,6 +356,166 @@ class UecpFrameTests(SimpleTestCase):
         inner = unstuff(inner_stuffed)
         core, crc_bytes = inner[:-2], inner[-2:]
         self.assertEqual(uecp.crc_ccitt(core), crc_bytes)
+
+
+class UecpSplitFramesTests(SimpleTestCase):
+    """uecp.split_frames() -- the safe-against-byte-stuffing splitter
+    added for IsadoraAir roadmap item [P1] 2.3A (2026-08-18): UECP/UDP
+    packetization. Unit-level coverage of the splitter itself; see
+    RBDSManagerTransmitTransportTests below for coverage of the real
+    _transmit() call path that actually uses it."""
+
+    def test_single_frame_roundtrips(self):
+        frame = uecp.build_frame(1, 0, 1, uecp.mec_ps("KOGR-LP "))
+        self.assertEqual(uecp.split_frames(frame), [frame])
+
+    def test_multiple_frames_split_in_order(self):
+        frame1 = uecp.build_frame(1, 0, 1, uecp.mec_pi(0x1000))
+        frame2 = uecp.build_frame(1, 0, 2, uecp.mec_ps("KOGR-LP "))
+        frame3 = uecp.build_frame(1, 0, 3, uecp.mec_rt("Now Playing", ab_flag=False))
+        payload = frame1 + frame2 + frame3
+        self.assertEqual(uecp.split_frames(payload), [frame1, frame2, frame3])
+
+    def test_splits_safely_around_stuffed_reserved_bytes(self):
+        """A MEC msg containing literal 0xFD/0xFE/0xFF -- build_frame()
+        must escape every one of them (see byte_stuff()), so a naive
+        unstuffed substring search for STA/STP would misfire here if
+        the splitter didn't rely on that escaping guarantee. Confirms
+        it doesn't: exactly 2 frames recovered, byte-for-byte identical
+        to the originals."""
+        frame1 = uecp.build_frame(1, 0, 1, bytes([0xFD, 0xFE, 0xFF, 0x41, 0x42]))
+        frame2 = uecp.build_frame(1, 0, 2, uecp.mec_ps("ABCDEFGH"))
+        # Sanity check the fixture actually exercises stuffing -- if
+        # this ever fails, the test below isn't testing what it claims.
+        self.assertIn(b"\xFD\x00\xFD\x01\xFD\x02", frame1)
+        payload = frame1 + frame2
+        self.assertEqual(uecp.split_frames(payload), [frame1, frame2])
+
+    def test_empty_payload_returns_empty_list(self):
+        self.assertEqual(uecp.split_frames(b""), [])
+
+    def test_missing_leading_sta_raises(self):
+        frame = uecp.build_frame(1, 0, 1, uecp.mec_ps("KOGR-LP "))
+        with self.assertRaises(ValueError):
+            uecp.split_frames(frame[1:])
+
+    def test_truncated_frame_missing_stp_raises(self):
+        frame = uecp.build_frame(1, 0, 1, uecp.mec_ps("KOGR-LP "))
+        with self.assertRaises(ValueError):
+            uecp.split_frames(frame[:-1])
+
+
+class RBDSManagerTransmitTransportTests(SimpleTestCase):
+    """IsadoraAir roadmap item [P1] 2.3A (2026-08-18): confirmed field
+    bug -- a BW TX300 V3 transmitter processed only the earlier
+    frame(s) in a multi-frame UDP datagram and silently dropped the
+    rest, so RadioText (built late in a normal full-resend payload)
+    never made it while PI/PS/etc. (built earlier in the same payload)
+    kept working. Root cause: _transmit() sent the whole concatenated
+    multi-frame UECP payload via one UDP sendto().
+
+    These tests call the REAL _transmit() (not mocked -- every other
+    RBDSManager test class in this file mocks it, since it needs a
+    real destination; this is the one class that instead mocks
+    socket.socket itself, one level down, so the real packetization
+    logic runs) to prove: one UDP sendto() per UECP frame, in order,
+    each payload exactly one complete frame; the existing single
+    sendall() TCP behavior is unchanged; ASCII/UDP still sends one
+    datagram; and a mid-loop UDP failure propagates rather than being
+    swallowed.
+
+    SimpleTestCase (no DB) -- _transmit() only ever reads plain
+    attributes off `config`, so a lightweight SimpleNamespace stands in
+    for a real (DB-backed) RBDSConfig row here; no need for the
+    heavier TestCase/RBDSConfig.load() fixture RBDSManagerOneShotToggleTests
+    et al. use for _tick()-level tests."""
+
+    def setUp(self):
+        self.mgr = RBDSManager()
+
+    def _config(self, transport, protocol="uecp"):
+        return SimpleNamespace(
+            transport=transport, protocol=protocol, host="10.0.0.5", port=4001,
+            uecp_site_address=1, uecp_encoder_address=0,
+        )
+
+    def _three_frame_payload(self, config):
+        meds = [uecp.mec_pi(0x1000), uecp.mec_ps("KOGR-LP "), uecp.mec_rt("Now Playing", ab_flag=False)]
+        return self.mgr._frames_for(config, meds)
+
+    def test_uecp_udp_sends_one_datagram_per_frame_in_order(self):
+        config = self._config("udp")
+        payload = self._three_frame_payload(config)
+        expected_frames = uecp.split_frames(payload)
+        self.assertEqual(len(expected_frames), 3, "fixture should produce exactly 3 frames")
+
+        with mock.patch("rbds.services.rbds_manager.socket.socket") as mock_socket_cls:
+            mock_sock = mock_socket_cls.return_value
+            self.mgr._transmit(config, payload)
+
+        self.assertEqual(mock_sock.sendto.call_count, 3)
+        for call, expected_frame in zip(mock_sock.sendto.call_args_list, expected_frames):
+            sent_payload, dest = call.args
+            self.assertEqual(sent_payload, expected_frame)
+            self.assertEqual(dest, ("10.0.0.5", 4001))
+        mock_sock.close.assert_called_once()
+
+    def test_uecp_udp_frame_with_reserved_byte_stuffing_splits_safely(self):
+        frame1 = uecp.build_frame(1, 0, 1, bytes([0xFD, 0xFE, 0xFF, 0x41, 0x42]))
+        frame2 = uecp.build_frame(1, 0, 2, uecp.mec_ps("ABCDEFGH"))
+        payload = frame1 + frame2
+        config = self._config("udp")
+
+        with mock.patch("rbds.services.rbds_manager.socket.socket") as mock_socket_cls:
+            mock_sock = mock_socket_cls.return_value
+            self.mgr._transmit(config, payload)
+
+        sent_payloads = [call.args[0] for call in mock_sock.sendto.call_args_list]
+        self.assertEqual(sent_payloads, [frame1, frame2])
+
+    def test_uecp_tcp_still_sends_one_sendall_with_full_concatenated_payload(self):
+        """Do NOT introduce one TCP write per frame -- the existing
+        single sendall() of the full concatenation must be untouched."""
+        config = self._config("tcp")
+        payload = self._three_frame_payload(config)
+        self.assertEqual(len(uecp.split_frames(payload)), 3, "fixture should produce exactly 3 frames")
+
+        self.mgr._sock = mock.Mock()
+        self.mgr._ensure_tcp_connected = mock.Mock()  # pretend already connected
+        self.mgr._transmit(config, payload)
+
+        self.mgr._sock.sendall.assert_called_once_with(payload)
+
+    def test_ascii_udp_still_sends_a_single_datagram(self):
+        """ASCII is unframed text, not a concatenation of UECP frames
+        -- must not be run through the splitter at all."""
+        payload = b"PI=1000\nPS=KOGR-LP \n"
+        config = self._config("udp", protocol="ascii")
+
+        with mock.patch("rbds.services.rbds_manager.socket.socket") as mock_socket_cls:
+            mock_sock = mock_socket_cls.return_value
+            self.mgr._transmit(config, payload)
+
+        mock_sock.sendto.assert_called_once_with(payload, ("10.0.0.5", 4001))
+
+    def test_uecp_udp_failure_on_later_frame_propagates(self):
+        """A sendto() failure partway through must never be swallowed
+        -- the manager needs to see it (via the existing _send()
+        except/return-False path, unchanged by this fix) so it never
+        treats a partially-delivered full-resend as successful; the
+        next normal retry/full-resend re-sends the complete state."""
+        config = self._config("udp")
+        payload = self._three_frame_payload(config)
+
+        with mock.patch("rbds.services.rbds_manager.socket.socket") as mock_socket_cls:
+            mock_sock = mock_socket_cls.return_value
+            mock_sock.sendto.side_effect = [None, OSError("network unreachable"), None]
+            with self.assertRaises(OSError):
+                self.mgr._transmit(config, payload)
+            # First frame sent, second raised -- third never attempted,
+            # and the socket is still closed on the way out (finally).
+            self.assertEqual(mock_sock.sendto.call_count, 2)
+            mock_sock.close.assert_called_once()
 
 
 class AsciiProtocolTests(SimpleTestCase):
