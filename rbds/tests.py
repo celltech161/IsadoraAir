@@ -10,7 +10,7 @@ from django.core.exceptions import ValidationError
 from django.test import SimpleTestCase, TestCase
 
 from rbds.models import RBDSConfig, RBDSMessage, RBDSPSFrame
-from rbds.services import ascii_protocol, charset, uecp
+from rbds.services import ascii_protocol, charset, dynamic_ps, uecp
 from rbds.services import rbds_manager
 from rbds.services.content_fetch import ContentFetchCache
 from rbds.services.rbds_manager import RBDSManager
@@ -609,6 +609,309 @@ class PSRotationTests(SimpleTestCase):
         # Admin edit: a new frame list entirely
         new_frames = [("NEWFRAME", 5)]
         self.assertEqual(rotation.advance(new_frames), "NEWFRAME")
+
+
+class DynamicPsFrameGeneratorTests(SimpleTestCase):
+    """rbds.services.dynamic_ps.generate_ps_frames() -- IsadoraAir
+    roadmap [P1] 2.3B (2026-08-18): pure Dynamic/Rotating PS frame
+    generation for Modes 0-3. Deliberately separate from PSRotation
+    (rotation.py, see PSRotationTests above, untouched by this class)
+    -- this module only decides WHAT the frames are, never WHEN to
+    show them; see dynamic_ps.py's own module docstring for the full
+    design rationale, including why normalization happens INSIDE this
+    function rather than being a caller obligation."""
+
+    # ---- Mode 0: fixed 8-character cells ----
+
+    def test_mode0_empty_text(self):
+        self.assertEqual(dynamic_ps.generate_ps_frames("", 0), ["        "])
+
+    def test_mode0_one_character(self):
+        self.assertEqual(dynamic_ps.generate_ps_frames("A", 0), ["A       "])
+
+    def test_mode0_exactly_eight_characters(self):
+        self.assertEqual(dynamic_ps.generate_ps_frames("ABCDEFGH", 0), ["ABCDEFGH"])
+
+    def test_mode0_nine_characters(self):
+        self.assertEqual(dynamic_ps.generate_ps_frames("ABCDEFGHI", 0), ["ABCDEFGH", "I       "])
+
+    def test_mode0_multiple_complete_cells(self):
+        self.assertEqual(
+            dynamic_ps.generate_ps_frames("ABCDEFGHIJKLMNOP", 0),
+            ["ABCDEFGH", "IJKLMNOP"],
+        )
+
+    def test_mode0_final_partial_cell(self):
+        self.assertEqual(
+            dynamic_ps.generate_ps_frames("ABCDEFGHIJKLMNOPQRST", 0),
+            ["ABCDEFGH", "IJKLMNOP", "QRST    "],
+        )
+
+    def test_mode0_preserves_internal_spaces(self):
+        """Mode 0 is the raw/fixed-cell mode -- manual formatting in
+        the source is meaningful and must never be collapsed, unlike
+        Mode 2's word-wrapping."""
+        self.assertEqual(
+            dynamic_ps.generate_ps_frames("AB  CD  EF", 0),
+            ["AB  CD  ", "EF      "],
+        )
+
+    # ---- Mode 1: one-character sliding window ----
+
+    def test_mode1_shorter_than_eight(self):
+        self.assertEqual(dynamic_ps.generate_ps_frames("ABC", 1), ["ABC     "])
+
+    def test_mode1_exactly_eight(self):
+        self.assertEqual(dynamic_ps.generate_ps_frames("ABCDEFGH", 1), ["ABCDEFGH"])
+
+    def test_mode1_nine_characters(self):
+        self.assertEqual(
+            dynamic_ps.generate_ps_frames("ABCDEFGHI", 1),
+            ["ABCDEFGH", "BCDEFGHI"],
+        )
+
+    def test_mode1_ten_plus_characters_exact_ordered_windows(self):
+        self.assertEqual(
+            dynamic_ps.generate_ps_frames("ABCDEFGHIJ", 1),
+            ["ABCDEFGH", "BCDEFGHI", "CDEFGHIJ"],
+        )
+
+    def test_mode1_no_circular_wrap_frame(self):
+        """The window sequence must stop at the literal end of the
+        text: exactly len(text) - PS_FRAME_WIDTH + 1 windows (never
+        len(text), which a circular/wraparound implementation would
+        produce), and no frame may equal the hypothetical wrapped
+        window (tail characters immediately followed by head
+        characters) a circular implementation would emit."""
+        text = "ABCDEFGHIJ"
+        frames = dynamic_ps.generate_ps_frames(text, 1)
+        self.assertEqual(len(frames), len(text) - dynamic_ps.PS_FRAME_WIDTH + 1)
+        wrapped_frame = (text + text)[len(text) - 1:len(text) - 1 + dynamic_ps.PS_FRAME_WIDTH]
+        self.assertEqual(wrapped_frame, "JABCDEFG")  # sanity-check the fixture itself
+        self.assertNotIn(wrapped_frame, frames)
+
+    # ---- Mode 2: word-aligned cells ----
+
+    def test_mode2_one_short_word(self):
+        self.assertEqual(dynamic_ps.generate_ps_frames("Hi", 2), ["Hi      "])
+
+    def test_mode2_multiple_words_fit_one_cell(self):
+        self.assertEqual(dynamic_ps.generate_ps_frames("THE BEST", 2), ["THE BEST"])
+
+    def test_mode2_words_requiring_multiple_cells(self):
+        self.assertEqual(
+            dynamic_ps.generate_ps_frames("THE BEST MUSIC", 2),
+            ["THE BEST", "MUSIC   "],
+        )
+
+    def test_mode2_repeated_and_mixed_whitespace_collapses(self):
+        self.assertEqual(
+            dynamic_ps.generate_ps_frames("THE   BEST\tMUSIC", 2),
+            dynamic_ps.generate_ps_frames("THE BEST MUSIC", 2),
+        )
+
+    def test_mode2_leading_and_trailing_whitespace_stripped(self):
+        self.assertEqual(dynamic_ps.generate_ps_frames("   THE BEST   ", 2), ["THE BEST"])
+
+    def test_mode2_exactly_eight_character_word(self):
+        self.assertEqual(dynamic_ps.generate_ps_frames("ABCDEFGH", 2), ["ABCDEFGH"])
+
+    def test_mode2_overlength_word_chunked_not_truncated(self):
+        """>8-character word: never truncated, never silently loses
+        characters -- split into its own consecutive fixed-width
+        chunks instead (reuses Mode 0's chunker)."""
+        self.assertEqual(
+            dynamic_ps.generate_ps_frames("CHRISTOPHER", 2),
+            ["CHRISTOP", "HER     "],
+        )
+
+    def test_mode2_several_overlength_words_never_share_a_frame(self):
+        self.assertEqual(
+            dynamic_ps.generate_ps_frames("CHRISTOPHERSON ALEXANDRIA", 2),
+            ["CHRISTOP", "HERSON  ", "ALEXANDR", "IA      "],
+        )
+
+    def test_mode2_short_word_never_packed_into_long_words_final_chunk_remainder(self):
+        """The blank remainder of an overlength word's final chunk
+        ("HERSON  ") must never be shared with the word that comes
+        next ("Bye") -- "Bye" gets its own fresh frame."""
+        self.assertEqual(
+            dynamic_ps.generate_ps_frames("Hi CHRISTOPHERSON Bye", 2),
+            ["Hi      ", "CHRISTOP", "HERSON  ", "Bye     "],
+        )
+
+    def test_mode2_punctuation_stays_attached_no_character_loss(self):
+        frames = dynamic_ps.generate_ps_frames("Hello, World!", 2)
+        self.assertEqual(frames, ["Hello,  ", "World!  "])
+        # No character loss beyond intended whitespace-collapsing: every
+        # non-space character from the source reappears in the output.
+        self.assertEqual("".join(frames).replace(" ", ""), "Hello,World!")
+
+    def test_mode2_empty_and_whitespace_only_text(self):
+        self.assertEqual(dynamic_ps.generate_ps_frames("", 2), ["        "])
+        self.assertEqual(dynamic_ps.generate_ps_frames("   ", 2), ["        "])
+
+    def test_mode2_oak_grove_example(self):
+        """None of these four words pair up under the 8-char/1-space
+        greedy rule (each pairing would exceed 8), so each gets its
+        own left-aligned, padded frame -- a legitimate, deterministic
+        outcome, not a bug."""
+        self.assertEqual(
+            dynamic_ps.generate_ps_frames("Oak Grove Radio 98.5", 2),
+            ["Oak     ", "Grove   ", "Radio   ", "98.5    "],
+        )
+
+    # ---- Mode 3: one-character scroll with blank separation ----
+
+    def test_mode3_empty_text(self):
+        self.assertEqual(dynamic_ps.generate_ps_frames("", 3), ["        "])
+
+    def test_mode3_short_text(self):
+        frames = dynamic_ps.generate_ps_frames("HI", 3)
+        self.assertEqual(len(frames), 11)  # (8+2+8) - 8 + 1
+        self.assertEqual(frames[0], "        ")
+        self.assertEqual(frames[-1], "        ")
+
+    def test_mode3_exactly_eight_characters(self):
+        frames = dynamic_ps.generate_ps_frames("ABCDEFGH", 3)
+        self.assertEqual(len(frames), 17)  # (8+8+8) - 8 + 1
+        self.assertEqual(frames[0], "        ")
+        self.assertEqual(frames[-1], "        ")
+
+    def test_mode3_longer_text_exact_sequence(self):
+        self.assertEqual(
+            dynamic_ps.generate_ps_frames("HELLO", 3),
+            [
+                "        ",
+                "       H",
+                "      HE",
+                "     HEL",
+                "    HELL",
+                "   HELLO",
+                "  HELLO ",
+                " HELLO  ",
+                "HELLO   ",
+                "ELLO    ",
+                "LLO     ",
+                "LO      ",
+                "O       ",
+                "        ",
+            ],
+        )
+
+    def test_mode3_first_frame_is_all_spaces(self):
+        self.assertEqual(dynamic_ps.generate_ps_frames("ANYTHING", 3)[0], "        ")
+
+    def test_mode3_last_frame_is_all_spaces(self):
+        self.assertEqual(dynamic_ps.generate_ps_frames("ANYTHING", 3)[-1], "        ")
+
+    def test_mode3_one_character_progression(self):
+        """Each frame after the first must differ from its predecessor
+        by exactly a one-character shift -- confirmed by the 7-char
+        overlap between consecutive frames."""
+        frames = dynamic_ps.generate_ps_frames("AB", 3)
+        for i in range(1, len(frames)):
+            self.assertEqual(frames[i - 1][1:], frames[i][:-1])
+
+    def test_mode3_source_enters_and_leaves_display(self):
+        text = "HI"
+        frames = dynamic_ps.generate_ps_frames(text, 3)
+        # Fully visible, flush right against the leading blanks
+        # (fully "entered" the display)...
+        self.assertIn(("        " + text)[-dynamic_ps.PS_FRAME_WIDTH:], frames)
+        # ...and fully visible, flush left against the trailing blanks
+        # (about to "leave" the display).
+        self.assertIn((text + "        ")[:dynamic_ps.PS_FRAME_WIDTH], frames)
+
+    def test_mode3_no_wraparound_extra_frames(self):
+        """Total frame count must exactly equal the non-circular
+        window formula applied to the padded working string -- a
+        circular/wrapping implementation would produce additional
+        frames beyond this count."""
+        text = "HELLO WORLD"
+        frames = dynamic_ps.generate_ps_frames(text, 3)
+        working_len = 2 * dynamic_ps.PS_FRAME_WIDTH + len(text)
+        self.assertEqual(len(frames), working_len - dynamic_ps.PS_FRAME_WIDTH + 1)
+
+    # ---- Normalization ordering ----
+
+    def test_normalization_accented_character_supported_by_normalize_text(self):
+        """A decomposed accented character (NFC-composed by
+        normalize_text() before this module ever sees it) appears in
+        the output as its single, precomposed G0-representable form."""
+        raw = "café"  # "café" as base "e" + combining acute (U+0301)
+        self.assertEqual(dynamic_ps.generate_ps_frames(raw, 0), ["café    "])
+
+    def test_normalization_smart_punctuation_supported_by_normalize_text(self):
+        self.assertEqual(dynamic_ps.generate_ps_frames("It’s", 0), ["It's    "])
+
+    def test_normalization_unsupported_character_not_dropped_by_this_module(self):
+        """A character with no G0 representation at all is outside
+        normalize_text()'s own scope (NFC/smart-punctuation/control-
+        chars only) -- it must still occupy exactly one character
+        position in the frame this module produces, never silently
+        dropped here. encode_rds_g0() substitutes it with a space only
+        later, at mec_ps()'s own call site -- never in this module."""
+        source = "AB\U0001F3B5CD"  # AB + musical-note emoji + CD -- 5 characters
+        self.assertEqual(len(source), 5)
+        frames = dynamic_ps.generate_ps_frames(source, 0)
+        self.assertEqual(frames, [source.ljust(8)])
+
+    def test_normalization_happens_before_frame_boundaries_are_computed(self):
+        """Direct proof that frame boundaries are placed AFTER
+        normalization, not on the raw input: the ellipsis "…" expands
+        to "..." (+2 characters) under normalize_text(). Constructed so
+        the RAW text is exactly PS_FRAME_WIDTH (8) characters -- which
+        would need only ONE frame if boundaries were (incorrectly)
+        computed on the raw string -- while the NORMALIZED text is 10
+        characters, which genuinely needs TWO."""
+        raw = "ABCDEFG…"  # 7 letters + ellipsis = 8 raw characters
+        self.assertEqual(len(raw), dynamic_ps.PS_FRAME_WIDTH)
+        frames = dynamic_ps.generate_ps_frames(raw, 0)
+        self.assertEqual(frames, ["ABCDEFG.", "..      "])
+        self.assertEqual(
+            len(frames), 2,
+            "boundary must be computed on the 10-char normalized form, not the 8-char raw form",
+        )
+
+    # ---- General / contract ----
+
+    def test_invalid_mode_raises_value_error_not_silent_fallback(self):
+        with self.assertRaises(ValueError):
+            dynamic_ps.generate_ps_frames("TEXT", 4)
+        with self.assertRaises(ValueError):
+            dynamic_ps.generate_ps_frames("TEXT", -1)
+        with self.assertRaises(ValueError):
+            dynamic_ps.generate_ps_frames("TEXT", "0")  # not silently coerced from a string
+
+    def test_all_returned_frames_are_exactly_eight_characters(self):
+        samples = ["", "A", "ABCDEFGH", "ABCDEFGHI", "THE BEST MUSIC", "CHRISTOPHER", "   ", "HELLO WORLD"]
+        for mode in (
+            dynamic_ps.MODE_FIXED_CELLS, dynamic_ps.MODE_SLIDING_WINDOW,
+            dynamic_ps.MODE_WORD_ALIGNED, dynamic_ps.MODE_SCROLL_WITH_BLANK,
+        ):
+            for text in samples:
+                for frame in dynamic_ps.generate_ps_frames(text, mode):
+                    self.assertEqual(
+                        len(frame), dynamic_ps.PS_FRAME_WIDTH, f"mode={mode} text={text!r} frame={frame!r}",
+                    )
+
+    def test_deterministic_same_input_same_output(self):
+        for mode in range(4):
+            first = dynamic_ps.generate_ps_frames("Oak Grove Radio 98.5", mode)
+            second = dynamic_ps.generate_ps_frames("Oak Grove Radio 98.5", mode)
+            self.assertEqual(first, second)
+
+    def test_generator_has_no_clock_or_time_dependency(self):
+        """No FakeClock, no time/datetime import anywhere in
+        dynamic_ps.py -- confirmed both structurally and behaviorally
+        (repeated calls never differ)."""
+        import inspect
+        source = inspect.getsource(dynamic_ps)
+        self.assertNotIn("import time", source)
+        self.assertNotIn("import datetime", source)
+        results = {tuple(dynamic_ps.generate_ps_frames("SAME TEXT HERE", 2)) for _ in range(5)}
+        self.assertEqual(len(results), 1)
 
 
 class RTRotationTests(SimpleTestCase):
