@@ -10,7 +10,7 @@ install is a `@@PLACEHOLDER@@` token — see below to render + install.
 |---|---|---|
 | `@@ISA_USER@@` | Linux user + group that owns the install and runs every service | `isadoraair`, or your existing `deploy` user |
 | `@@ISA_ROOT@@` | Repo checkout directory (contains `manage.py`, `venv/`, `.env`) | `/opt/isadoraair` |
-| `@@ISA_HOME@@` | Home directory of `@@ISA_USER@@` — only used to locate the backup script | `/home/isadoraair` |
+| `@@ISA_HOME@@` | Home directory of `@@ISA_USER@@` — only used in `isadoraair-backup.service`'s comment documenting where the backup credential file lives | `/home/isadoraair` |
 | `@@SYNDICATED_ROOT@@` | Root of the separate syndicated-ingest scripts + venv | `/home/isadoraair/syndicated-ingest` |
 | `@@WEATHER_ROOT@@` | Root of the separate weather-ingest scripts + venv | `/home/isadoraair/weather-ingest` |
 | `@@OGREMOTE_ROOT@@` | Root of the separate ogremote-ingest scripts + venv | `/home/isadoraair/ogremote-ingest` |
@@ -98,7 +98,7 @@ Timer-driven jobs (fire on a schedule, exit):
 | `isadoraair-prune-royalty-ledger.timer` | Daily (04:35) — prunes PlayEvent + IcecastSample rows past retention (default 3 years each). RoyaltyReport rows and their generated files are kept forever. |
 | `isadoraair-tunein-push.timer` | Every 30s — pushes now-playing to TuneIn's AIR API when the current PlayEvent id differs from the last successful push. No-op until credentials are entered at Config > TuneIn AIR and `enabled` is checked. |
 | `isadoraair-generate-dedication-intros.timer` | Every 15s — synthesizes spoken dedication intros (Kokoro) for scheduled web song requests. `Nice=19`, independent of the 20s web-requests-ingest poll cycle (Kokoro+ffmpeg can take tens of seconds). Only relevant if Web Requests is enabled. |
-| `isadoraair-backup.timer` | Nightly full backup (03:30) — needs the `backup_isadoraair.sh` script and remote-target creds outside the repo |
+| `isadoraair-backup.timer` | Nightly full backup (03:30) — runs the repo-managed `deploy/backup_isadoraair.sh`; needs remote-target creds (`@@ISA_HOME@@/.iasboxbu.cred`) outside the repo |
 | `isadoraair-prune-emaillog.timer` | Daily (04:15) EmailLog retention prune, 90-day default |
 | `isadoraair-prune-systemevents.timer` | Daily (04:24) SystemEvent retention prune |
 | `isadoraair-mitd-prep.timer` | Weekly (Mon 10:15) MITD show file staging |
@@ -174,10 +174,13 @@ reference them but do not include their source — this repo is
 IsadoraAir itself; those three ingest paths are companion projects
 that produce audio + metadata IsadoraAir then plays.
 
-The backup script (`@@ISA_HOME@@/bin/backup_isadoraair.sh`) and its
-credential file (`@@ISA_HOME@@/.iasboxbu.cred`) also live outside
-the repo — the `.timer` here just fires the script, you supply
-your own.
+The backup **script** (`deploy/backup_isadoraair.sh`) is repo-managed —
+`isadoraair-backup.service`'s `ExecStart` runs it directly from your
+checkout (`@@ISA_ROOT@@/deploy/backup_isadoraair.sh`), same as every
+other unit in this directory. Only its **credential file**
+(`@@ISA_HOME@@/.iasboxbu.cred` — `BAK_HOST`/`BAK_USER`/`BAK_PORT`/
+`BAK_PATH`/`BAK_PASS`, mode `0600`) lives outside the repo, since it's
+a station-specific secret, not code.
 
 If you're not running any of the above, skip enabling the
 corresponding units. The core five services + the three prune/

@@ -61,12 +61,16 @@
 # configuration). Neither is anything a restore needs; .env itself is
 # still fully included. Both are now excluded explicitly.
 #
-# The live production timer (isadoraair-backup.service, currently pointed
-# at ~/bin/backup_isadoraair.sh) has NOT been repointed at this repo copy
-# as part of writing this file — doing so (e.g. by symlinking the old
-# path here, or updating the unit's ExecStart) is an intended follow-up
-# deployment step, done deliberately and separately, not implied by this
-# commit.
+# 2026-08-17 disaster-recovery Phase 4.5: the intended follow-up above
+# has happened -- production's isadoraair-backup.service now runs THIS
+# file directly (ExecStart=/opt/isadoraair/deploy/backup_isadoraair.sh,
+# confirmed live). What Phase 4.5 actually found and fixed was that
+# deploy/isadoraair-backup.service's own repo TEMPLATE had not been
+# updated to match -- it still pointed at the old @@ISA_HOME@@/bin/
+# path, meaning a fresh install rendering that template would install a
+# unit pointing at a script the restore tooling never creates. See
+# docs/DISASTER_RECOVERY.md's "Known deployment follow-up, resolved"
+# section for the full history.
 #
 # Pushes the result via SFTP to a remote target configured in
 # ~/.iasboxbu.cred (BAK_HOST, BAK_USER, BAK_PORT, BAK_PATH, BAK_PASS) —

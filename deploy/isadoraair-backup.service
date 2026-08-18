@@ -7,4 +7,9 @@ Wants=network-online.target
 Type=oneshot
 User=@@ISA_USER@@
 Group=@@ISA_USER@@
-ExecStart=@@ISA_HOME@@/bin/backup_isadoraair.sh
+# deploy/backup_isadoraair.sh is the repo-managed, authoritative backup
+# implementation (IsadoraAir 1.2 Phase 2, 2026-08-12) -- NOT a host-local
+# copy the operator supplies separately. Only the credential file
+# (@@ISA_HOME@@/.iasboxbu.cred, read by the script itself, never by this
+# unit) is external -- see deploy/README.md and docs/DISASTER_RECOVERY.md.
+ExecStart=@@ISA_ROOT@@/deploy/backup_isadoraair.sh

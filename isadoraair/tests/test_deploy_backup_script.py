@@ -7,14 +7,29 @@ properties that matter most for disaster-recovery correctness: the
 exact set of things it does/doesn't touch, its own safety properties,
 and that no secret value has been hardcoded into a file this repo
 commits. `bash -n` (syntax only) is exercised separately by this same
-test as a subprocess check -- cheap, safe, no side effects."""
+test as a subprocess check -- cheap, safe, no side effects.
+
+`BackupServiceUnitTests` and `NinetySystemConfigRendersBackupUnitTests`
+below cover the sibling regression this same disaster-recovery work
+found in Phase 4.5 (2026-08-17): `deploy/isadoraair-backup.service`'s
+own `ExecStart` had drifted stale, still pointing at a historical
+`@@ISA_HOME@@/bin/backup_isadoraair.sh` host-local copy that production
+itself had already stopped using -- a fresh restore rendering that
+template would have installed a unit pointing at a script the restore
+tooling never creates. See docs/DISASTER_RECOVERY.md's "Known
+deployment follow-up, resolved" section for the full history."""
 import re
+import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 from django.test import SimpleTestCase
 
-SCRIPT_PATH = Path(__file__).resolve().parent.parent.parent / "deploy" / "backup_isadoraair.sh"
+DEPLOY_DIR = Path(__file__).resolve().parent.parent.parent / "deploy"
+SCRIPT_PATH = DEPLOY_DIR / "backup_isadoraair.sh"
+SERVICE_PATH = DEPLOY_DIR / "isadoraair-backup.service"
+NINETY_SYSTEM_CONFIG = DEPLOY_DIR / "restore" / "90-system-config.sh"
 
 
 class BackupScriptExistsAndParsesTests(SimpleTestCase):
@@ -255,3 +270,96 @@ class BackupScriptContentTests(SimpleTestCase):
         apply it -- it must never restart/reload any service."""
         for forbidden in ("systemctl restart", "systemctl reload", "nginx -s reload"):
             self.assertNotIn(forbidden, self.text)
+
+
+class BackupServiceUnitTests(SimpleTestCase):
+    """deploy/isadoraair-backup.service -- the systemd unit template.
+    Phase 4.5 regression coverage: the unit must run the repo-managed
+    script directly (@@ISA_ROOT@@/deploy/backup_isadoraair.sh), never
+    the historical @@ISA_HOME@@/bin/ host-local copy, and the
+    credential file stays external to both the script (already covered
+    above by test_config_file_is_external_not_repo_relative) and this
+    unit itself."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.text = SERVICE_PATH.read_text(encoding="utf-8")
+
+    def test_service_file_exists(self):
+        self.assertTrue(SERVICE_PATH.is_file(), f"{SERVICE_PATH} does not exist")
+
+    def test_execstart_runs_the_repo_managed_script(self):
+        self.assertIn(
+            "ExecStart=@@ISA_ROOT@@/deploy/backup_isadoraair.sh", self.text,
+        )
+
+    def test_execstart_does_not_reference_historical_host_local_copy(self):
+        """The exact regression this pass fixed: ExecStart must never
+        point at the old @@ISA_HOME@@/bin/ path again."""
+        self.assertNotIn("@@ISA_HOME@@/bin/backup_isadoraair.sh", self.text)
+        for line in self.text.splitlines():
+            if line.strip().startswith("ExecStart="):
+                self.assertNotIn("ISA_HOME", line, f"ExecStart still references ISA_HOME: {line!r}")
+
+    def test_credential_file_path_is_documentation_only_not_a_directive(self):
+        """@@ISA_HOME@@/.iasboxbu.cred may be MENTIONED (in the comment
+        explaining the script/credential split), but the unit itself
+        must never read it directly -- the script does that (see
+        CONFIG_FILE="$HOME/.iasboxbu.cred" in backup_isadoraair.sh)."""
+        self.assertNotIn("EnvironmentFile", self.text)
+        self.assertNotIn("iasboxbu.cred", " ".join(
+            line for line in self.text.splitlines()
+            if line.strip().startswith(("ExecStart=", "ExecStartPre=", "ExecStartPost="))
+        ))
+
+    def test_no_secret_value_embedded(self):
+        for forbidden in ("BAK_PASS=", "BAK_HOST=", "BAK_USER=", "PGPASSWORD"):
+            self.assertNotIn(forbidden, self.text)
+
+    def test_renders_cleanly_with_the_documented_placeholder_substitution(self):
+        """Same sed loop deploy/README.md documents as the canonical
+        install procedure -- confirms the file has no leftover/unknown
+        placeholder tokens after substitution."""
+        rendered = self.text
+        for token, value in (
+            ("@@ISA_USER@@", "isadoraair"),
+            ("@@ISA_ROOT@@", "/opt/isadoraair"),
+            ("@@ISA_HOME@@", "/home/isadoraair"),
+        ):
+            rendered = rendered.replace(token, value)
+        self.assertNotIn("@@", rendered, f"unrendered placeholder left in output:\n{rendered}")
+        self.assertIn("ExecStart=/opt/isadoraair/deploy/backup_isadoraair.sh", rendered)
+
+
+class NinetySystemConfigRendersBackupUnitTests(SimpleTestCase):
+    """Real functional test (subprocess, not text matching): exercises
+    deploy/restore/90-system-config.sh's own generic deploy/*.service
+    render+install loop -- the actual code path a real restore uses --
+    against an isolated --staging-root, and confirms the FINAL unit
+    landing on disk points at the repo-managed script. Proves the
+    restore tooling never needs to manufacture an extra host-local
+    backup-script copy; production is never touched (staging root
+    only)."""
+
+    def setUp(self):
+        self.staging_root = Path(tempfile.mkdtemp(prefix="isadoraair-backup-unit-test-"))
+        self.addCleanup(shutil.rmtree, self.staging_root, ignore_errors=True)
+
+    def test_rendered_backup_service_execstart_matches_repo_script(self):
+        result = subprocess.run(
+            [str(NINETY_SYSTEM_CONFIG), "--staging-root", str(self.staging_root), "--apply"],
+            capture_output=True, text=True, timeout=60,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        rendered_path = self.staging_root / "etc" / "systemd" / "system" / "isadoraair-backup.service"
+        self.assertTrue(rendered_path.is_file(), f"{rendered_path} was not rendered")
+        rendered_text = rendered_path.read_text(encoding="utf-8")
+
+        expected_execstart = f"ExecStart={self.staging_root}/opt/isadoraair/deploy/backup_isadoraair.sh"
+        self.assertIn(expected_execstart, rendered_text)
+        self.assertNotIn("ISA_HOME", "\n".join(
+            line for line in rendered_text.splitlines() if line.startswith("ExecStart=")
+        ))
+        self.assertNotIn("@@", rendered_text, "unrendered placeholder left in the installed unit")

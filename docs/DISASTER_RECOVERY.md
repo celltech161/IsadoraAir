@@ -23,8 +23,8 @@ the distilled, durable result.
 `deploy/backup_isadoraair.sh` — the authoritative, repo-versioned
 implementation as of Phase 2 (previously host-only, at
 `~/bin/backup_isadoraair.sh`, with no version control on the script
-itself; that host copy has not yet been repointed at this file, see
-"Known deployment follow-up" below) — runs nightly via
+itself; see "Known deployment follow-up, resolved" below for the
+repoint history) — runs nightly via
 `isadoraair-backup.service`/`.timer`, producing one timestamped
 `isadoraair-backup-YYYYMMDD-HHMMSS.tar.gz`, uploaded over SFTP to a
 remote target configured in `~/.iasboxbu.cred` (never in the repo), with
@@ -70,15 +70,30 @@ SHA it was taken alongside.
   components" below.
 - All the secrets listed under "Secret reprovisioning boundary".
 
-### Known deployment follow-up
+### Known deployment follow-up, resolved
 
-`isadoraair-backup.service` (the live systemd unit) still points at
-`~/bin/backup_isadoraair.sh`, not this repo's `deploy/backup_isadoraair.sh`.
-Repointing it (symlink the old path here, or update the unit's
-`ExecStart`) is an intentional, separate deployment step — not done
-automatically by adding this file to the repo, and not done as part of
-Phase 2 (which explicitly stopped short of restarting/redeploying
-anything pending review).
+Phase 2 (2026-08-12) deliberately stopped short of repointing
+production's live `isadoraair-backup.service` at the new repo copy,
+pending separate review — at that point the live unit still ran
+`~/bin/backup_isadoraair.sh`, and this section said so.
+
+That repoint has since happened: production's
+`/etc/systemd/system/isadoraair-backup.service` now runs
+`ExecStart=/opt/isadoraair/deploy/backup_isadoraair.sh` (confirmed live
+during the Phase 4.5 audit, 2026-08-17) — i.e. the repo-managed script,
+via the `/opt/isadoraair` symlink. What Phase 4.5 actually found and
+fixed was a second-order gap left behind by that manual repoint: the
+**repo's own template**, `deploy/isadoraair-backup.service`, still had
+`ExecStart=@@ISA_HOME@@/bin/backup_isadoraair.sh` — nobody had gone back
+and updated the template (or this doc, or `deploy/README.md`, or the
+backup script's own header comment) to match what production was
+actually running. A fresh install rendering that stale template would
+have installed a unit pointing at a script the restore tooling never
+creates — exactly the Phase 5 blocker this section originally existed
+to flag, just inverted (repo behind production, not production behind
+repo). Fixed in the same pass: the template now reads
+`ExecStart=@@ISA_ROOT@@/deploy/backup_isadoraair.sh`, matching
+production and every other unit in `deploy/`.
 
 ## Music library — explicit scope decision
 
