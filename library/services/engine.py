@@ -704,6 +704,16 @@ class PlaybackEngine:
 
         src = Gst.ElementFactory.make("alsasrc", "mic_src")
         src.set_property("device", mic_device)
+        # Do not allow removable capture hardware to become the shared main
+        # pipeline clock. A vanished ALSA capture device can leave its
+        # GstAudioSrcClock selected but frozen, stalling unrelated live
+        # branches in this same pipeline (Studio Monitor, StereoTool) even
+        # while PLAYING. Empirically validated in scratchpad/audio_recovery/
+        # (see PHASE_P0_1.3_DISCOVERY_AND_DESIGN.md) -- this alone is
+        # sufficient; GStreamer's normal automatic clock selection then
+        # falls through to GstSystemClock on its own. Do not pair this with
+        # a pipeline.use_clock() call (that path was tested and retired).
+        src.set_property("provide-clock", False)
         convert = Gst.ElementFactory.make("audioconvert", "mic_convert")
         resample = Gst.ElementFactory.make("audioresample", "mic_resample")
         capsfilter = Gst.ElementFactory.make("capsfilter", "mic_caps")
