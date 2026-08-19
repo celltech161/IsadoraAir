@@ -37,6 +37,11 @@ def make_minimal_stand_in():
     obj.mic_ptt_valve = None
     obj.mic_ok = False
     obj.mic_live = False
+    # [P0] 1.3B2: _write_state()'s mic_recovery field reads _mic_slot;
+    # None here matches "no mic configured" (_mic_recovery_state()
+    # returns None immediately in that case, same as every other mic_*
+    # field's "not configured" value above).
+    obj._mic_slot = None
     obj.manual_mode = False
     obj._manual_from_mic = False
     obj.remote_dj_tee = None

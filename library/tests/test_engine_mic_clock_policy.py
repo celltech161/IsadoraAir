@@ -40,9 +40,21 @@ def make_mic_stand_in():
     return None here anyway, short-circuiting the whole method before
     the alsasrc is even built), pipeline_sample_rate, and
     _apply_mic_gain (stubbed to a no-op -- gain is irrelevant to clock
-    policy and its real version also hits the DB)."""
+    policy and its real version also hits the DB).
+
+    [P0] 1.3B2 update: _build_mic_chain now also builds the persistent
+    silence/quarantine/selector topology and an initial hardware
+    generation via _build_mic_hw_generation -- the extra attributes below
+    are what those additions touch. See test_engine_mic_recovery.py for
+    the full 1.3B2-specific test suite; this file stays focused on the
+    1.3B1 clock-policy guarantee alone, now re-verified against the
+    post-1.3B2 construction shape."""
     obj = object.__new__(eng_module.PlaybackEngine)
     obj._resolve_mic_device = lambda: FAKE_MIC_DEVICE
+    obj._resolve_mic_identity = lambda: None  # real version hits the DB; harmless no-op here
+    obj._mic_identity_kind = ""
+    obj._mic_identity = ""
+    obj._mic_legacy_device = FAKE_MIC_DEVICE
     obj.pipeline_sample_rate = 44100
     obj._apply_mic_gain = lambda: None
     obj.mic_gain = None
@@ -50,15 +62,36 @@ def make_mic_stand_in():
     obj.mic_ptt_volume = None
     obj._mic_bin = None
     obj.mic_ok = False
+    obj._mic_hw_bin = None
+    obj._mic_hw_generation = 0
+    obj._mic_pending_hw_bin = None
+    obj._mic_selector = None
+    obj._mic_silence_pad = None
+    obj._mic_device_pad = None
+    obj._mic_quarantine_q = None
+    obj._mic_slot = None
+    obj._mic_last_observed_slot_state = None
+    obj._mic_buf_last_ns = None
+    obj._mic_buf_count = 0
     return obj
 
 
 def get_alsasrc(mic_bin):
-    """The mic bin's alsasrc, found by element name (assigned "mic_src"
-    in _build_mic_chain) rather than by position, so this doesn't
-    silently start checking the wrong element if the chain is
-    reordered."""
-    return mic_bin.get_by_name("mic_src")
+    """The mic bin's alsasrc, found by element FACTORY TYPE rather than
+    exact name or position. [P0] 1.3B2 update: the alsasrc now lives
+    nested inside a per-generation sub-bin (e.g. "mic_hw_gen1") and is
+    itself named with a generation suffix (e.g. "mic_src_gen1") -- exact-
+    name lookup would silently break on every rebuild. Gst.Bin.get_by_
+    name()/iterate_elements() both recurse into nested bins, so this
+    still finds it regardless of nesting depth or generation number."""
+    it = mic_bin.iterate_recurse()
+    while True:
+        ok, el = it.next()
+        if not ok:
+            return None
+        factory = el.get_factory()
+        if factory is not None and factory.get_name() == "alsasrc":
+            return el
 
 
 class MicSourceProvidesClockFalseTests(SimpleTestCase):
@@ -139,37 +172,73 @@ class NoPipelineClockForcingIntroducedTests(SimpleTestCase):
 
 
 class MicChainTopologyUnchangedTests(SimpleTestCase):
-    """Item 4: existing mic chain topology (elements, link order, ghost
-    pad) is unchanged by this one-property addition."""
+    """Item 4, re-scoped for [P0] 1.3B2: the mixer-facing DOWNSTREAM half
+    of the chain (mic_gain -> mic_ptt_volume -> ghost pad) is genuinely
+    unchanged -- this phase's own locked design explicitly requires it to
+    stay that way ("mixer-facing side is persistent"). The UPSTREAM half
+    (alsasrc -> convert -> resample -> caps) intentionally moved into a
+    nested, per-generation sub-bin behind a persistent silence/quarantine/
+    selector boundary -- that restructuring is the whole point of 1.3B2,
+    not a regression, so this test now asserts the NEW shape rather than
+    pinning the OLD one. See test_engine_mic_recovery.py for exhaustive
+    coverage of the new persistent/replaceable split itself."""
 
-    def test_element_set_and_link_order_unchanged(self):
+    def test_downstream_half_link_order_unchanged(self):
         obj = make_mic_stand_in()
         mic_bin = obj._build_mic_chain()[0]
 
-        names = {"mic_src", "mic_convert", "mic_resample", "mic_caps",
-                 "mic_queue", "mic_gain", "mic_ptt_volume"}
-        found = {el.get_name() for el in mic_bin.iterate_elements()}
-        self.assertEqual(found, names)
-
-        src = mic_bin.get_by_name("mic_src")
-        convert = mic_bin.get_by_name("mic_convert")
-        resample = mic_bin.get_by_name("mic_resample")
-        capsfilter = mic_bin.get_by_name("mic_caps")
-        queue = mic_bin.get_by_name("mic_queue")
         gain = mic_bin.get_by_name("mic_gain")
         ptt = mic_bin.get_by_name("mic_ptt_volume")
+        self.assertIsNotNone(gain)
+        self.assertIsNotNone(ptt)
 
         def linked(upstream, downstream):
             pad = upstream.get_static_pad("src")
             peer = pad.get_peer()
             return peer is not None and peer.get_parent_element() is downstream
 
-        self.assertTrue(linked(src, convert))
-        self.assertTrue(linked(convert, resample))
-        self.assertTrue(linked(resample, capsfilter))
-        self.assertTrue(linked(capsfilter, queue))
-        self.assertTrue(linked(queue, gain))
         self.assertTrue(linked(gain, ptt))
+
+    def test_upstream_half_reaches_gain_through_persistent_boundary(self):
+        """alsasrc -> convert -> resample -> caps -> (ghost) -> quarantine
+        queue -> input-selector -> mic_gain -- the new persistent
+        boundary this phase adds, verified end-to-end by pad linkage
+        rather than assuming it."""
+        obj = make_mic_stand_in()
+        mic_bin = obj._build_mic_chain()[0]
+
+        src = get_alsasrc(mic_bin)
+        self.assertIsNotNone(src)
+        convert = src.get_static_pad("src").get_peer().get_parent_element()
+        self.assertEqual(convert.get_factory().get_name(), "audioconvert")
+        resample = convert.get_static_pad("src").get_peer().get_parent_element()
+        self.assertEqual(resample.get_factory().get_name(), "audioresample")
+        capsfilter = resample.get_static_pad("src").get_peer().get_parent_element()
+        self.assertEqual(capsfilter.get_factory().get_name(), "capsfilter")
+
+        # The hw generation's ghost "src" pad feeds the persistent
+        # quarantine queue's sink pad directly.
+        hw_bin = obj._mic_hw_bin
+        self.assertIsNotNone(hw_bin)
+        quarantine_sink = obj._mic_quarantine_q.get_static_pad("sink")
+        self.assertIs(hw_bin.get_static_pad("src").get_peer(), quarantine_sink)
+
+        # quarantine_q -> input-selector's device pad -> mic_gain.
+        selector = obj._mic_selector
+        self.assertIs(
+            obj._mic_quarantine_q.get_static_pad("src").get_peer(), obj._mic_device_pad)
+        gain = mic_bin.get_by_name("mic_gain")
+        self.assertIs(selector.get_static_pad("src").get_peer(), gain.get_static_pad("sink"))
+
+    def test_silence_branch_present_and_feeds_selector(self):
+        """New in 1.3B2, not a regression check on old behavior --
+        confirms the persistent fallback exists at all."""
+        obj = make_mic_stand_in()
+        mic_bin = obj._build_mic_chain()[0]
+        self.assertIsNotNone(obj._mic_silence_pad)
+        silence_src = mic_bin.get_by_name("mic_silence_src")
+        self.assertIsNotNone(silence_src)
+        self.assertEqual(silence_src.get_factory().get_name(), "audiotestsrc")
 
     def test_ghost_pad_targets_ptt_volume_src_pad(self):
         obj = make_mic_stand_in()

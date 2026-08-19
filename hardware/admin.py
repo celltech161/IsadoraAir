@@ -344,6 +344,19 @@ class AudioInputAdmin(_DeviceFieldAdmin):
     def get_fieldsets(self, request, obj=None):
         fieldsets = [
             (None, {"fields": ["name", "device", "sort_order"]}),
+            # [P0] 1.3B2 -- automatic hotplug recovery only activates for
+            # this input once a stable identity is set here; blank keeps
+            # today's behavior (device errors degrade to silence, no
+            # automatic rebuild -- see library/services/audio_recovery.py).
+            ("Automatic Recovery (device identity)", {
+                "fields": ["device_identity_kind", "device_identity"],
+                "description": "Optional. A raw device path like 'plughw:2,0' can "
+                                "point at a different physical card after a "
+                                "hotplug re-enumeration, so automatic recovery is "
+                                "disabled unless a stable identity is set here. "
+                                "Run `cat /proc/asound/cards` to find the short ID "
+                                "shown in brackets for this input's card.",
+            }),
             ("Software Gain", {
                 "fields": ["gain_db"],
                 "description": "Applied in the on-air mix, independent of the "

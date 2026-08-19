@@ -148,6 +148,34 @@ class AudioInput(models.Model):
                    "meant to be hand-edited as raw JSON.",
     )
 
+    # [P0] 1.3B2 -- additive, rollback-safe stable-device-identity fields.
+    # `device` above is left completely untouched and is still what's
+    # actually used if these are blank -- existing rows and every other
+    # consumer of AudioInput.device (hardware/devices.py's admin dropdown,
+    # any other reader) are unaffected. Only automatic hotplug recovery
+    # (library/services/audio_recovery.py's resolve_runtime_device) prefers
+    # these when device_identity_kind is set, because a raw numeric
+    # `plughw:N,M` path is not safe to retry against after a device
+    # re-enumerates at a different card index on replug -- see
+    # scratchpad/audio_recovery/PHASE_P0_1.3_DISCOVERY_AND_DESIGN.md.
+    DEVICE_IDENTITY_KIND_CHOICES = [
+        ("", "Legacy (raw device path only, no automatic recovery)"),
+        ("alsa_card_id", "ALSA card ID (stable across re-enumeration)"),
+    ]
+    device_identity_kind = models.CharField(
+        max_length=32, blank=True, default="", choices=DEVICE_IDENTITY_KIND_CHOICES,
+        help_text="How to identify this hardware across a hotplug event. Leave blank "
+                   "to keep today's behavior (no automatic recovery on device loss). "
+                   "'ALSA card ID' enables automatic recovery for this input.",
+    )
+    device_identity = models.CharField(
+        max_length=64, blank=True, default="",
+        help_text="The stable identity value for the chosen kind above -- for 'ALSA "
+                   "card ID', the short id shown in brackets by `cat /proc/asound/cards` "
+                   "(e.g. 'PCH', 'CODEC'), NOT the numeric index. Ignored if "
+                   "device_identity_kind is blank.",
+    )
+
     class Meta:
         ordering = ["sort_order", "name"]
         verbose_name = "Audio Input"

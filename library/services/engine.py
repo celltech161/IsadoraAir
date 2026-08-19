@@ -41,6 +41,7 @@ from library.services.log_builder import (
     fill_remaining_hour,
 )
 from library.services.remote_dj_signaling import RemoteDJSignalingServer
+from library.services import audio_recovery
 from webrequests.services import SCHEDULING_CONTENDED, maybe_schedule_song_request, mark_song_requests_aired
 from isadoraair.version_info import capture_runtime_commit
 
@@ -385,6 +386,32 @@ class PlaybackEngine:
         self.mic_live = False
         self.local_mic_tee = None  # only built if remote_dj + local mic both enabled
         self._mic_bin = None
+        # [P0] 1.3B2 -- local input hotplug recovery. self._mic_bin above
+        # is now the PERSISTENT outer bin (silence source, quarantine
+        # queue, input-selector, mic_gain, mic_ptt_volume, ghost pad --
+        # never rebuilt); self._mic_hw_bin is the REPLACEABLE inner bin
+        # (alsasrc + convert/resample/caps) nested inside it, rebuilt on
+        # every recovery attempt. See _build_mic_chain/_build_mic_hw_
+        # generation and library/services/audio_recovery.py.
+        self._mic_hw_bin = None
+        self._mic_hw_generation = 0
+        self._mic_pending_hw_bin = None  # a rebuild attempt not yet health-verified
+        self._mic_selector = None
+        self._mic_silence_pad = None
+        self._mic_device_pad = None
+        self._mic_quarantine_q = None
+        self._mic_slot = None  # audio_recovery.SlotCoordinator, built in _build_mic_chain
+        self._mic_last_observed_slot_state = None
+        self._mic_recovery_attempt = 0
+        self._mic_next_retry_at = None  # monotonic seconds
+        self._mic_device_present = None  # observability only; None = unknown/not probed yet
+        self._mic_last_error = None
+        self._mic_last_state_change_at = None
+        self._mic_identity_kind = ""
+        self._mic_identity = ""
+        self._mic_legacy_device = ""
+        self._mic_buf_last_ns = None
+        self._mic_buf_count = 0
         # Remote DJ over WebRTC. remote_dj_tee only exists at all when
         # RemoteDJConfig.enabled (see _build_main_pipeline) -- while off,
         # these all stay None and the pipeline topology is unchanged from
@@ -469,6 +496,17 @@ class PlaybackEngine:
 
         self._position_timer = GLib.timeout_add(POSITION_POLL_MS, self._poll_position)
         GLib.timeout_add_seconds(AUTO_BUILD_CHECK_SECONDS, self._ensure_upcoming_logs)
+
+        # [P0] 1.3B2 -- local input hotplug recovery. Two independent
+        # timers, both no-ops (return True immediately) if no mic is
+        # configured (self._mic_slot stays None). Fast tick drives
+        # SlotCoordinator's own non-blocking abandonment detection
+        # (~200-500ms cadence per the locked design); slow tick is the
+        # device-presence fallback probe (~2s, per the locked design --
+        # pyudev event-driven detection is deliberately NOT wired in this
+        # phase, see the 1.3B2 report).
+        GLib.timeout_add(300, self._mic_recovery_tick)
+        GLib.timeout_add_seconds(2, self._mic_presence_probe_tick)
 
         if RemoteDJConfig.load().enabled:
             self._warm_stun_dns()
@@ -563,6 +601,39 @@ class PlaybackEngine:
             return None
         print(f"  AudioInput '{MIC_INPUT_NAME}' -> {configured}")
         return configured
+
+    def _resolve_mic_identity(self):
+        """[P0] 1.3B2 -- separate from _resolve_mic_device() above (left
+        completely untouched) so existing callers/tests of that method
+        are unaffected. Populates self._mic_identity_kind/_mic_identity/
+        _mic_legacy_device, used only by the recovery machinery (presence
+        probing + resolve_runtime_device on rebuild). Failure here
+        degrades to "legacy only, no automatic recovery" -- never blocks
+        mic construction, matching every other config-read in this file."""
+        try:
+            row = (
+                AudioInput.objects
+                .filter(name=MIC_INPUT_NAME)
+                .values("device", "device_identity_kind", "device_identity")
+                .first()
+            )
+        except Exception as exc:
+            print(f"  Failed to read AudioInput identity config ({exc}); automatic recovery disabled")
+            row = None
+        if not row:
+            self._mic_identity_kind = ""
+            self._mic_identity = ""
+            self._mic_legacy_device = ""
+            return
+        self._mic_legacy_device = row.get("device") or ""
+        self._mic_identity_kind = row.get("device_identity_kind") or ""
+        self._mic_identity = row.get("device_identity") or ""
+        if self._mic_identity_kind == "alsa_card_id" and self._mic_identity:
+            print(f"  AudioInput '{MIC_INPUT_NAME}' automatic recovery enabled "
+                  f"(alsa_card_id={self._mic_identity!r})")
+        else:
+            print(f"  AudioInput '{MIC_INPUT_NAME}' has no stable device identity configured; "
+                  f"automatic recovery disabled (device loss still degrades to silence)")
 
     def _build_dj_slots(self, n_slots):
         """Build `n_slots` persistent DJ subchains, each terminating in a
@@ -686,24 +757,23 @@ class PlaybackEngine:
                 return slot
         return None
 
-    def _build_mic_chain(self):
-        """Builds the mic capture chain as its own Gst.Bin (not loose
-        elements directly in main_pipeline) so a bus watch can be
-        scoped to just this bin -- mirrors the deck bins' own
-        get_bus()/add_signal_watch()/message::error pattern (see
-        _start_next_track/_on_deck_error). Returns [] if no mic device
-        is configured; the caller treats an empty list exactly like
-        "mic not configured" (self.mic_ptt_valve/self.mic_gain stay
-        None). Unlike deck bins (decodebin's src pad appears
-        asynchronously after typefind/demux), every element here is
-        static, so the whole chain links and gets its ghost pad target
-        set immediately -- no deferred pad-added handling needed."""
-        mic_device = self._resolve_mic_device()
-        if not mic_device:
-            return []
-
-        src = Gst.ElementFactory.make("alsasrc", "mic_src")
-        src.set_property("device", mic_device)
+    def _build_mic_hw_generation(self, device):
+        """[P0] 1.3B2 -- the REPLACEABLE hardware-facing portion of the
+        mic chain: alsasrc + convert/resample/caps, wrapped in its own
+        nested Gst.Bin with a ghost "src" pad. This is rebuilt fresh on
+        every recovery attempt (see _mic_quiesce_current_generation /
+        _mic_dispatch_rebuild) -- everything downstream of it (quarantine
+        queue, input-selector, mic_gain, mic_ptt_volume, the ghost pad
+        that feeds local_mic_tee/master_mixer) is PERSISTENT and never
+        touched by recovery. This is the ONLY place mic's alsasrc is ever
+        constructed, so provide-clock=False (locked, [P0] 1.3B1) and this
+        method's construction shape apply identically to every
+        generation, including rebuilds."""
+        self._mic_hw_generation += 1
+        gen = self._mic_hw_generation
+        hw_bin = Gst.Bin.new(f"mic_hw_gen{gen}")
+        src = Gst.ElementFactory.make("alsasrc", f"mic_src_gen{gen}")
+        src.set_property("device", device)
         # Do not allow removable capture hardware to become the shared main
         # pipeline clock. A vanished ALSA capture device can leave its
         # GstAudioSrcClock selected but frozen, stalling unrelated live
@@ -713,12 +783,136 @@ class PlaybackEngine:
         # sufficient; GStreamer's normal automatic clock selection then
         # falls through to GstSystemClock on its own. Do not pair this with
         # a pipeline.use_clock() call (that path was tested and retired).
+        # LOCKED -- [P0] 1.3B1 -- must apply to every generation, no exceptions.
         src.set_property("provide-clock", False)
-        convert = Gst.ElementFactory.make("audioconvert", "mic_convert")
-        resample = Gst.ElementFactory.make("audioresample", "mic_resample")
-        capsfilter = Gst.ElementFactory.make("capsfilter", "mic_caps")
+        convert = Gst.ElementFactory.make("audioconvert", None)
+        resample = Gst.ElementFactory.make("audioresample", None)
+        capsfilter = Gst.ElementFactory.make("capsfilter", None)
         caps = Gst.Caps.from_string(f"audio/x-raw,rate={self.pipeline_sample_rate},channels=2")
         capsfilter.set_property("caps", caps)
+        for el in (src, convert, resample, capsfilter):
+            hw_bin.add(el)
+        src.link(convert)
+        convert.link(resample)
+        resample.link(capsfilter)
+        ghost = Gst.GhostPad.new("src", capsfilter.get_static_pad("src"))
+        ghost.set_active(True)
+        hw_bin.add_pad(ghost)
+        return hw_bin, src
+
+    def _install_mic_eos_quarantine(self, sink_pad):
+        """[P0] 1.3B2 -- unconditionally drops EOS arriving from the
+        hardware-generation side before it can reach input-selector and
+        poison the shared main_pipeline. Armed HERE, at construction of
+        the persistent quarantine queue -- never reactively after a
+        failure is observed. scratchpad/audio_recovery/ Round 4 proved
+        reactive arming is always too late (the EOS is already in flight
+        by the time a bus-error handler could react).
+
+        EOS ONLY -- narrowed after pre-commit review. The eight-round
+        physical investigation's own suppression counters
+        (scratchpad/audio_recovery/hotplug_harness/logs/*.jsonl,
+        `eos_suppressed` events) show EXACTLY 6 suppressions across every
+        physical round, and every single one was type EOS -- zero
+        FLUSH_START, zero FLUSH_STOP, ever. No round or design-doc note
+        argued for suppressing flush events either; an earlier draft of
+        this method copied the harness helper's broader DROP set (EOS +
+        FLUSH_START + FLUSH_STOP) without re-checking that the flush half
+        was ever actually evidenced, which it wasn't -- fixed here to
+        match only what was observed. FLUSH_START/FLUSH_STOP are real,
+        materially different GStreamer events (clearing pending data and
+        participating in running-time reset semantics) that this probe
+        must not interfere with. Registering only EVENT_DOWNSTREAM (not
+        EVENT_FLUSH) means FLUSH_START never even reaches this callback
+        at all -- confirmed directly: GStreamer does not deliver
+        FLUSH_START to an EVENT_DOWNSTREAM-only probe. FLUSH_STOP DOES
+        still reach it (confirmed the same way), so it's explicitly
+        passed through unconditionally below, same as every other
+        non-EOS event -- never dropped.
+
+        Only affects this one pad (the hardware-facing boundary, upstream
+        of quarantine_q) -- the silence branch's own events, on a
+        completely different pad, are never touched."""
+        state = {"suppressed_count": 0}
+
+        def _probe(pad, info):
+            event = info.get_event()
+            if event is None:
+                return Gst.PadProbeReturn.OK
+            if event.type == Gst.EventType.EOS:
+                state["suppressed_count"] += 1
+                # Rate-limited: log the first one plainly (the interesting
+                # case -- "did suppression actually engage") and then only
+                # every 50th, so a pathological repeat can't flood stdout
+                # the way an output-side error storm can (see [P0] 1.3
+                # Round 3/4/8's documented output error-flood finding).
+                if state["suppressed_count"] == 1 or state["suppressed_count"] % 50 == 0:
+                    print(f"  Mic EOS quarantine: suppressed EOS "
+                          f"(count={state['suppressed_count']})")
+                return Gst.PadProbeReturn.DROP
+            return Gst.PadProbeReturn.OK
+
+        sink_pad.add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM, _probe)
+
+    def _mic_buffer_age_ms(self):
+        """Non-blocking; reads plain attributes updated by
+        _mic_buffer_probe below. None if no buffer has ever been seen
+        (e.g. no generation has ever linked in yet)."""
+        if self._mic_buf_last_ns is None:
+            return None
+        return (time.monotonic_ns() - self._mic_buf_last_ns) // 1_000_000
+
+    def _mic_buffer_probe(self, pad, info):
+        """Attached ONCE, on quarantine_q's src pad -- downstream of both
+        the silence and hardware branches' merge point via input-selector
+        is NOT where this lives; it's attached upstream of the selector,
+        on quarantine_q's src pad, so it measures ONLY the hardware
+        generation's real buffer flow (see _build_mic_chain), independent
+        of whichever generation is currently linked -- the old generation
+        is always fully unlinked+removed before a new one is linked in
+        (see _mic_quiesce_current_generation), so any buffer observed
+        here can only be from the CURRENT generation. This is what
+        distinguishes 'PLAYING state' from 'buffers actually flowing' for
+        the locked health rule (PLAYING >= 500ms AND fresh buffer <=
+        250ms) -- see _mic_dispatch_rebuild."""
+        self._mic_buf_count += 1
+        self._mic_buf_last_ns = time.monotonic_ns()
+        return Gst.PadProbeReturn.OK
+
+    def _build_mic_chain(self):
+        """Builds the mic capture chain as its own Gst.Bin (not loose
+        elements directly in main_pipeline) so a bus watch can be
+        scoped to just this bin -- mirrors the deck bins' own
+        get_bus()/add_signal_watch()/message::error pattern (see
+        _start_next_track/_on_deck_error). Returns [] if no mic device
+        is configured; the caller treats an empty list exactly like
+        "mic not configured" (self.mic_ptt_valve/self.mic_gain stay
+        None).
+
+        [P0] 1.3B2: this bin is now PERSISTENT -- silence source,
+        quarantine queue, input-selector, mic_gain, mic_ptt_volume, and
+        this bin's own ghost pad (still the exact same thing that feeds
+        local_mic_tee/master_mixer -- see _build_main_pipeline, UNCHANGED
+        by this phase) are built ONCE here and never rebuilt. Only the
+        nested hardware-facing bin (_build_mic_hw_generation) is
+        replaceable; recovery swaps that generation in and out without
+        ever touching this persistent boundary or the master_mixer-facing
+        pad, per the locked design in
+        scratchpad/audio_recovery/PHASE_P0_1.3_DISCOVERY_AND_DESIGN.md."""
+        mic_device = self._resolve_mic_device()
+        if not mic_device:
+            return []
+        self._resolve_mic_identity()
+
+        # Persistent silence fallback -- must exist before any hardware
+        # failure can occur, per the locked design ("the silence fallback
+        # must already be present before failure").
+        silence_src = Gst.ElementFactory.make("audiotestsrc", "mic_silence_src")
+        silence_src.set_property("wave", 4)  # silence
+        silence_src.set_property("is-live", True)
+        silence_caps = Gst.ElementFactory.make("capsfilter", "mic_silence_caps")
+        silence_caps.set_property(
+            "caps", Gst.Caps.from_string(f"audio/x-raw,rate={self.pipeline_sample_rate},channels=2"))
 
         # alsasrc is a genuinely live, hardware-clocked source feeding
         # directly into audiomixer, unlike filesrc/decodebin's buffered
@@ -729,10 +923,20 @@ class PlaybackEngine:
         # mixer, so silently dropping mic audio would be an audible
         # glitch in the primary output, unlike the StereoTool branch
         # which is only ever allowed to drop its own copy.
-        queue = Gst.ElementFactory.make("queue", "mic_queue")
+        #
+        # [P0] 1.3B2: this queue is now ALSO the EOS-quarantine boundary
+        # -- its sink pad is where the hardware generation links in, and
+        # is where the unconditional EOS/FLUSH suppression probe is
+        # installed (see _install_mic_eos_quarantine). Its config
+        # (200ms/unbounded) is unchanged from before this phase.
+        queue = Gst.ElementFactory.make("queue", "mic_quarantine_q")
         queue.set_property("max-size-time", 200_000_000)  # 200ms
         queue.set_property("max-size-buffers", 0)
         queue.set_property("max-size-bytes", 0)
+        self._mic_quarantine_q = queue
+
+        selector = Gst.ElementFactory.make("input-selector", "mic_selector")
+        self._mic_selector = selector
 
         self.mic_gain = Gst.ElementFactory.make("volume", "mic_gain")
         self._apply_mic_gain()
@@ -771,14 +975,38 @@ class PlaybackEngine:
         self.mic_ptt_valve = self.mic_ptt_volume
 
         mic_bin = Gst.Bin.new(f"mic_{int(time.time() * 1000)}")
-        for el in (src, convert, resample, capsfilter, queue, self.mic_gain, self.mic_ptt_volume):
+        for el in (silence_src, silence_caps, queue, selector, self.mic_gain, self.mic_ptt_volume):
             mic_bin.add(el)
-        src.link(convert)
-        convert.link(resample)
-        resample.link(capsfilter)
-        capsfilter.link(queue)
-        queue.link(self.mic_gain)
+
+        # Silence branch -- persistent, requested ONCE, held forever.
+        silence_src.link(silence_caps)
+        self._mic_silence_pad = selector.get_request_pad("sink_%u")
+        silence_caps.get_static_pad("src").link(self._mic_silence_pad)
+        # Hardware branch's fixed sink pad on the selector -- requested
+        # ONCE here too; only the peer bin upstream of quarantine_q ever
+        # changes (see _mic_quiesce_current_generation /
+        # _mic_dispatch_rebuild). Never released/re-requested by recovery.
+        self._mic_device_pad = selector.get_request_pad("sink_%u")
+        queue.get_static_pad("src").link(self._mic_device_pad)
+
+        selector.link(self.mic_gain)
         self.mic_gain.link(self.mic_ptt_volume)
+
+        self._install_mic_eos_quarantine(queue.get_static_pad("sink"))
+        queue.get_static_pad("src").add_probe(Gst.PadProbeType.BUFFER, self._mic_buffer_probe)
+
+        # First hardware generation -- built and linked synchronously here
+        # at cold start, same risk/timing profile as before this phase
+        # (a bad/absent device still surfaces via the normal async bus-
+        # error path a moment after PLAYING, exactly as it always has --
+        # see _on_mic_error, which now additionally drives recovery).
+        # Only RECOVERY attempts (after an observed failure) go through
+        # the guarded background-worker path in _mic_dispatch_rebuild.
+        hw_bin, hw_src = self._build_mic_hw_generation(mic_device)
+        mic_bin.add(hw_bin)
+        hw_bin.get_static_pad("src").link(queue.get_static_pad("sink"))
+        self._mic_hw_bin = hw_bin
+        selector.set_property("active-pad", self._mic_device_pad)
 
         ghost_pad = Gst.GhostPad.new("src", self.mic_ptt_volume.get_static_pad("src"))
         mic_bin.add_pad(ghost_pad)
@@ -789,6 +1017,9 @@ class PlaybackEngine:
         # containing Pipeline's bus instead, so the watch is set up there
         # (see _build_main_pipeline) and filtered to this bin.
         self._mic_bin = mic_bin
+
+        self._mic_slot = audio_recovery.SlotCoordinator("mic", timeout_s=15.0)
+        self._mic_last_observed_slot_state = self._mic_slot.state.value
 
         self.mic_ok = True
         return [mic_bin]
@@ -918,16 +1149,339 @@ class PlaybackEngine:
     def _on_mic_error(self, bus, message):
         err, debug = message.parse_error()
         print(f"  Mic error: {err} ({debug})")
+        self._mic_last_error = str(err)[:300]
+        self._mic_last_state_change_at = time.time()
+
+        classification = audio_recovery.classify_audio_device_error(str(err), str(debug))
+        if classification != "device_lost":
+            # "transient" (e.g. a busy/EBUSY-style resource contention --
+            # see audio_recovery.py's own docstring on why this category
+            # exists) and "unknown" are logged/observable only, never
+            # destructive by default -- [P0] 1.3B2's locked policy.
+            print(f"  Mic error classified '{classification}' -- logged only, no recovery action")
+            return True
+
         # Silence is the safe reaction to a runtime mic fault -- not
         # mixer-pad surgery. This codebase's own seek/resume history
         # already shows unlinking a live-mixer-linked bin mid-flight is
         # the riskier operation, reserved for planned transitions, not
-        # error recovery.
+        # error recovery. Done unconditionally, every time this fires
+        # (even a coalesced repeat for the same already-degraded
+        # generation) -- cheap, idempotent, and must never wait on
+        # anything below.
         self.mic_ok = False
-        self.mic_live = False
-        if self.mic_ptt_volume is not None:
-            self.mic_ptt_volume.set_property("volume", 0.0)
+        self._set_mic_ptt(False)  # mic_live=False, PTT volume=0, ducking + manual-mode-hold released exactly as a normal mic-off would
+        if self._mic_selector is not None and self._mic_silence_pad is not None:
+            self._mic_selector.set_property("active-pad", self._mic_silence_pad)
+
+        if self._mic_slot is None:
+            return True
+        first_failure = self._mic_slot.mark_degraded()
+        if not first_failure:
+            # Coalesced repeat (e.g. the well-known immediate follow-up
+            # "Internal data stream error" that always accompanies a real
+            # disconnect -- see audio_recovery.py's classifier docstring)
+            # -- the mic-off/silence steps above already ran again above
+            # (harmless, idempotent); no new teardown is dispatched.
+            return True
+
+        print(f"  Mic slot DEGRADED (generation {self._mic_slot.generation})")
+        self._mic_recovery_attempt = 0
+        self._mic_next_retry_at = None
+        self._mic_device_present = None
+        emit_event(
+            category="hardware", level="warning", title="Studio microphone lost",
+            detail={"error": self._mic_last_error},
+            dedupe_key=f"hardware|mic-lost|gen{self._mic_slot.generation}",
+        )
+        self._mic_quiesce_current_generation()
         return True
+
+    def _mic_quiesce_current_generation(self):
+        """[P0] 1.3B2 -- detaches the failed hardware generation from the
+        persistent quarantine queue and hands its NULL transition to a
+        bounded background worker. The detach (pad unlink + Bin.remove)
+        happens HERE, synchronously, on the GLib thread -- every physical
+        round in scratchpad/audio_recovery/ treated this as fast/safe
+        (never wrapped in a hang-watchdog); only the actual set_state()
+        call against the now-orphaned bin is the proven hang risk (Round
+        2's py-spy-confirmed pthread_mutex_lock contention), so only that
+        goes through SlotCoordinator's background worker."""
+        old_bin = self._mic_hw_bin
+        self._mic_hw_bin = None
+        if old_bin is None:
+            return
+        try:
+            src_pad = old_bin.get_static_pad("src")
+            sink_pad = self._mic_quarantine_q.get_static_pad("sink") if self._mic_quarantine_q else None
+            if src_pad is not None and sink_pad is not None and src_pad.is_linked():
+                src_pad.unlink(sink_pad)
+            self._mic_bin.remove(old_bin)
+        except Exception as exc:
+            print(f"  Mic quiesce: failed to detach old generation cleanly ({exc}); "
+                  f"still dispatching guarded teardown")
+
+        def worker():
+            old_bin.set_state(Gst.State.NULL)
+            # Reaching this line without hanging is the whole point of
+            # this operation -- Gst.StateChangeReturn is deliberately not
+            # treated as pass/fail; an already-errored element returning
+            # FAILURE from set_state(NULL) is still safe to abandon.
+            return True
+
+        result = self._mic_slot.request_recovery(worker)
+        print(f"  Mic quiesce dispatched: {result}")
+
+    def _mic_dispatch_rebuild(self):
+        """[P0] 1.3B2 -- called only from _mic_presence_probe_tick, only
+        while the slot is DEGRADED (no operation in flight) and the
+        configured stable identity is confirmed present. Construction and
+        pad-linking happen here, synchronously (proven fast/non-hazardous
+        throughout scratchpad/audio_recovery/); only the state-change call
+        AND the bounded health-verification wait happen inside the
+        background worker (see below) -- bundled together so
+        SlotCoordinator's own success/failure semantics land exactly on
+        this feature's locked health rule (PLAYING >= 500ms AND a fresh
+        buffer <= 250ms), not merely on set_state() not hanging."""
+        runtime_device = audio_recovery.resolve_runtime_device(
+            self._mic_identity_kind, self._mic_identity, self._mic_legacy_device)
+        if not runtime_device:
+            return
+        new_bin, new_src = self._build_mic_hw_generation(runtime_device)
+        self._mic_bin.add(new_bin)
+        new_bin.get_static_pad("src").link(self._mic_quarantine_q.get_static_pad("sink"))
+        self._mic_pending_hw_bin = new_bin
+
+        def worker():
+            # PyGObject's sync_state_with_parent() returns a plain bool
+            # (verified directly, not assumed -- it is NOT a
+            # Gst.StateChangeReturn), so it's checked as one here.
+            if not new_bin.sync_state_with_parent():
+                return False
+            # Locked health rule: PLAYING continuously for >= 500ms AND a
+            # real buffer observed within the last 250ms. Only non-
+            # blocking get_state(0) peeks (proven <120us,
+            # scratchpad/audio_recovery/ Round 6) and plain attribute
+            # reads -- nothing here can hang.
+            playing_since = None
+            deadline = time.monotonic() + 2.0  # generous grace for ASYNC preroll
+            while time.monotonic() < deadline:
+                _, st, _ = new_bin.get_state(0)
+                if st == Gst.State.PLAYING:
+                    if playing_since is None:
+                        playing_since = time.monotonic()
+                    elif time.monotonic() - playing_since >= 0.5:
+                        break
+                else:
+                    playing_since = None
+                time.sleep(0.05)
+            if playing_since is None or (time.monotonic() - playing_since) < 0.5:
+                return False
+            age = self._mic_buffer_age_ms()
+            return age is not None and age <= 250
+
+        result = self._mic_slot.request_recovery(worker)
+        print(f"  Mic rebuild dispatched (generation {self._mic_hw_generation}): {result}")
+
+    def _mic_discard_pending_hw_bin(self, abandoned=False):
+        """A rebuild attempt did not pass health verification (or its
+        state-change/health-wait was itself abandoned by the slot
+        coordinator's timeout). Either way the pending bin is not
+        promoted to self._mic_hw_bin.
+
+        The detach (pad unlink + Bin.remove) happens HERE, synchronously,
+        on the GLib thread -- empirically confirmed safe even against a
+        genuinely wedged streaming thread (see [P0] 1.3B2 pre-commit
+        review, Issue 2:
+        scratchpad/audio_recovery/hotplug_harness/harness_r_detach_stream_lock_probe.py
+        -- unlink()+Bin.remove() completed in <1ms while a synthetic
+        wedge held the exact pad's stream lock; a negative control
+        confirmed set_state(NULL) alone DOES hang under the identical
+        condition, validating the test and confirming set_state() is the
+        only real hazard here).
+
+        On a plain (non-abandoned) failure, the NULL transition itself
+        is dispatched through the SAME guarded background worker as
+        _mic_quiesce_current_generation -- pre-commit review caught that
+        an earlier draft called set_state(NULL) directly on the GLib
+        thread here, which is exactly the synchronous-hardware-state-call
+        pattern the locked design forbids (Round 2's original hang was
+        specifically a NULL transition, not detach). Safe to dispatch:
+        this method only runs while the slot is DEGRADED with no
+        operation in flight (the prior rebuild op just resolved), so
+        request_recovery() is guaranteed to accept it.
+
+        On ABANDONMENT, per the still-open Round-3 question ("can a
+        fresh element safely reopen the same device while an old,
+        abandoned close() may still hold it?" -- untested, not assumed
+        true), we do NOT attempt any further state call against this bin
+        at all, guarded or not -- only detach it (proven safe above) so
+        engine shutdown never has to wait on it, and then abandon the
+        Python reference, exactly like the original object."""
+        bin_obj = self._mic_pending_hw_bin
+        self._mic_pending_hw_bin = None
+        if bin_obj is None:
+            return
+        try:
+            src_pad = bin_obj.get_static_pad("src")
+            sink_pad = self._mic_quarantine_q.get_static_pad("sink") if self._mic_quarantine_q else None
+            if src_pad is not None and sink_pad is not None and src_pad.is_linked():
+                src_pad.unlink(sink_pad)
+            self._mic_bin.remove(bin_obj)
+        except Exception as exc:
+            print(f"  Mic discard-pending: failed to detach cleanly ({exc})")
+        if not abandoned:
+            def worker():
+                bin_obj.set_state(Gst.State.NULL)
+                return True  # reaching this line without hanging is the point; see _mic_quiesce_current_generation's worker
+
+            result = self._mic_slot.request_recovery(worker)
+            print(f"  Mic discard-pending NULL dispatched: {result}")
+
+    def _mic_handle_slot_transition(self, old_state, new_state, snapshot):
+        SlotState = audio_recovery.SlotState
+        if new_state == SlotState.OK.value:
+            if self._mic_pending_hw_bin is not None:
+                # A REBUILD attempt succeeded (state-change + locked
+                # health rule both passed, verified inside the worker).
+                self._mic_hw_bin = self._mic_pending_hw_bin
+                self._mic_pending_hw_bin = None
+                self.mic_ok = True
+                if self._mic_selector is not None and self._mic_device_pad is not None:
+                    self._mic_selector.set_property("active-pad", self._mic_device_pad)
+                # RECOVERED MIC SAFETY (locked): stays logically OFF.
+                # Operator must explicitly key PTT again -- do NOT restore
+                # mic_live/PTT volume here.
+                self._mic_recovery_attempt = 0
+                self._mic_next_retry_at = None
+                self._mic_device_present = True
+                print(f"  Mic recovered (generation {snapshot['generation']}) -- "
+                      f"device audible again, PTT remains OFF")
+                emit_event(
+                    category="hardware", level="info", title="Studio microphone recovered",
+                    detail={"generation": snapshot["generation"]},
+                    dedupe_key=f"hardware|mic-recovered|gen{snapshot['generation']}",
+                )
+            else:
+                # A QUIESCE succeeded (old generation torn down cleanly).
+                # SlotCoordinator's own OK here means only "that operation
+                # finished" -- the mic itself is not healthy yet (no
+                # hardware generation exists at all right now). Re-mark
+                # DEGRADED immediately so presence-probing continues to
+                # gate a rebuild attempt; mic_ok/mic_live/PTT are already
+                # OFF from _on_mic_error.
+                print("  Mic old generation quiesced cleanly; waiting for device to return")
+                self._mic_slot.mark_degraded()
+        elif new_state == SlotState.DEGRADED.value:
+            if self._mic_pending_hw_bin is not None:
+                print("  Mic rebuild attempt failed health verification; will retry after backoff")
+                self._mic_discard_pending_hw_bin(abandoned=False)
+            else:
+                # A QUIESCE op resolved with succeeded=False -- only
+                # reachable if old_bin.set_state(Gst.State.NULL) itself
+                # raised (no scratchpad round ever observed this; only
+                # hanging was observed, which goes through RESTART_
+                # REQUIRED instead). self._mic_hw_bin was already cleared
+                # before dispatch, so the old bin is harmlessly leaked
+                # (detached from _mic_bin, can't block shutdown) rather
+                # than definitively NULL'd -- logged for visibility;
+                # presence-probing still proceeds normally from here,
+                # since it only depends on slot state being DEGRADED.
+                print("  Mic quiesce operation failed unexpectedly (see exception in operation_failed "
+                      "log above, if any); old generation reference abandoned, continuing")
+        elif new_state == SlotState.RESTART_REQUIRED.value:
+            if self._mic_pending_hw_bin is not None:
+                self._mic_discard_pending_hw_bin(abandoned=True)
+            print("  Mic slot RESTART_REQUIRED -- a background hardware-state operation "
+                  "was abandoned; no further automatic rebuild attempts for this process lifetime")
+            emit_event(
+                category="hardware", level="error", title="Studio microphone recovery abandoned",
+                detail={
+                    "generation": snapshot["generation"],
+                    "note": "A background hardware-state operation did not complete within its "
+                            "timeout and was abandoned. Automatic retry has stopped for this slot; "
+                            "an engine restart is the only way to fully reclaim it.",
+                },
+                dedupe_key=f"hardware|mic-restart-required|gen{snapshot['generation']}",
+            )
+
+    def _mic_recovery_tick(self):
+        """GLib timer, ~300ms -- non-blocking. Drives SlotCoordinator's
+        own abandonment detection and reacts to any state transition it
+        observes since the last tick. Deliberately does NOT touch
+        GStreamer/Django state from inside the coordinator's background
+        worker threads -- only from here, on the GLib thread, matching
+        this file's established threading conventions."""
+        if not self.running or self._mic_slot is None:
+            return True
+        self._mic_slot.tick()
+        snapshot = self._mic_slot.snapshot()
+        new_state = snapshot["state"]
+        old_state = self._mic_last_observed_slot_state
+        if new_state != old_state:
+            self._mic_handle_slot_transition(old_state, new_state, snapshot)
+            self._mic_last_observed_slot_state = new_state
+        return True
+
+    def _mic_presence_probe_tick(self):
+        """GLib timer, ~2s -- non-blocking (a plain /proc/asound/cards
+        read, no subprocess -- see audio_recovery.read_alsa_cards_present).
+        Only acts while the slot is DEGRADED with no operation in flight;
+        RESTART_REQUIRED deliberately does not auto-retry (see
+        SlotCoordinator/scratchpad Round 3's still-open question), OK
+        needs nothing, RECOVERING/QUIESCING already has an op outstanding."""
+        if not self.running or self._mic_slot is None:
+            return True
+        if self._mic_identity_kind != "alsa_card_id" or not self._mic_identity:
+            # No stable identity configured for this input -- automatic
+            # presence-based rebuild is deliberately not attempted (see
+            # [P0] 1.3B2 report: "do not build hotplug recovery around a
+            # raw numeric string if the returning device may enumerate at
+            # a different card index"). Quiesce/silence-fallback above
+            # still applies; only the auto-rebuild-on-return step needs
+            # this identity.
+            return True
+        if self._mic_slot.state != audio_recovery.SlotState.DEGRADED:
+            return True
+        cards = audio_recovery.read_alsa_cards_present()
+        present = audio_recovery.alsa_card_identity_present(self._mic_identity, cards)
+        self._mic_device_present = present
+        if not present:
+            return True
+        now = time.monotonic()
+        if self._mic_next_retry_at is not None and now < self._mic_next_retry_at:
+            return True
+        self._mic_recovery_attempt += 1
+        self._mic_next_retry_at = now + audio_recovery.compute_backoff_seconds(self._mic_recovery_attempt)
+        self._mic_dispatch_rebuild()
+        return True
+
+    def _mic_recovery_state(self):
+        """[P0] 1.3B2 -- engine_state.json's mic_recovery block. None
+        when no mic is configured at all (matches mic_configured=False;
+        there's genuinely nothing to report)."""
+        if self._mic_slot is None:
+            return None
+        snapshot = self._mic_slot.snapshot()
+        next_retry_in_s = None
+        if self._mic_next_retry_at is not None:
+            # next_retry_in_s, not a raw monotonic timestamp -- monotonic
+            # clock epoch is meaningless to a JSON consumer/dashboard;
+            # "seconds from now" is directly usable, matching timestamp's
+            # own wall-clock (time.time()) convention elsewhere in this
+            # payload.
+            next_retry_in_s = max(0.0, round(self._mic_next_retry_at - time.monotonic(), 1))
+        return {
+            "state": snapshot["state"],
+            "generation": snapshot["generation"],
+            "device_present": self._mic_device_present,
+            "runtime_device": audio_recovery.resolve_runtime_device(
+                self._mic_identity_kind, self._mic_identity, self._mic_legacy_device),
+            "last_error": self._mic_last_error,
+            "last_state_change": self._mic_last_state_change_at,
+            "next_retry_in_s": next_retry_in_s,
+            "restart_required": snapshot["state"] == audio_recovery.SlotState.RESTART_REQUIRED.value,
+        }
 
     def _apply_mic_gain(self):
         if self.mic_gain is None:
@@ -5882,6 +6436,10 @@ class PlaybackEngine:
                 "mic_configured": self.mic_ptt_valve is not None,
                 "mic_ok": self.mic_ok,
                 "mic_live": self.mic_live,
+                # [P0] 1.3B2 -- input hotplug recovery observability.
+                # None throughout when no mic is configured at all
+                # (self._mic_slot stays None -- see _build_mic_chain).
+                "mic_recovery": self._mic_recovery_state(),
                 "manual_mode": self.manual_mode,
                 "manual_from_mic": self._manual_from_mic,
                 # Same "configured vs. live" distinction as the mic fields
