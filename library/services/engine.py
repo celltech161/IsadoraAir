@@ -113,6 +113,20 @@ LEVELS_TMP_PATH = Path("/run/isadoraair/levels.json.tmp")
 LEVEL_INTERVAL_MS = 50
 LEVEL_PEAK_TTL_MS = 300
 LEVEL_PEAK_FALLOFF_DB_PER_SEC = 20.0
+
+# [4.1] Remote Mic PTT VU meter -- how old the most recent captured
+# session.dj_level_sample is allowed to be before _remote_dj_level_
+# payload() treats it as gone rather than frozen-stale. Matches the
+# client's own existing Program Level staleness literal in
+# dashboard.html's pollLevels() (0.75s) -- belt-and-braces on both
+# ends of the same file, not two independently-chosen thresholds. A
+# session disconnecting (self.remote_dj_session -> None, see
+# _remote_dj_session_stop) already clears this on the very next
+# output_level tick (~LEVEL_INTERVAL_MS later), well under this
+# threshold -- this constant is the second-line defense for the rarer
+# case where the session object survives but its audio has genuinely
+# stopped flowing (e.g. a WebRTC hiccup).
+REMOTE_DJ_LEVEL_STALE_S = 0.75
 POSITION_POLL_MS = 250
 AUTO_BUILD_CHECK_SECONDS = 10
 NEXT_HOUR_LOOKAHEAD_SECONDS = 30
@@ -322,6 +336,16 @@ class RemoteDJSession:
         self.dump_bytes_written = 0    # running total for progress logging
         self.dump_last_marked_bytes = 0  # when we last emitted a progress line
         self.dj_level = None           # `level` element between opusdec and audioconvert
+        # [4.1] Remote Mic PTT VU meter. dj_gain_db is captured ONCE at
+        # session start (see _remote_dj_session_start) from the same
+        # RemoteDJAudioInput.load().gain_db read that already sets
+        # slot.remote_gain's volume -- never re-queried per meter
+        # message. dj_level_sample is the most recent gain-adjusted
+        # reading from session.dj_level (see _on_element_message),
+        # None until the first message arrives. Both are read (never
+        # written) by _remote_dj_level_payload().
+        self.dj_gain_db = 0.0
+        self.dj_level_sample = None
         self.dj_mixer_pad_src = None   # gate_conv src pad for probe cleanup
         self.caps_probe_id = 0         # pad probe id for the caps-event logger
         self.dump_probe_id = 0         # pad probe id for the PCM dump
@@ -1029,13 +1053,15 @@ class PlaybackEngine:
         BOTH the master output_level (dashboard VU meter) AND the
         remote-DJ session's dj_level (post-opusdec level meter, whose
         readings are appended to DJ_DIAG_LOG for the remote-DJ static
-        post-mortem). All other element messages are ignored so this
-        stays cheap."""
+        post-mortem, AND -- [4.1] -- captured as a gain-adjusted sample
+        for the Remote Mic PTT button's own VU meter). All other
+        element messages are ignored so this stays cheap."""
         structure = message.get_structure()
         if structure is None or structure.get_name() != "level":
             return True
 
         # Remote-DJ level meter -- log to diag file. Cheap, ~10Hz.
+        # Unchanged from before [4.1] -- same fields, same log line.
         session = self.remote_dj_session
         if session is not None and message.src is session.dj_level:
             try:
@@ -1043,6 +1069,33 @@ class PlaybackEngine:
                 rms = list(structure.get_value("rms")) or []
                 _dj_diag(session,
                           f"dj_level peak={['%.1f' % p for p in peak]} rms={['%.1f' % r for r in rms]}")
+            except Exception:
+                pass
+            # [4.1] Remote Mic PTT VU meter -- capture the most recent
+            # sample for the button-fill meter, gain-adjusted by the
+            # engine-side Remote DJ gain actually applied to THIS
+            # session (session.dj_gain_db, cached once at session
+            # start -- see _remote_dj_session_start; never re-queried
+            # here). Stored on the session only -- NOT written to
+            # LEVELS_PATH from here. output_level's own handler below
+            # (already the sole writer of LEVELS_PATH, ~50ms cadence)
+            # embeds this in its own next write via
+            # _remote_dj_level_payload(), so LEVELS_PATH still has
+            # exactly one writer. A malformed/empty level structure
+            # fails safe -- session.dj_level_sample is simply left
+            # unchanged (or None), never raises out of this handler,
+            # independent of the diagnostic block above.
+            try:
+                sample_rms = list(structure.get_value("rms")) or []
+                sample_peak = list(structure.get_value("peak")) or []
+                sample_decay = list(structure.get_value("decay")) or []
+                gain_db = session.dj_gain_db or 0.0
+                session.dj_level_sample = {
+                    "ts": time.time(),
+                    "rms": [v + gain_db for v in sample_rms],
+                    "peak": [v + gain_db for v in sample_peak],
+                    "decay": [v + gain_db for v in sample_decay],
+                }
             except Exception:
                 pass
             return True
@@ -1063,6 +1116,14 @@ class PlaybackEngine:
             "rms": rms,
             "peak": peak,
             "decay": decay,
+            # [4.1] Remote Mic PTT VU meter -- existing top-level keys
+            # (ts/rms/peak/decay) are UNCHANGED, preserving the contract
+            # every current Program Level consumer already relies on.
+            # This is the only new key. None (JSON null) whenever there's
+            # no active Remote DJ session, no sample has arrived yet, or
+            # the sample has gone stale -- see _remote_dj_level_payload's
+            # own docstring for exactly which of those applies and why.
+            "remote_dj": self._remote_dj_level_payload(),
         }
         try:
             LEVELS_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -1074,6 +1135,34 @@ class PlaybackEngine:
             # try again with fresh values.
             pass
         return True
+
+    def _remote_dj_level_payload(self):
+        """[4.1] Returns the most recent gain-adjusted Remote DJ level
+        sample (see _on_element_message's dj_level capture above) for
+        embedding in the shared LEVELS_PATH payload, or None when:
+          - there is no active Remote DJ session (self.remote_dj_session
+            is None -- set immediately at the TOP of
+            _remote_dj_session_stop, before any other teardown work, so
+            a disconnect already makes this return None on the very
+            next output_level tick, ~LEVEL_INTERVAL_MS later -- never
+            "indefinitely frozen");
+          - a session exists but no dj_level message has arrived yet
+            (session.dj_level_sample is still None); or
+          - the most recent sample is older than REMOTE_DJ_LEVEL_STALE_S
+            -- a second, independent safety net for the rarer case
+            where the session object survives but its audio has
+            genuinely stopped flowing (e.g. a WebRTC hiccup), distinct
+            from the ordinary disconnect path above.
+        Never raises -- called on every output_level tick (~20Hz)."""
+        session = self.remote_dj_session
+        if session is None:
+            return None
+        sample = session.dj_level_sample
+        if sample is None:
+            return None
+        if time.time() - sample.get("ts", 0.0) > REMOTE_DJ_LEVEL_STALE_S:
+            return None
+        return sample
 
     def _on_main_bus_error(self, bus, message):
         # self.main_pipeline's bus isn't watched for anything else today
@@ -4648,9 +4737,13 @@ class PlaybackEngine:
         # config now (fresh read at session start; changes take effect
         # on the next connect, same contract as before). Gate stays at
         # 0 until the DJ explicitly opens it via _remote_dj_set_gate.
-        slot.remote_gain.set_property(
-            "volume", 10 ** (RemoteDJAudioInput.load().gain_db / 20.0)
-        )
+        # [4.1] Same read also seeds session.dj_gain_db -- the ONLY
+        # place this ever hits the DB; _on_element_message's dj_level
+        # handler reuses this cached value on every ~100ms meter
+        # message rather than querying per-message.
+        dj_gain_db = RemoteDJAudioInput.load().gain_db
+        session.dj_gain_db = dj_gain_db
+        slot.remote_gain.set_property("volume", 10 ** (dj_gain_db / 20.0))
         slot.remote_gate.set_property("volume", 0.0)
         self.remote_dj_session = session
         # Open the two diagnostic sinks. Truncate on each session start

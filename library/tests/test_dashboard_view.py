@@ -62,6 +62,48 @@ class DashboardPageRenderTests(TestCase):
         content = response.content.decode("utf-8")
         self.assertNotIn('class="queue-panel has-fx-carts" id="queuePanel"', content)
 
+    def test_remote_mic_vu_meter_plumbing_renders(self):
+        """Roadmap 4.1 -- the Remote Mic PTT button's VU-meter-as-fill
+        plumbing must render on the normal Dashboard: the button itself
+        (unchanged id/label/click-handler), the CSS custom property it's
+        driven by, the fill pseudo-element rule, and the JS function
+        that sets the property from the existing levels poll."""
+        response = self.client.get("/")
+        content = response.content.decode("utf-8")
+        self.assertIn('id="remoteDjGateBtn"', content)
+        self.assertIn('onclick="toggleRemoteDjGate()"', content)
+        self.assertIn("--remote-dj-vu-pct", content)
+        self.assertIn("#remoteDjGateBtn::before", content)
+        self.assertIn("function renderRemoteDjVu(remoteDj)", content)
+        # Must be wired into the EXISTING poll, not a new one -- the
+        # only setInterval driving level polling stays at 100ms, and
+        # renderRemoteDjVu is called from inside pollLevels(), not from
+        # a second interval of its own.
+        self.assertEqual(content.count("setInterval(pollLevels"), 1)
+        self.assertIn("renderRemoteDjVu(data.remote_dj)", content)
+
+    def test_remote_mic_ptt_off_clears_vu_fill_immediately(self):
+        """Roadmap 4.1 follow-up -- toggleRemoteDjGate() must reset
+        --remote-dj-vu-pct to 0% the instant THIS browser's own
+        active:false request succeeds, rather than waiting for the
+        next ~1Hz /api/engine/status/ poll (verified live via a
+        Playwright-driven timing test against the real rendered page
+        during development; this is the accompanying static regression
+        guard against the fix silently regressing). Must not touch
+        .active/LIVE itself -- that stays exclusively driven by
+        renderRemoteDjGate()/the status poll."""
+        response = self.client.get("/")
+        content = response.content.decode("utf-8")
+        self.assertIn("} else if (!desiredActive) {", content)
+        self.assertIn("btn.style.setProperty('--remote-dj-vu-pct', '0%');", content)
+        # The reset call must live inside toggleRemoteDjGate, after the
+        # fetch resolves -- not inside renderRemoteDjGate/renderRemoteDjVu
+        # (which would make it re-run on every poll instead of once per
+        # successful click).
+        toggle_fn = content[content.index("async function toggleRemoteDjGate"):content.index("async function rdjRunCalibration")]
+        self.assertIn("btn.style.setProperty('--remote-dj-vu-pct', '0%');", toggle_fn)
+        self.assertNotIn("classList.toggle('active'", toggle_fn)
+
 
 @override_settings(SECURE_SSL_REDIRECT=False)
 class RemoteDjPageRenderTests(TestCase):
@@ -81,3 +123,22 @@ class RemoteDjPageRenderTests(TestCase):
         content = response.content.decode("utf-8")
         self.assertIn("coming-up-card", content)
         self.assertIn("listenerTlh", content)
+
+    def test_remote_mic_vu_meter_plumbing_renders_in_remote_dj_mode(self):
+        """Roadmap 4.1 -- implemented once in the shared template, so
+        /remote-dj/ must show the identical Remote Mic meter plumbing
+        as the full Dashboard (test_dashboard_view.DashboardPageRenderTests
+        .test_remote_mic_vu_meter_plumbing_renders), not a second copy or
+        a degraded version. The Remote Mic button itself is NOT inside
+        the `{% if mode != 'remote_dj' %}` block that hides Studio Mic
+        PTT -- it must still be present and clickable here."""
+        response = self.client.get("/remote-dj/")
+        content = response.content.decode("utf-8")
+        self.assertIn('id="remoteDjGateBtn"', content)
+        self.assertIn('onclick="toggleRemoteDjGate()"', content)
+        self.assertIn("--remote-dj-vu-pct", content)
+        self.assertIn("function renderRemoteDjVu(remoteDj)", content)
+        # Studio Mic PTT (operator-only) stays hidden in this mode --
+        # confirms the shared template's existing mode-gating is
+        # undisturbed by this change.
+        self.assertNotIn('id="micPttBtn"', content)

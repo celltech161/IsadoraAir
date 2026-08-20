@@ -98,6 +98,54 @@
   #remoteDjGateBtn.active { background: var(--danger); border-color: var(--danger); }
   #remoteDjGateBtn:disabled { opacity: 0.5; }
 
+  /* [4.1] Remote Mic PTT VU meter -- the button fill IS the meter, a
+     single ::before pseudo-element whose width tracks --remote-dj-vu-pct
+     (a CSS custom property set from JS in pollLevels()/renderRemoteDjVu,
+     reusing the existing fast-cadence level poll -- see that function).
+     No child DOM nodes are created/removed per tick, matching every
+     other VU element in this file (.vu-bar-mask above works the same
+     way). --remote-dj-vu-pct defaults to 0% via the var() fallback, so
+     the button never shows a fill before the first poll resolves.
+
+     Stacking: #remoteDjGateBtn gets position:relative + overflow:hidden
+     so ::before (position:absolute, inset:0) is clipped to the button's
+     own box and positioned against it. The fill uses z-index:-1, which
+     (per CSS painting order) places it ABOVE the button's own solid
+     .active background (an unpositioned box-level paint) but BELOW the
+     button's text content (in-flow inline content always paints above
+     z-index<0 descendants) -- so the label stays readable without
+     needing its own wrapper element or z-index.
+
+     The fill is a semi-transparent WHITE overlay rather than a second
+     hardcoded color -- --danger (and --accent) are admin-configurable
+     per ui_theme, so "brighter" has to mean "lighter than whatever the
+     base color currently is," not a specific hex value. Only relevant
+     while .active (LIVE): the button's OWN unconditional .active red
+     background already conveys "LIVE" regardless of the fill, so a
+     silent/quiet LIVE mic (fill near 0%) still reads unmistakably as
+     LIVE, never as OFF -- the fill only adds "how loud right now" on
+     top of that. Explicitly hidden outside .active as a CSS-level
+     guarantee independent of JS correctness (renderRemoteDjVu already
+     zeroes the custom property in every OFF/disconnected/stale case,
+     but this means a fill can never show at all on a non-active button
+     even if that ever regressed). */
+  #remoteDjGateBtn {
+    position: relative;
+    overflow: hidden;
+    --remote-dj-vu-pct: 0%;
+  }
+  #remoteDjGateBtn::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    width: var(--remote-dj-vu-pct, 0%);
+    background: rgba(255, 255, 255, 0.4);
+    z-index: -1;
+    transition: width 60ms linear;
+    pointer-events: none;
+  }
+  #remoteDjGateBtn:not(.active)::before { display: none; }
+
   /* Mobile portrait: two buttons per row, slightly smaller text so the
      longest labels (~"Studio Mic: ERROR", "Disconnect Remote",
      "Mic Cal: +12.5 dB") still fit inside each half-row. */
@@ -1575,7 +1623,24 @@ async function toggleRemoteDjGate() {
       headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') },
       body: JSON.stringify({ active: desiredActive }),
     });
-    if (!resp.ok) btn.classList.remove('pending');
+    if (!resp.ok) {
+      btn.classList.remove('pending');
+    } else if (!desiredActive) {
+      // [4.1 follow-up] This browser just successfully requested OFF --
+      // don't let the VU fill keep animating real, still-flowing
+      // pre-gate dj_level data (the DJ may still be talking) for up to
+      // ~1s until the next slow /api/engine/status/ poll updates
+      // remote_dj_live and renderRemoteDjGate() removes .active. Purely
+      // cosmetic: resets the same CSS custom property renderRemoteDjVu()
+      // already drives every ~100ms; does NOT touch .active/LIVE
+      // itself, which stays exclusively driven by /api/engine/status/
+      // per that function. If this request somehow didn't actually
+      // take effect, the very next pollLevels() tick just recomputes
+      // and reasserts the correct value under the same authoritative
+      // gating as always -- this can only preempt a stale-looking
+      // frame or two, never desync anything.
+      btn.style.setProperty('--remote-dj-vu-pct', '0%');
+    }
   } else {
     // Calibration mode.
     if (rdjCalibrating) return;
@@ -2601,14 +2666,56 @@ function vuRenderSilence() {
   }
 }
 
+// [4.1] Remote Mic PTT VU meter -- sets --remote-dj-vu-pct on
+// #remoteDjGateBtn from the SAME data.remote_dj sub-object the engine
+// now embeds in /api/engine/levels/ (see engine.py's
+// _remote_dj_level_payload). Deliberately takes NO fetch/poll of its
+// own -- called once per pollLevels() tick below, same 100ms cadence
+// already used for Program Level, reusing that single request.
+//
+// remoteDj may be null/undefined (no session, no sample yet, or a
+// stale sample -- the engine already resolved all three cases to
+// null) -- ANY falsy value here means "render zero," same as vuRenderSilence
+// does for the Program Level bars above.
+//
+// LIVE/OFF is read from window.__rdjLastEngineState.remote_dj_live --
+// the SAME state renderRemoteDjGate() already maintains from the
+// existing ~1Hz /api/engine/status/ poll (see poll()/renderRemoteDjGate
+// above) -- never inferred from the presence of level data itself, per
+// the explicit design rule that /api/engine/status/ stays the sole
+// authority for LIVE/OFF. window.__rdjLastEngineState may still be
+// undefined on the very first tick or two after page load (pollLevels()
+// starts immediately; the slower status poll may not have resolved
+// yet) -- that reads as "not live" and renders zero, the safe default.
+function renderRemoteDjVu(remoteDj) {
+  const btn = document.getElementById('remoteDjGateBtn');
+  if (!btn) return;
+  const live = !!(window.__rdjLastEngineState && window.__rdjLastEngineState.remote_dj_live);
+  if (!live || !remoteDj) {
+    btn.style.setProperty('--remote-dj-vu-pct', '0%');
+    return;
+  }
+  const now = Date.now() / 1000;
+  if (!remoteDj.ts || (now - remoteDj.ts) > 0.75) {
+    btn.style.setProperty('--remote-dj-vu-pct', '0%');
+    return;
+  }
+  // Prefer the LOUDEST channel rather than averaging L/R -- a single
+  // mono/near-mono remote DJ mic input shouldn't read half-scale just
+  // because one channel is silent.
+  const rms = (remoteDj.rms || []).filter(v => typeof v === 'number' && isFinite(v));
+  const maxRmsDb = rms.length ? Math.max(...rms) : null;
+  btn.style.setProperty('--remote-dj-vu-pct', `${vuDbToPct(maxRmsDb)}%`);
+}
+
 async function pollLevels() {
   try {
     const resp = await fetch('/api/engine/levels/');
-    if (!resp.ok) { vuRenderSilence(); return; }
+    if (!resp.ok) { vuRenderSilence(); renderRemoteDjVu(null); return; }
     const data = await resp.json();
     const now = Date.now() / 1000;
     const stale = !data.ts || (now - data.ts) > 0.75;
-    if (stale) { vuRenderSilence(); return; }
+    if (stale) { vuRenderSilence(); renderRemoteDjVu(null); return; }
     const rms = data.rms || [];
     const decay = data.decay || [];
     for (let ch = 0; ch < 2; ch++) {
@@ -2622,8 +2729,10 @@ async function pollLevels() {
       if (mask) mask.style.width = `${100 - fillPct}%`;
       if (peakEl) peakEl.style.left = `${peakPct}%`;
     }
+    renderRemoteDjVu(data.remote_dj);
   } catch (e) {
     vuRenderSilence();
+    renderRemoteDjVu(null);
   }
 }
 setInterval(pollLevels, 100);
