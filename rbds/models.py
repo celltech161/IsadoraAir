@@ -41,6 +41,16 @@ DYNAMIC_PS_MODE_CHOICES = [
     (2, "Mode 2 — Word-aligned scrolling"),
     (3, "Mode 3 — Scroll by 1 character, blank spacing at start/end"),
 ]
+# Long PS ([P2] 2.3F2) content source -- deliberately an explicit
+# choices field, not a boolean, so a future source type (e.g. a
+# dedicated PROGRAM/STATION_IDENTITY/TEMPLATE variant) can be added
+# without a schema redesign. Only the two proven-useful sources ship
+# now -- see rbds/services/rbds_manager.py's _resolve_long_ps for the
+# exact composition each one performs.
+LONG_PS_SOURCE_CHOICES = [
+    ("static", "Static text"),
+    ("now_playing", "Now Playing"),
+]
 
 
 class RBDSConfig(models.Model):
@@ -119,6 +129,62 @@ class RBDSConfig(models.Model):
                    "Padded/truncated to 8 chars automatically at send time. Sent "
                    "directly when PS Mode below is Static PS; also the fail-safe "
                    "fallback for Manual PS Frames mode when zero frames are enabled.",
+    )
+
+    # --- Long PS (2026-08-20, [P2] 2.3F2) ---
+    # A separate, later RDS service (UECP MEC 0x21, up to 32 display
+    # characters) from the ordinary 8-character PS above -- independently
+    # configurable, never coupled to ps_mode (see rbds/services/
+    # rbds_manager.py's _resolve_long_ps and _tick for why the two are
+    # resolved and sent completely independently). RF-proven working on
+    # a real TEF6686 receiver before this field ever existed -- see
+    # scratchpad/rbds_bench/long_ps_static_proof/ and rbds/services/
+    # uecp.py's mec_long_ps() for the full protocol derivation.
+    #
+    # long_ps_managed (2026-08-20 pre-commit ownership fix) is the
+    # MASTER switch, separate from long_ps_enabled below -- once
+    # long_ps_enabled's own disabled state became authoritatively
+    # reasserted on every startup/reconnect/full-resend (matching CT
+    # On/Off's own established precedent, see rbds_manager.py's
+    # __init__ comment), leaving long_ps_enabled=False as the sole
+    # migration default would have meant EVERY existing installation
+    # started sending an unsolicited MEC 0x21 disable the moment this
+    # code deployed -- silently overriding any pre-existing
+    # encoder/StereoTool-local Long PS configuration on a station that
+    # never opted into IsadoraAir managing this at all. long_ps_managed
+    # is what distinguishes "IsadoraAir does not manage Long PS" (the
+    # safe default -- no MEC 0x21 traffic of any kind) from "IsadoraAir
+    # manages Long PS and currently wants it disabled" (an
+    # authoritative, actively-asserted state) -- see
+    # rbds_manager.py's _tick for exactly where this gates.
+    long_ps_managed = models.BooleanField(
+        "Manage Long PS with IsadoraAir", default=False,
+        help_text="When off (the default), IsadoraAir sends no Long PS commands at "
+                   "all and leaves any existing encoder-local Long PS configuration "
+                   "untouched. Turn on to let IsadoraAir control Long PS using the "
+                   "settings below -- including explicitly turning Long PS off, if "
+                   "Long PS Enabled below is off.",
+    )
+    long_ps_enabled = models.BooleanField(
+        "Long PS enabled", default=False,
+        help_text="Transmits an extended, up to 32-character Program Service name "
+                   "alongside the ordinary 8-character PS above. Support varies by "
+                   "receiver. Only takes effect when Manage Long PS with IsadoraAir "
+                   "above is on.",
+    )
+    long_ps_source = models.CharField(
+        "Long PS source", max_length=16, choices=LONG_PS_SOURCE_CHOICES, default="static",
+        help_text="Static text: always sends Long PS Static Text below. Now Playing: "
+                   "sends the current track's Artist - Title (just one field alone if "
+                   "only one is known), falling back to Long PS Static Text below "
+                   "whenever no usable now-playing metadata exists. Independent of PS "
+                   "Mode above -- any combination of the two is valid.",
+    )
+    long_ps_static_text = models.CharField(
+        "Long PS static text", max_length=32, blank=True, default="",
+        help_text="Up to 32 characters. Sent as-is when Long PS Source is Static text; "
+                   "also the fallback shown when Long PS Source is Now Playing but "
+                   "nothing usable is currently playing.",
     )
 
     # --- Short PS mode + Generated Rotating PS settings (2.3C) ---

@@ -4811,3 +4811,707 @@ class RuntimeCommitStateTests(SimpleTestCase):
         mgr._write_state(self.config, "PS", "RT", "nowplaying", None)
         state = json.loads(self.state_path.read_text())
         self.assertIsNone(state["runtime_commit"])
+
+
+# ============================================================
+# [P2] 2.3F2 -- Long PS production integration
+# ============================================================
+
+class RBDSConfigLongPsFieldsTests(SimpleTestCase):
+    """MODEL/CONFIG: long_ps_managed/long_ps_enabled/long_ps_source/
+    long_ps_static_text field definitions themselves (defaults,
+    choices, max_length) -- no DB access needed, mirrors
+    RBDSConfigDynamicPsFieldsTests's own unsaved-instance style."""
+
+    # Test 1 (ownership-fix numbering): migration/default is
+    # long_ps_managed=False -- deployment alone must cause zero Long
+    # PS wire behavior change for any existing installation.
+    def test_long_ps_managed_default_is_false(self):
+        self.assertFalse(RBDSConfig().long_ps_managed)
+
+    def test_long_ps_enabled_default_is_false(self):
+        self.assertFalse(RBDSConfig().long_ps_enabled)
+
+    def test_long_ps_source_default_is_static(self):
+        self.assertEqual(RBDSConfig().long_ps_source, "static")
+
+    def test_long_ps_source_has_static_and_now_playing_choices(self):
+        field = RBDSConfig._meta.get_field("long_ps_source")
+        self.assertEqual(dict(field.choices), {"static": "Static text", "now_playing": "Now Playing"})
+
+    def test_long_ps_static_text_default_is_blank(self):
+        self.assertEqual(RBDSConfig().long_ps_static_text, "")
+
+    def test_long_ps_static_text_max_length_is_32(self):
+        field = RBDSConfig._meta.get_field("long_ps_static_text")
+        self.assertEqual(field.max_length, 32)
+
+
+class RBDSConfigAdminLongPsFieldsetTests(SimpleTestCase):
+    """ADMIN: the Long PS fieldset's position and contents in
+    RBDSConfigAdmin.fieldsets. No DB access needed -- fieldsets is a
+    plain class attribute."""
+
+    def _fieldset_names(self):
+        return [name for name, _opts in RBDSConfigAdmin.fieldsets]
+
+    def test_long_ps_fieldset_positioned_after_ps_before_identity(self):
+        names = self._fieldset_names()
+        ps_index = names.index("Program Service (PS)")
+        long_ps_index = names.index("Long PS")
+        identity_index = names.index("Identity")
+        self.assertEqual(long_ps_index, ps_index + 1)
+        self.assertEqual(identity_index, long_ps_index + 1)
+
+    def test_long_ps_fieldset_exposes_required_fields(self):
+        fields_by_name = dict(RBDSConfigAdmin.fieldsets)
+        self.assertEqual(
+            fields_by_name["Long PS"]["fields"],
+            ["long_ps_managed", "long_ps_enabled", "long_ps_source", "long_ps_static_text"],
+        )
+
+    def test_long_ps_fieldset_description_omits_protocol_internals(self):
+        """Operator-facing copy must explain the feature in plain
+        terms -- MEC numbers, MEL, UECP framing, and Advanced RDS
+        licensing are implementation details, not operator UI (see
+        the [P2] 2.3F2 task's own explicit requirement)."""
+        fields_by_name = dict(RBDSConfigAdmin.fieldsets)
+        description = fields_by_name["Long PS"]["description"].lower()
+        for internal_term in ("mec", "mel", "uecp", "advanced rds", "license", "0x21", "0x24"):
+            self.assertNotIn(internal_term, description)
+
+
+class ResolveLongPsCompositionTests(SimpleTestCase):
+    """COMPOSITION: _resolve_long_ps's own (enabled, text) resolution,
+    in isolation from the manager's send/dedupe machinery. Mirrors
+    RtNormalizationGapTests's own SimpleTestCase-with-mock-config style
+    -- _resolve_long_ps does no DB access."""
+
+    def setUp(self):
+        self.mgr = RBDSManager()
+
+    def test_static_source_returns_static_text_and_enabled_flag(self):
+        config = mock.Mock(long_ps_enabled=True, long_ps_source="static",
+                            long_ps_static_text="OAK GROVE RADIO 98.5")
+        enabled, text = self.mgr._resolve_long_ps(config, {"artist": "Rush", "title": "Tom Sawyer"})
+        self.assertTrue(enabled)
+        self.assertEqual(text, "OAK GROVE RADIO 98.5")
+
+    def test_static_source_ignores_now_playing_entirely(self):
+        config = mock.Mock(long_ps_enabled=True, long_ps_source="static", long_ps_static_text="STATIC")
+        enabled, text = self.mgr._resolve_long_ps(config, {"artist": "Rush", "title": "Tom Sawyer"})
+        self.assertEqual(text, "STATIC")
+
+    def test_now_playing_source_composes_artist_and_title(self):
+        config = mock.Mock(long_ps_enabled=True, long_ps_source="now_playing", long_ps_static_text="FALLBACK")
+        enabled, text = self.mgr._resolve_long_ps(config, {"artist": "Rush", "title": "Tom Sawyer"})
+        self.assertEqual(text, "Rush - Tom Sawyer")
+
+    def test_now_playing_source_falls_back_to_static_text_when_blank(self):
+        config = mock.Mock(long_ps_enabled=True, long_ps_source="now_playing", long_ps_static_text="FALLBACK")
+        enabled, text = self.mgr._resolve_long_ps(config, {"artist": "", "title": ""})
+        self.assertEqual(text, "FALLBACK")
+
+    def test_now_playing_source_uses_title_only_when_artist_unknown(self):
+        config = mock.Mock(long_ps_enabled=True, long_ps_source="now_playing", long_ps_static_text="FALLBACK")
+        enabled, text = self.mgr._resolve_long_ps(config, {"artist": "", "title": "Tom Sawyer"})
+        self.assertEqual(text, "Tom Sawyer")
+
+    def test_now_playing_source_uses_artist_only_when_title_unknown(self):
+        config = mock.Mock(long_ps_enabled=True, long_ps_source="now_playing", long_ps_static_text="FALLBACK")
+        enabled, text = self.mgr._resolve_long_ps(config, {"artist": "Rush", "title": ""})
+        self.assertEqual(text, "Rush")
+
+    def test_result_is_normalized(self):
+        config = mock.Mock(long_ps_enabled=True, long_ps_source="static", long_ps_static_text="DJ’s Show")
+        enabled, text = self.mgr._resolve_long_ps(config, {"artist": "", "title": ""})
+        self.assertEqual(text, "DJ's Show")
+
+    def test_disabled_still_resolves_text_but_enabled_flag_is_false(self):
+        config = mock.Mock(long_ps_enabled=False, long_ps_source="static", long_ps_static_text="STATIC")
+        enabled, text = self.mgr._resolve_long_ps(config, {})
+        self.assertFalse(enabled)
+        self.assertEqual(text, "STATIC")
+
+
+def _long_ps_values_sent(sent_payloads):
+    """Decodes each MEC 0x21 (Long PS) frame found across
+    `sent_payloads` into either the enabled text (str) or None
+    (disabled/MEL=0), one entry per frame actually transmitted, in
+    order -- mirrors RBDSManagerLicTests's own _lic_values_sent shape.
+    MEL = len(text) + 1 (trailing pad byte, see uecp.mec_long_ps's own
+    docstring), so the text bytes are msg[4:4 + mel - 1]."""
+    values = []
+    for payload in sent_payloads:
+        for msg in _split_uecp_frames(payload):
+            if not msg or msg[0] != 0x21:
+                continue
+            mel = msg[3]
+            values.append(None if mel == 0 else msg[4:4 + mel - 1].decode("ascii"))
+    return values
+
+
+class RBDSManagerLongPsTests(TestCase):
+    """MANAGER: Long PS's own dedupe/full-resend/reconnect/disable
+    state machine, exercised through the REAL _tick() -- never a
+    reimplementation. Modeled on RBDSManagerCtOnOffTests's own
+    structure and precedent (2026-08-20 pre-commit fix): see
+    rbds_manager.py's __init__ comment for why CT On/Off
+    (disabled is a first-class, always-reasserted state), not LIC
+    (send-clear-once-then-fully-disengage), is the correct precedent
+    for Long PS's disable semantics -- StereoTool can retain a stale
+    UECP-supplied Long PS value across an IsadoraAir process restart
+    or TCP reconnect, and a fresh process has no in-memory way to tell
+    a station that has genuinely never touched the feature apart from
+    one that was enabled before and is now explicitly Disabled."""
+
+    def setUp(self):
+        # Same close_old_connections() patch RBDSManagerLicTests uses --
+        # see that class's own setUp comment for why (test-harness-only
+        # interaction with this environment's atomic-block wrapping,
+        # not a real production behavior difference).
+        patcher = mock.patch("rbds.services.rbds_manager.close_old_connections")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.mgr = RBDSManager()
+        self.sent = []
+        self.mgr._transmit = mock.Mock(side_effect=lambda config, payload: self.sent.append(payload))
+        self.mgr._read_now_playing = mock.Mock(return_value={"title": "", "artist": ""})
+        self.mgr._read_category_state = mock.Mock(return_value={"pty_override": None, "ptyn": ""})
+        self.config = RBDSConfig.load()
+        self.config.protocol = "uecp"
+        self.config.use_rt_plus = False
+        # This class exercises MANAGED Long PS behavior specifically
+        # (the ownership gate itself has its own dedicated test class,
+        # RBDSManagerLongPsOwnershipTests) -- long_ps_managed defaults
+        # to False (the safe migration default), so it must be turned
+        # on here for every test below to exercise anything at all.
+        self.config.long_ps_managed = True
+
+    def _sent_long_ps(self):
+        return _long_ps_values_sent(self.sent)
+
+    # 1. Disabled is a first-class, authoritative state once MANAGED
+    # -- the very first eligible tick (initial manager/full-state
+    # send) sends exactly one MEC 0x21 disable even for a station
+    # whose long_ps_enabled has always been at its default False,
+    # since a fresh process cannot know whether StereoTool is
+    # retaining a stale value from a prior process's lifetime. (See
+    # RBDSManagerLongPsOwnershipTests for the separate, and different,
+    # UNmanaged-startup behavior.)
+    def test_startup_while_disabled_sends_one_disable(self):
+        self.config.save()  # long_ps_managed=True (setUp), long_ps_enabled stays at its default (False)
+        self.mgr._tick()
+        self.assertEqual(self._sent_long_ps(), [None])
+        self.assertEqual(self.mgr._last_sent_long_ps_enabled, False)
+
+    # 2. Enabling with Static source sends the configured text.
+    def test_enabling_static_sends_text(self):
+        self.config.long_ps_enabled = True
+        self.config.long_ps_source = "static"
+        self.config.long_ps_static_text = "OAK GROVE RADIO 98.5"
+        self.config.save()
+        self.mgr._tick()
+        self.assertEqual(self._sent_long_ps(), ["OAK GROVE RADIO 98.5"])
+
+    # 3. A static text edit sends the new value.
+    def test_static_text_change_sends_new_value(self):
+        self.config.long_ps_enabled = True
+        self.config.long_ps_source = "static"
+        self.config.long_ps_static_text = "FIRST VALUE"
+        self.config.save()
+        self.mgr._tick()
+        self.config.long_ps_static_text = "SECOND VALUE"
+        self.config.save()
+        self.mgr._tick()
+        self.assertEqual(self._sent_long_ps(), ["FIRST VALUE", "SECOND VALUE"])
+
+    # 4. Unchanged content does not continuously resend on an ordinary tick.
+    def test_unchanged_content_does_not_resend_on_ordinary_tick(self):
+        self.config.long_ps_enabled = True
+        self.config.long_ps_source = "static"
+        self.config.long_ps_static_text = "STEADY"
+        self.config.save()
+        self.mgr._tick()
+        self.mgr._tick()  # nothing changed, not due for full resend, still connected
+        self.assertEqual(self._sent_long_ps(), ["STEADY"])
+
+    # 5. A source change forces a send even if the resolved text is
+    # coincidentally identical -- this is exactly why _last_long_ps_source
+    # is tracked as its own piece of state, separate from _last_sent_long_ps.
+    def test_source_change_sends_even_if_text_coincidentally_unchanged(self):
+        self.config.long_ps_enabled = True
+        self.config.long_ps_source = "static"
+        self.config.long_ps_static_text = "SAME TEXT"
+        self.config.save()
+        self.mgr._tick()
+        self.mgr._read_now_playing = mock.Mock(return_value={"artist": "", "title": ""})
+        self.config.long_ps_source = "now_playing"  # falls back to static text -- same resolved string
+        self.config.save()
+        self.mgr._tick()
+        self.assertEqual(self._sent_long_ps(), ["SAME TEXT", "SAME TEXT"])
+
+    # 6. Enabled True->False sends ONE disable, then stops -- even
+    # across a further ordinary tick with nothing else changed.
+    def test_disabling_after_enabled_sends_disable_once_then_stops(self):
+        self.config.long_ps_enabled = True
+        self.config.long_ps_source = "static"
+        self.config.long_ps_static_text = "ON AIR"
+        self.config.save()
+        self.mgr._tick()
+        self.config.long_ps_enabled = False
+        self.config.save()
+        self.mgr._tick()
+        self.assertEqual(self._sent_long_ps(), ["ON AIR", None])
+        self.mgr._tick()
+        self.assertEqual(self._sent_long_ps(), ["ON AIR", None])
+
+    # 7. The existing 30s periodic full resend reasserts the current
+    # enabled value even though it hasn't changed (same as PS/RT/LIC).
+    def test_periodic_full_resend_reasserts_enabled_value(self):
+        self.config.long_ps_enabled = True
+        self.config.long_ps_source = "static"
+        self.config.long_ps_static_text = "STEADY"
+        self.config.save()
+        self.mgr._tick()
+        self.mgr._last_full_resend = 0.0  # force the full-resend gate open
+        self.mgr._tick()
+        self.assertEqual(self._sent_long_ps(), ["STEADY", "STEADY"])
+
+    # 8. Disabled is reasserted on the periodic full resend too, same
+    # as CT On/Off's own False -- see test_periodic_full_resend_
+    # reasserts_disabled_state_too in RBDSManagerCtOnOffTests for the
+    # direct precedent this mirrors, and __init__'s own comment for
+    # why (StereoTool can drift/retain state independently of any
+    # local config change, exactly the class of problem the 30s
+    # periodic resend exists to guard against for every other field).
+    def test_periodic_full_resend_reasserts_disabled_state_too(self):
+        self.config.long_ps_enabled = True
+        self.config.long_ps_source = "static"
+        self.config.long_ps_static_text = "ON AIR"
+        self.config.save()
+        self.mgr._tick()
+        self.config.long_ps_enabled = False
+        self.config.save()
+        self.mgr._tick()  # sends the one disable
+        self.assertEqual(self._sent_long_ps(), ["ON AIR", None])
+        self.mgr._last_full_resend = 0.0  # force the full-resend gate open again
+        self.mgr._tick()
+        self.assertEqual(self._sent_long_ps(), ["ON AIR", None, None])
+
+    # 9. A fresh reconnect reasserts the current enabled value.
+    def test_reconnect_reasserts_enabled_value(self):
+        self.config.long_ps_enabled = True
+        self.config.long_ps_source = "static"
+        self.config.long_ps_static_text = "STEADY"
+        self.config.save()
+        self.mgr._tick()
+        self.mgr._connected = False
+        self.mgr._connected_since = None
+        self.mgr._tick()
+        self.assertEqual(self._sent_long_ps(), ["STEADY", "STEADY"])
+
+    # 10. A fresh reconnect resends the disable again even though it
+    # was already successfully settled on the prior connection --
+    # StereoTool's own connection may not have preserved that state.
+    # A further ordinary tick after the reconnect-triggered resend
+    # does not repeat it a third time.
+    def test_reconnect_while_disabled_sends_disable_again(self):
+        self.config.save()  # long_ps_enabled stays False
+        self.mgr._tick()  # startup: sends the first disable
+        self.assertEqual(self._sent_long_ps(), [None])
+        self.mgr._connected = False
+        self.mgr._connected_since = None
+        self.mgr._tick()
+        self.assertEqual(self._sent_long_ps(), [None, None])
+        self.mgr._tick()  # ordinary tick, nothing changed, no reconnect this time
+        self.assertEqual(self._sent_long_ps(), [None, None])
+
+    # 11. Now Playing source sends the composed "Artist - Title" value.
+    def test_now_playing_source_sends_composed_value(self):
+        self.config.long_ps_enabled = True
+        self.config.long_ps_source = "now_playing"
+        self.config.long_ps_static_text = "FALLBACK"
+        self.config.save()
+        self.mgr._read_now_playing = mock.Mock(return_value={"artist": "Rush", "title": "Tom Sawyer"})
+        self.mgr._tick()
+        self.assertEqual(self._sent_long_ps(), ["Rush - Tom Sawyer"])
+
+    # 12. Now Playing source falls back to the static text when
+    # nothing usable is currently playing.
+    def test_now_playing_source_falls_back_when_nothing_playing(self):
+        self.config.long_ps_enabled = True
+        self.config.long_ps_source = "now_playing"
+        self.config.long_ps_static_text = "OAK GROVE RADIO 98.5"
+        self.config.save()
+        self.mgr._read_now_playing = mock.Mock(return_value={"artist": "", "title": ""})
+        self.mgr._tick()
+        self.assertEqual(self._sent_long_ps(), ["OAK GROVE RADIO 98.5"])
+
+    # 13. A longer-to-shorter replacement transmits a clean frame with
+    # no stale tail from the prior, longer value -- proven at the raw
+    # transmitted-byte level, not just the decoded string, since
+    # mec_long_ps() rebuilds the MEL/text from scratch every call.
+    def test_longer_to_shorter_replacement_sends_clean_frame_no_stale_tail(self):
+        self.config.long_ps_enabled = True
+        self.config.long_ps_source = "static"
+        self.config.long_ps_static_text = "THIS IS A MUCH LONGER LONG PS V"
+        self.config.save()
+        self.mgr._tick()
+        self.config.long_ps_static_text = "SHORT"
+        self.config.save()
+        self.mgr._tick()
+        self.assertEqual(self._sent_long_ps(), ["THIS IS A MUCH LONGER LONG PS V", "SHORT"])
+        frames = _split_uecp_frames(self.sent[-1])
+        msg = _find_mec(frames, 0x21)
+        self.assertEqual(bytes(msg), uecp.mec_long_ps("SHORT"))
+
+    # 14. A failed send preserves the pending disable for retry,
+    # rather than silently committing or dropping it -- checked
+    # against _last_sent_long_ps_enabled, the actual tri-state flag
+    # that decides whether the disable still needs (re)sending (see
+    # this fix's own "IMPORTANT STATE-MODEL DETAIL" requirement: a
+    # bare _last_sent_long_ps=None alone cannot distinguish "never
+    # sent" from "already sent," which is exactly the ambiguity this
+    # dedicated flag exists to resolve).
+    def test_failed_send_preserves_pending_disable(self):
+        self.config.long_ps_enabled = True
+        self.config.long_ps_source = "static"
+        self.config.long_ps_static_text = "ON AIR"
+        self.config.save()
+        self.mgr._tick()
+        self.config.long_ps_enabled = False
+        self.config.save()
+        self.mgr._transmit = mock.Mock(side_effect=ConnectionError("simulated failure"))
+        self.mgr._tick()
+        self.assertEqual(self.mgr._last_sent_long_ps_enabled, True,
+                          "a failed disable send must not commit the new (disabled) state")
+        self.mgr._transmit = mock.Mock(side_effect=lambda config, payload: self.sent.append(payload))
+        self.mgr._tick()
+        self.assertEqual(self._sent_long_ps(), ["ON AIR", None])
+        self.assertEqual(self.mgr._last_sent_long_ps_enabled, False)
+
+    # 7 (user's numbering). A failed send on the very first (startup)
+    # tick -- where there is no prior committed state at all -- must
+    # leave _last_sent_long_ps_enabled at None (never authoritatively
+    # sent), not silently treat the failed attempt as good enough; the
+    # next eligible tick retries and succeeds.
+    def test_failed_startup_disable_is_retried(self):
+        self.config.save()  # long_ps_enabled stays False
+        self.mgr._transmit = mock.Mock(side_effect=ConnectionError("simulated failure"))
+        self.mgr._tick()
+        self.assertEqual(self._sent_long_ps(), [])
+        self.assertIsNone(self.mgr._last_sent_long_ps_enabled, "a failed startup send must not commit any state")
+        self.mgr._transmit = mock.Mock(side_effect=lambda config, payload: self.sent.append(payload))
+        self.mgr._tick()
+        self.assertEqual(self._sent_long_ps(), [None])
+        self.assertEqual(self.mgr._last_sent_long_ps_enabled, False)
+
+    # 15. Re-enabling after a disable forces a send even when the
+    # text matches what was transmitted before the disable -- the
+    # None-collapse on disable is what guarantees this, not a
+    # dedicated "was it re-enabled" flag.
+    def test_re_enable_forces_send_even_if_text_matches_prior_value(self):
+        self.config.long_ps_enabled = True
+        self.config.long_ps_source = "static"
+        self.config.long_ps_static_text = "SAME VALUE"
+        self.config.save()
+        self.mgr._tick()
+        self.config.long_ps_enabled = False
+        self.config.save()
+        self.mgr._tick()  # sends the disable
+        self.config.long_ps_enabled = True  # re-enable with the identical text
+        self.config.save()
+        self.mgr._tick()
+        self.assertEqual(self._sent_long_ps(), ["SAME VALUE", None, "SAME VALUE"])
+
+    # 16. Long PS never alters ordinary PS content -- proves the two
+    # fields coexist in the same payload untouched.
+    def test_long_ps_does_not_alter_ps_content(self):
+        self.config.station_ps = "KOGR-LP "
+        self.config.ps_mode = "static"
+        self.config.long_ps_enabled = True
+        self.config.long_ps_source = "static"
+        self.config.long_ps_static_text = "OAK GROVE RADIO 98.5"
+        self.config.save()
+        self.mgr._tick()
+        frames = _split_uecp_frames(self.sent[0])
+        ps_mec = _find_mec(frames, 0x02)
+        self.assertEqual(bytes(ps_mec), uecp.mec_ps("KOGR-LP "))
+
+
+class RBDSManagerLongPsOwnershipTests(TestCase):
+    """MANAGER: long_ps_managed's own ownership-gate behavior --
+    [P2] 2.3F2 pre-commit ownership fix (2026-08-20). Exercised
+    through the REAL _tick(), same harness style as
+    RBDSManagerLongPsTests. Unlike that class, long_ps_managed is
+    deliberately left at its default (False) in setUp -- every test
+    here explicitly sets it to whatever value the scenario needs, so
+    the "unmanaged" and "just became managed"/"just relinquished
+    management" transitions are all exercised directly rather than
+    assumed."""
+
+    def setUp(self):
+        patcher = mock.patch("rbds.services.rbds_manager.close_old_connections")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.mgr = RBDSManager()
+        self.sent = []
+        self.mgr._transmit = mock.Mock(side_effect=lambda config, payload: self.sent.append(payload))
+        self.mgr._read_now_playing = mock.Mock(return_value={"title": "", "artist": ""})
+        self.mgr._read_category_state = mock.Mock(return_value={"pty_override": None, "ptyn": ""})
+        self.config = RBDSConfig.load()
+        self.config.protocol = "uecp"
+        self.config.use_rt_plus = False
+
+    def _sent_long_ps(self):
+        return _long_ps_values_sent(self.sent)
+
+    # 2. Startup while unmanaged: NO MEC 0x21 -- even though this is
+    # also the very first ever tick, which, if managed, would force an
+    # immediate send (see RBDSManagerLongPsTests's own startup test).
+    def test_startup_while_unmanaged_sends_no_long_ps_mec(self):
+        self.config.save()  # long_ps_managed stays at its default (False)
+        self.mgr._tick()
+        self.assertEqual(self._sent_long_ps(), [])
+
+    # 3. Periodic full resend while unmanaged: still no MEC 0x21.
+    def test_periodic_full_resend_while_unmanaged_sends_no_long_ps_mec(self):
+        self.config.save()
+        self.mgr._tick()
+        self.mgr._last_full_resend = 0.0
+        self.mgr._tick()
+        self.assertEqual(self._sent_long_ps(), [])
+
+    # 4. Reconnect while unmanaged: still no MEC 0x21.
+    def test_reconnect_while_unmanaged_sends_no_long_ps_mec(self):
+        self.config.save()
+        self.mgr._tick()
+        self.mgr._connected = False
+        self.mgr._connected_since = None
+        self.mgr._tick()
+        self.assertEqual(self._sent_long_ps(), [])
+
+    # 5. unmanaged -> managed + enabled: the current Long PS value is
+    # force-sent immediately on the transition tick, not merely
+    # eventually picked up by the periodic full resend.
+    def test_unmanaged_to_managed_enabled_force_sends_current_value(self):
+        self.config.save()  # unmanaged
+        self.mgr._tick()
+        self.assertEqual(self._sent_long_ps(), [])
+        self.config.long_ps_managed = True
+        self.config.long_ps_enabled = True
+        self.config.long_ps_source = "static"
+        self.config.long_ps_static_text = "OAK GROVE RADIO 98.5"
+        self.config.save()
+        self.mgr._tick()
+        self.assertEqual(self._sent_long_ps(), ["OAK GROVE RADIO 98.5"])
+
+    # 6. unmanaged -> managed + disabled: the disable is force-sent
+    # immediately on the transition tick.
+    def test_unmanaged_to_managed_disabled_force_sends_disable(self):
+        self.config.save()  # unmanaged
+        self.mgr._tick()
+        self.assertEqual(self._sent_long_ps(), [])
+        self.config.long_ps_managed = True  # long_ps_enabled stays at its default False
+        self.config.save()
+        self.mgr._tick()
+        self.assertEqual(self._sent_long_ps(), [None])
+
+    # 7. managed enabled -> disabled: one disable on the edge.
+    def test_managed_enabled_to_disabled_sends_one_disable(self):
+        self.config.long_ps_managed = True
+        self.config.long_ps_enabled = True
+        self.config.long_ps_source = "static"
+        self.config.long_ps_static_text = "ON AIR"
+        self.config.save()
+        self.mgr._tick()
+        self.config.long_ps_enabled = False
+        self.config.save()
+        self.mgr._tick()
+        self.assertEqual(self._sent_long_ps(), ["ON AIR", None])
+
+    # 8. managed disabled, periodic full resend: disable reasserted.
+    def test_managed_disabled_periodic_full_resend_reasserts_disable(self):
+        self.config.long_ps_managed = True
+        self.config.save()  # long_ps_enabled stays False
+        self.mgr._tick()
+        self.assertEqual(self._sent_long_ps(), [None])
+        self.mgr._last_full_resend = 0.0
+        self.mgr._tick()
+        self.assertEqual(self._sent_long_ps(), [None, None])
+
+    # 9. managed disabled, reconnect: disable reasserted.
+    def test_managed_disabled_reconnect_reasserts_disable(self):
+        self.config.long_ps_managed = True
+        self.config.save()
+        self.mgr._tick()
+        self.assertEqual(self._sent_long_ps(), [None])
+        self.mgr._connected = False
+        self.mgr._connected_since = None
+        self.mgr._tick()
+        self.assertEqual(self._sent_long_ps(), [None, None])
+
+    # 10. managed -> unmanaged: no disable or other Long PS MEC is
+    # generated merely because ownership was relinquished -- even
+    # though an ENABLED value was actively being managed (the more
+    # tempting case to accidentally "clean up" with a disable on the
+    # way out, which is explicitly the wrong behavior per spec:
+    # relinquishing management means "hands off, the downstream
+    # encoder owns this again," not "force Long PS off").
+    def test_managed_to_unmanaged_sends_no_long_ps_mec(self):
+        self.config.long_ps_managed = True
+        self.config.long_ps_enabled = True
+        self.config.long_ps_source = "static"
+        self.config.long_ps_static_text = "ON AIR"
+        self.config.save()
+        self.mgr._tick()
+        self.assertEqual(self._sent_long_ps(), ["ON AIR"])
+        self.config.long_ps_managed = False
+        self.config.save()
+        self.mgr._tick()
+        self.assertEqual(self._sent_long_ps(), ["ON AIR"])  # no new entry -- no disable sent
+
+    # 11. Subsequent unmanaged sends -- including a periodic full
+    # resend and a reconnect after relinquishing management -- still
+    # emit no Long PS MEC at all.
+    def test_subsequent_unmanaged_sends_emit_no_long_ps_mec(self):
+        self.config.long_ps_managed = True
+        self.config.long_ps_enabled = True
+        self.config.long_ps_static_text = "ON AIR"
+        self.config.save()
+        self.mgr._tick()
+        self.config.long_ps_managed = False
+        self.config.save()
+        self.mgr._tick()
+        self.mgr._last_full_resend = 0.0
+        self.mgr._tick()
+        self.mgr._connected = False
+        self.mgr._connected_since = None
+        self.mgr._tick()
+        self.assertEqual(self._sent_long_ps(), ["ON AIR"])  # only the original managed send
+
+    # 12. A failed send exactly at the unmanaged->managed transition
+    # edge leaves the authoritative state pending, retried on the next
+    # eligible tick -- not silently committed or dropped.
+    def test_failed_unmanaged_to_managed_send_is_retried(self):
+        self.config.save()  # unmanaged
+        self.mgr._tick()
+        self.assertEqual(self._sent_long_ps(), [])
+        self.config.long_ps_managed = True
+        self.config.long_ps_enabled = True
+        self.config.long_ps_static_text = "ON AIR"
+        self.config.save()
+        self.mgr._transmit = mock.Mock(side_effect=ConnectionError("simulated failure"))
+        self.mgr._tick()
+        self.assertEqual(self._sent_long_ps(), [])
+        self.assertIsNone(self.mgr._last_sent_long_ps_enabled, "a failed send must not commit any state")
+        self.mgr._transmit = mock.Mock(side_effect=lambda config, payload: self.sent.append(payload))
+        self.mgr._tick()
+        self.assertEqual(self._sent_long_ps(), ["ON AIR"])
+        self.assertEqual(self.mgr._last_sent_long_ps_enabled, True)
+
+    # 13. PS/RT/RT+ remain completely unaffected by the ownership
+    # gate, whether unmanaged or managed.
+    def test_ps_and_rt_unaffected_by_ownership_gate(self):
+        self.config.station_ps = "KOGR-LP "
+        self.config.ps_mode = "static"
+        self.config.use_rt_plus = True
+        self.config.save()  # unmanaged Long PS
+        self.mgr._tick()
+        frames = _split_uecp_frames(self.sent[0])
+        self.assertEqual(bytes(_find_mec(frames, 0x02)), uecp.mec_ps("KOGR-LP "))
+        self.assertIsNotNone(_find_mec(frames, 0x0A))
+        self.assertIsNotNone(_find_mec(frames, 0x24, subtype=0x06))
+        self.assertEqual(self._sent_long_ps(), [])
+
+        self.config.long_ps_managed = True  # now managed too
+        self.config.save()
+        self.mgr._tick()
+        frames = _split_uecp_frames(self.sent[-1])
+        self.assertEqual(bytes(_find_mec(frames, 0x02)), uecp.mec_ps("KOGR-LP "))
+        self.assertIsNotNone(_find_mec(frames, 0x0A))
+
+
+class LongPsRegressionTests(TestCase):
+    """REGRESSION: proves Long PS coexists with every existing RBDS
+    field/mode without altering them, and that it never touches MEC
+    0x24 (RT+) machinery -- the [P2] 2.3F2 task's own explicit
+    non-negotiable ("RT/RT+ 0x24 paths must remain untouched")."""
+
+    def setUp(self):
+        patcher = mock.patch("rbds.services.rbds_manager.close_old_connections")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.mgr = RBDSManager()
+        self.sent = []
+        self.mgr._transmit = mock.Mock(side_effect=lambda config, payload: self.sent.append(payload))
+        self.mgr._read_now_playing = mock.Mock(return_value={"title": "Tom Sawyer", "artist": "Rush"})
+        self.mgr._read_category_state = mock.Mock(return_value={"pty_override": None, "ptyn": ""})
+        self.config = RBDSConfig.load()
+        self.config.protocol = "uecp"
+        self.config.long_ps_managed = True
+        self.config.long_ps_enabled = True
+        self.config.long_ps_source = "static"
+        self.config.long_ps_static_text = "LONG PS ACTIVE"
+
+    def test_static_ps_mode_unaffected_by_long_ps(self):
+        self.config.ps_mode = "static"
+        self.config.station_ps = "KOGR-LP "
+        self.config.save()
+        self.mgr._tick()
+        frames = _split_uecp_frames(self.sent[0])
+        self.assertEqual(bytes(_find_mec(frames, 0x02)), uecp.mec_ps("KOGR-LP "))
+        self.assertIsNotNone(_find_mec(frames, 0x21))
+
+    def test_generated_rotating_ps_unaffected_by_long_ps(self):
+        self.config.ps_mode = "generated"
+        self.config.dynamic_ps_text = "Oak Grove Radio"
+        self.config.dynamic_ps_format = "{text}"
+        self.config.dynamic_ps_mode = 0
+        self.config.save()
+        self.mgr._tick()
+        frames = _split_uecp_frames(self.sent[0])
+        ps_mec = _find_mec(frames, 0x02)
+        self.assertIsNotNone(ps_mec)
+        self.assertNotEqual(bytes(ps_mec), uecp.mec_ps(""))
+        self.assertIsNotNone(_find_mec(frames, 0x21))
+
+    def test_manual_ps_frames_unaffected_by_long_ps(self):
+        self.config.ps_mode = "manual"
+        self.config.save()
+        RBDSPSFrame.objects.create(text="FRAME1  ", enabled=True, hold_seconds=4, sort_order=0)
+        self.mgr._tick()
+        frames = _split_uecp_frames(self.sent[0])
+        self.assertEqual(bytes(_find_mec(frames, 0x02)), uecp.mec_ps("FRAME1  "))
+        self.assertIsNotNone(_find_mec(frames, 0x21))
+
+    def test_rt_and_rt_plus_unaffected_by_long_ps(self):
+        self.config.use_rt_plus = True
+        self.config.save()
+        self.mgr._tick()
+        frames = _split_uecp_frames(self.sent[0])
+        self.assertIsNotNone(_find_mec(frames, 0x0A))  # ordinary RT
+        self.assertIsNotNone(_find_mec(frames, 0x24, subtype=0x06))  # RT+ ODA reg
+        self.assertIsNotNone(_find_mec(frames, 0x24, subtype=0x16))  # RT+ tags
+        self.assertIsNotNone(_find_mec(frames, 0x21))  # Long PS coexists
+
+    def test_mec_0x24_never_used_for_long_ps(self):
+        self.config.save()
+        self.mgr._tick()
+        frames = _split_uecp_frames(self.sent[0])
+        long_ps_mec = _find_mec(frames, 0x21)
+        self.assertIsNotNone(long_ps_mec)
+        self.assertNotEqual(long_ps_mec[0], 0x24)
+
+    def test_pi_ecc_pty_all_still_present_alongside_long_ps(self):
+        self.config.pi_code = "1000"
+        self.config.ecc = "A0"
+        self.config.pty = 10
+        self.config.save()
+        self.mgr._tick()
+        frames = _split_uecp_frames(self.sent[0])
+        self.assertIsNotNone(_find_mec(frames, 0x01))  # PI
+        self.assertIsNotNone(_find_mec(frames, 0x1A, subtype=0))  # ECC
+        self.assertIsNotNone(_find_mec(frames, 0x07))  # PTY
+        self.assertIsNotNone(_find_mec(frames, 0x21))  # Long PS

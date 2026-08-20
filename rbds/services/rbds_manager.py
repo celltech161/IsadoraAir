@@ -113,6 +113,58 @@ class RBDSManager:
         self._reconnect_delay_seconds = None
         self._last_sent_ps = None
         self._last_sent_rt = None
+        # Long PS ([P2] 2.3F2, revised 2026-08-20 pre-commit fix) --
+        # entirely separate cache/state from PS/RT/RT+ above (Long PS
+        # must never steal or reuse their dedupe state). Modeled
+        # directly on _last_send_ct_state's own design (MEC 0x19, CT
+        # On/Off), NOT on _last_sent_language_code/LIC's -- the first
+        # version of this feature used the LIC precedent (send a
+        # disable once, then go permanently silent about that MEC,
+        # even across later full-resends/reconnects), but that has a
+        # real stale-state hole LIC itself doesn't: StereoTool can
+        # retain a previously-UECP-supplied Long PS value across an
+        # IsadoraAir process restart or a TCP reconnect (StereoTool's
+        # own "use standard RDS settings when connection closed"
+        # behavior, confirmed during 2.3F1's live acceptance test,
+        # covers only ITS side of a closed connection -- it says
+        # nothing about what a BRAND NEW connection/process is
+        # responsible for asserting). A fresh process that starts up
+        # already configured Disabled has no in-memory history to
+        # notice a stale value from a PRIOR process's lifetime, so an
+        # edge-triggered-only design (send the disable only when THIS
+        # process observes the enabled->disabled transition) can
+        # silently leave StereoTool showing old text indefinitely.
+        # CT On/Off already solved exactly this class of problem once
+        # before (2026-08-03 CT_RESTART_EXPERIMENT_RESULT.md, same
+        # rationale: "the remote encoder can reset/retain its own
+        # state independently of this config ever changing") by
+        # treating BOTH its enabled and disabled states as first-class
+        # values that get unconditionally reasserted on startup, every
+        # periodic full resend, and every fresh reconnect -- never
+        # just once. Long PS now follows that same precedent.
+        #
+        # _last_sent_long_ps_enabled is the tri-state flag this
+        # mirrors from _last_send_ct_state: None means "not yet
+        # authoritatively sent during this process's life" (forces an
+        # immediate send on the very first eligible tick, matching
+        # test_fresh_manager_asserts_ct_state_on_first_tick_even_when_
+        # disabled's own CT precedent -- this is also the fix for the
+        # exact "never sent on this connection" vs "already sent the
+        # disable" ambiguity a bare None on _last_sent_long_ps alone
+        # could not represent); True/False are both "already
+        # authoritatively sent," reasserted again only on an actual
+        # edge, a periodic full resend, or a reconnect -- never on an
+        # ordinary unchanged tick. Because Long PS rides the SAME
+        # shared _build_uecp_payload()/_send() call PS/RT/PI/ECC/LIC
+        # already use (unlike CT, which has its own dedicated,
+        # separately-cadenced _send_ct_on_off() call site), it needs
+        # no separate just-reconnected/due-for-full-resend tracking of
+        # its own -- _tick's shared `changed or due_for_full_resend or
+        # not self._connected` gate already provides that for free;
+        # see _tick's own long_ps_changed comment.
+        self._last_sent_long_ps_enabled = None
+        self._last_long_ps_source = None
+        self._last_sent_long_ps = None  # text last transmitted while enabled; meaningless while disabled
         # Last-seen short-PS operating mode (Static/Manual/Generated,
         # 2026-08-18) -- None on init so the very first tick's mode
         # resolution always treats itself as "just switched," which is
@@ -235,7 +287,71 @@ class RBDSManager:
         # every receiver even when RT hadn't changed at all.
         rt_changed = rt_text != self._last_sent_rt
         language_changed = config.language_code != self._last_sent_language_code
-        changed = target_ps != self._last_sent_ps or rt_changed or language_changed
+
+        # Long PS ([P2] 2.3F2, revised 2026-08-20 twice) -- resolved
+        # from the SAME now_playing snapshot as target_ps/rt_text
+        # above, per _resolve_long_ps's own docstring.
+        #
+        # long_ps_managed is the MASTER ownership switch, checked
+        # FIRST and completely independent of everything below it --
+        # see models.py's own comment on the field for why this exists
+        # (the authoritative-disabled-state fix below, on its own,
+        # would otherwise make every pre-existing installation start
+        # sending an unsolicited MEC 0x21 disable on first deploy).
+        # While unmanaged, Long PS is excluded from the payload
+        # entirely (include_long_ps=False below) no matter WHY the
+        # outer send gate opens this tick -- an unrelated PS/RT change,
+        # the periodic full resend, or a reconnect must not smuggle a
+        # Long PS MEC out just because a payload happens to be built
+        # for some other reason. Any previously-committed Long PS
+        # state is also proactively forgotten (reset to None) on every
+        # unmanaged tick -- cheap, idempotent, pure bookkeeping, no
+        # wire traffic -- so that a LATER unmanaged->managed transition
+        # always looks like "nothing authoritatively sent yet" and
+        # forces an immediate assertion of the current state (required
+        # by spec: "force-sent" on that transition), rather than
+        # silently appearing unchanged just because the underlying
+        # config values happen to still match whatever was sent before
+        # management was last turned off.
+        #
+        # While managed, Disabled is a first-class, authoritatively-
+        # reasserted state, exactly like CT On/Off's False -- see
+        # __init__'s own comment for the full rationale (StereoTool
+        # can retain a stale UECP-supplied Long PS value across a
+        # process restart or TCP reconnect, and a fresh process has no
+        # in-memory way to tell "genuinely never touched under current
+        # management" apart from "was enabled before, now explicitly
+        # Disabled" -- so both are asserted the same way). Long PS
+        # therefore rides the shared payload unconditionally on EVERY
+        # send this gate lets through while managed (see
+        # include_long_ps=long_ps_managed at the _send() call below)
+        # -- exactly like PS/PI/ECC/PTY already do -- rather than being
+        # selectively excluded. long_ps_changed below only needs to
+        # force this gate open OUTSIDE the existing 30s/reconnect
+        # cadence, for an actual edit -- the due_for_full_resend/
+        # not-self._connected clauses already below cover startup,
+        # periodic reassertion, and reconnect for free, with no
+        # separate tracking of their own (unlike CT, Long PS has no
+        # dedicated call site of its own to need that).
+        long_ps_managed = config.long_ps_managed
+        if long_ps_managed:
+            long_ps_enabled, long_ps_text = self._resolve_long_ps(config, now_playing)
+            long_ps_changed = (
+                self._last_sent_long_ps_enabled is None  # never authoritatively sent under current management yet
+                or long_ps_enabled != self._last_sent_long_ps_enabled  # enabled<->disabled edge
+                or (long_ps_enabled and (
+                    long_ps_text != self._last_sent_long_ps
+                    or config.long_ps_source != self._last_long_ps_source
+                ))
+            )
+        else:
+            long_ps_enabled, long_ps_text = False, ""
+            long_ps_changed = False
+            self._last_sent_long_ps_enabled = None
+            self._last_long_ps_source = None
+            self._last_sent_long_ps = None
+
+        changed = target_ps != self._last_sent_ps or rt_changed or language_changed or long_ps_changed
         due_for_full_resend = (time.time() - self._last_full_resend) >= FULL_RESEND_SECONDS
 
         # While disconnected, retry every tick rather than waiting for the
@@ -256,7 +372,9 @@ class RBDSManager:
             effective_pty, effective_ptyn = self._effective_pty_ptyn(config)
             effective_dynamic_pty = self._effective_dynamic_pty(config)
             send_ok = self._send(config, target_ps, rt_text, rt_artist, rt_title, effective_pty, effective_ptyn,
-                                  rt_ab_toggle=rt_changed, dynamic_pty=effective_dynamic_pty)
+                                  rt_ab_toggle=rt_changed, dynamic_pty=effective_dynamic_pty,
+                                  include_long_ps=long_ps_managed,
+                                  long_ps_content=long_ps_text if long_ps_enabled else None)
             # Only commit "what we last sent" on an actual successful
             # transmission (2026-08-02 fix) -- see _send's own
             # docstring. A failed send leaves _last_sent_ps/_last_sent_rt
@@ -268,6 +386,22 @@ class RBDSManager:
                 self._last_sent_rt = rt_text
                 self._last_sent_language_code = config.language_code
                 self._last_full_resend = time.time()
+                # Same "only commit on success" principle as PS/RT/CT
+                # above -- a failed send leaves _last_sent_long_ps_enabled
+                # untouched (still None on a never-yet-successful first
+                # send, or still the OLD True/False on a failed edge/
+                # reassertion), so long_ps_changed keeps computing True
+                # next tick and the pending state -- enable, disable, or
+                # reassertion -- is retried rather than silently
+                # committed or forgotten. Gated on long_ps_managed --
+                # while unmanaged this state was already reset to None
+                # above and must stay that way (there is nothing to
+                # "commit"; include_long_ps was False, so no Long PS
+                # MEC rode this payload regardless of why it was sent).
+                if long_ps_managed:
+                    self._last_sent_long_ps_enabled = long_ps_enabled
+                    self._last_long_ps_source = config.long_ps_source
+                    self._last_sent_long_ps = long_ps_text if long_ps_enabled else None
                 # A full send just went out and includes the RT+ MECs,
                 # so count it as a fresh RT+ resend and let the 2s
                 # timer start counting from here rather than
@@ -449,6 +583,51 @@ class RBDSManager:
         # whole engine loop down with it.
         return normalize_text(config.station_ps or "")
 
+    def _resolve_long_ps(self, config, now_playing):
+        """[P2] 2.3F2 -- resolves Long PS's (enabled, text) for this tick.
+        Completely independent of _resolve_target_ps above: Long PS Mode
+        is never coupled to PS Mode (any combination of the two is
+        valid, per the product requirement), and this reads the SAME
+        `now_playing` snapshot _tick() already read once this tick --
+        never a second now_playing.json read, same principle
+        _resolve_target_ps's own docstring already documents.
+
+        Now Playing source reuses dynamic_ps.compose_dynamic_ps_source()
+        -- the same authoritative composer Generated Rotating PS uses --
+        rather than a new formatter, with a FIXED "{now_playing}"
+        template (Long PS has no operator-configurable format setting;
+        that would be speculative scope this phase doesn't need). That
+        template's own documented behavior is exactly the desired
+        Long PS contract for free: "Artist - Title" when both are known,
+        just the one known field when only one is, and -- because the
+        template literally references {now_playing} -- a clean collapse
+        to `long_ps_static_text` (passed as compose_dynamic_ps_source's
+        own `dynamic_text` fallback parameter) when neither is known.
+        This is also why Long PS Static Text doc reads as "sent as-is in
+        Static mode; also the fallback in Now Playing mode" -- one field,
+        two roles, mirroring station_ps's own existing dual role as both
+        the Static-PS value and Manual-mode's zero-frames fallback.
+
+        compose_dynamic_ps_source() does NOT normalize its own output
+        (only generate_ps_frames() does, as documented in dynamic_ps.py's
+        own module docstring) -- since Long PS never calls
+        generate_ps_frames() (no 8-char frame-splitting; Long PS is one
+        up-to-32-character string), normalize_text() is applied here
+        explicitly, exactly once, as the final step.
+
+        Truncation to 32 characters is deliberately NOT done here --
+        uecp.mec_long_ps() remains the single, final protocol-level
+        guard for that limit (its own docstring is explicit about this),
+        so there is exactly one place in the codebase that decides where
+        the cut lands."""
+        if config.long_ps_source == "now_playing":
+            source = dynamic_ps.compose_dynamic_ps_source(
+                "{now_playing}", config.long_ps_static_text, now_playing,
+            )
+        else:  # "static", or any future/unrecognized stored value -- fail safe to static text
+            source = config.long_ps_static_text or ""
+        return config.long_ps_enabled, normalize_text(source)
+
     RT_PLUS_SEPARATOR = " - "
 
     def _resolve_rt_content(self, config, now_playing, rt_source, rt_source_name, messages_by_name):
@@ -622,7 +801,8 @@ class RBDSManager:
 
     # --- Sending ---
 
-    def _send(self, config, ps, rt, artist, title, pty=None, ptyn="", rt_ab_toggle=False, dynamic_pty=None):
+    def _send(self, config, ps, rt, artist, title, pty=None, ptyn="", rt_ab_toggle=False, dynamic_pty=None,
+              include_long_ps=False, long_ps_content=None):
         """Returns True only if the payload actually reached
         _transmit() successfully. Callers MUST gate their own "what we
         last sent" bookkeeping (_last_sent_ps/_last_sent_rt/etc.) on
@@ -647,7 +827,13 @@ class RBDSManager:
         value (see _effective_dynamic_pty) and passes it in explicitly.
         Builders stay query-free/pure; the DB lookup lives in exactly
         one place, not buried inside a payload builder every caller
-        (including tests) would otherwise silently trigger."""
+        (including tests) would otherwise silently trigger.
+
+        include_long_ps/long_ps_content ([P2] 2.3F2): only meaningful
+        for protocol=uecp (Long PS has no ASCII-protocol equivalent in
+        this codebase, matching RT+ above) -- see _tick's own
+        long_ps_changed computation for what these mean and
+        _build_uecp_payload's docstring for how they're used."""
         if pty is None:
             pty = config.pty
         if dynamic_pty is None:
@@ -655,7 +841,8 @@ class RBDSManager:
         try:
             if config.protocol == "uecp":
                 payload = self._build_uecp_payload(config, ps, rt, artist, title, pty, ptyn, rt_ab_toggle,
-                                                     dynamic_pty)
+                                                     dynamic_pty, include_long_ps=include_long_ps,
+                                                     long_ps_content=long_ps_content)
             else:
                 payload = self._build_ascii_payload(config, ps, rt, artist, title, pty, dynamic_pty)
             self._transmit(config, payload)
@@ -695,7 +882,8 @@ class RBDSManager:
         self._transmit(config, self._frames_for(config, meds))
 
     def _build_uecp_payload(self, config, ps, rt, artist=None, title=None, pty=None, ptyn="",
-                             rt_ab_toggle=False, dynamic_pty=None):
+                             rt_ab_toggle=False, dynamic_pty=None, include_long_ps=False,
+                             long_ps_content=None):
         """Assemble the full UECP payload as ONE MEC PER UECP FRAME,
         concatenated back-to-back into a single bytes object (see
         _frames_for()). This concatenated form is written as one TCP
@@ -724,6 +912,29 @@ class RBDSManager:
         frame from _tick at the minute boundary so RDS group 4A is
         transmitted at :00 seconds (see _send_ct's docstring for the
         specific Sangean-receiver symptom that forced that split).
+
+        include_long_ps/long_ps_content ([P2] 2.3F2, revised
+        2026-08-20 twice): MEC 0x21 (Long PS) is appended -- as its own
+        frame, same as every other MEC here -- whenever include_long_ps
+        is True, which _tick() passes as config.long_ps_managed
+        directly: while managed, Disabled is a first-class,
+        always-reasserted state, same as CT On/Off's False; while
+        UNmanaged, Long PS is excluded from every payload this method
+        builds, full stop, regardless of why the payload is being sent
+        -- see _tick's own long_ps_managed/long_ps_changed comment and
+        __init__'s and models.py's comments for the full rationale
+        (an unmanaged station must never have IsadoraAir emit so much
+        as one MEC 0x21, since that could silently override a
+        pre-existing encoder-local Long PS configuration). The False
+        default here also covers OTHER callers of this method (e.g.
+        direct unit-test calls that have nothing to do with Long PS),
+        keeping their payloads exactly as before this feature existed.
+        long_ps_content is either the composed text to enable (str) or
+        None to disable -- passed straight through to
+        uecp.mec_long_ps(), the single established protocol-level
+        builder for this MEC ([P2] 2.3F/2.3F1); this method does not
+        reimplement or second-guess its MEL/encoding/32-char-truncation
+        behavior in any way.
         """
         meds = []
         if config.pi_code:
@@ -749,6 +960,15 @@ class RBDSManager:
             # after this successfully lands -- see _tick()'s send_ok block.
             meds.append(uecp.mec_language_code(0))
         meds.append(uecp.mec_ps(ps))
+        if include_long_ps:
+            # Own frame, own MEC (0x21) -- entirely separate protocol
+            # element from mec_ps's 0x02 above, per MEC 0x21's own
+            # established contract ([P2] 2.3F/2.3F1). Deliberately
+            # placed right next to PS in the payload for readability
+            # only (frame order carries no protocol meaning here --
+            # see this method's own docstring) -- Long PS remains fully
+            # decoupled from PS Mode/content at every other layer.
+            meds.append(uecp.mec_long_ps(long_ps_content))
         meds.append(uecp.mec_ta_tp(ta=config.ta, tp=config.tp))
         meds.append(uecp.mec_di(
             dynamic_pty=config.di_dynamic_pty if dynamic_pty is None else dynamic_pty,

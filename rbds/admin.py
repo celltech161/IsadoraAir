@@ -92,6 +92,22 @@ class RBDSConfigAdmin(admin.ModelAdmin):
                 "the RadioText fieldset below)."
             ),
         }),
+        ("Long PS", {
+            "fields": ["long_ps_managed", "long_ps_enabled", "long_ps_source", "long_ps_static_text"],
+            "description": (
+                "Long PS is a separate RDS service from the ordinary 8-character "
+                "Program Service (PS) above -- up to 32 characters, independent of "
+                "PS Mode, and only shown by receivers that support it.<br><br>"
+                "<b>Manage Long PS with IsadoraAir</b>: when off, IsadoraAir sends no "
+                "Long PS commands at all and leaves any existing encoder-local Long PS "
+                "configuration untouched -- turn on before the fields below have any "
+                "effect.<br>"
+                "<b>Static text</b>: always sends Long PS Static Text below.<br>"
+                "<b>Now Playing</b>: sends the current track's Artist - Title, "
+                "falling back to Long PS Static Text below whenever nothing usable "
+                "is currently playing."
+            ),
+        }),
         ("Identity", {"fields": ["pi_code", "ecc", "language_code", "pty", "tp", "ta", "ms"]}),
         ("DI Flags", {"fields": ["di_dynamic_pty", "di_compressed", "di_artificial_head", "di_stereo"]}),
         ("AF List", {"fields": ["af_frequencies_mhz"]}),
