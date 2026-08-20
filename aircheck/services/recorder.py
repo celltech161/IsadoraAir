@@ -32,15 +32,18 @@ safe to run concurrently with a real Start/Stop.
 """
 import errno
 import fcntl
+import json
 import os
 import shutil
 import socket
 import subprocess
 import threading
+import time
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
+from django.conf import settings
 from django.db import close_old_connections
 from django.utils import timezone
 
@@ -56,6 +59,37 @@ from monitoring.models import emit_event
 
 REMUX_PENDING_NOTE = "remux in progress"
 REMUX_INTERMEDIATE_DIR = Path("/run/isadoraair")
+
+# Substrings that show up in exit_note ONLY when finalization definitively
+# failed to produce usable audio at the session's destination -- matched
+# against the literal text the finalize helpers below already write, not
+# invented separately. Anything else non-empty (e.g. a telnet hiccup at
+# Stop that didn't actually stop the move/remux from succeeding) is a
+# "warning", not an "error" -- see classify_finalization().
+#   " failed: "  -- "remux failed: ..." (_mark_remux_failed) and
+#                    "move ... failed: ..." (_finalize_direct_move).
+#                    NOT a substring of "...failed at Stop: ..." (the
+#                    telnet-at-Stop note), which is deliberate.
+#   "no audio to" -- "no audio to remux" / "no audio to move" (working
+#                    file was already missing at Stop -- nothing to save).
+#   "could not stage intermediate" -- he_aac: couldn't even begin the remux.
+FINALIZATION_ERROR_MARKERS = (" failed: ", "no audio to", "could not stage intermediate")
+
+# Runtime state file the /monitoring/ Aircheck card reads (via
+# aircheck:api-status) to show idle-buffer-guard health. Written by
+# maintain_aircheck_buffer on every invocation -- see
+# record_buffer_heartbeat. Deliberately NOT read or written by
+# encoders/services/encoder_manager.py or the Liquidsoap script itself;
+# this is pure Django-side reporting about the guard, not something
+# Liquidsoap needs to know about.
+AIRCHECK_BUFFER_STATE_PATH = "/run/isadoraair/aircheck_buffer_state.json"
+
+# How long a maintenance heartbeat can go unrefreshed before the status
+# API calls it stale. The timer fires every 60s (isadoraair-aircheck-
+# buffer.timer); 165s is a bit under 3 missed cycles' worth of margin --
+# comfortably past ordinary jitter/one skipped cycle, without waiting so
+# long that a genuinely dead timer looks healthy for minutes.
+AIRCHECK_BUFFER_HEARTBEAT_STALE_SECONDS = 165
 
 # Cross-process advisory lock serializing every operation that touches
 # the aircheck working file or AircheckSession state: Start, Stop, and
@@ -336,6 +370,22 @@ def _finalize_direct_move(session, working, dest, telnet_note):
     session.exit_note = (telnet_note + move_note).strip("; ") or ""
     session.save()
 
+    if dest.is_file():
+        # .start() returns immediately -- the actual library-sync work
+        # (below) runs concurrently in its own thread and never
+        # contends for AIRCHECK_LOCK_PATH itself, so it can't make
+        # Stop's still-held lock (or a subsequent Start/idle
+        # maintenance) wait on it. Library analysis (waveform/cue
+        # points) can take real time on a large recording, and this
+        # step is best-effort/optional -- never something Stop itself
+        # should be blocked on.
+        threading.Thread(
+            target=_sync_finalized_recording_to_library,
+            args=(dest,),
+            daemon=True,
+            name=f"aircheck-library-sync-{session.id}",
+        ).start()
+
 
 def _finalize_he_aac_async(session, working, dest, telnet_note):
     """Move the working ADTS to a session-tagged intermediate name so a
@@ -425,6 +475,11 @@ def _remux_worker(session_id, intermediate_path, dest_path, telnet_note):
             s.save(update_fields=["size_bytes", "exit_note"])
         except AircheckSession.DoesNotExist:
             pass
+
+        # Already running in a background thread (the remux itself) --
+        # no separate thread needed here, unlike the direct-move path.
+        if dest.is_file():
+            _sync_finalized_recording_to_library(dest)
     finally:
         close_old_connections()
 
@@ -439,6 +494,55 @@ def _mark_remux_failed(session_id, telnet_note, err):
         s.save(update_fields=["exit_note"])
     except AircheckSession.DoesNotExist:
         pass
+
+
+def _sync_finalized_recording_to_library(dest):
+    """Best-effort: if AircheckConfig.output_directory happens to live
+    under LIBRARY_ROOT with a matching Category (see sync_track_file's
+    own convention: LIBRARY_ROOT/<category_code>/...), index the
+    just-finalized recording into the library so it shows up on the
+    track detail page. A silent no-op for the common/default case where
+    output_directory is NOT under LIBRARY_ROOT (e.g. the original
+    default, /srv/isadoraair/aircheck) -- this feature only activates
+    once an operator deliberately points output_directory at a
+    LIBRARY_ROOT/<Category> path and creates that Category.
+
+    ready2air=False (unlike sync_track_file's own command-line default
+    of True, meant for unattended pipelines delivering NEW programming)
+    -- an Aircheck recording is archival, a record of what already
+    aired, not new content ready to air again. It requires the same
+    human review as any manually-added track before it could ever enter
+    rotation, and rotation eligibility separately requires an explicit
+    RotationSlot for the category, which nothing here creates.
+
+    Never raises. Called from a background thread (either the direct-
+    move path's own dedicated thread, or already-in-progress inside the
+    he_aac remux thread) with nothing waiting on its result -- Stop
+    itself has already fully succeeded and returned by the time this
+    runs; a failure here must never look like Stop failed, and there's
+    no retry -- an operator can always run `manage.py sync_track_file
+    <path>` by hand later if this best-effort step didn't fire."""
+    close_old_connections()
+    try:
+        root = Path(getattr(settings, "LIBRARY_ROOT", "/srv/isadoraair/music")).resolve()
+        try:
+            dest.resolve().relative_to(root)
+        except ValueError:
+            return  # output_directory isn't under LIBRARY_ROOT -- feature not opted into, stay silent
+
+        from library.management.commands.sync_track_file import sync_track_file  # lazy: aircheck
+        # has no need to import library's management-command modules (and
+        # everything they pull in) unless this feature is actually in use.
+        track, created = sync_track_file(str(dest), ready2air=False)
+        print(f"  Aircheck: synced finalized recording into library as track id={track.id} ({'created' if created else 'updated'}, ready2air=False)")
+    except Exception as exc:
+        print(f"  Aircheck: library sync failed for {dest} (non-fatal): {exc}")
+        emit_event(
+            category="aircheck", level="warning", title="Aircheck library sync failed",
+            detail={"path": str(dest), "error": str(exc)},
+        )
+    finally:
+        close_old_connections()
 
 
 def maintain_idle_buffer(max_bytes=AIRCHECK_IDLE_BUFFER_MAX_BYTES):
@@ -501,3 +605,95 @@ def maintain_idle_buffer(max_bytes=AIRCHECK_IDLE_BUFFER_MAX_BYTES):
             return "error"
 
         return "rolled"
+
+
+def classify_finalization(session):
+    """Explicit finalization classification for one AircheckSession, so
+    the /monitoring/ card and its JS render a known enum rather than
+    parsing exit_note text client-side. Returns one of "recording",
+    "finalizing", "error", "warning", "complete", or None for
+    session=None.
+
+    Follows the recorder's own semantics above, not a separate guess:
+    still_running means _create/finalize haven't run yet at all; the
+    REMUX_PENDING_NOTE marker means _finalize_he_aac_async handed off
+    to its async worker and hasn't heard back; FINALIZATION_ERROR_MARKERS
+    are the exact substrings the finalize helpers write on a definitive
+    failure; any other non-empty note (e.g. a telnet hiccup at Stop that
+    didn't actually block the move/remux from succeeding) is a warning,
+    not an error; a clean stop with no note at all is complete."""
+    if session is None:
+        return None
+    if session.still_running:
+        return "recording"
+    note = session.exit_note or ""
+    if REMUX_PENDING_NOTE in note:
+        return "finalizing"
+    if any(marker in note for marker in FINALIZATION_ERROR_MARKERS):
+        return "error"
+    if note:
+        return "warning"
+    return "complete"
+
+
+def _atomic_write_json(path, data):
+    """Write-tmp-then-atomic-replace -- same idiom as
+    encoders/services/encoder_manager.py's own _atomic_write_json,
+    reimplemented locally (not imported) so this module keeps no
+    dependency on the encoder manager, matching the rest of this file's
+    stance that Liquidsoap/encoders know nothing about Aircheck beyond
+    the telnet client. No reader can ever observe a partially-written
+    or truncated state file."""
+    tmp = path.with_suffix(".tmp")
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(json.dumps(data, ensure_ascii=False))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def record_buffer_heartbeat(result, size_bytes, max_bytes):
+    """Persist the outcome of one maintain_idle_buffer invocation to
+    AIRCHECK_BUFFER_STATE_PATH for the /monitoring/ Aircheck card to
+    read. Called by the maintain_aircheck_buffer management command
+    AFTER maintain_idle_buffer has already made its (unchanged) rollover
+    decision -- this function is pure reporting and never influences
+    that decision.
+
+    last_rollover_at is preserved across invocations that didn't roll
+    (so the card can still show "last rollover: 2h ago" on an ordinary
+    below_limit cycle) and only refreshed to this invocation's
+    checked_at when result == "rolled".
+
+    Best-effort both ways: a missing or malformed prior state file is
+    treated as "no prior state" rather than raised, and a write failure
+    (e.g. /run momentarily unwritable) is swallowed -- this heartbeat
+    must never be able to fail the maintenance command itself."""
+    prior_rollover_at = None
+    try:
+        with open(AIRCHECK_BUFFER_STATE_PATH, "r", encoding="utf-8") as f:
+            prior = json.load(f)
+        if isinstance(prior, dict):
+            prior_rollover_at = prior.get("last_rollover_at")
+    except (OSError, ValueError):
+        pass  # missing or malformed prior state -- start fresh, not fatal
+
+    checked_at = time.time()
+    state = {
+        "checked_at": checked_at,
+        "result": result,
+        "size_bytes": size_bytes,
+        "max_bytes": max_bytes,
+        "last_rollover_at": checked_at if result == "rolled" else prior_rollover_at,
+    }
+    try:
+        _atomic_write_json(Path(AIRCHECK_BUFFER_STATE_PATH), state)
+    except OSError:
+        pass  # heartbeat is best-effort reporting, never fatal

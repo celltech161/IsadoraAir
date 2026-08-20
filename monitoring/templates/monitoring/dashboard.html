@@ -391,6 +391,7 @@
       <span class="mon-led-caption" id="aircheckCaption">Not recording</span>
     </div>
     <div class="mon-card-detail" id="aircheckDetail" style="min-height:1.2rem;"></div>
+    <div id="aircheckBufferBar"></div>
     <div class="mon-uptime-row" style="margin-top:0.4rem;">
       <span class="mon-uptime" id="aircheckSize"></span>
       <button class="mon-restart-btn" id="aircheckBtn" onclick="toggleAircheck()">Start</button>
@@ -1173,25 +1174,90 @@ function fmtElapsed(startedIso) {
   return (h > 0 ? String(h).padStart(2, '0') + ':' : '')
     + String(m).padStart(2, '0') + ':' + String(s).padStart(2, '0');
 }
+function truncateNote(note, maxLen) {
+  if (!note) return '';
+  return note.length > maxLen ? note.slice(0, maxLen - 1) + '…' : note;
+}
+// Maps the buffer-guard maintenance heartbeat to a compact status line.
+// Priority: unknown (no heartbeat yet) > stale (timer itself looks dead)
+// > "paused while recording" (the card's own live recording knowledge,
+// more reliable than a once-a-minute heartbeat's result field) > the
+// heartbeat's own result. active_session/lock_busy are expected/benign,
+// never rendered as a warning -- see recorder.maintain_idle_buffer's
+// own return-value contract.
+function bufferGuardStatus(buffer, recording) {
+  const m = (buffer && buffer.maintenance) || {};
+  if (m.checked_at == null) {
+    return { text: 'Buffer guard: unknown', color: 'var(--text-muted)' };
+  }
+  const agoText = formatSince(m.checked_at) + ' ago';
+  if (m.stale) {
+    return { text: `Buffer guard: stale • last checked ${agoText}`, color: '#f59e0b' };
+  }
+  if (recording) {
+    return { text: `Buffer guard: paused while recording • checked ${agoText}`, color: 'var(--text-muted)' };
+  }
+  if (m.result === 'error') {
+    return { text: `Buffer guard: error • checked ${agoText}`, color: 'var(--danger)' };
+  }
+  if (m.result === 'missing') {
+    return { text: `Buffer guard: working buffer unavailable • checked ${agoText}`, color: '#f59e0b' };
+  }
+  if (m.result === 'lock_busy') {
+    return { text: `Buffer guard: busy • checked ${agoText}`, color: 'var(--text-muted)' };
+  }
+  // below_limit, rolled, or anything else the guard reports while idle.
+  return { text: `Buffer guard: healthy • checked ${agoText}`, color: 'var(--accent)' };
+}
+function bufferBarStatusClass(percent) {
+  if (percent >= 100) return 'critical';
+  if (percent >= 80) return 'warning';
+  return 'ok';
+}
 async function pollAircheck() {
   try {
     const r = await fetch("{% url 'aircheck:api-status' %}");
     const data = await r.json();
     const rec = !!data.recording;
     const s = data.session;
-    document.getElementById('aircheckPill').textContent = rec ? 'rec' : 'idle';
-    document.getElementById('aircheckPill').className = 'mon-pill ' + (rec ? 'critical' : 'unknown');
-    document.getElementById('aircheckLed').className = 'mon-led ' + (rec ? 'critical' : 'unknown');
-    document.getElementById('aircheckCaption').textContent = rec ? 'Recording' : 'Not recording';
+    const buffer = data.buffer || {};
+    const recent = data.recent_session;
+    const finalizing = !rec && !!recent && recent.finalization === 'finalizing';
+
+    let pillText, stateClass, caption;
+    if (rec) { pillText = 'rec'; stateClass = 'critical'; caption = 'Recording'; }
+    else if (finalizing) { pillText = 'finalizing'; stateClass = 'warning'; caption = 'Finalizing'; }
+    else { pillText = 'idle'; stateClass = 'unknown'; caption = 'Ready'; }
+    document.getElementById('aircheckPill').textContent = pillText;
+    document.getElementById('aircheckPill').className = 'mon-pill ' + stateClass;
+    document.getElementById('aircheckLed').className = 'mon-led ' + stateClass;
+    document.getElementById('aircheckCaption').textContent = caption;
     document.getElementById('aircheckBtn').textContent = rec ? 'Stop' : 'Start';
+
+    const guard = bufferGuardStatus(buffer, rec);
+    const guardLine = `<div style="font-size:0.7rem;color:${guard.color};margin-top:0.15rem;">${guard.text}</div>`;
+
     if (rec && s) {
       const fmtLabel = s.audio_format.toUpperCase() + (s.bitrate ? ' ' + s.bitrate : '');
-      document.getElementById('aircheckDetail').innerHTML =
-        `${fmtLabel} • elapsed <span id="aircheckElapsed">${fmtElapsed(s.started_at)}</span>` +
-        `<div style="font-size:0.7rem;color:var(--text-muted);margin-top:0.15rem;">` +
-        `${(s.filename || '').split('/').pop()}</div>`;
+      let detailHtml = `${fmtLabel} • elapsed <span id="aircheckElapsed">${fmtElapsed(s.started_at)}</span>` +
+        `<div style="font-size:0.7rem;color:var(--text-muted);margin-top:0.15rem;">${(s.filename || '').split('/').pop()}</div>` +
+        guardLine;
+      // Rare overlap: a new recording started while the PREVIOUS
+      // session's async HE-AAC remux is still finishing -- the active
+      // recording stays the primary (REC) state; this is just a small
+      // secondary note, not a second card state.
+      if (recent && recent.finalization === 'finalizing') {
+        detailHtml += `<div style="font-size:0.65rem;color:var(--text-muted);margin-top:0.1rem;">` +
+          `Previous session still finalizing (HE-AAC remux)</div>`;
+      }
+      document.getElementById('aircheckDetail').innerHTML = detailHtml;
+      // Live working-file size, NOT AircheckSession.size_bytes (that
+      // field is only populated during/after Stop) -- and never shown
+      // relative to the idle 64 MiB limit, which is not a recording cap.
       document.getElementById('aircheckSize').textContent =
-        s.size_bytes != null ? fmtSize(s.size_bytes) : '';
+        buffer.size_bytes != null ? `Current recording: ${fmtSize(buffer.size_bytes)}` : '';
+      document.getElementById('aircheckSize').className = 'mon-uptime';
+      document.getElementById('aircheckBufferBar').innerHTML = '';
       // Tick the elapsed clock every second between polls so it looks live.
       if (window._aircheckTick) clearInterval(window._aircheckTick);
       window._aircheckTick = setInterval(() => {
@@ -1199,9 +1265,53 @@ async function pollAircheck() {
         if (el) el.textContent = fmtElapsed(s.started_at);
       }, 1000);
     } else {
-      document.getElementById('aircheckDetail').textContent = '';
-      document.getElementById('aircheckSize').textContent = '';
       if (window._aircheckTick) { clearInterval(window._aircheckTick); window._aircheckTick = null; }
+
+      let detailHtml = '';
+      if (finalizing) {
+        detailHtml += `${(recent.filename || '').split('/').pop()}` +
+          `<div style="font-size:0.7rem;color:var(--text-muted);margin-top:0.15rem;">HE-AAC remux in progress</div>`;
+      }
+      detailHtml += guardLine;
+
+      const rollover = buffer.maintenance && buffer.maintenance.last_rollover_at;
+      detailHtml += `<div style="font-size:0.7rem;color:var(--text-muted);margin-top:0.15rem;">` +
+        (rollover ? `Last rollover: ${formatSince(rollover)} ago` : 'Last rollover: none yet') + `</div>`;
+
+      if (recent && !finalizing) {
+        if (recent.finalization === 'error') {
+          const reason = truncateNote(recent.exit_note, 80);
+          detailHtml += `<div style="font-size:0.7rem;color:var(--danger);margin-top:0.15rem;">` +
+            `Last Aircheck: finalization failed${reason ? ' — ' + reason : ''}</div>`;
+        } else {
+          const dur = recent.duration_seconds != null ? Math.round(recent.duration_seconds) + 's' : '';
+          const sz = recent.size_bytes != null ? fmtSize(recent.size_bytes) : '';
+          const isWarning = recent.finalization === 'warning';
+          const warnNote = isWarning && recent.exit_note ? ` — ${truncateNote(recent.exit_note, 60)}` : '';
+          const color = isWarning ? '#f59e0b' : 'var(--text-muted)';
+          detailHtml += `<div style="font-size:0.7rem;color:${color};margin-top:0.15rem;">` +
+            `Last: ${(recent.filename || '').split('/').pop()}${dur ? ' • ' + dur : ''}${sz ? ' • ' + sz : ''}${warnNote}</div>`;
+        }
+      }
+      document.getElementById('aircheckDetail').innerHTML = detailHtml;
+
+      // Idle working-buffer size + progress bar, relative to the 64 MiB
+      // idle rollover threshold -- this branch only ever runs while NOT
+      // recording, so it can never be confused with a recording cap.
+      if (buffer.exists && buffer.size_bytes != null && buffer.max_bytes) {
+        const percent = (buffer.size_bytes / buffer.max_bytes) * 100;
+        const barStatus = bufferBarStatusClass(percent);
+        document.getElementById('aircheckSize').textContent =
+          `Working buffer: ${fmtSize(buffer.size_bytes)} / ${fmtSize(buffer.max_bytes)}`;
+        document.getElementById('aircheckSize').className = 'mon-uptime ' + barStatus;
+        document.getElementById('aircheckBufferBar').innerHTML =
+          `<div class="mon-bar-track" style="margin-top:0.3rem;"><div class="mon-bar-fill ${barStatus}" ` +
+          `style="width:${Math.max(0, Math.min(100, percent))}%;"></div></div>`;
+      } else {
+        document.getElementById('aircheckSize').textContent = buffer.exists === false ? 'Working buffer: unavailable' : '';
+        document.getElementById('aircheckSize').className = 'mon-uptime unknown';
+        document.getElementById('aircheckBufferBar').innerHTML = '';
+      }
     }
   } catch (e) { /* quiet: card just doesn't update this tick */ }
 }
