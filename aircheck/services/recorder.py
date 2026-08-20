@@ -20,11 +20,24 @@ homes.
 
 ffmpeg_pid is preserved on AircheckSession for backward compatibility
 with old rows but is always None on new sessions.
+
+Idle working-buffer maintenance (maintain_idle_buffer): because
+output.file above runs continuously -- even with no session active --
+the tmpfs working file at AIRCHECK_CURRENT_PATH grows without bound
+until the next Start/Stop cuts it. maintain_idle_buffer periodically
+rolls it over via the SAME aircheck.reopen telnet call Start/Stop
+already use, purely to bound tmpfs growth, never touching
+AircheckSession. See AIRCHECK_LOCK_PATH below for how this is kept
+safe to run concurrently with a real Start/Stop.
 """
+import errno
+import fcntl
+import os
 import shutil
 import socket
 import subprocess
 import threading
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
@@ -38,10 +51,60 @@ from encoders.services.encoder_manager import (
     AIRCHECK_TELNET_HOST,
     AIRCHECK_TELNET_PORT,
 )
+from monitoring.models import emit_event
 
 
 REMUX_PENDING_NOTE = "remux in progress"
 REMUX_INTERMEDIATE_DIR = Path("/run/isadoraair")
+
+# Cross-process advisory lock serializing every operation that touches
+# the aircheck working file or AircheckSession state: Start, Stop, and
+# idle-buffer maintenance all go through _aircheck_lock. Start/Stop
+# acquire it BLOCKING (they must eventually run); idle maintenance
+# acquires it NON-BLOCKING and just skips this cycle if a real
+# operation currently owns it -- a missed idle rollover costs nothing,
+# it retries next cycle, and it must never make a Start/Stop press
+# wait on it.
+AIRCHECK_LOCK_PATH = "/run/isadoraair/aircheck.lock"
+
+# Safety ceiling for the always-on idle working buffer (see module
+# docstring). 64 MiB is generous headroom above a realistic per-minute
+# maintenance cadence's worth of growth for any configured aircheck
+# format, while still bounding tmpfs exhaustion risk if the timer is
+# ever delayed or disabled for a while.
+AIRCHECK_IDLE_BUFFER_MAX_BYTES = 64 * 1024 * 1024
+
+
+@contextmanager
+def _aircheck_lock(blocking):
+    """Yields True once AIRCHECK_LOCK_PATH's flock is held, or False if
+    blocking=False and another process currently holds it. Blocking
+    acquisition always eventually yields True (or raises on a genuine
+    OS error) -- callers that pass blocking=True don't need to check
+    the yielded value.
+
+    A plain flock on a fixed-path lockfile, not a DB-side lock: this
+    must work even when the DB is briefly unavailable (idle
+    maintenance already treats "can't reach liquidsoap" as a safe
+    failure; the lock itself shouldn't add a second DB dependency),
+    and it needs to be held across the same-process Start/Stop calls
+    that are themselves plain function calls, not a task queue."""
+    fd = os.open(AIRCHECK_LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        flags = fcntl.LOCK_EX if blocking else (fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            fcntl.flock(fd, flags)
+        except OSError as exc:
+            if not blocking and exc.errno in (errno.EACCES, errno.EAGAIN):
+                yield False
+                return
+            raise
+        try:
+            yield True
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
 
 
 TELNET_TIMEOUT_SECONDS = 3.0
@@ -162,40 +225,46 @@ def start_recording():
     current working file (AIRCHECK_CURRENT_PATH) and starts a fresh
     one at the same path. The session row records the INTENDED final
     destination; the actual file lives at AIRCHECK_CURRENT_PATH until
-    Stop moves it there."""
-    _reap_stale_running_session()
-    existing = AircheckSession.objects.filter(still_running=True).order_by("-started_at").first()
-    if existing:
-        return existing, "already recording"
+    Stop moves it there.
 
-    cfg = AircheckConfig.load()
-    out_dir = Path(cfg.output_directory)
-    try:
-        out_dir.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        return None, f"cannot create output directory {out_dir}: {exc}"
+    Runs under AIRCHECK_LOCK_PATH, blocking, for its entire body
+    (including the stale-session reap) -- serializes against Stop and
+    against idle-buffer maintenance so neither can reopen/inspect the
+    working file mid-Start."""
+    with _aircheck_lock(blocking=True):
+        _reap_stale_running_session()
+        existing = AircheckSession.objects.filter(still_running=True).order_by("-started_at").first()
+        if existing:
+            return existing, "already recording"
 
-    stamp = timezone.localtime().strftime(cfg.filename_template)
-    out_path = out_dir / f"{stamp}.{cfg.file_extension()}"
+        cfg = AircheckConfig.load()
+        out_dir = Path(cfg.output_directory)
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            return None, f"cannot create output directory {out_dir}: {exc}"
 
-    # Guard against second-precision collisions on rapid Start clicks.
-    if out_path.exists():
-        out_path = out_dir / f"{stamp}-{datetime.now().microsecond}.{cfg.file_extension()}"
+        stamp = timezone.localtime().strftime(cfg.filename_template)
+        out_path = out_dir / f"{stamp}.{cfg.file_extension()}"
 
-    try:
-        _send_telnet(f"{AIRCHECK_OUTPUT_ID}.reopen")
-    except TelnetError as exc:
-        return None, f"liquidsoap telnet: {exc}"
+        # Guard against second-precision collisions on rapid Start clicks.
+        if out_path.exists():
+            out_path = out_dir / f"{stamp}-{datetime.now().microsecond}.{cfg.file_extension()}"
 
-    session = AircheckSession.objects.create(
-        filename=str(out_path),
-        audio_format=cfg.audio_format,
-        bitrate=cfg.effective_bitrate(),
-        source_device=cfg.source_device,
-        ffmpeg_pid=None,  # legacy field, always None on new sessions
-        still_running=True,
-    )
-    return session, None
+        try:
+            _send_telnet(f"{AIRCHECK_OUTPUT_ID}.reopen")
+        except TelnetError as exc:
+            return None, f"liquidsoap telnet: {exc}"
+
+        session = AircheckSession.objects.create(
+            filename=str(out_path),
+            audio_format=cfg.audio_format,
+            bitrate=cfg.effective_bitrate(),
+            source_device=cfg.source_device,
+            ffmpeg_pid=None,  # legacy field, always None on new sessions
+            still_running=True,
+        )
+        return session, None
 
 
 def stop_recording():
@@ -216,31 +285,41 @@ def stop_recording():
         note, and hand off to a daemon thread that ffmpeg-remuxes
         (ADTS -> m4a, `-c copy`, no re-encode) and updates the row
         on completion. Stop returns to the caller within a few ms
-        rather than waiting seconds for the remux."""
-    session = AircheckSession.objects.filter(still_running=True).order_by("-started_at").first()
-    if session is None:
-        return None, "no active session"
+        rather than waiting seconds for the remux.
 
-    telnet_note = ""
-    try:
-        _send_telnet(f"{AIRCHECK_OUTPUT_ID}.reopen")
-    except TelnetError as exc:
-        # Working file may still be flushed on close by whatever's
-        # left of liquidsoap; we can still attempt the finalization
-        # below.
-        telnet_note = f"telnet reopen failed at Stop: {exc}; "
+        Runs under AIRCHECK_LOCK_PATH, blocking, for the synchronous
+        portion only -- through the point the working file has been
+        moved/renamed off AIRCHECK_CURRENT_PATH and the session row
+        updated. The async he_aac remux thread (which only ever
+        touches its own intermediate file, never AIRCHECK_CURRENT_PATH)
+        deliberately runs AFTER the lock is released -- holding it for
+        up to ffmpeg's 600s timeout would starve idle maintenance and
+        any subsequent Start/Stop for far too long."""
+    with _aircheck_lock(blocking=True):
+        session = AircheckSession.objects.filter(still_running=True).order_by("-started_at").first()
+        if session is None:
+            return None, "no active session"
 
-    working = Path(AIRCHECK_CURRENT_PATH)
-    dest = Path(session.filename)
-    session.still_running = False
-    session.ended_at = timezone.now()
+        telnet_note = ""
+        try:
+            _send_telnet(f"{AIRCHECK_OUTPUT_ID}.reopen")
+        except TelnetError as exc:
+            # Working file may still be flushed on close by whatever's
+            # left of liquidsoap; we can still attempt the finalization
+            # below.
+            telnet_note = f"telnet reopen failed at Stop: {exc}; "
 
-    if session.audio_format == "he_aac":
-        _finalize_he_aac_async(session, working, dest, telnet_note)
-    else:
-        _finalize_direct_move(session, working, dest, telnet_note)
+        working = Path(AIRCHECK_CURRENT_PATH)
+        dest = Path(session.filename)
+        session.still_running = False
+        session.ended_at = timezone.now()
 
-    return session, None
+        if session.audio_format == "he_aac":
+            _finalize_he_aac_async(session, working, dest, telnet_note)
+        else:
+            _finalize_direct_move(session, working, dest, telnet_note)
+
+        return session, None
 
 
 def _finalize_direct_move(session, working, dest, telnet_note):
@@ -367,3 +446,65 @@ def _mark_remux_failed(session_id, telnet_note, err):
         s.save(update_fields=["exit_note"])
     except AircheckSession.DoesNotExist:
         pass
+
+
+def maintain_idle_buffer(max_bytes=AIRCHECK_IDLE_BUFFER_MAX_BYTES):
+    """Idle-time protection against unbounded growth of the always-on
+    working file at AIRCHECK_CURRENT_PATH (see module docstring and
+    encoder_manager._aircheck_block -- output.file never stops writing,
+    even with no Aircheck session in progress, and is only otherwise
+    cut on an explicit Start/Stop). Intended to be called on a ~1min
+    timer via the maintain_aircheck_buffer management command.
+
+    Deliberately narrow: the ONLY action this ever takes is the same
+    `aircheck.reopen` telnet call Start/Stop already use, and only when
+    genuinely idle and oversized. Never unlinks, renames, truncates, or
+    otherwise touches the working file from Python, and never creates
+    or modifies an AircheckSession -- a normal idle rollover is
+    invisible to session history, exactly like the file being cut by a
+    real Start/Stop is the only thing that should ever appear there.
+
+    Returns one of:
+      "lock_busy"      -- a real Start/Stop (or another maintenance
+                           run) currently holds AIRCHECK_LOCK_PATH;
+                           skipped harmlessly, retried next cycle.
+      "active_session"  -- an AircheckSession is running; never rolls
+                           over a file a real session is relying on.
+      "missing"         -- AIRCHECK_CURRENT_PATH doesn't exist (e.g.
+                           encoders not up yet); nothing to do.
+      "below_limit"     -- working file is under max_bytes; no-op.
+      "rolled"          -- issued exactly one aircheck.reopen.
+      "error"           -- stat failed, or the telnet reopen itself
+                           failed; file/session left untouched, a
+                           deduplicated warning SystemEvent is emitted
+                           (telnet-failure case only)."""
+    with _aircheck_lock(blocking=False) as acquired:
+        if not acquired:
+            return "lock_busy"
+
+        if AircheckSession.objects.filter(still_running=True).exists():
+            return "active_session"
+
+        working = Path(AIRCHECK_CURRENT_PATH)
+        try:
+            size = working.stat().st_size
+        except FileNotFoundError:
+            return "missing"
+        except OSError:
+            return "error"
+
+        if size < max_bytes:
+            return "below_limit"
+
+        try:
+            _send_telnet(f"{AIRCHECK_OUTPUT_ID}.reopen")
+        except TelnetError as exc:
+            emit_event(
+                category="aircheck", level="warning",
+                title="Idle aircheck buffer rollover failed",
+                detail={"error": str(exc), "size_bytes": size, "max_bytes": max_bytes},
+                dedupe_key="aircheck|idle-buffer-reopen-failed",
+            )
+            return "error"
+
+        return "rolled"

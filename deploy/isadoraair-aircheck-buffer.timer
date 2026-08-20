@@ -1,0 +1,10 @@
+[Unit]
+Description=Roll over the idle Aircheck working buffer once a minute if it has grown past the safety limit
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+Persistent=false
+
+[Install]
+WantedBy=timers.target

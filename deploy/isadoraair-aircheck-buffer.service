@@ -1,0 +1,12 @@
+[Unit]
+Description=IsadoraAir Aircheck idle working-buffer rollover maintenance
+After=network.target postgresql.service isadoraair-encoders.service
+
+[Service]
+Type=oneshot
+Nice=19
+User=@@ISA_USER@@
+Group=@@ISA_USER@@
+WorkingDirectory=@@ISA_ROOT@@
+ExecStart=@@ISA_ROOT@@/venv/bin/python @@ISA_ROOT@@/manage.py maintain_aircheck_buffer
+EnvironmentFile=@@ISA_ROOT@@/.env

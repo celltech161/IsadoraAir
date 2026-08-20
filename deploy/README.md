@@ -69,7 +69,8 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now isadoraair-gunicorn isadoraair-engine \
   isadoraair-encoders isadoraair-monitoring isadoraair-rbds
 sudo systemctl enable --now isadoraair-analyze.timer \
-  isadoraair-prune-emaillog.timer isadoraair-prune-systemevents.timer
+  isadoraair-prune-emaillog.timer isadoraair-prune-systemevents.timer \
+  isadoraair-aircheck-buffer.timer
 # Only needed if Web Requests is in use (WebRequestConfig.enabled):
 sudo systemctl enable --now isadoraair-generate-dedication-intros.timer
 # Optional: sudo systemctl enable --now isadoraair-backup.timer
@@ -98,6 +99,7 @@ Timer-driven jobs (fire on a schedule, exit):
 | `isadoraair-prune-royalty-ledger.timer` | Daily (04:35) — prunes PlayEvent + IcecastSample rows past retention (default 3 years each). RoyaltyReport rows and their generated files are kept forever. |
 | `isadoraair-tunein-push.timer` | Every 30s — pushes now-playing to TuneIn's AIR API when the current PlayEvent id differs from the last successful push. No-op until credentials are entered at Config > TuneIn AIR and `enabled` is checked. |
 | `isadoraair-generate-dedication-intros.timer` | Every 15s — synthesizes spoken dedication intros (Kokoro) for scheduled web song requests. `Nice=19`, independent of the 20s web-requests-ingest poll cycle (Kokoro+ffmpeg can take tens of seconds). Only relevant if Web Requests is enabled. |
+| `isadoraair-aircheck-buffer.timer` | Every minute — rolls over the always-on Aircheck idle working buffer (`/run/isadoraair/aircheck-current.audio`) via the existing `aircheck.reopen` telnet call once it grows past a hard-coded 64 MiB safety limit, but only when no Aircheck session is active. `Nice=19`. Never starts/restarts encoders and fails safely (retries next cycle) if Liquidsoap is unreachable. |
 | `isadoraair-backup.timer` | Nightly full backup (03:30) — runs the repo-managed `deploy/backup_isadoraair.sh`; needs remote-target creds (`@@ISA_HOME@@/.iasboxbu.cred`) outside the repo |
 | `isadoraair-prune-emaillog.timer` | Daily (04:15) EmailLog retention prune, 90-day default |
 | `isadoraair-prune-systemevents.timer` | Daily (04:24) SystemEvent retention prune |
