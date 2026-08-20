@@ -2,7 +2,7 @@
 
 Django-based radio automation system built for [Oak Grove Radio](https://oakgroveradio.com) (KOGR-LP, Minneapolis KS).
 
-IsadoraAir manages the full music library, schedule programming, playlist generation, and live on-air playback for a broadcast radio station — from importing and analyzing a track to actually mixing it out through the studio monitor. It replaces a previous FastAPI/mpv prototype with a proper Django application backed by PostgreSQL, plus a standalone GStreamer playback engine.
+IsadoraAir manages the full music library, schedule programming, playlist generation, and live on-air playback for a broadcast radio station — from importing and analyzing a track to actually mixing it out through the studio monitor. It replaces a NextKast OnAir + MagicRDS 4 on Win 11 + separate content ingestion scripts on a Ubuntu box with a Django application backed by PostgreSQL, plus a standalone GStreamer playback engine.
 
 ## Screenshots
 
