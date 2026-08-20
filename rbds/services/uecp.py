@@ -333,6 +333,85 @@ def mec_rt(text: str, ab_flag: bool, dsn: int = 0x00, psn: int = 0x00) -> bytes:
     return bytes([0x0A, dsn, psn, mel, med0]) + encode_rds_g0(text)
 
 
+def mec_long_ps(text, dsn: int = 0x00, psn: int = 0x00) -> bytes:
+    """MEC 0x21 -- Long PS (extended, up to 32-character Program Service
+    name). Not part of the SPB490/UECP spec text available to this
+    project (no worked example exists to check against, unlike every
+    other mec_* here) -- reverse-engineered directly from StereoTool's
+    own vendor-supplied C reference parser ([P2] 2.3F, 2026-08-2x),
+    after StereoTool's developer explicitly confirmed 0x21 "should
+    work... implemented at least; it may never have been tested/used by
+    anyone." Reconciled against this file's own generic MEC-envelope
+    convention and hand-traced against the vendor loop for 4/20/32-
+    character and disable inputs before ever transmitting (see
+    rbds/tests.py's byte-level checks) -- not inferred from mec_rt's
+    formula by analogy alone, even though the resulting formula
+    happens to look identical (see below).
+
+    Format: MEC(0x21) DSN(1) PSN(1) MEL(1) [text bytes][1 terminator],
+    terminator present only when MEL > 0 (see disable case below).
+
+    MEL semantics -- the vendor's own parser (StereoTool developer,
+    field names as given):
+        unsigned char MEL = unstuffed[read_pos + 3];
+        for (c = 0; c < 32; c++)
+            ch = (read_pos+4+c < upos && c < MEL-1) ? unstuffed[read_pos+4+c] : '\\0';
+        read_pos += 4 + MEL;
+    MEL is NOT "number of display characters" -- it is len(text) + 1.
+    The read loop only treats the first MEL-1 MED bytes as display
+    characters (`c < MEL - 1`); the LAST MED byte (at MED offset
+    MEL-1, i.e. len(text)) is skipped over by the `read_pos += 4 + MEL`
+    arithmetic but never dereferenced inside the loop -- it exists only
+    to keep read_pos correctly synced to the next message element in
+    the stream, and its actual value is irrelevant to StereoTool (never
+    read). Sent here as 0x00, matching the vendor's own '\\0' fallback
+    used everywhere else in that same snippet -- any value would do,
+    but this is the least surprising choice.
+
+    This formula LOOKS like mec_rt's own "MEL = 1 + len(text)" but for
+    a different reason: RT's extra byte is a LEADING flags byte that IS
+    real data, read at MED position 0. 0x21's extra byte is a fixed,
+    ignored pad at the END of MED. Do not "simplify" this by assuming
+    the two commands share semantics -- re-verify against the vendor
+    parser directly if this function is ever touched.
+
+    MEL == 0 disables Long PS (`rds->SetLongPSEnabled(MEL != 0, true)`
+    in the vendor snippet), sent here with ZERO MED bytes -- not even
+    the terminator: MEC DSN PSN 0x00, 4 bytes total. Confirmed against
+    the vendor loop directly: with MEL=0, `MEL - 1` promotes to a
+    signed int (standard C integer promotion of an `unsigned char`
+    operand) and equals -1, so `c < MEL - 1` (`0 < -1`, ...) is false
+    for every c -- no character position is ever read as valid, and
+    read_pos correctly advances by exactly 4 (the header only).
+
+    text=None AND text="" both produce the disable form above -- a
+    deliberate design choice, not an oversight: "nothing to show"
+    collapses to "don't show Long PS at all," letting Long-PS-capable
+    receivers fall back to the ordinary 8-char PS rather than displaying
+    32 blank characters under an "enabled" state nobody asked for.
+
+    Text longer than 32 characters is silently truncated (StereoTool's
+    own lps[32+1] buffer / `for c<32` outer loop is the hard display
+    limit the vendor snippet itself documents) -- same silent-truncate
+    convention as mec_ps (8 chars) and mec_rt (64 chars) in this file,
+    never a raised error. Encoded via encode_rds_g0() -- the real RDS
+    G0 table, NOT UTF-8 -- same as every other text field here. Text is
+    expected ALREADY NORMALIZED by the caller (normalize_text()),
+    matching mec_ps/mec_rt/mec_ptyn's own convention; this builder does
+    not normalize.
+
+    MEC 0x24 is StereoTool's OTHER Long PS command and is deliberately
+    NOT implemented here or anywhere in this project: the same vendor
+    conversation that confirmed 0x21 works also confirmed 0x24 requires
+    an Advanced RDS license this station does not have. Do not add 0x24
+    support without a new, deliberate reason to override this decision."""
+    if not text:
+        return bytes([0x21, dsn, psn, 0x00])
+    text = text[:32]
+    mel = 1 + len(text)
+    return bytes([0x21, dsn, psn, mel]) + encode_rds_g0(text) + bytes([0x00])
+
+
 def mec_rt_plus_oda_reg() -> bytes:
     """MEC 0x24 subtype 0x06 -- ODA registration for RT+.
 

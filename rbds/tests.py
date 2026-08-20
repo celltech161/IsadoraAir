@@ -204,6 +204,115 @@ class UecpMecBuilderTests(SimpleTestCase):
         result = uecp.mec_rt("A" * 64, ab_flag=False)
         self.assertEqual(result[3], 65)  # 1 flags byte + 64 text chars
 
+    # --- MEC 0x21 -- Long PS ([P2] 2.3F). Not part of the SPB490 spec
+    # text available to this project -- no worked example exists, so
+    # every case here is checked against StereoTool's own vendor-
+    # supplied C parser instead (reproduced in mec_long_ps's own
+    # docstring), hand-traced byte-for-byte rather than assumed from
+    # mec_rt's superficially-similar MEL formula. ---
+
+    def test_mec_long_ps_short_string(self):
+        # "TEST" (4 chars) -> MEL = 4+1 = 5, MED = "TEST" + one
+        # (unread-by-StereoTool) terminator byte.
+        result = uecp.mec_long_ps("TEST", dsn=0x00, psn=0x00)
+        self.assertEqual(result, bytes.fromhex("21000005") + b"TEST" + b"\x00")
+
+    def test_mec_long_ps_station_string(self):
+        # "OAK GROVE RADIO 98.5" -- 20 chars -> MEL = 21 (0x15).
+        text = "OAK GROVE RADIO 98.5"
+        self.assertEqual(len(text), 20)
+        result = uecp.mec_long_ps(text)
+        self.assertEqual(result[0:4], bytes.fromhex("21000015"))
+        self.assertEqual(result[4:24], text.encode("ascii"))
+        self.assertEqual(result[24], 0x00)
+        self.assertEqual(len(result), 25)  # 4 header + 20 text + 1 terminator
+
+    def test_mec_long_ps_exactly_32_chars(self):
+        text = "A" * 32
+        result = uecp.mec_long_ps(text)
+        self.assertEqual(result[3], 33)  # MEL = 32 + 1
+        self.assertEqual(result[4:36], b"A" * 32)
+        self.assertEqual(result[36], 0x00)
+        self.assertEqual(len(result), 37)
+
+    def test_mec_long_ps_over_32_chars_is_silently_truncated(self):
+        # Same silent-truncate convention as mec_ps (8 chars) and
+        # mec_rt (64 chars) in this file -- never a raised error.
+        result = uecp.mec_long_ps("A" * 40)
+        self.assertEqual(result[3], 33)  # still MEL = 32 + 1, not 41
+        self.assertEqual(result[4:36], b"A" * 32)
+        self.assertEqual(len(result), 37)
+
+    def test_mec_long_ps_none_disables(self):
+        # MEL=0, zero MED bytes -- not even the terminator.
+        result = uecp.mec_long_ps(None)
+        self.assertEqual(result, bytes.fromhex("21000000"))
+        self.assertEqual(len(result), 4)
+
+    def test_mec_long_ps_empty_string_disables(self):
+        # Deliberate design choice, documented in mec_long_ps's own
+        # docstring: "" is treated the same as None, not as "enabled
+        # with zero visible characters".
+        self.assertEqual(uecp.mec_long_ps(""), uecp.mec_long_ps(None))
+
+    def test_mec_long_ps_never_sends_mec_0x24(self):
+        # Vendor-confirmed license dependency for 0x24 -- this project
+        # only ever sends 0x21 for Long PS. A regression guard, not
+        # just a byte check.
+        for text in (None, "", "TEST", "A" * 32, "A" * 40):
+            with self.subTest(text=text):
+                self.assertEqual(uecp.mec_long_ps(text)[0], 0x21)
+
+    def test_mec_long_ps_round_trips_through_real_stereotool_parser_logic(self):
+        """Directly re-implements the vendor's exact C loop in Python
+        (not this project's own encoder logic) and runs it against
+        mec_long_ps()'s output, for several lengths including the
+        boundary and disable cases -- proves the RECONCILED MEL
+        semantics actually work end to end against an independent
+        transliteration of the vendor code, not just that our own
+        formula is internally consistent with itself."""
+        def stereotool_parse(unstuffed, read_pos):
+            mel = unstuffed[read_pos + 3]
+            upos = len(unstuffed)
+            lps = []
+            for c in range(32):
+                idx = read_pos + 4 + c
+                ch = unstuffed[idx] if (idx < upos and c < mel - 1) else 0x00
+                lps.append(ch)
+            enabled = mel != 0
+            next_read_pos = read_pos + 4 + mel
+            # Trim trailing NULs the way a C string display would.
+            text_bytes = bytes(lps).split(b"\x00", 1)[0]
+            return text_bytes, enabled, next_read_pos
+
+        for text in ("TEST", "OAK GROVE RADIO 98.5", "A" * 32, "A" * 40, "", None):
+            with self.subTest(text=text):
+                block = uecp.mec_long_ps(text)
+                # A second, unrelated MEC right after it -- proves
+                # next_read_pos actually lands on the right byte, not
+                # just that decoding within this block "looks okay".
+                sentinel = bytes([0x07, 0x00, 0x00, 0x05])  # mec_pty-shaped, arbitrary
+                stream = block + sentinel
+                decoded_text, enabled, next_read_pos = stereotool_parse(stream, 0)
+                expected_text = (text or "")[:32]
+                self.assertEqual(decoded_text, expected_text.encode("ascii"))
+                self.assertEqual(enabled, bool(expected_text))
+                self.assertEqual(next_read_pos, len(block))
+                self.assertEqual(stream[next_read_pos:next_read_pos + 4], sentinel)
+
+    def test_mec_long_ps_stuffing_round_trip(self):
+        # "ŧ" (U+0167) is a real RDS G0 code point that lands on byte
+        # 0xFE -- one of the three bytes UECP's frame-level byte-
+        # stuffing must escape. Confirms mec_long_ps's raw (unstuffed)
+        # output survives build_frame()'s stuffing + this test suite's
+        # own _split_uecp_frames() unstuffing round trip intact.
+        self.assertEqual(charset.encode_rds_g0("ŧ"), bytes([0xFE]))
+        med = uecp.mec_long_ps("Aŧ")
+        self.assertIn(0xFE, med)  # sanity: the raw byte really is 0xFE before stuffing
+        frame = uecp.build_frame(0, 0, sqc=1, msg=med)
+        decoded = _split_uecp_frames(frame)
+        self.assertEqual(decoded, [med])
+
     def test_mec_ct_matches_spec_example(self):
         # <0D><5C><09><0C><0A><12><21><0F><02> -- spec section 3.3.37's
         # own worked example: 1992-09-12 10:18:33.15 UTC, local offset +1h.
