@@ -69,11 +69,29 @@ class Command(BaseCommand):
          each a pending/no_slot_soon status plus an advisory
          estimated_play_time. Each candidate slot is checked with the
          SAME eligibility+recency test (is_track_eligible_at) real
-         scheduling uses, evaluated against that slot's own
-         scheduled_time rather than "now". Still only ever a preview:
-         since a real scheduling can happen for any request at any
-         later cycle, an advisory estimate can end up not matching
-         which slot a request actually lands in."""
+         scheduling uses, evaluated at max(now, that slot's own
+         scheduled_time) -- matching maybe_schedule_song_request's own
+         eligibility_time exactly, so this advisory pass can't disagree
+         with what real scheduling would actually decide for the same
+         item right now. Still only ever a preview: since a real
+         scheduling can happen for any request at any later cycle, an
+         advisory estimate can end up not matching which slot a
+         request actually lands in.
+
+      Candidate queries (6 and 7) bound scheduled_time to
+      [current_hour_start, lookahead_cutoff) -- current_hour_start
+      (the floor of the current station-local hour), not `now`. A
+      not-yet-played item's scheduled_time is a static build-time
+      estimate that routinely drifts behind real playback over the
+      course of an hour (ordinary variance, not a fault condition);
+      bounding by `now` instead silently drops a drifted-but-still-
+      upcoming item from every candidate query the moment its stale
+      estimate slips into the past, often the very next thing about to
+      air. current_hour_start avoids that without reintroducing
+      long-abandoned historical LogItems as candidates -- those stay
+      excluded by played_at__isnull=True combined with _is_dead_slot's
+      own STRANDED/UNKNOWN-in-current-or-earlier-hour classification,
+      not by a raw time filter."""
 
     help = "Re-evaluate SongRequest statuses (unavailable/expired/pending/no_slot_soon/scheduled) and estimated_play_time."
 
@@ -86,6 +104,31 @@ class Command(BaseCommand):
         # Comparing against a UTC `now` is wrong in the evening Central
         # Time, once UTC has already rolled to the next calendar date.
         wall_clock_key = (local_now.date(), local_now.hour)
+        # Floor of the current station-local hour -- the correct lower
+        # bound for "still worth considering" candidate queries below,
+        # replacing a prior `scheduled_time__gte=now`. scheduled_time is
+        # a STATIC estimate set once when the hour's log was built;
+        # real playback routinely drifts behind (or ahead of) that
+        # original plan over the course of an hour -- varying track
+        # lengths, no anomaly required -- so a not-yet-played CURRENT-
+        # HOUR item's own scheduled_time can already be in the past
+        # relative to `now` well before it actually airs. Filtering on
+        # `now` silently dropped exactly those drifted-but-still-
+        # upcoming items from every candidate query below (confirmed
+        # live 2026-08-20: a request submitted ~2 minutes before its
+        # only eligible slot showed "no slot soon" the whole time,
+        # because that slot's build-time scheduled_time had already
+        # drifted ~4 minutes into the past). `played_at__isnull=True`
+        # alone is NOT a safe substitute for a lower bound -- an
+        # abandoned/stranded LogItem from an earlier hour can
+        # legitimately sit unplayed forever, and must not be
+        # reintroduced as a candidate just because the time filter was
+        # removed; `current_hour_start` keeps the query scoped to "this
+        # hour or later" the same way `now` was meant to, without being
+        # defeated by ordinary intra-hour drift. Genuinely abandoned
+        # CURRENT-hour rows (not on a deck, not in the live queue) are
+        # still excluded -- that's _is_dead_slot's job, unchanged below.
+        current_hour_start = local_now.replace(minute=0, second=0, microsecond=0)
         open_slots = set(cfg.open_slots)
         state = _read_engine_state()
 
@@ -209,7 +252,7 @@ class Command(BaseCommand):
         fulfillment_candidates = [
             item for item in (
                 LogItem.objects.filter(
-                    scheduled_time__gte=now, scheduled_time__lt=lookahead_cutoff,
+                    scheduled_time__gte=current_hour_start, scheduled_time__lt=lookahead_cutoff,
                     played_at__isnull=True, category__kind__code="music",
                     playlist_log__status="approved",
                 )
@@ -240,7 +283,7 @@ class Command(BaseCommand):
         candidates = [
             item for item in (
                 LogItem.objects.filter(
-                    scheduled_time__gte=now, scheduled_time__lt=lookahead_cutoff,
+                    scheduled_time__gte=current_hour_start, scheduled_time__lt=lookahead_cutoff,
                     played_at__isnull=True, category__kind__code="music",
                     playlist_log__status="approved",
                 )
@@ -254,7 +297,7 @@ class Command(BaseCommand):
         for row in (
             SongRequest.objects.filter(
                 status__in=("scheduled", "fulfilled"), log_item__playlist_log_id__isnull=False,
-                log_item__scheduled_time__gte=now, log_item__scheduled_time__lt=lookahead_cutoff,
+                log_item__scheduled_time__gte=current_hour_start, log_item__scheduled_time__lt=lookahead_cutoff,
             )
             .values("log_item__playlist_log_id", "log_item_id").distinct()
         ):
@@ -294,7 +337,17 @@ class Command(BaseCommand):
                     continue
                 if used_per_hour[item.playlist_log_id] >= remaining_capacity[item.playlist_log_id]:
                     continue
-                if req.track is None or not is_track_eligible_at(req.track, item.scheduled_time, recency_cfg):
+                # Same max(now, ...) real scheduling uses (see
+                # maybe_schedule_song_request's own eligibility_time) --
+                # a drifted current-hour item's scheduled_time can be
+                # minutes in the past by the time this runs, and
+                # recency exclusions are relative to the CHECK time, not
+                # the slot's stale build-time estimate. Evaluating at
+                # the stale value alone could show this advisory pass
+                # disagreeing with what real scheduling would actually
+                # decide for the exact same item right now.
+                eligibility_time = max(now, item.scheduled_time)
+                if req.track is None or not is_track_eligible_at(req.track, eligibility_time, recency_cfg):
                     continue
                 estimate = estimate_air_time(item)
                 claimed_item_ids.add(item.id)
