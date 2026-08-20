@@ -87,9 +87,20 @@ DJ_DIAG_LOG = Path("/run/isadoraair/remote_dj_diag.log")
 # or examined in Audacity by importing as raw. Continuous session-length
 # dump of every buffer that reaches master_mixer via the DJ pad. Kept the
 # `_first_1s` name for backward compatibility of any monitoring/muscle
-# memory; it now covers the whole session, but a session is usually short
-# enough that the file stays modest (~10 MB/min at S16 stereo 44100).
+# memory; it now covers the whole session -- unbounded by session
+# length, ~10 MB/min at S16 stereo 44100 (a multi-hour remote DJ show
+# can put several GB on /run's tmpfs, shared with unrelated operational
+# state like engine_state.json/levels.json).
 DJ_DUMP_PCM = Path("/run/isadoraair/remote_dj_first_1s.pcm")
+# This instrumentation was built to hunt the static-on-connect bug
+# during Remote DJ connection establishment -- that investigation is
+# resolved, so the dump is OFF by default (2026-08-20 audit). Left
+# fully wired in, not removed: when a similar issue needs live PCM
+# evidence again, flip this back to True (no other code changes
+# needed) rather than re-deriving the instrumentation from git
+# history. While False, neither the file nor the pad probe below is
+# ever created -- zero cost, zero growth.
+DJ_DUMP_PCM_ENABLED = False
 
 
 def _dj_diag(session, msg):
@@ -4757,10 +4768,11 @@ class PlaybackEngine:
             _dj_diag(session, f"session_start")
         except OSError as exc:
             print(f"  Remote DJ: could not open diag log ({exc})")
-        try:
-            session.dump_fh = open(DJ_DUMP_PCM, "wb")
-        except OSError as exc:
-            print(f"  Remote DJ: could not open PCM dump file ({exc})")
+        if DJ_DUMP_PCM_ENABLED:
+            try:
+                session.dump_fh = open(DJ_DUMP_PCM, "wb")
+            except OSError as exc:
+                print(f"  Remote DJ: could not open PCM dump file ({exc})")
         try:
             self._remote_dj_build_session(session)
         except Exception as exc:
@@ -5398,6 +5410,10 @@ class PlaybackEngine:
         # rather than on a master_mixer sink pad that doesn't exist
         # in the new design. Data is what the slot's selector sees on
         # its webrtc_pad, which is what actually mixes into the master.
+        # OFF by default (DJ_DUMP_PCM_ENABLED, see its own comment near
+        # DJ_DUMP_PCM's definition) -- gated below and at the open()
+        # call in _remote_dj_session_start, so none of this fires at
+        # all while disabled.
         _DUMP_LOG_EVERY_BYTES = 44100 * 2 * 2  # ~1s of stereo S16
         def _dump_probe(probed_pad2, info2, _u2):
             try:
@@ -5426,13 +5442,14 @@ class PlaybackEngine:
                     pass
                 return Gst.PadProbeReturn.REMOVE
             return Gst.PadProbeReturn.OK
-        try:
-            session.dump_probe_id = queue_src.add_probe(
-                Gst.PadProbeType.BUFFER, _dump_probe, None,
-            )
-            _dj_diag(session, "dump probe installed on queue src (feeding slot selector)")
-        except Exception as exc:
-            _dj_diag(session, f"dump probe INSTALL FAILED: {exc!r}")
+        if DJ_DUMP_PCM_ENABLED:
+            try:
+                session.dump_probe_id = queue_src.add_probe(
+                    Gst.PadProbeType.BUFFER, _dump_probe, None,
+                )
+                _dj_diag(session, "dump probe installed on queue src (feeding slot selector)")
+            except Exception as exc:
+                _dj_diag(session, f"dump probe INSTALL FAILED: {exc!r}")
 
         print("  Remote DJ: decode chain wired; waiting for first buffer to flip slot selector")
         session.real_buf_seen = True
