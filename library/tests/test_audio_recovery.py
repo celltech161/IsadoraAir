@@ -3,6 +3,7 @@ No GStreamer, no Django DB, no hardware -- plain unittest against the
 classifier, SlotCoordinator, backoff, and ALSA-cards parsing/identity
 resolution. See test_engine_mic_recovery.py for the GStreamer-integrated
 half (topology, EOS quarantine, engine-level state transitions)."""
+import threading
 import time
 import unittest
 
@@ -182,6 +183,32 @@ class SlotCoordinatorCoreTests(SimpleTestCase):
             time.sleep(0.005)
         return False
 
+    def _release_and_wait_for_worker_exit(self, thread_name, release, timeout=2.0):
+        """SlotCoordinator's abandoned-worker design is deliberate --
+        production never kills a wedged close() (see tick()'s own
+        "will be reclaimed only on process exit" comment) -- so a test
+        that simulates the wedge must gate it (threading.Event, or a
+        plain dict flag a polling worker checks -- either way, `release`
+        is a no-arg callable that unblocks it) instead of a real
+        time.sleep(N), then confirm the underlying OS thread has actually
+        exited before returning. request_recovery()/retry_now() don't
+        hand back the Thread object, so this polls threading.enumerate()
+        for the worker's name (SlotCoordinator names it
+        f"slot-{name}-op{op_id}") to disappear -- the deterministic
+        equivalent of the .join() every other thread-spawning test file
+        in this codebase already does. Without this, the real thread
+        keeps running for however long the simulated wedge was set to
+        last, well past this test's own return -- a lingering
+        test-created thread free to overlap whatever test happens to run
+        next."""
+        release()
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if not any(t.name == thread_name for t in threading.enumerate()):
+                return True
+            time.sleep(0.01)
+        return False
+
     def test_mark_degraded_first_call_true_then_false(self):
         slot = ar.SlotCoordinator("mic")
         self.assertTrue(slot.mark_degraded())
@@ -273,9 +300,13 @@ class SlotCoordinatorCoreTests(SimpleTestCase):
             lambda: (slot.tick() or True) and slot.state == ar.SlotState.RESTART_REQUIRED,
             timeout=2.0))
         gen_at_abandonment = slot.generation
-        # Now let the real (leaked) worker thread finally finish.
-        gate["release"] = True
-        time.sleep(0.3)
+        # Now let the real (leaked) worker thread finally finish -- waited
+        # for deterministically (thread-name poll, not a blind sleep) so
+        # it doesn't outlive this test; see _release_and_wait_for_worker_exit.
+        self.assertTrue(
+            self._release_and_wait_for_worker_exit(
+                "slot-mic-op1", lambda: gate.__setitem__("release", True)),
+            "the late/abandoned worker thread must actually exit -- must not leak past this test")
         # State must NOT have been dragged back to OK by the late result.
         self.assertEqual(slot.state, ar.SlotState.RESTART_REQUIRED)
         self.assertEqual(slot.generation, gen_at_abandonment)
@@ -283,21 +314,35 @@ class SlotCoordinatorCoreTests(SimpleTestCase):
     def test_restart_required_ignores_automatic_retry(self):
         slot = ar.SlotCoordinator("mic", timeout_s=0.1)
         slot.mark_degraded()
-        slot.request_recovery(lambda: (time.sleep(5), True)[1])
+        release = threading.Event()
+        # release.wait(timeout=...) rather than a bare time.sleep(5) --
+        # simulates the same "worker outlives the coordinator's own
+        # timeout" wedge without a real 5-second sleep this test can't
+        # control the end of; see _release_and_wait_for_worker_exit.
+        slot.request_recovery(lambda: (release.wait(timeout=10), True)[1])
         self.assertTrue(self._wait_until(lambda: (slot.tick() or True) and
                                           slot.state == ar.SlotState.RESTART_REQUIRED))
         self.assertEqual(slot.request_recovery(lambda: True), "ignored_restart_required")
+        self.assertTrue(
+            self._release_and_wait_for_worker_exit("slot-mic-op1", release.set),
+            "the abandoned worker thread must actually exit once released -- "
+            "must not leak past this test")
 
     def test_retry_now_bumps_generation_after_restart_required(self):
         slot = ar.SlotCoordinator("mic", timeout_s=0.1)
         slot.mark_degraded()
-        slot.request_recovery(lambda: (time.sleep(5), True)[1])
+        release = threading.Event()
+        slot.request_recovery(lambda: (release.wait(timeout=10), True)[1])
         self.assertTrue(self._wait_until(lambda: (slot.tick() or True) and
                                           slot.state == ar.SlotState.RESTART_REQUIRED))
         gen_before = slot.generation
         result = slot.retry_now(lambda: True)
         self.assertEqual(result, "dispatched")
         self.assertEqual(slot.generation, gen_before + 1)
+        self.assertTrue(
+            self._release_and_wait_for_worker_exit("slot-mic-op1", release.set),
+            "the abandoned worker thread must actually exit once released -- "
+            "must not leak past this test")
 
     def test_no_unbounded_worker_creation_under_repeated_coalesced_notifications(self):
         """Item 14: many repeated 'failure' notifications while one
