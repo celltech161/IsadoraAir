@@ -1376,19 +1376,34 @@ class PlaybackEngine:
             if self._mic_pending_hw_bin is not None:
                 print("  Mic rebuild attempt failed health verification; will retry after backoff")
                 self._mic_discard_pending_hw_bin(abandoned=False)
-            else:
-                # A QUIESCE op resolved with succeeded=False -- only
-                # reachable if old_bin.set_state(Gst.State.NULL) itself
-                # raised (no scratchpad round ever observed this; only
-                # hanging was observed, which goes through RESTART_
-                # REQUIRED instead). self._mic_hw_bin was already cleared
-                # before dispatch, so the old bin is harmlessly leaked
-                # (detached from _mic_bin, can't block shutdown) rather
-                # than definitively NULL'd -- logged for visibility;
-                # presence-probing still proceeds normally from here,
-                # since it only depends on slot state being DEGRADED.
+            elif snapshot.get("operation_succeeded") is False:
+                # [P0] 1.3B4 -- distinguished via SlotCoordinator's own
+                # operation_succeeded tag (added for exactly this purpose),
+                # not inferred from incidental state. Found live during the
+                # 1.3B3 physical acceptance test: the OK-branch's own
+                # deliberate re-degrade below (mark_degraded() called again
+                # right after a SUCCESSFUL quiesce) reuses the SAME
+                # OperationRecord -- mark_degraded() never touches self._op
+                # -- so a naive "pending_hw_bin is None -> must be a
+                # failure" check couldn't tell that apart from a genuine
+                # worker failure and printed this exact message on a
+                # perfectly normal, successful transition. Now gated on
+                # operation_succeeded being explicitly False (only true if
+                # old_bin.set_state(Gst.State.NULL) itself raised -- no
+                # scratchpad round ever observed this; only hanging was
+                # observed, which goes through RESTART_REQUIRED instead).
+                # self._mic_hw_bin was already cleared before dispatch, so
+                # the old bin is harmlessly leaked (detached from _mic_bin,
+                # can't block shutdown) rather than definitively NULL'd --
+                # logged for visibility; presence-probing still proceeds
+                # normally from here, since it only depends on slot state
+                # being DEGRADED.
                 print("  Mic quiesce operation failed unexpectedly (see exception in operation_failed "
                       "log above, if any); old generation reference abandoned, continuing")
+            # else: operation_succeeded is True (the expected, intentional
+            # re-degrade right below, after a successful quiesce) or None
+            # (no operation has ever completed yet) -- neither is a
+            # failure; nothing to log.
         elif new_state == SlotState.RESTART_REQUIRED.value:
             if self._mic_pending_hw_bin is not None:
                 self._mic_discard_pending_hw_bin(abandoned=True)

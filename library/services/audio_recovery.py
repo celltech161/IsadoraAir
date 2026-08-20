@@ -258,6 +258,16 @@ class SlotCoordinator:
                                      (OperationState.TIMED_OUT_ABANDONED if self._op.abandoned
                                       else OperationState.RETURNED) or OperationState.IN_FLIGHT).value
                                     if self._op is not None else OperationState.NONE.value,
+                # New in 1.3B4 -- the explicit result of the most recently
+                # RESOLVED operation on record (True/False), or None if no
+                # operation has ever completed yet. Exists specifically so
+                # a caller can distinguish "this DEGRADED state was reached
+                # because a worker genuinely failed" from "the owner called
+                # mark_degraded() again deliberately, reusing this same
+                # already-succeeded record" -- mark_degraded() never
+                # touches self._op, so its value keeps reflecting whatever
+                # operation last actually ran, exactly what's needed here.
+                "operation_succeeded": self._op.succeeded if (self._op is not None and self._op.done) else None,
                 "abandoned_generations": list(self._abandoned_generations),
                 "recovery_requested_again": self._recovery_requested_again,
             }

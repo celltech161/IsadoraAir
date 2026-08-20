@@ -682,6 +682,84 @@ class RecoveredMicStaysOffTests(MockDuckingMixin, SimpleTestCase):
             pipeline.set_state(Gst.State.NULL)
 
 
+class QuiesceDiagnosticMessageTests(MockDuckingMixin, SimpleTestCase):
+    """[P0] 1.3B4 -- pre-commit-review-discovered diagnostic bug, fixed:
+    _mic_handle_slot_transition's DEGRADED-branch could not distinguish a
+    normal, intentional re-degrade (the OK-branch's own mark_degraded()
+    call, right after a successful quiesce) from a genuine worker
+    failure -- both look identical via _mic_pending_hw_bin alone (None
+    either way). Now gated on SlotCoordinator's own operation_succeeded
+    tag, which mark_degraded() never touches, so it keeps reflecting the
+    last RESOLVED operation's true outcome across a deliberate re-degrade.
+
+    Uses the real SlotCoordinator + real _mic_handle_slot_transition end
+    to end (dispatch a real worker, wait for it to resolve, then invoke
+    the transition handler) -- not a synthetic snapshot dict -- so this
+    proves the fix against the actual mechanism, not an assumption about
+    its shape."""
+
+    def _wait_until(self, predicate, timeout=2.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return True
+            time.sleep(0.01)
+        return False
+
+    def test_successful_quiesce_to_degraded_emits_no_false_failure_message(self):
+        import contextlib
+        import io
+
+        obj = make_mic_stand_in()
+        obj._build_mic_chain()
+        obj._mic_pending_hw_bin = None
+
+        # First half of the real sequence: mark_degraded() + a real,
+        # SUCCEEDING worker dispatch, exactly what _on_mic_error /
+        # _mic_quiesce_current_generation do.
+        obj._mic_slot.mark_degraded()
+        obj._mic_slot.request_recovery(lambda: True)
+        self.assertTrue(self._wait_until(lambda: obj._mic_slot.snapshot()["state"] == "OK"))
+
+        # The transition handler's OK-branch: prints "quiesced cleanly"
+        # and deliberately re-degrades via mark_degraded() again.
+        ok_snapshot = obj._mic_slot.snapshot()
+        obj._mic_handle_slot_transition("RECOVERING", "OK", ok_snapshot)
+        self.assertEqual(obj._mic_slot.state, audio_recovery.SlotState.DEGRADED)
+
+        # The transition this bug was about: observing THAT re-degrade.
+        degraded_snapshot = obj._mic_slot.snapshot()
+        self.assertIs(degraded_snapshot["operation_succeeded"], True,
+                       "sanity check on the primitive the fix relies on")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            obj._mic_handle_slot_transition("OK", "DEGRADED", degraded_snapshot)
+        output = buf.getvalue()
+        self.assertNotIn("failed unexpectedly", output)
+        self.assertNotIn("Mic quiesce operation failed", output)
+
+    def test_genuine_quiesce_worker_failure_still_emits_failure_diagnostic(self):
+        import contextlib
+        import io
+
+        obj = make_mic_stand_in()
+        obj._build_mic_chain()
+        obj._mic_pending_hw_bin = None
+
+        obj._mic_slot.mark_degraded()
+        obj._mic_slot.request_recovery(lambda: False)  # genuine failure
+        self.assertTrue(self._wait_until(lambda: obj._mic_slot.snapshot()["state"] == "DEGRADED"))
+
+        snapshot = obj._mic_slot.snapshot()
+        self.assertIs(snapshot["operation_succeeded"], False,
+                       "sanity check on the primitive the fix relies on")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            obj._mic_handle_slot_transition("RECOVERING", "DEGRADED", snapshot)
+        output = buf.getvalue()
+        self.assertIn("failed unexpectedly", output)
+
+
 class MasterMixerTopologyUntouchedTests(MockDuckingMixin, SimpleTestCase):
     """Item 13: the master-mixer-facing (ghost) pad and its target are
     never replaced/re-requested by any recovery step -- only the

@@ -192,6 +192,35 @@ class SlotCoordinatorCoreTests(SimpleTestCase):
         slot = ar.SlotCoordinator("mic")
         self.assertEqual(slot.request_recovery(lambda: True), "ignored_ok")
 
+    def test_snapshot_operation_succeeded_none_before_any_operation(self):
+        """[P0] 1.3B4: operation_succeeded is None until an operation has
+        actually resolved -- no operation dispatched yet."""
+        slot = ar.SlotCoordinator("mic")
+        self.assertIsNone(slot.snapshot()["operation_succeeded"])
+
+    def test_snapshot_operation_succeeded_true_after_success_and_survives_mark_degraded(self):
+        """[P0] 1.3B4: this is the exact primitive the diagnostic-message
+        fix relies on -- operation_succeeded must still read True even
+        after a SUBSEQUENT mark_degraded() call, since mark_degraded()
+        deliberately never touches self._op (see its own docstring)."""
+        slot = ar.SlotCoordinator("mic")
+        slot.mark_degraded()
+        slot.request_recovery(lambda: True)
+        self.assertTrue(self._wait_until(lambda: slot.snapshot()["operation_succeeded"] is True))
+        # The exact sequence _mic_handle_slot_transition's OK-branch
+        # performs: re-degrade immediately after a successful quiesce.
+        slot.mark_degraded()
+        self.assertEqual(slot.state, ar.SlotState.DEGRADED)
+        self.assertTrue(slot.snapshot()["operation_succeeded"],
+                         "operation_succeeded must still reflect the last RESOLVED "
+                         "operation's true outcome (success) after a deliberate re-degrade")
+
+    def test_snapshot_operation_succeeded_false_after_genuine_failure(self):
+        slot = ar.SlotCoordinator("mic")
+        slot.mark_degraded()
+        slot.request_recovery(lambda: False)
+        self.assertTrue(self._wait_until(lambda: slot.snapshot()["operation_succeeded"] is False))
+
     def test_successful_worker_transitions_to_ok(self):
         slot = ar.SlotCoordinator("mic")
         slot.mark_degraded()
