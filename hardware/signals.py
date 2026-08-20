@@ -30,10 +30,33 @@ def _write_engine_command(payload):
 
 
 @receiver(post_save, sender=AudioOutput)
-def reload_engine_on_studio_monitor_change(sender, instance, **kwargs):
-    # Only the Studio Monitor row currently drives engine output.
-    # Other named outputs (cue, headphones, ...) will need their own
-    # reload commands as they get wired.
-    if instance.name != "Studio Monitor":
-        return
-    _write_engine_command({"command": "reload_audio_output"})
+def reload_engine_on_audio_output_change(sender, instance, **kwargs):
+    # [P0] 1.3C -- every AudioOutput row now needs SOME live-reload
+    # signal, not just Studio Monitor: device_identity_kind/
+    # device_identity (the automatic-recovery fields) live in the
+    # running engine's OutputRecoverySlot objects, refreshed only when
+    # asked -- without this, enabling "Automatic Recovery" in the admin
+    # would silently do nothing until the next full engine restart.
+    #
+    # engine_cmd.json is a single-slot channel (see _write_engine_command
+    # below/_check_commands) -- writing two commands for one save would
+    # just have the second overwrite the first before the engine ever
+    # reads it -- so exactly one is written per save, not two:
+    #
+    #   Studio Monitor: "reload_audio_output" (the pre-existing device-
+    #     swap command) now ALSO refreshes every slot's recovery-identity
+    #     fields as part of the same command -- see engine.py's
+    #     _check_commands handler / _reload_output_recovery_identity.
+    #     Still the only named output with a live `device`-path swap at
+    #     all (see _apply_audio_output_device's own docstring for why).
+    #
+    #   Every other named output (Stereotool Input today; any future
+    #     output row): "reload_audio_output_recovery_config" -- refreshes
+    #     recovery-identity fields only. A `device` (raw path) edit on
+    #     one of these rows still requires a restart, unchanged from
+    #     before this phase -- there is no live device-swap path for
+    #     them at all, identity is the only thing now reloadable live.
+    if instance.name == "Studio Monitor":
+        _write_engine_command({"command": "reload_audio_output"})
+    else:
+        _write_engine_command({"command": "reload_audio_output_recovery_config"})

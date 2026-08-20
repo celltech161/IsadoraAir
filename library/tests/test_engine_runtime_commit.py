@@ -42,6 +42,11 @@ def make_minimal_stand_in():
     # returns None immediately in that case, same as every other mic_*
     # field's "not configured" value above).
     obj._mic_slot = None
+    # [P0] 1.3C: _write_state()'s output_recovery field reads
+    # _output_slots; {} here matches "no output slots configured"
+    # (_output_recovery_state() returns {} immediately in that case,
+    # same shape as _mic_slot's "not configured" None above).
+    obj._output_slots = {}
     obj.manual_mode = False
     obj._manual_from_mic = False
     obj.remote_dj_tee = None

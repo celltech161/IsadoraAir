@@ -54,6 +54,25 @@ STUDIO_MONITOR_FALLBACK_DEVICE = "plughw:2,0"
 # branch simply isn't built at all (see _build_main_pipeline).
 STEREOTOOL_OUTPUT_NAME = "Stereotool Input"
 
+# [P0] 1.3C -- audio OUTPUT device hotplug recovery. Health rule proven
+# empirically against real hardware (scratchpad/audio_output_recovery/
+# round6_physical_usb_validation/, see ROUND7_DECISION_REPORT.md) --
+# PLAYING held continuously for OUTPUT_HEALTH_STABILIZATION_S, THEN
+# (valve opened for verification) GstBaseSink stats()["rendered"] must
+# actually increase within OUTPUT_RENDER_VERIFY_DEADLINE_S, or the
+# attempt is reported as failed and the valve closes again. Mirrors
+# [P0] 1.3B2's locked mic-recovery health rule shape (PLAYING >= 500ms
+# AND fresh buffer <= 250ms), re-derived independently for output
+# because GstBaseSink's own rendered-count stat is a more direct
+# render-side signal than the mic path's buffer-probe-timestamp
+# approach -- see Round 6's SUMMARY.md for why PLAYING alone was
+# proven NOT sufficient (a real UCA222 rebuild reached PLAYING via
+# sync_state_with_parent() while genuinely stuck on a preroll wait).
+OUTPUT_HEALTH_STABILIZATION_S = 0.5
+OUTPUT_HEALTH_CHECK_DEADLINE_S = 5.0  # generous grace for a real device -- Round 6's real rebuilds took well under this
+OUTPUT_RENDER_VERIFY_DEADLINE_S = 2.0  # bounded window, valve open, waiting for stats()["rendered"] to actually increase
+OUTPUT_RECOVERY_SLOT_TIMEOUT_S = 15.0  # matches mic's own SlotCoordinator timeout_s
+
 # Studio mic input, mixed in via a second (master) mixer downstream of
 # the deck mixer -- see _build_main_pipeline's duck_gain/master_mixer
 # split. No fallback device, same reasoning as StereoTool: if unset, the
@@ -257,6 +276,22 @@ def _glib_safe(default_return=True):
     return decorator
 
 
+def _output_sink_rendered_count(sink):
+    """[P0] 1.3C -- non-blocking property read, safe to call from any
+    thread (GstBaseSink's `stats` GstStructure, confirmed via
+    gst-inspect-1.0 alsasink and read back exactly this way in Round 6's
+    physical validation -- get_uint64() returns (bool, value), not a
+    bare value). None if the sink has no usable stats (shouldn't happen
+    for a real alsasink, but this is used inside a background worker
+    where a defensive None is much better than an uncaught exception)."""
+    try:
+        stats = sink.get_property("stats")
+        ok, val = stats.get_uint64("rendered")
+        return val if ok else None
+    except Exception:
+        return None
+
+
 # Number of concurrent remote-DJ slots the pipeline is built to
 # support. Hardcoded to 1 today; the audio-path structure (per-slot
 # persistent selector + silence source + gate + gain + master_mixer
@@ -266,6 +301,90 @@ def _glib_safe(default_return=True):
 # build the slots but only one WebRTC session can be active at a time
 # with the current signaling protocol.
 MAX_DJ_SLOTS = 1
+
+
+class OutputRecoverySlot:
+    """[P0] 1.3C -- one independent recovery boundary per physical audio
+    output (Studio Monitor, Stereotool Input). Mirrors the mic-recovery
+    design's split between a PERSISTENT boundary (queue, errorignore,
+    valve -- never rebuilt) and a REPLACEABLE hardware generation (just
+    the alsasink, rebuilt on every recovery attempt) -- see
+    library/services/audio_recovery.py's SlotCoordinator and
+    PlaybackEngine's mic-recovery methods (_build_mic_hw_generation /
+    _mic_quiesce_current_generation / _mic_dispatch_rebuild) for the
+    proven precedent this reuses.
+
+    A flat-attribute style (like PlaybackEngine's self._mic_* fields)
+    doesn't fit here because there are TWO independent slots, not one --
+    this holder is deliberately thin (no logic of its own beyond
+    __init__ and the tiny device_loss_epoch accessor pair below; all
+    OTHER behavior lives in PlaybackEngine's _output_* methods), same
+    "thin data holder" precedent as RemoteDJSlot/Deck below.
+
+    device_loss_epoch + its own lock (pre-commit review finding, see
+    _output_dispatch_rebuild's docstring for the full race this closes):
+    a monotonically increasing counter, bumped on EVERY classified
+    device_lost bus error for this slot's current-or-pending generation
+    -- regardless of whether SlotCoordinator.mark_degraded() itself
+    returns True or False, i.e. even a COALESCED repeat still bumps it.
+    Read from a rebuild worker's background thread, written from the
+    GLib thread's bus-error handler -- given its own small lock rather
+    than relying on CPython's GIL to make a bare int increment/compare
+    "happen to be" safe, per the review's explicit instruction not to
+    add a new race while closing this one."""
+
+    def __init__(self, name, kind, queue, errorignore, valve, build_generation_fn,
+                 legacy_device, identity_kind, identity, current_bin, current_sink):
+        self.name = name                      # AudioOutput.name, e.g. "Studio Monitor"
+        self.kind = kind                      # short slug for logging/dedupe/SlotCoordinator naming, e.g. "studio_monitor"
+        self.queue = queue                    # persistent Gst.Queue, never rebuilt
+        self.errorignore = errorignore        # persistent errorignore element, never rebuilt
+        self.valve = valve                    # persistent valve element, never rebuilt
+        self.build_generation_fn = build_generation_fn  # callable(device) -> (Gst.Bin, alsasink)
+        self.coordinator = audio_recovery.SlotCoordinator(f"output-{kind}", timeout_s=OUTPUT_RECOVERY_SLOT_TIMEOUT_S)
+        self.legacy_device = legacy_device    # raw AudioOutput.device string (with Studio Monitor's fallback already applied)
+        self.identity_kind = identity_kind
+        self.identity = identity
+        self.current_bin = current_bin        # current hardware-generation Gst.Bin (ghost "sink" pad)
+        self.current_sink = current_sink      # current alsasink element -- for property reapplication + stats
+        self.pending_bin = None               # a rebuild attempt not yet promoted (or None)
+        self.pending_sink = None
+        self.pending_validation_epoch = None  # device_loss_epoch() at the moment THIS candidate's rebuild was dispatched --
+        # a SECOND pre-commit review finding: the worker's own final epoch check (see
+        # _output_dispatch_rebuild) closes the race for anything that happens WHILE the worker is
+        # still running, but there is a further, narrower TOCTOU window between the worker
+        # returning True and SlotCoordinator's own runner() actually transitioning state to OK
+        # (a real, if small, gap -- both happen on the worker's background thread, but not
+        # atomically with each other or with the GLib thread's own locking), plus the further gap
+        # until _output_recovery_tick's next ~300ms poll notices that transition at all. This
+        # field is what the SEPARATE, later check in _output_handle_slot_transition's OK-branch
+        # compares device_loss_epoch() against, immediately before promoting -- see that method's
+        # own comment for why re-checking there (not just inside the worker) is what actually
+        # closes this narrower window.
+        self.last_observed_slot_state = self.coordinator.state.value
+        self.recovery_attempt = 0
+        self.next_retry_at = None             # monotonic seconds
+        self.device_present = None            # observability only; None = unknown/not probed yet
+        self.last_error = None
+        self.last_state_change_at = None
+        self._device_loss_epoch = 0
+        self._device_loss_epoch_lock = threading.Lock()
+
+    def record_device_loss(self):
+        """Called from _on_output_error for EVERY classified device_lost
+        error belonging to this slot, before checking mark_degraded()'s
+        return value -- a coalesced repeat still needs to bump this."""
+        with self._device_loss_epoch_lock:
+            self._device_loss_epoch += 1
+            return self._device_loss_epoch
+
+    def device_loss_epoch(self):
+        """Thread-safe read -- called both from the GLib thread (to
+        capture the starting epoch at dispatch time) and from a rebuild
+        worker's background thread (to check whether a NEW device-loss
+        arrived since)."""
+        with self._device_loss_epoch_lock:
+            return self._device_loss_epoch
 
 
 class RemoteDJSlot:
@@ -407,11 +526,20 @@ class PlaybackEngine:
         Gst.init(None)
         self.loop = GLib.MainLoop()
         self.mixer = None
-        self.alsasink = None
         self.agc_dynamic = None
         self.agc_makeup = None
         self.agc_limiter = None
-        self.stereotool_sink = None
+        # [P0] 1.3C -- output hotplug recovery. Studio Monitor's and
+        # Stereotool Input's alsasinks are no longer static self.alsasink/
+        # self.stereotool_sink attributes -- each now lives inside its own
+        # OutputRecoverySlot (built in _build_main_pipeline), reachable at
+        # self._studio_monitor_slot.current_sink /
+        # self._stereotool_slot.current_sink (the latter None if
+        # StereoTool isn't configured). self._output_slots is the same
+        # two slots keyed by `kind`, for the tick methods to iterate.
+        self._studio_monitor_slot = None
+        self._stereotool_slot = None
+        self._output_slots = {}
         self.duck_gain = None
         self.master_mixer = None
         self.mic_ptt_valve = None
@@ -542,6 +670,17 @@ class PlaybackEngine:
         # phase, see the 1.3B2 report).
         GLib.timeout_add(300, self._mic_recovery_tick)
         GLib.timeout_add_seconds(2, self._mic_presence_probe_tick)
+
+        # [P0] 1.3C -- output hotplug recovery. Same two-timer shape as
+        # mic above, but ONE fast/slow tick pair services BOTH output
+        # slots (Studio Monitor always exists; Stereotool Input only if
+        # configured) -- each slot keeps its own independent
+        # SlotCoordinator/backoff state, only the GLib timer itself is
+        # shared. No-ops (return True immediately) if self._output_slots
+        # is empty, which shouldn't happen in practice since Studio
+        # Monitor's slot is always built.
+        GLib.timeout_add(300, self._output_recovery_tick)
+        GLib.timeout_add_seconds(2, self._output_presence_probe_tick)
 
         if RemoteDJConfig.load().enabled:
             self._warm_stun_dns()
@@ -1178,17 +1317,53 @@ class PlaybackEngine:
     def _on_main_bus_error(self, bus, message):
         # self.main_pipeline's bus isn't watched for anything else today
         # (deck errors go through each deck's own dedicated Gst.Pipeline
-        # bus instead) -- filter to only react to errors that originate
-        # inside the mic bin, so this doesn't swallow/mishandle unrelated
-        # pipeline errors.
-        if self._mic_bin is None:
-            return True
+        # bus instead, Remote DJ/FX/VT errors have their own dedicated
+        # paths -- see _on_dj_bus_msg/_fx_*/_vt_*, none of which route
+        # through here) -- filter to only react to errors that originate
+        # inside the mic bin or an output recovery slot, walking up the
+        # parent chain for an EXACT match against a known element, never
+        # a heuristic/substring match, so this can't misclassify an
+        # unrelated pipeline error.
+        #
+        # [P0] 1.3C: previously this whole handler was only CONNECTED at
+        # all when a mic was configured (see _build_main_pipeline) -- a
+        # real limitation: output recovery needs this router regardless,
+        # and even mic-only setups now go through the same unconditional
+        # connect. Checked mic first (existing precedent, unchanged
+        # logic), output slots second.
+        if self._mic_bin is not None:
+            obj = message.src
+            while obj is not None:
+                if obj == self._mic_bin:
+                    return self._on_mic_error(bus, message)
+                obj = obj.get_parent()
+        for slot in self._output_slots.values():
+            if self._output_slot_owns_message_src(slot, message):
+                return self._on_output_error(slot, bus, message)
+        return True
+
+    def _output_slot_owns_message_src(self, slot, message):
+        """[P0] 1.3C -- true iff message.src is (or descends from) one of
+        THIS slot's own elements: the persistent queue/errorignore/valve,
+        the CURRENT hardware generation, or a PENDING (being-verified)
+        generation. Reads slot.current_bin/slot.pending_bin fresh on
+        every call (not a captured snapshot) so a stale/late message from
+        an ALREADY-detached, already-replaced old generation never
+        matches -- once a generation is unlinked+removed it's no longer
+        reachable via slot.current_bin either, so this can't accidentally
+        act on a late result from an abandoned generation (the bus-
+        routing side of the same invariant SlotCoordinator's own
+        generation-tagging already enforces on the coordinator side)."""
+        known = [slot.queue, slot.errorignore, slot.valve, slot.current_bin]
+        if slot.pending_bin is not None:
+            known.append(slot.pending_bin)
         obj = message.src
         while obj is not None:
-            if obj == self._mic_bin:
-                return self._on_mic_error(bus, message)
+            for k in known:
+                if k is not None and obj == k:
+                    return True
             obj = obj.get_parent()
-        return True
+        return False
 
     def _on_dj_bus_msg(self, bus, message):
         """Bus WARNING and INFO messages routed to the remote-DJ diag
@@ -1598,6 +1773,661 @@ class PlaybackEngine:
             "restart_required": snapshot["state"] == audio_recovery.SlotState.RESTART_REQUIRED.value,
         }
 
+    # ------------------------------------------------------------------
+    # [P0] 1.3C -- audio OUTPUT device hotplug recovery. Mirrors the
+    # mic-recovery methods above wherever the shape genuinely matches
+    # (_on_mic_error -> _on_output_error, _mic_quiesce_current_generation
+    # -> _output_quiesce_current_generation, etc.), parameterized by an
+    # OutputRecoverySlot instead of flat self._mic_* attributes since
+    # there are two independent slots (Studio Monitor, Stereotool Input),
+    # not one. See scratchpad/audio_output_recovery/
+    # ROUND7_DECISION_REPORT.md for the discovery/proof this is based on.
+    # ------------------------------------------------------------------
+
+    def _resolve_output_device_identity(self, name):
+        """Returns (identity_kind, identity) for the AudioOutput row
+        named `name` -- the stable-identity half only. The legacy/
+        fallback device string itself is still resolved by
+        _resolve_studio_monitor_device/_resolve_stereotool_device
+        (left completely unchanged) so this doesn't duplicate or risk
+        diverging from their existing fallback-device behavior; callers
+        combine the two. Mirrors _resolve_mic_identity's read/log
+        pattern exactly."""
+        try:
+            row = AudioOutput.objects.filter(name=name).values(
+                "device_identity_kind", "device_identity").first()
+        except Exception as exc:
+            print(f"  Failed to read AudioOutput identity config for '{name}' ({exc}); automatic recovery disabled")
+            return "", ""
+        if not row:
+            return "", ""
+        identity_kind = row.get("device_identity_kind") or ""
+        identity = row.get("device_identity") or ""
+        if identity_kind == "alsa_card_id" and identity:
+            print(f"  AudioOutput '{name}' automatic recovery enabled (alsa_card_id={identity!r})")
+        else:
+            print(f"  AudioOutput '{name}' has no stable device identity configured; "
+                  f"automatic rebuild-on-return disabled (containment still applies)")
+        return identity_kind, identity
+
+    def _reload_output_recovery_identity(self):
+        """[P0] 1.3C -- pre-commit review finding: an operator setting
+        device_identity_kind/device_identity in the admin for the first
+        time (enabling automatic recovery) had no live-reload path at
+        all -- self._studio_monitor_slot/self._stereotool_slot's
+        identity_kind/identity were read ONCE at _build_main_pipeline
+        time and never refreshed, so the admin would silently claim
+        "Automatic Recovery enabled" while the running engine kept
+        using the stale (usually blank) values until the next full
+        restart. This command fixes that -- see hardware/signals.py's
+        post_save handler, which now fires it on every AudioOutput
+        save, and _check_commands' "reload_audio_output"/
+        "reload_audio_output_recovery_config" handlers below.
+
+        Refreshes ONLY identity_kind/identity, for EVERY currently-
+        built output slot, straight from the DB -- deliberately does
+        NOT touch the hardware generation, the valve, or the raw legacy
+        `device` string at all, so an identity-only edit can never
+        disturb a healthy sink (the review's explicit requirement).
+        Studio Monitor's `device` string itself is still refreshed by
+        the pre-existing _apply_audio_output_device live-swap path
+        (only invoked when actually requested, i.e. when `device`
+        genuinely changed); Stereotool's `device` has no live-swap path
+        at all, unchanged from before this phase -- a device-path edit
+        there still needs a restart, only identity is live now.
+
+        Iterates every BUILT slot regardless of which specific
+        AudioOutput row was just saved (cheap, idempotent DB reads) --
+        simpler and just as correct as trying to track exactly which
+        row triggered the call. Safe to call with zero slots built
+        (e.g. before _build_main_pipeline has ever run) -- no-op."""
+        for slot in self._output_slots.values():
+            identity_kind, identity = self._resolve_output_device_identity(slot.name)
+            if (identity_kind, identity) != (slot.identity_kind, slot.identity):
+                print(f"  Output recovery identity reload ({slot.name}): "
+                      f"identity_kind {slot.identity_kind!r}->{identity_kind!r}, "
+                      f"identity {slot.identity!r}->{identity!r}")
+                slot.identity_kind = identity_kind
+                slot.identity = identity
+
+    def _build_output_containment_queue(self, name):
+        """[P0] 1.3C -- persistent, leaky-upstream queue for one
+        physical-output branch off stereotool_tee (or directly off
+        output_level for Studio Monitor when StereoTool isn't
+        configured). Round 4's own empirical finding
+        (scratchpad/audio_output_recovery/round4_blocking_containment/):
+        a queue only GUARANTEES it can never become the thing that
+        blocks tee's shared push if it's leaky -- a bounded NON-leaky
+        queue still fills up and blocks upstream once its capacity is
+        exhausted, just with a longer runway than no queue at all,
+        which would eventually reproduce the exact sibling-stall hazard
+        this whole design exists to prevent (Round 6's real UCA222 test
+        needed a 46-SECOND device-absent window; nothing drains a
+        non-leaky queue for that long).
+
+        Leaky is safe here specifically because it costs almost
+        nothing extra: once this branch's OWN valve closes (near-
+        instant per Round 5/6), the valve absorbs everything pushed
+        into it with zero backpressure regardless of queue policy -- so
+        leaky policy mainly matters for the rarer "hangs without ever
+        erroring, valve never closes automatically" case Round 4
+        identified, where it's the ONLY thing standing between a
+        wedged branch and a stalled shared pipeline.
+
+        Unlike a naive "just match StereoTool" copy, this reasoning
+        applies EQUALLY to Studio Monitor: dropping ITS OWN queued
+        audio during ITS OWN hardware outage costs nothing beyond what
+        is already lost (nothing is being rendered to broken/absent
+        hardware either way) -- there is no real "primary output
+        deserves non-leaky" tradeoff being made here, so both branches
+        use the same policy for the same reason, not by default or
+        laziness. Same size config as the pre-1.3C stereotool_queue
+        (1s / unbounded-buffers / unbounded-bytes) -- no evidence
+        pointed at a different size being needed for either branch."""
+        queue = Gst.ElementFactory.make("queue", name)
+        queue.set_property("leaky", 1)  # upstream -- drop new buffers once full, never block the push in
+        queue.set_property("max-size-time", 1_000_000_000)  # 1s
+        queue.set_property("max-size-buffers", 0)
+        queue.set_property("max-size-bytes", 0)
+        return queue
+
+    def _build_output_errorignore(self, name):
+        """[P0] 1.3C -- explicit configuration, never relying on plugin
+        defaults (Round 1 found the defaults are ignore-error=True but
+        ALSO ignore-notnegotiated=True, which is deliberately NOT
+        wanted here -- a caps/negotiation bug is a real programming/
+        configuration problem and must stay visible/fatal, not silently
+        masked). convert-to=ok (not the default 'not-linked') -- Round
+        3's own supplementary finding: 'ok' keeps this branch's queue
+        fed at the normal rate indefinitely even while the downstream
+        generation is failing, the most predictable foundation for the
+        valve/rebuild choreography below; the default leaves the
+        branch's own queue silently starved instead."""
+        errignore = Gst.ElementFactory.make("errorignore", name)
+        errignore.set_property("ignore-error", True)
+        errignore.set_property("ignore-notnegotiated", False)
+        errignore.set_property("convert-to", 0)  # GST_FLOW_OK
+        return errignore
+
+    def _build_studio_monitor_hw_generation(self, device):
+        """[P0] 1.3C -- the REPLACEABLE hardware-facing portion of the
+        Studio Monitor output: just the alsasink, wrapped in its own
+        Gst.Bin with a ghost 'sink' pad -- mirrors
+        _build_mic_hw_generation's shape exactly. AGC (agc_dynamic/
+        agc_makeup/agc_limiter) is deliberately NOT inside this
+        generation -- it's not hardware-specific, its properties are
+        updated live by _apply_agc_config, and rebuilding it on every
+        USB fault would be unnecessary churn (see this phase's own
+        design refinement in ROUND7_DECISION_REPORT.md). No convert/
+        resample stage here, matching today's pre-1.3C direct
+        agc_limiter.link(alsasink) -- the format is already fixed
+        upstream by the shared capsfilter earlier in the chain."""
+        bin_ = Gst.Bin.new(f"studio_monitor_gen{int(time.time() * 1000)}")
+        sink = Gst.ElementFactory.make("alsasink", None)
+        sink.set_property("device", device)
+        bin_.add(sink)
+        ghost = Gst.GhostPad.new("sink", sink.get_static_pad("sink"))
+        ghost.set_active(True)
+        bin_.add_pad(ghost)
+        return bin_, sink
+
+    def _build_stereotool_hw_generation(self, device):
+        """[P0] 1.3C -- same shape as
+        _build_studio_monitor_hw_generation, but reapplies StereoTool's
+        special sink properties on EVERY generation (not just the
+        first) -- these are not defaults, they were tuned live against
+        real click/dropout symptoms (see the pre-1.3C construction
+        site's own extensive comments, unchanged reasoning, now living
+        here) and must survive every rebuild identically."""
+        bin_ = Gst.Bin.new(f"stereotool_gen{int(time.time() * 1000)}")
+        sink = Gst.ElementFactory.make("alsasink", None)
+        sink.set_property("device", device)
+        # sync=False/async=False -- without async=False, this sink's own
+        # preroll (waiting for its first buffer) can block the entire
+        # containing bin's PAUSED -> PLAYING transition if the leaky
+        # queue upstream ever drops that first buffer -- verified this
+        # stalls a real pipeline (Round 4 independently re-confirmed the
+        # identical hazard for a different sink). sync=False means it
+        # just renders buffers as they arrive rather than clock-pacing
+        # them against Studio Monitor's own hardware clock.
+        sink.set_property("sync", False)
+        sink.set_property("async", False)
+        # Enlarged ALSA ring on this sink specifically -- see the
+        # pre-1.3C construction site's history (clicks were heard on the
+        # FM output/streams downstream of StereoTool but NOT on the
+        # studio monitor, localizing the fault to this loopback-fed
+        # segment; kernel xrun counters were zero at the time, consistent
+        # with StereoTool covering brief input starves rather than
+        # surfacing an error). buffer-time=200000 (~200ms, vs. the ~43ms
+        # driver default) gives ~4.6x more runway before a scheduler
+        # stall starves the read side; latency-time=20000 keeps ALSA
+        # waking the writer roughly every 20ms. ~160ms extra one-way
+        # latency, inconsequential for a broadcast chain -- Studio
+        # Monitor's own generation is unaffected (driver default).
+        sink.set_property("buffer-time", 200000)
+        sink.set_property("latency-time", 20000)
+        bin_.add(sink)
+        ghost = Gst.GhostPad.new("sink", sink.get_static_pad("sink"))
+        ghost.set_active(True)
+        bin_.add_pad(ghost)
+        return bin_, sink
+
+    def _build_output_slot(self, name, kind, legacy_device, build_generation_fn):
+        """[P0] 1.3C -- builds one complete OutputRecoverySlot: persistent
+        queue + errorignore + valve, plus a first hardware generation
+        built synchronously here at cold start (same risk/timing profile
+        as every other device construction in this file -- a bad/absent
+        device still surfaces via the normal async bus-error path a
+        moment after PLAYING; see _build_mic_chain's own docstring for
+        the identical precedent, and this phase's own startup-behavior
+        investigation in the final report)."""
+        identity_kind, identity = self._resolve_output_device_identity(name)
+        runtime_device = audio_recovery.resolve_runtime_device(identity_kind, identity, legacy_device)
+        queue = self._build_output_containment_queue(f"{kind}_queue")
+        errignore = self._build_output_errorignore(f"{kind}_errorignore")
+        valve = Gst.ElementFactory.make("valve", f"{kind}_valve")
+        valve.set_property("drop", False)
+        bin_, sink = build_generation_fn(runtime_device)
+        return OutputRecoverySlot(
+            name=name, kind=kind, queue=queue, errorignore=errignore, valve=valve,
+            build_generation_fn=build_generation_fn,
+            legacy_device=legacy_device, identity_kind=identity_kind, identity=identity,
+            current_bin=bin_, current_sink=sink,
+        )
+
+    def _on_output_error(self, slot, bus, message):
+        """[P0] 1.3C -- mirrors _on_mic_error's structure, scoped to ONE
+        output slot. Unlike mic (which reacts by switching to silence),
+        an output branch's containment is already in place BEFORE any
+        failure via errorignore (Round 3) -- the only new action here is
+        closing THIS slot's OWN valve, which stops further buffers from
+        entering the (about to be torn down) failed generation. The
+        healthy sibling slot and the shared upstream tee/pipeline are
+        never touched (steps 5-8 of the locked device-loss sequence)."""
+        err, debug = message.parse_error()
+        print(f"  Output error ({slot.name}): {err} ({debug})")
+        slot.last_error = str(err)[:300]
+        slot.last_state_change_at = time.time()
+
+        classification = audio_recovery.classify_audio_device_error(str(err), str(debug))
+        if classification != "device_lost":
+            print(f"  Output error ({slot.name}) classified '{classification}' -- logged only, no recovery action")
+            return True
+
+        # Bump the device-loss epoch UNCONDITIONALLY, before checking
+        # mark_degraded()'s return value -- pre-commit review finding:
+        # a candidate generation being health-verified (valve open,
+        # rendered count already increasing) could still be promoted
+        # "recovered" even though a FRESH device-loss arrived mid-
+        # verification, because mark_degraded() correctly returns False
+        # for it (the slot is already RECOVERING, not OK) and the
+        # verifying worker's own success check had already latched
+        # rendered_increased=True by that point. This counter is the
+        # fix -- see _output_dispatch_rebuild's worker for the other
+        # half. Bumped even for a coalesced repeat (mark_degraded()
+        # returning False) precisely because THIS is the case that
+        # matters most: a repeat failure arriving while a rebuild is
+        # already in flight for that same generation.
+        slot.record_device_loss()
+
+        # Close the valve UNCONDITIONALLY, every time this fires -- even
+        # a coalesced repeat for the same already-degraded generation
+        # (a real unplug produced a 62-message burst within 11.6ms in
+        # Round 6's physical testing; the valve must already be shut
+        # well before the 2nd..62nd message arrives), and even a fresh
+        # error arriving from a PENDING (being health-verified)
+        # generation -- belt-and-braces: the verifying worker also
+        # closes the valve itself on a failed rendered-count check (see
+        # _output_dispatch_rebuild), but a real bus error arriving
+        # mid-verification should never rely on timing between two
+        # independent code paths to keep the valve shut.
+        slot.valve.set_property("drop", True)
+
+        first_failure = slot.coordinator.mark_degraded()
+        if not first_failure:
+            return True
+
+        print(f"  Output slot DEGRADED ({slot.name}, generation {slot.coordinator.generation})")
+        slot.recovery_attempt = 0
+        slot.next_retry_at = None
+        slot.device_present = None
+        emit_event(
+            category="hardware", level="warning", title=f"{slot.name} output lost",
+            detail={"error": slot.last_error},
+            dedupe_key=f"hardware|output-lost|{slot.kind}|gen{slot.coordinator.generation}",
+        )
+        self._output_quiesce_current_generation(slot)
+        return True
+
+    def _output_quiesce_current_generation(self, slot):
+        """[P0] 1.3C -- mirrors _mic_quiesce_current_generation exactly:
+        detach (unlink + Bin.remove) happens HERE, synchronously, on the
+        GLib thread -- proven fast/safe; only the actual
+        set_state(NULL) call against the now-orphaned bin goes through
+        the guarded background worker (the proven hang risk, per the
+        original mic-recovery investigation's own py-spy-confirmed
+        pthread_mutex_lock contention finding)."""
+        old_bin = slot.current_bin
+        valve_src = slot.valve.get_static_pad("src")
+        try:
+            old_sink_pad = old_bin.get_static_pad("sink")
+            if old_sink_pad is not None and valve_src.is_linked():
+                valve_src.unlink(old_sink_pad)
+            self.main_pipeline.remove(old_bin)
+        except Exception as exc:
+            print(f"  Output quiesce ({slot.name}): failed to detach old generation cleanly ({exc}); "
+                  f"still dispatching guarded teardown")
+
+        def worker():
+            old_bin.set_state(Gst.State.NULL)
+            # Reaching this line without hanging is the whole point --
+            # see _mic_quiesce_current_generation's identical comment.
+            return True
+
+        result = slot.coordinator.request_recovery(worker)
+        print(f"  Output quiesce dispatched ({slot.name}): {result}")
+
+    def _output_dispatch_rebuild(self, slot):
+        """[P0] 1.3C -- mirrors _mic_dispatch_rebuild's construction/
+        link-synchronous, state-change+health-wait-in-background split.
+
+        Health rule (named constants, measured against real Round 6
+        hardware evidence, not assumed): the fresh generation must reach
+        PLAYING and hold it for OUTPUT_HEALTH_STABILIZATION_S, AND (once
+        the valve is reopened for verification) GstBaseSink
+        stats()["rendered"] must actually increase within
+        OUTPUT_RENDER_VERIFY_DEADLINE_S -- PLAYING alone is not proof,
+        matching the locked mic-recovery precedent (and directly
+        motivated by Round 6's own physical finding: a real UCA222
+        rebuild reached PLAYING via sync_state_with_parent() while
+        genuinely stuck on a preroll wait).
+
+        Valve choreography (the exact ordering proven in Round 5/6, now
+        formalized as a hard gate rather than just observed after the
+        fact): the valve stays CLOSED while only the state-based check
+        has passed, opens ONLY once PLAYING has stabilized, and -- if
+        rendering doesn't materialize within the verification window --
+        closes again and this attempt is reported as failed (never left
+        half-open), before the next presence-probe-triggered attempt
+        discards it and tries a genuinely fresh generation. All of this
+        runs on the worker's own background thread -- property sets and
+        get_state(0)/stats reads are safe from any thread, only a real
+        hardware set_state() call is the proven hazard being kept off
+        the GLib thread.
+
+        Pre-commit review finding, fixed here: PLAYING-hold + rendered-
+        count-increase alone are NOT sufficient to declare success --
+        a device_lost error can arrive for THIS generation after
+        rendered_increased already latched True but before the worker
+        formally returns, and since SlotCoordinator.mark_degraded()
+        correctly returns False for that (the slot is already
+        RECOVERING, not OK -- see _on_output_error), nothing would
+        otherwise stop this worker from still returning True and
+        getting promoted "recovered" moments after a fresh real failure.
+        slot.device_loss_epoch() is captured HERE, before dispatch, and
+        checked again immediately before the worker returns True -- if
+        it changed, a device-loss happened somewhere in this whole
+        window (state-check, valve-open, or render-verify) and this
+        attempt must fail, valve closed, no promotion, matching the
+        locked health requirement's third clause exactly.
+
+        SECOND pre-commit review finding, also fixed here: the worker's
+        own check above closes the race for anything happening WHILE
+        the worker is still running, but there is a further, narrower
+        TOCTOU window between the worker returning True and
+        SlotCoordinator's runner() actually flipping state to OK (not
+        atomic with the GLib thread's own locking), plus the gap until
+        _output_recovery_tick's next ~300ms poll notices that
+        transition at all. The SAME captured epoch value is stashed on
+        slot.pending_validation_epoch (persistent, since the SECOND
+        check lives in a different method, _output_handle_slot_
+        transition, invoked later/elsewhere) -- see that method's OK-
+        branch for the promotion-time re-check that closes this
+        narrower window without needing to touch SlotCoordinator at all."""
+        runtime_device = audio_recovery.resolve_runtime_device(slot.identity_kind, slot.identity, slot.legacy_device)
+        if not runtime_device:
+            return
+        failure_epoch_at_start = slot.device_loss_epoch()
+        new_bin, new_sink = slot.build_generation_fn(runtime_device)
+        self.main_pipeline.add(new_bin)
+        slot.valve.get_static_pad("src").link(new_bin.get_static_pad("sink"))
+        slot.pending_bin = new_bin
+        slot.pending_sink = new_sink
+        slot.pending_validation_epoch = failure_epoch_at_start
+
+        def worker():
+            if not new_bin.sync_state_with_parent():
+                return False
+            playing_since = None
+            deadline = time.monotonic() + OUTPUT_HEALTH_CHECK_DEADLINE_S
+            while time.monotonic() < deadline:
+                _, st, _ = new_bin.get_state(0)
+                if st == Gst.State.PLAYING:
+                    if playing_since is None:
+                        playing_since = time.monotonic()
+                    elif time.monotonic() - playing_since >= OUTPUT_HEALTH_STABILIZATION_S:
+                        break
+                else:
+                    playing_since = None
+                time.sleep(0.05)
+            if playing_since is None or (time.monotonic() - playing_since) < OUTPUT_HEALTH_STABILIZATION_S:
+                return False
+
+            # State-only check passed. Open the valve to let real
+            # buffers actually reach this generation -- required to
+            # prove rendering at all -- then verify, then close again
+            # on failure so a bad generation is never left half-promoted.
+            rendered_before = _output_sink_rendered_count(new_sink)
+            slot.valve.set_property("drop", False)
+            verify_deadline = time.monotonic() + OUTPUT_RENDER_VERIFY_DEADLINE_S
+            rendered_increased = False
+            while time.monotonic() < verify_deadline:
+                rendered_now = _output_sink_rendered_count(new_sink)
+                if rendered_before is not None and rendered_now is not None and rendered_now > rendered_before:
+                    rendered_increased = True
+                    break
+                # Bail out early the moment a fresh device-loss is
+                # observed, rather than waiting out the rest of the
+                # verify window -- purely a responsiveness optimization,
+                # the authoritative gate is the check right before
+                # returning True below regardless.
+                if slot.device_loss_epoch() != failure_epoch_at_start:
+                    break
+                time.sleep(0.05)
+            if not rendered_increased:
+                slot.valve.set_property("drop", True)
+                return False
+
+            # Authoritative epoch gate -- checked AGAIN here, right
+            # before declaring success, even though rendered_increased
+            # is already True. A device-loss landing in the narrow
+            # window between the render-verify loop's last check and
+            # this line is exactly the race this whole mechanism exists
+            # to close.
+            if slot.device_loss_epoch() != failure_epoch_at_start:
+                slot.valve.set_property("drop", True)
+                return False
+            return True
+
+        result = slot.coordinator.request_recovery(worker)
+        print(f"  Output rebuild dispatched ({slot.name}, generation {slot.coordinator.generation}): {result}")
+
+    def _output_discard_pending_bin(self, slot, abandoned=False):
+        """[P0] 1.3C -- mirrors _mic_discard_pending_hw_bin exactly,
+        including the abandonment split (detach always safe/synchronous;
+        the NULL state-change is guarded UNLESS abandoned, in which case
+        the bin is never touched again at all -- same still-open
+        question this codebase already declines to resolve for mic:
+        can a fresh element safely reopen the same device while an old,
+        abandoned close() may still hold it? Untested, not assumed
+        true)."""
+        bin_obj = slot.pending_bin
+        slot.pending_bin = None
+        slot.pending_sink = None
+        slot.pending_validation_epoch = None
+        if bin_obj is None:
+            return
+        try:
+            sink_pad = bin_obj.get_static_pad("sink")
+            valve_src = slot.valve.get_static_pad("src")
+            if sink_pad is not None and valve_src.is_linked():
+                valve_src.unlink(sink_pad)
+            self.main_pipeline.remove(bin_obj)
+        except Exception as exc:
+            print(f"  Output discard-pending ({slot.name}): failed to detach cleanly ({exc})")
+        if not abandoned:
+            def worker():
+                bin_obj.set_state(Gst.State.NULL)
+                return True
+
+            result = slot.coordinator.request_recovery(worker)
+            print(f"  Output discard-pending NULL dispatched ({slot.name}): {result}")
+
+    def _output_handle_slot_transition(self, slot, old_state, new_state, snapshot):
+        """[P0] 1.3C -- mirrors _mic_handle_slot_transition exactly,
+        including the [P0] 1.3B4 operation_succeeded-gated diagnostic
+        fix (distinguishing a deliberate re-degrade-after-successful-
+        quiesce from a genuine worker failure).
+
+        SECOND pre-commit review finding, fixed here: the worker's own
+        epoch check (see _output_dispatch_rebuild) closes the race for
+        anything that happens WHILE the worker is still running, but
+        NOT the narrower TOCTOU window between the worker returning
+        True and this method actually running to process the
+        resulting OK transition (SlotCoordinator's own runner()
+        flipping state to OK is not atomic with a concurrent GLib-
+        thread bus-error handler's locking, and this method itself
+        only runs on _output_recovery_tick's ~300ms poll, not
+        instantly). A device-loss landing in EITHER sub-window bumps
+        slot.device_loss_epoch() while the coordinator was still
+        RECOVERING -- correctly coalesced there (SlotCoordinator's own
+        unmodified contract), and therefore invisible to it -- so this
+        promotion-time re-check, immediately below, is the only place
+        left that can still catch it before pending_bin is promoted."""
+        SlotState = audio_recovery.SlotState
+        if new_state == SlotState.OK.value:
+            if slot.pending_bin is not None:
+                current_epoch = slot.device_loss_epoch()
+                if current_epoch != slot.pending_validation_epoch:
+                    # A device-loss arrived after the worker's own final
+                    # check passed but before this promotion-time check
+                    # ran -- do NOT promote. The coordinator has already
+                    # reached OK (that's why we're in this branch at
+                    # all), so mark_degraded() is guaranteed to succeed
+                    # here (unlike the worker-side attempt at the same
+                    # notification, which was correctly coalesced while
+                    # still RECOVERING) -- this is what actually performs
+                    # the OK -> DEGRADED transition for that missed
+                    # notification, deterministically, rather than
+                    # depending on a bus-error handler having won a race
+                    # for SlotCoordinator's own lock. The failed
+                    # candidate is discarded via the SAME bounded
+                    # machinery the ordinary "rebuild failed health
+                    # verification" DEGRADED-branch below already uses --
+                    # correctly scoped to slot.pending_bin (the actual
+                    # failed candidate), not slot.current_bin (whatever
+                    # stale/already-detached reference that still holds
+                    # until a promotion actually happens).
+                    print(f"  Output ({slot.name}) device-loss detected between worker success and "
+                          f"promotion (epoch {slot.pending_validation_epoch} -> {current_epoch}); "
+                          f"discarding candidate, not promoting")
+                    slot.valve.set_property("drop", True)
+                    slot.coordinator.mark_degraded()
+                    self._output_discard_pending_bin(slot, abandoned=False)
+                    return
+                # A REBUILD attempt succeeded -- state-change, PLAYING-
+                # hold, valve-reopen, AND rendered-count verification all
+                # already happened and passed inside the worker itself
+                # (see _output_dispatch_rebuild); the valve is already
+                # open. Promotion here is pure bookkeeping.
+                slot.current_bin = slot.pending_bin
+                slot.current_sink = slot.pending_sink
+                slot.pending_bin = None
+                slot.pending_sink = None
+                slot.pending_validation_epoch = None
+                slot.recovery_attempt = 0
+                slot.next_retry_at = None
+                slot.device_present = True
+                print(f"  Output recovered ({slot.name}, generation {snapshot['generation']}) -- "
+                      f"device rendering again")
+                emit_event(
+                    category="hardware", level="info", title=f"{slot.name} output recovered",
+                    detail={"generation": snapshot["generation"]},
+                    dedupe_key=f"hardware|output-recovered|{slot.kind}|gen{snapshot['generation']}",
+                )
+            else:
+                # A QUIESCE succeeded (old generation torn down cleanly).
+                # SlotCoordinator's own OK here means only "that
+                # operation finished" -- nothing is rendering yet. Re-
+                # mark DEGRADED immediately so presence-probing continues
+                # to gate a rebuild attempt.
+                print(f"  Output ({slot.name}) old generation quiesced cleanly; waiting for device to return")
+                slot.coordinator.mark_degraded()
+        elif new_state == SlotState.DEGRADED.value:
+            if slot.pending_bin is not None:
+                print(f"  Output ({slot.name}) rebuild attempt failed health verification; will retry after backoff")
+                self._output_discard_pending_bin(slot, abandoned=False)
+            elif snapshot.get("operation_succeeded") is False:
+                print(f"  Output ({slot.name}) quiesce operation failed unexpectedly; "
+                      f"old generation reference abandoned, continuing")
+        elif new_state == SlotState.RESTART_REQUIRED.value:
+            if slot.pending_bin is not None:
+                self._output_discard_pending_bin(slot, abandoned=True)
+            print(f"  Output slot RESTART_REQUIRED ({slot.name}) -- a background hardware-state "
+                  f"operation was abandoned; no further automatic rebuild attempts for this process lifetime")
+            emit_event(
+                category="hardware", level="error", title=f"{slot.name} output recovery abandoned",
+                detail={
+                    "generation": snapshot["generation"],
+                    "note": "A background hardware-state operation did not complete within its "
+                            "timeout and was abandoned. Automatic retry has stopped for this slot; "
+                            "an engine restart is the only way to fully reclaim it.",
+                },
+                dedupe_key=f"hardware|output-restart-required|{slot.kind}|gen{snapshot['generation']}",
+            )
+
+    @_glib_safe(default_return=True)
+    def _output_recovery_tick(self):
+        """GLib timer, ~300ms -- non-blocking. One tick services BOTH
+        output slots; each keeps its own independent SlotCoordinator/
+        backoff state. See _mic_recovery_tick's identical docstring for
+        why this never touches GStreamer/Django state from inside a
+        background worker thread, only from here on the GLib thread."""
+        if not self.running:
+            return True
+        for slot in self._output_slots.values():
+            slot.coordinator.tick()
+            snapshot = slot.coordinator.snapshot()
+            new_state = snapshot["state"]
+            old_state = slot.last_observed_slot_state
+            if new_state != old_state:
+                self._output_handle_slot_transition(slot, old_state, new_state, snapshot)
+                slot.last_observed_slot_state = new_state
+        return True
+
+    @_glib_safe(default_return=True)
+    def _output_presence_probe_tick(self):
+        """GLib timer, ~2s -- non-blocking (a plain /proc/asound/cards
+        read per tick, shared across both slots -- see
+        _mic_presence_probe_tick's identical docstring for why this is
+        the deliberately-chosen fallback-probe cadence). Only acts on a
+        slot that's DEGRADED with a stable identity configured and no
+        operation in flight; blank identity means containment still
+        applies but automatic rebuild-on-return never fires -- a raw
+        numeric plughw:N,M path is not safe to retry against after a
+        replug may have re-enumerated it at a different index."""
+        if not self.running or not self._output_slots:
+            return True
+        cards = audio_recovery.read_alsa_cards_present()
+        for slot in self._output_slots.values():
+            if slot.identity_kind != "alsa_card_id" or not slot.identity:
+                continue
+            if slot.coordinator.state != audio_recovery.SlotState.DEGRADED:
+                continue
+            present = audio_recovery.alsa_card_identity_present(slot.identity, cards)
+            slot.device_present = present
+            if not present:
+                continue
+            now = time.monotonic()
+            if slot.next_retry_at is not None and now < slot.next_retry_at:
+                continue
+            slot.recovery_attempt += 1
+            slot.next_retry_at = now + audio_recovery.compute_backoff_seconds(slot.recovery_attempt)
+            self._output_dispatch_rebuild(slot)
+        return True
+
+    def _output_recovery_state(self):
+        """[P0] 1.3C -- engine_state.json's output_recovery block, keyed
+        by slot kind ("studio_monitor"/"stereotool"). {} if no output
+        slots exist at all (shouldn't happen in practice -- Studio
+        Monitor's slot is always built -- but matches mic_recovery's own
+        defensive shape for "nothing to report")."""
+        if not self._output_slots:
+            return {}
+        out = {}
+        for slot in self._output_slots.values():
+            snapshot = slot.coordinator.snapshot()
+            next_retry_in_s = None
+            if slot.next_retry_at is not None:
+                next_retry_in_s = max(0.0, round(slot.next_retry_at - time.monotonic(), 1))
+            out[slot.kind] = {
+                "name": slot.name,
+                "state": snapshot["state"],
+                "generation": snapshot["generation"],
+                "device_present": slot.device_present,
+                "configured_device": slot.legacy_device,
+                "resolved_runtime_device": audio_recovery.resolve_runtime_device(
+                    slot.identity_kind, slot.identity, slot.legacy_device),
+                "identity_kind": slot.identity_kind,
+                "identity": slot.identity,
+                "recovery_attempt": slot.recovery_attempt,
+                "next_retry_in_s": next_retry_in_s,
+                "last_error": slot.last_error,
+                "last_state_change": slot.last_state_change_at,
+                "restart_required": snapshot["state"] == audio_recovery.SlotState.RESTART_REQUIRED.value,
+            }
+        return out
+
     def _apply_mic_gain(self):
         if self.mic_gain is None:
             return
@@ -1630,8 +2460,11 @@ class PlaybackEngine:
         # — didn't fix the clipping, and introduced a new regression: it
         # also trimmed the *outgoing* deck's tail/outro right around the
         # transition, which never happened before this change. Reverted.
-        self.alsasink = Gst.ElementFactory.make("alsasink", "output")
-        self.alsasink.set_property("device", self._resolve_studio_monitor_device())
+        # [P0] 1.3C: the studio monitor alsasink is no longer built as a
+        # static element here -- it's now the disposable hardware
+        # generation inside self._studio_monitor_slot, built further down
+        # (after agc_dynamic/agc_makeup/agc_limiter exist, since the
+        # slot's queue links to agc_dynamic) via _build_output_slot.
 
         convert = Gst.ElementFactory.make("audioconvert", "outconvert")
         resample = Gst.ElementFactory.make("audioresample", "outresample")
@@ -1676,6 +2509,20 @@ class PlaybackEngine:
         self.agc_makeup = Gst.ElementFactory.make("volume", "agc_makeup")
         self.agc_limiter = Gst.ElementFactory.make("rglimiter", "agc_limiter")
 
+        # [P0] 1.3C -- Studio Monitor's containment/recovery boundary.
+        # Built UNCONDITIONALLY (unlike StereoTool below) -- per the task
+        # design, Studio Monitor must have its own recovery boundary
+        # regardless of whether StereoTool is configured at all; recovery
+        # must never depend on having two outputs wired up. AGC
+        # (agc_dynamic/agc_makeup/agc_limiter above) stays OUTSIDE/
+        # upstream of the disposable generation -- it's not hardware-
+        # specific, it's updated live by _apply_agc_config, and rebuilding
+        # it on every USB fault would be unnecessary churn.
+        studio_monitor_device = self._resolve_studio_monitor_device()
+        self._studio_monitor_slot = self._build_output_slot(
+            STUDIO_MONITOR_NAME, "studio_monitor", studio_monitor_device,
+            self._build_studio_monitor_hw_generation)
+
         # Ducking + mic mixing: a second (master) mixer sits between the
         # deck mixer and everything downstream (format normalization,
         # StereoTool tap, AGC, Studio Monitor). Ducking the DECKS'
@@ -1718,65 +2565,36 @@ class PlaybackEngine:
             self.program_fx_mixer, self.master_mixer, convert, resample, capsfilter,
             self.program_gain, self.output_level,
             self.agc_dynamic, self.agc_makeup, self.agc_limiter,
-            self.alsasink,
+            self._studio_monitor_slot.queue, self._studio_monitor_slot.errorignore,
+            self._studio_monitor_slot.valve, self._studio_monitor_slot.current_bin,
         ]
 
         # StereoTool bridge — raw (pre-AGC) tap off the mixer, split via a
         # tee right after format normalization. Only built at all if a
         # device is actually configured; otherwise the topology is
-        # unchanged from before (capsfilter links directly to agc_dynamic).
+        # unchanged from before (capsfilter links directly to
+        # studio_monitor_slot.queue -- see the linking section below).
+        #
+        # [P0] 1.3C: this branch's queue/sink special properties (leaky
+        # policy, sync/async, buffer-time/latency-time) are unchanged
+        # from before this phase -- see _build_output_containment_queue
+        # and _build_stereotool_hw_generation for exactly the same
+        # settings/reasoning, now reapplied on EVERY generation rebuild
+        # (not just this first one) since the alsasink itself is now
+        # disposable.
         stereotool_device = self._resolve_stereotool_device()
-        self.stereotool_sink = None
         stereotool_tee = None
-        stereotool_queue = None
+        self._stereotool_slot = None
         if stereotool_device:
             stereotool_tee = Gst.ElementFactory.make("tee", "stereotool_tee")
-            stereotool_queue = Gst.ElementFactory.make("queue", "stereotool_queue")
-            # Leaky upstream (drop oldest buffered data first) so a stalled
-            # or not-yet-listening StereoTool bridge — e.g. nothing has
-            # opened the other end of the ALSA loopback pair yet — can
-            # never back up into this queue and block the tee, which would
-            # otherwise stall the shared Studio Monitor/on-air chain too.
-            # This branch only ever drops its own audio, nothing else's.
-            stereotool_queue.set_property("leaky", 1)
-            stereotool_queue.set_property("max-size-time", 1_000_000_000)  # 1s
-            stereotool_queue.set_property("max-size-buffers", 0)
-            stereotool_queue.set_property("max-size-bytes", 0)
-            self.stereotool_sink = Gst.ElementFactory.make("alsasink", "stereotool_output")
-            self.stereotool_sink.set_property("device", stereotool_device)
-            # Critical: without these, this sink's own preroll (waiting for
-            # its first buffer) can block the *entire pipeline's* PAUSED ->
-            # PLAYING transition if the leaky queue above ever drops that
-            # first buffer — verified this stalls the real pipeline (stuck
-            # ASYNC/PAUSED forever, zero audio ever reaching this sink)
-            # despite the Studio Monitor branch appearing to work fine.
-            # `async=False` means this sink doesn't hold up the pipeline's
-            # state changes waiting to preroll; `sync=False` means it just
-            # renders buffers as they arrive rather than clock-pacing them
-            # against the *other* sink's real hardware clock (Studio
-            # Monitor's card vs this ALSA loopback's virtual one).
-            self.stereotool_sink.set_property("sync", False)
-            self.stereotool_sink.set_property("async", False)
-            # Enlarged ALSA ring on this sink specifically -- the Studio
-            # Monitor sink stays at the driver default. Rationale: clicks
-            # were being heard on the FM output and on the streams (both
-            # fed downstream of StereoTool) but NOT on the studio monitor,
-            # localizing the fault to this loopback-fed segment. Kernel
-            # xrun counters were all zero at the times of audible clicks
-            # -- consistent with StereoTool covering brief input starves
-            # with its last-frame pad rather than surfacing an error.
-            # Widening the writer-side ALSA ring here from the driver
-            # default (~43 ms at the 5-period × 8.7-ms loopback default)
-            # to ~200 ms gives ~4.6x more runway before a scheduler stall
-            # on the engine's master_mixer:src thread starves the read
-            # side. latency-time=20000 keeps ~10 periods per buffer so
-            # ALSA still wakes the writer roughly every 20 ms. Cost is
-            # ~160 ms extra one-way latency between the engine and
-            # StereoTool -- inconsequential for a broadcast chain, the
-            # studio-monitor branch is unaffected.
-            self.stereotool_sink.set_property("buffer-time", 200000)
-            self.stereotool_sink.set_property("latency-time", 20000)
-            elements += [stereotool_tee, stereotool_queue, self.stereotool_sink]
+            self._stereotool_slot = self._build_output_slot(
+                STEREOTOOL_OUTPUT_NAME, "stereotool", stereotool_device,
+                self._build_stereotool_hw_generation)
+            elements += [
+                stereotool_tee,
+                self._stereotool_slot.queue, self._stereotool_slot.errorignore,
+                self._stereotool_slot.valve, self._stereotool_slot.current_bin,
+            ]
 
         # Mic input — only built if a device is actually configured;
         # otherwise self.mic_ptt_valve/self.mic_gain stay None (same
@@ -1797,13 +2615,18 @@ class PlaybackEngine:
             self.mic_gain = None
             self._mic_bin = None
         # Bus signal watch: added once so both the level-metering handler
-        # (unconditional -- output_level is always in the pipeline) and the
-        # mic error handler (only when a mic bin exists) can subscribe.
+        # (unconditional -- output_level is always in the pipeline) and
+        # the mic/output error router can subscribe.
         bus = self.main_pipeline.get_bus()
         bus.add_signal_watch()
         bus.connect("message::element", self._on_element_message)
-        if mic_elements:
-            bus.connect("message::error", self._on_main_bus_error)
+        # [P0] 1.3C: connected UNCONDITIONALLY now -- was previously
+        # gated on `if mic_elements:`, a real limitation this phase
+        # fixes (see _on_main_bus_error's own docstring). Output
+        # recovery needs this router regardless of whether a studio mic
+        # is configured at all, and the Studio Monitor slot always
+        # exists.
+        bus.connect("message::error", self._on_main_bus_error)
         # Remote-DJ diagnostic bus watchers -- see _on_dj_bus_msg. These
         # route WARN/INFO/ERROR messages originating from a currently-
         # active remote-DJ session's elements (webrtcbin included) to
@@ -1914,17 +2737,38 @@ class PlaybackEngine:
 
         capsfilter.link(self.program_gain)
         self.program_gain.link(self.output_level)
+        # [P0] 1.3C -- Studio Monitor's queue now sits where agc_dynamic
+        # used to be linked directly (see the diagram in this phase's own
+        # design doc, ROUND7_DECISION_REPORT.md item 13): AGC stays
+        # persistent/upstream of Studio Monitor's own errorignore+valve+
+        # disposable generation. StereoTool's branch is unchanged in
+        # shape (tee -> its own queue -> ... -> its own disposable
+        # generation), just with errorignore+valve now sitting between
+        # its queue and its alsasink too.
         if stereotool_tee:
             self.output_level.link(stereotool_tee)
-            stereotool_tee.link(self.agc_dynamic)
-            stereotool_tee.link(stereotool_queue)
-            stereotool_queue.link(self.stereotool_sink)
+            stereotool_tee.link(self._studio_monitor_slot.queue)
+            stereotool_tee.link(self._stereotool_slot.queue)
         else:
-            self.output_level.link(self.agc_dynamic)
+            self.output_level.link(self._studio_monitor_slot.queue)
 
+        self._studio_monitor_slot.queue.link(self.agc_dynamic)
         self.agc_dynamic.link(self.agc_makeup)
         self.agc_makeup.link(self.agc_limiter)
-        self.agc_limiter.link(self.alsasink)
+        self.agc_limiter.link(self._studio_monitor_slot.errorignore)
+        self._studio_monitor_slot.errorignore.link(self._studio_monitor_slot.valve)
+        self._studio_monitor_slot.valve.get_static_pad("src").link(
+            self._studio_monitor_slot.current_bin.get_static_pad("sink"))
+
+        if self._stereotool_slot:
+            self._stereotool_slot.queue.link(self._stereotool_slot.errorignore)
+            self._stereotool_slot.errorignore.link(self._stereotool_slot.valve)
+            self._stereotool_slot.valve.get_static_pad("src").link(
+                self._stereotool_slot.current_bin.get_static_pad("sink"))
+
+        self._output_slots = {
+            slot.kind: slot for slot in (self._studio_monitor_slot, self._stereotool_slot) if slot is not None
+        }
 
         self._apply_agc_config()
 
@@ -4169,7 +5013,21 @@ class PlaybackEngine:
                 slot = data.get("slot")
                 self._seek_deck(slot, position)
             elif cmd == "reload_audio_output":
+                # [P0] 1.3C: also refreshes every output slot's recovery-
+                # identity fields as part of the same command -- see
+                # _reload_output_recovery_identity's own docstring for
+                # why this is folded in here rather than as a second,
+                # separately-fired command (engine_cmd.json is a single-
+                # slot channel; a second _write_engine_command call from
+                # the same admin save would just overwrite this one
+                # before the engine ever reads it).
+                self._reload_output_recovery_identity()
                 self._apply_audio_output_device(self._resolve_studio_monitor_device())
+            elif cmd == "reload_audio_output_recovery_config":
+                # [P0] 1.3C -- for AudioOutput rows other than Studio
+                # Monitor (Stereotool Input today), which have no live
+                # device-swap path at all -- see hardware/signals.py.
+                self._reload_output_recovery_identity()
             elif cmd == "reload_agc_config":
                 self._apply_agc_config()
             elif cmd == "reload_current_log":
@@ -5848,21 +6706,33 @@ class PlaybackEngine:
             print("  Reload requested but no approved log for current hour")
 
     def _apply_audio_output_device(self, device):
-        """Swap the alsasink output device live. alsasink's `device`
-        property is fixed once the element is in PAUSED/PLAYING, so
-        the pipeline drops to READY for the change. Brief audio
-        dropout (~tens of ms) while the device reopens."""
-        if not self.alsasink or not self.main_pipeline:
+        """Swap the Studio Monitor alsasink's device live. alsasink's
+        `device` property is fixed once the element is in PAUSED/
+        PLAYING, so the pipeline drops to READY for the change. Brief
+        audio dropout (~tens of ms) while the device reopens.
+
+        [P0] 1.3C: retargeted at the Studio Monitor output slot's
+        CURRENT generation's sink (was a static self.alsasink before
+        this phase). Deliberately kept as the SAME whole-main_pipeline
+        READY/PLAYING cycle as before -- not rebuilt to go through the
+        new valve/SlotCoordinator machinery -- since this is an
+        operator-requested device change via the admin (see
+        hardware/signals.py's post_save handler), not a fault; the
+        existing blast radius here is already accepted/documented
+        behavior, unrelated to hotplug recovery."""
+        if not self._studio_monitor_slot or not self.main_pipeline:
             return False
+        sink = self._studio_monitor_slot.current_sink
         try:
-            current = self.alsasink.get_property("device")
+            current = sink.get_property("device")
         except Exception:
             current = None
         if current == device:
             return False
-        print(f"  Switching alsasink device {current} -> {device}")
+        print(f"  Switching Studio Monitor alsasink device {current} -> {device}")
         self.main_pipeline.set_state(Gst.State.READY)
-        self.alsasink.set_property("device", device)
+        sink.set_property("device", device)
+        self._studio_monitor_slot.legacy_device = device  # keep the slot's own bookkeeping in sync
         self.main_pipeline.set_state(Gst.State.PLAYING)
         return True
 
@@ -6565,6 +7435,11 @@ class PlaybackEngine:
                 # None throughout when no mic is configured at all
                 # (self._mic_slot stays None -- see _build_mic_chain).
                 "mic_recovery": self._mic_recovery_state(),
+                # [P0] 1.3C -- output hotplug recovery observability,
+                # keyed by slot kind ("studio_monitor"/"stereotool"). {}
+                # if no output slots exist at all (shouldn't happen --
+                # Studio Monitor's slot is always built).
+                "output_recovery": self._output_recovery_state(),
                 "manual_mode": self.manual_mode,
                 "manual_from_mic": self._manual_from_mic,
                 # Same "configured vs. live" distinction as the mic fields

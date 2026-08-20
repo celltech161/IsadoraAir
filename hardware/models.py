@@ -114,6 +114,37 @@ class AudioOutput(models.Model):
                    "meant to be hand-edited as raw JSON.",
     )
 
+    # [P0] 1.3C -- additive, rollback-safe stable-device-identity fields,
+    # same shape/semantics as AudioInput.device_identity_kind/device_identity
+    # (see that model's own comment for the full rationale -- unchanged
+    # here). `device` above is left completely untouched and is still
+    # what's actually used if these are blank -- existing rows and every
+    # other consumer of AudioOutput.device are unaffected. Only automatic
+    # hotplug recovery (library/services/audio_recovery.py's
+    # resolve_runtime_device, reused unmodified from the AudioInput work)
+    # prefers these when device_identity_kind is set. See
+    # scratchpad/audio_output_recovery/ROUND7_DECISION_REPORT.md for the
+    # discovery/proof this implementation is based on.
+    DEVICE_IDENTITY_KIND_CHOICES = [
+        ("", "Legacy (raw device path only, no automatic recovery)"),
+        ("alsa_card_id", "ALSA card ID (stable across re-enumeration)"),
+    ]
+    device_identity_kind = models.CharField(
+        max_length=32, blank=True, default="", choices=DEVICE_IDENTITY_KIND_CHOICES,
+        help_text="How to identify this hardware across a hotplug event. Leave blank "
+                   "to keep today's behavior (no automatic recovery on device loss, "
+                   "though a lost/blocked output still can't poison a sibling output's "
+                   "audio -- see engine.py's [P0] 1.3C containment). 'ALSA card ID' "
+                   "additionally enables automatic rebuild-on-return for this output.",
+    )
+    device_identity = models.CharField(
+        max_length=64, blank=True, default="",
+        help_text="The stable identity value for the chosen kind above -- for 'ALSA "
+                   "card ID', the short id shown in brackets by `cat /proc/asound/cards` "
+                   "(e.g. 'PCH', 'CODEC'), NOT the numeric index. Ignored if "
+                   "device_identity_kind is blank.",
+    )
+
     class Meta:
         ordering = ["sort_order", "name"]
         verbose_name = "Audio Output"

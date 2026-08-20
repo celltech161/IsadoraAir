@@ -290,7 +290,34 @@ class AudioOutputAdmin(_DeviceFieldAdmin):
     _enumerate = staticmethod(list_output_devices)
 
     def get_fieldsets(self, request, obj=None):
-        fieldsets = [(None, {"fields": ["name", "device", "sort_order"]})]
+        fieldsets = [
+            (None, {"fields": ["name", "device", "sort_order"]}),
+            # [P0] 1.3C -- automatic hotplug recovery only activates for
+            # this output once a stable identity is set here; blank keeps
+            # today's behavior (no automatic rebuild-on-return), but
+            # containment (a lost/blocked output can't stall a sibling
+            # output) applies regardless -- see
+            # library/services/engine.py's OutputRecoverySlot machinery.
+            # Shown for every AudioOutput row, same as AudioInput's
+            # equivalent section, not just Studio Monitor/Stereotool
+            # Input -- mirrors AudioInputAdmin exactly.
+            ("Automatic Recovery (device identity)", {
+                "fields": ["device_identity_kind", "device_identity"],
+                "description": "Optional. A raw device path like 'plughw:2,0' can "
+                                "point at a different physical card after a "
+                                "hotplug re-enumeration, so automatic rebuild-on-"
+                                "return is disabled unless a stable identity is set "
+                                "here. Run `cat /proc/asound/cards` to find the "
+                                "short ID shown in brackets for this output's card. "
+                                "Changes here apply live on Save (no engine restart "
+                                "needed) — the running engine re-reads this identity "
+                                "on every save, without disturbing a currently-healthy "
+                                "sink. The device field above is separate: for Studio "
+                                "Monitor it also swaps live; for every other output "
+                                "(including Stereotool Input) a device change still "
+                                "requires a restart.",
+            }),
+        ]
         if obj and obj.name == STUDIO_MONITOR_NAME:
             fieldsets.append(("AGC (Studio Monitor Leveling)", {
                 "fields": ["agc_enabled", "agc_ratio", "agc_threshold", "agc_soft_knee", "agc_makeup_gain_db"],
