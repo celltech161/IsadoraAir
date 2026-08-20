@@ -182,44 +182,36 @@ def _recv_until_end(sock):
     return body.decode("utf-8", errors="replace").rstrip("\n")
 
 
-def _reap_stale_running_session():
-    """Close any AircheckSession row still marked still_running when
-    we know the recording is over. Called ONLY from start_recording
-    (never from current_session, which would race the monitoring
-    dashboard's poll and silently close just-started sessions).
-
-    We can't ask liquidsoap "is a session in progress" cleanly in the
-    fixed-path design -- the working file is always being written
-    regardless. Any still_running=True row we see at Start time was
-    left open by a Django crash or an out-of-band interrupt, so
-    reaping is safe. If a file exists at the row's declared
-    destination, record its size; otherwise leave size_bytes null.
-    """
-    stale = AircheckSession.objects.filter(still_running=True)
-    for s in stale:
-        s.still_running = False
-        s.ended_at = timezone.now()
-        s.exit_note = "reaped stale row at Start (django crash or out-of-band interrupt)"
-        if s.filename and Path(s.filename).is_file():
-            try:
-                s.size_bytes = Path(s.filename).stat().st_size
-            except OSError:
-                pass
-        s.save()
-
-
 def current_session():
     """Return the currently-running AircheckSession or None. Pure DB
-    read -- no reaper -- because this is called on every dashboard
-    status poll and a reaper race would silently close a just-started
-    session. Reconciliation with liquidsoap happens in start_recording."""
+    read, no side effects -- called on every dashboard status poll, so
+    it must never mutate a row out from under a real session. Liquidsoap
+    keeps writing the working file regardless of whether a still_running
+    row exists or not, and Gunicorn/Django restarting does not imply any
+    Aircheck session actually stopped -- there is no reconciliation to
+    do here beyond reading the DB as-is."""
     return AircheckSession.objects.filter(still_running=True).order_by("-started_at").first()
 
 
 def start_recording():
     """Start a new aircheck session. Returns (session, error) with one
-    being None. Idempotent-ish: if a session is already running the
-    caller gets it back with a note, not an error.
+    being None. Genuinely idempotent: if a session is already running,
+    the caller gets that SAME session back with "already recording" --
+    no telnet call, no new row, the existing row is not touched in any
+    way.
+
+    There is deliberately no automatic "stale session" detection here.
+    The fixed-path working file is always being written by Liquidsoap
+    regardless of session state, so a still_running=True row can't be
+    distinguished from a genuinely active session by inspecting the
+    file -- and Liquidsoap's own output.file keeps running independently
+    of Django/Gunicorn, so a still_running=True row surviving a Django
+    restart does not mean it's abandoned. Treating every still_running
+    row as stale at Start time (the previous behavior here) meant a
+    second Start press -- a double-click, or two admins -- silently cut
+    the in-progress recording and replaced it with a fresh one. If
+    explicit stale-session recovery is ever needed, it belongs in its
+    own deliberate mechanism, not as a side effect of every Start.
 
     Triggers `aircheck.reopen` over telnet -- liquidsoap closes its
     current working file (AIRCHECK_CURRENT_PATH) and starts a fresh
@@ -227,12 +219,13 @@ def start_recording():
     destination; the actual file lives at AIRCHECK_CURRENT_PATH until
     Stop moves it there.
 
-    Runs under AIRCHECK_LOCK_PATH, blocking, for its entire body
-    (including the stale-session reap) -- serializes against Stop and
-    against idle-buffer maintenance so neither can reopen/inspect the
+    Runs under AIRCHECK_LOCK_PATH, blocking, for its entire body --
+    serializes against Stop, against a second concurrent Start (the
+    existing-session check below only works if two overlapping calls
+    can't both pass it before either creates a row), and against
+    idle-buffer maintenance, so nothing else can reopen/inspect the
     working file mid-Start."""
     with _aircheck_lock(blocking=True):
-        _reap_stale_running_session()
         existing = AircheckSession.objects.filter(still_running=True).order_by("-started_at").first()
         if existing:
             return existing, "already recording"

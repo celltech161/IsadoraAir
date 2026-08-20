@@ -10,23 +10,29 @@ paths, since this suite runs on the same box that serves production.
 """
 import os
 import tempfile
+import threading
 from pathlib import Path
 from unittest.mock import patch
 
-from django.test import TestCase
+from django.db import close_old_connections
+from django.test import TestCase, TransactionTestCase
 
 from aircheck.models import AircheckConfig, AircheckSession
 from aircheck.services import recorder
 from monitoring.models import SystemEvent
 
 
-class AircheckRecorderTestBase(TestCase):
+class AircheckRecorderFixtureMixin:
     """Redirects AIRCHECK_LOCK_PATH/AIRCHECK_CURRENT_PATH to a fresh
     tempdir per test, and gives a real AircheckConfig row pointing its
     output_directory at that same tempdir (never the real
-    /srv/isadoraair/aircheck)."""
+    /srv/isadoraair/aircheck). Split out from AircheckRecorderTestBase so
+    it can also back a TransactionTestCase for the real-thread
+    concurrency test below, which needs actual committing DB
+    connections rather than TestCase's outer per-test atomic wrapper."""
 
     def setUp(self):
+        super().setUp()
         self._tmpdir = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmpdir.cleanup)
         tmp = Path(self._tmpdir.name)
@@ -46,6 +52,10 @@ class AircheckRecorderTestBase(TestCase):
         self.working_path.parent.mkdir(parents=True, exist_ok=True)
         with open(self.working_path, "wb") as f:
             f.write(b"\0" * size_bytes)
+
+
+class AircheckRecorderTestBase(AircheckRecorderFixtureMixin, TestCase):
+    pass
 
 
 class IdleBufferMaintenanceTests(AircheckRecorderTestBase):
@@ -176,19 +186,6 @@ class StartStopFinalizationTests(AircheckRecorderTestBase):
         telnet.assert_called_once_with(f"{recorder.AIRCHECK_OUTPUT_ID}.reopen")
         self.assertEqual(AircheckSession.objects.filter(still_running=True).count(), 1)
 
-    def test_start_recording_reaps_stale_session_under_the_lock(self):
-        stale = AircheckSession.objects.create(
-            filename="/tmp/stale.mp3", audio_format="mp3", bitrate="320k",
-            source_device="airtap", still_running=True,
-        )
-        with patch.object(recorder, "_send_telnet", return_value="reopened"):
-            session, err = recorder.start_recording()
-        self.assertIsNone(err)
-        stale.refresh_from_db()
-        self.assertFalse(stale.still_running)
-        self.assertIn("reaped stale row", stale.exit_note)
-        self.assertNotEqual(session.id, stale.id)
-
     def test_stop_recording_direct_move_finalizes_mp3(self):
         with patch.object(recorder, "_send_telnet", return_value="reopened"):
             session, _ = recorder.start_recording()
@@ -227,3 +224,125 @@ class StartStopFinalizationTests(AircheckRecorderTestBase):
         finalize.assert_called_once()
         args = finalize.call_args[0]
         self.assertEqual(args[0].id, session.id)
+
+
+class DoubleStartIdempotencyTests(AircheckRecorderTestBase):
+    """start_recording() must be genuinely idempotent: a second Start
+    while a session is already running returns that SAME session
+    untouched -- no telnet call, no new row, no mutation of any kind.
+    Regression coverage for the double-Start bug (a prior version of
+    start_recording() unconditionally reaped every still_running row
+    before checking for one, so this branch was unreachable and a
+    second Start silently cut the in-progress recording)."""
+
+    def test_start_with_existing_active_session_returns_it_unchanged(self):
+        existing = AircheckSession.objects.create(
+            filename="/tmp/already-running.mp3", audio_format="mp3", bitrate="320k",
+            source_device="airtap", still_running=True,
+        )
+        with patch.object(recorder, "_send_telnet") as telnet:
+            session, note = recorder.start_recording()
+
+        self.assertEqual(session.id, existing.id)
+        self.assertEqual(note, "already recording")
+        telnet.assert_not_called()
+        self.assertEqual(AircheckSession.objects.count(), 1)
+
+    def test_double_start_issues_exactly_one_reopen_total(self):
+        with patch.object(recorder, "_send_telnet", return_value="reopened") as telnet:
+            first_session, first_note = recorder.start_recording()
+            second_session, second_note = recorder.start_recording()
+
+        self.assertIsNone(first_note)
+        self.assertEqual(second_note, "already recording")
+        self.assertEqual(first_session.id, second_session.id)
+        telnet.assert_called_once_with(f"{recorder.AIRCHECK_OUTPUT_ID}.reopen")
+        self.assertEqual(AircheckSession.objects.count(), 1)
+
+    def test_second_start_does_not_mutate_the_existing_session(self):
+        existing = AircheckSession.objects.create(
+            filename="/tmp/untouched.mp3", audio_format="mp3", bitrate="320k",
+            source_device="airtap", still_running=True,
+        )
+        before = {
+            "filename": existing.filename, "audio_format": existing.audio_format,
+            "bitrate": existing.bitrate, "source_device": existing.source_device,
+            "started_at": existing.started_at,
+        }
+
+        with patch.object(recorder, "_send_telnet") as telnet:
+            recorder.start_recording()
+
+        existing.refresh_from_db()
+        telnet.assert_not_called()
+        self.assertTrue(existing.still_running)
+        self.assertIsNone(existing.ended_at)
+        self.assertEqual(existing.exit_note, "")
+        self.assertEqual(existing.filename, before["filename"])
+        self.assertEqual(existing.audio_format, before["audio_format"])
+        self.assertEqual(existing.bitrate, before["bitrate"])
+        self.assertEqual(existing.source_device, before["source_device"])
+        self.assertEqual(existing.started_at, before["started_at"])
+
+    def test_stop_after_idempotent_second_start_finalizes_original_session(self):
+        with patch.object(recorder, "_send_telnet", return_value="reopened"):
+            first_session, first_note = recorder.start_recording()
+        with patch.object(recorder, "_send_telnet") as telnet:
+            second_session, second_note = recorder.start_recording()
+        self.assertIsNone(first_note)
+        self.assertEqual(second_note, "already recording")
+        self.assertEqual(second_session.id, first_session.id)
+        telnet.assert_not_called()
+
+        self.write_working_file(999)
+        with patch.object(recorder, "_send_telnet", return_value="reopened") as stop_telnet:
+            stopped, stop_err = recorder.stop_recording()
+
+        self.assertIsNone(stop_err)
+        self.assertEqual(stopped.id, first_session.id)
+        self.assertFalse(stopped.still_running)
+        stop_telnet.assert_called_once_with(f"{recorder.AIRCHECK_OUTPUT_ID}.reopen")
+        dest = Path(stopped.filename)
+        self.assertTrue(dest.is_file())
+        self.assertEqual(dest.stat().st_size, 999)
+
+
+class ConcurrentStartTests(AircheckRecorderFixtureMixin, TransactionTestCase):
+    """Real inter-thread concurrency on the shared AIRCHECK_LOCK_PATH
+    flock -- TransactionTestCase (not TestCase) because each thread
+    needs its own genuinely committing DB connection; TestCase's outer
+    per-test atomic transaction would hide one thread's committed
+    session from the other and defeat the point of this test. The lock
+    itself (not test timing) is what must make this safe -- a
+    threading.Barrier is used only to maximize the odds both callers
+    actually contend, never to fake or bypass the lock."""
+
+    def test_concurrent_start_callers_produce_exactly_one_session(self):
+        start_barrier = threading.Barrier(2)
+        outcomes = []
+        outcomes_lock = threading.Lock()
+
+        def call_start():
+            close_old_connections()
+            try:
+                start_barrier.wait(timeout=5)
+                session, note = recorder.start_recording()
+                with outcomes_lock:
+                    outcomes.append((session.id if session else None, note))
+            finally:
+                close_old_connections()
+
+        with patch.object(recorder, "_send_telnet", return_value="reopened") as telnet:
+            threads = [threading.Thread(target=call_start) for _ in range(2)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=10)
+
+        self.assertEqual(len(outcomes), 2)
+        session_ids = {sid for sid, _ in outcomes}
+        self.assertEqual(len(session_ids), 1, f"expected exactly one session id across both callers, got {outcomes}")
+        notes = sorted(note or "" for _, note in outcomes)
+        self.assertEqual(notes, ["", "already recording"])
+        telnet.assert_called_once_with(f"{recorder.AIRCHECK_OUTPUT_ID}.reopen")
+        self.assertEqual(AircheckSession.objects.count(), 1)
