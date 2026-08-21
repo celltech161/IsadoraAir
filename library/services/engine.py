@@ -2401,7 +2401,23 @@ class PlaybackEngine:
         by slot kind ("studio_monitor"/"stereotool"). {} if no output
         slots exist at all (shouldn't happen in practice -- Studio
         Monitor's slot is always built -- but matches mic_recovery's own
-        defensive shape for "nothing to report")."""
+        defensive shape for "nothing to report").
+
+        [P0] 1.3C integration-bug fix -- added `active_device`,
+        distinct from `resolved_runtime_device`. The latter is a PURE
+        function of this slot's currently-known config (identity_kind/
+        identity/legacy_device) -- what device SHOULD be in use given
+        that config, not necessarily what the live sink actually has
+        open right now. Production surfaced exactly this gap: a bug
+        elsewhere briefly forced the live sink off its stable identity
+        path while `resolved_runtime_device` kept reporting the stable
+        path throughout, since it was never reading the sink itself.
+        `active_device` reads current_sink.get_property("device")
+        directly -- the actual live value, however it got there --
+        so state reporting can never again be mistaken for proof of
+        what the sink is really doing. `resolved_runtime_device` is
+        left as-is (not renamed/removed) since it's still the right
+        answer to "what does config say this should be"."""
         if not self._output_slots:
             return {}
         out = {}
@@ -2410,6 +2426,10 @@ class PlaybackEngine:
             next_retry_in_s = None
             if slot.next_retry_at is not None:
                 next_retry_in_s = max(0.0, round(slot.next_retry_at - time.monotonic(), 1))
+            try:
+                active_device = slot.current_sink.get_property("device") if slot.current_sink else None
+            except Exception:
+                active_device = None
             out[slot.kind] = {
                 "name": slot.name,
                 "state": snapshot["state"],
@@ -2418,6 +2438,7 @@ class PlaybackEngine:
                 "configured_device": slot.legacy_device,
                 "resolved_runtime_device": audio_recovery.resolve_runtime_device(
                     slot.identity_kind, slot.identity, slot.legacy_device),
+                "active_device": active_device,
                 "identity_kind": slot.identity_kind,
                 "identity": slot.identity,
                 "recovery_attempt": slot.recovery_attempt,
@@ -6740,20 +6761,55 @@ class PlaybackEngine:
         operator-requested device change via the admin (see
         hardware/signals.py's post_save handler), not a fault; the
         existing blast radius here is already accepted/documented
-        behavior, unrelated to hotplug recovery."""
+        behavior, unrelated to hotplug recovery.
+
+        [P0] 1.3C integration-bug fix -- "changed" is decided by
+        comparing `device` against slot.legacy_device (this slot's own
+        last-known raw AudioOutput.device string), NEVER against the
+        live sink's actual open device. Those two diverge on purpose
+        once a stable identity has resolved the sink to
+        plughw:CARD=<id>,DEV=0 -- comparing against the live sink there
+        would treat every identity-only edit, AGC-only edit, or
+        completely unchanged Save as a "device changed" event (every
+        one of them reaches this call with the SAME raw `device`
+        string every time, via the unified "reload_audio_output"
+        command), forcing a needless READY-cycle on a perfectly healthy
+        sink. That was a real, confirmed production bug -- see
+        hardware/tests/test_audio_output_recovery_reload_signal.py and
+        this method's own test coverage in test_engine_output_recovery.
+        py for the regression proof.
+
+        Once a real raw-device change IS detected, stable identity
+        (when active) stays authoritative for what the sink actually
+        uses -- resolve_runtime_device() already ignores legacy_device
+        entirely whenever identity_kind/identity are set, and rebuild/
+        recovery resolution already prefers identity over the raw path.
+        The live-edit path must not silently contradict that: a raw
+        `device` edit while a stable identity is active updates
+        legacy_device as fallback/config metadata (used if identity is
+        later cleared) WITHOUT touching the live sink at all. Only in
+        legacy mode (no stable identity configured) does a genuine raw-
+        device change still swap the live sink, unchanged from pre-
+        1.3C behavior."""
         if not self._studio_monitor_slot or not self.main_pipeline:
             return False
-        sink = self._studio_monitor_slot.current_sink
+        slot = self._studio_monitor_slot
+        if device == slot.legacy_device:
+            return False
+        slot.legacy_device = device  # bookkeeping updated regardless of whether the sink itself moves
+        if slot.identity_kind == "alsa_card_id" and slot.identity:
+            print(f"  Studio Monitor raw device changed ({device}) while a stable identity is "
+                  f"active ({slot.identity_kind}={slot.identity!r}) -- recorded as fallback "
+                  f"configuration only; the live sink stays on its stable identity path")
+            return False
+        sink = slot.current_sink
         try:
             current = sink.get_property("device")
         except Exception:
             current = None
-        if current == device:
-            return False
         print(f"  Switching Studio Monitor alsasink device {current} -> {device}")
         self.main_pipeline.set_state(Gst.State.READY)
         sink.set_property("device", device)
-        self._studio_monitor_slot.legacy_device = device  # keep the slot's own bookkeeping in sync
         self.main_pipeline.set_state(Gst.State.PLAYING)
         return True
 

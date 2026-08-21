@@ -1234,24 +1234,43 @@ class OutputRecoveryIdentityLiveReloadTests(MockEmitEventMixin, SimpleTestCase):
     admin-side signal half of this fix."""
 
     def test_reload_updates_identity_without_touching_hardware(self):
+        """[P0] 1.3C second integration-bug fix -- strengthened per that
+        review's own finding: object identity alone (current_bin/
+        current_sink `is` the same object) doesn't prove non-disturbance,
+        since the SAME sink object can have its `device` property changed
+        after a whole-pipeline READY cycle -- that's exactly what
+        happened in production. Swaps in _FakeAlsaSink (see below) so
+        the actual device-property value can be asserted, not just
+        object identity. See OutputRawDeviceSwapSemanticsTests for the
+        full command-level (identity + device-swap-decision + AGC
+        together) coverage this test doesn't attempt -- this one is
+        deliberately scoped to _reload_output_recovery_identity() alone,
+        matching its own narrow contract."""
         obj = make_output_engine_stand_in()
         pipeline, slot = build_slot_in_pipeline(obj, identity_kind="", identity="")
         try:
             self.assertTrue(wait_until(lambda: pipeline.get_state(0)[1] == Gst.State.PLAYING))
+            slot.current_sink = _FakeAlsaSink("plughw:CARD=CODEC,DEV=0")
             current_bin_before = slot.current_bin
             current_sink_before = slot.current_sink
             valve_state_before = slot.valve.get_property("drop")
             gen_before = slot.coordinator.generation
 
             with patch.object(eng_module.PlaybackEngine, "_resolve_output_device_identity",
-                               lambda self, name: ("alsa_card_id", "CODEC")):
+                               lambda self, name: ("alsa_card_id", "CODEC")), \
+                 patch.object(pipeline, "set_state", wraps=pipeline.set_state) as spy:
                 obj._reload_output_recovery_identity()
 
             self.assertEqual(slot.identity_kind, "alsa_card_id")
             self.assertEqual(slot.identity, "CODEC")
             # Nothing about the running hardware generation was touched
             # -- the review's explicit requirement that an identity-only
-            # edit must never disturb a healthy sink.
+            # edit must never disturb a healthy sink. Checked via the
+            # ACTUAL device property, not object identity alone.
+            self.assertEqual(slot.current_sink.device, "plughw:CARD=CODEC,DEV=0")
+            self.assertEqual(slot.current_sink.calls, [])
+            for call in spy.call_args_list:
+                self.assertNotEqual(call.args[0], Gst.State.READY)
             self.assertIs(slot.current_bin, current_bin_before)
             self.assertIs(slot.current_sink, current_sink_before)
             self.assertEqual(slot.valve.get_property("drop"), valve_state_before)
@@ -1374,3 +1393,298 @@ class ReloadAudioOutputCommandDispatchTests(MockEmitEventMixin, SimpleTestCase):
         obj, calls = self._obj_with_recording_stubs()
         self._dispatch(obj, "reload_agc_config")
         self.assertEqual(calls, ["apply_agc"])
+
+
+class _FakeAlsaSink:
+    """[P0] 1.3C second integration-bug fix -- stand-in for a real
+    alsasink's `device` property. fakesink (used by
+    make_synthetic_generation_builder for the rest of this file) has no
+    such property at all -- confirmed directly: fs.get_property("device")
+    raises TypeError, "object of type `GstFakeSink' does not have
+    property `device'". A REAL alsasink would risk touching actual ALSA
+    hardware even when pointed at a garbage device string (this file's
+    own stated invariant: "No real ALSA hardware is opened anywhere in
+    this file"). _apply_audio_output_device only ever calls
+    .get_property("device")/.set_property("device", ...) on
+    slot.current_sink (confirmed by reading its implementation) -- it
+    never bin_.add()s current_sink or otherwise needs it to be a real
+    Gst.Element -- so this plain Python stand-in is both safe and a
+    strictly STRONGER proof than object-identity-only checks: the exact
+    gap this review flagged ("the same Gst alsasink object can have its
+    `device` property changed after a whole-pipeline READY cycle" --
+    identity survives that; the property doesn't)."""
+
+    def __init__(self, device):
+        self.device = device
+        self.calls = []
+
+    def get_property(self, name):
+        if name == "device":
+            return self.device
+        raise AssertionError(f"unexpected get_property({name!r}) on fake sink")
+
+    def set_property(self, name, value):
+        self.calls.append((name, value))
+        if name == "device":
+            self.device = value
+        else:
+            raise AssertionError(f"unexpected set_property({name!r}, {value!r}) on fake sink")
+
+
+class OutputRawDeviceSwapSemanticsTests(MockEmitEventMixin, SimpleTestCase):
+    """[P0] 1.3C second integration-bug fix -- _apply_audio_output_device
+    used to decide "did the device change" by comparing the requested
+    raw device against the LIVE sink's ACTUAL open device
+    (sink.get_property("device")). That diverges from the raw numeric
+    path ON PURPOSE once a stable identity has resolved the sink to
+    plughw:CARD=<id>,DEV=0 (see resolve_runtime_device) -- so every
+    identity-only edit, AGC-only edit, or completely unchanged Save
+    (every one of which reaches this call with the SAME raw device
+    string every time, via the unified "reload_audio_output" command)
+    was mistaken for a real device change, forcing a needless whole-
+    pipeline READY cycle on a healthy sink. Confirmed live in
+    production: a no-op Save moved the sink OFF its stable CARD=PCH
+    path onto the raw numeric path.
+
+    Fixed by comparing the requested device against slot.legacy_device
+    (this slot's own last-known raw configuration) instead of the live
+    sink -- and by treating a REAL raw-device change as a no-op on the
+    live sink specifically WHILE a stable identity is active (identity
+    stays authoritative for what the sink actually uses; the raw field
+    becomes fallback-only metadata for if/when identity is later
+    cleared -- consistent with resolve_runtime_device already ignoring
+    legacy_device whenever identity is set).
+
+    A spy on main_pipeline.set_state proves the pipeline was (or
+    wasn't) ever dropped to READY -- the actual disturbance this bug
+    caused -- rather than trusting object identity alone."""
+
+    def _make_slot(self, identity_kind, identity, legacy_device, sink_device):
+        obj = make_output_engine_stand_in()
+        pipeline, slot = build_slot_in_pipeline(
+            obj, legacy_device=legacy_device, identity_kind=identity_kind, identity=identity)
+        slot.current_sink = _FakeAlsaSink(sink_device)
+        return obj, pipeline, slot
+
+    def _assert_sink_and_pipeline_untouched(self, slot, pipeline, set_state_spy,
+                                             current_bin_before, current_sink_before,
+                                             valve_before, gen_before, state_before):
+        self.assertEqual(slot.current_sink.calls, [], "sink property must never be touched")
+        for call in set_state_spy.call_args_list:
+            self.assertNotEqual(call.args[0], Gst.State.READY, "main_pipeline must never enter READY")
+        self.assertIs(slot.current_bin, current_bin_before)
+        self.assertIs(slot.current_sink, current_sink_before)
+        self.assertEqual(slot.valve.get_property("drop"), valve_before)
+        self.assertEqual(slot.coordinator.generation, gen_before)
+        self.assertEqual(slot.coordinator.state, state_before)
+        self.assertEqual(self.emitted_events, [], "no recovery activity must be triggered")
+
+    def test_a_stable_identity_unchanged_raw_device_leaves_sink_and_pipeline_untouched(self):
+        obj, pipeline, slot = self._make_slot(
+            identity_kind="alsa_card_id", identity="PCH",
+            legacy_device="plughw:2,0", sink_device="plughw:CARD=PCH,DEV=0")
+        try:
+            current_bin_before, current_sink_before = slot.current_bin, slot.current_sink
+            valve_before = slot.valve.get_property("drop")
+            gen_before, state_before = slot.coordinator.generation, slot.coordinator.state
+
+            with patch.object(pipeline, "set_state", wraps=pipeline.set_state) as spy:
+                result = obj._apply_audio_output_device("plughw:2,0")  # same raw device -- unchanged Save
+
+            self.assertFalse(result, "_apply_audio_output_device must report no state transition")
+            self.assertEqual(slot.current_sink.device, "plughw:CARD=PCH,DEV=0")
+            self._assert_sink_and_pipeline_untouched(
+                slot, pipeline, spy, current_bin_before, current_sink_before,
+                valve_before, gen_before, state_before)
+        finally:
+            pipeline.set_state(Gst.State.NULL)
+
+    def test_a_full_unified_command_reapplies_agc_without_disturbing_sink(self):
+        """The same scenario as above, but through the REAL unified
+        "reload_audio_output" command dispatch (identity refresh +
+        device apply + AGC reapply together) -- proving AGC is still
+        reapplied on an otherwise-unchanged Save, while the device-swap
+        portion remains correctly a no-op. _apply_agc_config is stubbed
+        (recording) since wiring real AGC elements is orthogonal to
+        this bug; _apply_audio_output_device and
+        _reload_output_recovery_identity are the REAL implementations."""
+        obj, pipeline, slot = self._make_slot(
+            identity_kind="alsa_card_id", identity="PCH",
+            legacy_device="plughw:2,0", sink_device="plughw:CARD=PCH,DEV=0")
+        try:
+            current_bin_before, current_sink_before = slot.current_bin, slot.current_sink
+            valve_before = slot.valve.get_property("drop")
+            gen_before, state_before = slot.coordinator.generation, slot.coordinator.state
+
+            agc_calls = []
+            obj._apply_agc_config = lambda: agc_calls.append("apply_agc")
+            obj._resolve_studio_monitor_device = lambda: "plughw:2,0"  # unchanged
+
+            with patch.object(pipeline, "set_state", wraps=pipeline.set_state) as spy, \
+                 patch.object(eng_module.PlaybackEngine, "_resolve_output_device_identity",
+                              lambda self, name: ("alsa_card_id", "PCH")):  # unchanged identity too
+                obj._reload_output_recovery_identity()
+                obj._apply_audio_output_device(obj._resolve_studio_monitor_device())
+                obj._apply_agc_config()
+
+            self.assertEqual(agc_calls, ["apply_agc"], "AGC must still be reapplied")
+            self._assert_sink_and_pipeline_untouched(
+                slot, pipeline, spy, current_bin_before, current_sink_before,
+                valve_before, gen_before, state_before)
+        finally:
+            pipeline.set_state(Gst.State.NULL)
+
+    def test_b_identity_only_change_updates_metadata_but_not_sink(self):
+        """Changing ONLY the identity fields (raw device untouched) must
+        update the slot's recovery metadata while leaving the healthy
+        sink and pipeline completely alone -- strengthens the older
+        test_reload_updates_identity_without_touching_hardware (object-
+        identity-only) with the actual device-property/pipeline-state
+        proof that test could not provide."""
+        obj, pipeline, slot = self._make_slot(
+            identity_kind="", identity="",
+            legacy_device="plughw:2,0", sink_device="plughw:2,0")
+        try:
+            current_bin_before, current_sink_before = slot.current_bin, slot.current_sink
+            valve_before = slot.valve.get_property("drop")
+            gen_before, state_before = slot.coordinator.generation, slot.coordinator.state
+
+            with patch.object(pipeline, "set_state", wraps=pipeline.set_state) as spy, \
+                 patch.object(eng_module.PlaybackEngine, "_resolve_output_device_identity",
+                              lambda self, name: ("alsa_card_id", "PCH")):
+                obj._reload_output_recovery_identity()
+                result = obj._apply_audio_output_device("plughw:2,0")  # raw device still unchanged
+
+            self.assertFalse(result)
+            self.assertEqual(slot.identity_kind, "alsa_card_id")
+            self.assertEqual(slot.identity, "PCH")
+            self.assertEqual(slot.current_sink.device, "plughw:2,0")
+            self._assert_sink_and_pipeline_untouched(
+                slot, pipeline, spy, current_bin_before, current_sink_before,
+                valve_before, gen_before, state_before)
+        finally:
+            pipeline.set_state(Gst.State.NULL)
+
+    def test_c_legacy_mode_real_device_change_still_swaps_live_sink(self):
+        """No stable identity configured (legacy mode) -- a genuine raw
+        `device` change must still swap the live sink, unchanged from
+        pre-1.3C behavior. The existing whole-pipeline READY/PLAYING
+        cycle is the intentionally-accepted, documented blast radius
+        for this specific case (an operator-requested device change)."""
+        obj, pipeline, slot = self._make_slot(
+            identity_kind="", identity="",
+            legacy_device="plughw:2,0", sink_device="plughw:2,0")
+        try:
+            with patch.object(pipeline, "set_state", wraps=pipeline.set_state) as spy:
+                result = obj._apply_audio_output_device("plughw:5,0")
+
+            self.assertTrue(result, "a real raw-device change in legacy mode must report a state transition")
+            self.assertEqual(slot.current_sink.device, "plughw:5,0")
+            self.assertIn(("device", "plughw:5,0"), slot.current_sink.calls)
+            states = [call.args[0] for call in spy.call_args_list]
+            self.assertIn(Gst.State.READY, states)
+            self.assertIn(Gst.State.PLAYING, states)
+            self.assertEqual(slot.legacy_device, "plughw:5,0")
+        finally:
+            pipeline.set_state(Gst.State.NULL)
+
+    def test_d_stable_identity_real_raw_device_change_updates_fallback_only(self):
+        """A genuine raw `device` edit WHILE a stable identity is active
+        must NOT force the healthy sink off its stable CARD=<id> path --
+        resolve_runtime_device() already ignores legacy_device entirely
+        whenever identity is set, so forcing the sink onto the raw path
+        here would silently contradict that. The raw value is still
+        recorded as fallback/config metadata (for if/when identity is
+        later cleared) -- this is the explicit chosen semantics, not an
+        oversight; see this method's own docstring."""
+        obj, pipeline, slot = self._make_slot(
+            identity_kind="alsa_card_id", identity="PCH",
+            legacy_device="plughw:2,0", sink_device="plughw:CARD=PCH,DEV=0")
+        try:
+            current_bin_before, current_sink_before = slot.current_bin, slot.current_sink
+            valve_before = slot.valve.get_property("drop")
+            gen_before, state_before = slot.coordinator.generation, slot.coordinator.state
+
+            with patch.object(pipeline, "set_state", wraps=pipeline.set_state) as spy:
+                result = obj._apply_audio_output_device("plughw:9,0")  # a genuine raw-device edit
+
+            self.assertFalse(result, "the live sink must not move off its stable identity path")
+            self.assertEqual(slot.current_sink.device, "plughw:CARD=PCH,DEV=0", "sink must stay on the stable path")
+            self._assert_sink_and_pipeline_untouched(
+                slot, pipeline, spy, current_bin_before, current_sink_before,
+                valve_before, gen_before, state_before)
+            # The raw field itself IS still updated -- fallback/config
+            # metadata, used only if identity is later cleared.
+            self.assertEqual(slot.legacy_device, "plughw:9,0")
+        finally:
+            pipeline.set_state(Gst.State.NULL)
+
+
+class OutputRecoveryStateActiveDeviceReportingTests(SimpleTestCase):
+    """[P0] 1.3C second integration-bug fix, item E -- production
+    surfaced that engine_state.json's `resolved_runtime_device` is a
+    PURE function of config (identity_kind/identity/legacy_device), not
+    a read of what the live sink actually has open -- so a bug that
+    forced the sink off its stable path left `resolved_runtime_device`
+    still reporting the stable path throughout, unable to catch the
+    disturbance. `active_device` (new field) reads
+    current_sink.get_property("device") directly -- the actual live
+    value, however it got there. `resolved_runtime_device` is
+    deliberately NOT renamed or removed -- it's still the right answer
+    to "what should this be given current config"; `active_device`
+    answers the different question "what is it actually right now"."""
+
+    def test_active_device_reflects_the_real_sink_not_the_desired_resolution(self):
+        """Reproduces the exact production-surfaced gap: force a
+        mismatch between the sink's actual device and what config-based
+        resolution would compute, and confirm state reporting exposes
+        BOTH values distinctly rather than only the desired one."""
+        obj = make_output_engine_stand_in()
+        pipeline, slot = build_slot_in_pipeline(
+            obj, legacy_device="plughw:2,0", identity_kind="alsa_card_id", identity="PCH")
+        try:
+            # Simulate the bug's exact aftermath: identity says PCH, but
+            # the live sink has (wrongly) ended up on the raw path.
+            slot.current_sink = _FakeAlsaSink("plughw:2,0")
+
+            state = obj._output_recovery_state()["studio_monitor"]
+
+            self.assertEqual(state["resolved_runtime_device"], "plughw:CARD=PCH,DEV=0",
+                              "desired/config-computed resolution is unchanged")
+            self.assertEqual(state["active_device"], "plughw:2,0",
+                              "active_device must reflect the REAL live sink, not the desired resolution")
+            self.assertNotEqual(state["active_device"], state["resolved_runtime_device"],
+                                 "this exact mismatch is what production hit -- state reporting must be able to show it")
+        finally:
+            pipeline.set_state(Gst.State.NULL)
+
+    def test_active_device_matches_resolved_runtime_device_when_healthy(self):
+        """The ordinary/healthy case: once the sink genuinely IS on its
+        stable identity path, both fields agree -- proving
+        active_device isn't just always-different noise."""
+        obj = make_output_engine_stand_in()
+        pipeline, slot = build_slot_in_pipeline(
+            obj, legacy_device="plughw:2,0", identity_kind="alsa_card_id", identity="PCH")
+        try:
+            slot.current_sink = _FakeAlsaSink("plughw:CARD=PCH,DEV=0")
+            state = obj._output_recovery_state()["studio_monitor"]
+            self.assertEqual(state["active_device"], state["resolved_runtime_device"])
+        finally:
+            pipeline.set_state(Gst.State.NULL)
+
+    def test_active_device_none_when_sink_property_read_fails(self):
+        """Defensive: a sink that can't report its device (property
+        read raises) must degrade to None, never raise out of state
+        reporting -- mirrors _apply_audio_output_device's own existing
+        try/except around the identical read."""
+        obj = make_output_engine_stand_in()
+        pipeline, slot = build_slot_in_pipeline(obj, legacy_device="plughw:2,0")
+        try:
+            class _BrokenSink:
+                def get_property(self, name):
+                    raise RuntimeError("boom")
+            slot.current_sink = _BrokenSink()
+            state = obj._output_recovery_state()["studio_monitor"]
+            self.assertIsNone(state["active_device"])
+        finally:
+            pipeline.set_state(Gst.State.NULL)
