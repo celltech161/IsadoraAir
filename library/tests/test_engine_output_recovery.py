@@ -34,7 +34,7 @@ import gi
 gi.require_version("Gst", "1.0")
 from gi.repository import Gst  # noqa: E402
 
-from django.test import SimpleTestCase
+from django.test import SimpleTestCase, TestCase
 
 import library.services.engine as eng_module
 from library.services import audio_recovery
@@ -149,7 +149,14 @@ def wait_until(predicate, timeout=5.0, interval=0.02):
     return False
 
 
-def fake_error_message(message_text, debug_text=""):
+def fake_error_message(message_text, debug_text="", src=None):
+    """`src` defaults to None (every pre-existing caller calls
+    _on_output_error directly, bypassing the ownership routing that
+    reads message.src, so they never needed one). [P0] 1.3C physical-
+    acceptance-failure fix: tests that need to exercise the REAL
+    ownership routing (_on_main_bus_error/_output_slot_owns_message_src)
+    pass a real Gst element here -- src stays a plain attribute (not a
+    method) to match GStreamer's own Gst.Message.src shape."""
     class _Err:
         def __str__(self_inner):
             return message_text
@@ -158,7 +165,9 @@ def fake_error_message(message_text, debug_text=""):
         def parse_error(self_inner):
             return _Err(), debug_text
 
-    return _Msg()
+    msg = _Msg()
+    msg.src = src
+    return msg
 
 
 def wait_until_pumping_glib(predicate, timeout=5.0, interval=0.02):
@@ -308,15 +317,29 @@ class OutputSlotConstructionTests(MockEmitEventMixin, SimpleTestCase):
             bin_.set_state(Gst.State.NULL)
 
     def test_studio_monitor_generation_does_not_get_stereotool_properties(self):
-        """Must NOT accidentally normalize Studio Monitor's sink to
-        StereoTool's special values -- alsasink's own driver defaults
-        for sync/async/buffer-time/latency-time apply instead."""
+        """[P0] 1.3C physical-acceptance-failure fix -- async is now
+        explicitly False (was left at alsasink's True default, which
+        the empirical preroll harness proved can never reach PLAYING
+        behind the recovery choreography's closed valve -- see
+        _build_studio_monitor_hw_generation's own docstring). sync
+        stays at its True default -- deliberately NOT copying
+        StereoTool's sync=False. latency-time is checked against
+        alsasink's own real default (10000, confirmed directly via
+        gst-inspect) rather than StereoTool's tuned 20000, proving
+        Studio Monitor was NOT accidentally given StereoTool's whole
+        property set -- just the one, narrowly-justified async change.
+        (buffer-time is NOT checked here: alsasink's own default
+        happens to already equal StereoTool's tuned 200000, so that
+        property alone can't distinguish "got StereoTool's value" from
+        "kept its own default" -- latency-time is the property that
+        actually proves it.)"""
         obj = make_output_engine_stand_in()
         bin_, sink = obj._build_studio_monitor_hw_generation("hw:CARD=Fake,DEV=0")
         try:
-            # alsasink defaults: sync=True, async=True (unset here).
-            self.assertTrue(sink.get_property("sync"))
-            self.assertTrue(sink.get_property("async"))
+            self.assertTrue(sink.get_property("sync"), "sync must stay at its True default")
+            self.assertFalse(sink.get_property("async"), "async must be explicitly False (the fix)")
+            self.assertEqual(sink.get_property("latency-time"), 10000,
+                              "must be alsasink's own default, not StereoTool's tuned 20000")
         finally:
             bin_.set_state(Gst.State.NULL)
 
@@ -1686,5 +1709,629 @@ class OutputRecoveryStateActiveDeviceReportingTests(SimpleTestCase):
             slot.current_sink = _BrokenSink()
             state = obj._output_recovery_state()["studio_monitor"]
             self.assertIsNone(state["active_device"])
+        finally:
+            pipeline.set_state(Gst.State.NULL)
+
+
+_DEVICE_LOST_ERROR_TEXT = ("gst-resource-error-quark: Error outputting to audio device. "
+                            "The device has been disconnected. (10)")
+
+
+class OutputStaleGenerationOwnershipTests(MockEmitEventMixin, SimpleTestCase):
+    """[P0] 1.3C physical-acceptance-failure fix -- Bug 1. A real UCA222
+    unplug/replug reproduced a genuine production event storm: ~560
+    "Studio Monitor output lost" events in ~2.5s off ONE physical
+    unplug, each with its OWN generation-specific dedupe key, driven by
+    SlotCoordinator.generation climbing without bound. Root cause:
+    _output_quiesce_current_generation detached (unlinked+removed) the
+    old generation but never retired slot.current_bin/current_sink --
+    so _output_slot_owns_message_src (which reads them fresh on every
+    call, exactly to avoid this) kept matching the remaining ALSA error
+    burst from that already-detached generation against the slot, long
+    after it stopped being current. Every one of those stale matches
+    ran through _on_output_error again -- and once the coordinator had
+    cycled back to OK (which a real teardown can do in milliseconds,
+    the other half of this fix -- see OutputFastOperationObserverTests),
+    mark_degraded() legitimately succeeded AGAIN, off a message that
+    was never really new.
+
+    These tests route messages through the REAL _on_main_bus_error/
+    _output_slot_owns_message_src path (not the _on_output_error
+    shortcut most other tests in this file use) specifically because
+    that ownership routing is what's under test here."""
+
+    def test_stale_current_generation_error_ignored_after_fast_worker_resolves(self):
+        """The realistic fast-error-burst reproduction (required test
+        1): drives the REAL, undelayed quiesce worker to completion
+        BEFORE sending the rest of the burst -- the single most
+        adversarial ordering (the exact condition that let the real
+        storm happen), rather than artificially slowing the worker down
+        (which is why an earlier 62-message test passed for the wrong
+        reason -- it never let the worker actually finish first).
+        Proves: exactly one genuine loss episode, exactly one quiesce,
+        no generation runaway, all stale detached-generation errors
+        ignored, one coalesced SystemEvent, valve stays closed."""
+        obj = make_output_engine_stand_in()
+        pipeline, slot = build_slot_in_pipeline(obj)
+        try:
+            stale_src = slot.current_sink  # captured BEFORE quiesce retires slot.current_sink
+            msg1 = fake_error_message(_DEVICE_LOST_ERROR_TEXT, src=stale_src)
+
+            with patch.object(slot.coordinator, "request_recovery",
+                               wraps=slot.coordinator.request_recovery) as dispatch_spy:
+                self.assertTrue(obj._on_main_bus_error(None, msg1))
+                self.assertEqual(slot.coordinator.state, audio_recovery.SlotState.RECOVERING)
+                self.assertEqual(dispatch_spy.call_count, 1)
+                # The whole point of the fix: retirement is synchronous,
+                # not dependent on the worker having finished yet.
+                self.assertIsNone(slot.current_bin, "current generation must be retired immediately")
+                self.assertIsNone(slot.current_sink)
+                self.assertEqual(len(self.emitted_events), 1)
+                self.assertEqual(slot.coordinator.generation, 1)
+
+                # Let the REAL background worker actually finish -- no
+                # artificial delay anywhere in this test.
+                self.assertTrue(wait_until(lambda: slot.coordinator.state == audio_recovery.SlotState.OK,
+                                            timeout=3.0),
+                                 "the real quiesce worker did not resolve in time")
+
+                gen_checkpoint = slot.coordinator.generation
+                events_checkpoint = list(self.emitted_events)
+                dispatch_checkpoint = dispatch_spy.call_count
+
+                # The rest of the burst: same stale src, tight loop, zero delay.
+                for _ in range(60):
+                    obj._on_main_bus_error(None, fake_error_message(_DEVICE_LOST_ERROR_TEXT, src=stale_src))
+
+                self.assertEqual(slot.coordinator.generation, gen_checkpoint,
+                                  "no generation runaway from the stale burst")
+                self.assertEqual(self.emitted_events, events_checkpoint,
+                                  "no additional SystemEvent from the stale burst -- exactly one loss episode")
+                self.assertEqual(dispatch_spy.call_count, dispatch_checkpoint,
+                                  "no new worker dispatched for any stale burst message")
+                self.assertEqual(slot.coordinator.state, audio_recovery.SlotState.OK,
+                                  "coordinator must not be re-degraded by stale messages")
+                self.assertEqual(slot.valve.get_property("drop"), True,
+                                  "valve stays closed after a quiesce-only success (only a "
+                                  "PROMOTED rebuild reopens it) -- stale burst messages must not "
+                                  "disturb that either way")
+        finally:
+            pipeline.set_state(Gst.State.NULL)
+
+    def test_stale_current_generation_error_explicitly_not_owned(self):
+        """Focused, minimal version of required test 3: after the
+        current generation is detached, a bus error whose source is
+        that old bin/sink is unambiguously not owned by the slot."""
+        obj = make_output_engine_stand_in()
+        pipeline, slot = build_slot_in_pipeline(obj)
+        try:
+            old_bin, old_sink = slot.current_bin, slot.current_sink
+            obj._on_output_error(slot, None, fake_error_message(_DEVICE_LOST_ERROR_TEXT))
+            self.assertIsNone(slot.current_bin)
+            self.assertIsNone(slot.current_sink)
+
+            stale_msg = fake_error_message(_DEVICE_LOST_ERROR_TEXT, src=old_sink)
+            self.assertFalse(obj._output_slot_owns_message_src(slot, stale_msg))
+            stale_msg_bin = fake_error_message(_DEVICE_LOST_ERROR_TEXT, src=old_bin)
+            self.assertFalse(obj._output_slot_owns_message_src(slot, stale_msg_bin))
+
+            # Cleanup hygiene: old_bin is already detached from
+            # main_pipeline (that's the whole point of this test), so
+            # pipeline.set_state(NULL) below can't reach it -- let the
+            # quiesce's own background worker finish first.
+            wait_until(lambda: slot.coordinator.state != audio_recovery.SlotState.RECOVERING, timeout=3.0)
+        finally:
+            pipeline.set_state(Gst.State.NULL)
+
+    def test_stale_pending_generation_error_ignored_after_discard(self):
+        """Required test 4. _output_discard_pending_bin already clears
+        slot.pending_bin/pending_sink at the very top, before any detach
+        or worker dispatch -- confirmed by direct code reading, and
+        locked in here: a bus error whose source is a just-discarded
+        candidate must not be attributed to the slot, must not
+        mark_degraded, must not bump generation, must not emit an event,
+        must not dispatch a new worker.
+
+        Uses the same guaranteed-fail "build_disconnected" generation as
+        test_rebuild_that_never_renders_fails_and_recloses_valve, and
+        waits for the REAL rebuild worker to actually finish (DEGRADED)
+        BEFORE discarding -- calling discard immediately after dispatch,
+        while the rebuild's own worker is still in flight, would just
+        coalesce onto it (request_recovery() correctly refuses a second
+        concurrent operation), never actually running the discard's own
+        NULL-teardown worker at all, which both defeats what this test
+        is trying to exercise and leaves the candidate bin's teardown
+        with nothing to ever drive it to NULL."""
+        obj = make_output_engine_stand_in()
+        pipeline, slot = build_slot_in_pipeline(obj)
+        try:
+            simulate_device_loss_and_quiesce(obj, slot)  # -> DEGRADED, no pending bin
+
+            def build_disconnected(device):
+                bin_ = Gst.Bin.new(f"disconnected_{int(time.time() * 1_000_000)}")
+                inner_valve = Gst.ElementFactory.make("valve", None)
+                inner_valve.set_property("drop", True)
+                sink = Gst.ElementFactory.make("fakesink", None)
+                sink.set_property("sync", False)
+                sink.set_property("async", False)
+                bin_.add(inner_valve)
+                bin_.add(sink)
+                inner_valve.link(sink)
+                ghost = Gst.GhostPad.new("sink", inner_valve.get_static_pad("sink"))
+                ghost.set_active(True)
+                bin_.add_pad(ghost)
+                return bin_, sink
+
+            slot.build_generation_fn = build_disconnected
+            obj._output_dispatch_rebuild(slot)
+            self.assertIsNotNone(slot.pending_bin)
+            candidate_sink = slot.pending_sink
+
+            self.assertTrue(wait_until(lambda: slot.coordinator.state == audio_recovery.SlotState.DEGRADED,
+                                        timeout=OUTPUT_TEST_TIMEOUT),
+                             "the rebuild worker must genuinely finish (fail) before discarding")
+
+            with patch.object(slot.coordinator, "request_recovery",
+                               wraps=slot.coordinator.request_recovery) as dispatch_spy:
+                obj._output_discard_pending_bin(slot, abandoned=False)
+                self.assertIsNone(slot.pending_bin)
+                self.assertIsNone(slot.pending_sink)
+
+                gen_checkpoint = slot.coordinator.generation
+                events_checkpoint = list(self.emitted_events)
+                dispatch_checkpoint = dispatch_spy.call_count
+
+                stale_msg = fake_error_message(_DEVICE_LOST_ERROR_TEXT, src=candidate_sink)
+                self.assertFalse(obj._output_slot_owns_message_src(slot, stale_msg))
+                result = obj._on_main_bus_error(None, stale_msg)
+                self.assertTrue(result)  # routed to nothing, handler still returns True (no-op)
+
+                self.assertEqual(slot.coordinator.generation, gen_checkpoint, "no generation increment")
+                self.assertEqual(self.emitted_events, events_checkpoint, "no event")
+                self.assertEqual(dispatch_spy.call_count, dispatch_checkpoint, "no new worker")
+
+            # Cleanup hygiene: the discarded candidate is already
+            # detached from main_pipeline, so pipeline.set_state(NULL)
+            # below can't reach it -- let its own background worker
+            # finish tearing it down first (same rationale as
+            # wait_for_pending_discard_to_resolve elsewhere in this file).
+            wait_until(lambda: slot.coordinator.state != audio_recovery.SlotState.RECOVERING, timeout=3.0)
+        finally:
+            pipeline.set_state(Gst.State.NULL)
+
+
+class OutputFastOperationObserverTests(MockEmitEventMixin, SimpleTestCase):
+    """[P0] 1.3C physical-acceptance-failure fix -- Bug 1, item 4
+    (required test 2). _output_recovery_tick only calls
+    _output_handle_slot_transition when snapshot["state"] differs from
+    slot.last_observed_slot_state, polled every ~300ms. A real UCA222
+    teardown can complete in well under that -- OK->DEGRADED->
+    RECOVERING->OK entirely between two ticks -- and pre-fix,
+    last_observed_slot_state was never updated at dispatch time, only by
+    the tick itself, so a tick landing after such a fast round-trip saw
+    new_state == old_state == "OK" and silently skipped the transition
+    handler: no re-degrade, the slot stranded reporting phantom "OK"
+    with a torn-down generation, no automatic rebuild ever attempted.
+
+    Fixed via _output_request_recovery, which records RECOVERING into
+    last_observed_slot_state synchronously the moment request_recovery()
+    returns "dispatched" (a guaranteed-true fact at that exact instant,
+    per SlotCoordinator's own locking -- see that method's docstring).
+
+    Deliberately does NOT manually invoke _output_handle_slot_transition
+    anywhere in this test -- that would hide exactly the race being
+    proven here. Only the real dispatch path and the real tick are used."""
+
+    def test_missed_intermediate_state_still_processed_by_next_real_tick(self):
+        obj = make_output_engine_stand_in()
+        pipeline, slot = build_slot_in_pipeline(obj)
+        try:
+            obj.running = True
+            obj._on_output_error(slot, None, fake_error_message(_DEVICE_LOST_ERROR_TEXT))
+            self.assertEqual(slot.last_observed_slot_state, audio_recovery.SlotState.RECOVERING.value,
+                              "the fix: dispatch must synchronously record RECOVERING as observed")
+
+            # Force the exact production race: the real worker resolves
+            # ALL THE WAY back to OK before _output_recovery_tick gets
+            # even one chance to run.
+            self.assertTrue(wait_until(lambda: slot.coordinator.state == audio_recovery.SlotState.OK, timeout=3.0))
+            self.assertIsNone(slot.pending_bin)  # this was a quiesce, not a rebuild
+
+            obj._output_recovery_tick()  # the REAL tick -- no manual transition-handler call
+
+            self.assertEqual(slot.coordinator.state, audio_recovery.SlotState.DEGRADED,
+                              "the quiesce completion must still be processed: re-degraded, "
+                              "ready for presence-probing to eventually dispatch a rebuild")
+            self.assertEqual(slot.last_observed_slot_state, audio_recovery.SlotState.DEGRADED.value)
+        finally:
+            pipeline.set_state(Gst.State.NULL)
+
+    def test_candidate_rebuild_dispatch_marks_recovering_immediately(self):
+        """Audits the second of the three named dispatch sites: candidate
+        rebuild (quiesce is covered by the test above)."""
+        obj = make_output_engine_stand_in()
+        pipeline, slot = build_slot_in_pipeline(obj)
+        try:
+            simulate_device_loss_and_quiesce(obj, slot)  # -> DEGRADED, ready for a rebuild dispatch
+            slot.last_observed_slot_state = audio_recovery.SlotState.DEGRADED.value
+            obj._output_dispatch_rebuild(slot)
+            self.assertEqual(slot.last_observed_slot_state, audio_recovery.SlotState.RECOVERING.value,
+                              "candidate rebuild dispatch must mark RECOVERING immediately")
+        finally:
+            pipeline.set_state(Gst.State.NULL)
+
+    def test_discard_pending_dispatch_site_and_tick_bookkeeping_survive_nested_dispatch(self):
+        """Audits the third dispatch site (pending-generation discard)
+        AND a second, related bug this review's fix surfaced: discard-
+        pending is itself invoked FROM WITHIN _output_handle_slot_
+        transition's DEGRADED branch (a failed rebuild is discarded
+        immediately) -- so its own request_recovery() call, and this
+        method's own last_observed_slot_state update, both happen
+        NESTED INSIDE a call the tick itself is in the middle of. The
+        tick's own post-handler bookkeeping must not blindly stomp that
+        nested update back down to the pre-handler snapshot value (see
+        _output_recovery_tick's own docstring) -- proven here by driving
+        the WHOLE sequence through real, undelayed dispatch and real
+        ticks only, never manually invoking _output_handle_slot_
+        transition."""
+        obj = make_output_engine_stand_in()
+        pipeline, slot = build_slot_in_pipeline(obj)
+        try:
+            simulate_device_loss_and_quiesce(obj, slot)  # -> DEGRADED, no pending bin
+
+            def build_disconnected(device):
+                # Same "reaches PLAYING but can never render" technique
+                # as test_rebuild_that_never_renders_fails_and_recloses_
+                # valve -- guarantees this candidate's health
+                # verification genuinely fails, deterministically.
+                bin_ = Gst.Bin.new(f"disconnected_{int(time.time() * 1_000_000)}")
+                inner_valve = Gst.ElementFactory.make("valve", None)
+                inner_valve.set_property("drop", True)
+                sink = Gst.ElementFactory.make("fakesink", None)
+                sink.set_property("sync", False)
+                sink.set_property("async", False)
+                bin_.add(inner_valve)
+                bin_.add(sink)
+                inner_valve.link(sink)
+                ghost = Gst.GhostPad.new("sink", inner_valve.get_static_pad("sink"))
+                ghost.set_active(True)
+                bin_.add_pad(ghost)
+                return bin_, sink
+
+            slot.build_generation_fn = build_disconnected
+            obj._output_dispatch_rebuild(slot)
+            self.assertEqual(slot.last_observed_slot_state, audio_recovery.SlotState.RECOVERING.value)
+
+            # Real, undelayed worker resolving the (guaranteed) failure --
+            # no artificial slowdown anywhere.
+            self.assertTrue(wait_until(lambda: slot.coordinator.state == audio_recovery.SlotState.DEGRADED,
+                                        timeout=OUTPUT_TEST_TIMEOUT))
+            self.assertIsNotNone(slot.pending_bin, "the failed candidate must still be in place pre-tick")
+
+            obj.running = True
+            with patch.object(slot.coordinator, "request_recovery",
+                               wraps=slot.coordinator.request_recovery) as dispatch_spy:
+                obj._output_recovery_tick()  # the REAL tick -- drives discard-pending internally
+
+            self.assertEqual(dispatch_spy.call_count, 1,
+                              "the tick's own call into the transition handler must have dispatched "
+                              "the discard-pending NULL worker exactly once")
+            self.assertIsNone(slot.pending_bin, "failed candidate must be discarded")
+            # The crux: after the nested discard-pending dispatch,
+            # last_observed_slot_state must reflect THAT fresh dispatch
+            # (RECOVERING), not the pre-handler DEGRADED snapshot the
+            # tick captured before calling the handler. Under real,
+            # uncontrolled timing (this test doesn't force the ordering
+            # either way), this is safe REGARDLESS of how fast the
+            # discard's own background worker resolves, specifically
+            # because of the recovery_dispatch_serial guard in
+            # _output_recovery_tick (review round 2) -- an EARLIER
+            # version of this fix (round 1: unconditionally re-reading
+            # coordinator.state fresh after the handler returns) was
+            # ITSELF still racy here: if that worker resolves to OK
+            # before the handler returns, "re-read fresh" would see OK
+            # and erase this marker. See
+            # test_nested_dispatch_fast_completion_before_handler_return_
+            # is_not_lost below for the version of this exact scenario
+            # that FORCES the worker to resolve before the handler
+            # returns, rather than leaving it to chance.
+            self.assertEqual(slot.last_observed_slot_state, audio_recovery.SlotState.RECOVERING.value,
+                              "tick bookkeeping must not stomp the nested dispatch's own update")
+
+            # Cleanup hygiene only, no bearing on the assertions above:
+            # the nested discard already detached its bin from
+            # main_pipeline (see _output_discard_pending_bin), so
+            # pipeline.set_state(NULL) below can no longer reach it --
+            # its own background worker owns tearing IT down. Let that
+            # finish before the pipeline teardown/test end, same
+            # rationale as wait_for_pending_discard_to_resolve elsewhere
+            # in this file (avoids a bin still in PLAYING racing
+            # Python's GC against its own daemon teardown thread).
+            wait_until(lambda: slot.coordinator.state != audio_recovery.SlotState.RECOVERING, timeout=3.0)
+        finally:
+            pipeline.set_state(Gst.State.NULL)
+
+    def test_nested_dispatch_fast_completion_before_handler_return_is_not_lost(self):
+        """[P0] 1.3C physical-acceptance-failure fix, review round 2 --
+        the exact race flagged: a nested operation dispatched from
+        INSIDE _output_handle_slot_transition (here, discard-pending)
+        resolves all the way back to OK BEFORE the handler call itself
+        returns. Round 1's fix ("re-read coordinator.state fresh after
+        the handler returns") was still racy against exactly this
+        ordering -- a value comparison can't tell "nothing new was
+        dispatched" apart from "something new was dispatched and
+        already finished". Fixed with slot.recovery_dispatch_serial.
+
+        FORCES the ordering deterministically -- never hopes scheduler
+        timing cooperates. Wraps _output_request_recovery itself so that,
+        the instant it reports "dispatched" for the NESTED call (the
+        discard's own NULL-teardown worker), this test blocks the
+        calling thread (the tick's own thread, still inside the handler)
+        until the real, undelayed worker has ACTUALLY resolved the
+        coordinator to OK -- guaranteeing the worker finishes strictly
+        before _output_handle_slot_transition, and therefore this whole
+        tick call, returns. The real tick and the real observer
+        bookkeeping are otherwise untouched -- only the timing is forced,
+        not the outcome."""
+        obj = make_output_engine_stand_in()
+        pipeline, slot = build_slot_in_pipeline(obj)
+        try:
+            simulate_device_loss_and_quiesce(obj, slot)  # -> DEGRADED, no pending bin
+
+            def build_disconnected(device):
+                bin_ = Gst.Bin.new(f"disconnected_{int(time.time() * 1_000_000)}")
+                inner_valve = Gst.ElementFactory.make("valve", None)
+                inner_valve.set_property("drop", True)
+                sink = Gst.ElementFactory.make("fakesink", None)
+                sink.set_property("sync", False)
+                sink.set_property("async", False)
+                bin_.add(inner_valve)
+                bin_.add(sink)
+                inner_valve.link(sink)
+                ghost = Gst.GhostPad.new("sink", inner_valve.get_static_pad("sink"))
+                ghost.set_active(True)
+                bin_.add_pad(ghost)
+                return bin_, sink
+
+            slot.build_generation_fn = build_disconnected
+            obj._output_dispatch_rebuild(slot)
+            self.assertTrue(wait_until(lambda: slot.coordinator.state == audio_recovery.SlotState.DEGRADED,
+                                        timeout=OUTPUT_TEST_TIMEOUT),
+                             "the rebuild worker must genuinely fail before the first tick runs")
+            self.assertIsNotNone(slot.pending_bin)
+            self.assertEqual(slot.last_observed_slot_state, audio_recovery.SlotState.RECOVERING.value,
+                              "primes the mismatch the first tick must detect: last_observed still "
+                              "RECOVERING (from the rebuild dispatch above) vs. the real DEGRADED state")
+
+            real_request_recovery = obj._output_request_recovery
+
+            def blocking_request_recovery(slot_arg, worker):
+                result = real_request_recovery(slot_arg, worker)
+                if result == "dispatched":
+                    # Force the exact adversarial ordering: don't return
+                    # control to the caller (here, _output_discard_pending_
+                    # bin, and therefore _output_handle_slot_transition,
+                    # and therefore this whole tick call) until the real
+                    # background worker has ACTUALLY resolved this
+                    # operation. No artificial worker slowdown anywhere --
+                    # only this test's own return is delayed.
+                    self.assertTrue(
+                        wait_until(lambda: slot_arg.coordinator.state == audio_recovery.SlotState.OK, timeout=3.0),
+                        "the nested discard's NULL-teardown worker must resolve to OK")
+                return result
+
+            obj.running = True
+            with patch.object(obj, "_output_request_recovery", side_effect=blocking_request_recovery):
+                obj._output_recovery_tick()  # first REAL tick -- drives the nested discard, forced to finish inline
+
+            # After the first tick: the nested worker has DEFINITELY
+            # already resolved to OK (forced above, not hoped for) --
+            # but last_observed_slot_state must still read RECOVERING,
+            # never OK, per the fix. This is the assertion round 1's fix
+            # could not reliably satisfy.
+            self.assertEqual(slot.coordinator.state, audio_recovery.SlotState.OK,
+                              "sanity: the nested worker really did finish before this point")
+            self.assertEqual(slot.last_observed_slot_state, audio_recovery.SlotState.RECOVERING.value,
+                              "the RECOVERING marker must survive the handler returning, even though "
+                              "the nested operation it dispatched already resolved to OK")
+            self.assertIsNone(slot.pending_bin, "the failed candidate was still correctly discarded")
+
+            # Second REAL tick -- must recognize the now-stale
+            # RECOVERING -> OK transition and actually process it
+            # (re-degrade after what was, functionally, a successful
+            # quiesce-equivalent teardown), landing the slot in the
+            # correct DEGRADED/waiting-for-presence state -- not stuck
+            # reporting a stale, already-superseded observation forever.
+            obj._output_recovery_tick()
+            self.assertEqual(slot.coordinator.state, audio_recovery.SlotState.DEGRADED,
+                              "second tick must process the missed completion and re-degrade")
+            self.assertEqual(slot.last_observed_slot_state, audio_recovery.SlotState.DEGRADED.value)
+        finally:
+            pipeline.set_state(Gst.State.NULL)
+
+
+def _build_generation_with_sink_props(async_val, sync_val):
+    """Test-only generation builder -- same shape as
+    _build_studio_monitor_hw_generation, with async/sync EXPLICITLY
+    controlled (rather than that method's own choice baked in) so a
+    test can directly compare the pre-fix (async=True, GstBaseSink's
+    own default) and post-fix (async=False) Studio Monitor behavior
+    through the REAL recovery choreography, without touching real ALSA
+    hardware. fakesink is a legitimate stand-in specifically for THIS
+    experiment: async/sync preroll-gating is implemented in GstBaseSink
+    itself (a common base class alsasink inherits unmodified), not
+    sink-type-specific -- confirmed directly via the standalone harness
+    in scratchpad/audio_output_recovery/ before this fix was written."""
+    def build(device):
+        bin_ = Gst.Bin.new(f"preroll_test_gen{int(time.time() * 1_000_000)}")
+        sink = Gst.ElementFactory.make("fakesink", None)
+        sink.set_property("async", async_val)
+        sink.set_property("sync", sync_val)
+        bin_.add(sink)
+        ghost = Gst.GhostPad.new("sink", sink.get_static_pad("sink"))
+        ghost.set_active(True)
+        bin_.add_pad(ghost)
+        return bin_, sink
+    return build
+
+
+class OutputStudioMonitorPrerollRegressionTests(MockEmitEventMixin, SimpleTestCase):
+    """[P0] 1.3C physical-acceptance-failure fix -- Bug 2 (required test
+    5). Root cause: _output_dispatch_rebuild links a fresh candidate
+    behind a CLOSED valve and waits for it to reach PLAYING before ever
+    opening that valve. async=True (GstBaseSink's own default, and what
+    _build_studio_monitor_hw_generation left Studio Monitor's alsasink
+    at, pre-fix) makes PAUSED->PLAYING itself asynchronous, gated on
+    receiving a first buffer to preroll with -- which a closed valve
+    upstream can never deliver. Circular: needs a buffer to reach
+    PLAYING, needs PLAYING before the valve opens, valve closed means no
+    buffer. Confirmed by physical UCA222 testing (every real rebuild
+    timed out at ~6s and failed health verification, repeated every
+    retry -- no automatic recovery, audio only returned after an
+    operator restarted the engine) and by the standalone empirical
+    harness this test's first method reproduces directly."""
+
+    def test_async_true_cannot_reach_playing_behind_closed_valve(self):
+        """Raw GstBaseSink reproduction of the empirical preroll-gate
+        harness (scratchpad/audio_output_recovery/) -- audiotestsrc ->
+        valve(drop=True) -> fakesink(async=True). Demonstrates the OLD,
+        broken Studio Monitor behavior directly, with no engine
+        machinery involved at all."""
+        pipeline = Gst.Pipeline.new("preroll-regression-async-true")
+        src = Gst.ElementFactory.make("audiotestsrc", None)
+        src.set_property("is-live", True)
+        valve = Gst.ElementFactory.make("valve", None)
+        valve.set_property("drop", True)
+        sink = Gst.ElementFactory.make("fakesink", None)
+        sink.set_property("async", True)
+        sink.set_property("sync", True)
+        for el in (src, valve, sink):
+            pipeline.add(el)
+        src.link(valve)
+        valve.link(sink)
+        try:
+            pipeline.set_state(Gst.State.PLAYING)
+            reached_playing = wait_until(
+                lambda: pipeline.get_state(0)[1] == Gst.State.PLAYING, timeout=1.5)
+            self.assertFalse(reached_playing,
+                              "async=True must NOT reach PLAYING behind a closed valve")
+        finally:
+            pipeline.set_state(Gst.State.NULL)
+
+    def test_async_false_reaches_playing_and_renders_after_valve_opens(self):
+        """Same shape, async=False/sync=True (the fix) -- reaches
+        PLAYING despite the closed valve, and opening the valve
+        afterward makes the rendered count increase."""
+        pipeline = Gst.Pipeline.new("preroll-regression-async-false")
+        src = Gst.ElementFactory.make("audiotestsrc", None)
+        src.set_property("is-live", True)
+        valve = Gst.ElementFactory.make("valve", None)
+        valve.set_property("drop", True)
+        sink = Gst.ElementFactory.make("fakesink", None)
+        sink.set_property("async", False)
+        sink.set_property("sync", True)
+        for el in (src, valve, sink):
+            pipeline.add(el)
+        src.link(valve)
+        valve.link(sink)
+        try:
+            pipeline.set_state(Gst.State.PLAYING)
+            self.assertTrue(wait_until(lambda: pipeline.get_state(0)[1] == Gst.State.PLAYING, timeout=1.5),
+                             "async=False must reach PLAYING even behind a closed valve")
+
+            def rendered():
+                stats = sink.get_property("stats")
+                ok, val = stats.get_uint64("rendered")
+                return val if ok else None
+
+            self.assertEqual(rendered(), 0, "nothing should have rendered yet -- valve still closed")
+            valve.set_property("drop", False)
+            self.assertTrue(wait_until(lambda: (rendered() or 0) > 0, timeout=1.5),
+                             "rendered count must increase once the valve opens")
+        finally:
+            pipeline.set_state(Gst.State.NULL)
+
+    def test_real_dispatch_rebuild_fails_with_async_true_studio_monitor_shape(self):
+        """The SAME failure through the REAL _output_dispatch_rebuild
+        choreography (not just the raw GstBaseSink harness) -- proves
+        the fix matters to the actual recovery machinery, not only in
+        the abstract. Deadline shrunk via patching so this stays a fast
+        test; the mechanism under test (the circular PLAYING/valve gate)
+        doesn't depend on the deadline's magnitude, only that it's
+        eventually reached."""
+        obj = make_output_engine_stand_in()
+        pipeline, slot = build_slot_in_pipeline(
+            obj, build_generation_fn=_build_generation_with_sink_props(async_val=True, sync_val=True))
+        try:
+            simulate_device_loss_and_quiesce(obj, slot)  # -> DEGRADED, ready for a rebuild dispatch
+            with patch.object(eng_module, "OUTPUT_HEALTH_CHECK_DEADLINE_S", 0.4):
+                obj._output_dispatch_rebuild(slot)
+                self.assertTrue(wait_until(lambda: slot.coordinator.state == audio_recovery.SlotState.DEGRADED,
+                                            timeout=3.0),
+                                 "the pre-fix shape must fail health verification (never reaches PLAYING)")
+            snapshot = slot.coordinator.snapshot()
+            self.assertIs(snapshot["operation_succeeded"], False)
+            self.assertEqual(slot.valve.get_property("drop"), True, "valve must stay closed on failure")
+        finally:
+            pipeline.set_state(Gst.State.NULL)
+
+    def test_real_dispatch_rebuild_succeeds_with_studio_monitor_fixed_shape(self):
+        """The SAME choreography, async=False/sync=True (matching
+        _build_studio_monitor_hw_generation's actual chosen properties
+        post-fix) -- candidate reaches PLAYING behind the closed valve,
+        the worker opens the valve, rendered count increases, and the
+        rebuild is reported successful end to end."""
+        obj = make_output_engine_stand_in()
+        pipeline, slot = build_slot_in_pipeline(
+            obj, build_generation_fn=_build_generation_with_sink_props(async_val=False, sync_val=True))
+        try:
+            simulate_device_loss_and_quiesce(obj, slot)  # -> DEGRADED, ready for a rebuild dispatch
+            obj._output_dispatch_rebuild(slot)
+            self.assertTrue(wait_until(lambda: slot.coordinator.state == audio_recovery.SlotState.OK,
+                                        timeout=OUTPUT_TEST_TIMEOUT),
+                             "the fixed shape must pass health verification and succeed")
+            snapshot = slot.coordinator.snapshot()
+            self.assertIs(snapshot["operation_succeeded"], True)
+            self.assertEqual(slot.valve.get_property("drop"), False, "valve must be open after success")
+            rendered_ok, rendered_val = slot.pending_sink.get_property("stats").get_uint64("rendered")
+            self.assertTrue(rendered_ok)
+            self.assertGreater(rendered_val, 0, "rendered count must have genuinely increased")
+        finally:
+            pipeline.set_state(Gst.State.NULL)
+
+
+class OutputMonitoringDedupeDefenseInDepthTests(TestCase):
+    """[P0] 1.3C physical-acceptance-failure fix -- required test 8,
+    engine-integration half (see monitoring/tests/test_emit_event_
+    dedupe.py for the direct, thorough emit_event-level coverage --
+    including a negative control proving a generation-suffixed key
+    genuinely defeats coalescing, so THAT file's positive result isn't
+    trivially true). This file closes the loop the other direction:
+    proves the REAL _on_output_error call site, against the REAL
+    database (no MockEmitEventMixin), actually uses the stable key
+    format monitoring/tests/test_emit_event_dedupe.py already proved
+    coalesces correctly -- i.e. that the fix in engine.py and the
+    defense-in-depth in emit_event are actually wired together, not
+    just each independently correct in isolation."""
+
+    def test_first_failure_notification_uses_the_stable_dedupe_key(self):
+        from monitoring.models import SystemEvent
+
+        obj = make_output_engine_stand_in()
+        pipeline, slot = build_slot_in_pipeline(obj)
+        try:
+            obj._on_output_error(slot, None, fake_error_message(_DEVICE_LOST_ERROR_TEXT))
+
+            rows = list(SystemEvent.objects.filter(category="hardware", title="Studio Monitor output lost"))
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0].dedupe_key, "hardware|output-lost|studio_monitor",
+                              "must be the stable per-slot key, no coordinator.generation suffix -- "
+                              "see monitoring/tests/test_emit_event_dedupe.py for proof THIS exact "
+                              "key format coalesces hundreds of rapid repeats into one row")
+            self.assertIn("generation", rows[0].detail)
+            self.assertIn("loss_episode", rows[0].detail)
+
+            self.assertTrue(wait_until(lambda: slot.coordinator.state != audio_recovery.SlotState.RECOVERING,
+                                        timeout=3.0))
         finally:
             pipeline.set_state(Gst.State.NULL)

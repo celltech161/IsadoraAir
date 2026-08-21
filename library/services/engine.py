@@ -369,6 +369,31 @@ class OutputRecoverySlot:
         self.last_state_change_at = None
         self._device_loss_epoch = 0
         self._device_loss_epoch_lock = threading.Lock()
+        # [P0] 1.3C physical-acceptance-failure fix -- a UI-facing loss-
+        # episode counter, DELIBERATELY separate from
+        # SlotCoordinator.generation (that counter is an internal
+        # operation-tagging mechanism, bumped once per dispatched
+        # recovery attempt -- NOT a "how many times has this genuinely
+        # gone from healthy to lost" count, and must never be used as a
+        # SystemEvent dedupe-key spam boundary; see _on_output_error and
+        # monitoring/models.py's emit_event). Bumped exactly once per
+        # OK->DEGRADED transition (a genuine first-failure notification),
+        # included in the "output lost" event's detail for operator
+        # traceability even when repeats coalesce into one dashboard row.
+        self.loss_episode = 0
+
+        # [P0] 1.3C second physical-acceptance-failure fix -- serial
+        # bumped synchronously, on the calling thread, every time
+        # _output_request_recovery() actually returns "dispatched" (a
+        # NEW operation genuinely started). Lets _output_recovery_tick
+        # distinguish "the transition handler I just called dispatched
+        # a follow-up operation" from "it didn't", WITHOUT relying on
+        # comparing coordinator.state values (which the nested
+        # operation's own worker can race past before the handler even
+        # returns, on real hardware-teardown timescales -- confirmed by
+        # physical UCA222 testing). See _output_request_recovery and
+        # _output_recovery_tick's own docstrings for the full mechanism.
+        self.recovery_dispatch_serial = 0
 
     def record_device_loss(self):
         """Called from _on_output_error for EVERY classified device_lost
@@ -1353,7 +1378,19 @@ class PlaybackEngine:
         reachable via slot.current_bin either, so this can't accidentally
         act on a late result from an abandoned generation (the bus-
         routing side of the same invariant SlotCoordinator's own
-        generation-tagging already enforces on the coordinator side)."""
+        generation-tagging already enforces on the coordinator side).
+
+        [P0] 1.3C physical-acceptance-failure fix -- that
+        "no longer reachable via slot.current_bin" claim was aspirational
+        until this fix: _output_quiesce_current_generation used to unlink
+        +remove the old bin WITHOUT ever clearing slot.current_bin itself,
+        so this method kept matching the remaining ALSA error burst from
+        an already-detached generation against the slot, long after it
+        stopped being current -- confirmed as the root of a real
+        production event-storm (gen0->gen563 in ~2.5s off one physical
+        unplug). slot.current_bin/current_sink are now retired (set to
+        None) at detach time specifically so THIS lookup's own fresh-read
+        guarantee actually holds -- see that method's docstring."""
         known = [slot.queue, slot.errorignore, slot.valve, slot.current_bin]
         if slot.pending_bin is not None:
             known.append(slot.pending_bin)
@@ -1921,10 +1958,39 @@ class PlaybackEngine:
         design refinement in ROUND7_DECISION_REPORT.md). No convert/
         resample stage here, matching today's pre-1.3C direct
         agc_limiter.link(alsasink) -- the format is already fixed
-        upstream by the shared capsfilter earlier in the chain."""
+        upstream by the shared capsfilter earlier in the chain.
+
+        [P0] 1.3C physical-acceptance-failure fix -- async=False,
+        deliberately NOT copying StereoTool's whole property set
+        (sync/buffer-time/latency-time stay untouched, i.e. sync
+        defaults to GStreamer's True). Root cause: the recovery
+        choreography in _output_dispatch_rebuild links a fresh candidate
+        behind a CLOSED valve and waits for it to reach PLAYING before
+        ever opening that valve -- but async=True (GstBaseSink's
+        default) makes PAUSED->PLAYING itself asynchronous, blocked on
+        receiving a first buffer to preroll with. A closed valve
+        upstream means no buffer ever arrives, so the candidate could
+        never reach PLAYING, the choreography's own gate could never
+        pass, and every real rebuild attempt timed out at
+        OUTPUT_HEALTH_CHECK_DEADLINE_S and failed health verification --
+        confirmed exactly by physical UCA222 testing (dispatch, ~6s,
+        "failed health verification", repeated every retry) and by a
+        standalone empirical harness reproducing the identical
+        audiotestsrc->valve(drop=True)->fakesink(async=?) shape (see
+        scratchpad/audio_output_recovery/ for the harness/results):
+        async=True never reaches PLAYING behind a closed valve within a
+        3s deadline; async=False reaches it immediately, and opening the
+        valve afterward makes the rendered count increase right away.
+        sync stays True (untouched) -- Studio Monitor is a real
+        listening output where normal clock-synchronised rendering is
+        wanted once buffers flow, unlike StereoTool's loopback-fed,
+        deliberately real-time-priority path; there is no evidence here
+        that Studio Monitor needs StereoTool's other tuned properties
+        (buffer-time/latency-time) at all, so none of those are copied."""
         bin_ = Gst.Bin.new(f"studio_monitor_gen{int(time.time() * 1000)}")
         sink = Gst.ElementFactory.make("alsasink", None)
         sink.set_property("device", device)
+        sink.set_property("async", False)
         bin_.add(sink)
         ghost = Gst.GhostPad.new("sink", sink.get_static_pad("sink"))
         ghost.set_active(True)
@@ -2051,13 +2117,101 @@ class PlaybackEngine:
         slot.recovery_attempt = 0
         slot.next_retry_at = None
         slot.device_present = None
+        slot.loss_episode += 1
+        # [P0] 1.3C physical-acceptance-failure fix -- the dedupe key is
+        # now STABLE per slot (no coordinator generation in it). Physical
+        # UCA222 testing surfaced a real production event flood: a
+        # separate bug (see _output_quiesce_current_generation's own
+        # fix, below) let a burst of stale bus errors from an already-
+        # detached generation keep re-triggering genuine OK->DEGRADED
+        # transitions, each bumping SlotCoordinator.generation -- and
+        # since THAT counter was baked into this dedupe key, every one
+        # of ~560 events in ~2.5s defeated emit_event's normal 60-second
+        # coalescing and became its own dashboard row. Fixed at the root
+        # (that storm can no longer happen at all), but hardening this
+        # key is deliberate defense-in-depth: coordinator.generation is
+        # an internal operation-tagging counter, never a UI spam
+        # boundary -- if some future bug reintroduces rapid flapping,
+        # repeats now coalesce into repeat_count on ONE row instead of
+        # flooding the dashboard again. generation and the separate,
+        # UI-facing loss_episode counter (bumped once per genuine
+        # OK->DEGRADED transition, independent of SlotCoordinator) both
+        # move into `detail` instead, so operators can still see how
+        # many distinct episodes a coalesced row represents.
         emit_event(
             category="hardware", level="warning", title=f"{slot.name} output lost",
-            detail={"error": slot.last_error},
-            dedupe_key=f"hardware|output-lost|{slot.kind}|gen{slot.coordinator.generation}",
+            detail={"error": slot.last_error, "generation": slot.coordinator.generation,
+                    "loss_episode": slot.loss_episode},
+            dedupe_key=f"hardware|output-lost|{slot.kind}",
         )
         self._output_quiesce_current_generation(slot)
         return True
+
+    def _output_request_recovery(self, slot, worker):
+        """[P0] 1.3C physical-acceptance-failure fix -- thin wrapper
+        around slot.coordinator.request_recovery(worker), shared by all
+        three output dispatch sites (current-generation quiesce,
+        candidate rebuild, pending-generation discard). Closes the
+        polling-observer race: _output_recovery_tick only calls
+        _output_handle_slot_transition when snapshot["state"] differs
+        from slot.last_observed_slot_state, polled every ~300ms -- but a
+        real UCA222 teardown was observed completing in well under that,
+        meaning OK->DEGRADED->RECOVERING->OK could all happen between
+        two ticks, leaving last_observed_slot_state sitting at "OK"
+        throughout and silently skipping the transition handler entirely
+        (no re-degrade, no promotion bookkeeping -- exactly the kind of
+        gap that let stale bus errors alone look like they were driving
+        the whole gen0->gen563 storm).
+
+        request_recovery() sets state to RECOVERING, synchronously,
+        under its own lock, BEFORE returning "dispatched" (see
+        SlotCoordinator._dispatch_locked) -- and the worker thread's own
+        eventual _on_worker_resolved() call needs that SAME lock, so it
+        cannot race ahead of this call's return. That makes "the
+        coordinator is in RECOVERING right now" a fact, not a guess, at
+        the exact moment "dispatched" comes back -- so recording it into
+        last_observed_slot_state HERE, synchronously, on the GLib
+        thread, is safe and race-free. The very next tick then always
+        has a true baseline to diff against, however fast the worker
+        resolves -- timing correctness no longer depends on a 300ms poll
+        catching an intermediate state.
+
+        Deliberately narrow: only "dispatched" means a NEW transition to
+        RECOVERING just happened. "coalesced" means the coordinator was
+        ALREADY RECOVERING (last_observed_slot_state should already
+        reflect that from whichever dispatch got coalesced onto).
+        "ignored_ok"/"ignored_restart_required" mean nothing changed at
+        all. Updating on anything else would be recording something that
+        didn't actually happen.
+
+        [P0] 1.3C SECOND physical-acceptance-failure fix (review round
+        2) -- also bumps slot.recovery_dispatch_serial on "dispatched",
+        synchronously, same call, same thread, same guarantee as the
+        last_observed_slot_state write above. This is the marker
+        _output_recovery_tick's post-handler bookkeeping now checks
+        before it's allowed to overwrite last_observed_slot_state at
+        all -- closing a SECOND, narrower race the first fix's own
+        "re-read coordinator.state fresh after the handler returns"
+        approach still had: if a NESTED operation dispatched from
+        inside _output_handle_slot_transition (e.g. discard-pending
+        firing from the DEGRADED branch) resolves all the way back to
+        OK before that handler call even returns, re-reading
+        coordinator.state fresh sees "OK" and erases the RECOVERING
+        marker this method just installed -- even though the marker was
+        correct and the tick that installed it hasn't had a chance to
+        observe it yet. A value comparison against coordinator.state
+        can't distinguish "nothing new was dispatched" from "something
+        new was dispatched AND already finished" -- both look like "the
+        state moved on" from the same starting point. The serial can:
+        it only advances on an actual NEW dispatch, so the tick can tell
+        the two cases apart deterministically, never by hoping a
+        millisecond-scale NULL worker (physical UCA222-confirmed) loses
+        the race."""
+        result = slot.coordinator.request_recovery(worker)
+        if result == "dispatched":
+            slot.last_observed_slot_state = audio_recovery.SlotState.RECOVERING.value
+            slot.recovery_dispatch_serial += 1
+        return result
 
     def _output_quiesce_current_generation(self, slot):
         """[P0] 1.3C -- mirrors _mic_quiesce_current_generation exactly:
@@ -2066,7 +2220,29 @@ class PlaybackEngine:
         set_state(NULL) call against the now-orphaned bin goes through
         the guarded background worker (the proven hang risk, per the
         original mic-recovery investigation's own py-spy-confirmed
-        pthread_mutex_lock contention finding)."""
+        pthread_mutex_lock contention finding).
+
+        [P0] 1.3C physical-acceptance-failure fix -- slot.current_bin/
+        slot.current_sink are now retired (set to None) HERE,
+        immediately after the detach, BEFORE request_recovery() even
+        dispatches the NULL worker. Previously they kept pointing at
+        this now-unlinked-and-removed old generation all the way until
+        (if ever) a FUTURE rebuild got promoted -- so
+        _output_slot_owns_message_src kept matching the remaining ALSA
+        error burst from that detached generation against THIS slot,
+        long after it stopped being the slot's real current generation.
+        Confirmed exactly this in physical UCA222 testing: a real unplug
+        produces a burst of near-simultaneous bus errors (Round 6's own
+        62-message/11.6ms precedent, and now ~560 in ~2.5s), and every
+        one after the first was still being attributed here, each
+        landing on a coordinator that had ALREADY cycled back to OK
+        (see _output_request_recovery's docstring for the other half of
+        why that kept happening so fast) -- re-triggering mark_degraded()
+        again and again, a fresh quiesce every time, generation climbing
+        without bound. old_bin is kept as a local closure variable for
+        the worker below (never re-read from the slot), so the teardown
+        itself is completely unaffected by retiring the slot's own
+        reference to it."""
         old_bin = slot.current_bin
         valve_src = slot.valve.get_static_pad("src")
         try:
@@ -2077,6 +2253,15 @@ class PlaybackEngine:
         except Exception as exc:
             print(f"  Output quiesce ({slot.name}): failed to detach old generation cleanly ({exc}); "
                   f"still dispatching guarded teardown")
+        # Retired regardless of whether the try above hit its except --
+        # even a failed/partial detach means this generation is no
+        # longer something later code should treat as "the healthy
+        # current sink" (mirrors the same all-paths-retire treatment
+        # _output_discard_pending_bin already gives pending_bin/
+        # pending_sink, just one line later here since old_bin has to be
+        # captured first).
+        slot.current_bin = None
+        slot.current_sink = None
 
         def worker():
             old_bin.set_state(Gst.State.NULL)
@@ -2084,7 +2269,7 @@ class PlaybackEngine:
             # see _mic_quiesce_current_generation's identical comment.
             return True
 
-        result = slot.coordinator.request_recovery(worker)
+        result = self._output_request_recovery(slot, worker)
         print(f"  Output quiesce dispatched ({slot.name}): {result}")
 
     def _output_dispatch_rebuild(self, slot):
@@ -2209,7 +2394,7 @@ class PlaybackEngine:
                 return False
             return True
 
-        result = slot.coordinator.request_recovery(worker)
+        result = self._output_request_recovery(slot, worker)
         print(f"  Output rebuild dispatched ({slot.name}, generation {slot.coordinator.generation}): {result}")
 
     def _output_discard_pending_bin(self, slot, abandoned=False):
@@ -2220,7 +2405,19 @@ class PlaybackEngine:
         question this codebase already declines to resolve for mic:
         can a fresh element safely reopen the same device while an old,
         abandoned close() may still hold it? Untested, not assumed
-        true)."""
+        true).
+
+        [P0] 1.3C physical-acceptance-failure fix, item 2 audit result:
+        slot.pending_bin/slot.pending_sink were ALREADY cleared to None
+        right here, at the very top, well before any detach or worker
+        dispatch -- so a stale bus error from a discarded candidate was
+        already correctly unable to match _output_slot_owns_message_src
+        (which reads slot.pending_bin fresh on every call) before this
+        physical-testing round ever ran. No ownership-fix needed for
+        THIS half of Bug 1 -- see test_stale_pending_generation_error_
+        ignored for the regression test locking it in. The observer-race
+        fix (self._output_request_recovery) still applies here the same
+        as the other two dispatch sites."""
         bin_obj = slot.pending_bin
         slot.pending_bin = None
         slot.pending_sink = None
@@ -2240,7 +2437,7 @@ class PlaybackEngine:
                 bin_obj.set_state(Gst.State.NULL)
                 return True
 
-            result = slot.coordinator.request_recovery(worker)
+            result = self._output_request_recovery(slot, worker)
             print(f"  Output discard-pending NULL dispatched ({slot.name}): {result}")
 
     def _output_handle_slot_transition(self, slot, old_state, new_state, snapshot):
@@ -2312,8 +2509,12 @@ class PlaybackEngine:
                       f"device rendering again")
                 emit_event(
                     category="hardware", level="info", title=f"{slot.name} output recovered",
-                    detail={"generation": snapshot["generation"]},
-                    dedupe_key=f"hardware|output-recovered|{slot.kind}|gen{snapshot['generation']}",
+                    detail={"generation": snapshot["generation"], "loss_episode": slot.loss_episode},
+                    # [P0] 1.3C physical-acceptance-failure fix -- stable
+                    # per-slot key, same reasoning as the "output lost"
+                    # key above: coordinator generation is an internal
+                    # counter, never a dedupe/UI-spam boundary.
+                    dedupe_key=f"hardware|output-recovered|{slot.kind}",
                 )
             else:
                 # A QUIESCE succeeded (old generation torn down cleanly).
@@ -2339,11 +2540,14 @@ class PlaybackEngine:
                 category="hardware", level="error", title=f"{slot.name} output recovery abandoned",
                 detail={
                     "generation": snapshot["generation"],
+                    "loss_episode": slot.loss_episode,
                     "note": "A background hardware-state operation did not complete within its "
                             "timeout and was abandoned. Automatic retry has stopped for this slot; "
                             "an engine restart is the only way to fully reclaim it.",
                 },
-                dedupe_key=f"hardware|output-restart-required|{slot.kind}|gen{snapshot['generation']}",
+                # [P0] 1.3C physical-acceptance-failure fix -- stable
+                # per-slot key; see the "output lost" key's comment.
+                dedupe_key=f"hardware|output-restart-required|{slot.kind}",
             )
 
     @_glib_safe(default_return=True)
@@ -2352,7 +2556,51 @@ class PlaybackEngine:
         output slots; each keeps its own independent SlotCoordinator/
         backoff state. See _mic_recovery_tick's identical docstring for
         why this never touches GStreamer/Django state from inside a
-        background worker thread, only from here on the GLib thread."""
+        background worker thread, only from here on the GLib thread.
+
+        [P0] 1.3C physical-acceptance-failure fix, round 1 -- the post-
+        handler bookkeeping no longer writes the PRE-handler-captured
+        `new_state` blindly. _output_handle_slot_transition can itself
+        dispatch a FOLLOW-UP operation (e.g. the DEGRADED branch
+        discarding a failed pending_bin, or the OK branch re-degrading
+        after a bare quiesce) -- and _output_request_recovery already
+        records THAT newer reality into slot.last_observed_slot_state
+        synchronously, the moment its own request_recovery() call
+        reports "dispatched" (see that method's docstring).
+
+        [P0] 1.3C physical-acceptance-failure fix, round 2 (this
+        review's own finding) -- round 1's fix, "re-read
+        slot.coordinator.state fresh after the handler returns instead
+        of reusing the stale pre-handler snapshot", was ITSELF still
+        racy: if the nested operation dispatched from inside the
+        handler resolves all the way back to OK before the handler call
+        even returns (confirmed possible on real hardware-teardown
+        timescales by physical UCA222 testing -- NULL workers can
+        finish in milliseconds), then "re-read fresh" sees OK and
+        erases the RECOVERING marker _output_request_recovery just
+        installed, even though that marker was correct and no tick has
+        observed it yet. A value comparison against coordinator.state
+        (or against `old_state`, which round 1's docstring already
+        rejected for a related reason) cannot tell "the handler
+        dispatched nothing new" apart from "the handler dispatched
+        something new that ALREADY finished" -- both present as "the
+        state moved on" from the same starting point.
+
+        Fixed with slot.recovery_dispatch_serial: bumped ONLY by
+        _output_request_recovery on an actual NEW "dispatched" result,
+        synchronously, same thread, same call. Captured here BEFORE
+        calling the handler; compared AFTER it returns. If the serial
+        is unchanged, nothing new was dispatched during handling --
+        safe to synchronize last_observed_slot_state with the actual
+        current coordinator state (round 1's behavior, still correct
+        for that case). If the serial advanced, a nested dispatch
+        happened -- last_observed_slot_state must be left exactly as
+        _output_request_recovery set it (RECOVERING), REGARDLESS of
+        whether that nested worker has already resolved further, so the
+        NEXT tick is guaranteed to observe the RECOVERING -> (whatever
+        it resolves to) transition and actually process the completion,
+        rather than silently losing it the way the original gen0->
+        gen563 storm depended on."""
         if not self.running:
             return True
         for slot in self._output_slots.values():
@@ -2361,8 +2609,19 @@ class PlaybackEngine:
             new_state = snapshot["state"]
             old_state = slot.last_observed_slot_state
             if new_state != old_state:
+                dispatch_serial_before_handler = slot.recovery_dispatch_serial
                 self._output_handle_slot_transition(slot, old_state, new_state, snapshot)
-                slot.last_observed_slot_state = new_state
+                if slot.recovery_dispatch_serial == dispatch_serial_before_handler:
+                    # The handler did not dispatch another operation --
+                    # safe to synchronize observation with the actual
+                    # current state.
+                    slot.last_observed_slot_state = slot.coordinator.state.value
+                # else: the handler dispatched a new operation --
+                # _output_request_recovery already installed the correct
+                # RECOVERING marker; do not overwrite it even if that
+                # worker has already resolved. The next tick must
+                # observe RECOVERING -> (its actual outcome) and process
+                # the completion.
         return True
 
     @_glib_safe(default_return=True)
@@ -6790,7 +7049,17 @@ class PlaybackEngine:
         later cleared) WITHOUT touching the live sink at all. Only in
         legacy mode (no stable identity configured) does a genuine raw-
         device change still swap the live sink, unchanged from pre-
-        1.3C behavior."""
+        1.3C behavior.
+
+        [P0] 1.3C physical-acceptance-failure fix -- slot.current_sink
+        can now legitimately be None (retired mid-quiesce/rebuild -- see
+        _output_quiesce_current_generation). Guarded explicitly: an
+        admin-triggered device change landing in that exact window has
+        nothing live to swap, so this is a no-op (not a crash, and not a
+        READY-cycle against a sink that no longer exists) -- the new
+        raw device is still recorded via legacy_device above, and will
+        apply to whatever generation rebuild/recovery eventually
+        produces."""
         if not self._studio_monitor_slot or not self.main_pipeline:
             return False
         slot = self._studio_monitor_slot
@@ -6803,6 +7072,11 @@ class PlaybackEngine:
                   f"configuration only; the live sink stays on its stable identity path")
             return False
         sink = slot.current_sink
+        if sink is None:
+            print(f"  Studio Monitor raw device changed ({device}) while no live generation is "
+                  f"currently attached (mid-recovery) -- recorded as fallback configuration only; "
+                  f"nothing to swap right now")
+            return False
         try:
             current = sink.get_property("device")
         except Exception:
