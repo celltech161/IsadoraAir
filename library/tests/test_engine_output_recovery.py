@@ -22,8 +22,11 @@ variable, and every _output_* method call operates on it directly.
 See scratchpad/audio_output_recovery/ROUND7_DECISION_REPORT.md for the
 discovery/proof this implementation is based on, and test_audio_recovery.py
 for the pure-module (SlotCoordinator itself) half."""
+import json
+import tempfile
 import threading
 import time
+from pathlib import Path
 from unittest.mock import patch
 
 import gi
@@ -1311,3 +1314,63 @@ class OutputRecoveryIdentityLiveReloadTests(MockEmitEventMixin, SimpleTestCase):
             self.assertEqual(st_slot.identity, "CODEC")
         finally:
             pipeline.set_state(Gst.State.NULL)
+
+
+class ReloadAudioOutputCommandDispatchTests(MockEmitEventMixin, SimpleTestCase):
+    """[P0] 1.3C integration-bug fix -- regression coverage for the
+    engine-side half. "reload_audio_output" is Studio Monitor's ONE
+    unified live-reload command: it must invoke
+    _reload_output_recovery_identity(), _apply_audio_output_device(...),
+    AND _apply_agc_config(), all under this single command. AGC reapply
+    used to arrive only via a separate "reload_agc_config" command
+    written directly by AudioOutputAdmin.save_model() -- which raced and
+    clobbered THIS command's own write to the same single-slot
+    engine_cmd.json (see hardware/admin.py's save_model docstring and
+    hardware/tests/test_audio_output_recovery_reload_signal.py's
+    AudioOutputAdminSaveModelIntegrationTests for the admin-side half of
+    this fix). Uses lightweight recording stubs rather than assertions
+    inside the stubs themselves -- _check_commands wraps its whole
+    dispatch in a bare `except Exception: print(...)`, so an
+    AssertionError raised from inside a stub would be silently
+    swallowed there instead of failing the test.
+
+    CMD_PATH is patched to a throwaway tempfile -- this box IS
+    production and the real /run/isadoraair/engine_cmd.json is the live
+    engine's actual IPC inbox. A test must never write to it."""
+
+    def _obj_with_recording_stubs(self):
+        obj = make_output_engine_stand_in()
+        calls = []
+        obj._reload_output_recovery_identity = lambda: calls.append("reload_identity")
+        obj._resolve_studio_monitor_device = lambda: "plughw:2,0"
+        obj._apply_audio_output_device = lambda device: calls.append(("apply_device", device))
+        obj._apply_agc_config = lambda: calls.append("apply_agc")
+        return obj, calls
+
+    def _dispatch(self, obj, command):
+        with tempfile.TemporaryDirectory() as tmp:
+            cmd_path = Path(tmp) / "engine_cmd.json"
+            cmd_path.write_text(json.dumps({"command": command}), encoding="utf-8")
+            with patch.object(eng_module, "CMD_PATH", cmd_path):
+                obj._check_commands()
+            self.assertFalse(cmd_path.exists(), "command file must be consumed (unlinked)")
+
+    def test_reload_audio_output_invokes_identity_device_and_agc(self):
+        obj, calls = self._obj_with_recording_stubs()
+        self._dispatch(obj, "reload_audio_output")
+        self.assertEqual(calls, ["reload_identity", ("apply_device", "plughw:2,0"), "apply_agc"])
+
+    def test_reload_audio_output_recovery_config_does_not_touch_device_or_agc(self):
+        """Stereotool Input (and any other non-Studio-Monitor row) still
+        gets identity-only reload -- no raw-device swap, no AGC touch."""
+        obj, calls = self._obj_with_recording_stubs()
+        self._dispatch(obj, "reload_audio_output_recovery_config")
+        self.assertEqual(calls, ["reload_identity"])
+
+    def test_reload_agc_config_still_works_standalone(self):
+        """Kept as a harmless, still-correct handler even though nothing
+        writes this command in production anymore (see the fix report's
+        repo-wide grep) -- removing support outright wasn't asked for."""
+        obj, calls = self._obj_with_recording_stubs()
+        self._dispatch(obj, "reload_agc_config")
+        self.assertEqual(calls, ["apply_agc"])

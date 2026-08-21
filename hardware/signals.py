@@ -44,11 +44,17 @@ def reload_engine_on_audio_output_change(sender, instance, **kwargs):
     # reads it -- so exactly one is written per save, not two:
     #
     #   Studio Monitor: "reload_audio_output" (the pre-existing device-
-    #     swap command) now ALSO refreshes every slot's recovery-identity
-    #     fields as part of the same command -- see engine.py's
-    #     _check_commands handler / _reload_output_recovery_identity.
-    #     Still the only named output with a live `device`-path swap at
-    #     all (see _apply_audio_output_device's own docstring for why).
+    #     swap command) is Studio Monitor's ONE unified live-reload
+    #     command -- it now ALSO refreshes every slot's recovery-identity
+    #     fields AND reapplies AGC, all as part of the same command --
+    #     see engine.py's _check_commands handler / _reload_output_
+    #     recovery_identity / _apply_agc_config. (AGC reapply used to be
+    #     a separate direct write from AudioOutputAdmin.save_model();
+    #     that raced this signal for the same single-slot file and
+    #     reliably clobbered this command -- see that module's save_model
+    #     docstring.) Still the only named output with a live `device`-
+    #     path swap at all (see _apply_audio_output_device's own
+    #     docstring for why).
     #
     #   Every other named output (Stereotool Input today; any future
     #     output row): "reload_audio_output_recovery_config" -- refreshes

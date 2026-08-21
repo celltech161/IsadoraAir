@@ -1,7 +1,5 @@
-import json
 import re
 import subprocess
-from pathlib import Path
 
 from django import forms
 from django.contrib import admin, messages
@@ -357,10 +355,20 @@ class AudioOutputAdmin(_DeviceFieldAdmin):
 
     def save_model(self, request, obj, form, change):
         super().save_model(request, obj, form, change)
-        if obj.name == STUDIO_MONITOR_NAME:
-            Path("/run/isadoraair/engine_cmd.json").write_text(
-                json.dumps({"command": "reload_agc_config"}), encoding="utf-8"
-            )
+        # [P0] 1.3C integration-bug fix -- this used to ALSO write a
+        # separate "reload_agc_config" command directly to
+        # engine_cmd.json here, racing hardware/signals.py's post_save
+        # handler (fired a moment earlier, inside super().save_model()
+        # above) for the same single-slot IPC file: whichever write
+        # landed second silently clobbered the first before the engine
+        # ever polled it, so a Studio Monitor save's identity-refresh
+        # command ("reload_audio_output") was reliably overwritten by
+        # this AGC-only command and never reached the engine. Fixed at
+        # the root by folding the AGC reapply INTO "reload_audio_output"
+        # itself (see engine.py's _check_commands handler) -- Studio
+        # Monitor now has exactly one live-reload command for a save,
+        # written exactly once by the signal, covering device identity +
+        # device swap + AGC together. Nothing to write here anymore.
         _apply_mixer_form_changes(request, obj, form, _parse_card_number(obj.device))
 
 

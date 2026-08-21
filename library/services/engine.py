@@ -5021,14 +5021,35 @@ class PlaybackEngine:
                 # slot channel; a second _write_engine_command call from
                 # the same admin save would just overwrite this one
                 # before the engine ever reads it).
+                #
+                # [P0] 1.3C integration-bug fix -- AGC reapply used to be
+                # dispatched as a SEPARATE "reload_agc_config" command,
+                # written directly by AudioOutputAdmin.save_model() after
+                # super().save_model() had already let this signal fire.
+                # Both writers targeted the same single-slot
+                # engine_cmd.json, so the admin's later write reliably
+                # clobbered this one before the engine ever polled it --
+                # a Studio Monitor save's identity refresh was silently
+                # lost every time, only the AGC reapply ever landed.
+                # Fixed by making "reload_audio_output" Studio Monitor's
+                # ONE unified live-reload command: identity refresh,
+                # device swap, AND AGC reapply, all under this single
+                # command. See hardware/admin.py's save_model for the
+                # writer-side half of this fix.
                 self._reload_output_recovery_identity()
                 self._apply_audio_output_device(self._resolve_studio_monitor_device())
+                self._apply_agc_config()
             elif cmd == "reload_audio_output_recovery_config":
                 # [P0] 1.3C -- for AudioOutput rows other than Studio
                 # Monitor (Stereotool Input today), which have no live
                 # device-swap path at all -- see hardware/signals.py.
                 self._reload_output_recovery_identity()
             elif cmd == "reload_agc_config":
+                # No longer written anywhere as of the integration-bug
+                # fix above (AGC reapply now rides along with
+                # "reload_audio_output" instead) -- kept as a harmless,
+                # still-correct standalone handler in case some future
+                # caller wants AGC-only reapply without the rest.
                 self._apply_agc_config()
             elif cmd == "reload_current_log":
                 self._reload_and_restart_current_log()
