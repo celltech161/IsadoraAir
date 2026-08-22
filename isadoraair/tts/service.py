@@ -10,6 +10,8 @@ from pathlib import Path
 from isadoraair.runtime_components import load_runtime_components
 from isadoraair.tts.errors import TTSError, TTSConfigurationError, TTSSynthesisError
 from isadoraair.tts.providers import (
+    PiperTTSProvider,
+    PiperVoiceSpec,
     ProviderMap,
     SubprocessTTSProvider,
     UnconfiguredPiperProvider,
@@ -49,7 +51,11 @@ class TTSService:
         temporary_path = Path(temporary_name)
         try:
             provider.synthesize(request, temporary_path)
-            validate_wav(temporary_path, provider.wav_requirements)
+            requirements_for = getattr(provider, "wav_requirements_for", None)
+            requirements = (
+                requirements_for(request) if requirements_for is not None else provider.wav_requirements
+            )
+            validate_wav(temporary_path, requirements)
             os.replace(temporary_path, destination)
             return destination
         except TTSError:
@@ -68,7 +74,7 @@ class TTSService:
                 logger.warning("failed to remove temporary TTS output")
 
 
-def build_default_service() -> TTSService:
+def build_default_service(*, piper_voices: tuple[PiperVoiceSpec, ...] | None = None) -> TTSService:
     manifest = load_runtime_components()
     kokoro = manifest["components"]["kokoro"]
     runtime = kokoro["runtime"]
@@ -80,7 +86,15 @@ def build_default_service() -> TTSService:
             module_root=PROJECT_ROOT,
             wav_requirements=KOKORO_WAV_REQUIREMENTS,
         ),
-        TTSEngine.PIPER: UnconfiguredPiperProvider(),
+        TTSEngine.PIPER: (
+            UnconfiguredPiperProvider()
+            if piper_voices is None
+            else PiperTTSProvider(
+                executable=manifest["components"]["piper"]["runtime"]["executable"],
+                asset_root=manifest["components"]["piper"]["models"]["root"],
+                voices=piper_voices,
+            )
+        ),
     }
     return TTSService(providers)
 

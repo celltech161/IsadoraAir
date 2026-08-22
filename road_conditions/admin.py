@@ -33,6 +33,10 @@ class RoadConditionsConfigurationAdmin(admin.ModelAdmin):
                             "on purpose -- that voice metadata (see the Weather Configuration voice "
                             "schedule) is already the single source of truth for the name.",
         }),
+        ("Future Shared TTS Cutover", {
+            "fields": ["tts_voice", "tts_use_weather_schedule", "tts_timeout_seconds"],
+            "description": "Inactive preparation only; current road-report voice resolution and synthesis are unchanged.",
+        }),
         ("Item Transition Sound", {
             "fields": ["transition_sound_enabled", "transition_sound_path"],
             "description": "Optional short sound effect (e.g. a chime or sting) inserted strictly "

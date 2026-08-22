@@ -62,6 +62,7 @@ INSTALLED_APPS = [
     'django.contrib.staticfiles',
     'django.contrib.postgres',
     'adminsortable2',
+    'isadoraair.tts.apps.TTSConfig',
     'hardware',
     'library',
     'encoders',

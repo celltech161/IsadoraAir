@@ -60,6 +60,14 @@ class RoadConditionsAdminTests(TestCase):
         response = self.client.get(reverse("admin:road_conditions_roadconditionsconfiguration_change", args=[1]))
         self.assertContains(response, 'name="additional_route_coverage"')
 
+    def test_config_change_form_includes_inactive_shared_tts_preparation(self):
+        RoadConditionsConfiguration.load()
+        response = self.client.get(reverse("admin:road_conditions_roadconditionsconfiguration_change", args=[1]))
+        self.assertContains(response, "Future Shared TTS Cutover")
+        self.assertContains(response, 'name="tts_voice"')
+        self.assertContains(response, 'name="tts_use_weather_schedule"')
+        self.assertContains(response, 'name="tts_timeout_seconds"')
+
     def test_config_change_form_shows_no_report_generation_yet_by_default(self):
         RoadConditionsConfiguration.load()
         response = self.client.get(reverse("admin:road_conditions_roadconditionsconfiguration_change", args=[1]))
@@ -104,6 +112,9 @@ class RoadConditionsAdminTests(TestCase):
             "lookahead_days": obj.lookahead_days,
             "stale_data_threshold_minutes": obj.stale_data_threshold_minutes,
             "debug_logging": "on" if obj.debug_logging else "",
+            "tts_voice": obj.tts_voice_id or "",
+            "tts_use_weather_schedule": "on" if obj.tts_use_weather_schedule else "",
+            "tts_timeout_seconds": obj.tts_timeout_seconds,
         }
         data.update(overrides)
         return data

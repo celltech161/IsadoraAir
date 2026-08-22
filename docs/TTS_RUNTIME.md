@@ -1,16 +1,20 @@
 # Shared IsadoraAir TTS runtime interface
 
-Runtime Foundation B defines one engine-neutral interface for IsadoraAir and
-its companion projects. It is implemented and tested in the repository but is
-**not deployed or used by current production callers yet**.
+Runtime Foundations A+B define the engine-neutral process boundary. Foundation
+C adds the station logical-voice layer described in
+`docs/TTS_STATION_CONFIGURATION.md`. It is implemented and tested in the
+repository but is **not deployed or used by current production callers yet**.
 
 ## Architecture
 
 ```text
-Django / management command / companion process
+Django feature / management command / companion process
         |
         v
-SynthesisRequest / stable isadoraair-tts CLI
+StationTTSVoice logical API / stable isadoraair-tts CLI
+        |
+        v
+station resolver -> SynthesisRequest(engine + provider voice)
         |
         v
 dependency-free dispatcher and atomic output service
@@ -20,7 +24,7 @@ dependency-free dispatcher and atomic output service
         |     -> Foundation A KokoroSynthesizer
         |
         +-- Piper provider boundary
-              -> optional and unconfigured until Foundation C
+              -> optional checksum-pinned station model registry
 ```
 
 There is no daemon. Each request launches one bounded provider subprocess.
@@ -44,7 +48,21 @@ shell activation, or a second source copy installed into every engine venv.
 
 ## Public Python contract
 
-Repository callers can use:
+Feature callers use the logical station interface:
+
+```python
+from isadoraair.tts.station import synthesize_station_voice
+
+synthesize_station_voice(
+    text,
+    voice="logical_voice_id",
+    output_path="/path/to/output.wav",
+    timeout_seconds=120,
+)
+```
+
+The lower-level resolved-provider interface remains available to the station
+dispatcher and controlled transition code:
 
 ```python
 from isadoraair.tts import synthesize
@@ -52,7 +70,7 @@ from isadoraair.tts import synthesize
 synthesize(
     text,
     engine="kokoro",
-    voice="logical_voice_id",
+    voice="provider_voice_id",
     output_path="/path/to/output.wav",
     speed=1.0,
     language="en-us",
@@ -60,14 +78,14 @@ synthesize(
 )
 ```
 
-The equivalent immutable request type is `SynthesisRequest`. Supported engine
-IDs are `kokoro` and `piper`. Voice is a logical station-configured identifier,
-not an ONNX/model pathname.
+Its immutable request type is `SynthesisRequest`. Supported engine IDs are
+`kokoro` and `piper`; at this boundary voice is the already-resolved native
+Kokoro ID or checksum-pinned Piper model ID, never an ONNX/model pathname.
 
-Input text and logical voice are required. Speed and timeout must be positive,
-finite numbers. The default timeout is 120 seconds; callers synthesizing long
-programs may choose a larger bound, such as the existing road-report 600-second
-limit.
+Input text and voice are required at both layers. Speed and timeout must be
+positive, finite numbers. The default timeout is 120 seconds; callers
+synthesizing long programs may choose a larger bound, such as the existing
+road-report 600-second limit.
 
 ## Stable external CLI contract
 
@@ -75,13 +93,19 @@ The future installed interface is:
 
 ```bash
 printf '%s' "$TEXT" | /usr/local/bin/isadoraair-tts \
-    --engine kokoro \
     --voice logical_voice_id \
     --output-file /path/to/output.wav \
     --speed 1.0 \
     --language en-us \
     --timeout 120
 ```
+
+In this public command, `--voice` always means the stable
+`StationTTSVoice.name` logical identifier. The public parser has no `--engine`,
+`--model`, runtime-path, or asset-path option. Engine and provider-native voice
+are resolved internally and are never companion concerns. Foundation B's
+pre-deployment `--engine ENGINE --voice VOICE` proposal is superseded by this
+single Foundation C contract.
 
 The identical dispatcher can currently be exercised from any working
 directory through the Git-owned repo-local launcher:
@@ -90,14 +114,9 @@ directory through the Git-owned repo-local launcher:
 /path/to/isadoraair/deploy/isadoraair-tts ...
 ```
 
-Foundation C may expose that same file at `/usr/local/bin/isadoraair-tts` with
-a symlink to the canonical `/opt/isadoraair` checkout. Foundations A+B do not
-install that symlink.
-
-`--model` is retained as an alias for `--voice`, `--output_file` for
-`--output-file`, and `--lang` for `--language`. These aliases reduce migration
-risk for existing Piper-shaped subprocess callers. The documented public names
-remain `--voice`, `--output-file`, and `--language`.
+The future installation exposes that same file at
+`/usr/local/bin/isadoraair-tts` with a symlink to the canonical
+`/opt/isadoraair` checkout. Foundations A-C do not install that symlink.
 
 Text is read only from stdin. The CLI does not accept runtime/model paths and
 does not print input text, environment variables, or configuration.
@@ -151,12 +170,11 @@ passed. Timeout, provider failure, and validation failure remove the temporary
 file and leave the existing destination intact. Parent directories created for
 a failed request remain; directory creation is an explicit part of the public
 contract. The resulting file is owned by the invoking user and retains the
-temporary file's private mode. Mode `0600` is the intentional Foundations A+B
-service contract, not a temporary implementation accident. Foundation C must
-verify that each intended consumer can read these private outputs under the
-selected service-user model. If another mode is genuinely required, that must
-be a deliberate contract change during caller migration rather than an
-incidental broadening to `0644`.
+temporary file's private mode. Mode `0600` is the intentional Foundations A-C
+service contract, not a temporary implementation accident. Foundation C
+verified that the intended repo-managed consumers use the same configured
+service account. If another mode is ever genuinely required, that must be a
+deliberate contract change rather than an incidental broadening to `0644`.
 
 Common WAV validation requires:
 
@@ -166,9 +184,8 @@ Common WAV validation requires:
 - two-byte signed samples;
 - sample rate between 8 and 192 kHz.
 
-The Kokoro adapter additionally requires exactly 24 kHz. Piper's eventual
-configured model contract may establish its own exact sample rate in Foundation
-C.
+The Kokoro adapter additionally requires exactly 24 kHz. Piper requires the
+exact native rate recorded for and verified against its paired model JSON.
 
 ## Provider responsibilities
 
@@ -181,25 +198,24 @@ Voice, speed, and language are forwarded unchanged.
 
 ### Piper
 
-Piper remains `SUPPORTED OPTIONAL`. Building the default service does not test
-or require Piper. Selecting Piper currently returns a voice-unavailable error
-because there is intentionally no generic model map. Foundation C must add a
-station-owned logical voice-to-model/hash mapping and provider adapter without
-adding HFC or other station models as product defaults.
+Piper remains `SUPPORTED OPTIONAL`. Foundation C supplies a station-owned,
+checksum-pinned logical model map and provider adapter without adding HFC or
+other station models as product defaults. See the Foundation C document for
+the exact native output, speed, language, and failure contracts.
 
 ## Voice, persona, and scheduling boundaries
 
-The TTS layer owns only:
+The external TTS layer owns:
 
 ```text
-text + engine + logical voice + synthesis options -> WAV
+text + logical station voice + synthesis options -> WAV
 ```
 
-`engine` selects an implementation. `voice` identifies the configured voice
-within that implementation. A presentation name/persona, spoken signoff,
-day/night selection, and weather schedule are business/station metadata above
-the TTS service. This layer is not a weather scheduler and does not know persona
-names.
+After logical resolution, the internal service owns
+`text + engine + provider voice + synthesis options -> WAV`. A presentation
+name/persona, spoken signoff, day/night selection, and weather schedule are
+business/station metadata above the TTS service. This layer is not a weather
+scheduler and does not know persona names.
 
 ## Companion boundary
 
@@ -208,9 +224,10 @@ the installed CLI and interpret its documented exit status. It must not import
 IsadoraAir source dynamically, discover engine venvs, know model paths, or
 assume a station username.
 
-## Planned caller migrations
+## Prepared caller migrations
 
-No caller changes are included in Foundation B.
+Foundation C adds inactive nullable configuration only. No production synthesis
+call is changed.
 
 ### Dedication intros
 
@@ -223,11 +240,11 @@ webrequests.services
   -> existing ffmpeg FLAC workflow
 ```
 
-Foundation C migration:
+Later controlled caller migration:
 
 ```text
 webrequests.services
-  -> isadoraair.tts.synthesize(... engine, logical voice, WAV path ...)
+  -> synthesize_station_voice(... logical voice, WAV path ...)
   -> existing ffmpeg FLAC workflow unchanged
 ```
 
@@ -247,7 +264,7 @@ road_conditions.synthesis
   -> existing transition/loudness/FLAC workflow
 ```
 
-Foundation C migration:
+Later controlled caller migration:
 
 ```text
 road_conditions
@@ -266,20 +283,19 @@ dispatch. Its future product boundary is:
 
 ```text
 weather-ingest decides when and what to speak
-  -> /usr/local/bin/isadoraair-tts with engine + logical voice
+  -> /usr/local/bin/isadoraair-tts with logical voice
   -> receives validated WAV or a documented nonzero exit
   -> performs its existing weather delivery/conversion behavior
 ```
 
 Weather persona names, schedule, wording, and day/night policy remain outside
 the TTS runtime. weather-ingest must no longer know Kokoro/Piper venv or model
-paths. Foundation B does not modify that companion.
+paths. Foundation C does not modify that companion.
 
 ## Scratch provisioning
 
 The component contract reserves `/run/isadoraair/tts` for future bounded
-scratch use but Foundation B does not create it. Production migration should
-provide it at boot, likely through a tmpfiles rule, owned by the configured
-service account with no access for unrelated users. Per-request atomic output
-temporaries remain beside their requested destinations so `os.replace()` stays
-same-filesystem.
+scratch use. Foundation C adds an inactive repo tmpfiles rule for mode `0700`,
+owned by the configured service account/group; it is not installed here.
+Per-request atomic output temporaries remain beside their requested
+destinations so `os.replace()` stays same-filesystem.

@@ -22,6 +22,10 @@ class WebRequestConfigAdmin(admin.ModelAdmin):
         ("Rate & Timing", {
             "fields": ["max_fulfilled_per_hour", "lookahead_warning_minutes", "expire_after_hours"],
         }),
+        ("Future Shared TTS Cutover", {
+            "fields": ["dedication_tts_voice", "dedication_tts_timeout_seconds"],
+            "description": "Inactive preparation only; current production dedication synthesis is unchanged.",
+        }),
         ("Notifications", {
             "fields": ["notify_email"],
         }),

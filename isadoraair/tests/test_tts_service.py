@@ -179,6 +179,9 @@ class TTSServiceTests(SimpleTestCase):
         result = service.synthesize(self._request("kokoro", destination))
 
         self.assertEqual(stat.S_IMODE(result.stat().st_mode), 0o600)
+        # Intended downstream processes use the same configured service
+        # account, so private output remains readable without widening it.
+        self.assertGreater(len(result.read_bytes()), 44)
 
     def test_failed_synthesis_preserves_existing_destination_and_cleans_temp(self):
         destination = self.root / "atomic.wav"

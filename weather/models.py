@@ -114,6 +114,49 @@ class WeatherConfig(models.Model):
         return obj
 
 
+class WeatherVoicePersona(models.Model):
+    """Feature-owned persona and schedule-slot mapping above shared TTS."""
+
+    slot = models.SlugField(
+        max_length=64,
+        unique=True,
+        help_text="Stable key referenced by WeatherConfig.voice_schedule, such as day or night.",
+    )
+    tts_voice = models.ForeignKey(
+        "tts.StationTTSVoice",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="weather_personas",
+        help_text="Logical station voice. Blank is a safe unconfigured state.",
+    )
+    display_name = models.CharField(
+        max_length=100,
+        blank=True,
+        default="",
+        help_text="Feature-facing short persona name; never passed to a TTS provider.",
+    )
+    full_name = models.CharField(
+        max_length=150,
+        blank=True,
+        default="",
+        help_text="Listener-facing full persona name; never passed to a TTS provider.",
+    )
+    signoff = models.TextField(
+        blank=True,
+        default="",
+        help_text="Weather-specific wording; never passed into TTS voice resolution.",
+    )
+
+    class Meta:
+        ordering = ["slot"]
+        verbose_name = "Weather Voice Persona"
+        verbose_name_plural = "Weather Voice Personas"
+
+    def __str__(self):
+        return self.slot
+
+
 class AmberAlertConfig(models.Model):
     """Singleton -- IPAWS OPEN configuration for AMBER (Child Abduction
     Emergency), Blue Alert (law-enforcement-officer down), and Missing

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -10,6 +11,7 @@ import subprocess
 import tempfile
 import threading
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
@@ -34,6 +36,8 @@ class TTSProvider(Protocol):
     wav_requirements: WavRequirements
 
     def synthesize(self, request: SynthesisRequest, output_path: Path) -> None: ...
+
+    def wav_requirements_for(self, request: SynthesisRequest) -> WavRequirements: ...
 
 
 class _BoundedCapture:
@@ -151,6 +155,9 @@ class SubprocessTTSProvider:
         self.module_root = module_root
         self.wav_requirements = wav_requirements
 
+    def wav_requirements_for(self, request: SynthesisRequest) -> WavRequirements:
+        return self.wav_requirements
+
     def synthesize(self, request: SynthesisRequest, output_path: Path) -> None:
         command = [str(argument) for argument in self.command_factory(request, output_path)]
         if not command:
@@ -207,10 +214,134 @@ class UnconfiguredPiperProvider:
 
     wav_requirements = DEFAULT_WAV_REQUIREMENTS
 
+    def wav_requirements_for(self, request: SynthesisRequest) -> WavRequirements:
+        return self.wav_requirements
+
     def synthesize(self, request: SynthesisRequest, output_path: Path) -> None:
         raise TTSVoiceUnavailable(
             f"Piper logical voice '{request.voice}' is not configured for this station"
         )
+
+
+@dataclass(frozen=True, slots=True)
+class PiperVoiceSpec:
+    """Path-free station metadata resolved to the canonical Piper asset root."""
+
+    model_id: str
+    model_filename: str
+    config_filename: str
+    model_sha256: str
+    config_sha256: str
+    language: str
+    sample_rate_hz: int
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _normalized_language(value: str) -> str:
+    return value.replace("_", "-").lower()
+
+
+class PiperTTSProvider:
+    """Invoke canonical Piper with a closed, checksum-pinned model registry."""
+
+    wav_requirements = DEFAULT_WAV_REQUIREMENTS
+
+    def __init__(
+        self,
+        *,
+        executable: str,
+        asset_root: str | os.PathLike[str],
+        voices: Sequence[PiperVoiceSpec],
+    ) -> None:
+        self.executable = executable
+        self.asset_root = Path(asset_root)
+        self.voices = {voice.model_id: voice for voice in voices}
+
+    def _spec_for(self, request: SynthesisRequest) -> PiperVoiceSpec:
+        try:
+            return self.voices[request.voice]
+        except KeyError as exc:
+            raise TTSVoiceUnavailable(
+                f"Piper model identity '{request.voice}' is not configured for this station"
+            ) from exc
+
+    def wav_requirements_for(self, request: SynthesisRequest) -> WavRequirements:
+        return WavRequirements(sample_rate_hz=self._spec_for(request).sample_rate_hz)
+
+    def _asset_paths(self, spec: PiperVoiceSpec) -> tuple[Path, Path]:
+        for filename, suffix in (
+            (spec.model_filename, ".onnx"),
+            (spec.config_filename, ".onnx.json"),
+        ):
+            if Path(filename).name != filename or not filename.endswith(suffix):
+                raise TTSVoiceUnavailable(f"Piper model '{spec.model_id}' has invalid asset metadata")
+        if spec.config_filename != f"{spec.model_filename}.json":
+            raise TTSVoiceUnavailable(f"Piper model '{spec.model_id}' has an invalid model/config pair")
+        asset_root = self.asset_root.resolve()
+        model_path = (asset_root / spec.model_filename).resolve()
+        config_path = (asset_root / spec.config_filename).resolve()
+        if model_path.parent != asset_root or config_path.parent != asset_root:
+            raise TTSVoiceUnavailable(f"Piper model '{spec.model_id}' has invalid asset metadata")
+        return model_path, config_path
+
+    def _validate_assets(self, request: SynthesisRequest, spec: PiperVoiceSpec) -> tuple[Path, Path]:
+        model_path, config_path = self._asset_paths(spec)
+        if not model_path.is_file() or not config_path.is_file():
+            raise TTSVoiceUnavailable(f"Piper model '{spec.model_id}' assets are unavailable")
+        try:
+            model_sha256 = _sha256(model_path)
+            config_sha256 = _sha256(config_path)
+        except OSError as exc:
+            raise TTSVoiceUnavailable(f"Piper model '{spec.model_id}' assets are unavailable") from exc
+        if model_sha256 != spec.model_sha256:
+            raise TTSVoiceUnavailable(f"Piper model '{spec.model_id}' model checksum does not match")
+        if config_sha256 != spec.config_sha256:
+            raise TTSVoiceUnavailable(f"Piper model '{spec.model_id}' config checksum does not match")
+        try:
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            sample_rate = int(config["audio"]["sample_rate"])
+            config_language = str(config["language"]["code"])
+        except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+            raise TTSVoiceUnavailable(f"Piper model '{spec.model_id}' config is invalid") from exc
+        if sample_rate != spec.sample_rate_hz:
+            raise TTSVoiceUnavailable(f"Piper model '{spec.model_id}' sample-rate metadata does not match")
+        if _normalized_language(config_language) != _normalized_language(spec.language):
+            raise TTSVoiceUnavailable(f"Piper model '{spec.model_id}' language metadata does not match")
+        if _normalized_language(request.language) != _normalized_language(spec.language):
+            raise TTSVoiceUnavailable(
+                f"Piper model '{spec.model_id}' does not support language '{request.language}'"
+            )
+        return model_path, config_path
+
+    def synthesize(self, request: SynthesisRequest, output_path: Path) -> None:
+        if not _command_exists(self.executable):
+            raise TTSRuntimeUnavailable("piper runtime executable is unavailable")
+        spec = self._spec_for(request)
+        model_path, config_path = self._validate_assets(request, spec)
+        # Piper length_scale is duration, the inverse of the public speed
+        # multiplier: speed 2.0 means length_scale 0.5.
+        command = (
+            self.executable,
+            "--model",
+            str(model_path),
+            "--config",
+            str(config_path),
+            "--output-file",
+            str(output_path),
+            "--length-scale",
+            format(1.0 / request.speed, ".12g"),
+        )
+        SubprocessTTSProvider(
+            engine=TTSEngine.PIPER,
+            command_factory=lambda _request, _output: command,
+        ).synthesize(request, output_path)
 
 
 def kokoro_provider_command(

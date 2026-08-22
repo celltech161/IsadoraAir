@@ -120,7 +120,7 @@ Drop-in configs (installed as-is, no per-install variation apart from the ones a
 |---|---|
 | `isadoraair.nginx` | `/etc/nginx/sites-available/isadoraair`, symlinked from `sites-enabled/isadoraair` |
 | `isadoraair-locations.conf` | `/etc/nginx/snippets/isadoraair-locations.conf` — shared location blocks `include`d by every HTTPS server block in `isadoraair.nginx` |
-| `isadoraair-tmpfiles.conf` | `/etc/tmpfiles.d/isadoraair.conf` — creates `/run/isadoraair` on boot with the right owner |
+| `isadoraair-tmpfiles.conf` | `/etc/tmpfiles.d/isadoraair.conf` — creates `/run/isadoraair` and its private mode-0700 `tts/` scratch directory on boot with the configured service-account owner/group |
 | `needrestart-isadoraair.conf` | `/etc/needrestart/conf.d/isadoraair.conf` — auto-restarts services on library upgrades so a matplotlib/psycopg2 refresh doesn't leave the engine on the old shared object |
 | `asound.conf` | `/etc/asound.conf` — ALSA loopback / dsnoop config for the studio + streaming feeds |
 | `isadoraair-aloop.conf` | `/etc/modprobe.d/isadoraair-aloop.conf` — pins `snd-aloop` to three loopback cards at fixed indices 0/3/4, which `asound.conf`'s `airtap`/`airtap_ds` aliases (and StereoTool's configured device) depend on by exact card number. Also requires `/etc/modules-load.d/snd-aloop.conf` containing the single line `snd-aloop` (`echo snd-aloop \| sudo tee /etc/modules-load.d/snd-aloop.conf`) so the module loads at boot at all -- see the main `README.md`'s "ALSA loopback module" step and this file's own header comment for the full reasoning. |

@@ -2,7 +2,7 @@ import json
 
 from django.core.management.base import BaseCommand
 
-from weather.models import WeatherConfig
+from weather.models import WeatherConfig, WeatherVoicePersona
 
 
 class Command(BaseCommand):
@@ -15,6 +15,15 @@ class Command(BaseCommand):
 
     def handle(self, *args, **options):
         cfg = WeatherConfig.load()
+        personas = {
+            persona.slot: {
+                "logical_voice": persona.tts_voice.name if persona.tts_voice_id else None,
+                "display_name": persona.display_name,
+                "full_name": persona.full_name,
+                "signoff": persona.signoff,
+            }
+            for persona in WeatherVoicePersona.objects.select_related("tts_voice")
+        }
         self.stdout.write(json.dumps({
             "station_lat": cfg.station_lat,
             "station_lon": cfg.station_lon,
@@ -25,6 +34,7 @@ class Command(BaseCommand):
             "nws_forecast_grid_y": cfg.nws_forecast_grid_y,
             "nws_cloud_stations": [s.strip() for s in cfg.nws_cloud_stations.split(",") if s.strip()],
             "voice_schedule": cfg.voice_schedule,
+            "voice_personas": personas,
             "notify_email": cfg.notify_email,
             "alert_sound_enabled": cfg.alert_sound_enabled,
             "alert_sound_cart_id": cfg.alert_sound_cart_id,

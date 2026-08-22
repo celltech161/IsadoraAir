@@ -70,6 +70,10 @@ provider dispatcher supplies that same checkout explicitly to the dedicated
 runtime interpreter. The future `/usr/local/bin/isadoraair-tts` entry point has
 not been installed. Existing callers remain unmigrated.
 
+Foundation C finalizes the external syntax as `--voice LOGICAL_NAME` plus text,
+output, and synthesis options. `--voice` always names `StationTTSVoice`; the
+public CLI exposes no engine or provider-native model selection.
+
 The runtime package is `kokoro-onnx==0.4.7`. The manifest also records the
 proven runtime dependency versions and exact SHA-256 identities for
 `kokoro-v1.0.onnx` and `voices-v1.0.bin`.
@@ -84,11 +88,10 @@ selected and valid      -> PASS
 selected and incomplete -> FAIL
 ```
 
-There are no product-default Piper models. The shared service accepts Piper as
-an engine identity without requiring it when unselected; selecting it reports
-that no logical voice is configured. Model filenames and hashes will be
-station-selected configuration consumed by Foundation C's provider and the
-future shared validator.
+There are no product-default Piper models. Foundation C's shared station
+registry supplies path-free model/config basenames, hashes, language, and
+native sample rate only when an operator configures a logical Piper voice. The
+provider resolves those beneath the canonical asset root and verifies them.
 
 ### fdkaac/libfdk-aac
 
@@ -127,10 +130,11 @@ its wrapper/provider source. Exact license references are retained in the
 machine-readable contract; private DR still needs to preserve applicable
 license and notice material with the artifacts.
 
-## Next-phase companion boundary
+## Prepared companion boundary
 
-Runtime Foundation C should add station TTS configuration, complete the Piper
-logical-voice provider, and prepare controlled caller migrations. Road
-conditions must then stop dynamically importing `weather-ingest/lib/voices.py`,
-and weather-ingest must consume the stable CLI instead of owning Kokoro/Piper
-runtime internals. None of those caller changes belongs to Foundation B.
+Runtime Foundation C adds station TTS configuration, completes the optional
+Piper logical-voice provider, and prepares controlled caller migrations. Road
+conditions must later stop dynamically importing
+`weather-ingest/lib/voices.py`, and weather-ingest must later consume the stable
+CLI instead of owning Kokoro/Piper runtime internals. Those caller changes are
+deliberately not part of Foundation C.

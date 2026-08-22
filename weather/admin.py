@@ -8,10 +8,16 @@ from django.utils.html import format_html
 
 from isadoraair import env_admin, env_config
 
-from .models import AmberAlertConfig, WeatherConfig
+from .models import AmberAlertConfig, WeatherConfig, WeatherVoicePersona
 
 _WEATHER_ENV_KEYS = ["WEATHER_DATA_DIR"]
 _WEATHER_DIAGNOSTIC_FILES = ["latest_weather.json", "wind_history.json", "smoothed_wind.json"]
+
+
+@admin.register(WeatherVoicePersona)
+class WeatherVoicePersonaAdmin(admin.ModelAdmin):
+    list_display = ["slot", "display_name", "full_name", "tts_voice"]
+    search_fields = ["slot", "display_name", "full_name", "tts_voice__name"]
 
 
 @admin.register(WeatherConfig)
