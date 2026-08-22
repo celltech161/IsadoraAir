@@ -6,7 +6,12 @@ from django.contrib import admin, messages
 from django.http import HttpResponseRedirect
 from django.urls import reverse
 
-from .devices import list_input_devices, list_mixer_controls, list_output_devices
+from .devices import (
+    list_alsa_card_identities,
+    list_input_devices,
+    list_mixer_controls,
+    list_output_devices,
+)
 from .models import AudioInput, AudioOutput, AudioPipeline, DuckingConfig, RemoteDJAudioInput
 from monitoring.models import emit_event
 
@@ -54,13 +59,76 @@ def _parse_card_number(device):
     return int(m.group(1)) if m else None
 
 
-def _mixer_controls_for(obj):
-    if not obj or not obj.device:
-        return []
-    card = _parse_card_number(obj.device)
-    if card is None:
-        return []
-    return list_mixer_controls(card)
+def _effective_mixer_target(kind, identity, device):
+    """Return the configured device identity that owns rendered controls."""
+
+    if kind == "alsa_card_id" and identity:
+        return ("alsa_card_id", identity)
+    return ("raw", device or "")
+
+
+def _mixer_target_changed(form):
+    """Whether a bound form moved away from the target it was rendered for.
+
+    Django builds the synthetic ``mixer_*`` fields before binding submitted
+    model values, so their control IDs always belong to the effective target
+    in ``form.initial``. Do not compare against ``form.instance`` here: by
+    ``save_model`` time it already contains the submitted identity/device.
+    """
+
+    initial = getattr(form, "initial", None)
+    cleaned = getattr(form, "cleaned_data", None)
+    target_fields = ("device_identity_kind", "device_identity", "device")
+    if not isinstance(initial, dict) or not isinstance(cleaned, dict):
+        return False
+    if not all(field in initial for field in target_fields):
+        return False
+
+    before = _effective_mixer_target(
+        initial["device_identity_kind"],
+        initial["device_identity"],
+        initial["device"],
+    )
+    after = _effective_mixer_target(
+        cleaned.get("device_identity_kind", initial["device_identity_kind"]),
+        cleaned.get("device_identity", initial["device_identity"]),
+        cleaned.get("device", initial["device"]),
+    )
+    return before != after
+
+
+def _effective_mixer_card_number(obj, direction):
+    """Resolve the numeric card whose controls affect the effective device.
+
+    Stable identity takes precedence over ``device`` in the engine, so the
+    admin must use the same precedence. The raw numeric path is fallback-only
+    while ``alsa_card_id`` is active and must not receive mixer changes. If the
+    configured identity is currently unavailable, expose no controls rather
+    than silently operating on the fallback card.
+    """
+
+    if not obj:
+        return None
+    if obj.device_identity_kind == "alsa_card_id" and obj.device_identity:
+        try:
+            identities = list_alsa_card_identities(direction)
+        except Exception:
+            return None
+        return next(
+            (
+                identity.card_index
+                for identity in identities
+                if identity.card_id == obj.device_identity
+            ),
+            None,
+        )
+    return _parse_card_number(obj.device)
+
+
+def _mixer_controls_for(obj, role):
+    direction = "playback" if role == "output" else "capture"
+    card = _effective_mixer_card_number(obj, direction)
+    return list_mixer_controls(card) if card is not None else []
 
 
 # ALSA controls whose name matches this pattern are OUTPUT-side (playback,
@@ -85,7 +153,7 @@ def _mixer_controls_for_role(obj, role):
     """Card mixer controls filtered to one role (input/output). Preserves
     the source ordering from `amixer controls` so field indices stay
     stable across renders."""
-    return [c for c in _mixer_controls_for(obj) if _mixer_role(c) == role]
+    return [c for c in _mixer_controls_for(obj, role) if _mixer_role(c) == role]
 
 
 def _inject_mixer_form_fields(form, controls, existing):
@@ -153,6 +221,26 @@ def _apply_mixer_form_changes(request, obj, form, card):
         obj.mixer_control_values = values
         obj.save(update_fields=["mixer_control_values"])
         _alsa_store(request=request)
+
+
+def _apply_mixer_form_changes_for_effective_target(request, obj, form, direction):
+    """Apply controls only when they still belong to the submitted target."""
+
+    if _mixer_target_changed(form):
+        if request is not None:
+            messages.warning(
+                request,
+                "Audio device changed. Hardware mixer controls were not applied "
+                "because the controls shown belonged to the previous device. "
+                "Reopen this page to configure the newly selected device.",
+            )
+        return
+    _apply_mixer_form_changes(
+        request,
+        obj,
+        form,
+        _effective_mixer_card_number(obj, direction),
+    )
 
 
 class AudioPipelineForm(forms.ModelForm):
@@ -266,6 +354,7 @@ class _DeviceFieldAdmin(admin.ModelAdmin):
     runtime hardware enumeration. Subclasses set `_enumerate` to the
     aplay-/arecord-backed discovery function."""
     _enumerate = None
+    _identity_direction = None
 
     list_display = ["name", "device", "sort_order"]
     list_editable = ["sort_order"]
@@ -280,12 +369,38 @@ class _DeviceFieldAdmin(admin.ModelAdmin):
                 choices = [(obj.device, f"{obj.device} (UNAVAILABLE)")] + choices
             choices = [("", "— not configured —")] + choices
             form.base_fields["device"].widget = forms.Select(choices=choices)
+        if "device_identity" in form.base_fields and self._identity_direction:
+            # Identity discovery is display-time convenience only. It must
+            # never make the admin fail or discard the stable ID recovery is
+            # waiting for when hardware happens to be disconnected.
+            try:
+                identities = list_alsa_card_identities(self._identity_direction)
+            except Exception:
+                identities = []
+            choices = [(identity.card_id, identity.label) for identity in identities]
+            current = obj.device_identity if obj else ""
+            if current and not any(current == value for value, _label in choices):
+                choices = [(current, f"{current} — currently unavailable")] + choices
+            choices = [("", "— not configured —")] + choices
+            identity_field = form.base_fields["device_identity"]
+            identity_field.widget = forms.Select(choices=choices)
+            direction_label = (
+                "playback" if self._identity_direction == "playback" else "capture"
+            )
+            identity_field.help_text = (
+                f"Lists currently detected {direction_label}-capable ALSA cards. "
+                "Only the stable short card ID is stored; hardware and USB-location "
+                "details are shown only to help identify the device. A configured "
+                "device that is disconnected remains selected as currently unavailable. "
+                "Ignored while identity kind is blank."
+            )
         return form
 
 
 @admin.register(AudioOutput)
 class AudioOutputAdmin(_DeviceFieldAdmin):
     _enumerate = staticmethod(list_output_devices)
+    _identity_direction = "playback"
 
     def get_fieldsets(self, request, obj=None):
         fieldsets = [
@@ -301,12 +416,16 @@ class AudioOutputAdmin(_DeviceFieldAdmin):
             # Input -- mirrors AudioInputAdmin exactly.
             ("Automatic Recovery (device identity)", {
                 "fields": ["device_identity_kind", "device_identity"],
-                "description": "Optional. A raw device path like 'plughw:2,0' can "
+                "description": "Optional. The identity dropdown lists currently "
+                                "detected playback devices and shows descriptive "
+                                "hardware/location details while storing only the "
+                                "stable ALSA short card ID. A configured device that "
+                                "is disconnected remains selected as unavailable. "
+                                "A raw device path like 'plughw:2,0' can "
                                 "point at a different physical card after a "
                                 "hotplug re-enumeration, so automatic rebuild-on-"
                                 "return is disabled unless a stable identity is set "
-                                "here. Run `cat /proc/asound/cards` to find the "
-                                "short ID shown in brackets for this output's card. "
+                                "here. "
                                 "Changes here apply live on Save (no engine restart "
                                 "needed). For Studio Monitor, changing the identity "
                                 "explicitly retargets only that output branch; an "
@@ -372,12 +491,15 @@ class AudioOutputAdmin(_DeviceFieldAdmin):
         # Monitor now has exactly one live-reload command for a save,
         # written exactly once by the signal, covering device identity +
         # device swap + AGC together. Nothing to write here anymore.
-        _apply_mixer_form_changes(request, obj, form, _parse_card_number(obj.device))
+        _apply_mixer_form_changes_for_effective_target(
+            request, obj, form, "playback"
+        )
 
 
 @admin.register(AudioInput)
 class AudioInputAdmin(_DeviceFieldAdmin):
     _enumerate = staticmethod(list_input_devices)
+    _identity_direction = "capture"
 
     def get_fieldsets(self, request, obj=None):
         fieldsets = [
@@ -388,12 +510,18 @@ class AudioInputAdmin(_DeviceFieldAdmin):
             # automatic rebuild -- see library/services/audio_recovery.py).
             ("Automatic Recovery (device identity)", {
                 "fields": ["device_identity_kind", "device_identity"],
-                "description": "Optional. A raw device path like 'plughw:2,0' can "
+                "description": "Optional. The identity dropdown lists currently "
+                                "detected capture devices and shows descriptive "
+                                "hardware/location details while storing only the "
+                                "stable ALSA short card ID. A configured device that "
+                                "is disconnected remains selected as unavailable. "
+                                "A raw device path like 'plughw:2,0' can "
                                 "point at a different physical card after a "
                                 "hotplug re-enumeration, so automatic recovery is "
                                 "disabled unless a stable identity is set here. "
-                                "Run `cat /proc/asound/cards` to find the short ID "
-                                "shown in brackets for this input's card.",
+                                "Saving this form does not change the existing input "
+                                "runtime lifecycle; the engine loads input identity "
+                                "configuration on startup.",
             }),
             ("Software Gain", {
                 "fields": ["gain_db"],
@@ -439,7 +567,9 @@ class AudioInputAdmin(_DeviceFieldAdmin):
 
     def save_model(self, request, obj, form, change):
         super().save_model(request, obj, form, change)
-        _apply_mixer_form_changes(request, obj, form, _parse_card_number(obj.device))
+        _apply_mixer_form_changes_for_effective_target(
+            request, obj, form, "capture"
+        )
 
 
 # DuckingConfig and RemoteDJAudioInput used to be their own admin pages;
