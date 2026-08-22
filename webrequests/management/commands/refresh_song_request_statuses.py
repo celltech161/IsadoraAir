@@ -20,7 +20,7 @@ from webrequests.services import (
 
 class Command(BaseCommand):
     """Re-evaluates every SongRequest on a timer (systemd), independent
-    of the polling scripts. Lifecycle: pending/no_slot_soon (waiting)
+    of the public-site transport. Lifecycle: pending/no_slot_soon (waiting)
     -> scheduled (assigned to a specific LogItem) -> fulfilled (that
     LogItem actually aired -- set by the engine's _create_deck, not by
     this command). unavailable/expired are terminal failures.
@@ -365,8 +365,8 @@ class Command(BaseCommand):
             "checked": len(pending),
             "resolved": resolved_count,
             # Key name kept as "fulfilled_now" for backward compatibility
-            # with the external requests_sync.py script, which reads
-            # this exact key -- semantically this now counts requests
+            # with the legacy helper during deployment cutover -- semantically
+            # this now counts requests
             # that moved to "scheduled" this run (real fulfillment
             # happens later, at actual airtime), but renaming the wire
             # key would require a coordinated deploy on their side for

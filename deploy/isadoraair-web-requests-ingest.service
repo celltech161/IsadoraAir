@@ -1,0 +1,15 @@
+[Unit]
+Description=IsadoraAir public-site listener request ingest
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=@@ISA_USER@@
+Group=@@ISA_USER@@
+WorkingDirectory=@@ISA_ROOT@@
+EnvironmentFile=@@ISA_ROOT@@/.env
+ExecStart=@@ISA_ROOT@@/venv/bin/python @@ISA_ROOT@@/manage.py ingest_web_requests
+# Bounds the two remote calls plus local lifecycle refresh. A failed/timed-out
+# run is retried by the next timer activation; the command is idempotent.
+TimeoutStartSec=90

@@ -232,6 +232,21 @@ WAVEFORMS_DIR = config('WAVEFORMS_DIR', default='/srv/isadoraair/waveforms')
 # the companion `weather-ingest` cron scripts. The two sides must agree.
 WEATHER_DATA_DIR = config('WEATHER_DATA_DIR', default='/var/lib/isadoraair/weather')
 
+# Optional listener song-request bridge. WebRequestConfig.enabled remains the
+# operator-facing master switch; these environment values define the remote
+# station website and keep its shared secret out of source and PostgreSQL.
+WEB_REQUESTS_INGEST_URL = config('WEB_REQUESTS_INGEST_URL', default='')
+WEB_REQUESTS_INGEST_API_KEY = config('WEB_REQUESTS_INGEST_API_KEY', default='')
+WEB_REQUESTS_INGEST_CONNECT_TIMEOUT = config(
+    'WEB_REQUESTS_INGEST_CONNECT_TIMEOUT', default=5.0, cast=float,
+)
+WEB_REQUESTS_INGEST_READ_TIMEOUT = config(
+    'WEB_REQUESTS_INGEST_READ_TIMEOUT', default=20.0, cast=float,
+)
+WEB_REQUESTS_INGEST_MAX_RESPONSE_BYTES = config(
+    'WEB_REQUESTS_INGEST_MAX_RESPONSE_BYTES', default=1048576, cast=int,
+)
+
 # Persistent (survives reboot, unlike /run's tmpfs) last-known-good
 # encoder configuration state -- see encoders/services/lkg.py. Contains
 # the exact rendered Liquidsoap script (with credentials embedded, since

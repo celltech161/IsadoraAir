@@ -1,0 +1,11 @@
+[Unit]
+Description=Poll the configured public site for listener requests
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=20s
+AccuracySec=1s
+Persistent=false
+
+[Install]
+WantedBy=timers.target

@@ -3,7 +3,7 @@ Description=Synthesize spoken dedication intros for scheduled web requests
 
 [Timer]
 # Kept independent of web-requests-poll.timer's 20s cadence (that
-# timer's requests_sync.py shells out to refresh_song_request_statuses
+# integrated ingest timer runs refresh_song_request_statuses
 # as one step of its own poll cycle -- see lib/config.py's
 # refresh_statuses()) deliberately -- Kokoro+ffmpeg together can take
 # tens of seconds worst case, and that reconciliation command must

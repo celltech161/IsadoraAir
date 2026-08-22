@@ -8,9 +8,10 @@ from webrequests.models import WebRequestConfig
 class Command(BaseCommand):
     """Prints WebRequestConfig as JSON to stdout, same cross-venv pattern
     as dump_weather_config/dump_amber_alert_config -- the external
-    web-requests-ingest scripts have no Django installed."""
+    legacy standalone ingest scripts have no Django installed. Retained only
+    to support a safe deployment cutover."""
 
-    help = "Dump WebRequestConfig as JSON for the external web-requests-ingest scripts."
+    help = "Legacy bridge: dump WebRequestConfig as JSON."
 
     def handle(self, *args, **options):
         cfg = WebRequestConfig.load()

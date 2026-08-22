@@ -43,7 +43,7 @@ class WebRequestConfigAdmin(admin.ModelAdmin):
 @admin.register(SongRequest)
 class SongRequestAdmin(admin.ModelAdmin):
     """Mostly a read-only audit trail -- rows are created by the
-    requests-poller script and mutated by the engine's own scheduling/
+    integrated ingest command and mutated by the engine's own scheduling/
     fulfillment logic. status is left editable for manual
     troubleshooting (e.g. force-expiring a stuck row); everything else
     that pins the request to a specific track/log_item is readonly so

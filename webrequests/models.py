@@ -96,9 +96,8 @@ class WebRequestConfig(models.Model):
 class SongRequest(models.Model):
     """One listener-submitted song request, mirrored locally from the
     public website's own request record. IsadoraAir never talks to the
-    public site's database directly -- a poller script creates one row
-    here per still-open request it sees on each poll (see
-    lib/webrequests_client.py on the ingest side), and the engine's own
+    public site's database directly -- the integrated ingest command creates one row
+    here per still-open request it sees on each poll, and the engine's own
     queue-advance logic is the only thing that ever fulfills one, by
     swapping the requested track into the next upcoming music-kind
     LogItem.

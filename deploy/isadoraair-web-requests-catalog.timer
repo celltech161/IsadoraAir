@@ -1,0 +1,10 @@
+[Unit]
+Description=Sync IsadoraAir's eligible request catalog to the public site
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=15min
+Persistent=false
+
+[Install]
+WantedBy=timers.target

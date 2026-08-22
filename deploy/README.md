@@ -72,7 +72,9 @@ sudo systemctl enable --now isadoraair-analyze.timer \
   isadoraair-prune-emaillog.timer isadoraair-prune-systemevents.timer \
   isadoraair-aircheck-buffer.timer
 # Only needed if Web Requests is in use (WebRequestConfig.enabled):
-sudo systemctl enable --now isadoraair-generate-dedication-intros.timer
+sudo systemctl enable --now isadoraair-web-requests-ingest.timer \
+  isadoraair-web-requests-catalog.timer \
+  isadoraair-generate-dedication-intros.timer
 # Optional: sudo systemctl enable --now isadoraair-backup.timer
 # Optional: sudo systemctl enable --now 'syndicated-*.timer' 'wx-*.timer'
 sudo systemctl reload nginx
@@ -99,6 +101,8 @@ Timer-driven jobs (fire on a schedule, exit):
 | `isadoraair-prune-royalty-ledger.timer` | Daily (04:35) — prunes PlayEvent + IcecastSample rows past retention (default 3 years each). RoyaltyReport rows and their generated files are kept forever. |
 | `isadoraair-tunein-push.timer` | Every 30s — pushes now-playing to TuneIn's AIR API when the current PlayEvent id differs from the last successful push. No-op until credentials are entered at Config > TuneIn AIR and `enabled` is checked. |
 | `isadoraair-generate-dedication-intros.timer` | Every 15s — synthesizes spoken dedication intros (Kokoro) for scheduled web song requests. `Nice=19`, independent of the 20s web-requests-ingest poll cycle (Kokoro+ffmpeg can take tens of seconds). Only relevant if Web Requests is enabled. |
+| `isadoraair-web-requests-ingest.timer` | Every 20s — polls a station-configured public website, atomically imports new listener requests, runs the existing lifecycle refresh, and pushes authoritative statuses. No-op unless Web Requests is enabled. |
+| `isadoraair-web-requests-catalog.timer` | Every 15min — sends the eligible music catalog and 168-hour availability grid to the configured public website. No-op unless Web Requests is enabled. |
 | `isadoraair-aircheck-buffer.timer` | Every minute — rolls over the always-on Aircheck idle working buffer (`/run/isadoraair/aircheck-current.audio`) via the existing `aircheck.reopen` telnet call once it grows past a hard-coded 64 MiB safety limit, but only when no Aircheck session is active. `Nice=19`. Never starts/restarts encoders and fails safely (retries next cycle) if Liquidsoap is unreachable. |
 | `isadoraair-backup.timer` | Nightly full backup (03:30) — runs the repo-managed `deploy/backup_isadoraair.sh`; needs remote-target creds (`@@ISA_HOME@@/.iasboxbu.cred`) outside the repo |
 | `isadoraair-prune-emaillog.timer` | Daily (04:15) EmailLog retention prune, 90-day default |
@@ -175,6 +179,10 @@ separate projects (own venvs, own creds). The units in `deploy/`
 reference them but do not include their source — this repo is
 IsadoraAir itself; those three ingest paths are companion projects
 that produce audio + metadata IsadoraAir then plays.
+
+Listener web-request ingestion is intentionally not on that list: it is a
+native `webrequests` feature, uses this repository and virtualenv, stores its
+durable state in PostgreSQL, and reads its remote-site secret from `.env`.
 
 The backup **script** (`deploy/backup_isadoraair.sh`) is repo-managed —
 `isadoraair-backup.service`'s `ExecStart` runs it directly from your

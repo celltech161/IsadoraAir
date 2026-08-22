@@ -2,63 +2,23 @@ import json
 import sys
 
 from django.core.management.base import BaseCommand
-from django.utils import timezone
-from django.utils.dateparse import parse_datetime
-
-from library.models import Track
-from webrequests.models import SongRequest
+from webrequests.ingest import ingest_pending_items
 
 
 class Command(BaseCommand):
-    """Reads a JSON payload of still-pending requests (piped via stdin
-    by the external requests_sync.py poller) and creates one local
+    """Legacy cutover bridge: reads still-pending requests from stdin
+    and creates one local
     SongRequest per external_request_id we haven't already seen.
-    Cross-venv pattern -- the poller has no Django installed, so all it
-    does is HTTP GET the public site's pending-requests endpoint and
-    pipe the response straight into this command.
+    The native ingest_web_requests command now performs this in-process; this
+    command remains temporarily useful while transitioning an older install.
 
     Already-known external_request_ids are silently skipped: once a
     request exists locally its lifecycle (pending -> ... -> terminal)
     is owned by refresh_song_request_statuses and the engine, not by
     repeated polls turning up the same still-open request."""
 
-    help = "Ingest pending song requests polled from the public site (JSON via stdin)."
+    help = "Legacy bridge: ingest pending public-site requests from JSON on stdin."
 
     def handle(self, *args, **options):
         payload = json.loads(sys.stdin.read())
-        now = timezone.now()
-        created = 0
-        skipped = 0
-
-        for item in payload.get("requests", []):
-            # external_request_id comes back as a bare integer (the
-            # site's own PK) -- str() it since our field is a CharField
-            # (kept as a string rather than assuming their id scheme is
-            # a plain integer forever).
-            external_id = str(item["external_request_id"])
-            if SongRequest.objects.filter(external_request_id=external_id).exists():
-                skipped += 1
-                continue
-
-            track = Track.objects.filter(
-                id=item["track_id"], category__kind__code="music", ready2air=True,
-            ).first()
-
-            req = SongRequest.objects.create(
-                external_request_id=external_id,
-                track=track,
-                requester_name=item.get("requester_name") or "",
-                dedication_message=item.get("dedication_message") or "",
-                submitted_at=parse_datetime(item["submitted_at"]),
-            )
-            if track is None:
-                # Public site's own catalog sync is stale, or the track
-                # went ineligible between catalog_sync and this poll --
-                # resolve it immediately rather than waiting for the
-                # next refresh_song_request_statuses cycle.
-                req.status = "unavailable"
-                req.resolved_at = now
-                req.save(update_fields=["status", "resolved_at"])
-            created += 1
-
-        self.stdout.write(json.dumps({"created": created, "skipped": skipped}))
+        self.stdout.write(json.dumps(ingest_pending_items(payload.get("requests", []))))
