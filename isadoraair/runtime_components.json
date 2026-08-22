@@ -1,0 +1,107 @@
+{
+  "schema_version": 1,
+  "canonical_paths": {
+    "runtime_root": "/opt/isadoraair-runtime",
+    "tts_asset_root": "/var/lib/isadoraair/tts",
+    "tts_cli": "/usr/local/bin/isadoraair-tts",
+    "tts_scratch": "/run/isadoraair/tts",
+    "fdkaac_binary": "/usr/local/bin/fdkaac",
+    "native_library_root": "/usr/local/lib"
+  },
+  "components": {
+    "kokoro": {
+      "availability": {
+        "policy": "feature_selected",
+        "unselected_absent": "optional_pass",
+        "selected_missing_or_broken": "fail"
+      },
+      "runtime": {
+        "venv": "/opt/isadoraair-runtime/kokoro/venv",
+        "python": "/opt/isadoraair-runtime/kokoro/venv/bin/python",
+        "packages": {
+          "kokoro-onnx": "0.4.7",
+          "onnxruntime": "1.28.0",
+          "numpy": "2.5.1",
+          "phonemizer-fork": "3.3.1",
+          "espeakng-loader": "0.2.4"
+        }
+      },
+      "assets": {
+        "model": {
+          "path": "/var/lib/isadoraair/tts/kokoro/kokoro-v1.0.onnx",
+          "filename": "kokoro-v1.0.onnx",
+          "sha256": "7d5df8ecf7d4b1878015a32686053fd0eebe2bc377234608764cc0ef3636a6c5"
+        },
+        "voices": {
+          "path": "/var/lib/isadoraair/tts/kokoro/voices-v1.0.bin",
+          "filename": "voices-v1.0.bin",
+          "sha256": "bca610b8308e8d99f32e6fe4197e7ec01679264efed0cac9140fe9c29f1fbf7d"
+        }
+      },
+      "output": {
+        "format": "wav",
+        "sample_rate_hz": 24000,
+        "channels": 1,
+        "sample_format": "signed-16-bit-pcm"
+      },
+      "execution": {
+        "cpu_affinity": null,
+        "onnx_intra_op_threads": null,
+        "process_nice": null
+      },
+      "provenance": {
+        "software_license": "MIT",
+        "model_license": "Apache-2.0",
+        "software_url": "https://github.com/thewh1teagle/kokoro-onnx",
+        "model_url": "https://huggingface.co/hexgrad/Kokoro-82M",
+        "voices_public_redistribution": "LICENSE CONFIRMATION REQUIRED FOR PUBLIC REDISTRIBUTION"
+      }
+    },
+    "piper": {
+      "availability": {
+        "policy": "optional",
+        "unselected_absent": "optional_pass",
+        "selected_missing_or_broken": "fail"
+      },
+      "runtime": {
+        "venv": "/opt/isadoraair-runtime/piper/venv",
+        "python": "/opt/isadoraair-runtime/piper/venv/bin/python",
+        "packages": {
+          "piper-tts": "1.4.2"
+        }
+      },
+      "models": {
+        "root": "/var/lib/isadoraair/tts/piper",
+        "selection_owner": "station_configuration",
+        "required_defaults": []
+      }
+    },
+    "fdkaac": {
+      "availability": {
+        "policy": "feature_selected",
+        "features": [
+          "he_aac",
+          "he_aac_v2"
+        ],
+        "unselected_absent": "optional_pass",
+        "selected_missing_or_broken": "fail"
+      },
+      "runtime": {
+        "fdkaac_version": "1.0.7",
+        "libfdk_aac_version": "2.0.3",
+        "binary": "/usr/local/bin/fdkaac",
+        "library_root": "/usr/local/lib"
+      },
+      "source_archives": {
+        "fdk-aac": {
+          "filename": "fdk-aac-2.0.3.tar.gz",
+          "sha256": "e25671cd96b10bad896aa42ab91a695a9e573395262baed4e4a2ff178d6a3a78"
+        },
+        "fdkaac": {
+          "filename": "fdkaac-1.0.7.tar.gz",
+          "sha256": "145d4684c9325a2bd650e46a04b03327abe780a7b59cce47e6de8af2064fb2c7"
+        }
+      }
+    }
+  }
+}

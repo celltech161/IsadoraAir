@@ -3,6 +3,18 @@
 Inspection of the production install (`/home/jreed/kokoro`, 2026-08-12).
 No large model files added to Git; no changes made to the live install.
 
+## Runtime Foundation A status
+
+The product-relevant wrapper implementation is now Git-owned in
+`isadoraair/tts/normalization.py` and `isadoraair/tts/kokoro.py`. Its canonical
+runtime and asset contract is `isadoraair/runtime_components.json`; see
+`docs/RUNTIME_COMPONENTS.md`.
+
+This is a source-ownership milestone, **not a production migration**. The live
+installation and all current callers still use the paths documented below.
+The future canonical paths have not been created, callers have not been
+switched, and the production wrapper files have not been modified.
+
 ## What it is
 
 [`kokoro-onnx`](https://github.com/thewh1teagle/kokoro-onnx) (`pip`
@@ -10,7 +22,7 @@ package `kokoro-onnx==0.4.7`) — an ONNX Runtime port of the
 Kokoro-82M text-to-speech model, run entirely locally/offline (no API
 calls, no network dependency at synthesis time).
 
-## Installation layout
+## Current production layout (legacy path, still active)
 
 ```
 /home/jreed/kokoro/
@@ -62,16 +74,17 @@ Installed versions on production: `numpy==2.5.1`, `onnxruntime==1.28.0`,
 `1.52.0+dfsg-5build1`) -- `phonemizer-fork`/`espeakng-loader` shell out
 to it for grapheme-to-phoneme conversion before synthesis.
 
-Recreate the venv:
+The historical manual recreation shape is:
 ```bash
 sudo apt install espeak-ng
 python3 -m venv venv
-venv/bin/pip install kokoro-onnx
+venv/bin/pip install kokoro-onnx==0.4.7
 ```
-(No pinned `requirements.txt` exists for this venv today -- the
-version above is what's confirmed working; a future pass could add one
-if pinning becomes important. Not fabricated as a blind `pip freeze`
-here, matching this phase's general policy on dependency manifests.)
+
+This is not yet the supported provisioner. Runtime Foundation A records the
+proven package versions in the component manifest without adding TTS-only
+packages to the main Django `requirements.txt`. A later provisioner will
+create the separate runtime deterministically.
 
 ## Command-line interface IsadoraAir/weather-ingest use
 
@@ -87,14 +100,13 @@ Reads UTF-8 text from stdin, writes 24 kHz mono 16-bit PCM WAV.
 `--model` is a **voice name** (e.g. `af_jessica`, `am_fenrir`), not a
 file path -- resolved against `voices-v1.0.bin`'s embedded voice table.
 
-The wrapper also applies CPU throttling (`taskset -c 0-3`, `nice -n
-19`, capped ONNX Runtime thread pools) and text preprocessing
-(decimal-point, phone-number, and "911" pronunciation fixes, hashtag
-stripping) documented in `_kokoro_synth.py`'s own header -- both are
-station-tuned behavior baked into this specific install, not something
-a generic reproduction needs to replicate exactly to be functional,
-just something to be aware exists if audio output ever sounds
-different from a fresh install.
+The active shell wrapper applies station-host CPU throttling (`taskset -c
+0-3`, `nice -n 19`, capped ONNX Runtime thread pools). Those machine-specific
+mechanics are not product defaults. The text preprocessing (decimal-point,
+phone-number, and `911` pronunciation fixes plus hashtag stripping) is
+product-relevant behavior and is now preserved with regression tests in the
+repository implementation. The repository version has no username, home
+directory, fixed CPU affinity, or fixed four-thread assumption.
 
 ## Voice assets currently present
 

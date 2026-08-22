@@ -46,6 +46,7 @@ upstream tag or checksum instead, documented in their own files below
 | Kokoro TTS | `docs/KOKORO_PROVENANCE.md` |
 | Piper TTS | `docs/PIPER_PROVENANCE.md` |
 | TTS support matrix + boundaries | `docs/TTS_SUPPORT_MATRIX.md` |
+| Runtime component machine contract | `isadoraair/runtime_components.json`, `docs/RUNTIME_COMPONENTS.md` |
 | PostgreSQL baseline | `docs/DISASTER_RECOVERY.md`'s "Database restore" section |
 | System package manifest | `deploy/packages-ubuntu-26.04.txt` |
 | Preflight checker | `monitoring/management/commands/check_deploy_baseline.py` (`manage.py check_deploy_baseline`) |
@@ -145,6 +146,8 @@ hardcode Oak Grove specifics into any of these):
 - The canonical `/opt/isadoraair` convention (`docs/HARDCODED_PATH_AUDIT.md`).
 - `docs/KOKORO_PROVENANCE.md` / `docs/PIPER_PROVENANCE.md` — TTS engine
   *installation* recipes (not which voices to select).
+- `isadoraair/runtime_components.json` — machine-readable runtime versions,
+  artifact identities, canonical paths, and conditional/optional semantics.
 
 **Station-specific** (Oak Grove's own configuration/hardware, never
 baked into the generic tooling above):
