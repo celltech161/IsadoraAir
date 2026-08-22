@@ -39,6 +39,7 @@ from library.services.log_builder import (
     build_and_approve_hour_log_locked,
     effective_airtime_seconds,
     fill_remaining_hour,
+    resolve_schedule_block,
 )
 from library.services.remote_dj_signaling import RemoteDJSignalingServer
 from library.services import audio_recovery
@@ -3160,6 +3161,81 @@ class PlaybackEngine:
         print(f"Loaded log for {target_date} {hour:02d}:00 — {len(self.log_items)} items "
               f"({'resuming at position ' + str(skipped) if skipped else 'from top'})")
 
+    def _active_log_has_committed_playout(self):
+        """Whether the active log still owns real program audio to play.
+
+        This is deliberately cursor-aware. A cursor at ``len(log_items)``
+        does not mean the log is exhausted if its last item is already on a
+        deck; conversely, an old PlaylistLog row by itself is not runway.
+        Only an unpaused, unfinished deck from the active log or a playable
+        future item at/after the cursor counts.
+        """
+        if self.current_log is None:
+            return False
+        active_log_id = self.current_log.id
+        with self._lock:
+            decks = tuple(self.decks.values())
+            cursor = self._queue_cursor
+            items = tuple(self.log_items[cursor:])
+
+        for deck in decks:
+            if deck is None or getattr(deck, "paused", False) or getattr(deck, "finished", False):
+                continue
+            log_item = getattr(deck, "log_item", None)
+            if (
+                log_item is not None
+                and log_item.playlist_log_id == active_log_id
+                and getattr(deck, "track", None) is not None
+            ):
+                return True
+
+        return any(
+            item.playlist_log_id == active_log_id and _log_item_playable(item)[0]
+            for item in items
+        )
+
+    def _current_hour_schedule_state(self, now):
+        """Central current-hour orchestration classification.
+
+        ``resolve_schedule_block`` intentionally remains exact-start. A
+        blank wall-clock hour is a healthy continuation only while an older
+        active log still has committed playout; an exhausted/missing old log
+        is an unscheduled gap, not silently accepted merely because a stale
+        PlaylistLog row exists.
+        """
+        now_key = (now.date(), now.hour)
+        active_key = (
+            (self.current_log.date, self.current_log.hour)
+            if self.current_log is not None else None
+        )
+        schedule_block = resolve_schedule_block(now.date(), now.hour)
+
+        if schedule_block is not None:
+            state = "scheduled"
+            has_committed_playout = False
+        elif active_key is not None and active_key > now_key:
+            state = "early_rollover"
+            has_committed_playout = False
+        elif active_key == now_key:
+            state = "current_log"
+            has_committed_playout = self._active_log_has_committed_playout()
+        else:
+            has_committed_playout = self._active_log_has_committed_playout()
+            state = (
+                "continuation"
+                if active_key is not None and active_key < now_key and has_committed_playout
+                else "unscheduled_gap"
+            )
+
+        return {
+            "state": state,
+            "now_key": now_key,
+            "active_key": active_key,
+            "schedule_block": schedule_block,
+            "schedule_expected": schedule_block is not None,
+            "has_committed_playout": has_committed_playout,
+        }
+
     @_glib_safe(default_return=True)
     def _ensure_upcoming_logs(self):
         """No human approval step for now — auto-build (and
@@ -3187,12 +3263,17 @@ class PlaybackEngine:
         with self._lock:
             idle = self.decks["A"] is None and self.decks["B"] is None
 
-        # Kick off (or no-op if already approved/in-flight) BEFORE the
+        hour_state = self._current_hour_schedule_state(now)
+
+        # Kick off (or no-op if already approved/in-flight/unscheduled) BEFORE the
         # monitoring check below, so a first-tick "no log yet" event
         # accurately reports build_in_progress=True rather than False
         # for the instant before the NEXT tick would otherwise have
         # been the first to notice the worker it just started.
-        self._ensure_log_building(now.date(), now.hour)
+        self._ensure_log_building(
+            now.date(), now.hour,
+            schedule_expected=hour_state["schedule_expected"],
+        )
 
         # Monitoring: distinguish a genuine missed/late rollover (the
         # active log is BEHIND wall-clock time) from two states that
@@ -3207,10 +3288,10 @@ class PlaybackEngine:
         # rollover case, which is the opposite of what's intended.
         # Deduplicated per (date, hour) via emit_event's own dedupe_key
         # so a persistent condition doesn't re-alert every 10s tick.
-        now_key = (now.date(), now.hour)
-        active_key = (self.current_log.date, self.current_log.hour) if self.current_log else None
+        now_key = hour_state["now_key"]
+        active_key = hour_state["active_key"]
 
-        if active_key is not None and active_key < now_key:
+        if hour_state["state"] == "scheduled" and active_key is not None and active_key < now_key:
             if not PlaylistLog.objects.filter(date=now.date(), hour=now.hour, status="approved").exists():
                 with self._lock:
                     build_in_progress = now_key in self._building_hours
@@ -3224,7 +3305,7 @@ class PlaybackEngine:
                     },
                     dedupe_key=f"engine|late-hour-log|{now.date()}|{now.hour}",
                 )
-        elif active_key is None:
+        elif hour_state["state"] == "scheduled" and active_key is None:
             if not PlaylistLog.objects.filter(date=now.date(), hour=now.hour, status="approved").exists():
                 with self._lock:
                     build_in_progress = now_key in self._building_hours
@@ -3238,7 +3319,21 @@ class PlaybackEngine:
                     },
                     dedupe_key=f"engine|no-current-log|{now.date()}|{now.hour}",
                 )
-        # active_key > now_key: intentional early rollover -- not a warning condition.
+        elif hour_state["state"] == "unscheduled_gap":
+            emit_event(
+                category="engine", level="warning",
+                title="Unscheduled hour has no continuing program",
+                detail={
+                    "target_date": str(now.date()), "target_hour": now.hour,
+                    "active_log_date": str(self.current_log.date) if self.current_log else None,
+                    "active_log_hour": self.current_log.hour if self.current_log else None,
+                    "has_committed_playout": False,
+                },
+                dedupe_key=f"engine|unscheduled-hour-gap|{now.date()}|{now.hour}",
+            )
+        # continuation/current_log/early_rollover are all intentional,
+        # warning-free states. In particular, an older active log is only
+        # accepted here when _active_log_has_committed_playout() proved it.
 
         # Checked every tick, not just the tick that built the log —
         # otherwise if the one attempt to start playback right after a
@@ -3255,9 +3350,25 @@ class PlaybackEngine:
         # from before -- _load_log_for is a single indexed query, not
         # the slow build, so it was never the source of the stall.
         if idle and not self.manual_mode:
-            self._load_log_for(now.date(), now.hour)
-            if self.log_items:
+            if active_key is not None and active_key > now_key:
+                # Intentional early rollover: never move the queue backward.
+                pass
+            elif active_key == now_key or hour_state["schedule_expected"]:
+                self._load_log_for(now.date(), now.hour)
+            # During a blank continuation/gap, retain the older active log.
+            # Its queued items or an async live-fill proposal still belong to
+            # that log; loading the nonexistent blank hour here would clear
+            # current_log and make either recovery path stale immediately.
+            if self.log_items and (
+                hour_state["state"] != "unscheduled_gap"
+                or self._queue_cursor < len(self.log_items)
+            ):
                 self._start_next_track()
+            elif (
+                hour_state["state"] == "unscheduled_gap"
+                and active_key is not None and active_key < now_key
+            ):
+                self._try_extend_live_log_async()
 
         seconds_left_in_hour = 3600 - (now.minute * 60 + now.second)
         if seconds_left_in_hour <= NEXT_HOUR_LOOKAHEAD_SECONDS:
@@ -3336,7 +3447,13 @@ class PlaybackEngine:
         self._next_hour_peek_at = 0.0
         print(f"  Advanced active queue to next hour ahead of TOH: {log.date} {log.hour:02d}:00 ({len(items)} items)")
 
-    def _ensure_log_building(self, target_date, target_hour, target_duration_seconds=NOMINAL_HOUR_SECONDS):
+    def _ensure_log_building(
+        self,
+        target_date,
+        target_hour,
+        target_duration_seconds=NOMINAL_HOUR_SECONDS,
+        schedule_expected=None,
+    ):
         """Kick off an async build for (target_date, target_hour) if no
         approved log exists yet and one isn't already in flight for
         this exact hour in this process. The "approved already exists"
@@ -3355,22 +3472,34 @@ class PlaybackEngine:
         12:59, and playback fell back to the previous approved hour
         (12pm news repeated).)
 
+        Missing exact-start ScheduleBlocks are deterministic and return
+        ``"unscheduled"`` without spawning a worker. ``schedule_expected``
+        lets _ensure_upcoming_logs reuse its centralized current-hour
+        classification; omitted for other callers, this method performs the
+        same exact-start resolution itself. This does not broaden schedule
+        resolution or clone an earlier block into a blank hour.
+
         `target_duration_seconds` defaults to a full nominal hour --
         _ensure_upcoming_logs passes a shorter, clock-drift-projected
         value for the NEXT hour's lookahead build only; the current-
         hour catch-up build (a startup/recovery scenario, not "predict
         the future") always uses the default."""
         if PlaylistLog.objects.filter(date=target_date, hour=target_hour, status="approved").exists():
-            return
+            return "approved"
+        if schedule_expected is None:
+            schedule_expected = resolve_schedule_block(target_date, target_hour) is not None
+        if not schedule_expected:
+            return "unscheduled"
         key = (target_date, target_hour)
         with self._lock:
             if key in self._building_hours:
-                return
+                return "building"
             self._building_hours.add(key)
         threading.Thread(
             target=self._build_hour_log_worker, args=(target_date, target_hour, target_duration_seconds),
             daemon=True,
         ).start()
+        return "dispatched"
 
     def _build_hour_log_worker(self, target_date, target_hour, target_duration_seconds=NOMINAL_HOUR_SECONDS):
         """Runs on a background thread -- touches only the Django ORM,
@@ -7434,6 +7563,20 @@ class PlaybackEngine:
     def _on_log_exhausted(self, slot):
         print(f"  [{slot}] Log exhausted for this hour.")
         now = timezone.localtime()
+        hour_state = self._current_hour_schedule_state(now)
+        if (
+            not hour_state["schedule_expected"]
+            and hour_state["active_key"] is not None
+            and hour_state["active_key"] < hour_state["now_key"]
+        ):
+            # An intentional blank hour still belongs to the older active
+            # log while fallback is being computed. Loading the nonexistent
+            # wall-clock log here would clear current_log/log_items and make
+            # the already-dispatched live-fill proposal stale by design.
+            self._try_extend_live_log_async()
+            print("Unscheduled hour exhausted. Waiting for live fill...")
+            GLib.timeout_add_seconds(30, self._try_load_next_hour)
+            return
         next_hour = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
         self._load_log_for(next_hour.date(), next_hour.hour)
         if self.log_items:
@@ -7447,6 +7590,24 @@ class PlaybackEngine:
         if not self.running:
             return False
         now = timezone.localtime()
+        hour_state = self._current_hour_schedule_state(now)
+        if (
+            not hour_state["schedule_expected"]
+            and hour_state["active_key"] is not None
+            and hour_state["active_key"] < hour_state["now_key"]
+        ):
+            # Keep ownership on the older log throughout an intentional
+            # blank hour. A completed live-fill extends this same queue; a
+            # pending/failed fill is retried without invalidating its
+            # generation. Once wall clock reaches an exactly scheduled hour,
+            # this branch stops applying and normal current-hour loading wins.
+            if self._queue_cursor < len(self.log_items):
+                self._start_next_track()
+                return False
+            if hour_state["has_committed_playout"]:
+                return False
+            self._try_extend_live_log_async()
+            return True
         self._load_log_for(now.date(), now.hour)
         if self.log_items:
             self._start_next_track()

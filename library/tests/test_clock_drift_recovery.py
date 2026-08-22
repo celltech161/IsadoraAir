@@ -208,7 +208,11 @@ class TargetDurationThreadingTests(TestCase):
         with patch.object(eng_module.PlaylistLog.objects, "filter") as mock_filter, \
              patch.object(stand_in, "_build_hour_log_worker", side_effect=fake_worker):
             mock_filter.return_value.exists.return_value = False
-            stand_in._ensure_log_building(date(2027, 5, 1), 10, target_duration_seconds=3100)
+            stand_in._ensure_log_building(
+                date(2027, 5, 1), 10,
+                target_duration_seconds=3100,
+                schedule_expected=True,
+            )
 
         deadline = time.time() + 5
         while "target_duration_seconds" not in captured and time.time() < deadline:

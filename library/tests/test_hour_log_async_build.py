@@ -3,11 +3,10 @@
 follow-up queue-monotonicity/monitoring fix caught in code review
 before that change went live.
 
-Uses bare LogItem fixtures (no real Track/ScheduleBlock/Rotation data)
-throughout -- these tests are about the surrounding async/locking/
-threading infrastructure, not the rotation-picking algorithm itself,
-which is exercised separately by normal usage and doesn't need
-re-testing here.
+Uses bare LogItem fixtures and minimal real ScheduleBlocks where build
+dispatch is expected. These tests are about the surrounding async/
+locking/threading infrastructure, not the rotation-picking algorithm
+itself, which is exercised separately.
 
 Every class here uses TransactionTestCase, not plain TestCase. Several
 tests spawn a REAL background thread (via _ensure_log_building, what a
@@ -30,7 +29,7 @@ unique_together on (date, hour))."""
 import inspect
 import threading
 import time
-from datetime import date
+from datetime import date, time as dt_time
 from unittest.mock import MagicMock, patch
 
 from django.db import close_old_connections, connection
@@ -38,7 +37,7 @@ from django.test import TransactionTestCase
 from django.utils import timezone
 
 import library.services.engine as eng_module
-from library.models import Category, CategoryKind, LogItem, PlaylistLog
+from library.models import Category, CategoryKind, LogItem, PlaylistLog, Rotation, ScheduleBlock
 from library.services.log_builder import (
     LOCK_CONTENDED,
     build_and_approve_hour_log_locked,
@@ -89,6 +88,16 @@ class HourLogFixtureMixin:
         super().setUp()
         kind = CategoryKind.objects.create(code="test-kind", name="Test Kind")
         self.category = Category.objects.create(code="TESTCAT", name="Test Category", kind=kind)
+        self.rotation = Rotation.objects.create(name="Hour Log Test Rotation")
+
+    def make_schedule_block(self, d, hour, *, specific=True):
+        return ScheduleBlock.objects.create(
+            specific_date=d if specific else None,
+            day_of_week=None if specific else d.weekday(),
+            start_time=dt_time(hour, 0),
+            end_time=dt_time((hour + 1) % 24, 0),
+            rotation=self.rotation,
+        )
 
     def make_log(self, d, hour, status="approved", item_count=1):
         log = PlaylistLog.objects.create(date=d, hour=hour, status=status)
@@ -176,14 +185,13 @@ class EarlyRolloverMonitoringTests(HourLogFixtureMixin, TransactionTestCase):
              patch.object(eng_module, "build_and_approve_hour_log_locked", return_value=build_return), \
              patch.object(eng_module, "GLib"):
             eng_module.PlaybackEngine._ensure_upcoming_logs(stand_in)
-            # _ensure_upcoming_logs unconditionally kicks off a
-            # background build for (now.date(), now.hour) -- wait for
-            # it to FULLY finish (including its own finally-block
-            # cleanup) while the patches are still active. Exiting the
-            # `with` block early would un-patch build_and_approve_hour_
-            # log_locked out from under a still-running thread, which
-            # would then call the REAL function against fixtures that
-            # don't support it, and race the test database's teardown.
+            # A scheduled current hour kicks off a background build --
+            # wait for it to FULLY finish (including its own finally-
+            # block cleanup) while the patches are still active. Exiting
+            # the `with` block early would un-patch build_and_approve_
+            # hour_log_locked out from under a still-running thread,
+            # which would then call the REAL function against fixtures
+            # that don't support it, and race the test database teardown.
             deadline = time.time() + 5
             while stand_in._building_hours and time.time() < deadline:
                 time.sleep(0.02)
@@ -208,6 +216,7 @@ class EarlyRolloverMonitoringTests(HourLogFixtureMixin, TransactionTestCase):
     def test_warning_when_active_log_is_genuinely_behind(self):
         d = date(2027, 3, 1)
         behind = self.make_log(d, 4)
+        self.make_schedule_block(d, 5)
 
         stand_in = make_stand_in()
         stand_in.current_log = behind
@@ -221,6 +230,8 @@ class EarlyRolloverMonitoringTests(HourLogFixtureMixin, TransactionTestCase):
         self.assertIn("Current hour's log not ready after rollover", emitted)
 
     def test_warning_when_no_active_log_at_all(self):
+        d = date(2027, 3, 1)
+        self.make_schedule_block(d, 5)
         stand_in = make_stand_in()
         stand_in.current_log = None
         stand_in._load_log_for = MagicMock()
@@ -316,7 +327,7 @@ class AdminRebuildSemanticsTests(TransactionTestCase):
         self.assertEqual(rebuilt_log.status, "draft")
 
 
-class NeverSynchronousTests(TransactionTestCase):
+class NeverSynchronousTests(HourLogFixtureMixin, TransactionTestCase):
     """_ensure_upcoming_logs must never call the builder on its own
     (the main GLib) thread, under any condition -- deck-idle state
     alone doesn't prove the engine has no live audio (studio mic,
@@ -325,6 +336,7 @@ class NeverSynchronousTests(TransactionTestCase):
     def test_ensure_upcoming_logs_never_calls_the_builder_on_the_main_thread(self):
         d = date(2027, 3, 4)
         hour = 8
+        self.make_schedule_block(d, hour)
 
         stand_in = make_stand_in()
         stand_in._load_log_for = MagicMock()
