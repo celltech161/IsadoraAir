@@ -13,6 +13,7 @@ this suite runs anywhere, no card required.
 See test_audio_recovery.py for the pure-module (no GStreamer) half."""
 import threading
 import time
+from unittest.mock import patch
 
 import gi
 
@@ -64,6 +65,7 @@ def make_mic_stand_in(identity_kind="", identity="", legacy_device=None):
     obj._mic_quarantine_q = None
     obj._mic_slot = None
     obj._mic_last_observed_slot_state = None
+    obj._mic_recovery_dispatch_serial = 0
     obj._mic_recovery_attempt = 0
     obj._mic_next_retry_at = None
     obj._mic_device_present = None
@@ -72,16 +74,15 @@ def make_mic_stand_in(identity_kind="", identity="", legacy_device=None):
     obj._mic_buf_last_ns = None
     obj._mic_buf_count = 0
 
-    # DuckingConfig.load() hits the DB -- stubbed to a plain, disabled
-    # ducking policy so _apply_talk_ducking (called via _set_mic_ptt)
-    # doesn't need a database.
-    from unittest.mock import patch
     return obj
 
 
-def build_and_play(obj, extra_elements=(), synthetic_hw=False):
-    """Constructs the mic bin, wires it into a throwaway test pipeline,
-    and reaches PLAYING. Returns (pipeline, mic_bin, sink).
+def build_pipeline(obj, extra_elements=(), synthetic_hw=False):
+    """Construct the mic bin and wire it into a stopped test pipeline.
+
+    Returns (pipeline, mic_bin, sink). Keeping construction separate from
+    playback lets event-probe tests install instrumentation before one-shot
+    startup events can be emitted.
 
     synthetic_hw=True replaces the cold-start generation (built by
     _build_mic_chain against FAKE_MIC_DEVICE, which -- confirmed directly,
@@ -104,6 +105,13 @@ def build_and_play(obj, extra_elements=(), synthetic_hw=False):
     for el in extra_elements:
         pipeline.add(el)
     mic_bin.link(sink)
+    return pipeline, mic_bin, sink
+
+
+def build_and_play(obj, extra_elements=(), synthetic_hw=False):
+    """Build a throwaway mic pipeline and bring it to PLAYING."""
+    pipeline, mic_bin, sink = build_pipeline(
+        obj, extra_elements=extra_elements, synthetic_hw=synthetic_hw)
     pipeline.set_state(Gst.State.PLAYING)
     deadline = time.monotonic() + 3.0
     while time.monotonic() < deadline:
@@ -294,11 +302,14 @@ class MicLossSemanticsTests(MockDuckingMixin, SimpleTestCase):
             # directly (a bare, never-PLAYING selector reads back None
             # regardless of what was set).
             assert_active_pad_is(self, obj._mic_selector, obj._mic_silence_pad)
-            # Recovery was dispatched immediately (quiesce), so by the
-            # time this returns the slot has already moved past the
-            # fleeting DEGRADED instant into RECOVERING -- "not OK" is
-            # the meaningful assertion here.
-            self.assertNotEqual(obj._mic_slot.state, audio_recovery.SlotState.OK)
+            # The worker may already have completed by this point, so its
+            # current state is intentionally not asserted. The observer
+            # marker must retain the dispatched RECOVERING edge until the
+            # real tick processes the completion.
+            self.assertEqual(
+                obj._mic_last_observed_slot_state,
+                audio_recovery.SlotState.RECOVERING.value,
+            )
         finally:
             pipeline.set_state(Gst.State.NULL)
 
@@ -359,6 +370,196 @@ class MicLossSemanticsTests(MockDuckingMixin, SimpleTestCase):
         self.assertEqual(obj._mic_slot.generation, first_generation)
 
 
+class MicFastOperationObserverTests(MockDuckingMixin, SimpleTestCase):
+    """Regression coverage for mic operations that finish between ticks.
+
+    These tests deliberately let the real SlotCoordinator worker resolve
+    before invoking the real _mic_recovery_tick. They exercise the same
+    observer marker and nested-dispatch serial discipline as the established
+    output-side fast-operation tests.
+    """
+
+    _DEVICE_LOST_ERROR = (
+        "gst-resource-error-quark: Error recording from audio device. "
+        "The device has been disconnected. (9)"
+    )
+
+    def _fake_error_message(self):
+        class _Err:
+            def __str__(self_inner):
+                return self._DEVICE_LOST_ERROR
+
+        class _Msg:
+            def parse_error(self_inner):
+                return _Err(), ""
+
+        return _Msg()
+
+    def _fast_quiesce_to_ok_before_first_tick(self, obj):
+        obj.mic_ok = True
+        obj._set_mic_ptt(True)
+        obj._on_mic_error(None, self._fake_error_message())
+        self.assertEqual(
+            obj._mic_last_observed_slot_state,
+            audio_recovery.SlotState.RECOVERING.value,
+            "dispatch must synchronously retain the RECOVERING observer edge",
+        )
+        self.assertTrue(
+            wait_until(lambda: obj._mic_slot.state == audio_recovery.SlotState.OK, timeout=3.0),
+            "the real quiescence worker must finish before the first tick",
+        )
+        self.assertIsNone(obj._mic_hw_bin)
+        self.assertIsNone(obj._mic_pending_hw_bin)
+
+    def test_fast_quiescence_is_processed_and_remains_safely_muted(self):
+        obj = make_mic_stand_in()
+        pipeline, mic_bin, sink = build_and_play(obj, synthetic_hw=True)
+        try:
+            self._fast_quiesce_to_ok_before_first_tick(obj)
+
+            obj._mic_recovery_tick()
+
+            self.assertEqual(obj._mic_slot.state, audio_recovery.SlotState.DEGRADED)
+            self.assertEqual(
+                obj._mic_last_observed_slot_state,
+                audio_recovery.SlotState.DEGRADED.value,
+            )
+            self.assertFalse(obj.mic_ok)
+            self.assertFalse(obj.mic_live)
+            self.assertEqual(obj.mic_ptt_volume.get_property("volume"), 0.0)
+            assert_active_pad_is(self, obj._mic_selector, obj._mic_silence_pad)
+        finally:
+            pipeline.set_state(Gst.State.NULL)
+
+    def test_presence_probe_can_dispatch_after_fast_quiescence(self):
+        obj = make_mic_stand_in(identity_kind="alsa_card_id", identity="TESTMIC")
+        pipeline, mic_bin, sink = build_and_play(obj, synthetic_hw=True)
+        try:
+            self._fast_quiesce_to_ok_before_first_tick(obj)
+            obj._mic_recovery_tick()
+            self.assertEqual(obj._mic_slot.state, audio_recovery.SlotState.DEGRADED)
+
+            def dispatch_synthetic_rebuild():
+                return obj._mic_request_recovery(lambda: True)
+
+            with (
+                patch.object(audio_recovery, "read_alsa_cards_present", return_value={"TESTMIC"}),
+                patch.object(obj, "_mic_dispatch_rebuild", wraps=dispatch_synthetic_rebuild) as dispatch_spy,
+            ):
+                obj._mic_presence_probe_tick()
+
+            dispatch_spy.assert_called_once_with()
+            self.assertEqual(
+                obj._mic_last_observed_slot_state,
+                audio_recovery.SlotState.RECOVERING.value,
+            )
+            self.assertGreaterEqual(obj._mic_recovery_attempt, 1)
+            self.assertTrue(wait_until(lambda: obj._mic_slot.state == audio_recovery.SlotState.OK))
+        finally:
+            pipeline.set_state(Gst.State.NULL)
+
+    def test_fast_rebuild_completion_is_promoted_by_next_real_tick(self):
+        obj = make_mic_stand_in(identity_kind="alsa_card_id", identity="TESTMIC")
+        pipeline, mic_bin, sink = build_and_play(obj, synthetic_hw=True)
+        try:
+            self._fast_quiesce_to_ok_before_first_tick(obj)
+            obj._mic_recovery_tick()
+
+            def build_synthetic_generation(device):
+                bin_obj = Gst.Bin.new(f"fast_rebuild_{time.monotonic_ns()}")
+                src = Gst.ElementFactory.make("audiotestsrc", None)
+                src.set_property("is-live", True)
+                bin_obj.add(src)
+                ghost = Gst.GhostPad.new("src", src.get_static_pad("src"))
+                ghost.set_active(True)
+                bin_obj.add_pad(ghost)
+                return bin_obj, src
+
+            with (
+                patch.object(audio_recovery, "resolve_runtime_device", return_value="synthetic:testmic"),
+                patch.object(obj, "_build_mic_hw_generation", side_effect=build_synthetic_generation),
+                patch.object(obj, "_mic_buffer_age_ms", return_value=0.0),
+            ):
+                obj._mic_dispatch_rebuild()
+                self.assertEqual(
+                    obj._mic_last_observed_slot_state,
+                    audio_recovery.SlotState.RECOVERING.value,
+                )
+                self.assertTrue(
+                    wait_until(lambda: obj._mic_slot.state == audio_recovery.SlotState.OK, timeout=3.0),
+                    "the valid rebuild must finish before its first observer tick",
+                )
+
+            pending = obj._mic_pending_hw_bin
+            self.assertIsNotNone(pending)
+            obj._mic_recovery_tick()
+
+            self.assertIs(obj._mic_hw_bin, pending)
+            self.assertIsNone(obj._mic_pending_hw_bin)
+            self.assertEqual(obj._mic_slot.state, audio_recovery.SlotState.OK)
+            self.assertEqual(obj._mic_last_observed_slot_state, audio_recovery.SlotState.OK.value)
+            self.assertTrue(obj.mic_ok)
+            self.assertFalse(obj.mic_live)
+            self.assertEqual(obj.mic_ptt_volume.get_property("volume"), 0.0)
+        finally:
+            pipeline.set_state(Gst.State.NULL)
+
+    def test_fast_nested_pending_discard_marker_is_not_overwritten(self):
+        obj = make_mic_stand_in()
+        pipeline, mic_bin, sink = build_and_play(obj, synthetic_hw=True)
+        try:
+            self._fast_quiesce_to_ok_before_first_tick(obj)
+            obj._mic_recovery_tick()
+
+            pending, _ = obj._build_mic_hw_generation(FAKE_MIC_DEVICE)
+            obj._mic_bin.add(pending)
+            pending.get_static_pad("src").link(obj._mic_quarantine_q.get_static_pad("sink"))
+            obj._mic_pending_hw_bin = pending
+
+            # Model a failed rebuild completion before its first observer
+            # tick. The DEGRADED handler will discard this pending bin and
+            # therefore dispatch another operation from inside the tick.
+            obj._mic_request_recovery(lambda: False)
+            self.assertTrue(
+                wait_until(lambda: obj._mic_slot.state == audio_recovery.SlotState.DEGRADED),
+            )
+            self.assertEqual(
+                obj._mic_last_observed_slot_state,
+                audio_recovery.SlotState.RECOVERING.value,
+            )
+
+            real_request_recovery = obj._mic_request_recovery
+
+            def complete_nested_before_return(worker):
+                result = real_request_recovery(worker)
+                if result == "dispatched":
+                    self.assertTrue(
+                        wait_until(lambda: obj._mic_slot.state == audio_recovery.SlotState.OK),
+                        "nested pending-bin teardown must finish before the handler returns",
+                    )
+                return result
+
+            with patch.object(obj, "_mic_request_recovery", side_effect=complete_nested_before_return):
+                obj._mic_recovery_tick()
+
+            self.assertIsNone(obj._mic_pending_hw_bin)
+            self.assertEqual(obj._mic_slot.state, audio_recovery.SlotState.OK)
+            self.assertEqual(
+                obj._mic_last_observed_slot_state,
+                audio_recovery.SlotState.RECOVERING.value,
+                "the outer tick must preserve the nested dispatch marker",
+            )
+
+            obj._mic_recovery_tick()
+            self.assertEqual(obj._mic_slot.state, audio_recovery.SlotState.DEGRADED)
+            self.assertEqual(
+                obj._mic_last_observed_slot_state,
+                audio_recovery.SlotState.DEGRADED.value,
+            )
+        finally:
+            pipeline.set_state(Gst.State.NULL)
+
+
 class EosQuarantineTests(MockDuckingMixin, SimpleTestCase):
     """Item 6/7, narrowed after pre-commit review (Issue 1): EOS from the
     hardware branch is suppressed; FLUSH_START/FLUSH_STOP are explicitly
@@ -377,16 +578,28 @@ class EosQuarantineTests(MockDuckingMixin, SimpleTestCase):
         probe on the final sink's own sink pad, so these tests can
         observe exactly what a downstream element actually receives, not
         just what was sent."""
-        pipeline, mic_bin, sink = build_and_play(obj, synthetic_hw=True)
-        self.assertTrue(play_pipeline(pipeline))
+        pipeline, mic_bin, sink = build_pipeline(obj, synthetic_hw=True)
         obj._mic_selector.set_property("active-pad", obj._mic_silence_pad)
         downstream_events = []
+        expected_events = {
+            Gst.EventType.STREAM_START,
+            Gst.EventType.CAPS,
+            Gst.EventType.SEGMENT,
+        }
+        startup_events_seen = threading.Event()
 
         def probe(pad, info):
             downstream_events.append(info.get_event().type)
+            if expected_events.issubset(downstream_events):
+                startup_events_seen.set()
             return Gst.PadProbeReturn.OK
 
         sink.get_static_pad("sink").add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM, probe)
+        self.assertTrue(play_pipeline(pipeline))
+        self.assertTrue(
+            startup_events_seen.wait(timeout=3.0),
+            f"startup events did not reach the pre-installed probe: {downstream_events}",
+        )
         return pipeline, sink, downstream_events
 
     def test_eos_on_hw_branch_sink_pad_is_dropped(self):
@@ -454,7 +667,6 @@ class EosQuarantineTests(MockDuckingMixin, SimpleTestCase):
         obj = make_mic_stand_in()
         pipeline, sink, downstream_events = self._build_played_pipeline_with_downstream_probe(obj)
         try:
-            time.sleep(0.3)
             for expected in (Gst.EventType.STREAM_START, Gst.EventType.CAPS, Gst.EventType.SEGMENT):
                 self.assertIn(expected, downstream_events, f"{expected} must reach downstream normally")
         finally:

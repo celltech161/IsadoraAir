@@ -598,6 +598,7 @@ class PlaybackEngine:
         self._mic_quarantine_q = None
         self._mic_slot = None  # audio_recovery.SlotCoordinator, built in _build_mic_chain
         self._mic_last_observed_slot_state = None
+        self._mic_recovery_dispatch_serial = 0
         self._mic_recovery_attempt = 0
         self._mic_next_retry_at = None  # monotonic seconds
         self._mic_device_present = None  # observability only; None = unknown/not probed yet
@@ -1227,6 +1228,7 @@ class PlaybackEngine:
 
         self._mic_slot = audio_recovery.SlotCoordinator("mic", timeout_s=15.0)
         self._mic_last_observed_slot_state = self._mic_slot.state.value
+        self._mic_recovery_dispatch_serial = 0
 
         self.mic_ok = True
         return [mic_bin]
@@ -1517,6 +1519,28 @@ class PlaybackEngine:
         self._mic_quiesce_current_generation()
         return True
 
+    def _mic_request_recovery(self, worker):
+        """Dispatch one guarded mic operation and preserve its observer edge.
+
+        This is the microphone equivalent of _output_request_recovery.
+        SlotCoordinator can finish a fast operation entirely between two
+        _mic_recovery_tick polls. Recording RECOVERING synchronously for
+        every newly dispatched operation guarantees the next tick observes
+        that operation's eventual completion instead of comparing a stale
+        OK baseline with a new OK result and skipping the transition.
+
+        The serial also protects a dispatch made inside
+        _mic_handle_slot_transition (currently pending-generation discard):
+        the outer tick must not overwrite the nested dispatch's RECOVERING
+        marker even if its worker has already completed before the handler
+        returns.
+        """
+        result = self._mic_slot.request_recovery(worker)
+        if result == "dispatched":
+            self._mic_last_observed_slot_state = audio_recovery.SlotState.RECOVERING.value
+            self._mic_recovery_dispatch_serial += 1
+        return result
+
     def _mic_quiesce_current_generation(self):
         """[P0] 1.3B2 -- detaches the failed hardware generation from the
         persistent quarantine queue and hands its NULL transition to a
@@ -1549,7 +1573,7 @@ class PlaybackEngine:
             # FAILURE from set_state(NULL) is still safe to abandon.
             return True
 
-        result = self._mic_slot.request_recovery(worker)
+        result = self._mic_request_recovery(worker)
         print(f"  Mic quiesce dispatched: {result}")
 
     def _mic_dispatch_rebuild(self):
@@ -1600,7 +1624,7 @@ class PlaybackEngine:
             age = self._mic_buffer_age_ms()
             return age is not None and age <= 250
 
-        result = self._mic_slot.request_recovery(worker)
+        result = self._mic_request_recovery(worker)
         print(f"  Mic rebuild dispatched (generation {self._mic_hw_generation}): {result}")
 
     def _mic_discard_pending_hw_bin(self, abandoned=False):
@@ -1655,7 +1679,7 @@ class PlaybackEngine:
                 bin_obj.set_state(Gst.State.NULL)
                 return True  # reaching this line without hanging is the point; see _mic_quiesce_current_generation's worker
 
-            result = self._mic_slot.request_recovery(worker)
+            result = self._mic_request_recovery(worker)
             print(f"  Mic discard-pending NULL dispatched: {result}")
 
     def _mic_handle_slot_transition(self, old_state, new_state, snapshot):
@@ -1754,8 +1778,15 @@ class PlaybackEngine:
         new_state = snapshot["state"]
         old_state = self._mic_last_observed_slot_state
         if new_state != old_state:
+            dispatch_serial_before_handler = self._mic_recovery_dispatch_serial
             self._mic_handle_slot_transition(old_state, new_state, snapshot)
-            self._mic_last_observed_slot_state = new_state
+            if self._mic_recovery_dispatch_serial == dispatch_serial_before_handler:
+                # No nested operation was dispatched while handling this
+                # transition, so synchronize with the coordinator's actual
+                # post-handler state. If the serial advanced,
+                # _mic_request_recovery already installed the RECOVERING
+                # marker that the next tick must process.
+                self._mic_last_observed_slot_state = self._mic_slot.state.value
         return True
 
     def _mic_presence_probe_tick(self):
