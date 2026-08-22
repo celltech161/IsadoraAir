@@ -9,11 +9,13 @@ import gzip
 import io
 import json
 import secrets
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from django.conf import settings
 from django.db import models, transaction
 from django.http import HttpResponseBadRequest, JsonResponse
 from django.shortcuts import get_object_or_404, redirect
+from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_GET, require_POST
@@ -45,6 +47,23 @@ class Availability(models.Model):
     grid = models.JSONField(default=list)
 
 
+def requests_are_open_now():
+    """Public-site UX gate using the station-local v1 availability grid.
+
+    Set ISADORAAIR_STATION_TIME_ZONE to the same IANA zone selected in
+    IsadoraAir at Config -> Station Time. IsadoraAir remains authoritative
+    about actual eligibility and scheduling after submission.
+    """
+    zone_name = getattr(settings, "ISADORAAIR_STATION_TIME_ZONE", "")
+    try:
+        local_now = timezone.now().astimezone(ZoneInfo(zone_name))
+    except (TypeError, ZoneInfoNotFoundError):
+        return False
+    grid = Availability.objects.filter(singleton=True).values_list("grid", flat=True).first()
+    slot = local_now.weekday() * 24 + local_now.hour
+    return isinstance(grid, list) and len(grid) == 168 and grid[slot] is True
+
+
 def _authorised(request):
     expected = getattr(settings, "ISADORAAIR_API_KEY", "")
     supplied = request.headers.get("X-IsadoraAir-Key", "")
@@ -63,6 +82,8 @@ def _api_guard(view):
 @require_POST
 def listener_submit(request):
     """Browser-facing: normal Django CSRF middleware applies here."""
+    if not requests_are_open_now():
+        return HttpResponseBadRequest("Listener requests are currently closed")
     track = get_object_or_404(
         RequestableTrack, remote_id=request.POST.get("track_id"), active=True,
     )
@@ -80,11 +101,15 @@ def listener_submit(request):
 @csrf_exempt
 @_api_guard
 def pending_requests(request):
+    # Protocol v1 returns only these two public-site statuses. A newer status
+    # POST can move a formerly scheduled row back here.
     rows = ListenerRequest.objects.filter(status__in=["pending", "no_slot_soon"])
     return JsonResponse({
         "success": True,
         "requests": [
             {
+                # str(row.pk) is only this example's choice. A real site may
+                # use its stable UUID/string/primary key (maximum 64 chars).
                 "external_request_id": str(row.pk),
                 "track_id": row.track_id,
                 "requester_name": row.requester_name,

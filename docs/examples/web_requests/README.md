@@ -8,10 +8,21 @@ shows the important boundary:
 - `pending_requests`, `catalog_sync`, and `status_update` are authenticated
   server-to-server views called only by IsadoraAir.
 
-Adapt the model names, templates, URL routing, rate limiting, catalog search,
-retention policy, and operator UI to the station's site. Put the shared key in
-that site's secret manager/environment as `ISADORAAIR_API_KEY`; do not render it
-into HTML or JavaScript.
+Before using the sketch, adapt all of the following to the station's site:
+
+- models and migrations;
+- URL routing, templates, branding, and listener UI;
+- catalog search and inactive-track handling;
+- `ISADORAAIR_STATION_TIME_ZONE`, set to the same IANA timezone selected in
+  IsadoraAir under **Config → Station Time**;
+- shared-secret storage (`ISADORAAIR_API_KEY`) in the website backend's secret
+  manager/environment;
+- request validation, CSRF protection, rate limiting, and bot/spam mitigation;
+- retention/privacy policy and operator support tools.
+
+Never render `ISADORAAIR_API_KEY` into HTML or JavaScript. The availability
+helper is a public-site UX gate; IsadoraAir remains authoritative about request
+eligibility and scheduling.
 
 Example routes:
 
@@ -24,5 +35,6 @@ urlpatterns = [
 ]
 ```
 
-The full transport and acknowledgement contract is in
-`docs/WEB_REQUESTS_INTEGRATION.md`.
+The complete Protocol v1 transport, storage, timezone, status, and
+acknowledgement contract is in
+[`docs/WEB_REQUESTS_INTEGRATION.md`](../../WEB_REQUESTS_INTEGRATION.md).
