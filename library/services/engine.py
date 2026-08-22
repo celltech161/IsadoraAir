@@ -307,8 +307,9 @@ class OutputRecoverySlot:
     """[P0] 1.3C -- one independent recovery boundary per physical audio
     output (Studio Monitor, Stereotool Input). Mirrors the mic-recovery
     design's split between a PERSISTENT boundary (queue, errorignore,
-    valve -- never rebuilt) and a REPLACEABLE hardware generation (just
-    the alsasink, rebuilt on every recovery attempt) -- see
+    valve -- never rebuilt) and a REPLACEABLE branch generation (the complete stateful
+    processing tail plus alsasink for Studio Monitor; sink-only for
+    StereoTool, rebuilt on every recovery attempt) -- see
     library/services/audio_recovery.py's SlotCoordinator and
     PlaybackEngine's mic-recovery methods (_build_mic_hw_generation /
     _mic_quiesce_current_generation / _mic_dispatch_rebuild) for the
@@ -556,9 +557,10 @@ class PlaybackEngine:
         Gst.init(None)
         self.loop = GLib.MainLoop()
         self.mixer = None
-        self.agc_dynamic = None
-        self.agc_makeup = None
-        self.agc_limiter = None
+        # Cached settings applied to every disposable Studio Monitor
+        # generation. The processing elements themselves live inside the
+        # generation so a branch retarget resets their streaming state too.
+        self._studio_monitor_agc_settings = None
         # [P0] 1.3C -- output hotplug recovery. Studio Monitor's and
         # Stereotool Input's alsasinks are no longer static self.alsasink/
         # self.stereotool_sink attributes -- each now lives inside its own
@@ -1948,56 +1950,77 @@ class PlaybackEngine:
         errignore.set_property("convert-to", 0)  # GST_FLOW_OK
         return errignore
 
-    def _build_studio_monitor_hw_generation(self, device):
-        """[P0] 1.3C -- the REPLACEABLE hardware-facing portion of the
-        Studio Monitor output: just the alsasink, wrapped in its own
-        Gst.Bin with a ghost 'sink' pad -- mirrors
-        _build_mic_hw_generation's shape exactly. AGC (agc_dynamic/
-        agc_makeup/agc_limiter) is deliberately NOT inside this
-        generation -- it's not hardware-specific, its properties are
-        updated live by _apply_agc_config, and rebuilding it on every
-        USB fault would be unnecessary churn (see this phase's own
-        design refinement in ROUND7_DECISION_REPORT.md). No convert/
-        resample stage here, matching today's pre-1.3C direct
-        agc_limiter.link(alsasink) -- the format is already fixed
-        upstream by the shared capsfilter earlier in the chain.
+    def _build_studio_monitor_hw_generation(self, device, *, sink_factory="alsasink"):
+        """Build the complete replaceable Studio Monitor branch tail.
 
-        [P0] 1.3C physical-acceptance-failure fix -- async=False,
-        deliberately NOT copying StereoTool's whole property set
-        (sync/buffer-time/latency-time stay untouched, i.e. sync
-        defaults to GStreamer's True). Root cause: the recovery
-        choreography in _output_dispatch_rebuild links a fresh candidate
-        behind a CLOSED valve and waits for it to reach PLAYING before
-        ever opening that valve -- but async=True (GstBaseSink's
-        default) makes PAUSED->PLAYING itself asynchronous, blocked on
-        receiving a first buffer to preroll with. A closed valve
-        upstream means no buffer ever arrives, so the candidate could
-        never reach PLAYING, the choreography's own gate could never
-        pass, and every real rebuild attempt timed out at
-        OUTPUT_HEALTH_CHECK_DEADLINE_S and failed health verification --
-        confirmed exactly by physical UCA222 testing (dispatch, ~6s,
-        "failed health verification", repeated every retry) and by a
-        standalone empirical harness reproducing the identical
-        audiotestsrc->valve(drop=True)->fakesink(async=?) shape (see
-        scratchpad/audio_output_recovery/ for the harness/results):
-        async=True never reaches PLAYING behind a closed valve within a
-        3s deadline; async=False reaches it immediately, and opening the
-        valve afterward makes the rendered count increase right away.
-        sync stays True (untouched) -- Studio Monitor is a real
-        listening output where normal clock-synchronised rendering is
-        wanted once buffers flow, unlike StereoTool's loopback-fed,
-        deliberately real-time-priority path; there is no evidence here
-        that Studio Monitor needs StereoTool's other tuned properties
-        (buffer-time/latency-time) at all, so none of those are copied."""
+        The generation contains AGC, makeup, limiter, and sink. Physical
+        Gate A testing found a sink-only replacement could report PLAYING,
+        render buffers, and advance ALSA hw_ptr while the persistent
+        processing leg emitted digital zero. Keeping these stateful
+        processors inside the same bounded generation means an intentional
+        retarget resets the whole Studio-Monitor-local tail without touching
+        the parent pipeline or StereoTool sibling. The containment queue,
+        errorignore, and valve remain persistent outside this bin.
+
+        async=False remains required because recovery links the new
+        generation behind a closed valve and waits for PLAYING before opening
+        it; an asynchronous base sink would wait forever for a preroll buffer
+        that the closed valve cannot provide. sync=False is also deliberate:
+        boundary-level physical capture on two UCA222s reproduced the silent
+        Studio output with clean nonzero PCM at the sink pad and advancing
+        ALSA hw_ptr when clock scheduling was enabled; changing only sync to
+        False restored the captured signal on both devices. This live-source
+        branch is paced upstream, and its valve consumes while closed, so
+        disabling sink scheduling cannot flush a retained queue backlog.
+
+        sink_factory is injectable only for hardware-free regression
+        coverage; production always uses the default alsasink.
+        """
         bin_ = Gst.Bin.new(f"studio_monitor_gen{int(time.time() * 1000)}")
-        sink = Gst.ElementFactory.make("alsasink", None)
-        sink.set_property("device", device)
+        dynamic = Gst.ElementFactory.make("audiodynamic", "agc_dynamic")
+        makeup = Gst.ElementFactory.make("volume", "agc_makeup")
+        limiter = Gst.ElementFactory.make("rglimiter", "agc_limiter")
+        sink = Gst.ElementFactory.make(sink_factory, None)
+        if sink_factory == "alsasink":
+            sink.set_property("device", device)
+        sink.set_property("sync", False)
         sink.set_property("async", False)
-        bin_.add(sink)
-        ghost = Gst.GhostPad.new("sink", sink.get_static_pad("sink"))
+        for element in (dynamic, makeup, limiter, sink):
+            bin_.add(element)
+        dynamic.link(makeup)
+        makeup.link(limiter)
+        limiter.link(sink)
+        self._configure_studio_monitor_generation(bin_)
+        ghost = Gst.GhostPad.new("sink", dynamic.get_static_pad("sink"))
         ghost.set_active(True)
         bin_.add_pad(ghost)
         return bin_, sink
+
+    def _configure_studio_monitor_generation(self, bin_, settings=None):
+        """Apply cached/live AGC settings to one disposable generation."""
+        settings = settings or getattr(self, "_studio_monitor_agc_settings", None)
+        settings = settings or {
+            "enabled": False,
+            "ratio": 1.0,
+            "threshold": 0.0,
+            "soft_knee": False,
+            "makeup_gain_db": 0.0,
+        }
+        dynamic = bin_.get_by_name("agc_dynamic")
+        makeup = bin_.get_by_name("agc_makeup")
+        limiter = bin_.get_by_name("agc_limiter")
+        if not all((dynamic, makeup, limiter)):
+            return
+        if settings["enabled"]:
+            dynamic.set_property("ratio", settings["ratio"])
+            dynamic.set_property("threshold", settings["threshold"])
+            dynamic.set_property("characteristics", 1 if settings["soft_knee"] else 0)
+            makeup.set_property("volume", 10 ** (settings["makeup_gain_db"] / 20.0))
+            limiter.set_property("enabled", True)
+        else:
+            dynamic.set_property("ratio", 1.0)
+            makeup.set_property("volume", 1.0)
+            limiter.set_property("enabled", False)
 
     def _build_stereotool_hw_generation(self, device):
         """[P0] 1.3C -- same shape as
@@ -2791,24 +2814,13 @@ class PlaybackEngine:
         self.output_level.set_property("peak-ttl", LEVEL_PEAK_TTL_MS * Gst.MSECOND)
         self.output_level.set_property("peak-falloff", LEVEL_PEAK_FALLOFF_DB_PER_SEC)
 
-        # Interim leveling for the studio monitor only (StereoTool will
-        # handle real transmitter processing separately, elsewhere). Kept
-        # permanently in the chain rather than conditionally linked, so
-        # enabling/disabling is just a property change, never a pipeline
-        # topology change — see _apply_agc_config.
-        self.agc_dynamic = Gst.ElementFactory.make("audiodynamic", "agc_dynamic")
-        self.agc_makeup = Gst.ElementFactory.make("volume", "agc_makeup")
-        self.agc_limiter = Gst.ElementFactory.make("rglimiter", "agc_limiter")
-
         # [P0] 1.3C -- Studio Monitor's containment/recovery boundary.
         # Built UNCONDITIONALLY (unlike StereoTool below) -- per the task
         # design, Studio Monitor must have its own recovery boundary
         # regardless of whether StereoTool is configured at all; recovery
-        # must never depend on having two outputs wired up. AGC
-        # (agc_dynamic/agc_makeup/agc_limiter above) stays OUTSIDE/
-        # upstream of the disposable generation -- it's not hardware-
-        # specific, it's updated live by _apply_agc_config, and rebuilding
-        # it on every USB fault would be unnecessary churn.
+        # must never depend on having two outputs wired up. The stateful AGC
+        # tail now lives inside the disposable generation so a branch-local
+        # retarget also resets it after a silent-but-PLAYING failure.
         studio_monitor_device = self._resolve_studio_monitor_device()
         self._studio_monitor_slot = self._build_output_slot(
             STUDIO_MONITOR_NAME, "studio_monitor", studio_monitor_device,
@@ -2855,7 +2867,6 @@ class PlaybackEngine:
             self.mixer, self.vt_duck_gain, self.duck_gain,
             self.program_fx_mixer, self.master_mixer, convert, resample, capsfilter,
             self.program_gain, self.output_level,
-            self.agc_dynamic, self.agc_makeup, self.agc_limiter,
             self._studio_monitor_slot.queue, self._studio_monitor_slot.errorignore,
             self._studio_monitor_slot.valve, self._studio_monitor_slot.current_bin,
         ]
@@ -3028,14 +3039,6 @@ class PlaybackEngine:
 
         capsfilter.link(self.program_gain)
         self.program_gain.link(self.output_level)
-        # [P0] 1.3C -- Studio Monitor's queue now sits where agc_dynamic
-        # used to be linked directly (see the diagram in this phase's own
-        # design doc, ROUND7_DECISION_REPORT.md item 13): AGC stays
-        # persistent/upstream of Studio Monitor's own errorignore+valve+
-        # disposable generation. StereoTool's branch is unchanged in
-        # shape (tee -> its own queue -> ... -> its own disposable
-        # generation), just with errorignore+valve now sitting between
-        # its queue and its alsasink too.
         if stereotool_tee:
             self.output_level.link(stereotool_tee)
             stereotool_tee.link(self._studio_monitor_slot.queue)
@@ -3043,10 +3046,11 @@ class PlaybackEngine:
         else:
             self.output_level.link(self._studio_monitor_slot.queue)
 
-        self._studio_monitor_slot.queue.link(self.agc_dynamic)
-        self.agc_dynamic.link(self.agc_makeup)
-        self.agc_makeup.link(self.agc_limiter)
-        self.agc_limiter.link(self._studio_monitor_slot.errorignore)
+        # Each branch keeps its own persistent containment queue,
+        # errorignore, and valve. Studio Monitor's disposable generation
+        # begins after that valve and includes its processing tail + sink;
+        # StereoTool's generation remains sink-only.
+        self._studio_monitor_slot.queue.link(self._studio_monitor_slot.errorignore)
         self._studio_monitor_slot.errorignore.link(self._studio_monitor_slot.valve)
         self._studio_monitor_slot.valve.get_static_pad("src").link(
             self._studio_monitor_slot.current_bin.get_static_pad("sink"))
@@ -3066,26 +3070,27 @@ class PlaybackEngine:
         self.main_pipeline.set_state(Gst.State.PLAYING)
 
     def _apply_agc_config(self):
-        """(Re)apply the studio monitor's AGC settings (fields on its
-        AudioOutput row — see hardware/admin.py's "AGC (Studio Monitor
-        Leveling)" fieldset) to the already-built pipeline elements.
-        `ratio`/`threshold` (audiodynamic) and `volume` are GStreamer
-        'controllable' properties — safe to set live while PLAYING, no
-        READY-state drop needed. Disabled == unity values, functionally
-        identical to not having these elements in the chain at all."""
+        """Apply live AGC settings and cache them for future generations.
+
+        The properties are controllable and safe to update while PLAYING.
+        Current and pending Studio Monitor generations receive the setting;
+        a generation built after this call reads the same cached values.
+        """
         close_old_connections()
         cfg = AudioOutput.objects.filter(name=STUDIO_MONITOR_NAME).first()
         enabled = bool(cfg and cfg.agc_enabled)
-        if enabled:
-            self.agc_dynamic.set_property("ratio", cfg.agc_ratio)
-            self.agc_dynamic.set_property("threshold", cfg.agc_threshold)
-            self.agc_dynamic.set_property("characteristics", 1 if cfg.agc_soft_knee else 0)
-            self.agc_makeup.set_property("volume", 10 ** (cfg.agc_makeup_gain_db / 20.0))
-            self.agc_limiter.set_property("enabled", True)
-        else:
-            self.agc_dynamic.set_property("ratio", 1.0)
-            self.agc_makeup.set_property("volume", 1.0)
-            self.agc_limiter.set_property("enabled", False)
+        self._studio_monitor_agc_settings = {
+            "enabled": enabled,
+            "ratio": cfg.agc_ratio if cfg else 1.0,
+            "threshold": cfg.agc_threshold if cfg else 0.0,
+            "soft_knee": cfg.agc_soft_knee if cfg else False,
+            "makeup_gain_db": cfg.agc_makeup_gain_db if cfg else 0.0,
+        }
+        slot = self._studio_monitor_slot
+        for bin_ in (slot.current_bin, slot.pending_bin):
+            if bin_ is not None:
+                self._configure_studio_monitor_generation(
+                    bin_, self._studio_monitor_agc_settings)
         print(f"  Applied AGC config: enabled={enabled}"
               + (f" ratio={cfg.agc_ratio} threshold={cfg.agc_threshold} makeup_gain_db={cfg.agc_makeup_gain_db}" if cfg else " (no AudioOutput row)"))
 
@@ -5327,11 +5332,11 @@ class PlaybackEngine:
                 # device swap, AND AGC reapply, all under this single
                 # command. See hardware/admin.py's save_model for the
                 # writer-side half of this fix.
+                self._apply_agc_config()
                 identity_changes = self._reload_output_recovery_identity()
                 self._apply_audio_output_device(
                     self._resolve_studio_monitor_device(),
                     identity_changed="studio_monitor" in identity_changes)
-                self._apply_agc_config()
             elif cmd == "reload_audio_output_recovery_config":
                 # [P0] 1.3C -- for AudioOutput rows other than Studio
                 # Monitor (Stereotool Input today), which have no live

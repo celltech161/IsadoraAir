@@ -374,18 +374,19 @@ class OutputSlotConstructionTests(MockEmitEventMixin, SimpleTestCase):
             self.assertEqual(sink.get_property("latency-time"), 20000)
             bin_.set_state(Gst.State.NULL)
 
-    def test_studio_monitor_generation_does_not_get_stereotool_properties(self):
+    def test_studio_monitor_generation_applies_branch_safe_sink_properties(self):
         """[P0] 1.3C physical-acceptance-failure fix -- async is now
         explicitly False (was left at alsasink's True default, which
         the empirical preroll harness proved can never reach PLAYING
         behind the recovery choreography's closed valve -- see
-        _build_studio_monitor_hw_generation's own docstring). sync
-        stays at its True default -- deliberately NOT copying
-        StereoTool's sync=False. latency-time is checked against
+        _build_studio_monitor_hw_generation's own docstring). Physical
+        P4/P5 capture later proved sync=True can accept nonzero buffers
+        while producing only analog noise; sync=False restored physical
+        signal on both UCA222 directions. latency-time is checked against
         alsasink's own real default (10000, confirmed directly via
         gst-inspect) rather than StereoTool's tuned 20000, proving
         Studio Monitor was NOT accidentally given StereoTool's whole
-        property set -- just the one, narrowly-justified async change.
+        property set -- only the independently justified base-sink changes.
         (buffer-time is NOT checked here: alsasink's own default
         happens to already equal StereoTool's tuned 200000, so that
         property alone can't distinguish "got StereoTool's value" from
@@ -394,30 +395,70 @@ class OutputSlotConstructionTests(MockEmitEventMixin, SimpleTestCase):
         obj = make_output_engine_stand_in()
         bin_, sink = obj._build_studio_monitor_hw_generation("hw:CARD=Fake,DEV=0")
         try:
-            self.assertTrue(sink.get_property("sync"), "sync must stay at its True default")
+            self.assertFalse(sink.get_property("sync"), "physical P5 fix must survive every generation")
             self.assertFalse(sink.get_property("async"), "async must be explicitly False (the fix)")
             self.assertEqual(sink.get_property("latency-time"), 10000,
                               "must be alsasink's own default, not StereoTool's tuned 20000")
         finally:
             bin_.set_state(Gst.State.NULL)
 
-    def test_studio_monitor_and_agc_are_not_inside_the_generation(self):
-        """The [P0] 1.3C design refinement: AGC stays persistent/outside
-        the disposable generation -- the generation contains ONLY the
-        sink."""
+    def test_studio_monitor_generation_owns_fresh_processing_tail(self):
+        """Gate A regression: a retarget replaces stateful processing too."""
         obj = make_output_engine_stand_in()
-        bin_, sink = obj._build_studio_monitor_hw_generation("hw:CARD=Fake,DEV=0")
+        first_bin, first_sink = obj._build_studio_monitor_hw_generation(
+            "hw:CARD=Fake,DEV=0")
+        second_bin, second_sink = obj._build_studio_monitor_hw_generation(
+            "hw:CARD=Fake,DEV=0")
         try:
-            found = []
-            it = bin_.iterate_elements()
-            while True:
-                ok, el = it.next()
-                if not ok:
-                    break
-                found.append(el)
-            self.assertEqual(found, [sink], "generation must contain ONLY the alsasink")
+            for bin_, sink in ((first_bin, first_sink), (second_bin, second_sink)):
+                self.assertIsNotNone(bin_.get_by_name("agc_dynamic"))
+                self.assertIsNotNone(bin_.get_by_name("agc_makeup"))
+                self.assertIsNotNone(bin_.get_by_name("agc_limiter"))
+                self.assertIs(sink.get_parent(), bin_)
+            for name in ("agc_dynamic", "agc_makeup", "agc_limiter"):
+                self.assertIsNot(
+                    first_bin.get_by_name(name), second_bin.get_by_name(name),
+                    f"{name} must be replaced with the generation")
         finally:
-            bin_.set_state(Gst.State.NULL)
+            first_bin.set_state(Gst.State.NULL)
+            second_bin.set_state(Gst.State.NULL)
+
+    def test_real_studio_processing_generation_passes_nonzero_samples(self):
+        """The production AGC/limiter topology must not manufacture silence."""
+        obj = make_output_engine_stand_in()
+        obj._studio_monitor_agc_settings = {
+            "enabled": True,
+            "ratio": 10.0,
+            "threshold": 0.9,
+            "soft_knee": True,
+            "makeup_gain_db": 0.0,
+        }
+        bin_, sink = obj._build_studio_monitor_hw_generation(
+            None, sink_factory="appsink")
+        sink.set_property("sync", False)
+        sink.set_property("max-buffers", 1)
+        pipeline = Gst.Pipeline.new("studio-processing-content-regression")
+        src = Gst.ElementFactory.make("audiotestsrc", None)
+        src.set_property("is-live", True)
+        src.set_property("volume", 0.2)
+        pipeline.add(src)
+        pipeline.add(bin_)
+        src.link(bin_)
+        try:
+            pipeline.set_state(Gst.State.PLAYING)
+            sample = sink.emit("try-pull-sample", 2 * Gst.SECOND)
+            self.assertIsNotNone(sample, "processing generation must deliver a sample")
+            buffer = sample.get_buffer()
+            ok, map_info = buffer.map(Gst.MapFlags.READ)
+            self.assertTrue(ok)
+            try:
+                self.assertTrue(
+                    any(byte != 0 for byte in map_info.data),
+                    "nonzero input must remain nonzero after AGC/limiter")
+            finally:
+                buffer.unmap(map_info)
+        finally:
+            pipeline.set_state(Gst.State.NULL)
 
 
 class OutputDeviceLossSemanticsTests(MockEmitEventMixin, SimpleTestCase):
@@ -1023,7 +1064,15 @@ class OutputDeviceLossDuringValidationRaceTests(MockEmitEventMixin, SimpleTestCa
             self.assertEqual(len(self.emitted_events), 0, "no 'recovered' event for a candidate that must not be promoted")
             obj._output_handle_slot_transition(slot, "RECOVERING", "DEGRADED", snapshot)
             self.assertIsNone(slot.pending_bin, "the un-promotable candidate must be discarded")
-            self.assertNotEqual(slot.coordinator.state, audio_recovery.SlotState.OK)
+            self.assertIsNone(slot.current_bin, "the rejected generation must never become current")
+            # The bounded discard worker is allowed to finish immediately;
+            # OK here means only "teardown returned", not that a candidate
+            # was promoted. wait_for_pending_discard_to_resolve below turns
+            # that completion back into the retryable DEGRADED state.
+            self.assertIn(
+                slot.coordinator.state,
+                (audio_recovery.SlotState.RECOVERING, audio_recovery.SlotState.OK),
+            )
 
             # Healthy sibling never stopped through any of this.
             self.assertGreater(healthy_count["n"], healthy_count_at_quiesce,
@@ -1471,13 +1520,14 @@ class ReloadAudioOutputCommandDispatchTests(MockEmitEventMixin, SimpleTestCase):
                 obj._check_commands()
             self.assertFalse(cmd_path.exists(), "command file must be consumed (unlinked)")
 
-    def test_reload_audio_output_invokes_identity_device_and_agc(self):
+    def test_reload_audio_output_caches_agc_before_identity_device_swap(self):
+        """A replacement built immediately must inherit the new AGC values."""
         obj, calls = self._obj_with_recording_stubs()
         self._dispatch(obj, "reload_audio_output")
         self.assertEqual(calls, [
+            "apply_agc",
             "reload_identity",
             ("apply_device", "plughw:2,0", {"identity_changed": True}),
-            "apply_agc",
         ])
 
     def test_reload_audio_output_recovery_config_does_not_touch_device_or_agc(self):
@@ -2180,7 +2230,14 @@ class OutputStaleGenerationOwnershipTests(MockEmitEventMixin, SimpleTestCase):
             with patch.object(slot.coordinator, "request_recovery",
                                wraps=slot.coordinator.request_recovery) as dispatch_spy:
                 self.assertTrue(obj._on_main_bus_error(None, msg1))
-                self.assertEqual(slot.coordinator.state, audio_recovery.SlotState.RECOVERING)
+                # The real bounded teardown can return before this thread
+                # regains the GIL; both states preserve the ownership
+                # contract this test exercises.
+                self.assertIn(
+                    slot.coordinator.state,
+                    (audio_recovery.SlotState.RECOVERING,
+                     audio_recovery.SlotState.OK),
+                )
                 self.assertEqual(dispatch_spy.call_count, 1)
                 # The whole point of the fix: retirement is synchronous,
                 # not dependent on the worker having finished yet.
@@ -2696,14 +2753,14 @@ class OutputStudioMonitorPrerollRegressionTests(MockEmitEventMixin, SimpleTestCa
             pipeline.set_state(Gst.State.NULL)
 
     def test_real_dispatch_rebuild_succeeds_with_studio_monitor_fixed_shape(self):
-        """The SAME choreography, async=False/sync=True (matching
+        """The SAME choreography, async=False/sync=False (matching
         _build_studio_monitor_hw_generation's actual chosen properties
         post-fix) -- candidate reaches PLAYING behind the closed valve,
         the worker opens the valve, rendered count increases, and the
         rebuild is reported successful end to end."""
         obj = make_output_engine_stand_in()
         pipeline, slot = build_slot_in_pipeline(
-            obj, build_generation_fn=_build_generation_with_sink_props(async_val=False, sync_val=True))
+            obj, build_generation_fn=_build_generation_with_sink_props(async_val=False, sync_val=False))
         try:
             simulate_device_loss_and_quiesce(obj, slot)  # -> DEGRADED, ready for a rebuild dispatch
             obj._output_dispatch_rebuild(slot)

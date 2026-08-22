@@ -311,10 +311,12 @@ class AudioOutputAdmin(_DeviceFieldAdmin):
                                 "needed). For Studio Monitor, changing the identity "
                                 "explicitly retargets only that output branch; an "
                                 "unchanged identity leaves its healthy sink alone. "
-                                "The device field above is separate: for Studio "
-                                "Monitor it also swaps live; for every other output "
-                                "(including Stereotool Input) a device change still "
-                                "requires a restart.",
+                                "The device field above is a fallback while a stable "
+                                "identity is enabled; changing it alone does not move "
+                                "the live Studio Monitor sink. With no stable identity, "
+                                "a Studio Monitor device change swaps live. For every "
+                                "other output (including Stereotool Input), a device "
+                                "change still requires a restart.",
             }),
         ]
         if obj and obj.name == STUDIO_MONITOR_NAME:
