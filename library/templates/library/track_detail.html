@@ -233,6 +233,24 @@
   .save-btn.danger { background: var(--danger); color: #fff; }
   .save-btn.danger:hover { opacity: 0.85; }
 
+  .download-audio-link {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    color: var(--accent);
+    font-size: 0.82rem;
+    font-weight: 700;
+    text-decoration: none;
+    border-radius: 5px;
+    padding: 0.25rem 0.35rem;
+    margin-left: -0.35rem;
+  }
+  .download-audio-link:hover { text-decoration: underline; }
+  .download-audio-link:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+
   /* Additional Rotation card -- two-column checkbox picker for
      additional_categories + holidays. Scrollable so a station with
      ~35 categories doesn't push the page down forever. */
@@ -678,8 +696,8 @@
       <span class="field-static">{% if track.bit_depth %}{{ track.bit_depth }}-bit{% endif %}</span>
     </div>
     <div class="field-row">
-      <label>Path</label>
-      <span class="field-muted" style="word-break:break-all;white-space:normal;">{{ track.filepath }}</span>
+      <label>Filename</label>
+      <span class="field-muted" style="word-break:break-all;white-space:normal;">{{ track_source_filename }}</span>
     </div>
     <div class="field-row">
       <label>Play Count</label>
@@ -690,6 +708,13 @@
       <span class="field-static">{% if track.last_played_at %}{{ track.last_played_at }}{% else %}Never{% endif %}</span>
     </div>
     {% if not is_library_read_only %}
+    <div class="field-row">
+      <label></label>
+      <a class="download-audio-link" href="{% url 'library:api-track-download' track.pk %}" download>
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M11 3h2v10.17l3.59-3.58L18 11l-6 6-6-6 1.41-1.41L11 13.17V3zm-5 16h12v2H6v-2z"/></svg>
+        <span>Download Audio</span>
+      </a>
+    </div>
     <div class="field-row">
       <label></label>
       <button class="save-btn" style="padding:0.4rem 1rem;font-size:0.78rem;" onclick="saveTrack()">Save Changes</button>

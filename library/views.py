@@ -1,11 +1,12 @@
 import json
+import os
 import re
 import shutil
 import time as time_mod
 from datetime import date as date_type, time
 from pathlib import Path
 
-from django.http import JsonResponse, HttpResponseForbidden, HttpResponseNotFound
+from django.http import FileResponse, Http404, JsonResponse, HttpResponseForbidden, HttpResponseNotFound
 from django.shortcuts import render
 from django.urls import reverse
 from django.views.decorators.csrf import csrf_exempt, ensure_csrf_cookie
@@ -1148,6 +1149,7 @@ def track_detail_page(request, pk):
     }
     return render(request, "library/track_detail.html", {
         "track": track,
+        "track_source_filename": Path(track.filepath).name if track.filepath else "",
         "categories": categories,
         "holidays": holidays,
         "selected_additional_cat_ids": selected_additional_cat_ids,
@@ -3011,7 +3013,33 @@ _AUDIO_CONTENT_TYPES = {
 _RANGE_RE = re.compile(r"bytes=(\d*)-(\d*)")
 
 
-def _leading_id3_size(fp):
+def _open_track_source_file(track):
+    """Open the authoritative Track source file or raise a path-safe 404.
+
+    Playback and download must agree on what constitutes a usable source.
+    Returning the already-open stream also avoids a validate-then-open race
+    and lets FileResponse stream without loading the file into memory.
+    """
+    if not track.filepath:
+        raise Http404("Track audio is unavailable.")
+
+    fp = Path(track.filepath)
+    source = None
+    try:
+        if not fp.is_file():
+            raise Http404("Track audio is unavailable.")
+        source = fp.open("rb")
+        size = os.fstat(source.fileno()).st_size
+    except Http404:
+        raise
+    except (OSError, ValueError):
+        if source is not None:
+            source.close()
+        raise Http404("Track audio is unavailable.") from None
+    return fp, source, size
+
+
+def _leading_id3_size(source):
     """Some FLAC files in this library have a non-standard ID3v2 tag
     bolted onto the front (a common mistake from MP3-oriented tagging
     tools) -- a real FLAC file must start with the literal bytes "fLaC",
@@ -3024,8 +3052,12 @@ def _leading_id3_size(fp):
     the bogus tag when SERVING the file rather than touching any real
     file on disk. Returns the number of bytes to skip (0 if the file
     already starts correctly)."""
-    with open(fp, "rb") as f:
-        header = f.read(10)
+    original_position = source.tell()
+    try:
+        source.seek(0)
+        header = source.read(10)
+    finally:
+        source.seek(original_position)
     if header[:3] != b"ID3":
         return 0
     # ID3v2 size is "syncsafe": 4 bytes, each only using its low 7 bits.
@@ -3035,19 +3067,25 @@ def _leading_id3_size(fp):
 
 @require_http_methods(["GET"])
 def api_track_audio(request, pk):
-    from django.http import FileResponse, HttpResponse
+    from django.http import HttpResponse
 
     track = get_object_or_404(Track, pk=pk)
-    fp = Path(track.filepath) if track.filepath else None
-    if not fp or not fp.is_file():
+    try:
+        _fp, source, real_size = _open_track_source_file(track)
+    except Http404:
+        # Preserve this endpoint's established missing-file response shape;
+        # the dedicated download endpoint may use Django's ordinary 404.
         return JsonResponse({"error": "File not found on disk"}, status=404)
 
     content_type = _AUDIO_CONTENT_TYPES.get(track.format, "application/octet-stream")
-    real_size = fp.stat().st_size
     # Everything below is relative to this offset, not the real file --
     # 0 for the ~14,000 FLAC files (and every non-FLAC format) that don't
     # have the bogus leading tag.
-    skip = _leading_id3_size(fp) if track.format == "flac" else 0
+    try:
+        skip = _leading_id3_size(source) if track.format == "flac" else 0
+    except (OSError, ValueError):
+        source.close()
+        return JsonResponse({"error": "File not found on disk"}, status=404)
     file_size = real_size - skip
 
     # Django's own FileResponse does NOT implement HTTP Range support
@@ -3064,9 +3102,13 @@ def api_track_audio(request, pk):
         end = min(end, file_size - 1)
         length = end - start + 1
 
-        with open(fp, "rb") as f:
-            f.seek(skip + start)
-            chunk = f.read(length)
+        try:
+            source.seek(skip + start)
+            chunk = source.read(length)
+        except (OSError, ValueError):
+            return JsonResponse({"error": "File not found on disk"}, status=404)
+        finally:
+            source.close()
 
         response = HttpResponse(chunk, status=206, content_type=content_type)
         response["Content-Length"] = str(length)
@@ -3074,12 +3116,36 @@ def api_track_audio(request, pk):
         response["Accept-Ranges"] = "bytes"
         return response
 
-    f = open(fp, "rb")
-    f.seek(skip)
-    response = FileResponse(f, content_type=content_type)
+    try:
+        source.seek(skip)
+    except (OSError, ValueError):
+        source.close()
+        return JsonResponse({"error": "File not found on disk"}, status=404)
+    response = FileResponse(source, content_type=content_type)
     response["Content-Length"] = str(file_size)
     response["Accept-Ranges"] = "bytes"
     return response
+
+
+@require_http_methods(["GET"])
+def api_track_download(request, pk):
+    """Stream a Track's original source file as an authorized download."""
+    from library.middleware import user_is_library_read_only
+
+    if user_is_library_read_only(request.user):
+        return JsonResponse({"error": "Read-only for this account."}, status=403)
+
+    track = get_object_or_404(Track, pk=pk)
+    fp, source, _size = _open_track_source_file(track)
+    content_type = _AUDIO_CONTENT_TYPES.get(
+        track.format, "application/octet-stream"
+    )
+    return FileResponse(
+        source,
+        as_attachment=True,
+        filename=fp.name,
+        content_type=content_type,
+    )
 
 
 @require_http_methods(["POST"])
