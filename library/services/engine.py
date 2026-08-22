@@ -350,6 +350,9 @@ class OutputRecoverySlot:
         self.pending_bin = None               # a rebuild attempt not yet promoted (or None)
         self.pending_sink = None
         self.pending_validation_epoch = None  # device_loss_epoch() at the moment THIS candidate's rebuild was dispatched --
+        # Operator retarget state bridging bounded teardown/rebuild operations.
+        self.retarget_requested = False
+        self.retarget_in_progress = False
         # a SECOND pre-commit review finding: the worker's own final epoch check (see
         # _output_dispatch_rebuild) closes the race for anything that happens WHILE the worker is
         # still running, but there is a further, narrower TOCTOU window between the worker
@@ -395,13 +398,15 @@ class OutputRecoverySlot:
         # _output_recovery_tick's own docstrings for the full mechanism.
         self.recovery_dispatch_serial = 0
 
-    def record_device_loss(self):
-        """Called from _on_output_error for EVERY classified device_lost
-        error belonging to this slot, before checking mark_degraded()'s
-        return value -- a coalesced repeat still needs to bump this."""
+    def invalidate_generation(self):
+        """Advance the epoch guarding current/pending generation ownership."""
         with self._device_loss_epoch_lock:
             self._device_loss_epoch += 1
             return self._device_loss_epoch
+
+    def record_device_loss(self):
+        """Invalidate generations for every classified device-loss message."""
+        return self.invalidate_generation()
 
     def device_loss_epoch(self):
         """Thread-safe read -- called both from the GLib thread (to
@@ -1861,23 +1866,18 @@ class PlaybackEngine:
         save, and _check_commands' "reload_audio_output"/
         "reload_audio_output_recovery_config" handlers below.
 
-        Refreshes ONLY identity_kind/identity, for EVERY currently-
-        built output slot, straight from the DB -- deliberately does
-        NOT touch the hardware generation, the valve, or the raw legacy
-        `device` string at all, so an identity-only edit can never
-        disturb a healthy sink (the review's explicit requirement).
-        Studio Monitor's `device` string itself is still refreshed by
-        the pre-existing _apply_audio_output_device live-swap path
-        (only invoked when actually requested, i.e. when `device`
-        genuinely changed); Stereotool's `device` has no live-swap path
-        at all, unchanged from before this phase -- a device-path edit
-        there still needs a restart, only identity is live now.
+        Refreshes identity_kind/identity for every built output slot and
+        returns the kinds whose identity changed. The caller treats a
+        Studio Monitor identity change as an explicit branch-local
+        retarget; other output identities remain metadata-only live reloads.
+        This method itself never touches a generation, valve, or raw path.
 
         Iterates every BUILT slot regardless of which specific
         AudioOutput row was just saved (cheap, idempotent DB reads) --
         simpler and just as correct as trying to track exactly which
         row triggered the call. Safe to call with zero slots built
         (e.g. before _build_main_pipeline has ever run) -- no-op."""
+        changed_kinds = set()
         for slot in self._output_slots.values():
             identity_kind, identity = self._resolve_output_device_identity(slot.name)
             if (identity_kind, identity) != (slot.identity_kind, slot.identity):
@@ -1886,6 +1886,8 @@ class PlaybackEngine:
                       f"identity {slot.identity!r}->{identity!r}")
                 slot.identity_kind = identity_kind
                 slot.identity = identity
+                changed_kinds.add(slot.kind)
+        return changed_kinds
 
     def _build_output_containment_queue(self, name):
         """[P0] 1.3C -- persistent, leaky-upstream queue for one
@@ -2497,6 +2499,7 @@ class PlaybackEngine:
                 # already happened and passed inside the worker itself
                 # (see _output_dispatch_rebuild); the valve is already
                 # open. Promotion here is pure bookkeeping.
+                intentional_retarget = slot.retarget_in_progress
                 slot.current_bin = slot.pending_bin
                 slot.current_sink = slot.pending_sink
                 slot.pending_bin = None
@@ -2505,25 +2508,32 @@ class PlaybackEngine:
                 slot.recovery_attempt = 0
                 slot.next_retry_at = None
                 slot.device_present = True
-                print(f"  Output recovered ({slot.name}, generation {snapshot['generation']}) -- "
-                      f"device rendering again")
-                emit_event(
-                    category="hardware", level="info", title=f"{slot.name} output recovered",
-                    detail={"generation": snapshot["generation"], "loss_episode": slot.loss_episode},
-                    # [P0] 1.3C physical-acceptance-failure fix -- stable
-                    # per-slot key, same reasoning as the "output lost"
-                    # key above: coordinator generation is an internal
-                    # counter, never a dedupe/UI-spam boundary.
-                    dedupe_key=f"hardware|output-recovered|{slot.kind}",
-                )
+                slot.retarget_in_progress = False
+                if intentional_retarget:
+                    print(f"  Output retarget completed ({slot.name}, generation "
+                          f"{snapshot['generation']}) -- requested device rendering")
+                else:
+                    print(f"  Output recovered ({slot.name}, generation {snapshot['generation']}) -- "
+                          f"device rendering again")
+                    emit_event(
+                        category="hardware", level="info", title=f"{slot.name} output recovered",
+                        detail={"generation": snapshot["generation"], "loss_episode": slot.loss_episode},
+                        dedupe_key=f"hardware|output-recovered|{slot.kind}",
+                    )
             else:
                 # A QUIESCE succeeded (old generation torn down cleanly).
                 # SlotCoordinator's own OK here means only "that
                 # operation finished" -- nothing is rendering yet. Re-
                 # mark DEGRADED immediately so presence-probing continues
                 # to gate a rebuild attempt.
-                print(f"  Output ({slot.name}) old generation quiesced cleanly; waiting for device to return")
+                print(f"  Output ({slot.name}) hardware generation teardown completed")
                 slot.coordinator.mark_degraded()
+                if slot.retarget_requested:
+                    # An intentional retarget gets one immediate open
+                    # attempt. If it fails, the ordinary stable-identity
+                    # presence probe/backoff path owns subsequent retries.
+                    slot.retarget_requested = False
+                    self._output_dispatch_rebuild(slot)
         elif new_state == SlotState.DEGRADED.value:
             if slot.pending_bin is not None:
                 print(f"  Output ({slot.name}) rebuild attempt failed health verification; will retry after backoff")
@@ -2693,6 +2703,7 @@ class PlaybackEngine:
                 "name": slot.name,
                 "state": snapshot["state"],
                 "generation": snapshot["generation"],
+                "operation_state": snapshot["operation_state"],
                 "device_present": slot.device_present,
                 "configured_device": slot.legacy_device,
                 "resolved_runtime_device": audio_recovery.resolve_runtime_device(
@@ -5316,8 +5327,10 @@ class PlaybackEngine:
                 # device swap, AND AGC reapply, all under this single
                 # command. See hardware/admin.py's save_model for the
                 # writer-side half of this fix.
-                self._reload_output_recovery_identity()
-                self._apply_audio_output_device(self._resolve_studio_monitor_device())
+                identity_changes = self._reload_output_recovery_identity()
+                self._apply_audio_output_device(
+                    self._resolve_studio_monitor_device(),
+                    identity_changed="studio_monitor" in identity_changes)
                 self._apply_agc_config()
             elif cmd == "reload_audio_output_recovery_config":
                 # [P0] 1.3C -- for AudioOutput rows other than Studio
@@ -7006,85 +7019,67 @@ class PlaybackEngine:
         else:
             print("  Reload requested but no approved log for current hour")
 
-    def _apply_audio_output_device(self, device):
-        """Swap the Studio Monitor alsasink's device live. alsasink's
-        `device` property is fixed once the element is in PAUSED/
-        PLAYING, so the pipeline drops to READY for the change. Brief
-        audio dropout (~tens of ms) while the device reopens.
+    def _apply_audio_output_device(self, device, *, identity_changed=False):
+        """Request an intentional Studio Monitor branch retarget.
 
-        [P0] 1.3C: retargeted at the Studio Monitor output slot's
-        CURRENT generation's sink (was a static self.alsasink before
-        this phase). Deliberately kept as the SAME whole-main_pipeline
-        READY/PLAYING cycle as before -- not rebuilt to go through the
-        new valve/SlotCoordinator machinery -- since this is an
-        operator-requested device change via the admin (see
-        hardware/signals.py's post_save handler), not a fault; the
-        existing blast radius here is already accepted/documented
-        behavior, unrelated to hotplug recovery.
+        The admin command passes ``identity_changed=True`` when the stable
+        identity fields changed. That is an explicit live retarget even when
+        the raw ``device`` fallback is unchanged. A raw-path edit remains
+        fallback-only while a stable identity is active.
 
-        [P0] 1.3C integration-bug fix -- "changed" is decided by
-        comparing `device` against slot.legacy_device (this slot's own
-        last-known raw AudioOutput.device string), NEVER against the
-        live sink's actual open device. Those two diverge on purpose
-        once a stable identity has resolved the sink to
-        plughw:CARD=<id>,DEV=0 -- comparing against the live sink there
-        would treat every identity-only edit, AGC-only edit, or
-        completely unchanged Save as a "device changed" event (every
-        one of them reaches this call with the SAME raw `device`
-        string every time, via the unified "reload_audio_output"
-        command), forcing a needless READY-cycle on a perfectly healthy
-        sink. That was a real, confirmed production bug -- see
-        hardware/tests/test_audio_output_recovery_reload_signal.py and
-        this method's own test coverage in test_engine_output_recovery.
-        py for the regression proof.
+        The actual lifecycle is the existing bounded output-slot lifecycle:
+        close only this slot's valve, synchronously detach and retire the old
+        generation, dispatch its potentially blocking NULL transition through
+        SlotCoordinator, then build/verify/promote a fresh generation. The
+        parent pipeline and StereoTool sibling are never state-cycled.
 
-        Once a real raw-device change IS detected, stable identity
-        (when active) stays authoritative for what the sink actually
-        uses -- resolve_runtime_device() already ignores legacy_device
-        entirely whenever identity_kind/identity are set, and rebuild/
-        recovery resolution already prefers identity over the raw path.
-        The live-edit path must not silently contradict that: a raw
-        `device` edit while a stable identity is active updates
-        legacy_device as fallback/config metadata (used if identity is
-        later cleared) WITHOUT touching the live sink at all. Only in
-        legacy mode (no stable identity configured) does a genuine raw-
-        device change still swap the live sink, unchanged from pre-
-        1.3C behavior.
-
-        [P0] 1.3C physical-acceptance-failure fix -- slot.current_sink
-        can now legitimately be None (retired mid-quiesce/rebuild -- see
-        _output_quiesce_current_generation). Guarded explicitly: an
-        admin-triggered device change landing in that exact window has
-        nothing live to swap, so this is a no-op (not a crash, and not a
-        READY-cycle against a sink that no longer exists) -- the new
-        raw device is still recorded via legacy_device above, and will
-        apply to whatever generation rebuild/recovery eventually
-        produces."""
+        Returning True means the asynchronous retarget was accepted, not that
+        the target has already opened. Identity/generation epochs invalidate
+        an older candidate if this request races an in-flight recovery.
+        """
         if not self._studio_monitor_slot or not self.main_pipeline:
             return False
         slot = self._studio_monitor_slot
-        if device == slot.legacy_device:
+        raw_changed = device != slot.legacy_device
+        if not raw_changed and not identity_changed:
             return False
-        slot.legacy_device = device  # bookkeeping updated regardless of whether the sink itself moves
-        if slot.identity_kind == "alsa_card_id" and slot.identity:
+        if raw_changed:
+            slot.legacy_device = device
+        if slot.identity_kind == "alsa_card_id" and slot.identity and not identity_changed:
             print(f"  Studio Monitor raw device changed ({device}) while a stable identity is "
                   f"active ({slot.identity_kind}={slot.identity!r}) -- recorded as fallback "
                   f"configuration only; the live sink stays on its stable identity path")
             return False
-        sink = slot.current_sink
-        if sink is None:
-            print(f"  Studio Monitor raw device changed ({device}) while no live generation is "
-                  f"currently attached (mid-recovery) -- recorded as fallback configuration only; "
-                  f"nothing to swap right now")
-            return False
-        try:
-            current = sink.get_property("device")
-        except Exception:
-            current = None
-        print(f"  Switching Studio Monitor alsasink device {current} -> {device}")
-        self.main_pipeline.set_state(Gst.State.READY)
-        sink.set_property("device", device)
-        self.main_pipeline.set_state(Gst.State.PLAYING)
+
+        runtime_device = audio_recovery.resolve_runtime_device(
+            slot.identity_kind, slot.identity, slot.legacy_device)
+        print(f"  Requesting branch-local Studio Monitor retarget -> {runtime_device}")
+
+        # Invalidate any candidate already being verified. Its promotion
+        # epoch check will discard it, so an identity edit racing recovery
+        # can never promote a generation built for the previous identity.
+        slot.invalidate_generation()
+        slot.retarget_requested = True
+        slot.retarget_in_progress = True
+        slot.recovery_attempt = 0
+        slot.next_retry_at = None
+        slot.device_present = None
+        slot.last_state_change_at = time.time()
+        slot.valve.set_property("drop", True)
+
+        if slot.current_bin is not None and slot.coordinator.state == audio_recovery.SlotState.OK:
+            slot.coordinator.mark_degraded()
+            self._output_quiesce_current_generation(slot)
+            return True
+
+        if slot.coordinator.state == audio_recovery.SlotState.OK:
+            slot.coordinator.mark_degraded()
+        if (slot.coordinator.state == audio_recovery.SlotState.DEGRADED and
+                slot.pending_bin is None):
+            slot.retarget_requested = False
+            self._output_dispatch_rebuild(slot)
+        else:
+            print("  Studio Monitor retarget queued behind the slot's current bounded operation")
         return True
 
     def _reload_queue_if_changed(self):

@@ -9,6 +9,7 @@ one poll cycle.
 import json
 from pathlib import Path
 
+from django.db import transaction
 from django.db.models.signals import post_save
 from django.dispatch import receiver
 
@@ -46,9 +47,11 @@ def reload_engine_on_audio_output_change(sender, instance, **kwargs):
     #   Studio Monitor: "reload_audio_output" (the pre-existing device-
     #     swap command) is Studio Monitor's ONE unified live-reload
     #     command -- it now ALSO refreshes every slot's recovery-identity
-    #     fields AND reapplies AGC, all as part of the same command --
-    #     see engine.py's _check_commands handler / _reload_output_
-    #     recovery_identity / _apply_agc_config. (AGC reapply used to be
+    #     fields AND reapplies AGC, all as part of the same command. An
+    #     actual Studio Monitor identity change is an explicit branch-local
+    #     live retarget; an unchanged identity is a hardware no-op. See
+    #     engine.py's command handler and bounded output-slot lifecycle.
+    #     (AGC reapply used to be
     #     a separate direct write from AudioOutputAdmin.save_model();
     #     that raced this signal for the same single-slot file and
     #     reliably clobbered this command -- see that module's save_model
@@ -62,7 +65,16 @@ def reload_engine_on_audio_output_change(sender, instance, **kwargs):
     #     one of these rows still requires a restart, unchanged from
     #     before this phase -- there is no live device-swap path for
     #     them at all, identity is the only thing now reloadable live.
-    if instance.name == "Studio Monitor":
-        _write_engine_command({"command": "reload_audio_output"})
-    else:
-        _write_engine_command({"command": "reload_audio_output_recovery_config"})
+    payload = {
+        "command": (
+            "reload_audio_output"
+            if instance.name == "Studio Monitor"
+            else "reload_audio_output_recovery_config"
+        )
+    }
+    # Django admin wraps the whole change form in transaction.atomic().
+    # Publishing from post_save itself lets the separately connected engine
+    # consume this command before the new identity is committed. Defer the
+    # atomic file write until the surrounding DB transaction commits; a
+    # rollback then correctly publishes nothing.
+    transaction.on_commit(lambda payload=payload: _write_engine_command(payload))

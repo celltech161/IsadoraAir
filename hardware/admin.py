@@ -308,9 +308,10 @@ class AudioOutputAdmin(_DeviceFieldAdmin):
                                 "here. Run `cat /proc/asound/cards` to find the "
                                 "short ID shown in brackets for this output's card. "
                                 "Changes here apply live on Save (no engine restart "
-                                "needed) — the running engine re-reads this identity "
-                                "on every save, without disturbing a currently-healthy "
-                                "sink. The device field above is separate: for Studio "
+                                "needed). For Studio Monitor, changing the identity "
+                                "explicitly retargets only that output branch; an "
+                                "unchanged identity leaves its healthy sink alone. "
+                                "The device field above is separate: for Studio "
                                 "Monitor it also swaps live; for every other output "
                                 "(including Stereotool Input) a device change still "
                                 "requires a restart.",

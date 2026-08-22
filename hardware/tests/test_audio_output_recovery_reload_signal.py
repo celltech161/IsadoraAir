@@ -25,13 +25,14 @@ class AudioOutputReloadSignalTests(TestCase):
     def _save_and_read_command(self, name, device="plughw:9,0", **extra_fields):
         with tempfile.TemporaryDirectory() as tmp:
             cmd_path = Path(tmp) / "engine_cmd.json"
-            with patch("hardware.signals.CMD_PATH", cmd_path):
+            with patch("hardware.signals.CMD_PATH", cmd_path), \
+                 self.captureOnCommitCallbacks(execute=True):
                 obj, _ = AudioOutput.objects.get_or_create(name=name, defaults={"device": device})
                 for field, value in extra_fields.items():
                     setattr(obj, field, value)
                 obj.save()
-                self.assertTrue(cmd_path.is_file(), "post_save must have written a command")
-                return json.loads(cmd_path.read_text(encoding="utf-8"))
+            self.assertTrue(cmd_path.is_file(), "committed save must write a command")
+            return json.loads(cmd_path.read_text(encoding="utf-8"))
 
     def test_studio_monitor_save_writes_reload_audio_output(self):
         payload = self._save_and_read_command("Studio Monitor")
@@ -59,6 +60,36 @@ class AudioOutputReloadSignalTests(TestCase):
         self.assertEqual(payload, {"command": "reload_audio_output_recovery_config"})
 
 
+    def test_command_is_published_only_after_transaction_commit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cmd_path = Path(tmp) / "engine_cmd.json"
+            with patch("hardware.signals.CMD_PATH", cmd_path):
+                with self.captureOnCommitCallbacks(execute=False) as callbacks:
+                    obj, _ = AudioOutput.objects.get_or_create(name="Studio Monitor")
+                    obj.device_identity_kind = "alsa_card_id"
+                    obj.device_identity = "CODEC"
+                    obj.save()
+                    self.assertFalse(cmd_path.exists())
+                self.assertGreaterEqual(len(callbacks), 1)
+                for callback in callbacks:
+                    callback()
+            self.assertEqual(
+                json.loads(cmd_path.read_text(encoding="utf-8")),
+                {"command": "reload_audio_output"})
+
+    def test_rolled_back_save_publishes_no_command(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cmd_path = Path(tmp) / "engine_cmd.json"
+            with patch("hardware.signals.CMD_PATH", cmd_path), \
+                 self.captureOnCommitCallbacks(execute=False) as callbacks:
+                obj, _ = AudioOutput.objects.get_or_create(name="Studio Monitor")
+                obj.device_identity_kind = "alsa_card_id"
+                obj.device_identity = "CODEC"
+                obj.save()
+            self.assertGreaterEqual(len(callbacks), 1)
+            self.assertFalse(cmd_path.exists())
+
+
 class AudioOutputAdminSaveModelIntegrationTests(TestCase):
     """Integration-bug regression coverage: a real production save via
     the Django Admin went through AudioOutputAdmin.save_model(), not
@@ -83,7 +114,8 @@ class AudioOutputAdminSaveModelIntegrationTests(TestCase):
         admin_instance = AudioOutputAdmin(AudioOutput, None)
         with tempfile.TemporaryDirectory() as tmp:
             cmd_path = Path(tmp) / "engine_cmd.json"
-            with patch("hardware.signals.CMD_PATH", cmd_path):
+            with patch("hardware.signals.CMD_PATH", cmd_path), \
+                 self.captureOnCommitCallbacks(execute=True):
                 if mock_subprocess:
                     with patch("hardware.admin.subprocess.run") as mock_run:
                         mock_run.return_value = SimpleNamespace(returncode=0, stdout="", stderr="")

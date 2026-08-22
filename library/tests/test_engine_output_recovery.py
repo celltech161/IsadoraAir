@@ -73,6 +73,47 @@ def make_synthetic_generation_builder(error_after=-1, sleep_time_us=0):
     return build
 
 
+
+class _DeviceAwareSink:
+    """Expose a synthetic sink's real stats plus the requested device."""
+
+    def __init__(self, sink, device):
+        self._sink = sink
+        self.device = device
+
+    def get_property(self, name):
+        if name == "device":
+            return self.device
+        return self._sink.get_property(name)
+
+    def get_static_pad(self, name):
+        return self._sink.get_static_pad(name)
+
+
+def make_device_aware_generation_builder(failing_devices=None, calls=None):
+    failing_devices = failing_devices if failing_devices is not None else set()
+    calls = calls if calls is not None else []
+
+    def build(device):
+        calls.append(device)
+        if device in failing_devices:
+            bin_ = Gst.Bin.new(f"failed_gen_{int(time.time() * 1_000_000)}")
+            gate = Gst.ElementFactory.make("valve", None)
+            gate.set_property("drop", True)
+            sink = Gst.ElementFactory.make("fakesink", None)
+            sink.set_property("sync", False)
+            sink.set_property("async", False)
+            bin_.add(gate)
+            bin_.add(sink)
+            gate.link(sink)
+            ghost = Gst.GhostPad.new("sink", gate.get_static_pad("sink"))
+            ghost.set_active(True)
+            bin_.add_pad(ghost)
+        else:
+            bin_, sink = make_synthetic_generation_builder()(device)
+        return bin_, _DeviceAwareSink(sink, device)
+    return build
+
 def make_output_engine_stand_in():
     """Minimal PlaybackEngine stand-in -- only the attributes the
     _output_* methods actually touch. Mirrors test_engine_mic_recovery.
@@ -230,6 +271,23 @@ def wait_for_pending_discard_to_resolve(obj, slot):
     obj._output_handle_slot_transition(slot, "RECOVERING", "OK", snapshot)
     if slot.coordinator.state != audio_recovery.SlotState.DEGRADED:
         raise AssertionError("slot must be re-degraded after a successful pending-bin discard")
+
+
+
+def complete_successful_retarget(obj, slot, timeout=5.0):
+    """Drive both asynchronous coordinator completions for a retarget."""
+    if not wait_until(lambda: slot.coordinator.state == audio_recovery.SlotState.OK,
+                      timeout=timeout):
+        raise AssertionError("retarget teardown did not resolve to OK")
+    obj._output_handle_slot_transition(
+        slot, "RECOVERING", "OK", slot.coordinator.snapshot())
+    if not wait_until(lambda: slot.coordinator.state == audio_recovery.SlotState.OK,
+                      timeout=timeout):
+        raise AssertionError("retarget candidate did not resolve to OK")
+    obj._output_handle_slot_transition(
+        slot, "RECOVERING", "OK", slot.coordinator.snapshot())
+    if slot.current_bin is None or slot.current_sink is None:
+        raise AssertionError("retarget candidate was not promoted")
 
 
 class MockEmitEventMixin:
@@ -419,20 +477,35 @@ class OutputDeviceLossSemanticsTests(MockEmitEventMixin, SimpleTestCase):
         unnecessary generation churn."""
         obj = make_output_engine_stand_in()
         pipeline, slot = build_slot_in_pipeline(obj)
+        release_teardown = threading.Event()
+        old_bin = slot.current_bin
+        original_set_state = old_bin.set_state
+
+        def held_set_state(state):
+            release_teardown.wait(timeout=2.0)
+            return original_set_state(state)
+
         try:
             gen_before = slot.coordinator.generation
             epoch_before = slot.device_loss_epoch()
             msg = fake_error_message(
                 "gst-resource-error-quark: Error outputting to audio device. "
                 "The device has been disconnected. (10)")
-            for _ in range(62):
-                obj._on_output_error(slot, None, msg)
-            self.assertEqual(slot.coordinator.generation, gen_before + 1,
-                              "62 repeated device-loss messages must dispatch exactly ONE recovery cycle")
-            self.assertEqual(len(self.emitted_events), 1)
-            self.assertEqual(slot.device_loss_epoch(), epoch_before + 62,
-                              "the epoch marker must bump on every classified message, coalesced or not")
+            # Keep the guarded teardown operation deterministically in
+            # flight for the whole synthetic burst. Production's real bus
+            # router also rejects messages from the synchronously retired
+            # old bin; this direct-handler unit test intentionally bypasses
+            # that ownership layer and therefore must hold the operation.
+            with patch.object(old_bin, "set_state", side_effect=held_set_state):
+                for _ in range(62):
+                    obj._on_output_error(slot, None, msg)
+                self.assertEqual(slot.coordinator.generation, gen_before + 1,
+                                  "62 repeated device-loss messages must dispatch exactly ONE recovery cycle")
+                self.assertEqual(len(self.emitted_events), 1)
+                self.assertEqual(slot.device_loss_epoch(), epoch_before + 62,
+                                  "the epoch marker must bump on every classified message, coalesced or not")
         finally:
+            release_teardown.set()
             pipeline.set_state(Gst.State.NULL)
 
 
@@ -1383,9 +1456,10 @@ class ReloadAudioOutputCommandDispatchTests(MockEmitEventMixin, SimpleTestCase):
     def _obj_with_recording_stubs(self):
         obj = make_output_engine_stand_in()
         calls = []
-        obj._reload_output_recovery_identity = lambda: calls.append("reload_identity")
+        obj._reload_output_recovery_identity = lambda: calls.append("reload_identity") or {"studio_monitor"}
         obj._resolve_studio_monitor_device = lambda: "plughw:2,0"
-        obj._apply_audio_output_device = lambda device: calls.append(("apply_device", device))
+        obj._apply_audio_output_device = lambda device, **kwargs: calls.append(
+            ("apply_device", device, kwargs))
         obj._apply_agc_config = lambda: calls.append("apply_agc")
         return obj, calls
 
@@ -1400,7 +1474,11 @@ class ReloadAudioOutputCommandDispatchTests(MockEmitEventMixin, SimpleTestCase):
     def test_reload_audio_output_invokes_identity_device_and_agc(self):
         obj, calls = self._obj_with_recording_stubs()
         self._dispatch(obj, "reload_audio_output")
-        self.assertEqual(calls, ["reload_identity", ("apply_device", "plughw:2,0"), "apply_agc"])
+        self.assertEqual(calls, [
+            "reload_identity",
+            ("apply_device", "plughw:2,0", {"identity_changed": True}),
+            "apply_agc",
+        ])
 
     def test_reload_audio_output_recovery_config_does_not_touch_device_or_agc(self):
         """Stereotool Input (and any other non-Studio-Monitor row) still
@@ -1478,9 +1556,8 @@ class OutputRawDeviceSwapSemanticsTests(MockEmitEventMixin, SimpleTestCase):
     cleared -- consistent with resolve_runtime_device already ignoring
     legacy_device whenever identity is set).
 
-    A spy on main_pipeline.set_state proves the pipeline was (or
-    wasn't) ever dropped to READY -- the actual disturbance this bug
-    caused -- rather than trusting object identity alone."""
+    A spy on main_pipeline.set_state proves the pipeline is never dropped
+    to READY; a real legacy edit now replaces only the monitor branch."""
 
     def _make_slot(self, identity_kind, identity, legacy_device, sink_device):
         obj = make_output_engine_stand_in()
@@ -1590,24 +1667,92 @@ class OutputRawDeviceSwapSemanticsTests(MockEmitEventMixin, SimpleTestCase):
 
     def test_c_legacy_mode_real_device_change_still_swaps_live_sink(self):
         """No stable identity configured (legacy mode) -- a genuine raw
-        `device` change must still swap the live sink, unchanged from
-        pre-1.3C behavior. The existing whole-pipeline READY/PLAYING
-        cycle is the intentionally-accepted, documented blast radius
-        for this specific case (an operator-requested device change)."""
+        `device` change replaces only the Studio Monitor generation."""
         obj, pipeline, slot = self._make_slot(
             identity_kind="", identity="",
             legacy_device="plughw:2,0", sink_device="plughw:2,0")
         try:
+            old_bin = slot.current_bin
             with patch.object(pipeline, "set_state", wraps=pipeline.set_state) as spy:
                 result = obj._apply_audio_output_device("plughw:5,0")
+                complete_successful_retarget(obj, slot)
 
-            self.assertTrue(result, "a real raw-device change in legacy mode must report a state transition")
-            self.assertEqual(slot.current_sink.device, "plughw:5,0")
-            self.assertIn(("device", "plughw:5,0"), slot.current_sink.calls)
+            self.assertTrue(result, "a real raw-device change in legacy mode must be accepted")
+            self.assertIsNot(slot.current_bin, old_bin)
             states = [call.args[0] for call in spy.call_args_list]
-            self.assertIn(Gst.State.READY, states)
-            self.assertIn(Gst.State.PLAYING, states)
+            self.assertNotIn(Gst.State.READY, states)
+            self.assertNotIn(Gst.State.PLAYING, states)
             self.assertEqual(slot.legacy_device, "plughw:5,0")
+            self.assertFalse(slot.valve.get_property("drop"))
+        finally:
+            pipeline.set_state(Gst.State.NULL)
+
+    def test_stable_identity_swap_keeps_stereotool_playing_and_continuous(self):
+        """Production-shaped PCH->CODEC retarget leaves StereoTool untouched."""
+        obj = make_output_engine_stand_in()
+        pipeline = Gst.Pipeline.new("standalone-device-swap-harness")
+        obj.main_pipeline = pipeline
+        monitor_builder = make_device_aware_generation_builder()
+        sibling_builder = make_synthetic_generation_builder()
+        with patch.object(eng_module.PlaybackEngine, "_resolve_output_device_identity",
+                          lambda self, name: (("alsa_card_id", "PCH")
+                                             if name == "Studio Monitor" else ("", ""))):
+            monitor = obj._build_output_slot(
+                "Studio Monitor", "studio_monitor", "device-a", monitor_builder)
+            stereotool = obj._build_output_slot(
+                "Stereotool Input", "stereotool", "stereotool-device", sibling_builder)
+        obj._studio_monitor_slot = monitor
+        obj._stereotool_slot = stereotool
+        obj._output_slots = {"studio_monitor": monitor, "stereotool": stereotool}
+
+        src = Gst.ElementFactory.make("audiotestsrc", None)
+        src.set_property("is-live", True)
+        tee = Gst.ElementFactory.make("tee", None)
+        for element in (src, tee,
+                        monitor.queue, monitor.errorignore, monitor.valve, monitor.current_bin,
+                        stereotool.queue, stereotool.errorignore, stereotool.valve, stereotool.current_bin):
+            pipeline.add(element)
+        src.link(tee)
+        for slot in (monitor, stereotool):
+            tee.link(slot.queue)
+            slot.queue.link(slot.errorignore)
+            slot.errorignore.link(slot.valve)
+            slot.valve.get_static_pad("src").link(slot.current_bin.get_static_pad("sink"))
+
+        sibling_buffers = []
+        sibling_states = []
+        def sibling_probe(pad, info):
+            sibling_buffers.append(time.monotonic())
+            sibling_states.append((pipeline.get_state(0)[1], stereotool.current_bin.get_state(0)[1]))
+            return Gst.PadProbeReturn.OK
+        stereotool.current_sink.get_static_pad("sink").add_probe(
+            Gst.PadProbeType.BUFFER, sibling_probe)
+        try:
+            pipeline.set_state(Gst.State.PLAYING)
+            self.assertTrue(wait_until(lambda: len(sibling_buffers) >= 5))
+            before = len(sibling_buffers)
+            with patch.object(pipeline, "set_state", wraps=pipeline.set_state) as state_spy, \
+                 patch.object(eng_module.PlaybackEngine, "_resolve_output_device_identity",
+                              lambda self, name: (("alsa_card_id", "CODEC")
+                                                 if name == "Studio Monitor" else ("", ""))):
+                changes = obj._reload_output_recovery_identity()
+                self.assertTrue(obj._apply_audio_output_device(
+                    "device-a", identity_changed="studio_monitor" in changes))
+                complete_successful_retarget(obj, monitor)
+                self.assertTrue(wait_until(lambda: len(sibling_buffers) > before + 5))
+
+            self.assertEqual(state_spy.call_args_list, [], "parent pipeline state must never be set")
+            _, sibling_state, _ = stereotool.current_bin.get_state(0)
+            _, pipeline_state, _ = pipeline.get_state(0)
+            self.assertEqual(sibling_state, Gst.State.PLAYING)
+            self.assertEqual(pipeline_state, Gst.State.PLAYING)
+            self.assertFalse(stereotool.valve.get_property("drop"))
+            self.assertTrue(all(a == Gst.State.PLAYING and b == Gst.State.PLAYING
+                                for a, b in sibling_states[before:]))
+            intervals = [b - a for a, b in zip(sibling_buffers, sibling_buffers[1:])]
+            max_gap = max(intervals)
+            print(f"  StereoTool success-retarget max inter-buffer gap: {max_gap:.6f}s")
+            self.assertLess(max_gap, 0.25, "StereoTool buffer production must remain continuous")
         finally:
             pipeline.set_state(Gst.State.NULL)
 
@@ -1639,6 +1784,281 @@ class OutputRawDeviceSwapSemanticsTests(MockEmitEventMixin, SimpleTestCase):
             # The raw field itself IS still updated -- fallback/config
             # metadata, used only if identity is later cleared.
             self.assertEqual(slot.legacy_device, "plughw:9,0")
+        finally:
+            pipeline.set_state(Gst.State.NULL)
+
+
+class OutputIntentionalStableIdentityRetargetTests(MockEmitEventMixin, SimpleTestCase):
+    """Explicit PCH/CODEC live-retarget coverage using synthetic sinks."""
+
+    def _make_slot(self, identity="PCH", failing_devices=None, calls=None):
+        obj = make_output_engine_stand_in()
+        builder = make_device_aware_generation_builder(failing_devices, calls)
+        pipeline, slot = build_slot_in_pipeline(
+            obj, identity_kind="alsa_card_id", identity=identity,
+            legacy_device="plughw:2,0", build_generation_fn=builder)
+        obj.running = True
+        return obj, pipeline, slot
+
+    def _request_identity(self, obj, identity):
+        with patch.object(
+                eng_module.PlaybackEngine, "_resolve_output_device_identity",
+                lambda self, name: ("alsa_card_id", identity)):
+            changed = obj._reload_output_recovery_identity()
+        self.assertEqual(changed, {"studio_monitor"})
+        return obj._apply_audio_output_device(
+            obj._studio_monitor_slot.legacy_device,
+            identity_changed="studio_monitor" in changed)
+
+    def test_pch_to_alternate_and_back_updates_all_slot_bookkeeping(self):
+        calls = []
+        obj, pipeline, slot = self._make_slot(calls=calls)
+        try:
+            old_bin = slot.current_bin
+            old_child = old_bin.iterate_elements().next()[1]
+            epoch_before = slot.device_loss_epoch()
+            with patch.object(pipeline, "set_state", wraps=pipeline.set_state) as state_spy:
+                self.assertTrue(self._request_identity(obj, "CODEC"))
+
+                # Detach/retire happens synchronously, while NULL teardown
+                # is an in-flight bounded worker operation.
+                self.assertIsNone(slot.current_bin)
+                self.assertIsNone(slot.current_sink)
+                self.assertIsNone(slot.pending_bin)
+                self.assertEqual(slot.coordinator.generation, 1)
+                self.assertEqual(slot.coordinator.state, audio_recovery.SlotState.RECOVERING)
+                self.assertEqual(slot.coordinator.snapshot()["operation_state"], "IN_FLIGHT")
+                self.assertEqual(slot.device_loss_epoch(), epoch_before + 1)
+                self.assertFalse(obj._output_slot_owns_message_src(
+                    slot, type("M", (), {"src": old_child})()))
+
+                complete_successful_retarget(obj, slot)
+
+            state = obj._output_recovery_state()["studio_monitor"]
+            self.assertEqual(slot.coordinator.generation, 2)
+            self.assertEqual(slot.coordinator.state, audio_recovery.SlotState.OK)
+            self.assertEqual(state["operation_state"], "RETURNED")
+            self.assertIsNot(slot.current_bin, old_bin)
+            self.assertIsNotNone(slot.current_sink)
+            self.assertIsNone(slot.pending_bin)
+            self.assertIsNone(slot.pending_sink)
+            self.assertIsNone(slot.pending_validation_epoch)
+            self.assertEqual((slot.identity_kind, slot.identity), ("alsa_card_id", "CODEC"))
+            self.assertEqual(state["resolved_runtime_device"], "plughw:CARD=CODEC,DEV=0")
+            self.assertEqual(state["active_device"], "plughw:CARD=CODEC,DEV=0")
+            self.assertFalse(slot.retarget_requested)
+            self.assertFalse(slot.retarget_in_progress)
+            self.assertFalse(slot.valve.get_property("drop"))
+            self.assertEqual(state_spy.call_args_list, [])
+
+            codec_bin = slot.current_bin
+            self.assertTrue(self._request_identity(obj, "PCH"))
+            complete_successful_retarget(obj, slot)
+            state = obj._output_recovery_state()["studio_monitor"]
+            self.assertIsNot(slot.current_bin, codec_bin)
+            self.assertEqual((slot.identity_kind, slot.identity), ("alsa_card_id", "PCH"))
+            self.assertEqual(state["resolved_runtime_device"], "plughw:CARD=PCH,DEV=0")
+            self.assertEqual(state["active_device"], "plughw:CARD=PCH,DEV=0")
+            self.assertEqual(slot.coordinator.generation, 4)
+            self.assertEqual(calls[-2:], ["plughw:CARD=CODEC,DEV=0", "plughw:CARD=PCH,DEV=0"])
+        finally:
+            pipeline.set_state(Gst.State.NULL)
+
+    def _assert_failed_target(self, target):
+        target_device = f"plughw:CARD={target},DEV=0"
+        failing = {target_device}
+        obj, pipeline, slot = self._make_slot(failing_devices=failing)
+        try:
+            old_bin = slot.current_bin
+            with patch.object(pipeline, "set_state", wraps=pipeline.set_state) as state_spy, \
+                 patch.object(eng_module, "OUTPUT_HEALTH_CHECK_DEADLINE_S", 0.2):
+                self.assertTrue(self._request_identity(obj, target))
+                self.assertTrue(wait_until(
+                    lambda: slot.coordinator.state == audio_recovery.SlotState.OK))
+                obj._output_handle_slot_transition(
+                    slot, "RECOVERING", "OK", slot.coordinator.snapshot())
+                self.assertTrue(wait_until(
+                    lambda: slot.coordinator.state == audio_recovery.SlotState.DEGRADED,
+                    timeout=2.0))
+
+            self.assertIsNone(slot.current_bin)
+            self.assertIsNone(slot.current_sink)
+            self.assertIsNotNone(slot.pending_bin)
+            self.assertTrue(slot.valve.get_property("drop"))
+            self.assertEqual(slot.identity, target)
+            self.assertEqual(state_spy.call_args_list, [])
+            self.assertIsNot(slot.pending_bin, old_bin)
+
+            # Failed candidate teardown is also bounded; after it resolves,
+            # normal stable-identity recovery owns later retries.
+            obj._output_handle_slot_transition(
+                slot, "RECOVERING", "DEGRADED", slot.coordinator.snapshot())
+            wait_for_pending_discard_to_resolve(obj, slot)
+            self.assertEqual(slot.coordinator.state, audio_recovery.SlotState.DEGRADED)
+            self.assertIsNone(slot.pending_bin)
+
+            failing.remove(target_device)
+            with patch.object(audio_recovery, "read_alsa_cards_present", lambda: {target: 5}):
+                obj._output_presence_probe_tick()
+            self.assertTrue(wait_until(
+                lambda: slot.coordinator.state == audio_recovery.SlotState.OK))
+            obj._output_handle_slot_transition(
+                slot, "RECOVERING", "OK", slot.coordinator.snapshot())
+            self.assertEqual(slot.current_sink.get_property("device"), target_device)
+            self.assertEqual(slot.coordinator.state, audio_recovery.SlotState.OK)
+            self.assertFalse(slot.valve.get_property("drop"))
+        finally:
+            pipeline.set_state(Gst.State.NULL)
+
+    def test_missing_target_degrades_then_recovers_requested_identity(self):
+        self._assert_failed_target("MISSING")
+
+    def test_busy_open_failure_degrades_then_recovers_requested_identity(self):
+        self._assert_failed_target("BUSY")
+
+    def test_stale_error_from_detached_generation_is_ignored(self):
+        obj, pipeline, slot = self._make_slot()
+        try:
+            old_bin = slot.current_bin
+            old_child = old_bin.iterate_elements().next()[1]
+            self.assertTrue(self._request_identity(obj, "CODEC"))
+            generation = slot.coordinator.generation
+            epoch = slot.device_loss_epoch()
+            self.assertTrue(obj._on_main_bus_error(
+                None, fake_error_message(
+                    "Error outputting to audio device. The device has been disconnected.",
+                    src=old_child)))
+            self.assertEqual(slot.coordinator.generation, generation)
+            self.assertEqual(slot.device_loss_epoch(), epoch)
+            complete_successful_retarget(obj, slot)
+            self.assertEqual(slot.current_sink.get_property("device"), "plughw:CARD=CODEC,DEV=0")
+        finally:
+            pipeline.set_state(Gst.State.NULL)
+
+    def test_old_sink_null_transition_runs_on_bounded_worker_thread(self):
+        obj, pipeline, slot = self._make_slot()
+        old_bin = slot.current_bin
+        caller = threading.current_thread()
+        threads = []
+        original = old_bin.set_state
+
+        def recording_set_state(state):
+            threads.append(threading.current_thread())
+            return original(state)
+
+        try:
+            with patch.object(old_bin, "set_state", side_effect=recording_set_state):
+                self.assertTrue(self._request_identity(obj, "CODEC"))
+                complete_successful_retarget(obj, slot)
+            self.assertTrue(threads)
+            self.assertTrue(all(thread is not caller for thread in threads))
+        finally:
+            pipeline.set_state(Gst.State.NULL)
+
+    def test_failed_target_keeps_stereotool_playing_and_continuous(self):
+        obj = make_output_engine_stand_in()
+        pipeline = Gst.Pipeline.new("failed-retarget-sibling-harness")
+        obj.main_pipeline = pipeline
+        failed_device = "plughw:CARD=MISSING,DEV=0"
+        monitor_builder = make_device_aware_generation_builder({failed_device})
+        sibling_builder = make_synthetic_generation_builder()
+        with patch.object(eng_module.PlaybackEngine, "_resolve_output_device_identity",
+                          lambda self, name: (("alsa_card_id", "PCH")
+                                             if name == "Studio Monitor" else ("", ""))):
+            monitor = obj._build_output_slot(
+                "Studio Monitor", "studio_monitor", "device-a", monitor_builder)
+            stereotool = obj._build_output_slot(
+                "Stereotool Input", "stereotool", "stereotool-device", sibling_builder)
+        obj._studio_monitor_slot = monitor
+        obj._stereotool_slot = stereotool
+        obj._output_slots = {"studio_monitor": monitor, "stereotool": stereotool}
+        obj.running = True
+
+        src = Gst.ElementFactory.make("audiotestsrc", None)
+        src.set_property("is-live", True)
+        tee = Gst.ElementFactory.make("tee", None)
+        for element in (src, tee, monitor.queue, monitor.errorignore, monitor.valve,
+                        monitor.current_bin, stereotool.queue, stereotool.errorignore,
+                        stereotool.valve, stereotool.current_bin):
+            pipeline.add(element)
+        src.link(tee)
+        for slot in (monitor, stereotool):
+            tee.link(slot.queue)
+            slot.queue.link(slot.errorignore)
+            slot.errorignore.link(slot.valve)
+            slot.valve.get_static_pad("src").link(slot.current_bin.get_static_pad("sink"))
+
+        timestamps = []
+        states = []
+        def probe(pad, info):
+            timestamps.append(time.monotonic())
+            states.append((pipeline.get_state(0)[1], stereotool.current_bin.get_state(0)[1]))
+            return Gst.PadProbeReturn.OK
+        stereotool.current_sink.get_static_pad("sink").add_probe(Gst.PadProbeType.BUFFER, probe)
+        try:
+            pipeline.set_state(Gst.State.PLAYING)
+            self.assertTrue(wait_until(lambda: len(timestamps) >= 10))
+            start = len(timestamps)
+            with patch.object(pipeline, "set_state", wraps=pipeline.set_state) as state_spy, \
+                 patch.object(eng_module, "OUTPUT_HEALTH_CHECK_DEADLINE_S", 0.2), \
+                 patch.object(eng_module.PlaybackEngine, "_resolve_output_device_identity",
+                              lambda self, name: (("alsa_card_id", "MISSING")
+                                                 if name == "Studio Monitor" else ("", ""))):
+                changes = obj._reload_output_recovery_identity()
+                self.assertTrue(obj._apply_audio_output_device(
+                    "device-a", identity_changed="studio_monitor" in changes))
+                self.assertTrue(wait_until(
+                    lambda: monitor.coordinator.state == audio_recovery.SlotState.OK))
+                obj._output_handle_slot_transition(
+                    monitor, "RECOVERING", "OK", monitor.coordinator.snapshot())
+                self.assertTrue(wait_until(
+                    lambda: monitor.coordinator.state == audio_recovery.SlotState.DEGRADED,
+                    timeout=2.0))
+                self.assertTrue(wait_until(lambda: len(timestamps) >= start + 10))
+
+            self.assertEqual(state_spy.call_args_list, [])
+            self.assertEqual(pipeline.get_state(0)[1], Gst.State.PLAYING)
+            self.assertEqual(stereotool.current_bin.get_state(0)[1], Gst.State.PLAYING)
+            self.assertTrue(all(a == Gst.State.PLAYING and b == Gst.State.PLAYING
+                                for a, b in states[start:]))
+            intervals = [b - a for a, b in zip(timestamps, timestamps[1:])]
+            max_gap = max(intervals)
+            print(f"  StereoTool failed-retarget max inter-buffer gap: {max_gap:.6f}s")
+            self.assertLess(max_gap, 0.25)
+            self.assertTrue(monitor.valve.get_property("drop"))
+            self.assertIsNone(monitor.current_bin)
+        finally:
+            pipeline.set_state(Gst.State.NULL)
+
+    def test_identity_retarget_racing_pending_recovery_discards_old_candidate(self):
+        calls = []
+        obj, pipeline, slot = self._make_slot(calls=calls)
+        try:
+            simulate_device_loss_and_quiesce(obj, slot)
+            with patch.object(eng_module, "OUTPUT_HEALTH_STABILIZATION_S", 0.4):
+                obj._output_dispatch_rebuild(slot)  # candidate for PCH
+                old_pending = slot.pending_bin
+                self.assertTrue(self._request_identity(obj, "CODEC"))
+                self.assertTrue(wait_until(
+                    lambda: slot.coordinator.state == audio_recovery.SlotState.DEGRADED))
+
+            # Epoch invalidation makes the old-identity candidate fail;
+            # discard it through the normal bounded pending-bin path.
+            obj._output_handle_slot_transition(
+                slot, "RECOVERING", "DEGRADED", slot.coordinator.snapshot())
+            self.assertIsNone(slot.current_bin)
+            self.assertIsNone(slot.pending_bin)
+            self.assertIsNot(old_pending, slot.current_bin)
+            # The discard's completion observes retarget_requested and
+            # dispatches the replacement for the new identity.
+            self.assertTrue(wait_until(lambda: slot.coordinator.state == audio_recovery.SlotState.OK))
+            obj._output_handle_slot_transition(
+                slot, "RECOVERING", "OK", slot.coordinator.snapshot())
+            self.assertTrue(wait_until(lambda: slot.coordinator.state == audio_recovery.SlotState.OK))
+            obj._output_handle_slot_transition(
+                slot, "RECOVERING", "OK", slot.coordinator.snapshot())
+            self.assertEqual(slot.current_sink.get_property("device"), "plughw:CARD=CODEC,DEV=0")
+            self.assertEqual(calls[-1], "plughw:CARD=CODEC,DEV=0")
         finally:
             pipeline.set_state(Gst.State.NULL)
 
