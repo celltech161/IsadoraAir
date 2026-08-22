@@ -1,6 +1,27 @@
-"""IsadoraAir-owned text-to-speech provider implementations.
+"""Dependency-free public interface for IsadoraAir text-to-speech."""
 
-Foundation A owns provider behavior here. A shared station-facing TTS service
-will be introduced in the next phase; callers should not import provider
-internals directly yet.
-"""
+from isadoraair.tts.errors import (
+    TTSConfigurationError,
+    TTSError,
+    TTSOutputValidationError,
+    TTSRuntimeUnavailable,
+    TTSSynthesisError,
+    TTSTimeout,
+    TTSVoiceUnavailable,
+)
+from isadoraair.tts.request import SynthesisRequest, TTSEngine
+from isadoraair.tts.service import TTSService, synthesize
+
+__all__ = [
+    "SynthesisRequest",
+    "TTSConfigurationError",
+    "TTSEngine",
+    "TTSError",
+    "TTSOutputValidationError",
+    "TTSRuntimeUnavailable",
+    "TTSService",
+    "TTSSynthesisError",
+    "TTSTimeout",
+    "TTSVoiceUnavailable",
+    "synthesize",
+]

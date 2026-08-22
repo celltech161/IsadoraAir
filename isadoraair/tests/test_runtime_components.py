@@ -29,6 +29,7 @@ class RuntimeComponentManifestTests(SimpleTestCase):
 
     def test_canonical_paths_are_generic_and_absolute(self):
         paths = self.manifest["canonical_paths"]
+        self.assertEqual(paths["application_root"], "/opt/isadoraair")
         self.assertEqual(paths["runtime_root"], "/opt/isadoraair-runtime")
         self.assertEqual(paths["tts_asset_root"], "/var/lib/isadoraair/tts")
         self.assertEqual(paths["tts_cli"], "/usr/local/bin/isadoraair-tts")
@@ -58,6 +59,7 @@ class RuntimeComponentManifestTests(SimpleTestCase):
         self.assertEqual(kokoro["output"]["sample_rate_hz"], 24000)
         self.assertEqual(kokoro["output"]["channels"], 1)
         self.assertEqual(kokoro["output"]["sample_format"], "signed-16-bit-pcm")
+        self.assertEqual(kokoro["runtime"]["provider_module"], "isadoraair.tts.provider_cli")
 
     def test_kokoro_has_no_fixed_cpu_policy(self):
         execution = get_runtime_component("kokoro")["execution"]
@@ -72,6 +74,7 @@ class RuntimeComponentManifestTests(SimpleTestCase):
         self.assertEqual(piper["availability"]["unselected_absent"], "optional_pass")
         self.assertEqual(piper["availability"]["selected_missing_or_broken"], "fail")
         self.assertEqual(piper["runtime"]["packages"], {"piper-tts": "1.4.2"})
+        self.assertEqual(piper["runtime"]["executable"], "/opt/isadoraair-runtime/piper/venv/bin/piper")
         self.assertEqual(piper["models"]["selection_owner"], "station_configuration")
         self.assertEqual(piper["models"]["required_defaults"], [])
 

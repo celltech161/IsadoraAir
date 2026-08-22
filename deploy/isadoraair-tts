@@ -1,0 +1,20 @@
+#!/usr/bin/python3
+"""Git-owned launcher for the stable IsadoraAir TTS command."""
+
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+
+application_root = Path(__file__).resolve().parent.parent
+runtime_python = application_root / "venv" / "bin" / "python"
+environment = os.environ.copy()
+environment.pop("PYTHONPATH", None)
+os.chdir(application_root)
+os.execve(
+    runtime_python,
+    [str(runtime_python), "-E", "-m", "isadoraair.tts", *sys.argv[1:]],
+    environment,
+)

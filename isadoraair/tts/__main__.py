@@ -1,10 +1,6 @@
-"""Temporary module entry point for staged Kokoro validation.
+"""Repo-local entry point for the stable shared TTS CLI contract."""
 
-The future installed `/usr/local/bin/isadoraair-tts` command will call the
-shared TTS service. Foundation A deliberately does not migrate callers.
-"""
-
-from isadoraair.tts.kokoro import main
+from isadoraair.tts.cli import main
 
 
 if __name__ == "__main__":

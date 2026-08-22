@@ -1,7 +1,9 @@
 # Runtime component contract
 
-Runtime Foundation A establishes a Git-owned, machine-readable product
-contract for the separately provisioned Kokoro, Piper, and fdkaac runtimes:
+Runtime Foundation A established a Git-owned, machine-readable product
+contract for the separately provisioned Kokoro, Piper, and fdkaac runtimes.
+Runtime Foundation B adds the shared TTS request, dispatcher, and stable CLI
+contract documented in `docs/TTS_RUNTIME.md`:
 
 ```text
 isadoraair/runtime_components.json
@@ -12,9 +14,9 @@ provisioners, validators, disaster-recovery restore, and the interactive
 installer must consume this contract instead of copying versions, hashes, or
 paths into independent scripts.
 
-## Foundation A deployment status
+## Foundation A/B deployment status
 
-This phase owns source and defines the future contract; it does **not** deploy
+These phases own source and define the future contract; they do **not** deploy
 or migrate production:
 
 - The active Kokoro wrapper and assets remain under `/home/jreed/kokoro`.
@@ -29,6 +31,7 @@ or migrate production:
 
 | Purpose | Contract path |
 |---|---|
+| Application/provider source | `/opt/isadoraair` |
 | Separate runtime environments | `/opt/isadoraair-runtime` |
 | Kokoro model and voice data | `/var/lib/isadoraair/tts/kokoro` |
 | Station-selected Piper models | `/var/lib/isadoraair/tts/piper` |
@@ -55,13 +58,17 @@ The checked-in implementation is now owned by:
 ```text
 isadoraair/tts/normalization.py
 isadoraair/tts/kokoro.py
+deploy/isadoraair-tts
 ```
 
-It preserves the production normalizer, Piper-compatible arguments, and mono
-signed-16-bit WAV behavior. `python -m isadoraair.tts` exists for isolated
-staging and tests; callers are not migrated to it in Foundation A. The next
-phase should put the shared engine-neutral service behind the single stable
-`isadoraair-tts` interface.
+It preserves the production normalizer and mono signed-16-bit WAV behavior.
+Foundation B's shared process-isolated interface now owns the public Python and
+CLI contract. The Git-owned `deploy/isadoraair-tts` launcher exercises that
+dispatcher from any working directory without venv activation or a caller
+`PYTHONPATH`; it resolves the authoritative checkout from its own path. The
+provider dispatcher supplies that same checkout explicitly to the dedicated
+runtime interpreter. The future `/usr/local/bin/isadoraair-tts` entry point has
+not been installed. Existing callers remain unmigrated.
 
 The runtime package is `kokoro-onnx==0.4.7`. The manifest also records the
 proven runtime dependency versions and exact SHA-256 identities for
@@ -77,8 +84,11 @@ selected and valid      -> PASS
 selected and incomplete -> FAIL
 ```
 
-There are no product-default Piper models. Model filenames and hashes will be
-station-selected configuration consumed by the future shared validator.
+There are no product-default Piper models. The shared service accepts Piper as
+an engine identity without requiring it when unselected; selecting it reports
+that no logical voice is configured. Model filenames and hashes will be
+station-selected configuration consumed by Foundation C's provider and the
+future shared validator.
 
 ### fdkaac/libfdk-aac
 
@@ -119,9 +129,8 @@ license and notice material with the artifacts.
 
 ## Next-phase companion boundary
 
-Runtime Foundation B should add one engine-neutral service/CLI, migrate
-IsadoraAir callers in controlled steps, and define the interface companions
-consume. In particular, road conditions must eventually stop dynamically
-importing `weather-ingest/lib/voices.py`, and weather-ingest must stop owning
-Kokoro/Piper runtime internals. None of those caller changes belongs to
-Foundation A.
+Runtime Foundation C should add station TTS configuration, complete the Piper
+logical-voice provider, and prepare controlled caller migrations. Road
+conditions must then stop dynamically importing `weather-ingest/lib/voices.py`,
+and weather-ingest must consume the stable CLI instead of owning Kokoro/Piper
+runtime internals. None of those caller changes belongs to Foundation B.

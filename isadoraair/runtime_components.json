@@ -1,6 +1,7 @@
 {
   "schema_version": 1,
   "canonical_paths": {
+    "application_root": "/opt/isadoraair",
     "runtime_root": "/opt/isadoraair-runtime",
     "tts_asset_root": "/var/lib/isadoraair/tts",
     "tts_cli": "/usr/local/bin/isadoraair-tts",
@@ -18,6 +19,7 @@
       "runtime": {
         "venv": "/opt/isadoraair-runtime/kokoro/venv",
         "python": "/opt/isadoraair-runtime/kokoro/venv/bin/python",
+        "provider_module": "isadoraair.tts.provider_cli",
         "packages": {
           "kokoro-onnx": "0.4.7",
           "onnxruntime": "1.28.0",
@@ -66,6 +68,7 @@
       "runtime": {
         "venv": "/opt/isadoraair-runtime/piper/venv",
         "python": "/opt/isadoraair-runtime/piper/venv/bin/python",
+        "executable": "/opt/isadoraair-runtime/piper/venv/bin/piper",
         "packages": {
           "piper-tts": "1.4.2"
         }
