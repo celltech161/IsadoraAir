@@ -48,6 +48,27 @@ clean Ubuntu 26.04
   v  issue or restore certificates
 ```
 
+For the native stage, a future complete DR archive supplies its extracted
+`native/fdkaac/` directory directly:
+
+```bash
+deploy/restore/50-native-deps.sh --apply --staging-root /path/to/stage \
+  --source-dir /path/to/extracted-backup/native/fdkaac
+```
+
+For the all-stage orchestrator, export the same handoff without passing a flag
+that unrelated stages would reject:
+
+```bash
+FDKAAC_SOURCE_DIR=/path/to/extracted-backup/native/fdkaac \
+  deploy/restore/restore.sh --archive /path/to/backup.tar.gz --apply ...
+```
+
+That local mode verifies the exact manifest hashes and cannot use the network.
+The current production backup has not yet been extended to carry those source
+archives, so this invocation documents the handoff contract rather than
+claiming end-to-end DR completion.
+
 Run each stage with `--plan` first (always safe, never writes anything),
 then `--apply` once the plan looks right. `deploy/restore/restore.sh`
 chains all eleven stages if you'd rather run them in one shot; running

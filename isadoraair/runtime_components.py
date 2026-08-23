@@ -94,9 +94,35 @@ def _validate_contract(manifest: dict[str, Any]) -> None:
         _require_nonempty_string(
             archive.get("filename"), f"components.fdkaac.source_archives.{archive_name}.filename"
         )
+        if not isinstance(archive.get("bytes"), int) or archive["bytes"] <= 0:
+            raise RuntimeComponentContractError(
+                f"components.fdkaac.source_archives.{archive_name}.bytes must be a positive integer"
+            )
         _validate_sha256(
             archive.get("sha256"), f"components.fdkaac.source_archives.{archive_name}.sha256"
         )
+        acquisition_url = _require_nonempty_string(
+            archive.get("acquisition_url"),
+            f"components.fdkaac.source_archives.{archive_name}.acquisition_url",
+        )
+        if not acquisition_url.startswith("https://"):
+            raise RuntimeComponentContractError(
+                f"components.fdkaac.source_archives.{archive_name}.acquisition_url must use HTTPS"
+            )
+        license_file = Path(
+            _require_nonempty_string(
+                archive.get("license_file"),
+                f"components.fdkaac.source_archives.{archive_name}.license_file",
+            )
+        )
+        if license_file.name != str(license_file):
+            raise RuntimeComponentContractError(
+                f"components.fdkaac.source_archives.{archive_name}.license_file must be a basename"
+            )
+
+    fdkaac_build = _require_mapping(components["fdkaac"].get("build"), "components.fdkaac.build")
+    for field in ("script", "validator", "ubuntu_packages_group", "local_source_mode", "network_source_mode"):
+        _require_nonempty_string(fdkaac_build.get(field), f"components.fdkaac.build.{field}")
 
 
 def load_runtime_components(path: str | Path | None = None) -> dict[str, Any]:

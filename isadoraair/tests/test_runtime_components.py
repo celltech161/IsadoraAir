@@ -86,14 +86,30 @@ class RuntimeComponentManifestTests(SimpleTestCase):
             fdkaac["source_archives"]["fdk-aac"],
             {
                 "filename": "fdk-aac-2.0.3.tar.gz",
+                "bytes": 2518649,
                 "sha256": "e25671cd96b10bad896aa42ab91a695a9e573395262baed4e4a2ff178d6a3a78",
+                "acquisition_url": "https://github.com/mstorsjo/fdk-aac/archive/refs/tags/v2.0.3.tar.gz",
+                "license_file": "NOTICE",
             },
         )
         self.assertEqual(
             fdkaac["source_archives"]["fdkaac"],
             {
                 "filename": "fdkaac-1.0.7.tar.gz",
+                "bytes": 86687,
                 "sha256": "145d4684c9325a2bd650e46a04b03327abe780a7b59cce47e6de8af2064fb2c7",
+                "acquisition_url": "https://github.com/nu774/fdkaac/archive/refs/tags/v1.0.7.tar.gz",
+                "license_file": "COPYING",
+            },
+        )
+        self.assertEqual(
+            fdkaac["build"],
+            {
+                "script": "deploy/build_fdkaac.sh",
+                "validator": "deploy/check_he_aac.sh",
+                "ubuntu_packages_group": "BUILD_HEAAC",
+                "local_source_mode": "--source-dir",
+                "network_source_mode": "--download-sources",
             },
         )
 

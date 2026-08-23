@@ -74,7 +74,12 @@ BUILD_HEAAC=(
   automake
   libtool
   pkg-config
-  # gcc/g++/make/git already covered by CORE's build-essential + git
+  # Optional --download-sources acquisition only; local DR mode does not use it.
+  curl
+  ca-certificates
+  # gcc/g++/make/binutils already come from CORE's build-essential.
+  # tar/coreutils/libc-bin/python3 are baseline Ubuntu/CORE dependencies.
+  # ffmpeg is in AUDIO_GSTREAMER and is required by capability validation.
 )
 
 # ---- optional: CD ripping (skip if the box has no optical drive) -----

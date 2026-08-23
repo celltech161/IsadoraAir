@@ -356,9 +356,11 @@ See `docs/HE_AAC_FDKAAC_PROVENANCE.md` for the full investigation. Short
 version: `/usr/local/bin/fdkaac` (upstream `nu774/fdkaac`) and
 `/usr/local/lib/libfdk-aac.so.2` (upstream `mstorsjo/fdk-aac`) are
 custom source builds, required because Ubuntu's packaged versions have
-HE-AAC/HE-AACv2 (SBR/PS) stripped for patent reasons. No build script or
-documented build flags currently exist — that's the actual Phase 3 target,
-not attempted here.
+HE-AAC/HE-AACv2 (SBR/PS) stripped for patent reasons. Runtime Foundation D now
+provides one exact-archive local/network build path and an authoritative
+linkage/capability validator. The private DR payload still needs to carry those
+audited archives and their license/notice material; they are deliberately not
+stored in Git.
 
 ## Generic vs. Oak Grove-specific — summary
 

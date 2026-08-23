@@ -16,6 +16,21 @@ music library disk, cert issuance, GitHub access. What's automated here
 is everything *around* those: packages, code, database, native deps,
 companion repos, config, and a read-only validation pass at the end.
 
+Runtime Foundation D adds a GitHub-free fdkaac route without pretending the
+current backup already contains its private source payload. Run stage 50 with
+`--source-dir /path/to/native/fdkaac` (or `FDKAAC_SOURCE_DIR`) for immutable
+local archives. If neither is supplied, stage 50 explicitly selects and warns
+about optional connected acquisition; once local mode is selected it never
+falls back to the network.
+
+For the all-stage orchestrator, use the environment form because stage-specific
+arguments are intentionally not accepted by unrelated stages:
+
+```bash
+FDKAAC_SOURCE_DIR=/path/to/native/fdkaac \
+  deploy/restore/restore.sh --archive /path/to/backup.tar.gz --apply ...
+```
+
 ## The three safety modes
 
 Every stage script (`NN-*.sh`) and `inspect_backup.sh` sources
@@ -84,7 +99,7 @@ deploy/restore/
   20-application.sh       Git clone/SHA checkout, .env + app-tree restore from app.tar.gz.
   30-postgresql.sh        PG bootstrap + pg_restore.
   40-station-content.sh   /srv/isadoraair reconstruction (carts/voicetracks/waveforms/etc).
-  50-native-deps.sh       HE-AAC build (deploy/build_fdkaac.sh + check_he_aac.sh wrapper).
+  50-native-deps.sh       HE-AAC exact-archive build (builder performs shared validation).
   60-python.sh            IsadoraAir venv creation + requirements.txt + safe checks.
   70-tts.sh               Kokoro + Piper provisioning/smoke test.
   80-companions.sh        syndicated-ingest/weather-ingest/ogremote-ingest clone+venv.

@@ -96,15 +96,20 @@ provider resolves those beneath the canonical asset root and verifies them.
 ### fdkaac/libfdk-aac
 
 fdkaac is conditionally required only for features selecting HE-AAC or
-HE-AACv2. The contract records fdkaac 1.0.7, libfdk-aac 2.0.3, and the exact
-local-source archive identities needed for a future GitHub-free DR build:
+HE-AACv2. Foundation D makes the manifest the build-script authority for
+fdkaac 1.0.7, libfdk-aac 2.0.3, and these exact GitHub-free source inputs:
 
-| Archive | SHA-256 |
-|---|---|
-| `fdk-aac-2.0.3.tar.gz` | `e25671cd96b10bad896aa42ab91a695a9e573395262baed4e4a2ff178d6a3a78` |
-| `fdkaac-1.0.7.tar.gz` | `145d4684c9325a2bd650e46a04b03327abe780a7b59cce47e6de8af2064fb2c7` |
+| Archive | Bytes | SHA-256 |
+|---|---:|---|
+| `fdk-aac-2.0.3.tar.gz` | 2,518,649 | `e25671cd96b10bad896aa42ab91a695a9e573395262baed4e4a2ff178d6a3a78` |
+| `fdkaac-1.0.7.tar.gz` | 86,687 | `145d4684c9325a2bd650e46a04b03327abe780a7b59cce47e6de8af2064fb2c7` |
 
-Foundation A does not alter `deploy/build_fdkaac.sh` or DR payloads.
+`deploy/build_fdkaac.sh --source-dir` verifies and builds local immutable
+archives; `--download-sources` is separate and optional. Both converge on one
+build path and automatically invoke `deploy/check_he_aac.sh`, which verifies
+version, intended 2.0.3 linkage, LC, HE/SBR, HEv2/SBR+PS, and ffmpeg decode.
+The private archives are not stored in Git and are not yet captured by the
+production backup.
 
 ## Product and station ownership
 
