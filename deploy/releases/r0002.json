@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "release_id": "r0002",
+  "previous_release_id": "r0001",
+  "minimum_updater_protocol_version": 1,
+  "summary": "Phase A bootstrap release: adds the read-only managed Update Center, its additive UpdateJob schema, release-chain planning, and staff-only /updates/ UI. No update execution, privileged helper, package installation, service control, or migration execution path exists.",
+  "migrations_required": [
+    "updatecenter.0001_initial"
+  ],
+  "migration_compatibility": "additive",
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-gunicorn"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0001"
+}

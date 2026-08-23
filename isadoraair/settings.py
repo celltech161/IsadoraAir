@@ -73,6 +73,7 @@ INSTALLED_APPS = [
     'ogremote',
     'webrequests',
     'aircheck',
+    'updatecenter',
     'axes',
 ]
 

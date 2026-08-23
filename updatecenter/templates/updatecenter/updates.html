@@ -1,0 +1,169 @@
+{% extends "base.html" %}
+
+{% block title %}Update Center — IsadoraAir{% endblock %}
+
+{% block extra_css %}
+<style>
+  .uc-panel {
+    background: var(--panel-bg);
+    border: 1px solid var(--border-subtle);
+    border-radius: 10px;
+    padding: 1rem 1.2rem;
+    margin-bottom: 1rem;
+  }
+  .uc-panel h2 {
+    margin: 0 0 0.6rem 0;
+    font-size: 1rem;
+    color: var(--text-main);
+  }
+  .uc-row { display: flex; justify-content: space-between; gap: 1rem; padding: 0.2rem 0; font-size: 0.9rem; }
+  .uc-row .k { color: var(--text-muted); }
+  .uc-row .v { color: var(--text-main); font-family: monospace; }
+  .uc-badge {
+    display: inline-block; padding: 0.1rem 0.5rem; border-radius: 6px;
+    font-size: 0.78rem; font-family: monospace;
+  }
+  .uc-badge.current { background: rgba(120, 200, 140, 0.15); color: #78c88c; }
+  .uc-badge.stale, .uc-badge.dirty { background: rgba(249, 115, 115, 0.15); color: var(--danger); }
+  .uc-badge.unknown, .uc-badge.indeterminate { background: rgba(200, 200, 120, 0.15); color: #c8c878; }
+  .uc-safety {
+    font-weight: 600; padding: 0.5rem 0.8rem; border-radius: 8px; margin-bottom: 0.6rem;
+  }
+  .uc-safety.ready_to_plan, .uc-safety.up_to_date, .uc-safety.schema_current { background: rgba(120, 200, 140, 0.12); color: #78c88c; }
+  .uc-safety.dirty_checkout, .uc-safety.diverged_from_origin, .uc-safety.invalid_release_manifest,
+  .uc-safety.cross_check_failed, .uc-safety.target_commit_unknown, .uc-safety.installed_release_unknown,
+  .uc-safety.detached_head, .uc-safety.no_origin_remote, .uc-safety.local_commits_not_on_origin,
+  .uc-safety.installed_release_too_old,
+  .uc-safety.schema_drift_detected,
+  .uc-safety.unapplied_migrations_detected { background: rgba(249, 115, 115, 0.12); color: var(--danger); }
+  .uc-safety.migration_state_indeterminate { background: rgba(200, 160, 90, 0.15); color: #d8a860; }
+  .uc-safety.target_schema_plan_validation_pending,
+  .uc-safety.not_evaluated_plan_blocked,
+  .uc-safety.not_applicable_no_target_transition {
+    background: rgba(200, 160, 90, 0.15); color: #d8a860;
+  }
+  .uc-safety.manual_system_package_action_required, .uc-safety.migration_manual_gate_required {
+    background: rgba(200, 160, 90, 0.15); color: #d8a860;
+  }
+  .uc-note { color: var(--text-muted); font-size: 0.82rem; margin-top: 0.4rem; }
+  .uc-list { margin: 0.3rem 0 0.3rem 1.1rem; padding: 0; font-size: 0.88rem; }
+  .uc-list li { margin-bottom: 0.15rem; }
+  form.uc-inline { display: inline; }
+  button.uc-btn {
+    background: var(--accent-soft); color: var(--text-main); border: 1px solid var(--border-subtle);
+    border-radius: 6px; padding: 0.4rem 0.9rem; font-size: 0.85rem; cursor: pointer;
+  }
+</style>
+{% endblock %}
+
+{% block content %}
+<h1>Update Center</h1>
+<p class="uc-note">
+  Read-only, Phase A. There is no "Update IsadoraAir" action yet -- this
+  page shows installed source, running-software version skew, and (if
+  a release chain is available and safe to plan) what a future update
+  would do. Nothing on this page changes the checkout, the database,
+  systemd, or any running service.
+</p>
+
+<div class="uc-panel">
+  <h2>Installed Source</h2>
+  <div class="uc-row"><span class="k">Commit</span><span class="v">{{ checkout.short_commit|default:"unknown" }}</span></div>
+  <div class="uc-row"><span class="k">Full SHA</span><span class="v">{{ checkout.commit|default:"unknown" }}</span></div>
+  <div class="uc-row"><span class="k">Clean tree</span>
+    <span class="v">
+      {% if checkout.dirty is None %}unknown
+      {% elif checkout.dirty %}<span class="uc-badge dirty">dirty</span>
+      {% else %}<span class="uc-badge current">clean</span>{% endif %}
+    </span>
+  </div>
+</div>
+
+<div class="uc-panel">
+  <h2>Running Software</h2>
+  {% for unit, info in version_lookup.items %}
+  <div class="uc-row">
+    <span class="k">{{ unit }}</span>
+    <span class="v">
+      {{ info.runtime_short|default:"unknown" }}
+      <span class="uc-badge {{ info.state }}">{{ info.state }}</span>
+    </span>
+  </div>
+  {% endfor %}
+</div>
+
+{% if not plan_error %}
+<div class="uc-panel">
+  <h2>Database Schema</h2>
+  <p class="uc-note">A separate signal from source/git state below -- a clean, current checkout does not by itself mean the database schema is current. See docs/UPDATE_CENTER.md.</p>
+  <div class="uc-safety {{ plan.schema_health_status }}">{{ plan.schema_health_status|upper }}</div>
+  <p class="uc-note">{{ plan.schema_health_detail }}</p>
+  {% if plan.schema_pending_migrations %}
+  <ul class="uc-list">{% for m in plan.schema_pending_migrations %}<li>{{ m }}</li>{% endfor %}</ul>
+  {% endif %}
+</div>
+{% endif %}
+
+<div class="uc-panel">
+  <h2>Available Update</h2>
+  {% if plan_error %}
+    <div class="uc-safety cross_check_failed">PLANNING FAILED</div>
+    <p class="uc-note">{{ plan_error }}</p>
+  {% else %}
+    <div class="uc-safety {{ plan.safety_status }}">{{ plan.safety_status|upper }}</div>
+    <p class="uc-note">{{ plan.safety_detail }}</p>
+    <div class="uc-row"><span class="k">Installed release</span><span class="v">{{ plan.installed_release_id|default:"unknown" }}</span></div>
+    <div class="uc-row"><span class="k">Latest known release</span><span class="v">{{ plan.target_release_id|default:"unknown" }}</span></div>
+    {% if plan.releases_in_plan %}
+    <div class="uc-row"><span class="k">Releases behind</span><span class="v">{{ plan.releases_in_plan|length }} ({{ plan.releases_in_plan|join:", " }})</span></div>
+    {% endif %}
+  {% endif %}
+  <form class="uc-inline" method="post" action="{% url 'updatecenter:check-for-updates' %}">
+    {% csrf_token %}
+    <button class="uc-btn" type="submit">Check for Updates</button>
+  </form>
+  <p class="uc-note">Performs a <code>git fetch</code> against <code>origin</code> only (remote-tracking refs, never the working tree) -- an explicit, deliberate action, not a side effect of loading this page.</p>
+</div>
+
+{% if not plan_error %}
+<div class="uc-panel">
+  <h2>Target Schema Validation</h2>
+  <p class="uc-note">Distinct from current database health: Phase A can show manifest-declared transition migrations, but only Phase B running against safely staged target source can validate the target Django migration graph.</p>
+  <div class="uc-safety {{ plan.target_schema_validation_status }}">{{ plan.target_schema_validation_status|upper }}</div>
+  <p class="uc-note">{{ plan.target_schema_validation_detail }}</p>
+</div>
+{% endif %}
+
+{% if plan and plan.safety_status == "ready_to_plan" %}
+<div class="uc-panel">
+  <h2>Planned Actions</h2>
+  <div class="uc-row"><span class="k">Source update</span><span class="v">required ({{ plan.installed_commit|slice:":7" }} → {{ plan.target_commit|slice:":7" }})</span></div>
+  <div class="uc-row"><span class="k">Python requirements</span><span class="v">{{ plan.python_requirements_changed|yesno:"changed,unchanged" }}</span></div>
+
+  <div class="uc-row"><span class="k">Manifest-declared transition migrations</span>
+    <span class="v">{% if plan.migrations.expected_transition_unapplied %}{{ plan.migrations.expected_transition_unapplied|length }} not currently recorded{% else %}none{% endif %}</span>
+  </div>
+  {% if plan.migrations.expected_transition_unapplied %}
+  <ul class="uc-list">{% for m in plan.migrations.expected_transition_unapplied %}<li>{{ m }}</li>{% endfor %}</ul>
+  <div class="uc-row"><span class="k">Migration compatibility</span><span class="v">{{ plan.migrations.compatibility }}</span></div>
+  {% endif %}
+  {% if plan.migrations.unknown_to_current_graph %}
+  <div class="uc-row"><span class="k">Not loadable from current graph</span><span class="v">{{ plan.migrations.unknown_to_current_graph|length }}</span></div>
+  <ul class="uc-list">{% for m in plan.migrations.unknown_to_current_graph %}<li>{{ m }}</li>{% endfor %}</ul>
+  {% endif %}
+
+  <div class="uc-row"><span class="k">Systemd definitions changed</span><span class="v">{{ plan.systemd_units_changed|length }}</span></div>
+  <div class="uc-row"><span class="k">New core units</span><span class="v">{{ plan.systemd_units_new_required|length }}</span></div>
+  {% if plan.systemd_units_new_optional %}
+  <div class="uc-row"><span class="k">Optional-unit notices</span><span class="v">{{ plan.systemd_units_new_optional|join:", " }} (not auto-installed)</span></div>
+  {% endif %}
+  <div class="uc-row"><span class="k">Static files / collectstatic</span><span class="v">{{ plan.collectstatic_required|yesno:"required,not required" }}</span></div>
+  <div class="uc-row"><span class="k">nginx</span><span class="v">{{ plan.nginx_changed|yesno:"changed,unchanged" }}</span></div>
+  <div class="uc-row"><span class="k">Service restarts required</span><span class="v">{{ plan.services_requiring_restart|join:", "|default:"none" }}</span></div>
+  {% if plan.apt_packages_new %}
+  <div class="uc-row"><span class="k">apt prerequisites</span><span class="v">{{ plan.apt_packages_new|join:", " }} (manual action required)</span></div>
+  {% endif %}
+  <p class="uc-note">This is a declarative action expectation from the release chain, cross-checked against target Git objects where Phase A can do so. It is not final target migration validation; Phase B must materialize target source and compare its real Django migration plan before execution.</p>
+</div>
+{% endif %}
+{% endblock %}

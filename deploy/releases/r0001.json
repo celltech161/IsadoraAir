@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "release_id": "r0001",
+  "previous_release_id": null,
+  "bootstrap_commit": "5a0cb0e707ac5e7fd364fca5f8ca801a1cc4c969",
+  "minimum_updater_protocol_version": 1,
+  "summary": "Bootstrap release: production baseline as of the day release manifests were introduced. library.0079 is applied and active. The four migrations below landed with this baseline's model state and are schema-required -- WebRequestConfig/RoadConditionsConfiguration gained columns; tts app and WeatherVoicePersona are new tables. No feature behavior is cut over: TTS voice FKs stay null, existing synthesis/config paths are unchanged.",
+  "migrations_required": [
+    "tts.0001_initial",
+    "road_conditions.0010_roadconditionsconfiguration_tts",
+    "weather.0007_weathervoicepersona",
+    "webrequests.0008_webrequestconfig_dedication_tts"
+  ],
+  "migration_compatibility": "additive",
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": null
+}

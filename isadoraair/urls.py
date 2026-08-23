@@ -34,6 +34,7 @@ urlpatterns = [
         auth_views.PasswordResetCompleteView.as_view()
     ), name='password_reset_complete'),
     path('monitoring/', include('monitoring.urls')),
+    path('updates/', include('updatecenter.urls')),
     path('rbds/', include('rbds.urls')),
     path('wx/', include('weather.urls')),
     path('', include('webrequests.urls')),
