@@ -136,6 +136,28 @@ class SendSmtpFailureVisibilityTests(TestCase):
         self.assertFalse(SystemEvent.objects.filter(dedupe_key="monitoring|notify-smtp-failed").exists())
 
 
+class SendOperationalEmailTests(TestCase):
+    def test_reuses_config_recipients_and_shared_sender(self):
+        config = make_config(recipients="ops@example.com\nchief@example.org")
+        with patch.object(notify, "_send", return_value="sent") as sender:
+            status = notify.send_operational_email("subject", "body", config=config)
+        self.assertEqual(status, "sent")
+        sender.assert_called_once_with(config, "subject", "body")
+
+    def test_disabled_config_is_explicit_and_does_not_send(self):
+        config = make_config(enabled=False)
+        with patch.object(notify, "_send") as sender:
+            status = notify.send_operational_email("subject", "body", config=config)
+        self.assertEqual(status, "disabled")
+        sender.assert_not_called()
+
+    def test_delivery_failure_is_returned_not_raised(self):
+        config = make_config()
+        with patch("django.core.mail.send_mail", side_effect=RuntimeError("boom")):
+            status = notify.send_operational_email("subject", "body", config=config)
+        self.assertEqual(status, "failed")
+
+
 class SendTestEmailTests(TestCase):
     def test_no_recipients_configured_returns_graceful_error(self):
         config = make_config(recipients="")

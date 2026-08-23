@@ -433,6 +433,124 @@ class Track(models.Model):
 
 
 # ---------------------------------------------------------------
+# MediaPlaybackIncident - durable attribution/validation queue
+# ---------------------------------------------------------------
+
+class MediaPlaybackIncident(models.Model):
+    """Immutable playback evidence plus the asynchronous validation result.
+
+    The playback engine creates one row only after the affected deck has been
+    detached from the shared pipeline.  The row is also the durable work queue:
+    a single background validator consumes pending rows without ever delaying
+    the GLib/playout path.  It deliberately does not mutate Track readiness.
+    """
+
+    TRIGGER_WATCHDOG = "watchdog_stall"
+    TRIGGER_DECK_ERROR = "deck_pipeline_error"
+    TRIGGER_CHOICES = [
+        (TRIGGER_WATCHDOG, "Deck watchdog stall"),
+        (TRIGGER_DECK_ERROR, "Deck GStreamer error"),
+    ]
+
+    STATE_PENDING = "pending"
+    STATE_VALIDATING = "validating"
+    STATE_COMPLETE = "complete"
+    STATE_CHOICES = [
+        (STATE_PENDING, "Pending"),
+        (STATE_VALIDATING, "Validating"),
+        (STATE_COMPLETE, "Complete"),
+    ]
+
+    CLASS_CONFIRMED_MEDIA_FAILURE = "CONFIRMED_MEDIA_FAILURE"
+    CLASS_GSTREAMER_COMPATIBILITY = "GSTREAMER_MEDIA_COMPATIBILITY_FAILURE"
+    CLASS_ENGINE_COMPLETION_PATH = "ENGINE_COMPLETION_PATH_FAILURE"
+    CLASS_VALIDATION_CLEAN = "MEDIA_VALIDATION_CLEAN"
+    CLASS_FILE_MISSING_OR_CHANGED = "FILE_MISSING_OR_CHANGED"
+    CLASS_INCONCLUSIVE = "INCONCLUSIVE"
+    CLASSIFICATION_CHOICES = [
+        (CLASS_CONFIRMED_MEDIA_FAILURE, "Confirmed media failure"),
+        (CLASS_GSTREAMER_COMPATIBILITY, "GStreamer media compatibility failure"),
+        (CLASS_ENGINE_COMPLETION_PATH, "Engine completion-path failure"),
+        (CLASS_VALIDATION_CLEAN, "Media validation clean"),
+        (CLASS_FILE_MISSING_OR_CHANGED, "File missing or changed"),
+        (CLASS_INCONCLUSIVE, "Inconclusive"),
+    ]
+
+    NOTIFY_PENDING = "pending"
+    NOTIFY_SENT = "sent"
+    NOTIFY_SUPPRESSED = "suppressed"
+    NOTIFY_DISABLED = "disabled"
+    NOTIFY_NO_RECIPIENTS = "no_recipients"
+    NOTIFY_FAILED = "failed"
+    NOTIFICATION_CHOICES = [
+        (NOTIFY_PENDING, "Pending"),
+        (NOTIFY_SENT, "Sent"),
+        (NOTIFY_SUPPRESSED, "Suppressed by cooldown"),
+        (NOTIFY_DISABLED, "Notifications disabled"),
+        (NOTIFY_NO_RECIPIENTS, "No recipients"),
+        (NOTIFY_FAILED, "Delivery failed"),
+    ]
+
+    track = models.ForeignKey(
+        Track, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name="media_playback_incidents",
+    )
+    track_id_snapshot = models.BigIntegerField(null=True, blank=True)
+    track_title_snapshot = models.CharField(max_length=255, blank=True, default="")
+    track_artist_snapshot = models.CharField(max_length=255, blank=True, default="")
+    filepath_snapshot = models.CharField(max_length=1024)
+    slot = models.CharField(max_length=1)
+    deck_generation = models.PositiveBigIntegerField()
+    trigger = models.CharField(max_length=32, choices=TRIGGER_CHOICES)
+    detected_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    runtime_commit = models.CharField(max_length=64, blank=True, default="")
+
+    playback_position_seconds = models.FloatField(null=True, blank=True)
+    track_duration_seconds = models.FloatField(null=True, blank=True)
+    observed_duration_seconds = models.FloatField(null=True, blank=True)
+    media_buffer_count = models.PositiveBigIntegerField(default=0)
+    last_media_buffer_age_seconds = models.FloatField(null=True, blank=True)
+    eos_snapshot = models.JSONField(default=dict, blank=True)
+    gstreamer_error = models.TextField(blank=True, default="")
+    gstreamer_debug = models.TextField(blank=True, default="")
+
+    file_exists_snapshot = models.BooleanField(null=True, blank=True)
+    file_size_snapshot = models.BigIntegerField(null=True, blank=True)
+    file_mtime_ns_snapshot = models.BigIntegerField(null=True, blank=True)
+
+    validation_state = models.CharField(
+        max_length=16, choices=STATE_CHOICES, default=STATE_PENDING, db_index=True,
+    )
+    validation_attempts = models.PositiveSmallIntegerField(default=0)
+    classification = models.CharField(
+        max_length=48, choices=CLASSIFICATION_CHOICES, blank=True, default="", db_index=True,
+    )
+    validator_detail = models.JSONField(default=dict, blank=True)
+    validated_at = models.DateTimeField(null=True, blank=True)
+
+    notification_status = models.CharField(
+        max_length=24, choices=NOTIFICATION_CHOICES, default=NOTIFY_PENDING,
+    )
+    notification_identity = models.CharField(max_length=64, blank=True, default="", db_index=True)
+    notified_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-detected_at"]
+        indexes = [
+            models.Index(fields=["validation_state", "detected_at"]),
+            models.Index(fields=["classification", "detected_at"]),
+            models.Index(fields=["track", "detected_at"]),
+        ]
+
+    def __str__(self):
+        return (
+            f"{self.detected_at:%Y-%m-%d %H:%M:%S} deck {self.slot} "
+            f"generation {self.deck_generation}: "
+            f"{self.classification or self.validation_state}"
+        )
+
+
+# ---------------------------------------------------------------
 # DuplicateCandidate - review-only de-dup findings from find_duplicate_tracks
 # ---------------------------------------------------------------
 

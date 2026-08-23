@@ -29,6 +29,7 @@ from .models import (
     Holiday,
     LogFillConfig,
     LogItem,
+    MediaPlaybackIncident,
     NavMenuItem,
     PlayEvent,
     Playlist,
@@ -62,7 +63,7 @@ from .models import (
 # grouping changes.
 _TRAFFIC_MODELS = {"playlist", "rotation", "scheduleblock", "playlistlog"}
 _CONFIG_MODELS = {"analysisconfig", "recencyconfig", "uitheme", "logfillconfig", "uploadconfig", "navmenuitem", "remotedjconfig", "stationtimeconfig", "stationinfo", "tuneinconfig", "fxbusconfig", "fxcart", "voicetrackconfig"}
-_LOG_MODELS = {"emaillog", "playevent", "royaltyreport"}
+_LOG_MODELS = {"emaillog", "playevent", "mediaplaybackincident", "royaltyreport"}
 
 
 class SectionedAdminSite(admin.AdminSite):
@@ -1277,6 +1278,41 @@ class PlayEventAdmin(admin.ModelAdmin):
         "track", "track_title", "track_artist", "album_title", "record_label",
         "isrc", "category_kind", "source",
         "started_at", "ended_at", "duration_played_seconds",
+    )
+    fields = readonly_fields
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+
+@admin.register(MediaPlaybackIncident)
+class MediaPlaybackIncidentAdmin(admin.ModelAdmin):
+    """Read-only operational evidence and validator history."""
+
+    list_display = (
+        "detected_at", "track", "trigger", "slot", "deck_generation",
+        "track_artist_snapshot", "track_title_snapshot",
+        "validation_state", "classification", "filepath_snapshot",
+        "validated_at", "notification_status",
+    )
+    list_filter = (
+        "trigger", "validation_state", "classification", "notification_status", "slot",
+        ("detected_at", admin.DateFieldListFilter),
+    )
+    search_fields = (
+        "track_title_snapshot", "track_artist_snapshot", "filepath_snapshot",
+        "runtime_commit", "gstreamer_error", "gstreamer_debug", "=track_id_snapshot",
+    )
+    date_hierarchy = "detected_at"
+    ordering = ("-detected_at",)
+    readonly_fields = tuple(
+        field.name for field in MediaPlaybackIncident._meta.fields
     )
     fields = readonly_fields
 

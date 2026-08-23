@@ -44,6 +44,11 @@ from library.services.log_builder import (
 )
 from library.services.remote_dj_signaling import RemoteDJSignalingServer
 from library.services import audio_recovery
+from library.services.media_health import (
+    MediaValidationWorker,
+    capture_deck_evidence,
+    create_incident,
+)
 from webrequests.services import SCHEDULING_CONTENDED, maybe_schedule_song_request, mark_song_requests_aired
 from isadoraair.version_info import capture_runtime_commit
 
@@ -639,6 +644,7 @@ class PlaybackEngine:
         # the CURRENT checkout and show a compact mismatch indicator
         # without ever re-deriving it live. See isadoraair/version_info.py.
         self._runtime_commit = capture_runtime_commit()
+        self._media_validation_worker = MediaValidationWorker()
         Gst.init(None)
         self.loop = GLib.MainLoop()
         self.mixer = None
@@ -815,6 +821,7 @@ class PlaybackEngine:
         GLib.timeout_add(300, self._output_recovery_tick)
         GLib.timeout_add_seconds(2, self._output_presence_probe_tick)
         GLib.timeout_add(300, self._deck_teardown_tick)
+        self._media_validation_worker.start()
 
         if RemoteDJConfig.load().enabled:
             self._warm_stun_dns()
@@ -842,6 +849,11 @@ class PlaybackEngine:
 
     def stop(self):
         self.running = False
+        # Non-blocking: if a validator child is active, its process group is
+        # terminated/reaped by the daemon worker after observing this signal.
+        worker = getattr(self, "_media_validation_worker", None)
+        if worker is not None:
+            worker.stop()
         # Retire active decks through the same exact-generation detach-first
         # primitive used on air. Their potentially hazardous NULL calls remain
         # on the bounded per-slot workers; shutdown never invokes deck NULL on
@@ -7781,6 +7793,18 @@ class PlaybackEngine:
             return deck.observed_duration_seconds
         return None
 
+    def _persist_media_incident(self, evidence):
+        """Best-effort post-containment handoff to the durable validator."""
+        worker = getattr(self, "_media_validation_worker", None)
+        # Lightweight unit stand-ins intentionally omit the worker; a real
+        # PlaybackEngine always constructs it before any deck can exist.
+        if worker is None:
+            return None
+        incident = create_incident(evidence)
+        if incident is not None:
+            worker.wake()
+        return incident
+
     def _check_stuck_decks(self):
         """Contain a generation only after both timing and progress evidence.
 
@@ -7834,6 +7858,15 @@ class PlaybackEngine:
                 rolling_count = len(self._deck_watchdog_times)
                 escalation = rolling_count >= DECK_WATCHDOG_ESCALATION_COUNT
                 reason = "unhandled_eos" if eos_timed_out else "duration_overrun_without_progress"
+                # In-memory only: no filesystem/DB/process work may precede
+                # exact-generation isolation below.
+                incident_evidence = capture_deck_evidence(
+                    deck,
+                    trigger="watchdog_stall",
+                    runtime_commit=getattr(self, "_runtime_commit", ""),
+                    position_seconds=pos,
+                    observed_duration_seconds=observed_duration,
+                )
                 print(
                     f"  [{slot}] WATCHDOG: {deck.track.title!r} generation {deck.generation} "
                     f"stuck at {pos:.1f}s; detach-first containment ({reason})."
@@ -7875,6 +7908,9 @@ class PlaybackEngine:
                 self._next_triggered = False
                 if self.decks.get(self._other_slot(slot)) is None and not self.manual_mode:
                     self._start_next_track(slot=slot)
+                # File stat, DB write, and validator wake happen only after
+                # detach-first retirement and any immediate playout advance.
+                self._persist_media_incident(incident_evidence)
 
     @_glib_safe(default_return=True)
     def _poll_position(self):
@@ -8063,6 +8099,14 @@ class PlaybackEngine:
             return True
         err, debug = message.parse_error()
         deck.mark_milestone("ERROR_OBSERVED", state=err)
+        incident_evidence = capture_deck_evidence(
+            deck,
+            trigger="deck_pipeline_error",
+            runtime_commit=getattr(self, "_runtime_commit", ""),
+            observed_duration_seconds=deck.observed_duration_seconds,
+            gstreamer_error=err,
+            gstreamer_debug=debug,
+        )
         print(f"  GStreamer error on {deck.track.title}: {err} ({debug})")
         emit_event(
             category="engine",
@@ -8077,8 +8121,15 @@ class PlaybackEngine:
             },
             dedupe_key=f"engine|gst_error|track={deck.track.id}",
         )
-        GLib.idle_add(self._handle_deck_finished, deck)
+        GLib.idle_add(self._retire_deck_error_and_record, deck, incident_evidence)
         return True
+
+    @_glib_safe(default_return=False)
+    def _retire_deck_error_and_record(self, deck, incident_evidence):
+        """Retire/advance first; only then touch filesystem or database."""
+        self._handle_deck_finished(deck)
+        self._persist_media_incident(incident_evidence)
+        return False
 
     @_glib_safe(default_return=False)
     def _handle_deck_finished(self, deck):

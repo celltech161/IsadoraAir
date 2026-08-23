@@ -69,7 +69,7 @@ def _safe_exception_detail(exc):
 def _send(config, subject, body):
     recipients = config.recipient_list()
     if not recipients:
-        return
+        return "no_recipients"
     try:
         from django.conf import settings
         from django.core.mail import send_mail
@@ -111,6 +111,26 @@ def _send(config, subject, body):
             detail=safe_detail,
             dedupe_key="monitoring|notify-smtp-failed",
         )
+        return "failed"
+    return "sent"
+
+
+def send_operational_email(subject, body, config=None):
+    """Send a non-MonitorCheck operational alert through station email.
+
+    This is the public entry point for subsystems such as asynchronous media
+    validation.  It deliberately reuses NotificationConfig recipient
+    resolution and the same failure-safe SMTP path as monitor transitions.
+    Cooldown policy remains the caller's responsibility because only the
+    caller knows the durable incident identity it is suppressing.
+
+    Returns one of ``sent``, ``disabled``, ``no_recipients``, or ``failed``;
+    it never raises.
+    """
+    config = config or NotificationConfig.load()
+    if not config.enabled:
+        return "disabled"
+    return _send(config, subject, body)
 
 
 TEST_EMAIL_SUBJECT = "[IsadoraAir] Test notification"

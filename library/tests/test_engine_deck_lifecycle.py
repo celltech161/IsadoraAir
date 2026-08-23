@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import gc
+import inspect
 import struct
 import subprocess
 import sys
@@ -975,6 +976,73 @@ class DeckGenerationAndWatchdogTests(SimpleTestCase):
             engine._check_stuck_decks()
         engine._remove_deck.assert_called_once_with(deck)
         self.assertEqual(emitted.call_args.kwargs["detail"]["reason"], "duration_overrun_without_progress")
+
+    def test_watchdog_persists_exact_incident_only_after_retire_and_advance(self):
+        deck = self._deck(duration=10.0)
+        deck.track.filepath = "/srv/music/exact-suspect.wav"
+        deck.last_media_buffer_monotonic = time.monotonic() - DECK_STUCK_TIMEOUT_SECONDS - 1
+        deck.mark_milestone("A_DECODER_AUDIO_EOS")
+        engine = self._engine(deck)
+        engine._runtime_commit = "runtime-commit"
+        engine._media_validation_worker = MagicMock()
+        engine._get_deck_position = MagicMock(return_value=41.0)
+        order = []
+
+        def retire(value):
+            order.append("retire")
+            value.finished = True
+            engine.decks[value.slot] = None
+
+        engine._remove_deck = MagicMock(side_effect=retire)
+        engine._start_next_track = MagicMock(side_effect=lambda **_kwargs: order.append("advance"))
+        with patch.object(eng_module, "emit_event"), \
+             patch.object(eng_module, "create_incident", side_effect=lambda evidence: order.append("persist") or SimpleNamespace(pk=1)) as create:
+            engine._check_stuck_decks()
+        self.assertEqual(order, ["retire", "advance", "persist"])
+        evidence = create.call_args.args[0]
+        self.assertEqual(evidence["filepath_snapshot"], "/srv/music/exact-suspect.wav")
+        self.assertEqual(evidence["deck_generation"], deck.generation)
+        self.assertEqual(evidence["trigger"], "watchdog_stall")
+        self.assertIn("A_DECODER_AUDIO_EOS", evidence["eos_snapshot"]["milestones"])
+        engine._media_validation_worker.wake.assert_called_once()
+
+    def test_deck_error_retirement_precedes_incident_persistence(self):
+        deck = self._deck()
+        deck.track.filepath = "/srv/music/decode-error.mp3"
+        engine = self._engine(deck)
+        engine._runtime_commit = "runtime-commit"
+        engine._media_validation_worker = MagicMock()
+        message = MagicMock()
+        message.parse_error.return_value = (RuntimeError("decode failed"), "decoder debug")
+        scheduled = {}
+
+        def capture_idle(callback, *args):
+            scheduled.update(callback=callback, args=args)
+            return 1
+
+        with patch.object(eng_module.GLib, "idle_add", side_effect=capture_idle), \
+             patch.object(eng_module, "emit_event"):
+            self.assertTrue(engine._on_deck_error(None, message, deck))
+        evidence = scheduled["args"][1]
+        self.assertEqual(evidence["trigger"], "deck_pipeline_error")
+        self.assertIn("decode failed", evidence["gstreamer_error"])
+        order = []
+        engine._handle_deck_finished = MagicMock(side_effect=lambda value: order.append("retire"))
+        with patch.object(eng_module, "create_incident", side_effect=lambda value: order.append("persist") or SimpleNamespace(pk=2)):
+            scheduled["callback"](*scheduled["args"])
+        self.assertEqual(order, ["retire", "persist"])
+
+    def test_only_watchdog_and_exact_deck_error_capture_media_incidents(self):
+        source = Path(eng_module.__file__).read_text()
+        self.assertEqual(source.count("capture_deck_evidence("), 2)
+        self.assertIn("capture_deck_evidence(", inspect.getsource(PlaybackEngine._check_stuck_decks))
+        self.assertIn("capture_deck_evidence(", inspect.getsource(PlaybackEngine._on_deck_error))
+        for handler in (
+            PlaybackEngine._on_main_bus_error,
+            PlaybackEngine._on_mic_error,
+            PlaybackEngine._on_output_error,
+        ):
+            self.assertNotIn("capture_deck_evidence", inspect.getsource(handler))
 
     def test_missing_metadata_can_recover_from_observed_unhandled_eos(self):
         deck = self._deck(duration=None)

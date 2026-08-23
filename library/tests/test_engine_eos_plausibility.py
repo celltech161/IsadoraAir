@@ -233,11 +233,11 @@ class EOSPlausibilityTests(TransactionTestCase):
         EOS) must NOT go through this plausibility gate -- a real
         pipeline error deserves a full teardown regardless of position;
         silently ignoring it would leave a broken deck producing no
-        audio with no recovery path. Static check: _on_deck_error calls
-        _handle_deck_finished directly, not through
-        _on_deck_eos_probed's position-gated path."""
+        audio with no recovery path. Static check: _on_deck_error schedules
+        the dedicated retire-and-record callback, not the position-gated
+        EOS path."""
         src = inspect.getsource(eng_module.PlaybackEngine._on_deck_error)
-        self.assertIn("_handle_deck_finished", src)
+        self.assertIn("_retire_deck_error_and_record", src)
         self.assertNotIn("_get_deck_position", src)
 
 
