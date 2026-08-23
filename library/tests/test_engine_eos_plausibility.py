@@ -117,6 +117,8 @@ class EOSPlausibilityTests(TransactionTestCase):
 
         mock_finished.assert_not_called()
         self.assertFalse(deck.finished, "the deck must be left alone, not marked finished")
+        self.assertIn("I_EOS_REJECTED_POST_SEEK", deck.eos_milestones)
+        self.assertNotIn("I_EOS_ACCEPTED", deck.eos_milestones)
 
     # -- Plausibility margin, within the seek window --
 
@@ -295,7 +297,7 @@ class SeekRejectionHandlingTests(TransactionTestCase):
         reporting a target the deck never reached."""
         src = inspect.getsource(eng_module.PlaybackEngine._resume_deck)
         start = src.index("if seek_ok:")
-        end = src.index("with self._lock:", start)
+        end = src.index("print(f\"  [{slot}] Resumed", start)
         seek_result_block = src[start:end]
         self.assertIn("new_deck.seeked_at = time.time()", seek_result_block)
         self.assertIn("new_deck.started_at = time.time()", seek_result_block)
@@ -303,7 +305,7 @@ class SeekRejectionHandlingTests(TransactionTestCase):
     def test_seek_deck_resets_started_at_on_rejected_seek(self):
         src = inspect.getsource(eng_module.PlaybackEngine._seek_deck)
         start = src.index("if seek_ok:")
-        end = src.index("with self._lock:", start)
+        end = src.index("if was_paused:", start)
         seek_result_block = src[start:end]
         self.assertIn("new_deck.seeked_at = time.time()", seek_result_block)
         self.assertIn("new_deck.started_at = time.time()", seek_result_block)

@@ -375,3 +375,81 @@ class SlotCoordinatorCoreTests(SimpleTestCase):
         slot.request_recovery(raising_worker)
         self.assertTrue(self._wait_until(lambda: slot.state == ar.SlotState.DEGRADED and
                                           slot.snapshot()["operation_state"] == "RETURNED"))
+
+
+class BoundedTeardownCoordinatorTests(SimpleTestCase):
+    def _wait_until(self, predicate, timeout=3.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return True
+            time.sleep(0.002)
+        return False
+
+    def test_hundreds_of_fast_operations_use_one_worker(self):
+        coordinator = ar.BoundedTeardownCoordinator(
+            "deck-test", timeout_s=1.0, queue_capacity=300
+        )
+        completed = []
+        for generation in range(1, 301):
+            result = coordinator.submit(
+                generation,
+                lambda generation=generation: completed.append(generation),
+            )
+            self.assertEqual(result, "queued")
+        self.assertTrue(self._wait_until(lambda: coordinator.snapshot()["completed"] == 300))
+        self.assertEqual(completed, list(range(1, 301)))
+        self.assertEqual(coordinator.snapshot()["worker_starts"], 1)
+        coordinator.stop()
+
+    def test_one_hang_poisoning_prevents_worker_per_generation_growth(self):
+        coordinator = ar.BoundedTeardownCoordinator(
+            "deck-hang-test", timeout_s=0.05, queue_capacity=2
+        )
+        release = threading.Event()
+        self.assertEqual(coordinator.submit(1, release.wait), "queued")
+        self.assertTrue(
+            self._wait_until(lambda: coordinator.snapshot()["active_generation"] == 1)
+        )
+        coordinator.tick(now=time.monotonic() + 1.0)
+        self.assertTrue(coordinator.snapshot()["poisoned"])
+        for generation in range(2, 102):
+            self.assertEqual(
+                coordinator.submit(generation, lambda: None),
+                "rejected_poisoned",
+            )
+        snapshot = coordinator.snapshot()
+        self.assertEqual(snapshot["worker_starts"], 1)
+        self.assertEqual(snapshot["active_generation"], 1)
+        self.assertEqual(snapshot["queue_depth"], 0)
+        self.assertEqual(snapshot["suppressed_poison_rejections"], 99)
+        events = coordinator.drain_events()
+        self.assertEqual(
+            sum(event["kind"] == "rejected_poisoned" for event in events),
+            1,
+        )
+        release.set()
+        self.assertTrue(
+            self._wait_until(
+                lambda: not any(t.name == "deck-hang-test-worker" for t in threading.enumerate())
+            )
+        )
+
+    def test_stop_never_waits_for_hung_worker(self):
+        coordinator = ar.BoundedTeardownCoordinator(
+            "deck-stop-test", timeout_s=0.05, queue_capacity=1
+        )
+        release = threading.Event()
+        coordinator.submit(1, release.wait)
+        self.assertTrue(
+            self._wait_until(lambda: coordinator.snapshot()["active_generation"] == 1)
+        )
+        started = time.monotonic()
+        coordinator.stop()
+        self.assertLess(time.monotonic() - started, 0.05)
+        release.set()
+        self.assertTrue(
+            self._wait_until(
+                lambda: not any(t.name == "deck-stop-test-worker" for t in threading.enumerate())
+            )
+        )

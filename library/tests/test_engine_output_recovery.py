@@ -1867,20 +1867,51 @@ class OutputIntentionalStableIdentityRetargetTests(MockEmitEventMixin, SimpleTes
             old_bin = slot.current_bin
             old_child = old_bin.iterate_elements().next()[1]
             epoch_before = slot.device_loss_epoch()
-            with patch.object(pipeline, "set_state", wraps=pipeline.set_state) as state_spy:
-                self.assertTrue(self._request_identity(obj, "CODEC"))
+            teardown_entered = threading.Event()
+            release_teardown = threading.Event()
+            original_request = slot.coordinator.request_recovery
 
-                # Detach/retire happens synchronously, while NULL teardown
-                # is an in-flight bounded worker operation.
-                self.assertIsNone(slot.current_bin)
-                self.assertIsNone(slot.current_sink)
-                self.assertIsNone(slot.pending_bin)
-                self.assertEqual(slot.coordinator.generation, 1)
-                self.assertEqual(slot.coordinator.state, audio_recovery.SlotState.RECOVERING)
-                self.assertEqual(slot.coordinator.snapshot()["operation_state"], "IN_FLIGHT")
-                self.assertEqual(slot.device_loss_epoch(), epoch_before + 1)
-                self.assertFalse(obj._output_slot_owns_message_src(
-                    slot, type("M", (), {"src": old_child})()))
+            def hold_first_teardown(worker):
+                def held_worker():
+                    teardown_entered.set()
+                    if not release_teardown.wait(timeout=5.0):
+                        raise TimeoutError("test did not release output teardown")
+                    return worker()
+
+                return original_request(held_worker)
+
+            with patch.object(pipeline, "set_state", wraps=pipeline.set_state) as state_spy:
+                try:
+                    # Hold the legitimately fast worker at the exact boundary
+                    # this test inspects. Scheduler speed must not decide
+                    # whether RECOVERING is observable.
+                    with patch.object(
+                        slot.coordinator,
+                        "request_recovery",
+                        side_effect=hold_first_teardown,
+                    ):
+                        self.assertTrue(self._request_identity(obj, "CODEC"))
+                        self.assertTrue(teardown_entered.wait(timeout=1.0))
+
+                        # Detach/retire happens synchronously, while NULL
+                        # teardown is an in-flight bounded worker operation.
+                        self.assertIsNone(slot.current_bin)
+                        self.assertIsNone(slot.current_sink)
+                        self.assertIsNone(slot.pending_bin)
+                        self.assertEqual(slot.coordinator.generation, 1)
+                        self.assertEqual(
+                            slot.coordinator.state,
+                            audio_recovery.SlotState.RECOVERING,
+                        )
+                        self.assertEqual(
+                            slot.coordinator.snapshot()["operation_state"],
+                            "IN_FLIGHT",
+                        )
+                        self.assertEqual(slot.device_loss_epoch(), epoch_before + 1)
+                        self.assertFalse(obj._output_slot_owns_message_src(
+                            slot, type("M", (), {"src": old_child})()))
+                finally:
+                    release_teardown.set()
 
                 complete_successful_retarget(obj, slot)
 

@@ -31,10 +31,11 @@ import random
 import re
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 # ---------------------------------------------------------------------------
 # Error classification
@@ -395,3 +396,227 @@ class SlotCoordinator:
             if self._recovery_requested_again:
                 self._recovery_requested_again = False
                 self._emit("coalesced_request_cleared", generation=record.generation)
+
+
+# ---------------------------------------------------------------------------
+# Bounded teardown worker
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class TeardownRecord:
+    """One isolated generation's potentially-blocking teardown call."""
+
+    generation: int
+    worker_fn: Callable[[], Any]
+    metadata: dict
+    submitted_at: float
+    started_at: Optional[float] = None
+    completed_at: Optional[float] = None
+    result: Any = None
+    exc: Optional[BaseException] = None
+    abandoned: bool = False
+
+
+class BoundedTeardownCoordinator:
+    """Serialize hazardous teardown calls on one bounded daemon worker.
+
+    This deliberately differs from :class:`SlotCoordinator`: deck retirement
+    has no rebuild/retry state machine. The live topology is detached by the
+    owner first; this helper owns only the final operation which may hang.
+
+    Exactly one daemon worker is created lazily. If an operation exceeds the
+    timeout the coordinator becomes permanently poisoned, abandons its fixed-
+    capacity queue, and rejects future operations. It never creates a
+    replacement thread for a worker Python cannot safely kill. The owner can
+    drain structured events from its GLib/main thread for operator reporting.
+    """
+
+    def __init__(self, name: str, *, timeout_s: float = 15.0, queue_capacity: int = 4):
+        if timeout_s <= 0:
+            raise ValueError("timeout_s must be positive")
+        if queue_capacity <= 0:
+            raise ValueError("queue_capacity must be positive")
+        self.name = name
+        self.timeout_s = timeout_s
+        self.queue_capacity = queue_capacity
+        self._condition = threading.Condition()
+        self._pending = deque()
+        self._active: Optional[TeardownRecord] = None
+        self._events = deque()
+        self._worker = None
+        self._stopping = False
+        self._poisoned = False
+        self._worker_starts = 0
+        self._completed = 0
+        self._rejected = 0
+        self._poison_rejection_reported = False
+        self._suppressed_poison_rejections = 0
+        self._abandoned_generations = []
+
+    def _event_locked(self, kind: str, record: TeardownRecord, **fields) -> None:
+        self._events.append(
+            {
+                "kind": kind,
+                "generation": record.generation,
+                "metadata": dict(record.metadata),
+                **fields,
+            }
+        )
+
+    def _start_worker_locked(self) -> None:
+        if self._worker is not None:
+            return
+        self._worker_starts += 1
+        self._worker = threading.Thread(
+            target=self._run,
+            name=f"{self.name}-worker",
+            daemon=True,
+        )
+        self._worker.start()
+
+    def submit(
+        self,
+        generation: int,
+        worker_fn: Callable[[], Any],
+        *,
+        metadata: Optional[dict] = None,
+        now: Optional[float] = None,
+    ) -> str:
+        """Queue one generation, or reject it without spawning a worker."""
+
+        record = TeardownRecord(
+            generation=generation,
+            worker_fn=worker_fn,
+            metadata=dict(metadata or {}),
+            submitted_at=now if now is not None else time.monotonic(),
+        )
+        with self._condition:
+            if self._stopping:
+                self._rejected += 1
+                self._event_locked("rejected_stopping", record)
+                return "rejected_stopping"
+            if self._poisoned:
+                self._rejected += 1
+                # The timeout event already made the restart-required state
+                # operator-visible. Report the first later rejected teardown
+                # once, then expose only counters in snapshot() rather than
+                # emitting one critical event per otherwise-healthy deck.
+                if not self._poison_rejection_reported:
+                    self._poison_rejection_reported = True
+                    self._event_locked("rejected_poisoned", record)
+                else:
+                    self._suppressed_poison_rejections += 1
+                return "rejected_poisoned"
+            generations = {item.generation for item in self._pending}
+            if self._active is not None:
+                generations.add(self._active.generation)
+            if generation in generations:
+                self._event_locked("duplicate_ignored", record)
+                return "duplicate"
+            if len(self._pending) >= self.queue_capacity:
+                self._rejected += 1
+                self._event_locked("rejected_full", record)
+                return "rejected_full"
+            self._pending.append(record)
+            self._event_locked("queued", record, queue_depth=len(self._pending))
+            self._start_worker_locked()
+            self._condition.notify()
+            return "queued"
+
+    def _run(self) -> None:
+        while True:
+            with self._condition:
+                while not self._pending and not self._stopping:
+                    self._condition.wait()
+                if self._stopping and not self._pending:
+                    return
+                record = self._pending.popleft()
+                if self._poisoned:
+                    record.abandoned = True
+                    self._abandoned_generations.append(record.generation)
+                    self._event_locked("abandoned_without_start", record, reason="coordinator_poisoned")
+                    continue
+                self._active = record
+                record.started_at = time.monotonic()
+                self._event_locked("started", record)
+            try:
+                result = record.worker_fn()
+            except Exception as exc:  # noqa: BLE001 -- failure is reported as coordinator data
+                record.exc = exc
+            else:
+                record.result = result
+            completed_at = time.monotonic()
+            with self._condition:
+                record.completed_at = completed_at
+                if record.abandoned:
+                    self._event_locked(
+                        "late_result_discarded",
+                        record,
+                        elapsed_s=round(completed_at - (record.started_at or completed_at), 3),
+                    )
+                    return
+                self._completed += 1
+                self._event_locked(
+                    "failed" if record.exc is not None else "completed",
+                    record,
+                    elapsed_s=round(completed_at - (record.started_at or completed_at), 3),
+                    error=repr(record.exc) if record.exc is not None else None,
+                )
+                self._active = None
+
+    def tick(self, *, now: Optional[float] = None) -> None:
+        """Detect one timeout without waiting for or replacing the worker."""
+
+        current = now if now is not None else time.monotonic()
+        with self._condition:
+            record = self._active
+            if (
+                record is None
+                or record.started_at is None
+                or record.abandoned
+                or current - record.started_at < self.timeout_s
+            ):
+                return
+            record.abandoned = True
+            self._poisoned = True
+            self._abandoned_generations.append(record.generation)
+            self._event_locked(
+                "timed_out",
+                record,
+                elapsed_s=round(current - record.started_at, 3),
+            )
+            while self._pending:
+                queued = self._pending.popleft()
+                queued.abandoned = True
+                self._abandoned_generations.append(queued.generation)
+                self._event_locked("abandoned_without_start", queued, reason="earlier_operation_timed_out")
+
+    def drain_events(self) -> list[dict]:
+        with self._condition:
+            events = list(self._events)
+            self._events.clear()
+            return events
+
+    def snapshot(self) -> dict:
+        with self._condition:
+            return {
+                "name": self.name,
+                "poisoned": self._poisoned,
+                "stopping": self._stopping,
+                "worker_starts": self._worker_starts,
+                "worker_alive": bool(self._worker and self._worker.is_alive()),
+                "active_generation": self._active.generation if self._active else None,
+                "queue_depth": len(self._pending),
+                "completed": self._completed,
+                "rejected": self._rejected,
+                "suppressed_poison_rejections": self._suppressed_poison_rejections,
+                "abandoned_generations": list(self._abandoned_generations),
+            }
+
+    def stop(self) -> None:
+        """Ask an idle worker to exit; deliberately never join a hung one."""
+
+        with self._condition:
+            self._stopping = True
+            self._condition.notify_all()

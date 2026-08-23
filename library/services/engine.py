@@ -7,6 +7,7 @@ import sys
 import threading
 import time
 import traceback
+from collections import deque
 from datetime import timedelta
 from pathlib import Path
 
@@ -172,6 +173,9 @@ MAX_CLOCK_RECOVERY_SECONDS = 600
 CACHE_WARM_LEAD_SECONDS = 3.0
 SILENCE_PRIME_SECONDS = 0.3
 DECK_STUCK_TIMEOUT_SECONDS = 30  # generous margin past a track's own duration before assuming its EOS was missed
+DECK_TEARDOWN_TIMEOUT_SECONDS = 10.0
+DECK_WATCHDOG_WINDOW_SECONDS = 10 * 60
+DECK_WATCHDOG_ESCALATION_COUNT = 3
 # How long after an actual seek (auto-resume or manual) an EOS is
 # treated with suspicion by _on_deck_eos_probed. Empirically measured
 # via an isolated throwaway-pipeline reproduction of the 2026-08-01
@@ -514,14 +518,26 @@ class RemoteDJSession:
 
 
 class Deck:
-    def __init__(self, slot, track, log_item, pipeline, mixer_pad, silence_primed=False):
+    def __init__(
+        self,
+        slot,
+        track,
+        log_item,
+        pipeline,
+        mixer_pad,
+        silence_primed=False,
+        generation=0,
+    ):
         self.slot = slot
         self.track = track
         self.log_item = log_item
         self.pipeline = pipeline
         self.mixer_pad = mixer_pad
+        self.generation = generation
         self.started_at = None
         self.finished = False
+        self.retirement_started = False
+        self.detached_from_mixer = False
         self.paused = False
         self.paused_position = 0.0
         # True for decks built with a silence lead-in (see _create_deck) —
@@ -543,6 +559,74 @@ class Deck:
         # is made either, avoiding a spurious update against a row that
         # doesn't exist.
         self.play_event_id = None
+        # Per-generation, bounded EOS/resource diagnostics. Streaming threads
+        # only update counters/timestamps; no buffer or event is logged here.
+        self.created_monotonic = time.monotonic()
+        self._milestone_lock = threading.Lock()
+        self.eos_milestones = {}
+        self.media_buffer_count = 0
+        self.last_media_buffer_monotonic = None
+        self.observed_duration_seconds = None
+        self.completion_claimed = False
+        self.completion_reason = None
+        self.probe_handles = []
+        self.signal_handles = []
+
+    def mark_milestone(self, name, *, state=None, now=None):
+        current = time.monotonic() if now is None else now
+        with self._milestone_lock:
+            item = self.eos_milestones.setdefault(
+                name,
+                {"count": 0, "first": current, "last": current, "state": None},
+            )
+            item["count"] += 1
+            item["last"] = current
+            if state is not None:
+                item["state"] = str(state)
+
+    def mark_media_buffer(self, *, now=None):
+        current = time.monotonic() if now is None else now
+        with self._milestone_lock:
+            self.media_buffer_count += 1
+            self.last_media_buffer_monotonic = current
+
+    def milestone_snapshot(self, *, now=None):
+        current = time.monotonic() if now is None else now
+        with self._milestone_lock:
+            milestones = {
+                name: {
+                    "count": item["count"],
+                    "first_ms": round((item["first"] - self.created_monotonic) * 1000),
+                    "last_ms": round((item["last"] - self.created_monotonic) * 1000),
+                    **({"state": item["state"]} if item["state"] is not None else {}),
+                }
+                for name, item in self.eos_milestones.items()
+            }
+            last_buffer_age = (
+                round(current - self.last_media_buffer_monotonic, 3)
+                if self.last_media_buffer_monotonic is not None
+                else None
+            )
+            return {
+                "generation": self.generation,
+                "silence_primed": self.silence_primed,
+                "media_buffers": self.media_buffer_count,
+                "last_media_buffer_age_seconds": last_buffer_age,
+                "milestones": milestones,
+            }
+
+    def latest_milestone_time(self, names):
+        with self._milestone_lock:
+            values = [self.eos_milestones[name]["last"] for name in names if name in self.eos_milestones]
+            return max(values) if values else None
+
+    def claim_completion(self, reason):
+        with self._milestone_lock:
+            if self.completion_claimed:
+                return False
+            self.completion_claimed = True
+            self.completion_reason = reason
+            return True
 
 
 class PlaybackEngine:
@@ -646,6 +730,21 @@ class PlaybackEngine:
         self.main_pipeline = None
         self.decks = {"A": None, "B": None}
         self._deck_bin_map = {}
+        self._deck_generation_serial = 0
+        # A wedged NULL poisons only the logical slot which owned that
+        # generation. The other A/B slot remains able to retire future decks
+        # through its own single bounded worker; the poisoned slot is never
+        # reused, so later decks cannot become detached-but-still-PLAYING
+        # leaks merely because an unrelated generation wedged first.
+        self._deck_teardowns = {
+            slot: audio_recovery.BoundedTeardownCoordinator(
+                f"deck-{slot.lower()}-teardown",
+                timeout_s=DECK_TEARDOWN_TIMEOUT_SECONDS,
+                queue_capacity=1,
+            )
+            for slot in SLOTS
+        }
+        self._deck_watchdog_times = deque()
         self._cache_warm_item_id = None
         self._last_queue_reload = 0
         self._next_triggered = False
@@ -715,6 +814,7 @@ class PlaybackEngine:
         # Monitor's slot is always built.
         GLib.timeout_add(300, self._output_recovery_tick)
         GLib.timeout_add_seconds(2, self._output_presence_probe_tick)
+        GLib.timeout_add(300, self._deck_teardown_tick)
 
         if RemoteDJConfig.load().enabled:
             self._warm_stun_dns()
@@ -742,13 +842,21 @@ class PlaybackEngine:
 
     def stop(self):
         self.running = False
+        # Retire active decks through the same exact-generation detach-first
+        # primitive used on air. Their potentially hazardous NULL calls remain
+        # on the bounded per-slot workers; shutdown never invokes deck NULL on
+        # the GLib/main thread.
+        for deck in tuple(self.decks.values()):
+            if deck is not None:
+                self._remove_deck(deck)
+        for coordinator in getattr(self, "_deck_teardowns", {}).values():
+            # Non-blocking even if a daemon worker is stuck inside a
+            # quarantined generation's set_state(NULL).
+            coordinator.stop()
         if self.remote_dj_session:
             self._remote_dj_session_stop()
         if self.main_pipeline:
             self.main_pipeline.set_state(Gst.State.NULL)
-        for deck in self.decks.values():
-            if deck and deck.pipeline:
-                deck.pipeline.set_state(Gst.State.NULL)
         if self.loop.is_running():
             self.loop.quit()
         self._write_state(transport="STOPPED")
@@ -1089,10 +1197,9 @@ class PlaybackEngine:
 
     def _build_mic_chain(self):
         """Builds the mic capture chain as its own Gst.Bin (not loose
-        elements directly in main_pipeline) so a bus watch can be
-        scoped to just this bin -- mirrors the deck bins' own
-        get_bus()/add_signal_watch()/message::error pattern (see
-        _start_next_track/_on_deck_error). Returns [] if no mic device
+        elements directly in main_pipeline) so the main bus router can
+        scope an error by exact parent identity, the same pattern now used
+        for deck generations. Returns [] if no mic device
         is configured; the caller treats an empty list exactly like
         "mic not configured" (self.mic_ptt_valve/self.mic_gain stay
         None).
@@ -1350,15 +1457,11 @@ class PlaybackEngine:
         return sample
 
     def _on_main_bus_error(self, bus, message):
-        # self.main_pipeline's bus isn't watched for anything else today
-        # (deck errors go through each deck's own dedicated Gst.Pipeline
-        # bus instead, Remote DJ/FX/VT errors have their own dedicated
-        # paths -- see _on_dj_bus_msg/_fx_*/_vt_*, none of which route
-        # through here) -- filter to only react to errors that originate
-        # inside the mic bin or an output recovery slot, walking up the
-        # parent chain for an EXACT match against a known element, never
-        # a heuristic/substring match, so this can't misclassify an
-        # unrelated pipeline error.
+        # Errors from a child Gst.Bin are posted on the top-level pipeline
+        # bus. Resolve a deck first by exact current-generation parent
+        # identity; the old per-bin bus watch never received these messages.
+        # Once detach-first retirement pops _deck_bin_map, late errors from
+        # that generation no longer resolve and are harmless.
         #
         # [P0] 1.3C: previously this whole handler was only CONNECTED at
         # all when a mic was configured (see _build_main_pipeline) -- a
@@ -1366,6 +1469,9 @@ class PlaybackEngine:
         # and even mic-only setups now go through the same unconditional
         # connect. Checked mic first (existing precedent, unchanged
         # logic), output slots second.
+        deck = self._deck_for_message_src(message.src)
+        if deck is not None:
+            return self._on_deck_error(bus, message, deck)
         if self._mic_bin is not None:
             obj = message.src
             while obj is not None:
@@ -1376,6 +1482,16 @@ class PlaybackEngine:
             if self._output_slot_owns_message_src(slot, message):
                 return self._on_output_error(slot, bus, message)
         return True
+
+    def _deck_for_message_src(self, source):
+        deck_map = getattr(self, "_deck_bin_map", {})
+        obj = source
+        while obj is not None:
+            deck = deck_map.get(id(obj))
+            if deck is not None and deck.pipeline is obj and not deck.retirement_started:
+                return deck
+            obj = obj.get_parent()
+        return None
 
     def _output_slot_owns_message_src(self, slot, message):
         """[P0] 1.3C -- true iff message.src is (or descends from) one of
@@ -3609,9 +3725,26 @@ class PlaybackEngine:
         """Whichever slot is currently empty, preferring 'A'. None if
         both are occupied."""
         for slot in SLOTS:
-            if self.decks[slot] is None:
+            if self.decks[slot] is None and self._deck_slot_available(slot):
                 return slot
         return None
+
+    def _deck_slot_available(self, slot):
+        """Whether a logical slot may safely own a new Gst generation.
+
+        Slot reuse waits for its previous bounded NULL to return. If that
+        operation times out, the slot remains unavailable for this process
+        lifetime while its A/B sibling can continue playout. This is the
+        interlock which bounds leakage to one wedged generation per slot.
+        """
+        coordinator = self._ensure_deck_teardown_coordinator(slot)
+        snapshot = coordinator.snapshot()
+        return not (
+            snapshot["poisoned"]
+            or snapshot["stopping"]
+            or snapshot["active_generation"] is not None
+            or snapshot["queue_depth"]
+        )
 
     def _leading_deck(self):
         """The deck whose position the crossfade trigger should watch.
@@ -4189,9 +4322,17 @@ class PlaybackEngine:
     def _start_next_track(self, slot=None):
         """Load the next queued item into `slot` (or whichever slot is
         free, preferring A) and start it playing right away."""
-        if slot is None:
+        if (
+            slot is None
+            or self.decks.get(slot) is not None
+            or not self._deck_slot_available(slot)
+        ):
             slot = self._free_slot()
         if slot is None:
+            # A healthy NULL normally returns before the next poll. Leave the
+            # trigger retryable; do not consume a queue item while neither
+            # teardown boundary can safely accept a generation.
+            self._next_triggered = False
             return
 
         log_item, is_forced = self._next_queue_item()
@@ -4249,14 +4390,6 @@ class PlaybackEngine:
             # File missing — move on to whatever's after it for this slot.
             self._start_next_track(slot=slot)
             return
-
-        with self._lock:
-            self.decks[slot] = deck
-        self._deck_bin_map[id(deck.pipeline)] = deck
-
-        bus = deck.pipeline.get_bus()
-        bus.add_signal_watch()
-        bus.connect("message::error", self._on_deck_error, deck)
 
     def _apply_pad_offset(self, deck_bin, internal_position_ns=0):
         """A bin linked into the already-playing audiomixer needs its
@@ -4326,6 +4459,22 @@ class PlaybackEngine:
 
         ghost_pad = Gst.GhostPad.new_no_target("src", Gst.PadDirection.SRC)
         deck_bin.add_pad(ghost_pad)
+        # Assigned before the bin is synchronized with its PLAYING parent.
+        # Probe closures below cannot run until then, so they always see the
+        # fully-registered generation rather than racing map registration.
+        deck = None
+        real_stage_src = None
+        real_concat_sink = None
+        concat_src = None
+        probe_handles = []
+        signal_handles = []
+
+        def decoder_probe(pad, info):
+            if info.type & Gst.PadProbeType.EVENT_DOWNSTREAM:
+                event = info.get_event()
+                if event is not None and event.type == Gst.EventType.EOS:
+                    deck.mark_milestone("A_DECODER_AUDIO_EOS")
+            return Gst.PadProbeReturn.OK
 
         # Prime fresh track starts with a short burst of real silence
         # ahead of the decoded audio, via `concat` (plays sink_0 to EOS,
@@ -4376,41 +4525,109 @@ class PlaybackEngine:
             silence.link(silence_caps)
             # Request silence's concat sink first so it gets sink_0
             # (concat plays request-numbered sinks in order).
-            silence_caps.get_static_pad("src").link(concat.request_pad_simple("sink_%u"))
-            real_caps.get_static_pad("src").link(concat.request_pad_simple("sink_%u"))
+            silence_concat_sink = concat.request_pad_simple("sink_%u")
+            real_concat_sink = concat.request_pad_simple("sink_%u")
+            silence_caps.get_static_pad("src").link(silence_concat_sink)
+            real_caps.get_static_pad("src").link(real_concat_sink)
+            real_stage_src = real_caps.get_static_pad("src")
+            concat_src = concat.get_static_pad("src")
 
             # concat's src pad exists immediately (no dynamic negotiation
             # needed, unlike decodebin's), so the ghost pad's target can
             # be fixed right away instead of waiting for pad-added.
-            ghost_pad.set_target(concat.get_static_pad("src"))
+            ghost_pad.set_target(concat_src)
 
             def on_pad_added(element, pad):
                 if pad.get_current_caps():
                     struct = pad.get_current_caps().get_structure(0)
                     if struct.get_name().startswith("audio"):
+                        probe_id = pad.add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM, decoder_probe)
+                        probe_handles.append((pad, probe_id))
                         pad.link(convert.get_static_pad("sink"))
         else:
+            real_stage_src = resample.get_static_pad("src")
+
             def on_pad_added(element, pad):
                 if pad.get_current_caps():
                     struct = pad.get_current_caps().get_structure(0)
                     if struct.get_name().startswith("audio"):
+                        probe_id = pad.add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM, decoder_probe)
+                        probe_handles.append((pad, probe_id))
                         pad.link(convert.get_static_pad("sink"))
                         ghost_pad.set_target(resample.get_static_pad("src"))
 
-        decode.connect("pad-added", on_pad_added)
+        signal_handles.append((decode, decode.connect("pad-added", on_pad_added)))
 
-        # Block EOS from reaching audiomixer — we handle track
-        # completion via position polling instead
+        def real_stage_probe(pad, info):
+            if info.type & Gst.PadProbeType.BUFFER:
+                deck.mark_media_buffer()
+            elif info.type & Gst.PadProbeType.EVENT_DOWNSTREAM:
+                event = info.get_event()
+                if event is not None and event.type == Gst.EventType.EOS:
+                    deck.mark_milestone("B_REAL_LEG_EOS_BEFORE_CONCAT")
+            return Gst.PadProbeReturn.OK
+
+        def eos_milestone_probe(name):
+            def probe(pad, info):
+                event = info.get_event()
+                if event is not None and event.type == Gst.EventType.EOS:
+                    deck.mark_milestone(name)
+                return Gst.PadProbeReturn.OK
+
+            return probe
+
+        # Block EOS from reaching audiomixer. The streaming-thread probe only
+        # records bounded state and hands completion to the GLib thread.
         def eos_probe(pad, info):
             event = info.get_event()
             if event.type == Gst.EventType.EOS:
-                GLib.idle_add(self._on_deck_eos_probed, deck_bin)
+                deck.mark_milestone("E_DECK_GHOST_SRC_EOS")
+                deck.mark_milestone("F_EOS_PROBE_ENTERED")
+                source_id = GLib.idle_add(self._on_deck_eos_probed, deck_bin, deck)
+                if source_id:
+                    deck.mark_milestone("G_GLIB_IDLE_SCHEDULED", state=source_id)
+                else:
+                    deck.mark_milestone("G_GLIB_IDLE_SCHEDULE_FAILED")
                 return Gst.PadProbeReturn.DROP
             return Gst.PadProbeReturn.OK
 
-        ghost_pad.add_probe(
-            Gst.PadProbeType.EVENT_DOWNSTREAM,
-            eos_probe,
+        probe_handles.append(
+            (
+                real_stage_src,
+                real_stage_src.add_probe(
+                    Gst.PadProbeType.BUFFER | Gst.PadProbeType.EVENT_DOWNSTREAM,
+                    real_stage_probe,
+                ),
+            )
+        )
+        if real_concat_sink is not None:
+            probe_handles.append(
+                (
+                    real_concat_sink,
+                    real_concat_sink.add_probe(
+                        Gst.PadProbeType.EVENT_DOWNSTREAM,
+                        eos_milestone_probe("C_CONCAT_REAL_SINK_EOS"),
+                    ),
+                )
+            )
+        if concat_src is not None:
+            probe_handles.append(
+                (
+                    concat_src,
+                    concat_src.add_probe(
+                        Gst.PadProbeType.EVENT_DOWNSTREAM,
+                        eos_milestone_probe("D_CONCAT_SRC_EOS"),
+                    ),
+                )
+            )
+        probe_handles.append(
+            (
+                ghost_pad,
+                ghost_pad.add_probe(
+                    Gst.PadProbeType.EVENT_DOWNSTREAM,
+                    eos_probe,
+                ),
+            )
         )
 
         self.main_pipeline.add(deck_bin)
@@ -4419,9 +4636,9 @@ class PlaybackEngine:
         deck_bin.get_static_pad("src").link(mixer_pad)
 
         self._apply_pad_offset(deck_bin, internal_position_ns=resume_position_ns or 0)
-
-        deck_bin.sync_state_with_parent()
-
+        with self._lock:
+            self._deck_generation_serial += 1
+            generation = self._deck_generation_serial
         deck = Deck(
             slot=slot,
             track=track,
@@ -4429,7 +4646,10 @@ class PlaybackEngine:
             pipeline=deck_bin,
             mixer_pad=mixer_pad,
             silence_primed=silence_primed,
+            generation=generation,
         )
+        deck.probe_handles = probe_handles
+        deck.signal_handles = signal_handles
         start_offset = (resume_position_ns or 0) / Gst.SECOND
         # For primed decks, "position 0" (start of the real content) is
         # SILENCE_PRIME_SECONDS after creation, not immediately — shift
@@ -4439,6 +4659,14 @@ class PlaybackEngine:
         # computed against), not the silence-inclusive elapsed time.
         silence_shift = SILENCE_PRIME_SECONDS if silence_primed else 0.0
         deck.started_at = time.time() - start_offset + silence_shift
+
+        # Register object identity and error routing before PLAYING can emit
+        # EOS/error. This closes the very-short-ID/startup race in which an
+        # idle callback could previously precede the caller's map insertion.
+        with self._lock:
+            self.decks[slot] = deck
+            self._deck_bin_map[id(deck_bin)] = deck
+        deck_bin.sync_state_with_parent()
 
         if resume_position_ns is None:
             aired_at = timezone.now()
@@ -4616,15 +4844,23 @@ class PlaybackEngine:
         warm_pipeline.set_state(Gst.State.NULL)
         return False  # one-shot GLib timeout, don't repeat
 
-    def _remove_deck(self, deck):
-        # Close out the PlayEvent row (if one was written at
-        # _create_deck) BEFORE we drop the lock -- ended_at and
-        # duration_played_seconds are set from the row's own
-        # started_at, so this is safe against clock skew. Best-effort;
-        # a DB failure here is logged and dropped, same policy as the
-        # create-side write. Report-time query drops rows whose
-        # duration is below the SoundExchange 30s threshold, so a
-        # spurious short close-out here still gets filtered on export.
+    def _ensure_deck_teardown_coordinator(self, slot):
+        coordinators = getattr(self, "_deck_teardowns", None)
+        if coordinators is None:
+            coordinators = {}
+            self._deck_teardowns = coordinators
+        coordinator = coordinators.get(slot)
+        if coordinator is None:
+            coordinator = audio_recovery.BoundedTeardownCoordinator(
+                f"deck-{slot.lower()}-teardown",
+                timeout_s=DECK_TEARDOWN_TIMEOUT_SECONDS,
+                queue_capacity=1,
+            )
+            coordinators[slot] = coordinator
+        return coordinator
+
+    def _close_deck_play_event(self, deck):
+        """Best-effort PlayEvent close-out after live-topology isolation."""
         if deck.play_event_id:
             try:
                 close_old_connections()
@@ -4643,19 +4879,201 @@ class PlaybackEngine:
             except Exception as exc:
                 print(f"  PlayEvent close-out failed (non-fatal): {exc}")
 
-        with self._lock:
-            self._deck_bin_map.pop(id(deck.pipeline), None)
-            deck.pipeline.set_state(Gst.State.NULL)
+    def _schedule_deck_null(self, deck):
+        """Send only the hazardous NULL transition to one bounded worker."""
+
+        def release_callbacks():
+            for pad, probe_id in deck.probe_handles:
+                try:
+                    pad.remove_probe(probe_id)
+                except Exception:
+                    pass
+            deck.probe_handles.clear()
+            for element, handler_id in deck.signal_handles:
+                try:
+                    element.disconnect(handler_id)
+                except Exception:
+                    pass
+            deck.signal_handles.clear()
+
+        def set_null():
             try:
-                deck.pipeline.get_static_pad("src").unlink(deck.mixer_pad)
-            except Exception:
-                pass
-            if deck.mixer_pad is not None:
-                self.mixer.release_request_pad(deck.mixer_pad)
-            self.main_pipeline.remove(deck.pipeline)
+                result = deck.pipeline.set_state(Gst.State.NULL)
+            except Exception as exc:
+                deck.mark_milestone("O_NULL_TRANSITION_FAILED", state=repr(exc))
+                raise
+            else:
+                if result == Gst.StateChangeReturn.FAILURE:
+                    deck.mark_milestone("O_NULL_TRANSITION_FAILED", state=result)
+                    raise RuntimeError(f"set_state(NULL) returned {result}")
+                deck.mark_milestone("O_NULL_TRANSITION_COMPLETE", state=result)
+                return result
+            finally:
+                # Break Python/GObject callback cycles after the generation is
+                # quiesced. This cleanup stays on the same bounded worker: pad
+                # probe/signal disconnection is never added to the GLib-thread
+                # isolation critical path.
+                release_callbacks()
+
+        outcome = self._ensure_deck_teardown_coordinator(deck.slot).submit(
+            deck.generation,
+            set_null,
+            metadata={
+                "slot": deck.slot,
+                "track_id": deck.track.id,
+                "track_title": deck.track.title,
+                "detached_from_mixer": deck.detached_from_mixer,
+            },
+        )
+        if outcome != "queued":
+            deck.mark_milestone("O_NULL_TRANSITION_NOT_STARTED", state=outcome)
+        return outcome
+
+    def _remove_deck(self, deck):
+        """Detach one exact generation first, then retire it off-thread.
+
+        Unlink/release/remove are intentionally performed on the GLib thread
+        only after the generation has been removed from logical bookkeeping.
+        The potentially hanging set_state(NULL) never runs here. Identity
+        checks make duplicate, late EOS, error, and watchdog callbacks harmless
+        and prevent an old generation from clearing a newer A/B occupant.
+        """
+        if deck is None:
+            return False
+        deck.mark_milestone("K_REMOVE_DECK_ENTERED")
+        with self._lock:
+            if deck.retirement_started:
+                deck.mark_milestone("K_DUPLICATE_RETIREMENT_IGNORED")
+                return False
+            deck.retirement_started = True
+            if self._deck_bin_map.get(id(deck.pipeline)) is deck:
+                self._deck_bin_map.pop(id(deck.pipeline), None)
             deck.finished = True
             if self.decks.get(deck.slot) is deck:
                 self.decks[deck.slot] = None
+
+        isolation_errors = []
+        mixer_pad = deck.mixer_pad
+        try:
+            src_pad = deck.pipeline.get_static_pad("src")
+            unlinked = True if mixer_pad is None else src_pad.unlink(mixer_pad)
+            deck.mark_milestone("L_MIXER_UNLINK_COMPLETE", state=unlinked)
+            if mixer_pad is not None and not unlinked:
+                isolation_errors.append("mixer unlink returned false")
+        except Exception as exc:
+            isolation_errors.append(f"mixer unlink failed: {exc!r}")
+            deck.mark_milestone("L_MIXER_UNLINK_FAILED", state=repr(exc))
+
+        if mixer_pad is not None:
+            try:
+                self.mixer.release_request_pad(mixer_pad)
+                deck.mark_milestone("M_MIXER_REQUEST_PAD_RELEASE_COMPLETE")
+            except Exception as exc:
+                isolation_errors.append(f"mixer request-pad release failed: {exc!r}")
+                deck.mark_milestone("M_MIXER_REQUEST_PAD_RELEASE_FAILED", state=repr(exc))
+            finally:
+                deck.mixer_pad = None
+
+        try:
+            removed = self.main_pipeline.remove(deck.pipeline)
+            deck.mark_milestone("N_BIN_REMOVAL_COMPLETE", state=removed)
+            if not removed:
+                isolation_errors.append("main pipeline remove returned false")
+        except Exception as exc:
+            isolation_errors.append(f"main pipeline remove failed: {exc!r}")
+            deck.mark_milestone("N_BIN_REMOVAL_FAILED", state=repr(exc))
+
+        deck.detached_from_mixer = not any("mixer" in error for error in isolation_errors)
+        if isolation_errors:
+            emit_event(
+                category="engine",
+                level="critical",
+                title="Deck generation isolation incomplete",
+                detail={
+                    "slot": deck.slot,
+                    "track_id": deck.track.id,
+                    "track_title": deck.track.title,
+                    "generation": deck.generation,
+                    "errors": isolation_errors,
+                    "eos": deck.milestone_snapshot(),
+                    "restart_recommended": True,
+                },
+                dedupe_key=f"engine|deck-isolation|generation={deck.generation}",
+            )
+
+        # Dispatch hazardous quiescence immediately after isolation; database
+        # accounting must not delay it (or live-mixer detach above).
+        self._schedule_deck_null(deck)
+        self._close_deck_play_event(deck)
+        return True
+
+    @_glib_safe(default_return=True)
+    def _deck_teardown_tick(self):
+        coordinators = getattr(self, "_deck_teardowns", None)
+        if not coordinators:
+            return True
+        healthy_teardown_completed = False
+        for slot, coordinator in coordinators.items():
+            coordinator.tick()
+            for event in coordinator.drain_events():
+                kind = event["kind"]
+                if kind == "completed":
+                    healthy_teardown_completed = True
+                if kind in {"queued", "started", "completed", "duplicate_ignored"}:
+                    continue
+                metadata = event.get("metadata", {})
+                critical = kind in {
+                    "timed_out",
+                    "rejected_poisoned",
+                    "rejected_full",
+                    "abandoned_without_start",
+                }
+                timed_out = kind == "timed_out"
+                emit_event(
+                    category="engine",
+                    level="critical" if critical else "error",
+                    title=(
+                        f"Deck {slot} teardown timed out; playout isolated to remaining slot"
+                        if timed_out
+                        else f"Deck {slot} teardown could not complete after isolation"
+                    ),
+                    detail={
+                        **metadata,
+                        "slot": slot,
+                        "generation": event["generation"],
+                        "teardown_event": kind,
+                        "elapsed_seconds": event.get("elapsed_s"),
+                        "error": event.get("error"),
+                        "coordinator": coordinator.snapshot(),
+                        "bad_generation_isolated_from_live_mixer": metadata.get(
+                            "detached_from_mixer", False
+                        ),
+                        "playout_continues_on_remaining_slot": any(
+                            other != slot and self._deck_slot_available(other)
+                            for other in SLOTS
+                        ),
+                        "restart_required_to_reclaim_generation": critical,
+                        "restart_recommended": critical,
+                    },
+                    # A poison episode is one operational incident. Never
+                    # create a new dashboard row for each later observation.
+                    dedupe_key=f"engine|deck-teardown|slot={slot}|{kind}",
+                )
+        if (
+            healthy_teardown_completed
+            and getattr(self, "running", False)
+            and not self.manual_mode
+            and all(deck is None for deck in self.decks.values())
+            and self._free_slot() is not None
+        ):
+            # With one poisoned slot, the surviving slot is briefly
+            # unavailable while its previous generation reaches NULL. A deck
+            # may have ended during that interval, leaving no leading deck for
+            # _poll_position to retry from. Resume as soon as the healthy
+            # slot's worker reports completion; handoff never waits in the
+            # ordinary two-slot/crossfade case.
+            self._start_next_track()
+        return True
 
     def _read_resume_hint(self):
         """Look for a bookmark file left by the PREVIOUS engine instance
@@ -7075,14 +7493,6 @@ class PlaybackEngine:
             )
             new_deck.started_at = time.time()
 
-        with self._lock:
-            self.decks[slot] = new_deck
-        self._deck_bin_map[id(new_deck.pipeline)] = new_deck
-
-        bus = new_deck.pipeline.get_bus()
-        bus.add_signal_watch()
-        bus.connect("message::error", self._on_deck_error, new_deck)
-
         print(f"  [{slot}] Resumed at {resume_position:.1f}s", flush=True)
 
     def _seek_deck(self, slot, position):
@@ -7132,14 +7542,6 @@ class PlaybackEngine:
                 dedupe_key=f"engine|seek-rejected|slot={slot}|track={new_deck.track.id}",
             )
             new_deck.started_at = time.time()
-
-        with self._lock:
-            self.decks[slot] = new_deck
-        self._deck_bin_map[id(new_deck.pipeline)] = new_deck
-
-        bus = new_deck.pipeline.get_bus()
-        bus.add_signal_watch()
-        bus.connect("message::error", self._on_deck_error, new_deck)
 
         if was_paused:
             self._pause_deck(slot)
@@ -7310,50 +7712,132 @@ class PlaybackEngine:
         self.log_items = fresh_items
         self._queue_cursor = min(new_cursor, len(fresh_items))
 
-    def _check_stuck_decks(self):
-        """Watchdog for a deck whose EOS was never detected. Seen live: a
-        startup-timing race left both decks permanently deadlocked --
-        _poll_position's crossfade trigger only runs when the OTHER slot
-        is empty (see the `if not other_occupied` guard below), which is
-        correct for the normal case (EOS frees a slot, the survivor's own
-        trigger then fires) but has no escape if EOS never fires for
-        EITHER deck: neither slot ever frees, so neither trigger can ever
-        run, and playback silently stalls forever at the end of both
-        tracks with no error anywhere -- state-writing and command
-        handling keep ticking normally since they don't touch this path,
-        so nothing else looks wrong.
+    def _mixer_sink_pad_count(self):
+        try:
+            return len(tuple(self.mixer.sinkpads))
+        except Exception:
+            return None
 
-        Recovery is deliberately NOT the normal-EOS teardown path
-        (_handle_deck_finished -> _remove_deck's synchronous
-        pipeline.set_state(Gst.State.NULL) / main_pipeline.remove() /
-        release_request_pad()) -- confirmed live that those GStreamer
-        calls can themselves block forever on a pipeline that's already
-        wedged (which is exactly the state a deck stuck here is in): a
-        first version of this watchdog that called _handle_deck_finished
-        hung the entire engine process so completely that even SIGTERM
-        was ignored for systemd's full 90s stop timeout, requiring
-        SIGKILL. Instead this only forgets the deck at the application
-        level, so _start_next_track can claim the slot and build a fresh
-        deck with its own new mixer pad. The old, wedged GStreamer bin is
-        deliberately leaked (stays linked into the mixer, silent, using a
-        small amount of memory) rather than risking another full hang --
-        a normal engine restart clears it. _next_triggered is reset too:
-        it's a single engine-wide flag, and it stayed pinned True for the
-        whole stuck period (set once, when the two boot decks were first
-        created), which would otherwise silently block the survivor's own
-        next trigger even after this frees its slot."""
+    def _active_deck_generations(self):
+        return {
+            slot: (deck.generation if deck is not None else None)
+            for slot, deck in self.decks.items()
+        }
+
+    def _deck_recovery_state(self):
+        now = time.monotonic()
+        watchdog_times = getattr(self, "_deck_watchdog_times", ())
+        recent = [
+            timestamp
+            for timestamp in watchdog_times
+            if now - timestamp <= DECK_WATCHDOG_WINDOW_SECONDS
+        ]
+        coordinators = getattr(self, "_deck_teardowns", {})
+        teardown = {
+            slot: coordinator.snapshot()
+            for slot, coordinator in coordinators.items()
+        }
+        poisoned_slots = [
+            slot for slot, snapshot in teardown.items() if snapshot["poisoned"]
+        ]
+        remaining_slots = [slot for slot in SLOTS if slot not in poisoned_slots]
+        terminal_degraded = len(poisoned_slots) == len(SLOTS)
+        return {
+            "watchdogs_in_window": len(recent),
+            "watchdog_window_seconds": DECK_WATCHDOG_WINDOW_SECONDS,
+            "restart_recommended": (
+                len(recent) >= DECK_WATCHDOG_ESCALATION_COUNT
+                or bool(poisoned_slots)
+            ),
+            "health": (
+                "RESTART_REQUIRED_NO_PLAYBACK_SLOTS"
+                if terminal_degraded
+                else (
+                    "RESTART_REQUIRED_GENERATION_ISOLATED"
+                    if poisoned_slots else "HEALTHY"
+                )
+            ),
+            "poisoned_slots": poisoned_slots,
+            "reusable_slots": remaining_slots,
+            "automated_playout_available": bool(remaining_slots),
+            "terminal_degraded": terminal_degraded,
+            "restart_required_before_automated_playout": terminal_degraded,
+            "playout_continues_on_remaining_slot": bool(remaining_slots),
+            "restart_required_to_reclaim_generation": bool(poisoned_slots),
+            "mixer_sink_pad_count": self._mixer_sink_pad_count(),
+            "active_deck_generations": self._active_deck_generations(),
+            "teardown": teardown,
+        }
+
+    def _query_deck_duration(self, deck):
+        if deck.observed_duration_seconds is not None:
+            return deck.observed_duration_seconds
+        try:
+            ok, duration_ns = deck.pipeline.query_duration(Gst.Format.TIME)
+        except Exception:
+            return None
+        if ok and duration_ns not in (None, Gst.CLOCK_TIME_NONE) and duration_ns > 0:
+            deck.observed_duration_seconds = duration_ns / Gst.SECOND
+            return deck.observed_duration_seconds
+        return None
+
+    def _check_stuck_decks(self):
+        """Contain a generation only after both timing and progress evidence.
+
+        Metadata duration is an expectation, not proof that a decoder has
+        stopped. A deck becomes watchdog-eligible when an unhandled EOS
+        boundary has remained unresolved for the timeout, or when the best
+        available duration is overrun *and* decoded media buffers have also
+        stopped for the timeout. This prevents short DB metadata from cutting
+        off healthy media while retaining a bounded escape for a true stall.
+        """
+        now_monotonic = time.monotonic()
+        if not hasattr(self, "_deck_watchdog_times"):
+            self._deck_watchdog_times = deque()
         for slot, deck in list(self.decks.items()):
             if deck is None or deck.finished or deck.paused:
                 continue
-            duration = deck.track.duration_seconds or 0
-            if not duration:
-                continue
             pos = self._get_deck_position(deck)
-            if pos > duration + DECK_STUCK_TIMEOUT_SECONDS:
-                print(f"  [{slot}] WATCHDOG: '{deck.track.title}' stuck at {pos:.1f}s "
-                      f"(duration {duration:.1f}s) with no EOS detected -- abandoning "
-                      f"this deck (leaking its pipeline rather than risking a hung "
-                      f"teardown) and freeing the slot.")
+            observed_duration = self._query_deck_duration(deck)
+            metadata_duration = deck.track.duration_seconds or 0
+            duration = observed_duration or metadata_duration
+            progress_anchor = deck.last_media_buffer_monotonic or deck.created_monotonic
+            stalled_seconds = max(0.0, now_monotonic - progress_anchor)
+
+            eos_at = deck.latest_milestone_time(
+                (
+                    "A_DECODER_AUDIO_EOS",
+                    "B_REAL_LEG_EOS_BEFORE_CONCAT",
+                    "C_CONCAT_REAL_SINK_EOS",
+                    "D_CONCAT_SRC_EOS",
+                    "E_DECK_GHOST_SRC_EOS",
+                )
+            )
+            rejected_at = deck.latest_milestone_time(("I_EOS_REJECTED_POST_SEEK",))
+            unhandled_eos_seconds = None
+            if eos_at is not None and (rejected_at is None or eos_at > rejected_at):
+                unhandled_eos_seconds = max(0.0, now_monotonic - eos_at)
+
+            duration_overrun = bool(duration and pos > duration + DECK_STUCK_TIMEOUT_SECONDS)
+            eos_timed_out = bool(
+                unhandled_eos_seconds is not None
+                and unhandled_eos_seconds >= DECK_STUCK_TIMEOUT_SECONDS
+            )
+            stalled_past_duration = duration_overrun and stalled_seconds >= DECK_STUCK_TIMEOUT_SECONDS
+            if eos_timed_out or stalled_past_duration:
+                while (
+                    self._deck_watchdog_times
+                    and now_monotonic - self._deck_watchdog_times[0] > DECK_WATCHDOG_WINDOW_SECONDS
+                ):
+                    self._deck_watchdog_times.popleft()
+                self._deck_watchdog_times.append(now_monotonic)
+                rolling_count = len(self._deck_watchdog_times)
+                escalation = rolling_count >= DECK_WATCHDOG_ESCALATION_COUNT
+                reason = "unhandled_eos" if eos_timed_out else "duration_overrun_without_progress"
+                print(
+                    f"  [{slot}] WATCHDOG: {deck.track.title!r} generation {deck.generation} "
+                    f"stuck at {pos:.1f}s; detach-first containment ({reason})."
+                )
                 emit_event(
                     category="engine",
                     level="critical",
@@ -7362,15 +7846,35 @@ class PlaybackEngine:
                         "slot": slot,
                         "track_id": deck.track.id,
                         "track_title": deck.track.title,
+                        "generation": deck.generation,
                         "position_seconds": round(pos, 1),
-                        "duration_seconds": round(duration, 1),
-                        "overrun_seconds": round(pos - duration, 1),
+                        "metadata_duration_seconds": metadata_duration or None,
+                        "observed_duration_seconds": (
+                            round(observed_duration, 3) if observed_duration is not None else None
+                        ),
+                        "watchdog_duration_seconds": round(duration, 3) if duration else None,
+                        "overrun_seconds": round(pos - duration, 1) if duration else None,
+                        "media_stalled_seconds": round(stalled_seconds, 1),
+                        "unhandled_eos_seconds": (
+                            round(unhandled_eos_seconds, 1)
+                            if unhandled_eos_seconds is not None
+                            else None
+                        ),
+                        "reason": reason,
+                        "eos": deck.milestone_snapshot(now=now_monotonic),
+                        "mixer_sink_pad_count": self._mixer_sink_pad_count(),
+                        "active_deck_generations": self._active_deck_generations(),
+                        "watchdogs_in_window": rolling_count,
+                        "watchdog_window_seconds": DECK_WATCHDOG_WINDOW_SECONDS,
+                        "escalated": escalation,
+                        "restart_recommended": escalation,
                     },
-                    dedupe_key=f"engine|stuck|slot={slot}|track={deck.track.id}",
+                    dedupe_key=f"engine|stuck|generation={deck.generation}",
                 )
-                deck.finished = True
-                self.decks[slot] = None
+                self._remove_deck(deck)
                 self._next_triggered = False
+                if self.decks.get(self._other_slot(slot)) is None and not self.manual_mode:
+                    self._start_next_track(slot=slot)
 
     @_glib_safe(default_return=True)
     def _poll_position(self):
@@ -7475,10 +7979,17 @@ class PlaybackEngine:
         return True
 
     @_glib_safe(default_return=False)
-    def _on_deck_eos_probed(self, deck_bin):
+    def _on_deck_eos_probed(self, deck_bin, expected_deck=None):
+        if expected_deck is not None:
+            expected_deck.mark_milestone("H_EOS_IDLE_CALLBACK_ENTERED")
         deck = self._deck_bin_map.get(id(deck_bin))
-        if not deck or deck.finished:
+        if expected_deck is not None and deck is not expected_deck:
+            expected_deck.mark_milestone("H_STALE_EOS_CALLBACK_IGNORED")
             return
+        if not deck or deck.finished or deck.retirement_started:
+            return
+        if expected_deck is None:
+            deck.mark_milestone("H_EOS_IDLE_CALLBACK_ENTERED")
 
         # A flushing seek into compressed audio -- the auto-resume seek
         # on an engine restart, or a manual seek from the wave-canvas UI
@@ -7521,6 +8032,7 @@ class PlaybackEngine:
                 margin = min(DECK_STUCK_TIMEOUT_SECONDS, duration / 2)
                 pos = self._get_deck_position(deck)
                 if pos < duration - margin:
+                    deck.mark_milestone("I_EOS_REJECTED_POST_SEEK")
                     print(f"  [{deck.slot}] Ignoring implausible post-seek EOS at {pos:.1f}s "
                           f"(duration {duration:.1f}s) on {deck.track.title!r} -- "
                           f"likely a post-seek parser hiccup, not a real end of stream")
@@ -7535,11 +8047,22 @@ class PlaybackEngine:
                     )
                     return
 
+        if not deck.claim_completion("eos"):
+            deck.mark_milestone("I_DUPLICATE_COMPLETION_IGNORED")
+            return
+        deck.mark_milestone("I_EOS_ACCEPTED")
         self._handle_deck_finished(deck)
 
     @_glib_safe(default_return=True)
     def _on_deck_error(self, bus, message, deck):
+        if deck.finished or deck.retirement_started:
+            deck.mark_milestone("ERROR_CALLBACK_STALE_IGNORED")
+            return True
+        if not deck.claim_completion("error"):
+            deck.mark_milestone("ERROR_DUPLICATE_COMPLETION_IGNORED")
+            return True
         err, debug = message.parse_error()
+        deck.mark_milestone("ERROR_OBSERVED", state=err)
         print(f"  GStreamer error on {deck.track.title}: {err} ({debug})")
         emit_event(
             category="engine",
@@ -7559,6 +8082,13 @@ class PlaybackEngine:
 
     @_glib_safe(default_return=False)
     def _handle_deck_finished(self, deck):
+        if deck.finished or deck.retirement_started:
+            deck.mark_milestone("J_STALE_FINISH_CALLBACK_IGNORED")
+            return
+        if self._deck_bin_map.get(id(deck.pipeline)) is not deck:
+            deck.mark_milestone("J_STALE_FINISH_CALLBACK_IGNORED")
+            return
+        deck.mark_milestone("J_HANDLE_DECK_FINISHED_ENTERED")
         slot = deck.slot
 
         # VT mode: if the deck ending is the outgoing one in a VT
@@ -7983,6 +8513,10 @@ class PlaybackEngine:
                 # if no output slots exist at all (shouldn't happen --
                 # Studio Monitor's slot is always built).
                 "output_recovery": self._output_recovery_state(),
+                # P0 deck-EOS containment: enough bounded state for
+                # Monitoring to recommend a controlled restart without the
+                # engine doing so automatically.
+                "deck_recovery": self._deck_recovery_state(),
                 "manual_mode": self.manual_mode,
                 "manual_from_mic": self._manual_from_mic,
                 # Same "configured vs. live" distinction as the mic fields
