@@ -56,7 +56,9 @@ class UpdateJobState:
     # (ARCHITECTURE_REPORT.md §18). A job's own daemon-side code is
     # responsible for eventually landing in one of these; nothing here
     # times a job out on its own.
-    TERMINAL = frozenset({SUCCEEDED, FAILED, INTERRUPTED, CANCELLED})
+    TERMINAL = frozenset({
+        SUCCEEDED, FAILED, MANUAL_INTERVENTION_REQUIRED, INTERRUPTED, CANCELLED,
+    })
 
 
 class UpdateJob(models.Model):

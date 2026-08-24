@@ -27,6 +27,7 @@ from django.db.migrations.loader import MigrationLoader
 from django.db import connection
 
 from . import cross_check, git_adapter, manifest as manifest_mod, release_chain, schema_health as schema_health_mod
+from .execution_contract import execution_fingerprint
 
 # Deliberately matches ARCHITECTURE_REPORT.md §15's restart ordering,
 # derived from these units' own declared `After=` dependencies
@@ -126,6 +127,7 @@ class Plan:
     services_requiring_restart: tuple[str, ...]  # already in RESTART_ORDER order
     nginx_changed: bool
     runtime_components_changed: bool
+    minimum_updater_protocol_version: int
     cross_check_findings: tuple[cross_check.CrossCheckFinding, ...]
     fingerprint: str  # stable hash of this plan's own content, for Phase B revalidation (§10)
     # [P0] 1.1 correction: independent of safety_status/releases_in_plan
@@ -168,6 +170,7 @@ class Plan:
             "services_requiring_restart": list(self.services_requiring_restart),
             "nginx_changed": self.nginx_changed,
             "runtime_components_changed": self.runtime_components_changed,
+            "minimum_updater_protocol_version": self.minimum_updater_protocol_version,
             "schema_health_status": self.schema_health_status,
             "schema_pending_migrations": list(self.schema_pending_migrations),
             "target_schema_validation_status": self.target_schema_validation_status,
@@ -205,6 +208,7 @@ def _safe(safety_status: str, detail: str, schema_health: schema_health_mod.Sche
         systemd_units_new_optional=(), systemd_units_removed_or_renamed=(),
         collectstatic_required=False, services_requiring_restart=(),
         nginx_changed=False, runtime_components_changed=False,
+        minimum_updater_protocol_version=manifest_mod.UPDATER_PROTOCOL_VERSION,
         cross_check_findings=(),
         schema_health_status=schema_health.status,
         schema_pending_migrations=schema_health.pending_migrations,
@@ -480,6 +484,7 @@ def build_plan(checkout_root, releases_dirname: str = release_chain.RELEASES_DIR
     nginx_changed = False
     runtime_components_changed = False
     compatibility_seen: set[str] = set()
+    minimum_protocol = 1
 
     for chained in releases_in_plan:
         m = chained.manifest
@@ -503,6 +508,7 @@ def build_plan(checkout_root, releases_dirname: str = release_chain.RELEASES_DIR
         collectstatic = collectstatic or m.collectstatic_required
         nginx_changed = nginx_changed or m.nginx_changed
         runtime_components_changed = runtime_components_changed or m.runtime_components_changed
+        minimum_protocol = max(minimum_protocol, m.minimum_updater_protocol_version)
         if m.migrations_required:
             compatibility_seen.add(m.migration_compatibility)
 
@@ -540,16 +546,26 @@ def build_plan(checkout_root, releases_dirname: str = release_chain.RELEASES_DIR
         safety_status = SafetyStatus.MIGRATION_MANUAL_GATE_REQUIRED
         safety_detail = "This update includes a non-additive (destructive) migration -- requires an explicit maintenance-window gate, not the unattended path."
 
-    serializable_for_fp = {
-        "target_commit": target_commit,
-        "releases_in_plan": [c.manifest.release_id for c in releases_in_plan],
-        "expected_transition_migrations_unapplied": (
-            list(migrations.expected_transition_unapplied) if migrations else []
-        ),
-        "apt_packages_new": apt_new,
-        "systemd_units_changed": units_changed,
-        "systemd_units_new_required": units_new_required,
-    }
+    execution_fp = execution_fingerprint(
+        installed_release_id=installed.manifest.release_id,
+        installed_commit=installed_commit,
+        target_release_id=latest.manifest.release_id,
+        target_commit=target_commit,
+        releases_in_plan=tuple(c.manifest.release_id for c in releases_in_plan),
+        migrations_required=tuple(explicit_refs),
+        migration_compatibility=overall_compatibility,
+        python_requirements_changed=requirements_changed,
+        apt_packages_new=tuple(apt_new),
+        systemd_units_changed=tuple(units_changed),
+        systemd_units_new_required=tuple(units_new_required),
+        systemd_units_new_optional=tuple(units_new_optional),
+        systemd_units_removed_or_renamed=tuple(units_removed),
+        collectstatic_required=collectstatic,
+        services_requiring_restart=ordered_restart,
+        nginx_changed=nginx_changed,
+        runtime_components_changed=runtime_components_changed,
+        minimum_updater_protocol_version=minimum_protocol,
+    )
 
     return Plan(
         safety_status=safety_status, safety_detail=safety_detail,
@@ -567,8 +583,9 @@ def build_plan(checkout_root, releases_dirname: str = release_chain.RELEASES_DIR
         services_requiring_restart=ordered_restart,
         nginx_changed=nginx_changed,
         runtime_components_changed=runtime_components_changed,
+        minimum_updater_protocol_version=minimum_protocol,
         cross_check_findings=(),
-        fingerprint=_fingerprint(serializable_for_fp),
+        fingerprint=execution_fp,
         schema_health_status=schema_health.status,
         schema_pending_migrations=schema_health.pending_migrations,
         schema_health_detail=schema_health.detail,

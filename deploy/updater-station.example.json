@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "trusted_repository_url": "git@github.com:celltech161/IsadoraAir.git",
+  "trusted_branch": "main",
+  "application_root": "/opt/isadoraair",
+  "application_user": "isadoraair",
+  "application_group": "isadoraair",
+  "application_environment_file": "/opt/isadoraair/.env",
+  "trusted_repository": "/var/lib/isadoraair-updater/repository.git",
+  "jobs_root": "/var/lib/isadoraair-updater/jobs",
+  "logs_root": "/var/log/isadoraair-updater/jobs",
+  "staging_root": "/var/lib/isadoraair-updater/staging",
+  "checkpoint_root": "/var/backups/isadoraair/update-checkpoints",
+  "socket_path": "/run/isadoraair-updater/updater.sock",
+  "systemd_unit_root": "/etc/systemd/system",
+  "render_values": {
+    "isa_user": "isadoraair",
+    "isa_root": "/opt/isadoraair",
+    "isa_home": "/home/isadoraair",
+    "syndicated_root": "/home/isadoraair/syndicated-ingest",
+    "weather_root": "/home/isadoraair/weather-ingest",
+    "ogremote_root": "/home/isadoraair/ogremote-ingest"
+  },
+  "database": {
+    "name": "isadoraair",
+    "user": "isadoraair",
+    "host": "localhost",
+    "port": 5432,
+    "pgpass_file": "/home/isadoraair/.pgpass"
+  },
+  "gunicorn_health_url": "http://127.0.0.1:8000/login/"
+}

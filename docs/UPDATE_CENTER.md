@@ -1,8 +1,9 @@
-# Update Center — design & usage (Phase A)
+# Update Center — design & usage (Phases A+B)
 
-[P0] Bucket 1 / 1.1. This document covers what exists **today**
-(Phase A: non-privileged foundation only) and the design constraints
-future phases must respect. The private/gitignored architecture notes
+[P0] Bucket 1 / 1.1. This document covers what exists **today**:
+Phase A's non-privileged planning foundation and Phase B's deliberately
+uninstalled safe-execution backend source. The design constraints still
+govern future phases. The private/gitignored architecture notes
 used during review are not part of the deployable product; this
 Git-owned document is the authoritative shipped contract.
 
@@ -426,5 +427,238 @@ execution feature omitted by accident.
 
 The same logic applies to the future Phase B systemd unit
 (`isadoraair-updater.service`) — it, too, must be installed manually
-the first time, following whatever install instructions Phase C adds
-to `deploy/README.md`.
+the first time, following the protected-copy bootstrap in
+`deploy/updater_runtime/README.md`. Phase C still owns production activation.
+
+## Phase B safe-execution backend
+
+Phase B adds a complete, testable backend source boundary but does **not**
+make updates reachable from HTTP and does **not** install privileged code.
+The existing `/updates/` URLs remain exactly the read-only dashboard plus the
+CSRF-protected Git-fetch action. There is no start-update view or button.
+
+### Protected runtime and root trust boundary
+
+The standalone source under `deploy/updater_runtime/` uses only the Python
+standard library and imports no Django/application module. Its Git location is
+for code review and distribution only. Production execution is permitted only
+after a reviewed copy has been installed root-owned and application-unwritable:
+
+```
+/usr/bin/python3 -I \
+  /usr/local/libexec/isadoraair-updater/updaterd.py \
+  --config /etc/isadoraair/station.json
+```
+
+The shipped optional `isadoraair-updater.service` uses that exact protected
+shape. It never uses `/opt/isadoraair/venv`, never imports from the application
+checkout, and never executes target Python as root. The source README documents
+bootstrap using fixed `install` invocations; it never tells an operator to run
+repo-owned Python with `sudo`.
+
+The root-owned station configuration is strict JSON with a closed field set:
+trusted upstream URL and branch, application identity/root, protected state
+paths, finite station render values, database connection identity, and a
+loopback Gunicorn health URL. It contains no executable command, hook, arbitrary
+destination, or client-controlled value. The loader refuses symlinks, oversized
+files, non-root ownership, group/world writability, path overlap with the
+application tree, unknown keys, malformed branches/accounts, non-loopback
+health URLs, and unsafe repository identities.
+
+### Independently trusted Git and release plan
+
+Root never treats the application checkout's `.git`, PostgreSQL, or an
+`UpdateJob` row as authority. It owns a separate bare repository, normally:
+
+```
+/var/lib/isadoraair-updater/repository.git
+```
+
+Its origin and branch come only from root-owned station configuration. Fetches
+use fixed argv, no shell, no hooks, controlled environment, bounded output, and
+hard timeouts. Previously accepted upstream history may advance only by
+fast-forward; a force-push or divergence fails closed. An SSH upstream requires
+a separately provisioned root-owned read-only deploy credential and trusted
+host key; the updater never borrows an application-writable SSH identity.
+
+The protected runtime independently parses the strict manifest schema, builds
+the one linear chain, resolves immutable introducing commits, rejects modified
+or re-added manifests and shared introducing commits, verifies every release
+commit lies on the trusted branch, and cross-checks migration/unit/requirements
+claims against trusted Git objects. It independently derives the installed and
+latest releases, complete skipped-release action set, target commit, and
+protocol-v1 execution fingerprint. The `START_UPDATE` release/fingerprint are
+requests for comparison, not authorization facts. Any mismatch is fatal.
+Each transition is also compared with its predecessor: requirements, systemd
+unit, nginx, and runtime-component bytes must agree with the corresponding
+manifest change flags/lists. A falsely undeclared change therefore fails closed
+instead of bypassing a manual gate.
+
+Python requirement changes, apt prerequisites, destructive migrations,
+unknown required/changed units, removed/renamed units, nginx changes,
+runtime-component changes, or a newer updater protocol are Phase B manual
+blockers. Phase B never runs pip against the live venv, never installs apt
+packages, and never replaces itself.
+
+### Narrow IPC and durable root state
+
+The daemon owns a Unix socket under `/run/isadoraair-updater/`, a systemd-created
+root-owned runtime directory. `SO_PEERCRED` must identify root or the configured
+application UID/GID. The protocol is one bounded UTF-8 JSON object with an exact
+field set and version. Only four actions exist:
+
+- `PING`;
+- `START_UPDATE` with canonical UUID, `r####` target, and SHA-256 plan
+  fingerprint;
+- `GET_JOB_STATUS` for that UUID;
+- `GET_JOB_LOG` with a maximum tail size no greater than 64 KiB.
+
+There is no `RUN_COMMAND`, shell, arbitrary systemctl, write-file, path, unit, or
+service operation. Unknown fields/actions and oversized/malformed messages are
+rejected.
+
+Authoritative state is atomic mode-0600 JSON under
+`/var/lib/isadoraair-updater/jobs/`; logs are append-only mode-0600 files under
+`/var/log/isadoraair-updater/jobs/`. A daemon-wide filesystem lock prevents two
+updater daemons. At most one active job is accepted. Starting the same UUID with
+identical authorization facts is idempotent; reusing it with different facts or
+starting a different concurrent job is rejected. Safe completed milestones are
+durable and support restart recovery. A migration-started job lacking a durable
+database-verified milestone is intentionally ambiguous and becomes
+manual-intervention-required rather than blindly rerunning migration.
+
+The Django `UpdateJob` remains a UI/audit mirror. `updatecenter.job_service`
+provides explicit create/submit/reconcile primitives for Phase C, but no web
+view imports or calls them. Root neither reads nor writes the row. Reconciliation
+also compares root-derived target/fingerprint with the mirror before accepting
+status.
+
+### Staging and schema-before-source ordering
+
+The mandatory execution order is:
+
+```
+validate clean exact live release
+  -> fetch and independently validate trusted release chain
+  -> require CURRENT live-source schema plan clean
+  -> git-archive exact target from root repository
+  -> securely extract root-owned, application-read-only staged target
+  -> run TARGET migration probe as ISA_USER
+  -> compare target plan with manifest set + target dependency closure
+  -> mechanically prove v1 additive compatibility
+  -> create valid pg_dump checkpoint
+  -> run target-source migrate as ISA_USER
+  -> re-probe target schema clean
+  -> only then fast-forward live source as ISA_USER
+  -> collectstatic if declared
+  -> reconcile required/changed systemd units from immutable staging
+  -> restart exactly declared core services
+  -> postflight and durable success
+```
+
+Secure extraction accepts only regular files/directories, caps archive/member/
+expanded sizes, rejects duplicate/traversal/absolute names, links, devices and
+special files, and publishes source mode read-only. Job directories are
+canonical UUID children of one configured staging root. Cleanup verifies that
+relationship and refuses symlinks, so it cannot escape via a client path.
+
+The management command `updatecenter_probe` is deliberately machine-readable
+and read-only. It reports the target source's actual Django forward plan,
+complete dependency map, applied set, conflicts, replacement migrations, and
+mechanical operation classification in bounded strict JSON. It is always run
+from the staged target as the application user, with bytecode writes disabled,
+a controlled environment, and the existing application venv. Root never
+imports or executes it directly.
+
+Expected manifest migrations must exist in the target graph. Their full target
+dependency closure minus already-applied nodes must equal the actual Django
+plan exactly—no missing or unexpected migration. Conflicts, replacement/
+squash ambiguity, cycles, missing dependencies, and target migrations applied
+outside the job fail closed. The v1 mechanical auto-allowlist is intentionally
+small: `CreateModel` and nullable `AddField`. Every other operation is manual,
+even if a manifest calls the release additive. Current schema drift is checked
+first and cannot be explained away by target work; the WebRequestConfig incident
+remains the canonical reason.
+
+### Database checkpoint and migration failure
+
+Immediately before the first actual migration, Phase B runs fixed-path
+`/usr/bin/pg_dump` as the application user with fixed custom-format/no-owner/
+no-ACL arguments. Database identity comes from root configuration; an optional
+pgpass path is passed only via the controlled environment. Password and secret
+values are never placed in argv or logs. Root streams the result into an
+internally generated `.partial` file with timeout and size bounds. Only a
+non-empty successful dump is atomically promoted, mode 0600, with metadata
+recording SHA-256, size, job, source release/commit, and target release/commit.
+
+Retention is 30 days and at most five valid checkpoints. The newest valid
+checkpoint is always kept even after 30 days until another valid checkpoint
+supersedes it. Retention runs only after validating a new dump. Incomplete or
+invalid dumps never count as checkpoints.
+
+Migration is one ordinary staged-target `migrate --noinput`, run as ISA_USER,
+only after the exact plan and checkpoint gates. Failure leaves live source and
+service state untouched and retains the checkpoint/evidence. Phase B never
+automatically reverses migrations or restores a dump. Expanded additive schema
+with old source still active is the intentional recoverable state.
+
+### Live source, static files, systemd and restarts
+
+Live Git is never manipulated as root. Immediately before advancement, fixed
+application-user Git commands recheck expected branch, exact installed HEAD,
+clean tree, configured origin identity, exact target object, and fast-forward
+relationship. Hooks are disabled. The application user fetches the configured
+branch and performs `merge --ff-only` to the independently pinned target SHA;
+then root verifies exact HEAD and cleanliness. Dirty work, local commits,
+branch/remote changes, a moved HEAD, non-fast-forward target, or target absence
+all fail closed without stash/reset/clean/force.
+
+`collectstatic --noinput` runs as ISA_USER after source advancement because the
+project's `STATIC_ROOT` belongs to the live release layout. A failure is manual
+intervention after the point of no fake rollback, and no service restarts occur.
+
+Systemd input bytes come only from the root-owned immutable staged target.
+Phase B automatically handles only a compiled closed allowlist of core
+IsadoraAir units that are also declared changed/new-required by the complete
+validated chain. Rendering accepts only the six finite station tokens.
+Destination names are basenames in the configured unit directory; symlinks,
+non-regular files, unexpected ownership, unknown tokens/units, arbitrary
+destinations and drop-ins are refused. Identical bytes are not rewritten;
+changes use a mode-0644 atomic replacement, followed by at most one
+`daemon-reload`. New required units may be enabled/started. Optional units,
+including the Phase B updater service itself in `r0003`, are report-only and
+never automatically activated. Removal/rename remains a manual gate.
+
+Restarts use only the manifest's closed five-service set in deterministic
+dependency order. No source-change inference adds another service. Each restart
+is checked through typed systemd properties; exited successful oneshots are not
+misclassified as failed. Postflight verifies exact target HEAD, clean live
+target-source schema, installed unit state, declared service health, durable job
+state, and a bounded loopback HTTP response when Gunicorn restarted.
+
+### Failure, retry, rollback and Phase C gate
+
+Before migration, failure leaves production unchanged. After verified additive
+migration but before live advancement, extra backward-compatible schema may
+remain while old source continues. After source advancement there is no
+automatic rollback promise: failures are `failed` or
+`manual_intervention_required` with exact evidence. No reverse migrations,
+dump restore, forced Git reset, broad cancellation, or updater self-replacement
+exists.
+
+Fetch/validation/staging are repeatable. A valid root-recorded checkpoint can be
+reused, applied migrations and source-at-target are recognized only alongside
+durable milestones, identical units are not rewritten, and each service has
+started/completed restart milestones so completed restarts are skipped while an
+ambiguous interrupted restart becomes manual. Ambiguous migration interruption
+likewise cannot auto-resume. Cancellation is intentionally unsupported.
+
+Finally, protected updater installation alone is insufficient authorization for
+Phase C. Before any production Update button can exist, the restart paths in
+`hardware/admin.py`, `rbds/admin.py`, and `monitoring/views.py` must move to a
+constrained mechanism and the station's unrestricted `NOPASSWD: ALL` grant must
+be removed. The updater service/config/repository/socket must then be separately
+installed, reviewed and exercised without exposing HTTP execution. `r0003`
+ships these artifacts as optional source only and requires a Gunicorn restart
+for the changed planner/model code; it declares no migration, package, static,
+nginx, or automatically activated systemd work.

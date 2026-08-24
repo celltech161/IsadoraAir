@@ -4,6 +4,17 @@ systemd units, nginx site config, and misc drop-in configs for a
 production IsadoraAir install. Every path or user that varies per
 install is a `@@PLACEHOLDER@@` token — see below to render + install.
 
+## Managed Update Center Phase B artifact
+
+`isadoraair-updater.service`, `updater-station.example.json`, and
+`updater_runtime/` are deliberately **not** part of the broad unit-install loop
+below. They define an optional protected backend that must be independently
+reviewed and copied with fixed root-owned `install` tooling as documented in
+`updater_runtime/README.md`. Never point its `ExecStart` at this checkout or the
+application venv, and do not enable it until the Phase C security prerequisites
+in `docs/UPDATE_CENTER.md`—especially removal of unrestricted `NOPASSWD: ALL`—
+have been completed.
+
 ## Placeholders
 
 | Token | What to set it to | Example |
@@ -39,6 +50,9 @@ export OGREMOTE_ROOT=$ISA_HOME/ogremote-ingest
 # 2. Render + install every deploy/*.service, *.timer, and *.conf
 for f in deploy/*.service deploy/*.timer deploy/*.conf; do
   [ -f "$f" ] || continue
+  # Protected updater bootstrap is separate and must never ride this broad
+  # application-unit loop; see updater_runtime/README.md.
+  [ "$(basename "$f")" = "isadoraair-updater.service" ] && continue
   sed \
     -e "s|@@ISA_USER@@|$ISA_USER|g" \
     -e "s|@@ISA_ROOT@@|$ISA_ROOT|g" \

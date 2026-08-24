@@ -1,0 +1,140 @@
+"""Closed-allowlist systemd file reconciliation and service health checks."""
+from __future__ import annotations
+
+import os
+from pathlib import Path
+import re
+import stat
+
+from .config import StationConfig
+from .process import CommandRunner
+from .release import KNOWN_MANAGED_UNITS, RESTART_ORDER, TrustedPlan
+from .security import assert_root_protected, assert_root_protected_parents
+
+
+SYSTEMCTL = "/usr/bin/systemctl"
+TOKEN_RE = re.compile(r"@@[A-Z_]+@@")
+TOKENS = {
+    "@@ISA_USER@@": "isa_user",
+    "@@ISA_ROOT@@": "isa_root",
+    "@@ISA_HOME@@": "isa_home",
+    "@@SYNDICATED_ROOT@@": "syndicated_root",
+    "@@WEATHER_ROOT@@": "weather_root",
+    "@@OGREMOTE_ROOT@@": "ogremote_root",
+}
+
+
+class SystemdError(RuntimeError):
+    pass
+
+
+class SystemdManager:
+    def __init__(self, config: StationConfig, runner: CommandRunner, *, enforce_root_ownership: bool = True):
+        self.config = config
+        self.runner = runner
+        self.enforce_root_ownership = enforce_root_ownership
+
+    def _systemctl(self, args: list[str], timeout: float = 60):
+        result = self.runner.run([SYSTEMCTL, *args], timeout=timeout)
+        if not result.ok:
+            raise SystemdError(f"systemctl {args[0]} failed")
+        return result
+
+    def _render(self, content: bytes) -> bytes:
+        if len(content) > 1024 * 1024:
+            raise SystemdError("unit template exceeds 1 MiB")
+        try:
+            text = content.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise SystemdError("unit template is not UTF-8") from exc
+        if "\x00" in text:
+            raise SystemdError("unit template contains NUL")
+        for token, key in TOKENS.items():
+            text = text.replace(token, self.config.render_values[key])
+        unknown = TOKEN_RE.findall(text)
+        if unknown:
+            raise SystemdError(f"unit template contains unknown render token(s): {sorted(set(unknown))!r}")
+        return text.encode("utf-8")
+
+    def _install_one(self, source_root: Path, unit: str) -> bool:
+        if unit not in KNOWN_MANAGED_UNITS:
+            raise SystemdError(f"unit {unit!r} is outside the installed updater allowlist")
+        source = source_root / "deploy" / unit
+        if source.parent != source_root / "deploy" or not source.is_file() or source.is_symlink():
+            raise SystemdError(f"trusted staged unit source is invalid: {unit}")
+        rendered = self._render(source.read_bytes())
+        root = self.config.systemd_unit_root
+        assert_root_protected_parents(root)
+        root.mkdir(parents=True, exist_ok=True, mode=0o755)
+        assert_root_protected(root)
+        destination = root / unit
+        if destination.parent != root:
+            raise SystemdError("unit destination escaped configured systemd root")
+        if destination.exists() or destination.is_symlink():
+            info = destination.lstat()
+            if not stat.S_ISREG(info.st_mode) or destination.is_symlink():
+                raise SystemdError("existing unit destination is not a regular file")
+            if self.enforce_root_ownership and (info.st_uid != 0 or info.st_mode & 0o022):
+                raise SystemdError("existing unit destination is not root-owned/non-writable")
+            if destination.read_bytes() == rendered:
+                return False
+        temporary = root / f".{unit}.isadoraair-updater.{os.getpid()}"
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o644)
+        try:
+            os.write(fd, rendered)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.chmod(temporary, 0o644)
+        os.replace(temporary, destination)
+        return True
+
+    def reconcile(self, source_root: Path, plan: TrustedPlan) -> dict:
+        changed = []
+        for unit in (*plan.systemd_units_changed, *plan.systemd_units_new_required):
+            if self._install_one(source_root, unit):
+                changed.append(unit)
+        if changed:
+            self._systemctl(["daemon-reload"])
+        for unit in plan.systemd_units_new_required:
+            self._systemctl(["enable", "--now", unit], timeout=120)
+            self.verify_unit(unit)
+        return {
+            "changed": changed,
+            "optional_report_only": list(plan.systemd_units_new_optional),
+            "daemon_reload": bool(changed),
+        }
+
+    def restart_declared(self, services: tuple[str, ...]) -> list[str]:
+        if tuple(name for name in RESTART_ORDER if name in set(services)) != tuple(services):
+            raise SystemdError("restart list is not the closed deterministic manifest order")
+        restarted = []
+        for service in services:
+            unit = f"{service}.service"
+            if unit not in KNOWN_MANAGED_UNITS:
+                raise SystemdError(f"service {service!r} is outside the restart allowlist")
+            self._systemctl(["restart", unit], timeout=180)
+            self.verify_unit(unit)
+            restarted.append(service)
+        return restarted
+
+    def verify_unit(self, unit: str):
+        if unit not in KNOWN_MANAGED_UNITS:
+            raise SystemdError("cannot verify an unknown unit")
+        result = self._systemctl([
+            "show", unit, "--property=Type", "--property=ActiveState",
+            "--property=SubState", "--property=Result",
+        ])
+        values = {}
+        for line in result.stdout.decode("utf-8", "replace").splitlines():
+            key, separator, value = line.partition("=")
+            if separator:
+                values[key] = value
+        unit_type = values.get("Type", "")
+        active = values.get("ActiveState", "")
+        outcome = values.get("Result", "")
+        if unit_type == "oneshot":
+            if not (outcome in {"", "success"} and active in {"active", "inactive"}):
+                raise SystemdError(f"oneshot unit {unit} did not complete successfully")
+        elif active != "active":
+            raise SystemdError(f"unit {unit} is not active")

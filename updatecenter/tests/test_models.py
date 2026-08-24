@@ -1,10 +1,4 @@
-"""UpdateJob schema tests -- [P0] 1.1 Phase A.
-
-No Phase A code path ever creates an UpdateJob row -- these tests
-exist purely to prove the SCHEMA itself (state vocabulary, the
-concurrency constraint §18 lays groundwork for, plan-snapshot
-serialization round-trip) behaves correctly, ready for Phase B without
-further migration churn."""
+"""UpdateJob schema and Phase B audit-mirror constraints."""
 import uuid
 from pathlib import Path
 
@@ -25,16 +19,18 @@ def _make_job(**overrides):
     return UpdateJob.objects.create(**defaults)
 
 
-class NoPhaseACodeCreatesJobsTests(TestCase):
+class JobWriteConfinementTests(TestCase):
     def test_zero_jobs_exist_by_default(self):
         self.assertEqual(UpdateJob.objects.count(), 0)
 
-    def test_non_test_phase_a_source_has_no_updatejob_write(self):
+    def test_non_test_writes_are_confined_to_phase_b_job_service(self):
         app_root = Path(__file__).resolve().parents[1]
         for path in app_root.rglob("*.py"):
             if "tests" in path.parts or "migrations" in path.parts or path.name == "models.py":
                 continue
             text = path.read_text(encoding="utf-8")
+            if path.name == "job_service.py":
+                continue
             self.assertNotIn("UpdateJob.objects.create", text, str(path))
             self.assertNotIn("UpdateJob.objects.bulk_create", text, str(path))
 
@@ -47,7 +43,9 @@ class StateVocabularyTests(TestCase):
     def test_terminal_states_are_exactly_the_documented_set(self):
         self.assertEqual(
             UpdateJobState.TERMINAL,
-            {UpdateJobState.SUCCEEDED, UpdateJobState.FAILED, UpdateJobState.INTERRUPTED, UpdateJobState.CANCELLED},
+            {UpdateJobState.SUCCEEDED, UpdateJobState.FAILED,
+             UpdateJobState.MANUAL_INTERVENTION_REQUIRED,
+             UpdateJobState.INTERRUPTED, UpdateJobState.CANCELLED},
         )
 
     def test_every_choice_value_is_a_valid_state_constant(self):
