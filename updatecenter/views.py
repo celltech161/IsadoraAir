@@ -8,7 +8,6 @@ from django.views.decorators.csrf import ensure_csrf_cookie
 from django.views.decorators.http import require_http_methods
 
 from isadoraair.version_info import get_checkout_identity
-from monitoring.services.release_status import get_release_status
 
 from . import planner, release_chain
 from .backend_client import BackendError, PROTOCOL_VERSION, UpdaterClient
@@ -19,6 +18,13 @@ from .schema_health import SchemaHealthStatus
 
 CHECKOUT_ROOT = Path(__file__).resolve().parent.parent
 RELEASES_DIRNAME = release_chain.RELEASES_DIRNAME_DEFAULT
+SERVICE_RESTART_LABELS = {
+    "isadoraair-gunicorn": "Web interface",
+    "isadoraair-engine": "Audio engine",
+    "isadoraair-monitoring": "Monitoring",
+    "isadoraair-encoders": "Stream encoders",
+    "isadoraair-rbds": "RBDS",
+}
 
 
 def _permission_check(request):
@@ -115,9 +121,18 @@ def _refresh_job(job: UpdateJob, client: UpdaterClient | None = None) -> tuple[U
     return job, None
 
 
+def _operator_service_restart_labels(plan) -> tuple[str, ...]:
+    """Translate planner identities for the primary operator summary only."""
+    if plan is None:
+        return ()
+    return tuple(
+        SERVICE_RESTART_LABELS.get(service, service)
+        for service in getattr(plan, "services_requiring_restart", ())
+    )
+
+
 def _build_context(request):
     checkout = get_checkout_identity()
-    _checkout_unused, version_lookup = get_release_status()
     try:
         plan = planner.build_plan(CHECKOUT_ROOT, RELEASES_DIRNAME)
         plan_error = None
@@ -136,14 +151,17 @@ def _build_context(request):
     blockers = _execution_blockers(request, plan, readiness, active_job)
     return {
         "checkout": checkout,
-        "version_lookup": version_lookup,
         "plan": plan,
         "plan_error": plan_error,
         "backend_readiness": readiness,
+        "operator_service_restarts": _operator_service_restart_labels(plan),
         "execution_blockers": blockers,
         "update_eligible": not blockers,
         "active_job": active_job,
         "shown_job": shown_job,
+        "shown_job_terminal": bool(
+            shown_job and shown_job.state in UpdateJobState.TERMINAL
+        ),
         "reconciliation_error": reconciliation_error,
     }
 

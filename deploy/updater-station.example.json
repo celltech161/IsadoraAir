@@ -17,7 +17,7 @@
   "application_environment_file": "/opt/isadoraair/.env",
   "trusted_repository": "/var/lib/isadoraair-updater/repository.git",
   "jobs_root": "/var/lib/isadoraair-updater/jobs",
-  "logs_root": "/var/log/isadoraair-updater/jobs",
+  "logs_root": "/var/lib/isadoraair-updater/logs",
   "staging_root": "/var/lib/isadoraair-updater/staging",
   "checkpoint_root": "/var/backups/isadoraair/update-checkpoints",
   "socket_path": "/run/isadoraair-updater/updater.sock",

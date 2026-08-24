@@ -4,232 +4,296 @@
 
 {% block extra_css %}
 <style>
-  .uc-panel {
-    background: var(--panel-bg);
-    border: 1px solid var(--border-subtle);
-    border-radius: 10px;
-    padding: 1rem 1.2rem;
-    margin-bottom: 1rem;
+  .uc-page { max-width: 1120px; margin: 0 auto; }
+  .uc-heading {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 1rem; margin-bottom: 0.8rem;
   }
-  .uc-panel h2 {
-    margin: 0 0 0.6rem 0;
-    font-size: 1rem;
-    color: var(--text-main);
+  .uc-heading h1 { margin: 0; font-size: 1.55rem; }
+  .uc-heading p { margin: 0.15rem 0 0; }
+  .uc-panel, .uc-hero, .uc-details {
+    background: var(--panel-bg); border: 1px solid var(--border-subtle);
+    border-radius: 10px; margin-bottom: 0.75rem;
   }
-  .uc-row { display: flex; justify-content: space-between; gap: 1rem; padding: 0.2rem 0; font-size: 0.9rem; }
+  .uc-panel, .uc-hero { padding: 0.85rem 1rem; }
+  .uc-panel h2 { margin: 0 0 0.45rem; font-size: 1rem; }
+  .uc-hero { border-left: 4px solid var(--border-subtle); }
+  .uc-hero.good { border-left-color: #78c88c; }
+  .uc-hero.update { border-left-color: var(--accent); }
+  .uc-hero.attention { border-left-color: var(--danger); }
+  .uc-hero-title { font-size: 1.35rem; font-weight: 700; }
+  .uc-hero.good .uc-hero-title { color: #78c88c; }
+  .uc-hero.update .uc-hero-title { color: var(--accent); }
+  .uc-hero.attention .uc-hero-title { color: var(--danger); }
+  .uc-hero-copy { color: var(--text-muted); margin: 0.25rem 0 0; font-size: 0.9rem; }
+  .uc-summary-grid {
+    display: grid; grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 0.65rem; margin-top: 0.7rem;
+  }
+  .uc-summary-item {
+    background: rgba(148, 163, 184, 0.06); border-radius: 8px;
+    padding: 0.55rem 0.7rem;
+  }
+  .uc-summary-label { color: var(--text-muted); font-size: 0.78rem; }
+  .uc-summary-value { margin-top: 0.1rem; font-size: 1rem; font-weight: 650; }
+  .uc-good { color: #78c88c; }
+  .uc-danger { color: var(--danger); }
+  .uc-warning { color: #d8a860; }
+  .uc-note { color: var(--text-muted); font-size: 0.82rem; margin: 0.35rem 0 0; }
+  .uc-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 0.75rem; margin-top: 0.7rem; }
+  .uc-link { color: var(--accent); font-size: 0.86rem; text-decoration: none; }
+  .uc-link:hover { text-decoration: underline; }
+  .uc-row { display: flex; justify-content: space-between; gap: 1rem; padding: 0.18rem 0; font-size: 0.88rem; }
   .uc-row .k { color: var(--text-muted); }
-  .uc-row .v { color: var(--text-main); font-family: monospace; }
-  .uc-badge {
-    display: inline-block; padding: 0.1rem 0.5rem; border-radius: 6px;
-    font-size: 0.78rem; font-family: monospace;
-  }
-  .uc-badge.current { background: rgba(120, 200, 140, 0.15); color: #78c88c; }
-  .uc-badge.stale, .uc-badge.dirty { background: rgba(249, 115, 115, 0.15); color: var(--danger); }
-  .uc-badge.unknown, .uc-badge.indeterminate { background: rgba(200, 200, 120, 0.15); color: #c8c878; }
-  .uc-safety {
-    font-weight: 600; padding: 0.5rem 0.8rem; border-radius: 8px; margin-bottom: 0.6rem;
-  }
-  .uc-safety.ready_to_plan, .uc-safety.up_to_date, .uc-safety.schema_current { background: rgba(120, 200, 140, 0.12); color: #78c88c; }
-  .uc-safety.dirty_checkout, .uc-safety.diverged_from_origin, .uc-safety.invalid_release_manifest,
-  .uc-safety.cross_check_failed, .uc-safety.target_commit_unknown, .uc-safety.installed_release_unknown,
-  .uc-safety.detached_head, .uc-safety.no_origin_remote, .uc-safety.local_commits_not_on_origin,
-  .uc-safety.installed_release_too_old,
-  .uc-safety.schema_drift_detected,
-  .uc-safety.unapplied_migrations_detected { background: rgba(249, 115, 115, 0.12); color: var(--danger); }
-  .uc-safety.migration_state_indeterminate { background: rgba(200, 160, 90, 0.15); color: #d8a860; }
-  .uc-safety.target_schema_plan_validation_pending,
-  .uc-safety.not_evaluated_plan_blocked,
-  .uc-safety.not_applicable_no_target_transition {
-    background: rgba(200, 160, 90, 0.15); color: #d8a860;
-  }
-  .uc-safety.manual_system_package_action_required, .uc-safety.migration_manual_gate_required {
-    background: rgba(200, 160, 90, 0.15); color: #d8a860;
-  }
-  .uc-note { color: var(--text-muted); font-size: 0.82rem; margin-top: 0.4rem; }
-  .uc-list { margin: 0.3rem 0 0.3rem 1.1rem; padding: 0; font-size: 0.88rem; }
+  .uc-row .v { color: var(--text-main); font-family: monospace; text-align: right; overflow-wrap: anywhere; }
+  .uc-list { margin: 0.3rem 0 0 1.1rem; padding: 0; font-size: 0.88rem; }
   .uc-list li { margin-bottom: 0.15rem; }
+  .uc-alert { border-left: 3px solid var(--danger); padding-left: 0.7rem; margin-top: 0.5rem; }
+  .uc-plan-grid {
+    display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 0.5rem; margin: 0.55rem 0;
+  }
+  .uc-plan-item { padding: 0.5rem 0.65rem; border-radius: 7px; background: rgba(148, 163, 184, 0.06); }
+  .uc-plan-item span { display: block; color: var(--text-muted); font-size: 0.75rem; }
+  .uc-plan-item strong { display: block; margin-top: 0.1rem; font-size: 0.88rem; }
   form.uc-inline { display: inline; }
   button.uc-btn {
     background: var(--accent-soft); color: var(--text-main); border: 1px solid var(--border-subtle);
     border-radius: 6px; padding: 0.4rem 0.9rem; font-size: 0.85rem; cursor: pointer;
   }
   button.uc-btn[disabled] { opacity: 0.5; cursor: not-allowed; }
-  .uc-console { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 22rem; overflow: auto; }
+  .uc-details { padding: 0; }
+  .uc-details > summary { cursor: pointer; padding: 0.7rem 1rem; font-weight: 600; font-size: 0.9rem; }
+  .uc-details-body { border-top: 1px solid var(--border-subtle); padding: 0.7rem 1rem 0.9rem; }
+  .uc-details h3 { margin: 0.7rem 0 0.25rem; font-size: 0.9rem; }
+  .uc-details h3:first-child { margin-top: 0; }
+  .uc-console { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 22rem; overflow: auto; font-size: 0.8rem; }
+  @media (max-width: 720px) {
+    .uc-heading { align-items: flex-start; }
+    .uc-summary-grid, .uc-plan-grid { grid-template-columns: 1fr; }
+  }
 </style>
 {% endblock %}
 
 {% block content %}
-<h1>Update Center</h1>
-<p class="uc-note">
-  Staff may review release and runtime state. Only a superuser can submit an
-  eligible plan to the separately installed, root-protected updater. The root
-  service recomputes authorization facts and may remain explicitly disarmed.
-</p>
+<div class="uc-page">
+  <header class="uc-heading">
+    <div>
+      <h1>Update Center</h1>
+      <p class="uc-note">Release updates for this station.</p>
+    </div>
+    <form class="uc-inline" method="post" action="{% url 'updatecenter:check-for-updates' %}">
+      {% csrf_token %}
+      <button class="uc-btn" type="submit">Check for Updates</button>
+    </form>
+  </header>
 
-<div class="uc-panel">
-  <h2>Installed Source</h2>
-  <div class="uc-row"><span class="k">Commit</span><span class="v">{{ checkout.short_commit|default:"unknown" }}</span></div>
-  <div class="uc-row"><span class="k">Full SHA</span><span class="v">{{ checkout.commit|default:"unknown" }}</span></div>
-  <div class="uc-row"><span class="k">Clean tree</span>
-    <span class="v">
-      {% if checkout.dirty is None %}unknown
-      {% elif checkout.dirty %}<span class="uc-badge dirty">dirty</span>
-      {% else %}<span class="uc-badge current">clean</span>{% endif %}
-    </span>
-  </div>
-</div>
-
-<div class="uc-panel">
-  <h2>Protected Updater</h2>
-  <div class="uc-safety {% if backend_readiness.ready %}schema_current{% else %}migration_state_indeterminate{% endif %}">
-    {% if backend_readiness.ready %}READY / ARMED{% else %}NOT READY{% endif %}
-  </div>
-  <p class="uc-note">{{ backend_readiness.detail }}</p>
-  <div class="uc-row"><span class="k">Reachable</span><span class="v">{{ backend_readiness.reachable|yesno:"yes,no" }}</span></div>
-  <div class="uc-row"><span class="k">Protocol compatible</span><span class="v">{{ backend_readiness.protocol_compatible|yesno:"yes,no" }}</span></div>
-  <div class="uc-row"><span class="k">Root execution armed</span><span class="v">{{ backend_readiness.execution_armed|yesno:"yes,no" }}</span></div>
-</div>
-
-<div class="uc-panel">
-  <h2>Running Software</h2>
-  {% for unit, info in version_lookup.items %}
-  <div class="uc-row">
-    <span class="k">{{ unit }}</span>
-    <span class="v">
-      {{ info.runtime_short|default:"unknown" }}
-      <span class="uc-badge {{ info.state }}">{{ info.state }}</span>
-    </span>
-  </div>
-  {% endfor %}
-</div>
-
-{% if not plan_error %}
-<div class="uc-panel">
-  <h2>Database Schema</h2>
-  <p class="uc-note">A separate signal from source/git state below -- a clean, current checkout does not by itself mean the database schema is current. See docs/UPDATE_CENTER.md.</p>
-  <div class="uc-safety {{ plan.schema_health_status }}">{{ plan.schema_health_status|upper }}</div>
-  <p class="uc-note">{{ plan.schema_health_detail }}</p>
-  {% if plan.schema_pending_migrations %}
-  <ul class="uc-list">{% for m in plan.schema_pending_migrations %}<li>{{ m }}</li>{% endfor %}</ul>
-  {% endif %}
-</div>
-{% endif %}
-
-<div class="uc-panel">
-  <h2>Available Update</h2>
-  {% if plan_error %}
-    <div class="uc-safety cross_check_failed">PLANNING FAILED</div>
-    <p class="uc-note">{{ plan_error }}</p>
-  {% else %}
-    <div class="uc-safety {{ plan.safety_status }}">{{ plan.safety_status|upper }}</div>
-    <p class="uc-note">{{ plan.safety_detail }}</p>
-    <div class="uc-row"><span class="k">Installed release</span><span class="v">{{ plan.installed_release_id|default:"unknown" }}</span></div>
-    <div class="uc-row"><span class="k">Latest known release</span><span class="v">{{ plan.target_release_id|default:"unknown" }}</span></div>
-    {% if plan.releases_in_plan %}
-    <div class="uc-row"><span class="k">Releases behind</span><span class="v">{{ plan.releases_in_plan|length }} ({{ plan.releases_in_plan|join:", " }})</span></div>
+  <section class="uc-hero {% if plan_error %}attention{% elif plan.safety_status == 'up_to_date' and backend_readiness.ready and plan.schema_health_status == 'schema_current' %}good{% elif plan.safety_status == 'ready_to_plan' %}update{% else %}attention{% endif %}">
+    {% if plan_error %}
+      <div class="uc-hero-title">Attention required</div>
+      <p class="uc-hero-copy">Update planning could not be completed.</p>
+    {% elif plan.safety_status == "up_to_date" and backend_readiness.ready and plan.schema_health_status == "schema_current" %}
+      <div class="uc-hero-title">✓ Up to date — {{ plan.installed_release_id|default:"unknown" }}</div>
+      <p class="uc-hero-copy">No updates are currently available.</p>
+    {% elif plan.safety_status == "ready_to_plan" %}
+      <div class="uc-hero-title">Update available — {{ plan.target_release_id|default:"unknown" }}</div>
+      <p class="uc-hero-copy">Review the installation summary and any warnings below.</p>
+    {% else %}
+      <div class="uc-hero-title">Attention required — {{ plan.installed_release_id|default:"release unknown" }}</div>
+      <p class="uc-hero-copy">IsadoraAir cannot safely install an update in the current state.</p>
     {% endif %}
-  {% endif %}
-  <form class="uc-inline" method="post" action="{% url 'updatecenter:check-for-updates' %}">
-    {% csrf_token %}
-    <button class="uc-btn" type="submit">Check for Updates</button>
-  </form>
-  <p class="uc-note">Performs a <code>git fetch</code> against <code>origin</code> only (remote-tracking refs, never the working tree) -- an explicit, deliberate action, not a side effect of loading this page.</p>
-</div>
 
-{% if not plan_error %}
-<div class="uc-panel">
-  <h2>Target Schema Validation</h2>
-  <p class="uc-note">Distinct from current database health: Phase A can show manifest-declared transition migrations, but only Phase B running against safely staged target source can validate the target Django migration graph.</p>
-  <div class="uc-safety {{ plan.target_schema_validation_status }}">{{ plan.target_schema_validation_status|upper }}</div>
-  <p class="uc-note">{{ plan.target_schema_validation_detail }}</p>
-</div>
-{% endif %}
+    <div class="uc-summary-grid">
+      <div class="uc-summary-item">
+        <div class="uc-summary-label">Current release</div>
+        <div class="uc-summary-value">{% if plan %}{{ plan.installed_release_id|default:"Unknown" }}{% else %}Unknown{% endif %}</div>
+      </div>
+      <div class="uc-summary-item">
+        <div class="uc-summary-label">Update service</div>
+        <div class="uc-summary-value {% if backend_readiness.ready %}uc-good{% else %}uc-danger{% endif %}">
+          {% if backend_readiness.ready %}Ready{% else %}Attention required{% endif %}
+        </div>
+      </div>
+    </div>
 
-{% if plan and plan.safety_status == "ready_to_plan" %}
-<div class="uc-panel">
-  <h2>Planned Actions</h2>
-  <div class="uc-row"><span class="k">Source update</span><span class="v">required ({{ plan.installed_commit|slice:":7" }} → {{ plan.target_commit|slice:":7" }})</span></div>
-  <div class="uc-row"><span class="k">Python requirements</span><span class="v">{{ plan.python_requirements_changed|yesno:"changed,unchanged" }}</span></div>
+    <div class="uc-actions">
+      <a class="uc-link" href="{% url 'monitoring:dashboard' %}">System monitoring</a>
+      <span class="uc-note">Service health, resource use, audio, encoder, transmitter, and runtime status</span>
+    </div>
+  </section>
 
-  <div class="uc-row"><span class="k">Manifest-declared transition migrations</span>
-    <span class="v">{% if plan.migrations.expected_transition_unapplied %}{{ plan.migrations.expected_transition_unapplied|length }} not currently recorded{% else %}none{% endif %}</span>
-  </div>
-  {% if plan.migrations.expected_transition_unapplied %}
-  <ul class="uc-list">{% for m in plan.migrations.expected_transition_unapplied %}<li>{{ m }}</li>{% endfor %}</ul>
-  <div class="uc-row"><span class="k">Migration compatibility</span><span class="v">{{ plan.migrations.compatibility }}</span></div>
-  {% endif %}
-  {% if plan.migrations.unknown_to_current_graph %}
-  <div class="uc-row"><span class="k">Not loadable from current graph</span><span class="v">{{ plan.migrations.unknown_to_current_graph|length }}</span></div>
-  <ul class="uc-list">{% for m in plan.migrations.unknown_to_current_graph %}<li>{{ m }}</li>{% endfor %}</ul>
+  {% if plan_error %}
+  <section class="uc-panel">
+    <h2 class="uc-danger">Update planning failed</h2>
+    <p class="uc-alert">{{ plan_error }}</p>
+  </section>
   {% endif %}
 
-  <div class="uc-row"><span class="k">Systemd definitions changed</span><span class="v">{{ plan.systemd_units_changed|length }}</span></div>
-  <div class="uc-row"><span class="k">New core units</span><span class="v">{{ plan.systemd_units_new_required|length }}</span></div>
-  {% if plan.systemd_units_new_optional %}
-  <div class="uc-row"><span class="k">Optional-unit notices</span><span class="v">{{ plan.systemd_units_new_optional|join:", " }} (not auto-installed)</span></div>
+  {% if not backend_readiness.ready %}
+  <section class="uc-panel">
+    <h2 class="uc-danger">Update service needs attention</h2>
+    <p class="uc-alert">{{ backend_readiness.detail }}</p>
+  </section>
   {% endif %}
-  <div class="uc-row"><span class="k">Static files / collectstatic</span><span class="v">{{ plan.collectstatic_required|yesno:"required,not required" }}</span></div>
-  <div class="uc-row"><span class="k">nginx</span><span class="v">{{ plan.nginx_changed|yesno:"changed,unchanged" }}</span></div>
-  <div class="uc-row"><span class="k">Service restarts required</span><span class="v">{{ plan.services_requiring_restart|join:", "|default:"none" }}</span></div>
-  {% if plan.apt_packages_new %}
-  <div class="uc-row"><span class="k">apt prerequisites</span><span class="v">{{ plan.apt_packages_new|join:", " }} (manual action required)</span></div>
-  {% endif %}
-  <p class="uc-note">This is a declarative action expectation from the release chain, cross-checked against target Git objects where Phase A can do so. It is not final target migration validation; Phase B must materialize target source and compare its real Django migration plan before execution.</p>
 
-  {% if update_eligible %}
-  <form method="post" action="{% url 'updatecenter:start-update' %}"
-        onsubmit="return window.confirm('Install {{ plan.target_release_id|escapejs }}? Service interruption is expected. There is no automatic rollback.');">
-    {% csrf_token %}
-    <input type="hidden" name="confirmed_target_release_id" value="{{ plan.target_release_id }}">
-    <input type="hidden" name="confirmed_plan_fingerprint" value="{{ plan.fingerprint }}">
-    <button class="uc-btn" type="submit">Install {{ plan.target_release_id }}</button>
-  </form>
-  <p class="uc-note">Confirmation covers {{ plan.installed_release_id }} → {{ plan.target_release_id }},
-    migrations shown above, collectstatic={{ plan.collectstatic_required|yesno:"yes,no" }}, and restarts:
-    {{ plan.services_requiring_restart|join:", "|default:"none" }}. The server recomputes the complete plan after confirmation.</p>
-  {% else %}
-  <p class="uc-note">Installation is blocked:</p>
-  <ul class="uc-list">{% for blocker in execution_blockers %}<li>{{ blocker }}</li>{% endfor %}</ul>
+  {% if plan and plan.schema_health_status != "schema_current" %}
+  <section class="uc-panel">
+    <h2 class="uc-danger">Database needs attention</h2>
+    <p class="uc-alert">{{ plan.schema_health_detail }}</p>
+    {% if plan.schema_pending_migrations %}
+    <ul class="uc-list">{% for migration in plan.schema_pending_migrations %}<li>{{ migration }}</li>{% endfor %}</ul>
+    {% endif %}
+  </section>
   {% endif %}
-</div>
-{% endif %}
 
-{% if shown_job %}
-<div class="uc-panel" id="uc-job" data-status-url="{% url 'updatecenter:job-status' shown_job.id %}">
-  <h2>Update Job</h2>
-  <div class="uc-row"><span class="k">Job</span><span class="v" id="uc-job-id">{{ shown_job.id }}</span></div>
-  <div class="uc-row"><span class="k">State</span><span class="v" id="uc-job-state">{{ shown_job.state }}</span></div>
-  <div class="uc-row"><span class="k">Current step</span><span class="v" id="uc-job-step">{{ shown_job.current_step }}</span></div>
-  <p class="uc-note" id="uc-job-detail">{{ shown_job.progress_detail }}</p>
-  <p class="uc-note" id="uc-job-backend">{% if reconciliation_error %}Backend temporarily unavailable: {{ reconciliation_error }}{% endif %}</p>
-  <pre class="uc-console" id="uc-job-log">{{ shown_job.completed_log_snapshot }}</pre>
-</div>
-<script>
-(() => {
-  const panel = document.getElementById('uc-job');
-  if (!panel) return;
-  let delay = 2000;
-  const write = (id, value) => { document.getElementById(id).textContent = value || ''; };
-  const poll = async () => {
-    try {
-      const response = await fetch(panel.dataset.statusUrl, {headers: {'Accept': 'application/json'}});
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      const data = await response.json();
-      write('uc-job-state', data.state);
-      write('uc-job-step', data.current_step);
-      write('uc-job-detail', data.failure_detail || data.progress_detail);
-      write('uc-job-backend', data.backend_temporarily_unavailable ? `Backend temporarily unavailable: ${data.backend_detail}` : '');
-      write('uc-job-log', data.log_tail);
-      delay = 2000;
-      if (data.terminal) return;
-    } catch (_error) {
-      write('uc-job-backend', 'Application or updater temporarily unavailable; polling will retry.');
-      delay = Math.min(delay * 2, 15000);
-    }
+  {% if plan and plan.safety_status != "up_to_date" and plan.safety_status != "ready_to_plan" %}
+  <section class="uc-panel">
+    <h2 class="uc-danger">Installation blocked</h2>
+    <p class="uc-alert">{{ plan.safety_detail }}</p>
+    {% if execution_blockers %}
+    <ul class="uc-list">{% for blocker in execution_blockers %}<li>{{ blocker }}</li>{% endfor %}</ul>
+    {% endif %}
+  </section>
+  {% endif %}
+
+  {% if plan and plan.safety_status == "ready_to_plan" %}
+  <section class="uc-panel">
+    <h2>{{ plan.installed_release_id }} → {{ plan.target_release_id }}</h2>
+    <div class="uc-plan-grid">
+      <div class="uc-plan-item">
+        <span>Database changes</span>
+        <strong>{% if not plan.migrations %}None{% elif plan.migrations.compatibility == "destructive" %}Manual handling required{% elif plan.migrations.expected_transition_unapplied %}Automatic{% else %}None pending{% endif %}</strong>
+      </div>
+      <div class="uc-plan-item">
+        <span>Dependencies / system packages</span>
+        <strong>{% if plan.python_requirements_changed or plan.apt_packages_new %}Attention required{% else %}None{% endif %}</strong>
+      </div>
+      <div class="uc-plan-item">
+        <span>Service restarts</span>
+        <strong>{{ operator_service_restarts|join:", "|default:"None" }}</strong>
+      </div>
+    </div>
+
+    {% if update_eligible %}
+    <form method="post" action="{% url 'updatecenter:start-update' %}"
+          onsubmit="return window.confirm('Install {{ plan.target_release_id|escapejs }}? Service interruption is expected. There is no automatic rollback.');">
+      {% csrf_token %}
+      <input type="hidden" name="confirmed_target_release_id" value="{{ plan.target_release_id }}">
+      <input type="hidden" name="confirmed_plan_fingerprint" value="{{ plan.fingerprint }}">
+      <button class="uc-btn" type="submit">Install {{ plan.target_release_id }}</button>
+    </form>
+    <p class="uc-note">The installation plan is verified again after confirmation. Service interruption is expected; automatic rollback is not available.</p>
+    {% else %}
+    <h3 class="uc-danger">Installation blocked</h3>
+    <ul class="uc-list">{% for blocker in execution_blockers %}<li>{{ blocker }}</li>{% endfor %}</ul>
+    {% endif %}
+
+    <details class="uc-details">
+      <summary>Technical update plan</summary>
+      <div class="uc-details-body">
+        <div class="uc-row"><span class="k">Source</span><span class="v">{{ plan.installed_commit|slice:":7" }} → {{ plan.target_commit|slice:":7" }}</span></div>
+        <div class="uc-row"><span class="k">Releases</span><span class="v">{{ plan.releases_in_plan|join:", " }}</span></div>
+        <div class="uc-row"><span class="k">Python requirements changed</span><span class="v">{{ plan.python_requirements_changed|yesno:"yes,no" }}</span></div>
+        <div class="uc-row"><span class="k">apt prerequisites</span><span class="v">{{ plan.apt_packages_new|join:", "|default:"none" }}</span></div>
+        <div class="uc-row"><span class="k">Systemd definitions changed</span><span class="v">{{ plan.systemd_units_changed|length }}</span></div>
+        <div class="uc-row"><span class="k">New core units</span><span class="v">{{ plan.systemd_units_new_required|length }}</span></div>
+        <div class="uc-row"><span class="k">Static files / collectstatic</span><span class="v">{{ plan.collectstatic_required|yesno:"required,not required" }}</span></div>
+        <div class="uc-row"><span class="k">nginx changed</span><span class="v">{{ plan.nginx_changed|yesno:"yes,no" }}</span></div>
+        <div class="uc-row"><span class="k">Service restart identities</span><span class="v">{{ plan.services_requiring_restart|join:", "|default:"none" }}</span></div>
+        <div class="uc-row"><span class="k">Plan fingerprint</span><span class="v">{{ plan.fingerprint }}</span></div>
+        {% if plan.migrations %}
+        <h3>Declared migrations</h3>
+        <ul class="uc-list">{% for migration in plan.migrations.explicitly_required %}<li>{{ migration }}</li>{% endfor %}</ul>
+        <div class="uc-row"><span class="k">Compatibility</span><span class="v">{{ plan.migrations.compatibility }}</span></div>
+        {% endif %}
+      </div>
+    </details>
+  </section>
+  {% endif %}
+
+  {% if shown_job and not shown_job_terminal %}
+  <section class="uc-panel" id="uc-job" data-status-url="{% url 'updatecenter:job-status' shown_job.id %}">
+    <h2>Update in progress — {{ shown_job.target_release_id }}</h2>
+    <div class="uc-row"><span class="k">Job</span><span class="v" id="uc-job-id">{{ shown_job.id }}</span></div>
+    <div class="uc-row"><span class="k">State</span><span class="v" id="uc-job-state">{{ shown_job.state }}</span></div>
+    <div class="uc-row"><span class="k">Current step</span><span class="v" id="uc-job-step">{{ shown_job.current_step }}</span></div>
+    <p class="uc-note" id="uc-job-detail">{{ shown_job.progress_detail }}</p>
+    <p class="uc-note" id="uc-job-backend">{% if reconciliation_error %}Backend temporarily unavailable: {{ reconciliation_error }}{% endif %}</p>
+    <pre class="uc-console" id="uc-job-log">{{ shown_job.completed_log_snapshot }}</pre>
+  </section>
+  <script>
+  (() => {
+    const panel = document.getElementById('uc-job');
+    if (!panel) return;
+    let delay = 2000;
+    const write = (id, value) => { document.getElementById(id).textContent = value || ''; };
+    const poll = async () => {
+      try {
+        const response = await fetch(panel.dataset.statusUrl, {headers: {'Accept': 'application/json'}});
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const data = await response.json();
+        write('uc-job-state', data.state);
+        write('uc-job-step', data.current_step);
+        write('uc-job-detail', data.failure_detail || data.progress_detail);
+        write('uc-job-backend', data.backend_temporarily_unavailable ? `Backend temporarily unavailable: ${data.backend_detail}` : '');
+        write('uc-job-log', data.log_tail);
+        delay = 2000;
+        if (data.terminal) return;
+      } catch (_error) {
+        write('uc-job-backend', 'Application or updater temporarily unavailable; polling will retry.');
+        delay = Math.min(delay * 2, 15000);
+      }
+      window.setTimeout(poll, delay);
+    };
     window.setTimeout(poll, delay);
-  };
-  window.setTimeout(poll, delay);
-})();
-</script>
-{% endif %}
+  })();
+  </script>
+  {% elif shown_job %}
+  <section class="uc-panel">
+    <h2>Last update</h2>
+    <div class="uc-row"><span class="k">Release</span><span class="v">{{ shown_job.installed_release_id }} → {{ shown_job.target_release_id }}</span></div>
+    <div class="uc-row"><span class="k">Result</span><span class="v {% if shown_job.state == 'succeeded' %}uc-good{% else %}uc-danger{% endif %}">{{ shown_job.get_state_display }}</span></div>
+    <div class="uc-row"><span class="k">Completed</span><span class="v">{{ shown_job.finished_at|default:shown_job.created_at|date:"Y-m-d H:i" }}</span></div>
+    {% if shown_job.state != "succeeded" %}
+    <p class="uc-alert">{{ shown_job.failure_detail|default:shown_job.progress_detail|default:"The update did not complete successfully. Review its details." }}</p>
+    {% endif %}
+    <details class="uc-details">
+      <summary>Last update details</summary>
+      <div class="uc-details-body">
+        <div class="uc-row"><span class="k">Job</span><span class="v">{{ shown_job.id }}</span></div>
+        <div class="uc-row"><span class="k">Final step</span><span class="v">{{ shown_job.current_step|default:"—" }}</span></div>
+        <pre class="uc-console">{{ shown_job.completed_log_snapshot }}</pre>
+      </div>
+    </details>
+  </section>
+  {% endif %}
+
+  <details class="uc-details">
+    <summary>Technical details</summary>
+    <div class="uc-details-body">
+      <h3>Checkout</h3>
+      <div class="uc-row"><span class="k">Commit</span><span class="v">{{ checkout.short_commit|default:"unknown" }}</span></div>
+      <div class="uc-row"><span class="k">Full SHA</span><span class="v">{{ checkout.commit|default:"unknown" }}</span></div>
+      <div class="uc-row"><span class="k">Working tree</span><span class="v">{% if checkout.dirty is None %}unknown{% elif checkout.dirty %}dirty{% else %}clean{% endif %}</span></div>
+
+      <h3>Protected update service</h3>
+      <div class="uc-row"><span class="k">Reachable</span><span class="v">{{ backend_readiness.reachable|yesno:"yes,no" }}</span></div>
+      <div class="uc-row"><span class="k">Protocol compatible</span><span class="v">{{ backend_readiness.protocol_compatible|yesno:"yes,no" }}</span></div>
+      <div class="uc-row"><span class="k">Protected runtime valid</span><span class="v">{{ backend_readiness.protected_runtime_valid|yesno:"yes,no" }}</span></div>
+      <div class="uc-row"><span class="k">Configuration valid</span><span class="v">{{ backend_readiness.config_valid|yesno:"yes,no" }}</span></div>
+      <div class="uc-row"><span class="k">Trusted repository ready</span><span class="v">{{ backend_readiness.trusted_repository_ready|yesno:"yes,no" }}</span></div>
+      <div class="uc-row"><span class="k">Execution armed</span><span class="v">{{ backend_readiness.execution_armed|yesno:"yes,no" }}</span></div>
+      <p class="uc-note">{{ backend_readiness.detail }}</p>
+
+      {% if plan %}
+      <h3>Database and planner</h3>
+      <div class="uc-row"><span class="k">Planner state</span><span class="v">{{ plan.safety_status }}</span></div>
+      <div class="uc-row"><span class="k">Current schema</span><span class="v">{{ plan.schema_health_status }}</span></div>
+      <p class="uc-note">{{ plan.schema_health_detail }}</p>
+      <div class="uc-row"><span class="k">Target schema validation</span><span class="v">{{ plan.target_schema_validation_status }}</span></div>
+      <p class="uc-note">{{ plan.target_schema_validation_detail }}</p>
+      {% endif %}
+    </div>
+  </details>
+</div>
 {% endblock %}

@@ -94,6 +94,24 @@ class ValidManifestsTests(SimpleTestCase):
         self.assertEqual(parsed.services_requiring_restart, ("isadoraair-gunicorn",))
         self.assertFalse(parsed.collectstatic_required)
 
+    def test_actual_r0005_manifest_is_low_risk_and_automatic(self):
+        path = Path(__file__).resolve().parents[2] / "deploy" / "releases" / "r0005.json"
+        parsed = m.validate_manifest_dict(
+            json.loads(path.read_text(encoding="utf-8")), source_label="r0005.json",
+        )
+        self.assertEqual(parsed.previous_release_id, "r0004")
+        self.assertEqual(parsed.minimum_updater_protocol_version, 3)
+        self.assertEqual(parsed.migrations_required, ())
+        self.assertIsNone(parsed.migration_compatibility)
+        self.assertFalse(parsed.manual_bootstrap_required)
+        self.assertFalse(parsed.python_requirements_changed)
+        self.assertEqual(parsed.apt_packages_new, ())
+        self.assertEqual(parsed.systemd_units_changed, ())
+        self.assertEqual(parsed.services_requiring_restart, ("isadoraair-gunicorn",))
+        self.assertFalse(parsed.nginx_changed)
+        self.assertFalse(parsed.runtime_components_changed)
+        self.assertEqual(parsed.minimum_supported_release_id, "r0004")
+
     def test_valid_followup_parses(self):
         parsed = m.validate_manifest_dict(_valid_followup())
         self.assertFalse(parsed.is_bootstrap)

@@ -512,7 +512,10 @@ stop timeout.
 
 Authoritative state is atomic mode-0600 JSON under
 `/var/lib/isadoraair-updater/jobs/`; logs are append-only mode-0600 files under
-`/var/log/isadoraair-updater/jobs/`. A daemon-wide filesystem lock prevents two
+`/var/lib/isadoraair-updater/logs/`. Keeping both roots beneath the root-owned
+`/var/lib/isadoraair-updater/` state directory satisfies the protected-parent
+policy; `/var/log` is group-writable by `syslog` on Ubuntu and is therefore not
+an acceptable parent for this runtime. A daemon-wide filesystem lock prevents two
 updater daemons. At most one active job is accepted. Starting the same UUID with
 identical authorization facts is idempotent; reusing it with different facts or
 starting a different concurrent job is rejected. Safe completed milestones are
@@ -786,14 +789,34 @@ sudo install -o root -g root -m 0600 /path/to/reviewed-station.json /etc/isadora
 
 # Render only the known user token without root, review, then install.
 sed -e "s|@@ISA_USER@@|$ISA_USER|g" -e "s|@@ISA_ROOT@@|$ISA_ROOT|g" \
-  "$UPDATER_STAGE/deploy/isadoraair-updater.service" > "$UPDATER_STAGE/isadoraair-updater.service.rendered"
-systemd-analyze verify "$UPDATER_STAGE/isadoraair-updater.service.rendered"
-sudo install -o root -g root -m 0644 "$UPDATER_STAGE/isadoraair-updater.service.rendered" \
+  "$UPDATER_STAGE/deploy/isadoraair-updater.service" > "$UPDATER_STAGE/isadoraair-updater.service"
+systemd-analyze verify "$UPDATER_STAGE/isadoraair-updater.service"
+sudo install -o root -g root -m 0644 "$UPDATER_STAGE/isadoraair-updater.service" \
   /etc/systemd/system/isadoraair-updater.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now isadoraair-updater.service
-/usr/bin/python3 -I /usr/local/libexec/isadoraair-updater/updaterctl.py ping
+
+# The socket is created asynchronously after systemd starts the service. Poll
+# for at most 30 seconds instead of treating a harmless startup race as failure.
+(
+  updater_ready=false
+  for attempt in $(seq 1 30); do
+    if /usr/bin/python3 -I /usr/local/libexec/isadoraair-updater/updaterctl.py ping; then
+      updater_ready=true
+      break
+    fi
+    sleep 1
+  done
+  if [ "$updater_ready" = true ]; then
+    echo "Updater readiness check succeeded"
+  else
+    echo "Updater did not become ready within 30 seconds" >&2
+    exit 1
+  fi
+)
 ```
+
+Do not continue unless this check succeeds.
 
 The PING must show protocol 3, protected/config/repository readiness, and
 `update_execution_enabled: false`. Only then manually fast-forward the reviewed
@@ -802,6 +825,35 @@ application source to r0004, apply `updatecenter.0002_alter_updatejob_state` and
 procedure, restart Gunicorn, and verify `/healthz/`, `/updates/`, hardware mixer
 persistence, AudioPipeline restart, RBDS topology restart, and each allowed
 monitoring restart.
+
+After restarting Gunicorn, use a bounded readiness check before continuing:
+
+```bash
+(
+  gunicorn_ready=false
+  for attempt in $(seq 1 30); do
+    if curl --fail --silent --show-error http://127.0.0.1:8000/healthz/ >/dev/null 2>&1; then
+      gunicorn_ready=true
+      break
+    fi
+    sleep 1
+  done
+  if [ "$gunicorn_ready" = true ]; then
+    echo "Gunicorn readiness check succeeded"
+  else
+    echo "Gunicorn /healthz/ did not become ready within 30 seconds" >&2
+    exit 1
+  fi
+)
+```
+
+Do not continue unless this check succeeds.
+
+The shipped service definition still contains now-redundant
+`LogsDirectory=/var/log/isadoraair-updater` and `/var/log/isadoraair-updater`
+`ReadWritePaths` entries. Removing those protected-unit allowances is deliberately
+deferred to a separately reviewed updater-runtime/systemd release; r0005 does not
+modify or claim a systemd-unit change.
 
 Next remove the historical unrestricted sudo grant manually. Do not use
 `sudo -n true` as proof because a credential timestamp can mislead. Inspect the

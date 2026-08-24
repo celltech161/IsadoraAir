@@ -366,6 +366,26 @@ class HealthContractTests(TestCase):
         config = json.loads((root / "deploy" / "updater-station.example.json").read_text())
         self.assertEqual(config["gunicorn_health_url"], "http://127.0.0.1:8000/healthz/")
 
+    def test_shipped_log_root_has_only_root_protected_parents(self):
+        root = Path(__file__).resolve().parents[2]
+        config = json.loads((root / "deploy" / "updater-station.example.json").read_text())
+        self.assertEqual(config["logs_root"], "/var/lib/isadoraair-updater/logs")
+
+    def test_bootstrap_runbook_uses_bounded_readiness_polling(self):
+        root = Path(__file__).resolve().parents[2]
+        runbook = (root / "docs" / "UPDATE_CENTER.md").read_text(encoding="utf-8")
+        self.assertIn("for attempt in $(seq 1 30)", runbook)
+        self.assertIn("Updater did not become ready within 30 seconds", runbook)
+        self.assertIn("Gunicorn /healthz/ did not become ready within 30 seconds", runbook)
+        self.assertIn("(\n  updater_ready=false", runbook)
+        self.assertIn("(\n  gunicorn_ready=false", runbook)
+        self.assertEqual(runbook.count("Do not continue unless this check succeeds."), 2)
+        self.assertNotIn("isadoraair-updater.service.rendered", runbook)
+        self.assertIn(
+            'systemd-analyze verify "$UPDATER_STAGE/isadoraair-updater.service"',
+            runbook,
+        )
+
 
 class NavSeedTests(TestCase):
     def setUp(self):

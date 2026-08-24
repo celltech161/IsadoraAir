@@ -1,5 +1,6 @@
 """/updates/ permission + side-effect tests -- [P0] 1.1 Phase A."""
 import json
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from django.contrib.auth.models import User
@@ -7,7 +8,54 @@ from django.test import Client, TestCase, override_settings
 from django.urls import NoReverseMatch, reverse
 
 from updatecenter import views as uc_views
+from updatecenter.models import UpdateJob, UpdateJobState
 from .gitfixtures import FakeRepo
+
+
+READY_BACKEND = {
+    "reachable": True,
+    "protocol_compatible": True,
+    "protected_runtime_valid": True,
+    "config_valid": True,
+    "trusted_repository_ready": True,
+    "execution_armed": True,
+    "ready": True,
+    "detail": "Protected updater is reachable, compatible, ready, and armed.",
+}
+
+
+def _operator_plan(**changes):
+    values = {
+        "safety_status": "up_to_date",
+        "safety_detail": "Installed source is already the latest declared release.",
+        "installed_release_id": "r0004",
+        "installed_commit": "a" * 40,
+        "target_release_id": "r0004",
+        "target_commit": "a" * 40,
+        "releases_in_plan": (),
+        "migrations": None,
+        "python_requirements_changed": False,
+        "apt_packages_new": (),
+        "systemd_units_changed": (),
+        "systemd_units_new_required": (),
+        "systemd_units_new_optional": (),
+        "systemd_units_removed_or_renamed": (),
+        "collectstatic_required": False,
+        "services_requiring_restart": (),
+        "nginx_changed": False,
+        "runtime_components_changed": False,
+        "minimum_updater_protocol_version": 3,
+        "manual_bootstrap_required": False,
+        "cross_check_findings": (),
+        "fingerprint": "f" * 64,
+        "schema_health_status": "schema_current",
+        "schema_pending_migrations": (),
+        "schema_health_detail": "Database schema is current.",
+        "target_schema_validation_status": "not_applicable_no_target_transition",
+        "target_schema_validation_detail": "No target transition exists.",
+    }
+    values.update(changes)
+    return SimpleNamespace(**values)
 
 
 def _write_bootstrap_manifest(repo):
@@ -128,6 +176,7 @@ class GetHasNoSideEffectTests(TestCase):
 class DashboardContentTests(TestCase):
     def setUp(self):
         self.staff_user = User.objects.create_user("staffuser", password="x", is_staff=True)
+        self.superuser = User.objects.create_superuser("rootuser", password="x")
         self.client_ = Client()
         self.client_.force_login(self.staff_user)
 
@@ -135,19 +184,149 @@ class DashboardContentTests(TestCase):
         with FakeRepo() as repo:
             releases_dir = _write_bootstrap_manifest(repo)
             with patch.object(uc_views, "CHECKOUT_ROOT", repo.work), \
-                 patch.object(uc_views, "RELEASES_DIRNAME", "deploy/releases"):
+                 patch.object(uc_views, "RELEASES_DIRNAME", "deploy/releases"), \
+                 patch("updatecenter.views._backend_readiness", return_value=READY_BACKEND):
                 resp = self.client_.get(reverse("updatecenter:dashboard"))
                 self.assertEqual(resp.status_code, 200)
                 body = resp.content.decode()
-                self.assertIn("UP_TO_DATE", body)
-                for heading in (
-                    "Installed Source", "Running Software", "Database Schema",
-                    "Available Update", "Target Schema Validation",
-                ):
-                    self.assertIn(heading, body)
-                self.assertIn("NOT_APPLICABLE_NO_TARGET_TRANSITION", body)
+                self.assertIn("Up to date — r0001", body)
+                self.assertIn("Current release", body)
+                self.assertIn("Update service", body)
+                self.assertIn("Ready", body)
+                self.assertIn("Check for Updates", body)
+                self.assertIn("Technical details", body)
+                self.assertIn(f'href="{reverse("monitoring:dashboard")}"', body)
+                self.assertIn("System monitoring", body)
+                self.assertNotIn("Installed Source", body)
+                self.assertNotIn("Running Software", body)
+                primary = body.split('<details class="uc-details">', 1)[0]
+                self.assertNotIn("Plan fingerprint", primary)
+                self.assertNotIn("Target schema validation", primary)
                 self.assertNotIn("Roll Back", body)
                 self.assertNotIn("Rollback", body)
+
+    def test_update_service_failures_remain_immediately_actionable(self):
+        states = (
+            "Protected updater is unavailable.",
+            "Protected updater is reachable but root execution is disarmed.",
+            "Protected updater protocol is incompatible; manual helper upgrade required.",
+        )
+        for detail in states:
+            with self.subTest(detail=detail), \
+                 patch("updatecenter.views.planner.build_plan", return_value=_operator_plan()), \
+                 patch("updatecenter.views._backend_readiness", return_value={
+                     **READY_BACKEND, "ready": False, "detail": detail,
+                 }):
+                body = self.client_.get(reverse("updatecenter:dashboard")).content.decode()
+            self.assertIn("Update service needs attention", body)
+            self.assertIn(detail, body)
+            self.assertIn("Attention required", body)
+
+    def test_schema_problems_remain_visible_and_blocking(self):
+        for state in (
+            "schema_drift_detected",
+            "unapplied_migrations_detected",
+            "migration_state_indeterminate",
+        ):
+            detail = f"Database problem: {state}"
+            plan = _operator_plan(
+                schema_health_status=state,
+                schema_health_detail=detail,
+                schema_pending_migrations=("library.9999_example",),
+            )
+            with self.subTest(state=state), \
+                 patch("updatecenter.views.planner.build_plan", return_value=plan), \
+                 patch("updatecenter.views._backend_readiness", return_value=READY_BACKEND):
+                body = self.client_.get(reverse("updatecenter:dashboard")).content.decode()
+            self.assertIn("Database needs attention", body)
+            self.assertIn(detail, body)
+            self.assertIn("library.9999_example", body)
+
+    def test_update_available_is_concise_and_install_uses_existing_eligibility(self):
+        plan = _operator_plan(
+            safety_status="ready_to_plan",
+            safety_detail="One release is available.",
+            target_release_id="r0005",
+            target_commit="b" * 40,
+            releases_in_plan=("r0005",),
+            services_requiring_restart=("isadoraair-gunicorn",),
+            target_schema_validation_status="target_schema_plan_validation_pending",
+            target_schema_validation_detail="Root will validate the target graph.",
+        )
+        root_client = Client()
+        root_client.force_login(self.superuser)
+        patches = (
+            patch("updatecenter.views.planner.build_plan", return_value=plan),
+            patch("updatecenter.views._backend_readiness", return_value=READY_BACKEND),
+        )
+        with patches[0], patches[1]:
+            body = root_client.get(reverse("updatecenter:dashboard")).content.decode()
+        self.assertIn("Update available — r0005", body)
+        self.assertIn("r0004 → r0005", body)
+        self.assertIn("Database changes", body)
+        self.assertIn("Dependencies / system packages", body)
+        primary_summary, technical_plan = body.split("<summary>Technical update plan</summary>", 1)
+        self.assertIn("Web interface", primary_summary)
+        self.assertNotIn("isadoraair-gunicorn", primary_summary)
+        self.assertIn("isadoraair-gunicorn", technical_plan)
+        self.assertIn(">Install r0005</button>", body)
+        self.assertIn("Technical update plan", body)
+
+        with patch("updatecenter.views.planner.build_plan", return_value=plan), \
+             patch("updatecenter.views._backend_readiness", return_value=READY_BACKEND):
+            staff_body = self.client_.get(reverse("updatecenter:dashboard")).content.decode()
+        self.assertNotIn(">Install r0005</button>", staff_body)
+        self.assertIn("Only a superuser may start an update.", staff_body)
+
+    def test_known_restart_services_have_operator_labels(self):
+        plan = _operator_plan(services_requiring_restart=(
+            "isadoraair-gunicorn", "isadoraair-engine", "isadoraair-monitoring",
+            "isadoraair-encoders", "isadoraair-rbds",
+        ))
+        self.assertEqual(
+            uc_views._operator_service_restart_labels(plan),
+            ("Web interface", "Audio engine", "Monitoring", "Stream encoders", "RBDS"),
+        )
+
+    def test_active_job_keeps_progress_and_polling(self):
+        job = UpdateJob.objects.create(
+            initiated_by_username="rootuser", installed_release_id="r0004",
+            target_release_id="r0005", installed_commit="a" * 40,
+            target_commit="b" * 40, state=UpdateJobState.RUNNING,
+            active_lock=1, current_step="target_staged", progress_detail="Installing safely",
+        )
+        with patch("updatecenter.views.planner.build_plan", return_value=_operator_plan()), \
+             patch("updatecenter.views._backend_readiness", return_value=READY_BACKEND), \
+             patch("updatecenter.views._refresh_job", return_value=(job, None)):
+            body = self.client_.get(reverse("updatecenter:dashboard")).content.decode()
+        self.assertIn("Update in progress — r0005", body)
+        self.assertIn("target_staged", body)
+        self.assertIn("data-status-url", body)
+        self.assertIn("window.setTimeout(poll, delay)", body)
+
+    def test_completed_job_is_compact_and_failure_stays_visible(self):
+        completed = UpdateJob.objects.create(
+            initiated_by_username="rootuser", installed_release_id="r0004",
+            target_release_id="r0005", installed_commit="a" * 40,
+            target_commit="b" * 40, state=UpdateJobState.SUCCEEDED,
+            completed_log_snapshot="completed log details",
+        )
+        with patch("updatecenter.views.planner.build_plan", return_value=_operator_plan()), \
+             patch("updatecenter.views._backend_readiness", return_value=READY_BACKEND):
+            body = self.client_.get(reverse("updatecenter:dashboard")).content.decode()
+        self.assertIn("Last update", body)
+        self.assertIn("Last update details", body)
+        self.assertIn("completed log details", body)
+        self.assertNotIn("data-status-url", body)
+
+        completed.state = UpdateJobState.FAILED
+        completed.failure_detail = "Postflight health check failed"
+        completed.save(update_fields=["state", "failure_detail"])
+        with patch("updatecenter.views.planner.build_plan", return_value=_operator_plan()), \
+             patch("updatecenter.views._backend_readiness", return_value=READY_BACKEND):
+            failed_body = self.client_.get(reverse("updatecenter:dashboard")).content.decode()
+        visible_summary = failed_body.split("<summary>Last update details</summary>", 1)[0]
+        self.assertIn("Postflight health check failed", visible_summary)
 
     def test_no_secrets_leaked_in_rendered_page(self):
         """Not an exhaustive secret scan -- a direct check that this
@@ -155,7 +334,8 @@ class DashboardContentTests(TestCase):
         with FakeRepo() as repo:
             releases_dir = _write_bootstrap_manifest(repo)
             with patch.object(uc_views, "CHECKOUT_ROOT", repo.work), \
-                 patch.object(uc_views, "RELEASES_DIRNAME", "deploy/releases"):
+                 patch.object(uc_views, "RELEASES_DIRNAME", "deploy/releases"), \
+                 patch("updatecenter.views._backend_readiness", return_value=READY_BACKEND):
                 resp = self.client_.get(reverse("updatecenter:dashboard"))
                 body = resp.content.decode()
                 from django.conf import settings
