@@ -19,11 +19,12 @@ class ConfigError(ValueError):
 _NAME = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
 _BRANCH = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$")
 _DB_NAME = re.compile(r"^[A-Za-z0-9_.-]{1,63}$")
+_SYSTEMD_UNIT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.@-]{0,98}\.service$")
 _RENDER_KEYS = frozenset({
     "isa_user", "isa_root", "isa_home", "syndicated_root",
     "weather_root", "ogremote_root",
 })
-_FIELDS = frozenset({
+_REQUIRED_FIELDS = frozenset({
     "schema_version", "trusted_repository_url", "trusted_branch",
     "application_root", "application_user", "application_group",
     "application_environment_file", "trusted_repository", "jobs_root",
@@ -31,6 +32,8 @@ _FIELDS = frozenset({
     "systemd_unit_root", "render_values", "database",
     "gunicorn_health_url",
 })
+_OPTIONAL_FIELDS = frozenset({"update_execution_enabled", "operator_restart_units"})
+_FIELDS = _REQUIRED_FIELDS | _OPTIONAL_FIELDS
 _DB_FIELDS = frozenset({"name", "user", "host", "port", "pgpass_file"})
 
 
@@ -61,6 +64,8 @@ class StationConfig:
     render_values: dict[str, str]
     database: DatabaseConfig
     gunicorn_health_url: str
+    update_execution_enabled: bool
+    operator_restart_units: tuple[str, ...]
 
     @property
     def application_python(self) -> Path:
@@ -115,11 +120,23 @@ def validate_config_dict(data: dict, *, allow_local_repository: bool = False) ->
     if not isinstance(data, dict):
         raise ConfigError("station configuration must be a JSON object")
     unknown = set(data) - _FIELDS
-    missing = _FIELDS - set(data)
+    missing = _REQUIRED_FIELDS - set(data)
     if unknown or missing:
         raise ConfigError(f"station configuration fields mismatch; unknown={sorted(unknown)!r}, missing={sorted(missing)!r}")
     if data["schema_version"] != 1 or isinstance(data["schema_version"], bool):
         raise ConfigError("schema_version must be exactly 1")
+
+    execution_enabled = data.get("update_execution_enabled", False)
+    if not isinstance(execution_enabled, bool):
+        raise ConfigError("update_execution_enabled must be a boolean")
+    restart_units = data.get("operator_restart_units", [])
+    if (not isinstance(restart_units, list)
+            or any(not isinstance(unit, str) or not _SYSTEMD_UNIT.fullmatch(unit) for unit in restart_units)
+            or len(restart_units) != len(set(restart_units))
+            or len(restart_units) > 32):
+        raise ConfigError(
+            "operator_restart_units must be a duplicate-free list of at most 32 exact .service names"
+        )
 
     branch = _plain_string(data["trusted_branch"], "trusted_branch", maximum=128)
     if not _BRANCH.fullmatch(branch) or ".." in branch or branch.endswith("/") or branch.startswith("/"):
@@ -212,6 +229,8 @@ def validate_config_dict(data: dict, *, allow_local_repository: bool = False) ->
         render_values=normalized_renders,
         database=DatabaseConfig(db_name, db_user, db_host, db_port, pgpass_path),
         gunicorn_health_url=health_url,
+        update_execution_enabled=execution_enabled,
+        operator_restart_units=tuple(restart_units),
     )
 
 

@@ -476,5 +476,6 @@ def dataclass_to_dict(plan: TrustedPlan) -> dict:
         "nginx_changed": plan.nginx_changed,
         "runtime_components_changed": plan.runtime_components_changed,
         "minimum_updater_protocol_version": plan.minimum_updater_protocol_version,
+        "manual_bootstrap_required": plan.manual_bootstrap_required,
         "fingerprint": plan.fingerprint,
     }

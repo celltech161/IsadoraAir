@@ -24,7 +24,8 @@ def trusted_plan(**changes):
         systemd_units_new_optional=(), systemd_units_removed_or_renamed=(),
         collectstatic_required=False, services_requiring_restart=("isadoraair-engine",),
         nginx_changed=False, runtime_components_changed=False,
-        minimum_updater_protocol_version=1, fingerprint="f" * 64,
+        minimum_updater_protocol_version=1, manual_bootstrap_required=False,
+        fingerprint="f" * 64,
     )
     data.update(changes)
     return TrustedPlan(**data)

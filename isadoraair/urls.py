@@ -4,6 +4,7 @@ from django.contrib.auth.decorators import login_not_required
 from django.urls import include, path
 
 from library.auth_forms import InviteCapablePasswordResetForm
+from isadoraair.health import healthz
 
 # Password-reset flow. All four views must bypass LoginRequiredMiddleware
 # (that's the whole point -- these are for people who can't sign in) via
@@ -16,6 +17,7 @@ from library.auth_forms import InviteCapablePasswordResetForm
 # is every account created via the admin's no-password add-user form
 # (see library/admin.py) until they've completed their first setup.
 urlpatterns = [
+    path('healthz/', healthz, name='healthz'),
     path('admin/', admin.site.urls),
     path('login/', auth_views.LoginView.as_view(template_name='registration/login.html'), name='login'),
     path('logout/', auth_views.LogoutView.as_view(), name='logout'),

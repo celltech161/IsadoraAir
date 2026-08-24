@@ -1,10 +1,15 @@
-"""Django audit-mirror/submission primitives; intentionally not wired to HTTP."""
+"""Django audit-mirror, idempotent submission, and reconciliation primitives."""
 from __future__ import annotations
 
 from django.db import IntegrityError, transaction
 from django.utils import timezone
 
-from .backend_client import UpdaterClient
+from .backend_client import (
+    BackendError,
+    BackendRejectedError,
+    BackendTransportError,
+    UpdaterClient,
+)
 from .models import UpdateJob, UpdateJobState
 from .planner import Plan, SafetyStatus
 
@@ -28,7 +33,7 @@ def create_job(*, plan: Plan, user) -> UpdateJob:
             target_commit=plan.target_commit,
             state=UpdateJobState.PLANNED,
             current_step="awaiting_backend_submission",
-            progress_detail="Prepared for protected-backend submission; no HTTP execution path exists.",
+            progress_detail="Prepared for one narrow protected-backend submission.",
             plan_snapshot=plan.to_serializable(),
             plan_fingerprint=plan.fingerprint,
             active_lock=1,
@@ -38,25 +43,110 @@ def create_job(*, plan: Plan, user) -> UpdateJob:
 
 
 def submit_job(job: UpdateJob, *, client: UpdaterClient | None = None) -> dict:
-    if job.state not in {UpdateJobState.PLANNED, UpdateJobState.RUNNING} or job.active_lock != 1:
+    if job.state not in {
+        UpdateJobState.PLANNED,
+        UpdateJobState.RUNNING,
+        UpdateJobState.SUBMISSION_UNCERTAIN,
+    } or job.active_lock != 1:
         raise JobSubmissionError("job is not eligible for protected-backend submission")
     backend = client or UpdaterClient()
-    response = backend.start_update(
-        job_id=job.id, target_release_id=job.target_release_id,
-        plan_fingerprint=job.plan_fingerprint,
+    arguments = {
+        "job_id": job.id,
+        "target_release_id": job.target_release_id,
+        "plan_fingerprint": job.plan_fingerprint,
+    }
+
+    # One retry with the SAME UUID resolves both common transport races:
+    # never-delivered requests are submitted, and accepted-but-response-lost
+    # requests are acknowledged idempotently by the root store.
+    for attempt in range(2):
+        try:
+            response = backend.start_update(**arguments)
+        except BackendRejectedError:
+            # A negative START_UPDATE response is not proof that durable root
+            # acceptance did not already happen. JobStore.accept() publishes
+            # state before later durability work such as its audit-log append,
+            # so every generic refusal must be resolved through root status.
+            break
+        except BackendTransportError:
+            if attempt == 0:
+                continue
+            break
+        else:
+            _mark_accepted(job)
+            return response
+
+    # A status response is root truth. Only the precise root-side "does not
+    # exist" result proves that neither same-ID submission was accepted.
+    try:
+        response = backend.get_job_status(job.id)
+    except BackendRejectedError as exc:
+        if exc.error_code == "JobError" and str(exc) == "job does not exist":
+            _mark_definitely_not_accepted(job, "Protected updater proved the job was never accepted.")
+            raise JobSubmissionError("protected updater proved the job was never accepted") from exc
+        _mark_submission_uncertain(job)
+        return {"ok": False, "submission_uncertain": True}
+    except BackendError:
+        _mark_submission_uncertain(job)
+        return {"ok": False, "submission_uncertain": True}
+
+    _reconcile_response(job, response, backend=backend)
+    return {"ok": True, "reconciled_after_uncertain_submission": True}
+
+
+def _mark_accepted(job: UpdateJob):
+    if job.state == UpdateJobState.RUNNING:
+        return
+    job.state = UpdateJobState.RUNNING
+    job.started_at = job.started_at or timezone.now()
+    job.current_step = "submitted_to_protected_backend"
+    job.progress_detail = (
+        "Accepted by the protected updater; root independently revalidates every authorization fact."
     )
-    if job.state != UpdateJobState.RUNNING:
-        job.state = UpdateJobState.RUNNING
-        job.started_at = timezone.now()
-        job.current_step = "submitted_to_protected_backend"
-        job.progress_detail = "Accepted by the protected updater; root independently revalidates every authorization fact."
-        job.save(update_fields=["state", "started_at", "current_step", "progress_detail"])
-    return response
+    job.save(update_fields=["state", "started_at", "current_step", "progress_detail"])
+
+
+def _mark_submission_uncertain(job: UpdateJob):
+    job.state = UpdateJobState.SUBMISSION_UNCERTAIN
+    job.current_step = "submission_status_unknown"
+    job.progress_detail = (
+        "The protected updater response was unavailable. The active lock remains held "
+        "until root truth can be reconciled."
+    )
+    job.save(update_fields=["state", "current_step", "progress_detail"])
+
+
+def _mark_definitely_not_accepted(job: UpdateJob, detail: str):
+    job.state = UpdateJobState.FAILED
+    job.current_step = "submission_rejected"
+    job.progress_detail = "The protected updater definitively rejected this submission."
+    job.failure_classification = "SUBMISSION_REJECTED"
+    job.failure_detail = str(detail)[:10000]
+    job.finished_at = timezone.now()
+    job.active_lock = None
+    job.save(update_fields=[
+        "state", "current_step", "progress_detail", "failure_classification",
+        "failure_detail", "finished_at", "active_lock",
+    ])
 
 
 def reconcile_job(job: UpdateJob, *, client: UpdaterClient | None = None) -> UpdateJob:
     backend = client or UpdaterClient()
-    response = backend.get_job_status(job.id)
+    try:
+        response = backend.get_job_status(job.id)
+    except BackendRejectedError as exc:
+        if (job.state in {UpdateJobState.PLANNED, UpdateJobState.SUBMISSION_UNCERTAIN}
+                and exc.error_code == "JobError"
+                and str(exc) == "job does not exist"):
+            _mark_definitely_not_accepted(
+                job, "Protected updater proved the uncertain job was never accepted."
+            )
+            return job
+        raise
+    return _reconcile_response(job, response, backend=backend)
+
+
+def _reconcile_response(job: UpdateJob, response: dict, *, backend: UpdaterClient) -> UpdateJob:
     root_job = response.get("job")
     if not isinstance(root_job, dict) or root_job.get("job_id") != str(job.id):
         raise JobSubmissionError("protected backend returned the wrong job identity")
@@ -84,6 +174,11 @@ def reconcile_job(job: UpdateJob, *, client: UpdaterClient | None = None) -> Upd
     if terminal:
         job.finished_at = timezone.now()
         job.active_lock = None
-        job.completed_log_snapshot = backend.get_job_log(job.id, max_bytes=65536)
+        try:
+            job.completed_log_snapshot = backend.get_job_log(job.id, max_bytes=65536)
+        except BackendError:
+            # Terminal root state is sufficient to release the concurrency
+            # lock. A transient log-tail failure must not fabricate activity.
+            pass
     job.save()
     return job

@@ -53,17 +53,17 @@
     background: var(--accent-soft); color: var(--text-main); border: 1px solid var(--border-subtle);
     border-radius: 6px; padding: 0.4rem 0.9rem; font-size: 0.85rem; cursor: pointer;
   }
+  button.uc-btn[disabled] { opacity: 0.5; cursor: not-allowed; }
+  .uc-console { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 22rem; overflow: auto; }
 </style>
 {% endblock %}
 
 {% block content %}
 <h1>Update Center</h1>
 <p class="uc-note">
-  Read-only, Phase A. There is no "Update IsadoraAir" action yet -- this
-  page shows installed source, running-software version skew, and (if
-  a release chain is available and safe to plan) what a future update
-  would do. Nothing on this page changes the checkout, the database,
-  systemd, or any running service.
+  Staff may review release and runtime state. Only a superuser can submit an
+  eligible plan to the separately installed, root-protected updater. The root
+  service recomputes authorization facts and may remain explicitly disarmed.
 </p>
 
 <div class="uc-panel">
@@ -77,6 +77,17 @@
       {% else %}<span class="uc-badge current">clean</span>{% endif %}
     </span>
   </div>
+</div>
+
+<div class="uc-panel">
+  <h2>Protected Updater</h2>
+  <div class="uc-safety {% if backend_readiness.ready %}schema_current{% else %}migration_state_indeterminate{% endif %}">
+    {% if backend_readiness.ready %}READY / ARMED{% else %}NOT READY{% endif %}
+  </div>
+  <p class="uc-note">{{ backend_readiness.detail }}</p>
+  <div class="uc-row"><span class="k">Reachable</span><span class="v">{{ backend_readiness.reachable|yesno:"yes,no" }}</span></div>
+  <div class="uc-row"><span class="k">Protocol compatible</span><span class="v">{{ backend_readiness.protocol_compatible|yesno:"yes,no" }}</span></div>
+  <div class="uc-row"><span class="k">Root execution armed</span><span class="v">{{ backend_readiness.execution_armed|yesno:"yes,no" }}</span></div>
 </div>
 
 <div class="uc-panel">
@@ -164,6 +175,61 @@
   <div class="uc-row"><span class="k">apt prerequisites</span><span class="v">{{ plan.apt_packages_new|join:", " }} (manual action required)</span></div>
   {% endif %}
   <p class="uc-note">This is a declarative action expectation from the release chain, cross-checked against target Git objects where Phase A can do so. It is not final target migration validation; Phase B must materialize target source and compare its real Django migration plan before execution.</p>
+
+  {% if update_eligible %}
+  <form method="post" action="{% url 'updatecenter:start-update' %}"
+        onsubmit="return window.confirm('Install {{ plan.target_release_id|escapejs }}? Service interruption is expected. There is no automatic rollback.');">
+    {% csrf_token %}
+    <input type="hidden" name="confirmed_target_release_id" value="{{ plan.target_release_id }}">
+    <input type="hidden" name="confirmed_plan_fingerprint" value="{{ plan.fingerprint }}">
+    <button class="uc-btn" type="submit">Install {{ plan.target_release_id }}</button>
+  </form>
+  <p class="uc-note">Confirmation covers {{ plan.installed_release_id }} → {{ plan.target_release_id }},
+    migrations shown above, collectstatic={{ plan.collectstatic_required|yesno:"yes,no" }}, and restarts:
+    {{ plan.services_requiring_restart|join:", "|default:"none" }}. The server recomputes the complete plan after confirmation.</p>
+  {% else %}
+  <p class="uc-note">Installation is blocked:</p>
+  <ul class="uc-list">{% for blocker in execution_blockers %}<li>{{ blocker }}</li>{% endfor %}</ul>
+  {% endif %}
 </div>
+{% endif %}
+
+{% if shown_job %}
+<div class="uc-panel" id="uc-job" data-status-url="{% url 'updatecenter:job-status' shown_job.id %}">
+  <h2>Update Job</h2>
+  <div class="uc-row"><span class="k">Job</span><span class="v" id="uc-job-id">{{ shown_job.id }}</span></div>
+  <div class="uc-row"><span class="k">State</span><span class="v" id="uc-job-state">{{ shown_job.state }}</span></div>
+  <div class="uc-row"><span class="k">Current step</span><span class="v" id="uc-job-step">{{ shown_job.current_step }}</span></div>
+  <p class="uc-note" id="uc-job-detail">{{ shown_job.progress_detail }}</p>
+  <p class="uc-note" id="uc-job-backend">{% if reconciliation_error %}Backend temporarily unavailable: {{ reconciliation_error }}{% endif %}</p>
+  <pre class="uc-console" id="uc-job-log">{{ shown_job.completed_log_snapshot }}</pre>
+</div>
+<script>
+(() => {
+  const panel = document.getElementById('uc-job');
+  if (!panel) return;
+  let delay = 2000;
+  const write = (id, value) => { document.getElementById(id).textContent = value || ''; };
+  const poll = async () => {
+    try {
+      const response = await fetch(panel.dataset.statusUrl, {headers: {'Accept': 'application/json'}});
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const data = await response.json();
+      write('uc-job-state', data.state);
+      write('uc-job-step', data.current_step);
+      write('uc-job-detail', data.failure_detail || data.progress_detail);
+      write('uc-job-backend', data.backend_temporarily_unavailable ? `Backend temporarily unavailable: ${data.backend_detail}` : '');
+      write('uc-job-log', data.log_tail);
+      delay = 2000;
+      if (data.terminal) return;
+    } catch (_error) {
+      write('uc-job-backend', 'Application or updater temporarily unavailable; polling will retry.');
+      delay = Math.min(delay * 2, 15000);
+    }
+    window.setTimeout(poll, delay);
+  };
+  window.setTimeout(poll, delay);
+})();
+</script>
 {% endif %}
 {% endblock %}

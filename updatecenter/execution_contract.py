@@ -1,4 +1,4 @@
-"""Pure application-side copy of the protocol-v1 execution fingerprint spec."""
+"""Pure application-side copy of fingerprint contract v2 used by protocol v3."""
 from __future__ import annotations
 
 import hashlib
@@ -7,7 +7,7 @@ import json
 
 def execution_fingerprint_payload(**values) -> dict:
     return {
-        "contract_version": 1,
+        "contract_version": 2,
         "installed_release_id": values["installed_release_id"],
         "installed_commit": values["installed_commit"],
         "target_release_id": values["target_release_id"],
@@ -26,6 +26,7 @@ def execution_fingerprint_payload(**values) -> dict:
         "nginx_changed": values["nginx_changed"],
         "runtime_components_changed": values["runtime_components_changed"],
         "minimum_updater_protocol_version": values["minimum_updater_protocol_version"],
+        "manual_bootstrap_required": values["manual_bootstrap_required"],
     }
 
 

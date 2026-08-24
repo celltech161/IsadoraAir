@@ -36,6 +36,7 @@ KNOWN_FIELDS = frozenset({
     "systemd_units_removed_or_renamed", "collectstatic_required",
     "services_requiring_restart", "nginx_changed", "runtime_components_changed",
     "minimum_supported_release_id",
+    "manual_bootstrap_required",
 })
 FORBIDDEN_FIELDS = frozenset({
     "pre_update_hooks", "post_update_hooks", "hooks", "commands", "shell",
@@ -68,6 +69,7 @@ class Manifest:
     nginx_changed: bool
     runtime_components_changed: bool
     minimum_supported_release_id: str | None
+    manual_bootstrap_required: bool
 
 
 @dataclasses.dataclass(frozen=True)
@@ -97,6 +99,7 @@ class TrustedPlan:
     nginx_changed: bool
     runtime_components_changed: bool
     minimum_updater_protocol_version: int
+    manual_bootstrap_required: bool
     fingerprint: str
 
     def fingerprint_payload(self) -> dict:
@@ -119,13 +122,14 @@ class TrustedPlan:
             nginx_changed=self.nginx_changed,
             runtime_components_changed=self.runtime_components_changed,
             minimum_updater_protocol_version=self.minimum_updater_protocol_version,
+            manual_bootstrap_required=self.manual_bootstrap_required,
         )
 
 
 def execution_fingerprint_payload(**values) -> dict:
-    """Protocol-v1 canonical authorization facts, duplicated app-side by spec."""
+    """Fingerprint contract v2 authorization facts used by protocol v3."""
     return {
-        "contract_version": 1,
+        "contract_version": 2,
         "installed_release_id": values["installed_release_id"],
         "installed_commit": values["installed_commit"],
         "target_release_id": values["target_release_id"],
@@ -144,6 +148,7 @@ def execution_fingerprint_payload(**values) -> dict:
         "nginx_changed": values["nginx_changed"],
         "runtime_components_changed": values["runtime_components_changed"],
         "minimum_updater_protocol_version": values["minimum_updater_protocol_version"],
+        "manual_bootstrap_required": values["manual_bootstrap_required"],
     }
 
 
@@ -169,7 +174,10 @@ def parse_manifest(data: dict, *, label: str) -> Manifest:
     unknown = set(data) - KNOWN_FIELDS
     if forbidden or unknown:
         raise ReleaseError(f"{label}: forbidden/unknown fields: {sorted(forbidden | unknown)!r}")
-    required = KNOWN_FIELDS - {"bootstrap_commit", "summary", "migration_compatibility", "requirements_sha256", "minimum_supported_release_id"}
+    required = KNOWN_FIELDS - {
+        "bootstrap_commit", "summary", "migration_compatibility", "requirements_sha256",
+        "minimum_supported_release_id", "manual_bootstrap_required",
+    }
     if required - set(data):
         raise ReleaseError(f"{label}: missing fields: {sorted(required - set(data))!r}")
     if data.get("schema_version") != 1 or isinstance(data.get("schema_version"), bool):
@@ -220,6 +228,9 @@ def parse_manifest(data: dict, *, label: str) -> Manifest:
     minimum_release = data.get("minimum_supported_release_id")
     if minimum_release is not None and (not isinstance(minimum_release, str) or not RELEASE_ID_RE.fullmatch(minimum_release)):
         raise ReleaseError(f"{label}: invalid minimum_supported_release_id")
+    manual_bootstrap_required = data.get("manual_bootstrap_required", False)
+    if not isinstance(manual_bootstrap_required, bool):
+        raise ReleaseError(f"{label}: manual_bootstrap_required must be boolean")
     summary = data.get("summary", "")
     if not isinstance(summary, str) or len(summary) > 500:
         raise ReleaseError(f"{label}: invalid summary")
@@ -229,7 +240,7 @@ def parse_manifest(data: dict, *, label: str) -> Manifest:
         _list(data.get("apt_packages_new"), "apt_packages_new", PACKAGE_RE),
         units_changed, units_required, units_optional, units_removed,
         data["collectstatic_required"], restarts, data["nginx_changed"],
-        data["runtime_components_changed"], minimum_release,
+        data["runtime_components_changed"], minimum_release, manual_bootstrap_required,
     )
 
 
@@ -545,6 +556,7 @@ def derive_plan(repository: TrustedRepository, trusted_tip: str, live_head: str,
         nginx_changed=any(entry.manifest.nginx_changed for entry in transitions),
         runtime_components_changed=any(entry.manifest.runtime_components_changed for entry in transitions),
         minimum_updater_protocol_version=max(entry.manifest.minimum_updater_protocol_version for entry in transitions),
+        manual_bootstrap_required=any(entry.manifest.manual_bootstrap_required for entry in transitions),
     )
     plan_fingerprint = fingerprint(execution_fingerprint_payload(**values))
     return TrustedPlan(**values, fingerprint=plan_fingerprint)
@@ -554,6 +566,8 @@ def manual_blockers(plan: TrustedPlan) -> tuple[str, ...]:
     blockers = []
     if plan.minimum_updater_protocol_version > PROTOCOL_VERSION:
         blockers.append("UPDATER_UPGRADE_REQUIRED")
+    if plan.manual_bootstrap_required:
+        blockers.append("MANUAL_BOOTSTRAP_REQUIRED")
     if plan.python_requirements_changed:
         blockers.append("PYTHON_REQUIREMENTS_MANUAL")
     if plan.apt_packages_new:

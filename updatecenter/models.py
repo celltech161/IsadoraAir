@@ -1,12 +1,9 @@
-"""Durable UpdateJob schema -- [P0] 1.1 Phase A.
+"""Durable UpdateJob audit mirror for the managed Update Center.
 
-Nothing in Phase A creates a row here. This model exists now so its
-migration exists now, additive and simple, safe to review and apply
-manually the one time Update Center support is first installed on a
-station -- see this app's own module docstring in __init__.py and
-docs/UPDATE_CENTER.md's "bootstrap limitation" section for why that
-one manual step can never be automated away by the very feature it
-bootstraps.
+Phase A introduced the additive table without creating rows. Phase C's
+superuser-only POST creates one row before protected-backend submission;
+root-owned files remain execution truth and this PostgreSQL row remains the
+durable application/UI mirror across Gunicorn restarts.
 
 Every field matches something Phase B genuinely needs to make the job
 durable across a Gunicorn restart (see ARCHITECTURE_REPORT.md §6) --
@@ -25,15 +22,16 @@ from django.db import models
 
 class UpdateJobState:
     """Explicit, finite vocabulary. Phase A never sets any of these
-    except by not existing (no UpdateJob row is ever created by
-    Phase A code) -- Phase B's daemon/executor is the only thing that
-    will ever write a transition. Kept here, not as a bare tuple, so
+    except by not existing (no UpdateJob row was created by
+    Phase A code). Phase C's application mirror writes reconciled transitions;
+    root uses its separate vocabulary and state store. Kept here, not as a bare tuple, so
     both the model's `choices=` and any future planner/executor code
     import the SAME names rather than risking a typo'd string drifting
     from the model's own choices list."""
     QUEUED = "queued"
     PLANNED = "planned"
     RUNNING = "running"
+    SUBMISSION_UNCERTAIN = "submission_uncertain"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     MANUAL_INTERVENTION_REQUIRED = "manual_intervention_required"
@@ -44,6 +42,7 @@ class UpdateJobState:
         (QUEUED, "Queued"),
         (PLANNED, "Planned"),
         (RUNNING, "Running"),
+        (SUBMISSION_UNCERTAIN, "Submission uncertain"),
         (SUCCEEDED, "Succeeded"),
         (FAILED, "Failed"),
         (MANUAL_INTERVENTION_REQUIRED, "Manual intervention required"),

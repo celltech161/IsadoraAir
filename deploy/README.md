@@ -4,16 +4,17 @@ systemd units, nginx site config, and misc drop-in configs for a
 production IsadoraAir install. Every path or user that varies per
 install is a `@@PLACEHOLDER@@` token — see below to render + install.
 
-## Managed Update Center Phase B artifact
+## Managed Update Center Phase C protected artifact
 
 `isadoraair-updater.service`, `updater-station.example.json`, and
 `updater_runtime/` are deliberately **not** part of the broad unit-install loop
 below. They define an optional protected backend that must be independently
 reviewed and copied with fixed root-owned `install` tooling as documented in
-`updater_runtime/README.md`. Never point its `ExecStart` at this checkout or the
-application venv, and do not enable it until the Phase C security prerequisites
-in `docs/UPDATE_CENTER.md`—especially removal of unrestricted `NOPASSWD: ALL`—
-have been completed.
+`docs/UPDATE_CENTER.md` and `updater_runtime/README.md`. Never point its
+`ExecStart` at this checkout or the application venv. The r0004 bootstrap starts
+it disarmed; update execution may be armed only after the maintenance broker is
+verified and unrestricted `NOPASSWD: ALL` has been removed. The broad unit loop
+below deliberately continues to exclude this root service.
 
 ## Placeholders
 

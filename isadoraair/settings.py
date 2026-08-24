@@ -313,7 +313,7 @@ SECURE_SSL_REDIRECT = True
 # nginx also needs its own matching exemption (see deploy notes) since
 # the redirect above only fires for requests that already got past
 # nginx's own unconditional :80 -> :443 redirect.
-SECURE_REDIRECT_EXEMPT = [r'^wx/gw3000$']
+SECURE_REDIRECT_EXEMPT = [r'^wx/gw3000$', r'^healthz/$']
 SESSION_COOKIE_SECURE = True
 CSRF_COOKIE_SECURE = True
 

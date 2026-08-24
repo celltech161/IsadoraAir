@@ -114,6 +114,22 @@ class TrustedReleaseTests(SimpleTestCase):
         plan = derive_plan(repo, tip, r2, "r0003")
         self.assertIn("PYTHON_REQUIREMENTS_MANUAL", manual_blockers(plan))
 
+    def test_explicit_manual_bootstrap_gate_aggregates_and_blocks_root_execution(self):
+        _author, upstream, _bootstrap, r2, _r3 = create_release_repository(
+            self.root / "manual-bootstrap",
+            third_release_changes={
+                "manual_bootstrap_required": True,
+                "minimum_updater_protocol_version": 3,
+            },
+        )
+        repo = TrustedRepository(
+            self.root / "manual-bootstrap-trusted.git", str(upstream), "main", CommandRunner()
+        )
+        tip = repo.fetch()
+        plan = derive_plan(repo, tip, r2, "r0003")
+        self.assertTrue(plan.manual_bootstrap_required)
+        self.assertIn("MANUAL_BOOTSTRAP_REQUIRED", manual_blockers(plan))
+
     def test_undeclared_systemd_unit_change_is_rejected_from_predecessor_diff(self):
         _author, upstream, _bootstrap, r2, _r3 = create_release_repository(
             self.root / "undeclared-unit",

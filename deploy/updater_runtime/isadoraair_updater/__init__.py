@@ -5,5 +5,5 @@ review/distribution artifact; production must execute only the protected copy
 installed under ``/usr/local/libexec/isadoraair-updater``.
 """
 
-PROTOCOL_VERSION = 1
-RUNTIME_VERSION = 1
+PROTOCOL_VERSION = 3
+RUNTIME_VERSION = 3

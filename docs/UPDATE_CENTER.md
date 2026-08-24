@@ -1,24 +1,22 @@
-# Update Center — design & usage (Phases A+B)
+# Update Center — design & usage (Phases A–C)
 
 [P0] Bucket 1 / 1.1. This document covers what exists **today**:
-Phase A's non-privileged planning foundation and Phase B's deliberately
-uninstalled safe-execution backend source. The design constraints still
-govern future phases. The private/gitignored architecture notes
+Phase A's non-privileged planning foundation, Phase B's protected execution
+backend, and Phase C's application integration and manual privileged bootstrap.
+The private/gitignored architecture notes
 used during review are not part of the deployable product; this
 Git-owned document is the authoritative shipped contract.
 
-## What Phase A actually is
+## Phase A planning foundation
 
-A read-only `/updates/` status page (staff/superuser only) showing
+Phase A introduced a read-only `/updates/` status page (staff/superuser only) showing
 installed source, running-software version skew (reusing
 `isadoraair/version_info.py` and `monitoring/services/release_status.py`
 unmodified), and — when a release chain is present and safe to plan —
-a computed update plan. **There is no working "Update IsadoraAir"
-button, no privileged code, and no code path that changes the
-checkout, runs a migration, runs pip, installs/reloads systemd,
-restarts a service, writes nginx config, or runs apt.** This is
-enforced, not just documented — see `updatecenter/tests/
-test_security_contract.py`.
+a computed update plan. Phase C retains that read access and adds one
+superuser-only, POST/CSRF-protected submission route. Django still cannot run a
+command as root: execution crosses a strict Unix-socket protocol into a
+separately installed protected runtime.
 
 ## The release manifest
 
@@ -301,40 +299,22 @@ unit just because its template exists.** This matches
 `deploy/README.md`'s own existing convention (optional timers are
 opt-in, one `sudo systemctl enable --now` at a time).
 
-## Station-config contract (schema only — nothing installed by Phase A)
+## Station-config trust contract
 
-The architecture report originally proposed `deploy/station_config.json`
-for persisting the six `@@PLACEHOLDER@@` render values
-(`ISA_USER`/`ISA_ROOT`/`ISA_HOME`/`SYNDICATED_ROOT`/`WEATHER_ROOT`/
-`OGREMOTE_ROOT`) a future systemd-reconciliation step would need.
-Review corrected this: a file under the git checkout, writable by the
-same account Gunicorn runs as, is exactly the wrong place for a value
-a future privileged executor would trust for rendering system-level
-unit files — a compromised Gunicorn process could redirect where units
-get rendered. **Phase A does not create this file.** The intended
-shape, for whenever it is actually built:
+The architecture report originally proposed an application-owned station file
+for the six `@@PLACEHOLDER@@` render values. Review corrected this: a file under
+the Git checkout, writable by Gunicorn's account, is exactly the wrong authority
+for rendering root systemd units. The complete strict schema is shown in
+`deploy/updater-station.example.json`. Its production location is
+`/etc/isadoraair/station.json`, outside the checkout, root-owned and mode 0600
+(it may identify a pgpass file). The privileged executor reads it directly;
+Gunicorn cannot write it. Unknown fields, overlapping protected/application
+paths, non-loopback health targets, malformed account/database values and
+invalid operator units fail config loading.
 
-```json
-{
-  "schema_version": 1,
-  "isa_user": "isadoraair",
-  "isa_root": "/opt/isadoraair",
-  "isa_home": "/home/isadoraair",
-  "syndicated_root": "/home/isadoraair/syndicated-ingest",
-  "weather_root": "/home/isadoraair/weather-ingest",
-  "ogremote_root": "/home/isadoraair/ogremote-ingest"
-}
-```
+## Privilege boundary
 
-Intended location: **outside the git checkout**, e.g.
-`/etc/isadoraair/station.json` — root-owned, root-writable only,
-world/group-readable is fine (no secrets in it, just paths). The
-future privileged executor reads this directly; Gunicorn must never be
-able to write it.
-
-## Privilege boundary (Phase B, not built yet — encoded here so Phase A doesn't foreclose it)
-
-The future privileged executor **must not** run from
+The privileged executor **must not** run from
 `/opt/isadoraair`, the station's physical checkout path, or the shared
 application venv — anywhere the Gunicorn/application service account
 can write. A compromised Django process that can modify
@@ -354,20 +334,15 @@ runtime. Application-level operations (`manage.py migrate`,
 `collectstatic`, git working-tree actions, `pip install` into the
 application venv) are launched explicitly as the unprivileged
 `ISA_USER` where appropriate — only the narrow slice that genuinely
-needs root (systemd install/`daemon-reload`/enable/restart, possibly
-apt) runs as root.
+needs root (systemd install/`daemon-reload`/enable/restart) runs as root.
+Automatic apt/package mutation remains outside the updater contract.
 
-**Existing, unrelated gap this must not extend**: `hardware/admin.py`,
-`rbds/admin.py`, and `monitoring/views.py` already call `sudo systemctl
-restart <unit>` directly from Django, backed by this box's `jreed`
-account having unrestricted `(ALL) NOPASSWD: ALL` sudo — meaning
-Gunicorn is not meaningfully unprivileged **today**, independent of
-this feature. Before Phase B/C's Update button is ever enabled in
-production: (1) these three existing restart paths must move to
-whatever constrained mechanism Phase B builds, and (2) the unrestricted
-`NOPASSWD: ALL` grant must be removed. Building a narrow updater while
-leaving an equivalent unrestricted root path open through Gunicorn
-would not actually close the exposure.
+Phase C removes the source-level direct `sudo` calls formerly present in
+`hardware/admin.py`, `rbds/admin.py`, and `monitoring/views.py`. They now use
+the same protected broker's two maintenance operations. Production execution
+must remain disarmed until the historical unrestricted `(ALL) NOPASSWD: ALL`
+grant has been removed and effective policy verified; installing these source
+changes does not edit sudoers automatically.
 
 ## Other locked decisions
 
@@ -378,11 +353,11 @@ would not actually close the exposure.
 - **apt packages are never auto-installed.** A manifest declaring
   `apt_packages_new` makes the plan `manual_system_package_action_required`
   — a hard stop, not a prompt to `apt install` anything.
-- **Pre-migration DB checkpoint retention (Phase B, not built)**: keep
+- **Pre-migration DB checkpoint retention (Phase B)**: keep
   the last 5, or 30 days, whichever is less restrictive at the moment
   of pruning; always retain the newest successful checkpoint until a
-  newer one exists. Not implemented in Phase A — `pg_dump` execution is
-  entirely a Phase B concern.
+  newer one exists. `pg_dump` execution remains entirely inside the protected
+  Phase B runtime.
 
 ## Bootstrap release sequence
 
@@ -425,17 +400,18 @@ route this specific bootstrap step through the Update Center itself —
 the sequence above is the unavoidable bootstrap boundary, not an
 execution feature omitted by accident.
 
-The same logic applies to the future Phase B systemd unit
+The same logic applies to the Phase B systemd unit
 (`isadoraair-updater.service`) — it, too, must be installed manually
 the first time, following the protected-copy bootstrap in
-`deploy/updater_runtime/README.md`. Phase C still owns production activation.
+`deploy/updater_runtime/README.md`. The Phase C source checkpoint still does
+not activate it automatically.
 
 ## Phase B safe-execution backend
 
-Phase B adds a complete, testable backend source boundary but does **not**
-make updates reachable from HTTP and does **not** install privileged code.
-The existing `/updates/` URLs remain exactly the read-only dashboard plus the
-CSRF-protected Git-fetch action. There is no start-update view or button.
+Phase B added the complete backend trust boundary without installing it.
+Phase C supplies the narrow application integration, while protected code
+installation, configuration, service activation, sudo cleanup, and final
+arming remain explicit manual operator work.
 
 ### Protected runtime and root trust boundary
 
@@ -487,7 +463,8 @@ or re-added manifests and shared introducing commits, verifies every release
 commit lies on the trusted branch, and cross-checks migration/unit/requirements
 claims against trusted Git objects. It independently derives the installed and
 latest releases, complete skipped-release action set, target commit, and
-protocol-v1 execution fingerprint. The `START_UPDATE` release/fingerprint are
+version-2 canonical execution fingerprint under protocol v3. The
+`START_UPDATE` release/fingerprint are
 requests for comparison, not authorization facts. Any mismatch is fatal.
 Each transition is also compared with its predecessor: requirements, systemd
 unit, nginx, and runtime-component bytes must agree with the corresponding
@@ -505,17 +482,33 @@ packages, and never replaces itself.
 The daemon owns a Unix socket under `/run/isadoraair-updater/`, a systemd-created
 root-owned runtime directory. `SO_PEERCRED` must identify root or the configured
 application UID/GID. The protocol is one bounded UTF-8 JSON object with an exact
-field set and version. Only four actions exist:
+field set and protocol version 3. Exactly seven actions exist:
 
 - `PING`;
 - `START_UPDATE` with canonical UUID, `r####` target, and SHA-256 plan
   fingerprint;
 - `GET_JOB_STATUS` for that UUID;
 - `GET_JOB_LOG` with a maximum tail size no greater than 64 KiB.
+- `RESTART_OPERATOR_SERVICE` with one exact service name that must also be an
+  exact member of the root-owned station allowlist;
+- `STORE_ALSA_STATE`, which accepts no arguments and always executes fixed
+  `/usr/sbin/alsactl store`.
+- `GET_MAINTENANCE_STATUS` for one root-generated maintenance UUID.
 
-There is no `RUN_COMMAND`, shell, arbitrary systemctl, write-file, path, unit, or
-service operation. Unknown fields/actions and oversized/malformed messages are
-rejected.
+There is no `RUN_COMMAND`, shell, arbitrary systemctl argv, write-file, or path
+operation. A service string is data only until root independently matches it
+against `operator_restart_units`. Unknown fields/actions and oversized or
+malformed messages are rejected. One bounded asynchronous maintenance worker
+exists; requests are never accumulated in an unbounded queue.
+
+Each admitted maintenance action receives a root-generated UUID and a mode-0600
+result record under the protected job-state tree. At most 100 records are
+retained. The record contains only the fixed action, the already-allowlisted
+service when applicable, state, timestamps, and a sanitized result
+classification—never command output. Fast completion/failure is returned in
+the admission response; longer work remains observable through the single
+`GET_MAINTENANCE_STATUS` query without keeping Gunicorn attached to systemd's
+stop timeout.
 
 Authoritative state is atomic mode-0600 JSON under
 `/var/lib/isadoraair-updater/jobs/`; logs are append-only mode-0600 files under
@@ -527,11 +520,17 @@ durable and support restart recovery. A migration-started job lacking a durable
 database-verified milestone is intentionally ambiguous and becomes
 manual-intervention-required rather than blindly rerunning migration.
 
-The Django `UpdateJob` remains a UI/audit mirror. `updatecenter.job_service`
-provides explicit create/submit/reconcile primitives for Phase C, but no web
-view imports or calls them. Root neither reads nor writes the row. Reconciliation
-also compares root-derived target/fingerprint with the mirror before accepting
-status.
+The Django `UpdateJob` remains a UI/audit mirror. The superuser POST recomputes
+the plan and creates the row before submitting only its UUID, logical target
+release, and fingerprint. Root neither reads nor writes the row. Reconciliation
+compares root-derived target/fingerprint with the mirror before accepting
+status. A lost response—or any generic negative START response—becomes
+`submission_uncertain`, not `failed`, unless `GET_JOB_STATUS` explicitly proves
+that the UUID does not exist. A durable accepted state therefore remains root
+truth even when a later acceptance-log write fails. The
+active database lock remains held. The POST retries only the same UUID, and
+later GET reconciliation releases the lock only after root reports a terminal
+state or explicitly proves that UUID does not exist.
 
 ### Staging and schema-before-source ordering
 
@@ -636,7 +635,7 @@ misclassified as failed. Postflight verifies exact target HEAD, clean live
 target-source schema, installed unit state, declared service health, durable job
 state, and a bounded loopback HTTP response when Gunicorn restarted.
 
-### Failure, retry, rollback and Phase C gate
+### Failure, retry, and rollback
 
 Before migration, failure leaves production unchanged. After verified additive
 migration but before live advancement, extra backward-compatible schema may
@@ -653,12 +652,175 @@ started/completed restart milestones so completed restarts are skipped while an
 ambiguous interrupted restart becomes manual. Ambiguous migration interruption
 likewise cannot auto-resume. Cancellation is intentionally unsupported.
 
-Finally, protected updater installation alone is insufficient authorization for
-Phase C. Before any production Update button can exist, the restart paths in
-`hardware/admin.py`, `rbds/admin.py`, and `monitoring/views.py` must move to a
-constrained mechanism and the station's unrestricted `NOPASSWD: ALL` grant must
-be removed. The updater service/config/repository/socket must then be separately
-installed, reviewed and exercised without exposing HTTP execution. `r0003`
-ships these artifacts as optional source only and requires a Gunicorn restart
-for the changed planner/model code; it declares no migration, package, static,
-nginx, or automatically activated systemd work.
+## Phase C application contract
+
+`GET /updates/` remains staff/superuser-visible and never fetches from the
+network. `POST /updates/check-for-updates/` remains a CSRF-protected fetch of
+remote refs only. `POST /updates/start/` is superuser-only. The browser confirms
+the displayed release and fingerprint, but these values never authorize a
+target: the POST rebuilds schema health, checkout state, release chain, plan,
+backend readiness and arming state, then rejects a stale confirmation.
+
+The Install control is offered only for an actionable plan with healthy current
+schema, no active job, no manual/package/runtime/nginx/removal blocker, a
+compatible reachable protected backend, and root execution armed. Staff can
+inspect the reason it is blocked but cannot submit it. No `GET`, query string,
+model permission, hidden target SHA, or caller path can start an update.
+
+The initiating request does not own execution. The browser polls the UUID status
+endpoint with bounded backoff. PostgreSQL locates the active job after a page or
+Gunicorn restart; root JSON state remains execution truth. Live root log access
+is superuser-only and capped at 32 KiB in the response; terminal logs come from
+the durable bounded `completed_log_snapshot`. The UI uses `textContent`, never
+HTML insertion. Updater outage is a temporary status and never a Gunicorn
+startup dependency.
+
+`GET /healthz/` is a small, unauthenticated Django + `SELECT 1` probe. It is the
+configured postflight URL (`http://127.0.0.1:8000/healthz/`) and is narrowly
+exempt from Django's HTTP redirect so a direct loopback Gunicorn probe returns
+200. All ordinary public HTTP paths retain the existing HTTPS redirect. The
+response is only `ok` or `unhealthy` and reveals no commit, path, or credential.
+
+The `library.0080_seed_updates_nav_item` data migration creates `Updates` /
+`updatecenter:dashboard` only when that URL identity is absent. It never edits an
+existing row, so station label/order/enabled customization survives. New shared
+operator pages must ship a similarly idempotent `NavMenuItem` seed in the same
+release.
+
+## Root configuration and arming
+
+`/etc/isadoraair/station.json` remains root-owned and application-unwritable.
+Phase C adds two fields:
+
+```json
+{
+  "update_execution_enabled": false,
+  "operator_restart_units": [
+    "isadoraair-engine.service",
+    "isadoraair-rbds.service",
+    "isadoraair-gunicorn.service",
+    "isadoraair-encoders.service",
+    "nginx.service",
+    "stereotool.service"
+  ]
+}
+```
+
+Missing `update_execution_enabled` means false. It is never database- or
+Django-controlled. `PING` reports protocol/runtime, protected-runtime and config
+validity, trusted-repository readiness, and armed/disarmed state. Root rejects
+`START_UPDATE` while false. Maintenance broker actions have their own exact
+policy and do not imply update authorization.
+
+The restart list is finite station policy, not a pattern. Every request must be
+one exact member; wildcards, paths, malformed names and command-like strings are
+rejected. The root runtime alone constructs `/usr/bin/systemctl restart UNIT`
+and validates the result. ALSA persistence accepts no input and constructs only
+`/usr/sbin/alsactl store`. Hardware live mixer saves remain successful when
+persistence submission fails, with a warning/SystemEvent. Hardware/RBDS admin
+saves likewise persist their DB change if the broker is unavailable.
+
+## r0004 manual protected-runtime bootstrap
+
+`r0004` is the manual bridge, not an unattended-update demonstration. It ships
+source, migrations, protocol v3, the service template, config example and this
+runbook, but never copies root code, edits sudoers, starts a service, or arms
+execution. Substitute station values; these examples match the current checkout
+layout without making it an authority:
+
+Its two migrations are truthfully classified `additive`. Manual installation is
+declared independently by `manual_bootstrap_required: true`. That boolean is
+OR-aggregated across every skipped transition, included in fingerprint contract
+v2, blocks the Django Install control, and produces the root
+`MANUAL_BOOTSTRAP_REQUIRED` blocker. Older application/root runtimes reject the
+unknown field, while r0004's minimum protocol 3 prevents an older helper from
+attempting unattended execution. The existing protected-systemd-work blocker
+remains independent.
+
+```bash
+export ISA_ROOT=/home/jreed/isadoraair-django
+export ISA_USER=jreed
+
+# Fetch objects as the unprivileged application owner. Resolve the one commit
+# that introduced r0004 and inspect it before materializing anything.
+git -C "$ISA_ROOT" fetch origin main
+git -C "$ISA_ROOT" log --format='%H' --diff-filter=A origin/main -- deploy/releases/r0004.json
+export R0004_COMMIT=REPLACE_WITH_THE_SINGLE_REVIEWED_SHA
+git -C "$ISA_ROOT" show "$R0004_COMMIT:deploy/releases/r0004.json"
+git -C "$ISA_ROOT" merge-base --is-ancestor "$R0004_COMMIT" origin/main
+
+# Materialize reviewed files without root and without executing checkout code.
+export UPDATER_STAGE="$(mktemp -d)"
+git -C "$ISA_ROOT" archive "$R0004_COMMIT" \
+  deploy/updater_runtime deploy/isadoraair-updater.service \
+  deploy/updater-station.example.json | tar -x -C "$UPDATER_STAGE"
+find "$UPDATER_STAGE/deploy/updater_runtime" -maxdepth 3 -type f -print
+```
+
+Review every staged file. Then use only fixed system utilities to install the
+specific reviewed artifacts; do **not** run `sudo python`, a repo-owned install
+script, or any program from the application-writable checkout:
+
+```bash
+sudo install -d -o root -g root -m 0755 /usr/local/libexec/isadoraair-updater
+sudo install -d -o root -g root -m 0755 /usr/local/libexec/isadoraair-updater/isadoraair_updater
+sudo install -o root -g root -m 0755 "$UPDATER_STAGE/deploy/updater_runtime/updaterd.py" \
+  /usr/local/libexec/isadoraair-updater/updaterd.py
+sudo install -o root -g root -m 0755 "$UPDATER_STAGE/deploy/updater_runtime/updaterctl.py" \
+  /usr/local/libexec/isadoraair-updater/updaterctl.py
+for module in __init__ checkpoint config daemon executor jobs process protocol release security staging systemd; do
+  sudo install -o root -g root -m 0644 \
+    "$UPDATER_STAGE/deploy/updater_runtime/isadoraair_updater/$module.py" \
+    "/usr/local/libexec/isadoraair-updater/isadoraair_updater/$module.py"
+done
+sudo install -d -o root -g root -m 0755 /var/backups/isadoraair
+sudo install -d -o root -g root -m 0700 /var/backups/isadoraair/update-checkpoints
+```
+
+Prepare a station-specific JSON copy as the unprivileged user, retaining
+`update_execution_enabled: false` and an exact minimal restart allowlist. Then:
+
+```bash
+sudo install -d -o root -g root -m 0755 /etc/isadoraair
+sudo install -o root -g root -m 0600 /path/to/reviewed-station.json /etc/isadoraair/station.json
+
+# Render only the known user token without root, review, then install.
+sed -e "s|@@ISA_USER@@|$ISA_USER|g" -e "s|@@ISA_ROOT@@|$ISA_ROOT|g" \
+  "$UPDATER_STAGE/deploy/isadoraair-updater.service" > "$UPDATER_STAGE/isadoraair-updater.service.rendered"
+systemd-analyze verify "$UPDATER_STAGE/isadoraair-updater.service.rendered"
+sudo install -o root -g root -m 0644 "$UPDATER_STAGE/isadoraair-updater.service.rendered" \
+  /etc/systemd/system/isadoraair-updater.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now isadoraair-updater.service
+/usr/bin/python3 -I /usr/local/libexec/isadoraair-updater/updaterctl.py ping
+```
+
+The PING must show protocol 3, protected/config/repository readiness, and
+`update_execution_enabled: false`. Only then manually fast-forward the reviewed
+application source to r0004, apply `updatecenter.0002_alter_updatejob_state` and
+`library.0080_seed_updates_nav_item` through the normal station migration
+procedure, restart Gunicorn, and verify `/healthz/`, `/updates/`, hardware mixer
+persistence, AudioPipeline restart, RBDS topology restart, and each allowed
+monitoring restart.
+
+Next remove the historical unrestricted sudo grant manually. Do not use
+`sudo -n true` as proof because a credential timestamp can mislead. Inspect the
+effective policy with the fixed operator command:
+
+```bash
+sudo -l -U "$ISA_USER"
+```
+
+Require that no `(ALL) NOPASSWD: ALL`, equivalent all-command rule, wildcard
+`systemctl`, or wildcard `alsactl` authorization remains. Re-test broker-backed
+web operations with that policy removed. Only after all those checks may root
+edit `/etc/isadoraair/station.json` to set `update_execution_enabled: true`,
+restart `isadoraair-updater.service`, and verify `/updates/` reports READY /
+ARMED. Django never performs any of these bootstrap or sudo-policy steps.
+
+`r0005` will be the first deliberate end-to-end Update-button release. Keep it
+boring: no requirements, apt, native runtime, dangerous systemd, nginx, or
+preferably migration change; use a harmless visible application change and a
+Gunicorn-only restart. Automatic rollback, apt installation, live-venv pip
+mutation, destructive migration handling, and protected-updater self-update all
+remain unsupported and manual.

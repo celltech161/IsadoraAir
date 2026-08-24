@@ -13,6 +13,7 @@ from .security import assert_root_protected, assert_root_protected_parents
 
 
 SYSTEMCTL = "/usr/bin/systemctl"
+ALSACTL = "/usr/sbin/alsactl"
 TOKEN_RE = re.compile(r"@@[A-Z_]+@@")
 TOKENS = {
     "@@ISA_USER@@": "isa_user",
@@ -118,6 +119,28 @@ class SystemdManager:
             restarted.append(service)
         return restarted
 
+    def restart_operator_service(self, unit: str):
+        """Restart one exact root-configured unit; DB/request text is never authority."""
+        if unit not in self.config.operator_restart_units:
+            raise SystemdError("service is outside the root-owned operator restart allowlist")
+        self._systemctl(["restart", unit], timeout=180)
+        self._verify_operator_unit(unit)
+
+    def store_alsa_state(self):
+        """Persist all live ALSA controls with a fixed executable and argv."""
+        result = self.runner.run([ALSACTL, "store"], timeout=30)
+        if not result.ok:
+            raise SystemdError("alsactl store failed")
+
+    def _verify_operator_unit(self, unit: str):
+        if unit not in self.config.operator_restart_units:
+            raise SystemdError("cannot verify a unit outside the operator allowlist")
+        result = self._systemctl([
+            "show", unit, "--property=Type", "--property=ActiveState",
+            "--property=SubState", "--property=Result",
+        ])
+        self._validate_unit_status(unit, result)
+
     def verify_unit(self, unit: str):
         if unit not in KNOWN_MANAGED_UNITS:
             raise SystemdError("cannot verify an unknown unit")
@@ -125,6 +148,10 @@ class SystemdManager:
             "show", unit, "--property=Type", "--property=ActiveState",
             "--property=SubState", "--property=Result",
         ])
+        self._validate_unit_status(unit, result)
+
+    @staticmethod
+    def _validate_unit_status(unit: str, result):
         values = {}
         for line in result.stdout.decode("utf-8", "replace").splitlines():
             key, separator, value = line.partition("=")

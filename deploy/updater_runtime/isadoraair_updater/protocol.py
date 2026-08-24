@@ -14,7 +14,11 @@ MAX_RESPONSE_BYTES = 131072
 MAX_LOG_TAIL_BYTES = 65536
 RELEASE_ID = re.compile(r"^r[0-9]{4,}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
-ACTIONS = frozenset({"PING", "START_UPDATE", "GET_JOB_STATUS", "GET_JOB_LOG"})
+ACTIONS = frozenset({
+    "PING", "START_UPDATE", "GET_JOB_STATUS", "GET_JOB_LOG",
+    "RESTART_OPERATOR_SERVICE", "STORE_ALSA_STATE", "GET_MAINTENANCE_STATUS",
+})
+SYSTEMD_UNIT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.@-]{0,98}\.service$")
 
 
 class ProtocolError(ValueError):
@@ -28,6 +32,8 @@ class Request:
     requested_target_release_id: str | None = None
     expected_plan_fingerprint: str | None = None
     max_bytes: int | None = None
+    service: str | None = None
+    operation_id: str | None = None
 
 
 def _uuid(value, field="job_id") -> str:
@@ -57,13 +63,23 @@ def decode_request(raw: bytes) -> Request:
     required = {"PING": {"protocol_version", "action"},
                 "START_UPDATE": {"protocol_version", "action", "job_id", "requested_target_release_id", "expected_plan_fingerprint"},
                 "GET_JOB_STATUS": {"protocol_version", "action", "job_id"},
-                "GET_JOB_LOG": {"protocol_version", "action", "job_id", "max_bytes"}}[action]
+                "GET_JOB_LOG": {"protocol_version", "action", "job_id", "max_bytes"},
+                "RESTART_OPERATOR_SERVICE": {"protocol_version", "action", "service"},
+                "STORE_ALSA_STATE": {"protocol_version", "action"},
+                "GET_MAINTENANCE_STATUS": {"protocol_version", "action", "operation_id"}}[action]
     if set(data) != required:
         raise ProtocolError(f"{action} fields must be exactly {sorted(required)!r}")
     if data["protocol_version"] != PROTOCOL_VERSION or isinstance(data["protocol_version"], bool):
         raise ProtocolError("unsupported protocol_version")
-    if action == "PING":
+    if action in {"PING", "STORE_ALSA_STATE"}:
         return Request(action=action)
+    if action == "RESTART_OPERATOR_SERVICE":
+        service = data["service"]
+        if not isinstance(service, str) or not SYSTEMD_UNIT.fullmatch(service):
+            raise ProtocolError("service must be one exact syntactically valid .service name")
+        return Request(action=action, service=service)
+    if action == "GET_MAINTENANCE_STATUS":
+        return Request(action=action, operation_id=_uuid(data["operation_id"], "operation_id"))
     job_id = _uuid(data["job_id"])
     if action == "START_UPDATE":
         release = data["requested_target_release_id"]

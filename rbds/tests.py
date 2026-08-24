@@ -20,6 +20,7 @@ from rbds.services import rbds_manager
 from rbds.services.content_fetch import ContentFetchCache
 from rbds.services.rbds_manager import RBDSManager
 from rbds.services.rotation import PSRotation, RTRotation
+from updatecenter.backend_client import BackendTransportError
 
 
 class FakeClock:
@@ -2505,7 +2506,7 @@ class RBDSManagerPsStateFileTests(TestCase):
         self.assertNotIn("dynamic_ps_text", state)
 
 
-@mock.patch("rbds.admin.subprocess.Popen")
+@mock.patch("rbds.admin.UpdaterClient")
 class RBDSConfigAdminRestartScopingTests(TestCase):
     """2026-08-18 restart-scoping fix -- RBDSConfigAdmin.save_model()
     must restart isadoraair-rbds only when an actual connection-
@@ -2531,20 +2532,26 @@ class RBDSConfigAdminRestartScopingTests(TestCase):
         fake_form = SimpleNamespace(changed_data=list(changed_fields))
         self.model_admin.save_model(request=None, obj=self.config, form=fake_form, change=change)
 
-    def test_topology_field_edit_restarts(self, mock_popen):
+    def test_topology_field_edit_restarts(self, mock_client):
         self._save(["host"])
-        mock_popen.assert_called_once()
+        mock_client.return_value.restart_operator_service.assert_called_once_with("isadoraair-rbds.service")
 
-    def test_each_topology_field_alone_restarts(self, mock_popen):
+    def test_each_topology_field_alone_restarts(self, mock_client):
         for field in RBDSConfigAdmin.RESTART_TOPOLOGY_FIELDS:
             with self.subTest(field=field):
-                mock_popen.reset_mock()
+                mock_client.reset_mock()
                 self._save([field])
-                mock_popen.assert_called_once()
+                mock_client.return_value.restart_operator_service.assert_called_once_with("isadoraair-rbds.service")
 
-    def test_multiple_fields_including_one_topology_field_restarts(self, mock_popen):
+    def test_multiple_fields_including_one_topology_field_restarts(self, mock_client):
         self._save(["station_ps", "port"])
-        mock_popen.assert_called_once()
+        mock_client.return_value.restart_operator_service.assert_called_once_with("isadoraair-rbds.service")
+
+    def test_broker_outage_does_not_rollback_or_raise_from_admin_save(self, mock_client):
+        mock_client.return_value.restart_operator_service.side_effect = BackendTransportError("down")
+        with mock.patch("rbds.admin.emit_event") as event:
+            self._save(["host"])
+        event.assert_called_once()
 
     def test_generated_ps_text_edit_does_not_restart(self, mock_popen):
         self._save(["dynamic_ps_text"])

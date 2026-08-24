@@ -52,6 +52,7 @@ class StateVocabularyTests(TestCase):
         choice_values = {v for v, _ in UpdateJobState.CHOICES}
         declared = {
             UpdateJobState.QUEUED, UpdateJobState.PLANNED, UpdateJobState.RUNNING,
+            UpdateJobState.SUBMISSION_UNCERTAIN,
             UpdateJobState.SUCCEEDED, UpdateJobState.FAILED,
             UpdateJobState.MANUAL_INTERVENTION_REQUIRED, UpdateJobState.INTERRUPTED,
             UpdateJobState.CANCELLED,

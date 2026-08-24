@@ -87,12 +87,13 @@ class ProtectedRuntimeStaticTests(SimpleTestCase):
         for forbidden in ("RUN_COMMAND", "RUN_SYSTEMCTL", "WRITE_FILE", '"EXEC"', '"SHELL"'):
             self.assertNotIn(forbidden, protocol)
 
-    def test_no_http_start_route_or_view(self):
+    def test_http_execution_is_narrow_and_has_no_generic_command_input(self):
         urls = (PROJECT_ROOT / "updatecenter" / "urls.py").read_text(encoding="utf-8")
         views = (PROJECT_ROOT / "updatecenter" / "views.py").read_text(encoding="utf-8")
-        self.assertNotIn("start_update", urls)
-        self.assertNotIn("submit_job", views)
-        self.assertNotIn("create_job", views)
+        self.assertIn("start_update", urls)
+        self.assertIn("@require_http_methods([\"POST\"])", views)
+        for forbidden in ("target_sha", "command", "systemctl", "shell=True", "csrf_exempt"):
+            self.assertNotIn(forbidden, views)
 
     def test_root_migration_and_live_git_are_explicitly_run_as_user(self):
         executor = (RUNTIME_PACKAGE / "executor.py").read_text(encoding="utf-8")
@@ -104,8 +105,10 @@ class ProtectedRuntimeStaticTests(SimpleTestCase):
     def test_privileged_destinations_come_only_from_config_and_allowlists(self):
         protocol_fields = (RUNTIME_PACKAGE / "protocol.py").read_text(encoding="utf-8")
         self.assertNotIn("destination", protocol_fields)
-        self.assertNotIn("unit", protocol_fields)
-        self.assertNotIn("service", protocol_fields)
+        self.assertNotIn("argv", protocol_fields)
+        self.assertNotIn("command", protocol_fields)
+        config = (RUNTIME_PACKAGE / "config.py").read_text(encoding="utf-8")
+        self.assertIn("operator_restart_units", config)
 
     def test_no_updater_self_replacement(self):
         text = "\n".join(
@@ -123,4 +126,5 @@ class ProtectedRuntimeStaticTests(SimpleTestCase):
     def test_unrestricted_sudo_gate_is_documented(self):
         docs = (PROJECT_ROOT / "docs" / "UPDATE_CENTER.md").read_text(encoding="utf-8")
         self.assertIn("NOPASSWD: ALL", docs)
-        self.assertIn("Before any production Update button", docs)
+        self.assertIn("must remain disarmed", docs)
+        self.assertIn('sudo -l -U "$ISA_USER"', docs)

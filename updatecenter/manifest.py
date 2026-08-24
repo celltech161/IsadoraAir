@@ -60,7 +60,7 @@ SCHEMA_VERSION = 1
 # A manifest whose minimum_updater_protocol_version exceeds what THIS
 # code understands must be refused, never best-effort-interpreted --
 # see validate_manifest_dict's UNSUPPORTED_PROTOCOL check.
-UPDATER_PROTOCOL_VERSION = 1
+UPDATER_PROTOCOL_VERSION = 3
 
 RELEASE_ID_PATTERN = re.compile(r"^r[0-9]{4,}$")
 # "app_label.migration_name", matching Django's own migration-name
@@ -148,6 +148,7 @@ KNOWN_FIELDS = frozenset({
     "nginx_changed",
     "runtime_components_changed",
     "minimum_supported_release_id",
+    "manual_bootstrap_required",
 })
 
 SUMMARY_MAX_LEN = 500
@@ -186,6 +187,7 @@ class ReleaseManifest:
     nginx_changed: bool
     runtime_components_changed: bool
     minimum_supported_release_id: str | None
+    manual_bootstrap_required: bool
 
     @property
     def is_bootstrap(self) -> bool:
@@ -372,6 +374,9 @@ def validate_manifest_dict(data: dict, *, source_label: str = "<manifest>") -> R
         if not RELEASE_ID_PATTERN.match(minimum_supported_release_id):
             raise ManifestError(f"{source_label}: minimum_supported_release_id does not match required pattern")
 
+    manual_bootstrap_required = data.get("manual_bootstrap_required", False)
+    _require_type(manual_bootstrap_required, bool, "manual_bootstrap_required")
+
     return ReleaseManifest(
         schema_version=schema_version,
         release_id=release_id,
@@ -393,6 +398,7 @@ def validate_manifest_dict(data: dict, *, source_label: str = "<manifest>") -> R
         nginx_changed=nginx_changed,
         runtime_components_changed=runtime_components_changed,
         minimum_supported_release_id=minimum_supported_release_id,
+        manual_bootstrap_required=manual_bootstrap_required,
     )
 
 

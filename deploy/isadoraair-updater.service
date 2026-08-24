@@ -27,7 +27,7 @@ ProtectKernelModules=true
 ProtectControlGroups=true
 RestrictSUIDSGID=true
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
-ReadWritePaths=/var/lib/isadoraair-updater /var/log/isadoraair-updater /var/backups/isadoraair/update-checkpoints /etc/systemd/system @@ISA_ROOT@@
+ReadWritePaths=/var/lib/isadoraair-updater /var/log/isadoraair-updater /var/backups/isadoraair/update-checkpoints /var/lib/alsa /etc/systemd/system @@ISA_ROOT@@
 
 [Install]
 WantedBy=multi-user.target

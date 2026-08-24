@@ -17,6 +17,9 @@ TERMINAL_STATES = frozenset({"succeeded", "failed", "manual_intervention_require
 ACTIVE_STATES = frozenset({"accepted", "running"})
 UUID_RE = re.compile(r"^[0-9a-f-]{36}$")
 MAX_JOB_RECORDS = 1000
+MAX_MAINTENANCE_RECORDS = 100
+MAINTENANCE_ACTIONS = frozenset({"RESTART_OPERATOR_SERVICE", "STORE_ALSA_STATE"})
+MAINTENANCE_STATES = frozenset({"accepted", "running", "succeeded", "failed"})
 
 
 class JobError(ValueError):
@@ -49,6 +52,10 @@ class JobStore:
         assert_root_protected(self.logs_root)
         os.chmod(self.jobs_root, 0o700)
         os.chmod(self.logs_root, 0o700)
+        self.maintenance_root = self.jobs_root / "maintenance"
+        self.maintenance_root.mkdir(mode=0o700, exist_ok=True)
+        assert_root_protected(self.maintenance_root)
+        os.chmod(self.maintenance_root, 0o700)
         self._lock_handle = None
         if acquire_daemon_lock:
             lock_path = self.jobs_root / ".daemon.lock"
@@ -77,6 +84,9 @@ class JobStore:
 
     def _log_path(self, job_id: str) -> Path:
         return self.logs_root / f"{_canonical_job_id(job_id)}.log"
+
+    def _maintenance_path(self, operation_id: str) -> Path:
+        return self.maintenance_root / f"{_canonical_job_id(operation_id)}.json"
 
     def _atomic_write(self, path: Path, data: dict):
         raw = json.dumps(data, sort_keys=True, separators=(",", ":")).encode("utf-8") + b"\n"
@@ -239,3 +249,93 @@ class JobStore:
         finally:
             os.close(fd)
         return raw.decode("utf-8", "replace")
+
+    def load_maintenance(self, operation_id: str) -> dict:
+        path = self._maintenance_path(operation_id)
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            fd = os.open(path, flags)
+        except FileNotFoundError as exc:
+            raise JobError("maintenance operation does not exist") from exc
+        try:
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_mode & 0o077
+                    or (os.geteuid() == 0 and info.st_uid != 0)):
+                raise JobError("maintenance result protection is invalid")
+            raw = os.read(fd, 8193)
+        finally:
+            os.close(fd)
+        if len(raw) > 8192:
+            raise JobError("maintenance result exceeds its size limit")
+        try:
+            record = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise JobError("maintenance result is corrupt") from exc
+        expected_fields = {
+            "schema_version", "operation_id", "action", "service", "state",
+            "result_code", "result_detail", "created_at", "updated_at",
+        }
+        if (not isinstance(record, dict) or set(record) != expected_fields
+                or record.get("schema_version") != 1
+                or record.get("operation_id") != operation_id
+                or record.get("action") not in MAINTENANCE_ACTIONS
+                or record.get("state") not in MAINTENANCE_STATES
+                or not isinstance(record.get("result_code"), str)
+                or not isinstance(record.get("result_detail"), str)
+                or len(record["result_code"]) > 64 or len(record["result_detail"]) > 160
+                or not isinstance(record.get("created_at"), str)
+                or not isinstance(record.get("updated_at"), str)):
+            raise JobError("maintenance result identity/schema mismatch")
+        service = record.get("service")
+        if ((record["action"] == "STORE_ALSA_STATE" and service is not None)
+                or (record["action"] == "RESTART_OPERATOR_SERVICE" and not isinstance(service, str))):
+            raise JobError("maintenance result action/service mismatch")
+        return record
+
+    def create_maintenance(self, operation_id: str, action: str, service: str | None) -> dict:
+        _canonical_job_id(operation_id)
+        if action not in MAINTENANCE_ACTIONS:
+            raise JobError("unknown maintenance action")
+        if action == "STORE_ALSA_STATE" and service is not None:
+            raise JobError("ALSA maintenance cannot carry a service")
+        if action == "RESTART_OPERATOR_SERVICE" and not isinstance(service, str):
+            raise JobError("restart maintenance requires an exact service")
+        records = sorted(self.maintenance_root.glob("*.json"), key=lambda path: path.stat().st_mtime)
+        for path in records:
+            if len(records) < MAX_MAINTENANCE_RECORDS:
+                break
+            try:
+                current = self.load_maintenance(path.stem)
+            except JobError:
+                continue
+            if current["state"] in {"succeeded", "failed"}:
+                path.unlink()
+                records.remove(path)
+        if len(records) >= MAX_MAINTENANCE_RECORDS:
+            raise JobError("maintenance result retention limit reached")
+        now = _now()
+        record = {
+            "schema_version": 1,
+            "operation_id": operation_id,
+            "action": action,
+            "service": service,
+            "state": "accepted",
+            "result_code": "",
+            "result_detail": "",
+            "created_at": now,
+            "updated_at": now,
+        }
+        self._atomic_write(self._maintenance_path(operation_id), record)
+        return record
+
+    def update_maintenance(self, operation_id: str, *, state: str,
+                           result_code: str = "", result_detail: str = "") -> dict:
+        if state not in MAINTENANCE_STATES - {"accepted"}:
+            raise JobError("invalid maintenance state transition")
+        record = self.load_maintenance(operation_id)
+        record["state"] = state
+        record["result_code"] = re.sub(r"[^A-Z0-9_]", "_", str(result_code).upper())[:64]
+        record["result_detail"] = re.sub(r"[^A-Za-z0-9_. -]", "?", str(result_detail))[:160]
+        record["updated_at"] = _now()
+        self._atomic_write(self._maintenance_path(operation_id), record)
+        return record

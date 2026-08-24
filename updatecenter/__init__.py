@@ -1,17 +1,14 @@
 """IsadoraAir Managed Update Center -- [P0] Bucket 1 / 1.1.
 
-Phase A (this app, as it exists right now): non-privileged foundation
-only. Release-manifest schema + validation (`manifest.py`), release-
+Phase A established the non-privileged planning foundation. Release-manifest schema + validation (`manifest.py`), release-
 chain assembly (`release_chain.py`), read-only git operations
 (`git_adapter.py`), manifest-vs-repository cross-checking
 (`cross_check.py`), update planning (`planner.py`), the durable
-`UpdateJob` schema (`models.py`), and a read-only `/updates/` status
-page (`views.py`). There is no working "Update IsadoraAir" execution
-path anywhere in this app, no privileged code, and nothing here
-changes the checkout, runs a migration, runs pip, installs a systemd
-unit, reloads systemd, restarts a service, writes nginx config, or
-runs apt. See docs/UPDATE_CENTER.md for the full design and the
-authoritative shipped contract.
+`UpdateJob` schema (`models.py`), and `/updates/` status page remain.
+Phase C adds a superuser-only submission/status UI and a narrow client for the
+separately installed protocol-v3 root broker. No privileged code executes from
+this package; package/apt/rollback/updater-self-update scope remains blocked.
+See docs/UPDATE_CENTER.md for the authoritative shipped contract.
 
 ## Bootstrap note
 

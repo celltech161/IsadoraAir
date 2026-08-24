@@ -1,5 +1,4 @@
 import json
-import subprocess
 import time
 from datetime import timedelta
 from pathlib import Path
@@ -11,8 +10,9 @@ from django.views.decorators.http import require_http_methods
 
 from django.utils import timezone as django_tz
 
-from .models import ListenerPeak, MonitorCheck, SystemEvent
+from .models import ListenerPeak, MonitorCheck, SystemEvent, emit_event
 from .services.release_status import get_release_status
+from updatecenter.backend_client import BackendError, UpdaterClient
 
 STATE_PATH = Path("/run/isadoraair/monitoring_state.json")
 LISTENER_STATE_PATH = Path("/run/isadoraair/listeners.json")
@@ -56,20 +56,37 @@ def api_monitoring_status(request):
 
 @require_http_methods(["POST"])
 def api_restart_check(request, check_id):
-    """Restart the systemd unit backing one MonitorCheck card. The unit
-    name always comes from the check row itself (never from the
-    request) -- the client only ever supplies a check id, so this can't
-    be used to restart an arbitrary unit on the box. Fire-and-forget
-    Popen, same as the original engine-restart button this replaces:
-    a blocking subprocess.run here would tie up a gunicorn worker for
-    the duration of the stop/start (or hang the request entirely if the
-    unit's stop-timeout is ever hit, as happened for real with the
-    playback engine earlier -- see PROJECT_NOTES.md)."""
+    """Request a bounded asynchronous restart for one MonitorCheck card.
+
+    The database unit is only a requested identifier, never root authority:
+    the protected broker independently requires exact membership in its
+    root-owned station allowlist. The broker admits at most one maintenance
+    worker and acknowledges promptly, so Gunicorn never owns a potentially
+    long systemd stop/start operation.
+    """
     check = get_object_or_404(MonitorCheck, pk=check_id, kind="systemd")
     if not check.systemd_unit:
         return JsonResponse({"error": "No systemd unit configured for this check"}, status=400)
-    subprocess.Popen(["sudo", "systemctl", "restart", check.systemd_unit])
-    return JsonResponse({"ok": True, "unit": check.systemd_unit})
+    try:
+        result = UpdaterClient().restart_operator_service(check.systemd_unit)
+    except BackendError as exc:
+        emit_event(
+            category="monitoring",
+            level="error",
+            title="Protected service restart request rejected",
+            detail={"check_id": check.pk, "unit": check.systemd_unit, "error": str(exc)[:500]},
+            dedupe_key=f"monitoring|protected_restart_failed|{check.pk}",
+        )
+        return JsonResponse(
+            {"ok": False, "error": "Protected restart broker unavailable or request rejected"},
+            status=503,
+        )
+    return JsonResponse({
+        "ok": True,
+        "unit": check.systemd_unit,
+        "operation_id": result.get("operation_id"),
+        "state": result.get("state"),
+    }, status=202)
 
 
 @require_http_methods(["GET"])

@@ -1,14 +1,15 @@
 import json
-import subprocess
 from pathlib import Path
 
-from django.contrib import admin
+from django.contrib import admin, messages
 from django.http import HttpResponseRedirect
 from django.urls import reverse
 from django.utils.html import format_html, format_html_join
 
 from .models import RBDSConfig, RBDSMessage, RBDSPSFrame
 from .services import dynamic_ps
+from monitoring.models import emit_event
+from updatecenter.backend_client import BackendError, UpdaterClient
 
 # Same path RBDSManager's own NOW_PLAYING_PATH points at (rbds_manager.py,
 # read-only, owned by library/services/engine.py) -- deliberately a
@@ -207,7 +208,35 @@ class RBDSConfigAdmin(admin.ModelAdmin):
         # every ~1s tick, so content-only changes need no restart at
         # all to take effect.
         if not change or self.RESTART_TOPOLOGY_FIELDS.intersection(form.changed_data):
-            subprocess.Popen(["sudo", "systemctl", "restart", "isadoraair-rbds"])
+            try:
+                result = UpdaterClient().restart_operator_service("isadoraair-rbds.service")
+                if result.get("state") in {"accepted", "running"}:
+                    operation_id = str(result.get("operation_id", ""))[:36]
+                    if request is not None:
+                        messages.warning(
+                            request,
+                            f"RBDS restart is still pending (operation {operation_id}).",
+                        )
+                    emit_event(
+                        category="rbds", level="warning",
+                        title="Protected RBDS restart remains pending",
+                        detail={"operation_id": operation_id},
+                        dedupe_key="rbds|protected_restart_pending",
+                    )
+            except BackendError as exc:
+                if request is not None:
+                    messages.error(
+                        request,
+                        "RBDS configuration was saved, but the protected broker could "
+                        f"not request the RBDS restart: {str(exc)[:160]}",
+                    )
+                emit_event(
+                    category="rbds",
+                    level="error",
+                    title="Protected RBDS restart request failed after topology save",
+                    detail={"error": str(exc)[:500]},
+                    dedupe_key="rbds|protected_restart_failed",
+                )
 
 
 @admin.register(RBDSPSFrame)

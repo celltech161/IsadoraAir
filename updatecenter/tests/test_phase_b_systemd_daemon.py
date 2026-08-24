@@ -38,7 +38,8 @@ def plan(**changes):
         systemd_units_new_optional=(), systemd_units_removed_or_renamed=(),
         collectstatic_required=False, services_requiring_restart=(),
         nginx_changed=False, runtime_components_changed=False,
-        minimum_updater_protocol_version=1, fingerprint="f" * 64,
+        minimum_updater_protocol_version=1, manual_bootstrap_required=False,
+        fingerprint="f" * 64,
     )
     data.update(changes)
     return TrustedPlan(**data)
@@ -150,7 +151,7 @@ class DaemonPeerTests(SimpleTestCase):
             self.config, store=self.store, executor=_NeverExecutor(),
             authorized_uids={os.getuid()}, authorized_gids=set(),
         )
-        response = self._roundtrip(daemon, {"protocol_version": 1, "action": "PING"})
+        response = self._roundtrip(daemon, {"protocol_version": 3, "action": "PING"})
         self.assertTrue(response["ok"])
 
     def test_bad_peer_denied_before_dispatch(self):
@@ -158,7 +159,7 @@ class DaemonPeerTests(SimpleTestCase):
             self.config, store=self.store, executor=_NeverExecutor(),
             authorized_uids={999999}, authorized_gids={999999},
         )
-        response = self._roundtrip(daemon, {"protocol_version": 1, "action": "PING"})
+        response = self._roundtrip(daemon, {"protocol_version": 3, "action": "PING"})
         self.assertFalse(response["ok"])
         self.assertIn("authorized", response["detail"])
 

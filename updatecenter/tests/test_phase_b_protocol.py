@@ -5,10 +5,11 @@ from django.test import SimpleTestCase
 
 from .phase_b_helpers import RUNTIME_ROOT  # also installs runtime on sys.path
 from isadoraair_updater.protocol import MAX_REQUEST_BYTES, ProtocolError, decode_request, encode_response
+from isadoraair_updater import PROTOCOL_VERSION
 
 
 def _request(**changes):
-    data = {"protocol_version": 1, "action": "PING"}
+    data = {"protocol_version": PROTOCOL_VERSION, "action": "PING"}
     data.update(changes)
     return json.dumps(data).encode()
 

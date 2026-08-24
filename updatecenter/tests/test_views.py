@@ -81,15 +81,13 @@ class NoExecutionEndpointTests(TestCase):
     this app -- not "the button is disabled in HTML" but "the endpoint
     literally does not exist to route to.\""""
 
-    def test_no_start_update_url_exists(self):
-        for name in ("start-update", "update", "execute-update", "run-update", "apply-update"):
-            with self.assertRaises(NoReverseMatch):
-                reverse(f"updatecenter:{name}")
+    def test_start_update_url_now_exists(self):
+        self.assertEqual(reverse("updatecenter:start-update"), "/updates/start/")
 
-    def test_only_two_urls_are_registered(self):
+    def test_only_narrow_phase_c_urls_are_registered(self):
         from updatecenter.urls import urlpatterns
         names = sorted(p.name for p in urlpatterns)
-        self.assertEqual(names, ["check-for-updates", "dashboard"])
+        self.assertEqual(names, ["check-for-updates", "dashboard", "job-status", "start-update"])
 
 
 @override_settings(SECURE_SSL_REDIRECT=False)

@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "release_id": "r0004",
+  "previous_release_id": "r0003",
+  "minimum_updater_protocol_version": 3,
+  "summary": "Phase C manual-bootstrap checkpoint: adds protocol-v3 protected maintenance actions, observable bounded results, and root execution arming; removes direct web sudo paths; integrates the durable Update Center; and explicitly requires manual privileged bootstrap without misclassifying its additive migrations.",
+  "migrations_required": [
+    "updatecenter.0002_alter_updatejob_state",
+    "library.0080_seed_updates_nav_item"
+  ],
+  "migration_compatibility": "additive",
+  "manual_bootstrap_required": true,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [
+    "isadoraair-updater.service"
+  ],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-gunicorn"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0003"
+}

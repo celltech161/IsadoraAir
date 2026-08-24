@@ -241,6 +241,16 @@ class RejectionTests(SimpleTestCase):
         with self.assertRaisesMessage(m.ManifestError, "requires updater protocol"):
             m.validate_manifest_dict(_valid_bootstrap(minimum_updater_protocol_version=999))
 
+    def test_manual_bootstrap_gate_is_optional_false_or_explicit_boolean(self):
+        self.assertFalse(m.validate_manifest_dict(_valid_followup()).manual_bootstrap_required)
+        self.assertTrue(
+            m.validate_manifest_dict(
+                _valid_followup(manual_bootstrap_required=True)
+            ).manual_bootstrap_required
+        )
+        with self.assertRaisesMessage(m.ManifestError, "manual_bootstrap_required"):
+            m.validate_manifest_dict(_valid_followup(manual_bootstrap_required="yes"))
+
     def test_non_dict_manifest_rejected(self):
         with self.assertRaises(m.ManifestError):
             m.validate_manifest_dict(["not", "a", "dict"])

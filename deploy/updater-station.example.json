@@ -1,5 +1,14 @@
 {
   "schema_version": 1,
+  "update_execution_enabled": false,
+  "operator_restart_units": [
+    "isadoraair-engine.service",
+    "isadoraair-rbds.service",
+    "isadoraair-gunicorn.service",
+    "isadoraair-encoders.service",
+    "nginx.service",
+    "stereotool.service"
+  ],
   "trusted_repository_url": "git@github.com:celltech161/IsadoraAir.git",
   "trusted_branch": "main",
   "application_root": "/opt/isadoraair",
@@ -28,5 +37,5 @@
     "port": 5432,
     "pgpass_file": "/home/isadoraair/.pgpass"
   },
-  "gunicorn_health_url": "http://127.0.0.1:8000/login/"
+  "gunicorn_health_url": "http://127.0.0.1:8000/healthz/"
 }

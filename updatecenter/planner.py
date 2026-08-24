@@ -62,6 +62,7 @@ class SafetyStatus:
     CROSS_CHECK_FAILED = "cross_check_failed"
     MANUAL_SYSTEM_PACKAGE_ACTION_REQUIRED = "manual_system_package_action_required"
     MIGRATION_MANUAL_GATE_REQUIRED = "migration_manual_gate_required"
+    MANUAL_BOOTSTRAP_REQUIRED = "manual_bootstrap_required"
     # [P0] 1.1 correction: a real production incident (see docs/
     # UPDATE_CENTER.md's "Schema vs. feature activation" section)
     # proved that a migration absent from every release manifest's
@@ -128,6 +129,7 @@ class Plan:
     nginx_changed: bool
     runtime_components_changed: bool
     minimum_updater_protocol_version: int
+    manual_bootstrap_required: bool
     cross_check_findings: tuple[cross_check.CrossCheckFinding, ...]
     fingerprint: str  # stable hash of this plan's own content, for Phase B revalidation (§10)
     # [P0] 1.1 correction: independent of safety_status/releases_in_plan
@@ -171,6 +173,7 @@ class Plan:
             "nginx_changed": self.nginx_changed,
             "runtime_components_changed": self.runtime_components_changed,
             "minimum_updater_protocol_version": self.minimum_updater_protocol_version,
+            "manual_bootstrap_required": self.manual_bootstrap_required,
             "schema_health_status": self.schema_health_status,
             "schema_pending_migrations": list(self.schema_pending_migrations),
             "target_schema_validation_status": self.target_schema_validation_status,
@@ -209,6 +212,7 @@ def _safe(safety_status: str, detail: str, schema_health: schema_health_mod.Sche
         collectstatic_required=False, services_requiring_restart=(),
         nginx_changed=False, runtime_components_changed=False,
         minimum_updater_protocol_version=manifest_mod.UPDATER_PROTOCOL_VERSION,
+        manual_bootstrap_required=False,
         cross_check_findings=(),
         schema_health_status=schema_health.status,
         schema_pending_migrations=schema_health.pending_migrations,
@@ -485,6 +489,7 @@ def build_plan(checkout_root, releases_dirname: str = release_chain.RELEASES_DIR
     runtime_components_changed = False
     compatibility_seen: set[str] = set()
     minimum_protocol = 1
+    manual_bootstrap_required = False
 
     for chained in releases_in_plan:
         m = chained.manifest
@@ -509,6 +514,7 @@ def build_plan(checkout_root, releases_dirname: str = release_chain.RELEASES_DIR
         nginx_changed = nginx_changed or m.nginx_changed
         runtime_components_changed = runtime_components_changed or m.runtime_components_changed
         minimum_protocol = max(minimum_protocol, m.minimum_updater_protocol_version)
+        manual_bootstrap_required = manual_bootstrap_required or m.manual_bootstrap_required
         if m.migrations_required:
             compatibility_seen.add(m.migration_compatibility)
 
@@ -539,7 +545,12 @@ def build_plan(checkout_root, releases_dirname: str = release_chain.RELEASES_DIR
 
     safety_status = SafetyStatus.READY_TO_PLAN
     safety_detail = f"{len(releases_in_plan)} release(s) available: {', '.join(c.manifest.release_id for c in releases_in_plan)}."
-    if apt_new:
+    if manual_bootstrap_required:
+        safety_status = SafetyStatus.MANUAL_BOOTSTRAP_REQUIRED
+        safety_detail = (
+            "This release chain explicitly requires manual bootstrap and cannot use unattended execution."
+        )
+    elif apt_new:
         safety_status = SafetyStatus.MANUAL_SYSTEM_PACKAGE_ACTION_REQUIRED
         safety_detail = f"New apt package(s) required: {', '.join(apt_new)} -- must be installed manually before this update can proceed."
     elif migrations is not None and migrations.compatibility == "destructive":
@@ -565,6 +576,7 @@ def build_plan(checkout_root, releases_dirname: str = release_chain.RELEASES_DIR
         nginx_changed=nginx_changed,
         runtime_components_changed=runtime_components_changed,
         minimum_updater_protocol_version=minimum_protocol,
+        manual_bootstrap_required=manual_bootstrap_required,
     )
 
     return Plan(
@@ -584,6 +596,7 @@ def build_plan(checkout_root, releases_dirname: str = release_chain.RELEASES_DIR
         nginx_changed=nginx_changed,
         runtime_components_changed=runtime_components_changed,
         minimum_updater_protocol_version=minimum_protocol,
+        manual_bootstrap_required=manual_bootstrap_required,
         cross_check_findings=(),
         fingerprint=execution_fp,
         schema_health_status=schema_health.status,

@@ -14,6 +14,7 @@ from .devices import (
 )
 from .models import AudioInput, AudioOutput, AudioPipeline, DuckingConfig, RemoteDJAudioInput
 from monitoring.models import emit_event
+from updatecenter.backend_client import BackendError, UpdaterClient
 
 # Must match engine.py's STUDIO_MONITOR_NAME.
 STUDIO_MONITOR_NAME = "Studio Monitor"
@@ -31,12 +32,22 @@ def _alsa_store(request=None):
     be wasted). Failure is logged but non-fatal -- the live state is
     already correct; only the reboot survivability is at risk."""
     try:
-        subprocess.run(
-            ["sudo", "-n", "/usr/sbin/alsactl", "store"],
-            capture_output=True, text=True, timeout=10, check=True,
-        )
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as exc:
-        stderr = getattr(exc, "stderr", "") or str(exc)
+        result = UpdaterClient().store_alsa_state()
+        if result.get("state") in {"accepted", "running"}:
+            operation_id = str(result.get("operation_id", ""))[:36]
+            if request is not None:
+                messages.warning(
+                    request,
+                    f"ALSA persistence was accepted but is still pending (operation {operation_id}).",
+                )
+            emit_event(
+                category="hardware", level="warning",
+                title="ALSA persistence remains pending in protected broker",
+                detail={"operation_id": operation_id},
+                dedupe_key="hardware|alsactl_store_pending",
+            )
+    except BackendError as exc:
+        stderr = str(exc)
         if request is not None:
             messages.warning(
                 request,
@@ -346,7 +357,35 @@ class AudioPipelineAdmin(admin.ModelAdmin):
         # session start, neither needs a rebuild.
         restart_fields = {"sample_rate", "program_gain_db"}
         if restart_fields & set(form.changed_data):
-            subprocess.Popen(["sudo", "systemctl", "restart", "isadoraair-engine"])
+            try:
+                result = UpdaterClient().restart_operator_service("isadoraair-engine.service")
+                if result.get("state") in {"accepted", "running"}:
+                    operation_id = str(result.get("operation_id", ""))[:36]
+                    if request is not None:
+                        messages.warning(
+                            request,
+                            f"Engine restart is still pending (operation {operation_id}).",
+                        )
+                    emit_event(
+                        category="hardware", level="warning",
+                        title="Protected engine restart remains pending",
+                        detail={"operation_id": operation_id},
+                        dedupe_key="hardware|protected_engine_restart_pending",
+                    )
+            except BackendError as exc:
+                if request is not None:
+                    messages.error(
+                        request,
+                        "Audio configuration was saved, but the protected broker could not "
+                        f"request the engine restart: {str(exc)[:160]}",
+                    )
+                emit_event(
+                    category="hardware",
+                    level="error",
+                    title="Protected engine restart request failed after audio pipeline save",
+                    detail={"error": str(exc)[:500]},
+                    dedupe_key="hardware|protected_engine_restart_failed",
+                )
 
 
 class _DeviceFieldAdmin(admin.ModelAdmin):
