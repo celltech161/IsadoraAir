@@ -2506,6 +2506,132 @@ class RBDSManagerPsStateFileTests(TestCase):
         self.assertNotIn("dynamic_ps_text", state)
 
 
+@mock.patch("rbds.services.rbds_manager.close_old_connections", new=lambda: None)
+class RBDSManagerResolvedTelemetryTests(TestCase):
+    """The state file reports the same resolved Long PS and category-aware
+    PTY/PTYN values used by the manager without changing its send gate."""
+
+    def setUp(self):
+        self.mgr = RBDSManager()
+        self.sent = []
+        self.mgr._transmit = mock.Mock(
+            side_effect=lambda config, payload: self.sent.append(payload)
+        )
+        self.mgr._read_now_playing = mock.Mock(
+            return_value={"title": "", "artist": ""}
+        )
+        self.mgr._read_category_state = mock.Mock(
+            return_value={"pty_override": None, "ptyn": ""}
+        )
+        self.mgr._last_send_ct_state = False
+        self.mgr._last_full_resend = time.time()
+        self.mgr._connected = True
+        self.mgr._connected_since = 1.0
+        self.mgr._last_ct_synced_connected_since = 1.0
+        self.config = RBDSConfig.load()
+        self.config.protocol = "uecp"
+        self.config.use_rt_plus = False
+        self.config.send_ct = False
+        self.config.pty = 14
+        self.config.save()
+        self.tmpdir = tempfile.mkdtemp(prefix="isadoraair-rbds-telemetry-test-")
+        self.addCleanup(shutil.rmtree, self.tmpdir, ignore_errors=True)
+        self.state_path = Path(self.tmpdir) / "rbds_state.json"
+
+    def _tick_and_read(self):
+        with mock.patch("rbds.services.rbds_manager.STATE_PATH", self.state_path):
+            self.mgr._tick()
+        return json.loads(self.state_path.read_text())
+
+    def test_station_default_pty_and_shared_name_are_exposed(self):
+        state = self._tick_and_read()
+        self.assertEqual(state["current_pty"], 14)
+        self.assertEqual(state["current_pty_name"], "Jazz")
+        self.assertEqual(state["current_ptyn"], "")
+
+    def test_category_pty_and_ptyn_overrides_are_exposed_and_sent(self):
+        self.mgr._read_category_state.return_value = {
+            "pty_override": 29,
+            "ptyn": "WEATHER",
+        }
+        state = self._tick_and_read()
+        self.assertEqual(state["current_pty"], 29)
+        self.assertEqual(state["current_pty_name"], "Weather")
+        self.assertEqual(state["current_ptyn"], "WEATHER")
+        frames = _split_uecp_frames(self.sent[-1])
+        self.assertEqual(bytes(_find_mec(frames, 0x07)), uecp.mec_pty(29))
+        self.assertEqual(bytes(_find_mec(frames, 0x3E)), uecp.mec_ptyn("WEATHER"))
+
+    def test_normalized_truncated_ptyn_matches_transmitted_field(self):
+        raw_ptyn = "ABCD…EFGH"
+        expected = charset.normalize_text(raw_ptyn)[:8]
+        self.assertEqual(expected, "ABCD...E")
+        self.mgr._read_category_state.return_value = {
+            "pty_override": 14,
+            "ptyn": raw_ptyn,
+        }
+        state = self._tick_and_read()
+        self.assertEqual(state["current_ptyn"], expected)
+        frames = _split_uecp_frames(self.sent[-1])
+        self.assertEqual(bytes(_find_mec(frames, 0x3E)), uecp.mec_ptyn(expected))
+
+    def test_unmanaged_long_ps_is_exposed_truthfully(self):
+        self.config.long_ps_managed = False
+        self.config.long_ps_enabled = True  # ignored while ownership is off
+        self.config.long_ps_static_text = "NOT MANAGED"
+        self.config.save()
+        state = self._tick_and_read()
+        self.assertFalse(state["long_ps_managed"])
+        self.assertFalse(state["long_ps_enabled"])
+        self.assertEqual(state["current_long_ps"], "")
+
+    def test_managed_disabled_long_ps_is_exposed_truthfully(self):
+        self.config.long_ps_managed = True
+        self.config.long_ps_enabled = False
+        self.config.save()
+        state = self._tick_and_read()
+        self.assertTrue(state["long_ps_managed"])
+        self.assertFalse(state["long_ps_enabled"])
+        self.assertEqual(state["current_long_ps"], "")
+
+    def test_managed_enabled_long_ps_exposes_resolved_text(self):
+        self.config.long_ps_managed = True
+        self.config.long_ps_enabled = True
+        self.config.long_ps_source = "static"
+        self.config.long_ps_static_text = "OAK GROVE RADIO 98.5"
+        self.config.save()
+        state = self._tick_and_read()
+        self.assertTrue(state["long_ps_managed"])
+        self.assertTrue(state["long_ps_enabled"])
+        self.assertEqual(state["current_long_ps"], "OAK GROVE RADIO 98.5")
+
+    def test_long_now_playing_value_matches_transmitted_32_character_field(self):
+        artist = "An Extremely Long Artist Name"
+        title = "A Very Long Song Title"
+        expected = charset.normalize_text(f"{artist} - {title}")[:32]
+        self.assertEqual(len(expected), 32)
+        self.config.long_ps_managed = True
+        self.config.long_ps_enabled = True
+        self.config.long_ps_source = "now_playing"
+        self.config.save()
+        self.mgr._read_now_playing.return_value = {
+            "artist": artist,
+            "title": title,
+        }
+        state = self._tick_and_read()
+        self.assertEqual(state["current_long_ps"], expected)
+        frames = _split_uecp_frames(self.sent[-1])
+        self.assertEqual(bytes(_find_mec(frames, 0x21)), uecp.mec_long_ps(expected))
+
+    def test_dynamic_pty_database_work_remains_inside_send_gate(self):
+        self.mgr._effective_dynamic_pty = mock.Mock(return_value=False)
+        self._tick_and_read()  # initial content send
+        self._tick_and_read()  # unchanged telemetry-only tick
+        self.mgr._effective_dynamic_pty.assert_called_once_with(self.config)
+        self.assertEqual(self.mgr._read_category_state.call_count, 2)
+        self.assertEqual(len(self.sent), 1)
+
+
 @mock.patch("rbds.admin.UpdaterClient")
 class RBDSConfigAdminRestartScopingTests(TestCase):
     """2026-08-18 restart-scoping fix -- RBDSConfigAdmin.save_model()

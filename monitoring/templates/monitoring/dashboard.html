@@ -54,12 +54,11 @@
     grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
     gap: 0.55rem;
   }
-  /* Services cards are short on content (LED + uptime + restart button)
-     -- narrower than the shared 210px default so a typical desktop
-     width fits all of them (7 as of this row's addition) on one line
-     instead of wrapping to a second row. Other groups' cards (bars,
-     readings, RBDS text boxes) keep the wider default. */
-  .mon-group-services .mon-cards {
+  /* These dense operational rows use the narrower card minimum while
+     other Monitoring groups retain the shared 210px default. */
+  .mon-group-services .mon-cards,
+  .mon-group-system .mon-cards,
+  .mon-group-transmitter .mon-cards {
     grid-template-columns: repeat(auto-fill, minmax(175px, 1fr));
   }
   .mon-card {
@@ -191,6 +190,7 @@
   .mon-value-text.warning { color: #f59e0b; }
   .mon-value-text.critical { color: var(--danger); }
   .mon-value-text.unknown { color: var(--text-muted); }
+  .mon-group-transmitter .mon-value-text { font-size: 1rem; }
 
   .mon-cores-grid {
     display: grid;
@@ -246,13 +246,39 @@
      directly before this moved here) --- */
   .mon-rbds-ps-box {
     font-family: monospace;
-    font-size: 1.1rem;
-    letter-spacing: 0.15em;
+    font-size: 1rem;
     background: var(--bg-dark);
     border: 1px solid var(--border-subtle);
-    border-radius: 6px;
-    padding: 0.4rem 0.6rem;
+    border-radius: 5px;
+    box-sizing: content-box;
+    width: 8ch;
+    flex: 0 0 8ch;
+    padding: 0.25rem 0.4rem;
     display: inline-block;
+    overflow: hidden;
+    white-space: pre;
+  }
+  .mon-rbds-summary-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.45rem;
+    min-width: 0;
+    margin-top: 0.3rem;
+  }
+  .mon-rbds-summary-row:first-of-type { margin-top: 0; }
+  .mon-rbds-summary-label {
+    flex: 0 0 auto;
+    color: var(--text-muted);
+    font-size: 0.72rem;
+    font-weight: 600;
+  }
+  .mon-rbds-summary-value {
+    min-width: 0;
+    color: var(--text-main);
+    font-size: 0.76rem;
+    font-weight: 600;
+    overflow-wrap: anywhere;
   }
   .mon-rbds-rt-text {
     font-size: 0.95rem;
@@ -384,11 +410,7 @@
   <div class="mon-card" id="aircheckCard">
     <div class="mon-card-top">
       <span class="mon-card-name">Aircheck</span>
-      <span class="mon-pill" id="aircheckPill">idle</span>
-    </div>
-    <div class="mon-led-row">
-      <span class="mon-led" id="aircheckLed"></span>
-      <span class="mon-led-caption" id="aircheckCaption">Not recording</span>
+      <span class="mon-pill ok" id="aircheckPill">READY</span>
     </div>
     <div class="mon-card-detail" id="aircheckDetail" style="min-height:1.2rem;"></div>
     <div id="aircheckBufferBar"></div>
@@ -403,8 +425,22 @@
   <h2>RBDS</h2>
   <div class="mon-cards">
     <div class="mon-card">
-      <div class="mon-card-top"><span class="mon-card-name">Current PS</span></div>
-      <div class="mon-rbds-ps-box" id="rbdsPs">--------</div>
+      <div class="mon-rbds-summary-row">
+        <span class="mon-card-name">Current PS</span>
+        <span class="mon-rbds-ps-box" id="rbdsPs">--------</span>
+      </div>
+      <div class="mon-rbds-summary-row">
+        <span class="mon-rbds-summary-label">Long PS</span>
+        <span class="mon-rbds-summary-value" id="rbdsLongPs">&mdash;</span>
+      </div>
+      <div class="mon-rbds-summary-row">
+        <span class="mon-rbds-summary-label">PTY</span>
+        <span class="mon-rbds-summary-value" id="rbdsPty">&mdash;</span>
+      </div>
+      <div class="mon-rbds-summary-row">
+        <span class="mon-rbds-summary-label">PTYN</span>
+        <span class="mon-rbds-summary-value" id="rbdsPtyn">&mdash;</span>
+      </div>
     </div>
 
     <div class="mon-card">
@@ -414,19 +450,14 @@
     </div>
 
     <div class="mon-card">
-      <div class="mon-card-top"><span class="mon-card-name">Connection</span></div>
-      <div class="mon-led-row">
-        <span class="mon-led unknown" id="rbdsLed"></span>
-        <span class="mon-led-caption" id="rbdsLedCaption">Unknown</span>
+      <div class="mon-card-top">
+        <span class="mon-card-name">Connection</span>
+        <span class="mon-pill unknown" id="rbdsConnectionPill">UNKNOWN</span>
       </div>
+      <div class="mon-card-detail" id="rbdsProtocol">&mdash;</div>
       <div class="mon-card-detail" id="rbdsSince"></div>
-      <div class="mon-card-detail" id="rbdsError" style="display:none; color:var(--danger);"></div>
-    </div>
-
-    <div class="mon-card">
-      <div class="mon-card-top"><span class="mon-card-name">Protocol</span></div>
-      <div class="mon-rbds-rt-text" id="rbdsProtocol">&mdash;</div>
       <div class="mon-card-detail" id="rbdsLastSend"></div>
+      <div class="mon-card-detail" id="rbdsError" style="display:none; color:var(--danger);"></div>
     </div>
   </div>
 </div>
@@ -999,21 +1030,40 @@ async function pollRbdsStatus() {
     document.getElementById("rbdsPs").textContent = data.current_ps || "--------";
     document.getElementById("rbdsRt").textContent = data.current_rt || "—";
 
+    let longPs = "—";
+    if (data.long_ps_managed === false) {
+      longPs = "Unmanaged";
+    } else if (data.long_ps_managed === true && data.long_ps_enabled === false) {
+      longPs = "Disabled";
+    } else if (data.long_ps_managed === true && data.long_ps_enabled === true) {
+      longPs = data.current_long_ps || "—";
+    }
+    document.getElementById("rbdsLongPs").textContent = longPs;
+
+    const hasPty = data.current_pty !== null && data.current_pty !== undefined;
+    document.getElementById("rbdsPty").textContent = hasPty
+      ? `${data.current_pty}${data.current_pty_name ? " · " + data.current_pty_name : ""}`
+      : "—";
+    document.getElementById("rbdsPtyn").textContent = data.current_ptyn || "—";
+
     const sourceLabel = data.rt_source === "promo"
       ? `Promo: ${data.rt_source_name || ""}`
       : "Now Playing";
     document.getElementById("rbdsRtSource").textContent = data.current_rt ? sourceLabel : "";
 
-    const led = document.getElementById("rbdsLed");
-    const caption = document.getElementById("rbdsLedCaption");
+    const connectionPill = document.getElementById("rbdsConnectionPill");
     const since = document.getElementById("rbdsSince");
-    if (data.connected) {
-      led.className = "mon-led ok";
-      caption.textContent = "OK";
+    if (data.stale || (data.connected !== true && data.connected !== false)) {
+      connectionPill.className = "mon-pill unknown";
+      connectionPill.textContent = "UNKNOWN";
+      since.textContent = "";
+    } else if (data.connected === true) {
+      connectionPill.className = "mon-pill ok";
+      connectionPill.textContent = "CONNECTED";
       since.textContent = data.connected_since ? `Connected since ${window.stationFormatString(data.connected_since * 1000)}` : "";
     } else {
-      led.className = "mon-led critical";
-      caption.textContent = "DOWN";
+      connectionPill.className = "mon-pill critical";
+      connectionPill.textContent = "DOWN";
       since.textContent = data.down_since ? `Down since ${window.stationFormatString(data.down_since * 1000)}` : "";
     }
 
@@ -1026,7 +1076,7 @@ async function pollRbdsStatus() {
     }
 
     document.getElementById("rbdsProtocol").textContent = data.protocol
-      ? `${data.protocol.toUpperCase()} / ${(data.transport || "").toUpperCase()} → ${data.host}:${data.port}`
+      ? `Protocol: ${data.protocol.toUpperCase()}/${(data.transport || "").toUpperCase()} → ${data.host}:${data.port}`
       : "—";
     document.getElementById("rbdsLastSend").textContent = data.last_send_at ? `Last sent ${rbdsTimeAgo(data.last_send_at)}` : "";
 
@@ -1224,14 +1274,12 @@ async function pollAircheck() {
     const recent = data.recent_session;
     const finalizing = !rec && !!recent && recent.finalization === 'finalizing';
 
-    let pillText, stateClass, caption;
-    if (rec) { pillText = 'rec'; stateClass = 'critical'; caption = 'Recording'; }
-    else if (finalizing) { pillText = 'finalizing'; stateClass = 'warning'; caption = 'Finalizing'; }
-    else { pillText = 'idle'; stateClass = 'unknown'; caption = 'Ready'; }
+    let pillText, stateClass;
+    if (rec) { pillText = 'REC'; stateClass = 'critical'; }
+    else if (finalizing) { pillText = 'FINALIZING'; stateClass = 'warning'; }
+    else { pillText = 'READY'; stateClass = 'ok'; }
     document.getElementById('aircheckPill').textContent = pillText;
     document.getElementById('aircheckPill').className = 'mon-pill ' + stateClass;
-    document.getElementById('aircheckLed').className = 'mon-led ' + stateClass;
-    document.getElementById('aircheckCaption').textContent = caption;
     document.getElementById('aircheckBtn').textContent = rec ? 'Stop' : 'Start';
 
     const guard = bufferGuardStatus(buffer, rec);
@@ -1345,7 +1393,7 @@ pollRbdsStatus();
 loadRecentEvents();
 pollAircheck();
 setInterval(pollStatus, 5000);
-setInterval(pollRbdsStatus, 5000);
+setInterval(pollRbdsStatus, 500);
 setInterval(loadRecentEvents, 15000);
 setInterval(pollAircheck, 3000);
 </script>

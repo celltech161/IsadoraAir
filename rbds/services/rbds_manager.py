@@ -23,6 +23,7 @@ from rbds.models import RBDSConfig, RBDSMessage, RBDSPSFrame  # noqa: E402
 from rbds.services import ascii_protocol, dynamic_ps, uecp  # noqa: E402
 from rbds.services.charset import normalize_text  # noqa: E402
 from rbds.services.content_fetch import ContentFetchCache  # noqa: E402
+from rbds.services.rbds_pty import RBDS_PTY_CHOICES  # noqa: E402
 from rbds.services.rotation import PSRotation, RTRotation  # noqa: E402
 from isadoraair.version_info import capture_runtime_commit  # noqa: E402
 
@@ -354,6 +355,13 @@ class RBDSManager:
         changed = target_ps != self._last_sent_ps or rt_changed or language_changed or long_ps_changed
         due_for_full_resend = (time.time() - self._last_full_resend) >= FULL_RESEND_SECONDS
 
+        # Category-aware PTY/PTYN is useful both to the wire payload and
+        # operator telemetry. Resolve the existing category-state file once
+        # per tick so both consumers see the same snapshot. This helper is
+        # file-backed; unlike _effective_dynamic_pty() below it performs no
+        # database query.
+        effective_pty, effective_ptyn = self._effective_pty_ptyn(config)
+
         # While disconnected, retry every tick rather than waiting for the
         # 30s full-resend window -- _ensure_tcp_connected()'s own
         # TCP_RECONNECT_BACKOFF (1/2/5s, then 5s repeating) is what
@@ -369,7 +377,9 @@ class RBDSManager:
         # StereoTool was ready and "fixed" it, which looked like the admin
         # save mattered but was really just a lucky retry window.
         if changed or due_for_full_resend or not self._connected:
-            effective_pty, effective_ptyn = self._effective_pty_ptyn(config)
+            # Deliberately remain inside the send gate: this helper performs
+            # a Category database query and must not become unconditional
+            # one-second dashboard work.
             effective_dynamic_pty = self._effective_dynamic_pty(config)
             send_ok = self._send(config, target_ps, rt_text, rt_artist, rt_title, effective_pty, effective_ptyn,
                                   rt_ab_toggle=rt_changed, dynamic_pty=effective_dynamic_pty,
@@ -492,7 +502,14 @@ class RBDSManager:
                     # failure without hiding the connection state.
                     self._last_error = f"CT send failed: {exc}"
 
-        self._write_state(config, target_ps, rt_text, rt_source, rt_source_name)
+        self._write_state(
+            config, target_ps, rt_text, rt_source, rt_source_name,
+            effective_pty=effective_pty,
+            effective_ptyn=effective_ptyn,
+            long_ps_managed=long_ps_managed,
+            long_ps_enabled=long_ps_enabled,
+            long_ps_text=long_ps_text,
+        )
 
     def _resolve_target_ps(self, config, now_playing):
         """Resolves the current 8-char target PS per config.ps_mode
@@ -1266,7 +1283,20 @@ class RBDSManager:
 
     # --- State file ---
 
-    def _write_state(self, config, ps, rt, rt_source, rt_source_name):
+    def _write_state(
+        self, config, ps, rt, rt_source, rt_source_name, *,
+        effective_pty=None, effective_ptyn="", long_ps_managed=False,
+        long_ps_enabled=False, long_ps_text="",
+    ):
+        pty_names = dict(RBDS_PTY_CHOICES)
+        effective_pty_name = (
+            "" if effective_pty is None else pty_names.get(effective_pty, "Unknown")
+        )
+        display_long_ps = (
+            normalize_text(long_ps_text)[:32]
+            if long_ps_managed and long_ps_enabled else ""
+        )
+        display_ptyn = normalize_text(effective_ptyn or "")[:8]
         state = {
             "timestamp": time.time(),
             "current_ps": ps,
@@ -1286,6 +1316,15 @@ class RBDSManager:
             "current_rt": rt,
             "rt_source": rt_source,
             "rt_source_name": rt_source_name,
+            # Resolved operating values, not merely station defaults. The
+            # connection fields below remain the separate authority for
+            # whether these values are currently reaching the encoder.
+            "current_long_ps": display_long_ps,
+            "long_ps_managed": long_ps_managed,
+            "long_ps_enabled": long_ps_enabled,
+            "current_pty": effective_pty,
+            "current_pty_name": effective_pty_name,
+            "current_ptyn": display_ptyn,
             "protocol": config.protocol,
             "transport": config.transport,
             "host": config.host,

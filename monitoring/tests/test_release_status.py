@@ -374,6 +374,38 @@ class DashboardTemplateSanityTests(TestCase):
         # defined and orphaned.
         self.assertIn("renderReleaseLine(data.checkout)", body)
 
+    def test_r0007_monitoring_and_rbds_card_contract(self):
+        resp = self.client.get(reverse("monitoring:dashboard"))
+        self.assertEqual(resp.status_code, 200)
+        body = resp.content.decode()
+
+        self.assertIn(".mon-group-system .mon-cards", body)
+        self.assertIn(".mon-group-transmitter .mon-cards", body)
+        self.assertIn("minmax(175px, 1fr)", body)
+        self.assertIn(".mon-group-transmitter .mon-value-text", body)
+
+        self.assertNotIn('id="aircheckLed"', body)
+        self.assertNotIn('id="aircheckCaption"', body)
+        self.assertIn("pillText = 'READY'; stateClass = 'ok'", body)
+        self.assertIn("pillText = 'REC'; stateClass = 'critical'", body)
+        self.assertIn("pillText = 'FINALIZING'; stateClass = 'warning'", body)
+
+        rbds_section = body.split("<h2>RBDS</h2>", 1)[1].split(
+            "<h2>Recent Failed Logins</h2>", 1
+        )[0]
+        self.assertEqual(rbds_section.count('class="mon-card"'), 3)
+        for element_id in (
+            "rbdsPs", "rbdsLongPs", "rbdsPty", "rbdsPtyn",
+            "rbdsRt", "rbdsConnectionPill", "rbdsProtocol",
+        ):
+            self.assertIn(f'id="{element_id}"', rbds_section)
+        self.assertNotIn('<span class="mon-card-name">Protocol</span>', rbds_section)
+        self.assertIn("Protocol: ${data.protocol.toUpperCase()}/", body)
+        self.assertIn("if (data.stale ||", body)
+        self.assertIn('connectionPill.textContent = "UNKNOWN"', body)
+        self.assertIn("setInterval(pollRbdsStatus, 500);", body)
+        self.assertIn("setInterval(pollStatus, 5000);", body)
+
 
 @override_settings(SECURE_SSL_REDIRECT=False)
 class LoginRequiredTests(TestCase):

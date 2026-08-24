@@ -562,7 +562,7 @@ class R0006ReleaseContractTests(SimpleTestCase):
     def test_bridge_runs_checkout_git_and_materialization_as_application_user(self):
         runbook = (self.ROOT / "docs" / "UPDATE_CENTER.md").read_text(encoding="utf-8")
         bridge = runbook.split(
-            "### Exact r0005 to r0006 production bridge", 1,
+            "### Historical exact r0005 to r0006 manual production bridge", 1,
         )[1]
         self.assertNotRegex(bridge, r"(?m)^\s*git -C")
         self.assertIn('sudo -u "$ISA_USER" git -C "$ISA_ROOT" fetch origin main', bridge)
@@ -573,7 +573,7 @@ class R0006ReleaseContractTests(SimpleTestCase):
     def test_bridge_restarts_only_gunicorn_after_source_advancement(self):
         runbook = (self.ROOT / "docs" / "UPDATE_CENTER.md").read_text(encoding="utf-8")
         bridge = runbook.split(
-            "### Exact r0005 to r0006 production bridge", 1,
+            "### Historical exact r0005 to r0006 manual production bridge", 1,
         )[1]
         source_checkpoint = bridge.split("8. Fast-forward", 1)[1]
         self.assertIn("sudo systemctl restart isadoraair-gunicorn.service", source_checkpoint)

@@ -686,9 +686,16 @@ response is only `ok` or `unhealthy` and reveals no commit, path, or credential.
 
 The `library.0080_seed_updates_nav_item` data migration creates `Updates` /
 `updatecenter:dashboard` only when that URL identity is absent. It never edits an
-existing row, so station label/order/enabled customization survives. New shared
-operator pages must ship a similarly idempotent `NavMenuItem` seed in the same
-release.
+existing row, so station label/order/enabled customization survives. Any new
+first-party page intended for the main navigation must ship a similarly
+idempotent `NavMenuItem` data migration in the same release. The migration must
+create and enable the product-default row automatically, identify it by a stable
+product identity such as `url_name`, avoid duplicates, and preserve any
+pre-existing operator-created or customized row. Do not reconcile navigation at
+startup: repeatedly recreating or re-enabling a row would override an operator's
+intent on every boot. A reverse migration may remove only an untouched
+product-created default that it can positively identify; otherwise it must leave
+the row alone. The Reports and Updates migrations are the established examples.
 
 ## Root configuration and arming
 
@@ -880,11 +887,15 @@ remain unsupported and manual.
 ## r0006 protected-updater hardening and manual bridge
 
 The first real r0005 Update Center run exposed two protected-runtime boundaries.
-First, `NoNewPrivileges=true` prevented root's `runuser` process from changing
-to the application UID because the service had no permitted/effective
-`CAP_SETUID` or `CAP_SETGID`. The production-proven base-unit correction is
-`AmbientCapabilities=CAP_SETUID CAP_SETGID`; the application-user child has zero
-permitted, effective, and ambient capabilities. Second, `UMask=0077` reduced the
+First, the updater service's complete security context prevented root's
+`runuser` process from changing to the application UID. The production-proven
+base-unit correction is `AmbientCapabilities=CAP_SETUID CAP_SETGID`, which keeps
+those capabilities available across the required exec boundary; it does not
+claim that the User=root parent has only those two capabilities in its permitted
+or effective sets. The shipped unit has no `CapabilityBoundingSet` restriction,
+and production inspection showed the parent retains the broader root capability
+set. The application-user child has zero permitted, effective, and ambient
+capabilities. Second, `UMask=0077` reduced the
 new staging job directory to `0700`, preventing the application user from
 traversing to the staged source. Runtime v4 explicitly changes that root-owned
 job directory to `0711`; it remains unlistable by group/other, `target.tar`
@@ -898,18 +909,20 @@ replace its own protected runtime.
 
 ### Manual systemd capability acceptance (do not automate in CI)
 
-Run this only during an approved production maintenance review. The first
-transient unit deliberately omits ambient capabilities and is expected to fail;
-the second is expected to print the application UID. Both retain
-`NoNewPrivileges=yes` and use fixed system executables with no shell:
+Run this only during an approved production maintenance review. A generic
+transient `User=root`, `NoNewPrivileges=yes` unit that omits ambient
+capabilities is not a valid negative acceptance test: it does not reproduce the
+updater unit's complete capability/security context and may still execute
+`runuser` successfully. Do not require that simplified negative case to fail.
+
+The authoritative acceptance is the actual updater runtime v4 startup
+behavioral self-check: it executes fixed `/usr/bin/id -u` as the configured
+application user, validates the exact UID, and reports
+`protected_runtime_valid` only after that succeeds. The following positive
+transient check is supplementary and should print the application UID; it
+retains `NoNewPrivileges=yes` and uses fixed system executables with no shell:
 
 ```bash
-sudo systemd-run --quiet --wait --pipe --collect \
-  --unit=isadoraair-runuser-negative \
-  --property=User=root --property=Group=jreed \
-  --property=NoNewPrivileges=yes \
-  /usr/sbin/runuser --user jreed -- /usr/bin/id -u
-
 sudo systemd-run --quiet --wait --pipe --collect \
   --unit=isadoraair-runuser-positive \
   --property=User=root --property=Group=jreed \
@@ -931,10 +944,15 @@ sudo systemd-run --quiet --wait --pipe --collect \
 ```
 
 Require the resulting `jreed` child to report zero in `CapPrm`, `CapEff`, and
-`CapAmb`. Do not continue if the negative case unexpectedly succeeds, the
-positive case fails, or any child capability set is nonzero.
+`CapAmb`. Do not continue if the actual updater startup self-check fails, the
+positive supplementary check fails, `protected_runtime_valid` is false, or any
+child capability set is nonzero.
 
-### Exact r0005 to r0006 production bridge (draft; do not execute during review)
+### Historical exact r0005 to r0006 manual production bridge
+
+This historical procedure applies only to a station first proven to be on the
+exact clean r0005 baseline. Do not rerun it blindly on an r0006-or-newer station
+or any other baseline.
 
 This procedure is deliberately checkpointed for interactive SSH. Every
 pasteable block that can fail the checkpoint runs in a subshell, so `exit 1`
