@@ -24,6 +24,26 @@ class DaemonError(RuntimeError):
     pass
 
 
+def _validate_privilege_drop(application_user: str, runner: CommandRunner) -> bool:
+    """Prove the daemon can perform the one privilege transition it requires."""
+    expected_uid = pwd.getpwnam(application_user).pw_uid
+    result = runner.run_as_user(
+        application_user,
+        ["/usr/bin/id", "-u"],
+        timeout=5,
+        output_limit=128,
+    )
+    if not result.ok:
+        raise DaemonError(
+            "application-user privilege-drop self-check failed "
+            f"(returncode={result.returncode!r}, timed_out={result.timed_out}, "
+            f"output_truncated={result.output_truncated})"
+        )
+    if result.stdout.strip() != str(expected_uid).encode("ascii"):
+        raise DaemonError("application-user privilege-drop self-check returned the wrong uid")
+    return True
+
+
 def _peer_credentials(connection: socket.socket) -> tuple[int, int, int]:
     raw = connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
     return struct.unpack("3i", raw)
@@ -35,6 +55,9 @@ class UpdaterDaemon:
                  authorized_uids: set[int] | None = None, authorized_gids: set[int] | None = None):
         self.config = config
         self.runner = runner or CommandRunner()
+        self._protected_runtime_valid = _validate_privilege_drop(
+            config.application_user, self.runner,
+        )
         self.store = store or JobStore(config.jobs_root, config.logs_root)
         self.executor = executor or Executor(config, self.store, self.runner)
         app_uid = pwd.getpwnam(config.application_user).pw_uid
@@ -159,7 +182,7 @@ class UpdaterDaemon:
                 "ok": True,
                 "protocol_version": PROTOCOL_VERSION,
                 "runtime_version": RUNTIME_VERSION,
-                "protected_runtime_valid": True,
+                "protected_runtime_valid": self._protected_runtime_valid,
                 "config_valid": True,
                 "trusted_repository_ready": self._trusted_repository_ready(),
                 "update_execution_enabled": self.config.update_execution_enabled,

@@ -78,6 +78,50 @@ class RequirementsCrossCheckTests(SimpleTestCase):
             self.assertTrue(any(f.field == "requirements_sha256" for f in findings))
 
 
+class ProtectedRuntimeIntentCrossCheckTests(SimpleTestCase):
+    def test_runtime_change_requires_manual_bootstrap(self):
+        with FakeRepo() as repo:
+            previous = repo.rev_parse("HEAD")
+            repo.write("deploy/updater_runtime/isadoraair_updater/runtime.py", "changed\n")
+            target = repo.commit("protected runtime")
+            rel = m.validate_manifest_dict(_no_migrations_no_requirements(
+                release_id="r0006", previous_release_id="r0005",
+            ))
+            findings = cc.cross_check_release(
+                rel, target, repo.work, previous_commit=previous,
+            )
+            self.assertTrue(any(f.field == "manual_bootstrap_required" for f in findings))
+
+    def test_runtime_change_with_manual_bootstrap_is_accepted(self):
+        with FakeRepo() as repo:
+            previous = repo.rev_parse("HEAD")
+            repo.write("deploy/updater_runtime/isadoraair_updater/runtime.py", "changed\n")
+            target = repo.commit("protected runtime")
+            rel = m.validate_manifest_dict(
+                _no_migrations_no_requirements(
+                    release_id="r0006", previous_release_id="r0005",
+                    manual_bootstrap_required=True,
+                )
+            )
+            findings = cc.cross_check_release(
+                rel, target, repo.work, previous_commit=previous,
+            )
+            self.assertEqual(findings, [])
+
+    def test_ordinary_change_does_not_force_manual_bootstrap(self):
+        with FakeRepo() as repo:
+            previous = repo.rev_parse("HEAD")
+            repo.write("ordinary.txt", "changed\n")
+            target = repo.commit("ordinary change")
+            rel = m.validate_manifest_dict(_no_migrations_no_requirements(
+                release_id="r0006", previous_release_id="r0005",
+            ))
+            findings = cc.cross_check_release(
+                rel, target, repo.work, previous_commit=previous,
+            )
+            self.assertEqual(findings, [])
+
+
 def _no_migrations_no_requirements(**overrides):
     """`_valid_followup`'s own defaults declare a required migration
     AND a changed-requirements hash (see test_manifest.py) -- fine for

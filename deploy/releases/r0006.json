@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "release_id": "r0006",
+  "previous_release_id": "r0005",
+  "minimum_updater_protocol_version": 3,
+  "summary": "Harden protected updater privilege drop, staging, and diagnostics",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": true,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [
+    "isadoraair-updater.service"
+  ],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-gunicorn"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0005"
+}

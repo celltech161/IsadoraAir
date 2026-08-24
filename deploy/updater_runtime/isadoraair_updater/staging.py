@@ -57,6 +57,7 @@ def materialize(repository: TrustedRepository, target_commit: str,
     if job_root.exists() or job_root.is_symlink():
         raise StagingError("staging job directory already exists")
     job_root.mkdir(mode=0o755)
+    os.chmod(job_root, 0o711)
     archive = job_root / "target.tar"
     source = job_root / "source"
     source.mkdir(mode=0o755)

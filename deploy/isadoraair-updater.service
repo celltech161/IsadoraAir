@@ -19,6 +19,7 @@ StateDirectoryMode=0750
 LogsDirectory=isadoraair-updater
 LogsDirectoryMode=0700
 NoNewPrivileges=true
+AmbientCapabilities=CAP_SETUID CAP_SETGID
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only

@@ -128,6 +128,75 @@ class ExecutorSchemaComparisonTests(SimpleTestCase):
         )
 
 
+class LiveIdentityDiagnosticTests(SimpleTestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.config = validate_config_dict(
+            config_dict(self.root, "https://example.invalid/trusted.git"),
+            allow_local_repository=True,
+        )
+        self.store = JobStore(
+            self.config.jobs_root, self.config.logs_root,
+            acquire_daemon_lock=False,
+        )
+        self.executor = Executor(
+            self.config, self.store, CommandRunner(),
+            systemd_manager=FakeSystemd([]),
+        )
+
+    def tearDown(self):
+        self.store.close()
+        self.temp.cleanup()
+
+    def _ok_results(self):
+        return [
+            ProcessResult(("git",), 0, b"main\n", b""),
+            ProcessResult(("git",), 0, b"a" * 40 + b"\n", b""),
+            ProcessResult(("git",), 0, b"", b""),
+            ProcessResult(("git",), 0, b"https://example.invalid/trusted.git\n", b""),
+        ]
+
+    def test_each_failed_probe_has_specific_bounded_classification(self):
+        classifications = (
+            "LIVE_GIT_BRANCH_FAILED",
+            "LIVE_GIT_HEAD_FAILED",
+            "LIVE_GIT_STATUS_FAILED",
+            "LIVE_GIT_REMOTE_FAILED",
+        )
+        for index, expected in enumerate(classifications):
+            results = self._ok_results()
+            results[index] = ProcessResult(
+                ("git",), 7, b"SECRET-STDOUT" * 1000,
+                b"SECRET-STDERR" * 1000,
+            )
+            with self.subTest(expected=expected):
+                with mock.patch.object(self.executor, "_app_git", side_effect=results):
+                    with self.assertRaises(ExecutionError) as caught:
+                        self.executor._live_identity()
+                self.assertEqual(caught.exception.classification, expected)
+                self.assertNotIn("SECRET", caught.exception.detail)
+                self.assertLess(len(caught.exception.detail), 300)
+
+    def test_semantic_branch_dirty_and_remote_mismatches_remain_fail_closed(self):
+        cases = (
+            (0, b"other\n", "LIVE_GIT_INVALID"),
+            (2, b"?? unexpected\n", "LIVE_CHECKOUT_DIRTY"),
+            (3, b"https://example.invalid/wrong.git\n", "LIVE_REMOTE_MISMATCH"),
+        )
+        for index, output, expected in cases:
+            results = self._ok_results()
+            result = results[index]
+            results[index] = ProcessResult(
+                result.argv, result.returncode, output, result.stderr,
+            )
+            with self.subTest(expected=expected):
+                with mock.patch.object(self.executor, "_app_git", side_effect=results):
+                    with self.assertRaises(ExecutionError) as caught:
+                        self.executor._live_identity()
+                self.assertEqual(caught.exception.classification, expected)
+
+
 class ExecutorOrderingTests(SimpleTestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

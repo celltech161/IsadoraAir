@@ -203,12 +203,27 @@ class Executor:
         )
 
     def _live_identity(self) -> dict:
-        branch = self._app_git(["symbolic-ref", "-q", "--short", "HEAD"])
-        head = self._app_git(["rev-parse", "--verify", "HEAD"])
-        dirty = self._app_git(["status", "--porcelain"])
-        remote = self._app_git(["remote", "get-url", "origin"])
-        if not all(result.ok for result in (branch, head, dirty, remote)):
-            raise ExecutionError("LIVE_GIT_INVALID", "could not establish live checkout identity")
+        probes = (
+            ("branch", "LIVE_GIT_BRANCH_FAILED", ["symbolic-ref", "-q", "--short", "HEAD"]),
+            ("head", "LIVE_GIT_HEAD_FAILED", ["rev-parse", "--verify", "HEAD"]),
+            ("status", "LIVE_GIT_STATUS_FAILED", ["status", "--porcelain"]),
+            ("remote", "LIVE_GIT_REMOTE_FAILED", ["remote", "get-url", "origin"]),
+        )
+        results = {}
+        for name, classification, arguments in probes:
+            result = self._app_git(arguments)
+            if not result.ok:
+                raise ExecutionError(
+                    classification,
+                    f"live Git {name} probe failed "
+                    f"(returncode={result.returncode!r}, timed_out={result.timed_out}, "
+                    f"output_truncated={result.output_truncated})",
+                )
+            results[name] = result
+        branch = results["branch"]
+        head = results["head"]
+        dirty = results["status"]
+        remote = results["remote"]
         branch_value = branch.stdout.decode("utf-8").strip()
         head_value = head.stdout.decode("ascii").strip()
         remote_value = remote.stdout.decode("utf-8").strip()

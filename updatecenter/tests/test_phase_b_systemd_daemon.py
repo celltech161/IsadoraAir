@@ -14,7 +14,7 @@ from isadoraair_updater.jobs import JobStore
 from isadoraair_updater.process import CommandRunner, ProcessResult
 from isadoraair_updater.release import TrustedPlan
 from isadoraair_updater.systemd import SystemdError, SystemdManager
-from isadoraair_updater.daemon import UpdaterDaemon
+from isadoraair_updater.daemon import DaemonError, UpdaterDaemon
 
 
 class FakeSystemRunner(CommandRunner):
@@ -114,6 +114,79 @@ class SystemdReconciliationTests(SimpleTestCase):
 class _NeverExecutor:
     def execute(self, job_id):
         raise AssertionError("PING must never start execution")
+
+
+class FakeIdentityRunner(CommandRunner):
+    def __init__(self, result):
+        super().__init__()
+        self.result = result
+        self.calls = []
+
+    def run_as_user(self, user, argv, **kwargs):
+        self.calls.append((user, list(argv), kwargs))
+        return self.result
+
+
+class DaemonPrivilegeDropTests(SimpleTestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.config = validate_config_dict(
+            config_dict(self.root, str(self.root / "upstream.git")),
+            allow_local_repository=True,
+        )
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def _result(self, *, returncode=0, stdout=None, timed_out=False,
+                output_truncated=False):
+        uid = os.getuid()
+        return ProcessResult(
+            ("/usr/bin/id", "-u"), returncode,
+            f"{uid}\n".encode() if stdout is None else stdout,
+            b"private diagnostic", timed_out, output_truncated,
+        )
+
+    def test_successful_fixed_identity_check_allows_readiness(self):
+        runner = FakeIdentityRunner(self._result())
+        store = JobStore(self.config.jobs_root, self.config.logs_root, acquire_daemon_lock=False)
+        try:
+            daemon = UpdaterDaemon(
+                self.config, store=store, runner=runner, executor=_NeverExecutor(),
+                authorized_uids={os.getuid()}, authorized_gids=set(),
+            )
+            self.assertTrue(daemon._protected_runtime_valid)
+            self.assertEqual(
+                runner.calls,
+                [(self.config.application_user, ["/usr/bin/id", "-u"],
+                  {"timeout": 5, "output_limit": 128})],
+            )
+        finally:
+            store.close()
+
+    def test_failed_privilege_drop_blocks_startup_without_reflecting_output(self):
+        runner = FakeIdentityRunner(self._result(returncode=1, stdout=b"secret material"))
+        with self.assertRaises(DaemonError) as caught:
+            UpdaterDaemon(self.config, runner=runner, executor=_NeverExecutor())
+        self.assertNotIn("secret material", str(caught.exception))
+
+    def test_wrong_uid_blocks_startup(self):
+        runner = FakeIdentityRunner(self._result(stdout=b"999999\n"))
+        with self.assertRaisesRegex(DaemonError, "wrong uid"):
+            UpdaterDaemon(self.config, runner=runner, executor=_NeverExecutor())
+
+    def test_timeout_or_truncation_blocks_startup(self):
+        for result in (
+            self._result(returncode=None, timed_out=True),
+            self._result(output_truncated=True),
+        ):
+            with self.subTest(result=result):
+                with self.assertRaises(DaemonError):
+                    UpdaterDaemon(
+                        self.config, runner=FakeIdentityRunner(result),
+                        executor=_NeverExecutor(),
+                    )
 
 
 class DaemonPeerTests(SimpleTestCase):

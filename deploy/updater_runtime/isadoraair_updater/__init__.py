@@ -6,4 +6,4 @@ installed under ``/usr/local/libexec/isadoraair-updater``.
 """
 
 PROTOCOL_VERSION = 3
-RUNTIME_VERSION = 3
+RUNTIME_VERSION = 4

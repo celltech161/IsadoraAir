@@ -54,7 +54,8 @@ def manifest(release_id: str, previous: str | None, *, bootstrap: str | None = N
 
 
 def create_release_repository(root: Path, *, third_release_changes: dict | None = None,
-                              third_release_files: dict[str, str] | None = None):
+                              third_release_files: dict[str, str] | None = None,
+                              third_release_id: str = "r0003"):
     root.mkdir(parents=True, exist_ok=True)
     author = root / "author"
     upstream = root / "upstream.git"
@@ -89,14 +90,14 @@ def create_release_repository(root: Path, *, third_release_changes: dict | None 
         deploy = author / "deploy"
         deploy.mkdir(exist_ok=True)
         (deploy / unit).write_text("[Service]\nExecStart=/bin/true\n", encoding="utf-8")
-    (releases / "r0003.json").write_text(json.dumps(manifest("r0003", "r0002", minimum_supported_release_id="r0002", **changes)), encoding="utf-8")
+    (releases / f"{third_release_id}.json").write_text(json.dumps(manifest(third_release_id, "r0002", minimum_supported_release_id="r0002", **changes)), encoding="utf-8")
     git(author, "add", ".")
     git(author, "commit", "-m", "release r0003")
-    r0003 = git(author, "rev-parse", "HEAD")
+    third_release = git(author, "rev-parse", "HEAD")
     subprocess.run(["git", "init", "--bare", str(upstream)], check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     git(author, "remote", "add", "origin", str(upstream))
     git(author, "push", "-u", "origin", "main")
-    return author, upstream, bootstrap, r0002, r0003
+    return author, upstream, bootstrap, r0002, third_release
 
 
 def config_dict(root: Path, upstream: str) -> dict:

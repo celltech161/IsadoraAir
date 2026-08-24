@@ -25,6 +25,7 @@ from . import git_adapter, manifest as manifest_mod
 
 REQUIREMENTS_PATH = "requirements.txt"
 DEPLOY_DIR = "deploy"
+_PRE_GUARD_RELEASES = frozenset({"r0001", "r0002", "r0003", "r0004", "r0005"})
 
 
 @dataclasses.dataclass(frozen=True)
@@ -38,7 +39,8 @@ class CrossCheckFinding:
 
 
 def cross_check_release(rel: manifest_mod.ReleaseManifest, target_commit: str, checkout_root,
-                         app_label_paths: dict | None = None) -> list[CrossCheckFinding]:
+                         app_label_paths: dict | None = None,
+                         previous_commit: str | None = None) -> list[CrossCheckFinding]:
     """Returns every finding for one release against its resolved
     target commit -- empty list means the manifest's objectively-
     checkable claims all match reality. Never raises for an ordinary
@@ -54,7 +56,36 @@ def cross_check_release(rel: manifest_mod.ReleaseManifest, target_commit: str, c
     findings.extend(_check_migrations(rel, target_commit, checkout_root, app_label_paths or {}))
     findings.extend(_check_requirements(rel, target_commit, checkout_root))
     findings.extend(_check_units(rel, target_commit, checkout_root))
+    if previous_commit is not None:
+        findings.extend(_check_protected_runtime_intent(
+            rel, previous_commit, target_commit, checkout_root,
+        ))
     return findings
+
+
+def _check_protected_runtime_intent(rel, previous_commit, target_commit,
+                                    checkout_root) -> list[CrossCheckFinding]:
+    # The immutable r0001-r0005 chain predates this r0006 rule; r0003
+    # legitimately changed this tree before manual_bootstrap_required existed.
+    if rel.release_id in _PRE_GUARD_RELEASES:
+        return []
+    paths = git_adapter.changed_paths_between(
+        checkout_root, previous_commit, target_commit, "deploy/updater_runtime",
+    )
+    if paths is None:
+        return [CrossCheckFinding(
+            field="manual_bootstrap_required",
+            detail="could not verify the protected-runtime predecessor diff",
+        )]
+    if paths and not rel.manual_bootstrap_required:
+        return [CrossCheckFinding(
+            field="manual_bootstrap_required",
+            detail=(
+                "deploy/updater_runtime/ changes require "
+                "manual_bootstrap_required=true"
+            ),
+        )]
+    return []
 
 
 def _migration_ref_to_path(ref: str, app_label_paths: dict) -> str:

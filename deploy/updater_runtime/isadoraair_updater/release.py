@@ -449,6 +449,17 @@ def _content(repository: TrustedRepository, commit: str, path: str) -> bytes | N
 
 def _cross_check(repository: TrustedRepository, previous_commit: str, entry: ChainEntry):
     manifest = entry.manifest
+    protected_runtime_changes = repository.changed_paths(
+        previous_commit, entry.commit, "deploy/updater_runtime",
+    )
+    pre_guard_releases = {"r0001", "r0002", "r0003", "r0004", "r0005"}
+    if (manifest.release_id not in pre_guard_releases
+            and protected_runtime_changes
+            and not manifest.manual_bootstrap_required):
+        raise ReleaseError(
+            f"{manifest.release_id}: protected updater runtime changes require "
+            "manual_bootstrap_required=true"
+        )
     for ref in manifest.migrations_required:
         app, name = ref.split(".", 1)
         root = APP_MIGRATION_PATHS.get(app, app)

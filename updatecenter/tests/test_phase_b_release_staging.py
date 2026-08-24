@@ -130,6 +130,51 @@ class TrustedReleaseTests(SimpleTestCase):
         self.assertTrue(plan.manual_bootstrap_required)
         self.assertIn("MANUAL_BOOTSTRAP_REQUIRED", manual_blockers(plan))
 
+    def test_protected_runtime_change_requires_manual_bootstrap_intent(self):
+        _author, upstream, _bootstrap, r2, _r3 = create_release_repository(
+            self.root / "protected-runtime-unattended",
+            third_release_id="r0006",
+            third_release_files={
+                "deploy/updater_runtime/isadoraair_updater/runtime.py": "changed\n",
+            },
+        )
+        repo = TrustedRepository(
+            self.root / "protected-runtime-unattended.git",
+            str(upstream), "main", CommandRunner(),
+        )
+        tip = repo.fetch()
+        with self.assertRaisesRegex(ReleaseError, "manual_bootstrap_required"):
+            derive_plan(repo, tip, r2, "r0006")
+
+    def test_protected_runtime_change_with_manual_bootstrap_is_accepted(self):
+        _author, upstream, _bootstrap, r2, _r3 = create_release_repository(
+            self.root / "protected-runtime-manual",
+            third_release_id="r0006",
+            third_release_changes={"manual_bootstrap_required": True},
+            third_release_files={
+                "deploy/updater_runtime/isadoraair_updater/runtime.py": "changed\n",
+            },
+        )
+        repo = TrustedRepository(
+            self.root / "protected-runtime-manual.git",
+            str(upstream), "main", CommandRunner(),
+        )
+        tip = repo.fetch()
+        self.assertTrue(derive_plan(repo, tip, r2, "r0006").manual_bootstrap_required)
+
+    def test_ordinary_change_does_not_require_manual_bootstrap(self):
+        _author, upstream, _bootstrap, r2, _r3 = create_release_repository(
+            self.root / "ordinary-change",
+            third_release_id="r0006",
+            third_release_files={"ordinary.txt": "changed\n"},
+        )
+        repo = TrustedRepository(
+            self.root / "ordinary-change.git",
+            str(upstream), "main", CommandRunner(),
+        )
+        tip = repo.fetch()
+        self.assertFalse(derive_plan(repo, tip, r2, "r0006").manual_bootstrap_required)
+
     def test_undeclared_systemd_unit_change_is_rejected_from_predecessor_diff(self):
         _author, upstream, _bootstrap, r2, _r3 = create_release_repository(
             self.root / "undeclared-unit",
@@ -184,6 +229,24 @@ class StagingTests(SimpleTestCase):
         self.assertEqual((staged.source_root / "README").read_text(), "baseline\n")
         self.assertEqual((staged.source_root / "README").stat().st_mode & 0o222, 0)
         cleanup(self.root / "staging", job)
+        self.assertFalse(staged.job_root.exists())
+
+    def test_materialize_overrides_restrictive_service_umask_for_traversal(self):
+        job = "123e4567-e89b-42d3-a456-426614174001"
+        previous_umask = os.umask(0o077)
+        try:
+            staged = materialize(self.repo, self.target, self.root / "umask-stage", job)
+        finally:
+            os.umask(previous_umask)
+
+        self.assertEqual(staged.job_root.stat().st_mode & 0o777, 0o711)
+        self.assertEqual(staged.source_root.stat().st_mode & 0o777, 0o555)
+        self.assertEqual(staged.archive_path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual((staged.source_root / "README").stat().st_mode & 0o777, 0o444)
+        self.assertEqual(staged.job_root.stat().st_mode & 0o111, 0o111)
+        self.assertEqual(staged.job_root.stat().st_mode & 0o066, 0)
+
+        cleanup(self.root / "umask-stage", job)
         self.assertFalse(staged.job_root.exists())
 
     def test_cleanup_rejects_non_uuid(self):

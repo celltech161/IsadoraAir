@@ -5,7 +5,7 @@ from django.test import SimpleTestCase
 
 from .phase_b_helpers import RUNTIME_ROOT  # also installs runtime on sys.path
 from isadoraair_updater.protocol import MAX_REQUEST_BYTES, ProtocolError, decode_request, encode_response
-from isadoraair_updater import PROTOCOL_VERSION
+from isadoraair_updater import PROTOCOL_VERSION, RUNTIME_VERSION
 
 
 def _request(**changes):
@@ -15,6 +15,10 @@ def _request(**changes):
 
 
 class StrictProtocolTests(SimpleTestCase):
+    def test_runtime_v4_keeps_wire_protocol_v3(self):
+        self.assertEqual(PROTOCOL_VERSION, 3)
+        self.assertEqual(RUNTIME_VERSION, 4)
+
     def test_ping_is_exact(self):
         self.assertEqual(decode_request(_request()).action, "PING")
 

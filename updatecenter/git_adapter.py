@@ -308,6 +308,31 @@ def read_bytes_at_commit(checkout_root: Path, sha: str, relative_path: str) -> b
     return stdout
 
 
+def changed_paths_between(checkout_root: Path, before_sha: str, after_sha: str,
+                          relative_dir: str) -> tuple[str, ...] | None:
+    """Repo-relative changed paths below one directory, without checkout."""
+    if relative_dir.startswith("/") or ".." in Path(relative_dir).parts:
+        raise ValueError(f"relative_dir must be repo-relative with no '..': {relative_dir!r}")
+    if not commit_exists(checkout_root, before_sha) or not commit_exists(checkout_root, after_sha):
+        return None
+    returncode, stdout = _run_git_argv(
+        ["git", "-C", str(checkout_root), "diff", "--name-only", "-z",
+         before_sha, after_sha, "--", f"{relative_dir}/"],
+        GIT_TIMEOUT_SECONDS,
+    )
+    if returncode != 0:
+        return None
+    try:
+        paths = tuple(path for path in stdout.decode("utf-8").split("\x00") if path)
+    except UnicodeDecodeError:
+        return None
+    prefix = f"{relative_dir.rstrip('/')}/"
+    if any(path.startswith("/") or ".." in Path(path).parts or not path.startswith(prefix)
+           for path in paths):
+        return None
+    return paths
+
+
 def list_files_at_commit(checkout_root: Path, sha: str, relative_dir: str) -> list[str] | None:
     """Filenames (basenames only, not recursive) directly under
     `relative_dir` in the tree of `sha` -- via `git ls-tree`, still

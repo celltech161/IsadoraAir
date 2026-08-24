@@ -65,6 +65,24 @@ class ProtectedRuntimeStaticTests(SimpleTestCase):
         self.assertNotIn("@@ISA_ROOT@@", exec_line)
         self.assertNotIn("/venv/", exec_line)
 
+    def test_service_retains_privilege_drop_capabilities_and_hardening(self):
+        unit = (PROJECT_ROOT / "deploy" / "isadoraair-updater.service").read_text(encoding="utf-8")
+        required_lines = {
+            "User=root",
+            "Group=@@ISA_USER@@",
+            "AmbientCapabilities=CAP_SETUID CAP_SETGID",
+            "NoNewPrivileges=true",
+            "UMask=0077",
+            "ProtectSystem=strict",
+            "ProtectHome=read-only",
+            "ProtectKernelTunables=true",
+            "ProtectKernelModules=true",
+            "ProtectControlGroups=true",
+            "RestrictSUIDSGID=true",
+            "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
+        }
+        self.assertTrue(required_lines.issubset(set(unit.splitlines())))
+
     def test_entrypoint_imports_no_privileged_package_before_install_check(self):
         tree = ast.parse((RUNTIME_ROOT / "updaterd.py").read_text(encoding="utf-8"))
         top_level_imports = [

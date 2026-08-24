@@ -4,7 +4,8 @@ Validates the WHOLE `deploy/releases/` set: every individual manifest
 (manifest.validate_manifest_dict), the chain they form
 (release_chain.build_chain), and -- for every release whose commit can
 be resolved in THIS checkout's git history -- cross-checks its claims
-against that commit's actual content (cross_check.cross_check_release).
+and predecessor-diff intent against actual Git content
+(cross_check.cross_check_release).
 
 Never modifies anything. Exit code 0 iff everything validates cleanly;
 nonzero otherwise -- same convention as
@@ -59,7 +60,7 @@ class Command(BaseCommand):
         any_cross_check_failure = False
         resolved_release_by_commit = {}
         head_sha = git_adapter.rev_parse(checkout_root, "HEAD")
-        for chained in chain:
+        for position, chained in enumerate(chain):
             commit = release_chain.resolve_release_commit(chained, checkout_root)
             if commit is None:
                 relative_path = f"{release_chain.RELEASES_DIRNAME_DEFAULT}/{chained.manifest.release_id}.json"
@@ -89,7 +90,22 @@ class Command(BaseCommand):
                 ))
                 continue
             resolved_release_by_commit[commit] = chained.manifest.release_id
-            findings = cross_check.cross_check_release(chained.manifest, commit, checkout_root, app_label_paths)
+            previous_commit = None
+            if position:
+                previous_commit = release_chain.resolve_release_commit(
+                    chain[position - 1], checkout_root,
+                )
+                if previous_commit is None:
+                    any_cross_check_failure = True
+                    self.stderr.write(self.style.ERROR(
+                        f"  {chained.manifest.release_id}: predecessor commit could not be "
+                        "resolved for protected-runtime diff validation"
+                    ))
+                    continue
+            findings = cross_check.cross_check_release(
+                chained.manifest, commit, checkout_root, app_label_paths,
+                previous_commit,
+            )
             if findings:
                 any_cross_check_failure = True
                 self.stderr.write(self.style.ERROR(f"  {chained.manifest.release_id} @ {commit[:12]}: {len(findings)} finding(s):"))

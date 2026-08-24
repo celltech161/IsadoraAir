@@ -876,3 +876,300 @@ preferably migration change; use a harmless visible application change and a
 Gunicorn-only restart. Automatic rollback, apt installation, live-venv pip
 mutation, destructive migration handling, and protected-updater self-update all
 remain unsupported and manual.
+
+## r0006 protected-updater hardening and manual bridge
+
+The first real r0005 Update Center run exposed two protected-runtime boundaries.
+First, `NoNewPrivileges=true` prevented root's `runuser` process from changing
+to the application UID because the service had no permitted/effective
+`CAP_SETUID` or `CAP_SETGID`. The production-proven base-unit correction is
+`AmbientCapabilities=CAP_SETUID CAP_SETGID`; the application-user child has zero
+permitted, effective, and ambient capabilities. Second, `UMask=0077` reduced the
+new staging job directory to `0700`, preventing the application user from
+traversing to the staged source. Runtime v4 explicitly changes that root-owned
+job directory to `0711`; it remains unlistable by group/other, `target.tar`
+remains `0600`, and the source remains read-only.
+
+`r0006` keeps updater protocol 3 but declares
+`manual_bootstrap_required: true`. Any predecessor diff below
+`deploy/updater_runtime/` is rejected unless that declaration is true, by both
+the web planner and root-side trusted-plan derivation. The updater must never
+replace its own protected runtime.
+
+### Manual systemd capability acceptance (do not automate in CI)
+
+Run this only during an approved production maintenance review. The first
+transient unit deliberately omits ambient capabilities and is expected to fail;
+the second is expected to print the application UID. Both retain
+`NoNewPrivileges=yes` and use fixed system executables with no shell:
+
+```bash
+sudo systemd-run --quiet --wait --pipe --collect \
+  --unit=isadoraair-runuser-negative \
+  --property=User=root --property=Group=jreed \
+  --property=NoNewPrivileges=yes \
+  /usr/sbin/runuser --user jreed -- /usr/bin/id -u
+
+sudo systemd-run --quiet --wait --pipe --collect \
+  --unit=isadoraair-runuser-positive \
+  --property=User=root --property=Group=jreed \
+  --property=NoNewPrivileges=yes \
+  --property='AmbientCapabilities=CAP_SETUID CAP_SETGID' \
+  /usr/sbin/runuser --user jreed -- /usr/bin/id -u
+```
+
+For the positive case, inspect the actual application-user child rather than
+assuming capability clearing from the unit configuration:
+
+```bash
+sudo systemd-run --quiet --wait --pipe --collect \
+  --unit=isadoraair-runuser-capability-proof \
+  --property=User=root --property=Group=jreed \
+  --property=NoNewPrivileges=yes \
+  --property='AmbientCapabilities=CAP_SETUID CAP_SETGID' \
+  /usr/sbin/runuser --user jreed -- /usr/bin/cat /proc/self/status
+```
+
+Require the resulting `jreed` child to report zero in `CapPrm`, `CapEff`, and
+`CapAmb`. Do not continue if the negative case unexpectedly succeeds, the
+positive case fails, or any child capability set is nonzero.
+
+### Exact r0005 to r0006 production bridge (draft; do not execute during review)
+
+This procedure is deliberately checkpointed for interactive SSH. Every
+pasteable block that can fail the checkpoint runs in a subshell, so `exit 1`
+cannot terminate the parent login shell. Substitute the one reviewed r0006
+commit only after it exists on the trusted remote.
+
+1. From any operator shell, prove the live checkout is the exact clean r0005
+release. Every Git process explicitly runs as the configured application user;
+do not add a root `safe.directory` exception:
+
+```bash
+export ISA_ROOT=/home/jreed/isadoraair-django
+export ISA_USER=jreed
+export R0005_COMMIT=2eea69817d7894118b1473b0693a5c1514c5f54d
+export R0006_COMMIT=REPLACE_WITH_THE_SINGLE_REVIEWED_R0006_SHA
+
+(
+  test "$(sudo -u "$ISA_USER" git -C "$ISA_ROOT" branch --show-current)" = main || {
+    echo "Production checkout is not on main" >&2
+    exit 1
+  }
+  test "$(sudo -u "$ISA_USER" git -C "$ISA_ROOT" rev-parse HEAD)" = "$R0005_COMMIT" || {
+    echo "Production checkout is not exact r0005" >&2
+    exit 1
+  }
+  test -z "$(sudo -u "$ISA_USER" git -C "$ISA_ROOT" status --porcelain)" || {
+    echo "Production checkout is not clean" >&2
+    exit 1
+  }
+  echo "Exact clean r0005 production baseline verified"
+)
+```
+
+Stop the r0006 bridge unless this checkpoint succeeds.
+
+2. Fetch and authenticate the one r0006 release commit as `ISA_USER`, then
+materialize reviewed artifacts outside the live checkout as that same user:
+
+```bash
+sudo -u "$ISA_USER" git -C "$ISA_ROOT" fetch origin main
+(
+  test "$(sudo -u "$ISA_USER" git -C "$ISA_ROOT" log --format='%H' --diff-filter=A origin/main -- \
+    deploy/releases/r0006.json)" = "$R0006_COMMIT" || {
+    echo "r0006 does not have the expected unique introducing commit" >&2
+    exit 1
+  }
+  sudo -u "$ISA_USER" git -C "$ISA_ROOT" merge-base --is-ancestor \
+    "$R0005_COMMIT" "$R0006_COMMIT" || exit 1
+  test "$(sudo -u "$ISA_USER" git -C "$ISA_ROOT" rev-list --count \
+    "$R0005_COMMIT..$R0006_COMMIT")" = 1 || exit 1
+  sudo -u "$ISA_USER" git -C "$ISA_ROOT" show \
+    "$R0006_COMMIT:deploy/releases/r0006.json"
+)
+```
+
+Stop the r0006 bridge unless this checkpoint succeeds. Then materialize without executing
+repository code:
+
+```bash
+export UPDATER_STAGE="$(sudo -u "$ISA_USER" mktemp -d)"
+sudo -u "$ISA_USER" git -C "$ISA_ROOT" archive "$R0006_COMMIT" \
+  deploy/updater_runtime deploy/isadoraair-updater.service \
+  deploy/releases/r0006.json | sudo -u "$ISA_USER" tar -x -C "$UPDATER_STAGE"
+sudo -u "$ISA_USER" find \
+  "$UPDATER_STAGE/deploy/updater_runtime" -maxdepth 3 -type f -print
+```
+
+Review the manifest, every runtime module, and the service candidate.
+
+3. Before replacing protected files, root must edit
+`/etc/isadoraair/station.json` so `update_execution_enabled` is `false`, then
+restart only `isadoraair-updater.service`. Poll its settled response and require
+PING to show execution is disarmed. Do not proceed from a single immediate
+post-restart sample.
+
+4. With execution confirmed disarmed, install only the reviewed files with
+fixed system utilities:
+
+```bash
+sudo install -d -o root -g root -m 0755 /usr/local/libexec/isadoraair-updater
+sudo install -d -o root -g root -m 0755 /usr/local/libexec/isadoraair-updater/isadoraair_updater
+sudo install -o root -g root -m 0755 \
+  "$UPDATER_STAGE/deploy/updater_runtime/updaterd.py" \
+  /usr/local/libexec/isadoraair-updater/updaterd.py
+sudo install -o root -g root -m 0755 \
+  "$UPDATER_STAGE/deploy/updater_runtime/updaterctl.py" \
+  /usr/local/libexec/isadoraair-updater/updaterctl.py
+for module in __init__ checkpoint config daemon executor jobs process protocol release security staging systemd; do
+  sudo install -o root -g root -m 0644 \
+    "$UPDATER_STAGE/deploy/updater_runtime/isadoraair_updater/$module.py" \
+    "/usr/local/libexec/isadoraair-updater/isadoraair_updater/$module.py"
+done
+```
+
+5. Render and verify the exact r0006 unit outside `/etc`, explicitly confirm its
+capability and sandbox lines, then install it:
+
+```bash
+sed -e "s|@@ISA_USER@@|$ISA_USER|g" -e "s|@@ISA_ROOT@@|$ISA_ROOT|g" \
+  "$UPDATER_STAGE/deploy/isadoraair-updater.service" \
+  > "$UPDATER_STAGE/isadoraair-updater.service"
+systemd-analyze verify "$UPDATER_STAGE/isadoraair-updater.service"
+(
+  grep -Fx 'AmbientCapabilities=CAP_SETUID CAP_SETGID' \
+    "$UPDATER_STAGE/isadoraair-updater.service" >/dev/null || exit 1
+  grep -Fx 'NoNewPrivileges=true' \
+    "$UPDATER_STAGE/isadoraair-updater.service" >/dev/null || exit 1
+  grep -Fx 'UMask=0077' "$UPDATER_STAGE/isadoraair-updater.service" >/dev/null || exit 1
+  echo "Rendered updater unit capability and sandbox contract verified"
+)
+```
+
+Do not continue unless both verification commands succeed.
+
+```bash
+sudo install -o root -g root -m 0644 \
+  "$UPDATER_STAGE/isadoraair-updater.service" \
+  /etc/systemd/system/isadoraair-updater.service
+sudo systemctl daemon-reload
+sudo systemctl restart isadoraair-updater.service
+```
+
+No other service is restarted in this checkpoint.
+
+6. Poll readiness for at most 30 seconds and inspect settled service state:
+
+```bash
+(
+  updater_ready=false
+  for attempt in $(seq 1 30); do
+    if /usr/bin/python3 -I \
+      /usr/local/libexec/isadoraair-updater/updaterctl.py ping; then
+      updater_ready=true
+      break
+    fi
+    sleep 1
+  done
+  if [ "$updater_ready" = true ]; then
+    echo "Updater readiness check succeeded"
+  else
+    echo "Updater did not become ready within 30 seconds" >&2
+    exit 1
+  fi
+)
+```
+
+Stop the r0006 bridge unless this checkpoint succeeds. PING must report protocol 3,
+runtime 4, protected/config/repository readiness true, and
+`update_execution_enabled: false`. Successful startup itself proves the fixed
+`/usr/bin/id -u` application-user self-check passed. Then inspect the settled
+unit rather than racing the restart:
+
+```bash
+systemctl show isadoraair-updater.service \
+  --property=ActiveState --property=SubState --property=Result \
+  --property=NoNewPrivileges --property=AmbientCapabilities
+systemctl cat isadoraair-updater.service
+```
+
+Require active/running/success, `NoNewPrivileges=yes`, and ambient
+`cap_setuid cap_setgid`. Run the manual transient-unit capability acceptance
+above and require zero `CapPrm`, `CapEff`, and `CapAmb` in the `jreed` child.
+
+7. Remove `/etc/systemd/system/isadoraair-updater.service.d/10-privilege-drop.conf`
+only after `systemctl cat` proves the installed base unit itself contains the
+ambient-capability setting and the checks above pass. After removal, run
+`daemon-reload`, restart only the updater, repeat bounded readiness polling,
+and repeat all settled capability/self-check assertions.
+
+8. Fast-forward the live application source manually to the exact reviewed
+r0006 commit. Every Git command remains explicitly constrained to `ISA_USER`;
+the Update Center must not perform this protected-runtime transition:
+
+```bash
+(
+  test "$(sudo -u "$ISA_USER" git -C "$ISA_ROOT" rev-parse HEAD)" = \
+    "$R0005_COMMIT" || exit 1
+  test -z "$(sudo -u "$ISA_USER" git -C "$ISA_ROOT" status --porcelain)" || exit 1
+  sudo -u "$ISA_USER" git -C "$ISA_ROOT" merge --ff-only "$R0006_COMMIT" || exit 1
+  test "$(sudo -u "$ISA_USER" git -C "$ISA_ROOT" rev-parse HEAD)" = \
+    "$R0006_COMMIT" || exit 1
+  test -z "$(sudo -u "$ISA_USER" git -C "$ISA_ROOT" status --porcelain)" || exit 1
+  echo "Exact r0006 application source installed"
+)
+```
+
+Stop the r0006 bridge unless this checkpoint succeeds. r0006 requires no
+migrations, `collectstatic`, dependency installation, or nginx change. Because
+r0006 changes Django code loaded by Gunicorn, restart only Gunicorn after source
+advancement:
+
+```bash
+sudo systemctl restart isadoraair-gunicorn.service
+(
+  gunicorn_ready=false
+  for attempt in $(seq 1 30); do
+    if curl --fail --silent --show-error \
+      http://127.0.0.1:8000/healthz/ >/dev/null 2>&1; then
+      gunicorn_ready=true
+      break
+    fi
+    sleep 1
+  done
+  if [ "$gunicorn_ready" = true ]; then
+    echo "Gunicorn readiness check succeeded"
+  else
+    echo "Gunicorn /healthz/ did not become ready within 30 seconds" >&2
+    exit 1
+  fi
+)
+systemctl show isadoraair-gunicorn.service \
+  --property=ActiveState --property=SubState --property=Result
+```
+
+Stop the r0006 bridge unless the health probe succeeds and Gunicorn is settled
+active/running with a successful result. Do not restart the engine, monitoring,
+encoders, or RBDS. The protected updater was restarted separately during its
+earlier root-owned runtime and unit replacement.
+
+9. Verify Django health, exact Git identity, `/updates/` current release r0006,
+and all station core services. The final Git identity check is again explicit
+about application-user ownership:
+
+```bash
+(
+  test "$(sudo -u "$ISA_USER" git -C "$ISA_ROOT" branch --show-current)" = main || exit 1
+  test "$(sudo -u "$ISA_USER" git -C "$ISA_ROOT" rev-parse HEAD)" = \
+    "$R0006_COMMIT" || exit 1
+  test -z "$(sudo -u "$ISA_USER" git -C "$ISA_ROOT" status --porcelain)" || exit 1
+  echo "Final clean r0006 Git identity verified as $ISA_USER"
+)
+```
+
+Keep execution disarmed until every check is healthy. Only then may root edit
+`/etc/isadoraair/station.json` to set
+`update_execution_enabled` to `true`, restart only
+`isadoraair-updater.service`, repeat the bounded PING, and require `/updates/`
+to report READY / ARMED.

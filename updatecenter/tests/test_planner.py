@@ -18,7 +18,7 @@ from pathlib import Path
 
 from django.db import connection
 from django.db.migrations.recorder import MigrationRecorder
-from django.test import TestCase
+from django.test import SimpleTestCase, TestCase
 
 from updatecenter import manifest as m, planner, schema_health
 from .gitfixtures import FakeRepo
@@ -141,7 +141,8 @@ class NoUpdateTests(TestCase):
 
 
 class ValidUpdateTests(TestCase):
-    def _two_release_repo(self, followup_overrides=None, extra_files=None):
+    def _two_release_repo(self, followup_overrides=None, extra_files=None,
+                          followup_release_id="r0002"):
         """Returns (repo, releases_dir, bootstrap_sha), with local HEAD
         already reset back to the bootstrap commit -- simulating "the
         station is currently on the bootstrap release; r0002 exists
@@ -171,7 +172,7 @@ class ValidUpdateTests(TestCase):
         after_bootstrap_sha = repo.commit("add bootstrap manifest", push=True)
 
         overrides = followup_overrides or {}
-        _write_manifest(releases_dir, _followup("r0002", "r0001", **overrides))
+        _write_manifest(releases_dir, _followup(followup_release_id, "r0001", **overrides))
         for relative_path, content in (extra_files or {}).items():
             repo.write(relative_path, content)
         repo.commit("add r0002" + (" + accompanying files" if extra_files else ""), push=True)
@@ -191,6 +192,46 @@ class ValidUpdateTests(TestCase):
                 planner.TargetSchemaValidationStatus.PENDING,
             )
             self.assertIn("target source", plan.target_schema_validation_detail.lower())
+
+    def test_protected_runtime_change_without_manual_intent_is_rejected(self):
+        repo, _releases_dir, _bootstrap_sha = self._two_release_repo(
+            extra_files={
+                "deploy/updater_runtime/isadoraair_updater/runtime.py": "changed\n",
+            },
+            followup_release_id="r0006",
+        )
+        with repo:
+            plan = planner.build_plan(repo.work, "deploy/releases")
+            self.assertEqual(plan.safety_status, planner.SafetyStatus.CROSS_CHECK_FAILED)
+            self.assertTrue(any(
+                finding.field == "manual_bootstrap_required"
+                for finding in plan.cross_check_findings
+            ))
+
+    def test_protected_runtime_change_with_manual_intent_is_manual(self):
+        repo, _releases_dir, _bootstrap_sha = self._two_release_repo(
+            {"manual_bootstrap_required": True},
+            extra_files={
+                "deploy/updater_runtime/isadoraair_updater/runtime.py": "changed\n",
+            },
+            followup_release_id="r0006",
+        )
+        with repo:
+            plan = planner.build_plan(repo.work, "deploy/releases")
+            self.assertEqual(
+                plan.safety_status,
+                planner.SafetyStatus.MANUAL_BOOTSTRAP_REQUIRED,
+            )
+
+    def test_r0006_ordinary_change_does_not_force_manual_bootstrap(self):
+        repo, _releases_dir, _bootstrap_sha = self._two_release_repo(
+            extra_files={"ordinary.txt": "changed\n"},
+            followup_release_id="r0006",
+        )
+        with repo:
+            plan = planner.build_plan(repo.work, "deploy/releases")
+            self.assertEqual(plan.safety_status, planner.SafetyStatus.READY_TO_PLAN)
+            self.assertFalse(plan.manual_bootstrap_required)
 
     def test_requirements_changed_reflected(self):
         content = "Django==5.2.15\n"
@@ -502,6 +543,49 @@ class BootstrapSchemaExpectationTests(TestCase):
                 "webrequests.0008_webrequestconfig_dedication_tts",
             ):
                 self.assertNotIn(baseline_ref, plan.migrations.explicitly_required)
+
+
+class R0006ReleaseContractTests(SimpleTestCase):
+    ROOT = Path(__file__).resolve().parents[2]
+
+    def test_manifest_requires_only_gunicorn_restart(self):
+        data = json.loads(
+            (self.ROOT / "deploy" / "releases" / "r0006.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(
+            data["services_requiring_restart"],
+            ["isadoraair-gunicorn"],
+        )
+
+    def test_bridge_runs_checkout_git_and_materialization_as_application_user(self):
+        runbook = (self.ROOT / "docs" / "UPDATE_CENTER.md").read_text(encoding="utf-8")
+        bridge = runbook.split(
+            "### Exact r0005 to r0006 production bridge", 1,
+        )[1]
+        self.assertNotRegex(bridge, r"(?m)^\s*git -C")
+        self.assertIn('sudo -u "$ISA_USER" git -C "$ISA_ROOT" fetch origin main', bridge)
+        self.assertIn('sudo -u "$ISA_USER" mktemp -d', bridge)
+        self.assertIn('| sudo -u "$ISA_USER" tar -x', bridge)
+        self.assertNotIn("git config", bridge)
+
+    def test_bridge_restarts_only_gunicorn_after_source_advancement(self):
+        runbook = (self.ROOT / "docs" / "UPDATE_CENTER.md").read_text(encoding="utf-8")
+        bridge = runbook.split(
+            "### Exact r0005 to r0006 production bridge", 1,
+        )[1]
+        source_checkpoint = bridge.split("8. Fast-forward", 1)[1]
+        self.assertIn("sudo systemctl restart isadoraair-gunicorn.service", source_checkpoint)
+        self.assertIn("http://127.0.0.1:8000/healthz/", source_checkpoint)
+        self.assertIn("systemctl show isadoraair-gunicorn.service", source_checkpoint)
+        for forbidden in (
+            "restart isadoraair-engine.service",
+            "restart isadoraair-monitoring.service",
+            "restart isadoraair-encoders.service",
+            "restart isadoraair-rbds.service",
+        ):
+            self.assertNotIn(forbidden, source_checkpoint)
 
 
 class MigrationAggregationTests(TestCase):

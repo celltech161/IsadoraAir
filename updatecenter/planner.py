@@ -460,7 +460,11 @@ def build_plan(checkout_root, releases_dirname: str = release_chain.RELEASES_DIR
     all_findings: list[cross_check.CrossCheckFinding] = []
     for chained in releases_in_plan:
         rel_commit = release_commits[chained.manifest.release_id]
-        all_findings.extend(cross_check.cross_check_release(chained.manifest, rel_commit, checkout_root, app_label_paths))
+        previous_commit = release_commits[chain[chained.index - 1].manifest.release_id]
+        all_findings.extend(cross_check.cross_check_release(
+            chained.manifest, rel_commit, checkout_root, app_label_paths,
+            previous_commit,
+        ))
 
     if all_findings:
         return _safe(
