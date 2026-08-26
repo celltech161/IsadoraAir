@@ -8412,13 +8412,18 @@ class PlaybackEngine:
                     # [P0] 1.8 WRJE follow-up -- schedule a deferred re-check
                     # so the deck can't be stranded to the ~30s stuck-deck
                     # watchdog when stale Track.duration_seconds made a
-                    # GENUINE EOS look implausibly early. Only one check is
-                    # pending per generation; second/third rejections within
-                    # the window let the first callback decide from the same
-                    # baseline.
+                    # GENUINE EOS look implausibly early. Only ONE callback
+                    # is scheduled per pending window (the False->True
+                    # transition), but the baseline is REFRESHED on every
+                    # rejection so a later genuine EOS after apparent
+                    # recovery inside the same guard window is still
+                    # detected: without the refresh, EOS#1 baseline=10 +
+                    # buffers recovering to 42 + EOS#2 (genuine) inside
+                    # the window would leave the callback comparing 42 to
+                    # 10 and incorrectly concluding "recovered."
+                    deck.deferred_seek_eos_baseline = deck.media_buffer_count
                     if not deck.deferred_seek_eos_pending:
                         deck.deferred_seek_eos_pending = True
-                        deck.deferred_seek_eos_baseline = deck.media_buffer_count
                         # Wake ~1s after the guard window elapses -- gives
                         # the parser its whole 5s to resync AND buffers
                         # some slack to actually reach the probe before we

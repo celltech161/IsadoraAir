@@ -1391,6 +1391,84 @@ class DeckGenerationAndWatchdogTests(SimpleTestCase):
             engine._on_deck_eos_probed(deck.pipeline, deck)
         self.assertEqual(len(captured_all), 1)
 
+    def test_second_eos_after_apparent_recovery_still_detects_genuine_end(self):
+        """WRJE follow-up hole: EOS#1 rejected (baseline=10), buffers
+        appear to recover (count=42), then a GENUINE EOS#2 arrives
+        still inside the same seek-guard window. Without the per-
+        rejection baseline refresh, the deferred callback would compare
+        current=42 against baseline=10 and incorrectly conclude the
+        deck recovered."""
+        deck = self._seeked_deck(duration=180.0, media_buffer_count=10)
+        engine = self._engine(deck)
+        engine._get_deck_position = MagicMock(return_value=5.0)
+        engine._handle_deck_finished = MagicMock()
+
+        captured = []
+
+        def capture(_delay_s, fn, *args, **_kwargs):
+            captured.append((fn, args))
+            return 1
+
+        with patch.object(eng_module, "emit_event"), \
+             patch.object(eng_module.GLib, "timeout_add_seconds", side_effect=capture):
+            # EOS#1 -- baseline snapped at 10, one callback scheduled.
+            engine._on_deck_eos_probed(deck.pipeline, deck)
+            self.assertEqual(deck.deferred_seek_eos_baseline, 10)
+            # Buffers appear to recover.
+            deck.media_buffer_count = 42
+            # EOS#2 (genuine end of a much-shorter-than-metadata track)
+            # inside the same window. Baseline MUST refresh to 42; no
+            # second callback is scheduled.
+            engine._on_deck_eos_probed(deck.pipeline, deck)
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(deck.deferred_seek_eos_baseline, 42)
+
+        # No new buffers after EOS#2 -- deferred callback must complete
+        # the deck instead of being fooled by the pre-EOS#1 recovery.
+        fn, args = captured[0]
+        with patch.object(eng_module, "emit_event"):
+            fn(*args)
+        engine._handle_deck_finished.assert_called_once_with(deck)
+        self.assertTrue(deck.completion_claimed)
+        self.assertEqual(deck.completion_reason, "eos_deferred")
+        self.assertIn("I_EOS_DEFERRED_ACCEPTED", deck.eos_milestones)
+
+    def test_second_eos_after_recovery_with_ongoing_recovery_leaves_deck_running(self):
+        """Companion to the previous test: EOS#1 rejected, buffers
+        recover, EOS#2 rejected (baseline refreshed), buffers keep
+        advancing after EOS#2 -- deferred callback observes real
+        forward progress and must leave the deck alive."""
+        deck = self._seeked_deck(duration=180.0, media_buffer_count=10)
+        engine = self._engine(deck)
+        engine._get_deck_position = MagicMock(return_value=5.0)
+        engine._handle_deck_finished = MagicMock()
+
+        captured = []
+
+        def capture(_delay_s, fn, *args, **_kwargs):
+            captured.append((fn, args))
+            return 1
+
+        with patch.object(eng_module, "emit_event"), \
+             patch.object(eng_module.GLib, "timeout_add_seconds", side_effect=capture):
+            engine._on_deck_eos_probed(deck.pipeline, deck)
+            self.assertEqual(deck.deferred_seek_eos_baseline, 10)
+            deck.media_buffer_count = 42
+            engine._on_deck_eos_probed(deck.pipeline, deck)
+        self.assertEqual(deck.deferred_seek_eos_baseline, 42)
+        self.assertEqual(len(captured), 1)
+
+        # Real buffers advance past the refreshed baseline before the
+        # deferred callback fires -- confirmed still-recovering, deck
+        # must remain alive.
+        deck.media_buffer_count = 60
+        fn, args = captured[0]
+        with patch.object(eng_module, "emit_event"):
+            fn(*args)
+        engine._handle_deck_finished.assert_not_called()
+        self.assertFalse(deck.completion_claimed)
+        self.assertIn("I_EOS_POST_SEEK_RECOVERED", deck.eos_milestones)
+
 
 class RealWedgedDetachOperationTests(SimpleTestCase):
     helper = Path(__file__).with_name("_deck_detach_probe.py")
