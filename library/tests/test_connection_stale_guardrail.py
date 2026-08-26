@@ -52,22 +52,28 @@ class ConnectionStaleGuardrailStaticTests(TestCase):
         # Exactly the two pre-existing intervals (poll @1000ms status,
         # updatePositionIndicators @100ms) plus the two pre-existing
         # level/listener intervals -- nothing new added by this fix.
-        self.assertEqual(content.count("setInterval(poll,"), 1)
+        # The exact live statement, not a loose substring -- this
+        # fix's own explanatory comments legitimately mention
+        # "setInterval(poll," in prose, which a bare substring count
+        # would also (mis)count.
+        self.assertEqual(content.count("setInterval(poll, 1000);"), 1)
         self.assertNotIn("WebSocket(", content.split("toggleRemoteDjConnect")[0])
         # Only ever fetches the existing status endpoint for connectivity.
         self.assertIn("const resp = await fetch('/api/engine/status/');", content)
 
     def test_does_not_infer_connectivity_from_levels_or_listener_endpoints(self):
         content = self._content()
-        # The stale-tracking function itself must not appear anywhere
-        # near the levels/listener poll functions' own bodies.
+        # The stale-tracking functions must not appear anywhere near
+        # the levels/listener poll functions' own bodies.
         levels_fn = content[content.index("async function pollLevels()"):
                              content.index("async function pollListeners()")]
-        self.assertNotIn("updateConnectionStale", levels_fn)
+        self.assertNotIn("checkConnectionStaleness", levels_fn)
+        self.assertNotIn("markStatusSuccess", levels_fn)
         self.assertNotIn("connectionStale", levels_fn)
         listeners_start = content.index("async function pollListeners()")
         listeners_fn = content[listeners_start:listeners_start + 2000]
-        self.assertNotIn("updateConnectionStale", listeners_fn)
+        self.assertNotIn("checkConnectionStaleness", listeners_fn)
+        self.assertNotIn("markStatusSuccess", listeners_fn)
 
     # -- the threshold/accumulation logic itself --
 
@@ -76,42 +82,84 @@ class ConnectionStaleGuardrailStaticTests(TestCase):
         self.assertIn("const STATUS_STALE_THRESHOLD_MS = 3000;", content)
         self.assertIn("let lastStatusSuccessAt = Date.now();", content)
         self.assertIn("let connectionStale = false;", content)
-        self.assertIn("function updateConnectionStale(success)", content)
+        self.assertIn("function checkConnectionStaleness()", content)
+        self.assertIn("function markStatusSuccess()", content)
         self.assertIn("function renderConnectionStale(stale)", content)
 
-    def test_poll_calls_update_connection_stale_before_the_null_data_return(self):
-        """1 & 3: every poll() tick reports success/failure to the
-        stale tracker BEFORE the existing `if (!data) return;` early
-        exit -- otherwise a failed poll would never be observed at all."""
+    def test_stale_age_check_runs_before_awaiting_fetch_status(self):
+        """Timing-hole fix: staleness must be evaluated from ELAPSED
+        TIME at the start of every poll() tick, BEFORE `await
+        fetchStatus()` -- not from a failure callback reached only
+        after that await resolves. A blackholed/hanging request never
+        resolves and so never reaches any code after the await; if the
+        stale check lived there, an indefinitely-pending request could
+        suppress detection forever even though setInterval(poll, 1000)
+        keeps firing fresh ticks every second. Checking synchronously
+        at the top of poll(), before the await, guarantees every tick
+        -- pending fetch or not -- re-evaluates elapsed time."""
         content = self._content()
         poll_start = content.index("async function poll() {")
         poll_fn = content[poll_start:content.index("\n}", poll_start)]
-        self.assertIn("updateConnectionStale(!!data);", poll_fn)
-        call_pos = poll_fn.index("updateConnectionStale(!!data);")
+        self.assertIn("checkConnectionStaleness();", poll_fn)
+        self.assertIn("await fetchStatus();", poll_fn)
+        check_pos = poll_fn.index("checkConnectionStaleness();")
+        await_pos = poll_fn.index("await fetchStatus();")
+        self.assertLess(check_pos, await_pos,
+            "checkConnectionStaleness() must run BEFORE `await fetchStatus()`, "
+            "so a hung/pending request cannot suppress stale detection")
+
+    def test_success_reported_only_after_fetch_resolves_with_data(self):
+        """markStatusSuccess() must only run once fetchStatus() has
+        actually resolved with real data -- never speculatively, and
+        never for a null/failed result."""
+        content = self._content()
+        poll_start = content.index("async function poll() {")
+        poll_fn = content[poll_start:content.index("\n}", poll_start)]
+        self.assertIn("if (data) markStatusSuccess();", poll_fn)
+        mark_pos = poll_fn.index("if (data) markStatusSuccess();")
+        await_pos = poll_fn.index("await fetchStatus();")
         return_pos = poll_fn.index("if (!data) return;")
-        self.assertLess(call_pos, return_pos,
-            "updateConnectionStale must run before the null-data early return")
+        self.assertLess(await_pos, mark_pos)
+        self.assertLess(mark_pos, return_pos)
 
     def test_single_transient_miss_does_not_immediately_mark_stale(self):
         """2: a bare failure alone doesn't flip the flag -- only a
-        failure that's been going on for STATUS_STALE_THRESHOLD_MS."""
+        failure that's been going on for STATUS_STALE_THRESHOLD_MS.
+        checkConnectionStaleness() only ever SETS stale (based on
+        elapsed time); it is never told about a failure directly."""
         content = self._content()
-        fn_start = content.index("function updateConnectionStale(success)")
-        fn = content[fn_start:content.index("\nasync function fetchStatus()")]
-        self.assertIn("(now - lastStatusSuccessAt) >= STATUS_STALE_THRESHOLD_MS", fn)
-        # The elapsed-time check must gate the flip -- not a bare
-        # "on any failure" assignment.
-        self.assertNotIn("connectionStale = true;\n  }\n}", fn.replace(" ", ""))
+        fn_start = content.index("function checkConnectionStaleness()")
+        fn = content[fn_start:content.index("\n}", fn_start) + 2]
+        self.assertIn("Date.now() - lastStatusSuccessAt >= STATUS_STALE_THRESHOLD_MS", fn)
+        self.assertIn("if (connectionStale) return;", fn)
 
     def test_success_updates_timestamp_and_clears_stale_immediately(self):
-        """5: next successful status clears stale with no extra delay."""
+        """5: next successful status clears stale with no extra delay,
+        and refreshes the timestamp checkConnectionStaleness() reads
+        on every subsequent tick."""
         content = self._content()
-        fn_start = content.index("function updateConnectionStale(success)")
-        fn = content[fn_start:content.index("\nasync function fetchStatus()")]
-        success_branch = fn[fn.index("if (success)"):fn.index("if (!connectionStale")]
-        self.assertIn("lastStatusSuccessAt = now;", success_branch)
-        self.assertIn("connectionStale = false;", success_branch)
-        self.assertIn("renderConnectionStale(false);", success_branch)
+        fn_start = content.index("function markStatusSuccess()")
+        fn = content[fn_start:content.index("\n}", fn_start) + 2]
+        self.assertIn("lastStatusSuccessAt = Date.now();", fn)
+        self.assertIn("connectionStale = false;", fn)
+        self.assertIn("renderConnectionStale(false);", fn)
+
+    def test_failure_leaves_last_success_timestamp_untouched(self):
+        """Explicit invariant from the correction: on a failed
+        response, lastStatusSuccessAt must NOT be touched -- staleness
+        is purely a function of elapsed time since the last real
+        success, never reset/extended by a failure itself."""
+        content = self._content()
+        poll_start = content.index("async function poll() {")
+        poll_fn = content[poll_start:content.index("\n}", poll_start)]
+        # poll() itself never assigns the timestamp directly -- the
+        # only write path is inside markStatusSuccess(), reached only
+        # via `if (data) markStatusSuccess();`. (The module-scope
+        # `let lastStatusSuccessAt = Date.now();` seed and the
+        # assignment inside markStatusSuccess() are the two legitimate
+        # occurrences of this exact text elsewhere in the file.)
+        self.assertNotIn("lastStatusSuccessAt = Date.now();", poll_fn)
+        self.assertNotIn("lastStatusSuccessAt =", poll_fn)
 
     # -- banner presentation --
 
@@ -200,16 +248,98 @@ class ConnectionStaleGuardrailStaticTests(TestCase):
         (renderMicPtt/renderRemoteDjConnect/renderRemoteDjGate/etc,
         already reasserted every successful poll) is never fought with
         or clobbered, and nothing needs to be explicitly "restored" on
-        reconnect."""
+        reconnect. The presentational stale-CSS-class toggle is the
+        one exception allowed to touch DOM state directly, and it only
+        ever touches the banner's `hidden` attribute and
+        #consoleRoot's class list -- never any control's own
+        `.disabled` property."""
         content = self._content()
-        stale_fn_start = content.index("function updateConnectionStale(success)")
         render_stale_start = content.index("function renderConnectionStale(stale)")
-        # renderConnectionStale only ever touches the banner's hidden
-        # attribute, never any control's .disabled property.
+        check_fn_start = content.index("function checkConnectionStaleness()")
+        mark_fn_start = content.index("function markStatusSuccess()")
         render_stale_fn = content[render_stale_start:content.index("\n}", render_stale_start) + 2]
         self.assertNotIn(".disabled", render_stale_fn)
-        stale_fn = content[stale_fn_start:render_stale_start]
-        self.assertNotIn(".disabled", stale_fn)
+        self.assertIn("classList.toggle('connection-stale', stale)", render_stale_fn)
+        check_fn = content[check_fn_start:content.index("\n}", check_fn_start) + 2]
+        mark_fn = content[mark_fn_start:content.index("\n}", mark_fn_start) + 2]
+        self.assertNotIn(".disabled", check_fn)
+        self.assertNotIn(".disabled", mark_fn)
+
+    # -- presentational stale treatment (CSS-only, on #consoleRoot) --
+
+    def test_console_root_has_stable_id_for_the_stale_class_toggle(self):
+        content = self._content()
+        self.assertIn('id="consoleRoot"', content)
+
+    def test_render_connection_stale_toggles_class_on_console_root(self):
+        content = self._content()
+        fn_start = content.index("function renderConnectionStale(stale)")
+        fn = content[fn_start:content.index("\n}", fn_start) + 2]
+        self.assertIn("document.getElementById('consoleRoot')", fn)
+        self.assertIn("classList.toggle('connection-stale', stale)", fn)
+
+    STALE_DIMMED_SELECTORS = [
+        "#consoleRoot.connection-stale .ops-btn:not(#remoteDjConnectBtn)",
+        "#consoleRoot.connection-stale .playnow-btn:not(.ops-btn)",
+        "#consoleRoot.connection-stale .deck-transport-btn",
+        "#consoleRoot.connection-stale .qt-next-btn",
+        "#consoleRoot.connection-stale .qt-drag-handle",
+        "#consoleRoot.connection-stale .qir-btn",
+        "#consoleRoot.connection-stale .fx-cart",
+    ]
+
+    def test_stale_css_dims_every_enumerated_control_category(self):
+        """4 (visual half): manual/auto, studio mic PTT, Remote DJ
+        gate, deck transport (both buttons share .deck-transport-btn),
+        queue set-next/insert/reorder, FX fire, and play-now all read
+        as visibly unavailable while #consoleRoot carries
+        .connection-stale."""
+        content = self._content()
+        for selector in self.STALE_DIMMED_SELECTORS:
+            with self.subTest(selector=selector):
+                self.assertIn(selector, content)
+        # The shared dimmed-rule body itself.
+        rule_start = content.index(self.STALE_DIMMED_SELECTORS[0])
+        rule = content[rule_start:content.index("}", rule_start)]
+        self.assertIn("opacity:", rule)
+        self.assertIn("cursor: not-allowed;", rule)
+        self.assertIn("pointer-events: none;", rule)
+
+    def test_remote_dj_connect_button_excluded_from_stale_dimming(self):
+        """The connect/disconnect button must NOT visually read as
+        unavailable while stale -- its disconnect action stays
+        functionally live (see toggleRemoteDjConnect's own gate
+        placement), so dimming it would misrepresent a control that
+        still works."""
+        content = self._content()
+        rule_start = content.index(self.STALE_DIMMED_SELECTORS[0])
+        rule = content[rule_start:content.index("{", rule_start)]
+        self.assertIn(":not(#remoteDjConnectBtn)", rule)
+        self.assertNotIn("#remoteDjConnectBtn,", rule)
+
+    def test_stale_css_never_sets_the_disabled_property_anywhere(self):
+        """The presentational treatment must be pure CSS/opacity, not
+        a second mechanism that writes to `.disabled` -- that remains
+        exclusively each control's own render*(data) function's job."""
+        content = self._content()
+        css_start = content.index("#consoleRoot.connection-stale")
+        css_end = content.index("pointer-events: none;\n  }", css_start) + len("pointer-events: none;\n  }")
+        css_block = content[css_start:css_end]
+        self.assertNotIn(".disabled", css_block)
+        self.assertNotIn("disabled = true", css_block)
+        self.assertNotIn("disabled = false", css_block)
+
+    def test_pure_navigation_and_search_input_not_targeted_by_stale_css(self):
+        """fx-toggle-mobile/fx-more (show/hide UI) and the search input
+        itself must not be swept up by the dimming rule -- only actual
+        engine-mutation controls."""
+        content = self._content()
+        rule_start = content.index(self.STALE_DIMMED_SELECTORS[0])
+        rule = content[rule_start:content.index("{", rule_start)]
+        self.assertNotIn("fx-toggle-mobile", rule)
+        self.assertNotIn("fx-more", rule)
+        self.assertNotIn("queueInsertSearch", rule)
+        self.assertNotIn("queueInsertResults", rule)
 
     # -- pure navigation must NOT be gated --
 
@@ -241,9 +371,14 @@ class ConnectionStaleGuardrailRemoteDjModeTests(TestCase):
         self.assertEqual(response.status_code, 200)
         content = response.content.decode("utf-8")
         self.assertIn('id="connectionStaleBanner"', content)
+        self.assertIn('id="consoleRoot"', content)
         self.assertIn("const STATUS_STALE_THRESHOLD_MS = 3000;", content)
-        self.assertIn("function updateConnectionStale(success)", content)
-        # The Remote DJ gate control (visible in this mode) is gated.
+        self.assertIn("function checkConnectionStaleness()", content)
+        self.assertIn("function markStatusSuccess()", content)
+        # The Remote DJ gate control (visible in this mode) is gated,
+        # both functionally and via the presentational CSS class.
+        self.assertIn(
+            "#consoleRoot.connection-stale .ops-btn:not(#remoteDjConnectBtn)", content)
         start = content.index("async function toggleRemoteDjGate() {")
         head = content[start:start + 400]
         self.assertIn("if (connectionStale) return;", head)

@@ -1098,11 +1098,44 @@
     margin-bottom: 0.75rem;
   }
   .connection-stale-banner[hidden] { display: none; }
+
+  /* [P1] 1.7 follow-up -- purely presentational stale treatment for
+     live-mutation controls. The function-level `if (connectionStale)
+     return;` guards (toggleManualMode/toggleMicPtt/toggleRemoteDjGate/
+     deckCommand/seekTo/setNext/insertTrack/the reorder handler/
+     playNow/fireFxCart) remain the actual safety boundary -- they also
+     cover keyboard/programmatic invocation, which no CSS rule can.
+     This block only makes the SAME controls visibly read as
+     unavailable, via one class toggled on #consoleRoot (see
+     renderConnectionStale() below) -- never by setting/clearing any
+     individual control's own `disabled` property, so each control's
+     pre-existing authoritative disabled state (e.g. renderMicPtt's
+     !data.mic_configured) is untouched and simply reappears exactly
+     as it was the moment #consoleRoot.connection-stale is removed.
+
+     #remoteDjConnectBtn is deliberately EXCLUDED even though it
+     shares .ops-btn with the three buttons below -- tearing down an
+     already-connected session bypasses the stale gate by design (see
+     toggleRemoteDjConnect's own comment), so dimming it here would
+     visually misrepresent a control that still works. */
+  #consoleRoot.connection-stale .ops-btn:not(#remoteDjConnectBtn),
+  #consoleRoot.connection-stale .playnow-btn:not(.ops-btn),
+  #consoleRoot.connection-stale .deck-transport-btn,
+  #consoleRoot.connection-stale .qt-next-btn,
+  #consoleRoot.connection-stale .qt-drag-handle,
+  #consoleRoot.connection-stale .qir-btn,
+  #consoleRoot.connection-stale .fx-cart,
+  #consoleRoot.connection-stale #npWaveform-A,
+  #consoleRoot.connection-stale #npWaveform-B {
+    opacity: 0.45;
+    cursor: not-allowed;
+    pointer-events: none;
+  }
 </style>
 {% endblock %}
 
 {% block content %}
-<div class="console-{{ mode|default:'full' }}">
+<div class="console-{{ mode|default:'full' }}" id="consoleRoot">
 <div id="connectionStaleBanner" class="connection-stale-banner" hidden role="status">CONNECTION LOST — STATUS STALE</div>
 <div class="top-status-row">
 <div class="listener-widget" id="listenerWidget" aria-label="Live Shoutcast listener count">
@@ -1998,30 +2031,52 @@ const STATUS_STALE_THRESHOLD_MS = 3000;
 let lastStatusSuccessAt = Date.now();
 let connectionStale = false;
 
+// Toggles the banner's `hidden` attribute AND a single presentational
+// class on #consoleRoot -- CSS rules scoped under
+// #consoleRoot.connection-stale dim the same live-mutation controls
+// the function-level guards below already block, purely so the
+// operator doesn't click a control that silently does nothing. Never
+// touches any individual control's own `disabled` property -- see the
+// CSS block's own comment for why that split matters on reconnect.
 function renderConnectionStale(stale) {
   const banner = document.getElementById('connectionStaleBanner');
   if (banner) banner.hidden = !stale;
+  const root = document.getElementById('consoleRoot');
+  if (root) root.classList.toggle('connection-stale', stale);
 }
 
-// Called once per poll() tick with whether that tick's fetchStatus()
-// succeeded. A single transient miss does NOT flip the console stale
-// -- only once STATUS_STALE_THRESHOLD_MS has elapsed with no
-// successful response at all. Clears immediately (no delay) on the
-// first success, per "automatically restore ... on the first
-// successful status response."
-function updateConnectionStale(success) {
-  const now = Date.now();
-  if (success) {
-    lastStatusSuccessAt = now;
-    if (connectionStale) {
-      connectionStale = false;
-      renderConnectionStale(false);
-    }
-    return;
-  }
-  if (!connectionStale && (now - lastStatusSuccessAt) >= STATUS_STALE_THRESHOLD_MS) {
+// Evaluated at the START of every poll() tick, BEFORE awaiting
+// fetchStatus() -- staleness depends on ELAPSED TIME since the last
+// successful response, never on a failure callback. This matters
+// because a blackholed/hanging request never resolves and so never
+// reaches a failure branch at all; setInterval(poll, 1000) still
+// fires a fresh poll() (and therefore a fresh call to this function)
+// every second regardless of how many earlier calls are still
+// pending, so an indefinitely-hung fetch cannot suppress detection.
+// A single transient miss does NOT flip the console stale -- only
+// once STATUS_STALE_THRESHOLD_MS has actually elapsed with no
+// successful response at all.
+function checkConnectionStaleness() {
+  if (connectionStale) return;
+  if (Date.now() - lastStatusSuccessAt >= STATUS_STALE_THRESHOLD_MS) {
     connectionStale = true;
     renderConnectionStale(true);
+  }
+}
+
+// Called only when a poll() tick's fetchStatus() actually resolved
+// with data -- refreshes the last-success timestamp and clears stale
+// immediately (no delay), per "automatically restore ... on the
+// first successful status response." A failed/pending response never
+// calls this, so lastStatusSuccessAt is left untouched on failure --
+// staleness is entirely a function of how long ago the last real
+// success was, re-evaluated fresh by checkConnectionStaleness() above
+// on every subsequent tick.
+function markStatusSuccess() {
+  lastStatusSuccessAt = Date.now();
+  if (connectionStale) {
+    connectionStale = false;
+    renderConnectionStale(false);
   }
 }
 
@@ -2630,8 +2685,14 @@ async function insertTrack(trackId, position) {
 
 // --- Main poll loop ---
 async function poll() {
+  // Evaluated BEFORE the fetch, from elapsed wall-clock time, so a
+  // hung/blackholed request (which never resolves and so never lets
+  // this tick reach any code after the await) still gets checked --
+  // the next 1000ms setInterval(poll, ...) tick runs this again
+  // regardless of whether an earlier fetchStatus() is still pending.
+  checkConnectionStaleness();
   const data = await fetchStatus();
-  updateConnectionStale(!!data);
+  if (data) markStatusSuccess();
   if (!data) return;
   const decks = data.decks || {};
   const queue = data.queue || [];
