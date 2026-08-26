@@ -1226,6 +1226,171 @@ class DeckGenerationAndWatchdogTests(SimpleTestCase):
         )
         engine._deck_teardowns["B"].stop()
 
+    # ==================================================================
+    # [P0] 1.8 WRJE follow-up -- deferred post-seek-EOS re-check tests.
+    # ==================================================================
+
+    def _seeked_deck(self, *, generation=1, duration=180.0, slot="A",
+                    seek_seconds_ago=1.0, media_buffer_count=0):
+        deck = self._deck(generation=generation, duration=duration, slot=slot)
+        deck.seeked_at = time.time() - seek_seconds_ago
+        deck.media_buffer_count = media_buffer_count
+        return deck
+
+    def _reject_eos_and_capture_deferred(self, engine, deck):
+        """Invoke _on_deck_eos_probed under a GLib.timeout_add_seconds
+        capture so we can drive the deferred callback synchronously.
+        Returns (callback, expected_generation)."""
+        captured = []
+
+        def capture(_delay_s, fn, *args, **_kwargs):
+            captured.append((fn, args))
+            return 1  # a non-zero source id keeps the caller happy
+
+        with patch.object(eng_module, "emit_event"), \
+             patch.object(eng_module.GLib, "timeout_add_seconds", side_effect=capture):
+            engine._on_deck_eos_probed(deck.pipeline, deck)
+        return captured
+
+    def test_premature_post_seek_eos_with_buffer_recovery_lets_deck_continue(self):
+        # Stale duration_seconds=180 vs. pos=5 -> looks implausibly early.
+        deck = self._seeked_deck(duration=180.0, media_buffer_count=10)
+        engine = self._engine(deck)
+        engine._get_deck_position = MagicMock(return_value=5.0)
+        engine._handle_deck_finished = MagicMock()
+
+        captured = self._reject_eos_and_capture_deferred(engine, deck)
+        self.assertEqual(len(captured), 1,
+            "one deferred re-check scheduled on rejection")
+        self.assertTrue(deck.deferred_seek_eos_pending)
+        self.assertEqual(deck.deferred_seek_eos_baseline, 10)
+        self.assertIn("I_EOS_REJECTED_POST_SEEK", deck.eos_milestones)
+
+        # Real media buffers arrive AFTER the rejection -- parser hiccup
+        # confirmed transient. Deferred callback must leave the deck alive.
+        deck.media_buffer_count = 42
+        fn, args = captured[0]
+        with patch.object(eng_module, "emit_event"):
+            fn(*args)
+        engine._handle_deck_finished.assert_not_called()
+        self.assertFalse(deck.finished)
+        self.assertFalse(deck.completion_claimed)
+        self.assertFalse(deck.deferred_seek_eos_pending)
+        self.assertIn("I_EOS_POST_SEEK_RECOVERED", deck.eos_milestones)
+
+    def test_post_seek_eos_without_buffer_recovery_completes_after_guard(self):
+        deck = self._seeked_deck(duration=180.0, media_buffer_count=10)
+        engine = self._engine(deck)
+        engine._get_deck_position = MagicMock(return_value=5.0)
+        engine._handle_deck_finished = MagicMock()
+
+        captured = self._reject_eos_and_capture_deferred(engine, deck)
+        self.assertEqual(len(captured), 1)
+
+        # No new buffers arrived -- deferred callback must accept EOS
+        # as genuine and retire the deck via the ordinary finished path.
+        fn, args = captured[0]
+        with patch.object(eng_module, "emit_event") as emitted:
+            fn(*args)
+        engine._handle_deck_finished.assert_called_once_with(deck)
+        self.assertTrue(deck.completion_claimed)
+        self.assertEqual(deck.completion_reason, "eos_deferred")
+        self.assertIn("I_EOS_DEFERRED_ACCEPTED", deck.eos_milestones)
+        deferred_events = [
+            call for call in emitted.call_args_list
+            if "Deferred post-seek EOS" in call.kwargs.get("title", "")
+        ]
+        self.assertEqual(len(deferred_events), 1)
+
+    def test_stale_metadata_duration_does_not_delay_completion_to_duration_plus_thirty(self):
+        """WRJE scenario: Track.duration_seconds=7194 (stale), the real
+        audio is much shorter, deck gets to genuine EOS at pos~=60.
+        Without the deferred re-check the EOS would be rejected and the
+        deck would only complete when _check_stuck_decks fires ~30s past
+        the METADATA duration -- effectively minutes/hours of dead
+        deck. With the fix, completion happens inside ~SEEK_EOS_GUARD_SECONDS."""
+        deck = self._seeked_deck(duration=7194.0, media_buffer_count=200)
+        engine = self._engine(deck)
+        engine._get_deck_position = MagicMock(return_value=60.0)
+        engine._handle_deck_finished = MagicMock()
+
+        captured = self._reject_eos_and_capture_deferred(engine, deck)
+        # Sanity: the classic guard math WAS triggered (60 < 7194 - 30).
+        self.assertIn("I_EOS_REJECTED_POST_SEEK", deck.eos_milestones)
+        # Deferred callback fires ~6s later (SEEK_EOS_GUARD_SECONDS+1),
+        # not ~7194s later. Buffers did not advance -> completion runs.
+        fn, args = captured[0]
+        with patch.object(eng_module, "emit_event"):
+            fn(*args)
+        engine._handle_deck_finished.assert_called_once_with(deck)
+        self.assertTrue(deck.completion_claimed)
+
+    def test_deferred_callback_is_harmless_when_generation_replaced(self):
+        old = self._seeked_deck(generation=1, duration=180.0)
+        engine = self._engine(old)
+        engine._get_deck_position = MagicMock(return_value=5.0)
+        engine._handle_deck_finished = MagicMock()
+
+        captured = self._reject_eos_and_capture_deferred(engine, old)
+        fn, args = captured[0]
+
+        # Between rejection and the deferred callback the slot was
+        # replaced: old deck retired, new generation installed.
+        old.retirement_started = True
+        engine._deck_bin_map.pop(id(old.pipeline), None)
+        new = self._deck(generation=2, slot="A")
+        engine.decks["A"] = new
+        engine._deck_bin_map[id(new.pipeline)] = new
+
+        with patch.object(eng_module, "emit_event"):
+            result = fn(*args)
+        # Return False so GLib auto-removes the timeout source.
+        self.assertFalse(result)
+        engine._handle_deck_finished.assert_not_called()
+        self.assertFalse(new.completion_claimed,
+            "the replacement generation must NEVER be affected by the old deck's deferred callback")
+        self.assertNotIn("I_EOS_DEFERRED_ACCEPTED", new.eos_milestones)
+
+    def test_deferred_callback_does_not_double_complete_when_racing_watchdog(self):
+        deck = self._seeked_deck(duration=180.0)
+        engine = self._engine(deck)
+        engine._get_deck_position = MagicMock(return_value=5.0)
+        engine._handle_deck_finished = MagicMock()
+
+        captured = self._reject_eos_and_capture_deferred(engine, deck)
+        fn, args = captured[0]
+
+        # Between rejection and deferred callback, a watchdog / error /
+        # EOS race retires the deck first and claims completion.
+        self.assertTrue(deck.claim_completion("watchdog"))
+        # Then the deferred callback fires. It must NOT call
+        # _handle_deck_finished a second time.
+        with patch.object(eng_module, "emit_event"):
+            fn(*args)
+        engine._handle_deck_finished.assert_not_called()
+        self.assertEqual(deck.completion_reason, "watchdog",
+            "the earlier winner's completion_reason must be preserved")
+
+    def test_second_eos_rejection_in_window_does_not_stack_deferred_callbacks(self):
+        deck = self._seeked_deck(duration=180.0, media_buffer_count=10)
+        engine = self._engine(deck)
+        engine._get_deck_position = MagicMock(return_value=5.0)
+
+        captured_all = []
+
+        def capture(_delay_s, fn, *args, **_kwargs):
+            captured_all.append((fn, args))
+            return 1
+
+        with patch.object(eng_module, "emit_event"), \
+             patch.object(eng_module.GLib, "timeout_add_seconds", side_effect=capture):
+            engine._on_deck_eos_probed(deck.pipeline, deck)
+            # Second spurious EOS inside the window -- must NOT schedule
+            # a second deferred callback.
+            engine._on_deck_eos_probed(deck.pipeline, deck)
+            engine._on_deck_eos_probed(deck.pipeline, deck)
+        self.assertEqual(len(captured_all), 1)
+
 
 class RealWedgedDetachOperationTests(SimpleTestCase):
     helper = Path(__file__).with_name("_deck_detach_probe.py")

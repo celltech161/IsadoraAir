@@ -596,6 +596,19 @@ class Deck:
         self.completion_reason = None
         self.probe_handles = []
         self.signal_handles = []
+        # [P0] 1.8 WRJE follow-up -- deferred post-seek-EOS re-check.
+        # An EOS rejected inside SEEK_EOS_GUARD_SECONDS (because pos looked
+        # implausibly early) may have been genuine after all -- stale
+        # Track.duration_seconds can push a real EOS below the plausibility
+        # threshold. deferred_seek_eos_baseline snapshots media_buffer_count
+        # at the moment of rejection; after the guard window expires, a
+        # deferred callback compares the current count to it. If buffers
+        # advanced, the rejection stands (transient parser hiccup); if not,
+        # the deferred callback accepts the EOS as genuine and retires the
+        # deck rather than waiting for the ~30s stuck-deck watchdog. Only
+        # one deferred check is ever pending per deck generation.
+        self.deferred_seek_eos_pending = False
+        self.deferred_seek_eos_baseline = 0
 
     def mark_milestone(self, name, *, state=None, now=None):
         current = time.monotonic() if now is None else now
@@ -8396,6 +8409,25 @@ class PlaybackEngine:
                         },
                         dedupe_key=f"engine|implausible-eos|slot={deck.slot}|track={deck.track.id}",
                     )
+                    # [P0] 1.8 WRJE follow-up -- schedule a deferred re-check
+                    # so the deck can't be stranded to the ~30s stuck-deck
+                    # watchdog when stale Track.duration_seconds made a
+                    # GENUINE EOS look implausibly early. Only one check is
+                    # pending per generation; second/third rejections within
+                    # the window let the first callback decide from the same
+                    # baseline.
+                    if not deck.deferred_seek_eos_pending:
+                        deck.deferred_seek_eos_pending = True
+                        deck.deferred_seek_eos_baseline = deck.media_buffer_count
+                        # Wake ~1s after the guard window elapses -- gives
+                        # the parser its whole 5s to resync AND buffers
+                        # some slack to actually reach the probe before we
+                        # compare counts.
+                        GLib.timeout_add_seconds(
+                            int(SEEK_EOS_GUARD_SECONDS) + 1,
+                            self._recheck_deferred_seek_eos,
+                            deck, deck.generation,
+                        )
                     return
 
         if not deck.claim_completion("eos"):
@@ -8403,6 +8435,70 @@ class PlaybackEngine:
             return
         deck.mark_milestone("I_EOS_ACCEPTED")
         self._handle_deck_finished(deck)
+
+    @_glib_safe(default_return=False)
+    def _recheck_deferred_seek_eos(self, deck, expected_generation):
+        """[P0] 1.8 WRJE follow-up -- decide the deferred post-seek EOS.
+
+        Fires ~1s after SEEK_EOS_GUARD_SECONDS. Returns False so this
+        one-shot GLib timeout auto-removes.
+
+        Exact-generation safe: if the deck was retired/replaced (a new
+        generation now sits in this slot, or the deck was removed from
+        _deck_bin_map by _remove_deck, or finished/retirement_started
+        flipped True from any completion path), this is a no-op.
+
+        Race-safe with EOS/error/watchdog: completion goes through the
+        same claim_completion primitive every other completion path
+        uses, so a concurrent completion wins and this call is silently
+        dropped -- no duplicate _handle_deck_finished invocation."""
+        if deck is None:
+            return False
+        if deck.generation != expected_generation:
+            return False
+        if deck.finished or deck.retirement_started:
+            return False
+        if self._deck_bin_map.get(id(deck.pipeline)) is not deck:
+            return False
+        baseline = deck.deferred_seek_eos_baseline
+        current = deck.media_buffer_count
+        deck.deferred_seek_eos_pending = False
+        if current > baseline:
+            # Real media buffers advanced after the rejected EOS -- the
+            # original rejection was correct, this is the confirmed
+            # transient parser hiccup. Leave the deck alone.
+            deck.mark_milestone("I_EOS_POST_SEEK_RECOVERED", state=current - baseline)
+            print(f"  [{deck.slot}] Post-seek EOS re-check: media buffers "
+                  f"resumed ({baseline}->{current}) -- confirmed transient parser hiccup, deck continues.")
+            return False
+        # No new real buffers arrived after the rejection. Stale
+        # Track.duration_seconds most likely made a GENUINE EOS look
+        # implausibly early. Retire this exact generation now instead
+        # of waiting for the ~30s stuck-deck watchdog.
+        deck.mark_milestone("I_EOS_DEFERRED_ACCEPTED", state=current)
+        seconds_since_seek = (
+            round(time.time() - deck.seeked_at, 1) if deck.seeked_at else None
+        )
+        print(f"  [{deck.slot}] Post-seek EOS re-check: media_buffer_count "
+              f"still {current} after guard -- accepting EOS as genuine "
+              f"(likely stale Track.duration_seconds).")
+        emit_event(
+            category="engine", level="warning",
+            title="Deferred post-seek EOS accepted as genuine",
+            detail={
+                "slot": deck.slot, "track_id": deck.track.id,
+                "track_title": deck.track.title,
+                "media_buffer_count": current,
+                "seconds_since_seek": seconds_since_seek,
+                "metadata_duration_seconds": deck.track.duration_seconds,
+            },
+            dedupe_key=f"engine|deferred-eos|slot={deck.slot}|track={deck.track.id}",
+        )
+        if not deck.claim_completion("eos_deferred"):
+            deck.mark_milestone("I_DUPLICATE_COMPLETION_IGNORED")
+            return False
+        self._handle_deck_finished(deck)
+        return False
 
     @_glib_safe(default_return=True)
     def _on_deck_error(self, bus, message, deck):

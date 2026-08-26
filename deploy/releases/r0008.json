@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "release_id": "r0008",
+  "previous_release_id": "r0007",
+  "minimum_updater_protocol_version": 3,
+  "summary": "P0 1.8 -- deck EOS/watchdog containment. First poisoned slot triggers a systemd-driven policy restart with an atomic per-boot LogItem-occurrence anti-replay marker (never per-Track). Adds explicit engine-unit StartLimit=3/10min and a deferred post-seek-EOS re-check so a stalled deck retires inside the guard window instead of waiting for the 30s stuck-deck watchdog. No migrations.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [
+    "isadoraair-engine.service"
+  ],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-engine"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0007"
+}
