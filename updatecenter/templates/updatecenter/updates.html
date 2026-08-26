@@ -238,7 +238,20 @@
         write('uc-job-backend', data.backend_temporarily_unavailable ? `Backend temporarily unavailable: ${data.backend_detail}` : '');
         write('uc-job-log', data.log_tail);
         delay = 2000;
-        if (data.terminal) return;
+        if (data.terminal) {
+          // Reached ANY terminal state (succeeded/failed/manual-
+          // intervention/etc) -- do not special-case success. The rest
+          // of this page (active-lock blocker, installed release,
+          // available-update summary, schema health, backend
+          // readiness) was server-rendered from state that existed
+          // BEFORE this job finished; only a normal authoritative
+          // reload recomputes it. Not a reload loop: the fresh
+          // server-render of a terminal shown_job never re-includes
+          // this polling block (see the {% if shown_job and not
+          // shown_job_terminal %} guard around this <script>).
+          window.location.reload();
+          return;
+        }
       } catch (_error) {
         write('uc-job-backend', 'Application or updater temporarily unavailable; polling will retry.');
         delay = Math.min(delay * 2, 15000);
