@@ -1252,6 +1252,16 @@ class DeckGenerationAndWatchdogTests(SimpleTestCase):
             engine._on_deck_eos_probed(deck.pipeline, deck)
         return captured
 
+    def _expire_deferred_window(self, deck):
+        """Backdate the most-recent-rejection timestamp past
+        DEFERRED_SEEK_EOS_OBSERVATION_SECONDS so a captured callback
+        decides immediately when invoked synchronously in a test,
+        instead of rescheduling itself (real wall-clock time barely
+        moves between scheduling and invocation in these tests)."""
+        deck.deferred_seek_eos_last_rejected_monotonic -= (
+            eng_module.DEFERRED_SEEK_EOS_OBSERVATION_SECONDS + 1
+        )
+
     def test_premature_post_seek_eos_with_buffer_recovery_lets_deck_continue(self):
         # Stale duration_seconds=180 vs. pos=5 -> looks implausibly early.
         deck = self._seeked_deck(duration=180.0, media_buffer_count=10)
@@ -1269,6 +1279,7 @@ class DeckGenerationAndWatchdogTests(SimpleTestCase):
         # Real media buffers arrive AFTER the rejection -- parser hiccup
         # confirmed transient. Deferred callback must leave the deck alive.
         deck.media_buffer_count = 42
+        self._expire_deferred_window(deck)
         fn, args = captured[0]
         with patch.object(eng_module, "emit_event"):
             fn(*args)
@@ -1289,6 +1300,7 @@ class DeckGenerationAndWatchdogTests(SimpleTestCase):
 
         # No new buffers arrived -- deferred callback must accept EOS
         # as genuine and retire the deck via the ordinary finished path.
+        self._expire_deferred_window(deck)
         fn, args = captured[0]
         with patch.object(eng_module, "emit_event") as emitted:
             fn(*args)
@@ -1317,8 +1329,9 @@ class DeckGenerationAndWatchdogTests(SimpleTestCase):
         captured = self._reject_eos_and_capture_deferred(engine, deck)
         # Sanity: the classic guard math WAS triggered (60 < 7194 - 30).
         self.assertIn("I_EOS_REJECTED_POST_SEEK", deck.eos_milestones)
-        # Deferred callback fires ~6s later (SEEK_EOS_GUARD_SECONDS+1),
-        # not ~7194s later. Buffers did not advance -> completion runs.
+        # Deferred callback fires ~6s later (DEFERRED_SEEK_EOS_OBSERVATION_
+        # SECONDS), not ~7194s later. Buffers did not advance -> completion.
+        self._expire_deferred_window(deck)
         fn, args = captured[0]
         with patch.object(eng_module, "emit_event"):
             fn(*args)
@@ -1363,6 +1376,11 @@ class DeckGenerationAndWatchdogTests(SimpleTestCase):
         # Between rejection and deferred callback, a watchdog / error /
         # EOS race retires the deck first and claims completion.
         self.assertTrue(deck.claim_completion("watchdog"))
+        # Expire the window so the callback actually reaches its
+        # claim_completion race instead of short-circuiting via a
+        # reschedule (which would also leave _handle_deck_finished
+        # uncalled, but wouldn't exercise the real race).
+        self._expire_deferred_window(deck)
         # Then the deferred callback fires. It must NOT call
         # _handle_deck_finished a second time.
         with patch.object(eng_module, "emit_event"):
@@ -1425,6 +1443,7 @@ class DeckGenerationAndWatchdogTests(SimpleTestCase):
 
         # No new buffers after EOS#2 -- deferred callback must complete
         # the deck instead of being fooled by the pre-EOS#1 recovery.
+        self._expire_deferred_window(deck)
         fn, args = captured[0]
         with patch.object(eng_module, "emit_event"):
             fn(*args)
@@ -1462,9 +1481,113 @@ class DeckGenerationAndWatchdogTests(SimpleTestCase):
         # deferred callback fires -- confirmed still-recovering, deck
         # must remain alive.
         deck.media_buffer_count = 60
+        self._expire_deferred_window(deck)
         fn, args = captured[0]
         with patch.object(eng_module, "emit_event"):
             fn(*args)
+        engine._handle_deck_finished.assert_not_called()
+        self.assertFalse(deck.completion_claimed)
+        self.assertIn("I_EOS_POST_SEEK_RECOVERED", deck.eos_milestones)
+
+    def test_second_eos_shortly_before_deadline_reschedules_full_window(self):
+        """[P0] 1.8 timing follow-up: the deferred callback deadline was
+        previously anchored to the FIRST rejection. A second rejection
+        arriving late in the window (shortly before that first deadline)
+        would only get whatever time was left -- shorter than the
+        known ~2.7s parser-recovery case -- before the ORIGINAL
+        callback decided. Fixed by having the callback reschedule
+        itself for the remaining time whenever
+        deferred_seek_eos_last_rejected_monotonic was refreshed after
+        the callback was originally scheduled."""
+        deck = self._seeked_deck(duration=180.0, media_buffer_count=10)
+        engine = self._engine(deck)
+        engine._get_deck_position = MagicMock(return_value=5.0)
+        engine._handle_deck_finished = MagicMock()
+
+        captured = []
+
+        def capture(_delay_s, fn, *args, **_kwargs):
+            captured.append((fn, args))
+            return 1
+
+        with patch.object(eng_module, "emit_event"), \
+             patch.object(eng_module.GLib, "timeout_add_seconds", side_effect=capture):
+            # EOS#1 -- one GLib source scheduled, baseline=10.
+            engine._on_deck_eos_probed(deck.pipeline, deck)
+            self.assertEqual(len(captured), 1)
+            # Buffers appear to recover.
+            deck.media_buffer_count = 42
+            # EOS#2 arrives shortly before EOS#1's callback deadline --
+            # still well within DEFERRED_SEEK_EOS_OBSERVATION_SECONDS
+            # of real wall-clock time, so no NEW GLib source is created
+            # (deferred_seek_eos_pending is already True); only the
+            # baseline and timestamp refresh.
+            engine._on_deck_eos_probed(deck.pipeline, deck)
+        self.assertEqual(len(captured), 1, "still only the original GLib source at this point")
+        self.assertEqual(deck.deferred_seek_eos_baseline, 42)
+
+        # The ORIGINAL scheduled callback now fires (simulating the real
+        # GLib timeout elapsing). Because the timestamp was refreshed by
+        # EOS#2 moments ago, this call must defer -- reschedule itself
+        # for the remaining time -- rather than deciding on a partial
+        # observation window.
+        fn1, args1 = captured[0]
+        with patch.object(eng_module, "emit_event"), \
+             patch.object(eng_module.GLib, "timeout_add_seconds", side_effect=capture):
+            result = fn1(*args1)
+        self.assertFalse(result, "one-shot GLib callback must return False regardless of outcome")
+        self.assertEqual(len(captured), 2, "callback rescheduled itself for the remaining window")
+        engine._handle_deck_finished.assert_not_called()
+        self.assertTrue(deck.deferred_seek_eos_pending,
+            "still pending -- the deadline was deferred, not decided")
+
+        # After the FULL interval from EOS#2 (not EOS#1) has elapsed,
+        # with no new buffers -> genuine EOS accepted.
+        self._expire_deferred_window(deck)
+        fn2, args2 = captured[1]
+        with patch.object(eng_module, "emit_event"):
+            fn2(*args2)
+        engine._handle_deck_finished.assert_called_once_with(deck)
+        self.assertTrue(deck.completion_claimed)
+        self.assertEqual(deck.completion_reason, "eos_deferred")
+
+    def test_second_eos_shortly_before_deadline_then_recovery_leaves_deck_running(self):
+        """Companion to the previous test: same reschedule, but real
+        media buffers advance past the refreshed baseline before the
+        rescheduled callback fires -- deck must survive."""
+        deck = self._seeked_deck(duration=180.0, media_buffer_count=10)
+        engine = self._engine(deck)
+        engine._get_deck_position = MagicMock(return_value=5.0)
+        engine._handle_deck_finished = MagicMock()
+
+        captured = []
+
+        def capture(_delay_s, fn, *args, **_kwargs):
+            captured.append((fn, args))
+            return 1
+
+        with patch.object(eng_module, "emit_event"), \
+             patch.object(eng_module.GLib, "timeout_add_seconds", side_effect=capture):
+            engine._on_deck_eos_probed(deck.pipeline, deck)
+            deck.media_buffer_count = 42
+            engine._on_deck_eos_probed(deck.pipeline, deck)
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(deck.deferred_seek_eos_baseline, 42)
+
+        fn1, args1 = captured[0]
+        with patch.object(eng_module, "emit_event"), \
+             patch.object(eng_module.GLib, "timeout_add_seconds", side_effect=capture):
+            fn1(*args1)
+        self.assertEqual(len(captured), 2)
+        engine._handle_deck_finished.assert_not_called()
+
+        # Real buffers advance past the refreshed baseline (42) before
+        # the rescheduled callback fires.
+        deck.media_buffer_count = 100
+        self._expire_deferred_window(deck)
+        fn2, args2 = captured[1]
+        with patch.object(eng_module, "emit_event"):
+            fn2(*args2)
         engine._handle_deck_finished.assert_not_called()
         self.assertFalse(deck.completion_claimed)
         self.assertIn("I_EOS_POST_SEEK_RECOVERED", deck.eos_milestones)

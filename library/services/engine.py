@@ -216,6 +216,14 @@ POLICY_RESTART_EXIT_STATUS = 75  # EX_TEMPFAIL; distinct from 0/SIGTERM/SIGINT
 # genuine EOS inside this window still only gets scrutinized, not
 # blocked, if its position is actually near the track's real end).
 SEEK_EOS_GUARD_SECONDS = 5.0
+# [P0] 1.8 WRJE follow-up -- how long _recheck_deferred_seek_eos waits,
+# from the MOST RECENT rejected post-seek EOS, before deciding. +1s over
+# the raw guard gives the parser its whole window to resync AND buffers
+# some slack to actually reach the probe before counts are compared. A
+# later rejection inside an already-pending window reschedules the same
+# one-shot decision so it also gets this full interval, rather than
+# inheriting whatever's left of an earlier rejection's countdown.
+DEFERRED_SEEK_EOS_OBSERVATION_SECONDS = SEEK_EOS_GUARD_SECONDS + 1.0
 SLOTS = ("A", "B")
 
 # Remote DJ over WebRTC.
@@ -606,9 +614,15 @@ class Deck:
         # advanced, the rejection stands (transient parser hiccup); if not,
         # the deferred callback accepts the EOS as genuine and retires the
         # deck rather than waiting for the ~30s stuck-deck watchdog. Only
-        # one deferred check is ever pending per deck generation.
+        # one deferred DECISION CHAIN is ever pending per deck generation
+        # -- deferred_seek_eos_last_rejected_monotonic tracks the most
+        # recent rejection so a later rejection inside the same window
+        # gets its own full observation interval (the callback reschedules
+        # itself rather than deciding early) instead of inheriting
+        # whatever's left of the first rejection's countdown.
         self.deferred_seek_eos_pending = False
         self.deferred_seek_eos_baseline = 0
+        self.deferred_seek_eos_last_rejected_monotonic = 0.0
 
     def mark_milestone(self, name, *, state=None, now=None):
         current = time.monotonic() if now is None else now
@@ -8412,24 +8426,30 @@ class PlaybackEngine:
                     # [P0] 1.8 WRJE follow-up -- schedule a deferred re-check
                     # so the deck can't be stranded to the ~30s stuck-deck
                     # watchdog when stale Track.duration_seconds made a
-                    # GENUINE EOS look implausibly early. Only ONE callback
-                    # is scheduled per pending window (the False->True
-                    # transition), but the baseline is REFRESHED on every
-                    # rejection so a later genuine EOS after apparent
-                    # recovery inside the same guard window is still
-                    # detected: without the refresh, EOS#1 baseline=10 +
-                    # buffers recovering to 42 + EOS#2 (genuine) inside
-                    # the window would leave the callback comparing 42 to
-                    # 10 and incorrectly concluding "recovered."
+                    # GENUINE EOS look implausibly early. Only ONE decision
+                    # chain is ever created per pending window (the
+                    # False->True transition below), but BOTH the baseline
+                    # AND the last-rejection timestamp are REFRESHED on
+                    # every rejection:
+                    #  - baseline refresh: a later genuine EOS after
+                    #    apparent recovery inside the same window must
+                    #    still be detected (without it, EOS#1 baseline=10
+                    #    + buffers recovering to 42 + EOS#2 genuine would
+                    #    have the callback compare 42 to 10 and wrongly
+                    #    conclude "recovered").
+                    #  - timestamp refresh: a rejection arriving late in
+                    #    the window must get its OWN full observation
+                    #    interval, not whatever's left of the first
+                    #    rejection's countdown -- _recheck_deferred_seek_eos
+                    #    reschedules itself if it fires before that full
+                    #    interval has elapsed since the most recent
+                    #    rejection.
                     deck.deferred_seek_eos_baseline = deck.media_buffer_count
+                    deck.deferred_seek_eos_last_rejected_monotonic = time.monotonic()
                     if not deck.deferred_seek_eos_pending:
                         deck.deferred_seek_eos_pending = True
-                        # Wake ~1s after the guard window elapses -- gives
-                        # the parser its whole 5s to resync AND buffers
-                        # some slack to actually reach the probe before we
-                        # compare counts.
                         GLib.timeout_add_seconds(
-                            int(SEEK_EOS_GUARD_SECONDS) + 1,
+                            int(DEFERRED_SEEK_EOS_OBSERVATION_SECONDS),
                             self._recheck_deferred_seek_eos,
                             deck, deck.generation,
                         )
@@ -8445,8 +8465,15 @@ class PlaybackEngine:
     def _recheck_deferred_seek_eos(self, deck, expected_generation):
         """[P0] 1.8 WRJE follow-up -- decide the deferred post-seek EOS.
 
-        Fires ~1s after SEEK_EOS_GUARD_SECONDS. Returns False so this
-        one-shot GLib timeout auto-removes.
+        Fires ~DEFERRED_SEEK_EOS_OBSERVATION_SECONDS after the FIRST
+        rejection in a pending window. If a LATER rejection refreshed
+        deferred_seek_eos_last_rejected_monotonic since then, that later
+        rejection hasn't had its own full observation window yet --
+        reschedule this same one-shot decision for the remaining time
+        instead of deciding early. Returns False in both the
+        reschedule and decide cases so the CURRENT GLib timeout source
+        always auto-removes (a fresh one is created explicitly on
+        reschedule, never left running twice).
 
         Exact-generation safe: if the deck was retired/replaced (a new
         generation now sits in this slot, or the deck was removed from
@@ -8464,6 +8491,18 @@ class PlaybackEngine:
         if deck.finished or deck.retirement_started:
             return False
         if self._deck_bin_map.get(id(deck.pipeline)) is not deck:
+            return False
+        elapsed = time.monotonic() - deck.deferred_seek_eos_last_rejected_monotonic
+        remaining = DEFERRED_SEEK_EOS_OBSERVATION_SECONDS - elapsed
+        if remaining > 0:
+            # A later rejection refreshed the timestamp after this
+            # timeout was scheduled -- give it its own full window
+            # rather than deciding on a partial observation.
+            GLib.timeout_add_seconds(
+                max(1, int(remaining) + 1),
+                self._recheck_deferred_seek_eos,
+                deck, expected_generation,
+            )
             return False
         baseline = deck.deferred_seek_eos_baseline
         current = deck.media_buffer_count
