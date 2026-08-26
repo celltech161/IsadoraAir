@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "release_id": "r0009",
+  "previous_release_id": "r0008",
+  "minimum_updater_protocol_version": 3,
+  "summary": "Completes P0 1.8 deferred post-seek EOS recovery (baseline/deadline corrected across repeated and late rejections) and adds operator-state safeguards: terminal Update Center jobs now reconcile the full page instead of just stopping polling, and Dashboard/Remote DJ detect stale/disconnected authoritative engine status and block unsafe live mutations while stale.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-gunicorn",
+    "isadoraair-engine"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0007"
+}
