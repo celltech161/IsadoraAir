@@ -1,6 +1,13 @@
 [Unit]
 Description=IsadoraAir Playback Engine
 After=network.target postgresql.service isadoraair-gunicorn.service
+# [P0] 1.8 -- circuit breaker for policy-triggered engine restarts. One
+# poison-restart cycle is >=20-25s (10s teardown timeout + 5s RestartSec
+# + engine warm-up), so 3 restarts inside 10 min = 60-75s minimum span,
+# well below the interval; sustained hits mean a genuine loop the
+# operator must resolve. Canonical [Unit] placement per systemd docs.
+StartLimitIntervalSec=10min
+StartLimitBurst=3
 
 [Service]
 User=@@ISA_USER@@

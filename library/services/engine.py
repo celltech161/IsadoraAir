@@ -181,6 +181,26 @@ DECK_STUCK_TIMEOUT_SECONDS = 30  # generous margin past a track's own duration b
 DECK_TEARDOWN_TIMEOUT_SECONDS = 10.0
 DECK_WATCHDOG_WINDOW_SECONDS = 10 * 60
 DECK_WATCHDOG_ESCALATION_COUNT = 3
+
+# [P0] 1.8 -- poisoned-slot policy restart. When BoundedTeardownCoordinator
+# reports a set_state(NULL) timeout, the offending generation cannot safely
+# be reclaimed inside this process; the engine exits with
+# POLICY_RESTART_EXIT_STATUS so systemd's Restart=on-failure hands off to a
+# fresh instance. Anti-replay guard: the exact (playlist_log_id, log_item_id)
+# pair(s) that poisoned a slot are persisted to POLICY_RESTART_MARKER_PATH,
+# survive the restart on tmpfs, and are refused by every playback selection
+# path (materialization + selection-time gate) for the boot lifetime. See
+# _request_restart / _apply_poison_skip / _is_poison_guarded and
+# library/tests/test_engine_deck_lifecycle.py's poison-restart tests.
+POLICY_RESTART_MARKER_PATH = Path("/run/isadoraair/last_policy_restart.json")
+# Bound the persisted identity set. Systemd StartLimit bounds RESTART RATE,
+# not cumulative identities across a long-uptime boot, so we cap explicitly.
+# LogItem identities are exact occurrences (not Tracks) -- retaining the
+# newest bounded set for a whole boot never blacklists later plays of the
+# same media, only the exact LogItem row that was on air when its deck
+# poisoned. /run/ clears on host reboot, which is the intentional expiry.
+POLICY_RESTART_MAX_SKIP_IDENTITIES = 16
+POLICY_RESTART_EXIT_STATUS = 75  # EX_TEMPFAIL; distinct from 0/SIGTERM/SIGINT
 # How long after an actual seek (auto-resume or manual) an EOS is
 # treated with suspicion by _on_deck_eos_probed. Empirically measured
 # via an isolated throwaway-pipeline reproduction of the 2026-08-01
@@ -753,6 +773,19 @@ class PlaybackEngine:
         self._deck_watchdog_times = deque()
         self._cache_warm_item_id = None
         self._last_queue_reload = 0
+        # [P0] 1.8 -- policy-restart machinery. See _request_restart /
+        # _apply_poison_skip / _is_poison_guarded and their tests.
+        # `restart_required` is checked by run_engine after start() returns
+        # and drives the non-zero exit that triggers Restart=on-failure.
+        # `_poison_skip_identities` is an ordered list (oldest->newest) of
+        # (playlist_log_id, log_item_id) tuples the previous process
+        # observed poisoning a deck slot; refused for the boot lifetime.
+        # `_poison_reported_identities` is per-process report-dedupe so
+        # `_reload_queue_if_changed`'s ~3s tick doesn't re-emit the same
+        # SystemEvent every time it filters the same guarded item.
+        self.restart_required = False
+        self._poison_skip_identities = self._load_policy_restart_marker()
+        self._poison_reported_identities = set()
         self._next_triggered = False
         self.current_log = None
         self.log_items = []
@@ -3283,7 +3316,13 @@ class PlaybackEngine:
             return
 
         self.current_log = log
-        self.log_items = list(
+        # [P0] 1.8 defense-in-depth -- _apply_poison_skip removes any
+        # LogItem occurrence the previous process recorded as having
+        # poisoned a deck slot. The authoritative gate is
+        # _is_poison_guarded at the selection sites; this filter avoids
+        # even loading the row into the live queue where it could be
+        # observed and reported multiple times.
+        self.log_items = self._apply_poison_skip(list(
             log.items
             .select_related(
                 "track", "track__artist", "track__album", "track__category", "track__category__kind",
@@ -3295,7 +3334,7 @@ class PlaybackEngine:
                 "category", "category__kind",
             )
             .order_by("position")
-        )
+        ))
         # Advance past anything already played -- an engine restart
         # mid-hour must NOT replay the log from position 0, or we'd
         # start hearing tracks that already aired. Especially bad for
@@ -3588,14 +3627,14 @@ class PlaybackEngine:
         )
         if not log:
             return
-        items = list(
+        items = self._apply_poison_skip(list(  # [P0] 1.8 defense-in-depth
             log.items
             .select_related(
                 "track", "track__artist", "track__album", "track__category", "track__category__kind",
                 "category", "category__kind",  # LogItem's own category, read directly by dedication logic
             )
             .order_by("position")
-        )
+        ))
         if not items:
             return
 
@@ -3792,14 +3831,14 @@ class PlaybackEngine:
         )
         result = None
         if log:
-            items = list(
+            items = self._apply_poison_skip(list(  # [P0] 1.8 defense-in-depth
                 log.items
                 .select_related(
                 "track", "track__artist", "track__album", "track__category", "track__category__kind",
                 "category", "category__kind",  # LogItem's own category, read directly by dedication logic
             )
                 .order_by("position")
-            )
+            ))
             if items:
                 result = (log, items)
 
@@ -4136,6 +4175,13 @@ class PlaybackEngine:
             return False
 
         # DB succeeded -- only NOW extend the in-memory queue.
+        # [P0] 1.8 defense-in-depth: brand-new LogItems returned by
+        # append_fill_items structurally cannot collide with a
+        # pre-restart poison identity (their PKs were just allocated),
+        # but the filter is idempotent and cheap -- applying it
+        # everywhere keeps the invariant "no LogItem enters self.log_items
+        # without going through _apply_poison_skip" simple and provable.
+        new_items = self._apply_poison_skip(new_items)
         self.log_items.extend(new_items)
         print(f"  Installed {len(new_items)} live-filled track(s) onto the active queue "
               f"({seconds_left_now:.0f}s left in the real hour)")
@@ -4210,12 +4256,23 @@ class PlaybackEngine:
         warming/VT lookahead, and once a follow-up is armed it's what's
         actually going to play next regardless of what self.log_items
         currently contains (which may be a different hour entirely, if
-        rollover happened while a dedication intro was on a deck)."""
+        rollover happened while a dedication intro was on a deck).
+
+        [P0] 1.8 -- both the forced-item scan and the cursor walk consult
+        _is_poison_guarded so a LogItem that poisoned a deck in the
+        previous process cannot be surfaced regardless of how it entered
+        engine memory (a dedication follow-up placed directly into
+        _forced_next_items bypasses the DB-materialization filter)."""
         for item in self._forced_next_items:
+            if self._is_poison_guarded(item):
+                continue
             if _log_item_playable(item)[0]:
                 return item
         while self._queue_cursor < len(self.log_items):
             item = self.log_items[self._queue_cursor]
+            if self._is_poison_guarded(item):
+                self._queue_cursor += 1
+                continue
             playable, reason = _log_item_playable(item)
             if playable:
                 return item
@@ -4247,6 +4304,14 @@ class PlaybackEngine:
         # rollover that happens while the intro is playing.
         while self._forced_next_items:
             item = self._forced_next_items.pop(0)
+            # [P0] 1.8 authoritative gate: a guarded LogItem placed
+            # directly into _forced_next_items must NEVER reach
+            # _start_next_track, no matter how it arrived. The
+            # materialization filter cannot see items that go through
+            # this bypass. Discard silently (reporting is deduped in
+            # _is_poison_guarded/_report_poison_hit_once).
+            if self._is_poison_guarded(item):
+                continue
             playable, reason = _log_item_playable(item)
             if not playable:
                 print(f"  Skipping forced log item id={item.id}: {reason}")
@@ -4283,6 +4348,13 @@ class PlaybackEngine:
                 continue
             item = self.log_items[self._queue_cursor]
             self._queue_cursor += 1
+            # [P0] 1.8 -- same authoritative gate as the forced branch
+            # above. Defense-in-depth against a guarded item that
+            # somehow entered self.log_items despite _apply_poison_skip
+            # (would only happen if a new code path is added later and
+            # forgets to route through the filter).
+            if self._is_poison_guarded(item):
+                continue
             playable, reason = _log_item_playable(item)
             if playable:
                 return item, False
@@ -4321,15 +4393,28 @@ class PlaybackEngine:
         decide deck/queue membership. Without this, a protected
         follow-up song would look STRANDED to that reconciliation the
         moment rollover swaps self.log_items to a different hour, even
-        though it's guaranteed to actually play next."""
-        forced = [it for it in self._forced_next_items if _log_item_playable(it)[0]]
+        though it's guaranteed to actually play next.
+
+        [P0] 1.8 -- the preview must not display items that playback
+        will refuse to select. _is_poison_guarded is the same gate
+        _next_queue_item / _peek_playable_at_cursor consult, so the
+        preview stays consistent with what actually airs."""
+        forced = [
+            it for it in self._forced_next_items
+            if not self._is_poison_guarded(it) and _log_item_playable(it)[0]
+        ]
         forced_ids = {it.id for it in forced}
         items = list(self.log_items[self._queue_cursor:])
         if not items:
             peek = self._peek_next_hour()
             if peek:
                 items = list(peek[1])
-        return forced + [it for it in items if it.id not in forced_ids and _log_item_playable(it)[0]]
+        return forced + [
+            it for it in items
+            if it.id not in forced_ids
+            and not self._is_poison_guarded(it)
+            and _log_item_playable(it)[0]
+        ]
 
     def _start_next_track(self, slot=None):
         """Load the next queued item into `slot` (or whichever slot is
@@ -4871,6 +4956,213 @@ class PlaybackEngine:
             coordinators[slot] = coordinator
         return coordinator
 
+    # ------------------------------------------------------------------
+    # [P0] 1.8 -- policy-restart / poisoned-slot anti-replay machinery.
+    # See module-level docstring on POLICY_RESTART_MARKER_PATH.
+    # ------------------------------------------------------------------
+
+    def _load_policy_restart_marker(self):
+        """Read the persisted poison-skip identities. Never deletes the
+        marker: the file survives normal engine stops for the full boot
+        lifetime, exactly because the poisoned LogItem's `played_at`
+        may still be NULL in PostgreSQL and a later manual/systemd
+        restart must not lose the anti-replay evidence. /run/ clears
+        on host reboot; that is the intended expiry.
+
+        Returns an ordered list (oldest->newest) of
+        (playlist_log_id, log_item_id) tuples, bounded to
+        POLICY_RESTART_MAX_SKIP_IDENTITIES. A malformed / partial /
+        permission-failing marker returns an empty list so the engine
+        still starts (the guard's absence just means it's not applied
+        this cycle; a subsequent poison will re-establish it via
+        _request_restart's atomic write)."""
+        try:
+            if not POLICY_RESTART_MARKER_PATH.is_file():
+                return []
+            data = json.loads(POLICY_RESTART_MARKER_PATH.read_text(encoding="utf-8"))
+            identities: list = []
+            seen: set = set()
+            for entry in data.get("skip", []):
+                if not isinstance(entry, dict):
+                    continue
+                pll = entry.get("playlist_log_id")
+                li = entry.get("log_item_id")
+                if isinstance(pll, int) and isinstance(li, int):
+                    key = (pll, li)
+                    if key not in seen:
+                        identities.append(key)
+                        seen.add(key)
+            if len(identities) > POLICY_RESTART_MAX_SKIP_IDENTITIES:
+                identities = identities[-POLICY_RESTART_MAX_SKIP_IDENTITIES:]
+            if identities:
+                print(f"  Policy-restart marker loaded: {len(identities)} "
+                      f"identity(ies) refused for this boot's lifetime")
+            return identities
+        except Exception as exc:
+            print(f"  Policy-restart marker read failed (non-fatal, empty guard): {exc}")
+            return []
+
+    def _report_poison_hit_once(self, item, source):
+        """Emit a SystemEvent the FIRST time a given guarded identity is
+        observed by any filter/gate in this process. Subsequent hits on
+        the same (playlist_log_id, log_item_id) tuple are silent -- the
+        ~3s _reload_queue_if_changed tick must not re-emit every cycle.
+        The filtering itself continues regardless; only the reporting
+        is deduped."""
+        if item is None:
+            return
+        identity = (item.playlist_log_id, item.id)
+        reported = getattr(self, "_poison_reported_identities", None)
+        if reported is None:
+            reported = set()
+            self._poison_reported_identities = reported
+        if identity in reported:
+            return
+        reported.add(identity)
+        emit_event(
+            category="engine", level="warning",
+            title="Refused poison-guarded LogItem after policy restart",
+            detail={
+                "log_item_id": item.id,
+                "playlist_log_id": item.playlist_log_id,
+                "track_id": getattr(getattr(item, "track", None), "id", None),
+                "track_title": getattr(getattr(item, "track", None), "title", None),
+                "source": source,
+            },
+            dedupe_key=f"engine|poison-skip|log={item.playlist_log_id}|item={item.id}",
+        )
+
+    def _apply_poison_skip(self, items):
+        """Defense-in-depth filter applied at every DB->live-queue
+        materialization site. Removes any LogItem whose identity is in
+        the persisted skip set. NOT the authoritative safety boundary
+        -- see _is_poison_guarded, applied at the selection layer,
+        which is what _forced_next_items and every other selection path
+        actually route through.
+
+        getattr-defensive: a few narrow-fixture tests build engines via
+        object.__new__(PlaybackEngine) and set only the attributes they
+        need. Missing/empty skip set is a no-op; the invariant "no
+        LogItem enters self.log_items without going through this
+        filter" still holds for the real PlaybackEngine construction
+        path in production."""
+        skip_identities = getattr(self, "_poison_skip_identities", None)
+        if not skip_identities or not items:
+            return items
+        skip = set(skip_identities)
+        filtered = []
+        for it in items:
+            if (it.playlist_log_id, it.id) in skip:
+                self._report_poison_hit_once(it, "materialization")
+            else:
+                filtered.append(it)
+        return filtered
+
+    def _is_poison_guarded(self, item):
+        """The authoritative selection-time gate. Every code path that
+        can hand a LogItem to _start_next_track (or announce it to a UI
+        preview that must match what will actually play) must consult
+        this. The materialization filter (_apply_poison_skip) is
+        defense-in-depth but insufficient on its own because
+        _forced_next_items bypasses that layer -- a dedication follow-up
+        or urgent alert placed directly onto _forced_next_items is
+        selected without a fresh DB read.
+
+        getattr-defensive for the same reason as _apply_poison_skip."""
+        if item is None:
+            return False
+        skip_identities = getattr(self, "_poison_skip_identities", None)
+        if not skip_identities:
+            return False
+        identity = (item.playlist_log_id, item.id)
+        if identity not in skip_identities:
+            return False
+        self._report_poison_hit_once(item, "selection")
+        return True
+
+    def _request_restart(self, reason, detail):
+        """Ask the process to exit non-zero so systemd's Restart=on-failure
+        starts a fresh instance. Idempotent (only the first call per
+        process writes/updates the marker and quits the loop); later
+        calls no-op.
+
+        Unions the new identity with any identities already on disk
+        (from an earlier process, or from a rapid-succession poison
+        inside this very process), keeps the newest
+        POLICY_RESTART_MAX_SKIP_IDENTITIES, and writes atomically via a
+        same-directory tmp + os.replace(). The process exits
+        immediately after this returns; a torn marker file would defeat
+        the guard on the very next start."""
+        if self.restart_required:
+            return
+        self.restart_required = True
+
+        new_identity = None
+        pll = detail.get("playlist_log_id")
+        li = detail.get("log_item_id")
+        if isinstance(pll, int) and isinstance(li, int):
+            new_identity = (pll, li)
+
+        # Re-read the on-disk list so we don't lose identities the
+        # in-memory copy might have missed (theoretical: a stale marker
+        # was ignored at __init__ then legitimately valid identities
+        # appeared in a subsequent poison). Order preserved.
+        existing = self._load_policy_restart_marker()
+        merged: list = []
+        seen: set = set()
+        for source in (existing, self._poison_skip_identities):
+            for key in source:
+                if key not in seen:
+                    merged.append(key)
+                    seen.add(key)
+        if new_identity is not None:
+            # LRU-refresh: if the new identity is already present, move
+            # it to the newest position so it survives truncation.
+            if new_identity in seen:
+                merged = [k for k in merged if k != new_identity]
+            merged.append(new_identity)
+            seen.add(new_identity)
+        if len(merged) > POLICY_RESTART_MAX_SKIP_IDENTITIES:
+            merged = merged[-POLICY_RESTART_MAX_SKIP_IDENTITIES:]
+
+        # Update the in-memory copy too so any post-request selection
+        # (unlikely -- we're about to quit the loop) still filters
+        # correctly, and so tests that don't drive the process to real
+        # exit can observe the final state.
+        self._poison_skip_identities = list(merged)
+
+        marker = {
+            "reason": reason,
+            "written_at": timezone.now().isoformat(timespec="seconds"),
+            "last_event": detail,
+            "skip": [
+                {"playlist_log_id": p, "log_item_id": i}
+                for p, i in merged
+            ],
+        }
+
+        try:
+            tmp = POLICY_RESTART_MARKER_PATH.with_suffix(".json.tmp")
+            tmp.write_text(
+                json.dumps(marker, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            os.replace(tmp, POLICY_RESTART_MARKER_PATH)
+        except Exception as exc:
+            print(f"  Policy-restart marker write failed (non-fatal): {exc}")
+
+        emit_event(
+            category="engine", level="critical",
+            title="Policy restart requested",
+            detail=marker,
+            dedupe_key=f"engine|policy-restart|{reason}",
+        )
+        print(f"  Policy restart requested ({reason}); quitting main loop.")
+        try:
+            self.loop.quit()
+        except Exception:
+            pass
+
     def _close_deck_play_event(self, deck):
         """Best-effort PlayEvent close-out after live-topology isolation."""
         if deck.play_event_id:
@@ -4934,6 +5226,11 @@ class PlaybackEngine:
                 "slot": deck.slot,
                 "track_id": deck.track.id,
                 "track_title": deck.track.title,
+                # [P0] 1.8 -- carried through into the coordinator's
+                # timed_out event so _deck_teardown_tick can hand the
+                # exact poisoning identity to _request_restart's marker.
+                "log_item_id": deck.log_item.id,
+                "playlist_log_id": deck.log_item.playlist_log_id,
                 "detached_from_mixer": deck.detached_from_mixer,
             },
         )
@@ -5071,6 +5368,21 @@ class PlaybackEngine:
                     # create a new dashboard row for each later observation.
                     dedupe_key=f"engine|deck-teardown|slot={slot}|{kind}",
                 )
+                # [P0] 1.8 -- first timed_out per slot triggers a policy
+                # restart. _request_restart is idempotent so this is safe
+                # against duplicate observations of the same poison.
+                if timed_out:
+                    self._request_restart(
+                        reason="deck_teardown_poisoned",
+                        detail={
+                            "slot": slot,
+                            "generation": event["generation"],
+                            "log_item_id": metadata.get("log_item_id"),
+                            "playlist_log_id": metadata.get("playlist_log_id"),
+                            "track_id": metadata.get("track_id"),
+                            "track_title": metadata.get("track_title"),
+                        },
+                    )
         if (
             healthy_teardown_completed
             and getattr(self, "running", False)
@@ -7670,14 +7982,17 @@ class PlaybackEngine:
         self._last_queue_reload = now
 
         close_old_connections()
-        fresh_items = list(
+        # [P0] 1.8 defense-in-depth -- the ~3s reload MUST NOT reintroduce
+        # a poison-guarded item that the previous cycle already filtered.
+        # See _apply_poison_skip's docstring and PoisonMarkerCrossRestartTests.
+        fresh_items = self._apply_poison_skip(list(
             self.current_log.items
             .select_related(
                 "track", "track__artist", "track__album", "track__category", "track__category__kind",
                 "category", "category__kind",  # LogItem's own category, read directly by dedication logic
             )
             .order_by("position")
-        )
+        ))
         occupied_ids = {d.log_item.id for d in self.decks.values() if d}
 
         if occupied_ids:

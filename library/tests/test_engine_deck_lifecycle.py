@@ -7,9 +7,11 @@ handoff. They are hardware-free and write media only beneath TemporaryDirectory.
 
 from __future__ import annotations
 
+import json
 import os
 import gc
 import inspect
+import shutil
 import struct
 import subprocess
 import sys
@@ -98,14 +100,25 @@ def _make_track(path, track_id, duration=0.01, title="Test Track"):
     return track
 
 
-def _make_log_item(track, item_id):
+def _make_log_item(track, item_id, playlist_log_id=None):
     item = MagicMock()
     item.id = item_id
+    item.playlist_log_id = playlist_log_id  # None keeps _request_restart's int-check false
     item.track = track
     item.category_id = None
     item.category = None
     item.position = item_id
     return item
+
+
+def _init_policy_restart_attrs(engine):
+    """[P0] 1.8 -- engines built via object.__new__(PlaybackEngine) skip
+    __init__, so the policy-restart bookkeeping attributes must be set
+    explicitly. Kept in one helper so every fixture stays consistent
+    with the real init order."""
+    engine.restart_required = False
+    engine._poison_skip_identities = []
+    engine._poison_reported_identities = set()
 
 
 def _make_real_engine():
@@ -150,6 +163,11 @@ def _make_real_engine():
     engine._write_now_playing = lambda _track: None
     engine._write_rbds_category_state = lambda _track: None
     engine._start_next_track = lambda **_kwargs: None
+    # loop is what _request_restart tries to quit(); MagicMock keeps the
+    # try/except path a no-op instead of an AttributeError when a real
+    # deck test happens to trigger the poison path.
+    engine.loop = MagicMock()
+    _init_policy_restart_attrs(engine)
     return engine
 
 
@@ -159,6 +177,11 @@ class RealDeckTopologyTests(SimpleTestCase):
         self.addCleanup(self.temp_dir.cleanup)
         self.wav_path = Path(self.temp_dir.name) / "short.wav"
         _write_wav(self.wav_path)
+        # [P0] 1.8 -- redirect poison marker writes to a tmpdir so the
+        # real-deck poison tests below never touch /run/isadoraair/.
+        self._marker_tmpdir = tempfile.TemporaryDirectory(prefix="isa-p0-1.8-real.")
+        self.addCleanup(self._marker_tmpdir.cleanup)
+        self.marker_path = Path(self._marker_tmpdir.name) / "last_policy_restart.json"
         self.engine = _make_real_engine()
         self.addCleanup(self._cleanup_engine)
         self.patches = (
@@ -174,6 +197,7 @@ class RealDeckTopologyTests(SimpleTestCase):
             ),
             patch.object(eng_module, "mark_song_requests_aired", new=lambda *_args, **_kwargs: None),
             patch.object(eng_module, "emit_event", new=lambda **_kwargs: None),
+            patch.object(eng_module, "POLICY_RESTART_MARKER_PATH", self.marker_path),
         )
         for mocked in self.patches:
             mocked.start()
@@ -523,7 +547,13 @@ class RealDeckTopologyTests(SimpleTestCase):
                         if call.kwargs["level"] == "critical"
                     ]
                 )
-                self.assertEqual(critical_before, 2)
+                # [P0] 1.8 -- 3 critical events, not 2: one "timed out"
+                # per poisoned slot (A and B), PLUS one "Policy restart
+                # requested" from _request_restart -- fired only once
+                # per process (idempotent) even though both slots
+                # poisoned.
+                self.assertEqual(critical_before, 3)
+                self.assertTrue(self.engine.restart_required)
 
                 # With no reusable slot, repeated start attempts fail before
                 # queue selection. They cannot allocate topology, increment a
@@ -872,16 +902,33 @@ class RealDeckTopologyTests(SimpleTestCase):
 
 
 class DeckGenerationAndWatchdogTests(SimpleTestCase):
-    def _deck(self, *, generation=1, duration=60.0, slot="A"):
+    def setUp(self):
+        # [P0] 1.8 -- keep _request_restart's atomic marker write out of
+        # the real /run/isadoraair/. Also lets each test observe/assert
+        # the marker file directly without cross-test contamination.
+        self._marker_tmpdir = tempfile.TemporaryDirectory(prefix="isa-p0-1.8-marker.")
+        self.addCleanup(self._marker_tmpdir.cleanup)
+        self.marker_path = Path(self._marker_tmpdir.name) / "last_policy_restart.json"
+        self._marker_patch = patch.object(eng_module, "POLICY_RESTART_MARKER_PATH", self.marker_path)
+        self._marker_patch.start()
+        self.addCleanup(self._marker_patch.stop)
+
+    def _deck(self, *, generation=1, duration=60.0, slot="A",
+              log_item_id=None, playlist_log_id=None):
         track = MagicMock(id=generation, title=f"Track {generation}", duration_seconds=duration)
         pipeline = MagicMock()
         pipeline.query_duration.return_value = (False, Gst.CLOCK_TIME_NONE)
         pipeline.set_state.return_value = Gst.StateChangeReturn.SUCCESS
         pipeline.get_static_pad.return_value.unlink.return_value = True
+        log_item = MagicMock()
+        # Concrete ints when caller wants marker identity to survive the
+        # isinstance(int) checks in _request_restart; None otherwise.
+        log_item.id = log_item_id if log_item_id is not None else generation * 100
+        log_item.playlist_log_id = playlist_log_id
         return Deck(
             slot,
             track,
-            MagicMock(),
+            log_item,
             pipeline,
             MagicMock(),
             generation=generation,
@@ -907,6 +954,10 @@ class DeckGenerationAndWatchdogTests(SimpleTestCase):
         engine._next_triggered = True
         engine._start_next_track = MagicMock()
         engine._vt = {"phase": "idle", "outgoing_track_id": None}
+        # loop is what _request_restart tries to quit(); MagicMock keeps
+        # the try/except path a no-op instead of an AttributeError.
+        engine.loop = MagicMock()
+        _init_policy_restart_attrs(engine)
         return engine
 
     def test_stale_late_callback_cannot_retire_replacement_generation(self):
@@ -1079,7 +1130,11 @@ class DeckGenerationAndWatchdogTests(SimpleTestCase):
         self.assertIn("mixer_sink_pad_count", details[2])
 
     def test_detach_first_returns_while_null_worker_is_deliberately_wedged(self):
-        deck = self._deck()
+        # [P0] 1.8 -- pass concrete int identities so _request_restart's
+        # isinstance(int) marker-persistence guard survives, letting the
+        # test observe the exact (playlist_log_id, log_item_id) that was
+        # written to the anti-replay marker file.
+        deck = self._deck(playlist_log_id=999, log_item_id=1234)
         engine = self._engine(deck)
         release = threading.Event()
         deck.pipeline.set_state.side_effect = release.wait
@@ -1106,6 +1161,22 @@ class DeckGenerationAndWatchdogTests(SimpleTestCase):
                     for call in emitted.call_args_list
                 )
             )
+            # [P0] 1.8 -- restart requested, marker atomically written,
+            # loop quit invoked exactly once.
+            self.assertTrue(engine.restart_required)
+            self.assertTrue(self.marker_path.exists(),
+                            "poison marker must be written for the next process to consume")
+            engine.loop.quit.assert_called_once()
+            marker = json.loads(self.marker_path.read_text(encoding="utf-8"))
+            self.assertEqual(marker["reason"], "deck_teardown_poisoned")
+            self.assertEqual(marker["last_event"]["slot"], "A")
+            self.assertEqual(marker["last_event"]["log_item_id"], 1234)
+            self.assertEqual(marker["last_event"]["playlist_log_id"], 999)
+            self.assertEqual(
+                marker["skip"],
+                [{"playlist_log_id": 999, "log_item_id": 1234}],
+            )
+            self.assertIn((999, 1234), engine._poison_skip_identities)
             self.assertFalse(engine._deck_slot_available("A"))
             self.assertTrue(engine._deck_slot_available("B"))
             for index, generation in enumerate(range(2, 102), start=1):
@@ -1119,16 +1190,26 @@ class DeckGenerationAndWatchdogTests(SimpleTestCase):
                         == expected
                     )
                 )
-            engine._deck_teardown_tick()
+            # [P0] 1.8 -- repeated _deck_teardown_tick observations of
+            # the same poison must not double-request restart.
+            for _ in range(5):
+                engine._deck_teardown_tick()
             snapshot = engine._deck_teardowns["A"].snapshot()
             self.assertEqual(snapshot["worker_starts"], 1)
             self.assertEqual(snapshot["active_generation"], 1)
             self.assertEqual(engine._deck_teardowns["B"].snapshot()["completed"], 100)
+            engine.loop.quit.assert_called_once()  # still exactly one
             critical_events = [
                 call for call in emitted.call_args_list
                 if call.kwargs["level"] == "critical"
             ]
-            self.assertEqual(len(critical_events), 1)
+            # Two critical events: one "timed out" from the coordinator
+            # drain, one "Policy restart requested" from _request_restart.
+            self.assertEqual(len(critical_events), 2)
+            self.assertTrue(any(
+                "Policy restart requested" in call.kwargs["title"]
+                for call in critical_events
+            ))
             state = engine._deck_recovery_state()
             self.assertEqual(state["health"], "RESTART_REQUIRED_GENERATION_ISOLATED")
             self.assertEqual(state["poisoned_slots"], ["A"])
@@ -1228,3 +1309,564 @@ class MediaTerminationClassificationTests(SimpleTestCase):
         self.assertEqual(self._classify(truncated_wav), "EOS")
         self.assertEqual(self._classify(mp3_path), "EOS")
         self.assertEqual(self._classify(truncated_mp3), "EOS")
+
+
+# ==========================================================================
+# [P0] 1.8 -- policy-restart / poisoned-slot anti-replay tests.
+# ==========================================================================
+
+
+class PolicyRestartMechanismTests(SimpleTestCase):
+    """Marker-shape, atomic-replace, bounded-set, per-process report
+    dedupe, and idempotency of _request_restart. In-memory only (no
+    real GStreamer, no real DB) -- the mechanism is exercised through
+    the same object.__new__(PlaybackEngine) fixture the other unit-
+    level lifecycle tests use."""
+
+    def setUp(self):
+        self._marker_tmpdir = tempfile.TemporaryDirectory(prefix="isa-p0-1.8-mech.")
+        self.addCleanup(self._marker_tmpdir.cleanup)
+        self.marker_path = Path(self._marker_tmpdir.name) / "last_policy_restart.json"
+        self._marker_patch = patch.object(eng_module, "POLICY_RESTART_MARKER_PATH", self.marker_path)
+        self._marker_patch.start()
+        self.addCleanup(self._marker_patch.stop)
+
+    def _bare(self):
+        engine = object.__new__(PlaybackEngine)
+        _init_policy_restart_attrs(engine)
+        engine.loop = MagicMock()
+        # Mirror __init__'s marker consumption (the real __init__ builds
+        # a full pipeline, which is too heavy for these mechanism tests).
+        engine._poison_skip_identities = engine._load_policy_restart_marker()
+        return engine
+
+    def test_load_marker_returns_empty_list_when_file_missing(self):
+        eng = self._bare()
+        self.assertEqual(eng._load_policy_restart_marker(), [])
+
+    def test_load_marker_malformed_json_yields_empty_guard_no_raise(self):
+        self.marker_path.write_text("{not valid json at all", encoding="utf-8")
+        eng = self._bare()
+        self.assertEqual(eng._load_policy_restart_marker(), [])
+
+    def test_load_marker_missing_skip_key_yields_empty_guard(self):
+        self.marker_path.write_text(json.dumps({"reason": "x"}), encoding="utf-8")
+        eng = self._bare()
+        self.assertEqual(eng._load_policy_restart_marker(), [])
+
+    def test_load_marker_non_int_entries_are_ignored(self):
+        self.marker_path.write_text(json.dumps({
+            "skip": [
+                {"playlist_log_id": "not-int", "log_item_id": 5},
+                {"playlist_log_id": 7, "log_item_id": None},
+                {"playlist_log_id": 8, "log_item_id": 9},
+            ],
+        }), encoding="utf-8")
+        eng = self._bare()
+        self.assertEqual(eng._load_policy_restart_marker(), [(8, 9)])
+
+    def test_request_restart_writes_atomic_marker_via_same_dir_tmp(self):
+        eng = self._bare()
+        original_replace = eng_module.os.replace
+        replace_calls = []
+
+        def track_replace(src, dst):
+            self.assertEqual(Path(src).parent, Path(dst).parent,
+                "tmp and dst MUST be in the same directory for POSIX atomicity")
+            replace_calls.append((str(src), str(dst)))
+            return original_replace(src, dst)
+
+        with patch.object(eng_module, "emit_event"), \
+             patch.object(eng_module.os, "replace", side_effect=track_replace):
+            eng._request_restart(
+                reason="deck_teardown_poisoned",
+                detail={"slot": "A", "generation": 1,
+                        "log_item_id": 42, "playlist_log_id": 7},
+            )
+        self.assertEqual(len(replace_calls), 1)
+        self.assertTrue(eng.restart_required)
+        # No stray tmp file left behind.
+        self.assertFalse(self.marker_path.with_suffix(".json.tmp").exists())
+        result = json.loads(self.marker_path.read_text(encoding="utf-8"))
+        self.assertEqual(result["reason"], "deck_teardown_poisoned")
+        self.assertEqual(result["skip"], [{"playlist_log_id": 7, "log_item_id": 42}])
+        eng.loop.quit.assert_called_once()
+
+    def test_request_restart_is_idempotent_second_call_is_noop(self):
+        eng = self._bare()
+        with patch.object(eng_module, "emit_event"):
+            eng._request_restart(reason="deck_teardown_poisoned",
+                detail={"slot": "A", "generation": 1,
+                        "log_item_id": 42, "playlist_log_id": 7})
+            first_mtime = self.marker_path.stat().st_mtime_ns
+            time.sleep(0.005)
+            eng._request_restart(reason="deck_teardown_poisoned",
+                detail={"slot": "B", "generation": 2,
+                        "log_item_id": 99, "playlist_log_id": 7})
+        # Second call was a full no-op: marker unchanged.
+        self.assertEqual(self.marker_path.stat().st_mtime_ns, first_mtime)
+        result = json.loads(self.marker_path.read_text(encoding="utf-8"))
+        self.assertEqual(result["skip"], [{"playlist_log_id": 7, "log_item_id": 42}])
+        eng.loop.quit.assert_called_once()
+
+    def test_request_restart_unions_with_existing_marker_and_bounds_to_max(self):
+        # Seed marker with 15 identities (below the cap).
+        seed = [{"playlist_log_id": 100, "log_item_id": i} for i in range(15)]
+        self.marker_path.write_text(json.dumps({"skip": seed}), encoding="utf-8")
+        eng = self._bare()
+        self.assertEqual(len(eng._poison_skip_identities), 15)
+        # Poison a 16th identity: reaches but does not exceed the cap.
+        with patch.object(eng_module, "emit_event"):
+            eng._request_restart(reason="deck_teardown_poisoned",
+                detail={"slot": "A", "generation": 1,
+                        "log_item_id": 999, "playlist_log_id": 100})
+        result = json.loads(self.marker_path.read_text(encoding="utf-8"))
+        self.assertEqual(len(result["skip"]),
+            eng_module.POLICY_RESTART_MAX_SKIP_IDENTITIES)
+        self.assertEqual(result["skip"][-1],
+            {"playlist_log_id": 100, "log_item_id": 999})
+
+    def test_request_restart_over_cap_keeps_newest_identities(self):
+        # Seed marker with the cap already reached.
+        cap = eng_module.POLICY_RESTART_MAX_SKIP_IDENTITIES
+        seed = [{"playlist_log_id": 100, "log_item_id": i} for i in range(cap)]
+        self.marker_path.write_text(json.dumps({"skip": seed}), encoding="utf-8")
+        eng = self._bare()
+        # Add one MORE identity than the cap allows.
+        with patch.object(eng_module, "emit_event"):
+            eng._request_restart(reason="deck_teardown_poisoned",
+                detail={"slot": "A", "generation": 1,
+                        "log_item_id": 999_999, "playlist_log_id": 100})
+        result = json.loads(self.marker_path.read_text(encoding="utf-8"))
+        skip_ids = [(e["playlist_log_id"], e["log_item_id"]) for e in result["skip"]]
+        self.assertEqual(len(skip_ids), cap)
+        # Oldest identity (i=0) was dropped; newest (999_999) survives.
+        self.assertNotIn((100, 0), skip_ids)
+        self.assertIn((100, 999_999), skip_ids)
+        self.assertEqual(skip_ids[-1], (100, 999_999))
+
+    def test_report_hit_once_deduplicates_per_process(self):
+        eng = self._bare()
+        eng._poison_skip_identities = [(7, 42)]
+        item = MagicMock(id=42, playlist_log_id=7)
+        item.track.id = 1
+        item.track.title = "T"
+        with patch.object(eng_module, "emit_event") as emitted:
+            for _ in range(5):
+                eng._report_poison_hit_once(item, "test")
+        self.assertEqual(emitted.call_count, 1)
+        # A different identity emits its own event.
+        item2 = MagicMock(id=43, playlist_log_id=7)
+        item2.track.id = 1
+        item2.track.title = "T"
+        eng._poison_skip_identities.append((7, 43))
+        with patch.object(eng_module, "emit_event") as emitted2:
+            eng._report_poison_hit_once(item2, "test")
+        self.assertEqual(emitted2.call_count, 1)
+
+    def test_is_poison_guarded_short_circuits_when_no_identities(self):
+        eng = self._bare()
+        item = MagicMock(id=42, playlist_log_id=7)
+        self.assertFalse(eng._is_poison_guarded(item))
+        # None-item is also safe.
+        self.assertFalse(eng._is_poison_guarded(None))
+
+    def test_apply_poison_skip_removes_matching_identities_only(self):
+        eng = self._bare()
+        eng._poison_skip_identities = [(7, 42)]
+        keep1 = MagicMock(id=41, playlist_log_id=7)
+        drop = MagicMock(id=42, playlist_log_id=7)
+        keep2 = MagicMock(id=42, playlist_log_id=8)  # same LogItem id, DIFFERENT playlist
+        for m in (keep1, drop, keep2):
+            m.track.id = 1
+            m.track.title = "T"
+        with patch.object(eng_module, "emit_event"):
+            filtered = eng._apply_poison_skip([keep1, drop, keep2])
+        self.assertEqual([it.id for it in filtered], [41, 42])
+        # keep2 stays because its playlist_log_id differs.
+        self.assertIs(filtered[1], keep2)
+
+
+class PolicyRestartForcedItemGateTests(SimpleTestCase):
+    """[P0] 1.8 -- the authoritative gate: a guarded LogItem placed
+    directly onto _forced_next_items must NEVER reach _start_next_track,
+    even though _forced_next_items bypasses the DB-materialization
+    filter entirely."""
+
+    def _engine_with_guard(self, guarded_identity):
+        engine = object.__new__(PlaybackEngine)
+        _init_policy_restart_attrs(engine)
+        engine._poison_skip_identities = [guarded_identity]
+        engine.log_items = []
+        engine._queue_cursor = 0
+        engine._forced_next_items = []
+        engine.decks = {"A": None, "B": None}
+        engine._lock = threading.RLock()
+        engine.current_log = None
+        return engine
+
+    def _make_item(self, item_id, playlist_log_id, playable=True):
+        item = MagicMock()
+        item.id = item_id
+        item.playlist_log_id = playlist_log_id
+        item.position = item_id
+        item.category_id = None
+        item.category = None
+        item.track = MagicMock()
+        item.track.id = item_id * 10
+        item.track.title = f"Track {item_id}"
+        item.track.filepath = "/dev/null" if playable else None
+        return item
+
+    def test_forced_item_matching_guard_is_skipped_next_healthy_selected(self):
+        guarded = self._make_item(item_id=42, playlist_log_id=7)
+        healthy = self._make_item(item_id=43, playlist_log_id=7)
+        engine = self._engine_with_guard((7, 42))
+        engine._forced_next_items = [guarded, healthy]
+        with patch.object(eng_module, "emit_event"), \
+             patch.object(eng_module, "_log_item_playable",
+                          new=lambda it: (True, None)):
+            item, forced = engine._next_queue_item()
+        self.assertIs(item, healthy)
+        self.assertTrue(forced)
+        # Guarded item was consumed off _forced_next_items -- proves it
+        # didn't just skip in place.
+        self.assertNotIn(guarded, engine._forced_next_items)
+
+    def test_forced_item_same_track_different_logitem_still_playable(self):
+        # Same Track.id (10*4=40 on both items via _make_item's convention).
+        guarded = self._make_item(item_id=4, playlist_log_id=7)
+        sibling = self._make_item(item_id=44, playlist_log_id=7)  # different LogItem PK, may or may not share Track
+        # Force them to share the same Track id -- the guard MUST NOT
+        # blacklist by Track.
+        sibling.track.id = guarded.track.id
+        engine = self._engine_with_guard((7, 4))
+        engine._forced_next_items = [guarded, sibling]
+        with patch.object(eng_module, "emit_event"), \
+             patch.object(eng_module, "_log_item_playable",
+                          new=lambda it: (True, None)):
+            item, forced = engine._next_queue_item()
+        self.assertIs(item, sibling)
+        self.assertTrue(forced)
+
+    def test_peek_playable_at_cursor_also_gates_forced_items(self):
+        guarded = self._make_item(item_id=42, playlist_log_id=7)
+        healthy = self._make_item(item_id=43, playlist_log_id=7)
+        engine = self._engine_with_guard((7, 42))
+        engine._forced_next_items = [guarded, healthy]
+        with patch.object(eng_module, "emit_event"), \
+             patch.object(eng_module, "_log_item_playable",
+                          new=lambda it: (True, None)):
+            peeked = engine._peek_playable_at_cursor()
+        self.assertIs(peeked, healthy)
+        # peek does not consume forced items -- guarded still present.
+        self.assertIn(guarded, engine._forced_next_items)
+
+    def test_upcoming_preview_hides_guarded_forced_and_queued_items(self):
+        guarded_forced = self._make_item(item_id=42, playlist_log_id=7)
+        healthy_forced = self._make_item(item_id=43, playlist_log_id=7)
+        guarded_queued = self._make_item(item_id=44, playlist_log_id=7)
+        healthy_queued = self._make_item(item_id=45, playlist_log_id=7)
+        engine = self._engine_with_guard((7, 42))
+        # Two guards this time.
+        engine._poison_skip_identities.append((7, 44))
+        engine._forced_next_items = [guarded_forced, healthy_forced]
+        engine.log_items = [guarded_queued, healthy_queued]
+        engine._peek_next_hour = lambda: None
+        with patch.object(eng_module, "emit_event"), \
+             patch.object(eng_module, "_log_item_playable",
+                          new=lambda it: (True, None)):
+            preview = engine._get_upcoming_preview()
+        ids = [it.id for it in preview]
+        # Guarded items must be absent from the preview altogether.
+        self.assertNotIn(42, ids)
+        self.assertNotIn(44, ids)
+        # Healthy items surface in the expected order (forced first).
+        self.assertEqual(ids, [43, 45])
+
+
+class RunEngineExitStatusTests(SimpleTestCase):
+    """[P0] 1.8 -- the run_engine management command exits with a
+    non-zero status when the engine sets restart_required, so systemd's
+    Restart=on-failure fires. Uses the actual Command's handle() to
+    prove the wiring, not a re-implementation."""
+
+    def test_exit_status_is_non_zero_when_restart_required(self):
+        from library.management.commands.run_engine import Command
+        cmd = Command()
+        fake_engine = MagicMock()
+        fake_engine.restart_required = True
+        # start() returns None (like the real one after the loop quits).
+        fake_engine.start.return_value = None
+        with patch("library.services.engine.PlaybackEngine",
+                   return_value=fake_engine):
+            with self.assertRaises(SystemExit) as cm:
+                cmd.handle()
+        self.assertEqual(cm.exception.code, eng_module.POLICY_RESTART_EXIT_STATUS)
+        self.assertNotEqual(cm.exception.code, 0)
+        fake_engine.start.assert_called_once()
+
+    def test_exit_is_clean_when_restart_not_required(self):
+        from library.management.commands.run_engine import Command
+        cmd = Command()
+        fake_engine = MagicMock()
+        fake_engine.restart_required = False
+        fake_engine.start.return_value = None
+        with patch("library.services.engine.PlaybackEngine",
+                   return_value=fake_engine):
+            # handle() returns None; no SystemExit raised.
+            self.assertIsNone(cmd.handle())
+
+
+class EngineServiceUnitDeclaresCircuitBreakerTests(SimpleTestCase):
+    """[P0] 1.8 -- the systemd unit file must declare the explicit
+    circuit breaker under [Unit], not rely on systemd's 10s/5-burst
+    default (which cannot catch a poison loop because one poison cycle
+    itself exceeds 10s)."""
+
+    def test_deploy_service_file_has_start_limits_under_unit_section(self):
+        import configparser
+        unit = Path(__file__).resolve().parents[2] / "deploy" / "isadoraair-engine.service"
+        # configparser can read systemd unit syntax for this narrow purpose.
+        parser = configparser.ConfigParser(strict=False, interpolation=None)
+        parser.optionxform = str  # preserve case
+        parser.read(unit, encoding="utf-8")
+        self.assertIn("Unit", parser.sections())
+        self.assertEqual(parser["Unit"].get("StartLimitIntervalSec"), "10min")
+        self.assertEqual(parser["Unit"].get("StartLimitBurst"), "3")
+        # Failure-restart plumbing must remain intact.
+        self.assertIn("Service", parser.sections())
+        self.assertEqual(parser["Service"].get("Restart"), "on-failure")
+        self.assertEqual(parser["Service"].get("RestartSec"), "5")
+
+
+class PoisonMarkerCrossRestartTests(SimpleTestCase):
+    """[P0] 1.8 -- full cross-restart integrity of the anti-replay guard
+    with real DB rows: proves the guard survives even when the poison
+    LogItem's `played_at` failed to persist AND after
+    _reload_queue_if_changed re-reads from PostgreSQL. Uses real
+    Track/LogItem/PlaylistLog rows so `_apply_poison_skip` operates on
+    ORM objects the same way it does in production."""
+
+    databases = {"default"}
+
+    def setUp(self):
+        # Real DB fixture -- SimpleTestCase does not roll back, so we
+        # clean up in tearDown.
+        from django.utils import timezone as _tz
+        from datetime import date
+        from library.models import (
+            Artist, Category, CategoryKind, LogItem, PlaylistLog, Track,
+        )
+        self._tz = _tz
+        self._models = SimpleNamespace(
+            Artist=Artist, Category=Category, CategoryKind=CategoryKind,
+            LogItem=LogItem, PlaylistLog=PlaylistLog, Track=Track,
+        )
+
+        self._marker_tmpdir = tempfile.TemporaryDirectory(prefix="isa-p0-1.8-xr.")
+        self.addCleanup(self._marker_tmpdir.cleanup)
+        self.marker_path = Path(self._marker_tmpdir.name) / "last_policy_restart.json"
+        self._marker_patch = patch.object(
+            eng_module, "POLICY_RESTART_MARKER_PATH", self.marker_path,
+        )
+        self._marker_patch.start()
+        self.addCleanup(self._marker_patch.stop)
+
+        self._media_tmpdir = tempfile.TemporaryDirectory(prefix="isa-p0-1.8-media.")
+        self.addCleanup(self._media_tmpdir.cleanup)
+
+        self.kind = CategoryKind.objects.create(code="p018", name="P0 1.8 test")
+        self.category = Category.objects.create(code="P018CAT", name="P0 1.8", kind=self.kind)
+        self.artist, _ = Artist.get_or_create_ci("P0 1.8 Test Artist")
+        self.log = PlaylistLog.objects.create(date=date(2027, 6, 1), hour=10, status="approved")
+
+        # Two Tracks; item_bad and item_shared_again reference the same Track.
+        self.track_shared = self._make_track("shared.mp3")
+        self.track_middle = self._make_track("middle.mp3")
+        self.item_bad = self._make_item(self.track_shared, position=1)
+        self.item_good = self._make_item(self.track_middle, position=2)
+        self.item_shared_again = self._make_item(self.track_shared, position=3)
+        # Sanity: same Track, different LogItem PKs.
+        self.assertEqual(self.item_bad.track_id, self.item_shared_again.track_id)
+        self.assertNotEqual(self.item_bad.id, self.item_shared_again.id)
+
+        self.addCleanup(self._teardown_db)
+
+    def _teardown_db(self):
+        # Ordered teardown so FK constraints don't complain.
+        m = self._models
+        m.LogItem.objects.filter(playlist_log=self.log).delete()
+        self.log.delete()
+        m.Track.objects.filter(id__in=[self.track_shared.id, self.track_middle.id]).delete()
+        self.artist.delete()
+        self.category.delete()
+        self.kind.delete()
+
+    def _make_track(self, filename):
+        real_path = Path(self._media_tmpdir.name) / filename
+        real_path.touch()
+        return self._models.Track.objects.create(
+            filepath=str(real_path), filename=filename,
+            title=filename, artist=self.artist, category=self.category,
+            ready2air=True, duration_seconds=100.0, next_start_seconds=100.0,
+            cue_in_seconds=0.0,
+        )
+
+    def _make_item(self, track, position):
+        return self._models.LogItem.objects.create(
+            playlist_log=self.log, position=position,
+            scheduled_time=self._tz.now(),
+            track=track, category=self.category,
+        )
+
+    def _bare_engine(self):
+        eng = object.__new__(PlaybackEngine)
+        _init_policy_restart_attrs(eng)
+        eng.loop = MagicMock()
+        eng._lock = threading.RLock()
+        eng.current_log = None
+        eng.log_items = []
+        eng._queue_cursor = 0
+        eng._forced_next_items = []
+        eng.decks = {"A": None, "B": None}
+        # Attributes _reload_queue_if_changed touches:
+        eng._last_queue_reload = 0.0
+        eng._next_hour_peek = None
+        eng._next_hour_peek_at = 0.0
+        # Poll_position/state helpers _load_log_for and friends may call
+        eng._peek_next_hour = lambda: None
+        # Mirror __init__'s marker consumption -- the real __init__
+        # builds a full pipeline, which is too heavy for these tests.
+        eng._poison_skip_identities = eng._load_policy_restart_marker()
+        return eng
+
+    # (1) poison LogItem has played_at=NULL after the simulated save failure.
+    def test_poison_item_played_at_stays_null_on_save_failure(self):
+        from django.db.utils import DatabaseError
+        with patch.object(type(self.item_bad), "save",
+                          side_effect=DatabaseError("simulated write failure")):
+            try:
+                self.item_bad.played_at = self._tz.now()
+                self.item_bad.save(update_fields=["played_at"])
+            except DatabaseError:
+                pass
+        self.item_bad.refresh_from_db()
+        self.assertIsNone(self.item_bad.played_at)
+
+    # (2)+(3)+(4)+(5)+(6) -- the central cross-restart proof.
+    def test_reload_after_load_does_not_reintroduce_poison_item(self):
+        # played_at MUST be NULL for this test's premise to hold.
+        self.item_bad.refresh_from_db()
+        self.assertIsNone(self.item_bad.played_at)
+
+        # Previous process: _request_restart wrote a marker.
+        prev = self._bare_engine()
+        with patch.object(eng_module, "emit_event"):
+            prev._request_restart(
+                reason="deck_teardown_poisoned",
+                detail={"slot": "A", "generation": 42,
+                        "log_item_id": self.item_bad.id,
+                        "playlist_log_id": self.log.id,
+                        "track_id": self.item_bad.track_id,
+                        "track_title": self.item_bad.track.title},
+            )
+        self.assertTrue(prev.restart_required)
+        self.assertTrue(self.marker_path.exists())
+
+        # Fresh process: __init__ consumes the marker WITHOUT deleting it.
+        fresh = self._bare_engine()
+        self.assertEqual(
+            fresh._poison_skip_identities,
+            [(self.log.id, self.item_bad.id)],
+        )
+        self.assertTrue(self.marker_path.exists(),
+            "marker must survive __init__ so a crash before load doesn't lose the guard")
+
+        # (2) initial _load_log_for skips it.
+        with patch.object(eng_module, "emit_event"):
+            fresh._load_log_for(self.log.date, self.log.hour)
+        first_load_ids = [it.id for it in fresh.log_items]
+        self.assertNotIn(self.item_bad.id, first_load_ids)
+        self.assertIn(self.item_good.id, first_load_ids)               # (5)
+        self.assertIn(self.item_shared_again.id, first_load_ids)       # (6)
+
+        # (3) _reload_queue_if_changed runs afterward.
+        fresh._last_queue_reload = 0.0
+        with patch.object(eng_module, "emit_event"):
+            fresh._reload_queue_if_changed()
+
+        # (4) poison item STILL does not reappear.
+        reload_ids = [it.id for it in fresh.log_items]
+        self.assertNotIn(self.item_bad.id, reload_ids,
+            "reload must not reintroduce the poison item -- its played_at is NULL")
+        self.assertIn(self.item_good.id, reload_ids)
+        self.assertIn(self.item_shared_again.id, reload_ids)
+
+        # Guard survives multiple reloads.
+        for _ in range(3):
+            fresh._last_queue_reload = 0.0
+            with patch.object(eng_module, "emit_event"):
+                fresh._reload_queue_if_changed()
+            self.assertNotIn(self.item_bad.id, [it.id for it in fresh.log_items])
+
+    # (7) replacement engine crashing before queue load must not lose guard.
+    def test_marker_survives_replacement_startup_crash(self):
+        prev = self._bare_engine()
+        with patch.object(eng_module, "emit_event"):
+            prev._request_restart(
+                reason="deck_teardown_poisoned",
+                detail={"slot": "A", "generation": 1,
+                        "log_item_id": self.item_bad.id,
+                        "playlist_log_id": self.log.id},
+            )
+        self.assertTrue(self.marker_path.exists())
+
+        # Simulate: replacement process starts, reads marker, then
+        # crashes before touching any queue.
+        crashed = self._bare_engine()
+        self.assertIn((self.log.id, self.item_bad.id), crashed._poison_skip_identities)
+        # Do NOT call _load_log_for. Just verify the marker is still on
+        # disk for the NEXT process to read.
+        self.assertTrue(self.marker_path.exists())
+        next_next = self._bare_engine()
+        self.assertIn((self.log.id, self.item_bad.id), next_next._poison_skip_identities)
+
+    def test_marker_persists_across_clean_stop_no_expiry(self):
+        # Preexisting marker.
+        prev = self._bare_engine()
+        with patch.object(eng_module, "emit_event"):
+            prev._request_restart(
+                reason="deck_teardown_poisoned",
+                detail={"slot": "A", "generation": 1,
+                        "log_item_id": self.item_bad.id,
+                        "playlist_log_id": self.log.id},
+            )
+        # Marker file was written; NO age-based expiry, NO clean-stop
+        # cleanup -- once the poison LogItem might still be replayable
+        # from DB, the guard MUST remain for the boot lifetime.
+        # Backdate mtime by 24h to prove there is no age check.
+        past = time.time() - 86400
+        os.utime(self.marker_path, (past, past))
+        fresh = self._bare_engine()
+        self.assertIn((self.log.id, self.item_bad.id), fresh._poison_skip_identities,
+            "no 5-minute expiry -- guard must persist for the boot lifetime")
+
+    # (9) preview matches playback selection.
+    def test_upcoming_preview_matches_selection_after_load(self):
+        prev = self._bare_engine()
+        with patch.object(eng_module, "emit_event"):
+            prev._request_restart(
+                reason="deck_teardown_poisoned",
+                detail={"slot": "A", "generation": 1,
+                        "log_item_id": self.item_bad.id,
+                        "playlist_log_id": self.log.id},
+            )
+        fresh = self._bare_engine()
+        with patch.object(eng_module, "emit_event"):
+            fresh._load_log_for(self.log.date, self.log.hour)
+        preview_ids = [it.id for it in fresh._get_upcoming_preview()]
+        self.assertNotIn(self.item_bad.id, preview_ids,
+            "the preview must not show items playback will refuse")
+        self.assertIn(self.item_good.id, preview_ids)
+        self.assertIn(self.item_shared_again.id, preview_ids)
