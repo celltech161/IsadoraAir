@@ -280,6 +280,7 @@ class ConnectionStaleGuardrailStaticTests(TestCase):
 
     STALE_DIMMED_SELECTORS = [
         "#consoleRoot.connection-stale .ops-btn:not(#remoteDjConnectBtn)",
+        "#consoleRoot.connection-stale #remoteDjConnectBtn:not(.active)",
         "#consoleRoot.connection-stale .playnow-btn:not(.ops-btn)",
         "#consoleRoot.connection-stale .deck-transport-btn",
         "#consoleRoot.connection-stale .qt-next-btn",
@@ -290,10 +291,10 @@ class ConnectionStaleGuardrailStaticTests(TestCase):
 
     def test_stale_css_dims_every_enumerated_control_category(self):
         """4 (visual half): manual/auto, studio mic PTT, Remote DJ
-        gate, deck transport (both buttons share .deck-transport-btn),
-        queue set-next/insert/reorder, FX fire, and play-now all read
-        as visibly unavailable while #consoleRoot carries
-        .connection-stale."""
+        gate, a NOT-connected Remote DJ connect button, deck transport
+        (both buttons share .deck-transport-btn), queue set-next/
+        insert/reorder, FX fire, and play-now all read as visibly
+        unavailable while #consoleRoot carries .connection-stale."""
         content = self._content()
         for selector in self.STALE_DIMMED_SELECTORS:
             with self.subTest(selector=selector):
@@ -305,17 +306,52 @@ class ConnectionStaleGuardrailStaticTests(TestCase):
         self.assertIn("cursor: not-allowed;", rule)
         self.assertIn("pointer-events: none;", rule)
 
-    def test_remote_dj_connect_button_excluded_from_stale_dimming(self):
-        """The connect/disconnect button must NOT visually read as
-        unavailable while stale -- its disconnect action stays
-        functionally live (see toggleRemoteDjConnect's own gate
-        placement), so dimming it would misrepresent a control that
-        still works."""
+    def test_remote_dj_connect_not_connected_is_dimmed_while_stale(self):
+        """1: a NOT-connected "Connect Remote" button (no .active
+        class) is a real, currently-gated mutation (starting a new
+        session) -- it must be included in the visually-unavailable
+        selector, same as every other blocked control, or the
+        operator clicks it and it silently does nothing."""
+        content = self._content()
+        self.assertIn(
+            "#consoleRoot.connection-stale #remoteDjConnectBtn:not(.active)",
+            content,
+        )
+
+    def test_remote_dj_connect_active_remains_exempt_from_stale_dimming(self):
+        """2: once connected (.active), the button must NOT visually
+        read as unavailable while stale -- Disconnect Remote stays
+        functionally live (see toggleRemoteDjConnect's own guard
+        ordering, proven separately below), so dimming it here would
+        misrepresent a control that still works. No selector anywhere
+        in the stylesheet may match a bare `#remoteDjConnectBtn` (i.e.
+        every reference must be qualified with either
+        :not(#remoteDjConnectBtn) on the shared .ops-btn rule, or
+        :not(.active) on its own dedicated rule) -- there must be no
+        unqualified selector that would dim it regardless of state."""
         content = self._content()
         rule_start = content.index(self.STALE_DIMMED_SELECTORS[0])
         rule = content[rule_start:content.index("{", rule_start)]
         self.assertIn(":not(#remoteDjConnectBtn)", rule)
+        self.assertIn("#remoteDjConnectBtn:not(.active)", rule)
         self.assertNotIn("#remoteDjConnectBtn,", rule)
+        self.assertNotIn("#remoteDjConnectBtn {", content[rule_start:])
+
+    def test_toggle_remote_dj_connect_disconnect_branch_precedes_stale_guard(self):
+        """3: the existing function-level connectionStale guard must
+        remain AFTER the local-disconnect early-return -- this is what
+        makes the CSS split in test 1/2 above actually correct
+        (disconnect truly is reachable regardless of staleness; a new
+        connect attempt truly is not). Not itself a behavior change --
+        this correction pass explicitly must not touch
+        toggleRemoteDjConnect()'s logic, only prove it's still true."""
+        content = self._content()
+        start = content.index("async function toggleRemoteDjConnect() {")
+        fn = content[start:content.index("\n}\n", start)]
+        disconnect_pos = fn.index("if (rdjPc || rdjWs) { rdjDisconnect(); return; }")
+        guard_pos = fn.index("if (connectionStale) return;")
+        self.assertLess(disconnect_pos, guard_pos,
+            "the local-disconnect branch must run BEFORE the connectionStale gate")
 
     def test_stale_css_never_sets_the_disabled_property_anywhere(self):
         """The presentational treatment must be pure CSS/opacity, not

@@ -1113,12 +1113,19 @@
      !data.mic_configured) is untouched and simply reappears exactly
      as it was the moment #consoleRoot.connection-stale is removed.
 
-     #remoteDjConnectBtn is deliberately EXCLUDED even though it
-     shares .ops-btn with the three buttons below -- tearing down an
-     already-connected session bypasses the stale gate by design (see
-     toggleRemoteDjConnect's own comment), so dimming it here would
-     visually misrepresent a control that still works. */
+     #remoteDjConnectBtn is a SPLIT case, not a blanket exclusion --
+     renderRemoteDjConnect() already toggles .active for
+     weAreConnected, and toggleRemoteDjConnect()'s own disconnect
+     branch (rdjPc || rdjWs) runs before its `if (connectionStale)
+     return;` guard, so an existing session's Disconnect action stays
+     functionally live through a stale period. Only that .active
+     (connected) state is excluded from dimming below -- the NOT-
+     connected "Connect Remote" state is a real, currently-gated
+     mutation (starting a new session) and must read as unavailable
+     like every other gated control, or the operator clicks it and it
+     silently does nothing. */
   #consoleRoot.connection-stale .ops-btn:not(#remoteDjConnectBtn),
+  #consoleRoot.connection-stale #remoteDjConnectBtn:not(.active),
   #consoleRoot.connection-stale .playnow-btn:not(.ops-btn),
   #consoleRoot.connection-stale .deck-transport-btn,
   #consoleRoot.connection-stale .qt-next-btn,
@@ -1131,6 +1138,9 @@
     cursor: not-allowed;
     pointer-events: none;
   }
+  /* #remoteDjConnectBtn.active (an existing, still-disconnectable
+     session) is deliberately NOT matched by any rule above -- stays
+     fully visible/usable through a stale period. */
 </style>
 {% endblock %}
 
