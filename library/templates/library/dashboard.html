@@ -1074,11 +1074,36 @@
     z-index: 2;
     pointer-events: none;
   }
+
+  /* [P1] 1.7 -- browser-side stale-connection guardrail (Fix B). A
+     banner, not a full-page overlay -- the operator must still be
+     able to see the last-known deck/queue state underneath while it's
+     up, per the "distinguish last-known state from current
+     authoritative state" requirement. Driven purely by connectionStale
+     (see the JS near fetchStatus()/poll() below); toggled via the
+     native `hidden` attribute so there's no extra visible/invisible
+     class to keep in sync. */
+  .connection-stale-banner {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.5rem;
+    background: var(--danger);
+    color: #000;
+    font-weight: 700;
+    letter-spacing: 0.03em;
+    font-size: 0.85rem;
+    padding: 0.5rem 1rem;
+    border-radius: 8px;
+    margin-bottom: 0.75rem;
+  }
+  .connection-stale-banner[hidden] { display: none; }
 </style>
 {% endblock %}
 
 {% block content %}
 <div class="console-{{ mode|default:'full' }}">
+<div id="connectionStaleBanner" class="connection-stale-banner" hidden role="status">CONNECTION LOST — STATUS STALE</div>
 <div class="top-status-row">
 <div class="listener-widget" id="listenerWidget" aria-label="Live Shoutcast listener count">
   <span class="listener-led" id="listenerLed" data-state="red" title="Stream status"></span>
@@ -1324,6 +1349,7 @@ function esc(s) {
 }
 
 async function playNow() {
+  if (connectionStale) return;  // [P1] 1.7 -- live engine mutation gate
   const sel = document.getElementById('playNowSelect');
   const msg = document.getElementById('playNowMsg');
   const id = sel.value;
@@ -1521,6 +1547,7 @@ function reconcileFxFires(fxFires) {
 }
 
 async function fireFxCart(btn) {
+  if (connectionStale) return;  // [P1] 1.7 -- live engine mutation gate
   const cartId = btn.dataset.cartId;
   const retriggerMode = btn.dataset.retrigger || 'restart';
   const durationHint = parseFloat(btn.dataset.duration) || 2.0;
@@ -1576,6 +1603,7 @@ document.addEventListener('keydown', function (e) {
 });
 
 async function toggleMicPtt() {
+  if (connectionStale) return;  // [P1] 1.7 -- live engine mutation gate
   const btn = document.getElementById('micPttBtn');
   const desiredActive = !btn.classList.contains('active');
   btn.classList.add('pending');
@@ -1606,6 +1634,11 @@ function renderMicPtt(data) {
 }
 
 async function toggleRemoteDjGate() {
+  // [P1] 1.7 -- live engine mutation gate. Covers both this button's
+  // modes (gate PTT AND local-only calibration) for simplicity -- the
+  // operator has no reliable way to know engine state is current
+  // while stale, so neither branch should be reachable.
+  if (connectionStale) return;
   // Dual-purpose: acts as gate PTT when a remote DJ is connected,
   // otherwise runs the operator's own 6-second mic calibration --
   // saves the calibrated gain to localStorage where the dashboard
@@ -1736,6 +1769,11 @@ function rdjSaveGainDb(db) {
 
 async function toggleRemoteDjConnect() {
   if (rdjPc || rdjWs) { rdjDisconnect(); return; }
+  // [P1] 1.7 -- live engine mutation gate. Only guards STARTING a new
+  // connection -- tearing an existing one down (above) is a purely
+  // local WebRTC/WebSocket cleanup with no engine round-trip, and
+  // must stay available even while the status poll is stale.
+  if (connectionStale) return;
   const btn = document.getElementById('remoteDjConnectBtn');
   btn.classList.add('pending');
   btn.classList.remove('error');
@@ -1916,6 +1954,7 @@ function renderRemoteDjGate(data) {
 }
 
 async function toggleManualMode() {
+  if (connectionStale) return;  // [P1] 1.7 -- live engine mutation gate
   const btn = document.getElementById('manualModeBtn');
   const desiredActive = !btn.classList.contains('active');
   btn.classList.add('pending');
@@ -1941,6 +1980,49 @@ function renderManualMode(data) {
   btn.textContent = data.manual_mode
     ? (data.manual_from_mic ? 'Manual (mic)' : 'Manual')
     : 'Auto';
+}
+
+// [P1] 1.7 -- browser-side stale-connection guardrail (Fix B). Uses
+// ONLY the existing ~1Hz /api/engine/status/ poll below (fetchStatus/
+// poll) as the sole authoritative connectivity signal -- no new
+// endpoint, no new interval, no WebSocket, no service/DB state.
+// Never inferred from pollLevels()/pollListeners() (those hit
+// different endpoints with their own independent failure modes).
+//
+// lastStatusSuccessAt starts at page-load time -- the initial
+// server-rendered state IS a real "last known good" snapshot (Django
+// rendered it from live data moments ago), so the very first poll
+// gets the same grace period as every subsequent one rather than
+// flipping stale instantly if it happens to be slow.
+const STATUS_STALE_THRESHOLD_MS = 3000;
+let lastStatusSuccessAt = Date.now();
+let connectionStale = false;
+
+function renderConnectionStale(stale) {
+  const banner = document.getElementById('connectionStaleBanner');
+  if (banner) banner.hidden = !stale;
+}
+
+// Called once per poll() tick with whether that tick's fetchStatus()
+// succeeded. A single transient miss does NOT flip the console stale
+// -- only once STATUS_STALE_THRESHOLD_MS has elapsed with no
+// successful response at all. Clears immediately (no delay) on the
+// first success, per "automatically restore ... on the first
+// successful status response."
+function updateConnectionStale(success) {
+  const now = Date.now();
+  if (success) {
+    lastStatusSuccessAt = now;
+    if (connectionStale) {
+      connectionStale = false;
+      renderConnectionStale(false);
+    }
+    return;
+  }
+  if (!connectionStale && (now - lastStatusSuccessAt) >= STATUS_STALE_THRESHOLD_MS) {
+    connectionStale = true;
+    renderConnectionStale(true);
+  }
 }
 
 async function fetchStatus() {
@@ -2326,6 +2408,7 @@ function renderDeckLive(slot, deck, transport) {
 }
 
 async function deckCommand(slot, action) {
+  if (connectionStale) return;  // [P1] 1.7 -- deck transport mutation gate
   await fetch(`/api/engine/deck/${slot}/`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') },
@@ -2335,6 +2418,7 @@ async function deckCommand(slot, action) {
 }
 
 async function seekTo(slot, seconds) {
+  if (connectionStale) return;  // [P1] 1.7 -- live engine mutation gate
   await fetch('/api/engine/seek/', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') },
@@ -2454,6 +2538,7 @@ function initQueueDrag() {
 
     handle.addEventListener('pointerup', async (e) => {
       if (!dragEl || e.pointerId !== activePointerId) return;
+      if (connectionStale) { endDrag(); return; }  // [P1] 1.7 -- queue mutation gate
       const dropRow = rowAtPoint(e.clientX, e.clientY);
       const draggedEl = dragEl;
       endDrag();
@@ -2480,6 +2565,7 @@ function initQueueDrag() {
 }
 
 async function setNext(itemId) {
+  if (connectionStale) return;  // [P1] 1.7 -- queue mutation gate
   await fetch('/api/engine/queue/set-next/', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') },
@@ -2531,6 +2617,7 @@ async function searchForInsert(q) {
 }
 
 async function insertTrack(trackId, position) {
+  if (connectionStale) return;  // [P1] 1.7 -- queue mutation gate
   await fetch('/api/engine/queue/insert/', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') },
@@ -2544,6 +2631,7 @@ async function insertTrack(trackId, position) {
 // --- Main poll loop ---
 async function poll() {
   const data = await fetchStatus();
+  updateConnectionStale(!!data);
   if (!data) return;
   const decks = data.decks || {};
   const queue = data.queue || [];
