@@ -2,7 +2,7 @@
 
 Django-based radio automation system built for [Oak Grove Radio](https://oakgroveradio.com) (KOGR-LP, Minneapolis KS).
 
-IsadoraAir manages the full music library, schedule programming, playlist generation, and live on-air playback for a broadcast radio station — from importing and analyzing a track to actually mixing it out through the studio monitor. At our station it has replaced NextKast OnAir + MagicRDS 4 on Win 11 + separate content ingestion scripts on a Ubuntu box with a Django application backed by PostgreSQL, plus a standalone GStreamer playback engine running on Ubuntu on a modest 8th Gen i7 and all of the horsepower of a proper database, controlled by any web browser.
+IsadoraAir manages the full music library, schedule programming, playlist generation, and live on-air playback for a broadcast radio station — from importing and analyzing a track to actually mixing it out through the studio monitor. At our station it replaced a Windows-based NextKast OnAir and MagicRDS automation core with a Django/PostgreSQL application and standalone GStreamer playback engine running on an Ubuntu box, controlled from any web browser. Specialized external helpers can still handle provider-specific content ingestion where appropriate.
 
 ## Screenshots
 
@@ -25,7 +25,8 @@ IsadoraAir manages the full music library, schedule programming, playlist genera
 - `fix_unknown_artists` management command: parses "Artist - Title" out of tracks whose artist is "Unknown Artist" and writes the split back to file metadata; WAV/AIF get transcoded to FLAC first (since they can't carry tags cleanly) with the original marked `ready2air=False` for manual weeding
 - Related Artists: a per-track, comma-separated free-text field (editable on `/track/<pk>/`) naming other artists that should count as "the same artist" for rotation separation. A shared conservative parser auto-discovers feat./ft./featuring/with credits and bare "&"/"and" collaborations (only split when both resulting names already exist as Artist rows) from the artist/title fields and appends newly-found names — never replacing a manually entered value, even on forced reanalysis. The `autofill_related_artists` management command (dry-run by default, `--query`/`--category`/`--ready2air` filters) and a matching "Auto-fill Related Artists" button on `/library/` apply the same discovery across a whole filtered set of tracks in one pass
 - Searchable/filterable frontend with full track detail editing; comfortably handles libraries in the tens of thousands of tracks on modest hardware (Postgres + indexed queries scale further for anyone with a bigger collection)
-- Bulk actions: mark ready-to-air, assign categories, set metadata
+- Bulk actions: mark ready-to-air, assign/add categories, add holiday tags, and delete selected tracks
+- Authorized users can download the source audio from Track Detail when they need an operator-reviewed copy
 - Per-track cue points, rotation weight, energy level, vocal type, end type, RBDS overrides
 - Category Kind (Music/Imaging/Spot/Talk, extensible) with an admin-manageable fill color per kind, shown on the live dashboard's queue
 - Album-art resolver with layered fallbacks: per-Album and per-Artist manual overrides, cached results, embedded artwork extracted from the audio file, an optional station-hosted `{artist-slug}.png` source, Deezer/iTunes lookup for music, and a UI Theme default image as the final fallback. The hosted base URL is configurable alongside Default album art in UI Theme; blank disables hosted lookup, and changing it selectively invalidates hosted/previously-unresolved cache rows so the new setting takes effect without a service restart
@@ -50,18 +51,22 @@ IsadoraAir manages the full music library, schedule programming, playlist genera
 - End-of-hour landing uses matched-pair planning plus full-pool duration-aware exact fitting; scheduling and Coming Up projections share listener-facing effective-airtime semantics (cue-in adjusted), with clock-drift-aware targets and bounded asynchronous live backfill for genuine gaps
 - Related-artist separation: a track's artist identity is its primary Artist plus every name in its Related Artists field, and two tracks are treated as the same artist for recency purposes whenever those identity sets overlap — so a solo cut and a feature/duet involving the same performer won't air back-to-back even when neither track's primary Artist field matches the other's. Applies everywhere ordinary artist separation does — recent-play history, same-hour picks, fixed rotation slots, playlist fills, and holiday injection pools — and to Web Request slot-eligibility checks
 - Log Fill Configuration: tops a short hour up from a fallback category (repeat-last or fixed) so a short playlist/rotation never leaves the engine short
+- Intentionally blank schedule hours can let the current program/log continue instead of forcing an artificial hourly break
 
 **Playback Engine** (`library/services/engine.py`, runs as its own `isadoraair-engine` service)
 - Single GStreamer pipeline mixing two independent decks through a live `audiomixer`, with real crossfading timed off each track's analyzed cue-in/next-start points — not a scripted fade curve, the "fade" is each track's own mastered outro/intro
 - Broadcast-clock hour handling: swaps to the next hour's log ~30s before top-of-hour rather than waiting for the current hour's queue to drain, so playback stays locked to wall-clock hours
 - Pause/resume/eject/seek per deck, all live-controllable from the dashboard
 - Interim AGC (compressor + makeup gain + limiter) for the studio monitor output specifically, configured from its `AudioOutput` admin page
+- Supported physical `AudioOutput` branches can use stable ALSA identities to recover from USB device loss or re-enumeration without rebuilding unrelated program-audio branches
+- Bounded deck teardown and watchdog containment isolate failed playback generations as far as practical; durable media-playback incidents preserve evidence for asynchronous validation that helps distinguish file problems from runtime playback-path failures
 
 **Live Studio Mic + PTT + Graceful Ducking**
 - Dashboard "Studio Mic" button (click-to-toggle) gates a live studio mic input into the on-air mix via a two-mixer pipeline: the decks' summed output feeds a duck gain stage before joining the mic in a shared master mixer, so a track transition mid-talkover never causes a duck discontinuity
 - Optional ducking (admin enable/disable + level in dB) smoothly ramps program audio down/up over ~500ms on PTT toggle — no clicks from an instantaneous level change
 - Mic hardware controls (gain, preamp, etc.) are dynamically enumerated from the configured device's real ALSA mixer controls in admin — no hardcoded interface-specific fields, so it adapts to whatever's actually plugged in
 - Optional stable ALSA card identity can be stored for the studio `AudioInput`; when configured, device loss is detected and the mic branch is rebuilt automatically when the interface returns even if its numeric ALSA card index changes. Legacy/raw-path rows keep the old no-auto-recovery behavior by default, and a recovered mic returns gated OFF
+- Stable-identity input and output recovery are independently scoped, so loss of one supported device does not require rebuilding the entire audio pipeline
 
 **Remote DJ over WebRTC**
 - Browser-based remote DJ console at `/remote-dj/` — a remote DJ connects from any phone or laptop, hears program audio via a WebRTC monitor-return (mix-minus so they don't hear themselves), and can talk over via a gated remote mic that mixes into the on-air chain
@@ -94,8 +99,11 @@ IsadoraAir manages the full music library, schedule programming, playlist genera
 
 **Aircheck Recording** (`aircheck/` app)
 - Captures what actually went out over the air, on demand, from any dashboard — start/stop button, session list with duration + file size + status
-- Backed by a persistent liquidsoap `output.file` block driven over telnet (`aircheck.reopen`), so no per-session ffmpeg subprocess is spawned and no ALSA device is contended with the encoders — the same in-process source that feeds Icecast/Shoutcast is what gets written to disk
+- Backed by a persistent, always-ready Liquidsoap `output.file` path driven over telnet (`aircheck.reopen`), so no per-session capture subprocess is spawned and no ALSA device is contended with the encoders — the same in-process source that feeds Icecast/Shoutcast is what gets written to disk
+- Serialized Start/Stop handling makes repeated Start idempotent and rejects a no-active-session Stop without mutating recording state; an idle-buffer guard rolls the always-on working file before it can grow without bound
+- Monitoring shows the live Aircheck session, working-buffer health, and asynchronous finalization state
 - HE-AAC encodes are remuxed async on stop for compact archival (~1/10th the size of FLAC) without blocking the session state, so a "did I really air that ad?" question a week later is a browser click away
+- When the configured output directory is a matching Category beneath `LIBRARY_ROOT`, finalized recordings are indexed into the library with `ready2air=False` for operator review
 
 **Streaming Encoders** (`encoders/` app, `isadoraair-encoders` service)
 - First-class Django-configured Liquidsoap relay to Icecast and Shoutcast (v1/v2) destinations, one child process per shared ALSA capture device fanning out to every enabled stream (MP3/AAC/Vorbis) on that device
@@ -113,7 +121,8 @@ IsadoraAir manages the full music library, schedule programming, playlist genera
 - Extended Country Code (ECC) transmitted via UECP's Slow Labelling Codes command (RDS group 1A, variant 0) so receivers can fully qualify the PI code's country instead of inferring it from the PI's leading nibble alone — UECP only, StereoTool's ASCII dialect has no ECC command
 - Per-Category RBDS PTY (Program Type) override with an optional 8-character PTYN (Program Type Name) — lets a specific rotation category broadcast a different PTY than the station-wide default while its tracks are airing (e.g. a Sunday jazz block sending PTY=Jazz on top of an otherwise Rock station), configurable per category in Django admin or the `/categories/` frontend page; PTY override applies on both protocols, PTYN is UECP-only (no ASCII equivalent)
 - Promo rotation with priority-interrupt scheduling that returns to now-playing once shown; each message can source its text from a static field, a local file, or a URL
-- Read-only status dashboard; all configuration is admin-only
+- Monitoring exposes the current resolved PS, Long PS, PTY/PTYN, RT, connection/protocol state, and last-send/error information in one read-only runtime view
+- Station-wide RBDS configuration is admin-managed; per-Category PTY/PTYN overrides are also editable from the Categories frontend
 
 **System Monitoring** (`monitoring/` app, `isadoraair-monitoring` service)
 - systemd/disk/CPU/memory/temperature/transmitter/audio-silence health checks, admin-configurable thresholds
@@ -144,14 +153,28 @@ IsadoraAir manages the full music library, schedule programming, playlist genera
 - Notification Config includes SMTP transport diagnostics and an explicit Send Test Email action; recipients are validated before save and delivery failures are recorded without exposing SMTP secrets
 - django-axes login lockout on repeated failed sign-ins
 
+**Managed Update Center** (`updatecenter/` app)
+- Staff and superusers can inspect release state and available updates at `/updates/`; installation remains superuser-only
+- Declarative release manifests and exact-source/release-chain planning validate the checkout, schema, prerequisites, and requested transition before installation is offered
+- A separately installed, protected privileged backend independently revalidates authorization and applies only release-declared safe actions, including migrations, selected systemd reconciliation, service restarts, and static-file collection; package changes and other unsupported/manual prerequisites block unattended execution
+- Dirty, divergent, ambiguous, or otherwise untrustworthy source/release state fails closed. The managed path is operational for normal releases without giving Django arbitrary root command execution
+
+**Shared Text-to-Speech Foundation** (`isadoraair/tts/`)
+- Logical station voices give Django features and external companions one engine-neutral interface while keeping provider-native voices, model paths, and runtime details internal
+- The tested runtime boundary supports Kokoro and optional checksum-pinned Piper providers with bounded subprocess execution and validated atomic output
+- Weather, road-condition, and dedication speech already exist, but their callers are still being consolidated onto this common logical-voice foundation
+
 **Content Ingestion & Integrations**
-- Syndicated program ingestion framework: any external audio program can be pulled from its source, tagged (with artwork where available), and delivered into a rotation category on its own broadcast schedule. Each show is a `syndicated-<slug>.timer`/`.service` pair paired with a small per-source fetcher script; the framework handles metadata, categorization, file placement, and the ready2air gate. Per-source fetchers live outside this repo since they typically carry feed URLs, credentials, or scraping logic specific to each provider. The KOGR-LP install runs 20+ syndicated shows through this framework
-- Weather integration: NWS-sourced current temperature, one-day and three-day forecasts feeding RadioText messages via the RBDS client, plus an alert beep for active watches/warnings that fires as a regular `FXCart` (`WeatherConfig.alert_sound_cart`) through the playback engine's own FX sub-mixer — audible on the studio monitor and remote-DJ monitor-return, not just on air, at the cost of depending on the engine being up to fire at all
-- Kansas road-conditions integration (`road_conditions` app): ingests KDOT/KanDrive CARS construction, closure, restriction, winter-driving, and weather-warning events into normalized `RoadEvent` rows with admin-configurable coverage filters; generates a consolidated spoken road report with the weather voice schedule/Kokoro path, optional inter-item transition audio, safe stale-feed retirement, and deterministic report fingerprinting so unchanged healthy reports skip unnecessary re-synthesis
+- Companion-based syndicated program ingestion can pull provider-specific audio, tag it, and deliver it into scheduled rotation categories while preserving categorization, file-placement, and ready-to-air gates. Specialized fetchers remain external when they carry provider credentials or scraping logic; a native generic/operator-managed recurring-program system remains roadmap work
+- Weather integration: operational NWS-sourced current temperature, one-day and three-day forecasts feed RadioText messages via the RBDS client, while active watches/warnings can fire an ordinary configured `FXCart` through the playback engine
+- Kansas road-conditions integration (`road_conditions` app): operational KDOT/KanDrive CARS ingestion normalizes construction, closure, restriction, winter-driving, and weather-warning events with admin-configurable coverage filters; it generates consolidated spoken reports with optional transitions, safe stale-feed retirement, and fingerprints that avoid needless re-synthesis when a healthy report is unchanged
+- Weather and road-condition reporting remain operational while their generated-speech callers are migrated onto the shared logical-voice TTS foundation
 - Bluesky auto-poster: now-playing metadata pushed to a configured Bluesky account every 2 minutes, with de-duplication so an unchanged track doesn't re-post
 - TuneIn AIR now-playing pusher: hits TuneIn's broadcaster metadata API on every track change with one HTTP call per song start (respects their explicit "do not use a timer to submit a song" rule by deduping on PlayEvent id — the timer fires every 30s but only makes an outbound call when the current PlayEvent id differs from the last successful push). `commercial=true` set automatically for Spot-category plays. Credentials in Config → TuneIn AIR
 - `ogremote` receiver: **ogremote is a separate newsgathering / voiceover tool that is not part of this project** — it runs on its own box and produces content to be aired. IsadoraAir ships only the receiving-side integration: polls for available uploads and dispatches urgent-replay drops into the library. Optional; disable the two `ogremote-*.timer` units if you're not running ogremote upstream
-- Web song requests (`webrequests` app): **the listener-facing form remains on a separate public website**, but catalog sync, request polling, status acknowledgement, scheduling, and fulfillment are native IsadoraAir features. The main IsadoraAir virtualenv runs the repo-managed `isadoraair-web-requests-catalog.timer` (15-minute catalog/availability sync) and `isadoraair-web-requests-ingest.timer` (~20-second request/status cycle); the remote HTTPS base URL and shared API key live in IsadoraAir's protected `.env`. Lifecycle is `pending` / `no_slot_soon` → `scheduled` → `fulfilled` (plus terminal `expired` / `unavailable`) — `scheduled` means the track has been swapped in place into an open, recency-clear music slot (never inserted, so a request can never preempt an `insert_urgent` weather/AMBER alert or resize the hour); `fulfilled` is set only once the engine actually starts playing it, from the same real air-start event that drives recency/royalty logging. If an assigned slot gets swept away by an hour-boundary rollover before its turn, the request is automatically detected and requeued rather than left stuck — concurrency-safe against the engine's own last-second scheduling via row-level Postgres locking. Multiple requests for the same song collapse onto a single play, counted as one slot against the hourly cap regardless of how many listeners asked for it. Per-station config (master on/off, request hours, requests-per-hour cap, no-slot-soon lookahead, expiry) lives at `/web-request/` (staff-only) plus a matching `WebRequestConfig` admin singleton. Webmaster implementation details and the framework-independent public-site contract are in [`docs/WEB_REQUESTS_INTEGRATION.md`](docs/WEB_REQUESTS_INTEGRATION.md).
+- Web song requests (`webrequests` app): **the listener-facing form remains on a separate public website**, while catalog sync, request polling, status acknowledgement, scheduling, lifecycle management, and fulfillment are native IsadoraAir features. Repo-managed timers perform the catalog and request/status cycles, with remote credentials kept in the protected `.env`
+- Requests move from waiting to an in-place, recency-clear scheduled music slot without resizing the hour or preempting urgent alerts. A request becomes fulfilled only when the playback engine commits its assigned `LogItem` to playback and successfully records the item's `played_at` event, not when it is merely scheduled; swept-away assignments are requeued, and duplicate requests for one song can share a single play
+- Optional dedication intros render the requester name/message as speech, pair that intro with the requested track, and preserve the ordinary native request lifecycle. Per-station controls live at `/web-request/`; the public-site contract is documented in [`docs/WEB_REQUESTS_INTEGRATION.md`](docs/WEB_REQUESTS_INTEGRATION.md)
 
 ## Architecture
 
@@ -160,6 +183,7 @@ IsadoraAir (Django 5.2 LTS)
 ├── isadoraair/                    # Django project settings + shared operational config
 │   ├── env_config.py              # Allowlisted atomic .env read/write layer
 │   ├── env_admin.py               # Shared Saved-vs-Running admin helpers
+│   ├── tts/                       # Logical voices + Kokoro/Piper provider boundary
 │   └── version_info.py            # Checkout/runtime Git revision identity
 ├── library/                       # Main library, scheduling, dashboard + playback app
 │   ├── models.py                  # Track, Artist, Album, Category, Rotation, Playlist,
@@ -172,7 +196,8 @@ IsadoraAir (Django 5.2 LTS)
 │   ├── services/
 │   │   ├── log_builder.py         # Playlist generation, fit/timing + scheduler diagnostics
 │   │   ├── engine.py              # GStreamer playback engine (standalone process)
-│   │   ├── audio_recovery.py      # Stable-device resolution + input recovery helpers
+│   │   ├── audio_recovery.py      # Stable-device resolution + I/O recovery helpers
+│   │   ├── media_health.py        # Durable incident evidence + async media validation
 │   │   ├── related_artists.py     # Shared credit parser + artist-identity separation
 │   │   └── remote_dj_signaling.py # WebRTC signaling websocket server (in-engine)
 │   ├── management/commands/       # Import/analyze/CD rip/engine/maintenance commands
@@ -186,6 +211,7 @@ IsadoraAir (Django 5.2 LTS)
 ├── encoders/                      # Liquidsoap stream manager, provider presets + LKG rollback
 ├── monitoring/                    # System/service/transmitter/audio health, release skew
 ├── rbds/                          # UECP/ASCII RDS client, Dynamic PS + Long PS
+├── updatecenter/                  # Release-chain planning + managed-update UI
 ├── weather/                       # Weather configuration + FX-Cart alert bridge
 ├── road_conditions/               # KDOT/KanDrive CARS ingest + spoken report generation
 ├── templates/
@@ -198,6 +224,8 @@ IsadoraAir (Django 5.2 LTS)
 │   ├── build_fdkaac.sh            # Pinned fdk-aac/fdkaac build
 │   ├── check_he_aac.sh            # LC/HE/HEv2 capability validation
 │   ├── backup_isadoraair.sh       # Repo-managed nightly backup implementation
+│   ├── releases/                   # Declarative immutable release manifests
+│   ├── updater_runtime/            # Separately installed protected updater backend
 │   └── restore/                   # Staged plan/apply bare-machine restore tooling
 ├── docs/                          # Runtime baseline, DR, ALSA/GStreamer/TTS provenance
 └── legacy/                        # Original FastAPI prototype (reference only)
@@ -445,6 +473,12 @@ conventions and placeholder rendering. The long-running components
 `isadoraair-rbds`, `isadoraair-monitoring`) each run as their own systemd
 unit; timer-driven jobs are separate `.service`/`.timer` pairs.
 
+Managed release delivery has an additional protected-install boundary. See
+[`docs/UPDATE_CENTER.md`](docs/UPDATE_CENTER.md) for protected updater
+installation and release-management details; do not treat
+`deploy/updater_runtime/` as another unit installed by the ordinary broad
+`deploy/*.service` rendering loop.
+
 The nightly backup implementation is now repo-managed at
 `deploy/backup_isadoraair.sh` and is the source used by
 `isadoraair-backup.service`. It captures PostgreSQL, the application/.env,
@@ -465,10 +499,12 @@ For a full production bring-up, also run the read-only baseline preflight:
 python manage.py check_deploy_baseline
 ```
 
-Syndicated/weather/ogremote/web-request companion fetchers remain separate
-projects when they carry provider-specific URLs, credentials, or scraping
-logic. Their service templates can be rendered from `deploy/`, but their
-code/venvs and secrets remain intentionally outside this repository.
+Syndicated, weather, and ogremote companion fetchers remain separate projects
+when they carry provider-specific URLs, credentials, or scraping logic. Their
+service templates can be rendered from `deploy/`, but their code/venvs and
+secrets remain intentionally outside this repository. Web-request ingestion
+itself is native to IsadoraAir; only the listener-facing website remains
+separate.
 
 ## Running tests
 
@@ -591,18 +627,19 @@ native to IsadoraAir; only the listener-facing website remains separate.
 | 1. Django models | Complete |
 | 2. Library import & analysis | Complete |
 | 3. Log builder | Complete — matched-pair/full-pool exact-fit landing, cue-in-adjusted effective airtime, clock-drift-aware targets, bounded async live backfill |
-| 4. Playback engine | Complete — dual-deck GStreamer mixer, real crossfading, broadcast-clock hour handling, studio-monitor AGC |
+| 4. Playback engine | Operational — dual-deck GStreamer mixer, real crossfading, broadcast-clock hour handling, stable-identity output recovery, bounded deck-failure containment |
 | 5. Live dashboard | Complete — dual-deck view, full-hour queue with drag-reorder + force-next, click-to-seek waveform, manual overrides, Remote Mic live VU fill |
-| 6. Streaming, RDS & monitoring | Complete — reconciled/LKG-protected Icecast/Shoutcast relay with Live365/Radio.co presets; UECP/ASCII RDS with Dynamic/Long PS; system/transmitter checks, alerting, and runtime-version-skew visibility |
+| 6. Streaming, RDS & monitoring | Operational — reconciled/LKG-protected Icecast/Shoutcast relay; UECP/ASCII RDS with resolved runtime telemetry; system/transmitter checks, alerting, and runtime-version-skew visibility |
 | 7. Studio mic + ducking | Complete — dashboard PTT, dynamically-enumerated mixer controls, graceful ducking, optional stable-identity USB input hotplug recovery |
-| 8. Content ingestion | Complete — 20+ syndicated shows on real schedules, weather data + alerts, Bluesky auto-poster, TuneIn AIR now-playing push |
+| 8. Content ingestion | Operational — companion-based syndicated ingestion plus weather and road integrations exist; native operator-managed recurring-program ingestion remains roadmap work |
 | 9. Remote DJ over WebRTC | Complete — browser-based remote console, mix-minus monitor return, gated remote mic with live VU fill, full queue authority for the connected DJ |
 | 10. Email + admin infrastructure | Complete — EmailLog transport capture, invite/reset flows, SMTP diagnostics/test send, admin-managed selected `.env` keys, editable nav menu, django-axes lockout |
 | 11. Royalty reporting | Complete — PlayEvent evidence ledger, SoundExchange NCE / summary / raw-CSV generators, /reports/ frontend with Listener Stats, ISRC auto-populate from tags + MusicBrainz backfill, owned-stream ATH computation with manual override, 3-year retention prune |
 | 12. FX carts / hotkeys | Complete — one-shot buttons with drag-drop file upload, RGBA colors, per-cart retrigger modes (restart/ignore/stop), keyboard shortcuts, mobile-collapsible panel, authoritative engine-synced progress state, persistent FX sub-mixer with one permanent pad on the master mixer and always-on silence to keep the audio path hot |
 | 13. Voice tracking | Complete — per-track intro + outro VT slots, browser recording with DSP forced off, in-browser waveform editor with keep/delete trim + peak normalize + undo, engine state machine sequences outro-VT → gap → intro-VT with computed underlap-delay so intro-VT ends exactly at incoming intro_until, dedicated vt_duck_gain in the pipeline, auto-resume on engine restart preserves position |
-| 14. Web song requests | Complete — public-site catalog/availability sync, request polling + live status/ETA push, in-place recency-aware queue fulfillment that can't preempt urgent alerts or resize the hour |
-| 15. Road conditions | Complete — KDOT/KanDrive CARS ingest with configurable coverage, normalized event storage, spoken consolidated report generation, stale-feed retirement, and unchanged-report fingerprint skipping |
+| 14. Web song requests | Complete — public-site catalog/availability sync, native lifecycle/status handling, optional spoken dedication intros, and in-place recency-aware queue fulfillment |
+| 15. Road conditions | Operational — KDOT/KanDrive CARS ingest with configurable coverage, normalized event storage, spoken consolidated reports, stale-feed retirement, and unchanged-report fingerprint skipping |
+| 16. Managed release delivery | Operational — staff/superuser Update Center, declarative release planning, prerequisite validation, and separately protected execution for normal managed releases |
 
 Actively running end-to-end on a live station: schedule → log builder → playback engine → StereoTool → transmitter, plus live streaming, RDS, monitoring, remote DJ, and content ingestion.
 
@@ -618,9 +655,9 @@ Reliability, correctness, recovery, and runtime-baseline work that should be
 settled before adding more architectural surface area.
 
 - Disaster-recovery audit + bare-machine restore proof
-- Automatic recovery when a USB audio output device disappears and returns
+- Playback EOS/watchdog/reliability validation and follow-up
 - GStreamer 1.28.6 upgrade and regression validation
-- Remote DJ connection-establishment investigation and hardening
+- Remote DJ connection-establishment hardening
 - Playback/accounting semantics audit — make “played” mean the event we actually intend
 - Operational guardrails and observability follow-up
 
@@ -631,13 +668,14 @@ layer rather than a rewrite.
 
 - Scheduled Aircheck recording tied to `/schedule/` program blocks
 - HE-AAC native dependency packaging for fresh installs and recovery
-- Shared generated-speech / automated-announcement foundation + Weather Suite integration (staged)
+- Complete shared generated-speech caller migration for weather, road conditions, and dedications
 - Granular talent roles, capabilities, and scheduled access
 - Log-position voice tracking + remote talent job workflow
 - Native managed syndicated / recurring program-content ingestion
 - Advanced music scheduling rules + category-health / rule-break diagnostics
 - Full-day log editor + programmer diagnostics
 - Overlay sweeper engine using existing cue points and hardened audio buses
+- iPulse audience-response music weighting and scoring
 
 ### Bucket 3 — Independent feature additions
 
