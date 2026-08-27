@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "release_id": "r0011",
+  "previous_release_id": "r0010",
+  "minimum_updater_protocol_version": 3,
+  "summary": "Adds a category override to import_songs and vendor-neutral transmitter monitoring with disabled, Aquabroadcast COBALT C300, and BW Broadcast TX300v3 drivers, including additive transmitter configuration and read-only BW telemetry.",
+  "migrations_required": [
+    "monitoring.0011_transmitter_vendor_and_password"
+  ],
+  "migration_compatibility": "additive",
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-gunicorn",
+    "isadoraair-monitoring"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0007"
+}
