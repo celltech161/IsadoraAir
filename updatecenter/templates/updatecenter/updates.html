@@ -174,7 +174,17 @@
       </div>
     </div>
 
-    {% if update_eligible %}
+    {% if active_job %}
+    <!-- An active job owning the lock is EXPECTED while an install is
+         running -- update_eligible is correctly False here (see
+         _execution_blockers), but that must not be presented as a
+         warning/error: the update is proceeding normally. The
+         detailed #uc-job panel just below remains the authoritative
+         source for job id/state/step/backend status/log; this block
+         intentionally does not duplicate any of that. -->
+    <h3>Update in progress — {{ plan.target_release_id }}</h3>
+    <p class="uc-note">This update is currently being installed. Installation controls are unavailable until it completes.</p>
+    {% elif update_eligible %}
     <form method="post" action="{% url 'updatecenter:start-update' %}"
           onsubmit="return window.confirm('Install {{ plan.target_release_id|escapejs }}? Service interruption is expected. There is no automatic rollback.');">
       {% csrf_token %}

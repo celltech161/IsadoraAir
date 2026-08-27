@@ -115,11 +115,20 @@ class TerminalJobServerReconciliationTests(TestCase):
                    return_value={**READY_PING, "ready": True, "execution_armed": True, "detail": "ready"}):
             return self.client.get(reverse("updatecenter:dashboard"))
 
-    def test_active_nonterminal_job_shows_stale_style_active_lock_blocker(self):
+    def test_active_nonterminal_job_shows_live_polling_panel(self):
         """Baseline: BEFORE the job finishes, the page correctly shows
-        the active-lock blocker and the live polling panel -- this is
-        the exact state a real WRJE-style page load would have shown
-        mid-update, confirming the "before" half of the bug."""
+        the live polling panel -- this is the exact state a real
+        WRJE/KOGR-style page load shows mid-update.
+
+        [fix/updatecenter-active-job-presentation correction] The raw
+        "still owns the active lock" blocker text is deliberately NOT
+        asserted here anymore -- a later, separate fix corrected that
+        exact presentation bug (a normal in-progress install is no
+        longer shown as "Installation blocked"; see
+        test_active_job_presentation.py for the full regression
+        coverage of that fix). active_job/the active_lock safety
+        mechanism itself is untouched -- only what the operator SEES
+        while it's held changed."""
         UpdateJob.objects.create(
             initiated_by_username="uc-reload-root2",
             installed_release_id="r0007", target_release_id="r0008",
@@ -129,7 +138,6 @@ class TerminalJobServerReconciliationTests(TestCase):
         with patch("updatecenter.views._refresh_job", side_effect=lambda job: (job, None)):
             response = self._get()
         content = response.content.decode("utf-8")
-        self.assertIn("still owns the active lock", content)
         self.assertIn('id="uc-job"', content)
 
     def test_freshly_rendered_page_after_terminal_reconciliation_drops_active_lock_blocker(self):
