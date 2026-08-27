@@ -3,7 +3,7 @@ import struct
 from pathlib import Path
 
 from django.conf import settings
-from django.core.management.base import BaseCommand
+from django.core.management.base import BaseCommand, CommandError
 from mutagen import File as MutagenFile
 
 from library.models import Album, Artist, Category, Genre, Track
@@ -193,6 +193,10 @@ class Command(BaseCommand):
             action="store_true",
             help="Report what would be created/updated without writing to the DB.",
         )
+        parser.add_argument(
+            "--category",
+            help="Assign every imported file to this existing Category code.",
+        )
 
     def handle(self, *args, **options):
         scan_path = options["path"] or getattr(settings, "LIBRARY_ROOT", None)
@@ -204,6 +208,16 @@ class Command(BaseCommand):
         if not root.is_dir():
             self.stderr.write(f"Not a directory: {root}")
             return
+
+        category_override = None
+        category_code = options["category"]
+        if category_code is not None:
+            try:
+                category_override = Category.objects.get(code=category_code)
+            except Category.DoesNotExist as exc:
+                raise CommandError(
+                    f"No Category exists with code '{category_code}'."
+                ) from exc
 
         dry_run = options["dry_run"]
         if dry_run:
@@ -227,7 +241,9 @@ class Command(BaseCommand):
                     continue
 
                 try:
-                    ok, status = self._process_file(filepath, root, dry_run)
+                    ok, status = self._process_file(
+                        filepath, root, dry_run, category_override
+                    )
                 except Exception as exc:
                     self.stderr.write(f"  [ERROR] {filepath}: {exc}")
                     skipped += 1
@@ -253,7 +269,7 @@ class Command(BaseCommand):
             f"inserted: {inserted}, updated: {updated}, skipped: {skipped}"
         )
 
-    def _process_file(self, filepath, root, dry_run):
+    def _process_file(self, filepath, root, dry_run, category_override=None):
         tags, info = parse_tags(filepath)
 
         def clean(val):
@@ -273,9 +289,13 @@ class Command(BaseCommand):
         genre_name = clean(tags.get("genre")) or ""
         fmt = filepath.suffix.lstrip(".").lower()
 
-        rel = filepath.relative_to(root)
-        parts = rel.parts
-        category_name = parts[0] if len(parts) > 1 else ""
+        category_obj = category_override
+        if category_obj is None:
+            rel = filepath.relative_to(root)
+            parts = rel.parts
+            category_name = parts[0] if len(parts) > 1 else ""
+        else:
+            category_name = ""
 
         if dry_run:
             existing = Track.objects.filter(filepath=str(filepath)).exists()
@@ -297,8 +317,7 @@ class Command(BaseCommand):
         if genre_name:
             genre_obj, _ = Genre.objects.get_or_create(name=genre_name)
 
-        category_obj = None
-        if category_name:
+        if category_obj is None and category_name:
             category_obj = Category.objects.filter(code=category_name).first()
             if category_obj is None:
                 # Category.kind is a required FK (CategoryKind) that can't
