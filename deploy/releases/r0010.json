@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "release_id": "r0010",
+  "previous_release_id": "r0009",
+  "minimum_updater_protocol_version": 3,
+  "summary": "Update Center now presents an active install as 'Update in progress' instead of misreporting the expected active lock as an installation blocker, naming it via the frozen job target for authoritative identity. Django planning now refuses installation when live HEAD is merely descended from -- not exactly equal to -- the canonical installed release commit, aligning application-side eligibility with the protected executor.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-gunicorn"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0007"
+}
