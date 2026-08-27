@@ -136,6 +136,65 @@ class ActiveJobPresentationTests(TestCase):
         self.assertNotIn("Current step", action_area)
         self.assertNotIn("uc-job-state", action_area)
 
+    def test_active_job_notice_names_the_job_target_not_a_newer_plan_target(self):
+        """Authoritative-identity regression: the running job is a
+        FROZEN snapshot of what it was actually confirmed/submitted
+        for. The planner's current target can legitimately move on --
+        a newer release becoming visible mid-install -- while this
+        exact job stays locked onto whatever it started with. The
+        notice must name active_job.target_release_id, never
+        plan.target_release_id, or an operator could be told a release
+        is "in progress" that isn't the one actually locked and
+        installing.
+
+        ReadyPlan.target_release_id is fixed at "r0005" (the current
+        planner target -- simulating a newer release that became
+        visible after this job was submitted). The active job here is
+        deliberately given a DIFFERENT target ("r0004") to prove the
+        notice reads from the job, not the plan -- a same-value
+        fixture (as the other tests in this file use) can't
+        distinguish "correctly reads the job" from "coincidentally
+        matches because both happen to agree," which is exactly how
+        the bug this test guards against slipped through review once
+        already (see the #uc-job panel below, which independently
+        renders shown_job.target_release_id and would mask a wrong
+        value in the new block via simple substring overlap if both
+        fixtures used the same release id)."""
+        job = UpdateJob.objects.create(
+            initiated_by_username="uc-active-job-root",
+            installed_release_id="r0003", target_release_id="r0004",
+            installed_commit="a" * 40, target_commit="c" * 40,
+            state=UpdateJobState.RUNNING, active_lock=1,
+        )
+        self.assertNotEqual(job.target_release_id, ReadyPlan.target_release_id)
+        content = self._get_dashboard(active_job=job)
+
+        # Isolate the new action-area block specifically, so an
+        # incidental match from the separate #uc-job panel's own
+        # heading (shown_job.target_release_id) can't paper over a
+        # wrong value here.
+        action_area = content[
+            content.index(f"{ReadyPlan.installed_release_id} → {ReadyPlan.target_release_id}"):
+            content.index('<details class="uc-details">')
+        ]
+        self.assertIn(f"Update in progress — {job.target_release_id}", action_area)
+        self.assertNotIn(f"Update in progress — {ReadyPlan.target_release_id}", action_area)
+        # The action area may legitimately mention the plan's newer
+        # target elsewhere (e.g. inside "r0003 → r0005" in its own
+        # heading a few lines up, which is the CURRENT planner target
+        # and correctly stays as-is per the task's explicit "do not
+        # change the ordinary plan heading" instruction) -- what must
+        # never happen is claiming that release is "in progress."
+        self.assertIn(f"{ReadyPlan.installed_release_id} → {ReadyPlan.target_release_id}", action_area)
+
+        # The existing #uc-job panel remains consistent with this same
+        # active job -- same id, same target -- proving both surfaces
+        # agree with each other and with the real locked job, not with
+        # the planner's possibly-newer target.
+        self.assertIn(f'>{job.id}<', content)
+        uc_job_panel = content[content.index('id="uc-job"'):content.index("</section>", content.index('id="uc-job"'))]
+        self.assertIn(f"Update in progress — {job.target_release_id}", uc_job_panel)
+
     # -- 3. genuine non-active-job blocker --------------------------------
 
     def test_genuine_blocker_without_active_job_still_shows_blocked(self):

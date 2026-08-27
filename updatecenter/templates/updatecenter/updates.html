@@ -181,8 +181,18 @@
          warning/error: the update is proceeding normally. The
          detailed #uc-job panel just below remains the authoritative
          source for job id/state/step/backend status/log; this block
-         intentionally does not duplicate any of that. -->
-    <h3>Update in progress — {{ plan.target_release_id }}</h3>
+         intentionally does not duplicate any of that.
+
+         active_job.target_release_id, NOT plan.target_release_id --
+         the running job is a frozen snapshot of what it was actually
+         confirmed/submitted for. The planner's current target can
+         legitimately move on (a newer release becoming visible mid-
+         install) while this exact job is still locked onto whatever
+         it started with; showing plan.target_release_id here could
+         claim a release is "in progress" that isn't the one actually
+         locked and installing. Matches shown_job.target_release_id's
+         use in the #uc-job panel just below. -->
+    <h3>Update in progress — {{ active_job.target_release_id }}</h3>
     <p class="uc-note">This update is currently being installed. Installation controls are unavailable until it completes.</p>
     {% elif update_eligible %}
     <form method="post" action="{% url 'updatecenter:start-update' %}"
