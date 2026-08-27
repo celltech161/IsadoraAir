@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "release_id": "r0012",
+  "previous_release_id": "r0011",
+  "minimum_updater_protocol_version": 3,
+  "summary": "Corrects staged-target migration classification to recognize conservatively safe non-null fields with simple literal defaults and help-text-only field alterations, allowing additive r0011 migrations to proceed while unsafe operations remain manual.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0007"
+}
