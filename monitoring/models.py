@@ -68,15 +68,15 @@ class MonitorCheck(models.Model):
     # --- kind="transmitter_param" ---
     transmitter_parameter = models.CharField(
         max_length=64, blank=True,
-        help_text="COBALT get-parameter, e.g. psu.fwd_power, psu.vswr, "
-                   "psu.pa_temperature, psu.fan_speed_measured_fan1.",
+        help_text="Transmitter parameter/check identifier. Existing COBALT names "
+                  "are translated by compatible vendor drivers where supported.",
     )
 
     # --- kind="transmitter_indicator" ---
     transmitter_indicator = models.CharField(
         max_length=64, blank=True,
-        help_text="COBALT indicator parameter, e.g. status.indicator.rf, "
-                   "status.indicator.vswr, status.indicator.temp, status.rf_interlock.",
+        help_text="Transmitter status/check identifier. Existing COBALT names "
+                  "are translated by compatible vendor drivers where supported.",
     )
     fault_values = models.CharField(
         max_length=128, blank=True,
@@ -191,20 +191,40 @@ class MonitorCheck(models.Model):
 
 
 class TransmitterConfig(models.Model):
-    """Singleton — connection details for the Aquabroadcast COBALT
-    transmitter's ASCII TCP control port (see
-    monitoring/services/transmitter_client.py). No host known yet — until
-    one is entered, transmitter_param/transmitter_indicator checks simply
-    report 'unknown', not critical."""
+    """Singleton connection details for the selected transmitter driver."""
+    TYPE_NONE = "none"
+    TYPE_COBALT_C300 = "cobalt_c300"
+    TYPE_BW_TX300V3 = "bw_tx300v3"
+    TYPE_CHOICES = [
+        (TYPE_NONE, "None / disabled"),
+        (TYPE_COBALT_C300, "Aquabroadcast COBALT C300"),
+        (TYPE_BW_TX300V3, "BW Broadcast TX300v3"),
+    ]
+
+    transmitter_type = models.CharField(
+        max_length=24,
+        choices=TYPE_CHOICES,
+        default=TYPE_COBALT_C300,
+        help_text="Select the transmitter protocol, or disable transmitter monitoring.",
+    )
     host = models.CharField(
         max_length=255, blank=True,
-        help_text="Transmitter IP or hostname. Leave blank to disable transmitter polling.",
+        help_text="Transmitter IP address or hostname.",
     )
     port = models.PositiveIntegerField(
         default=23,
-        help_text="TCP port for the ASCII control protocol — confirm against the unit's own network settings.",
+        help_text="TCP port for the selected transmitter's monitoring protocol.",
     )
-    timeout_seconds = models.FloatField(default=3.0)
+    password = models.CharField(
+        max_length=255,
+        blank=True,
+        default="",
+        help_text="Required for BW TX300v3. Leave blank when editing to preserve the saved password.",
+    )
+    timeout_seconds = models.FloatField(
+        default=3.0,
+        help_text="Maximum seconds for each bounded connection or protocol wait.",
+    )
     poll_interval_seconds = models.PositiveIntegerField(
         default=30,
         help_text="How often to poll the transmitter specifically — independent of the "
@@ -494,4 +514,3 @@ def emit_event(category, title, level="info", detail=None, source=None, dedupe_k
         import sys as _sys
         print(f"  [emit_event] failed to record event ({category}/{level}: {title}): {exc}", file=_sys.stderr)
         return None
-

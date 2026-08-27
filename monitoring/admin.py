@@ -1,3 +1,4 @@
+from django import forms
 from django.conf import settings
 from django.contrib import admin, messages
 from django.http import HttpResponseRedirect
@@ -9,6 +10,36 @@ from isadoraair import env_config
 
 from .models import ListenerPeak, MonitorCheck, NotificationConfig, SystemEvent, TransmitterConfig, emit_event
 from .services.notify import send_test_email
+
+
+class TransmitterConfigAdminForm(forms.ModelForm):
+    password = forms.CharField(
+        required=False,
+        widget=forms.PasswordInput(render_value=False),
+        help_text=(
+            "Required for BW TX300v3. Leave blank while editing to preserve "
+            "the saved password; saved values are never displayed."
+        ),
+    )
+
+    class Meta:
+        model = TransmitterConfig
+        fields = "__all__"
+
+    def clean_password(self):
+        submitted = self.cleaned_data.get("password", "")
+        if not submitted and self.instance.pk:
+            return self.instance.password
+        return submitted
+
+    def clean(self):
+        cleaned = super().clean()
+        if (
+            cleaned.get("transmitter_type") == TransmitterConfig.TYPE_BW_TX300V3
+            and not cleaned.get("password")
+        ):
+            self.add_error("password", "A password is required for BW TX300v3.")
+        return cleaned
 
 
 @admin.register(MonitorCheck)
@@ -65,7 +96,16 @@ class _SingletonAdmin(admin.ModelAdmin):
 class TransmitterConfigAdmin(_SingletonAdmin):
     singleton_model = TransmitterConfig
     change_url_name = "admin:monitoring_transmitterconfig_change"
-    fields = ["host", "port", "timeout_seconds", "poll_interval_seconds", "full_power_watts"]
+    form = TransmitterConfigAdminForm
+    fields = [
+        "transmitter_type",
+        "host",
+        "port",
+        "password",
+        "timeout_seconds",
+        "poll_interval_seconds",
+        "full_power_watts",
+    ]
 
 
 @admin.register(NotificationConfig)

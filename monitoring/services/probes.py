@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 import psutil
 
 from monitoring.services.transmitter_client import parse_numeric
+from monitoring.services.transmitters import UnsupportedTransmitterParameter
 
 # Real bug hit live: Django's TIME_ZONE/USE_TZ setting makes django.setup()
 # set this process's own TZ env var (confirmed: os.environ['TZ'] ==
@@ -143,6 +144,8 @@ def probe_transmitter_param(check, tx_client):
         return "unknown", {"reason": "transmitter unreachable or not configured"}
     try:
         raw = tx_client.get(check.transmitter_parameter)
+    except UnsupportedTransmitterParameter as exc:
+        return "unsupported", {"reason": str(exc)}
     except Exception as exc:
         return "unknown", {"error": str(exc)}
     if raw is None:
@@ -168,6 +171,8 @@ def probe_transmitter_indicator(check, tx_client):
         return "unknown", {"reason": "transmitter unreachable or not configured"}
     try:
         raw = tx_client.get(check.transmitter_indicator)
+    except UnsupportedTransmitterParameter as exc:
+        return "unsupported", {"reason": str(exc)}
     except Exception as exc:
         return "unknown", {"error": str(exc)}
     if raw is None:

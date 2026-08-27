@@ -27,7 +27,10 @@ from monitoring.models import ListenerPeak, MonitorCheck, TransmitterConfig, emi
 from monitoring.services.notify import maybe_notify  # noqa: E402
 from monitoring.services.probes import PROBE_DISPATCH  # noqa: E402
 from monitoring.services.shoutcast import fetch_shoutcast_stats  # noqa: E402
-from monitoring.services.transmitter_client import TransmitterClient  # noqa: E402
+from monitoring.services.transmitters import (  # noqa: E402
+    TRANSMITTER_NONE,
+    create_transmitter_driver,
+)
 from isadoraair.version_info import capture_runtime_commit  # noqa: E402
 
 STATE_PATH = Path("/run/isadoraair/monitoring_state.json")
@@ -57,6 +60,7 @@ class MonitorManager:
         self._cooldowns = {}         # str(check.id) -> last_notified_at, persisted in state file
         self._last_tx_poll = 0.0
         self._last_tx_result = {}    # check.id -> {"status":.., "detail":..} from the last real poll
+        self._last_tx_type = None
 
     def start(self):
         self.running = True
@@ -86,13 +90,47 @@ class MonitorManager:
         checks = list(MonitorCheck.objects.filter(enabled=True).order_by("sort_order"))
         tx_config = TransmitterConfig.load()
 
+        tx_checks = [c for c in checks if c.kind in _TRANSMITTER_KINDS]
+        if tx_config.transmitter_type != self._last_tx_type:
+            self._clear_transmitter_state(tx_checks)
+            self._last_tx_poll = 0.0
+            self._last_tx_type = tx_config.transmitter_type
+
+        tx_driver = None
+        if tx_config.transmitter_type == TRANSMITTER_NONE:
+            # Disabled means absent, not failed: omit all transmitter checks
+            # so the dashboard has no transmitter group and no notifications
+            # are generated from intentionally unavailable hardware.
+            self._clear_transmitter_state(tx_checks)
+            checks = [c for c in checks if c.kind not in _TRANSMITTER_KINDS]
+        else:
+            try:
+                tx_driver = create_transmitter_driver(tx_config)
+            except Exception as exc:
+                # An invalid persisted type is contained to transmitter
+                # monitoring. Non-transmitter checks continue normally.
+                print(f"  [transmitter] Invalid configuration: {exc}")
+
+            if tx_driver is not None:
+                unsupported_ids = {
+                    check.id for check in tx_checks
+                    if not tx_driver.supports_reference(
+                        check.transmitter_parameter or check.transmitter_indicator
+                    )
+                }
+                if unsupported_ids:
+                    self._clear_transmitter_state(
+                        [check for check in tx_checks if check.id in unsupported_ids]
+                    )
+                    checks = [check for check in checks if check.id not in unsupported_ids]
+
         tx_client = None
         needs_tx = any(c.kind in _TRANSMITTER_KINDS for c in checks)
         tx_due = (time.monotonic() - self._last_tx_poll) >= tx_config.poll_interval_seconds
-        if needs_tx and tx_due and tx_config.host:
+        if needs_tx and tx_due and tx_config.host and tx_driver is not None:
             self._last_tx_poll = time.monotonic()
             try:
-                tx_client = TransmitterClient(tx_config.host, tx_config.port, tx_config.timeout_seconds)
+                tx_client = tx_driver
                 tx_client.__enter__()
             except Exception as exc:
                 print(f"  [transmitter] Failed to connect: {exc}")
@@ -126,6 +164,14 @@ class MonitorManager:
                     status, detail = probe_fn(check)
             except Exception as exc:
                 status, detail = "unknown", {"error": str(exc)}
+
+            if is_transmitter and status == "unsupported":
+                # A device can report a parameter as unsupported even when
+                # its model family normally provides it. Hide that check just
+                # like a statically unsupported capability, without debounce,
+                # events, or notifications, and continue the rest of the poll.
+                self._clear_transmitter_state([check])
+                continue
 
             prev_status = self._current_status.get(check.id, "ok")
             status = self._debounce(check, status)
@@ -167,6 +213,13 @@ class MonitorManager:
             # listener JSON stale for one tick. Log once so a persistent
             # regression shows up rather than swallowing silently.
             print(f"  [listeners] poll failed: {exc}")
+
+    def _clear_transmitter_state(self, checks):
+        for check in checks:
+            self._last_tx_result.pop(check.id, None)
+            self._consecutive_bad.pop(check.id, None)
+            self._since.pop(check.id, None)
+            self._current_status.pop(check.id, None)
 
     @staticmethod
     def _maybe_reset_tlh_for_new_month(peak, now):
