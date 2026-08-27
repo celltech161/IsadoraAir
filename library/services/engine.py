@@ -3318,16 +3318,84 @@ class PlaybackEngine:
         now = timezone.localtime()
         self._load_log_for(now.date(), now.hour)
 
-        if not self.log_items:
-            fallback = (
+        # An approved exact-hour log owns startup even when it is empty.
+        # In particular, do not replace it with stale prior-date material.
+        if self.current_log is not None:
+            return
+
+        fallback = (
+            PlaylistLog.objects
+            .filter(date=now.date(), status="approved", hour__lte=now.hour)
+            .order_by("-hour")
+            .first()
+        )
+        if fallback:
+            print(f"No log for hour {now.hour}, falling back to hour {fallback.hour}")
+            self._load_log_for(fallback.date, fallback.hour)
+            return
+
+        continuation = self._prior_date_startup_continuation(now)
+        if continuation is None:
+            return
+        log, reason = continuation
+        self._load_log_for(log.date, log.hour)
+        print(
+            "Startup continuation fallback: recovering approved log "
+            f"{log.date} {log.hour:02d}:00 while wall clock is "
+            f"{now.date()} {now.hour:02d}:{now.minute:02d} ({reason})"
+        )
+
+    def _prior_date_startup_continuation(self, now):
+        """Return ``(PlaylistLog, reason)`` for a proven yesterday fallback.
+
+        This is deliberately startup-only and fail-closed. A resolved current
+        ScheduleBlock owns recovery, and ordinary inspection considers only
+        yesterday's latest approved log. A fresh resume hint may identify the
+        exact approved yesterday log that the previous process was playing;
+        its LogItem and Track identities must agree and the media must remain
+        playable. Without that direct evidence, the latest log must prove both
+        that it started and that it retains an unplayed, playable item.
+        """
+        try:
+            if resolve_schedule_block(now.date(), now.hour) is not None:
+                return None
+
+            previous_date = now.date() - timedelta(days=1)
+            hint = getattr(self, "_resume_hint", None)
+            if hint and hint.get("log_item_id") and hint.get("track_id"):
+                hinted_item = (
+                    LogItem.objects
+                    .select_related("playlist_log", "track")
+                    .filter(
+                        id=hint["log_item_id"],
+                        track_id=hint["track_id"],
+                        playlist_log__date=previous_date,
+                        playlist_log__status="approved",
+                    )
+                    .first()
+                )
+                if hinted_item is not None and _log_item_playable(hinted_item)[0]:
+                    return hinted_item.playlist_log, "resume_hint"
+
+            candidate = (
                 PlaylistLog.objects
-                .filter(date=now.date(), status="approved", hour__lte=now.hour)
+                .filter(date=previous_date, status="approved")
                 .order_by("-hour")
                 .first()
             )
-            if fallback:
-                print(f"No log for hour {now.hour}, falling back to hour {fallback.hour}")
-                self._load_log_for(fallback.date, fallback.hour)
+            if candidate is None:
+                return None
+            if not candidate.items.filter(played_at__isnull=False).exists():
+                return None
+
+            future_items = candidate.items.filter(
+                played_at__isnull=True
+            ).select_related("track").order_by("position")
+            if any(_log_item_playable(item)[0] for item in future_items):
+                return candidate, "remaining_unplayed_items"
+        except Exception as exc:
+            print(f"Startup continuation fallback inspection failed (non-fatal): {exc}")
+        return None
 
     def _load_log_for(self, target_date, hour):
         close_old_connections()

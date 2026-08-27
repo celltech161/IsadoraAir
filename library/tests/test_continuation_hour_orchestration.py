@@ -31,6 +31,7 @@ from library.models import (
 
 FRIDAY = date(2027, 3, 5)
 SATURDAY = date(2027, 3, 6)
+THURSDAY = date(2027, 3, 4)
 
 
 def make_stand_in():
@@ -424,3 +425,214 @@ class ContinuationHourOrchestrationTests(TransactionTestCase):
         state = stand_in._current_hour_schedule_state(now)
         self.assertEqual(state["state"], "continuation")
         self.assertTrue(state["has_committed_playout"])
+
+    def test_cross_midnight_startup_recovers_started_log_with_future_items(self):
+        played = self.make_track()
+        future = self.make_track()
+        prior, items = self.make_log(FRIDAY, 23, tracks=[played, future])
+        items[0].played_at = timezone.now()
+        items[0].save(update_fields=["played_at"])
+        stand_in = make_stand_in()
+        now = self.fake_now(SATURDAY, 0, minute=25)
+
+        with patch.object(eng_module.timezone, "localtime", return_value=now):
+            stand_in._load_current_hour_log()
+
+        self.assertEqual(stand_in.current_log.id, prior.id)
+        self.assertEqual(stand_in._queue_cursor, 1)
+        state = stand_in._current_hour_schedule_state(now)
+        self.assertEqual(state["state"], "continuation")
+        self.assertTrue(state["has_committed_playout"])
+
+    def test_cross_midnight_startup_recovers_long_item_from_exact_resume_hint(self):
+        long_track = self.make_track(duration=7200)
+        prior, (item,) = self.make_log(
+            FRIDAY, 23, tracks=[long_track], played=True
+        )
+        stand_in = make_stand_in()
+        stand_in._resume_hint = {
+            "track_id": long_track.id,
+            "position": 4500.0,
+            "log_item_id": item.id,
+        }
+        now = self.fake_now(SATURDAY, 0, minute=25)
+
+        with patch.object(eng_module.timezone, "localtime", return_value=now):
+            stand_in._load_current_hour_log()
+
+        self.assertEqual(stand_in.current_log.id, prior.id)
+        self.assertEqual(stand_in._queue_cursor, 1)
+        stand_in._apply_resume_hint_queue_rewind()
+        self.assertEqual(stand_in._queue_cursor, 0)
+        self.assertEqual(stand_in.log_items[0].track_id, long_track.id)
+        state = stand_in._current_hour_schedule_state(now)
+        self.assertEqual(state["state"], "continuation")
+        self.assertTrue(state["has_committed_playout"])
+
+    def test_cross_midnight_startup_rejects_exhausted_yesterday_log(self):
+        track = self.make_track()
+        self.make_log(FRIDAY, 23, tracks=[track], played=True)
+        stand_in = make_stand_in()
+
+        with patch.object(
+            eng_module.timezone,
+            "localtime",
+            return_value=self.fake_now(SATURDAY, 0),
+        ):
+            stand_in._load_current_hour_log()
+
+        self.assertIsNone(stand_in.current_log)
+        self.assertEqual(stand_in.log_items, [])
+
+    def test_cross_midnight_startup_rejects_never_started_yesterday_log(self):
+        track = self.make_track()
+        self.make_log(FRIDAY, 23, tracks=[track])
+        stand_in = make_stand_in()
+
+        with patch.object(
+            eng_module.timezone,
+            "localtime",
+            return_value=self.fake_now(SATURDAY, 0),
+        ):
+            stand_in._load_current_hour_log()
+
+        self.assertIsNone(stand_in.current_log)
+
+    def test_current_schedule_block_prevents_cross_midnight_startup_fallback(self):
+        self.make_block(SATURDAY, 0)
+        played = self.make_track()
+        future = self.make_track()
+        _prior, items = self.make_log(FRIDAY, 23, tracks=[played, future])
+        items[0].played_at = timezone.now()
+        items[0].save(update_fields=["played_at"])
+        stand_in = make_stand_in()
+
+        with patch.object(
+            eng_module.timezone,
+            "localtime",
+            return_value=self.fake_now(SATURDAY, 0),
+        ):
+            stand_in._load_current_hour_log()
+
+        self.assertIsNone(stand_in.current_log)
+
+    def test_current_approved_log_wins_over_cross_midnight_candidate(self):
+        played = self.make_track()
+        future = self.make_track()
+        _prior, prior_items = self.make_log(
+            FRIDAY, 23, tracks=[played, future]
+        )
+        prior_items[0].played_at = timezone.now()
+        prior_items[0].save(update_fields=["played_at"])
+        current_track = self.make_track()
+        current, _current_items = self.make_log(
+            SATURDAY, 0, tracks=[current_track]
+        )
+        stand_in = make_stand_in()
+
+        with patch.object(
+            eng_module.timezone,
+            "localtime",
+            return_value=self.fake_now(SATURDAY, 0),
+        ):
+            stand_in._load_current_hour_log()
+
+        self.assertEqual(stand_in.current_log.id, current.id)
+        self.assertEqual(stand_in.current_log.date, SATURDAY)
+
+    def test_cross_midnight_startup_never_searches_back_two_days(self):
+        played = self.make_track()
+        future = self.make_track()
+        _old, items = self.make_log(THURSDAY, 23, tracks=[played, future])
+        items[0].played_at = timezone.now()
+        items[0].save(update_fields=["played_at"])
+        stand_in = make_stand_in()
+
+        with patch.object(
+            eng_module.timezone,
+            "localtime",
+            return_value=self.fake_now(SATURDAY, 0),
+        ):
+            stand_in._load_current_hour_log()
+
+        self.assertIsNone(stand_in.current_log)
+
+    def test_cross_midnight_startup_does_not_skip_later_exhausted_log(self):
+        played = self.make_track()
+        future = self.make_track()
+        _earlier, earlier_items = self.make_log(
+            FRIDAY, 22, tracks=[played, future]
+        )
+        earlier_items[0].played_at = timezone.now()
+        earlier_items[0].save(update_fields=["played_at"])
+        latest_track = self.make_track()
+        self.make_log(FRIDAY, 23, tracks=[latest_track], played=True)
+        stand_in = make_stand_in()
+
+        with patch.object(
+            eng_module.timezone,
+            "localtime",
+            return_value=self.fake_now(SATURDAY, 0),
+        ):
+            stand_in._load_current_hour_log()
+
+        self.assertIsNone(stand_in.current_log)
+
+    def test_cross_midnight_startup_rejects_unplayable_future_item(self):
+        played = self.make_track()
+        missing = self.make_track()
+        _prior, items = self.make_log(FRIDAY, 23, tracks=[played, missing])
+        items[0].played_at = timezone.now()
+        items[0].save(update_fields=["played_at"])
+        Path(missing.filepath).unlink()
+        stand_in = make_stand_in()
+
+        with patch.object(
+            eng_module.timezone,
+            "localtime",
+            return_value=self.fake_now(SATURDAY, 0),
+        ):
+            stand_in._load_current_hour_log()
+
+        self.assertIsNone(stand_in.current_log)
+
+    def test_cross_midnight_startup_rejects_resume_hint_identity_mismatch(self):
+        long_track = self.make_track(duration=7200)
+        _prior, (item,) = self.make_log(
+            FRIDAY, 23, tracks=[long_track], played=True
+        )
+        other_track = self.make_track()
+        stand_in = make_stand_in()
+        stand_in._resume_hint = {
+            "track_id": other_track.id,
+            "position": 4500.0,
+            "log_item_id": item.id,
+        }
+
+        with patch.object(
+            eng_module.timezone,
+            "localtime",
+            return_value=self.fake_now(SATURDAY, 0),
+        ):
+            stand_in._load_current_hour_log()
+
+        self.assertIsNone(stand_in.current_log)
+
+    def test_cross_midnight_startup_recovers_during_second_blank_hour(self):
+        played = self.make_track()
+        future = self.make_track(duration=7200)
+        prior, items = self.make_log(FRIDAY, 23, tracks=[played, future])
+        items[0].played_at = timezone.now()
+        items[0].save(update_fields=["played_at"])
+        stand_in = make_stand_in()
+        now = self.fake_now(SATURDAY, 1, minute=15)
+
+        with patch.object(eng_module.timezone, "localtime", return_value=now):
+            stand_in._load_current_hour_log()
+
+        self.assertEqual(stand_in.current_log.id, prior.id)
+        self.assertEqual(stand_in._queue_cursor, 1)
+        self.assertEqual(
+            stand_in._current_hour_schedule_state(now)["state"],
+            "continuation",
+        )
