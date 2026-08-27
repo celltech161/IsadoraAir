@@ -7,6 +7,13 @@ from django.core.validators import EmailValidator
 from django.db import models
 from django.utils import timezone as _django_tz
 
+from monitoring.services.transmitters.registry import (
+    TRANSMITTER_BW_TX300V3,
+    TRANSMITTER_COBALT_C300,
+    TRANSMITTER_NONE,
+    transmitter_type_choices,
+)
+
 
 class MonitorCheck(models.Model):
     """One health check the monitoring poller runs every cycle — a
@@ -192,14 +199,10 @@ class MonitorCheck(models.Model):
 
 class TransmitterConfig(models.Model):
     """Singleton connection details for the selected transmitter driver."""
-    TYPE_NONE = "none"
-    TYPE_COBALT_C300 = "cobalt_c300"
-    TYPE_BW_TX300V3 = "bw_tx300v3"
-    TYPE_CHOICES = [
-        (TYPE_NONE, "None / disabled"),
-        (TYPE_COBALT_C300, "Aquabroadcast COBALT C300"),
-        (TYPE_BW_TX300V3, "BW Broadcast TX300v3"),
-    ]
+    TYPE_NONE = TRANSMITTER_NONE
+    TYPE_COBALT_C300 = TRANSMITTER_COBALT_C300
+    TYPE_BW_TX300V3 = TRANSMITTER_BW_TX300V3
+    TYPE_CHOICES = transmitter_type_choices()
 
     transmitter_type = models.CharField(
         max_length=24,

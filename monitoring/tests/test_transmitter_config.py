@@ -4,6 +4,7 @@ from django.urls import reverse
 
 from monitoring.admin import TransmitterConfigAdminForm
 from monitoring.models import TransmitterConfig
+from monitoring.services.transmitters import transmitter_type_choices
 
 
 class TransmitterConfigModelTests(TestCase):
@@ -18,6 +19,9 @@ class TransmitterConfigModelTests(TestCase):
         self.assertEqual(
             {value for value, _label in TransmitterConfig.TYPE_CHOICES},
             {"none", "cobalt_c300", "bw_tx300v3"},
+        )
+        self.assertEqual(
+            TransmitterConfig.TYPE_CHOICES, transmitter_type_choices()
         )
 
 

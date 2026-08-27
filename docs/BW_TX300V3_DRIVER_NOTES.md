@@ -12,6 +12,15 @@ reuses that connection for every supported configured check. Unsupported
 checks are omitted without affecting supported transmitter readings or any
 non-transmitter monitoring.
 
+The implementations are peers under
+`monitoring/services/transmitters/`: shared contracts live in `base.py`, each
+vendor protocol lives in its own driver module, and `registry.py` is the sole
+authority for stable type slugs, display labels, construction, and declared
+configuration capabilities. Adding a transmitter should primarily mean adding
+a driver module and one registry entry; MonitorManager and probes do not branch
+on vendor type. `cobalt_c300` remains the database migration default only to
+preserve existing installations, not because it is a canonical transmitter.
+
 `none` opens no transmitter connection and removes transmitter results from
 the live state document, which also removes the Transmitter group from the
 Monitoring dashboard.
@@ -23,6 +32,11 @@ and the `TX-V3>` prompt. The driver does not send a username. Authentication,
 command responses, and prompt waits are deadline-bounded; rejected logins and
 connections that close before a complete response raise a transmitter error.
 Passwords are never included in exceptions, logs, state JSON, or events.
+
+RFC854 option negotiation is filtered by a bounded state machine that carries
+an incomplete IAC command across TCP receive boundaries. The driver declines
+`DO` with `WONT` and `WILL` with `DONT`; Telnet control bytes never become
+password prompts or response text.
 
 The implementation sends only allowlisted `get PARAMETER` requests. It has no
 RF on/off, frequency, power, reboot, reset, RDS, alarm, or configuration-write
@@ -68,6 +82,10 @@ verified equivalent:
 | `status.indicator.rf` | normalized `metering.rf_out_status` |
 | `status.indicator.vswr` | normalized `status.VSWRLimitActive` |
 | `status.indicator.temp` | normalized `status.TempLimitActive` |
+
+Only recognized active/inactive values are translated to legacy indicator
+colors. An unfamiliar vendor state remains unavailable, so the existing probe
+reports `unknown` rather than incorrectly treating it as healthy.
 
 The COBALT fan-RPM check and RF-interlock check are explicitly unsupported on
 the TX300v3 because no equivalent semantics have been verified. They are

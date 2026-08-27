@@ -55,11 +55,12 @@ class MonitorManagerTransmitterTests(TransactionTestCase):
             "status": "ok", "detail": {"value": 250.0}
         }
         manager._current_status[check.id] = "critical"
+        factory.return_value = None
 
         results, notify = self._run(manager)
 
         self.assertEqual(results, [])
-        factory.assert_not_called()
+        factory.assert_called_once()
         notify.assert_not_called()
         self.assertNotIn(check.id, manager._last_tx_result)
         self.assertNotIn(check.id, manager._current_status)

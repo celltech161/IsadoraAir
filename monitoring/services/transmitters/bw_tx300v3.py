@@ -1,130 +1,39 @@
-"""Vendor-neutral, read-only transmitter drivers and driver factory.
-
-The monitoring poller talks only to this module.  Vendor protocol details stay
-inside the drivers, while existing COBALT MonitorCheck identifiers continue to
-work through each driver's compatibility mapping.
-"""
+"""BW Broadcast TX300v3 transmitter driver."""
 
 import math
 import socket
 import time
 
-from monitoring.services.transmitter_client import (
-    TransmitterClient,
-    TransmitterError,
-    parse_numeric,
+from monitoring.services.transmitter_client import TransmitterError, parse_numeric
+
+from .base import (
+    TransmitterConfigurationError,
+    UnsupportedTransmitterParameter,
+    compute_vswr,
 )
 
 
-TRANSMITTER_NONE = "none"
-TRANSMITTER_COBALT_C300 = "cobalt_c300"
-TRANSMITTER_BW_TX300V3 = "bw_tx300v3"
-
-
-class TransmitterConfigurationError(TransmitterError):
-    """The configured transmitter type cannot be safely constructed."""
-
-
-class UnsupportedTransmitterParameter(TransmitterError):
-    """A driver explicitly does not support a requested check/parameter."""
-
-
-CANONICAL_METRICS = (
-    "forward_power_watts",
-    "reflected_power_watts",
-    "vswr",
-    "pa_temperature_c",
-    "rf_output_state",
-    "frequency_hz",
-    "uptime_raw",
-    "power_control_state",
-    "vswr_limit_active",
-    "temperature_limit_active",
-    "fallback_active",
-    "fallback_cause",
-    "product_id",
-    "software_version",
-)
-
-
-def compute_vswr(forward_power, reflected_power):
-    """Return VSWR or ``None`` when the power readings are not physical."""
-    try:
-        forward = float(forward_power)
-        reflected = float(reflected_power)
-    except (TypeError, ValueError):
-        return None
-    if not math.isfinite(forward) or not math.isfinite(reflected):
-        return None
-    if forward <= 0 or reflected < 0 or reflected >= forward:
-        return None
-    rho = math.sqrt(reflected / forward)
-    if rho >= 1:
-        return None
-    return (1 + rho) / (1 - rho)
-
-
-class CobaltTransmitterDriver:
-    """Thin adapter around the live-proven COBALT client."""
-
-    type_slug = TRANSMITTER_COBALT_C300
-    supported_canonical_metrics = frozenset({
-        "forward_power_watts",
-        "reflected_power_watts",
-        "vswr",
-        "pa_temperature_c",
-    })
-    _CANONICAL_PARAMETERS = {
-        "forward_power_watts": "psu.fwd_power",
-        "reflected_power_watts": "psu.rev_power",
-        "vswr": "psu.vswr",
-        "pa_temperature_c": "psu.pa_temperature",
-    }
-
-    def __init__(self, host, port, timeout=3.0):
-        self._client = TransmitterClient(host, port, timeout)
-
-    def __enter__(self):
-        self._client.__enter__()
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        return self._client.__exit__(exc_type, exc, tb)
-
-    def supports_reference(self, reference):
-        # COBALT historically accepted arbitrary raw get-parameters from
-        # operator-created MonitorCheck rows.  Preserve that exact behavior.
-        return bool(reference)
-
-    def get(self, parameter):
-        return self._client.get(parameter)
-
-    def read_status(self, metrics=None):
-        requested = set(
-            self.supported_canonical_metrics if metrics is None else metrics
-        )
-        status = {}
-        for metric in requested & self.supported_canonical_metrics:
-            raw = self.get(self._CANONICAL_PARAMETERS[metric])
-            if raw is None:
-                continue
-            value = parse_numeric(raw)
-            if value is not None and math.isfinite(value):
-                status[metric] = value
-        return status
+TYPE_SLUG = "bw_tx300v3"
+DISPLAY_LABEL = "BW Broadcast TX300v3"
 
 
 class BWTx300v3Driver:
     """Password-authenticated, read-only client for the BW TX300v3.
 
-    Only the verified ``get`` parameters below are admitted.  No method in
+    Only the verified ``get`` parameters below are admitted. No method in
     this driver sends RF, configuration, reset, or other control commands.
     """
 
-    type_slug = TRANSMITTER_BW_TX300V3
+    type_slug = TYPE_SLUG
+    requires_password = True
     prompt = b"TX-V3>"
     password_prompt = b"Password:"
     max_response_bytes = 64 * 1024
+    _IAC = 255
+    _WILL = 251
+    _WONT = 252
+    _DO = 253
+    _DONT = 254
     _AUTH_FAILURE_MARKERS = (
         b"access denied",
         b"authentication failed",
@@ -180,6 +89,17 @@ class BWTx300v3Driver:
         self._sock = None
         self._buf = b""
         self._native_cache = {}
+        self._iac_state = "data"
+        self._iac_command = None
+
+    @classmethod
+    def from_config(cls, config):
+        return cls(
+            config.host,
+            config.port,
+            password=config.password,
+            timeout=config.timeout_seconds,
+        )
 
     def __enter__(self):
         try:
@@ -193,6 +113,7 @@ class BWTx300v3Driver:
             self._sock.settimeout(self.timeout)
             self._buf = b""
             self._native_cache = {}
+            self._reset_iac_state()
             self._read_until(self.password_prompt, "password prompt")
             try:
                 password_bytes = self.password.encode("ascii")
@@ -201,7 +122,9 @@ class BWTx300v3Driver:
                     "Transmitter password must contain only ASCII characters."
                 ) from None
             self._sock.sendall(password_bytes + b"\r\n")
-            self._read_until(self.prompt, "authentication response", authenticating=True)
+            self._read_until(
+                self.prompt, "authentication response", authenticating=True
+            )
             return self
         except Exception:
             self._close()
@@ -211,6 +134,10 @@ class BWTx300v3Driver:
         self._close()
         return False
 
+    def _reset_iac_state(self):
+        self._iac_state = "data"
+        self._iac_command = None
+
     def _close(self):
         if self._sock is not None:
             try:
@@ -219,22 +146,41 @@ class BWTx300v3Driver:
                 self._sock = None
                 self._buf = b""
                 self._native_cache = {}
+                self._reset_iac_state()
 
     def _strip_iac(self, data):
-        """Strip RFC854 option negotiation and decline requested options."""
+        """Filter RFC854 negotiation with bounded state across recv calls.
+
+        The state machine retains at most a command byte while waiting for an
+        option byte. The BW monitoring client declines every option it is
+        asked to perform or accept and never exposes Telnet control bytes as
+        transmitter response text.
+        """
         out = bytearray()
-        i = 0
-        while i < len(data):
-            if data[i] == 255 and i + 2 < len(data):
-                command, option = data[i + 1], data[i + 2]
-                if command == 253:  # DO
-                    self._sock.sendall(bytes([255, 252, option]))  # WONT
-                elif command == 251:  # WILL
-                    self._sock.sendall(bytes([255, 254, option]))  # DONT
-                i += 3
+        for byte in data:
+            if self._iac_state == "data":
+                if byte == self._IAC:
+                    self._iac_state = "command"
+                else:
+                    out.append(byte)
                 continue
-            out.append(data[i])
-            i += 1
+
+            if self._iac_state == "command":
+                if byte in {self._DO, self._DONT, self._WILL, self._WONT}:
+                    self._iac_command = byte
+                    self._iac_state = "option"
+                else:
+                    # Other two-byte Telnet commands (and escaped IAC) are
+                    # control traffic, not ASCII application response data.
+                    self._reset_iac_state()
+                continue
+
+            command = self._iac_command
+            if command == self._DO:
+                self._sock.sendall(bytes([self._IAC, self._WONT, byte]))
+            elif command == self._WILL:
+                self._sock.sendall(bytes([self._IAC, self._DONT, byte]))
+            self._reset_iac_state()
         return bytes(out)
 
     def _read_until(self, marker, description, *, authenticating=False):
@@ -305,6 +251,8 @@ class BWTx300v3Driver:
 
     @staticmethod
     def _legacy_binary_indicator(raw, *, active_is_fault):
+        if raw is None:
+            return None
         normalized = raw.strip().lower()
         active = {"1", "active", "enabled", "on", "true", "yes"}
         inactive = {"0", "inactive", "disabled", "off", "false", "no"}
@@ -312,7 +260,7 @@ class BWTx300v3Driver:
             return "R" if active_is_fault else "G"
         if normalized in inactive:
             return "G" if active_is_fault else "R"
-        return "0"
+        return None
 
     def get(self, parameter):
         if not self.supports_reference(parameter):
@@ -393,7 +341,11 @@ class BWTx300v3Driver:
                 value = self._numeric(raw)
             elif metric == "frequency_hz":
                 numeric = self._numeric(raw)
-                value = int(numeric) if numeric is not None and numeric.is_integer() else None
+                value = (
+                    int(numeric)
+                    if numeric is not None and numeric.is_integer()
+                    else None
+                )
             elif metric in on_off_metrics:
                 value = self._on_off(raw)
             elif metric == "rf_output_state":
@@ -413,28 +365,3 @@ class BWTx300v3Driver:
             if value is not None:
                 status["vswr"] = value
         return status
-
-
-DRIVER_REGISTRY = {
-    TRANSMITTER_COBALT_C300: CobaltTransmitterDriver,
-    TRANSMITTER_BW_TX300V3: BWTx300v3Driver,
-}
-
-
-def create_transmitter_driver(config):
-    """Build an unconnected driver for ``config`` or return None if disabled."""
-    transmitter_type = config.transmitter_type
-    if transmitter_type == TRANSMITTER_NONE:
-        return None
-    try:
-        driver_class = DRIVER_REGISTRY[transmitter_type]
-    except KeyError:
-        raise TransmitterConfigurationError(
-            f"Unsupported transmitter type {transmitter_type!r}."
-        ) from None
-    common = (config.host, config.port)
-    if transmitter_type == TRANSMITTER_BW_TX300V3:
-        return driver_class(
-            *common, password=config.password, timeout=config.timeout_seconds
-        )
-    return driver_class(*common, timeout=config.timeout_seconds)

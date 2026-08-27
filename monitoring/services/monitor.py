@@ -27,10 +27,7 @@ from monitoring.models import ListenerPeak, MonitorCheck, TransmitterConfig, emi
 from monitoring.services.notify import maybe_notify  # noqa: E402
 from monitoring.services.probes import PROBE_DISPATCH  # noqa: E402
 from monitoring.services.shoutcast import fetch_shoutcast_stats  # noqa: E402
-from monitoring.services.transmitters import (  # noqa: E402
-    TRANSMITTER_NONE,
-    create_transmitter_driver,
-)
+from monitoring.services.transmitters import create_transmitter_driver  # noqa: E402
 from isadoraair.version_info import capture_runtime_commit  # noqa: E402
 
 STATE_PATH = Path("/run/isadoraair/monitoring_state.json")
@@ -97,32 +94,33 @@ class MonitorManager:
             self._last_tx_type = tx_config.transmitter_type
 
         tx_driver = None
-        if tx_config.transmitter_type == TRANSMITTER_NONE:
+        driver_resolved = False
+        try:
+            tx_driver = create_transmitter_driver(tx_config)
+            driver_resolved = True
+        except Exception as exc:
+            # An invalid persisted type is contained to transmitter
+            # monitoring. Non-transmitter checks continue normally.
+            print(f"  [transmitter] Invalid configuration: {exc}")
+
+        if driver_resolved and tx_driver is None:
             # Disabled means absent, not failed: omit all transmitter checks
             # so the dashboard has no transmitter group and no notifications
             # are generated from intentionally unavailable hardware.
             self._clear_transmitter_state(tx_checks)
             checks = [c for c in checks if c.kind not in _TRANSMITTER_KINDS]
-        else:
-            try:
-                tx_driver = create_transmitter_driver(tx_config)
-            except Exception as exc:
-                # An invalid persisted type is contained to transmitter
-                # monitoring. Non-transmitter checks continue normally.
-                print(f"  [transmitter] Invalid configuration: {exc}")
-
-            if tx_driver is not None:
-                unsupported_ids = {
-                    check.id for check in tx_checks
-                    if not tx_driver.supports_reference(
-                        check.transmitter_parameter or check.transmitter_indicator
-                    )
-                }
-                if unsupported_ids:
-                    self._clear_transmitter_state(
-                        [check for check in tx_checks if check.id in unsupported_ids]
-                    )
-                    checks = [check for check in checks if check.id not in unsupported_ids]
+        elif tx_driver is not None:
+            unsupported_ids = {
+                check.id for check in tx_checks
+                if not tx_driver.supports_reference(
+                    check.transmitter_parameter or check.transmitter_indicator
+                )
+            }
+            if unsupported_ids:
+                self._clear_transmitter_state(
+                    [check for check in tx_checks if check.id in unsupported_ids]
+                )
+                checks = [check for check in checks if check.id not in unsupported_ids]
 
         tx_client = None
         needs_tx = any(c.kind in _TRANSMITTER_KINDS for c in checks)

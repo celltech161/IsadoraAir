@@ -10,6 +10,10 @@ from isadoraair import env_config
 
 from .models import ListenerPeak, MonitorCheck, NotificationConfig, SystemEvent, TransmitterConfig, emit_event
 from .services.notify import send_test_email
+from .services.transmitters import (
+    TransmitterConfigurationError,
+    transmitter_type_requires_password,
+)
 
 
 class TransmitterConfigAdminForm(forms.ModelForm):
@@ -34,11 +38,18 @@ class TransmitterConfigAdminForm(forms.ModelForm):
 
     def clean(self):
         cleaned = super().clean()
-        if (
-            cleaned.get("transmitter_type") == TransmitterConfig.TYPE_BW_TX300V3
-            and not cleaned.get("password")
-        ):
-            self.add_error("password", "A password is required for BW TX300v3.")
+        transmitter_type = cleaned.get("transmitter_type")
+        try:
+            password_required = (
+                transmitter_type
+                and transmitter_type_requires_password(transmitter_type)
+            )
+        except TransmitterConfigurationError:
+            password_required = False
+        if password_required and not cleaned.get("password"):
+            self.add_error(
+                "password", "A password is required for this transmitter driver."
+            )
         return cleaned
 
 

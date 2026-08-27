@@ -10,6 +10,7 @@ from monitoring.services.transmitters import (
     CobaltTransmitterDriver,
     DRIVER_REGISTRY,
     TransmitterConfigurationError,
+    TransmitterDriverRegistration,
     UnsupportedTransmitterParameter,
     compute_vswr,
     create_transmitter_driver,
@@ -44,16 +45,15 @@ class FakeSocket:
 class BWProtocolTests(SimpleTestCase):
     password = "test-only-placeholder"
 
-    def _connect(self, response_chunks):
-        sock = FakeSocket([
+    def _connect(self, response_chunks, *, login_chunks=None):
+        sock = FakeSocket((login_chunks or [
             b"BW Broadcast TX300v3\r\nPass",
             b"word:",
             b"\r\nTX-",
             b"V3>",
-            *response_chunks,
-        ])
+        ]) + response_chunks)
         patcher = patch(
-            "monitoring.services.transmitters.socket.create_connection",
+            "monitoring.services.transmitters.bw_tx300v3.socket.create_connection",
             return_value=sock,
         )
         create_connection = patcher.start()
@@ -73,6 +73,91 @@ class BWProtocolTests(SimpleTestCase):
             ("203.0.113.10", 23), timeout=1.0
         )
         self.assertEqual(sock.sent, [self.password.encode("ascii") + b"\r\n"])
+
+    def test_iac_then_do_option_split_across_recv_boundaries(self):
+        driver, sock, _create_connection = self._connect(
+            [],
+            login_chunks=[
+                b"Banner before negotiation\xff",
+                b"\xfd\x18Password:",
+                b"\r\nTX-V3>",
+            ],
+        )
+
+        self.assertIsInstance(driver, BWTx300v3Driver)
+        self.assertEqual(
+            sock.sent,
+            [b"\xff\xfc\x18", self.password.encode("ascii") + b"\r\n"],
+        )
+        self.assertNotIn(b"\xff", driver._buf)
+
+    def test_iac_do_then_option_split_across_recv_boundaries(self):
+        driver, sock, _create_connection = self._connect(
+            [],
+            login_chunks=[
+                b"Banner before negotiation\xff\xfd",
+                b"\x18Password:",
+                b"\r\nTX-V3>",
+            ],
+        )
+
+        self.assertIsInstance(driver, BWTx300v3Driver)
+        self.assertEqual(
+            sock.sent,
+            [b"\xff\xfc\x18", self.password.encode("ascii") + b"\r\n"],
+        )
+        self.assertNotIn(b"\xff", driver._buf)
+
+    def test_iac_will_then_option_split_sends_dont_and_preserves_prompt(self):
+        driver, sock, _create_connection = self._connect(
+            [],
+            login_chunks=[
+                b"\xff\xfb",
+                b"\x01Password:",
+                b"\r\nTX-V3>",
+            ],
+        )
+
+        self.assertIsInstance(driver, BWTx300v3Driver)
+        self.assertEqual(
+            sock.sent,
+            [b"\xff\xfe\x01", self.password.encode("ascii") + b"\r\n"],
+        )
+        self.assertNotIn(b"\xff", driver._buf)
+
+    def test_split_iac_filter_preserves_only_surrounding_application_data(self):
+        driver = BWTx300v3Driver(
+            "203.0.113.10", 23, self.password, timeout=1.0
+        )
+        sock = FakeSocket([])
+        driver._sock = sock
+
+        filtered = (
+            driver._strip_iac(b"Banner\xff")
+            + driver._strip_iac(b"\xfd")
+            + driver._strip_iac(b"\x18Password:")
+        )
+
+        self.assertEqual(filtered, b"BannerPassword:")
+        self.assertNotIn(b"\xff", filtered)
+        self.assertEqual(sock.sent, [b"\xff\xfc\x18"])
+
+    def test_early_close_with_incomplete_iac_still_fails_and_closes(self):
+        sock = FakeSocket([b"Banner\xff", b""])
+        with patch(
+            "monitoring.services.transmitters.bw_tx300v3.socket.create_connection",
+            return_value=sock,
+        ):
+            driver = BWTx300v3Driver(
+                "203.0.113.10", 23, self.password, timeout=1.0
+            )
+            with self.assertRaisesMessage(
+                TransmitterError, "closed the connection"
+            ):
+                driver.__enter__()
+
+        self.assertTrue(sock.closed)
+        self.assertEqual(driver._iac_state, "data")
 
     def test_repeated_get_calls_reuse_one_connection(self):
         driver, sock, create_connection = self._connect([
@@ -100,7 +185,7 @@ class BWProtocolTests(SimpleTestCase):
     def test_rejected_login_without_final_prompt_fails_immediately(self):
         sock = FakeSocket([b"Password:", b"Login incorrect\r\n"])
         with patch(
-            "monitoring.services.transmitters.socket.create_connection",
+            "monitoring.services.transmitters.bw_tx300v3.socket.create_connection",
             return_value=sock,
         ):
             driver = BWTx300v3Driver(
@@ -115,7 +200,7 @@ class BWProtocolTests(SimpleTestCase):
     def test_password_never_appears_in_authentication_error(self):
         sock = FakeSocket([b"Password:", b"Access denied\r\n"])
         with patch(
-            "monitoring.services.transmitters.socket.create_connection",
+            "monitoring.services.transmitters.bw_tx300v3.socket.create_connection",
             return_value=sock,
         ):
             driver = BWTx300v3Driver(
@@ -125,7 +210,7 @@ class BWProtocolTests(SimpleTestCase):
                 driver.__enter__()
         self.assertNotIn(self.password, str(context.exception))
 
-    @patch("monitoring.services.transmitters.socket.create_connection")
+    @patch("monitoring.services.transmitters.bw_tx300v3.socket.create_connection")
     def test_missing_password_fails_before_opening_socket(self, create_connection):
         driver = BWTx300v3Driver("203.0.113.10", 23, "", timeout=1.0)
 
@@ -148,7 +233,7 @@ class BWProtocolTests(SimpleTestCase):
         )
         driver._sock = FakeSocket([socket.timeout()])
         with patch(
-            "monitoring.services.transmitters.time.monotonic",
+            "monitoring.services.transmitters.bw_tx300v3.time.monotonic",
             side_effect=[0.0, 0.0, 2.0],
         ):
             with self.assertRaisesMessage(TransmitterError, "Timed out"):
@@ -242,17 +327,30 @@ class BWTelemetryTests(SimpleTestCase):
                 self.assertIsNone(compute_vswr(forward, reflected))
 
     def test_legacy_indicator_mapping_preserves_existing_fault_values(self):
-        values = {
-            "metering.rf_out_status": "on",
-            "status.VSWRLimitActive": "on",
-            "status.TempLimitActive": "off",
-        }
-        with patch.object(
-            self.driver, "_get_native", side_effect=lambda name: values[name]
+        cases = (
+            ("status.indicator.rf", "on", "G"),
+            ("status.indicator.rf", "off", "R"),
+            ("status.indicator.vswr", "on", "R"),
+            ("status.indicator.vswr", "off", "G"),
+            ("status.indicator.temp", "on", "R"),
+            ("status.indicator.temp", "off", "G"),
+        )
+        for reference, raw, expected in cases:
+            with self.subTest(reference=reference, raw=raw):
+                with patch.object(self.driver, "_get_native", return_value=raw):
+                    self.assertEqual(self.driver.get(reference), expected)
+
+    def test_unfamiliar_legacy_indicator_values_remain_unavailable(self):
+        for reference in (
+            "status.indicator.rf",
+            "status.indicator.vswr",
+            "status.indicator.temp",
         ):
-            self.assertEqual(self.driver.get("status.indicator.rf"), "G")
-            self.assertEqual(self.driver.get("status.indicator.vswr"), "R")
-            self.assertEqual(self.driver.get("status.indicator.temp"), "G")
+            with self.subTest(reference=reference):
+                with patch.object(
+                    self.driver, "_get_native", return_value="fault?"
+                ):
+                    self.assertIsNone(self.driver.get(reference))
 
     def test_unknown_bw_fan_units_are_not_mapped_to_legacy_rpm(self):
         self.assertFalse(
@@ -282,7 +380,7 @@ class TransmitterFactoryTests(SimpleTestCase):
             timeout_seconds=2.5,
         )
 
-    @patch("monitoring.services.transmitters.socket.create_connection")
+    @patch("monitoring.services.transmitters.bw_tx300v3.socket.create_connection")
     def test_none_selects_no_driver_and_opens_no_connection(self, connect):
         self.assertIsNone(create_transmitter_driver(self._config("none")))
         connect.assert_not_called()
@@ -298,34 +396,29 @@ class TransmitterFactoryTests(SimpleTestCase):
         self.assertIsInstance(driver, BWTx300v3Driver)
         self.assertEqual(driver.password, "test-only-placeholder")
 
-    def test_factory_passes_password_only_to_bw_constructor(self):
-        cobalt_constructor = MagicMock(return_value=object())
-        bw_constructor = MagicMock(return_value=object())
+    def test_factory_delegates_construction_to_registered_driver(self):
+        future_driver = MagicMock()
+        built_driver = object()
+        future_driver.from_config.return_value = built_driver
         with patch.dict(
             DRIVER_REGISTRY,
             {
-                "cobalt_c300": cobalt_constructor,
-                "bw_tx300v3": bw_constructor,
+                "future_tx": TransmitterDriverRegistration(
+                    "future_tx", "Future transmitter", future_driver
+                ),
             },
+            clear=True,
         ):
-            create_transmitter_driver(self._config("cobalt_c300"))
-            create_transmitter_driver(self._config("bw_tx300v3"))
+            config = self._config("future_tx")
+            self.assertIs(create_transmitter_driver(config), built_driver)
 
-        cobalt_constructor.assert_called_once_with(
-            "203.0.113.10", 23, timeout=2.5
-        )
-        bw_constructor.assert_called_once_with(
-            "203.0.113.10",
-            23,
-            password="test-only-placeholder",
-            timeout=2.5,
-        )
+        future_driver.from_config.assert_called_once_with(config)
 
     def test_unrecognized_type_fails_safely(self):
         with self.assertRaises(TransmitterConfigurationError):
             create_transmitter_driver(self._config("unknown-vendor"))
 
-    @patch("monitoring.services.transmitters.TransmitterClient")
+    @patch("monitoring.services.transmitters.cobalt.TransmitterClient")
     def test_cobalt_adapter_delegates_to_existing_client_unchanged(self, client_cls):
         client = MagicMock()
         client.get.return_value = "249.42 W"
