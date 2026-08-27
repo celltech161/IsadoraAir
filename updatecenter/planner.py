@@ -74,6 +74,27 @@ class SafetyStatus:
     # does not account for. Never silently ignored, never auto-applied
     # -- a hard stop, same tier as CROSS_CHECK_FAILED.
     SCHEMA_DRIFT_DETECTED = "schema_drift_detected"
+    # Real KOGR r0008->r0009 incident: release_chain.resolve_installed_
+    # release() deliberately uses ANCESTRY (release commit == HEAD, or
+    # is an ancestor of HEAD) -- useful for informational "which release
+    # is this checkout descended from" callers, but the protected
+    # updater's own executor requires HEAD to be EXACTLY the resolved
+    # release's canonical commit ("live HEAD must exactly equal one
+    # independently resolved release commit" -- deploy/updater_runtime/
+    # isadoraair_updater/release.py's derive_plan()). A checkout merely
+    # descended from a release commit (unreleased commits landed after
+    # it, before the next release manifest) was offered a valid-looking
+    # Install button here and then correctly rejected by the protected
+    # executor -- an operator must never see an actionable plan the
+    # root-side executor is guaranteed to refuse. This status fires
+    # when the ancestry-resolved installed release's canonical commit
+    # does not equal live HEAD -- checked BEFORE UP_TO_DATE/READY_TO_
+    # PLAN determination, so it correctly blocks both "an older release
+    # is an ancestor of HEAD" and "the latest release is an ancestor of
+    # HEAD" (the latter would otherwise wrongly report UP_TO_DATE).
+    # Detection/refusal only -- this status never resets, checks out,
+    # pulls, or merges anything.
+    CHECKOUT_NOT_AT_RELEASE_COMMIT = "checkout_not_at_release_commit"
 
     # States in this set are the only ones where an operator could ever
     # eventually click an Update button (Phase B) -- every other state
@@ -423,6 +444,33 @@ def build_plan(checkout_root, releases_dirname: str = release_chain.RELEASES_DIR
             SafetyStatus.SCHEMA_DRIFT_DETECTED,
             "The database is not synchronized with the CURRENTLY installed Django source; "
             "a future release plan cannot make current schema drift healthy." + pending_detail,
+            schema_health,
+            installed_release_id=installed.manifest.release_id, installed_commit=installed_commit,
+        )
+
+    # Real KOGR incident boundary -- see SafetyStatus.CHECKOUT_NOT_AT_
+    # RELEASE_COMMIT's own docstring. resolve_installed_release() above
+    # deliberately allows HEAD to be an ANCESTOR of a release commit's
+    # ancestor (i.e. the release commit is an ancestor of HEAD) for
+    # informational "which release is this descended from" purposes --
+    # but execution eligibility requires HEAD to equal that release's
+    # canonical commit EXACTLY. Checked here, before UP_TO_DATE/READY_
+    # TO_PLAN are determined, so it correctly blocks both directions:
+    # an unreleased descendant of an OLDER release (would otherwise
+    # wrongly proceed to READY_TO_PLAN) and an unreleased descendant of
+    # the LATEST release (would otherwise wrongly report UP_TO_DATE --
+    # "latest release is an ancestor of HEAD" is not the same claim as
+    # "checkout is exactly on the latest released source").
+    if head_sha != installed_commit:
+        return _safe(
+            SafetyStatus.CHECKOUT_NOT_AT_RELEASE_COMMIT,
+            f"Checkout HEAD {head_sha[:12]} is not the exact canonical commit "
+            f"{installed_commit[:12]} for the inferred installed release "
+            f"{installed.manifest.release_id!r} -- it is a descendant, not that "
+            "exact release commit. Protected updates require the live checkout "
+            "to be positioned exactly at a release commit; this is a detection-"
+            "only refusal and Update Center will not reposition the checkout "
+            "automatically.",
             schema_health,
             installed_release_id=installed.manifest.release_id, installed_commit=installed_commit,
         )

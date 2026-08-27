@@ -105,6 +105,64 @@ literal filesystem `deploy/releases/*.json` on disk. (The disk-based
 `manage.py validate_release_manifests`'s default mode — validating a
 manifest a human is authoring, before it's ever committed.)
 
+## Installed-release identification: ancestry vs. exact-commit execution eligibility
+
+**Real incident, KOGR r0008→r0009**: the live checkout's HEAD was a
+descendant of canonical r0008 (some ordinary, unreleased commits had
+landed on top of it before r0009 was cut) rather than r0008's own
+canonical commit. `release_chain.resolve_installed_release()`
+correctly identified "installed = r0008" via **ancestry** (release
+commit == HEAD, or an ancestor of HEAD) and `build_plan()` offered a
+valid-looking Install button for r0008→r0009. After confirmation, the
+protected updater's `derive_plan()` correctly refused: *"live HEAD
+must exactly equal one independently resolved release commit"* — its
+own exact-match rule, unrelated to and stricter than the Django
+planner's ancestry-based identification. Only after the checkout was
+manually repositioned to r0008's exact canonical commit did the same
+update succeed normally.
+
+The fix (`SafetyStatus.CHECKOUT_NOT_AT_RELEASE_COMMIT`): `build_plan()`
+now compares `head_sha` against the inferred installed release's
+canonical commit *after* ancestry resolution but *before* deciding
+`UP_TO_DATE`/`READY_TO_PLAN`. A mismatch refuses with this distinct
+status — never implying corruption, an unknown release, git
+divergence, or a dirty tree, and never repositioning the checkout
+automatically (detection/refusal only). This closes both directions
+ancestry-only resolution could get wrong: an unreleased descendant of
+an *older* release (would otherwise wrongly proceed to
+`READY_TO_PLAN`) and an unreleased descendant of the *latest* release
+(would otherwise wrongly report `UP_TO_DATE` — "the latest release is
+an ancestor of HEAD" is not the same claim as "the checkout is exactly
+on the latest released source").
+
+**The two concepts stay distinct, on purpose:**
+
+```
+ANCESTRY-BASED IDENTIFICATION   <- "which release is this checkout descended
+                                    from" -- informational, used to build the
+                                    release-chain diagnosis in the first place
+EXACT-COMMIT ELIGIBILITY        <- "can the protected executor actually
+                                    install from here" -- HEAD must equal
+                                    that release's own canonical commit,
+                                    nothing looser
+```
+
+**Multi-release catch-up is unaffected.** This rule applies only to
+the *current* installed boundary, not to every intermediate release in
+between: a station whose HEAD is *exactly* an older release's
+canonical commit (e.g. exactly r0007) can still aggregate straight to
+a later target (e.g. r0007→r0008→r0009 in one plan) — see
+`MultiReleaseAggregateTests`/`CheckoutNotAtReleaseCommitTests` in
+`updatecenter/tests/test_planner.py`. Nothing about this fix requires
+stepping through and checking out every intermediate release.
+
+The protected updater's own exact-match check
+(`deploy/updater_runtime/isadoraair_updater/release.py`'s
+`derive_plan()`) remains the authoritative root-side safety boundary,
+unchanged by this fix — this Django-side check is defense-in-depth/
+operator correctness (the operator should never be offered a plan the
+root executor is guaranteed to reject), not a replacement for it.
+
 ## Migration policy — the core guarantee (CORRECTED 2026-08-23)
 
 **This section was corrected after a real production incident.** The

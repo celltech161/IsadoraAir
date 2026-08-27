@@ -61,9 +61,10 @@ def _operator_plan(**changes):
 def _write_bootstrap_manifest(repo):
     releases_dir = repo.work / "deploy" / "releases"
     releases_dir.mkdir(parents=True, exist_ok=True)
+    bootstrap_sha = repo.rev_parse("HEAD")
     data = {
         "schema_version": 1, "release_id": "r0001", "previous_release_id": None,
-        "bootstrap_commit": repo.rev_parse("HEAD"), "minimum_updater_protocol_version": 1,
+        "bootstrap_commit": bootstrap_sha, "minimum_updater_protocol_version": 1,
         "summary": "test", "migrations_required": [], "migration_compatibility": None,
         "python_requirements_changed": False, "requirements_sha256": None,
         "apt_packages_new": [], "systemd_units_changed": [], "systemd_units_new_required": [],
@@ -73,6 +74,13 @@ def _write_bootstrap_manifest(repo):
     }
     (releases_dir / "r0001.json").write_text(json.dumps(data), encoding="utf-8")
     repo.commit("add bootstrap manifest", push=True)
+    # [checkout-not-at-release-commit correction] HEAD must land back
+    # on the TRUE bootstrap_commit -- the commit that introduces
+    # r0001.json is necessarily one commit later (manifest.py forbids
+    # the two from being the same commit), so without this reset HEAD
+    # is a mere descendant of the bootstrap release's own canonical
+    # identity, not "installed exactly at r0001."
+    repo.reset_local_to(bootstrap_sha)
     return releases_dir
 
 

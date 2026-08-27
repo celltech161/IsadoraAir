@@ -132,8 +132,16 @@ class NoUpdateTests(TestCase):
     def test_up_to_date_when_head_is_bootstrap(self):
         with FakeRepo() as repo:
             releases_dir = repo.work / "deploy" / "releases"
-            _write_manifest(releases_dir, _bootstrap(repo.rev_parse("HEAD")))
+            bootstrap_sha = repo.rev_parse("HEAD")
+            _write_manifest(releases_dir, _bootstrap(bootstrap_sha))
             repo.commit("add manifest", push=True)
+            # [checkout-not-at-release-commit correction] HEAD must be
+            # reset back to the TRUE bootstrap_commit -- the commit
+            # that introduces r0001.json is necessarily one commit
+            # later (manifest.py forbids the two from being the same
+            # commit), so without this reset HEAD is a mere descendant
+            # of the bootstrap release's own canonical identity.
+            repo.reset_local_to(bootstrap_sha)
             plan = planner.build_plan(repo.work, "deploy/releases")
             self.assertEqual(plan.safety_status, planner.SafetyStatus.UP_TO_DATE)
             self.assertEqual(plan.installed_release_id, "r0001")
@@ -169,14 +177,26 @@ class ValidUpdateTests(TestCase):
         releases_dir = repo.work / "deploy" / "releases"
         bootstrap_sha = repo.rev_parse("HEAD")
         _write_manifest(releases_dir, _bootstrap(bootstrap_sha))
-        after_bootstrap_sha = repo.commit("add bootstrap manifest", push=True)
+        repo.commit("add bootstrap manifest", push=True)
 
         overrides = followup_overrides or {}
         _write_manifest(releases_dir, _followup(followup_release_id, "r0001", **overrides))
         for relative_path, content in (extra_files or {}).items():
             repo.write(relative_path, content)
         repo.commit("add r0002" + (" + accompanying files" if extra_files else ""), push=True)
-        repo.reset_local_to(after_bootstrap_sha)
+        # [checkout-not-at-release-commit correction] Reset to the TRUE
+        # bootstrap_commit (bootstrap_sha), not the commit that merely
+        # introduces r0001.json -- manifest.py's own validation forbids
+        # bootstrap_commit from ever equaling that introducing commit
+        # (a real bootstrap release's manifest ALWAYS lives in a LATER
+        # commit than the immutable pre-manifest-era baseline it
+        # names), so "installed exactly at the bootstrap release" can
+        # only ever mean HEAD == bootstrap_sha. Resetting to the
+        # manifest-introducing commit instead (the previous bug here)
+        # left HEAD one commit descended from the bootstrap release's
+        # own canonical identity -- exactly the KOGR incident's failure
+        # shape, just latent in this fixture instead of a real station.
+        repo.reset_local_to(bootstrap_sha)
         return repo, releases_dir, bootstrap_sha
 
     def test_one_step_update_ready_to_plan(self):
@@ -340,8 +360,9 @@ class MultiReleaseAggregateTests(TestCase):
     def test_skip_several_releases_aggregates_all(self):
         with FakeRepo() as repo:
             releases_dir = repo.work / "deploy" / "releases"
-            _write_manifest(releases_dir, _bootstrap(repo.rev_parse("HEAD")))
-            after_bootstrap_sha = repo.commit("bootstrap", push=True)
+            bootstrap_sha = repo.rev_parse("HEAD")
+            _write_manifest(releases_dir, _bootstrap(bootstrap_sha))
+            repo.commit("bootstrap", push=True)
 
             _write_manifest(releases_dir, _followup("r0002", "r0001", services_requiring_restart=["isadoraair-engine"]))
             repo.commit("r0002", push=True)
@@ -358,8 +379,11 @@ class MultiReleaseAggregateTests(TestCase):
             # Simulate a station currently on r0001 (only) -- r0002-4
             # exist in history (already pushed to origin) but were
             # never checked out here, exactly like a real station
-            # behind on releases after a fetch but no checkout.
-            repo.reset_local_to(after_bootstrap_sha)
+            # behind on releases after a fetch but no checkout. Must be
+            # the TRUE bootstrap_commit, not merely the commit that
+            # introduces r0001.json -- see _two_release_repo's own
+            # comment on this same correction.
+            repo.reset_local_to(bootstrap_sha)
 
             plan = planner.build_plan(repo.work, "deploy/releases")
             self.assertEqual(plan.safety_status, planner.SafetyStatus.READY_TO_PLAN)
@@ -416,8 +440,9 @@ class MultiReleaseAggregateTests(TestCase):
     def test_minimum_supported_release_blocks_too_old_station(self):
         with FakeRepo() as repo:
             releases_dir = repo.work / "deploy" / "releases"
-            _write_manifest(releases_dir, _bootstrap(repo.rev_parse("HEAD")))
-            after_bootstrap_sha = repo.commit("bootstrap", push=True)
+            bootstrap_sha = repo.rev_parse("HEAD")
+            _write_manifest(releases_dir, _bootstrap(bootstrap_sha))
+            repo.commit("bootstrap", push=True)
             _write_manifest(releases_dir, _followup("r0002", "r0001"))
             repo.commit("r0002", push=True)
             _write_manifest(
@@ -425,7 +450,7 @@ class MultiReleaseAggregateTests(TestCase):
                 _followup("r0003", "r0002", minimum_supported_release_id="r0002"),
             )
             repo.commit("r0003", push=True)
-            repo.reset_local_to(after_bootstrap_sha)
+            repo.reset_local_to(bootstrap_sha)
 
             plan = planner.build_plan(repo.work, "deploy/releases")
             self.assertEqual(
@@ -504,10 +529,11 @@ class BootstrapSchemaExpectationTests(TestCase):
         Phase A must include only r0002's transition migration."""
         with FakeRepo() as repo:
             releases_dir = repo.work / "deploy" / "releases"
+            bootstrap_sha = repo.rev_parse("HEAD")
             _write_manifest(
                 releases_dir,
                 _bootstrap(
-                    repo.rev_parse("HEAD"),
+                    bootstrap_sha,
                     migrations_required=[
                         "tts.0001_initial",
                         "road_conditions.0010_roadconditionsconfiguration_tts",
@@ -517,7 +543,7 @@ class BootstrapSchemaExpectationTests(TestCase):
                     migration_compatibility="additive",
                 ),
             )
-            installed_sha = repo.commit("r0001", push=True)
+            repo.commit("r0001", push=True)
             _write_manifest(
                 releases_dir,
                 _followup(
@@ -530,7 +556,7 @@ class BootstrapSchemaExpectationTests(TestCase):
             )
             repo.write("updatecenter/migrations/0001_initial.py", "# phase A migration\n")
             repo.commit("r0002", push=True)
-            repo.reset_local_to(installed_sha)
+            repo.reset_local_to(bootstrap_sha)
 
             plan = planner.build_plan(repo.work, "deploy/releases")
             self.assertEqual(plan.safety_status, planner.SafetyStatus.READY_TO_PLAN)
@@ -604,15 +630,16 @@ class MigrationAggregationTests(TestCase):
         ever appear."""
         with FakeRepo() as repo:
             releases_dir = repo.work / "deploy" / "releases"
-            _write_manifest(releases_dir, _bootstrap(repo.rev_parse("HEAD")))
-            after_bootstrap_sha = repo.commit("bootstrap", push=True)
+            bootstrap_sha = repo.rev_parse("HEAD")
+            _write_manifest(releases_dir, _bootstrap(bootstrap_sha))
+            repo.commit("bootstrap", push=True)
             _write_manifest(releases_dir, _followup(
                 "r0002", "r0001",
                 migrations_required=["library.0079_mediaplaybackincident"], migration_compatibility="additive",
             ))
             repo.write("library/migrations/0079_mediaplaybackincident.py", "# migration\n")
             repo.commit("r0002", push=True)
-            repo.reset_local_to(after_bootstrap_sha)
+            repo.reset_local_to(bootstrap_sha)
 
             plan = planner.build_plan(repo.work, "deploy/releases")
             self.assertEqual(plan.safety_status, planner.SafetyStatus.READY_TO_PLAN)
@@ -633,8 +660,9 @@ class MigrationAggregationTests(TestCase):
         actually being consulted, not bypassed."""
         with FakeRepo() as repo:
             releases_dir = repo.work / "deploy" / "releases"
-            _write_manifest(releases_dir, _bootstrap(repo.rev_parse("HEAD")))
-            after_bootstrap_sha = repo.commit("bootstrap", push=True)
+            bootstrap_sha = repo.rev_parse("HEAD")
+            _write_manifest(releases_dir, _bootstrap(bootstrap_sha))
+            repo.commit("bootstrap", push=True)
             _write_manifest(releases_dir, _followup(
                 "r0002", "r0001",
                 migrations_required=["road_conditions.0010_roadconditionsconfiguration_tts"],
@@ -642,7 +670,7 @@ class MigrationAggregationTests(TestCase):
             ))
             repo.write("road_conditions/migrations/0010_roadconditionsconfiguration_tts.py", "# migration\n")
             repo.commit("r0002", push=True)
-            repo.reset_local_to(after_bootstrap_sha)
+            repo.reset_local_to(bootstrap_sha)
 
             plan = planner.build_plan(repo.work, "deploy/releases")
             self.assertEqual(plan.safety_status, planner.SafetyStatus.READY_TO_PLAN)
@@ -662,15 +690,16 @@ class MigrationAggregationTests(TestCase):
         SchemaDriftDetectionTests below), not this one."""
         with FakeRepo() as repo:
             releases_dir = repo.work / "deploy" / "releases"
-            _write_manifest(releases_dir, _bootstrap(repo.rev_parse("HEAD")))
-            after_bootstrap_sha = repo.commit("bootstrap", push=True)
+            bootstrap_sha = repo.rev_parse("HEAD")
+            _write_manifest(releases_dir, _bootstrap(bootstrap_sha))
+            repo.commit("bootstrap", push=True)
             _write_manifest(releases_dir, _followup(
                 "r0002", "r0001",
                 migrations_required=["library.0079_mediaplaybackincident"], migration_compatibility="additive",
             ))
             repo.write("library/migrations/0079_mediaplaybackincident.py", "# migration\n")
             repo.commit("r0002", push=True)
-            repo.reset_local_to(after_bootstrap_sha)
+            repo.reset_local_to(bootstrap_sha)
 
             plan = planner.build_plan(repo.work, "deploy/releases")
             self.assertEqual(plan.safety_status, planner.SafetyStatus.READY_TO_PLAN)
@@ -774,8 +803,10 @@ class SchemaDriftDetectionTests(TestCase):
         database is (as normal) fully migrated."""
         with FakeRepo() as repo:
             releases_dir = repo.work / "deploy" / "releases"
-            _write_manifest(releases_dir, _bootstrap(repo.rev_parse("HEAD")))
+            bootstrap_sha = repo.rev_parse("HEAD")
+            _write_manifest(releases_dir, _bootstrap(bootstrap_sha))
             repo.commit("bootstrap", push=True)
+            repo.reset_local_to(bootstrap_sha)
             plan = planner.build_plan(repo.work, "deploy/releases")
             self.assertEqual(plan.safety_status, planner.SafetyStatus.UP_TO_DATE)
             self.assertEqual(plan.schema_health_status, schema_health.SchemaHealthStatus.SCHEMA_CURRENT)
@@ -810,3 +841,125 @@ class FeatureActivationRemainsSeparateFromSchemaTests(TestCase):
         that anything populates or reads it yet."""
         from weather.models import WeatherVoicePersona
         self.assertEqual(WeatherVoicePersona.objects.count(), 0)
+
+
+class CheckoutNotAtReleaseCommitTests(TestCase):
+    """fix/updatecenter-active-job-presentation, second r0010 fix --
+    real KOGR r0008->r0009 incident: resolve_installed_release()
+    deliberately uses ANCESTRY (release commit == HEAD, or an ancestor
+    of HEAD) for informational "which release is this descended from"
+    purposes, but the protected updater's own executor requires HEAD
+    to equal that release's canonical commit EXACTLY ("live HEAD must
+    exactly equal one independently resolved release commit" --
+    deploy/updater_runtime/isadoraair_updater/release.py's
+    derive_plan()). Before this fix, a checkout merely descended from
+    a release commit was offered a valid-looking Install button here
+    and then correctly rejected by the protected executor after
+    confirmation -- exactly what happened on KOGR. These tests prove
+    build_plan() now refuses BEFORE offering that plan, in both
+    directions ancestry-only resolution can go wrong."""
+
+    def test_head_is_unreleased_descendant_of_older_release_with_newer_available(self):
+        """Synthesizes the real incident topology as closely as
+        practical:
+
+            canonical r0002 ("r0008")
+               |
+            unreleased descendant commit (live HEAD)
+               |
+            later commit
+               |
+            canonical r0003 ("r0009" / origin branch tip)
+
+        The descendant commit is pushed (part of accepted origin
+        history) before local HEAD is reset back to it -- reaching
+        THIS gate rather than being intercepted by
+        LOCAL_COMMITS_NOT_ON_ORIGIN/DIVERGED_FROM_ORIGIN."""
+        with FakeRepo() as repo:
+            releases_dir = repo.work / "deploy" / "releases"
+            _write_manifest(releases_dir, _bootstrap(repo.rev_parse("HEAD")))
+            repo.commit("bootstrap", push=True)
+
+            _write_manifest(releases_dir, _followup("r0002", "r0001"))
+            r0002_canonical_sha = repo.commit("r0002", push=True)
+
+            repo.write("unreleased-change.txt", "ordinary dev work\n")
+            descendant_sha = repo.commit("ordinary unreleased commit", push=True)
+
+            repo.write("more-unreleased-work.txt", "still developing\n")
+            repo.commit("another unreleased commit", push=True)
+
+            _write_manifest(releases_dir, _followup("r0003", "r0002"))
+            repo.commit("r0003", push=True)
+
+            repo.reset_local_to(descendant_sha)
+
+            plan = planner.build_plan(repo.work, "deploy/releases")
+            self.assertEqual(plan.safety_status, planner.SafetyStatus.CHECKOUT_NOT_AT_RELEASE_COMMIT)
+            self.assertNotIn(plan.safety_status, planner.SafetyStatus.ACTIONABLE)
+            self.assertNotEqual(plan.safety_status, planner.SafetyStatus.READY_TO_PLAN)
+            # Diagnostic fields retained: which release ancestry inferred,
+            # and that release's real canonical commit -- NOT live HEAD.
+            self.assertEqual(plan.installed_release_id, "r0002")
+            self.assertEqual(plan.installed_commit, r0002_canonical_sha)
+            self.assertNotEqual(plan.installed_commit, descendant_sha)
+            # No install eligibility whatsoever.
+            self.assertIsNone(plan.target_release_id)
+            self.assertIsNone(plan.target_commit)
+            self.assertEqual(plan.releases_in_plan, ())
+            # Operator-facing detail names both the real HEAD and the
+            # canonical commit it's not equal to, and the inferred
+            # release -- without implying corruption/divergence/an
+            # unknown release/a dirty tree/automatic repair.
+            self.assertIn(descendant_sha[:12], plan.safety_detail)
+            self.assertIn(r0002_canonical_sha[:12], plan.safety_detail)
+            self.assertIn("r0002", plan.safety_detail)
+            for wrong_word in ("corrupt", "unknown release", "diverged", "dirty"):
+                self.assertNotIn(wrong_word, plan.safety_detail.lower())
+
+    def test_head_is_unreleased_descendant_of_latest_release_is_not_up_to_date(self):
+        """The other direction: HEAD descends from the LATEST known
+        release but isn't exactly that commit. "Latest release is an
+        ancestor of HEAD" must not be conflated with "checkout is
+        exactly on the latest released source" -- this must NOT read
+        as UP_TO_DATE."""
+        with FakeRepo() as repo:
+            releases_dir = repo.work / "deploy" / "releases"
+            _write_manifest(releases_dir, _bootstrap(repo.rev_parse("HEAD")))
+            repo.commit("bootstrap", push=True)
+
+            _write_manifest(releases_dir, _followup("r0002", "r0001"))
+            r0002_canonical_sha = repo.commit("r0002", push=True)
+
+            repo.write("unreleased-change.txt", "ordinary dev work after the latest release\n")
+            descendant_sha = repo.commit("ordinary unreleased commit after latest release", push=True)
+
+            repo.reset_local_to(descendant_sha)
+
+            plan = planner.build_plan(repo.work, "deploy/releases")
+            self.assertEqual(plan.safety_status, planner.SafetyStatus.CHECKOUT_NOT_AT_RELEASE_COMMIT)
+            self.assertNotEqual(plan.safety_status, planner.SafetyStatus.UP_TO_DATE)
+            self.assertEqual(plan.installed_release_id, "r0002")
+            self.assertEqual(plan.installed_commit, r0002_canonical_sha)
+
+    def test_exact_head_at_latest_non_bootstrap_release_still_up_to_date(self):
+        """Regression guard for the fix itself: an EXACT match at the
+        latest release in a real multi-release chain (not just the
+        single-release bootstrap-only case other UP_TO_DATE tests
+        cover) must still report UP_TO_DATE, unaffected by this
+        correction."""
+        with FakeRepo() as repo:
+            releases_dir = repo.work / "deploy" / "releases"
+            _write_manifest(releases_dir, _bootstrap(repo.rev_parse("HEAD")))
+            repo.commit("bootstrap", push=True)
+
+            _write_manifest(releases_dir, _followup("r0002", "r0001"))
+            r0002_canonical_sha = repo.commit("r0002", push=True)
+            # HEAD is already exactly r0002's canonical commit -- no
+            # reset needed.
+
+            plan = planner.build_plan(repo.work, "deploy/releases")
+            self.assertEqual(plan.safety_status, planner.SafetyStatus.UP_TO_DATE)
+            self.assertEqual(plan.installed_release_id, "r0002")
+            self.assertEqual(plan.installed_commit, r0002_canonical_sha)
+            self.assertEqual(plan.target_release_id, "r0002")
