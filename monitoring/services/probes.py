@@ -139,6 +139,17 @@ def probe_temperature(check):
     return status, detail
 
 
+# Established forward-power references treated equivalently for
+# "percent of configured full power" purposes -- the C300-era
+# compatibility identifier and the canonical TX300v3 native parameter
+# it now shares a physical meaning with (r0016). A named set rather
+# than hardcoding the string twice below.
+FORWARD_POWER_REFERENCES = {
+    "psu.fwd_power",
+    "meters.pafwd",
+}
+
+
 def probe_transmitter_param(check, tx_client):
     if tx_client is None:
         return "unknown", {"reason": "transmitter unreachable or not configured"}
@@ -155,10 +166,12 @@ def probe_transmitter_param(check, tx_client):
         return "unknown", {"raw": raw, "error": "non-numeric response"}
     status = _threshold_status(value, check.warning_threshold, check.critical_threshold, check.threshold_direction)
     detail = {"value": value, "raw": raw}
-    if check.transmitter_parameter == "psu.fwd_power":
-        # Only the Forward Power meter needs a "percent of max" reading --
-        # narrow special-case rather than a generic reference-max field
-        # on MonitorCheck, since no other parameter needs this treatment.
+    if check.transmitter_parameter in FORWARD_POWER_REFERENCES:
+        # Only the Forward Power meter (psu.fwd_power on COBALT,
+        # meters.pafwd natively on TX300v3 -- the same physical reading)
+        # needs a "percent of max" reading -- narrow special-case rather
+        # than a generic reference-max field on MonitorCheck, since no
+        # other parameter needs this treatment.
         from monitoring.models import TransmitterConfig
         full_power = TransmitterConfig.load().full_power_watts
         if full_power:

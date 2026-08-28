@@ -38,6 +38,93 @@ class TransmitterProbeCompatibilityTests(TestCase):
         self.assertEqual(detail["value"], 245.5)
         self.assertEqual(detail["percent_of_max"], 98.2)
 
+    def test_bw_native_forward_power_reference_also_receives_percent_of_max(self):
+        """r0016: WRJE's native meters.pafwd forward-power check must
+        get the same percent_of_max the established psu.fwd_power
+        compatibility reference already gets -- the C300 forward-power
+        renderer requires it."""
+        check = MonitorCheck(
+            name="TX Forward Power (native)",
+            kind="transmitter_param",
+            transmitter_parameter="meters.pafwd",
+            warning_threshold=200,
+            critical_threshold=150,
+            threshold_direction="below",
+        )
+        with patch.object(self.driver, "_get_native", return_value="246"):
+            status, detail = probe_transmitter_param(check, self.driver)
+
+        self.assertEqual(status, "ok")
+        self.assertEqual(detail["value"], 246.0)
+        # WRJE's real configuration: full_power_watts=265, ~246W -> ~92.8%.
+        self.assertAlmostEqual(detail["percent_of_max"], 98.4, places=1)
+
+    def test_psu_fwd_power_and_meters_pafwd_produce_equal_percentages(self):
+        """Equivalent readings/configuration must produce equal
+        percentages for both established forward-power references --
+        proves this is one calculation, not two."""
+        config = TransmitterConfig.load()
+        config.full_power_watts = 265.0
+        config.save()
+        check_legacy = MonitorCheck(
+            name="TX Forward Power (legacy ref)",
+            kind="transmitter_param",
+            transmitter_parameter="psu.fwd_power",
+            warning_threshold=200,
+            critical_threshold=150,
+            threshold_direction="below",
+        )
+        check_native = MonitorCheck(
+            name="TX Forward Power (native ref)",
+            kind="transmitter_param",
+            transmitter_parameter="meters.pafwd",
+            warning_threshold=200,
+            critical_threshold=150,
+            threshold_direction="below",
+        )
+        with patch.object(self.driver, "_get_native", return_value="246"):
+            _legacy_status, legacy_detail = probe_transmitter_param(check_legacy, self.driver)
+        with patch.object(self.driver, "_get_native", return_value="246"):
+            _native_status, native_detail = probe_transmitter_param(check_native, self.driver)
+
+        self.assertEqual(legacy_detail["percent_of_max"], native_detail["percent_of_max"])
+        self.assertAlmostEqual(native_detail["percent_of_max"], 92.8, places=1)
+
+    def test_informational_reflected_power_reads_ok_with_no_thresholds(self):
+        """r0016: after the Part A validation fix, meters.parev with no
+        configured thresholds is a valid informational check -- its
+        status must be 'ok' whenever the read succeeds, and it must
+        never receive percent_of_max (that's forward-power only)."""
+        check = MonitorCheck(
+            name="TX Reflected Power",
+            kind="transmitter_param",
+            transmitter_parameter="meters.parev",
+        )
+        with patch.object(self.driver, "_get_native", return_value="4"):
+            status, detail = probe_transmitter_param(check, self.driver)
+
+        self.assertEqual(status, "ok")
+        self.assertEqual(detail["value"], 4.0)
+        self.assertEqual(detail["raw"], "4")
+        self.assertNotIn("percent_of_max", detail)
+
+    def test_informational_transmitter_reads_preserve_numeric_value_and_raw(self):
+        """Informational (thresholdless) transmitter reads must still
+        produce a numeric detail['value'] suitable for the dashboard
+        renderers/API consumers, and preserve detail['raw'] -- never
+        a formatted display string used for comparison."""
+        check = MonitorCheck(
+            name="TX Fan Speed",
+            kind="transmitter_param",
+            transmitter_parameter="meters.fanspeed",
+        )
+        with patch.object(self.driver, "_get_native", return_value="3150 RPM"):
+            status, detail = probe_transmitter_param(check, self.driver)
+
+        self.assertEqual(status, "ok")
+        self.assertEqual(detail["value"], 3150.0)
+        self.assertEqual(detail["raw"], "3150 RPM")
+
     def test_bw_board_temperature_native_response_yields_numeric_detail(self):
         """r0015: live WRJE TX300v3 (firmware 2.0-R) returned
         'get aio.temp.board' -> '49 (C)'. The shared numeric parser

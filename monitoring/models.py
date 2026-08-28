@@ -173,7 +173,17 @@ class MonitorCheck(models.Model):
             errors["systemd_unit"] = "Required for Systemd Service checks."
         if self.kind == "disk" and not self.disk_path:
             errors["disk_path"] = "Required for Disk Usage checks."
-        if self.kind in ("disk", "cpu", "memory", "temperature", "transmitter_param"):
+        # transmitter_param is deliberately excluded here (r0016): unlike
+        # disk/cpu/memory/temperature, a transmitter parameter can be a
+        # legitimate informational-only reading (e.g. TX Reflected Power,
+        # TX Fan Speed) with no alert thresholds at all --
+        # probe_transmitter_param() already handles warning_threshold=
+        # critical_threshold=None correctly (_threshold_status() returns
+        # "ok"). Requiring a threshold here rejected real, already-
+        # enabled production rows (WRJE ids 20/25) through the Admin
+        # changelist's list-editable formset -- see
+        # monitoring/tests/test_monitor_check_admin.py.
+        if self.kind in ("disk", "cpu", "memory", "temperature"):
             if self.warning_threshold is None and self.critical_threshold is None:
                 errors["critical_threshold"] = "At least one threshold is required for this kind."
         if self.kind == "transmitter_param" and not self.transmitter_parameter:

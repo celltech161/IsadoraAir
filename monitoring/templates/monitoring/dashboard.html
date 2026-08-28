@@ -897,6 +897,13 @@ function renderCardBody(check, byTxRef) {
   if (check.tx_ref === "aio.temp.board" || check.tx_ref === "aio.temp.dsp") {
     return renderPaTempBody(check, check.status);
   }
+  // Native TX300v3 forward/reflected power (r0016) -- same treatment:
+  // no paired C300-style indicator check exists for these, so color by
+  // the check's own calculated status rather than inventing a fake
+  // indicator mapping. Reuses the exact same established renderers as
+  // psu.fwd_power / psu.rev_power above.
+  if (check.tx_ref === "meters.pafwd") return renderForwardPowerBody(check, check.status);
+  if (check.tx_ref === "meters.parev") return renderReversePowerBody(check, check.status);
   if (check.tx_ref === "psu.fan_speed_measured_fan1") return renderFanSpeedBody(check);
   if (check.tx_ref === "status.rf_interlock") return renderInterlockBody(check);
   switch (check.kind) {

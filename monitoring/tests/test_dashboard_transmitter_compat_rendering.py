@@ -81,3 +81,78 @@ class DashboardTransmitterCompatRenderingTests(TestCase):
             'if (check.tx_ref === "psu.pa_temperature") return renderPaTempBody(check, colorClass);',
             block,
         )
+
+
+@override_settings(SECURE_SSL_REDIRECT=False)
+class NativeTx300PowerDashboardRenderingTests(TestCase):
+    """r0016: native BW TX300v3 forward/reflected power (meters.pafwd /
+    meters.parev) must render using the SAME established C300 renderers
+    (renderForwardPowerBody / renderReversePowerBody) as psu.fwd_power /
+    psu.rev_power -- not a new renderer, and not the generic fallback.
+    Unlike the C300 references, there is no paired legacy indicator
+    check for these native parameters, so color comes from the check's
+    own calculated status, same treatment as r0015's computed:vswr /
+    aio.temp.board / aio.temp.dsp."""
+
+    def setUp(self):
+        user = User.objects.create_superuser("dashboard-tx300-power-rendering")
+        self.client.force_login(user)
+
+    def _dispatch_block(self):
+        response = self.client.get(reverse("monitoring:dashboard"))
+        self.assertEqual(response.status_code, 200)
+        content = response.content.decode("utf-8")
+        start = content.index("function renderCardBody(check, byTxRef) {")
+        end = content.index("function renderGroups(checks) {")
+        return content[start:end]
+
+    def test_native_forward_power_dispatches_to_the_existing_forward_power_renderer(self):
+        block = self._dispatch_block()
+        self.assertIn(
+            'if (check.tx_ref === "meters.pafwd") return renderForwardPowerBody(check, check.status);',
+            block,
+        )
+
+    def test_native_reflected_power_dispatches_to_the_existing_reverse_power_renderer(self):
+        block = self._dispatch_block()
+        self.assertIn(
+            'if (check.tx_ref === "meters.parev") return renderReversePowerBody(check, check.status);',
+            block,
+        )
+
+    def test_native_power_dispatch_precedes_the_generic_fallback(self):
+        block = self._dispatch_block()
+        forward_index = block.index('check.tx_ref === "meters.pafwd"')
+        reverse_index = block.index('check.tx_ref === "meters.parev"')
+        default_index = block.index("default: return `<div class=\"mon-card-detail\">")
+        self.assertLess(forward_index, default_index)
+        self.assertLess(reverse_index, default_index)
+
+    def test_no_new_forward_or_reverse_power_renderer_introduced(self):
+        content = self.client.get(reverse("monitoring:dashboard")).content.decode(
+            "utf-8"
+        )
+        self.assertEqual(content.count("function renderForwardPowerBody("), 1)
+        self.assertEqual(content.count("function renderReversePowerBody("), 1)
+
+    def test_existing_c300_forward_and_reverse_power_dispatch_unchanged(self):
+        block = self._dispatch_block()
+        self.assertIn(
+            'if (check.tx_ref === "psu.fwd_power") return renderForwardPowerBody(check, colorClass);',
+            block,
+        )
+        self.assertIn(
+            'if (check.tx_ref === "psu.rev_power") return renderReversePowerBody(check, colorClass);',
+            block,
+        )
+
+    def test_r0015_dispatch_entries_remain_unchanged(self):
+        block = self._dispatch_block()
+        self.assertIn(
+            'if (check.tx_ref === "computed:vswr") return renderVswrBody(check, check.status);',
+            block,
+        )
+        self.assertIn(
+            'if (check.tx_ref === "aio.temp.board" || check.tx_ref === "aio.temp.dsp") {',
+            block,
+        )
