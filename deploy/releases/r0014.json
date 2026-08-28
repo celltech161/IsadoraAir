@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "release_id": "r0014",
+  "previous_release_id": "r0013",
+  "minimum_updater_protocol_version": 3,
+  "summary": "BW TX300v3 password-prompt detection is now ASCII case-insensitive, supporting firmware variants that emit lowercase or mixed-case password prompts while preserving existing Telnet negotiation, authentication safety, and read-only telemetry behavior.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-monitoring"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0007"
+}
