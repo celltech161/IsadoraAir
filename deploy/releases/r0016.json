@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "release_id": "r0016",
+  "previous_release_id": "r0015",
+  "minimum_updater_protocol_version": 3,
+  "summary": "Fixes informational transmitter-check validation and Django Admin list editing, and gives native BW TX300v3 forward/reflected power readings the same established dashboard presentation as equivalent C300 metrics.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-monitoring",
+    "isadoraair-gunicorn"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0007"
+}
