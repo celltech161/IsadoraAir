@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "release_id": "r0015",
+  "previous_release_id": "r0014",
+  "minimum_updater_protocol_version": 3,
+  "summary": "Restores field-verified BW TX300v3 legacy monitoring compatibility for computed VSWR and board/DSP temperature references, with proper existing dashboard presentation, while deliberately keeping unverified PSU voltage/current counters unsupported.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-monitoring",
+    "isadoraair-gunicorn"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0007"
+}
