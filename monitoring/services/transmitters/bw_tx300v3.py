@@ -65,12 +65,23 @@ class BWTx300v3Driver:
     safe_native_parameters = frozenset({
         *_CANONICAL_PARAMETERS.values(),
         "meters.fanspeed",
+        # Field-verified on WRJE's real TX300v3, firmware 2.0-R (r0015):
+        # 'get aio.temp.board' -> '49 (C)', 'get aio.temp.dsp' -> '57 (C)'.
+        # See docs/BW_TX300V3_DRIVER_NOTES.md. Native/compatibility
+        # references only -- not added to supported_canonical_metrics or
+        # read_status(); the architecture doesn't require that.
+        "aio.temp.board",
+        "aio.temp.dsp",
     })
     _LEGACY_NUMERIC = {
         "psu.fwd_power": "meters.pafwd",
         "psu.rev_power": "meters.parev",
         "psu.pa_temperature": "meters.patemp",
     }
+    # Legacy WRJE reference for the same guarded forward/reflected-power
+    # VSWR computation already exposed as psu.vswr -- a compatibility
+    # alias, never a second VSWR implementation. See get() below.
+    _VSWR_REFERENCES = frozenset({"psu.vswr", "computed:vswr"})
     _LEGACY_INDICATORS = {
         "status.indicator.rf",
         "status.indicator.vswr",
@@ -79,6 +90,12 @@ class BWTx300v3Driver:
     _UNSUPPORTED_LEGACY = {
         "psu.fan_speed_measured_fan1",
         "status.rf_interlock",
+        # Deliberately unsupported (r0015): live WRJE queries returned
+        # meters.psuvoltage -> '342' and meters.psucurrent -> '934' with
+        # no established scaling/units. Do not add without authoritative
+        # protocol evidence -- see docs/BW_TX300V3_DRIVER_NOTES.md.
+        "meters.psuvoltage",
+        "meters.psucurrent",
     }
 
     def __init__(self, host, port, password, timeout=3.0):
@@ -240,7 +257,7 @@ class BWTx300v3Driver:
         return (
             reference in self.safe_native_parameters
             or reference in self._LEGACY_NUMERIC
-            or reference == "psu.vswr"
+            or reference in self._VSWR_REFERENCES
             or reference in self._LEGACY_INDICATORS
         )
 
@@ -287,7 +304,7 @@ class BWTx300v3Driver:
             return self._get_native(parameter)
         if parameter in self._LEGACY_NUMERIC:
             return self._get_native(self._LEGACY_NUMERIC[parameter])
-        if parameter == "psu.vswr":
+        if parameter in self._VSWR_REFERENCES:
             forward = parse_numeric(self._get_native("meters.pafwd"))
             reflected = parse_numeric(self._get_native("meters.parev"))
             value = compute_vswr(forward, reflected)

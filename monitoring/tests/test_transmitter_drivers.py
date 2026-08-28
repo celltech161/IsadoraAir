@@ -402,6 +402,68 @@ class BWTelemetryTests(SimpleTestCase):
             [b"get meters.pafwd\r\n", b"get meters.parev\r\n"],
         )
 
+    def test_computed_vswr_is_a_compatibility_alias_for_psu_vswr(self):
+        """r0015: the legacy WRJE reference computed:vswr must be a
+        supported compatibility identifier that delegates to the exact
+        same guarded forward/reflected-power calculation already
+        exposed as psu.vswr -- never a second VSWR implementation."""
+        self.assertTrue(self.driver.supports_reference("computed:vswr"))
+        values = {"meters.pafwd": "247.0", "meters.parev": "4.0"}
+        with patch.object(
+            self.driver, "_get_native", side_effect=lambda name: values[name]
+        ):
+            computed_vswr = self.driver.get("computed:vswr")
+        with patch.object(
+            self.driver, "_get_native", side_effect=lambda name: values[name]
+        ):
+            psu_vswr = self.driver.get("psu.vswr")
+        self.assertEqual(computed_vswr, psu_vswr)
+        self.assertAlmostEqual(float(computed_vswr), 1.2916252451934438)
+
+    def test_board_and_dsp_temperature_are_supported_read_only_native_references(self):
+        """r0015: field-verified on WRJE's real TX300v3 (firmware
+        2.0-R) -- aio.temp.board / aio.temp.dsp are native/compatibility
+        references only, reached through the existing read-only command
+        path, never a new canonical read_status() metric."""
+        self.assertTrue(self.driver.supports_reference("aio.temp.board"))
+        self.assertTrue(self.driver.supports_reference("aio.temp.dsp"))
+        self.assertNotIn("aio.temp.board", self.driver.supported_canonical_metrics)
+        self.assertNotIn("aio.temp.dsp", self.driver.supported_canonical_metrics)
+
+        self.driver._sock = FakeSocket([
+            b"get aio.temp.board\r\n49 (C)\r\nTX-V3>",
+        ])
+        self.assertEqual(self.driver.get("aio.temp.board"), "49 (C)")
+        self.assertEqual(self.driver._sock.sent, [b"get aio.temp.board\r\n"])
+
+        self.driver._sock = FakeSocket([
+            b"get aio.temp.dsp\r\n57 (C)\r\nTX-V3>",
+        ])
+        self.assertEqual(self.driver.get("aio.temp.dsp"), "57 (C)")
+        self.assertEqual(self.driver._sock.sent, [b"get aio.temp.dsp\r\n"])
+
+    def test_psu_voltage_and_current_remain_explicitly_unsupported(self):
+        """r0015: live WRJE queries returned meters.psuvoltage -> '342'
+        and meters.psucurrent -> '934' with no established scaling/
+        units. These must stay out of every allowlist/compatibility
+        map -- this is an intentional exclusion, not an oversight."""
+        for reference in ("meters.psuvoltage", "meters.psucurrent"):
+            with self.subTest(reference=reference):
+                self.assertFalse(self.driver.supports_reference(reference))
+                self.assertNotIn(reference, self.driver.safe_native_parameters)
+                self.assertNotIn(reference, self.driver.supported_canonical_metrics)
+                self.assertIn(reference, self.driver._UNSUPPORTED_LEGACY)
+                with self.assertRaises(UnsupportedTransmitterParameter):
+                    self.driver.get(reference)
+
+    def test_unsupported_psu_references_never_send_a_get_command(self):
+        for reference in ("meters.psuvoltage", "meters.psucurrent"):
+            with self.subTest(reference=reference):
+                self.driver._sock = FakeSocket([])
+                with self.assertRaises(UnsupportedTransmitterParameter):
+                    self.driver.get(reference)
+                self.assertEqual(self.driver._sock.sent, [])
+
     def test_vswr_guards_invalid_inputs(self):
         for forward, reflected in (
             (0, 0), (-1, 0), (100, -1), (100, 100), (100, 101),

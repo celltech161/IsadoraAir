@@ -886,6 +886,17 @@ function renderCardBody(check, byTxRef) {
     if (check.tx_ref === "psu.vswr") return renderVswrBody(check, colorClass);
     if (check.tx_ref === "psu.pa_temperature") return renderPaTempBody(check, colorClass);
   }
+  // Legacy WRJE compatibility references restored in r0015 (see
+  // docs/BW_TX300V3_DRIVER_NOTES.md) have no paired COBALT-style legacy
+  // indicator check to derive color from -- use the check's own
+  // calculated threshold status instead, with the same presentation
+  // (VSWR / degrees-C) as the established psu.vswr / psu.pa_temperature
+  // cards. check.status is already one of the same "ok"/"warning"/
+  // "critical"/"unknown" class names indicatorColorClass() returns.
+  if (check.tx_ref === "computed:vswr") return renderVswrBody(check, check.status);
+  if (check.tx_ref === "aio.temp.board" || check.tx_ref === "aio.temp.dsp") {
+    return renderPaTempBody(check, check.status);
+  }
   if (check.tx_ref === "psu.fan_speed_measured_fan1") return renderFanSpeedBody(check);
   if (check.tx_ref === "status.rf_interlock") return renderInterlockBody(check);
   switch (check.kind) {

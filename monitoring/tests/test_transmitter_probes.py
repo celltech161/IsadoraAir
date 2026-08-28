@@ -38,6 +38,145 @@ class TransmitterProbeCompatibilityTests(TestCase):
         self.assertEqual(detail["value"], 245.5)
         self.assertEqual(detail["percent_of_max"], 98.2)
 
+    def test_bw_board_temperature_native_response_yields_numeric_detail(self):
+        """r0015: live WRJE TX300v3 (firmware 2.0-R) returned
+        'get aio.temp.board' -> '49 (C)'. The shared numeric parser
+        already yields 49.0; probe_transmitter_param() stays unchanged
+        and must never compare formatted display strings."""
+        check = MonitorCheck(
+            name="TX Board Temperature High",
+            kind="transmitter_param",
+            transmitter_parameter="aio.temp.board",
+            warning_threshold=55,
+            critical_threshold=65,
+            threshold_direction="above",
+        )
+        with patch.object(self.driver, "_get_native", return_value="49 (C)"):
+            status, detail = probe_transmitter_param(check, self.driver)
+
+        self.assertEqual(status, "ok")
+        self.assertEqual(detail["value"], 49.0)
+        self.assertEqual(detail["raw"], "49 (C)")
+
+    def test_bw_dsp_temperature_native_response_yields_numeric_detail(self):
+        check = MonitorCheck(
+            name="TX DSP Temperature High",
+            kind="transmitter_param",
+            transmitter_parameter="aio.temp.dsp",
+            warning_threshold=58,
+            critical_threshold=65,
+            threshold_direction="above",
+        )
+        with patch.object(self.driver, "_get_native", return_value="57 (C)"):
+            status, detail = probe_transmitter_param(check, self.driver)
+
+        self.assertEqual(status, "ok")
+        self.assertEqual(detail["value"], 57.0)
+        self.assertEqual(detail["raw"], "57 (C)")
+
+    def test_board_temperature_high_threshold_behavior(self):
+        check = MonitorCheck(
+            name="TX Board Temperature High",
+            kind="transmitter_param",
+            transmitter_parameter="aio.temp.board",
+            warning_threshold=55,
+            critical_threshold=65,
+            threshold_direction="above",
+        )
+        cases = (("49 (C)", "ok"), ("60 (C)", "warning"), ("70 (C)", "critical"))
+        for raw, expected in cases:
+            with self.subTest(raw=raw):
+                with patch.object(self.driver, "_get_native", return_value=raw):
+                    status, detail = probe_transmitter_param(check, self.driver)
+                self.assertEqual(status, expected)
+                self.assertEqual(detail["value"], float(raw.split()[0]))
+
+    def test_board_temperature_low_threshold_behavior(self):
+        check = MonitorCheck(
+            name="TX Board Temperature Low",
+            kind="transmitter_param",
+            transmitter_parameter="aio.temp.board",
+            warning_threshold=5,
+            critical_threshold=0,
+            threshold_direction="below",
+        )
+        cases = (("49 (C)", "ok"), ("3 (C)", "warning"), ("-1 (C)", "critical"))
+        for raw, expected in cases:
+            with self.subTest(raw=raw):
+                with patch.object(self.driver, "_get_native", return_value=raw):
+                    status, detail = probe_transmitter_param(check, self.driver)
+                self.assertEqual(status, expected)
+                self.assertEqual(detail["value"], float(raw.split()[0]))
+
+    def test_dsp_temperature_high_threshold_behavior(self):
+        check = MonitorCheck(
+            name="TX DSP Temperature High",
+            kind="transmitter_param",
+            transmitter_parameter="aio.temp.dsp",
+            warning_threshold=58,
+            critical_threshold=65,
+            threshold_direction="above",
+        )
+        cases = (("57 (C)", "ok"), ("60 (C)", "warning"), ("66 (C)", "critical"))
+        for raw, expected in cases:
+            with self.subTest(raw=raw):
+                with patch.object(self.driver, "_get_native", return_value=raw):
+                    status, detail = probe_transmitter_param(check, self.driver)
+                self.assertEqual(status, expected)
+                self.assertEqual(detail["value"], float(raw.split()[0]))
+
+    def test_dsp_temperature_low_threshold_behavior(self):
+        check = MonitorCheck(
+            name="TX DSP Temperature Low",
+            kind="transmitter_param",
+            transmitter_parameter="aio.temp.dsp",
+            warning_threshold=5,
+            critical_threshold=0,
+            threshold_direction="below",
+        )
+        cases = (("57 (C)", "ok"), ("3 (C)", "warning"), ("-1 (C)", "critical"))
+        for raw, expected in cases:
+            with self.subTest(raw=raw):
+                with patch.object(self.driver, "_get_native", return_value=raw):
+                    status, detail = probe_transmitter_param(check, self.driver)
+                self.assertEqual(status, expected)
+                self.assertEqual(detail["value"], float(raw.split()[0]))
+
+    def test_computed_vswr_feeds_existing_numeric_probe_same_as_psu_vswr(self):
+        check_computed = MonitorCheck(
+            name="TX VSWR",
+            kind="transmitter_param",
+            transmitter_parameter="computed:vswr",
+            warning_threshold=1.5,
+            critical_threshold=1.65,
+            threshold_direction="above",
+        )
+        check_legacy = MonitorCheck(
+            name="TX VSWR (legacy ref)",
+            kind="transmitter_param",
+            transmitter_parameter="psu.vswr",
+            warning_threshold=1.5,
+            critical_threshold=1.65,
+            threshold_direction="above",
+        )
+        values = {"meters.pafwd": "247.0", "meters.parev": "4.0"}
+        with patch.object(
+            self.driver, "_get_native", side_effect=lambda name: values[name]
+        ):
+            computed_status, computed_detail = probe_transmitter_param(
+                check_computed, self.driver
+            )
+        with patch.object(
+            self.driver, "_get_native", side_effect=lambda name: values[name]
+        ):
+            legacy_status, legacy_detail = probe_transmitter_param(
+                check_legacy, self.driver
+            )
+
+        self.assertEqual(computed_status, legacy_status)
+        self.assertEqual(computed_detail["value"], legacy_detail["value"])
+        self.assertAlmostEqual(computed_detail["value"], 1.2916252451934438)
+
     def test_bw_protection_state_feeds_existing_indicator_fault_values(self):
         check = MonitorCheck(
             name="TX VSWR Indicator",
