@@ -74,6 +74,90 @@ class BWProtocolTests(SimpleTestCase):
         )
         self.assertEqual(sock.sent, [self.password.encode("ascii") + b"\r\n"])
 
+    def test_successful_login_with_lowercase_password_prompt(self):
+        """Real WRJE TX300v3 firmware emits a lowercase ``password:``
+        prompt rather than the ``Password:`` this driver was originally
+        written against. Password-prompt matching must be ASCII
+        case-insensitive without changing the ordinary command prompt or
+        telemetry parsing."""
+        driver, sock, _create_connection = self._connect(
+            [],
+            login_chunks=[
+                b"Welcome to the TX-V3!\r\n",
+                b"password:",
+                b"\r\nTX-V3>",
+            ],
+        )
+
+        self.assertIsInstance(driver, BWTx300v3Driver)
+        self.assertEqual(sock.sent, [self.password.encode("ascii") + b"\r\n"])
+
+    def test_lowercase_password_prompt_with_wrje_telnet_negotiation(self):
+        """Reproduces the exact real-WRJE banner shape: a greeting line,
+        an IAC WILL ECHO negotiation, then the lowercase password prompt.
+        The driver must still decline the option (IAC DONT ECHO) and then
+        authenticate."""
+        driver, sock, _create_connection = self._connect(
+            [],
+            login_chunks=[
+                b"Welcome to the TX-V3!\r\n",
+                b"\xff\xfb\x01",
+                b"password:",
+                b"\r\nTX-V3>",
+            ],
+        )
+
+        self.assertIsInstance(driver, BWTx300v3Driver)
+        self.assertEqual(
+            sock.sent,
+            [b"\xff\xfe\x01", self.password.encode("ascii") + b"\r\n"],
+        )
+        self.assertNotIn(b"\xff", driver._buf)
+
+    def test_lowercase_password_prompt_split_across_recv_boundaries(self):
+        driver, sock, _create_connection = self._connect(
+            [],
+            login_chunks=[
+                b"Welcome to the TX-V3!\r\npass",
+                b"word:",
+                b"\r\nTX-",
+                b"V3>",
+            ],
+        )
+
+        self.assertIsInstance(driver, BWTx300v3Driver)
+        self.assertEqual(sock.sent, [self.password.encode("ascii") + b"\r\n"])
+
+    def test_mixed_case_password_prompt_is_matched_case_insensitively(self):
+        """A deliberately mixed-case prompt establishes this is genuine
+        ASCII case-insensitive matching, not a lowercase-only special
+        case."""
+        driver, sock, _create_connection = self._connect(
+            [],
+            login_chunks=[
+                b"Welcome to the TX-V3!\r\n",
+                b"pAsSwOrD:",
+                b"\r\nTX-V3>",
+            ],
+        )
+
+        self.assertIsInstance(driver, BWTx300v3Driver)
+        self.assertEqual(sock.sent, [self.password.encode("ascii") + b"\r\n"])
+
+    def test_password_prompt_case_insensitivity_does_not_broaden_to_command_prompt(self):
+        """The ordinary command prompt (``TX-V3>``) match must remain
+        case-sensitive -- only password-prompt detection changed."""
+        driver, sock, _create_connection = self._connect([
+            b"get meters.pafwd\r\n250.5\r\ntx-v3>",
+        ])
+
+        with patch(
+            "monitoring.services.transmitters.bw_tx300v3.time.monotonic",
+            side_effect=[0.0, 0.0, 2.0],
+        ):
+            with self.assertRaisesMessage(TransmitterError, "Timed out"):
+                driver.get("meters.pafwd")
+
     def test_iac_then_do_option_split_across_recv_boundaries(self):
         driver, sock, _create_connection = self._connect(
             [],

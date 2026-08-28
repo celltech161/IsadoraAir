@@ -114,7 +114,9 @@ class BWTx300v3Driver:
             self._buf = b""
             self._native_cache = {}
             self._reset_iac_state()
-            self._read_until(self.password_prompt, "password prompt")
+            self._read_until(
+                self.password_prompt, "password prompt", case_insensitive=True
+            )
             try:
                 password_bytes = self.password.encode("ascii")
             except UnicodeEncodeError:
@@ -183,9 +185,23 @@ class BWTx300v3Driver:
             self._reset_iac_state()
         return bytes(out)
 
-    def _read_until(self, marker, description, *, authenticating=False):
+    def _read_until(
+        self, marker, description, *, authenticating=False, case_insensitive=False
+    ):
+        # bytes.lower() only folds ASCII A-Z and leaves every other byte
+        # (including Telnet IAC/option bytes already stripped by
+        # _strip_iac) untouched, so this is exactly ASCII case-insensitive
+        # matching -- never a general/locale-aware casefold. Only the
+        # marker search uses the folded view; self._buf itself, and the
+        # bytes returned/retained from it, keep their original case.
+        search_marker = marker.lower() if case_insensitive else marker
+
+        def _find(buf):
+            haystack = buf.lower() if case_insensitive else buf
+            return haystack.find(search_marker)
+
         deadline = time.monotonic() + self.timeout
-        while marker not in self._buf:
+        while _find(self._buf) == -1:
             if authenticating and any(
                 failure in self._buf.lower()
                 for failure in self._AUTH_FAILURE_MARKERS
@@ -213,7 +229,7 @@ class BWTx300v3Driver:
                     f"Transmitter {description} exceeded the response-size limit."
                 )
 
-        index = self._buf.index(marker)
+        index = _find(self._buf)
         result = self._buf[:index]
         self._buf = self._buf[index + len(marker):]
         return result
