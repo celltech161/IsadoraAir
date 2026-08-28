@@ -83,6 +83,7 @@
       "availability": {
         "policy": "feature_selected",
         "features": [
+          "aac_lc",
           "he_aac",
           "he_aac_v2"
         ],

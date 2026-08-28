@@ -80,6 +80,7 @@ class RuntimeComponentManifestTests(SimpleTestCase):
 
     def test_fdkaac_versions_and_source_identities_are_exact(self):
         fdkaac = get_runtime_component("fdkaac")
+        self.assertEqual(fdkaac["availability"]["features"], ["aac_lc", "he_aac", "he_aac_v2"])
         self.assertEqual(fdkaac["runtime"]["fdkaac_version"], "1.0.7")
         self.assertEqual(fdkaac["runtime"]["libfdk_aac_version"], "2.0.3")
         self.assertEqual(

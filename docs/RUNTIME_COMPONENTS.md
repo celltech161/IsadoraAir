@@ -9,7 +9,9 @@ contract documented in `docs/TTS_RUNTIME.md`:
 isadoraair/runtime_components.json
 ```
 
-`isadoraair.runtime_components` is the validating loader. Future
+`isadoraair.runtime_components` is the validating loader. Runtime Foundation E
+adds the read-only requirement resolver and validator described in
+`docs/RUNTIME_VALIDATION.md`. Future
 provisioners, validators, disaster-recovery restore, and the interactive
 installer must consume this contract instead of copying versions, hashes, or
 paths into independent scripts.
@@ -95,8 +97,10 @@ provider resolves those beneath the canonical asset root and verifies them.
 
 ### fdkaac/libfdk-aac
 
-fdkaac is conditionally required only for features selecting HE-AAC or
-HE-AACv2. Foundation D makes the manifest the build-script authority for
+fdkaac is conditionally required for enabled outputs selecting AAC-LC,
+HE-AAC, or HE-AACv2. The AAC-LC entry matters because IsadoraAir's enabled
+streaming AAC rows still invoke the same canonical fdkaac binary above the HE
+bitrate tiers. Foundation D makes the manifest the build-script authority for
 fdkaac 1.0.7, libfdk-aac 2.0.3, and these exact GitHub-free source inputs:
 
 | Archive | Bytes | SHA-256 |
