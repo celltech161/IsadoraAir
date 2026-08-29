@@ -1,0 +1,52 @@
+#!/usr/bin/python3
+"""Git-owned template for the stable installed IsadoraAir TTS command.
+
+This is NOT the file that runs from a checkout. It is a template:
+Runtime Foundation E5's isadoraair.runtime_surfaces module substitutes the
+literal marker below with the canonical (or, for disposable target-root
+testing, target-root-mapped) application root, then publishes the result to
+
+    /usr/local/bin/isadoraair-tts
+
+(or <target-root>/usr/local/bin/isadoraair-tts for a mapped install). The
+published file is a fixed, standalone script -- it cannot discover its own
+checkout the way deploy/isadoraair-tts does, because it no longer lives
+inside one.
+
+deploy/isadoraair-tts (no suffix) is a SEPARATE, unrelated file: the
+Git-owned repo-local development launcher that discovers <checkout>/venv
+relative to itself. It is not touched, replaced, or superseded by this one
+and keeps working the same way for arbitrary checkouts. This file is the
+one and only thing published to the stable /usr/local/bin path.
+
+Provider selection (Kokoro vs Piper) is intentionally NOT decided here --
+this launcher only ever enters the logical TTS layer (isadoraair.tts, via
+-m), which owns that decision through the existing logical-voice contract.
+No Kokoro/Piper runtime path appears in this file.
+"""
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+
+APPLICATION_ROOT_MARKER = "@@ISADORAAIR_APPLICATION_ROOT@@"
+
+application_root = Path(APPLICATION_ROOT_MARKER)
+runtime_python = application_root / "venv" / "bin" / "python"
+
+if not runtime_python.is_file():
+    sys.stderr.write(
+        f"isadoraair-tts: canonical application Python is missing: {runtime_python}\n"
+    )
+    sys.exit(1)
+
+environment = os.environ.copy()
+environment.pop("PYTHONPATH", None)
+os.chdir(application_root)
+os.execve(
+    str(runtime_python),
+    [str(runtime_python), "-E", "-m", "isadoraair.tts", *sys.argv[1:]],
+    environment,
+)

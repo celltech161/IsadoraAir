@@ -3,9 +3,11 @@
 Foundation E3 consumes trusted local build material and constructs the
 canonical Kokoro and Piper runtimes. It performs no acquisition and does not
 activate any production caller. Foundation E4 adds the native fdkaac
-publication adapter described below. The stable system CLI, tmpfiles
-installation, caller migration, backup v3, restore integration, and
-fresh-installer orchestration remain later work.
+publication adapter described below. The stable installed system CLI and
+tmpfiles ownership of the containing directories are Foundation E5's
+concern -- see `docs/RUNTIME_SYSTEM_SURFACES.md` -- not this document's.
+Caller migration, backup v3, restore integration, and fresh-installer
+orchestration remain later work beyond E5.
 
 ## Authority boundaries
 

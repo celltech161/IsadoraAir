@@ -11,10 +11,13 @@ isadoraair/runtime_components.json
 
 `isadoraair.runtime_components` is the validating loader. Runtime Foundation E
 adds the read-only requirement resolver and validator described in
-`docs/RUNTIME_VALIDATION.md`, followed by the offline provisioner described in
-`docs/RUNTIME_PROVISIONING.md`. Future disaster-recovery restore and the
-interactive installer must consume these APIs instead of copying versions,
-hashes, paths, selection rules, or acceptance logic into independent scripts.
+`docs/RUNTIME_VALIDATION.md`, the offline TTS and native fdkaac provisioners
+described in `docs/RUNTIME_PROVISIONING.md`, and the stable OS filesystem/CLI
+surfaces (installed TTS launcher, canonical runtime/data directories,
+tmpfiles ownership) described in `docs/RUNTIME_SYSTEM_SURFACES.md`. Future
+disaster-recovery restore and the interactive installer must consume these
+APIs instead of copying versions, hashes, paths, selection rules, or
+acceptance logic into independent scripts.
 
 ## Foundation A/B deployment status
 

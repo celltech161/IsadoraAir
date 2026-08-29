@@ -218,6 +218,9 @@ class ProvisioningLayout:
     piper_assets: Path
     fdkaac_binary: Path
     fdkaac_library_root: Path
+    application_root: Path
+    tts_cli: Path
+    tts_scratch: Path
 
     @staticmethod
     def _map(path: str | Path, target_root: Path) -> Path:
@@ -247,6 +250,9 @@ class ProvisioningLayout:
             piper_assets=cls._map(piper["models"]["root"], root),
             fdkaac_binary=cls._map(fdkaac["runtime"]["binary"], root),
             fdkaac_library_root=cls._map(fdkaac["runtime"]["library_root"], root),
+            application_root=cls._map(paths["application_root"], root),
+            tts_cli=cls._map(paths["tts_cli"], root),
+            tts_scratch=cls._map(paths["tts_scratch"], root),
         )
 
     def runtime_pointer(self, component: str) -> Path:

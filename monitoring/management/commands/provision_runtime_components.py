@@ -13,6 +13,7 @@ from isadoraair.runtime_components import RuntimeComponentContractError, load_ru
 from isadoraair.runtime_native import NativeRuntimeProvisioner
 from isadoraair.runtime_provisioning import RuntimeProvisioner, RuntimeProvisioningError
 from isadoraair.runtime_requirements import resolve_current_runtime_requirements
+from isadoraair.runtime_surfaces import RuntimeSystemSurfaceManager
 
 
 def _trusted_uid(value: str) -> int:
@@ -30,7 +31,10 @@ def _trusted_uid(value: str) -> int:
 
 
 class Command(BaseCommand):
-    help = "Plan/apply offline TTS or explicitly prepare/publish native fdkaac."
+    help = (
+        "Plan/apply offline TTS, explicitly prepare/publish native fdkaac, "
+        "or plan/apply the E5 system-surface contract (--surfaces)."
+    )
 
     def add_arguments(self, parser):
         parser.add_argument(
@@ -55,6 +59,15 @@ class Command(BaseCommand):
             "--fdkaac",
             action="store_true",
             help="Make --plan report the native fdkaac component rather than E3 TTS.",
+        )
+        parser.add_argument(
+            "--surfaces",
+            action="store_true",
+            help=(
+                "Make --plan/--apply act on the E5 system-surface contract (installed "
+                "TTS launcher, canonical runtime/data directories, tmpfiles config) "
+                "rather than E3 TTS or E4 native fdkaac."
+            ),
         )
         parser.add_argument(
             "--native-source-dir",
@@ -112,10 +125,66 @@ class Command(BaseCommand):
         for error in plan.errors:
             self.stdout.write(f"  station configuration: {error}")
 
+    def _write_surfaces_plan(self, plan, *, json_output):
+        if json_output:
+            self.stdout.write(plan.to_json())
+            return
+        self.stdout.write(f"System-surface plan: {'READY' if plan.ready else 'BLOCKED'}")
+        self.stdout.write(f"  target root: {plan.target_root}")
+        self.stdout.write(f"  action: {plan.action}")
+        self.stdout.write(
+            f"  protected publication: {'required' if plan.privilege_required else 'not required'}"
+        )
+        for name in sorted(plan.current_evidence.surfaces):
+            item = plan.current_evidence.surfaces[name]
+            self.stdout.write(f"  {name}: {item.state} ({item.path})")
+        for error in plan.errors:
+            self.stdout.write(f"  error: {error}")
+
     def handle(self, *args, **options):
         json_output = options["json_output"]
         try:
             manifest = load_runtime_components()
+            if options["surfaces"]:
+                if any(
+                    options[flag]
+                    for flag in (
+                        "bundle",
+                        "fdkaac",
+                        "prepare_fdkaac",
+                        "publish_fdkaac",
+                        "native_source_dir",
+                        "prepared_native_root",
+                        "trusted_preparer_uid",
+                        "bootstrap_fdkaac",
+                    )
+                ):
+                    raise CommandError(
+                        "--surfaces cannot be combined with E3 TTS or E4 native options"
+                    )
+                if not (options["plan"] or options["apply"]):
+                    raise CommandError("--surfaces requires --plan or --apply")
+                surfaces = RuntimeSystemSurfaceManager(
+                    product_manifest=manifest, target_root=options["target_root"]
+                )
+                if options["plan"]:
+                    plan = surfaces.plan()
+                    self._write_surfaces_plan(plan, json_output=json_output)
+                    if not plan.ready:
+                        raise CommandError("system-surface plan contains blocking errors")
+                    return
+                result = surfaces.apply()
+                if json_output:
+                    self.stdout.write(result.to_json())
+                else:
+                    outcome = "NO-OP" if result.no_op else "APPLIED"
+                    self.stdout.write(f"System-surface provisioning: {outcome}")
+                    for name in result.changed_surfaces:
+                        self.stdout.write(f"  repaired: {name}")
+                    self.stdout.write(
+                        f"  all surfaces healthy: {result.evidence.healthy}"
+                    )
+                return
             try:
                 requirements = resolve_current_runtime_requirements(manifest)
             except Exception as exc:
