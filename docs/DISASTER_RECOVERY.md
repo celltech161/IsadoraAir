@@ -32,6 +32,17 @@ remote target configured in `~/.iasboxbu.cred` (never in the repo), with
 own exact contents, exclusions, script version, and the IsadoraAir Git
 SHA it was taken alongside.
 
+**Current script version is 2.1.0** — it does not carry Kokoro/Piper
+runtime material or fdkaac/libfdk-aac source archives; a bare-machine
+restore still reprovisions TTS/native runtimes by hand (see "Restore"
+below and `deploy/restore/70-tts.sh`/`50-native-deps.sh`'s own headers).
+Runtime Foundation E7A (`docs/RUNTIME_BACKUP_PAYLOAD.md`) has since
+defined the self-contained runtime recovery payload artifact meant to
+close that gap, plus its builder/validator API — but as of this writing
+`backup_isadoraair.sh` does not yet produce or consume it, and neither
+restore stage consumes it either. That wiring is E7B, explicitly
+deferred; do not read this section as "backup v3 is operational."
+
 **Covered:**
 
 - Full `pg_dump -Fc` of the database (see "Database restore" below —
