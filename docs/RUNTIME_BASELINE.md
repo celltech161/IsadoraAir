@@ -49,7 +49,8 @@ upstream tag or checksum instead, documented in their own files below
 | Runtime component machine contract | `isadoraair/runtime_components.json`, `docs/RUNTIME_COMPONENTS.md` |
 | PostgreSQL baseline | `docs/DISASTER_RECOVERY.md`'s "Database restore" section |
 | System package manifest | `deploy/packages-ubuntu-26.04.txt` |
-| Preflight checker | `monitoring/management/commands/check_deploy_baseline.py` (`manage.py check_deploy_baseline`) |
+| Preflight checker, consolidated onto Runtime Foundation E (E6) | `monitoring/management/commands/check_deploy_baseline.py` (`manage.py check_deploy_baseline`), `isadoraair/deploy_baseline.py`, `docs/RUNTIME_DEPLOY_BASELINE.md` |
+| Runtime Foundation E phase index | `docs/RUNTIME_FOUNDATION_E.md` |
 | This file | Restore ordering, generic/station-specific boundary, supported-baseline summary |
 
 ## GStreamer 1.28.6 boundary (roadmap item 1.4)

@@ -103,8 +103,17 @@ deploy/restore/
   60-python.sh            IsadoraAir venv creation + requirements.txt + safe checks.
   70-tts.sh               Kokoro + Piper provisioning/smoke test.
   80-companions.sh        syndicated-ingest/weather-ingest/ogremote-ingest clone+venv.
-  90-system-config.sh     nginx + systemd install/validation (never starts/reloads).
-  95-validate.sh          Post-restore read-only Django/migration/static validation.
+  90-system-config.sh     nginx + systemd install/validation (never starts/reloads);
+                          also establishes Runtime Foundation E5's system
+                          surfaces (installed launcher, canonical
+                          runtime/data directories, both tmpfiles
+                          configs at their correct, distinct
+                          destinations) -- see docs/RUNTIME_DEPLOY_BASELINE.md.
+  95-validate.sh          Post-restore validation. Canonical / receives
+                          Django/live-station/migration checks; a staging
+                          root receives target-mapped structural/filesystem
+                          validation only (Runtime Foundation E6 --
+                          docs/RUNTIME_DEPLOY_BASELINE.md).
   restore.sh              Orchestrator -- runs 00 through 95 in order, same flags passed through.
 ```
 
@@ -147,7 +156,7 @@ below implement that ordering directly:
   v
 90-system-config  nginx + systemd units installed, NOT started
   v
-95-validate    read-only Django/migration/static checks
+95-validate    canonical live checks OR offline target structural checks
 ```
 
 `docs/DISASTER_RECOVERY_RESTORE.md` picks up from here for the parts
@@ -221,3 +230,11 @@ large companion repos) against this box, without ever touching
 `/opt/isadoraair`, the live `isadoraair` database, or any live service —
 see the Phase 4 completion report's "Staging validation" section for the
 exact commands and results per stage.
+
+For Runtime Foundation E6, stage 95 does not borrow a healthy installer
+host to validate a mounted target. It passes the staging root explicitly
+to `check_deploy_baseline --structural-only`; missing target launchers,
+E5 directories, either tmpfiles configuration, unsafe scratch ancestry,
+or an unresolved target service identity fail the staged acceptance.
+This does not claim a fully offline runtime restore: stages 50/70 remain
+pre-Foundation-E payload consumers until E7.

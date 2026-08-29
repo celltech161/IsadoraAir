@@ -2,6 +2,7 @@
 
 import json
 import tempfile
+from copy import deepcopy
 from pathlib import Path
 
 from django.test import SimpleTestCase
@@ -12,6 +13,7 @@ from isadoraair.runtime_components import (
     get_runtime_component,
     load_runtime_components,
 )
+from isadoraair.runtime_bundle import product_contract_digest
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -150,3 +152,54 @@ class RuntimeComponentManifestTests(SimpleTestCase):
     def test_unknown_component_fails_clearly(self):
         with self.assertRaisesRegex(RuntimeComponentContractError, "unknown runtime component"):
             get_runtime_component("unknown")
+
+
+class RuntimePackageGroupReferenceTests(SimpleTestCase):
+    """Runtime Foundation E6: the machine-readable component -> Ubuntu
+    package-authority-group relationship (task section 10/11)."""
+
+    def test_kokoro_declares_its_runtime_package_group_in_the_manifest(self):
+        kokoro = get_runtime_component("kokoro")
+        self.assertEqual(kokoro["runtime"]["ubuntu_packages_group"], "OPTIONAL_KOKORO_TTS")
+
+    def test_piper_declares_no_runtime_package_group(self):
+        piper = get_runtime_component("piper")
+        self.assertNotIn("ubuntu_packages_group", piper.get("runtime", {}))
+
+    def test_fdkaac_build_group_is_distinct_from_any_runtime_group(self):
+        fdkaac = get_runtime_component("fdkaac")
+        self.assertEqual(fdkaac["build"]["ubuntu_packages_group"], "BUILD_HEAAC")
+        self.assertNotIn("ubuntu_packages_group", fdkaac.get("runtime", {}))
+
+    def test_runtime_ubuntu_packages_group_must_be_a_non_empty_string_when_present(self):
+        manifest = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+        manifest["components"]["kokoro"]["runtime"]["ubuntu_packages_group"] = ""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "components.json"
+            path.write_text(json.dumps(manifest), encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeComponentContractError, "ubuntu_packages_group"):
+                load_runtime_components(path)
+
+    def test_unknown_runtime_package_group_fails_contract_load(self):
+        manifest = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+        manifest["components"]["kokoro"]["runtime"]["ubuntu_packages_group"] = "DOES_NOT_EXIST"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "components.json"
+            path.write_text(json.dumps(manifest), encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeComponentContractError, "unknown Ubuntu package group"):
+                load_runtime_components(path)
+
+    def test_malformed_package_authority_fails_contract_load(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            packages = Path(temp_dir) / "packages.txt"
+            packages.write_text("echo unsupported\n", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeComponentContractError, "package authority is invalid"):
+                load_runtime_components(packages_path=packages)
+
+    def test_kokoro_package_relationship_changes_product_contract_digest(self):
+        original = load_runtime_components()
+        changed = deepcopy(original)
+        changed["components"]["kokoro"]["runtime"]["ubuntu_packages_group"] = "CORE"
+        self.assertNotEqual(
+            product_contract_digest(original), product_contract_digest(changed)
+        )

@@ -83,6 +83,21 @@ The runtime package is `kokoro-onnx==0.4.7`. The manifest also records the
 proven runtime dependency versions and exact SHA-256 identities for
 `kokoro-v1.0.onnx` and `voices-v1.0.bin`.
 
+Runtime Foundation E6 adds one machine-readable relationship:
+`components.kokoro.runtime.ubuntu_packages_group` names
+`OPTIONAL_KOKORO_TTS`, the Ubuntu apt package group Kokoro's runtime
+needs (`espeak-ng`) -- membership itself stays authoritative in
+`deploy/packages-ubuntu-26.04.txt`, never duplicated here (see
+`isadoraair/runtime_packages.py`, `docs/RUNTIME_DEPLOY_BASELINE.md`).
+The runtime-component loader parses that authority with a strict,
+non-executing grammar and rejects an unknown referenced group as a
+product-contract error.
+This is a RUNTIME prerequisite, kept structurally distinct from
+fdkaac's pre-existing BUILD-only `components.fdkaac.build.
+ubuntu_packages_group` (`BUILD_HEAAC`) by which block declares it, not
+by an invented second field name. Piper declares no such group at all --
+it is self-contained (see below).
+
 ### Piper
 
 Piper is a supported optional component at `piper-tts==1.4.2`:

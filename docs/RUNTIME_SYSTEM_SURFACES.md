@@ -45,7 +45,10 @@ an independent Python, shell, or test constant.
 - `/run/isadoraair` and its `/tts` scratch subdirectory are already
   owned by the pre-existing `deploy/isadoraair-tmpfiles.conf`
   (`0700`, `@@ISA_USER@@`-owned) -- see "Why `/run/isadoraair/tts` is
-  untouched" below.
+  untouched" below. Foundation E6 validates the final directory and
+  its confined ancestry; for an offline target it resolves
+  `@@ISA_USER@@` from that target's own `/etc/passwd`, never the
+  installer host's identity database.
 
 ## Inventory: who actually reads/writes each directory
 
@@ -230,18 +233,22 @@ to scope every directory operation to that mapped root only -- a
 mapped-root test genuinely cannot create, read, or alter anything under
 the real host's `/opt`, `/var/lib`, `/run`, or `/etc/tmpfiles.d`).
 
-### Known deferred integration gap
+### Restore integration (closed by Runtime Foundation E6)
 
-`deploy/restore/90-system-config.sh`'s existing generic `deploy/*.conf`
-install loop does not yet know the new file's correct
-`/etc/tmpfiles.d/isadoraair-runtime.conf` destination (it would fall
-through to that loop's systemd-unit-shaped default destination, which is
-wrong for a tmpfiles config). Fixing that script is restore-implementation
-work, explicitly out of E5's scope; recorded here for the later
-Foundation E restore/baseline consolidation pass (E6), alongside the
-already-known `check_deploy_baseline` fdkaac and `espeak-ng` prerequisite
-gaps documented in `docs/RUNTIME_PROVISIONING.md` and
-`docs/RUNTIME_COMPONENTS.md`.
+`deploy/restore/90-system-config.sh`'s generic `deploy/*.conf` install
+loop did not originally know this file's correct
+`/etc/tmpfiles.d/isadoraair-runtime.conf` destination (it would have
+fallen through to that loop's systemd-unit-shaped default, which is
+wrong for a tmpfiles config). Runtime Foundation E6 closed this: the
+file is now excluded from that generic loop and installed by its own
+dedicated step, which prefers actually invoking this module's
+`RuntimeSystemSurfaceManager` via `manage.py
+provision_runtime_components --surfaces` once the restore's own venv +
+application checkout are in place (falling back to a minimal direct
+render only if they are not yet available at that point) -- see
+`docs/RUNTIME_DEPLOY_BASELINE.md` for the full writeup, including the
+matching `check_deploy_baseline` fdkaac/`espeak-ng` prerequisite
+consolidation.
 
 ## API: plan / apply / validate
 

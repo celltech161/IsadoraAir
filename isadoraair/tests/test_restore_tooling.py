@@ -11,9 +11,11 @@ inspect_backup.sh is the one script fully exercised for real here --
 against small, synthetic, temp-directory-only archives (never a real
 production backup), which is enough to prove its actual pass/fail logic
 works without needing production data in the test suite."""
+import os
 import shutil
 import subprocess
 import tarfile
+import tempfile
 from pathlib import Path
 
 from django.test import SimpleTestCase
@@ -482,3 +484,235 @@ class InspectBackupFunctionalTests(SimpleTestCase):
         self.assertNotIn("age --decrypt", text)
         self.assertNotIn("age -d", text)
         self.assertNotRegex(text, r"\bage\s+-i\b")
+
+
+class RuntimeFoundationE5TmpfilesMappingTests(SimpleTestCase):
+    """Runtime Foundation E6 -- MUST CLOSE: 90-system-config.sh must
+    install deploy/isadoraair-runtime-tmpfiles.conf at its own correct
+    destination, distinct from the pre-existing isadoraair.conf, never
+    at the generic loop's default systemd/system/<basename> path."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.text = (RESTORE_DIR / "90-system-config.sh").read_text(encoding="utf-8")
+
+    def test_runtime_tmpfiles_conf_excluded_from_the_generic_unit_loop(self):
+        start = self.text.index('for f in "$REPO_ROOT"/deploy/*.service')
+        end = self.text.index("\ndone", start)
+        loop_body = self.text[start:end]
+        self.assertIn("isadoraair-runtime-tmpfiles.conf", loop_body)
+        # It must appear only inside the exclusion case, never as a
+        # dest-mapping case that would route it through render()'s
+        # @@ISA_USER@@-only substitution vocabulary.
+        exclusion_line = next(
+            line for line in loop_body.splitlines() if "continue ;;" in line and "isadoraair-runtime-tmpfiles.conf" in line
+        )
+        self.assertIn("isadoraair-runtime-tmpfiles.conf", exclusion_line)
+
+    def test_isadoraair_conf_still_maps_to_its_own_pre_existing_destination(self):
+        """Preserve the existing isadoraair-tmpfiles.conf -> isadoraair.conf
+        mapping unchanged -- the two tmpfiles authorities must never merge."""
+        self.assertIn('isadoraair-tmpfiles.conf) dest="$ETC_ROOT/tmpfiles.d/isadoraair.conf" ;;', self.text)
+
+    def test_dedicated_e5_step_installs_at_the_correct_destination(self):
+        self.assertIn('E5_TMPFILES_DEST="$ETC_ROOT/tmpfiles.d/isadoraair-runtime.conf"', self.text)
+
+    def test_e5_step_prefers_the_management_command_and_falls_back_to_a_minimal_render(self):
+        self.assertIn("provision_runtime_components --surfaces", self.text)
+        self.assertIn("ISADORAAIR_SURFACE_UID", self.text)
+        self.assertIn("ISADORAAIR_SURFACE_GID", self.text)
+
+    def test_e5_target_root_mirrors_staging_vs_real_host_exactly_like_etc_root(self):
+        start = self.text.index("if [ -n \"$RESTORE_STAGING_ROOT\" ]; then\n  E5_TARGET_ROOT=")
+        self.assertNotEqual(start, -1)
+
+    def test_stage_95_passes_staging_root_to_structural_baseline(self):
+        text = (RESTORE_DIR / "95-validate.sh").read_text(encoding="utf-8")
+        self.assertIn('--target-root "$RESTORE_STAGING_ROOT"', text)
+        self.assertIn("--structural-only", text)
+
+
+class RuntimeFoundationE5SystemConfigFunctionalTests(SimpleTestCase):
+    """Real subprocess execution of 90-system-config.sh against a
+    disposable --staging-root -- never a real /etc, /opt, /usr/local,
+    or /var/lib path. Mirrors InspectBackupFunctionalTests' own
+    real-execution-against-synthetic-fixtures approach."""
+
+    def setUp(self):
+        super().setUp()
+        temporary = tempfile.TemporaryDirectory(prefix="isadoraair-e6-90-config-")
+        self.addCleanup(shutil.rmtree, temporary.name, ignore_errors=True)
+        self.staging = Path(temporary.name)
+
+    def _run(self, *args, timeout=60):
+        return subprocess.run(
+            [str(RESTORE_DIR / "90-system-config.sh"), "--staging-root", str(self.staging), *args],
+            capture_output=True, text=True, timeout=timeout,
+        )
+
+    def test_plan_mode_writes_nothing_and_previews_both_tmpfiles_destinations(self):
+        result = self._run("--plan")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(self.staging.exists() and any(self.staging.rglob("*")))
+        self.assertIn("isadoraair.conf", result.stdout)
+        self.assertIn("isadoraair-runtime.conf", result.stdout)
+
+    def test_apply_without_venv_falls_back_to_minimal_runtime_tmpfiles_install(self):
+        app_root = self.staging / "opt" / "isadoraair"
+        app_root.mkdir(parents=True)
+        (app_root / ".env").write_text("SECRET_KEY=test\n", encoding="utf-8")
+
+        result = self._run("--apply")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        isadoraair_conf = self.staging / "etc" / "tmpfiles.d" / "isadoraair.conf"
+        runtime_conf = self.staging / "etc" / "tmpfiles.d" / "isadoraair-runtime.conf"
+        self.assertTrue(isadoraair_conf.is_file())
+        self.assertTrue(runtime_conf.is_file())
+        self.assertNotEqual(isadoraair_conf.read_text(), runtime_conf.read_text())
+
+        runtime_text = runtime_conf.read_text(encoding="utf-8")
+        self.assertNotIn("@@ISADORAAIR_SURFACE_UID@@", runtime_text)
+        self.assertNotIn("@@ISADORAAIR_SURFACE_GID@@", runtime_text)
+        self.assertIn("/opt/isadoraair-runtime", runtime_text)
+        self.assertIn("/var/lib/isadoraair/tts", runtime_text)
+        # Fallback path: file only -- no directories, no real tmpfiles
+        # execution (that's E5's own authority, once the venv exists).
+        self.assertFalse((self.staging / "opt" / "isadoraair-runtime").exists())
+
+    def test_apply_with_real_venv_establishes_full_e5_contract_with_canonical_content(self):
+        """The preferred path: a real venv + manage.py checkout is
+        available at this stage, so 90-system-config.sh invokes
+        Runtime Foundation E5's own RuntimeSystemSurfaceManager via
+        provision_runtime_components --surfaces --apply. Proves BOTH
+        the exact destination fix AND that the installed launcher
+        embeds the canonical /opt/isadoraair -- never this staging
+        root's own mount prefix (task section 17's regression)."""
+
+        project_root = RESTORE_DIR.parent.parent
+        app_root = self.staging / "opt" / "isadoraair"
+        app_root.parent.mkdir(parents=True, exist_ok=True)
+        app_root.symlink_to(project_root)
+
+        venv_python = project_root / "venv" / "bin" / "python"
+        if not venv_python.is_file():
+            self.skipTest("no worktree-local venv symlink available for a real manage.py invocation")
+
+        result = self._run("--apply", timeout=120)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("System-surface provisioning", result.stdout)
+        self.assertIn("all surfaces healthy: True", result.stdout)
+
+        launcher = self.staging / "usr" / "local" / "bin" / "isadoraair-tts"
+        self.assertTrue(launcher.is_file())
+        content = launcher.read_text(encoding="utf-8")
+        self.assertIn('APPLICATION_ROOT_MARKER = "/opt/isadoraair"', content)
+        self.assertNotIn(str(self.staging), content)
+
+        runtime_conf = self.staging / "etc" / "tmpfiles.d" / "isadoraair-runtime.conf"
+        self.assertTrue(runtime_conf.is_file())
+        self.assertTrue((self.staging / "opt" / "isadoraair-runtime").is_dir())
+        self.assertTrue((self.staging / "var" / "lib" / "isadoraair" / "tts").is_dir())
+
+
+class RuntimeFoundationE6TargetValidationFunctionalTests(SimpleTestCase):
+    """Exercise stages 90/95 only beneath a disposable target root."""
+
+    def setUp(self):
+        super().setUp()
+        temporary = tempfile.TemporaryDirectory(prefix="isadoraair-e6-95-target-")
+        self.addCleanup(temporary.cleanup)
+        self.staging = Path(temporary.name)
+        self.project_root = RESTORE_DIR.parent.parent
+        if not (self.project_root / "venv" / "bin" / "python").is_file():
+            self.skipTest("no worktree-local venv link available for restore functional proof")
+        self.env = os.environ.copy()
+        self.env.update(
+            {
+                "DEBUG": "True",
+                "SECRET_KEY": "e6-disposable-restore-only",
+                "DB_NAME": "unused",
+                "DB_USER": "unused",
+                "DB_PASSWORD": "",
+                "DB_HOST": "127.0.0.1",
+                "DB_PORT": "65534",
+                "PYTHONPATH": str(self.project_root),
+                "PYTHONDONTWRITEBYTECODE": "1",
+            }
+        )
+
+    def _application_shell(self, *, with_venv: bool) -> Path:
+        app = self.staging / "opt" / "isadoraair"
+        app.mkdir(parents=True, exist_ok=True)
+        (app / "manage.py").symlink_to(self.project_root / "manage.py")
+        if with_venv:
+            (app / "venv").symlink_to(self.project_root / "venv")
+        return app
+
+    def _target_identity_and_runtime_dirs(self):
+        uid, gid = os.getuid(), os.getgid()
+        etc = self.staging / "etc"
+        etc.mkdir(parents=True, exist_ok=True)
+        (etc / "passwd").write_text(
+            f"station:x:{uid}:{gid}:Station:/nonexistent:/usr/sbin/nologin\n",
+            encoding="utf-8",
+        )
+        (self.staging / "srv" / "isadoraair" / "music").mkdir(parents=True)
+        scratch = self.staging / "run" / "isadoraair" / "tts"
+        scratch.mkdir(parents=True, mode=0o700)
+        scratch.chmod(0o700)
+
+    def _run_stage(self, name: str, *extra: str, timeout: int = 120):
+        return subprocess.run(
+            [
+                str(RESTORE_DIR / name),
+                "--staging-root",
+                str(self.staging),
+                "--apply",
+                "--isa-user",
+                "station",
+                *extra,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=self.env,
+        )
+
+    def test_preferred_stage_90_then_stage_95_targets_staging_and_detects_deleted_launcher(self):
+        self._application_shell(with_venv=True)
+        self._target_identity_and_runtime_dirs()
+        stage90 = self._run_stage("90-system-config.sh")
+        self.assertEqual(stage90.returncode, 0, stage90.stdout + stage90.stderr)
+
+        launcher = self.staging / "usr" / "local" / "bin" / "isadoraair-tts"
+        self.assertTrue(launcher.is_file())
+        self.assertIn(
+            'APPLICATION_ROOT_MARKER = "/opt/isadoraair"',
+            launcher.read_text(encoding="utf-8"),
+        )
+        self.assertTrue((self.staging / "etc/tmpfiles.d/isadoraair.conf").is_file())
+        self.assertTrue((self.staging / "etc/tmpfiles.d/isadoraair-runtime.conf").is_file())
+
+        healthy = self._run_stage("95-validate.sh")
+        self.assertEqual(healthy.returncode, 0, healthy.stdout + healthy.stderr)
+        self.assertIn("offline target check_deploy_baseline: PASS", healthy.stdout)
+
+        launcher.unlink()
+        missing = self._run_stage("95-validate.sh")
+        self.assertNotEqual(missing.returncode, 0, missing.stdout + missing.stderr)
+        self.assertIn("offline target check_deploy_baseline: FAILED", missing.stderr)
+
+    def test_stage_90_fallback_cannot_reach_final_success(self):
+        app = self._application_shell(with_venv=False)
+        self._target_identity_and_runtime_dirs()
+        fallback = self._run_stage("90-system-config.sh")
+        self.assertEqual(fallback.returncode, 0, fallback.stdout + fallback.stderr)
+        self.assertIn("falling back", fallback.stderr)
+        self.assertFalse((self.staging / "usr/local/bin/isadoraair-tts").exists())
+
+        (app / "venv").symlink_to(self.project_root / "venv")
+        final = self._run_stage("95-validate.sh")
+        self.assertNotEqual(final.returncode, 0, final.stdout + final.stderr)
+        self.assertIn("offline target check_deploy_baseline: FAILED", final.stderr)

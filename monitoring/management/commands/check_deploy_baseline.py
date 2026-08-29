@@ -1,312 +1,237 @@
-"""Read-only runtime/dependency baseline preflight -- IsadoraAir 1.2
-Phase 3. Reports whether this host has what IsadoraAir (and, best-
-effort, the companion projects it depends on) needs to actually run --
-never modifies anything. Deliberately small and deterministic rather
-than a general diagnostics framework: one check per real dependency
-this phase's audit actually identified, not an open-ended health
-scanner.
+"""Read-only deployment-baseline preflight -- IsadoraAir 1.2 Phase 3,
+consolidated onto Runtime Foundation E evidence by Runtime Foundation E6.
 
-Distinguishes four states per check, not a flat pass/fail:
-  PASS      -- present and working
-  DEGRADED  -- present but with a caveat worth knowing about
-  MISSING   -- absent and required for what it checks
-  OPTIONAL  -- absent, but the feature it supports is optional/unused
-               here, so its absence does not fail the overall run
+One coherent read-only answer to: is this host structurally capable of
+satisfying the station's runtime contract, and can a restored/clean host
+establish the required system surfaces without relying on historical
+one-off checks? Never modifies the host.
 
-Reusable by the restore procedure (Phase 4), an installer, or release
-validation -- run any time, any host, with no side effects.
+This command is a thin presentation layer over
+:func:`isadoraair.deploy_baseline.evaluate_deployment_baseline` -- it
+contains no independent capability-detection logic of its own for
+anything Runtime Foundation E now owns (fdkaac, Kokoro, Piper, the E5
+system surfaces, the pre-existing TTS scratch surface, package
+prerequisites). See docs/RUNTIME_DEPLOY_BASELINE.md for the full
+consolidation writeup, including exactly which pre-E6 checks were
+retained as-is, which were replaced by Foundation E evidence, and why.
+
+Two tiers, reported together by default:
+  STRUCTURAL -- host/system checks, package prerequisite presence, the
+  E5 system surfaces, the scratch surface, manifest validity. Evaluable
+  with no station database at all.
+  STATION -- which optional runtimes the station's own configuration
+  actually requires, and whether they pass Foundation E's own E2
+  component validation. Reports UNRESOLVED (never a guessed PASS) when
+  no usable database exists -- use --structural-only to skip this tier
+  entirely for a pre-database installer/bootstrap context.
+
+Exit code 0 iff the requested tier(s) all resolve to PASS; nonzero for
+FAIL or UNRESOLVED alike (fail-closed, matching Foundation E1/E2's own
+existing design for an unresolved station) -- unchanged from this
+command's pre-E6 contract, which
+deploy/restore/95-validate.sh and updatecenter's release-validation
+convention both already depend on.
 """
-import os
-import shutil
-import subprocess
+
+from __future__ import annotations
+
+import json
 from pathlib import Path
 
-from django.core.management.base import BaseCommand
-from django.db import connection
+from django.core.management.base import BaseCommand, CommandError
 
-REQUIRED_GST_ELEMENTS = [
-    "alsasrc", "alsasink", "audioconvert", "audiodynamic", "audiomixer",
-    "audioresample", "audiotestsrc", "capsfilter", "concat", "decodebin",
-    "fakesink", "filesrc", "input-selector", "level", "opusdec", "opusenc",
-    "queue", "rglimiter", "rtpopusdepay", "rtpopuspay", "tee", "volume",
-    "webrtcbin",
-]
-# Format-specific decode path -- see docs/GSTREAMER_ELEMENT_INVENTORY.md.
-REQUIRED_GST_DECODE_ELEMENTS = [
-    "flacparse", "flacdec", "qtdemux", "avdec_aac", "mpegaudioparse",
-    "id3demux", "avdec_mp3", "aiffparse", "wavparse",
-]
-
-MIN_PYTHON = (3, 14)
+from isadoraair.deploy_baseline import (
+    LEGACY_DEGRADED,
+    LEGACY_MISSING,
+    LEGACY_OPTIONAL,
+    LEGACY_PASS,
+    RESULT_PASS,
+    evaluate_deployment_baseline,
+)
 
 
 class Command(BaseCommand):
     help = (
-        "Read-only preflight: reports whether this host has the runtime/"
-        "dependency baseline IsadoraAir 1.2 Phase 3 established (Python, "
-        "PostgreSQL tools, GStreamer + required elements, Liquidsoap, "
-        "ALSA utils + snd-aloop layout, fdkaac + HE-AAC support, required "
-        "directories, canonical /opt/isadoraair path, Kokoro, Piper). "
-        "Never modifies the host. Exit code 0 if every REQUIRED check "
-        "passes; nonzero otherwise. Missing OPTIONAL dependencies never "
-        "fail the run."
+        "Read-only deployment-baseline preflight: legacy host/system checks "
+        "(Python, PostgreSQL tools, GStreamer + required elements, "
+        "Liquidsoap, ALSA utils + snd-aloop layout, canonical directories) "
+        "consolidated with Runtime Foundation E evidence (package "
+        "prerequisites, E5 system surfaces, the TTS scratch surface, and "
+        "E1/E2 fdkaac/Kokoro/Piper component evidence). Never modifies the "
+        "host. Exit code 0 iff everything resolves to PASS; nonzero for "
+        "FAIL or UNRESOLVED alike."
     )
 
+    def add_arguments(self, parser):
+        parser.add_argument(
+            "--structural-only",
+            action="store_true",
+            help=(
+                "Report only the structural tier (no station database "
+                "required) -- for a pre-database installer/bootstrap "
+                "context. Skips Foundation E1/E2 station-requirement "
+                "evidence entirely rather than reporting it UNRESOLVED."
+            ),
+        )
+        parser.add_argument(
+            "--isa-user",
+            default=None,
+            help=(
+                "The service account identity restore/install tooling "
+                "resolved (deploy/restore/90-system-config.sh's own "
+                "ISA_USER) -- required to evaluate the pre-existing TTS "
+                "scratch surface (/run/isadoraair/tts) meaningfully. "
+                "Omitted: reported as service-identity-unresolved, never "
+                "guessed."
+            ),
+        )
+        parser.add_argument(
+            "--target-root",
+            type=Path,
+            default=Path("/"),
+            help=(
+                "Map canonical filesystem evidence beneath an offline target root. "
+                "A noncanonical target automatically uses structural-only validation; "
+                "persistent content is still checked against boot-root canonical paths."
+            ),
+        )
+        parser.add_argument(
+            "--isa-uid",
+            type=int,
+            default=None,
+            help="Trusted expected numeric service UID (must be paired with --isa-gid).",
+        )
+        parser.add_argument(
+            "--isa-gid",
+            type=int,
+            default=None,
+            help="Trusted expected numeric service GID (must be paired with --isa-uid).",
+        )
+        parser.add_argument(
+            "--json",
+            action="store_true",
+            dest="json_output",
+            help="Write only deterministic machine-readable output to stdout.",
+        )
+
     def handle(self, *args, **options):
-        results = []
-        results.append(self._check_python())
-        results.append(self._check_postgres_tools())
-        results.append(self._check_postgres_connection())
-        gst_ver, gst_results = self._check_gstreamer()
-        results.append(gst_ver)
-        results.extend(gst_results)
-        results.append(self._check_liquidsoap())
-        results.append(self._check_alsa_utils())
-        results.extend(self._check_snd_aloop())
-        results.append(self._check_fdkaac())
-        results.extend(self._check_directories())
-        results.extend(self._check_kokoro())
-        results.extend(self._check_piper())
+        if (options["isa_uid"] is None) != (options["isa_gid"] is None):
+            raise CommandError("--isa-uid and --isa-gid must be supplied together")
+        if options["isa_uid"] is not None and (
+            options["isa_uid"] < 0 or options["isa_gid"] < 0
+        ):
+            raise CommandError("--isa-uid and --isa-gid must be non-negative")
+        evidence = evaluate_deployment_baseline(
+            structural_only=options["structural_only"],
+            target_root=options["target_root"],
+            isa_user=options["isa_user"],
+            expected_uid=options["isa_uid"],
+            expected_gid=options["isa_gid"],
+        )
 
-        required_failed = 0
-        for state, label, detail in results:
-            self.stdout.write(self._line(state, label, detail))
-            if state == "MISSING":
-                required_failed += 1
+        if options["json_output"]:
+            self.stdout.write(json.dumps(evidence.to_dict(), sort_keys=True, separators=(",", ":")))
+        else:
+            self._write_human(evidence)
 
-        self.stdout.write("")
-        if required_failed:
-            self.stdout.write(self.style.ERROR(
-                f"FAIL: {required_failed} required dependency check(s) missing."
-            ))
+        if evidence.result != RESULT_PASS:
             self.stderr.write("check_deploy_baseline: FAIL")
             raise SystemExit(1)
-        self.stdout.write(self.style.SUCCESS("PASS: runtime baseline satisfied."))
 
-    # ---- output formatting -------------------------------------------
-    def _line(self, state, label, detail):
-        marker = {
-            "PASS": self.style.SUCCESS("PASS    "),
-            "DEGRADED": self.style.WARNING("DEGRADED"),
-            "MISSING": self.style.ERROR("MISSING "),
-            "OPTIONAL": "OPTIONAL",
-        }[state]
-        suffix = f": {detail}" if detail else ""
-        return f"{marker}  {label}{suffix}"
+    # ---- human-readable presentation --------------------------------
 
-    # ---- checks ---------------------------------------------------------
-    def _check_python(self):
-        import sys
-        v = sys.version_info
-        actual = f"{v.major}.{v.minor}.{v.micro}"
-        if (v.major, v.minor) >= MIN_PYTHON:
-            return ("PASS", "Python", actual)
-        return ("MISSING", "Python", f"{actual} (need >= {MIN_PYTHON[0]}.{MIN_PYTHON[1]})")
+    def _marker(self, state):
+        return {
+            LEGACY_PASS: self.style.SUCCESS("PASS    "),
+            LEGACY_DEGRADED: self.style.WARNING("DEGRADED"),
+            LEGACY_MISSING: self.style.ERROR("MISSING "),
+            LEGACY_OPTIONAL: "OPTIONAL",
+            "pass": self.style.SUCCESS("PASS    "),
+            "fail": self.style.ERROR("FAIL    "),
+            "unresolved": self.style.WARNING("UNRESOLVED"),
+            "optional_absent": "OPTIONAL",
+            "not_applicable": "N/A     ",
+        }.get(state, state)
 
-    def _check_postgres_tools(self):
-        missing = [b for b in ("psql", "pg_dump", "pg_restore") if shutil.which(b) is None]
-        if missing:
-            return ("MISSING", "PostgreSQL client tools", f"missing: {', '.join(missing)}")
-        return ("PASS", "PostgreSQL client tools", "psql, pg_dump, pg_restore on PATH")
-
-    def _check_postgres_connection(self):
-        try:
-            with connection.cursor() as cur:
-                cur.execute("SELECT version()")
-                version_str = cur.fetchone()[0]
-            return ("PASS", "PostgreSQL connection", version_str.split(",")[0])
-        except Exception as exc:
-            return ("MISSING", "PostgreSQL connection", str(exc))
-
-    def _check_gstreamer(self):
-        gst_inspect = shutil.which("gst-inspect-1.0")
-        if gst_inspect is None:
-            ver_result = ("MISSING", "GStreamer", "gst-inspect-1.0 not found")
-            elem_results = [("MISSING", f"  element {e}", "gst-inspect-1.0 unavailable")
-                             for e in REQUIRED_GST_ELEMENTS + REQUIRED_GST_DECODE_ELEMENTS]
-            return ver_result, elem_results
-
-        try:
-            out = subprocess.run([gst_inspect, "--version"], capture_output=True, text=True, timeout=10)
-            ver_line = out.stdout.strip().splitlines()[0] if out.stdout else "unknown version"
-        except Exception as exc:
-            ver_line = f"version check failed: {exc}"
-        ver_result = ("PASS", "GStreamer", ver_line)
-
-        elem_results = []
-        for elem in REQUIRED_GST_ELEMENTS:
-            elem_results.append(self._check_one_gst_element(gst_inspect, elem, optional=False))
-        for elem in REQUIRED_GST_DECODE_ELEMENTS:
-            # Decode-path elements are format-specific (FLAC/AAC/MP3/AIFF/WAV) --
-            # a library that happens to contain none of one format wouldn't
-            # strictly need its decoder, but IsadoraAir's own production
-            # library uses all five, so these are checked as required too.
-            elem_results.append(self._check_one_gst_element(gst_inspect, elem, optional=False))
-        return ver_result, elem_results
-
-    def _check_one_gst_element(self, gst_inspect, elem, optional):
-        try:
-            result = subprocess.run([gst_inspect, elem], capture_output=True, text=True, timeout=10)
-        except Exception as exc:
-            return ("MISSING", f"  element {elem}", str(exc))
-        if result.returncode != 0 or "No such element" in result.stdout + result.stderr:
-            state = "OPTIONAL" if optional else "MISSING"
-            return (state, f"  element {elem}", "not found")
-        return ("PASS", f"  element {elem}", None)
-
-    def _check_liquidsoap(self):
-        liq = shutil.which("liquidsoap")
-        if liq is None:
-            return ("MISSING", "Liquidsoap", "not found on PATH")
-        try:
-            out = subprocess.run([liq, "--version"], capture_output=True, text=True, timeout=10)
-            first_line = out.stdout.strip().splitlines()[0] if out.stdout else "version unknown"
-        except Exception as exc:
-            first_line = f"version check failed: {exc}"
-        return ("PASS", "Liquidsoap", first_line)
-
-    def _check_alsa_utils(self):
-        missing = [b for b in ("aplay", "arecord") if shutil.which(b) is None]
-        if missing:
-            return ("MISSING", "ALSA utils", f"missing: {', '.join(missing)}")
-        return ("PASS", "ALSA utils", "aplay, arecord on PATH")
-
-    def _check_snd_aloop(self):
-        results = []
-        try:
-            loaded = Path("/proc/modules").read_text()
-            if "snd_aloop " not in loaded and not loaded.startswith("snd_aloop "):
-                results.append(("MISSING", "snd-aloop module", "not loaded (modprobe snd-aloop)"))
-                return results
-        except Exception as exc:
-            results.append(("MISSING", "snd-aloop module", f"could not read /proc/modules: {exc}"))
-            return results
-        results.append(("PASS", "snd-aloop module", "loaded"))
-
-        try:
-            cards = Path("/proc/asound/cards").read_text()
-        except Exception as exc:
-            results.append(("MISSING", "snd-aloop card layout", f"could not read /proc/asound/cards: {exc}"))
-            return results
-
-        loopback_indices = set()
-        for line in cards.splitlines():
-            line = line.strip()
-            if not line or not line[0].isdigit():
+    def _write_human(self, evidence):
+        structural = evidence.structural
+        self.stdout.write(self.style.MIGRATE_HEADING("-- Structural baseline --"))
+        if structural.manifest_error:
+            self.stdout.write(self._marker("fail") + f"  runtime component contract: {structural.manifest_error}")
+            return
+        for check in structural.legacy_checks:
+            suffix = f": {check.detail}" if check.detail else ""
+            self.stdout.write(f"{self._marker(check.state)}  {check.label}{suffix}")
+        if structural.system_surfaces_error:
+            self.stdout.write(self._marker("fail") + f"  E5 system surfaces: {structural.system_surfaces_error}")
+        elif structural.system_surfaces is not None:
+            for name in sorted(structural.system_surfaces.surfaces):
+                item = structural.system_surfaces.surfaces[name]
+                state = "pass" if item.state == "healthy" else "fail"
+                self.stdout.write(f"{self._marker(state)}  E5 surface: {name} ({item.state})")
+        scratch = structural.scratch_surface
+        scratch_state = "pass" if scratch.healthy else ("unresolved" if scratch.state == "unresolved_identity" else "fail")
+        self.stdout.write(f"{self._marker(scratch_state)}  TTS scratch surface {scratch.path} ({scratch.state})")
+        for diagnostic in scratch.diagnostics:
+            self.stdout.write(f"    {diagnostic}")
+        for pkg in structural.package_prerequisites:
+            missing_suffix = f" missing: {', '.join(pkg.missing)}" if pkg.missing else ""
+            if pkg.kind == "build":
+                self.stdout.write(
+                    f"INFO     package group {pkg.group} "
+                    f"({pkg.component}/build-only, non-gating): {pkg.status}{missing_suffix}"
+                )
                 continue
-            idx_str = line.split()[0]
-            if "Loopback" in line:
-                try:
-                    loopback_indices.add(int(idx_str))
-                except ValueError:
-                    pass
-
-        # Expected layout per deploy/isadoraair-aloop.conf: index=0,3,4.
-        # A different but still-3-instance layout is DEGRADED, not
-        # MISSING -- /etc/asound.conf's exact hw:Loopback_1,1,0 reference
-        # would need re-checking against whatever indices are actually
-        # present, which this preflight doesn't attempt (station-specific
-        # asound.conf content, not a generic dependency question).
-        expected = {0, 3, 4}
-        if loopback_indices == expected:
-            results.append(("PASS", "snd-aloop card layout", f"3 instances at indices {sorted(loopback_indices)}"))
-        elif len(loopback_indices) >= 1:
-            results.append(("DEGRADED", "snd-aloop card layout",
-                             f"found indices {sorted(loopback_indices)}, expected {sorted(expected)} "
-                             "(deploy/isadoraair-aloop.conf not installed, or a different layout in use)"))
-        else:
-            results.append(("MISSING", "snd-aloop card layout", "no Loopback cards found"))
-        return results
-
-    def _check_fdkaac(self):
-        try:
-            from encoders.services.encoder_manager import FDKAAC_PATH
-        except Exception as exc:
-            return ("MISSING", "fdkaac + HE-AAC", f"could not import FDKAAC_PATH: {exc}")
-
-        if not Path(FDKAAC_PATH).is_file():
-            return ("MISSING", "fdkaac + HE-AAC", f"{FDKAAC_PATH} does not exist -- see deploy/build_fdkaac.sh")
-        if not os.access(FDKAAC_PATH, os.X_OK):
-            return ("MISSING", "fdkaac + HE-AAC", f"{FDKAAC_PATH} exists but is not executable")
-
-        check_script = Path(__file__).resolve().parents[3] / "deploy" / "check_he_aac.sh"
-        if not check_script.is_file():
-            return ("DEGRADED", "fdkaac + HE-AAC", f"{FDKAAC_PATH} present, but deploy/check_he_aac.sh not found to verify LC/HE/HEv2")
-        try:
-            result = subprocess.run(
-                ["bash", str(check_script), FDKAAC_PATH],
-                capture_output=True, text=True, timeout=30,
+            self.stdout.write(
+                f"{self._marker(pkg.status)}  package group {pkg.group} "
+                f"({pkg.component}/{pkg.kind}): {pkg.status}{missing_suffix}"
             )
-        except Exception as exc:
-            return ("DEGRADED", "fdkaac + HE-AAC", f"{FDKAAC_PATH} present, but validation could not run: {exc}")
-        if result.returncode == 0:
-            return ("PASS", "fdkaac + HE-AAC", "LC / HE / HEv2 supported")
-        return ("MISSING", "fdkaac + HE-AAC", "encode/decode validation failed -- see deploy/check_he_aac.sh output")
+            for diagnostic in pkg.diagnostics:
+                self.stdout.write(f"    {diagnostic}")
 
-    def _check_directories(self):
-        results = []
-        opt_root = Path("/opt/isadoraair")
-        if opt_root.is_dir() and (opt_root / "manage.py").is_file():
-            kind = "symlink" if opt_root.is_symlink() else "directory"
-            results.append(("PASS", "/opt/isadoraair (canonical app root)", f"{kind}, manage.py present"))
+        self.stdout.write("")
+        if evidence.station is None:
+            self.stdout.write(
+                "-- Live/station baseline: skipped "
+                "(--structural-only or offline --target-root) --"
+            )
         else:
-            results.append(("MISSING", "/opt/isadoraair (canonical app root)", "missing, or manage.py not found under it"))
+            self.stdout.write(self.style.MIGRATE_HEADING("-- Live/station baseline --"))
+            for check in evidence.live_checks:
+                suffix = f": {check.detail}" if check.detail else ""
+                self.stdout.write(f"{self._marker(check.state)}  {check.label}{suffix}")
+            station = evidence.station
+            if station.requirement_errors:
+                for error in station.requirement_errors:
+                    self.stdout.write(self._marker("unresolved") + f"  station configuration: {error}")
+            for name in sorted(station.components):
+                component = station.components[name]
+                self.stdout.write(
+                    f"{self._marker(component.status)}  {name} (required={component.required}): {component.status}"
+                )
+                for diag in component.diagnostics:
+                    self.stdout.write(f"    {diag}")
+            for pkg in evidence.station_package_prerequisites:
+                missing_suffix = f" missing: {', '.join(pkg.missing)}" if pkg.missing else ""
+                if pkg.kind == "build":
+                    self.stdout.write(
+                        f"INFO     package group {pkg.group} "
+                        f"({pkg.component}/build-only, non-gating, required={pkg.required}): "
+                        f"{pkg.status}{missing_suffix}"
+                    )
+                    continue
+                self.stdout.write(
+                    f"{self._marker(pkg.status)}  package group {pkg.group} "
+                    f"({pkg.component}/{pkg.kind}, required={pkg.required}): "
+                    f"{pkg.status}{missing_suffix}"
+                )
+                for diagnostic in pkg.diagnostics:
+                    self.stdout.write(f"    {diagnostic}")
 
-        library_root = Path(os.environ.get("LIBRARY_ROOT", "/srv/isadoraair/music"))
-        if library_root.is_dir():
-            results.append(("PASS", "Library root", str(library_root)))
+        self.stdout.write("")
+        if evidence.result == RESULT_PASS:
+            self.stdout.write(self.style.SUCCESS("PASS: deployment baseline satisfied."))
+        elif evidence.result == "unresolved":
+            self.stdout.write(self.style.WARNING("UNRESOLVED: some evidence could not be resolved -- see above."))
         else:
-            results.append(("MISSING", "Library root", f"{library_root} does not exist"))
-
-        run_dir = Path("/run/isadoraair")
-        if run_dir.is_dir():
-            results.append(("PASS", "/run/isadoraair", "present"))
-        else:
-            results.append(("DEGRADED", "/run/isadoraair", "missing -- created by systemd-tmpfiles at boot (deploy/isadoraair-tmpfiles.conf); absence is normal if services haven't started yet"))
-        return results
-
-    def _check_kokoro(self):
-        results = []
-        kokoro_root = Path(os.environ.get("KOKORO_ROOT", "/home/jreed/kokoro"))
-        binary = kokoro_root / "bin" / "kokoro_synth"
-        model = kokoro_root / "kokoro-v1.0.onnx"
-        voices = kokoro_root / "voices-v1.0.bin"
-
-        if not binary.exists():
-            results.append(("OPTIONAL", "Kokoro runtime", f"{binary} not found -- see docs/KOKORO_PROVENANCE.md"))
-            return results
-        if not os.access(binary, os.X_OK):
-            results.append(("MISSING", "Kokoro runtime", f"{binary} exists but is not executable"))
-            return results
-        results.append(("PASS", "Kokoro runtime", str(binary)))
-
-        if model.is_file() and voices.is_file():
-            results.append(("PASS", "Kokoro configured model", f"{model.name} + {voices.name} present"))
-        else:
-            missing = [p.name for p in (model, voices) if not p.is_file()]
-            results.append(("MISSING", "Kokoro configured model", f"missing: {', '.join(missing)}"))
-        return results
-
-    def _check_piper(self):
-        results = []
-        weather_root = Path(os.environ.get("WEATHER_ROOT", "/home/jreed/weather-ingest"))
-        binary = weather_root / "venv" / "bin" / "piper"
-        piper_models_dir = Path(os.environ.get("PIPER_MODELS_DIR", "/home/jreed/piper"))
-
-        if not binary.exists():
-            results.append(("OPTIONAL", "Piper runtime", f"{binary} not found -- see docs/PIPER_PROVENANCE.md"))
-            return results
-        if not os.access(binary, os.X_OK):
-            results.append(("MISSING", "Piper runtime", f"{binary} exists but is not executable"))
-            return results
-        results.append(("PASS", "Piper runtime", str(binary)))
-
-        if piper_models_dir.is_dir():
-            voice_count = len(list(piper_models_dir.glob("*.onnx")))
-            if voice_count:
-                results.append(("PASS", "Piper voices found", str(voice_count)))
-            else:
-                results.append(("OPTIONAL", "Piper voices found", f"0 -- {piper_models_dir} has no .onnx files"))
-        else:
-            results.append(("OPTIONAL", "Piper voices found", f"{piper_models_dir} does not exist"))
-        return results
+            self.stdout.write(self.style.ERROR("FAIL: deployment baseline is not satisfied -- see above."))

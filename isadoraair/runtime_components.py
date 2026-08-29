@@ -40,7 +40,9 @@ def _validate_sha256(value: Any, location: str) -> None:
         raise RuntimeComponentContractError(f"{location} must be a lowercase SHA-256 digest")
 
 
-def _validate_contract(manifest: dict[str, Any]) -> None:
+def _validate_contract(
+    manifest: dict[str, Any], *, packages_path: Path | None = None
+) -> None:
     if manifest.get("schema_version") != 1:
         raise RuntimeComponentContractError("schema_version must be 1")
 
@@ -70,6 +72,36 @@ def _validate_contract(manifest: dict[str, Any]) -> None:
             raise RuntimeComponentContractError(
                 f"components.{required_name}.availability.selected_missing_or_broken must be fail"
             )
+
+    # Package membership remains authoritative in the Git-owned Ubuntu
+    # package file. The product contract may reference its group names,
+    # but an unknown reference makes the combined contract invalid now --
+    # never later only when station evidence happens to request it.
+    from isadoraair.runtime_packages import (
+        PACKAGES_MANIFEST_PATH,
+        RuntimePackageAuthorityError,
+        parse_package_groups,
+    )
+
+    try:
+        package_groups = parse_package_groups(packages_path or PACKAGES_MANIFEST_PATH)
+    except RuntimePackageAuthorityError as exc:
+        raise RuntimeComponentContractError(
+            f"Ubuntu package authority is invalid: {exc}"
+        ) from exc
+
+    for name in ("kokoro", "piper"):
+        runtime_block = components[name].get("runtime")
+        if isinstance(runtime_block, dict) and "ubuntu_packages_group" in runtime_block:
+            group = _require_nonempty_string(
+                runtime_block["ubuntu_packages_group"],
+                f"components.{name}.runtime.ubuntu_packages_group",
+            )
+            if group not in package_groups:
+                raise RuntimeComponentContractError(
+                    f"components.{name}.runtime.ubuntu_packages_group references "
+                    f"unknown Ubuntu package group '{group}'"
+                )
 
     kokoro_assets = _require_mapping(components["kokoro"].get("assets"), "components.kokoro.assets")
     for asset_name in ("model", "voices"):
@@ -123,9 +155,17 @@ def _validate_contract(manifest: dict[str, Any]) -> None:
     fdkaac_build = _require_mapping(components["fdkaac"].get("build"), "components.fdkaac.build")
     for field in ("script", "validator", "ubuntu_packages_group", "local_source_mode", "network_source_mode"):
         _require_nonempty_string(fdkaac_build.get(field), f"components.fdkaac.build.{field}")
+    build_group = fdkaac_build["ubuntu_packages_group"]
+    if build_group not in package_groups:
+        raise RuntimeComponentContractError(
+            "components.fdkaac.build.ubuntu_packages_group references unknown "
+            f"Ubuntu package group '{build_group}'"
+        )
 
 
-def load_runtime_components(path: str | Path | None = None) -> dict[str, Any]:
+def load_runtime_components(
+    path: str | Path | None = None, *, packages_path: str | Path | None = None
+) -> dict[str, Any]:
     """Return a validated runtime-component manifest.
 
     ``path`` exists for provisioner/validator tests and staged installs. Normal
@@ -140,7 +180,10 @@ def load_runtime_components(path: str | Path | None = None) -> dict[str, Any]:
             f"cannot load runtime-component contract {manifest_path}: {exc}"
         ) from exc
     manifest = _require_mapping(manifest, "manifest")
-    _validate_contract(manifest)
+    _validate_contract(
+        manifest,
+        packages_path=Path(packages_path) if packages_path is not None else None,
+    )
     return manifest
 
 

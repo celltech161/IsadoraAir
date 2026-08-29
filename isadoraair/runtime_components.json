@@ -20,6 +20,7 @@
         "venv": "/opt/isadoraair-runtime/kokoro/venv",
         "python": "/opt/isadoraair-runtime/kokoro/venv/bin/python",
         "provider_module": "isadoraair.tts.provider_cli",
+        "ubuntu_packages_group": "OPTIONAL_KOKORO_TTS",
         "packages": {
           "kokoro-onnx": "0.4.7",
           "onnxruntime": "1.28.0",

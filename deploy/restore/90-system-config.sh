@@ -118,12 +118,25 @@ install_rendered() {
 # explicitly excluded from this generic pass and handled only by their
 # dedicated steps (section 2 for asound.conf, section 3 for
 # isadoraair-locations.conf) below.
+#
+# deploy/isadoraair-runtime-tmpfiles.conf (Runtime Foundation E5) is ALSO
+# excluded from this generic pass, for a different reason: its
+# @@ISADORAAIR_SURFACE_UID@@/@@ISADORAAIR_SURFACE_GID@@ markers are not
+# part of this script's render() substitution vocabulary above (they are
+# never a username -- see that file's own header comment), and its
+# correct destination is /etc/tmpfiles.d/isadoraair-runtime.conf, not the
+# generic loop's default $ETC_ROOT/systemd/system/<basename>. It has its
+# own dedicated step (section 4 below), which prefers actually invoking
+# Runtime Foundation E5's own RuntimeSystemSurfaceManager (same renderer
+# apply/validate both already use) once this stage's own venv+app
+# checkout are in place, falling back to a minimal direct render only if
+# they are not yet available at this point in the sequence.
 UNIT_COUNT=0
 RENDERED_UNITS=()
 for f in "$REPO_ROOT"/deploy/*.service "$REPO_ROOT"/deploy/*.timer "$REPO_ROOT"/deploy/*.conf; do
   [ -f "$f" ] || continue
   case "$(basename "$f")" in
-    asound.conf|isadoraair-locations.conf) continue ;;
+    asound.conf|isadoraair-locations.conf|isadoraair-runtime-tmpfiles.conf) continue ;;
   esac
   dest="$ETC_ROOT/systemd/system/$(basename "$f")"
   case "$(basename "$f")" in
@@ -156,11 +169,100 @@ else
   log_plan "ln -sf $ETC_ROOT/nginx/sites-available/isadoraair $ETC_ROOT/nginx/sites-enabled/isadoraair"
 fi
 
-# ---- 4. Validation (never enable/start/reload anything below) -----------
+# ---- 4. Runtime Foundation E5 system surfaces (installed launcher,
+#      canonical /opt/isadoraair-runtime + /var/lib/isadoraair/tts, and
+#      deploy/isadoraair-runtime-tmpfiles.conf at its correct
+#      destination: /etc/tmpfiles.d/isadoraair-runtime.conf, distinct
+#      from and never merged with isadoraair.conf above) -----------------
+# E5_TARGET_ROOT mirrors this stage's own staging/real-host duality as
+# Foundation E's own --target-root: a staging run maps the whole tree
+# beneath $RESTORE_STAGING_ROOT (exactly what $ETC_ROOT already does for
+# /etc above); a real run targets the actual /. E5's own rendering
+# contract keeps these two concerns separate on purpose: --target-root
+# only maps WHERE files are written, never what a launcher's own content
+# refers to -- a staging-root install still embeds the canonical
+# /opt/isadoraair, never $RESTORE_STAGING_ROOT/opt/isadoraair, since that
+# mount prefix is meaningless once this target filesystem actually boots
+# as / (see docs/RUNTIME_SYSTEM_SURFACES.md).
+if [ -n "$RESTORE_STAGING_ROOT" ]; then
+  E5_TARGET_ROOT="$RESTORE_STAGING_ROOT"
+else
+  E5_TARGET_ROOT="/"
+fi
+VENV_PY="$ISA_ROOT/venv/bin/python"
+if [ -x "$VENV_PY" ] && [ -f "$ISA_ROOT/manage.py" ]; then
+  # Preferred: the venv + application checkout this stage needs are
+  # already in place (20-application.sh + 60-python.sh both run before
+  # this stage) -- invoke Runtime Foundation E5's own reusable API via
+  # its management-command surface rather than developing a second
+  # mkdir/chown/chmod-and-render-tmpfiles implementation here. This is
+  # the SAME renderer apply/validate both already use, so nothing
+  # rendered by restore can ever disagree with what E5's own validation
+  # later expects.
+  E5_MODE_FLAG="--plan"
+  [ "$RESTORE_MODE" = "apply" ] && E5_MODE_FLAG="--apply"
+  E5_CMD=("$VENV_PY" manage.py provision_runtime_components --surfaces "$E5_MODE_FLAG" --target-root "$E5_TARGET_ROOT")
+  if [ "$RESTORE_MODE" = "apply" ]; then
+    log_apply "${E5_CMD[*]}"
+  else
+    log_plan "${E5_CMD[*]}"
+  fi
+  if [ "$USE_SUDO" -eq 1 ]; then
+    ( cd "$ISA_ROOT" && sudo "${E5_CMD[@]}" )
+  else
+    ( cd "$ISA_ROOT" && "${E5_CMD[@]}" )
+  fi
+  log_info "Runtime Foundation E5 system surfaces: $( [ "$RESTORE_MODE" = apply ] && echo "established (launcher, runtime/data directories, tmpfiles config+execution)" || echo "plan reported above" )."
+else
+  # Fallback: this stage is being run before 60-python.sh has created the
+  # venv (e.g. re-running just this stage in isolation) -- a minimal,
+  # direct install of the Git-owned tmpfiles file only, so
+  # /etc/tmpfiles.d/isadoraair-runtime.conf at least exists at its
+  # correct destination. This does NOT create /opt/isadoraair-runtime or
+  # /var/lib/isadoraair/tts, and does NOT run systemd-tmpfiles -- later
+  # validation (manage.py check_deploy_baseline, or re-running this stage
+  # once the venv exists) is what converges the rest through E5's own
+  # authority. Never a second, competing establishing mechanism.
+  log_warn "Runtime Foundation E5: $VENV_PY or $ISA_ROOT/manage.py not yet available at this stage -- falling back to a minimal direct install of deploy/isadoraair-runtime-tmpfiles.conf only. Run 60-python.sh, then re-run this stage, for the full E5 surface contract to converge."
+  if [ -n "$RESTORE_STAGING_ROOT" ]; then
+    E5_SURFACE_UID="$(id -u)"
+    E5_SURFACE_GID="$(id -g)"
+  else
+    E5_SURFACE_UID=0
+    E5_SURFACE_GID=0
+  fi
+  E5_TMPFILES_SRC="$REPO_ROOT/deploy/isadoraair-runtime-tmpfiles.conf"
+  E5_TMPFILES_DEST="$ETC_ROOT/tmpfiles.d/isadoraair-runtime.conf"
+  if [ "$RESTORE_MODE" != "apply" ]; then
+    log_plan "render $E5_TMPFILES_SRC -> $E5_TMPFILES_DEST (file only -- no directories, no systemd-tmpfiles)"
+  else
+    log_apply "render $E5_TMPFILES_SRC -> $E5_TMPFILES_DEST (file only)"
+    E5_TMP="$(mktemp)"
+    sed \
+      -e "s|@@ISADORAAIR_SURFACE_UID@@|$E5_SURFACE_UID|g" \
+      -e "s|@@ISADORAAIR_SURFACE_GID@@|$E5_SURFACE_GID|g" \
+      "$E5_TMPFILES_SRC" > "$E5_TMP"
+    if [ "$USE_SUDO" -eq 1 ]; then
+      sudo mkdir -p "$(dirname "$E5_TMPFILES_DEST")"
+      E5_DEST_TMP="$(sudo mktemp "${E5_TMPFILES_DEST}.tmp.XXXXXX")"
+      sudo install -o root -g root -m 0644 "$E5_TMP" "$E5_DEST_TMP"
+      sudo mv -f "$E5_DEST_TMP" "$E5_TMPFILES_DEST"
+    else
+      mkdir -p "$(dirname "$E5_TMPFILES_DEST")"
+      E5_DEST_TMP="$(mktemp "${E5_TMPFILES_DEST}.tmp.XXXXXX")"
+      install -m 0644 "$E5_TMP" "$E5_DEST_TMP"
+      mv -f "$E5_DEST_TMP" "$E5_TMPFILES_DEST"
+    fi
+    rm -f "$E5_TMP"
+    log_info "Runtime Foundation E5: tmpfiles config file installed only -- re-run this stage after 60-python.sh for full establishment (directories + real systemd-tmpfiles execution + the installed launcher)."
+  fi
+fi
+
+# ---- 5. Validation (never enable/start/reload anything below) -----------
 if [ "$RESTORE_MODE" = "apply" ]; then
   log_info "--- Validation ---"
 
-  # 4a. Unit syntax -- systemd-analyze verify needs no installation
+  # 5a. Unit syntax -- systemd-analyze verify needs no installation
   #     context, works directly against a file path.
   if command -v systemd-analyze >/dev/null 2>&1; then
     UNIT_FAIL=0
@@ -181,7 +283,7 @@ if [ "$RESTORE_MODE" = "apply" ]; then
     log_warn "systemd-analyze not found -- skipping unit syntax verification."
   fi
 
-  # 4b. Referenced paths exist
+  # 5b. Referenced paths exist
   PATH_FAIL=0
   for p in "$ISA_ROOT/manage.py" "$ISA_ROOT/venv/bin/python" "$ISA_ROOT/.env"; do
     if [ -e "$p" ]; then
@@ -192,14 +294,14 @@ if [ "$RESTORE_MODE" = "apply" ]; then
     fi
   done
 
-  # 4c. Service user/group exist
+  # 5c. Service user/group exist
   if getent passwd "$ISA_USER" >/dev/null 2>&1; then
     log_info "  [x] user '$ISA_USER' exists"
   else
     log_warn "  [ ] user '$ISA_USER' does NOT exist -- create it before enabling any unit."
   fi
 
-  # 4d. nginx -t -- only meaningful against the REAL /etc/nginx tree; an
+  # 5d. nginx -t -- only meaningful against the REAL /etc/nginx tree; an
   #     isolated staged site file has no full config context to check
   #     against, so this is skipped (not faked) under --staging-root.
   if [ "$USE_SUDO" -eq 1 ] && command -v nginx >/dev/null 2>&1; then
@@ -213,7 +315,7 @@ if [ "$RESTORE_MODE" = "apply" ]; then
     log_warn "nginx -t skipped ($( [ "$USE_SUDO" -eq 0 ] && echo "staging mode -- isolated site file has no full config tree to validate against" || echo "nginx not found" ))."
   fi
 
-  # 4e. snd-aloop verification -- read-only, real (non-staging) mode
+  # 5e. snd-aloop verification -- read-only, real (non-staging) mode
   #     only, since a staging root cannot load a kernel module. Per
   #     Phase 4 spec section 23: "Document snd-aloop load; expected
   #     indices; verification; expected airtap/airtap_ds aliases" --
