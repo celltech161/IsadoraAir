@@ -347,9 +347,15 @@ class PiperTTSProvider:
 def kokoro_provider_command(
     runtime_python: str,
     provider_module: str,
+    *,
+    model_path: str | None = None,
+    voices_path: str | None = None,
 ) -> CommandFactory:
+    if (model_path is None) != (voices_path is None):
+        raise ValueError("Kokoro staged model and voices paths must be supplied together")
+
     def build(request: SynthesisRequest, output_path: Path) -> Sequence[str]:
-        return (
+        command = [
             runtime_python,
             "-m",
             provider_module,
@@ -363,7 +369,10 @@ def kokoro_provider_command(
             str(request.speed),
             "--language",
             request.language,
-        )
+        ]
+        if model_path is not None and voices_path is not None:
+            command.extend(("--model-path", model_path, "--voices-path", voices_path))
+        return tuple(command)
 
     return build
 

@@ -11,10 +11,10 @@ isadoraair/runtime_components.json
 
 `isadoraair.runtime_components` is the validating loader. Runtime Foundation E
 adds the read-only requirement resolver and validator described in
-`docs/RUNTIME_VALIDATION.md`. Future
-provisioners, validators, disaster-recovery restore, and the interactive
-installer must consume this contract instead of copying versions, hashes, or
-paths into independent scripts.
+`docs/RUNTIME_VALIDATION.md`, followed by the offline provisioner described in
+`docs/RUNTIME_PROVISIONING.md`. Future disaster-recovery restore and the
+interactive installer must consume these APIs instead of copying versions,
+hashes, paths, selection rules, or acceptance logic into independent scripts.
 
 ## Foundation A/B deployment status
 

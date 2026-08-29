@@ -26,6 +26,8 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-file", required=True)
     parser.add_argument("--speed", type=float, default=1.0)
     parser.add_argument("--language", default="en-us")
+    parser.add_argument("--model-path", help="Internal staged Kokoro model override")
+    parser.add_argument("--voices-path", help="Internal staged Kokoro voices override")
     return parser
 
 
@@ -45,9 +47,19 @@ def main(
     if args.engine != TTSEngine.KOKORO.value:
         _emit_error("runtime_unavailable", "Piper provider is not productized yet", error_stream)
         return int(TTSExitCode.RUNTIME_UNAVAILABLE)
+    if (args.model_path is None) != (args.voices_path is None):
+        _emit_error(
+            "configuration",
+            "Kokoro staged model and voices paths must be supplied together",
+            error_stream,
+        )
+        return int(TTSExitCode.CONFIGURATION)
 
     try:
-        KokoroSynthesizer().synthesize(
+        KokoroSynthesizer(
+            model_path=args.model_path,
+            voices_path=args.voices_path,
+        ).synthesize(
             text,
             voice=args.voice,
             output_path=args.output_file,

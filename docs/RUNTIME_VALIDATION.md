@@ -7,10 +7,15 @@ separate questions:
 2. Which components does this station's active configuration require, and does
    the canonical installation prove that they work?
 
-These passes **do not provision anything**. They do not install packages,
+E1/E2 themselves **do not provision anything**. They do not install packages,
 download assets, create virtual environments, change database rows, modify
 system paths, or start services. Current dedication, road-condition, and
 weather-ingest callers remain on their historical production paths.
+
+Runtime Foundation E3 adds the separate deterministic offline provisioner
+documented in `docs/RUNTIME_PROVISIONING.md`. It consumes E1 requirements and
+must pass these E2 checks before accepting a generation; it does not change
+the definitions in this document.
 
 ## Canonical evidence before caller cutover
 

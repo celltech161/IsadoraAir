@@ -241,6 +241,7 @@ class ProviderCliTests(SimpleTestCase):
                 stderr=stderr,
             )
         self.assertEqual(result, TTSExitCode.SUCCESS)
+        synthesizer.assert_called_once_with(model_path=None, voices_path=None)
         synthesizer.return_value.synthesize.assert_called_once_with(
             "Text",
             voice="test_voice",
@@ -251,6 +252,39 @@ class ProviderCliTests(SimpleTestCase):
         source = Path(provider_cli.__file__).read_text(encoding="utf-8")
         self.assertNotIn("preprocess_text", source)
         self.assertNotIn("_DECIMAL_POINT_RE", source)
+
+    def test_kokoro_worker_accepts_only_a_paired_internal_staging_override(self):
+        stderr = io.StringIO()
+        with patch("isadoraair.tts.provider_cli.KokoroSynthesizer") as synthesizer:
+            result = provider_cli.main(
+                [
+                    "--engine", "kokoro",
+                    "--voice", "test_voice",
+                    "--output-file", "/tmp/provider-output.wav",
+                    "--model-path", "/staged/model.onnx",
+                    "--voices-path", "/staged/voices.bin",
+                ],
+                stdin=io.StringIO("Text"),
+                stderr=stderr,
+            )
+        self.assertEqual(result, TTSExitCode.SUCCESS)
+        synthesizer.assert_called_once_with(
+            model_path="/staged/model.onnx", voices_path="/staged/voices.bin"
+        )
+
+        stderr = io.StringIO()
+        result = provider_cli.main(
+            [
+                "--engine", "kokoro",
+                "--voice", "test_voice",
+                "--output-file", "/tmp/provider-output.wav",
+                "--model-path", "/staged/model.onnx",
+            ],
+            stdin=io.StringIO("Text"),
+            stderr=stderr,
+        )
+        self.assertEqual(result, TTSExitCode.CONFIGURATION)
+        self.assertIn("supplied together", stderr.getvalue())
 
     def test_worker_empty_input_is_structured_and_deterministic(self):
         stderr = io.StringIO()

@@ -297,6 +297,7 @@ class KokoroRuntimeValidatorTests(RuntimeValidatorFixture):
             import wave
             observed["cwd"] = provider.cwd
             observed["module_root"] = provider.module_root
+            observed["command"] = provider.command_factory(request, output_path)
             with wave.open(str(output_path), "wb") as output:
                 output.setnchannels(1)
                 output.setsampwidth(2)
@@ -307,6 +308,15 @@ class KokoroRuntimeValidatorTests(RuntimeValidatorFixture):
             _kokoro_smoke(requirement, product)
         self.assertNotEqual(observed["cwd"], Path.cwd())
         self.assertEqual(observed["module_root"].resolve(), Path(__file__).resolve().parents[2])
+        self.assertEqual(
+            observed["command"][-4:],
+            (
+                "--model-path",
+                product["assets"]["model"]["path"],
+                "--voices-path",
+                product["assets"]["voices"]["path"],
+            ),
+        )
         self.assertFalse(observed["cwd"].exists())
 
     def test_smoke_temporary_directory_is_removed_on_provider_failure(self):
@@ -458,6 +468,14 @@ class FdkaacRuntimeValidatorTests(RuntimeValidatorFixture):
         component = self.validator().validate(self.requirements(fdkaac=True)).components["fdkaac"]
         self.assertEqual(component.status, STATUS_PASS)
         self.assertEqual(self.calls["fdkaac"], 1)
+
+    def test_required_missing_binary_fails_without_running_host_validator(self):
+        component = self.validator().validate(
+            self.requirements(fdkaac=True)
+        ).components["fdkaac"]
+        self.assertEqual(component.status, STATUS_FAIL)
+        self.assertIn("binary is unavailable", " ".join(component.diagnostics))
+        self.assertEqual(self.calls["fdkaac"], 0)
 
     def test_required_failure_and_timeout_fail_safely(self):
         self.executable(self.fdkaac_binary)

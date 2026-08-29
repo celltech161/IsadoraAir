@@ -187,7 +187,10 @@ def _kokoro_smoke(requirement: ComponentRequirement, product: dict[str, Any]) ->
                 TTSEngine.KOKORO: SubprocessTTSProvider(
                     engine=TTSEngine.KOKORO,
                     command_factory=kokoro_provider_command(
-                        runtime["python"], runtime["provider_module"]
+                        runtime["python"],
+                        runtime["provider_module"],
+                        model_path=product["assets"]["model"]["path"],
+                        voices_path=product["assets"]["voices"]["path"],
                     ),
                     cwd=unrelated_cwd,
                     module_root=PROJECT_ROOT,
@@ -470,7 +473,9 @@ class RuntimeValidator:
         capabilities = ({"name": "lc_he_hev2_encode_and_decode", "verified": False},)
         observed: dict[str, Any] = {"binary_present": binary.is_file()}
         validator_path = self.project_root / product["build"]["validator"]
-        if not validator_path.is_file():
+        if not binary.is_file():
+            diagnostics.append("canonical fdkaac binary is unavailable")
+        elif not validator_path.is_file():
             diagnostics.append("authoritative HE-AAC validator is unavailable")
         else:
             try:
