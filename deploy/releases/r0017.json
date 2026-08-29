@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "release_id": "r0017",
+  "previous_release_id": "r0016",
+  "minimum_updater_protocol_version": 3,
+  "summary": "Ships Runtime Foundation E1-E6 as dormant infrastructure: the runtime-component contract, read-only requirement/evidence validation, offline TTS and native fdkaac provisioning primitives, canonical system-surface and installed TTS CLI primitives, and deployment-baseline/restore consolidation (closes the fdkaac pkg-config false-negative; fixes the E5 tmpfiles restore-destination mapping). No canonical runtime is provisioned or activated; existing TTS/native caller paths are unchanged.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [],
+  "nginx_changed": false,
+  "runtime_components_changed": true,
+  "minimum_supported_release_id": "r0007"
+}
