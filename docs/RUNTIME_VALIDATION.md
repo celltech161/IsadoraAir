@@ -123,9 +123,13 @@ For every selected station model it delegates basename/root confinement,
 model/config pairing, hashes, language, native sample rate, synthesis, and
 native-rate WAV proof to the existing `PiperTTSProvider` and `TTSService`.
 
-fdkaac validation invokes `deploy/check_he_aac.sh` with a bounded process group
-and translates its result. Foundation E does not duplicate that script's exact
-version, linkage, AAC-LC, HE-AAC/SBR, HE-AACv2/SBR+PS, and ffmpeg-decode checks.
+fdkaac validation invokes `deploy/check_he_aac.sh` with explicit canonical
+binary/library paths and a bounded process group, then translates its result.
+Canonical validation uses `--runtime-only`, omitting only build-time pkg-config
+metadata that E4 deliberately does not publish. Expected versioned-library
+identity, ELF linkage/resolution, AAC-LC, HE-AAC/SBR, HE-AACv2/SBR+PS, and
+ffmpeg-decode proofs remain unchanged. Full E4 staging validation continues to
+require pkg-config evidence. Foundation E does not duplicate those checks.
 
 All synthesis output lives in automatically cleaned temporary directories.
 There is no network operation and no sudo invocation.

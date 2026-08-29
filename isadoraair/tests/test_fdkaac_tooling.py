@@ -134,6 +134,7 @@ class FdkaacToolingTests(SimpleTestCase):
             "ffmpeg",
             "HE-AAC/SBR",
             "HE-AACv2/SBR+PS",
+            "--runtime-only",
         ):
             self.assertIn(required, text)
 

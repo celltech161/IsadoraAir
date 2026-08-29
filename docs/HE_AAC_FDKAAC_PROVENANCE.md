@@ -153,7 +153,14 @@ Encoder/Aircheck preflight contexts:
 deploy/check_he_aac.sh                         # canonical /usr/local
 deploy/check_he_aac.sh --prefix /tmp/stage     # isolated prefix
 deploy/check_he_aac.sh --fdkaac PATH --lib-dir PATH
+deploy/check_he_aac.sh --fdkaac PATH --lib-dir PATH --runtime-only
 ```
+
+`--runtime-only` serves Foundation E4's deliberately minimal canonical
+publication, which excludes build-only pkg-config metadata. It still checks
+the exact expected versioned library filename, fdkaac version, ELF dependency
+and exact resolution, and all three encode/decode profiles. Ordinary staged
+build validation remains the stricter pkg-config-aware default.
 
 It exits nonzero on any version, linkage, capability, or decode failure. It
 performs three real encodes and decodes (about 0.23 seconds on the audited
@@ -191,12 +198,24 @@ acquisition and warns; there is no silent fallback after local mode is chosen.
 The normal backup does not yet capture this private native payload, so the
 overall disaster-recovery archive remains unfinished.
 
-## Deliberate production installation and rollback
+## Deliberate production publication and rollback
 
-Foundation D performs no production install. A later approved production pass
-must preserve a rollback copy, run the same builder with both
-`--prefix /usr/local` and `--allow-production-prefix`, run `sudo ldconfig`, and
-then run the validator again without staging overrides. Rollback restores the
-previous binary, versioned library, symlinks, headers/pkg-config metadata, runs
-`ldconfig`, and repeats the validator. Removing only a symlink or library is
-unsafe because Ubuntu's older 2.0.2 can otherwise be selected silently.
+Foundation E4 supplies the reusable publication adapter; this checkpoint does
+not execute it in production. Its unprivileged phase invokes Foundation D only
+with `--source-dir` and a staging prefix. Its separately privileged phase
+requires an explicit trusted administrative preparer UID, verifies that UID
+and non-shared-writable ownership on the prepared handoff, copies the verified
+runtime files into private same-filesystem staging, runs
+the full validator there, snapshots and atomically replaces only the exact
+versioned library and fdkaac executable, runs `ldconfig`, and performs
+canonical runtime-only E2 validation. Failure restores the exact prior
+present/absent file state, reruns `ldconfig`, and compares fdkaac E2 evidence.
+Ubuntu's older 2.0.2 must never satisfy the intended-library resolution check.
+The trusted preparer is a provisioning/admin identity, not a runtime service
+account; the receipt's recorded UID is diagnostic and never an authority.
+E4 assumes honest preparation by that trusted actor; it proves the manifest
+source contract, handoff consistency, protected root-owned re-copy, hashes,
+Foundation D functionality, and canonical E2 acceptance, but intentionally
+does not cryptographically attest that a malicious preparer ran the audited
+builder. A compromised IsadoraAir runtime identity must therefore never be
+selected as the trusted preparer.

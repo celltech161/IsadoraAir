@@ -83,6 +83,7 @@ class RuntimeValidatorFixture(SimpleTestCase):
         self.manifest_path = self.root / "runtime_components.json"
         self._write_manifest()
         self.calls = {"kokoro": 0, "piper": 0, "fdkaac": 0}
+        self.fdkaac_args = []
         self.package_versions = {
             **kokoro["runtime"]["packages"],
             **piper["runtime"]["packages"],
@@ -103,8 +104,9 @@ class RuntimeValidatorFixture(SimpleTestCase):
         def piper_ok(requirement, product):
             self.calls["piper"] += 1
 
-        def fdkaac_ok(script):
+        def fdkaac_ok(script, binary, library_root):
             self.calls["fdkaac"] += 1
+            self.fdkaac_args.append((script, binary, library_root))
 
         return ValidationSeams(
             package_probe=package_probe or (
@@ -468,6 +470,10 @@ class FdkaacRuntimeValidatorTests(RuntimeValidatorFixture):
         component = self.validator().validate(self.requirements(fdkaac=True)).components["fdkaac"]
         self.assertEqual(component.status, STATUS_PASS)
         self.assertEqual(self.calls["fdkaac"], 1)
+        self.assertEqual(
+            self.fdkaac_args[0][1:],
+            (self.fdkaac_binary, Path(self.manifest["components"]["fdkaac"]["runtime"]["library_root"])),
+        )
 
     def test_required_missing_binary_fails_without_running_host_validator(self):
         component = self.validator().validate(
@@ -481,7 +487,7 @@ class FdkaacRuntimeValidatorTests(RuntimeValidatorFixture):
         self.executable(self.fdkaac_binary)
         for error in (RuntimeValidationError("validator failed"), RuntimeValidationError("validator timed out")):
             with self.subTest(error=error):
-                def fail(script, error=error):
+                def fail(script, binary, library_root, error=error):
                     raise error
                 component = self.validator(self.seams(fdkaac=fail)).validate(
                     self.requirements(fdkaac=True)

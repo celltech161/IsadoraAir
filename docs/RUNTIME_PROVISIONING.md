@@ -1,9 +1,10 @@
-# Runtime Foundation E3: deterministic offline TTS provisioning
+# Runtime Foundations E3/E4: deterministic offline runtime provisioning
 
 Foundation E3 consumes trusted local build material and constructs the
 canonical Kokoro and Piper runtimes. It performs no acquisition and does not
-activate any production caller. fdkaac publication, the stable system CLI,
-tmpfiles installation, caller migration, backup v3, restore integration, and
+activate any production caller. Foundation E4 adds the native fdkaac
+publication adapter described below. The stable system CLI, tmpfiles
+installation, caller migration, backup v3, restore integration, and
 fresh-installer orchestration remain later work.
 
 ## Authority boundaries
@@ -267,3 +268,138 @@ They must not copy this logic into `restore/70-tts.sh`.
 No production caller should be migrated until the canonical runtime and later
 system surfaces have separately passed their activation gates. Historical
 weather-ingest TTS remains an explicit companion/caller-migration concern.
+
+## E4 native fdkaac adapter
+
+Foundation D remains the sole fdkaac build authority:
+`runtime_components.json` owns versions, source archive filenames/byte counts/
+SHA-256 identities, canonical paths, and the build/validator paths;
+`deploy/build_fdkaac.sh` owns extraction and compilation; and
+`deploy/check_he_aac.sh` owns linkage and LC/HE/HEv2 capability acceptance.
+E4 does not duplicate those constants or recipes. It supplies deterministic
+orchestration and a protected publication transaction.
+
+The native plan is read-only and explicit:
+
+```bash
+python manage.py provision_runtime_components --fdkaac --plan
+python manage.py provision_runtime_components --fdkaac --plan \
+  --native-source-dir /path/to/native/fdkaac
+```
+
+`--bootstrap-fdkaac` deliberately selects the component for a future fresh
+installer even when current station features do not require it. Otherwise E1
+station requirements decide selection. A required healthy component is an
+authoritative no-op under the common E3/E4 provision lock: source material is
+not inspected, no build occurs, `ldconfig` is not called, and `/usr/local` is
+not changed. A required broken/missing component is blocked until an explicit
+source or prepared directory is supplied. Unrelated TTS failures remain visible
+in evidence but do not invalidate a successful component-scoped fdkaac repair.
+
+### Explicit two-identity lifecycle
+
+Compilation and protected publication are deliberately separate operations:
+
+```bash
+# Trusted, unprivileged administrative/provisioning identity
+python manage.py provision_runtime_components \
+  --prepare-fdkaac \
+  --native-source-dir /path/to/native/fdkaac \
+  --prepared-native-root /path/to/new-prepared-root
+
+# Explicit privileged identity for canonical /usr/local publication
+python manage.py provision_runtime_components \
+  --publish-fdkaac \
+  --prepared-native-root /path/to/new-prepared-root \
+  --trusted-preparer-uid "$(id -u TRUSTED_PREPARER_ACCOUNT)"
+```
+
+The first phase requires a new caller-owned output root. It verifies both
+manifest-named archives as non-symlink, single-link regular files with exact
+byte counts and hashes, copies them into a private preparation directory, and
+invokes exactly the existing local-only build shape:
+
+```text
+deploy/build_fdkaac.sh --source-dir VERIFIED_PRIVATE_COPY --prefix STAGED_PREFIX
+```
+
+E4 never supplies `--download-sources` or `--allow-production-prefix`, never
+infers a source directory, and never runs `sudo`. The build script retains the
+authoritative `BUILD_HEAAC` missing-tool diagnostic. After the script's own
+validation, E4 validates the prefix again and writes a hash/size/mode receipt.
+The preparer is a trusted administrator or provisioning identity, not an
+IsadoraAir runtime/service account and not an account whose prepared tree is
+writable by a runtime service. Preparation remains unprivileged.
+
+The second phase revalidates that mutable caller-owned receipt and material
+under the common lock, then copies only fdkaac, the exact versioned libfdk-aac,
+and temporary checker metadata into a mode-0700 private sibling beneath the
+mapped `/usr/local`. That protected copy is rehashed and receives the full
+authoritative staged check before canonical mutation. On real `/`, this phase
+requires the process itself to be root and requires an explicit
+`--trusted-preparer-uid`. The publisher checks the kernel `st_uid` and rejects
+symlinks, hard links, or group/world-writable modes for the prepared root,
+receipt, relied-upon prefix directories, artifacts, and SONAME. The UID written
+in the receipt is diagnostic only: it cannot select or infer the trusted
+identity. Caller-owned `--target-root` tests and future staging can publish
+unprivileged and default to the current caller's UID. There is no username
+lookup, `SUDO_USER` behavior, internal privilege broker, or root
+`safe.directory` configuration.
+
+This handoff protects against path escape, link substitution, receipt/material
+disagreement, and mutation by identities other than the explicitly trusted
+preparer before protected restaging. It assumes that the selected preparer
+identity and the privileged publisher are trusted administrative actors; it is
+not a cryptographic defense against a malicious preparer using its own UID.
+
+### Trust boundary
+
+E4 proves the source contract during honest preparation, receipt/file
+consistency at handoff, kernel ownership and restrictive modes after the
+privileged publisher accepts that handoff, a root-owned protected re-copy,
+content hashes, Foundation D functionality, and canonical component-scoped E2
+acceptance. Prepared material remains owned by the explicitly selected
+unprivileged preparer UID; it is not made root-owned merely to cross the
+boundary.
+
+E4 assumes that the preparation identity is a trusted administrative or
+provisioning actor. It deliberately does not provide cryptographic attestation
+that a malicious trusted preparer actually ran the audited build script. The
+IsadoraAir runtime/service identity must not be the preparer: compromising the
+running application or service must not grant a path to construct native
+runtime material that root will later trust.
+
+### Minimal transaction and rollback
+
+Canonical publication owns only:
+
+```text
+/usr/local/lib/libfdk-aac.so.2.0.3
+/usr/local/bin/fdkaac
+```
+
+No header tree, static archive, libtool archive, pkg-config tree, or other
+unrelated `/usr/local` content is recursively installed. E4 snapshots the exact
+pre-state, prepares fsynced same-directory temporary files, atomically replaces
+the versioned library first and fdkaac second, then invokes the host `ldconfig`
+with a minimal environment and bounded process group. `ldconfig` owns the
+runtime SONAME cache/link update. Caller-owned mapped test roots use ldconfig's
+directory-only mode, so no host cache is touched.
+
+Final acceptance is the existing Foundation E2 validator against the canonical
+binary and library root. Its explicit `--runtime-only` checker mode omits only
+the build-time pkg-config metadata requirement; exact expected versioned
+library identity, ELF dependency/resolution, AAC-LC, HE-AAC, HE-AACv2, and
+ffmpeg decode checks are unchanged. Protected build staging still uses the full
+pkg-config-aware check.
+
+Any failure after mutation restores the prior regular files (including an
+absent pre-state), reruns `ldconfig`, and compares fdkaac's E2 evidence with its
+pre-publication evidence. Rollback failure is reported while retaining the
+original failure as its cause. Private protected staging is removed after both
+success and failure; unrelated `/usr/local` files are never cleanup targets.
+
+E4 does not acquire the two private source archives, install `BUILD_HEAAC`
+packages, capture backup payloads, integrate restore/fresh-install flows, or
+activate production. The future DR source shape remains
+`native/fdkaac/{fdk-aac-2.0.3.tar.gz,fdkaac-1.0.7.tar.gz,SHA256SUMS,provenance}`.

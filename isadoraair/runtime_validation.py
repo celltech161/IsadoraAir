@@ -127,7 +127,7 @@ class RuntimeEvidence:
 PackageProbe = Callable[[str, Mapping[str, str]], dict[str, str]]
 KokoroSmoke = Callable[[ComponentRequirement, dict[str, Any]], None]
 PiperSmoke = Callable[[ComponentRequirement, dict[str, Any]], None]
-FdkaacCheck = Callable[[Path], None]
+FdkaacCheck = Callable[[Path, Path, Path], None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -264,10 +264,21 @@ def _terminate_group(process: subprocess.Popen[bytes]) -> None:
     process.wait()
 
 
-def _fdkaac_check(script: Path) -> None:
+def _fdkaac_check(
+    script: Path,
+    binary: Path | None = None,
+    library_root: Path | None = None,
+) -> None:
+    command = [str(script)]
+    if binary is not None:
+        command.extend(("--fdkaac", str(binary)))
+    if library_root is not None:
+        command.extend(("--lib-dir", str(library_root)))
+    if binary is not None or library_root is not None:
+        command.append("--runtime-only")
     try:
         process = subprocess.Popen(
-            [str(script)],
+            command,
             cwd=PROJECT_ROOT,
             env={
                 name: os.environ[name]
@@ -479,7 +490,11 @@ class RuntimeValidator:
             diagnostics.append("authoritative HE-AAC validator is unavailable")
         else:
             try:
-                self.seams.fdkaac_check(validator_path)
+                self.seams.fdkaac_check(
+                    validator_path,
+                    binary,
+                    Path(runtime["library_root"]),
+                )
                 capabilities = ({"name": "lc_he_hev2_encode_and_decode", "verified": True},)
                 observed.update(
                     {

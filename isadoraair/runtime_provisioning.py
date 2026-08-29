@@ -12,6 +12,7 @@ import subprocess
 import sys
 import uuid
 from copy import deepcopy
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable
@@ -216,6 +217,7 @@ class ProvisioningLayout:
     piper_venv: Path
     piper_assets: Path
     fdkaac_binary: Path
+    fdkaac_library_root: Path
 
     @staticmethod
     def _map(path: str | Path, target_root: Path) -> Path:
@@ -244,6 +246,7 @@ class ProvisioningLayout:
             piper_venv=cls._map(piper["runtime"]["venv"], root),
             piper_assets=cls._map(piper["models"]["root"], root),
             fdkaac_binary=cls._map(fdkaac["runtime"]["binary"], root),
+            fdkaac_library_root=cls._map(fdkaac["runtime"]["library_root"], root),
         )
 
     def runtime_pointer(self, component: str) -> Path:
@@ -296,7 +299,39 @@ def manifest_for_layout(
     piper["runtime"]["executable"] = str(piper_venv / "bin" / "piper")
     piper["models"]["root"] = str(piper_assets)
     mapped["components"]["fdkaac"]["runtime"]["binary"] = str(layout.fdkaac_binary)
+    mapped["components"]["fdkaac"]["runtime"]["library_root"] = str(
+        layout.fdkaac_library_root
+    )
     return mapped
+
+
+@contextmanager
+def runtime_provision_lock(layout: ProvisioningLayout):
+    """Acquire the one process-wide publication lock shared by E3 and E4."""
+
+    try:
+        _mkdir_controlled(layout.runtime_root)
+        lock_path = layout.runtime_root / ".provision.lock"
+        lock_descriptor = os.open(
+            lock_path,
+            os.O_RDWR
+            | os.O_CREAT
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+    except OSError as exc:
+        raise RuntimeProvisioningError(
+            "exclusive runtime provisioning lock could not be opened"
+        ) from exc
+    with os.fdopen(lock_descriptor, "a+b") as lock_file:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        except OSError as exc:
+            raise RuntimeProvisioningError(
+                "exclusive runtime provisioning lock could not be acquired"
+            ) from exc
+        yield
 
 
 @dataclass(frozen=True, slots=True)
@@ -879,28 +914,7 @@ class RuntimeProvisioner:
         if not plan.ready:
             raise RuntimeProvisioningError("provisioning plan contains blocking errors")
         self._preflight_apply()
-        try:
-            _mkdir_controlled(self.layout.runtime_root)
-            lock_path = self.layout.runtime_root / ".provision.lock"
-            lock_descriptor = os.open(
-                lock_path,
-                os.O_RDWR
-                | os.O_CREAT
-                | getattr(os, "O_CLOEXEC", 0)
-                | getattr(os, "O_NOFOLLOW", 0),
-                0o600,
-            )
-        except OSError as exc:
-            raise RuntimeProvisioningError(
-                "exclusive runtime provisioning lock could not be opened"
-            ) from exc
-        with os.fdopen(lock_descriptor, "a+b") as lock_file:
-            try:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-            except OSError as exc:
-                raise RuntimeProvisioningError(
-                    "exclusive runtime provisioning lock could not be acquired"
-                ) from exc
+        with runtime_provision_lock(self.layout):
             locked_plan = self.plan()
             if not locked_plan.ready:
                 raise RuntimeProvisioningError("provisioning plan changed and is no longer ready")

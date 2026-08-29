@@ -112,6 +112,12 @@ fdkaac 1.0.7, libfdk-aac 2.0.3, and these exact GitHub-free source inputs:
 archives; `--download-sources` is separate and optional. Both converge on one
 build path and automatically invoke `deploy/check_he_aac.sh`, which verifies
 version, intended 2.0.3 linkage, LC, HE/SBR, HEv2/SBR+PS, and ffmpeg decode.
+Foundation E4 invokes only local-source mode into an unprivileged staged
+prefix, then publishes only the exact versioned shared library and fdkaac
+executable through a protected transaction. Full staged validation still
+checks pkg-config metadata; canonical E2 uses the checker's explicit
+runtime-only mode because headers, static/libtool files, and pkg-config data
+are build artifacts rather than the minimal runtime publication set.
 The private archives are not stored in Git and are not yet captured by the
 production backup.
 

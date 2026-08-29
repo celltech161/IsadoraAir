@@ -22,6 +22,7 @@ Options:
   --lib-dir PATH                     Intended libfdk-aac directory.
   --expected-fdkaac-version VERSION  Override manifest expectation.
   --expected-libfdk-version VERSION  Override manifest expectation.
+  --runtime-only                     Do not require build-only pkg-config metadata.
   -h, --help                         Show this help.
 
 With no arguments, validates canonical production paths from the runtime
@@ -53,6 +54,7 @@ LIB_DIR="${DEFAULTS[1]}"
 EXPECTED_FDKAAC_VERSION="${DEFAULTS[2]}"
 EXPECTED_LIBFDK_VERSION="${DEFAULTS[3]}"
 PREFIX_VALUE=""
+RUNTIME_ONLY=0
 
 if [ "$#" -gt 0 ] && [[ "$1" != -* ]]; then
   FDKAAC_BIN="$1"
@@ -75,6 +77,7 @@ while [ "$#" -gt 0 ]; do
     --expected-fdkaac-version=*) EXPECTED_FDKAAC_VERSION="${1#*=}"; shift ;;
     --expected-libfdk-version) EXPECTED_LIBFDK_VERSION="${2:?version required}"; shift 2 ;;
     --expected-libfdk-version=*) EXPECTED_LIBFDK_VERSION="${1#*=}"; shift ;;
+    --runtime-only) RUNTIME_ONLY=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "FAIL: unrecognized argument: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -89,7 +92,11 @@ if [ -n "$PREFIX_VALUE" ]; then
   LIB_DIR="$PREFIX_VALUE/lib"
 fi
 
-for tool in python3 readelf ldd realpath pkg-config ffmpeg awk sed; do
+REQUIRED_TOOLS=(python3 readelf ldd realpath ffmpeg awk sed)
+if [ "$RUNTIME_ONLY" -eq 0 ]; then
+  REQUIRED_TOOLS+=(pkg-config)
+fi
+for tool in "${REQUIRED_TOOLS[@]}"; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     echo "FAIL: required validation tool not found on PATH: $tool" >&2
     exit 1
@@ -119,15 +126,19 @@ if [ ! -f "$EXPECTED_LIBRARY" ]; then
   echo "FAIL: expected libfdk-aac versioned library is missing: $EXPECTED_LIBRARY" >&2
   exit 1
 fi
-ACTUAL_PC_VERSION="$(PKG_CONFIG_PATH="$LIB_DIR/pkgconfig" \
-  PKG_CONFIG_LIBDIR="$LIB_DIR/pkgconfig" pkg-config --modversion fdk-aac 2>/dev/null || true)"
-if [ "$ACTUAL_PC_VERSION" != "$EXPECTED_LIBFDK_VERSION" ]; then
-  echo "FAIL: staged fdk-aac pkg-config version mismatch" >&2
-  echo "  expected: $EXPECTED_LIBFDK_VERSION" >&2
-  echo "  actual:   ${ACTUAL_PC_VERSION:-unavailable}" >&2
-  exit 1
+if [ "$RUNTIME_ONLY" -eq 0 ]; then
+  ACTUAL_PC_VERSION="$(PKG_CONFIG_PATH="$LIB_DIR/pkgconfig" \
+    PKG_CONFIG_LIBDIR="$LIB_DIR/pkgconfig" pkg-config --modversion fdk-aac 2>/dev/null || true)"
+  if [ "$ACTUAL_PC_VERSION" != "$EXPECTED_LIBFDK_VERSION" ]; then
+    echo "FAIL: staged fdk-aac pkg-config version mismatch" >&2
+    echo "  expected: $EXPECTED_LIBFDK_VERSION" >&2
+    echo "  actual:   ${ACTUAL_PC_VERSION:-unavailable}" >&2
+    exit 1
+  fi
+  echo "PASS libfdk-aac version: $ACTUAL_PC_VERSION"
+else
+  echo "PASS libfdk-aac runtime identity: $EXPECTED_LIBRARY"
 fi
-echo "PASS libfdk-aac version: $ACTUAL_PC_VERSION"
 
 if ! readelf -d "$FDKAAC_BIN" | awk '/NEEDED/ && /libfdk-aac\.so\.2/ {found=1} END {exit !found}'; then
   echo "FAIL: fdkaac ELF does not declare the required libfdk-aac.so.2 dependency" >&2
