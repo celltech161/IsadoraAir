@@ -301,7 +301,13 @@ class BackupScriptContentTests(SimpleTestCase):
     # helper script this file calls (deploy/encrypt_recovery_credentials.sh).
 
     def test_script_version_bumped_for_new_archive_layout(self):
-        self.assertIn('SCRIPT_VERSION="2.1.0"', self.text)
+        # Runtime Foundation E7B (2026-08-29): bumped again, to a MAJOR
+        # version (3.0.0) -- see RuntimeRecoveryPayloadBackupTests for the
+        # dedicated v3/runtime-recovery coverage. This assertion still only
+        # needs to prove SCRIPT_VERSION was deliberately bumped past its
+        # pre-E7B baseline, not pin the exact string forever.
+        self.assertIn('SCRIPT_VERSION="3.0.0"', self.text)
+        self.assertNotIn('SCRIPT_VERSION="2.1.0"', self.text)
 
     def test_encryption_step_calls_the_standalone_helper_script(self):
         self.assertIn(
@@ -395,6 +401,134 @@ class BackupScriptContentTests(SimpleTestCase):
         exit path, success or failure), never somewhere that could
         survive a crash."""
         self.assertIn('RECOVERY_CRED_DIR="$WORKDIR/recovery-credentials"', self.text)
+
+
+class RuntimeRecoveryPayloadBackupTests(SimpleTestCase):
+    """Runtime Foundation E7B -- static assertions proving
+    deploy/backup_isadoraair.sh's own runtime-recovery/ integration,
+    matching this file's own established real-execution-would-need-
+    production-secrets rationale (see module docstring)."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.text = SCRIPT_PATH.read_text(encoding="utf-8")
+
+    def test_script_version_is_separate_from_archive_format_classification(self):
+        self.assertIn('SCRIPT_VERSION="3.0.0"', self.text)
+        self.assertNotIn('SCRIPT_VERSION="2.1.0"', self.text)
+        self.assertIn("runtime-recovery-archive.json", self.text)
+        self.assertIn("archive_format_version", self.text)
+        self.assertIn("recovery_class", self.text)
+
+    def test_recovery_payload_config_vars_default_safely(self):
+        self.assertIn(
+            'RECOVERY_PAYLOAD_ROOT="${RECOVERY_PAYLOAD_ROOT:-/var/lib/isadoraair/runtime-recovery}"', self.text
+        )
+        self.assertIn('BACKUP_REQUIRED_RECOVERY_COMPONENTS="${BACKUP_REQUIRED_RECOVERY_COMPONENTS:-}"', self.text)
+
+    def test_payload_validated_via_the_real_e7a_python_api_not_reimplemented(self):
+        """Must call validate_runtime_recovery_payload (the actual E7A/
+        E7B Python authority) -- never parse/re-derive wheel/model/
+        source identity itself in shell."""
+        self.assertIn("validate_runtime_recovery_payload --base-root", self.text)
+        self.assertIn("--current --json", self.text)
+        # No independent hash table or wheel/package constant sneaked in.
+        self.assertNotIn("kokoro-onnx", self.text)
+        self.assertNotIn("sha256sum", self.text)
+
+    def test_no_network_acquisition_introduced(self):
+        """This step must never fetch anything -- no pip install, no
+        curl/wget, no --download-sources -- only validate+copy an
+        already-prepared local payload."""
+        self.assertNotIn("--download-sources", self.text)
+        self.assertNotIn("pip install", self.text)
+        self.assertNotIn("curl ", self.text)
+        self.assertNotIn("wget ", self.text)
+
+    def test_configured_but_broken_payload_always_aborts(self):
+        """Exit code 2 is treated specially ONLY when paired with an
+        EMPTY BACKUP_REQUIRED_RECOVERY_COMPONENTS -- every other exit
+        code (including exit 2 WITH a policy configured) is fatal,
+        unconditionally."""
+        self.assertIn('if [ "$RECOVERY_PAYLOAD_EXIT" -eq 2 ] && [ -z "$BACKUP_REQUIRED_RECOVERY_COMPONENTS" ]; then', self.text)
+        self.assertIn('elif [ "$RECOVERY_PAYLOAD_EXIT" -ne 0 ]; then', self.text)
+        self.assertIn("aborting before upload", self.text)
+
+    def test_not_configured_case_never_aborts_when_no_policy_set(self):
+        start = self.text.index('if [ "$RECOVERY_PAYLOAD_EXIT" -eq 2 ]')
+        end = self.text.index("elif ", start)
+        not_configured_branch = self.text[start:end]
+        self.assertNotRegex(not_configured_branch, r"\bexit 1\b")
+
+    def test_copied_payload_is_re_validated_inside_workdir(self):
+        """Belt-and-suspenders, matching the existing app.tar.gz manage.py/
+        .env checks -- the COPY itself must be re-validated, not just the
+        original source."""
+        self.assertIn('validate_runtime_recovery_payload "$WORKDIR/runtime-recovery"', self.text)
+
+    def test_unprivileged_backup_copy_does_not_attempt_to_preserve_root_ownership(self):
+        start = self.text.index("Validating and including the current Runtime Foundation E7")
+        end = self.text.index('echo "Encrypting recovery credentials', start)
+        payload_step = self.text[start:end]
+        self.assertIn('cp -R "$RECOVERY_PAYLOAD_RESOLVED_PATH/."', payload_step)
+        self.assertNotIn('cp -a "$RECOVERY_PAYLOAD_RESOLVED_PATH/."', payload_step)
+
+    def test_policy_is_parsed_by_the_strict_python_authority(self):
+        self.assertIn('--require-components "$BACKUP_REQUIRED_RECOVERY_COMPONENTS"', self.text)
+        self.assertNotIn("REQUIRED_COMPONENT_LIST", self.text)
+
+    def test_recovery_payload_step_runs_before_manifest_and_upload(self):
+        payload_step = self.text.index("Validating and including the current Runtime Foundation E7")
+        manifest_write = self.text.index('echo "Writing backup manifest...')
+        upload_step = self.text.index("Uploading via SFTP")
+        self.assertLess(payload_step, manifest_write)
+        self.assertLess(manifest_write, upload_step)
+
+    def test_recovery_payload_step_is_not_gated_by_dry_run(self):
+        """This step touches no network at all (pure local filesystem +
+        one Django ORM read for Piper freshness) -- it must run
+        identically whether or not DRY_RUN=1, exactly like every other
+        archive-building step, never specially skipped."""
+        start = self.text.index("Validating and including the current Runtime Foundation E7")
+        end = self.text.index('echo "Encrypting recovery credentials')
+        step_body = self.text[start:end]
+        self.assertNotIn("DRY_RUN", step_body)
+
+    def test_manifest_records_required_fields(self):
+        for expected in (
+            "Runtime recovery payload ID:",
+            "Runtime recovery payload schema version:",
+            "Runtime recovery product-contract digest:",
+            "Runtime recovery tts component:",
+            "Runtime recovery native fdkaac component:",
+            "Runtime recovery required-component policy:",
+            "Runtime recovery required-component policy satisfied:",
+        ):
+            self.assertIn(expected, self.text)
+
+    def test_manifest_contents_listing_mentions_runtime_recovery(self):
+        self.assertIn("runtime-recovery/", self.text)
+
+    def test_venv_python_prerequisite_checked_early(self):
+        self.assertIn('APP_VENV_PYTHON="$PROJECT_DIR/venv/bin/python"', self.text)
+        self.assertIn('if [ ! -x "$APP_VENV_PYTHON" ]; then', self.text)
+
+    def test_json_field_extraction_uses_stdlib_json_never_eval(self):
+        self.assertIn("import json, sys", self.text)
+        self.assertNotIn("eval ", self.text)
+        self.assertNotIn("eval(", self.text)
+
+    def test_existing_safety_checks_still_present(self):
+        """E7B must not regress any pre-existing safeguard."""
+        self.assertIn('if [ ! -s "$WORKDIR/database.dump" ]; then', self.text)
+        self.assertIn("manage\\.py", self.text)
+        self.assertIn(".env.bak", self.text)
+        self.assertIn(".env.lock", self.text)
+        self.assertIn("album_art_cache", self.text)
+        self.assertIn('REMOTE_PARTIAL="${REMOTE_FILE}.partial"', self.text)
+        self.assertIn("rename ${REMOTE_PARTIAL} ${REMOTE_FILE}", self.text)
+        self.assertIn("RETENTION_DAYS=30", self.text)
 
 
 class EncryptRecoveryCredentialsScriptTests(SimpleTestCase):

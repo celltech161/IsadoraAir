@@ -19,6 +19,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from django.core.management import call_command
+from django.core.management.base import CommandError
 from django.test import SimpleTestCase, TestCase
 
 from isadoraair.runtime_bundle import RuntimeBundleError, load_runtime_bundle
@@ -31,6 +32,7 @@ from isadoraair.runtime_provisioning import (
     _install_wheels,
     _minimal_environment,
 )
+from isadoraair.runtime_recovery import RuntimeRecoveryBuilder, load_recovery_payload
 from isadoraair.runtime_requirements import (
     ComponentRequirement,
     PiperModelRequirement,
@@ -45,6 +47,10 @@ from isadoraair.runtime_validation import (
     STATUS_PASS,
 )
 from isadoraair.tests.test_runtime_bundle import RuntimeBundleFixture, digest
+from monitoring.management.commands.provision_runtime_components import (
+    RECOVERY_PAYLOAD_REASON,
+    _requirements_for_recovery_tts,
+)
 
 
 def _requirements(
@@ -942,3 +948,250 @@ class RuntimeProvisioningCommandTests(TestCase):
         self.assertEqual(evidence["components"], [])
         self.assertEqual(before_counts, {model: model.objects.count() for model in models})
         self.assertEqual(before_files, tuple(self.target.rglob("*")))
+
+
+class RecoveryPayloadTTSRequirementsTests(RuntimeProvisioningFixture):
+    """Runtime Foundation E7B: --recovery-payload's requirements are
+    payload-derived for dormant historical Kokoro, while Piper retains
+    the restored database's E1 model/config identity authority. See
+    isadoraair/runtime_recovery.py's module docstring and
+    monitoring/management/commands/provision_runtime_components.py's
+    _requirements_for_recovery_tts."""
+
+    def _payload(self, *, output_name: str) -> Path:
+        payload_root = self.root / output_name
+        piper_requirement = ComponentRequirement("piper")
+        if "piper" in self.components:
+            model = self.components["piper"]["models"][0]
+            piper_requirement = ComponentRequirement(
+                "piper",
+                True,
+                ("restored station",),
+                piper_models=(
+                    PiperModelRequirement(
+                        model_id=model["model_id"],
+                        model_filename=Path(model["model"]["filename"]).name,
+                        config_filename=Path(model["config"]["filename"]).name,
+                        model_sha256=model["model"]["sha256"],
+                        config_sha256=model["config"]["sha256"],
+                        language=model["language"],
+                        sample_rate_hz=model["sample_rate_hz"],
+                    ),
+                ),
+            )
+        RuntimeRecoveryBuilder(product_manifest=self.product).apply(
+            tts_bundle=self.bundle_root,
+            output=payload_root,
+            payload_id=output_name,
+            piper_selection=RuntimeRequirements(components={"piper": piper_requirement}),
+        )
+        return payload_root
+
+    def test_kokoro_only_bundle_requires_only_kokoro_never_from_e1(self):
+        self.add_kokoro()
+        self.write_manifest()
+        payload_root = self._payload(output_name="p-kokoro-only")
+        payload = load_recovery_payload(payload_root, product_manifest=self.product)
+        requirements = _requirements_for_recovery_tts(payload.tts_bundle)
+        self.assertTrue(requirements.components["kokoro"].required)
+        self.assertEqual(requirements.components["kokoro"].reasons, (RECOVERY_PAYLOAD_REASON,))
+        self.assertFalse(requirements.components["piper"].required)
+        self.assertFalse(requirements.components["fdkaac"].required)
+
+    def test_kokoro_plus_piper_uses_exact_db_owned_piper_model_list(self):
+        self.add_kokoro()
+        self.add_piper(model_id="en_us-fixture")
+        self.write_manifest()
+        payload_root = self._payload(output_name="p-kokoro-piper")
+        payload = load_recovery_payload(payload_root, product_manifest=self.product)
+        station_requirements = RuntimeRequirements(
+            components={
+                "piper": ComponentRequirement(
+                    "piper",
+                    True,
+                    ("restored station",),
+                    piper_models=(
+                        PiperModelRequirement(
+                            model_id="en_us-fixture",
+                            model_filename="en_us-fixture.onnx",
+                            config_filename="en_us-fixture.onnx.json",
+                            model_sha256=self.components["piper"]["models"][0]["model"]["sha256"],
+                            config_sha256=self.components["piper"]["models"][0]["config"]["sha256"],
+                            language="en-us",
+                            sample_rate_hz=22050,
+                        ),
+                    ),
+                )
+            }
+        )
+        requirements = _requirements_for_recovery_tts(payload.tts_bundle, station_requirements)
+        piper_requirement = requirements.components["piper"]
+        self.assertTrue(piper_requirement.required)
+        self.assertEqual(len(piper_requirement.piper_models), 1)
+        model = piper_requirement.piper_models[0]
+        self.assertEqual(model.model_id, "en_us-fixture")
+        self.assertEqual(model.model_filename, "en_us-fixture.onnx")
+        self.assertEqual(model.config_filename, "en_us-fixture.onnx.json")
+        self.assertEqual(model.language, "en-us")
+        self.assertEqual(model.sample_rate_hz, 22050)
+
+    def test_synthesized_requirements_drive_a_real_publish(self):
+        """Not just shape -- prove the synthesized requirements actually
+        make RuntimeProvisioner.apply() publish kokoro, using this
+        file's own fake seams (no real pip/venv), exactly like every
+        other apply test here."""
+        self.add_kokoro()
+        self.write_manifest()
+        payload_root = self._payload(output_name="p-publish")
+        payload = load_recovery_payload(payload_root, product_manifest=self.product)
+        requirements = _requirements_for_recovery_tts(payload.tts_bundle)
+        provisioner = RuntimeProvisioner(
+            bundle_root=payload.tts_bundle.root,
+            requirements=requirements,
+            product_manifest=self.product,
+            target_root=self.target,
+            seams=self.seams(),
+        )
+        result = provisioner.apply()
+        self.assertIn("kokoro", result.changed_components)
+        self.assertFalse(result.no_op)
+
+    def test_recovery_payload_cli_flag_bypasses_e1_and_wires_the_bundle(self):
+        """CLI-level wiring: --recovery-payload both supplies --bundle
+        and replaces resolve_current_runtime_requirements() -- proven by
+        patching RuntimeProvisioner itself and inspecting what it was
+        actually constructed with (station DB is never touched)."""
+        self.add_kokoro()
+        self.write_manifest()
+        payload_root = self._payload(output_name="p-cli")
+        stdout = io.StringIO()
+        with patch(
+            "monitoring.management.commands.provision_runtime_components.RuntimeProvisioner"
+        ) as provisioner_cls, patch(
+            "monitoring.management.commands.provision_runtime_components.resolve_current_runtime_requirements"
+        ) as resolver, patch(
+            "monitoring.management.commands.provision_runtime_components.load_runtime_components",
+            return_value=self.product,
+        ):
+            plan = provisioner_cls.return_value.plan.return_value
+            plan.to_json.return_value = json.dumps({"ready": True})
+            plan.ready = True
+            call_command(
+                "provision_runtime_components",
+                "--recovery-payload",
+                str(payload_root),
+                "--target-root",
+                str(self.target),
+                "--plan",
+                "--json",
+                stdout=stdout,
+            )
+        resolver.assert_not_called()
+        _, kwargs = provisioner_cls.call_args
+        self.assertEqual(Path(kwargs["bundle_root"]), payload_root / "tts")
+        self.assertTrue(kwargs["requirements"].components["kokoro"].required)
+
+    def test_piper_recovery_fails_when_restored_database_cannot_be_inspected(self):
+        self.add_piper(model_id="en_us-fixture")
+        self.write_manifest()
+        payload_root = self._payload(output_name="p-piper-db-unavailable")
+        with patch(
+            "monitoring.management.commands.provision_runtime_components.load_runtime_components",
+            return_value=self.product,
+        ), patch(
+            "monitoring.management.commands.provision_runtime_components.resolve_current_runtime_requirements",
+            side_effect=RuntimeError("database unavailable"),
+        ), self.assertRaisesRegex(CommandError, "station configuration could not be inspected"):
+            call_command(
+                "provision_runtime_components",
+                "--recovery-payload",
+                str(payload_root),
+                "--target-root",
+                str(self.target),
+                "--plan",
+            )
+
+    def test_piper_recovery_fails_when_restored_database_selects_different_identity(self):
+        self.add_piper(model_id="en_us-fixture")
+        self.write_manifest()
+        payload_root = self._payload(output_name="p-piper-stale")
+        different = RuntimeRequirements(
+            components={
+                "piper": ComponentRequirement(
+                    "piper",
+                    True,
+                    ("different station",),
+                    piper_models=(
+                        PiperModelRequirement(
+                            model_id="different",
+                            model_filename="different.onnx",
+                            config_filename="different.onnx.json",
+                            model_sha256="1" * 64,
+                            config_sha256="2" * 64,
+                            language="en-us",
+                            sample_rate_hz=22050,
+                        ),
+                    ),
+                )
+            }
+        )
+        with patch(
+            "monitoring.management.commands.provision_runtime_components.load_runtime_components",
+            return_value=self.product,
+        ), patch(
+            "monitoring.management.commands.provision_runtime_components.resolve_current_runtime_requirements",
+            return_value=different,
+        ), self.assertRaisesRegex(CommandError, "does not match the restored station selection"):
+            call_command(
+                "provision_runtime_components",
+                "--recovery-payload",
+                str(payload_root),
+                "--target-root",
+                str(self.target),
+                "--plan",
+            )
+
+    def test_recovery_payload_and_bundle_together_is_rejected(self):
+        self.add_kokoro()
+        self.write_manifest()
+        payload_root = self._payload(output_name="p-conflict")
+        with patch(
+            "monitoring.management.commands.provision_runtime_components.load_runtime_components",
+            return_value=self.product,
+        ), self.assertRaisesRegex(CommandError, "do not also pass --bundle"):
+            call_command(
+                "provision_runtime_components",
+                "--recovery-payload",
+                str(payload_root),
+                "--bundle",
+                str(self.bundle_root),
+                "--plan",
+            )
+
+    def test_recovery_payload_without_tts_component_is_rejected(self):
+        native_source = self.root / "native-src"
+        archives = self.product["components"]["fdkaac"]["source_archives"]
+        for name, expected in archives.items():
+            content = f"FAKE ARCHIVE {name}".encode()
+            path = native_source / expected["filename"]
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
+            path.chmod(0o644)
+            expected["bytes"] = len(content)
+            expected["sha256"] = digest(content)
+        payload_root = self.root / "p-native-only"
+        RuntimeRecoveryBuilder(product_manifest=self.product).apply(
+            native_source_dir=native_source, output=payload_root, payload_id="p-native-only"
+        )
+        with patch(
+            "monitoring.management.commands.provision_runtime_components.load_runtime_components",
+            return_value=self.product,
+        ), self.assertRaisesRegex(CommandError, "no tts component"):
+            call_command(
+                "provision_runtime_components",
+                "--recovery-payload",
+                str(payload_root),
+                "--target-root",
+                str(self.target),
+                "--plan",
+            )

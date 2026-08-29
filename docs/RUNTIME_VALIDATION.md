@@ -142,8 +142,11 @@ provisioner, backup v3, bare-machine restore, fresh installer,
 consume the same evidence.
 
 That integration is not part of E1/E2. In particular,
-`deploy/restore/70-tts.sh` still provisions historical home-directory runtimes,
-`deploy/restore/95-validate.sh` still calls `check_deploy_baseline`, and that
+`deploy/restore/70-tts.sh` still provisions historical home-directory runtimes
+for its explicit connected/fresh-install mode (Runtime Foundation E7B,
+2026-08-29: its default backup-based-DR mode now delegates to Foundation
+E3 instead — see `docs/RUNTIME_BACKUP_PAYLOAD.md`'s "Restore
+integration"), `deploy/restore/95-validate.sh` still calls `check_deploy_baseline`, and that
 management command still carries older `/home/jreed/...` presence-oriented TTS
 checks. `deploy/restore/50-native-deps.sh` already delegates native work to the
 authoritative fdkaac tooling and should remain the provisioning layer rather

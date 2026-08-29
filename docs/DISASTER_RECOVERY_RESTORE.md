@@ -31,9 +31,9 @@ clean Ubuntu 26.04
   v  deploy/restore/20-application.sh  -- git clone + SHA checkout, .env + media/
   v  deploy/restore/30-postgresql.sh   -- role/DB bootstrap, pg_restore
   v  deploy/restore/40-station-content.sh -- carts/voicetracks/reports/StereoTool profile
-  v  deploy/restore/50-native-deps.sh  -- fdk-aac/fdkaac build + HE-AAC validation
   v  deploy/restore/60-python.sh       -- IsadoraAir venv
-  v  deploy/restore/70-tts.sh          -- Kokoro + Piper
+  v  deploy/restore/50-native-deps.sh  -- native fdkaac (see "Runtime recovery payload" below)
+  v  deploy/restore/70-tts.sh          -- Kokoro + Piper (see "Runtime recovery payload" below)
   v  deploy/restore/80-companions.sh   -- syndicated-ingest/weather-ingest/ogremote-ingest
   v  deploy/restore/90-system-config.sh -- nginx + systemd units installed, NOT started
   v  deploy/restore/95-validate.sh     -- read-only final check (manage.py check,
@@ -48,32 +48,94 @@ clean Ubuntu 26.04
   v  issue or restore certificates
 ```
 
-For the native stage, a future complete DR archive supplies its extracted
-`native/fdkaac/` directory directly:
-
-```bash
-deploy/restore/50-native-deps.sh --apply --staging-root /path/to/stage \
-  --source-dir /path/to/extracted-backup/native/fdkaac
-```
-
-For the all-stage orchestrator, export the same handoff without passing a flag
-that unrelated stages would reject:
-
-```bash
-FDKAAC_SOURCE_DIR=/path/to/extracted-backup/native/fdkaac \
-  deploy/restore/restore.sh --archive /path/to/backup.tar.gz --apply ...
-```
-
-That local mode verifies the exact manifest hashes and cannot use the network.
-The current production backup has not yet been extended to carry those source
-archives, so this invocation documents the handoff contract rather than
-claiming end-to-end DR completion.
+Note 60-python now runs *before* 50-native-deps, reversing the numeric
+order the filenames imply — see "Runtime recovery payload" below and
+`deploy/restore/README.md`'s dependency map for why.
 
 Run each stage with `--plan` first (always safe, never writes anything),
 then `--apply` once the plan looks right. `deploy/restore/restore.sh`
 chains all eleven stages if you'd rather run them in one shot; running
 them individually and reviewing each is recommended for the actual
 Phase 5 drill.
+
+## Runtime recovery payload (Runtime Foundation E7B)
+
+If `runtime-recovery-archive.json` classifies the backup as archive
+format `3.0.0` / `self_contained_v3`, it positively carries a validated
+`runtime-recovery/` payload satisfying a non-empty operator policy. Stages
+50 and 70 use it automatically — nothing else to pass:
+
+```bash
+deploy/restore/restore.sh --archive /path/to/backup-v3.tar.gz \
+  --staging-root /path/to/stage --apply
+```
+
+Each stage locates and validates the embedded payload
+(`deploy/restore/lib.sh`'s `restore_locate_recovery_payload`, the one
+shared contract both use), then delegates to Foundation E4's real
+prepare/publish authority (native fdkaac) or Foundation E3's real
+provisioner (Kokoro/Piper) — see `docs/RUNTIME_BACKUP_PAYLOAD.md`'s
+"Restore integration" section for the exact mechanism. Which of Kokoro/
+Kokoro requiredness is read from the recovery policy/bundle so the known
+historical-caller blind spot cannot drop it. Piper remains DB-owned: its
+bundle identity, payload selection digest, and restored station model/config
+selection must all match before publication; DB `not_checked` fails closed.
+
+**If the archive has no `runtime-recovery/` payload** (every archive
+taken before an operator activates E7B on the production host, and
+every archive from before this checkpoint) — see "Backward
+compatibility" below; each stage reports this plainly and does not
+silently fall back to the network.
+
+**Explicit connected/fresh install** (not for backup-based DR) remains
+available, unchanged, as a clearly separate mode:
+
+```bash
+# Native fdkaac -- local source archives, no payload involved:
+deploy/restore/50-native-deps.sh --apply --staging-root /path/to/stage \
+  --source-dir /path/to/fdkaac/sources
+# ...or, accepting a real network fetch:
+deploy/restore/50-native-deps.sh --apply --staging-root /path/to/stage \
+  --download-sources
+
+# TTS -- the old per-engine venv + pip install path:
+deploy/restore/70-tts.sh --apply --staging-root /path/to/stage \
+  --legacy-connected-install
+```
+
+For the all-stage orchestrator, export the source-dir handoff without
+passing a flag that unrelated stages would reject:
+
+```bash
+FDKAAC_SOURCE_DIR=/path/to/fdkaac/sources \
+  deploy/restore/restore.sh --archive /path/to/backup.tar.gz --apply ...
+```
+
+### Backward compatibility — v2.x / non-self-contained archives
+
+A v2.x archive, and an archive taken by the 3.0.0-capable script before an operator ever
+activated a policy-satisfying recovery payload on the production host (`RECOVERY_PAYLOAD_ROOT`
+is not populated there as of this writing — see
+`docs/RUNTIME_BACKUP_PAYLOAD.md`'s "Persistent payload location"), are
+**equivalent** for this purpose: neither is self-contained for Runtime
+Foundation E TTS/native recovery. Restoring from one:
+
+- `50-native-deps.sh`/`70-tts.sh` (default, `--archive`-driven mode)
+  report `LEGACY ARCHIVE -- NOT SELF-CONTAINED FOR FOUNDATION E` and fail.
+  They never fall back to `--download-sources` or `pip install`.
+- Stages 50/70 record successful component recovery in a target-mapped
+  receipt bound to the archive format and payload ID. `95-validate.sh`
+  consumes that receipt and refuses overall PASS unless every component in
+  the archive's non-empty recovery policy was actually reconstructed.
+- The **only** way to actually recover TTS/native from such an archive
+  is the explicit, operator-selected connected/fresh-install path shown
+  above (`--source-dir`/`--download-sources` for native,
+  `--legacy-connected-install` for TTS) — a conscious choice, documented
+  as a "legacy/manual recovery mode," never something either stage
+  reaches for on its own.
+  After deliberate manual reconstruction, pass
+  `--accept-legacy-runtime-recovery` to stage 95 itself; the output remains
+  explicitly classified as legacy rather than backup-v3 evidence.
 
 ## Manual checkpoints
 

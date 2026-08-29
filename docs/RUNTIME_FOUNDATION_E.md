@@ -13,14 +13,14 @@ detailed doc; this file is only the map between them.
 | **E4** | Native fdkaac prepare/publish (unprivileged build validation, then protected canonical publication) — shares E3's provisioning lock and atomic-publication primitives. | `docs/RUNTIME_PROVISIONING.md` |
 | **E5** | Canonical, stable OS-level filesystem/CLI surfaces: the installed `isadoraair-tts` launcher, `/opt/isadoraair-runtime`, `/var/lib/isadoraair/tts`, and their `systemd-tmpfiles` config — independent of `--target-root`'s file-placement mapping. | `docs/RUNTIME_SYSTEM_SURFACES.md` |
 | **E6** | Baseline + restore consolidation: DB-independent structural and canonical live/station tiers; target-root-aware offline restore validation; legacy preflight and `deploy/restore/` aggregated onto E1–E5 evidence; closes the fdkaac pkg-config false-negative; fail-closed component→Ubuntu-package-group relationships; target-identity/safe-ancestry scratch evidence; E5's tmpfiles config at its correct restore destination. | `docs/RUNTIME_DEPLOY_BASELINE.md` |
-| **E7A** | Backup v3 runtime payload contract, builder, and validator: a self-contained disaster-recovery artifact (an embedded, unmodified E3 TTS bundle plus E4's fdkaac source archives, with integrity/product-contract/Piper-freshness metadata) and its plan/apply preparation + read-only validation API. The artifact and API only — **not yet wired into** `deploy/backup_isadoraair.sh` (still v2.1.0) or `deploy/restore/50-native-deps.sh`/`70-tts.sh` (still their pre-Foundation-E mechanisms). | `docs/RUNTIME_BACKUP_PAYLOAD.md` |
-| **E7B** *(deferred)* | Wiring: `deploy/backup_isadoraair.sh` produces/validates the E7A payload as part of the nightly backup; `deploy/restore/50-native-deps.sh`/`70-tts.sh` consume it and hand off to E3/E4's own canonical provisioners instead of their current mechanisms. | *(not yet written; see `docs/RUNTIME_BACKUP_PAYLOAD.md`'s "E7B handoff" section)* |
-| **E8** *(deferred)* | Fully offline, disposable, whole-machine acceptance — an end-to-end restore/provision/validate run with no network access at all, once E7B's payload consumption exists. | *(not yet written)* |
+| **E7A** | Backup v3 runtime payload contract, builder, and validator: a self-contained disaster-recovery artifact (an embedded, unmodified E3 TTS bundle plus E4's fdkaac source archives, with integrity/product-contract/Piper-freshness metadata) and its plan/apply preparation + read-only validation API. | `docs/RUNTIME_BACKUP_PAYLOAD.md` |
+| **E7B** | Wiring: `deploy/backup_isadoraair.sh` implementation v3.0.0 emits an unambiguous machine-readable archive class (self-contained v3 only for a policy-satisfying payload; otherwise legacy 2.1), validates/copies E7A material without regenerating it, and restore stages safely extract and hand off to E3/E4's canonical provisioners. A payload-bound completion receipt gates stage-95 acceptance; explicit connected-install paths remain separate. A protected `<base-root>/payloads/<id>` + `current` location is established but **not activated on production**. Real-station archive staging (E7C) and production activation remain open. | `docs/RUNTIME_BACKUP_PAYLOAD.md` |
+| **E8** *(deferred)* | Fully offline, disposable, whole-machine acceptance — an end-to-end restore/provision/validate run with no network access at all, once E7C's real-archive proof exists. | *(not yet written)* |
 
 ## Reading order
 
 For a first read of the whole sequence: E1/E2 → E3 → E4 → E5 → E6 →
-E7A, in that order — each phase's doc assumes the previous ones'
+E7A → E7B, in that order — each phase's doc assumes the previous ones'
 vocabulary (canonical paths, the plan/apply/validate pattern, the
 shared provisioning lock, structured evidence) without re-explaining
 it.

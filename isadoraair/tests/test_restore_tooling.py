@@ -12,6 +12,8 @@ against small, synthetic, temp-directory-only archives (never a real
 production backup), which is enough to prove its actual pass/fail logic
 works without needing production data in the test suite."""
 import os
+import io
+import json
 import shutil
 import subprocess
 import tarfile
@@ -486,6 +488,304 @@ class InspectBackupFunctionalTests(SimpleTestCase):
         self.assertNotRegex(text, r"\bage\s+-i\b")
 
 
+class RestoreLocateRecoveryPayloadFunctionalTests(SimpleTestCase):
+    """Runtime Foundation E7B -- real subprocess execution of lib.sh's
+    restore_locate_recovery_payload against small synthetic backup-v3-
+    style archives, mirroring InspectBackupFunctionalTests' own
+    established pattern (never a real production backup)."""
+
+    def setUp(self):
+        self.tmpdir = Path(
+            subprocess.run(["mktemp", "-d"], capture_output=True, text=True, check=True).stdout.strip()
+        )
+        self.addCleanup(shutil.rmtree, self.tmpdir, ignore_errors=True)
+
+    def _build_archive(self, workdir: Path, out_path: Path):
+        with tarfile.open(out_path, "w:gz") as tf:
+            tf.add(workdir, arcname=".")
+
+    def _write_v3_metadata(self, workdir: Path, *, required=("native_fdkaac",)):
+        (workdir / "runtime-recovery-archive.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "backup_script_version": "3.0.0",
+                    "archive_format_version": "3.0.0",
+                    "recovery_class": "self_contained_v3",
+                    "payload_included": True,
+                    "payload_id": "p1",
+                    "payload_schema_version": 1,
+                    "product_contract_sha256": "0" * 64,
+                    "included_components": ["native_fdkaac"],
+                    "required_components": list(required),
+                    "policy_satisfied": True,
+                    "piper_freshness": "not_checked",
+                },
+                sort_keys=True,
+            )
+        )
+
+    def _locate(self, archive_path: Path, dest: Path):
+        script = (
+            'set -euo pipefail; '
+            f'source "{RESTORE_DIR / "lib.sh"}"; '
+            f'RESTORE_ARCHIVE="{archive_path}"; '
+            f'restore_locate_recovery_payload "{dest}"; '
+            'echo "FOUND=$RESTORE_RECOVERY_PAYLOAD_FOUND"'
+        )
+        return subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=15)
+
+    def test_archive_with_runtime_recovery_extracts_it_as_the_payload_root(self):
+        workdir = self.tmpdir / "work"
+        (workdir / "runtime-recovery" / "native" / "fdkaac").mkdir(parents=True)
+        (workdir / "runtime-recovery" / "runtime-recovery.json").write_text('{"payload_id": "p1"}')
+        (workdir / "runtime-recovery" / "native" / "fdkaac" / "source.tar.gz").write_bytes(b"fake")
+        (workdir / "MANIFEST.txt").write_text("IsadoraAir Git SHA: abc123\n")
+        self._write_v3_metadata(workdir)
+        archive_path = self.tmpdir / "backup.tar.gz"
+        self._build_archive(workdir, archive_path)
+
+        dest = self.tmpdir / "extracted-payload"
+        result = self._locate(archive_path, dest)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("FOUND=1", result.stdout)
+        self.assertTrue((dest / "runtime-recovery.json").is_file())
+        self.assertTrue((dest / "native" / "fdkaac" / "source.tar.gz").is_file())
+        # Landed directly at dest -- no leftover "runtime-recovery/" prefix.
+        self.assertFalse((dest / "runtime-recovery").exists())
+
+    def test_archive_without_runtime_recovery_reports_not_found_not_error(self):
+        """A v2.x-style archive (or a v3 archive backed up with no
+        current payload configured) -- this must be a clean, non-fatal
+        FOUND=0, never a script error."""
+        workdir = self.tmpdir / "work"
+        workdir.mkdir()
+        (workdir / "MANIFEST.txt").write_text("IsadoraAir Git SHA: abc123\n")
+        (workdir / "database.dump").write_bytes(b"PGDMP" + b"\x00" * 20)
+        archive_path = self.tmpdir / "backup.tar.gz"
+        self._build_archive(workdir, archive_path)
+
+        dest = self.tmpdir / "extracted-payload"
+        result = self._locate(archive_path, dest)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("FOUND=0", result.stdout)
+
+    def test_no_archive_given_is_a_clean_failure(self):
+        script = (
+            'set -euo pipefail; '
+            f'source "{RESTORE_DIR / "lib.sh"}"; '
+            'RESTORE_ARCHIVE=""; '
+            f'restore_locate_recovery_payload "{self.tmpdir / "dest"}"'
+        )
+        result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=15)
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_nonempty_destination_is_refused_rather_than_merged_into(self):
+        workdir = self.tmpdir / "work"
+        (workdir / "runtime-recovery").mkdir(parents=True)
+        (workdir / "runtime-recovery" / "runtime-recovery.json").write_text("{}")
+        self._write_v3_metadata(workdir)
+        archive_path = self.tmpdir / "backup.tar.gz"
+        self._build_archive(workdir, archive_path)
+
+        dest = self.tmpdir / "already-has-stuff"
+        dest.mkdir()
+        (dest / "pre-existing-file").write_text("do not touch")
+        result = self._locate(archive_path, dest)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertTrue((dest / "pre-existing-file").is_file())
+        self.assertFalse((dest / "runtime-recovery.json").exists())
+
+    def test_symlink_member_is_rejected_before_extraction(self):
+        archive = self.tmpdir / "symlink.tar.gz"
+        metadata_root = self.tmpdir / "meta"
+        metadata_root.mkdir()
+        self._write_v3_metadata(metadata_root)
+        with tarfile.open(archive, "w:gz") as tf:
+            tf.add(metadata_root / "runtime-recovery-archive.json", arcname="runtime-recovery-archive.json")
+            root = tarfile.TarInfo("runtime-recovery/")
+            root.type = tarfile.DIRTYPE
+            tf.addfile(root)
+            link = tarfile.TarInfo("runtime-recovery/runtime-recovery.json")
+            link.type = tarfile.SYMTYPE
+            link.linkname = "/etc/passwd"
+            tf.addfile(link)
+        result = self._locate(archive, self.tmpdir / "dest-symlink")
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_traversal_member_is_rejected_before_extraction(self):
+        archive = self.tmpdir / "traversal.tar.gz"
+        metadata_root = self.tmpdir / "meta-traversal"
+        metadata_root.mkdir()
+        self._write_v3_metadata(metadata_root)
+        with tarfile.open(archive, "w:gz") as tf:
+            tf.add(metadata_root / "runtime-recovery-archive.json", arcname="runtime-recovery-archive.json")
+            member = tarfile.TarInfo("runtime-recovery/../../escape")
+            member.size = 4
+            tf.addfile(member, io.BytesIO(b"evil"))
+        result = self._locate(archive, self.tmpdir / "dest-traversal")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.tmpdir / "escape").exists())
+
+    def test_duplicate_member_is_rejected_before_extraction(self):
+        archive = self.tmpdir / "duplicate.tar.gz"
+        metadata_root = self.tmpdir / "meta-duplicate"
+        metadata_root.mkdir()
+        self._write_v3_metadata(metadata_root)
+        with tarfile.open(archive, "w:gz") as tf:
+            tf.add(metadata_root / "runtime-recovery-archive.json", arcname="runtime-recovery-archive.json")
+            for content in (b"one", b"two"):
+                member = tarfile.TarInfo("runtime-recovery/runtime-recovery.json")
+                member.size = len(content)
+                tf.addfile(member, io.BytesIO(content))
+        result = self._locate(archive, self.tmpdir / "dest-duplicate")
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_final_receipt_requires_every_policy_component(self):
+        workdir = self.tmpdir / "receipt-work"
+        (workdir / "runtime-recovery").mkdir(parents=True)
+        (workdir / "runtime-recovery" / "runtime-recovery.json").write_text("{}")
+        self._write_v3_metadata(workdir)
+        archive = self.tmpdir / "receipt.tar.gz"
+        self._build_archive(workdir, archive)
+        helper = RESTORE_DIR / "runtime_recovery_archive.py"
+        receipt = self.tmpdir / "receipt.json"
+        before = subprocess.run(
+            [str(helper), "accept", "--archive", str(archive), "--receipt", str(receipt)],
+            capture_output=True, text=True, timeout=15,
+        )
+        self.assertNotEqual(before.returncode, 0)
+        recorded = subprocess.run(
+            [str(helper), "record", "--archive", str(archive), "--receipt", str(receipt),
+             "--component", "native_fdkaac"],
+            capture_output=True, text=True, timeout=15,
+        )
+        self.assertEqual(recorded.returncode, 0, recorded.stdout + recorded.stderr)
+        accepted = subprocess.run(
+            [str(helper), "accept", "--archive", str(archive), "--receipt", str(receipt)],
+            capture_output=True, text=True, timeout=15,
+        )
+        self.assertEqual(accepted.returncode, 0, accepted.stdout + accepted.stderr)
+
+
+class RuntimeFoundationE7BStageModeSelectionTests(SimpleTestCase):
+    """Real --plan executions of the rewritten 50/70 restore stages
+    against a synthetic --archive, proving the archive-presence-driven
+    mode selection actually runs (not just present in the source text)
+    -- --plan is side-effect-free and needs no venv/DB, so this is cheap
+    to exercise for real."""
+
+    def setUp(self):
+        self.tmpdir = Path(
+            subprocess.run(["mktemp", "-d"], capture_output=True, text=True, check=True).stdout.strip()
+        )
+        self.addCleanup(shutil.rmtree, self.tmpdir, ignore_errors=True)
+        workdir = self.tmpdir / "work"
+        workdir.mkdir()
+        (workdir / "MANIFEST.txt").write_text("IsadoraAir Git SHA: abc123\n")
+        self.archive_path = self.tmpdir / "backup.tar.gz"
+        with tarfile.open(self.archive_path, "w:gz") as tf:
+            tf.add(workdir, arcname=".")
+
+    def _run(self, script_name, *extra_args):
+        return subprocess.run(
+            [str(RESTORE_DIR / script_name), "--plan", "--archive", str(self.archive_path), *extra_args],
+            capture_output=True, text=True, timeout=15,
+        )
+
+    def test_native_deps_plan_with_archive_selects_the_recovery_payload_path(self):
+        result = self._run("50-native-deps.sh")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("provision_runtime_components --fdkaac --prepare-fdkaac --recovery-payload", result.stdout)
+        self.assertNotIn("build_fdkaac.sh", result.stdout)
+
+    def test_native_deps_plan_with_explicit_source_dir_keeps_the_legacy_path(self):
+        source_dir = self.tmpdir / "native-src"
+        source_dir.mkdir()
+        result = self._run("50-native-deps.sh", "--source-dir", str(source_dir))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("build_fdkaac.sh", result.stdout)
+        self.assertNotIn("--recovery-payload", result.stdout)
+
+    def test_tts_plan_with_archive_selects_the_recovery_payload_path(self):
+        result = self._run("70-tts.sh")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("provision_runtime_components --recovery-payload", result.stdout)
+        self.assertNotIn("pip install kokoro-onnx", result.stdout)
+
+    def test_tts_plan_with_legacy_flag_keeps_the_old_path(self):
+        result = self._run("70-tts.sh", "--legacy-connected-install")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("pip install kokoro-onnx", result.stdout)
+        self.assertNotIn("provision_runtime_components --recovery-payload", result.stdout)
+
+    def test_tts_skip_flags_rejected_on_the_recovery_payload_path(self):
+        result = self._run("70-tts.sh", "--skip-piper")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("only apply to --legacy-connected-install", result.stdout + result.stderr)
+
+
+class RuntimeRecoveryArchiveClassificationTests(SimpleTestCase):
+    def setUp(self):
+        self.tmpdir = Path(tempfile.mkdtemp(prefix="isadoraair-archive-class-test-"))
+        self.addCleanup(shutil.rmtree, self.tmpdir, ignore_errors=True)
+        self.helper = RESTORE_DIR / "runtime_recovery_archive.py"
+
+    def _write(self, status):
+        output = self.tmpdir / f"metadata-{len(tuple(self.tmpdir.iterdir()))}.json"
+        result = subprocess.run(
+            [
+                str(self.helper),
+                "write-metadata",
+                "--status-json",
+                json.dumps(status),
+                "--script-version",
+                "3.0.0",
+                "--output",
+                str(output),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        return json.loads(output.read_text())
+
+    def test_policy_satisfying_payload_is_unambiguously_self_contained_v3(self):
+        metadata = self._write(
+            {
+                "schema_version": 1,
+                "payload_id": "p1",
+                "product_contract_sha256": "0" * 64,
+                "components": {"native_fdkaac": {"state": "present"}},
+                "tts_components": ["kokoro"],
+                "piper_freshness": {"state": "not_checked"},
+                "policy": {"required": ["kokoro"], "missing": [], "satisfied": True},
+            }
+        )
+        self.assertEqual(metadata["archive_format_version"], "3.0.0")
+        self.assertEqual(metadata["recovery_class"], "self_contained_v3")
+
+    def test_no_payload_and_empty_policy_payload_remain_legacy_class(self):
+        absent = self._write({"pointer_configured": False})
+        self.assertEqual(absent["archive_format_version"], "2.1.0")
+        self.assertEqual(absent["recovery_class"], "legacy_non_self_contained")
+
+        optional = self._write(
+            {
+                "schema_version": 1,
+                "payload_id": "p2",
+                "product_contract_sha256": "0" * 64,
+                "components": {"native_fdkaac": {"state": "present"}},
+                "tts_components": [],
+                "piper_freshness": {"state": "not_checked"},
+                "policy": {"required": [], "missing": [], "satisfied": True},
+            }
+        )
+        self.assertEqual(optional["archive_format_version"], "2.1.0")
+        self.assertEqual(optional["recovery_class"], "legacy_non_self_contained")
+
+
 class RuntimeFoundationE5TmpfilesMappingTests(SimpleTestCase):
     """Runtime Foundation E6 -- MUST CLOSE: 90-system-config.sh must
     install deploy/isadoraair-runtime-tmpfiles.conf at its own correct
@@ -531,6 +831,12 @@ class RuntimeFoundationE5TmpfilesMappingTests(SimpleTestCase):
         text = (RESTORE_DIR / "95-validate.sh").read_text(encoding="utf-8")
         self.assertIn('--target-root "$RESTORE_STAGING_ROOT"', text)
         self.assertIn("--structural-only", text)
+
+    def test_stage_95_gates_archive_restore_on_component_receipt(self):
+        text = (RESTORE_DIR / "95-validate.sh").read_text(encoding="utf-8")
+        self.assertIn("restore_accept_recovery_receipt", text)
+        self.assertIn("--accept-legacy-runtime-recovery", text)
+        self.assertIn("Required components were not positively reconstructed", text)
 
 
 class RuntimeFoundationE5SystemConfigFunctionalTests(SimpleTestCase):

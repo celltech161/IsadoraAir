@@ -99,9 +99,18 @@ deploy/restore/
   20-application.sh       Git clone/SHA checkout, .env + app-tree restore from app.tar.gz.
   30-postgresql.sh        PG bootstrap + pg_restore.
   40-station-content.sh   /srv/isadoraair reconstruction (carts/voicetracks/waveforms/etc).
-  50-native-deps.sh       HE-AAC exact-archive build (builder performs shared validation).
+  50-native-deps.sh       Backup-based DR: delegates to Foundation E4's real prepare/
+                          publish authority using the embedded recovery payload.
+                          Explicit connected install: unchanged HE-AAC exact-archive
+                          build (builder performs shared validation). Runs AFTER
+                          60-python.sh despite the numbering -- see the dependency
+                          map below.
   60-python.sh            IsadoraAir venv creation + requirements.txt + safe checks.
-  70-tts.sh               Kokoro + Piper provisioning/smoke test.
+  70-tts.sh               Backup-based DR: delegates to Foundation E3's real
+                          provisioning authority using the embedded recovery
+                          payload. Explicit connected install (--legacy-connected-
+                          install): unchanged Kokoro + Piper venv/pip provisioning
+                          + smoke test.
   80-companions.sh        syndicated-ingest/weather-ingest/ogremote-ingest clone+venv.
   90-system-config.sh     nginx + systemd install/validation (never starts/reloads);
                           also establishes Runtime Foundation E5's system
@@ -132,8 +141,8 @@ there was no reason to deviate.
 
 ## Restore-order dependency map
 
-Matches `docs/RUNTIME_BASELINE.md`'s existing map — the stage numbers
-below implement that ordering directly:
+Based on `docs/RUNTIME_BASELINE.md`'s general map, with one deliberate
+deviation — see the 2026-08-29 note below:
 
 ```
 00-preflight   OS check, archive validation
@@ -146,9 +155,9 @@ below implement that ordering directly:
   v
 40-station-content  /srv/isadoraair carts/voicetracks/waveforms/etc
   v
-50-native-deps HE-AAC (fdkaac/libfdk-aac)
-  v
 60-python      IsadoraAir venv + requirements.txt
+  v
+50-native-deps HE-AAC (fdkaac/libfdk-aac)
   v
 70-tts         Kokoro + Piper
   v
@@ -159,10 +168,48 @@ below implement that ordering directly:
 95-validate    canonical live checks OR offline target structural checks
 ```
 
+**2026-08-29, Runtime Foundation E7B:** 60-python now runs *before*
+50-native-deps, reversing the numeric order the stage filenames imply.
+`docs/RUNTIME_BASELINE.md`'s general statement that "fdkaac/Kokoro/
+Piper/snd-aloop can be built/installed any time before the services
+that need them start... none of them are Python-venv dependencies"
+remains true for the **generic/connected-install** path (plain
+`build_fdkaac.sh --source-dir`/`--download-sources`, still exactly what
+50-native-deps.sh falls back to when no `--archive` is given, or
+`--source-dir`/`--download-sources` is passed explicitly — see that
+script's own header). It is deliberately **not true** for
+**backup-based disaster recovery**: that path now delegates to Runtime
+Foundation E4's real prepare/publish authority via `manage.py
+provision_runtime_components --fdkaac`, which needs the restored app's
+Django environment to run at all. 60-python.sh has no dependency on
+50-native-deps and is idempotent (verifies rather than recreates an
+existing venv), so pulling it earlier costs nothing when the chain
+reaches its usual numeric position again. The stage file **numbers**
+remain stable identifiers (`ls` sort order, individual invocation) —
+they no longer imply a strict execution order on their own; `restore.sh`
+is the authority for the actual order it runs stages in.
+
 `docs/DISASTER_RECOVERY_RESTORE.md` picks up from here for the parts
 that stay manual (StereoTool binary/license, controlled service
 bring-up order, certs, music library) — this map is the automated
 portion only.
+
+## Runtime recovery payload (Runtime Foundation E7B)
+
+A self-contained backup-v3 archive is identified by
+`runtime-recovery-archive.json` as format 3.0.0 / `self_contained_v3`;
+that classification positively requires a policy-satisfying
+`runtime-recovery/` directory — an operator-prepared, already-validated
+Runtime Foundation E7 disaster-recovery payload (see
+`docs/RUNTIME_BACKUP_PAYLOAD.md`). Stages 50 and 70 are the only two
+consumers, and neither locates it independently: both call
+`lib.sh`'s `restore_locate_recovery_payload`, the one shared contract
+for "where did this archive's payload end up." See that function's own
+header comment for the exact extraction/confinement behavior, and
+`docs/DISASTER_RECOVERY_RESTORE.md`'s "Runtime recovery payload" and
+"Backward compatibility" sections for the operator-facing picture
+(including why a pre-E7B/non-self-contained archive fails the default
+backup-based stages and requires an explicit connected/manual path).
 
 ## Application-source recovery model (Git vs. `app.tar.gz`)
 

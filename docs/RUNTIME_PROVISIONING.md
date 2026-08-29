@@ -261,6 +261,19 @@ them. Final ownership policy and production activation remain a later pass.
 
 ## Future DR/installer consumption
 
+**Update, Runtime Foundation E7B (2026-08-29):** backup v3 now does
+exactly this — the embedded `runtime-recovery.json`'s `tts` component
+points at an ordinary, unmodified E3 bundle preserving this exact
+shape, and `deploy/restore/70-tts.sh`'s backup-based-DR mode feeds it
+to this module's own `RuntimeProvisioner` (via `manage.py
+provision_runtime_components --recovery-payload`) and relies on E2
+acceptance — no copy of this logic lives in `restore/70-tts.sh` itself.
+Kokoro requiredness comes from the explicit recovery policy/bundle to cover
+the historical-caller gap; Piper is still resolved from the restored station
+database and its model/config digest must match both payload and bundle.
+See `docs/RUNTIME_BACKUP_PAYLOAD.md`'s "Restore integration" section.
+The paragraph below is retained as the original design rationale.
+
 Backup v3 should preserve this bundle shape rather than a copied virtualenv:
 complete wheel closures and locks, Kokoro assets, selected Piper assets and
 DB-owned hashes, and applicable notices/licenses. Strict restore and a fresh

@@ -28,6 +28,18 @@
 #     ~/.ogremote_ingest.cred, under recovery-credentials/*.age — see the
 #     2026-08-18 note below and deploy/encrypt_recovery_credentials.sh.
 #     Disabled by default; never included in plaintext either way.
+#   - The station's CURRENT Runtime Foundation E7 disaster-recovery
+#     payload (an offline-capable copy of the E3 Kokoro/Piper TTS bundle
+#     and/or E4 native fdkaac source material), under runtime-recovery/
+#     -- see the 2026-08-29 note below and docs/RUNTIME_BACKUP_PAYLOAD.md.
+#     Included only if a current payload has been explicitly prepared
+#     and activated on this host (isadoraair.runtime_recovery /
+#     manage.py prepare_runtime_recovery_payload --activate); this step
+#     never builds, downloads, or acquires anything itself -- it only
+#     validates and copies an already-prepared, already-validated local
+#     payload. If not yet configured, the archive is built exactly as
+#     before Runtime Foundation E7B existed (no new failure mode) unless
+#     BACKUP_REQUIRED_RECOVERY_COMPONENTS says otherwise -- see that note.
 #
 # Deliberately excluded — see docs/DISASTER_RECOVERY.md for the full,
 # explicit policy this was derived from:
@@ -100,6 +112,24 @@
 # -- the private key must never be handled by anything running on this
 # host).
 #
+# 2026-08-29 Runtime Foundation E7B: this is what makes the archive
+# "backup v3" -- it can now carry a self-contained, offline-capable
+# runtime recovery payload (Runtime Foundation E7A's own
+# isadoraair.runtime_recovery contract: an E3 TTS bundle and/or E4
+# native fdkaac source material) rather than requiring a restore to
+# reconstruct Kokoro/Piper/fdkaac from the internet by hand. This
+# script never builds or acquires that payload itself -- acquisition
+# (isadoraair.runtime_recovery.RuntimeRecoveryBuilder, an explicit,
+# operator-run `manage.py prepare_runtime_recovery_payload --apply`
+# then `--activate`) stays a deliberately separate, out-of-band step;
+# this script only validates the CURRENT already-prepared payload
+# (manage.py validate_runtime_recovery_payload --current, the same
+# read-only Python API a restore will later call) and, if it validates
+# cleanly, copies it into the archive verbatim. See
+# docs/RUNTIME_BACKUP_PAYLOAD.md for the full contract and the
+# RECOVERY_PAYLOAD_ROOT / BACKUP_REQUIRED_RECOVERY_COMPONENTS env vars
+# this step reads (both documented at their point of use below).
+#
 # Pushes the result via SFTP to a remote target configured in
 # ~/.iasboxbu.cred (BAK_HOST, BAK_USER, BAK_PORT, BAK_PATH, BAK_PASS) —
 # never hardcoded here; this file has no station-specific secrets in it.
@@ -132,13 +162,23 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Bump when backup coverage or the archive layout changes -- recorded in
-# the manifest inside every archive, so a restore always knows exactly
-# what shape of backup it's looking at. 2.1.0: added the optional
+# Version of this Git-owned backup implementation. Archive format is
+# classified separately in runtime-recovery-archive.json: this script
+# can produce a legacy/non-self-contained 2.1.0 archive before a station
+# deliberately activates a policy-satisfying payload, or a self-contained
+# 3.0.0 archive after it does. The implementation version must never
+# ambiguously stand in for both archive classes. 2.1.0 added the optional
 # recovery-credentials/*.age directory (additive, backward compatible --
 # an archive with encryption disabled or absent is still a fully valid
-# 2.0.0-shaped backup in every other respect).
-SCRIPT_VERSION="2.1.0"
+# 2.0.0-shaped backup in every other respect). 3.0.0: added the optional
+# runtime-recovery/ Runtime Foundation E7 disaster-recovery payload --
+# a MAJOR implementation bump, because this enables closing the
+# "restore has to reconstruct Kokoro/Piper/fdkaac from the internet by
+# hand" DR gap this whole backup mechanism exists for; restore tooling
+# classifies an archive without a policy-satisfying runtime-recovery/
+# payload as legacy format 2.1.0, never as self-contained v3 -- see
+# docs/RUNTIME_BACKUP_PAYLOAD.md's "Backward compatibility" section.
+SCRIPT_VERSION="3.0.0"
 
 # See the DRY_RUN note in the header comment above.
 DRY_RUN="${DRY_RUN:-0}"
@@ -155,6 +195,28 @@ CONFIG_FILE="$HOME/.iasboxbu.cred"
 # plain shell default instead.
 PROJECT_DIR="${PROJECT_DIR:-/opt/isadoraair}"
 STEREOTOOL_DIR="${STEREOTOOL_DIR:-$HOME/stereotool}"
+# Runtime Foundation E7B -- see the 2026-08-29 header note above and
+# docs/RUNTIME_BACKUP_PAYLOAD.md. RECOVERY_PAYLOAD_ROOT is WHERE to look
+# for the station's current, already-prepared-and-activated recovery
+# payload (never created or written to by this script -- see
+# isadoraair.runtime_recovery.resolve_current_recovery_payload_root).
+# BACKUP_REQUIRED_RECOVERY_COMPONENTS is empty/unset by default --
+# exactly the same "disabled by default, no new failure mode until an
+# operator deliberately opts in" contract the recovery-credential
+# encryption feature above already established. Once set (a
+# comma-separated list drawn from kokoro/piper/native_fdkaac -- see
+# isadoraair.runtime_recovery.RECOVERY_POLICY_COMPONENT_NAMES), this
+# backup becomes fail-closed: no current payload, or a current payload
+# that does not positively contain every listed component, aborts
+# before upload. This is the mechanism the 2026-08-29 note's
+# "historical dormant-Kokoro" migration period needs: E1's own
+# kokoro.required flag is NOT consulted here at all (see
+# isadoraair/runtime_recovery.py's own module docstring for exactly
+# why) -- an operator who knows this station's dedication/road-condition
+# features still depend on the historical Kokoro path sets
+# BACKUP_REQUIRED_RECOVERY_COMPONENTS=kokoro explicitly instead.
+RECOVERY_PAYLOAD_ROOT="${RECOVERY_PAYLOAD_ROOT:-/var/lib/isadoraair/runtime-recovery}"
+BACKUP_REQUIRED_RECOVERY_COMPONENTS="${BACKUP_REQUIRED_RECOVERY_COMPONENTS:-}"
 STAMP=$(date +%Y%m%d-%H%M%S)
 WORKDIR="/tmp/isadoraair-backup-${STAMP}"
 TMP_TAR="/tmp/isadoraair-backup-${STAMP}.tar.gz"
@@ -210,6 +272,16 @@ fi
 ENV_FILE="$PROJECT_DIR/.env"
 if [ ! -f "$ENV_FILE" ]; then
   echo "Error: $ENV_FILE not found -- can't read DB credentials." >&2
+  exit 1
+fi
+
+# Needed for the Runtime Foundation E7B recovery-payload validation step
+# below (manage.py validate_runtime_recovery_payload) -- checked here,
+# early, alongside this script's other prerequisite checks, rather than
+# failing deep into the run after the database dump/app archive work.
+APP_VENV_PYTHON="$PROJECT_DIR/venv/bin/python"
+if [ ! -x "$APP_VENV_PYTHON" ]; then
+  echo "Error: $APP_VENV_PYTHON not found or not executable -- needed to validate the Runtime Foundation E7 recovery payload." >&2
   exit 1
 fi
 
@@ -409,6 +481,104 @@ else
   echo "  (none found at $REPORTS_DIR)"
 fi
 
+echo "Validating and including the current Runtime Foundation E7 recovery payload..."
+# Small, safe extraction of one field from validate_runtime_recovery_payload's
+# --json output -- pure stdlib json, no eval, never passed anything but
+# this script's own already-validated subprocess output.
+recovery_json_get() {
+  python3 -c "
+import json, sys
+data = json.loads(sys.argv[1])
+for key in sys.argv[2].split('.'):
+    data = (data or {}).get(key) if isinstance(data, dict) else None
+if isinstance(data, list):
+    print(','.join(str(x) for x in data))
+elif data is None:
+    print('')
+else:
+    print(data)
+" "$1" "$2"
+}
+
+set +e
+RECOVERY_PAYLOAD_STATUS_JSON=$("$APP_VENV_PYTHON" "$PROJECT_DIR/manage.py" \
+  validate_runtime_recovery_payload --base-root "$RECOVERY_PAYLOAD_ROOT" --current --json \
+  --require-components "$BACKUP_REQUIRED_RECOVERY_COMPONENTS")
+RECOVERY_PAYLOAD_EXIT=$?
+set -e
+
+RECOVERY_PAYLOAD_INCLUDED=0
+if [ "$RECOVERY_PAYLOAD_EXIT" -eq 2 ] && [ -z "$BACKUP_REQUIRED_RECOVERY_COMPONENTS" ]; then
+  # Exit 2 = RecoveryPayloadNotConfiguredError specifically (never any
+  # other failure) -- Runtime Foundation E7B simply hasn't been adopted
+  # on this host yet, and no operator policy says it must be. Same,
+  # unchanged backup behavior as before Runtime Foundation E7 existed.
+  echo "  no current recovery payload is configured at ${RECOVERY_PAYLOAD_ROOT} -- Runtime Foundation E7B not yet adopted on this host. Continuing without runtime-recovery/ in this archive."
+  RECOVERY_PAYLOAD_MANIFEST_BLOCK="Runtime recovery payload: not included (no current payload configured at ${RECOVERY_PAYLOAD_ROOT})"
+elif [ "$RECOVERY_PAYLOAD_EXIT" -ne 0 ]; then
+  # Every other failure is fatal, unconditionally -- exit 2 with a
+  # required-components policy configured (the payload MUST exist),
+  # exit 1 (found but invalid/tampered/stale/wrong-digest), or exit 1
+  # for a configured-but-unsafe base_root/current pointer. A configured-
+  # but-broken payload is never treated as "not yet adopted."
+  echo "Error: Runtime Foundation E7 recovery payload validation failed -- aborting before upload rather than producing a backup that appears to carry a trustworthy runtime recovery payload when it does not." >&2
+  echo "$RECOVERY_PAYLOAD_STATUS_JSON" >&2
+  exit 1
+else
+  RECOVERY_PAYLOAD_RESOLVED_PATH=$(recovery_json_get "$RECOVERY_PAYLOAD_STATUS_JSON" resolved_path)
+  RECOVERY_PAYLOAD_ID=$(recovery_json_get "$RECOVERY_PAYLOAD_STATUS_JSON" payload_id)
+  RECOVERY_PAYLOAD_SCHEMA_VERSION=$(recovery_json_get "$RECOVERY_PAYLOAD_STATUS_JSON" schema_version)
+  RECOVERY_PAYLOAD_PRODUCT_DIGEST=$(recovery_json_get "$RECOVERY_PAYLOAD_STATUS_JSON" product_contract_sha256)
+  RECOVERY_PAYLOAD_TTS_STATE=$(recovery_json_get "$RECOVERY_PAYLOAD_STATUS_JSON" components.tts.state)
+  RECOVERY_PAYLOAD_NATIVE_STATE=$(recovery_json_get "$RECOVERY_PAYLOAD_STATUS_JSON" components.native_fdkaac.state)
+  RECOVERY_PAYLOAD_TTS_COMPONENTS=$(recovery_json_get "$RECOVERY_PAYLOAD_STATUS_JSON" tts_components)
+  RECOVERY_PAYLOAD_PIPER_FRESHNESS=$(recovery_json_get "$RECOVERY_PAYLOAD_STATUS_JSON" piper_freshness.state)
+  RECOVERY_PAYLOAD_POLICY_REQUIRED=$(recovery_json_get "$RECOVERY_PAYLOAD_STATUS_JSON" policy.required)
+  RECOVERY_PAYLOAD_POLICY_SATISFIED=$(recovery_json_get "$RECOVERY_PAYLOAD_STATUS_JSON" policy.satisfied)
+
+  mkdir -p "$WORKDIR/runtime-recovery"
+  # The backup unit runs as the application account. The trusted source
+  # remains administrator-owned 0755/0644 and is readable but not
+  # writable. Do not attempt to preserve root ownership in the caller's
+  # workdir; byte identity is re-proven on the copy immediately below.
+  cp -R "$RECOVERY_PAYLOAD_RESOLVED_PATH/." "$WORKDIR/runtime-recovery/"
+
+  # Belt-and-suspenders, matching the app.tar.gz manage.py/.env checks
+  # above: re-validate the COPY actually inside the working directory
+  # (a direct payload-path call, not --current) before trusting it goes
+  # into the final archive -- proves the copy itself round-tripped
+  # correctly, never just the original.
+  if ! "$APP_VENV_PYTHON" "$PROJECT_DIR/manage.py" validate_runtime_recovery_payload "$WORKDIR/runtime-recovery" >/dev/null; then
+    echo "Error: the copied runtime-recovery payload inside the backup working directory failed re-validation -- aborting before upload." >&2
+    exit 1
+  fi
+
+  echo "  included: payload ${RECOVERY_PAYLOAD_ID} (tts=${RECOVERY_PAYLOAD_TTS_STATE} [${RECOVERY_PAYLOAD_TTS_COMPONENTS}], native_fdkaac=${RECOVERY_PAYLOAD_NATIVE_STATE})"
+  RECOVERY_PAYLOAD_INCLUDED=1
+  RECOVERY_PAYLOAD_MANIFEST_BLOCK="Runtime recovery payload: included
+Runtime recovery payload ID: ${RECOVERY_PAYLOAD_ID}
+Runtime recovery payload schema version: ${RECOVERY_PAYLOAD_SCHEMA_VERSION}
+Runtime recovery product-contract digest: ${RECOVERY_PAYLOAD_PRODUCT_DIGEST}
+Runtime recovery tts component: ${RECOVERY_PAYLOAD_TTS_STATE} (${RECOVERY_PAYLOAD_TTS_COMPONENTS})
+Runtime recovery native fdkaac component: ${RECOVERY_PAYLOAD_NATIVE_STATE}
+Runtime recovery Piper station-selection freshness: ${RECOVERY_PAYLOAD_PIPER_FRESHNESS}
+Runtime recovery required-component policy: ${RECOVERY_PAYLOAD_POLICY_REQUIRED:-(none configured)}
+Runtime recovery required-component policy satisfied: ${RECOVERY_PAYLOAD_POLICY_SATISFIED:-n/a}"
+fi
+
+# Only a payload satisfying a NON-EMPTY explicit policy earns archive
+# format 3.0.0 / self_contained_v3. Before station adoption, this E7B-
+# capable script keeps producing a clearly labelled legacy 2.1.0
+# archive, preserving nightly-backup availability without overstating DR.
+RECOVERY_ARCHIVE_METADATA_JSON=$(python3 "$SCRIPT_DIR/restore/runtime_recovery_archive.py" \
+  write-metadata \
+  --status-json "$RECOVERY_PAYLOAD_STATUS_JSON" \
+  --script-version "$SCRIPT_VERSION" \
+  --output "$WORKDIR/runtime-recovery-archive.json")
+RECOVERY_ARCHIVE_FORMAT=$(recovery_json_get "$RECOVERY_ARCHIVE_METADATA_JSON" archive_format_version)
+RECOVERY_ARCHIVE_CLASS=$(recovery_json_get "$RECOVERY_ARCHIVE_METADATA_JSON" recovery_class)
+echo
+
 echo "Encrypting recovery credentials (if configured)..."
 # See deploy/encrypt_recovery_credentials.sh's own header for the full
 # security model and failure policy. Run unconditionally (including under
@@ -462,6 +632,8 @@ cat > "$WORKDIR/MANIFEST.txt" <<MANIFEST
 IsadoraAir disaster-recovery backup manifest
 =============================================
 Backup script version: ${SCRIPT_VERSION}
+Archive format version: ${RECOVERY_ARCHIVE_FORMAT}
+Runtime recovery archive class: ${RECOVERY_ARCHIVE_CLASS}
 Created (UTC):          $(date -u -Iseconds)
 IsadoraAir Git SHA:     ${GIT_SHA}
 Database name:          ${DB_NAME}
@@ -477,6 +649,8 @@ Contents of this archive:
   srv-content/carts/                     FX Cart audio (operator-uploaded)
   srv-content/voicetracks/               recorded voicetrack audio (operator-created)
   reports/                               SoundExchange/royalty report filings (if present)
+  runtime-recovery/                      Runtime Foundation E7 disaster-recovery payload (if configured -- see below)
+  runtime-recovery-archive.json          machine-readable archive/recovery classification
   recovery-credentials/*.age             age-encrypted companion credential copies (if configured -- see below; NEVER plaintext)
 
 Deliberately EXCLUDED from this backup (see docs/DISASTER_RECOVERY.md):
@@ -487,6 +661,20 @@ Deliberately EXCLUDED from this backup (see docs/DISASTER_RECOVERY.md):
   /srv/isadoraair/mitd_artbell 44+ GB syndicated-show staging, own future sizing decision
   .git/, venv/, __pycache__/, staticfiles/, media/album_art_cache/
   .env.bak, .env.lock                    stray local files, not restore-relevant (.env itself IS included)
+
+${RECOVERY_PAYLOAD_MANIFEST_BLOCK}
+NOTE: an included runtime recovery payload is the actual Runtime
+Foundation E3/E4 offline material (wheels, models, native source
+archives) needed to restore Kokoro/Piper/fdkaac without network access
+-- see docs/RUNTIME_BACKUP_PAYLOAD.md. It was NOT built or acquired by
+this backup run; it is a copy of whatever an operator already prepared
+and activated on this host via manage.py prepare_runtime_recovery_payload.
+Only archive format 3.0.0 / class self_contained_v3 is self-contained
+for Runtime Foundation E restore. An E7B-capable script run without a
+policy-satisfying payload writes archive format 2.1.0 / class
+legacy_non_self_contained, even if an optional payload happened to be
+copied; the script implementation version never doubles as the archive
+class.
 
 ${RECOVERY_CRED_MANIFEST_BLOCK}
 NOTE: an "included" recovery credential above is ciphertext only, decryptable

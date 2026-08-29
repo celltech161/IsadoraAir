@@ -228,3 +228,82 @@ require_cmd() {
     exit 1
   fi
 }
+
+# ---------------------------------------------------------------------
+# Runtime Foundation E7B (2026-08-29) -- the ONE place a restore stage
+# locates a self-contained backup-v3 archive's embedded runtime-recovery/
+# payload. The stdlib-only helper performs pre-extraction archive-member
+# validation and atomic confined extraction; system tar never writes these
+# root-trusted payload bytes.
+# Stages 50 (native fdkaac) and 70 (TTS) are the only callers; neither
+# guesses the archive layout independently -- see task step 15 /
+# docs/DISASTER_RECOVERY_RESTORE.md's "Runtime recovery payload" section.
+#
+# restore_locate_recovery_payload DEST_DIR
+#   DEST_DIR must not yet exist (or be empty) -- created here. On
+#   return:
+#     RESTORE_RECOVERY_PAYLOAD_FOUND=1  DEST_DIR IS the payload root
+#                                        (runtime-recovery.json directly
+#                                        inside it) -- extracted, and its
+#                                        basic confinement/shape checked,
+#                                        but NOT yet validated for
+#                                        integrity -- that is Python's
+#                                        job (validate_runtime_recovery_payload
+#                                        / load_recovery_payload), never
+#                                        re-implemented here.
+#     RESTORE_RECOVERY_PAYLOAD_FOUND=0  legacy/v2.x or explicitly
+#                                        non-self-contained archive.
+#                                        Callers fail backup-based DR;
+#                                        legacy recovery must be selected
+#                                        explicitly and never falls back.
+#
+# Returns nonzero only for a genuine extraction failure (corrupt
+# archive, unwritable DEST_DIR, ...).
+restore_locate_recovery_payload() {
+  local dest="$1"
+  require_cmd python3
+  if [ -z "$RESTORE_ARCHIVE" ] || [ ! -f "$RESTORE_ARCHIVE" ]; then
+    log_error "restore_locate_recovery_payload: no valid --archive given."
+    return 1
+  fi
+  local helper="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/runtime_recovery_archive.py"
+  local status=0
+  python3 "$helper" extract --archive "$RESTORE_ARCHIVE" --destination "$dest" || status=$?
+  if [ "$status" -eq 2 ] || [ "$status" -eq 3 ]; then
+    RESTORE_RECOVERY_PAYLOAD_FOUND=0
+    return 0
+  fi
+  if [ "$status" -ne 0 ]; then
+    log_error "restore_locate_recovery_payload: safe extraction failed."
+    return 1
+  fi
+  RESTORE_RECOVERY_PAYLOAD_FOUND=1
+  return 0
+}
+
+restore_recovery_receipt_path() {
+  if [ -n "$RESTORE_STAGING_ROOT" ]; then
+    printf '%s\n' "$RESTORE_STAGING_ROOT/var/lib/isadoraair/restore/runtime-recovery.json"
+  else
+    printf '%s\n' "/var/lib/isadoraair/restore/runtime-recovery.json"
+  fi
+}
+
+restore_record_recovery_components() {
+  local receipt
+  receipt=$(restore_recovery_receipt_path)
+  local helper="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/runtime_recovery_archive.py"
+  local args=()
+  local component
+  for component in "$@"; do
+    args+=(--component "$component")
+  done
+  python3 "$helper" record --archive "$RESTORE_ARCHIVE" --receipt "$receipt" "${args[@]}"
+}
+
+restore_accept_recovery_receipt() {
+  local receipt
+  receipt=$(restore_recovery_receipt_path)
+  local helper="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/runtime_recovery_archive.py"
+  python3 "$helper" accept --archive "$RESTORE_ARCHIVE" --receipt "$receipt"
+}

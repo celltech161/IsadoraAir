@@ -27,6 +27,7 @@ from isadoraair.runtime_native import (
     verify_native_sources,
 )
 from isadoraair.runtime_provisioning import ProvisioningLayout, runtime_provision_lock
+from isadoraair.runtime_recovery import RuntimeRecoveryBuilder, load_recovery_payload
 from isadoraair.runtime_requirements import ComponentRequirement, RuntimeRequirements
 from isadoraair.runtime_validation import (
     ComponentEvidence,
@@ -34,6 +35,10 @@ from isadoraair.runtime_validation import (
     STATUS_FAIL,
     STATUS_OPTIONAL_ABSENT,
     STATUS_PASS,
+)
+from monitoring.management.commands.provision_runtime_components import (
+    RECOVERY_PAYLOAD_REASON,
+    _requirements_for_recovery_native,
 )
 
 
@@ -722,3 +727,107 @@ class NativeCommandTests(TestCase):
                     "--trusted-preparer-uid",
                     value,
                 )
+
+
+class RecoveryPayloadNativeRequirementsTests(NativeFixture):
+    """Runtime Foundation E7B: --recovery-payload's fdkaac requiredness
+    is never re-derived from live station configuration (Runtime
+    Foundation E1) -- the payload's own native_fdkaac component already
+    passed E7's fail-closed load, which only happens because an
+    operator's recovery-component policy justified including it. See
+    monitoring/management/commands/provision_runtime_components.py's
+    _requirements_for_recovery_native."""
+
+    def _payload(self) -> Path:
+        payload_root = self.root / "recovery-payload"
+        RuntimeRecoveryBuilder(product_manifest=self.product).apply(
+            native_source_dir=self.source, output=payload_root, payload_id="p-native"
+        )
+        return payload_root
+
+    def test_requirements_marks_only_fdkaac_required(self):
+        requirements = _requirements_for_recovery_native()
+        self.assertTrue(requirements.components["fdkaac"].required)
+        self.assertEqual(requirements.components["fdkaac"].reasons, (RECOVERY_PAYLOAD_REASON,))
+        self.assertFalse(requirements.components["kokoro"].required)
+        self.assertFalse(requirements.components["piper"].required)
+
+    def test_synthesized_requirements_drive_a_real_prepare(self):
+        payload_root = self._payload()
+        payload = load_recovery_payload(payload_root, product_manifest=self.product)
+        provisioner = NativeRuntimeProvisioner(
+            requirements=_requirements_for_recovery_native(),
+            product_manifest=self.product,
+            target_root=self.target,
+            project_root=Path(__file__).parents[2],
+            seams=self.seams(),
+        )
+        result = provisioner.prepare(
+            source_dir=payload.native_source.source_dir, prepared_root=self.prepared
+        )
+        self.assertFalse(result.no_op)
+        self.assertIsNotNone(result.prepared_root)
+        self.assertTrue((Path(result.prepared_root) / "prefix" / "bin" / "fdkaac").is_file())
+
+    def test_recovery_payload_cli_flag_bypasses_e1_and_wires_the_source_dir(self):
+        payload_root = self._payload()
+        with patch(
+            "monitoring.management.commands.provision_runtime_components.NativeRuntimeProvisioner"
+        ) as provisioner_cls, patch(
+            "monitoring.management.commands.provision_runtime_components.resolve_current_runtime_requirements"
+        ) as resolver, patch(
+            "monitoring.management.commands.provision_runtime_components.load_runtime_components",
+            return_value=self.product,
+        ):
+            plan = provisioner_cls.return_value.plan.return_value
+            plan.ready = True
+            plan.to_json.return_value = json.dumps({"ready": True})
+            call_command(
+                "provision_runtime_components",
+                "--fdkaac",
+                "--recovery-payload",
+                str(payload_root),
+                "--plan",
+                "--json",
+                stdout=io.StringIO(),
+            )
+        resolver.assert_not_called()
+        _, plan_kwargs = provisioner_cls.return_value.plan.call_args
+        self.assertEqual(Path(plan_kwargs["source_dir"]), payload_root / "native" / "fdkaac")
+        _, ctor_kwargs = provisioner_cls.call_args
+        self.assertTrue(ctor_kwargs["requirements"].components["fdkaac"].required)
+
+    def test_recovery_payload_and_native_source_dir_together_is_rejected(self):
+        payload_root = self._payload()
+        with patch(
+            "monitoring.management.commands.provision_runtime_components.load_runtime_components",
+            return_value=self.product,
+        ), self.assertRaisesRegex(CommandError, "do not also pass --native-source-dir"):
+            call_command(
+                "provision_runtime_components",
+                "--fdkaac",
+                "--recovery-payload",
+                str(payload_root),
+                "--native-source-dir",
+                str(self.source),
+                "--plan",
+            )
+
+    def test_recovery_payload_without_native_component_is_rejected(self):
+        # This fixture's own payload is native_fdkaac-only -- asking the
+        # CLI for TTS provisioning against it (no --fdkaac) must fail
+        # closed rather than silently treating "not in the payload" as
+        # "not needed".
+        payload_root = self._payload()
+        with patch(
+            "monitoring.management.commands.provision_runtime_components.load_runtime_components",
+            return_value=self.product,
+        ), self.assertRaisesRegex(CommandError, "no tts component"):
+            call_command(
+                "provision_runtime_components",
+                "--recovery-payload",
+                str(payload_root),
+                "--target-root",
+                str(self.target),
+                "--plan",
+            )

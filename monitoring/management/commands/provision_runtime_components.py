@@ -12,8 +12,83 @@ from isadoraair.runtime_bundle import RuntimeBundleError
 from isadoraair.runtime_components import RuntimeComponentContractError, load_runtime_components
 from isadoraair.runtime_native import NativeRuntimeProvisioner
 from isadoraair.runtime_provisioning import RuntimeProvisioner, RuntimeProvisioningError
-from isadoraair.runtime_requirements import resolve_current_runtime_requirements
+from isadoraair.runtime_recovery import (
+    RuntimeRecoveryError,
+    load_recovery_payload,
+    piper_selection_digest,
+)
+from isadoraair.runtime_requirements import (
+    ComponentRequirement,
+    RuntimeRequirements,
+    resolve_current_runtime_requirements,
+)
 from isadoraair.runtime_surfaces import RuntimeSystemSurfaceManager
+
+# Runtime Foundation E7B (2026-08-29): a fixed, non-station-specific
+# reason string recorded on every ComponentRequirement synthesized from
+# a recovery payload below -- deliberately distinct from any reason
+# resolve_current_runtime_requirements() would ever produce (those are
+# always live-station-configuration-derived), so a plan/apply's own
+# printed `required by:` line makes the origin unambiguous.
+RECOVERY_PAYLOAD_REASON = "Runtime Foundation E7 recovery payload"
+
+
+def _requirements_for_recovery_native() -> RuntimeRequirements:
+    """fdkaac's requiredness for a --recovery-payload native provisioning
+    call is never re-derived from live station configuration (Runtime
+    Foundation E1) -- the payload's own native_fdkaac component already
+    passed E7's fail-closed load, which is itself only possible because
+    an operator's recovery-component policy justified including it (see
+    docs/RUNTIME_BACKUP_PAYLOAD.md). Re-querying E1 here would silently
+    reintroduce exactly the dormant-Kokoro-style blind spot this
+    integration exists to avoid."""
+    return RuntimeRequirements(
+        components={
+            "fdkaac": ComponentRequirement(name="fdkaac", required=True, reasons=(RECOVERY_PAYLOAD_REASON,)),
+            "kokoro": ComponentRequirement(name="kokoro"),
+            "piper": ComponentRequirement(name="piper"),
+        }
+    )
+
+
+def _requirements_for_recovery_tts(
+    tts_bundle, station_requirements: RuntimeRequirements | None = None
+) -> RuntimeRequirements:
+    """kokoro/piper requiredness for a --recovery-payload TTS
+    provisioning call comes from what the embedded, already-validated
+    E3 bundle actually contains -- never from resolve_current_runtime_requirements()
+    (Runtime Foundation E1), which is exactly the signal that misses a
+    station's dormant-but-still-live Kokoro usage (webrequests/road_conditions'
+    hardcoded KOKORO_BINARY callers bypass StationTTSVoice entirely --
+    see runtime_recovery.py's module docstring). Piper's model list is
+    remains the exception: its model/config identities are owned by the
+    restored station database.  The caller must supply E1-resolved
+    station requirements when Piper is present; bundle/payload/station
+    digests have already been proven equal before this helper runs."""
+    components: dict[str, ComponentRequirement] = {
+        "fdkaac": ComponentRequirement(name="fdkaac"),
+    }
+    for name in ("kokoro", "piper"):
+        present = tts_bundle.components.get(name)
+        if present is None:
+            components[name] = ComponentRequirement(name=name)
+            continue
+        piper_models: tuple[PiperModelRequirement, ...] = ()
+        if name == "piper":
+            if station_requirements is None:
+                raise RuntimeRecoveryError(
+                    "Piper recovery requires restored station configuration"
+                )
+            selected = station_requirements.components.get("piper")
+            if selected is None or not selected.required:
+                raise RuntimeRecoveryError(
+                    "recovery payload contains Piper but the restored station selects no Piper models"
+                )
+            piper_models = selected.piper_models
+        components[name] = ComponentRequirement(
+            name=name, required=True, reasons=(RECOVERY_PAYLOAD_REASON,), piper_models=piper_models
+        )
+    return RuntimeRequirements(components=components)
 
 
 def _trusted_uid(value: str) -> int:
@@ -99,6 +174,19 @@ class Command(BaseCommand):
             help="Map canonical absolute paths beneath a caller-owned staging root.",
         )
         parser.add_argument(
+            "--recovery-payload",
+            type=Path,
+            help=(
+                "Runtime Foundation E7B: an already-extracted, already-validated "
+                "recovery payload root (runtime-recovery.json directly inside it). "
+                "Supplies --bundle (TTS) or the native fdkaac source directory "
+                "automatically -- do not also pass those -- and REPLACES live-"
+                "station-derived requirements with exactly what this payload "
+                "declares, never Runtime Foundation E1. For disaster-recovery "
+                "restore only; not used for an ordinary connected install."
+            ),
+        )
+        parser.add_argument(
             "--json",
             action="store_true",
             dest="json_output",
@@ -157,6 +245,7 @@ class Command(BaseCommand):
                         "prepared_native_root",
                         "trusted_preparer_uid",
                         "bootstrap_fdkaac",
+                        "recovery_payload",
                     )
                 ):
                     raise CommandError(
@@ -185,17 +274,60 @@ class Command(BaseCommand):
                         f"  all surfaces healthy: {result.evidence.healthy}"
                     )
                 return
-            try:
-                requirements = resolve_current_runtime_requirements(manifest)
-            except Exception as exc:
-                raise RuntimeProvisioningError(
-                    "station configuration could not be inspected"
-                ) from exc
             native_mode = (
                 options["fdkaac"]
                 or options["prepare_fdkaac"]
                 or options["publish_fdkaac"]
             )
+            recovery_payload = None
+            if options["recovery_payload"] is not None:
+                try:
+                    recovery_payload = load_recovery_payload(
+                        options["recovery_payload"], product_manifest=manifest
+                    )
+                except (RuntimeRecoveryError, RuntimeBundleError, RuntimeProvisioningError) as exc:
+                    safe = " ".join(str(exc).split())[:512] or "recovery payload failed to load"
+                    raise CommandError(f"--recovery-payload: {safe}") from None
+                if native_mode:
+                    if options["native_source_dir"] is not None:
+                        raise CommandError(
+                            "--recovery-payload already supplies the native fdkaac source -- "
+                            "do not also pass --native-source-dir"
+                        )
+                    if recovery_payload.native_source is None:
+                        raise CommandError("recovery payload has no native_fdkaac component")
+                    requirements = _requirements_for_recovery_native()
+                else:
+                    if options["bundle"] is not None:
+                        raise CommandError(
+                            "--recovery-payload already supplies the tts bundle -- "
+                            "do not also pass --bundle"
+                        )
+                    if recovery_payload.tts_bundle is None:
+                        raise CommandError("recovery payload has no tts component")
+                    station_requirements = None
+                    if "piper" in recovery_payload.tts_bundle.components:
+                        try:
+                            station_requirements = resolve_current_runtime_requirements(manifest)
+                            current_piper_digest = piper_selection_digest(station_requirements)
+                        except Exception as exc:
+                            raise CommandError(
+                                "recovery payload contains Piper but restored station configuration could not be inspected"
+                            ) from exc
+                        if recovery_payload.piper_selection_digest != current_piper_digest:
+                            raise CommandError(
+                                "recovery payload Piper model/config identity does not match the restored station selection"
+                            )
+                    requirements = _requirements_for_recovery_tts(
+                        recovery_payload.tts_bundle, station_requirements
+                    )
+            else:
+                try:
+                    requirements = resolve_current_runtime_requirements(manifest)
+                except Exception as exc:
+                    raise RuntimeProvisioningError(
+                        "station configuration could not be inspected"
+                    ) from exc
             if native_mode:
                 if options["bundle"] is not None:
                     raise CommandError("--bundle is only valid for E3 TTS provisioning")
@@ -207,9 +339,14 @@ class Command(BaseCommand):
                     target_root=options["target_root"],
                     bootstrap=options["bootstrap_fdkaac"],
                 )
+                effective_source_dir = (
+                    Path(recovery_payload.native_source.source_dir)
+                    if recovery_payload is not None
+                    else options["native_source_dir"]
+                )
                 if options["plan"]:
                     plan = native.plan(
-                        source_dir=options["native_source_dir"],
+                        source_dir=effective_source_dir,
                         prepared_root=options["prepared_native_root"],
                         expected_preparer_uid=options["trusted_preparer_uid"],
                     )
@@ -235,12 +372,13 @@ class Command(BaseCommand):
                         raise CommandError(
                             "--trusted-preparer-uid is only valid for protected publication"
                         )
-                    if options["native_source_dir"] is None or options["prepared_native_root"] is None:
+                    if effective_source_dir is None or options["prepared_native_root"] is None:
                         raise CommandError(
-                            "--prepare-fdkaac requires --native-source-dir and --prepared-native-root"
+                            "--prepare-fdkaac requires --prepared-native-root, and either "
+                            "--native-source-dir or --recovery-payload"
                         )
                     result = native.prepare(
-                        source_dir=options["native_source_dir"],
+                        source_dir=effective_source_dir,
                         prepared_root=options["prepared_native_root"],
                     )
                     if json_output:
@@ -283,10 +421,13 @@ class Command(BaseCommand):
                 raise CommandError("--bootstrap-fdkaac requires native fdkaac mode")
             if options["trusted_preparer_uid"] is not None:
                 raise CommandError("--trusted-preparer-uid requires native fdkaac mode")
-            if options["bundle"] is None:
-                raise CommandError("E3 TTS provisioning requires --bundle")
+            effective_bundle = (
+                recovery_payload.tts_bundle.root if recovery_payload is not None else options["bundle"]
+            )
+            if effective_bundle is None:
+                raise CommandError("E3 TTS provisioning requires --bundle or --recovery-payload")
             provisioner = RuntimeProvisioner(
-                bundle_root=options["bundle"],
+                bundle_root=effective_bundle,
                 requirements=requirements,
                 product_manifest=manifest,
                 target_root=options["target_root"],
@@ -308,7 +449,12 @@ class Command(BaseCommand):
                 self.stdout.write(f"  Foundation E2 acceptance: {result.evidence.result.upper()}")
         except CommandError:
             raise
-        except (RuntimeBundleError, RuntimeComponentContractError, RuntimeProvisioningError) as exc:
+        except (
+            RuntimeBundleError,
+            RuntimeComponentContractError,
+            RuntimeProvisioningError,
+            RuntimeRecoveryError,
+        ) as exc:
             safe = " ".join(str(exc).split())[:512] or "runtime provisioning failed"
             if json_output:
                 self.stdout.write(

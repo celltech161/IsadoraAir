@@ -103,6 +103,18 @@ class RuntimeRecoveryError(ValueError):
     exception hierarchy."""
 
 
+class RecoveryPayloadNotConfiguredError(RuntimeRecoveryError):
+    """Raised specifically when a persistent recovery-payload base
+    root's `current` pointer does not exist at all -- the "this host
+    has not adopted Runtime Foundation E7B yet" case, deliberately
+    distinguished from every other failure (a configured-but-invalid/
+    tampered/escaped pointer stays the base RuntimeRecoveryError).
+    Callers (e.g. deploy/backup_isadoraair.sh, via
+    validate_runtime_recovery_payload's exit code 2) may legitimately
+    treat this one case as "not yet configured" rather than "broken" --
+    never the reverse."""
+
+
 # ---- filesystem safety primitives (mirrors runtime_provisioning.py's /
 # ---- runtime_native.py's own established discipline; each Foundation E
 # ---- module keeps its own copy rather than sharing a grab-bag utility
@@ -239,6 +251,19 @@ def _copy_tree_verified(source_root: Path, destination_root: Path) -> None:
             _copy_regular(source_file, destination_file)
 
 
+def _normalize_payload_modes(root: Path) -> None:
+    """Give a newly built payload the immutable-readable publication
+    modes enforced by the persistent trust boundary."""
+
+    os.chmod(root, 0o755)
+    for current, directories, filenames in os.walk(root, followlinks=False):
+        current_path = Path(current)
+        for name in directories:
+            os.chmod(current_path / name, 0o755)
+        for name in filenames:
+            os.chmod(current_path / name, 0o644)
+
+
 # ---- Piper station-selection digest (E1 reuse) ---------------------------
 
 def piper_selection_digest(requirements: RuntimeRequirements | None = None) -> str:
@@ -260,6 +285,29 @@ def piper_selection_digest(requirements: RuntimeRequirements | None = None) -> s
                 "config_sha256": model.config_sha256,
             }
             for model in models
+        ),
+        key=lambda item: item["model_id"],
+    )
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def piper_bundle_selection_digest(bundle: RuntimeBundle) -> str:
+    """Return the E1-compatible identity of the Piper models carried by
+    an E3 bundle.  This is deliberately the same narrow identity used by
+    :func:`piper_selection_digest`: model id plus model/config hashes.
+    It lets recovery reject an internally valid but station-unrelated
+    Piper bundle before publication."""
+
+    component = bundle.components.get("piper")
+    payload = [] if component is None else sorted(
+        (
+            {
+                "model_id": model.model_id,
+                "model_sha256": model.model.sha256,
+                "config_sha256": model.config.sha256,
+            }
+            for model in component.piper_models.values()
         ),
         key=lambda item: item["model_id"],
     )
@@ -306,8 +354,20 @@ class RuntimeRecoveryEvidence:
     payload_id: str | None
     manifest_error: str | None
     product_contract_match: bool | None
+    # The manifest's own declared digest -- present only once
+    # product_contract_match is True (a payload that failed to load at
+    # all, or whose declared digest didn't match, never exposes one).
+    # Not a secret; recorded here so a caller (e.g. the backup script's
+    # MANIFEST.txt) can cite it without a second file read.
+    product_contract_sha256: str | None
     components: dict[str, RecoveryComponentEvidence]
     piper_freshness: PiperFreshnessEvidence
+    # Which E3 components (kokoro/piper) the embedded tts bundle actually
+    # carries -- () when tts is absent or invalid. Runtime Foundation E7B's
+    # recovery-component policy (evaluate_recovery_policy) reads this to
+    # answer "does this payload contain Kokoro/Piper", independent of
+    # whether the top-level `tts` entry alone would say so.
+    tts_components: tuple[str, ...] = ()
     schema_version: int = RECOVERY_SCHEMA_VERSION
 
     @property
@@ -320,7 +380,7 @@ class RuntimeRecoveryEvidence:
             return RESULT_FAIL
         if not any(item.state == STATE_PRESENT for item in self.components.values()):
             return RESULT_FAIL
-        if self.piper_freshness.state == PIPER_FRESHNESS_STALE:
+        if "piper" in self.tts_components and self.piper_freshness.state != PIPER_FRESHNESS_CURRENT:
             return RESULT_FAIL
         return RESULT_PASS
 
@@ -331,12 +391,124 @@ class RuntimeRecoveryEvidence:
             "payload_id": self.payload_id,
             "piper_freshness": self.piper_freshness.to_dict(),
             "product_contract_match": self.product_contract_match,
+            "product_contract_sha256": self.product_contract_sha256,
             "result": self.result,
             "schema_version": self.schema_version,
+            "tts_components": list(self.tts_components),
         }
 
     def to_json(self) -> str:
         return json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":"))
+
+
+# ---- recovery-component policy (Runtime Foundation E7B) ------------------
+#
+# E1's station-requirement resolver only sees TTS demand that flows
+# through StationTTSVoice / WebRequestConfig.dedication_tts_voice_id /
+# RoadConditionsConfiguration.tts_voice_id. On this station,
+# WebRequestConfig.enabled and RoadConditionsConfiguration.enabled are
+# both True, but both voice-id fields are None and there are zero
+# StationTTSVoice rows -- yet both features already synthesize via the
+# hardcoded historical Kokoro binary (webrequests/services.py's and
+# road_conditions/synthesis.py's own KOKORO_BINARY constants), entirely
+# bypassing StationTTSVoice. E1 therefore currently resolves
+# kokoro.required=False even though Kokoro is operationally live here.
+#
+# This policy layer is deliberately independent of E1's `required` flag,
+# generic (never a station-name literal), and explicit: an operator (or
+# the backup script, via BACKUP_REQUIRED_RECOVERY_COMPONENTS) declares
+# which component NAMES a recovery payload must positively contain --
+# "kokoro"/"piper" (checked against the embedded E3 bundle's own
+# component set) and/or "native_fdkaac" (checked against this payload's
+# own top-level component). Nothing here infers policy from station
+# configuration; it only checks payload evidence against an explicit,
+# operator-supplied list.
+RECOVERY_POLICY_COMPONENT_NAMES = frozenset({"kokoro", "piper", "native_fdkaac"})
+
+
+def parse_recovery_policy_components(value: str | None) -> frozenset[str]:
+    """Parse the backup policy's strict comma-separated component list.
+
+    An actually empty value means no policy.  Empty entries, surrounding
+    whitespace, duplicates, and unknown names are configuration errors;
+    none may silently weaken the operator's requested recovery contract.
+    """
+
+    if value is None or value == "":
+        return frozenset()
+    items = value.split(",")
+    if any(not item or item != item.strip() or any(char.isspace() for char in item) for item in items):
+        raise RuntimeRecoveryError(
+            "recovery component policy must be a comma-separated list without empty or whitespace-containing entries"
+        )
+    duplicates = sorted({item for item in items if items.count(item) > 1})
+    if duplicates:
+        raise RuntimeRecoveryError(
+            f"recovery component policy contains duplicate name(s): {', '.join(duplicates)}"
+        )
+    unknown = sorted(set(items) - RECOVERY_POLICY_COMPONENT_NAMES)
+    if unknown:
+        raise RuntimeRecoveryError(
+            f"unknown recovery policy component name(s): {', '.join(unknown)}"
+        )
+    return frozenset(items)
+
+
+@dataclass(frozen=True, slots=True)
+class RecoveryPolicyEvidence:
+    required: frozenset[str]
+    missing: frozenset[str]
+
+    @property
+    def satisfied(self) -> bool:
+        return not self.missing
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "missing": sorted(self.missing),
+            "required": sorted(self.required),
+            "satisfied": self.satisfied,
+        }
+
+
+def evaluate_recovery_policy(
+    evidence: RuntimeRecoveryEvidence, required_components: frozenset[str] | set[str] | None
+) -> RecoveryPolicyEvidence:
+    """Pure, no-I/O check: does this ALREADY-COMPUTED evidence positively
+    establish every operator-required component? An empty/None policy is
+    trivially satisfied -- "not expected" components may remain absent
+    (task's own "absence can remain optional" rule). `not_checked` Piper
+    freshness is NEVER promoted to satisfied when Piper is
+    policy-required -- an indeterminate DB-dependent check must fail
+    closed, never advertise recoverability it could not positively
+    confirm."""
+
+    required = frozenset(required_components or ())
+    unknown = required - RECOVERY_POLICY_COMPONENT_NAMES
+    if unknown:
+        raise RuntimeRecoveryError(
+            f"unknown recovery policy component name(s): {', '.join(sorted(unknown))}"
+        )
+    missing: set[str] = set()
+    for name in ("kokoro", "piper"):
+        if name not in required:
+            continue
+        if evidence.components.get("tts") is None or evidence.components["tts"].state != STATE_PRESENT:
+            missing.add(name)
+            continue
+        if name not in evidence.tts_components:
+            missing.add(name)
+            continue
+        if name == "piper" and evidence.piper_freshness.state != PIPER_FRESHNESS_CURRENT:
+            # Required AND present is not enough for Piper specifically --
+            # policy-required Piper must be POSITIVELY confirmed current,
+            # never left at STALE or (critically) NOT_CHECKED.
+            missing.add(name)
+    if "native_fdkaac" in required:
+        component = evidence.components.get("native_fdkaac")
+        if component is None or component.state != STATE_PRESENT:
+            missing.add("native_fdkaac")
+    return RecoveryPolicyEvidence(required=required, missing=frozenset(missing))
 
 
 @dataclass(frozen=True, slots=True)
@@ -507,6 +679,13 @@ def _load_tts_component(shell: _ManifestShell, product_manifest: dict[str, Any])
         raise RuntimeRecoveryError(
             "embedded TTS bundle's runtime-bundle.json was modified after the recovery payload was built"
         )
+    if "piper" in bundle.components:
+        if shell.piper_selection_sha256 is None:
+            raise RuntimeRecoveryError("Piper recovery payload is missing station-selection identity")
+        if piper_bundle_selection_digest(bundle) != shell.piper_selection_sha256:
+            raise RuntimeRecoveryError(
+                "embedded Piper model/config identity does not match the recovery manifest's station selection"
+            )
     return bundle
 
 
@@ -591,11 +770,13 @@ def validate_recovery_payload(
             payload_id=None,
             manifest_error=_safe_message(exc),
             product_contract_match=None,
+            product_contract_sha256=None,
             components={},
             piper_freshness=PiperFreshnessEvidence(checked=False, state=PIPER_FRESHNESS_NOT_CHECKED),
         )
 
     components: dict[str, RecoveryComponentEvidence] = {}
+    tts_components: tuple[str, ...] = ()
     for name, loader in (("tts", _load_tts_component), ("native_fdkaac", _load_native_component)):
         if name not in shell.components:
             components[name] = RecoveryComponentEvidence(name=name, state=STATE_ABSENT)
@@ -609,6 +790,8 @@ def validate_recovery_payload(
             continue
         path = str(loaded.root) if name == "tts" else loaded.source_dir
         components[name] = RecoveryComponentEvidence(name=name, state=STATE_PRESENT, path=path)
+        if name == "tts":
+            tts_components = tuple(sorted(loaded.components))
 
     if current_piper_selection_digest is None:
         freshness = PiperFreshnessEvidence(checked=False, state=PIPER_FRESHNESS_NOT_CHECKED)
@@ -626,8 +809,10 @@ def validate_recovery_payload(
         payload_id=shell.payload_id,
         manifest_error=None,
         product_contract_match=True,
+        product_contract_sha256=shell.product_contract_sha256,
         components=components,
         piper_freshness=freshness,
+        tts_components=tts_components,
     )
 
 
@@ -640,6 +825,9 @@ def validate_current_recovery_payload(
     be inspected -- mirrors Runtime Foundation E6's own
     validate_current_runtime bootstrap-safe design."""
 
+    structural = validate_recovery_payload(root, product_manifest=product_manifest)
+    if "piper" not in structural.tts_components:
+        return structural
     try:
         digest = piper_selection_digest()
     except Exception:
@@ -792,21 +980,38 @@ class RuntimeRecoveryBuilder:
                     components={"piper": ComponentRequirement("piper")}
                 )
 
+            resolved_piper_digest = piper_selection_digest(resolved_piper_selection)
+            if staged_bundle is not None and "piper" in staged_bundle.components:
+                bundle_piper_digest = piper_bundle_selection_digest(staged_bundle)
+                if bundle_piper_digest != resolved_piper_digest:
+                    raise RuntimeRecoveryError(
+                        "embedded Piper model/config identity does not match the selected station requirements"
+                    )
+
             manifest_dict = {
                 "schema_version": RECOVERY_SCHEMA_VERSION,
                 "payload_id": resolved_payload_id,
                 "product_contract_sha256": product_contract_digest(self.manifest),
                 "built_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "components": components,
-                "piper_selection_sha256": piper_selection_digest(resolved_piper_selection),
+                "piper_selection_sha256": resolved_piper_digest,
             }
             encoded = json.dumps(manifest_dict, sort_keys=True, separators=(",", ":")).encode("utf-8")
             _write_atomic(staging / RECOVERY_MANIFEST_FILENAME, encoded)
+            _normalize_payload_modes(staging)
 
             # Re-validate the fully-staged payload before it becomes
             # visible at `output` -- proves the copy round-tripped
             # correctly, mirroring E3/E4's own post-publish verification.
-            evidence = validate_recovery_payload(staging, product_manifest=self.manifest)
+            evidence = validate_recovery_payload(
+                staging,
+                product_manifest=self.manifest,
+                current_piper_selection_digest=(
+                    resolved_piper_digest
+                    if staged_bundle is not None and "piper" in staged_bundle.components
+                    else None
+                ),
+            )
             if evidence.result != RESULT_PASS:
                 raise RuntimeRecoveryError(
                     f"newly-built recovery payload failed its own validation: {evidence.to_json()}"
@@ -820,7 +1025,211 @@ class RuntimeRecoveryBuilder:
             shutil.rmtree(staging, ignore_errors=True)
             raise
 
-        final_evidence = validate_recovery_payload(resolved_output, product_manifest=self.manifest)
+        final_evidence = validate_recovery_payload(
+            resolved_output,
+            product_manifest=self.manifest,
+            current_piper_selection_digest=(
+                resolved_piper_digest
+                if staged_bundle is not None and "piper" in staged_bundle.components
+                else None
+            ),
+        )
         return RuntimeRecoveryPreparationResult(
             payload_id=resolved_payload_id, output=str(resolved_output), evidence=final_evidence
         )
+
+
+# ---- persistent payload location (Runtime Foundation E7B) ----------------
+#
+# Convention (not established on any production host by this module --
+# see docs/RUNTIME_BACKUP_PAYLOAD.md for the operator-facing writeup):
+#
+#   <base_root>/payloads/<payload-id>/     one immutable, RuntimeRecoveryBuilder-
+#                                          built payload per directory; never
+#                                          overwritten in place (apply() already
+#                                          refuses an existing --output).
+#   <base_root>/current -> payloads/<payload-id>
+#                                          a single, explicit, atomically-swapped
+#                                          pointer -- never a directory scan or
+#                                          "pick newest by mtime" -- resolved by
+#                                          resolve_current_recovery_payload_root
+#                                          below, exactly one symlink hop,
+#                                          confined to payloads/.
+#
+# Intended production ownership: base_root and everything under it
+# root-owned, 0755 directories / 0644 files (matching Foundation E5's own
+# /var/lib/isadoraair/tts convention) -- so the isadoraair service
+# account (which every long-running production process actually runs
+# as) can read but never write any of it. Only a deliberate, explicitly
+# privileged prepare/activate run (this module's own API, run by an
+# operator -- never a service) can ever create or repoint it. This
+# module never creates base_root itself and never runs privileged on a
+# caller's behalf; see prepare_runtime_recovery_payload's own docstring.
+PAYLOADS_SUBDIR = "payloads"
+CURRENT_POINTER_NAME = "current"
+
+
+def _assert_trusted_mode_owner(path: Path, *, owner_uid: int, directory: bool) -> None:
+    metadata = path.lstat()
+    expected_mode = 0o755 if directory else 0o644
+    expected_type = stat.S_ISDIR if directory else stat.S_ISREG
+    if not expected_type(metadata.st_mode):
+        kind = "directory" if directory else "regular file"
+        raise RuntimeRecoveryError(f"trusted recovery path is not a {kind}: {path}")
+    if metadata.st_uid != owner_uid:
+        raise RuntimeRecoveryError(
+            f"trusted recovery path has owner UID {metadata.st_uid}, expected {owner_uid}: {path}"
+        )
+    actual_mode = stat.S_IMODE(metadata.st_mode)
+    if actual_mode != expected_mode:
+        raise RuntimeRecoveryError(
+            f"trusted recovery path has mode {actual_mode:04o}, expected {expected_mode:04o}: {path}"
+        )
+    if not directory and metadata.st_nlink != 1:
+        raise RuntimeRecoveryError(f"trusted recovery file is not single-link: {path}")
+
+
+def _assert_trusted_payload_tree(root: Path, *, owner_uid: int) -> None:
+    _assert_trusted_mode_owner(root, owner_uid=owner_uid, directory=True)
+    for current, directories, filenames in os.walk(root, followlinks=False):
+        current_path = Path(current)
+        for name in directories:
+            candidate = current_path / name
+            if candidate.is_symlink():
+                raise RuntimeRecoveryError(f"trusted recovery tree contains a symlink: {candidate}")
+            _assert_trusted_mode_owner(candidate, owner_uid=owner_uid, directory=True)
+        for name in filenames:
+            candidate = current_path / name
+            if candidate.is_symlink():
+                raise RuntimeRecoveryError(f"trusted recovery tree contains a symlink: {candidate}")
+            _assert_trusted_mode_owner(candidate, owner_uid=owner_uid, directory=False)
+
+
+def resolve_current_recovery_payload_root(
+    base_root: str | Path, *, expected_owner_uid: int = 0
+) -> Path:
+    """Safely resolve <base_root>/current to the payload directory it
+    points at -- exactly one symlink hop, confined to
+    <base_root>/payloads/, never a directory scan. Raises
+    RuntimeRecoveryError for anything unsafe or absent: no pointer, the
+    pointer is not a symlink, the pointer's target escapes
+    <base_root>/payloads/, a symlinked ancestor anywhere in the chain,
+    or a dangling target. Never validates the payload's OWN contents --
+    call validate_recovery_payload on the result for that."""
+
+    resolved_base = Path(base_root)
+    if not resolved_base.is_absolute():
+        resolved_base = resolved_base.absolute()
+    _assert_no_symlink_ancestors(resolved_base)
+    if resolved_base.is_symlink():
+        raise RuntimeRecoveryError(f"recovery base root must be a non-symlink directory: {resolved_base}")
+    if not resolved_base.exists():
+        # Simply never set up on this host yet -- distinct from every
+        # other failure mode below, all of which mean "configured, but
+        # unsafe/broken."
+        raise RecoveryPayloadNotConfiguredError(f"recovery base root does not exist: {resolved_base}")
+    if not resolved_base.is_dir():
+        raise RuntimeRecoveryError(f"recovery base root must be a directory: {resolved_base}")
+    _assert_trusted_mode_owner(resolved_base, owner_uid=expected_owner_uid, directory=True)
+
+    payloads_root = resolved_base / PAYLOADS_SUBDIR
+    if payloads_root.is_symlink():
+        raise RuntimeRecoveryError(f"recovery payloads directory must not be a symlink: {payloads_root}")
+    if not payloads_root.exists():
+        raise RecoveryPayloadNotConfiguredError(f"recovery payloads directory does not exist: {payloads_root}")
+    _assert_trusted_mode_owner(payloads_root, owner_uid=expected_owner_uid, directory=True)
+
+    pointer = resolved_base / CURRENT_POINTER_NAME
+    try:
+        pointer_stat = pointer.lstat()
+    except OSError as exc:
+        raise RecoveryPayloadNotConfiguredError(f"no current recovery payload is selected: {pointer}") from exc
+    if not stat.S_ISLNK(pointer_stat.st_mode):
+        raise RuntimeRecoveryError(f"current recovery payload pointer must be a symlink: {pointer}")
+    if pointer_stat.st_uid != expected_owner_uid:
+        raise RuntimeRecoveryError(
+            f"current recovery payload pointer has owner UID {pointer_stat.st_uid}, expected {expected_owner_uid}: {pointer}"
+        )
+
+    # Exactly ONE symlink hop, read literally (os.readlink), never
+    # Path.resolve() -- resolve() walks an UNBOUNDED chain of symlinks,
+    # which would silently follow a symlink planted *inside* payloads/
+    # too (e.g. current -> payloads/fake -> payloads/real) and defeat
+    # the "immediate child must be a real directory" check below.
+    raw_target = os.readlink(pointer)
+    if os.path.isabs(raw_target) or "\x00" in raw_target:
+        raise RuntimeRecoveryError(f"current recovery payload pointer must be a safe relative symlink: {pointer}")
+    target = (resolved_base / raw_target).absolute()
+    try:
+        relative = target.relative_to(payloads_root)
+    except ValueError:
+        raise RuntimeRecoveryError(
+            f"current recovery payload pointer escapes {payloads_root}: {pointer} -> {target}"
+        ) from None
+    if not relative.parts or ".." in relative.parts:
+        raise RuntimeRecoveryError(f"current recovery payload pointer is malformed: {pointer} -> {target}")
+    # The immediate child of payloads/ (the actual payload-id directory)
+    # must itself be a real, non-symlink directory -- checked with
+    # is_symlink()/is_dir(), neither of which follows further symlinks
+    # past this one component, so a symlinked payload-id directory can
+    # never be mistaken for a real, immutable one, and the pointer may
+    # only ever name that directory directly (no deeper path segments).
+    immediate = payloads_root / relative.parts[0]
+    if immediate.is_symlink():
+        raise RuntimeRecoveryError(f"recovery payload directory is an unexpected symlink: {immediate}")
+    if not immediate.is_dir():
+        raise RuntimeRecoveryError(f"current recovery payload target is not an existing directory: {immediate}")
+    if len(relative.parts) != 1:
+        raise RuntimeRecoveryError(f"current recovery payload pointer must name a direct child of {payloads_root}")
+    _assert_trusted_payload_tree(immediate, owner_uid=expected_owner_uid)
+    return immediate
+
+
+def activate_recovery_payload(
+    base_root: str | Path,
+    payload_id: str,
+    *,
+    product_manifest: dict[str, Any] | None = None,
+    expected_owner_uid: int = 0,
+) -> Path:
+    """Validate <base_root>/payloads/<payload_id> and, only if it
+    validates cleanly, atomically repoint <base_root>/current at it.
+    Never mutates the payload directory itself. Refuses a payload_id
+    that isn't the exact directory basename already present (never
+    creates one) -- this is a SELECTION action, not a build action;
+    build with RuntimeRecoveryBuilder.apply() first."""
+
+    resolved_base = Path(base_root)
+    if not resolved_base.is_absolute():
+        resolved_base = resolved_base.absolute()
+    _assert_no_symlink_ancestors(resolved_base)
+    payloads_root = resolved_base / PAYLOADS_SUBDIR
+    _assert_trusted_mode_owner(resolved_base, owner_uid=expected_owner_uid, directory=True)
+    _assert_trusted_mode_owner(payloads_root, owner_uid=expected_owner_uid, directory=True)
+
+    if not _PAYLOAD_ID_RE.fullmatch(payload_id) or "/" in payload_id:
+        raise RuntimeRecoveryError("payload_id has an invalid stable identity")
+    target = payloads_root / payload_id
+    if target.parent != payloads_root:
+        raise RuntimeRecoveryError("payload_id must name a direct child of payloads/")
+    _assert_trusted_payload_tree(target, owner_uid=expected_owner_uid)
+
+    evidence = validate_current_recovery_payload(target, product_manifest=product_manifest)
+    if evidence.result != RESULT_PASS:
+        raise RuntimeRecoveryError(f"payload '{payload_id}' does not validate cleanly: {evidence.to_json()}")
+
+    pointer = resolved_base / CURRENT_POINTER_NAME
+    relative_target = os.path.relpath(target, resolved_base)
+    temporary = resolved_base / f".{CURRENT_POINTER_NAME}.e7-{uuid.uuid4().hex}"
+    try:
+        os.symlink(relative_target, temporary)
+        if temporary.lstat().st_uid != expected_owner_uid:
+            raise RuntimeRecoveryError(
+                f"temporary recovery pointer is not owned by expected UID {expected_owner_uid}: {temporary}"
+            )
+        os.replace(temporary, pointer)
+        _fsync_directory(resolved_base)
+    finally:
+        if temporary.is_symlink():
+            temporary.unlink(missing_ok=True)
+    return target

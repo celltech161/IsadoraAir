@@ -32,16 +32,29 @@ remote target configured in `~/.iasboxbu.cred` (never in the repo), with
 own exact contents, exclusions, script version, and the IsadoraAir Git
 SHA it was taken alongside.
 
-**Current script version is 2.1.0** — it does not carry Kokoro/Piper
-runtime material or fdkaac/libfdk-aac source archives; a bare-machine
-restore still reprovisions TTS/native runtimes by hand (see "Restore"
-below and `deploy/restore/70-tts.sh`/`50-native-deps.sh`'s own headers).
-Runtime Foundation E7A (`docs/RUNTIME_BACKUP_PAYLOAD.md`) has since
-defined the self-contained runtime recovery payload artifact meant to
-close that gap, plus its builder/validator API — but as of this writing
-`backup_isadoraair.sh` does not yet produce or consume it, and neither
-restore stage consumes it either. That wiring is E7B, explicitly
-deferred; do not read this section as "backup v3 is operational."
+**Current script version is 3.0.0** (Runtime Foundation E7B,
+2026-08-29) — it *can* carry an operator-prepared Runtime Foundation E7
+disaster-recovery payload (Kokoro/Piper runtime material and/or
+fdkaac/libfdk-aac source archives) in a `runtime-recovery/` directory,
+and `deploy/restore/50-native-deps.sh`/`70-tts.sh` now consume it when
+present, delegating to Foundation E3/E4's own canonical provisioners
+(see `docs/RUNTIME_BACKUP_PAYLOAD.md`'s "Backup v3 integration" and
+"Restore integration" sections, and `docs/DISASTER_RECOVERY_RESTORE.md`'s
+"Runtime recovery payload" section, for exactly how). This is **not**
+yet operational on the production station: inclusion requires an
+operator to have explicitly prepared and activated a payload at
+`RECOVERY_PAYLOAD_ROOT` (default `/var/lib/isadoraair/runtime-recovery`),
+which has not been done — so production's nightly backups currently
+remain archive format 2.1.0 / `legacy_non_self_contained`, even though
+the script implementation is 3.0.0-capable. They do not contain a
+`runtime-recovery/` payload and are not self-contained for TTS/native
+recovery, same as every older v2.x archive (see the machine-readable
+`runtime-recovery-archive.json` classification and backward-compatibility note in
+`docs/DISASTER_RECOVERY_RESTORE.md`). A bare-machine restore against
+today's actual production archives therefore still needs the manual/
+connected-install fallback described below and in each restore stage's
+own header. Runtime Foundation E7C — proving this path against a real
+station backup-v3 archive — has not been done yet either.
 
 **Covered:**
 

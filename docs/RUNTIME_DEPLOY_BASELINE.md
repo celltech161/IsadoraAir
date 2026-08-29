@@ -311,12 +311,15 @@ address explicitly — never a silent fetch.
 
 ## Remaining E7/E8 responsibilities
 
-- `deploy/restore/50-native-deps.sh` (fdkaac) and `70-tts.sh`
-  (Kokoro/Piper) still provision through their own pre-Foundation-E,
-  non-canonical mechanisms (a throwaway `native/fdkaac` prefix, and
-  `$HOME/kokoro`/`$HOME/piper` respectively) — wiring these onto
-  Foundation E3/E4's own canonical provisioners is backup v3 payload
-  consumption, explicitly E7's scope, not E6's.
+- **Update, Runtime Foundation E7B (2026-08-29):** for backup-based
+  disaster recovery specifically, `deploy/restore/50-native-deps.sh`
+  and `70-tts.sh` now delegate to Foundation E4/E3's own canonical
+  provisioners via the embedded recovery payload — see
+  `docs/RUNTIME_BACKUP_PAYLOAD.md`'s "Restore integration" section. The
+  pre-Foundation-E mechanisms described below (a throwaway
+  `native/fdkaac` prefix, `$HOME/kokoro`/`$HOME/piper`) remain, but only
+  as an explicit, separately-invoked connected/fresh-install mode —
+  never a backup-based restore's default path.
 - E7 also owns actually shipping the wheel/model/native-source bundles
   E3/E4's provisioners consume.
 - E8 owns fully offline, disposable, whole-machine acceptance once E7's

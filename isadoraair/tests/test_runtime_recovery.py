@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import tempfile
 from copy import deepcopy
@@ -29,6 +30,7 @@ from isadoraair.runtime_bundle import (
 )
 from isadoraair.runtime_components import load_runtime_components
 from isadoraair.runtime_recovery import (
+    PAYLOADS_SUBDIR,
     PIPER_FRESHNESS_CURRENT,
     PIPER_FRESHNESS_NOT_CHECKED,
     PIPER_FRESHNESS_STALE,
@@ -40,8 +42,12 @@ from isadoraair.runtime_recovery import (
     STATE_PRESENT,
     RuntimeRecoveryBuilder,
     RuntimeRecoveryError,
+    activate_recovery_payload,
+    evaluate_recovery_policy,
     load_recovery_payload,
     piper_selection_digest,
+    parse_recovery_policy_components,
+    resolve_current_recovery_payload_root,
     validate_recovery_payload,
 )
 from isadoraair.runtime_requirements import (
@@ -241,6 +247,19 @@ class HappyPathTests(RecoveryFixture):
         stored_digest = json.loads((output / RECOVERY_MANIFEST_FILENAME).read_text())["piper_selection_sha256"]
         self.assertEqual(stored_digest, piper_selection_digest(self.piper_requirement()))
 
+    def test_piper_bundle_must_match_selected_station_identity(self):
+        tts_bundle = self.write_tts_bundle(include_piper=True)
+        unrelated = RuntimeRequirements(
+            components={"piper": ComponentRequirement("piper")}
+        )
+        with self.assertRaisesRegex(RuntimeRecoveryError, "Piper model/config identity"):
+            self.builder().apply(
+                tts_bundle=tts_bundle,
+                output=self.root / "payload-unrelated-piper",
+                payload_id="p-unrelated-piper",
+                piper_selection=unrelated,
+            )
+
     def test_valid_native_fdkaac_only_payload(self):
         output = self.root / "payload-native"
         result = self.builder().apply(native_source_dir=self.native_source_dir, output=output, payload_id="p-native")
@@ -362,7 +381,7 @@ class IntegrityTests(RecoveryFixture):
     def test_not_checked_when_no_live_digest_supplied(self):
         evidence = validate_recovery_payload(self.output, product_manifest=self.manifest)
         self.assertEqual(evidence.piper_freshness.state, PIPER_FRESHNESS_NOT_CHECKED)
-        self.assertEqual(evidence.result, RESULT_PASS)
+        self.assertEqual(evidence.result, RESULT_FAIL)
 
     def test_wrong_platform_abi_is_invalid(self):
         mutated = self._mutated_copy()
@@ -604,3 +623,384 @@ class ManagementCommandTests(RecoveryFixture):
     def test_validate_command_fails_closed_on_missing_payload(self):
         with self.assertRaises(CommandError):
             call_command("validate_runtime_recovery_payload", str(self.root / "does-not-exist"))
+
+
+class RecoveryPolicyTests(RecoveryFixture):
+    """Runtime Foundation E7B -- the required-component policy layer.
+    Deliberately independent of E1's `required` flag (see this fixture's
+    piper_requirement, kokoro is NEVER inferred that way)."""
+
+    def test_no_policy_is_trivially_satisfied(self):
+        tts_bundle = self.write_tts_bundle()
+        output = self.root / "payload"
+        self.builder().apply(tts_bundle=tts_bundle, output=output, payload_id="p1")
+        evidence = validate_recovery_payload(output, product_manifest=self.manifest)
+        policy = evaluate_recovery_policy(evidence, None)
+        self.assertTrue(policy.satisfied)
+        self.assertEqual(policy.missing, frozenset())
+
+    def test_kokoro_required_and_present_is_satisfied(self):
+        tts_bundle = self.write_tts_bundle()
+        output = self.root / "payload"
+        self.builder().apply(tts_bundle=tts_bundle, output=output, payload_id="p1")
+        evidence = validate_recovery_payload(output, product_manifest=self.manifest)
+        policy = evaluate_recovery_policy(evidence, {"kokoro"})
+        self.assertTrue(policy.satisfied)
+
+    def test_kokoro_required_but_absent_is_not_satisfied(self):
+        """The exact E7B scenario: a payload built without Kokoro must
+        never silently pass a policy that requires it -- station E1
+        `required=False` is never consulted here at all."""
+
+        output = self.root / "payload"
+        self.builder().apply(native_source_dir=self.native_source_dir, output=output, payload_id="p1")
+        evidence = validate_recovery_payload(output, product_manifest=self.manifest)
+        policy = evaluate_recovery_policy(evidence, {"kokoro"})
+        self.assertFalse(policy.satisfied)
+        self.assertEqual(policy.missing, frozenset({"kokoro"}))
+
+    def test_native_fdkaac_required_but_absent_is_not_satisfied(self):
+        tts_bundle = self.write_tts_bundle()
+        output = self.root / "payload"
+        self.builder().apply(tts_bundle=tts_bundle, output=output, payload_id="p1")
+        evidence = validate_recovery_payload(output, product_manifest=self.manifest)
+        policy = evaluate_recovery_policy(evidence, {"native_fdkaac"})
+        self.assertFalse(policy.satisfied)
+        self.assertEqual(policy.missing, frozenset({"native_fdkaac"}))
+
+    def test_piper_required_present_but_not_checked_is_not_satisfied(self):
+        """not_checked is not success (task's own explicit rule): a
+        policy-required Piper must be POSITIVELY confirmed current, an
+        indeterminate DB-dependent check must fail closed."""
+
+        tts_bundle = self.write_tts_bundle(include_piper=True)
+        output = self.root / "payload"
+        self.builder().apply(
+            tts_bundle=tts_bundle, output=output, payload_id="p1", piper_selection=self.piper_requirement()
+        )
+        evidence = validate_recovery_payload(output, product_manifest=self.manifest)  # no live digest given
+        self.assertEqual(evidence.piper_freshness.state, PIPER_FRESHNESS_NOT_CHECKED)
+        policy = evaluate_recovery_policy(evidence, {"piper"})
+        self.assertFalse(policy.satisfied)
+
+    def test_piper_required_and_confirmed_current_is_satisfied(self):
+        tts_bundle = self.write_tts_bundle(include_piper=True)
+        output = self.root / "payload"
+        self.builder().apply(
+            tts_bundle=tts_bundle, output=output, payload_id="p1", piper_selection=self.piper_requirement()
+        )
+        digest = piper_selection_digest(self.piper_requirement())
+        evidence = validate_recovery_payload(output, product_manifest=self.manifest, current_piper_selection_digest=digest)
+        self.assertEqual(evidence.piper_freshness.state, PIPER_FRESHNESS_CURRENT)
+        policy = evaluate_recovery_policy(evidence, {"piper"})
+        self.assertTrue(policy.satisfied)
+
+    def test_piper_required_but_stale_is_not_satisfied(self):
+        tts_bundle = self.write_tts_bundle(include_piper=True)
+        output = self.root / "payload"
+        self.builder().apply(
+            tts_bundle=tts_bundle, output=output, payload_id="p1", piper_selection=self.piper_requirement()
+        )
+        evidence = validate_recovery_payload(
+            output, product_manifest=self.manifest, current_piper_selection_digest="0" * 64
+        )
+        self.assertEqual(evidence.piper_freshness.state, PIPER_FRESHNESS_STALE)
+        policy = evaluate_recovery_policy(evidence, {"piper"})
+        self.assertFalse(policy.satisfied)
+
+    def test_multiple_required_components_all_must_be_satisfied(self):
+        tts_bundle = self.write_tts_bundle()  # kokoro only, no native
+        output = self.root / "payload"
+        self.builder().apply(tts_bundle=tts_bundle, output=output, payload_id="p1")
+        evidence = validate_recovery_payload(output, product_manifest=self.manifest)
+        policy = evaluate_recovery_policy(evidence, {"kokoro", "native_fdkaac"})
+        self.assertFalse(policy.satisfied)
+        self.assertEqual(policy.missing, frozenset({"native_fdkaac"}))
+
+    def test_unknown_policy_component_name_is_rejected(self):
+        tts_bundle = self.write_tts_bundle()
+        output = self.root / "payload"
+        self.builder().apply(tts_bundle=tts_bundle, output=output, payload_id="p1")
+        evidence = validate_recovery_payload(output, product_manifest=self.manifest)
+        with self.assertRaises(RuntimeRecoveryError):
+            evaluate_recovery_policy(evidence, {"not-a-real-component"})
+
+    def test_strict_policy_parser_rejects_empty_whitespace_unknown_and_duplicates(self):
+        for malformed in (
+            "kokoro,",
+            ",kokoro",
+            "kokoro,,piper",
+            "kokoro, piper",
+            "kokoro,kokoro",
+            "not-real",
+        ):
+            with self.subTest(malformed=malformed), self.assertRaises(RuntimeRecoveryError):
+                parse_recovery_policy_components(malformed)
+        self.assertEqual(
+            parse_recovery_policy_components("kokoro,piper,native_fdkaac"),
+            frozenset({"kokoro", "piper", "native_fdkaac"}),
+        )
+        self.assertEqual(parse_recovery_policy_components(""), frozenset())
+
+    def test_invalid_payload_never_satisfies_any_policy(self):
+        broken_output = self.root / "does-not-exist"
+        evidence = validate_recovery_payload(broken_output, product_manifest=self.manifest)
+        self.assertEqual(evidence.result, RESULT_FAIL)
+        policy = evaluate_recovery_policy(evidence, {"kokoro"})
+        self.assertFalse(policy.satisfied)
+
+
+class PersistentLocationTests(RecoveryFixture):
+    """Runtime Foundation E7B -- the durable base_root/payloads/<id> +
+    base_root/current convention. Never established on any production
+    path by these tests -- every base_root here is a disposable temp
+    directory."""
+
+    def _base_root(self) -> Path:
+        base = self.root / "persistent"
+        (base / PAYLOADS_SUBDIR).mkdir(parents=True)
+        base.chmod(0o755)
+        (base / PAYLOADS_SUBDIR).chmod(0o755)
+        return base
+
+    def _activate(self, base: Path, payload_id: str) -> Path:
+        return activate_recovery_payload(
+            base,
+            payload_id,
+            product_manifest=self.manifest,
+            expected_owner_uid=os.getuid(),
+        )
+
+    def _resolve(self, base: Path) -> Path:
+        return resolve_current_recovery_payload_root(base, expected_owner_uid=os.getuid())
+
+    def test_resolve_with_no_pointer_fails_closed(self):
+        base = self._base_root()
+        with self.assertRaises(RuntimeRecoveryError):
+            self._resolve(base)
+
+    def test_activate_then_resolve_round_trip(self):
+        base = self._base_root()
+        tts_bundle = self.write_tts_bundle()
+        target = base / PAYLOADS_SUBDIR / "p1"
+        self.builder().apply(tts_bundle=tts_bundle, output=target, payload_id="p1")
+
+        activated = self._activate(base, "p1")
+        self.assertEqual(activated, target)
+
+        resolved = self._resolve(base)
+        self.assertEqual(resolved, target)
+
+    def test_activate_refuses_an_invalid_payload(self):
+        base = self._base_root()
+        broken = base / PAYLOADS_SUBDIR / "broken"
+        broken.mkdir()  # no runtime-recovery.json at all
+        with self.assertRaises(RuntimeRecoveryError):
+            self._activate(base, "broken")
+        # and no pointer was created as a side effect of the failed attempt
+        self.assertFalse((base / "current").exists())
+
+    def test_activate_never_overwrites_a_payload_directory(self):
+        """activate_recovery_payload only ever repoints the `current`
+        symlink -- it must never write into payloads/<id>/ itself."""
+
+        base = self._base_root()
+        tts_bundle = self.write_tts_bundle()
+        target = base / PAYLOADS_SUBDIR / "p1"
+        self.builder().apply(tts_bundle=tts_bundle, output=target, payload_id="p1")
+        before = {p: p.stat().st_mtime_ns for p in target.rglob("*") if p.is_file()}
+
+        self._activate(base, "p1")
+
+        after = {p: p.stat().st_mtime_ns for p in target.rglob("*") if p.is_file()}
+        self.assertEqual(before, after)
+
+    def test_activation_is_atomic_pointer_swap_not_directory_scan(self):
+        """Two payloads exist; activating the OLDER one after the newer
+        one was already built must select exactly the one asked for --
+        proving this is never a "pick newest" scan."""
+
+        base = self._base_root()
+        tts_bundle_a = self.write_tts_bundle(bundle_id="bundle-a")
+        target_a = base / PAYLOADS_SUBDIR / "p-a"
+        self.builder().apply(tts_bundle=tts_bundle_a, output=target_a, payload_id="p-a")
+
+        # A second, newer payload -- native-only, so it's trivially
+        # distinguishable from p-a's tts-only shape.
+        target_b = base / PAYLOADS_SUBDIR / "p-b"
+        self.builder().apply(native_source_dir=self.native_source_dir, output=target_b, payload_id="p-b")
+
+        self._activate(base, "p-a")
+        resolved = self._resolve(base)
+        self.assertEqual(resolved, target_a)
+        evidence = validate_recovery_payload(resolved, product_manifest=self.manifest)
+        self.assertEqual(evidence.components["tts"].state, STATE_PRESENT)
+        self.assertEqual(evidence.components["native_fdkaac"].state, STATE_ABSENT)
+
+    def test_reactivating_a_different_payload_swaps_cleanly(self):
+        base = self._base_root()
+        tts_bundle = self.write_tts_bundle()
+        target_a = base / PAYLOADS_SUBDIR / "p-a"
+        self.builder().apply(tts_bundle=tts_bundle, output=target_a, payload_id="p-a")
+        target_b = base / PAYLOADS_SUBDIR / "p-b"
+        self.builder().apply(native_source_dir=self.native_source_dir, output=target_b, payload_id="p-b")
+
+        self._activate(base, "p-a")
+        self.assertEqual(self._resolve(base), target_a)
+        self._activate(base, "p-b")
+        self.assertEqual(self._resolve(base), target_b)
+        # p-a itself must remain untouched by the re-activation
+        self.assertTrue(target_a.is_dir())
+
+    def test_pointer_target_outside_payloads_root_is_rejected(self):
+        base = self._base_root()
+        escape_target = self.root / "outside-payloads"
+        escape_target.mkdir()
+        (base / "current").symlink_to(escape_target)
+        with self.assertRaises(RuntimeRecoveryError):
+            self._resolve(base)
+
+    def test_current_pointer_must_itself_be_a_symlink(self):
+        base = self._base_root()
+        (base / "current").mkdir()  # a real directory, not a symlink
+        with self.assertRaises(RuntimeRecoveryError):
+            self._resolve(base)
+
+    def test_symlinked_payload_id_directory_is_rejected(self):
+        base = self._base_root()
+        tts_bundle = self.write_tts_bundle()
+        real_target = base / PAYLOADS_SUBDIR / "p-real"
+        self.builder().apply(tts_bundle=tts_bundle, output=real_target, payload_id="p-real")
+        fake_link = base / PAYLOADS_SUBDIR / "p-fake"
+        fake_link.symlink_to(real_target)
+        (base / "current").symlink_to(Path(PAYLOADS_SUBDIR) / "p-fake")
+        with self.assertRaises(RuntimeRecoveryError):
+            self._resolve(base)
+
+    def test_activate_rejects_traversal_in_payload_id(self):
+        base = self._base_root()
+        with self.assertRaises(RuntimeRecoveryError):
+            self._activate(base, "../../etc")
+
+    def test_base_root_itself_symlinked_is_rejected(self):
+        real_base = self.root / "real-base"
+        (real_base / PAYLOADS_SUBDIR).mkdir(parents=True)
+        link = self.root / "base-link"
+        link.symlink_to(real_base)
+        with self.assertRaises(RuntimeRecoveryError):
+            self._resolve(link)
+
+    def test_group_writable_payload_file_is_rejected(self):
+        base = self._base_root()
+        tts_bundle = self.write_tts_bundle()
+        target = base / PAYLOADS_SUBDIR / "p1"
+        self.builder().apply(tts_bundle=tts_bundle, output=target, payload_id="p1")
+        self._activate(base, "p1")
+        (target / RECOVERY_MANIFEST_FILENAME).chmod(0o664)
+        with self.assertRaises(RuntimeRecoveryError):
+            self._resolve(base)
+
+
+class ManagementCommandE7BTests(RecoveryFixture):
+    def _base_root(self) -> Path:
+        base = self.root / "persistent"
+        (base / PAYLOADS_SUBDIR).mkdir(parents=True)
+        base.chmod(0o755)
+        (base / PAYLOADS_SUBDIR).chmod(0o755)
+        return base
+
+    def test_activate_and_validate_current_round_trip_via_cli(self):
+        base = self._base_root()
+        tts_bundle = self.write_tts_bundle()
+        target = base / PAYLOADS_SUBDIR / "p1"
+        with patch("isadoraair.runtime_recovery.load_runtime_components", return_value=self.manifest):
+            call_command(
+                "prepare_runtime_recovery_payload",
+                "--apply",
+                f"--tts-bundle={tts_bundle}",
+                f"--output={target}",
+                "--payload-id=p1",
+            )
+            call_command(
+                "prepare_runtime_recovery_payload", "--activate", f"--base-root={base}", "--payload-id=p1",
+                f"--trusted-owner-uid={os.getuid()}",
+            )
+            call_command(
+                "validate_runtime_recovery_payload", f"--base-root={base}", "--current", "--require=kokoro",
+                f"--trusted-owner-uid={os.getuid()}",
+            )
+            with self.assertRaises(CommandError):
+                call_command(
+                    "validate_runtime_recovery_payload", f"--base-root={base}", "--current", "--require=piper",
+                    f"--trusted-owner-uid={os.getuid()}",
+                )
+
+    def test_validate_current_json_includes_resolved_path_and_policy(self):
+        import io
+        import json
+
+        base = self._base_root()
+        tts_bundle = self.write_tts_bundle()
+        target = base / PAYLOADS_SUBDIR / "p1"
+        with patch("isadoraair.runtime_recovery.load_runtime_components", return_value=self.manifest):
+            call_command(
+                "prepare_runtime_recovery_payload",
+                "--apply",
+                f"--tts-bundle={tts_bundle}",
+                f"--output={target}",
+                "--payload-id=p1",
+            )
+            call_command(
+                "prepare_runtime_recovery_payload", "--activate", f"--base-root={base}", "--payload-id=p1",
+                f"--trusted-owner-uid={os.getuid()}",
+            )
+            out = io.StringIO()
+            call_command(
+                "validate_runtime_recovery_payload",
+                f"--base-root={base}",
+                "--current",
+                "--require=kokoro",
+                "--json",
+                f"--trusted-owner-uid={os.getuid()}",
+                stdout=out,
+            )
+        payload = json.loads(out.getvalue())
+        self.assertEqual(payload["resolved_path"], str(target))
+        self.assertTrue(payload["policy"]["satisfied"])
+        self.assertEqual(payload["policy"]["required"], ["kokoro"])
+
+    def test_validate_requires_exactly_one_resolution_mode(self):
+        with self.assertRaises(CommandError):
+            call_command("validate_runtime_recovery_payload")
+        with self.assertRaises(CommandError):
+            call_command(
+                "validate_runtime_recovery_payload", str(self.root), f"--base-root={self.root}", "--current"
+            )
+
+    def test_validate_rejects_malformed_csv_policy_before_inspection(self):
+        with self.assertRaisesRegex(CommandError, "without empty"):
+            call_command(
+                "validate_runtime_recovery_payload",
+                str(self.root / "not-even-inspected"),
+                "--require-components=kokoro,",
+            )
+
+    def test_validate_current_not_configured_exits_2_distinct_from_broken(self):
+        """Exit code 2 (not CommandError's usual 1) specifically for a
+        never-set-up base root -- distinct from a configured-but-broken
+        one, which must still raise the ordinary CommandError/exit 1."""
+
+        never_configured = self.root / "never-configured"
+        with self.assertRaises(SystemExit) as cm:
+            call_command("validate_runtime_recovery_payload", f"--base-root={never_configured}", "--current")
+        self.assertEqual(cm.exception.code, 2)
+
+        broken_base = self.root / "broken-base"
+        (broken_base / PAYLOADS_SUBDIR).mkdir(parents=True)
+        (broken_base / "current").symlink_to(Path("/etc"))  # escapes payloads/
+        with self.assertRaises(CommandError):
+            call_command("validate_runtime_recovery_payload", f"--base-root={broken_base}", "--current")
+
+    def test_prepare_activate_requires_base_root_and_payload_id(self):
+        with self.assertRaises(CommandError):
+            call_command("prepare_runtime_recovery_payload", "--activate")

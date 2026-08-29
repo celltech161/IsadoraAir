@@ -1,34 +1,57 @@
 #!/usr/bin/env bash
-# deploy/restore/70-tts.sh -- IsadoraAir 1.2 Phase 4.
+# deploy/restore/70-tts.sh -- IsadoraAir 1.2 Phase 4 / Runtime Foundation E7B.
 #
-# Provisions Kokoro and Piper as INDEPENDENT local speech capabilities,
-# per docs/KOKORO_PROVENANCE.md / docs/PIPER_PROVENANCE.md (IsadoraAir
-# 1.2 Phase 3) -- both are first-class here; Piper is not treated as
-# obsolete just because production currently prefers Kokoro for most
-# slots. No backend-selection policy lives in this script -- that's
-# station config (weather-ingest's lib/voices.py VOICES dict), not a
-# restore concern.
+# Two entirely separate modes, chosen automatically (never mixed):
 #
-# Each engine's *runtime* (pip package + native deps) is fully
-# reproducible from an ordinary pip install; each engine's *model
-# assets* are large, externally-hosted binaries this repo/backup
-# deliberately does not carry (see the provenance docs' "Reproducibility
-# verdict" sections) -- --kokoro-model-src / --piper-model-src let this
-# stage copy them from a known-good local source (e.g. a preserved copy
-# of the original install, or a mount of one) when available, and
-# report MISSING rather than fail hard when not, per Phase 4 spec
-# section 22 ("report available/configured/missing state").
+#   Backup-based disaster recovery (--archive was given, and
+#   --legacy-connected-install was not passed): locates this restore's
+#   embedded Runtime Foundation E7 recovery payload (via lib.sh's
+#   restore_locate_recovery_payload -- the one shared contract stages
+#   50/70 both use, see docs/DISASTER_RECOVERY_RESTORE.md), validates
+#   it, then delegates the embedded E3 TTS bundle to the REAL Runtime
+#   Foundation E3 authority (monitoring/management/commands/
+#   provision_runtime_components.py, via --recovery-payload). This
+#   stage does not build a venv itself, does not pip install anything,
+#   does not re-implement E3's verification, and NEVER falls back to
+#   pip/PyPI acquisition just because the payload is missing -- a legacy/
+#   v2.x or explicitly non-self-contained archive fails this backup-based
+#   stage plainly (Runtime Foundation E7B task step 16 -- see "Backward
+#   compatibility" in docs/DISASTER_RECOVERY_RESTORE.md). Kokoro
+#   requiredness comes from the explicit recovery policy/bundle, never
+#   from E1's known historical-caller blind spot. Piper remains
+#   station-owned: bundle, payload selection digest, and restored DB E1
+#   model/config identity must match before publication -- see
+#   monitoring/management/commands/provision_runtime_components.py's
+#   _requirements_for_recovery_tts and isadoraair/runtime_recovery.py's
+#   module docstring for why: a station can have BOTH features backed
+#   by Kokoro live in production AND E1's own `kokoro.required` read as
+#   false (webrequests/road_conditions' hardcoded KOKORO_BINARY callers
+#   bypass StationTTSVoice entirely) -- re-deriving requiredness from
+#   the freshly-restored database at this point would reintroduce
+#   exactly that blind spot.
 #
-# Kokoro's two model files are checksum-verified against the exact
-# SHA-256 values docs/KOKORO_PROVENANCE.md recorded -- Piper's 8 voice
-# files have no such pinned per-file table (Piper's own
-# download_voices.py resolves by name against a versioned catalog
-# instead, see that doc), so those are structurally verified (each
-# .onnx has its .onnx.json sibling) rather than checksummed here.
+#   Explicit connected/fresh install (--legacy-connected-install, or no
+#   --archive at all): UNCHANGED from Phase 4 -- ad hoc per-engine venv
+#   + `pip install kokoro-onnx`/`pip install piper-tts`, optional
+#   --kokoro-model-src/--piper-model-src, checksum/structural
+#   verification, synthesis smoke test. A deliberate, separate,
+#   operator-selected concern (task step 14), not a fallback a backup-
+#   based restore ever reaches for on its own. --skip-kokoro/--skip-piper
+#   only apply to this legacy path -- the recovery-payload path trusts
+#   the payload's own declared component set as authoritative (an
+#   operator who genuinely needs to skip a component that IS present in
+#   the payload should use --legacy-connected-install instead of
+#   silently ignoring their own --skip flag).
+#
+# Foundation E3's real apply() needs the restored app's Django
+# environment (it runs as a manage.py command) -- this stage therefore
+# runs AFTER 60-python.sh in restore.sh's order, same as it always has.
 #
 # Usage:
-#   deploy/restore/70-tts.sh [--plan|--apply] [--staging-root PATH]
-#     [--skip-kokoro] [--skip-piper]
+#   deploy/restore/70-tts.sh --archive PATH [--plan|--apply]
+#     [--staging-root PATH]
+#   deploy/restore/70-tts.sh --legacy-connected-install [--plan|--apply]
+#     [--staging-root PATH] [--skip-kokoro] [--skip-piper]
 #     [--kokoro-dir PATH] [--kokoro-model-src PATH]
 #     [--piper-dir PATH] [--piper-model-src PATH]
 set -euo pipefail
@@ -46,6 +69,7 @@ KOKORO_DIR=""
 KOKORO_MODEL_SRC=""
 PIPER_DIR=""
 PIPER_MODEL_SRC=""
+LEGACY_CONNECTED_INSTALL=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --skip-kokoro) SKIP_KOKORO=1; shift ;;
@@ -58,14 +82,98 @@ while [ $# -gt 0 ]; do
     --piper-dir=*) PIPER_DIR="${1#*=}"; shift ;;
     --piper-model-src) PIPER_MODEL_SRC="${2:?}"; shift 2 ;;
     --piper-model-src=*) PIPER_MODEL_SRC="${1#*=}"; shift ;;
+    --legacy-connected-install) LEGACY_CONNECTED_INSTALL=1; shift ;;
     *) log_error "70-tts.sh: unrecognized argument: $1"; exit 2 ;;
   esac
 done
-[ -z "$KOKORO_DIR" ] && KOKORO_DIR="${RESTORE_STAGING_ROOT:-$HOME}/kokoro"
-[ -z "$PIPER_DIR" ] && PIPER_DIR="${RESTORE_STAGING_ROOT:-$HOME}/piper"
 
 log_info "=== 70-tts (Kokoro + Piper) ==="
 guard_production_target
+
+USE_RECOVERY_PAYLOAD=0
+if [ -n "$RESTORE_ARCHIVE" ] && [ "$LEGACY_CONNECTED_INSTALL" -eq 0 ]; then
+  USE_RECOVERY_PAYLOAD=1
+fi
+
+if [ "$USE_RECOVERY_PAYLOAD" -eq 1 ]; then
+  # =====================================================================
+  # Backup-based disaster recovery: Runtime Foundation E7B payload path.
+  # =====================================================================
+  if [ "$SKIP_KOKORO" -eq 1 ] || [ "$SKIP_PIPER" -eq 1 ]; then
+    log_error "--skip-kokoro/--skip-piper only apply to --legacy-connected-install -- the recovery-payload path publishes exactly what the payload declares. Re-run with --legacy-connected-install if selective skipping is genuinely needed."
+    exit 2
+  fi
+  if [ -n "$KOKORO_MODEL_SRC" ] || [ -n "$PIPER_MODEL_SRC" ] || [ -n "$KOKORO_DIR" ] || [ -n "$PIPER_DIR" ]; then
+    log_error "--kokoro-dir/--kokoro-model-src/--piper-dir/--piper-model-src only apply to --legacy-connected-install -- the recovery-payload path uses Foundation E3's own canonical/mapped target-root layout, never an ad hoc directory."
+    exit 2
+  fi
+  require_cmd tar
+
+  TTS_TARGET_ROOT="${RESTORE_STAGING_ROOT:-/}"
+  log_info "TTS (E3) target root: $TTS_TARGET_ROOT"
+
+  if [ "$RESTORE_MODE" != "apply" ]; then
+    log_plan "locate + validate the runtime-recovery/ payload embedded in $RESTORE_ARCHIVE"
+    log_plan "manage.py provision_runtime_components --recovery-payload <payload>/tts --target-root $TTS_TARGET_ROOT --apply"
+    log_info "70-tts: PLAN complete"
+    exit 0
+  fi
+
+  VENV_PYTHON="$RESTORE_TARGET_ROOT/venv/bin/python"
+  if [ ! -x "$VENV_PYTHON" ]; then
+    log_error "$VENV_PYTHON not found -- run 60-python.sh first (it runs before this stage already, see deploy/restore/README.md's dependency map)."
+    exit 1
+  fi
+  if [ ! -f "$RESTORE_TARGET_ROOT/manage.py" ]; then
+    log_error "$RESTORE_TARGET_ROOT/manage.py not found -- run 20-application.sh first."
+    exit 1
+  fi
+
+  WORKDIR="$(mktemp -d /tmp/isadoraair-restore-tts-recovery.XXXXXX)"
+  cleanup_tts_recovery() { rm -rf "$WORKDIR"; }
+  trap cleanup_tts_recovery EXIT
+  PAYLOAD_DIR="$WORKDIR/payload"
+
+  restore_locate_recovery_payload "$PAYLOAD_DIR"
+  if [ "$RESTORE_RECOVERY_PAYLOAD_FOUND" -ne 1 ]; then
+    log_error "LEGACY ARCHIVE -- NOT SELF-CONTAINED FOR FOUNDATION E. Backup-based TTS recovery fails closed and never falls back to pip/PyPI. For an old archive, deliberately run the documented --legacy-connected-install path."
+    exit 1
+  fi
+
+  log_apply "validating runtime-recovery payload at $PAYLOAD_DIR"
+  RECOVERY_EVIDENCE_JSON=$("$VENV_PYTHON" "$RESTORE_TARGET_ROOT/manage.py" validate_runtime_recovery_payload "$PAYLOAD_DIR" --json)
+
+  if [ ! -d "$PAYLOAD_DIR/tts" ]; then
+    log_warn "Recovery payload has no tts/ component -- not self-contained for TTS disaster recovery (this station's operator-established recovery policy did not include TTS in the prepared payload, or only native fdkaac was included). See docs/RUNTIME_BACKUP_PAYLOAD.md."
+    log_info "70-tts: PASS (no TTS recovered -- see warning above)"
+    exit 0
+  fi
+
+  log_apply "manage.py provision_runtime_components --recovery-payload $PAYLOAD_DIR --target-root $TTS_TARGET_ROOT --apply"
+  ( cd "$RESTORE_TARGET_ROOT" && "$VENV_PYTHON" manage.py provision_runtime_components \
+      --recovery-payload "$PAYLOAD_DIR" \
+      --target-root "$TTS_TARGET_ROOT" \
+      --apply )
+
+  mapfile -t RECOVERED_TTS_COMPONENTS < <(
+    python3 -c 'import json,sys; print("\n".join(json.loads(sys.argv[1]).get("tts_components", [])))' "$RECOVERY_EVIDENCE_JSON"
+  )
+  if [ "${#RECOVERED_TTS_COMPONENTS[@]}" -eq 0 ]; then
+    log_error "validated TTS payload did not report any recoverable TTS components"
+    exit 1
+  fi
+  restore_record_recovery_components "${RECOVERED_TTS_COMPONENTS[@]}" >/dev/null
+
+  log_info "70-tts: PASS (TTS recovered from the Runtime Foundation E7 payload via Foundation E3's real provisioning authority)"
+  exit 0
+fi
+
+# =========================================================================
+# Legacy / explicit connected-install path -- UNCHANGED from Phase 4.
+# =========================================================================
+[ -z "$KOKORO_DIR" ] && KOKORO_DIR="${RESTORE_STAGING_ROOT:-$HOME}/kokoro"
+[ -z "$PIPER_DIR" ] && PIPER_DIR="${RESTORE_STAGING_ROOT:-$HOME}/piper"
+
 require_cmd python3
 
 KOKORO_ONNX_SHA256="7d5df8ecf7d4b1878015a32686053fd0eebe2bc377234608764cc0ef3636a6c5"

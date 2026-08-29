@@ -56,10 +56,12 @@ set -- "${RESTORE_REMAINING_ARGS[@]}"
 # the expected service identity here, rather than reporting it
 # unresolved on every single post-restore run.
 ISA_USER="$(id -un)"
+ACCEPT_LEGACY_RUNTIME_RECOVERY=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --isa-user) ISA_USER="${2:?}"; shift 2 ;;
     --isa-user=*) ISA_USER="${1#*=}"; shift ;;
+    --accept-legacy-runtime-recovery) ACCEPT_LEGACY_RUNTIME_RECOVERY=1; shift ;;
     *) log_error "95-validate.sh: unrecognized argument: $1"; exit 2 ;;
   esac
 done
@@ -78,6 +80,9 @@ if [ -z "$RESTORE_STAGING_ROOT" ] && [ ! -f "$RESTORE_TARGET_ROOT/.env" ]; then
 fi
 
 if [ "$RESTORE_MODE" != "apply" ]; then
+  if [ -n "$RESTORE_ARCHIVE" ]; then
+    log_plan "verify self-contained Runtime Foundation E archive metadata and completed-component receipt"
+  fi
   if [ -n "$RESTORE_STAGING_ROOT" ]; then
     log_plan "cd $RESTORE_TARGET_ROOT && venv/bin/python manage.py check_deploy_baseline --structural-only --target-root $RESTORE_STAGING_ROOT --isa-user $ISA_USER"
   else
@@ -92,6 +97,18 @@ fi
 
 cd "$RESTORE_TARGET_ROOT"
 OVERALL_OK=1
+
+if [ -n "$RESTORE_ARCHIVE" ]; then
+  log_info "--- Runtime Foundation E archive recovery acceptance ---"
+  if [ "$ACCEPT_LEGACY_RUNTIME_RECOVERY" -eq 1 ]; then
+    log_warn "LEGACY ARCHIVE -- NOT SELF-CONTAINED FOR FOUNDATION E. Operator explicitly accepted connected/manual runtime reconstruction; this is not backup-v3 evidence."
+  elif restore_accept_recovery_receipt; then
+    log_info "Runtime Foundation E archive recovery receipt: PASS"
+  else
+    log_error "Runtime Foundation E archive recovery acceptance: FAILED. Required components were not positively reconstructed from this exact self-contained archive."
+    exit 1
+  fi
+fi
 
 if [ -n "$RESTORE_STAGING_ROOT" ]; then
   log_info "--- Offline target structural baseline ---"
