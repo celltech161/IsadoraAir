@@ -11,6 +11,7 @@ from django.db import close_old_connections, connection, transaction
 from django.db.utils import OperationalError
 from django.utils import timezone
 
+from isadoraair.tts.station import synthesize_station_voice
 from library.models import Category, LogItem, PlaylistLog, RecencyConfig, Track
 from library.services.log_builder import get_recent_exclusions, get_separation
 from library.services.related_artists import track_identity_keys
@@ -18,13 +19,19 @@ from monitoring.models import emit_event
 
 from .models import SongRequest, WebRequestConfig
 
-# Kokoro CLI wrapper -- same binary/argument shape weather-ingest's
-# lib/voices.py already uses successfully in production
+# Historical direct-binary path -- same binary/argument shape
+# weather-ingest's lib/voices.py already uses successfully in production
 # (`[binary, "--model", model, "--output_file", wav_path]`, verified
 # directly against the installed wrapper's --help too). am_fenrir is the
 # voice earmarked in PROJECT_NOTES.md for exactly this kind of
 # machine-driven announcement -- distinct enough from the weather
 # personas (Claira/Max) that a listener won't mistake one for the other.
+#
+# Still the default/rollback path: WebRequestConfig.dedication_tts_voice
+# is null on a fresh install and stays null until an operator explicitly
+# selects a logical voice in Django Admin (see
+# _synthesize_dedication_wav below) -- this binary/voice pair keeps
+# running exactly as before until that happens.
 KOKORO_BINARY = "/home/jreed/kokoro/bin/kokoro_synth"
 DEDICATION_VOICE = "am_fenrir"
 DEDICATION_ROOT = Path(settings.LIBRARY_ROOT) / "Dedications"
@@ -493,6 +500,37 @@ def _probe_duration(path):
     return float(out.stdout.strip())
 
 
+def _synthesize_dedication_wav(cfg, text, tmp_wav):
+    """The one synthesis-routing decision this feature makes. cfg is the
+    already-loaded WebRequestConfig singleton (callers already load it
+    once per request; no extra query here).
+
+    dedication_tts_voice is null: historical production path, unchanged
+    -- direct KOKORO_BINARY invocation, DEDICATION_VOICE hardcoded.
+
+    dedication_tts_voice is set: shared-TTS cutover -- routed through
+    the station's own logical-voice API (isadoraair.tts.station), which
+    resolves the logical name to a real provider/voice/engine internally.
+    This function passes only cfg.dedication_tts_voice.name -- the
+    logical name an operator picked in Django Admin -- never a Kokoro
+    provider voice id; the caller has no other knowledge of or access to
+    provider infrastructure."""
+
+    if cfg.dedication_tts_voice_id is None:
+        subprocess.run(
+            [KOKORO_BINARY, "--model", DEDICATION_VOICE, "--output_file", str(tmp_wav)],
+            input=text.encode("utf-8"), check=True, timeout=30,
+        )
+        return
+
+    synthesize_station_voice(
+        text,
+        voice=cfg.dedication_tts_voice.name,
+        output_path=tmp_wav,
+        timeout_seconds=cfg.dedication_tts_timeout_seconds,
+    )
+
+
 def synthesize_dedication_intro(req):
     """Renders req's spoken intro via Kokoro, converts to FLAC, and
     attaches it as req.intro_track -- called from the standalone
@@ -519,10 +557,8 @@ def synthesize_dedication_intro(req):
         tmp_wav = DEDICATION_ROOT / f".request-{req.id}.{os.getpid()}.tmp.wav"
         tmp_flac = DEDICATION_ROOT / f".request-{req.id}.{os.getpid()}.tmp.flac"
         try:
-            subprocess.run(
-                [KOKORO_BINARY, "--model", DEDICATION_VOICE, "--output_file", str(tmp_wav)],
-                input=text.encode("utf-8"), check=True, timeout=30,
-            )
+            cfg = WebRequestConfig.load()
+            _synthesize_dedication_wav(cfg, text, tmp_wav)
             subprocess.run(["ffmpeg", "-y", "-i", str(tmp_wav), str(tmp_flac)],
                             check=True, timeout=30, capture_output=True)
             duration = _probe_duration(tmp_flac)

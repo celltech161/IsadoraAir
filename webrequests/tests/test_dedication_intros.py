@@ -34,6 +34,7 @@ from django.test import TransactionTestCase
 from django.utils import timezone
 
 import library.services.engine as eng_module
+from isadoraair.tts.models import StationTTSVoice
 from library.models import (
     Artist, Category, CategoryKind, LogItem, PlaylistLog, Track, VoiceTrack, VoiceTrackConfig,
 )
@@ -392,6 +393,168 @@ class DedicationSynthesisTests(DedicationFixtureMixin, TransactionTestCase):
         synthesize_dedication_intro(req)
 
         self.assertTrue(Track.objects.filter(id=intro_track_id).exists())
+
+
+# ---------------------------------------------------------------------
+# Dedication TTS cutover -- synthesis-routing decision only.
+# WebRequestConfig.dedication_tts_voice is null by fixture default
+# (WebRequestFixtureMixin.setUp), so DedicationSynthesisTests above
+# already proves the legacy KOKORO_BINARY path end to end on every one
+# of its tests -- untouched by this feature. This class covers the
+# shared-TTS branch specifically: routing, no provider-id leakage,
+# configured timeout, non-fatal failure, and that a successful shared
+# synthesis still flows through the existing FLAC/Track pipeline.
+# ---------------------------------------------------------------------
+class DedicationSharedTTSRoutingTests(DedicationFixtureMixin, TransactionTestCase):
+    def setUp(self):
+        super().setUp()
+        self._dedi_tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dedi_tmpdir.cleanup)
+        root_patcher = patch.object(services_module, "DEDICATION_ROOT", Path(self._dedi_tmpdir.name))
+        root_patcher.start()
+        self.addCleanup(root_patcher.stop)
+
+        def fake_run(cmd, **kwargs):
+            if cmd[0] == services_module.KOKORO_BINARY:
+                Path(cmd[cmd.index("--output_file") + 1]).write_bytes(b"WAV")
+            elif cmd[0] == "ffmpeg":
+                Path(cmd[-1]).write_bytes(b"FLAC")
+            return MagicMock(returncode=0)
+
+        run_patcher = patch.object(services_module.subprocess, "run", side_effect=fake_run)
+        run_patcher.start()
+        self.addCleanup(run_patcher.stop)
+
+        duration_patcher = patch.object(services_module, "_probe_duration", return_value=6.5)
+        duration_patcher.start()
+        self.addCleanup(duration_patcher.stop)
+
+        analyze_patcher = patch("library.management.commands.analyze_tracks.analyze_one_track", return_value=True)
+        analyze_patcher.start()
+        self.addCleanup(analyze_patcher.stop)
+
+    def _make_voice(self, name="Dedication_Dave", provider_voice="am_fenrir"):
+        return StationTTSVoice.objects.create(
+            name=name, enabled=True, engine=StationTTSVoice.Engine.KOKORO,
+            provider_voice=provider_voice, language="en-us", speed=1.0,
+        )
+
+    def _select_voice(self, voice, **overrides):
+        self.cfg.dedication_tts_voice = voice
+        for field, value in overrides.items():
+            setattr(self.cfg, field, value)
+        self.cfg.save(update_fields=["dedication_tts_voice", *overrides])
+
+    @staticmethod
+    def _fake_station_synth(text, *, voice, output_path, speed=None, language=None,
+                             timeout_seconds=None, service=None):
+        Path(output_path).write_bytes(b"WAV")
+        return Path(output_path)
+
+    def test_legacy_kokoro_path_when_dedication_voice_blank(self):
+        self.assertIsNone(self.cfg.dedication_tts_voice_id, "fixture default must stay blank")
+        track = self.make_track(title="Free Fallin'")
+        log = self.make_log(date(2027, 6, 1), 5)
+        item = self.make_item(log, 0, track=track)
+        req = self.make_request(track, status="scheduled", log_item=item, requester_name="Justin")
+
+        with patch.object(services_module, "synthesize_station_voice") as mock_station:
+            result = synthesize_dedication_intro(req)
+
+        self.assertTrue(result)
+        mock_station.assert_not_called()
+        kokoro_calls = [
+            c for c in services_module.subprocess.run.call_args_list
+            if c.args[0][0] == services_module.KOKORO_BINARY
+        ]
+        self.assertEqual(len(kokoro_calls), 1, "the historical binary must still be invoked exactly as before")
+        cmd = kokoro_calls[0].args[0]
+        self.assertEqual(cmd[cmd.index("--model") + 1], services_module.DEDICATION_VOICE)
+
+    def test_shared_tts_path_uses_logical_voice_and_never_leaks_provider_voice_id(self):
+        voice = self._make_voice(name="Dedication_Dave", provider_voice="am_fenrir")
+        self._select_voice(voice)
+        track = self.make_track(title="Free Fallin'")
+        log = self.make_log(date(2027, 6, 1), 6)
+        item = self.make_item(log, 0, track=track)
+        req = self.make_request(track, status="scheduled", log_item=item, requester_name="Justin")
+
+        with patch.object(services_module, "synthesize_station_voice",
+                           side_effect=self._fake_station_synth) as mock_station:
+            result = synthesize_dedication_intro(req)
+
+        self.assertTrue(result)
+        mock_station.assert_called_once()
+        args, kwargs = mock_station.call_args
+        self.assertEqual(kwargs["voice"], "Dedication_Dave", "caller must pass the logical name, not a provider id")
+        self.assertNotIn("am_fenrir", (args, kwargs), "the Kokoro provider voice id must never reach the caller")
+        kokoro_calls = [
+            c for c in services_module.subprocess.run.call_args_list
+            if c.args[0][0] == services_module.KOKORO_BINARY
+        ]
+        self.assertEqual(kokoro_calls, [], "the legacy binary must not run once a logical voice is selected")
+
+    def test_configured_timeout_passed_through_to_station_service(self):
+        voice = self._make_voice()
+        self._select_voice(voice, dedication_tts_timeout_seconds=17)
+        track = self.make_track(title="Free Fallin'")
+        log = self.make_log(date(2027, 6, 1), 7)
+        item = self.make_item(log, 0, track=track)
+        req = self.make_request(track, status="scheduled", log_item=item)
+
+        with patch.object(services_module, "synthesize_station_voice",
+                           side_effect=self._fake_station_synth) as mock_station:
+            synthesize_dedication_intro(req)
+
+        self.assertEqual(mock_station.call_args.kwargs["timeout_seconds"], 17)
+
+    def test_shared_tts_failure_is_non_fatal_and_emits_warning_event(self):
+        voice = self._make_voice()
+        self._select_voice(voice)
+        track = self.make_track(title="Free Fallin'")
+        log = self.make_log(date(2027, 6, 1), 8)
+        item = self.make_item(log, 0, track=track)
+        req = self.make_request(track, status="scheduled", log_item=item)
+
+        with patch.object(services_module, "synthesize_station_voice",
+                           side_effect=RuntimeError("provider unavailable")), \
+             patch.object(services_module, "emit_event") as mock_emit:
+            result = synthesize_dedication_intro(req)
+
+        self.assertFalse(result, "best-effort: a shared-TTS failure must not raise or crash the caller")
+        req.refresh_from_db()
+        self.assertIsNone(req.intro_track_id, "no partial Track should be attached on failure")
+        mock_emit.assert_called_once()
+        self.assertEqual(mock_emit.call_args.kwargs["category"], "webrequests")
+        self.assertEqual(mock_emit.call_args.kwargs["level"], "warning")
+        self.assertEqual(mock_emit.call_args.kwargs["title"], "Dedication intro synthesis failed")
+        self.assertEqual(
+            list(Path(self._dedi_tmpdir.name).glob(".request-*")), [],
+            "temp files must still be cleaned up on a shared-TTS failure",
+        )
+
+    def test_successful_shared_tts_synthesis_still_attaches_track_via_existing_pipeline(self):
+        voice = self._make_voice()
+        self._select_voice(voice)
+        track = self.make_track(title="Free Fallin'")
+        log = self.make_log(date(2027, 6, 1), 9)
+        item = self.make_item(log, 0, track=track)
+        req = self.make_request(track, status="scheduled", log_item=item, requester_name="Justin")
+
+        with patch.object(services_module, "synthesize_station_voice", side_effect=self._fake_station_synth):
+            result = synthesize_dedication_intro(req)
+
+        self.assertTrue(result)
+        req.refresh_from_db()
+        self.assertIsNotNone(req.intro_track_id)
+        self.assertEqual(req.intro_track.title, track.title)
+        self.assertEqual(req.intro_track.artist_id, track.artist_id)
+        self.assertEqual(req.intro_track.category_id, self.dedication_category.id)
+        self.assertEqual(req.intro_track.duration_seconds, 6.5)
+        self.assertTrue(
+            Path(req.intro_track.filepath).exists(),
+            "ffmpeg WAV->FLAC conversion must still run for the shared-TTS path",
+        )
 
 
 # ---------------------------------------------------------------------

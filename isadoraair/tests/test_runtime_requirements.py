@@ -189,6 +189,19 @@ class StationInspectionTests(TestCase):
         self.assertTrue(result.components["kokoro"].required)
         self.assertIn("enabled web-request dedications", result.components["kokoro"].reasons)
 
+    def test_blank_dedication_voice_does_not_select_kokoro_via_web_requests(self):
+        """Dedication TTS cutover: an enabled Web Request configuration
+        with dedication_tts_voice left blank (the pre-cutover/rollback
+        state) must not select Kokoro on its own -- even though an
+        enabled, otherwise-unreferenced Kokoro voice exists elsewhere on
+        the station. Selection must come from the FK reference, not
+        merely a voice's own enabled flag."""
+        self._voice()
+        WebRequestConfig.objects.create(pk=1, enabled=True, dedication_tts_voice=None)
+        result = resolve_runtime_requirements(inspect_station_selection())
+        self.assertFalse(result.components["kokoro"].required)
+        self.assertEqual(result.errors, ())
+
     def test_malformed_weather_schedule_fails_closed(self):
         WeatherConfig.objects.create(pk=1, voice_schedule=[["day", 0, 10]])
         selection = inspect_station_selection()
