@@ -12,6 +12,16 @@ from . import MANIFEST_PROTOCOL_VERSION
 from .process import CommandRunner, ProcessResult
 from .security import assert_root_protected, assert_root_protected_parents
 
+# Sibling package under this SAME deploy/updater_runtime/ root -- unlike
+# updatecenter/manifest.py's own independently-maintained mirror (the
+# Django app's own venv/sys.path never reaches into this root-owned
+# tree at all), this worker module is installed alongside
+# protected_bootstrap as part of the identical protected installation,
+# so importing it directly here is safe and avoids a third copy of the
+# same validation logic. See protected_bootstrap/manifest_field.py's
+# own docstring for the full D0 bridge reasoning this field exists for.
+from protected_bootstrap.manifest_field import ProtectedRuntimeField, ProtectedRuntimeFieldError, parse_protected_runtime_field
+
 
 GIT = "/usr/bin/git"
 RELEASE_DIR = "deploy/releases"
@@ -78,6 +88,7 @@ KNOWN_FIELDS = frozenset({
     "services_requiring_restart", "nginx_changed", "runtime_components_changed",
     "minimum_supported_release_id",
     "manual_bootstrap_required",
+    "protected_runtime",
 })
 FORBIDDEN_FIELDS = frozenset({
     "pre_update_hooks", "post_update_hooks", "hooks", "commands", "shell",
@@ -111,6 +122,7 @@ class Manifest:
     runtime_components_changed: bool
     minimum_supported_release_id: str | None
     manual_bootstrap_required: bool
+    protected_runtime: ProtectedRuntimeField | None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -198,6 +210,47 @@ def fingerprint(payload: dict) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
+def protected_runtime_fingerprint_payload(**values) -> dict:
+    """Fingerprint contract v3 (Update Center Phase D, D1-H) -- for a
+    plan whose transitions include at least one release declaring
+    protected_runtime metadata. Deliberately built by embedding v2's
+    EXACT SAME "existing release actions" facts unchanged (via
+    execution_fingerprint_payload(**values) below, with only
+    contract_version overwritten) rather than a parallel/rewritten
+    payload shape -- so an old worker and a new worker comparing a v3
+    fingerprint are still comparing byte-for-byte identical v2-era
+    facts for everything v2 already covered, with no possibility the
+    v3 contract quietly reinterprets what "the same target release"
+    means. A candidate worker generation must never be able to
+    substitute a different release plan just because a fresher
+    contract version is now in play -- see this function's own test
+    coverage for that exact invariant.
+
+    Adds, at minimum per D1-H: the protected-runtime generation, the
+    exact descriptor digest it must match, the bootstrap-protocol
+    requirement, and runtime/manifest/wire compatibility identity --
+    every fact a supervisor/candidate handoff needs the application
+    and root authorization to agree on, none of it duplicated or left
+    to be re-derived differently by each side. Still flat kwargs (not
+    a nested dataclass parameter) to match execution_fingerprint_
+    payload's own existing calling convention exactly, and so this
+    module never needs to import protected_bootstrap at all merely to
+    build a fingerprint payload."""
+    base = execution_fingerprint_payload(**values)
+    return {
+        **{key: value for key, value in base.items() if key != "contract_version"},
+        "contract_version": 3,
+        "protected_runtime": {
+            "generation": values["protected_runtime_generation"],
+            "descriptor_sha256": values["protected_runtime_descriptor_sha256"],
+            "minimum_bootstrap_protocol_version": values["protected_runtime_minimum_bootstrap_protocol_version"],
+            "runtime_version": values["protected_runtime_runtime_version"],
+            "manifest_protocol_version": values["protected_runtime_manifest_protocol_version"],
+            "supported_wire_protocols": list(values["protected_runtime_supported_wire_protocols"]),
+        },
+    }
+
+
 def _list(value, field: str, pattern=None) -> tuple[str, ...]:
     if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
         raise ReleaseError(f"{field} must be a list of strings")
@@ -217,7 +270,7 @@ def parse_manifest(data: dict, *, label: str) -> Manifest:
         raise ReleaseError(f"{label}: forbidden/unknown fields: {sorted(forbidden | unknown)!r}")
     required = KNOWN_FIELDS - {
         "bootstrap_commit", "summary", "migration_compatibility", "requirements_sha256",
-        "minimum_supported_release_id", "manual_bootstrap_required",
+        "minimum_supported_release_id", "manual_bootstrap_required", "protected_runtime",
     }
     if required - set(data):
         raise ReleaseError(f"{label}: missing fields: {sorted(required - set(data))!r}")
@@ -275,6 +328,12 @@ def parse_manifest(data: dict, *, label: str) -> Manifest:
     summary = data.get("summary", "")
     if not isinstance(summary, str) or len(summary) > 500:
         raise ReleaseError(f"{label}: invalid summary")
+    try:
+        protected_runtime = parse_protected_runtime_field(
+            data.get("protected_runtime"), label=f"{label}.protected_runtime",
+        )
+    except ProtectedRuntimeFieldError as exc:
+        raise ReleaseError(f"{label}: {exc}") from exc
     return Manifest(
         release_id, previous, bootstrap, minimum_protocol, migrations,
         compatibility, requirements_changed, requirements_hash,
@@ -282,6 +341,7 @@ def parse_manifest(data: dict, *, label: str) -> Manifest:
         units_changed, units_required, units_optional, units_removed,
         data["collectstatic_required"], restarts, data["nginx_changed"],
         data["runtime_components_changed"], minimum_release, manual_bootstrap_required,
+        protected_runtime,
     )
 
 

@@ -163,7 +163,146 @@ KNOWN_FIELDS = frozenset({
     "runtime_components_changed",
     "minimum_supported_release_id",
     "manual_bootstrap_required",
+    "protected_runtime",
 })
+
+# D1-A (Update Center Phase D): the optional protected-runtime bundle
+# reference. Every release through r0025, and r0026's own final manual-
+# bootstrap bridge release, must declare this null (or omit it) -- see
+# deploy/updater_runtime/protected_bootstrap/manifest_field.py's own
+# docstring for the full D0 bridge reasoning. This is an INDEPENDENTLY
+# maintained mirror of that module's parse_protected_runtime_field(),
+# not an import of it -- this module's own top docstring already
+# explains why (no Django-app-side import may ever reach into the
+# separately-installed, root-owned protected tree); the two are kept in
+# lockstep by test_phase_d_contracts.py's own cross-check, not by
+# sharing code.
+PROTECTED_RUNTIME_DESCRIPTOR_PREFIX = "deploy/updater_runtime/"
+PROTECTED_RUNTIME_ATTESTATION_PREFIX = "deploy/updater_attestations/"
+PROTECTED_RUNTIME_MAX_GENERATION = 1_000_000
+PROTECTED_RUNTIME_MAX_WIRE_PROTOCOLS = 8
+PROTECTED_RUNTIME_MAX_ATTESTATIONS = 16
+PROTECTED_RUNTIME_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+# Same strict relative-path rule protected_bootstrap.descriptor.
+# validate_relative_path enforces -- restated independently here for
+# the same no-cross-import reason as everything else in this block.
+PROTECTED_RUNTIME_PATH_SEGMENT_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]*$")
+
+
+@dataclasses.dataclass(frozen=True)
+class ProtectedRuntimeManifestField:
+    generation: int
+    descriptor_path: str
+    descriptor_sha256: str
+    minimum_bootstrap_protocol_version: int
+    runtime_version: int
+    manifest_protocol_version: int
+    supported_wire_protocols: tuple[int, ...]
+    attestations: tuple[str, ...]
+
+
+def _validate_protected_runtime_relative_path(value, *, field: str, prefix: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ManifestError(f"{field}: must be a non-empty string")
+    if len(value) > 255:
+        raise ManifestError(f"{field}: exceeds 255 characters")
+    if "\\" in value or any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in value):
+        raise ManifestError(f"{field}: contains an unsupported character")
+    if value.startswith("/") or value.endswith("/"):
+        raise ManifestError(f"{field}: must be a relative path with no leading/trailing slash")
+    segments = value.split("/")
+    if any(segment in ("", ".", "..") for segment in segments):
+        raise ManifestError(f"{field}: contains an empty, '.', or '..' path segment")
+    for segment in segments:
+        if not PROTECTED_RUNTIME_PATH_SEGMENT_RE.match(segment):
+            raise ManifestError(f"{field}: path segment {segment!r} contains an unsupported character")
+    if not value.startswith(prefix):
+        raise ManifestError(f"{field}: must live under {prefix!r}, got {value!r}")
+    return value
+
+
+def _validate_protected_runtime(value, source_label: str) -> ProtectedRuntimeManifestField | None:
+    """value is data.get("protected_runtime") -- None (absent or
+    explicit null) is the ordinary-release case and returns None
+    immediately, exactly as every release through today's schema
+    already behaves with this field simply not existing."""
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ManifestError(f"{source_label}: protected_runtime must be a JSON object or null")
+
+    known = {
+        "generation", "descriptor_path", "descriptor_sha256",
+        "minimum_bootstrap_protocol_version", "runtime_version",
+        "manifest_protocol_version", "supported_wire_protocols", "attestations",
+    }
+    unknown = set(value) - known
+    if unknown:
+        raise ManifestError(f"{source_label}: protected_runtime has unrecognized field(s) {sorted(unknown)!r}")
+    missing = known - set(value)
+    if missing:
+        raise ManifestError(f"{source_label}: protected_runtime is missing field(s) {sorted(missing)!r}")
+
+    def positive_int(field_name, *, maximum=None):
+        raw = value[field_name]
+        if not isinstance(raw, int) or isinstance(raw, bool) or raw < 1:
+            raise ManifestError(f"{source_label}: protected_runtime.{field_name} must be a positive integer")
+        if maximum is not None and raw > maximum:
+            raise ManifestError(f"{source_label}: protected_runtime.{field_name} exceeds maximum {maximum}")
+        return raw
+
+    generation = positive_int("generation", maximum=PROTECTED_RUNTIME_MAX_GENERATION)
+    minimum_bootstrap_protocol_version = positive_int("minimum_bootstrap_protocol_version")
+    runtime_version = positive_int("runtime_version")
+    manifest_protocol_version = positive_int("manifest_protocol_version")
+
+    descriptor_path = _validate_protected_runtime_relative_path(
+        value["descriptor_path"], field=f"{source_label}: protected_runtime.descriptor_path",
+        prefix=PROTECTED_RUNTIME_DESCRIPTOR_PREFIX,
+    )
+
+    descriptor_sha256 = value["descriptor_sha256"]
+    if not isinstance(descriptor_sha256, str) or not PROTECTED_RUNTIME_SHA256_RE.match(descriptor_sha256):
+        raise ManifestError(f"{source_label}: protected_runtime.descriptor_sha256 must be exactly 64 lowercase hex characters")
+
+    wire = value["supported_wire_protocols"]
+    if not isinstance(wire, list) or not wire:
+        raise ManifestError(f"{source_label}: protected_runtime.supported_wire_protocols must be a non-empty list")
+    if len(wire) > PROTECTED_RUNTIME_MAX_WIRE_PROTOCOLS:
+        raise ManifestError(f"{source_label}: protected_runtime.supported_wire_protocols exceeds {PROTECTED_RUNTIME_MAX_WIRE_PROTOCOLS} entries")
+    if any(not isinstance(v, int) or isinstance(v, bool) or v < 1 for v in wire):
+        raise ManifestError(f"{source_label}: protected_runtime.supported_wire_protocols must contain only positive integers")
+    if len(set(wire)) != len(wire):
+        raise ManifestError(f"{source_label}: protected_runtime.supported_wire_protocols contains a duplicate")
+    if list(wire) != sorted(wire):
+        raise ManifestError(f"{source_label}: protected_runtime.supported_wire_protocols must be in canonical ascending order")
+
+    raw_attestations = value["attestations"]
+    if not isinstance(raw_attestations, list) or not raw_attestations:
+        raise ManifestError(f"{source_label}: protected_runtime.attestations must be a non-empty list")
+    if len(raw_attestations) > PROTECTED_RUNTIME_MAX_ATTESTATIONS:
+        raise ManifestError(f"{source_label}: protected_runtime.attestations exceeds {PROTECTED_RUNTIME_MAX_ATTESTATIONS} entries")
+    attestations = tuple(
+        _validate_protected_runtime_relative_path(
+            raw, field=f"{source_label}: protected_runtime.attestations[{index}]",
+            prefix=PROTECTED_RUNTIME_ATTESTATION_PREFIX,
+        )
+        for index, raw in enumerate(raw_attestations)
+    )
+    if len(set(attestations)) != len(attestations):
+        raise ManifestError(f"{source_label}: protected_runtime.attestations contains a duplicate path")
+
+    return ProtectedRuntimeManifestField(
+        generation=generation,
+        descriptor_path=descriptor_path,
+        descriptor_sha256=descriptor_sha256,
+        minimum_bootstrap_protocol_version=minimum_bootstrap_protocol_version,
+        runtime_version=runtime_version,
+        manifest_protocol_version=manifest_protocol_version,
+        supported_wire_protocols=tuple(wire),
+        attestations=attestations,
+    )
+
 
 SUMMARY_MAX_LEN = 500
 
@@ -202,6 +341,7 @@ class ReleaseManifest:
     runtime_components_changed: bool
     minimum_supported_release_id: str | None
     manual_bootstrap_required: bool
+    protected_runtime: ProtectedRuntimeManifestField | None
 
     @property
     def is_bootstrap(self) -> bool:
@@ -391,6 +531,8 @@ def validate_manifest_dict(data: dict, *, source_label: str = "<manifest>") -> R
     manual_bootstrap_required = data.get("manual_bootstrap_required", False)
     _require_type(manual_bootstrap_required, bool, "manual_bootstrap_required")
 
+    protected_runtime = _validate_protected_runtime(data.get("protected_runtime"), source_label)
+
     return ReleaseManifest(
         schema_version=schema_version,
         release_id=release_id,
@@ -413,6 +555,7 @@ def validate_manifest_dict(data: dict, *, source_label: str = "<manifest>") -> R
         runtime_components_changed=runtime_components_changed,
         minimum_supported_release_id=minimum_supported_release_id,
         manual_bootstrap_required=manual_bootstrap_required,
+        protected_runtime=protected_runtime,
     )
 
 
