@@ -110,6 +110,23 @@ restore_parse_common_args() {
     RESTORE_DB_NAME="${RESTORE_DB_NAME:-isadoraair}"
   fi
 
+  # Runtime Foundation E7C (2026-08-29) restore-safety fix: 30-postgresql.sh
+  # pg_restores into the isolated $RESTORE_DB_NAME under --staging-root, but
+  # $RESTORE_TARGET_ROOT/.env is a byte-faithful, UNMODIFIED copy of the
+  # real station's .env (see 20-application.sh's own header -- rewriting it
+  # here would make the staged tree wrong for eventual real restoration).
+  # Every later manage.py invocation (60-python.sh, 50-native-deps.sh,
+  # 70-tts.sh, 95-validate.sh) reads DB_NAME via python-decouple's config(),
+  # which checks the real OS environment BEFORE .env -- so exporting it
+  # once, here, at the one place every stage already resolves
+  # RESTORE_DB_NAME, makes every later manage.py call in this stage's own
+  # process automatically and deterministically target the SAME database
+  # pg_restore just used, with no stage-specific code and no operator-
+  # remembered manual export. Production restores are unaffected: this
+  # exports exactly "isadoraair" (or an explicit --db-name), the same value
+  # .env already carries for a real restore of this station.
+  export DB_NAME="$RESTORE_DB_NAME"
+
   log_info "mode=${RESTORE_MODE} target_root=${RESTORE_TARGET_ROOT} db_name=${RESTORE_DB_NAME}${RESTORE_STAGING_ROOT:+ staging_root=$RESTORE_STAGING_ROOT}"
 }
 

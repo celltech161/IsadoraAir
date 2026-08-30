@@ -46,6 +46,17 @@ SMOKE_TEXT = "IsadoraAir runtime validation."
 PACKAGE_PROBE_TIMEOUT_SECONDS = 15.0
 TTS_SMOKE_TIMEOUT_SECONDS = 120.0
 FDKAAC_TIMEOUT_SECONDS = 60.0
+# Runtime Foundation E7C (2026-08-29): a Runtime Foundation E7 recovery-
+# payload requirement (isadoraair/runtime_recovery.py -- Kokoro inclusion
+# there is operator-declared, never tied to one specific selected
+# StationTTSVoice) sets kokoro.required=True with an EMPTY voices tuple.
+# Any of Kokoro's built-in voices proves the engine itself can synthesize;
+# which one is irrelevant here, unlike Piper where per-model identity IS
+# the capability under test. Not a station default, purely a capability
+# probe -- see _kokoro_smoke.
+KOKORO_CAPABILITY_PROBE_VOICE = "af_heart"
+KOKORO_CAPABILITY_PROBE_LANGUAGE = "en-us"
+KOKORO_CAPABILITY_PROBE_SPEED = 1.0
 
 
 class RuntimeValidationError(RuntimeError):
@@ -176,9 +187,27 @@ def _probe_runtime_packages(executable: str, expected: Mapping[str, str]) -> dic
 
 
 def _kokoro_smoke(requirement: ComponentRequirement, product: dict[str, Any]) -> None:
-    if not requirement.voices:
-        return
-    voice = requirement.voices[0]
+    # This function is only ever called when requirement.required is True
+    # (see _validate_kokoro's own gate) -- "no station-selected voice" must
+    # NEVER mean "skip the capability proof". It previously did: a Runtime
+    # Foundation E7 recovery-payload requirement sets required=True with an
+    # empty voices tuple (Kokoro inclusion there is operator-declared, see
+    # this module's KOKORO_CAPABILITY_PROBE_VOICE comment), and the early
+    # `if not requirement.voices: return` above silently no-op'd, leaving
+    # _validate_kokoro's capabilities list recording
+    # provider_synthesis_pcm16_mono_24000: verified=True with NO synthesis
+    # ever attempted -- a false-positive Foundation E2 PASS discovered by
+    # Runtime Foundation E7C's real acceptance testing
+    # (isadoraair/tests/test_runtime_validation.py::
+    # KokoroCapabilityProbeFallbackTests).
+    if requirement.voices:
+        voice_id = requirement.voices[0].provider_voice
+        language = requirement.voices[0].language
+        speed = requirement.voices[0].speed
+    else:
+        voice_id = KOKORO_CAPABILITY_PROBE_VOICE
+        language = KOKORO_CAPABILITY_PROBE_LANGUAGE
+        speed = KOKORO_CAPABILITY_PROBE_SPEED
     runtime = product["runtime"]
     with tempfile.TemporaryDirectory(prefix="isadoraair-kokoro-validation-") as directory:
         unrelated_cwd = Path(directory)
@@ -202,9 +231,9 @@ def _kokoro_smoke(requirement: ComponentRequirement, product: dict[str, Any]) ->
             SynthesisRequest(
                 text=SMOKE_TEXT,
                 engine=TTSEngine.KOKORO,
-                voice=voice.provider_voice,
-                language=voice.language,
-                speed=voice.speed,
+                voice=voice_id,
+                language=language,
+                speed=speed,
                 timeout_seconds=TTS_SMOKE_TIMEOUT_SECONDS,
                 output_path=unrelated_cwd / "smoke.wav",
             )
@@ -231,14 +260,31 @@ def _piper_smoke(requirement: ComponentRequirement, product: dict[str, Any]) -> 
     }
     with tempfile.TemporaryDirectory(prefix="isadoraair-piper-validation-") as directory:
         for model in requirement.piper_models:
-            voice = voices_by_model[model.model_id]
+            # requirement.voices is empty for a Runtime Foundation E7
+            # recovery-payload requirement -- _requirements_for_recovery_tts
+            # supplies piper_models directly, without a matching
+            # VoiceRequirement (see _kokoro_smoke's own comment on the
+            # sibling Kokoro case). A plain `voices_by_model[model.model_id]`
+            # then raised KeyError, crashing Foundation E2 acceptance outright
+            # for any recovery payload that legitimately contains Piper --
+            # discovered by code inspection during Runtime Foundation E7C's
+            # real acceptance testing (isadoraair/tests/test_runtime_validation.py::
+            # PiperCapabilityProbeFallbackTests), never exercised by a real
+            # station here (this station's recovery policy has no Piper).
+            # Model identity (including language) still comes from the
+            # PiperModelRequirement itself; only a synthesis speed has no
+            # station-declared value in that case, so a neutral default is
+            # used for this pure capability probe.
+            voice = voices_by_model.get(model.model_id)
+            language = voice.language if voice is not None else model.language
+            speed = voice.speed if voice is not None else 1.0
             service.synthesize(
                 SynthesisRequest(
                     text=SMOKE_TEXT,
                     engine=TTSEngine.PIPER,
                     voice=model.model_id,
-                    language=voice.language,
-                    speed=voice.speed,
+                    language=language,
+                    speed=speed,
                     timeout_seconds=TTS_SMOKE_TIMEOUT_SECONDS,
                     output_path=Path(directory) / f"{model.model_id}.wav",
                 )

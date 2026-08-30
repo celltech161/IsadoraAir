@@ -25,6 +25,9 @@ from isadoraair.runtime_requirements import (
 )
 from isadoraair.runtime_validation import (
     ComponentEvidence,
+    KOKORO_CAPABILITY_PROBE_LANGUAGE,
+    KOKORO_CAPABILITY_PROBE_SPEED,
+    KOKORO_CAPABILITY_PROBE_VOICE,
     RuntimeEvidence,
     RuntimeValidationError,
     RuntimeValidator,
@@ -458,6 +461,154 @@ with wave.open(a.output_file, 'wb') as output:
             with self.assertRaises(TTSRuntimeUnavailable):
                 _piper_smoke(requirement, product)
         self.assertTrue(all(not directory.exists() for directory in observed))
+
+
+class KokoroCapabilityProbeFallbackTests(RuntimeValidatorFixture):
+    """Runtime Foundation E7C (2026-08-29) regression coverage: a Runtime
+    Foundation E7 recovery-payload requirement sets kokoro.required=True
+    with an EMPTY voices tuple (see
+    isadoraair/runtime_recovery.py's module docstring and
+    monitoring/management/commands/provision_runtime_components.py's
+    _requirements_for_recovery_tts). Real acceptance testing found this
+    previously produced a false-positive Foundation E2 PASS -- the smoke
+    test silently no-op'd instead of actually probing synthesis
+    capability."""
+
+    def _prepare_runtime(self):
+        self.executable(self.root / "kokoro-python")
+
+    def test_direct_smoke_falls_back_to_capability_probe_voice_when_required_but_voiceless(self):
+        self._prepare_runtime()
+        requirement = ComponentRequirement("kokoro", True, ("recovery payload",), voices=())
+        product = self.manifest["components"]["kokoro"]
+        observed = {}
+
+        def fake_synthesize(provider, request, output_path):
+            import wave
+            observed["voice"] = request.voice
+            observed["language"] = request.language
+            observed["speed"] = request.speed
+            with wave.open(str(output_path), "wb") as output:
+                output.setnchannels(1)
+                output.setsampwidth(2)
+                output.setframerate(24000)
+                output.writeframes(b"\0\0" * 10)
+
+        with patch("isadoraair.runtime_validation.SubprocessTTSProvider.synthesize", new=fake_synthesize):
+            _kokoro_smoke(requirement, product)
+        self.assertEqual(observed["voice"], KOKORO_CAPABILITY_PROBE_VOICE)
+        self.assertEqual(observed["language"], KOKORO_CAPABILITY_PROBE_LANGUAGE)
+        self.assertEqual(observed["speed"], KOKORO_CAPABILITY_PROBE_SPEED)
+
+    def test_a_real_station_selected_voice_still_takes_priority_over_the_probe_default(self):
+        self._prepare_runtime()
+        requirement = self.requirements(kokoro=True).components["kokoro"]
+        product = self.manifest["components"]["kokoro"]
+        observed = {}
+
+        def fake_synthesize(provider, request, output_path):
+            import wave
+            observed["voice"] = request.voice
+            with wave.open(str(output_path), "wb") as output:
+                output.setnchannels(1)
+                output.setsampwidth(2)
+                output.setframerate(24000)
+                output.writeframes(b"\0\0" * 10)
+
+        with patch("isadoraair.runtime_validation.SubprocessTTSProvider.synthesize", new=fake_synthesize):
+            _kokoro_smoke(requirement, product)
+        self.assertEqual(observed["voice"], "af_test")
+        self.assertNotEqual(observed["voice"], KOKORO_CAPABILITY_PROBE_VOICE)
+
+    def test_end_to_end_validator_actually_smokes_a_required_but_voiceless_kokoro_requirement(self):
+        # The full RuntimeValidator.validate() path, not just the isolated
+        # function -- proves the previously-silent early return no longer
+        # lets a recovery-payload-shaped requirement report
+        # provider_synthesis_pcm16_mono_24000: verified=True without a real
+        # synthesis attempt ever having been made. Asserting the outcome
+        # (status/verified) ALONE does not prove this -- the old buggy
+        # early return produced the exact same outcome (confirmed by
+        # temporarily reproducing it: this test passed unchanged). The
+        # call-count assertion below is what actually discriminates.
+        self._prepare_runtime()
+        calls = []
+
+        def fake_synthesize(provider, request, output_path):
+            import wave
+            calls.append(request.voice)
+            with wave.open(str(output_path), "wb") as output:
+                output.setnchannels(1)
+                output.setsampwidth(2)
+                output.setframerate(24000)
+                output.writeframes(b"\0\0" * 10)
+
+        requirements = RuntimeRequirements(
+            components={
+                "kokoro": ComponentRequirement("kokoro", True, ("recovery payload",), voices=()),
+                "piper": ComponentRequirement("piper"),
+                "fdkaac": ComponentRequirement("fdkaac"),
+            }
+        )
+        with patch("isadoraair.runtime_validation.SubprocessTTSProvider.synthesize", new=fake_synthesize):
+            component = self.validator(self.seams(kokoro=_kokoro_smoke)).validate(requirements).components["kokoro"]
+        self.assertEqual(calls, [KOKORO_CAPABILITY_PROBE_VOICE])
+        self.assertEqual(component.status, STATUS_PASS)
+        capability = next(
+            item for item in component.capabilities if item["name"] == "provider_synthesis_pcm16_mono_24000"
+        )
+        self.assertTrue(capability["verified"])
+
+    def test_a_genuinely_failing_synthesis_now_fails_closed_instead_of_a_false_positive(self):
+        self._prepare_runtime()
+
+        def fail(provider, request, output_path):
+            raise TTSRuntimeUnavailable("provider unavailable")
+
+        requirements = RuntimeRequirements(
+            components={
+                "kokoro": ComponentRequirement("kokoro", True, ("recovery payload",), voices=()),
+                "piper": ComponentRequirement("piper"),
+                "fdkaac": ComponentRequirement("fdkaac"),
+            }
+        )
+        with patch("isadoraair.runtime_validation.SubprocessTTSProvider.synthesize", new=fail):
+            component = self.validator(self.seams(kokoro=_kokoro_smoke)).validate(requirements).components["kokoro"]
+        self.assertEqual(component.status, STATUS_FAIL)
+
+
+class PiperCapabilityProbeFallbackTests(PiperRuntimeValidatorTests):
+    """Runtime Foundation E7C (2026-08-29) regression coverage: a Runtime
+    Foundation E7 recovery-payload requirement supplies piper_models
+    without a matching VoiceRequirement (the sibling of
+    KokoroCapabilityProbeFallbackTests above). Real acceptance testing
+    found -- by code inspection, this station has no Piper -- that this
+    previously crashed Foundation E2 acceptance outright with a KeyError."""
+
+    def test_direct_smoke_does_not_crash_and_uses_model_language_when_voiceless(self):
+        requirements, _model, _config = self._prepare_runtime_and_assets()
+        component = requirements.components["piper"]
+        voiceless = ComponentRequirement(
+            "piper", True, component.reasons, voices=(), piper_models=component.piper_models
+        )
+        product = self.manifest["components"]["piper"]
+        observed = []
+
+        def succeed(service, request):
+            observed.append((request.language, request.speed))
+            return request.output_path
+
+        with patch("isadoraair.runtime_validation.TTSService.synthesize", new=succeed):
+            _piper_smoke(voiceless, product)
+        self.assertEqual(observed, [(component.piper_models[0].language, 1.0)])
+
+    def test_end_to_end_validator_no_longer_raises_keyerror_for_a_voiceless_piper_requirement(self):
+        requirements, _model, _config = self._prepare_runtime_and_assets()
+        component = requirements.components["piper"]
+        requirements.components["piper"] = ComponentRequirement(
+            "piper", True, component.reasons, voices=(), piper_models=component.piper_models
+        )
+        result = self.validator(self.seams(piper=_piper_smoke)).validate(requirements).components["piper"]
+        self.assertEqual(result.status, STATUS_PASS)
 
 
 class FdkaacRuntimeValidatorTests(RuntimeValidatorFixture):

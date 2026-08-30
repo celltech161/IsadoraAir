@@ -99,6 +99,76 @@ class LibShSafetyGuardTests(SimpleTestCase):
         self.assertIn('if [ "$RESTORE_MODE" = "apply" ]', body)
 
 
+class RestoreDbNameExportFunctionalTests(SimpleTestCase):
+    """Runtime Foundation E7C (2026-08-29) restore-safety regression:
+    real acceptance testing found that 30-postgresql.sh pg_restores into
+    an isolated $RESTORE_DB_NAME under --staging-root, but
+    $RESTORE_TARGET_ROOT/.env is a byte-faithful copy of the real
+    station's .env -- so any later manage.py invocation would silently
+    default to the real production database name (python-decouple's
+    config() checks the OS environment before .env) unless an operator
+    manually exported DB_NAME. The fix: restore_parse_common_args
+    exports DB_NAME=$RESTORE_DB_NAME itself. Verified here via real
+    subprocess execution -- including confirming it is genuinely
+    EXPORTED (visible to a child process), not just a local shell
+    variable that happens to share the name."""
+
+    def _resolve(self, *args: str) -> subprocess.CompletedProcess:
+        script = (
+            'set -euo pipefail; '
+            f'source "{RESTORE_DIR / "lib.sh"}"; '
+            f'restore_parse_common_args {" ".join(args)} >/dev/null 2>&1; '
+            # A child process only sees DB_NAME if it was actually
+            # exported -- a plain (unexported) shell variable of the
+            # same name would not appear here.
+            'bash -c \'echo "CHILD_DB_NAME=$DB_NAME"\''
+        )
+        return subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=15)
+
+    def test_staging_root_exports_the_isolated_db_name_to_child_processes(self):
+        result = self._resolve("--staging-root /tmp/whatever-e7c-lib-test --apply")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("CHILD_DB_NAME=isadoraair_restore_test", result.stdout)
+
+    def test_production_mode_exports_the_real_db_name(self):
+        result = self._resolve("--apply")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("CHILD_DB_NAME=isadoraair", result.stdout)
+
+    def test_explicit_db_name_override_is_exported_verbatim(self):
+        result = self._resolve("--staging-root /tmp/whatever-e7c-lib-test --db-name custom_test_db --apply")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("CHILD_DB_NAME=custom_test_db", result.stdout)
+
+    def test_decouple_actually_prefers_an_exported_db_name_over_env_file(self):
+        """Not just that DB_NAME is exported -- that the actual mechanism
+        the restored .env is read through (python-decouple) honors it.
+        A regression here would silently defeat the whole fix even if
+        the export itself still looked correct."""
+        tmpdir = Path(
+            subprocess.run(["mktemp", "-d"], capture_output=True, text=True, check=True).stdout.strip()
+        )
+        self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
+        (tmpdir / ".env").write_text("DB_NAME=isadoraair\n", encoding="utf-8")
+        python = Path(__file__).resolve().parent.parent.parent / "venv" / "bin" / "python"
+        if not python.exists():
+            self.skipTest("no venv symlink present in this worktree")
+        probe = (
+            "from decouple import Config, RepositoryEnv\n"
+            "print(Config(RepositoryEnv('.env'))('DB_NAME'))\n"
+        )
+        result = subprocess.run(
+            [str(python), "-c", probe],
+            cwd=tmpdir,
+            capture_output=True,
+            text=True,
+            env={**os.environ, "DB_NAME": "isadoraair_restore_test"},
+            timeout=15,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout.strip(), "isadoraair_restore_test")
+
+
 class StageScriptsNeverHardcodeSecretsTests(SimpleTestCase):
     """Same property test_deploy_backup_script.py already enforces on
     the backup script itself, applied to every restore stage script --

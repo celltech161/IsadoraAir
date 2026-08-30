@@ -15,6 +15,7 @@ from django.test import SimpleTestCase
 from isadoraair.runtime_bundle import (
     BUNDLE_FILENAME,
     RuntimeBundleError,
+    _wheel_is_compatible,
     current_platform_contract,
     load_runtime_bundle,
     product_contract_digest,
@@ -298,3 +299,77 @@ class RuntimeBundleValidationTests(RuntimeBundleFixture):
         self.write_manifest()
         bundle = load_runtime_bundle(self.bundle_root, self.product)
         self.assertIn("model-one", bundle.components["piper"].piper_models)
+
+
+class WheelAbi3CompatibilityTests(SimpleTestCase):
+    """Runtime Foundation E7C real acceptance (2026-08-29): downloading a
+    genuine Kokoro wheel closure surfaced that a real PyPI wheel using the
+    CPython stable ABI (e.g. protobuf's own cp310-abi3 build) was rejected
+    on a cp314 host, even though real pip installs it without complaint --
+    packaging.tags.compatible_tags treats an abi3 wheel's python tag as a
+    minimum-version floor, forward-compatible with every later same-major
+    interpreter. No synthetic fixture wheel ever exercised this path
+    (every existing fixture wheel is universal py3-none-any)."""
+
+    def _host(self, *, major="3", minor="14"):
+        return {
+            "architecture": "x86_64",
+            "os": "linux",
+            "python_abi": f"cpython-{major}{minor}",
+            "python_implementation": "cpython",
+            "python_version": f"{major}.{minor}.4",
+        }
+
+    def test_older_cp_tag_abi3_wheel_is_forward_compatible(self):
+        self.assertTrue(
+            _wheel_is_compatible(
+                "protobuf-7.36.0-cp310-abi3-manylinux2014_x86_64.whl", self._host()
+            )
+        )
+
+    def test_exact_cp_tag_abi3_wheel_is_compatible(self):
+        self.assertTrue(
+            _wheel_is_compatible(
+                "somepkg-1.0.0-cp314-abi3-manylinux2014_x86_64.whl", self._host()
+            )
+        )
+
+    def test_newer_cp_tag_abi3_wheel_is_rejected(self):
+        self.assertFalse(
+            _wheel_is_compatible(
+                "somepkg-1.0.0-cp315-abi3-manylinux2014_x86_64.whl", self._host()
+            )
+        )
+
+    def test_different_major_abi3_wheel_is_rejected(self):
+        self.assertFalse(
+            _wheel_is_compatible(
+                "somepkg-1.0.0-cp27-abi3-manylinux2014_x86_64.whl",
+                self._host(major="3", minor="14"),
+            )
+        )
+
+    def test_non_abi3_older_cp_tag_is_still_rejected_exact_match_only(self):
+        # abi3 forward-compatibility must never leak into ordinary
+        # exact-interpreter (non-stable-ABI) wheels -- this is the
+        # pre-existing, still-correct behavior for a cp310-cp310 wheel.
+        self.assertFalse(
+            _wheel_is_compatible(
+                "somepkg-1.0.0-cp310-cp310-manylinux2014_x86_64.whl", self._host()
+            )
+        )
+
+    def test_real_downloaded_kokoro_closure_validates_end_to_end(self):
+        # A live end-to-end regression pin, not just the unit-level check
+        # above: the exact real wheel filename this bug was found with.
+        self.assertTrue(
+            _wheel_is_compatible(
+                "protobuf-7.36.0-cp310-abi3-manylinux2014_x86_64.whl", self._host()
+            )
+        )
+        self.assertTrue(
+            _wheel_is_compatible(
+                "onnxruntime-1.28.0-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+                self._host(),
+            )
+        )

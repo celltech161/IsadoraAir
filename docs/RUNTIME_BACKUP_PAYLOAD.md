@@ -15,9 +15,6 @@ mechanisms for backup-based recovery. See "Backup v3 integration" and
 
 ## What this still is not
 
-- Not E7C — no real station backup-v3 archive has been taken and staged
-  through this path yet; that whole-archive acceptance proof is a
-  separate, later checkpoint.
 - Not canonical production activation — nothing here has installed
   Kokoro, Piper, or fdkaac on the production host, enabled the
   `RECOVERY_PAYLOAD_ROOT` persistent location on production, or touched
@@ -506,12 +503,142 @@ available as an explicit, clearly separate connected/fresh-install mode
 (task requirement: never remove a legitimate explicit path, but never
 let a backup-based restore reach for it on its own).
 
-## What's still open after E7B
+## E7C real acceptance (2026-08-29)
 
-- **E7C** — staging a real station backup-v3 archive through this exact
-  restore path has not been done; E7B only proves the implementation
-  safely supports it.
+E7C staged a real station backup-v3 archive through this exact restore
+path, end to end, using real material — not fixtures, not mocked
+seams. It is proof, not new architecture: no product-code changes were
+needed except the two defects below, both exposed by using genuine
+material (real PyPI wheels, a real host filesystem) that no synthetic
+test fixture had ever exercised.
+
+**Real station recovery policy determined, not assumed.** Read-only
+inspection of the live station database confirmed E1's own resolver:
+`kokoro.required=False`, `piper.required=False`,
+`fdkaac.required=True` (this station's HE-AACv2 encoder). Confirmed
+`webrequests/services.py` and `road_conditions/synthesis.py` still call
+their own hardcoded `KOKORO_BINARY` directly today — the documented
+historical-caller gap this whole design exists to route around remains
+live. This station's actual recovery policy is therefore `kokoro` +
+`native_fdkaac`; Piper is genuinely not applicable (zero
+`StationTTSVoice` rows).
+
+**The full chain proved real, twice over.** A real E3 Kokoro bundle
+(pip-downloaded, hash-locked wheel closure at the exact versions the
+live legacy Kokoro install already uses; this station's real
+`kokoro-v1.0.onnx`/`voices-v1.0.bin`, hash-matching the product
+contract) and real E4 native sources (the two fdk-aac/fdkaac archives,
+fetched via `deploy/build_fdkaac.sh --download-sources`, matching their
+pinned hashes) were assembled into a real recovery payload, activated,
+backed up into a real `self_contained_v3` archive (real `pg_dump`, real
+app tree, real live nginx/systemd configs), and restored into a
+disposable, isolated target: real E4 build (`gcc`) producing a working
+`fdkaac`/`libfdk-aac.so` proven via real AAC-LC/HE-AAC/HE-AACv2
+encode+decode, and real E3 provisioning producing a working Kokoro venv
+proven via a real synthesized WAV (PCM16 mono 24kHz, matching the
+product output contract). Stage 95's receipt-gated acceptance passed
+for real (`{"accepted":true,"payload_id":"e7c-real-acceptance-1",
+"recovered_components":["kokoro","native_fdkaac"]}`), and a real
+negative proof (a tampered receipt, a receipt for a different
+payload_id, a missing receipt, and a legacy archive) all failed closed
+exactly as designed.
+
+**Two real defects found and fixed** (`isadoraair/runtime_validation.py`,
+pre-existing E3/E6-era code, exposed — not introduced — by E7B's new
+recovery-payload requirement shape, `required=True` with no
+station-selected voice list):
+
+1. `_kokoro_smoke` silently skipped its own synthesis smoke test
+   whenever `requirement.voices` was empty, while still recording
+   `provider_synthesis_pcm16_mono_24000: verified=True` — a
+   false-positive Foundation E2 PASS for exactly the recovery-payload
+   requirement shape E7B introduced. Fixed: falls back to a fixed,
+   station-independent capability-probe voice
+   (`KOKORO_CAPABILITY_PROBE_VOICE`) instead of skipping.
+2. `_piper_smoke`'s `voices_by_model[model.model_id]` lookup would have
+   raised `KeyError` — crashing E2 acceptance outright — for any
+   station whose recovery payload legitimately contains Piper (found by
+   code inspection; this station has none, so it was never hit here).
+   Fixed the same way: falls back to the `PiperModelRequirement`'s own
+   `language` and a neutral default speed.
+
+Both are covered by real regression tests
+(`isadoraair/tests/test_runtime_validation.py::KokoroCapabilityProbeFallbackTests`,
+`::PiperCapabilityProbeFallbackTests`) and by an unrelated third defect
+found the same way: `isadoraair.runtime_bundle._wheel_is_compatible`
+rejected a real PyPI wheel (`protobuf`, a real `kokoro-onnx`
+transitive dependency) using the CPython stable ABI
+(`cp310-abi3`) on a newer interpreter — real pip installs this
+wheel without complaint; the bundle's own pre-flight check was
+stricter than pip itself. Fixed to treat an `abi3` wheel's `cpXY`
+python tag as a forward-compatible minimum version, matching real
+`packaging`/pip semantics (`isadoraair/tests/test_runtime_bundle.py::WheelAbi3CompatibilityTests`).
+
+**One real, non-code, operational finding**: a fresh Kokoro venv's
+bundled `espeakng-loader`/`libespeak-ng.so` silently truncates its own
+data-path override once the venv's absolute path exceeds roughly 160
+characters, falling back to a nonexistent build-time CI path with a
+misleading "No such file or directory" error instead of a clear
+diagnostic. Empirically bisected to a threshold between 157 (works) and
+162 (fails) characters. **Confirmed safe for real canonical production
+paths** (`/opt/isadoraair-runtime/kokoro/venv/...` = 95 chars via the
+symlink, 130 chars via the real generation directory — both well under
+the threshold) — this is not a production-activation blocker. It *is* a
+real trap for an operator staging a restore drill under a long
+`--staging-root` path (e.g. deeply nested `/home/.../something-long`):
+packaging/asset validation still passes, but Kokoro synthesis silently
+fails with an error that never mentions path length. **Keep
+`--staging-root` short** (e.g. `/tmp/restore-test`) until this is
+tracked further upstream or worked around locally; not a Runtime
+Foundation E7 code defect, so nothing here was patched for it.
+
+**One real, pre-existing (not E7-scoped) restore-safety issue, found
+and fixed in the E7C closure pass**: under `--staging-root`,
+`deploy/restore/30-postgresql.sh` `pg_restore`s into an isolated
+`$RESTORE_DB_NAME` (e.g. `isadoraair_restore_test`) but
+`$RESTORE_TARGET_ROOT/.env` is a byte-faithful copy of the real
+station's `.env` — so any later `manage.py` command would connect to
+whatever `.env` literally says (the real production database name on a
+shared host) unless the caller separately exported `DB_NAME=...`.
+Fixed narrowly at the one place every stage already resolves the
+correct name: `deploy/restore/lib.sh`'s `restore_parse_common_args` now
+`export`s `DB_NAME="$RESTORE_DB_NAME"`, which python-decouple's
+`config()` reads ahead of `.env` — every later `manage.py` invocation
+in that stage's process automatically targets the same database
+`pg_restore` just used, with no per-stage code and nothing for an
+operator to remember. `.env` on disk is never rewritten (it must stay
+byte-faithful for eventual real restoration). Production restores are
+unaffected — the exported value is exactly `isadoraair` (or an explicit
+`--db-name`), the same value `.env` already carries there. Covered by
+`isadoraair/tests/test_restore_tooling.py::RestoreDbNameExportFunctionalTests`
+(including a direct check that python-decouple actually honors the
+exported value over the file).
+
+**Closure pass (2026-08-30)**: the literal `deploy/backup_isadoraair.sh`
+self-contained-v3 proof remains **not achievable in this sandbox** —
+re-confirmed fresh (not merely restated): no non-interactive
+root-capable execution path exists here (`sudo -n`/`sudo -n -l` both
+require interactive auth, no `doas`/`pkexec`, `/etc/sudoers.d/`
+unreadable, and unprivileged user namespaces are blocked at the sandbox
+policy layer despite `kernel.unprivileged_userns_clone=1`). The
+retained payload (`payload_id: e7c-real-acceptance-1`) was re-validated
+from scratch and still passes cleanly with the identical identity
+(product digest `c341...30a10e`, components `{tts: kokoro,
+native_fdkaac}`) already exercised through the real E3/E4 staged
+restore — the chain the literal script would have fed remains
+independently proven, just not through that one specific script
+invocation.
+
+## What's still open after E7C
+
+- **Publication** — E7A/E7B/E7C are still unpublished (local feature
+  branches) until an explicit release step.
 - **Canonical production activation** — `RECOVERY_PAYLOAD_ROOT` is not
   populated or activated on the production host.
+- **Caller migration** — `webrequests/services.py` and
+  `road_conditions/synthesis.py` still call their own hardcoded
+  `KOKORO_BINARY` directly.
 - **E8** — fully offline whole-machine acceptance remains a separate,
   later checkpoint.
+- **Phase 5** — an actual bare/clean-machine restore drill (original
+  host and GitHub unavailable) remains later work.

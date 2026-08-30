@@ -51,6 +51,29 @@ def current_platform_contract() -> dict[str, str]:
     }
 
 
+_CP_TAG_RE = re.compile(r"^cp(\d)(\d+)$")
+
+
+def _abi3_forward_compatible(python_tags: set[str], major: str, minor: str) -> bool:
+    """True if some cpXY tag in `python_tags` names a CPython minor version
+    at or before this host's, same major version.
+
+    The CPython stable ABI (abi3) is forward-compatible by design: a wheel
+    built as cp310-abi3 remains ABI-compatible with every later CPython 3.x
+    interpreter, not just cp310 itself -- this is real pip/packaging
+    behavior (packaging.tags.compatible_tags), not an IsadoraAir policy
+    choice. Exposed by Runtime Foundation E7C's real Kokoro bundle
+    (protobuf ships exactly this way, e.g. cp310-abi3 on a cp314 host) --
+    a synthetic fixture wheel never exercised this path."""
+
+    host_major, host_minor = int(major), int(minor)
+    for tag in python_tags:
+        match = _CP_TAG_RE.fullmatch(tag)
+        if match and int(match.group(1)) == host_major and int(match.group(2)) <= host_minor:
+            return True
+    return False
+
+
 def _wheel_is_compatible(filename: str, host: dict[str, str]) -> bool:
     stem = filename.removesuffix(".whl")
     try:
@@ -59,10 +82,16 @@ def _wheel_is_compatible(filename: str, host: dict[str, str]) -> bool:
         return False
     major, minor, *_rest = host["python_version"].split(".")
     cp_tag = f"cp{major}{minor}"
-    supported_python = {"py3", f"py{major}", f"py{major}{minor}", cp_tag}
-    if not set(python_tags.split(".")) & supported_python:
-        return False
-    if not set(abi_tags.split(".")) & {"none", "abi3", cp_tag}:
+    python_tag_set = set(python_tags.split("."))
+    abi_tag_set = set(abi_tags.split("."))
+    if "abi3" in abi_tag_set:
+        if not _abi3_forward_compatible(python_tag_set, major, minor):
+            return False
+    else:
+        supported_python = {"py3", f"py{major}", f"py{major}{minor}", cp_tag}
+        if not python_tag_set & supported_python:
+            return False
+    if not abi_tag_set & {"none", "abi3", cp_tag}:
         return False
     platforms = set(platform_tags.split("."))
     if "any" in platforms:

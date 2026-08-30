@@ -58,7 +58,33 @@ chains all eleven stages if you'd rather run them in one shot; running
 them individually and reviewing each is recommended for the actual
 Phase 5 drill.
 
-## Runtime recovery payload (Runtime Foundation E7B)
+## Runtime recovery payload (Runtime Foundation E7B/E7C)
+
+Runtime Foundation E7C (2026-08-29, closed 2026-08-30) proved this
+exact path end to end with real material on this station: a real
+self-contained v3 archive, restored into a disposable, isolated target,
+correctly reconstructed a working `fdkaac`/`libfdk-aac` (real AAC-LC/
+HE-AAC/HE-AACv2 encode+decode) and a working Kokoro TTS venv (a real
+synthesized WAV) with the stage-95 receipt gate passing for real — see
+`docs/RUNTIME_BACKUP_PAYLOAD.md`'s "E7C real acceptance" section for
+what was proved, the Foundation E defects it found and fixed, and one
+operational finding worth knowing before staging your own drill:
+
+- **Keep `--staging-root` short.** A fresh Kokoro venv's bundled
+  `espeakng-loader` silently truncates its own data-path override once
+  the venv's absolute path exceeds roughly 160 characters, and Kokoro
+  synthesis then fails with a misleading error that never mentions path
+  length. Confirmed safe for real canonical production paths (well
+  under the threshold); only a risk for a `--staging-root` chosen under
+  a long absolute path (e.g. deeply nested project directories).
+
+`.env`'s `DB_NAME` is **not** rewritten under `--staging-root` — `.env`
+must stay byte-faithful to the real backup for eventual real
+restoration — but `deploy/restore/lib.sh`'s `restore_parse_common_args`
+now `export`s `DB_NAME=$RESTORE_DB_NAME` itself, so every later
+`manage.py` invocation in that stage's process automatically targets
+the same isolated database `30-postgresql.sh` restored into, with
+nothing for an operator to remember.
 
 If `runtime-recovery-archive.json` classifies the backup as archive
 format `3.0.0` / `self_contained_v3`, it positively carries a validated
