@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "release_id": "r0021",
+  "previous_release_id": "r0020",
+  "minimum_updater_protocol_version": 3,
+  "summary": "Adds the Road Conditions weather-schedule cutover to canonical shared TTS using Weather Voice Personas and logical Station TTS Voices while retaining the historical weather-ingest/Kokoro path as rollback.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0007"
+}
