@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from django.test import TestCase, TransactionTestCase
 
+from isadoraair.tts.models import StationTTSVoice
 from library.models import Artist, Category, CategoryKind, Track
 from road_conditions import synthesis as synthesis_module
 from road_conditions.synthesis import (
@@ -16,6 +17,40 @@ from road_conditions.synthesis import (
     build_loudnorm_string, existing_report_is_healthy, hash_file_sha256, retire_road_report,
     road_report_path, road_report_text_path, synthesize_road_report, write_road_report_text,
 )
+from weather.models import WeatherVoicePersona
+
+
+def ensure_default_weather_voice_personas():
+    """road_conditions/voice.py's resolve_voice() -- BOTH its shared and
+    (as of the shared-TTS migration) its legacy mode -- resolves real
+    day/night identity through WeatherVoicePersona/StationTTSVoice
+    rather than a static external dict (see that module's own
+    docstring: weather-ingest's own provider dictionary, the thing
+    legacy mode used to source identity from with zero DB dependency,
+    no longer exists). Any test that exercises the REAL resolve_voice()
+    (most of this file, and generate_road_condition_audio's own
+    command tests, via KanDriveSynthesisFixtureMixin below) needs these
+    rows to exist -- get_or_create so it's safe under both TestCase's
+    per-test rollback and TransactionTestCase's per-test flush."""
+    claira, _ = StationTTSVoice.objects.get_or_create(
+        name="Claira_Sky",
+        defaults=dict(enabled=True, engine=StationTTSVoice.Engine.KOKORO,
+                      provider_voice="af_jessica", language="en-us", speed=1.0),
+    )
+    max_voice, _ = StationTTSVoice.objects.get_or_create(
+        name="Max_Weatherly",
+        defaults=dict(enabled=True, engine=StationTTSVoice.Engine.KOKORO,
+                      provider_voice="am_liam", language="en-us", speed=1.0),
+    )
+    WeatherVoicePersona.objects.get_or_create(
+        slot="day", defaults=dict(tts_voice=claira, display_name="Claira",
+                                   full_name="Claira Sky", signoff="I'm Claira Sky."),
+    )
+    WeatherVoicePersona.objects.get_or_create(
+        slot="night", defaults=dict(tts_voice=max_voice, display_name="Max",
+                                     full_name="Max Weatherly", signoff="I'm Max Weatherly."),
+    )
+
 
 DAY_VOICE = {"engine": "kokoro", "model": "af_jessica", "name": "Claira"}
 NIGHT_VOICE = {"engine": "kokoro", "model": "am_liam", "name": "Max"}
@@ -43,6 +78,7 @@ class KanDriveSynthesisFixtureMixin:
         # DedicationFixtureMixin uses for its own Dedications category.
         spot_kind, _ = CategoryKind.objects.get_or_create(code="spot", defaults={"name": "Spot"})
         Category.objects.get_or_create(code="KanDrive", defaults={"name": "KanDrive", "kind": spot_kind})
+        ensure_default_weather_voice_personas()
 
         self._tmpdir = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmpdir.cleanup)

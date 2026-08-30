@@ -1,82 +1,130 @@
-"""road_conditions/voice.py tests: KanDrive uses weather's OWN
-VOICES dict and voice_for_hour() function (loaded by file path) plus
-WeatherConfig.voice_schedule (read directly via the ORM) -- never a
-road_conditions-local copy of either. No live Kokoro calls anywhere
-here; this module never invokes Kokoro itself, only resolves which
-voice a caller should use.
+"""road_conditions/voice.py tests.
 
-_cached_module is a module-level cache in road_conditions.voice --
-reset it before/after every test so one test's load (real or faked)
-can never leak into another's assertions about failure paths."""
-import textwrap
+KanDrive resolves its day/night slot and voice identity ENTIRELY
+through Django-owned configuration now -- WeatherConfig.voice_schedule
+(via weather.voice_schedule.voice_for_hour(), a pure function) and
+WeatherVoicePersona/StationTTSVoice (via
+isadoraair.tts.station.resolve_station_voice()). This module no longer
+imports the external weather-ingest project at all -- see
+NoWeatherIngestImportDependencyTests below, which fails loudly if that
+coupling is ever reintroduced.
+
+No live Kokoro calls anywhere here; this module never invokes Kokoro
+itself, only resolves which voice a caller should use."""
+import sys
 from datetime import datetime, timezone as dt_timezone
-from pathlib import Path
 
-from django.test import TestCase, override_settings
+from django.test import TestCase
+from django.utils import timezone as dj_timezone
 
 from isadoraair.tts.models import StationTTSVoice
 from road_conditions import voice as voice_module
 from road_conditions.models import RoadConditionsConfiguration
 from road_conditions.voice import VoiceResolutionError, available_slots, resolve_voice
 from weather.models import WeatherConfig, WeatherVoicePersona
+from weather.voice_schedule import voice_for_hour
 
 
-def _reset_cache():
-    voice_module._cached_module = None
+class NoWeatherIngestImportDependencyTests(TestCase):
+    """Codex's exact Part 1 requirement: road_conditions/voice.py must
+    not import weather-ingest code. Proven two ways -- static source
+    inspection (survives even if the external path happened to be
+    importable in some environment) and confirming the external
+    project's module name never appears in sys.modules after using
+    every resolve_voice() path this test module exercises."""
+
+    def test_source_contains_no_weather_ingest_filesystem_path(self):
+        """Doc comments may legitimately mention "weather-ingest" by
+        name to explain migration history -- what must never appear is
+        an actual filesystem path into that external project."""
+        import inspect
+        source = inspect.getsource(voice_module)
+        self.assertNotIn("/home/jreed/weather-ingest", source)
+
+    def test_source_never_imports_by_file_path(self):
+        import inspect
+        source = inspect.getsource(voice_module)
+        self.assertNotIn("importlib.util", source)
+        self.assertNotIn("spec_from_file_location", source)
+
+    def test_no_import_statement_references_weather_ingest(self):
+        import ast
+        import inspect
+        tree = ast.parse(inspect.getsource(voice_module))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    self.assertNotIn("weather_ingest", alias.name)
+            elif isinstance(node, ast.ImportFrom):
+                self.assertFalse(node.module and "weather_ingest" in node.module)
+
+    def test_no_weather_ingest_module_loaded_after_full_resolution_cycle(self):
+        before = set(sys.modules)
+        RoadConditionsConfiguration.objects.all().delete()
+        claira = StationTTSVoice.objects.create(
+            name="Claira_Sky", enabled=True, engine=StationTTSVoice.Engine.KOKORO,
+            provider_voice="af_jessica", language="en-us", speed=1.0,
+        )
+        WeatherVoicePersona.objects.create(slot="day", tts_voice=claira, display_name="Claira")
+        resolve_voice(slot_override="day")  # legacy mode (default)
+        config = RoadConditionsConfiguration.load()
+        config.tts_use_weather_schedule = True
+        config.save()
+        resolve_voice(slot_override="day")  # shared mode
+        after = set(sys.modules)
+        new_modules = after - before
+        self.assertFalse(
+            any("weather_ingest" in name or "weather-ingest" in name for name in new_modules),
+            f"unexpected weather-ingest-shaped module(s) loaded: {new_modules}",
+        )
 
 
-class RealWeatherVoiceModuleTests(TestCase):
-    """Integration-style: exercises the ACTUAL weather-ingest/lib/voices.py
-    on this box, confirming KanDrive really is reusing weather's own
-    module object, not a copy. If weather-ingest ever changes its VOICES
-    keys, these tests should fail loudly rather than silently drifting."""
+class ScheduleResolutionTests(TestCase):
+    """weather.voice_schedule.voice_for_hour() -- pure, Django-owned,
+    provider-free schedule resolution, and resolve_voice()'s use of it
+    via _resolve_schedule_slot()."""
 
-    def setUp(self):
-        _reset_cache()
+    def test_day_slot_resolution(self):
+        self.assertEqual(voice_for_hour(10, [["day", 6, 17], ["night", 18, 5]]), "day")
 
-    def tearDown(self):
-        _reset_cache()
+    def test_night_slot_resolution(self):
+        self.assertEqual(voice_for_hour(20, [["day", 6, 17], ["night", 18, 5]]), "night")
 
-    def test_available_slots_matches_real_weather_voices(self):
-        self.assertEqual(available_slots(), ["day", "night"])
+    def test_wrapped_midnight_range_resolution(self):
+        schedule = [["day", 6, 17], ["night", 18, 5]]
+        # The wrap: start(18) > end(5) means "hour >= 18 or hour <= 5".
+        for hour in (18, 23, 0, 5):
+            with self.subTest(hour=hour):
+                self.assertEqual(voice_for_hour(hour, schedule), "night")
+        for hour in (6, 12, 17):
+            with self.subTest(hour=hour):
+                self.assertEqual(voice_for_hour(hour, schedule), "day")
 
-    def test_slot_override_resolves_real_voice_identity(self):
-        slot, voice = resolve_voice(slot_override="day")
-        self.assertEqual(slot, "day")
-        self.assertEqual(voice["engine"], "kokoro")
-        self.assertEqual(voice["model"], "af_jessica")
-        self.assertEqual(voice["name"], "Claira")
+    def test_hour_covered_by_no_entry_defaults_to_day(self):
+        self.assertEqual(voice_for_hour(10, [["night", 18, 5]]), "day")
 
-        slot, voice = resolve_voice(slot_override="night")
-        self.assertEqual(slot, "night")
-        self.assertEqual(voice["model"], "am_liam")
-        self.assertEqual(voice["name"], "Max")
+    def test_schedule_resolution_matches_weather_config_for_the_hour_through_resolve_voice(self):
+        """resolve_voice() determines which voice WEATHER would use for
+        a given scheduled slot, from WeatherConfig.voice_schedule -- not
+        a hardcoded schedule of its own."""
+        RoadConditionsConfiguration.objects.all().delete()
+        claira = StationTTSVoice.objects.create(
+            name="Claira_Sky", enabled=True, engine=StationTTSVoice.Engine.KOKORO,
+            provider_voice="af_jessica", language="en-us", speed=1.0,
+        )
+        max_voice = StationTTSVoice.objects.create(
+            name="Max_Weatherly", enabled=True, engine=StationTTSVoice.Engine.KOKORO,
+            provider_voice="am_liam", language="en-us", speed=1.0,
+        )
+        WeatherVoicePersona.objects.create(slot="day", tts_voice=claira, display_name="Claira")
+        WeatherVoicePersona.objects.create(slot="night", tts_voice=max_voice, display_name="Max")
 
-    def test_unknown_slot_override_raises(self):
-        with self.assertRaises(VoiceResolutionError):
-            resolve_voice(slot_override="afternoon")
-
-    def test_schedule_resolution_matches_weather_config_for_the_hour(self):
-        """The exact scenario Step 6 requires: KanDrive determines which
-        voice WEATHER would use for a given scheduled slot, from
-        WeatherConfig.voice_schedule -- not a hardcoded schedule of its
-        own. Uses a schedule where day/night is unambiguous at the
-        tested hours so this test doesn't depend on wall-clock time."""
         config = WeatherConfig.load()
         config.voice_schedule = [["day", 6, 17], ["night", 18, 5]]
         config.save()
 
-        noon = datetime(2026, 8, 4, 12, 0, tzinfo=dt_timezone.utc)  # naive-local doesn't matter here,
-        # localtime() is exercised for real -- see the separate localtime test below
+        noon = datetime(2026, 8, 4, 12, 0, tzinfo=dt_timezone.utc)
         midnight = datetime(2026, 8, 4, 23, 0, tzinfo=dt_timezone.utc)
-
-        # America/Chicago (this project's TIME_ZONE) is behind UTC, so
-        # 12:00 UTC and 23:00 UTC land in different local hours than
-        # their UTC clock time -- resolve via the same localtime() path
-        # resolve_voice() itself uses, rather than asserting fixed UTC
-        # hours, so this test can't silently drift from what the
-        # production code actually does.
-        from django.utils import timezone as dj_timezone
         noon_local_hour = dj_timezone.localtime(noon).hour
         midnight_local_hour = dj_timezone.localtime(midnight).hour
         expected_noon_slot = "day" if 6 <= noon_local_hour <= 17 else "night"
@@ -84,98 +132,15 @@ class RealWeatherVoiceModuleTests(TestCase):
 
         slot, _voice = resolve_voice(now=noon)
         self.assertEqual(slot, expected_noon_slot)
-
         slot, _voice = resolve_voice(now=midnight)
         self.assertEqual(slot, expected_midnight_slot)
 
-    def test_changing_weather_voice_schedule_changes_kandrive_resolution(self):
-        """Directly demonstrates "no independent hard-coded voice
-        rotation that can drift from the weather configuration" --
-        editing ONLY WeatherConfig.voice_schedule changes what KanDrive
-        resolves, with no road_conditions code or data touched."""
-        config = WeatherConfig.load()
-        fixed_time = datetime(2026, 8, 4, 15, 0, tzinfo=dt_timezone.utc)
+    def test_unknown_slot_override_raises(self):
+        with self.assertRaises(VoiceResolutionError):
+            resolve_voice(slot_override="afternoon")
 
-        config.voice_schedule = [["day", 0, 23]]  # always day
-        config.save()
-        slot, _voice = resolve_voice(now=fixed_time)
-        self.assertEqual(slot, "day")
-
-        config.voice_schedule = [["night", 0, 23]]  # always night
-        config.save()
-        slot, _voice = resolve_voice(now=fixed_time)
-        self.assertEqual(slot, "night")
-
-
-class FakeWeatherVoiceModuleTests(TestCase):
-    """Error-path/edge-case tests using a hand-built fake voices.py --
-    doesn't touch or depend on the real weather-ingest file at all."""
-
-    def setUp(self):
-        _reset_cache()
-        self.addCleanup(_reset_cache)
-
-    def _write_fake_module(self, tmp_path, extra_voice_py=""):
-        tmp_path.write_text(textwrap.dedent(f"""
-            VOICES = {{
-                "day": {{"engine": "kokoro", "model": "af_test", "name": "TestDay"}},
-                "night": {{"engine": "kokoro", "model": "am_test", "name": "TestNight"}},
-                {extra_voice_py}
-            }}
-
-            def voice_for_hour(hour, voice_schedule):
-                for voice, start, end in voice_schedule:
-                    if start <= end:
-                        if start <= hour <= end:
-                            return voice
-                    else:
-                        if hour >= start or hour <= end:
-                            return voice
-                return "day"
-        """))
-
-    def test_missing_weather_ingest_file_raises_clear_error(self):
-        missing = Path("/nonexistent/definitely/not/here/voices.py")
-        with self.settings():
-            original = voice_module.WEATHER_INGEST_VOICES_PATH
-            voice_module.WEATHER_INGEST_VOICES_PATH = missing
-            try:
-                with self.assertRaises(VoiceResolutionError) as ctx:
-                    resolve_voice(slot_override="day")
-                self.assertIn(str(missing), str(ctx.exception))
-            finally:
-                voice_module.WEATHER_INGEST_VOICES_PATH = original
-
-    def test_non_kokoro_engine_raises_clear_error(self, tmp_path=None):
-        import tempfile
-        with tempfile.TemporaryDirectory() as tmpdir:
-            fake_path = Path(tmpdir) / "voices.py"
-            self._write_fake_module(
-                fake_path,
-                extra_voice_py='"afternoon": {"engine": "piper", "model": "/some/path.onnx", "name": "TestPiper"},',
-            )
-            original = voice_module.WEATHER_INGEST_VOICES_PATH
-            voice_module.WEATHER_INGEST_VOICES_PATH = fake_path
-            try:
-                with self.assertRaises(VoiceResolutionError) as ctx:
-                    resolve_voice(slot_override="afternoon")
-                self.assertIn("kokoro", str(ctx.exception))
-            finally:
-                voice_module.WEATHER_INGEST_VOICES_PATH = original
-
-    def test_available_slots_reflects_fake_module(self):
-        import tempfile
-        with tempfile.TemporaryDirectory() as tmpdir:
-            fake_path = Path(tmpdir) / "voices.py"
-            self._write_fake_module(fake_path)
-            original = voice_module.WEATHER_INGEST_VOICES_PATH
-            voice_module.WEATHER_INGEST_VOICES_PATH = fake_path
-            try:
-                self.assertEqual(available_slots(), ["day", "night"])
-                slot, voice = resolve_voice(slot_override="day")
-                self.assertEqual(voice["model"], "af_test")
-            finally:
-                voice_module.WEATHER_INGEST_VOICES_PATH = original
+    def test_available_slots(self):
+        self.assertEqual(available_slots(), ["day", "night"])
 
 
 # ---------------------------------------------------------------------
@@ -185,8 +150,6 @@ class FakeWeatherVoiceModuleTests(TestCase):
 # ---------------------------------------------------------------------
 class SharedScheduleVoiceResolutionTests(TestCase):
     def setUp(self):
-        _reset_cache()
-        self.addCleanup(_reset_cache)
         self.config = RoadConditionsConfiguration.load()
         self.config.tts_use_weather_schedule = True
         self.config.tts_timeout_seconds = 45
@@ -240,7 +203,6 @@ class SharedScheduleVoiceResolutionTests(TestCase):
         wconfig.voice_schedule = [["day", 6, 17], ["night", 18, 5]]
         wconfig.save()
 
-        from django.utils import timezone as dj_timezone
         noon = datetime(2026, 8, 4, 18, 0, tzinfo=dt_timezone.utc)  # afternoon UTC
         noon_local_hour = dj_timezone.localtime(noon).hour
         expected_slot = "day" if 6 <= noon_local_hour <= 17 else "night"
@@ -250,10 +212,10 @@ class SharedScheduleVoiceResolutionTests(TestCase):
         self.assertEqual(voice["logical_voice_name"], "Claira_Sky" if expected_slot == "day" else "Max_Weatherly")
 
     def test_provider_mapping_change_changes_resolved_model_but_not_logical_name(self):
-        """The exact scenario the task requires: repointing the SAME
-        logical voice at a different provider identity must be visible
-        in the resolved voice's "model" (fingerprint-relevant) field
-        even though logical_voice_name is untouched."""
+        """Repointing the SAME logical voice at a different provider
+        identity must be visible in the resolved voice's "model"
+        (fingerprint-relevant) field even though logical_voice_name is
+        untouched."""
         slot, voice_before = resolve_voice(slot_override="day")
         self.assertEqual(voice_before["model"], "af_jessica")
 
@@ -336,31 +298,88 @@ class SharedScheduleVoiceResolutionTests(TestCase):
         self.assertNotIn("Claira_Sky", (voice["name"], voice["full_name"]))
 
 
-class LegacyModeRemainsDefaultTests(TestCase):
-    """tts_use_weather_schedule=False (the model default -- and KOGR's
-    real production state) must resolve exactly as before, with zero
-    Weather Voice Persona/StationTTSVoice involvement."""
-
+# ---------------------------------------------------------------------
+# Legacy (rollback-only) mode -- tts_use_weather_schedule=False, the
+# model default. Historically resolved voice identity from weather-
+# ingest's own external VOICES dict; now resolves through the SAME
+# WeatherVoicePersona/StationTTSVoice chain shared mode uses (there is
+# no more separate provider dictionary anywhere to source it from --
+# see this module's own docstring), pulling the resolved provider_voice
+# into voice["model"] for synthesis.py's direct-Kokoro fallback and
+# never setting shared_tts=True.
+# ---------------------------------------------------------------------
+class LegacyModeVoiceResolutionTests(TestCase):
     def setUp(self):
-        _reset_cache()
-        self.addCleanup(_reset_cache)
+        self.config = RoadConditionsConfiguration.load()
+        self.assertFalse(self.config.tts_use_weather_schedule, "must default to legacy/off")
 
-    def test_default_config_is_legacy_and_untouched_config_row_stays_off(self):
-        config = RoadConditionsConfiguration.load()
-        self.assertFalse(config.tts_use_weather_schedule)
-        self.assertIsNone(config.tts_voice_id)
+        WeatherConfig.load()
 
+        self.claira = StationTTSVoice.objects.create(
+            name="Claira_Sky", enabled=True, engine=StationTTSVoice.Engine.KOKORO,
+            provider_voice="af_jessica", language="en-us", speed=1.0,
+        )
+        self.max_voice = StationTTSVoice.objects.create(
+            name="Max_Weatherly", enabled=True, engine=StationTTSVoice.Engine.KOKORO,
+            provider_voice="am_liam", language="en-us", speed=1.0,
+        )
+        WeatherVoicePersona.objects.create(
+            slot="day", tts_voice=self.claira,
+            display_name="Claira", full_name="Claira Sky", signoff="I'm Claira Sky.",
+        )
+        WeatherVoicePersona.objects.create(
+            slot="night", tts_voice=self.max_voice,
+            display_name="Max", full_name="Max Weatherly", signoff="I'm Max Weatherly.",
+        )
+
+    def test_default_config_is_legacy(self):
+        self.assertIsNone(self.config.tts_voice_id)
+
+    def test_day_slot_identical_claira_identity_never_shared_tts(self):
         slot, voice = resolve_voice(slot_override="day")
         self.assertEqual(slot, "day")
+        self.assertEqual(voice["engine"], "kokoro")
         self.assertEqual(voice["model"], "af_jessica")
+        self.assertEqual(voice["name"], "Claira")
+        self.assertEqual(voice["full_name"], "Claira Sky")
+        self.assertEqual(voice["signoff"], "I'm Claira Sky.")
         self.assertNotIn("shared_tts", voice)
         self.assertNotIn("logical_voice_name", voice)
 
+    def test_night_slot_identical_max_identity(self):
+        slot, voice = resolve_voice(slot_override="night")
+        self.assertEqual(slot, "night")
+        self.assertEqual(voice["model"], "am_liam")
+        self.assertEqual(voice["name"], "Max")
+        self.assertEqual(voice["full_name"], "Max Weatherly")
+
     def test_explicit_legacy_config_row_resolves_legacy_voice(self):
-        config = RoadConditionsConfiguration.load()
-        config.tts_use_weather_schedule = False
-        config.save()
+        self.config.tts_use_weather_schedule = False
+        self.config.save()
 
         slot, voice = resolve_voice(slot_override="night")
         self.assertEqual(voice["model"], "am_liam")
         self.assertFalse(voice.get("shared_tts"))
+
+    def test_legacy_mode_fails_clearly_when_persona_missing(self):
+        WeatherVoicePersona.objects.filter(slot="day").delete()
+        with self.assertRaises(VoiceResolutionError):
+            resolve_voice(slot_override="day")
+
+    def test_legacy_mode_rejects_non_kokoro_persona_voice(self):
+        from isadoraair.tts.models import PiperVoiceModel
+
+        model = PiperVoiceModel.objects.create(
+            model_id="test-piper-legacy", model_filename="test-piper.onnx",
+            config_filename="test-piper.onnx.json",
+            model_sha256="3" * 64, config_sha256="4" * 64,
+            language="en-us", sample_rate_hz=22050,
+        )
+        piper_voice = StationTTSVoice.objects.create(
+            name="Piper_Legacy_Test", enabled=True, engine=StationTTSVoice.Engine.PIPER,
+            provider_voice="", piper_model=model, language="en-us", speed=1.0,
+        )
+        WeatherVoicePersona.objects.filter(slot="day").update(tts_voice=piper_voice)
+        with self.assertRaises(VoiceResolutionError) as ctx:
+            resolve_voice(slot_override="day")
+        self.assertIn("kokoro", str(ctx.exception).lower())

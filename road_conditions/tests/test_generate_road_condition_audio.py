@@ -27,7 +27,9 @@ from road_conditions.models import RoadConditionsConfiguration, RoadEvent
 from road_conditions.report import ReportBuildError
 from road_conditions.synthesis import SynthesisError, road_report_path, road_report_text_path
 from road_conditions.tests.test_kandrive_report import make_road_event
-from road_conditions.tests.test_kandrive_synthesis import KanDriveSynthesisFixtureMixin
+from road_conditions.tests.test_kandrive_synthesis import (
+    KanDriveSynthesisFixtureMixin, ensure_default_weather_voice_personas,
+)
 
 CMD = "road_conditions.management.commands.generate_road_condition_audio"
 
@@ -43,6 +45,7 @@ def fake_track(id=999, duration_seconds=180.0):
 
 
 def make_fresh_config():
+    ensure_default_weather_voice_personas()
     config = RoadConditionsConfiguration.load()
     config.enabled = True
     config.last_error = ""
@@ -195,6 +198,7 @@ class StaleFailedFeedBehaviorTests(TestCase):
         self.assertIn("disabled", out.getvalue().lower())
 
     def test_force_bypasses_the_freshness_gate(self):
+        ensure_default_weather_voice_personas()
         config = RoadConditionsConfiguration.load()
         config.enabled = True
         config.last_error = "boom"
