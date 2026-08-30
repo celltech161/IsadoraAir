@@ -15,6 +15,7 @@ from library.models import NavMenuItem
 from hardware.admin import AudioPipelineAdmin, _alsa_store
 from hardware.models import AudioPipeline, DuckingConfig, RemoteDJAudioInput
 from monitoring.models import MonitorCheck
+from updatecenter import manifest as manifest_mod
 from updatecenter.backend_client import (
     BackendRejectedError,
     BackendTransportError,
@@ -23,7 +24,7 @@ from updatecenter.backend_client import (
 )
 from updatecenter.job_service import JobSubmissionError, create_job, reconcile_job, submit_job
 from updatecenter.models import UpdateJob, UpdateJobState
-from updatecenter.views import _backend_readiness
+from updatecenter.views import _backend_readiness, _execution_blockers
 
 
 class ReadyPlan:
@@ -82,6 +83,52 @@ class ReadinessTests(SimpleTestCase):
         client = Mock()
         client.ping.return_value = READY_PING
         self.assertTrue(_backend_readiness(client)["ready"])
+
+
+    def test_manifest_protocol_gate_is_independent_of_wire_protocol(self):
+        """A helper can correctly speak socket protocol 3 while
+        understanding release-manifest execution semantics protocol 4.
+        The Install gate must compare a release's minimum against the
+        manifest-semantics version, never backend_client.PROTOCOL_VERSION.
+        """
+        self.assertEqual(PROTOCOL_VERSION, 3)
+        self.assertEqual(manifest_mod.UPDATER_PROTOCOL_VERSION, 4)
+
+        request = SimpleNamespace(
+            user=SimpleNamespace(is_superuser=True)
+        )
+        readiness = {
+            **READY_PING,
+            "ready": True,
+            "execution_armed": True,
+            "detail": "ready",
+        }
+
+        supported = ReadyPlan()
+        supported.minimum_updater_protocol_version = (
+            manifest_mod.UPDATER_PROTOCOL_VERSION
+        )
+
+        blockers = _execution_blockers(
+            request, supported, readiness, None
+        )
+        self.assertNotIn(
+            "The protected updater must be upgraded manually first.",
+            blockers,
+        )
+
+        unsupported = ReadyPlan()
+        unsupported.minimum_updater_protocol_version = (
+            manifest_mod.UPDATER_PROTOCOL_VERSION + 1
+        )
+
+        blockers = _execution_blockers(
+            request, unsupported, readiness, None
+        )
+        self.assertIn(
+            "The protected updater must be upgraded manually first.",
+            blockers,
+        )
 
 
 class MaintenanceClientTests(SimpleTestCase):

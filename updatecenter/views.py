@@ -9,7 +9,7 @@ from django.views.decorators.http import require_http_methods
 
 from isadoraair.version_info import get_checkout_identity
 
-from . import planner, release_chain
+from . import manifest as manifest_mod, planner, release_chain
 from .backend_client import BackendError, PROTOCOL_VERSION, UpdaterClient
 from .job_service import JobSubmissionError, create_job, reconcile_job, submit_job
 from .models import UpdateJob, UpdateJobState
@@ -103,7 +103,7 @@ def _execution_blockers(request, plan, readiness: dict, active_job) -> list[str]
         blockers.append("Native/runtime component changes require manual handling.")
     if plan.manual_bootstrap_required:
         blockers.append("This release explicitly requires manual privileged bootstrap.")
-    if plan.minimum_updater_protocol_version > PROTOCOL_VERSION:
+    if plan.minimum_updater_protocol_version > manifest_mod.UPDATER_PROTOCOL_VERSION:
         blockers.append("The protected updater must be upgraded manually first.")
     if not readiness["ready"]:
         blockers.append(readiness["detail"])
