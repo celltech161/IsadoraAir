@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "release_id": "r0023",
+  "previous_release_id": "r0022",
+  "minimum_updater_protocol_version": 4,
+  "summary": "Promotes the existing Road Conditions sync service/timer into the managed updater contract and adds the KanDrive road-condition audio generation service/timer. Companion oneshot services are installed only; their paired timers are enabled and started automatically.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [
+    "isadoraair-sync-road-conditions.service",
+    "isadoraair-sync-road-conditions.timer",
+    "isadoraair-generate-road-condition-audio.service",
+    "isadoraair-generate-road-condition-audio.timer"
+  ],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0007"
+}
