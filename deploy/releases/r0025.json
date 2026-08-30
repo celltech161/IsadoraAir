@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "release_id": "r0025",
+  "previous_release_id": "r0024",
+  "minimum_updater_protocol_version": 4,
+  "summary": "Decouples Road Conditions weather-persona resolution from the external weather-ingest companion as the IsadoraAir side of the Weather Shared TTS cutover. No migrations, requirements, systemd units, or runtime components change. The changed code is only imported by the generate_road_condition_audio oneshot management command (fresh process per timer run), so no restart is required.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0007"
+}
