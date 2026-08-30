@@ -254,7 +254,7 @@ FLAC/metadata behavior remains its responsibility.
 
 ### Road conditions
 
-Current:
+Current (production, unchanged as of this writing):
 
 ```text
 road_conditions.voice
@@ -276,6 +276,14 @@ road_conditions
 This removes the dynamic companion import while preserving road-specific
 segmentation, transition audio, scheduling, and final FLAC publication.
 
+> **Implementation status (2026-08-30):** this migration is implemented on
+> the `feature/weather-shared-tts-cutover` development branch --
+> `road_conditions/voice.py` no longer dynamically imports
+> `weather-ingest/lib/voices.py` in any mode; both legacy and shared voice
+> resolution now go through `isadoraair.tts.station.resolve_station_voice()`.
+> **Not yet merged to `main` or deployed to production** -- the "Current"
+> block above still describes what production actually runs today.
+
 ### weather-ingest
 
 Current weather-ingest owns engine executable/model paths and provider
@@ -291,6 +299,34 @@ weather-ingest decides when and what to speak
 Weather persona names, schedule, wording, and day/night policy remain outside
 the TTS runtime. weather-ingest must no longer know Kokoro/Piper venv or model
 paths. Foundation C does not modify that companion.
+
+> **Implementation status (2026-08-30):** the weather-ingest side of this
+> migration is implemented and ready for production acceptance, on its own
+> `feature/shared-tts-cutover` development branch (a separate repository/
+> checkout) -- `lib/voices.py` now dispatches only through the canonical
+> `/usr/local/bin/isadoraair-tts` CLI shown above, with no remaining
+> reference to `/home/jreed/kokoro`, `kokoro_synth`, `af_jessica`, or
+> `am_liam`. The migrated helper resolves `--voice day`, `--voice night`,
+> and `--voice auto` all equally correctly; **the deployed forecast systemd
+> units continue passing explicit `--voice day`/`--voice night`, deliberately
+> unchanged in this cutover** (see below). **Not yet merged or deployed** --
+> `/home/jreed/kokoro` must not be deleted and production weather-ingest
+> still runs the "Current" dispatch described above until this branch is
+> reviewed, cut over, and accepted.
+>
+> **Deferred, separate task:** switching the 4 forecast unit templates from
+> explicit `--voice day`/`--voice night` to `--voice auto` (so
+> `WeatherConfig.voice_schedule` alone decides forecast voice, not the unit
+> file) was drafted and then deliberately reverted out of this cutover --
+> those 5 `deploy/wx-*.service` files are not in the protected Update
+> Center's `MANAGED_UNIT_POLICIES`/`KNOWN_MANAGED_UNITS` allowlist
+> (`deploy/updater_runtime/isadoraair_updater/release.py`), so the change
+> could not be honestly deployed through the existing protected updater
+> without first expanding that allowlist -- a protected-runtime change
+> deliberately out of scope for a Shared-TTS-only cutover. A future task
+> should decide whether to add these units to the protected updater or
+> handle them through the fresh-machine/companion deployment layer instead;
+> this document takes no position on that choice.
 
 ## Scratch provisioning
 

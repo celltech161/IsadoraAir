@@ -17,6 +17,22 @@ Both verdicts are based on real inspection + a real synthesis smoke
 test performed during this phase (2026-08-12), not documentation
 review alone -- see "Smoke tests performed" below.
 
+> **Implementation status (2026-08-30):** the table below ("Where each
+> engine actually lives") is a factual snapshot of what production ran on
+> 2026-08-12 and still runs today -- it is left unedited as history. A
+> shared-TTS migration is now implemented and ready for production
+> acceptance (not yet deployed) that retires weather-ingest's direct
+> `lib/voices.py` dispatch shown below in favor of the canonical
+> `/usr/local/bin/isadoraair-tts` CLI documented in `docs/TTS_RUNTIME.md`;
+> the migration lives on development branches only
+> (`feature/weather-shared-tts-cutover` in this repo, `feature/shared-tts-
+> cutover` in weather-ingest) pending production acceptance. Nothing on
+> this page's dispatch table is inaccurate for what is live today. This
+> migration is Python-source-only -- the forecast systemd units are
+> unaffected and continue passing explicit `--voice day`/`--voice night`;
+> see `docs/TTS_RUNTIME.md`'s weather-ingest section for why that separate
+> unit-level change was deferred to a future task.
+
 ## Where each engine actually lives
 
 | | Kokoro | Piper |
