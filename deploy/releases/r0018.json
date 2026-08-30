@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "release_id": "r0018",
+  "previous_release_id": "r0017",
+  "minimum_updater_protocol_version": 3,
+  "summary": "Ships Runtime Foundation E7 (A-C) as dormant backup/restore infrastructure: recovery-payload preparation/validation, backup-v3 payload classification, offline TTS/native restore via E3/E4, safe archive extraction, and stage-95 recovery-receipt acceptance. Corrects two Foundation E validation defects and a staged-restore DB-isolation gap. No canonical runtime provisioned/activated, no TTS caller migrated, no production payload or nightly backup-v3 policy enabled by installing this release.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0007"
+}
