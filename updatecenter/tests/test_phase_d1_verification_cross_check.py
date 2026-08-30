@@ -113,6 +113,8 @@ class VerifyCandidateBundleTests(SimpleTestCase):
             release_id=release_id, previous_release_id=previous_release_id,
             previous_generation=previous_generation, descriptor_bytes=descriptor_bytes,
             bundle_root=self.bundle_root, trust_policy=self.trust_policy, assertions=assertions,
+            current_bootstrap_protocol_version=1, current_wire_protocol_version=3,
+            candidate_minimum_bootstrap_protocol_version=1,
         )
 
     def test_happy_path_first_generation_ok(self):
@@ -189,6 +191,8 @@ class VerifyCandidateBundleTests(SimpleTestCase):
             release_id="r0027", previous_release_id="r0026", previous_generation=None,
             descriptor_bytes=descriptor_bytes, bundle_root=self.bundle_root,
             trust_policy=self.trust_policy, assertions=assertions,
+            current_bootstrap_protocol_version=1, current_wire_protocol_version=3,
+            candidate_minimum_bootstrap_protocol_version=1,
             require_policy_file="protected-policy.json",
         )
         self.assertFalse(result.ok)

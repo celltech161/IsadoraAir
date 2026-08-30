@@ -37,6 +37,42 @@ behavior yet.** No supervisor exists. No A/B slot exists. The existing
 `isadoraair_updater.release._cross_check()`'s `manual_bootstrap_required`
 gate for `deploy/updater_runtime/**` changes is completely unchanged.
 
+## D2 status
+
+D2 ("Stable Supervisor + A/B Runtime Storage") implements the immutable
+supervisor's own source tree, `deploy/updater_bootstrap/
+isadoraair_updater_bootstrap/` -- config, security, process, descriptor,
+attestation, trust, verification, slots, state (+ its durable atomic
+writer), activation (the phase state machine), protocol (the private
+root-only control IPC), launch (fixed worker process exec), readiness,
+and the supervisor orchestrator tying them together. A draft (not
+installed) `deploy/updater-bootstrapd.service` and a development-only
+signing helper (`deploy/updater_bootstrap/tools/sign_release_bundle.py`)
+round it out.
+
+**Independence from the replaceable worker tree is real, not asserted**:
+this package imports nothing from `deploy/updater_runtime/
+isadoraair_updater/**` or `protected_bootstrap/**`, nothing from Django,
+nothing from an application checkout/venv -- Python stdlib and fixed
+absolute OS-utility invocations only. Where the supervisor needs logic
+equivalent to the worker's own D1 contracts (descriptor/trust/
+attestation/verification), it has its own SEPARATE, independently
+written implementation, proven to agree with the worker-side one only
+by a large shared fixture corpus
+(`updatecenter/tests/test_phase_d2_parity.py`) that imports both
+packages and compares outcomes -- never by one importing the other.
+
+**Still none of this is wired into live activation.** No real
+Update Center job creates a transaction, launches a real candidate
+worker, or requests activation from this supervisor -- every D2 test
+uses synthetic fixtures/temp directories/a throwaway test worker
+script, exactly as scoped. `START_UPDATE` is untouched;
+`updatecenter/views.py`, `job_service.py`, and the worker's own
+`daemon.py`/`executor.py`/`jobs.py` have zero changes in this phase.
+That handoff -- a real UpdateJob driving real candidate staging through
+this real supervisor, and the `runtime_activation_accepted` milestone
+gating real database/source/systemd mutation -- is D3's job.
+
 ## Target architecture (D2 and beyond)
 
 ### Stable supervisor

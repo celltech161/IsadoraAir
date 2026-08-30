@@ -1,0 +1,34 @@
+[Unit]
+Description=IsadoraAir immutable Update Center bootstrap supervisor (Phase D draft -- NOT installed)
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=@@ISA_USER@@
+ExecStart=/usr/bin/python3 -I /usr/local/libexec/isadoraair-updater-bootstrap/updater_bootstrapd.py --config /etc/isadoraair/updater-bootstrap.json --application-root @@ISA_ROOT@@
+Restart=on-failure
+RestartSec=5
+UMask=0077
+Environment=PYTHONDONTWRITEBYTECODE=1
+RuntimeDirectory=isadoraair-updater-bootstrap
+RuntimeDirectoryMode=0700
+StateDirectory=isadoraair-updater-bootstrap isadoraair-updater
+StateDirectoryMode=0750
+LogsDirectory=isadoraair-updater-bootstrap isadoraair-updater
+LogsDirectoryMode=0700
+NoNewPrivileges=true
+AmbientCapabilities=CAP_SETUID CAP_SETGID
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/isadoraair-updater-bootstrap /var/lib/isadoraair-updater /var/log/isadoraair-updater /var/backups/isadoraair/update-checkpoints /var/lib/alsa /etc/systemd/system @@ISA_ROOT@@
+
+[Install]
+WantedBy=multi-user.target

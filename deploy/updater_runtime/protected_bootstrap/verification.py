@@ -68,6 +68,9 @@ def verify_candidate_bundle(
     bundle_root: Path,
     trust_policy: TrustPolicy,
     assertions: Sequence[SignatureAssertion],
+    current_bootstrap_protocol_version: int,
+    current_wire_protocol_version: int,
+    candidate_minimum_bootstrap_protocol_version: int,
     require_policy_file: str | None = None,
     runner=None,
 ) -> CandidateVerificationResult:
@@ -85,7 +88,18 @@ def verify_candidate_bundle(
         own file inventory;
       - the real files under bundle_root match the descriptor's
         inventory EXACTLY -- no missing file, no extra file, exact
-        hash, exact mode, for every declared entry.
+        hash, exact mode, for every declared entry;
+      - candidate_minimum_bootstrap_protocol_version does not exceed
+        current_bootstrap_protocol_version, and current_wire_protocol_
+        version is among the descriptor's own supported_wire_protocols
+        -- see deploy/updater_bootstrap/isadoraair_updater_bootstrap/
+        verification.py's own copy of this same pair of checks
+        (parity-tested, not shared code -- test_phase_d2_parity.py).
+
+    candidate_minimum_bootstrap_protocol_version is supplied by the
+    CALLER, never read from the descriptor -- see the D2 copy's own
+    docstring for why (it is a manifest protected_runtime fact, not a
+    descriptor fact).
 
     Collects every failure reason rather than stopping at the first --
     a caller (or a test) can see the full picture of what's wrong with
@@ -98,6 +112,17 @@ def verify_candidate_bundle(
         not isinstance(previous_generation, int) or isinstance(previous_generation, bool)
     ):
         raise CandidateRejected("previous_generation must be an integer or None")
+    if not isinstance(candidate_minimum_bootstrap_protocol_version, int) or isinstance(
+        candidate_minimum_bootstrap_protocol_version, bool
+    ) or candidate_minimum_bootstrap_protocol_version < 1:
+        raise CandidateRejected("candidate_minimum_bootstrap_protocol_version must be a positive integer")
+
+    if candidate_minimum_bootstrap_protocol_version > current_bootstrap_protocol_version:
+        reasons.append(
+            f"candidate requires bootstrap protocol {candidate_minimum_bootstrap_protocol_version}, "
+            f"this supervisor only understands up to {current_bootstrap_protocol_version} -- "
+            "unsupported bootstrap protocol"
+        )
 
     descriptor: RuntimeDescriptor | None = None
     descriptor_sha256: str | None = None
@@ -124,6 +149,13 @@ def verify_candidate_bundle(
                     f"generation {descriptor.generation} does not strictly exceed "
                     f"the previous generation {previous_generation} -- replay/rollback refused"
                 )
+
+        if current_wire_protocol_version not in descriptor.supported_wire_protocols:
+            reasons.append(
+                f"descriptor supported_wire_protocols {list(descriptor.supported_wire_protocols)!r} "
+                f"does not include this supervisor's current wire protocol "
+                f"{current_wire_protocol_version} -- would strand an already-connected client"
+            )
 
         if require_policy_file is not None:
             if require_policy_file not in descriptor.file_by_path():

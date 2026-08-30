@@ -14,6 +14,21 @@ RUNTIME_ROOT = PROJECT_ROOT / "deploy" / "updater_runtime"
 if str(RUNTIME_ROOT) not in sys.path:
     sys.path.insert(0, str(RUNTIME_ROOT))
 
+# The immutable-supervisor source tree (Phase D2) -- deliberately a
+# SEPARATE sys.path entry from RUNTIME_ROOT above, mirroring production
+# reality: the supervisor and the replaceable worker are two different
+# installations on a real station (see docs/UPDATE_CENTER_PHASE_D.md's
+# "supervisor independence" section) and never share an import root
+# there either. Adding both to sys.path here is purely a test-process
+# convenience for exercising both trees in the same pytest/Django test
+# run -- it does not make production import across that boundary, and
+# Correction 1's independence requirement is enforced by test_phase_d2_
+# parity.py never importing one package from the other's code, not by
+# this sys.path arrangement.
+BOOTSTRAP_ROOT = PROJECT_ROOT / "deploy" / "updater_bootstrap"
+if str(BOOTSTRAP_ROOT) not in sys.path:
+    sys.path.insert(0, str(BOOTSTRAP_ROOT))
+
 
 def git(repo: Path, *args: str) -> str:
     result = subprocess.run(
