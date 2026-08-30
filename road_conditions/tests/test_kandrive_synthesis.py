@@ -20,6 +20,17 @@ from road_conditions.synthesis import (
 DAY_VOICE = {"engine": "kokoro", "model": "af_jessica", "name": "Claira"}
 NIGHT_VOICE = {"engine": "kokoro", "model": "am_liam", "name": "Max"}
 
+# A resolve_voice()-shaped shared-TTS voice dict (see road_conditions/
+# voice.py's _resolve_shared_schedule_voice()) -- "model" deliberately
+# holds the RESOLVED PROVIDER voice id (fingerprint authenticity only),
+# while "logical_voice_name" is the only identity synthesis.py may ever
+# pass to synthesize_station_voice().
+SHARED_DAY_VOICE = {
+    "engine": "kokoro", "model": "af_jessica", "name": "Claira", "full_name": "Claira Sky",
+    "signoff": "I'm Claira Sky.", "logical_voice_name": "Claira_Sky",
+    "shared_tts": True, "tts_timeout_seconds": 45,
+}
+
 
 class KanDriveSynthesisFixtureMixin:
     def setUp(self):
@@ -381,6 +392,96 @@ class TransitionSoundSynthesisTests(KanDriveSynthesisFixtureMixin, TransactionTe
         # form still behaves identically (one Kokoro call).
         synthesize_road_report("Plain text, old-style call.", "day", DAY_VOICE)
         self.assertEqual(self._kokoro_call_count, 1)
+
+
+class SharedTTSSynthesisRoutingTests(KanDriveSynthesisFixtureMixin, TransactionTestCase):
+    """synthesize_road_report()'s routing decision (_synthesize_segment_wav)
+    for a shared_tts=True voice dict -- both the plain whole-report path
+    and the per-segment transition path. KOKORO_BINARY's own fake_run
+    branch (from KanDriveSynthesisFixtureMixin) stays wired the whole
+    time, so `self._kokoro_call_count == 0` genuinely proves no fallback,
+    not merely that nothing checked."""
+
+    def setUp(self):
+        super().setUp()
+
+        def fake_station_synth(text, *, voice, output_path, speed=None, language=None,
+                                timeout_seconds=None, service=None):
+            self.station_calls.append(
+                {"text": text, "voice": voice, "output_path": Path(output_path), "timeout_seconds": timeout_seconds}
+            )
+            Path(output_path).write_bytes(b"FAKE-WAV-CONTENT")
+            return Path(output_path)
+
+        self.station_calls = []
+        self._station_should_fail = False
+
+        def dispatch(text, *, voice, output_path, speed=None, language=None,
+                     timeout_seconds=None, service=None):
+            if self._station_should_fail:
+                from isadoraair.tts.errors import TTSSynthesisError
+                raise TTSSynthesisError("simulated shared-TTS provider failure")
+            return fake_station_synth(
+                text, voice=voice, output_path=output_path, speed=speed,
+                language=language, timeout_seconds=timeout_seconds, service=service,
+            )
+
+        station_patcher = patch.object(synthesis_module, "synthesize_station_voice", side_effect=dispatch)
+        station_patcher.start()
+        self.addCleanup(station_patcher.stop)
+
+    def test_whole_report_uses_shared_tts_not_legacy_binary(self):
+        track = synthesize_road_report("Test report text.", "day", SHARED_DAY_VOICE)
+
+        self.assertEqual(self._kokoro_call_count, 0, "legacy KOKORO_BINARY must not run in shared-TTS mode")
+        self.assertEqual(len(self.station_calls), 1)
+        self.assertEqual(self.station_calls[0]["voice"], "Claira_Sky")
+        self.assertNotIn("af_jessica", str(self.station_calls[0]["voice"]), "provider id must never be passed")
+        self.assertEqual(self.station_calls[0]["timeout_seconds"], 45)
+        self.assertEqual(track.title, "KanDrive Road Report (Claira)")
+
+    def test_every_transition_segment_uses_shared_tts_not_legacy_binary(self):
+        synthesize_road_report(
+            "unused when segments given", "day", SHARED_DAY_VOICE,
+            segments=["first item.", "second item.", "third item."],
+            transition_sound_path="/fake/path/woosh.wav",
+        )
+        self.assertEqual(self._kokoro_call_count, 0, "no segment may fall back to KOKORO_BINARY")
+        self.assertEqual(len(self.station_calls), 3)
+        for call in self.station_calls:
+            self.assertEqual(call["voice"], "Claira_Sky")
+            self.assertEqual(call["timeout_seconds"], 45, "tts_timeout_seconds applies PER segment")
+
+    def test_configured_timeout_seconds_value_reaches_every_call(self):
+        voice = dict(SHARED_DAY_VOICE, tts_timeout_seconds=17)
+        synthesize_road_report(
+            "unused", "day", voice,
+            segments=["a", "b"], transition_sound_path="/fake/path/woosh.wav",
+        )
+        self.assertTrue(self.station_calls)
+        self.assertTrue(all(call["timeout_seconds"] == 17 for call in self.station_calls))
+
+    def test_shared_tts_failure_raises_synthesis_error_and_preserves_last_known_good(self):
+        good = synthesize_road_report("Good, plain report.", "day", DAY_VOICE)
+        good_bytes = Path(good.filepath).read_bytes()
+
+        self._station_should_fail = True
+        with self.assertRaises(SynthesisError):
+            synthesize_road_report("unused", "night", dict(SHARED_DAY_VOICE, logical_voice_name="Max_Weatherly"))
+
+        self.assertEqual(Path(good.filepath).read_bytes(), good_bytes)
+        good.refresh_from_db()
+        self.assertEqual(good.title, "KanDrive Road Report (Claira)")
+
+    def test_no_temp_files_left_behind_after_shared_tts_success(self):
+        synthesize_road_report("Test report text.", "day", SHARED_DAY_VOICE)
+        leftovers = [p for p in Path(self._tmpdir.name).iterdir() if p.name.startswith(".")]
+        self.assertEqual(leftovers, [])
+
+    def test_legacy_voice_dict_still_uses_kokoro_binary_unaffected_by_this_feature(self):
+        synthesize_road_report("Plain text, old-style call.", "day", DAY_VOICE)
+        self.assertEqual(self._kokoro_call_count, 1)
+        self.assertEqual(self.station_calls, [])
 
 
 class LastKnownGoodPreservationTests(KanDriveSynthesisFixtureMixin, TransactionTestCase):
