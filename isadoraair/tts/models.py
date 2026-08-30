@@ -13,6 +13,8 @@ from django.core.exceptions import ValidationError
 from django.core.validators import RegexValidator
 from django.db import models
 
+from isadoraair.tts.voice_catalog import KOKORO_PROVIDER_VOICE_ID_SET
+
 
 SHA256_VALIDATOR = RegexValidator(
     regex=r"^[0-9a-f]{64}$",
@@ -135,6 +137,8 @@ class StationTTSVoice(models.Model):
         if self.engine == self.Engine.KOKORO:
             if not self.provider_voice:
                 errors["provider_voice"] = "A Kokoro voice requires a provider voice ID."
+            elif self.provider_voice not in KOKORO_PROVIDER_VOICE_ID_SET:
+                errors["provider_voice"] = "Select a supported Kokoro provider voice."
             if self.piper_model_id is not None:
                 errors["piper_model"] = "A Kokoro voice cannot select a Piper model."
         elif self.engine == self.Engine.PIPER:

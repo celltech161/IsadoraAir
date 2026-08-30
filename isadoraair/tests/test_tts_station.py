@@ -6,14 +6,21 @@ from dataclasses import fields
 from importlib import import_module
 from pathlib import Path
 
+from django import forms
+from django.contrib import admin as django_admin
 from django.core.exceptions import ValidationError
 from django.core.management import call_command
 from django.db import migrations
 from django.test import TestCase
 
 from isadoraair.tts import SynthesisRequest, TTSEngine, TTSVoiceUnavailable
+from isadoraair.tts.admin import StationTTSVoiceAdmin
 from isadoraair.tts.models import PiperVoiceModel, StationTTSVoice
 from isadoraair.tts.station import StationTTSService, resolve_station_voice
+from isadoraair.tts.voice_catalog import (
+    KOKORO_PROVIDER_VOICE_CHOICES,
+    KOKORO_PROVIDER_VOICE_IDS,
+)
 from road_conditions.models import RoadConditionsConfiguration
 from weather.models import WeatherConfig, WeatherVoicePersona
 from webrequests.models import WebRequestConfig
@@ -48,11 +55,11 @@ class StationVoiceResolutionTests(TestCase):
     def test_logical_kokoro_voice_resolution(self):
         StationTTSVoice.objects.create(
             name="weather-day", enabled=True, engine="kokoro",
-            provider_voice="provider-voice", language="en-us", speed=1.1,
+            provider_voice="af_heart", language="en-us", speed=1.1,
         )
         resolved = resolve_station_voice("weather-day")
         self.assertEqual(resolved.engine, TTSEngine.KOKORO)
-        self.assertEqual(resolved.provider_voice, "provider-voice")
+        self.assertEqual(resolved.provider_voice, "af_heart")
         self.assertEqual(resolved.language, "en-us")
         self.assertEqual(resolved.speed, 1.1)
         self.assertIsNone(resolved.piper_spec)
@@ -75,7 +82,7 @@ class StationVoiceResolutionTests(TestCase):
 
     def test_disabled_logical_voice(self):
         StationTTSVoice.objects.create(
-            name="disabled", enabled=False, engine="kokoro", provider_voice="native"
+            name="disabled", enabled=False, engine="kokoro", provider_voice="af_bella"
         )
         with self.assertRaisesRegex(TTSVoiceUnavailable, "disabled"):
             resolve_station_voice("disabled")
@@ -90,7 +97,7 @@ class StationVoiceResolutionTests(TestCase):
     def test_high_level_service_resolves_defaults_and_hides_engine_from_caller(self):
         StationTTSVoice.objects.create(
             name="dedication", enabled=True, engine="kokoro",
-            provider_voice="native", language="en-gb", speed=1.25,
+            provider_voice="am_adam", language="en-gb", speed=1.25,
         )
         low_level = _RecordingResolvedService()
         result = StationTTSService().synthesize(
@@ -103,7 +110,7 @@ class StationVoiceResolutionTests(TestCase):
         request = low_level.requests[0]
         self.assertEqual(result, Path("/tmp/station-voice-test.wav"))
         self.assertEqual(request.engine, TTSEngine.KOKORO)
-        self.assertEqual(request.voice, "native")
+        self.assertEqual(request.voice, "am_adam")
         self.assertEqual(request.speed, 1.25)
         self.assertEqual(request.language, "en-gb")
         self.assertEqual(request.timeout_seconds, 30)
@@ -120,7 +127,7 @@ class StationVoiceResolutionTests(TestCase):
 
     def test_persona_remains_outside_tts_resolution(self):
         voice = StationTTSVoice.objects.create(
-            name="weather-day", enabled=True, engine="kokoro", provider_voice="native"
+            name="weather-day", enabled=True, engine="kokoro", provider_voice="af_jessica"
         )
         WeatherVoicePersona.objects.create(
             slot="day", tts_voice=voice, display_name="Presenter",
@@ -176,6 +183,109 @@ class StationVoiceModelValidationTests(TestCase):
                 with self.assertRaises(ValidationError):
                     voice.full_clean()
 
+    def test_supported_kokoro_provider_voice_is_accepted(self):
+        voice = StationTTSVoice(
+            name="supported-kokoro",
+            engine="kokoro",
+            provider_voice="af_heart",
+        )
+        voice.full_clean()
+
+    def test_unknown_kokoro_provider_voice_is_rejected(self):
+        voice = StationTTSVoice(
+            name="unknown-kokoro",
+            engine="kokoro",
+            provider_voice="not_a_kokoro_voice",
+        )
+        with self.assertRaises(ValidationError) as context:
+            voice.full_clean()
+        self.assertEqual(
+            context.exception.message_dict["provider_voice"],
+            ["Select a supported Kokoro provider voice."],
+        )
+
+    def test_existing_saved_supported_kokoro_voice_remains_valid(self):
+        saved = StationTTSVoice.objects.create(
+            name="existing-kokoro",
+            engine="kokoro",
+            provider_voice="am_adam",
+        )
+        StationTTSVoice.objects.get(pk=saved.pk).full_clean()
+
+
+class StationVoiceAdminTests(TestCase):
+    def setUp(self):
+        self.model_admin = StationTTSVoiceAdmin(
+            StationTTSVoice,
+            django_admin.AdminSite(),
+        )
+        self.form_class = self.model_admin.get_form(request=None)
+
+    def _piper_model(self):
+        return PiperVoiceModel.objects.create(
+            model_id="admin-piper",
+            model_filename="admin-piper.onnx",
+            config_filename="admin-piper.onnx.json",
+            model_sha256="1" * 64,
+            config_sha256="2" * 64,
+            language="en-us",
+            sample_rate_hz=22050,
+        )
+
+    def test_kokoro_provider_voice_is_supported_choice_selector(self):
+        form = self.form_class(
+            instance=StationTTSVoice(engine=StationTTSVoice.Engine.KOKORO)
+        )
+        field = form.fields["provider_voice"]
+        self.assertIsInstance(field.widget, forms.Select)
+        self.assertEqual(
+            list(field.choices),
+            [("", "---------"), *KOKORO_PROVIDER_VOICE_CHOICES],
+        )
+        self.assertIn("af_heart", KOKORO_PROVIDER_VOICE_IDS)
+        self.assertIn("am_adam", KOKORO_PROVIDER_VOICE_IDS)
+
+    def test_admin_rejects_unknown_kokoro_provider_voice(self):
+        form = self.form_class(
+            data={
+                "name": "invalid-admin-kokoro",
+                "enabled": "on",
+                "engine": "kokoro",
+                "provider_voice": "not_a_kokoro_voice",
+                "piper_model": "",
+                "language": "en-us",
+                "speed": "1.0",
+            }
+        )
+        self.assertFalse(form.is_valid())
+        self.assertIn("provider_voice", form.errors)
+
+    def test_piper_provider_voice_is_blank_only_and_model_validation_is_unchanged(self):
+        model = self._piper_model()
+        voice = StationTTSVoice(
+            name="admin-piper-voice",
+            engine=StationTTSVoice.Engine.PIPER,
+            piper_model=model,
+            language="en-us",
+        )
+        voice.full_clean()
+
+        form = self.form_class(instance=voice)
+        self.assertEqual(list(form.fields["provider_voice"].choices), [("", "---------")])
+
+        bound_form = self.form_class(
+            data={
+                "name": "admin-piper-voice",
+                "enabled": "",
+                "engine": "piper",
+                "provider_voice": "",
+                "piper_model": str(model.pk),
+                "language": "en-us",
+                "speed": "1.0",
+            }
+        )
+        self.assertTrue(bound_form.is_valid(), bound_form.errors)
+
 
 class FeatureMigrationPreparationTests(TestCase):
     def test_existing_feature_configs_are_safe_and_unconfigured(self):
@@ -190,7 +300,7 @@ class FeatureMigrationPreparationTests(TestCase):
     def test_weather_dump_exposes_persona_to_logical_mapping_without_provider_paths(self):
         WeatherConfig.load()
         voice = StationTTSVoice.objects.create(
-            name="logical-day", enabled=True, engine="kokoro", provider_voice="native"
+            name="logical-day", enabled=True, engine="kokoro", provider_voice="af_sarah"
         )
         WeatherVoicePersona.objects.create(
             slot="day", tts_voice=voice, display_name="Day", full_name="Day Person", signoff="Bye",

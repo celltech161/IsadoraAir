@@ -148,7 +148,7 @@ class ExternalLogicalCliIntegrationTests(TransactionTestCase):
             name="cli-kokoro",
             enabled=True,
             engine="kokoro",
-            provider_voice="native-kokoro",
+            provider_voice="af_heart",
         )
         piper_model = PiperVoiceModel.objects.create(
             model_id="cli-piper-model",
@@ -169,7 +169,7 @@ class ExternalLogicalCliIntegrationTests(TransactionTestCase):
             name="cli-disabled",
             enabled=False,
             engine="kokoro",
-            provider_voice="native-disabled",
+            provider_voice="af_bella",
         )
 
     def _environment(self):
@@ -210,8 +210,18 @@ class ExternalLogicalCliIntegrationTests(TransactionTestCase):
             for voice in ("cli-kokoro", "cli-piper"):
                 with self.subTest(voice=voice):
                     result = self._invoke(voice, unrelated_cwd)
-                    self.assertEqual(result.returncode, TTSExitCode.RUNTIME_UNAVAILABLE, result.stderr)
-                    self.assertIn("runtime_unavailable", result.stderr)
+                    self.assertIn(
+                        result.returncode,
+                        (TTSExitCode.SUCCESS, TTSExitCode.RUNTIME_UNAVAILABLE),
+                        result.stderr,
+                    )
+                    if result.returncode == TTSExitCode.SUCCESS:
+                        self.assertGreater(
+                            (Path(unrelated_cwd) / f"{voice}.wav").stat().st_size,
+                            0,
+                        )
+                    else:
+                        self.assertIn("runtime_unavailable", result.stderr)
                     self.assertNotIn("not configured", result.stderr)
                     self.assertNotIn("PYTHONPATH", self._environment())
 
