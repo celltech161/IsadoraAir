@@ -259,3 +259,186 @@ M-of-N schema and evaluator — proven directly by
 production threshold and signer count are deliberately left to a later,
 separate operational decision; this phase's job was the capability, not
 the policy.
+
+## D2 corrective review (2026-08-30)
+
+Four corrections applied to D2 before D3 begins. See each module's own
+docstring/tests for the full detail; summarized here.
+
+### Correction 1 — supervisor capability inheritance
+
+**Finding**: `deploy/updater-bootstrapd.service` already contained
+`AmbientCapabilities=CAP_SETUID CAP_SETGID` (byte-identical to the
+r0006-hardened worker unit's own line) — the D2 report's claim that it
+was "deliberately omitted" was a stale description of an earlier draft
+that had already been superseded before the file was committed. The
+prose was wrong; the shipped unit was already correct. Fixed the
+false claim here and in the corrective commit message; added
+`updatecenter/tests/test_phase_d2_supervisor_capability.py` (9 tests)
+so a *future* edit dropping the line fails a fast, unprivileged test
+rather than only being caught by an expensive manual acceptance run.
+
+**Why the supervisor unit needs it, not just the worker**: under Phase
+D the worker is a root CHILD PROCESS the supervisor forks
+(`launch.py: launch_worker()` → `process.py: launch_tracked()`, a
+plain `subprocess.Popen`, never an `execve()` that replaces the
+supervisor). Per `capabilities(7)`, the ambient capability set survives
+`execve()` of a non-privileged (non-setuid, no file-capability) program
+— true for both hops here: the supervisor's own `/usr/bin/python3`
+target, and the worker's own `/usr/bin/python3 -I <slot>/<entrypoint>`
+target. Neither is setuid or has file capabilities (confirmed:
+`test_worker_process_launch_uses_plain_non_shell_exec_that_cannot_
+strip_ambient_capabilities`). So a capability set on the *supervisor's*
+own systemd unit is what actually reaches the worker child process's
+own later `runuser --user ISA_USER` call
+(`isadoraair_updater.process.CommandRunner.run_as_user()`, unchanged,
+still `runuser`-based — confirmed still present by
+`test_worker_still_actually_uses_runuser_for_privilege_drop`).
+
+**Manual acceptance (do not automate in CI, matches r0006's own
+convention)** — NOT executed in this development environment (no
+non-interactive root/sudo available in this session; see the prior
+weather-schedule-authority corrective-review report for the same
+limitation). The r0006 single-hop transient-unit proof
+(`docs/UPDATE_CENTER.md`'s own "Manual systemd capability acceptance"
+section) already establishes the underlying kernel rule for one
+non-privileged exec hop; this is its two-hop extension, to be run by
+an operator during an approved maintenance review once D0 is staged:
+
+```bash
+sudo systemd-run --quiet --wait --pipe --collect \
+  --unit=isadoraair-bootstrap-capability-proof \
+  --property=User=root --property=Group=jreed \
+  --property=NoNewPrivileges=yes \
+  --property='AmbientCapabilities=CAP_SETUID CAP_SETGID' \
+  /usr/bin/python3 -c "
+import subprocess
+# Hop 1: simulates the supervisor forking the worker as a plain child
+# process (exactly launch.py's launch_tracked() -- no shell, no setuid
+# wrapper).
+subprocess.run([
+    '/usr/bin/python3', '-c',
+    'import subprocess; '
+    'subprocess.run([\"/usr/sbin/runuser\", \"--user\", \"jreed\", '
+    '\"--\", \"/usr/bin/cat\", \"/proc/self/status\"])',
+])
+"
+```
+
+Require the resulting `jreed` child's reported `CapPrm`, `CapEff`, and
+`CapAmb` to all be zero — the exact acceptance target:
+
+```text
+Supervisor:  root-owned, root-executed (User=root, ambient CAP_SETUID/CAP_SETGID)
+Worker:      root child of supervisor (inherits ambient set across a non-privileged execve)
+Application: ISA_USER child of runuser -- CapPrm=0, CapEff=0, CapAmb=0
+```
+
+The final D0 production acceptance must explicitly re-prove, on the
+real staged supervisor/worker (not only this simulated transient
+unit): (1) supervisor/worker startup succeeds; (2) the worker's own
+privilege-drop self-check succeeds (mirroring the existing
+`protected_runtime_valid` self-check); (3) the resulting application-
+user child has zero permitted/effective/ambient capabilities.
+
+### Correction 2 — post-rename fsync durability semantics
+
+**Finding, confirmed real**: the D2 report's fault-injection tests
+proved no CLOBBERING of the existing destination on failure, but never
+distinguished failure *before* `os.replace()` (destination provably
+unchanged) from failure *after* a successful `os.replace()` but before
+the parent-directory `fsync()` (destination already changed at the
+filesystem level; only the RENAME's own crash-durability is uncertain,
+not its current-process visibility). The original single test for this
+boundary (`test_failure_after_replace_before_directory_fsync_still_
+leaves_file_durable_on_disk`) only asserted the new file is visible to
+the *same still-running process* -- true, but not the relevant safety
+question, which is what a crash right at that boundary means for the
+*next* process to read this file after a restart.
+
+**Fix**: `write_runtime_state_atomically()` keeps its ordinary contract
+(returns `None` on full success, raises `OSError` for any failure
+*before* `os.replace()` succeeds -- these are the genuinely
+recoverable cases where the destination is provably untouched and "old
+state remains authoritative" is simply true). A parent-directory-fsync
+failure occurring *after* a successful `os.replace()` is no longer
+allowed to surface as an indistinguishable bare `OSError` -- it is
+caught and re-raised as a new, distinct `IndeterminateStateWriteError`
+(a small dataclass-carrying exception, not a silently-ignorable return
+value: a caller cannot accidentally fail to notice it the way a
+forgotten return-value check could happen). A caller that CATCHES
+`IndeterminateStateWriteError` receives enough to log the exact
+situation but is never handed anything resembling "safe to treat X as
+current" -- the only correct response is to stop, decline to proceed
+with activation, and surface it for operator attention.
+
+`supervisor.py`'s own transition functions remain deliberately I/O-free
+(pure `RuntimeState -> RuntimeState`, unchanged by this correction --
+see D2-S's own scope boundary: nothing in this phase persists a
+transition to disk itself, that wiring is D3's job). This correction's
+job was narrower and prerequisite to that wiring: making the ATOMIC
+WRITER's own contract unambiguous, so whichever D3 code eventually
+calls `write_runtime_state_atomically()` after a `supervisor.py`
+transition has no way to accidentally treat an indeterminate rename as
+either "old" or "new" -- it must catch `IndeterminateStateWriteError`
+specifically and fail the transaction closed. This is proven now by
+`test_phase_d2_state.py`'s own fault-injection tests distinguishing all
+seven boundaries (see Tests below), not deferred to D3 to discover.
+
+On restart, `read_runtime_state()` is unchanged (it already either
+successfully parses one complete, valid JSON document or raises --
+`os.replace()`'s atomicity guarantees there is never a half-written
+file to misparse) — recovery logic does not need to change to handle
+"old vs. new state after an indeterminate write," because by the time
+recovery runs, the file that exists IS one complete state or the
+other; `recovery_action_for()`'s already-conservative "discard any
+non-idle transaction" rule already covers both possibilities without
+needing to know which one actually happened.
+
+### Correction 3 — active-slot invariant, made mechanical
+
+`commit_transaction()` was already, by construction, the only function
+in `supervisor.py` that assigns to `RuntimeState.active_slot` — now
+proven by a dedicated AST-based test
+(`test_only_commit_transaction_assigns_active_slot`) that greps every
+function in the module for an assignment to that field, rather than
+relying on the module docstring's own claim. Also added an explicit
+test proving candidate launch/readiness classification
+(`readiness.classify_readiness`) never receives or returns anything
+resembling `RuntimeState` at all — structurally incapable of
+influencing `active_slot`, not merely "doesn't currently."
+
+### Correction 4 — worker process lifecycle ownership
+
+Added `isadoraair_updater_bootstrap.worker_lifecycle`, a small pure
+policy module the supervisor consults (not yet wired to a real event
+loop, matching D2-S's own scope) answering exactly one question per
+observed transition: is starting a NEW worker legal given the
+CURRENTLY tracked one's state (`NONE` / `RUNNING` /
+`EXITED_UNACKNOWLEDGED`)? Refuses to launch a second worker while one
+is already tracked as running (no duplicate simultaneous workers);
+requires an explicit `acknowledge_exit()` after `record_exit()` before
+a new launch is legal (a normal exit and a crash reach the identical
+state here -- this layer only tracks "may I launch," not "what
+happened," deliberately); bounds consecutive restart attempts within a
+rolling time window (`max_consecutive_restart_attempts`/
+`restart_attempt_window_seconds`, both configurable, neither wired to
+any automatic reset); and a freshly-constructed instance (what a
+restarted supervisor process necessarily has -- it cannot remember a
+prior instance's PID) always starts able to launch, matching
+`supervisor.py`'s own conservative recovery stance.
+
+Orphan prevention: `process.py`'s `TrackedChild.terminate()` already
+used process-group signaling (`os.killpg`) with a SIGTERM grace period
+before SIGKILL — unchanged, now proven directly against a real
+subprocess tree (a worker that itself spawns a grandchild) via `pgrep`
+on the process group, not merely asserted. Independently, the
+supervisor's own draft unit relies on systemd's DEFAULT `KillMode`
+(`control-group`, when the directive is simply absent, as it is here)
+so a `systemctl stop`/`restart` of the supervisor itself sends
+SIGTERM/SIGKILL to its entire cgroup — including the worker child
+process — as a second, independent safety net on top of (not instead
+of) whatever explicit termination the supervisor's own code performs;
+`test_no_kill_mode_weakening_the_cgroup_wide_stop_restart_safety_net`
+refuses a future `KillMode=process` edit that would narrow this to
+only the main PID.

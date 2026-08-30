@@ -13,8 +13,8 @@ from .phase_b_helpers import BOOTSTRAP_ROOT  # noqa: F401
 from isadoraair_updater_bootstrap.activation import ActivationPhase
 from isadoraair_updater_bootstrap.slots import Slot
 from isadoraair_updater_bootstrap.state import (
-    ActivationTransaction, RuntimeState, StateError, parse_runtime_state_dict,
-    read_runtime_state, write_runtime_state_atomically,
+    ActivationTransaction, IndeterminateStateWriteError, RuntimeState, StateError,
+    parse_runtime_state_dict, read_runtime_state, write_runtime_state_atomically,
 )
 
 VALID_UUID = "12345678-1234-4123-8123-123456789abc"
@@ -178,10 +178,11 @@ class AtomicStateWriterTests(SimpleTestCase):
         reloaded = read_runtime_state(self.path)
         self.assertEqual(reloaded.active_generation, 5)
 
-    def test_failure_during_write_leaves_no_partial_temp_file(self):
-        # Fault injection at the "write complete bytes" boundary --
-        # os.fdopen's handle.write() raising mid-way must not leave a
-        # temp file behind, and must never touch the real destination.
+    # ---- D2 corrective review, Correction 2: 7 distinguished boundaries ----
+
+    def test_1_failure_before_temporary_write_completion(self):
+        # os.fdopen's handle.write() raising mid-way -- destination
+        # provably untouched (os.replace() never ran at all).
         with mock.patch("os.fdopen") as fdopen:
             handle = mock.MagicMock()
             handle.write.side_effect = OSError("simulated disk full")
@@ -189,33 +190,53 @@ class AtomicStateWriterTests(SimpleTestCase):
             with self.assertRaises(OSError):
                 write_runtime_state_atomically(self.path, self._state())
         self.assertFalse(self.path.exists())
-        leftovers = list(self.path.parent.iterdir())
-        self.assertEqual(leftovers, [])
+        self.assertEqual(list(self.path.parent.iterdir()), [])
 
-    def test_failure_during_fsync_leaves_no_partial_temp_file(self):
+    def test_2_file_fsync_failure(self):
+        # The FIRST fsync call (the temp file's own bytes) -- also
+        # strictly before os.replace(), so the destination is provably
+        # untouched, same guarantee as case 1.
         with mock.patch("os.fsync", side_effect=OSError("simulated fsync failure")):
             with self.assertRaises(OSError):
                 write_runtime_state_atomically(self.path, self._state())
         self.assertFalse(self.path.exists())
-        leftovers = list(self.path.parent.iterdir())
-        self.assertEqual(leftovers, [])
+        self.assertEqual(list(self.path.parent.iterdir()), [])
 
-    def test_failure_during_replace_leaves_no_partial_temp_file_and_no_destination(self):
+    def test_2b_file_fsync_failure_does_not_raise_indeterminate(self):
+        # Specifically NOT IndeterminateStateWriteError -- that type is
+        # reserved for a post-replace failure only; a pre-replace
+        # failure of any kind is an ordinary, safely-retryable OSError.
+        with mock.patch("os.fsync", side_effect=OSError("simulated fsync failure")):
+            try:
+                write_runtime_state_atomically(self.path, self._state())
+            except IndeterminateStateWriteError:
+                self.fail("a pre-replace failure must never raise IndeterminateStateWriteError")
+            except OSError:
+                pass
+
+    def test_3_replace_failure(self):
         with mock.patch("os.replace", side_effect=OSError("simulated replace failure")):
             with self.assertRaises(OSError):
                 write_runtime_state_atomically(self.path, self._state())
         self.assertFalse(self.path.exists())
-        leftovers = list(self.path.parent.iterdir())
-        self.assertEqual(leftovers, [])
+        self.assertEqual(list(self.path.parent.iterdir()), [])
 
-    def test_failure_after_replace_before_directory_fsync_still_leaves_file_durable_on_disk(self):
-        # os.replace() already happened by the time directory fsync is
-        # attempted -- the RENAME is done at the filesystem level even
-        # if this process then fails to fsync the parent (a real crash
-        # here risks losing durability of the rename on SOME mount
-        # options, which is exactly why this step exists at all -- but
-        # the file itself, as observed by THIS still-running process,
-        # is already present).
+    def test_3b_existing_destination_provably_untouched_if_replace_itself_fails(self):
+        write_runtime_state_atomically(self.path, self._state())
+        original_bytes = self.path.read_bytes()
+        with mock.patch("os.replace", side_effect=OSError("simulated failure")):
+            with self.assertRaises(OSError):
+                write_runtime_state_atomically(self.path, self._state(active_generation=99))
+        self.assertEqual(self.path.read_bytes(), original_bytes)
+
+    def test_4_parent_directory_fsync_failure_after_replace_is_indeterminate(self):
+        # os.replace() ALREADY succeeded by the time directory fsync is
+        # attempted -- this is the case Correction 2 exists for. Must
+        # raise the DISTINCT IndeterminateStateWriteError, never a bare
+        # OSError indistinguishable from cases 1-3, and this function
+        # must never claim (by return value, by exception type, or by
+        # any side effect) that the OLD destination content is "still
+        # the current state" -- it is not; the rename already happened.
         original_fsync = os.fsync
         call_count = {"n": 0}
 
@@ -226,14 +247,68 @@ class AtomicStateWriterTests(SimpleTestCase):
             return original_fsync(fd)
 
         with mock.patch("os.fsync", side_effect=fsync_second_call_fails):
-            with self.assertRaises(OSError):
+            with self.assertRaises(IndeterminateStateWriteError) as ctx:
                 write_runtime_state_atomically(self.path, self._state())
-        self.assertTrue(self.path.exists())
+        # The new bytes ARE visible to this process (the rename really
+        # did happen) -- but this test asserts only what the exception
+        # itself communicates, never treats file presence as proof of
+        # crash-survivability.
+        self.assertEqual(ctx.exception.path, self.path)
+        self.assertIsInstance(ctx.exception.original_error, OSError)
 
-    def test_existing_destination_untouched_if_write_fails_before_replace(self):
-        write_runtime_state_atomically(self.path, self._state())
-        original_bytes = self.path.read_bytes()
-        with mock.patch("os.replace", side_effect=OSError("simulated failure")):
+    def test_4b_indeterminate_error_never_raised_for_a_clean_write(self):
+        # Sanity: the distinct exception type is not accidentally
+        # raised on the ordinary success path.
+        try:
+            write_runtime_state_atomically(self.path, self._state())
+        except IndeterminateStateWriteError:
+            self.fail("a fully successful write must never raise IndeterminateStateWriteError")
+
+    def test_5_restart_with_old_complete_state_present(self):
+        # Simulates: a write never even started (or failed cleanly per
+        # cases 1-3) -- on "restart," the file on disk is exactly the
+        # previously-written, complete, valid state.
+        original = self._state(active_generation=4)
+        write_runtime_state_atomically(self.path, original)
+        with mock.patch("os.replace", side_effect=OSError("simulated failure -- write never landed")):
             with self.assertRaises(OSError):
                 write_runtime_state_atomically(self.path, self._state(active_generation=99))
-        self.assertEqual(self.path.read_bytes(), original_bytes)
+        reloaded = read_runtime_state(self.path)
+        self.assertEqual(reloaded, original)
+
+    def test_6_restart_with_new_complete_state_present(self):
+        # Simulates: a write fully succeeded (all 7 steps) before
+        # "restart" -- the file on disk is exactly the NEW state.
+        write_runtime_state_atomically(self.path, self._state(active_generation=4))
+        new_state = self._state(active_generation=5)
+        write_runtime_state_atomically(self.path, new_state)
+        reloaded = read_runtime_state(self.path)
+        self.assertEqual(reloaded, new_state)
+
+    def test_7_malformed_or_inconsistent_resulting_state_never_reconstructed_as_valid(self):
+        # Simulates a genuinely corrupted/foreign file at the state
+        # path (never produced by write_runtime_state_atomically
+        # itself, which is atomic by construction -- but read_runtime_
+        # state()/parse_runtime_state_dict() must still fail closed
+        # against ANY malformed content reaching that path by some
+        # other means, rather than attempting to salvage a partial
+        # parse into a "best guess" RuntimeState).
+        self.path.write_text('{"schema_version": 1, "active_slot": "A"', encoding="utf-8")  # truncated JSON
+        with self.assertRaises(ValueError):
+            read_runtime_state(self.path)
+
+    def test_7b_structurally_valid_json_but_semantically_inconsistent_state_rejected(self):
+        # Valid JSON, but internally contradictory (previous_slot ==
+        # active_slot) -- parse_runtime_state_dict's own consistency
+        # checks (ParseRuntimeStateDictTests above) must still apply
+        # when reached via the file-reading path, not just the
+        # dict-in-memory path.
+        import json
+        contradictory = {
+            "schema_version": 1, "active_slot": "A", "active_generation": 4,
+            "active_descriptor_sha256": "a" * 64, "previous_slot": "A",
+            "previous_generation": 3, "previous_descriptor_sha256": "b" * 64, "activation": None,
+        }
+        self.path.write_text(json.dumps(contradictory), encoding="utf-8")
+        with self.assertRaises(StateError):
+            read_runtime_state(self.path)

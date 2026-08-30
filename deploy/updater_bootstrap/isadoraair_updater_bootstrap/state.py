@@ -181,6 +181,35 @@ def _fsync_directory(path: Path) -> None:
         os.close(fd)
 
 
+class IndeterminateStateWriteError(RuntimeError):
+    """D2 corrective review, Correction 2. Raised ONLY when
+    os.replace() has already succeeded but the following parent-
+    directory fsync() then fails. This is NOT an ordinary write
+    failure: the destination path has already been atomically renamed
+    to the NEW content and is visible to this process (and to any
+    other process on this host that reads it right now) -- but whether
+    that rename itself survives a concurrent crash/power-loss before
+    the directory entry is flushed to durable storage is genuinely
+    unknown on some filesystems/mount options.
+
+    A caller must NEVER treat this as "the old state is still
+    authoritative" (it may not be -- the rename already happened from
+    this process's own point of view) and must NEVER treat it as "the
+    new state is durably committed" (that is exactly what could not be
+    confirmed). The only correct response is to stop, decline to
+    proceed with whatever this write was for (e.g. an activation
+    transaction), and surface the situation for operator attention --
+    never silently retry-and-hope, never silently pick a side."""
+
+    def __init__(self, path: Path, original_error: OSError):
+        super().__init__(
+            f"{path}: os.replace() succeeded but the parent-directory fsync failed afterward -- "
+            f"rename durability across a crash is indeterminate: {original_error}"
+        )
+        self.path = path
+        self.original_error = original_error
+
+
 def write_runtime_state_atomically(path: Path, state: RuntimeState) -> None:
     """D2-F's exact durable-publication sequence:
       1. same-directory temporary file (guarantees the final rename
@@ -197,8 +226,31 @@ def write_runtime_state_atomically(path: Path, state: RuntimeState) -> None:
          just the file's bytes; without this, a crash right after
          os.replace() could still lose the rename on some filesystems/
          mount options.
-    No state update is considered durable until step 7 completes --
-    this function does not return before then."""
+
+    Returns normally (None) only once ALL SEVEN steps have succeeded --
+    that is the ONLY case in which the caller may treat the new state
+    as durably authoritative.
+
+    A failure at steps 1-5, or os.replace() itself (step 6) failing,
+    raises an ordinary OSError -- in every one of those cases the
+    destination path is PROVABLY UNTOUCHED (os.replace() never ran, or
+    never completed), so "the old state, if any, remains authoritative"
+    is simply true; the temporary file is cleaned up and the caller may
+    safely retry.
+
+    A failure at step 7 ALONE (directory fsync, after a successful
+    replace) raises IndeterminateStateWriteError instead -- see that
+    exception's own docstring for why this case is handled distinctly
+    rather than folded into the same generic OSError path. There is
+    nothing to "clean up" in this case (the temporary name no longer
+    exists; it IS the destination now), and this function does not
+    attempt a second rename to "undo" the replace -- see this module's
+    own corrective-review notes (docs/UPDATE_CENTER_PHASE_D.md): a
+    second rename cannot erase the original durability ambiguity, it
+    can only ADD a second one, so this function does not pretend to
+    offer a rollback here at all -- that decision belongs to the
+    caller (supervisor.py), which always fails the transaction closed
+    rather than attempting to reconstruct anything from this state."""
     path = Path(path)
     raw = json.dumps(state.to_dict(), sort_keys=True, separators=(",", ":")).encode("utf-8")
     directory = path.parent
@@ -209,13 +261,22 @@ def write_runtime_state_atomically(path: Path, state: RuntimeState) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temp_name, path)
-        _fsync_directory(directory)
     except BaseException:
         try:
             os.unlink(temp_name)
         except FileNotFoundError:
             pass
         raise
+
+    # From this point on, os.replace() has ALREADY succeeded -- `path`
+    # is already the new content. temp_name no longer exists at its
+    # original location, so there is nothing left to clean up on a
+    # failure below; only the directory-fsync durability question
+    # remains, handled as its own distinct outcome.
+    try:
+        _fsync_directory(directory)
+    except OSError as exc:
+        raise IndeterminateStateWriteError(path, exc) from exc
 
 
 def _mkstemp_in(directory: Path):
