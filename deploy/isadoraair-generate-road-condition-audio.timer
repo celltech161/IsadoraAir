@@ -1,0 +1,35 @@
+[Unit]
+Description=Generate IsadoraAir KanDrive road-condition audio
+
+[Timer]
+# Deliberately decoupled from isadoraair-sync-road-conditions.timer --
+# the two commands have their own separate advisory locks, own
+# schedules, and own jobs (KDOT ingestion vs. spoken-report synthesis),
+# same idiom as generate_dedication_intros.timer being independent of
+# web-requests-poll.timer. The KDOT fetch cadence stays under
+# RoadConditionsConfiguration.poll_cadence_minutes (15 min by
+# default) -- generation checks in independently, every 5 minutes,
+# so that:
+#   - newly-synced KDOT changes reach the spoken report within at
+#     most ~5 minutes of a sync completing;
+#   - a day/night voice-schedule boundary (WeatherConfig.voice_schedule)
+#     is picked up within ~5 minutes of crossing it;
+#   - a feed going stale/failed/disabled is noticed and the report
+#     retired promptly (see report.feed_freshness());
+#   - an unchanged report costs nothing extra -- generate_road_
+#     condition_audio's own fingerprint/health check
+#     (report.compute_report_fingerprint() / synthesis.
+#     existing_report_is_healthy()) skips the Kokoro/ffmpeg pipeline
+#     entirely on every tick where nothing that affects the resulting
+#     audio has actually changed, so a 5-minute check cadence does NOT
+#     mean a 5-minute TTS cost.
+# generate_road_condition_audio's own command-wide advisory lock
+# (GENERATE_ROAD_AUDIO_LOCK_KEY) means an overlapping firing (a
+# genuinely long multi-segment synthesis still in flight when the next
+# tick arrives) just exits immediately rather than racing itself.
+OnBootSec=3min
+OnUnitActiveSec=5min
+Persistent=false
+
+[Install]
+WantedBy=timers.target

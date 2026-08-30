@@ -1,11 +1,13 @@
 # Road Conditions
 
-Ingests Kansas DOT road/construction events from the state's CARS API
-and normalizes them into `RoadEvent` rows for later use by a spoken
-road-conditions report (not yet built — see "What this app does NOT do
-yet" below). Sits alongside Weather Configuration and AMBER Alert
-Configuration in Django admin, following the same singleton-config
-pattern as both.
+Ingests Kansas DOT road/construction events from the state's CARS API,
+normalizes them into `RoadEvent` rows, and builds them into a single
+consolidated spoken "KanDrive" road report (`road_conditions/report.py`
++ `road_conditions/synthesis.py`) that airs as an ordinary rotation
+Track. Two independently-scheduled systemd timers drive the pipeline
+end to end -- see "Scheduling" below. Sits alongside Weather
+Configuration and AMBER Alert Configuration in Django admin, following
+the same singleton-config pattern as both.
 
 ## Status
 
@@ -233,15 +235,37 @@ the station's real configured coverage." Only a plain
 `sync_road_conditions` (or `--force-full`) run using the full
 configured scope can deactivate or rescope `RoadEvent` rows.
 
-## Scheduling (proposed, NOT installed)
+## Scheduling
 
-`deploy/isadoraair-sync-road-conditions.service` and `.timer` exist as
-a proposal, guarded by the same Postgres-advisory-lock overlap-
-protection idiom `generate_dedication_intros` already uses (an
-overlapping firing just exits immediately). They are **not** rendered,
-installed, or enabled by this change — do that deliberately once
-you've reviewed the coverage-area settings and run a few manual
-`--dry-run`s.
+Two systemd timers, deliberately decoupled -- separate advisory locks,
+separate schedules, separate jobs (KDOT ingestion vs. spoken-report
+synthesis), same idiom as `generate_dedication_intros.timer` being
+independent of `web-requests-poll.timer`. Neither is coupled to the
+other's cadence or triggered by the other completing.
+
+```text
+KDOT sync timer (isadoraair-sync-road-conditions.timer)
+    -> wakes every ~1 minute
+    -> sync_road_conditions itself enforces the real cadence
+       (RoadConditionsConfiguration.poll_cadence_minutes, 15 min default)
+    -> writes/updates/deactivates RoadEvent rows
+
+KanDrive audio timer (isadoraair-generate-road-condition-audio.timer)
+    -> wakes every 5 minutes (its own fixed cadence -- not admin-editable,
+       and not tied to poll_cadence_minutes)
+    -> generate_road_condition_audio composes the current report,
+       resolves the current voice, and computes a fingerprint of the
+       actual on-air artifact that generation would produce
+    -> feed_freshness() + the fingerprint/health check decide whether to
+       retire the existing report, skip synthesis (nothing changed), or
+       actually run Kokoro/shared-TTS + ffmpeg
+```
+
+### KDOT sync
+
+`deploy/isadoraair-sync-road-conditions.service` and `.timer`, guarded
+by a Postgres-advisory-lock overlap-protection idiom (an overlapping
+firing just exits immediately).
 
 **Cadence design (Option B, matching this project's own OGRemote
 poller idiom)**: the timer itself fires every ~1 minute, but
@@ -267,25 +291,52 @@ freshness isn't buying much; lower `poll_cadence_minutes` in the admin
 shorter interval is worth the bandwidth trade-off -- e.g. for winter
 road-condition operations.
 
+### KanDrive audio generation
+
+`deploy/isadoraair-generate-road-condition-audio.service` and `.timer`
+run `generate_road_condition_audio` (no flags -- normal production
+invocation never passes `--force`/`--regenerate`/`--voice`, which exist
+for manual verification only) on a fixed 5-minute check, independent of
+`poll_cadence_minutes`. A 5-minute check means a newly-synced KDOT
+change, or a day/night voice-schedule boundary, reaches the spoken
+report within at most ~5 minutes, and a stale/failed/disabled feed is
+retired promptly -- without costing anything extra on every other tick,
+since `report.compute_report_fingerprint()` / `synthesis.
+existing_report_is_healthy()` skip the whole Kokoro/shared-TTS/ffmpeg
+pipeline whenever nothing that actually affects the resulting audio has
+changed. Its own command-wide advisory lock
+(`GENERATE_ROAD_AUDIO_LOCK_KEY`) means an overlapping firing (a
+genuinely long multi-segment synthesis still in flight) just exits
+immediately. `TimeoutStartSec=0` on the service deliberately leaves the
+run duration to the application's own internal bounds (per-call Kokoro/
+shared-TTS timeouts, ffmpeg/ffprobe timeouts, the advisory lock) rather
+than an arbitrary systemd start timeout -- a real production report has
+already measured at 165.2s of finished audio for 7 events.
+
+### Installing either timer
+
 ```bash
 # Render @@ISA_USER@@/@@ISA_ROOT@@ per deploy/README.md's convention, then:
 sudo cp deploy/isadoraair-sync-road-conditions.service deploy/isadoraair-sync-road-conditions.timer /etc/systemd/system/
+sudo cp deploy/isadoraair-generate-road-condition-audio.service deploy/isadoraair-generate-road-condition-audio.timer /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now isadoraair-sync-road-conditions.timer
+sudo systemctl enable --now isadoraair-generate-road-condition-audio.timer
 ```
 
-## What this app does NOT do yet
+Review the coverage-area settings and run a few manual `--dry-run`s of
+each command before enabling either timer for the first time.
 
-By design, per this round's scope:
+## What this app does NOT do
 
-- **No spoken/on-air announcements.** `RoadEvent.description` is the
-  field a future TTS pipeline should read, but nothing synthesizes or
-  schedules speech from it yet.
 - **No `PlaylistLog`/engine integration.** Nothing here touches
   `library/services/engine.py`, the GLib main loop, or any real-time
-  audio path — this app only ever talks to the CARS API and the
-  database, from a management command invoked by a systemd timer,
-  same isolation as `generate_dedication_intros`.
+  audio path — this app only ever talks to the CARS API, the shared TTS
+  service, and the database, from management commands invoked by
+  systemd timers, same isolation as `generate_dedication_intros`. The
+  resulting KanDrive Track is an ordinary rotation-eligible Track an
+  operator adds to rotations manually, like any other spoken-segment
+  Track (WxForecast/WxObs/WxTemp).
 - **No bounding-box/coordinate-radius filtering** — the live API has
   no such server-side support, and county/route filtering already
   covers "administrator-configurable coverage" without inventing a

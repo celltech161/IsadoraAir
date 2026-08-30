@@ -1,0 +1,36 @@
+[Unit]
+Description=Generate IsadoraAir KanDrive road-condition audio
+After=postgresql.service
+
+[Service]
+Type=oneshot
+# Same reasoning as isadoraair-generate-dedication-intros.service --
+# this is the same category of job (Kokoro/shared-TTS synthesis +
+# ffmpeg), running unattended in the background on the same box as the
+# live on-air engine. Lowered priority so a report generation cycle
+# never contends with real-time playback for CPU.
+Nice=19
+User=@@ISA_USER@@
+Group=@@ISA_USER@@
+WorkingDirectory=@@ISA_ROOT@@
+ExecStart=@@ISA_ROOT@@/venv/bin/python @@ISA_ROOT@@/manage.py generate_road_condition_audio
+EnvironmentFile=@@ISA_ROOT@@/.env
+# Deliberately unbounded, NOT systemd's ordinary 90s default start
+# timeout -- a real production KanDrive report has already measured at
+# 165.2s of finished audio (7 events, single-call synthesis), and
+# transition-sound mode synthesizes one Kokoro/shared-TTS call PER
+# event plus ffmpeg concat/loudnorm on top of that, so a legitimate,
+# healthy run can easily exceed several minutes of wall time. The
+# command already has real internal bounds that make an unbounded
+# systemd timeout safe rather than a footgun: a fixed 600s timeout per
+# legacy Kokoro subprocess call, RoadConditionsConfiguration.
+# tts_timeout_seconds (also 600s by default) applied PER shared-TTS
+# call/segment, a 120s ffmpeg loudnorm encode timeout, a 15s ffprobe
+# duration-probe timeout, and its own Postgres advisory lock
+# (GENERATE_ROAD_AUDIO_LOCK_KEY) so an overlapping timer firing just
+# exits immediately rather than piling up -- see road_conditions/
+# synthesis.py and generate_road_condition_audio.py. Let those
+# application-level bounds govern; a separate, shorter systemd start
+# timeout would only risk killing a legitimately slow-but-healthy
+# multi-segment report mid-synthesis for no real safety benefit.
+TimeoutStartSec=0
