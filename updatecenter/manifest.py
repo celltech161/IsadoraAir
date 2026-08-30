@@ -60,7 +60,21 @@ SCHEMA_VERSION = 1
 # A manifest whose minimum_updater_protocol_version exceeds what THIS
 # code understands must be refused, never best-effort-interpreted --
 # see validate_manifest_dict's UNSUPPORTED_PROTOCOL check.
-UPDATER_PROTOCOL_VERSION = 3
+#
+# 3 -> 4: systemd_units_new_required's EXECUTION semantics changed --
+# a required unit is no longer unconditionally `enable --now`d. The
+# protected updater now looks up each declared unit's activation
+# policy in a closed, protected-runtime-compiled map
+# (isadoraair_updater.release.MANAGED_UNIT_POLICIES): ENABLE_NOW
+# (existing behavior, unchanged) or INSTALL_ONLY (installed + daemon-
+# reloaded, but never enabled/started -- for a timer-triggered
+# companion .service). The manifest schema/fields are unchanged; a
+# release requiring this new interpretation must declare
+# minimum_updater_protocol_version=4 so an updater still running
+# protocol 3 code refuses it (UPDATER_UPGRADE_REQUIRED) instead of
+# silently enable --now-ing a companion .service that was only ever
+# meant to be installed. See docs/UPDATE_CENTER.md.
+UPDATER_PROTOCOL_VERSION = 4
 
 RELEASE_ID_PATTERN = re.compile(r"^r[0-9]{4,}$")
 # "app_label.migration_name", matching Django's own migration-name

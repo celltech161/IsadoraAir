@@ -42,6 +42,24 @@ runtime derive and enforce that fact independently. The protected helper never
 self-updates. The exact r0005-to-r0006 bridge and the manual systemd capability
 acceptance procedure are in `docs/UPDATE_CENTER.md`.
 
+r0022 (companion-unit support) is itself one of those `deploy/updater_runtime`
+changes, so it too requires `manual_bootstrap_required: true` and a manual
+bridge before it takes effect — it never self-installs. It bumps
+`MANIFEST_PROTOCOL_VERSION` 3 → 4 (a release-manifest execution-semantics
+number, deliberately kept separate from the socket wire `PROTOCOL_VERSION`
+above, which stays 3) and replaces "every `systemd_units_new_required` unit
+gets `enable --now`" with a closed, protected-runtime-compiled policy map,
+`release.MANAGED_UNIT_POLICIES`: `ENABLE_NOW` (unchanged existing behavior —
+the five core services, and a companion `.timer`) or `INSTALL_ONLY`
+(installed and daemon-reloaded, but never enabled or started — a
+`Type=oneshot` companion `.service` meant only to be triggered by its own
+paired `.timer`). `_cross_check()` also now permits a manifest to promote an
+already-tracked, byte-unchanged unit template into that required contract
+without a fake content edit — allowed only for a unit name already in
+`MANAGED_UNIT_POLICIES`. Full detail, including exactly why the two protocol
+numbers must stay independent, is in `docs/UPDATE_CENTER.md`'s "Managed-unit
+activation policy" and "Release-manifest protocol version" sections.
+
 If the trusted upstream uses SSH, provision a dedicated root-owned read-only
 deploy key and known-host entry separately. Do not reuse an application-owned
 SSH key or place credential material in `station.json`.

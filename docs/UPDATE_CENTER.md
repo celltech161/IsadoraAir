@@ -357,6 +357,88 @@ unit just because its template exists.** This matches
 `deploy/README.md`'s own existing convention (optional timers are
 opt-in, one `sudo systemctl enable --now` at a time).
 
+## Managed-unit activation policy (r0022+)
+
+Every unit declared in `systemd_units_changed`/`systemd_units_new_required` is
+installed from the trusted staged target and (if any bytes actually changed)
+daemon-reloaded, exactly as always. What happens next to a
+`systemd_units_new_required` unit is no longer "always `enable --now`" —
+it is decided per unit name by a **closed, protected-runtime-compiled
+map**, `isadoraair_updater.release.MANAGED_UNIT_POLICIES`, never by
+manifest text and never inferred from the unit's own `.service`/`.timer`
+suffix:
+
+- **`ENABLE_NOW`** — installed, then `systemctl enable --now`'d and
+  verified active/healthy (`SystemdManager.verify_unit`). This is the
+  only behavior a required unit had before this policy existed, and it
+  is still exactly how the five core services (and each companion
+  `.timer` below) work.
+- **`INSTALL_ONLY`** — installed and covered by the same daemon-reload,
+  but **never enabled and never started** by this updater. Only
+  confirmed to have loaded successfully
+  (`SystemdManager.verify_unit_loaded`, a fixed, read-only
+  `systemctl show <unit> --property=LoadState` check — never
+  `ActiveState`, and never anything that could execute the unit). This
+  exists for a `Type=oneshot` `.service` that is meant only to be
+  triggered by its own paired `.timer`.
+
+`KNOWN_MANAGED_UNITS` (the allowlist `_install_one`/`manual_blockers`
+enforce) is `frozenset(MANAGED_UNIT_POLICIES)` — the same map decides
+both "may this updater ever touch this unit" and "what does touching it
+actually do," so the two can never drift apart. As of r0022 the map
+covers the five core services (all `ENABLE_NOW`) plus the Road
+Conditions/KanDrive companion pairs:
+
+```python
+"isadoraair-sync-road-conditions.service": INSTALL_ONLY,
+"isadoraair-sync-road-conditions.timer":   ENABLE_NOW,
+"isadoraair-generate-road-condition-audio.service": INSTALL_ONLY,
+"isadoraair-generate-road-condition-audio.timer":   ENABLE_NOW,
+```
+
+Both units of a pair are always installed in the same first pass, before
+any activation happens at all — by the time an `ENABLE_NOW` `.timer` is
+actually enabled, its paired `INSTALL_ONLY` `.service` is already on
+disk (and already covered by the one daemon-reload), regardless of which
+name a manifest happens to list first. A future companion unit requires
+an explicit `MANAGED_UNIT_POLICIES` entry — a real, reviewable protected-
+runtime code change — never an inferred default.
+
+### Promoting a pre-existing template into the required contract
+
+`_cross_check()`'s predecessor-diff match (above) used to assume every
+`systemd_units_new_required`/`_new_optional` unit was genuinely **added**
+in that release's own diff. That is too narrow for a unit that has been
+tracked in `deploy/` for a long time (in Road Conditions' real case,
+since before the release-manifest system existed at all) and is only now
+being deliberately promoted into the managed/required deployment
+contract — declaring that intent must never require a fake content edit
+just to make the predecessor diff show an "A".
+
+The revised invariant: each unit declared in
+`systemd_units_new_required`/`_new_optional` is either
+
+- **NEW FILE** — absent from the immediate predecessor commit — must
+  appear as an actual `A` (added) in the predecessor diff, exactly as
+  before; or
+- **PROMOTED EXISTING FILE** — already present, byte-identical, at the
+  immediate predecessor commit — permitted **only** when the unit name
+  is already in `MANAGED_UNIT_POLICIES`/`KNOWN_MANAGED_UNITS`, so an
+  unrelated pre-existing file can never be smuggled into the managed
+  contract merely by naming it in a manifest. A "promoted" unit that was
+  actually modified in this release (its bytes differ from the
+  predecessor) still fails closed — it lands in the actual-changed set,
+  which is compared only against `systemd_units_changed`, so declaring
+  it solely as new-required/new-optional while its bytes differ is
+  exactly the undeclared-modification case this check exists to catch.
+
+Everything else about the predecessor-diff check is unchanged and still
+fails closed: an actually-added unit omitted from every intent list, an
+actually-modified unit omitted from `systemd_units_changed`, an
+actually-removed unit omitted from `systemd_units_removed_or_renamed`,
+and a unit appearing in more than one intent list at once (rejected by
+the existing manifest-parsing duplicate check).
+
 ## Station-config trust contract
 
 The architecture report originally proposed an application-owned station file
@@ -540,7 +622,11 @@ packages, and never replaces itself.
 The daemon owns a Unix socket under `/run/isadoraair-updater/`, a systemd-created
 root-owned runtime directory. `SO_PEERCRED` must identify root or the configured
 application UID/GID. The protocol is one bounded UTF-8 JSON object with an exact
-field set and protocol version 3. Exactly seven actions exist:
+field set and protocol version 3 (`isadoraair_updater.PROTOCOL_VERSION` —
+the client<->daemon wire protocol; kept a deliberately DIFFERENT number
+from `MANIFEST_PROTOCOL_VERSION` below, which is a different boundary
+entirely — see "Release-manifest protocol version" further down).
+Exactly seven actions exist:
 
 - `PING`;
 - `START_UPDATE` with canonical UUID, `r####` target, and SHA-256 plan
@@ -787,6 +873,45 @@ and validates the result. ALSA persistence accepts no input and constructs only
 `/usr/sbin/alsactl store`. Hardware live mixer saves remain successful when
 persistence submission fails, with a warning/SystemEvent. Hardware/RBDS admin
 saves likewise persist their DB change if the broker is unavailable.
+
+## Release-manifest protocol version
+
+A second, independent "protocol version" exists alongside the daemon's
+own socket wire protocol (see "Narrow IPC and durable root state"
+above) — each release manifest's `minimum_updater_protocol_version`,
+compared against the protected runtime's own
+`isadoraair_updater.MANIFEST_PROTOCOL_VERSION` and the application
+planner's `updatecenter.manifest.UPDATER_PROTOCOL_VERSION` (the two are
+maintained as one number, bumped together). A manifest declaring a
+number higher than what THIS code understands is refused —
+`UPDATER_UPGRADE_REQUIRED` from `manual_blockers()`, the
+`UNSUPPORTED_PROTOCOL` check from `validate_manifest_dict` — never
+best-effort interpreted.
+
+Bumped only when a manifest field's *execution meaning* changes in a
+way old planning/execution code could misinterpret — never for "a new
+optional field was added." r0022 bumps it 3 → 4:
+`systemd_units_new_required` stopped meaning "always `enable --now`"
+and started meaning "install always; activate per
+`MANAGED_UNIT_POLICIES`" (see "Managed-unit activation policy" above).
+An updater still running protocol-3 code that fetched an r0022+ release
+(as it would immediately after `fetch()`, before its own manual-
+bootstrap upgrade) must refuse to plan it with `UPDATER_UPGRADE_
+REQUIRED`, not silently `enable --now` a companion `.service` that was
+only ever meant to be installed.
+
+Deliberately a **different number** from the daemon's own wire protocol
+(still 3, unchanged by r0022) — the two cover genuinely different
+boundaries (an operator's CLI/Django client talking to this daemon,
+versus this daemon's own interpretation of a release author's manifest)
+and must be free to change independently; conflating them once already
+broke every existing socket client during this feature's own
+development (see `test_phase_b_protocol.py`'s
+`test_runtime_v4_keeps_wire_protocol_v3`, and
+`isadoraair_updater/__init__.py`'s own comments on both constants). The
+manifest schema itself is unchanged by this bump — no executable or
+activation-policy field was added to it; activation policy is, and
+remains, compiled protected-runtime code, never manifest-controlled.
 
 ## r0004 manual protected-runtime bootstrap
 

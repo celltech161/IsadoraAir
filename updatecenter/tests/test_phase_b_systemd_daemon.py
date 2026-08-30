@@ -24,7 +24,10 @@ class FakeSystemRunner(CommandRunner):
 
     def run(self, argv, **kwargs):
         self.calls.append(list(argv))
-        output = b"Type=simple\nActiveState=active\nSubState=running\nResult=success\n" if "show" in argv else b""
+        output = (
+            b"Type=simple\nActiveState=active\nSubState=running\nResult=success\nLoadState=loaded\n"
+            if "show" in argv else b""
+        )
         return ProcessResult(tuple(argv), 0, output, b"")
 
 
@@ -109,6 +112,214 @@ class SystemdReconciliationTests(SimpleTestCase):
         (self.config.systemd_unit_root / "isadoraair-gunicorn.service").symlink_to("/etc/passwd")
         with self.assertRaises(SystemdError):
             self.manager.reconcile(self.source, plan(systemd_units_changed=("isadoraair-gunicorn.service",)))
+
+
+class _UnitFailingShowRunner(CommandRunner):
+    """Like FakeSystemRunner, but one named unit's `show` calls return a
+    caller-supplied bad status instead of the healthy canned one --
+    used to prove a failed load/activation verification actually fails
+    the update rather than being silently ignored."""
+
+    def __init__(self, failing_unit: str, failing_output: bytes):
+        super().__init__()
+        self.calls = []
+        self.failing_unit = failing_unit
+        self.failing_output = failing_output
+
+    def run(self, argv, **kwargs):
+        self.calls.append(list(argv))
+        if "show" in argv and self.failing_unit in argv:
+            return ProcessResult(tuple(argv), 0, self.failing_output, b"")
+        output = (
+            b"Type=simple\nActiveState=active\nSubState=running\nResult=success\nLoadState=loaded\n"
+            if "show" in argv else b""
+        )
+        return ProcessResult(tuple(argv), 0, output, b"")
+
+
+class ManagedUnitPolicyReconciliationTests(SimpleTestCase):
+    """SystemdManager.reconcile()'s activation-policy dispatch (r0022
+    work) -- ENABLE_NOW vs. INSTALL_ONLY, decided purely from
+    MANAGED_UNIT_POLICIES, never from which systemd_units_* list a
+    manifest happens to use or from the unit's own .service/.timer
+    suffix."""
+
+    SYNC_SERVICE = "isadoraair-sync-road-conditions.service"
+    SYNC_TIMER = "isadoraair-sync-road-conditions.timer"
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.config = validate_config_dict(config_dict(self.root, str(self.root / "upstream.git")), allow_local_repository=True)
+        self.source = self.root / "source"
+        (self.source / "deploy").mkdir(parents=True)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def _unit(self, name, content="[Service]\nExecStart=/bin/true\n"):
+        (self.source / "deploy" / name).write_text(content, encoding="utf-8")
+
+    # ---- install-only service ----------------------------------------
+
+    def test_install_only_service_is_installed_and_load_verified_but_never_enabled_or_started(self):
+        self._unit(self.SYNC_SERVICE)
+        runner = FakeSystemRunner()
+        manager = SystemdManager(self.config, runner, enforce_root_ownership=False)
+
+        result = manager.reconcile(self.source, plan(systemd_units_new_required=(self.SYNC_SERVICE,)))
+
+        installed = self.config.systemd_unit_root / self.SYNC_SERVICE
+        self.assertTrue(installed.exists())
+        self.assertEqual(result["installed_only"], [self.SYNC_SERVICE])
+        self.assertEqual(result["enabled"], [])
+        self.assertEqual(sum(call[-1] == "daemon-reload" for call in runner.calls), 1)
+        enable_calls = [call for call in runner.calls if "enable" in call]
+        start_calls = [call for call in runner.calls if "start" in call]
+        self.assertEqual(enable_calls, [])
+        self.assertEqual(start_calls, [])
+        # Load verification WAS performed -- a `show --property=LoadState` call for this unit.
+        show_calls = [call for call in runner.calls if "show" in call and self.SYNC_SERVICE in call]
+        self.assertEqual(len(show_calls), 1)
+        self.assertIn("--property=LoadState", show_calls[0])
+
+    def test_install_only_service_daemon_reload_only_when_bytes_changed(self):
+        self._unit(self.SYNC_SERVICE)
+        runner = FakeSystemRunner()
+        manager = SystemdManager(self.config, runner, enforce_root_ownership=False)
+        selected = plan(systemd_units_new_required=(self.SYNC_SERVICE,))
+        manager.reconcile(self.source, selected)
+        runner.calls.clear()
+
+        manager.reconcile(self.source, selected)  # identical content, second run
+
+        self.assertFalse(any(call[-1] == "daemon-reload" for call in runner.calls))
+        # Load verification still runs every reconcile -- it's cheap,
+        # read-only, and confirms the unit is STILL loaded, not merely
+        # that it was once installed.
+        self.assertTrue(any("show" in call and self.SYNC_SERVICE in call for call in runner.calls))
+
+    def test_install_only_service_failing_to_load_fails_the_update(self):
+        self._unit(self.SYNC_SERVICE)
+        runner = _UnitFailingShowRunner(self.SYNC_SERVICE, b"LoadState=not-found\n")
+        manager = SystemdManager(self.config, runner, enforce_root_ownership=False)
+        with self.assertRaises(SystemdError):
+            manager.reconcile(self.source, plan(systemd_units_new_required=(self.SYNC_SERVICE,)))
+
+    def test_install_only_service_never_produces_an_active_state_call(self):
+        # verify_unit_loaded() must query ONLY LoadState -- never
+        # ActiveState/SubState/Result, which would suggest this method
+        # cares whether the (never-started) unit is "running."
+        self._unit(self.SYNC_SERVICE)
+        runner = FakeSystemRunner()
+        manager = SystemdManager(self.config, runner, enforce_root_ownership=False)
+        manager.reconcile(self.source, plan(systemd_units_new_required=(self.SYNC_SERVICE,)))
+        show_calls = [call for call in runner.calls if "show" in call and self.SYNC_SERVICE in call]
+        self.assertEqual(len(show_calls), 1)
+        self.assertNotIn("--property=ActiveState", show_calls[0])
+
+    # ---- enable-now timer ----------------------------------------------
+
+    def test_enable_now_timer_is_installed_enabled_once_and_verified_active(self):
+        self._unit(self.SYNC_TIMER, "[Timer]\nOnUnitActiveSec=5min\n")
+        runner = FakeSystemRunner()
+        manager = SystemdManager(self.config, runner, enforce_root_ownership=False)
+
+        result = manager.reconcile(self.source, plan(systemd_units_new_required=(self.SYNC_TIMER,)))
+
+        self.assertTrue((self.config.systemd_unit_root / self.SYNC_TIMER).exists())
+        self.assertEqual(result["enabled"], [self.SYNC_TIMER])
+        self.assertEqual(result["installed_only"], [])
+        self.assertEqual(sum("enable" in call and "--now" in call and self.SYNC_TIMER in call for call in runner.calls), 1)
+        active_verify_calls = [
+            call for call in runner.calls
+            if "show" in call and self.SYNC_TIMER in call and "--property=ActiveState" in call
+        ]
+        self.assertEqual(len(active_verify_calls), 1)
+
+    def test_enable_now_timer_failure_fails_the_update(self):
+        self._unit(self.SYNC_TIMER, "[Timer]\nOnUnitActiveSec=5min\n")
+        runner = _UnitFailingShowRunner(
+            self.SYNC_TIMER, b"Type=\nActiveState=inactive\nSubState=dead\nResult=\n",
+        )
+        manager = SystemdManager(self.config, runner, enforce_root_ownership=False)
+        with self.assertRaises(SystemdError):
+            manager.reconcile(self.source, plan(systemd_units_new_required=(self.SYNC_TIMER,)))
+
+    # ---- mixed pair ------------------------------------------------------
+
+    def test_mixed_pair_both_installed_before_activation_one_reload_service_never_run_timer_enabled(self):
+        self._unit(self.SYNC_SERVICE)
+        self._unit(self.SYNC_TIMER, "[Timer]\nOnUnitActiveSec=5min\n")
+        runner = FakeSystemRunner()
+        manager = SystemdManager(self.config, runner, enforce_root_ownership=False)
+
+        result = manager.reconcile(
+            self.source, plan(systemd_units_new_required=(self.SYNC_SERVICE, self.SYNC_TIMER)),
+        )
+
+        # Both installed.
+        self.assertTrue((self.config.systemd_unit_root / self.SYNC_SERVICE).exists())
+        self.assertTrue((self.config.systemd_unit_root / self.SYNC_TIMER).exists())
+        # Exactly one daemon-reload for the whole pair.
+        self.assertEqual(sum(call[-1] == "daemon-reload" for call in runner.calls), 1)
+        # The companion service was never enabled or started.
+        self.assertEqual(result["installed_only"], [self.SYNC_SERVICE])
+        self.assertEqual(result["enabled"], [self.SYNC_TIMER])
+        self.assertFalse(any("enable" in call and self.SYNC_SERVICE in call for call in runner.calls))
+        self.assertFalse(any("start" in call and self.SYNC_SERVICE in call for call in runner.calls))
+        # The install pass for BOTH units happens before any enable
+        # call at all -- the timer's paired service is already on disk
+        # (and already daemon-reloaded) by the time it's enabled.
+        first_enable_index = next(i for i, call in enumerate(runner.calls) if "enable" in call)
+        reload_index = next(i for i, call in enumerate(runner.calls) if call[-1] == "daemon-reload")
+        self.assertLess(reload_index, first_enable_index)
+
+    def test_mixed_pair_reversed_declaration_order_still_installs_both_before_activating(self):
+        # The manifest/plan lists the timer BEFORE the service -- must
+        # not matter, since install always happens for every unit
+        # first, in one pass, before any activation at all.
+        self._unit(self.SYNC_SERVICE)
+        self._unit(self.SYNC_TIMER, "[Timer]\nOnUnitActiveSec=5min\n")
+        runner = FakeSystemRunner()
+        manager = SystemdManager(self.config, runner, enforce_root_ownership=False)
+
+        result = manager.reconcile(
+            self.source, plan(systemd_units_new_required=(self.SYNC_TIMER, self.SYNC_SERVICE)),
+        )
+        self.assertEqual(set(result["enabled"]), {self.SYNC_TIMER})
+        self.assertEqual(set(result["installed_only"]), {self.SYNC_SERVICE})
+        self.assertTrue((self.config.systemd_unit_root / self.SYNC_SERVICE).exists())
+
+    # ---- existing core-service regression --------------------------------
+
+    def test_existing_core_service_required_behavior_is_unchanged(self):
+        self._unit("isadoraair-gunicorn.service")
+        runner = FakeSystemRunner()
+        manager = SystemdManager(self.config, runner, enforce_root_ownership=False)
+
+        result = manager.reconcile(self.source, plan(systemd_units_new_required=("isadoraair-gunicorn.service",)))
+
+        self.assertEqual(result["enabled"], ["isadoraair-gunicorn.service"])
+        self.assertEqual(result["installed_only"], [])
+        self.assertEqual(
+            sum("enable" in call and "--now" in call and "isadoraair-gunicorn.service" in call for call in runner.calls),
+            1,
+        )
+
+    def test_unknown_unit_is_still_refused_before_any_policy_lookup(self):
+        self._unit("evil.service")
+        runner = FakeSystemRunner()
+        manager = SystemdManager(self.config, runner, enforce_root_ownership=False)
+        with self.assertRaises(SystemdError):
+            manager.reconcile(self.source, plan(systemd_units_new_required=("evil.service",)))
+
+    def test_unknown_timer_is_refused(self):
+        self._unit("evil.timer", "[Timer]\nOnUnitActiveSec=5min\n")
+        runner = FakeSystemRunner()
+        manager = SystemdManager(self.config, runner, enforce_root_ownership=False)
+        with self.assertRaises(SystemdError):
+            manager.reconcile(self.source, plan(systemd_units_new_required=("evil.timer",)))
 
 
 class _NeverExecutor:

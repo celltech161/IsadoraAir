@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 import dataclasses
+import enum
 import hashlib
 import json
 from pathlib import Path, PurePosixPath
 import re
 
-from . import PROTOCOL_VERSION
+from . import MANIFEST_PROTOCOL_VERSION
 from .process import CommandRunner, ProcessResult
 from .security import assert_root_protected, assert_root_protected_parents
 
@@ -26,7 +27,47 @@ RESTART_ORDER = (
     "isadoraair-gunicorn", "isadoraair-engine", "isadoraair-monitoring",
     "isadoraair-encoders", "isadoraair-rbds",
 )
-KNOWN_MANAGED_UNITS = frozenset(f"{name}.service" for name in CORE_SERVICES)
+
+
+class UnitActivationPolicy(enum.Enum):
+    """Closed, protected-runtime-compiled activation behavior for one
+    managed unit -- never inferred from a manifest, never inferred
+    from the unit's own name/suffix (a .timer is not assumed
+    ENABLE_NOW and a .service is not assumed INSTALL_ONLY; each name
+    below is listed explicitly). See SystemdManager.reconcile() in
+    systemd.py for exactly what each value does."""
+
+    #: Installed, then `systemctl enable --now`d and verified active/
+    #: healthy -- the only behavior a "required" unit had before this
+    #: policy existed (still exactly how the five core services work).
+    ENABLE_NOW = "enable_now"
+
+    #: Installed and daemon-reloaded, but NEVER enabled and NEVER
+    #: started by this updater -- for a oneshot .service that only
+    #: exists to be triggered by its own paired .timer (which IS
+    #: ENABLE_NOW). Verified only for successful LoadState=loaded,
+    #: never executed.
+    INSTALL_ONLY = "install_only"
+
+
+# The single closed source of truth for both "which units may this
+# updater ever touch" (KNOWN_MANAGED_UNITS, derived below so the two
+# can never drift) and "what does touching this specific one actually
+# do" (see UnitActivationPolicy above). Adding a unit here is a real,
+# reviewable protected-runtime code change -- never inferred from a
+# manifest, a filename pattern, or which of the four systemd_units_*
+# lists a manifest happens to put it in.
+MANAGED_UNIT_POLICIES: dict[str, "UnitActivationPolicy"] = {
+    **{f"{name}.service": UnitActivationPolicy.ENABLE_NOW for name in CORE_SERVICES},
+    # Timer-triggered Road Conditions/KanDrive companions (r0022+) --
+    # each .service is oneshot and exists only to be fired by its own
+    # paired .timer; only the .timer is ever enabled/started here.
+    "isadoraair-sync-road-conditions.service": UnitActivationPolicy.INSTALL_ONLY,
+    "isadoraair-sync-road-conditions.timer": UnitActivationPolicy.ENABLE_NOW,
+    "isadoraair-generate-road-condition-audio.service": UnitActivationPolicy.INSTALL_ONLY,
+    "isadoraair-generate-road-condition-audio.timer": UnitActivationPolicy.ENABLE_NOW,
+}
+KNOWN_MANAGED_UNITS = frozenset(MANAGED_UNIT_POLICIES)
 KNOWN_FIELDS = frozenset({
     "schema_version", "release_id", "previous_release_id", "bootstrap_commit",
     "minimum_updater_protocol_version", "summary", "migrations_required",
@@ -493,9 +534,39 @@ def _cross_check(repository: TrustedRepository, previous_commit: str, entry: Cha
             continue
         destination = {"A": actual_added, "D": actual_removed}.get(status, actual_changed)
         destination.add(pure.name)
+
+    # A declared systemd_units_new_required/new_optional unit is
+    # either NEW FILE (genuinely absent from previous_commit -- must
+    # appear as an actual "A" in the predecessor diff below, exactly
+    # as always) or PROMOTED EXISTING FILE (already present at
+    # previous_commit -- an already-tracked template a release
+    # deliberately elevates into the managed/required deployment
+    # contract, with no content change of its own). Promotion is NEVER
+    # inferred from "it just wasn't in the diff" alone -- it is only
+    # permitted for a unit this protected runtime already recognizes
+    # by exact name (MANAGED_UNIT_POLICIES/KNOWN_MANAGED_UNITS), so an
+    # unrelated pre-existing file can never be smuggled into the
+    # managed contract merely by naming it in a manifest. A promoted
+    # unit that WAS actually modified in this release still fails
+    # below (it lands in actual_changed, which is compared only against
+    # systemd_units_changed -- declaring it solely as new_required/
+    # new_optional while its bytes differ is exactly the undeclared-
+    # modification case this check exists to catch).
     declared_added = set(manifest.systemd_units_new_required) | set(manifest.systemd_units_new_optional)
+    promoted = {
+        unit for unit in declared_added
+        if repository.path_exists(previous_commit, f"deploy/{unit}")
+    }
+    unknown_promotions = promoted - KNOWN_MANAGED_UNITS
+    if unknown_promotions:
+        raise ReleaseError(
+            f"{manifest.release_id}: promoted unit(s) {sorted(unknown_promotions)!r} are not in the "
+            "protected managed-unit policy -- promotion of a pre-existing template is only "
+            "permitted for a unit this protected updater already recognizes by exact name"
+        )
+    genuinely_new = declared_added - promoted
     if (actual_changed != set(manifest.systemd_units_changed)
-            or actual_added != declared_added
+            or actual_added != genuinely_new
             or actual_removed != set(manifest.systemd_units_removed_or_renamed)):
         raise ReleaseError(f"{manifest.release_id}: systemd unit intent does not match the predecessor diff")
 
@@ -575,7 +646,7 @@ def derive_plan(repository: TrustedRepository, trusted_tip: str, live_head: str,
 
 def manual_blockers(plan: TrustedPlan) -> tuple[str, ...]:
     blockers = []
-    if plan.minimum_updater_protocol_version > PROTOCOL_VERSION:
+    if plan.minimum_updater_protocol_version > MANIFEST_PROTOCOL_VERSION:
         blockers.append("UPDATER_UPGRADE_REQUIRED")
     if plan.manual_bootstrap_required:
         blockers.append("MANUAL_BOOTSTRAP_REQUIRED")

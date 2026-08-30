@@ -8,7 +8,7 @@ import stat
 
 from .config import StationConfig
 from .process import CommandRunner
-from .release import KNOWN_MANAGED_UNITS, RESTART_ORDER, TrustedPlan
+from .release import KNOWN_MANAGED_UNITS, MANAGED_UNIT_POLICIES, RESTART_ORDER, TrustedPlan, UnitActivationPolicy
 from .security import assert_root_protected, assert_root_protected_parents
 
 
@@ -91,17 +91,55 @@ class SystemdManager:
         return True
 
     def reconcile(self, source_root: Path, plan: TrustedPlan) -> dict:
+        """Install every changed/newly-required unit from the trusted
+        staged target, daemon-reload at most once, then activate each
+        newly-required unit exactly per its closed, protected-runtime-
+        compiled MANAGED_UNIT_POLICIES entry -- never per manifest
+        text, never inferred from the unit's own .service/.timer
+        suffix. ENABLE_NOW units (the five core services, and each
+        companion .timer) are `enable --now`d and verified
+        active/healthy, exactly the only behavior a required unit had
+        before this policy existed. INSTALL_ONLY units (a companion
+        oneshot .service meant only to be triggered by its own paired
+        ENABLE_NOW .timer) are installed and daemon-reloaded like any
+        other required unit, but this method never enables or starts
+        them -- only confirms systemd successfully parsed the just-
+        installed unit file (see verify_unit_loaded()).
+
+        Both units of a pair are always installed in the SAME first
+        pass, before any activation happens at all -- so by the time
+        an ENABLE_NOW .timer is actually enabled, its paired
+        INSTALL_ONLY .service is already on disk and already covered
+        by the one daemon-reload above, regardless of which name
+        happens to come first in plan.systemd_units_new_required."""
         changed = []
         for unit in (*plan.systemd_units_changed, *plan.systemd_units_new_required):
             if self._install_one(source_root, unit):
                 changed.append(unit)
         if changed:
             self._systemctl(["daemon-reload"])
+        enabled = []
+        installed_only = []
         for unit in plan.systemd_units_new_required:
-            self._systemctl(["enable", "--now", unit], timeout=120)
-            self.verify_unit(unit)
+            policy = MANAGED_UNIT_POLICIES.get(unit)
+            if policy is None:
+                # _install_one() above already refused any unit outside
+                # KNOWN_MANAGED_UNITS (== MANAGED_UNIT_POLICIES.keys()) --
+                # unreachable in practice. Kept as a hard fail-closed
+                # guard against a future refactor silently decoupling
+                # the install allowlist from the activation policy map.
+                raise SystemdError(f"unit {unit!r} has no managed-unit activation policy")
+            if policy is UnitActivationPolicy.ENABLE_NOW:
+                self._systemctl(["enable", "--now", unit], timeout=120)
+                self.verify_unit(unit)
+                enabled.append(unit)
+            else:
+                self.verify_unit_loaded(unit)
+                installed_only.append(unit)
         return {
             "changed": changed,
+            "enabled": enabled,
+            "installed_only": installed_only,
             "optional_report_only": list(plan.systemd_units_new_optional),
             "daemon_reload": bool(changed),
         }
@@ -149,6 +187,29 @@ class SystemdManager:
             "--property=SubState", "--property=Result",
         ])
         self._validate_unit_status(unit, result)
+
+    def verify_unit_loaded(self, unit: str):
+        """The INSTALL_ONLY counterpart to verify_unit() above -- for a
+        unit this updater deliberately never enables or starts (a
+        oneshot .service meant only to be triggered by its own paired
+        .timer), this is the narrowest available confirmation that the
+        just-installed template is actually usable: systemd parsed it
+        successfully after the daemon-reload already run by
+        reconcile(). `systemctl show --property=LoadState` is a pure,
+        fixed-argv, read-only introspection query -- the same class of
+        command verify_unit() already uses -- and never starts, stops,
+        or otherwise executes the unit."""
+        if unit not in KNOWN_MANAGED_UNITS:
+            raise SystemdError("cannot verify an unknown unit")
+        result = self._systemctl(["show", unit, "--property=LoadState"])
+        values = {}
+        for line in result.stdout.decode("utf-8", "replace").splitlines():
+            key, separator, value = line.partition("=")
+            if separator:
+                values[key] = value
+        load_state = values.get("LoadState", "")
+        if load_state != "loaded":
+            raise SystemdError(f"unit {unit} did not load successfully: LoadState={load_state!r}")
 
     @staticmethod
     def _validate_unit_status(unit: str, result):
