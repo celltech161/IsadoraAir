@@ -88,7 +88,7 @@ def launch_worker(slot_path: Path, entrypoint: str, *, config_path: Path,
                   extra_env: dict[str, str] | None = None,
                   active_identity: ActiveIdentity | None = None,
                   candidate_identity: CandidateIdentity | None = None) -> TrackedChild:
-    """Runs exactly: /usr/bin/python3 -I <resolved-entrypoint> --config
+    """Runs exactly: /usr/bin/python3 -I -B <resolved-entrypoint> --config
     <config_path> [--expected-slot ... --expected-generation ...
     --expected-descriptor-sha256 ... [--expected-job-uuid ...]]. The
     three-field form identifies a selected active A/B generation; the
@@ -96,13 +96,16 @@ def launch_worker(slot_path: Path, entrypoint: str, *, config_path: Path,
     (isolated mode) ignores PYTHONPATH/PYTHONHOME and user site-
     packages -- the candidate worker gets only what its own slot
     directory and the standard library provide, never anything this
-    supervisor process's own environment happens to have on disk. No
+    supervisor process's own environment happens to have on disk. `-B`
+    prevents root bytecode writes from mutating the already-verified signed
+    slot; an environment-only PYTHONDONTWRITEBYTECODE setting is ineffective
+    because `-I` implies `-E`. No
     shell; argv is a fixed-shape literal list, never string-joined/
     interpolated -- candidate_identity, when given, is itself a
     validated CandidateIdentity (see its own __post_init__), never a
     raw caller-supplied string appended directly."""
     entry_path = resolve_entrypoint(slot_path, entrypoint)
-    argv = [PYTHON_BINARY, "-I", str(entry_path), "--config", str(config_path)]
+    argv = [PYTHON_BINARY, "-I", "-B", str(entry_path), "--config", str(config_path)]
     if active_identity is not None and candidate_identity is not None:
         raise LaunchError("active_identity and candidate_identity are mutually exclusive")
     identity = candidate_identity if candidate_identity is not None else active_identity

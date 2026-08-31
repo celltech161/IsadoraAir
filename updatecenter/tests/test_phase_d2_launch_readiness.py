@@ -116,6 +116,26 @@ class LaunchWorkerTests(SimpleTestCase):
             time.sleep(0.02)
         self.assertEqual(child.poll(), 0)
 
+    def test_launch_never_writes_bytecode_into_verified_slot(self):
+        (self.slot_path / "worker_helper.py").write_text("VALUE = 7\n")
+        (self.slot_path / "updaterd.py").write_text(
+            "import pathlib, sys\n"
+            "sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))\n"
+            "import worker_helper\n"
+            "assert worker_helper.VALUE == 7\n"
+        )
+        child = launch_worker(
+            self.slot_path,
+            "updaterd.py",
+            config_path=self.slot_path / "config.json",
+            extra_env={"PYTHONDONTWRITEBYTECODE": "0"},
+        )
+        deadline = time.monotonic() + 5
+        while child.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertEqual(child.poll(), 0)
+        self.assertFalse((self.slot_path / "__pycache__").exists())
+
     def test_active_slot_identity_is_supplied_without_candidate_job_uuid(self):
         (self.slot_path / "updaterd.py").write_text(
             "import argparse\n"
