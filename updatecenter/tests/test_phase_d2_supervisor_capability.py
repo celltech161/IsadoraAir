@@ -53,6 +53,16 @@ class SupervisorUnitRetainsCapabilityTests(SimpleTestCase):
     def test_runs_as_root_not_isa_user(self):
         self.assertIn("User=root", self.supervisor_lines)
 
+    def test_execstart_supplies_required_worker_config(self):
+        exec_start = [
+            line for line in self.supervisor_lines if line.startswith("ExecStart=")
+        ]
+        self.assertEqual(len(exec_start), 1)
+        self.assertIn(
+            "--worker-config /etc/isadoraair/station.json",
+            exec_start[0],
+        )
+
     def test_no_capability_bounding_set_introduced(self):
         # The task's own explicit instruction: do not casually introduce
         # a CapabilityBoundingSet= restriction alongside this fix.
