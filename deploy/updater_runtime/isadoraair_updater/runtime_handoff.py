@@ -239,9 +239,15 @@ def materialize_candidate(
         except ValueError as exc:
             raise HandoffError(f"descriptor path {entry.path!r} escapes the staging directory") from exc
         destination.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
-        fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, int(entry.mode, 8))
+        declared_mode = int(entry.mode, 8)
+        fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, declared_mode)
         try:
             os.write(fd, content)
+            # The real systemd worker intentionally runs with UMask=0077.
+            # os.open() applies that umask to its creation mode, but the
+            # signed descriptor inventory is the authoritative publication
+            # mode and the independent verifier must observe it exactly.
+            os.fchmod(fd, declared_mode)
         finally:
             os.close(fd)
 

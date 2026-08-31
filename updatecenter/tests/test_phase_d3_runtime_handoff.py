@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 import tempfile
 from pathlib import Path
@@ -95,6 +96,20 @@ class MaterializeCandidateTests(SimpleTestCase):
         for path, content in self.entry_files.items():
             self.assertEqual((self.staging / path).read_bytes(), content)
         self.assertEqual(oct((self.staging / "updaterd.py").stat().st_mode & 0o777), "0o755")
+
+    def test_materialization_overrides_restrictive_service_umask(self):
+        staging = self.root / "restrictive-umask-staging"
+        staging.mkdir()
+        previous_umask = os.umask(0o077)
+        try:
+            materialize_candidate(self.repo, self.field, self.target_commit, staging)
+        finally:
+            os.umask(previous_umask)
+        self.assertEqual(oct((staging / "updaterd.py").stat().st_mode & 0o777), "0o755")
+        self.assertEqual(
+            oct((staging / "isadoraair_updater" / "__init__.py").stat().st_mode & 0o777),
+            "0o644",
+        )
 
     def test_wrong_descriptor_sha_pin_rejected(self):
         wrong_field = ProtectedRuntimeField(
