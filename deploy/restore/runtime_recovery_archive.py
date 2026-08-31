@@ -27,7 +27,7 @@ SELF_CONTAINED_CLASS = "self_contained_v3"
 LEGACY_CLASS = "legacy_non_self_contained"
 V3_FORMAT = "3.0.0"
 LEGACY_FORMAT = "2.1.0"
-COMPONENTS = frozenset({"kokoro", "piper", "native_fdkaac"})
+COMPONENTS = frozenset({"kokoro", "piper", "native_fdkaac", "protected_updater"})
 MAX_METADATA_BYTES = 1024 * 1024
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _PAYLOAD_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -93,8 +93,10 @@ def _strict_metadata(value: object) -> dict:
     if value["payload_included"]:
         if not isinstance(value["payload_id"], str) or not _PAYLOAD_ID_RE.fullmatch(value["payload_id"]):
             raise ArchiveContractError("included payload has invalid identity")
-        if value["payload_schema_version"] != 1:
+        if value["payload_schema_version"] not in (1, 2):
             raise ArchiveContractError("included payload has unsupported schema version")
+        if value["payload_schema_version"] == 2 and "protected_updater" not in included:
+            raise ArchiveContractError("payload schema 2 must include protected_updater evidence")
         if not isinstance(value["product_contract_sha256"], str) or not _SHA256_RE.fullmatch(value["product_contract_sha256"]):
             raise ArchiveContractError("included payload has invalid product-contract digest")
         if value["piper_freshness"] not in ("current", "stale", "not_checked"):
@@ -139,6 +141,9 @@ def write_metadata(args: argparse.Namespace) -> int:
     native = (status.get("components") or {}).get("native_fdkaac") or {}
     if native.get("state") == "present":
         included.add("native_fdkaac")
+    protected_updater = (status.get("components") or {}).get("protected_updater") or {}
+    if protected_updater.get("state") == "present":
+        included.add("protected_updater")
     self_contained = (
         payload_included
         and bool(required)

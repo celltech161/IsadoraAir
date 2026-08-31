@@ -642,3 +642,32 @@ invocation.
   later checkpoint.
 - **Phase 5** — an actual bare/clean-machine restore drill (original
   host and GitHub unavailable) remains later work.
+
+## Phase-D protected updater recovery extension
+
+Historical Runtime Foundation E payloads remain valid schema 1. A payload that
+claims Phase-D updater recovery uses schema 2 and adds the
+`protected_updater` component. It carries the immutable bootstrap source and
+service template, active and previous A/B generations, exact runtime state,
+station/bootstrap configuration, public trust policy and public signer keys,
+runtime descriptors, public attestation wrappers and a strict file/hash/mode
+restore manifest. Private signing keys are categorically excluded; existing
+station credentials retain the encrypted-credential policy.
+
+`isadoraair.phase_d_recovery.validate_phase_d_component` is the reusable
+validator used by payload/backup-v3 handling and fake-root restore. A backup
+claiming Phase-D capability fails closed for missing supervisor material,
+incomplete active or previous slots, inconsistent state, absent trust/key or
+attestation evidence, descriptor mismatch, unsafe filesystem objects, or an
+unsatisfied signature threshold. Schema-1 archives do not claim this capability
+and remain historical rather than being mislabeled corrupt.
+
+The offline restore path never contacts GitHub. It first revalidates all
+provenance, then materializes the bootstrap, configuration, public trust,
+runtime slots and state under a new temporary fake root. That unprivileged
+harness does not start the worker and reports `worker_started=false` and
+`readiness=not-run`: the production entry point correctly requires root and
+root-owned protected ancestry, neither of which a user-owned fake root can
+represent. A privileged disposable DISARMED worker/readiness proof, production
+ownership, systemd activation and the live capability proof remain explicit
+pre-D6 acceptance work.

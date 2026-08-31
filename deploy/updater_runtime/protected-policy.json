@@ -1,0 +1,41 @@
+{
+  "managed_units": [
+    {
+      "policy": "ENABLE_NOW",
+      "unit": "isadoraair-encoders.service"
+    },
+    {
+      "policy": "ENABLE_NOW",
+      "unit": "isadoraair-engine.service"
+    },
+    {
+      "policy": "INSTALL_ONLY",
+      "unit": "isadoraair-generate-road-condition-audio.service"
+    },
+    {
+      "policy": "ENABLE_NOW",
+      "unit": "isadoraair-generate-road-condition-audio.timer"
+    },
+    {
+      "policy": "ENABLE_NOW",
+      "unit": "isadoraair-gunicorn.service"
+    },
+    {
+      "policy": "ENABLE_NOW",
+      "unit": "isadoraair-monitoring.service"
+    },
+    {
+      "policy": "ENABLE_NOW",
+      "unit": "isadoraair-rbds.service"
+    },
+    {
+      "policy": "INSTALL_ONLY",
+      "unit": "isadoraair-sync-road-conditions.service"
+    },
+    {
+      "policy": "ENABLE_NOW",
+      "unit": "isadoraair-sync-road-conditions.timer"
+    }
+  ],
+  "schema_version": 1
+}

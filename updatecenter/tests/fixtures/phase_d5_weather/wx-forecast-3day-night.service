@@ -1,0 +1,11 @@
+[Unit]
+Description=3-day forecast announcer, night voice (Piper TTS -> WxForecast)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=@@ISA_USER@@
+Group=@@ISA_USER@@
+WorkingDirectory=@@WEATHER_ROOT@@
+ExecStart=@@WEATHER_ROOT@@/venv/bin/python @@WEATHER_ROOT@@/wx_forecast.py --mode 3day --voice auto

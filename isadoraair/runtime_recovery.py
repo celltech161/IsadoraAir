@@ -79,6 +79,8 @@ from isadoraair.runtime_requirements import (
 
 RECOVERY_MANIFEST_FILENAME = "runtime-recovery.json"
 RECOVERY_SCHEMA_VERSION = 1
+PHASE_D_RECOVERY_SCHEMA_VERSION = 2
+PROTECTED_UPDATER_SUBDIR = "protected-updater"
 TTS_BUNDLE_SUBDIR = "tts"
 NATIVE_FDKAAC_SUBDIR = "native/fdkaac"
 MAX_MANIFEST_BYTES = 1024 * 1024
@@ -423,7 +425,7 @@ class RuntimeRecoveryEvidence:
 # own top-level component). Nothing here infers policy from station
 # configuration; it only checks payload evidence against an explicit,
 # operator-supplied list.
-RECOVERY_POLICY_COMPONENT_NAMES = frozenset({"kokoro", "piper", "native_fdkaac"})
+RECOVERY_POLICY_COMPONENT_NAMES = frozenset({"kokoro", "piper", "native_fdkaac", "protected_updater"})
 
 
 def parse_recovery_policy_components(value: str | None) -> frozenset[str]:
@@ -508,6 +510,10 @@ def evaluate_recovery_policy(
         component = evidence.components.get("native_fdkaac")
         if component is None or component.state != STATE_PRESENT:
             missing.add("native_fdkaac")
+    if "protected_updater" in required:
+        component = evidence.components.get("protected_updater")
+        if component is None or component.state != STATE_PRESENT:
+            missing.add("protected_updater")
     return RecoveryPolicyEvidence(required=required, missing=frozenset(missing))
 
 
@@ -558,6 +564,7 @@ class RuntimeRecoveryPayload:
     tts_bundle: RuntimeBundle | None
     native_source: NativeSourceEvidence | None
     piper_selection_digest: str | None
+    protected_updater_evidence: dict[str, Any] | None = None
 
 
 # ---- manifest read/write --------------------------------------------------
@@ -598,6 +605,7 @@ class _ManifestShell:
     product_contract_sha256: str
     components: dict[str, dict[str, Any]]
     piper_selection_sha256: str | None
+    schema_version: int
 
 
 def _parse_manifest_shell(
@@ -625,8 +633,11 @@ def _parse_manifest_shell(
     if extra:
         raise RuntimeRecoveryError(f"runtime-recovery manifest has unsupported fields: {', '.join(extra)}")
 
-    if manifest["schema_version"] != RECOVERY_SCHEMA_VERSION:
-        raise RuntimeRecoveryError(f"runtime-recovery manifest schema_version must be {RECOVERY_SCHEMA_VERSION}")
+    schema_version = manifest["schema_version"]
+    if schema_version not in {RECOVERY_SCHEMA_VERSION, PHASE_D_RECOVERY_SCHEMA_VERSION}:
+        raise RuntimeRecoveryError(
+            "runtime-recovery manifest schema_version must be 1 (historical) or 2 (Phase-D capable)"
+        )
 
     payload_id = manifest["payload_id"]
     if not isinstance(payload_id, str) or not _PAYLOAD_ID_RE.fullmatch(payload_id):
@@ -641,7 +652,14 @@ def _parse_manifest_shell(
     components = manifest["components"]
     if not isinstance(components, dict) or not components:
         raise RuntimeRecoveryError("runtime-recovery manifest.components must be a non-empty object")
-    unknown_components = sorted(set(components) - {"tts", "native_fdkaac"})
+    if schema_version == PHASE_D_RECOVERY_SCHEMA_VERSION and "protected_updater" not in components:
+        raise RuntimeRecoveryError(
+            "runtime-recovery schema 2 must include the protected_updater component"
+        )
+    allowed_components = {"tts", "native_fdkaac"}
+    if schema_version == PHASE_D_RECOVERY_SCHEMA_VERSION:
+        allowed_components.add("protected_updater")
+    unknown_components = sorted(set(components) - allowed_components)
     if unknown_components:
         raise RuntimeRecoveryError(f"runtime-recovery manifest has unsupported components: {', '.join(unknown_components)}")
     if "tts" in components:
@@ -654,6 +672,14 @@ def _parse_manifest_shell(
         if not isinstance(entry, dict) or set(entry) != {"path"}:
             raise RuntimeRecoveryError("runtime-recovery manifest.components.native_fdkaac is malformed")
         _confined_relative_path(entry["path"], "components.native_fdkaac.path")
+    if "protected_updater" in components:
+        entry = components["protected_updater"]
+        if not isinstance(entry, dict) or set(entry) != {"path", "restore_manifest_sha256"}:
+            raise RuntimeRecoveryError("runtime-recovery manifest.components.protected_updater is malformed")
+        _confined_relative_path(entry["path"], "components.protected_updater.path")
+        digest = entry["restore_manifest_sha256"]
+        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise RuntimeRecoveryError("protected-updater restore manifest digest is invalid")
 
     piper_digest = manifest.get("piper_selection_sha256")
     if piper_digest is not None and not isinstance(piper_digest, str):
@@ -665,6 +691,7 @@ def _parse_manifest_shell(
         product_contract_sha256=declared_product_hash,
         components=components,
         piper_selection_sha256=piper_digest,
+        schema_version=schema_version,
     )
     return shell, active_product_manifest
 
@@ -697,6 +724,24 @@ def _load_native_component(shell: _ManifestShell, product_manifest: dict[str, An
     return evidence
 
 
+def _load_protected_updater_component(shell: _ManifestShell) -> dict[str, Any]:
+    from isadoraair.phase_d_recovery import MANIFEST_NAME, validate_phase_d_component
+
+    entry = shell.components["protected_updater"]
+    component_root = shell.payload_root / entry["path"]
+    manifest_path = component_root / MANIFEST_NAME
+    try:
+        digest = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    except OSError as exc:
+        raise RuntimeRecoveryError("protected-updater restore manifest is unreadable") from exc
+    if digest != entry["restore_manifest_sha256"]:
+        raise RuntimeRecoveryError("protected-updater restore manifest was modified after payload assembly")
+    try:
+        return validate_phase_d_component(component_root)
+    except ValueError as exc:
+        raise RuntimeRecoveryError(f"protected-updater recovery validation failed: {exc}") from exc
+
+
 def load_recovery_payload(
     root: str | Path, product_manifest: dict[str, Any] | None = None
 ) -> RuntimeRecoveryPayload:
@@ -714,6 +759,9 @@ def load_recovery_payload(
     native_source = (
         _load_native_component(shell, active_product_manifest) if "native_fdkaac" in shell.components else None
     )
+    protected_updater = (
+        _load_protected_updater_component(shell) if "protected_updater" in shell.components else None
+    )
     return RuntimeRecoveryPayload(
         root=shell.payload_root,
         payload_id=shell.payload_id,
@@ -721,6 +769,7 @@ def load_recovery_payload(
         tts_bundle=tts_bundle,
         native_source=native_source,
         piper_selection_digest=shell.piper_selection_sha256,
+        protected_updater_evidence=protected_updater,
     )
 
 
@@ -792,6 +841,26 @@ def validate_recovery_payload(
         components[name] = RecoveryComponentEvidence(name=name, state=STATE_PRESENT, path=path)
         if name == "tts":
             tts_components = tuple(sorted(loaded.components))
+    if "protected_updater" not in shell.components:
+        components["protected_updater"] = RecoveryComponentEvidence(
+            name="protected_updater", state=STATE_ABSENT
+        )
+    else:
+        try:
+            protected_evidence = _load_protected_updater_component(shell)
+        except RuntimeRecoveryError as exc:
+            components["protected_updater"] = RecoveryComponentEvidence(
+                name="protected_updater", state=STATE_INVALID, diagnostics=(_safe_message(exc),)
+            )
+        else:
+            components["protected_updater"] = RecoveryComponentEvidence(
+                name="protected_updater", state=STATE_PRESENT,
+                path=str(shell.payload_root / shell.components["protected_updater"]["path"]),
+                diagnostics=(
+                    f"active_generation={protected_evidence['active_generation']}",
+                    f"trust_threshold={protected_evidence['trust_threshold']}",
+                ),
+            )
 
     if current_piper_selection_digest is None:
         freshness = PiperFreshnessEvidence(checked=False, state=PIPER_FRESHNESS_NOT_CHECKED)
@@ -813,6 +882,7 @@ def validate_recovery_payload(
         components=components,
         piper_freshness=freshness,
         tts_components=tts_components,
+        schema_version=shell.schema_version,
     )
 
 
@@ -839,6 +909,68 @@ def validate_current_recovery_payload(
 
 def _safe_message(value: object) -> str:
     return " ".join(str(value).split())[:512] or "recovery payload validation failed"
+
+
+def attach_phase_d_recovery_component(
+    *, existing_payload: str | Path, protected_updater_component: str | Path,
+    output: str | Path, product_manifest: dict[str, Any] | None = None,
+) -> RuntimeRecoveryEvidence:
+    """Assemble a schema-2 payload from a validated historical payload.
+
+    This is the narrow compatibility bridge: schema-1 Foundation-E payloads
+    remain valid forever, while a payload claiming Phase-D recovery upgrades
+    explicitly to schema 2 and becomes fail-closed on the protected-updater
+    component.  The source payload/component are never modified.
+    """
+
+    from isadoraair.phase_d_recovery import MANIFEST_NAME, validate_phase_d_component
+
+    source = Path(existing_payload).absolute()
+    component = Path(protected_updater_component).absolute()
+    destination = Path(output).absolute()
+    active_product_manifest = product_manifest or load_runtime_components()
+    source_evidence = validate_recovery_payload(source, product_manifest=active_product_manifest)
+    if source_evidence.result != RESULT_PASS:
+        raise RuntimeRecoveryError("existing recovery payload is not valid")
+    try:
+        validate_phase_d_component(component)
+    except ValueError as exc:
+        raise RuntimeRecoveryError(f"protected-updater component is not valid: {exc}") from exc
+    if destination.exists():
+        raise RuntimeRecoveryError(f"output already exists -- refusing to overwrite: {destination}")
+    _assert_existing_directory(destination.parent, owner=os.geteuid())
+    staging = destination.parent / f".{destination.name}.phase-d-building-{uuid.uuid4().hex}"
+    staging.mkdir(mode=0o755)
+    try:
+        _copy_tree_verified(source, staging)
+        target_component = staging / PROTECTED_UPDATER_SUBDIR
+        if target_component.exists():
+            raise RuntimeRecoveryError("source payload already contains a protected-updater component")
+        _copy_tree_verified(component, target_component)
+        manifest = _read_manifest(staging)
+        manifest["schema_version"] = PHASE_D_RECOVERY_SCHEMA_VERSION
+        manifest["components"]["protected_updater"] = {
+            "path": PROTECTED_UPDATER_SUBDIR,
+            "restore_manifest_sha256": hashlib.sha256(
+                (target_component / MANIFEST_NAME).read_bytes()
+            ).hexdigest(),
+        }
+        _write_atomic(
+            staging / RECOVERY_MANIFEST_FILENAME,
+            json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+        )
+        _normalize_payload_modes(staging)
+        evidence = validate_recovery_payload(staging, product_manifest=active_product_manifest)
+        if evidence.result != RESULT_PASS:
+            raise RuntimeRecoveryError(
+                f"schema-2 recovery payload failed validation: {evidence.to_json()}"
+            )
+        os.rename(staging, destination)
+        _fsync_directory(destination.parent)
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    return validate_recovery_payload(destination, product_manifest=active_product_manifest)
 
 
 # ---- preparation (plan / apply) ------------------------------------------

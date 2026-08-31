@@ -945,3 +945,135 @@ suite (`test_phase_b_security.py`) both pass unchanged.
   not touch: production signer keys, `/etc/isadoraair/` install,
   `/usr/local/libexec/` install, the Phase-D systemd unit's actual
   activation, retiring the old updater, r0026/r0027.
+
+## D5 pre-bootstrap integration contract
+
+D5 implements the release-authoring and recovery substrate before any station
+is bootstrapped. It does not install or activate Phase D. The current composed
+fixtures use the real mutation gate, active/candidate signed-policy rules,
+`SystemdManager`, Django audit mirror and Unix backend transport. They do not
+yet constitute the mandatory single-process-chain acceptance run: the real
+production `updaterd.py` correctly refuses non-root execution and verifies
+UID-0-owned protected ancestry, while this host provides neither a privileged
+disposable harness nor unprivileged user namespaces. No test bypass is added to
+that security boundary. A privileged disposable run of the real supervisor,
+old worker and real candidate remains a D5 acceptance blocker. In the Weather
+authority case generation N does not recognize any of the four
+`wx-forecast-{1day,3day}-{day,night}.service` names; generation N+1 adds all
+four as `INSTALL_ONLY`. The reviewed templates differ only by
+`--voice day/night` becoming `--voice auto`. No timer changes, service starts,
+enables, restarts, migration, or checkout advancement occur before the durable
+`runtime_activation_accepted` milestone.
+
+The D5 release tool is
+`deploy/updater_bootstrap/tools/sign_release_bundle.py`. The safe workflow is:
+
+1. Generate canonical generation-1 policy from the compiled D0 authority.
+2. Build the descriptor from the closed protected-runtime source inventory.
+3. Review the source diff, policy, descriptor and exact attestation statement.
+4. Sign the statement with an explicitly named private key. The tool invokes
+   only `/usr/bin/openssl` with fixed argv, never a shell or caller command.
+5. Verify each signature against its explicitly named public key.
+6. Run `manage.py validate_protected_runtime_release` with a public trust
+   fixture and predecessor facts before sealing the release.
+
+The private key is never inferred, logged, placed in the repository or copied
+to a station. Symlink, hard-linked, group/world-accessible, or non-regular
+private-key paths are refused. Rebuilding unchanged input yields byte-identical
+policy, descriptor and statement bytes.
+
+### Initial signer recommendation and rotation
+
+For KOGR/WRJE's current single-operator reality, begin with **1-of-2**: one
+offline primary release key plus a separately stored recovery/rotation key.
+Signing twice with two keys controlled and stored by the same person in the
+same place does not materially add independent authorization. **2-of-2** is
+appropriate only with genuinely separate custodians and has the availability
+risk that loss of either key blocks every protected update. **2-of-3** is the
+preferred future multi-custodian posture when three real, separately controlled
+keys/custodians exist.
+
+A trust-root transition must be authorized by the currently trusted threshold,
+install the new public root, and only after an accepted transition retire the
+old root. Worker/policy evolution and rotations representable inside the
+established signed trust model require no station SSH. A change to the immutable
+supervisor's root-config/trust parser or recovery from loss of all threshold
+keys still requires a privileged bootstrap/recovery operation; D5 does not
+pretend otherwise.
+
+### Final manual bootstrap inventory (do not execute in D5)
+
+| Artifact | Class | Owner/mode target | Secret | Recovery payload |
+|---|---|---|---|---|
+| `deploy/updater_bootstrap/updater_bootstrapd.py` and `isadoraair_updater_bootstrap/*.py` | repo artifact | root:root, dirs 0755, Python 0644, entrypoint 0755 | no | yes |
+| `deploy/updater-bootstrapd.service` | repo artifact | root:root 0644 | no | yes |
+| `/etc/isadoraair/updater-bootstrap.json` | operator/root config | root:root 0600 | path policy only | yes |
+| `/etc/isadoraair/updater-trust.json` | operator/root config | root:root 0644 | public only | yes |
+| signer public PEM files | generated release artifacts | root:root 0644 | no | yes |
+| generation-1 worker tree and `protected-policy.json` | repo/generated bundle | root:root; dirs 0755, entrypoint 0755, other files 0644 | no | active slot |
+| generation-1 descriptor and public attestation wrappers | generated release artifacts | root:root 0644 | no | yes |
+| initial `runtime-state.json` | generated bootstrap state | root:root 0600 | no | yes |
+| A/B root and staging root | operator/root filesystem | root:root 0750; staging 0700 | no | reconstructed |
+| Phase-D station-path additions | operator/root config | root:root 0600 | existing credential policy | yes, encrypted where required |
+| legacy `/usr/local/libexec/isadoraair-updater` | rollback-only LKG | retain current protected ownership | no new secret | yes until retirement |
+
+Generation 1 policy is generated programmatically from
+`MANAGED_UNIT_POLICIES` and regression-tested for exact unit membership and
+identical `ENABLE_NOW`/`INSTALL_ONLY` semantics: no extra and no missing unit.
+It is not production-signed in D5.
+
+### Draft release sequence (not immutable manifests)
+
+**Future r0026 — FINAL MANUAL UPDATER BOOTSTRAP.** Remains readable by r0025,
+uses the old manifest semantics, sets `manual_bootstrap_required: true`, and
+carries the Phase-D application/planner source, immutable supervisor source and
+unit, generation-1 worker/bundle tooling and operator ceremony. It does not use
+`protected_runtime`, because r0025 cannot safely interpret that field. This is
+the last routine manual updater bridge.
+
+**Future r0027 — FIRST AUTOMATIC PROTECTED-RUNTIME UPDATE + WEATHER
+AUTHORITY.** Declares `protected_runtime`, advances the signed generation and
+policy, authorizes exactly the four Weather services as `INSTALL_ONLY`, and
+changes their reviewed templates to `--voice auto`. The entire runtime handoff,
+same-job continuation and post-acceptance service-template reconciliation runs
+through Update Center with no SSH, sudo, manual copy, updater restart, or root
+configuration change.
+
+No final `r0026.json` or `r0027.json` is created by D5.
+
+### Product promise after the final bootstrap
+
+After successful installation of the Phase-D bootstrap supervisor, ordinary
+releases that modify protected updater worker code or signed managed-unit
+policy do **not** require station-side SSH, sudo, manual file copy, manual
+updater restart, or manual root configuration changes. Exceptional privileged
+work remains limited to immutable-supervisor implementation/sandbox changes,
+trust-root loss with no authorized rotation path, catastrophic protected root
+state corruption, and OS-level recovery.
+
+### Capability live-proof runbook (D6, not D5)
+
+1. Record the supervisor unit and process identity and confirm
+   `NoNewPrivileges=yes`, `AmbientCapabilities=cap_setuid,cap_setgid`.
+2. Submit a synthetic signed no-production-mutation handoff through the normal
+   supervisor socket; never invoke a caller-supplied command.
+3. Record supervisor, protected worker and final `ISA_USER` PIDs from durable
+   readiness/job evidence.
+4. Prove the supervisor-spawned worker successfully traversed the fixed
+   `runuser` privilege-drop path.
+5. Read `/proc/<ISA_USER-pid>/status` and require `CapPrm`, `CapEff` and
+   `CapAmb` all equal `0000000000000000`.
+6. Fail acceptance if PID identity, ancestry, UID/GID, readiness, or any zero
+   capability assertion cannot be established. Never weaken the unit sandbox
+   to make the proof pass.
+
+### Observation and rollback after D0
+
+After bootstrap, require the supervisor active, generation 1 worker ready,
+ordinary Update Center planning/status healthy, no job ambiguity, and no
+production feature change caused merely by D0. Retain the legacy protected
+updater as rollback-only material. Retire it only after r0027 succeeds through
+the automated path, all four Weather units are installed-only with no timer or
+restart side effects, A/B rollback evidence is intact, backup-v3 contains and
+validates Phase D, an offline fake-root restore succeeds, and the observation
+window has no supervisor restart/readiness/job-continuity faults.
