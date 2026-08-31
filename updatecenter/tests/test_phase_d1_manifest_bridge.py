@@ -3,6 +3,7 @@
 constants), D1-J (the two-release final-bootstrap compatibility bridge)."""
 import json
 from pathlib import Path
+from types import SimpleNamespace
 import tempfile
 
 from django.test import SimpleTestCase
@@ -13,7 +14,8 @@ from isadoraair_updater import BOOTSTRAP_PROTOCOL_VERSION, MANIFEST_PROTOCOL_VER
 from isadoraair_updater.process import CommandRunner
 from isadoraair_updater.release import (
     ReleaseError, TrustedRepository, execution_fingerprint_payload, fingerprint,
-    parse_manifest, protected_runtime_fingerprint_payload,
+    _previous_protected_runtime_generation, parse_manifest,
+    protected_runtime_fingerprint_payload,
 )
 
 from protected_bootstrap.manifest_field import ProtectedRuntimeFieldError, parse_protected_runtime_field
@@ -313,6 +315,54 @@ class FinalBootstrapCompatibilityBridgeTests(SimpleTestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
+
+    @staticmethod
+    def _chain_entry(*, generation=None, manual=False, commit="commit"):
+        protected_runtime = (
+            None if generation is None else SimpleNamespace(generation=generation)
+        )
+        return SimpleNamespace(
+            commit=commit,
+            manifest=SimpleNamespace(
+                manual_bootstrap_required=manual,
+                protected_runtime=protected_runtime,
+            ),
+        )
+
+    def test_manual_bootstrap_policy_bridges_to_generation_two(self):
+        repository = SimpleNamespace(path_exists=lambda commit, path: (
+            commit == "bridge" and path == "deploy/updater_runtime/protected-policy.json"
+        ))
+        chain = [
+            self._chain_entry(manual=True, commit="bridge"),
+            self._chain_entry(generation=2, commit="successor"),
+        ]
+        self.assertEqual(
+            _previous_protected_runtime_generation(repository, chain, 1),
+            1,
+        )
+
+    def test_manual_release_without_phase_d_policy_does_not_bridge(self):
+        repository = SimpleNamespace(path_exists=lambda _commit, _path: False)
+        chain = [
+            self._chain_entry(manual=True, commit="ordinary-manual"),
+            self._chain_entry(generation=2, commit="successor"),
+        ]
+        self.assertIsNone(
+            _previous_protected_runtime_generation(repository, chain, 1)
+        )
+
+    def test_declared_generation_takes_precedence_over_manual_bridge(self):
+        repository = SimpleNamespace(path_exists=lambda _commit, _path: True)
+        chain = [
+            self._chain_entry(generation=7, commit="declared"),
+            self._chain_entry(manual=True, commit="bridge"),
+            self._chain_entry(generation=8, commit="successor"),
+        ]
+        self.assertEqual(
+            _previous_protected_runtime_generation(repository, chain, 2),
+            7,
+        )
 
     def test_1_final_bootstrap_release_readable_by_pre_phase_d_schema(self):
         # The "r0026-shaped" release: manual_bootstrap_required=true,

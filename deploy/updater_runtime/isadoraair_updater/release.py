@@ -639,7 +639,9 @@ def _content(repository: TrustedRepository, commit: str, path: str) -> bytes | N
     return content
 
 
-def _previous_protected_runtime_generation(chain: list[ChainEntry], index: int) -> int | None:
+def _previous_protected_runtime_generation(
+    repository: TrustedRepository, chain: list[ChainEntry], index: int,
+) -> int | None:
     """D3: the most recent protected_runtime.generation declared by
     any release STRICTLY BEFORE `index` in the whole chain -- not just
     within the current transition window, since a station may be
@@ -650,6 +652,28 @@ def _previous_protected_runtime_generation(chain: list[ChainEntry], index: int) 
     for candidate in reversed(chain[:index]):
         if candidate.manifest.protected_runtime is not None:
             return candidate.manifest.protected_runtime.generation
+
+    # D5.1: the final pre-Phase-D release is intentionally installed by
+    # an operator rather than activated from a protected_runtime
+    # declaration. Its manifest therefore has to remain readable by
+    # the old schema (manual_bootstrap_required=true and no new field),
+    # even though that manual procedure installs generation 1. Let
+    # only the IMMEDIATE successor observe that one-generation bridge,
+    # and only when the predecessor really carries the Phase-D policy
+    # artifact. Any older declared generation above still wins, and
+    # ordinary first declarations continue to be required to start at
+    # generation 1.
+    if index:
+        predecessor = chain[index - 1]
+        if (
+            predecessor.manifest.manual_bootstrap_required
+            and predecessor.manifest.protected_runtime is None
+            and repository.path_exists(
+                predecessor.commit,
+                "deploy/updater_runtime/protected-policy.json",
+            )
+        ):
+            return 1
     return None
 
 
@@ -701,7 +725,7 @@ def _cross_check(repository: TrustedRepository, previous_commit: str, entry: Cha
         phase_d_active=True,
         runtime_paths_changed=bool(protected_runtime_changes) and not using_manual_valve_only,
         protected_runtime_field=manifest.protected_runtime,
-        previous_generation=_previous_protected_runtime_generation(chain, entry.index),
+        previous_generation=_previous_protected_runtime_generation(repository, chain, entry.index),
         current_bootstrap_protocol_version=BOOTSTRAP_PROTOCOL_VERSION,
         current_wire_protocol_version=PROTOCOL_VERSION,
     )
