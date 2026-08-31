@@ -11,12 +11,13 @@ import struct
 import threading
 import uuid
 
-from . import PROTOCOL_VERSION, RUNTIME_VERSION
+from . import BOOTSTRAP_PROTOCOL_VERSION, PROTOCOL_VERSION, RUNTIME_VERSION
 from .config import StationConfig
 from .executor import Executor
 from .jobs import JobError, JobStore
 from .process import CommandRunner
 from .protocol import MAX_REQUEST_BYTES, ProtocolError, decode_request, encode_response
+from .runtime_handoff import MUTATION_GATE_MILESTONE, SAFE_YIELD_MILESTONE
 from .security import assert_root_protected_parents
 
 
@@ -53,31 +54,46 @@ class UpdaterDaemon:
     def __init__(self, config: StationConfig, *, store: JobStore | None = None,
                  runner: CommandRunner | None = None, executor: Executor | None = None,
                  authorized_uids: set[int] | None = None, authorized_gids: set[int] | None = None,
+                 expected_slot: str | None = None,
                  expected_handoff_generation: int | None = None,
-                 expected_handoff_descriptor_sha256: str | None = None):
+                 expected_handoff_descriptor_sha256: str | None = None,
+                 expected_resumable_job_uuid: str | None = None,
+                 supervisor_client: object | None = None):
         self.config = config
         self.runner = runner or CommandRunner()
         self._protected_runtime_valid = _validate_privilege_drop(
             config.application_user, self.runner,
         )
-        self.store = store or JobStore(config.jobs_root, config.logs_root)
-        self.executor = executor or Executor(config, self.store, self.runner)
-        # Update Center Phase D, D3-H: BOTH None (every ordinary daemon
-        # startup, including every station before Phase D) means this
-        # daemon has no reason to believe it is a candidate resuming a
-        # handoff -- recover_jobs() below falls back to its own
-        # original, unchanged "at most one active job" rule. Both
+        # Update Center Phase D, D3-H/D4-B: ALL FOUR None (every
+        # ordinary daemon startup, including every station before
+        # Phase D) means this daemon has no reason to believe it is a
+        # candidate resuming a handoff -- recover_jobs() below falls
+        # back to its own original, unchanged "at most one active job"
+        # rule, and no readiness report is ever sent. All four
         # supplied means the supervisor launched THIS process as a
-        # specific candidate generation -- see launch.py/updaterd.py's
-        # own future entrypoint wiring (D4) for where these values
-        # come from (the descriptor this process itself was launched
-        # from, never a value this process invents about itself).
-        if (expected_handoff_generation is None) != (expected_handoff_descriptor_sha256 is None):
+        # specific candidate for a specific slot/generation/descriptor/
+        # job -- see updaterd.py's own D4-B entrypoint wiring for where
+        # these values come from (the supervisor's own launch
+        # arguments, never a value this process invents about itself).
+        identity_fields = (expected_slot, expected_handoff_generation,
+                           expected_handoff_descriptor_sha256, expected_resumable_job_uuid)
+        if len({value is None for value in identity_fields}) != 1:
             raise DaemonError(
-                "expected_handoff_generation and expected_handoff_descriptor_sha256 must be both null or both present"
+                "expected_slot/expected_handoff_generation/expected_handoff_descriptor_sha256/"
+                "expected_resumable_job_uuid must be all null or all present"
             )
+        self.expected_slot = expected_slot
         self.expected_handoff_generation = expected_handoff_generation
         self.expected_handoff_descriptor_sha256 = expected_handoff_descriptor_sha256
+        self.expected_resumable_job_uuid = expected_resumable_job_uuid
+        self.store = store or JobStore(config.jobs_root, config.logs_root)
+        self.executor = executor or Executor(
+            config, self.store, self.runner,
+            expected_handoff_generation=expected_handoff_generation,
+            expected_handoff_descriptor_sha256=expected_handoff_descriptor_sha256,
+            expected_resumable_job_uuid=expected_resumable_job_uuid,
+        )
+        self._supervisor_client = supervisor_client
         app_uid = pwd.getpwnam(config.application_user).pw_uid
         app_gid = grp.getgrnam(config.application_group).gr_gid
         self.authorized_uids = authorized_uids if authorized_uids is not None else {0, app_uid}
@@ -105,9 +121,35 @@ class UpdaterDaemon:
             raise ProtocolError("exactly one JSON message is permitted per connection")
         return bytes(data).rstrip(b"\n")
 
+    def _shutdown_if_old_worker_just_yielded(self, result: dict) -> None:
+        """D3-F/D4-D: the OLD worker's own voluntary-yield self-exit.
+        Executor.execute() returning normally (no exception) with the
+        job still "running", SAFE_YIELD_MILESTONE present, and
+        MUTATION_GATE_MILESTONE absent is EXACTLY the signature of a
+        successful handoff yield (see executor.py's own
+        _execute_runtime_handoff) -- this process has already released
+        its JobStore lock (Executor.store.close(), same object as
+        self.store) and has nothing further to legitimately do for
+        this job (see execute()'s own three-way branch: THIS process's
+        own Executor has expected_handoff_generation=None, so even a
+        stray re-entry could never progress the job further). The
+        daemon therefore stops its own accept loop -- serve_forever()
+        returns, and the entrypoint script (updaterd.py) exits the
+        process, exactly matching D3-F's "old worker ... terminates or
+        enters a state where it cannot mutate the job." An ORDINARY
+        completed job (state succeeded/failed/manual_intervention_
+        required, or a non-protected-runtime job) never matches this
+        condition and never triggers a shutdown."""
+        if not isinstance(result, dict) or result.get("state") != "running":
+            return
+        milestones = set(result.get("milestones", []))
+        if SAFE_YIELD_MILESTONE in milestones and MUTATION_GATE_MILESTONE not in milestones:
+            self.stop()
+
     def _run_worker(self, job_id: str):
         try:
-            self.executor.execute(job_id)
+            result = self.executor.execute(job_id)
+            self._shutdown_if_old_worker_just_yielded(result)
         except Exception as exc:
             # Never strand an accepted job as active because of an unexpected
             # implementation failure. Avoid logging exception text here: an
@@ -193,6 +235,53 @@ class UpdaterDaemon:
             return True
         except Exception:
             return False
+
+    def _get_supervisor_client(self):
+        if self._supervisor_client is not None:
+            return self._supervisor_client
+        activation_socket = self.config.phase_d_supervisor_activation_socket
+        if activation_socket is None:
+            return None
+        from .supervisor_client import SupervisorClient
+        return SupervisorClient(activation_socket)
+
+    def report_candidate_readiness(self) -> None:
+        """D4-B/D4-C: the real candidate readiness handshake -- called
+        once, from serve_forever(), only when this daemon was
+        constructed with a full expected-candidate identity. Reports
+        every fact D4-C requires (slot, generation, descriptor SHA,
+        bootstrap protocol, wire protocols, config parsed, privilege-
+        drop self-check, job-store lock, worker-socket bound, trusted
+        repository usable, resumable job UUID) -- the supervisor
+        independently checks every one against its own activation
+        transaction (ipc_server._handle_report_readiness); this
+        method's own report is evidence, never authorization. Mere
+        process existence is never readiness -- every fact reported
+        here reflects something this method has ALREADY verified by
+        the time it is called (config parsed and privilege-drop are
+        proven by __init__ succeeding at all; job_store_ready by
+        self.store already holding its exclusive lock; worker_socket_
+        bound by _prepare_socket() having already succeeded, checked
+        by the caller's own ordering -- see serve_forever())."""
+        if self.expected_slot is None:
+            return
+        client = self._get_supervisor_client()
+        if client is None:
+            return
+        client.report_readiness(
+            transaction_id=self.expected_resumable_job_uuid,
+            candidate_slot=self.expected_slot,
+            candidate_generation=self.expected_handoff_generation,
+            candidate_descriptor_sha256=self.expected_handoff_descriptor_sha256,
+            bootstrap_protocol_version=BOOTSTRAP_PROTOCOL_VERSION,
+            supported_wire_protocols=(PROTOCOL_VERSION,),
+            config_parsed=True,
+            privilege_drop_self_check_passed=self._protected_runtime_valid,
+            job_store_ready=self.store._lock_handle is not None,
+            worker_socket_bound=self._socket is not None,
+            trusted_repository_usable=self._trusted_repository_ready(),
+            resumable_job_uuid=self.expected_resumable_job_uuid,
+        )
 
     def _dispatch(self, request):
         if request.action == "PING":
@@ -370,6 +459,7 @@ class UpdaterDaemon:
     def serve_forever(self):
         self._socket = self._prepare_socket()
         self.recover_jobs()
+        self.report_candidate_readiness()
         while not self._stop.is_set():
             try:
                 connection, _address = self._socket.accept()

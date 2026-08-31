@@ -36,7 +36,10 @@ from .protocol import (
 from .security import assert_root_protected_parents
 from .slots import Slot, SlotLayout
 from .state import IndeterminateStateWriteError, RuntimeState, StateError, read_runtime_state, write_runtime_state_atomically
-from .supervisor import SupervisorError, begin_transaction, mark_candidate_verified, request_activation
+from .supervisor import (
+    SupervisorError, begin_transaction, commit_transaction, mark_candidate_ready,
+    mark_candidate_starting, mark_candidate_verified, request_activation,
+)
 from .trust import SignatureAssertion, TrustPolicy
 from .verification import verify_candidate_bundle
 
@@ -244,6 +247,81 @@ class IPCServer:
             self._persist(requested_state)
             return self._status_payload()
 
+    def begin_candidate_launch(self) -> None:
+        """D4-A: called by SupervisorDaemon (same process, same
+        object -- never over IPC, since nothing external "requests"
+        this; it is the supervisor's OWN decision to actually launch
+        the candidate) at the moment it is about to exec the candidate
+        process. Advances ACTIVATION_REQUESTED -> CANDIDATE_STARTING.
+        Raises SupervisorError if the transaction is not in the
+        expected phase -- the caller (the daemon's own event loop)
+        must not call this speculatively."""
+        with self._lock:
+            self._persist(mark_candidate_starting(self.state))
+
+    def _matches_transaction(self, request) -> bool:
+        activation = self.state.activation
+        if activation is None:
+            return False
+        internal_id = self._client_transactions.get(request.transaction_id)
+        if internal_id is None or activation.transaction_id != internal_id:
+            return False
+        if request.resumable_job_uuid != request.transaction_id:
+            # By convention (supervisor_client.py's own docstring) the
+            # wire transaction_id IS the durable job UUID -- a request
+            # naming a DIFFERENT resumable_job_uuid than the
+            # transaction_id it is otherwise correlated under can never
+            # be legitimate; refuse rather than pick one.
+            return False
+        return (
+            activation.candidate_slot.value == request.candidate_slot
+            and activation.candidate_generation == request.candidate_generation
+            and activation.candidate_descriptor_sha256 == request.candidate_descriptor_sha256
+        )
+
+    def _handle_report_readiness(self, request) -> dict:
+        """D4-C: independently checks EVERY reported fact against this
+        supervisor's own already-verified activation transaction --
+        wrong slot/generation/digest/job UUID/wire compatibility all
+        fail activation (never advance to CANDIDATE_READY). A
+        candidate's own self-report is evidence, never authorization,
+        exactly like REQUEST_ACTIVATION's own worker claim."""
+        with self._lock:
+            if self.state.activation is None or self.state.activation.phase is not ActivationPhase.CANDIDATE_STARTING:
+                return {"ok": False, "error": "SupervisorError", "detail": "no candidate is currently starting"}
+            if not self._matches_transaction(request):
+                return self._fail_in_flight("reported readiness identity does not match the activation transaction")
+            if request.bootstrap_protocol_version > self.bootstrap_protocol_version:
+                return self._fail_in_flight("candidate requires a bootstrap protocol this supervisor does not understand")
+            if self.wire_protocol_version not in request.supported_wire_protocols:
+                return self._fail_in_flight("candidate does not support this supervisor's current wire protocol")
+            if not (
+                request.config_parsed and request.privilege_drop_self_check_passed
+                and request.job_store_ready and request.worker_socket_bound
+                and request.trusted_repository_usable
+            ):
+                # Alive, correctly identified, but not yet fully ready
+                # -- a legitimate, expected transient state (D2's own
+                # ALIVE_NOT_READY), never itself a failure.
+                return self._status_payload()
+            self._persist(mark_candidate_ready(self.state))
+            return self._status_payload()
+
+    def _handle_confirm_runtime_acceptance(self, request) -> dict:
+        """D4-J: the ONE action that may lead to commit_transaction().
+        Requires CANDIDATE_READY (readiness already independently
+        confirmed above) and, again, independently re-checks identity
+        -- never commits merely because a candidate process bound a
+        socket, and never commits on a second, mismatched request."""
+        with self._lock:
+            if self.state.activation is None or self.state.activation.phase is not ActivationPhase.CANDIDATE_READY:
+                return {"ok": False, "error": "SupervisorError", "detail": "no candidate is currently ready to accept"}
+            if not self._matches_transaction(request):
+                return self._fail_in_flight("reported acceptance identity does not match the activation transaction")
+            self._persist(commit_transaction(self.state))
+            del self._client_transactions[request.transaction_id]
+            return self._status_payload()
+
     def _fail_in_flight(self, detail: str) -> dict:
         from .supervisor import fail_transaction
         try:
@@ -263,6 +341,10 @@ class IPCServer:
             return self._status_payload()
         if request.action == "REQUEST_ACTIVATION":
             return self._handle_request_activation(request)
+        if request.action == "REPORT_READINESS":
+            return self._handle_report_readiness(request)
+        if request.action == "CONFIRM_RUNTIME_ACCEPTANCE":
+            return self._handle_confirm_runtime_acceptance(request)
         if request.action == "GET_ACTIVATION_STATUS":
             with self._lock:
                 internal_id = self._client_transactions.get(request.transaction_id)

@@ -44,6 +44,19 @@ _OPTIONAL_FIELDS = frozenset({
     # protected_runtime release on such a station (UNBOOTSTRAPPED_
     # SUPERVISOR, never a silent same-process best-effort attempt).
     "phase_d_supervisor_activation_socket", "phase_d_supervisor_slots_root",
+    # D4-P/D4-E: the SAME root-owned trust material the supervisor
+    # itself uses (config.py's own signer_root/trust_policy_path,
+    # BootstrapConfig) -- read-only for the worker, never a SEPARATE
+    # or worker-writable copy. Lets THIS worker independently verify a
+    # candidate bundle's signature threshold and read its policy file
+    # for D4-G's own two-stage new-unit authorization, without ever
+    # trusting the supervisor's later verification alone. Both null
+    # (the D0 bridge default) means this worker cannot independently
+    # verify anything about a candidate and must treat every
+    # protected_runtime release as requiring an already-bootstrapped
+    # supervisor for ANY progression -- never a silent best-effort
+    # skip of this check.
+    "phase_d_trust_policy_path", "phase_d_signer_root",
 })
 _FIELDS = _REQUIRED_FIELDS | _OPTIONAL_FIELDS
 _DB_FIELDS = frozenset({"name", "user", "host", "port", "pgpass_file"})
@@ -80,6 +93,8 @@ class StationConfig:
     operator_restart_units: tuple[str, ...]
     phase_d_supervisor_activation_socket: Path | None
     phase_d_supervisor_slots_root: Path | None
+    phase_d_trust_policy_path: Path | None
+    phase_d_signer_root: Path | None
 
     @property
     def application_python(self) -> Path:
@@ -231,6 +246,21 @@ def validate_config_dict(data: dict, *, allow_local_repository: bool = False) ->
     if phase_d_slots_path is not None and _is_within(phase_d_slots_path, application_root):
         raise ConfigError("phase_d_supervisor_slots_root must not overlap application_root")
 
+    phase_d_trust_policy = data.get("phase_d_trust_policy_path")
+    phase_d_signers = data.get("phase_d_signer_root")
+    if (phase_d_trust_policy is None) != (phase_d_signers is None):
+        raise ConfigError(
+            "phase_d_trust_policy_path and phase_d_signer_root must be both null or both present"
+        )
+    phase_d_trust_policy_path = None if phase_d_trust_policy is None else _absolute_path(
+        phase_d_trust_policy, "phase_d_trust_policy_path",
+    )
+    phase_d_signer_root_path = None if phase_d_signers is None else _absolute_path(
+        phase_d_signers, "phase_d_signer_root",
+    )
+    if phase_d_signer_root_path is not None and _is_within(phase_d_signer_root_path, application_root):
+        raise ConfigError("phase_d_signer_root must not overlap application_root")
+
     health_url = _plain_string(data["gunicorn_health_url"], "gunicorn_health_url", maximum=512)
     parsed_health = urlsplit(health_url)
     try:
@@ -264,6 +294,8 @@ def validate_config_dict(data: dict, *, allow_local_repository: bool = False) ->
         operator_restart_units=tuple(restart_units),
         phase_d_supervisor_activation_socket=phase_d_socket_path,
         phase_d_supervisor_slots_root=phase_d_slots_path,
+        phase_d_trust_policy_path=phase_d_trust_policy_path,
+        phase_d_signer_root=phase_d_signer_root_path,
     )
 
 

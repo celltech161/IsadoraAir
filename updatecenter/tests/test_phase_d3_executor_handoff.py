@@ -185,6 +185,18 @@ class ExecutorRuntimeHandoffEndToEndTests(SimpleTestCase):
         data["phase_d_supervisor_slots_root"] = str(self.slots_root)
         self.activation_socket = self.root / "activation.sock"
         data["phase_d_supervisor_activation_socket"] = str(self.activation_socket)
+        # D4-G/D4-P: this worker's OWN read access to the same trust
+        # material the supervisor uses -- a REAL file on disk (unlike
+        # the in-memory TrustPolicy object built further below for the
+        # IPCServer, Executor._load_phase_d_trust_policy() reads this
+        # path directly).
+        self.trust_policy_path = self.root / "trust-policy.json"
+        self.trust_policy_path.write_text(json.dumps({
+            "schema_version": 1, "signature_algorithm": "ed25519", "threshold": 1,
+            "signers": [{"id": "primary-release", "public_key_path": str(self.public_key)}],
+        }))
+        data["phase_d_trust_policy_path"] = str(self.trust_policy_path)
+        data["phase_d_signer_root"] = str(self.signer_dir)
         self.config = validate_config_dict(data, allow_local_repository=True)
         app = Path(data["application_root"])
         git(app, "init", "-b", "main")

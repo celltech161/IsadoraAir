@@ -116,3 +116,54 @@ class SupervisorClient:
 
     def get_activation_status(self, transaction_id: str) -> dict:
         return self._request({"action": "GET_ACTIVATION_STATUS", "transaction_id": transaction_id})
+
+    def report_readiness(
+        self, *, transaction_id: str, candidate_slot: str, candidate_generation: int,
+        candidate_descriptor_sha256: str, bootstrap_protocol_version: int,
+        supported_wire_protocols, config_parsed: bool, privilege_drop_self_check_passed: bool,
+        job_store_ready: bool, worker_socket_bound: bool, trusted_repository_usable: bool,
+        resumable_job_uuid: str,
+    ) -> dict:
+        """D4-C: the candidate's own real readiness handshake. Every
+        fact here is exactly what readiness.ReadinessFacts (D2) already
+        defines (plus resumable_job_uuid, D4's own addition) -- the
+        supervisor independently checks every one of these against its
+        own activation transaction before ever marking the candidate
+        ready; a candidate's own self-report is evidence, never
+        authorization (same principle as REQUEST_ACTIVATION)."""
+        return self._request({
+            "action": "REPORT_READINESS",
+            "transaction_id": transaction_id,
+            "candidate_slot": candidate_slot,
+            "candidate_generation": candidate_generation,
+            "candidate_descriptor_sha256": candidate_descriptor_sha256,
+            "bootstrap_protocol_version": bootstrap_protocol_version,
+            "supported_wire_protocols": list(supported_wire_protocols),
+            "config_parsed": config_parsed,
+            "privilege_drop_self_check_passed": privilege_drop_self_check_passed,
+            "job_store_ready": job_store_ready,
+            "worker_socket_bound": worker_socket_bound,
+            "trusted_repository_usable": trusted_repository_usable,
+            "resumable_job_uuid": resumable_job_uuid,
+        })
+
+    def confirm_runtime_acceptance(
+        self, *, transaction_id: str, candidate_slot: str, candidate_generation: int,
+        candidate_descriptor_sha256: str, resumable_job_uuid: str,
+    ) -> dict:
+        """D4-J: sent ONLY once this candidate's own Executor has
+        already durably written runtime_activation_accepted for
+        resumable_job_uuid -- see runtime_handoff.py's own
+        MUTATION_GATE_MILESTONE. The supervisor's own commit_
+        transaction() call is gated on receiving and independently
+        re-checking this, never on readiness alone (D4-J's own
+        explicit "do not commit the runtime generation merely because
+        the candidate bound a socket" rule)."""
+        return self._request({
+            "action": "CONFIRM_RUNTIME_ACCEPTANCE",
+            "transaction_id": transaction_id,
+            "candidate_slot": candidate_slot,
+            "candidate_generation": candidate_generation,
+            "candidate_descriptor_sha256": candidate_descriptor_sha256,
+            "resumable_job_uuid": resumable_job_uuid,
+        })

@@ -16,13 +16,17 @@ from .jobs import JobError, JobStore
 from .process import CommandRunner, ProcessResult
 from .release import (
     GIT, ReleaseError, TrustedPlan, TrustedRepository, derive_plan, load_chain, manual_blockers,
+    resolve_known_managed_units,
 )
 from .runtime_handoff import (
     MILESTONE_RUNTIME_ACTIVATION_REQUESTED, MILESTONE_RUNTIME_CANDIDATE_STAGED,
     MILESTONE_RUNTIME_CANDIDATE_VERIFIED, MILESTONE_RUNTIME_DESCRIPTOR_VALIDATED,
-    MUTATION_GATE_MILESTONE, HandoffError, MutationGateError, handoff_required,
-    materialize_candidate, new_supervisor_staging_directory, publish_to_candidate_slot,
-    require_mutation_allowed, stage_attestations, stage_descriptor,
+    MILESTONE_RUNTIME_GENERATION_COMMITTED,
+    MUTATION_GATE_MILESTONE, SAFE_YIELD_MILESTONE, HandoffError, MutationGateError,
+    attestations_staging_directory, descriptor_staging_path, handoff_required, materialize_candidate,
+    new_supervisor_staging_directory, publish_to_candidate_slot, require_mutation_allowed,
+    stage_attestations, stage_descriptor, verify_candidate_independently,
+    verify_new_units_authorized_by_candidate_policy,
 )
 from .security import ProtectionError
 from .staging import StagedSource, StagingError, cleanup, materialize
@@ -30,6 +34,8 @@ from .supervisor_client import (
     SupervisorClientError, SupervisorClient, SupervisorRejectedError, SupervisorTransportError,
 )
 from .systemd import SystemdError, SystemdManager
+
+from protected_bootstrap.trust import TrustPolicyError, parse_trust_policy_dict
 
 
 class ExecutionError(RuntimeError):
@@ -160,12 +166,46 @@ def _dependency_closure(nodes: dict[str, list[str]], expected: tuple[str, ...]) 
 
 class Executor:
     def __init__(self, config: StationConfig, store: JobStore, runner: CommandRunner,
-                 *, systemd_manager: SystemdManager | None = None):
+                 *, systemd_manager: SystemdManager | None = None,
+                 expected_handoff_generation: int | None = None,
+                 expected_handoff_descriptor_sha256: str | None = None,
+                 expected_resumable_job_uuid: str | None = None,
+                 active_policy=None):
         self.config = config
         self.store = store
         self.runner = runner
         self.repository = TrustedRepository(config.trusted_repository, config.trusted_repository_url, config.trusted_branch, runner)
-        self.systemd = systemd_manager or SystemdManager(config, runner)
+        # D4-P: this worker's OWN independently-loaded active signed
+        # policy (from its own slot -- see daemon.py/updaterd.py's own
+        # loading, never from application/database/env-var sources) --
+        # None (every pre-Phase-D and D0-bootstrap worker) means
+        # resolve_known_managed_units()/SystemdManager both fall back
+        # to the compiled MANAGED_UNIT_POLICIES map, byte-for-byte
+        # today's behavior.
+        self.active_policy = active_policy
+        self.systemd = systemd_manager or SystemdManager(config, runner, signed_policy=active_policy)
+        # D4-D: None/None/None (every non-candidate Executor -- every
+        # ordinary worker, and the OLD worker in a handoff) means this
+        # process is NEVER authorized to perform the candidate's own
+        # runtime-acceptance step (_execute_candidate_acceptance
+        # below), regardless of what a job's own durable milestones
+        # say -- see execute()'s own three-way branch. Only a process
+        # the supervisor ACTUALLY launched as a specific candidate
+        # (all three populated, matching daemon.py's own
+        # expected_handoff_* parameters) may take that branch. This is
+        # the concrete answer to "prove old and new workers can never
+        # mutate the same job concurrently": mutation authority is
+        # bound to PROCESS IDENTITY the supervisor itself assigned,
+        # never inferred from job state alone (job state is necessary
+        # but not sufficient).
+        if len({expected_handoff_generation is None, expected_handoff_descriptor_sha256 is None,
+                expected_resumable_job_uuid is None}) != 1:
+            raise ValueError(
+                "expected_handoff_generation/descriptor_sha256/resumable_job_uuid must be all null or all present"
+            )
+        self.expected_handoff_generation = expected_handoff_generation
+        self.expected_handoff_descriptor_sha256 = expected_handoff_descriptor_sha256
+        self.expected_resumable_job_uuid = expected_resumable_job_uuid
 
     def _app_env(self, source: Path) -> tuple[dict[str, str], dict[str, str]]:
         settings = _parse_env_file(self.config.application_environment_file)
@@ -341,6 +381,24 @@ class Executor:
         except MutationGateError as exc:
             raise ExecutionError("RUNTIME_ACTIVATION_NOT_ACCEPTED", str(exc), manual=True) from exc
 
+    def _load_phase_d_trust_policy(self):
+        """D4-G/D4-P: this worker's OWN read of the SAME root-owned
+        trust material the supervisor uses (config.phase_d_trust_
+        policy_path/phase_d_signer_root, D3-C's own StationConfig
+        extension) -- returns None (never raises) when either is
+        unconfigured, matching this whole verification step's own
+        UNBOOTSTRAPPED_SUPERVISOR fail-closed handling at its one call
+        site."""
+        path = self.config.phase_d_trust_policy_path
+        signer_root = self.config.phase_d_signer_root
+        if path is None or signer_root is None:
+            return None
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+            return parse_trust_policy_dict(data, signer_directory=signer_root)
+        except (OSError, ValueError, TrustPolicyError):
+            return None
+
     def _resolve_candidate_slot(self, activation_socket: Path) -> tuple[str, str, SupervisorClient]:
         client = SupervisorClient(activation_socket)
         runtime_state = client.get_runtime_state()
@@ -391,12 +449,52 @@ class Executor:
                 milestones.add(MILESTONE_RUNTIME_CANDIDATE_STAGED)
 
             if MILESTONE_RUNTIME_CANDIDATE_VERIFIED not in milestones:
-                # This worker's own local record that staging completed
-                # without error -- NEVER a substitute for the
-                # supervisor's own independent re-verification
-                # (verification.verify_candidate_bundle, always run
-                # server-side before ACTIVATION_REQUESTED -- see D3-A's
-                # own "request is intent, never authorization" rule).
+                # D4-G: THIS worker's own independent re-verification
+                # of the just-staged/published candidate -- defense in
+                # depth alongside (never instead of) the supervisor's
+                # own independent re-verification (always run server-
+                # side before ACTIVATION_REQUESTED -- D3-A's own
+                # "request is intent, never authorization" rule).
+                # Required for THIS worker to safely reason about
+                # whether the target release's own new (to THIS
+                # worker's active policy) managed unit is legitimately
+                # authorized -- see verify_new_units_authorized_by_
+                # candidate_policy below.
+                record = self.store.load(job_id)["protected_runtime_candidate"]
+                candidate_slot = record["candidate_slot"]
+                _active_slot, _cs, client = self._resolve_candidate_slot(activation_socket)
+                runtime_state = client.get_runtime_state()
+                bundle_root = Path(slots_root) / candidate_slot
+                descriptor_bytes = descriptor_staging_path(slots_root, candidate_slot).read_bytes()
+                trust_policy = self._load_phase_d_trust_policy()
+                if trust_policy is None:
+                    raise ExecutionError(
+                        "UNBOOTSTRAPPED_SUPERVISOR",
+                        "this worker has no configured phase_d_trust_policy_path/phase_d_signer_root -- "
+                        "cannot independently verify the staged candidate",
+                        manual=True,
+                    )
+                outcome = verify_candidate_independently(
+                    trust_policy=trust_policy, descriptor_bytes=descriptor_bytes, bundle_root=bundle_root,
+                    attestations_dir=attestations_staging_directory(slots_root, candidate_slot),
+                    release_id=plan.target_release_id, previous_release_id=plan.installed_release_id,
+                    previous_generation=runtime_state["active_generation"],
+                    current_bootstrap_protocol_version=1, current_wire_protocol_version=PROTOCOL_VERSION,
+                )
+                if not outcome.ok:
+                    raise ExecutionError(
+                        "CANDIDATE_INDEPENDENT_VERIFICATION_FAILED", "; ".join(outcome.reasons), manual=True,
+                    )
+                needed_units = (
+                    set(plan.systemd_units_changed) | set(plan.systemd_units_new_required)
+                ) - resolve_known_managed_units(active_policy=self.active_policy)
+                manifest_declared = set(plan.systemd_units_new_required) | set(plan.systemd_units_new_optional)
+                unit_violations = verify_new_units_authorized_by_candidate_policy(
+                    needed_units=frozenset(needed_units), manifest_declared_units=frozenset(manifest_declared),
+                    candidate_policy=outcome.candidate_policy,
+                )
+                if unit_violations:
+                    raise ExecutionError("NEW_MANAGED_UNIT_NOT_AUTHORIZED", "; ".join(unit_violations), manual=True)
                 self.store.milestone(job_id, MILESTONE_RUNTIME_CANDIDATE_VERIFIED)
                 milestones.add(MILESTONE_RUNTIME_CANDIDATE_VERIFIED)
 
@@ -429,6 +527,105 @@ class Executor:
             raise
         except (HandoffError, SupervisorClientError) as exc:
             raise ExecutionError("RUNTIME_HANDOFF_FAILED", str(exc), manual=False) from exc
+
+    def _is_authorized_candidate_for(self, job_id: str, protected_runtime_field) -> bool:
+        """D4-D: mutation/acceptance authority is bound to the PROCESS
+        IDENTITY the supervisor itself assigned at launch time (see
+        Executor.__init__'s own docstring), never inferred from job
+        state alone. True only when every one of this Executor's own
+        expected_handoff_* values (populated ONLY by a real candidate
+        launch -- see daemon.py/updaterd.py) matches BOTH the target
+        release's own protected_runtime facts and the job_id this
+        execute() call was made for. An old worker re-entering
+        execute() for an already-yielded job has expected_handoff_*
+        all None and can never satisfy this."""
+        if self.expected_handoff_generation is None:
+            return False
+        return (
+            self.expected_resumable_job_uuid == job_id
+            and self.expected_handoff_generation == protected_runtime_field.generation
+            and self.expected_handoff_descriptor_sha256 == protected_runtime_field.descriptor_sha256
+        )
+
+    def _accept_runtime_as_candidate(self, job_id: str, protected_runtime_field) -> None:
+        """D4-J: the CANDIDATE's own acceptance step -- called only
+        once _is_authorized_candidate_for() has already proven this
+        exact process is the one the supervisor launched for this exact
+        job. By the time this runs, execute()'s own unconditional top-
+        of-function fetch+derive_plan()+fingerprint check has ALREADY
+        independently re-derived the trusted target plan and verified
+        it against the durably-stored expected_plan_fingerprint (D3-I,
+        D4-D's own "independently re-derives target plan" requirement
+        -- no separate re-derivation needed here). This function's own
+        job is narrow: sanity-check this candidate's own identity
+        against the job's recorded protected_runtime_candidate facts
+        one more time, write MUTATION_GATE_MILESTONE
+        (runtime_activation_accepted) durably, and tell the supervisor
+        (D4-J: "candidate informs supervisor" -- the ONE fact that may
+        legitimize supervisor.commit_transaction()). Deliberately does
+        NOT itself continue into the mutation pipeline -- the caller
+        (execute()) does that, through the SAME single central barrier
+        (_enter_mutation_phase) every other path also passes through;
+        this function's only job is to make runtime_activation_accepted
+        durable and reported, nothing more."""
+        milestones = set(self.store.load(job_id)["milestones"])
+        record = self.store.load(job_id).get("protected_runtime_candidate")
+        if (not isinstance(record, dict)
+                or record.get("generation") != protected_runtime_field.generation
+                or record.get("descriptor_sha256") != protected_runtime_field.descriptor_sha256):
+            raise ExecutionError(
+                "CANDIDATE_IDENTITY_MISMATCH",
+                "this candidate's own expected generation/descriptor does not match the job's "
+                "recorded protected_runtime_candidate facts",
+                manual=True,
+            )
+        activation_socket = self.config.phase_d_supervisor_activation_socket
+        if activation_socket is None:
+            raise ExecutionError(
+                "UNBOOTSTRAPPED_SUPERVISOR",
+                "candidate acceptance requires a configured Phase-D supervisor socket", manual=True,
+            )
+        if MUTATION_GATE_MILESTONE not in milestones:
+            self.store.milestone(job_id, MUTATION_GATE_MILESTONE)
+            milestones.add(MUTATION_GATE_MILESTONE)
+        try:
+            client = SupervisorClient(activation_socket)
+            client.confirm_runtime_acceptance(
+                transaction_id=job_id, candidate_slot=record["candidate_slot"],
+                candidate_generation=record["generation"], candidate_descriptor_sha256=record["descriptor_sha256"],
+                resumable_job_uuid=job_id,
+            )
+        except (SupervisorTransportError, SupervisorRejectedError, SupervisorClientError) as exc:
+            # runtime_activation_accepted is ALREADY durable at this
+            # point -- per D3-N/D4-J, failure AFTER this milestone
+            # never automatically downgrades the runtime and never
+            # blocks THIS worker's own progression; it only means the
+            # supervisor may not yet know to commit the generation.
+            # Logged, not fatal -- mutation proceeds on this worker's
+            # own already-accepted authority.
+            self.store.append_log(
+                job_id, f"could not inform supervisor of runtime acceptance (non-fatal, mutation proceeds): {exc}",
+            )
+        self.store.append_log(job_id, "runtime activation accepted; entering mutation phase")
+
+    def _enter_mutation_phase(self, plan: TrustedPlan, milestones) -> None:
+        """D4-I: the CENTRAL mutation-phase barrier -- ONE explicit,
+        unconditional call sitting exactly at the transition point
+        between the validation/handoff phase and the mutation phase in
+        execute()'s own body, so every path that reaches the mutation
+        pipeline (an ordinary release, OR a protected_runtime job that
+        just accepted runtime activation above) passes through this
+        SAME single checkpoint first -- never merely relying on each
+        mutator's own individual check to be the only thing standing
+        between "validated" and "mutating." The per-mutator
+        require_mutation_allowed() calls throughout the pipeline below
+        remain, unchanged, as defense-in-depth: this call and those
+        calls share the exact same underlying rule (a no-op for an
+        ordinary release, a hard gate on MUTATION_GATE_MILESTONE for a
+        protected_runtime one), so a bug in one is never silently
+        compensated for by the other -- both must independently agree
+        mutation is allowed."""
+        self._require_mutation_allowed(plan, milestones)
 
     def execute(self, job_id: str):
         state = self.store.load(job_id)
@@ -466,33 +663,71 @@ class Executor:
             )
             if ("source_advanced" in milestones or source_already_at_target) and isinstance(previous_plan, dict):
                 basis_head = previous_plan.get("installed_commit", basis_head)
+            known_units = resolve_known_managed_units(active_policy=self.active_policy)
             plan = derive_plan(
                 self.repository, trusted_tip, basis_head,
-                state["requested_target_release_id"],
+                state["requested_target_release_id"], known_units=known_units,
             )
             if plan.fingerprint != state["expected_plan_fingerprint"]:
                 raise ExecutionError("PLAN_FINGERPRINT_MISMATCH", "root-derived plan does not match the requested plan fingerprint")
-            blockers = manual_blockers(plan)
+            blockers = manual_blockers(plan, known_units=known_units)
             if blockers:
                 raise ExecutionError("MANUAL_PREREQUISITE", ", ".join(blockers), manual=True)
             plan_record = dataclass_to_dict(plan)
             self.store.update(job_id, trusted_plan=plan_record)
             self.store.milestone(job_id, "trusted_plan_validated")
 
-            # Update Center Phase D, D3: the target release itself
-            # declares protected_runtime (plan.protected_runtime, set
-            # by derive_plan() -- see release.py's own D3-J docstring)
-            # and this SAME job has not yet reached MUTATION_GATE_
-            # MILESTONE -- this worker's own job here is the SHORT
-            # handoff pipeline (stage+verify+request activation, then
-            # YIELD), never the ordinary Phase-B mutation pipeline
-            # below. Once MUTATION_GATE_MILESTONE IS present (this is
-            # the CANDIDATE worker resuming the SAME job_id after
-            # activation was accepted), execution falls straight
-            # through to the unchanged pipeline below, gated at every
-            # mutating step by require_mutation_allowed().
+            # Update Center Phase D, D4: three-way branch for a target
+            # release that declares protected_runtime (plan.
+            # protected_runtime, set by derive_plan() -- D3-J). Never a
+            # simple binary "handoff needed or not" -- D4-D's own
+            # "prove old and new workers can never mutate the same job
+            # concurrently" requires distinguishing exactly which of
+            # three roles THIS process may legitimately play for this
+            # job right now:
+            #
+            #   1. MUTATION_GATE_MILESTONE already present -- runtime
+            #      acceptance already happened (by some earlier
+            #      candidate call). Fall straight through to the
+            #      unchanged Phase-B pipeline below, gated at every
+            #      mutating step by require_mutation_allowed().
+            #   2. SAFE_YIELD_MILESTONE present, acceptance not yet --
+            #      a handoff is already in flight. ONLY a process the
+            #      supervisor actually launched as THIS exact candidate
+            #      (self.expected_handoff_* populated and matching) may
+            #      perform the candidate's own acceptance step
+            #      (_execute_candidate_acceptance) and then fall
+            #      through to the pipeline. Any OTHER process --
+            #      critically including the OLD worker re-entering
+            #      execute() for a job it already yielded -- takes
+            #      NEITHER action: it must never re-stage, never
+            #      re-request, never mutate. It simply reports the
+            #      job's current durable state and returns.
+            #   3. Neither milestone present -- this is the OLD
+            #      worker's own first pass: stage+verify+request
+            #      activation, then YIELD (_execute_runtime_handoff).
             if handoff_required(plan.protected_runtime) and MUTATION_GATE_MILESTONE not in milestones:
-                return self._execute_runtime_handoff(job_id, plan, plan.protected_runtime, milestones)
+                if SAFE_YIELD_MILESTONE in milestones:
+                    if not self._is_authorized_candidate_for(job_id, plan.protected_runtime):
+                        self.store.append_log(
+                            job_id,
+                            "execute() re-entered for a job already past its safe-yield boundary by a process "
+                            "not authorized as this job's candidate -- taking no further action",
+                        )
+                        return self.store.load(job_id)
+                    self._accept_runtime_as_candidate(job_id, plan.protected_runtime)
+                    milestones = set(self.store.load(job_id)["milestones"])
+                    # Falls through below -- an authorized candidate that
+                    # just accepted runtime activation proceeds into the
+                    # SAME mutation pipeline an ordinary release uses,
+                    # through the SAME central barrier immediately below.
+                else:
+                    return self._execute_runtime_handoff(job_id, plan, plan.protected_runtime, milestones)
+
+            # D4-I: central mutation-phase barrier -- see
+            # _enter_mutation_phase's own docstring. Every mutating
+            # call below this line is reachable only after this check.
+            self._enter_mutation_phase(plan, milestones)
 
             current_payload = self._validate_current_schema() if "source_advanced" not in milestones else {"applied": []}
             self.store.milestone(job_id, "current_schema_validated")

@@ -738,3 +738,210 @@ updates the SAME `UpdateJob` row — no new job is ever created.
   pass).
 - No r0026/r0027 manifests, no root install, no systemd activation —
   all explicitly out of scope for D3 and untouched.
+
+## D4 status — functional runtime completion (harness-proven, not deployed)
+
+D4 closes the five gaps D3 explicitly left open: a real supervisor
+event loop, a real candidate startup/readiness handshake, actual same-
+job resumption through to downstream mutation, signed-policy authority
+over genuinely new managed-unit names, and the Weather-unit end-to-end
+mechanism. Everything below is exercised by real, non-mocked tests
+(real subprocesses launched by a real event loop, real Unix sockets,
+real openssl Ed25519 signing) — **nothing has been deployed, installed,
+or run as root**.
+
+### D4-A — real supervisor daemon
+
+New `isadoraair_updater_bootstrap/supervisor_daemon.py`:
+`SupervisorDaemon` recovers any interrupted activation conservatively
+at startup (D2's own `recovery_action_for`/`apply_recovery`), launches
+the active slot's worker, runs the IPC server in a background thread,
+and polls the activation transaction's own phase to react: stop the
+old worker at the approved boundary (waiting for its voluntary exit,
+force-terminating past a bound), launch the candidate, and roll back
+pre-acceptance on candidate crash or either of two now-real timeouts
+(readiness, and acceptance). Never gains release-chain planning,
+migrations, application Git manipulation, systemd unit policy,
+collectstatic, pg_dump, or Django — none of that code exists in this
+module. `updater_bootstrapd.py` now actually drives it.
+
+### D4-B/D4-C — real candidate startup and readiness
+
+`updaterd.py` gained four fixed-shape candidate-identity arguments
+(`--expected-slot/--expected-generation/--expected-descriptor-sha256/
+--expected-job-uuid`) and a two-phase installation-safety check (its
+own directory's basename must match the expected slot immediately;
+`_ENTRY_ROOT.parent` must equal the supervisor's own configured
+`slots_root` once config is trusted). `launch.launch_worker()` gained
+a strict `CandidateIdentity` parameter -- the only way these four
+values ever reach a candidate's argv. `UpdaterDaemon.report_candidate_
+readiness()` reports every D4-C fact (slot, generation, descriptor
+SHA, bootstrap/wire protocol, config-parsed, privilege-drop self-
+check, job-store lock actually held, worker socket actually bound,
+trusted repository usable, resumable job UUID) -- each one reflecting
+something already independently verified by the time it's reported,
+never an optimistic hardcode. `ipc_server._handle_report_readiness()`
+independently re-checks every fact against the supervisor's own
+activation transaction before ever marking a candidate ready.
+
+### D4-D — same-job resumption, proven concurrency-safe
+
+`Executor.execute()`'s handoff branch became a real three-way split
+(not the D3 binary one): mutation-gate-satisfied falls through to the
+ordinary pipeline; safe-yield-present-but-not-yet-accepted is handled
+ONLY by a process whose own `expected_handoff_generation/descriptor_
+sha256/resumable_job_uuid` (bound at `Executor.__init__`, populated
+only by a real candidate launch) match this exact job -- any other
+process (including the old worker re-entering `execute()` after it
+already yielded) takes no action at all; neither milestone present is
+the old worker's own first pass. Mutation authority is therefore bound
+to PROCESS IDENTITY the supervisor itself assigned at launch, never to
+job state alone. `test_phase_d4_supervisor_daemon.py`'s real end-to-end
+test proves the full chain reaches a committed generation with the
+correct previous-slot/generation retained as LKG.
+
+### D4-E/D4-F — signed policy becomes the runtime-authoritative unit allowlist
+
+**Real bug found and fixed**: `SystemdManager._install_one()`'s own
+allowlist check still compared directly against the bare compiled
+`KNOWN_MANAGED_UNITS` constant, completely bypassing D3-C's own
+signed-policy resolution -- a genuinely new, signed-policy-authorized
+unit would still have been refused at the INSTALL step even though its
+activation policy resolved correctly. Fixed: `release.
+resolve_known_managed_units(active_policy=...)` is now the ONE
+authoritative known-unit resolver (signed policy first, compiled map
+only as the D0/legacy fallback), and `SystemdManager._known_units()`
+routes every one of its four allowlist checks through it.
+`derive_plan()`/`manual_blockers()`/`_cross_check()` all gained an
+explicit `known_units` parameter (defaulted to preserve today's
+behavior byte-for-byte when omitted). Regression-tested directly:
+`test_phase_d4_new_unit_authority.SystemdManagerNewUnitInstallTests`
+proves the SAME new unit is refused under the compiled fallback and
+successfully installed+activated under a signed policy that authorizes
+it.
+
+### D4-G/D4-H — two-stage authorization
+
+`manual_blockers()` no longer decides unit-name-known-ness at all for
+a `protected_runtime` release (deferred, D4-H's own "CURRENT-RUNTIME
+EXECUTABLE ACTION vs. ACTION DEFERRED UNTIL VERIFIED TARGET RUNTIME
+ACTIVATION" distinction) -- the real gate moved into the handoff
+pipeline's own `MILESTONE_RUNTIME_CANDIDATE_VERIFIED` step, which now:
+(1) independently re-verifies the just-staged/published candidate
+bundle using D1's own worker-side `protected_bootstrap.verification.
+verify_candidate_bundle` (built in D1, never actually called from a
+real code path until now) -- defense in depth alongside the
+supervisor's own independent re-verification, never a replacement for
+it; (2) if that fails, refuses outright; (3) resolves the candidate's
+own `protected-policy.json` (read only from the already-hash-verified
+staged bundle, `runtime_handoff.resolve_candidate_policy_from_bundle`
+-- D4-P's own "never from application checkout/database/env" rule);
+(4) `verify_new_units_authorized_by_candidate_policy()` requires every
+unit outside this worker's OWN active policy to be named by the
+candidate's policy AND to agree with the manifest's own predecessor-
+diff-checked declared intent. Any failure raises before
+`REQUEST_ACTIVATION` is ever sent -- the old worker never executes
+anything either way. Point 8 ("new worker independently re-derives the
+same fact") is satisfied by construction: the candidate's own
+`SystemdManager.reconcile()` call, wired to ITS OWN active policy (D4-
+P), already fails closed via its existing "unit has no managed-unit
+activation policy" check if that policy doesn't actually contain the
+unit.
+
+### D4-I — central mutation-phase barrier
+
+`Executor._enter_mutation_phase()` -- one explicit, unconditional call
+sitting exactly at the transition point in `execute()`'s own body,
+after the three-way branch resolves and before the first mutating
+line. Every existing per-mutator `require_mutation_allowed()` call
+remains, unchanged, as defense-in-depth -- both share the identical
+underlying rule, so a bug in one is never silently compensated for by
+the other.
+
+### D4-J — runtime acceptance / supervisor commit
+
+Two new bootstrap-protocol actions, `REPORT_READINESS` and
+`CONFIRM_RUNTIME_ACCEPTANCE` (protocol.py, mirrored in
+`supervisor_client.py`) -- both still only bounded identity facts,
+still zero path/command/argv fields. `ipc_server._handle_confirm_
+runtime_acceptance()` requires `CANDIDATE_READY` (readiness
+independently confirmed) and re-checks identity one more time before
+ever calling `commit_transaction()` -- never merely because a socket
+was bound. `Executor._accept_runtime_as_candidate()` writes
+`runtime_activation_accepted` durably FIRST, then informs the
+supervisor (a transport failure here is logged, non-fatal -- the
+worker's own already-durable acceptance is authoritative for ITS OWN
+progression regardless of whether the supervisor's generation-commit
+bookkeeping succeeds yet).
+
+### D4-K — recovery
+
+Real-process tests prove: supervisor restart... (recovery_action_for,
+unchanged from D2); old worker that never exits voluntarily is force-
+terminated past a bound; candidate that crashes before or after
+reporting readiness rolls back and restarts the previous worker;
+candidate that reports ready but never confirms acceptance now times
+out and rolls back too -- **a real gap this pass found and fixed**
+(`SupervisorDaemon` previously had no bound on that phase at all and
+would have waited forever). `test_phase_d4_supervisor_daemon.py`
+exercises all of these against real subprocesses and a real socket.
+
+### D4-L — Django continuity
+
+No new code needed beyond D3-P's own proof -- `job_service.py`'s
+existing design already covers this window correctly.
+
+### D4-M/D4-N — integration harness / Weather fixture
+
+Scoped deliberately: `test_phase_d4_supervisor_daemon.py` proves the
+REAL process/IPC orchestration (old worker → supervisor → candidate →
+committed generation) using lightweight synthetic fixture workers
+(matching D2's own established pattern for this exact reason -- the
+real `updaterd.py` cannot run without root in any environment, test or
+production); `test_phase_d4_new_unit_authority.py`/
+`test_phase_d4_adversarial_new_unit.py` prove the new-unit
+authorization mechanism itself, end to end, with real signing, against
+the real `SystemdManager.reconcile()` call. A SINGLE further harness
+combining a full real Django "application" fixture (migrations,
+`manage.py`, `updatecenter_probe`) with the real trusted-Git chain, the
+real supervisor daemon, AND a real subprocess candidate all in one test
+-- proving an *observable synthetic systemd mutation specifically after
+runtime acceptance*, and the full four-forecast-unit Weather fixture
+-- was not built this pass; the pieces it would combine are each
+independently, genuinely proven above and in D3's own harness. Left
+for D4 follow-up / D5.
+
+### D4-P — worker's own signed-policy source
+
+`StationConfig` gained `phase_d_trust_policy_path`/`phase_d_signer_root`
+(both-or-neither, matching D3's `phase_d_supervisor_*` pattern) -- the
+SAME root-owned trust material the supervisor uses, read-only for the
+worker. `Executor._load_phase_d_trust_policy()` loads it; `Executor.
+active_policy` (constructor parameter, `None` by default) is what
+`SystemdManager`/`resolve_known_managed_units` actually consult. Never
+loaded from application checkout, live Git working tree, database, an
+environment variable, or an arbitrary station config path.
+
+### D4-Q — process security preserved
+
+`git diff --stat` against `deploy/updater-bootstrapd.service` and
+`deploy/isadoraair-updater.service` is empty -- neither file was
+touched. D2's own capability regression suite
+(`test_phase_d2_supervisor_capability.py`) and the broader security
+suite (`test_phase_b_security.py`) both pass unchanged.
+
+### What remains before D5/production (explicit)
+
+- The combined full-Django-app + full-trusted-Git + real-candidate-
+  subprocess harness proving an observable mutation strictly after
+  runtime acceptance in ONE end-to-end run (D4-M's own strongest form),
+  and the full four-unit Weather fixture (D4-N) -- the underlying
+  mechanisms are each independently proven; only the single combined
+  demonstration was not built.
+- Making the pg_dump/canonical-runtime-path/TTS-launcher environmental
+  test failures hermetic (pre-existing, unrelated to Phase D, already
+  tracked).
+- Everything D3's own "what remains" list already named that D4 did
+  not touch: production signer keys, `/etc/isadoraair/` install,
+  `/usr/local/libexec/` install, the Phase-D systemd unit's actual
+  activation, retiring the old updater, r0026/r0027.

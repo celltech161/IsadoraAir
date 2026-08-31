@@ -8,16 +8,19 @@ handoff is durably accepted (D3-K), and the trusted-Git materialization
 of a candidate bundle into the supervisor's own inactive-slot staging
 area (D3-B).
 
-Nothing here trusts a worker-created descriptor, and nothing here
-performs signature/attestation verification -- see D3-A's own split:
-the supervisor (deploy/updater_bootstrap/isadoraair_updater_bootstrap/
-verification.py) is the one party whose verify_candidate_bundle() call
-actually gates activation. This module only proves the MATERIALIZED
-bytes match the descriptor the release manifest itself pinned
-(descriptor_sha256, then every file's own sha256/size), and only
-tracks/enforces the milestone sequence -- it never accepts a worker's
-own "verified=true" as authoritative for anything beyond "safe to ask
-the supervisor."""
+Nothing here trusts a worker-created descriptor -- see D3-A's own
+split: the supervisor (deploy/updater_bootstrap/
+isadoraair_updater_bootstrap/verification.py) is the party whose
+verify_candidate_bundle() call actually GATES activation; a worker's
+own opinion is never authorization. D4-G adds one exception to
+"nothing here performs signature/attestation verification": this
+worker's OWN independent re-verification of the just-staged candidate
+(verify_candidate_independently, below) -- defense in depth alongside
+the supervisor's own check, never a replacement for it, and used ONLY
+to decide whether THIS worker may safely proceed to REQUEST_ACTIVATION
+for a target release naming a managed unit outside its own current
+policy -- never to authorize mutation, which this worker still never
+performs for a protected_runtime release at all."""
 from __future__ import annotations
 
 import dataclasses
@@ -32,6 +35,11 @@ from protected_bootstrap.descriptor import (
     DescriptorError, RuntimeDescriptor, parse_descriptor_dict,
 )
 from protected_bootstrap.manifest_field import ProtectedRuntimeField
+from protected_bootstrap.policy import PolicyError, ProtectedPolicyDocument, parse_policy_dict
+from protected_bootstrap.trust import SignatureAssertion
+from protected_bootstrap.verification import verify_candidate_bundle as _independent_verify_candidate_bundle
+
+POLICY_FILE_NAME = "protected-policy.json"
 
 from .release import ReleaseError, TrustedRepository
 
@@ -456,3 +464,131 @@ def classify_handoff_recovery(
         protected_runtime_generation=record["generation"],
         protected_runtime_descriptor_sha256=record["descriptor_sha256"],
     )
+
+
+def load_signature_assertions(directory: Path) -> list[SignatureAssertion]:
+    """Worker-side twin of deploy/updater_bootstrap/
+    isadoraair_updater_bootstrap/ipc_server.py's own
+    _load_signature_assertions() -- same file convention
+    (schema_version/signer_id/signature_base64 JSON files), same
+    tolerant-skip-malformed behavior (an unreadable/malformed file
+    simply contributes nothing toward the threshold, exactly like an
+    absent signature legitimately would). Independently implemented,
+    never imported across the supervisor/worker boundary (Correction
+    1's own principle, restated for this new D4-G use)."""
+    import base64
+
+    assertions: list[SignatureAssertion] = []
+    if not directory.is_dir():
+        return assertions
+    for path in sorted(directory.glob("*.json")):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if (not isinstance(data, dict) or data.get("schema_version") != 1
+                    or not isinstance(data.get("signer_id"), str)
+                    or not isinstance(data.get("signature_base64"), str)):
+                continue
+            signature = base64.b64decode(data["signature_base64"], validate=True)
+        except Exception:
+            continue
+        assertions.append(SignatureAssertion(signer_id=data["signer_id"], signature=signature))
+    return assertions
+
+
+def resolve_candidate_policy_from_bundle(bundle_root: Path) -> ProtectedPolicyDocument | None:
+    """D4-G/D4-P: reads the candidate's OWN protected-policy.json --
+    NEVER from the application checkout, live Git working tree,
+    database, environment variable, or an arbitrary station config
+    path (D4-P's own explicit prohibition) -- only from the candidate
+    bundle itself, already materialized/verified file-by-file against
+    the signed descriptor (materialize_candidate). Returns None when
+    the descriptor's own file inventory simply does not include a
+    policy file at all -- not every protected_runtime generation
+    changes policy, and that is not itself an error."""
+    policy_path = Path(bundle_root) / POLICY_FILE_NAME
+    if not policy_path.is_file() or policy_path.is_symlink():
+        return None
+    try:
+        data = json.loads(policy_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        raise HandoffError(f"candidate policy file is unreadable or invalid: {exc}") from exc
+    try:
+        return parse_policy_dict(data, label="candidate protected-policy.json")
+    except PolicyError as exc:
+        raise HandoffError(f"candidate policy file is malformed: {exc}") from exc
+
+
+@dataclasses.dataclass(frozen=True)
+class CandidateVerificationOutcome:
+    ok: bool
+    reasons: tuple[str, ...]
+    candidate_policy: ProtectedPolicyDocument | None
+
+
+def verify_candidate_independently(
+    *, trust_policy, descriptor_bytes: bytes, bundle_root: Path, attestations_dir: Path,
+    release_id: str, previous_release_id: str | None, previous_generation: int,
+    current_bootstrap_protocol_version: int, current_wire_protocol_version: int,
+) -> CandidateVerificationOutcome:
+    """D4-G points 2-3: the OLD WORKER's OWN independent re-
+    verification of the just-staged/published candidate bundle --
+    defense in depth alongside (never instead of) the supervisor's own
+    verify_candidate_bundle() call, which remains the sole actually
+    load-bearing gate on activation (D3-A: "the worker's request is
+    intent, never authorization"). Uses D1's own worker-side
+    protected_bootstrap.verification.verify_candidate_bundle -- built
+    in D1, parity-tested against the supervisor's own copy, and never
+    actually called from any real code path until now."""
+    assertions = load_signature_assertions(attestations_dir)
+    result = _independent_verify_candidate_bundle(
+        release_id=release_id, previous_release_id=previous_release_id,
+        previous_generation=previous_generation, descriptor_bytes=descriptor_bytes,
+        bundle_root=bundle_root, trust_policy=trust_policy, assertions=assertions,
+        current_bootstrap_protocol_version=current_bootstrap_protocol_version,
+        current_wire_protocol_version=current_wire_protocol_version,
+        candidate_minimum_bootstrap_protocol_version=1,
+        require_policy_file=None,
+    )
+    candidate_policy = None
+    if result.ok:
+        candidate_policy = resolve_candidate_policy_from_bundle(bundle_root)
+    return CandidateVerificationOutcome(ok=result.ok, reasons=result.reasons, candidate_policy=candidate_policy)
+
+
+def verify_new_units_authorized_by_candidate_policy(
+    *, needed_units: frozenset[str], manifest_declared_units: frozenset[str],
+    candidate_policy: ProtectedPolicyDocument | None,
+) -> tuple[str, ...]:
+    """D4-G points 4-6, the exact "old worker may permit progression"
+    checklist: the candidate's signed policy must (4) contain every
+    exact new unit name needed, (5) assign each one an existing,
+    already-safe enum value (parse_policy_dict's own closed
+    ALLOWED_POLICIES already guarantees this structurally -- a
+    malformed/unknown policy value can never even reach this function
+    as a parsed ProtectedPolicyDocument), and (6) agree with the
+    manifest's own declared systemd intent -- the candidate policy may
+    not silently smuggle in extra units the manifest itself never
+    declared changing. Returns a tuple of violation strings; empty
+    means fully authorized. `needed_units` is every unit this worker's
+    OWN active policy does not already recognize (see release.
+    resolve_known_managed_units) -- units already known need no
+    candidate-policy involvement at all."""
+    if not needed_units:
+        return ()
+    if candidate_policy is None:
+        return (
+            f"target release requires unit(s) {sorted(needed_units)!r} this worker does not "
+            "recognize, and the candidate generation carries no protected-policy.json to authorize them",
+        )
+    candidate_mapping = candidate_policy.as_mapping()
+    violations = []
+    missing = needed_units - set(candidate_mapping)
+    if missing:
+        violations.append(f"candidate policy does not authorize unit(s): {sorted(missing)!r}")
+    undeclared = needed_units - manifest_declared_units
+    if undeclared:
+        violations.append(
+            f"unit(s) {sorted(undeclared)!r} are authorized by the candidate policy but were not "
+            "declared changing by the release manifest's own predecessor-diff-checked intent"
+        )
+    return tuple(violations)

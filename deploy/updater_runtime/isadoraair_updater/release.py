@@ -653,7 +653,8 @@ def _previous_protected_runtime_generation(chain: list[ChainEntry], index: int) 
     return None
 
 
-def _cross_check(repository: TrustedRepository, previous_commit: str, entry: ChainEntry, *, chain: list[ChainEntry]):
+def _cross_check(repository: TrustedRepository, previous_commit: str, entry: ChainEntry, *,
+                  chain: list[ChainEntry], known_units: frozenset[str] | None = None):
     manifest = entry.manifest
     protected_runtime_changes = repository.changed_paths(
         previous_commit, entry.commit, "deploy/updater_runtime",
@@ -765,7 +766,7 @@ def _cross_check(repository: TrustedRepository, previous_commit: str, entry: Cha
         unit for unit in declared_added
         if repository.path_exists(previous_commit, f"deploy/{unit}")
     }
-    unknown_promotions = promoted - KNOWN_MANAGED_UNITS
+    unknown_promotions = promoted - (known_units if known_units is not None else KNOWN_MANAGED_UNITS)
     if unknown_promotions:
         raise ReleaseError(
             f"{manifest.release_id}: promoted unit(s) {sorted(unknown_promotions)!r} are not in the "
@@ -788,7 +789,7 @@ def _cross_check(repository: TrustedRepository, previous_commit: str, entry: Cha
 
 
 def derive_plan(repository: TrustedRepository, trusted_tip: str, live_head: str,
-                requested_target_release_id: str) -> TrustedPlan:
+                requested_target_release_id: str, *, known_units: frozenset[str] | None = None) -> TrustedPlan:
     chain = load_chain(repository, trusted_tip)
     exact = [entry for entry in chain if entry.commit == live_head]
     if len(exact) != 1:
@@ -801,7 +802,7 @@ def derive_plan(repository: TrustedRepository, trusted_tip: str, live_head: str,
         raise ReleaseError("station is already current or target does not advance the installed release")
     transitions = chain[installed.index + 1:target.index + 1]
     for entry in transitions:
-        _cross_check(repository, chain[entry.index - 1].commit, entry, chain=chain)
+        _cross_check(repository, chain[entry.index - 1].commit, entry, chain=chain, known_units=known_units)
         minimum = entry.manifest.minimum_supported_release_id
         if minimum and installed.index < next(item.index for item in chain if item.manifest.release_id == minimum):
             raise ReleaseError(f"installed release is older than {entry.manifest.release_id} permits")
@@ -891,7 +892,21 @@ def manifest_for_release(chain: list[ChainEntry], release_id: str) -> Manifest:
     raise ReleaseError(f"release {release_id!r} is not present in the independently derived chain")
 
 
-def manual_blockers(plan: TrustedPlan) -> tuple[str, ...]:
+def resolve_known_managed_units(*, active_policy: ProtectedPolicyDocument | None) -> frozenset[str]:
+    """D4-E/D4-F: once an active signed policy exists, IT is the
+    authoritative known-unit set -- the compiled MANAGED_UNIT_POLICIES
+    map is consulted only as the legacy/D0-bootstrap fallback
+    (active_policy is None). Never the other way around: a signed
+    policy that names a unit is authoritative even if the compiled map
+    has never heard of it; the compiled map is never an independent
+    ceiling on top of an active signed policy (D4-E's own explicit
+    "must NOT remain an independent ceiling" rule)."""
+    if active_policy is not None:
+        return frozenset(active_policy.as_mapping())
+    return KNOWN_MANAGED_UNITS
+
+
+def manual_blockers(plan: TrustedPlan, *, known_units: frozenset[str] | None = None) -> tuple[str, ...]:
     blockers = []
     if plan.minimum_updater_protocol_version > MANIFEST_PROTOCOL_VERSION:
         blockers.append("UPDATER_UPGRADE_REQUIRED")
@@ -905,9 +920,23 @@ def manual_blockers(plan: TrustedPlan) -> tuple[str, ...]:
         blockers.append("DESTRUCTIVE_MIGRATION_MANUAL")
     if plan.systemd_units_removed_or_renamed:
         blockers.append("SYSTEMD_REMOVAL_MANUAL")
-    unknown_units = (set(plan.systemd_units_changed) | set(plan.systemd_units_new_required)) - KNOWN_MANAGED_UNITS
-    if unknown_units:
-        blockers.append("UNKNOWN_MANAGED_UNIT")
+    # D4-G/D4-H: for an ORDINARY release (no protected_runtime), an
+    # unknown unit is a hard, CURRENT-RUNTIME EXECUTABLE ACTION
+    # blocker -- exactly as before Phase D existed. For a
+    # protected_runtime release, this check is deliberately DEFERRED
+    # (never decided here at all): the target runtime's own candidate
+    # policy may legitimately authorize a name this worker's own
+    # active policy has never seen -- see runtime_handoff.py's own
+    # verify_new_units_authorized_by_candidate_policy(), called from
+    # inside the handoff pipeline BEFORE activation is ever requested,
+    # which is the real gate for that case. Never silently permissive:
+    # if that later check fails, the job still fails closed, just
+    # later and with the real evidence available to explain why.
+    if plan.protected_runtime is None:
+        active = known_units if known_units is not None else KNOWN_MANAGED_UNITS
+        unknown_units = (set(plan.systemd_units_changed) | set(plan.systemd_units_new_required)) - active
+        if unknown_units:
+            blockers.append("UNKNOWN_MANAGED_UNIT")
     if plan.nginx_changed:
         blockers.append("NGINX_CHANGE_MANUAL")
     if plan.runtime_components_changed:

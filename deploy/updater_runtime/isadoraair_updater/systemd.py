@@ -8,7 +8,9 @@ import stat
 
 from .config import StationConfig
 from .process import CommandRunner
-from .release import KNOWN_MANAGED_UNITS, RESTART_ORDER, TrustedPlan, UnitActivationPolicy, resolve_unit_policy
+from .release import (
+    RESTART_ORDER, TrustedPlan, UnitActivationPolicy, resolve_known_managed_units, resolve_unit_policy,
+)
 from .security import assert_root_protected, assert_root_protected_parents
 
 
@@ -46,6 +48,16 @@ class SystemdManager:
         # UPDATE_CENTER_PHASE_D.md) would ever pass something else.
         self.signed_policy = signed_policy
 
+    def _known_units(self) -> frozenset[str]:
+        """D4-E/D4-F: the ONE authoritative known-unit set this whole
+        class ever consults -- resolve_known_managed_units() itself
+        (release.py), never the bare compiled MANAGED_UNIT_POLICIES/
+        KNOWN_MANAGED_UNITS constant directly. self.signed_policy is
+        None (compiled fallback, byte-for-byte today's behavior) for
+        every caller that has not explicitly loaded/verified an active
+        signed policy."""
+        return resolve_known_managed_units(active_policy=self.signed_policy)
+
     def _systemctl(self, args: list[str], timeout: float = 60):
         result = self.runner.run([SYSTEMCTL, *args], timeout=timeout)
         if not result.ok:
@@ -69,7 +81,7 @@ class SystemdManager:
         return text.encode("utf-8")
 
     def _install_one(self, source_root: Path, unit: str) -> bool:
-        if unit not in KNOWN_MANAGED_UNITS:
+        if unit not in self._known_units():
             raise SystemdError(f"unit {unit!r} is outside the installed updater allowlist")
         source = source_root / "deploy" / unit
         if source.parent != source_root / "deploy" or not source.is_file() or source.is_symlink():
@@ -162,7 +174,7 @@ class SystemdManager:
         restarted = []
         for service in services:
             unit = f"{service}.service"
-            if unit not in KNOWN_MANAGED_UNITS:
+            if unit not in self._known_units():
                 raise SystemdError(f"service {service!r} is outside the restart allowlist")
             self._systemctl(["restart", unit], timeout=180)
             self.verify_unit(unit)
@@ -192,7 +204,7 @@ class SystemdManager:
         self._validate_unit_status(unit, result)
 
     def verify_unit(self, unit: str):
-        if unit not in KNOWN_MANAGED_UNITS:
+        if unit not in self._known_units():
             raise SystemdError("cannot verify an unknown unit")
         result = self._systemctl([
             "show", unit, "--property=Type", "--property=ActiveState",
@@ -211,7 +223,7 @@ class SystemdManager:
         fixed-argv, read-only introspection query -- the same class of
         command verify_unit() already uses -- and never starts, stops,
         or otherwise executes the unit."""
-        if unit not in KNOWN_MANAGED_UNITS:
+        if unit not in self._known_units():
             raise SystemdError("cannot verify an unknown unit")
         result = self._systemctl(["show", unit, "--property=LoadState"])
         values = {}

@@ -27,8 +27,26 @@ MAX_RESPONSE_BYTES = 131072
 RELEASE_ID_RE = re.compile(r"^r[0-9]{4,}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 SLOT_VALUES = frozenset({"A", "B"})
+MAX_WIRE_PROTOCOLS = 8
 
-ACTIONS = frozenset({"PING", "GET_RUNTIME_STATE", "REQUEST_ACTIVATION", "GET_ACTIVATION_STATUS"})
+# Update Center Phase D, D4-C/D4-J: two new actions, both still only
+# bounded identity facts -- no path/command/argv/service/unit/shell/
+# environment field exists on ANY action, including these.
+#   REPORT_READINESS -- a candidate worker's own D2 readiness facts
+#     (readiness.ReadinessFacts' exact field set), reported so the
+#     supervisor can independently compare them against its own
+#     activation transaction (D4-C: wrong slot/generation/digest/job
+#     UUID/wire compatibility must fail activation) before ever
+#     marking the candidate ready.
+#   CONFIRM_RUNTIME_ACCEPTANCE -- sent ONLY once the candidate's own
+#     Executor has durably written runtime_activation_accepted for
+#     the resumed job (D4-J) -- the one fact that legitimizes
+#     supervisor.commit_transaction(). The supervisor never commits
+#     merely because a candidate process bound a socket.
+ACTIONS = frozenset({
+    "PING", "GET_RUNTIME_STATE", "REQUEST_ACTIVATION", "GET_ACTIVATION_STATUS",
+    "REPORT_READINESS", "CONFIRM_RUNTIME_ACCEPTANCE",
+})
 
 
 class ProtocolError(ValueError):
@@ -56,6 +74,18 @@ class Request:
     candidate_descriptor_sha256: str | None = None
     release_id: str | None = None
     previous_release_id: str | None = None
+    # D4-C: REPORT_READINESS's own bounded identity facts -- the exact
+    # field set readiness.ReadinessFacts already defines (D2), minus
+    # slot/generation/descriptor_sha256 (already covered by the three
+    # fields above, reused rather than duplicated).
+    bootstrap_protocol_version: int | None = None
+    supported_wire_protocols: tuple[int, ...] | None = None
+    config_parsed: bool | None = None
+    privilege_drop_self_check_passed: bool | None = None
+    job_store_ready: bool | None = None
+    worker_socket_bound: bool | None = None
+    trusted_repository_usable: bool | None = None
+    resumable_job_uuid: str | None = None
 
 
 # Exactly which Request fields each action legally carries -- every
@@ -71,6 +101,16 @@ ACTION_FIELDS: dict[str, frozenset[str]] = {
         "candidate_descriptor_sha256", "release_id", "previous_release_id",
     }),
     "GET_ACTIVATION_STATUS": frozenset({"transaction_id"}),
+    "REPORT_READINESS": frozenset({
+        "transaction_id", "candidate_slot", "candidate_generation", "candidate_descriptor_sha256",
+        "bootstrap_protocol_version", "supported_wire_protocols", "config_parsed",
+        "privilege_drop_self_check_passed", "job_store_ready", "worker_socket_bound",
+        "trusted_repository_usable", "resumable_job_uuid",
+    }),
+    "CONFIRM_RUNTIME_ACCEPTANCE": frozenset({
+        "transaction_id", "candidate_slot", "candidate_generation",
+        "candidate_descriptor_sha256", "resumable_job_uuid",
+    }),
 }
 
 
@@ -124,6 +164,31 @@ def decode_request(raw: bytes) -> Request:
         if previous is not None and (not isinstance(previous, str) or not RELEASE_ID_RE.match(previous)):
             raise ProtocolError("previous_release_id does not match the required r#### pattern")
         fields["previous_release_id"] = previous
+    if "bootstrap_protocol_version" in allowed:
+        value = data["bootstrap_protocol_version"]
+        if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+            raise ProtocolError("bootstrap_protocol_version must be a positive integer")
+        fields["bootstrap_protocol_version"] = value
+    if "supported_wire_protocols" in allowed:
+        wire = data["supported_wire_protocols"]
+        if not isinstance(wire, list) or not wire or len(wire) > MAX_WIRE_PROTOCOLS:
+            raise ProtocolError("supported_wire_protocols must be a non-empty, bounded list")
+        if any(not isinstance(v, int) or isinstance(v, bool) or v < 1 for v in wire):
+            raise ProtocolError("supported_wire_protocols must contain only positive integers")
+        if len(set(wire)) != len(wire) or list(wire) != sorted(wire):
+            raise ProtocolError("supported_wire_protocols must be unique and canonically sorted")
+        fields["supported_wire_protocols"] = tuple(wire)
+    for bool_field in (
+        "config_parsed", "privilege_drop_self_check_passed", "job_store_ready",
+        "worker_socket_bound", "trusted_repository_usable",
+    ):
+        if bool_field in allowed:
+            value = data[bool_field]
+            if not isinstance(value, bool):
+                raise ProtocolError(f"{bool_field} must be a boolean")
+            fields[bool_field] = value
+    if "resumable_job_uuid" in allowed:
+        fields["resumable_job_uuid"] = _uuid_field(data["resumable_job_uuid"], "resumable_job_uuid")
 
     return Request(action=action, **fields)
 
