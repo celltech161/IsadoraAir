@@ -8,7 +8,7 @@ import json
 from pathlib import Path, PurePosixPath
 import re
 
-from . import MANIFEST_PROTOCOL_VERSION
+from . import BOOTSTRAP_PROTOCOL_VERSION, MANIFEST_PROTOCOL_VERSION, PROTOCOL_VERSION
 from .process import CommandRunner, ProcessResult
 from .security import assert_root_protected, assert_root_protected_parents
 
@@ -21,6 +21,21 @@ from .security import assert_root_protected, assert_root_protected_parents
 # same validation logic. See protected_bootstrap/manifest_field.py's
 # own docstring for the full D0 bridge reasoning this field exists for.
 from protected_bootstrap.manifest_field import ProtectedRuntimeField, ProtectedRuntimeFieldError, parse_protected_runtime_field
+# D3-C: the signed protected managed-unit policy document -- D1-C's
+# own contract, previously unused by any real code path. See
+# resolve_unit_policy() below.
+from protected_bootstrap.policy import ManagedUnitPolicy, ProtectedPolicyDocument
+# D3: cross_check_protected_runtime() was written in D1 as a complete,
+# independently-tested contract deliberately NOT wired into
+# _cross_check() below (see that module's own top docstring -- its own
+# `phase_d_active` no-op made an accidental early wire-in impossible to
+# even notice). D3 is the slice where Phase-D execution semantics
+# become real, so it is spliced in here now, always with
+# phase_d_active=True -- the r0025/r0026-era manual `manual_bootstrap_
+# required=true` gate immediately below is left completely unchanged
+# (belt-and-suspenders: a protected_runtime-declaring release must
+# satisfy BOTH gates).
+from protected_bootstrap.cross_check import cross_check_protected_runtime
 
 
 GIT = "/usr/bin/git"
@@ -78,6 +93,57 @@ MANAGED_UNIT_POLICIES: dict[str, "UnitActivationPolicy"] = {
     "isadoraair-generate-road-condition-audio.timer": UnitActivationPolicy.ENABLE_NOW,
 }
 KNOWN_MANAGED_UNITS = frozenset(MANAGED_UNIT_POLICIES)
+
+# D3-C: the D0 generation-1 signed policy document -- an EXACT,
+# byte-for-byte data representation of MANAGED_UNIT_POLICIES above,
+# in D1-C's own protected_bootstrap.policy.ProtectedPolicyDocument
+# shape (canonical ascending unit-name order, ENABLE_NOW/INSTALL_ONLY
+# strings). This is what D0's bootstrap generation carries as its OWN
+# signed policy.json (see docs/UPDATE_CENTER_PHASE_D.md's D3 section)
+# -- kept in lockstep with MANAGED_UNIT_POLICIES by
+# test_phase_d3_signed_policy.py's own parity test, which builds this
+# exact document from a JSON round-trip and asserts .as_mapping() and
+# {unit: policy.value for ...} of the two sources agree exactly.
+GENERATION_1_POLICY_DOCUMENT = ProtectedPolicyDocument(
+    schema_version=1,
+    entries=tuple(
+        ManagedUnitPolicy(unit=unit, policy=policy.name)
+        for unit, policy in sorted(MANAGED_UNIT_POLICIES.items())
+    ),
+)
+def resolve_unit_policy(unit: str, *, signed_policy: ProtectedPolicyDocument | None) -> UnitActivationPolicy | None:
+    """D3-C: the ONE lookup SystemdManager.reconcile() calls for a
+    managed unit's activation behavior. Never a Python source edit for
+    a station that has moved to a real signed generation's policy --
+    `signed_policy`, when supplied, is consulted FIRST; a unit it does
+    not mention falls through to MANAGED_UNIT_POLICIES (never the
+    other way around -- an operator's D0-era compiled defaults must
+    never silently override a NEWER signed generation's own explicit
+    choice for a unit both happen to name).
+
+    `signed_policy=None` (a station with no Phase-D supervisor, or a
+    release whose protected_runtime carried no policy file) preserves
+    TODAY'S behavior byte-for-byte: MANAGED_UNIT_POLICIES alone, the
+    exact parity test_phase_d3_signed_policy.py's own regression test
+    proves. A signed policy naming an unrecognized policy STRING can
+    never reach this function at all (policy.parse_policy_dict already
+    refused it at parse time, closed-enum, no wildcard) -- this
+    function's only remaining job is which of the two sources wins,
+    never interpreting what a policy value itself means (that
+    remains SystemdManager.reconcile()'s own job, matching
+    UnitActivationPolicy exactly).
+
+    Returns None for a unit neither source recognizes -- the caller
+    (SystemdManager._install_one/reconcile) already refuses an
+    unrecognized unit outright; this function never invents a
+    default."""
+    if signed_policy is not None:
+        mapping = signed_policy.as_mapping()
+        if unit in mapping:
+            return UnitActivationPolicy[mapping[unit]]
+    return MANAGED_UNIT_POLICIES.get(unit)
+
+
 KNOWN_FIELDS = frozenset({
     "schema_version", "release_id", "previous_release_id", "bootstrap_commit",
     "minimum_updater_protocol_version", "summary", "migrations_required",
@@ -154,9 +220,23 @@ class TrustedPlan:
     minimum_updater_protocol_version: int
     manual_bootstrap_required: bool
     fingerprint: str
+    # Update Center Phase D, D3-J: the TARGET release's own protected_
+    # runtime field, when it declares one -- None for every ordinary
+    # (non-Phase-D) release, which is every release through r0026 and
+    # every future release that does not touch the protected runtime.
+    # A DEFAULT of None (rather than a new required positional field)
+    # so every existing `TrustedPlan(**data)` test fixture across this
+    # codebase -- none of which know this field exists -- keeps
+    # constructing a plain v2 plan unchanged; only derive_plan() below
+    # ever populates it from a real independently-resolved chain.
+    protected_runtime: ProtectedRuntimeField | None = None
 
     def fingerprint_payload(self) -> dict:
-        return execution_fingerprint_payload(
+        """v2 payload for an ordinary release, v3 (D3-J) the moment
+        this plan's own target release declares protected_runtime --
+        never decided by a caller, never by a flag, only by this
+        plan's own already-independently-resolved fact."""
+        values = dict(
             installed_release_id=self.installed_release_id,
             installed_commit=self.installed_commit,
             target_release_id=self.target_release_id,
@@ -176,6 +256,17 @@ class TrustedPlan:
             runtime_components_changed=self.runtime_components_changed,
             minimum_updater_protocol_version=self.minimum_updater_protocol_version,
             manual_bootstrap_required=self.manual_bootstrap_required,
+        )
+        if self.protected_runtime is None:
+            return execution_fingerprint_payload(**values)
+        return protected_runtime_fingerprint_payload(
+            **values,
+            protected_runtime_generation=self.protected_runtime.generation,
+            protected_runtime_descriptor_sha256=self.protected_runtime.descriptor_sha256,
+            protected_runtime_minimum_bootstrap_protocol_version=self.protected_runtime.minimum_bootstrap_protocol_version,
+            protected_runtime_runtime_version=self.protected_runtime.runtime_version,
+            protected_runtime_manifest_protocol_version=self.protected_runtime.manifest_protocol_version,
+            protected_runtime_supported_wire_protocols=self.protected_runtime.supported_wire_protocols,
         )
 
 
@@ -548,18 +639,75 @@ def _content(repository: TrustedRepository, commit: str, path: str) -> bytes | N
     return content
 
 
-def _cross_check(repository: TrustedRepository, previous_commit: str, entry: ChainEntry):
+def _previous_protected_runtime_generation(chain: list[ChainEntry], index: int) -> int | None:
+    """D3: the most recent protected_runtime.generation declared by
+    any release STRICTLY BEFORE `index` in the whole chain -- not just
+    within the current transition window, since a station may be
+    advancing across several releases at once and generation must be
+    monotonic across the ENTIRE chain, not merely between adjacent
+    transitions. None if no earlier release ever declared one (the
+    legitimate "this is the very first generation" case)."""
+    for candidate in reversed(chain[:index]):
+        if candidate.manifest.protected_runtime is not None:
+            return candidate.manifest.protected_runtime.generation
+    return None
+
+
+def _cross_check(repository: TrustedRepository, previous_commit: str, entry: ChainEntry, *, chain: list[ChainEntry]):
     manifest = entry.manifest
     protected_runtime_changes = repository.changed_paths(
         previous_commit, entry.commit, "deploy/updater_runtime",
     )
     pre_guard_releases = {"r0001", "r0002", "r0003", "r0004", "r0005"}
+    # D3: a properly signed protected_runtime declaration is now a
+    # SECOND, independent way to satisfy this r0006-era requirement --
+    # see the cross_check_protected_runtime() call immediately below,
+    # which is what ACTUALLY proves a protected_runtime declaration is
+    # well-formed and legitimately generation-advancing. This original
+    # gate's own job narrows to: a runtime-tree change must be covered
+    # by EITHER escape valve, never neither.
     if (manifest.release_id not in pre_guard_releases
             and protected_runtime_changes
-            and not manifest.manual_bootstrap_required):
+            and not manifest.manual_bootstrap_required
+            and manifest.protected_runtime is None):
         raise ReleaseError(
             f"{manifest.release_id}: protected updater runtime changes require "
-            "manual_bootstrap_required=true"
+            "manual_bootstrap_required=true or a signed protected_runtime declaration"
+        )
+
+    # D3: the D1 predecessor-diff/generation-monotonicity contract,
+    # now actually enforced (phase_d_active=True) -- see this module's
+    # own top-of-file import comment. Every release from here on is
+    # cross-checked, not merely ones a caller opted into, matching
+    # this function's own existing unconditional style -- with ONE
+    # deliberate exception: `manual_bootstrap_required=true` remains a
+    # complete, independent escape valve, exactly as it already was
+    # before Phase D existed (the check immediately above this one).
+    # A release using THAT valve is not claiming to carry a signed
+    # protected_runtime generation at all -- it is an operator-driven
+    # manual bootstrap, the same one every release through r0026 could
+    # already use, and D3 does not retroactively require it to also
+    # satisfy the NEW automated contract. Only a runtime-tree change
+    # that is NOT already covered by manual_bootstrap_required must
+    # declare protected_runtime metadata. The mask below applies ONLY
+    # when a release uses the manual valve WITHOUT ALSO declaring
+    # protected_runtime -- a release that declares BOTH (unusual, but
+    # not forbidden) still gets the real runtime_paths_changed value,
+    # so the converse check below ("protected_runtime present but
+    # paths unchanged") is never defeated by this masking.
+    using_manual_valve_only = manifest.manual_bootstrap_required and manifest.protected_runtime is None
+    protected_runtime_result = cross_check_protected_runtime(
+        phase_d_active=True,
+        runtime_paths_changed=bool(protected_runtime_changes) and not using_manual_valve_only,
+        protected_runtime_field=manifest.protected_runtime,
+        previous_generation=_previous_protected_runtime_generation(chain, entry.index),
+        current_bootstrap_protocol_version=BOOTSTRAP_PROTOCOL_VERSION,
+        current_wire_protocol_version=PROTOCOL_VERSION,
+    )
+    if not protected_runtime_result.ok:
+        raise ReleaseError(
+            f"{manifest.release_id}: protected_runtime cross-check failed: "
+            f"{'; '.join(protected_runtime_result.violations)}"
         )
     for ref in manifest.migrations_required:
         app, name = ref.split(".", 1)
@@ -653,7 +801,7 @@ def derive_plan(repository: TrustedRepository, trusted_tip: str, live_head: str,
         raise ReleaseError("station is already current or target does not advance the installed release")
     transitions = chain[installed.index + 1:target.index + 1]
     for entry in transitions:
-        _cross_check(repository, chain[entry.index - 1].commit, entry)
+        _cross_check(repository, chain[entry.index - 1].commit, entry, chain=chain)
         minimum = entry.manifest.minimum_supported_release_id
         if minimum and installed.index < next(item.index for item in chain if item.manifest.release_id == minimum):
             raise ReleaseError(f"installed release is older than {entry.manifest.release_id} permits")
@@ -700,8 +848,47 @@ def derive_plan(repository: TrustedRepository, trusted_tip: str, live_head: str,
         minimum_updater_protocol_version=max(entry.manifest.minimum_updater_protocol_version for entry in transitions),
         manual_bootstrap_required=any(entry.manifest.manual_bootstrap_required for entry in transitions),
     )
-    plan_fingerprint = fingerprint(execution_fingerprint_payload(**values))
-    return TrustedPlan(**values, fingerprint=plan_fingerprint)
+    # D3-J: fingerprint contract v3 becomes authoritative the moment
+    # the TARGET release itself (never merely some earlier release
+    # somewhere in the transition list) declares protected_runtime --
+    # target.manifest is the release actually being installed, and is
+    # the release whose protected_runtime field (if any) governs
+    # whether a runtime handoff is required for THIS plan at all (see
+    # runtime_handoff.handoff_required()). An ordinary release with no
+    # protected_runtime field anywhere in its transition list keeps
+    # using the exact v2 payload/fingerprint unchanged -- this is not
+    # a reinterpretation of v2, it is the same function, called with
+    # the same values, whenever protected_runtime is None.
+    protected_runtime = target.manifest.protected_runtime
+    if protected_runtime is None:
+        plan_fingerprint = fingerprint(execution_fingerprint_payload(**values))
+    else:
+        plan_fingerprint = fingerprint(protected_runtime_fingerprint_payload(
+            **values,
+            protected_runtime_generation=protected_runtime.generation,
+            protected_runtime_descriptor_sha256=protected_runtime.descriptor_sha256,
+            protected_runtime_minimum_bootstrap_protocol_version=protected_runtime.minimum_bootstrap_protocol_version,
+            protected_runtime_runtime_version=protected_runtime.runtime_version,
+            protected_runtime_manifest_protocol_version=protected_runtime.manifest_protocol_version,
+            protected_runtime_supported_wire_protocols=protected_runtime.supported_wire_protocols,
+        ))
+    return TrustedPlan(**values, fingerprint=plan_fingerprint, protected_runtime=protected_runtime)
+
+
+def manifest_for_release(chain: list[ChainEntry], release_id: str) -> Manifest:
+    """D3: a caller that already paid for one load_chain() call (e.g.
+    Executor.execute(), which needs `chain` for exactly one lookup --
+    whether the TARGET release declares protected_runtime, see
+    runtime_handoff.py) can look up any one release's own manifest by
+    id without a second trusted-Git read. Raises, rather than
+    returning None, for an unknown release_id -- every real caller
+    already has a release_id that derive_plan() itself just proved is
+    present in this exact chain; a miss here means a caller bug, not
+    an ordinary "not found" outcome."""
+    for entry in chain:
+        if entry.manifest.release_id == release_id:
+            return entry.manifest
+    raise ReleaseError(f"release {release_id!r} is not present in the independently derived chain")
 
 
 def manual_blockers(plan: TrustedPlan) -> tuple[str, ...]:

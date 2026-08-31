@@ -8,7 +8,7 @@ import stat
 
 from .config import StationConfig
 from .process import CommandRunner
-from .release import KNOWN_MANAGED_UNITS, MANAGED_UNIT_POLICIES, RESTART_ORDER, TrustedPlan, UnitActivationPolicy
+from .release import KNOWN_MANAGED_UNITS, RESTART_ORDER, TrustedPlan, UnitActivationPolicy, resolve_unit_policy
 from .security import assert_root_protected, assert_root_protected_parents
 
 
@@ -30,10 +30,21 @@ class SystemdError(RuntimeError):
 
 
 class SystemdManager:
-    def __init__(self, config: StationConfig, runner: CommandRunner, *, enforce_root_ownership: bool = True):
+    def __init__(self, config: StationConfig, runner: CommandRunner, *, enforce_root_ownership: bool = True,
+                 signed_policy=None):
         self.config = config
         self.runner = runner
         self.enforce_root_ownership = enforce_root_ownership
+        # D3-C: None (every existing caller, unchanged) means
+        # resolve_unit_policy() falls straight through to
+        # MANAGED_UNIT_POLICIES alone -- exactly today's behavior,
+        # byte for byte (see test_phase_d3_signed_policy.py's own
+        # parity test). Only a caller that has actually loaded and
+        # independently verified a signed protected-policy document
+        # for the CURRENTLY active generation (D4's own future job --
+        # see this module's own D3-C scope note in docs/
+        # UPDATE_CENTER_PHASE_D.md) would ever pass something else.
+        self.signed_policy = signed_policy
 
     def _systemctl(self, args: list[str], timeout: float = 60):
         result = self.runner.run([SYSTEMCTL, *args], timeout=timeout)
@@ -93,11 +104,12 @@ class SystemdManager:
     def reconcile(self, source_root: Path, plan: TrustedPlan) -> dict:
         """Install every changed/newly-required unit from the trusted
         staged target, daemon-reload at most once, then activate each
-        newly-required unit exactly per its closed, protected-runtime-
-        compiled MANAGED_UNIT_POLICIES entry -- never per manifest
-        text, never inferred from the unit's own .service/.timer
-        suffix. ENABLE_NOW units (the five core services, and each
-        companion .timer) are `enable --now`d and verified
+        newly-required unit exactly per resolve_unit_policy()'s own
+        closed answer (D3-C: a signed protected-policy document when
+        self.signed_policy is set, MANAGED_UNIT_POLICIES otherwise --
+        never per manifest text, never inferred from the unit's own
+        .service/.timer suffix). ENABLE_NOW units (the five core
+        services, and each companion .timer) are `enable --now`d and verified
         active/healthy, exactly the only behavior a required unit had
         before this policy existed. INSTALL_ONLY units (a companion
         oneshot .service meant only to be triggered by its own paired
@@ -121,7 +133,7 @@ class SystemdManager:
         enabled = []
         installed_only = []
         for unit in plan.systemd_units_new_required:
-            policy = MANAGED_UNIT_POLICIES.get(unit)
+            policy = resolve_unit_policy(unit, signed_policy=self.signed_policy)
             if policy is None:
                 # _install_one() above already refused any unit outside
                 # KNOWN_MANAGED_UNITS (== MANAGED_UNIT_POLICIES.keys()) --

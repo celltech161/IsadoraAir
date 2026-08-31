@@ -74,7 +74,16 @@ SCHEMA_VERSION = 1
 # protocol 3 code refuses it (UPDATER_UPGRADE_REQUIRED) instead of
 # silently enable --now-ing a companion .service that was only ever
 # meant to be installed. See docs/UPDATE_CENTER.md.
-UPDATER_PROTOCOL_VERSION = 4
+#
+# 4 -> 5 (Update Center Phase D, D3): protected_runtime (already
+# parseable since D1) now has real execution meaning -- a release that
+# declares it requires the D3 runtime-handoff pipeline, which a
+# protocol-4 worker cannot perform. Independently mirrors deploy/
+# updater_runtime/isadoraair_updater/__init__.py's own MANIFEST_
+# PROTOCOL_VERSION bump; see that module's own docstring for the full
+# reasoning and test_phase_d3_version_bridge.py for the cross-copy
+# lockstep proof.
+UPDATER_PROTOCOL_VERSION = 5
 
 RELEASE_ID_PATTERN = re.compile(r"^r[0-9]{4,}$")
 # "app_label.migration_name", matching Django's own migration-name

@@ -52,7 +52,9 @@ def _peer_credentials(connection: socket.socket) -> tuple[int, int, int]:
 class UpdaterDaemon:
     def __init__(self, config: StationConfig, *, store: JobStore | None = None,
                  runner: CommandRunner | None = None, executor: Executor | None = None,
-                 authorized_uids: set[int] | None = None, authorized_gids: set[int] | None = None):
+                 authorized_uids: set[int] | None = None, authorized_gids: set[int] | None = None,
+                 expected_handoff_generation: int | None = None,
+                 expected_handoff_descriptor_sha256: str | None = None):
         self.config = config
         self.runner = runner or CommandRunner()
         self._protected_runtime_valid = _validate_privilege_drop(
@@ -60,6 +62,22 @@ class UpdaterDaemon:
         )
         self.store = store or JobStore(config.jobs_root, config.logs_root)
         self.executor = executor or Executor(config, self.store, self.runner)
+        # Update Center Phase D, D3-H: BOTH None (every ordinary daemon
+        # startup, including every station before Phase D) means this
+        # daemon has no reason to believe it is a candidate resuming a
+        # handoff -- recover_jobs() below falls back to its own
+        # original, unchanged "at most one active job" rule. Both
+        # supplied means the supervisor launched THIS process as a
+        # specific candidate generation -- see launch.py/updaterd.py's
+        # own future entrypoint wiring (D4) for where these values
+        # come from (the descriptor this process itself was launched
+        # from, never a value this process invents about itself).
+        if (expected_handoff_generation is None) != (expected_handoff_descriptor_sha256 is None):
+            raise DaemonError(
+                "expected_handoff_generation and expected_handoff_descriptor_sha256 must be both null or both present"
+            )
+        self.expected_handoff_generation = expected_handoff_generation
+        self.expected_handoff_descriptor_sha256 = expected_handoff_descriptor_sha256
         app_uid = pwd.getpwnam(config.application_user).pw_uid
         app_gid = grp.getgrnam(config.application_group).gr_gid
         self.authorized_uids = authorized_uids if authorized_uids is not None else {0, app_uid}
@@ -307,6 +325,36 @@ class UpdaterDaemon:
             state for state in self.store.list_states()
             if state.get("state") in {"accepted", "running"}
         ]
+
+        # Update Center Phase D, D3-H: this process was launched by the
+        # supervisor as a SPECIFIC candidate generation -- distinguish
+        # "ordinary clean startup" from "Phase-D handoff recovery of
+        # one durable job" BEFORE falling back to the original at-
+        # most-one-active-job rule below, never after. A single caller
+        # of runtime_handoff.classify_handoff_recovery(), not a
+        # reimplementation -- see that function's own docstring for
+        # exactly what "unambiguous" means here.
+        if self.expected_handoff_generation is not None:
+            from .runtime_handoff import RecoveryAmbiguous, classify_handoff_recovery
+            try:
+                facts = classify_handoff_recovery(
+                    active, expected_generation=self.expected_handoff_generation,
+                    expected_descriptor_sha256=self.expected_handoff_descriptor_sha256,
+                )
+            except RecoveryAmbiguous:
+                # Fail closed: never guess which job (if any) this
+                # candidate is meant to resume.
+                return
+            if facts is not None:
+                self._ensure_worker(facts.job_id)
+                return
+            # No resumable handoff job found for this candidate's own
+            # generation/descriptor -- an ordinary startup would still
+            # be legal (e.g. an operator started a fresh Django job
+            # directly against this candidate after it's already
+            # live), so fall through to the original rule below rather
+            # than refusing all recovery outright.
+
         if len(active) > 1:
             for state in active:
                 self.store.fail(

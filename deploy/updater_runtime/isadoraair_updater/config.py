@@ -32,7 +32,19 @@ _REQUIRED_FIELDS = frozenset({
     "systemd_unit_root", "render_values", "database",
     "gunicorn_health_url",
 })
-_OPTIONAL_FIELDS = frozenset({"update_execution_enabled", "operator_restart_units"})
+_OPTIONAL_FIELDS = frozenset({
+    "update_execution_enabled", "operator_restart_units",
+    # Update Center Phase D, D3: where the IMMUTABLE supervisor's own
+    # private, root-only activation socket and A/B slots_root live --
+    # needed only by a station that has actually completed the D0
+    # bootstrap (installed the supervisor). Both absent/None (the D0
+    # bridge default -- every station through r0026) means this worker
+    # cannot request a runtime handoff at all; runtime_handoff.py's own
+    # handoff_required() check therefore fails CLOSED for a
+    # protected_runtime release on such a station (UNBOOTSTRAPPED_
+    # SUPERVISOR, never a silent same-process best-effort attempt).
+    "phase_d_supervisor_activation_socket", "phase_d_supervisor_slots_root",
+})
 _FIELDS = _REQUIRED_FIELDS | _OPTIONAL_FIELDS
 _DB_FIELDS = frozenset({"name", "user", "host", "port", "pgpass_file"})
 
@@ -66,6 +78,8 @@ class StationConfig:
     gunicorn_health_url: str
     update_execution_enabled: bool
     operator_restart_units: tuple[str, ...]
+    phase_d_supervisor_activation_socket: Path | None
+    phase_d_supervisor_slots_root: Path | None
 
     @property
     def application_python(self) -> Path:
@@ -200,6 +214,23 @@ def validate_config_dict(data: dict, *, allow_local_repository: bool = False) ->
     pgpass = database["pgpass_file"]
     pgpass_path = None if pgpass is None else _absolute_path(pgpass, "database.pgpass_file")
 
+    phase_d_socket = data.get("phase_d_supervisor_activation_socket")
+    phase_d_slots = data.get("phase_d_supervisor_slots_root")
+    if (phase_d_socket is None) != (phase_d_slots is None):
+        raise ConfigError(
+            "phase_d_supervisor_activation_socket and phase_d_supervisor_slots_root "
+            "must be both null or both present -- a station either has a Phase-D "
+            "supervisor installed or it does not"
+        )
+    phase_d_socket_path = None if phase_d_socket is None else _absolute_path(
+        phase_d_socket, "phase_d_supervisor_activation_socket",
+    )
+    phase_d_slots_path = None if phase_d_slots is None else _absolute_path(
+        phase_d_slots, "phase_d_supervisor_slots_root",
+    )
+    if phase_d_slots_path is not None and _is_within(phase_d_slots_path, application_root):
+        raise ConfigError("phase_d_supervisor_slots_root must not overlap application_root")
+
     health_url = _plain_string(data["gunicorn_health_url"], "gunicorn_health_url", maximum=512)
     parsed_health = urlsplit(health_url)
     try:
@@ -231,6 +262,8 @@ def validate_config_dict(data: dict, *, allow_local_repository: bool = False) ->
         gunicorn_health_url=health_url,
         update_execution_enabled=execution_enabled,
         operator_restart_units=tuple(restart_units),
+        phase_d_supervisor_activation_socket=phase_d_socket_path,
+        phase_d_supervisor_slots_root=phase_d_slots_path,
     )
 
 

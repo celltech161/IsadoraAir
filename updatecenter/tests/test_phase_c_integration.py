@@ -87,12 +87,12 @@ class ReadinessTests(SimpleTestCase):
 
     def test_manifest_protocol_gate_is_independent_of_wire_protocol(self):
         """A helper can correctly speak socket protocol 3 while
-        understanding release-manifest execution semantics protocol 4.
+        understanding release-manifest execution semantics protocol 5.
         The Install gate must compare a release's minimum against the
         manifest-semantics version, never backend_client.PROTOCOL_VERSION.
         """
         self.assertEqual(PROTOCOL_VERSION, 3)
-        self.assertEqual(manifest_mod.UPDATER_PROTOCOL_VERSION, 4)
+        self.assertEqual(manifest_mod.UPDATER_PROTOCOL_VERSION, 5)
 
         request = SimpleNamespace(
             user=SimpleNamespace(is_superuser=True)

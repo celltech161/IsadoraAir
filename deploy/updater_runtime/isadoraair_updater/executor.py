@@ -15,10 +15,20 @@ from .config import StationConfig
 from .jobs import JobError, JobStore
 from .process import CommandRunner, ProcessResult
 from .release import (
-    GIT, ReleaseError, TrustedPlan, TrustedRepository, derive_plan, manual_blockers,
+    GIT, ReleaseError, TrustedPlan, TrustedRepository, derive_plan, load_chain, manual_blockers,
+)
+from .runtime_handoff import (
+    MILESTONE_RUNTIME_ACTIVATION_REQUESTED, MILESTONE_RUNTIME_CANDIDATE_STAGED,
+    MILESTONE_RUNTIME_CANDIDATE_VERIFIED, MILESTONE_RUNTIME_DESCRIPTOR_VALIDATED,
+    MUTATION_GATE_MILESTONE, HandoffError, MutationGateError, handoff_required,
+    materialize_candidate, new_supervisor_staging_directory, publish_to_candidate_slot,
+    require_mutation_allowed, stage_attestations, stage_descriptor,
 )
 from .security import ProtectionError
 from .staging import StagedSource, StagingError, cleanup, materialize
+from .supervisor_client import (
+    SupervisorClientError, SupervisorClient, SupervisorRejectedError, SupervisorTransportError,
+)
 from .systemd import SystemdError, SystemdManager
 
 
@@ -315,6 +325,111 @@ class Executor:
         finally:
             connection.close()
 
+    def _require_mutation_allowed(self, plan: TrustedPlan, milestones) -> None:
+        """D3-K's central pre-mutation gate, called at EVERY production-
+        mutating step below (checkpoint/migration, source advancement,
+        collectstatic, systemd reconciliation, service restarts) --
+        never once at the top of execute(), so a future refactor that
+        adds a new mutating step cannot silently forget to gate it (a
+        missing call here is a missing call at THAT site, not a
+        globally-bypassed check). A complete no-op for an ordinary
+        release (plan.protected_runtime is None) -- see runtime_
+        handoff.require_mutation_allowed's own docstring for the
+        parity guarantee this preserves."""
+        try:
+            require_mutation_allowed(plan.protected_runtime, milestones)
+        except MutationGateError as exc:
+            raise ExecutionError("RUNTIME_ACTIVATION_NOT_ACCEPTED", str(exc), manual=True) from exc
+
+    def _resolve_candidate_slot(self, activation_socket: Path) -> tuple[str, str, SupervisorClient]:
+        client = SupervisorClient(activation_socket)
+        runtime_state = client.get_runtime_state()
+        active_slot = runtime_state["active_slot"]
+        candidate_slot = "B" if active_slot == "A" else "A"
+        return active_slot, candidate_slot, client
+
+    def _execute_runtime_handoff(self, job_id: str, plan: TrustedPlan, protected_runtime_field, milestones: set):
+        """D3: the OLD worker's own short pipeline for a job whose
+        target release declares protected_runtime -- stage+verify the
+        candidate from root-trusted Git, request supervisor
+        activation, then YIELD (return without raising and WITHOUT
+        calling store.succeed()/store.fail()) so this job stays
+        durably "running," open for whichever worker the supervisor
+        next starts to resume (D3-H). Never runs a single Phase-B
+        mutation call -- see execute()'s own MUTATION_GATE_MILESTONE
+        branch, which this function's own milestones never reach on
+        their own (mark_candidate_verified is a LOCAL sanity record,
+        not runtime_activation_accepted)."""
+        try:
+            if MILESTONE_RUNTIME_DESCRIPTOR_VALIDATED not in milestones:
+                self.store.milestone(job_id, MILESTONE_RUNTIME_DESCRIPTOR_VALIDATED)
+                milestones.add(MILESTONE_RUNTIME_DESCRIPTOR_VALIDATED)
+
+            slots_root = self.config.phase_d_supervisor_slots_root
+            activation_socket = self.config.phase_d_supervisor_activation_socket
+            if slots_root is None or activation_socket is None:
+                raise ExecutionError(
+                    "UNBOOTSTRAPPED_SUPERVISOR",
+                    "this station's protected_runtime target requires a Phase-D supervisor, "
+                    "but none is configured (phase_d_supervisor_slots_root/activation_socket are null)",
+                    manual=True,
+                )
+
+            if MILESTONE_RUNTIME_CANDIDATE_STAGED not in milestones:
+                active_slot, candidate_slot, _client = self._resolve_candidate_slot(activation_socket)
+                staging = new_supervisor_staging_directory(slots_root)
+                materialized = materialize_candidate(self.repository, protected_runtime_field, plan.target_commit, staging)
+                stage_attestations(self.repository, protected_runtime_field, plan.target_commit, slots_root, candidate_slot)
+                stage_descriptor(materialized.descriptor_bytes, slots_root, candidate_slot)
+                publish_to_candidate_slot(slots_root, candidate_slot, staging, active_slot=active_slot)
+                self.store.update(job_id, protected_runtime_candidate={
+                    "generation": protected_runtime_field.generation,
+                    "descriptor_sha256": materialized.descriptor_sha256,
+                    "candidate_slot": candidate_slot,
+                })
+                self.store.milestone(job_id, MILESTONE_RUNTIME_CANDIDATE_STAGED)
+                milestones.add(MILESTONE_RUNTIME_CANDIDATE_STAGED)
+
+            if MILESTONE_RUNTIME_CANDIDATE_VERIFIED not in milestones:
+                # This worker's own local record that staging completed
+                # without error -- NEVER a substitute for the
+                # supervisor's own independent re-verification
+                # (verification.verify_candidate_bundle, always run
+                # server-side before ACTIVATION_REQUESTED -- see D3-A's
+                # own "request is intent, never authorization" rule).
+                self.store.milestone(job_id, MILESTONE_RUNTIME_CANDIDATE_VERIFIED)
+                milestones.add(MILESTONE_RUNTIME_CANDIDATE_VERIFIED)
+
+            if MILESTONE_RUNTIME_ACTIVATION_REQUESTED not in milestones:
+                record = self.store.load(job_id)["protected_runtime_candidate"]
+                _active_slot, _candidate_slot, client = self._resolve_candidate_slot(activation_socket)
+                client.request_activation(
+                    transaction_id=job_id, candidate_slot=record["candidate_slot"],
+                    candidate_generation=record["generation"], candidate_descriptor_sha256=record["descriptor_sha256"],
+                    release_id=plan.target_release_id, previous_release_id=plan.installed_release_id,
+                )
+                self.store.milestone(job_id, MILESTONE_RUNTIME_ACTIVATION_REQUESTED)
+                milestones.add(MILESTONE_RUNTIME_ACTIVATION_REQUESTED)
+
+            # D3-E/D3-F: SAFE TO YIELD. runtime_activation_requested is
+            # now durable (fsync'd via the SAME atomic milestone write
+            # every other step uses) -- this is exactly SAFE_YIELD_
+            # MILESTONE (runtime_handoff.py). Release this worker's own
+            # EXCLUSIVE job-store lock so a candidate worker's own
+            # JobStore(...) construction can acquire it -- proof, not
+            # convention: see test_phase_d3_lock_ownership.py's own
+            # two-real-JobStore-instances test. Reads (store.load,
+            # daemon.py's own GET_JOB_STATUS handler) remain legal on
+            # this closed store; only exclusive re-acquisition was ever
+            # gated by the flock.
+            self.store.append_log(job_id, "runtime handoff requested; releasing job-store lock and yielding for candidate resumption")
+            self.store.close()
+            return self.store.load(job_id)
+        except ExecutionError:
+            raise
+        except (HandoffError, SupervisorClientError) as exc:
+            raise ExecutionError("RUNTIME_HANDOFF_FAILED", str(exc), manual=False) from exc
+
     def execute(self, job_id: str):
         state = self.store.load(job_id)
         if state["state"] in {"succeeded", "failed", "manual_intervention_required"}:
@@ -364,6 +479,21 @@ class Executor:
             self.store.update(job_id, trusted_plan=plan_record)
             self.store.milestone(job_id, "trusted_plan_validated")
 
+            # Update Center Phase D, D3: the target release itself
+            # declares protected_runtime (plan.protected_runtime, set
+            # by derive_plan() -- see release.py's own D3-J docstring)
+            # and this SAME job has not yet reached MUTATION_GATE_
+            # MILESTONE -- this worker's own job here is the SHORT
+            # handoff pipeline (stage+verify+request activation, then
+            # YIELD), never the ordinary Phase-B mutation pipeline
+            # below. Once MUTATION_GATE_MILESTONE IS present (this is
+            # the CANDIDATE worker resuming the SAME job_id after
+            # activation was accepted), execution falls straight
+            # through to the unchanged pipeline below, gated at every
+            # mutating step by require_mutation_allowed().
+            if handoff_required(plan.protected_runtime) and MUTATION_GATE_MILESTONE not in milestones:
+                return self._execute_runtime_handoff(job_id, plan, plan.protected_runtime, milestones)
+
             current_payload = self._validate_current_schema() if "source_advanced" not in milestones else {"applied": []}
             self.store.milestone(job_id, "current_schema_validated")
 
@@ -380,6 +510,7 @@ class Executor:
             self.store.milestone(job_id, "target_schema_validated")
 
             if actual_migrations and "database_verified" not in milestones:
+                self._require_mutation_allowed(plan, milestones)
                 checkpoint = state.get("checkpoint")
                 if not checkpoint or not verify_checkpoint(self.config.checkpoint_root, checkpoint):
                     checkpoint = create_checkpoint(
@@ -407,6 +538,7 @@ class Executor:
                         "exact target source already present after database verification; recording recovered advancement milestone",
                     )
                 else:
+                    self._require_mutation_allowed(plan, milestones)
                     self._advance_source(plan)
             else:
                 live_after_resume = self._live_identity()
@@ -415,15 +547,18 @@ class Executor:
             self.store.milestone(job_id, "source_advanced")
 
             if plan.collectstatic_required and "static_collected" not in milestones:
+                self._require_mutation_allowed(plan, milestones)
                 result, settings = self._run_app(self.config.application_root, ["collectstatic", "--noinput", "--skip-checks"], timeout=600)
                 if not result.ok:
                     raise ExecutionError("COLLECTSTATIC_FAILED", _decode(result, settings), manual=True)
             self.store.milestone(job_id, "static_collected")
 
             if "systemd_reconciled" not in milestones:
+                self._require_mutation_allowed(plan, milestones)
                 self.systemd.reconcile(staged.source_root, plan)
             self.store.milestone(job_id, "systemd_reconciled")
             if "services_restarted" not in milestones:
+                self._require_mutation_allowed(plan, milestones)
                 for service in plan.services_requiring_restart:
                     slug = service.replace("-", "_")
                     started_marker = f"service_restart_started_{slug}"

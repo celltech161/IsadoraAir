@@ -442,3 +442,299 @@ of) whatever explicit termination the supervisor's own code performs;
 `test_no_kill_mode_weakening_the_cgroup_wide_stop_restart_safety_net`
 refuses a future `KillMode=process` edit that would narrow this to
 only the main PID.
+
+## D3 status — runtime-first worker handoff (harness-proven, not yet deployed)
+
+D3 makes the runtime-first handoff sequence real: an already-running
+worker can hand a durable update job to a brand-new protected-runtime
+generation the D2 supervisor starts, without ever letting a production
+mutation (migration, source advancement, systemd reconciliation,
+service restart) happen before the new runtime is proven and accepted.
+Everything below is implemented and exercised by real, non-mocked
+tests (real Unix sockets, real Ed25519 signing via `openssl`, a real
+local Git repository, real `fcntl.flock` lock acquisition across two
+`JobStore` instances) — **nothing has been deployed, installed, or
+run as root**; see this section's own "what remains" list at the end.
+
+### Version identities
+
+- `PROTOCOL_VERSION = 3` (Django↔worker wire shape) — **unchanged**.
+- `RUNTIME_VERSION = 4 → 5`, `MANIFEST_PROTOCOL_VERSION = 4 → 5` — a
+  real change to worker code and to `protected_runtime`'s own
+  execution semantics (see below), not a cosmetic bump. Mirrored in
+  `updatecenter/manifest.py`'s `UPDATER_PROTOCOL_VERSION`.
+- `BOOTSTRAP_PROTOCOL_VERSION = 1` — unchanged.
+
+### D3-A — real worker↔supervisor IPC
+
+- `deploy/updater_bootstrap/isadoraair_updater_bootstrap/ipc_server.py`
+  (new): the real Unix-socket server for the D2 `protocol.py` private
+  activation protocol. PING / GET_RUNTIME_STATE / REQUEST_ACTIVATION /
+  GET_ACTIVATION_STATUS. SO_PEERCRED-authorized (root-only by default,
+  overridable only for tests, matching `isadoraair_updater.daemon.
+  UpdaterDaemon`'s own established pattern). REQUEST_ACTIVATION never
+  authorizes anything by itself — the server always independently
+  re-derives the descriptor/attestation/inventory proof
+  (`verification.verify_candidate_bundle`) against files the worker
+  staged at fixed, convention-based paths (never a path carried on the
+  wire).
+- `deploy/updater_runtime/isadoraair_updater/supervisor_client.py`
+  (new): the worker's own strict client, an INDEPENDENT reimplementation
+  of the same wire shape (never imports the supervisor's own tree —
+  Correction 1's independence boundary applies in both directions).
+  Kept honest by `test_phase_d3_supervisor_ipc.py`'s own byte-for-byte
+  wire-encoding parity test.
+- **Real bug found and fixed during this work**: the server's original
+  `handle_connection()` checked SO_PEERCRED *before* draining the
+  client's request bytes. For an unauthorized peer this left unread
+  bytes in the socket's own receive buffer at close time, and Linux
+  answered with an abrupt RST instead of a clean FIN — the CLIENT's
+  own second `recv()` call (still inside its read loop, since the
+  short rejection response was well under the response size cap) then
+  raised `ConnectionResetError` instead of seeing a clean EOF. Fixed to
+  read-then-authorize, exactly matching `daemon.py`'s own already-
+  proven order. `test_phase_d3_supervisor_ipc.py` locks this in.
+
+### D3-B — candidate materialization from root-trusted Git
+
+`deploy/updater_runtime/isadoraair_updater/runtime_handoff.py` (new,
+worker-side):
+
+- `materialize_candidate()` — loads the exact descriptor bytes at
+  `protected_runtime.descriptor_path` from root-trusted Git, verifies
+  them against the release manifest's own signed `descriptor_sha256`
+  pin, parses the descriptor, then loads every descriptor-listed file
+  from the SAME trusted commit (path resolved relative to the
+  descriptor's own containing directory) and writes it into a staging
+  directory, verifying size/sha256 per file as it writes. Never trusts
+  a worker-created descriptor; never touches a live checkout,
+  application-owned Git, a Django upload, or an HTTP request body.
+- `new_supervisor_staging_directory()` / `publish_to_candidate_slot()`
+  — independently reproduce (never import) `slots.py`'s own
+  `staging_root`/`publish_slot()` path conventions and atomic-rename
+  semantics, so the worker's staged bytes land exactly where the
+  supervisor's own slot layout expects them, refusing to ever publish
+  into the currently active slot.
+- `stage_descriptor()` / `stage_attestations()` — copy the raw
+  descriptor bytes and every attestation file (verbatim, unparsed) to
+  fixed, convention-based sibling paths
+  (`slots_root/.staging/descriptor-<slot>.json`,
+  `slots_root/.staging/attestations-<slot>/`) the supervisor can find
+  using only facts the wire protocol already carries (`candidate_slot`)
+  plus its own configured `slots_root` — no new path field was added
+  to the wire protocol.
+- Attestation file wire shape (new, since none existed before this
+  work): `{"schema_version": 1, "signer_id": "...", "signature_base64":
+  "..."}`, one file per `protected_runtime.attestations` entry.
+
+### D3-C — signed protected policy actually consulted
+
+- `release.py`: `resolve_unit_policy(unit, *, signed_policy)` — a
+  signed `ProtectedPolicyDocument` (D1's `protected_bootstrap.policy`)
+  is consulted first when supplied; a unit it doesn't mention, or a
+  fully absent signed policy (`None`, every existing caller today),
+  falls back to `MANAGED_UNIT_POLICIES` unchanged. `SystemdManager`
+  gained an optional `signed_policy=None` constructor parameter and
+  now calls `resolve_unit_policy()` instead of reading
+  `MANAGED_UNIT_POLICIES` directly.
+- `GENERATION_1_POLICY_DOCUMENT` — an exact, parity-tested data
+  representation of today's compiled `MANAGED_UNIT_POLICIES`, in D1's
+  signed-policy shape. This is what D0's bootstrap generation is meant
+  to carry as its own initial signed policy.
+- **Known, deliberate scope limit**: this makes a *signed policy*
+  authoritative for a unit's *activation behavior* (`ENABLE_NOW` vs
+  `INSTALL_ONLY`). It does **not** yet let a signed policy introduce a
+  genuinely *new* unit name outside `KNOWN_MANAGED_UNITS` — that
+  constant is still a module-level compile-time value, consumed by
+  `release.py`'s manifest cross-checking *before* any candidate bundle
+  has been materialized (a real chicken-and-egg ordering question: the
+  release chain must validate before a runtime handoff can even begin,
+  but a signed policy naming a new unit would live inside the very
+  candidate bundle that handoff produces). Left for D4 — see below.
+
+### D3-D — durable job milestones (worker job store)
+
+`jobs.py`'s job-state shape gained one new field,
+`protected_runtime_candidate` (`{generation, descriptor_sha256,
+candidate_slot}` or `null`), set once by the old worker when it stages
+a candidate, read (never duplicated further) by a resuming candidate.
+`runtime_handoff.py` defines the exact six milestones, in order:
+
+```
+runtime_descriptor_validated
+runtime_candidate_staged
+runtime_candidate_verified
+runtime_activation_requested   <- SAFE_YIELD_MILESTONE (D3-E/F)
+runtime_activation_accepted    <- MUTATION_GATE_MILESTONE (D3-K)
+runtime_generation_committed
+```
+
+The supervisor's own `ActivationPhase` state machine (D2) is a
+SEPARATE, independently durable record of the same real-world handoff
+— this list is the worker job's own minimal identity evidence, never a
+wholesale copy of supervisor slot-activation state.
+
+### D3-E/D3-F — durable job ownership transfer, proven not asserted
+
+`Executor._execute_runtime_handoff()`: for a job whose target release
+declares `protected_runtime`, the old worker validates just enough to
+know a handoff is required, stages+publishes the candidate, requests
+activation, and — once `runtime_activation_requested` is durable —
+calls `self.store.close()` (releasing the real `fcntl.flock` exclusive
+`.daemon.lock`) and **returns without ever calling
+`store.succeed()`/`store.fail()`**, leaving the job durably `"running"`
+and open for whichever worker the supervisor starts next.
+
+`test_phase_d3_executor_handoff.py`'s
+`test_lock_ownership_transfers_to_a_second_jobstore_after_yield` proves
+this directly: a **second, independent `JobStore` instance** cannot
+acquire the lock before the old worker yields (`JobError`), and *can*
+acquire it immediately afterward — the real OS primitive, not a
+narrative claim. A re-entrant call against the same job_id from the
+same old process (e.g. a Django submission retry racing the first
+worker thread) is idempotent, absorbed by the supervisor's own
+transaction-id correlation (D3-A) rather than starting a second,
+conflicting transaction.
+
+Bounded-timeout termination of the old worker PROCESS itself (as
+opposed to its job-store lock, proven above) reuses D2's own
+already-tested `worker_lifecycle.py`/`process.TrackedChild.terminate()`
+primitives — real supervisor event-loop wiring that actually calls
+`terminate()` when a worker overstays a bound is D4 work, matching D2's
+own established "not yet wired to a real event loop" scope pattern for
+that module.
+
+### D3-G/D3-H — candidate readiness and job recovery
+
+- `runtime_handoff.classify_handoff_recovery()` — pure function:
+  distinguishes ordinary clean startup from a Phase-D handoff resume of
+  exactly one durable job, requiring the job's own recorded
+  `protected_runtime_candidate` generation/descriptor to match what
+  this candidate process was actually activated as, and requiring
+  `SAFE_YIELD_MILESTONE` to already be present (a job whose old worker
+  never reached a legal yield point is never treated as resumable).
+  Raises (never guesses) on more than one candidate or a mismatch.
+- `daemon.UpdaterDaemon` gained optional
+  `expected_handoff_generation`/`expected_handoff_descriptor_sha256`
+  constructor parameters (both `None` by default — every existing/
+  non-Phase-D daemon startup is unaffected). When both are supplied,
+  `recover_jobs()` consults `classify_handoff_recovery()` first and
+  resumes the matched job specifically; otherwise it falls back to its
+  original, unchanged "at most one active job" rule.
+- D2's own `readiness.py` contract (facts a candidate must prove:
+  slot/generation/descriptor SHA, bootstrap protocol, wire protocol,
+  config parsed, privilege-drop self-check, job-store lock acquired,
+  worker socket bound) remains the target shape for a real candidate
+  startup script to report — wiring an actual `updaterd.py` entrypoint
+  to emit `ReadinessFacts` over the bootstrap protocol is D4 work (D2's
+  own `readiness.py` docstring already flagged this as D3's job; the
+  facts contract and its classification are complete and tested, only
+  the real startup script's own emission is not yet written).
+
+### D3-I — independent trusted-plan re-derivation
+
+Achieved by construction, not a new module: `Executor.execute()`
+**always** re-fetches trusted Git and calls `derive_plan()` from
+scratch on every single invocation, then refuses
+(`PLAN_FINGERPRINT_MISMATCH`) unless the freshly-derived fingerprint
+equals the job's own durably-stored `expected_plan_fingerprint`. A
+candidate worker resuming a handoff-yielded job therefore performs
+EXACTLY the same independent re-derivation an ordinary fresh job
+already required — no new code path, no new trust decision — proven by
+`test_phase_d3_fingerprint_v3.py`'s cross-boundary parity and by
+`test_phase_d3_executor_handoff.py`'s own idempotent-reentry test.
+
+### D3-J — fingerprint contract v3
+
+`release.py`'s `protected_runtime_fingerprint_payload()` (already
+written in D1) is now what `derive_plan()` actually uses whenever the
+TARGET release declares `protected_runtime` — `TrustedPlan` gained a
+`protected_runtime: ProtectedRuntimeField | None = None` field
+(default preserves every existing `TrustedPlan(**data)` test fixture).
+`updatecenter/execution_contract.py` gained an independently-maintained
+mirror, `protected_runtime_fingerprint_payload()`/
+`protected_runtime_execution_fingerprint()`, and `planner.py`'s
+`build_plan()` now selects v2/v3 the same way. `test_phase_d3_
+fingerprint_v3.py` proves Django's and the worker's independent v3
+computations are byte-identical for the same facts, that v3 preserves
+every v2 fact unchanged except `contract_version`, and that v2/v3
+never accidentally collide.
+
+### D3-K — mutation gate
+
+`runtime_handoff.require_mutation_allowed()`: a complete no-op for an
+ordinary release; for a `protected_runtime` release, refuses
+(`MutationGateError`) unless `runtime_activation_accepted` is already a
+durable milestone. Called individually at **every** production-
+mutating call site in `Executor.execute()` — checkpoint/migration,
+source advancement, collectstatic, systemd reconciliation, service
+restarts — never once at the top of the function, so a future new
+mutating step must add its own gate call to compile into the intended
+behavior; a missing call is a missing call at that one site, not a
+globally bypassed check. `Executor._require_mutation_allowed()`
+converts the refusal into `ExecutionError("RUNTIME_ACTIVATION_NOT_
+ACCEPTED", ..., manual=True)`.
+
+### D3-L — candidate-ready vs. activation-accepted
+
+Unchanged from D2: `ActivationPhase.CANDIDATE_READY` and `COMMITTED`
+remain genuinely distinct phases (`activation.runtime_activation_
+accepted()` is true only for `COMMITTED`), and D3's own worker-side
+`MUTATION_GATE_MILESTONE` is `runtime_activation_accepted` — a fact the
+WORKER records only once the supervisor's own activation response
+confirms the transaction reached that phase, never merely because a
+candidate process bound a socket.
+
+### D3-M/D3-N — failure handling
+
+Covered directly by tests in this pass: bad candidate signature (fails
+closed, transaction returns to idle, in-memory transaction-id
+correlation dropped), wire-claimed digest/generation mismatch against
+independently-derived facts (refused), a second concurrent activation
+request while one is in flight (refused, first request unaffected), a
+missing/unbootstrapped supervisor configuration
+(`UNBOOTSTRAPPED_SUPERVISOR`, `manual=True`), and a transport-absent
+supervisor socket (`SupervisorTransportError`, classified distinctly
+from an explicit rejection). Every one of these is provably PRE-
+`runtime_activation_accepted`, so D3-K's own gate structurally
+guarantees no production mutation occurred. Post-acceptance failure
+handling is intentionally unchanged from existing Phase-B semantics
+(fail/manual-intervention as appropriate; no automatic runtime
+rollback) — no new code was added there, matching D3-N's own explicit
+instruction.
+
+### D3-P — Django-facing outage semantics
+
+No production code changes were required: `updatecenter/job_service.
+py`'s existing retry-once/`SUBMISSION_UNCERTAIN`/reconcile-via-
+`GET_JOB_STATUS` design (built for ordinary transient socket
+unavailability) already satisfies D3-P's requirements exactly, proven
+directly against a real Unix socket that is absent, then present, in
+`test_phase_d3_django_outage_semantics.py`: a submission during the
+outage window becomes `SUBMISSION_UNCERTAIN` (never `FAILED`), the
+active lock is retained, and reconciliation once the socket returns
+updates the SAME `UpdateJob` row — no new job is ever created.
+
+### What remains before D4/production (explicit)
+
+- A real candidate `updaterd.py` startup path that reports
+  `ReadinessFacts` over the bootstrap protocol and calls
+  `UpdaterDaemon` with `expected_handoff_generation`/
+  `expected_handoff_descriptor_sha256` populated from its own launch
+  arguments.
+- A real supervisor event loop that actually calls `launch_worker()`,
+  polls readiness, and calls `TrackedChild.terminate()` on a bounded
+  timeout — `worker_lifecycle.py`'s policy and `ipc_server.py`'s
+  protocol handling are both ready to be driven by it.
+- Letting a signed policy introduce a genuinely NEW unit name (not
+  merely override an existing one's activation behavior) — requires
+  resolving the `KNOWN_MANAGED_UNITS`-is-a-module-constant ordering
+  question noted under D3-C above.
+- The D3-R Weather-unit policy-change proof fixture specifically (the
+  underlying mechanism — `resolve_unit_policy()` overriding an
+  existing unit's policy via signed data alone — is implemented and
+  tested in `test_phase_d3_signed_policy.py`; the *end-to-end* fixture
+  with a real second-generation signed release was not built this
+  pass).
+- No r0026/r0027 manifests, no root install, no systemd activation —
+  all explicitly out of scope for D3 and untouched.

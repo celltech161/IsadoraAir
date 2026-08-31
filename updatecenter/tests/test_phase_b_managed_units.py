@@ -365,19 +365,19 @@ class ManifestProtocolBumpTests(SimpleTestCase):
         self.root = Path(self.temp.name)
         self.addCleanup(self.temp.cleanup)
 
-    def test_manifest_protocol_bumped_to_four(self):
-        self.assertEqual(MANIFEST_PROTOCOL_VERSION, 4)
+    def test_manifest_protocol_bumped_to_five(self):
+        self.assertEqual(MANIFEST_PROTOCOL_VERSION, 5)
 
     def test_wire_protocol_unchanged_by_this_release(self):
         # Same invariant test_phase_b_protocol.py's own
-        # test_runtime_v4_keeps_wire_protocol_v3 documents -- restated
+        # test_runtime_v5_keeps_wire_protocol_v3 documents -- restated
         # here because this is precisely the change that could have
         # broken it (see this task's own investigation: MANIFEST_
         # PROTOCOL_VERSION and PROTOCOL_VERSION used to be the same
         # constant, and bumping it broke every existing daemon-socket
         # client's request shape).
         self.assertEqual(PROTOCOL_VERSION, 3)
-        self.assertEqual(RUNTIME_VERSION, 4)
+        self.assertEqual(RUNTIME_VERSION, 5)
 
     def test_old_updater_protocol_rejects_a_release_requiring_the_new_one(self):
         """Simulates an updater still running protocol-3 code (as it

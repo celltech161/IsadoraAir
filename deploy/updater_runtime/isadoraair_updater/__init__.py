@@ -20,7 +20,22 @@ PROTOCOL_VERSION = 3
 
 # This package's own code version -- independent of both protocol
 # numbers above and below.
-RUNTIME_VERSION = 4
+#
+# 4 -> 5 (Update Center Phase D, D3): this package gains real Phase-D
+# runtime-first execution semantics -- a supervisor/candidate IPC
+# client (supervisor_client.py), protected-runtime candidate
+# materialization from root-trusted Git (protected_materialize.py),
+# signed managed-unit policy consumption (release.py's
+# resolve_unit_policy(), sourced from protected_bootstrap.policy when
+# a generation supplies one, D0 generation 1's compiled
+# MANAGED_UNIT_POLICIES otherwise), the runtime-handoff milestone
+# vocabulary and central pre-mutation gate (runtime_handoff.py), and
+# fingerprint contract v3 becoming authoritative for a protected-
+# runtime target release (release.py's derive_plan()). This is a real
+# change to what this package's own code DOES, not a redefinition of
+# either protocol number below -- see D3's own workorder: "Do not bump
+# merely for cosmetics."
+RUNTIME_VERSION = 5
 
 # The release-MANIFEST execution-semantics protocol (see release.py's
 # manual_blockers(), compared against each release's declared
@@ -35,7 +50,23 @@ RUNTIME_VERSION = 4
 # 3 -> 4: systemd_units_new_required's execution semantics changed -- a
 # required unit is no longer unconditionally `enable --now`d; see
 # MANAGED_UNIT_POLICIES below.
-MANIFEST_PROTOCOL_VERSION = 4
+#
+# 4 -> 5 (Update Center Phase D, D3): a release manifest's
+# protected_runtime field (D1-A) now has real EXECUTION semantics for
+# the first time -- when present, this worker's own execute() no
+# longer runs its ordinary Phase-B pipeline directly on the currently
+# active process. It instead validates just enough to know a handoff
+# is required, stages+independently-verifies the signed candidate
+# generation into the supervisor's inactive slot, requests activation,
+# and yields the durable job (still open, still owned by this SAME
+# job_id) to whichever worker the supervisor next starts -- see
+# runtime_handoff.py. A release declaring protected_runtime therefore
+# means something this worker could not even attempt to execute before
+# this version; a release requiring it must declare
+# minimum_updater_protocol_version=5 so a pre-Phase-D updater refuses
+# it (UPDATER_UPGRADE_REQUIRED) rather than attempting its ordinary
+# pipeline against a runtime it cannot actually replace.
+MANIFEST_PROTOCOL_VERSION = 5
 
 # The BOOTSTRAP SUPERVISOR protocol (Update Center Phase D, [P1] 1.16
 # D1) -- how a future stable, rarely-changing supervisor process and a

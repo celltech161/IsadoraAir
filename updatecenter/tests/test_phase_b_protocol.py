@@ -15,9 +15,9 @@ def _request(**changes):
 
 
 class StrictProtocolTests(SimpleTestCase):
-    def test_runtime_v4_keeps_wire_protocol_v3(self):
+    def test_runtime_v5_keeps_wire_protocol_v3(self):
         self.assertEqual(PROTOCOL_VERSION, 3)
-        self.assertEqual(RUNTIME_VERSION, 4)
+        self.assertEqual(RUNTIME_VERSION, 5)
 
     def test_ping_is_exact(self):
         self.assertEqual(decode_request(_request()).action, "PING")

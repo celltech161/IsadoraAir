@@ -169,6 +169,16 @@ class JobStore:
             "failure_detail": "",
             "trusted_plan": None,
             "checkpoint": None,
+            # Update Center Phase D, D3-D: set ONCE (by the OLD worker,
+            # when it stages a candidate -- see runtime_handoff.py),
+            # never overwritten afterwards. Deliberately narrow: only
+            # the immutable identity a resuming candidate needs to
+            # prove "this is the SAME candidate I was activated as"
+            # (runtime_handoff.classify_handoff_recovery) -- generation
+            # and descriptor_sha256, nothing about supervisor slot
+            # state, which remains the supervisor's own, not
+            # duplicated here (D3-D's own explicit instruction).
+            "protected_runtime_candidate": None,
         }
         self._atomic_write(path, state)
         self.append_log(job_id, "job accepted")
@@ -176,7 +186,10 @@ class JobStore:
 
     def update(self, job_id: str, **changes) -> dict:
         state = self.load(job_id)
-        allowed = {"state", "current_step", "failure_classification", "failure_detail", "trusted_plan", "checkpoint"}
+        allowed = {
+            "state", "current_step", "failure_classification", "failure_detail",
+            "trusted_plan", "checkpoint", "protected_runtime_candidate",
+        }
         if set(changes) - allowed:
             raise JobError("attempt to write unknown job-state fields")
         state.update(changes)
