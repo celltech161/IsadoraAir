@@ -314,7 +314,7 @@ class SupervisorDaemon:
 
     def _check_active_worker_liveness(self) -> None:
         if self.active_worker is None:
-            self._launch_active_worker()
+            self._restart_active_worker_if_needed()
             return
         if self.active_worker.poll() is None:
             return

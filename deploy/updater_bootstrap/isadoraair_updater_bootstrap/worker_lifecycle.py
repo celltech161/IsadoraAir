@@ -65,11 +65,18 @@ class WorkerLifecycle:
     def can_launch(self) -> bool:
         return self.state is WorkerLifecycleState.NONE
 
-    def require_can_launch(self) -> None:
+    def require_can_launch(self, *, now: float | None = None) -> None:
         if not self.can_launch():
             raise WorkerLifecycleError(
                 f"cannot launch a new worker while lifecycle state is {self.state.value!r} "
                 "-- a previously-launched worker must be observed exited AND acknowledged first"
+            )
+        self._prune_old_attempts(now)
+        if len(self._attempt_timestamps) >= self.max_consecutive_restart_attempts:
+            raise WorkerLifecycleError(
+                f"refusing to launch: {len(self._attempt_timestamps)} restart attempts already "
+                f"recorded within the last {self.restart_attempt_window_seconds}s "
+                f"(bound: {self.max_consecutive_restart_attempts})"
             )
 
     def record_launch(self, pid: int, *, now: float | None = None) -> None:
@@ -78,14 +85,7 @@ class WorkerLifecycle:
         docstring). Refuses if a launch is not currently legal, exactly
         mirroring require_can_launch() so a caller cannot bypass the
         check by simply not calling it first."""
-        self.require_can_launch()
-        self._prune_old_attempts(now)
-        if len(self._attempt_timestamps) >= self.max_consecutive_restart_attempts:
-            raise WorkerLifecycleError(
-                f"refusing to launch: {len(self._attempt_timestamps)} restart attempts already "
-                f"recorded within the last {self.restart_attempt_window_seconds}s "
-                f"(bound: {self.max_consecutive_restart_attempts})"
-            )
+        self.require_can_launch(now=now)
         self._attempt_timestamps.append(now if now is not None else time.monotonic())
         self.state = WorkerLifecycleState.RUNNING
         self.pid = pid

@@ -26,6 +26,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
+from unittest.mock import Mock
 
 from django.test import SimpleTestCase
 
@@ -38,6 +39,7 @@ from isadoraair_updater_bootstrap.slots import Slot, SlotLayout
 from isadoraair_updater_bootstrap.state import RuntimeState, write_runtime_state_atomically
 from isadoraair_updater_bootstrap.supervisor_daemon import SupervisorDaemon
 from isadoraair_updater_bootstrap.trust import parse_trust_policy_dict
+from isadoraair_updater_bootstrap.worker_lifecycle import WorkerLifecycle
 
 
 def _keypair(directory: Path, name: str):
@@ -182,6 +184,17 @@ class SupervisorDaemonRealHandoffTests(SimpleTestCase):
         while not self.activation_socket.exists() and time.monotonic() < deadline:
             time.sleep(0.02)
         return thread
+
+    def test_exhausted_restart_bound_does_not_launch_an_untracked_worker(self):
+        daemon = object.__new__(SupervisorDaemon)
+        daemon.active_worker = None
+        daemon.lifecycle = WorkerLifecycle(max_consecutive_restart_attempts=0)
+        daemon._launch_active_worker = Mock()
+
+        daemon._check_active_worker_liveness()
+
+        daemon._launch_active_worker.assert_not_called()
+        self.assertIsNone(daemon.active_worker)
 
     def _stage_and_publish_candidate(self, *, generation=2, candidate_slot="B"):
         """Real staging -- materialize_candidate/stage_descriptor/

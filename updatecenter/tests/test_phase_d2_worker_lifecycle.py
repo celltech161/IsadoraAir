@@ -107,6 +107,8 @@ class BoundedRestartAttemptTests(SimpleTestCase):
             lifecycle.acknowledge_exit()
             now += 1.0
         with self.assertRaises(WorkerLifecycleError):
+            lifecycle.require_can_launch(now=now)
+        with self.assertRaises(WorkerLifecycleError):
             lifecycle.record_launch(pid=4, now=now)
 
     def test_attempts_outside_the_window_do_not_count(self):
