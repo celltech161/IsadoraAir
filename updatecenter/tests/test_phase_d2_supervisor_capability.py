@@ -63,6 +63,12 @@ class SupervisorUnitRetainsCapabilityTests(SimpleTestCase):
             exec_start[0],
         )
 
+    def test_supervisor_interpreter_cannot_mutate_immutable_tree_with_bytecode(self):
+        exec_start = next(
+            line for line in self.supervisor_lines if line.startswith("ExecStart=")
+        )
+        self.assertIn("/usr/bin/python3 -I -B ", exec_start)
+
     def test_runtime_directories_cover_both_supervisor_and_worker_sockets(self):
         self.assertIn(
             "RuntimeDirectory=isadoraair-updater-bootstrap isadoraair-updater",
