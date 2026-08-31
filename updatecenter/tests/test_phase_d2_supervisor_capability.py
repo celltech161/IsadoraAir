@@ -63,6 +63,13 @@ class SupervisorUnitRetainsCapabilityTests(SimpleTestCase):
             exec_start[0],
         )
 
+    def test_runtime_directories_cover_both_supervisor_and_worker_sockets(self):
+        self.assertIn(
+            "RuntimeDirectory=isadoraair-updater-bootstrap isadoraair-updater",
+            self.supervisor_lines,
+        )
+        self.assertIn("RuntimeDirectoryMode=0750", self.supervisor_lines)
+
     def test_no_capability_bounding_set_introduced(self):
         # The task's own explicit instruction: do not casually introduce
         # a CapabilityBoundingSet= restriction alongside this fix.

@@ -12,8 +12,8 @@ Restart=on-failure
 RestartSec=5
 UMask=0077
 Environment=PYTHONDONTWRITEBYTECODE=1
-RuntimeDirectory=isadoraair-updater-bootstrap
-RuntimeDirectoryMode=0700
+RuntimeDirectory=isadoraair-updater-bootstrap isadoraair-updater
+RuntimeDirectoryMode=0750
 StateDirectory=isadoraair-updater-bootstrap isadoraair-updater
 StateDirectoryMode=0750
 LogsDirectory=isadoraair-updater-bootstrap isadoraair-updater
