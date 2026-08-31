@@ -399,7 +399,8 @@ class RecoveryAmbiguous(HandoffError):
 
 
 def classify_handoff_recovery(
-    job_states: list[dict], *, expected_generation: int, expected_descriptor_sha256: str,
+    job_states: list[dict], *, expected_slot: str, expected_generation: int,
+    expected_descriptor_sha256: str,
 ) -> HandoffRecoveryFacts | None:
     """D3-H's own "distinguish ordinary clean startup from Phase-D
     handoff recovery" decision, as a pure function of the job records
@@ -450,12 +451,14 @@ def classify_handoff_recovery(
         )
 
     state, record = candidates[0]
-    required = {"generation", "descriptor_sha256"}
+    required = {"generation", "descriptor_sha256", "candidate_slot"}
     if set(record) != required:
         raise RecoveryAmbiguous("protected_runtime_candidate record has an invalid shape")
-    if record["generation"] != expected_generation or record["descriptor_sha256"] != expected_descriptor_sha256:
+    if (record["candidate_slot"] != expected_slot
+            or record["generation"] != expected_generation
+            or record["descriptor_sha256"] != expected_descriptor_sha256):
         raise RecoveryAmbiguous(
-            "the one resumable job's recorded candidate generation/descriptor does not match "
+            "the one resumable job's recorded candidate slot/generation/descriptor does not match "
             "what this candidate process was activated as"
         )
     return HandoffRecoveryFacts(

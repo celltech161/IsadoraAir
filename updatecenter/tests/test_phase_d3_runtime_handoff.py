@@ -210,33 +210,33 @@ def _job_state(job_id, *, milestones, protected_runtime_candidate=None, state="r
 
 class ClassifyHandoffRecoveryTests(SimpleTestCase):
     def test_no_candidates_is_ordinary_clean_startup(self):
-        self.assertIsNone(classify_handoff_recovery([], expected_generation=1, expected_descriptor_sha256="a" * 64))
+        self.assertIsNone(classify_handoff_recovery([], expected_slot="A", expected_generation=1, expected_descriptor_sha256="a" * 64))
         self.assertIsNone(classify_handoff_recovery(
             [_job_state("j1", milestones=["trusted_source_fetched"])],
-            expected_generation=1, expected_descriptor_sha256="a" * 64,
+            expected_slot="A", expected_generation=1, expected_descriptor_sha256="a" * 64,
         ))
 
     def test_candidate_before_safe_yield_milestone_is_not_resumable(self):
         state = _job_state(
             "j1", milestones=["runtime_descriptor_validated", "runtime_candidate_staged"],
-            protected_runtime_candidate={"generation": 1, "descriptor_sha256": "a" * 64},
+            protected_runtime_candidate={"candidate_slot": "A", "generation": 1, "descriptor_sha256": "a" * 64},
         )
-        self.assertIsNone(classify_handoff_recovery([state], expected_generation=1, expected_descriptor_sha256="a" * 64))
+        self.assertIsNone(classify_handoff_recovery([state], expected_slot="A", expected_generation=1, expected_descriptor_sha256="a" * 64))
 
     def test_terminal_or_inactive_job_never_counted(self):
         state = _job_state(
             "j1", state="succeeded", milestones=list(HANDOFF_MILESTONES),
-            protected_runtime_candidate={"generation": 1, "descriptor_sha256": "a" * 64},
+            protected_runtime_candidate={"candidate_slot": "A", "generation": 1, "descriptor_sha256": "a" * 64},
         )
-        self.assertIsNone(classify_handoff_recovery([state], expected_generation=1, expected_descriptor_sha256="a" * 64))
+        self.assertIsNone(classify_handoff_recovery([state], expected_slot="A", expected_generation=1, expected_descriptor_sha256="a" * 64))
 
     def test_exactly_one_matching_candidate_resolves(self):
         state = _job_state(
             "j1", milestones=["runtime_descriptor_validated", "runtime_candidate_staged",
                               "runtime_candidate_verified", SAFE_YIELD_MILESTONE],
-            protected_runtime_candidate={"generation": 2, "descriptor_sha256": "b" * 64},
+            protected_runtime_candidate={"candidate_slot": "B", "generation": 2, "descriptor_sha256": "b" * 64},
         )
-        facts = classify_handoff_recovery([state], expected_generation=2, expected_descriptor_sha256="b" * 64)
+        facts = classify_handoff_recovery([state], expected_slot="B", expected_generation=2, expected_descriptor_sha256="b" * 64)
         self.assertEqual(facts.job_id, "j1")
         self.assertEqual(facts.target_release_id, "r0027")
         self.assertEqual(facts.protected_runtime_generation, 2)
@@ -245,26 +245,34 @@ class ClassifyHandoffRecoveryTests(SimpleTestCase):
     def test_two_candidates_is_ambiguous(self):
         make = lambda job_id: _job_state(
             job_id, milestones=[SAFE_YIELD_MILESTONE],
-            protected_runtime_candidate={"generation": 1, "descriptor_sha256": "a" * 64},
+            protected_runtime_candidate={"candidate_slot": "A", "generation": 1, "descriptor_sha256": "a" * 64},
         )
         with self.assertRaises(RecoveryAmbiguous):
-            classify_handoff_recovery([make("j1"), make("j2")], expected_generation=1, expected_descriptor_sha256="a" * 64)
+            classify_handoff_recovery([make("j1"), make("j2")], expected_slot="A", expected_generation=1, expected_descriptor_sha256="a" * 64)
 
     def test_mismatched_generation_is_ambiguous_never_silently_resumed(self):
         state = _job_state(
             "j1", milestones=[SAFE_YIELD_MILESTONE],
-            protected_runtime_candidate={"generation": 1, "descriptor_sha256": "a" * 64},
+            protected_runtime_candidate={"candidate_slot": "A", "generation": 1, "descriptor_sha256": "a" * 64},
         )
         with self.assertRaises(RecoveryAmbiguous):
-            classify_handoff_recovery([state], expected_generation=2, expected_descriptor_sha256="a" * 64)
+            classify_handoff_recovery([state], expected_slot="A", expected_generation=2, expected_descriptor_sha256="a" * 64)
 
     def test_mismatched_descriptor_sha_is_ambiguous(self):
         state = _job_state(
             "j1", milestones=[SAFE_YIELD_MILESTONE],
-            protected_runtime_candidate={"generation": 1, "descriptor_sha256": "a" * 64},
+            protected_runtime_candidate={"candidate_slot": "A", "generation": 1, "descriptor_sha256": "a" * 64},
         )
         with self.assertRaises(RecoveryAmbiguous):
-            classify_handoff_recovery([state], expected_generation=1, expected_descriptor_sha256="c" * 64)
+            classify_handoff_recovery([state], expected_slot="A", expected_generation=1, expected_descriptor_sha256="c" * 64)
+
+    def test_mismatched_slot_is_ambiguous(self):
+        state = _job_state(
+            "j1", milestones=[SAFE_YIELD_MILESTONE],
+            protected_runtime_candidate={"candidate_slot": "B", "generation": 1, "descriptor_sha256": "a" * 64},
+        )
+        with self.assertRaises(RecoveryAmbiguous):
+            classify_handoff_recovery([state], expected_slot="A", expected_generation=1, expected_descriptor_sha256="a" * 64)
 
     def test_malformed_candidate_record_is_ambiguous(self):
         state = _job_state(
@@ -272,4 +280,4 @@ class ClassifyHandoffRecoveryTests(SimpleTestCase):
             protected_runtime_candidate={"generation": 1},
         )
         with self.assertRaises(RecoveryAmbiguous):
-            classify_handoff_recovery([state], expected_generation=1, expected_descriptor_sha256="a" * 64)
+            classify_handoff_recovery([state], expected_slot="A", expected_generation=1, expected_descriptor_sha256="a" * 64)

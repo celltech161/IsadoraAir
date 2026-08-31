@@ -429,7 +429,8 @@ class UpdaterDaemon:
             from .runtime_handoff import RecoveryAmbiguous, classify_handoff_recovery
             try:
                 facts = classify_handoff_recovery(
-                    active, expected_generation=self.expected_handoff_generation,
+                    active, expected_slot=self.expected_slot,
+                    expected_generation=self.expected_handoff_generation,
                     expected_descriptor_sha256=self.expected_handoff_descriptor_sha256,
                 )
             except RecoveryAmbiguous:

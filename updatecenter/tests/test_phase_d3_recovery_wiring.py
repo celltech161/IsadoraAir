@@ -45,6 +45,7 @@ class RecoverJobsHandoffWiringTests(SimpleTestCase):
         import threading
         daemon._start_lock = threading.Lock()
         daemon._workers = {}
+        daemon.expected_slot = kwargs.get("expected_slot")
         daemon.expected_handoff_generation = kwargs.get("expected_handoff_generation")
         daemon.expected_handoff_descriptor_sha256 = kwargs.get("expected_handoff_descriptor_sha256")
         return daemon, executor
@@ -68,15 +69,15 @@ class RecoverJobsHandoffWiringTests(SimpleTestCase):
         self.store.milestone("22222222-2222-4222-8222-222222222222", "runtime_activation_requested")
         self.store.update(
             "22222222-2222-4222-8222-222222222222",
-            protected_runtime_candidate={"generation": 2, "descriptor_sha256": "c" * 64},
+            protected_runtime_candidate={"candidate_slot": "B", "generation": 2, "descriptor_sha256": "c" * 64},
         )
-        daemon, executor = self._daemon(expected_handoff_generation=2, expected_handoff_descriptor_sha256="c" * 64)
+        daemon, executor = self._daemon(expected_slot="B", expected_handoff_generation=2, expected_handoff_descriptor_sha256="c" * 64)
         daemon.recover_jobs()
         self.assertEqual(executor.executed, ["22222222-2222-4222-8222-222222222222"])
 
     def test_no_matching_handoff_job_falls_through_to_original_rule(self):
         state, _ = self.store.accept("33333333-3333-4333-8333-333333333333", "r0004", "f" * 64)
-        daemon, executor = self._daemon(expected_handoff_generation=9, expected_handoff_descriptor_sha256="d" * 64)
+        daemon, executor = self._daemon(expected_slot="B", expected_handoff_generation=9, expected_handoff_descriptor_sha256="d" * 64)
         daemon.recover_jobs()
         # No handoff-matching job -- falls through to the ordinary
         # single-active-job rule, which still finds this one job.
@@ -94,16 +95,16 @@ class RecoverJobsHandoffWiringTests(SimpleTestCase):
         first_id = "44444444-4444-4444-8444-444444444444"
         self.store.accept(first_id, "r0004", "f" * 64)
         self.store.milestone(first_id, "runtime_activation_requested")
-        self.store.update(first_id, protected_runtime_candidate={"generation": 2, "descriptor_sha256": "e" * 64})
+        self.store.update(first_id, protected_runtime_candidate={"candidate_slot": "B", "generation": 2, "descriptor_sha256": "e" * 64})
         # Second job written DIRECTLY (bypassing accept()'s own single-
         # active-job guard, which a real caller can never get past) --
         # see this test's own docstring above.
         second_id = "55555555-5555-4555-8555-555555555555"
         second_state = dict(self.store.load(first_id))
-        second_state.update(job_id=second_id, protected_runtime_candidate={"generation": 2, "descriptor_sha256": "f" * 64})
+        second_state.update(job_id=second_id, protected_runtime_candidate={"candidate_slot": "B", "generation": 2, "descriptor_sha256": "f" * 64})
         self.store._atomic_write(self.store._state_path(second_id), second_state)
 
-        daemon, executor = self._daemon(expected_handoff_generation=2, expected_handoff_descriptor_sha256="e" * 64)
+        daemon, executor = self._daemon(expected_slot="B", expected_handoff_generation=2, expected_handoff_descriptor_sha256="e" * 64)
         daemon.recover_jobs()
         self.assertEqual(executor.executed, [])
 
