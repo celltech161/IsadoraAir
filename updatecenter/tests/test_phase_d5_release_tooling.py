@@ -7,6 +7,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import shutil
+from unittest.mock import patch
 
 from django.test import SimpleTestCase
 
@@ -193,3 +194,19 @@ class ProtectedRuntimeReleaseToolTests(SimpleTestCase):
         self.assertEqual(evidence["release_id"], "r0027")
         self.assertEqual(evidence["generation"], 2)
         self.assertEqual(evidence["verified_signers"], ["primary-release"])
+
+        with patch(
+            "updatecenter.protected_release_validator.git_adapter.changed_paths_between",
+            return_value=("deploy/updater_runtime/release.py",),
+        ) as changed_paths:
+            evidence = validate_protected_release(
+                checkout_root=checkout, manifest_path=manifest_path,
+                trust_policy_path=trust_path, signer_directory=signers,
+                previous_generation=1, previous_policy_path=previous_policy,
+                previous_commit="before", target_commit="after",
+            )
+        changed_paths.assert_called_once_with(checkout, "before", "after", "deploy")
+        self.assertEqual(
+            evidence["changed_paths"],
+            ["deploy/updater_runtime/release.py"],
+        )

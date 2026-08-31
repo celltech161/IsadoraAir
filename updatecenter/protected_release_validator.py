@@ -167,7 +167,9 @@ def validate_protected_release(
         raise ProtectedReleaseValidationError("previous_commit and target_commit must be supplied together")
     changed_paths: tuple[str, ...] = ()
     if previous_commit is not None:
-        paths = git_adapter.changed_paths_between(checkout, previous_commit, target_commit)
+        paths = git_adapter.changed_paths_between(
+            checkout, previous_commit, target_commit, "deploy",
+        )
         if paths is None:
             raise ProtectedReleaseValidationError("could not derive predecessor Git diff")
         changed_paths = tuple(sorted(paths))
