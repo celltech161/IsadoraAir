@@ -108,6 +108,34 @@ class ProtectedRuntimeIntentCrossCheckTests(SimpleTestCase):
             )
             self.assertEqual(findings, [])
 
+    def test_runtime_change_with_protected_candidate_is_accepted(self):
+        with FakeRepo() as repo:
+            previous = repo.rev_parse("HEAD")
+            repo.write("deploy/updater_runtime/isadoraair_updater/runtime.py", "changed\n")
+            target = repo.commit("signed protected runtime candidate")
+            rel = m.validate_manifest_dict(
+                _no_migrations_no_requirements(
+                    release_id="r0027",
+                    previous_release_id="r0026",
+                    protected_runtime={
+                        "generation": 2,
+                        "descriptor_path": "deploy/updater_runtime/runtime-descriptor.json",
+                        "descriptor_sha256": "a" * 64,
+                        "minimum_bootstrap_protocol_version": 1,
+                        "runtime_version": 5,
+                        "manifest_protocol_version": 5,
+                        "supported_wire_protocols": [3],
+                        "attestations": [
+                            "deploy/updater_attestations/runtime-descriptor.sig.json"
+                        ],
+                    },
+                )
+            )
+            findings = cc.cross_check_release(
+                rel, target, repo.work, previous_commit=previous,
+            )
+            self.assertEqual(findings, [])
+
     def test_ordinary_change_does_not_force_manual_bootstrap(self):
         with FakeRepo() as repo:
             previous = repo.rev_parse("HEAD")

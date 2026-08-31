@@ -77,12 +77,21 @@ def _check_protected_runtime_intent(rel, previous_commit, target_commit,
             field="manual_bootstrap_required",
             detail="could not verify the protected-runtime predecessor diff",
         )]
-    if paths and not rel.manual_bootstrap_required:
+    # Once Phase D is installed, a signed protected-runtime candidate is
+    # precisely the mechanism authorized to change this tree. The legacy
+    # manual valve remains mandatory only when the target manifest does not
+    # carry a strictly parsed protected_runtime declaration. Root still
+    # independently validates its generation, descriptor, attestations and
+    # signed policy before any mutation.
+    if paths and not (
+        rel.manual_bootstrap_required or rel.protected_runtime is not None
+    ):
         return [CrossCheckFinding(
             field="manual_bootstrap_required",
             detail=(
-                "deploy/updater_runtime/ changes require "
-                "manual_bootstrap_required=true"
+                "deploy/updater_runtime/ changes require either "
+                "manual_bootstrap_required=true or a validated "
+                "protected_runtime candidate"
             ),
         )]
     return []
