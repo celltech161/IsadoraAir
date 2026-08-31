@@ -58,6 +58,7 @@ class UpdaterDaemon:
                  expected_handoff_generation: int | None = None,
                  expected_handoff_descriptor_sha256: str | None = None,
                  expected_resumable_job_uuid: str | None = None,
+                 active_policy=None,
                  supervisor_client: object | None = None):
         self.config = config
         self.runner = runner or CommandRunner()
@@ -92,6 +93,7 @@ class UpdaterDaemon:
             expected_handoff_generation=expected_handoff_generation,
             expected_handoff_descriptor_sha256=expected_handoff_descriptor_sha256,
             expected_resumable_job_uuid=expected_resumable_job_uuid,
+            active_policy=active_policy,
         )
         self._supervisor_client = supervisor_client
         app_uid = pwd.getpwnam(config.application_user).pw_uid

@@ -28,25 +28,34 @@ UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]
 
 
 @dataclasses.dataclass(frozen=True)
-class CandidateIdentity:
+class ActiveIdentity:
+    """Identity of the supervisor-selected active A/B generation."""
+
+    slot: str
+    generation: int
+    descriptor_sha256: str
+
+    def __post_init__(self):
+        if self.slot not in ("A", "B"):
+            raise ValueError("ActiveIdentity.slot must be exactly 'A' or 'B'")
+        if not isinstance(self.generation, int) or isinstance(self.generation, bool) or self.generation < 1:
+            raise ValueError("ActiveIdentity.generation must be a positive integer")
+        if not SHA256_RE.fullmatch(self.descriptor_sha256):
+            raise ValueError("ActiveIdentity.descriptor_sha256 must be exactly 64 lowercase hex characters")
+
+
+@dataclasses.dataclass(frozen=True)
+class CandidateIdentity(ActiveIdentity):
     """Update Center Phase D, D4-B: the ONLY extra information
     launch_worker() may ever add to a candidate's argv -- exactly the
     four fixed, closed-shape fields updaterd.py's own argparse expects
     (--expected-slot/--expected-generation/--expected-descriptor-
     sha256/--expected-job-uuid), each independently validated here
     too, never a free-form string, path, or command."""
-    slot: str
-    generation: int
-    descriptor_sha256: str
     job_uuid: str
 
     def __post_init__(self):
-        if self.slot not in ("A", "B"):
-            raise ValueError("CandidateIdentity.slot must be exactly 'A' or 'B'")
-        if not isinstance(self.generation, int) or isinstance(self.generation, bool) or self.generation < 1:
-            raise ValueError("CandidateIdentity.generation must be a positive integer")
-        if not SHA256_RE.fullmatch(self.descriptor_sha256):
-            raise ValueError("CandidateIdentity.descriptor_sha256 must be exactly 64 lowercase hex characters")
+        super().__post_init__()
         if not UUID_RE.fullmatch(self.job_uuid):
             raise ValueError("CandidateIdentity.job_uuid must be a canonical lowercase UUID")
 
@@ -77,10 +86,13 @@ def resolve_entrypoint(slot_path: Path, entrypoint: str) -> Path:
 
 def launch_worker(slot_path: Path, entrypoint: str, *, config_path: Path,
                   extra_env: dict[str, str] | None = None,
+                  active_identity: ActiveIdentity | None = None,
                   candidate_identity: CandidateIdentity | None = None) -> TrackedChild:
     """Runs exactly: /usr/bin/python3 -I <resolved-entrypoint> --config
     <config_path> [--expected-slot ... --expected-generation ...
-    --expected-descriptor-sha256 ... --expected-job-uuid ...]. `-I`
+    --expected-descriptor-sha256 ... [--expected-job-uuid ...]]. The
+    three-field form identifies a selected active A/B generation; the
+    four-field form identifies a candidate resuming one durable job. `-I`
     (isolated mode) ignores PYTHONPATH/PYTHONHOME and user site-
     packages -- the candidate worker gets only what its own slot
     directory and the standard library provide, never anything this
@@ -91,11 +103,15 @@ def launch_worker(slot_path: Path, entrypoint: str, *, config_path: Path,
     raw caller-supplied string appended directly."""
     entry_path = resolve_entrypoint(slot_path, entrypoint)
     argv = [PYTHON_BINARY, "-I", str(entry_path), "--config", str(config_path)]
-    if candidate_identity is not None:
+    if active_identity is not None and candidate_identity is not None:
+        raise LaunchError("active_identity and candidate_identity are mutually exclusive")
+    identity = candidate_identity if candidate_identity is not None else active_identity
+    if identity is not None:
         argv.extend([
-            "--expected-slot", candidate_identity.slot,
-            "--expected-generation", str(candidate_identity.generation),
-            "--expected-descriptor-sha256", candidate_identity.descriptor_sha256,
-            "--expected-job-uuid", candidate_identity.job_uuid,
+            "--expected-slot", identity.slot,
+            "--expected-generation", str(identity.generation),
+            "--expected-descriptor-sha256", identity.descriptor_sha256,
         ])
+    if candidate_identity is not None:
+        argv.extend(["--expected-job-uuid", candidate_identity.job_uuid])
     return launch_tracked(argv, cwd=Path(slot_path), env=extra_env)

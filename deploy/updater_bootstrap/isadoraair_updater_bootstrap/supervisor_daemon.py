@@ -22,7 +22,7 @@ import time
 from .activation import ActivationPhase
 from .config import BootstrapConfig
 from .ipc_server import IPCServer
-from .launch import CandidateIdentity, launch_worker
+from .launch import ActiveIdentity, CandidateIdentity, launch_worker
 from .process import TrackedChild
 from .slots import SlotLayout
 from .supervisor import (
@@ -111,10 +111,15 @@ class SupervisorDaemon:
             LOGGER.info("recovered interrupted activation transaction: %s", action)
 
     def _launch_active_worker(self) -> None:
-        slot = self.ipc_server.state.active_slot
+        state = self.ipc_server.state
+        slot = state.active_slot
+        identity = ActiveIdentity(
+            slot=slot.value, generation=state.active_generation,
+            descriptor_sha256=state.active_descriptor_sha256,
+        )
         self.active_worker = launch_worker(
             self.layout.slot_path(slot), ENTRYPOINT_NAME, config_path=self.worker_config_path,
-            extra_env=self.worker_extra_env,
+            active_identity=identity, extra_env=self.worker_extra_env,
         )
         self.lifecycle.record_launch(pid=self.active_worker.pid)
         LOGGER.info("launched active worker: slot=%s pid=%s", slot.value, self.active_worker.pid)

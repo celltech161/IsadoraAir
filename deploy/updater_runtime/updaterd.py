@@ -1,21 +1,23 @@
 #!/usr/bin/python3
 """Installed entry point; production runs this file only from protected storage.
 
-Update Center Phase D, D4-B: the SAME file serves two launch shapes --
-`--config` alone (today's ordinary, pre-Phase-D worker, unstoppable/
-untouched), or `--config` PLUS the four candidate identity arguments
+Update Center Phase D, D4-B/D5.1: the SAME file serves three launch shapes --
+`--config` alone (the ordinary pre-Phase-D worker), `--config` plus the
+three active A/B generation identity arguments, or `--config` plus all four
+candidate identity arguments
 (`--expected-slot`, `--expected-generation`, `--expected-descriptor-
 sha256`, `--expected-job-uuid`), which is exactly what the supervisor's
 own launch.launch_worker() invokes for a real Phase-D handoff -- fixed
 argument NAMES only, never an arbitrary path/command (see launch.py's
 own docstring: `/usr/bin/python3 -I <slot>/updaterd.py --config <path>
 [--expected-slot ... --expected-generation ... --expected-descriptor-
-sha256 ... --expected-job-uuid ...]`, nothing else is ever on this
+sha256 ... [--expected-job-uuid ...]]`, nothing else is ever on this
 argv)."""
 from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 from pathlib import Path
 import re
@@ -115,21 +117,25 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--expected-job-uuid", default=None)
     arguments = parser.parse_args(argv)
 
-    identity = (
+    slot_identity = (
         arguments.expected_slot, arguments.expected_generation,
-        arguments.expected_descriptor_sha256, arguments.expected_job_uuid,
+        arguments.expected_descriptor_sha256,
     )
-    if len({value is None for value in identity}) != 1:
+    if not (all(value is None for value in slot_identity)
+            or all(value is not None for value in slot_identity)):
         parser.error(
-            "--expected-slot/--expected-generation/--expected-descriptor-sha256/--expected-job-uuid "
+            "--expected-slot/--expected-generation/--expected-descriptor-sha256 "
             "must be given all together or not at all"
         )
+    if arguments.expected_job_uuid is not None and arguments.expected_slot is None:
+        parser.error("--expected-job-uuid requires a complete slot identity")
     if arguments.expected_generation is not None:
         if arguments.expected_generation < 1:
             parser.error("--expected-generation must be a positive integer")
         if not _SHA256_RE.fullmatch(arguments.expected_descriptor_sha256 or ""):
             parser.error("--expected-descriptor-sha256 must be exactly 64 lowercase hex characters")
-        if not _UUID_RE.fullmatch(arguments.expected_job_uuid or ""):
+        if (arguments.expected_job_uuid is not None
+                and not _UUID_RE.fullmatch(arguments.expected_job_uuid)):
             parser.error("--expected-job-uuid must be a canonical lowercase UUID")
     return arguments
 
@@ -140,8 +146,9 @@ def main() -> int:
         sys.stderr.write("updaterd: the protected updater daemon must run as root\n")
         return 1
     _assert_protected_install(expected_slot=arguments.expected_slot)
-    is_candidate = arguments.expected_slot is not None
-    if is_candidate:
+    is_slot_worker = arguments.expected_slot is not None
+    is_candidate = arguments.expected_job_uuid is not None
+    if is_slot_worker:
         _assert_descriptor_identity(
             expected_slot=arguments.expected_slot,
             expected_descriptor_sha256=arguments.expected_descriptor_sha256,
@@ -150,9 +157,11 @@ def main() -> int:
     # every package file have been proven root-owned and application-unwritable.
     from isadoraair_updater.config import load_config
     from isadoraair_updater.daemon import UpdaterDaemon
+    from protected_bootstrap.policy import parse_policy_dict
 
     config = load_config(Path(arguments.config), enforce_protection=True)
-    if is_candidate:
+    active_policy = None
+    if is_slot_worker:
         # Phase two of D4-B step 1: now that root-owned config is
         # trusted, cross-check the supervisor's OWN configured
         # slots_root against where this process is ACTUALLY running
@@ -164,14 +173,22 @@ def main() -> int:
                 "inside this station's configured phase_d_supervisor_slots_root\n"
             )
             return 1
+        try:
+            policy_data = json.loads((_ENTRY_ROOT / "protected-policy.json").read_text(encoding="utf-8"))
+            active_policy = parse_policy_dict(policy_data, label="active protected-policy.json")
+        except (OSError, UnicodeError, ValueError) as exc:
+            sys.stderr.write(f"updaterd: invalid active protected policy: {exc}\n")
+            return 1
+    if is_candidate:
         daemon = UpdaterDaemon(
             config, expected_slot=arguments.expected_slot,
             expected_handoff_generation=arguments.expected_generation,
             expected_handoff_descriptor_sha256=arguments.expected_descriptor_sha256,
             expected_resumable_job_uuid=arguments.expected_job_uuid,
+            active_policy=active_policy,
         )
     else:
-        daemon = UpdaterDaemon(config)
+        daemon = UpdaterDaemon(config, active_policy=active_policy)
     try:
         daemon.serve_forever()
     finally:

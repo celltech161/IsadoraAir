@@ -17,6 +17,8 @@ from isadoraair_updater.config import validate_config_dict
 from isadoraair_updater.daemon import DaemonError, UpdaterDaemon
 from isadoraair_updater.jobs import JobStore
 from isadoraair_updater.process import CommandRunner
+from protected_bootstrap.policy import parse_policy_dict
+from updaterd import parse_args as parse_updaterd_args
 
 
 class _FakeSupervisorClient:
@@ -55,6 +57,32 @@ class DaemonCandidateIdentityValidationTests(SimpleTestCase):
         self.addCleanup(store.close)
         daemon = UpdaterDaemon(self.config, store=store, executor=_NoopExecutor(), authorized_uids={0})
         self.assertIsNone(daemon.expected_slot)
+
+    def test_active_signed_policy_is_forwarded_to_real_executor(self):
+        store = JobStore(self.config.jobs_root, self.config.logs_root, acquire_daemon_lock=False)
+        self.addCleanup(store.close)
+        policy = parse_policy_dict({
+            "schema_version": 1,
+            "managed_units": [{"unit": "fixture.service", "policy": "INSTALL_ONLY"}],
+        })
+        daemon = UpdaterDaemon(
+            self.config, store=store, authorized_uids={0}, active_policy=policy,
+        )
+        self.assertIs(daemon.executor.active_policy, policy)
+        self.assertIs(daemon.executor.systemd.signed_policy, policy)
+
+    def test_entrypoint_accepts_active_slot_identity_without_job_uuid(self):
+        arguments = parse_updaterd_args([
+            "--config", "/etc/isadoraair/station.json",
+            "--expected-slot", "A", "--expected-generation", "1",
+            "--expected-descriptor-sha256", "a" * 64,
+        ])
+        self.assertEqual(arguments.expected_slot, "A")
+        self.assertIsNone(arguments.expected_job_uuid)
+
+    def test_entrypoint_refuses_job_uuid_without_complete_slot_identity(self):
+        with self.assertRaises(SystemExit):
+            parse_updaterd_args(["--expected-job-uuid", "a" * 36])
 
 
 class ReportCandidateReadinessTests(SimpleTestCase):

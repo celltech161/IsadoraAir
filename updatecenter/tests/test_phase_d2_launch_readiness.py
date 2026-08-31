@@ -10,7 +10,7 @@ from django.test import SimpleTestCase
 
 from .phase_b_helpers import BOOTSTRAP_ROOT  # noqa: F401
 
-from isadoraair_updater_bootstrap.launch import LaunchError, launch_worker, resolve_entrypoint
+from isadoraair_updater_bootstrap.launch import ActiveIdentity, LaunchError, launch_worker, resolve_entrypoint
 from isadoraair_updater_bootstrap.readiness import ReadinessError, ReadinessState, classify_readiness, parse_readiness_facts_dict
 
 VALID_SHA = "a" * 64
@@ -111,6 +111,27 @@ class LaunchWorkerTests(SimpleTestCase):
         # anything unusual, so this mainly guards against a future
         # accidental removal of "-I" changing exit behavior silently).
         child = launch_worker(self.slot_path, "updaterd.py", config_path=self.slot_path / "config.json")
+        deadline = time.monotonic() + 5
+        while child.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertEqual(child.poll(), 0)
+
+    def test_active_slot_identity_is_supplied_without_candidate_job_uuid(self):
+        (self.slot_path / "updaterd.py").write_text(
+            "import argparse\n"
+            "p = argparse.ArgumentParser()\n"
+            "p.add_argument('--config', required=True)\n"
+            "p.add_argument('--expected-slot', required=True)\n"
+            "p.add_argument('--expected-generation', required=True, type=int)\n"
+            "p.add_argument('--expected-descriptor-sha256', required=True)\n"
+            "a = p.parse_args()\n"
+            "assert (a.expected_slot, a.expected_generation, a.expected_descriptor_sha256) == "
+            "('A', 1, '" + VALID_SHA + "')\n"
+        )
+        child = launch_worker(
+            self.slot_path, "updaterd.py", config_path=self.slot_path / "config.json",
+            active_identity=ActiveIdentity(slot="A", generation=1, descriptor_sha256=VALID_SHA),
+        )
         deadline = time.monotonic() + 5
         while child.poll() is None and time.monotonic() < deadline:
             time.sleep(0.02)
