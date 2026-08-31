@@ -488,7 +488,16 @@ class Executor:
                 needed_units = (
                     set(plan.systemd_units_changed) | set(plan.systemd_units_new_required)
                 ) - resolve_known_managed_units(active_policy=self.active_policy)
-                manifest_declared = set(plan.systemd_units_new_required) | set(plan.systemd_units_new_optional)
+                # An exact existing template whose bytes change is just as
+                # predecessor-diff-checked as a newly added/promoted unit.
+                # This matters for the Phase-D Weather transition: the four
+                # templates already exist, while the candidate signed policy
+                # makes their exact names newly executable by this runtime.
+                manifest_declared = (
+                    set(plan.systemd_units_changed)
+                    | set(plan.systemd_units_new_required)
+                    | set(plan.systemd_units_new_optional)
+                )
                 unit_violations = verify_new_units_authorized_by_candidate_policy(
                     needed_units=frozenset(needed_units), manifest_declared_units=frozenset(manifest_declared),
                     candidate_policy=outcome.candidate_policy,

@@ -160,6 +160,18 @@ class SystemdManager:
             else:
                 self.verify_unit_loaded(unit)
                 installed_only.append(unit)
+        # A protected-runtime transition can make an already-present,
+        # byte-changed template newly authoritative through signed policy.
+        # INSTALL_ONLY remains exactly that: prove systemd parsed it, but
+        # never enable or start it. Changed ENABLE_NOW units retain the
+        # historical behavior here (restart only when separately declared).
+        for unit in plan.systemd_units_changed:
+            if unit in plan.systemd_units_new_required:
+                continue
+            policy = resolve_unit_policy(unit, signed_policy=self.signed_policy)
+            if policy is UnitActivationPolicy.INSTALL_ONLY:
+                self.verify_unit_loaded(unit)
+                installed_only.append(unit)
         return {
             "changed": changed,
             "enabled": enabled,
