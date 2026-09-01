@@ -353,25 +353,62 @@ def restore_phase_d_component(*, component_root: Path, fake_root: Path) -> dict:
     """Offline, non-privileged restore into an empty fake root."""
 
     evidence = validate_phase_d_component(component_root)
+    _runtime_paths()
+    from isadoraair_updater.config import validate_config_dict as validate_station_config
+    from isadoraair_updater_bootstrap.config import validate_config_dict as validate_bootstrap_config
+    from isadoraair_updater_bootstrap.state import parse_runtime_state_dict
+
     destination = Path(fake_root)
     if destination.exists():
         raise PhaseDRecoveryError("fake restore root must not already exist")
     staging = Path(tempfile.mkdtemp(prefix=f".{destination.name}.restore-", dir=destination.parent))
     try:
         _copy_tree(Path(component_root), staging / "var/lib/isadoraair/recovery/protected-updater")
-        # Materialize the intended protected surfaces separately.  This is a
-        # fake root only; ownership transition remains the operator runbook's
-        # explicit privileged step.
         payload = staging / "var/lib/isadoraair/recovery/protected-updater"
+        station_value = _read_json(payload / "station.json", label="station config")
+        station = validate_station_config(station_value, allow_local_repository=True)
+        bootstrap_value = _read_json(payload / "updater-bootstrap.json", label="bootstrap config")
+        bootstrap = validate_bootstrap_config(
+            bootstrap_value,
+            application_root=station.application_root,
+            enforce_root_ownership=False,
+        )
+        state = parse_runtime_state_dict(_read_json(payload / "runtime-state.json", label="runtime state"))
+        restore_manifest = _read_json(payload / MANIFEST_NAME, label="restore manifest")
+
+        def restored(path: Path) -> Path:
+            path = Path(path)
+            if not path.is_absolute() or ".." in path.parts:
+                raise PhaseDRecoveryError(f"restore destination is not a safe absolute path: {path}")
+            return staging.joinpath(*path.parts[1:])
+
+        # Materialize the exact protected surfaces named by the validated
+        # root-owned configuration. The payload stores slots by logical role
+        # (active/previous); restore maps those roles back to their recorded
+        # A/B identities and republishes each descriptor at the supervisor's
+        # fixed staging convention so the real worker can verify itself.
         _copy_tree(payload / "bootstrap" / "source", staging / "usr/local/libexec/isadoraair-updater-bootstrap")
         service_name = _read_json(payload / MANIFEST_NAME, label="restore manifest")["supervisor_service"]
         _copy_plain(payload / "bootstrap" / service_name, staging / "etc/systemd/system" / service_name)
         _copy_plain(payload / "station.json", staging / "etc/isadoraair/station.json")
         _copy_plain(payload / "updater-bootstrap.json", staging / "etc/isadoraair/updater-bootstrap.json")
-        _copy_plain(payload / "trust-policy.json", staging / "etc/isadoraair/updater-trust.json")
-        _copy_tree(payload / "signer-public-keys", staging / "etc/isadoraair/updater-signers")
-        _copy_tree(payload / "runtime-slots", staging / "var/lib/isadoraair/updater-runtime-slots")
-        _copy_plain(payload / "runtime-state.json", staging / "var/lib/isadoraair/updater-runtime-state.json")
+        _copy_plain(payload / "trust-policy.json", restored(bootstrap.trust_policy_path))
+        _copy_tree(payload / "signer-public-keys", restored(bootstrap.signer_root))
+
+        slot_mappings = [("active", state.active_slot, state.active_descriptor_sha256)]
+        if state.previous_slot is not None:
+            slot_mappings.append(("previous", state.previous_slot, state.previous_descriptor_sha256))
+        for label, slot, descriptor_digest in slot_mappings:
+            _copy_tree(payload / "runtime-slots" / label, restored(bootstrap.slots_root / slot.value))
+            identity = restore_manifest["runtime_identities"].get(descriptor_digest)
+            if identity is None:
+                raise PhaseDRecoveryError(f"{label} descriptor identity is absent from restore manifest")
+            descriptor_source = payload / _safe_relative(identity["path"])
+            descriptor_destination = restored(
+                bootstrap.slots_root / ".staging" / f"descriptor-{slot.value}.json"
+            )
+            _copy_plain(descriptor_source, descriptor_destination)
+        _copy_plain(payload / "runtime-state.json", restored(bootstrap.runtime_state_path))
         os.rename(staging, destination)
     except BaseException:
         shutil.rmtree(staging, ignore_errors=True)

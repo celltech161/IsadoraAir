@@ -100,12 +100,46 @@ class PhaseDRecoveryComponentTests(SimpleTestCase):
         }, sort_keys=True, separators=(",", ":")))
         self.runtime_state.chmod(0o600)
         self.station = self.root / "station.json"
-        self.station.write_text('{"schema_version":1,"station":"fixture"}\n')
+        self.station.write_text(json.dumps({
+            "schema_version": 1,
+            "trusted_repository_url": "https://example.invalid/isadoraair.git",
+            "trusted_branch": "main",
+            "application_root": "/opt/isadoraair",
+            "application_user": "nobody",
+            "application_group": "nobody",
+            "application_environment_file": "/opt/isadoraair/.env",
+            "trusted_repository": "/var/lib/isadoraair-updater/repository.git",
+            "jobs_root": "/var/lib/isadoraair-updater/jobs",
+            "logs_root": "/var/log/isadoraair-updater",
+            "staging_root": "/var/lib/isadoraair-updater/staging",
+            "checkpoint_root": "/var/backups/isadoraair/update-checkpoints",
+            "socket_path": "/run/isadoraair-updater/updater.sock",
+            "systemd_unit_root": "/etc/systemd/system",
+            "render_values": {
+                "isa_user": "nobody",
+                "isa_root": "/opt/isadoraair",
+                "isa_home": "/var/lib/isadoraair",
+                "syndicated_root": "/var/lib/isadoraair/syndicated",
+                "weather_root": "/var/lib/isadoraair/weather",
+                "ogremote_root": "/var/lib/isadoraair/ogremote",
+            },
+            "database": {
+                "name": "isadoraair", "user": "isadoraair",
+                "host": "127.0.0.1", "port": 5432, "pgpass_file": None,
+            },
+            "gunicorn_health_url": "http://127.0.0.1:8000/health/",
+            "update_execution_enabled": False,
+            "operator_restart_units": [],
+            "phase_d_supervisor_activation_socket": "/run/isadoraair-updater-bootstrap/activation.sock",
+            "phase_d_supervisor_slots_root": "/var/lib/isadoraair-updater-bootstrap/runtime-slots",
+            "phase_d_trust_policy_path": "/etc/isadoraair/updater-trust.json",
+            "phase_d_signer_root": "/etc/isadoraair/updater-signers",
+        }))
         self.station.chmod(0o600)
         self.bootstrap_config = self.root / "updater-bootstrap.json"
         self.bootstrap_config.write_text(json.dumps({
             "schema_version": 1, "bootstrap_protocol_version": 1,
-            "slots_root": "/var/lib/isadoraair-updater-bootstrap/slots",
+            "slots_root": "/var/lib/isadoraair-updater-bootstrap/runtime-slots",
             "runtime_state_path": "/var/lib/isadoraair-updater-bootstrap/runtime-state.json",
             "activation_socket": "/run/isadoraair-updater-bootstrap/activation.sock",
             "worker_socket": "/run/isadoraair-updater/updater.sock",
@@ -185,7 +219,13 @@ class PhaseDRecoveryComponentTests(SimpleTestCase):
         self.assertEqual(restored["readiness"], "not-run")
         fake = self.root / "fake-root"
         self.assertTrue((fake / "usr/local/libexec/isadoraair-updater-bootstrap/updater_bootstrapd.py").is_file())
-        self.assertTrue((fake / "var/lib/isadoraair/updater-runtime-state.json").is_file())
+        runtime_root = fake / "var/lib/isadoraair-updater-bootstrap"
+        self.assertTrue((runtime_root / "runtime-state.json").is_file())
+        self.assertTrue((runtime_root / "runtime-slots/A/updaterd.py").is_file())
+        self.assertTrue((runtime_root / "runtime-slots/B/updaterd.py").is_file())
+        self.assertTrue((runtime_root / "runtime-slots/.staging/descriptor-A.json").is_file())
+        self.assertTrue((runtime_root / "runtime-slots/.staging/descriptor-B.json").is_file())
+        self.assertFalse((fake / "var/lib/isadoraair/updater-runtime-slots").exists())
 
     def test_schema_two_attachment_preserves_protected_component_modes(self):
         self._capture()
