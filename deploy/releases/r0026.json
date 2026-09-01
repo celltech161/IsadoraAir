@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "release_id": "r0026",
+  "previous_release_id": "r0025",
+  "minimum_updater_protocol_version": 4,
+  "summary": "Final manual Update Center bootstrap: establishes the immutable Phase-D root supervisor, production trust/signing policy, and signed generation-1 protected runtime worker alongside the existing updater. Manually installed by the operator; does not itself change station feature behavior, migrations, or Weather service configuration.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": true,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [
+    "updater-bootstrapd.service"
+  ],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [],
+  "nginx_changed": false,
+  "runtime_components_changed": true,
+  "minimum_supported_release_id": "r0007"
+}
