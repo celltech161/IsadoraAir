@@ -8,6 +8,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tempfile
+from copy import deepcopy
 
 from django.test import SimpleTestCase
 
@@ -22,6 +23,11 @@ from isadoraair.phase_d_recovery import (
     capture_phase_d_component,
     restore_phase_d_component,
     validate_phase_d_component,
+)
+from isadoraair.runtime_components import load_runtime_components
+from isadoraair.runtime_recovery import (
+    RuntimeRecoveryBuilder,
+    attach_phase_d_recovery_component,
 )
 
 
@@ -180,6 +186,40 @@ class PhaseDRecoveryComponentTests(SimpleTestCase):
         fake = self.root / "fake-root"
         self.assertTrue((fake / "usr/local/libexec/isadoraair-updater-bootstrap/updater_bootstrapd.py").is_file())
         self.assertTrue((fake / "var/lib/isadoraair/updater-runtime-state.json").is_file())
+
+    def test_schema_two_attachment_preserves_protected_component_modes(self):
+        self._capture()
+        product_manifest = deepcopy(load_runtime_components())
+        native_source = self.root / "native-source"
+        native_source.mkdir()
+        for name, declaration in product_manifest["components"]["fdkaac"]["source_archives"].items():
+            content = f"fixture-{name}".encode("ascii")
+            (native_source / declaration["filename"]).write_bytes(content)
+            declaration["bytes"] = len(content)
+            declaration["sha256"] = hashlib.sha256(content).hexdigest()
+
+        base = self.root / "base-schema-one"
+        RuntimeRecoveryBuilder(product_manifest=product_manifest).apply(
+            native_source_dir=native_source,
+            output=base,
+            payload_id="phase-d-mode-regression",
+        )
+        combined = self.root / "schema-two"
+        evidence = attach_phase_d_recovery_component(
+            existing_payload=base,
+            protected_updater_component=self.component,
+            output=combined,
+            product_manifest=product_manifest,
+        )
+
+        self.assertEqual(evidence.result, "pass")
+        protected = combined / "protected-updater"
+        self.assertEqual((protected / "station.json").stat().st_mode & 0o777, 0o600)
+        self.assertEqual((protected / "runtime-state.json").stat().st_mode & 0o777, 0o600)
+        self.assertEqual(
+            (protected / "runtime-slots" / "active" / "updaterd.py").stat().st_mode & 0o777,
+            0o755,
+        )
 
     def test_claimed_phase_d_backup_fails_closed_on_each_critical_gap(self):
         self._capture()

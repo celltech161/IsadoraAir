@@ -233,7 +233,9 @@ def _copy_regular(source: Path, destination: Path, *, mode: int = 0o644) -> str:
     return digest.hexdigest()
 
 
-def _copy_tree_verified(source_root: Path, destination_root: Path) -> None:
+def _copy_tree_verified(
+    source_root: Path, destination_root: Path, *, preserve_modes: bool = False,
+) -> None:
     """Copy an entire directory tree of plain regular files only --
     raises on the first symlink, non-regular file, or hardlink
     encountered anywhere in the source tree. Confined: every produced
@@ -250,7 +252,8 @@ def _copy_tree_verified(source_root: Path, destination_root: Path) -> None:
             source_file = current_path / name
             relative = source_file.relative_to(source_root)
             destination_file = destination_root / relative
-            _copy_regular(source_file, destination_file)
+            mode = stat.S_IMODE(source_file.stat().st_mode) if preserve_modes else 0o644
+            _copy_regular(source_file, destination_file, mode=mode)
 
 
 def _normalize_payload_modes(root: Path) -> None:
@@ -943,10 +946,16 @@ def attach_phase_d_recovery_component(
     staging.mkdir(mode=0o755)
     try:
         _copy_tree_verified(source, staging)
+        _normalize_payload_modes(staging)
         target_component = staging / PROTECTED_UPDATER_SUBDIR
         if target_component.exists():
             raise RuntimeRecoveryError("source payload already contains a protected-updater component")
-        _copy_tree_verified(component, target_component)
+        # Unlike historical Foundation-E payload material, the Phase-D
+        # component has a signed/validated file-mode inventory: root-only
+        # configuration and state remain 0600, while executable entrypoints
+        # remain 0755. Preserve those modes exactly instead of flattening the
+        # component to the historical payload-wide 0644 publication mode.
+        _copy_tree_verified(component, target_component, preserve_modes=True)
         manifest = _read_manifest(staging)
         manifest["schema_version"] = PHASE_D_RECOVERY_SCHEMA_VERSION
         manifest["components"]["protected_updater"] = {
@@ -959,7 +968,6 @@ def attach_phase_d_recovery_component(
             staging / RECOVERY_MANIFEST_FILENAME,
             json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode("utf-8"),
         )
-        _normalize_payload_modes(staging)
         evidence = validate_recovery_payload(staging, product_manifest=active_product_manifest)
         if evidence.result != RESULT_PASS:
             raise RuntimeRecoveryError(
