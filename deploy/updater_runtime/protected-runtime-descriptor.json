@@ -1,0 +1,169 @@
+{
+  "bundle_sha256": "b9f78e90a5a2a77a35f25efccb0d644fad59bfdd4550f1ce32f26d0c758580c6",
+  "entrypoint": "updaterd.py",
+  "files": [
+    {
+      "mode": "0644",
+      "path": "README.md",
+      "sha256": "0a71a3985b1e71562f0a1863cc816abc954670c69414ea404f9c9e60a90ebf26",
+      "size_bytes": 3803
+    },
+    {
+      "mode": "0644",
+      "path": "isadoraair_updater/__init__.py",
+      "sha256": "1fd677ccbd691cfbb97ba11764f771b98bdec4315603d8ec31fc1bf40c60ebf6",
+      "size_bytes": 6021
+    },
+    {
+      "mode": "0644",
+      "path": "isadoraair_updater/checkpoint.py",
+      "sha256": "d917f68f284f283aa08e505c017cd5974eac2aa797f404c0c3fe0026bc67f9ca",
+      "size_bytes": 4979
+    },
+    {
+      "mode": "0644",
+      "path": "isadoraair_updater/config.py",
+      "sha256": "f12d9f4e1e8da5728ea23f2aecb8009d664c1d62d12809f81430bbb99374d36f",
+      "size_bytes": 15695
+    },
+    {
+      "mode": "0644",
+      "path": "isadoraair_updater/daemon.py",
+      "sha256": "a5aa341905ca53469ab342c48714e71556a0b0bc9c69e04237bd19a0f51d3b39",
+      "size_bytes": 23191
+    },
+    {
+      "mode": "0644",
+      "path": "isadoraair_updater/executor.py",
+      "sha256": "2d6b7ba45a76c3bd2d0d024548ca7227ed9e33ca0f2673433871b007120ed76a",
+      "size_bytes": 49784
+    },
+    {
+      "mode": "0644",
+      "path": "isadoraair_updater/jobs.py",
+      "sha256": "3ba4d9df5d7a825e056fc8ec1e670cf7f86eeeea1d64a31419cc34ec0fb60da2",
+      "size_bytes": 15416
+    },
+    {
+      "mode": "0644",
+      "path": "isadoraair_updater/process.py",
+      "sha256": "341287af32b01b7a55b6d901b7eb900c12f892c25d7a2f552973bcb1c9c6fdde",
+      "size_bytes": 5949
+    },
+    {
+      "mode": "0644",
+      "path": "isadoraair_updater/protocol.py",
+      "sha256": "6b65d2297394055b6b0e4e0a0fa21d73bb2169d00e34143ad9e85f96657e8bf3",
+      "size_bytes": 4626
+    },
+    {
+      "mode": "0644",
+      "path": "isadoraair_updater/release.py",
+      "sha256": "9c94fca54218d7cc9351ae6e5c96c92914826e99fe53d2fd521842d3df823ad4",
+      "size_bytes": 52189
+    },
+    {
+      "mode": "0644",
+      "path": "isadoraair_updater/runtime_handoff.py",
+      "sha256": "9e1e0be736593ac6d6a93be41b69e67876f646173c2a23bac3fbb9df2b7816cd",
+      "size_bytes": 30560
+    },
+    {
+      "mode": "0644",
+      "path": "isadoraair_updater/security.py",
+      "sha256": "7fbed7fe62584f6c25af5ecb0cae63cac38fee7a3f7275542b476a87653a77ac",
+      "size_bytes": 1687
+    },
+    {
+      "mode": "0644",
+      "path": "isadoraair_updater/staging.py",
+      "sha256": "4799ea5168896c55f392cb89272915c781d3bf7727492462c13c09611aa51606",
+      "size_bytes": 5297
+    },
+    {
+      "mode": "0644",
+      "path": "isadoraair_updater/supervisor_client.py",
+      "sha256": "e6128a2ddc0e6ffd5db2f786ac83839f73582c0df08d2f3030aab0c84770f68c",
+      "size_bytes": 8294
+    },
+    {
+      "mode": "0644",
+      "path": "isadoraair_updater/systemd.py",
+      "sha256": "9b1942773a81512ea57c9895d7702f2459e4b4f25feb1e01970a16d5de1edd7d",
+      "size_bytes": 12850
+    },
+    {
+      "mode": "0644",
+      "path": "protected-policy.json",
+      "sha256": "4fd4bc6b5e0cb292f83721f0bde595b531e089acc4c89c74b2ccc3f17159541f",
+      "size_bytes": 1260
+    },
+    {
+      "mode": "0644",
+      "path": "protected_bootstrap/__init__.py",
+      "sha256": "694c1996f9eabab0a881a971e7033d8838100a0415b83dc871ec1f8292d6e92d",
+      "size_bytes": 1819
+    },
+    {
+      "mode": "0644",
+      "path": "protected_bootstrap/attestation.py",
+      "sha256": "fceedbe3acf4b9dd463ba3e34f09fe175d946e9a70e2a4870a00e9921ec3e229",
+      "size_bytes": 7240
+    },
+    {
+      "mode": "0644",
+      "path": "protected_bootstrap/cross_check.py",
+      "sha256": "b60d0c8eedc1f330b565c353e997de7124f8bdfabcd98b02b806cde3eff0603e",
+      "size_bytes": 5865
+    },
+    {
+      "mode": "0644",
+      "path": "protected_bootstrap/descriptor.py",
+      "sha256": "24688ce6ca7b0caff751bd3cdacd417820449870cd5f829178c793c01e3b8c56",
+      "size_bytes": 15974
+    },
+    {
+      "mode": "0644",
+      "path": "protected_bootstrap/manifest_field.py",
+      "sha256": "ef9944497d72cca1ecc90c183be0318c5b4475b76c83586cc04e9886829a201f",
+      "size_bytes": 7869
+    },
+    {
+      "mode": "0644",
+      "path": "protected_bootstrap/policy.py",
+      "sha256": "9c464ebee51834a8a88a1bd88a6f65d56adeb0d77d679372f323d1ac8a4bc426",
+      "size_bytes": 6589
+    },
+    {
+      "mode": "0644",
+      "path": "protected_bootstrap/trust.py",
+      "sha256": "fe6816be2876a77e56058562507e490b4e9004bc181c84e9688d8faa9529a888",
+      "size_bytes": 11181
+    },
+    {
+      "mode": "0644",
+      "path": "protected_bootstrap/verification.py",
+      "sha256": "5d593a5da86994cb86e69336846b842ac1b922720cf4eb12a94da252931d6332",
+      "size_bytes": 9037
+    },
+    {
+      "mode": "0644",
+      "path": "updaterctl.py",
+      "sha256": "450e478d13c21200c6631683bb43782f46240ae1f65a3fe9818d12884c3f2832",
+      "size_bytes": 1740
+    },
+    {
+      "mode": "0755",
+      "path": "updaterd.py",
+      "sha256": "b1f64373bc58858d99f25b8b3f740419684ff5472596da593297df42e6e87122",
+      "size_bytes": 9975
+    }
+  ],
+  "generation": 2,
+  "manifest_protocol_version": 5,
+  "runtime_version": 5,
+  "schema_version": 1,
+  "supported_wire_protocols": [
+    3
+  ]
+}

@@ -8,4 +8,4 @@ Type=oneshot
 User=@@ISA_USER@@
 Group=@@ISA_USER@@
 WorkingDirectory=@@WEATHER_ROOT@@
-ExecStart=@@WEATHER_ROOT@@/venv/bin/python @@WEATHER_ROOT@@/wx_forecast.py --mode 3day --voice day
+ExecStart=@@WEATHER_ROOT@@/venv/bin/python @@WEATHER_ROOT@@/wx_forecast.py --mode 3day --voice auto

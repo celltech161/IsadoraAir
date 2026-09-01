@@ -35,6 +35,22 @@
     {
       "policy": "ENABLE_NOW",
       "unit": "isadoraair-sync-road-conditions.timer"
+    },
+    {
+      "policy": "INSTALL_ONLY",
+      "unit": "wx-forecast-1day-day.service"
+    },
+    {
+      "policy": "INSTALL_ONLY",
+      "unit": "wx-forecast-1day-night.service"
+    },
+    {
+      "policy": "INSTALL_ONLY",
+      "unit": "wx-forecast-3day-day.service"
+    },
+    {
+      "policy": "INSTALL_ONLY",
+      "unit": "wx-forecast-3day-night.service"
     }
   ],
   "schema_version": 1
