@@ -1,5 +1,5 @@
 [Unit]
-Description=IsadoraAir immutable Update Center bootstrap supervisor (Phase D draft -- NOT installed)
+Description=IsadoraAir immutable Update Center bootstrap supervisor (Phase D)
 After=network-online.target postgresql.service
 Wants=network-online.target
 

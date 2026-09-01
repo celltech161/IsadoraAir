@@ -664,10 +664,14 @@ and remain historical rather than being mislabeled corrupt.
 
 The offline restore path never contacts GitHub. It first revalidates all
 provenance, then materializes the bootstrap, configuration, public trust,
-runtime slots and state under a new temporary fake root. That unprivileged
-harness does not start the worker and reports `worker_started=false` and
-`readiness=not-run`: the production entry point correctly requires root and
-root-owned protected ancestry, neither of which a user-owned fake root can
-represent. A privileged disposable DISARMED worker/readiness proof, production
-ownership, systemd activation and the live capability proof remain explicit
-pre-D6 acceptance work.
+runtime slots and state under canonical A/B paths. The unprivileged fake-root
+harness still reports `worker_started=false` and `readiness=not-run`: the
+production entry point correctly requires root and root-owned protected
+ancestry, neither of which a user-owned fake root can represent. D5.1B then
+completed the complementary privileged proof on the disposable host: restored
+B/gen2 started DISARMED under the production ownership and network sandbox,
+PING/readiness passed, `START_UPDATE` was refused without creating a job, and
+both A/gen1 and B/gen2 verified independently. A harmless signed gen3 update
+also proved restored continuity while leaving Weather, migrations, services
+and application behavior untouched. Repeating the final bootstrap on KOGR
+production remains D6; it was not performed by this acceptance.

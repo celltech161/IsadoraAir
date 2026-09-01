@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Immutable Update Center Phase-D bootstrap supervisor entrypoint.
 
-NOT installed or run anywhere by this workorder (implementation +
-tests only -- see docs/UPDATE_CENTER_PHASE_D.md, D4-T's own explicit
-scope exclusions). This is the exact shape the future systemd unit
-(deploy/updater-bootstrapd.service, a draft, also not installed) would
-invoke: `/usr/bin/python3 -I updater_bootstrapd.py --config
+Installed and exercised only on the disposable host during D5.1A
+acceptance. It is not installed on KOGR production. This is the exact
+entrypoint shape the final systemd unit used in the D5.1 fixture and a D6
+production bootstrap would invoke:
+`/usr/bin/python3 -I -B updater_bootstrapd.py --config
 /etc/isadoraair/updater-bootstrap.json --application-root ... --worker-
 config /etc/isadoraair/station.json`.
 

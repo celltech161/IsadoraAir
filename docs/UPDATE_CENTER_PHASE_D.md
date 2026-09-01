@@ -1,5 +1,15 @@
 # Update Center Phase D — self-updating protected runtime
 
+**Status through D5.1C (2026-09-01).** Phase D5 and its D5.1A live-update
+and D5.1B offline-recovery acceptance were completed on the disposable
+`isadoraair2` host. Final implementation source is
+`f45877b26f2065b59649459e3d79d51e6b104f83`; the two commits after the
+accepted D5.1A source only correct schema-2 recovery assembly and restore
+layout. Sections below that describe D1–D4 as not yet deployed, or D5 as
+pre-bootstrap, are retained as the chronological design record. They are not
+the current acceptance status. KOGR production was not touched and D6 has not
+begun.
+
 Phase D exists to close the one remaining gap in the Update Center
 architecture: **the protected updater worker's own code and protected
 managed-unit policy cannot currently update themselves.** Every other
@@ -1077,3 +1087,49 @@ the automated path, all four Weather units are installed-only with no timer or
 restart side effects, A/B rollback evidence is intact, backup-v3 contains and
 validates Phase D, an offline fake-root restore succeeds, and the observation
 window has no supervisor restart/readiness/job-continuity faults.
+
+## D5.1C consolidation status
+
+D5.1A completed the privileged single-process-chain acceptance on the
+disposable host with the real supervisor, generation-1 worker, generation-2
+candidate, signed policy, Django audit mirror and systemd reconciliation.
+One durable UpdateJob UUID survived generation-1 yield, supervisor handoff,
+generation-2 recovery and mutation. The supervisor committed B/gen2 before
+the durable `runtime_activation_accepted` gate opened; A/gen1 remained the
+previous known-good slot and the activation record cleared.
+
+The disposable release bridge retained the intended compatibility contract:
+
+- r0026 (`e44696d973f9d7a228c2e4158a29df247767e045`) is parseable by r0025,
+  sets `manual_bootstrap_required: true`, omits `protected_runtime`, and
+  establishes the immutable supervisor, trust/config/state and signed gen1.
+- r0027 (`4a7f27dd76d6bb21c1755aed88acb90ae4684702`) is the first ordinary
+  protected-runtime update. Its signed gen2 policy authorizes exactly the four
+  Weather service names as `INSTALL_ONLY`; reconciliation performed one
+  daemon reload and no enable, start, restart, timer or core-service change.
+- The generation-1 bridge exception is limited to the immediate manual
+  predecessor carrying Phase-D policy. Ordinary candidates still require
+  generation advancement, exact slot/generation/descriptor identity, root
+  ancestry, signature threshold and protected-diff authorization.
+
+Schema-2 recovery preserves 0600 protected configuration/state, 0755
+entrypoints, canonical A/B slots, `.staging/descriptor-A.json` and
+`.staging/descriptor-B.json`, active/previous semantics, public trust/signers,
+attestations, policy, exact inventory and restore provenance. It excludes
+private signing keys, database payloads, Git credentials and TLS private keys.
+D5.1B proved privileged offline DISARMED startup, PING/readiness, refusal of
+`START_UPDATE` without job creation, independent gen1/gen2 verification and a
+harmless signed gen3 continuity update with no Weather, migration, service or
+application-feature mutation.
+
+The one-final-manual-bootstrap product promise is unchanged: after the
+production bootstrap, ordinary worker and signed-policy evolution requires no
+station SSH, sudo, manual copy, protected-service restart or root config edit.
+Manual intervention remains exceptional for immutable-supervisor or sandbox
+changes, loss of every authorized trust key, catastrophic protected-state
+corruption, and OS-level recovery.
+
+The D5.1 manifests, signing material and host changes are disposable
+acceptance fixtures, not KOGR production artifacts. The final production
+bootstrap, production signing ceremony and production observation window
+remain D6 work.
