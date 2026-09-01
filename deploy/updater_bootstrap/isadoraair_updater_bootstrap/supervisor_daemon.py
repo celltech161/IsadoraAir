@@ -155,6 +155,7 @@ class SupervisorDaemon:
         with self._lock:
             activation = self.ipc_server.state.activation
             if activation is None:
+                self._adopt_promoted_candidate_if_any()
                 self._check_active_worker_liveness()
                 return
             phase = activation.phase
@@ -175,7 +176,57 @@ class SupervisorDaemon:
             # distinct on-disk phase" docstring. This tick loop
             # observes the RESULT (active_slot already advanced,
             # activation already None) on its very next iteration,
-            # exactly like any other post-transaction idle state.
+            # exactly like any other post-transaction idle state --
+            # see _adopt_promoted_candidate_if_any(), called just
+            # above from the `activation is None` branch, for what
+            # that observation must still do.
+
+    def _adopt_promoted_candidate_if_any(self) -> None:
+        """Real defect found after the first genuine production
+        generation-1 -> generation-2 promotion (r0027): commit_
+        transaction() (see supervisor.py) atomically advances
+        active_slot/active_generation/active_descriptor_sha256 to the
+        candidate's own values and clears `activation` back to None --
+        but nothing previously updated THIS daemon's own in-memory
+        active_worker/candidate_worker/lifecycle bookkeeping to match.
+        self.active_worker was already None (the OLD worker's exit was
+        acknowledged by _old_worker_has_yielded() before the candidate
+        was ever launched), so the very next tick's
+        _check_active_worker_liveness() saw "no active worker" and
+        tried to launch a FRESH one into the now-active candidate slot
+        -- colliding with the candidate process that was already
+        running there (refused by JobStore's own flock, exactly as
+        designed) -- forever, once per poll_interval, until the bounded
+        restart-attempt budget exhausted and the supervisor settled
+        into permanently logging "bounded restart attempts exhausted"
+        instead of ever trying again -- silently disabling real crash
+        recovery for the (correctly running, unaffected) promoted
+        worker until the whole supervisor process was restarted.
+
+        The fix: reaching here (`activation is None`) with
+        self.candidate_worker still set is unambiguous evidence of
+        exactly this situation -- a rollback already clears
+        candidate_worker itself (see _rollback()) before activation
+        ever goes back to None, so no other path leaves both true at
+        once. The already-running, already-independently-verified
+        candidate process IS the new active worker; promote it in
+        place (never terminate/relaunch it -- it is already correct)
+        and reset every piece of bookkeeping that still described the
+        OLD active worker's lifecycle, so liveness/restart-budget
+        tracking applies to the newly-promoted process from here on,
+        with a clean crash-recovery budget of its own."""
+        if self.candidate_worker is None:
+            return
+        promoted = self.candidate_worker
+        LOGGER.info(
+            "candidate promoted to active worker: slot=%s pid=%s",
+            self.ipc_server.state.active_slot.value, promoted.pid,
+        )
+        self.active_worker = promoted
+        self.candidate_worker = None
+        self._candidate_deadline = None
+        self._candidate_ready_at = None
+        self.lifecycle.adopt_running_worker(promoted.pid)
 
     # -- old worker yield / candidate launch --------------------------------------------------------
 

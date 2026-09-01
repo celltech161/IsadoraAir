@@ -128,3 +128,33 @@ class WorkerLifecycle:
         module itself, so a caller cannot silently defeat the bound by
         calling it in a loop."""
         self._attempt_timestamps = []
+
+    def adopt_running_worker(self, pid: int) -> None:
+        """A successful protected-runtime candidate promotion, NOT an
+        ordinary launch -- the process named by `pid` is already
+        running and already independently proven (readiness +
+        acceptance, both re-verified by the supervisor itself) BEFORE
+        this is ever called; this method only makes THIS tracker
+        recognize a process it did not itself launch via
+        record_launch(). Deliberately distinct from record_launch():
+        it does not consult require_can_launch() (a promotion is never
+        refused by the restart-attempt bound -- that bound exists to
+        stop a crash-loop of NEW launches, not to block adopting an
+        already-healthy incumbent) and it does not append to
+        `_attempt_timestamps` (adopting is not itself a "restart
+        attempt").
+
+        Deliberately unconditional on the CURRENT state (works from
+        NONE, RUNNING, or EXITED_UNACKNOWLEDGED alike): the promoted
+        process belongs to a different generation than whatever this
+        tracker most recently knew about, so that prior state is
+        never authoritative for it. Clears the restart-attempt history
+        too -- any attempts recorded before promotion describe the
+        OLD generation (or, if the supervisor's own post-commit
+        bookkeeping had a bug, phantom relaunch attempts into the
+        candidate's own slot); either way they must never count
+        against the newly-promoted worker's own future crash-recovery
+        budget."""
+        self.state = WorkerLifecycleState.RUNNING
+        self.pid = pid
+        self._attempt_timestamps = []

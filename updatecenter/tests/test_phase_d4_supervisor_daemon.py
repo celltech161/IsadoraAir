@@ -349,3 +349,192 @@ class SupervisorDaemonRealHandoffTests(SimpleTestCase):
             time.sleep(0.05)
         else:
             self.fail(f"rollback after candidate crash never completed; final state: {self.daemon.ipc_server.state}")
+
+
+class SupervisorDaemonPromotionBookkeepingTests(SupervisorDaemonRealHandoffTests):
+    """Real defect regression: the first genuine production generation-1
+    -> generation-2 promotion (r0027) left self.active_worker == None
+    after a successful commit (the OLD worker's exit had already been
+    acknowledged; nothing ever repointed the ALREADY-RUNNING, already-
+    verified candidate process into self.active_worker). Every
+    subsequent tick's _check_active_worker_liveness() then believed no
+    worker was tracked at all and tried to launch a fresh one into the
+    now-active candidate slot -- colliding with the real process
+    already running there (correctly refused by JobStore's own flock),
+    repeatedly, until the bounded restart-attempt budget exhausted and
+    the supervisor was left permanently unable to recover a REAL future
+    crash of that worker without an operator restarting the whole
+    supervisor process.
+
+    Subclasses SupervisorDaemonRealHandoffTests purely to reuse its
+    setUp()/fixture-staging helpers -- these are genuinely new test
+    methods, not overrides."""
+
+    def test_promoted_candidate_is_tracked_as_active_worker_with_no_duplicate_launch(self):
+        self._candidate_behavior = "accept"
+        job_uuid = str(uuid.uuid4())
+        descriptor_sha256 = self._stage_and_publish_candidate(generation=2, candidate_slot="B")
+        self._write_old_worker_fixture(
+            job_uuid=job_uuid, candidate_slot="B", generation=2, descriptor_sha256=descriptor_sha256,
+        )
+        self._start_daemon_thread()
+
+        # Capture the candidate's PID before promotion, so "the exact
+        # same process" can be proven, not merely "some process".
+        deadline = time.monotonic() + 15
+        while self.daemon.candidate_worker is None and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertIsNotNone(self.daemon.candidate_worker, "candidate was never launched")
+        candidate_pid = self.daemon.candidate_worker.pid
+
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            state = self.daemon.ipc_server.state
+            if state.active_slot.value == "B" and state.activation is None:
+                break
+            time.sleep(0.05)
+        else:
+            self.fail(f"handoff never committed; final state: {self.daemon.ipc_server.state}")
+
+        # Give the tick loop a moment to observe the commit and adopt
+        # the promoted candidate.
+        deadline = time.monotonic() + 5
+        while self.daemon.candidate_worker is not None and time.monotonic() < deadline:
+            time.sleep(0.02)
+
+        # The promoted process must be tracked as the active worker --
+        # the EXACT SAME process, never terminated/relaunched -- and
+        # candidate tracking must be cleared.
+        self.assertIsNotNone(self.daemon.active_worker, "promotion left no active worker tracked at all")
+        self.assertEqual(self.daemon.active_worker.pid, candidate_pid)
+        self.assertIsNone(self.daemon.active_worker.poll(), "promoted worker must still be the original live process")
+        self.assertIsNone(self.daemon.candidate_worker)
+
+        # The restart-budget tracker must recognize the promoted
+        # process too, with a clean (unpoisoned) attempt history --
+        # never populated by record_launch()'s own bookkeeping, since
+        # promotion is not an ordinary launch.
+        self.assertEqual(self.daemon.lifecycle.state.value, "running")
+        self.assertEqual(self.daemon.lifecycle.pid, candidate_pid)
+        self.assertEqual(self.daemon.lifecycle._attempt_timestamps, [])  # noqa: SLF001
+
+        # This is exactly the window where the real defect spawned a
+        # duplicate launch into slot B roughly every poll_interval,
+        # forever: let many more ticks pass and prove nothing changes.
+        time.sleep(self.daemon.poll_interval * 15)
+        self.assertEqual(
+            self.daemon.active_worker.pid, candidate_pid,
+            "a duplicate worker was launched into the already-promoted slot",
+        )
+        self.assertIsNone(self.daemon.active_worker.poll())
+        self.assertIsNone(self.daemon.candidate_worker)
+        self.assertEqual(self.daemon.lifecycle._attempt_timestamps, [])  # noqa: SLF001
+
+    def test_promoted_worker_crash_recovers_normally_afterward(self):
+        """The forward-looking half of the same defect: a real future
+        crash of the promoted worker must still be recoverable by
+        ordinary bounded restart logic -- proving the fix does not
+        merely stop the log storm but actually restores real crash
+        recovery, which the pre-fix bug silently disabled until an
+        operator manually restarted the whole supervisor."""
+        self._candidate_behavior = "accept"
+        job_uuid = str(uuid.uuid4())
+        descriptor_sha256 = self._stage_and_publish_candidate(generation=2, candidate_slot="B")
+        self._write_old_worker_fixture(
+            job_uuid=job_uuid, candidate_slot="B", generation=2, descriptor_sha256=descriptor_sha256,
+        )
+        self._start_daemon_thread()
+
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            state = self.daemon.ipc_server.state
+            if state.active_slot.value == "B" and state.activation is None:
+                break
+            time.sleep(0.05)
+        else:
+            self.fail(f"handoff never committed; final state: {self.daemon.ipc_server.state}")
+
+        deadline = time.monotonic() + 5
+        while self.daemon.candidate_worker is not None and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertIsNotNone(self.daemon.active_worker)
+        promoted_pid = self.daemon.active_worker.pid
+
+        # Replace slot B's entrypoint with a trivial, argv-tolerant
+        # fixture before killing the promoted process -- the real
+        # crash-recovery relaunch uses ActiveIdentity (never the
+        # candidate's --expected-job-uuid flags), and this test cares
+        # only about "did a fresh distinct worker get launched", not
+        # about re-exercising the activation IPC protocol a second time.
+        entrypoint = self.layout.slot_path(Slot.B) / "updaterd.py"
+        entrypoint.write_text("import time\ntime.sleep(30)\n")
+        entrypoint.chmod(0o755)
+
+        self.daemon.active_worker.terminate()
+
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            worker = self.daemon.active_worker
+            if worker is not None and worker.pid != promoted_pid and worker.poll() is None:
+                break
+            time.sleep(0.05)
+        else:
+            self.fail(
+                "supervisor never recovered a real crash of the promoted active worker -- "
+                "the restart budget was likely still poisoned"
+            )
+        self.assertEqual(self.daemon.lifecycle.pid, self.daemon.active_worker.pid)
+
+    def test_fresh_supervisor_start_with_gen2_already_committed_needs_no_promotion_logic(self):
+        """Distinct from in-process promotion: a supervisor process
+        that starts up fresh (e.g. after the real operator restart
+        that mitigated the production incident) with runtime-state.json
+        already showing the committed generation active reads that
+        state directly via the ordinary start() path -- activation is
+        already None, there is no candidate_worker to adopt, and
+        _launch_active_worker() launches the real active slot exactly
+        as it always does. This is the exact scenario production's own
+        `systemctl restart updater-bootstrapd.service` exercised for
+        real; asserted here so it stays covered by an in-repo test
+        rather than only having been proven once, manually, in
+        production."""
+        # IPCServer reads runtime-state.json exactly once, at its own
+        # construction time (see ipc_server.py's __init__) -- the
+        # setUp()-built self.daemon already loaded the OLD (slot-A)
+        # state before this test ever runs, so the desired B/gen2
+        # state must be written BEFORE constructing a fresh daemon,
+        # not after.
+        write_runtime_state_atomically(self.state_path, RuntimeState(
+            schema_version=1, active_slot=Slot.B, active_generation=2,
+            active_descriptor_sha256="b" * 64, previous_slot=Slot.A,
+            previous_generation=1, previous_descriptor_sha256="a" * 64, activation=None,
+        ))
+        (self.layout.slot_path(Slot.B)).mkdir(parents=True)
+        entrypoint = self.layout.slot_path(Slot.B) / "updaterd.py"
+        entrypoint.write_text("import time\ntime.sleep(30)\n")
+        entrypoint.chmod(0o755)
+
+        import os
+        self.daemon = SupervisorDaemon(
+            self.bootstrap_config, self.trust_policy, layout=self.layout,
+            worker_config_path=self.worker_config_path,
+            authorized_uids={os.getuid()}, poll_interval=0.05,
+            old_worker_yield_timeout=2, candidate_readiness_timeout=2, candidate_acceptance_timeout=2,
+        )
+        self.addCleanup(self.daemon.stop)
+        self._start_daemon_thread()
+
+        deadline = time.monotonic() + 5
+        while self.daemon.active_worker is None and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertIsNotNone(self.daemon.active_worker)
+        self.assertIsNone(self.daemon.active_worker.poll())
+        self.assertIsNone(self.daemon.candidate_worker)
+        self.assertEqual(self.daemon.lifecycle.state.value, "running")
+
+        # No duplicate-launch storm here either -- prove stability the
+        # same way as the promotion test above.
+        pid = self.daemon.active_worker.pid
+        time.sleep(self.daemon.poll_interval * 15)
+        self.assertEqual(self.daemon.active_worker.pid, pid)
+        self.assertIsNone(self.daemon.active_worker.poll())

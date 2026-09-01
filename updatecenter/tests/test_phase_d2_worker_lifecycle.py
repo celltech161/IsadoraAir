@@ -140,6 +140,59 @@ class BoundedRestartAttemptTests(SimpleTestCase):
         self.assertEqual(lifecycle.pid, 2)
 
 
+class AdoptRunningWorkerTests(SimpleTestCase):
+    """D4 corrective (post-r0027 real defect): a protected-runtime
+    candidate promotion hands this tracker a process it did NOT itself
+    launch via record_launch() -- adopt_running_worker() is how the
+    supervisor's own tick loop recognizes it afterward. See
+    supervisor_daemon.py's _adopt_promoted_candidate_if_any()."""
+
+    def test_adopt_from_fresh_lifecycle_marks_running_with_the_given_pid(self):
+        lifecycle = WorkerLifecycle()
+        lifecycle.adopt_running_worker(pid=4242)
+        self.assertEqual(lifecycle.state.value, "running")
+        self.assertEqual(lifecycle.pid, 4242)
+        self.assertFalse(lifecycle.can_launch())
+
+    def test_adopt_never_consults_or_counts_against_the_restart_bound(self):
+        # Adoption is not a launch ATTEMPT -- it must never be refused
+        # by an exhausted bound, and must never itself count as one.
+        lifecycle = WorkerLifecycle(max_consecutive_restart_attempts=0)
+        lifecycle.adopt_running_worker(pid=1)  # would raise if this consulted require_can_launch()
+        self.assertEqual(lifecycle.pid, 1)
+        self.assertEqual(lifecycle._attempt_timestamps, [])  # noqa: SLF001
+
+    def test_adopt_clears_a_poisoned_restart_attempt_history(self):
+        # The real defect's own failure mode: several launch attempts
+        # already recorded (from the OLD generation, or from the bug's
+        # own phantom relaunch storm) must never count against the
+        # newly-promoted worker's future crash-recovery budget.
+        lifecycle = WorkerLifecycle(max_consecutive_restart_attempts=1)
+        lifecycle.record_launch(pid=1, now=0.0)
+        lifecycle.record_exit()
+        lifecycle.acknowledge_exit()
+        with self.assertRaises(WorkerLifecycleError):
+            lifecycle.record_launch(pid=2, now=1.0)  # budget already exhausted
+
+        lifecycle.adopt_running_worker(pid=99)
+
+        self.assertEqual(lifecycle._attempt_timestamps, [])  # noqa: SLF001
+        lifecycle.record_exit()
+        lifecycle.acknowledge_exit()
+        lifecycle.record_launch(pid=100, now=2.0)  # would have raised pre-fix
+        self.assertEqual(lifecycle.pid, 100)
+
+    def test_adopt_overrides_a_stale_running_state_from_a_different_pid(self):
+        # Unconditional on current state: whatever this tracker
+        # believed about a DIFFERENT (old-generation) process is never
+        # authoritative for the newly-promoted one.
+        lifecycle = WorkerLifecycle()
+        lifecycle.record_launch(pid=1, now=0.0)  # still "running" from this tracker's own view
+        lifecycle.adopt_running_worker(pid=2)
+        self.assertEqual(lifecycle.state.value, "running")
+        self.assertEqual(lifecycle.pid, 2)
+
+
 class ProcessGroupTerminationTests(SimpleTestCase):
     """Orphan prevention: process.py's TrackedChild already signals the
     whole PROCESS GROUP (os.killpg), not just the direct child, and
