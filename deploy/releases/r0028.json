@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "release_id": "r0028",
+  "previous_release_id": "r0027",
+  "minimum_updater_protocol_version": 5,
+  "summary": "Weather announcer schedule grid: replaces raw WeatherConfig.voice_schedule JSON editing with a 24-hour clickable admin grid. Ordinary application-only release -- no protected-runtime change, no migration. The underlying JSONField/representation is unchanged; the admin now expands it to 24 hourly assignments and compresses back to the identical canonical form on save, with full server-side coverage/persona/voice validation.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": true,
+  "services_requiring_restart": [
+    "isadoraair-gunicorn"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0007"
+}
