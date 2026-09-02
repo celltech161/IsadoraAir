@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "release_id": "r0032",
+  "previous_release_id": "r0031",
+  "minimum_updater_protocol_version": 5,
+  "summary": "Fixes a latent bootstrap-config ancestry bug: validate_config_dict's root-ownership check stopped at a live Unix socket (activation_socket/worker_socket) instead of its containing directory, since a socket satisfies neither S_ISDIR nor S_ISREG. First surfaced by r0031's --phase-d plan against real production. Generic fix, not path-specific; no protected-runtime change.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-gunicorn"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0007"
+}

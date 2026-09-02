@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import dataclasses
 from pathlib import Path
+import stat
 
 from .security import ProtectionError, assert_root_protected, assert_root_protected_parents
 
@@ -65,9 +66,45 @@ def _require_absolute_path(value, field: str) -> Path:
     return path
 
 
+def _is_unclassifiable_special_file(path: Path) -> bool:
+    """True for a socket, FIFO, or device node -- something that exists
+    on disk but satisfies neither S_ISDIR nor S_ISREG, so
+    assert_root_protected can never classify it as safe or unsafe.
+    Generic over the object type; never keys off a field name or
+    filename. A symlink is deliberately NOT special here: lstat still
+    reports it distinctly, and leaving it as a stopping point preserves
+    assert_root_protected's own existing "contains a symlink" check."""
+    try:
+        info = path.lstat()
+    except OSError:
+        return False
+    return bool(
+        stat.S_ISSOCK(info.st_mode)
+        or stat.S_ISFIFO(info.st_mode)
+        or stat.S_ISCHR(info.st_mode)
+        or stat.S_ISBLK(info.st_mode)
+    )
+
+
 def _closest_existing_ancestor(path: Path) -> Path:
+    """Walk upward to the closest ancestor suitable for root-protection
+    ancestry validation.
+
+    activation_socket and worker_socket name a live Unix domain socket
+    while the supervisor is running -- a legitimate, expected object
+    that a plain `.exists()` check treats as "found" but that
+    assert_root_protected can never classify (it is neither a directory
+    nor a regular file). Rather than stopping there and failing a
+    perfectly healthy, correctly-protected socket, skip past it -- and
+    past any other socket/FIFO/device found the same way -- and keep
+    walking up, exactly as if that path did not exist yet. This
+    preserves the check's real intent (the *containing directory
+    structure* is root-protected) instead of requiring the configured
+    leaf object itself to be a plain file. All other existing paths
+    (directories, regular files, symlinks) still stop the walk exactly
+    as before."""
     current = path
-    while not current.exists():
+    while not current.exists() or _is_unclassifiable_special_file(current):
         parent = current.parent
         if parent == current:
             break
