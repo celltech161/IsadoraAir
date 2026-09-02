@@ -24,6 +24,21 @@ COMPONENT_DIRECTORY = "protected-updater"
 MAX_FILES = 1024
 MAX_BYTES = 128 * 1024 * 1024
 
+# r0031: fixed, trusted constants for this station's real installed
+# Phase-D bootstrap -- verified directly against the live supervisor
+# (systemctl show updater-bootstrapd.service --property=ExecStart,
+# FragmentPath). Never operator-configurable and never read from any
+# config document: a config field naming these would let a compromised
+# config file alone redirect what capture reads, the exact same
+# reasoning isadoraair_updater_bootstrap.config's own module docstring
+# already gives for why the supervisor's entrypoint path is a compiled
+# constant, not a config field. See docs/RUNTIME_BACKUP_PAYLOAD.md's
+# "Publishing a schema-2 Phase-D recovery payload" section.
+STATION_CONFIG_PATH = Path("/etc/isadoraair/station.json")
+BOOTSTRAP_CONFIG_PATH = Path("/etc/isadoraair/updater-bootstrap.json")
+INSTALLED_BOOTSTRAP_SOURCE_ROOT = Path("/usr/local/libexec/isadoraair-updater-bootstrap")
+INSTALLED_SUPERVISOR_SERVICE = Path("/etc/systemd/system/updater-bootstrapd.service")
+
 
 class PhaseDRecoveryError(ValueError):
     pass
@@ -162,6 +177,144 @@ def _attestation_assertions(directory: Path):
             raise PhaseDRecoveryError(f"attestation {path.name} has invalid base64") from exc
         assertions.append(SignatureAssertion(value["signer_id"], signature))
     return assertions
+
+
+def load_installed_phase_d_state(
+    *, station_config_path: Path = STATION_CONFIG_PATH,
+    bootstrap_config_path: Path = BOOTSTRAP_CONFIG_PATH,
+    enforce_root_ownership: bool = True,
+) -> dict[str, Any]:
+    """Read-only. Loads and validates this host's real, installed
+    station and Phase-D bootstrap configuration, live runtime state,
+    and trust policy -- exactly the sources capture_phase_d_component()'s
+    own path arguments (slots_root, runtime_state, signer_root,
+    trust_policy) are derived from, and everything an operator-facing
+    plan report needs (active/previous generation+slot+descriptor
+    identity, trust threshold/signer identities, whether an activation
+    is currently in progress). Requires read access to both config
+    paths (0600 root:root on a real station) -- raises
+    PhaseDRecoveryError with a clear message if either is unreadable or
+    invalid, never a partial/guessed report.
+
+    Returns the parsed dataclass objects themselves (not just paths),
+    so a caller (plan report, or resolve_installed_phase_d_capture_kwargs
+    below) never re-parses the same documents twice:
+      {"station_config": StationConfig, "bootstrap_config": BootstrapConfig,
+       "runtime_state": RuntimeState, "trust_policy": TrustPolicy}
+
+    `enforce_root_ownership=False` is the same "inactive under an
+    unprivileged test process" convention isadoraair_updater_bootstrap.
+    config.validate_config_dict's own parameter already establishes --
+    kept explicit here, threaded through to BOTH the station and
+    bootstrap config loaders, so a test can exercise this function
+    end-to-end without running as root. Real production callers must
+    never pass False."""
+
+    _runtime_paths()
+    from isadoraair_updater.config import ConfigError as StationConfigError
+    from isadoraair_updater.config import load_config as load_station_config
+    from isadoraair_updater_bootstrap.config import ConfigError as BootstrapConfigError
+    from isadoraair_updater_bootstrap.config import validate_config_dict as validate_bootstrap_config
+    from isadoraair_updater_bootstrap.state import StateError, parse_runtime_state_dict
+    from isadoraair_updater_bootstrap.trust import TrustPolicyError, parse_trust_policy_dict
+
+    try:
+        station_config = load_station_config(
+            Path(station_config_path), enforce_protection=enforce_root_ownership,
+        )
+    except StationConfigError as exc:
+        raise PhaseDRecoveryError(f"installed station configuration is invalid or unreadable: {exc}") from exc
+
+    bootstrap_raw = _read_json(Path(bootstrap_config_path), label="installed bootstrap configuration")
+    try:
+        bootstrap_config = validate_bootstrap_config(
+            bootstrap_raw, application_root=station_config.application_root,
+            enforce_root_ownership=enforce_root_ownership,
+        )
+    except BootstrapConfigError as exc:
+        raise PhaseDRecoveryError(f"installed bootstrap configuration is invalid: {exc}") from exc
+
+    state_raw = _read_json(bootstrap_config.runtime_state_path, label="installed runtime state")
+    try:
+        runtime_state = parse_runtime_state_dict(state_raw)
+    except StateError as exc:
+        raise PhaseDRecoveryError(f"installed runtime state is invalid: {exc}") from exc
+
+    trust_raw = _read_json(bootstrap_config.trust_policy_path, label="installed trust policy")
+    try:
+        trust_policy = parse_trust_policy_dict(trust_raw, signer_directory=bootstrap_config.signer_root)
+    except TrustPolicyError as exc:
+        raise PhaseDRecoveryError(f"installed trust policy is invalid: {exc}") from exc
+
+    return {
+        "station_config": station_config,
+        "bootstrap_config": bootstrap_config,
+        "runtime_state": runtime_state,
+        "trust_policy": trust_policy,
+    }
+
+
+def _prepare_attestations_root(
+    *, slots_root: Path, active_slot: str, previous_slot: str | None, scratch_dir: Path,
+) -> Path:
+    """The one capture input that needs real preparation, not just a
+    direct pointer: the real on-disk convention names attestation
+    evidence by slot LETTER (slots_root/.staging/attestations-<A|B>,
+    the same convention deploy/updater_bootstrap/isadoraair_updater_bootstrap/
+    slots.py, deploy/updater_runtime/isadoraair_updater/runtime_handoff.py,
+    and updaterd.py's own descriptor-staging convention already agree
+    on), while capture_phase_d_component expects a tree pre-organized
+    by ROLE (active/previous). This performs that one small, read-
+    only-source remapping copy into a fresh scratch_dir -- never
+    modifies slots_root/.staging itself. scratch_dir must not already
+    exist."""
+
+    destination = Path(scratch_dir)
+    if destination.exists():
+        raise PhaseDRecoveryError(f"attestations scratch directory must not already exist: {destination}")
+    destination.mkdir(parents=True)
+    staging_root = Path(slots_root) / ".staging"
+    _copy_tree(staging_root / f"attestations-{active_slot}", destination / "active")
+    if previous_slot is not None:
+        _copy_tree(staging_root / f"attestations-{previous_slot}", destination / "previous")
+    return destination
+
+
+def resolve_installed_phase_d_capture_kwargs(
+    *, installed: dict[str, Any], scratch_dir: Path,
+    station_config_path: Path = STATION_CONFIG_PATH,
+    bootstrap_config_path: Path = BOOTSTRAP_CONFIG_PATH,
+    bootstrap_root: Path = INSTALLED_BOOTSTRAP_SOURCE_ROOT,
+    supervisor_service: Path = INSTALLED_SUPERVISOR_SERVICE,
+) -> dict[str, Path]:
+    """Builds the exact kwargs capture_phase_d_component() needs, all
+    derived from `installed` (the result of load_installed_phase_d_state)
+    plus fixed trusted constants -- the operator never supplies a
+    protected filesystem path. `scratch_dir` hosts the one prepared
+    input (attestations, see _prepare_attestations_root above); it must
+    not already exist, and the caller owns cleaning it up afterward
+    (capture_phase_d_component only reads from it)."""
+
+    bootstrap_config = installed["bootstrap_config"]
+    runtime_state = installed["runtime_state"]
+    attestations_root = _prepare_attestations_root(
+        slots_root=bootstrap_config.slots_root,
+        active_slot=runtime_state.active_slot.value,
+        previous_slot=runtime_state.previous_slot.value if runtime_state.previous_slot else None,
+        scratch_dir=Path(scratch_dir),
+    )
+    return {
+        "bootstrap_root": Path(bootstrap_root),
+        "supervisor_service": Path(supervisor_service),
+        "slots_root": bootstrap_config.slots_root,
+        "runtime_state": bootstrap_config.runtime_state_path,
+        "station_config": Path(station_config_path),
+        "bootstrap_config": Path(bootstrap_config_path),
+        "trust_policy": bootstrap_config.trust_policy_path,
+        "signer_root": bootstrap_config.signer_root,
+        "descriptors_root": bootstrap_config.slots_root / ".staging",
+        "attestations_root": attestations_root,
+    }
 
 
 def capture_phase_d_component(

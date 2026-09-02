@@ -55,6 +55,7 @@ import os
 import re
 import shutil
 import stat
+import tempfile
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -267,6 +268,28 @@ def _normalize_payload_modes(root: Path) -> None:
             os.chmod(current_path / name, 0o755)
         for name in filenames:
             os.chmod(current_path / name, 0o644)
+
+
+def _normalize_directory_modes_only(root: Path) -> None:
+    """The r0031 sibling of _normalize_payload_modes above -- normalizes
+    every DIRECTORY under root to 0755 (the mode _assert_trusted_payload_tree/
+    activate_recovery_payload require for every directory in an
+    activatable payload tree), without touching any FILE's mode.
+    _copy_tree_verified's own implicit `mkdir(parents=True, exist_ok=True)`
+    directory creation depends on the calling process's umask, which is
+    not guaranteed to produce 0755 -- unlike _normalize_payload_modes
+    (used for the historical Foundation-E portion, whose files are
+    deliberately flattened to a uniform 0644), attach_phase_d_recovery_
+    component's protected-updater subtree must keep the EXACT file
+    modes preserve_modes=True already copied in (0600 root-only
+    config/state, 0755 executable entrypoints) -- only its directories
+    need normalizing here."""
+
+    os.chmod(root, 0o755)
+    for current, directories, _filenames in os.walk(root, followlinks=False):
+        current_path = Path(current)
+        for name in directories:
+            os.chmod(current_path / name, 0o755)
 
 
 # ---- Piper station-selection digest (E1 reuse) ---------------------------
@@ -957,7 +980,8 @@ def _safe_message(value: object) -> str:
 
 def attach_phase_d_recovery_component(
     *, existing_payload: str | Path, protected_updater_component: str | Path,
-    output: str | Path, product_manifest: dict[str, Any] | None = None,
+    output: str | Path, new_payload_id: str | None = None,
+    product_manifest: dict[str, Any] | None = None,
 ) -> RuntimeRecoveryEvidence:
     """Assemble a schema-2 payload from a validated historical payload.
 
@@ -965,6 +989,21 @@ def attach_phase_d_recovery_component(
     remain valid forever, while a payload claiming Phase-D recovery upgrades
     explicitly to schema 2 and becomes fail-closed on the protected-updater
     component.  The source payload/component are never modified.
+
+    `new_payload_id` (r0031): the manifest's own `payload_id` field is
+    inherited verbatim from `existing_payload` when omitted (unchanged,
+    default behavior -- every caller before r0031 gets exactly today's
+    result). A caller that publishes the built payload under a NEW
+    `payloads/<id>` directory basename (e.g.
+    build_and_attach_installed_phase_d_payload below) should always pass
+    the SAME string here, so the on-disk directory identity and the
+    manifest's own reported payload_id (what
+    validate_runtime_recovery_payload/backup-v3 metadata actually
+    surfaces) can never silently diverge -- see
+    activate_recovery_payload's own matching invariant, which refuses
+    to activate a directory whose validated manifest payload_id
+    disagrees with the requested directory name, so a caller that got
+    this wrong here would fail closed there too, not just here.
     """
 
     from isadoraair.phase_d_recovery import MANIFEST_NAME, validate_phase_d_component
@@ -972,6 +1011,8 @@ def attach_phase_d_recovery_component(
     source = Path(existing_payload).absolute()
     component = Path(protected_updater_component).absolute()
     destination = Path(output).absolute()
+    if new_payload_id is not None and not _PAYLOAD_ID_RE.fullmatch(new_payload_id):
+        raise RuntimeRecoveryError("new_payload_id has an invalid stable identity")
     active_product_manifest = product_manifest or load_runtime_components()
     source_evidence = validate_recovery_payload(source, product_manifest=active_product_manifest)
     if source_evidence.result != RESULT_PASS:
@@ -997,8 +1038,11 @@ def attach_phase_d_recovery_component(
         # remain 0755. Preserve those modes exactly instead of flattening the
         # component to the historical payload-wide 0644 publication mode.
         _copy_tree_verified(component, target_component, preserve_modes=True)
+        _normalize_directory_modes_only(target_component)
         manifest = _read_manifest(staging)
         manifest["schema_version"] = PHASE_D_RECOVERY_SCHEMA_VERSION
+        if new_payload_id is not None:
+            manifest["payload_id"] = new_payload_id
         manifest["components"]["protected_updater"] = {
             "path": PROTECTED_UPDATER_SUBDIR,
             "restore_manifest_sha256": hashlib.sha256(
@@ -1020,6 +1064,243 @@ def attach_phase_d_recovery_component(
         shutil.rmtree(staging, ignore_errors=True)
         raise
     return validate_recovery_payload(destination, product_manifest=active_product_manifest)
+
+
+@dataclass(frozen=True, slots=True)
+class InstalledPhaseDPublicationPlan:
+    """Read-only report for `manage.py prepare_runtime_recovery_payload
+    --plan --phase-d` -- everything an operator needs to see before
+    building, with no filesystem write anywhere in its construction."""
+
+    ready: bool
+    errors: tuple[str, ...]
+    base_root: str
+    source_payload_id: str | None
+    source_schema_version: int | None
+    source_requires_refresh_derivation: bool
+    new_payload_id: str
+    output: str
+    active_slot: str | None
+    active_generation: int | None
+    active_descriptor_sha256: str | None
+    previous_slot: str | None
+    previous_generation: int | None
+    previous_descriptor_sha256: str | None
+    activation_in_progress: bool
+    trust_threshold: int | None
+    public_signer_ids: tuple[str, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "ready": self.ready,
+            "errors": list(self.errors),
+            "base_root": self.base_root,
+            "source_payload_id": self.source_payload_id,
+            "source_schema_version": self.source_schema_version,
+            "source_requires_refresh_derivation": self.source_requires_refresh_derivation,
+            "new_payload_id": self.new_payload_id,
+            "output": self.output,
+            "active_slot": self.active_slot,
+            "active_generation": self.active_generation,
+            "active_descriptor_sha256": self.active_descriptor_sha256,
+            "previous_slot": self.previous_slot,
+            "previous_generation": self.previous_generation,
+            "previous_descriptor_sha256": self.previous_descriptor_sha256,
+            "activation_in_progress": self.activation_in_progress,
+            "trust_threshold": self.trust_threshold,
+            "public_signer_ids": list(self.public_signer_ids),
+            # No private key material is ever read, held, or reported by
+            # this plan or the apply it previews -- capture_phase_d_component
+            # itself never touches a private key path at all (see
+            # isadoraair/phase_d_recovery.py's own module docstring).
+            "private_key_material_included": False,
+        }
+
+    def to_json(self) -> str:
+        return json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":"))
+
+
+def plan_installed_phase_d_publication(
+    *, base_root: str | Path, new_payload_id: str | None = None,
+    expected_owner_uid: int = 0, product_manifest: dict[str, Any] | None = None,
+    enforce_root_ownership: bool = True,
+    station_config_path: Path | None = None, bootstrap_config_path: Path | None = None,
+) -> InstalledPhaseDPublicationPlan:
+    """Entirely read-only -- never writes anything, including no
+    scratch/temp directory. Resolves the same installed Phase-D state
+    and current Foundation-E payload build_and_attach_installed_phase_d_payload
+    (below) would use, and reports what an --apply would do, without
+    doing it. `station_config_path`/`bootstrap_config_path` default to
+    the real fixed constants (isadoraair.phase_d_recovery.STATION_CONFIG_PATH/
+    BOOTSTRAP_CONFIG_PATH) when omitted -- overriding them is test-only,
+    same as `enforce_root_ownership=False` -- see
+    isadoraair.phase_d_recovery.load_installed_phase_d_state."""
+
+    from isadoraair.phase_d_recovery import PhaseDRecoveryError, load_installed_phase_d_state
+
+    resolved_base = Path(base_root)
+    resolved_new_id = new_payload_id or f"phase-d-{_default_payload_id()}"
+    errors: list[str] = []
+    if new_payload_id is not None and not _PAYLOAD_ID_RE.fullmatch(new_payload_id):
+        errors.append("new_payload_id has an invalid stable identity")
+
+    source_payload_id = source_schema_version = None
+    requires_refresh = False
+    try:
+        current_root = resolve_current_recovery_payload_root(resolved_base, expected_owner_uid=expected_owner_uid)
+        current_evidence = validate_current_recovery_payload(current_root, product_manifest=product_manifest)
+        if current_evidence.result != RESULT_PASS:
+            errors.append(f"current recovery payload does not validate cleanly: {current_evidence.to_json()}")
+        else:
+            source_payload_id = current_evidence.payload_id
+            source_schema_version = current_evidence.schema_version
+            requires_refresh = current_evidence.schema_version == PHASE_D_RECOVERY_SCHEMA_VERSION
+    except RuntimeRecoveryError as exc:
+        errors.append(str(exc))
+
+    active_slot = active_generation = active_descriptor = None
+    previous_slot = previous_generation = previous_descriptor = None
+    activation_in_progress = True  # fail closed if we never learn otherwise
+    trust_threshold = None
+    signer_ids: tuple[str, ...] = ()
+    config_path_overrides: dict[str, Any] = {}
+    if station_config_path is not None:
+        config_path_overrides["station_config_path"] = station_config_path
+    if bootstrap_config_path is not None:
+        config_path_overrides["bootstrap_config_path"] = bootstrap_config_path
+    try:
+        installed = load_installed_phase_d_state(
+            enforce_root_ownership=enforce_root_ownership, **config_path_overrides,
+        )
+        state = installed["runtime_state"]
+        trust = installed["trust_policy"]
+        active_slot = state.active_slot.value
+        active_generation = state.active_generation
+        active_descriptor = state.active_descriptor_sha256
+        if state.previous_slot is not None:
+            previous_slot = state.previous_slot.value
+            previous_generation = state.previous_generation
+            previous_descriptor = state.previous_descriptor_sha256
+        activation_in_progress = state.activation is not None
+        if activation_in_progress:
+            errors.append("a protected-runtime activation is currently in progress -- refusing to capture")
+        trust_threshold = trust.threshold
+        signer_ids = tuple(sorted(signer.id for signer in trust.signers))
+    except PhaseDRecoveryError as exc:
+        errors.append(f"installed Phase-D state is unavailable: {exc}")
+
+    return InstalledPhaseDPublicationPlan(
+        ready=not errors,
+        errors=tuple(errors),
+        base_root=str(resolved_base),
+        source_payload_id=source_payload_id,
+        source_schema_version=source_schema_version,
+        source_requires_refresh_derivation=requires_refresh,
+        new_payload_id=resolved_new_id,
+        output=str(resolved_base / PAYLOADS_SUBDIR / resolved_new_id),
+        active_slot=active_slot, active_generation=active_generation,
+        active_descriptor_sha256=active_descriptor,
+        previous_slot=previous_slot, previous_generation=previous_generation,
+        previous_descriptor_sha256=previous_descriptor,
+        activation_in_progress=activation_in_progress,
+        trust_threshold=trust_threshold, public_signer_ids=signer_ids,
+    )
+
+
+def build_and_attach_installed_phase_d_payload(
+    *, base_root: str | Path, new_payload_id: str | None = None,
+    expected_owner_uid: int = 0, product_manifest: dict[str, Any] | None = None,
+    enforce_root_ownership: bool = True,
+    station_config_path: Path | None = None, bootstrap_config_path: Path | None = None,
+    bootstrap_root: Path | None = None, supervisor_service: Path | None = None,
+) -> RuntimeRecoveryEvidence:
+    """The r0031 orchestration: capture this host's installed Phase-D
+    state (observational only -- never modifies active/previous slots,
+    runtime state, trust policy, or signer keys; never arms/disarms or
+    starts/restarts anything; never creates a new protected-runtime
+    generation) and attach it to the CURRENT Foundation-E recovery
+    payload, publishing the result as a brand-new
+    base_root/payloads/<new_payload_id> directory. Never activates it
+    -- call activate_recovery_payload as a deliberate separate step.
+
+    If the current payload is already schema 2 (a previous r0031-style
+    refresh), a fresh schema-1 base is re-derived from ITS OWN embedded
+    tts/native_fdkaac material first (attach_phase_d_recovery_component
+    refuses to attach onto a source that already has a
+    protected-updater component, by design) -- current's own tree is
+    never read into, written into, or otherwise mutated either way.
+
+    `enforce_root_ownership=False` and the four *_path/*_root overrides
+    all default to the real, fixed constants/enforcement and are
+    test-only when overridden -- see
+    isadoraair.phase_d_recovery.load_installed_phase_d_state and
+    .resolve_installed_phase_d_capture_kwargs."""
+
+    from isadoraair.phase_d_recovery import (
+        capture_phase_d_component, load_installed_phase_d_state,
+        resolve_installed_phase_d_capture_kwargs,
+    )
+
+    resolved_base = Path(base_root)
+    resolved_new_id = new_payload_id or f"phase-d-{_default_payload_id()}"
+    if not _PAYLOAD_ID_RE.fullmatch(resolved_new_id):
+        raise RuntimeRecoveryError("new_payload_id has an invalid stable identity")
+    active_product_manifest = product_manifest or load_runtime_components()
+
+    current_root = resolve_current_recovery_payload_root(resolved_base, expected_owner_uid=expected_owner_uid)
+    current_evidence = validate_current_recovery_payload(current_root, product_manifest=active_product_manifest)
+    if current_evidence.result != RESULT_PASS:
+        raise RuntimeRecoveryError(f"current recovery payload does not validate cleanly: {current_evidence.to_json()}")
+
+    output = resolved_base / PAYLOADS_SUBDIR / resolved_new_id
+
+    config_path_overrides: dict[str, Any] = {}
+    if station_config_path is not None:
+        config_path_overrides["station_config_path"] = station_config_path
+    if bootstrap_config_path is not None:
+        config_path_overrides["bootstrap_config_path"] = bootstrap_config_path
+    capture_input_overrides: dict[str, Any] = dict(config_path_overrides)
+    if bootstrap_root is not None:
+        capture_input_overrides["bootstrap_root"] = bootstrap_root
+    if supervisor_service is not None:
+        capture_input_overrides["supervisor_service"] = supervisor_service
+
+    with tempfile.TemporaryDirectory(prefix="isadoraair-phase-d-publish-") as work_name:
+        work = Path(work_name)
+
+        installed = load_installed_phase_d_state(
+            enforce_root_ownership=enforce_root_ownership, **config_path_overrides,
+        )
+        capture_kwargs = resolve_installed_phase_d_capture_kwargs(
+            installed=installed, scratch_dir=work / "attestations", **capture_input_overrides,
+        )
+        captured_component = work / "captured-component"
+        capture_phase_d_component(output=captured_component, **capture_kwargs)
+
+        if current_evidence.schema_version == PHASE_D_RECOVERY_SCHEMA_VERSION:
+            # Refresh case: current already carries a protected_updater
+            # component -- re-derive a fresh schema-1 base from its OWN
+            # already-validated tts/native_fdkaac material (never from
+            # current's tree directly) rather than attach onto it.
+            tts = current_evidence.components.get("tts")
+            native = current_evidence.components.get("native_fdkaac")
+            refreshed_base = RuntimeRecoveryBuilder(product_manifest=active_product_manifest).apply(
+                tts_bundle=tts.path if tts and tts.state == STATE_PRESENT else None,
+                native_source_dir=native.path if native and native.state == STATE_PRESENT else None,
+                output=work / "refreshed-foundation-e-base",
+                payload_id=f"{resolved_new_id}-foundation-e-base",
+            )
+            attach_source = refreshed_base.output
+        else:
+            attach_source = current_root
+
+        return attach_phase_d_recovery_component(
+            existing_payload=attach_source,
+            protected_updater_component=captured_component,
+            output=output,
+            new_payload_id=resolved_new_id,
+            product_manifest=active_product_manifest,
+        )
 
 
 # ---- preparation (plan / apply) ------------------------------------------
@@ -1250,9 +1531,24 @@ PAYLOADS_SUBDIR = "payloads"
 CURRENT_POINTER_NAME = "current"
 
 
-def _assert_trusted_mode_owner(path: Path, *, owner_uid: int, directory: bool) -> None:
+# r0031: the exact same trusted file-mode set capture_phase_d_component's
+# own _copy_plain (isadoraair/phase_d_recovery.py) already validates a
+# Phase-D component's inventory against -- root-only config/state stays
+# 0600, executable entrypoints stay 0755, matching the SIGNED mode
+# inventory validate_phase_d_component cross-checks byte-for-byte
+# (see _inventory's own "mode" field). Reusing this exact set here
+# (never inventing a second, possibly-divergent one) is what lets
+# activate_recovery_payload accept a Phase-D-capable schema-2 payload
+# without flattening its deliberately-preserved modes to Foundation-E's
+# own uniform 0644 -- files everywhere else in the tree still require
+# EXACTLY 0644, no widening for anything outside protected-updater/.
+_PHASE_D_TRUSTED_FILE_MODES = frozenset({0o600, 0o640, 0o644, 0o700, 0o750, 0o755})
+
+
+def _assert_trusted_mode_owner(
+    path: Path, *, owner_uid: int, directory: bool, allowed_file_modes: frozenset[int] | None = None,
+) -> None:
     metadata = path.lstat()
-    expected_mode = 0o755 if directory else 0o644
     expected_type = stat.S_ISDIR if directory else stat.S_ISREG
     if not expected_type(metadata.st_mode):
         kind = "directory" if directory else "regular file"
@@ -1262,18 +1558,26 @@ def _assert_trusted_mode_owner(path: Path, *, owner_uid: int, directory: bool) -
             f"trusted recovery path has owner UID {metadata.st_uid}, expected {owner_uid}: {path}"
         )
     actual_mode = stat.S_IMODE(metadata.st_mode)
-    if actual_mode != expected_mode:
-        raise RuntimeRecoveryError(
-            f"trusted recovery path has mode {actual_mode:04o}, expected {expected_mode:04o}: {path}"
-        )
+    if directory:
+        if actual_mode != 0o755:
+            raise RuntimeRecoveryError(f"trusted recovery path has mode {actual_mode:04o}, expected 0755: {path}")
+    else:
+        allowed = allowed_file_modes or frozenset({0o644})
+        if actual_mode not in allowed:
+            expected_display = "/".join(f"{mode:04o}" for mode in sorted(allowed))
+            raise RuntimeRecoveryError(
+                f"trusted recovery path has mode {actual_mode:04o}, expected {expected_display}: {path}"
+            )
     if not directory and metadata.st_nlink != 1:
         raise RuntimeRecoveryError(f"trusted recovery file is not single-link: {path}")
 
 
 def _assert_trusted_payload_tree(root: Path, *, owner_uid: int) -> None:
     _assert_trusted_mode_owner(root, owner_uid=owner_uid, directory=True)
+    protected_updater_root = root / PROTECTED_UPDATER_SUBDIR
     for current, directories, filenames in os.walk(root, followlinks=False):
         current_path = Path(current)
+        under_protected_updater = current_path == protected_updater_root or protected_updater_root in current_path.parents
         for name in directories:
             candidate = current_path / name
             if candidate.is_symlink():
@@ -1283,7 +1587,10 @@ def _assert_trusted_payload_tree(root: Path, *, owner_uid: int) -> None:
             candidate = current_path / name
             if candidate.is_symlink():
                 raise RuntimeRecoveryError(f"trusted recovery tree contains a symlink: {candidate}")
-            _assert_trusted_mode_owner(candidate, owner_uid=owner_uid, directory=False)
+            _assert_trusted_mode_owner(
+                candidate, owner_uid=owner_uid, directory=False,
+                allowed_file_modes=_PHASE_D_TRUSTED_FILE_MODES if under_protected_updater else None,
+            )
 
 
 def resolve_current_recovery_payload_root(
@@ -1398,6 +1705,25 @@ def activate_recovery_payload(
     evidence = validate_current_recovery_payload(target, product_manifest=product_manifest)
     if evidence.result != RESULT_PASS:
         raise RuntimeRecoveryError(f"payload '{payload_id}' does not validate cleanly: {evidence.to_json()}")
+    # r0031: the authoritative identity invariant. validate_runtime_recovery_payload
+    # (and, from it, backup-v3's runtime-recovery-archive.json) reports
+    # evidence.payload_id -- the MANIFEST's own internal field -- as
+    # THE payload identity, not this directory's basename. Nothing
+    # elsewhere cross-checks the two, so enforcing it exactly here, at
+    # the one place a payload becomes `current`, is what makes "the
+    # activated directory and the identity backup-v3 reports can never
+    # diverge" true for every caller (this r0031 release included),
+    # not just a convention a caller has to remember to uphold.
+    # Existing, already-published payloads whose manifest payload_id
+    # already equals their own payloads/<id> directory name (the
+    # existing convention every RuntimeRecoveryBuilder.apply()-built
+    # payload, including production's current e7c-real-acceptance-1,
+    # already follows) are unaffected.
+    if evidence.payload_id != payload_id:
+        raise RuntimeRecoveryError(
+            f"payload directory '{payload_id}' has manifest payload_id "
+            f"'{evidence.payload_id}' -- refusing to activate a mismatched identity"
+        )
 
     pointer = resolved_base / CURRENT_POINTER_NAME
     relative_target = os.path.relpath(target, resolved_base)

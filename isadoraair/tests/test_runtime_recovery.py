@@ -1004,3 +1004,60 @@ class ManagementCommandE7BTests(RecoveryFixture):
     def test_prepare_activate_requires_base_root_and_payload_id(self):
         with self.assertRaises(CommandError):
             call_command("prepare_runtime_recovery_payload", "--activate")
+
+
+class ManagementCommandPhaseDTests(RecoveryFixture):
+    """r0031: --phase-d's own argument-validation/dispatch logic at the
+    manage.py command layer -- the full derived capture/attach/activate
+    workflow itself is exercised end to end (real fixtures, no mocking)
+    in isadoraair.tests.test_phase_d_recovery.InstalledPhaseDPublicationTests;
+    this class only proves the command's own dispatch/argument
+    contract, matching ManagementCommandE7BTests' own established
+    call_command-based pattern above."""
+
+    def _base_root(self) -> Path:
+        base = self.root / "phase-d-persistent"
+        (base / PAYLOADS_SUBDIR).mkdir(parents=True)
+        base.chmod(0o755)
+        (base / PAYLOADS_SUBDIR).chmod(0o755)
+        return base
+
+    def test_phase_d_rejects_tts_bundle(self):
+        with self.assertRaisesRegex(CommandError, "do not apply"):
+            call_command(
+                "prepare_runtime_recovery_payload", "--plan", "--phase-d",
+                f"--base-root={self._base_root()}", f"--tts-bundle={self.root}",
+            )
+
+    def test_phase_d_rejects_native_source_dir(self):
+        with self.assertRaisesRegex(CommandError, "do not apply"):
+            call_command(
+                "prepare_runtime_recovery_payload", "--plan", "--phase-d",
+                f"--base-root={self._base_root()}", f"--native-source-dir={self.root}",
+            )
+
+    def test_phase_d_rejects_output(self):
+        with self.assertRaisesRegex(CommandError, "do not pass --output"):
+            call_command(
+                "prepare_runtime_recovery_payload", "--plan", "--phase-d",
+                f"--base-root={self._base_root()}", f"--output={self.root / 'unused'}",
+            )
+
+    def test_phase_d_requires_base_root(self):
+        with self.assertRaisesRegex(CommandError, "requires --base-root"):
+            call_command("prepare_runtime_recovery_payload", "--plan", "--phase-d")
+
+    def test_phase_d_plan_against_unreadable_installed_config_fails_closed_not_silently(self):
+        """Run genuinely unprivileged (this sandbox's real permission
+        state -- /etc/isadoraair/station.json is real, root-owned, and
+        unreadable here) against a fresh --base-root with no `current`
+        selected yet: both real sources of failure are absent/
+        unreadable, and the command must report BOTH clearly rather
+        than silently guessing or crashing uninformatively."""
+        base = self._base_root()
+        with self.assertRaises(CommandError):
+            call_command("prepare_runtime_recovery_payload", "--plan", "--phase-d", f"--base-root={base}")
+
+    def test_phase_d_apply_also_requires_base_root(self):
+        with self.assertRaisesRegex(CommandError, "requires --base-root"):
+            call_command("prepare_runtime_recovery_payload", "--apply", "--phase-d")

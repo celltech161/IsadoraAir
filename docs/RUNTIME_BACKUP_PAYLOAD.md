@@ -343,7 +343,7 @@ env var (comma-separated, empty by default) is the one place this
 policy gets configured for the nightly backup — see "Backup v3
 integration."
 
-## Persistent payload location (Runtime Foundation E7B — established, not yet activated on production)
+## Persistent payload location (Runtime Foundation E7B — established and activated on production)
 
 `isadoraair.runtime_recovery`:
 
@@ -374,19 +374,91 @@ integration."
 - The trust boundary is enforced, not merely documented: base root,
   `payloads/`, selected payload and every nested directory must have the
   expected administrative owner (UID 0 by default) and mode 0755; every
-  file must be owner-matching, single-link, regular, non-symlink mode 0644;
-  `current` must be an owner-matching confined one-hop symlink. Runtime
-  service identities can traverse/read but cannot modify the source.
-- **Not activated on any host this session** — `RECOVERY_PAYLOAD_ROOT`
-  in `deploy/backup_isadoraair.sh` defaults to
-  `/var/lib/isadoraair/runtime-recovery`, but nothing in E7B creates
-  that directory or a `current` pointer on production. Until an operator
-  explicitly runs `prepare_runtime_recovery_payload --apply` +
-  `--activate` there, the nightly backup finds nothing configured (exit
-  code 2) and — with no `BACKUP_REQUIRED_RECOVERY_COMPONENTS` policy set
-  — continues without a `runtime-recovery/` payload and labels the result
-  format 2.1.0 / `legacy_non_self_contained`, exactly like every backup
-  taken before E7B for runtime-DR purposes.
+  file must be owner-matching, single-link, regular, non-symlink mode
+  0644 -- **except** (r0031) a file under an activated payload's own
+  `protected-updater/` subtree, which may instead be any of the modes
+  its own signed inventory recorded (0600/0640/0644/0700/0750/0755 --
+  see `isadoraair.phase_d_recovery.capture_phase_d_component`'s own
+  mode-preservation and `isadoraair.runtime_recovery.
+  _PHASE_D_TRUSTED_FILE_MODES`), never anything more permissive than
+  that same fixed, already-signed set; `current` must be an
+  owner-matching confined one-hop symlink. Runtime service identities
+  can traverse/read but cannot modify the source.
+- **Activated on production** (r0031) — `RECOVERY_PAYLOAD_ROOT` in
+  `deploy/backup_isadoraair.sh` defaults to
+  `/var/lib/isadoraair/runtime-recovery`; production's `current` there
+  selects a real, validated payload, kept current via
+  `prepare_runtime_recovery_payload --phase-d --apply` +
+  `--activate` -- see "Publishing a schema-2 Phase-D recovery payload"
+  below for the full operator workflow and when to re-run it. A host
+  that has genuinely never run this at all still gets the honest,
+  original E7B behavior described in the rest of this bullet's history:
+  the nightly backup finds nothing configured (exit code 2) and, with
+  no `BACKUP_REQUIRED_RECOVERY_COMPONENTS` policy set, continues without
+  a `runtime-recovery/` payload, labeling the result format 2.1.0 /
+  `legacy_non_self_contained`.
+
+## Publishing a schema-2 Phase-D recovery payload (r0031)
+
+`manage.py prepare_runtime_recovery_payload`'s `--phase-d` flag (a
+modifier on the existing `--plan`/`--apply`, alongside the unchanged,
+fully schema-agnostic `--activate`) derives a fresh
+`protected_updater` component from THIS host's own installed,
+currently-active Phase-D state and attaches it to the current
+Foundation-E payload as a new schema-2 payload -- no protected
+filesystem path is ever operator-typed; every capture input (slots
+root, runtime state, trust policy, signer root, descriptors,
+attestations) is derived from the installed `/etc/isadoraair/
+station.json` + `/etc/isadoraair/updater-bootstrap.json`, plus the two
+fixed, trusted, never-configurable constants
+(`isadoraair.phase_d_recovery.INSTALLED_BOOTSTRAP_SOURCE_ROOT`/
+`INSTALLED_SUPERVISOR_SERVICE`). See
+`isadoraair.runtime_recovery.build_and_attach_installed_phase_d_payload`'s
+own docstring for the exact mechanics, including how a current payload
+that is ALREADY schema 2 (a prior refresh) is handled: a fresh
+schema-1 base is re-derived from its own embedded tts/native_fdkaac
+material first (never mutating its tree), then the newly-captured
+Phase-D component is attached to that fresh base as yet another new
+payload -- the prior schema-2 payload is never overwritten in place.
+
+```bash
+# Real production use requires root -- both reading the installed
+# 0600 root:root config files and writing beneath the root-owned
+# persistent recovery root need it; see build_and_attach_installed_
+# phase_d_payload's own docstring for why this is inherent to the
+# security model, not a gap.
+sudo venv/bin/python manage.py prepare_runtime_recovery_payload \
+  --plan --phase-d --base-root /var/lib/isadoraair/runtime-recovery
+sudo venv/bin/python manage.py prepare_runtime_recovery_payload \
+  --apply --phase-d --base-root /var/lib/isadoraair/runtime-recovery
+# --activate is unchanged and already schema-agnostic -- no --phase-d needed:
+sudo venv/bin/python manage.py prepare_runtime_recovery_payload \
+  --activate --base-root /var/lib/isadoraair/runtime-recovery --payload-id <id from --apply>
+```
+
+**When to re-run this.** Whenever the currently-activated payload's
+`protected_updater` component should represent a NEW active/previous
+generation pair -- i.e., after any legitimate protected-runtime
+generation change (an ordinary signed candidate promotion), if the
+disaster-recovery payload should reflect it. Nothing does this
+automatically; the recovery payload is a deliberate, operator-refreshed
+DR artifact, not a live mirror of the protected runtime's own state.
+Publication alone never activates anything -- `--activate` remains a
+separate, deliberate step, and both together never touch the live
+protected runtime itself (no new generation, no state change, no
+arming/starting/reloading).
+
+**Backup-v3 consumes whatever is activated, automatically.**
+`deploy/backup_isadoraair.sh` already resolves `current` via
+`validate_runtime_recovery_payload --base-root ... --current --json`
+(unchanged by r0031) and reports whatever schema/components/policy that
+payload's own evidence carries -- once a schema-2 payload is `current`,
+the very next nightly backup embeds `runtime-recovery/protected-updater/`
+and reports `payload_schema_version: 2` with no code change needed.
+E8 should select/build a backup archive taken *after* this activation
+-- an archive whose embedded payload is still schema 1 (taken before
+activation) will not exercise `protected_updater` at all, same as any
+other stale-payload archive.
 
 ## No network fallback
 
@@ -629,17 +701,28 @@ restore — the chain the literal script would have fed remains
 independently proven, just not through that one specific script
 invocation.
 
-## What's still open after E7C
+## What's still open (updated through r0031)
 
-- **Publication** — E7A/E7B/E7C are still unpublished (local feature
-  branches) until an explicit release step.
-- **Canonical production activation** — `RECOVERY_PAYLOAD_ROOT` is not
-  populated or activated on the production host.
-- **Caller migration** — `webrequests/services.py` and
-  `road_conditions/synthesis.py` still call their own hardcoded
-  `KOKORO_BINARY` directly.
+- ~~Publication~~ — **done.** E7A/E7B/E7C shipped through r0028/r0029;
+  r0030 added the numbered restore-stage integration for
+  `protected_updater`; r0031 added the operator-facing schema-2
+  publication/activation workflow itself (see "Publishing a schema-2
+  Phase-D recovery payload" below).
+- ~~Canonical production activation~~ — **done.** `RECOVERY_PAYLOAD_ROOT`
+  (`/var/lib/isadoraair/runtime-recovery`) is populated and activated on
+  the production host; `current` selects a real, validated payload.
+- ~~Caller migration~~ — **done** (r0029). `webrequests/services.py` and
+  `road_conditions/synthesis.py` no longer have a `KOKORO_BINARY`
+  fallback of any kind — both fail clearly instead of attempting a
+  deleted binary when left unconfigured; canonical shared-TTS is the
+  only path either ever takes.
 - **E8** — fully offline whole-machine acceptance remains a separate,
-  later checkpoint.
+  later checkpoint (r0030 removed the restore-orchestration blocker
+  that would have prevented `protected_updater` from ever being
+  exercised; r0031 removed the publication blocker that would have
+  left `current` schema-1 forever). See this doc's own "Phase-D
+  protected updater recovery extension" section below for exactly what
+  E8 should now use.
 - **Phase 5** — an actual bare/clean-machine restore drill (original
   host and GitHub unavailable) remains later work.
 
