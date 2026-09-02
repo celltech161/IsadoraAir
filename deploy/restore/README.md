@@ -111,6 +111,15 @@ deploy/restore/
                           payload. Explicit connected install (--legacy-connected-
                           install): unchanged Kokoro + Piper venv/pip provisioning
                           + smoke test.
+  75-protected-updater.sh Backup-based DR only (no connected-install path exists
+                          for this component): restores the Phase-D protected
+                          updater component from the embedded recovery payload
+                          -- offline, non-privileged verification into a
+                          throwaway fake root, then publishes onto the real/
+                          staging target (root-owned via sudo for a real
+                          target, matching 90-system-config.sh's own USE_SUDO
+                          idiom). Never starts/enables/reloads anything;
+                          activation stays a separate, privileged step.
   80-companions.sh        syndicated-ingest/weather-ingest/ogremote-ingest clone+venv.
   90-system-config.sh     nginx + systemd install/validation (never starts/reloads);
                           also establishes Runtime Foundation E5's system
@@ -161,6 +170,8 @@ deviation — see the 2026-08-29 note below:
   v
 70-tts         Kokoro + Piper
   v
+75-protected-updater  Phase-D protected updater (backup-based DR only)
+  v
 80-companions  syndicated-ingest/weather-ingest/ogremote-ingest
   v
 90-system-config  nginx + systemd units installed, NOT started
@@ -189,6 +200,14 @@ remain stable identifiers (`ls` sort order, individual invocation) —
 they no longer imply a strict execution order on their own; `restore.sh`
 is the authority for the actual order it runs stages in.
 
+**r0030:** `75-protected-updater.sh` runs immediately after `70-tts.sh`
+and before `80-companions.sh` — the same app-source/venv prerequisite
+70/50 already have (`manage.py restore_phase_d_component` runs as a
+manage.py command), no dependency on 30/40/80/90, and nothing after it
+can invalidate its runtime-recovery receipt entry before `95-validate.sh`
+checks it. Its stage NUMBER (75) is likewise a stable identifier only —
+`restore.sh`'s `STAGES` array is what actually places it there.
+
 `docs/DISASTER_RECOVERY_RESTORE.md` picks up from here for the parts
 that stay manual (StereoTool binary/license, controlled service
 bring-up order, certs, music library) — this map is the automated
@@ -201,15 +220,17 @@ A self-contained backup-v3 archive is identified by
 that classification positively requires a policy-satisfying
 `runtime-recovery/` directory — an operator-prepared, already-validated
 Runtime Foundation E7 disaster-recovery payload (see
-`docs/RUNTIME_BACKUP_PAYLOAD.md`). Stages 50 and 70 are the only two
-consumers, and neither locates it independently: both call
+`docs/RUNTIME_BACKUP_PAYLOAD.md`). Stages 50, 70, and (r0030) 75 are the
+only three consumers, and none locates it independently: all three call
 `lib.sh`'s `restore_locate_recovery_payload`, the one shared contract
 for "where did this archive's payload end up." See that function's own
 header comment for the exact extraction/confinement behavior, and
 `docs/DISASTER_RECOVERY_RESTORE.md`'s "Runtime recovery payload" and
 "Backward compatibility" sections for the operator-facing picture
 (including why a pre-E7B/non-self-contained archive fails the default
-backup-based stages and requires an explicit connected/manual path).
+backup-based stages and requires an explicit connected/manual path; a
+schema-1 payload with no `protected_updater` component is likewise a
+clean no-op for stage 75 specifically, never a failure).
 
 ## Application-source recovery model (Git vs. `app.tar.gz`)
 

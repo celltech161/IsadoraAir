@@ -776,6 +776,47 @@ def load_recovery_payload(
     )
 
 
+def restore_protected_updater_component(
+    root: str | Path, *, fake_root: str | Path, product_manifest: dict[str, Any] | None = None
+) -> dict[str, Any] | None:
+    """Locate, integrity-check, and offline-restore one recovery
+    payload's protected_updater component -- the restore-side sibling
+    of _load_protected_updater_component (validate-only). Returns None
+    if this payload declares no protected_updater component at all
+    (the caller's own signal that there is nothing to restore, matching
+    every other component's ABSENT state -- never an error on its own).
+
+    Delegates the actual restore to isadoraair.phase_d_recovery.
+    restore_phase_d_component, which alone owns the Phase-D trust/
+    signature/descriptor verification and the offline, non-privileged,
+    empty-fake-root materialization -- this function only resolves
+    WHICH on-disk directory (inside the payload) is the component, the
+    same restore-manifest-digest tamper check
+    _load_protected_updater_component already performs, before handing
+    off. Raises RuntimeRecoveryError on any structural or integrity
+    problem, same contract as load_recovery_payload -- never returns a
+    partially-trusted result."""
+
+    from isadoraair.phase_d_recovery import MANIFEST_NAME, restore_phase_d_component
+
+    shell, _ = _parse_manifest_shell(root, product_manifest)
+    if "protected_updater" not in shell.components:
+        return None
+    entry = shell.components["protected_updater"]
+    component_root = shell.payload_root / entry["path"]
+    manifest_path = component_root / MANIFEST_NAME
+    try:
+        digest = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    except OSError as exc:
+        raise RuntimeRecoveryError("protected-updater restore manifest is unreadable") from exc
+    if digest != entry["restore_manifest_sha256"]:
+        raise RuntimeRecoveryError("protected-updater restore manifest was modified after payload assembly")
+    try:
+        return restore_phase_d_component(component_root=component_root, fake_root=Path(fake_root))
+    except ValueError as exc:
+        raise RuntimeRecoveryError(f"protected-updater recovery restore failed: {exc}") from exc
+
+
 def _assert_strict_closure(root: Path, expected_relative: set[Path]) -> None:
     observed: set[Path] = set()
     for current, directories, filenames in os.walk(root, followlinks=False):

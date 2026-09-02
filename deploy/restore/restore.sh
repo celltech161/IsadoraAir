@@ -44,6 +44,13 @@
 # dependency map" for the full picture -- the file/stage NUMBERS stay
 # as stable identifiers (`ls` sort order, individual invocation), they
 # no longer imply a strict execution order on their own.
+#
+# r0030: 75-protected-updater.sh added, placed after 70-tts.sh (same
+# app-source/venv prerequisite, no DB/nginx/companion dependency) and
+# before 80-companions.sh -- restores the Phase-D protected updater
+# component from an embedded runtime-recovery payload, the same
+# locate/validate/publish/record-receipt shape 50/70 already use for
+# their own components. See deploy/restore/README.md's dependency map.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -57,6 +64,7 @@ STAGES=(
   60-python.sh
   50-native-deps.sh
   70-tts.sh
+  75-protected-updater.sh
   80-companions.sh
   90-system-config.sh
   95-validate.sh

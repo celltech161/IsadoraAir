@@ -738,6 +738,158 @@ class RestoreLocateRecoveryPayloadFunctionalTests(SimpleTestCase):
         self.assertEqual(accepted.returncode, 0, accepted.stdout + accepted.stderr)
 
 
+class ProtectedUpdaterReceiptSemanticsTests(SimpleTestCase):
+    """r0030: the receipt/accept contract (runtime_recovery_archive.py)
+    needed zero code changes to support protected_updater -- it was
+    already fully generic across all four COMPONENTS. These tests prove
+    that generic contract actually behaves correctly for
+    protected_updater specifically, including alongside another
+    component, matching the design requirement that one successful
+    component can never mask another missing one."""
+
+    def setUp(self):
+        self.tmpdir = Path(
+            subprocess.run(["mktemp", "-d"], capture_output=True, text=True, check=True).stdout.strip()
+        )
+        self.addCleanup(shutil.rmtree, self.tmpdir, ignore_errors=True)
+        self.helper = RESTORE_DIR / "runtime_recovery_archive.py"
+
+    def _write_schema_two_metadata(self, workdir: Path, *, required):
+        (workdir / "runtime-recovery-archive.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "backup_script_version": "3.0.0",
+                    "archive_format_version": "3.0.0",
+                    "recovery_class": "self_contained_v3",
+                    "payload_included": True,
+                    "payload_id": "p-phase-d",
+                    "payload_schema_version": 2,
+                    "product_contract_sha256": "0" * 64,
+                    "included_components": ["native_fdkaac", "protected_updater"],
+                    "required_components": list(required),
+                    "policy_satisfied": True,
+                    "piper_freshness": "not_checked",
+                },
+                sort_keys=True,
+            )
+        )
+
+    def _build_archive(self, *, required) -> Path:
+        workdir = self.tmpdir / f"work-{'-'.join(required)}"
+        (workdir / "runtime-recovery").mkdir(parents=True)
+        (workdir / "runtime-recovery" / "runtime-recovery.json").write_text("{}")
+        self._write_schema_two_metadata(workdir, required=required)
+        archive = self.tmpdir / f"{'-'.join(required)}.tar.gz"
+        with tarfile.open(archive, "w:gz") as tf:
+            tf.add(workdir, arcname=".")
+        return archive
+
+    def _run(self, *args) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [str(self.helper), *args], capture_output=True, text=True, timeout=15,
+        )
+
+    def test_recording_one_required_component_does_not_mask_another_missing_one(self):
+        """required_components = [native_fdkaac, protected_updater].
+        Recording only native_fdkaac must still fail acceptance -- a
+        successful component can never paper over a still-missing one."""
+        archive = self._build_archive(required=["native_fdkaac", "protected_updater"])
+        receipt = self.tmpdir / "receipt.json"
+
+        recorded = self._run("record", "--archive", str(archive), "--receipt", str(receipt),
+                              "--component", "native_fdkaac")
+        self.assertEqual(recorded.returncode, 0, recorded.stdout + recorded.stderr)
+
+        still_incomplete = self._run("accept", "--archive", str(archive), "--receipt", str(receipt))
+        self.assertNotEqual(still_incomplete.returncode, 0)
+        self.assertIn("protected_updater", still_incomplete.stdout + still_incomplete.stderr)
+
+        recorded_second = self._run("record", "--archive", str(archive), "--receipt", str(receipt),
+                                     "--component", "protected_updater")
+        self.assertEqual(recorded_second.returncode, 0, recorded_second.stdout + recorded_second.stderr)
+        self.assertIn("native_fdkaac", json.loads(recorded_second.stdout)["recovered_components"],
+                      "recording protected_updater must not lose the earlier native_fdkaac record")
+
+        complete = self._run("accept", "--archive", str(archive), "--receipt", str(receipt))
+        self.assertEqual(complete.returncode, 0, complete.stdout + complete.stderr)
+
+    def test_protected_updater_required_and_never_recorded_fails_acceptance(self):
+        """The exact original defect, reproduced directly against the
+        receipt contract: a schema-2 archive requiring protected_updater
+        where NO receipt file exists yet at all (no stage ever ran) must
+        fail acceptance clearly -- exactly the state r0029 left every
+        such archive in, since no stage called `record`."""
+        archive = self._build_archive(required=["protected_updater"])
+        receipt = self.tmpdir / "receipt.json"
+        result = self._run("accept", "--archive", str(archive), "--receipt", str(receipt))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing or invalid", result.stdout + result.stderr)
+
+    def test_protected_updater_required_and_recorded_for_a_different_component_only_fails(self):
+        """The same defect, one step further: a receipt DOES exist (an
+        earlier stage recorded something), but never protected_updater
+        specifically -- acceptance must name it as the missing piece,
+        never silently pass because the receipt file merely exists."""
+        archive = self._build_archive(required=["native_fdkaac", "protected_updater"])
+        receipt = self.tmpdir / "receipt.json"
+        recorded = self._run("record", "--archive", str(archive), "--receipt", str(receipt),
+                              "--component", "native_fdkaac")
+        self.assertEqual(recorded.returncode, 0, recorded.stdout + recorded.stderr)
+        result = self._run("accept", "--archive", str(archive), "--receipt", str(receipt))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("protected_updater", result.stdout + result.stderr)
+
+    def test_protected_updater_not_required_accepts_without_ever_recording_it(self):
+        """required_components = [native_fdkaac] only (protected_updater
+        present in the archive but not policy-required) -- acceptance
+        must succeed once native_fdkaac alone is recorded; stage 95 must
+        never demand a component this station's policy didn't ask for."""
+        archive = self._build_archive(required=["native_fdkaac"])
+        receipt = self.tmpdir / "receipt.json"
+        recorded = self._run("record", "--archive", str(archive), "--receipt", str(receipt),
+                              "--component", "native_fdkaac")
+        self.assertEqual(recorded.returncode, 0, recorded.stdout + recorded.stderr)
+        accepted = self._run("accept", "--archive", str(archive), "--receipt", str(receipt))
+        self.assertEqual(accepted.returncode, 0, accepted.stdout + accepted.stderr)
+
+    def test_receipt_for_a_different_payload_id_is_rejected_not_silently_reused(self):
+        """A receipt genuinely completed against one archive/payload
+        must never be mistaken for evidence about a different one --
+        e.g. a stale receipt left over from an earlier restore attempt
+        against a different backup."""
+        archive_one = self._build_archive(required=["protected_updater"])
+        receipt = self.tmpdir / "receipt.json"
+        recorded = self._run("record", "--archive", str(archive_one), "--receipt", str(receipt),
+                              "--component", "protected_updater")
+        self.assertEqual(recorded.returncode, 0, recorded.stdout + recorded.stderr)
+        accepted_original = self._run("accept", "--archive", str(archive_one), "--receipt", str(receipt))
+        self.assertEqual(accepted_original.returncode, 0)
+
+        # A hand-corrupted/foreign receipt claiming a payload_id this
+        # archive never had -- no fake/manual receipt entry may satisfy
+        # validation.
+        tampered = json.loads(receipt.read_text())
+        tampered["payload_id"] = "not-the-real-payload-id"
+        receipt.write_text(json.dumps(tampered, sort_keys=True))
+        result = self._run("accept", "--archive", str(archive_one), "--receipt", str(receipt))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("does not match", result.stdout + result.stderr)
+
+    def test_record_refuses_a_component_the_archive_never_declared_included(self):
+        """A hand-typed --component that isn't in this archive's own
+        included_components must be refused at record time -- never a
+        route to a fabricated receipt entry for something the archive
+        genuinely doesn't contain."""
+        archive = self._build_archive(required=["protected_updater"])
+        # piper is a real COMPONENTS name but this archive never declared it included.
+        result = self._run(
+            "record", "--archive", str(archive), "--receipt", str(self.tmpdir / "receipt.json"),
+            "--component", "piper",
+        )
+        self.assertNotEqual(result.returncode, 0)
+
+
 class RuntimeFoundationE7BStageModeSelectionTests(SimpleTestCase):
     """Real --plan executions of the rewritten 50/70 restore stages
     against a synthetic --archive, proving the archive-presence-driven
@@ -793,6 +945,46 @@ class RuntimeFoundationE7BStageModeSelectionTests(SimpleTestCase):
         result = self._run("70-tts.sh", "--skip-piper")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("only apply to --legacy-connected-install", result.stdout + result.stderr)
+
+    def test_protected_updater_plan_with_archive_targets_restore_phase_d_component(self):
+        result = self._run("75-protected-updater.sh")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("restore_phase_d_component --recovery-payload", result.stdout)
+        self.assertIn("--publish-root /", result.stdout)
+
+    def test_protected_updater_plan_with_staging_root_publishes_under_it_not_real_root(self):
+        result = subprocess.run(
+            [str(RESTORE_DIR / "75-protected-updater.sh"), "--plan", "--archive", str(self.archive_path),
+             "--staging-root", str(self.tmpdir / "staging")],
+            capture_output=True, text=True, timeout=15,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"--publish-root {self.tmpdir / 'staging'}", result.stdout)
+        # Never the real filesystem root under --staging-root.
+        self.assertNotIn("--publish-root /\n", result.stdout)
+
+    def test_protected_updater_plan_with_no_archive_is_a_clean_noop(self):
+        result = subprocess.run(
+            [str(RESTORE_DIR / "75-protected-updater.sh"), "--plan"],
+            capture_output=True, text=True, timeout=15,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("nothing to restore", result.stdout)
+        self.assertNotIn("restore_phase_d_component", result.stdout)
+
+    def test_protected_updater_rejects_unrecognized_argument(self):
+        result = self._run("75-protected-updater.sh", "--some-bogus-flag")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("unrecognized argument", result.stdout + result.stderr)
+
+    def test_protected_updater_never_references_github_or_network_fetch(self):
+        """Offline-recovery requirement, proven directly against the
+        stage script's own source: no git clone/fetch, no curl/wget, no
+        pip/PyPI acquisition -- unlike 50/70's legacy connected-install
+        branches, this component has no such branch to begin with."""
+        source = (RESTORE_DIR / "75-protected-updater.sh").read_text()
+        for forbidden in ("github.com", "git clone", "git fetch", "curl ", "wget ", "pip install"):
+            self.assertNotIn(forbidden, source, f"stage 75 must never reference {forbidden!r}")
 
 
 class RuntimeRecoveryArchiveClassificationTests(SimpleTestCase):

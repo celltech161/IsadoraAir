@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "release_id": "r0030",
+  "previous_release_id": "r0029",
+  "minimum_updater_protocol_version": 5,
+  "summary": "Fixes a DR restore-orchestration defect found during E8 preflight: no numbered restore stage restored the Phase-D protected_updater component, so a schema-2 archive requiring it could never pass final restore validation. Adds deploy/restore/75-protected-updater.sh (locate/validate/publish/record-receipt, same shape as stages 50/70), a small library addition, and a new manage.py command. Never starts/enables/reloads anything; no new protected-runtime generation.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-gunicorn"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0007"
+}

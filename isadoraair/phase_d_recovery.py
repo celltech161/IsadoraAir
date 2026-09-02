@@ -64,11 +64,23 @@ def _copy_plain(source: Path, destination: Path, *, mode: int | None = None) -> 
     if publication_mode not in {0o600, 0o640, 0o644, 0o700, 0o750, 0o755}:
         raise PhaseDRecoveryError(f"recovery input has an unsupported or writable mode: {source}")
     destination.parent.mkdir(parents=True, exist_ok=True)
-    descriptor = os.open(
-        destination,
-        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-        publication_mode,
-    )
+    try:
+        descriptor = os.open(
+            destination,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            publication_mode,
+        )
+    except FileExistsError as exc:
+        # Every caller of _copy_plain/_copy_tree relies on this refusing
+        # rather than silently overwriting -- capture_phase_d_component/
+        # restore_phase_d_component never expect to hit this (their own
+        # destination is always freshly created immediately beforehand),
+        # but publish_phase_d_component's whole safety contract depends
+        # on it: a pre-existing file at the real/staging target must stop
+        # the publish cold, with a clear error, not a raw OSError leaking
+        # past every PhaseDRecoveryError handler upstream (management
+        # command, restore stage).
+        raise PhaseDRecoveryError(f"refusing to overwrite existing destination: {destination}") from exc
     try:
         with source.open("rb") as input_file, os.fdopen(descriptor, "wb") as output_file:
             descriptor = -1
@@ -425,3 +437,34 @@ def restore_phase_d_component(*, component_root: Path, fake_root: Path) -> dict:
         "worker_started": False,
         "readiness": "not-run",
     }
+
+
+def publish_phase_d_component(*, fake_root: Path, target_root: Path) -> None:
+    """Materialize an already-restored fake-root's tree onto the real
+    (or staging-mirrored) filesystem root, so a disaster-recovery
+    receipt recording this component means what it means for every
+    other runtime-recovery component: genuinely present at the restore
+    target, not merely proven reconstructable in a throwaway directory.
+
+    Reuses _copy_tree -- the SAME mode-preserving, symlink-rejecting,
+    exclusive-create primitive restore_phase_d_component itself is
+    built from -- so this call inherits its safety properties for free:
+    it refuses (raises PhaseDRecoveryError, via the underlying
+    FileExistsError from _copy_plain's os.O_EXCL) rather than silently
+    overwriting ANY file that already exists at its destination under
+    target_root. A partial prior restore attempt, or files installed
+    for an unrelated reason, must be dealt with explicitly by the
+    caller/operator -- this function never guesses which pre-existing
+    content is safe to clobber.
+
+    Deliberately does not chown anything -- ownership of newly-created
+    files/directories falls out of whichever effective UID this process
+    runs as (root, when the caller invokes this under sudo for a real
+    target -- see deploy/restore/75-protected-updater.sh's own
+    staging/real sudo distinction, matching deploy/restore/
+    90-system-config.sh's established USE_SUDO idiom). Never starts,
+    enables, or reloads anything -- activation of the restored generation
+    remains a deliberate, separate, privileged step outside this
+    function's (and this whole restore stage's) scope."""
+
+    _copy_tree(Path(fake_root), Path(target_root))

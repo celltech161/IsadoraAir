@@ -21,13 +21,16 @@ from deploy.updater_bootstrap.tools.protected_runtime_release import (
 from isadoraair.phase_d_recovery import (
     PhaseDRecoveryError,
     capture_phase_d_component,
+    publish_phase_d_component,
     restore_phase_d_component,
     validate_phase_d_component,
 )
 from isadoraair.runtime_components import load_runtime_components
 from isadoraair.runtime_recovery import (
     RuntimeRecoveryBuilder,
+    RuntimeRecoveryError,
     attach_phase_d_recovery_component,
+    restore_protected_updater_component,
 )
 
 
@@ -301,3 +304,190 @@ class PhaseDRecoveryComponentTests(SimpleTestCase):
         manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
         with self.assertRaises(PhaseDRecoveryError):
             validate_phase_d_component(tampered)
+
+    def _build_schema_two_payload(self, output_name: str = "schema-two") -> Path:
+        """A real, fully-valid schema-2 recovery payload with
+        protected_updater attached -- the exact fixture shape r0030's
+        stage-75 integration consumes. Shares self._capture()'s real
+        cryptographic Phase-D component with
+        test_schema_two_attachment_preserves_protected_component_modes
+        above; the only difference is explicit 0o644 permissions on the
+        native-source fixture files below (Path.write_bytes here
+        otherwise inherits a group/world-writable mode under this
+        sandbox's umask, which RuntimeRecoveryBuilder's own native-
+        source contract correctly rejects -- see
+        isadoraair/tests/test_phase_d_recovery.py's own pre-existing,
+        environment-dependent failure on the SAME check when this isn't
+        done; fixing it here rather than there keeps this fixture
+        reliable without touching that unrelated, already-tracked
+        issue)."""
+        self._capture()
+        self.product_manifest = deepcopy(load_runtime_components())
+        native_source = self.root / f"native-source-{output_name}"
+        native_source.mkdir()
+        for name, declaration in self.product_manifest["components"]["fdkaac"]["source_archives"].items():
+            content = f"fixture-{name}".encode("ascii")
+            path = native_source / declaration["filename"]
+            path.write_bytes(content)
+            path.chmod(0o644)
+            declaration["bytes"] = len(content)
+            declaration["sha256"] = hashlib.sha256(content).hexdigest()
+
+        base = self.root / f"base-schema-one-{output_name}"
+        RuntimeRecoveryBuilder(product_manifest=self.product_manifest).apply(
+            native_source_dir=native_source,
+            output=base,
+            payload_id="phase-d-stage-integration",
+        )
+        combined = self.root / output_name
+        attach_phase_d_recovery_component(
+            existing_payload=base,
+            protected_updater_component=self.component,
+            output=combined,
+            product_manifest=self.product_manifest,
+        )
+        return combined
+
+    def test_restore_protected_updater_component_from_schema_two_payload(self):
+        """The r0030 restore-side entry point stage 75 calls: locates
+        protected_updater inside a real schema-2 payload, verifies the
+        restore-manifest digest, and delegates to
+        restore_phase_d_component -- proving the exact result shape and
+        content stage 75/the receipt logic depend on."""
+        payload = self._build_schema_two_payload()
+        fake_root = self.root / "restored-fake-root"
+        evidence = restore_protected_updater_component(
+            payload, fake_root=fake_root, product_manifest=self.product_manifest,
+        )
+
+        self.assertIsNotNone(evidence)
+        self.assertEqual(evidence["result"], "pass")
+        self.assertEqual(evidence["active_generation"], 2)
+        self.assertFalse(evidence["worker_started"])
+        self.assertEqual(evidence["readiness"], "not-run")
+        self.assertTrue(
+            (fake_root / "usr/local/libexec/isadoraair-updater-bootstrap/updater_bootstrapd.py").is_file()
+        )
+
+    def test_restore_protected_updater_component_returns_none_when_archive_lacks_it(self):
+        """A schema-1-only payload (no protected_updater component at
+        all) is a clean, no-op-for-this-component signal -- never an
+        error -- matching every other component's ABSENT state. Stage
+        75's own bash dispatch checks this via
+        validate_runtime_recovery_payload before ever calling the
+        restore command; this proves the underlying function itself
+        also degrades cleanly if called directly."""
+        self._capture()
+        product_manifest = deepcopy(load_runtime_components())
+        native_source = self.root / "native-source-schema-one-only"
+        native_source.mkdir()
+        for name, declaration in product_manifest["components"]["fdkaac"]["source_archives"].items():
+            content = f"fixture-{name}".encode("ascii")
+            path = native_source / declaration["filename"]
+            path.write_bytes(content)
+            path.chmod(0o644)
+            declaration["bytes"] = len(content)
+            declaration["sha256"] = hashlib.sha256(content).hexdigest()
+        schema_one = self.root / "schema-one-only"
+        RuntimeRecoveryBuilder(product_manifest=product_manifest).apply(
+            native_source_dir=native_source, output=schema_one, payload_id="schema-one-only",
+        )
+
+        evidence = restore_protected_updater_component(
+            schema_one, fake_root=self.root / "unused-fake-root", product_manifest=product_manifest,
+        )
+        self.assertIsNone(evidence)
+
+    def test_restore_protected_updater_component_rejects_tampered_restore_manifest_digest(self):
+        """The outer recovery-payload manifest pins protected_updater's
+        own restore-manifest.json by sha256 (restore_manifest_sha256).
+        A restore-manifest modified after payload assembly -- even one
+        that would otherwise still validate on its own -- must be
+        rejected before any restore is attempted, not silently
+        restored from tampered material."""
+        payload = self._build_schema_two_payload(output_name="schema-two-tamper")
+        manifest_path = payload / "protected-updater" / "restore-manifest.json"
+        content = manifest_path.read_bytes()
+        manifest_path.write_bytes(content + b" ")  # any byte change invalidates the pinned digest
+
+        with self.assertRaises(RuntimeRecoveryError):
+            restore_protected_updater_component(
+                payload, fake_root=self.root / "should-not-exist", product_manifest=self.product_manifest,
+            )
+        self.assertFalse((self.root / "should-not-exist").exists())
+
+    def test_publish_phase_d_component_materializes_files_at_target_root(self):
+        """After restore_protected_updater_component builds the fake
+        root, publish_phase_d_component must make its content genuinely
+        present at the real/staging restore target -- not merely leave
+        a throwaway proof tree -- so a receipt recorded afterward means
+        the same thing it means for kokoro/native_fdkaac."""
+        payload = self._build_schema_two_payload(output_name="schema-two-publish")
+        fake_root = self.root / "fake-root-for-publish"
+        restore_protected_updater_component(
+            payload, fake_root=fake_root, product_manifest=self.product_manifest,
+        )
+
+        target_root = self.root / "staging-target" / "opt-analog"
+        publish_phase_d_component(fake_root=fake_root, target_root=target_root)
+
+        launcher = target_root / "usr/local/libexec/isadoraair-updater-bootstrap/updater_bootstrapd.py"
+        self.assertTrue(launcher.is_file())
+        self.assertEqual(launcher.stat().st_mode & 0o777, 0o755)
+        unit = target_root / "etc/systemd/system/updater-bootstrapd.service"
+        self.assertTrue(unit.is_file())
+        state = target_root / "var/lib/isadoraair-updater-bootstrap/runtime-state.json"
+        self.assertTrue(state.is_file())
+        self.assertEqual(state.stat().st_mode & 0o777, 0o600)
+        # The fake root itself is untouched/still present -- publish copies, never moves.
+        self.assertTrue(fake_root.exists())
+
+    def test_publish_phase_d_component_refuses_preexisting_destination_file(self):
+        """A stale/partial prior restore (or any unrelated file) already
+        occupying one of protected_updater's real destination paths
+        must stop the publish cold, never be silently overwritten --
+        the same 'never guess what's safe to clobber' discipline every
+        other guard in this restore tooling already enforces."""
+        payload = self._build_schema_two_payload(output_name="schema-two-conflict")
+        fake_root = self.root / "fake-root-for-conflict"
+        restore_protected_updater_component(
+            payload, fake_root=fake_root, product_manifest=self.product_manifest,
+        )
+
+        target_root = self.root / "staging-target-conflict"
+        conflicting = target_root / "usr/local/libexec/isadoraair-updater-bootstrap/updater_bootstrapd.py"
+        conflicting.parent.mkdir(parents=True)
+        conflicting.write_text("pre-existing, unrelated content -- must not be touched")
+        conflicting.chmod(0o644)
+
+        with self.assertRaises(PhaseDRecoveryError):
+            publish_phase_d_component(fake_root=fake_root, target_root=target_root)
+
+        self.assertEqual(
+            conflicting.read_text(), "pre-existing, unrelated content -- must not be touched",
+            "publish must never overwrite pre-existing destination content",
+        )
+
+    def test_restore_then_publish_is_the_only_path_that_can_precede_a_receipt(self):
+        """End-to-end proof of the exact sequence stage 75 performs
+        before it may ever call restore_record_recovery_components:
+        restore into a fake root, publish to the target, only then is
+        there genuine evidence at the target root a receipt could
+        honestly describe as 'recovered'."""
+        payload = self._build_schema_two_payload(output_name="schema-two-e2e")
+        fake_root = self.root / "e2e-fake-root"
+        evidence = restore_protected_updater_component(
+            payload, fake_root=fake_root, product_manifest=self.product_manifest,
+        )
+        self.assertEqual(evidence["result"], "pass")
+
+        target_root = self.root / "e2e-target"
+        self.assertFalse(
+            (target_root / "usr/local/libexec/isadoraair-updater-bootstrap").exists(),
+            "sanity: nothing at the target root before publish",
+        )
+        publish_phase_d_component(fake_root=fake_root, target_root=target_root)
+        self.assertTrue(
+            (target_root / "usr/local/libexec/isadoraair-updater-bootstrap/updater_bootstrapd.py").is_file(),
+            "only after publish does the target root have genuine evidence a receipt may describe",
+        )

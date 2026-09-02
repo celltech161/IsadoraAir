@@ -149,7 +149,11 @@ Foundation E TTS/native recovery. Restoring from one:
 - `50-native-deps.sh`/`70-tts.sh` (default, `--archive`-driven mode)
   report `LEGACY ARCHIVE -- NOT SELF-CONTAINED FOR FOUNDATION E` and fail.
   They never fall back to `--download-sources` or `pip install`.
-- Stages 50/70 record successful component recovery in a target-mapped
+  `75-protected-updater.sh` reports the same and exits 0 (a legacy
+  archive has no protected_updater component to recover -- see "Phase-D
+  protected updater recovery" below; it has no connected/manual
+  fallback of its own).
+- Stages 50/70/75 record successful component recovery in a target-mapped
   receipt bound to the archive format and payload ID. `95-validate.sh`
   consumes that receipt and refuses overall PASS unless every component in
   the archive's non-empty recovery policy was actually reconstructed.
@@ -162,6 +166,61 @@ Foundation E TTS/native recovery. Restoring from one:
   After deliberate manual reconstruction, pass
   `--accept-legacy-runtime-recovery` to stage 95 itself; the output remains
   explicitly classified as legacy rather than backup-v3 evidence.
+
+### Phase-D protected updater recovery (r0030)
+
+`75-protected-updater.sh` restores a payload's `protected_updater`
+component -- present only in a schema-2 (Phase-D-capable) recovery
+payload, see `docs/RUNTIME_BACKUP_PAYLOAD.md`'s "Phase-D protected
+updater recovery extension" -- through the same locate/validate/
+publish/record-receipt shape stages 50/70 already use for their own
+components. It runs immediately after `70-tts.sh` (same restored-app/
+venv prerequisite, no DB dependency) and before `80-companions.sh`; see
+this doc's own "Restore-order dependency map" above.
+
+**Input:** the archive's embedded `runtime-recovery/` payload (same
+`--archive`, no separate flag) — specifically its `protected-updater/`
+component, if `manage.py validate_runtime_recovery_payload`'s
+`components.protected_updater.state` reports `present`. If a schema-1
+payload, or a schema-2 payload whose recovery policy didn't include
+this component, this stage is a clean no-op PASS, exactly like 50/70's
+own "component not in this archive" case — never a failure.
+
+**What it does:** delegates entirely to
+`isadoraair.phase_d_recovery`/`isadoraair.runtime_recovery` (via
+`manage.py restore_phase_d_component`) — full Phase-D trust/signature/
+descriptor/runtime-state verification, then materializes the restored
+bootstrap source, service unit, active/previous A/B runtime slots,
+trust policy, signer public keys, and runtime state onto the real
+(`/`, via `sudo` for root-owned destinations — matching
+`90-system-config.sh`'s own established pattern) or staging-mirrored
+(`--staging-root`) filesystem root. Refuses -- never silently
+overwrites -- any file already present at its destination, so a stale
+or partial prior restore attempt stops the stage rather than producing
+misleading evidence.
+
+**What it never does:** start, enable, or reload anything; create a
+new protected-runtime generation (it reconstructs exactly the
+generation the backup recorded); or weaken any Phase-D trust check.
+Activating the restored generation -- a real, privileged supervisor
+start under genuine root-owned ancestry, with DISARMED readiness proof
+-- is a deliberate, separate step outside this stage's (and this whole
+automated restore sequence's) scope. **E8 and Phase 5 must not
+manually reconstruct this component outside the numbered stage
+sequence** -- running `75-protected-updater.sh` (directly, or via
+`restore.sh`) is the only supported way to produce its receipt entry;
+a hand-run `manage.py restore_phase_d_component` invocation that skips
+`restore_record_recovery_components` leaves `95-validate.sh` correctly
+still failing, by design.
+
+**Success evidence:** the same `runtime-recovery.json` receipt every
+other component uses (`$RESTORE_STAGING_ROOT/var/lib/isadoraair/restore/`
+under staging, `/var/lib/isadoraair/restore/` for real) —
+`protected_updater` appears in `recovered_components` only after the
+publish step above genuinely succeeds. `95-validate.sh`'s existing
+`restore_accept_recovery_receipt` call (already run for every archive,
+unchanged by this stage's addition) fails closed if a schema-2 archive
+required this component and it is absent from the receipt.
 
 ## Manual checkpoints
 
