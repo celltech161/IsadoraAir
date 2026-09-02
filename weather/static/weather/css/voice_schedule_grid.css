@@ -1,0 +1,115 @@
+/* r0028: Weather announcer schedule grid. Deliberately modest -- no
+   framework, no build step. Every visual cue here is layered ON TOP of
+   real text (the <select> itself, and the "(now)" badge below) --
+   never color alone, since color-blindness/monochrome display must
+   still make the schedule readable. */
+
+.wx-schedule-grid {
+  max-width: 62rem;
+}
+
+.wx-schedule-error {
+  color: #a31515;
+  font-weight: 600;
+  margin: 0.5em 0;
+}
+
+.wx-schedule-summary {
+  font-size: 1.05em;
+  margin: 0.3em 0 0.6em;
+}
+
+.wx-on-duty {
+  font-weight: 700;
+}
+
+.wx-schedule-legend,
+.wx-schedule-ranges {
+  list-style: none;
+  margin: 0 0 0.8em;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6em 1.4em;
+}
+
+.wx-schedule-ranges {
+  display: block;
+}
+
+.wx-schedule-ranges li {
+  margin-bottom: 0.2em;
+}
+
+.wx-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4em;
+  font-size: 0.92em;
+}
+
+.wx-swatch {
+  display: inline-block;
+  width: 0.9em;
+  height: 0.9em;
+  border-radius: 3px;
+  border: 1px solid rgba(0, 0, 0, 0.35);
+  background: #ccc; /* default; a persona's own colour is applied by JS
+                        as a progressive enhancement, never required */
+}
+
+.wx-hour-grid {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 0.4em;
+}
+
+@media (max-width: 900px) {
+  .wx-hour-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+}
+@media (max-width: 560px) {
+  .wx-hour-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+.wx-hour-cell {
+  border: 1px solid #ccc;
+  border-radius: 4px;
+  padding: 0.35em 0.4em;
+  background: #fafafa;
+}
+
+.wx-hour-cell label {
+  display: block;
+  font-size: 0.82em;
+  font-weight: 600;
+  margin-bottom: 0.2em;
+}
+
+.wx-hour-cell.wx-hour-current {
+  border-width: 2px;
+  border-color: #333;
+}
+
+/* Text badge, not just a border/color, for the current hour --
+   satisfies "do not make color the only indicator". */
+.wx-hour-cell.wx-hour-current label::after {
+  content: " (now)";
+  font-weight: 400;
+  color: #444;
+}
+
+.wx-hour-select {
+  width: 100%;
+  font-size: 0.88em;
+}
+
+.wx-schedule-hint {
+  margin-top: 0.7em;
+  font-size: 0.85em;
+  color: #555;
+}
+
+/* JS enhancement: while a click-drag paint gesture is in progress. */
+.wx-hour-grid.wx-painting .wx-hour-cell {
+  cursor: pointer;
+}

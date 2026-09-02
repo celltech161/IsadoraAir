@@ -1,0 +1,60 @@
+{% load static %}
+<div class="wx-schedule-grid" data-field-name="{{ widget.name }}">
+  {% if widget.schedule_error %}
+    <p class="wx-schedule-error">
+      The saved schedule could not be read ({{ widget.schedule_error }}). Every hour below
+      starts unassigned -- choose an announcer for each hour and save to replace it with a
+      valid schedule.
+    </p>
+  {% endif %}
+
+  <p class="wx-schedule-summary">
+    On duty now ({{ widget.current_hour_label }} station time): <strong class="wx-on-duty">{{ widget.on_duty_label }}</strong>
+  </p>
+
+  {% if widget.personas %}
+    <ul class="wx-schedule-legend">
+      {% for persona in widget.personas %}
+        <li class="wx-legend-item wx-slot-{{ persona.slot }}">
+          <span class="wx-swatch" aria-hidden="true"></span>
+          <span class="wx-legend-label">{{ persona.display_name|default:persona.full_name|default:persona.slot }}</span>
+        </li>
+      {% endfor %}
+    </ul>
+  {% else %}
+    <p class="wx-schedule-error">
+      No Weather Voice Personas exist yet -- create at least one (Weather &rsaquo; Weather Voice Personas)
+      before an announcer schedule can be assigned.
+    </p>
+  {% endif %}
+
+  {% if widget.persona_ranges %}
+    <ul class="wx-schedule-ranges">
+      {% for entry in widget.persona_ranges %}
+        <li><strong>{{ entry.label }}:</strong> {{ entry.ranges }}</li>
+      {% endfor %}
+    </ul>
+  {% endif %}
+
+  <div class="wx-hour-grid" role="group" aria-label="24-hour announcer schedule, station-local time">
+    {% for hour in widget.hours %}
+      <div class="wx-hour-cell{% if hour.is_current %} wx-hour-current{% endif %}{% if hour.selected_slot %} wx-slot-{{ hour.selected_slot }}{% endif %}"
+           data-hour="{{ hour.hour }}">
+        <label for="id_{{ hour.field_name }}">{{ hour.label }}</label>
+        <select name="{{ hour.field_name }}" id="id_{{ hour.field_name }}" class="wx-hour-select">
+          <option value=""{% if not hour.selected_slot %} selected{% endif %}>&mdash; choose &mdash;</option>
+          {% for persona in widget.personas %}
+            <option value="{{ persona.slot }}"{% if hour.selected_slot == persona.slot %} selected{% endif %}>
+              {{ persona.display_name|default:persona.full_name|default:persona.slot }}
+            </option>
+          {% endfor %}
+        </select>
+      </div>
+    {% endfor %}
+  </div>
+
+  <p class="wx-schedule-hint">
+    Tip: click an hour, then click (or click-and-drag across) other hours to assign the same
+    announcer quickly. Every control also works with the keyboard alone.
+  </p>
+</div>

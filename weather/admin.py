@@ -8,6 +8,7 @@ from django.utils.html import format_html
 
 from isadoraair import env_admin, env_config
 
+from .forms import WeatherConfigForm
 from .models import AmberAlertConfig, WeatherConfig, WeatherVoicePersona
 
 _WEATHER_ENV_KEYS = ["WEATHER_DATA_DIR"]
@@ -26,6 +27,7 @@ class WeatherConfigAdmin(admin.ModelAdmin):
     data directory (WEATHER_DATA_DIR) is a separate, .env-backed setting
     -- surfaced here via a sub-page (isadoraair/env_admin.py's shared
     helper), not injected into this ModelAdmin's own save_model()."""
+    form = WeatherConfigForm
     fieldsets = [
         ("Station Location", {
             "fields": ["station_lat", "station_lon", "sun_alt_threshold_deg"],
@@ -36,7 +38,8 @@ class WeatherConfigAdmin(admin.ModelAdmin):
         }),
         ("Announcer Voices", {
             "fields": ["voice_schedule"],
-            "description": "Day/night voice shift schedule -- see field help text for format.",
+            "description": "Click an hour to assign the announcer on duty for that hour, "
+                            "station-local time.",
         }),
         ("Alert Beep", {
             "fields": ["alert_sound_enabled", "alert_sound_cart", "alert_sound_interval_seconds"],
