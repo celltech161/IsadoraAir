@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "release_id": "r0029",
+  "previous_release_id": "r0028",
+  "minimum_updater_protocol_version": 5,
+  "summary": "Legacy TTS cleanup: removes the dormant direct-Kokoro fallback (~/kokoro/bin/kokoro_synth, retired earlier and unreachable) from road_conditions and webrequests dedication synthesis. Both now fail clearly instead of attempting a deleted binary; canonical shared-TTS behavior is unchanged. Small, targeted DR-doc corrections and a README status refresh. Ordinary application-only release -- no protected-runtime change, no migration.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-gunicorn"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0007"
+}

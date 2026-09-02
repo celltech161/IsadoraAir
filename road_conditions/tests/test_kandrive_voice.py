@@ -66,11 +66,10 @@ class NoWeatherIngestImportDependencyTests(TestCase):
             provider_voice="af_jessica", language="en-us", speed=1.0,
         )
         WeatherVoicePersona.objects.create(slot="day", tts_voice=claira, display_name="Claira")
-        resolve_voice(slot_override="day")  # legacy mode (default)
         config = RoadConditionsConfiguration.load()
         config.tts_use_weather_schedule = True
         config.save()
-        resolve_voice(slot_override="day")  # shared mode
+        resolve_voice(slot_override="day")  # the one real (shared) mode
         after = set(sys.modules)
         new_modules = after - before
         self.assertFalse(
@@ -108,6 +107,7 @@ class ScheduleResolutionTests(TestCase):
         a given scheduled slot, from WeatherConfig.voice_schedule -- not
         a hardcoded schedule of its own."""
         RoadConditionsConfiguration.objects.all().delete()
+        RoadConditionsConfiguration.objects.create(tts_use_weather_schedule=True)
         claira = StationTTSVoice.objects.create(
             name="Claira_Sky", enabled=True, engine=StationTTSVoice.Engine.KOKORO,
             provider_voice="af_jessica", language="en-us", speed=1.0,
@@ -136,6 +136,11 @@ class ScheduleResolutionTests(TestCase):
         self.assertEqual(slot, expected_midnight_slot)
 
     def test_unknown_slot_override_raises(self):
+        # Explicitly enabled -- otherwise resolve_voice() would raise
+        # for "schedule not enabled" before ever looking at the slot
+        # override, which would prove nothing about slot validation.
+        RoadConditionsConfiguration.objects.all().delete()
+        RoadConditionsConfiguration.objects.create(tts_use_weather_schedule=True)
         with self.assertRaises(VoiceResolutionError):
             resolve_voice(slot_override="afternoon")
 
@@ -299,87 +304,53 @@ class SharedScheduleVoiceResolutionTests(TestCase):
 
 
 # ---------------------------------------------------------------------
-# Legacy (rollback-only) mode -- tts_use_weather_schedule=False, the
-# model default. Historically resolved voice identity from weather-
-# ingest's own external VOICES dict; now resolves through the SAME
-# WeatherVoicePersona/StationTTSVoice chain shared mode uses (there is
-# no more separate provider dictionary anywhere to source it from --
-# see this module's own docstring), pulling the resolved provider_voice
-# into voice["model"] for synthesis.py's direct-Kokoro fallback and
-# never setting shared_tts=True.
+# Legacy (direct-Kokoro rollback) mode is RETIRED as of r0029 -- that
+# runtime no longer exists. tts_use_weather_schedule=False (still this
+# field's default -- e.g. a freshly reset/never-configured row) is now
+# simply an invalid configuration state: resolve_voice() must raise
+# VoiceResolutionError immediately, telling the operator to enable
+# tts_use_weather_schedule, WITHOUT attempting any persona/voice lookup
+# or synthesis dispatch first. Persona-missing / non-Kokoro-engine
+# rejection for the one remaining (shared) path is already covered by
+# SharedScheduleVoiceResolutionTests above -- not duplicated here.
 # ---------------------------------------------------------------------
-class LegacyModeVoiceResolutionTests(TestCase):
+class RetiredLegacyModeTests(TestCase):
     def setUp(self):
         self.config = RoadConditionsConfiguration.load()
-        self.assertFalse(self.config.tts_use_weather_schedule, "must default to legacy/off")
+        self.assertFalse(self.config.tts_use_weather_schedule, "must default to disabled")
 
-        WeatherConfig.load()
+    def test_default_config_raises_clearly_not_legacy_dispatch(self):
+        with self.assertRaises(VoiceResolutionError) as ctx:
+            resolve_voice(slot_override="day")
+        message = str(ctx.exception).lower()
+        self.assertIn("tts_use_weather_schedule", message)
+        self.assertIn("retired", message)
 
-        self.claira = StationTTSVoice.objects.create(
-            name="Claira_Sky", enabled=True, engine=StationTTSVoice.Engine.KOKORO,
-            provider_voice="af_jessica", language="en-us", speed=1.0,
-        )
-        self.max_voice = StationTTSVoice.objects.create(
-            name="Max_Weatherly", enabled=True, engine=StationTTSVoice.Engine.KOKORO,
-            provider_voice="am_liam", language="en-us", speed=1.0,
-        )
-        WeatherVoicePersona.objects.create(
-            slot="day", tts_voice=self.claira,
-            display_name="Claira", full_name="Claira Sky", signoff="I'm Claira Sky.",
-        )
-        WeatherVoicePersona.objects.create(
-            slot="night", tts_voice=self.max_voice,
-            display_name="Max", full_name="Max Weatherly", signoff="I'm Max Weatherly.",
-        )
-
-    def test_default_config_is_legacy(self):
-        self.assertIsNone(self.config.tts_voice_id)
-
-    def test_day_slot_identical_claira_identity_never_shared_tts(self):
-        slot, voice = resolve_voice(slot_override="day")
-        self.assertEqual(slot, "day")
-        self.assertEqual(voice["engine"], "kokoro")
-        self.assertEqual(voice["model"], "af_jessica")
-        self.assertEqual(voice["name"], "Claira")
-        self.assertEqual(voice["full_name"], "Claira Sky")
-        self.assertEqual(voice["signoff"], "I'm Claira Sky.")
-        self.assertNotIn("shared_tts", voice)
-        self.assertNotIn("logical_voice_name", voice)
-
-    def test_night_slot_identical_max_identity(self):
-        slot, voice = resolve_voice(slot_override="night")
-        self.assertEqual(slot, "night")
-        self.assertEqual(voice["model"], "am_liam")
-        self.assertEqual(voice["name"], "Max")
-        self.assertEqual(voice["full_name"], "Max Weatherly")
-
-    def test_explicit_legacy_config_row_resolves_legacy_voice(self):
+    def test_explicitly_disabled_config_row_also_raises_clearly(self):
         self.config.tts_use_weather_schedule = False
         self.config.save()
 
-        slot, voice = resolve_voice(slot_override="night")
-        self.assertEqual(voice["model"], "am_liam")
-        self.assertFalse(voice.get("shared_tts"))
+        with self.assertRaises(VoiceResolutionError):
+            resolve_voice(slot_override="night")
 
-    def test_legacy_mode_fails_clearly_when_persona_missing(self):
-        WeatherVoicePersona.objects.filter(slot="day").delete()
+    def test_raises_even_with_no_personas_or_voices_configured_at_all(self):
+        """Proves the check happens BEFORE any persona/voice lookup --
+        no WeatherVoicePersona or StationTTSVoice fixtures exist in this
+        test at all, yet resolution still fails with the clear
+        VoiceResolutionError, not some deeper lookup error."""
+        self.assertFalse(WeatherVoicePersona.objects.exists())
+        self.assertFalse(StationTTSVoice.objects.exists())
         with self.assertRaises(VoiceResolutionError):
             resolve_voice(slot_override="day")
 
-    def test_legacy_mode_rejects_non_kokoro_persona_voice(self):
-        from isadoraair.tts.models import PiperVoiceModel
+    def test_legacy_resolution_function_no_longer_exists(self):
+        self.assertFalse(
+            hasattr(voice_module, "_resolve_legacy_voice"),
+            "the retired direct-Kokoro resolution function must be fully removed, not just unreachable",
+        )
 
-        model = PiperVoiceModel.objects.create(
-            model_id="test-piper-legacy", model_filename="test-piper.onnx",
-            config_filename="test-piper.onnx.json",
-            model_sha256="3" * 64, config_sha256="4" * 64,
-            language="en-us", sample_rate_hz=22050,
+    def test_module_no_longer_defines_kokoro_binary_constant(self):
+        self.assertFalse(
+            hasattr(voice_module, "KOKORO_BINARY"),
+            "the retired direct-Kokoro binary path constant must be fully removed",
         )
-        piper_voice = StationTTSVoice.objects.create(
-            name="Piper_Legacy_Test", enabled=True, engine=StationTTSVoice.Engine.PIPER,
-            provider_voice="", piper_model=model, language="en-us", speed=1.0,
-        )
-        WeatherVoicePersona.objects.filter(slot="day").update(tts_voice=piper_voice)
-        with self.assertRaises(VoiceResolutionError) as ctx:
-            resolve_voice(slot_override="day")
-        self.assertIn("kokoro", str(ctx.exception).lower())

@@ -158,8 +158,11 @@ class SongRequest(models.Model):
                       turn.
 
     dedication_message, together with requester_name and the requested
-    track, is formatted into a spoken intro synthesized via Kokoro
-    (voice am_fenrir) and spliced immediately ahead of the requested
+    track, is formatted into a spoken intro synthesized through the
+    shared TTS service using WebRequestConfig.dedication_tts_voice (an
+    operator-selected logical station voice; dedication intros are
+    disabled -- no intro synthesized, song still airs plainly -- until
+    one is selected) and spliced immediately ahead of the requested
     track once it airs -- see intro_track/intro_log_item below,
     webrequests.services.build_dedication_intro_text/synthesize_
     dedication_intro, and library.services.engine's dedication-splice

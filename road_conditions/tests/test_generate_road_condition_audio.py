@@ -48,6 +48,10 @@ def make_fresh_config():
     ensure_default_weather_voice_personas()
     config = RoadConditionsConfiguration.load()
     config.enabled = True
+    # Matches KOGR's real production state -- resolve_voice() has no
+    # other way to resolve a voice since r0029 retired the direct-
+    # Kokoro rollback path (see road_conditions/voice.py's docstring).
+    config.tts_use_weather_schedule = True
     config.last_error = ""
     config.last_fetch_succeeded_at = dj_timezone.now()
     config.stale_data_threshold_minutes = 60
@@ -201,6 +205,7 @@ class StaleFailedFeedBehaviorTests(TestCase):
         ensure_default_weather_voice_personas()
         config = RoadConditionsConfiguration.load()
         config.enabled = True
+        config.tts_use_weather_schedule = True
         config.last_error = "boom"
         config.save()
         make_road_event(external_id="A", headline_category="closure", description="Road closed.")
@@ -1143,8 +1148,12 @@ class FramingAndVoiceChangeForcesRegenerationTests(KanDriveSynthesisFixtureMixin
         # Same slot/name, different model -- the model behind an
         # announcer name changing must still force regeneration (see
         # report.compute_report_fingerprint()'s own docstring).
-        voice_v1 = {"engine": "kokoro", "model": "af_jessica", "name": "Claira", "full_name": "Claira Sky"}
-        voice_v2 = {"engine": "kokoro", "model": "af_jessica_v2", "name": "Claira", "full_name": "Claira Sky"}
+        voice_v1 = {
+            "engine": "kokoro", "model": "af_jessica", "name": "Claira", "full_name": "Claira Sky",
+            "signoff": "I'm Claira Sky.", "logical_voice_name": "Claira_Sky",
+            "shared_tts": True, "tts_timeout_seconds": 45,
+        }
+        voice_v2 = dict(voice_v1, model="af_jessica_v2")
 
         with patch(f"{CMD}.resolve_voice", return_value=("day", voice_v1)):
             call_command("generate_road_condition_audio", stdout=StringIO())

@@ -1,12 +1,8 @@
 """Voice selection for KanDrive road-report speech.
 
-resolve_voice() has two real modes, chosen by
-RoadConditionsConfiguration.tts_use_weather_schedule (mirrors the same
-precedence isadoraair.runtime_requirements.inspect_station_selection()
-already established: schedule mode wins over a fixed tts_voice):
-
-  SHARED WEATHER-SCHEDULE (tts_use_weather_schedule=True -- KOGR's
-  current production state):
+resolve_voice() has exactly one real mode: the SHARED WEATHER-SCHEDULE
+path, gated on RoadConditionsConfiguration.tts_use_weather_schedule
+being True (KOGR's real production state):
 
     1. THE SCHEDULE is WeatherConfig.voice_schedule, resolved via
        weather.voice_schedule.voice_for_hour() -- pure, provider-free
@@ -26,62 +22,33 @@ already established: schedule mode wins over a fixed tts_voice):
        fingerprint if an operator repoints the same logical voice at a
        different provider identity.
 
-  LEGACY (tts_use_weather_schedule=False -- the rollback path):
-  bypasses the shared TTS service and invokes Kokoro directly (see
-  synthesis.py's _synthesize_segment_wav "else" branch), but resolves
-  its slot and voice identity through the EXACT SAME Django-owned
-  WeatherConfig -> WeatherVoicePersona -> StationTTSVoice chain shared
-  mode uses -- there is no separate "provider dictionary" anywhere
-  left to duplicate or drift from. Historically this path imported
-  weather-ingest's own external lib/voices.py (both for schedule
-  resolution AND for a hardcoded day/night Kokoro model-id table) --
-  that coupling is retired as part of the shared-TTS migration:
-  weather-ingest's own provider dictionary no longer exists, so
-  nothing legitimate is left to import, and this module must not
-  introduce a new hardcoded copy of a provider voice id either. Only
-  the FINAL step differs from shared mode: this path pulls
-  resolve_station_voice()'s own provider_voice out into voice["model"]
-  for a direct Kokoro subprocess call, and never sets shared_tts=True.
-  ROLLBACK-ONLY -- do not expand or modernize this path; KOGR's real
-  production state is shared-schedule mode (proven prior to this
-  migration), not legacy.
+  LEGACY (tts_use_weather_schedule=False) is RETIRED as of r0029. It
+  used to bypass the shared TTS service and invoke Kokoro directly via
+  a hardcoded `/home/jreed/kokoro/bin/kokoro_synth` path -- that
+  runtime is gone (retired alongside the direct-Kokoro fallback; see
+  docs/DISASTER_RECOVERY.md). tts_use_weather_schedule=False (still
+  this field's default, e.g. on a freshly reset/never-configured row)
+  is now simply an invalid configuration state for KanDrive: resolve_
+  voice() raises VoiceResolutionError immediately, before any text is
+  composed or persona/voice lookups are attempted, telling the
+  operator to enable tts_use_weather_schedule rather than attempting a
+  deleted binary. This is a genuine narrowing of behavior, not a
+  fallback -- there is no other way for KanDrive to produce a voice.
 
-  WHAT THIS PATH DOES AND DOES NOT ISOLATE: because both modes now
-  share the exact same WeatherVoicePersona -> StationTTSVoice ->
-  resolve_station_voice() identity-resolution chain, switching
-  tts_use_weather_schedule to False no longer isolates KanDrive from a
-  broken/missing/misconfigured persona or logical voice row -- a
-  VoiceResolutionError there fails BOTH modes identically (see
-  test_legacy_mode_fails_clearly_when_persona_missing). What this path
-  still does isolate KanDrive from is a regression in the shared TTS
-  SERVICE/invocation layer itself (synthesize_station_voice() and
-  everything under isadoraair.tts.service) -- legacy mode never calls
-  that; it takes the already-resolved provider_voice and invokes
-  Kokoro directly (see synthesis.py's _synthesize_segment_wav "else"
-  branch, unchanged by this migration). This is a real, deliberate
-  narrowing of what "rollback" covers, forced by this migration's own
-  constraint that no second hardcoded provider-voice-id table may
-  exist anywhere (see this workorder's own "never hard-code provider
-  voice IDs" rule) -- there is no remaining place to source an
-  identity independent of the DB-backed chain. An operator relying on
-  this flag as a resolution-layer rollback, not just a service-layer
-  one, needs to know that distinction before flipping it.
+  A FIXED tts_voice (no weather schedule involved) is intentionally
+  NOT implemented here -- RoadConditionsConfiguration.tts_voice has no
+  associated listener-facing name source anywhere in the current model
+  (WeatherVoicePersona is schedule-slot-keyed only), so completing it
+  cleanly would require inventing new persona metadata or a new field,
+  which this round of work was explicitly told not to do. Setting
+  tts_voice alone, with tts_use_weather_schedule left off, still has no
+  effect -- resolve_voice() raises the same "not enabled" error.
 
-  A third state, a FIXED tts_voice (no weather schedule involved), is
-  intentionally NOT implemented here -- RoadConditionsConfiguration.
-  tts_voice has no associated listener-facing name source anywhere in
-  the current model (WeatherVoicePersona is schedule-slot-keyed only),
-  so completing it cleanly would require inventing new persona
-  metadata or a new field, which this round of work was explicitly
-  told not to do. Setting tts_voice alone, with
-  tts_use_weather_schedule left off, currently has no effect --
-  resolve_voice() still takes the legacy path.
-
-Both modes raise the same VoiceResolutionError for any failure --
-unknown slot, missing/incomplete persona, non-Kokoro engine, or a
-disabled/invalid shared-TTS voice -- so generate_road_condition_audio.py's
-existing `except VoiceResolutionError` handling covers both without
-changes."""
+Every failure -- schedule disabled, unknown slot, missing/incomplete
+persona, non-Kokoro engine, or a disabled/invalid shared-TTS voice --
+raises the same VoiceResolutionError, so generate_road_condition_audio.py's
+existing `except VoiceResolutionError` handling covers all of them
+without changes."""
 from django.utils import timezone as dj_timezone
 
 from weather.voice_schedule import voice_for_hour
@@ -175,38 +142,15 @@ def _persona_listener_facing_name(persona, slot):
     return name, (full_name or name)
 
 
-def _resolve_legacy_voice(slot_override, now):
-    """ROLLBACK-ONLY -- see this module's own docstring. Resolves
-    through the same WeatherVoicePersona/StationTTSVoice chain shared
-    mode uses, but pulls the RESOLVED provider voice id out into
-    voice["model"] for synthesis.py's direct-Kokoro fallback, and never
-    sets shared_tts=True."""
-    slot = _resolve_schedule_slot(slot_override, now)
-    if slot_override and slot_override not in available_slots():
-        raise VoiceResolutionError(
-            f"Unknown voice slot {slot_override!r} -- KanDrive currently defines {list(available_slots())}."
-        )
-    persona, resolved = _resolve_persona_for_slot(slot)
-    name, full_name = _persona_listener_facing_name(persona, slot)
-    voice = {
-        "engine": resolved.engine.value,
-        "model": resolved.provider_voice,
-        "name": name,
-        "full_name": full_name,
-        "signoff": persona.signoff,
-    }
-    return slot, voice
-
-
 def _resolve_shared_schedule_voice(config, slot_override, now):
     """The weather-schedule -> WeatherVoicePersona -> StationTTSVoice ->
     canonical shared TTS path (see this module's own docstring). Never
-    silently falls back to a different announcer or the legacy Kokoro
-    path on any failure -- every failure mode below is a clear,
-    immediate VoiceResolutionError, raised before any text has been
-    composed or any audio synthesized (resolve_voice() is always called
-    first -- see generate_road_condition_audio.py), so a bad/incomplete
-    persona can never overwrite the last-known-good report."""
+    silently falls back to a different announcer on any failure --
+    every failure mode below is a clear, immediate VoiceResolutionError,
+    raised before any text has been composed or any audio synthesized
+    (resolve_voice() is always called first -- see
+    generate_road_condition_audio.py), so a bad/incomplete persona can
+    never overwrite the last-known-good report."""
     slot = _resolve_schedule_slot(slot_override, now)
     persona, resolved = _resolve_persona_for_slot(slot)
     name, full_name = _persona_listener_facing_name(persona, slot)
@@ -237,21 +181,32 @@ def _resolve_shared_schedule_voice(config, slot_override, now):
 
 
 def resolve_voice(slot_override=None, now=None):
-    """Returns (slot_name, voice_dict). Which of two real modes this
-    uses is decided by RoadConditionsConfiguration.tts_use_weather_
-    schedule -- see this module's own docstring for the full picture;
-    both modes raise the same VoiceResolutionError for every failure
-    mode, so every existing caller (generate_road_condition_audio.py)
-    needs no mode-awareness of its own.
+    """Returns (slot_name, voice_dict) via the shared weather-schedule
+    path -- see this module's own docstring for the full picture.
+    Raises VoiceResolutionError, before any text is composed or audio
+    synthesized, when RoadConditionsConfiguration.tts_use_weather_
+    schedule is not enabled (the direct-Kokoro rollback path this used
+    to fall back to was retired in r0029; that runtime no longer
+    exists) as well as for every other resolution failure (unknown
+    slot, missing/incomplete persona, non-Kokoro engine, disabled/
+    invalid shared-TTS voice) -- so every existing caller
+    (generate_road_condition_audio.py) needs no mode-awareness of its
+    own.
 
     `now` is an optional aware datetime for tests; defaults to the
     current time. The hour used is LOCAL time (America/Chicago on this
     box), matching WeatherConfig.voice_schedule's own documented
-    contract ("local time, 0-23") -- both modes share this via
-    _resolve_schedule_slot() above."""
+    contract ("local time, 0-23") -- see _resolve_schedule_slot()
+    above."""
     from road_conditions.models import RoadConditionsConfiguration
     config = RoadConditionsConfiguration.load()
 
-    if config.tts_use_weather_schedule:
-        return _resolve_shared_schedule_voice(config, slot_override, now)
-    return _resolve_legacy_voice(slot_override, now)
+    if not config.tts_use_weather_schedule:
+        raise VoiceResolutionError(
+            "RoadConditionsConfiguration.tts_use_weather_schedule is not enabled -- "
+            "KanDrive has no other way to resolve a voice. The legacy direct-Kokoro "
+            "path this used to fall back to was retired in r0029 and no longer exists. "
+            "Enable tts_use_weather_schedule (Road Conditions configuration) to resolve "
+            "an announcer through the shared weather schedule."
+        )
+    return _resolve_shared_schedule_voice(config, slot_override, now)

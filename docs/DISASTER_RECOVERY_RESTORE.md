@@ -734,10 +734,14 @@ during this process for a fast recheck.
   target — an isolated staging tree has no full nginx config context or
   kernel to load a module into, so those two checks are explicitly
   skipped (not faked) under `--staging-root`.
-- `manage.py check_deploy_baseline` checks this HOST's actual configured
-  paths (e.g. `/usr/local/bin/fdkaac`, `~/kokoro`), not a
-  `--staging-root`'s isolated copies — during Phase 4's own staging
-  validation this meant it was confirming production's real, already-
-  correct state rather than the freshly-staged build/venv from earlier
-  stages. Still a genuine, useful check; just not staging-root-aware by
-  design (it's meant to run on the real target after a real restore).
+- `manage.py check_deploy_baseline` validates THIS HOST's actual,
+  already-established state -- Runtime Foundation E's own canonical
+  runtime (fdkaac/Kokoro/Piper component evidence, the E5 system
+  surfaces, the TTS scratch surface, package prerequisites; see
+  `docs/RUNTIME_DEPLOY_BASELINE.md`), not `~/kokoro` (retired in r0029;
+  no longer present at all) and not a `--staging-root`'s isolated
+  copies -- during Phase 4's own staging validation this meant it was
+  confirming production's real, already-correct state rather than the
+  freshly-staged build/venv from earlier stages. Still a genuine,
+  useful check; just not staging-root-aware by design (it's meant to
+  run on the real target after a real restore).

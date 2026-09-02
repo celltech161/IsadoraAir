@@ -50,7 +50,7 @@ _synthesize_with_transitions()) is run through the SAME two-pass EBU
 R128 loudnorm target the KNS show ingest script applies to every other
 syndicated show (get_kns.py's own LOUDNORM_TARGETS/build_loudnorm_
 string/two-pass analyze-then-encode structure, duplicated here rather
-than cross-imported -- same reasoning as KOKORO_BINARY above). True
+than cross-imported). True
 two-pass loudnorm structurally can't run as a single streaming pass
 over a pipe -- the second pass's linear correction needs the first
 pass's COMPLETE measurement before it can correctly apply anything
@@ -80,16 +80,6 @@ from django.db import transaction
 from isadoraair.tts.errors import TTSError
 from isadoraair.tts.station import synthesize_station_voice
 from library.models import AnalysisConfig, Category, Track
-
-# Same literal binary path used both in weather-ingest's lib/voices.py
-# (external project) and webrequests/services.py (in-Django) --
-# duplicated here rather than imported cross-app, matching this
-# codebase's own established idiom of each app owning its own copy of
-# this one constant (see webrequests/services.py's own comment on the
-# same duplication against weather-ingest). Still the historical/
-# rollback path -- see _synthesize_segment_wav() below and
-# road_conditions/voice.py's own module docstring.
-KOKORO_BINARY = "/home/jreed/kokoro/bin/kokoro_synth"
 
 KANDRIVE_ROOT = Path(settings.LIBRARY_ROOT) / "KanDrive"
 KANDRIVE_FILENAME = "road_report.flac"
@@ -276,8 +266,7 @@ def _probe_duration(path):
 def build_loudnorm_string(extra_args=""):
     """Same construction as the KNS show ingest script's own
     build_loudnorm_string() (get_kns.py) -- duplicated here rather
-    than cross-imported, matching this module's existing convention
-    for KOKORO_BINARY. Uses LOUDNORM_TARGETS, the same numbers KNS
+    than cross-imported. Uses LOUDNORM_TARGETS, the same numbers KNS
     applies to every other syndicated show."""
     base = "loudnorm=I={I}:TP={TP}:LRA={LRA}".format(**LOUDNORM_TARGETS)
     return f"{base}:{extra_args}" if extra_args else base
@@ -360,46 +349,34 @@ def _run_loudnorm_two_pass(build_filter_args, tmp_flac):
 
 
 def _synthesize_segment_wav(voice, text, output_wav):
-    """The one synthesis-routing decision this module makes, applied
-    identically to the plain single-call path (synthesize_road_report's
-    own body) and every per-segment call in _synthesize_with_transitions()
-    below -- neither path may fall back to the other while the caller's
-    resolved `voice` says otherwise.
-
-    voice["shared_tts"] is set only by road_conditions.voice.
-    resolve_voice()'s weather-schedule-mode branch. When it's not set
-    (legacy/rollback -- the historical resolve_voice() dict, or a
-    caller-built dict like this module's own tests), this is the exact
-    historical direct-KOKORO_BINARY invocation, same fixed 600s timeout
-    it has always used. When it IS set, this routes through the
-    existing shared isadoraair.tts.station.synthesize_station_voice()
-    API instead, passing ONLY voice["logical_voice_name"] -- an
-    operator-selected logical station voice name -- never
-    voice["model"] (which in shared mode holds the RESOLVED provider
-    voice id, e.g. "af_jessica", kept only for report.
+    """Applied identically to the plain single-call path
+    (synthesize_road_report's own body) and every per-segment call in
+    _synthesize_with_transitions() below. Routes through the shared
+    isadoraair.tts.station.synthesize_station_voice() API, passing ONLY
+    voice["logical_voice_name"] -- an operator-selected logical station
+    voice name -- never voice["model"] (which holds the RESOLVED
+    provider voice id, e.g. "af_jessica", kept only for report.
     compute_report_fingerprint()'s fingerprint authenticity; see
     voice.py's _resolve_shared_schedule_voice()). Timeout is
     voice["tts_timeout_seconds"] (RoadConditionsConfiguration.
     tts_timeout_seconds, applied per call -- i.e. per segment on the
     transition-sound path, matching that field's own documented
-    intent), not the legacy path's fixed 600s.
+    intent).
 
-    Raises subprocess.CalledProcessError/TimeoutExpired (legacy) or
-    isadoraair.tts.errors.TTSError (shared) -- both are caught by
+    `voice` is always a road_conditions.voice.resolve_voice()-shaped
+    dict -- that function raises VoiceResolutionError before returning
+    anything else (the direct-Kokoro fallback this used to route to for
+    a legacy/unshaped dict was retired in r0029; that runtime no longer
+    exists).
+
+    Raises isadoraair.tts.errors.TTSError, caught by
     synthesize_road_report()'s own wrapping try/except and turned into
-    a SynthesisError, exactly the same non-fatal, last-known-good-
-    preserving contract either way."""
-    if voice.get("shared_tts"):
-        synthesize_station_voice(
-            text,
-            voice=voice["logical_voice_name"],
-            output_path=output_wav,
-            timeout_seconds=voice["tts_timeout_seconds"],
-        )
-        return
-    subprocess.run(
-        [KOKORO_BINARY, "--model", voice["model"], "--output_file", str(output_wav)],
-        input=text.encode("utf-8"), check=True, timeout=600,
+    a SynthesisError, non-fatal and last-known-good-preserving."""
+    synthesize_station_voice(
+        text,
+        voice=voice["logical_voice_name"],
+        output_path=output_wav,
+        timeout_seconds=voice["tts_timeout_seconds"],
     )
 
 
@@ -464,9 +441,8 @@ def _synthesize_with_transitions(segments, voice, transition_sound_path, tmp_fla
 
 
 def synthesize_road_report(text, voice_slot, voice, segments=None, transition_sound_path=None):
-    """Renders `text` via Kokoro -- directly (legacy) or through the
-    shared TTS service (weather-schedule cutover), decided per call by
-    _synthesize_segment_wav() below purely from the already-resolved
+    """Renders `text` through the shared TTS service via
+    _synthesize_segment_wav() below, using the already-resolved
     `voice` dict (see road_conditions/voice.py's resolve_voice(), which
     is the ONLY place a voice should be chosen; this function just
     plays whatever it's handed) -- converts to FLAC, and attaches it as
@@ -552,23 +528,19 @@ def synthesize_road_report(text, voice_slot, voice, segments=None, transition_so
                 TMP_AUDIO_ROOT.mkdir(parents=True, exist_ok=True)
                 tmp_wav = TMP_AUDIO_ROOT / f".{KANDRIVE_FILENAME}.{pid}.tmp.wav"
                 cleanup_paths.append(tmp_wav)
-                # Timeout (legacy path: fixed 600s; shared-TTS path:
-                # voice["tts_timeout_seconds"] -- see
-                # _synthesize_segment_wav()), NOT copied from
+                # Timeout is voice["tts_timeout_seconds"] -- see
+                # _synthesize_segment_wav() -- NOT copied from
                 # webrequests/services.py's 30s -- that value is sized
                 # for a several-second dedication intro. A KanDrive
                 # report is a full multi-event round-up (~780 words /
                 # ~5-6 minutes of speech on the live dataset at
-                # reconnaissance time); kokoro_synth's own header
-                # comment documents ~1.5-2x realtime throughput on this
-                # hardware (a 30s forecast takes ~15-20s wall time), so
-                # a report this length could reasonably take several
-                # minutes of wall time to synthesize. 600s (the legacy
-                # fixed value, and RoadConditionsConfiguration.
-                # tts_timeout_seconds' own default) gives real headroom
-                # above that without being unbounded -- a genuinely hung
-                # Kokoro process still gets killed, just not mistaken
-                # for one on a long report.
+                # reconnaissance time), so a report this length could
+                # reasonably take several minutes of wall time to
+                # synthesize. RoadConditionsConfiguration.
+                # tts_timeout_seconds' own default (600s) gives real
+                # headroom above that without being unbounded -- a
+                # genuinely hung synthesis process still gets killed,
+                # just not mistaken for one on a long report.
                 _synthesize_segment_wav(voice, text, tmp_wav)
 
                 def build_filter_args(loudnorm_filter_str):
@@ -578,7 +550,7 @@ def synthesize_road_report(text, voice_slot, voice, segments=None, transition_so
                 _run_loudnorm_two_pass(build_filter_args, tmp_flac)
                 duration = _probe_duration(tmp_flac)
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, ValueError, TTSError) as exc:
-            raise SynthesisError(f"Kokoro/ffmpeg/shared-TTS synthesis failed: {exc}") from exc
+            raise SynthesisError(f"Shared-TTS/ffmpeg synthesis failed: {exc}") from exc
 
         # Atomic -- no reader (the log builder, a manual admin listen,
         # a concurrent generation run) ever sees a partially-written

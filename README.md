@@ -162,13 +162,13 @@ IsadoraAir manages the full music library, schedule programming, playlist genera
 **Shared Text-to-Speech Foundation** (`isadoraair/tts/`)
 - Logical station voices give Django features and external companions one engine-neutral interface while keeping provider-native voices, model paths, and runtime details internal
 - The tested runtime boundary supports Kokoro and optional checksum-pinned Piper providers with bounded subprocess execution and validated atomic output
-- Weather, road-condition, and dedication speech already exist, but their callers are still being consolidated onto this common logical-voice foundation
+- Weather, road-condition, and dedication speech are fully consolidated onto this common logical-voice foundation — no feature synthesizes against a provider-native path directly; an unconfigured voice fails clearly instead of falling back to one
 
 **Content Ingestion & Integrations**
 - Companion-based syndicated program ingestion can pull provider-specific audio, tag it, and deliver it into scheduled rotation categories while preserving categorization, file-placement, and ready-to-air gates. Specialized fetchers remain external when they carry provider credentials or scraping logic; a native generic/operator-managed recurring-program system remains roadmap work
 - Weather integration: operational NWS-sourced current temperature, one-day and three-day forecasts feed RadioText messages via the RBDS client, while active watches/warnings can fire an ordinary configured `FXCart` through the playback engine
 - Kansas road-conditions integration (`road_conditions` app): operational KDOT/KanDrive CARS ingestion normalizes construction, closure, restriction, winter-driving, and weather-warning events with admin-configurable coverage filters; it generates consolidated spoken reports with optional transitions, safe stale-feed retirement, and fingerprints that avoid needless re-synthesis when a healthy report is unchanged
-- Weather and road-condition reporting remain operational while their generated-speech callers are migrated onto the shared logical-voice TTS foundation
+- Weather and road-condition reporting are fully migrated onto the shared logical-voice TTS foundation described above
 - Bluesky auto-poster: now-playing metadata pushed to a configured Bluesky account every 2 minutes, with de-duplication so an unchanged track doesn't re-post
 - TuneIn AIR now-playing pusher: hits TuneIn's broadcaster metadata API on every track change with one HTTP call per song start (respects their explicit "do not use a timer to submit a song" rule by deduping on PlayEvent id — the timer fires every 30s but only makes an outbound call when the current PlayEvent id differs from the last successful push). `commercial=true` set automatically for Spot-category plays. Credentials in Config → TuneIn AIR
 - `ogremote` receiver: **ogremote is a separate newsgathering / voiceover tool that is not part of this project** — it runs on its own box and produces content to be aired. IsadoraAir ships only the receiving-side integration: polls for available uploads and dispatches urgent-replay drops into the library. Optional; disable the two `ogremote-*.timer` units if you're not running ogremote upstream
@@ -491,9 +491,12 @@ without storing a private decryption key on the IsadoraAir host.
 
 Bare-machine recovery tooling lives under `deploy/restore/`, with the
 operator procedure in [`docs/DISASTER_RECOVERY_RESTORE.md`](docs/DISASTER_RECOVERY_RESTORE.md).
-The tooling supports plan/staging/apply modes and has been staged against a
-real backup; the actual clean-machine acceptance drill remains roadmap work.
-For a full production bring-up, also run the read-only baseline preflight:
+The tooling supports plan/staging/apply modes and has proven a real
+end-to-end restore (application, database, and native TTS/HE-AAC runtime
+reconstruction) from a real self-contained backup archive into an isolated
+target; a fully offline, disposable whole-machine acceptance drill (no
+network access at all) remains roadmap work. For a full production
+bring-up, also run the read-only baseline preflight:
 
 ```bash
 python manage.py check_deploy_baseline
@@ -668,7 +671,6 @@ layer rather than a rewrite.
 
 - Scheduled Aircheck recording tied to `/schedule/` program blocks
 - HE-AAC native dependency packaging for fresh installs and recovery
-- Complete shared generated-speech caller migration for weather, road conditions, and dedications
 - Granular talent roles, capabilities, and scheduled access
 - Log-position voice tracking + remote talent job workflow
 - Native managed syndicated / recurring program-content ingestion

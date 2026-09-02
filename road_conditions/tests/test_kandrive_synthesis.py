@@ -21,17 +21,16 @@ from weather.models import WeatherVoicePersona
 
 
 def ensure_default_weather_voice_personas():
-    """road_conditions/voice.py's resolve_voice() -- BOTH its shared and
-    (as of the shared-TTS migration) its legacy mode -- resolves real
+    """road_conditions/voice.py's resolve_voice() resolves real
     day/night identity through WeatherVoicePersona/StationTTSVoice
     rather than a static external dict (see that module's own
-    docstring: weather-ingest's own provider dictionary, the thing
-    legacy mode used to source identity from with zero DB dependency,
-    no longer exists). Any test that exercises the REAL resolve_voice()
-    (most of this file, and generate_road_condition_audio's own
-    command tests, via KanDriveSynthesisFixtureMixin below) needs these
-    rows to exist -- get_or_create so it's safe under both TestCase's
-    per-test rollback and TransactionTestCase's per-test flush."""
+    docstring -- the direct-Kokoro rollback path that used to bypass
+    this chain was retired in r0029). Any test that exercises the REAL
+    resolve_voice() (most of this file, and generate_road_condition_audio's
+    own command tests, via KanDriveSynthesisFixtureMixin below) needs
+    these rows to exist -- get_or_create so it's safe under both
+    TestCase's per-test rollback and TransactionTestCase's per-test
+    flush."""
     claira, _ = StationTTSVoice.objects.get_or_create(
         name="Claira_Sky",
         defaults=dict(enabled=True, engine=StationTTSVoice.Engine.KOKORO,
@@ -52,17 +51,20 @@ def ensure_default_weather_voice_personas():
     )
 
 
-DAY_VOICE = {"engine": "kokoro", "model": "af_jessica", "name": "Claira"}
-NIGHT_VOICE = {"engine": "kokoro", "model": "am_liam", "name": "Max"}
-
-# A resolve_voice()-shaped shared-TTS voice dict (see road_conditions/
-# voice.py's _resolve_shared_schedule_voice()) -- "model" deliberately
+# resolve_voice()-shaped shared-TTS voice dicts (see road_conditions/
+# voice.py's _resolve_shared_schedule_voice() -- the only shape
+# _synthesize_segment_wav() accepts since r0029). "model" deliberately
 # holds the RESOLVED PROVIDER voice id (fingerprint authenticity only),
 # while "logical_voice_name" is the only identity synthesis.py may ever
 # pass to synthesize_station_voice().
-SHARED_DAY_VOICE = {
+DAY_VOICE = {
     "engine": "kokoro", "model": "af_jessica", "name": "Claira", "full_name": "Claira Sky",
     "signoff": "I'm Claira Sky.", "logical_voice_name": "Claira_Sky",
+    "shared_tts": True, "tts_timeout_seconds": 45,
+}
+NIGHT_VOICE = {
+    "engine": "kokoro", "model": "am_liam", "name": "Max", "full_name": "Max Weatherly",
+    "signoff": "I'm Max Weatherly.", "logical_voice_name": "Max_Weatherly",
     "shared_tts": True, "tts_timeout_seconds": 45,
 }
 
@@ -110,15 +112,33 @@ class KanDriveSynthesisFixtureMixin:
         self._loudnorm_analyze_call_count = 0
         self._loudnorm_analysis_should_be_empty = False
 
+        # Shared-TTS synthesis is a plain function call now, not a
+        # subprocess -- faked here (patching synthesize_station_voice
+        # directly) rather than through fake_run's subprocess.run
+        # interception below, which now only ever sees ffmpeg calls
+        # (the direct-Kokoro subprocess dispatch this used to also
+        # simulate was retired in r0029; that runtime no longer
+        # exists). _kokoro_call_count/_kokoro_should_fail keep their
+        # names and meaning unchanged for every existing test in this
+        # file -- still "how many times did the (Kokoro-engine, shared-
+        # TTS) synthesis step run" / "should it fail" -- only the
+        # underlying mechanism moved.
+        def fake_station_synth(text, *, voice, output_path, speed=None, language=None,
+                                timeout_seconds=None, service=None):
+            self._kokoro_call_count += 1
+            if self._kokoro_should_fail:
+                from isadoraair.tts.errors import TTSSynthesisError
+                raise TTSSynthesisError("simulated shared-TTS provider failure")
+            Path(output_path).write_bytes(b"FAKE-WAV-CONTENT")
+            return Path(output_path)
+
+        station_patcher = patch.object(synthesis_module, "synthesize_station_voice", side_effect=fake_station_synth)
+        station_patcher.start()
+        self.addCleanup(station_patcher.stop)
+
         def fake_run(cmd, **kwargs):
             import subprocess as _sp
-            if cmd[0] == synthesis_module.KOKORO_BINARY:
-                self._kokoro_call_count += 1
-                if self._kokoro_should_fail:
-                    raise _sp.CalledProcessError(1, cmd, output=b"", stderr=b"kokoro exploded")
-                Path(cmd[cmd.index("--output_file") + 1]).write_bytes(b"FAKE-WAV-CONTENT")
-                return _sp.CompletedProcess(cmd, 0)
-            elif cmd[0] == "ffmpeg":
+            if cmd[0] == "ffmpeg":
                 if cmd[-3:] == ["-f", "null", "-"]:
                     # loudnorm analysis pass -- never writes a real file
                     # (discarded via -f null), so it's never subject to
@@ -431,12 +451,13 @@ class TransitionSoundSynthesisTests(KanDriveSynthesisFixtureMixin, TransactionTe
 
 
 class SharedTTSSynthesisRoutingTests(KanDriveSynthesisFixtureMixin, TransactionTestCase):
-    """synthesize_road_report()'s routing decision (_synthesize_segment_wav)
-    for a shared_tts=True voice dict -- both the plain whole-report path
-    and the per-segment transition path. KOKORO_BINARY's own fake_run
-    branch (from KanDriveSynthesisFixtureMixin) stays wired the whole
-    time, so `self._kokoro_call_count == 0` genuinely proves no fallback,
-    not merely that nothing checked."""
+    """synthesize_road_report()'s call into _synthesize_segment_wav's
+    shared-TTS dispatch -- both the plain whole-report path and the
+    per-segment transition path. Its own synthesize_station_voice
+    override (below) replaces KanDriveSynthesisFixtureMixin's generic
+    one for the duration of every test here, so it can assert on the
+    exact voice/timeout each call received, not just that a call
+    happened."""
 
     def setUp(self):
         super().setUp()
@@ -466,30 +487,28 @@ class SharedTTSSynthesisRoutingTests(KanDriveSynthesisFixtureMixin, TransactionT
         station_patcher.start()
         self.addCleanup(station_patcher.stop)
 
-    def test_whole_report_uses_shared_tts_not_legacy_binary(self):
-        track = synthesize_road_report("Test report text.", "day", SHARED_DAY_VOICE)
+    def test_whole_report_uses_shared_tts_with_logical_voice_only(self):
+        track = synthesize_road_report("Test report text.", "day", DAY_VOICE)
 
-        self.assertEqual(self._kokoro_call_count, 0, "legacy KOKORO_BINARY must not run in shared-TTS mode")
         self.assertEqual(len(self.station_calls), 1)
         self.assertEqual(self.station_calls[0]["voice"], "Claira_Sky")
         self.assertNotIn("af_jessica", str(self.station_calls[0]["voice"]), "provider id must never be passed")
         self.assertEqual(self.station_calls[0]["timeout_seconds"], 45)
         self.assertEqual(track.title, "KanDrive Road Report (Claira)")
 
-    def test_every_transition_segment_uses_shared_tts_not_legacy_binary(self):
+    def test_every_transition_segment_uses_shared_tts_with_logical_voice_only(self):
         synthesize_road_report(
-            "unused when segments given", "day", SHARED_DAY_VOICE,
+            "unused when segments given", "day", DAY_VOICE,
             segments=["first item.", "second item.", "third item."],
             transition_sound_path="/fake/path/woosh.wav",
         )
-        self.assertEqual(self._kokoro_call_count, 0, "no segment may fall back to KOKORO_BINARY")
         self.assertEqual(len(self.station_calls), 3)
         for call in self.station_calls:
             self.assertEqual(call["voice"], "Claira_Sky")
             self.assertEqual(call["timeout_seconds"], 45, "tts_timeout_seconds applies PER segment")
 
     def test_configured_timeout_seconds_value_reaches_every_call(self):
-        voice = dict(SHARED_DAY_VOICE, tts_timeout_seconds=17)
+        voice = dict(DAY_VOICE, tts_timeout_seconds=17)
         synthesize_road_report(
             "unused", "day", voice,
             segments=["a", "b"], transition_sound_path="/fake/path/woosh.wav",
@@ -503,21 +522,16 @@ class SharedTTSSynthesisRoutingTests(KanDriveSynthesisFixtureMixin, TransactionT
 
         self._station_should_fail = True
         with self.assertRaises(SynthesisError):
-            synthesize_road_report("unused", "night", dict(SHARED_DAY_VOICE, logical_voice_name="Max_Weatherly"))
+            synthesize_road_report("unused", "night", dict(DAY_VOICE, logical_voice_name="Max_Weatherly"))
 
         self.assertEqual(Path(good.filepath).read_bytes(), good_bytes)
         good.refresh_from_db()
         self.assertEqual(good.title, "KanDrive Road Report (Claira)")
 
     def test_no_temp_files_left_behind_after_shared_tts_success(self):
-        synthesize_road_report("Test report text.", "day", SHARED_DAY_VOICE)
+        synthesize_road_report("Test report text.", "day", DAY_VOICE)
         leftovers = [p for p in Path(self._tmpdir.name).iterdir() if p.name.startswith(".")]
         self.assertEqual(leftovers, [])
-
-    def test_legacy_voice_dict_still_uses_kokoro_binary_unaffected_by_this_feature(self):
-        synthesize_road_report("Plain text, old-style call.", "day", DAY_VOICE)
-        self.assertEqual(self._kokoro_call_count, 1)
-        self.assertEqual(self.station_calls, [])
 
 
 class LastKnownGoodPreservationTests(KanDriveSynthesisFixtureMixin, TransactionTestCase):

@@ -196,10 +196,32 @@ class DedicationSynthesisTests(DedicationFixtureMixin, TransactionTestCase):
         root_patcher.start()
         self.addCleanup(root_patcher.stop)
 
+        # A selected Dedication TTS Voice -- required since r0029
+        # retired the direct-Kokoro fallback this fixture used to rely
+        # on when dedication_tts_voice was left blank (see
+        # DedicationSharedTTSRoutingTests below for the "still blank"
+        # failure-mode coverage). Winner-selection/advisory-lock/CAS-
+        # cleanup/already-played-exclusion below are about the request
+        # pipeline, not voice routing, so a plain always-succeeding
+        # fake is enough here.
+        self.dedication_voice = StationTTSVoice.objects.create(
+            name="Dedication_Dave", enabled=True, engine=StationTTSVoice.Engine.KOKORO,
+            provider_voice="am_fenrir", language="en-us", speed=1.0,
+        )
+        self.cfg.dedication_tts_voice = self.dedication_voice
+        self.cfg.save(update_fields=["dedication_tts_voice"])
+
+        def fake_station_synth(text, *, voice, output_path, speed=None, language=None,
+                                timeout_seconds=None, service=None):
+            Path(output_path).write_bytes(b"WAV")
+            return Path(output_path)
+
+        station_patcher = patch.object(services_module, "synthesize_station_voice", side_effect=fake_station_synth)
+        station_patcher.start()
+        self.addCleanup(station_patcher.stop)
+
         def fake_run(cmd, **kwargs):
-            if cmd[0] == services_module.KOKORO_BINARY:
-                Path(cmd[cmd.index("--output_file") + 1]).write_bytes(b"WAV")
-            elif cmd[0] == "ffmpeg":
+            if cmd[0] == "ffmpeg":
                 Path(cmd[-1]).write_bytes(b"FLAC")
             return MagicMock(returncode=0)
 
@@ -398,12 +420,16 @@ class DedicationSynthesisTests(DedicationFixtureMixin, TransactionTestCase):
 # ---------------------------------------------------------------------
 # Dedication TTS cutover -- synthesis-routing decision only.
 # WebRequestConfig.dedication_tts_voice is null by fixture default
-# (WebRequestFixtureMixin.setUp), so DedicationSynthesisTests above
-# already proves the legacy KOKORO_BINARY path end to end on every one
-# of its tests -- untouched by this feature. This class covers the
-# shared-TTS branch specifically: routing, no provider-id leakage,
-# configured timeout, non-fatal failure, and that a successful shared
-# synthesis still flows through the existing FLAC/Track pipeline.
+# (WebRequestFixtureMixin.setUp); as of r0029 that's an invalid
+# configuration state (the direct-Kokoro fallback this used to run
+# was retired -- see test_dedication_voice_blank_raises_configuration_
+# error_not_legacy_dispatch below). DedicationSynthesisTests above
+# selects a Dedication TTS Voice in its own fixture and proves the
+# request pipeline (winner-selection, locking, cleanup) works through
+# shared TTS. This class covers the shared-TTS routing decision itself:
+# no provider-id leakage, configured timeout, non-fatal failure, the
+# blank-voice failure mode, and that a successful shared synthesis
+# still flows through the existing FLAC/Track pipeline.
 # ---------------------------------------------------------------------
 class DedicationSharedTTSRoutingTests(DedicationFixtureMixin, TransactionTestCase):
     def setUp(self):
@@ -415,9 +441,7 @@ class DedicationSharedTTSRoutingTests(DedicationFixtureMixin, TransactionTestCas
         self.addCleanup(root_patcher.stop)
 
         def fake_run(cmd, **kwargs):
-            if cmd[0] == services_module.KOKORO_BINARY:
-                Path(cmd[cmd.index("--output_file") + 1]).write_bytes(b"WAV")
-            elif cmd[0] == "ffmpeg":
+            if cmd[0] == "ffmpeg":
                 Path(cmd[-1]).write_bytes(b"FLAC")
             return MagicMock(returncode=0)
 
@@ -451,25 +475,37 @@ class DedicationSharedTTSRoutingTests(DedicationFixtureMixin, TransactionTestCas
         Path(output_path).write_bytes(b"WAV")
         return Path(output_path)
 
-    def test_legacy_kokoro_path_when_dedication_voice_blank(self):
+    def test_dedication_voice_blank_raises_configuration_error_not_legacy_dispatch(self):
+        """dedication_tts_voice is null (this fixture's/field's
+        default) is an invalid configuration state as of r0029 -- the
+        direct-Kokoro fallback this used to run no longer exists.
+        _synthesize_dedication_wav() must raise TTSConfigurationError
+        immediately, WITHOUT calling synthesize_station_voice or any
+        subprocess -- and synthesize_dedication_intro()'s own outer
+        try/except must absorb that non-fatally, same contract as any
+        other synthesis failure (see test_shared_tts_failure_is_non_
+        fatal_and_emits_warning_event below)."""
         self.assertIsNone(self.cfg.dedication_tts_voice_id, "fixture default must stay blank")
         track = self.make_track(title="Free Fallin'")
         log = self.make_log(date(2027, 6, 1), 5)
         item = self.make_item(log, 0, track=track)
         req = self.make_request(track, status="scheduled", log_item=item, requester_name="Justin")
 
-        with patch.object(services_module, "synthesize_station_voice") as mock_station:
+        from isadoraair.tts.errors import TTSConfigurationError
+        with patch.object(services_module, "synthesize_station_voice") as mock_station, \
+             patch.object(services_module, "emit_event") as mock_emit:
+            with self.assertRaises(TTSConfigurationError):
+                services_module._synthesize_dedication_wav(self.cfg, "text", Path("/unused"))
             result = synthesize_dedication_intro(req)
 
-        self.assertTrue(result)
+        self.assertFalse(result, "best-effort: a blank dedication voice must not raise or crash the caller")
         mock_station.assert_not_called()
-        kokoro_calls = [
-            c for c in services_module.subprocess.run.call_args_list
-            if c.args[0][0] == services_module.KOKORO_BINARY
-        ]
-        self.assertEqual(len(kokoro_calls), 1, "the historical binary must still be invoked exactly as before")
-        cmd = kokoro_calls[0].args[0]
-        self.assertEqual(cmd[cmd.index("--model") + 1], services_module.DEDICATION_VOICE)
+        services_module.subprocess.run.assert_not_called()
+        req.refresh_from_db()
+        self.assertIsNone(req.intro_track_id, "no partial Track should be attached")
+        mock_emit.assert_called_once()
+        self.assertEqual(mock_emit.call_args.kwargs["category"], "webrequests")
+        self.assertEqual(mock_emit.call_args.kwargs["level"], "warning")
 
     def test_shared_tts_path_uses_logical_voice_and_never_leaks_provider_voice_id(self):
         voice = self._make_voice(name="Dedication_Dave", provider_voice="am_fenrir")
@@ -488,11 +524,6 @@ class DedicationSharedTTSRoutingTests(DedicationFixtureMixin, TransactionTestCas
         args, kwargs = mock_station.call_args
         self.assertEqual(kwargs["voice"], "Dedication_Dave", "caller must pass the logical name, not a provider id")
         self.assertNotIn("am_fenrir", (args, kwargs), "the Kokoro provider voice id must never reach the caller")
-        kokoro_calls = [
-            c for c in services_module.subprocess.run.call_args_list
-            if c.args[0][0] == services_module.KOKORO_BINARY
-        ]
-        self.assertEqual(kokoro_calls, [], "the legacy binary must not run once a logical voice is selected")
 
     def test_configured_timeout_passed_through_to_station_service(self):
         voice = self._make_voice()

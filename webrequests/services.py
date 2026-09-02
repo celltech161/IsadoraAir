@@ -11,6 +11,7 @@ from django.db import close_old_connections, connection, transaction
 from django.db.utils import OperationalError
 from django.utils import timezone
 
+from isadoraair.tts.errors import TTSConfigurationError
 from isadoraair.tts.station import synthesize_station_voice
 from library.models import Category, LogItem, PlaylistLog, RecencyConfig, Track
 from library.services.log_builder import get_recent_exclusions, get_separation
@@ -19,21 +20,6 @@ from monitoring.models import emit_event
 
 from .models import SongRequest, WebRequestConfig
 
-# Historical direct-binary path -- same binary/argument shape
-# weather-ingest's lib/voices.py already uses successfully in production
-# (`[binary, "--model", model, "--output_file", wav_path]`, verified
-# directly against the installed wrapper's --help too). am_fenrir is the
-# voice earmarked in PROJECT_NOTES.md for exactly this kind of
-# machine-driven announcement -- distinct enough from the weather
-# personas (Claira/Max) that a listener won't mistake one for the other.
-#
-# Still the default/rollback path: WebRequestConfig.dedication_tts_voice
-# is null on a fresh install and stays null until an operator explicitly
-# selects a logical voice in Django Admin (see
-# _synthesize_dedication_wav below) -- this binary/voice pair keeps
-# running exactly as before until that happens.
-KOKORO_BINARY = "/home/jreed/kokoro/bin/kokoro_synth"
-DEDICATION_VOICE = "am_fenrir"
 DEDICATION_ROOT = Path(settings.LIBRARY_ROOT) / "Dedications"
 
 # "feat." (any case, with the period -- requiring it is what keeps this
@@ -501,27 +487,35 @@ def _probe_duration(path):
 
 
 def _synthesize_dedication_wav(cfg, text, tmp_wav):
-    """The one synthesis-routing decision this feature makes. cfg is the
-    already-loaded WebRequestConfig singleton (callers already load it
-    once per request; no extra query here).
+    """cfg is the already-loaded WebRequestConfig singleton (callers
+    already load it once per request; no extra query here).
 
-    dedication_tts_voice is null: historical production path, unchanged
-    -- direct KOKORO_BINARY invocation, DEDICATION_VOICE hardcoded.
+    dedication_tts_voice must be set -- routed through the station's
+    own logical-voice API (isadoraair.tts.station), which resolves the
+    logical name to a real provider/voice/engine internally. This
+    function passes only cfg.dedication_tts_voice.name -- the logical
+    name an operator picked in Django Admin -- never a Kokoro provider
+    voice id; the caller has no other knowledge of or access to
+    provider infrastructure.
 
-    dedication_tts_voice is set: shared-TTS cutover -- routed through
-    the station's own logical-voice API (isadoraair.tts.station), which
-    resolves the logical name to a real provider/voice/engine internally.
-    This function passes only cfg.dedication_tts_voice.name -- the
-    logical name an operator picked in Django Admin -- never a Kokoro
-    provider voice id; the caller has no other knowledge of or access to
-    provider infrastructure."""
+    dedication_tts_voice is null (still this field's default, e.g. a
+    fresh install that has never had an operator select one in Django
+    Admin) is now an invalid configuration state: the direct-Kokoro
+    fallback this used to run (a hardcoded `/home/jreed/kokoro/bin/
+    kokoro_synth` invocation with a hardcoded "am_fenrir" voice) was
+    retired in r0029; that runtime no longer exists. Raises
+    TTSConfigurationError immediately rather than attempting a deleted
+    binary -- caught by synthesize_dedication_intro()'s own wrapping
+    try/except below, same non-fatal, no-intro-attached contract as any
+    other synthesis failure."""
 
     if cfg.dedication_tts_voice_id is None:
-        subprocess.run(
-            [KOKORO_BINARY, "--model", DEDICATION_VOICE, "--output_file", str(tmp_wav)],
-            input=text.encode("utf-8"), check=True, timeout=30,
+        raise TTSConfigurationError(
+            "WebRequestConfig.dedication_tts_voice is not set -- dedication intros have "
+            "no other way to resolve a voice. The legacy direct-Kokoro fallback this used "
+            "to run was retired in r0029 and no longer exists. Select a Dedication TTS "
+            "Voice in Django Admin (Web Requests configuration) to enable dedication intros."
         )
-        return
 
     synthesize_station_voice(
         text,

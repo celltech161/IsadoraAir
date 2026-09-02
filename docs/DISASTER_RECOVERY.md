@@ -90,8 +90,16 @@ station backup-v3 archive — has not been done yet either.
   `weather-ingest/`, `ogremote-ingest/`) — see "Companion projects"
   below; not yet even under version control, tracked as separate
   follow-up work, not silently ignored.
-- Kokoro TTS's model files (`~/kokoro/`, ~587 MB) — see "External
-  components" below.
+- `~/kokoro/` — historical rollback material only. It is no longer
+  required, and as of r0029 is no longer present on this host at all
+  (the direct-Kokoro fallback code paths that used it were retired;
+  rollback to that path was proven from an off-host archive before
+  retirement). Canonical Kokoro TTS is now carried entirely by Runtime
+  Foundation E's own content-addressed runtime (E3's provisioned
+  bundle under `/opt/isadoraair-runtime`, see `docs/RUNTIME_PROVISIONING.md`),
+  which backup-v3 material (E7A, see `docs/RUNTIME_BACKUP_PAYLOAD.md`)
+  independently reconstructs from its own hash-pinned wheel/model
+  archive — not from `~/kokoro/`.
 - All the secrets listed under "Secret reprovisioning boundary".
 
 ### Known deployment follow-up, resolved
