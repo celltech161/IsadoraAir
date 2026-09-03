@@ -67,7 +67,16 @@ def _resolve_signer_key_path(raw_path, resolved_directory: Path, *, label: str) 
     return candidate
 
 
-def parse_trust_policy_dict(data: dict, *, signer_directory: Path, label: str = "<trust-policy>") -> TrustPolicy:
+def _parse_trust_policy_dict_against_resolved_directory(
+    data: dict, *, resolved_directory: Path, label: str,
+) -> TrustPolicy:
+    """Shared parsing/validation body for both entry points below.
+    `resolved_directory` has already been through whichever ownership
+    check (or deliberate lack of one) its caller's category requires --
+    everything from here on (schema shape, signer id syntax/
+    uniqueness, MAX_SIGNERS, key-path containment under
+    resolved_directory, threshold range) is identical and un-relaxed
+    for both."""
     if not isinstance(data, dict):
         raise TrustPolicyError(f"{label}: trust policy must be a JSON object")
     known = {"schema_version", "signature_algorithm", "threshold", "signers"}
@@ -82,7 +91,6 @@ def parse_trust_policy_dict(data: dict, *, signer_directory: Path, label: str = 
     if not isinstance(raw_signers, list) or not raw_signers or len(raw_signers) > MAX_SIGNERS:
         raise TrustPolicyError(f"{label}: signers must be a non-empty, bounded list")
 
-    resolved_directory = _resolve_root_protected_directory(signer_directory, label=label)
     signers: list[Signer] = []
     seen_ids: set[str] = set()
     for index, raw in enumerate(raw_signers):
@@ -104,6 +112,47 @@ def parse_trust_policy_dict(data: dict, *, signer_directory: Path, label: str = 
 
     return TrustPolicy(schema_version=data["schema_version"], signature_algorithm=data["signature_algorithm"],
                        threshold=threshold, signers=tuple(signers))
+
+
+def parse_trust_policy_dict(data: dict, *, signer_directory: Path, label: str = "<trust-policy>") -> TrustPolicy:
+    """Parse and validate a trust policy against LIVE, INSTALLED,
+    root-protected signer state -- the real supervisor's own startup/
+    activation decision (updater_bootstrapd.py) and installed-state
+    inspection (isadoraair.phase_d_recovery.load_installed_phase_d_state)
+    both depend on this. `signer_directory` must genuinely be the
+    system's current, root-owned signer directory; this is never the
+    right entry point for a portable recovery artifact still sitting in
+    ordinary staging -- see parse_trust_policy_dict_for_recovery_artifact
+    for that case. Unchanged in behavior and signature from before r0033;
+    every existing caller keeps its exact enforcement."""
+    resolved_directory = _resolve_root_protected_directory(signer_directory, label=label)
+    return _parse_trust_policy_dict_against_resolved_directory(data, resolved_directory=resolved_directory, label=label)
+
+
+def parse_trust_policy_dict_for_recovery_artifact(
+    data: dict, *, signer_directory: Path, label: str = "<trust-policy>",
+) -> TrustPolicy:
+    """Parse and validate a trust policy embedded in a portable Phase-D
+    recovery artifact (a capture/attach/restore staging tree) -- never
+    live installed state. r0031/r0030's capture, attach, and restore
+    pipelines all validate a component copy that legitimately still
+    sits under ordinary, non-root-owned scratch space (e.g. a
+    tempfile.mkdtemp() staging directory) until/unless it is later
+    installed by an entirely separate, still fully root-ownership-
+    enforced path. Asking "is this the real, currently-installed,
+    root-guarded signer directory" is categorically inapplicable to an
+    artifact that has not been installed anywhere, so this entry point
+    intentionally skips only that one check (_resolve_root_protected_directory).
+    Every other check is identical and un-relaxed: schema shape, signer
+    id syntax/uniqueness, MAX_SIGNERS, key-path containment under
+    signer_directory, threshold range, and (for callers that verify
+    signatures afterward) Ed25519 verification itself. This function
+    must never be called with a live installed-state signer_directory --
+    use parse_trust_policy_dict for that."""
+    directory = Path(signer_directory)
+    if not directory.is_absolute():
+        raise TrustPolicyError(f"{label}: signer_directory must be an absolute path")
+    return _parse_trust_policy_dict_against_resolved_directory(data, resolved_directory=directory, label=label)
 
 
 @dataclasses.dataclass(frozen=True)

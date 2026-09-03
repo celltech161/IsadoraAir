@@ -408,12 +408,22 @@ def capture_phase_d_component(
 
 
 def validate_phase_d_component(root: Path) -> dict:
-    """Reusable backup-v3 and restore validator for one component."""
+    """Reusable backup-v3 and restore validator for one component.
+
+    Always validates a portable, captured/staged recovery artifact --
+    never live installed state -- so its embedded trust policy is
+    parsed via parse_trust_policy_dict_for_recovery_artifact (r0033),
+    not parse_trust_policy_dict. The component this function is handed
+    legitimately still sits under ordinary, non-root-owned scratch
+    space at every one of its call sites (capture_phase_d_component's
+    post-capture self-check, attach_phase_d_recovery_component's
+    pre-copy check, restore_phase_d_component's pre-materialization
+    check, and backup-v3's own load-time inspection)."""
 
     _runtime_paths()
     from isadoraair_updater_bootstrap.descriptor import parse_descriptor_dict, verify_descriptor_against_directory
     from isadoraair_updater_bootstrap.state import parse_runtime_state_dict
-    from isadoraair_updater_bootstrap.trust import parse_trust_policy_dict
+    from isadoraair_updater_bootstrap.trust import parse_trust_policy_dict_for_recovery_artifact
     from isadoraair_updater_bootstrap.verification import verify_candidate_bundle
 
     component = Path(root)
@@ -444,7 +454,9 @@ def validate_phase_d_component(root: Path) -> dict:
     for signer in rewritten.get("signers", []):
         source_name = Path(signer.get("public_key_path", "")).name
         signer["public_key_path"] = str((signer_directory / source_name).resolve())
-    trust = parse_trust_policy_dict(rewritten, signer_directory=signer_directory.resolve(), label="recovered trust policy")
+    trust = parse_trust_policy_dict_for_recovery_artifact(
+        rewritten, signer_directory=signer_directory.resolve(), label="recovered trust policy",
+    )
     if trust.threshold != manifest["trust_threshold"] or sorted(s.id for s in trust.signers) != manifest["public_signer_ids"]:
         raise PhaseDRecoveryError("recovered trust authority differs from restore metadata")
 

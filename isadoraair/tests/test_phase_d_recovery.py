@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import tempfile
 from copy import deepcopy
+from unittest import mock
 
 from django.test import SimpleTestCase
 
@@ -312,6 +313,51 @@ class PhaseDRecoveryComponentTests(SimpleTestCase):
         with self.assertRaises(PhaseDRecoveryError):
             validate_phase_d_component(tampered)
 
+    def test_tampered_trust_policy_content_still_refused_including_under_simulated_root(self):
+        """r0033 changed ONLY whether the signer directory's on-disk
+        ownership is checked -- the trust document's own CONTENT
+        (threshold vs. manifest agreement, signer id shape) must still
+        be fully validated, with or without a simulated-root euid."""
+        self._capture()
+        tampered = self.root / "tampered-trust-content"
+        shutil.copytree(self.component, tampered)
+        trust_path = tampered / "trust-policy.json"
+        trust = json.loads(trust_path.read_text())
+        trust["threshold"] = 999
+        trust_path.write_text(json.dumps(trust, sort_keys=True, separators=(",", ":")))
+        with self.assertRaises(PhaseDRecoveryError):
+            validate_phase_d_component(tampered)
+        with mock.patch("isadoraair_updater_bootstrap.security.os.geteuid", return_value=0):
+            with self.assertRaises(PhaseDRecoveryError):
+                validate_phase_d_component(tampered)
+
+    def test_capture_succeeds_under_simulated_root_against_ordinary_tmp_staging(self):
+        """r0033 regression: capture_phase_d_component's own post-capture
+        self-check (validate_phase_d_component) used to fail here, because
+        self.root -- an ordinary tempfile.TemporaryDirectory(), never
+        root-owned -- is exactly production's real failure shape
+        (a live, non-root-owned staging tree validated under real root).
+        Before the fix this raised PhaseDRecoveryError: "signer directory
+        is not safely root-protected"."""
+        with mock.patch("isadoraair_updater_bootstrap.security.os.geteuid", return_value=0):
+            evidence = self._capture()
+        self.assertEqual(evidence["trust_threshold"], 1)
+        self.assertEqual(evidence["active_generation"], 2)
+
+    def test_validate_phase_d_component_succeeds_under_simulated_root_for_a_captured_component(self):
+        """The single shared function every Phase-D recovery-artifact
+        caller (capture's self-check, attach's pre-copy check, restore's
+        pre-materialization check, backup-v3's load-time inspection) goes
+        through -- proven directly, with no unrelated ownership check
+        from a caller layered on top to collide with the euid mock (see
+        _build_schema_two_payload's own docstring below for why attach/
+        RuntimeRecoveryBuilder-layer callers cannot be faithfully
+        simulated this way without genuine root)."""
+        self._capture()
+        with mock.patch("isadoraair_updater_bootstrap.security.os.geteuid", return_value=0):
+            evidence = validate_phase_d_component(self.component)
+        self.assertEqual(evidence["trust_threshold"], 1)
+
     def _build_schema_two_payload(self, output_name: str = "schema-two") -> Path:
         """A real, fully-valid schema-2 recovery payload with
         protected_updater attached -- the exact fixture shape r0030's
@@ -327,7 +373,26 @@ class PhaseDRecoveryComponentTests(SimpleTestCase):
         environment-dependent failure on the SAME check when this isn't
         done; fixing it here rather than there keeps this fixture
         reliable without touching that unrelated, already-tracked
-        issue)."""
+        issue).
+
+        Deliberately never wraps ANY part of this helper in a simulated-
+        root euid: both RuntimeRecoveryBuilder.apply() and
+        attach_phase_d_recovery_component() have their OWN unrelated
+        _assert_existing_directory(owner=os.geteuid()) ownership check
+        against the REAL (unprivileged) tempdir owner, which a process-
+        wide os.geteuid() patch (os is one shared module object --
+        patching it by any qualified name affects every caller, not
+        just security.py's own) would make fail with an artificial
+        mismatch no real root invocation would ever hit (a real root
+        process's own output directories are genuinely root-owned
+        too). The r0033 fix itself is proven directly, at the exact
+        function that used to fail, by
+        test_validate_phase_d_component_succeeds_under_simulated_root_for_a_captured_component
+        above and by test_restore_succeeds_under_simulated_root_when_source_
+        extracted_under_ordinary_staging /
+        test_restore_and_publish_pipeline_preserves_target_modes_under_simulated_root
+        below, both of which wrap ONLY restore_protected_updater_component
+        (no such unrelated ownership check inside it)."""
         self._capture()
         self.product_manifest = deepcopy(load_runtime_components())
         native_source = self.root / f"native-source-{output_name}"
@@ -422,6 +487,59 @@ class PhaseDRecoveryComponentTests(SimpleTestCase):
                 payload, fake_root=self.root / "should-not-exist", product_manifest=self.product_manifest,
             )
         self.assertFalse((self.root / "should-not-exist").exists())
+
+    def test_attach_succeeds_with_a_legitimate_temporary_captured_component(self):
+        """attach_phase_d_recovery_component re-validates the captured
+        component a second time before copying it into the new payload
+        (runtime_recovery.py's own call site) -- via the SAME
+        validate_phase_d_component this class's own dedicated
+        test_validate_phase_d_component_succeeds_under_simulated_root_for_a_captured_component
+        proves is euid-independent after r0033. self.component here is
+        exactly the "legitimate temporary captured component" shape:
+        built fresh by self._capture() into self.root, an ordinary,
+        never-root-owned tempdir."""
+        payload = self._build_schema_two_payload(output_name="schema-two-attach-legit")
+        self.assertTrue((payload / "protected-updater" / "restore-manifest.json").is_file())
+
+    def test_restore_succeeds_under_simulated_root_when_source_extracted_under_ordinary_staging(self):
+        """r0030's own stage-75 path: restore_phase_d_component's first
+        statement is validate_phase_d_component(component_root), called
+        on wherever the caller located/extracted the archive -- an
+        ordinary staging location, never root-owned, exactly like a real
+        restore drill's extracted backup. This is THE call chain that
+        would have blocked a genuine root-privileged E8 restore."""
+        payload = self._build_schema_two_payload(output_name="schema-two-restore-root-sim")
+        fake_root = self.root / "fake-root-restore-root-sim"
+        with mock.patch("isadoraair_updater_bootstrap.security.os.geteuid", return_value=0):
+            restored = restore_protected_updater_component(
+                payload, fake_root=fake_root, product_manifest=self.product_manifest,
+            )
+        self.assertEqual(restored["result"], "pass")
+        self.assertTrue((fake_root / "usr/local/libexec/isadoraair-updater-bootstrap/updater_bootstrapd.py").is_file())
+
+    def test_restore_and_publish_pipeline_preserves_target_modes_under_simulated_root(self):
+        """Full capture -> attach -> restore -> publish chain under a
+        simulated root euid throughout, proving r0033 only widened the
+        validation-time ownership CHECK -- the actual restored/published
+        file modes (0755 entrypoint, 0600 config/state, 0644 everything
+        else) are byte-identical to the already-established, previously
+        unprivileged-only test_publish_phase_d_component_materializes_
+        files_at_target_root expectations."""
+        payload = self._build_schema_two_payload(output_name="schema-two-full-pipeline-root-sim")
+        fake_root = self.root / "fake-root-full-pipeline-root-sim"
+        target_root = self.root / "staging-target-full-pipeline-root-sim"
+        with mock.patch("isadoraair_updater_bootstrap.security.os.geteuid", return_value=0):
+            restore_protected_updater_component(
+                payload, fake_root=fake_root, product_manifest=self.product_manifest,
+            )
+            publish_phase_d_component(fake_root=fake_root, target_root=target_root)
+
+        launcher = target_root / "usr/local/libexec/isadoraair-updater-bootstrap/updater_bootstrapd.py"
+        self.assertEqual(launcher.stat().st_mode & 0o777, 0o755)
+        state = target_root / "var/lib/isadoraair-updater-bootstrap/runtime-state.json"
+        self.assertEqual(state.stat().st_mode & 0o777, 0o600)
+        trust = target_root / "etc/isadoraair/updater-trust.json"
+        self.assertEqual(trust.stat().st_mode & 0o777, 0o644)
 
     def test_publish_phase_d_component_materializes_files_at_target_root(self):
         """After restore_protected_updater_component builds the fake

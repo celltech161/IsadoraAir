@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "release_id": "r0033",
+  "previous_release_id": "r0032",
+  "minimum_updater_protocol_version": 5,
+  "summary": "Fixes a second latent root-ownership bug r0031 surfaced: validate_phase_d_component (used by capture/attach/restore) always enforced live root-ownership on a captured artifact's own signer directory, which legitimately sits in ordinary /tmp staging. Adds parse_trust_policy_dict_for_recovery_artifact as a separate, explicit entry point; parse_trust_policy_dict (live installed state, the real supervisor's own check) is unchanged. No protected-runtime change; no supervisor re-stage needed.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-gunicorn"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0007"
+}
