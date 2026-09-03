@@ -21,11 +21,14 @@ from deploy.updater_bootstrap.tools.protected_runtime_release import (
     sign_statement,
 )
 from isadoraair.phase_d_recovery import (
+    GENERATION_ONE_MANUAL_BOOTSTRAP_BINDING,
+    GENERATION_ONE_MANUAL_BOOTSTRAP_DESCRIPTOR_SHA256,
     PhaseDRecoveryError,
     capture_phase_d_component,
     load_installed_phase_d_state,
     publish_phase_d_component,
     resolve_installed_phase_d_capture_kwargs,
+    resolve_protected_runtime_binding,
     restore_phase_d_component,
     validate_phase_d_component,
 )
@@ -40,6 +43,40 @@ from isadoraair.runtime_recovery import (
     restore_protected_updater_component,
     validate_current_recovery_payload,
 )
+
+
+def _write_release_manifest(
+    releases_dir: Path, *, release_id: str, previous_release_id: str | None,
+    protected_runtime_generation: int | None = None,
+    protected_runtime_descriptor_sha256: str | None = None,
+) -> None:
+    """r0034: a minimal, schema-valid deploy/releases/<id>.json --
+    shared by every fixture below that needs a real, chainable
+    release-manifest set for resolve_protected_runtime_binding to
+    derive from, instead of a hand-written binding.json."""
+    data = {
+        "schema_version": 1, "release_id": release_id, "previous_release_id": previous_release_id,
+        "minimum_updater_protocol_version": 1,
+        "migrations_required": [], "python_requirements_changed": False,
+        "apt_packages_new": [], "systemd_units_changed": [],
+        "systemd_units_new_required": [], "systemd_units_new_optional": [],
+        "collectstatic_required": False, "services_requiring_restart": [],
+        "nginx_changed": False, "runtime_components_changed": protected_runtime_generation is not None,
+    }
+    if previous_release_id is None:
+        data["bootstrap_commit"] = "a" * 40
+    if protected_runtime_generation is not None:
+        data["protected_runtime"] = {
+            "generation": protected_runtime_generation,
+            "descriptor_path": "deploy/updater_runtime/protected-runtime-descriptor.json",
+            "descriptor_sha256": protected_runtime_descriptor_sha256,
+            "minimum_bootstrap_protocol_version": 1,
+            "runtime_version": 5,
+            "manifest_protocol_version": 5,
+            "supported_wire_protocols": [3],
+            "attestations": [f"deploy/updater_attestations/{release_id}-primary.json"],
+        }
+    (Path(releases_dir) / f"{release_id}.json").write_text(json.dumps(data, indent=2, sort_keys=True))
 
 
 class PhaseDRecoveryComponentTests(SimpleTestCase):
@@ -99,6 +136,7 @@ class PhaseDRecoveryComponentTests(SimpleTestCase):
             label="active", slot="A", generation=2,
             release_id="r0027", previous_release_id="r0026", previous_generation=1,
         )
+        self._build_releases_dir()
 
         self.runtime_state = self.root / "runtime-state.json"
         self.runtime_state.write_text(json.dumps({
@@ -199,11 +237,34 @@ class PhaseDRecoveryComponentTests(SimpleTestCase):
             "signature_base64": base64.b64encode(signature).decode("ascii"),
         }))
         (evidence_root / "signature.json").chmod(0o644)
-        (evidence_root / "binding.json").write_text(json.dumps({
-            "release_id": release_id, "previous_release_id": previous_release_id,
-            "previous_generation": previous_generation,
-        }))
-        (evidence_root / "binding.json").chmod(0o644)
+        # r0034: no binding.json here -- production's own real
+        # .staging/attestations-<slot>/ never contains one (only
+        # per-signer signature files like signature.json above).
+        # capture_phase_d_component now synthesizes it from
+        # self.releases_dir (see _build_releases_dir below), exactly
+        # as it must against the real installed system.
+
+    def _build_releases_dir(self) -> None:
+        """r0034: a small, self-contained, real-shaped release-manifest
+        chain (bootstrap r0025 -> r0026 declaring protected_runtime
+        generation 1, matching this fixture's own "previous" -> r0027
+        declaring generation 2, matching "active") -- proving capture
+        derives each generation's binding from committed manifests, the
+        same mechanism proven against real production evidence in
+        r0034's own discovery record (see
+        GENERATION_ONE_MANUAL_BOOTSTRAP_BINDING's docstring), not a
+        hand-written binding.json fixture."""
+        self.releases_dir = self.root / "releases"
+        self.releases_dir.mkdir()
+        _write_release_manifest(self.releases_dir, release_id="r0025", previous_release_id=None)
+        _write_release_manifest(
+            self.releases_dir, release_id="r0026", previous_release_id="r0025",
+            protected_runtime_generation=1, protected_runtime_descriptor_sha256=self.identities["previous"],
+        )
+        _write_release_manifest(
+            self.releases_dir, release_id="r0027", previous_release_id="r0026",
+            protected_runtime_generation=2, protected_runtime_descriptor_sha256=self.identities["active"],
+        )
 
     def _capture(self):
         return capture_phase_d_component(
@@ -213,6 +274,7 @@ class PhaseDRecoveryComponentTests(SimpleTestCase):
             station_config=self.station, bootstrap_config=self.bootstrap_config,
             trust_policy=self.trust_policy, signer_root=self.signers,
             descriptors_root=self.descriptors, attestations_root=self.attestations,
+            releases_dir=self.releases_dir,
         )
 
     def test_capture_validate_and_offline_fake_root_restore(self):
@@ -618,6 +680,131 @@ class PhaseDRecoveryComponentTests(SimpleTestCase):
         )
 
 
+class ResolveProtectedRuntimeBindingTests(SimpleTestCase):
+    """r0034: direct unit coverage of resolve_protected_runtime_binding,
+    independent of the broader capture pipeline -- proves the
+    derivation algorithm itself (manifest match, descriptor
+    cross-check, multi-hop predecessor lookup, the generation-1
+    hardcoded fallback, and honest failure) without needing a full
+    Phase-D component fixture for each case."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.releases_dir = Path(self.temp.name)
+
+    def test_single_generation_matches_and_returns_manifest_fields(self):
+        _write_release_manifest(self.releases_dir, release_id="r0100", previous_release_id=None)
+        _write_release_manifest(
+            self.releases_dir, release_id="r0101", previous_release_id="r0100",
+            protected_runtime_generation=5, protected_runtime_descriptor_sha256="a" * 64,
+        )
+        binding = resolve_protected_runtime_binding(
+            generation=5, descriptor_sha256="a" * 64, releases_dir=self.releases_dir,
+        )
+        self.assertEqual(binding, {
+            "release_id": "r0101", "previous_release_id": "r0100", "previous_generation": None,
+        })
+
+    def test_descriptor_mismatch_against_a_matching_generation_is_refused(self):
+        """A release DOES declare this generation number, but with a
+        different descriptor -- refusing, not silently trusting the
+        generation number alone, is the whole point of the
+        cross-check."""
+        _write_release_manifest(self.releases_dir, release_id="r0100", previous_release_id=None)
+        _write_release_manifest(
+            self.releases_dir, release_id="r0101", previous_release_id="r0100",
+            protected_runtime_generation=5, protected_runtime_descriptor_sha256="a" * 64,
+        )
+        with self.assertRaises(PhaseDRecoveryError):
+            resolve_protected_runtime_binding(
+                generation=5, descriptor_sha256="b" * 64, releases_dir=self.releases_dir,
+            )
+
+    def test_multi_hop_predecessor_is_the_closest_earlier_protected_runtime_release(self):
+        """Three protected-runtime-bearing releases, with ordinary
+        (non-protected-runtime) releases interleaved -- proves
+        previous_generation is derived from the closest EARLIER
+        protected_runtime release in chain order, not simply
+        generation - 1 or the immediately-preceding release_id."""
+        _write_release_manifest(self.releases_dir, release_id="r0200", previous_release_id=None)
+        _write_release_manifest(
+            self.releases_dir, release_id="r0201", previous_release_id="r0200",
+            protected_runtime_generation=1, protected_runtime_descriptor_sha256="1" * 64,
+        )
+        _write_release_manifest(self.releases_dir, release_id="r0202", previous_release_id="r0201")
+        _write_release_manifest(
+            self.releases_dir, release_id="r0203", previous_release_id="r0202",
+            protected_runtime_generation=2, protected_runtime_descriptor_sha256="2" * 64,
+        )
+        _write_release_manifest(self.releases_dir, release_id="r0204", previous_release_id="r0203")
+        _write_release_manifest(self.releases_dir, release_id="r0205", previous_release_id="r0204")
+        _write_release_manifest(
+            self.releases_dir, release_id="r0206", previous_release_id="r0205",
+            protected_runtime_generation=3, protected_runtime_descriptor_sha256="3" * 64,
+        )
+
+        binding = resolve_protected_runtime_binding(
+            generation=3, descriptor_sha256="3" * 64, releases_dir=self.releases_dir,
+        )
+        self.assertEqual(binding["release_id"], "r0206")
+        self.assertEqual(binding["previous_release_id"], "r0205")
+        self.assertEqual(binding["previous_generation"], 2)
+
+        # generation 2's OWN previous_generation is 1 (r0201), not None
+        # and not 0 -- proves the lookup isn't hardcoded to "the very
+        # first protected_runtime release means previous_generation=None"
+        # for anything other than a genuine chain head.
+        binding_gen2 = resolve_protected_runtime_binding(
+            generation=2, descriptor_sha256="2" * 64, releases_dir=self.releases_dir,
+        )
+        self.assertEqual(binding_gen2["previous_generation"], 1)
+
+        binding_gen1 = resolve_protected_runtime_binding(
+            generation=1, descriptor_sha256="1" * 64, releases_dir=self.releases_dir,
+        )
+        self.assertIsNone(binding_gen1["previous_generation"])
+
+    def test_generation_one_manual_bootstrap_fallback_matches_the_hardcoded_binding(self):
+        """No manifest anywhere declares generation 1 -- exactly
+        production's real shape (r0026 predates the protected_runtime
+        manifest field). Cryptographically proven, not guessed -- see
+        GENERATION_ONE_MANUAL_BOOTSTRAP_BINDING's own docstring for the
+        r0034 discovery record."""
+        _write_release_manifest(self.releases_dir, release_id="r0300", previous_release_id=None)
+        binding = resolve_protected_runtime_binding(
+            generation=1, descriptor_sha256=GENERATION_ONE_MANUAL_BOOTSTRAP_DESCRIPTOR_SHA256,
+            releases_dir=self.releases_dir,
+        )
+        self.assertEqual(binding, GENERATION_ONE_MANUAL_BOOTSTRAP_BINDING)
+
+    def test_generation_one_with_an_unrecognized_descriptor_is_an_honest_gap_not_a_guess(self):
+        """Generation 1, but NOT the proven production descriptor --
+        must NOT silently fall back to the hardcoded binding just
+        because the generation number happens to match."""
+        with self.assertRaises(PhaseDRecoveryError):
+            resolve_protected_runtime_binding(
+                generation=1, descriptor_sha256="c" * 64, releases_dir=self.releases_dir,
+            )
+
+    def test_unrecoverable_generation_raises_rather_than_fabricating_a_value(self):
+        _write_release_manifest(self.releases_dir, release_id="r0400", previous_release_id=None)
+        with self.assertRaises(PhaseDRecoveryError) as ctx:
+            resolve_protected_runtime_binding(
+                generation=7, descriptor_sha256="d" * 64, releases_dir=self.releases_dir,
+            )
+        self.assertIn("cannot be recovered", str(ctx.exception))
+
+    def test_malformed_release_chain_is_wrapped_as_phase_d_recovery_error(self):
+        _write_release_manifest(self.releases_dir, release_id="r0500", previous_release_id="r0499")
+        # r0499 (the referenced predecessor) is never written -- an
+        # orphaned chain, release_chain.build_chain's own job to catch.
+        with self.assertRaises(PhaseDRecoveryError):
+            resolve_protected_runtime_binding(
+                generation=1, descriptor_sha256="e" * 64, releases_dir=self.releases_dir,
+            )
+
+
 class InstalledPhaseDPublicationTests(SimpleTestCase):
     """r0031: the operator-facing publish/activate workflow, exercised
     against a REALISTIC on-disk 'installed host' layout -- station.json
@@ -689,6 +876,18 @@ class InstalledPhaseDPublicationTests(SimpleTestCase):
         self.identities = {}
         self._generation(slot="B", generation=1, release_id="r0026", previous_release_id="r0025", previous_generation=None)
         self._generation(slot="A", generation=2, release_id="r0027", previous_release_id="r0026", previous_generation=1)
+
+        self.releases_dir = self.root / "releases"
+        self.releases_dir.mkdir()
+        _write_release_manifest(self.releases_dir, release_id="r0025", previous_release_id=None)
+        _write_release_manifest(
+            self.releases_dir, release_id="r0026", previous_release_id="r0025",
+            protected_runtime_generation=1, protected_runtime_descriptor_sha256=self.identities["B"],
+        )
+        _write_release_manifest(
+            self.releases_dir, release_id="r0027", previous_release_id="r0026",
+            protected_runtime_generation=2, protected_runtime_descriptor_sha256=self.identities["A"],
+        )
 
         self.runtime_state_path = self.root / "runtime-state.json"
         self._write_runtime_state(
@@ -795,11 +994,8 @@ class InstalledPhaseDPublicationTests(SimpleTestCase):
             "signature_base64": base64.b64encode(signature).decode("ascii"),
         }))
         (evidence_root / "signature.json").chmod(0o644)
-        (evidence_root / "binding.json").write_text(json.dumps({
-            "release_id": release_id, "previous_release_id": previous_release_id,
-            "previous_generation": previous_generation,
-        }))
-        (evidence_root / "binding.json").chmod(0o644)
+        # r0034: no binding.json here either -- see the first fixture's
+        # own comment in this file for why.
 
     def _write_runtime_state(self, *, active_slot, active_generation, active_descriptor,
                               previous_slot, previous_generation, previous_descriptor, activation):
@@ -834,6 +1030,7 @@ class InstalledPhaseDPublicationTests(SimpleTestCase):
             base_root=self.base_root, expected_owner_uid=os.geteuid(), enforce_root_ownership=False,
             station_config_path=self.station_config_path, bootstrap_config_path=self.bootstrap_config_path,
             bootstrap_root=self.bootstrap_root, supervisor_service=self.supervisor_service,
+            releases_dir=self.releases_dir,
             product_manifest=self.product_manifest,
         )
         kwargs.update(overrides)
@@ -866,12 +1063,14 @@ class InstalledPhaseDPublicationTests(SimpleTestCase):
             installed=installed, scratch_dir=scratch,
             station_config_path=self.station_config_path,
             bootstrap_config_path=self.bootstrap_config_path,
+            releases_dir=self.releases_dir,
         )
         from isadoraair.phase_d_recovery import INSTALLED_BOOTSTRAP_SOURCE_ROOT, INSTALLED_SUPERVISOR_SERVICE
         self.assertEqual(kwargs["bootstrap_root"], INSTALLED_BOOTSTRAP_SOURCE_ROOT)
         self.assertEqual(kwargs["supervisor_service"], INSTALLED_SUPERVISOR_SERVICE)
         self.assertEqual(kwargs["slots_root"], self.slots_root)
         self.assertEqual(kwargs["descriptors_root"], self.staging)
+        self.assertEqual(kwargs["releases_dir"], self.releases_dir)
         self.assertTrue((kwargs["attestations_root"] / "active" / "signature.json").is_file())
         self.assertTrue((kwargs["attestations_root"] / "previous" / "signature.json").is_file())
         # The real .staging/ directory itself is never modified.
@@ -888,6 +1087,7 @@ class InstalledPhaseDPublicationTests(SimpleTestCase):
             bootstrap_config_path=self.bootstrap_config_path,
             bootstrap_root=self.bootstrap_root,
             supervisor_service=self.supervisor_service,
+            releases_dir=self.releases_dir,
         )
         evidence = capture_phase_d_component(output=self.root / "captured", **kwargs)
         self.assertEqual(evidence["active_generation"], 2)

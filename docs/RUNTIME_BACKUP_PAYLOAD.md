@@ -421,6 +421,27 @@ material first (never mutating its tree), then the newly-captured
 Phase-D component is attached to that fresh base as yet another new
 payload -- the prior schema-2 payload is never overwritten in place.
 
+**Attestation binding (r0034).** Each captured generation's
+`runtime-attestations/<role>/binding.json` -- the `release_id`/
+`previous_release_id`/`previous_generation` needed to reconstruct the
+exact statement its real signatures were made against -- is derived
+from the application's own committed `deploy/releases/` chain
+(`isadoraair.phase_d_recovery.resolve_protected_runtime_binding`), the
+one capture-time-only input that comes from the git checkout rather
+than installed system state. The real installed system durably
+persists none of this (`RuntimeState` carries no `release_id` field;
+`REQUEST_ACTIVATION`'s `release_id`/`previous_release_id` are
+transient IPC-only values). Generation 1 is a fixed exception:
+`deploy/releases/r0026.json` (the manual bootstrap) predates the
+`protected_runtime` manifest field entirely, so its binding
+(`release_id="r0026"`, `previous_release_id="r0025"`) is a hardcoded,
+cryptographically-proven constant
+(`isadoraair.phase_d_recovery.GENERATION_ONE_MANUAL_BOOTSTRAP_BINDING`)
+rather than a manifest lookup -- see that constant's own docstring for
+the verification record. A future protected-runtime generation bump
+needs no new code here: as long as its release manifest correctly
+declares `protected_runtime`, the derivation picks it up automatically.
+
 ```bash
 # Real production use requires root -- both reading the installed
 # 0600 root:root config files and writing beneath the root-owned

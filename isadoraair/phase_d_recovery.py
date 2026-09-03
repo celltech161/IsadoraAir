@@ -39,6 +39,35 @@ BOOTSTRAP_CONFIG_PATH = Path("/etc/isadoraair/updater-bootstrap.json")
 INSTALLED_BOOTSTRAP_SOURCE_ROOT = Path("/usr/local/libexec/isadoraair-updater-bootstrap")
 INSTALLED_SUPERVISOR_SERVICE = Path("/etc/systemd/system/updater-bootstrapd.service")
 
+# r0034: protected-runtime generation 1 predates the protected_runtime
+# release-manifest field entirely -- r0026 ("FINAL MANUAL UPDATER
+# BOOTSTRAP", manual_bootstrap_required=true, see
+# docs/UPDATE_CENTER_PHASE_D.md) has no protected_runtime block for
+# resolve_protected_runtime_binding() to derive this from. Proven, not
+# guessed: build_attestation_statement(release_id="r0026",
+# previous_release_id="r0025", generation=1,
+# descriptor_sha256=<this constant>) verifies against this host's own
+# real, already-existing 00-primary-release.json signature under
+# runtime-slots/.staging/attestations-A, checked against the real
+# installed primary-release.pem -- a cryptographic round-trip against
+# genuine evidence, not an assumption (r0034 discovery record). Fixed,
+# never operator-configurable, for the same reason every other
+# compiled constant in this module is: a config field naming this
+# would let a compromised config file alone redirect what capture
+# treats as generation 1's proven binding.
+GENERATION_ONE_MANUAL_BOOTSTRAP_DESCRIPTOR_SHA256 = (
+    "196c93c43eba5a07dfe1fcb023c3dfb18c4a908a259a6b8c99d4333fb140f1a1"
+)
+GENERATION_ONE_MANUAL_BOOTSTRAP_BINDING = {
+    "release_id": "r0026", "previous_release_id": "r0025", "previous_generation": None,
+}
+
+# The application's own committed release-manifest directory -- capture's
+# one, capture-time-only dependency on the git checkout (never read by
+# validate_phase_d_component itself, which stays offline/self-contained;
+# see resolve_protected_runtime_binding's own docstring).
+DEFAULT_RELEASES_DIR = Path(__file__).resolve().parents[1] / "deploy" / "releases"
+
 
 class PhaseDRecoveryError(ValueError):
     pass
@@ -286,6 +315,7 @@ def resolve_installed_phase_d_capture_kwargs(
     bootstrap_config_path: Path = BOOTSTRAP_CONFIG_PATH,
     bootstrap_root: Path = INSTALLED_BOOTSTRAP_SOURCE_ROOT,
     supervisor_service: Path = INSTALLED_SUPERVISOR_SERVICE,
+    releases_dir: Path = DEFAULT_RELEASES_DIR,
 ) -> dict[str, Path]:
     """Builds the exact kwargs capture_phase_d_component() needs, all
     derived from `installed` (the result of load_installed_phase_d_state)
@@ -314,16 +344,99 @@ def resolve_installed_phase_d_capture_kwargs(
         "signer_root": bootstrap_config.signer_root,
         "descriptors_root": bootstrap_config.slots_root / ".staging",
         "attestations_root": attestations_root,
+        "releases_dir": Path(releases_dir),
     }
+
+
+def resolve_protected_runtime_binding(
+    *, generation: int, descriptor_sha256: str, releases_dir: Path,
+) -> dict[str, Any]:
+    """Derives {"release_id", "previous_release_id", "previous_generation"}
+    -- the binding that was ORIGINALLY signed for one protected-runtime
+    generation -- deterministically, from the committed release-manifest
+    chain. Never fabricated, never read from installed runtime state
+    (which durably records none of this: RuntimeState carries no
+    release_id field, and REQUEST_ACTIVATION's release_id/
+    previous_release_id are transient IPC-only values, never persisted
+    -- see r0034's own discovery record).
+
+    release_id/previous_release_id are cryptographically load-bearing:
+    they are two of the four fields build_attestation_statement signs
+    (with generation and descriptor_sha256). previous_generation is NOT
+    part of the signed statement at all -- it exists only for
+    generation_advances' separate, non-cryptographic monotonicity
+    check, so an imprecise-but-chain-derived value here can never
+    weaken signature verification itself, only that supplementary
+    anti-rollback check.
+
+    Reuses updatecenter.release_chain's own validated chain assembly
+    (the same ordering manage.py validate_release_manifests itself
+    depends on) rather than re-walking previous_release_id links here.
+
+    Raises PhaseDRecoveryError if no committed release's protected_runtime
+    field matches (generation, descriptor_sha256) -- for every
+    generation except 1 (see GENERATION_ONE_MANUAL_BOOTSTRAP_BINDING's
+    own docstring), this is a genuine, honestly-reported recovery-
+    evidence gap, never silently guessed at."""
+    from updatecenter import release_chain
+
+    try:
+        manifests = release_chain.load_manifest_files(Path(releases_dir))
+        chain = release_chain.build_chain(manifests)
+    except release_chain.ChainError as exc:
+        raise PhaseDRecoveryError(f"release-manifest chain is invalid: {exc}") from exc
+
+    protected_chain = [entry for entry in chain if entry.manifest.protected_runtime is not None]
+    match_index = next(
+        (index for index, entry in enumerate(protected_chain)
+         if entry.manifest.protected_runtime.generation == generation),
+        None,
+    )
+    if match_index is not None:
+        match = protected_chain[match_index]
+        if match.manifest.protected_runtime.descriptor_sha256 != descriptor_sha256:
+            raise PhaseDRecoveryError(
+                f"release {match.manifest.release_id} declares protected-runtime generation "
+                f"{generation} with descriptor {match.manifest.protected_runtime.descriptor_sha256}, "
+                f"but the installed descriptor is {descriptor_sha256} -- refusing to derive a binding "
+                "for material that does not match its own claimed release"
+            )
+        predecessor = protected_chain[match_index - 1] if match_index > 0 else None
+        return {
+            "release_id": match.manifest.release_id,
+            "previous_release_id": match.manifest.previous_release_id,
+            "previous_generation": (
+                predecessor.manifest.protected_runtime.generation if predecessor is not None else None
+            ),
+        }
+
+    if generation == 1 and descriptor_sha256 == GENERATION_ONE_MANUAL_BOOTSTRAP_DESCRIPTOR_SHA256:
+        return dict(GENERATION_ONE_MANUAL_BOOTSTRAP_BINDING)
+
+    raise PhaseDRecoveryError(
+        f"no committed release declares protected-runtime generation {generation} with descriptor "
+        f"{descriptor_sha256} -- this generation's original attestation binding cannot be recovered "
+        "from authoritative data"
+    )
 
 
 def capture_phase_d_component(
     *, output: Path, bootstrap_root: Path, supervisor_service: Path,
     slots_root: Path, runtime_state: Path, station_config: Path,
     bootstrap_config: Path, trust_policy: Path, signer_root: Path,
-    descriptors_root: Path, attestations_root: Path,
+    descriptors_root: Path, attestations_root: Path, releases_dir: Path,
 ) -> dict:
-    """Build one new component atomically from explicit local inputs."""
+    """Build one new component atomically from explicit local inputs.
+
+    releases_dir is capture's one, capture-time-only dependency on the
+    application's own git checkout (deploy/releases/) -- used solely
+    to synthesize each captured generation's runtime-attestations/
+    <role>/binding.json (r0034) via resolve_protected_runtime_binding.
+    The real installed system persists no release_id/previous_release_id
+    anywhere durable (see that function's own docstring), so capture is
+    the ONE place that can recover and embed it; validate_phase_d_component
+    itself never touches releases_dir and stays fully offline/self-
+    contained, exactly as this module's own docstring requires."""
 
     _runtime_paths()
     from isadoraair_updater_bootstrap.descriptor import parse_descriptor_dict
@@ -370,6 +483,30 @@ def capture_phase_d_component(
         for digest in filter(None, (state.active_descriptor_sha256, state.previous_descriptor_sha256)):
             if digest not in descriptors:
                 raise PhaseDRecoveryError(f"runtime state descriptor {digest} is absent from recovery descriptors")
+
+        # r0034: synthesize each present generation's own binding.json --
+        # the real installed .staging/attestations-<slot>/ directory
+        # never contains one (confirmed: the real worker/supervisor only
+        # ever write/read per-signer signature files there). Derived
+        # deterministically from the committed release chain, never
+        # copied from anywhere that doesn't actually have it.
+        active_binding = resolve_protected_runtime_binding(
+            generation=state.active_generation,
+            descriptor_sha256=state.active_descriptor_sha256,
+            releases_dir=releases_dir,
+        )
+        active_binding_path = staging / "runtime-attestations" / "active" / "binding.json"
+        active_binding_path.write_bytes(_canonical(active_binding))
+        active_binding_path.chmod(0o644)
+        if state.previous_slot is not None:
+            previous_binding = resolve_protected_runtime_binding(
+                generation=state.previous_generation,
+                descriptor_sha256=state.previous_descriptor_sha256,
+                releases_dir=releases_dir,
+            )
+            previous_binding_path = staging / "runtime-attestations" / "previous" / "binding.json"
+            previous_binding_path.write_bytes(_canonical(previous_binding))
+            previous_binding_path.chmod(0o644)
 
         trust_value = _read_json(staging / "trust-policy.json", label="trust policy")
         signer_ids = [entry.get("id") for entry in trust_value.get("signers", []) if isinstance(entry, dict)]

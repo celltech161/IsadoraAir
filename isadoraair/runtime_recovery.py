@@ -1213,6 +1213,7 @@ def build_and_attach_installed_phase_d_payload(
     enforce_root_ownership: bool = True,
     station_config_path: Path | None = None, bootstrap_config_path: Path | None = None,
     bootstrap_root: Path | None = None, supervisor_service: Path | None = None,
+    releases_dir: Path | None = None,
 ) -> RuntimeRecoveryEvidence:
     """The r0031 orchestration: capture this host's installed Phase-D
     state (observational only -- never modifies active/previous slots,
@@ -1230,11 +1231,14 @@ def build_and_attach_installed_phase_d_payload(
     protected-updater component, by design) -- current's own tree is
     never read into, written into, or otherwise mutated either way.
 
-    `enforce_root_ownership=False` and the four *_path/*_root overrides
-    all default to the real, fixed constants/enforcement and are
-    test-only when overridden -- see
+    `enforce_root_ownership=False` and the five *_path/*_root/*_dir
+    overrides all default to the real, fixed constants/enforcement and
+    are test-only when overridden -- see
     isadoraair.phase_d_recovery.load_installed_phase_d_state and
-    .resolve_installed_phase_d_capture_kwargs."""
+    .resolve_installed_phase_d_capture_kwargs. releases_dir (r0034) is
+    capture's one, capture-time-only dependency on the application's
+    own git checkout, needed to synthesize each captured generation's
+    binding.json -- see resolve_protected_runtime_binding."""
 
     from isadoraair.phase_d_recovery import (
         capture_phase_d_component, load_installed_phase_d_state,
@@ -1264,6 +1268,8 @@ def build_and_attach_installed_phase_d_payload(
         capture_input_overrides["bootstrap_root"] = bootstrap_root
     if supervisor_service is not None:
         capture_input_overrides["supervisor_service"] = supervisor_service
+    if releases_dir is not None:
+        capture_input_overrides["releases_dir"] = releases_dir
 
     with tempfile.TemporaryDirectory(prefix="isadoraair-phase-d-publish-") as work_name:
         work = Path(work_name)

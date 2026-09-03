@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "release_id": "r0034",
+  "previous_release_id": "r0033",
+  "minimum_updater_protocol_version": 5,
+  "summary": "Fixes a third latent gap r0031 surfaced: capture_phase_d_component assumed a binding.json (release_id/previous_release_id/previous_generation) already existed in .staging/attestations-<slot>/, but the real system never writes one -- only per-signer signatures. Now derives it deterministically from the committed deploy/releases/ chain, with a cryptographically-proven fixed constant for generation 1 (predates the protected_runtime manifest field). No protected-runtime change.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-gunicorn"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0007"
+}
