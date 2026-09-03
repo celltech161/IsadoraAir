@@ -375,15 +375,44 @@ integration."
   `payloads/`, selected payload and every nested directory must have the
   expected administrative owner (UID 0 by default) and mode 0755; every
   file must be owner-matching, single-link, regular, non-symlink mode
-  0644 -- **except** (r0031) a file under an activated payload's own
-  `protected-updater/` subtree, which may instead be any of the modes
-  its own signed inventory recorded (0600/0640/0644/0700/0750/0755 --
-  see `isadoraair.phase_d_recovery.capture_phase_d_component`'s own
-  mode-preservation and `isadoraair.runtime_recovery.
-  _PHASE_D_TRUSTED_FILE_MODES`), never anything more permissive than
-  that same fixed, already-signed set; `current` must be an
+  0644 -- **except** (r0031, narrowed by r0035) a file under an
+  activated payload's own `protected-updater/` subtree, which may
+  instead be 0644 or 0755 (an executable entrypoint --
+  `updater_bootstrapd.py`/`updaterd.py`), never anything more permissive
+  than that (`isadoraair.runtime_recovery.
+  _PROTECTED_UPDATER_TRUSTED_FILE_MODES`); `current` must be an
   owner-matching confined one-hop symlink. Runtime service identities
   can traverse/read but cannot modify the source.
+
+  **Backup-readable storage vs. restored modes (r0035).** Before r0035,
+  `capture_phase_d_component` preserved each protected config/state
+  file's real installed mode straight into the payload --
+  `station.json`/`updater-bootstrap.json`/`runtime-state.json` at 0600
+  root:root, exactly matching the live system. That preservation is
+  what made the very first production `--apply --phase-d` backup fail:
+  `isadoraair-backup.service` runs unprivileged, as `jreed`, and
+  `validate_runtime_recovery_payload`'s inventory pass reads full file
+  content to compute hashes, which a 0600 root-owned file structurally
+  refuses to any non-owner. Those three files are now stored at the
+  same uniform, backup-readable `isadoraair.phase_d_recovery.
+  PHASE_D_STORAGE_MODE` (0644) every other Foundation-E component
+  already uses -- none of them contain a secret, credential, or private
+  key (paths, socket locations, bookkeeping; private signing keys
+  remain categorically absent, unaffected). Each file's TRUE,
+  deliberately-restrictive installed mode is recorded separately in the
+  restore manifest's own `restore_modes` field and re-applied
+  explicitly by `restore_phase_d_component` at actual restore time --
+  never inferred from whatever mode the payload copy happens to carry.
+  Restore-mode fidelity (0600 landing on the real/staging restore
+  target) is therefore unaffected; only the payload's own at-rest
+  storage representation changed. `runtime-descriptors/` and
+  `runtime-attestations/<role>/` are also now normalized to 0644
+  unconditionally at capture time (their real installed modes were
+  never a deliberate contract, only whatever the real worker/
+  supervisor's own process umask happened to produce when staging
+  them) -- and `runtime-descriptors/` no longer duplicates the
+  installed `.staging/attestations-<slot>/` subtree, which was
+  previously copied in wholesale but never read by anything.
 - **Activated on production** (r0031) — `RECOVERY_PAYLOAD_ROOT` in
   `deploy/backup_isadoraair.sh` defaults to
   `/var/lib/isadoraair/runtime-recovery`; production's `current` there

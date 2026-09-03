@@ -1537,18 +1537,32 @@ PAYLOADS_SUBDIR = "payloads"
 CURRENT_POINTER_NAME = "current"
 
 
-# r0031: the exact same trusted file-mode set capture_phase_d_component's
-# own _copy_plain (isadoraair/phase_d_recovery.py) already validates a
-# Phase-D component's inventory against -- root-only config/state stays
-# 0600, executable entrypoints stay 0755, matching the SIGNED mode
-# inventory validate_phase_d_component cross-checks byte-for-byte
-# (see _inventory's own "mode" field). Reusing this exact set here
-# (never inventing a second, possibly-divergent one) is what lets
-# activate_recovery_payload accept a Phase-D-capable schema-2 payload
-# without flattening its deliberately-preserved modes to Foundation-E's
-# own uniform 0644 -- files everywhere else in the tree still require
-# EXACTLY 0644, no widening for anything outside protected-updater/.
-_PHASE_D_TRUSTED_FILE_MODES = frozenset({0o600, 0o640, 0o644, 0o700, 0o750, 0o755})
+# r0035: protected-updater/ no longer needs the FULL six-value mode
+# allowance r0031 originally introduced. Before r0035, capture preserved
+# each protected config/state file's real installed mode (0600 for
+# station.json/updater-bootstrap.json/runtime-state.json) straight into
+# the payload -- that preservation is exactly what made the payload
+# unreadable by the unprivileged backup process (isadoraair-backup.
+# service runs as jreed, never root). capture_phase_d_component now
+# stores those three files at the same uniform PHASE_D_STORAGE_MODE
+# (0644) every other Foundation-E component already uses, recording
+# each one's TRUE, deliberately-restrictive mode separately in the
+# restore manifest's own restore_modes field (isadoraair.
+# phase_d_recovery), reapplied explicitly at restore time -- never
+# inferred from the payload's own on-disk mode.
+#
+# What remains: executable entrypoints (bootstrap/source/
+# updater_bootstrapd.py, runtime-slots/{active,previous}/updaterd.py)
+# are still deliberately 0755, not 0644 -- unrelated to the backup-
+# readability problem (0755 is already world-readable) and independently,
+# precisely cross-checked file-by-file against the descriptor's own
+# signed mode field for the runtime-slots/ case
+# (isadoraair_updater_bootstrap.descriptor.verify_descriptor_against_
+# directory). This coarser tree-wide check only needs to accept the two
+# values that legitimately occur now -- a real strengthening from the
+# original six-value set (0600/0640/0700/0750 are no longer tolerated
+# anywhere in the tree), not a loosening.
+_PROTECTED_UPDATER_TRUSTED_FILE_MODES = frozenset({0o644, 0o755})
 
 
 def _assert_trusted_mode_owner(
@@ -1595,7 +1609,7 @@ def _assert_trusted_payload_tree(root: Path, *, owner_uid: int) -> None:
                 raise RuntimeRecoveryError(f"trusted recovery tree contains a symlink: {candidate}")
             _assert_trusted_mode_owner(
                 candidate, owner_uid=owner_uid, directory=False,
-                allowed_file_modes=_PHASE_D_TRUSTED_FILE_MODES if under_protected_updater else None,
+                allowed_file_modes=_PROTECTED_UPDATER_TRUSTED_FILE_MODES if under_protected_updater else None,
             )
 
 

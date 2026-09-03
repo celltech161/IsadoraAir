@@ -327,12 +327,20 @@ class PhaseDRecoveryComponentTests(SimpleTestCase):
 
         self.assertEqual(evidence.result, "pass")
         protected = combined / "protected-updater"
-        self.assertEqual((protected / "station.json").stat().st_mode & 0o777, 0o600)
-        self.assertEqual((protected / "runtime-state.json").stat().st_mode & 0o777, 0o600)
+        # r0035: storage mode is now uniformly 0644 -- backup-readable by
+        # the unprivileged isadoraair-backup.service (runs as jreed) --
+        # the TRUE, deliberately-restrictive 0600 is recorded separately
+        # in restore_modes and re-applied only at actual restore time.
+        self.assertEqual((protected / "station.json").stat().st_mode & 0o777, 0o644)
+        self.assertEqual((protected / "runtime-state.json").stat().st_mode & 0o777, 0o644)
         self.assertEqual(
             (protected / "runtime-slots" / "active" / "updaterd.py").stat().st_mode & 0o777,
             0o755,
         )
+        manifest = json.loads((protected / "restore-manifest.json").read_text())
+        self.assertEqual(manifest["restore_modes"], {
+            "runtime-state.json": "0600", "station.json": "0600", "updater-bootstrap.json": "0600",
+        })
 
     def test_claimed_phase_d_backup_fails_closed_on_each_critical_gap(self):
         self._capture()
@@ -678,6 +686,131 @@ class PhaseDRecoveryComponentTests(SimpleTestCase):
             (target_root / "usr/local/libexec/isadoraair-updater-bootstrap/updater_bootstrapd.py").is_file(),
             "only after publish does the target root have genuine evidence a receipt may describe",
         )
+
+    def test_validate_reads_every_file_successfully_at_uniform_storage_mode(self):
+        """r0035 regression, direct proof of the structural precondition
+        the real bug depended on: _inventory()'s path.read_bytes() call
+        (isadoraair-backup.service's real failure point, reproduced
+        genuinely -- as jreed, against the real preserved production
+        payload -- during r0035's own discovery) never needs anything
+        beyond world-read permission once every file is stored at
+        PHASE_D_STORAGE_MODE. This test process is always jreed in this
+        sandbox (no privilege boundary exists to cross here), so it
+        cannot itself prove cross-UID readability the way the real
+        production reproduction and the post-deployment unprivileged
+        validate_runtime_recovery_payload run do -- see docs/
+        RUNTIME_BACKUP_PAYLOAD.md's r0035 section for that record. What
+        IS provable here, and is the real regression surface for this
+        code: every file in a captured component is 0644 (world-
+        readable, unlike 0600 which the file's own OWNER-bit semantics
+        would deny to anyone else regardless of world bits)."""
+        self._capture()
+        for path in self.component.rglob("*"):
+            if path.is_file():
+                mode = path.stat().st_mode & 0o777
+                self.assertIn(
+                    mode, (0o644, 0o755),
+                    f"{path.relative_to(self.component)} is mode {mode:04o}, not world-readable",
+                )
+                self.assertTrue(mode & 0o044, f"{path.relative_to(self.component)} lacks world-read")
+        evidence = validate_phase_d_component(self.component)
+        self.assertEqual(evidence["trust_threshold"], 1)
+
+    def test_restore_reapplies_the_recorded_restore_mode_not_the_storage_mode(self):
+        """The other half of the r0035 contract: storage mode (0644) is
+        NOT what lands on the real/staging restore target -- restore
+        explicitly re-applies each file's true, deliberately-restrictive
+        restore_modes entry (0600), regardless of the payload copy's
+        own on-disk mode. Proves restore-mode-fidelity is unaffected by
+        the backup-readability fix."""
+        self._capture()
+        for relative in ("station.json", "updater-bootstrap.json", "runtime-state.json"):
+            self.assertEqual((self.component / relative).stat().st_mode & 0o777, 0o644)
+        fake_root = self.root / "restore-mode-fidelity-fake-root"
+        restore_phase_d_component(component_root=self.component, fake_root=fake_root)
+        self.assertEqual(
+            (fake_root / "etc/isadoraair/station.json").stat().st_mode & 0o777, 0o600,
+        )
+        self.assertEqual(
+            (fake_root / "etc/isadoraair/updater-bootstrap.json").stat().st_mode & 0o777, 0o600,
+        )
+        self.assertEqual(
+            (fake_root / "var/lib/isadoraair-updater-bootstrap/runtime-state.json").stat().st_mode & 0o777, 0o600,
+        )
+
+    def test_restore_modes_value_outside_trusted_set_is_rejected(self):
+        self._capture()
+        manifest_path = self.component / "restore-manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["restore_modes"]["station.json"] = "0666"
+        manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True))
+        with self.assertRaises(PhaseDRecoveryError):
+            validate_phase_d_component(self.component)
+
+    def test_restore_modes_referencing_unknown_file_is_rejected(self):
+        self._capture()
+        manifest_path = self.component / "restore-manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["restore_modes"]["not-a-real-file.json"] = "0600"
+        manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True))
+        with self.assertRaises(PhaseDRecoveryError):
+            validate_phase_d_component(self.component)
+
+    def test_restore_modes_malformed_string_is_rejected(self):
+        self._capture()
+        manifest_path = self.component / "restore-manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        manifest["restore_modes"]["station.json"] = "600"  # missing leading zero
+        manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True))
+        with self.assertRaises(PhaseDRecoveryError):
+            validate_phase_d_component(self.component)
+
+    def test_missing_restore_modes_key_is_an_unsupported_schema(self):
+        self._capture()
+        manifest_path = self.component / "restore-manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        del manifest["restore_modes"]
+        manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True))
+        with self.assertRaises(PhaseDRecoveryError):
+            validate_phase_d_component(self.component)
+
+    def test_assert_trusted_payload_tree_rejects_a_bogus_mode_under_protected_updater(self):
+        """r0035 is a real strengthening of the persisted-payload trust-
+        boundary check, not just a loosening elsewhere: before r0035
+        ANY of six modes (including 0600/0640/0700/0750) was silently
+        tolerated for any file under protected-updater/; now only
+        0644/0755 are. A stray 0600 there -- exactly the mode every file
+        in this subtree used to be captured at -- is now correctly
+        rejected rather than tolerated."""
+        from isadoraair.runtime_recovery import _assert_trusted_payload_tree
+
+        self._capture()
+        product_manifest = deepcopy(load_runtime_components())
+        native_source = self.root / "native-source-strengthening"
+        native_source.mkdir()
+        for name, declaration in product_manifest["components"]["fdkaac"]["source_archives"].items():
+            content = f"fixture-{name}".encode("ascii")
+            path = native_source / declaration["filename"]
+            path.write_bytes(content)
+            path.chmod(0o644)
+            declaration["bytes"] = len(content)
+            declaration["sha256"] = hashlib.sha256(content).hexdigest()
+        base = self.root / "base-schema-one-strengthening"
+        RuntimeRecoveryBuilder(product_manifest=product_manifest).apply(
+            native_source_dir=native_source, output=base, payload_id="phase-d-strengthening",
+        )
+        combined = self.root / "schema-two-strengthening"
+        attach_phase_d_recovery_component(
+            existing_payload=base, protected_updater_component=self.component,
+            output=combined, product_manifest=product_manifest,
+        )
+        owner_uid = os.geteuid()
+        # Baseline: the freshly-attached tree, untampered, passes.
+        _assert_trusted_payload_tree(combined, owner_uid=owner_uid)
+
+        (combined / "protected-updater" / "trust-policy.json").chmod(0o600)
+        with self.assertRaises(RuntimeRecoveryError):
+            _assert_trusted_payload_tree(combined, owner_uid=owner_uid)
 
 
 class ResolveProtectedRuntimeBindingTests(SimpleTestCase):
@@ -1093,6 +1226,37 @@ class InstalledPhaseDPublicationTests(SimpleTestCase):
         self.assertEqual(evidence["active_generation"], 2)
         self.assertEqual(evidence["previous_generation"], 1)
         self.assertFalse(any(p.suffix == ".key" for p in (self.root / "captured").rglob("*")))
+
+    def test_captured_component_never_duplicates_the_real_staging_attestations_subtree(self):
+        """r0035: descriptors_root here is the REAL installed .staging/
+        layout (this fixture's own self.staging), which -- exactly like
+        production -- also holds attestations-<slot>/ subdirectories
+        alongside the flat descriptor-<slot>.json files. Before r0035,
+        capturing descriptors_root via a whole-tree copy silently pulled
+        that redundant, already-separately-captured (under
+        runtime-attestations/<role>/) subtree into runtime-descriptors/
+        too, carrying whatever incidental mode the real worker's own
+        process umask produced for it. Proves it is never copied at all
+        now -- not merely re-moded."""
+        installed = self._load_installed()
+        kwargs = resolve_installed_phase_d_capture_kwargs(
+            installed=installed, scratch_dir=self.root / "attestations-scratch-3",
+            station_config_path=self.station_config_path,
+            bootstrap_config_path=self.bootstrap_config_path,
+            bootstrap_root=self.bootstrap_root,
+            supervisor_service=self.supervisor_service,
+            releases_dir=self.releases_dir,
+        )
+        captured = self.root / "captured-no-duplication"
+        capture_phase_d_component(output=captured, **kwargs)
+        descriptors_dir = captured / "runtime-descriptors"
+        self.assertTrue((descriptors_dir / "descriptor-A.json").is_file())
+        self.assertTrue((descriptors_dir / "descriptor-B.json").is_file())
+        self.assertFalse((descriptors_dir / "attestations-A").exists())
+        self.assertFalse((descriptors_dir / "attestations-B").exists())
+        for path in descriptors_dir.rglob("*"):
+            self.assertTrue(path.is_file(), f"unexpected non-file entry under runtime-descriptors/: {path}")
+            self.assertEqual(path.stat().st_mode & 0o777, 0o644)
 
     # ---- plan (read-only) ----
 

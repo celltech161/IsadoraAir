@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
+import re
 import shutil
 import stat
 import tempfile
@@ -68,6 +69,29 @@ GENERATION_ONE_MANUAL_BOOTSTRAP_BINDING = {
 # see resolve_protected_runtime_binding's own docstring).
 DEFAULT_RELEASES_DIR = Path(__file__).resolve().parents[1] / "deploy" / "releases"
 
+# r0035: the closed set of modes _copy_plain will ever accept for a
+# SOURCE file it is capturing -- unchanged from before r0035, just
+# promoted to a named constant so it can be reused (restore_modes
+# validation) instead of re-typed as a literal.
+TRUSTED_PHASE_D_SOURCE_MODES = frozenset({0o600, 0o640, 0o644, 0o700, 0o750, 0o755})
+
+# r0035: the uniform mode every file captured into a Phase-D recovery
+# component is now WRITTEN at inside the payload -- matching the exact
+# mode every OTHER Foundation-E component already uses, and safely
+# readable by the unprivileged backup process (isadoraair-backup.service
+# runs as jreed, never root; see docs/RUNTIME_BACKUP_PAYLOAD.md's
+# "Backup-readable storage vs. restored modes" note). None of the files
+# this applies to contain a secret, credential, or private key --
+# station.json/updater-bootstrap.json/runtime-state.json are root/config
+# paths and bookkeeping, trust-policy.json/signer keys/descriptors/
+# attestations are deliberately public trust evidence. A file's TRUE,
+# deliberately-restrictive installed mode (when it has one -- currently
+# only the three files above) is instead recorded in the restore
+# manifest's own restore_modes field and re-applied explicitly at
+# restore time (restore_phase_d_component), never inferred from
+# whatever mode the payload copy itself happens to have.
+PHASE_D_STORAGE_MODE = 0o644
+
 
 class PhaseDRecoveryError(ValueError):
     pass
@@ -97,16 +121,32 @@ def _safe_relative(value: str) -> Path:
     return Path(*candidate.parts)
 
 
-def _copy_plain(source: Path, destination: Path, *, mode: int | None = None) -> None:
+def _copy_plain(source: Path, destination: Path, *, mode: int | None = None) -> str:
+    """Copies one plain, single-link, non-symlink regular file.
+
+    The SOURCE's own mode is always validated against
+    TRUSTED_PHASE_D_SOURCE_MODES -- r0035: previously this check was
+    silently skipped whenever a caller passed an explicit `mode=`
+    override (the override's own value was checked instead, the
+    source's real mode was never looked at) -- a latent gap no caller
+    happened to trigger before r0035 introduced the first ones.
+    Returns the source's own validated mode as a 4-digit octal string,
+    regardless of whether `mode` overrides what gets WRITTEN -- the
+    caller's one way to learn/record a file's true original mode when
+    storing it at a different, backup-readable one (see
+    PHASE_D_STORAGE_MODE and restore_modes)."""
     try:
         info = source.lstat()
     except OSError as exc:
         raise PhaseDRecoveryError(f"required recovery input is missing: {source}") from exc
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
         raise PhaseDRecoveryError(f"recovery input is not a plain single-link file: {source}")
-    publication_mode = stat.S_IMODE(info.st_mode) if mode is None else mode
-    if publication_mode not in {0o600, 0o640, 0o644, 0o700, 0o750, 0o755}:
+    source_mode = stat.S_IMODE(info.st_mode)
+    if source_mode not in TRUSTED_PHASE_D_SOURCE_MODES:
         raise PhaseDRecoveryError(f"recovery input has an unsupported or writable mode: {source}")
+    publication_mode = source_mode if mode is None else mode
+    if publication_mode not in TRUSTED_PHASE_D_SOURCE_MODES:
+        raise PhaseDRecoveryError(f"recovery input has an unsupported or writable destination mode: {destination}")
     destination.parent.mkdir(parents=True, exist_ok=True)
     try:
         descriptor = os.open(
@@ -134,9 +174,20 @@ def _copy_plain(source: Path, destination: Path, *, mode: int | None = None) -> 
     finally:
         if descriptor >= 0:
             os.close(descriptor)
+    return f"{source_mode:04o}"
 
 
-def _copy_tree(source: Path, destination: Path) -> None:
+def _copy_tree(source: Path, destination: Path, *, mode: int | None = None) -> None:
+    """mode, when given, overrides every copied file's WRITTEN mode
+    uniformly (r0035) -- used to normalize a source tree whose files
+    carry no deliberate, documented mode contract of their own (e.g.
+    descriptors/attestations staged by the real worker/supervisor
+    under whatever process umask happened to apply -- see
+    resolve_protected_runtime_binding's own docstring for why that
+    staging is never mode-deliberate) into the same uniform,
+    backup-readable storage convention every other Foundation-E
+    component already uses. Leaves _copy_plain's own source-mode
+    validation fully in effect either way."""
     if source.is_symlink() or not source.is_dir():
         raise PhaseDRecoveryError(f"recovery tree input is not a non-symlink directory: {source}")
     for current, directories, filenames in os.walk(source, followlinks=False):
@@ -148,7 +199,7 @@ def _copy_tree(source: Path, destination: Path) -> None:
         for name in filenames:
             file_path = current_path / name
             relative = file_path.relative_to(source)
-            _copy_plain(file_path, destination / relative)
+            _copy_plain(file_path, destination / relative, mode=mode)
 
 
 def _inventory(root: Path) -> list[dict[str, Any]]:
@@ -461,13 +512,51 @@ def capture_phase_d_component(
         for label, slot in (("active", state.active_slot.value), ("previous", state.previous_slot.value if state.previous_slot else None)):
             if slot is not None:
                 _copy_tree(Path(slots_root) / slot, staging / "runtime-slots" / label)
-        _copy_plain(Path(runtime_state), staging / "runtime-state.json")
-        _copy_plain(Path(station_config), staging / "station.json")
-        _copy_plain(Path(bootstrap_config), staging / "updater-bootstrap.json")
+
+        # r0035: station.json/updater-bootstrap.json/runtime-state.json
+        # are the only files with a deliberate, documented, restrictive
+        # installed mode (0600 root:root) -- everything else in this
+        # component is already public trust evidence or has its own
+        # mode contract enforced elsewhere (descriptor.py's entrypoint
+        # vs. plain-file split). Store them at the same uniform,
+        # backup-readable PHASE_D_STORAGE_MODE every other file uses,
+        # and record each one's TRUE source mode (_copy_plain's own
+        # return value) as an explicit restore instruction -- never
+        # inferred later from whatever mode the payload copy has.
+        restore_modes: dict[str, str] = {}
+        restore_modes["runtime-state.json"] = _copy_plain(
+            Path(runtime_state), staging / "runtime-state.json", mode=PHASE_D_STORAGE_MODE,
+        )
+        restore_modes["station.json"] = _copy_plain(
+            Path(station_config), staging / "station.json", mode=PHASE_D_STORAGE_MODE,
+        )
+        restore_modes["updater-bootstrap.json"] = _copy_plain(
+            Path(bootstrap_config), staging / "updater-bootstrap.json", mode=PHASE_D_STORAGE_MODE,
+        )
         _copy_plain(Path(trust_policy), staging / "trust-policy.json")
         _copy_tree(Path(signer_root), staging / "signer-public-keys")
-        _copy_tree(Path(descriptors_root), staging / "runtime-descriptors")
-        _copy_tree(Path(attestations_root), staging / "runtime-attestations")
+
+        # r0035: descriptors_root is the real installed .staging/
+        # directory, which ALSO holds attestations-<slot>/ subdirectories
+        # (a separate, already-role-remapped copy of the same signature
+        # evidence lives under attestations_root/runtime-attestations --
+        # see resolve_installed_phase_d_capture_kwargs). Copying the
+        # whole tree here (the pre-r0035 behavior) silently duplicated
+        # that subtree into the payload, unused by anything that reads
+        # runtime-descriptors/ (capture/validate only ever glob flat
+        # *.json files here) and carrying whatever incidental mode the
+        # real worker's own process umask happened to produce when it
+        # staged them -- never a deliberate mode contract. Copy only
+        # the flat descriptor-*.json files this component actually
+        # uses, normalized to the uniform storage mode.
+        for descriptor_path in sorted(Path(descriptors_root).glob("*.json")):
+            _copy_plain(
+                descriptor_path, staging / "runtime-descriptors" / descriptor_path.name,
+                mode=PHASE_D_STORAGE_MODE,
+            )
+        # r0035: same incidental-umask reasoning for the per-signer
+        # attestation files -- normalize to the uniform storage mode.
+        _copy_tree(Path(attestations_root), staging / "runtime-attestations", mode=PHASE_D_STORAGE_MODE)
 
         descriptors: dict[str, dict[str, Any]] = {}
         for descriptor_path in sorted((staging / "runtime-descriptors").glob("*.json")):
@@ -533,6 +622,7 @@ def capture_phase_d_component(
             "public_signer_ids": sorted(signer_ids),
             "runtime_identities": descriptors,
             "files": inventory,
+            "restore_modes": restore_modes,
         }
         (staging / MANIFEST_NAME).write_bytes(_canonical(manifest))
         (staging / MANIFEST_NAME).chmod(0o644)
@@ -570,11 +660,32 @@ def validate_phase_d_component(root: Path) -> dict:
     required = {
         "schema_version", "active", "previous", "bootstrap_protocol", "supervisor_service",
         "runtime_state_sha256", "trust_threshold", "public_signer_ids", "runtime_identities", "files",
+        "restore_modes",
     }
     if set(manifest) != required or manifest["schema_version"] != SCHEMA_VERSION:
         raise PhaseDRecoveryError("Phase-D restore manifest has an unsupported schema")
     if manifest["supervisor_service"] != "updater-bootstrapd.service":
         raise PhaseDRecoveryError("Phase-D supervisor service identity is not recognized")
+    # r0035: restore_modes records each protected config/state file's
+    # TRUE, deliberately-restrictive installed mode -- what
+    # restore_phase_d_component re-applies explicitly at
+    # materialization time -- decoupled from PHASE_D_STORAGE_MODE, the
+    # uniform, backup-readable mode the payload copy itself is stored
+    # at. Validated here, at the one place every caller (capture's
+    # self-check, attach, restore, backup-v3 inspection) always goes
+    # through, so a malformed entry is caught before it could ever
+    # reach restore's own mode-application.
+    restore_modes = manifest["restore_modes"]
+    if not isinstance(restore_modes, dict):
+        raise PhaseDRecoveryError("Phase-D restore manifest restore_modes must be an object")
+    known_paths = {entry["path"] for entry in manifest["files"]}
+    for relative_path, raw_mode in restore_modes.items():
+        if relative_path not in known_paths:
+            raise PhaseDRecoveryError(f"restore_modes references a file absent from this component: {relative_path!r}")
+        if not isinstance(raw_mode, str) or not re.fullmatch(r"0[0-7]{3}", raw_mode):
+            raise PhaseDRecoveryError(f"restore_modes entry for {relative_path!r} is not a 4-digit octal string")
+        if int(raw_mode, 8) not in TRUSTED_PHASE_D_SOURCE_MODES:
+            raise PhaseDRecoveryError(f"restore_modes entry for {relative_path!r} is not a trusted mode: {raw_mode!r}")
     observed = _inventory(component)
     if observed != manifest["files"]:
         raise PhaseDRecoveryError("Phase-D recovery file inventory/hash/mode does not match restore manifest")
@@ -696,6 +807,16 @@ def restore_phase_d_component(*, component_root: Path, fake_root: Path) -> dict:
                 raise PhaseDRecoveryError(f"restore destination is not a safe absolute path: {path}")
             return staging.joinpath(*path.parts[1:])
 
+        def restore_mode(relative_path: str) -> int | None:
+            # r0035: restore_modes' shape/trusted-membership is already
+            # validated (validate_phase_d_component, called above as
+            # this function's own first statement) -- this only converts
+            # the recorded octal string to an int. None (no entry) means
+            # "no override" -- _copy_plain then preserves whatever mode
+            # the payload copy itself has, its pre-r0035 default.
+            raw = restore_manifest["restore_modes"].get(relative_path)
+            return int(raw, 8) if raw is not None else None
+
         # Materialize the exact protected surfaces named by the validated
         # root-owned configuration. The payload stores slots by logical role
         # (active/previous); restore maps those roles back to their recorded
@@ -704,8 +825,14 @@ def restore_phase_d_component(*, component_root: Path, fake_root: Path) -> dict:
         _copy_tree(payload / "bootstrap" / "source", staging / "usr/local/libexec/isadoraair-updater-bootstrap")
         service_name = _read_json(payload / MANIFEST_NAME, label="restore manifest")["supervisor_service"]
         _copy_plain(payload / "bootstrap" / service_name, staging / "etc/systemd/system" / service_name)
-        _copy_plain(payload / "station.json", staging / "etc/isadoraair/station.json")
-        _copy_plain(payload / "updater-bootstrap.json", staging / "etc/isadoraair/updater-bootstrap.json")
+        _copy_plain(
+            payload / "station.json", staging / "etc/isadoraair/station.json",
+            mode=restore_mode("station.json"),
+        )
+        _copy_plain(
+            payload / "updater-bootstrap.json", staging / "etc/isadoraair/updater-bootstrap.json",
+            mode=restore_mode("updater-bootstrap.json"),
+        )
         _copy_plain(payload / "trust-policy.json", restored(bootstrap.trust_policy_path))
         _copy_tree(payload / "signer-public-keys", restored(bootstrap.signer_root))
 
@@ -722,7 +849,10 @@ def restore_phase_d_component(*, component_root: Path, fake_root: Path) -> dict:
                 bootstrap.slots_root / ".staging" / f"descriptor-{slot.value}.json"
             )
             _copy_plain(descriptor_source, descriptor_destination)
-        _copy_plain(payload / "runtime-state.json", restored(bootstrap.runtime_state_path))
+        _copy_plain(
+            payload / "runtime-state.json", restored(bootstrap.runtime_state_path),
+            mode=restore_mode("runtime-state.json"),
+        )
         os.rename(staging, destination)
     except BaseException:
         shutil.rmtree(staging, ignore_errors=True)
