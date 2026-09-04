@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "release_id": "r0037",
+  "previous_release_id": "r0036",
+  "minimum_updater_protocol_version": 5,
+  "summary": "Hardens fully offline disaster-recovery restore tooling found during E8 testing: preserves protected-updater executable modes, fixes fdkaac recovery validation, makes the current restore checkout the recovery authority, safely creates noncanonical native publication paths, and supports explicit staged target identity plus TTS scratch recovery. No migrations, dependency changes, restarts, nginx, systemd, or protected-runtime changes.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0007"
+}
