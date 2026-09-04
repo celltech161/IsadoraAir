@@ -286,8 +286,12 @@ redirect to a file and keep for troubleshooting. **No stage ever logs a
 secret value** — `.env` contents, database passwords, credential-file
 contents. Where a stage needs to reference that such a value exists
 (e.g. confirming `.env` was restored), it names the *key*, never the
-value (`lib.sh`'s `redact()` helper exists as a reminder/placeholder for
-this, though the actual discipline is "just don't print the variable").
+value. Commands that consume a secret must use `do_or_plan_redacted`,
+whose operator-facing description is supplied separately from the real
+command and arguments; `redact()` emits the fixed marker `<redacted>`
+without revealing the value or its length. Stage 30 additionally passes a
+new PostgreSQL role password through `createuser --pwprompt` stdin, never
+through command arguments or password-bearing SQL text.
 
 ## Phase 4 staging validation
 

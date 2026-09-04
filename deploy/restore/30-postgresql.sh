@@ -33,6 +33,7 @@ log_info "=== 30-postgresql ==="
 guard_production_target
 require_cmd psql
 require_cmd pg_restore
+require_cmd createuser
 require_cmd tar
 
 if [ -z "$RESTORE_ARCHIVE" ] || [ ! -f "$RESTORE_ARCHIVE" ]; then
@@ -57,12 +58,25 @@ DB_PORT="${DB_PORT:-5432}"
 export PGPASSWORD="$DB_PASSWORD"
 log_info "DB target: ${DB_USER}@${DB_HOST}:${DB_PORT}/${RESTORE_DB_NAME} (password read from .env, not logged)"
 
+# createuser --pwprompt is PostgreSQL's purpose-built non-echoing path for
+# assigning a new role password. Feeding its two prompts over stdin keeps the
+# password out of both the process argument list and SQL text that psql could
+# reproduce in an error message. Never replace this with `psql -c "...PASSWORD
+# '$DB_PASSWORD'"`: do_or_plan logs its arguments, and psql errors may echo the
+# submitted SQL to stderr.
+create_postgresql_role_with_password() {
+  printf '%s\n%s\n' "$DB_PASSWORD" "$DB_PASSWORD" |
+    sudo -u postgres createuser --pwprompt --no-password "$DB_USER"
+}
+
 # ---- 1. Role bootstrap ---------------------------------------------------
 ROLE_EXISTS=$(sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname = '${DB_USER}'" 2>/dev/null || true)
 if [ "$ROLE_EXISTS" = "1" ]; then
   log_info "Role '$DB_USER' already exists -- skipping CREATE USER."
 else
-  do_or_plan sudo -u postgres psql -c "CREATE USER ${DB_USER} WITH PASSWORD '${DB_PASSWORD}'"
+  do_or_plan_redacted \
+    "create PostgreSQL login role '$DB_USER' with createuser --pwprompt (password from $ENV_FILE: $(redact "$DB_PASSWORD"))" \
+    create_postgresql_role_with_password
 fi
 
 # ---- 2. Database bootstrap ------------------------------------------------

@@ -54,9 +54,9 @@ log_plan()  { printf '[%s] [PLAN]  %s\n' "$(_restore_ts)" "$*"; }
 # same action, so the two modes' output is directly diffable.
 log_apply() { printf '[%s] [APPLY] %s\n' "$(_restore_ts)" "$*"; }
 
-# Never call this with a secret value -- see deploy/restore/README.md's
-# "Logging" section. Reminder only; nothing here can enforce it.
-redact() { printf '<redacted, %d bytes>' "${#1}"; }
+# Fixed marker for operator-facing descriptions of sensitive actions.
+# Deliberately does not expose even the secret's length.
+redact() { printf '<redacted>'; }
 
 # ---------------------------------------------------------------------
 # Common flag parsing. Each stage script does:
@@ -236,6 +236,22 @@ do_or_plan() {
     "$@"
   else
     log_plan "$*"
+  fi
+}
+
+# do_or_plan_redacted SAFE_DESCRIPTION CMD... -- equivalent to
+# do_or_plan, but never derives its log line from CMD or its arguments.
+# Use this whenever CMD receives a secret through argv, stdin, or its
+# environment. SAFE_DESCRIPTION must contain only non-secret context and
+# an explicit <redacted> marker where useful to the operator.
+do_or_plan_redacted() {
+  local safe_description="${1:?safe description required}"
+  shift
+  if [ "$RESTORE_MODE" = "apply" ]; then
+    log_apply "$safe_description"
+    "$@"
+  else
+    log_plan "$safe_description"
   fi
 }
 

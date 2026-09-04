@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "release_id": "r0036",
+  "previous_release_id": "r0035",
+  "minimum_updater_protocol_version": 5,
+  "summary": "Fixes a restore-tooling security defect found during E8: Stage 30 passed password-bearing CREATE USER SQL through the generic plan/apply command logger, exposing the restored database password in operator and evidence output. Role creation now uses PostgreSQL's non-echoing createuser password prompt over stdin, and sensitive actions use a separately supplied redacted operator description. No migrations, dependency changes, service restarts, or protected-runtime changes.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0007"
+}

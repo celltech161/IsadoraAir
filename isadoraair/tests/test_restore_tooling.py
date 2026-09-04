@@ -195,8 +195,11 @@ class StageScriptsNeverLogSecretValuesTests(SimpleTestCase):
     def test_postgresql_stage_never_echoes_password_value(self):
         text = (RESTORE_DIR / "30-postgresql.sh").read_text(encoding="utf-8")
         self.assertIn("not logged", text.lower())
-        # The password variable is used (exported to PGPASSWORD / used in
-        # a CREATE USER statement), but never passed to log_info/log_apply.
+        self.assertIn("do_or_plan_redacted", text)
+        self.assertNotIn("CREATE USER ${DB_USER} WITH PASSWORD '${DB_PASSWORD}'", text)
+        # The password variable is used (exported to PGPASSWORD / fed to
+        # createuser's non-echoing password prompt), but never passed to a
+        # normal logging function.
         for lineno, line in enumerate(text.splitlines(), start=1):
             if "log_info" in line or "log_apply" in line or "log_warn" in line:
                 self.assertNotIn("$DB_PASSWORD", line, f"line {lineno} logs DB_PASSWORD: {line!r}")
@@ -204,6 +207,148 @@ class StageScriptsNeverLogSecretValuesTests(SimpleTestCase):
     def test_application_stage_never_echoes_env_file_contents(self):
         text = (RESTORE_DIR / "20-application.sh").read_text(encoding="utf-8")
         self.assertIn("value NOT logged", text)
+
+
+class Stage30SecretLoggingFunctionalTests(SimpleTestCase):
+    """Exercise Stage 30's apply path with a synthetic archive and fake
+    PostgreSQL commands. The sentinel password is deliberately shell-hostile:
+    it proves the real value reaches createuser over stdin while never reaching
+    command logging, stdout/stderr, or the evidence transcript."""
+
+    def setUp(self):
+        self.tmpdir = Path(tempfile.mkdtemp(prefix="isadoraair-stage30-secret-test-"))
+        self.addCleanup(shutil.rmtree, self.tmpdir, ignore_errors=True)
+        self.password = "E8-stage30-secret-'-$-20260904"
+        self.db_user = "isadoraair_e8_test"
+
+        self.staging_root = self.tmpdir / "staging"
+        self.target_root = self.staging_root / "opt" / "isadoraair"
+        self.target_root.mkdir(parents=True)
+        self.env_file = self.target_root / ".env"
+        self.env_file.write_text(
+            f"DB_USER={self.db_user}\n"
+            f"DB_PASSWORD={self.password}\n"
+            "DB_HOST=localhost\n"
+            "DB_PORT=5432\n",
+            encoding="utf-8",
+        )
+
+        archive_root = self.tmpdir / "archive-root"
+        archive_root.mkdir()
+        (archive_root / "database.dump").write_bytes(b"PGDMP" + b"\x00" * 64)
+        self.archive = self.tmpdir / "backup.tar.gz"
+        with tarfile.open(self.archive, "w:gz") as tf:
+            tf.add(archive_root, arcname=".")
+
+        self.fakebin = self.tmpdir / "fakebin"
+        self.fakebin.mkdir()
+        self.role_password_file = self.tmpdir / "role-password-received"
+        self.createuser_args_file = self.tmpdir / "createuser-args"
+        self.database_file = self.tmpdir / "database-created"
+        self.restore_file = self.tmpdir / "pg-restore-completed"
+
+        self._write_executable(
+            "sudo",
+            """#!/usr/bin/env bash
+set -euo pipefail
+if [ "${1:-}" = "-u" ]; then
+  shift 2
+fi
+exec "$@"
+""",
+        )
+        self._write_executable(
+            "createuser",
+            """#!/usr/bin/env bash
+set -euo pipefail
+IFS= read -r first_password
+IFS= read -r second_password
+[ "$first_password" = "$second_password" ]
+printf '%s' "$first_password" > "$FAKE_ROLE_PASSWORD_FILE"
+printf '%s\n' "$*" > "$FAKE_CREATEUSER_ARGS_FILE"
+""",
+        )
+        self._write_executable(
+            "psql",
+            """#!/usr/bin/env bash
+set -euo pipefail
+args="$*"
+if [[ "$args" == *"FROM pg_roles"* ]]; then
+  if [ -f "$FAKE_ROLE_PASSWORD_FILE" ]; then printf '1\n'; fi
+elif [[ "$args" == *"FROM pg_database"* ]]; then
+  if [ -f "$FAKE_DATABASE_FILE" ]; then printf '1\n'; fi
+elif [[ "$args" == *"CREATE DATABASE"* ]]; then
+  : > "$FAKE_DATABASE_FILE"
+elif [[ "$args" == *"SELECT count(*) FROM django_migrations"* ]]; then
+  printf '42\n'
+elif [[ "$args" == *"table_name = 'django_migrations'"* ]]; then
+  printf '1\n'
+elif [[ "$args" == *"information_schema.tables"* ]]; then
+  if [ -f "$FAKE_RESTORE_FILE" ]; then printf '7\n'; else printf '0\n'; fi
+fi
+""",
+        )
+        self._write_executable(
+            "pg_restore",
+            """#!/usr/bin/env bash
+set -euo pipefail
+: > "$FAKE_RESTORE_FILE"
+""",
+        )
+
+        env = {
+            **os.environ,
+            "PATH": f"{self.fakebin}:{os.environ['PATH']}",
+            "FAKE_ROLE_PASSWORD_FILE": str(self.role_password_file),
+            "FAKE_CREATEUSER_ARGS_FILE": str(self.createuser_args_file),
+            "FAKE_DATABASE_FILE": str(self.database_file),
+            "FAKE_RESTORE_FILE": str(self.restore_file),
+        }
+        self.result = subprocess.run(
+            [
+                str(RESTORE_DIR / "30-postgresql.sh"),
+                "--archive", str(self.archive),
+                "--staging-root", str(self.staging_root),
+                "--apply",
+            ],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=30,
+        )
+        self.combined_output = self.result.stdout + self.result.stderr
+        self.evidence_file = self.tmpdir / "e8-stage30.evidence.log"
+        self.evidence_file.write_text(self.combined_output, encoding="utf-8")
+
+    def _write_executable(self, name: str, content: str):
+        path = self.fakebin / name
+        path.write_text(content, encoding="utf-8")
+        path.chmod(0o755)
+
+    def test_db_password_is_absent_from_stage_stdout_and_stderr(self):
+        self.assertNotIn(self.password, self.result.stdout)
+        self.assertNotIn(self.password, self.result.stderr)
+
+    def test_db_password_is_absent_from_generated_evidence_log(self):
+        self.assertNotIn(self.password, self.evidence_file.read_text(encoding="utf-8"))
+
+    def test_postgresql_role_database_and_dump_restore_still_succeed(self):
+        self.assertEqual(self.result.returncode, 0, self.combined_output)
+        self.assertEqual(self.role_password_file.read_text(encoding="utf-8"), self.password)
+        self.assertEqual(
+            self.createuser_args_file.read_text(encoding="utf-8").strip(),
+            f"--pwprompt --no-password {self.db_user}",
+        )
+        self.assertTrue(self.database_file.is_file())
+        self.assertTrue(self.restore_file.is_file())
+        self.assertIn("30-postgresql: PASS", self.combined_output)
+
+    def test_redacted_apply_log_remains_operator_useful(self):
+        self.assertIn(
+            f"[APPLY] create PostgreSQL login role '{self.db_user}' with createuser --pwprompt",
+            self.combined_output,
+        )
+        self.assertIn(f"password from {self.env_file}: <redacted>", self.combined_output)
 
 
 class InspectBackupFunctionalTests(SimpleTestCase):
