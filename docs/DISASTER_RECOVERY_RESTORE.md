@@ -27,7 +27,7 @@ report.
 clean Ubuntu 26.04
   |
   v  deploy/restore/00-preflight.sh    -- OS check, validate the backup archive
-  v  deploy/restore/10-packages.sh     -- apt packages
+  v  deploy/restore/10-packages.sh     -- apt packages (+ optional offline apt/snap closure -- see below)
   v  deploy/restore/20-application.sh  -- git clone + SHA checkout, .env + media/
   v  deploy/restore/30-postgresql.sh   -- role/DB bootstrap, pg_restore
   v  deploy/restore/40-station-content.sh -- carts/voicetracks/reports/StereoTool profile
@@ -57,6 +57,164 @@ then `--apply` once the plan looks right. `deploy/restore/restore.sh`
 chains all eleven stages if you'd rather run them in one shot; running
 them individually and reviewing each is recommended for the actual
 Phase 5 drill.
+
+## Offline package/snap closure (E8, r0038)
+
+**E8** is the fully offline clean-machine restore acceptance run: one
+production backup plus preserved off-host recovery inputs, on a machine
+with production and GitHub genuinely unreachable. `10-packages.sh`
+(apt) needed two new capabilities to pass it for real, and a real E8 run
+found (and this pass fixed) two closure-completeness bugs and one
+Ubuntu-26.04-specific Chromium packaging trap along the way. Read this
+section before attempting an authoritative E8 run — silently skipping it
+and relying on Stage 10's ordinary connected behavior will hang or fall
+back to the network the moment Selenium/Chromium is selected.
+
+### Why `chromium-browser.deb` alone is not enough on Ubuntu 26.04
+
+`chromium-browser` (part of `--with-syndicated-selenium` /
+`--with-all-optional`) is, on Ubuntu 26.04, a thin **Snap Store
+transition package** — installing its `.deb` does not give you a
+browser. Its own `preinst` script checks whether `/run/snapd.socket`
+exists and, if so, shells out to `snap info chromium` / `snap install
+chromium` to fetch the real browser from the Snap Store. With E8's
+network deliberately unreachable, that hangs/times out and the script
+falls into an interactive debconf Retry/Abort/Skip prompt — fatal for an
+unattended restore. This is true even when a working Chromium **snap**
+is already installed locally: the preinst does not check "is Chromium
+already usable", it unconditionally tries the store first whenever
+`/run/snapd.socket` exists at all (verified directly: `timeout 15 snap
+info chromium` still attempts Snap Store access and times out even with
+Chromium already installed). So an offline closure needs the full snap
+closure (including the `snapd` **system snap** itself — a real gap the
+first E8 attempt hit, see below) installed and ack'd locally, and Stage
+10 has to make `/run/snapd.socket` genuinely absent before the wrapper
+`.deb`s are unpacked.
+
+### Two apt-closure defects a real offline run found
+
+An ad hoc, hand-built offline apt closure was NOT complete, in two
+different ways:
+
+1. **A DIRECT package already installed on the source host was silently
+   omitted.** `age` (`--with-backup-encryption`) is listed directly in
+   `deploy/packages-ubuntu-26.04.txt`, but because it was already
+   installed on the machine the closure was built from, a naive
+   `apt-get --download-only install` never re-fetched its `.deb` — apt
+   only downloads what it's about to actually install, and an
+   already-satisfied package isn't queued for download at all.
+2. **A TRANSITIVE dependency was missing entirely** — no `.deb`, no
+   `Packages` stanza, no manifest entry. `glycin-loaders -> bubblewrap`
+   was never named anywhere in `packages-ubuntu-26.04.txt` (it's a
+   dependency of a GNOME content-rendering library pulled in
+   transitively), so a closure built only from the file's own package
+   names missed it outright.
+
+`deploy/restore/build_offline_closure.py`'s `apt-closure` step fixes
+both structurally, not by special-casing `age`/`bubblewrap`: it always
+runs the real download step with `--reinstall` (forces every package in
+the resolved graph to be fetched regardless of current install state),
+and it always takes `apt-get`'s own dependency resolver's word for the
+full closure (a `--simulate` pass's `Inst <name>` lines) rather than
+hand-curating which transitive packages to include. See that script's
+own module docstring for the full mechanism.
+
+### The missing `snapd` system snap
+
+A real E8 attempt preserved `bare`, `chromium`, `core22`, `core24`,
+`cups`, `gnome-46-2404`, `gtk-common-themes`, and `mesa-2404` as
+`.snap`/`.assert` pairs. `bare`/`core22`/`core24` installed offline
+fine, but `mesa-2404` failed trying to fetch the **`snapd` system snap**
+itself from `https://api.snapcraft.io/v2/snaps/refresh` — the closure
+had never captured it, because it isn't a snap anyone `snap install`s
+directly; snapd fetches it lazily on first need. Once `snapd_27710.snap`
++ `snapd_27710.assert` were added and ack'd, the entire preserved stack
+(`bare`, `core22`, `core24`, `snapd`, `mesa-2404`, `gtk-common-themes`,
+`gnome-46-2404`, `cups`, `chromium`) installed successfully, fully
+offline. `build_offline_closure.py`'s `snap-closure` step always
+includes `snapd` explicitly for exactly this reason, regardless of what
+snap names are requested.
+
+### Building the closure (run on a CONNECTED host)
+
+```bash
+deploy/restore/build_offline_closure.py all --out-dir /path/to/e8-closure
+```
+
+This needs real Internet access — run it on production, or a throwaway
+Ubuntu 26.04 host with the same package selection, well before the E8
+drill; the RESTORE side never needs network access. It produces:
+
+```
+/path/to/e8-closure/
+  apt-repo/                     .deb files + Packages/Packages.gz (a real local apt repo)
+  snaps/                        .snap/.assert files + snap-manifest.json
+  manifests/
+    apt-closure-manifest.json   name/version/architecture/filename/sha256/direct per package
+    direct-apt-packages.txt     one direct package name per line
+    snap-manifest.json          (copy of snaps/snap-manifest.json)
+```
+
+Run it again whenever `deploy/packages-ubuntu-26.04.txt` changes, a new
+Ubuntu 26.04 point release ships, or production's actual snap revisions
+drift — it's deterministic given the same inputs and re-runnable for
+Phase 6 recurring DR acceptance. No secrets or private keys are written
+anywhere in this output; it's public software, not credentials. Copy the
+whole `/path/to/e8-closure` directory to off-host recovery media (the
+same media class as the backup archive itself).
+
+### Consuming the closure during Stage 10
+
+```bash
+deploy/restore/10-packages.sh --apply \
+  --with-syndicated-selenium \
+  --apt-repo-dir /path/to/e8-closure/apt-repo \
+  --snap-dir /path/to/e8-closure/snaps
+```
+
+- `--apt-repo-dir PATH` scopes every apt-get call in this stage
+  EXCLUSIVELY to that local repo (`-o Dir::Etc::sourcelist=...`) — apt
+  never attempts a configured online mirror, so an incomplete closure
+  fails closed (apt's own dependency error) instead of a silent network
+  fallback. Safe to use even when Selenium isn't selected.
+- `--snap-dir PATH` is only meaningful combined with
+  `--with-syndicated-selenium` (or `--with-all-optional`): it switches
+  Stage 10 into **local-snap mode** for Chromium specifically. Before
+  touching anything, Stage 10 runs `offline_snap_install.py`'s manifest
+  verification (unprivileged, safe in both `--plan` and `--apply`) —
+  any missing file, SHA256 mismatch, missing `snapd`/`chromium`, or
+  invalid install order fails the WHOLE stage closed, before any
+  privileged action, with no fallback to the Snap Store.
+- Local-snap mode then: ack's + installs every snap in the manifest's
+  authoritative order (`snap ack` — never `--dangerous`/`--devmode`),
+  installing Chromium itself BEFORE the Ubuntu wrapper packages; stops
+  `snapd.socket`/`snapd.service` and verifies they're genuinely
+  inactive; verifies (via `ss -lxH src <socket>`, never assumed) that no
+  process still holds `/run/snapd.socket` before removing the stale
+  inode `systemctl stop` leaves behind; installs
+  `chromium-browser`/`chromium-chromedriver` via `DEBIAN_FRONTEND=
+  noninteractive dpkg -i` (unattended — no debconf prompt reachable,
+  because `/run/snapd.socket` is genuinely gone by this point, not
+  merely "made noninteractive"); and always restarts snapd afterward —
+  including on failure partway through — to leave the host in a
+  reasonable state either way.
+- Validates `chromium-browser --version` / `chromedriver --version`
+  after install, checks their major versions match, and runs a bounded
+  (`timeout`-guarded) headless smoke test — logged either way, non-fatal
+  on its own (sandbox/AppArmor warnings are expected and did not prevent
+  execution during the real E8 acceptance run), while a version mismatch
+  IS treated as fatal.
+
+Without `--snap-dir`, `--with-syndicated-selenium` behaves exactly as
+before r0038: `chromium-browser`/`chromium-chromedriver` go through the
+ordinary `apt-get install` path — correct for an OFFLINE run only if
+`/run/snapd.socket` genuinely doesn't exist on the target at all (no
+snapd installed) or the operator has some other offline resolution in
+place; on a normal Ubuntu 26.04 box with snapd present, this is the
+connected/non-E8 path and will hit the transition-package trap above
+under E8's network isolation. **There is no online fallback in
+local-snap mode, ever** — this is a hard requirement, not a convenience
+default.
 
 ## Runtime recovery payload (Runtime Foundation E7B/E7C)
 

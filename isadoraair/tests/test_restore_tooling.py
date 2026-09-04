@@ -11,6 +11,8 @@ inspect_backup.sh is the one script fully exercised for real here --
 against small, synthetic, temp-directory-only archives (never a real
 production backup), which is enough to prove its actual pass/fail logic
 works without needing production data in the test suite."""
+import hashlib
+import importlib.util
 import os
 import io
 import json
@@ -27,6 +29,19 @@ from django.test import SimpleTestCase
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 RESTORE_DIR = REPO_ROOT / "deploy" / "restore"
 STAGE_SCRIPTS = sorted(RESTORE_DIR.glob("*.sh"))
+
+
+def _load_module(path: Path, name: str):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    # Registered in sys.modules BEFORE exec -- dataclasses (used by
+    # offline_snap_install.py) resolves its owning module via
+    # sys.modules[cls.__module__] while the class body is still
+    # executing, which requires the entry to already exist.
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 class RestoreScriptsExistAndParseTests(SimpleTestCase):
@@ -1940,3 +1955,786 @@ class RestoreStage90ScratchSurfaceSafetyTests(SimpleTestCase):
         # the requested-but-unachievable 65001.
         tts_dir = self.staging / "run" / "isadoraair" / "tts"
         self.assertFalse(tts_dir.exists())
+
+
+# =======================================================================
+# r0038 (E8 offline restore hardening): offline_snap_install.py,
+# build_offline_closure.py, and 10-packages.sh's local-snap mode.
+#
+# The real Chromium/snap transition sequence needs actual root, a real
+# snapd, and real apt/snap state -- none of which belongs in a unit test.
+# Following Stage30SecretLoggingFunctionalTests's own established
+# pattern, the functional tests below run the REAL 10-packages.sh via a
+# fake PATH (sudo/systemctl/ss/dpkg/snap/apt-get/chromium-browser/
+# chromedriver stand-ins that record every invocation to a log file and
+# track a tiny bit of fake system state), so the actual bash control
+# flow -- ordering, fail-closed behavior, DEBIAN_FRONTEND propagation,
+# never falling back to an online snap/apt install -- is exercised for
+# real, never asserted against by reading the script's source text alone.
+# =======================================================================
+
+offline_snap_install = _load_module(RESTORE_DIR / "offline_snap_install.py", "offline_snap_install_under_test")
+build_offline_closure = _load_module(RESTORE_DIR / "build_offline_closure.py", "build_offline_closure_under_test")
+TEN_PACKAGES_R38 = RESTORE_DIR / "10-packages.sh"
+
+
+def _sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _write_snap_fixture(root: Path, entries):
+    """entries: iterable of (name, revision, snap_bytes, assert_bytes).
+    Writes the .snap/.assert files and returns the manifest 'snaps' list
+    (SHA256 computed from the actual bytes written -- never asserted
+    independently, so a test that wants a mismatch must tamper with the
+    file or the manifest AFTER calling this)."""
+    snaps = []
+    for name, revision, snap_bytes, assert_bytes in entries:
+        snap_path = root / f"{name}_{revision}.snap"
+        assert_path = root / f"{name}_{revision}.assert"
+        snap_path.write_bytes(snap_bytes)
+        assert_path.write_bytes(assert_bytes)
+        snaps.append({
+            "name": name, "revision": revision,
+            "snap_file": snap_path.name, "snap_sha256": _sha256_bytes(snap_bytes),
+            "assert_file": assert_path.name, "assert_sha256": _sha256_bytes(assert_bytes),
+        })
+    return snaps
+
+
+def _write_fakebin(fakebin_dir: Path, scripts: dict):
+    fakebin_dir.mkdir(parents=True, exist_ok=True)
+    for name, content in scripts.items():
+        path = fakebin_dir / name
+        path.write_text(content, encoding="utf-8")
+        path.chmod(0o755)
+
+
+class OfflineSnapInstallHelperTests(SimpleTestCase):
+    """Pure-Python unit tests of offline_snap_install.py's manifest
+    verification/ordering -- the fail-closed logic Stage 10's local-snap
+    mode depends on to never proceed on an incomplete, mismatched, or
+    tampered closure. See that module's own docstring for the full
+    contract exercised here."""
+
+    def setUp(self):
+        self.tmpdir = Path(tempfile.mkdtemp(prefix="isadoraair-offline-snap-"))
+        self.addCleanup(shutil.rmtree, self.tmpdir, ignore_errors=True)
+
+    def _manifest(self, snaps, install_order):
+        (self.tmpdir / "snap-manifest.json").write_text(
+            json.dumps({"schema_version": 1, "snaps": snaps, "install_order": install_order}),
+            encoding="utf-8",
+        )
+
+    def _complete_closure(self):
+        snaps = _write_snap_fixture(self.tmpdir, [
+            ("snapd", "27710", b"snapd-bytes", b"snapd-assert-bytes"),
+            ("core22", "2437", b"core22-bytes", b"core22-assert-bytes"),
+            ("chromium", "3520", b"chromium-bytes", b"chromium-assert-bytes"),
+        ])
+        self._manifest(snaps, ["snapd", "core22", "chromium"])
+        return snaps
+
+    def test_complete_closure_produces_ordered_plan(self):
+        self._complete_closure()
+        plan = offline_snap_install.build_plan(self.tmpdir)
+        self.assertEqual([e.name for e in plan], ["snapd", "core22", "chromium"])
+        self.assertEqual(plan[0].revision, "27710")
+
+    def test_missing_manifest_fails_closed(self):
+        with self.assertRaises(offline_snap_install.ManifestError):
+            offline_snap_install.build_plan(self.tmpdir)
+
+    def test_missing_snapd_fails_closed_with_required_snap_error(self):
+        snaps = _write_snap_fixture(self.tmpdir, [
+            ("chromium", "3520", b"chromium-bytes", b"chromium-assert-bytes"),
+        ])
+        self._manifest(snaps, ["chromium"])
+        with self.assertRaises(offline_snap_install.RequiredSnapMissingError):
+            offline_snap_install.build_plan(self.tmpdir)
+
+    def test_missing_chromium_fails_closed_with_required_snap_error(self):
+        snaps = _write_snap_fixture(self.tmpdir, [
+            ("snapd", "27710", b"snapd-bytes", b"snapd-assert-bytes"),
+        ])
+        self._manifest(snaps, ["snapd"])
+        with self.assertRaises(offline_snap_install.RequiredSnapMissingError):
+            offline_snap_install.build_plan(self.tmpdir)
+
+    def test_sha256_mismatch_fails_closed(self):
+        self._complete_closure()
+        # Tamper with the chromium .snap file's contents AFTER the
+        # manifest was written from the original bytes' real SHA256.
+        (self.tmpdir / "chromium_3520.snap").write_bytes(b"tampered-bytes")
+        with self.assertRaises(offline_snap_install.HashMismatchError):
+            offline_snap_install.build_plan(self.tmpdir)
+
+    def test_missing_referenced_file_fails_closed(self):
+        self._complete_closure()
+        (self.tmpdir / "chromium_3520.snap").unlink()
+        with self.assertRaises(offline_snap_install.MissingFileError):
+            offline_snap_install.build_plan(self.tmpdir)
+
+    def test_chromium_before_snapd_in_install_order_fails_closed(self):
+        snaps = _write_snap_fixture(self.tmpdir, [
+            ("snapd", "27710", b"snapd-bytes", b"snapd-assert-bytes"),
+            ("chromium", "3520", b"chromium-bytes", b"chromium-assert-bytes"),
+        ])
+        self._manifest(snaps, ["chromium", "snapd"])
+        with self.assertRaises(offline_snap_install.InstallOrderError):
+            offline_snap_install.build_plan(self.tmpdir)
+
+    def test_install_order_not_a_permutation_fails_closed(self):
+        snaps = _write_snap_fixture(self.tmpdir, [
+            ("snapd", "27710", b"snapd-bytes", b"snapd-assert-bytes"),
+            ("chromium", "3520", b"chromium-bytes", b"chromium-assert-bytes"),
+        ])
+        self._manifest(snaps, ["snapd"])  # chromium missing from install_order
+        with self.assertRaises(offline_snap_install.InstallOrderError):
+            offline_snap_install.build_plan(self.tmpdir)
+
+    def test_path_traversal_in_manifest_filename_rejected(self):
+        self._complete_closure()
+        data = json.loads((self.tmpdir / "snap-manifest.json").read_text())
+        data["snaps"][0]["snap_file"] = "../evil.snap"
+        (self.tmpdir / "snap-manifest.json").write_text(json.dumps(data))
+        with self.assertRaises(offline_snap_install.ManifestError):
+            offline_snap_install.build_plan(self.tmpdir)
+
+    def test_cli_plan_prints_tsv_and_exits_zero_on_success(self):
+        self._complete_closure()
+        result = subprocess.run(
+            [sys.executable, str(RESTORE_DIR / "offline_snap_install.py"), "plan", "--snap-dir", str(self.tmpdir)],
+            capture_output=True, text=True, timeout=15,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        lines = [line for line in result.stdout.splitlines() if line]
+        self.assertEqual(len(lines), 3)
+        self.assertTrue(lines[0].startswith("SNAP\tsnapd\t"))
+        self.assertTrue(lines[-1].startswith("SNAP\tchromium\t"))
+
+    def test_cli_plan_fails_with_no_stdout_on_bad_closure(self):
+        """Fail-closed means no partial/misleading stdout a careless
+        caller might consume despite the nonzero exit."""
+        result = subprocess.run(
+            [sys.executable, str(RESTORE_DIR / "offline_snap_install.py"), "plan", "--snap-dir", str(self.tmpdir)],
+            capture_output=True, text=True, timeout=15,
+        )
+        self.assertEqual(result.returncode, 2)  # manifest missing entirely
+        self.assertEqual(result.stdout, "")
+        self.assertIn("snap manifest not found", result.stderr)
+
+
+class BuildOfflineClosureTests(SimpleTestCase):
+    """Pure-Python unit tests of build_offline_closure.py against a fake
+    subprocess runner -- never touches real apt/snap/the network. Directly
+    regression-tests the two root causes the E8 acceptance run found: an
+    already-installed DIRECT package (`age`) silently missing from the
+    apt closure, and a TRANSITIVE dependency (`bubblewrap`) missing
+    entirely."""
+
+    def setUp(self):
+        self.tmpdir = Path(tempfile.mkdtemp(prefix="isadoraair-closure-builder-"))
+        self.addCleanup(shutil.rmtree, self.tmpdir, ignore_errors=True)
+
+    def test_parse_packages_file_matches_the_real_manifest(self):
+        groups = build_offline_closure.parse_packages_file(REPO_ROOT / "deploy" / "packages-ubuntu-26.04.txt")
+        self.assertIn("age", groups["OPTIONAL_BACKUP_ENCRYPTION"])
+        self.assertIn("chromium-browser", groups["OPTIONAL_SYNDICATED_SELENIUM"])
+        self.assertIn("python3", groups["CORE"])
+
+    def test_resolve_direct_packages_rejects_unknown_group(self):
+        groups = {"CORE": ["python3"]}
+        with self.assertRaises(build_offline_closure.ClosureBuildError):
+            build_offline_closure.resolve_direct_packages(groups, ["NOT_A_GROUP"])
+
+    def _fake_apt_runner(self, archives_dir: Path, direct_names, transitive_names):
+        """A fake apt-get/dpkg-deb/dpkg-scanpackages runner covering
+        exactly the age (already-installed DIRECT) and bubblewrap
+        (TRANSITIVE, never named in packages-ubuntu-26.04.txt) scenarios
+        from the real E8 acceptance run -- generalized to whatever
+        direct/transitive names the test passes in."""
+        all_names = list(direct_names) + list(transitive_names)
+        calls = []
+
+        def runner(argv, **kwargs):
+            calls.append((list(argv), kwargs))
+            if "dpkg-scanpackages" in argv:
+                return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+            if "update" in argv:
+                return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+            if "-s" in argv:
+                inst_lines = "".join(f"Inst {name} (1.0-1 Ubuntu:26.04 [amd64])\n" for name in transitive_names)
+                return subprocess.CompletedProcess(argv, 0, stdout=inst_lines, stderr="")
+            if "dpkg-deb" in argv:
+                target = Path(argv[argv.index("-f") + 1])
+                name = target.name.split("_")[0]
+                out = f"Package: {name}\nVersion: 1.0-1\nArchitecture: amd64\n"
+                return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
+            if "install" in argv and "--download-only" in argv:
+                # The real download step: --reinstall means this always
+                # (re-)populates the cache, even for an ALREADY-INSTALLED
+                # direct package like `age` -- this fake mirrors that by
+                # always (re-)writing every closure member's .deb here,
+                # regardless of any prior on-disk state.
+                for name in all_names:
+                    (archives_dir / f"{name}_1.0-1_amd64.deb").write_bytes(f"{name}-bytes".encode())
+                return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+        return runner, calls
+
+    def test_apt_closure_includes_already_installed_direct_package(self):
+        """Regression test for the `age` omission: a direct package that
+        is already installed on the source host must still be captured,
+        because the real fix is `--reinstall` on the real download step,
+        which never special-cases 'already installed'."""
+        archives_dir = self.tmpdir / "archives"
+        archives_dir.mkdir()
+        runner, _ = self._fake_apt_runner(archives_dir, direct_names=["age"], transitive_names=[])
+        result = build_offline_closure.build_apt_closure(
+            ["age"], self.tmpdir / "out", runner=runner, archives_dir=archives_dir, sudo=False,
+        )
+        names = {e["name"]: e for e in result.entries}
+        self.assertIn("age", names)
+        self.assertTrue(names["age"]["direct"])
+
+    def test_apt_closure_captures_transitive_dependency(self):
+        """Regression test for the bubblewrap omission: a package NEVER
+        named in packages-ubuntu-26.04.txt, resolved only via apt's own
+        dependency graph, must still end up in the closure and manifest,
+        marked non-direct."""
+        archives_dir = self.tmpdir / "archives"
+        archives_dir.mkdir()
+        runner, _ = self._fake_apt_runner(archives_dir, direct_names=["glycin-loaders"], transitive_names=["bubblewrap"])
+        result = build_offline_closure.build_apt_closure(
+            ["glycin-loaders"], self.tmpdir / "out", runner=runner, archives_dir=archives_dir, sudo=False,
+        )
+        names = {e["name"]: e for e in result.entries}
+        self.assertIn("bubblewrap", names)
+        self.assertFalse(names["bubblewrap"]["direct"])
+
+    def test_apt_closure_writes_manifest_and_direct_list_and_local_repo_index(self):
+        archives_dir = self.tmpdir / "archives"
+        archives_dir.mkdir()
+        runner, calls = self._fake_apt_runner(archives_dir, direct_names=["age"], transitive_names=["bubblewrap"])
+        result = build_offline_closure.build_apt_closure(
+            ["age"], self.tmpdir / "out", runner=runner, archives_dir=archives_dir, sudo=False,
+        )
+        self.assertTrue(result.manifest_path.is_file())
+        manifest = json.loads(result.manifest_path.read_text())
+        manifest_names = {p["name"] for p in manifest["packages"]}
+        self.assertEqual(manifest_names, {"age", "bubblewrap"})
+        for pkg in manifest["packages"]:
+            self.assertIn("sha256", pkg)
+            self.assertIn("filename", pkg)
+        self.assertEqual(result.direct_list_path.read_text().strip(), "age")
+        self.assertTrue(any("dpkg-scanpackages" in c[0] for c in calls))
+        self.assertTrue((result.apt_repo_dir / "Packages").is_file())
+
+    def test_apt_closure_real_download_uses_reinstall(self):
+        """The specific flag that fixes the `age` omission -- assert it's
+        actually present on the real (non-simulate) download command."""
+        archives_dir = self.tmpdir / "archives"
+        archives_dir.mkdir()
+        runner, calls = self._fake_apt_runner(archives_dir, direct_names=["age"], transitive_names=[])
+        build_offline_closure.build_apt_closure(
+            ["age"], self.tmpdir / "out", runner=runner, archives_dir=archives_dir, sudo=False,
+        )
+        download_calls = [c[0] for c in calls if "install" in c[0] and "--download-only" in c[0] and "-s" not in c[0]]
+        self.assertEqual(len(download_calls), 1)
+        self.assertIn("--reinstall", download_calls[0])
+
+    def _fake_snap_runner(self, installed_revisions: dict, types: dict):
+        def runner(argv, **kwargs):
+            if argv[:2] == ["snap", "list"]:
+                name = argv[2]
+                if name in installed_revisions:
+                    out = f"Name  Version  Rev  Tracking  Publisher  Notes\n{name}  1.0  {installed_revisions[name]}  latest  x  -\n"
+                    return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
+                return subprocess.CompletedProcess(argv, 1, stdout="", stderr="no matching snaps")
+            if argv[:2] == ["snap", "download"]:
+                name = argv[2]
+                cwd = Path(kwargs["cwd"])
+                rev = argv[argv.index("--revision") + 1] if "--revision" in argv else "999"
+                (cwd / f"{name}_{rev}.snap").write_bytes(f"{name}-snap".encode())
+                (cwd / f"{name}_{rev}.assert").write_bytes(f"{name}-assert".encode())
+                return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+            if argv[:2] == ["snap", "info"]:
+                name = argv[2]
+                return subprocess.CompletedProcess(argv, 0, stdout=f"name: {name}\ntype: {types.get(name, 'app')}\n", stderr="")
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+        return runner
+
+    def test_snap_closure_includes_snapd_and_chromium_even_if_not_requested(self):
+        runner = self._fake_snap_runner(installed_revisions={}, types={"snapd": "snapd"})
+        result = build_offline_closure.build_snap_closure(["gtk-common-themes"], self.tmpdir / "out", runner=runner)
+        names = {e["name"] for e in result.manifest["snaps"]}
+        self.assertIn("snapd", names)
+        self.assertIn("chromium", names)
+
+    def test_snap_closure_prefers_actual_installed_revision(self):
+        runner = self._fake_snap_runner(installed_revisions={"core22": "2437"}, types={"snapd": "snapd", "core22": "base"})
+        result = build_offline_closure.build_snap_closure(["core22"], self.tmpdir / "out", runner=runner)
+        entry = next(e for e in result.manifest["snaps"] if e["name"] == "core22")
+        self.assertEqual(entry["revision"], "2437")
+
+    def test_snap_closure_install_order_snapd_first_chromium_last(self):
+        runner = self._fake_snap_runner(installed_revisions={}, types={"snapd": "snapd", "core22": "base"})
+        result = build_offline_closure.build_snap_closure(["core22"], self.tmpdir / "out", runner=runner)
+        order = result.manifest["install_order"]
+        self.assertEqual(order[0], "snapd")
+        self.assertEqual(order[-1], "chromium")
+
+    def test_snap_closure_output_is_directly_consumable_by_offline_snap_install(self):
+        """End-to-end: the manifest/files build_offline_closure.py writes
+        must be exactly what offline_snap_install.py's fail-closed
+        verification accepts -- no format drift between the two tools."""
+        runner = self._fake_snap_runner(installed_revisions={}, types={"snapd": "snapd", "core22": "base"})
+        result = build_offline_closure.build_snap_closure(["core22"], self.tmpdir / "out", runner=runner)
+        plan = offline_snap_install.build_plan(result.snap_dir)
+        self.assertEqual([e.name for e in plan], result.manifest["install_order"])
+
+
+class OfflineClosureToolingSyntaxTests(SimpleTestCase):
+    def test_offline_snap_install_compiles(self):
+        result = subprocess.run(
+            [sys.executable, "-m", "py_compile", str(RESTORE_DIR / "offline_snap_install.py")],
+            capture_output=True, text=True, timeout=15,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_build_offline_closure_compiles(self):
+        result = subprocess.run(
+            [sys.executable, "-m", "py_compile", str(RESTORE_DIR / "build_offline_closure.py")],
+            capture_output=True, text=True, timeout=15,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_offline_snap_install_is_executable(self):
+        self.assertTrue((RESTORE_DIR / "offline_snap_install.py").stat().st_mode & 0o111)
+
+    def test_build_offline_closure_is_executable(self):
+        self.assertTrue((RESTORE_DIR / "build_offline_closure.py").stat().st_mode & 0o111)
+
+    def test_10_packages_documents_the_new_flags(self):
+        text = TEN_PACKAGES_R38.read_text(encoding="utf-8")
+        self.assertIn("--snap-dir", text)
+        self.assertIn("--apt-repo-dir", text)
+
+
+class Stage10LocalSnapModeFunctionalTests(SimpleTestCase):
+    """Real subprocess execution of 10-packages.sh --apply in local-snap
+    mode, against a fake PATH -- never real sudo/systemctl/dpkg/snap/apt,
+    never a real network or Snap Store. Exercises the actual bash control
+    flow proven by hand during the E8 acceptance run: snap install order,
+    the noninteractive Chromium transition-package sequence, and snapd
+    being stopped/restarted around it."""
+
+    def setUp(self):
+        self.tmpdir = Path(tempfile.mkdtemp(prefix="isadoraair-stage10-localsnap-"))
+        self.addCleanup(shutil.rmtree, self.tmpdir, ignore_errors=True)
+        self.fakebin = self.tmpdir / "fakebin"
+        self.state_dir = self.tmpdir / "state"
+        self.state_dir.mkdir()
+        self.calls_log = self.tmpdir / "calls.log"
+        self.calls_log.write_text("", encoding="utf-8")
+        (self.state_dir / "snapd-state").write_text("active", encoding="utf-8")
+        self.fake_socket = self.tmpdir / "fake-snapd.socket"
+        self.fake_socket.write_text("", encoding="utf-8")
+
+        self.snap_dir = self.tmpdir / "snapdir"
+        self.snap_dir.mkdir()
+        snaps = _write_snap_fixture(self.snap_dir, [
+            ("snapd", "27710", b"snapd-bytes", b"snapd-assert-bytes"),
+            ("core22", "2437", b"core22-bytes", b"core22-assert-bytes"),
+            ("chromium", "3520", b"chromium-bytes", b"chromium-assert-bytes"),
+        ])
+        (self.snap_dir / "snap-manifest.json").write_text(
+            json.dumps({"schema_version": 1, "snaps": snaps, "install_order": ["snapd", "core22", "chromium"]}),
+            encoding="utf-8",
+        )
+
+        _write_fakebin(self.fakebin, {
+            "sudo": """#!/usr/bin/env bash
+set -euo pipefail
+while [[ "${1:-}" =~ ^[A-Za-z_][A-Za-z0-9_]*=.*$ ]]; do export "$1"; shift; done
+exec "$@"
+""",
+            "dpkg": """#!/usr/bin/env bash
+set -euo pipefail
+echo "dpkg $* | DEBIAN_FRONTEND=${DEBIAN_FRONTEND:-<unset>}" >> "$FAKE_CALLS"
+if [ "$1" = "-s" ]; then exit "${FAKE_DPKG_S_EXIT:-0}"; fi
+if [ "$1" = "-i" ]; then exit "${FAKE_DPKG_I_EXIT:-0}"; fi
+exit 0
+""",
+            "snap": """#!/usr/bin/env bash
+set -euo pipefail
+echo "snap $*" >> "$FAKE_CALLS"
+case "$1" in
+  list)
+    name="$2"
+    if [ -f "$FAKE_STATE_DIR/snap-installed-$name" ]; then
+      rev=$(cat "$FAKE_STATE_DIR/snap-installed-$name")
+      echo "Name  Version  Rev  Tracking  Publisher  Notes"
+      echo "$name  1.0  $rev  latest  x  -"
+    else
+      echo "error: no matching snaps installed" >&2
+      exit 1
+    fi
+    ;;
+  ack) : ;;
+  install)
+    base=$(basename "$2")
+    name="${base%_*}"
+    rev="${base##*_}"; rev="${rev%.snap}"
+    echo "$rev" > "$FAKE_STATE_DIR/snap-installed-$name"
+    ;;
+esac
+""",
+            "systemctl": """#!/usr/bin/env bash
+set -euo pipefail
+echo "systemctl $*" >> "$FAKE_CALLS"
+case "$1" in
+  is-active)
+    if [ "$(cat "$FAKE_STATE_DIR/snapd-state" 2>/dev/null || echo active)" = "active" ]; then exit 0; else exit 3; fi
+    ;;
+  stop) echo "inactive" > "$FAKE_STATE_DIR/snapd-state" ;;
+  start) echo "active" > "$FAKE_STATE_DIR/snapd-state" ;;
+esac
+""",
+            "ss": """#!/usr/bin/env bash
+echo "ss $*" >> "$FAKE_CALLS"
+if [ -f "$FAKE_STATE_DIR/socket-listener" ]; then
+  echo "u_str LISTEN 0 4096 ${*: -1} 1 * 0"
+fi
+exit 0
+""",
+            "apt-get": """#!/usr/bin/env bash
+set -euo pipefail
+echo "apt-get $*" >> "$FAKE_CALLS"
+if [[ " $* " == *" download "* ]]; then
+  : > chromium-browser_1snap1-0ubuntu4_amd64.deb
+  : > chromium-chromedriver_1snap1-0ubuntu4_amd64.deb
+fi
+exit 0
+""",
+            "chromium-browser": """#!/usr/bin/env bash
+echo "chromium-browser $*" >> "$FAKE_CALLS"
+if [ "$1" = "--version" ]; then echo "Chromium 152.0.7977.64 snap"; exit 0; fi
+if [ "$1" = "--headless" ]; then echo "<html><head></head><body>${FAKE_SMOKE_MARKER:-E8-CHROMIUM-OFFLINE-PASS}</body></html>"; exit 0; fi
+exit 0
+""",
+            "chromedriver": """#!/usr/bin/env bash
+echo "chromedriver $*" >> "$FAKE_CALLS"
+echo "ChromeDriver 152.0.7977.64 (abcdef-refs/branch-heads/7977@{#1891})"
+""",
+        })
+
+    def _env(self, **extra):
+        env = {
+            **os.environ,
+            "PATH": f"{self.fakebin}:{os.environ['PATH']}",
+            "FAKE_CALLS": str(self.calls_log),
+            "FAKE_STATE_DIR": str(self.state_dir),
+            "RESTORE_SNAPD_SOCKET_PATH": str(self.fake_socket),
+        }
+        env.update(extra)
+        return env
+
+    def _run(self, *extra_args, env_extra=None):
+        return subprocess.run(
+            [
+                str(TEN_PACKAGES_R38), "--staging-root", str(self.tmpdir / "staging"), "--apply",
+                "--with-syndicated-selenium", "--snap-dir", str(self.snap_dir),
+                *extra_args,
+            ],
+            capture_output=True, text=True, timeout=60,
+            env=self._env(**(env_extra or {})),
+        )
+
+    def _calls(self):
+        return self.calls_log.read_text(encoding="utf-8").splitlines()
+
+    def test_succeeds_and_reports_pass(self):
+        result = self._run()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("10-packages: PASS", result.stdout)
+
+    def test_snaps_ack_and_install_in_manifest_order(self):
+        self._run()
+        calls = self._calls()
+        snap_calls = [c for c in calls if c.startswith("snap ")]
+        expected_order = []
+        for name in ("snapd", "core22", "chromium"):
+            expected_order.append(f"snap list {name}")
+            expected_order.append(f"snap ack {self.snap_dir}/{name}_")
+            expected_order.append(f"snap install {self.snap_dir}/{name}_")
+        # Every ack/install call references the exact local file path --
+        # never a bare snap name (which would mean a Snap Store install).
+        for name in ("snapd", "core22", "chromium"):
+            ack = next(c for c in snap_calls if c.startswith(f"snap ack {self.snap_dir}/{name}_"))
+            install = next(c for c in snap_calls if c.startswith(f"snap install {self.snap_dir}/{name}_"))
+            self.assertIn(ack, snap_calls)
+            self.assertIn(install, snap_calls)
+        # snapd installs before chromium.
+        self.assertLess(
+            snap_calls.index(next(c for c in snap_calls if c.startswith(f"snap install {self.snap_dir}/snapd_"))),
+            snap_calls.index(next(c for c in snap_calls if c.startswith(f"snap install {self.snap_dir}/chromium_"))),
+        )
+
+    def test_never_installs_chromium_via_bare_snap_store_or_apt_name(self):
+        """The single most important local-snap-mode invariant: no
+        fallback to the network under any circumstance."""
+        self._run()
+        calls = self._calls()
+        self.assertNotIn("snap install chromium", calls)
+        for c in calls:
+            if c.startswith("apt-get") and "install" in c:
+                self.assertNotIn("chromium-browser", c)
+                self.assertNotIn("chromium-chromedriver", c)
+
+    def test_chromium_snap_installed_before_wrapper_debs(self):
+        self._run()
+        calls = self._calls()
+        chromium_install_idx = calls.index(next(c for c in calls if c.startswith(f"snap install {self.snap_dir}/chromium_")))
+        dpkg_i_idx = calls.index(next(c for c in calls if c.startswith("dpkg -i")))
+        self.assertLess(chromium_install_idx, dpkg_i_idx)
+
+    def test_dpkg_transition_install_is_noninteractive(self):
+        self._run()
+        dpkg_i_line = next(c for c in self._calls() if c.startswith("dpkg -i"))
+        self.assertIn("DEBIAN_FRONTEND=noninteractive", dpkg_i_line)
+
+    def test_snapd_stopped_before_dpkg_and_restarted_after(self):
+        self._run()
+        calls = self._calls()
+        stop_idx = calls.index("systemctl stop snapd.socket snapd.service")
+        dpkg_i_idx = calls.index(next(c for c in calls if c.startswith("dpkg -i")))
+        start_idx = calls.index("systemctl start snapd.socket snapd.service")
+        self.assertLess(stop_idx, dpkg_i_idx)
+        self.assertLess(dpkg_i_idx, start_idx)
+        self.assertEqual((self.state_dir / "snapd-state").read_text(encoding="utf-8").strip(), "active")
+
+    def test_stale_socket_removed_only_after_listener_check(self):
+        self._run()
+        calls = self._calls()
+        ss_idx = next(i for i, c in enumerate(calls) if c.startswith("ss "))
+        stop_idx = calls.index("systemctl stop snapd.socket snapd.service")
+        self.assertLess(stop_idx, ss_idx)
+        self.assertFalse(self.fake_socket.exists())
+
+    def test_listener_present_aborts_without_removing_socket_but_restores_snapd(self):
+        (self.state_dir / "socket-listener").write_text("", encoding="utf-8")
+        result = self._run()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("refusing to remove it", result.stdout + result.stderr)
+        self.assertTrue(self.fake_socket.exists(), "a live listener's socket must never be removed")
+        self.assertIn("systemctl start snapd.socket snapd.service", self._calls())
+        self.assertEqual((self.state_dir / "snapd-state").read_text(encoding="utf-8").strip(), "active")
+
+    def test_dpkg_failure_still_restores_snapd(self):
+        result = self._run(env_extra={"FAKE_DPKG_I_EXIT": "1"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("systemctl start snapd.socket snapd.service", self._calls())
+        self.assertEqual((self.state_dir / "snapd-state").read_text(encoding="utf-8").strip(), "active")
+
+    def test_version_mismatch_fails(self):
+        chromedriver = self.fakebin / "chromedriver"
+        chromedriver.write_text(
+            "#!/usr/bin/env bash\necho 'ChromeDriver 99.0.1.2 (abc)'\n", encoding="utf-8",
+        )
+        chromedriver.chmod(0o755)
+        result = self._run()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("do not match", result.stdout + result.stderr)
+
+    def test_headless_smoke_test_marker_is_checked(self):
+        result = self._run()
+        self.assertIn("Headless Chromium smoke test: PASS", result.stdout)
+
+    def test_already_installed_at_matching_revision_skips_reinstall(self):
+        (self.state_dir / "snap-installed-snapd").write_text("27710", encoding="utf-8")
+        result = self._run()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        calls = self._calls()
+        self.assertNotIn(f"snap install {self.snap_dir}/snapd_27710.snap", calls)
+        self.assertIn("already installed at revision 27710 -- skipping", result.stdout)
+
+    def test_installed_at_different_revision_fails_closed_not_silently_reinstalled(self):
+        (self.state_dir / "snap-installed-snapd").write_text("99999", encoding="utf-8")
+        result = self._run()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("mismatched revision", result.stdout + result.stderr)
+        self.assertNotIn(f"snap install {self.snap_dir}/snapd_27710.snap", self._calls())
+
+
+class Stage10IncompleteClosureFailsClosedFunctionalTests(SimpleTestCase):
+    """An incomplete/tampered closure must be rejected BEFORE any
+    privileged action -- not partway through, and never by falling back
+    to an online install."""
+
+    def setUp(self):
+        self.tmpdir = Path(tempfile.mkdtemp(prefix="isadoraair-stage10-incomplete-"))
+        self.addCleanup(shutil.rmtree, self.tmpdir, ignore_errors=True)
+        self.fakebin = self.tmpdir / "fakebin"
+        self.calls_log = self.tmpdir / "poison-calls.log"
+        self.calls_log.write_text("", encoding="utf-8")
+        poison = """#!/usr/bin/env bash
+echo "POISON:{name} $*" >> "{calls}"
+exit 99
+"""
+        _write_fakebin(self.fakebin, {
+            name: poison.format(name=name, calls=self.calls_log)
+            for name in ("sudo", "systemctl", "ss", "apt-get")
+        })
+        _write_fakebin(self.fakebin, {
+            "dpkg": f"""#!/usr/bin/env bash
+if [ "$1" = "-s" ]; then exit 1; fi
+echo "POISON:dpkg $*" >> "{self.calls_log}"
+exit 99
+""",
+            "snap": f"""#!/usr/bin/env bash
+if [ "$1" = "list" ]; then echo "error: none" >&2; exit 1; fi
+echo "POISON:snap $*" >> "{self.calls_log}"
+exit 99
+""",
+        })
+        self.snap_dir = self.tmpdir / "snapdir"
+        self.snap_dir.mkdir()
+        # Incomplete closure: snapd is missing entirely.
+        snaps = _write_snap_fixture(self.snap_dir, [
+            ("chromium", "3520", b"chromium-bytes", b"chromium-assert-bytes"),
+        ])
+        (self.snap_dir / "snap-manifest.json").write_text(
+            json.dumps({"schema_version": 1, "snaps": snaps, "install_order": ["chromium"]}),
+            encoding="utf-8",
+        )
+
+    def test_incomplete_closure_fails_closed_before_any_privileged_action(self):
+        result = subprocess.run(
+            [
+                str(TEN_PACKAGES_R38), "--staging-root", str(self.tmpdir / "staging"), "--apply",
+                "--with-syndicated-selenium", "--snap-dir", str(self.snap_dir),
+            ],
+            capture_output=True, text=True, timeout=30,
+            env={**os.environ, "PATH": f"{self.fakebin}:{os.environ['PATH']}"},
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("offline snap closure verification FAILED", result.stdout + result.stderr)
+        self.assertIn("No fallback to the Snap Store", result.stdout + result.stderr)
+        self.assertEqual(self.calls_log.read_text(encoding="utf-8"), "", "no privileged/mutating command may run before closure verification")
+
+
+class Stage10PlanModeSafetyFunctionalTests(SimpleTestCase):
+    """--plan must stay non-destructive and non-root even with
+    --with-syndicated-selenium --snap-dir given -- the header comment's
+    own documented contract ('never touches apt or needs root')."""
+
+    def setUp(self):
+        self.tmpdir = Path(tempfile.mkdtemp(prefix="isadoraair-stage10-plan-safety-"))
+        self.addCleanup(shutil.rmtree, self.tmpdir, ignore_errors=True)
+        self.fakebin = self.tmpdir / "fakebin"
+        self.calls_log = self.tmpdir / "poison-calls.log"
+        self.calls_log.write_text("", encoding="utf-8")
+        poison = """#!/usr/bin/env bash
+echo "POISON:{name} $*" >> "{calls}"
+exit 99
+"""
+        _write_fakebin(self.fakebin, {
+            name: poison.format(name=name, calls=self.calls_log)
+            for name in ("sudo", "systemctl", "ss", "apt-get")
+        })
+        _write_fakebin(self.fakebin, {
+            "dpkg": f"""#!/usr/bin/env bash
+if [ "$1" = "-s" ]; then exit 1; fi
+echo "POISON:dpkg $*" >> "{self.calls_log}"
+exit 99
+""",
+            "snap": f"""#!/usr/bin/env bash
+if [ "$1" = "list" ]; then echo "error: none" >&2; exit 1; fi
+echo "POISON:snap $*" >> "{self.calls_log}"
+exit 99
+""",
+        })
+        self.snap_dir = self.tmpdir / "snapdir"
+        self.snap_dir.mkdir()
+        snaps = _write_snap_fixture(self.snap_dir, [
+            ("snapd", "27710", b"snapd-bytes", b"snapd-assert-bytes"),
+            ("chromium", "3520", b"chromium-bytes", b"chromium-assert-bytes"),
+        ])
+        (self.snap_dir / "snap-manifest.json").write_text(
+            json.dumps({"schema_version": 1, "snaps": snaps, "install_order": ["snapd", "chromium"]}),
+            encoding="utf-8",
+        )
+
+    def _env(self):
+        return {**os.environ, "PATH": f"{self.fakebin}:{os.environ['PATH']}"}
+
+    def test_plan_mode_with_local_snap_is_non_destructive_and_non_root(self):
+        result = subprocess.run(
+            [str(TEN_PACKAGES_R38), "--plan", "--with-syndicated-selenium", "--snap-dir", str(self.snap_dir)],
+            capture_output=True, text=True, timeout=30, env=self._env(),
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.calls_log.read_text(encoding="utf-8"), "")
+        self.assertIn("[PLAN]", result.stdout)
+
+    def test_default_plan_mode_also_never_touches_apt_or_root(self):
+        result = subprocess.run(
+            [str(TEN_PACKAGES_R38), "--plan"],
+            capture_output=True, text=True, timeout=30, env=self._env(),
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.calls_log.read_text(encoding="utf-8"), "")
+
+
+class Stage10DefaultBehaviorUnchangedFunctionalTests(SimpleTestCase):
+    """Selenium selected WITHOUT --snap-dir must behave exactly as
+    before r0038 -- chromium-browser/chromium-chromedriver go through
+    the ordinary apt install list, and none of the new snap/systemctl/ss
+    machinery is touched at all."""
+
+    def setUp(self):
+        self.tmpdir = Path(tempfile.mkdtemp(prefix="isadoraair-stage10-default-"))
+        self.addCleanup(shutil.rmtree, self.tmpdir, ignore_errors=True)
+        self.fakebin = self.tmpdir / "fakebin"
+        self.calls_log = self.tmpdir / "calls.log"
+        self.calls_log.write_text("", encoding="utf-8")
+        _write_fakebin(self.fakebin, {
+            "sudo": """#!/usr/bin/env bash
+set -euo pipefail
+exec "$@"
+""",
+            "dpkg": f"""#!/usr/bin/env bash
+echo "dpkg $*" >> "{self.calls_log}"
+if [ "$1" = "-s" ]; then exit 1; fi
+exit 0
+""",
+            "apt-get": f"""#!/usr/bin/env bash
+echo "apt-get $*" >> "{self.calls_log}"
+exit 0
+""",
+        })
+        for poisoned in ("systemctl", "ss", "snap"):
+            path = self.fakebin / poisoned
+            path.write_text(f"""#!/usr/bin/env bash
+echo "POISON:{poisoned} $*" >> "{self.calls_log}"
+exit 99
+""", encoding="utf-8")
+            path.chmod(0o755)
+
+    def test_selenium_without_snap_dir_uses_ordinary_apt_install(self):
+        result = subprocess.run(
+            [str(TEN_PACKAGES_R38), "--staging-root", str(self.tmpdir / "staging"), "--apply", "--with-syndicated-selenium"],
+            capture_output=True, text=True, timeout=30,
+            env={**os.environ, "PATH": f"{self.fakebin}:{os.environ['PATH']}"},
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        calls = self.calls_log.read_text(encoding="utf-8").splitlines()
+        install_call = next(c for c in calls if c.startswith("apt-get") and "install" in c)
+        self.assertIn("chromium-browser", install_call)
+        self.assertIn("chromium-chromedriver", install_call)
+        self.assertFalse(any(c.startswith("POISON:") for c in calls), "local-snap-only machinery must not run")

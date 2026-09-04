@@ -96,6 +96,17 @@ deploy/restore/
   inspect_backup.sh       Standalone archive validator -- also called by 00-preflight.sh.
   00-preflight.sh         OS check, archive validation, mode/target resolution.
   10-packages.sh          OS package bootstrap (deploy/packages-ubuntu-26.04.txt).
+                          r0038: --apt-repo-dir/--snap-dir select a fully
+                          offline apt+snap closure (see
+                          docs/DISASTER_RECOVERY_RESTORE.md's "Offline
+                          package/snap closure" section).
+  offline_snap_install.py Verifies/orders an offline snap closure for
+                          10-packages.sh's local-snap mode -- stdlib-only,
+                          fails closed on any incomplete/tampered closure.
+  build_offline_closure.py Builds the offline apt+snap closure
+                          (10-packages.sh's own --apt-repo-dir/--snap-dir
+                          inputs) on a CONNECTED host -- never run during
+                          a restore itself.
   20-application.sh       Git clone/SHA checkout, .env + app-tree restore from app.tar.gz.
   30-postgresql.sh        PG bootstrap + pg_restore.
   40-station-content.sh   /srv/isadoraair reconstruction (carts/voicetracks/waveforms/etc).
