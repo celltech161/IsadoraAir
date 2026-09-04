@@ -29,6 +29,9 @@ V3_FORMAT = "3.0.0"
 LEGACY_FORMAT = "2.1.0"
 COMPONENTS = frozenset({"kokoro", "piper", "native_fdkaac", "protected_updater"})
 MAX_METADATA_BYTES = 1024 * 1024
+TRUSTED_DIRECTORY_MODE = 0o755
+TRUSTED_REGULAR_FILE_MODE = 0o644
+TRUSTED_PROTECTED_UPDATER_FILE_MODES = frozenset({0o644, 0o755})
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _PAYLOAD_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
@@ -204,6 +207,45 @@ def _metadata_from_tar(archive: Path) -> dict | None:
     return _strict_metadata(value)
 
 
+def _trusted_recovery_member_mode(
+    member: tarfile.TarInfo, *, relative: PurePosixPath | None,
+) -> int:
+    """Return one deliberately permitted payload mode, or fail closed.
+
+    The outer archive is untrusted input.  Runtime-recovery payloads have a
+    much narrower storage contract than arbitrary tar files: directories are
+    exactly 0755, ordinary regular files are exactly 0644, and files beneath
+    protected-updater are exactly 0644 or 0755.  The latter is required for
+    launchers whose restore inventories include executable mode.  This mirrors
+    runtime_recovery.py's trusted-payload boundary; never copy arbitrary tar
+    mode bits or broaden executable mode to unrelated payload components.
+    """
+
+    mode = stat.S_IMODE(member.mode)
+    if member.isdir():
+        allowed = frozenset({TRUSTED_DIRECTORY_MODE})
+        kind = "directory"
+    elif member.isreg():
+        under_protected_updater = bool(relative and relative.parts[0] == "protected-updater")
+        allowed = (
+            TRUSTED_PROTECTED_UPDATER_FILE_MODES
+            if under_protected_updater
+            else frozenset({TRUSTED_REGULAR_FILE_MODE})
+        )
+        kind = "regular file"
+    else:
+        raise ArchiveContractError(
+            f"runtime recovery archive member is not a directory or regular file: {member.name}"
+        )
+    if mode not in allowed:
+        expected = "/".join(f"{candidate:04o}" for candidate in sorted(allowed))
+        raise ArchiveContractError(
+            f"runtime recovery archive {kind} has untrusted mode {mode:04o}, "
+            f"expected {expected}: {member.name}"
+        )
+    return mode
+
+
 def inspect_archive(args: argparse.Namespace) -> int:
     metadata = _metadata_from_tar(args.archive)
     if metadata is None:
@@ -227,43 +269,57 @@ def extract_payload(args: argparse.Namespace) -> int:
     temporary = Path(tempfile.mkdtemp(prefix=f".{args.destination.name}.extract-", dir=args.destination.parent))
     try:
         seen: set[PurePosixPath] = set()
-        extracted = 0
         with tarfile.open(args.archive, "r:gz") as source:
+            # Validate the complete selected member set before writing a byte.
+            # In particular, links/special files and any mode outside the
+            # closed recovery-payload contract fail before extraction begins.
+            selected: list[tuple[tarfile.TarInfo, PurePosixPath, int]] = []
+            root_seen = False
             for member in source.getmembers():
                 name = _normalized_name(member.name)
                 if not name.parts or name.parts[0] != "runtime-recovery":
                     continue
                 relative = PurePosixPath(*name.parts[1:])
                 if not relative.parts:
-                    if not member.isdir():
-                        raise ArchiveContractError("runtime-recovery archive root must be a directory")
+                    if root_seen:
+                        raise ArchiveContractError("duplicate runtime recovery archive root")
+                    root_seen = True
+                    _trusted_recovery_member_mode(member, relative=None)
                     continue
                 if relative in seen:
                     raise ArchiveContractError(f"duplicate runtime recovery archive member: {relative}")
                 seen.add(relative)
+                selected.append((
+                    member,
+                    relative,
+                    _trusted_recovery_member_mode(member, relative=relative),
+                ))
+
+            if not root_seen:
+                raise ArchiveContractError("runtime-recovery archive root directory is missing")
+
+            os.chmod(temporary, TRUSTED_DIRECTORY_MODE)
+            extracted = 0
+            for member, relative, trusted_mode in selected:
                 destination = temporary.joinpath(*relative.parts)
                 if member.isdir():
                     destination.mkdir(parents=True, exist_ok=False)
-                    os.chmod(destination, 0o755)
-                elif member.isreg():
+                    os.chmod(destination, trusted_mode)
+                else:
                     destination.parent.mkdir(parents=True, exist_ok=True)
                     descriptor = os.open(
                         destination,
                         os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-                        0o644,
+                        trusted_mode,
                     )
                     stream = source.extractfile(member)
                     if stream is None:
                         os.close(descriptor)
-                        raise ArchiveContractError(f"could not read archive member: {name}")
+                        raise ArchiveContractError(f"could not read archive member: {member.name}")
                     with os.fdopen(descriptor, "wb") as output:
                         shutil.copyfileobj(stream, output, length=1024 * 1024)
-                    os.chmod(destination, 0o644)
+                    os.chmod(destination, trusted_mode)
                     extracted += 1
-                else:
-                    raise ArchiveContractError(
-                        f"runtime recovery archive member is not a directory or regular file: {name}"
-                    )
         if not extracted or not (temporary / "runtime-recovery.json").is_file():
             raise ArchiveContractError("runtime recovery extraction did not produce its manifest")
         os.replace(temporary, args.destination)

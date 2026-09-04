@@ -43,9 +43,14 @@
 #   the payload should use --legacy-connected-install instead of
 #   silently ignoring their own --skip flag).
 #
-# Foundation E3's real apply() needs the restored app's Django
-# environment (it runs as a manage.py command) -- this stage therefore
-# runs AFTER 60-python.sh in restore.sh's order, same as it always has.
+# Foundation E3's real apply() needs a Django environment to run as a
+# manage.py command -- this stage therefore runs AFTER 60-python.sh in
+# restore.sh's order, same as it always has. That command always comes
+# from THIS checkout, never $RESTORE_TARGET_ROOT's own possibly-older
+# copy -- only the Python interpreter running it comes from the restored
+# target's venv, and only once verified compatible with this checkout's
+# requirements.txt. See lib.sh's restore_manage / restore_manage.py's own
+# docstring (Runtime Foundation E7C) for the full split.
 #
 # Usage:
 #   deploy/restore/70-tts.sh --archive PATH [--plan|--apply]
@@ -114,16 +119,16 @@ if [ "$USE_RECOVERY_PAYLOAD" -eq 1 ]; then
 
   if [ "$RESTORE_MODE" != "apply" ]; then
     log_plan "locate + validate the runtime-recovery/ payload embedded in $RESTORE_ARCHIVE"
-    log_plan "manage.py provision_runtime_components --recovery-payload <payload>/tts --target-root $TTS_TARGET_ROOT --apply"
+    log_plan "restore_manage provision_runtime_components --recovery-payload <payload>/tts --target-root $TTS_TARGET_ROOT --apply"
     log_info "70-tts: PLAN complete"
     exit 0
   fi
 
-  VENV_PYTHON="$RESTORE_TARGET_ROOT/venv/bin/python"
-  if [ ! -x "$VENV_PYTHON" ]; then
-    log_error "$VENV_PYTHON not found -- run 60-python.sh first (it runs before this stage already, see deploy/restore/README.md's dependency map)."
-    exit 1
-  fi
+  # restore_manage (lib.sh) owns the venv-python and .env preconditions
+  # (and whether that venv is even compatible with this checkout's
+  # requirements.txt) with one shared, clear diagnostic -- this stage
+  # only needs its own ordering precondition: has 20-application.sh
+  # actually reconstructed the target checkout yet.
   if [ ! -f "$RESTORE_TARGET_ROOT/manage.py" ]; then
     log_error "$RESTORE_TARGET_ROOT/manage.py not found -- run 20-application.sh first."
     exit 1
@@ -140,8 +145,8 @@ if [ "$USE_RECOVERY_PAYLOAD" -eq 1 ]; then
     exit 1
   fi
 
-  log_apply "validating runtime-recovery payload at $PAYLOAD_DIR"
-  RECOVERY_EVIDENCE_JSON=$("$VENV_PYTHON" "$RESTORE_TARGET_ROOT/manage.py" validate_runtime_recovery_payload "$PAYLOAD_DIR" --json)
+  log_apply "restore_manage validate_runtime_recovery_payload $PAYLOAD_DIR --json"
+  RECOVERY_EVIDENCE_JSON=$(restore_manage validate_runtime_recovery_payload "$PAYLOAD_DIR" --json)
 
   if [ ! -d "$PAYLOAD_DIR/tts" ]; then
     log_warn "Recovery payload has no tts/ component -- not self-contained for TTS disaster recovery (this station's operator-established recovery policy did not include TTS in the prepared payload, or only native fdkaac was included). See docs/RUNTIME_BACKUP_PAYLOAD.md."
@@ -149,11 +154,11 @@ if [ "$USE_RECOVERY_PAYLOAD" -eq 1 ]; then
     exit 0
   fi
 
-  log_apply "manage.py provision_runtime_components --recovery-payload $PAYLOAD_DIR --target-root $TTS_TARGET_ROOT --apply"
-  ( cd "$RESTORE_TARGET_ROOT" && "$VENV_PYTHON" manage.py provision_runtime_components \
+  log_apply "restore_manage provision_runtime_components --recovery-payload $PAYLOAD_DIR --target-root $TTS_TARGET_ROOT --apply"
+  restore_manage provision_runtime_components \
       --recovery-payload "$PAYLOAD_DIR" \
       --target-root "$TTS_TARGET_ROOT" \
-      --apply )
+      --apply
 
   mapfile -t RECOVERED_TTS_COMPONENTS < <(
     python3 -c 'import json,sys; print("\n".join(json.loads(sys.argv[1]).get("tts_components", [])))' "$RECOVERY_EVIDENCE_JSON"

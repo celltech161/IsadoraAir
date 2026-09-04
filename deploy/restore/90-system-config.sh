@@ -24,9 +24,37 @@
 # silently skipped) while systemd-analyze verify (which needs no
 # installation context) still runs either way.
 #
+# Runtime Foundation E7D (2026-09-04): an isolated --staging-root target
+# has no /etc/passwd of its own to resolve a named service identity from
+# (--isa-user alone cannot establish one there -- see 95-validate.sh's
+# own header and isadoraair/runtime_scratch.py's module docstring for
+# why looking the name up against the INSTALLER HOST's own /etc/passwd
+# would be wrong: that identity belongs to whoever is running this
+# restore, not necessarily the target station's eventual service
+# account). --isa-uid/--isa-gid (an explicit, trusted, all-or-nothing
+# numeric pair -- the same contract check_deploy_baseline's own
+# --isa-uid/--isa-gid and isadoraair/runtime_scratch.resolve_expected_
+# identity() already enforce) lets a caller supply that identity
+# directly instead. Staging defaults the pair to the caller's own
+# uid/gid when not given, since that is the only identity an
+# unprivileged staging run could actually chown anything to anyway.
+#
+# This stage also establishes the legacy scratch-tmpfiles surface
+# (/run/isadoraair, /run/isadoraair/tts -- the pre-existing deploy/
+# isadoraair-tmpfiles.conf / @@ISA_USER@@ convention Runtime Foundation
+# E5 deliberately excludes, see section 4 below and isadoraair/
+# runtime_scratch.py) INSIDE an isolated staging root, using that same
+# trusted identity: a real host gets these for free from systemd itself
+# at boot (this stage already renders the declarative isadoraair.conf
+# tmpfiles.d file that produces them there); a --staging-root tree is
+# never booted, so nothing else would ever create them. This is NOT
+# service activation and does not start, enable, or reload anything --
+# it establishes exactly the directories the existing tmpfiles.conf
+# declares, never a second, competing authority for them.
+#
 # Usage:
 #   deploy/restore/90-system-config.sh [--plan|--apply] [--staging-root PATH]
-#     [--isa-user USER] [--isa-home PATH]
+#     [--isa-user USER] [--isa-uid UID --isa-gid GID] [--isa-home PATH]
 #     [--syndicated-root PATH] [--weather-root PATH] [--ogremote-root PATH]
 set -euo pipefail
 
@@ -39,6 +67,8 @@ restore_parse_common_args "$@"
 set -- "${RESTORE_REMAINING_ARGS[@]}"
 
 ISA_USER="$(id -un)"
+ISA_UID=""
+ISA_GID=""
 ISA_HOME="$HOME"
 SYNDICATED_ROOT=""
 WEATHER_ROOT=""
@@ -47,6 +77,10 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --isa-user) ISA_USER="${2:?}"; shift 2 ;;
     --isa-user=*) ISA_USER="${1#*=}"; shift ;;
+    --isa-uid) ISA_UID="${2:?}"; shift 2 ;;
+    --isa-uid=*) ISA_UID="${1#*=}"; shift ;;
+    --isa-gid) ISA_GID="${2:?}"; shift 2 ;;
+    --isa-gid=*) ISA_GID="${1#*=}"; shift ;;
     --isa-home) ISA_HOME="${2:?}"; shift 2 ;;
     --isa-home=*) ISA_HOME="${1#*=}"; shift ;;
     --syndicated-root) SYNDICATED_ROOT="${2:?}"; shift 2 ;;
@@ -58,6 +92,29 @@ while [ $# -gt 0 ]; do
     *) log_error "90-system-config.sh: unrecognized argument: $1"; exit 2 ;;
   esac
 done
+
+# --isa-uid/--isa-gid: an explicit, trusted, all-or-nothing numeric pair
+# -- the same contract check_deploy_baseline's own --isa-uid/--isa-gid
+# and isadoraair/runtime_scratch.resolve_expected_identity() already
+# enforce, threaded through here so this stage's own legacy-scratch-
+# surface establishment (section 4b below) and 95-validate.sh's later
+# validation of it agree on the SAME identity.
+if { [ -n "$ISA_UID" ] && [ -z "$ISA_GID" ]; } || { [ -z "$ISA_UID" ] && [ -n "$ISA_GID" ]; }; then
+  log_error "90-system-config.sh: --isa-uid and --isa-gid must be supplied together"
+  exit 2
+fi
+if [ -n "$ISA_UID" ]; then
+  case "$ISA_UID" in ''|*[!0-9]*) log_error "90-system-config.sh: --isa-uid must be a non-negative integer"; exit 2 ;; esac
+  case "$ISA_GID" in ''|*[!0-9]*) log_error "90-system-config.sh: --isa-gid must be a non-negative integer"; exit 2 ;; esac
+elif [ -n "$RESTORE_STAGING_ROOT" ]; then
+  # Not explicitly supplied: default to the caller's own identity under
+  # staging -- the only identity an unprivileged staging run could ever
+  # actually chown the scratch surface to anyway (see
+  # ensure_confined_directory in lib.sh). A REAL (non-staging) install
+  # never uses ISA_UID/ISA_GID at all -- section 4b below is staging-only.
+  ISA_UID="$(id -u)"
+  ISA_GID="$(id -g)"
+fi
 COMPANIONS_ROOT="${RESTORE_STAGING_ROOT:-$HOME}"
 [ -z "$SYNDICATED_ROOT" ] && SYNDICATED_ROOT="$COMPANIONS_ROOT/syndicated-ingest"
 [ -z "$WEATHER_ROOT" ] && WEATHER_ROOT="$COMPANIONS_ROOT/weather-ingest"
@@ -74,7 +131,7 @@ else
   ETC_ROOT="/etc"
   USE_SUDO=1
 fi
-log_info "ISA_USER=$ISA_USER ISA_ROOT=$ISA_ROOT ISA_HOME=$ISA_HOME"
+log_info "ISA_USER=$ISA_USER ISA_ROOT=$ISA_ROOT ISA_HOME=$ISA_HOME${ISA_UID:+ ISA_UID=$ISA_UID ISA_GID=$ISA_GID}"
 log_info "Rendering into: $ETC_ROOT"
 
 render() {
@@ -190,7 +247,7 @@ else
   E5_TARGET_ROOT="/"
 fi
 VENV_PY="$ISA_ROOT/venv/bin/python"
-if [ -x "$VENV_PY" ] && [ -f "$ISA_ROOT/manage.py" ]; then
+if [ -x "$VENV_PY" ] && [ -f "$ISA_ROOT/manage.py" ] && [ -f "$ISA_ROOT/.env" ]; then
   # Preferred: the venv + application checkout this stage needs are
   # already in place (20-application.sh + 60-python.sh both run before
   # this stage) -- invoke Runtime Foundation E5's own reusable API via
@@ -198,32 +255,37 @@ if [ -x "$VENV_PY" ] && [ -f "$ISA_ROOT/manage.py" ]; then
   # mkdir/chown/chmod-and-render-tmpfiles implementation here. This is
   # the SAME renderer apply/validate both already use, so nothing
   # rendered by restore can ever disagree with what E5's own validation
-  # later expects.
+  # later expects. restore_manage_command (lib.sh) makes THIS checkout's
+  # provision_runtime_components authoritative here too -- never
+  # $ISA_ROOT/manage.py's own possibly-older copy -- exactly like every
+  # other stage that provisions/repairs runtime state (50/70/75); only
+  # the restored venv's Python interpreter comes from $ISA_ROOT, and only
+  # after it is verified compatible with this checkout's requirements.txt.
   E5_MODE_FLAG="--plan"
   [ "$RESTORE_MODE" = "apply" ] && E5_MODE_FLAG="--apply"
-  E5_CMD=("$VENV_PY" manage.py provision_runtime_components --surfaces "$E5_MODE_FLAG" --target-root "$E5_TARGET_ROOT")
+  restore_manage_command provision_runtime_components --surfaces "$E5_MODE_FLAG" --target-root "$E5_TARGET_ROOT"
+  E5_CMD=("${RESTORE_MANAGE_CMD[@]}")
+  if [ "$USE_SUDO" -eq 1 ]; then
+    E5_CMD=(sudo "${E5_CMD[@]}")
+  fi
   if [ "$RESTORE_MODE" = "apply" ]; then
     log_apply "${E5_CMD[*]}"
   else
     log_plan "${E5_CMD[*]}"
   fi
-  if [ "$USE_SUDO" -eq 1 ]; then
-    ( cd "$ISA_ROOT" && sudo "${E5_CMD[@]}" )
-  else
-    ( cd "$ISA_ROOT" && "${E5_CMD[@]}" )
-  fi
+  "${E5_CMD[@]}"
   log_info "Runtime Foundation E5 system surfaces: $( [ "$RESTORE_MODE" = apply ] && echo "established (launcher, runtime/data directories, tmpfiles config+execution)" || echo "plan reported above" )."
 else
-  # Fallback: this stage is being run before 60-python.sh has created the
-  # venv (e.g. re-running just this stage in isolation) -- a minimal,
-  # direct install of the Git-owned tmpfiles file only, so
-  # /etc/tmpfiles.d/isadoraair-runtime.conf at least exists at its
+  # Fallback: this stage is being run before 60-python.sh/20-application.sh
+  # have made the venv/.env available (e.g. re-running just this stage in
+  # isolation) -- a minimal, direct install of the Git-owned tmpfiles file
+  # only, so /etc/tmpfiles.d/isadoraair-runtime.conf at least exists at its
   # correct destination. This does NOT create /opt/isadoraair-runtime or
   # /var/lib/isadoraair/tts, and does NOT run systemd-tmpfiles -- later
   # validation (manage.py check_deploy_baseline, or re-running this stage
-  # once the venv exists) is what converges the rest through E5's own
+  # once the venv/.env exist) is what converges the rest through E5's own
   # authority. Never a second, competing establishing mechanism.
-  log_warn "Runtime Foundation E5: $VENV_PY or $ISA_ROOT/manage.py not yet available at this stage -- falling back to a minimal direct install of deploy/isadoraair-runtime-tmpfiles.conf only. Run 60-python.sh, then re-run this stage, for the full E5 surface contract to converge."
+  log_warn "Runtime Foundation E5: $VENV_PY, $ISA_ROOT/manage.py, or $ISA_ROOT/.env not yet available at this stage -- falling back to a minimal direct install of deploy/isadoraair-runtime-tmpfiles.conf only. Run 20-application.sh and 60-python.sh, then re-run this stage, for the full E5 surface contract to converge."
   if [ -n "$RESTORE_STAGING_ROOT" ]; then
     E5_SURFACE_UID="$(id -u)"
     E5_SURFACE_GID="$(id -g)"
@@ -255,6 +317,39 @@ else
     fi
     rm -f "$E5_TMP"
     log_info "Runtime Foundation E5: tmpfiles config file installed only -- re-run this stage after 60-python.sh for full establishment (directories + real systemd-tmpfiles execution + the installed launcher)."
+  fi
+fi
+
+# ---- 4b. Legacy scratch surface (/run/isadoraair, /run/isadoraair/tts)
+#      -- staging only -------------------------------------------------
+# isadoraair/runtime_scratch.py's own module docstring: this TTS scratch
+# surface is deliberately NOT part of Runtime Foundation E5 (section 4
+# above) -- it stays owned by the pre-existing deploy/isadoraair-
+# tmpfiles.conf / @@ISA_USER@@ convention, whose config file section 1
+# above already rendered to $ETC_ROOT/tmpfiles.d/isadoraair.conf. This
+# establishes exactly the two directories that file declares
+# (`d /run/isadoraair 0755 ...` / `d /run/isadoraair/tts 0700 ...`) --
+# not a second, competing authority for them, and not service
+# activation: nothing is started, enabled, or reloaded.
+#
+# On a REAL (non-staging) host this is a no-op: systemd itself creates
+# these from that same rendered config at boot, using the real service
+# account's real /etc/passwd entry -- this stage never needs to (and
+# does not) fabricate them there, and never invents a Unix account.
+# A --staging-root tree is never booted, so nothing else ever creates
+# them there -- hence this section, gated on --staging-root only, using
+# the SAME trusted ISA_UID/ISA_GID identity resolved above (explicit
+# --isa-uid/--isa-gid, or the caller's own identity by default).
+if [ -n "$RESTORE_STAGING_ROOT" ]; then
+  SCRATCH_RUN_DIR="$RESTORE_STAGING_ROOT/run/isadoraair"
+  SCRATCH_TTS_DIR="$SCRATCH_RUN_DIR/tts"
+  if [ "$RESTORE_MODE" != "apply" ]; then
+    log_plan "establish $SCRATCH_RUN_DIR (0755, owner $ISA_UID:$ISA_GID) and $SCRATCH_TTS_DIR (0700, owner $ISA_UID:$ISA_GID) -- legacy isadoraair-tmpfiles.conf scratch surface, staging only"
+  else
+    log_apply "establish $SCRATCH_RUN_DIR (0755) and $SCRATCH_TTS_DIR (0700), owner $ISA_UID:$ISA_GID"
+    ensure_confined_directory "$RESTORE_STAGING_ROOT" "$SCRATCH_RUN_DIR" 0755 "$ISA_UID" "$ISA_GID"
+    ensure_confined_directory "$RESTORE_STAGING_ROOT" "$SCRATCH_TTS_DIR" 0700 "$ISA_UID" "$ISA_GID"
+    log_info "Legacy scratch surface established under staging root (deploy/isadoraair-tmpfiles.conf authority; not service activation -- nothing started/enabled/reloaded)."
   fi
 fi
 

@@ -36,6 +36,12 @@
 # Phase 5's clean-machine drill, not for exercising Phase 4 itself.
 set -euo pipefail
 
+# The current restore checkout's own root -- computed once from lib.sh's
+# own location, since every stage script sources lib.sh from the same
+# tree. This is the recovery SOURCE authority (see restore_manage below);
+# never confuse it with $RESTORE_TARGET_ROOT, the tree being restored.
+RESTORE_REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+
 # ---------------------------------------------------------------------
 # Logging -- plain, timestamped, no color codes (these scripts are as
 # likely to be read from a journalctl/redirected-file transcript during
@@ -224,6 +230,88 @@ guard_never_touch_music_library() {
   esac
 }
 
+# ---------------------------------------------------------------------
+# ensure_confined_directory ROOT TARGET MODE UID GID
+#
+# Runtime Foundation E7D (2026-09-04) -- the shared, confined directory-
+# establishment primitive 90-system-config.sh uses to build the legacy
+# scratch-tmpfiles surface (/run/isadoraair, /run/isadoraair/tts) inside
+# an isolated --staging-root, mirroring isadoraair/runtime_native.py's
+# _ensure_noncanonical_publication_directories -- the Python-side sibling
+# of this exact same safety contract for E4's native-publication target
+# skeleton. See that function's own docstring for the parallel reasoning.
+#
+# Creates TARGET (and any missing ancestor between ROOT and TARGET) as a
+# real, non-symlink directory, one path component at a time:
+#   - ROOT itself must already be a real, non-symlink, existing directory.
+#   - TARGET must fall beneath ROOT -- anything else is refused before
+#     touching the filesystem at all (this is what keeps a staging
+#     establish from ever reaching the real host /run).
+#   - Each EXISTING ancestor component is validated as a real,
+#     non-symlink directory and left otherwise untouched (never
+#     chmodded/chowned merely because it already existed).
+#   - Each MISSING ancestor component is created fresh at a fixed, safe
+#     0755 mode.
+#   - TARGET itself (the final component) always gets MODE/UID:GID
+#     explicitly (re-)asserted, whether newly created or pre-existing --
+#     this mirrors what a tmpfiles.d `d` line itself does at every boot,
+#     since this establishes the exact directories deploy/isadoraair-
+#     tmpfiles.conf already declares, never a second competing authority
+#     for them.
+# Never follows or replaces a symlink; never deletes anything. Fails
+# closed (logs a clear diagnostic and exits 1) on any symlink ancestor,
+# non-directory collision, an escape outside ROOT, or an ownership this
+# caller cannot actually establish (e.g. an unprivileged staging run
+# requesting a UID/GID other than its own) -- NEVER silently substitutes
+# a different identity than the one requested.
+ensure_confined_directory() {
+  local root="$1" target="$2" mode="$3" uid="$4" gid="$5"
+  if [ -L "$root" ] || [ ! -d "$root" ]; then
+    log_error "ensure_confined_directory: root is not a real, existing directory: $root"
+    exit 1
+  fi
+  case "$target" in
+    "$root"|"$root"/*) ;;
+    *) log_error "ensure_confined_directory: $target escapes root $root"; exit 1 ;;
+  esac
+  local relative="${target#"$root"}"
+  relative="${relative#/}"
+  local cursor="$root"
+  local parts=()
+  if [ -n "$relative" ]; then
+    IFS='/' read -ra parts <<< "$relative"
+  fi
+  local part
+  for part in "${parts[@]}"; do
+    [ -z "$part" ] && continue
+    cursor="$cursor/$part"
+    if [ -L "$cursor" ]; then
+      log_error "ensure_confined_directory: unexpected symlink at $cursor"
+      exit 1
+    fi
+    if [ -e "$cursor" ]; then
+      if [ ! -d "$cursor" ]; then
+        log_error "ensure_confined_directory: $cursor exists and is not a directory"
+        exit 1
+      fi
+    else
+      if ! mkdir -m 0755 "$cursor" 2>/dev/null || [ -L "$cursor" ] || [ ! -d "$cursor" ]; then
+        log_error "ensure_confined_directory: failed to create a real directory at $cursor"
+        exit 1
+      fi
+    fi
+  done
+  if [ -L "$target" ] || [ ! -d "$target" ]; then
+    log_error "ensure_confined_directory: $target is not a plain directory"
+    exit 1
+  fi
+  chmod "$mode" "$target"
+  if ! chown "$uid:$gid" "$target" 2>/dev/null; then
+    log_error "ensure_confined_directory: cannot set ownership $uid:$gid on $target -- this caller does not have permission to establish that identity here (an unprivileged staging run can normally only chown to its own uid/gid). Supply --isa-uid/--isa-gid matching an identity this run can actually establish, or run with sufficient privilege. Never silently substituting a different identity."
+    exit 1
+  fi
+}
+
 # do_or_plan CMD... -- runs CMD only in --apply mode; in --plan mode,
 # logs what would run and returns success without executing it. Every
 # stage script's actual filesystem/DB/systemctl mutations go through
@@ -268,8 +356,8 @@ require_cmd() {
 # payload. The stdlib-only helper performs pre-extraction archive-member
 # validation and atomic confined extraction; system tar never writes these
 # root-trusted payload bytes.
-# Stages 50 (native fdkaac) and 70 (TTS) are the only callers; neither
-# guesses the archive layout independently -- see task step 15 /
+# Stages 50 (native fdkaac), 70 (TTS), and 75 (protected updater) are
+# the only callers; none guesses the archive layout independently -- see task step 15 /
 # docs/DISASTER_RECOVERY_RESTORE.md's "Runtime recovery payload" section.
 #
 # restore_locate_recovery_payload DEST_DIR
@@ -339,4 +427,81 @@ restore_accept_recovery_receipt() {
   receipt=$(restore_recovery_receipt_path)
   local helper="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/runtime_recovery_archive.py"
   python3 "$helper" accept --archive "$RESTORE_ARCHIVE" --receipt "$receipt"
+}
+
+# ---------------------------------------------------------------------
+# Restore management authority (Runtime Foundation E7C, 2026-09-04).
+#
+# Stages 50 (native fdkaac), 70 (TTS), 75 (protected updater), and 90 (E5
+# system surfaces) all REPAIR or PROVISION runtime state by invoking a
+# manage.py management command against the restored target. Naively
+# running "$RESTORE_TARGET_ROOT/venv/bin/python" "$RESTORE_TARGET_ROOT/
+# manage.py" -- as every one of them once did -- makes the RESTORED
+# BACKUP's OWN recovery code authoritative for its own repair: a newer
+# restore checkout can no longer fix a defect in an older, otherwise-
+# compatible backup's runtime-recovery implementation, because the fix
+# never runs -- the backup's stale copy of the same command does. This
+# is not acceptable for backward-compatible disaster recovery.
+#
+# restore_manage CMD [ARGS...] is the one shared call every stage that
+# needs to run a manage.py command against a restored target should use
+# instead of inventing its own venv/manage.py invocation. It runs
+# restore_manage.py (a stdlib-only helper, see that file's own docstring
+# for the full contract), which:
+#   - always executes THIS checkout's manage.py ($RESTORE_REPO_ROOT) --
+#     never $RESTORE_TARGET_ROOT/manage.py, no matter what;
+#   - under the RESTORED target's own venv Python interpreter (it already
+#     has Django + every runtime dependency 60-python.sh installed), but
+#     ONLY after verifying that interpreter's installed packages exactly
+#     satisfy THIS checkout's own requirements.txt pins -- on any
+#     mismatch this fails closed (nonzero exit, logged below) and NEVER
+#     falls back to the restored target's own manage.py;
+#   - relays $RESTORE_TARGET_ROOT/.env into the real OS environment
+#     first, so the restored station's own configuration/secrets remain
+#     authoritative for the command about to run (python-decouple's
+#     config() always checks os.environ before any file -- see
+#     restore_manage.py's own docstring) without ever copying .env into
+#     this checkout and without decouple's own file-search risking a
+#     stray developer/sandbox .env instead. Anything the caller's own
+#     shell already exported (e.g. this file's own DB_NAME staging
+#     override above) is left untouched -- it already wins by the exact
+#     same os.environ-first rule.
+#
+# $RESTORE_TARGET_ROOT/venv and $RESTORE_TARGET_ROOT/.env must already
+# exist (60-python.sh, 20-application.sh) -- checked here with the same
+# clear diagnostics every stage already gave inline, so no caller-visible
+# behavior changes for that failure mode.
+#
+# restore_manage_command populates the global array RESTORE_MANAGE_CMD
+# with the fully-resolved argv (never executes it) -- use this directly,
+# instead of restore_manage below, when the caller needs to run the
+# result under sudo (bash functions aren't visible to a separate sudo
+# process; a real argv is) -- see 75-protected-updater.sh's real
+# (non-staging) publish path for the one caller that needs this.
+restore_manage_command() {
+  local venv_python="$RESTORE_TARGET_ROOT/venv/bin/python"
+  if [ ! -x "$venv_python" ]; then
+    log_error "restore_manage: $venv_python not found -- run 60-python.sh first (it builds the restored target's Python environment that this checkout's recovery authority runs under)."
+    exit 1
+  fi
+  if [ ! -f "$RESTORE_TARGET_ROOT/.env" ]; then
+    log_error "restore_manage: $RESTORE_TARGET_ROOT/.env not found -- run 20-application.sh first."
+    exit 1
+  fi
+  local helper="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/restore_manage.py"
+  RESTORE_MANAGE_CMD=(
+    "$venv_python" "$helper"
+    --repo-root "$RESTORE_REPO_ROOT"
+    --target-root "$RESTORE_TARGET_ROOT"
+    -- "$@"
+  )
+}
+
+# restore_manage CMD [ARGS...] -- resolves + immediately runs. The
+# ordinary case every caller except 75-protected-updater.sh's real-root
+# publish step (sudo) wants.
+restore_manage() {
+  local RESTORE_MANAGE_CMD=()
+  restore_manage_command "$@"
+  "${RESTORE_MANAGE_CMD[@]}"
 }

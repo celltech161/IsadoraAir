@@ -15,14 +15,17 @@ import os
 import io
 import json
 import shutil
+import stat
 import subprocess
+import sys
 import tarfile
 import tempfile
 from pathlib import Path
 
 from django.test import SimpleTestCase
 
-RESTORE_DIR = Path(__file__).resolve().parent.parent.parent / "deploy" / "restore"
+REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+RESTORE_DIR = REPO_ROOT / "deploy" / "restore"
 STAGE_SCRIPTS = sorted(RESTORE_DIR.glob("*.sh"))
 
 
@@ -716,6 +719,14 @@ class RestoreLocateRecoveryPayloadFunctionalTests(SimpleTestCase):
         self.addCleanup(shutil.rmtree, self.tmpdir, ignore_errors=True)
 
     def _build_archive(self, workdir: Path, out_path: Path):
+        payload = workdir / "runtime-recovery"
+        if payload.is_dir():
+            payload.chmod(0o755)
+            for path in payload.rglob("*"):
+                if path.is_dir():
+                    path.chmod(0o755)
+                elif path.is_file() and (path.stat().st_mode & 0o777) not in (0o644, 0o755):
+                    path.chmod(0o644)
         with tarfile.open(out_path, "w:gz") as tf:
             tf.add(workdir, arcname=".")
 
@@ -769,6 +780,127 @@ class RestoreLocateRecoveryPayloadFunctionalTests(SimpleTestCase):
         # Landed directly at dest -- no leftover "runtime-recovery/" prefix.
         self.assertFalse((dest / "runtime-recovery").exists())
 
+    def test_archive_extraction_preserves_only_the_trusted_file_modes(self):
+        workdir = self.tmpdir / "mode-work"
+        payload = workdir / "runtime-recovery"
+        payload.mkdir(parents=True)
+        regular = payload / "runtime-recovery.json"
+        regular.write_text('{"payload_id": "p1"}')
+        regular.chmod(0o644)
+        executable = payload / "protected-updater" / "updaterd.py"
+        executable.parent.mkdir()
+        executable.write_text("#!/usr/bin/env python3\n")
+        executable.chmod(0o755)
+        self._write_v3_metadata(workdir)
+        archive = self.tmpdir / "trusted-modes.tar.gz"
+        self._build_archive(workdir, archive)
+
+        destination = self.tmpdir / "trusted-modes-output"
+        result = self._locate(archive, destination)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(regular.stat().st_mode & 0o777, 0o644)
+        self.assertEqual((destination / "runtime-recovery.json").stat().st_mode & 0o777, 0o644)
+        self.assertEqual((destination / "protected-updater" / "updaterd.py").stat().st_mode & 0o777, 0o755)
+        self.assertEqual(destination.stat().st_mode & 0o777, 0o755)
+
+    def test_archive_extraction_rejects_writable_and_unrecognized_file_modes(self):
+        metadata_root = self.tmpdir / "mode-meta"
+        metadata_root.mkdir()
+        self._write_v3_metadata(metadata_root)
+        for mode in (0o444, 0o600, 0o664, 0o700, 0o777, 0o4755):
+            with self.subTest(mode=f"{mode:04o}"):
+                archive = self.tmpdir / f"untrusted-mode-{mode:04o}.tar.gz"
+                with tarfile.open(archive, "w:gz") as tf:
+                    tf.add(
+                        metadata_root / "runtime-recovery-archive.json",
+                        arcname="runtime-recovery-archive.json",
+                    )
+                    root = tarfile.TarInfo("runtime-recovery/")
+                    root.type = tarfile.DIRTYPE
+                    root.mode = 0o755
+                    tf.addfile(root)
+                    member = tarfile.TarInfo("runtime-recovery/runtime-recovery.json")
+                    member.mode = mode
+                    member.size = 2
+                    tf.addfile(member, io.BytesIO(b"{}"))
+                destination = self.tmpdir / f"untrusted-mode-output-{mode:04o}"
+                result = self._locate(archive, destination)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f"untrusted mode {mode:04o}", result.stderr)
+                self.assertFalse(destination.exists())
+
+    def test_archive_extraction_rejects_executable_mode_outside_protected_updater(self):
+        metadata_root = self.tmpdir / "executable-meta"
+        metadata_root.mkdir()
+        self._write_v3_metadata(metadata_root)
+        archive = self.tmpdir / "unexpected-executable.tar.gz"
+        with tarfile.open(archive, "w:gz") as tf:
+            tf.add(metadata_root / "runtime-recovery-archive.json", arcname="runtime-recovery-archive.json")
+            root = tarfile.TarInfo("runtime-recovery/")
+            root.type = tarfile.DIRTYPE
+            root.mode = 0o755
+            tf.addfile(root)
+            member = tarfile.TarInfo("runtime-recovery/runtime-recovery.json")
+            member.mode = 0o755
+            member.size = 2
+            tf.addfile(member, io.BytesIO(b"{}"))
+
+        destination = self.tmpdir / "unexpected-executable-output"
+        result = self._locate(archive, destination)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("untrusted mode 0755, expected 0644", result.stderr)
+        self.assertFalse(destination.exists())
+
+    def test_archive_extraction_rejects_untrusted_directory_mode(self):
+        metadata_root = self.tmpdir / "directory-mode-meta"
+        metadata_root.mkdir()
+        self._write_v3_metadata(metadata_root)
+        archive = self.tmpdir / "untrusted-directory-mode.tar.gz"
+        with tarfile.open(archive, "w:gz") as tf:
+            tf.add(metadata_root / "runtime-recovery-archive.json", arcname="runtime-recovery-archive.json")
+            root = tarfile.TarInfo("runtime-recovery/")
+            root.type = tarfile.DIRTYPE
+            root.mode = 0o775
+            tf.addfile(root)
+
+        destination = self.tmpdir / "untrusted-directory-output"
+        result = self._locate(archive, destination)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("untrusted mode 0775, expected 0755", result.stderr)
+        self.assertFalse(destination.exists())
+
+    def test_archive_ownership_metadata_is_not_applied(self):
+        metadata_root = self.tmpdir / "owner-meta"
+        metadata_root.mkdir()
+        self._write_v3_metadata(metadata_root)
+        archive = self.tmpdir / "untrusted-owner.tar.gz"
+        with tarfile.open(archive, "w:gz") as tf:
+            tf.add(metadata_root / "runtime-recovery-archive.json", arcname="runtime-recovery-archive.json")
+            root = tarfile.TarInfo("runtime-recovery/")
+            root.type = tarfile.DIRTYPE
+            root.mode = 0o755
+            root.uid = 12345
+            root.gid = 23456
+            tf.addfile(root)
+            member = tarfile.TarInfo("runtime-recovery/runtime-recovery.json")
+            member.mode = 0o644
+            member.uid = 12345
+            member.gid = 23456
+            member.size = 2
+            tf.addfile(member, io.BytesIO(b"{}"))
+
+        destination = self.tmpdir / "owner-output"
+        result = self._locate(archive, destination)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(destination.stat().st_uid, os.geteuid())
+        self.assertEqual(destination.stat().st_gid, os.getegid())
+        self.assertEqual((destination / "runtime-recovery.json").stat().st_uid, os.geteuid())
+        self.assertEqual((destination / "runtime-recovery.json").stat().st_gid, os.getegid())
+
     def test_archive_without_runtime_recovery_reports_not_found_not_error(self):
         """A v2.x-style archive (or a v3 archive backed up with no
         current payload configured) -- this must be a clean, non-fatal
@@ -820,6 +952,7 @@ class RestoreLocateRecoveryPayloadFunctionalTests(SimpleTestCase):
             tf.add(metadata_root / "runtime-recovery-archive.json", arcname="runtime-recovery-archive.json")
             root = tarfile.TarInfo("runtime-recovery/")
             root.type = tarfile.DIRTYPE
+            root.mode = 0o755
             tf.addfile(root)
             link = tarfile.TarInfo("runtime-recovery/runtime-recovery.json")
             link.type = tarfile.SYMTYPE
@@ -827,6 +960,27 @@ class RestoreLocateRecoveryPayloadFunctionalTests(SimpleTestCase):
             tf.addfile(link)
         result = self._locate(archive, self.tmpdir / "dest-symlink")
         self.assertNotEqual(result.returncode, 0)
+
+    def test_special_file_member_is_rejected_before_extraction(self):
+        archive = self.tmpdir / "special-file.tar.gz"
+        metadata_root = self.tmpdir / "meta-special-file"
+        metadata_root.mkdir()
+        self._write_v3_metadata(metadata_root)
+        with tarfile.open(archive, "w:gz") as tf:
+            tf.add(metadata_root / "runtime-recovery-archive.json", arcname="runtime-recovery-archive.json")
+            root = tarfile.TarInfo("runtime-recovery/")
+            root.type = tarfile.DIRTYPE
+            root.mode = 0o755
+            tf.addfile(root)
+            fifo = tarfile.TarInfo("runtime-recovery/runtime-recovery.json")
+            fifo.type = tarfile.FIFOTYPE
+            fifo.mode = 0o644
+            tf.addfile(fifo)
+        destination = self.tmpdir / "dest-special-file"
+        result = self._locate(archive, destination)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("not a directory or regular file", result.stderr)
+        self.assertFalse(destination.exists())
 
     def test_traversal_member_is_rejected_before_extraction(self):
         archive = self.tmpdir / "traversal.tar.gz"
@@ -1036,7 +1190,7 @@ class ProtectedUpdaterReceiptSemanticsTests(SimpleTestCase):
 
 
 class RuntimeFoundationE7BStageModeSelectionTests(SimpleTestCase):
-    """Real --plan executions of the rewritten 50/70 restore stages
+    """Real --plan executions of the rewritten 50/70/75 restore stages
     against a synthetic --archive, proving the archive-presence-driven
     mode selection actually runs (not just present in the source text)
     -- --plan is side-effect-free and needs no venv/DB, so this is cheap
@@ -1059,6 +1213,13 @@ class RuntimeFoundationE7BStageModeSelectionTests(SimpleTestCase):
             [str(RESTORE_DIR / script_name), "--plan", "--archive", str(self.archive_path), *extra_args],
             capture_output=True, text=True, timeout=15,
         )
+
+    def test_all_runtime_recovery_stages_use_the_shared_safe_extractor(self):
+        for script_name in ("50-native-deps.sh", "70-tts.sh", "75-protected-updater.sh"):
+            with self.subTest(script=script_name):
+                source = (RESTORE_DIR / script_name).read_text(encoding="utf-8")
+                self.assertIn('restore_locate_recovery_payload "$PAYLOAD_DIR"', source)
+                self.assertNotIn("runtime_recovery_archive.py", source)
 
     def test_native_deps_plan_with_archive_selects_the_recovery_payload_path(self):
         result = self._run("50-native-deps.sh")
@@ -1130,6 +1291,173 @@ class RuntimeFoundationE7BStageModeSelectionTests(SimpleTestCase):
         source = (RESTORE_DIR / "75-protected-updater.sh").read_text()
         for forbidden in ("github.com", "git clone", "git fetch", "curl ", "wget ", "pip install"):
             self.assertNotIn(forbidden, source, f"stage 75 must never reference {forbidden!r}")
+
+
+class RestoreManageSharedHelperTests(SimpleTestCase):
+    """Runtime Foundation E7C (2026-09-04): lib.sh's restore_manage /
+    restore_manage_command is the ONE shared mechanism stages 50/70/75/90
+    use to run a manage.py command against a restored target. Real
+    subprocess execution of lib.sh itself, against a fixture target whose
+    own manage.py is a deliberately broken decoy that must never run --
+    proving this checkout's own manage.py (never the target's) is what
+    actually executes, using the restored target's venv Python."""
+
+    def setUp(self):
+        self.tmpdir = Path(tempfile.mkdtemp(prefix="isadoraair-restore-manage-lib-test."))
+        self.addCleanup(shutil.rmtree, self.tmpdir, ignore_errors=True)
+        self.target = self.tmpdir / "target"
+        venv_bin = self.target / "venv" / "bin"
+        venv_bin.mkdir(parents=True)
+        # A wrapper (not a bare symlink) so argv[0] the interpreter itself
+        # sees is the REAL venv's own python path -- CPython's venv/site-
+        # packages detection keys off that path's own directory structure
+        # (looking for a sibling pyvenv.cfg), which a symlink living
+        # outside that real venv tree would not resolve correctly.
+        (venv_bin / "python").write_text(
+            f'#!/usr/bin/env bash\nexec "{sys.executable}" "$@"\n', encoding="utf-8"
+        )
+        (venv_bin / "python").chmod(0o755)
+        scratch = self.tmpdir / "scratch"
+        for sub in ("library", "waveforms", "weather", "reports"):
+            (scratch / sub).mkdir(parents=True)
+        self.env_file = self.target / ".env"
+        self.env_file.write_text(
+            "DEBUG=True\n"
+            "DB_USER=isadoraair\n"
+            "DB_PASSWORD=unused-check-does-not-connect\n"
+            f"LIBRARY_ROOT={scratch / 'library'}\n"
+            f"WAVEFORMS_DIR={scratch / 'waveforms'}\n"
+            f"WEATHER_DATA_DIR={scratch / 'weather'}\n"
+            f"REPORTS_ROOT={scratch / 'reports'}\n",
+            encoding="utf-8",
+        )
+        decoy = self.target / "manage.py"
+        decoy.write_text(
+            "import sys\nprint('DECOY-MANAGE-RAN-THIS-MUST-NEVER-HAPPEN')\nsys.exit(97)\n",
+            encoding="utf-8",
+        )
+
+    def _run(self, function_call: str):
+        script = (
+            'set -euo pipefail; '
+            f'source "{RESTORE_DIR / "lib.sh"}"; '
+            f'restore_parse_common_args --staging-root {self.tmpdir}/staging '
+            f'--target-root {self.target} --db-name isadoraair_restore_test --apply >/dev/null 2>&1; '
+            f'{function_call}'
+        )
+        return subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30)
+
+    def test_restore_manage_runs_this_checkout_never_the_decoy(self):
+        result = self._run("restore_manage check")
+        self.assertNotIn("DECOY-MANAGE-RAN-THIS-MUST-NEVER-HAPPEN", result.stdout + result.stderr)
+        self.assertNotEqual(result.returncode, 97)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_restore_manage_command_resolves_repo_root_to_this_checkout(self):
+        """restore_manage_command only resolves the OUTER invocation (of
+        restore_manage.py itself, which performs the compatibility probe
+        and only THEN execs the real manage.py) -- the --repo-root it
+        passes is what ultimately determines which manage.py runs, so
+        that is what must point at this checkout, never the target."""
+        result = self._run(
+            'restore_manage_command check; printf "ARGV:%s\\n" "${RESTORE_MANAGE_CMD[@]}"'
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"ARGV:{RESTORE_DIR / 'restore_manage.py'}", result.stdout)
+        self.assertIn("ARGV:--repo-root\nARGV:" + str(REPO_ROOT), result.stdout)
+        self.assertIn("ARGV:--target-root\nARGV:" + str(self.target), result.stdout)
+        self.assertNotIn(str(self.target / "manage.py"), result.stdout)
+
+    def test_restore_manage_fails_closed_without_venv(self):
+        shutil.rmtree(self.target / "venv")
+        result = self._run("restore_manage check")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("venv", result.stdout + result.stderr)
+        self.assertNotIn("DECOY-MANAGE-RAN-THIS-MUST-NEVER-HAPPEN", result.stdout + result.stderr)
+
+    def test_restore_manage_fails_closed_without_env(self):
+        self.env_file.unlink()
+        result = self._run("restore_manage check")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(".env", result.stdout + result.stderr)
+        self.assertNotIn("DECOY-MANAGE-RAN-THIS-MUST-NEVER-HAPPEN", result.stdout + result.stderr)
+
+    def test_restore_manage_fails_closed_on_incompatible_venv(self):
+        """A venv whose installed packages don't satisfy this checkout's
+        own requirements.txt must never silently fall back to the
+        restored target's own manage.py. Simulated cheaply: -I -S makes
+        the same real interpreter run with no site-packages at all, so
+        every pinned dependency (Django included) is "not installed" from
+        its point of view -- without needing to build a second real venv."""
+        stub = self.target / "venv" / "bin" / "python"
+        stub.unlink()
+        stub.write_text(f'#!/usr/bin/env bash\nexec {sys.executable} -I -S "$@"\n', encoding="utf-8")
+        stub.chmod(0o755)
+        result = self._run("restore_manage check")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("DECOY-MANAGE-RAN-THIS-MUST-NEVER-HAPPEN", result.stdout + result.stderr)
+
+
+class RestoreManageStageWiringTests(SimpleTestCase):
+    """Static source-identity checks: every stage that provisions/repairs
+    runtime state via a manage.py command must go through the shared
+    restore_manage/restore_manage_command helper -- never hand-roll
+    "$RESTORE_TARGET_ROOT/venv/bin/python" "$RESTORE_TARGET_ROOT/manage.py"
+    again, which is exactly the architectural defect this fix closes.
+    A regression back to that literal pattern in any of these four
+    stages must fail this test."""
+
+    OLD_PATTERN_FRAGMENTS = (
+        '"$VENV_PYTHON" "$RESTORE_TARGET_ROOT/manage.py"',
+        '"$VENV_PYTHON" manage.py',
+        '"$VENV_PY" manage.py',
+    )
+
+    def test_stages_50_70_75_90_use_the_shared_helper(self):
+        for script_name in ("50-native-deps.sh", "70-tts.sh", "75-protected-updater.sh", "90-system-config.sh"):
+            with self.subTest(script=script_name):
+                text = (RESTORE_DIR / script_name).read_text(encoding="utf-8")
+                self.assertTrue(
+                    "restore_manage " in text or "restore_manage_command " in text or "restore_manage\n" in text,
+                    f"{script_name} does not appear to call restore_manage/restore_manage_command",
+                )
+                for fragment in self.OLD_PATTERN_FRAGMENTS:
+                    self.assertNotIn(
+                        fragment, text,
+                        f"{script_name} still contains the old direct-delegation pattern {fragment!r}",
+                    )
+
+    def test_stage_95_deliberately_still_binds_to_the_restored_target(self):
+        """The one intentional exception: 95-validate.sh proves the
+        RESTORED application (its own migrations/checks/runtime contract,
+        exactly as installed) is internally self-consistent -- that is
+        only meaningful using the restored target's own manage.py, never
+        this checkout's. See that script's own header -- which now
+        explains this in prose (mentioning restore_manage BY NAME to
+        contrast with it), so the check below only needs to prove
+        restore_manage is never actually CALLED from executable code,
+        not that the string never appears anywhere in the file."""
+        text = (RESTORE_DIR / "95-validate.sh").read_text(encoding="utf-8")
+        self.assertIn('"$VENV_PY" manage.py check', text)
+        for lineno, line in enumerate(text.splitlines(), start=1):
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                continue
+            self.assertNotIn(
+                "restore_manage", line,
+                f"95-validate.sh:{lineno} actually invokes restore_manage: {line!r}",
+            )
+
+    def test_stage_80_never_actually_executes_manage_py(self):
+        """80-companions.sh only mentions manage.py in a documentation
+        comment (why weather-ingest must run after IsadoraAir) -- it must
+        never itself invoke it."""
+        text = (RESTORE_DIR / "80-companions.sh").read_text(encoding="utf-8")
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("#"):
+                continue
+            self.assertNotIn("manage.py", line)
 
 
 class RuntimeRecoveryArchiveClassificationTests(SimpleTestCase):
@@ -1258,10 +1586,10 @@ class RuntimeFoundationE5SystemConfigFunctionalTests(SimpleTestCase):
         self.addCleanup(shutil.rmtree, temporary.name, ignore_errors=True)
         self.staging = Path(temporary.name)
 
-    def _run(self, *args, timeout=60):
+    def _run(self, *args, timeout=60, env=None):
         return subprocess.run(
             [str(RESTORE_DIR / "90-system-config.sh"), "--staging-root", str(self.staging), *args],
-            capture_output=True, text=True, timeout=timeout,
+            capture_output=True, text=True, timeout=timeout, env=env,
         )
 
     def test_plan_mode_writes_nothing_and_previews_both_tmpfiles_destinations(self):
@@ -1301,18 +1629,37 @@ class RuntimeFoundationE5SystemConfigFunctionalTests(SimpleTestCase):
         provision_runtime_components --surfaces --apply. Proves BOTH
         the exact destination fix AND that the installed launcher
         embeds the canonical /opt/isadoraair -- never this staging
-        root's own mount prefix (task section 17's regression)."""
+        root's own mount prefix (task section 17's regression).
+
+        Runtime Foundation E7D: the preferred branch now also requires
+        $ISA_ROOT/.env to exist (restore_manage needs it to relay
+        config) -- a dedicated isolated app shell with its OWN .env
+        inside the staging tree (never the real checkout's own root, and
+        never a bare symlink to the whole project_root, which would put
+        a live .env inside the actual repository)."""
 
         project_root = RESTORE_DIR.parent.parent
-        app_root = self.staging / "opt" / "isadoraair"
-        app_root.parent.mkdir(parents=True, exist_ok=True)
-        app_root.symlink_to(project_root)
-
         venv_python = project_root / "venv" / "bin" / "python"
         if not venv_python.is_file():
             self.skipTest("no worktree-local venv symlink available for a real manage.py invocation")
 
-        result = self._run("--apply", timeout=120)
+        app_root = self.staging / "opt" / "isadoraair"
+        app_root.mkdir(parents=True, exist_ok=True)
+        (app_root / "manage.py").symlink_to(project_root / "manage.py")
+        (app_root / "venv").symlink_to(project_root / "venv")
+        scratch_weather = self.staging / "app-env-scratch" / "weather"
+        scratch_weather.mkdir(parents=True, exist_ok=True)
+        (app_root / ".env").write_text(
+            "DEBUG=True\n"
+            "DB_NAME=unused\nDB_USER=unused\nDB_PASSWORD=\nDB_HOST=127.0.0.1\nDB_PORT=65534\n"
+            f"WEATHER_DATA_DIR={scratch_weather}\n",
+            encoding="utf-8",
+        )
+        env = os.environ.copy()
+        env.pop("LIBRARY_ROOT", None)  # keep check_deploy_baseline-style canonical mapping intact
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+
+        result = self._run("--apply", timeout=120, env=env)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("System-surface provisioning", result.stdout)
         self.assertIn("all surfaces healthy: True", result.stdout)
@@ -1330,7 +1677,20 @@ class RuntimeFoundationE5SystemConfigFunctionalTests(SimpleTestCase):
 
 
 class RuntimeFoundationE6TargetValidationFunctionalTests(SimpleTestCase):
-    """Exercise stages 90/95 only beneath a disposable target root."""
+    """Exercise stages 90/95 only beneath a disposable target root.
+
+    Runtime Foundation E7D (2026-09-04) regression: the previous version
+    of this fixture pre-created BOTH the target's /etc/passwd AND
+    /run/isadoraair/tts before ever running Stage 90 -- which completely
+    masked the real E8 defect (Stage 90 never actually established that
+    scratch surface itself, and an isolated staging target genuinely has
+    no /etc/passwd of its own to resolve a named identity from). This
+    fixture now creates NEITHER: it supplies a trusted --isa-uid/--isa-gid
+    numeric pair instead (exactly what a real offline restore operator
+    would use), and asserts Stage 90 itself establishes
+    /run/isadoraair(/tts) with the correct numeric owner/group/modes,
+    and that Stage 95 then resolves identity and PASSes without ever
+    touching a staged passwd database."""
 
     def setUp(self):
         super().setUp()
@@ -1340,6 +1700,7 @@ class RuntimeFoundationE6TargetValidationFunctionalTests(SimpleTestCase):
         self.project_root = RESTORE_DIR.parent.parent
         if not (self.project_root / "venv" / "bin" / "python").is_file():
             self.skipTest("no worktree-local venv link available for restore functional proof")
+        self.uid, self.gid = os.getuid(), os.getgid()
         self.env = os.environ.copy()
         self.env.update(
             {
@@ -1354,6 +1715,15 @@ class RuntimeFoundationE6TargetValidationFunctionalTests(SimpleTestCase):
                 "PYTHONDONTWRITEBYTECODE": "1",
             }
         )
+        # Hermetic on purpose: this test's own outer runner may itself be
+        # invoked with LIBRARY_ROOT (or similar) pointed at a scratch
+        # directory for ITS OWN unrelated needs -- os.environ.copy() above
+        # would otherwise leak that into these subprocess stage-script
+        # calls, silently breaking check_deploy_baseline's canonical
+        # /srv/isadoraair/music target-root mapping (which
+        # _unrelated_structural_prerequisites below assumes). Popped, not
+        # merely left unset, so an inherited override can never win.
+        self.env.pop("LIBRARY_ROOT", None)
 
     def _application_shell(self, *, with_venv: bool) -> Path:
         app = self.staging / "opt" / "isadoraair"
@@ -1361,43 +1731,56 @@ class RuntimeFoundationE6TargetValidationFunctionalTests(SimpleTestCase):
         (app / "manage.py").symlink_to(self.project_root / "manage.py")
         if with_venv:
             (app / "venv").symlink_to(self.project_root / "venv")
+            # restore_manage (lib.sh) -- the current-checkout recovery
+            # authority Stage 90's preferred (E5) branch routes through --
+            # needs a real .env to relay, and needs WEATHER_DATA_DIR
+            # writable (weather/services.py mkdir's it at Django import
+            # time); LIBRARY_ROOT is deliberately left at its own default
+            # (/srv/isadoraair/music) so check_deploy_baseline's
+            # structural mapping still matches what
+            # _unrelated_structural_prerequisites below creates.
+            scratch = self.staging / "app-env-scratch" / "weather"
+            scratch.mkdir(parents=True, exist_ok=True)
+            (app / ".env").write_text(
+                f"DEBUG=True\nWEATHER_DATA_DIR={scratch}\n", encoding="utf-8"
+            )
         return app
 
-    def _target_identity_and_runtime_dirs(self):
-        uid, gid = os.getuid(), os.getgid()
-        etc = self.staging / "etc"
-        etc.mkdir(parents=True, exist_ok=True)
-        (etc / "passwd").write_text(
-            f"station:x:{uid}:{gid}:Station:/nonexistent:/usr/sbin/nologin\n",
-            encoding="utf-8",
-        )
+    def _unrelated_structural_prerequisites(self):
+        """Only the music-library structural prerequisite
+        check_deploy_baseline's own (identity-independent) checks need --
+        never identity (/etc/passwd) and never the scratch surface this
+        fix now proves Stage 90 establishes itself."""
         (self.staging / "srv" / "isadoraair" / "music").mkdir(parents=True)
-        scratch = self.staging / "run" / "isadoraair" / "tts"
-        scratch.mkdir(parents=True, mode=0o700)
-        scratch.chmod(0o700)
 
-    def _run_stage(self, name: str, *extra: str, timeout: int = 120):
-        return subprocess.run(
-            [
-                str(RESTORE_DIR / name),
-                "--staging-root",
-                str(self.staging),
-                "--apply",
-                "--isa-user",
-                "station",
-                *extra,
-            ],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            env=self.env,
-        )
+    def _run_stage(self, name: str, *extra: str, with_identity: bool = True, timeout: int = 120):
+        args = [str(RESTORE_DIR / name), "--staging-root", str(self.staging), "--apply"]
+        if with_identity:
+            args += ["--isa-user", "station", "--isa-uid", str(self.uid), "--isa-gid", str(self.gid)]
+        args += list(extra)
+        return subprocess.run(args, capture_output=True, text=True, timeout=timeout, env=self.env)
+
+    def _assert_scratch_surface_established_by_stage_90(self):
+        run_dir = self.staging / "run" / "isadoraair"
+        tts_dir = run_dir / "tts"
+        for directory, mode in ((run_dir, 0o755), (tts_dir, 0o700)):
+            self.assertTrue(directory.is_dir(), f"{directory} was not created by Stage 90")
+            self.assertFalse(directory.is_symlink())
+            self.assertEqual(stat.S_IMODE(directory.stat().st_mode), mode)
+            self.assertEqual(directory.stat().st_uid, self.uid)
+            self.assertEqual(directory.stat().st_gid, self.gid)
 
     def test_preferred_stage_90_then_stage_95_targets_staging_and_detects_deleted_launcher(self):
         self._application_shell(with_venv=True)
-        self._target_identity_and_runtime_dirs()
+        self._unrelated_structural_prerequisites()
         stage90 = self._run_stage("90-system-config.sh")
         self.assertEqual(stage90.returncode, 0, stage90.stdout + stage90.stderr)
+
+        # Stage 90 itself established the legacy scratch surface -- not
+        # pre-created by this fixture -- with the trusted numeric identity.
+        self._assert_scratch_surface_established_by_stage_90()
+        # And no staged passwd database was ever needed to do it.
+        self.assertFalse((self.staging / "etc" / "passwd").exists())
 
         launcher = self.staging / "usr" / "local" / "bin" / "isadoraair-tts"
         self.assertTrue(launcher.is_file())
@@ -1411,21 +1794,149 @@ class RuntimeFoundationE6TargetValidationFunctionalTests(SimpleTestCase):
         healthy = self._run_stage("95-validate.sh")
         self.assertEqual(healthy.returncode, 0, healthy.stdout + healthy.stderr)
         self.assertIn("offline target check_deploy_baseline: PASS", healthy.stdout)
+        self.assertFalse((self.staging / "etc" / "passwd").exists())
 
         launcher.unlink()
         missing = self._run_stage("95-validate.sh")
         self.assertNotEqual(missing.returncode, 0, missing.stdout + missing.stderr)
         self.assertIn("offline target check_deploy_baseline: FAILED", missing.stderr)
 
+    def test_stage_95_without_target_passwd_or_trusted_identity_fails_closed(self):
+        """The exact real E8 failure this fix addresses, reproduced and
+        pinned as a deliberate negative proof: with neither a target
+        /etc/passwd entry NOR a trusted --isa-uid/--isa-gid pair, the TTS
+        scratch surface identity is genuinely unresolvable -- Stage 95
+        must fail closed, never guess."""
+        self._application_shell(with_venv=True)
+        self._unrelated_structural_prerequisites()
+        stage90 = self._run_stage("90-system-config.sh")
+        self.assertEqual(stage90.returncode, 0, stage90.stdout + stage90.stderr)
+
+        unresolved = self._run_stage("95-validate.sh", with_identity=False)
+        self.assertNotEqual(unresolved.returncode, 0, unresolved.stdout + unresolved.stderr)
+        self.assertIn("offline target check_deploy_baseline: FAILED", unresolved.stderr)
+        self.assertIn("unresolved_identity", unresolved.stdout)
+
     def test_stage_90_fallback_cannot_reach_final_success(self):
         app = self._application_shell(with_venv=False)
-        self._target_identity_and_runtime_dirs()
+        self._unrelated_structural_prerequisites()
         fallback = self._run_stage("90-system-config.sh")
         self.assertEqual(fallback.returncode, 0, fallback.stdout + fallback.stderr)
         self.assertIn("falling back", fallback.stderr)
         self.assertFalse((self.staging / "usr/local/bin/isadoraair-tts").exists())
+        # The fallback branch is E5-specific -- the legacy scratch surface
+        # (section 4b) is a separate, unconditional step and is still
+        # established regardless of which E5 branch ran.
+        self._assert_scratch_surface_established_by_stage_90()
 
         (app / "venv").symlink_to(self.project_root / "venv")
         final = self._run_stage("95-validate.sh")
         self.assertNotEqual(final.returncode, 0, final.stdout + final.stderr)
         self.assertIn("offline target check_deploy_baseline: FAILED", final.stderr)
+
+
+class RestoreStage90IdentityPairValidationTests(SimpleTestCase):
+    """--isa-uid/--isa-gid must be all-or-nothing, for both stages that
+    accept them -- cheap --plan-mode proof, no venv/DB required."""
+
+    def setUp(self):
+        super().setUp()
+        self.staging = Path(tempfile.mkdtemp(prefix="isadoraair-e7d-pair-test-"))
+        self.addCleanup(shutil.rmtree, self.staging, ignore_errors=True)
+
+    def _run(self, script: str, *extra: str):
+        return subprocess.run(
+            [str(RESTORE_DIR / script), "--staging-root", str(self.staging), "--plan", *extra],
+            capture_output=True, text=True, timeout=15,
+        )
+
+    def test_stage_90_uid_without_gid_fails(self):
+        result = self._run("90-system-config.sh", "--isa-uid", "1000")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("must be supplied together", result.stdout + result.stderr)
+
+    def test_stage_90_gid_without_uid_fails(self):
+        result = self._run("90-system-config.sh", "--isa-gid", "1000")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("must be supplied together", result.stdout + result.stderr)
+
+    def test_stage_95_uid_without_gid_fails(self):
+        result = self._run("95-validate.sh", "--isa-uid", "1000")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("must be supplied together", result.stdout + result.stderr)
+
+    def test_stage_95_gid_without_uid_fails(self):
+        result = self._run("95-validate.sh", "--isa-gid", "1000")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("must be supplied together", result.stdout + result.stderr)
+
+    def test_stage_90_non_numeric_uid_fails(self):
+        result = self._run("90-system-config.sh", "--isa-uid", "notanumber", "--isa-gid", "1000")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("non-negative integer", result.stdout + result.stderr)
+
+
+class RestoreStage90ScratchSurfaceSafetyTests(SimpleTestCase):
+    """Fail-closed proof for the confined directory-establishment helper
+    ensure_confined_directory (lib.sh), exercised through the real Stage
+    90 --apply path -- no host /run is ever touched or at risk, since
+    every target is confined beneath an isolated tmpdir staging root."""
+
+    def setUp(self):
+        super().setUp()
+        self.staging = Path(tempfile.mkdtemp(prefix="isadoraair-e7d-scratch-safety-"))
+        self.addCleanup(shutil.rmtree, self.staging, ignore_errors=True)
+        self.uid, self.gid = os.getuid(), os.getgid()
+
+    def _run_apply(self, *extra: str):
+        return subprocess.run(
+            [
+                str(RESTORE_DIR / "90-system-config.sh"),
+                "--staging-root", str(self.staging), "--apply",
+                "--isa-uid", str(self.uid), "--isa-gid", str(self.gid),
+                *extra,
+            ],
+            capture_output=True, text=True, timeout=60,
+        )
+
+    def test_symlinked_run_ancestor_fails_closed(self):
+        outside = self.staging.parent / f"{self.staging.name}-outside-run"
+        outside.mkdir(exist_ok=True)
+        self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+        (self.staging / "run").symlink_to(outside, target_is_directory=True)
+        result = self._run_apply()
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("symlink", result.stdout + result.stderr)
+        # Confined -- the real escape target was never touched.
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_symlinked_run_isadoraair_leaf_fails_closed(self):
+        outside = self.staging.parent / f"{self.staging.name}-outside-tts"
+        outside.mkdir(exist_ok=True)
+        self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+        (self.staging / "run").mkdir()
+        (self.staging / "run" / "isadoraair").symlink_to(outside, target_is_directory=True)
+        result = self._run_apply()
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("symlink", result.stdout + result.stderr)
+
+    def test_non_directory_collision_fails_closed(self):
+        (self.staging / "run").mkdir()
+        (self.staging / "run" / "isadoraair").write_text("not a directory", encoding="utf-8")
+        result = self._run_apply()
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("not a directory", result.stdout + result.stderr)
+
+    def test_ownership_this_caller_cannot_establish_fails_closed_not_substituted(self):
+        """An unprivileged staging run cannot chown to an arbitrary UID
+        it isn't -- this must fail closed, never silently fall back to
+        the caller's own (installer-host) identity instead."""
+        result = self._run_apply("--isa-uid", "65001", "--isa-gid", "65001")
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("cannot set ownership", result.stdout + result.stderr)
+        # The failure is on the FIRST directory (run/isadoraair) -- the
+        # second (tts) is never even attempted, and the first is never
+        # left silently owned by the caller's own uid as a substitute for
+        # the requested-but-unachievable 65001.
+        tts_dir = self.staging / "run" / "isadoraair" / "tts"
+        self.assertFalse(tts_dir.exists())

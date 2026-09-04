@@ -15,7 +15,13 @@
 # Usage:
 #   deploy/restore/restore.sh --archive PATH [--plan|--apply]
 #     [--staging-root PATH] [--force-production-target] [--force-db] [--force-env]
+#     [--isa-user USER] [--isa-uid UID --isa-gid GID]
 #     [-- <stage-specific args, passed to every stage that accepts them>]
+#
+# --isa-user/--isa-uid/--isa-gid are the one exception to "every stage
+# gets the same args": they are routed ONLY to 90-system-config.sh and
+# 95-validate.sh (the only stages that recognize them) -- see this
+# script's own identity-flag routing below.
 #
 # For a real Phase 5 bare-machine drill, prefer running stages
 # individually and reviewing each one's output before proceeding to the
@@ -70,11 +76,41 @@ STAGES=(
   95-validate.sh
 )
 
+# ---------------------------------------------------------------------
+# Identity flags (--isa-user/--isa-uid/--isa-gid) are recognized ONLY by
+# 90-system-config.sh and 95-validate.sh -- every other stage's own
+# strict "unrecognized argument" guard would reject them if broadcast
+# via the same args every stage otherwise receives identically. Runtime
+# Foundation E7D (2026-09-04): pulled out here and forwarded ONLY to
+# those two stages, so a full end-to-end restore.sh run can supply a
+# trusted --isa-uid/--isa-gid pair (e.g. for an isolated --staging-root
+# target with no /etc/passwd of its own -- see 90-system-config.sh's and
+# 95-validate.sh's own headers) without breaking every earlier stage.
+# Deliberately narrow: no other stage-specific flag gets this special-
+# cased routing, and no other stage's own argument surface is touched.
+COMMON_ARGS=()
+IDENTITY_ARGS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --isa-user|--isa-uid|--isa-gid)
+      IDENTITY_ARGS+=("$1" "${2:?$1 needs a value}"); shift 2 ;;
+    --isa-user=*|--isa-uid=*|--isa-gid=*)
+      IDENTITY_ARGS+=("$1"); shift ;;
+    *)
+      COMMON_ARGS+=("$1"); shift ;;
+  esac
+done
+
 echo "=== IsadoraAir restore orchestrator: ${#STAGES[@]} stages ==="
 for stage in "${STAGES[@]}"; do
   echo
   echo ">>> Running $stage"
-  "$SCRIPT_DIR/$stage" "$@"
+  case "$stage" in
+    90-system-config.sh|95-validate.sh)
+      "$SCRIPT_DIR/$stage" "${COMMON_ARGS[@]}" "${IDENTITY_ARGS[@]}" ;;
+    *)
+      "$SCRIPT_DIR/$stage" "${COMMON_ARGS[@]}" ;;
+  esac
 done
 echo
 echo "=== All stages completed. ==="

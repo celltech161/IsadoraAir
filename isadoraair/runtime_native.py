@@ -53,8 +53,20 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _safe_message(value: object) -> str:
-    return " ".join(str(value).split())[:512] or "native provisioning failed"
+def _safe_message(value: object, *, max_length: int = 512) -> str:
+    """Collapse whitespace and bound the length, keeping the end of long text.
+
+    Failure diagnostics (compiler/build transcripts routed through
+    ``_run_bounded``) carry their most useful content at the end, not the
+    start, so truncation keeps the tail rather than the head.
+    """
+
+    collapsed = " ".join(str(value).split())
+    if not collapsed:
+        return "native provisioning failed"
+    if len(collapsed) <= max_length:
+        return collapsed
+    return collapsed[-max_length:]
 
 
 def _regular_file(
@@ -97,6 +109,80 @@ def _assert_existing_directory(
     if forbid_shared_write and metadata.st_mode & 0o022:
         raise RuntimeProvisioningError(f"prepared directory is group/world writable: {path}")
     return metadata
+
+
+def _ensure_noncanonical_publication_directories(root: Path, *targets: Path) -> None:
+    """Establish the minimal confined directory skeleton ONE noncanonical
+    (never "/") native-publication target root needs, one path component
+    at a time.
+
+    Runtime Foundation E7C: a noncanonical --target-root (e.g. an
+    isolated `--staging-root` restore tree) is intentionally an
+    incomplete filesystem skeleton -- it must never borrow /usr/local
+    from the installer host, and nothing upstream of native publication
+    creates it. Canonical "/" gets none of this: _preflight_publish only
+    calls this helper when root != Path("/"), so the trusted system
+    hierarchy under real "/" is never auto-created -- it must already
+    exist, exactly as before.
+
+    Each existing path component is validated as a real, non-symlink
+    directory (never chmodded/chowned just because it already existed);
+    each missing component is created fresh, one mkdir at a time, at a
+    fixed 0755 mode, and immediately re-validated as a real, non-symlink
+    directory before moving on -- deliberately NOT `path.mkdir(parents=
+    True, exist_ok=True)` (see _mkdir_controlled in runtime_provisioning.py),
+    which creates every missing ancestor in one call without proving each
+    one it silently traverses is a real directory rather than a symlink.
+    Never follows a symlink, never replaces or deletes anything, and
+    never creates anything outside `root` -- a target outside `root`, or
+    any existing non-directory/symlink collision along the way, fails
+    closed instead.
+
+    Idempotent: calling this again on an already-established skeleton
+    validates and does nothing further, so a retried publish (including
+    one that partially created this skeleton before failing later) sees
+    the same skeleton as fully valid and moves on -- see this module's
+    NativeRuntimeProvisioner.publish() docstring / this repo's E4
+    publication-transaction contract for why these directories are
+    deliberately NOT rolled back on a later failure: they are inert,
+    contain nothing sensitive, and are not part of the two-file
+    (fdkaac binary + libfdk-aac library) transaction that IS rolled back.
+    """
+
+    if root == Path("/"):
+        raise RuntimeProvisioningError(
+            "internal error: noncanonical publication directories requested for the canonical root"
+        )
+    for target in targets:
+        if not target.is_relative_to(root):
+            raise RuntimeProvisioningError("publication target escapes the requested root")
+        cursor = root
+        for part in target.relative_to(root).parts:
+            cursor = cursor / part
+            if cursor.is_symlink():
+                raise RuntimeProvisioningError("publication path contains an unexpected symlink")
+            if cursor.exists():
+                if not cursor.is_dir():
+                    raise RuntimeProvisioningError(
+                        f"publication path component is not a directory: {cursor}"
+                    )
+                continue
+            try:
+                os.mkdir(cursor, 0o755)
+            except FileExistsError as exc:
+                raise RuntimeProvisioningError(
+                    f"publication path component appeared unexpectedly during creation: {cursor}"
+                ) from exc
+            if cursor.is_symlink() or not stat.S_ISDIR(cursor.lstat().st_mode):
+                raise RuntimeProvisioningError(
+                    f"newly created publication directory is not a plain directory: {cursor}"
+                )
+            os.chmod(cursor, 0o755)
+            metadata = cursor.lstat()
+            if metadata.st_uid != os.geteuid():
+                raise RuntimeProvisioningError(
+                    f"newly created publication directory has an unexpected owner: {cursor}"
+                )
 
 
 def _validated_preparer_uid(value: int | None, *, canonical: bool) -> int:
@@ -177,10 +263,11 @@ def _run_bounded(command: list[str], *, cwd: Path, timeout: float, label: str) -
         raise RuntimeProvisioningError(f"{label} timed out") from exc
     reader.join(timeout=2.0)
     if return_code != 0:
-        diagnostic = _safe_message(tail.decode("utf-8", errors="replace"))
-        raise RuntimeProvisioningError(
-            f"{label} exited with status {return_code}: {diagnostic}"
+        prefix = f"{label} exited with status {return_code}: "
+        diagnostic = _safe_message(
+            tail.decode("utf-8", errors="replace"), max_length=max(0, 512 - len(prefix))
         )
+        raise RuntimeProvisioningError(prefix + diagnostic)
 
 
 def _run_build(script: Path, source_dir: Path, prefix: Path) -> None:
@@ -850,6 +937,18 @@ class NativeRuntimeProvisioner:
         root = self.layout.target_root
         local_root = ProvisioningLayout._map("/usr/local", root)
         _assert_confined_non_symlink(root, local_root)
+        # Canonical "/" never gets here: the trusted system hierarchy
+        # (/usr/local, its bin/lib) must already exist there -- native
+        # publication must never manufacture trusted system ancestors on
+        # the real host. A noncanonical target root (e.g. an isolated
+        # --staging-root restore tree) is intentionally an incomplete
+        # filesystem skeleton that nothing upstream creates, so it is the
+        # one case allowed to establish its own confined /usr/local
+        # skeleton first -- see _ensure_noncanonical_publication_directories.
+        if root != Path("/"):
+            _ensure_noncanonical_publication_directories(
+                root, local_root, self.layout.fdkaac_binary.parent, self.layout.fdkaac_library_root
+            )
         for directory in (local_root, self.layout.fdkaac_binary.parent, self.layout.fdkaac_library_root):
             _assert_confined_non_symlink(root, directory)
             _assert_existing_directory(directory)

@@ -12,7 +12,11 @@
 #   validates it, then delegates to the REAL Runtime Foundation E4
 #   authority (monitoring/management/commands/provision_runtime_components.py
 #   --fdkaac, via --recovery-payload) for both the unprivileged prepare
-#   phase and the protected publish phase. This stage does not build
+#   phase and the protected publish phase -- always THIS checkout's own
+#   copy of that authority, via lib.sh's restore_manage, never the
+#   restored backup's own possibly-older copy (Runtime Foundation E7C --
+#   see restore_manage.py's own docstring for the full "recovery source
+#   authority vs. restored target" split). This stage does not build
 #   anything itself, does not re-implement E4's verification, and NEVER
 #   reaches for --download-sources -- a legacy/v2.x or explicitly non-
 #   self-contained archive fails this backup-based stage plainly rather
@@ -26,18 +30,21 @@
 #   deliberate, separate, operator-selected concern, not a fallback a
 #   backup-based restore ever reaches for on its own (task step 14).
 #
-# Foundation E4's real prepare/publish split needs the restored app's
-# Django environment (it runs as a manage.py command) -- which is why,
-# for the recovery-payload path only, this stage now depends on
-# 60-python.sh having already created $RESTORE_TARGET_ROOT/venv. This
-# is a REAL new dependency Runtime Foundation E7B introduces (native
-# fdkaac's old direct C build had none); restore.sh's stage order was
-# updated to run 60-python before 50-native-deps to match -- see
-# deploy/restore/README.md's "Restore-order dependency map" for the
-# 2026-08-29 note, and 60-python.sh's own idempotence guarantee (safe
-# to have already run, or to run again later at its usual numeric spot
-# -- it verifies rather than recreates). The legacy connected-install
-# path below has no such dependency and is unaffected.
+# Foundation E4's real prepare/publish split needs a Django environment
+# to run as a manage.py command -- which is why, for the recovery-payload
+# path only, this stage now depends on 60-python.sh having already
+# created $RESTORE_TARGET_ROOT/venv. This is a REAL new dependency
+# Runtime Foundation E7B introduces (native fdkaac's old direct C build
+# had none); restore.sh's stage order was updated to run 60-python before
+# 50-native-deps to match -- see deploy/restore/README.md's "Restore-
+# order dependency map" for the 2026-08-29 note, and 60-python.sh's own
+# idempotence guarantee (safe to have already run, or to run again later
+# at its usual numeric spot -- it verifies rather than recreates). Note
+# the split (Runtime Foundation E7C): that venv only supplies the Python
+# INTERPRETER, verified compatible with this checkout's requirements.txt
+# first -- the manage.py command it runs always comes from this checkout.
+# The legacy connected-install path below has no such dependency and is
+# unaffected.
 #
 # Usage:
 #   deploy/restore/50-native-deps.sh --archive PATH [--plan|--apply]
@@ -112,17 +119,17 @@ if [ "$USE_RECOVERY_PAYLOAD" -eq 1 ]; then
 
   if [ "$RESTORE_MODE" != "apply" ]; then
     log_plan "locate + validate the runtime-recovery/ payload embedded in $RESTORE_ARCHIVE"
-    log_plan "manage.py provision_runtime_components --fdkaac --prepare-fdkaac --recovery-payload <payload>/native/fdkaac --prepared-native-root <tmp> --target-root $NATIVE_TARGET_ROOT"
-    log_plan "manage.py provision_runtime_components --fdkaac --publish-fdkaac --recovery-payload <payload>/native/fdkaac --prepared-native-root <tmp> --target-root $NATIVE_TARGET_ROOT${TRUSTED_PREPARER_UID:+ --trusted-preparer-uid $TRUSTED_PREPARER_UID}"
+    log_plan "restore_manage provision_runtime_components --fdkaac --prepare-fdkaac --recovery-payload <payload>/native/fdkaac --prepared-native-root <tmp> --target-root $NATIVE_TARGET_ROOT"
+    log_plan "restore_manage provision_runtime_components --fdkaac --publish-fdkaac --recovery-payload <payload>/native/fdkaac --prepared-native-root <tmp> --target-root $NATIVE_TARGET_ROOT${TRUSTED_PREPARER_UID:+ --trusted-preparer-uid $TRUSTED_PREPARER_UID}"
     log_info "50-native-deps: PLAN complete"
     exit 0
   fi
 
-  VENV_PYTHON="$RESTORE_TARGET_ROOT/venv/bin/python"
-  if [ ! -x "$VENV_PYTHON" ]; then
-    log_error "$VENV_PYTHON not found -- Runtime Foundation E7B native fdkaac delegation needs the restored app's Python environment to invoke Foundation E4's authority (it runs as a manage.py command). Run 60-python.sh before 50-native-deps.sh for a backup-based restore (yes, out of its usual numeric position -- see deploy/restore/README.md's 2026-08-29 note)."
-    exit 1
-  fi
+  # restore_manage (lib.sh) owns the venv-python and .env preconditions
+  # (and, before running anything, whether that venv is even compatible
+  # with this checkout's requirements.txt) with one shared, clear
+  # diagnostic -- this stage only needs its own ordering precondition:
+  # has 20-application.sh actually reconstructed the target checkout yet.
   if [ ! -f "$RESTORE_TARGET_ROOT/manage.py" ]; then
     log_error "$RESTORE_TARGET_ROOT/manage.py not found -- run 20-application.sh first."
     exit 1
@@ -140,27 +147,27 @@ if [ "$USE_RECOVERY_PAYLOAD" -eq 1 ]; then
     exit 1
   fi
 
-  log_apply "validating runtime-recovery payload at $PAYLOAD_DIR"
-  RECOVERY_EVIDENCE_JSON=$("$VENV_PYTHON" "$RESTORE_TARGET_ROOT/manage.py" validate_runtime_recovery_payload "$PAYLOAD_DIR" --json)
+  log_apply "restore_manage validate_runtime_recovery_payload $PAYLOAD_DIR --json"
+  RECOVERY_EVIDENCE_JSON=$(restore_manage validate_runtime_recovery_payload "$PAYLOAD_DIR" --json)
   NATIVE_STATE=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["components"]["native_fdkaac"]["state"])' "$RECOVERY_EVIDENCE_JSON")
   if [ "$NATIVE_STATE" != "present" ]; then
     log_info "50-native-deps: no native_fdkaac component is included; no native recovery action is required by this archive"
     exit 0
   fi
 
-  log_apply "manage.py provision_runtime_components --fdkaac --prepare-fdkaac --recovery-payload $PAYLOAD_DIR --prepared-native-root $PREPARED_DIR --target-root $NATIVE_TARGET_ROOT"
-  ( cd "$RESTORE_TARGET_ROOT" && "$VENV_PYTHON" manage.py provision_runtime_components \
+  log_apply "restore_manage provision_runtime_components --fdkaac --prepare-fdkaac --recovery-payload $PAYLOAD_DIR --prepared-native-root $PREPARED_DIR --target-root $NATIVE_TARGET_ROOT"
+  restore_manage provision_runtime_components \
       --fdkaac --prepare-fdkaac \
       --recovery-payload "$PAYLOAD_DIR" \
       --prepared-native-root "$PREPARED_DIR" \
-      --target-root "$NATIVE_TARGET_ROOT" )
+      --target-root "$NATIVE_TARGET_ROOT"
 
   PUBLISH_ARGS=(--fdkaac --publish-fdkaac --recovery-payload "$PAYLOAD_DIR" --prepared-native-root "$PREPARED_DIR" --target-root "$NATIVE_TARGET_ROOT")
   if [ -n "$TRUSTED_PREPARER_UID" ]; then
     PUBLISH_ARGS+=(--trusted-preparer-uid "$TRUSTED_PREPARER_UID")
   fi
-  log_apply "manage.py provision_runtime_components ${PUBLISH_ARGS[*]}"
-  ( cd "$RESTORE_TARGET_ROOT" && "$VENV_PYTHON" manage.py provision_runtime_components "${PUBLISH_ARGS[@]}" )
+  log_apply "restore_manage provision_runtime_components ${PUBLISH_ARGS[*]}"
+  restore_manage provision_runtime_components "${PUBLISH_ARGS[@]}"
 
   restore_record_recovery_components native_fdkaac >/dev/null
 

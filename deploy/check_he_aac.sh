@@ -111,7 +111,7 @@ if [ ! -d "$LIB_DIR" ]; then
   exit 1
 fi
 
-VERSION_OUTPUT="$({ "$FDKAAC_BIN" 2>&1 || true; } | sed -n '1p')"
+VERSION_OUTPUT="$({ LD_LIBRARY_PATH="$LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$FDKAAC_BIN" 2>&1 || true; } | sed -n '1p')"
 ACTUAL_FDKAAC_VERSION="${VERSION_OUTPUT#fdkaac }"
 if [ "$ACTUAL_FDKAAC_VERSION" != "$EXPECTED_FDKAAC_VERSION" ]; then
   echo "FAIL: fdkaac version mismatch" >&2

@@ -3,15 +3,18 @@ from __future__ import annotations
 import base64
 import hashlib
 import inspect
+import io
 import json
 import os
 from pathlib import Path
 import shutil
 import subprocess
+import tarfile
 import tempfile
 from copy import deepcopy
 from unittest import mock
 
+from django.core.management import call_command
 from django.test import SimpleTestCase
 
 from deploy.updater_bootstrap.tools.protected_runtime_release import (
@@ -510,6 +513,77 @@ class PhaseDRecoveryComponentTests(SimpleTestCase):
         self.assertTrue(
             (fake_root / "usr/local/libexec/isadoraair-updater-bootstrap/updater_bootstrapd.py").is_file()
         )
+
+    def test_schema_two_payload_survives_real_backup_archive_extraction(self):
+        """Regression for E8's stage-50 failure: the shared outer archive
+        extractor must preserve the schema-2 component's manifest-backed
+        executable modes while retaining ordinary file modes, after which
+        both Phase-D's exact inventory check and the operator-facing Django
+        validation command must pass."""
+        payload = self._build_schema_two_payload(output_name="schema-two-archive-round-trip")
+        archive_root = self.root / "backup-archive-work"
+        archive_root.mkdir()
+        shutil.copytree(payload, archive_root / "runtime-recovery", copy_function=shutil.copy2)
+        payload_manifest = json.loads((payload / "runtime-recovery.json").read_text())
+        (archive_root / "runtime-recovery-archive.json").write_text(json.dumps({
+            "schema_version": 1,
+            "backup_script_version": "3.0.0",
+            "archive_format_version": "3.0.0",
+            "recovery_class": "self_contained_v3",
+            "payload_included": True,
+            "payload_id": payload_manifest["payload_id"],
+            "payload_schema_version": 2,
+            "product_contract_sha256": payload_manifest["product_contract_sha256"],
+            "included_components": ["native_fdkaac", "protected_updater"],
+            "required_components": ["native_fdkaac", "protected_updater"],
+            "policy_satisfied": True,
+            "piper_freshness": "not_checked",
+        }, sort_keys=True))
+        archive = self.root / "schema-two-backup.tar.gz"
+        with tarfile.open(archive, "w:gz") as target:
+            target.add(archive_root, arcname=".")
+
+        extracted = self.root / "schema-two-extracted"
+        helper = self.repository / "deploy" / "restore" / "runtime_recovery_archive.py"
+        extraction = subprocess.run(
+            [str(helper), "extract", "--archive", str(archive), "--destination", str(extracted)],
+            capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(extraction.returncode, 0, extraction.stdout + extraction.stderr)
+
+        executable_paths = (
+            "bootstrap/source/updater_bootstrapd.py",
+            "runtime-slots/active/updaterd.py",
+            "runtime-slots/previous/updaterd.py",
+        )
+        component = extracted / "protected-updater"
+        for relative in executable_paths:
+            self.assertEqual((component / relative).stat().st_mode & 0o777, 0o755, relative)
+        self.assertEqual((extracted / "runtime-recovery.json").stat().st_mode & 0o777, 0o644)
+        self.assertEqual((component / "station.json").stat().st_mode & 0o777, 0o644)
+
+        restore_manifest = json.loads((component / "restore-manifest.json").read_text())
+        for expected in restore_manifest["files"]:
+            actual = component / expected["path"]
+            content = actual.read_bytes()
+            self.assertEqual(len(content), expected["size_bytes"], expected["path"])
+            self.assertEqual(hashlib.sha256(content).hexdigest(), expected["sha256"], expected["path"])
+            self.assertEqual(f"{actual.stat().st_mode & 0o777:04o}", expected["mode"], expected["path"])
+        phase_d_evidence = validate_phase_d_component(component)
+        self.assertEqual(phase_d_evidence["active_generation"], 2)
+
+        output = io.StringIO()
+        validator = "monitoring.management.commands.validate_runtime_recovery_payload.validate_current_recovery_payload"
+        with mock.patch(
+            validator,
+            side_effect=lambda root: validate_current_recovery_payload(
+                root, product_manifest=self.product_manifest,
+            ),
+        ):
+            call_command("validate_runtime_recovery_payload", str(extracted), "--json", stdout=output)
+        command_evidence = json.loads(output.getvalue())
+        self.assertEqual(command_evidence["result"], "pass")
+        self.assertEqual(command_evidence["components"]["protected_updater"]["state"], "present")
 
     def test_restore_protected_updater_component_returns_none_when_archive_lacks_it(self):
         """A schema-1-only payload (no protected_updater component at

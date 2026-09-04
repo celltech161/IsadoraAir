@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import io
 import json
 import multiprocessing
@@ -22,8 +23,11 @@ from isadoraair.runtime_native import (
     NativeProvisioningSeams,
     NativeRuntimeProvisioner,
     RuntimeProvisioningError,
+    _ensure_noncanonical_publication_directories,
+    _run_bounded,
     _run_build,
     _run_ldconfig,
+    _safe_message,
     verify_native_sources,
 )
 from isadoraair.runtime_provisioning import ProvisioningLayout, runtime_provision_lock
@@ -197,6 +201,75 @@ class NativeFixture(SimpleTestCase):
     def prepare(self, provisioner=None):
         active = provisioner or self.provisioner()
         return active.prepare(source_dir=self.source, prepared_root=self.prepared)
+
+
+class SafeMessageTruncationTests(SimpleTestCase):
+    """The most useful part of a failed build/validator transcript is at
+    the end, not the start. _safe_message must collapse whitespace and
+    stay bounded, but keep the tail when text exceeds its budget."""
+
+    def test_short_text_is_returned_unchanged_aside_from_whitespace_collapse(self):
+        self.assertEqual(_safe_message("  hello   world  \n"), "hello world")
+
+    def test_empty_or_whitespace_only_falls_back_to_default_message(self):
+        self.assertEqual(_safe_message(""), "native provisioning failed")
+        self.assertEqual(_safe_message("   \n\t  "), "native provisioning failed")
+
+    def test_long_text_keeps_the_tail_not_the_head(self):
+        early_marker = "EARLY-IRRELEVANT-BUILD-OUTPUT"
+        filler = "x" * 2000
+        tail = "the real compiler error is right here"
+        text = early_marker + filler + tail
+        result = _safe_message(text)
+        self.assertLessEqual(len(result), 512)
+        self.assertIn(tail, result)
+        self.assertNotIn(early_marker, result)
+
+    def test_max_length_override_is_honored(self):
+        text = "x" * 40 + "END-MARKER"
+        result = _safe_message(text, max_length=15)
+        self.assertEqual(len(result), 15)
+        self.assertTrue(result.endswith("END-MARKER"))
+
+
+class RunBoundedDiagnosticTailTests(SimpleTestCase):
+    """End-to-end coverage for the E8 diagnostic-quality defect: a failed
+    child process with a long transcript must surface the END of that
+    transcript in the raised exception, not get flattened down to the
+    first ~512 characters of an already-bounded 32 KiB tail."""
+
+    def test_failed_child_process_diagnostic_preserves_the_end_of_a_long_transcript(self):
+        marker = "REAL-FAILURE-REASON-AT-THE-END"
+        script = (
+            "import sys\n"
+            "sys.stdout.write('noise-' * 20000)\n"
+            f"sys.stdout.write({marker!r})\n"
+            "sys.exit(1)\n"
+        )
+        with tempfile.TemporaryDirectory() as workdir:
+            with self.assertRaises(RuntimeProvisioningError) as captured:
+                _run_bounded(
+                    ["python3", "-c", script],
+                    cwd=Path(workdir),
+                    timeout=10.0,
+                    label="test child process",
+                )
+        message = str(captured.exception)
+        self.assertIn(marker, message)
+        self.assertIn("test child process exited with status 1", message)
+        self.assertLessEqual(len(message), 512)
+
+    def test_short_child_failure_message_is_unaffected(self):
+        with tempfile.TemporaryDirectory() as workdir:
+            with self.assertRaises(RuntimeProvisioningError) as captured:
+                _run_bounded(
+                    ["python3", "-c", "import sys; print('boom'); sys.exit(3)"],
+                    cwd=Path(workdir),
+                    timeout=10.0,
+                    label="test child process",
+                )
+        message = str(captured.exception)
+        self.assertEqual(message, "test child process exited with status 3: boom")
 
 
 class NativeSourceSecurityTests(NativeFixture):
@@ -650,6 +723,298 @@ class NativePublicationTests(NativeFixture):
         with self.assertRaisesRegex(RuntimeProvisioningError, "rollback failed") as caught:
             self.provisioner(seams=seams).publish(prepared_root=self.prepared)
         self.assertIn("original failure", str(caught.exception.__cause__))
+
+
+class EnsureNoncanonicalPublicationDirectoriesUnitTests(SimpleTestCase):
+    """Direct unit coverage for _ensure_noncanonical_publication_directories
+    itself -- the E7C fix for the real E8 failure (`CommandError: directory
+    is unavailable: /tmp/kkb/usr/local`): a noncanonical --target-root's
+    /usr/local skeleton is nothing upstream creates, and _preflight_publish
+    previously required it to already exist for BOTH canonical and
+    noncanonical roots alike."""
+
+    def setUp(self):
+        super().setUp()
+        temporary = tempfile.TemporaryDirectory(prefix="isadoraair-e7c-skeleton-test-")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+
+    def _targets(self, root=None):
+        root = root or self.root
+        local_root = root / "usr" / "local"
+        return local_root, local_root / "bin", local_root / "lib"
+
+    def test_refuses_the_canonical_root_outright(self):
+        with self.assertRaisesRegex(RuntimeProvisioningError, "canonical root"):
+            _ensure_noncanonical_publication_directories(Path("/"), Path("/usr/local"))
+
+    def test_creates_the_full_skeleton_at_fixed_mode_from_empty(self):
+        local_root, bin_dir, lib_dir = self._targets()
+        _ensure_noncanonical_publication_directories(self.root, local_root, bin_dir, lib_dir)
+        for directory in (self.root / "usr", local_root, bin_dir, lib_dir):
+            self.assertTrue(directory.is_dir())
+            self.assertFalse(directory.is_symlink())
+            self.assertEqual(stat.S_IMODE(directory.stat().st_mode), 0o755)
+            self.assertEqual(directory.stat().st_uid, os.geteuid())
+
+    def test_is_idempotent_on_an_already_established_skeleton(self):
+        local_root, bin_dir, lib_dir = self._targets()
+        _ensure_noncanonical_publication_directories(self.root, local_root, bin_dir, lib_dir)
+        _ensure_noncanonical_publication_directories(self.root, local_root, bin_dir, lib_dir)  # no raise
+        self.assertTrue(bin_dir.is_dir())
+
+    def test_preexisting_directory_mode_is_validated_not_mutated(self):
+        (self.root / "usr").mkdir(mode=0o750)
+        os.chmod(self.root / "usr", 0o750)  # mkdir's mode is subject to umask
+        local_root, bin_dir, lib_dir = self._targets()
+        _ensure_noncanonical_publication_directories(self.root, local_root, bin_dir, lib_dir)
+        self.assertEqual(stat.S_IMODE((self.root / "usr").stat().st_mode), 0o750)
+        self.assertEqual(stat.S_IMODE(bin_dir.stat().st_mode), 0o755)  # newly created gets the fixed mode
+
+    def test_rejects_a_symlink_at_every_ancestor_and_leaf(self):
+        for relative in ("usr", "usr/local", "usr/local/bin", "usr/local/lib"):
+            with self.subTest(component=relative):
+                trial_root = self.root / f"trial-{relative.replace('/', '-')}"
+                trial_root.mkdir()
+                real_target = trial_root / "real-target"
+                real_target.mkdir()
+                symlink_path = trial_root
+                for part in relative.split("/")[:-1]:
+                    symlink_path = symlink_path / part
+                    symlink_path.mkdir(exist_ok=True)
+                symlink_path = symlink_path / relative.split("/")[-1]
+                symlink_path.symlink_to(real_target, target_is_directory=True)
+                local_root, bin_dir, lib_dir = self._targets(trial_root)
+                with self.assertRaisesRegex(RuntimeProvisioningError, "symlink"):
+                    _ensure_noncanonical_publication_directories(trial_root, local_root, bin_dir, lib_dir)
+
+    def test_rejects_a_non_directory_collision(self):
+        (self.root / "usr").mkdir()
+        (self.root / "usr" / "local").write_text("not a directory", encoding="utf-8")
+        local_root, bin_dir, lib_dir = self._targets()
+        with self.assertRaisesRegex(RuntimeProvisioningError, "not a directory"):
+            _ensure_noncanonical_publication_directories(self.root, local_root, bin_dir, lib_dir)
+
+    def test_rejects_a_target_outside_root(self):
+        """Direct proof of host isolation: a target that escapes `root`
+        (e.g. the REAL /usr/local) is refused before anything is touched
+        -- never silently redirected, never operated on for real."""
+        with self.assertRaisesRegex(RuntimeProvisioningError, "escapes"):
+            _ensure_noncanonical_publication_directories(self.root, Path("/usr/local"))
+        self.assertFalse((self.root / "usr").exists())
+
+
+class NativePublicationNoncanonicalSkeletonTests(NativeFixture):
+    """End-to-end coverage through the real publish() path -- deliberately
+    WITHOUT NativePublicationTests' own setUp, which always pre-creates
+    usr/local/{bin,lib} and so never exercised the real E8 failure."""
+
+    def setUp(self):
+        super().setUp()
+        self.prepare()
+        self.calls.clear()
+
+    @property
+    def binary(self):
+        return self.target / "usr" / "local" / "bin" / "fdkaac"
+
+    @property
+    def library(self):
+        version = self.product["components"]["fdkaac"]["runtime"]["libfdk_aac_version"]
+        return self.target / "usr" / "local" / "lib" / f"libfdk-aac.so.{version}"
+
+    def test_publish_against_a_completely_empty_target_root_succeeds(self):
+        self.assertFalse((self.target / "usr").exists())
+        result = self.provisioner().publish(prepared_root=self.prepared)
+        self.assertEqual(result.changed_components, ("fdkaac",))
+        self.assertEqual(result.evidence.components["fdkaac"].status, STATUS_PASS)
+        for directory in (
+            self.target / "usr",
+            self.target / "usr" / "local",
+            self.target / "usr" / "local" / "bin",
+            self.target / "usr" / "local" / "lib",
+        ):
+            self.assertTrue(directory.is_dir())
+            self.assertFalse(directory.is_symlink())
+        self.assertEqual(self.binary.read_bytes(), b"new-fdkaac")
+        self.assertEqual(self.library.read_bytes(), b"new-libfdk")
+
+    def test_partially_existing_skeleton_is_completed(self):
+        (self.target / "usr").mkdir()  # only the first component pre-exists
+        result = self.provisioner().publish(prepared_root=self.prepared)
+        self.assertFalse(result.no_op)
+        self.assertTrue((self.target / "usr" / "local" / "bin").is_dir())
+        self.assertTrue((self.target / "usr" / "local" / "lib").is_dir())
+
+    def test_preexisting_unrelated_sibling_directory_is_untouched(self):
+        (self.target / "usr").mkdir(mode=0o755)
+        share = self.target / "usr" / "share"
+        share.mkdir()
+        share_marker = share / "keep"
+        share_marker.write_text("keep", encoding="utf-8")
+        self.provisioner().publish(prepared_root=self.prepared)
+        self.assertEqual(share_marker.read_text(), "keep")
+
+    def test_symlinked_usr_fails_closed_and_publishes_nothing(self):
+        outside = self.root / "outside-usr"
+        outside.mkdir()
+        (self.target / "usr").symlink_to(outside, target_is_directory=True)
+        with self.assertRaisesRegex(RuntimeProvisioningError, "symlink"):
+            self.provisioner().publish(prepared_root=self.prepared)
+        self.assertFalse(self.binary.exists())
+        self.assertFalse(any(call[0] in {"build", "validate_prefix", "ldconfig"} for call in self.calls))
+
+    def test_symlinked_usr_local_fails_closed(self):
+        (self.target / "usr").mkdir()
+        outside = self.root / "outside-local"
+        outside.mkdir()
+        (self.target / "usr" / "local").symlink_to(outside, target_is_directory=True)
+        with self.assertRaisesRegex(RuntimeProvisioningError, "symlink"):
+            self.provisioner().publish(prepared_root=self.prepared)
+        self.assertFalse(self.binary.exists())
+
+    def test_symlinked_usr_local_bin_fails_closed(self):
+        (self.target / "usr" / "local").mkdir(parents=True)
+        outside = self.root / "outside-bin"
+        outside.mkdir()
+        (self.target / "usr" / "local" / "bin").symlink_to(outside, target_is_directory=True)
+        with self.assertRaisesRegex(RuntimeProvisioningError, "symlink"):
+            self.provisioner().publish(prepared_root=self.prepared)
+        self.assertFalse(self.binary.exists())
+
+    def test_symlinked_usr_local_lib_fails_closed(self):
+        (self.target / "usr" / "local" / "bin").mkdir(parents=True)
+        outside = self.root / "outside-lib"
+        outside.mkdir()
+        (self.target / "usr" / "local" / "lib").symlink_to(outside, target_is_directory=True)
+        with self.assertRaisesRegex(RuntimeProvisioningError, "symlink"):
+            self.provisioner().publish(prepared_root=self.prepared)
+        self.assertFalse(self.library.exists())
+
+    def test_non_directory_collision_fails_closed(self):
+        (self.target / "usr").mkdir()
+        (self.target / "usr" / "local").write_text("not a directory", encoding="utf-8")
+        with self.assertRaisesRegex(RuntimeProvisioningError, "not a directory"):
+            self.provisioner().publish(prepared_root=self.prepared)
+        self.assertFalse(self.binary.exists())
+
+    def test_target_root_not_owned_by_caller_fails_closed_before_any_creation(self):
+        with patch("isadoraair.runtime_native.os.geteuid", return_value=os.geteuid() + 1):
+            with self.assertRaisesRegex(RuntimeProvisioningError, "owned by the caller"):
+                self.provisioner().publish(prepared_root=self.prepared)
+        self.assertFalse((self.target / "usr").exists())
+
+    def test_target_root_not_writable_fails_closed_before_any_creation(self):
+        os.chmod(self.target, 0o500)
+        self.addCleanup(os.chmod, self.target, 0o700)
+        with self.assertRaisesRegex(RuntimeProvisioningError, "not writable"):
+            self.provisioner().publish(prepared_root=self.prepared)
+        self.assertFalse((self.target / "usr").exists())
+
+    def test_skeleton_created_before_a_later_failure_is_not_rolled_back(self):
+        """Documented policy: the confined directory skeleton is not part
+        of the two-file (binary + library) publication transaction --
+        empty 0755 directories under a disposable/noncanonical target
+        root are harmless, contain nothing sensitive, and are left in
+        place exactly like every other _mkdir_controlled call elsewhere
+        in this codebase is never rolled back on a later failure."""
+        def checkpoint(name):
+            if name == "after_binary_publication":
+                raise RuntimeProvisioningError("publish failed after directory creation")
+
+        with self.assertRaisesRegex(RuntimeProvisioningError, "publish failed"):
+            self.provisioner(seams=self.seams(checkpoint=checkpoint)).publish(
+                prepared_root=self.prepared
+            )
+        # The two-file transaction WAS rolled back (pre-existing E4 contract)...
+        self.assertFalse(self.binary.exists())
+        # ...but the skeleton directories this fix created remain.
+        for directory in (
+            self.target / "usr",
+            self.target / "usr" / "local",
+            self.target / "usr" / "local" / "bin",
+            self.target / "usr" / "local" / "lib",
+        ):
+            self.assertTrue(directory.is_dir())
+
+    def test_a_preexisting_skeleton_directory_is_never_removed_on_failure(self):
+        (self.target / "usr" / "local" / "bin").mkdir(parents=True)
+        (self.target / "usr" / "local" / "lib").mkdir()
+
+        def checkpoint(name):
+            if name == "after_binary_publication":
+                raise RuntimeProvisioningError("publish failed")
+
+        with self.assertRaisesRegex(RuntimeProvisioningError, "publish failed"):
+            self.provisioner(seams=self.seams(checkpoint=checkpoint)).publish(
+                prepared_root=self.prepared
+            )
+        self.assertTrue((self.target / "usr" / "local" / "bin").is_dir())
+        self.assertTrue((self.target / "usr" / "local" / "lib").is_dir())
+
+
+class CanonicalPublicationNeverAutoCreatesTests(NativeFixture):
+    """Canonical "/" must keep requiring the trusted system hierarchy to
+    already exist -- native publication must never manufacture trusted
+    system ancestors on the real host. Real "/" cannot safely be
+    exercised end-to-end in a test process, so this is proven two ways:
+    a static guard on _preflight_publish's own source, and a functional
+    check that the canonical branch fails before root privileges even
+    let it reach directory validation."""
+
+    def test_preflight_publish_only_calls_the_creation_helper_for_noncanonical_roots(self):
+        source = inspect.getsource(NativeRuntimeProvisioner._preflight_publish)
+        guard_index = source.index('if root != Path("/"):')
+        call_index = source.index("_ensure_noncanonical_publication_directories(")
+        self.assertGreater(
+            call_index, guard_index,
+            "_ensure_noncanonical_publication_directories must be called only inside "
+            'the "if root != Path(\\"/\\")" branch',
+        )
+        # And nowhere else in the method, unconditionally.
+        self.assertEqual(source.count("_ensure_noncanonical_publication_directories("), 1)
+
+    def test_canonical_root_still_requires_root_privileges_before_anything_else(self):
+        canonical = NativeRuntimeProvisioner(
+            requirements=requirements(),
+            product_manifest=self.product,
+            target_root="/",
+            seams=self.seams(),
+        )
+        with patch("isadoraair.runtime_native.os.geteuid", return_value=12345):
+            with self.assertRaisesRegex(RuntimeProvisioningError, "root privileges"):
+                canonical.publish(prepared_root=self.prepared, expected_preparer_uid=12345)
+
+    def test_canonical_root_with_missing_usr_local_fails_closed_not_auto_created(self):
+        """Simulates canonical "/" whose /usr/local does not exist, purely
+        via mocking (never touching the real host filesystem, and calling
+        _preflight_publish directly -- the full publish() transaction
+        also acquires a real cross-process lock that itself writes under
+        the real canonical runtime root, which a non-root test process
+        cannot safely simulate its way past). Proves the canonical branch
+        still hits _assert_existing_directory's fail-closed path rather
+        than silently creating anything."""
+        canonical = NativeRuntimeProvisioner(
+            requirements=requirements(),
+            product_manifest=self.product,
+            target_root="/",
+            seams=self.seams(),
+        )
+        real_lstat = Path.lstat
+
+        def fake_root_lstat(path):
+            if path == Path("/"):
+                return real_lstat(Path("/"))
+            if str(path) in ("/usr/local", "/usr"):
+                raise FileNotFoundError(path)
+            return real_lstat(path)
+
+        with patch("isadoraair.runtime_native.os.geteuid", return_value=0), patch(
+            "isadoraair.runtime_native.os.access", return_value=True
+        ):
+            with patch.object(Path, "lstat", autospec=True, side_effect=fake_root_lstat):
+                with self.assertRaisesRegex(RuntimeProvisioningError, "directory is unavailable"):
+                    canonical._preflight_publish()
 
 
 class NativeLockingTests(NativeFixture):
