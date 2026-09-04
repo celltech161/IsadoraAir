@@ -51,6 +51,37 @@ closure" section for the full narrative):
   act on) and then downloads EXACTLY that resolved name list -- not just
   the packages named in `deploy/packages-ubuntu-26.04.txt`.
 
+  The simulate/`-s` pass never needs root (it never touches the
+  filesystem at all -- true of ordinary apt-get simulate regardless of
+  status/cache isolation). The REAL download (`apt-get install
+  --download-only`, no `-s`) is a different story even with an isolated
+  Dir::State::status/Dir::Cache::archives: apt-get's normal download path
+  still acquires the dpkg/frontend/archive locks before it does anything,
+  including a download-only run -- unprivileged only if this process
+  already owns those lock paths, which an isolated, freshly-created
+  archive dir does NOT guarantee in general. r0038 code review (round 2):
+  the real download call runs under the SAME `sudo_prefix` as `apt-get
+  update`, controlled by the same `sudo` parameter -- it still never
+  unpacks/configures anything (`--download-only`), still uses the
+  isolated status/cache, still names the exact resolved closure. `sudo`
+  can still be set False for a mocked/unit-test runner that never touches
+  a real apt-get at all.
+
+  A resolver token from `-s` output can be architecture-qualified
+  (`Inst libc6:amd64 (...)` for a native/multiarch package) -- Debian
+  archive `.deb` filenames never include that qualifier
+  (`libc6_<version>_amd64.deb`, never `libc6:amd64_<version>_amd64.deb`),
+  so a raw token is never used directly as a cache-glob package name.
+  `split_resolver_token` splits it into (bare name, architecture-or-None)
+  ONLY for that file lookup -- `find_cached_deb` prefers an
+  architecture-matched candidate when one is available, so two same-name
+  different-architecture cached .deb files are never conflated. The RAW
+  (possibly arch-qualified) token is still what's passed to apt-get for
+  the real download, so multiarch resolution stays exactly what apt
+  itself intended. The final copied artifact's identity is always
+  re-verified against real `dpkg-deb` control metadata either way -- the
+  resolver token is never trusted as authoritative on its own.
+
   3. The snap closure needs more than `{snapd, chromium}` to avoid
      reaching for the Snap Store mid-sequence (a manifest missing e.g.
      `mesa-2404` would previously still pass verification and only fail
@@ -78,11 +109,11 @@ Usage:
 
 Requires on THIS (builder) host only: apt-get, dpkg-deb, dpkg-scanpackages
 (package `dpkg-dev`), snap, gzip -- all standard on an Ubuntu 26.04 box.
-Only `apt-get update` (refreshing this host's real package indices) runs
-under sudo; every apt-closure resolution/download call uses an isolated
-status+cache it owns and needs no root at all. Writes no secret material
--- there is none to write; package/snap closures are public software, not
-credentials.
+`apt-get update` and the real `apt-get install --download-only` both run
+under sudo (the isolated status/cache do not make the real download
+unprivileged -- see above); only the `-s`/simulate resolution pass needs
+no root. Writes no secret material -- there is none to write; package/
+snap closures are public software, not credentials.
 """
 
 from __future__ import annotations
@@ -192,7 +223,13 @@ def parse_simulate_inst_names(simulate_stdout: str) -> list[str]:
     act on with `Inst <name> ...` -- this is the authoritative resolved
     closure (direct + every transitive dependency), straight from apt's
     own dependency resolver. Never hand-curated. Meaningful only when run
-    against an isolated/empty dpkg status -- see `_isolation_opts`."""
+    against an isolated/empty dpkg status -- see `_isolation_opts`.
+
+    `<name>` can be architecture-qualified for a native/multiarch package
+    (`Inst libc6:amd64 ...`) -- returned VERBATIM, unsplit, so the exact
+    resolver token is still what's passed to the real apt-get download
+    call. `split_resolver_token` is where that qualifier gets peeled off,
+    only where it must be (file lookup)."""
     names: list[str] = []
     for line in simulate_stdout.splitlines():
         line = line.strip()
@@ -201,6 +238,21 @@ def parse_simulate_inst_names(simulate_stdout: str) -> list[str]:
             if len(parts) >= 2:
                 names.append(parts[1])
     return names
+
+
+def split_resolver_token(token: str) -> tuple[str, str | None]:
+    """Split an apt resolver token into (bare_package_name, architecture
+    or None). Debian archive `.deb` filenames are always
+    `<name>_<version>_<arch>.deb` -- NEVER `<name>:<arch>_<version>_
+    <arch>.deb` -- so a `name:arch` resolver token must never be used
+    verbatim as a cache-glob package name. The architecture, when
+    present, is retained (not discarded) so `find_cached_deb` can
+    disambiguate same-name-different-architecture cached files rather
+    than silently guessing."""
+    if ":" in token:
+        name, architecture = token.split(":", 1)
+        return name, architecture
+    return token, None
 
 
 def _isolation_opts(status_path: Path, archives_dir: Path) -> list[str]:
@@ -214,7 +266,11 @@ def _isolation_opts(status_path: Path, archives_dir: Path) -> list[str]:
       - Dir::Cache::archives: a dedicated, empty-at-start directory this
         run owns, so downloaded .deb files can never be confused with
         (or shadowed by) a previous run's or the real system's cache.
-    Both overrides also mean these apt-get calls need no root at all."""
+    These overrides make dependency RESOLUTION independent of root/real
+    system state -- they do NOT make the real (non-simulate) download
+    call unprivileged: apt-get's normal download path still acquires the
+    dpkg/frontend/archive locks even for `--download-only`. See
+    build_apt_closure's own sudo handling."""
     return [
         "-o", f"Dir::State::status={status_path}",
         "-o", f"Dir::Cache::archives={archives_dir}",
@@ -236,14 +292,26 @@ def read_deb_control_fields(deb_path: Path, runner: Runner) -> dict[str, str]:
     return fields
 
 
-def find_cached_deb(archives_dir: Path, package_name: str) -> Path:
+def find_cached_deb(archives_dir: Path, package_name: str, architecture: str | None = None) -> Path:
+    """package_name must already be the BARE name (see
+    split_resolver_token) -- never an arch-qualified resolver token.
+    When `architecture` is given (from that same split), candidates
+    matching `_<architecture>.deb` are preferred whenever any exist, so
+    two cached .deb files sharing a bare name but differing only in
+    architecture (a genuine multiarch scenario) are never conflated by a
+    plain glob+mtime guess."""
     candidates = sorted(
         p for p in archives_dir.glob(f"{package_name}_*.deb")
         if fnmatch.fnmatchcase(p.name.split("_", 1)[0], package_name)
     )
+    if architecture is not None:
+        arch_matches = [p for p in candidates if p.name.endswith(f"_{architecture}.deb")]
+        if arch_matches:
+            candidates = arch_matches
     if not candidates:
         raise ClosureBuildError(
-            f"expected a cached .deb for '{package_name}' in {archives_dir} after "
+            f"expected a cached .deb for '{package_name}"
+            f"{':' + architecture if architecture else ''}' in {archives_dir} after "
             "`apt-get install --download-only` against the isolated closure archive, found "
             "none -- this indicates the real download step did not actually fetch a package "
             "the simulate step resolved; re-run with apt-get's own output visible to diagnose."
@@ -301,21 +369,45 @@ def build_apt_closure(
         # Simulate against the isolated/empty status: apt resolves the
         # full recursive closure as a genuinely clean machine would need
         # it, independent of this builder's own real installed state.
+        # Never sudo -- simulate touches no filesystem state at all.
         simulate = runner(
             ["apt-get", "install", "--download-only", "-s", "-y", *iso, *direct_packages]
         )
         if simulate.returncode != 0:
             raise ClosureBuildError(f"apt-get install --simulate failed to resolve the closure: {simulate.stderr}")
-        closure_names = sorted(set(parse_simulate_inst_names(simulate.stdout)) | set(direct_packages))
-        if not closure_names:
+        # Raw resolver tokens -- may be architecture-qualified
+        # (`libc6:amd64`); never split/stripped here, only where a file
+        # lookup specifically requires the bare name (see
+        # split_resolver_token / find_cached_deb below).
+        closure_tokens = sorted(set(parse_simulate_inst_names(simulate.stdout)) | set(direct_packages))
+        if not closure_tokens:
             raise ClosureBuildError("apt-get --simulate resolved an empty closure -- refusing to proceed")
 
-        # Real download: same isolation, and EVERY name explicitly from
+        # The SAME underlying package can appear twice in the set above
+        # under two different token spellings -- a bare direct-package
+        # name (e.g. "age", from direct_packages) and an architecture-
+        # qualified resolver token for that identical package (e.g.
+        # "age:amd64", from simulate output). Both split to the same
+        # bare name; collapse to exactly one token per bare name (the
+        # qualified spelling wins when both are present -- more precise
+        # for the real download call) so neither the download nor the
+        # manifest ever gets a duplicate entry for one real package.
+        by_bare_name: dict[str, str] = {}
+        for token in closure_tokens:
+            bare_name, _ = split_resolver_token(token)
+            if bare_name not in by_bare_name or ":" in token:
+                by_bare_name[bare_name] = token
+        closure_tokens = sorted(by_bare_name.values())
+
+        # Real download: same isolation, and EVERY token explicitly from
         # the exact resolved closure above (not just direct_packages) --
         # what gets downloaded is provably what was just resolved, never
-        # re-derived a second time by a second dependency resolution pass.
+        # re-derived a second time by a second dependency resolution
+        # pass. Unlike simulate, this genuinely writes files and acquires
+        # apt's dpkg/frontend/archive locks even with --download-only --
+        # sudo, same as `apt-get update` above.
         download = runner(
-            ["apt-get", "install", "--download-only", "-y", *iso, *closure_names]
+            [*sudo_prefix, "apt-get", "install", "--download-only", "-y", *iso, *closure_tokens]
         )
         if download.returncode != 0:
             raise ClosureBuildError(f"apt-get install --download-only failed: {download.stderr}")
@@ -325,8 +417,13 @@ def build_apt_closure(
 
         entries = []
         direct_set = set(direct_packages)
-        for name in closure_names:
-            cached = find_cached_deb(archives_dir, name)
+        for token in closure_tokens:
+            bare_name, architecture = split_resolver_token(token)
+            cached = find_cached_deb(archives_dir, bare_name, architecture)
+            # The copied artifact's real identity always comes from its
+            # own control metadata (dpkg-deb), never trusted from the
+            # resolver token alone -- true regardless of whether the
+            # token happened to be architecture-qualified.
             fields = read_deb_control_fields(cached, runner)
             dest = apt_repo_dir / cached.name
             shutil.copy2(cached, dest)

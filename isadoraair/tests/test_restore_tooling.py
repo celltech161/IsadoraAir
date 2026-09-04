@@ -2311,6 +2311,104 @@ class BuildOfflineClosureTests(SimpleTestCase):
                 self.assertEqual(len(cache_opts), 1)
                 self.assertNotIn("/var/cache/apt/archives", cache_opts[0])
 
+    def test_apt_closure_real_download_uses_sudo_simulate_never_does(self):
+        """r0038 code review round 2: the isolated status/cache make
+        dependency RESOLUTION independent of root, but the REAL
+        (non-simulate) download call still acquires apt's dpkg/frontend/
+        archive locks even with --download-only -- it must run under the
+        same sudo_prefix as `apt-get update`, never assumed unprivileged
+        just because the status/cache are isolated."""
+        work_dir = self.tmpdir / "work"
+        runner, calls = self._fake_apt_runner(work_dir, direct_names=["age"], transitive_names=[])
+        build_offline_closure.build_apt_closure(
+            ["age"], self.tmpdir / "out", runner=runner, sudo=True, work_dir=work_dir,
+        )
+        update_calls = [c[0] for c in calls if "update" in c[0]]
+        simulate_calls = [c[0] for c in calls if "-s" in c[0]]
+        download_calls = [c[0] for c in calls if "install" in c[0] and "--download-only" in c[0] and "-s" not in c[0]]
+        self.assertEqual(len(update_calls), 1)
+        self.assertEqual(len(simulate_calls), 1)
+        self.assertEqual(len(download_calls), 1)
+        self.assertEqual(update_calls[0][0], "sudo")
+        self.assertNotIn("sudo", simulate_calls[0])
+        self.assertEqual(download_calls[0][0], "sudo", "the real download-only call must run under sudo")
+        # Both isolated calls still carry the synthetic status; the real
+        # download call still carries the dedicated archive cache.
+        for argv in (simulate_calls[0], download_calls[0]):
+            self.assertTrue(any(str(a).startswith("Dir::State::status=") for a in argv))
+        self.assertTrue(any(str(a).startswith("Dir::Cache::archives=") for a in download_calls[0]))
+
+    def test_apt_closure_sudo_false_keeps_download_unprivileged_for_mocked_use(self):
+        """sudo=False (this test suite's own default) must still work --
+        the real download call simply omits the sudo prefix entirely,
+        for a runner that's mocked/never touches a real apt-get at all."""
+        work_dir = self.tmpdir / "work"
+        runner, calls = self._fake_apt_runner(work_dir, direct_names=["age"], transitive_names=[])
+        build_offline_closure.build_apt_closure(
+            ["age"], self.tmpdir / "out", runner=runner, sudo=False, work_dir=work_dir,
+        )
+        download_calls = [c[0] for c in calls if "install" in c[0] and "--download-only" in c[0] and "-s" not in c[0]]
+        self.assertEqual(len(download_calls), 1)
+        self.assertNotIn("sudo", download_calls[0])
+
+    def test_apt_closure_handles_architecture_qualified_resolver_token(self):
+        """apt's simulate output can return an arch-qualified resolver
+        token like 'foo:amd64' for a native/multiarch package -- Debian
+        archive filenames never include that qualifier
+        (foo_<version>_amd64.deb, never foo:amd64_<version>_amd64.deb),
+        so file lookup must split it, while the real download call still
+        gets the exact qualified token apt itself produced."""
+        work_dir = self.tmpdir / "work"
+        archives_dir = work_dir / "archives"
+        calls = []
+
+        def runner(argv, **kwargs):
+            calls.append(list(argv))
+            if "dpkg-scanpackages" in argv:
+                return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+            if "update" in argv:
+                return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+            if "-s" in argv:
+                return subprocess.CompletedProcess(argv, 0, stdout="Inst foo:amd64 (1.0-1 Ubuntu:26.04 [amd64])\n", stderr="")
+            if "dpkg-deb" in argv:
+                return subprocess.CompletedProcess(argv, 0, stdout="Package: foo\nVersion: 1.0-1\nArchitecture: amd64\n", stderr="")
+            if "install" in argv and "--download-only" in argv:
+                self.assertIn("foo:amd64", argv, "the exact qualified resolver token must reach the real download call")
+                (archives_dir / "foo_1.0-1_amd64.deb").write_bytes(b"foo-bytes")
+                return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+        result = build_offline_closure.build_apt_closure(
+            ["foo"], self.tmpdir / "out", runner=runner, sudo=False, work_dir=work_dir,
+        )
+        # Exactly one entry -- "foo" (direct_packages, bare) and
+        # "foo:amd64" (simulate output) are the SAME real package, never
+        # two manifest entries for it.
+        self.assertEqual(len(result.entries), 1)
+        entry = result.entries[0]
+        self.assertEqual(entry["name"], "foo")
+        self.assertEqual(entry["architecture"], "amd64")
+        self.assertEqual(entry["filename"], "apt-repo/foo_1.0-1_amd64.deb")
+        self.assertTrue(entry["direct"])
+        self.assertTrue((result.apt_repo_dir / "foo_1.0-1_amd64.deb").is_file())
+
+    def test_find_cached_deb_prefers_architecture_match_when_ambiguous(self):
+        """Two cached .deb files sharing a bare name but differing only
+        in architecture (a genuine multiarch scenario) must never be
+        conflated by a plain glob+mtime guess."""
+        archives_dir = self.tmpdir / "archives"
+        archives_dir.mkdir()
+        (archives_dir / "foo_1.0-1_amd64.deb").write_bytes(b"amd64-bytes")
+        (archives_dir / "foo_1.0-1_i386.deb").write_bytes(b"i386-bytes")
+        found = build_offline_closure.find_cached_deb(archives_dir, "foo", architecture="i386")
+        self.assertEqual(found.name, "foo_1.0-1_i386.deb")
+        found_amd64 = build_offline_closure.find_cached_deb(archives_dir, "foo", architecture="amd64")
+        self.assertEqual(found_amd64.name, "foo_1.0-1_amd64.deb")
+
+    def test_split_resolver_token(self):
+        self.assertEqual(build_offline_closure.split_resolver_token("age"), ("age", None))
+        self.assertEqual(build_offline_closure.split_resolver_token("libc6:amd64"), ("libc6", "amd64"))
+
     def test_apt_closure_writes_manifest_and_direct_list_and_local_repo_index(self):
         work_dir = self.tmpdir / "work"
         runner, calls = self._fake_apt_runner(
