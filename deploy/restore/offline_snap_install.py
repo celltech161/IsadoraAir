@@ -22,10 +22,35 @@ privileged install sequence (ack/install/stop-snapd/dpkg -i/restart-snapd)
 stays in `10-packages.sh`, which already owns every other stage's
 plan/apply/sudo idiom (see `lib.sh`). This script's whole reason to exist
 is that manifest verification -- JSON schema, path confinement, SHA256
-checks, "snapd and chromium must both be present", "install_order must be
-a genuine permutation with snapd no later than chromium" -- is exactly the
-kind of logic that is easy to get subtly wrong and easy to unit-test in
-Python, and hard to get right (or test) in bash.
+checks, and the full required-snap-set/install-order recovery contract
+below -- is exactly the kind of logic that is easy to get subtly wrong
+and easy to unit-test in Python, and hard to get right (or test) in bash.
+
+## The required-snap-set/install-order contract
+
+r0038 code review found the original "snapd and chromium must both be
+present, and snapd no later than chromium" check insufficient: a
+manifest missing `mesa-2404`, `core22`, `core24`, `gtk-common-themes`,
+etc. would still PASS verification and only fail later during `snap
+install` -- potentially still reaching for the Snap Store mid-sequence.
+A coarse type-bucket/alphabetical install order is also not an actual
+dependency graph and does not match what was proven to work by hand.
+
+So this module hard-codes `REQUIRED_SNAP_INSTALL_ORDER` below as an
+explicit, versioned recovery contract for the CURRENT Ubuntu 26.04 /
+Chromium snap stack -- the exact sequence proven to install fully
+offline during the E8 acceptance run (`bare`/`core22`/`core24` need
+nothing else; `snapd` the system snap itself must exist locally before
+`mesa-2404` -- which failed for exactly its absence -- or anything after
+it; `chromium` goes last since it needs the rest already present). A
+manifest's `snaps` must be exactly this set and its `install_order` must
+be exactly this sequence -- not merely a permutation, not a superset,
+not a looser ordering -- or verification fails closed before any
+privileged action. snap REVISIONS remain entirely manifest-driven; only
+the set of NAMES and their relative order is an explicit code contract.
+If a future Ubuntu/Chromium snap stack needs a different closure, update
+`REQUIRED_SNAP_INSTALL_ORDER` deliberately (a reviewed code change), not
+silently accept whatever a manifest happens to declare.
 
 Fail-closed by design: ANY problem with the manifest or the files it
 references -- missing manifest, malformed JSON, missing/renamed file,
@@ -55,8 +80,8 @@ Exit codes:
   2  manifest missing, unreadable, or fails schema validation
   3  a file the manifest references is missing, unsafe, or not a regular file
   4  a SHA256 in the manifest does not match the file's real contents
-  5  a required snap ("snapd" and/or "chromium") is absent from the manifest
-  6  install_order is not a valid dependency-safe ordering of the manifest's snaps
+  5  one or more required snaps (see REQUIRED_SNAP_INSTALL_ORDER) are absent
+  6  install_order does not exactly match REQUIRED_SNAP_INSTALL_ORDER
 """
 
 from __future__ import annotations
@@ -69,7 +94,25 @@ from dataclasses import dataclass
 from pathlib import Path
 
 MANIFEST_NAME = "snap-manifest.json"
-REQUIRED_SNAP_NAMES = ("snapd", "chromium")
+
+# The proven-offline Ubuntu 26.04 / Chromium snap recovery contract (E8
+# acceptance run, r0038 review) -- see this module's own docstring for
+# why this is a fixed, explicit sequence rather than a computed
+# type-bucket/alphabetical order or a bare {snapd, chromium} minimum.
+# bare/core22/core24 need nothing else; snapd (the system snap) must be
+# present before mesa-2404 (which failed for exactly its absence) or
+# anything after it; chromium goes last.
+REQUIRED_SNAP_INSTALL_ORDER = (
+    "bare",
+    "core22",
+    "core24",
+    "snapd",
+    "mesa-2404",
+    "gtk-common-themes",
+    "gnome-46-2404",
+    "cups",
+    "chromium",
+)
 _SHA256_RE_LEN = 64
 _REQUIRED_ENTRY_KEYS = {"name", "revision", "snap_file", "snap_sha256", "assert_file", "assert_sha256"}
 
@@ -186,13 +229,22 @@ def _validate_schema(data: dict) -> tuple[list[dict], list[str]]:
 
 
 def _validate_required_snaps_present(names: set[str]) -> None:
-    missing = [n for n in REQUIRED_SNAP_NAMES if n not in names]
+    missing = [n for n in REQUIRED_SNAP_INSTALL_ORDER if n not in names]
     if missing:
         raise RequiredSnapMissingError(
             "snap manifest is missing required snap(s): "
             + ", ".join(missing)
-            + " -- an offline Selenium/Chromium closure must include both the snapd "
-            "system snap and chromium; see build_offline_closure.py's snap-closure step."
+            + " -- the current Ubuntu 26.04/Chromium offline recovery contract requires "
+            "every one of " + ", ".join(REQUIRED_SNAP_INSTALL_ORDER) + "; see "
+            "build_offline_closure.py's snap-closure step and this module's own docstring."
+        )
+    extra = sorted(names - set(REQUIRED_SNAP_INSTALL_ORDER))
+    if extra:
+        raise RequiredSnapMissingError(
+            "snap manifest declares snap(s) outside the current recovery contract: "
+            + ", ".join(extra)
+            + " -- the manifest's 'snaps' must be EXACTLY " + ", ".join(REQUIRED_SNAP_INSTALL_ORDER)
+            + ", not a superset; see this module's own docstring."
         )
 
 
@@ -202,13 +254,13 @@ def _validate_install_order(snap_names: list[str], install_order: list[str]) -> 
             "snap manifest: 'install_order' must contain each snap in 'snaps' exactly once "
             f"(snaps={sorted(snap_names)}, install_order={install_order})"
         )
-    snapd_index = install_order.index("snapd")
-    chromium_index = install_order.index("chromium")
-    if snapd_index > chromium_index:
+    expected = list(REQUIRED_SNAP_INSTALL_ORDER)
+    if install_order != expected:
         raise InstallOrderError(
-            "snap manifest: 'install_order' installs chromium before snapd -- the snapd "
-            "system snap must be installed no later than chromium, since chromium's own "
-            "prerequisite snaps (mesa/gtk-common-themes/etc.) may need it during install"
+            "snap manifest: 'install_order' must exactly match the current Ubuntu 26.04/"
+            f"Chromium offline recovery contract order {expected} -- got {install_order}. "
+            "This is a fixed, proven-offline sequence, not a computed/alphabetical one; "
+            "see this module's own docstring."
         )
 
 

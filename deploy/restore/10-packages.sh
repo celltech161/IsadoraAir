@@ -173,6 +173,26 @@ done
 
 log_info "=== 10-packages ==="
 
+# ---------------------------------------------------------------------
+# r0038 code review: --apt-repo-dir + --with-syndicated-selenium with NO
+# --snap-dir must fail closed, not silently fall through to the ordinary
+# apt chromium-browser path. An operator who explicitly scoped apt to a
+# strictly offline local repo has clearly signaled an offline/E8-style
+# run -- letting Selenium/Chromium through the ordinary path in that
+# situation would still hit the Snap Store transition-package hang this
+# whole file exists to avoid (see the "Local-snap mode" section above),
+# just later and more confusingly. This check runs BEFORE any apt/snap/
+# dpkg action, in BOTH --plan and --apply -- a configuration error, not
+# a runtime one, so there is nothing to preview differently between the
+# two modes. Selenium + neither offline flag (ordinary connected
+# install) and Selenium + --snap-dir (with or without --apt-repo-dir)
+# both remain entirely unaffected by this check.
+# ---------------------------------------------------------------------
+if [ -n "$APT_REPO_DIR" ] && [ "$WITH_SYNDICATED_SELENIUM" -eq 1 ] && [ -z "$SNAP_DIR" ]; then
+  log_error "10-packages.sh: --apt-repo-dir with --with-syndicated-selenium also requires --snap-dir -- on Ubuntu 26.04, chromium-browser is a Snap Store transition package, and the ordinary apt install path can re-enter its offline hang under a strictly offline apt repo. Provide --snap-dir (see docs/DISASTER_RECOVERY_RESTORE.md's 'Offline package/snap closure' section), or drop --apt-repo-dir for an ordinary connected install."
+  exit 2
+fi
+
 # Overridable only for test isolation (see isadoraair/tests/
 # test_restore_tooling.py's Stage10 local-snap functional tests) -- a
 # real restore always uses the real /run/snapd.socket; this lets a test

@@ -10,57 +10,79 @@ directory to off-host recovery media. `10-packages.sh --snap-dir PATH`
 script is never invoked during a restore itself, and needs real Internet
 access to do its job; the restore host never needs any.
 
-Two closure defects found by the genuine E8 clean/offline acceptance run
-motivate this tool's specific design choices (see
-`docs/DISASTER_RECOVERY_RESTORE.md`'s "Offline package/snap closure"
-section for the full narrative):
+Two apt-closure defects and one snap-closure defect found by the genuine
+E8 clean/offline acceptance run (plus a code-review pass that found the
+first fix was still incomplete) motivate this tool's specific design
+choices (see `docs/DISASTER_RECOVERY_RESTORE.md`'s "Offline package/snap
+closure" section for the full narrative):
 
   1. `age` -- a DIRECT package -- was silently missing from a prior ad hoc
      apt closure because it was already installed on the source host, and
      a naive `apt-get --download-only install` does not re-fetch a
-     package that is already installed. This tool always runs the real
-     download step with `--reinstall`, which forces apt to fetch every
-     package in the resolved dependency graph regardless of its current
-     install state on the source host -- there is no special case for
-     "already installed", because that is exactly the class of bug that
-     caused the omission.
+     package that is already installed.
   2. `bubblewrap` -- a TRANSITIVE dependency (`glycin-loaders ->
      bubblewrap`) -- was missing entirely: no .deb, no Packages stanza,
-     no manifest entry. This tool never hand-curates the transitive set;
-     it always takes apt's own dependency resolver's word for the full
-     closure (`apt-get install --reinstall --download-only -s`, i.e. a
-     simulate/dry-run, enumerates every `Inst <name>` line apt would act
-     on) and captures every one of them, not just the packages named in
-     `deploy/packages-ubuntu-26.04.txt`.
+     no manifest entry.
 
-For snaps, the same "capture reality, don't hand-curate" principle
-applies to the one problem that is snap-specific: this tool always
-includes the `snapd` system snap explicitly (a real production `mesa-2404`
-install offline failed for exactly the lack of it -- see the
-`10-packages.sh`/`offline_snap_install.py` headers for the full story),
-and prefers to capture each snap at its ACTUAL locally-installed revision
-(`snap list <name>`) rather than whatever the store's current stable
-channel happens to be, so the closure matches what production is really
-running rather than drifting from it between builder runs.
+  The FIRST fix attempt for (1) used `apt-get install --reinstall
+  --download-only` against the builder's REAL dpkg status. That is
+  insufficient for (2): `--reinstall` only forces re-fetching of packages
+  named directly on the command line -- it does nothing for a transitive
+  dependency that the builder's real dpkg status already reports as
+  satisfied, so a builder host where `bubblewrap` happens to already be
+  installed would still omit it, silently, exactly like `age` originally
+  was. The actual, general fix (r0038 code review): resolve and download
+  against an ISOLATED, EMPTY synthetic dpkg status
+  (`-o Dir::State::status=<empty file>`), so apt computes the closure as
+  a genuinely clean machine would need it -- completely independent of
+  whatever this builder host happens to already have installed, for
+  EVERY package in the graph, direct or transitive, not just the ones
+  named on the command line. `-o Dir::Cache::archives=<dedicated temp
+  dir>` is used for the same run, so no stale `.deb` left over from a
+  previous run or the builder's own real `/var/cache/apt/archives` can
+  influence the result. Real package availability/versions still come
+  from the REAL configured apt sources (`Dir::State::lists` is left
+  alone) -- only "what's already installed" is faked away.
+
+  This tool never hand-curates the transitive set either way: it always
+  takes apt's own dependency resolver's word for the full closure
+  (`apt-get install --download-only -s`, a simulate/dry-run against that
+  same isolated status, enumerating every `Inst <name>` line apt would
+  act on) and then downloads EXACTLY that resolved name list -- not just
+  the packages named in `deploy/packages-ubuntu-26.04.txt`.
+
+  3. The snap closure needs more than `{snapd, chromium}` to avoid
+     reaching for the Snap Store mid-sequence (a manifest missing e.g.
+     `mesa-2404` would previously still pass verification and only fail
+     later, potentially triggering a store lookup). And a coarse
+     type-bucket/alphabetical install order is not an actual dependency
+     graph. r0038 code review: this tool now always builds the full,
+     fixed, PROVEN-offline Ubuntu 26.04/Chromium snap set and order --
+     see `offline_snap_install.REQUIRED_SNAP_INSTALL_ORDER`, the single
+     source of truth both tools share (imported here, never duplicated).
+     Each snap is still captured at its ACTUAL locally-installed revision
+     (`snap list <name>`) when available, rather than whatever the
+     store's current stable channel happens to be, so the closure matches
+     what production is really running rather than drifting from it
+     between builder runs; only when a snap isn't installed locally does
+     this fall back to downloading the given `--channel`.
 
 Usage:
   build_offline_closure.py apt-closure --out-dir DIR
       [--packages-file deploy/packages-ubuntu-26.04.txt]
       [--groups CORE,AUDIO_GSTREAMER,BUILD_HEAAC,OPTIONAL_CD_RIP,OPTIONAL_KOKORO_TTS,OPTIONAL_SYNDICATED_SELENIUM,OPTIONAL_BACKUP_ENCRYPTION]
 
-  build_offline_closure.py snap-closure --out-dir DIR
-      [--snaps chromium,gtk-common-themes,gnome-46-2404,cups,mesa-2404,core22,core24,bare]
-      [--channel latest/stable]
+  build_offline_closure.py snap-closure --out-dir DIR [--channel latest/stable]
 
   build_offline_closure.py all --out-dir DIR [same flags as both above]
 
 Requires on THIS (builder) host only: apt-get, dpkg-deb, dpkg-scanpackages
 (package `dpkg-dev`), snap, gzip -- all standard on an Ubuntu 26.04 box.
-Both apt-get steps that actually touch the network/cache run under sudo
-(the simulate/-s enumeration step does not need root and is never run
-under sudo). Never runs anything as root beyond that. Writes no secret
-material -- there is none to write; package/snap closures are public
-software, not credentials.
+Only `apt-get update` (refreshing this host's real package indices) runs
+under sudo; every apt-closure resolution/download call uses an isolated
+status+cache it owns and needs no root at all. Writes no secret material
+-- there is none to write; package/snap closures are public software, not
+credentials.
 """
 
 from __future__ import annotations
@@ -74,10 +96,19 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
+
+# offline_snap_install.REQUIRED_SNAP_INSTALL_ORDER is the one shared
+# source of truth for the snap recovery contract's names/order -- never
+# duplicated here. Works whether this file is run directly (its own
+# directory is already sys.path[0]) or loaded dynamically by path (e.g.
+# from a test) -- the explicit insert covers the latter.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from offline_snap_install import REQUIRED_SNAP_INSTALL_ORDER  # noqa: E402
 
 Runner = Callable[..., subprocess.CompletedProcess]
 
@@ -90,18 +121,6 @@ DEFAULT_GROUPS = (
     "OPTIONAL_SYNDICATED_SELENIUM",
     "OPTIONAL_BACKUP_ENCRYPTION",
 )
-DEFAULT_SNAPS = (
-    "bare",
-    "core22",
-    "core24",
-    "gtk-common-themes",
-    "mesa-2404",
-    "gnome-46-2404",
-    "cups",
-    "chromium",
-)
-ESSENTIAL_SNAP = "snapd"
-CHROMIUM_SNAP = "chromium"
 _GROUP_HEADER_RE = re.compile(r"^([A-Z_][A-Z0-9_]*)=\($")
 
 
@@ -172,7 +191,8 @@ def parse_simulate_inst_names(simulate_stdout: str) -> list[str]:
     """apt-get's `-s`/`--simulate` output prefixes every package it would
     act on with `Inst <name> ...` -- this is the authoritative resolved
     closure (direct + every transitive dependency), straight from apt's
-    own dependency resolver. Never hand-curated."""
+    own dependency resolver. Never hand-curated. Meaningful only when run
+    against an isolated/empty dpkg status -- see `_isolation_opts`."""
     names: list[str] = []
     for line in simulate_stdout.splitlines():
         line = line.strip()
@@ -181,6 +201,24 @@ def parse_simulate_inst_names(simulate_stdout: str) -> list[str]:
             if len(parts) >= 2:
                 names.append(parts[1])
     return names
+
+
+def _isolation_opts(status_path: Path, archives_dir: Path) -> list[str]:
+    """apt-get -o overrides that make dependency resolution/download
+    depend ONLY on the real configured package sources (Dir::State::lists
+    is deliberately left alone), never on this builder host's own
+    installed-package state or any stale previously-downloaded .deb:
+      - Dir::State::status: an isolated, empty dpkg status file, so apt
+        resolves as if NOTHING is installed yet -- the fix for the
+        bubblewrap-class defect (see module docstring).
+      - Dir::Cache::archives: a dedicated, empty-at-start directory this
+        run owns, so downloaded .deb files can never be confused with
+        (or shadowed by) a previous run's or the real system's cache.
+    Both overrides also mean these apt-get calls need no root at all."""
+    return [
+        "-o", f"Dir::State::status={status_path}",
+        "-o", f"Dir::Cache::archives={archives_dir}",
+    ]
 
 
 def read_deb_control_fields(deb_path: Path, runner: Runner) -> dict[str, str]:
@@ -206,12 +244,13 @@ def find_cached_deb(archives_dir: Path, package_name: str) -> Path:
     if not candidates:
         raise ClosureBuildError(
             f"expected a cached .deb for '{package_name}' in {archives_dir} after "
-            "`apt-get install --reinstall --download-only`, found none -- this indicates "
-            "the real download step did not actually fetch a package the simulate step "
-            "resolved; re-run with apt-get's own output visible to diagnose."
+            "`apt-get install --download-only` against the isolated closure archive, found "
+            "none -- this indicates the real download step did not actually fetch a package "
+            "the simulate step resolved; re-run with apt-get's own output visible to diagnose."
         )
-    # Multiple cached versions (from a previous run) can coexist; the most
-    # recently written one is the one this run's download step produced.
+    # Multiple cached versions can coexist only in pathological cases
+    # (this run owns a fresh, dedicated archives dir) -- the most
+    # recently written one is authoritative either way.
     return max(candidates, key=lambda p: p.stat().st_mtime)
 
 
@@ -227,59 +266,83 @@ def build_apt_closure(
     direct_packages: list[str],
     out_dir: Path,
     runner: Runner = _default_runner,
-    archives_dir: Path = Path("/var/cache/apt/archives"),
     sudo: bool = True,
+    work_dir: Path | None = None,
 ) -> AptClosureResult:
+    """work_dir: an isolated scratch directory this function creates the
+    synthetic dpkg status file and dedicated archive cache under. If not
+    given, a temp directory is created and removed automatically; a
+    caller-supplied work_dir is left in place for the caller to inspect/
+    clean up (used by tests)."""
     if not direct_packages:
         raise ClosureBuildError("no direct packages resolved -- refusing to build an empty closure")
 
     sudo_prefix = ["sudo"] if sudo else []
 
+    # Only step that touches real, shared system state -- refreshing
+    # THIS host's real package indices (Dir::State::lists), which the
+    # isolated-status calls below deliberately still read from.
     update = runner([*sudo_prefix, "apt-get", "update"])
     if update.returncode != 0:
         raise ClosureBuildError(f"apt-get update failed: {update.stderr}")
 
-    # Simulate first (no root, no network/filesystem writes) purely to
-    # enumerate the full resolved closure via apt's own resolver.
-    simulate = runner(
-        ["apt-get", "install", "--reinstall", "--download-only", "-s", "-y", *direct_packages]
-    )
-    if simulate.returncode != 0:
-        raise ClosureBuildError(f"apt-get install --simulate failed to resolve the closure: {simulate.stderr}")
-    closure_names = sorted(set(parse_simulate_inst_names(simulate.stdout)) | set(direct_packages))
-    if not closure_names:
-        raise ClosureBuildError("apt-get --simulate resolved an empty closure -- refusing to proceed")
+    owns_work_dir = work_dir is None
+    if work_dir is None:
+        work_dir = Path(tempfile.mkdtemp(prefix="isadoraair-apt-closure-"))
+    else:
+        work_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        status_path = work_dir / "isolated-dpkg-status"
+        status_path.touch()
+        archives_dir = work_dir / "archives"
+        archives_dir.mkdir(parents=True, exist_ok=True)
+        iso = _isolation_opts(status_path, archives_dir)
 
-    # Real download: --reinstall forces every package to be fetched
-    # regardless of current install state (the `age` fix); --download-only
-    # never unpacks/configures anything, so this step is safe to run
-    # against a live source host.
-    download = runner(
-        [*sudo_prefix, "apt-get", "install", "--reinstall", "--download-only", "-y", *direct_packages]
-    )
-    if download.returncode != 0:
-        raise ClosureBuildError(f"apt-get install --reinstall --download-only failed: {download.stderr}")
-
-    apt_repo_dir = out_dir / "apt-repo"
-    apt_repo_dir.mkdir(parents=True, exist_ok=True)
-
-    entries = []
-    direct_set = set(direct_packages)
-    for name in closure_names:
-        cached = find_cached_deb(archives_dir, name)
-        fields = read_deb_control_fields(cached, runner)
-        dest = apt_repo_dir / cached.name
-        shutil.copy2(cached, dest)
-        entries.append(
-            {
-                "name": fields["Package"],
-                "version": fields["Version"],
-                "architecture": fields["Architecture"],
-                "filename": f"apt-repo/{dest.name}",
-                "sha256": sha256_file(dest),
-                "direct": fields["Package"] in direct_set,
-            }
+        # Simulate against the isolated/empty status: apt resolves the
+        # full recursive closure as a genuinely clean machine would need
+        # it, independent of this builder's own real installed state.
+        simulate = runner(
+            ["apt-get", "install", "--download-only", "-s", "-y", *iso, *direct_packages]
         )
+        if simulate.returncode != 0:
+            raise ClosureBuildError(f"apt-get install --simulate failed to resolve the closure: {simulate.stderr}")
+        closure_names = sorted(set(parse_simulate_inst_names(simulate.stdout)) | set(direct_packages))
+        if not closure_names:
+            raise ClosureBuildError("apt-get --simulate resolved an empty closure -- refusing to proceed")
+
+        # Real download: same isolation, and EVERY name explicitly from
+        # the exact resolved closure above (not just direct_packages) --
+        # what gets downloaded is provably what was just resolved, never
+        # re-derived a second time by a second dependency resolution pass.
+        download = runner(
+            ["apt-get", "install", "--download-only", "-y", *iso, *closure_names]
+        )
+        if download.returncode != 0:
+            raise ClosureBuildError(f"apt-get install --download-only failed: {download.stderr}")
+
+        apt_repo_dir = out_dir / "apt-repo"
+        apt_repo_dir.mkdir(parents=True, exist_ok=True)
+
+        entries = []
+        direct_set = set(direct_packages)
+        for name in closure_names:
+            cached = find_cached_deb(archives_dir, name)
+            fields = read_deb_control_fields(cached, runner)
+            dest = apt_repo_dir / cached.name
+            shutil.copy2(cached, dest)
+            entries.append(
+                {
+                    "name": fields["Package"],
+                    "version": fields["Version"],
+                    "architecture": fields["Architecture"],
+                    "filename": f"apt-repo/{dest.name}",
+                    "sha256": sha256_file(dest),
+                    "direct": fields["Package"] in direct_set,
+                }
+            )
+    finally:
+        if owns_work_dir:
+            shutil.rmtree(work_dir, ignore_errors=True)
 
     scan = runner(["dpkg-scanpackages", ".", "/dev/null"], cwd=str(apt_repo_dir))
     if scan.returncode != 0:
@@ -311,15 +374,12 @@ def build_apt_closure(
 # snap closure
 # ---------------------------------------------------------------------
 
-_SNAP_TYPE_RE = re.compile(r"^type:\s*(\S+)", re.MULTILINE)
-
-
 def parse_installed_snap_revision(snap_list_stdout: str, name: str) -> str | None:
     """Parse `snap list <name>`'s own output for the ACTUAL locally
     installed revision (column 3), so the closure captures what
     production is really running rather than the store's current
     channel head. Returns None if the snap is not installed locally
-    (caller falls back to the store's current revision for that one)."""
+    (caller falls back to the store's current --channel for that one)."""
     lines = [ln for ln in snap_list_stdout.splitlines() if ln.strip()]
     if len(lines) < 2:
         return None
@@ -330,24 +390,6 @@ def parse_installed_snap_revision(snap_list_stdout: str, name: str) -> str | Non
     return None
 
 
-def classify_snap_bucket(name: str, snap_info_stdout: str) -> int:
-    """Dependency-safe install ordering, computed here (not hardcoded in
-    the restore-side installer) so a manifest regeneration can react to a
-    snap's type changing. `snapd` always installs first; `chromium`
-    always installs last (its own prerequisite base/content snaps must
-    already be present); everything else is ordered by declared type:
-    base/os/kernel/gadget snaps before ordinary app/content snaps."""
-    if name == ESSENTIAL_SNAP:
-        return 0
-    if name == CHROMIUM_SNAP:
-        return 3
-    match = _SNAP_TYPE_RE.search(snap_info_stdout)
-    snap_type = match.group(1) if match else ""
-    if snap_type in ("base", "os", "kernel", "gadget", "snapd"):
-        return 1
-    return 2
-
-
 @dataclass(frozen=True)
 class SnapClosureResult:
     manifest: dict
@@ -356,18 +398,21 @@ class SnapClosureResult:
 
 
 def build_snap_closure(
-    names: list[str],
     out_dir: Path,
     runner: Runner = _default_runner,
     channel: str = "latest/stable",
 ) -> SnapClosureResult:
-    all_names = sorted(set(names) | {ESSENTIAL_SNAP, CHROMIUM_SNAP})
+    """Always builds exactly REQUIRED_SNAP_INSTALL_ORDER -- the fixed,
+    proven-offline Ubuntu 26.04/Chromium recovery contract (imported from
+    offline_snap_install, the single source of truth both tools share).
+    There is no `names` parameter: this is not an arbitrary snap list
+    any more, see the module docstring for why a computed/alphabetical
+    order was rejected in favor of this explicit contract."""
     snap_dir = out_dir / "snaps"
     snap_dir.mkdir(parents=True, exist_ok=True)
 
     entries = []
-    buckets: dict[str, int] = {}
-    for name in all_names:
+    for name in REQUIRED_SNAP_INSTALL_ORDER:
         listed = runner(["snap", "list", name])
         revision = parse_installed_snap_revision(listed.stdout, name) if listed.returncode == 0 else None
 
@@ -391,11 +436,8 @@ def build_snap_closure(
 
         if revision is None:
             # Recover the actual downloaded revision from the filename
-            # apt/snap always writes as `<name>_<revision>.snap`.
+            # snap always writes as `<name>_<revision>.snap`.
             revision = snap_path.stem.rsplit("_", 1)[-1]
-
-        info = runner(["snap", "info", name])
-        buckets[name] = classify_snap_bucket(name, info.stdout if info.returncode == 0 else "")
 
         entries.append(
             {
@@ -408,8 +450,6 @@ def build_snap_closure(
             }
         )
 
-    install_order = [e["name"] for e in sorted(entries, key=lambda e: (buckets[e["name"]], e["name"]))]
-
     manifests_dir = out_dir / "manifests"
     manifests_dir.mkdir(parents=True, exist_ok=True)
     manifest = {
@@ -417,7 +457,7 @@ def build_snap_closure(
         "generated_at": _now_iso(),
         "ubuntu_release": "26.04",
         "snaps": sorted(entries, key=lambda e: e["name"]),
-        "install_order": install_order,
+        "install_order": list(REQUIRED_SNAP_INSTALL_ORDER),
     }
     manifest_path = manifests_dir / "snap-manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -450,9 +490,11 @@ def _parser() -> argparse.ArgumentParser:
     )
     apt_cmd.add_argument("--groups", type=_split_csv, default=list(DEFAULT_GROUPS))
 
-    snap_cmd = sub.add_parser("snap-closure", help="Build the offline snap closure + manifest.")
+    snap_cmd = sub.add_parser(
+        "snap-closure",
+        help="Build the offline snap closure + manifest (always the full required set -- see REQUIRED_SNAP_INSTALL_ORDER).",
+    )
     snap_cmd.add_argument("--out-dir", required=True, type=Path)
-    snap_cmd.add_argument("--snaps", type=_split_csv, default=list(DEFAULT_SNAPS))
     snap_cmd.add_argument("--channel", default="latest/stable")
 
     all_cmd = sub.add_parser("all", help="Run both apt-closure and snap-closure.")
@@ -463,7 +505,6 @@ def _parser() -> argparse.ArgumentParser:
         default=Path(__file__).resolve().parent.parent / "packages-ubuntu-26.04.txt",
     )
     all_cmd.add_argument("--groups", type=_split_csv, default=list(DEFAULT_GROUPS))
-    all_cmd.add_argument("--snaps", type=_split_csv, default=list(DEFAULT_SNAPS))
     all_cmd.add_argument("--channel", default="latest/stable")
 
     return parser
@@ -479,7 +520,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"apt-closure: {len(result.entries)} package(s) -> {result.apt_repo_dir}")
             print(f"apt-closure: manifest -> {result.manifest_path}")
         if args.command in ("snap-closure", "all"):
-            result = build_snap_closure(args.snaps, args.out_dir, channel=args.channel)
+            result = build_snap_closure(args.out_dir, channel=args.channel)
             print(f"snap-closure: {len(result.manifest['snaps'])} snap(s) -> {result.snap_dir}")
             print(f"snap-closure: install_order = {result.manifest['install_order']}")
     except ClosureBuildError as exc:

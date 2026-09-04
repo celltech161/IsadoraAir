@@ -141,9 +141,24 @@ snap names are requested.
 deploy/restore/build_offline_closure.py all --out-dir /path/to/e8-closure
 ```
 
-This needs real Internet access — run it on production, or a throwaway
-Ubuntu 26.04 host with the same package selection, well before the E8
-drill; the RESTORE side never needs network access. It produces:
+This needs real, FULL Ubuntu archive access (`archive.ubuntu.com`/
+`security.ubuntu.com` or a full mirror) — not merely a host that can
+reach the general Internet. `apt-closure` resolves the FULL recursive
+dependency graph against an isolated, empty synthetic dpkg status (see
+`build_offline_closure.py`'s own module docstring for why: this is what
+makes the closure independent of whatever this builder host happens to
+already have installed, the r0038 code-review fix for a
+`bubblewrap`-class omission), which means even ordinary base-system
+packages (e.g. `libc6`) that a real Ubuntu install already has must be
+resolvable from the builder's OWN configured apt sources at build time.
+A builder scoped to a small/partial local repo (as the E8 sandbox
+deliberately is, for testing) will fail closed with a clear apt
+dependency error rather than produce an incomplete closure — this was
+verified directly against this repository's own E8 sandbox, which
+intentionally has no real Ubuntu mirror configured. Run it on production,
+or a throwaway Ubuntu 26.04 host with real archive access and the same
+package selection, well before the E8 drill; the RESTORE side never
+needs network access. It produces:
 
 ```
 /path/to/e8-closure/
