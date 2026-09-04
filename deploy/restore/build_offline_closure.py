@@ -68,19 +68,28 @@ closure" section for the full narrative):
   a real apt-get at all.
 
   A resolver token from `-s` output can be architecture-qualified
-  (`Inst libc6:amd64 (...)` for a native/multiarch package) -- Debian
-  archive `.deb` filenames never include that qualifier
-  (`libc6_<version>_amd64.deb`, never `libc6:amd64_<version>_amd64.deb`),
-  so a raw token is never used directly as a cache-glob package name.
-  `split_resolver_token` splits it into (bare name, architecture-or-None)
-  ONLY for that file lookup -- `find_cached_deb` prefers an
-  architecture-matched candidate when one is available, so two same-name
-  different-architecture cached .deb files are never conflated. The RAW
-  (possibly arch-qualified) token is still what's passed to apt-get for
-  the real download, so multiarch resolution stays exactly what apt
-  itself intended. The final copied artifact's identity is always
-  re-verified against real `dpkg-deb` control metadata either way -- the
-  resolver token is never trusted as authoritative on its own.
+  (`Inst libc6:amd64 (...)` for a native/multiarch package). This tool
+  is deliberately NOT a general multiarch repository builder -- the
+  current IsadoraAir/E8 recovery contract is Ubuntu 26.04 x86-64/amd64,
+  period, and it fails closed outside that contract rather than trying
+  to handle it generally:
+    - `require_builder_architecture` checks `dpkg --print-architecture`
+      up front and refuses to run at all on a non-amd64 builder.
+    - `split_resolver_token` + `_normalize_closure_tokens` treat a bare
+      token and `<name>:amd64` as the SAME package identity (collapsing
+      to the bare name -- Debian archive `.deb` filenames never carry
+      the qualifier anyway: `libc6_<version>_amd64.deb`, never
+      `libc6:amd64_<version>_amd64.deb`). Any OTHER explicit
+      architecture qualifier (`foo:i386`) fails the whole build closed
+      immediately -- never silently dropped, never conflated with the
+      amd64 package of the same name.
+    - `find_cached_deb`, when given an explicit architecture, requires
+      an EXACT `_<architecture>.deb` filename match and never falls back
+      to a differently-architected candidate.
+    - Every copied artifact's real `dpkg-deb` control-metadata
+      Architecture is verified to be `amd64` or `all` before it's
+      accepted into the closure -- the resolver token is never trusted
+      as authoritative on its own.
 
   3. The snap closure needs more than `{snapd, chromium}` to avoid
      reaching for the Snap Store mid-sequence (a manifest missing e.g.
@@ -153,6 +162,14 @@ DEFAULT_GROUPS = (
     "OPTIONAL_BACKUP_ENCRYPTION",
 )
 _GROUP_HEADER_RE = re.compile(r"^([A-Z_][A-Z0-9_]*)=\($")
+
+# The current IsadoraAir/E8 recovery closure contract: Ubuntu 26.04
+# x86-64/amd64, explicitly, not a general multiarch repository builder --
+# see the module docstring's "not a general multiarch repository builder"
+# paragraph for the full reasoning. Every apt-closure package's real
+# architecture (per dpkg-deb control metadata) must be one of these.
+ARCHITECTURE = "amd64"
+ACCEPTABLE_PACKAGE_ARCHITECTURES = frozenset({"amd64", "all"})
 
 
 class ClosureBuildError(Exception):
@@ -245,14 +262,50 @@ def split_resolver_token(token: str) -> tuple[str, str | None]:
     or None). Debian archive `.deb` filenames are always
     `<name>_<version>_<arch>.deb` -- NEVER `<name>:<arch>_<version>_
     <arch>.deb` -- so a `name:arch` resolver token must never be used
-    verbatim as a cache-glob package name. The architecture, when
-    present, is retained (not discarded) so `find_cached_deb` can
-    disambiguate same-name-different-architecture cached files rather
-    than silently guessing."""
+    verbatim as a cache-glob package name."""
     if ":" in token:
         name, architecture = token.split(":", 1)
         return name, architecture
     return token, None
+
+
+def require_builder_architecture(runner: Runner, expected: str = ARCHITECTURE) -> None:
+    """Fail closed if THIS builder host's own native architecture isn't
+    the one the current IsadoraAir/E8 recovery closure contract targets.
+    Deliberately narrow: this tool builds a SINGLE-architecture closure
+    for the current contract, not a general multiarch repository
+    builder -- see the module docstring."""
+    result = runner(["dpkg", "--print-architecture"])
+    if result.returncode != 0:
+        raise ClosureBuildError(f"dpkg --print-architecture failed: {result.stderr}")
+    native = result.stdout.strip()
+    if native != expected:
+        raise ClosureBuildError(
+            f"this builder's native architecture is '{native}', not '{expected}' -- the "
+            f"current IsadoraAir/E8 Ubuntu 26.04 recovery closure contract is {expected}-only. "
+            "Refusing to build a closure on a different native architecture; this tool is not "
+            "a general multiarch repository builder."
+        )
+
+
+def _normalize_closure_tokens(tokens: set[str]) -> list[str]:
+    """Collapse resolver tokens to bare package names under the current
+    amd64-only recovery contract (ARCHITECTURE). A bare token and
+    '<name>:amd64' are the SAME package identity and collapse to one
+    entry. Any OTHER explicit architecture qualifier (e.g. 'foo:i386')
+    fails the whole build closed -- never silently dropped, never
+    silently conflated with the amd64 package of the same name."""
+    bare_names: set[str] = set()
+    for token in tokens:
+        bare_name, architecture = split_resolver_token(token)
+        if architecture is not None and architecture != ARCHITECTURE:
+            raise ClosureBuildError(
+                f"resolver token '{token}' requests architecture '{architecture}', outside the "
+                f"current {ARCHITECTURE}-only IsadoraAir/E8 recovery closure contract -- "
+                "refusing to silently drop it or conflate it with any other package."
+            )
+        bare_names.add(bare_name)
+    return sorted(bare_names)
 
 
 def _isolation_opts(status_path: Path, archives_dir: Path) -> list[str]:
@@ -295,19 +348,20 @@ def read_deb_control_fields(deb_path: Path, runner: Runner) -> dict[str, str]:
 def find_cached_deb(archives_dir: Path, package_name: str, architecture: str | None = None) -> Path:
     """package_name must already be the BARE name (see
     split_resolver_token) -- never an arch-qualified resolver token.
-    When `architecture` is given (from that same split), candidates
-    matching `_<architecture>.deb` are preferred whenever any exist, so
-    two cached .deb files sharing a bare name but differing only in
-    architecture (a genuine multiarch scenario) are never conflated by a
-    plain glob+mtime guess."""
+    When `architecture` is given, an EXACT `_<architecture>.deb` filename
+    match is REQUIRED -- this never falls back to a differently-
+    architected candidate; if no exact match exists, this raises
+    ClosureBuildError rather than silently returning a wrong-architecture
+    file. When not given, any architecture's cached file matching the
+    bare name is acceptable (the caller is expected to verify the real
+    architecture via dpkg-deb control metadata afterward -- see
+    build_apt_closure, which never trusts a filename alone)."""
     candidates = sorted(
         p for p in archives_dir.glob(f"{package_name}_*.deb")
         if fnmatch.fnmatchcase(p.name.split("_", 1)[0], package_name)
     )
     if architecture is not None:
-        arch_matches = [p for p in candidates if p.name.endswith(f"_{architecture}.deb")]
-        if arch_matches:
-            candidates = arch_matches
+        candidates = [p for p in candidates if p.name.endswith(f"_{architecture}.deb")]
     if not candidates:
         raise ClosureBuildError(
             f"expected a cached .deb for '{package_name}"
@@ -345,6 +399,11 @@ def build_apt_closure(
     if not direct_packages:
         raise ClosureBuildError("no direct packages resolved -- refusing to build an empty closure")
 
+    # Fail fast, before touching apt at all, on the wrong native
+    # architecture -- this tool builds a single-architecture (amd64)
+    # closure for the current IsadoraAir/E8 recovery contract only.
+    require_builder_architecture(runner)
+
     sudo_prefix = ["sudo"] if sudo else []
 
     # Only step that touches real, shared system state -- refreshing
@@ -375,31 +434,17 @@ def build_apt_closure(
         )
         if simulate.returncode != 0:
             raise ClosureBuildError(f"apt-get install --simulate failed to resolve the closure: {simulate.stderr}")
-        # Raw resolver tokens -- may be architecture-qualified
-        # (`libc6:amd64`); never split/stripped here, only where a file
-        # lookup specifically requires the bare name (see
-        # split_resolver_token / find_cached_deb below).
-        closure_tokens = sorted(set(parse_simulate_inst_names(simulate.stdout)) | set(direct_packages))
-        if not closure_tokens:
+        # _normalize_closure_tokens collapses bare/`:amd64` duplicates to
+        # one bare name each and fails closed on any OTHER architecture
+        # qualifier (e.g. `foo:i386`) -- see its own docstring and the
+        # module docstring's "not a general multiarch repository
+        # builder" paragraph. closure_names is bare package names only,
+        # no qualifiers, from here on.
+        closure_names = _normalize_closure_tokens(set(parse_simulate_inst_names(simulate.stdout)) | set(direct_packages))
+        if not closure_names:
             raise ClosureBuildError("apt-get --simulate resolved an empty closure -- refusing to proceed")
 
-        # The SAME underlying package can appear twice in the set above
-        # under two different token spellings -- a bare direct-package
-        # name (e.g. "age", from direct_packages) and an architecture-
-        # qualified resolver token for that identical package (e.g.
-        # "age:amd64", from simulate output). Both split to the same
-        # bare name; collapse to exactly one token per bare name (the
-        # qualified spelling wins when both are present -- more precise
-        # for the real download call) so neither the download nor the
-        # manifest ever gets a duplicate entry for one real package.
-        by_bare_name: dict[str, str] = {}
-        for token in closure_tokens:
-            bare_name, _ = split_resolver_token(token)
-            if bare_name not in by_bare_name or ":" in token:
-                by_bare_name[bare_name] = token
-        closure_tokens = sorted(by_bare_name.values())
-
-        # Real download: same isolation, and EVERY token explicitly from
+        # Real download: same isolation, and EVERY name explicitly from
         # the exact resolved closure above (not just direct_packages) --
         # what gets downloaded is provably what was just resolved, never
         # re-derived a second time by a second dependency resolution
@@ -407,7 +452,7 @@ def build_apt_closure(
         # apt's dpkg/frontend/archive locks even with --download-only --
         # sudo, same as `apt-get update` above.
         download = runner(
-            [*sudo_prefix, "apt-get", "install", "--download-only", "-y", *iso, *closure_tokens]
+            [*sudo_prefix, "apt-get", "install", "--download-only", "-y", *iso, *closure_names]
         )
         if download.returncode != 0:
             raise ClosureBuildError(f"apt-get install --download-only failed: {download.stderr}")
@@ -417,14 +462,24 @@ def build_apt_closure(
 
         entries = []
         direct_set = set(direct_packages)
-        for token in closure_tokens:
-            bare_name, architecture = split_resolver_token(token)
-            cached = find_cached_deb(archives_dir, bare_name, architecture)
-            # The copied artifact's real identity always comes from its
-            # own control metadata (dpkg-deb), never trusted from the
-            # resolver token alone -- true regardless of whether the
-            # token happened to be architecture-qualified.
+        for name in closure_names:
+            # No architecture hint here -- a legitimate package can be
+            # Architecture: all (filename ends `_all.deb`, not
+            # `_amd64.deb`), so the lookup itself stays architecture-
+            # unconstrained. The real safety net is below: the copied
+            # artifact's real identity/architecture ALWAYS comes from its
+            # own dpkg-deb control metadata, never trusted from a
+            # filename or resolver token alone.
+            cached = find_cached_deb(archives_dir, name)
             fields = read_deb_control_fields(cached, runner)
+            if fields["Architecture"] not in ACCEPTABLE_PACKAGE_ARCHITECTURES:
+                raise ClosureBuildError(
+                    f"{fields['Package']} ({cached.name}) reports architecture "
+                    f"'{fields['Architecture']}' via dpkg-deb control metadata -- outside the "
+                    f"current {ARCHITECTURE}-only IsadoraAir/E8 recovery closure contract "
+                    f"(expected one of {sorted(ACCEPTABLE_PACKAGE_ARCHITECTURES)}); refusing to "
+                    "include it."
+                )
             dest = apt_repo_dir / cached.name
             shutil.copy2(cached, dest)
             entries.append(

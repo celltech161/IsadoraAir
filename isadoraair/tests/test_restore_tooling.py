@@ -2222,6 +2222,8 @@ class BuildOfflineClosureTests(SimpleTestCase):
 
         def runner(argv, **kwargs):
             calls.append((list(argv), kwargs))
+            if argv[-1:] == ["--print-architecture"]:
+                return subprocess.CompletedProcess(argv, 0, stdout="amd64\n", stderr="")
             if "dpkg-scanpackages" in argv:
                 return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
             if "update" in argv:
@@ -2351,39 +2353,44 @@ class BuildOfflineClosureTests(SimpleTestCase):
         self.assertEqual(len(download_calls), 1)
         self.assertNotIn("sudo", download_calls[0])
 
-    def test_apt_closure_handles_architecture_qualified_resolver_token(self):
-        """apt's simulate output can return an arch-qualified resolver
-        token like 'foo:amd64' for a native/multiarch package -- Debian
-        archive filenames never include that qualifier
-        (foo_<version>_amd64.deb, never foo:amd64_<version>_amd64.deb),
-        so file lookup must split it, while the real download call still
-        gets the exact qualified token apt itself produced."""
-        work_dir = self.tmpdir / "work"
-        archives_dir = work_dir / "archives"
+    def _arch_qualified_runner(self, archives_dir: Path, inst_line: str, native_arch: str = "amd64",
+                                control_architecture: str = "amd64"):
         calls = []
 
         def runner(argv, **kwargs):
             calls.append(list(argv))
+            if argv[-1:] == ["--print-architecture"]:
+                return subprocess.CompletedProcess(argv, 0, stdout=f"{native_arch}\n", stderr="")
             if "dpkg-scanpackages" in argv:
                 return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
             if "update" in argv:
                 return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
             if "-s" in argv:
-                return subprocess.CompletedProcess(argv, 0, stdout="Inst foo:amd64 (1.0-1 Ubuntu:26.04 [amd64])\n", stderr="")
+                return subprocess.CompletedProcess(argv, 0, stdout=inst_line, stderr="")
             if "dpkg-deb" in argv:
-                return subprocess.CompletedProcess(argv, 0, stdout="Package: foo\nVersion: 1.0-1\nArchitecture: amd64\n", stderr="")
+                out = f"Package: foo\nVersion: 1.0-1\nArchitecture: {control_architecture}\n"
+                return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
             if "install" in argv and "--download-only" in argv:
-                self.assertIn("foo:amd64", argv, "the exact qualified resolver token must reach the real download call")
+                archives_dir.mkdir(parents=True, exist_ok=True)
                 (archives_dir / "foo_1.0-1_amd64.deb").write_bytes(b"foo-bytes")
                 return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
             return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
+        return runner, calls
+
+    def test_apt_closure_deduplicates_bare_and_amd64_qualified_token_to_one_entry(self):
+        """apt's simulate output can return an arch-qualified resolver
+        token like 'foo:amd64' for a native package -- under the current
+        amd64-only recovery contract this is the SAME package identity
+        as a bare 'foo' (e.g. from direct_packages), and must collapse
+        to exactly one manifest entry, downloaded by its bare name."""
+        work_dir = self.tmpdir / "work"
+        archives_dir = work_dir / "archives"
+        runner, calls = self._arch_qualified_runner(archives_dir, "Inst foo:amd64 (1.0-1 Ubuntu:26.04 [amd64])\n")
+
         result = build_offline_closure.build_apt_closure(
             ["foo"], self.tmpdir / "out", runner=runner, sudo=False, work_dir=work_dir,
         )
-        # Exactly one entry -- "foo" (direct_packages, bare) and
-        # "foo:amd64" (simulate output) are the SAME real package, never
-        # two manifest entries for it.
         self.assertEqual(len(result.entries), 1)
         entry = result.entries[0]
         self.assertEqual(entry["name"], "foo")
@@ -2391,19 +2398,79 @@ class BuildOfflineClosureTests(SimpleTestCase):
         self.assertEqual(entry["filename"], "apt-repo/foo_1.0-1_amd64.deb")
         self.assertTrue(entry["direct"])
         self.assertTrue((result.apt_repo_dir / "foo_1.0-1_amd64.deb").is_file())
+        # The bare name is what reaches the real download call -- no
+        # architecture qualifier survives past normalization under the
+        # amd64-only contract.
+        download_call = next(c for c in calls if "install" in c and "--download-only" in c and "-s" not in c)
+        self.assertIn("foo", download_call)
+        self.assertNotIn("foo:amd64", download_call)
 
-    def test_find_cached_deb_prefers_architecture_match_when_ambiguous(self):
-        """Two cached .deb files sharing a bare name but differing only
-        in architecture (a genuine multiarch scenario) must never be
-        conflated by a plain glob+mtime guess."""
+    def test_apt_closure_non_amd64_resolver_token_fails_closed(self):
+        """A resolver token explicitly requesting a non-amd64
+        architecture (e.g. 'foo:i386') must fail the whole build closed
+        -- never silently dropped, never conflated with an amd64 package
+        of the same name."""
+        work_dir = self.tmpdir / "work"
+        archives_dir = work_dir / "archives"
+        runner, calls = self._arch_qualified_runner(archives_dir, "Inst foo:i386 (1.0-1 Ubuntu:26.04 [i386])\n")
+        with self.assertRaises(build_offline_closure.ClosureBuildError) as ctx:
+            build_offline_closure.build_apt_closure(
+                ["bar"], self.tmpdir / "out", runner=runner, sudo=False, work_dir=work_dir,
+            )
+        self.assertIn("foo:i386", str(ctx.exception))
+        self.assertIn("amd64-only", str(ctx.exception))
+        # Never reached the real download call.
+        self.assertFalse(any("--download-only" in c and "-s" not in c for c in calls))
+
+    def test_apt_closure_artifact_architecture_mismatch_fails_closed(self):
+        """The final copied artifact's real dpkg-deb control-metadata
+        architecture must be amd64 or all -- a filename/resolver token
+        alone is never trusted. Models a cached .deb whose control data
+        (ground truth) disagrees with what was expected."""
+        work_dir = self.tmpdir / "work"
+        archives_dir = work_dir / "archives"
+        runner, calls = self._arch_qualified_runner(
+            archives_dir, "Inst foo (1.0-1 Ubuntu:26.04 [amd64])\n", control_architecture="i386",
+        )
+        with self.assertRaises(build_offline_closure.ClosureBuildError) as ctx:
+            build_offline_closure.build_apt_closure(
+                ["foo"], self.tmpdir / "out", runner=runner, sudo=False, work_dir=work_dir,
+            )
+        self.assertIn("i386", str(ctx.exception))
+        self.assertIn("amd64-only", str(ctx.exception))
+
+    def test_apt_closure_non_amd64_builder_fails_closed(self):
+        """This tool is not a general multiarch repository builder --
+        refuses to run at all on a builder whose own native architecture
+        isn't amd64, before touching apt in any other way."""
+        work_dir = self.tmpdir / "work"
+        archives_dir = work_dir / "archives"
+        runner, calls = self._arch_qualified_runner(
+            archives_dir, "Inst foo (1.0-1 Ubuntu:26.04 [arm64])\n", native_arch="arm64",
+        )
+        with self.assertRaises(build_offline_closure.ClosureBuildError) as ctx:
+            build_offline_closure.build_apt_closure(
+                ["foo"], self.tmpdir / "out", runner=runner, sudo=False, work_dir=work_dir,
+            )
+        self.assertIn("arm64", str(ctx.exception))
+        self.assertIn("amd64", str(ctx.exception))
+        # Nothing beyond the architecture check itself was ever called.
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][-1], "--print-architecture")
+
+    def test_find_cached_deb_requires_exact_architecture_match_no_fallback(self):
+        """Given an explicit architecture, find_cached_deb must find an
+        EXACT '_<architecture>.deb' match or fail closed -- never fall
+        back to a differently-architected candidate."""
         archives_dir = self.tmpdir / "archives"
         archives_dir.mkdir()
-        (archives_dir / "foo_1.0-1_amd64.deb").write_bytes(b"amd64-bytes")
         (archives_dir / "foo_1.0-1_i386.deb").write_bytes(b"i386-bytes")
-        found = build_offline_closure.find_cached_deb(archives_dir, "foo", architecture="i386")
-        self.assertEqual(found.name, "foo_1.0-1_i386.deb")
-        found_amd64 = build_offline_closure.find_cached_deb(archives_dir, "foo", architecture="amd64")
-        self.assertEqual(found_amd64.name, "foo_1.0-1_amd64.deb")
+        with self.assertRaises(build_offline_closure.ClosureBuildError):
+            build_offline_closure.find_cached_deb(archives_dir, "foo", architecture="amd64")
+        # The matching architecture still works normally.
+        (archives_dir / "foo_1.0-1_amd64.deb").write_bytes(b"amd64-bytes")
+        found = build_offline_closure.find_cached_deb(archives_dir, "foo", architecture="amd64")
+        self.assertEqual(found.name, "foo_1.0-1_amd64.deb")
 
     def test_split_resolver_token(self):
         self.assertEqual(build_offline_closure.split_resolver_token("age"), ("age", None))
