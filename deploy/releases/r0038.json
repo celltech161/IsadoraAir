@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "release_id": "r0038",
+  "previous_release_id": "r0037",
+  "minimum_updater_protocol_version": 5,
+  "summary": "Adds reproducible fully offline E8 package closure tooling: complete clean-machine APT dependency capture, verified fixed-order Chromium snap closure, fail-closed offline Stage 10 Selenium handling, and amd64 recovery-contract enforcement. No migrations, runtime dependency changes, service restarts, nginx, systemd, or protected-runtime changes.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0007"
+}
