@@ -47,6 +47,7 @@ Every stage script (`NN-*.sh`) and `inspect_backup.sh` sources
 | `--force-production-target` | Required *in addition to* `--apply` before any stage will write to the real `/opt/isadoraair` — see "Production-target protection" below. |
 | `--force-db` | Required before `30-postgresql.sh` will `pg_restore` over a database that already has tables in it. |
 | `--force-env` | Required before `20-application.sh` will overwrite an existing non-empty `.env` at the target. |
+| `--owner USER:GROUP` | `20-application.sh`/`40-station-content.sh` only: the operator/service identity a freshly-established real target directory is given (`sudo chown`). Defaults to the caller's own identity. Never used, and sudo never invoked, under `--staging-root`. |
 
 `--staging-root ... --apply` and bare `--plan` are the two modes Phase 4
 itself used. Bare `--apply` with no `--staging-root` is what Phase 5's
@@ -288,6 +289,24 @@ onto the other is exactly how a restore resurrects stale files:
    gap rather than a solved problem. A future backup-script enhancement
    (recording `git status --porcelain` output, or refusing to back up a
    dirty tree at all) is the right fix; out of scope for this pass.
+6. **Target ownership (Runtime Foundation E7E)**: on a genuinely clean
+   host `/opt` is root-owned, so `20-application.sh` cannot simply
+   `git clone` into `/opt/isadoraair` as the ordinary operator — the
+   directory has to exist and be owned by the intended service account
+   first. For a REAL (non-`--staging-root`) target that is absent (or
+   present and already-verified-empty — an existing non-empty non-Git
+   target still fails closed, unchanged), this stage establishes it
+   with `sudo mkdir`/`sudo chown` to `--owner USER:GROUP` (default: the
+   caller's own identity) *before* cloning — the clone itself, and
+   every write after it (`.env`, `media/`, and `60-python.sh`'s venv),
+   still run as that ordinary operator, never as root. An existing
+   `.git` checkout is never chowned, recursively or otherwise, under
+   any flag — only fetched/verified, exactly as before. This mirrors
+   `40-station-content.sh`'s own established `--owner`/`ensure_dir`
+   pattern for `/srv/isadoraair` and `/var/lib/isadoraair/reports`
+   rather than a second convention. `--staging-root` is completely
+   unaffected: the target root there already sits inside a tree the
+   caller owns, so this never invokes `sudo`.
 
 ## Logging
 

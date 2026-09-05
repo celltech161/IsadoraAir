@@ -353,7 +353,18 @@ needed if you install the systemd units.
 
 ### 5. Clone + Python environment
 
+`/opt` itself is root-owned on a stock Ubuntu install, so — same as
+`/srv/isadoraair`/`/var/lib/isadoraair` in step 4 — establish
+`/opt/isadoraair` with the intended service account's ownership
+*before* cloning into it, rather than cloning as root (which would
+leave the whole tree, and everything the venv step below writes beneath
+it, root-owned):
+
 ```bash
+sudo mkdir -p /opt/isadoraair
+# Replace 'youruser' with whichever account will run the services
+sudo chown youruser:youruser /opt/isadoraair
+
 git clone https://github.com/celltech161/IsadoraAir.git /opt/isadoraair
 cd /opt/isadoraair
 

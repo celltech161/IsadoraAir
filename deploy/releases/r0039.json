@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "release_id": "r0039",
+  "previous_release_id": "r0038",
+  "minimum_updater_protocol_version": 5,
+  "summary": "Fixes a genuine E8 clean-machine failure: stock Ubuntu's root-owned /opt made 20-application.sh's unprivileged `git clone /opt/isadoraair` fail before creating the work tree. Stage 20 now privileges only the target-directory establishment (new --owner flag, mirroring 40-station-content.sh's existing convention) before cloning as the ordinary operator; --staging-root unaffected. README.md install docs fixed to match. No migrations, package, runtime, or service changes.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0007"
+}

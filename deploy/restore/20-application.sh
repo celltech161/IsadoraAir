@@ -14,10 +14,24 @@
 #
 # Usage:
 #   deploy/restore/20-application.sh --archive PATH [--plan|--apply]
-#     [--staging-root PATH] [--repo-url URL] [--force-env]
+#     [--staging-root PATH] [--repo-url URL] [--owner USER:GROUP] [--force-env]
 #
 # --repo-url defaults to git@github.com:celltech161/IsadoraAir.git --
 # override for a fork or a differently-named remote.
+#
+# --owner USER:GROUP (Runtime Foundation E7E, 2026-09-05): the intended
+# operator/service identity a freshly-established REAL (non-staging)
+# target root is given -- same flag name/shape as
+# deploy/restore/40-station-content.sh's own already-established
+# --owner/ensure_dir convention, reused deliberately rather than
+# inventing a second identity vocabulary. Defaults to the caller's own
+# identity ($(id -un):$(id -gn)) -- the only identity that makes sense
+# for the ordinary case where the operator running this restore IS the
+# intended service account. See the "Clone or verify existing checkout"
+# section below for why this exists: a genuinely clean host's /opt is
+# root-owned, so an unprivileged clone directly into /opt/isadoraair
+# fails before it can even create the work tree (the exact E8 defect
+# this fixes) -- see docs/DISASTER_RECOVERY_RESTORE.md.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -28,10 +42,13 @@ restore_parse_common_args "$@"
 set -- "${RESTORE_REMAINING_ARGS[@]}"
 
 REPO_URL="git@github.com:celltech161/IsadoraAir.git"
+OWNER="$(id -un):$(id -gn)"
 while [ $# -gt 0 ]; do
   case "$1" in
     --repo-url) REPO_URL="${2:?--repo-url needs a value}"; shift 2 ;;
     --repo-url=*) REPO_URL="${1#*=}"; shift ;;
+    --owner) OWNER="${2:?--owner needs USER:GROUP}"; shift 2 ;;
+    --owner=*) OWNER="${1#*=}"; shift ;;
     *) log_error "20-application.sh: unrecognized argument: $1"; exit 2 ;;
   esac
 done
@@ -61,6 +78,38 @@ log_info "Backup recorded Git SHA: $GIT_SHA"
 log_warn "MANIFEST.txt does not currently record whether the source tree was clean (uncommitted changes) at backup time -- a known, documented limitation (see docs/DISASTER_RECOVERY_RESTORE.md). This restore checks out exactly $GIT_SHA; any uncommitted changes present when the backup was taken are NOT recoverable from this archive."
 
 # ---- Clone or verify existing checkout -----------------------------------
+#
+# Runtime Foundation E7E (2026-09-05) -- the real E8 clean-machine
+# defect this section fixes: on a stock Ubuntu host, /opt is root-owned
+# (0755 root:root). An unprivileged caller can `git clone` INTO an
+# already-writable directory just fine, but cannot create
+# /opt/isadoraair beneath root-owned /opt at all -- `mkdir`/`git clone`
+# both fail closed with a plain permission error before anything is
+# written, exactly what the real E8 acceptance run observed and
+# correctly stopped on.
+#
+# Fix, mirroring deploy/restore/40-station-content.sh's own established
+# --owner/ensure_dir pattern for the identical class of problem
+# (/srv/isadoraair, /var/lib/isadoraair/reports) rather than inventing a
+# second convention: under --staging-root the target root already sits
+# inside a tree the caller already owns (lib.sh's own RESTORE_TARGET_ROOT
+# resolution) -- nothing here changes, and sudo is NEVER invoked in that
+# mode, matching every other stage's staging behavior. For a REAL
+# target, the ONE privileged action is establishing the empty target
+# directory with the intended operator/service ownership (--owner,
+# default the caller's own identity); `git clone` itself, and every
+# write after it (.env, media/ below, and Stage 60's venv beneath this
+# same tree), still run as the ordinary operator, never as root.
+#
+# An existing `.git` checkout is NEVER touched by any of this -- no
+# chown, recursive or otherwise, under any flag: only fetch/verify, same
+# as before. If ownership doesn't actually permit that fetch, it fails
+# naturally and closed, on purpose (see deploy/restore/README.md).
+# Likewise, an existing NON-EMPTY non-Git target still fails closed
+# unchanged, immediately below -- this section is only ever reached for
+# a target that is either completely absent or an already-verified-
+# empty directory, so establishing ownership here is never a takeover of
+# real content, recursive or otherwise.
 if [ -d "$RESTORE_TARGET_ROOT/.git" ]; then
   log_info "$RESTORE_TARGET_ROOT already has a .git directory -- will fetch + verify rather than re-clone."
   do_or_plan git -C "$RESTORE_TARGET_ROOT" fetch --all --tags
@@ -69,8 +118,23 @@ elif [ -e "$RESTORE_TARGET_ROOT" ] && [ -n "$(ls -A "$RESTORE_TARGET_ROOT" 2>/de
   exit 1
 else
   log_info "Cloning $REPO_URL into $RESTORE_TARGET_ROOT"
-  do_or_plan mkdir -p "$(dirname "$RESTORE_TARGET_ROOT")"
+  if [ -n "$RESTORE_STAGING_ROOT" ]; then
+    do_or_plan mkdir -p "$(dirname "$RESTORE_TARGET_ROOT")"
+  else
+    log_info "Establishing $RESTORE_TARGET_ROOT (privileged) with owner $OWNER before cloning as the ordinary operator -- absent or already-verified-empty target only, never an existing tree."
+    do_or_plan sudo mkdir -p "$(dirname "$RESTORE_TARGET_ROOT")"
+    do_or_plan sudo mkdir -p "$RESTORE_TARGET_ROOT"
+    do_or_plan sudo chown "$OWNER" "$RESTORE_TARGET_ROOT"
+  fi
   do_or_plan git clone "$REPO_URL" "$RESTORE_TARGET_ROOT"
+  if [ -z "$RESTORE_STAGING_ROOT" ]; then
+    # Belt-and-suspenders, mirroring 40-station-content.sh's own
+    # post-extraction re-chown: the clone above already ran as the
+    # ordinary caller (never sudo), so this is only consequential when
+    # --owner names a DIFFERENT identity than the caller's own -- in the
+    # common case (the default) it is a harmless no-op.
+    do_or_plan sudo chown -R "$OWNER" "$RESTORE_TARGET_ROOT"
+  fi
 fi
 
 if [ "$RESTORE_MODE" = "apply" ]; then

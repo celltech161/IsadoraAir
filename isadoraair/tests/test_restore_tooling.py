@@ -1691,6 +1691,238 @@ class RuntimeFoundationE5SystemConfigFunctionalTests(SimpleTestCase):
         self.assertTrue((self.staging / "var" / "lib" / "isadoraair" / "tts").is_dir())
 
 
+class RuntimeFoundationE7ETargetOwnershipFunctionalTests(SimpleTestCase):
+    """Real subprocess execution of 20-application.sh against a disposable
+    --target-root -- never a real /opt. Reproduces the exact real E8
+    clean-machine defect: a stock host's /opt is root-owned, so an
+    unprivileged `git clone` directly into /opt/isadoraair fails before
+    it can create the work tree at all.
+
+    Real (non-staging) privileged establishment is exercised for real,
+    without needing actual root, via a `sudo` shim placed first on PATH
+    that simply execs its argv (and logs it) instead of asking for a
+    password -- the target directory lives under a temp dir this test
+    process already owns, so the underlying mkdir/chown succeed exactly
+    as a genuinely privileged caller's would. This proves the real
+    sequence of operations (and their exact ordering/gating), not a
+    mock of it. --target-root (not --staging-root) is used so
+    guard_production_target's "looks like /opt/isadoraair" check never
+    engages -- this test is about the ownership-establishment logic,
+    not that separate guard (see LibShSafetyGuardTests for that one)."""
+
+    def setUp(self):
+        self.tmpdir = Path(
+            subprocess.run(["mktemp", "-d"], capture_output=True, text=True, check=True).stdout.strip()
+        )
+        self.addCleanup(shutil.rmtree, self.tmpdir, ignore_errors=True)
+
+        # A tiny real local Git repo to clone from -- exercises a real
+        # `git clone`/`git checkout --detach`, never a mock.
+        self.fixture_repo = self.tmpdir / "fixture-repo"
+        self.fixture_repo.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=self.fixture_repo, check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=self.fixture_repo, check=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=self.fixture_repo, check=True)
+        (self.fixture_repo / "manage.py").write_text("#!/usr/bin/env python\n", encoding="utf-8")
+        subprocess.run(["git", "add", "-A"], cwd=self.fixture_repo, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=self.fixture_repo, check=True)
+        self.fixture_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=self.fixture_repo, capture_output=True, text=True, check=True
+        ).stdout.strip()
+
+        # A `sudo` shim: logs its argv, then execs it directly (no real
+        # privilege escalation, no password prompt) -- the target lives
+        # under a temp dir this test process already fully owns, so the
+        # real mkdir/chown succeed exactly as a genuinely privileged
+        # caller's would.
+        self.sudo_log = self.tmpdir / "sudo-calls.log"
+        shim_dir = self.tmpdir / "shim-bin"
+        shim_dir.mkdir()
+        sudo_shim = shim_dir / "sudo"
+        sudo_shim.write_text(
+            "#!/usr/bin/env bash\n"
+            f"printf '%s\\n' \"$*\" >> {self.sudo_log}\n"
+            "exec \"$@\"\n",
+            encoding="utf-8",
+        )
+        sudo_shim.chmod(0o755)
+        self.shim_env = os.environ.copy()
+        self.shim_env["PATH"] = f"{shim_dir}:{self.shim_env['PATH']}"
+        # No shim at all -- used to prove --plan never even looks for sudo.
+        self.plain_env = os.environ.copy()
+
+        self.secret_marker = "SECRET_KEY=do-not-log-this-marker-1a2b3c"
+
+    def _build_archive(self, *, git_sha: str) -> Path:
+        workdir = self.tmpdir / "work"
+        workdir.mkdir()
+        (workdir / "MANIFEST.txt").write_text(f"IsadoraAir Git SHA:     {git_sha}\n", encoding="utf-8")
+        app_dir = self.tmpdir / "app_build" / "isadoraair"
+        app_dir.mkdir(parents=True)
+        (app_dir / ".env").write_text(self.secret_marker + "\n", encoding="utf-8")
+        app_tar = workdir / "app.tar.gz"
+        with tarfile.open(app_tar, "w:gz") as tf:
+            tf.add(app_dir, arcname="isadoraair")
+        archive_path = self.tmpdir / "backup.tar.gz"
+        with tarfile.open(archive_path, "w:gz") as tf:
+            tf.add(workdir, arcname=".")
+        return archive_path
+
+    def _run(self, *args, env, timeout=30):
+        return subprocess.run(
+            [str(RESTORE_DIR / "20-application.sh"), *args],
+            capture_output=True, text=True, timeout=timeout, env=env,
+        )
+
+    def _sudo_log_lines(self) -> list[str]:
+        if not self.sudo_log.exists():
+            return []
+        return [line for line in self.sudo_log.read_text(encoding="utf-8").splitlines() if line]
+
+    def test_real_apply_absent_target_establishes_ownership_then_clones_unprivileged(self):
+        """Items 1-4 of the r0039 regression list: a privileged
+        establishment path exists for a real, absent target; resulting
+        ownership is the requested (default: caller's own) identity;
+        `git clone` itself is never run under the sudo shim; the
+        resulting tree is fully owned by the caller, so Stage 60 could
+        create a venv beneath it without any further privilege."""
+        archive = self._build_archive(git_sha=self.fixture_sha)
+        target = self.tmpdir / "target-root" / "opt" / "isadoraair"  # parent absent too
+
+        result = self._run(
+            "--apply", "--archive", str(archive), "--target-root", str(target),
+            "--repo-url", f"file://{self.fixture_repo}",
+            env=self.shim_env,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        # A privileged establishment actually happened...
+        sudo_calls = self._sudo_log_lines()
+        self.assertTrue(any("mkdir" in c for c in sudo_calls), sudo_calls)
+        self.assertTrue(any(c.startswith("chown") for c in sudo_calls), sudo_calls)
+        # ...but `git clone` itself was never one of the sudo calls.
+        self.assertFalse(any("git clone" in c for c in sudo_calls), sudo_calls)
+        self.assertFalse(any(c.startswith("git ") for c in sudo_calls), sudo_calls)
+
+        # Real clone + checkout actually happened, at the recorded SHA.
+        self.assertTrue((target / ".git").is_dir())
+        head = subprocess.run(
+            ["git", "-C", str(target), "rev-parse", "HEAD"], capture_output=True, text=True, check=True
+        ).stdout.strip()
+        self.assertEqual(head, self.fixture_sha)
+
+        # .env restored (proves Stage 20's LATER, unprivileged writes
+        # also succeeded against the newly-established tree) -- and its
+        # secret value never appeared in this stage's own output.
+        env_file = target / ".env"
+        self.assertTrue(env_file.is_file())
+        self.assertNotIn(self.secret_marker, result.stdout + result.stderr)
+
+        # Resulting ownership: everything under target is owned by the
+        # identity that ran this test (the default --owner) -- nothing
+        # left root-owned that would block an unprivileged Stage 60 venv.
+        my_uid, my_gid = os.getuid(), os.getgid()
+        for path in [target, *target.rglob("*")]:
+            st = path.stat()
+            self.assertEqual(st.st_uid, my_uid, path)
+            self.assertEqual(st.st_gid, my_gid, path)
+
+    def test_owner_flag_threads_through_to_the_privileged_chown_call(self):
+        """--owner USER:GROUP is honored verbatim in the actual chown
+        invocation, not silently ignored or re-derived."""
+        archive = self._build_archive(git_sha=self.fixture_sha)
+        target = self.tmpdir / "target-root2" / "opt" / "isadoraair"
+        owner = f"{os.environ.get('USER') or subprocess.run(['id', '-un'], capture_output=True, text=True).stdout.strip()}:" \
+                f"{subprocess.run(['id', '-gn'], capture_output=True, text=True).stdout.strip()}"
+
+        result = self._run(
+            "--apply", "--archive", str(archive), "--target-root", str(target),
+            "--repo-url", f"file://{self.fixture_repo}", "--owner", owner,
+            env=self.shim_env,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        sudo_calls = self._sudo_log_lines()
+        self.assertTrue(
+            any(c.startswith("chown") and owner in c and str(target) in c for c in sudo_calls), sudo_calls
+        )
+
+    def test_existing_git_checkout_is_fetched_never_chowned(self):
+        """Item 8: an existing .git checkout is fetched/verified only --
+        zero sudo calls of any kind, let alone a recursive chown."""
+        archive = self._build_archive(git_sha=self.fixture_sha)
+        target = self.tmpdir / "target-root3" / "opt" / "isadoraair"
+        target.parent.mkdir(parents=True)
+        subprocess.run(["git", "clone", "-q", str(self.fixture_repo), str(target)], check=True)
+
+        result = self._run(
+            "--apply", "--archive", str(archive), "--target-root", str(target),
+            "--repo-url", f"file://{self.fixture_repo}",
+            env=self.shim_env,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("will fetch + verify rather than re-clone", result.stdout)
+        self.assertEqual(self._sudo_log_lines(), [])
+
+    def test_existing_nonempty_non_git_target_still_fails_closed(self):
+        """Pre-existing regression, unchanged: a non-empty, non-Git
+        target is refused before any privileged action is attempted."""
+        archive = self._build_archive(git_sha=self.fixture_sha)
+        target = self.tmpdir / "target-root4" / "opt" / "isadoraair"
+        target.mkdir(parents=True)
+        (target / "unexpected-file").write_text("not a git checkout\n", encoding="utf-8")
+
+        result = self._run(
+            "--apply", "--archive", str(archive), "--target-root", str(target),
+            "--repo-url", f"file://{self.fixture_repo}",
+            env=self.shim_env,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("already exists, is non-empty, and is not a Git checkout", result.stdout + result.stderr)
+        self.assertEqual(self._sudo_log_lines(), [])
+
+    def test_plan_mode_needs_no_root_and_previews_privileged_establishment(self):
+        """--plan never writes, never invokes sudo (run with NO shim on
+        PATH at all -- real sudo is reachable but do_or_plan must never
+        call it under --plan), and clearly previews what --apply would
+        do."""
+        archive = self._build_archive(git_sha=self.fixture_sha)
+        target = self.tmpdir / "target-root5" / "opt" / "isadoraair"
+
+        result = self._run(
+            "--plan", "--archive", str(archive), "--target-root", str(target),
+            "--repo-url", f"file://{self.fixture_repo}",
+            env=self.plain_env,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(target.exists())
+        self.assertIn("sudo mkdir", result.stdout)
+        self.assertIn("sudo chown", result.stdout)
+        self.assertIn("git clone", result.stdout)
+
+    def test_staging_root_remains_unprivileged_and_unchanged(self):
+        """--staging-root never invokes sudo, even with the shim present
+        on PATH to catch it if it tried -- existing behavior, unchanged
+        by this fix."""
+        archive = self._build_archive(git_sha=self.fixture_sha)
+        staging = self.tmpdir / "staging"
+
+        result = self._run(
+            "--apply", "--archive", str(archive), "--staging-root", str(staging),
+            "--repo-url", f"file://{self.fixture_repo}",
+            env=self.shim_env,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self._sudo_log_lines(), [])
+        self.assertTrue((staging / "opt" / "isadoraair" / ".git").is_dir())
+
+    def test_production_target_guard_still_wired(self):
+        """Item 9: guard_production_target (unchanged by this fix) is
+        still called by this stage -- structural check, since the guard
+        itself is already covered generically by LibShSafetyGuardTests."""
+        text = (RESTORE_DIR / "20-application.sh").read_text(encoding="utf-8")
+        self.assertIn("guard_production_target", text)
+
+
 class RuntimeFoundationE6TargetValidationFunctionalTests(SimpleTestCase):
     """Exercise stages 90/95 only beneath a disposable target root.
 
