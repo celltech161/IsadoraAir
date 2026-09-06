@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "release_id": "r0040",
+  "previous_release_id": "r0039",
+  "minimum_updater_protocol_version": 5,
+  "summary": "Fixes an E8 regression: Stage 30's createuser --pwprompt-over-stdin (r0036) is bypassed by real PostgreSQL, which prompts via /dev/tty when a terminal exists. Password is now set via a separate SQL step using psql's \\getenv/:'var' quoting, never argv. Existing role from a partial failure resyncs its password when the target DB is empty/absent. Fake-createuser test replaced with real PostgreSQL + pty integration tests. No migration/dependency/package/service changes.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0007"
+}

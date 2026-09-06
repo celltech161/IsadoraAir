@@ -319,9 +319,18 @@ contents. Where a stage needs to reference that such a value exists
 value. Commands that consume a secret must use `do_or_plan_redacted`,
 whose operator-facing description is supplied separately from the real
 command and arguments; `redact()` emits the fixed marker `<redacted>`
-without revealing the value or its length. Stage 30 additionally passes a
-new PostgreSQL role password through `createuser --pwprompt` stdin, never
-through command arguments or password-bearing SQL text.
+without revealing the value or its length.
+
+Stage 30's new PostgreSQL role password (r0040; replaces r0036's
+`createuser --pwprompt` stdin pipe, which real PostgreSQL bypasses via
+`/dev/tty` whenever a controlling terminal is available -- see
+`30-postgresql.sh`'s own comment on the regression) is never assembled
+into an SQL string this script writes, and never appears on any
+command's argv: it is written to a private, `postgres`-owned temp file
+as a shell-quoted (`printf '%q'`) assignment, `source`d by the
+`postgres`-owned process, and read from there into a `psql` variable via
+`\getenv` -- `psql`'s own `:'var'` literal-substitution then does the
+SQL string-quoting, never this shell.
 
 ## Phase 4 staging validation
 

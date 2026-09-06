@@ -16,12 +16,15 @@ import importlib.util
 import os
 import io
 import json
+import pty
 import shutil
+import socket
 import stat
 import subprocess
 import sys
 import tarfile
 import tempfile
+import unittest
 from pathlib import Path
 
 from django.test import SimpleTestCase
@@ -215,9 +218,21 @@ class StageScriptsNeverLogSecretValuesTests(SimpleTestCase):
         self.assertIn("not logged", text.lower())
         self.assertIn("do_or_plan_redacted", text)
         self.assertNotIn("CREATE USER ${DB_USER} WITH PASSWORD '${DB_PASSWORD}'", text)
-        # The password variable is used (exported to PGPASSWORD / fed to
-        # createuser's non-echoing password prompt), but never passed to a
-        # normal logging function.
+        # r0036's createuser --pwprompt-over-stdin mechanism is the r0040
+        # regression: PostgreSQL's real password prompt opens /dev/tty
+        # directly whenever one is available, bypassing the pipe. Never
+        # reintroduce it as actual code (it may still be mentioned in
+        # prose, e.g. this very file's own explanatory comment on why).
+        for lineno, line in enumerate(text.splitlines(), start=1):
+            if line.strip().startswith("#"):
+                continue
+            self.assertNotIn("--pwprompt", line, f"line {lineno} re-introduces --pwprompt: {line!r}")
+        # The r0040 replacement: the password is read by psql itself,
+        # inside its own process, straight out of its environment.
+        self.assertIn("\\getenv", text)
+        # The password variable is used (exported to PGPASSWORD / written
+        # to a private temp file for the secure role-password mechanism),
+        # but never passed to a normal logging function.
         for lineno, line in enumerate(text.splitlines(), start=1):
             if "log_info" in line or "log_apply" in line or "log_warn" in line:
                 self.assertNotIn("$DB_PASSWORD", line, f"line {lineno} logs DB_PASSWORD: {line!r}")
@@ -227,146 +242,394 @@ class StageScriptsNeverLogSecretValuesTests(SimpleTestCase):
         self.assertIn("value NOT logged", text)
 
 
-class Stage30SecretLoggingFunctionalTests(SimpleTestCase):
-    """Exercise Stage 30's apply path with a synthetic archive and fake
-    PostgreSQL commands. The sentinel password is deliberately shell-hostile:
-    it proves the real value reaches createuser over stdin while never reaching
-    command logging, stdout/stderr, or the evidence transcript."""
+def _find_postgres_bin_dir():
+    """Locates a directory holding initdb/pg_ctl/createuser/psql/pg_dump/
+    pg_restore -- preferring PATH, then Debian/Ubuntu's versioned
+    /usr/lib/postgresql/<N>/bin layout (initdb and pg_ctl are
+    deliberately not put on PATH there, unlike the client tools)."""
+    needed = ("initdb", "pg_ctl", "createuser", "psql", "pg_dump", "pg_restore")
+    for d in os.environ.get("PATH", "").split(os.pathsep):
+        if d and all(shutil.which(n, path=d) for n in needed):
+            return Path(d)
+    base = Path("/usr/lib/postgresql")
+    if base.is_dir():
+        for version_dir in sorted(base.iterdir(), reverse=True):
+            candidate = version_dir / "bin"
+            if all((candidate / n).is_file() for n in needed):
+                return candidate
+    return None
 
-    def setUp(self):
-        self.tmpdir = Path(tempfile.mkdtemp(prefix="isadoraair-stage30-secret-test-"))
-        self.addCleanup(shutil.rmtree, self.tmpdir, ignore_errors=True)
-        self.password = "E8-stage30-secret-'-$-20260904"
-        self.db_user = "isadoraair_e8_test"
 
-        self.staging_root = self.tmpdir / "staging"
-        self.target_root = self.staging_root / "opt" / "isadoraair"
-        self.target_root.mkdir(parents=True)
-        self.env_file = self.target_root / ".env"
-        self.env_file.write_text(
-            f"DB_USER={self.db_user}\n"
-            f"DB_PASSWORD={self.password}\n"
-            "DB_HOST=localhost\n"
-            "DB_PORT=5432\n",
-            encoding="utf-8",
+def _free_tcp_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+_POSTGRES_BIN_DIR = _find_postgres_bin_dir()
+
+
+@unittest.skipUnless(_POSTGRES_BIN_DIR, "no local PostgreSQL server binaries available")
+class Stage30RealPostgreSQLTestCase(SimpleTestCase):
+    """Shared base for the r0040 fix: a genuine, disposable local
+    PostgreSQL cluster, initdb'd fresh under a temp dir as this test's
+    own unprivileged OS user -- no sudo, no root, an entirely separate
+    data directory/port, and never touching the real 'isadoraair' role
+    or database. Real SCRAM password authentication is enforced on its
+    TCP listener, so a wrong or empty password genuinely fails to
+    authenticate, exactly like production.
+
+    This replaces r0036's own fake createuser (which read two lines off
+    stdin, reproducing the very assumption about PostgreSQL's real
+    prompt behavior that turned out to be wrong -- see 30-postgresql.sh's
+    own comment on the regression) with the real external tool. The only
+    double left is `sudo` itself, standing in for the OS-level jump to
+    the `postgres` user this sandbox has no root to actually make."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.pg_bin = _POSTGRES_BIN_DIR
+        cls.cluster_dir = Path(tempfile.mkdtemp(prefix="isadoraair-pgtest-cluster-"))
+        cls.addClassCleanup(shutil.rmtree, cls.cluster_dir, ignore_errors=True)
+        cls.data_dir = cls.cluster_dir / "data"
+        cls.sock_dir = Path(tempfile.mkdtemp(prefix="isadoraair-pgtest-sock-"))
+        cls.addClassCleanup(shutil.rmtree, cls.sock_dir, ignore_errors=True)
+        cls.port = _free_tcp_port()
+
+        subprocess.run(
+            [str(cls.pg_bin / "initdb"), "-D", str(cls.data_dir), "-U", "postgres",
+             "--auth=trust", "-E", "UTF8", "--locale=en_US.UTF-8"],
+            check=True, capture_output=True, text=True,
+        )
+        with (cls.data_dir / "postgresql.conf").open("a", encoding="utf-8") as f:
+            f.write(f"\nunix_socket_directories = '{cls.sock_dir}'\n")
+            f.write("listen_addresses = '127.0.0.1'\n")
+        subprocess.run(
+            [str(cls.pg_bin / "pg_ctl"), "-D", str(cls.data_dir),
+             "-l", str(cls.cluster_dir / "server.log"), "-o", f"-p {cls.port}", "-w", "start"],
+            check=True, capture_output=True, text=True,
+        )
+        cls.addClassCleanup(
+            subprocess.run,
+            [str(cls.pg_bin / "pg_ctl"), "-D", str(cls.data_dir), "-m", "fast", "stop"],
+            capture_output=True, text=True,
         )
 
-        archive_root = self.tmpdir / "archive-root"
-        archive_root.mkdir()
-        (archive_root / "database.dump").write_bytes(b"PGDMP" + b"\x00" * 64)
-        self.archive = self.tmpdir / "backup.tar.gz"
-        with tarfile.open(self.archive, "w:gz") as tf:
-            tf.add(archive_root, arcname=".")
+        # A fresh --auth=trust initdb still trusts 127.0.0.1 unconditionally;
+        # tighten that one line to real SCRAM auth so a wrong password
+        # genuinely fails over TCP, matching production's real pg_hba.conf.
+        hba = cls.data_dir / "pg_hba.conf"
+        text = hba.read_text(encoding="utf-8")
+        replaced = text.replace(
+            "host    all             all             127.0.0.1/32            trust",
+            "host    all             all             127.0.0.1/32            scram-sha-256",
+        )
+        assert replaced != text, "expected initdb's default IPv4 trust line to rewrite"
+        hba.write_text(replaced, encoding="utf-8")
+        subprocess.run(
+            [str(cls.pg_bin / "pg_ctl"), "-D", str(cls.data_dir), "reload"],
+            check=True, capture_output=True, text=True,
+        )
 
-        self.fakebin = self.tmpdir / "fakebin"
-        self.fakebin.mkdir()
-        self.role_password_file = self.tmpdir / "role-password-received"
-        self.createuser_args_file = self.tmpdir / "createuser-args"
-        self.database_file = self.tmpdir / "database-created"
-        self.restore_file = self.tmpdir / "pg-restore-completed"
-
-        self._write_executable(
-            "sudo",
+        cls.fakebin = cls.cluster_dir / "fakebin"
+        cls.fakebin.mkdir()
+        sudo_shim = cls.fakebin / "sudo"
+        sudo_shim.write_text(
             """#!/usr/bin/env bash
+# The one double in this suite: no root is available to actually become
+# the postgres OS user, so this plays both sides as the SAME
+# unprivileged test user against its own disposable cluster.
 set -euo pipefail
+if [ "${1:-}" = "chown" ] && [ "${2:-}" = "postgres:postgres" ]; then
+  exit 0  # ownership handoff to the postgres OS user is meaningless here
+fi
 if [ "${1:-}" = "-u" ]; then
   shift 2
 fi
 exec "$@"
 """,
+            encoding="utf-8",
         )
-        self._write_executable(
-            "createuser",
-            """#!/usr/bin/env bash
-set -euo pipefail
-IFS= read -r first_password
-IFS= read -r second_password
-[ "$first_password" = "$second_password" ]
-printf '%s' "$first_password" > "$FAKE_ROLE_PASSWORD_FILE"
-printf '%s\n' "$*" > "$FAKE_CREATEUSER_ARGS_FILE"
-""",
-        )
-        self._write_executable(
-            "psql",
-            """#!/usr/bin/env bash
-set -euo pipefail
-args="$*"
-if [[ "$args" == *"FROM pg_roles"* ]]; then
-  if [ -f "$FAKE_ROLE_PASSWORD_FILE" ]; then printf '1\n'; fi
-elif [[ "$args" == *"FROM pg_database"* ]]; then
-  if [ -f "$FAKE_DATABASE_FILE" ]; then printf '1\n'; fi
-elif [[ "$args" == *"CREATE DATABASE"* ]]; then
-  : > "$FAKE_DATABASE_FILE"
-elif [[ "$args" == *"SELECT count(*) FROM django_migrations"* ]]; then
-  printf '42\n'
-elif [[ "$args" == *"table_name = 'django_migrations'"* ]]; then
-  printf '1\n'
-elif [[ "$args" == *"information_schema.tables"* ]]; then
-  if [ -f "$FAKE_RESTORE_FILE" ]; then printf '7\n'; else printf '0\n'; fi
-fi
-""",
-        )
-        self._write_executable(
-            "pg_restore",
-            """#!/usr/bin/env bash
-set -euo pipefail
-: > "$FAKE_RESTORE_FILE"
-""",
+        sudo_shim.chmod(0o755)
+
+    def _run_super(self, *args, database="postgres", check=True):
+        return subprocess.run(
+            [str(self.pg_bin / "psql"), "-h", str(self.sock_dir), "-p", str(self.port),
+             "-U", "postgres", "-d", database, *args],
+            capture_output=True, text=True, check=check,
         )
 
+    def _authenticates(self, role, password, database="postgres"):
+        result = subprocess.run(
+            [str(self.pg_bin / "psql"), "-h", "127.0.0.1", "-p", str(self.port),
+             "-U", role, "-d", database, "-tAc", "SELECT 1"],
+            capture_output=True, text=True,
+            env={**os.environ, "PGPASSWORD": password},
+        )
+        return result.returncode == 0 and result.stdout.strip() == "1"
+
+    def _make_archive(self, tmpdir: Path, seed_db: str) -> Path:
+        """A synthetic backup tar.gz whose database.dump is a REAL
+        `pg_dump -Fc` of an actual seed database in this test's own
+        disposable cluster -- including a genuine django_migrations-
+        shaped table -- never a fake byte string, so pg_restore in
+        30-postgresql.sh does real, meaningful work end to end."""
+        self._run_super("-c", f"DROP DATABASE IF EXISTS {seed_db}")
+        self._run_super("-c", f"CREATE DATABASE {seed_db}")
+        self._run_super(
+            "-c",
+            "CREATE TABLE django_migrations "
+            "(id serial primary key, app text, name text, applied timestamptz); "
+            "INSERT INTO django_migrations (app, name, applied) "
+            "VALUES ('isadoraair', '0001_initial', now());",
+            database=seed_db,
+        )
+        archive_root = tmpdir / "archive-root"
+        archive_root.mkdir()
+        subprocess.run(
+            [str(self.pg_bin / "pg_dump"), "-h", str(self.sock_dir), "-p", str(self.port),
+             "-U", "postgres", "-Fc", "-d", seed_db, "-f", str(archive_root / "database.dump")],
+            check=True, capture_output=True, text=True,
+        )
+        archive = tmpdir / "backup.tar.gz"
+        with tarfile.open(archive, "w:gz") as tf:
+            tf.add(archive_root, arcname=".")
+        return archive
+
+    def _run_stage30(self, tmpdir, db_user, password, extra_args=(), pty_stdio=False, timeout=30):
+        staging_root = tmpdir / "staging"
+        target_root = staging_root / "opt" / "isadoraair"
+        target_root.mkdir(parents=True)
+        (target_root / ".env").write_text(
+            f"DB_USER={db_user}\nDB_PASSWORD={password}\nDB_HOST=127.0.0.1\nDB_PORT={self.port}\n",
+            encoding="utf-8",
+        )
+        archive = self._make_archive(tmpdir, seed_db=f"{db_user}_seed")
+        args = [
+            str(RESTORE_DIR / "30-postgresql.sh"),
+            "--archive", str(archive),
+            "--staging-root", str(staging_root),
+            "--apply",
+            *extra_args,
+        ]
         env = {
             **os.environ,
-            "PATH": f"{self.fakebin}:{os.environ['PATH']}",
-            "FAKE_ROLE_PASSWORD_FILE": str(self.role_password_file),
-            "FAKE_CREATEUSER_ARGS_FILE": str(self.createuser_args_file),
-            "FAKE_DATABASE_FILE": str(self.database_file),
-            "FAKE_RESTORE_FILE": str(self.restore_file),
+            "PATH": f"{self.fakebin}:{self.pg_bin}:{os.environ['PATH']}",
+            # Every "sudo -u postgres ..." call in the script omits -h/-U/-p
+            # (it expects OS-user identity + peer/trust auth to resolve
+            # them); the fake sudo above can't actually become the
+            # postgres OS user, so these stand in for that resolution.
+            "PGHOST": str(self.sock_dir),
+            "PGPORT": str(self.port),
+            "PGUSER": "postgres",
         }
-        self.result = subprocess.run(
-            [
-                str(RESTORE_DIR / "30-postgresql.sh"),
-                "--archive", str(self.archive),
-                "--staging-root", str(self.staging_root),
-                "--apply",
-            ],
-            capture_output=True,
-            text=True,
-            env=env,
-            timeout=30,
-        )
+        if not pty_stdio:
+            result = subprocess.run(args, capture_output=True, text=True, env=env, timeout=timeout)
+            return result, target_root / ".env"
+        return self._run_under_pty(args, env, timeout), target_root / ".env"
+
+    @staticmethod
+    def _run_under_pty(args, env, timeout):
+        """Runs args with a REAL controlling terminal on stdin/stdout/
+        stderr -- the exact condition (see 30-postgresql.sh's own
+        comment) under which real createuser --pwprompt bypassed a piped
+        stdin and blocked on /dev/tty instead. Returns an object with
+        .returncode/.stdout/.stderr, mirroring subprocess.run's result
+        closely enough for these tests' assertions."""
+        controller_fd, follower_fd = pty.openpty()
+        try:
+            proc = subprocess.Popen(
+                args, stdin=follower_fd, stdout=follower_fd, stderr=follower_fd,
+                env=env, start_new_session=True, close_fds=True,
+            )
+            os.close(follower_fd)
+            follower_fd = -1
+            chunks = []
+            try:
+                while True:
+                    try:
+                        chunk = os.read(controller_fd, 65536)
+                    except OSError:
+                        break
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+            finally:
+                returncode = proc.wait(timeout=timeout)
+            output = b"".join(chunks).decode("utf-8", errors="replace")
+
+            class _Result:
+                pass
+
+            r = _Result()
+            r.returncode = returncode
+            r.stdout = output
+            r.stderr = ""
+            return r
+        finally:
+            os.close(controller_fd)
+            if follower_fd != -1:
+                os.close(follower_fd)
+
+
+class Stage30HostilePasswordRoleCreationTests(Stage30RealPostgreSQLTestCase):
+    """Task 3, states 1-7: a fresh role, a password containing every
+    listed hostile character in one string, real TCP authentication,
+    and exhaustive absence of the plaintext from every captured
+    channel."""
+
+    PASSWORD = "E8'stage30 \"secret\"$-with\\backslash-20260904"
+
+    def setUp(self):
+        self.tmpdir = Path(tempfile.mkdtemp(prefix="isadoraair-stage30-real-"))
+        self.addCleanup(shutil.rmtree, self.tmpdir, ignore_errors=True)
+        self.db_user = "isadoraair_e8_hostile"
+        # This class's cluster (one per class, via setUpClass) is shared
+        # across all of this class's test methods -- start each one from
+        # a clean slate rather than whatever the previous method left in
+        # the (fixed, --staging-root-default) restore-target database.
+        self._run_super("-c", "DROP DATABASE IF EXISTS isadoraair_restore_test")
+        self._run_super("-c", f"DROP ROLE IF EXISTS {self.db_user}")
+        self.result, self.env_file = self._run_stage30(self.tmpdir, self.db_user, self.PASSWORD)
         self.combined_output = self.result.stdout + self.result.stderr
-        self.evidence_file = self.tmpdir / "e8-stage30.evidence.log"
-        self.evidence_file.write_text(self.combined_output, encoding="utf-8")
 
-    def _write_executable(self, name: str, content: str):
-        path = self.fakebin / name
-        path.write_text(content, encoding="utf-8")
-        path.chmod(0o755)
-
-    def test_db_password_is_absent_from_stage_stdout_and_stderr(self):
-        self.assertNotIn(self.password, self.result.stdout)
-        self.assertNotIn(self.password, self.result.stderr)
-
-    def test_db_password_is_absent_from_generated_evidence_log(self):
-        self.assertNotIn(self.password, self.evidence_file.read_text(encoding="utf-8"))
-
-    def test_postgresql_role_database_and_dump_restore_still_succeed(self):
+    def test_role_created_and_authenticates_with_the_exact_hostile_password(self):
         self.assertEqual(self.result.returncode, 0, self.combined_output)
-        self.assertEqual(self.role_password_file.read_text(encoding="utf-8"), self.password)
-        self.assertEqual(
-            self.createuser_args_file.read_text(encoding="utf-8").strip(),
-            f"--pwprompt --no-password {self.db_user}",
-        )
-        self.assertTrue(self.database_file.is_file())
-        self.assertTrue(self.restore_file.is_file())
         self.assertIn("30-postgresql: PASS", self.combined_output)
+        self.assertTrue(self._authenticates(self.db_user, self.PASSWORD))
+
+    def test_wrong_password_does_not_authenticate(self):
+        self.assertEqual(self.result.returncode, 0, self.combined_output)
+        self.assertFalse(self._authenticates(self.db_user, "definitely-the-wrong-password"))
+
+    def test_password_absent_from_stdout_and_stderr(self):
+        self.assertNotIn(self.PASSWORD, self.result.stdout)
+        self.assertNotIn(self.PASSWORD, self.result.stderr)
+
+    def test_password_absent_from_evidence_transcript(self):
+        evidence_file = self.tmpdir / "e8-stage30.evidence.log"
+        evidence_file.write_text(self.combined_output, encoding="utf-8")
+        self.assertNotIn(self.PASSWORD, evidence_file.read_text(encoding="utf-8"))
+
+    def test_password_absent_from_every_logged_command_line(self):
+        # do_or_plan's [APPLY]/[PLAN] lines are the closest thing this
+        # tool has to a logged argv; no [APPLY]/[PLAN] line -- and no
+        # line at all -- may contain the raw password.
+        for lineno, line in enumerate(self.combined_output.splitlines(), start=1):
+            self.assertNotIn(self.PASSWORD, line, f"line {lineno} leaked the password: {line!r}")
 
     def test_redacted_apply_log_remains_operator_useful(self):
         self.assertIn(
-            f"[APPLY] create PostgreSQL login role '{self.db_user}' with createuser --pwprompt",
+            f"[APPLY] create PostgreSQL login role '{self.db_user}'",
             self.combined_output,
         )
         self.assertIn(f"password from {self.env_file}: <redacted>", self.combined_output)
+
+
+class Stage30NoInteractivePromptUnderRealTTYTests(Stage30RealPostgreSQLTestCase):
+    """Task 3, state 8 -- the actual E8 failure mode: run the fixed
+    script with a REAL controlling terminal on stdin/stdout/stderr
+    (a pty, via Python's pty module), which is exactly the condition
+    under which the old createuser --pwprompt silently bypassed the
+    piped password and blocked on /dev/tty instead. A hang here would
+    time out subprocess.wait() and fail the test."""
+
+    PASSWORD = "E8-tty-check-'-$-\\-20260906"
+
+    def test_completes_without_hanging_or_prompting_under_a_real_tty(self):
+        tmpdir = Path(tempfile.mkdtemp(prefix="isadoraair-stage30-tty-"))
+        self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
+        db_user = "isadoraair_e8_tty"
+        result, _env_file = self._run_stage30(tmpdir, db_user, self.PASSWORD, pty_stdio=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("30-postgresql: PASS", result.stdout)
+        self.assertNotIn("Enter password for new role", result.stdout)
+        self.assertTrue(self._authenticates(db_user, self.PASSWORD))
+        self.assertNotIn(self.PASSWORD, result.stdout)
+
+
+class Stage30PartialFailureIdempotenceTests(Stage30RealPostgreSQLTestCase):
+    """Task 4's state matrix, proven against the real cluster rather
+    than a fake that could silently diverge from real PostgreSQL
+    semantics (rolsuper, table counts, real auth)."""
+
+    def setUp(self):
+        # Shared cluster across this class's methods (see setUpClass) --
+        # each test builds its own precise starting state, so none of
+        # them should see the (fixed, --staging-root-default) restore
+        # database left over from a previous method.
+        self._run_super("-c", "DROP DATABASE IF EXISTS isadoraair_restore_test")
+
+    def test_role_exists_with_wrong_password_and_db_absent_is_resynchronized(self):
+        """Exactly what the real E8 failure left behind: the role
+        exists (created by a prior, since-fixed broken run) with some
+        other password, and the target database was never created. A
+        rerun must converge on the .env password, not skip-and-preserve
+        the wrong one."""
+        tmpdir = Path(tempfile.mkdtemp(prefix="isadoraair-stage30-resync-"))
+        self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
+        db_user = "isadoraair_e8_resync"
+        self._run_super("-c", f"DROP ROLE IF EXISTS {db_user}")
+        self._run_super("-c", f"CREATE ROLE {db_user} LOGIN PASSWORD 'stale-wrong-password'")
+        self.addCleanup(self._run_super, "-c", f"DROP ROLE IF EXISTS {db_user}", check=False)
+
+        correct_password = "E8-resync-correct-'-$-20260906"
+        result, _env_file = self._run_stage30(tmpdir, db_user, correct_password)
+        combined = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 0, combined)
+        self.assertIn(
+            f"Role '{db_user}' already exists and", combined,
+        )
+        self.assertTrue(self._authenticates(db_user, correct_password))
+        self.assertFalse(self._authenticates(db_user, "stale-wrong-password"))
+        self.assertNotIn(correct_password, combined)
+
+    def test_role_exists_with_restored_content_is_left_untouched(self):
+        """A completed prior restore (or an unrelated same-named role):
+        the target database already has real content, so the role's
+        password must NOT be silently resynchronized."""
+        tmpdir = Path(tempfile.mkdtemp(prefix="isadoraair-stage30-hascontent-"))
+        self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
+        db_user = "isadoraair_e8_hascontent"
+        original_password = "original-password-still-in-place"
+        self._run_super("-c", f"DROP DATABASE IF EXISTS isadoraair_restore_test")
+        self._run_super("-c", f"DROP ROLE IF EXISTS {db_user}")
+        self._run_super("-c", f"CREATE ROLE {db_user} LOGIN PASSWORD '{original_password}'")
+        self._run_super("-c", f"CREATE DATABASE isadoraair_restore_test OWNER {db_user}")
+        self._run_super(
+            "-c", "CREATE TABLE already_here (id serial primary key);",
+            database="isadoraair_restore_test",
+        )
+        self.addCleanup(self._run_super, "-c", "DROP DATABASE IF EXISTS isadoraair_restore_test", check=False)
+        self.addCleanup(self._run_super, "-c", f"DROP ROLE IF EXISTS {db_user}", check=False)
+
+        result, _env_file = self._run_stage30(tmpdir, db_user, "attempted-new-password")
+        combined = result.stdout + result.stderr
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("already has", combined)
+        self.assertIn("leaving its password untouched", combined)
+        self.assertTrue(self._authenticates(db_user, original_password))
+        self.assertFalse(self._authenticates(db_user, "attempted-new-password"))
+
+    def test_role_exists_as_superuser_is_left_untouched(self):
+        """A role sharing DB_USER's name but flagged SUPERUSER does not
+        look like anything this tool ever created; refuse rather than
+        guess."""
+        tmpdir = Path(tempfile.mkdtemp(prefix="isadoraair-stage30-superuser-"))
+        self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
+        db_user = "isadoraair_e8_super"
+        original_password = "superuser-original-password"
+        self._run_super("-c", f"DROP ROLE IF EXISTS {db_user}")
+        self._run_super("-c", f"CREATE ROLE {db_user} LOGIN SUPERUSER PASSWORD '{original_password}'")
+        self.addCleanup(self._run_super, "-c", f"DROP ROLE IF EXISTS {db_user}", check=False)
+
+        result, _env_file = self._run_stage30(tmpdir, db_user, "attempted-new-password")
+        combined = result.stdout + result.stderr
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("SUPERUSER", combined)
+        self.assertTrue(self._authenticates(db_user, original_password))
+        self.assertFalse(self._authenticates(db_user, "attempted-new-password"))
 
 
 class InspectBackupFunctionalTests(SimpleTestCase):
