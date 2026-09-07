@@ -151,6 +151,7 @@ class Command(BaseCommand):
             "unresolved": self.style.WARNING("UNRESOLVED"),
             "optional_absent": "OPTIONAL",
             "not_applicable": "N/A     ",
+            "deferred": self.style.WARNING("DEFERRED"),
         }.get(state, state)
 
     def _write_human(self, evidence):
@@ -170,7 +171,18 @@ class Command(BaseCommand):
                 state = "pass" if item.state == "healthy" else "fail"
                 self.stdout.write(f"{self._marker(state)}  E5 surface: {name} ({item.state})")
         scratch = structural.scratch_surface
-        scratch_state = "pass" if scratch.healthy else ("unresolved" if scratch.state == "unresolved_identity" else "fail")
+        # r0042: STATE_ABSENT is non-gating (deferred until systemd-tmpfiles
+        # runs at boot -- see StructuralBaselineEvidence.result) -- shown as
+        # DEFERRED, not FAIL, so the human output doesn't contradict the
+        # exit code it's paired with.
+        if scratch.healthy:
+            scratch_state = "pass"
+        elif scratch.state == "unresolved_identity":
+            scratch_state = "unresolved"
+        elif scratch.state == "absent":
+            scratch_state = "deferred"
+        else:
+            scratch_state = "fail"
         self.stdout.write(f"{self._marker(scratch_state)}  TTS scratch surface {scratch.path} ({scratch.state})")
         for diagnostic in scratch.diagnostics:
             self.stdout.write(f"    {diagnostic}")

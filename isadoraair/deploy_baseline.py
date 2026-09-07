@@ -70,6 +70,7 @@ from isadoraair.runtime_packages import (
     evaluate_package_prerequisite,
 )
 from isadoraair.runtime_scratch import (
+    STATE_ABSENT as SCRATCH_STATE_ABSENT,
     STATE_HEALTHY as SCRATCH_STATE_HEALTHY,
     STATE_UNRESOLVED_IDENTITY as SCRATCH_STATE_UNRESOLVED_IDENTITY,
     ScratchSurfaceEvidence,
@@ -206,19 +207,39 @@ def _check_alsa_utils() -> LegacyCheck:
 
 
 def _check_snd_aloop() -> list[LegacyCheck]:
+    """Live kernel-module/card-layout evidence only -- deliberately
+    non-gating (DEGRADED at worst, never MISSING). r0042: Stage 95's
+    canonical acceptance point is post-Stage-90, pre-service-activation
+    -- BEFORE any reboot or manual 'modprobe snd-aloop' has happened.
+    90-system-config.sh's own snd-aloop verification already documents
+    this exact deferral ("module may not be loaded yet ... A reboot ...
+    is needed after installing the modprobe.d config for it to take
+    effect") and only ever WARNs, never fails, for the identical reason.
+    The structural, gating question -- is
+    deploy/isadoraair-aloop.conf correctly installed to
+    /etc/modprobe.d/isadoraair-aloop.conf? -- is answered separately in
+    _check_directories() (target-root-mapped, so it also covers an
+    offline staging target, unlike this live-root-only check)."""
     try:
         loaded = Path("/proc/modules").read_text()
         if "snd_aloop " not in loaded and not loaded.startswith("snd_aloop "):
-            return [LegacyCheck("snd-aloop module", LEGACY_MISSING, "not loaded (modprobe snd-aloop)")]
+            return [
+                LegacyCheck(
+                    "snd-aloop module",
+                    LEGACY_DEGRADED,
+                    "not loaded yet (modprobe snd-aloop, or reboot) -- expected pre-boot/pre-activation; "
+                    "see 'snd-aloop modprobe.d config' above for the structural install check",
+                )
+            ]
     except Exception as exc:
-        return [LegacyCheck("snd-aloop module", LEGACY_MISSING, f"could not read /proc/modules: {exc}")]
+        return [LegacyCheck("snd-aloop module", LEGACY_DEGRADED, f"could not read /proc/modules: {exc}")]
     results = [LegacyCheck("snd-aloop module", LEGACY_PASS, "loaded")]
 
     try:
         cards = Path("/proc/asound/cards").read_text()
     except Exception as exc:
         results.append(
-            LegacyCheck("snd-aloop card layout", LEGACY_MISSING, f"could not read /proc/asound/cards: {exc}")
+            LegacyCheck("snd-aloop card layout", LEGACY_DEGRADED, f"could not read /proc/asound/cards: {exc}")
         )
         return results
 
@@ -249,7 +270,13 @@ def _check_snd_aloop() -> list[LegacyCheck]:
             )
         )
     else:
-        results.append(LegacyCheck("snd-aloop card layout", LEGACY_MISSING, "no Loopback cards found"))
+        results.append(
+            LegacyCheck(
+                "snd-aloop card layout",
+                LEGACY_DEGRADED,
+                "no Loopback cards found -- expected pre-boot/pre-activation",
+            )
+        )
     return results
 
 
@@ -326,6 +353,27 @@ def _check_directories(
             state = LEGACY_PASS if actual == expected else LEGACY_MISSING
             detail = "matches Git-owned authority" if state == LEGACY_PASS else "content mismatch"
             results.append(LegacyCheck("TTS scratch tmpfiles config", state, detail))
+
+    # r0042: the modprobe.d config's INSTALLATION is structural (gates
+    # here, target-root-mapped so an offline staging target is covered
+    # too) -- whether the kernel module is actually LOADED right now is
+    # separate live/deferred evidence, see _check_snd_aloop() above.
+    aloop_conf = _map_target_path(target_root, Path("/etc/modprobe.d/isadoraair-aloop.conf"))
+    source_aloop_conf = project_root / "deploy" / "isadoraair-aloop.conf"
+    if not aloop_conf.is_file():
+        results.append(
+            LegacyCheck("snd-aloop modprobe.d config", LEGACY_MISSING, f"{aloop_conf} is missing")
+        )
+    else:
+        try:
+            expected_conf = source_aloop_conf.read_text(encoding="utf-8")
+            actual_conf = aloop_conf.read_text(encoding="utf-8")
+        except OSError as exc:
+            results.append(LegacyCheck("snd-aloop modprobe.d config", LEGACY_MISSING, str(exc)))
+        else:
+            state = LEGACY_PASS if actual_conf == expected_conf else LEGACY_MISSING
+            detail = "matches Git-owned authority" if state == LEGACY_PASS else "content mismatch"
+            results.append(LegacyCheck("snd-aloop modprobe.d config", state, detail))
     return results
 
 
@@ -386,7 +434,21 @@ class StructuralBaselineEvidence:
             p.status == PACKAGE_STATUS_FAIL for p in self.package_prerequisites if p.kind == "runtime"
         ):
             return RESULT_FAIL
-        if self.scratch_surface.state not in (SCRATCH_STATE_HEALTHY, SCRATCH_STATE_UNRESOLVED_IDENTITY):
+        # r0042: STATE_ABSENT is deliberately non-gating here -- Stage 95's
+        # canonical acceptance point is post-Stage-90/pre-service-activation,
+        # BEFORE systemd-tmpfiles has ever run (that happens at boot, per
+        # deploy/isadoraair-tmpfiles.conf -- 90-system-config.sh installs
+        # the declaration but never creates /run/isadoraair/tts itself,
+        # exactly like /run/isadoraair's own already-DEGRADED-not-MISSING
+        # treatment above in _check_directories()). Every OTHER non-healthy
+        # state (wrong type/owner, unsafe permissions/ancestry, symlink)
+        # reflects an actual problem with something that already exists,
+        # never mere pre-boot absence, and must still fail closed.
+        if self.scratch_surface.state not in (
+            SCRATCH_STATE_HEALTHY,
+            SCRATCH_STATE_UNRESOLVED_IDENTITY,
+            SCRATCH_STATE_ABSENT,
+        ):
             return RESULT_FAIL
         if self.scratch_surface.state == SCRATCH_STATE_UNRESOLVED_IDENTITY:
             return RESULT_UNRESOLVED
@@ -397,6 +459,20 @@ class StructuralBaselineEvidence:
         ):
             return RESULT_UNRESOLVED
         return RESULT_PASS
+
+    @property
+    def has_unresolved_identity(self) -> bool:
+        """True only for the scratch-surface identity-ambiguity reason
+        `result` can report as RESULT_UNRESOLVED -- never the OTHER
+        reason it collapses into the same string (a runtime package
+        prerequisite this structural-only tier cannot resolve without
+        station DB/config access). r0042: DeploymentBaselineEvidence.result
+        needs this distinction to know which specific UNRESOLVED reason
+        a subsequently-available, more-informed station tier is capable
+        of superseding (package selection) versus which one it is not
+        (identity) -- collapsing both into one sentinel string made that
+        impossible to tell apart from the aggregate alone."""
+        return self.scratch_surface.state == SCRATCH_STATE_UNRESOLVED_IDENTITY
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -543,7 +619,28 @@ class DeploymentBaselineEvidence:
                 if p.kind == "runtime"
             ):
                 return RESULT_UNRESOLVED
-        if self.structural.result == RESULT_UNRESOLVED:
+        # r0042: structural.result collapses two distinct UNRESOLVED
+        # reasons into one string -- scratch-surface identity ambiguity
+        # (never resolvable by station data; must always still gate
+        # here) and runtime-package-selection uncertainty (exactly what
+        # the station tier immediately above exists to resolve, using
+        # real station DB/config access the structural-only tier
+        # deliberately never has). Blindly checking structural.result
+        # here made a fully healthy canonical live baseline -- station
+        # tier PASS, every station_package_prerequisite resolved -- stay
+        # UNRESOLVED forever, purely because the LESS-informed
+        # structural-only package check could not have known the
+        # station's actual selection. Only identity ambiguity still
+        # propagates once a station tier is present and has already
+        # cleared every other station-tier check above without
+        # returning; with no station tier at all (--structural-only,
+        # non-canonical target_root, or a manifest error already
+        # returned FAIL above), the full structural.result still governs
+        # exactly as before -- there is no more-informed tier to defer
+        # to.
+        if self.structural.has_unresolved_identity:
+            return RESULT_UNRESOLVED
+        if self.station is None and self.structural.result == RESULT_UNRESOLVED:
             return RESULT_UNRESOLVED
         return RESULT_PASS
 

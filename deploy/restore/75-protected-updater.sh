@@ -39,6 +39,24 @@
 # THIS checkout (see lib.sh's restore_manage/restore_manage_command),
 # never from $RESTORE_TARGET_ROOT's own possibly-older copy.
 #
+# r0042: because the WHOLE restore_phase_d_component invocation above
+# runs under sudo for a real target (unlike E4's native fdkaac, which
+# has a genuine separate --prepare-fdkaac/--publish-fdkaac process
+# split), step 1's --fake-root ends up root-owned too, even though it
+# physically lives inside THIS script's own unprivileged mktemp'd
+# $WORKDIR below. A real E8 restore hit exactly this: restore, publish,
+# and the receipt update below all succeeded, then this script's own
+# unprivileged EXIT trap failed trying to `rm -rf "$WORKDIR"` a root-
+# owned --fake-root subtree it can't reach, reporting the whole stage
+# FAILED despite a fully successful restore. Fixed at the source: the
+# management command now removes its own --fake-root itself (as root,
+# the one identity that always can, regardless of the modes it just
+# wrote) before returning, on every path -- success or failure -- so by
+# the time this script's own WORKDIR cleanup ever runs, there is
+# nothing root-owned left inside it to fail on. See
+# RestorePhaseDComponentCommandCleanupTests in
+# isadoraair/tests/test_phase_d_recovery.py.
+#
 # NEVER starts, enables, or reloads anything, and NEVER creates a new
 # protected-runtime generation -- this stage reconstructs EXACTLY the
 # generation the backup recorded, nothing more. Activating the restored

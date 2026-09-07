@@ -82,7 +82,15 @@ def _write_release_manifest(
     (Path(releases_dir) / f"{release_id}.json").write_text(json.dumps(data, indent=2, sort_keys=True))
 
 
-class PhaseDRecoveryComponentTests(SimpleTestCase):
+class _PhaseDComponentFixture:
+    """Shared Phase-D fixture (real ed25519 signing keys, a captured
+    two-generation protected-updater component, a real schema-2
+    payload builder) -- NOT itself a TestCase. Mixed into SimpleTestCase
+    subclasses that need this fixture, so reusing it never also
+    re-collects/re-runs whichever class first defined it as its own
+    test suite (plain subclassing of a TestCase does that -- unittest
+    discovers every inherited test_ method too)."""
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -280,6 +288,70 @@ class PhaseDRecoveryComponentTests(SimpleTestCase):
             releases_dir=self.releases_dir,
         )
 
+    def _build_schema_two_payload(self, output_name: str = "schema-two") -> Path:
+        """A real, fully-valid schema-2 recovery payload with
+        protected_updater attached -- the exact fixture shape r0030's
+        stage-75 integration consumes. Shares self._capture()'s real
+        cryptographic Phase-D component with
+        test_schema_two_attachment_preserves_protected_component_modes
+        above; the only difference is explicit 0o644 permissions on the
+        native-source fixture files below (Path.write_bytes here
+        otherwise inherits a group/world-writable mode under this
+        sandbox's umask, which RuntimeRecoveryBuilder's own native-
+        source contract correctly rejects -- see
+        isadoraair/tests/test_phase_d_recovery.py's own pre-existing,
+        environment-dependent failure on the SAME check when this isn't
+        done; fixing it here rather than there keeps this fixture
+        reliable without touching that unrelated, already-tracked
+        issue).
+
+        Deliberately never wraps ANY part of this helper in a simulated-
+        root euid: both RuntimeRecoveryBuilder.apply() and
+        attach_phase_d_recovery_component() have their OWN unrelated
+        _assert_existing_directory(owner=os.geteuid()) ownership check
+        against the REAL (unprivileged) tempdir owner, which a process-
+        wide os.geteuid() patch (os is one shared module object --
+        patching it by any qualified name affects every caller, not
+        just security.py's own) would make fail with an artificial
+        mismatch no real root invocation would ever hit (a real root
+        process's own output directories are genuinely root-owned
+        too). The r0033 fix itself is proven directly, at the exact
+        function that used to fail, by
+        test_validate_phase_d_component_succeeds_under_simulated_root_for_a_captured_component
+        above and by test_restore_succeeds_under_simulated_root_when_source_
+        extracted_under_ordinary_staging /
+        test_restore_and_publish_pipeline_preserves_target_modes_under_simulated_root
+        below, both of which wrap ONLY restore_protected_updater_component
+        (no such unrelated ownership check inside it)."""
+        self._capture()
+        self.product_manifest = deepcopy(load_runtime_components())
+        native_source = self.root / f"native-source-{output_name}"
+        native_source.mkdir()
+        for name, declaration in self.product_manifest["components"]["fdkaac"]["source_archives"].items():
+            content = f"fixture-{name}".encode("ascii")
+            path = native_source / declaration["filename"]
+            path.write_bytes(content)
+            path.chmod(0o644)
+            declaration["bytes"] = len(content)
+            declaration["sha256"] = hashlib.sha256(content).hexdigest()
+
+        base = self.root / f"base-schema-one-{output_name}"
+        RuntimeRecoveryBuilder(product_manifest=self.product_manifest).apply(
+            native_source_dir=native_source,
+            output=base,
+            payload_id="phase-d-stage-integration",
+        )
+        combined = self.root / output_name
+        attach_phase_d_recovery_component(
+            existing_payload=base,
+            protected_updater_component=self.component,
+            output=combined,
+            product_manifest=self.product_manifest,
+        )
+        return combined
+
+
+class PhaseDRecoveryComponentTests(_PhaseDComponentFixture, SimpleTestCase):
     def test_capture_validate_and_offline_fake_root_restore(self):
         evidence = self._capture()
         self.assertEqual(evidence["active_generation"], 2)
@@ -430,68 +502,6 @@ class PhaseDRecoveryComponentTests(SimpleTestCase):
         with mock.patch("isadoraair_updater_bootstrap.security.os.geteuid", return_value=0):
             evidence = validate_phase_d_component(self.component)
         self.assertEqual(evidence["trust_threshold"], 1)
-
-    def _build_schema_two_payload(self, output_name: str = "schema-two") -> Path:
-        """A real, fully-valid schema-2 recovery payload with
-        protected_updater attached -- the exact fixture shape r0030's
-        stage-75 integration consumes. Shares self._capture()'s real
-        cryptographic Phase-D component with
-        test_schema_two_attachment_preserves_protected_component_modes
-        above; the only difference is explicit 0o644 permissions on the
-        native-source fixture files below (Path.write_bytes here
-        otherwise inherits a group/world-writable mode under this
-        sandbox's umask, which RuntimeRecoveryBuilder's own native-
-        source contract correctly rejects -- see
-        isadoraair/tests/test_phase_d_recovery.py's own pre-existing,
-        environment-dependent failure on the SAME check when this isn't
-        done; fixing it here rather than there keeps this fixture
-        reliable without touching that unrelated, already-tracked
-        issue).
-
-        Deliberately never wraps ANY part of this helper in a simulated-
-        root euid: both RuntimeRecoveryBuilder.apply() and
-        attach_phase_d_recovery_component() have their OWN unrelated
-        _assert_existing_directory(owner=os.geteuid()) ownership check
-        against the REAL (unprivileged) tempdir owner, which a process-
-        wide os.geteuid() patch (os is one shared module object --
-        patching it by any qualified name affects every caller, not
-        just security.py's own) would make fail with an artificial
-        mismatch no real root invocation would ever hit (a real root
-        process's own output directories are genuinely root-owned
-        too). The r0033 fix itself is proven directly, at the exact
-        function that used to fail, by
-        test_validate_phase_d_component_succeeds_under_simulated_root_for_a_captured_component
-        above and by test_restore_succeeds_under_simulated_root_when_source_
-        extracted_under_ordinary_staging /
-        test_restore_and_publish_pipeline_preserves_target_modes_under_simulated_root
-        below, both of which wrap ONLY restore_protected_updater_component
-        (no such unrelated ownership check inside it)."""
-        self._capture()
-        self.product_manifest = deepcopy(load_runtime_components())
-        native_source = self.root / f"native-source-{output_name}"
-        native_source.mkdir()
-        for name, declaration in self.product_manifest["components"]["fdkaac"]["source_archives"].items():
-            content = f"fixture-{name}".encode("ascii")
-            path = native_source / declaration["filename"]
-            path.write_bytes(content)
-            path.chmod(0o644)
-            declaration["bytes"] = len(content)
-            declaration["sha256"] = hashlib.sha256(content).hexdigest()
-
-        base = self.root / f"base-schema-one-{output_name}"
-        RuntimeRecoveryBuilder(product_manifest=self.product_manifest).apply(
-            native_source_dir=native_source,
-            output=base,
-            payload_id="phase-d-stage-integration",
-        )
-        combined = self.root / output_name
-        attach_phase_d_recovery_component(
-            existing_payload=base,
-            protected_updater_component=self.component,
-            output=combined,
-            product_manifest=self.product_manifest,
-        )
-        return combined
 
     def test_restore_protected_updater_component_from_schema_two_payload(self):
         """The r0030 restore-side entry point stage 75 calls: locates
@@ -885,6 +895,220 @@ class PhaseDRecoveryComponentTests(SimpleTestCase):
         (combined / "protected-updater" / "trust-policy.json").chmod(0o600)
         with self.assertRaises(RuntimeRecoveryError):
             _assert_trusted_payload_tree(combined, owner_uid=owner_uid)
+
+
+class RestorePhaseDComponentCommandCleanupTests(_PhaseDComponentFixture, SimpleTestCase):
+    """r0042: a real E8 restore proved restore+publish+receipt all
+    succeed, then Stage 75 exits nonzero anyway -- its own EXIT trap's
+    unprivileged `rm -rf "$WORKDIR"` cannot remove --fake-root, because
+    for a real (non-staging) restore the WHOLE restore_phase_d_component
+    management command (not just publish, unlike E4's native fdkaac)
+    runs under sudo, so --fake-root -- despite living inside the
+    caller's own unprivileged mktemp'd scratch tree -- is materialized
+    root-owned. Traced and confirmed directly against
+    isadoraair/phase_d_recovery.py's own restore_phase_d_component:
+    _copy_tree/_copy_plain apply the recorded restore_modes verbatim
+    under whatever the calling process's effective UID happens to be,
+    with no ownership normalization step.
+
+    These exercise the real management command (call_command, not a
+    reimplementation of its cleanup logic) with a real, valid schema-2
+    payload -- the exact same _build_schema_two_payload fixture
+    PhaseDRecoveryComponentTests itself uses (real ed25519-signed
+    generations, a real native_fdkaac fixture component). That helper's
+    own fixture fdkaac source archives are synthetic, so it mutates a
+    manifest COPY's declared source_archives sha256/bytes to match --
+    the command under test has no CLI option to accept an overridden
+    manifest and always falls back to the real installed one
+    (load_runtime_components()) wherever it needs the product contract
+    digest, so every call_command() invocation below patches that one
+    lookup point (isadoraair.runtime_recovery.load_runtime_components)
+    to return the SAME test manifest the payload was built from --
+    otherwise every one of these would fail before ever reaching
+    fake-root at all ("recovery payload targets a different product
+    runtime contract"), not because of anything this fix changed.
+
+    This test process is never actually root, so it cannot reproduce
+    the cross-UID permission denial directly -- but a same-UID, self-
+    imposed 0000 directory reproduces the identical shutil.rmtree
+    failure mode for real (a directory's own permission bits gate even
+    its owner's ability to traverse/empty it, confirmed empirically
+    before writing this test), which is what the fix's error handling
+    actually has to survive.
+
+    Mixes in _PhaseDComponentFixture (the same shared fixture
+    PhaseDRecoveryComponentTests uses) rather than subclassing that
+    TestCase directly -- subclassing a TestCase for its setUp also
+    re-collects and re-runs every one of its own test_ methods under
+    this class's name too; the fixture was split out specifically so
+    two independent test classes can share it without that."""
+
+    def _build_payload(self, name: str) -> Path:
+        return self._build_schema_two_payload(output_name=name)
+
+    def _fresh_target(self, name: str) -> Path:
+        target = self.root / name
+        target.mkdir()
+        return target
+
+    def _call(self, *args, **kwargs):
+        with mock.patch("isadoraair.runtime_recovery.load_runtime_components", return_value=self.product_manifest):
+            call_command("restore_phase_d_component", *args, **kwargs)
+
+    def test_successful_restore_and_publish_cleans_up_fake_root(self):
+        payload = self._build_payload("cleanup-success")
+        fake_root = self.root / "cleanup-success-fake-root"
+        target = self._fresh_target("cleanup-success-target")
+        output = io.StringIO()
+        self._call(
+            "--recovery-payload", str(payload),
+            "--fake-root", str(fake_root),
+            "--publish-root", str(target),
+            "--json",
+            stdout=output,
+        )
+        evidence = json.loads(output.getvalue())
+        self.assertEqual(evidence["result"], "pass")
+        self.assertFalse(fake_root.exists(), "fake-root must not survive a successful restore+publish")
+        self.assertTrue(
+            (target / "usr/local/libexec/isadoraair-updater-bootstrap/updater_bootstrapd.py").is_file()
+        )
+
+    def test_restore_only_no_publish_still_cleans_up_fake_root(self):
+        """Item 7-adjacent: no --publish-root at all (the offline-proof-
+        only use) must clean up exactly like the publish case."""
+        payload = self._build_payload("cleanup-no-publish")
+        fake_root = self.root / "cleanup-no-publish-fake-root"
+        self._call(
+            "--recovery-payload", str(payload),
+            "--fake-root", str(fake_root),
+            "--json",
+            stdout=io.StringIO(),
+        )
+        self.assertFalse(fake_root.exists())
+
+    def test_cleanup_runs_when_publish_fails(self):
+        """Item 8: a failure DURING privileged publication (refused
+        pre-existing destination file) must still clean fake-root --
+        the original CommandError must still propagate, unmasked."""
+        payload = self._build_payload("cleanup-publish-fail")
+        fake_root = self.root / "cleanup-publish-fail-fake-root"
+        target = self._fresh_target("cleanup-publish-fail-target")
+        conflicting = target / "usr/local/libexec/isadoraair-updater-bootstrap/updater_bootstrapd.py"
+        conflicting.parent.mkdir(parents=True)
+        conflicting.write_text("pre-existing, unrelated file -- must not be clobbered\n")
+
+        with self.assertRaises(Exception) as caught:
+            self._call(
+                "--recovery-payload", str(payload),
+                "--fake-root", str(fake_root),
+                "--publish-root", str(target),
+                stdout=io.StringIO(), stderr=io.StringIO(),
+            )
+        self.assertIn("publish", str(caught.exception).lower())
+        self.assertFalse(fake_root.exists(), "fake-root must be cleaned up even when publish fails")
+        self.assertEqual(
+            conflicting.read_text(), "pre-existing, unrelated file -- must not be clobbered\n",
+            "a failed publish must never have touched the pre-existing destination content",
+        )
+
+    def test_cleanup_runs_when_no_protected_updater_component(self):
+        """Item 7 (failure before publication): a schema-1-only payload
+        with no protected_updater component fails before fake-root is
+        ever populated -- cleanup of a fake-root that was never created
+        must be a safe no-op, never its own error."""
+        product_manifest = deepcopy(load_runtime_components())
+        native_source = self.root / "native-source-no-pu"
+        native_source.mkdir()
+        for name, declaration in product_manifest["components"]["fdkaac"]["source_archives"].items():
+            content = f"fixture-{name}".encode("ascii")
+            path = native_source / declaration["filename"]
+            path.write_bytes(content)
+            path.chmod(0o644)
+            declaration["bytes"] = len(content)
+            declaration["sha256"] = hashlib.sha256(content).hexdigest()
+        payload = self.root / "schema-one-only"
+        RuntimeRecoveryBuilder(product_manifest=product_manifest).apply(
+            native_source_dir=native_source, output=payload, payload_id="no-protected-updater",
+        )
+        fake_root = self.root / "cleanup-no-component-fake-root"
+
+        with self.assertRaises(Exception) as caught:
+            with mock.patch("isadoraair.runtime_recovery.load_runtime_components", return_value=product_manifest):
+                call_command(
+                    "restore_phase_d_component",
+                    "--recovery-payload", str(payload),
+                    "--fake-root", str(fake_root),
+                    stdout=io.StringIO(), stderr=io.StringIO(),
+                )
+        self.assertIn("protected_updater", str(caught.exception).lower())
+        self.assertFalse(fake_root.exists())
+
+    def test_cleanup_failure_does_not_mask_a_successful_restore(self):
+        """Item 6, proven for real (not mocked): a same-UID, self-locked
+        (mode 0000) directory inside fake-root makes shutil.rmtree
+        genuinely fail with PermissionError, reproducing the exact
+        exception class a cross-UID root-owned subtree raises against
+        an unprivileged remover. The command must still report success
+        -- only a warning on stderr, never a raised exception, never a
+        nonzero exit."""
+        payload = self._build_payload("cleanup-locked")
+        fake_root = self.root / "cleanup-locked-fake-root"
+        target = self._fresh_target("cleanup-locked-target")
+
+        real_rmtree = shutil.rmtree
+        locked_dir = {}
+
+        def _lock_then_rmtree(path, *args, **kwargs):
+            # Fires once, right when the command's own finally block
+            # tries to remove fake_root -- lock one subdirectory inside
+            # it immediately beforehand so the real shutil.rmtree call
+            # genuinely cannot recurse into it, then let the real
+            # implementation run and genuinely fail.
+            path = Path(path)
+            if path == fake_root and not locked_dir:
+                target_dir = next(p for p in path.rglob("*") if p.is_dir())
+                target_dir.chmod(0o000)
+                locked_dir["path"] = target_dir
+            return real_rmtree(path, *args, **kwargs)
+
+        stderr = io.StringIO()
+        try:
+            with mock.patch("shutil.rmtree", side_effect=_lock_then_rmtree):
+                self._call(
+                    "--recovery-payload", str(payload),
+                    "--fake-root", str(fake_root),
+                    "--publish-root", str(target),
+                    "--json",
+                    stdout=(output := io.StringIO()), stderr=stderr,
+                )
+        finally:
+            if locked_dir:
+                locked_dir["path"].chmod(0o755)
+                shutil.rmtree(fake_root, ignore_errors=True)
+
+        evidence = json.loads(output.getvalue())
+        self.assertEqual(evidence["result"], "pass", "a cleanup failure must never mask restore success")
+        self.assertIn("warning", stderr.getvalue().lower())
+        self.assertIn(str(fake_root), stderr.getvalue())
+
+    def test_staging_style_publish_also_cleans_up(self):
+        """No sudo involved at all in this whole test (this process
+        never becomes root) -- confirms the fix is unconditional, not
+        gated on any staging/canonical distinction the command itself
+        cannot even observe (that distinction lives entirely in
+        deploy/restore/75-protected-updater.sh's own USE_SUDO choice,
+        never passed to this command)."""
+        payload = self._build_payload("cleanup-staging-style")
+        fake_root = self.root / "cleanup-staging-style-fake-root"
+        target = self._fresh_target("cleanup-staging-style-target")
+        self._call(
+            "--recovery-payload", str(payload),
+            "--fake-root", str(fake_root),
+            "--publish-root", str(target),
+            stdout=io.StringIO(),
+        )
+        self.assertFalse(fake_root.exists())
 
 
 class ResolveProtectedRuntimeBindingTests(SimpleTestCase):

@@ -527,6 +527,57 @@ class Stage30HostilePasswordRoleCreationTests(Stage30RealPostgreSQLTestCase):
         self.assertIn(f"password from {self.env_file}: <redacted>", self.combined_output)
 
 
+class Stage30RolePasswordCleanupOnChownFailureTests(Stage30RealPostgreSQLTestCase):
+    """r0042 sibling audit follow-up (found while tracing 75-protected-
+    updater.sh's own privileged-scratch defect -- a different, minor
+    class of gap in the same neighborhood): set_postgresql_role_password's
+    envfile/sqlfile are jreed-owned right up until `sudo chown
+    postgres:postgres` -- an ordinary rm can always reach them, but
+    under `set -e` a failing chown used to abort the whole script before
+    either cleanup line ran, stranding a mode-600 file holding
+    DB_PASSWORD in shell-quoted form. A dedicated fake sudo that fails
+    only that one chown call proves the real fix: the temp files are
+    gone and the stage fails closed (nonzero), never silently leaving
+    the pair behind."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        # Overwrite the inherited fakebin/sudo (this subclass's own,
+        # independent from every other Stage30*Tests class's) so the one
+        # chown this test cares about fails, while every other sudo call
+        # Stage 30 makes (createuser, psql, the postgres-owned bash -c)
+        # behaves exactly as it does for every other real test here.
+        (cls.fakebin / "sudo").write_text(
+            """#!/usr/bin/env bash
+set -euo pipefail
+if [ "${1:-}" = "chown" ] && [ "${2:-}" = "postgres:postgres" ]; then
+  echo "sudo: simulated chown failure (test)" >&2
+  exit 1
+fi
+if [ "${1:-}" = "-u" ]; then
+  shift 2
+fi
+exec "$@"
+""",
+            encoding="utf-8",
+        )
+        (cls.fakebin / "sudo").chmod(0o755)
+
+    def test_temp_files_do_not_survive_a_failed_chown(self):
+        tmpdir = Path(tempfile.mkdtemp(prefix="isadoraair-stage30-chownfail-"))
+        self.addCleanup(shutil.rmtree, tmpdir, ignore_errors=True)
+        db_user = "isadoraair_e8_chownfail"
+        before = set(Path("/tmp").glob("isadoraair-restore-role*"))
+        result, _env_file = self._run_stage30(tmpdir, db_user, "irrelevant-password")
+        after = set(Path("/tmp").glob("isadoraair-restore-role*"))
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(
+            after - before, set(),
+            "a failed chown must never leave the role-password envfile/sqlfile behind",
+        )
+
+
 class Stage30NoInteractivePromptUnderRealTTYTests(Stage30RealPostgreSQLTestCase):
     """Task 3, state 8 -- the actual E8 failure mode: run the fixed
     script with a REAL controlling terminal on stdin/stdout/stderr
@@ -1636,6 +1687,35 @@ class RuntimeFoundationE7BStageModeSelectionTests(SimpleTestCase):
         for forbidden in ("github.com", "git clone", "git fetch", "curl ", "wget ", "pip install"):
             self.assertNotIn(forbidden, source, f"stage 75 must never reference {forbidden!r}")
 
+    def test_protected_updater_canonical_orchestration_reaches_pass_unconditionally_after_success(self):
+        """r0042: 'restore PASS + receipt PASS + cleanup PASS => script
+        exit 0' -- the real E8 bug was entirely inside
+        restore_phase_d_component's own --fake-root cleanup (fixed
+        there, see RestorePhaseDComponentCommandCleanupTests in
+        test_phase_d_recovery.py, proven against the real management
+        command including a genuine same-UID permission-lockout
+        failure mode); this stage script itself needed no change at
+        all. Proven here structurally: nothing runs, and nothing can
+        early-exit or swallow the outcome, between a successful
+        RESTORE_MANAGE_CMD invocation and this stage's own unconditional
+        PASS + exit 0 -- the fix holds precisely because --fake-root no
+        longer exists by the time this shell ever reaches its own
+        (unprivileged, trivially-succeeding once nothing root-owned
+        remains) WORKDIR cleanup trap."""
+        source = (RESTORE_DIR / "75-protected-updater.sh").read_text()
+        publish_call = source.index('"${RESTORE_MANAGE_CMD[@]}"')
+        record_call = source.index("restore_record_recovery_components protected_updater")
+        pass_line = source.index('75-protected-updater: PASS')
+        exit_zero = source.rindex("exit 0")
+        self.assertLess(publish_call, record_call)
+        self.assertLess(record_call, pass_line)
+        self.assertLess(pass_line, exit_zero)
+        # No conditional guards anything between the privileged call and
+        # the final PASS/exit -- a plain, unconditional straight line.
+        between = source[publish_call:exit_zero]
+        for guard in ("if ", "||", "&&"):
+            self.assertNotIn(guard, between, f"unexpected conditional {guard!r} between publish and PASS/exit")
+
 
 class RecoveryReceiptDirectoryEstablishmentTests(SimpleTestCase):
     """r0041, Defect 3: on a genuinely fresh machine, no earlier restore
@@ -2689,6 +2769,271 @@ class RuntimeFoundationE5SystemConfigFunctionalTests(SimpleTestCase):
         self.assertTrue(runtime_conf.is_file())
         self.assertTrue((self.staging / "opt" / "isadoraair-runtime").is_dir())
         self.assertTrue((self.staging / "var" / "lib" / "isadoraair" / "tts").is_dir())
+
+    def test_install_rendered_never_leaves_mktemps_0600_mode_on_the_destination(self):
+        """r0042, Defect A: mktemp creates its scratch file at 0600, and
+        plain `cp` to a not-yet-existing destination preserves the
+        SOURCE's mode regardless of umask -- confirmed empirically (a
+        real E8 run hit exactly this: Stage 95, unprivileged, "Permission
+        denied" reading /etc/tmpfiles.d/isadoraair.conf). Every
+        install_rendered() destination is ordinary, non-secret,
+        declarative text configuration -- root:root 0644 is the one
+        correct mode for all of them, set deterministically via
+        `install -m 0644` now, independent of mktemp's mode and of
+        whatever umask happens to be in effect."""
+        self._run("--apply")
+        candidates = [
+            self.staging / "etc" / "tmpfiles.d" / "isadoraair.conf",
+            self.staging / "etc" / "modprobe.d" / "isadoraair-aloop.conf",
+            self.staging / "etc" / "needrestart" / "conf.d" / "isadoraair.conf",
+            self.staging / "etc" / "asound.conf",
+            self.staging / "etc" / "nginx" / "snippets" / "isadoraair-locations.conf",
+            self.staging / "etc" / "nginx" / "sites-available" / "isadoraair",
+        ]
+        systemd_dir = self.staging / "etc" / "systemd" / "system"
+        if systemd_dir.is_dir():
+            candidates.extend(systemd_dir.glob("*.service"))
+            candidates.extend(systemd_dir.glob("*.timer"))
+        checked = 0
+        for path in candidates:
+            if not path.is_file():
+                continue
+            checked += 1
+            mode = stat.S_IMODE(path.stat().st_mode)
+            self.assertEqual(mode, 0o644, f"{path} has mode {mode:04o}, expected 0644")
+        self.assertGreaterEqual(checked, 5, "expected at least the always-rendered files to exist")
+
+    def test_self_signed_certificate_is_generated_with_generic_cn_and_correct_modes(self):
+        result = self._run("--apply")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        cert = self.staging / "etc" / "ssl" / "isadoraair" / "selfsigned.crt"
+        key = self.staging / "etc" / "ssl" / "isadoraair" / "selfsigned.key"
+        self.assertTrue(cert.is_file())
+        self.assertTrue(key.is_file())
+        self.assertEqual(stat.S_IMODE(cert.stat().st_mode), 0o644)
+        self.assertEqual(stat.S_IMODE(key.stat().st_mode), 0o600)
+        subject = subprocess.run(
+            ["openssl", "x509", "-noout", "-subject", "-in", str(cert)],
+            capture_output=True, text=True, check=True,
+        ).stdout
+        self.assertEqual(subject.strip(), "subject=CN=isadoraair.local")
+
+    def test_an_existing_certificate_is_never_regenerated_or_overwritten(self):
+        cert_dir = self.staging / "etc" / "ssl" / "isadoraair"
+        cert_dir.mkdir(parents=True)
+        cert = cert_dir / "selfsigned.crt"
+        key = cert_dir / "selfsigned.key"
+        cert.write_text("SENTINEL-CERT-CONTENT\n", encoding="utf-8")
+        key.write_text("SENTINEL-KEY-CONTENT\n", encoding="utf-8")
+        cert.chmod(0o644)
+        key.chmod(0o600)
+
+        result = self._run("--apply")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(cert.read_text(encoding="utf-8"), "SENTINEL-CERT-CONTENT\n")
+        self.assertEqual(key.read_text(encoding="utf-8"), "SENTINEL-KEY-CONTENT\n")
+        self.assertIn("not regenerating", result.stdout)
+
+
+class Stage90NginxExitCodeGatingTests(SimpleTestCase):
+    """r0042: an `nginx -t` failure used to be logged as FAILED but never
+    affect this stage's own exit code -- "90-system-config: PASS" always
+    followed regardless. This exercises the REAL (non-staging) USE_SUDO=1
+    branch for real -- this stage's ETC_ROOT is unconditionally the real
+    /etc whenever --staging-root is not given, so a fake `sudo` shim is
+    the only way to exercise section 5d without ever touching the real
+    host's own /etc. The shim (a) rewrites any `/etc` path in its argv to
+    a private per-test temp directory, and (b) strips `-o`/`-g` ownership
+    flags -- this test process is not really root, so a literal
+    `install -o root -g root` would otherwise fail outright with
+    "Operation not permitted", aborting the whole script under `set -e`
+    long before ever reaching nginx -t. A fake `nginx` binary placed
+    first on PATH stands in for the real one so the pass/fail scenario
+    is fully controlled. --target-root (never /opt/isadoraair itself)
+    keeps guard_production_target a no-op, exactly like
+    RuntimeFoundationE7ETargetOwnershipFunctionalTests does for 20-application.sh."""
+
+    def setUp(self):
+        super().setUp()
+        self.tmpdir = Path(tempfile.mkdtemp(prefix="isadoraair-e6-90-nginx-"))
+        self.addCleanup(shutil.rmtree, self.tmpdir, ignore_errors=True)
+        self.fake_etc = self.tmpdir / "fake-etc"
+        self.fake_etc.mkdir()
+        self.target_root = self.tmpdir / "opt" / "isadoraair"
+        self.fakebin = self.tmpdir / "fakebin"
+        self.fakebin.mkdir()
+        self.sudo_log = self.tmpdir / "sudo.log"
+        (self.fakebin / "sudo").write_text(
+            f"""#!/usr/bin/env bash
+printf '%s\\n' "$*" >> {self.sudo_log}
+args=()
+skip_next=0
+for a in "$@"; do
+  if [ "$skip_next" = 1 ]; then skip_next=0; continue; fi
+  case "$a" in
+    -o|-g) skip_next=1; continue ;;
+  esac
+  args+=("${{a//\\/etc/{self.fake_etc}}}")
+done
+exec "${{args[@]}}"
+""",
+            encoding="utf-8",
+        )
+        (self.fakebin / "sudo").chmod(0o755)
+
+    def _write_fake_nginx(self, *, passes: bool):
+        script = self.fakebin / "nginx"
+        if passes:
+            script.write_text(
+                "#!/usr/bin/env bash\n"
+                "echo 'nginx: configuration file /etc/nginx/nginx.conf test is successful'\n"
+                "exit 0\n",
+                encoding="utf-8",
+            )
+        else:
+            script.write_text(
+                "#!/usr/bin/env bash\n"
+                "echo 'nginx: [emerg] unexpected end of file, expecting \"}\"' >&2\n"
+                "exit 1\n",
+                encoding="utf-8",
+            )
+        script.chmod(0o755)
+
+    def _run(self):
+        env = {**os.environ, "PATH": f"{self.fakebin}:{os.environ['PATH']}"}
+        return subprocess.run(
+            [str(RESTORE_DIR / "90-system-config.sh"), "--target-root", str(self.target_root), "--apply"],
+            capture_output=True, text=True, timeout=60, env=env,
+        )
+
+    def test_nginx_t_failure_fails_the_stage_closed(self):
+        self._write_fake_nginx(passes=False)
+        result = self._run()
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("90-system-config: FAIL", result.stdout + result.stderr)
+        self.assertIn("nginx -t reported a configuration error", result.stdout + result.stderr)
+
+    def test_nginx_t_success_still_passes_the_stage(self):
+        self._write_fake_nginx(passes=True)
+        result = self._run()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("90-system-config: PASS", result.stdout)
+
+
+class Stage80CompanionProvisioningExitCodeTests(SimpleTestCase):
+    """r0042: a requested companion repository that could not actually be
+    provisioned (non-Git collision, missing requirements.txt) used to
+    record STATUS[repo]=ERROR in the printed summary but never affect
+    this stage's own exit code -- every apply run reached the
+    unconditional "80-companions: PASS" regardless. Real `git
+    clone`/venv/pip execution against small local, disposable fixture
+    repos -- never a real GitHub host, and never touches a real
+    ~/{syndicated,weather,ogremote}-ingest."""
+
+    def setUp(self):
+        super().setUp()
+        self.tmpdir = Path(tempfile.mkdtemp(prefix="isadoraair-e6-80-companions-"))
+        self.addCleanup(shutil.rmtree, self.tmpdir, ignore_errors=True)
+        self.remotes = self.tmpdir / "remotes"
+        self.remotes.mkdir()
+        self.companions_root = self.tmpdir / "companions"
+        self.staging = self.tmpdir / "staging"
+        self.staging.mkdir()
+        for repo in ("syndicated-ingest", "weather-ingest", "ogremote-ingest"):
+            self._make_fixture_repo(repo, with_requirements=True)
+
+    def _make_fixture_repo(self, name, *, with_requirements):
+        repo_dir = self.remotes / f"{name}.git"
+        if repo_dir.exists():
+            shutil.rmtree(repo_dir)
+        repo_dir.mkdir(parents=True)
+        subprocess.run(["git", "init", "-q"], cwd=repo_dir, check=True)
+        subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repo_dir, check=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=repo_dir, check=True)
+        if with_requirements:
+            (repo_dir / "requirements.txt").write_text("", encoding="utf-8")
+        (repo_dir / "README.md").write_text(f"{name} fixture\n", encoding="utf-8")
+        subprocess.run(["git", "add", "-A"], cwd=repo_dir, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=repo_dir, check=True)
+        return repo_dir
+
+    def _run(self, *extra, only=None, timeout=180):
+        args = [
+            str(RESTORE_DIR / "80-companions.sh"),
+            "--staging-root", str(self.staging),
+            "--companions-root", str(self.companions_root),
+            "--repo-url-prefix", str(self.remotes),
+            "--apply",
+        ]
+        if only is not None:
+            args += ["--only", only]
+        args += list(extra)
+        return subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+
+    def test_all_provisioned_passes_with_exit_zero(self):
+        result = self._run()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("80-companions: PASS", result.stdout)
+        self.assertNotIn("ERROR", result.stdout)
+        for repo in ("syndicated-ingest", "weather-ingest", "ogremote-ingest"):
+            self.assertTrue((self.companions_root / repo / "venv" / "bin" / "python").exists())
+
+    def test_non_git_collision_fails_the_stage_closed(self):
+        collision = self.companions_root / "weather-ingest"
+        collision.mkdir(parents=True)
+        (collision / "some-file.txt").write_text("not a git repo\n", encoding="utf-8")
+        result = self._run()
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("80-companions: FAIL", result.stdout + result.stderr)
+        self.assertIn("weather-ingest: ERROR", result.stdout)
+        # one bad repo must not silently swallow evidence about the
+        # others -- they were still attempted/provisioned.
+        self.assertTrue((self.companions_root / "syndicated-ingest" / "venv").exists())
+
+    def test_missing_requirements_txt_fails_the_stage_closed(self):
+        self._make_fixture_repo("ogremote-ingest", with_requirements=False)
+        result = self._run()
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("80-companions: FAIL", result.stdout + result.stderr)
+        self.assertIn("ogremote-ingest: ERROR (no requirements.txt)", result.stdout)
+
+    def test_only_scoping_touches_only_the_requested_repo(self):
+        result = self._run(only="weather-ingest")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue((self.companions_root / "weather-ingest").exists())
+        self.assertFalse((self.companions_root / "syndicated-ingest").exists())
+        self.assertFalse((self.companions_root / "ogremote-ingest").exists())
+
+    def test_clone_failure_already_propagates_as_nonzero(self):
+        shutil.rmtree(self.remotes / "weather-ingest.git")  # now unclonable
+        result = self._run()
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_pip_install_failure_already_propagates_as_nonzero(self):
+        repo_dir = self.remotes / "syndicated-ingest.git"
+        (repo_dir / "requirements.txt").write_text(
+            "this-package-definitely-does-not-exist-isadoraair-e6-test===0.0.0\n", encoding="utf-8"
+        )
+        subprocess.run(["git", "add", "-A"], cwd=repo_dir, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "bad requirement"], cwd=repo_dir, check=True)
+        result = self._run(only="syndicated-ingest")
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_manual_credential_absence_does_not_count_as_a_failure(self):
+        """Credential provisioning is documented as a separate manual
+        checkpoint -- its absence must never surface as STATUS ERROR or
+        a nonzero exit, only code+venv actually failing must."""
+        result = self._run()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("PROVISIONED (code + venv only", result.stdout)
+
+    def test_summary_never_contradicts_exit_status(self):
+        collision = self.companions_root / "ogremote-ingest"
+        collision.mkdir(parents=True)
+        (collision / "x").write_text("x", encoding="utf-8")
+        result = self._run()
+        summary_has_error = "ERROR" in result.stdout
+        self.assertEqual(result.returncode != 0, summary_has_error)
 
 
 class RuntimeFoundationE7ETargetOwnershipFunctionalTests(SimpleTestCase):

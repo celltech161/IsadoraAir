@@ -34,6 +34,7 @@ section for why that boundary exists and stays in place here."""
 from __future__ import annotations
 
 import json as json_module
+import shutil
 from pathlib import Path
 
 from django.core.management.base import BaseCommand, CommandError
@@ -85,23 +86,59 @@ class Command(BaseCommand):
         publish_root = options["publish_root"]
 
         try:
-            evidence = restore_protected_updater_component(payload, fake_root=fake_root)
-        except RuntimeRecoveryError as exc:
-            raise CommandError(str(exc)) from None
-
-        if evidence is None:
-            raise CommandError(
-                "this recovery payload declares no protected_updater component -- nothing to "
-                "restore (check components.protected_updater.state via manage.py "
-                "validate_runtime_recovery_payload before calling this command)"
-            )
-
-        if publish_root is not None:
             try:
-                publish_phase_d_component(fake_root=fake_root, target_root=publish_root)
-            except PhaseDRecoveryError as exc:
-                raise CommandError(f"protected-updater publish to {publish_root} failed: {exc}") from None
-            evidence = {**evidence, "published_to": str(publish_root)}
+                evidence = restore_protected_updater_component(payload, fake_root=fake_root)
+            except RuntimeRecoveryError as exc:
+                raise CommandError(str(exc)) from None
+
+            if evidence is None:
+                raise CommandError(
+                    "this recovery payload declares no protected_updater component -- nothing to "
+                    "restore (check components.protected_updater.state via manage.py "
+                    "validate_runtime_recovery_payload before calling this command)"
+                )
+
+            if publish_root is not None:
+                try:
+                    publish_phase_d_component(fake_root=fake_root, target_root=publish_root)
+                except PhaseDRecoveryError as exc:
+                    raise CommandError(f"protected-updater publish to {publish_root} failed: {exc}") from None
+                evidence = {**evidence, "published_to": str(publish_root)}
+        finally:
+            # r0042: for a real (non-staging) publish, this whole command
+            # runs under sudo -- deploy/restore/75-protected-updater.sh
+            # wraps the entire restore_manage_command invocation, not
+            # just the publish half, since restore_protected_updater_
+            # component's own "offline, non-privileged" fake-root
+            # materialization and publish_phase_d_component's canonical
+            # publish are one process here (unlike E4's native fdkaac,
+            # which exposes a real --prepare-fdkaac/--publish-fdkaac
+            # process split). --fake-root therefore ends up root-owned
+            # even though it physically lives inside the CALLER's own
+            # unprivileged mktemp'd scratch directory -- the caller's own
+            # unprivileged `rm -rf` cleanup of that directory cannot
+            # remove it (a real E8 restore hit exactly this: successful
+            # restore + successful publish + successful receipt, then a
+            # nonzero exit from cleanup alone). This command created
+            # fake_root and is the only identity that can reliably remove
+            # it again, regardless of success or any failure above --
+            # never touches anything outside the exact path it was given,
+            # never chowns/relaxes anything at the real destination this
+            # already-completed publish wrote to.
+            try:
+                shutil.rmtree(fake_root)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                # Never lets a cleanup problem mask or convert an
+                # already-successful (or already cleanly failed) restore/
+                # publish result above -- only ever a visible warning.
+                self.stderr.write(
+                    f"warning: could not fully remove the protected-updater restore "
+                    f"scratch directory {fake_root}: {exc} -- this does not affect the "
+                    f"restore/publish result above, but stale scratch state may remain; "
+                    f"remove it manually if so."
+                )
 
         if options["json_output"]:
             self.stdout.write(json_module.dumps(evidence, sort_keys=True, separators=(",", ":")))

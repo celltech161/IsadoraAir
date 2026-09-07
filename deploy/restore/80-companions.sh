@@ -67,6 +67,17 @@ require_cmd python3
 IFS=',' read -ra REPOS <<< "$ONLY"
 
 declare -A STATUS
+# r0042: a requested companion that cannot actually be provisioned
+# (non-Git collision, missing requirements.txt) used to log an ERROR
+# and `continue` to the next repo, but nothing ever made THIS flag
+# affect the stage's own exit code -- every apply run reached the
+# unconditional "80-companions: PASS" below regardless. Never true for
+# a whole-machine restore acceptance: a requested companion that never
+# got cloned/provisioned must fail this stage closed. Manual credential
+# provisioning remaining outstanding is NOT this -- see this script's
+# own header and the PROVISIONED status below, deliberately not an
+# error status.
+ANY_FAILED=0
 for repo in "${REPOS[@]}"; do
   log_info "-- $repo --"
   TARGET="$COMPANIONS_ROOT/$repo"
@@ -84,6 +95,7 @@ for repo in "${REPOS[@]}"; do
   elif [ -e "$TARGET" ] && [ -n "$(ls -A "$TARGET" 2>/dev/null)" ]; then
     log_error "$TARGET exists, is non-empty, and is not a Git checkout. Refusing to clone into it."
     STATUS[$repo]="ERROR"
+    ANY_FAILED=1
     continue
   else
     do_or_plan mkdir -p "$COMPANIONS_ROOT"
@@ -94,6 +106,7 @@ for repo in "${REPOS[@]}"; do
   if [ "$RESTORE_MODE" = "apply" ] && [ ! -f "$REQUIREMENTS" ]; then
     log_error "$REQUIREMENTS not found -- expected every companion repo to have one as of IsadoraAir 1.2 Phase 3. Skipping venv setup for $repo."
     STATUS[$repo]="ERROR (no requirements.txt)"
+    ANY_FAILED=1
     continue
   fi
 
@@ -122,5 +135,11 @@ if [ "$RESTORE_MODE" = "apply" ]; then
   for repo in "${REPOS[@]}"; do
     log_info "  $repo: ${STATUS[$repo]:-not attempted}"
   done
+  if [ "$ANY_FAILED" -eq 1 ]; then
+    log_error "80-companions: FAIL -- one or more requested companion repositories could not be provisioned (see summary above). Manual credential provisioning remaining outstanding is expected and does not count against this; a repo actually marked ERROR above does."
+    exit 1
+  fi
+  log_info "80-companions: PASS (see summary above)"
+else
+  log_info "80-companions: PLAN complete"
 fi
-log_info "80-companions: $( [ "$RESTORE_MODE" = apply ] && echo "PASS (see summary above)" || echo "PLAN complete" )"

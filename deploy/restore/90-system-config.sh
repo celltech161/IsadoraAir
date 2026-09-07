@@ -154,12 +154,27 @@ install_rendered() {
   local tmp
   tmp="$(mktemp)"
   render "$src" > "$tmp"
+  # r0042: mktemp's own 0600 mode otherwise propagates verbatim onto the
+  # real /etc destination -- plain `cp` to a not-yet-existing
+  # destination preserves the SOURCE's mode regardless of umask
+  # (confirmed empirically), so a real restore's rendered systemd
+  # units/tmpfiles/modprobe/needrestart snippets/asound.conf/nginx site
+  # all installed root:root 0600, unreadable by anything but root (a
+  # real E8 run hit exactly this: Stage 95, running unprivileged,
+  # "Permission denied" reading /etc/tmpfiles.d/isadoraair.conf). Every
+  # one of these is ordinary, non-secret, declarative text configuration
+  # -- the conventional mode for all of them is root:root 0644, set here
+  # explicitly and deterministically via `install`, independent of
+  # mktemp's own mode and of whatever umask happens to be in effect --
+  # matching the E5 tmpfiles install step's own already-correct
+  # `install -o root -g root -m 0644` below, now the single shared
+  # publication mechanism every install_rendered() caller gets for free.
   if [ "$USE_SUDO" -eq 1 ]; then
     sudo mkdir -p "$(dirname "$dest")"
-    sudo cp "$tmp" "$dest"
+    sudo install -o root -g root -m 0644 "$tmp" "$dest"
   else
     mkdir -p "$(dirname "$dest")"
-    cp "$tmp" "$dest"
+    install -m 0644 "$tmp" "$dest"
   fi
   rm -f "$tmp"
 }
@@ -224,6 +239,51 @@ if [ "$RESTORE_MODE" = "apply" ]; then
   log_info "sites-enabled/isadoraair -> sites-available/isadoraair (symlink, per deploy/README.md's 'One authoritative nginx config')."
 else
   log_plan "ln -sf $ETC_ROOT/nginx/sites-available/isadoraair $ETC_ROOT/nginx/sites-enabled/isadoraair"
+fi
+
+# ---- 3b. Self-signed TLS certificate -------------------------------------
+# r0042: docs/DISASTER_RECOVERY_RESTORE.md's own "Certificates" section
+# documents the generic template's whole point as "self-signed cert
+# only", and its secrets table already claimed this cert is "already
+# restored as part of the nginx config by 90-system-config.sh" -- true
+# of the CONFIG (referencing it), never of the actual cert/key files
+# themselves, which nothing ever generated. That gap is exactly what
+# let a real E8 run reach `nginx -t` with no certificate on disk at all.
+# Generated here, deterministically, only if not already present --
+# never overwrites a real, externally-issued (or externally-restored)
+# cert an operator already placed at the same path. Ephemeral,
+# LAN/local-only by design (see that doc section's option 3); the
+# station-specific real certificate remains the documented, separate,
+# manual "issue or restore certificates" checkpoint -- this never
+# invents a public hostname or embeds one.
+CERT_DIR="$ETC_ROOT/ssl/isadoraair"
+CERT_FILE="$CERT_DIR/selfsigned.crt"
+KEY_FILE="$CERT_DIR/selfsigned.key"
+if [ "$RESTORE_MODE" = "apply" ]; then
+  if [ -f "$CERT_FILE" ] && [ -f "$KEY_FILE" ]; then
+    log_info "Self-signed TLS certificate already present at $CERT_FILE -- not regenerating (a real or previously-restored cert may already be here)."
+  elif command -v openssl >/dev/null 2>&1; then
+    log_apply "generating a fresh self-signed TLS certificate at $CERT_FILE (generic template default -- see docs/DISASTER_RECOVERY_RESTORE.md's Certificates section)"
+    TMP_CERT_DIR="$(mktemp -d)"
+    openssl req -x509 -nodes -newkey rsa:2048 -days 3650 \
+      -keyout "$TMP_CERT_DIR/selfsigned.key" -out "$TMP_CERT_DIR/selfsigned.crt" \
+      -subj "/CN=isadoraair.local" >/dev/null 2>&1
+    if [ "$USE_SUDO" -eq 1 ]; then
+      sudo mkdir -p "$CERT_DIR"
+      sudo install -o root -g root -m 0644 "$TMP_CERT_DIR/selfsigned.crt" "$CERT_FILE"
+      sudo install -o root -g root -m 0600 "$TMP_CERT_DIR/selfsigned.key" "$KEY_FILE"
+    else
+      mkdir -p "$CERT_DIR"
+      install -m 0644 "$TMP_CERT_DIR/selfsigned.crt" "$CERT_FILE"
+      install -m 0600 "$TMP_CERT_DIR/selfsigned.key" "$KEY_FILE"
+    fi
+    rm -rf "$TMP_CERT_DIR"
+    log_info "Self-signed TLS certificate generated."
+  else
+    log_warn "openssl not found -- cannot generate the self-signed TLS certificate; nginx -t will fail below until one is provided."
+  fi
+else
+  log_plan "generate a self-signed TLS certificate at $CERT_FILE if not already present (never overwrites an existing one)"
 fi
 
 # ---- 4. Runtime Foundation E5 system surfaces (installed launcher,
@@ -399,12 +459,20 @@ if [ "$RESTORE_MODE" = "apply" ]; then
   # 5d. nginx -t -- only meaningful against the REAL /etc/nginx tree; an
   #     isolated staged site file has no full config context to check
   #     against, so this is skipped (not faked) under --staging-root.
+  # r0042: a real E8 run found this FAILED result never affected the
+  # stage's own exit code -- "90-system-config: PASS" always followed,
+  # unconditionally. A genuine nginx syntax/configuration error (never
+  # merely the self-signed cert being absent -- section 3b above now
+  # generates it deterministically before this ever runs) must fail
+  # this stage closed.
+  NGINX_TEST_FAILED=0
   if [ "$USE_SUDO" -eq 1 ] && command -v nginx >/dev/null 2>&1; then
     log_info "Running nginx -t..."
     if sudo nginx -t 2>&1; then
       log_info "nginx -t: PASS"
     else
       log_error "nginx -t: FAILED -- see output above."
+      NGINX_TEST_FAILED=1
     fi
   else
     log_warn "nginx -t skipped ($( [ "$USE_SUDO" -eq 0 ] && echo "staging mode -- isolated site file has no full config tree to validate against" || echo "nginx not found" ))."
@@ -433,6 +501,11 @@ if [ "$RESTORE_MODE" = "apply" ]; then
   fi
 
   log_info "No unit was started, enabled, or reloaded by this stage. nginx was NOT reloaded even in real-install mode."
+
+  if [ "$NGINX_TEST_FAILED" -eq 1 ]; then
+    log_error "90-system-config: FAIL -- nginx -t reported a configuration error (see above). Fix the nginx configuration before proceeding; this stage never reloads nginx itself, so the live service is unaffected either way."
+    exit 1
+  fi
 fi
 
 log_info "90-system-config: $( [ "$RESTORE_MODE" = apply ] && echo "PASS (installation + validation complete, nothing started -- see deploy/restore/README.md's service bring-up order for what comes next)" || echo "PLAN complete" )"

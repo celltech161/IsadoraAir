@@ -118,7 +118,18 @@ set_postgresql_role_password() {
 \endif
 ALTER ROLE :"restore_role_name" PASSWORD :'restore_role_password';
 SQL
-  sudo chown postgres:postgres "$envfile" "$sqlfile"
+  # r0042 sibling audit (found while tracing 75-protected-updater.sh's
+  # own privileged-scratch-in-caller-tree defect): unlike that case,
+  # these two files are still jreed-owned right up until the chown
+  # below, so an ordinary rm can always reach them -- but under `set -e`
+  # a failing chown here would abort this whole script before EITHER
+  # cleanup line below ever ran, leaving a stray mode-600 file holding
+  # DB_PASSWORD in shell-quoted form. Guarded explicitly rather than
+  # relying on set -e to do the right thing.
+  if ! sudo chown postgres:postgres "$envfile" "$sqlfile"; then
+    rm -f "$envfile" "$sqlfile"
+    return 1
+  fi
   sudo -u postgres bash -c 'set -a; source "$1"; set +a; exec psql -v ON_ERROR_STOP=1 -d postgres -f "$2"' _ "$envfile" "$sqlfile" || status=$?
   sudo rm -f "$envfile" "$sqlfile"
   return "$status"
