@@ -395,6 +395,23 @@ publish step above genuinely succeeds. `95-validate.sh`'s existing
 unchanged by this stage's addition) fails closed if a schema-2 archive
 required this component and it is absent from the receipt.
 
+r0041: on a genuinely fresh machine, nothing creates
+`/var/lib/isadoraair/restore` ahead of time, and an ordinary restore
+operator cannot create it themselves beneath root-owned `/var/lib`.
+`lib.sh`'s shared `restore_record_recovery_components` (called by
+Stages 50/70/75 after each already-privileged canonical publish)
+establishes ONLY that one directory's existence/ownership first —
+`sudo mkdir -p` + a deterministic `chmod 0755` (independent of root's
+own umask) + `chown` to the restore operator's own UID/GID, the same
+idiom `40-station-content.sh`'s `ensure_dir()` already uses for
+`/var/lib/isadoraair/reports` — then runs the receipt's own real
+content generation (atomic write, schema validation, archive/payload
+identity checks) completely unprivileged, exactly as before. A
+`--staging-root` restore never escalates anything here; `95-validate.sh`'s
+own `restore_accept_recovery_receipt` stays fully read-only/unprivileged
+too, since by the time it runs the directory the writing stages already
+established is already operator-owned.
+
 ## Manual checkpoints
 
 These are deliberately **not** automated — the tooling makes them

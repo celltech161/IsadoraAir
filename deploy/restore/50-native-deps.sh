@@ -48,9 +48,27 @@
 #
 # Usage:
 #   deploy/restore/50-native-deps.sh --archive PATH [--plan|--apply]
-#     [--staging-root PATH] [--trusted-preparer-uid UID]
+#     [--staging-root PATH]
 #   deploy/restore/50-native-deps.sh [--plan|--apply] [--staging-root PATH]
 #     [--prefix PATH] [--jobs N] [--source-dir PATH | --download-sources]
+#
+# r0041: --trusted-preparer-uid used to be an external flag this stage
+# only forwarded on request -- a real canonical (non-staging) restore
+# left it unset, so provision_runtime_components' own publish phase
+# correctly refused ("canonical native publication requires
+# --trusted-preparer-uid"), a real E8 Stage-50 failure. Removed as a
+# public option: this stage always runs BOTH the unprivileged prepare
+# phase and the privileged canonical publish phase in the same
+# invocation, so it can -- and now does -- determine the real preparer
+# UID itself (whatever this process's own UID was when it ran prepare),
+# never accepting an operator-supplied value a bare-machine operator
+# would have no way to know is correct, and which an external caller
+# supplying an arbitrary UID could otherwise use to bypass
+# NativeRuntimeProvisioner.publish()'s ownership check entirely. A
+# canonical restore now runs unprivileged prepare, then ONLY the
+# publish half under sudo, passing that captured UID -- see
+# lib.sh's restore_manage_command and 75-protected-updater.sh's
+# established USE_SUDO idiom, the same pattern used here.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -65,7 +83,6 @@ PREFIX=""
 JOBS=""
 SOURCE_DIR="${FDKAAC_SOURCE_DIR:-}"
 DOWNLOAD_SOURCES=0
-TRUSTED_PREPARER_UID=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --prefix) PREFIX="${2:?--prefix needs a path}"; shift 2 ;;
@@ -75,8 +92,6 @@ while [ $# -gt 0 ]; do
     --source-dir) SOURCE_DIR="${2:?--source-dir needs a path}"; shift 2 ;;
     --source-dir=*) SOURCE_DIR="${1#*=}"; shift ;;
     --download-sources) DOWNLOAD_SOURCES=1; shift ;;
-    --trusted-preparer-uid) TRUSTED_PREPARER_UID="${2:?--trusted-preparer-uid needs a UID}"; shift 2 ;;
-    --trusted-preparer-uid=*) TRUSTED_PREPARER_UID="${1#*=}"; shift ;;
     *) log_error "50-native-deps.sh: unrecognized argument: $1"; exit 2 ;;
   esac
 done
@@ -110,17 +125,29 @@ if [ "$USE_RECOVERY_PAYLOAD" -eq 1 ]; then
   # same thing as $RESTORE_TARGET_ROOT (the application root,
   # "/opt/isadoraair" or "$STAGING_ROOT/opt/isadoraair") -- see this
   # file's header. Staging: publish beneath the whole staging root, so
-  # it lands at $RESTORE_STAGING_ROOT/usr/local/... . Real restore:
-  # literal / -- the real canonical location -- which the E4 CLI itself
-  # then correctly refuses without root and --trusted-preparer-uid; this
-  # script does not weaken that.
-  NATIVE_TARGET_ROOT="${RESTORE_STAGING_ROOT:-/}"
+  # it lands at $RESTORE_STAGING_ROOT/usr/local/... -- unprivileged
+  # throughout, matching 75-protected-updater.sh's own USE_SUDO=0 case.
+  # Real restore: literal / -- the real canonical location -- which
+  # NativeRuntimeProvisioner.publish() requires root for; this script
+  # runs ONLY that publish half under sudo (never prepare -- see below),
+  # matching 75-protected-updater.sh's own established USE_SUDO=1 idiom.
+  if [ -n "$RESTORE_STAGING_ROOT" ]; then
+    NATIVE_TARGET_ROOT="$RESTORE_STAGING_ROOT"
+    USE_SUDO=0
+  else
+    NATIVE_TARGET_ROOT="/"
+    USE_SUDO=1
+  fi
   log_info "Native fdkaac (E4) target root: $NATIVE_TARGET_ROOT"
 
   if [ "$RESTORE_MODE" != "apply" ]; then
     log_plan "locate + validate the runtime-recovery/ payload embedded in $RESTORE_ARCHIVE"
-    log_plan "restore_manage provision_runtime_components --fdkaac --prepare-fdkaac --recovery-payload <payload>/native/fdkaac --prepared-native-root <tmp> --target-root $NATIVE_TARGET_ROOT"
-    log_plan "restore_manage provision_runtime_components --fdkaac --publish-fdkaac --recovery-payload <payload>/native/fdkaac --prepared-native-root <tmp> --target-root $NATIVE_TARGET_ROOT${TRUSTED_PREPARER_UID:+ --trusted-preparer-uid $TRUSTED_PREPARER_UID}"
+    log_plan "restore_manage provision_runtime_components --fdkaac --prepare-fdkaac --recovery-payload <payload>/native/fdkaac --prepared-native-root <tmp> --target-root $NATIVE_TARGET_ROOT (unprivileged)"
+    if [ "$USE_SUDO" -eq 1 ]; then
+      log_plan "sudo restore_manage provision_runtime_components --fdkaac --publish-fdkaac --recovery-payload <payload>/native/fdkaac --prepared-native-root <tmp> --target-root $NATIVE_TARGET_ROOT --trusted-preparer-uid <uid this process prepared as>"
+    else
+      log_plan "restore_manage provision_runtime_components --fdkaac --publish-fdkaac --recovery-payload <payload>/native/fdkaac --prepared-native-root <tmp> --target-root $NATIVE_TARGET_ROOT (unprivileged)"
+    fi
     log_info "50-native-deps: PLAN complete"
     exit 0
   fi
@@ -155,19 +182,39 @@ if [ "$USE_RECOVERY_PAYLOAD" -eq 1 ]; then
     exit 0
   fi
 
+  # Unprivileged, always -- this is the E4 trust handoff's whole point
+  # (prepare as an ordinary user; only publish is ever privileged).
+  # Never wrapped in sudo, canonical target or not.
   log_apply "restore_manage provision_runtime_components --fdkaac --prepare-fdkaac --recovery-payload $PAYLOAD_DIR --prepared-native-root $PREPARED_DIR --target-root $NATIVE_TARGET_ROOT"
   restore_manage provision_runtime_components \
       --fdkaac --prepare-fdkaac \
       --recovery-payload "$PAYLOAD_DIR" \
       --prepared-native-root "$PREPARED_DIR" \
       --target-root "$NATIVE_TARGET_ROOT"
+  # The UID that ACTUALLY just prepared the tree above -- this process's
+  # own, captured immediately after prepare succeeds. Never an
+  # externally-supplied value: publish's own ownership check
+  # (NativeRuntimeProvisioner.publish -> _validated_preparer_uid) exists
+  # specifically so an arbitrary/wrong UID can never be trusted, and a
+  # bare-machine operator has no legitimate way to know the right value
+  # except by asking this same process what it just did.
+  PREPARER_UID="$(id -u)"
 
   PUBLISH_ARGS=(--fdkaac --publish-fdkaac --recovery-payload "$PAYLOAD_DIR" --prepared-native-root "$PREPARED_DIR" --target-root "$NATIVE_TARGET_ROOT")
-  if [ -n "$TRUSTED_PREPARER_UID" ]; then
-    PUBLISH_ARGS+=(--trusted-preparer-uid "$TRUSTED_PREPARER_UID")
+  if [ "$USE_SUDO" -eq 1 ]; then
+    PUBLISH_ARGS+=(--trusted-preparer-uid "$PREPARER_UID")
   fi
-  log_apply "restore_manage provision_runtime_components ${PUBLISH_ARGS[*]}"
-  restore_manage provision_runtime_components "${PUBLISH_ARGS[@]}"
+  # restore_manage_command (not the plain restore_manage wrapper) here --
+  # a real (non-staging) publish needs the whole invocation, venv python
+  # included, run under sudo; bash functions aren't visible to a separate
+  # sudo process, but a resolved argv is. Matches
+  # 75-protected-updater.sh's own established real-root publish pattern.
+  restore_manage_command provision_runtime_components "${PUBLISH_ARGS[@]}"
+  if [ "$USE_SUDO" -eq 1 ]; then
+    RESTORE_MANAGE_CMD=(sudo "${RESTORE_MANAGE_CMD[@]}")
+  fi
+  log_apply "${RESTORE_MANAGE_CMD[*]}"
+  "${RESTORE_MANAGE_CMD[@]}"
 
   restore_record_recovery_components native_fdkaac >/dev/null
 

@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "release_id": "r0041",
+  "previous_release_id": "r0040",
+  "minimum_updater_protocol_version": 5,
+  "summary": "Fixes three bare-metal restore regressions: (1) backup's runtime-recovery/ root archived at umask-dependent 0775, fixed via chmod plus a verify-extractable pre-upload check; (2) canonical fdkaac/TTS publication ran unprivileged and was refused by E4/E3 -- Stage 50/70 now escalate publish under sudo; (3) the recovery receipt dir can't be created unprivileged on a fresh machine -- lib.sh now establishes it via sudo first. No migration/dependency/package/service changes.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0007"
+}

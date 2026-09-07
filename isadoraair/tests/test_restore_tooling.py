@@ -983,6 +983,72 @@ class InspectBackupFunctionalTests(SimpleTestCase):
         self.assertNotIn("age -d", text)
         self.assertNotRegex(text, r"\bage\s+-i\b")
 
+    # ---- r0041 Task 3: closing the validation gap a real E8 run hit --
+    # inspect_backup.sh: OVERALL PASS on an archive whose runtime-recovery/
+    # root later failed real extraction. These build a genuine, complete
+    # synthetic archive (same shape as _minimal_valid_workdir) plus a real
+    # runtime-recovery/ tree, and prove inspect_backup.sh itself now
+    # catches a bad root mode via the real safe-extraction authority --
+    # not a reimplementation of its rules.
+
+    def _add_runtime_recovery(self, workdir: Path, *, root_mode: int) -> None:
+        recovery_dir = workdir / "runtime-recovery"
+        recovery_dir.mkdir()
+        os.chmod(recovery_dir, root_mode)
+        (recovery_dir / "runtime-recovery.json").write_bytes(b'{"ok": true}\n')
+        os.chmod(recovery_dir / "runtime-recovery.json", 0o644)
+        status = {
+            "schema_version": 1,
+            "payload_id": "inspect-test-payload",
+            "product_contract_sha256": "0" * 64,
+            "components": {"native_fdkaac": {"state": "present"}},
+            "tts_components": ["kokoro"],
+            "piper_freshness": {"state": "not_checked"},
+            "policy": {"required": ["kokoro"], "missing": [], "satisfied": True},
+        }
+        metadata_path = workdir / "runtime-recovery-archive.json"
+        result = subprocess.run(
+            [
+                str(RESTORE_DIR / "runtime_recovery_archive.py"), "write-metadata",
+                "--status-json", json.dumps(status),
+                "--script-version", "3.0.0",
+                "--output", str(metadata_path),
+            ],
+            capture_output=True, text=True, timeout=15,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self._append_manifest(workdir, "\nRuntime recovery payload: included\n")
+
+    def test_extractable_runtime_recovery_payload_passes(self):
+        workdir = self.tmpdir / "work"
+        self._minimal_valid_workdir(workdir)
+        self._add_runtime_recovery(workdir, root_mode=0o755)
+        archive_path = self.tmpdir / "test-backup.tar.gz"
+        self._build_archive(workdir, archive_path)
+
+        result = self._run_inspect(archive_path)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("OVERALL: PASS", result.stdout)
+        self.assertIn("Runtime recovery extractability", result.stdout)
+        self.assertIn("PASS", result.stdout)
+
+    def test_unextractable_runtime_recovery_payload_fails_overall(self):
+        """The real E8 regression, reproduced end to end through
+        inspect_backup.sh itself: a runtime-recovery/ root archived at
+        0775 must now flip OVERALL to FAIL here, not just at Stage 50."""
+        workdir = self.tmpdir / "work"
+        self._minimal_valid_workdir(workdir)
+        self._add_runtime_recovery(workdir, root_mode=0o775)
+        archive_path = self.tmpdir / "test-backup.tar.gz"
+        self._build_archive(workdir, archive_path)
+
+        result = self._run_inspect(archive_path)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("OVERALL: FAIL", result.stdout)
+        self.assertIn("Runtime recovery extractability", result.stdout)
+        self.assertIn("FAIL", result.stdout)
+        self.assertIn("0775", result.stdout)
+
 
 class RestoreLocateRecoveryPayloadFunctionalTests(SimpleTestCase):
     """Runtime Foundation E7B -- real subprocess execution of lib.sh's
@@ -1571,6 +1637,196 @@ class RuntimeFoundationE7BStageModeSelectionTests(SimpleTestCase):
             self.assertNotIn(forbidden, source, f"stage 75 must never reference {forbidden!r}")
 
 
+class RecoveryReceiptDirectoryEstablishmentTests(SimpleTestCase):
+    """r0041, Defect 3: on a genuinely fresh machine, no earlier restore
+    stage creates /var/lib/isadoraair/restore -- an ordinary restore
+    operator cannot create it beneath root-owned /var/lib (empirically
+    confirmed against a real E8 sandbox: a bare `mkdir` there fails
+    Permission denied). Proves lib.sh's real establishment logic,
+    INCLUDING its actual sudo invocation shape for a canonical
+    (non-staging, non-override) restore, without ever touching the real
+    host's own /var/lib/isadoraair -- the fake sudo below rewrites any
+    /var/lib/isadoraair path in its argv to a per-test temp directory
+    before exec'ing; everything else about the invocation (the real
+    `mkdir -p` / `chown "$(id -u):$(id -g)"` argv shape) is exactly what
+    a real restore would run.
+
+    RESTORE_RECOVERY_RECEIPT_ROOT is the test/override seam
+    restore_recovery_receipt_path itself documents -- also exercised
+    directly here, since it's what every OTHER real-execution test in
+    this file that runs a canonical (non-staging) Stage 50/70 now relies
+    on to avoid the exact same real-filesystem pollution this defect's
+    own investigation found in this session's own earlier test runs
+    (a stray .../restore/runtime-recovery.json this session had to
+    clean up from the real production host)."""
+
+    def setUp(self):
+        self.tmpdir = Path(tempfile.mkdtemp(prefix="isadoraair-receipt-dir-test-"))
+        self.addCleanup(shutil.rmtree, self.tmpdir, ignore_errors=True)
+        self.fake_var_lib_isadoraair = self.tmpdir / "fake-var-lib-isadoraair"
+        self.fake_var_lib_isadoraair.mkdir()
+        self.sudo_log = self.tmpdir / "sudo.log"
+        self.fakebin = self.tmpdir / "fakebin"
+        self.fakebin.mkdir()
+        (self.fakebin / "sudo").write_text(
+            f"""#!/usr/bin/env bash
+printf '%s\\n' "$*" >> {self.sudo_log}
+args=()
+for a in "$@"; do
+  args+=("${{a//\\/var\\/lib\\/isadoraair/{self.fake_var_lib_isadoraair}}}")
+done
+exec "${{args[@]}}"
+""",
+            encoding="utf-8",
+        )
+        (self.fakebin / "sudo").chmod(0o755)
+
+    def _run(self, function_call, *, staging_root=None, receipt_override=None):
+        common_args = "--apply"
+        if staging_root:
+            common_args += f" --staging-root {staging_root}"
+        script = (
+            "set -euo pipefail; "
+            f'source "{RESTORE_DIR / "lib.sh"}"; '
+            f"restore_parse_common_args {common_args} >/dev/null 2>&1; "
+            f"{function_call}"
+        )
+        env = {**os.environ, "PATH": f"{self.fakebin}:{os.environ['PATH']}"}
+        env.pop("RESTORE_RECOVERY_RECEIPT_ROOT", None)
+        if receipt_override is not None:
+            env["RESTORE_RECOVERY_RECEIPT_ROOT"] = str(receipt_override)
+        return subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env, timeout=15)
+
+    def _sudo_calls(self):
+        if not self.sudo_log.exists():
+            return []
+        return [line for line in self.sudo_log.read_text(encoding="utf-8").splitlines() if line]
+
+    def test_canonical_establishment_uses_sudo_mkdir_then_chown_to_the_caller(self):
+        real_uid, real_gid = os.getuid(), os.getgid()
+        real_path = "/var/lib/isadoraair/restore"  # the argv sudo actually LOGGED, before this
+        # test's own fake-sudo rewrite to a safe temp location -- proves
+        # the real invocation targets the real canonical path.
+        result = self._run("_restore_ensure_recovery_receipt_dir")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        sudo_calls = self._sudo_calls()
+        self.assertEqual(len(sudo_calls), 3, f"expected mkdir + chmod + chown, got: {sudo_calls}")
+        self.assertEqual(sudo_calls[0], f"mkdir -p {real_path}")
+        self.assertEqual(sudo_calls[1], f"chmod 0755 {real_path}")
+        self.assertEqual(sudo_calls[2], f"chown {real_uid}:{real_gid} {real_path}")
+        established = self.fake_var_lib_isadoraair / "restore"
+        self.assertTrue(established.is_dir())
+        self.assertEqual(established.stat().st_uid, real_uid)
+
+    def test_established_directory_is_not_world_writable(self):
+        """The fix must never make this directory group/world-writable --
+        a forged receipt must not become possible merely by reaching
+        this directory (item: 'receipt cannot be forged merely by
+        making its parent writable')."""
+        result = self._run("_restore_ensure_recovery_receipt_dir")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        mode = stat.S_IMODE(os.stat(self.fake_var_lib_isadoraair / "restore").st_mode)
+        self.assertEqual(mode & 0o022, 0, f"receipt directory must not be group/world-writable, got {mode:04o}")
+
+    def test_idempotent_on_a_second_call(self):
+        first = self._run("_restore_ensure_recovery_receipt_dir")
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        second = self._run("_restore_ensure_recovery_receipt_dir")
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+
+    def test_staging_root_never_uses_sudo(self):
+        staging = self.tmpdir / "staging"
+        result = self._run("_restore_ensure_recovery_receipt_dir", staging_root=staging)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self._sudo_calls(), [])
+        self.assertTrue((staging / "var/lib/isadoraair/restore").is_dir())
+
+    def test_receipt_root_override_never_uses_sudo(self):
+        override = self.tmpdir / "override-root"
+        result = self._run("_restore_ensure_recovery_receipt_dir", receipt_override=override)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self._sudo_calls(), [])
+        self.assertTrue((override / "var/lib/isadoraair/restore").is_dir())
+
+    def test_symlinked_receipt_dir_is_rejected(self):
+        override = self.tmpdir / "symlink-root"
+        (override / "var" / "lib" / "isadoraair").mkdir(parents=True)
+        elsewhere = self.tmpdir / "elsewhere"
+        elsewhere.mkdir()
+        (override / "var" / "lib" / "isadoraair" / "restore").symlink_to(elsewhere)
+        result = self._run("_restore_ensure_recovery_receipt_dir", receipt_override=override)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("symlink", result.stdout + result.stderr)
+        self.assertEqual(self._sudo_calls(), [])
+
+    def test_symlinked_parent_is_rejected(self):
+        override = self.tmpdir / "symlink-parent-root"
+        (override / "var" / "lib").mkdir(parents=True)
+        elsewhere = self.tmpdir / "elsewhere2"
+        elsewhere.mkdir()
+        (override / "var" / "lib" / "isadoraair").symlink_to(elsewhere)
+        result = self._run("_restore_ensure_recovery_receipt_dir", receipt_override=override)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("symlink", result.stdout + result.stderr)
+        self.assertEqual(self._sudo_calls(), [])
+
+    def test_record_and_accept_round_trip_through_the_established_directory(self):
+        """The receipt's own content -- atomic write, schema validation,
+        archive/payload identity checks -- must be completely untouched
+        by this fix: a real record then accept, through the newly
+        established directory, still works end to end."""
+        override = self.tmpdir / "roundtrip-root"
+        archive = self.tmpdir / "backup.tar.gz"
+        workdir = self.tmpdir / "archive-work"
+        (workdir / "runtime-recovery").mkdir(parents=True)
+        (workdir / "runtime-recovery" / "runtime-recovery.json").write_text("{}")
+        metadata = {
+            "schema_version": 1,
+            "backup_script_version": "3.0.0",
+            "archive_format_version": "3.0.0",
+            "recovery_class": "self_contained_v3",
+            "payload_included": True,
+            "payload_id": "roundtrip-test",
+            "payload_schema_version": 1,
+            "product_contract_sha256": "0" * 64,
+            "included_components": ["native_fdkaac"],
+            "required_components": ["native_fdkaac"],
+            "policy_satisfied": True,
+            "piper_freshness": "not_checked",
+        }
+        (workdir / "runtime-recovery-archive.json").write_text(json.dumps(metadata), encoding="utf-8")
+        with tarfile.open(archive, "w:gz") as tf:
+            tf.add(workdir, arcname=".")
+
+        script = (
+            "set -euo pipefail; "
+            f'source "{RESTORE_DIR / "lib.sh"}"; '
+            f"restore_parse_common_args --archive {archive} --apply >/dev/null 2>&1; "
+            "restore_record_recovery_components native_fdkaac"
+        )
+        env = {
+            **os.environ, "PATH": f"{self.fakebin}:{os.environ['PATH']}",
+            "RESTORE_RECOVERY_RECEIPT_ROOT": str(override),
+        }
+        record = subprocess.run(["bash", "-c", script], capture_output=True, text=True, env=env, timeout=15)
+        self.assertEqual(record.returncode, 0, record.stdout + record.stderr)
+        self.assertEqual(self._sudo_calls(), [])
+
+        receipt_path = override / "var/lib/isadoraair/restore/runtime-recovery.json"
+        self.assertTrue(receipt_path.is_file())
+        self.assertEqual(json.loads(receipt_path.read_text())["recovered_components"], ["native_fdkaac"])
+
+        accept_script = (
+            "set -euo pipefail; "
+            f'source "{RESTORE_DIR / "lib.sh"}"; '
+            f"restore_parse_common_args --archive {archive} --apply >/dev/null 2>&1; "
+            "restore_accept_recovery_receipt"
+        )
+        accept = subprocess.run(["bash", "-c", accept_script], capture_output=True, text=True, env=env, timeout=15)
+        self.assertEqual(accept.returncode, 0, accept.stdout + accept.stderr)
+        self.assertIn('"accepted":true', accept.stdout.replace(" ", ""))
+
+
 class RestoreManageSharedHelperTests(SimpleTestCase):
     """Runtime Foundation E7C (2026-09-04): lib.sh's restore_manage /
     restore_manage_command is the ONE shared mechanism stages 50/70/75/90
@@ -1797,6 +2053,487 @@ class RuntimeRecoveryArchiveClassificationTests(SimpleTestCase):
         )
         self.assertEqual(optional["archive_format_version"], "2.1.0")
         self.assertEqual(optional["recovery_class"], "legacy_non_self_contained")
+
+
+class RuntimeRecoveryArchiveModeContractTests(SimpleTestCase):
+    """r0041: real, non-synthetic proof of the archive-producer's mode
+    fix and the safe extractor's own trusted-mode contract. Reproduces
+    the actual E8 Stage-50 failure -- a mode-0775 runtime-recovery/ root,
+    from deploy/backup_isadoraair.sh's own umask-derived `mkdir -p`,
+    passing inspect_backup.sh yet failing real extraction -- using the
+    ACTUAL three-line producer sequence (mkdir/chmod/cp -R) and the
+    ACTUAL safe-extraction authority (runtime_recovery_archive.py),
+    never a reimplementation of either."""
+
+    def setUp(self):
+        self.tmpdir = Path(tempfile.mkdtemp(prefix="isadoraair-rr-mode-test-"))
+        self.addCleanup(shutil.rmtree, self.tmpdir, ignore_errors=True)
+        self.helper = RESTORE_DIR / "runtime_recovery_archive.py"
+        self.payload_src = self._build_trusted_payload_source()
+
+    def _build_trusted_payload_source(self):
+        """A small, real trusted-mode payload tree -- 0755 dirs, 0644
+        files, one protected-updater launcher at the other permitted
+        mode, 0755 -- matching /var/lib/isadoraair/runtime-recovery's
+        own real on-disk contract (verified this session). The bug is
+        never in this source; only in the archive producer's own
+        synthetic outer directory, proven below."""
+        src = self.tmpdir / "trusted-source"
+        (src / "tts" / "kokoro").mkdir(parents=True)
+        (src / "protected-updater" / "bootstrap").mkdir(parents=True)
+        (src / "runtime-recovery.json").write_text('{"ok": true}\n', encoding="utf-8")
+        (src / "tts" / "runtime-bundle.json").write_text("{}\n", encoding="utf-8")
+        (src / "protected-updater" / "restore-manifest.json").write_text("{}\n", encoding="utf-8")
+        launcher = src / "protected-updater" / "bootstrap" / "launcher.sh"
+        launcher.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        for path in src.rglob("*"):
+            if path.is_dir():
+                path.chmod(0o755)
+        for path in src.rglob("*"):
+            if path.is_file() and path != launcher:
+                path.chmod(0o644)
+        launcher.chmod(0o755)
+        src.chmod(0o755)
+        return src
+
+    def _metadata_json_text(self):
+        output = self.tmpdir / f"meta-{len(list(self.tmpdir.glob('meta-*.json')))}.json"
+        result = subprocess.run(
+            [
+                str(self.helper), "write-metadata",
+                "--status-json", json.dumps({
+                    "schema_version": 1,
+                    "payload_id": "mode-contract-test",
+                    "product_contract_sha256": "0" * 64,
+                    "components": {"native_fdkaac": {"state": "present"}},
+                    "tts_components": ["kokoro"],
+                    "piper_freshness": {"state": "not_checked"},
+                    "policy": {"required": ["kokoro"], "missing": [], "satisfied": True},
+                }),
+                "--script-version", "3.0.0",
+                "--output", str(output),
+            ],
+            capture_output=True, text=True, timeout=15,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        return output.read_text(encoding="utf-8")
+
+    def _build_archive_like_the_real_producer(self, name, umask_value):
+        """Literally deploy/backup_isadoraair.sh's own sequence: mkdir
+        -p, chmod 0755 (the r0041 fix), cp -R -- run under a deliberately
+        permissive umask that would otherwise leave a 0775 directory --
+        then tarred exactly as that script tars its own $WORKDIR
+        (tar czf ... -C "$WORKDIR" .)."""
+        workdir = self.tmpdir / f"workdir-{name}"
+        workdir.mkdir()
+        recovery_dir = workdir / "runtime-recovery"
+        script = (
+            f"umask {umask_value:04o}\n"
+            f"mkdir -p {recovery_dir}\n"
+            f"chmod 0755 {recovery_dir}\n"
+            f"cp -R {self.payload_src}/. {recovery_dir}/\n"
+        )
+        subprocess.run(["bash", "-c", script], check=True, capture_output=True, text=True, timeout=15)
+        (workdir / "runtime-recovery-archive.json").write_text(self._metadata_json_text(), encoding="utf-8")
+        archive = self.tmpdir / f"{name}.tar.gz"
+        subprocess.run(
+            ["tar", "czf", str(archive), "-C", str(workdir), "."],
+            check=True, capture_output=True, text=True, timeout=15,
+        )
+        return archive, workdir
+
+    def _root_mode_in_tar(self, archive):
+        with tarfile.open(archive, "r:gz") as tf:
+            for member in tf.getmembers():
+                if member.name in ("./runtime-recovery", "runtime-recovery"):
+                    return stat.S_IMODE(member.mode)
+        raise AssertionError("runtime-recovery root not found in archive")
+
+    def _verify_extractable(self, archive):
+        return subprocess.run(
+            [str(self.helper), "verify-extractable", "--archive", str(archive)],
+            capture_output=True, text=True, timeout=30,
+        )
+
+    def _tamper_member_mode(self, src_archive, member_name, new_mode, dest_name):
+        """Rewrites exactly one tar member's mode in a copy of an
+        otherwise-good archive -- the deliberate-violation half of each
+        rejection test below."""
+        dest = self.tmpdir / dest_name
+        with tarfile.open(src_archive, "r:gz") as src, tarfile.open(dest, "w:gz") as out:
+            for member in src.getmembers():
+                data = src.extractfile(member).read() if member.isreg() else None
+                if member.name == member_name:
+                    member.mode = new_mode
+                out.addfile(member, fileobj=(io.BytesIO(data) if data is not None else None))
+        return dest
+
+    # ---- Task 4, items 1-3: the fix itself, on real tar output --------
+
+    def test_producer_sequence_yields_exactly_0755_root_under_permissive_umask(self):
+        archive, workdir = self._build_archive_like_the_real_producer("permissive", 0o002)
+        self.assertEqual(stat.S_IMODE(os.stat(workdir / "runtime-recovery").st_mode), 0o755)
+        self.assertEqual(self._root_mode_in_tar(archive), 0o755)
+
+    def test_mkdir_alone_would_have_reproduced_the_real_regression(self):
+        """Negative control proving this is a genuine umask-dependent
+        bug, not a strawman: the bare `mkdir -p` this script used to
+        run, with no chmod at all, under the same permissive umask."""
+        workdir = self.tmpdir / "no-fix"
+        workdir.mkdir()
+        subprocess.run(
+            ["bash", "-c", f"umask 0002; mkdir -p {workdir}/runtime-recovery"],
+            check=True, capture_output=True, text=True, timeout=15,
+        )
+        self.assertEqual(stat.S_IMODE(os.stat(workdir / "runtime-recovery").st_mode), 0o775)
+
+    def test_real_safe_extractor_accepts_the_fixed_archive(self):
+        archive, _ = self._build_archive_like_the_real_producer("accept", 0o002)
+        result = self._verify_extractable(archive)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(json.loads(result.stdout)["verified_extractable"])
+
+    def test_real_safe_extractor_actually_extracts_the_fixed_archive(self):
+        archive, _ = self._build_archive_like_the_real_producer("extract", 0o002)
+        destination = self.tmpdir / "extracted"
+        result = subprocess.run(
+            [str(self.helper), "extract", "--archive", str(archive), "--destination", str(destination)],
+            capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(stat.S_IMODE(os.stat(destination).st_mode), 0o755)
+        self.assertEqual(
+            stat.S_IMODE(os.stat(destination / "protected-updater" / "bootstrap" / "launcher.sh").st_mode), 0o755
+        )
+        self.assertEqual(stat.S_IMODE(os.stat(destination / "runtime-recovery.json").st_mode), 0o644)
+
+    # ---- Task 4, items 4-7: rejection paths on the real extractor -----
+
+    def test_deliberately_altered_root_mode_0775_is_rejected(self):
+        good, _ = self._build_archive_like_the_real_producer("root-tamper-base", 0o022)
+        tampered = self._tamper_member_mode(good, "./runtime-recovery", 0o775, "root-0775.tar.gz")
+        result = self._verify_extractable(tampered)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("0775", result.stderr)
+        self.assertIn("0755", result.stderr)
+        self.assertIn("./runtime-recovery", result.stderr)
+
+    def test_nested_directory_mode_violation_is_rejected(self):
+        good, _ = self._build_archive_like_the_real_producer("nested-dir-tamper-base", 0o022)
+        tampered = self._tamper_member_mode(good, "./runtime-recovery/tts", 0o777, "nested-dir-0777.tar.gz")
+        result = self._verify_extractable(tampered)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("directory", result.stderr)
+        self.assertIn("0777", result.stderr)
+
+    def test_ordinary_file_mode_violation_is_rejected(self):
+        good, _ = self._build_archive_like_the_real_producer("file-tamper-base", 0o022)
+        tampered = self._tamper_member_mode(
+            good, "./runtime-recovery/runtime-recovery.json", 0o666, "file-0666.tar.gz",
+        )
+        result = self._verify_extractable(tampered)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("regular file", result.stderr)
+        self.assertIn("0666", result.stderr)
+
+    def test_allowed_protected_updater_executable_mode_is_accepted(self):
+        """0755 under protected-updater/ is an explicitly permitted
+        exception (launcher executables) -- must remain accepted, not
+        collateral damage from tightening the outer-root fix."""
+        archive, _ = self._build_archive_like_the_real_producer("launcher-mode", 0o002)
+        result = self._verify_extractable(archive)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+
+class Stage50CanonicalNativePublishPrivilegeSplitTests(RuntimeRecoveryArchiveModeContractTests):
+    """r0041, second E8 Stage-50 defect: canonical (non-staging) native
+    fdkaac publication used to run through ordinary restore_manage with
+    no --trusted-preparer-uid at all, so provision_runtime_components'
+    own real E4 authority correctly refused ("canonical native
+    publication requires --trusted-preparer-uid") -- a second real E8
+    Stage-50 failure, reached only after the mode-0775 archive defect
+    above was independently corrected.
+
+    Exercises the REAL deploy/restore/50-native-deps.sh shell
+    orchestration end to end: real restore_parse_common_args/
+    restore_locate_recovery_payload/restore_manage_command, a real
+    self-contained-v3 archive built by this class's own inherited
+    real-archive-producer helpers, and a real sudo shim -- but with a
+    fake $TARGET/venv/bin/python standing in for the actual Django
+    management commands (E4's own ownership/root checks already have
+    real, thorough coverage in isadoraair/tests/test_runtime_native.py --
+    NativeCommandTests, NativePublicationTests -- proving items 5/6 of
+    this task's own list; duplicating that here would just be a weaker
+    reimplementation). What this class proves instead, for real, is the
+    one thing that actually regressed: Stage 50's OWN decision of *when*
+    to escalate and *which* UID to hand the E4 authority."""
+
+    def setUp(self):
+        super().setUp()
+        self.target = self.tmpdir / "restore-target"
+        self.target.mkdir()
+        (self.target / "manage.py").write_text("# never executed -- see fake venv python\n", encoding="utf-8")
+        (self.target / ".env").write_text(
+            "DEBUG=True\nDB_USER=isadoraair\nDB_PASSWORD=unused\n", encoding="utf-8",
+        )
+        venv_bin = self.target / "venv" / "bin"
+        venv_bin.mkdir(parents=True)
+        self.python_log = self.tmpdir / "python-argv.log"
+        self.sudo_log = self.tmpdir / "sudo-argv.log"
+        (venv_bin / "python").write_text(
+            f"""#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\\n' "$*" >> {self.python_log}
+if [[ "$*" == *"validate_runtime_recovery_payload"* ]]; then
+  printf '%s\\n' '{{"components": {{"native_fdkaac": {{"state": "present"}}}}}}'
+  exit 0
+fi
+if [[ "$*" == *"--publish-fdkaac"* ]] && [ "${{FAKE_PUBLISH_EXIT:-0}}" != "0" ]; then
+  echo "SIMULATED PUBLISH FAILURE" >&2
+  exit "$FAKE_PUBLISH_EXIT"
+fi
+exit 0
+""",
+            encoding="utf-8",
+        )
+        (venv_bin / "python").chmod(0o755)
+        self.fakebin = self.tmpdir / "fakebin"
+        self.fakebin.mkdir()
+        sudo_shim = self.fakebin / "sudo"
+        sudo_shim.write_text(
+            f"""#!/usr/bin/env bash
+printf '%s\\n' "$*" >> {self.sudo_log}
+exec "$@"
+""",
+            encoding="utf-8",
+        )
+        sudo_shim.chmod(0o755)
+
+    def _run_stage50(self, *, canonical: bool, extra_env=None):
+        archive, _ = self._build_archive_like_the_real_producer("stage50-e2e", 0o022)
+        args = [
+            str(RESTORE_DIR / "50-native-deps.sh"),
+            "--archive", str(archive),
+            "--target-root", str(self.target),
+            "--apply",
+        ]
+        if not canonical:
+            args += ["--staging-root", str(self.tmpdir / "staging")]
+        env = {
+            **os.environ,
+            "PATH": f"{self.fakebin}:{os.environ['PATH']}",
+            # Never let a "canonical" (--target-root only, no
+            # --staging-root, by design here so NATIVE_TARGET_ROOT is
+            # genuinely "/") test run touch the real host's
+            # /var/lib/isadoraair/restore -- see restore_recovery_receipt_path's
+            # own docstring on this exact test/override seam.
+            "RESTORE_RECOVERY_RECEIPT_ROOT": str(self.tmpdir / "receipt-root"),
+        }
+        if extra_env:
+            env.update(extra_env)
+        return subprocess.run(args, capture_output=True, text=True, env=env, timeout=30)
+
+    def _python_calls(self):
+        return [line for line in self.python_log.read_text(encoding="utf-8").splitlines() if line]
+
+    def _sudo_calls(self):
+        if not self.sudo_log.exists():
+            return []
+        return [line for line in self.sudo_log.read_text(encoding="utf-8").splitlines() if line]
+
+    # ---- items 1-4, 9: the actual privilege-split regression ----------
+
+    def test_canonical_prepare_runs_unprivileged(self):
+        result = self._run_stage50(canonical=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        prepare_calls = [c for c in self._python_calls() if "--prepare-fdkaac" in c]
+        self.assertEqual(len(prepare_calls), 1)
+        sudo_calls = self._sudo_calls()
+        self.assertTrue(
+            all("--prepare-fdkaac" not in c for c in sudo_calls),
+            f"prepare must never run under sudo, got sudo calls: {sudo_calls}",
+        )
+
+    def test_canonical_publication_runs_under_sudo_with_the_real_preparer_uid(self):
+        real_uid = os.getuid()
+        result = self._run_stage50(canonical=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        sudo_calls = self._sudo_calls()
+        publish_sudo_calls = [c for c in sudo_calls if "--publish-fdkaac" in c]
+        self.assertEqual(len(publish_sudo_calls), 1, f"expected exactly one sudo publish call, got: {sudo_calls}")
+        self.assertIn(f"--trusted-preparer-uid {real_uid}", publish_sudo_calls[0])
+
+    def test_canonical_end_to_end_succeeds_with_the_intended_privilege_split(self):
+        """Item 9: the full canonical flow -- unprivileged prepare, then
+        ONLY publish escalated, with the correct UID -- succeeds end to
+        end through the real script."""
+        result = self._run_stage50(canonical=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("50-native-deps: PASS", result.stdout)
+        calls = self._python_calls()
+        self.assertTrue(any("--prepare-fdkaac" in c for c in calls))
+        self.assertTrue(any("--publish-fdkaac" in c for c in calls))
+
+    def test_staging_root_publication_needs_no_root_or_trusted_uid(self):
+        """Item 7: --staging-root must keep working exactly as before --
+        no sudo anywhere, and no --trusted-preparer-uid is even passed
+        (None is the correct, safe default there -- see
+        _validated_preparer_uid's own non-canonical branch)."""
+        result = self._run_stage50(canonical=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self._sudo_calls(), [])
+        publish_calls = [c for c in self._python_calls() if "--publish-fdkaac" in c]
+        self.assertEqual(len(publish_calls), 1)
+        self.assertNotIn("--trusted-preparer-uid", publish_calls[0])
+
+    def test_trusted_preparer_uid_is_no_longer_an_accepted_public_flag(self):
+        """Audit outcome: an external caller can no longer hand Stage 50
+        an arbitrary UID for canonical publication -- the one legitimate
+        value (this process's own preparer UID) is now always
+        determined internally."""
+        archive, _ = self._build_archive_like_the_real_producer("rejected-flag", 0o022)
+        result = subprocess.run(
+            [
+                str(RESTORE_DIR / "50-native-deps.sh"),
+                "--archive", str(archive), "--target-root", str(self.target),
+                "--trusted-preparer-uid", "0", "--plan",
+            ],
+            capture_output=True, text=True, timeout=15,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unrecognized argument", result.stdout + result.stderr)
+
+    # ---- item 6 (Stage-50-level half): a publish failure from the real
+    # E4 authority must still fail this stage closed, never swallowed --
+    # the authority's OWN missing/wrong-UID rejection itself is covered
+    # for real in test_runtime_native.py (NativeCommandTests,
+    # NativePublicationTests), not re-derived here.
+
+    def test_publish_failure_from_the_authority_fails_the_stage_closed(self):
+        result = self._run_stage50(canonical=True, extra_env={"FAKE_PUBLISH_EXIT": "1"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("50-native-deps: PASS", result.stdout)
+
+    # ---- item 10: nothing sudo-adjacent leaks the target's secrets ----
+
+    def test_no_secrets_in_sudo_argv_or_python_log(self):
+        result = self._run_stage50(canonical=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        combined = "\n".join(self._sudo_calls() + self._python_calls()) + result.stdout + result.stderr
+        self.assertNotIn("unused", combined)  # the fixture's DB_PASSWORD value
+        self.assertNotIn("DB_PASSWORD", combined)
+
+
+class Stage70CanonicalTTSPublishPrivilegeSplitTests(RuntimeRecoveryArchiveModeContractTests):
+    """r0041 broader audit: RuntimeProvisioner.apply()
+    (isadoraair/runtime_provisioning.py) requires root outright for a
+    canonical "/" target root, exactly the same class of real Stage-50
+    failure -- found here by audit, before it could reach a real E8 run.
+    Unlike E4's native fdkaac, E3's TTS provisioning has no prepare/
+    publish split (one atomic apply()), so the fix is simpler: escalate
+    that one call under sudo for a real restore, nothing else changes."""
+
+    def setUp(self):
+        super().setUp()
+        self.target = self.tmpdir / "restore-target"
+        self.target.mkdir()
+        (self.target / "manage.py").write_text("# never executed -- see fake venv python\n", encoding="utf-8")
+        (self.target / ".env").write_text(
+            "DEBUG=True\nDB_USER=isadoraair\nDB_PASSWORD=unused\n", encoding="utf-8",
+        )
+        venv_bin = self.target / "venv" / "bin"
+        venv_bin.mkdir(parents=True)
+        self.python_log = self.tmpdir / "python-argv.log"
+        self.sudo_log = self.tmpdir / "sudo-argv.log"
+        (venv_bin / "python").write_text(
+            f"""#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\\n' "$*" >> {self.python_log}
+if [[ "$*" == *"validate_runtime_recovery_payload"* ]]; then
+  printf '%s\\n' '{{"components": {{"native_fdkaac": {{"state": "absent"}}}}, "tts_components": ["kokoro"]}}'
+  exit 0
+fi
+if [[ "$*" == *"provision_runtime_components"* ]] && [ "${{FAKE_APPLY_EXIT:-0}}" != "0" ]; then
+  echo "SIMULATED APPLY FAILURE" >&2
+  exit "$FAKE_APPLY_EXIT"
+fi
+exit 0
+""",
+            encoding="utf-8",
+        )
+        (venv_bin / "python").chmod(0o755)
+        self.fakebin = self.tmpdir / "fakebin"
+        self.fakebin.mkdir()
+        sudo_shim = self.fakebin / "sudo"
+        sudo_shim.write_text(
+            f"""#!/usr/bin/env bash
+printf '%s\\n' "$*" >> {self.sudo_log}
+exec "$@"
+""",
+            encoding="utf-8",
+        )
+        sudo_shim.chmod(0o755)
+
+    def _run_stage70(self, *, canonical: bool, extra_env=None):
+        archive, _ = self._build_archive_like_the_real_producer("stage70-e2e", 0o022)
+        args = [
+            str(RESTORE_DIR / "70-tts.sh"),
+            "--archive", str(archive),
+            "--target-root", str(self.target),
+            "--apply",
+        ]
+        if not canonical:
+            args += ["--staging-root", str(self.tmpdir / "staging")]
+        env = {
+            **os.environ,
+            "PATH": f"{self.fakebin}:{os.environ['PATH']}",
+            # See Stage50CanonicalNativePublishPrivilegeSplitTests's own
+            # identical comment -- never touch the real host's
+            # /var/lib/isadoraair/restore from a "canonical" test run.
+            "RESTORE_RECOVERY_RECEIPT_ROOT": str(self.tmpdir / "receipt-root"),
+        }
+        if extra_env:
+            env.update(extra_env)
+        return subprocess.run(args, capture_output=True, text=True, env=env, timeout=30)
+
+    def _python_calls(self):
+        return [line for line in self.python_log.read_text(encoding="utf-8").splitlines() if line]
+
+    def _sudo_calls(self):
+        if not self.sudo_log.exists():
+            return []
+        return [line for line in self.sudo_log.read_text(encoding="utf-8").splitlines() if line]
+
+    def test_canonical_apply_runs_under_sudo(self):
+        result = self._run_stage70(canonical=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        sudo_calls = self._sudo_calls()
+        apply_sudo_calls = [c for c in sudo_calls if "provision_runtime_components" in c]
+        self.assertEqual(len(apply_sudo_calls), 1, f"expected exactly one sudo apply call, got: {sudo_calls}")
+
+    def test_canonical_end_to_end_succeeds(self):
+        result = self._run_stage70(canonical=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("70-tts: PASS", result.stdout)
+
+    def test_staging_root_needs_no_sudo(self):
+        result = self._run_stage70(canonical=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self._sudo_calls(), [])
+        apply_calls = [c for c in self._python_calls() if "provision_runtime_components" in c]
+        self.assertEqual(len(apply_calls), 1)
+
+    def test_apply_failure_from_the_authority_fails_the_stage_closed(self):
+        result = self._run_stage70(canonical=True, extra_env={"FAKE_APPLY_EXIT": "1"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("70-tts: PASS", result.stdout)
+
+    def test_no_secrets_in_sudo_argv_or_python_log(self):
+        result = self._run_stage70(canonical=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        combined = "\n".join(self._sudo_calls() + self._python_calls()) + result.stdout + result.stderr
+        self.assertNotIn("unused", combined)
+        self.assertNotIn("DB_PASSWORD", combined)
 
 
 class RuntimeFoundationE5TmpfilesMappingTests(SimpleTestCase):

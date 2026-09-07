@@ -255,6 +255,55 @@ def inspect_archive(args: argparse.Namespace) -> int:
     return 0
 
 
+def _collect_recovery_members(
+    source: tarfile.TarFile,
+) -> list[tuple[tarfile.TarInfo, PurePosixPath, int]]:
+    """Validate every runtime-recovery member's path and mode against the
+    trusted archive contract, WITHOUT touching the filesystem -- read-only
+    against the already-open tar handle. This is the one authority both
+    extract_payload (which then actually writes bytes to disk) and
+    verify_extractable (which never does -- see its own docstring, used
+    by backup producers and archive/media inspection to catch exactly the
+    r0040 Stage-50 regression class before extraction is ever attempted)
+    share, so the mode/confinement rules -- including the implicit
+    rejection of symlinks/special files via _trusted_recovery_member_mode's
+    isdir()/isreg() check -- are enforced in exactly one place.
+
+    Raises ArchiveContractError on the first violation: duplicate root,
+    missing root, duplicate member, untrusted mode, or a non-directory/
+    non-regular-file member. Returns the validated (member, relative path,
+    trusted mode) list for every member EXCEPT the root directory itself
+    (callers needing to know the root was present/valid check root_seen
+    via a duplicate-root ArchiveContractError never firing, or simply rely
+    on the "runtime-recovery archive root directory is missing" error
+    below)."""
+    seen: set[PurePosixPath] = set()
+    selected: list[tuple[tarfile.TarInfo, PurePosixPath, int]] = []
+    root_seen = False
+    for member in source.getmembers():
+        name = _normalized_name(member.name)
+        if not name.parts or name.parts[0] != "runtime-recovery":
+            continue
+        relative = PurePosixPath(*name.parts[1:])
+        if not relative.parts:
+            if root_seen:
+                raise ArchiveContractError("duplicate runtime recovery archive root")
+            root_seen = True
+            _trusted_recovery_member_mode(member, relative=None)
+            continue
+        if relative in seen:
+            raise ArchiveContractError(f"duplicate runtime recovery archive member: {relative}")
+        seen.add(relative)
+        selected.append((
+            member,
+            relative,
+            _trusted_recovery_member_mode(member, relative=relative),
+        ))
+    if not root_seen:
+        raise ArchiveContractError("runtime-recovery archive root directory is missing")
+    return selected
+
+
 def extract_payload(args: argparse.Namespace) -> int:
     metadata = _metadata_from_tar(args.archive)
     if metadata is None:
@@ -268,35 +317,11 @@ def extract_payload(args: argparse.Namespace) -> int:
     args.destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = Path(tempfile.mkdtemp(prefix=f".{args.destination.name}.extract-", dir=args.destination.parent))
     try:
-        seen: set[PurePosixPath] = set()
         with tarfile.open(args.archive, "r:gz") as source:
             # Validate the complete selected member set before writing a byte.
             # In particular, links/special files and any mode outside the
             # closed recovery-payload contract fail before extraction begins.
-            selected: list[tuple[tarfile.TarInfo, PurePosixPath, int]] = []
-            root_seen = False
-            for member in source.getmembers():
-                name = _normalized_name(member.name)
-                if not name.parts or name.parts[0] != "runtime-recovery":
-                    continue
-                relative = PurePosixPath(*name.parts[1:])
-                if not relative.parts:
-                    if root_seen:
-                        raise ArchiveContractError("duplicate runtime recovery archive root")
-                    root_seen = True
-                    _trusted_recovery_member_mode(member, relative=None)
-                    continue
-                if relative in seen:
-                    raise ArchiveContractError(f"duplicate runtime recovery archive member: {relative}")
-                seen.add(relative)
-                selected.append((
-                    member,
-                    relative,
-                    _trusted_recovery_member_mode(member, relative=relative),
-                ))
-
-            if not root_seen:
-                raise ArchiveContractError("runtime-recovery archive root directory is missing")
+            selected = _collect_recovery_members(source)
 
             os.chmod(temporary, TRUSTED_DIRECTORY_MODE)
             extracted = 0
@@ -326,6 +351,45 @@ def extract_payload(args: argparse.Namespace) -> int:
     finally:
         shutil.rmtree(temporary, ignore_errors=True)
     print(json.dumps(metadata, sort_keys=True, separators=(",", ":")))
+    return 0
+
+
+def verify_extractable(args: argparse.Namespace) -> int:
+    """Read-only: proves a self-contained-v3 archive's runtime-recovery/
+    tree is actually acceptable to extract_payload's trusted mode/
+    confinement contract -- WITHOUT extracting anything to disk (no
+    tempdir, no chmod, no writes; only tarfile.getmembers() reads).
+
+    This closes the r0040 Stage-50 validation gap: inspect_archive above
+    only ever checked the small runtime-recovery-archive.json metadata
+    member, never the actual mode of every runtime-recovery/ tar member --
+    so a backup whose synthetic outer runtime-recovery/ directory got
+    archived at the wrong mode (e.g. 0775 from an uncontrolled umask
+    instead of the required 0755) passed both inspect_backup.sh and this
+    tool's own `inspect` subcommand, then failed for real, for the first
+    time, at actual Stage 50/70/75 extraction. Backup producers should
+    call this on the archive they are about to upload/export whenever a
+    runtime-recovery payload was included, and abort before upload on
+    failure -- see deploy/backup_isadoraair.sh and inspect_backup.sh.
+
+    Exit codes mirror extract_payload's for the two "nothing to verify"
+    cases (2 = legacy/no metadata, 3 = non-self-contained), 0 for a
+    verified-extractable self-contained archive, 1 for a self-contained
+    archive whose runtime-recovery tree fails the trusted contract.
+    """
+    metadata = _metadata_from_tar(args.archive)
+    if metadata is None:
+        print("LEGACY ARCHIVE -- no runtime-recovery payload to verify", file=sys.stderr)
+        return 2
+    if metadata["recovery_class"] != SELF_CONTAINED_CLASS:
+        print("NON-SELF-CONTAINED ARCHIVE -- no runtime-recovery payload to verify", file=sys.stderr)
+        return 3
+    with tarfile.open(args.archive, "r:gz") as source:
+        selected = _collect_recovery_members(source)
+    print(json.dumps(
+        {"verified_extractable": True, "payload_id": metadata["payload_id"], "member_count": len(selected)},
+        sort_keys=True, separators=(",", ":"),
+    ))
     return 0
 
 
@@ -409,6 +473,9 @@ def parser() -> argparse.ArgumentParser:
     extract.add_argument("--archive", required=True, type=Path)
     extract.add_argument("--destination", required=True, type=Path)
     extract.set_defaults(handler=extract_payload)
+    verify = commands.add_parser("verify-extractable", allow_abbrev=False)
+    verify.add_argument("--archive", required=True, type=Path)
+    verify.set_defaults(handler=verify_extractable)
     record = commands.add_parser("record", allow_abbrev=False)
     record.add_argument("--archive", required=True, type=Path)
     record.add_argument("--receipt", required=True, type=Path)

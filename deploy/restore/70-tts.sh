@@ -114,12 +114,32 @@ if [ "$USE_RECOVERY_PAYLOAD" -eq 1 ]; then
   fi
   require_cmd tar
 
-  TTS_TARGET_ROOT="${RESTORE_STAGING_ROOT:-/}"
+  # r0041: RuntimeProvisioner.apply() (isadoraair/runtime_provisioning.py)
+  # requires root outright for a canonical "/" target root -- the same
+  # class of real E8 Stage-50 failure (canonical publication requiring a
+  # privilege this stage never actually escalated to) applies here too,
+  # found by this session's own audit before it could reach a real E8
+  # run. Unlike E4's native fdkaac (prepare unprivileged, publish
+  # privileged, ownership-verified handoff between the two), E3's TTS
+  # provisioning has no such split -- one atomic apply() -- so the fix
+  # is simply escalating that one call under sudo for a real restore,
+  # matching 75-protected-updater.sh's own established USE_SUDO idiom.
+  if [ -n "$RESTORE_STAGING_ROOT" ]; then
+    TTS_TARGET_ROOT="$RESTORE_STAGING_ROOT"
+    USE_SUDO=0
+  else
+    TTS_TARGET_ROOT="/"
+    USE_SUDO=1
+  fi
   log_info "TTS (E3) target root: $TTS_TARGET_ROOT"
 
   if [ "$RESTORE_MODE" != "apply" ]; then
     log_plan "locate + validate the runtime-recovery/ payload embedded in $RESTORE_ARCHIVE"
-    log_plan "restore_manage provision_runtime_components --recovery-payload <payload>/tts --target-root $TTS_TARGET_ROOT --apply"
+    if [ "$USE_SUDO" -eq 1 ]; then
+      log_plan "sudo restore_manage provision_runtime_components --recovery-payload <payload>/tts --target-root $TTS_TARGET_ROOT --apply"
+    else
+      log_plan "restore_manage provision_runtime_components --recovery-payload <payload>/tts --target-root $TTS_TARGET_ROOT --apply (unprivileged)"
+    fi
     log_info "70-tts: PLAN complete"
     exit 0
   fi
@@ -154,11 +174,20 @@ if [ "$USE_RECOVERY_PAYLOAD" -eq 1 ]; then
     exit 0
   fi
 
-  log_apply "restore_manage provision_runtime_components --recovery-payload $PAYLOAD_DIR --target-root $TTS_TARGET_ROOT --apply"
-  restore_manage provision_runtime_components \
+  # restore_manage_command (not the plain restore_manage wrapper) here --
+  # a real (non-staging) apply needs the whole invocation, venv python
+  # included, run under sudo; bash functions aren't visible to a separate
+  # sudo process, but a resolved argv is. Matches
+  # 75-protected-updater.sh's own established real-root publish pattern.
+  restore_manage_command provision_runtime_components \
       --recovery-payload "$PAYLOAD_DIR" \
       --target-root "$TTS_TARGET_ROOT" \
       --apply
+  if [ "$USE_SUDO" -eq 1 ]; then
+    RESTORE_MANAGE_CMD=(sudo "${RESTORE_MANAGE_CMD[@]}")
+  fi
+  log_apply "${RESTORE_MANAGE_CMD[*]}"
+  "${RESTORE_MANAGE_CMD[@]}"
 
   mapfile -t RECOVERED_TTS_COMPONENTS < <(
     python3 -c 'import json,sys; print("\n".join(json.loads(sys.argv[1]).get("tts_components", [])))' "$RECOVERY_EVIDENCE_JSON"

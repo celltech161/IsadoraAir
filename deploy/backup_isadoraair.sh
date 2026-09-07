@@ -537,6 +537,24 @@ else
   RECOVERY_PAYLOAD_POLICY_SATISFIED=$(recovery_json_get "$RECOVERY_PAYLOAD_STATUS_JSON" policy.satisfied)
 
   mkdir -p "$WORKDIR/runtime-recovery"
+  # r0041: this directory has no source item of its own to inherit a mode
+  # from (unlike everything copied into it below), so a bare `mkdir -p`
+  # leaves it at the umask-derived default -- 0775 under a permissive
+  # umask (e.g. 002, as an interactive shell or a differently-configured
+  # invoker might have), NOT the 0755 deploy/restore/
+  # runtime_recovery_archive.py's trusted extractor requires. That exact
+  # gap reached a real E8 run once (Stage 50 failure, r0040 acceptance):
+  # this passed inspect_backup.sh and the E8 export's own integrity
+  # checks, then failed for the first time at actual extraction. Fixed
+  # here deterministically, independent of whatever umask is in effect --
+  # never rely on ambient umask for a mode this archive's own restore
+  # contract enforces exactly. Everything copied INTO this directory by
+  # `cp -R` below already carries its own source mode (the trusted
+  # payload's own 0755 dirs / 0644 files) unaffected by umask, since cp
+  # only falls back to a umask-derived default for a destination with no
+  # corresponding source item -- this directory is the only one that ever
+  # has none.
+  chmod 0755 "$WORKDIR/runtime-recovery"
   # The backup unit runs as the application account. The trusted source
   # remains administrator-owned 0755/0644 and is readable but not
   # writable. Do not attempt to preserve root ownership in the caller's
@@ -705,6 +723,26 @@ if ! tar -tzf "$TMP_TAR" > /dev/null; then
   exit 1
 fi
 echo "  ok"
+
+# r0041: being metadata-valid (RECOVERY_PAYLOAD_INCLUDED=1's own
+# validate_runtime_recovery_payload re-check above) is not the same as
+# being extractable -- neither that check nor a plain `tar -tzf` inspects
+# individual member modes. Prove the archive is actually acceptable to
+# the exact safe extractor Stage 50/70/75 will run, on the real finished
+# archive, before it ever leaves this host -- reusing that extractor's
+# own trusted-mode authority (deploy/restore/runtime_recovery_archive.py)
+# rather than re-implementing its rules here. This is the check whose
+# absence let a mode-0775 runtime-recovery/ root (see the mkdir/chmod
+# comment above) reach a real E8 acceptance run: inspect_backup.sh and
+# this same integrity check both already passed it.
+if [ "$RECOVERY_PAYLOAD_INCLUDED" -eq 1 ]; then
+  echo "Verifying the runtime-recovery payload is extractable (real safe-extraction authority, no filesystem writes)..."
+  if ! python3 "$SCRIPT_DIR/restore/runtime_recovery_archive.py" verify-extractable --archive "$TMP_TAR" >/dev/null; then
+    echo "Error: the runtime-recovery payload embedded in the freshly-built archive is not acceptable to the trusted safe extractor Stage 50/70/75 will use -- aborting before upload rather than producing a backup that claims self_contained_v3 but cannot actually be extracted." >&2
+    exit 1
+  fi
+  echo "  ok"
+fi
 echo
 
 if [ "$DRY_RUN" = "1" ]; then

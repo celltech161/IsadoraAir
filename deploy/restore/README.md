@@ -112,7 +112,12 @@ deploy/restore/
   30-postgresql.sh        PG bootstrap + pg_restore.
   40-station-content.sh   /srv/isadoraair reconstruction (carts/voicetracks/waveforms/etc).
   50-native-deps.sh       Backup-based DR: delegates to Foundation E4's real prepare/
-                          publish authority using the embedded recovery payload.
+                          publish authority using the embedded recovery payload --
+                          prepare always unprivileged, publish onto a real (non-
+                          staging) target only under sudo, passing the UID that
+                          actually ran prepare (captured via `id -u`, never an
+                          operator-supplied value -- r0041; matches
+                          75-protected-updater.sh's own USE_SUDO idiom).
                           Explicit connected install: unchanged HE-AAC exact-archive
                           build (builder performs shared validation). Runs AFTER
                           60-python.sh despite the numbering -- see the dependency
@@ -120,9 +125,12 @@ deploy/restore/
   60-python.sh            IsadoraAir venv creation + requirements.txt + safe checks.
   70-tts.sh               Backup-based DR: delegates to Foundation E3's real
                           provisioning authority using the embedded recovery
-                          payload. Explicit connected install (--legacy-connected-
-                          install): unchanged Kokoro + Piper venv/pip provisioning
-                          + smoke test.
+                          payload -- its one --apply call runs under sudo for a
+                          real (non-staging) target (r0041; E3's own
+                          RuntimeProvisioner requires root there, same USE_SUDO
+                          idiom as above). Explicit connected install
+                          (--legacy-connected-install): unchanged Kokoro + Piper
+                          venv/pip provisioning + smoke test.
   75-protected-updater.sh Backup-based DR only (no connected-install path exists
                           for this component): restores the Phase-D protected
                           updater component from the embedded recovery payload

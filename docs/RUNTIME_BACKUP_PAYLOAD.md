@@ -600,9 +600,23 @@ mechanism — `--source-dir`/`--download-sources` for 50,
 3. Native fdkaac preserves the full authority chain: E4's real
    `--prepare-fdkaac` (unprivileged) then `--publish-fdkaac` (protected
    — still requires `--trusted-preparer-uid` for a real canonical `/`
-   target, exactly as before; a `--staging-root` restore never needs
-   it). TTS uses E3's single real `--apply` (no separate prepare/publish
-   phase in E3, unlike E4).
+   target, exactly as before). r0041: `50-native-deps.sh` itself now
+   determines and supplies that UID internally (whatever its own
+   process's UID was when it ran `--prepare-fdkaac`, captured via
+   `id -u` immediately afterward) and runs only the `--publish-fdkaac`
+   half under `sudo`, via `restore_manage_command` + the same
+   `USE_SUDO` idiom `75-protected-updater.sh` established —
+   `--trusted-preparer-uid` is no longer a public `50-native-deps.sh`
+   flag an operator can (or needs to) supply; a `--staging-root` restore
+   still runs entirely unprivileged and passes no UID at all (E4's own
+   `_validated_preparer_uid` treats that as "use the caller's own EUID",
+   correct there since prepare and publish are the same unprivileged
+   identity). TTS uses E3's single real `--apply` (no separate prepare/
+   publish phase in E3, unlike E4) — `RuntimeProvisioner._preflight_apply`
+   requires root for a canonical `/` target the same way E4 does, so
+   r0041 also escalates `70-tts.sh`'s one `--apply` call under `sudo`
+   for a real (non-staging) restore, the same `USE_SUDO` idiom, nothing
+   else about its invocation changed.
 4. **60-python.sh now runs before 50-native-deps.sh** in `restore.sh`'s
    order (reversing the numeric order the filenames imply) — E4
    delegation runs as a `manage.py` command and needs the restored app's

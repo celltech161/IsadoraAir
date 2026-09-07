@@ -530,6 +530,66 @@ class RuntimeRecoveryPayloadBackupTests(SimpleTestCase):
         self.assertIn("rename ${REMOTE_PARTIAL} ${REMOTE_FILE}", self.text)
         self.assertIn("RETENTION_DAYS=30", self.text)
 
+    # ---- r0041: umask-derived runtime-recovery/ root mode regression
+    # (real E8 Stage-50 failure -- see deploy/restore/runtime_recovery_archive.py's
+    # TRUSTED_DIRECTORY_MODE contract and this script's own comment on the
+    # mkdir/chmod pair below). Static, matching this whole test file's own
+    # established rationale for never executing the real backup script;
+    # RuntimeRecoveryArchiveModeContractTests in test_restore_tooling.py
+    # exercises the real archive helper against real, umask-sensitive tar
+    # output produced by this exact command sequence.
+
+    def test_runtime_recovery_root_mode_fixed_independent_of_umask(self):
+        """mkdir -p alone leaves this one directory's mode at whatever the
+        invoking umask produces (0775 under umask 002, not the required
+        0755) -- everything else under it inherits cp -R's own source
+        mode instead, unaffected by umask. The explicit chmod immediately
+        after mkdir is what must never be removed."""
+        mkdir_line = self.text.index('mkdir -p "$WORKDIR/runtime-recovery"')
+        cp_line = self.text.index('cp -R "$RECOVERY_PAYLOAD_RESOLVED_PATH/."')
+        chmod_line = self.text.index('chmod 0755 "$WORKDIR/runtime-recovery"')
+        self.assertLess(mkdir_line, chmod_line)
+        self.assertLess(chmod_line, cp_line)
+
+    def test_verify_extractable_gate_runs_before_upload_when_payload_included(self):
+        """The archive must be proven acceptable to the real safe
+        extractor (deploy/restore/runtime_recovery_archive.py
+        verify-extractable), gated on a payload actually having been
+        included, after the archive is built and before either the
+        DRY_RUN preview or the real SFTP upload -- this is the check
+        whose absence let a mode-0775 root reach a real E8 acceptance
+        run despite inspect_backup.sh: OVERALL PASS."""
+        self.assertIn("runtime_recovery_archive.py\" verify-extractable --archive \"$TMP_TAR\"", self.text)
+        self.assertIn('if [ "$RECOVERY_PAYLOAD_INCLUDED" -eq 1 ]; then', self.text)
+        build_archive = self.text.index('tar czf "$TMP_TAR" -C "$WORKDIR" .')
+        verify_gate = self.text.index("verify-extractable --archive")
+        dry_run_branch = self.text.index('if [ "$DRY_RUN" = "1" ]; then\n  echo "DRY_RUN=1: not uploading')
+        self.assertLess(build_archive, verify_gate)
+        self.assertLess(verify_gate, dry_run_branch)
+        # Aborts before upload, same convention as every other pre-upload
+        # validation failure in this script.
+        gate_start = self.text.index('Verifying the runtime-recovery payload is extractable')
+        gate_end = self.text.index("echo\n", gate_start)
+        self.assertIn("aborting before upload", self.text[gate_start:gate_end])
+
+    def test_runtime_recovery_fix_does_not_introduce_ownership_preservation(self):
+        """The fix is a single deterministic chmod of one directory's
+        permission bits -- it must not start preserving root ownership
+        (still an unprivileged backup account copy) or otherwise change
+        what test_unprivileged_backup_copy_does_not_attempt_to_preserve_root_ownership
+        already established."""
+        start = self.text.index("Validating and including the current Runtime Foundation E7")
+        end = self.text.index('echo "Encrypting recovery credentials', start)
+        payload_step = self.text[start:end]
+        self.assertNotIn("chown", payload_step)
+        self.assertNotIn("cp -Rp", payload_step)
+        self.assertNotIn("--preserve", payload_step)
+        # Exactly one directory gets an explicit chmod -- the fix must
+        # stay scoped to the one item with no source mode to inherit,
+        # never broadened into a recursive chmod over the copied payload.
+        self.assertEqual(payload_step.count("chmod"), 1)
+        self.assertNotIn("chmod -R", payload_step)
+
 
 class EncryptRecoveryCredentialsScriptTests(SimpleTestCase):
     """Real functional tests against deploy/encrypt_recovery_credentials.sh

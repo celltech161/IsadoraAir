@@ -403,16 +403,81 @@ restore_locate_recovery_payload() {
 }
 
 restore_recovery_receipt_path() {
-  if [ -n "$RESTORE_STAGING_ROOT" ]; then
+  # RESTORE_RECOVERY_RECEIPT_ROOT is a test/override seam only -- unset
+  # in every real invocation, so real behavior (real canonical path, or
+  # the real --staging-root-relative path) is completely unchanged. It
+  # exists because a canonical-mode functional test needs the NATIVE_
+  # TARGET_ROOT/TTS_TARGET_ROOT half of a stage's behavior to stay real
+  # ("/"), while never touching the real host's
+  # /var/lib/isadoraair/restore -- two independent concerns
+  # --staging-root alone cannot separate, since it redirects both.
+  if [ -n "${RESTORE_RECOVERY_RECEIPT_ROOT:-}" ]; then
+    printf '%s\n' "$RESTORE_RECOVERY_RECEIPT_ROOT/var/lib/isadoraair/restore/runtime-recovery.json"
+  elif [ -n "$RESTORE_STAGING_ROOT" ]; then
     printf '%s\n' "$RESTORE_STAGING_ROOT/var/lib/isadoraair/restore/runtime-recovery.json"
   else
     printf '%s\n' "/var/lib/isadoraair/restore/runtime-recovery.json"
   fi
 }
 
+# r0041: on a genuinely fresh machine, no earlier restore stage creates
+# /var/lib/isadoraair/restore -- an ordinary operator account cannot
+# create it beneath root-owned /var/lib (empirically confirmed: a bare
+# `mkdir /var/lib/isadoraair/restore` as the restore's own unprivileged
+# account fails with Permission denied). Stages 50/70/75 all record
+# into this same receipt after a real canonical publish already
+# escalated under sudo for their own main operation -- this establishes
+# ONLY the receipt directory's existence/ownership, narrowly and
+# idempotently, using the exact same sudo-mkdir-then-chown-the-leaf
+# idiom 40-station-content.sh's own ensure_dir() already uses for
+# /var/lib/isadoraair/reports (never broadens /var/lib/isadoraair
+# itself -- a mix of root-owned siblings, e.g. .../tts, and operator-
+# owned ones, e.g. .../reports and this directory, is the existing,
+# intentional design; every directory below /var/lib/isadoraair only
+# needs the PARENT to remain traversable, 0755, never writable, which a
+# bare `mkdir -p` already leaves it as). The receipt's own content --
+# atomic write, schema validation, archive/payload identity checks,
+# fail-closed behavior -- stays entirely inside runtime_recovery_archive.py's
+# existing record command, run completely UNPRIVILEGED once this
+# directory is owned by the caller: privilege here is scoped to
+# directory establishment only, never receipt content.
+_restore_ensure_recovery_receipt_dir() {
+  local receipt_dir parent
+  receipt_dir="$(dirname "$(restore_recovery_receipt_path)")"
+  parent="$(dirname "$receipt_dir")"
+  # Checked unconditionally, in every mode -- not just the real
+  # canonical path -- so a staging/override tree gets the exact same
+  # confinement guarantee, never a second, weaker convention.
+  if [ -L "$receipt_dir" ]; then
+    log_error "refusing: $receipt_dir is a symlink, not a real directory -- will not create or chown through it."
+    exit 1
+  fi
+  if [ -L "$parent" ]; then
+    log_error "refusing: $parent is a symlink, not a real directory -- will not create or chown through it."
+    exit 1
+  fi
+  if [ -n "$RESTORE_STAGING_ROOT" ] || [ -n "${RESTORE_RECOVERY_RECEIPT_ROOT:-}" ]; then
+    mkdir -p "$receipt_dir"
+    chmod 0755 "$receipt_dir"
+    return 0
+  fi
+  sudo mkdir -p "$receipt_dir"
+  if [ -L "$receipt_dir" ]; then
+    log_error "refusing: $receipt_dir became a symlink during establishment -- aborting."
+    exit 1
+  fi
+  # Deterministic regardless of root's own umask -- the same class of
+  # bug as the backup producer's runtime-recovery/ root (see
+  # backup_isadoraair.sh's own comment): `mkdir -p` alone leaves this at
+  # whatever mode 0777-minus-umask happens to produce, not a fixed 0755.
+  sudo chmod 0755 "$receipt_dir"
+  sudo chown "$(id -u):$(id -g)" "$receipt_dir"
+}
+
 restore_record_recovery_components() {
   local receipt
   receipt=$(restore_recovery_receipt_path)
+  _restore_ensure_recovery_receipt_dir
   local helper="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/runtime_recovery_archive.py"
   local args=()
   local component
@@ -476,8 +541,14 @@ restore_accept_recovery_receipt() {
 # with the fully-resolved argv (never executes it) -- use this directly,
 # instead of restore_manage below, when the caller needs to run the
 # result under sudo (bash functions aren't visible to a separate sudo
-# process; a real argv is) -- see 75-protected-updater.sh's real
-# (non-staging) publish path for the one caller that needs this.
+# process; a real argv is) -- see 75-protected-updater.sh's and (r0041)
+# 50-native-deps.sh's and 70-tts.sh's own real (non-staging) canonical
+# publish steps, the three callers that need this. All three share the
+# same USE_SUDO idiom: unprivileged for everything else (50-native-
+# deps.sh's own prepare phase deliberately stays on the plain,
+# never-sudo restore_manage wrapper below -- see that script's own
+# comment on the E4 prepare/publish trust handoff) except that one
+# final privileged invocation.
 restore_manage_command() {
   local venv_python="$RESTORE_TARGET_ROOT/venv/bin/python"
   if [ ! -x "$venv_python" ]; then
@@ -498,8 +569,9 @@ restore_manage_command() {
 }
 
 # restore_manage CMD [ARGS...] -- resolves + immediately runs. The
-# ordinary case every caller except 75-protected-updater.sh's real-root
-# publish step (sudo) wants.
+# ordinary case every caller except 75-protected-updater.sh's,
+# 50-native-deps.sh's, and 70-tts.sh's own real-root publish steps
+# (sudo) wants.
 restore_manage() {
   local RESTORE_MANAGE_CMD=()
   restore_manage_command "$@"

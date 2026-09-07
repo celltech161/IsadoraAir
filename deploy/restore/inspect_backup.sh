@@ -254,6 +254,37 @@ case "$NOTE_RECOVERY_CRED_STATUS" in
     ;;
 esac
 
+# ---- 10. Runtime-recovery payload extractability (r0041) -------------
+# Everything above -- MANIFEST.txt content, `tar -tzf`, the credential
+# checks -- is metadata-valid-or-not. None of it inspects individual
+# archive member modes, so a self_contained_v3 archive whose synthetic
+# runtime-recovery/ root got tarred at the wrong mode (0775 from an
+# uncontrolled umask instead of the required 0755) used to pass this
+# entire script's OVERALL PASS, then fail for the first time at real
+# Stage 50/70/75 extraction -- exactly what a real E8 acceptance run
+# hit. Reuses runtime_recovery_archive.py's own trusted-mode authority
+# (verify-extractable: read-only, no filesystem writes, same rules
+# extract_payload enforces) rather than re-implementing the rules here.
+# Still read-only, matching this whole script's own contract.
+if command -v python3 >/dev/null 2>&1; then
+  RUNTIME_RECOVERY_VERIFY_OUTPUT=""
+  RUNTIME_RECOVERY_VERIFY_EXIT=0
+  RUNTIME_RECOVERY_VERIFY_OUTPUT=$(python3 "$SCRIPT_DIR/runtime_recovery_archive.py" verify-extractable --archive "$ARCHIVE" 2>&1) || RUNTIME_RECOVERY_VERIFY_EXIT=$?
+  case "$RUNTIME_RECOVERY_VERIFY_EXIT" in
+    0)
+      pass "Runtime recovery extractability" "self_contained_v3 payload verified extractable (trusted mode contract satisfied)"
+      ;;
+    2|3)
+      warn "Runtime recovery extractability" "no self-contained runtime-recovery payload in this archive -- not applicable"
+      ;;
+    *)
+      fail "Runtime recovery extractability" "$RUNTIME_RECOVERY_VERIFY_OUTPUT"
+      ;;
+  esac
+else
+  warn "Runtime recovery extractability" "python3 not available -- could not run the safe-extraction authority"
+fi
+
 echo
 if [ -n "$NOTE_GIT_SHA" ]; then
   echo "Git SHA:              $NOTE_GIT_SHA"
