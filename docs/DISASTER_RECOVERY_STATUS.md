@@ -20,7 +20,7 @@ against.
 
 | Field | Value |
 |---|---|
-| Current production release | r0043, commit `<filled in at release time -- see bottom of this file>` |
+| Current production release | r0043, commit `814791ae1f41fc9771d7d4cbebafdd2ad3e41d14` |
 | Previous production release | r0042, commit `1f3cd2a524be94bd1f2c4657a5a2b91bc1e684f0` |
 | Current E8 acceptance candidate | r0043 |
 | Last authoritative E8 result | r0042 -- **FAIL at Stage 80** (see incident record below) |
