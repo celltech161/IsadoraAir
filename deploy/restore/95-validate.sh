@@ -215,6 +215,9 @@ log_info "--- Static/media readiness (informational only -- not run) ---"
 log_info "collectstatic has not been run by this stage -- it's safe/additive but left as an explicit Phase 5 operator step, same as service bring-up. STATIC_ROOT/MEDIA_ROOT ownership should match \$ISA_USER before gunicorn starts."
 
 if [ "$OVERALL_OK" -eq 1 ]; then
+  if [ "$RESTORE_MODE" = "apply" ]; then
+    restore_ledger_record "95-validate"
+  fi
   log_info "95-validate: PASS"
 else
   log_error "95-validate: one or more checks failed -- see above. Do not proceed to service bring-up (Phase 5) until resolved."

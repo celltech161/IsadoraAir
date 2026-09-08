@@ -76,6 +76,7 @@ RESTORE_TARGET_ROOT=""
 RESTORE_FORCE_PRODUCTION_TARGET=0
 RESTORE_FORCE_DB=0
 RESTORE_FORCE_ENV=0
+RESTORE_RESUME=0
 RESTORE_DB_NAME=""
 RESTORE_ARCHIVE=""
 RESTORE_REMAINING_ARGS=()
@@ -101,6 +102,7 @@ restore_parse_common_args() {
       --force-production-target) RESTORE_FORCE_PRODUCTION_TARGET=1; shift ;;
       --force-db) RESTORE_FORCE_DB=1; shift ;;
       --force-env) RESTORE_FORCE_ENV=1; shift ;;
+      --resume) RESTORE_RESUME=1; shift ;;
       --) shift; while [ $# -gt 0 ]; do RESTORE_REMAINING_ARGS+=("$1"); shift; done ;;
       *) RESTORE_REMAINING_ARGS+=("$1"); shift ;;
     esac
@@ -133,7 +135,51 @@ restore_parse_common_args() {
   # .env already carries for a real restore of this station.
   export DB_NAME="$RESTORE_DB_NAME"
 
-  log_info "mode=${RESTORE_MODE} target_root=${RESTORE_TARGET_ROOT} db_name=${RESTORE_DB_NAME}${RESTORE_STAGING_ROOT:+ staging_root=$RESTORE_STAGING_ROOT}"
+  local resume_suffix=""
+  [ "$RESTORE_RESUME" -eq 1 ] && resume_suffix=" resume=1"
+  log_info "mode=${RESTORE_MODE} target_root=${RESTORE_TARGET_ROOT} db_name=${RESTORE_DB_NAME}${RESTORE_STAGING_ROOT:+ staging_root=$RESTORE_STAGING_ROOT}${resume_suffix}"
+}
+
+# ---------------------------------------------------------------------
+# restore_default_companions_root -- the SAME default 80-companions.sh
+# itself resolves COMPANIONS_ROOT from (${RESTORE_STAGING_ROOT:-$HOME}),
+# pulled out here as the single shared source of truth. r0043: this is
+# also exactly the root the "known legacy WEATHER_DATA_DIR" recognition
+# check (40-station-content.sh) and the provenance-checked scaffold
+# repair (80-companions.sh) both need -- a companion project's own
+# SOURCE CHECKOUT namespace is always "<this root>/<repo-name>",
+# regardless of an operator's later --companions-root override at
+# Stage 80 (a legacy .env value predates, and is independent of, any
+# such override choice made now).
+# ---------------------------------------------------------------------
+restore_default_companions_root() {
+  printf '%s\n' "${RESTORE_STAGING_ROOT:-$HOME}"
+}
+
+# _restore_is_known_empty_scaffold DIR -- true (exit 0) only if DIR
+# exists, is a real (non-symlink) directory, contains no .git anywhere,
+# and its ENTIRE recursive content is real directories only -- zero
+# regular files, zero symlinks anywhere in the tree. r0043: this is the
+# exact, narrow signature the legacy-WEATHER_DATA_DIR defect leaves
+# behind -- weather/services.py's own module-level `DATA_DIR.mkdir(
+# parents=True, exist_ok=True)` creates ONLY the empty directory tree,
+# never a single file; an application that had actually received real
+# weather data, or any other real content, would have written at least
+# one regular file somewhere in that tree. Used by 80-companions.sh's
+# own narrowly-scoped, ledger-provenance-gated repair -- never a
+# general "trust any empty directory" primitive on its own.
+_restore_is_known_empty_scaffold() {
+  local dir="$1"
+  if [ -L "$dir" ] || [ ! -d "$dir" ]; then
+    return 1
+  fi
+  if [ -e "$dir/.git" ]; then
+    return 1
+  fi
+  if find "$dir" \( -type f -o -type l \) -print -quit 2>/dev/null | grep -q .; then
+    return 1
+  fi
+  return 0
 }
 
 # ---------------------------------------------------------------------
@@ -472,6 +518,75 @@ _restore_ensure_recovery_receipt_dir() {
   # whatever mode 0777-minus-umask happens to produce, not a fixed 0755.
   sudo chmod 0755 "$receipt_dir"
   sudo chown "$(id -u):$(id -g)" "$receipt_dir"
+}
+
+# ---------------------------------------------------------------------
+# Restore-session ledger (Runtime Foundation, r0043) -- see
+# restore_ledger.py's own module docstring for the full identity/
+# fail-closed contract. Lives in the SAME /var/lib/isadoraair/restore/
+# directory as the recovery receipt above, established the same
+# narrow, sudo-then-chown-to-caller way -- never a second, broader
+# writable surface.
+#
+# restore_ledger_path -- same staging/override-root resolution as
+# restore_recovery_receipt_path (including the SAME
+# RESTORE_RECOVERY_RECEIPT_ROOT test/override seam -- there is
+# deliberately no second override variable for the ledger; it is the
+# same directory, so the same seam already relocates it correctly).
+restore_ledger_path() {
+  if [ -n "${RESTORE_RECOVERY_RECEIPT_ROOT:-}" ]; then
+    printf '%s\n' "$RESTORE_RECOVERY_RECEIPT_ROOT/var/lib/isadoraair/restore/ledger.json"
+  elif [ -n "$RESTORE_STAGING_ROOT" ]; then
+    printf '%s\n' "$RESTORE_STAGING_ROOT/var/lib/isadoraair/restore/ledger.json"
+  else
+    printf '%s\n' "/var/lib/isadoraair/restore/ledger.json"
+  fi
+}
+
+# restore_ledger_record STAGE [--git-sha SHA] [--payload-id ID]
+#   [--product-contract-sha256 SHA] [--detail JSON]
+#
+# Records STAGE as durably complete for the CURRENT --archive/
+# --target-root. A no-op (returns 0, writes nothing) when the calling
+# stage doesn't take --archive at all (60-python.sh, 90-system-
+# config.sh, 95-validate.sh currently don't) -- those stages' own
+# completion is not meaningfully bindable to an archive identity they
+# never receive, and every OTHER stage that DOES take --archive already
+# establishes/verifies that same identity before they would ever run.
+#
+# Called as a bare command (never inside a `$(...)` substitution) so
+# `set -e` aborts the calling stage script immediately, with
+# restore_ledger.py's own clear stderr message, on any identity
+# mismatch or ledger corruption -- exactly the "wrong restore-session/
+# archive identity" and "corrupted/incomplete ledger" hard-failure
+# cases the r0043 safety boundary requires.
+restore_ledger_record() {
+  local stage="$1"; shift
+  if [ -z "$RESTORE_ARCHIVE" ] || [ ! -f "$RESTORE_ARCHIVE" ]; then
+    return 0
+  fi
+  _restore_ensure_recovery_receipt_dir
+  local ledger; ledger="$(restore_ledger_path)"
+  local helper="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/restore_ledger.py"
+  python3 "$helper" record --ledger "$ledger" --archive "$RESTORE_ARCHIVE" --target-root "$RESTORE_TARGET_ROOT" --stage "$stage" "$@"
+}
+
+# restore_ledger_stage_state STAGE -- prints "complete" or "absent" to
+# stdout, exit 0. Exits nonzero (restore_ledger.py's own clear stderr
+# message) if an existing ledger belongs to a different archive/target
+# -- callers MUST NOT swallow that exit status (assign via a bare
+# `VAR=$(...) || exit 1` / explicit `if` check, never `local
+# VAR=$(...)`, whose own exit status is the `local` builtin's, not the
+# substituted command's -- see each caller for the exact idiom used).
+restore_ledger_stage_state() {
+  local stage="$1"
+  if [ -z "$RESTORE_ARCHIVE" ] || [ ! -f "$RESTORE_ARCHIVE" ]; then
+    printf 'absent\n'
+    return 0
+  fi
+  local ledger; ledger="$(restore_ledger_path)"
+  local helper="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/restore_ledger.py"
+  python3 "$helper" stage-state --ledger "$ledger" --archive "$RESTORE_ARCHIVE" --target-root "$RESTORE_TARGET_ROOT" --stage "$stage"
 }
 
 restore_record_recovery_components() {

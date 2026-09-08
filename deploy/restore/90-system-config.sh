@@ -508,4 +508,7 @@ if [ "$RESTORE_MODE" = "apply" ]; then
   fi
 fi
 
+if [ "$RESTORE_MODE" = "apply" ]; then
+  restore_ledger_record "90-system-config"
+fi
 log_info "90-system-config: $( [ "$RESTORE_MODE" = apply ] && echo "PASS (installation + validation complete, nothing started -- see deploy/restore/README.md's service bring-up order for what comes next)" || echo "PLAN complete" )"

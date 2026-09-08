@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "release_id": "r0043",
+  "previous_release_id": "r0042",
+  "minimum_updater_protocol_version": 5,
+  "summary": "Fixes Stage 80 weather-ingest collision: a legacy WEATHER_DATA_DIR inside the companion checkout let Stage 60 Django-import manufacture it before Stage 80 ran -- Stage 40 now normalizes it. Adds a restore-session ledger (restore_ledger.py) and --resume: Stage 20/30 verify-and-skip already-completed work instead of hard-failing, and Stage 80 can provenance-checked-repair the known scaffold. No migration/dependency/service changes.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0007"
+}

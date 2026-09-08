@@ -93,10 +93,63 @@ for repo in "${REPOS[@]}"; do
       fi
     fi
   elif [ -e "$TARGET" ] && [ -n "$(ls -A "$TARGET" 2>/dev/null)" ]; then
-    log_error "$TARGET exists, is non-empty, and is not a Git checkout. Refusing to clone into it."
-    STATUS[$repo]="ERROR"
-    ANY_FAILED=1
-    continue
+    # r0043: a confirmed real E8 defect left a non-empty, non-Git
+    # $HOME/weather-ingest behind -- a LEGACY WEATHER_DATA_DIR restored
+    # verbatim into .env pointed INSIDE this exact companion checkout
+    # namespace, and Stage 60's first Django import (weather/services.py's
+    # own module-level DATA_DIR.mkdir(parents=True, exist_ok=True))
+    # manufactured the empty directory tree before this stage ever ran.
+    # 40-station-content.sh now normalizes that root cause for every
+    # FRESH restore (see that stage's own section 5) -- this handles the
+    # machine that already has the pre-r0043 damage sitting on disk.
+    #
+    # Repaired ONLY when ALL of the following hold -- never a general
+    # "trust any empty directory" mechanism, and never for any repo
+    # other than weather-ingest (the one, specific, currently-known
+    # defect this addresses):
+    #   1. --resume was explicitly given.
+    #   2. This is exactly weather-ingest, at exactly its default
+    #      companions-root location (restore_default_companions_root)
+    #      -- the SAME known legacy namespace 40-station-content.sh's
+    #      own normalization check uses, never wherever --companions-
+    #      root/--repo-url-prefix might point THIS invocation.
+    #   3. The directory's entire recursive content is REAL directories
+    #      only -- zero regular files, zero symlinks anywhere in the
+    #      tree, no .git -- the exact, narrow signature Stage 60's own
+    #      mkdir -p (and nothing else) can produce; a single real file
+    #      anywhere disqualifies it immediately.
+    #   4. Durable ledger evidence proves 40-station-content.sh's own
+    #      normalization already ran, for THIS EXACT archive identity,
+    #      against THIS EXACT target root -- i.e. this restore session
+    #      (not a guess, not merely "some ledger exists somewhere")
+    #      already fixed the root cause. restore_ledger_stage_state's
+    #      own identity check separately fails closed (hard error) on
+    #      a ledger recorded against a different archive/target.
+    # Any other pre-existing content -- real files, a different repo,
+    # no matching ledger provenance, or --resume not given -- falls
+    # straight through to the unchanged, strict failure below.
+    WEATHER_SCAFFOLD_REPAIRED=0
+    if [ "$RESTORE_RESUME" -eq 1 ] && [ "$repo" = "weather-ingest" ] \
+        && [ "$TARGET" = "$(restore_default_companions_root)/weather-ingest" ] \
+        && _restore_is_known_empty_scaffold "$TARGET"; then
+      NORMALIZATION_STAGE_STATE=$(restore_ledger_stage_state "40-station-content") || exit 1
+      if [ "$NORMALIZATION_STAGE_STATE" = "complete" ]; then
+        log_warn "$TARGET matches the known r0043 legacy-WEATHER_DATA_DIR scaffold signature (empty directory tree, no .git, no regular files anywhere) -- durable ledger evidence proves 40-station-content.sh's WEATHER_DATA_DIR normalization already ran for this exact archive/target, so this is provably restore-tooling-manufactured scaffold, not real operator content. Repairing (removing) it before cloning -- see docs/DISASTER_RECOVERY_STATUS.md."
+        do_or_plan rm -rf "$TARGET"
+        WEATHER_SCAFFOLD_REPAIRED=1
+      else
+        log_warn "$TARGET looks like the known r0043 legacy scaffold signature, but the ledger does not (yet) record 40-station-content.sh complete for this exact archive/target -- NOT repairing; falling through to the strict collision failure below."
+      fi
+    fi
+    if [ "$WEATHER_SCAFFOLD_REPAIRED" -eq 1 ]; then
+      do_or_plan mkdir -p "$COMPANIONS_ROOT"
+      do_or_plan git clone "$URL" "$TARGET"
+    else
+      log_error "$TARGET exists, is non-empty, and is not a Git checkout. Refusing to clone into it."
+      STATUS[$repo]="ERROR"
+      ANY_FAILED=1
+      continue
+    fi
   else
     do_or_plan mkdir -p "$COMPANIONS_ROOT"
     do_or_plan git clone "$URL" "$TARGET"
@@ -139,6 +192,7 @@ if [ "$RESTORE_MODE" = "apply" ]; then
     log_error "80-companions: FAIL -- one or more requested companion repositories could not be provisioned (see summary above). Manual credential provisioning remaining outstanding is expected and does not count against this; a repo actually marked ERROR above does."
     exit 1
   fi
+  restore_ledger_record "80-companions"
   log_info "80-companions: PASS (see summary above)"
 else
   log_info "80-companions: PLAN complete"

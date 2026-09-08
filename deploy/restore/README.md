@@ -48,6 +48,7 @@ Every stage script (`NN-*.sh`) and `inspect_backup.sh` sources
 | `--force-db` | Required before `30-postgresql.sh` will `pg_restore` over a database that already has tables in it. |
 | `--force-env` | Required before `20-application.sh` will overwrite an existing non-empty `.env` at the target. |
 | `--owner USER:GROUP` | `20-application.sh`/`40-station-content.sh` only: the operator/service identity a freshly-established real target directory is given (`sudo chown`). Defaults to the caller's own identity. Never used, and sudo never invoked, under `--staging-root`. |
+| `--resume` | r0043: binds this run to a small durable ledger keyed on this exact `--archive`'s SHA256 + target root; stages already durably complete against that identity verify and converge instead of re-doing destructive work, and 80-companions.sh can narrowly repair the known legacy-`WEATHER_DATA_DIR` scaffold defect. See `docs/DISASTER_RECOVERY_STATUS.md`'s "Resumable restore mechanism" section for the full contract. Without it, every stage behaves exactly as before r0043. |
 
 `--staging-root ... --apply` and bare `--plan` are the two modes Phase 4
 itself used. Bare `--apply` with no `--staging-root` is what Phase 5's

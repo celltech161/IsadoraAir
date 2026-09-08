@@ -170,6 +170,7 @@ if [ "$USE_RECOVERY_PAYLOAD" -eq 1 ]; then
 
   if [ ! -d "$PAYLOAD_DIR/tts" ]; then
     log_warn "Recovery payload has no tts/ component -- not self-contained for TTS disaster recovery (this station's operator-established recovery policy did not include TTS in the prepared payload, or only native fdkaac was included). See docs/RUNTIME_BACKUP_PAYLOAD.md."
+    restore_ledger_record "70-tts"
     log_info "70-tts: PASS (no TTS recovered -- see warning above)"
     exit 0
   fi
@@ -198,6 +199,7 @@ if [ "$USE_RECOVERY_PAYLOAD" -eq 1 ]; then
   fi
   restore_record_recovery_components "${RECOVERED_TTS_COMPONENTS[@]}" >/dev/null
 
+  restore_ledger_record "70-tts"
   log_info "70-tts: PASS (TTS recovered from the Runtime Foundation E7 payload via Foundation E3's real provisioning authority)"
   exit 0
 fi
@@ -360,5 +362,8 @@ fi
 if [ "$RESTORE_MODE" = "apply" ]; then
   log_info "TTS provisioning summary: Kokoro=$KOKORO_STATE Piper=$PIPER_STATE"
   log_info "(AVAILABLE = runtime + models + smoke test all passed; CONFIGURED = runtime+models present but smoke test didn't confirm; MISSING = not usable yet, see warnings above)"
+fi
+if [ "$RESTORE_MODE" = "apply" ]; then
+  restore_ledger_record "70-tts"
 fi
 log_info "70-tts: $( [ "$RESTORE_MODE" = apply ] && echo "PASS (see summary above -- MISSING states are informational, not fatal to this stage)" || echo "PLAN complete" )"

@@ -77,6 +77,47 @@ fi
 log_info "Backup recorded Git SHA: $GIT_SHA"
 log_warn "MANIFEST.txt does not currently record whether the source tree was clean (uncommitted changes) at backup time -- a known, documented limitation (see docs/DISASTER_RECOVERY_RESTORE.md). This restore checks out exactly $GIT_SHA; any uncommitted changes present when the backup was taken are NOT recoverable from this archive."
 
+# ---- Resume: verify already-durably-completed work rather than
+#      re-cloning/re-extracting -- r0043. The ledger's own identity
+#      check (archive_sha256 + target_root) already fails closed on a
+#      mismatched archive/session (restore_ledger_stage_state below
+#      propagates that as a hard error); a "complete" state additionally
+#      requires INDEPENDENT verification here (checked-out HEAD actually
+#      matches this archive's own recorded Git SHA, .env actually
+#      present) before ever treating a pre-existing target as already
+#      correctly restored -- ledger and filesystem disagreeing is a
+#      genuine ambiguity, reported precisely, never silently resolved
+#      either way. A ledger that does NOT yet record this stage complete
+#      falls through to today's exact behavior unchanged (an existing
+#      non-empty .env still requires --force-env, exactly as before --
+#      unknown/non-restore-owned content stays fail-closed).
+if [ "$RESTORE_RESUME" -eq 1 ] && [ "$RESTORE_MODE" = "apply" ]; then
+  STAGE_STATE=$(restore_ledger_stage_state "20-application") || exit 1
+  if [ "$STAGE_STATE" = "complete" ]; then
+    log_info "20-application: --resume -- ledger records this stage already complete for this exact archive/target root; verifying durable output rather than re-cloning/re-extracting."
+    RESUME_VERIFY_OK=1
+    CURRENT_HEAD=""
+    if [ ! -d "$RESTORE_TARGET_ROOT/.git" ]; then
+      log_error "20-application: resume verification FAILED -- $RESTORE_TARGET_ROOT/.git is missing, but the ledger records this stage already complete. Ledger and filesystem disagree -- refusing to guess which is authoritative; investigate manually (or remove the stale ledger entry at $(restore_ledger_path)) before retrying."
+      RESUME_VERIFY_OK=0
+    elif ! CURRENT_HEAD=$(git -C "$RESTORE_TARGET_ROOT" rev-parse HEAD 2>/dev/null) || [ "$CURRENT_HEAD" != "$GIT_SHA" ]; then
+      log_error "20-application: resume verification FAILED -- $RESTORE_TARGET_ROOT's checked-out HEAD (${CURRENT_HEAD:-<unreadable>}) does not match this archive's own recorded Git SHA ($GIT_SHA). Refusing to guess which is authoritative; investigate manually before retrying."
+      RESUME_VERIFY_OK=0
+    elif [ ! -s "$RESTORE_TARGET_ROOT/.env" ]; then
+      log_error "20-application: resume verification FAILED -- $RESTORE_TARGET_ROOT/.env is missing or empty, but the ledger records this stage already complete."
+      RESUME_VERIFY_OK=0
+    fi
+    if [ "$RESUME_VERIFY_OK" -ne 1 ]; then
+      exit 1
+    fi
+    log_info "20-application: resume verification PASS -- Git checkout at $GIT_SHA, .env present. Not re-cloning, not re-extracting .env/media."
+    restore_ledger_record "20-application" --git-sha "$GIT_SHA"
+    log_info "20-application: PASS (resumed/verified)"
+    exit 0
+  fi
+  log_info "20-application: --resume given, but the ledger does not yet record this stage complete for this archive/target -- proceeding with the normal restore below."
+fi
+
 # ---- Clone or verify existing checkout -----------------------------------
 #
 # Runtime Foundation E7E (2026-09-05) -- the real E8 clean-machine
@@ -195,4 +236,7 @@ else
 fi
 
 log_info "Nothing else was extracted from app.tar.gz -- code comes from the Git checkout above, not the tarball. See deploy/restore/README.md."
+if [ "$RESTORE_MODE" = "apply" ]; then
+  restore_ledger_record "20-application" --git-sha "$GIT_SHA"
+fi
 log_info "20-application: $( [ "$RESTORE_MODE" = apply ] && echo PASS || echo "PLAN complete" )"

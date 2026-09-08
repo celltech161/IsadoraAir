@@ -178,6 +178,7 @@ if [ "$USE_RECOVERY_PAYLOAD" -eq 1 ]; then
   RECOVERY_EVIDENCE_JSON=$(restore_manage validate_runtime_recovery_payload "$PAYLOAD_DIR" --json)
   NATIVE_STATE=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["components"]["native_fdkaac"]["state"])' "$RECOVERY_EVIDENCE_JSON")
   if [ "$NATIVE_STATE" != "present" ]; then
+    restore_ledger_record "50-native-deps"
     log_info "50-native-deps: no native_fdkaac component is included; no native recovery action is required by this archive"
     exit 0
   fi
@@ -218,6 +219,7 @@ if [ "$USE_RECOVERY_PAYLOAD" -eq 1 ]; then
 
   restore_record_recovery_components native_fdkaac >/dev/null
 
+  restore_ledger_record "50-native-deps"
   log_info "50-native-deps: PASS (native fdkaac recovered from the Runtime Foundation E7 payload via Foundation E4's real prepare/publish authority)"
   exit 0
 fi
@@ -277,6 +279,7 @@ fi
 if [ "$RESTORE_MODE" = "apply" ]; then
   log_apply "$BUILD_SCRIPT ${BUILD_ARGS[*]}"
   "$BUILD_SCRIPT" "${BUILD_ARGS[@]}"
+  restore_ledger_record "50-native-deps"
   log_info "50-native-deps: PASS (built + linkage/capability verified at $PREFIX)"
 else
   log_plan "$BUILD_SCRIPT ${BUILD_ARGS[*]}"

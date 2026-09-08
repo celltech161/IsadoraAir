@@ -3093,6 +3093,15 @@ class RuntimeFoundationE7ETargetOwnershipFunctionalTests(SimpleTestCase):
         sudo_shim.chmod(0o755)
         self.shim_env = os.environ.copy()
         self.shim_env["PATH"] = f"{shim_dir}:{self.shim_env['PATH']}"
+        # r0043: 20-application.sh now unconditionally records its own
+        # completion into the restore ledger (lib.sh's
+        # restore_ledger_record) -- this uses --target-root (real,
+        # non-staging shape), so restore_ledger_path would otherwise
+        # resolve to the REAL host's /var/lib/isadoraair/restore/
+        # ledger.json. Same test/override seam
+        # RecoveryReceiptDirectoryEstablishmentTests already established
+        # for the identical class of problem.
+        self.shim_env["RESTORE_RECOVERY_RECEIPT_ROOT"] = str(self.tmpdir / "fake-var-lib-isadoraair-root")
         # No shim at all -- used to prove --plan never even looks for sudo.
         self.plain_env = os.environ.copy()
 

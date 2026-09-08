@@ -83,4 +83,7 @@ log_info "  archive:     $RESTORE_ARCHIVE"
 if [ -n "$RESTORE_STAGING_ROOT" ]; then
   log_info "  staging_root: $RESTORE_STAGING_ROOT (isolated -- production is not touched)"
 fi
+if [ "$RESTORE_MODE" = "apply" ]; then
+  restore_ledger_record "00-preflight"
+fi
 log_info "00-preflight: PASS"

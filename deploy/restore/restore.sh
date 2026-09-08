@@ -15,8 +15,25 @@
 # Usage:
 #   deploy/restore/restore.sh --archive PATH [--plan|--apply]
 #     [--staging-root PATH] [--force-production-target] [--force-db] [--force-env]
-#     [--isa-user USER] [--isa-uid UID --isa-gid GID]
+#     [--resume] [--isa-user USER] [--isa-uid UID --isa-gid GID]
 #     [-- <stage-specific args, passed to every stage that accepts them>]
+#
+# --resume (r0043): binds this run to a small durable ledger
+# (/var/lib/isadoraair/restore/ledger.json -- see lib.sh's
+# restore_ledger_* functions and restore_ledger.py) keyed on this exact
+# --archive's SHA256 + the resolved target root. Stages that already
+# durably completed against that exact identity verify their own output
+# and converge (no-op) instead of re-doing expensive/destructive work
+# (20-application.sh does not re-clone/re-extract .env;
+# 30-postgresql.sh does not re-run pg_restore); a genuine ambiguity
+# (ledger says done, filesystem/database disagrees) fails with a
+# precise diagnostic, never silently either way. 80-companions.sh can
+# also, ONLY with --resume and matching ledger provenance, repair the
+# EXACT known legacy-WEATHER_DATA_DIR scaffold a pre-r0043 run could
+# leave behind -- see docs/DISASTER_RECOVERY_STATUS.md's incident
+# record. A different --archive against the same target root, or a
+# corrupt/incomplete ledger, always fails closed. Without --resume,
+# every stage behaves exactly as before r0043.
 #
 # --isa-user/--isa-uid/--isa-gid are the one exception to "every stage
 # gets the same args": they are routed ONLY to 90-system-config.sh and

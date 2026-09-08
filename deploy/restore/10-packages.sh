@@ -469,4 +469,7 @@ if [ "$LOCAL_SNAP_MODE" -eq 1 ]; then
   rm -rf "$CHROMIUM_DL_DIR" 2>/dev/null || true
 fi
 
+if [ "$RESTORE_MODE" = "apply" ]; then
+  restore_ledger_record "10-packages"
+fi
 log_info "10-packages: PASS"

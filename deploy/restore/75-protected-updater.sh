@@ -126,6 +126,7 @@ FAKE_ROOT="$WORKDIR/fake-root"
 
 restore_locate_recovery_payload "$PAYLOAD_DIR"
 if [ "$RESTORE_RECOVERY_PAYLOAD_FOUND" -ne 1 ]; then
+  restore_ledger_record "75-protected-updater"
   log_info "75-protected-updater: legacy/non-self-contained archive -- no runtime-recovery payload embedded, nothing to restore. PASS"
   exit 0
 fi
@@ -134,6 +135,7 @@ log_apply "restore_manage validate_runtime_recovery_payload $PAYLOAD_DIR --json"
 RECOVERY_EVIDENCE_JSON=$(restore_manage validate_runtime_recovery_payload "$PAYLOAD_DIR" --json)
 PROTECTED_UPDATER_STATE=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["components"]["protected_updater"]["state"])' "$RECOVERY_EVIDENCE_JSON")
 if [ "$PROTECTED_UPDATER_STATE" != "present" ]; then
+  restore_ledger_record "75-protected-updater"
   log_info "75-protected-updater: no protected_updater component in this archive (state=$PROTECTED_UPDATER_STATE) -- this station's recovery policy did not include it, or this is a pre-Phase-D archive. Nothing to restore. PASS"
   exit 0
 fi
@@ -151,6 +153,7 @@ log_apply "${RESTORE_MANAGE_CMD[*]}"
 "${RESTORE_MANAGE_CMD[@]}"
 
 restore_record_recovery_components protected_updater >/dev/null
+restore_ledger_record "75-protected-updater"
 
 log_info "75-protected-updater: PASS (protected_updater recovered from the Runtime Foundation E7 payload and published to $PUBLISH_ROOT; activation remains a separate, privileged, deliberate step -- see docs/RUNTIME_BACKUP_PAYLOAD.md)"
 exit 0

@@ -82,6 +82,7 @@ print('Gst version:', '.'.join(str(x) for x in Gst.version()))
   else
     log_warn "No .env at $ENV_FILE -- skipping manage.py check (run 20-application.sh first for a full verification)."
   fi
+  restore_ledger_record "60-python"
   log_info "60-python: PASS"
 else
   log_plan "$VENV_DIR/bin/python -c \"import gi; ...; Gst.init(None)\""

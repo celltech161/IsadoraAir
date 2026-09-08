@@ -40,6 +40,12 @@
 #     StereoTool's binary/license are NEVER part of this backup or repo
 #     (proprietary, externally reprovisioned) -- restoring the profile
 #     alone does not mean StereoTool is ready to run.
+#   - WEATHER_DATA_DIR (default /var/lib/isadoraair/weather) -- r0043:
+#     also normalizes a known-legacy .env value pointing inside the
+#     weather-ingest companion's own source-checkout namespace, before
+#     Stage 60's first Django import can materialize it there and
+#     poison Stage 80's companion clone. See section 5 below and
+#     docs/DISASTER_RECOVERY_STATUS.md.
 #
 # Usage:
 #   deploy/restore/40-station-content.sh --archive PATH [--plan|--apply]
@@ -187,7 +193,76 @@ else
   log_warn "reports: archive has no reports/ entries -- may be legitimate (no filings generated yet)."
 fi
 
-# ---- 5. StereoTool .sts processing profile(s) -----------------------------
+# ---- 5. Weather data directory (WEATHER_DATA_DIR) ------------------------
+# r0043: a restored .env can carry a legacy WEATHER_DATA_DIR pointing
+# INSIDE the weather-ingest companion's own source-checkout namespace
+# (e.g. $HOME/weather-ingest/data) -- a real, confirmed E8 defect:
+# weather/services.py's own module-level `DATA_DIR.mkdir(parents=True,
+# exist_ok=True)`, triggered by Stage 60's very first Django import,
+# then manufactures a non-empty, non-Git companion-checkout directory
+# BEFORE Stage 80 ever runs -- so Stage 80's own (correct, must-stay-
+# strict) non-Git-collision refusal fires on a directory IsadoraAir
+# itself created. Recognized ONLY: a value that resolves inside
+# <companions-default-root>/weather-ingest/ -- the exact, known legacy
+# namespace this defect can leave behind (restore_default_companions_root,
+# lib.sh -- the SAME default 80-companions.sh itself resolves
+# COMPANIONS_ROOT from). Any OTHER value -- the current canonical
+# default, or a genuine operator-chosen custom path outside that one
+# namespace -- is NEVER rewritten; only this one recognized-legacy case
+# is normalized, here, before Stage 60 can ever import Django.
+#
+# This is a deliberate, narrow exception to this stage's general
+# "restore exactly what was backed up" posture -- 20-application.sh's
+# own .env IS still byte-faithful at the moment IT finishes; this
+# happens one stage later, specifically because the value is
+# objectively wrong for ANY restore of this archive (a companion
+# project's own checkout is not a legitimate runtime-data home in the
+# current architecture), never merely an artifact of --staging-root.
+# See docs/DISASTER_RECOVERY_STATUS.md for the full incident record.
+CANONICAL_WEATHER_DATA_DIR="/var/lib/isadoraair/weather"
+WEATHER_DATA_DIR="$CANONICAL_WEATHER_DATA_DIR"
+if [ -f "$ENV_FILE" ]; then
+  ENV_WEATHER_DATA_DIR=$(grep -E '^WEATHER_DATA_DIR=' "$ENV_FILE" | tail -1 | cut -d= -f2- || true)
+  [ -n "$ENV_WEATHER_DATA_DIR" ] && WEATHER_DATA_DIR="$ENV_WEATHER_DATA_DIR"
+fi
+LEGACY_WEATHER_NAMESPACE="$(restore_default_companions_root)/weather-ingest"
+case "$WEATHER_DATA_DIR" in
+  "$LEGACY_WEATHER_NAMESPACE"|"$LEGACY_WEATHER_NAMESPACE"/*)
+    log_warn "WEATHER_DATA_DIR=$WEATHER_DATA_DIR is a known legacy value inside the weather-ingest companion's own source-checkout namespace ($LEGACY_WEATHER_NAMESPACE) -- normalizing $ENV_FILE to the canonical runtime-data location $CANONICAL_WEATHER_DATA_DIR before Stage 60's first Django import can materialize it (r0043 -- see docs/DISASTER_RECOVERY_STATUS.md)."
+    if [ "$RESTORE_MODE" = "apply" ] && [ -f "$ENV_FILE" ]; then
+      WEATHER_ENV_TMP="$(mktemp)"
+      grep -vE '^WEATHER_DATA_DIR=' "$ENV_FILE" > "$WEATHER_ENV_TMP" || true
+      printf 'WEATHER_DATA_DIR=%s\n' "$CANONICAL_WEATHER_DATA_DIR" >> "$WEATHER_ENV_TMP"
+      install -m 0600 "$WEATHER_ENV_TMP" "$ENV_FILE"
+      rm -f "$WEATHER_ENV_TMP"
+      log_info "$ENV_FILE: WEATHER_DATA_DIR normalized to $CANONICAL_WEATHER_DATA_DIR (every other key left byte-for-byte unchanged)."
+    else
+      log_plan "normalize WEATHER_DATA_DIR in $ENV_FILE to $CANONICAL_WEATHER_DATA_DIR"
+    fi
+    WEATHER_DATA_DIR="$CANONICAL_WEATHER_DATA_DIR"
+    ;;
+  *)
+    log_info "WEATHER_DATA_DIR=$WEATHER_DATA_DIR is not a recognized legacy value -- left unchanged."
+    ;;
+esac
+if [ -n "$RESTORE_STAGING_ROOT" ]; then
+  WEATHER_DATA_DIR="$RESTORE_STAGING_ROOT${WEATHER_DATA_DIR}"
+fi
+log_info "Weather data directory: $WEATHER_DATA_DIR"
+ensure_dir "$WEATHER_DATA_DIR"
+# Explicit, deterministic mode -- ensure_dir's own plain `mkdir -p`
+# leaves a freshly-created directory at whatever 0777-minus-umask
+# happens to produce (the exact class of bug r0041/r0042 already fixed
+# for other restore-tooling destinations); asserted here independent of
+# ambient umask, every run, whether the directory is fresh or
+# pre-existing (matching ensure_dir's own unconditional chown).
+if [ -n "$RESTORE_STAGING_ROOT" ]; then
+  do_or_plan chmod 0755 "$WEATHER_DATA_DIR"
+else
+  do_or_plan sudo chmod 0755 "$WEATHER_DATA_DIR"
+fi
+
+# ---- 6. StereoTool .sts processing profile(s) -----------------------------
 log_info "StereoTool profile directory: $STEREOTOOL_DIR"
 if [ -n "$RESTORE_STAGING_ROOT" ]; then
   do_or_plan mkdir -p "$STEREOTOOL_DIR"
@@ -236,7 +311,7 @@ log_info "  [ ] License entered -- NOT a blocker; StereoTool runs unlicensed (oc
 log_warn "  [ ] Service unit valid -- installed and syntax-checked by 90-system-config.sh, not this stage; run that stage next."
 log_info "See docs/DISASTER_RECOVERY_RESTORE.md's 'StereoTool' section for the full manual handoff procedure."
 
-# ---- 6. Readiness signal --------------------------------------------------
+# ---- 7. Readiness signal --------------------------------------------------
 if [ "$RESTORE_MODE" = "apply" ]; then
   MUSIC_HAS_CONTENT=0
   if [ -d "$SRV_ROOT/music" ] && [ -n "$(ls -A "$SRV_ROOT/music" 2>/dev/null)" ]; then
@@ -249,4 +324,7 @@ if [ "$RESTORE_MODE" = "apply" ]; then
   fi
 fi
 
+if [ "$RESTORE_MODE" = "apply" ]; then
+  restore_ledger_record "40-station-content"
+fi
 log_info "40-station-content: $( [ "$RESTORE_MODE" = apply ] && echo PASS || echo "PLAN complete" )"
