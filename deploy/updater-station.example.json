@@ -27,7 +27,7 @@
     "isa_root": "/opt/isadoraair",
     "isa_home": "/home/isadoraair",
     "syndicated_root": "/home/isadoraair/syndicated-ingest",
-    "weather_root": "/home/isadoraair/weather-ingest",
+    "weather_root": "/opt/isadoraair/weather_ingest",
     "ogremote_root": "/home/isadoraair/ogremote-ingest"
   },
   "database": {

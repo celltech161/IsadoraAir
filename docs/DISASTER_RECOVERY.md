@@ -342,15 +342,23 @@ Phase 5.
 
 ## Companion projects
 
-`syndicated-ingest/`, `weather-ingest/`, and `ogremote-ingest/`
-(`/home/jreed/*-ingest/`) are real, currently-scheduled production code
-(20+ syndicated-show timers, weather polling, remote-content polling)
-with **no version control at all** and no backup coverage. This is a
-known, tracked gap — explicitly **not** addressed in this Phase 2 pass
-(per its own scope boundary: these need a secrets/`.gitignore` audit
-*before* `git init`, which is separate controlled follow-up work, not
-done here). See each project's own git-readiness notes under
-`docs/companion-projects/` for what that follow-up pass will need.
+Historical (Phase 2 pass, superseded): `syndicated-ingest/`,
+`weather-ingest/`, and `ogremote-ingest/` (`/home/jreed/*-ingest/`)
+were, at that time, real, currently-scheduled production code (20+
+syndicated-show timers, weather polling, remote-content polling) with
+**no version control at all** and no backup coverage — a known, tracked
+gap explicitly not addressed in that pass. See each project's own
+git-readiness notes under `docs/companion-projects/` for that
+follow-up's own scope at the time.
+
+**Current (r0048):** all three were subsequently versioned (Phase 2B).
+`weather-ingest` has since been imported in-tree at `weather_ingest/`
+inside this repository -- it is no longer a separate companion project
+or a separate backup-coverage question at all; see
+`docs/WEATHER_INGEST_MONOREPO.md`. `syndicated-ingest/` and
+`ogremote-ingest/` remain separate, privately-versioned companion
+repositories, each still without its own backup coverage as of this
+writing -- that gap is unaffected by this migration.
 
 ## Secret reprovisioning boundary
 

@@ -31,10 +31,10 @@ clean Ubuntu 26.04
   v  deploy/restore/20-application.sh  -- git clone + SHA checkout, .env + media/
   v  deploy/restore/30-postgresql.sh   -- role/DB bootstrap, pg_restore
   v  deploy/restore/40-station-content.sh -- carts/voicetracks/reports/StereoTool profile
-  v  deploy/restore/60-python.sh       -- IsadoraAir venv
+  v  deploy/restore/60-python.sh       -- IsadoraAir venv, + in-tree weather_ingest/venv (r0048+ modern target)
   v  deploy/restore/50-native-deps.sh  -- native fdkaac (see "Runtime recovery payload" below)
   v  deploy/restore/70-tts.sh          -- Kokoro + Piper (see "Runtime recovery payload" below)
-  v  deploy/restore/80-companions.sh   -- syndicated-ingest/weather-ingest/ogremote-ingest
+  v  deploy/restore/80-companions.sh   -- syndicated-ingest/ogremote-ingest (modern); + weather-ingest (legacy pre-r0048 target only -- see docs/WEATHER_INGEST_MONOREPO.md)
   v  deploy/restore/90-system-config.sh -- nginx + systemd units installed, NOT started
   v  deploy/restore/95-validate.sh     -- read-only final check (manage.py check,
   |                                       check_deploy_baseline, migration state)
@@ -479,7 +479,7 @@ obvious rather than pretending the whole restore is unattended:
 
 | Checkpoint | Why it's manual |
 |---|---|
-| GitHub private-repo access | `deploy/restore/20-application.sh` and `80-companions.sh` need working, non-interactive `git`/SSH access to `celltech161/IsadoraAir` + the three companion repos. Provision an SSH key with read access before starting — see "GitHub access" below. |
+| GitHub private-repo access | `deploy/restore/20-application.sh` (public `IsadoraAir` repo) always needs working, non-interactive `git`/SSH access. `80-companions.sh` needs it for the two remaining private companion repos on a MODERN target (`syndicated-ingest`, `ogremote-ingest` -- weather is in-tree, r0048+, no private weather-ingest GitHub access needed at all); a LEGACY target still needs all three, `weather-ingest` included. Provision an SSH key with read access to whichever set applies before starting -- see "GitHub access" below. |
 | Attach/identify persistent music storage | The 717+ GB library is never part of any backup (see `docs/DISASTER_RECOVERY.md`'s "Music library" section) — mount the real disk (or its current replacement/replica) at `LIBRARY_ROOT` separately. `40-station-content.sh` only creates the empty mountpoint. |
 | Recover the three companion credential files | See "Secrets and credentials inventory" and "Encrypted recovery-credential preservation" below — as of 2026-08-18 these have a verified operator-maintained off-host recovery copy; still a manual install step (decrypt-or-copy-in, `chmod 0600`), not automated. |
 | Obtain StereoTool binary | Proprietary, paid software — never in Git or backups. See "StereoTool" below. |
@@ -490,9 +490,14 @@ obvious rather than pretending the whole restore is unattended:
 ## GitHub access
 
 `git@github.com:celltech161/IsadoraAir.git`,
-`.../syndicated-ingest.git`, `.../weather-ingest.git`,
-`.../ogremote-ingest.git` are all **private**. A restore needs an SSH
-key with read access to all four, usable non-interactively (no
+`.../syndicated-ingest.git`, and `.../ogremote-ingest.git` are all
+**private** (IsadoraAir the application repo is public as of its own
+release history, but its *checkout* access for a restore is whatever
+this box's own SSH setup requires either way). `.../weather-ingest.git`
+is **only needed for a LEGACY (pre-r0048) target** -- weather is
+in-tree for a modern one, see `docs/WEATHER_INGEST_MONOREPO.md`. A
+restore needs an SSH key with read access to whichever repos its
+target revision actually needs, usable non-interactively (no
 passphrase prompt) — e.g.:
 
 ```bash

@@ -30,6 +30,12 @@
 #      running it destructively (collectstatic itself is safe/additive,
 #      but left as an explicit operator step for Phase 5, not implied
 #      here).
+#   5. r0048: in-tree weather runtime presence/usability (source +
+#      isolated venv) for a MODERN target -- structural only, never
+#      network-dependent, never anything capable of an on-air alert/beep
+#      action. A LEGACY target (no in-tree weather source) passes this
+#      check trivially -- weather is Stage 80's standalone-companion
+#      concern there instead. See lib.sh's restore_target_has_intree_weather.
 #
 # A --staging-root is an offline filesystem, not a booted host. In that
 # mode this stage runs only target-mapped structural validation: E5 and
@@ -158,6 +164,34 @@ if [ -n "$RESTORE_ARCHIVE" ]; then
   fi
 fi
 
+# r0048: presence/usability of the in-tree weather source + its
+# isolated venv, structural-only (file presence, never subprocess
+# execution) under --staging-root -- this stage never runs anything
+# network-dependent or capable of putting an alert/beep on air, staging
+# or real. A legacy target (no in-tree weather source) is not a
+# failure here -- it means weather is provisioned via Stage 80's
+# standalone companion path instead, which this check is not about.
+_restore_check_weather_runtime_structural() {
+  if ! restore_target_has_intree_weather "$RESTORE_TARGET_ROOT"; then
+    log_info "weather runtime: legacy target (no in-tree weather source) -- provisioned via Stage 80's standalone companion path instead; not this check's concern."
+    return 0
+  fi
+  local ok=1
+  if [ -f "$RESTORE_TARGET_ROOT/weather_ingest/requirements.txt" ]; then
+    log_info "weather runtime: in-tree source present ($RESTORE_TARGET_ROOT/weather_ingest)."
+  else
+    log_error "weather runtime: $RESTORE_TARGET_ROOT/weather_ingest/requirements.txt not found."
+    ok=0
+  fi
+  if [ -x "$RESTORE_TARGET_ROOT/weather_ingest/venv/bin/python" ]; then
+    log_info "weather runtime: isolated venv present ($RESTORE_TARGET_ROOT/weather_ingest/venv)."
+  else
+    log_error "weather runtime: $RESTORE_TARGET_ROOT/weather_ingest/venv/bin/python not found or not executable -- run 60-python.sh first."
+    ok=0
+  fi
+  [ "$ok" -eq 1 ]
+}
+
 if [ -n "$RESTORE_STAGING_ROOT" ]; then
   log_info "--- Offline target structural baseline ---"
   if [ -n "$ISA_UID" ]; then
@@ -165,15 +199,22 @@ if [ -n "$RESTORE_STAGING_ROOT" ]; then
   else
     log_info "Target service identity '$ISA_USER' will be resolved from $RESTORE_STAGING_ROOT/etc/passwd, not the installer host -- pass --isa-uid/--isa-gid if this target has no /etc/passwd of its own."
   fi
+  STAGING_OK=1
   if "$VENV_PY" manage.py check_deploy_baseline \
       --structural-only \
       --target-root "$RESTORE_STAGING_ROOT" \
       "${CHECK_BASELINE_IDENTITY_ARGS[@]}"; then
     log_info "offline target check_deploy_baseline: PASS"
+  else
+    log_error "offline target check_deploy_baseline: FAILED -- the staged filesystem is incomplete or unsafe, or the target service identity could not be resolved (no target /etc/passwd entry for '$ISA_USER' and no --isa-uid/--isa-gid supplied). Installer-host state cannot satisfy this check."
+    STAGING_OK=0
+  fi
+  log_info "--- weather runtime (structural) ---"
+  _restore_check_weather_runtime_structural || STAGING_OK=0
+  if [ "$STAGING_OK" -eq 1 ]; then
     log_info "95-validate: PASS (offline target structural/filesystem contract; live DB, station, kernel, and runtime execution checks intentionally deferred until boot-root validation)"
     exit 0
   fi
-  log_error "offline target check_deploy_baseline: FAILED -- the staged filesystem is incomplete or unsafe, or the target service identity could not be resolved (no target /etc/passwd entry for '$ISA_USER' and no --isa-uid/--isa-gid supplied). Installer-host state cannot satisfy this check."
   exit 1
 fi
 
@@ -209,6 +250,26 @@ if grep -qE '^\s*\[ \]' <<< "$PLAN_OUTPUT"; then
   log_warn "migrate --plan shows unapplied migrations. A restore against the exact Git SHA recorded in the backup's MANIFEST.txt (see 20-application.sh) should normally show none -- investigate before running migrate, don't apply automatically. This restore tooling does NOT run migrate for you."
 else
   log_info "migrate --plan: no pending migrations -- consistent with a restore against the exact recorded Git SHA."
+fi
+
+log_info "--- weather runtime ---"
+# r0048: presence/usability only -- no network access, no on-air
+# alert/beep action. A legacy target logs and passes (weather is
+# Stage 80's concern there, not this stage's).
+if restore_target_has_intree_weather "$RESTORE_TARGET_ROOT"; then
+  if _restore_check_weather_runtime_structural; then
+    WEATHER_VENV_PY="$RESTORE_TARGET_ROOT/weather_ingest/venv/bin/python"
+    if "$WEATHER_VENV_PY" -c "import requests" 2>/dev/null; then
+      log_info "weather venv interpreter check: PASS"
+    else
+      log_error "weather venv interpreter check: FAILED -- $WEATHER_VENV_PY cannot import requests. Run 60-python.sh."
+      OVERALL_OK=0
+    fi
+  else
+    OVERALL_OK=0
+  fi
+else
+  _restore_check_weather_runtime_structural
 fi
 
 log_info "--- Static/media readiness (informational only -- not run) ---"

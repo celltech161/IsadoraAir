@@ -117,9 +117,20 @@ elif [ -n "$RESTORE_STAGING_ROOT" ]; then
 fi
 COMPANIONS_ROOT="${RESTORE_STAGING_ROOT:-$HOME}"
 [ -z "$SYNDICATED_ROOT" ] && SYNDICATED_ROOT="$COMPANIONS_ROOT/syndicated-ingest"
-[ -z "$WEATHER_ROOT" ] && WEATHER_ROOT="$COMPANIONS_ROOT/weather-ingest"
-[ -z "$OGREMOTE_ROOT" ] && OGREMOTE_ROOT="$COMPANIONS_ROOT/ogremote-ingest"
 ISA_ROOT="$RESTORE_TARGET_ROOT"
+# r0048: @@WEATHER_ROOT@@ defaults to the in-tree weather source for a
+# MODERN target (weather_ingest/requirements.txt present in the checked-
+# out source -- see lib.sh's restore_target_has_intree_weather), or the
+# standalone companion root for a LEGACY one -- an explicit
+# --weather-root always overrides either default, unchanged.
+if [ -z "$WEATHER_ROOT" ]; then
+  if restore_target_has_intree_weather "$ISA_ROOT"; then
+    WEATHER_ROOT="$ISA_ROOT/weather_ingest"
+  else
+    WEATHER_ROOT="$COMPANIONS_ROOT/weather-ingest"
+  fi
+fi
+[ -z "$OGREMOTE_ROOT" ] && OGREMOTE_ROOT="$COMPANIONS_ROOT/ogremote-ingest"
 
 log_info "=== 90-system-config ==="
 guard_production_target
@@ -132,6 +143,7 @@ else
   USE_SUDO=1
 fi
 log_info "ISA_USER=$ISA_USER ISA_ROOT=$ISA_ROOT ISA_HOME=$ISA_HOME${ISA_UID:+ ISA_UID=$ISA_UID ISA_GID=$ISA_GID}"
+log_info "WEATHER_ROOT=$WEATHER_ROOT"
 log_info "Rendering into: $ETC_ROOT"
 
 render() {

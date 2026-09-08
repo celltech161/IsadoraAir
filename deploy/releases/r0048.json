@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "release_id": "r0048",
+  "previous_release_id": "r0047",
+  "minimum_updater_protocol_version": 5,
+  "summary": "Imports weather-ingest in-tree at weather_ingest/ (byte-identical git-archive of its final standalone tag, no history graft) and wires it into restore/recovery tooling with an explicit modern/legacy distinction. deploy/wx-*.service templates are unchanged. Production timers keep using /home/jreed/weather-ingest until a later, manual, non-release cutover -- see docs/WEATHER_INGEST_MONOREPO.md. No migration/dependency/systemd-unit/protected-runtime change.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0007"
+}

@@ -194,6 +194,14 @@ else
 fi
 
 # ---- 5. Weather data directory (WEATHER_DATA_DIR) ------------------------
+# r0048 note: this section is unaffected by weather-ingest's in-tree
+# import -- it recognizes and repairs an OLD *.env* value from a
+# LEGACY-era backup (WEATHER_DATA_DIR, a runtime-DATA path, not the
+# weather-ingest SOURCE checkout location), regardless of whether the
+# revision being restored is modern or legacy. Retained unchanged so a
+# genuinely historical archive (r0042-era or earlier) restores exactly
+# as it always has -- see docs/DISASTER_RECOVERY_STATUS.md's incident
+# record.
 # r0043: a restored .env can carry a legacy WEATHER_DATA_DIR pointing
 # INSIDE the weather-ingest companion's own source-checkout namespace
 # (e.g. $HOME/weather-ingest/data) -- a real, confirmed E8 defect:

@@ -163,6 +163,28 @@ restore_default_companions_root() {
   printf '%s\n' "${RESTORE_STAGING_ROOT:-$HOME}"
 }
 
+# restore_target_has_intree_weather TARGET_ROOT -- true (exit 0) only
+# if TARGET_ROOT's checked-out IsadoraAir source contains
+# weather_ingest/requirements.txt (r0048+ monorepo import). This is the
+# ONE authoritative modern/legacy signal every restore stage that cares
+# about weather (60/80/90/95) consults -- deliberately structural (file
+# presence in the ACTUAL checked-out revision), never a release-number
+# comparison, so a future release doesn't need this function to keep
+# changing, and a target genuinely checked out at an old commit (e.g. a
+# --resume of an interrupted pre-r0048 restore, or an operator
+# deliberately restoring an old archive) is classified correctly
+# regardless of what release ID happens to be running THIS restore
+# tooling. "Modern" = weather is in-tree, provisioned via Stage 60/
+# rendered via Stage 90's in-tree root, no private weather-ingest
+# GitHub access needed. "Legacy" = the pre-monorepo standalone
+# weather-ingest companion path (Stage 80 clone + Stage 90's legacy
+# companion root) remains available, unchanged, for restoring an older
+# backup whose exact IsadoraAir revision predates this import.
+restore_target_has_intree_weather() {
+  local target_root="$1"
+  [ -f "$target_root/weather_ingest/requirements.txt" ]
+}
+
 # _restore_is_known_empty_scaffold DIR -- true (exit 0) only if DIR
 # exists, is a real (non-symlink) directory, contains no .git anywhere,
 # and its ENTIRE recursive content is real directories only -- zero

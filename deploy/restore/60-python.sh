@@ -18,6 +18,19 @@
 #      .env (stage 20) and a reachable database (stage 30) to have
 #      already run.
 #
+# r0048: a MODERN target (weather_ingest/requirements.txt present in
+# the checked-out source -- see lib.sh's restore_target_has_intree_weather)
+# additionally gets its own independently reproducible weather-ingest
+# venv, built the same idempotent way as the main venv above but
+# WITHOUT --system-site-packages (the standalone companion's own
+# isolation semantics, preserved verbatim -- weather-ingest has no
+# GStreamer/PyGObject dependency, confirmed by inspecting its committed
+# requirements.txt/README.md, so there is no reason to weaken its
+# isolation just because it now lives inside this repository). A LEGACY
+# target (no in-tree weather source) logs that weather runtime
+# provisioning is deferred to Stage 80's standalone companion path --
+# never treated as this stage's own failure/corruption.
+#
 # Usage:
 #   deploy/restore/60-python.sh [--plan|--apply] [--staging-root PATH]
 set -euo pipefail
@@ -82,10 +95,47 @@ print('Gst version:', '.'.join(str(x) for x in Gst.version()))
   else
     log_warn "No .env at $ENV_FILE -- skipping manage.py check (run 20-application.sh first for a full verification)."
   fi
-  restore_ledger_record "60-python"
-  log_info "60-python: PASS"
 else
   log_plan "$VENV_DIR/bin/python -c \"import gi; ...; Gst.init(None)\""
   log_plan "cd $RESTORE_TARGET_ROOT && $VENV_DIR/bin/python manage.py check"
+fi
+
+# ---------------------------------------------------------------------
+# r0048: in-tree weather-ingest venv (modern target only).
+# ---------------------------------------------------------------------
+if restore_target_has_intree_weather "$RESTORE_TARGET_ROOT"; then
+  WEATHER_ROOT="$RESTORE_TARGET_ROOT/weather_ingest"
+  WEATHER_REQUIREMENTS="$WEATHER_ROOT/requirements.txt"
+  WEATHER_VENV_DIR="$WEATHER_ROOT/venv"
+  log_info "In-tree weather source detected ($WEATHER_ROOT) -- provisioning its isolated venv."
+
+  if [ -d "$WEATHER_VENV_DIR" ]; then
+    log_info "$WEATHER_VENV_DIR already exists -- verifying rather than recreating (idempotent). Delete it manually first if a from-scratch rebuild is actually what's wanted."
+  else
+    do_or_plan python3 -m venv "$WEATHER_VENV_DIR"
+  fi
+
+  do_or_plan "$WEATHER_VENV_DIR/bin/pip" install --upgrade pip
+  do_or_plan "$WEATHER_VENV_DIR/bin/pip" install -r "$WEATHER_REQUIREMENTS"
+
+  if [ "$RESTORE_MODE" = "apply" ]; then
+    log_info "Verifying the weather venv's own interpreter is usable..."
+    if "$WEATHER_VENV_DIR/bin/python" -c "import requests; print('requests version:', requests.__version__)"; then
+      log_info "weather venv interpreter check: PASS"
+    else
+      log_error "weather venv interpreter check FAILED -- see output above."
+      exit 1
+    fi
+  else
+    log_plan "$WEATHER_VENV_DIR/bin/python -c \"import requests; ...\""
+  fi
+else
+  log_info "No in-tree weather source (weather_ingest/requirements.txt absent) -- this is a legacy target. Weather runtime provisioning is deferred to Stage 80's standalone companion path, not this stage's concern."
+fi
+
+if [ "$RESTORE_MODE" = "apply" ]; then
+  restore_ledger_record "60-python"
+  log_info "60-python: PASS"
+else
   log_info "60-python: PLAN complete"
 fi

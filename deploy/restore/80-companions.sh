@@ -1,11 +1,28 @@
 #!/usr/bin/env bash
 # deploy/restore/80-companions.sh -- IsadoraAir 1.2 Phase 4.
 #
-# Clones + provisions the three companion repos (syndicated-ingest,
-# weather-ingest, ogremote-ingest -- all private, IsadoraAir 1.2
-# Phase 2B) at their expected paths, each with its own venv (no
-# --system-site-packages -- none of them touch GStreamer) and its own
-# Phase 3 requirements.txt.
+# r0048: weather-ingest was imported in-tree (weather_ingest/, see
+# docs/WEATHER_INGEST_MONOREPO.md) -- a MODERN target (weather_ingest/
+# requirements.txt present in the checked-out source; see lib.sh's
+# restore_target_has_intree_weather) therefore defaults to provisioning
+# only the two REMAINING companion repos, syndicated-ingest and
+# ogremote-ingest. weather-ingest's own venv is Stage 60's job now (the
+# in-tree weather_ingest/venv), not this stage's, and no private
+# weather-ingest GitHub access is needed at all for a modern restore.
+#
+# A LEGACY target (no in-tree weather source -- restoring an archive
+# whose exact IsadoraAir revision predates this import) keeps the
+# original three-companion default, unchanged, including weather-ingest
+# as its own clone + venv here -- this is what lets an OLDER backup
+# still be restored using the standalone checkout it actually needs.
+# --repo-url-prefix and every other flag below behave identically for
+# both cases; --only always overrides the computed default explicitly.
+#
+# Clones + provisions each requested companion repo (syndicated-ingest,
+# ogremote-ingest, and -- legacy targets/explicit --only only --
+# weather-ingest; all private, IsadoraAir 1.2 Phase 2B) at its expected
+# path, each with its own venv (no --system-site-packages -- none of
+# them touch GStreamer) and its own Phase 3 requirements.txt.
 #
 # GitHub access to these private repos is an external provisioning
 # requirement -- this script never embeds credentials; it relies on
@@ -18,9 +35,9 @@
 # fabricate (documented, not invented -- Phase 4 spec section 20):
 #   syndicated-ingest  ~/.syndicated_ingest.cred
 #   ogremote-ingest     ~/.ogremote_ingest.cred, data/ (untracked state)
-#   weather-ingest      NO standalone cred file -- config lives in
-#                        IsadoraAir's own database (WeatherConfig/
-#                        AmberAlertConfig), read via
+#   weather-ingest      (legacy targets only) NO standalone cred file --
+#                        config lives in IsadoraAir's own database
+#                        (WeatherConfig/AmberAlertConfig), read via
 #                        $ISADORAAIR_DIR/venv/bin/python manage.py
 #                        dump_weather_config -- IsadoraAir itself
 #                        (stages 20/30/60) must already be restored and
@@ -33,7 +50,8 @@
 # Usage:
 #   deploy/restore/80-companions.sh [--plan|--apply] [--staging-root PATH]
 #     [--companions-root PATH] [--repo-url-prefix PREFIX]
-#     [--only syndicated-ingest,weather-ingest,ogremote-ingest]
+#     [--only syndicated-ingest,ogremote-ingest]           (modern default)
+#     [--only syndicated-ingest,weather-ingest,ogremote-ingest]  (legacy default)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -45,7 +63,11 @@ set -- "${RESTORE_REMAINING_ARGS[@]}"
 
 COMPANIONS_ROOT=""
 REPO_URL_PREFIX="git@github.com:celltech161"
-ONLY="syndicated-ingest,weather-ingest,ogremote-ingest"
+if restore_target_has_intree_weather "$RESTORE_TARGET_ROOT"; then
+  ONLY="syndicated-ingest,ogremote-ingest"
+else
+  ONLY="syndicated-ingest,weather-ingest,ogremote-ingest"
+fi
 while [ $# -gt 0 ]; do
   case "$1" in
     --companions-root) COMPANIONS_ROOT="${2:?}"; shift 2 ;;
@@ -63,6 +85,12 @@ log_info "=== 80-companions ==="
 guard_production_target
 require_cmd git
 require_cmd python3
+
+if restore_target_has_intree_weather "$RESTORE_TARGET_ROOT"; then
+  log_info "Modern target (weather_ingest/requirements.txt present) -- weather is in-tree, provisioned by Stage 60. Default companion set: syndicated-ingest, ogremote-ingest."
+else
+  log_info "Legacy target (no in-tree weather source) -- provisioning the standalone weather-ingest companion here, unchanged. Default companion set: syndicated-ingest, weather-ingest, ogremote-ingest."
+fi
 
 IFS=',' read -ra REPOS <<< "$ONLY"
 

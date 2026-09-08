@@ -24,7 +24,7 @@ below deliberately continues to exclude this root service.
 | `@@ISA_ROOT@@` | Repo checkout directory (contains `manage.py`, `venv/`, `.env`) | `/opt/isadoraair` |
 | `@@ISA_HOME@@` | Home directory of `@@ISA_USER@@` — only used in `isadoraair-backup.service`'s comment documenting where the backup credential file lives | `/home/isadoraair` |
 | `@@SYNDICATED_ROOT@@` | Root of the separate syndicated-ingest scripts + venv | `/home/isadoraair/syndicated-ingest` |
-| `@@WEATHER_ROOT@@` | Root of the separate weather-ingest scripts + venv | `/home/isadoraair/weather-ingest` |
+| `@@WEATHER_ROOT@@` | Root of the weather-ingest scripts + venv -- r0048: in-tree (`weather_ingest/` inside this checkout) for a current release; the standalone companion root only for a legacy pre-r0048 install | `$ISA_ROOT/weather_ingest` (current), `/home/isadoraair/weather-ingest` (legacy) |
 | `@@OGREMOTE_ROOT@@` | Root of the separate ogremote-ingest scripts + venv | `/home/isadoraair/ogremote-ingest` |
 
 Only `ISA_USER` and `ISA_ROOT` are strictly required — if you don't
@@ -45,7 +45,7 @@ export ISA_USER=isadoraair
 export ISA_ROOT=/opt/isadoraair
 export ISA_HOME=/home/$ISA_USER
 export SYNDICATED_ROOT=$ISA_HOME/syndicated-ingest
-export WEATHER_ROOT=$ISA_HOME/weather-ingest
+export WEATHER_ROOT=$ISA_ROOT/weather_ingest  # in-tree as of r0048; a legacy pre-r0048 install uses $ISA_HOME/weather-ingest instead
 export OGREMOTE_ROOT=$ISA_HOME/ogremote-ingest
 
 # 2. Render + install every deploy/*.service, *.timer, and *.conf
