@@ -11,8 +11,57 @@ from django.core.management import call_command
 from django.test import TestCase, override_settings
 
 from library.models import FXCart
-from weather.models import WeatherConfig
+from isadoraair.tts.models import StationTTSVoice
+from weather.models import WeatherConfig, WeatherVoicePersona
 
+
+class WeatherConfigCleanInstallTests(TestCase):
+    def test_empty_database_gets_neutral_default_persona_and_schedule(self):
+        cfg = WeatherConfig.load()
+
+        self.assertEqual(cfg.voice_schedule, [["default", 0, 23]])
+        persona = WeatherVoicePersona.objects.get(slot="default")
+        self.assertEqual(persona.display_name, "Default announcer")
+        self.assertEqual(persona.full_name, "")
+        self.assertEqual(persona.signoff, "")
+        self.assertIsNone(persona.tts_voice_id)
+        self.assertFalse(StationTTSVoice.objects.exists())
+
+    def test_load_is_idempotent_and_does_not_repair_existing_default(self):
+        first = WeatherConfig.load()
+        persona = WeatherVoicePersona.objects.get(slot="default")
+        persona.display_name = "Operator label"
+        persona.save(update_fields=["display_name"])
+
+        second = WeatherConfig.load()
+
+        self.assertEqual(first.pk, second.pk)
+        self.assertEqual(WeatherConfig.objects.count(), 1)
+        self.assertEqual(WeatherVoicePersona.objects.count(), 1)
+        persona.refresh_from_db()
+        self.assertEqual(persona.display_name, "Operator label")
+
+    def test_existing_legacy_schedule_is_unchanged(self):
+        schedule = [["day", 6, 17], ["night", 18, 5]]
+        WeatherConfig.objects.create(pk=1, voice_schedule=schedule)
+
+        cfg = WeatherConfig.load()
+
+        self.assertEqual(cfg.voice_schedule, schedule)
+        self.assertFalse(WeatherVoicePersona.objects.filter(slot="default").exists())
+
+    def test_existing_arbitrary_personas_and_schedule_are_unchanged(self):
+        schedule = [["morning_host", 5, 11], ["evening_host", 12, 4]]
+        WeatherConfig.objects.create(pk=1, voice_schedule=schedule)
+        morning = WeatherVoicePersona.objects.create(
+            slot="morning_host", display_name="Morgan", signoff="Morgan here.",
+        )
+
+        cfg = WeatherConfig.load()
+
+        self.assertEqual(cfg.voice_schedule, schedule)
+        morning.refresh_from_db()
+        self.assertEqual(morning.display_name, "Morgan")
 
 class WeatherConfigAlertSoundCartTests(TestCase):
     def test_accepts_fx_cart_selection(self):

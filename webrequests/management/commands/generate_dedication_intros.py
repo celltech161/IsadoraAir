@@ -22,7 +22,7 @@ class Command(BaseCommand):
     on its own timer -- deliberately kept OUT of
     refresh_song_request_statuses, which must stay fast and reliable
     (stranded-request detection, self-heal, expiry, scheduling, ETA
-    refresh all run there every ~20s). Kokoro+ffmpeg together can take
+    refresh all run there every ~20s). TTS plus ffmpeg can take
     tens of seconds worst case; bolting that onto the reconciliation
     command would risk delaying exactly the recovery logic that matters
     most.
@@ -34,7 +34,7 @@ class Command(BaseCommand):
     making a collapsed duplicate look like "the first row" on the next
     cycle and get a redundant intro of its own."""
 
-    help = "Synthesize spoken dedication intros (Kokoro) for scheduled web song requests."
+    help = "Synthesize spoken dedication intros with the configured logical TTS voice."
 
     def handle(self, *args, **options):
         with connection.cursor() as cur:

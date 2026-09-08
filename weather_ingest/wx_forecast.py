@@ -20,24 +20,12 @@
 #   3day -> 6 forecast periods, "next three days" framing
 #   1day -> 2 forecast periods, "looking ahead" framing
 #
-# Three voice options are supported via --voice:
-#   day   -> Claira Sky (currently the day persona)
-#   night -> Max Weatherly (currently the night persona)
-#   auto  -> consults WeatherConfig.voice_schedule for the current hour
-#            (NOT currently used by any deployed forecast unit -- the
-#            deploy/wx-forecast-*.service units still each pass an
-#            explicit --voice day/night matched to their own schedule
-#            window, unchanged by the shared-TTS migration; --voice
-#            auto is fully supported here for manual/test use and for
-#            a possible future schedule-authority consolidation, not
-#            yet decided or scheduled)
-#
-# Cron usage (kogr-cron.txt cadence, preserved as each unit's own
-# systemd timer OnCalendar=; see deploy/wx-forecast-*.timer):
-#   59 8,11,20,23 * * *              --mode 3day --voice night
-#   59 0,1,9,10,12,13,21,22 * * *     --mode 1day --voice night
-#   59 2,5,14,17 * * *                --mode 3day --voice day
-#   59 3,4,6,7,15,16,18,19 * * *      --mode 1day --voice day
+# Voice selection via --voice is persona-agnostic:
+#   auto             -> consult WeatherConfig.voice_schedule now
+#   any other string -> resolve that WeatherVoicePersona slot explicitly
+# Current checked-in systemd service templates use --voice auto. Their
+# historical day/night filenames describe cadence only and have no
+# persona semantics. See deploy/wx-forecast-*.service and paired timers.
 #
 # The forecast cache is shared across both modes: NWS is hit once per
 # fetch, the full periods list is stored, and each mode slices at speak
@@ -675,9 +663,8 @@ def parse_args():
     )
     parser.add_argument(
         "--voice",
-        choices=("day", "night", "auto"),
         required=True,
-        help="Announcer voice: day, night, or auto (consults WeatherConfig.voice_schedule for the current hour).",
+        help="Persona slot key, or auto to use WeatherConfig.voice_schedule for the current hour.",
     )
     return parser.parse_args()
 

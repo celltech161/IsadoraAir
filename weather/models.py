@@ -1,4 +1,4 @@
-from django.db import models
+from django.db import models, transaction
 
 
 DEFAULT_AMBER_EVENT_CODES = "BLU,CAE,MEP"
@@ -18,7 +18,7 @@ DEFAULT_AMBER_SAME_CODES = ",".join([
 
 class WeatherConfig(models.Model):
     """Singleton -- station location, NWS lookup parameters, and the
-    day/night voice schedule for the weather announcer pipeline. These
+    announcer-persona schedule for the weather pipeline. These
     were hardcoded Python constants in the original kogr-sc scripts;
     admin-editable here so a station move or NWS zone change doesn't
     require a code edit + redeploy, matching the LogFillConfig/
@@ -26,7 +26,7 @@ class WeatherConfig(models.Model):
 
     Announcer email notifications reuse the project's own EMAIL_*
     settings (see monitoring.services.notify) via a management command
-    the external weather-ingest scripts shell out to -- no separate
+    the in-tree weather_ingest scripts shell out to -- no separate
     SMTP credential file, unlike the original scripts."""
 
     station_lat = models.FloatField(
@@ -56,10 +56,11 @@ class WeatherConfig(models.Model):
 
     voice_schedule = models.JSONField(
         default=list,
-        help_text='List of [voice, start_hour, end_hour] triples, local time, 0-23, '
-                   'end inclusive. A range may wrap past midnight (start > end). Must '
-                   'cover every hour with no gaps. voice is "day" or "night". Example: '
-                   '[["day",3,8],["night",9,14],["day",15,20],["night",21,2]]',
+        help_text='List of [persona_slot, start_hour, end_hour] triples, local time, '
+                   '0-23, end inclusive. A range may wrap past midnight (start > end) '
+                   'and every hour must be covered exactly once. Slot keys are arbitrary '
+                   'Weather Voice Persona identifiers. Example: '
+                   '[["morning_host",5,11],["default",12,4]]',
     )
 
     notify_email = models.EmailField(
@@ -107,11 +108,24 @@ class WeatherConfig(models.Model):
 
     @classmethod
     def load(cls):
-        obj, created = cls.objects.get_or_create(pk=1)
-        if created:
-            obj.voice_schedule = [["day", 3, 8], ["night", 9, 14], ["day", 15, 20], ["night", 21, 2]]
-            obj.save()
-        return obj
+        # Only a genuinely new singleton receives the neutral starter
+        # persona/schedule. Existing stations are returned byte-for-byte as
+        # configured -- in particular, legacy day/night slots are never
+        # renamed, rewritten, or "repaired" here.
+        with transaction.atomic():
+            obj, created = cls.objects.get_or_create(
+                pk=1,
+                defaults={"voice_schedule": [["default", 0, 23]]},
+            )
+            if created:
+                WeatherVoicePersona.objects.get_or_create(
+                    slot="default",
+                    defaults={
+                        "display_name": "Default announcer",
+                        "tts_voice": None,
+                    },
+                )
+            return obj
 
 
 class WeatherVoicePersona(models.Model):
@@ -120,7 +134,7 @@ class WeatherVoicePersona(models.Model):
     slot = models.SlugField(
         max_length=64,
         unique=True,
-        help_text="Stable key referenced by WeatherConfig.voice_schedule, such as day or night.",
+        help_text="Arbitrary stable key referenced by WeatherConfig.voice_schedule, such as default or morning_host.",
     )
     tts_voice = models.ForeignKey(
         "tts.StationTTSVoice",
@@ -173,7 +187,7 @@ class AmberAlertConfig(models.Model):
               -> follow each entry's link for the full CAP 1.2 XML
               -> filter by SAME area code overlap
               -> fingerprint the surviving set
-      change  -> synthesize with the on-duty Kokoro voice
+      change  -> synthesize with the scheduled logical station voice
               -> deliver + insert_urgent (analog to wx_alert.py)
       active  -> append text_core to the next scheduled forecast
 

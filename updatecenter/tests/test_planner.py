@@ -722,7 +722,7 @@ class SchemaDriftDetectionTests(TestCase):
     describes the release transition; it cannot make CURRENT schema
     healthy."""
 
-    MIGRATION = ("webrequests", "0008_webrequestconfig_dedication_tts")
+    MIGRATION = ("webrequests", "0009_alter_webrequestconfig_dedication_tts_timeout_seconds_and_more")
 
     def _mark_unapplied(self):
         recorder = MigrationRecorder(connection)
@@ -746,7 +746,7 @@ class SchemaDriftDetectionTests(TestCase):
 
                 plan = planner.build_plan(repo.work, "deploy/releases")
                 self.assertEqual(plan.safety_status, planner.SafetyStatus.SCHEMA_DRIFT_DETECTED)
-                self.assertIn("webrequests.0008_webrequestconfig_dedication_tts", plan.schema_pending_migrations)
+                self.assertIn("webrequests.0009_alter_webrequestconfig_dedication_tts_timeout_seconds_and_more", plan.schema_pending_migrations)
                 self.assertEqual(plan.schema_health_status, schema_health.SchemaHealthStatus.UNAPPLIED_MIGRATIONS_DETECTED)
         finally:
             self._mark_applied(recorder)
@@ -761,7 +761,7 @@ class SchemaDriftDetectionTests(TestCase):
                 releases_dir = repo.work / "deploy" / "releases"
                 _write_manifest(releases_dir, _bootstrap(
                     repo.rev_parse("HEAD"),
-                    migrations_required=["webrequests.0008_webrequestconfig_dedication_tts"],
+                    migrations_required=["webrequests.0009_alter_webrequestconfig_dedication_tts_timeout_seconds_and_more"],
                     migration_compatibility="additive",
                 ))
                 repo.commit("bootstrap", push=True)
@@ -769,7 +769,7 @@ class SchemaDriftDetectionTests(TestCase):
                 plan = planner.build_plan(repo.work, "deploy/releases")
                 self.assertEqual(plan.safety_status, planner.SafetyStatus.SCHEMA_DRIFT_DETECTED)
                 self.assertIn(
-                    "webrequests.0008_webrequestconfig_dedication_tts",
+                    "webrequests.0009_alter_webrequestconfig_dedication_tts_timeout_seconds_and_more",
                     plan.schema_pending_migrations,
                 )
         finally:

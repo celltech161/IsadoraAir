@@ -262,9 +262,8 @@ def parse_args():
     )
     parser.add_argument(
         "--voice",
-        choices=["day", "night", "auto"],
         required=True,
-        help="day=Claira, night=Max, auto=pick by WeatherConfig.voice_schedule for the current hour.",
+        help="Persona slot key, or auto to use WeatherConfig.voice_schedule for the current hour.",
     )
     return parser.parse_args()
 

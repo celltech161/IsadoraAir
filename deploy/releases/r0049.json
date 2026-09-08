@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "release_id": "r0049",
+  "previous_release_id": "r0048",
+  "minimum_updater_protocol_version": 5,
+  "summary": "Makes Weather schedules persona-agnostic, gives clean installs one neutral unvoiced all-day persona, removes literal-day fallbacks and KanDrive's fixed-slot/Kokoro-only restrictions, corrects active Weather/Web Requests terminology, and adds the speech-text audit. Existing configuration is never rewritten. Help-text-only additive migrations; no dependency, unit, static, nginx, protected-runtime, or live cutover change.",
+  "migrations_required": [
+    "weather.0008_alter_weatherconfig_voice_schedule_and_more",
+    "road_conditions.0011_alter_roadconditionsconfiguration_tts_timeout_seconds_and_more",
+    "webrequests.0009_alter_webrequestconfig_dedication_tts_timeout_seconds_and_more"
+  ],
+  "migration_compatibility": "additive",
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-gunicorn"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0007"
+}

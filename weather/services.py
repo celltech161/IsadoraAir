@@ -8,8 +8,8 @@ benefits from a separate process the way Piper/ffmpeg-based work does.
 
 Data files live under DATA_DIR (settings.WEATHER_DATA_DIR), read and
 written by both this module (via the Django view, running as the
-gunicorn user) and the standalone cron scripts of the companion
-`weather-ingest` project (running as the same user) -- same
+gunicorn user) and the in-tree weather_ingest jobs (running as the
+same user in their dedicated environment) -- the same
 shared-directory convention as syndicated-ingest/lib.
 """
 

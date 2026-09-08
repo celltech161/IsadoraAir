@@ -18,7 +18,7 @@ class Command(BaseCommand):
     """Thin internal bridge: submits an existing, enabled FXCart to the
     IsadoraAir playback engine via its existing fx_fire engine command,
     for callers that can't reach Django directly -- currently the
-    external weather-ingest venv's severe-weather alert beep
+    in-tree weather_ingest venv's severe-weather alert beep
     (wx_alert_beep.py), invoked via subprocess using the same cross-venv
     pattern as sync_track_file/send_weather_notification/dump_weather_config.
 

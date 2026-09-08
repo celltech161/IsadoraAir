@@ -28,14 +28,14 @@ class RoadConditionsConfigurationAdmin(admin.ModelAdmin):
                             "generate_road_condition_audio. Either field may be left blank to omit that "
                             "piece entirely. Both support the literal token {announcer_name}, replaced "
                             "with the FULL on-air name (e.g. 'Claira Sky', not just 'Claira') of "
-                            "whichever voice (day/night) is currently selected for this report. There "
+                            "whichever scheduled persona is selected for this report. There "
                             "is no separate announcer-name setting here "
                             "on purpose -- that voice metadata (see the Weather Configuration voice "
                             "schedule) is already the single source of truth for the name.",
         }),
-        ("Future Shared TTS Cutover", {
+        ("Speech & Announcer Personas", {
             "fields": ["tts_voice", "tts_use_weather_schedule", "tts_timeout_seconds"],
-            "description": "Inactive preparation only; current road-report voice resolution and synthesis are unchanged.",
+            "description": "Active shared-TTS settings. Enable the weather schedule to resolve any configured Weather Voice Persona; the fixed voice field remains reserved.",
         }),
         ("Item Transition Sound", {
             "fields": ["transition_sound_enabled", "transition_sound_path"],

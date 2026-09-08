@@ -213,16 +213,25 @@ text + logical station voice + synthesis options -> WAV
 
 After logical resolution, the internal service owns
 `text + engine + provider voice + synthesis options -> WAV`. A presentation
-name/persona, spoken signoff, day/night selection, and weather schedule are
-business/station metadata above the TTS service. This layer is not a weather
-scheduler and does not know persona names.
+name/persona, spoken signoff, persona-slot selection, and weather schedule
+are business/station metadata above the TTS service. This layer is not a
+weather scheduler and does not know persona names.
 
-## Companion boundary
+## Caller boundary
 
-A companion may decide when to synthesize and what text to speak. It may invoke
+A caller may decide when to synthesize and what text to speak. It may invoke
 the installed CLI and interpret its documented exit status. It must not import
 IsadoraAir source dynamically, discover engine venvs, know model paths, or
 assume a station username.
+
+> **Current status (r0049, 2026-09-08):** Dedication intros, Road
+> Conditions, and the in-tree `weather_ingest/` component all use the
+> canonical logical-voice boundary. Road Conditions and Weather resolve
+> arbitrary `WeatherVoicePersona` slot keys; `day` and `night` are
+> supported legacy keys, not product semantics. Current checked-in Weather
+> service templates pass `--voice auto`. The “Prepared caller migrations”
+> section below is retained as a historical rollout record and its
+> then-current/future labels do not describe r0049.
 
 ## Prepared caller migrations
 

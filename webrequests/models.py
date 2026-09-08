@@ -81,13 +81,13 @@ class WebRequestConfig(models.Model):
         on_delete=models.PROTECT,
         related_name="dedication_configurations",
         help_text=(
-            "Logical voice reserved for the later shared-TTS dedication cutover. "
-            "Blank keeps the current production synthesis path unchanged."
+            "Logical station voice used for spoken dedication intros. "
+            "Blank disables intro synthesis while the requested song still airs."
         ),
     )
     dedication_tts_timeout_seconds = models.PositiveIntegerField(
         default=30,
-        help_text="Future shared-TTS timeout for a short dedication intro; not active before cutover.",
+        help_text="Shared-TTS timeout for each short dedication intro.",
     )
 
     class Meta:

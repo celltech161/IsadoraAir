@@ -1,4 +1,4 @@
-"""Shared day/night announcer voice resolution -- used by
+"""Shared announcer-persona resolution -- used by
 current_temp.py, wx_forecast.py, wx_alert.py, and amber_alert.py.
 
 Routes ALL synthesis through the canonical, station-wide shared TTS
@@ -69,6 +69,10 @@ class VoiceResolutionError(Exception):
     than discovered only after attempting synthesis."""
 
 
+class ScheduleError(ValueError):
+    """Raised when a persona schedule cannot resolve one local hour."""
+
+
 class SynthesisResult:
     """Boolean-compatible result of one synthesize() call -- every
     existing caller's `if not voices.synthesize(...):` check keeps
@@ -104,18 +108,40 @@ def voice_for_hour(hour, voice_schedule):
     range may wrap past midnight (start > end, e.g. ["night", 21, 2]).
     Pure schedule-only logic -- must match IsadoraAir's own
     weather.voice_schedule.voice_for_hour() exactly (same algorithm,
-    intentionally kept as an independent implementation here since this
-    project has no Django/shared-code dependency on the companion
-    application beyond the JSON config export)."""
-    for voice, start, end in voice_schedule:
-        if start <= end:
-            if start <= hour <= end:
-                return voice
-        else:
-            if hour >= start or hour <= end:
-                return voice
-    log.warning("No voice_schedule entry covers hour %d - defaulting to 'day'", hour)
-    return "day"
+    intentionally kept as an independent implementation here because
+    the in-tree weather_ingest environment does not import Django and
+    consumes the JSON config export instead)."""
+    if isinstance(hour, bool) or not isinstance(hour, int) or not 0 <= hour <= 23:
+        raise ScheduleError(f"hour must be an integer from 0 through 23, got {hour!r}")
+    if not isinstance(voice_schedule, list):
+        raise ScheduleError("voice_schedule must be a list")
+
+    hour_to_slot = {}
+    for entry in voice_schedule:
+        if (
+            not isinstance(entry, (list, tuple))
+            or len(entry) != 3
+            or not isinstance(entry[0], str)
+            or not entry[0]
+            or isinstance(entry[1], bool)
+            or not isinstance(entry[1], int)
+            or isinstance(entry[2], bool)
+            or not isinstance(entry[2], int)
+            or not 0 <= entry[1] <= 23
+            or not 0 <= entry[2] <= 23
+        ):
+            raise ScheduleError(f"malformed schedule entry: {entry!r}")
+        slot, start, end = entry
+        hours = range(start, end + 1) if start <= end else (*range(start, 24), *range(0, end + 1))
+        for scheduled_hour in hours:
+            if scheduled_hour in hour_to_slot:
+                raise ScheduleError(f"voice_schedule overlaps at local hour {scheduled_hour}")
+            hour_to_slot[scheduled_hour] = slot
+
+    missing = [scheduled_hour for scheduled_hour in range(24) if scheduled_hour not in hour_to_slot]
+    if missing:
+        raise ScheduleError(f"voice_schedule has no entry covering local hour(s): {missing}")
+    return hour_to_slot[hour]
 
 
 def resolve_voice(cfg, requested_slot, *, now=None):
@@ -128,13 +154,17 @@ def resolve_voice(cfg, requested_slot, *, now=None):
     VoiceResolutionError for any missing/malformed configuration --
     fails closed rather than guessing an announcer.
 
-    requested_slot is "day", "night", or "auto" (resolves the current
+    requested_slot is an arbitrary nonblank persona slot key, or "auto",
+    which resolves the current
     slot from cfg["voice_schedule"] via voice_for_hour()). `now` is an
     optional datetime for tests; defaults to the current local time
     (this project runs without TZ-aware datetimes, same as its own
     historical current_temp.py/wx_forecast.py callers)."""
     if not isinstance(cfg, dict):
         raise VoiceResolutionError("weather configuration is missing or malformed")
+    if not isinstance(requested_slot, str) or not requested_slot.strip():
+        raise VoiceResolutionError("voice persona slot must be a nonblank string")
+    requested_slot = requested_slot.strip()
 
     if requested_slot == "auto":
         schedule = cfg.get("voice_schedule")
@@ -144,7 +174,10 @@ def resolve_voice(cfg, requested_slot, *, now=None):
             )
         from datetime import datetime
         hour = (now or datetime.now()).hour
-        slot = voice_for_hour(hour, schedule)
+        try:
+            slot = voice_for_hour(hour, schedule)
+        except ScheduleError as exc:
+            raise VoiceResolutionError(str(exc)) from exc
     else:
         slot = requested_slot
 

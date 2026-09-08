@@ -6,6 +6,14 @@ because Kokoro is the current production-preferred voice -- both are
 part of the generated-speech architecture as an explicitly selected alternate
 voice engine. There is no automatic engine selection or failover.
 
+> **Current architecture note (r0049, 2026-09-08):** the dated tables and
+> smoke-test paths below are retained as the 2026-08-12 runtime-discovery
+> record. Current callers select an enabled logical `StationTTSVoice` and
+> use the canonical shared TTS service. The in-tree `weather_ingest/`
+> component has no provider map; Road Conditions accepts both Kokoro and
+> Piper personas; Weather schedules contain arbitrary persona slot keys; and
+> current checked-in Weather service templates pass `--voice auto`.
+
 ## Support matrix
 
 | Engine | Runtime reproducible? | Models reproducible? | Current use | Future role |

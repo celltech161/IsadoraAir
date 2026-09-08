@@ -358,21 +358,22 @@ class RoadConditionsConfiguration(models.Model):
         on_delete=models.PROTECT,
         related_name="road_condition_configurations",
         help_text=(
-            "Logical voice reserved for the later shared-TTS road-report cutover. "
-            "Blank keeps the current external weather-voice/Kokoro path unchanged."
+            "Reserved fixed logical voice. The active generator currently resolves "
+            "Weather Voice Personas from the weather schedule instead."
         ),
     )
     tts_use_weather_schedule = models.BooleanField(
         default=False,
         help_text=(
-            "Future cutover option: resolve the current WeatherConfig schedule through "
-            "Weather Voice Personas instead of using the fixed voice above. Off by default."
+            "Resolve the current WeatherConfig schedule through Weather Voice Personas. "
+            "This is the active road-report voice mode and must be enabled; when off, "
+            "generation fails clearly because the retired legacy path is unavailable."
         ),
     )
     tts_timeout_seconds = models.PositiveIntegerField(
         default=600,
         help_text=(
-            "Future per-segment shared-TTS timeout for long road reports. This deliberately "
+            "Per-segment shared-TTS timeout for long road reports. This deliberately "
             "does not change the shared service's shorter generic default."
         ),
     )

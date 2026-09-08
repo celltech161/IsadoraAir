@@ -104,11 +104,11 @@ class WeatherConfigAdmin(admin.ModelAdmin):
         notices = [{
             "level": "info",
             "text": (
-                "The separate weather-ingest companion project (its own repo/venv, not "
-                "part of IsadoraAir) reads this authoritative setting through a narrow "
-                "management-command bridge on every new job. A saved path therefore takes "
-                "effect for its next invocation; move existing shared files before jobs "
-                "resume, and restart the web service for Django's long-running process."
+                "The in-tree weather_ingest jobs read this authoritative setting through "
+                "the dump_weather_config management-command bridge on every new job. A "
+                "saved path therefore takes effect for the next invocation; move existing "
+                "shared files before jobs resume, and restart the web service for Django's "
+                "long-running process."
             ),
         }]
         try:

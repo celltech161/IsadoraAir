@@ -28,11 +28,16 @@ class VoiceForHourTests(SimpleTestCase):
         self.assertEqual(voice_for_hour(18, schedule), "night")
         self.assertEqual(voice_for_hour(5, schedule), "night")
 
-    def test_no_covering_entry_defaults_to_day(self):
-        self.assertEqual(voice_for_hour(10, [["night", 18, 5]]), "day")
+    def test_no_covering_entry_raises(self):
+        with self.assertRaises(ScheduleError):
+            voice_for_hour(10, [["night", 18, 5]])
 
-    def test_empty_schedule_defaults_to_day(self):
-        self.assertEqual(voice_for_hour(10, []), "day")
+    def test_empty_schedule_raises(self):
+        with self.assertRaises(ScheduleError):
+            voice_for_hour(10, [])
+
+    def test_arbitrary_persona_slot_is_returned(self):
+        self.assertEqual(voice_for_hour(10, [["morning_host", 0, 23]]), "morning_host")
 
 
 PRODUCTION_SCHEDULE = [["day", 3, 8], ["night", 9, 14], ["day", 15, 20], ["night", 21, 2]]

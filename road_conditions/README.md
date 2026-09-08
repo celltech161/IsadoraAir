@@ -258,7 +258,7 @@ KanDrive audio timer (isadoraair-generate-road-condition-audio.timer)
        actual on-air artifact that generation would produce
     -> feed_freshness() + the fingerprint/health check decide whether to
        retire the existing report, skip synthesis (nothing changed), or
-       actually run Kokoro/shared-TTS + ffmpeg
+       actually run shared TTS + ffmpeg
 ```
 
 ### KDOT sync
@@ -298,17 +298,17 @@ run `generate_road_condition_audio` (no flags -- normal production
 invocation never passes `--force`/`--regenerate`/`--voice`, which exist
 for manual verification only) on a fixed 5-minute check, independent of
 `poll_cadence_minutes`. A 5-minute check means a newly-synced KDOT
-change, or a day/night voice-schedule boundary, reaches the spoken
+change, or an announcer-persona schedule boundary, reaches the spoken
 report within at most ~5 minutes, and a stale/failed/disabled feed is
 retired promptly -- without costing anything extra on every other tick,
 since `report.compute_report_fingerprint()` / `synthesis.
-existing_report_is_healthy()` skip the whole Kokoro/shared-TTS/ffmpeg
+existing_report_is_healthy()` skip the whole shared-TTS/ffmpeg
 pipeline whenever nothing that actually affects the resulting audio has
 changed. Its own command-wide advisory lock
 (`GENERATE_ROAD_AUDIO_LOCK_KEY`) means an overlapping firing (a
 genuinely long multi-segment synthesis still in flight) just exits
 immediately. `TimeoutStartSec=0` on the service deliberately leaves the
-run duration to the application's own internal bounds (per-call Kokoro/
+run duration to the application's own internal bounds (per-call shared-TTS/
 shared-TTS timeouts, ffmpeg/ffprobe timeouts, the advisory lock) rather
 than an arbitrary systemd start timeout -- a real production report has
 already measured at 165.2s of finished audio for 7 events.

@@ -11,7 +11,7 @@ state.
 LENGTH, verified against the real live dataset (14 currently-in-scope
 north-central Kansas events at reconnaissance time): the full,
 consolidated report runs ~780 words, roughly 5.2-6 minutes of spoken
-audio at typical Kokoro/radio pacing -- longer than the ~60-180s a
+audio at typical synthesized/radio pacing -- longer than the ~60-180s a
 single "traffic and road conditions" segment usually runs. Per the
 task's own escalation order, two length-reduction techniques were
 applied where they genuinely help without weakening content:
@@ -471,7 +471,7 @@ def compute_report_fingerprint(text, voice_slot, voice, transition_active,
     """SHA-256 hex digest of a deterministic, canonical JSON payload
     representing the effective on-air artifact this generation cycle
     would produce -- used by generate_road_condition_audio.py to skip
-    the expensive Kokoro/ffmpeg/analysis pipeline when nothing that
+    the expensive shared-TTS/ffmpeg/analysis pipeline when nothing that
     actually affects the resulting audio has changed since the last
     successful generation (see RoadConditionsConfiguration.
     last_report_fingerprint / last_report_generated_at).
@@ -524,7 +524,7 @@ def compute_report_fingerprint(text, voice_slot, voice, transition_active,
     fingerprint if it would actually insert a different number of
     transition sounds; irrelevant, and therefore ignored, whenever
     transition_active is False, since item/segment count has zero
-    effect on a single-Kokoro-call synthesis.
+    effect on a single-shared-TTS-call synthesis.
 
     `version` is REPORT_FINGERPRINT_VERSION and `audio_format_version`
     is synthesis.AUDIO_FORMAT_VERSION -- two independent counters (see

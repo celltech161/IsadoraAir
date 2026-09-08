@@ -66,9 +66,9 @@ class WeatherEnvAdminTests(TestCase):
         html = self.client.get(self.url()).content.decode()
         self.assertIn("/srv/fromdisk/weather", html)
 
-    def test_external_companion_shared_setting_contract_always_shown(self):
+    def test_in_tree_weather_shared_setting_contract_always_shown(self):
         html = self.client.get(self.url()).content.decode()
-        self.assertIn("weather-ingest companion project", html)
+        self.assertIn("in-tree weather_ingest jobs", html)
         self.assertIn("authoritative setting", html)
         self.assertIn("next invocation", html)
 

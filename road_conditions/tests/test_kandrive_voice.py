@@ -20,9 +20,9 @@ from django.utils import timezone as dj_timezone
 from isadoraair.tts.models import StationTTSVoice
 from road_conditions import voice as voice_module
 from road_conditions.models import RoadConditionsConfiguration
-from road_conditions.voice import VoiceResolutionError, available_slots, resolve_voice
+from road_conditions.voice import VoiceResolutionError, resolve_voice
 from weather.models import WeatherConfig, WeatherVoicePersona
-from weather.voice_schedule import voice_for_hour
+from weather.voice_schedule import ScheduleError, voice_for_hour
 
 
 class NoWeatherIngestImportDependencyTests(TestCase):
@@ -99,8 +99,9 @@ class ScheduleResolutionTests(TestCase):
             with self.subTest(hour=hour):
                 self.assertEqual(voice_for_hour(hour, schedule), "day")
 
-    def test_hour_covered_by_no_entry_defaults_to_day(self):
-        self.assertEqual(voice_for_hour(10, [["night", 18, 5]]), "day")
+    def test_hour_covered_by_no_entry_raises(self):
+        with self.assertRaises(ScheduleError):
+            voice_for_hour(10, [["night", 18, 5]])
 
     def test_schedule_resolution_matches_weather_config_for_the_hour_through_resolve_voice(self):
         """resolve_voice() determines which voice WEATHER would use for
@@ -144,8 +145,19 @@ class ScheduleResolutionTests(TestCase):
         with self.assertRaises(VoiceResolutionError):
             resolve_voice(slot_override="afternoon")
 
-    def test_available_slots(self):
-        self.assertEqual(available_slots(), ["day", "night"])
+    def test_schedule_gap_becomes_voice_resolution_error(self):
+        RoadConditionsConfiguration.objects.all().delete()
+        RoadConditionsConfiguration.objects.create(tts_use_weather_schedule=True)
+        weather_config = WeatherConfig.load()
+        weather_config.voice_schedule = []
+        weather_config.save(update_fields=["voice_schedule"])
+
+        with self.assertRaises(VoiceResolutionError) as ctx:
+            resolve_voice()
+
+        self.assertIn("no entry covering", str(ctx.exception))
+
+
 
 
 # ---------------------------------------------------------------------
@@ -202,6 +214,18 @@ class SharedScheduleVoiceResolutionTests(TestCase):
         self.assertEqual(voice["name"], "Max")
         self.assertEqual(voice["full_name"], "Max Weatherly")
         self.assertEqual(voice["model"], "am_liam")
+
+    def test_arbitrary_configured_persona_slot_resolves(self):
+        WeatherVoicePersona.objects.create(
+            slot="morning_host", tts_voice=self.claira,
+            display_name="Morgan", full_name="Morgan Lee",
+        )
+
+        slot, voice = resolve_voice(slot_override="morning_host")
+
+        self.assertEqual(slot, "morning_host")
+        self.assertEqual(voice["logical_voice_name"], "Claira_Sky")
+        self.assertEqual(voice["name"], "Morgan")
 
     def test_schedule_resolution_selects_correct_slot_for_the_hour(self):
         wconfig = WeatherConfig.load()
@@ -277,7 +301,7 @@ class SharedScheduleVoiceResolutionTests(TestCase):
     # resolve_station_voice()'s own "not configured" path is exercised
     # directly in isadoraair/tests/test_tts_station.py instead.
 
-    def test_non_kokoro_persona_voice_rejected(self):
+    def test_piper_persona_voice_is_supported(self):
         from isadoraair.tts.models import PiperVoiceModel
 
         model = PiperVoiceModel.objects.create(
@@ -291,9 +315,13 @@ class SharedScheduleVoiceResolutionTests(TestCase):
             provider_voice="", piper_model=model, language="en-us", speed=1.0,
         )
         WeatherVoicePersona.objects.filter(slot="day").update(tts_voice=piper_voice)
-        with self.assertRaises(VoiceResolutionError) as ctx:
-            resolve_voice(slot_override="day")
-        self.assertIn("kokoro", str(ctx.exception).lower())
+
+        slot, voice = resolve_voice(slot_override="day")
+
+        self.assertEqual(slot, "day")
+        self.assertEqual(voice["engine"], "piper")
+        self.assertEqual(voice["logical_voice_name"], "Piper_Test")
+        self.assertEqual(voice["model"], "test-piper")
 
     def test_blank_display_and_full_name_falls_back_to_slot_never_logical_id(self):
         WeatherVoicePersona.objects.filter(slot="day").update(display_name="", full_name="")

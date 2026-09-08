@@ -36,7 +36,7 @@ class Command(BaseCommand):
         "Generate (or retire) the single, consolidated KanDrive road-report "
         "audio from currently in-scope RoadEvent rows. See road_conditions/"
         "report.py (event selection + text) and road_conditions/synthesis.py "
-        "(Kokoro synthesis + Track lifecycle) for the actual logic -- this "
+        "(shared-TTS synthesis + Track lifecycle) for the actual logic -- this "
         "command is a thin CLI wrapper plus the overlap guard, matching "
         "sync_road_conditions.py's own shape."
     )
@@ -48,7 +48,7 @@ class Command(BaseCommand):
                 "Preview everything a real run would do -- selected events, "
                 "the final script, the resolved voice, the intended category "
                 "and output file, and what existing asset (if any) would be "
-                "replaced or retired -- without writing anything: no Kokoro "
+                "replaced or retired -- without writing anything: no TTS "
                 "call, no DB write, no file write."
             ),
         )
@@ -87,11 +87,11 @@ class Command(BaseCommand):
         parser.add_argument(
             "--voice", default=None,
             help=(
-                "Override the weather-schedule-resolved voice slot (e.g. "
-                "'day' or 'night') for this run only. Development/testing "
-                "use -- production omits this so KanDrive automatically uses "
-                "whichever voice weather's own schedule says for the moment "
-                "generation actually runs. See road_conditions/voice.py."
+                "Override the weather-schedule-resolved persona slot key for "
+                "this run only. Any configured Weather Voice Persona is accepted. "
+                "Development/testing use -- production omits this so KanDrive "
+                "automatically uses whichever persona weather's schedule says when "
+                "generation runs. See road_conditions/voice.py."
             ),
         )
         parser.add_argument(

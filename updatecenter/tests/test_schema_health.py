@@ -21,19 +21,19 @@ class SchemaHealthTests(TestCase):
 
     def test_unapplied_migration_detected_deterministically(self):
         recorder = MigrationRecorder(connection)
-        recorder.record_unapplied("webrequests", "0008_webrequestconfig_dedication_tts")
+        recorder.record_unapplied("webrequests", "0009_alter_webrequestconfig_dedication_tts_timeout_seconds_and_more")
         try:
             result = schema_health.check_schema_health()
             self.assertEqual(result.status, schema_health.SchemaHealthStatus.UNAPPLIED_MIGRATIONS_DETECTED)
-            self.assertIn("webrequests.0008_webrequestconfig_dedication_tts", result.pending_migrations)
+            self.assertIn("webrequests.0009_alter_webrequestconfig_dedication_tts_timeout_seconds_and_more", result.pending_migrations)
         finally:
-            recorder.record_applied("webrequests", "0008_webrequestconfig_dedication_tts")
+            recorder.record_applied("webrequests", "0009_alter_webrequestconfig_dedication_tts_timeout_seconds_and_more")
 
     def test_multiple_unapplied_migrations_all_listed(self):
         recorder = MigrationRecorder(connection)
         targets = [
-            ("webrequests", "0008_webrequestconfig_dedication_tts"),
-            ("road_conditions", "0010_roadconditionsconfiguration_tts"),
+            ("webrequests", "0009_alter_webrequestconfig_dedication_tts_timeout_seconds_and_more"),
+            ("road_conditions", "0011_alter_roadconditionsconfiguration_tts_timeout_seconds_and_more"),
         ]
         for app, name in targets:
             recorder.record_unapplied(app, name)
@@ -59,7 +59,7 @@ class SchemaHealthTests(TestCase):
         """Confirms the recorder round-trip itself is clean -- the
         fixture technique other tests rely on actually works both ways."""
         recorder = MigrationRecorder(connection)
-        recorder.record_unapplied("webrequests", "0008_webrequestconfig_dedication_tts")
-        recorder.record_applied("webrequests", "0008_webrequestconfig_dedication_tts")
+        recorder.record_unapplied("webrequests", "0009_alter_webrequestconfig_dedication_tts_timeout_seconds_and_more")
+        recorder.record_applied("webrequests", "0009_alter_webrequestconfig_dedication_tts_timeout_seconds_and_more")
         result = schema_health.check_schema_health()
         self.assertEqual(result.status, schema_health.SchemaHealthStatus.SCHEMA_CURRENT)

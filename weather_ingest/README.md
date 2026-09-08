@@ -1,26 +1,20 @@
-# weather-ingest
+# weather_ingest
 
-Local weather/alerting for IsadoraAir: current-temperature and
-multi-day forecast announcements (TTS), watch/warning alert beeps
-(fires an IsadoraAir FX Cart), and IPAWS AMBER/BLU/MEP alert polling.
-Companion production project to IsadoraAir, not part of that repo --
-runs as its own set of systemd timers/services on the same host.
-
-**Shared-TTS migration status (implementation branch)**: all speech
-synthesis in this project has been migrated, on this development
-branch, to route through IsadoraAir's canonical shared TTS surface
-(`/usr/local/bin/isadoraair-tts`, logical-voice based -- see "Runtime
-integration prerequisites" below) instead of invoking a TTS provider
-binary directly. This code has NOT yet been accepted onto production
-weather-ingest, and `/home/jreed/kokoro` must NOT be deleted until it
-is -- do not treat this README as describing the currently-running
-production script set until that cutover has actually happened.
+In-tree IsadoraAir component for local weather/alerting:
+current-temperature and multi-day forecast announcements (TTS),
+watch/warning alert beeps (fires an IsadoraAir FX Cart), and IPAWS
+AMBER/BLU/MEP alert polling. The former standalone weather-ingest
+repository was imported at r0048; this directory is now the canonical
+Git-owned source. It keeps an isolated venv and separate oneshot
+services, but is not a companion repository. All speech uses the
+canonical logical-voice TTS surface at
+`/usr/local/bin/isadoraair-tts`.
 
 ## What it does
 
 - `current_temp.py` -- current temperature announcer (shared logical TTS).
-- `wx_forecast.py` -- 1-day/3-day, day/night forecast announcers (4
-  separate scheduled variants).
+- `wx_forecast.py` -- 1-day/3-day forecast announcements; persona
+  selection is automatic from `WeatherConfig.voice_schedule`.
 - `update_local_wx_data.py` -- polls/refreshes the shared weather cache
   at IsadoraAir's admin-editable `WEATHER_DATA_DIR`.
 - `wx_alert.py` / `wx_alert_beep.py` -- watch/warning detection and the
@@ -32,18 +26,19 @@ production script set until that cutover has actually happened.
 
 ## Entry points
 
-One `systemd` service per script (`Type=oneshot`,
-`WorkingDirectory=/home/jreed/weather-ingest`,
-`ExecStart=/home/jreed/weather-ingest/venv/bin/python
-/home/jreed/weather-ingest/<script>.py`), each with a matching
-`.timer`: `wx-current-temp`, `wx-forecast-{1day,3day}-{day,night}`,
-`wx-update-local-data`, `wx-alert-beep`, `amber-alert-poll`. Units live
-in `/etc/systemd/system/` -- not part of this repo.
+Checked-in deploy templates define one `Type=oneshot` service per
+script, each with a matching timer: `wx-current-temp`,
+`wx-forecast-{1day,3day}-{day,night}`, `wx-update-local-data`,
+`wx-alert-beep`, and `amber-alert-poll`. The renderer expands
+`@@WEATHER_ROOT@@` to the in-tree directory for r0048+ installations.
+Current-temperature and all forecast templates pass `--voice auto`;
+legacy unit filenames do not define persona semantics.
 
 ## Python / venv
 
-`venv/` (not versioned) is a standalone `python3 -m venv` (Python
-3.14.4, no `--system-site-packages`).
+`weather_ingest/venv` (not versioned) is an isolated `python3` venv
+with no `--system-site-packages`. On a canonical installation it
+lives under `/opt/isadoraair/weather_ingest/venv`.
 
 Recreate it:
 
@@ -53,17 +48,17 @@ venv/bin/pip install -r requirements.txt
 ```
 
 `requirements.txt` (added 2026-08-12, IsadoraAir 1.2 Phase 3) covers
-this project's own Python environment -- `requests` is genuinely the
+this component's own Python environment -- `requests` is genuinely the
 only direct PyPI dependency (verified against every tracked `.py`
 file's actual `import` statements). It is **not**, by itself, enough to
-make weather-ingest functional -- see "Runtime integration
+make weather_ingest functional -- see "Runtime integration
 prerequisites" below for what else has to exist.
 
 ## Runtime integration prerequisites (not pip-installable)
 
-Unlike syndicated-ingest, this project has almost no ordinary
+Unlike syndicated-ingest, this component has almost no ordinary
 dependencies of its own -- what it actually needs is a set of *other
-running systems*, cross-venv/cross-process:
+runtime surfaces, cross-venv/cross-process:
 
 - **IsadoraAir itself, checked out and migrated**, reachable at
   `ISADORAAIR_DIR` (see below) with its own venv and `.env` in place.
@@ -108,7 +103,7 @@ migrated first), not a packaging gap.
 
 ## Configuration and credentials -- different pattern than syndicated-ingest
 
-This project has **no standalone credential file of its own**. Instead:
+This component has **no standalone credential file of its own**. Instead:
 
 - Station/alert configuration (`WeatherConfig`, `AmberAlertConfig`) is
   admin-editable inside IsadoraAir's own Django database, read here via
@@ -134,7 +129,7 @@ dependency on IsadoraAir's own absolute install path/canonical runtime
 surfaces and its database, not a self-contained config. See the
 IsadoraAir repo's `docs/HARDCODED_PATH_AUDIT.md` (IsadoraAir 1.2 Phase
 3) for the full classification of every such path across all three
-companion projects and which ones were judged worth a low-risk
+components and which ones were judged worth a low-risk
 env-override.
 
 ## External directories (outside this repo, not versioned)
@@ -152,10 +147,15 @@ All `*.py` source (top level and `lib/`), plus `media/weather_beeps.flac`
 -- a small, fixed audio asset `wx_alert_beep.py` plays, not generated
 output.
 
+
+Repository history establishes that `weather_beeps.flac` was imported
+byte-for-byte from the standalone repository, but contains no source,
+author, license, or acquisition record. Its provenance is not
+established from repository evidence.
 ## Voice resolution (shared-TTS migration)
 
-`day`/`night`/`auto` resolve identically across every speech-producing
-script (`current_temp.py`, `wx_forecast.py`, `wx_alert.py`,
+`auto` or an explicit arbitrary persona slot resolves identically
+across every speech-producing script (`current_temp.py`, `wx_forecast.py`, `wx_alert.py`,
 `amber_alert.py`), via `lib/voices.py`'s `resolve_voice()`:
 
 ```
@@ -170,15 +170,15 @@ Both the schedule and the persona come from `lib/wxconfig.py`'s
 `load_weather_config()` (the same cross-venv `dump_weather_config`
 export this project has always used) -- there is no local, independent
 copy of either the schedule or a provider voice-id table anywhere in
-this project.
+this component. Slot keys have no built-in semantics: `default`,
+`morning_host`, `day`, `night`, and any other configured slug are
+equivalent.
 
-The 4 deployed `wx_forecast.py` systemd units each still pass an
-explicit `--voice day`/`--voice night` matched to their own schedule
-window -- unchanged by this migration. `--voice auto` is fully
-supported by every speech script (see above) for manual/test use; a
-future consolidation of forecast voice-schedule authority into
-`WeatherConfig.voice_schedule` alone (switching those units to
-`--voice auto`) is a deliberately separate, not-yet-scheduled task.
+The checked-in current-temperature and forecast service templates pass
+`--voice auto`, making `WeatherConfig.voice_schedule` the authority.
+Manual and test runs may pass any explicit persona slot key; normal
+operation uses `auto`. Historical `day` and `night` keys remain
+valid data with no special behavior.
 
 ## Tests
 

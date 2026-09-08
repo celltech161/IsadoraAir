@@ -24,7 +24,7 @@ DEDICATION_ROOT = Path(settings.LIBRARY_ROOT) / "Dedications"
 
 # "feat." (any case, with the period -- requiring it is what keeps this
 # from also mangling "feat" used as an actual word, e.g. a title like
-# "Incredible Feat") gets spoken by Kokoro as the rhyming word ("feet")
+# "Incredible Feat") can be spoken as the rhyming word ("feet")
 # rather than expanded to "featuring". Word-boundary on the left only,
 # so it matches both "(feat. X)" and "feat. X" but never touches
 # "featuring" itself (which the same \bfeat\. pattern can't match --
@@ -459,7 +459,7 @@ def build_dedication_intro_text(track, requester_name, dedication_message):
 
     Title/artist go through the "feat." normalization below -- their
     display value in the DB/tags is untouched, only the string handed
-    to Kokoro."""
+    to the configured logical TTS voice."""
     title = _FEATURED_ARTIST_ABBREV_RE.sub("featuring", track.title)
     artist_name = _FEATURED_ARTIST_ABBREV_RE.sub("featuring", track.artist.name)
     sentence = f"Now here's {title} by {artist_name}"
@@ -526,11 +526,11 @@ def _synthesize_dedication_wav(cfg, text, tmp_wav):
 
 
 def synthesize_dedication_intro(req):
-    """Renders req's spoken intro via Kokoro, converts to FLAC, and
-    attaches it as req.intro_track -- called from the standalone
+    """Renders req's spoken intro via shared TTS, converts to FLAC, and
+    attaches it as req.intro_track -- called from the
     generate_dedication_intros command (its own timer, deliberately kept
     OUT of refresh_song_request_statuses, which must stay fast and
-    reliable; Kokoro+ffmpeg together can take tens of seconds worst
+    reliable; TTS plus ffmpeg can take tens of seconds worst
     case). Whole body in one try/except: a failure on one request must
     not stop the command's loop over the others.
 

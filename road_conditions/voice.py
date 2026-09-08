@@ -45,54 +45,39 @@ being True (KOGR's real production state):
   effect -- resolve_voice() raises the same "not enabled" error.
 
 Every failure -- schedule disabled, unknown slot, missing/incomplete
-persona, non-Kokoro engine, or a disabled/invalid shared-TTS voice --
-raises the same VoiceResolutionError, so generate_road_condition_audio.py's
+persona, or a disabled/invalid shared-TTS voice -- raises the same
+VoiceResolutionError, so generate_road_condition_audio.py's
 existing `except VoiceResolutionError` handling covers all of them
 without changes."""
 from django.utils import timezone as dj_timezone
 
-from weather.voice_schedule import voice_for_hour
-
-# Real slot names this station currently schedules -- kept here (not
-# derived from a live query) purely for --voice argument validation
-# and help text; see available_slots() below. Matches
-# WeatherConfig.voice_schedule's own documented contract ("day" or
-# "night").
-KNOWN_SLOTS = ("day", "night")
-
+from weather.voice_schedule import ScheduleError, voice_for_hour
 
 class VoiceResolutionError(Exception):
-    """Raised when a slot/persona/logical voice can't be resolved, or
-    when a resolved voice isn't usable (e.g. its engine isn't Kokoro --
-    Piper support is explicitly out of scope for KanDrive)."""
-
-
-def available_slots():
-    """The slot names this station currently schedules -- used to
-    validate --voice and to build admin/command help text without
-    hard-coding the list at each call site."""
-    return sorted(KNOWN_SLOTS)
-
+    """Raised when a persona slot or logical station voice cannot be resolved."""
 
 def _resolve_schedule_slot(slot_override, now):
     """The schedule-only half of voice resolution -- identical for both
     modes (see this module's own docstring): WeatherConfig.voice_schedule
     resolved via weather.voice_schedule.voice_for_hour(), which has no
-    knowledge of personas/Kokoro/Piper at all, so a schedule change can
+    knowledge of personas or providers, so a schedule change can
     never resolve a different slot in one mode than the other."""
     if slot_override:
         return slot_override
     from weather.models import WeatherConfig
     config = WeatherConfig.load()
     local_now = dj_timezone.localtime(now or dj_timezone.now())
-    return voice_for_hour(local_now.hour, config.voice_schedule)
+    try:
+        return voice_for_hour(local_now.hour, config.voice_schedule)
+    except ScheduleError as exc:
+        raise VoiceResolutionError(str(exc)) from exc
 
 
 def _resolve_persona_for_slot(slot):
     """Shared by both modes: WeatherVoicePersona -> its tts_voice FK ->
     isadoraair.tts.station.resolve_station_voice(). Raises
     VoiceResolutionError for any missing/incomplete persona or
-    disabled/invalid/non-Kokoro voice -- never silently falls back to a
+    disabled/invalid logical voice -- never silently falls back to a
     different announcer."""
     from isadoraair.tts.errors import TTSError
     from isadoraair.tts.station import resolve_station_voice
@@ -120,11 +105,6 @@ def _resolve_persona_for_slot(slot):
             f"(logical voice {persona.tts_voice.name!r}): {exc}"
         ) from exc
 
-    if resolved.engine.value != "kokoro":
-        raise VoiceResolutionError(
-            f"Weather Voice Persona {slot!r} resolves to engine {resolved.engine.value!r}, not kokoro -- "
-            "KanDrive audio generation only supports Kokoro (see road_conditions/synthesis.py)."
-        )
     return persona, resolved
 
 
@@ -188,8 +168,8 @@ def resolve_voice(slot_override=None, now=None):
     schedule is not enabled (the direct-Kokoro rollback path this used
     to fall back to was retired in r0029; that runtime no longer
     exists) as well as for every other resolution failure (unknown
-    slot, missing/incomplete persona, non-Kokoro engine, disabled/
-    invalid shared-TTS voice) -- so every existing caller
+    slot, missing/incomplete persona, or disabled/invalid shared-TTS
+    voice) -- so every existing caller
     (generate_road_condition_audio.py) needs no mode-awareness of its
     own.
 

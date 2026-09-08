@@ -17,7 +17,7 @@ import voices  # noqa: E402
 from voices import (  # noqa: E402
     ISADORAAIR_TTS_BINARY, REASON_LAUNCH_FAILED, REASON_MISSING_EXECUTABLE,
     REASON_NONZERO_EXIT, REASON_NO_LOGICAL_VOICE, REASON_OUTPUT_MISSING,
-    REASON_TIMEOUT, VoiceResolutionError, resolve_voice, synthesize, voice_for_hour,
+    REASON_TIMEOUT, ScheduleError, VoiceResolutionError, resolve_voice, synthesize, voice_for_hour,
 )
 
 
@@ -49,11 +49,13 @@ class VoiceForHourTests(unittest.TestCase):
             with self.subTest(hour=hour):
                 self.assertEqual(voice_for_hour(hour, schedule), "day")
 
-    def test_no_covering_entry_defaults_to_day(self):
-        self.assertEqual(voice_for_hour(10, [["night", 18, 5]]), "day")
+    def test_no_covering_entry_raises(self):
+        with self.assertRaises(ScheduleError):
+            voice_for_hour(10, [["night", 18, 5]])
 
-    def test_empty_schedule_defaults_to_day(self):
-        self.assertEqual(voice_for_hour(10, []), "day")
+    def test_empty_schedule_raises(self):
+        with self.assertRaises(ScheduleError):
+            voice_for_hour(10, [])
 
 
 class ResolveVoiceTests(unittest.TestCase):
@@ -91,6 +93,24 @@ class ResolveVoiceTests(unittest.TestCase):
             with self.subTest(hour=hour):
                 slot, _voice = resolve_voice(cfg, "auto", now=datetime(2026, 1, 1, hour, 0))
                 self.assertEqual(slot, expected)
+
+    def test_arbitrary_persona_slot_resolves_explicitly(self):
+        cfg = make_cfg(
+            schedule=[["morning_host", 0, 23]],
+            personas={"morning_host": {
+                "logical_voice": "Morning_Host", "display_name": "Morgan",
+                "full_name": "Morgan Lee", "signoff": "Morgan here.",
+            }},
+        )
+        slot, voice = resolve_voice(cfg, "morning_host")
+        self.assertEqual(slot, "morning_host")
+        self.assertEqual(voice["logical_voice"], "Morning_Host")
+
+    def test_schedule_gap_becomes_voice_resolution_error_for_auto(self):
+        cfg = make_cfg(schedule=[["day", 0, 5]])
+        with self.assertRaises(VoiceResolutionError) as ctx:
+            resolve_voice(cfg, "auto", now=datetime(2026, 1, 1, 12, 0))
+        self.assertIn("no entry covering", str(ctx.exception))
 
     def test_missing_config_fails_closed(self):
         with self.assertRaises(VoiceResolutionError):

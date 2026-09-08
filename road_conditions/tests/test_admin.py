@@ -60,10 +60,10 @@ class RoadConditionsAdminTests(TestCase):
         response = self.client.get(reverse("admin:road_conditions_roadconditionsconfiguration_change", args=[1]))
         self.assertContains(response, 'name="additional_route_coverage"')
 
-    def test_config_change_form_includes_inactive_shared_tts_preparation(self):
+    def test_config_change_form_includes_active_shared_tts_settings(self):
         RoadConditionsConfiguration.load()
         response = self.client.get(reverse("admin:road_conditions_roadconditionsconfiguration_change", args=[1]))
-        self.assertContains(response, "Future Shared TTS Cutover")
+        self.assertContains(response, "Speech &amp; Announcer Personas")
         self.assertContains(response, 'name="tts_voice"')
         self.assertContains(response, 'name="tts_use_weather_schedule"')
         self.assertContains(response, 'name="tts_timeout_seconds"')

@@ -7,12 +7,11 @@ from weather.models import WeatherConfig, WeatherVoicePersona
 
 
 class Command(BaseCommand):
-    """Prints WeatherConfig as JSON to stdout. The weather-ingest cron
-    scripts run in their own venv without Django installed (same
-    cross-venv-via-subprocess pattern as sync_track_file), so this is
-    their only way to read the admin-editable config."""
+    """Print WeatherConfig as JSON for the in-tree weather_ingest jobs.
+    Their dedicated environment does not import Django, so this narrow
+    management-command bridge is how they read admin-editable config."""
 
-    help = "Dump WeatherConfig as JSON for the external weather-ingest scripts."
+    help = "Dump WeatherConfig as JSON for the in-tree weather_ingest jobs."
 
     def handle(self, *args, **options):
         cfg = WeatherConfig.load()
@@ -26,7 +25,7 @@ class Command(BaseCommand):
             for persona in WeatherVoicePersona.objects.select_related("tts_voice")
         }
         self.stdout.write(json.dumps({
-            # Narrow config handoff for the external companion: expose this
+            # Narrow config handoff for weather_ingest: expose this
             # one non-secret setting, never IsadoraAir's complete .env.
             "weather_data_dir": str(settings.WEATHER_DATA_DIR),
             "station_lat": cfg.station_lat,

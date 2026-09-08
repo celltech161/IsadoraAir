@@ -35,16 +35,16 @@ not sequence-preserving. A multi-part report could play Part 2 without
 Part 1 ever having aired, or hours apart, which would be actively
 confusing rather than helpful. Not adopted.
 
-Kokoro invocation mirrors the established in-Django pattern
-(webrequests/services.py's synthesize_dedication_intro) exactly: same
-binary, same WAV-then-ffmpeg-to-FLAC pipeline, same atomic
+Shared-TTS invocation mirrors the established in-Django pattern
+(webrequests/services.py's synthesize_dedication_intro): the same
+logical-voice API, WAV-then-ffmpeg-to-FLAC pipeline, and atomic
 os.replace() (the final path is never touched until the new file is
 completely written and its duration probed), same temp-file naming and
 cleanup. A failure at any point in synthesis leaves the existing
 final_path (and its Track row) completely untouched -- the last
 known-good report keeps airing rather than going silent or corrupt.
 
-Loudness normalization: the final spoken audio (whether one Kokoro
+Loudness normalization: the final spoken audio (whether one shared-TTS
 call or several spliced with a transition sound -- see
 _synthesize_with_transitions()) is run through the SAME two-pass EBU
 R128 loudnorm target the KNS show ingest script applies to every other
@@ -55,11 +55,10 @@ two-pass loudnorm structurally can't run as a single streaming pass
 over a pipe -- the second pass's linear correction needs the first
 pass's COMPLETE measurement before it can correctly apply anything
 starting from sample 0 -- so this needs a real, re-readable file for
-Kokoro's raw output (and, on the transition-sound path, each segment's
-own WAV). Kokoro's own writer (see kokoro_synth's _kokoro_synth.py)
-uses Python's `wave` module, which seeks back to patch the RIFF header
-on close and so also can't write to a pipe/stdout regardless. Given
-both constraints, the closest thing to "no disk I/O for this scratch
+the provider's raw output (and, on the transition-sound path, each
+segment's own WAV). Provider WAV writers may require a seekable path.
+Given that and two-pass loudnorm, the closest thing to "no disk I/O
+for this scratch
 audio" is a tmpfs (RAM-backed, not real disk) directory -- see
 TMP_AUDIO_ROOT below -- rather than true zero-file streaming, which
 isn't possible here. The FINAL FLAC still lands on real disk at
@@ -84,7 +83,7 @@ from library.models import AnalysisConfig, Category, Track
 KANDRIVE_ROOT = Path(settings.LIBRARY_ROOT) / "KanDrive"
 KANDRIVE_FILENAME = "road_report.flac"
 
-# Scratch directory for Kokoro's own raw WAV output (and, on the
+# Scratch directory for shared-TTS raw WAV output (and, on the
 # transition-sound path, each segment's WAV) -- /dev/shm is a real,
 # POSIX-standard tmpfs (RAM-backed, not the real disk KANDRIVE_ROOT
 # lives on) on this box, verified via `mount` (tmpfs on /dev/shm).
@@ -103,7 +102,7 @@ LOUDNORM_TARGETS = {"I": -16.0, "TP": -1.0, "LRA": 5.0}
 # A separate counter from report.REPORT_FINGERPRINT_VERSION (see that
 # module's compute_report_fingerprint()) -- this one versions the
 # actual AUDIO ENCODING pipeline (loudnorm targets, sample format/rate,
-# FLAC compression settings, the Kokoro invocation shape itself), not
+# FLAC compression settings, the shared-TTS invocation shape itself), not
 # the fingerprint payload's own schema. Bump this alone when a change
 # here would produce materially different audio bytes for byte-
 # identical `text`/voice/transition inputs (e.g. changing
@@ -127,7 +126,7 @@ KANDRIVE_ARTIST_NAME = "Oak Grove Radio"
 
 
 class SynthesisError(Exception):
-    """Raised when Kokoro/ffmpeg/duration-probing fails. The caller
+    """Raised when shared TTS, ffmpeg, or duration probing fails. The caller
     (the management command) decides how to log/report this; this
     module never leaves a partial file at final_path either way."""
 
@@ -381,7 +380,7 @@ def _synthesize_segment_wav(voice, text, output_wav):
 
 
 def _synthesize_with_transitions(segments, voice, transition_sound_path, tmp_flac, pid, cleanup_paths):
-    """One Kokoro call per entry in `segments` (written to TMP_AUDIO_ROOT,
+    """One logical shared-TTS call per entry in `segments` (written to TMP_AUDIO_ROOT,
     not KANDRIVE_ROOT -- see the module docstring), concatenated via
     two-pass loudnorm (_run_loudnorm_two_pass above) with
     `transition_sound_path` spliced in strictly BETWEEN consecutive
@@ -399,7 +398,7 @@ def _synthesize_with_transitions(segments, voice, transition_sound_path, tmp_fla
     synthesize_road_report()'s established pattern of one shared
     cleanup list/block rather than each step managing its own.
 
-    Raises SynthesisError on any Kokoro/ffmpeg failure, same as the
+    Raises SynthesisError on any shared-TTS/ffmpeg failure, same as the
     plain single-call path -- a bad transition-sound file (corrupt,
     wrong format) surfaces here as an ffmpeg failure, not silently
     skipped; only a MISSING file is treated as "feature not usable
@@ -451,16 +450,16 @@ def synthesize_road_report(text, voice_slot, voice, segments=None, transition_so
     `segments` and `transition_sound_path` are both optional and both
     default to None -- every existing caller passing just (text,
     voice_slot, voice) is completely unaffected and still gets the
-    exact single-Kokoro-call behavior this function has always had.
+    exact single-shared-TTS-call behavior this function has always had.
     When BOTH are given, `segments` has 2+ entries, AND
     transition_sound_path is a real, existing file, this instead
-    synthesizes each entry in `segments` as its OWN Kokoro call and
+    synthesizes each entry in `segments` as its own shared-TTS call and
     concatenates them via ffmpeg with the transition sound file spliced
     in strictly BETWEEN consecutive segments -- see
     _synthesize_with_transitions() below, which mirrors the KNS show
     ingest script's own woosh-between-stories concat (get_kns.py's
     _build_merge_ffmpeg_args). `text` itself is not used for synthesis
-    in that case (only `segments` is actually sent to Kokoro) -- it
+    in that case (only `segments` is actually sent to shared TTS) -- it
     still identifies what the caller considers the human-readable full
     script (used for road_report.txt; see that call site), which by
     construction (report.py's compose_report_segments(), sharing
@@ -473,7 +472,7 @@ def synthesize_road_report(text, voice_slot, voice, segments=None, transition_so
     what makes a 0- or 1-event report, or the feature being disabled,
     behave identically to before this parameter existed.
 
-    Raises SynthesisError on any Kokoro/ffmpeg/duration-probe failure
+    Raises SynthesisError on any shared-TTS/ffmpeg/duration-probe failure
     -- the final path and any existing Track row are left completely
     untouched in that case (temp files are cleaned up regardless).
     Callers (the management command) decide how to log/report a
@@ -496,14 +495,6 @@ def synthesize_road_report(text, voice_slot, voice, segments=None, transition_so
     docstring.
 
     Returns the Track instance on success."""
-    if voice.get("engine") != "kokoro":
-        # Belt-and-suspenders -- road_conditions/voice.py's
-        # resolve_voice() already refuses to return a non-Kokoro voice,
-        # but this function is public and could in principle be called
-        # directly (e.g. from a test) with a hand-built voice dict.
-        raise SynthesisError(
-            f"synthesize_road_report only supports the kokoro engine, got {voice.get('engine')!r}"
-        )
 
     use_transitions = bool(segments) and len(segments) > 1 and bool(transition_sound_path)
 

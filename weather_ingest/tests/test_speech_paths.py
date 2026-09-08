@@ -132,6 +132,22 @@ class ForecastVoiceAutoTests(unittest.TestCase):
                     args = wx_forecast.parse_args()
                 self.assertEqual(args.voice, voice)
 
+    def test_forecast_accepts_arbitrary_persona_slot(self):
+        with patch.object(
+            sys, "argv", ["wx_forecast.py", "--mode", "1day", "--voice", "morning_host"],
+        ):
+            args = wx_forecast.parse_args()
+        self.assertEqual(args.voice, "morning_host")
+
+    def test_current_temperature_accepts_arbitrary_persona_slot_and_auto(self):
+        for voice in ("morning_host", "auto"):
+            with self.subTest(voice=voice):
+                with patch.object(
+                    sys, "argv", ["current_temp.py", "--voice", voice],
+                ):
+                    args = current_temp.parse_args()
+                self.assertEqual(args.voice, voice)
+
     def test_main_with_auto_resolves_and_synthesizes_with_resolved_voice(self):
         with patch.object(sys, "argv", ["wx_forecast.py", "--mode", "1day", "--voice", "auto"]), \
              patch.object(wx_forecast, "build_announcement", return_value="Test announcement."), \

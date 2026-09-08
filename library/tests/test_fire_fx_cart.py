@@ -13,7 +13,7 @@ from library.models import FXCart
 class FireFxCartCommandTests(TestCase):
     """Regression coverage for the fire_fx_cart bridge command
     (library/management/commands/fire_fx_cart.py), the internal process
-    bridge the external weather-ingest venv's wx_alert_beep.py now
+    bridge the in-tree weather_ingest venv's wx_alert_beep.py now
     shells out to instead of playing audio itself. No GStreamer
     playback is exercised here -- these tests only confirm the command
     validates the cart correctly and writes (or correctly fails to

@@ -1,7 +1,8 @@
 # Station logical TTS configuration (Runtime Foundation C)
 
-Foundation C is implemented and tested in Git but is **not deployed and no
-production caller has been switched**. It adds the station policy layer above
+Foundation C is implemented, and current generated-speech callers use its
+logical-voice boundary. The original rollout checklist later in this document
+is retained as history. Foundation C provides the station policy layer above
 the Foundations A+B process-isolated runtime.
 
 ## Ownership boundaries
@@ -33,22 +34,25 @@ voice choices are not product defaults.
 
 ## Feature configuration remains above TTS
 
-Weather's `voice_schedule` still maps hours to feature slot keys such as
-`day` and `night`. `WeatherVoicePersona` maps each slot to a nullable shared
-logical voice while retaining weather-only display name, full on-air name,
-and signoff. The TTS resolver never reads those persona fields.
+Weather's `voice_schedule` maps hours to arbitrary announcer-persona slot
+keys. `default`, `morning_host`, `day`, and `night` have identical
+semantics. `WeatherVoicePersona` maps each slot to a nullable shared logical
+voice while retaining weather-only display name, full on-air name, and
+signoff. The TTS resolver never reads those persona fields.
 
 `WebRequestConfig.dedication_tts_voice` and
-`RoadConditionsConfiguration.tts_voice` are nullable inactive cutover
-references. Dedications retain a 30-second feature bound. Road reports retain
+`RoadConditionsConfiguration.tts_voice` are nullable feature configuration.
+The dedication voice is active; blank disables intro synthesis while the song
+still airs. The Road fixed voice remains reserved while the active generator
+uses `tts_use_weather_schedule`. Dedications retain a 30-second feature
+bound. Road reports retain
 a 600-second per-segment bound because a multi-event report can be minutes
 long; the generic TTS default remains 120 seconds.
 
-Road conditions may instead deliberately enable
-`tts_use_weather_schedule` at cutover, resolving the existing weather schedule
-through `WeatherVoicePersona`. This preserves scheduled day/night behavior
-without importing the companion's source. It is off by default and the current
-caller does not read it yet.
+Road Conditions resolves the Weather schedule through
+`WeatherVoicePersona` when `tts_use_weather_schedule` is enabled. It
+accepts arbitrary configured persona keys and either enabled Kokoro or Piper
+logical voices without importing weather_ingest source.
 
 ## Public logical interfaces
 
@@ -134,15 +138,15 @@ does not force Kokoro's 24 kHz contract.
 | `piper-hfc-female` | Piper model `en_US-hfc_female-medium` | optional station alternative only |
 | `piper-hfc-male` | Piper model `en_US-hfc_male-medium` | optional station alternative only |
 
-The current weather schedule remains unchanged. Road conditions can preserve
-the same day/night selection by choosing the weather-schedule option after the
-two persona rows exist, or can deliberately select one fixed logical voice.
+Existing station schedules remain unchanged. New installations begin with one
+neutral `default` persona scheduled all day and no TTS voice selected.
+Operators may add any number of personas and assign them to any hours.
 
 ## Output and scratch permissions
 
 Foundation B's mode `0600` output remains intentional. All current repo-managed
 dedication, weather, engine, and road-sync units run as the same rendered
-`@@ISA_USER@@`; ffmpeg is a child of the synthesis job. A future road-audio
+`@@ISA_USER@@`; ffmpeg is a child of the synthesis job. The road-audio
 unit must use that same account. Under that service-user model every intended
 consumer can read the file, so no broader mode or cross-user group is needed.
 
@@ -158,7 +162,10 @@ request files in `finally` blocks, and reboot clears anything left after a
 crash. Atomic publication temporaries remain beside the requested destination,
 not in this scratch directory, so `os.replace()` stays on one filesystem.
 
-## Exact later deployment and caller cutover
+## Historical rollout checklist
+
+The steps below record the original controlled migration plan. The caller
+cutovers described in steps 7-9 are complete in the current source.
 
 1. Deploy code and apply schema migrations while all new voice references
    remain null/disabled. Do not switch callers.

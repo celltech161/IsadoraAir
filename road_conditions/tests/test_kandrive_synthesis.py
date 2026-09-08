@@ -17,7 +17,7 @@ from road_conditions.synthesis import (
     build_loudnorm_string, existing_report_is_healthy, hash_file_sha256, retire_road_report,
     road_report_path, road_report_text_path, synthesize_road_report, write_road_report_text,
 )
-from weather.models import WeatherVoicePersona
+from weather.models import WeatherConfig, WeatherVoicePersona
 
 
 def ensure_default_weather_voice_personas():
@@ -49,6 +49,10 @@ def ensure_default_weather_voice_personas():
         slot="night", defaults=dict(tts_voice=max_voice, display_name="Max",
                                      full_name="Max Weatherly", signoff="I'm Max Weatherly."),
     )
+    weather_config = WeatherConfig.load()
+    weather_config.voice_schedule = [["day", 6, 17], ["night", 18, 5]]
+    weather_config.save(update_fields=["voice_schedule"])
+
 
 
 # resolve_voice()-shaped shared-TTS voice dicts (see road_conditions/
@@ -102,6 +106,7 @@ class KanDriveSynthesisFixtureMixin:
         self._kokoro_should_fail = False
         self._ffmpeg_should_fail = False
         self._kokoro_call_count = 0
+        self._synth_voices = []
         # loudnorm's own two-pass analysis call (ends "-f null -", no
         # real output file -- see _run_loudnorm_two_pass) is tracked and
         # faked separately from the encode/concat call below, since it
@@ -126,6 +131,7 @@ class KanDriveSynthesisFixtureMixin:
         def fake_station_synth(text, *, voice, output_path, speed=None, language=None,
                                 timeout_seconds=None, service=None):
             self._kokoro_call_count += 1
+            self._synth_voices.append(voice)
             if self._kokoro_should_fail:
                 from isadoraair.tts.errors import TTSSynthesisError
                 raise TTSSynthesisError("simulated shared-TTS provider failure")
@@ -227,10 +233,16 @@ class SynthesizeRoadReportTests(KanDriveSynthesisFixtureMixin, TransactionTestCa
         self.assertEqual(track.next_start_seconds, 42.0)
         self.assertEqual(track.cue_in_seconds, 3.5)
 
-    def test_non_kokoro_voice_engine_rejected(self):
-        with self.assertRaises(SynthesisError):
-            synthesize_road_report("Test text.", "afternoon", {"engine": "piper", "model": "x", "name": "Y"})
-        self.assertEqual(self._kokoro_call_count, 0)
+    def test_piper_voice_uses_shared_logical_voice_boundary(self):
+        voice = {
+            **DAY_VOICE, "engine": "piper", "model": "test-piper",
+            "logical_voice_name": "Piper_Test",
+        }
+
+        synthesize_road_report("Test text.", "morning_host", voice)
+
+        self.assertEqual(self._kokoro_call_count, 1)
+        self.assertEqual(self._synth_voices, ["Piper_Test"])
 
     def test_analysis_failure_raises_synthesis_error(self):
         with patch.object(synthesis_module, "_run_full_analysis", return_value=False):

@@ -1,42 +1,11 @@
-"""Pure day/night voice-schedule resolution -- the correct ownership
-boundary for a fact every Django-side consumer of
-WeatherConfig.voice_schedule needs (Road Conditions' KanDrive voice
-resolution today; the external weather-ingest project reads this same
-schedule via weather.management.commands.dump_weather_config's
-exported "voice_schedule" field and applies the identical algorithm
-independently -- see that project's own lib/voices.py).
+"""Pure announcer-persona schedule resolution.
 
-Historically this exact algorithm lived ONLY in weather-ingest's own
-lib/voices.py (an external, non-Django file IsadoraAir's Road
-Conditions app imported directly by path). That coupling is retired as
-part of the shared-TTS migration -- weather-ingest's own provider
-dictionary (the reason Road Conditions imported that file in the first
-place) no longer exists, so nothing legitimate is left to import.
-voice_for_hour() below is the schedule-only half of what that file
-used to provide, now owned where it belongs: alongside WeatherConfig
-itself, provider-free and DB-free (takes the schedule as a plain
-argument, exactly matching the retired function's own signature so
-migrating every caller changes zero resolution behavior)."""
+WeatherConfig.voice_schedule stores arbitrary persona slot keys, not
+day/night modes. Django-side consumers use this provider-free, DB-free
+module directly; the in-tree weather_ingest runtime applies the same
+algorithm to the JSON exported by dump_weather_config.
 
-import logging
-
-log = logging.getLogger(__name__)
-
-
-def voice_for_hour(hour, voice_schedule):
-    """voice_schedule is a list of [voice, start_hour, end_hour] triples
-    (from WeatherConfig.voice_schedule), end inclusive, hours 0-23. A
-    range may wrap past midnight (start > end, e.g. ["night", 21, 2])."""
-    for voice, start, end in voice_schedule:
-        if start <= end:
-            if start <= hour <= end:
-                return voice
-        else:
-            if hour >= start or hour <= end:
-                return voice
-    log.warning("No voice_schedule entry covers hour %d - defaulting to 'day'", hour)
-    return "day"
-
+"""
 
 class ScheduleError(ValueError):
     """A voice_schedule value that is not well-formed: wrong shape, an
@@ -50,12 +19,23 @@ class ScheduleError(ValueError):
     that also need persona/voice validation do that separately)."""
 
 
+def voice_for_hour(hour, voice_schedule):
+    """Return the persona slot scheduled for local hour.
+
+    The schedule is validated as a complete, non-overlapping 24-hour
+    assignment before resolution. A malformed or incomplete schedule raises
+    ScheduleError; no persona name is ever invented as a fallback.
+    """
+    if isinstance(hour, bool) or not isinstance(hour, int) or not 0 <= hour <= 23:
+        raise ScheduleError(f"hour must be an integer from 0 through 23, got {hour!r}")
+    return expand_to_hours(voice_schedule)[hour]
+
+
 def expand_to_hours(voice_schedule):
     """The inverse of compress_from_hours(): a [voice, start, end]
     triple list -> {0: voice, 1: voice, ..., 23: voice}, one entry per
-    local hour. Raises ScheduleError for anything voice_for_hour()
-    would have to silently paper over -- malformed entries, a gap, or
-    an overlap -- since the admin grid must show operators an honest
+    local hour. Raises ScheduleError for malformed entries, a gap, or
+    an overlap, since the admin grid must show operators an honest
     picture of a broken schedule rather than guessing at one (see
     weather/forms.py's own use of this for exactly that "fail clearly
     and safely" requirement)."""
