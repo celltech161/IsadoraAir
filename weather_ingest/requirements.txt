@@ -1,0 +1,31 @@
+# weather-ingest direct dependencies -- derived 2026-08-12 (IsadoraAir
+# 1.2 Phase 3), updated for the shared-TTS migration (see this
+# project's own README.md's "Runtime integration prerequisites").
+# `requests` comes from grepping actual `import` statements across
+# every tracked .py file. Everything else this project imports is
+# Python stdlib or its own lib/*.py modules.
+#
+# piper-tts is intentionally NOT declared here anymore: lib/voices.py
+# no longer invokes any TTS provider binary directly (Kokoro or
+# Piper) -- all synthesis now goes through the canonical
+# /usr/local/bin/isadoraair-tts CLI (a separate, root-installed
+# executable, not a Python package this project imports or pip-installs
+# at all). This is a DECLARATION change only for the shared-TTS
+# migration's development branch -- it does not uninstall anything
+# from a live production venv (see this project's own README.md for
+# why production's actual venv rebuild is a separate, later step, only
+# after production acceptance).
+#
+# Recreate the venv:
+#   python3 -m venv venv
+#   venv/bin/pip install -r requirements.txt
+# (No --system-site-packages -- this project has no GStreamer/PyGObject
+# dependency, unlike IsadoraAir itself.)
+#
+# This manifest covers ONLY this project's own Python environment. It
+# is NOT sufficient on its own to make weather-ingest functional -- see
+# README.md's "Runtime integration prerequisites" section for the
+# non-pip requirements (IsadoraAir's own manage.py commands + database,
+# the canonical /usr/local/bin/isadoraair-tts CLI, ffmpeg).
+
+requests==2.34.2

@@ -1,0 +1,24 @@
+# weather-ingest .gitignore -- written 2026-08-12 as part of IsadoraAir
+# 1.2 Phase 2B (companion-project version control). Verified against the
+# actual tree at git-init time, not applied blindly from the earlier
+# candidate under IsadoraAir's docs/companion-projects/.
+
+venv/
+__pycache__/
+lib/__pycache__/
+*.pyc
+
+# Cached/polled weather + alert state -- runtime bookkeeping, not
+# source. Every current file under data/ is generated (verified at
+# git-init time); excluding the whole directory rather than by
+# extension so a new state file of a different type doesn't slip in.
+data/
+
+# Logs, if/when any appear here (most of these run under systemd
+# oneshot units whose stdout goes to the journal, not a file, but kept
+# for parity with the other companion projects).
+*.log
+
+# Deliberately NOT excluded -- media/weather_beeps.flac is a small,
+# fixed, intentional audio asset wx_alert_beep.py plays, not generated
+# output. Keep it tracked.
