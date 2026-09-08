@@ -183,6 +183,40 @@ if [ "$USE_RECOVERY_PAYLOAD" -eq 1 ]; then
     exit 0
   fi
 
+  # ---- Resume/adopt: r0043/r0044. publish_phase_d_component's sibling
+  #      in Foundation E4 (NativeRuntimeProvisioner.publish) also
+  #      refuses to silently overwrite pre-existing destination content
+  #      -- a real prior publish of this exact component (whether
+  #      ledger-recorded already, or pre-ledger) is therefore NOT simply
+  #      safe to blindly re-run. Both cases below share the SAME
+  #      receipt-based evidence -- see 75-protected-updater.sh's own
+  #      comment for the full "complete" (fail closed on disagreement)
+  #      vs "absent + --adopt-pre-ledger" (fall through, normal publish
+  #      is its own fail-closed backstop) contract.
+  if [ "$RESTORE_RESUME" -eq 1 ]; then
+    LEDGER_STAGE_STATE=$(restore_ledger_stage_state "50-native-deps") || exit 1
+    if [ "$LEDGER_STAGE_STATE" = "complete" ]; then
+      log_info "50-native-deps: --resume -- ledger records this stage already complete for this exact archive/target; verifying the existing runtime-recovery receipt rather than re-publishing."
+      if restore_verify_component_receipt native_fdkaac >/dev/null 2>&1; then
+        log_info "50-native-deps: resume verification PASS -- the existing runtime-recovery receipt still proves native_fdkaac was recovered from this exact archive/payload. Not re-publishing."
+        restore_ledger_record "50-native-deps"
+        log_info "50-native-deps: PASS (resumed/verified)"
+        exit 0
+      fi
+      log_error "50-native-deps: resume verification FAILED -- the ledger records this stage already complete, but the runtime-recovery receipt no longer proves native_fdkaac was recovered from this exact archive/payload. Ledger and receipt disagree -- refusing to guess which is authoritative; investigate manually (or remove the stale ledger entry at $(restore_ledger_path)) before retrying."
+      exit 1
+    elif [ "$LEDGER_STAGE_STATE" = "absent" ] && [ "$RESTORE_ADOPT_PRE_LEDGER" -eq 1 ]; then
+      log_info "50-native-deps: --resume --adopt-pre-ledger -- no ledger entry exists yet for this stage; checking whether the existing runtime-recovery receipt already proves native_fdkaac was recovered from this exact archive."
+      if restore_verify_component_receipt native_fdkaac >/dev/null 2>&1; then
+        log_info "50-native-deps: adoption verification PASS -- the existing runtime-recovery receipt already proves native_fdkaac was recovered from this exact archive/payload. Adopting -- recording this stage complete without re-publishing."
+        restore_ledger_record "50-native-deps" --detail '{"adopted":true}'
+        log_info "50-native-deps: PASS (adopted)"
+        exit 0
+      fi
+      log_info "50-native-deps: adoption not provable from the existing receipt (or none exists) -- proceeding with the normal prepare/publish below (which itself refuses to overwrite any real pre-existing destination content)."
+    fi
+  fi
+
   # Unprivileged, always -- this is the E4 trust handoff's whole point
   # (prepare as an ordinary user; only publish is ever privileged).
   # Never wrapped in sudo, canonical target or not.

@@ -140,6 +140,48 @@ if [ "$PROTECTED_UPDATER_STATE" != "present" ]; then
   exit 0
 fi
 
+# ---- Resume/adopt: r0043/r0044. publish_phase_d_component refuses to
+#      silently overwrite pre-existing destination content (os.O_EXCL)
+#      -- a real prior publish of this exact component (whether ledger-
+#      recorded already, or pre-ledger) is therefore NOT simply safe to
+#      blindly re-run. Both cases below share the SAME receipt-based
+#      evidence: if the existing runtime-recovery receipt already
+#      proves protected_updater was recovered from this EXACT archive/
+#      payload, skip straight to PASS instead of re-publishing.
+#   "complete" (ledger already recorded this stage done for this exact
+#      archive/target) -- receipt verification failing here is a
+#      genuine ambiguity (ledger and receipt disagree) and fails
+#      CLOSED, same philosophy as 20-application.sh/30-postgresql.sh's
+#      own "complete" branch.
+#   "absent" + --adopt-pre-ledger -- receipt verification failing here
+#      just means there is nothing (yet) to adopt; falls through to the
+#      normal restore+publish below exactly as before r0044, relying on
+#      that path's own existing refuse-to-overwrite behavior as the
+#      fail-closed backstop for any real pre-existing content.
+if [ "$RESTORE_RESUME" -eq 1 ]; then
+  LEDGER_STAGE_STATE=$(restore_ledger_stage_state "75-protected-updater") || exit 1
+  if [ "$LEDGER_STAGE_STATE" = "complete" ]; then
+    log_info "75-protected-updater: --resume -- ledger records this stage already complete for this exact archive/target; verifying the existing runtime-recovery receipt rather than re-publishing."
+    if restore_verify_component_receipt protected_updater >/dev/null 2>&1; then
+      log_info "75-protected-updater: resume verification PASS -- the existing runtime-recovery receipt still proves protected_updater was recovered from this exact archive/payload. Not republishing."
+      restore_ledger_record "75-protected-updater"
+      log_info "75-protected-updater: PASS (resumed/verified)"
+      exit 0
+    fi
+    log_error "75-protected-updater: resume verification FAILED -- the ledger records this stage already complete, but the runtime-recovery receipt no longer proves protected_updater was recovered from this exact archive/payload. Ledger and receipt disagree -- refusing to guess which is authoritative; investigate manually (or remove the stale ledger entry at $(restore_ledger_path)) before retrying."
+    exit 1
+  elif [ "$LEDGER_STAGE_STATE" = "absent" ] && [ "$RESTORE_ADOPT_PRE_LEDGER" -eq 1 ]; then
+    log_info "75-protected-updater: --resume --adopt-pre-ledger -- no ledger entry exists yet for this stage; checking whether the existing runtime-recovery receipt already proves protected_updater was recovered from this exact archive."
+    if restore_verify_component_receipt protected_updater >/dev/null 2>&1; then
+      log_info "75-protected-updater: adoption verification PASS -- the existing runtime-recovery receipt already proves protected_updater was recovered from this exact archive/payload. Adopting -- recording this stage complete without republishing."
+      restore_ledger_record "75-protected-updater" --detail '{"adopted":true}'
+      log_info "75-protected-updater: PASS (adopted)"
+      exit 0
+    fi
+    log_info "75-protected-updater: adoption not provable from the existing receipt (or none exists) -- proceeding with the normal restore+publish below (which itself refuses to overwrite any real pre-existing destination content)."
+  fi
+fi
+
 # restore_manage_command (not the plain restore_manage wrapper) here --
 # a real (non-staging) publish needs the whole invocation, venv python
 # included, run under sudo; bash functions aren't visible to a separate

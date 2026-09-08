@@ -458,6 +458,71 @@ def accept_restore(args: argparse.Namespace) -> int:
     return 0
 
 
+def verify_component_receipt(args: argparse.Namespace) -> int:
+    """r0044: pre-ledger adoption support for Stages 50/70/75. Proves --
+    without republishing anything -- that ONE specific component was
+    ALREADY durably recovered from THIS EXACT archive, using only
+    evidence that already existed before the restore-session ledger
+    (r0043) did: the runtime-recovery receipt record_components already
+    writes, plus this archive's own embedded metadata. This is a
+    narrower question than accept_restore's own "is the WHOLE archive's
+    required-component policy satisfied" -- a caller here only cares
+    about the ONE component its own stage owns, never the others.
+
+    Exit codes mirror the other read-only checks: 2 = legacy/no
+    metadata, 3 = non-self-contained, 1 = component not provably
+    recovered from this exact archive (missing/invalid receipt, a
+    receipt belonging to a different archive/payload, or the component
+    absent from either the archive's own included_components or the
+    receipt's recovered_components), 0 = verified.
+    """
+    metadata = _metadata_from_tar(args.archive)
+    if metadata is None:
+        print("LEGACY ARCHIVE -- no runtime-recovery payload to verify", file=sys.stderr)
+        return 2
+    if metadata["recovery_class"] != SELF_CONTAINED_CLASS:
+        print("NON-SELF-CONTAINED ARCHIVE -- no runtime-recovery payload to verify", file=sys.stderr)
+        return 3
+    if args.component not in metadata["included_components"]:
+        print(
+            f"component {args.component!r} is not part of this archive's own recovery metadata "
+            f"(included_components={metadata['included_components']}) -- nothing to adopt",
+            file=sys.stderr,
+        )
+        return 1
+    try:
+        receipt = json.loads(args.receipt.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        print("runtime recovery receipt is missing or invalid -- cannot adopt", file=sys.stderr)
+        return 1
+    if (
+        receipt.get("schema_version") != SCHEMA_VERSION
+        or receipt.get("archive_format_version") != metadata["archive_format_version"]
+        or receipt.get("payload_id") != metadata["payload_id"]
+    ):
+        print(
+            "runtime recovery receipt does not match this exact archive/payload -- refusing to adopt "
+            "(a receipt from a different archive/payload never proves this one's components were recovered)",
+            file=sys.stderr,
+        )
+        return 1
+    recovered_value = receipt.get("recovered_components")
+    if not isinstance(recovered_value, list) or not all(isinstance(item, str) for item in recovered_value):
+        print("runtime recovery receipt has invalid components -- cannot adopt", file=sys.stderr)
+        return 1
+    if args.component not in recovered_value:
+        print(
+            f"runtime recovery receipt does not record {args.component!r} as recovered -- cannot adopt",
+            file=sys.stderr,
+        )
+        return 1
+    print(json.dumps(
+        {"component_verified": True, "component": args.component, "payload_id": metadata["payload_id"]},
+        sort_keys=True, separators=(",", ":"),
+    ))
+    return 0
+
+
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(allow_abbrev=False)
     commands = root.add_subparsers(dest="command", required=True)
@@ -485,6 +550,11 @@ def parser() -> argparse.ArgumentParser:
     accept.add_argument("--archive", required=True, type=Path)
     accept.add_argument("--receipt", required=True, type=Path)
     accept.set_defaults(handler=accept_restore)
+    verify_component = commands.add_parser("verify-component-receipt", allow_abbrev=False)
+    verify_component.add_argument("--archive", required=True, type=Path)
+    verify_component.add_argument("--receipt", required=True, type=Path)
+    verify_component.add_argument("--component", required=True, choices=sorted(COMPONENTS))
+    verify_component.set_defaults(handler=verify_component_receipt)
     return root
 
 

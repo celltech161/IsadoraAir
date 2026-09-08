@@ -15,6 +15,16 @@
 # Usage:
 #   deploy/restore/20-application.sh --archive PATH [--plan|--apply]
 #     [--staging-root PATH] [--repo-url URL] [--owner USER:GROUP] [--force-env]
+#     [--resume [--adopt-pre-ledger]]
+#
+# --resume/--adopt-pre-ledger (r0043/r0044): see restore.sh's own header
+# and docs/DISASTER_RECOVERY_STATUS.md's "Resumable restore mechanism"
+# section for the full contract. Short version: --resume alone only
+# converges a stage the ledger ALREADY records complete for this exact
+# archive/target; --adopt-pre-ledger additionally allows independently
+# verifying and adopting a pre-existing, pre-ledger restore of the SAME
+# archive (never inferred from mere file existence, never weaker than
+# the --resume verification above).
 #
 # --repo-url defaults to git@github.com:celltech161/IsadoraAir.git --
 # override for a fork or a differently-named remote.
@@ -77,45 +87,91 @@ fi
 log_info "Backup recorded Git SHA: $GIT_SHA"
 log_warn "MANIFEST.txt does not currently record whether the source tree was clean (uncommitted changes) at backup time -- a known, documented limitation (see docs/DISASTER_RECOVERY_RESTORE.md). This restore checks out exactly $GIT_SHA; any uncommitted changes present when the backup was taken are NOT recoverable from this archive."
 
-# ---- Resume: verify already-durably-completed work rather than
-#      re-cloning/re-extracting -- r0043. The ledger's own identity
+# ---- Resume/adopt: verify already-durably-completed work rather than
+#      re-cloning/re-extracting -- r0043/r0044. The ledger's own identity
 #      check (archive_sha256 + target_root) already fails closed on a
 #      mismatched archive/session (restore_ledger_stage_state below
-#      propagates that as a hard error); a "complete" state additionally
-#      requires INDEPENDENT verification here (checked-out HEAD actually
-#      matches this archive's own recorded Git SHA, .env actually
-#      present) before ever treating a pre-existing target as already
-#      correctly restored -- ledger and filesystem disagreeing is a
+#      propagates that as a hard error). Two distinct cases share the
+#      SAME independent-verification logic below, never trusting either
+#      the ledger OR mere file existence alone:
+#   "complete" (r0043) -- a ledger already records this exact stage done
+#      for this exact archive/target. Verification here is a sanity
+#      check that ledger and filesystem still agree; a mismatch is a
 #      genuine ambiguity, reported precisely, never silently resolved
-#      either way. A ledger that does NOT yet record this stage complete
-#      falls through to today's exact behavior unchanged (an existing
-#      non-empty .env still requires --force-env, exactly as before --
-#      unknown/non-restore-owned content stays fail-closed).
+#      either way.
+#   "absent" + --adopt-pre-ledger (r0044) -- NO ledger entry exists
+#      (e.g. this target was restored by pre-r0043 tooling that had no
+#      ledger at all), but the operator has supplied/selected the SAME
+#      archive that produced the existing state and explicitly asked to
+#      adopt it. The SAME verification proves this pre-ledger state is
+#      equivalent to what a fresh restore of this exact archive would
+#      have produced before a single completed-stage entry is ever
+#      written -- completion is NEVER inferred merely because files
+#      exist. Verification failure here fails CLOSED with a precise
+#      diagnostic -- it does not fall through to attempt a normal
+#      (potentially destructive) restore instead.
+# Neither case runs at all without --resume; a ledger that does not yet
+# record this stage complete AND no --adopt-pre-ledger falls through to
+# today's exact pre-r0043 behavior unchanged (an existing non-empty
+# .env still requires --force-env -- unknown/non-restore-owned content
+# stays fail-closed).
+_stage20_verify_durable_output() {
+  # $1: human-readable context for log messages ("resume verification"
+  # or "adoption verification"). Sets STAGE20_VERIFY_OK=0/1 and
+  # CURRENT_HEAD; never exits directly, so both call sites can decide
+  # their own fail-closed handling.
+  local context="$1"
+  STAGE20_VERIFY_OK=1
+  CURRENT_HEAD=""
+  if [ ! -d "$RESTORE_TARGET_ROOT/.git" ]; then
+    log_error "20-application: $context FAILED -- $RESTORE_TARGET_ROOT/.git is missing."
+    STAGE20_VERIFY_OK=0
+  elif ! CURRENT_HEAD=$(git -C "$RESTORE_TARGET_ROOT" rev-parse HEAD 2>/dev/null) || [ "$CURRENT_HEAD" != "$GIT_SHA" ]; then
+    log_error "20-application: $context FAILED -- $RESTORE_TARGET_ROOT's checked-out HEAD (${CURRENT_HEAD:-<unreadable>}) does not match this archive's own recorded Git SHA ($GIT_SHA). Refusing to guess which is authoritative."
+    STAGE20_VERIFY_OK=0
+  elif [ ! -s "$RESTORE_TARGET_ROOT/.env" ]; then
+    log_error "20-application: $context FAILED -- $RESTORE_TARGET_ROOT/.env is missing or empty."
+    STAGE20_VERIFY_OK=0
+  elif git -C "$RESTORE_TARGET_ROOT" status --porcelain --untracked-files=no 2>/dev/null | grep -q .; then
+    # r0044: adoption specifically must refuse "unsafe/ambiguous state
+    # that would make adoption misleading" -- a detached-HEAD checkout
+    # this tooling itself created should never carry uncommitted
+    # changes to tracked files; if it does, something unexpected
+    # touched it since. Untracked files (venv/, __pycache__/, etc. --
+    # later stages' own normal output) are deliberately excluded, since
+    # their mere presence says nothing about whether THIS stage's own
+    # output (the checkout itself) is trustworthy.
+    log_error "20-application: $context FAILED -- $RESTORE_TARGET_ROOT has uncommitted changes to tracked files (git status is not clean). Refusing to treat this as equivalent to a fresh checkout of $GIT_SHA."
+    STAGE20_VERIFY_OK=0
+  fi
+}
+
 if [ "$RESTORE_RESUME" -eq 1 ] && [ "$RESTORE_MODE" = "apply" ]; then
   STAGE_STATE=$(restore_ledger_stage_state "20-application") || exit 1
   if [ "$STAGE_STATE" = "complete" ]; then
     log_info "20-application: --resume -- ledger records this stage already complete for this exact archive/target root; verifying durable output rather than re-cloning/re-extracting."
-    RESUME_VERIFY_OK=1
-    CURRENT_HEAD=""
-    if [ ! -d "$RESTORE_TARGET_ROOT/.git" ]; then
-      log_error "20-application: resume verification FAILED -- $RESTORE_TARGET_ROOT/.git is missing, but the ledger records this stage already complete. Ledger and filesystem disagree -- refusing to guess which is authoritative; investigate manually (or remove the stale ledger entry at $(restore_ledger_path)) before retrying."
-      RESUME_VERIFY_OK=0
-    elif ! CURRENT_HEAD=$(git -C "$RESTORE_TARGET_ROOT" rev-parse HEAD 2>/dev/null) || [ "$CURRENT_HEAD" != "$GIT_SHA" ]; then
-      log_error "20-application: resume verification FAILED -- $RESTORE_TARGET_ROOT's checked-out HEAD (${CURRENT_HEAD:-<unreadable>}) does not match this archive's own recorded Git SHA ($GIT_SHA). Refusing to guess which is authoritative; investigate manually before retrying."
-      RESUME_VERIFY_OK=0
-    elif [ ! -s "$RESTORE_TARGET_ROOT/.env" ]; then
-      log_error "20-application: resume verification FAILED -- $RESTORE_TARGET_ROOT/.env is missing or empty, but the ledger records this stage already complete."
-      RESUME_VERIFY_OK=0
-    fi
-    if [ "$RESUME_VERIFY_OK" -ne 1 ]; then
+    _stage20_verify_durable_output "resume verification"
+    if [ "$STAGE20_VERIFY_OK" -ne 1 ]; then
+      log_error "20-application: ledger and filesystem disagree -- investigate manually (or remove the stale ledger entry at $(restore_ledger_path)) before retrying."
       exit 1
     fi
     log_info "20-application: resume verification PASS -- Git checkout at $GIT_SHA, .env present. Not re-cloning, not re-extracting .env/media."
     restore_ledger_record "20-application" --git-sha "$GIT_SHA"
     log_info "20-application: PASS (resumed/verified)"
     exit 0
+  elif [ "$STAGE_STATE" = "absent" ] && [ "$RESTORE_ADOPT_PRE_LEDGER" -eq 1 ]; then
+    log_info "20-application: --resume --adopt-pre-ledger -- no ledger entry exists yet for this stage, but adoption of a pre-ledger restore was explicitly requested; independently verifying existing state against this exact archive before adopting it."
+    _stage20_verify_durable_output "adoption verification"
+    if [ "$STAGE20_VERIFY_OK" -ne 1 ]; then
+      log_error "20-application: adoption FAILED -- refusing to treat existing state as already restored. Fix or remove the existing $RESTORE_TARGET_ROOT and re-run a normal restore instead."
+      exit 1
+    fi
+    log_info "20-application: adoption verification PASS -- Git checkout at $GIT_SHA, .env present, tree clean. Adopting -- recording this stage complete without re-cloning/re-extracting .env/media."
+    restore_ledger_record "20-application" --git-sha "$GIT_SHA" --detail '{"adopted":true}'
+    log_info "20-application: PASS (adopted)"
+    exit 0
   fi
-  log_info "20-application: --resume given, but the ledger does not yet record this stage complete for this archive/target -- proceeding with the normal restore below."
+  log_info "20-application: --resume given, but the ledger does not yet record this stage complete for this archive/target (and --adopt-pre-ledger was not given, or adoption is not applicable) -- proceeding with the normal restore below."
 fi
 
 # ---- Clone or verify existing checkout -----------------------------------

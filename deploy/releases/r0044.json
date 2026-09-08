@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "release_id": "r0044",
+  "previous_release_id": "r0043",
+  "minimum_updater_protocol_version": 5,
+  "summary": "Fixes a real r0043 gap: --resume could not help a restore that began before the ledger existed (e.g. the actual r0042 E8 sandbox) -- it fell through to the ordinary destructive-guarded path. Adds --adopt-pre-ledger: each stage independently verifies pre-ledger durable output against the supplied archive before adopting it into a fresh ledger. Adds an interactive TTY recovery workflow so operators never need these flags. No migration/dependency/service changes.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0007"
+}

@@ -58,6 +58,42 @@ chains all eleven stages if you'd rather run them in one shot; running
 them individually and reviewing each is recommended for the actual
 Phase 5 drill.
 
+**Interactive recovery (r0044) is the normal way to run `restore.sh
+--apply`.** You do not need to remember `--resume`, `--adopt-pre-ledger`,
+`--force-env`, `--force-db`, or any stage number. Run it from a real
+terminal and it inspects the target and any existing recovery session
+first:
+
+- **A prior recovery session for this exact archive/target is already
+  underway** (its own small ledger under `/var/lib/isadoraair/restore/`
+  says so): you're shown what's already completed and offered
+  `[R] Resume recovery`, `[V] Verify completed stages`,
+  `[S] Show recovery status`, or `[Q] Quit`. Resuming independently
+  re-verifies every already-completed stage's real output before
+  trusting it -- never a blind skip.
+- **The target already shows restore progress but no session ledger
+  exists** (e.g. an interrupted restore from before this ledger existed
+  at all): you're shown `[A] Verify and adopt this interrupted
+  recovery`, `[N] Treat this as a new recovery`, `[S] Show detected
+  state`, or `[Q] Quit`. Adoption independently verifies each stage's
+  durable output against the SAME archive you're pointing it at (Git
+  HEAD, `.env`, database content, runtime-recovery receipts -- never
+  merely "a file exists") before recording anything as done; it never
+  guesses, and it fails closed if verification can't prove the prior
+  work is genuine.
+- **A different archive, or a corrupt/inconsistent existing session**:
+  always a hard, immediate stop -- never a menu, never silently ignored.
+- **Nothing exists yet**: proceeds immediately.
+
+The prompt only ever decides which of the above already-safe code paths
+to take -- it is never itself permission to weaken a safety check.
+Piped/non-interactive input (CI, automation) never triggers a prompt at
+all; pass `--non-interactive` to suppress it explicitly even from a
+real terminal, and pass `--resume`/`--adopt-pre-ledger` yourself for
+fully deterministic, scripted runs. See
+`docs/DISASTER_RECOVERY_STATUS.md`'s "Resumable restore mechanism"
+section and `restore.sh`'s own header comment for the full contract.
+
 ## Offline package/snap closure (E8, r0038)
 
 **E8** is the fully offline clean-machine restore acceptance run: one

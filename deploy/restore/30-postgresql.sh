@@ -20,7 +20,7 @@
 #
 # Usage:
 #   deploy/restore/30-postgresql.sh --archive PATH [--plan|--apply]
-#     [--staging-root PATH] [--force-db]
+#     [--staging-root PATH] [--force-db] [--resume [--adopt-pre-ledger]]
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -58,39 +58,62 @@ DB_PORT="${DB_PORT:-5432}"
 export PGPASSWORD="$DB_PASSWORD"
 log_info "DB target: ${DB_USER}@${DB_HOST}:${DB_PORT}/${RESTORE_DB_NAME} (password read from .env, not logged)"
 
-# ---- Resume: verify already-durably-completed work rather than
-#      re-running role bootstrap/pg_restore -- r0043. Same ledger-
-#      identity + independent-verification contract as
-#      20-application.sh's own resume branch: a "complete" ledger state
-#      is NEVER trusted alone -- the actual database is independently
-#      re-queried for the exact same evidence this stage's own post-
-#      restore verification (section 6 below) already establishes. A
-#      ledger that does not yet record this stage complete falls
-#      through to today's exact behavior unchanged (a non-empty
-#      database still requires --force-db without a matching completed
-#      ledger entry -- unknown/non-restore-owned content stays
-#      fail-closed).
+# ---- Resume/adopt: verify already-durably-completed work rather than
+#      re-running role bootstrap/pg_restore -- r0043/r0044. Same shared
+#      independent-verification philosophy as 20-application.sh's own
+#      resume/adopt branch (see that script's own comment for the full
+#      "complete" vs "absent + --adopt-pre-ledger" contract) -- a
+#      "complete" ledger state is NEVER trusted alone, and adoption is
+#      NEVER inferred merely because a database exists: the actual
+#      database is independently re-queried for the exact same evidence
+#      this stage's own post-restore verification (section 6 below)
+#      already establishes. Neither branch runs without --resume; a
+#      ledger that does not yet record this stage complete AND no
+#      --adopt-pre-ledger falls through to today's exact behavior
+#      unchanged (a non-empty database still requires --force-db --
+#      unknown/non-restore-owned content stays fail-closed).
+_stage30_verify_durable_output() {
+  local context="$1"
+  STAGE30_VERIFY_OK=1
+  STAGE30_TABLE_COUNT=$(psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$RESTORE_DB_NAME" -tAc \
+    "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public'" 2>/dev/null || echo "")
+  STAGE30_MIGRATIONS_EXISTS=""
+  if [ -n "$STAGE30_TABLE_COUNT" ] && [ "$STAGE30_TABLE_COUNT" -gt 0 ] 2>/dev/null; then
+    STAGE30_MIGRATIONS_EXISTS=$(psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$RESTORE_DB_NAME" -tAc \
+      "SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'django_migrations'" 2>/dev/null || echo "")
+  fi
+  if [ -z "$STAGE30_TABLE_COUNT" ] || [ "$STAGE30_TABLE_COUNT" -eq 0 ] || [ "$STAGE30_MIGRATIONS_EXISTS" != "1" ]; then
+    log_error "30-postgresql: $context FAILED -- database '$RESTORE_DB_NAME' does not currently hold the expected restored content (table_count=${STAGE30_TABLE_COUNT:-<unreachable>}, django_migrations present=${STAGE30_MIGRATIONS_EXISTS:-no})."
+    STAGE30_VERIFY_OK=0
+  fi
+}
+
 if [ "$RESTORE_RESUME" -eq 1 ] && [ "$RESTORE_MODE" = "apply" ]; then
   STAGE_STATE=$(restore_ledger_stage_state "30-postgresql") || exit 1
   if [ "$STAGE_STATE" = "complete" ]; then
     log_info "30-postgresql: --resume -- ledger records this stage already complete for this exact archive/target; verifying durable output rather than re-running pg_restore."
-    RESUME_TABLE_COUNT=$(psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$RESTORE_DB_NAME" -tAc \
-      "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public'" 2>/dev/null || echo "")
-    RESUME_MIGRATIONS_EXISTS=""
-    if [ -n "$RESUME_TABLE_COUNT" ] && [ "$RESUME_TABLE_COUNT" -gt 0 ] 2>/dev/null; then
-      RESUME_MIGRATIONS_EXISTS=$(psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$RESTORE_DB_NAME" -tAc \
-        "SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'django_migrations'" 2>/dev/null || echo "")
-    fi
-    if [ -z "$RESUME_TABLE_COUNT" ] || [ "$RESUME_TABLE_COUNT" -eq 0 ] || [ "$RESUME_MIGRATIONS_EXISTS" != "1" ]; then
-      log_error "30-postgresql: resume verification FAILED -- the ledger records this stage already complete, but database '$RESTORE_DB_NAME' does not currently hold the expected restored content (table_count=${RESUME_TABLE_COUNT:-<unreachable>}, django_migrations present=${RESUME_MIGRATIONS_EXISTS:-no}). Ledger and database disagree -- refusing to guess which is authoritative; investigate manually (or remove the stale ledger entry at $(restore_ledger_path)) before retrying."
+    _stage30_verify_durable_output "resume verification"
+    if [ "$STAGE30_VERIFY_OK" -ne 1 ]; then
+      log_error "30-postgresql: ledger and database disagree -- refusing to guess which is authoritative; investigate manually (or remove the stale ledger entry at $(restore_ledger_path)) before retrying."
       exit 1
     fi
-    log_info "30-postgresql: resume verification PASS -- $RESUME_TABLE_COUNT table(s), django_migrations present. Not re-running pg_restore."
+    log_info "30-postgresql: resume verification PASS -- $STAGE30_TABLE_COUNT table(s), django_migrations present. Not re-running pg_restore."
     restore_ledger_record "30-postgresql"
     log_info "30-postgresql: PASS (resumed/verified)"
     exit 0
+  elif [ "$STAGE_STATE" = "absent" ] && [ "$RESTORE_ADOPT_PRE_LEDGER" -eq 1 ]; then
+    log_info "30-postgresql: --resume --adopt-pre-ledger -- no ledger entry exists yet for this stage; independently verifying the existing database before adopting it."
+    _stage30_verify_durable_output "adoption verification"
+    if [ "$STAGE30_VERIFY_OK" -ne 1 ]; then
+      log_error "30-postgresql: adoption FAILED -- refusing to treat the existing database as already restored. Investigate manually (or --force-db a normal restore) instead."
+      exit 1
+    fi
+    log_info "30-postgresql: adoption verification PASS -- $STAGE30_TABLE_COUNT table(s), django_migrations present. Adopting -- recording this stage complete without re-running pg_restore."
+    restore_ledger_record "30-postgresql" --detail '{"adopted":true}'
+    log_info "30-postgresql: PASS (adopted)"
+    exit 0
   fi
-  log_info "30-postgresql: --resume given, but the ledger does not yet record this stage complete for this archive/target -- proceeding with the normal restore below."
+  log_info "30-postgresql: --resume given, but the ledger does not yet record this stage complete for this archive/target (and --adopt-pre-ledger was not given, or adoption is not applicable) -- proceeding with the normal restore below."
 fi
 
 # r0036 fed createuser --pwprompt's two "Enter password" prompts over a

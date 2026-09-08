@@ -1705,7 +1705,13 @@ class RuntimeFoundationE7BStageModeSelectionTests(SimpleTestCase):
         source = (RESTORE_DIR / "75-protected-updater.sh").read_text()
         publish_call = source.index('"${RESTORE_MANAGE_CMD[@]}"')
         record_call = source.index("restore_record_recovery_components protected_updater")
-        pass_line = source.index('75-protected-updater: PASS')
+        # r0044: rindex, not index -- --resume/--adopt-pre-ledger added
+        # EARLIER, legitimately-conditional "PASS (resumed/verified)"/
+        # "PASS (adopted)" short-circuit lines (see this stage's own
+        # resume/adopt block above); the property this test actually
+        # cares about is the REAL final line reached after a genuine
+        # publish, i.e. the LAST such occurrence.
+        pass_line = source.rindex('75-protected-updater: PASS')
         exit_zero = source.rindex("exit 0")
         self.assertLess(publish_call, record_call)
         self.assertLess(record_call, pass_line)

@@ -16,17 +16,33 @@ against.
 
 ---
 
-## Current state (as of r0043)
+## Current state (as of r0044)
 
 | Field | Value |
 |---|---|
-| Current production release | r0043, commit `814791ae1f41fc9771d7d4cbebafdd2ad3e41d14` |
-| Previous production release | r0042, commit `1f3cd2a524be94bd1f2c4657a5a2b91bc1e684f0` |
-| Current E8 acceptance candidate | r0043 |
-| Last authoritative E8 result | r0042 -- **FAIL at Stage 80** (see incident record below) |
+| Current production release | r0044 (see `git log -1` / `deploy/releases/r0044.json` for the exact commit -- never hardcoded here, since a commit cannot record its own future SHA) |
+| Previous production release | r0043, commit `814791ae1f41fc9771d7d4cbebafdd2ad3e41d14` (plus docs-only follow-up `b167cfa2ca7e7fe49beb2c689b988c51727c59f8`) |
+| Current E8 acceptance candidate | r0044 |
+| Last authoritative E8 result | r0042 -- **FAIL at Stage 80** (see incident record below -- still the last AUTHORITATIVE run; not yet superseded by a newer one) |
 | Last completed stage (authoritative) | 75-protected-updater (PASS) |
 | Failure stage (authoritative) | 80-companions |
 | Failure classification | **Product** (a real cross-stage restore defect in IsadoraAir's own restore tooling -- not a runner/harness defect, not sandbox contamination; independently confirmed by the run's own clean-baseline gate) |
+
+### Review finding (r0043 → r0044)
+
+r0043's own `--resume` only converges a stage the ledger ALREADY records
+complete for the exact current archive/target. The actual r0042 E8
+sandbox's restore PREDATES the ledger entirely (r0043 didn't exist yet
+when it ran) -- it has zero ledger entries, so plain `--resume` against
+it falls through to ordinary (destructively-guarded) restore behavior
+and hits `guard_env_overwrite`/`guard_db_overwrite` exactly as if
+nothing had ever been restored. r0044 closes this gap with a distinct,
+narrowly-scoped **pre-ledger adoption** mechanism -- see "Resumable
+restore mechanism" below for the full algorithm. This is the reason two
+formal releases (r0043, then r0044) were needed to close one real E8
+defect: r0043 fixed the root cause and built the ledger/resume
+scaffolding; r0044 makes that scaffolding actually able to recognize
+and adopt the specific machine the defect was found on.
 
 ### Proven stages (authoritative E8, r0042 run)
 
@@ -39,13 +55,13 @@ against.
 
 ### Open blockers
 
-None currently known, pending the r0043 acceptance run (see "Next single
+None currently known, pending the r0044 acceptance run (see "Next single
 action" below) proving Stage 80 → 90 → 95 on the existing partially
-restored E8 sandbox via the new `--resume` mechanism.
+restored E8 sandbox via the new pre-ledger adoption mechanism.
 
 ### Next release
 
-r0043 has been implemented and is pending its own E8 acceptance run (see
+r0044 has been implemented and is pending its own E8 acceptance run (see
 "Next single action"). Do **not** produce a fresh E8 export until that
 acceptance run's result is reviewed.
 
@@ -53,27 +69,41 @@ acceptance run's result is reviewed.
 
 Resume the EXISTING partially-restored E8 sandbox (the one whose r0042
 run completed through Stage 75 and failed at Stage 80 -- do **not** wipe
-it) using r0043's restore tooling and its `--archive` pointed at a fresh
-r0043 backup, with `--resume` on every stage from 00 onward:
+it, and do **not** manually delete `/home/jreed/weather-ingest`) using
+r0044's restore tooling, transferred to the sandbox through the allowed
+operator-PC management path, and the SAME frozen r0042 backup archive
+that produced the existing state
+(`isadoraair-backup-20260907-181431-formal-r0042.tar.gz`, SHA256
+`e40d33d747b8e55f690be75f275c150dc9df53688985dd6f9c03830f89cbeef8` --
+**not** a fresh r0043/r0044 backup, which would be a different archive
+identity and could never adopt this machine's existing state). Launch
+the normal interactive workflow (a real terminal, `--apply`, no flags):
 
 ```bash
-deploy/restore/restore.sh --archive /path/to/r0043-backup.tar.gz --apply --resume
+deploy/restore/restore.sh --archive /path/to/isadoraair-backup-20260907-181431-formal-r0042.tar.gz --apply
 ```
 
-Expected: 00 through 75 verify their own already-durable r0042 output
-and converge without destructively re-running (Stage 20 does NOT
-re-clone/re-extract .env; Stage 30 does NOT re-run pg_restore); Stage 40
-re-normalizes `WEATHER_DATA_DIR` in the already-restored `.env` (a
-no-op if it's already canonical, otherwise fixes it in place) and
-records itself in the new restore ledger; Stage 80, seeing durable
-ledger proof that Stage 40 already ran for this exact archive/target,
-recognizes `/home/jreed/weather-ingest` as the known r0042-era
-legacy-scaffold defect's own artifact (empty directory tree, no `.git`,
-no regular files anywhere) and repairs it before cloning; Stage 90 and
-95 proceed normally to PASS. See "Incident: Stage 80 weather-ingest
-collision (r0042)" below for the full root-cause record, and
-`deploy/restore/lib.sh`'s `restore_ledger_*` functions /
-`deploy/restore/restore_ledger.py` for the resume mechanism itself.
+Expected: no matching ledger exists yet (this restore predates it), but
+the target already shows restore progress (a real `.git` checkout, a
+non-empty `.env`) -- the interactive workflow detects this and offers
+`[A] Verify and adopt this interrupted recovery`. Choosing it
+independently verifies Stages 20/30's durable output (Git HEAD, `.env`,
+database content) against this exact archive and, only once proven,
+records them complete in a freshly-created ledger -- no `--force-env`,
+no `--force-db`. Stage 40 then runs for real (never needed adoption --
+always idempotent), re-normalizing `WEATHER_DATA_DIR` in the
+already-restored `.env` in place. Stages 50/70/75's own existing
+runtime-recovery receipts (already durable evidence from the original
+r0042 run, entirely independent of the ledger) let them adopt too
+without republishing anything. Stage 80, seeing durable ledger proof
+that Stage 40 already ran for this exact archive/target, recognizes
+`/home/jreed/weather-ingest` as the known r0042-era legacy-scaffold
+defect's own artifact (empty directory tree, no `.git`, no regular
+files anywhere) and repairs it before cloning -- no manual deletion.
+Stage 90 and 95 proceed normally to PASS. See "Incident: Stage 80
+weather-ingest collision (r0042)" below for the full root-cause record,
+and "Resumable restore mechanism" for the complete adoption algorithm
+and interactive workflow.
 
 ---
 
@@ -96,6 +126,7 @@ not a fresh discovery -- read the cited section/commit first.
 | 9 | `deploy_baseline.py`: snd-aloop live-module-state and TTS-scratch-surface pre-boot absence hard-failed Stage 95 even though Stage 95's own acceptance point is pre-boot/pre-service-activation | r0042 | Both now deferred/non-gating; their STRUCTURAL declarations (modprobe.d config, tmpfiles.d config) gate instead |
 | 10 | `DeploymentBaselineEvidence.result` stayed UNRESOLVED forever when a resolved station tier had already superseded the exact structural package-selection uncertainty that caused it | r0042 | Narrowly superseded; identity ambiguity and every other structural FAIL still always gate |
 | 11 | **Stage 80 weather-ingest collision** -- see full record below | r0043 | `WEATHER_DATA_DIR` legacy-value normalization (Stage 40) + `--resume`/ledger scaffold repair (Stage 80) |
+| 12 | r0043's `--resume` could not help a restore that BEGAN before the ledger existed at all (e.g. the actual r0042 E8 sandbox) -- it has no ledger entries, so `--resume` fell through to ordinary destructive-guarded behavior and still hit `guard_env_overwrite`/`guard_db_overwrite` | r0044 | New `--adopt-pre-ledger` mechanism: each stage independently verifies pre-ledger durable output against the supplied archive and, only if proven, adopts it into a freshly-created ledger -- never inferred from mere file existence. Plus: an interactive TTY workflow so an operator never needs to know these flags exist. See "Resumable restore mechanism" below. |
 
 ---
 
@@ -244,17 +275,118 @@ Concrete behavior added in r0043:
   what lets a LATER stage in the same or a later invocation ask "did an
   earlier stage already durably complete, for this exact archive?"
 
-**Explicitly NOT solved by r0043** (first implementation step, not the
-final system): 00-preflight/10-packages/60-python/50-native-deps/
-70-tts/75-protected-updater/90-system-config/95-validate were not given
-new `--resume`-specific skip logic, because each was already safe to
-re-run (idempotent verify-rather-than-recreate venv/package/role
-bootstrap, or an existing durable Foundation-E component receipt) --
-only 20/30 actually hard-failed on legitimate pre-existing content
-before r0043, and only 80 needed a repair mechanism at all. A more
-general per-stage "verify durable output, converge, or fail with a
-precise diagnostic" contract, and ledger-recorded verification detail
-beyond bare stage completion, remain future work.
+**r0043's own gap** (see "Review finding" above): a restore that began
+before the ledger existed at all has no ledger entries whatsoever, so
+`--resume` alone falls straight through to the "not yet recorded
+complete" branch and hits today's ordinary `guard_env_overwrite`/
+`guard_db_overwrite` refusals -- indistinguishable, to r0043's own
+`--resume`, from a genuinely unrelated pre-existing installation.
+
+## Pre-ledger adoption (r0044)
+
+**`--adopt-pre-ledger` flag**, combined with `--resume`. Where
+`--resume` alone only converges a stage the ledger ALREADY records
+complete, `--adopt-pre-ledger` additionally allows a stage whose ledger
+state is `absent` to independently verify a PRE-ledger restore's
+durable output against the supplied archive and, only if that
+verification proves it, adopt it: record the stage complete in a
+freshly-created ledger without redoing the underlying work. Completion
+is NEVER inferred merely because files exist.
+
+**Per-stage adoption evidence (the actual algorithm):**
+
+- **20-application.sh**: real Git checkout (`$TARGET/.git` exists),
+  HEAD exactly equals the archive's own recorded Git SHA, `.env` exists
+  and is non-empty, AND `git status --porcelain --untracked-files=no`
+  is clean (no uncommitted changes to TRACKED files -- untracked
+  output from later stages, e.g. `venv/`, is fine and ignored). Any
+  failure here is a fail-closed adoption error with a precise
+  diagnostic -- never a silent fallback.
+- **30-postgresql.sh**: the target database is reachable with the
+  restored credentials, has tables in its public schema, and
+  `django_migrations` exists there -- the exact same evidence the
+  stage's own post-`pg_restore` verification already establishes for a
+  fresh restore. No stronger archive-to-database provenance signal is
+  currently exposed by the backup/restore format itself (pg_dump does
+  not embed an archive identity marker); this is the strongest evidence
+  practically available today.
+- **40-station-content.sh**: no adoption branch needed at all -- every
+  operation here (directory establishment, srv-content extraction,
+  `WEATHER_DATA_DIR` normalization) is already idempotent/convergent
+  regardless of ledger state, so it always just runs for real. This is
+  precisely what lets it re-normalize an adopted, still-legacy `.env`
+  in place.
+- **50-native-deps.sh / 70-tts.sh / 75-protected-updater.sh**: the
+  EXISTING Runtime Foundation E7 runtime-recovery receipt
+  (`/var/lib/isadoraair/restore/runtime-recovery.json`, written by
+  `restore_record_recovery_components` on any real publish -- entirely
+  independent of, and pre-dating, the r0043 ledger) already proves a
+  component was recovered from a specific archive/payload identity. A
+  new `runtime_recovery_archive.py verify-component-receipt` subcommand
+  (wrapped as `restore_verify_component_receipt` in `lib.sh`) checks
+  that receipt's `payload_id`/`archive_format_version` against the
+  CURRENT archive's own embedded metadata and confirms the specific
+  component this stage owns is listed recovered -- never merely "some
+  receipt exists somewhere". This same evidence is used for BOTH
+  `--resume`'s own "ledger already says complete" verification (fails
+  closed on disagreement, since publish is genuinely NOT safe to
+  blindly re-run -- `publish_phase_d_component`/
+  `NativeRuntimeProvisioner.publish` both refuse to overwrite
+  pre-existing destination content) and `--adopt-pre-ledger`'s "nothing
+  in the ledger yet" case (falls through to a normal restore attempt if
+  adoption can't be proven, relying on that same refuse-to-overwrite
+  behavior as the fail-closed backstop for real pre-existing content).
+  70-tts.sh's own check additionally requires EVERY TTS component
+  (kokoro and/or piper) the archive declares to be individually
+  receipt-proven, not just one.
+- **80-companions.sh**: unchanged from r0043 -- its scaffold repair
+  already keys off `restore_ledger_stage_state("40-station-content")`,
+  which becomes `complete` the moment Stage 40 actually runs (adopted
+  target or not), so no separate Stage-80-specific adoption logic was
+  needed.
+- **00-preflight.sh / 10-packages.sh**: no adoption logic -- both are
+  either read-only (00) or purely additive/idempotent (10, installs
+  only what `dpkg -s` reports missing), so they always just run for
+  real regardless of ledger state; absence of an old ledger is never
+  treated as contamination.
+
+A different archive, or existing state that fails any of the above
+verifications, always fails closed with a specific diagnostic -- never
+a guess, and never silently treated as "must be fine, files exist."
+
+## Interactive recovery workflow (r0044)
+
+`restore.sh --apply`, run from a real terminal (stdin AND stdout both a
+TTY), with neither `--non-interactive` nor `--resume` already given,
+inspects the target root and any existing ledger BEFORE doing anything
+destructive:
+
+- **Ledger exists and matches this exact archive/target**: prints the
+  archive SHA256, target, last completed stage, and last incomplete
+  stage, then offers `[R] Resume recovery` (adds `--resume`),
+  `[V] Verify completed stages` (re-runs each already-`complete`
+  stage's own `--resume` verification and stops at the first
+  not-yet-complete one -- never advances the restore, purely an
+  integrity check), `[S] Show recovery status` (dumps the ledger,
+  read-only), or `[Q] Quit` (no changes).
+- **No ledger, but the target shows restore progress** (a `.git`
+  checkout and/or a non-empty `.env`): offers `[A] Verify and adopt
+  this interrupted recovery` (adds `--resume --adopt-pre-ledger`),
+  `[N] Treat this as a new recovery` (proceeds exactly as before
+  r0043/r0044 -- real existing content still requires
+  `--force-env`/`--force-db`), `[S] Show detected state`, or `[Q] Quit`.
+- **Ledger exists but belongs to a DIFFERENT archive or target root, or
+  is corrupt/schema-invalid**: always a hard, immediate failure --
+  never a menu, never silently ignored.
+- **No ledger and no detected pre-existing state**: proceeds
+  immediately, nothing to ask about.
+
+The prompt is never itself authorization to weaken any safety check --
+every menu choice still runs through the exact same fail-closed
+verification the flags above describe. No TTY (piped/redirected stdin,
+the normal CI/automation shape) never prompts at all; `--non-interactive`
+forces the same even under a real TTY. Deterministic automation/tests
+should prefer passing `--resume`/`--adopt-pre-ledger` explicitly.
 
 ---
 

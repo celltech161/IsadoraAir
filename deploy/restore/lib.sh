@@ -77,6 +77,7 @@ RESTORE_FORCE_PRODUCTION_TARGET=0
 RESTORE_FORCE_DB=0
 RESTORE_FORCE_ENV=0
 RESTORE_RESUME=0
+RESTORE_ADOPT_PRE_LEDGER=0
 RESTORE_DB_NAME=""
 RESTORE_ARCHIVE=""
 RESTORE_REMAINING_ARGS=()
@@ -103,6 +104,7 @@ restore_parse_common_args() {
       --force-db) RESTORE_FORCE_DB=1; shift ;;
       --force-env) RESTORE_FORCE_ENV=1; shift ;;
       --resume) RESTORE_RESUME=1; shift ;;
+      --adopt-pre-ledger) RESTORE_ADOPT_PRE_LEDGER=1; shift ;;
       --) shift; while [ $# -gt 0 ]; do RESTORE_REMAINING_ARGS+=("$1"); shift; done ;;
       *) RESTORE_REMAINING_ARGS+=("$1"); shift ;;
     esac
@@ -137,6 +139,7 @@ restore_parse_common_args() {
 
   local resume_suffix=""
   [ "$RESTORE_RESUME" -eq 1 ] && resume_suffix=" resume=1"
+  [ "$RESTORE_ADOPT_PRE_LEDGER" -eq 1 ] && resume_suffix="${resume_suffix} adopt_pre_ledger=1"
   log_info "mode=${RESTORE_MODE} target_root=${RESTORE_TARGET_ROOT} db_name=${RESTORE_DB_NAME}${RESTORE_STAGING_ROOT:+ staging_root=$RESTORE_STAGING_ROOT}${resume_suffix}"
 }
 
@@ -607,6 +610,40 @@ restore_accept_recovery_receipt() {
   receipt=$(restore_recovery_receipt_path)
   local helper="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/runtime_recovery_archive.py"
   python3 "$helper" accept --archive "$RESTORE_ARCHIVE" --receipt "$receipt"
+}
+
+# restore_archive_recovery_metadata -- prints $RESTORE_ARCHIVE's own
+# embedded runtime-recovery-archive.json metadata (payload_id,
+# included_components, recovery_class, ...) as JSON to stdout, or
+# nothing + nonzero exit for a legacy/non-self-contained archive (or if
+# $RESTORE_ARCHIVE isn't set at all). Read-only, never extracts the
+# payload itself -- cheap enough to call speculatively (r0044's TTS
+# adoption check uses this to learn which components an archive
+# declares BEFORE deciding whether extracting/validating the full
+# payload is even worth doing).
+restore_archive_recovery_metadata() {
+  if [ -z "$RESTORE_ARCHIVE" ] || [ ! -f "$RESTORE_ARCHIVE" ]; then
+    return 1
+  fi
+  local helper="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/runtime_recovery_archive.py"
+  python3 "$helper" inspect --archive "$RESTORE_ARCHIVE" 2>/dev/null
+}
+
+# restore_verify_component_receipt COMPONENT -- r0044 pre-ledger adoption
+# support for Stages 50/70/75: proves, WITHOUT republishing anything,
+# that COMPONENT was already durably recovered from THIS EXACT archive
+# using evidence that predates the ledger entirely (the runtime-
+# recovery receipt record_components already writes on a real publish,
+# plus this archive's own embedded metadata). Exit code 0 = verified;
+# nonzero (clear stderr message from runtime_recovery_archive.py) =
+# not provably recovered from this exact archive -- callers must treat
+# any nonzero exit as "adoption not proven," never a fallback pass.
+restore_verify_component_receipt() {
+  local component="$1"
+  local receipt
+  receipt=$(restore_recovery_receipt_path)
+  local helper="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/runtime_recovery_archive.py"
+  python3 "$helper" verify-component-receipt --archive "$RESTORE_ARCHIVE" --receipt "$receipt" --component "$component"
 }
 
 # ---------------------------------------------------------------------

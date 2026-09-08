@@ -144,6 +144,68 @@ if [ "$USE_RECOVERY_PAYLOAD" -eq 1 ]; then
     exit 0
   fi
 
+  # ---- Resume/adopt: r0043/r0044. RuntimeProvisioner.apply()'s one
+  #      atomic apply() has no split prepare/publish trust handoff like
+  #      E4's native fdkaac does, but it is NOT simply safe to blindly
+  #      re-run once genuinely already published either -- a real prior
+  #      TTS provisioning (whether ledger-recorded already, or pre-
+  #      ledger) is not something to redo speculatively. If the existing
+  #      runtime-recovery receipt already proves EVERY TTS component
+  #      this exact archive declares (kokoro and/or piper) was recovered
+  #      from this exact archive/payload, skip straight to PASS instead
+  #      of re-provisioning. Checked directly against the archive's own
+  #      metadata -- never requires extracting the payload first, so
+  #      this is cheap even for a large embedded TTS bundle.
+  #   "complete" -- receipt verification failing here is a genuine
+  #      ambiguity and fails CLOSED, same philosophy as
+  #      20-application.sh/30-postgresql.sh's own "complete" branch.
+  #   "absent" + --adopt-pre-ledger -- falls through to the normal
+  #      restore below exactly as before r0044 if adoption cannot be
+  #      proven.
+  if [ "$RESTORE_RESUME" -eq 1 ]; then
+    LEDGER_STAGE_STATE=$(restore_ledger_stage_state "70-tts") || exit 1
+    if [ "$LEDGER_STAGE_STATE" = "complete" ] || { [ "$LEDGER_STAGE_STATE" = "absent" ] && [ "$RESTORE_ADOPT_PRE_LEDGER" -eq 1 ]; }; then
+      if [ "$LEDGER_STAGE_STATE" = "complete" ]; then
+        log_info "70-tts: --resume -- ledger records this stage already complete for this exact archive/target; verifying the existing runtime-recovery receipt rather than re-provisioning."
+      else
+        log_info "70-tts: --resume --adopt-pre-ledger -- no ledger entry exists yet for this stage; checking whether the existing runtime-recovery receipt already proves every declared TTS component was recovered from this exact archive."
+      fi
+      ARCHIVE_METADATA_JSON=$(restore_archive_recovery_metadata) || ARCHIVE_METADATA_JSON=""
+      TTS_RESUME_OK=0
+      DECLARED_TTS_COMPONENTS=()
+      if [ -n "$ARCHIVE_METADATA_JSON" ]; then
+        mapfile -t DECLARED_TTS_COMPONENTS < <(
+          python3 -c 'import json,sys; data=json.loads(sys.argv[1]); print("\n".join(c for c in data.get("included_components", []) if c in ("kokoro","piper")))' "$ARCHIVE_METADATA_JSON"
+        )
+        if [ "${#DECLARED_TTS_COMPONENTS[@]}" -gt 0 ]; then
+          TTS_RESUME_OK=1
+          for resume_component in "${DECLARED_TTS_COMPONENTS[@]}"; do
+            if ! restore_verify_component_receipt "$resume_component" >/dev/null 2>&1; then
+              TTS_RESUME_OK=0
+              break
+            fi
+          done
+        fi
+      fi
+      if [ "$TTS_RESUME_OK" -eq 1 ]; then
+        log_info "70-tts: verification PASS -- the existing runtime-recovery receipt proves every declared TTS component (${DECLARED_TTS_COMPONENTS[*]}) was recovered from this exact archive/payload. Not re-provisioning."
+        if [ "$LEDGER_STAGE_STATE" = "absent" ]; then
+          restore_ledger_record "70-tts" --detail '{"adopted":true}'
+          log_info "70-tts: PASS (adopted)"
+        else
+          restore_ledger_record "70-tts"
+          log_info "70-tts: PASS (resumed/verified)"
+        fi
+        exit 0
+      fi
+      if [ "$LEDGER_STAGE_STATE" = "complete" ]; then
+        log_error "70-tts: resume verification FAILED -- the ledger records this stage already complete, but the runtime-recovery receipt no longer proves every declared TTS component was recovered from this exact archive/payload. Ledger and receipt disagree -- refusing to guess which is authoritative; investigate manually (or remove the stale ledger entry at $(restore_ledger_path)) before retrying."
+        exit 1
+      fi
+      log_info "70-tts: adoption not provable from the existing receipt (or none exists, or the archive declares no TTS component) -- proceeding with the normal restore below (which itself refuses to overwrite any real pre-existing destination content)."
+    fi
+  fi
+
   # restore_manage (lib.sh) owns the venv-python and .env preconditions
   # (and whether that venv is even compatible with this checkout's
   # requirements.txt) with one shared, clear diagnostic -- this stage
