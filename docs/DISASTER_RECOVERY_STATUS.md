@@ -16,17 +16,42 @@ against.
 
 ---
 
-## Current state (as of r0045)
+## Current state (as of r0046)
 
 | Field | Value |
 |---|---|
-| Current production release | r0045 (see `git log -1` / `deploy/releases/r0045.json` for the exact commit -- never hardcoded here, since a commit cannot record its own future SHA) |
-| Previous production release | r0044 |
-| Current E8 acceptance candidate | r0045 |
-| Last authoritative E8 result | r0042 -- **FAIL at Stage 80** (see incident record below -- still the last AUTHORITATIVE run; not yet superseded by a newer one) |
-| Last completed stage (authoritative) | 75-protected-updater (PASS) |
-| Failure stage (authoritative) | 80-companions |
-| Failure classification | **Product** (a real cross-stage restore defect in IsadoraAir's own restore tooling -- not a runner/harness defect, not sandbox contamination; independently confirmed by the run's own clean-baseline gate) |
+| Current production release | r0046 (see `git log -1` / `deploy/releases/r0046.json` for the exact commit -- never hardcoded here, since a commit cannot record its own future SHA) |
+| Previous production release | r0045, commit `1042033894f092b81f8bb214fc022fe0affa1e6d` |
+| Current E8 acceptance candidate | none pending -- r0046 is a routine backup-policy release (`deploy/backup_isadoraair.sh` + the Python recovery-policy authority only) that does not touch `deploy/restore/` and does not require its own E8 run |
+| Last authoritative E8 result | **r0045 -- PASS (2026-09-08).** The complete 00→95 software-recovery chain succeeded end to end under strict network isolation, using r0045's recovery-media authority and the original r0042 backup archive -- see "Next single action" below (now closed) and the r0042 incident record below for the defect this run finally closed out. This supersedes the r0042/r0044 FAIL record as the last authoritative result. |
+| Last completed stage (authoritative) | 95-validate (PASS) -- full chain |
+| Failure stage (authoritative) | none -- full PASS |
+| Failure classification | N/A (full PASS) |
+
+### r0046: automatic backup required-component policy
+
+Routine P0 1.2 backup-policy work, not an E8/restore-tooling change.
+`deploy/backup_isadoraair.sh`'s `BACKUP_REQUIRED_RECOVERY_COMPONENTS`
+was empty/unset by default, so a normal scheduled backup on a fully
+configured production station could still legally produce a
+`legacy_non_self_contained` archive unless an operator remembered to
+set it explicitly -- an operator-memory dependency. r0046 replaces that
+with one authoritative automatic policy
+(`isadoraair.runtime_recovery.resolve_automatic_recovery_policy()`):
+kokoro/piper/fdkaac requiredness is derived directly from the existing
+`isadoraair.runtime_requirements` authority (fdkaac mapped to the
+payload's own `native_fdkaac` component name), and `protected_updater`
+from an independent product/deployment rule
+(`protected_updater_is_required()`, never inferred from the payload's
+own state -- a corrupted/missing payload/component cannot remove its
+own backup requirement). This was possible because r0029 (see below)
+had already closed the one real blind spot that used to make
+station-derived Kokoro requiredness unsafe to trust for this purpose.
+`deploy/backup_isadoraair.sh` now uses this automatic policy by
+default; `BACKUP_REQUIRED_RECOVERY_COMPONENTS` remains available as a
+deliberate advanced/test override. See
+`docs/RUNTIME_BACKUP_PAYLOAD.md`'s "Recovery-component policy" section
+for the full contract.
 
 ### Review finding (r0044 → r0045)
 
@@ -59,81 +84,85 @@ defect: r0043 fixed the root cause and built the ledger/resume
 scaffolding; r0044 makes that scaffolding actually able to recognize
 and adopt the specific machine the defect was found on.
 
-### Proven stages (authoritative E8, r0042 run)
+### Proven stages (authoritative E8, r0045 run, 2026-09-08)
 
 00-preflight, 10-packages, 20-application, 30-postgresql, 40-station-content,
-60-python, 50-native-deps, 70-tts, 75-protected-updater — all PASS.
+50-native-deps, 60-python, 70-tts, 75-protected-updater, 80-companions,
+90-system-config, 95-validate — all PASS. The complete chain, end to
+end, for the first time -- see "r0045 E8 acceptance: full PASS" below.
 
-### Unproven stages (authoritative E8, r0042 run)
+### Unproven stages (authoritative E8)
 
-80-companions (FAILED), 90-system-config, 95-validate — never reached.
+None -- the full 00→95 chain is now proven authoritative.
 
 ### Open blockers
 
-None currently known, pending the r0045 acceptance run (see "Next single
-action" below) proving Stage 80 → 90 → 95 on the existing partially
-restored E8 sandbox via the pre-ledger adoption mechanism, this time
-driven fully offline through r0045's recovery-media discovery.
+None currently known. The r0042 Stage-80 defect (weather-ingest
+collision) that blocked full-chain E8 acceptance since it was found is
+now closed and proven closed by a real, complete, authoritative run.
+Phase 5 (an actual bare/clean-machine restore drill, original host and
+GitHub unavailable) remains later, separate work -- see
+`docs/RUNTIME_BACKUP_PAYLOAD.md`'s "What's still open" section.
 
 ### Next release
 
-r0045 has been implemented and is pending its own E8 acceptance run (see
-"Next single action"). Do **not** produce a fresh E8 export until that
-acceptance run's result is reviewed.
+r0046 (routine backup-policy work, see above) does not require a new E8
+run. Do **not** produce a fresh E8 export as part of it.
 
-### Next single action
+### r0045 E8 acceptance: full PASS (2026-09-08)
 
-Resume the EXISTING partially-restored E8 sandbox (the one whose r0042
-run completed through Stage 75 and failed at Stage 80 -- do **not** wipe
-it, and do **not** manually delete `/home/jreed/weather-ingest`) using
+The EXISTING partially-restored E8 sandbox (the one whose r0042 run had
+completed through Stage 75 and failed at Stage 80) was resumed using
 r0045's restore tooling, transferred to the sandbox through the allowed
-operator-PC management path, and the SAME frozen r0042 backup archive
-that produced the existing state
+operator-PC management path, against the SAME frozen r0042 backup
+archive that produced the existing state
 (`isadoraair-backup-20260907-181431-formal-r0042.tar.gz`, SHA256
 `e40d33d747b8e55f690be75f275c150dc9df53688985dd6f9c03830f89cbeef8` --
-**not** a fresh backup, which would be a different archive identity and
-could never adopt this machine's existing state). The sandbox already
-has the matching r0042 frozen media (`e8-inputs/`, containing the
+not a fresh backup, which would have been a different archive identity
+and could never have adopted this machine's existing state). The
+sandbox's matching r0042 frozen media (`e8-inputs/`, containing the
 backup, apt/snap closures, wheelhouse, and the IsadoraAir + companion
-Git mirrors) staged locally -- see "Recovery media (r0045)" below.
-Launch the normal interactive workflow (a real terminal, `--apply`, no
-flags):
+Git mirrors) was already staged locally -- see "Recovery media
+(r0045)" below. Launched via the normal interactive workflow (a real
+terminal, `--apply`, no flags):
 
 ```bash
 deploy/restore/restore.sh --archive /path/to/isadoraair-backup-20260907-181431-formal-r0042.tar.gz --apply
 ```
 
-Expected: restore.sh first resolves recovery media -- discovering the
-local `e8-inputs` root automatically (or prompting/listing candidates if
-it can't find exactly one) -- and shows what it found before anything
-else happens. Then: no matching ledger exists yet (this restore
-predates it), but the target already shows restore progress (a real
-`.git` checkout, a non-empty `.env`) -- the interactive workflow detects
-this and offers `[A] Verify and adopt this interrupted recovery`.
-Choosing it independently verifies Stages 20/30's durable output (Git
-HEAD, `.env`, database content) against this exact archive and, only
-once proven, records them complete in a freshly-created ledger -- no
-`--force-env`, no `--force-db`. Stage 10 then runs safely/idempotently
-against the resolved recovery media's local apt/snap closure (no
-Internet). Stage 40 then runs for real (never needed adoption --
-always idempotent), re-normalizing `WEATHER_DATA_DIR` in the
-already-restored `.env` in place. Stages 50/70/75's own existing
-runtime-recovery receipts (already durable evidence from the original
-r0042 run, entirely independent of the ledger) let them adopt too
-without republishing anything. Stage 80, seeing durable ledger proof
-that Stage 40 already ran for this exact archive/target, recognizes
-`/home/jreed/weather-ingest` as the known r0042-era legacy-scaffold
-defect's own artifact (empty directory tree, no `.git`, no regular
-files anywhere) and repairs it before cloning -- provisioning every
-companion from the resolved recovery media's local Git mirrors (no
-manual deletion, no Internet). Stage 60's convergence check, and Stage
-80's own pip install, both run constrained to the recovery media's
-wheelhouse (`PIP_NO_INDEX=1`). Stage 90 and 95 proceed normally to PASS,
-95 gated on the actual r0042 backup receipt. E8 network isolation
-remains intact throughout. See "Incident: Stage 80 weather-ingest
-collision (r0042)" below for the full root-cause record, "Resumable
-restore mechanism" for the complete adoption algorithm and interactive
-workflow, and "Recovery media (r0045)" for the offline-media contract.
+What actually happened, matching the predicted sequence exactly:
+restore.sh first resolved recovery media -- discovering the local
+`e8-inputs` root automatically and showing what it found before
+anything else happened. No matching ledger existed yet (this restore
+predated the ledger), but the target already showed restore progress
+(a real `.git` checkout, a non-empty `.env`) -- the interactive
+workflow detected this and offered `[A] Verify and adopt this
+interrupted recovery`. Choosing it independently verified Stages
+20/30's durable output (Git HEAD, `.env`, database content) against
+this exact archive and, once proven, recorded them complete in a
+freshly-created ledger -- no `--force-env`, no `--force-db`, no manual
+filesystem deletion, and no operator-entered stage-specific media
+flags. Stage 00 verified cleanly. Stage 10 ran safely/idempotently
+against the resolved recovery media's local apt/snap closure -- no
+Internet. Stage 20 adopted the exact r0042 checkout; Stage 30 adopted
+the existing restored database. Stage 40 ran for real (never needed
+adoption -- always idempotent), re-normalizing `WEATHER_DATA_DIR` in
+the already-restored `.env` in place. Stage 60 verified/converged using
+only the frozen wheelhouse. Stages 50/70/75 adopted from the exact
+r0042 runtime-recovery receipt without republishing anything. Stage 80,
+seeing durable ledger proof that Stage 40 already ran for this exact
+archive/target, recognized `/home/jreed/weather-ingest` as the known
+r0042-era legacy-scaffold defect's own artifact (empty directory tree,
+no `.git`, no regular files anywhere), removed only that known empty
+scaffold, and provisioned every companion from the resolved recovery
+media's local Git mirrors and wheelhouse -- no manual deletion, no
+Internet. Stage 90 PASS. Stage 95 PASS, gated on the actual r0042
+backup receipt. E8 network isolation remained intact throughout the
+entire run. See "Incident: Stage 80 weather-ingest collision (r0042)"
+below for the full root-cause record this run finally closed out,
+"Resumable restore mechanism" for the complete adoption algorithm and
+interactive workflow, and "Recovery media (r0045)" for the
+offline-media contract that made Stages 10/20/60/80 fully offline.
 
 ---
 
@@ -158,6 +187,7 @@ not a fresh discovery -- read the cited section/commit first.
 | 11 | **Stage 80 weather-ingest collision** -- see full record below | r0043 | `WEATHER_DATA_DIR` legacy-value normalization (Stage 40) + `--resume`/ledger scaffold repair (Stage 80) |
 | 12 | r0043's `--resume` could not help a restore that BEGAN before the ledger existed at all (e.g. the actual r0042 E8 sandbox) -- it has no ledger entries, so `--resume` fell through to ordinary destructive-guarded behavior and still hit `guard_env_overwrite`/`guard_db_overwrite` | r0044 | New `--adopt-pre-ledger` mechanism: each stage independently verifies pre-ledger durable output against the supplied archive and, only if proven, adopts it into a freshly-created ledger -- never inferred from mere file existence. Plus: an interactive TTY workflow so an operator never needs to know these flags exist. See "Resumable restore mechanism" below. |
 | 13 | r0044's interactive workflow broadcast identical `COMMON_ARGS` to every stage (aside from the pre-existing identity routing), so it could not express the authoritative offline-E8 invocation contract's stage-specific frozen-media inputs (Stage 10 apt/snap closure, Stage 20 Git mirror, Stage 60/80 pip wheelhouse, Stage 80 companion mirrors) | r0045 | One recovery-media root concept (`recovery_media.py`'s `validate`/`discover`/`detect-apt-groups`, `--recovery-media-root`, or interactive discovery); `restore.sh` now builds per-stage argument/env arrays (`_restore_build_media_stage_args`) instead of broadcasting. See "Recovery media (r0045)" below. |
+| 14 | `deploy/backup_isadoraair.sh`'s `BACKUP_REQUIRED_RECOVERY_COMPONENTS` was empty/unset by default, so a normal scheduled backup on a fully configured production station could still legally produce `legacy_non_self_contained` unless an operator remembered to set it -- an operator-memory dependency | r0046 | `isadoraair.runtime_recovery.resolve_automatic_recovery_policy()`: kokoro/piper/fdkaac derived automatically from the existing `isadoraair.runtime_requirements` authority (safe since r0029 closed the historical Kokoro-caller blind spot -- see docs/RUNTIME_BACKUP_PAYLOAD.md), `protected_updater` from an independent product/deployment rule never inferred from payload state. `deploy/backup_isadoraair.sh` now uses this by default; the explicit env var remains a deliberate advanced/test override. |
 
 ---
 
@@ -245,6 +275,15 @@ already exists on this host (pre-dating r0043, currently empty) as the
 canonical target for whenever that migration is eventually done
 manually. Tracked here so it is not confused with the restore-tooling
 fix itself.
+
+**Resolution confirmed (r0045 E8 acceptance, 2026-09-08):** the exact
+r0042 sandbox this incident was found on -- carrying the exact
+pre-r0043 damage described above, deliberately never wiped or manually
+repaired across r0043/r0044/r0045 -- was resumed end to end through
+Stage 95 PASS. Stage 40's normalization, the ledger/pre-ledger adoption
+mechanism, and Stage 80's scaffold repair all fired for real, against
+real pre-existing damage, not a synthetic reproduction. See "r0045 E8
+acceptance: full PASS" above for the complete run.
 
 ---
 

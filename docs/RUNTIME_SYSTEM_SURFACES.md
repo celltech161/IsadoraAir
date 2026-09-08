@@ -365,8 +365,14 @@ python manage.py provision_runtime_components --surfaces --apply [--target-root 
 ## No caller migration
 
 `/usr/local/bin/isadoraair-tts` now exists (once `apply()`d) but nothing
-is repointed at it. `webrequests/services.py`, `road_conditions/
-synthesis.py`, and any other historical `KOKORO_BINARY`/weather-ingest
-caller are untouched by E5 and continue exactly as before. Caller
-migration is deliberately a later, independently reversible activation
-decision.
+is repointed at it BY E5 ITSELF -- E5's own scope never touches any
+caller. `webrequests/services.py` and `road_conditions/synthesis.py`
+were untouched by E5 and continued on their historical `KOKORO_BINARY`
+path at the time this checkpoint was written; that migration happened
+independently and later, in r0029, which removed both hardcoded
+fallbacks outright (see docs/RUNTIME_BACKUP_PAYLOAD.md's "Historical
+Kokoro-caller blind spot (CLOSED r0029)") -- confirming caller migration
+really was the deliberately separate, independently reversible decision
+this section describes. weather-ingest is a separate companion
+repository with its own historical `KOKORO_BINARY` caller and its own,
+still-pending migration timeline (see docs/HARDCODED_PATH_AUDIT.md).

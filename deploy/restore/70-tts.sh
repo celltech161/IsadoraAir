@@ -17,18 +17,26 @@
 #   v2.x or explicitly non-self-contained archive fails this backup-based
 #   stage plainly (Runtime Foundation E7B task step 16 -- see "Backward
 #   compatibility" in docs/DISASTER_RECOVERY_RESTORE.md). Kokoro
-#   requiredness comes from the explicit recovery policy/bundle, never
-#   from E1's known historical-caller blind spot. Piper remains
-#   station-owned: bundle, payload selection digest, and restored DB E1
-#   model/config identity must match before publication -- see
-#   monitoring/management/commands/provision_runtime_components.py's
+#   requiredness comes from the explicit recovery policy/bundle the
+#   BACKUP already decided on, never re-derived from E1 against the
+#   freshly-restored database at this point in the restore. Piper
+#   remains station-owned: bundle, payload selection digest, and
+#   restored DB E1 model/config identity must match before publication
+#   -- see monitoring/management/commands/provision_runtime_components.py's
 #   _requirements_for_recovery_tts and isadoraair/runtime_recovery.py's
-#   module docstring for why: a station can have BOTH features backed
-#   by Kokoro live in production AND E1's own `kokoro.required` read as
-#   false (webrequests/road_conditions' hardcoded KOKORO_BINARY callers
-#   bypass StationTTSVoice entirely) -- re-deriving requiredness from
-#   the freshly-restored database at this point would reintroduce
-#   exactly that blind spot.
+#   module docstring. Historical note (CLOSED as of r0029): before then,
+#   a station could have Kokoro live in production via
+#   webrequests/road_conditions' hardcoded KOKORO_BINARY callers that
+#   bypassed StationTTSVoice entirely, while E1's own `kokoro.required`
+#   still read false -- re-deriving requiredness from the database at
+#   restore time would have reintroduced exactly that blind spot. r0029
+#   removed both hardcoded fallbacks, so E1 now sees a station's real
+#   demand -- but this stage still deliberately trusts the BACKUP's own
+#   recorded policy/bundle rather than re-querying the restored database
+#   at this specific point in the restore sequence, since the two could
+#   legitimately differ (e.g. configuration changed between backup and
+#   restore) and the already-embedded bundle is the actual material
+#   being published here, not whatever the database says right now.
 #
 #   Explicit connected/fresh install (--legacy-connected-install, or no
 #   --archive at all): UNCHANGED from Phase 4 -- ad hoc per-engine venv

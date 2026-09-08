@@ -27,24 +27,33 @@ It deliberately does NOT re-implement anything E3/E4 already own:
     isadoraair.runtime_requirements.resolve_current_runtime_requirements
     (E1) -- this module never invents its own station-selection query.
 
-Historical-caller note (Runtime Foundation E1-E6 boundary): E1's own
-station-requirement resolver only sees TTS demand that flows through
-StationTTSVoice / WebRequestConfig.dedication_tts_voice_id /
-RoadConditionsConfiguration.tts_voice_id. On THIS station today,
-WebRequestConfig.enabled and RoadConditionsConfiguration.enabled are
-both True, and both features synthesize via a hardcoded historical
-Kokoro binary path (webrequests/services.py's and
-road_conditions/synthesis.py's own KOKORO_BINARY constants) that never
-consults StationTTSVoice at all -- so E1 currently resolves
-kokoro.required=False even though this station operationally depends on
-Kokoro right now. Because of this documented gap, Kokoro/native
-inclusion in a recovery payload is deliberately OPERATOR-DECLARED here
-(present because the operator supplied real material for it), never
-gated on E1's `required` flag -- see build_recovery_payload's own
-docstring. Piper has no equivalent gap (no hardcoded caller bypasses
-StationTTSVoice for it anywhere in this codebase), so Piper staleness
-detection safely DOES reuse E1's live resolution -- see
-piper_selection_digest.
+Historical-caller note (Runtime Foundation E1-E6 boundary; CLOSED as of
+r0029, kept for the historical record E1's own contract still
+references): E1's station-requirement resolver only sees TTS demand
+that flows through StationTTSVoice / WebRequestConfig.
+dedication_tts_voice_id / RoadConditionsConfiguration.tts_voice_id.
+Before r0029, both WebRequestConfig's dedication intros and
+RoadConditionsConfiguration's KanDrive synthesis could bypass
+StationTTSVoice entirely via a hardcoded historical Kokoro binary path
+(webrequests/services.py's and road_conditions/synthesis.py's own
+KOKORO_BINARY constants), so E1 could resolve kokoro.required=False
+even while a station operationally depended on Kokoro. r0029 (see
+docs/DISASTER_RECOVERY_STATUS.md and that commit's own message) removed
+both hardcoded fallbacks outright -- every current caller resolves a
+voice through StationTTSVoice or fails closed
+(VoiceResolutionError/TTSConfigurationError), so E1's
+resolve_current_runtime_requirements() now sees the station's complete,
+current Kokoro/Piper/fdkaac demand with no blind spot. Payload
+PREPARATION (prepare_runtime_recovery_payload, i.e. which physical
+material to embed) remains a deliberate operator choice via its own
+--tts-bundle/--native-source flags -- an independent, still-reasonable
+design unaffected by this fix. What r0046 changes is the separate
+BACKUP-TIME POLICY question ("which components MUST a payload already
+contain"): resolve_automatic_recovery_policy() below now safely derives
+kokoro/piper/fdkaac requiredness directly from this same, now-complete
+E1 resolution (mapping fdkaac -> the payload's own "native_fdkaac"
+component name), rather than needing an operator to remember and supply
+BACKUP_REQUIRED_RECOVERY_COMPONENTS by hand.
 """
 
 from __future__ import annotations
@@ -431,26 +440,28 @@ class RuntimeRecoveryEvidence:
 
 # ---- recovery-component policy (Runtime Foundation E7B) ------------------
 #
-# E1's station-requirement resolver only sees TTS demand that flows
-# through StationTTSVoice / WebRequestConfig.dedication_tts_voice_id /
-# RoadConditionsConfiguration.tts_voice_id. On this station,
-# WebRequestConfig.enabled and RoadConditionsConfiguration.enabled are
-# both True, but both voice-id fields are None and there are zero
-# StationTTSVoice rows -- yet both features already synthesize via the
-# hardcoded historical Kokoro binary (webrequests/services.py's and
-# road_conditions/synthesis.py's own KOKORO_BINARY constants), entirely
-# bypassing StationTTSVoice. E1 therefore currently resolves
-# kokoro.required=False even though Kokoro is operationally live here.
+# Historical note (CLOSED as of r0029 -- see the module docstring above):
+# before r0029, WebRequestConfig/RoadConditionsConfiguration could
+# synthesize via a hardcoded historical Kokoro binary that bypassed
+# StationTTSVoice entirely, so E1's resolve_current_runtime_requirements()
+# could resolve kokoro.required=False even when a station operationally
+# depended on Kokoro. That gap is gone: every current caller resolves a
+# voice through StationTTSVoice or fails closed. r0046 accordingly adds
+# resolve_automatic_recovery_policy() (below), which derives this policy
+# DIRECTLY from E1 (kokoro -> kokoro, piper -> piper, fdkaac ->
+# native_fdkaac) plus an independent protected_updater product rule --
+# never a second, duplicated station-configuration query.
 #
-# This policy layer is deliberately independent of E1's `required` flag,
-# generic (never a station-name literal), and explicit: an operator (or
-# the backup script, via BACKUP_REQUIRED_RECOVERY_COMPONENTS) declares
-# which component NAMES a recovery payload must positively contain --
+# This layer stays evidence-only and generic (never a station-name
+# literal): given a `required` component-name set from EITHER source
+# below, it only checks already-computed payload evidence against it --
 # "kokoro"/"piper" (checked against the embedded E3 bundle's own
-# component set) and/or "native_fdkaac" (checked against this payload's
-# own top-level component). Nothing here infers policy from station
-# configuration; it only checks payload evidence against an explicit,
-# operator-supplied list.
+# component set) and/or "native_fdkaac"/"protected_updater" (checked
+# against this payload's own top-level components). An operator may
+# still supply an explicit list directly (--require/--require-components,
+# or the backup script's BACKUP_REQUIRED_RECOVERY_COMPONENTS override) --
+# kept as a deliberate advanced/test escape hatch -- but the normal,
+# unattended path is resolve_automatic_recovery_policy().
 RECOVERY_POLICY_COMPONENT_NAMES = frozenset({"kokoro", "piper", "native_fdkaac", "protected_updater"})
 
 
@@ -541,6 +552,92 @@ def evaluate_recovery_policy(
         if component is None or component.state != STATE_PRESENT:
             missing.add("protected_updater")
     return RecoveryPolicyEvidence(required=required, missing=frozenset(missing))
+
+
+def protected_updater_is_required() -> bool:
+    """Independent product/deployment requiredness authority for the
+    protected_updater recovery component (r0046).
+
+    Deliberately NEVER reads the recovery payload, any protected-updater
+    capture, or anything else that could itself be missing/corrupted --
+    a damaged or absent payload/component must never be able to remove
+    its own backup requirement. `updatecenter` is unconditionally part
+    of this product's INSTALLED_APPS (isadoraair/settings.py) -- not a
+    per-station configuration choice an operator can accidentally leave
+    unset -- so this reduces to "is this a current IsadoraAir 1.2+
+    deployment at all", which is exactly the narrowest fact that answers
+    "does this installation run the Phase-D Update Center architecture"
+    (docs/UPDATE_CENTER_PHASE_D.md). For a normal current r0045+
+    production installation this is always True."""
+
+    from django.apps import apps
+
+    return apps.is_installed("updatecenter")
+
+
+@dataclass(frozen=True, slots=True)
+class AutomaticRecoveryPolicy:
+    """The station/product-derived automatic recovery-component policy
+    (r0046) -- see resolve_automatic_recovery_policy. `reasons` is
+    diagnostic-only text (component names and config-derived labels,
+    e.g. "enabled encoder 'FM' selects he_aac" or a weather-persona
+    slot name) -- safe to surface in archive metadata/logs; it never
+    carries secrets."""
+
+    required: frozenset[str]
+    reasons: dict[str, tuple[str, ...]]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "required": sorted(self.required),
+            "reasons": {name: list(self.reasons.get(name, ())) for name in sorted(self.required)},
+        }
+
+
+def resolve_automatic_recovery_policy(
+    requirements: RuntimeRequirements | None = None,
+) -> AutomaticRecoveryPolicy:
+    """Derive the CURRENT, automatic, fail-closed recovery-component
+    policy directly from the existing runtime-requirements authority
+    (isadoraair.runtime_requirements.resolve_current_runtime_requirements)
+    plus the independent protected_updater product/deployment rule above
+    -- never a second, duplicated station-configuration query in Bash,
+    never a station-name literal, never inferred from the recovery
+    payload's own state.
+
+    Mapping: kokoro -> kokoro, piper -> piper, fdkaac -> native_fdkaac
+    (the payload's own component name for it).
+
+    Raises RuntimeRecoveryError if the station's current configuration
+    cannot be resolved (resolve_current_runtime_requirements().errors is
+    non-empty, e.g. an invalid weather voice schedule or a selected
+    logical voice using an unsupported engine) -- callers must fail
+    closed rather than silently derive a policy from indeterminate or
+    invalid configuration; a station that legitimately uses Piper
+    instead of Kokoro, or needs neither, must resolve that from its own
+    actual configuration, never guess."""
+
+    active = requirements if requirements is not None else resolve_current_runtime_requirements()
+    if active.errors:
+        raise RuntimeRecoveryError(
+            "current station configuration could not be resolved -- refusing to guess an automatic "
+            "recovery-component policy from it: " + "; ".join(active.errors)
+        )
+    required: set[str] = set()
+    reasons: dict[str, tuple[str, ...]] = {}
+    for station_name, policy_name in (("kokoro", "kokoro"), ("piper", "piper"), ("fdkaac", "native_fdkaac")):
+        component = active.components[station_name]
+        if component.required:
+            required.add(policy_name)
+            reasons[policy_name] = component.reasons
+    if protected_updater_is_required():
+        required.add("protected_updater")
+        reasons["protected_updater"] = (
+            "product/deployment architecture: this installation runs the Phase-D Update Center "
+            "architecture (updatecenter is unconditionally installed) -- independent of recovery "
+            "payload/component state",
+        )
+    return AutomaticRecoveryPolicy(required=frozenset(required), reasons=reasons)
 
 
 @dataclass(frozen=True, slots=True)

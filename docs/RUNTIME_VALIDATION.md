@@ -9,8 +9,13 @@ separate questions:
 
 E1/E2 themselves **do not provision anything**. They do not install packages,
 download assets, create virtual environments, change database rows, modify
-system paths, or start services. Current dedication, road-condition, and
-weather-ingest callers remain on their historical production paths.
+system paths, or start services. Dedication and road-condition callers cut
+over to canonical `StationTTSVoice`-resolved synthesis in r0029 (their
+historical hardcoded `KOKORO_BINARY` fallbacks were removed outright, not
+just deprioritized -- see docs/RUNTIME_BACKUP_PAYLOAD.md's "Historical
+Kokoro-caller blind spot (CLOSED r0029)"); weather-ingest is a separate
+companion repository and, as of this writing, remains on its own historical
+production path pending its own migration (see docs/HARDCODED_PATH_AUDIT.md).
 
 Runtime Foundation E3 adds the separate deterministic offline provisioner
 documented in `docs/RUNTIME_PROVISIONING.md`. It consumes E1 requirements and
@@ -24,13 +29,17 @@ Foundation E reports only the canonical product runtime described by
 `/home/...` production TTS paths are operational and does not use those paths
 to infer canonical requirements.
 
-Before caller cutover, legacy production Kokoro can therefore be actively
-working while no canonical feature reference selects Kokoro and the canonical
-Kokoro component correctly reports `optional_absent`. That result is not
-evidence that current on-air TTS is broken; it says only that this station does
-not yet require the separately provisioned canonical Kokoro runtime. E3 and
-the later production-activation pass will provision and validate canonical
-runtimes before each historical caller is deliberately migrated.
+Before a given caller's cutover, legacy production Kokoro can therefore be
+actively working through it while no canonical feature reference selects
+Kokoro and the canonical Kokoro component correctly reports `optional_absent`.
+That result is not evidence that current on-air TTS is broken; it says only
+that this station does not yet require the separately provisioned canonical
+Kokoro runtime for THAT caller. E3 and the later production-activation pass
+will provision and validate canonical runtimes before each historical caller
+is deliberately migrated. This is now historical for dedication/road-condition
+specifically (both cut over in r0029 -- see the note above); it remains the
+live, general principle for any caller (e.g. weather-ingest) that has not yet
+migrated.
 
 ## Ownership and API
 

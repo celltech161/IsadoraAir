@@ -37,9 +37,15 @@
 #     manage.py prepare_runtime_recovery_payload --activate); this step
 #     never builds, downloads, or acquires anything itself -- it only
 #     validates and copies an already-prepared, already-validated local
-#     payload. If not yet configured, the archive is built exactly as
-#     before Runtime Foundation E7B existed (no new failure mode) unless
-#     BACKUP_REQUIRED_RECOVERY_COMPONENTS says otherwise -- see that note.
+#     payload. As of r0046, a normal run REQUIRES this payload to
+#     positively contain every component this station's CURRENT
+#     configuration automatically needs (kokoro/piper/fdkaac derived from
+#     isadoraair.runtime_requirements, protected_updater from an
+#     independent product/deployment rule) -- see the 2026-09-08 note
+#     below. A station whose automatic policy needs nothing (no TTS
+#     voices selected, no AAC/HE-AAC encoder, and -- on some future,
+#     non-Phase-D deployment -- no protected_updater requirement either)
+#     still runs exactly as before Runtime Foundation E7B existed.
 #
 # Deliberately excluded — see docs/DISASTER_RECOVERY.md for the full,
 # explicit policy this was derived from:
@@ -130,6 +136,27 @@
 # RECOVERY_PAYLOAD_ROOT / BACKUP_REQUIRED_RECOVERY_COMPONENTS env vars
 # this step reads (both documented at their point of use below).
 #
+# 2026-09-08 (r0046) automatic required-component policy: before this,
+# BACKUP_REQUIRED_RECOVERY_COMPONENTS was empty/unset by default, so a
+# normal scheduled backup on a fully configured production station could
+# still legally produce a legacy_non_self_contained archive -- nothing
+# forced an operator to remember to set it. This depended on an
+# operator-memory step that r0029 (see docs/DISASTER_RECOVERY_STATUS.md)
+# made unnecessary: before r0029, WebRequestConfig/RoadConditionsConfiguration
+# could synthesize via a hardcoded historical Kokoro binary that bypassed
+# StationTTSVoice, so isadoraair.runtime_requirements couldn't see that
+# demand; r0029 removed that bypass outright, so this station's real
+# Kokoro/Piper/fdkaac demand is now always fully visible to it. This
+# script therefore now calls `validate_runtime_recovery_payload
+# --require-current-station-policy` by default (see
+# isadoraair.runtime_recovery.resolve_automatic_recovery_policy) --
+# derived directly from that same, now-complete authority, plus an
+# independent protected_updater product/deployment rule that is NEVER
+# inferred from the payload's own (possibly corrupted/missing) state.
+# BACKUP_REQUIRED_RECOVERY_COMPONENTS remains available as a deliberate
+# advanced/test override (an explicit list takes over completely instead
+# of the automatic policy) -- see that variable's own comment below.
+#
 # Pushes the result via SFTP to a remote target configured in
 # ~/.iasboxbu.cred (BAK_HOST, BAK_USER, BAK_PORT, BAK_PATH, BAK_PASS) —
 # never hardcoded here; this file has no station-specific secrets in it.
@@ -195,26 +222,29 @@ CONFIG_FILE="$HOME/.iasboxbu.cred"
 # plain shell default instead.
 PROJECT_DIR="${PROJECT_DIR:-/opt/isadoraair}"
 STEREOTOOL_DIR="${STEREOTOOL_DIR:-$HOME/stereotool}"
-# Runtime Foundation E7B -- see the 2026-08-29 header note above and
-# docs/RUNTIME_BACKUP_PAYLOAD.md. RECOVERY_PAYLOAD_ROOT is WHERE to look
-# for the station's current, already-prepared-and-activated recovery
-# payload (never created or written to by this script -- see
+# Runtime Foundation E7B -- see the 2026-08-29/2026-09-08 header notes
+# above and docs/RUNTIME_BACKUP_PAYLOAD.md. RECOVERY_PAYLOAD_ROOT is
+# WHERE to look for the station's current, already-prepared-and-activated
+# recovery payload (never created or written to by this script -- see
 # isadoraair.runtime_recovery.resolve_current_recovery_payload_root).
-# BACKUP_REQUIRED_RECOVERY_COMPONENTS is empty/unset by default --
-# exactly the same "disabled by default, no new failure mode until an
-# operator deliberately opts in" contract the recovery-credential
-# encryption feature above already established. Once set (a
-# comma-separated list drawn from kokoro/piper/native_fdkaac -- see
-# isadoraair.runtime_recovery.RECOVERY_POLICY_COMPONENT_NAMES), this
-# backup becomes fail-closed: no current payload, or a current payload
-# that does not positively contain every listed component, aborts
-# before upload. This is the mechanism the 2026-08-29 note's
-# "historical dormant-Kokoro" migration period needs: E1's own
-# kokoro.required flag is NOT consulted here at all (see
-# isadoraair/runtime_recovery.py's own module docstring for exactly
-# why) -- an operator who knows this station's dedication/road-condition
-# features still depend on the historical Kokoro path sets
-# BACKUP_REQUIRED_RECOVERY_COMPONENTS=kokoro explicitly instead.
+#
+# BACKUP_REQUIRED_RECOVERY_COMPONENTS is empty/unset by default. A
+# normal scheduled backup with NO special environment override (the
+# expected production configuration as of r0046) instead uses the
+# AUTOMATIC policy: --require-current-station-policy derives which
+# components (kokoro/piper/native_fdkaac/protected_updater) this
+# station's CURRENT configuration and product architecture actually
+# need, directly from isadoraair.runtime_recovery
+# .resolve_automatic_recovery_policy -- no operator memory required, and
+# it fails closed (aborts before upload) rather than ever silently
+# downgrading to legacy_non_self_contained. Setting
+# BACKUP_REQUIRED_RECOVERY_COMPONENTS to a non-empty comma-separated list
+# (drawn from isadoraair.runtime_recovery.RECOVERY_POLICY_COMPONENT_NAMES)
+# is a deliberate advanced/test override: it replaces the automatic
+# policy entirely with that explicit list instead (e.g. for a sandbox/CI
+# run where the automatic policy's own live-database dependency isn't
+# available, or to deliberately pin a narrower/wider set than the
+# station's real current configuration would produce).
 RECOVERY_PAYLOAD_ROOT="${RECOVERY_PAYLOAD_ROOT:-/var/lib/isadoraair/runtime-recovery}"
 BACKUP_REQUIRED_RECOVERY_COMPONENTS="${BACKUP_REQUIRED_RECOVERY_COMPONENTS:-}"
 STAMP=$(date +%Y%m%d-%H%M%S)
@@ -500,19 +530,57 @@ else:
 " "$1" "$2"
 }
 
+# One human-readable "component: reason" line per required component's
+# diagnostic reasons -- pure stdlib json, safe (component names and
+# config-derived labels only, e.g. "enabled encoder 'FM' selects
+# he_aac" -- never secrets; see resolve_automatic_recovery_policy's own
+# docstring). Empty policy/reasons prints nothing.
+recovery_json_get_reasons() {
+  python3 -c "
+import json, sys
+data = json.loads(sys.argv[1]).get('policy') or {}
+reasons = data.get('reasons') or {}
+for name in sorted(reasons):
+    for reason in reasons[name]:
+        print(f'  {name}: {reason}')
+" "$1"
+}
+
+# r0046: the automatic policy is the normal path -- an explicit
+# BACKUP_REQUIRED_RECOVERY_COMPONENTS is a deliberate advanced/test
+# override that replaces it entirely (see that variable's own comment
+# above). Exactly one of the two is ever passed.
+if [ -n "$BACKUP_REQUIRED_RECOVERY_COMPONENTS" ]; then
+  RECOVERY_POLICY_MODE_ARGS=(--require-components "$BACKUP_REQUIRED_RECOVERY_COMPONENTS")
+else
+  RECOVERY_POLICY_MODE_ARGS=(--require-current-station-policy)
+fi
+
 set +e
 RECOVERY_PAYLOAD_STATUS_JSON=$("$APP_VENV_PYTHON" "$PROJECT_DIR/manage.py" \
   validate_runtime_recovery_payload --base-root "$RECOVERY_PAYLOAD_ROOT" --current --json \
-  --require-components "$BACKUP_REQUIRED_RECOVERY_COMPONENTS")
+  "${RECOVERY_POLICY_MODE_ARGS[@]}")
 RECOVERY_PAYLOAD_EXIT=$?
 set -e
 
+# What the (automatic or explicit) policy actually required is reported
+# in the JSON output even on the NOT-CONFIGURED (exit 2) path -- read it
+# here rather than re-deriving it from BACKUP_REQUIRED_RECOVERY_COMPONENTS,
+# so the automatic policy's own resolution (never duplicated in Bash)
+# is always the single source of truth for "is a policy actually active."
+RECOVERY_PAYLOAD_POLICY_REQUIRED_PRECHECK=$(recovery_json_get "$RECOVERY_PAYLOAD_STATUS_JSON" policy.required)
+
 RECOVERY_PAYLOAD_INCLUDED=0
-if [ "$RECOVERY_PAYLOAD_EXIT" -eq 2 ] && [ -z "$BACKUP_REQUIRED_RECOVERY_COMPONENTS" ]; then
+if [ "$RECOVERY_PAYLOAD_EXIT" -eq 2 ] && [ -z "$RECOVERY_PAYLOAD_POLICY_REQUIRED_PRECHECK" ]; then
   # Exit 2 = RecoveryPayloadNotConfiguredError specifically (never any
-  # other failure) -- Runtime Foundation E7B simply hasn't been adopted
-  # on this host yet, and no operator policy says it must be. Same,
-  # unchanged backup behavior as before Runtime Foundation E7 existed.
+  # other failure), AND the active policy (automatic or explicit)
+  # requires nothing at all -- Runtime Foundation E7B simply hasn't been
+  # adopted on this host, and nothing says it must be. Same, unchanged
+  # backup behavior as before Runtime Foundation E7 existed. Under the
+  # r0046 automatic policy this is only possible for a station whose
+  # current configuration needs no TTS voice and no AAC/HE-AAC encoder,
+  # AND (on some future, non-Phase-D deployment) no protected_updater --
+  # for a normal current production station this branch is unreachable.
   echo "  no current recovery payload is configured at ${RECOVERY_PAYLOAD_ROOT} -- Runtime Foundation E7B not yet adopted on this host. Continuing without runtime-recovery/ in this archive."
   RECOVERY_PAYLOAD_MANIFEST_BLOCK="Runtime recovery payload: not included (no current payload configured at ${RECOVERY_PAYLOAD_ROOT})"
 elif [ "$RECOVERY_PAYLOAD_EXIT" -ne 0 ]; then
@@ -535,6 +603,8 @@ else
   RECOVERY_PAYLOAD_PIPER_FRESHNESS=$(recovery_json_get "$RECOVERY_PAYLOAD_STATUS_JSON" piper_freshness.state)
   RECOVERY_PAYLOAD_POLICY_REQUIRED=$(recovery_json_get "$RECOVERY_PAYLOAD_STATUS_JSON" policy.required)
   RECOVERY_PAYLOAD_POLICY_SATISFIED=$(recovery_json_get "$RECOVERY_PAYLOAD_STATUS_JSON" policy.satisfied)
+  RECOVERY_PAYLOAD_POLICY_SOURCE=$(recovery_json_get "$RECOVERY_PAYLOAD_STATUS_JSON" policy.source)
+  RECOVERY_PAYLOAD_POLICY_REASONS=$(recovery_json_get_reasons "$RECOVERY_PAYLOAD_STATUS_JSON")
 
   mkdir -p "$WORKDIR/runtime-recovery"
   # r0041: this directory has no source item of its own to inherit a mode
@@ -580,8 +650,11 @@ Runtime recovery product-contract digest: ${RECOVERY_PAYLOAD_PRODUCT_DIGEST}
 Runtime recovery tts component: ${RECOVERY_PAYLOAD_TTS_STATE} (${RECOVERY_PAYLOAD_TTS_COMPONENTS})
 Runtime recovery native fdkaac component: ${RECOVERY_PAYLOAD_NATIVE_STATE}
 Runtime recovery Piper station-selection freshness: ${RECOVERY_PAYLOAD_PIPER_FRESHNESS}
+Runtime recovery required-component policy source: ${RECOVERY_PAYLOAD_POLICY_SOURCE:-(none configured)}
 Runtime recovery required-component policy: ${RECOVERY_PAYLOAD_POLICY_REQUIRED:-(none configured)}
-Runtime recovery required-component policy satisfied: ${RECOVERY_PAYLOAD_POLICY_SATISFIED:-n/a}"
+Runtime recovery required-component policy satisfied: ${RECOVERY_PAYLOAD_POLICY_SATISFIED:-n/a}
+Runtime recovery required-component policy reasons:
+${RECOVERY_PAYLOAD_POLICY_REASONS:-  (none)}"
 fi
 
 # Only a payload satisfying a NON-EMPTY explicit policy earns archive

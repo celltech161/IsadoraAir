@@ -20,9 +20,13 @@ mechanisms for backup-based recovery. See "Backup v3 integration" and
   `RECOVERY_PAYLOAD_ROOT` persistent location on production, or touched
   `/opt/isadoraair-runtime`, `/var/lib/isadoraair/tts`, or `/usr/local`
   on the live station.
-- Not a TTS caller migration — `webrequests/services.py` and
-  `road_conditions/synthesis.py` still call their own hardcoded
-  `KOKORO_BINARY` directly; nothing here changes that.
+- Historical note (CLOSED as of r0029): at the time this checkpoint was
+  written, `webrequests/services.py` and `road_conditions/synthesis.py`
+  still called their own hardcoded `KOKORO_BINARY` directly, bypassing
+  StationTTSVoice. r0029 removed both hardcoded fallbacks outright —
+  every current caller resolves a voice through StationTTSVoice or
+  fails closed. See "Historical Kokoro-caller blind spot (CLOSED r0029)"
+  below for what this changed for the backup policy specifically.
 - Not Phase 5's clean-machine restore drill, and not E8's fully offline
   whole-machine acceptance.
 
@@ -131,36 +135,38 @@ the same underlying reason (see next section).
 
 ## Inclusion policy
 
-### Kokoro — operator-declared, never gated on E1's `required` flag
+### Kokoro — operator-declared payload preparation, never gated on E1's `required` flag
 
-**Historical-caller gap (load-bearing for this decision):** Runtime
-Foundation E1's station-requirement resolver only sees TTS demand that
-flows through `StationTTSVoice` / `WebRequestConfig.
-dedication_tts_voice_id` / `RoadConditionsConfiguration.tts_voice_id`.
-On the current production station, `WebRequestConfig.enabled` and
-`RoadConditionsConfiguration.enabled` are both `True` — both features
-are live — but both `dedication_tts_voice_id` and `tts_voice_id` are
-`None`, and there are zero `StationTTSVoice` rows at all. Both features'
-actual synthesis code (`webrequests/services.py`'s and
-`road_conditions/synthesis.py`'s own hardcoded `KOKORO_BINARY =
-"/home/jreed/kokoro/bin/kokoro_synth"` constants) calls the historical
-Kokoro binary directly and unconditionally, never consulting
-`StationTTSVoice` at all. **E1 therefore currently resolves
-`kokoro.required = False` even though this station operationally
-depends on Kokoro right now.**
+This section is about *payload preparation* (`RuntimeRecoveryBuilder` —
+what material gets physically embedded), a separate concern from the
+*backup policy* question of what a payload must already contain (see
+"Historical Kokoro-caller blind spot (CLOSED r0029)" above).
 
-Consequence: Kokoro/native inclusion in a recovery payload is
-**operator-declared** — present in the payload because the operator
-supplied real `--tts-bundle`/`--native-source-dir` material for it, full
-stop. The builder never consults `resolve_current_runtime_requirements()`
-to decide whether to include or omit Kokoro, and never treats
-`required=False` as license to silently produce a payload that can't
-actually restore this station's current capability.
+**Historically (CLOSED as of r0029):** before then, Runtime Foundation
+E1's station-requirement resolver could resolve `kokoro.required =
+False` even while a station operationally depended on Kokoro, because
+`webrequests/services.py`'s and `road_conditions/synthesis.py`'s own
+hardcoded `KOKORO_BINARY` constants bypassed `StationTTSVoice` entirely.
+r0029 removed that gap — E1 now sees a station's real Kokoro demand.
 
-This exact same historical-caller gap is why **restore-time**
-provisioning (see "Restore integration" below) also never re-derives
-"is Kokoro required" from the freshly-restored database — it would
-reintroduce the identical blind spot, just one step later.
+Payload preparation nonetheless remains **operator-declared** — Kokoro/
+native material is present in a payload because the operator supplied
+real `--tts-bundle`/`--native-source-dir` material for it, full stop.
+The builder never consults `resolve_current_runtime_requirements()` to
+decide whether to include or omit Kokoro. This is now a deliberate,
+independent design choice (an operator explicitly chooses what to
+embed) rather than a historical-gap workaround — the separate backup
+POLICY question (r0046, above) is what actually enforces that whatever
+gets embedded matches the station's current, automatically-resolved
+need.
+
+For the same reason, **restore-time** provisioning (see "Restore
+integration" below) still never re-derives "is Kokoro required" from
+the freshly-restored database — the embedded bundle reflects whatever
+the backup's policy already justified, which can legitimately have
+diverged from the database by restore time; re-deriving it here would
+publish material that doesn't match what was actually validated and
+embedded.
 
 ### Piper — station-aware, safely reuses E1
 
@@ -317,15 +323,14 @@ archive, a stale Piper station-model requirement, an unknown or
 duplicate component, an unsatisfied `--require` policy, and any
 unsupported manifest field.
 
-## Recovery-component policy (Runtime Foundation E7B)
+## Recovery-component policy (Runtime Foundation E7B, automatic policy r0046)
 
 `isadoraair.runtime_recovery.evaluate_recovery_policy(evidence,
-required_components)` — a small, explicit, operator-declared overlay on
-top of `RuntimeRecoveryEvidence`, answering "does the *currently
-selected* payload still positively contain what this station's DR
-policy requires" without ever consulting E1:
+required_components)` — a small, evidence-only overlay on top of
+`RuntimeRecoveryEvidence`, answering "does the *currently selected*
+payload still positively contain every one of these component names":
 
-- `RECOVERY_POLICY_COMPONENT_NAMES = {"kokoro", "piper", "native_fdkaac"}`
+- `RECOVERY_POLICY_COMPONENT_NAMES = {"kokoro", "piper", "native_fdkaac", "protected_updater"}`
   — generic component names, never a station name, never hardcoded to
   Oak Grove or any other specific station.
 - A component named in the policy but **absent, invalid, or (for
@@ -338,10 +343,75 @@ policy requires" without ever consulting E1:
 - Not-required components may be absent with no penalty — the policy is
   strictly opt-in per component, never "everything must be present."
 
-`deploy/backup_isadoraair.sh`'s `BACKUP_REQUIRED_RECOVERY_COMPONENTS`
-env var (comma-separated, empty by default) is the one place this
-policy gets configured for the nightly backup — see "Backup v3
-integration."
+**Where the `required_components` set itself comes from** is a separate
+question, answered one of two ways:
+
+1. **Automatic (r0046, the normal path)** —
+   `isadoraair.runtime_recovery.resolve_automatic_recovery_policy()`
+   derives it directly from `isadoraair.runtime_requirements.
+   resolve_current_runtime_requirements()` (Runtime Foundation E1):
+   `kokoro`/`piper` map straight across, `fdkaac` maps to
+   `native_fdkaac`. `protected_updater` comes from an *independent*
+   product/deployment rule (`protected_updater_is_required()`) that
+   never reads the payload/component itself — see "Historical
+   Kokoro-caller blind spot (CLOSED r0029)" below for why this became
+   safe, and "protected_updater: an independent product/deployment
+   rule" for that component specifically. Raises `RuntimeRecoveryError`
+   (fail closed) if the station's current configuration can't be
+   resolved at all (e.g. an invalid weather voice schedule) — it never
+   guesses a policy from indeterminate configuration.
+2. **Explicit (advanced/test override)** — `--require`/
+   `--require-components`, or `deploy/backup_isadoraair.sh`'s
+   `BACKUP_REQUIRED_RECOVERY_COMPONENTS` env var (comma-separated). When
+   set, this REPLACES the automatic policy entirely for that run — the
+   two are mutually exclusive at the CLI layer
+   (`validate_runtime_recovery_payload --require-current-station-policy`
+   vs `--require`/`--require-components`).
+
+`deploy/backup_isadoraair.sh` uses the automatic policy by default (no
+special environment override needed) and only falls back to the
+explicit `BACKUP_REQUIRED_RECOVERY_COMPONENTS` path when an operator
+sets it — see "Backup v3 integration."
+
+### Historical Kokoro-caller blind spot (CLOSED r0029)
+
+Before r0029, `webrequests/services.py`'s and
+`road_conditions/synthesis.py`'s own hardcoded `KOKORO_BINARY =
+"/home/jreed/kokoro/bin/kokoro_synth"` constants let a station
+operationally depend on Kokoro (both features live, actually
+synthesizing through that binary) while bypassing `StationTTSVoice`
+entirely — so Runtime Foundation E1 could resolve `kokoro.required =
+False` even though Kokoro was genuinely required. r0029 removed both
+hardcoded fallbacks outright (`road_conditions/voice.py`'s
+`resolve_voice()` now raises `VoiceResolutionError` immediately instead
+of falling back; `webrequests/services.py`'s dedication synthesis raises
+`TTSConfigurationError` when no voice is configured) — every current
+caller resolves a voice through `StationTTSVoice` or fails closed. E1's
+`resolve_current_runtime_requirements()` therefore now sees a station's
+complete, current Kokoro/Piper/fdkaac demand with no blind spot, which
+is exactly what makes `resolve_automatic_recovery_policy()` (above)
+safe to introduce for kokoro/piper/fdkaac. This historical gap is why
+Kokoro/native *payload preparation* (`RuntimeRecoveryBuilder`, see
+"Kokoro — operator-declared" below) remained a deliberately separate,
+operator-driven step rather than something r0046 also automates — an
+operator still explicitly chooses which physical material to embed in a
+payload; r0046 only changes whether the BACKUP considers a given
+payload adequate.
+
+### protected_updater: an independent product/deployment rule
+
+`protected_updater` has no station-configuration analogue at all — it
+isn't "selected" the way a TTS voice or an AAC encoder is. Its
+automatic requiredness rule (`protected_updater_is_required()`) instead
+answers "does this installation run the Phase-D Update Center
+architecture" by checking whether `updatecenter` is installed in
+Django's app registry — unconditionally true for every current
+IsadoraAir 1.2+ deployment (`isadoraair/settings.py`'s
+`INSTALLED_APPS`, not a per-station choice). This is deliberately NEVER
+derived from the recovery payload's own state (whether a
+`protected_updater` component happens to be present, valid, or
+readable) — a corrupted or missing payload/component must never be able
+to remove its own backup requirement.
 
 ## Persistent payload location (Runtime Foundation E7B — established and activated on production)
 
@@ -541,16 +611,26 @@ encryption:
 1. Resolve the current recovery payload at `$RECOVERY_PAYLOAD_ROOT`
    (default `/var/lib/isadoraair/runtime-recovery`, overridable) via
    `manage.py validate_runtime_recovery_payload --base-root ... --current
-   --json --require-components "$BACKUP_REQUIRED_RECOVERY_COMPONENTS"`;
-   the strict parser rejects empty entries, whitespace, duplicates, and
-   unknown names rather than silently weakening policy. The variable is
-   `$BACKUP_REQUIRED_RECOVERY_COMPONENTS` (comma-separated, empty by
-   default).
-2. Exit code 2 **and** no policy configured → warn and continue without
-   a payload (backward-compatible, no new failure mode for a host that
-   hasn't adopted E7B yet). Any other nonzero exit (broken payload, or
-   exit 2 *with* a policy configured — "not configured" is never an
-   acceptable answer to an explicit requirement) → abort before upload.
+   --json`, plus exactly one policy mode: **`$BACKUP_REQUIRED_RECOVERY_COMPONENTS`
+   unset/empty (the normal case, r0046)** → `--require-current-station-policy`,
+   deriving the required set automatically from
+   `isadoraair.runtime_recovery.resolve_automatic_recovery_policy()` (see
+   "Recovery-component policy" above); **`$BACKUP_REQUIRED_RECOVERY_COMPONENTS`
+   set** → `--require-components "$BACKUP_REQUIRED_RECOVERY_COMPONENTS"`
+   instead, a deliberate advanced/test override that replaces the
+   automatic policy entirely (the strict parser rejects empty entries,
+   whitespace, duplicates, and unknown names rather than silently
+   weakening policy).
+2. Exit code 2 **and** the active policy (automatic or explicit)
+   required nothing at all → warn and continue without a payload
+   (backward-compatible, no new failure mode for a host that hasn't
+   adopted E7B yet, or — on some future non-Phase-D deployment — one
+   whose automatic policy genuinely needs nothing). Any other nonzero
+   exit (broken payload, or exit 2 *with* a non-empty policy — "not
+   configured" is never an acceptable answer to a real requirement,
+   automatic or explicit) → abort before upload. Under the r0046
+   automatic policy this soft path is unreachable for a normal current
+   production station, since `protected_updater` is always required.
 3. On success: recursively copy the payload without attempting to preserve
    administrative ownership (the backup service is unprivileged), never regenerate it,
    into the archive's `runtime-recovery/` directory, then **re-validate
@@ -562,10 +642,13 @@ encryption:
    for humans plus inclusion status, payload ID, schema
    version, product-contract digest, tts/native_fdkaac component
    states, which tts components (`kokoro`/`piper`) are actually
-   present, Piper station-selection freshness, and the configured
-   recovery-component policy plus whether it was satisfied — never the
-   nested wheel/hash tables themselves (the embedded manifests remain
-   the integrity authority).
+   present, Piper station-selection freshness, the required-component
+   policy's SOURCE (`automatic`/`explicit`) and its component list plus
+   whether it was satisfied, and — for diagnostics, never secrets — the
+   automatically-resolved reasons per required component (e.g. which
+   enabled encoder selected HE-AAC, or the protected_updater
+   product/deployment rule) — never the nested wheel/hash tables
+   themselves (the embedded manifests remain the integrity authority).
 
 This step runs identically under `DRY_RUN=1` (no network involved, same
 as every other local archive-building step) and never calls
@@ -591,10 +674,14 @@ mechanism — `--source-dir`/`--download-sources` for 50,
    `--recovery-payload` option, which:
    - supplies `--bundle` (TTS) or the native fdkaac source directory
      automatically — never guessed or re-derived by the restore stage;
-   - uses payload/policy requiredness for Kokoro and native fdkaac, avoiding
-     the dormant historical-Kokoro caller blind spot; Piper is deliberately
-     different and must match the freshly restored DB's E1 model/config
-     identity before its station-derived requirements are handed to E3. See
+   - uses payload/policy requiredness for Kokoro and native fdkaac (what
+     the backup's recovery-component policy already justified embedding,
+     not whatever the freshly-restored database says right now — see
+     "Historical Kokoro-caller blind spot (CLOSED r0029)" above for why
+     that reasoning outlives the gap it was originally written for);
+     Piper is deliberately different and must match the freshly restored
+     DB's E1 model/config identity before its station-derived
+     requirements are handed to E3. See
      `monitoring/management/commands/provision_runtime_components.py`'s
      `_requirements_for_recovery_tts` / `_requirements_for_recovery_native`.
 3. Native fdkaac preserves the full authority chain: E4's real
@@ -657,7 +744,13 @@ their own hardcoded `KOKORO_BINARY` directly today — the documented
 historical-caller gap this whole design exists to route around remains
 live. This station's actual recovery policy is therefore `kokoro` +
 `native_fdkaac`; Piper is genuinely not applicable (zero
-`StationTTSVoice` rows).
+`StationTTSVoice` rows). **Historical snapshot, superseded by r0029:**
+this was a real, dated (2026-08-29) observation of the station AT THAT
+TIME, kept as an evidence trail (do not edit it away) — r0029 (Sept 1)
+subsequently removed both hardcoded `KOKORO_BINARY` fallbacks, so a
+fresh run of this same inspection today would resolve `kokoro.required`
+from `StationTTSVoice` like any other engine. See "Historical
+Kokoro-caller blind spot (CLOSED r0029)" above.
 
 **The full chain proved real, twice over.** A real E3 Kokoro bundle
 (pip-downloaded, hash-locked wheel closure at the exact versions the
@@ -789,6 +882,16 @@ invocation.
   E8 should now use.
 - **Phase 5** — an actual bare/clean-machine restore drill (original
   host and GitHub unavailable) remains later work.
+- ~~Operator-memory required-component policy~~ — **done** (r0046).
+  `BACKUP_REQUIRED_RECOVERY_COMPONENTS` being empty/unset by default
+  meant a normal scheduled backup on a fully configured production
+  station could still legally produce `legacy_non_self_contained`
+  without an operator remembering to set it. `resolve_automatic_recovery_policy()`
+  now derives the required set automatically and fail-closed (kokoro/
+  piper/fdkaac from E1, `protected_updater` from an independent
+  product/deployment rule); `deploy/backup_isadoraair.sh` uses it by
+  default, with the explicit env var kept only as a deliberate
+  advanced/test override. See "Recovery-component policy" above.
 
 ## Phase-D protected updater recovery extension
 

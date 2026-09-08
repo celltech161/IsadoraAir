@@ -329,10 +329,16 @@ shared contract both use), then delegates to Foundation E4's real
 prepare/publish authority (native fdkaac) or Foundation E3's real
 provisioner (Kokoro/Piper) — see `docs/RUNTIME_BACKUP_PAYLOAD.md`'s
 "Restore integration" section for the exact mechanism. Which of Kokoro/
-Kokoro requiredness is read from the recovery policy/bundle so the known
-historical-caller blind spot cannot drop it. Piper remains DB-owned: its
-bundle identity, payload selection digest, and restored station model/config
-selection must all match before publication; DB `not_checked` fails closed.
+native fdkaac's requiredness is read from the backup's own recorded recovery
+policy/bundle, never re-derived from the freshly-restored database at this
+point in the restore -- the two could legitimately have diverged since backup
+time, and it's the already-embedded material actually being published here
+(see docs/RUNTIME_BACKUP_PAYLOAD.md's "Historical Kokoro-caller blind spot
+(CLOSED r0029)" for the historical gap this reasoning originally closed, and
+"Recovery-component policy" for how that policy is now resolved automatically
+by default). Piper remains DB-owned: its bundle identity, payload selection
+digest, and restored station model/config selection must all match before
+publication; DB `not_checked` fails closed.
 
 **If the archive has no `runtime-recovery/` payload** (every archive
 taken before an operator activates E7B on the production host, and

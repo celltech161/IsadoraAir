@@ -447,13 +447,64 @@ class RuntimeRecoveryPayloadBackupTests(SimpleTestCase):
         self.assertNotIn("wget ", self.text)
 
     def test_configured_but_broken_payload_always_aborts(self):
-        """Exit code 2 is treated specially ONLY when paired with an
-        EMPTY BACKUP_REQUIRED_RECOVERY_COMPONENTS -- every other exit
-        code (including exit 2 WITH a policy configured) is fatal,
-        unconditionally."""
-        self.assertIn('if [ "$RECOVERY_PAYLOAD_EXIT" -eq 2 ] && [ -z "$BACKUP_REQUIRED_RECOVERY_COMPONENTS" ]; then', self.text)
+        """Exit code 2 is treated specially ONLY when the ACTIVE policy
+        (automatic or explicit -- read back from the command's own JSON,
+        never re-derived from BACKUP_REQUIRED_RECOVERY_COMPONENTS in
+        Bash) required nothing at all -- every other exit code (including
+        exit 2 with a non-empty required-component policy) is fatal,
+        unconditionally. r0046: this is what makes a fully configured
+        production station's automatic policy fail-closed even when the
+        payload was never adopted in the first place."""
+        self.assertIn(
+            'if [ "$RECOVERY_PAYLOAD_EXIT" -eq 2 ] && [ -z "$RECOVERY_PAYLOAD_POLICY_REQUIRED_PRECHECK" ]; then',
+            self.text,
+        )
         self.assertIn('elif [ "$RECOVERY_PAYLOAD_EXIT" -ne 0 ]; then', self.text)
         self.assertIn("aborting before upload", self.text)
+
+    def test_automatic_policy_is_the_default_mode(self):
+        """r0046: with BACKUP_REQUIRED_RECOVERY_COMPONENTS unset/empty
+        (the normal scheduled-service configuration), the backup calls
+        --require-current-station-policy -- never silently skips policy
+        enforcement entirely."""
+        self.assertIn('RECOVERY_POLICY_MODE_ARGS=(--require-current-station-policy)', self.text)
+        self.assertIn(
+            'if [ -n "$BACKUP_REQUIRED_RECOVERY_COMPONENTS" ]; then\n'
+            '  RECOVERY_POLICY_MODE_ARGS=(--require-components "$BACKUP_REQUIRED_RECOVERY_COMPONENTS")\n'
+            'else\n'
+            '  RECOVERY_POLICY_MODE_ARGS=(--require-current-station-policy)\n'
+            'fi',
+            self.text,
+        )
+
+    def test_explicit_override_still_available_and_takes_priority(self):
+        """BACKUP_REQUIRED_RECOVERY_COMPONENTS remains a real override --
+        when set, it replaces the automatic policy entirely rather than
+        combining with it (the underlying Python command refuses to
+        combine --require-current-station-policy with --require-components
+        -- this script must never attempt to pass both)."""
+        start = self.text.index('if [ -n "$BACKUP_REQUIRED_RECOVERY_COMPONENTS" ]; then')
+        end = self.text.index('\n\nset +e\nRECOVERY_PAYLOAD_STATUS_JSON=')
+        mode_selection = self.text[start:end]
+        self.assertNotIn("--require-current-station-policy\" \"--require-components", mode_selection)
+        self.assertIn('--require-components "$BACKUP_REQUIRED_RECOVERY_COMPONENTS"', mode_selection)
+
+    def test_policy_required_precheck_never_duplicates_station_policy_logic(self):
+        """The precheck reads the Python authority's own JSON
+        (policy.required) rather than re-implementing station-policy
+        mapping in Bash -- the whole point of this workorder."""
+        self.assertIn(
+            'RECOVERY_PAYLOAD_POLICY_REQUIRED_PRECHECK=$(recovery_json_get "$RECOVERY_PAYLOAD_STATUS_JSON" policy.required)',
+            self.text,
+        )
+
+    def test_manifest_records_automatic_policy_diagnostics(self):
+        """Operators must be able to see WHICH components were
+        automatically required and WHY, without exposing secrets --
+        reasons are component names and config-derived labels only."""
+        self.assertIn("Runtime recovery required-component policy source:", self.text)
+        self.assertIn("Runtime recovery required-component policy reasons:", self.text)
+        self.assertIn("recovery_json_get_reasons", self.text)
 
     def test_not_configured_case_never_aborts_when_no_policy_set(self):
         start = self.text.index('if [ "$RECOVERY_PAYLOAD_EXIT" -eq 2 ]')

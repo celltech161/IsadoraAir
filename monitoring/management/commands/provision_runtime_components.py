@@ -38,10 +38,15 @@ def _requirements_for_recovery_native() -> RuntimeRequirements:
     call is never re-derived from live station configuration (Runtime
     Foundation E1) -- the payload's own native_fdkaac component already
     passed E7's fail-closed load, which is itself only possible because
-    an operator's recovery-component policy justified including it (see
-    docs/RUNTIME_BACKUP_PAYLOAD.md). Re-querying E1 here would silently
-    reintroduce exactly the dormant-Kokoro-style blind spot this
-    integration exists to avoid."""
+    a recovery-component policy (r0046: normally the automatic one, see
+    isadoraair.runtime_recovery.resolve_automatic_recovery_policy; or an
+    explicit operator override) justified including it at BACKUP time
+    (see docs/RUNTIME_BACKUP_PAYLOAD.md). Re-querying E1 here would
+    trust the CURRENT database's configuration instead of the one the
+    payload was actually built for, which could legitimately have
+    changed since -- this provisioning step publishes exactly the
+    already-embedded, already-justified material, not whatever E1 says
+    right now."""
     return RuntimeRequirements(
         components={
             "fdkaac": ComponentRequirement(name="fdkaac", required=True, reasons=(RECOVERY_PAYLOAD_REASON,)),
@@ -56,15 +61,20 @@ def _requirements_for_recovery_tts(
 ) -> RuntimeRequirements:
     """kokoro/piper requiredness for a --recovery-payload TTS
     provisioning call comes from what the embedded, already-validated
-    E3 bundle actually contains -- never from resolve_current_runtime_requirements()
-    (Runtime Foundation E1), which is exactly the signal that misses a
-    station's dormant-but-still-live Kokoro usage (webrequests/road_conditions'
-    hardcoded KOKORO_BINARY callers bypass StationTTSVoice entirely --
-    see runtime_recovery.py's module docstring). Piper's model list is
-    remains the exception: its model/config identities are owned by the
-    restored station database.  The caller must supply E1-resolved
-    station requirements when Piper is present; bundle/payload/station
-    digests have already been proven equal before this helper runs."""
+    E3 bundle actually contains -- never from
+    resolve_current_runtime_requirements() (Runtime Foundation E1)
+    directly, since the bundle reflects whatever a recovery-component
+    policy justified embedding at BACKUP time (r0046: normally the
+    automatic policy, derived from E1 itself -- see
+    isadoraair.runtime_recovery.resolve_automatic_recovery_policy),
+    which can legitimately have diverged from the CURRENT database by
+    the time this provisioning step runs (see runtime_recovery.py's
+    module docstring for the historical r0029 gap this reasoning
+    predates and outlives). Piper's model list remains the exception:
+    its model/config identities are owned by the restored station
+    database. The caller must supply E1-resolved station requirements
+    when Piper is present; bundle/payload/station digests have already
+    been proven equal before this helper runs."""
     components: dict[str, ComponentRequirement] = {
         "fdkaac": ComponentRequirement(name="fdkaac"),
     }

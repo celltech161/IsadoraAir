@@ -34,6 +34,7 @@ from isadoraair.runtime_recovery import (
     RuntimeRecoveryError,
     evaluate_recovery_policy,
     parse_recovery_policy_components,
+    resolve_automatic_recovery_policy,
     resolve_current_recovery_payload_root,
     validate_current_recovery_payload,
 )
@@ -43,8 +44,12 @@ class Command(BaseCommand):
     help = (
         "Read-only validation of one Runtime Foundation E7 disaster-recovery "
         "payload -- integrity, product-contract identity, (using the live "
-        "station database) Piper selection freshness, and (with --require) "
-        "operator-declared recovery-component policy. Never modifies anything."
+        "station database) Piper selection freshness, and a required-component "
+        "policy: either an explicit, operator-declared list (--require/"
+        "--require-components) or, normally, --require-current-station-policy "
+        "(r0046) -- derived automatically and fail-closed from this station's "
+        "current configuration plus an independent protected_updater product "
+        "rule. Never modifies anything."
     )
 
     def add_arguments(self, parser):
@@ -55,7 +60,9 @@ class Command(BaseCommand):
             "--require-components",
             help=(
                 "Strict comma-separated recovery policy. Empty means no policy; "
-                "empty entries, whitespace, duplicates, and unknown names fail."
+                "empty entries, whitespace, duplicates, and unknown names fail. "
+                "An explicit, advanced/test override -- mutually exclusive with "
+                "--require-current-station-policy."
             ),
         )
         parser.add_argument(
@@ -81,8 +88,24 @@ class Command(BaseCommand):
             dest="required_components",
             choices=sorted(RECOVERY_POLICY_COMPONENT_NAMES),
             help="A component this payload must positively contain (repeatable): "
-            "kokoro, piper, and/or native_fdkaac. Never inferred from station "
-            "configuration -- an explicit, operator-declared policy only.",
+            "kokoro, piper, native_fdkaac, and/or protected_updater. An explicit, "
+            "operator-declared policy -- mutually exclusive with "
+            "--require-current-station-policy.",
+        )
+        parser.add_argument(
+            "--require-current-station-policy",
+            action="store_true",
+            dest="require_current_station_policy",
+            help=(
+                "Derive the required-component policy automatically (r0046): "
+                "kokoro/piper/fdkaac from this station's CURRENT configuration "
+                "(isadoraair.runtime_requirements), native_fdkaac from fdkaac, "
+                "and protected_updater from an independent product/deployment "
+                "rule -- never from the payload's own state. Fails closed "
+                "(CommandError) if station configuration cannot be resolved. "
+                "Mutually exclusive with --require/--require-components; this "
+                "is the mode a normal scheduled backup should use."
+            ),
         )
         parser.add_argument(
             "--json",
@@ -113,7 +136,28 @@ class Command(BaseCommand):
             )
         if options["trusted_owner_uid"] < 0:
             raise CommandError("--trusted-owner-uid must be non-negative")
-        required = csv_required | frozenset(repeated)
+
+        automatic_requested = bool(options["require_current_station_policy"])
+        explicit_requested = options["require_components"] is not None or bool(repeated)
+        if automatic_requested and explicit_requested:
+            raise CommandError(
+                "--require-current-station-policy cannot be combined with --require/--require-components"
+            )
+
+        policy_reasons: dict[str, tuple[str, ...]] = {}
+        policy_source: str | None = None
+        if automatic_requested:
+            try:
+                automatic_policy = resolve_automatic_recovery_policy()
+            except RuntimeRecoveryError as exc:
+                raise CommandError(str(exc)) from None
+            required = automatic_policy.required
+            policy_reasons = automatic_policy.reasons
+            policy_source = "automatic"
+        else:
+            required = csv_required | frozenset(repeated)
+            policy_source = "explicit" if explicit_requested else None
+        policy_requested = automatic_requested or explicit_requested
 
         try:
             if options["current"]:
@@ -125,11 +169,23 @@ class Command(BaseCommand):
         except RecoveryPayloadNotConfiguredError as exc:
             safe = " ".join(str(exc).split())[:512]
             if options["json_output"]:
-                self.stdout.write(
-                    json_module.dumps({"pointer_configured": False, "resolution_error": safe, "resolved_path": None})
-                )
+                result = {"pointer_configured": False, "resolution_error": safe, "resolved_path": None}
+                if policy_requested:
+                    result["policy"] = {
+                        "required": sorted(required),
+                        "missing": sorted(required),
+                        "satisfied": not required,
+                        "source": policy_source,
+                        "reasons": {name: list(policy_reasons.get(name, ())) for name in sorted(required)},
+                    }
+                self.stdout.write(json_module.dumps(result))
             else:
                 self.stdout.write(f"Recovery payload: NOT CONFIGURED -- {safe}")
+                if policy_requested and required:
+                    self.stdout.write(
+                        f"  {policy_source} recovery policy requires: {', '.join(sorted(required))} -- "
+                        "none can be satisfied without a configured payload"
+                    )
             raise SystemExit(2) from None
         except RuntimeRecoveryError as exc:
             safe = " ".join(str(exc).split())[:512]
@@ -140,7 +196,6 @@ class Command(BaseCommand):
             raise CommandError(safe) from None
 
         evidence = validate_current_recovery_payload(payload_root)
-        policy_requested = options["require_components"] is not None or bool(repeated)
         policy = evaluate_recovery_policy(evidence, required) if policy_requested else None
 
         if options["json_output"]:
@@ -148,6 +203,11 @@ class Command(BaseCommand):
             payload["pointer_configured"] = True
             payload["resolved_path"] = str(payload_root)
             payload["policy"] = policy.to_dict() if policy is not None else None
+            if payload["policy"] is not None:
+                payload["policy"]["source"] = policy_source
+                payload["policy"]["reasons"] = {
+                    name: list(policy_reasons.get(name, ())) for name in sorted(required)
+                }
             self.stdout.write(json_module.dumps(payload, sort_keys=True, separators=(",", ":")))
         else:
             self.stdout.write(f"Recovery payload ({payload_root}): {evidence.result.upper()}")
@@ -164,9 +224,12 @@ class Command(BaseCommand):
             self.stdout.write(f"  piper station selection: {freshness.state}")
             if policy is not None:
                 self.stdout.write(
-                    f"  recovery policy ({', '.join(sorted(required))}): "
+                    f"  recovery policy ({policy_source}, {', '.join(sorted(required)) or '(none)'}): "
                     f"{'SATISFIED' if policy.satisfied else 'NOT SATISFIED -- missing: ' + ', '.join(sorted(policy.missing))}"
                 )
+                for name in sorted(required):
+                    for reason in policy_reasons.get(name, ()):
+                        self.stdout.write(f"    {name}: {reason}")
 
         if evidence.result != RESULT_PASS:
             raise CommandError("recovery payload failed validation")

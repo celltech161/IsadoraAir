@@ -952,9 +952,11 @@ class RuntimeProvisioningCommandTests(TestCase):
 
 class RecoveryPayloadTTSRequirementsTests(RuntimeProvisioningFixture):
     """Runtime Foundation E7B: --recovery-payload's requirements are
-    payload-derived for dormant historical Kokoro, while Piper retains
-    the restored database's E1 model/config identity authority. See
-    isadoraair/runtime_recovery.py's module docstring and
+    payload-derived for Kokoro (what the backup's recovery-component
+    policy already justified embedding, not re-derived from whatever
+    E1 says against the freshly-restored database at this point), while
+    Piper retains the restored database's E1 model/config identity
+    authority. See isadoraair/runtime_recovery.py's module docstring and
     monitoring/management/commands/provision_runtime_components.py's
     _requirements_for_recovery_tts."""
 

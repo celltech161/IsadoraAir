@@ -40,13 +40,18 @@ from isadoraair.runtime_recovery import (
     STATE_ABSENT,
     STATE_INVALID,
     STATE_PRESENT,
+    PiperFreshnessEvidence,
+    RecoveryComponentEvidence,
     RuntimeRecoveryBuilder,
     RuntimeRecoveryError,
+    RuntimeRecoveryEvidence,
     activate_recovery_payload,
     evaluate_recovery_policy,
     load_recovery_payload,
     piper_selection_digest,
     parse_recovery_policy_components,
+    protected_updater_is_required,
+    resolve_automatic_recovery_policy,
     resolve_current_recovery_payload_root,
     validate_recovery_payload,
 )
@@ -750,6 +755,195 @@ class RecoveryPolicyTests(RecoveryFixture):
         self.assertFalse(policy.satisfied)
 
 
+class AutomaticRecoveryPolicyTests(RecoveryFixture):
+    """r0046 -- resolve_automatic_recovery_policy/protected_updater_is_required,
+    and their combination with evaluate_recovery_policy's existing
+    evidence-only checks. Station configuration is supplied directly as
+    a RuntimeRequirements object (a plain dataclass) rather than a real
+    DB query -- resolve_current_runtime_requirements's own live-database
+    resolution is a separate, already-tested concern (see
+    isadoraair/tests/test_runtime_requirements.py-equivalent coverage
+    inline in this module's docstring) -- so nothing here needs database
+    access."""
+
+    def _requirements(self, *, kokoro=False, piper=False, fdkaac=False, errors=()):
+        return RuntimeRequirements(
+            components={
+                "kokoro": ComponentRequirement(
+                    name="kokoro", required=kokoro,
+                    reasons=("enabled road conditions via weather persona 'day'",) if kokoro else (),
+                ),
+                "piper": ComponentRequirement(
+                    name="piper", required=piper,
+                    reasons=("enabled web-request dedications",) if piper else (),
+                ),
+                "fdkaac": ComponentRequirement(
+                    name="fdkaac", required=fdkaac,
+                    reasons=("enabled encoder 'FM' selects he_aac",) if fdkaac else (),
+                ),
+            },
+            errors=errors,
+        )
+
+    def _evidence(
+        self, *, tts_components=(), native_present=False, protected_updater_present=False,
+        piper_freshness_state=PIPER_FRESHNESS_NOT_CHECKED,
+    ):
+        components = {}
+        if tts_components:
+            components["tts"] = RecoveryComponentEvidence(name="tts", state=STATE_PRESENT)
+        components["native_fdkaac"] = RecoveryComponentEvidence(
+            name="native_fdkaac", state=STATE_PRESENT if native_present else STATE_ABSENT
+        )
+        components["protected_updater"] = RecoveryComponentEvidence(
+            name="protected_updater", state=STATE_PRESENT if protected_updater_present else STATE_ABSENT
+        )
+        return RuntimeRecoveryEvidence(
+            payload_id="p1", manifest_error=None, product_contract_match=True,
+            product_contract_sha256="0" * 64, components=components,
+            piper_freshness=PiperFreshnessEvidence(
+                checked=piper_freshness_state != PIPER_FRESHNESS_NOT_CHECKED, state=piper_freshness_state
+            ),
+            tts_components=tts_components,
+        )
+
+    # ---- Kokoro/Piper selection (mapped straight from E1) ------------
+
+    def test_kokoro_required_when_station_selects_a_kokoro_voice(self):
+        policy = resolve_automatic_recovery_policy(self._requirements(kokoro=True))
+        self.assertIn("kokoro", policy.required)
+        self.assertIn("enabled road conditions via weather persona 'day'", policy.reasons["kokoro"])
+
+    def test_piper_required_when_station_selects_a_piper_voice(self):
+        """A station that legitimately uses Piper instead of Kokoro
+        resolves that from actual configuration, not a station-name
+        literal or Oak-Grove-specific hardcoding."""
+        policy = resolve_automatic_recovery_policy(self._requirements(piper=True))
+        self.assertIn("piper", policy.required)
+        self.assertNotIn("kokoro", policy.required)
+
+    def test_neither_kokoro_nor_piper_required_when_no_voice_selected(self):
+        policy = resolve_automatic_recovery_policy(self._requirements())
+        self.assertNotIn("kokoro", policy.required)
+        self.assertNotIn("piper", policy.required)
+
+    # ---- AAC/HE-AAC fdkaac requiredness, mapped to native_fdkaac ------
+
+    def test_fdkaac_maps_to_native_fdkaac_component_name(self):
+        policy = resolve_automatic_recovery_policy(self._requirements(fdkaac=True))
+        self.assertIn("native_fdkaac", policy.required)
+        self.assertNotIn("fdkaac", policy.required)
+        self.assertIn("enabled encoder 'FM' selects he_aac", policy.reasons["native_fdkaac"])
+
+    def test_native_fdkaac_not_required_when_no_aac_encoder_enabled(self):
+        """A station that does not require fdkaac resolves that from its
+        own actual configuration too -- never assumed present."""
+        policy = resolve_automatic_recovery_policy(self._requirements())
+        self.assertNotIn("native_fdkaac", policy.required)
+
+    # ---- protected_updater: independent product/deployment rule ------
+
+    def test_protected_updater_required_on_a_normal_current_installation(self):
+        """For a normal current r0045+ production installation with
+        Phase-D Update Center architecture, the policy must require
+        protected_updater -- proven against the REAL Django app
+        registry, no mocking: updatecenter genuinely is installed."""
+        self.assertTrue(protected_updater_is_required())
+        policy = resolve_automatic_recovery_policy(self._requirements())
+        self.assertIn("protected_updater", policy.required)
+        self.assertTrue(policy.reasons["protected_updater"])
+
+    def test_protected_updater_requirement_source_never_reads_payload_or_evidence(self):
+        """Corruption of a recovery payload/component must never be able
+        to remove its own backup requirement -- structurally verified by
+        confirming the rule's own CODE BODY (not its prose docstring)
+        never calls anything payload/evidence/filesystem-reading, only
+        the Django app registry."""
+        import inspect
+
+        source = inspect.getsource(protected_updater_is_required)
+        body = source[source.index('"""', source.index('"""') + 3) + 3:]
+        for forbidden in ("validate_recovery_payload", "RuntimeRecoveryEvidence", "load_recovery_payload", "open(", "Path("):
+            self.assertNotIn(forbidden, body)
+        self.assertIn('apps.is_installed("updatecenter")', body)
+
+    def test_protected_updater_not_required_if_updatecenter_were_absent(self):
+        """Proves the rule is genuinely conditional, not a disguised
+        hardcoded True -- exercised by patching the one fact it depends
+        on (a future, non-Phase-D deployment shape)."""
+        with patch("django.apps.apps.is_installed", return_value=False):
+            self.assertFalse(protected_updater_is_required())
+            policy = resolve_automatic_recovery_policy(self._requirements(kokoro=True))
+        self.assertNotIn("protected_updater", policy.required)
+        self.assertIn("kokoro", policy.required)
+
+    # ---- unresolved/invalid station configuration: fail closed -------
+
+    def test_unresolved_station_configuration_fails_closed(self):
+        """Unknown/unresolved station configuration must fail closed
+        rather than guess a policy from it."""
+        with self.assertRaises(RuntimeRecoveryError):
+            resolve_automatic_recovery_policy(
+                self._requirements(errors=("weather voice schedule is invalid",))
+            )
+
+    # ---- combined with evaluate_recovery_policy: missing/incomplete/full --
+
+    def test_missing_required_payload_is_not_satisfied(self):
+        policy = resolve_automatic_recovery_policy(self._requirements(kokoro=True, fdkaac=True))
+        evidence = self._evidence()  # nothing present at all
+        result = evaluate_recovery_policy(evidence, policy.required)
+        self.assertFalse(result.satisfied)
+        self.assertEqual(result.missing, policy.required)
+
+    def test_incomplete_payload_missing_only_the_unfulfilled_component(self):
+        policy = resolve_automatic_recovery_policy(self._requirements(kokoro=True, fdkaac=True))
+        evidence = self._evidence(
+            tts_components=("kokoro",), native_present=False, protected_updater_present=True
+        )
+        result = evaluate_recovery_policy(evidence, policy.required)
+        self.assertFalse(result.satisfied)
+        self.assertEqual(result.missing, frozenset({"native_fdkaac"}))
+
+    def test_fully_satisfied_payload(self):
+        policy = resolve_automatic_recovery_policy(self._requirements(kokoro=True, fdkaac=True))
+        evidence = self._evidence(
+            tts_components=("kokoro",), native_present=True, protected_updater_present=True
+        )
+        result = evaluate_recovery_policy(evidence, policy.required)
+        self.assertTrue(result.satisfied)
+
+    def test_automatic_piper_requirement_still_needs_positive_freshness(self):
+        """The automatic policy's piper entry inherits
+        evaluate_recovery_policy's existing not_checked/stale
+        fail-closed rule unchanged -- r0046 adds WHICH names are
+        required, never weakens what "satisfied" means for any of
+        them."""
+        policy = resolve_automatic_recovery_policy(self._requirements(piper=True))
+        evidence = self._evidence(
+            tts_components=("piper",), protected_updater_present=True,
+            piper_freshness_state=PIPER_FRESHNESS_NOT_CHECKED,
+        )
+        result = evaluate_recovery_policy(evidence, policy.required)
+        self.assertFalse(result.satisfied)
+
+    # ---- explicit override compatibility ------------------------------
+
+    def test_explicit_policy_still_usable_independent_of_automatic_resolution(self):
+        """The pre-existing explicit --require/--require-components path
+        (parse_recovery_policy_components + evaluate_recovery_policy) is
+        untouched by resolve_automatic_recovery_policy's existence -- an
+        operator can still pin an arbitrary explicit set as a deliberate
+        advanced/test override."""
+        explicit = parse_recovery_policy_components("piper")
+        evidence = self._evidence(
+            tts_components=("kokoro",), native_present=True, protected_updater_present=True
+        )
+        result = evaluate_recovery_policy(evidence, explicit)
+        self.assertFalse(result.satisfied)
+        self.assertEqual(result.missing, frozenset({"piper"}))
+
+
 class PersistentLocationTests(RecoveryFixture):
     """Runtime Foundation E7B -- the durable base_root/payloads/<id> +
     base_root/current convention. Never established on any production
@@ -908,6 +1102,90 @@ class ManagementCommandE7BTests(RecoveryFixture):
         base.chmod(0o755)
         (base / PAYLOADS_SUBDIR).chmod(0o755)
         return base
+
+    def test_require_current_station_policy_fails_closed_on_incomplete_payload(self):
+        """r0046 end-to-end, at the actual CLI layer: with the station's
+        current configuration mocked to require Kokoro, and
+        protected_updater always required (the real, unmocked product
+        rule), a real payload that has Kokoro but no protected_updater
+        component fails closed via CommandError. This is exactly the
+        "abort before upload" outcome a default scheduled backup (no
+        BACKUP_REQUIRED_RECOVERY_COMPONENTS override) depends on to
+        never produce legacy_non_self_contained silently on a
+        fully configured current production station."""
+        base = self._base_root()
+        tts_bundle = self.write_tts_bundle()
+        target = base / PAYLOADS_SUBDIR / "p1"
+        fake_requirements = RuntimeRequirements(
+            components={
+                "kokoro": ComponentRequirement(name="kokoro", required=True, reasons=("test",)),
+                "piper": ComponentRequirement(name="piper", required=False),
+                "fdkaac": ComponentRequirement(name="fdkaac", required=False),
+            },
+        )
+        with patch("isadoraair.runtime_recovery.load_runtime_components", return_value=self.manifest), \
+                patch(
+                    "isadoraair.runtime_recovery.resolve_current_runtime_requirements",
+                    return_value=fake_requirements,
+                ):
+            call_command(
+                "prepare_runtime_recovery_payload", "--apply",
+                f"--tts-bundle={tts_bundle}", f"--output={target}", "--payload-id=p1",
+            )
+            call_command(
+                "prepare_runtime_recovery_payload", "--activate", f"--base-root={base}", "--payload-id=p1",
+                f"--trusted-owner-uid={os.getuid()}",
+            )
+            with self.assertRaisesRegex(CommandError, "protected_updater"):
+                call_command(
+                    "validate_runtime_recovery_payload", f"--base-root={base}", "--current",
+                    "--require-current-station-policy", f"--trusted-owner-uid={os.getuid()}",
+                )
+
+    def test_require_current_station_policy_satisfied_when_station_needs_nothing_else(self):
+        """The inverse: a payload lacking Kokoro/Piper/native_fdkaac is
+        still fine when the (mocked) station configuration doesn't need
+        any of them -- protected_updater is still required (the real
+        product rule) but this payload doesn't carry it either, so this
+        specific station configuration is used to prove the missing-only
+        component is reported precisely."""
+        base = self._base_root()
+        tts_bundle = self.write_tts_bundle()
+        target = base / PAYLOADS_SUBDIR / "p1"
+        fake_requirements = RuntimeRequirements(
+            components={
+                "kokoro": ComponentRequirement(name="kokoro", required=False),
+                "piper": ComponentRequirement(name="piper", required=False),
+                "fdkaac": ComponentRequirement(name="fdkaac", required=False),
+            },
+        )
+        with patch("isadoraair.runtime_recovery.load_runtime_components", return_value=self.manifest), \
+                patch(
+                    "isadoraair.runtime_recovery.resolve_current_runtime_requirements",
+                    return_value=fake_requirements,
+                ):
+            call_command(
+                "prepare_runtime_recovery_payload", "--apply",
+                f"--tts-bundle={tts_bundle}", f"--output={target}", "--payload-id=p1",
+            )
+            call_command(
+                "prepare_runtime_recovery_payload", "--activate", f"--base-root={base}", "--payload-id=p1",
+                f"--trusted-owner-uid={os.getuid()}",
+            )
+            with self.assertRaisesRegex(CommandError, "missing: protected_updater"):
+                call_command(
+                    "validate_runtime_recovery_payload", f"--base-root={base}", "--current",
+                    "--require-current-station-policy", f"--trusted-owner-uid={os.getuid()}",
+                )
+
+    def test_require_current_station_policy_rejects_combination_with_explicit_require(self):
+        with self.assertRaises(CommandError):
+            call_command(
+                "validate_runtime_recovery_payload",
+                str(self.root / "does-not-exist"),
+                "--require-current-station-policy",
+                "--require=kokoro",
+            )
 
     def test_activate_and_validate_current_round_trip_via_cli(self):
         base = self._base_root()
