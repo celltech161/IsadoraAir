@@ -16,17 +16,32 @@ against.
 
 ---
 
-## Current state (as of r0044)
+## Current state (as of r0045)
 
 | Field | Value |
 |---|---|
-| Current production release | r0044 (see `git log -1` / `deploy/releases/r0044.json` for the exact commit -- never hardcoded here, since a commit cannot record its own future SHA) |
-| Previous production release | r0043, commit `814791ae1f41fc9771d7d4cbebafdd2ad3e41d14` (plus docs-only follow-up `b167cfa2ca7e7fe49beb2c689b988c51727c59f8`) |
-| Current E8 acceptance candidate | r0044 |
+| Current production release | r0045 (see `git log -1` / `deploy/releases/r0045.json` for the exact commit -- never hardcoded here, since a commit cannot record its own future SHA) |
+| Previous production release | r0044 |
+| Current E8 acceptance candidate | r0045 |
 | Last authoritative E8 result | r0042 -- **FAIL at Stage 80** (see incident record below -- still the last AUTHORITATIVE run; not yet superseded by a newer one) |
 | Last completed stage (authoritative) | 75-protected-updater (PASS) |
 | Failure stage (authoritative) | 80-companions |
 | Failure classification | **Product** (a real cross-stage restore defect in IsadoraAir's own restore tooling -- not a runner/harness defect, not sandbox contamination; independently confirmed by the run's own clean-baseline gate) |
+
+### Review finding (r0044 → r0045)
+
+r0044's interactive Adopt/New/Show/Quit workflow made the ledger/adoption
+gap usable, but it still broadcast the same `COMMON_ARGS` to every stage
+except the pre-existing `--isa-user`/`--isa-uid`/`--isa-gid` routing --
+it had no way to express the authoritative offline-E8 invocation
+contract's stage-specific frozen-media inputs (Stage 10's local
+apt/snap closure, Stage 20's local Git mirror, Stage 60/80's offline pip
+wheelhouse, Stage 80's local companion Git mirrors). r0045 closes this
+with ONE recovery-media root concept (discovered interactively, or
+`--recovery-media-root PATH` for automation) instead of six separate
+flags, and restructures `restore.sh` to build per-stage argument/env
+arrays instead of broadcasting. See "Recovery media (r0045)" below. The
+r0043/r0044 ledger/adoption design itself is unchanged by this release.
 
 ### Review finding (r0043 → r0044)
 
@@ -55,13 +70,14 @@ and adopt the specific machine the defect was found on.
 
 ### Open blockers
 
-None currently known, pending the r0044 acceptance run (see "Next single
+None currently known, pending the r0045 acceptance run (see "Next single
 action" below) proving Stage 80 → 90 → 95 on the existing partially
-restored E8 sandbox via the new pre-ledger adoption mechanism.
+restored E8 sandbox via the pre-ledger adoption mechanism, this time
+driven fully offline through r0045's recovery-media discovery.
 
 ### Next release
 
-r0044 has been implemented and is pending its own E8 acceptance run (see
+r0045 has been implemented and is pending its own E8 acceptance run (see
 "Next single action"). Do **not** produce a fresh E8 export until that
 acceptance run's result is reviewed.
 
@@ -70,27 +86,36 @@ acceptance run's result is reviewed.
 Resume the EXISTING partially-restored E8 sandbox (the one whose r0042
 run completed through Stage 75 and failed at Stage 80 -- do **not** wipe
 it, and do **not** manually delete `/home/jreed/weather-ingest`) using
-r0044's restore tooling, transferred to the sandbox through the allowed
+r0045's restore tooling, transferred to the sandbox through the allowed
 operator-PC management path, and the SAME frozen r0042 backup archive
 that produced the existing state
 (`isadoraair-backup-20260907-181431-formal-r0042.tar.gz`, SHA256
 `e40d33d747b8e55f690be75f275c150dc9df53688985dd6f9c03830f89cbeef8` --
-**not** a fresh r0043/r0044 backup, which would be a different archive
-identity and could never adopt this machine's existing state). Launch
-the normal interactive workflow (a real terminal, `--apply`, no flags):
+**not** a fresh backup, which would be a different archive identity and
+could never adopt this machine's existing state). The sandbox already
+has the matching r0042 frozen media (`e8-inputs/`, containing the
+backup, apt/snap closures, wheelhouse, and the IsadoraAir + companion
+Git mirrors) staged locally -- see "Recovery media (r0045)" below.
+Launch the normal interactive workflow (a real terminal, `--apply`, no
+flags):
 
 ```bash
 deploy/restore/restore.sh --archive /path/to/isadoraair-backup-20260907-181431-formal-r0042.tar.gz --apply
 ```
 
-Expected: no matching ledger exists yet (this restore predates it), but
-the target already shows restore progress (a real `.git` checkout, a
-non-empty `.env`) -- the interactive workflow detects this and offers
-`[A] Verify and adopt this interrupted recovery`. Choosing it
-independently verifies Stages 20/30's durable output (Git HEAD, `.env`,
-database content) against this exact archive and, only once proven,
-records them complete in a freshly-created ledger -- no `--force-env`,
-no `--force-db`. Stage 40 then runs for real (never needed adoption --
+Expected: restore.sh first resolves recovery media -- discovering the
+local `e8-inputs` root automatically (or prompting/listing candidates if
+it can't find exactly one) -- and shows what it found before anything
+else happens. Then: no matching ledger exists yet (this restore
+predates it), but the target already shows restore progress (a real
+`.git` checkout, a non-empty `.env`) -- the interactive workflow detects
+this and offers `[A] Verify and adopt this interrupted recovery`.
+Choosing it independently verifies Stages 20/30's durable output (Git
+HEAD, `.env`, database content) against this exact archive and, only
+once proven, records them complete in a freshly-created ledger -- no
+`--force-env`, no `--force-db`. Stage 10 then runs safely/idempotently
+against the resolved recovery media's local apt/snap closure (no
+Internet). Stage 40 then runs for real (never needed adoption --
 always idempotent), re-normalizing `WEATHER_DATA_DIR` in the
 already-restored `.env` in place. Stages 50/70/75's own existing
 runtime-recovery receipts (already durable evidence from the original
@@ -99,11 +124,16 @@ without republishing anything. Stage 80, seeing durable ledger proof
 that Stage 40 already ran for this exact archive/target, recognizes
 `/home/jreed/weather-ingest` as the known r0042-era legacy-scaffold
 defect's own artifact (empty directory tree, no `.git`, no regular
-files anywhere) and repairs it before cloning -- no manual deletion.
-Stage 90 and 95 proceed normally to PASS. See "Incident: Stage 80
-weather-ingest collision (r0042)" below for the full root-cause record,
-and "Resumable restore mechanism" for the complete adoption algorithm
-and interactive workflow.
+files anywhere) and repairs it before cloning -- provisioning every
+companion from the resolved recovery media's local Git mirrors (no
+manual deletion, no Internet). Stage 60's convergence check, and Stage
+80's own pip install, both run constrained to the recovery media's
+wheelhouse (`PIP_NO_INDEX=1`). Stage 90 and 95 proceed normally to PASS,
+95 gated on the actual r0042 backup receipt. E8 network isolation
+remains intact throughout. See "Incident: Stage 80 weather-ingest
+collision (r0042)" below for the full root-cause record, "Resumable
+restore mechanism" for the complete adoption algorithm and interactive
+workflow, and "Recovery media (r0045)" for the offline-media contract.
 
 ---
 
@@ -127,6 +157,7 @@ not a fresh discovery -- read the cited section/commit first.
 | 10 | `DeploymentBaselineEvidence.result` stayed UNRESOLVED forever when a resolved station tier had already superseded the exact structural package-selection uncertainty that caused it | r0042 | Narrowly superseded; identity ambiguity and every other structural FAIL still always gate |
 | 11 | **Stage 80 weather-ingest collision** -- see full record below | r0043 | `WEATHER_DATA_DIR` legacy-value normalization (Stage 40) + `--resume`/ledger scaffold repair (Stage 80) |
 | 12 | r0043's `--resume` could not help a restore that BEGAN before the ledger existed at all (e.g. the actual r0042 E8 sandbox) -- it has no ledger entries, so `--resume` fell through to ordinary destructive-guarded behavior and still hit `guard_env_overwrite`/`guard_db_overwrite` | r0044 | New `--adopt-pre-ledger` mechanism: each stage independently verifies pre-ledger durable output against the supplied archive and, only if proven, adopts it into a freshly-created ledger -- never inferred from mere file existence. Plus: an interactive TTY workflow so an operator never needs to know these flags exist. See "Resumable restore mechanism" below. |
+| 13 | r0044's interactive workflow broadcast identical `COMMON_ARGS` to every stage (aside from the pre-existing identity routing), so it could not express the authoritative offline-E8 invocation contract's stage-specific frozen-media inputs (Stage 10 apt/snap closure, Stage 20 Git mirror, Stage 60/80 pip wheelhouse, Stage 80 companion mirrors) | r0045 | One recovery-media root concept (`recovery_media.py`'s `validate`/`discover`/`detect-apt-groups`, `--recovery-media-root`, or interactive discovery); `restore.sh` now builds per-stage argument/env arrays (`_restore_build_media_stage_args`) instead of broadcasting. See "Recovery media (r0045)" below. |
 
 ---
 
@@ -378,8 +409,11 @@ destructive:
 - **Ledger exists but belongs to a DIFFERENT archive or target root, or
   is corrupt/schema-invalid**: always a hard, immediate failure --
   never a menu, never silently ignored.
-- **No ledger and no detected pre-existing state**: proceeds
-  immediately, nothing to ask about.
+- **No ledger and no detected pre-existing state**: proceeds directly to
+  the ledger/adoption question above (there is nothing to ask about
+  there), but as of r0045 recovery-media resolution (below) still runs
+  first regardless of ledger/target state -- it is orthogonal to
+  adoption and applies to the most common E8 scenario, a brand-new box.
 
 The prompt is never itself authorization to weaken any safety check --
 every menu choice still runs through the exact same fail-closed
@@ -387,6 +421,92 @@ verification the flags above describe. No TTY (piped/redirected stdin,
 the normal CI/automation shape) never prompts at all; `--non-interactive`
 forces the same even under a real TTY. Deterministic automation/tests
 should prefer passing `--resume`/`--adopt-pre-ledger` explicitly.
+
+---
+
+## Recovery media (r0045)
+
+An authoritative offline E8 restore needs several stage-specific frozen
+inputs that a fresh backup archive alone cannot supply: Stage 10's local
+apt/snap closure, Stage 20's local IsadoraAir Git mirror, Stage 60/80's
+offline pip wheelhouse, and Stage 80's local companion Git mirrors.
+r0045 establishes ONE **recovery-media root** concept for all of these,
+derived directly from `deploy/restore/build_offline_closure.py`'s own
+`--out-dir` layout and the real E8 export procedure -- never a guessed
+or separately-documented layout:
+
+```
+<recovery-media-root>/            (an "e8-inputs"-style directory)
+  backups/<archive>.tar.gz
+  offline/apt-repo/                (dpkg-scanpackages-indexed .deb files)
+  offline/snaps/                   (+ snap-manifest.json)
+  offline/manifests/               (apt-closure-manifest.json, snap-manifest.json,
+                                     direct-apt-packages.txt)
+  offline/wheelhouse/               (pip wheels/sdists)
+  repos/IsadoraAir.git             (bare mirror)
+  repos/<companion>.git            (bare mirrors, one per companion)
+```
+
+`deploy/restore/recovery_media.py` (stdlib-only, mirrors
+`restore_ledger.py`'s own style) provides three subcommands:
+
+- `validate --root R [--archive A]`: structural completeness check
+  (`valid`) is reported separately from whether `A` specifically is
+  present in `R`'s own `backups/` (`archive_match`) -- `discover()` below
+  needs a structurally-sound-but-non-matching root reported as a real,
+  ranked candidate, never silently dropped. The CLI's own exit code
+  (what `restore.sh`'s explicit `--recovery-media-root` path actually
+  gates on) is the stricter combination: `valid AND archive_match is not
+  False`.
+- `discover --archive A --search-root R...`: returns every structurally
+  valid candidate under the given search roots (globbing for an
+  `e8-inputs`-named directory one/two levels down, plus checking whether
+  `A` already lives inside a media root's own `backups/`), ranked with
+  archive-matching candidates first.
+- `detect-apt-groups --root R --packages-file F`: reads `R`'s own
+  `offline/manifests/direct-apt-packages.txt` and intersects it against
+  each `OPTIONAL_*` group in `deploy/packages-ubuntu-26.04.txt` --
+  data-driven, so the `--with-*` flags `restore.sh` derives always match
+  what this SPECIFIC media root's own manifest says, never a hardcoded
+  guess.
+
+`restore.sh` resolves recovery media once, before the stage loop and
+before the ledger/adoption preflight:
+
+1. `--recovery-media-root PATH` (deterministic automation/CI path):
+   validated immediately; a bad/incomplete tree fails closed before any
+   stage runs.
+2. Otherwise, if interactively eligible (apply mode, a real TTY, not
+   `--non-interactive`, not `--resume`, a real `--archive`): discovers
+   candidates under the archive's own directory and `$HOME`. Exactly one
+   archive-matching candidate is used automatically, after showing the
+   operator what was found. Zero candidates prompts for a path (blank
+   proceeds with online/default sources for any stage that needs them).
+   More than one (or matches that aren't exact) shows a numbered list
+   and asks the operator to choose (or decline).
+3. Otherwise (non-interactive, no explicit root): no-op, exactly
+   pre-r0045 behavior -- online/default sources.
+
+Once resolved, `_restore_build_media_stage_args` builds per-stage
+argument/env arrays -- `restore.sh` never broadcasts a stage-specific
+flag to a stage that doesn't recognize it:
+
+| Array | Routed to | Contents |
+|---|---|---|
+| `STAGE10_ARGS` | `10-packages.sh` | `--apt-repo-dir`, `--snap-dir`, plus `--with-cd-rip`/`--with-kokoro-tts`/`--with-syndicated-selenium`/`--with-backup-encryption` per `detect-apt-groups` (HE-AAC is never skipped) |
+| `STAGE20_ARGS` | `20-application.sh` | `--repo-url file://<root>/repos/IsadoraAir.git` |
+| `STAGE60_ENV` | `60-python.sh` (via `env`) | `PIP_NO_INDEX=1`, `PIP_FIND_LINKS=<root>/offline/wheelhouse`, `PIP_DISABLE_PIP_VERSION_CHECK=1` |
+| `STAGE80_ARGS` | `80-companions.sh` | `--repo-url-prefix file://<root>/repos` |
+| `STAGE80_ENV` | `80-companions.sh` (via `env`) | same as `STAGE60_ENV` |
+
+`OWNER_ARGS` (`--owner USER:GROUP`) and `IDENTITY_ARGS`
+(`--isa-user`/`--isa-uid`/`--isa-gid`, pre-existing) are routed the same
+way, via one unified `_restore_run_stage` dispatcher -- this also fixed
+a latent pre-r0045 bug where `--owner` would have broken any stage other
+than 20/40 had it ever been passed through the orchestrator, since only
+those two stage scripts recognize it. No stage's own argument validation
+or network fail-closed behavior is weakened by any of this -- recovery
+media only ever SUPPLIES the same flags an operator could type by hand.
 
 ---
 

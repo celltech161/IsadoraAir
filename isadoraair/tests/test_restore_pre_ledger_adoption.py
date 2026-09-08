@@ -629,10 +629,18 @@ exec {real_git} "$@"
                 encoding="utf-8",
             )
             (shim_dir / "git").chmod(0o755)
+        # r0045: restore.sh's interactive path also does recovery-media
+        # discovery under $HOME -- isolate it so these ledger/adoption
+        # tests can't pick up any REAL recovery-media tree that happens
+        # to exist on the host running the tests (e.g. this session's
+        # own real E8 export lives under the real $HOME).
+        isolated_home = self.tmpdir / "isolated-home"
+        isolated_home.mkdir(parents=True, exist_ok=True)
         return {
             **os.environ,
             "PATH": f"{shim_dir}:{os.environ['PATH']}",
             "RESTORE_RECOVERY_RECEIPT_ROOT": str(self.ledger_root),
+            "HOME": str(isolated_home),
         }
 
     def _args(self):
@@ -671,7 +679,10 @@ exec {real_git} "$@"
         original_head = subprocess.run(
             ["git", "-C", str(target), "rev-parse", "HEAD"], capture_output=True, text=True, check=True
         ).stdout.strip()
-        returncode, output = _run_pty(self._args(), self._env(), send=b"Q\n")
+        # Leading blank line dismisses the r0045 recovery-media prompt
+        # (no media configured for this test), then "Q" answers the
+        # ledger-adoption menu that follows it.
+        returncode, output = _run_pty(self._args(), self._env(), send=b"\nQ\n")
         self.assertIn("Existing IsadoraAir restore state was found, but no recovery ledger exists", output)
         self.assertIn("Cancelled -- no changes made", output)
         self.assertEqual(returncode, 0)
@@ -682,7 +693,7 @@ exec {real_git} "$@"
 
     def test_pre_ledger_show_detected_state(self):
         self._establish_pre_ledger_target()
-        returncode, output = _run_pty(self._args(), self._env(), send=b"S\nQ\n", timeout=20)
+        returncode, output = _run_pty(self._args(), self._env(), send=b"\nS\nQ\n", timeout=20)
         self.assertIn("Detected at", output)
         self.assertIn(".git checkout=yes", output)
 
@@ -691,16 +702,22 @@ exec {real_git} "$@"
         before r0043/r0044, so the existing non-empty .env correctly
         still requires --force-env."""
         self._establish_pre_ledger_target()
-        returncode, output = _run_pty(self._args(), self._env(), send=b"N\n", timeout=20)
+        returncode, output = _run_pty(self._args(), self._env(), send=b"\nN\n", timeout=20)
         self.assertNotEqual(returncode, 0)
         self.assertIn("Refusing to overwrite existing non-empty", output)
 
     def test_fresh_target_never_prompts(self):
-        """No pre-existing state at all -- nothing to ask about, even
-        under a real TTY."""
+        """No pre-existing restore STATE at all -- nothing to ask about
+        regarding ledger adoption, even under a real TTY. (r0045: a
+        fresh target IS still asked about recovery media -- that prompt
+        is orthogonal to ledger/adoption state and applies to the most
+        common E8 scenario, a brand-new box -- so a blank reply is sent
+        to satisfy it; the ledger-adoption menu's own "Choice" prompt
+        must still never appear.)"""
         self.staging.mkdir(parents=True)
         (self.staging / "opt").mkdir()
-        returncode, output = _run_pty(self._args(), self._env(), send=b"", wait_before_send=2.0, timeout=15)
+        returncode, output = _run_pty(self._args(), self._env(), send=b"\n", wait_before_send=2.0, timeout=15)
+        self.assertIn("Recovery-media root []:", output)
         self.assertNotIn("Choice", output)
 
     def test_matching_ledger_resume_menu_and_quit(self):
@@ -713,7 +730,7 @@ exec {real_git} "$@"
              "--git-sha", self.fixture_sha],
             check=True, capture_output=True, text=True,
         )
-        returncode, output = _run_pty(self._args(), self._env(), send=b"Q\n")
+        returncode, output = _run_pty(self._args(), self._env(), send=b"\nQ\n")
         self.assertIn("Existing IsadoraAir recovery session found", output)
         self.assertIn("Last completed stage: 20-application", output)
         self.assertIn("Cancelled -- no changes made", output)
@@ -728,7 +745,7 @@ exec {real_git} "$@"
              "--archive", str(self.archive), "--target-root", str(target), "--stage", "20-application"],
             check=True, capture_output=True, text=True,
         )
-        returncode, output = _run_pty(self._args(), self._env(), send=b"S\nQ\n", timeout=20)
+        returncode, output = _run_pty(self._args(), self._env(), send=b"\nS\nQ\n", timeout=20)
         self.assertIn("20-application", output)
         self.assertIn("complete", output)
 
@@ -743,7 +760,11 @@ exec {real_git} "$@"
              "--archive", str(other_archive), "--target-root", str(target), "--stage", "20-application"],
             check=True, capture_output=True, text=True,
         )
-        returncode, output = _run_pty(self._args(), self._env(), send=b"", wait_before_send=1.5, timeout=15)
+        # A leading blank line dismisses the r0045 recovery-media prompt
+        # (no media configured for this test) before the ledger's own
+        # archive-mismatch fail-closed check runs -- still no ledger
+        # "Choice" menu is ever shown.
+        returncode, output = _run_pty(self._args(), self._env(), send=b"\n", wait_before_send=1.5, timeout=15)
         self.assertNotEqual(returncode, 0)
         self.assertIn("DIFFERENT archive", output)
         self.assertNotIn("Choice", output)
@@ -761,7 +782,7 @@ exec {real_git} "$@"
              "--git-sha", self.fixture_sha],
             check=True, capture_output=True, text=True,
         )
-        returncode, output = _run_pty(self._args(), self._env(), send=b"R\n", timeout=30)
+        returncode, output = _run_pty(self._args(), self._env(), send=b"\nR\n", timeout=30)
         self.assertIn("20-application: PASS (resumed/verified)", output)
 
 

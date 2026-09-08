@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
 # deploy/restore/restore.sh -- IsadoraAir 1.2 Phase 4.
 #
-# Orchestrator: runs every numbered stage (00 through 95) in order,
-# passing the same flags through to each. Equivalent to running each
-# deploy/restore/NN-*.sh script by hand in sequence -- this exists for
-# convenience and to guarantee the order is never accidentally scrambled,
-# not because the stages need shared state beyond what's already on disk
-# at $RESTORE_TARGET_ROOT.
+# Orchestrator: runs every numbered stage (00 through 95) in order.
+# Equivalent to running each deploy/restore/NN-*.sh script by hand in
+# sequence -- this exists for convenience and to guarantee the order is
+# never accidentally scrambled, not because the stages need shared
+# state beyond what's already on disk at $RESTORE_TARGET_ROOT.
 #
 # Stops at the first stage that fails (no stage swallows another's
 # failure) -- fix the reported problem and re-run; every stage is
@@ -16,82 +15,76 @@
 #   deploy/restore/restore.sh --archive PATH [--plan|--apply]
 #     [--staging-root PATH] [--force-production-target] [--force-db] [--force-env]
 #     [--resume [--adopt-pre-ledger]] [--non-interactive]
+#     [--recovery-media-root PATH] [--owner USER:GROUP]
 #     [--isa-user USER] [--isa-uid UID --isa-gid GID]
-#     [-- <stage-specific args, passed to every stage that accepts them>]
+#
+# Common arguments (--staging-root, --force-*, --resume, ...) are
+# broadcast identically to every stage, exactly as before. A handful of
+# genuinely stage-specific concerns are NOT broadcast -- each is routed
+# only to the stage(s) that actually recognize it (r0045 generalizes
+# this from the identity-flag routing r0040 already established):
+#
+#   --isa-user/--isa-uid/--isa-gid  -> 90-system-config.sh, 95-validate.sh
+#   --owner USER:GROUP              -> 20-application.sh, 40-station-content.sh
+#   (recovery-media-derived args)   -> see "Recovery media" below
 #
 # --resume (r0043): binds this run to a small durable ledger
 # (/var/lib/isadoraair/restore/ledger.json -- see lib.sh's
 # restore_ledger_* functions and restore_ledger.py) keyed on this exact
 # --archive's SHA256 + the resolved target root. Stages that already
 # durably completed against that exact identity verify their own output
-# and converge (no-op) instead of re-doing expensive/destructive work
-# (20-application.sh does not re-clone/re-extract .env;
-# 30-postgresql.sh does not re-run pg_restore); a genuine ambiguity
-# (ledger says done, filesystem/database disagrees) fails with a
-# precise diagnostic, never silently either way. 80-companions.sh can
-# also, ONLY with --resume and matching ledger provenance, repair the
-# EXACT known legacy-WEATHER_DATA_DIR scaffold a pre-r0043 run could
-# leave behind -- see docs/DISASTER_RECOVERY_STATUS.md's incident
-# record. A different --archive against the same target root, or a
-# corrupt/incomplete ledger, always fails closed. Without --resume,
-# every stage behaves exactly as before r0043.
+# and converge (no-op) instead of re-doing expensive/destructive work; a
+# genuine ambiguity (ledger says done, filesystem/database disagrees)
+# fails with a precise diagnostic, never silently either way. Without
+# --resume, every stage behaves exactly as before r0043.
 #
-# --adopt-pre-ledger (r0044): the FIRST implementation step for restores
-# that BEGAN before the ledger existed at all (e.g. an interrupted
-# pre-r0043 restore) -- combined with --resume, each stage independently
-# VERIFIES its own durable output against the supplied archive (the SAME
-# verification --resume's own "ledger already says complete" branch
-# uses) and, only if that verification passes, adopts it: records the
-# stage complete in a freshly-created ledger without redoing the
-# underlying work. Completion is NEVER inferred merely because files
-# exist -- see each stage's own "Adopt" section and
-# docs/DISASTER_RECOVERY_STATUS.md's "Resumable restore mechanism"
-# section for the exact per-stage evidence required. A different
-# archive, or state that fails verification, fails closed with a
-# precise diagnostic -- adoption never falls back to a guess.
+# --adopt-pre-ledger (r0044): for restores that BEGAN before the ledger
+# existed at all -- combined with --resume, each stage independently
+# VERIFIES its own durable output against the supplied archive and,
+# only if that verification passes, adopts it into a freshly-created
+# ledger without redoing the underlying work. A different archive, or
+# state that fails verification, fails closed -- adoption never falls
+# back to a guess. See docs/DISASTER_RECOVERY_STATUS.md's "Resumable
+# restore mechanism" section for the exact per-stage evidence required.
 #
-# --non-interactive: skip the interactive detect-and-prompt preflight
-# below even when a real TTY is attached (stdin is not a TTY at all --
-# e.g. piped/redirected input, common for CI -- already skips it
-# automatically). Deterministic automation/tests should prefer passing
-# --resume/--adopt-pre-ledger explicitly rather than relying on the
-# interactive prompt at all.
+# --non-interactive: skip the interactive preflight below (media
+# discovery AND the ledger/adopt menu) even when a real TTY is attached
+# (stdin not being a TTY at all -- piped/redirected, the normal CI
+# shape -- already skips both automatically). Deterministic automation/
+# tests should prefer passing --resume/--adopt-pre-ledger/
+# --recovery-media-root explicitly rather than relying on either
+# interactive step.
 #
-# ## Interactive workflow (r0044)
+# ## Recovery media (r0045)
 #
-# An operator should not need to remember --resume/--adopt-pre-ledger/
-# --force-env/--force-db/stage numbers. When this orchestrator runs
-# --apply, with a real TTY on both stdin and stdout, without
-# --non-interactive, and without --resume/--adopt-pre-ledger already
-# given explicitly, it inspects the target root and any existing ledger
-# BEFORE doing anything, and presents one of:
+# A full offline (E8) restore needs several stage-specific frozen
+# inputs -- Stage 10's local apt/snap closures, Stage 20's local Git
+# mirror, Stage 60/80's offline pip wheelhouse, Stage 80's local
+# companion Git mirrors -- that used to require operator-supplied,
+# stage-specific flags (--apt-repo-dir, --snap-dir, --repo-url,
+# --repo-url-prefix, --with-*, PIP_* env vars) with no single top-level
+# concept tying them together. `--recovery-media-root PATH` (or
+# interactive discovery -- see below) now names ONE coherent directory
+# tree (see recovery_media.py's own module docstring for the exact
+# layout contract, established directly from
+# deploy/restore/build_offline_closure.py's own --out-dir structure and
+# the E8 export procedure -- never guessed) that this script validates
+# once, then derives every one of those stage-specific inputs from
+# internally -- an operator never types any of them.
 #
-#   - A ledger already exists and matches this exact archive/target:
-#     [R] Resume recovery / [V] Verify completed stages (run each
-#     already-complete stage's own verification, then stop -- nothing
-#     beyond the last completed stage is touched) / [S] Show recovery
-#     status (read-only) / [Q] Quit (no changes).
-#   - No ledger exists, but the target already shows restore state
-#     (a .git checkout and/or a non-empty .env -- e.g. an interrupted
-#     pre-r0043 restore): [A] Verify and adopt this interrupted recovery
-#     (adds --resume --adopt-pre-ledger) / [N] Treat this as a new
-#     recovery (proceeds exactly as before r0043/r0044 -- existing
-#     content still requires --force-env/--force-db if it turns out to
-#     be real) / [S] Show detected state / [Q] Quit.
-#   - A ledger exists but belongs to a DIFFERENT archive or target root,
-#     or an existing ledger is corrupt/schema-invalid: always a hard,
-#     immediate failure -- never a menu, never silently ignored.
-#   - No ledger and no detected pre-existing state at all: proceeds
-#     immediately, nothing to ask about.
-#
-# The prompt is never itself authorization to weaken any safety check --
-# every choice above still runs through the exact same fail-closed
-# verification each stage script already implements.
+# Interactively (real TTY, --apply, no --non-interactive, no
+# --recovery-media-root already given): discovers candidate recovery-
+# media roots near the supplied --archive (and under $HOME). Exactly
+# one archive-matching candidate is used automatically (shown, not
+# silently); an ambiguous set is listed for the operator to choose
+# from (or decline, if none are actually wanted); nothing found prompts
+# for a path, blank means "no recovery media -- online/default sources
+# for stages that need them." Non-interactively, only --recovery-media-
+# root is consulted -- discovery/prompting never happens.
 #
 # --isa-user/--isa-uid/--isa-gid are the one exception to "every stage
-# gets the same args": they are routed ONLY to 90-system-config.sh and
-# 95-validate.sh (the only stages that recognize them) -- see this
-# script's own identity-flag routing below.
+# gets the same args" r0040 already established -- routed ONLY to
+# 90-system-config.sh and 95-validate.sh; see below.
 #
 # For a real Phase 5 bare-machine drill, prefer running stages
 # individually and reviewing each one's output before proceeding to the
@@ -149,32 +142,35 @@ STAGES=(
 )
 
 # ---------------------------------------------------------------------
-# Identity flags (--isa-user/--isa-uid/--isa-gid) are recognized ONLY by
-# 90-system-config.sh and 95-validate.sh -- every other stage's own
-# strict "unrecognized argument" guard would reject them if broadcast
-# via the same args every stage otherwise receives identically. Runtime
-# Foundation E7D (2026-09-04): pulled out here and forwarded ONLY to
-# those two stages, so a full end-to-end restore.sh run can supply a
-# trusted --isa-uid/--isa-gid pair (e.g. for an isolated --staging-root
-# target with no /etc/passwd of its own -- see 90-system-config.sh's and
-# 95-validate.sh's own headers) without breaking every earlier stage.
-# Deliberately narrow: no other stage-specific flag gets this special-
-# cased routing, and no other stage's own argument surface is touched.
-#
-# --non-interactive is ALSO stripped here (r0044) -- it is meaningful
-# only to this orchestrator's own preflight below, no individual stage
-# script recognizes it.
+# Flag routing. Identity flags (--isa-user/--isa-uid/--isa-gid) and
+# --owner are pulled out here and forwarded ONLY to the stage(s) that
+# actually recognize them -- every other stage's own strict
+# "unrecognized argument" guard would reject them if broadcast via the
+# same args every stage otherwise receives identically. --non-
+# interactive and --recovery-media-root are ALSO consumed here -- both
+# are meaningful only to this orchestrator's own preflight below, no
+# individual stage script recognizes either.
 COMMON_ARGS=()
 IDENTITY_ARGS=()
+OWNER_ARGS=()
 NON_INTERACTIVE=0
+EXPLICIT_MEDIA_ROOT=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --isa-user|--isa-uid|--isa-gid)
       IDENTITY_ARGS+=("$1" "${2:?$1 needs a value}"); shift 2 ;;
     --isa-user=*|--isa-uid=*|--isa-gid=*)
       IDENTITY_ARGS+=("$1"); shift ;;
+    --owner)
+      OWNER_ARGS=(--owner "${2:?--owner needs USER:GROUP}"); shift 2 ;;
+    --owner=*)
+      OWNER_ARGS=(--owner "${1#*=}"); shift ;;
     --non-interactive)
       NON_INTERACTIVE=1; shift ;;
+    --recovery-media-root)
+      EXPLICIT_MEDIA_ROOT="${2:?--recovery-media-root needs a path}"; shift 2 ;;
+    --recovery-media-root=*)
+      EXPLICIT_MEDIA_ROOT="${1#*=}"; shift ;;
     *)
       COMMON_ARGS+=("$1"); shift ;;
   esac
@@ -187,16 +183,16 @@ done
 # its own, identical parsing later.
 restore_parse_common_args "${COMMON_ARGS[@]}"
 
-# ---------------------------------------------------------------------
-# Interactive preflight (r0044) -- see this file's own header for the
-# full menu contract. Skipped entirely (falls straight through to the
-# stage loop, unchanged from pre-r0044 behavior) unless ALL of:
-#   - --apply (a --plan run never writes, nothing to ask about);
-#   - a real TTY on both stdin and stdout;
-#   - --non-interactive was not given;
-#   - --resume was not already given explicitly (an operator who already
-#     knows to pass --resume has already made their choice).
-# ---------------------------------------------------------------------
+# An explicit --resume means the operator has already told us exactly
+# what to do -- never prompt for anything (media root included), matching
+# the pre-r0045 contract that --resume runs fully unattended.
+INTERACTIVE_ELIGIBLE=0
+if [ "$RESTORE_MODE" = "apply" ] && [ "$NON_INTERACTIVE" -eq 0 ] \
+    && [ -t 0 ] && [ -t 1 ] && [ "$RESTORE_RESUME" -ne 1 ] \
+    && [ -n "$RESTORE_ARCHIVE" ] && [ -f "$RESTORE_ARCHIVE" ]; then
+  INTERACTIVE_ELIGIBLE=1
+fi
+
 _restore_interactive_read_choice() {
   local prompt="$1" default="${2:-}" reply=""
   if [ -r /dev/tty ]; then
@@ -207,6 +203,178 @@ _restore_interactive_read_choice() {
   printf '%s\n' "${reply:-$default}"
 }
 
+# ---------------------------------------------------------------------
+# Recovery media (r0045) -- see recovery_media.py's own module
+# docstring and this file's own header for the full layout contract and
+# UX. Populates MEDIA_ROOT (possibly empty -- "no recovery media, use
+# online/default sources") and the per-stage arg/env arrays below.
+# ---------------------------------------------------------------------
+MEDIA_ROOT=""
+STAGE10_ARGS=()
+STAGE20_ARGS=()
+STAGE60_ENV=()
+STAGE80_ARGS=()
+STAGE80_ENV=()
+
+_restore_show_media_evidence() {
+  local evidence_json="$1"
+  python3 -c '
+import json, sys
+e = json.loads(sys.argv[1])
+print("  Root: " + e["root"])
+print("  Archive present in backups/: " + str(e["archive_match"]))
+print("  IsadoraAir.git mirror: " + e["isadoraair_git"])
+print("  Companion mirrors: " + (", ".join(e["companion_repo_names"]) or "(none)"))
+print("  apt-repo: " + e["apt_repo_dir"])
+print("  snaps: " + e["snap_dir"])
+print("  wheelhouse: " + e["wheelhouse_dir"])
+' "$evidence_json"
+}
+
+_restore_resolve_media_root() {
+  if [ -n "$EXPLICIT_MEDIA_ROOT" ]; then
+    local evidence
+    if ! evidence=$(restore_media_validate "$EXPLICIT_MEDIA_ROOT" "$RESTORE_ARCHIVE"); then
+      log_error "--recovery-media-root $EXPLICIT_MEDIA_ROOT is not a valid/complete recovery-media tree:"
+      python3 -c 'import json,sys; e=json.loads(sys.argv[1]); [print("  - " + p) for p in e["problems"] + e.get("notes", [])]' "$evidence" >&2
+      exit 1
+    fi
+    MEDIA_ROOT="$EXPLICIT_MEDIA_ROOT"
+    log_info "Recovery media: using explicitly-supplied $MEDIA_ROOT"
+    return 0
+  fi
+
+  if [ "$INTERACTIVE_ELIGIBLE" -ne 1 ]; then
+    return 0  # non-interactive, no explicit root -- no media routing, exactly pre-r0045 behavior
+  fi
+
+  local candidates archive_dir
+  archive_dir=$(cd "$(dirname "$RESTORE_ARCHIVE")" && pwd)
+  candidates=$(restore_media_discover "$RESTORE_ARCHIVE" "$archive_dir" "$HOME") || candidates="[]"
+  local count matching_count
+  count=$(python3 -c 'import json,sys; print(len(json.loads(sys.argv[1])))' "$candidates")
+  matching_count=$(python3 -c 'import json,sys; print(sum(1 for c in json.loads(sys.argv[1]) if c["archive_match"]))' "$candidates")
+
+  if [ "$matching_count" -eq 1 ]; then
+    local only
+    only=$(python3 -c 'import json,sys; print(json.dumps(next(c for c in json.loads(sys.argv[1]) if c["archive_match"])))' "$candidates")
+    echo
+    echo "Recovery media found for this archive:"
+    _restore_show_media_evidence "$only"
+    MEDIA_ROOT=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["root"])' "$only")
+    return 0
+  fi
+
+  if [ "$count" -eq 0 ]; then
+    echo
+    local reply
+    reply=$(_restore_interactive_read_choice "No local recovery media (frozen apt/snap/wheelhouse/Git-mirror closure) was found for this archive.
+If this is an offline (E8-style) restore, enter its recovery-media root now.
+Leave blank to proceed with online/default sources for any stage that needs them.
+Recovery-media root []: " "")
+    if [ -n "$reply" ]; then
+      local evidence
+      if ! evidence=$(restore_media_validate "$reply" "$RESTORE_ARCHIVE"); then
+        log_error "$reply is not a valid/complete recovery-media tree:"
+        python3 -c 'import json,sys; e=json.loads(sys.argv[1]); [print("  - " + p) for p in e["problems"] + e.get("notes", [])]' "$evidence" >&2
+        exit 1
+      fi
+      MEDIA_ROOT="$reply"
+      log_info "Recovery media: using operator-supplied $MEDIA_ROOT"
+    fi
+    return 0
+  fi
+
+  # Ambiguous: more than one archive-matching candidate, or some
+  # structurally-valid candidates but none actually contain this exact
+  # archive -- shown honestly either way, never guessed.
+  echo
+  echo "Multiple possible recovery-media roots were found; none is an unambiguous single match for this archive:"
+  local i=0 roots=() line
+  while IFS=$'\t' read -r root match; do
+    i=$((i + 1))
+    roots+=("$root")
+    echo "  [$i] $root (archive present: $match)"
+  done < <(python3 -c 'import json,sys
+for c in json.loads(sys.argv[1]):
+    print(c["root"] + "\t" + str(c["archive_match"]))' "$candidates")
+  echo "  [0] None of these -- proceed with online/default sources"
+  local choice
+  choice=$(_restore_interactive_read_choice "Choice [0]: " "0")
+  if [ "$choice" = "0" ] || [ -z "$choice" ]; then
+    log_info "Recovery media: none selected -- proceeding with online/default sources."
+    return 0
+  fi
+  if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt "${#roots[@]}" ]; then
+    log_error "Invalid selection: $choice"
+    exit 1
+  fi
+  MEDIA_ROOT="${roots[$((choice - 1))]}"
+  log_info "Recovery media: using $MEDIA_ROOT"
+}
+
+_restore_build_media_stage_args() {
+  [ -z "$MEDIA_ROOT" ] && return 0
+
+  local groups_json
+  groups_json=$(restore_media_detect_apt_groups "$MEDIA_ROOT")
+  local with_cd_rip with_kokoro with_selenium with_backup_enc
+  with_cd_rip=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["OPTIONAL_CD_RIP"])' "$groups_json")
+  with_kokoro=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["OPTIONAL_KOKORO_TTS"])' "$groups_json")
+  with_selenium=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["OPTIONAL_SYNDICATED_SELENIUM"])' "$groups_json")
+  with_backup_enc=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["OPTIONAL_BACKUP_ENCRYPTION"])' "$groups_json")
+
+  STAGE10_ARGS=(--apt-repo-dir "$MEDIA_ROOT/offline/apt-repo" --snap-dir "$MEDIA_ROOT/offline/snaps")
+  [ "$with_cd_rip" = "True" ] && STAGE10_ARGS+=(--with-cd-rip)
+  [ "$with_kokoro" = "True" ] && STAGE10_ARGS+=(--with-kokoro-tts)
+  [ "$with_selenium" = "True" ] && STAGE10_ARGS+=(--with-syndicated-selenium)
+  [ "$with_backup_enc" = "True" ] && STAGE10_ARGS+=(--with-backup-encryption)
+  # HE-AAC (BUILD_HEAAC) is included by default and never skipped here --
+  # --skip-heaac-build is deliberately never added to STAGE10_ARGS.
+
+  STAGE20_ARGS=(--repo-url "file://$MEDIA_ROOT/repos/IsadoraAir.git")
+  STAGE80_ARGS=(--repo-url-prefix "file://$MEDIA_ROOT/repos")
+
+  local wheelhouse="$MEDIA_ROOT/offline/wheelhouse"
+  STAGE60_ENV=(
+    "PIP_NO_INDEX=1"
+    "PIP_FIND_LINKS=$wheelhouse"
+    "PIP_DISABLE_PIP_VERSION_CHECK=1"
+  )
+  STAGE80_ENV=("${STAGE60_ENV[@]}")
+
+  log_info "Recovery media: Stage 10 offline apt/snap closure + $(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); print(",".join(k for k,v in d.items() if v) or "no optional groups")' "$groups_json")"
+  log_info "Recovery media: Stage 20/80 local Git mirrors at $MEDIA_ROOT/repos"
+  log_info "Recovery media: Stage 60/80 pip constrained offline to $wheelhouse (PIP_NO_INDEX=1)"
+}
+
+# _restore_run_stage STAGE EXTRA_RESUME_FLAG -- the one place every
+# stage invocation happens (main loop AND the verify-only path below),
+# so per-stage argument/env routing is defined exactly once.
+_restore_run_stage() {
+  local stage="$1" extra_resume="${2:-}"
+  case "$stage" in
+    90-system-config.sh|95-validate.sh)
+      "$SCRIPT_DIR/$stage" "${COMMON_ARGS[@]}" "${IDENTITY_ARGS[@]}" $extra_resume ;;
+    10-packages.sh)
+      "$SCRIPT_DIR/$stage" "${COMMON_ARGS[@]}" "${STAGE10_ARGS[@]}" $extra_resume ;;
+    20-application.sh)
+      "$SCRIPT_DIR/$stage" "${COMMON_ARGS[@]}" "${STAGE20_ARGS[@]}" "${OWNER_ARGS[@]}" $extra_resume ;;
+    40-station-content.sh)
+      "$SCRIPT_DIR/$stage" "${COMMON_ARGS[@]}" "${OWNER_ARGS[@]}" $extra_resume ;;
+    60-python.sh)
+      env "${STAGE60_ENV[@]}" "$SCRIPT_DIR/$stage" "${COMMON_ARGS[@]}" $extra_resume ;;
+    80-companions.sh)
+      env "${STAGE80_ENV[@]}" "$SCRIPT_DIR/$stage" "${COMMON_ARGS[@]}" "${STAGE80_ARGS[@]}" $extra_resume ;;
+    *)
+      "$SCRIPT_DIR/$stage" "${COMMON_ARGS[@]}" $extra_resume ;;
+  esac
+}
+
+# ---------------------------------------------------------------------
+# Ledger/adoption preflight (r0044) -- see this file's own header for
+# the full menu contract.
+# ---------------------------------------------------------------------
 _restore_interactive_preflight() {
   local ledger_path archive_sha256 describe_json
   ledger_path="$(restore_ledger_path)"
@@ -342,36 +510,43 @@ _restore_interactive_verify_only() {
     fi
     echo
     echo ">>> Verifying $stage"
-    case "$stage" in
-      90-system-config.sh|95-validate.sh)
-        "$SCRIPT_DIR/$stage" "${COMMON_ARGS[@]}" --resume "${IDENTITY_ARGS[@]}" ;;
-      *)
-        "$SCRIPT_DIR/$stage" "${COMMON_ARGS[@]}" --resume ;;
-    esac
+    _restore_run_stage "$stage" "--resume"
   done
   echo
   echo "=== All ledger-recorded stages verified. ==="
 }
 
-if [ "$RESTORE_MODE" = "apply" ] && [ "$NON_INTERACTIVE" -eq 0 ] \
-    && [ -t 0 ] && [ -t 1 ] && [ "$RESTORE_RESUME" -ne 1 ] \
-    && [ -n "$RESTORE_ARCHIVE" ] && [ -f "$RESTORE_ARCHIVE" ]; then
-  _restore_interactive_preflight
-fi
+# ---------------------------------------------------------------------
+# Main body -- guarded so a test can `source` this file (BASH_SOURCE !=
+# $0, e.g. from a test harness's own bash process) to reach every
+# function/variable defined above for isolated, no-side-effect testing
+# (e.g. calling _restore_build_media_stage_args directly after setting
+# MEDIA_ROOT by hand) without ALSO running the real preflight/stage
+# loop. A normal `bash restore.sh ...` / `./restore.sh ...` invocation
+# is completely unaffected -- BASH_SOURCE[0] == $0 in that case, exactly
+# as it always has been.
+# ---------------------------------------------------------------------
+if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+  # _restore_resolve_media_root itself handles every case: an explicit
+  # --recovery-media-root is validated regardless of interactive
+  # eligibility (the deterministic automation/CI path); otherwise it's a
+  # no-op unless this run is actually interactive-eligible.
+  _restore_resolve_media_root
+  _restore_build_media_stage_args
 
-echo "=== IsadoraAir restore orchestrator: ${#STAGES[@]} stages ==="
-for stage in "${STAGES[@]}"; do
+  if [ "$INTERACTIVE_ELIGIBLE" -eq 1 ]; then
+    _restore_interactive_preflight
+  fi
+
+  echo "=== IsadoraAir restore orchestrator: ${#STAGES[@]} stages ==="
+  for stage in "${STAGES[@]}"; do
+    echo
+    echo ">>> Running $stage"
+    _restore_run_stage "$stage"
+  done
   echo
-  echo ">>> Running $stage"
-  case "$stage" in
-    90-system-config.sh|95-validate.sh)
-      "$SCRIPT_DIR/$stage" "${COMMON_ARGS[@]}" "${IDENTITY_ARGS[@]}" ;;
-    *)
-      "$SCRIPT_DIR/$stage" "${COMMON_ARGS[@]}" ;;
-  esac
-done
-echo
-echo "=== All stages completed. ==="
-echo "Nothing was started/enabled/reloaded -- see deploy/restore/README.md's"
-echo "'Restore-order dependency map' and docs/DISASTER_RECOVERY_RESTORE.md's"
-echo "'Service bring-up order' section for what comes next (Phase 5)."
+  echo "=== All stages completed. ==="
+  echo "Nothing was started/enabled/reloaded -- see deploy/restore/README.md's"
+  echo "'Restore-order dependency map' and docs/DISASTER_RECOVERY_RESTORE.md's"
+  echo "'Service bring-up order' section for what comes next (Phase 5)."
+fi

@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "release_id": "r0045",
+  "previous_release_id": "r0044",
+  "minimum_updater_protocol_version": 5,
+  "summary": "Fixes a real r0044 gap: the interactive recovery workflow broadcast identical args to every stage, unable to express the offline-E8 contract's stage-specific frozen-media inputs (Stage 10 apt/snap closure, Stage 20 Git mirror, Stage 60/80 pip wheelhouse, Stage 80 companion mirrors). Adds one recovery-media root concept (interactive discovery, or --recovery-media-root) with per-stage argument/env routing in restore.sh. Does not change the r0043/r0044 ledger/adoption design.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0007"
+}

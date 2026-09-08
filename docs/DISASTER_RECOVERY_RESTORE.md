@@ -85,14 +85,32 @@ first:
   always a hard, immediate stop -- never a menu, never silently ignored.
 - **Nothing exists yet**: proceeds immediately.
 
+**Before any of the above, restore.sh also resolves recovery media
+(r0045)** -- this applies even to a brand-new box with no prior restore
+state, since it's the most common offline-E8 scenario. If it can find
+exactly one matching frozen-media root (the same coherent `e8-inputs`
+tree a real E8 export produces: backup, local apt/snap closure, pip
+wheelhouse, and the IsadoraAir + companion Git mirrors) near the archive
+you gave it or under `$HOME`, it says so and uses it -- Stage 10's
+apt/snap install, Stage 20's clone, Stage 60/80's pip, and Stage 80's
+companion clones are then all constrained to that local media, with no
+Internet access needed or possible for those steps. If it finds more
+than one candidate (or none), it lists what it found (or asks for a
+path) and a blank/declined answer proceeds with online/default sources
+instead. Non-interactive/scripted runs pass `--recovery-media-root
+PATH` explicitly for the same effect, deterministically. See
+`docs/DISASTER_RECOVERY_STATUS.md`'s "Recovery media (r0045)" section
+for the exact directory layout and per-stage routing.
+
 The prompt only ever decides which of the above already-safe code paths
 to take -- it is never itself permission to weaken a safety check.
 Piped/non-interactive input (CI, automation) never triggers a prompt at
 all; pass `--non-interactive` to suppress it explicitly even from a
-real terminal, and pass `--resume`/`--adopt-pre-ledger` yourself for
-fully deterministic, scripted runs. See
-`docs/DISASTER_RECOVERY_STATUS.md`'s "Resumable restore mechanism"
-section and `restore.sh`'s own header comment for the full contract.
+real terminal, and pass `--resume`/`--adopt-pre-ledger`/
+`--recovery-media-root` yourself for fully deterministic, scripted runs.
+See `docs/DISASTER_RECOVERY_STATUS.md`'s "Resumable restore mechanism"
+and "Recovery media (r0045)" sections and `restore.sh`'s own header
+comment for the full contract.
 
 ## Offline package/snap closure (E8, r0038)
 

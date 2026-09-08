@@ -78,6 +78,7 @@ RESTORE_FORCE_DB=0
 RESTORE_FORCE_ENV=0
 RESTORE_RESUME=0
 RESTORE_ADOPT_PRE_LEDGER=0
+RESTORE_MEDIA_ROOT=""
 RESTORE_DB_NAME=""
 RESTORE_ARCHIVE=""
 RESTORE_REMAINING_ARGS=()
@@ -105,6 +106,9 @@ restore_parse_common_args() {
       --force-env) RESTORE_FORCE_ENV=1; shift ;;
       --resume) RESTORE_RESUME=1; shift ;;
       --adopt-pre-ledger) RESTORE_ADOPT_PRE_LEDGER=1; shift ;;
+      --recovery-media-root)
+        RESTORE_MEDIA_ROOT="${2:?--recovery-media-root needs a path}"; shift 2 ;;
+      --recovery-media-root=*) RESTORE_MEDIA_ROOT="${1#*=}"; shift ;;
       --) shift; while [ $# -gt 0 ]; do RESTORE_REMAINING_ARGS+=("$1"); shift; done ;;
       *) RESTORE_REMAINING_ARGS+=("$1"); shift ;;
     esac
@@ -627,6 +631,53 @@ restore_archive_recovery_metadata() {
   fi
   local helper="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/runtime_recovery_archive.py"
   python3 "$helper" inspect --archive "$RESTORE_ARCHIVE" 2>/dev/null
+}
+
+# ---------------------------------------------------------------------
+# Recovery media (r0045) -- see recovery_media.py's own module
+# docstring for the full layout contract this discovers/validates
+# against (established from build_offline_closure.py's own --out-dir
+# structure, never guessed). Read-only; never mutates anything.
+#
+# restore_media_validate ROOT [ARCHIVE] -- prints the JSON validation
+# evidence to stdout, returns 0 only if ROOT is a structurally complete
+# recovery-media tree (and, when ARCHIVE is given, ROOT's backups/
+# actually contains that exact archive by SHA256).
+restore_media_validate() {
+  local root="$1" archive="${2:-}"
+  local helper="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/recovery_media.py"
+  if [ -n "$archive" ]; then
+    python3 "$helper" validate --root "$root" --archive "$archive"
+  else
+    python3 "$helper" validate --root "$root"
+  fi
+}
+
+# restore_media_discover ARCHIVE [SEARCH_ROOT...] -- prints a JSON array
+# of every structurally-valid recovery-media root found (archive-
+# matching roots sorted first), to stdout. Empty array (`[]`, exit 1)
+# means nothing valid was found at all.
+restore_media_discover() {
+  local archive="$1"; shift
+  local helper="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/recovery_media.py"
+  local args=(discover --archive "$archive")
+  local search_root
+  for search_root in "$@"; do
+    args+=(--search-root "$search_root")
+  done
+  python3 "$helper" "${args[@]}"
+}
+
+# restore_media_detect_apt_groups ROOT -- prints
+# {"OPTIONAL_CD_RIP":bool,...} JSON for which optional
+# deploy/packages-ubuntu-26.04.txt groups ROOT's own frozen apt closure
+# actually includes -- data-driven from ROOT's own manifest, never
+# hard-coded.
+restore_media_detect_apt_groups() {
+  local root="$1"
+  local helper="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/recovery_media.py"
+  local packages_file="$RESTORE_REPO_ROOT/deploy/packages-ubuntu-26.04.txt"
+  python3 "$helper" detect-apt-groups --root "$root" --packages-file "$packages_file"
 }
 
 # restore_verify_component_receipt COMPONENT -- r0044 pre-ledger adoption
