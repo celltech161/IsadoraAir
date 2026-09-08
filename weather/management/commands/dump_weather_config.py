@@ -1,5 +1,6 @@
 import json
 
+from django.conf import settings
 from django.core.management.base import BaseCommand
 
 from weather.models import WeatherConfig, WeatherVoicePersona
@@ -25,6 +26,9 @@ class Command(BaseCommand):
             for persona in WeatherVoicePersona.objects.select_related("tts_voice")
         }
         self.stdout.write(json.dumps({
+            # Narrow config handoff for the external companion: expose this
+            # one non-secret setting, never IsadoraAir's complete .env.
+            "weather_data_dir": str(settings.WEATHER_DATA_DIR),
             "station_lat": cfg.station_lat,
             "station_lon": cfg.station_lon,
             "sun_alt_threshold_deg": cfg.sun_alt_threshold_deg,

@@ -8,7 +8,7 @@ import json
 from io import StringIO
 
 from django.core.management import call_command
-from django.test import TestCase
+from django.test import TestCase, override_settings
 
 from library.models import FXCart
 from weather.models import WeatherConfig
@@ -58,6 +58,16 @@ class DumpWeatherConfigCommandTests(TestCase):
         self.assertIn("alert_sound_enabled", payload)
         self.assertIn("alert_sound_interval_seconds", payload)
         self.assertIn("alert_sound_cart_id", payload)
+
+    @override_settings(WEATHER_DATA_DIR="/srv/station/weather")
+    def test_output_relays_configured_weather_data_dir(self):
+        self.assertEqual(self._dump()["weather_data_dir"], "/srv/station/weather")
+
+    @override_settings(WEATHER_DATA_DIR="/var/lib/isadoraair/weather")
+    def test_output_relays_canonical_weather_data_dir(self):
+        self.assertEqual(
+            self._dump()["weather_data_dir"], "/var/lib/isadoraair/weather"
+        )
 
     def test_output_no_longer_exposes_playback_specific_fields(self):
         payload = self._dump()

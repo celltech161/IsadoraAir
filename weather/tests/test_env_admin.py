@@ -66,10 +66,11 @@ class WeatherEnvAdminTests(TestCase):
         html = self.client.get(self.url()).content.decode()
         self.assertIn("/srv/fromdisk/weather", html)
 
-    def test_external_companion_project_warning_always_shown(self):
+    def test_external_companion_shared_setting_contract_always_shown(self):
         html = self.client.get(self.url()).content.decode()
         self.assertIn("weather-ingest companion project", html)
-        self.assertIn("does not update that external project", html)
+        self.assertIn("authoritative setting", html)
+        self.assertIn("next invocation", html)
 
     def test_diagnostic_file_status_reports_none_yet_for_empty_directory(self):
         data_dir = Path(self._tmpdir.name) / "wxdata"

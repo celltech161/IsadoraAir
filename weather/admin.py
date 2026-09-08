@@ -102,13 +102,13 @@ class WeatherConfigAdmin(admin.ModelAdmin):
             return HttpResponseRedirect(reverse("admin:weather_weatherconfig_weather_env"))
 
         notices = [{
-            "level": "warning",
+            "level": "info",
             "text": (
                 "The separate weather-ingest companion project (its own repo/venv, not "
-                "part of IsadoraAir) reads and writes this same directory independently "
-                "and has its own configuration -- saving a new path here does not update "
-                "that external project. Update its configuration separately (and move any "
-                "files it owns) if the shared directory moves."
+                "part of IsadoraAir) reads this authoritative setting through a narrow "
+                "management-command bridge on every new job. A saved path therefore takes "
+                "effect for its next invocation; move existing shared files before jobs "
+                "resume, and restart the web service for Django's long-running process."
             ),
         }]
         try:

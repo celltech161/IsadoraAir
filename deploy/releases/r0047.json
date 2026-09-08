@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "release_id": "r0047",
+  "previous_release_id": "r0046",
+  "minimum_updater_protocol_version": 5,
+  "summary": "Makes IsadoraAir's admin-editable WEATHER_DATA_DIR the single authority for Django and weather-ingest: dump_weather_config now relays only the resolved non-secret path through the existing cross-venv bridge, and admin guidance reflects that companion jobs pick it up on their next invocation. No migration, dependency, or systemd-unit changes.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-gunicorn"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0007"
+}

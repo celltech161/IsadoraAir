@@ -434,11 +434,9 @@ register_setting(ManagedSetting(
         "views, via weather/services.py's module-level DATA_DIR) holds this "
         "in memory -- restart to pick up a change. IMPORTANT: the separate "
         "weather-ingest companion project (its own repo/venv, not part of "
-        "IsadoraAir) reads/writes the SAME directory independently and has "
-        "its OWN configuration -- saving a new path here does not change "
-        "where that external project looks. Update its configuration "
-        "separately (and move any files it owns) if the shared directory "
-        "moves."
+        "IsadoraAir) reads this SAME setting through dump_weather_config on "
+        "each new job, so its next invocation picks up the saved path without "
+        "a separate config edit. Move existing shared files before jobs resume."
     ),
 ))
 register_setting(ManagedSetting(
