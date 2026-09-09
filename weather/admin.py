@@ -11,6 +11,7 @@ from isadoraair import env_admin, env_config
 from .diagnostics import get_weather_diagnostics
 from .forms import WeatherConfigForm
 from .models import AmberAlertConfig, WeatherConfig, WeatherVoicePersona
+from .setup_status import render_setup_status
 
 _WEATHER_ENV_KEYS = ["WEATHER_DATA_DIR"]
 # r0050: proves weather.diagnostics is genuinely reusable -- this page no
@@ -37,6 +38,12 @@ class WeatherConfigAdmin(admin.ModelAdmin):
     helper), not injected into this ModelAdmin's own save_model()."""
     form = WeatherConfigForm
     fieldsets = [
+        ("Weather Setup Status", {
+            "fields": ["setup_status"],
+            "description": "Read-only snapshot from weather.diagnostics, generated fresh on "
+                            "every page load -- reload the page to recheck. This panel never "
+                            "changes anything; the ordinary form below is unaffected by it.",
+        }),
         ("Station Location", {
             "fields": ["station_lat", "station_lon", "sun_alt_threshold_deg"],
         }),
@@ -67,7 +74,7 @@ class WeatherConfigAdmin(admin.ModelAdmin):
                             ".env, not this database record.",
         }),
     ]
-    readonly_fields = ["weather_env_link"]
+    readonly_fields = ["setup_status", "weather_env_link"]
 
     def has_add_permission(self, request):
         return not WeatherConfig.objects.exists()
@@ -80,6 +87,17 @@ class WeatherConfigAdmin(admin.ModelAdmin):
         return HttpResponseRedirect(
             reverse("admin:weather_weatherconfig_change", args=[obj.pk])
         )
+
+    @admin.display(description="")
+    def setup_status(self, obj):
+        """Pass C: the whole panel is rendered by weather.setup_status
+        from a single, fresh get_weather_diagnostics() call -- this
+        method itself does no ORM/filesystem inspection of its own (see
+        that module's own docstring). `obj` is intentionally unused:
+        the diagnostics snapshot reads WeatherConfig/AmberAlertConfig
+        directly, so this renders identically on the add form (before
+        a row exists) and the change form."""
+        return render_setup_status()
 
     def get_urls(self):
         return [

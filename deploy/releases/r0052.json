@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "release_id": "r0052",
+  "previous_release_id": "r0051",
+  "minimum_updater_protocol_version": 5,
+  "summary": "Pass C: adds a Weather Setup Status panel to the top of the Weather Configuration Admin change page (weather/setup_status.py), rendering the existing weather.diagnostics snapshot as a grouped, human-readable, safely-escaped read-only report with overall status, humanized ages, and named-Admin-route links. Presentation only -- no new readiness calculation, no schema change, no static assets, no on-air behavior change.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-gunicorn"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0007"
+}
