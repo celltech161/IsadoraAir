@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "release_id": "r0053",
+  "previous_release_id": "r0052",
+  "minimum_updater_protocol_version": 5,
+  "summary": "Pass D: folds Weather Voice Persona management into the Weather Configuration workflow, presents alert-beep interval in minutes, makes Alert FX Cart searchable, splits routine vs. Advanced fieldsets, adds explicit NWS discovery, and moves the Weather Alert Beep's qualifying-event list out of a hard-coded weather_ingest constant into WeatherConfig.alert_sound_trigger_events (same legacy defaults/matching, independent of spoken WxAlert/AMBER paths). One migration; no upgrade behavior change.",
+  "migrations_required": [
+    "weather.0009_weatherconfig_alert_sound_trigger_events_and_more"
+  ],
+  "migration_compatibility": "additive",
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-gunicorn"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0007"
+}

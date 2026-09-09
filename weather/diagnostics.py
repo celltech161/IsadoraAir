@@ -351,6 +351,13 @@ def _check_announcer_schedule(cfg: WeatherConfig | None) -> list[DiagnosticFact]
 
 
 def _check_alert_fx_cart(cfg: WeatherConfig | None) -> DiagnosticFact:
+    """r0053 amendment: also owns readiness of WeatherConfig.
+    alert_sound_trigger_events (the Weather Alert Beep's qualifying-
+    event list) -- weather.diagnostics stays the one readiness
+    authority for this, never a second Admin-only interpretation. This
+    fact is about the repeating sonar/ping FX Cart ONLY; it never
+    reflects on generated_artifact:wx_alert (the spoken urgent-alert
+    artifact), which has its own independent applicability logic."""
     if cfg is None:
         return DiagnosticFact(key="alert_fx_cart", state="needs_attention", summary=_NO_WEATHER_CONFIG_SUMMARY)
     if not cfg.alert_sound_enabled:
@@ -358,22 +365,41 @@ def _check_alert_fx_cart(cfg: WeatherConfig | None) -> DiagnosticFact:
             key="alert_fx_cart", state="optional_disabled",
             summary="Alert beep is disabled.",
         )
+
+    triggers = cfg.alert_sound_trigger_events
+    well_formed = isinstance(triggers, list) and all(isinstance(t, str) and t.strip() for t in triggers)
+    if not well_formed:
+        return DiagnosticFact(
+            key="alert_fx_cart", state="needs_attention",
+            summary="Weather Alert Beep trigger-event configuration is malformed.",
+            detail="alert_sound_trigger_events must be a list of non-empty NWS event-name strings.",
+            evidence={"trigger_events": triggers},
+        )
+    if not triggers:
+        return DiagnosticFact(
+            key="alert_fx_cart", state="optional_disabled",
+            summary="Weather Alert Beep has no trigger event types configured; it will not fire.",
+            evidence={"trigger_event_count": 0},
+        )
+
     cart = cfg.alert_sound_cart
+    evidence = {"trigger_events": triggers, "trigger_event_count": len(triggers)}
     if cart is None:
         return DiagnosticFact(
             key="alert_fx_cart", state="needs_attention",
             summary="Alert beep is enabled but no FX Cart is selected.",
+            evidence=evidence,
         )
     if not Path(cart.filepath).is_file():
         return DiagnosticFact(
             key="alert_fx_cart", state="needs_attention",
             summary=f'Alert FX Cart "{cart.name}" is selected but its audio file is missing.',
-            path=cart.filepath, evidence={"cart_id": cart.id, "cart_name": cart.name},
+            path=cart.filepath, evidence={**evidence, "cart_id": cart.id, "cart_name": cart.name},
         )
     return DiagnosticFact(
         key="alert_fx_cart", state="ready",
-        summary=f'Alert beep configured with FX Cart "{cart.name}".',
-        path=cart.filepath, evidence={"cart_id": cart.id, "cart_name": cart.name},
+        summary=f'Alert beep configured with FX Cart "{cart.name}" for {len(triggers)} trigger event type(s).',
+        path=cart.filepath, evidence={**evidence, "cart_id": cart.id, "cart_name": cart.name},
     )
 
 

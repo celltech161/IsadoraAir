@@ -1,0 +1,79 @@
+{% extends "admin/base_site.html" %}
+{% load i18n %}
+
+{# r0053 (Pass D): announcer-personas/ -- a summary + links into the
+   REAL WeatherVoicePersonaAdmin add/change/delete views. This page
+   never edits a persona itself; editing/validation stays entirely on
+   WeatherVoicePersonaAdmin (autocomplete tts_voice, read-only slot on
+   an existing row, delete_view's referenced-slot guard). Context:
+   `personas` (list of {slot, display_name, full_name, tts_voice_name,
+   tts_voice_enabled, referenced, change_url, delete_url}), `add_url`,
+   `change_url` (back to Weather Configuration), `title`. #}
+
+{% block breadcrumbs %}
+<div class="breadcrumbs">
+<a href="{% url 'admin:index' %}">{% translate 'Home' %}</a>
+&rsaquo; <a href="{% url 'admin:app_list' app_label=opts.app_label %}">{{ opts.app_config.verbose_name }}</a>
+&rsaquo; <a href="{{ change_url }}">{{ opts.verbose_name }}</a>
+&rsaquo; {{ title }}
+</div>
+{% endblock %}
+
+{% block content %}
+<div id="content-main">
+
+<p>
+  Weather Voice Personas are shared identifiers referenced by the Announcer
+  Voices schedule grid on the main Weather Configuration page -- adding one
+  here makes it available to assign hours to; it is not assigned any hours
+  automatically.
+</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>Slot</th>
+      <th>Display name</th>
+      <th>Full name</th>
+      <th>Logical voice</th>
+      <th></th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for persona in personas %}
+    <tr>
+      <td><code>{{ persona.slot }}</code></td>
+      <td>{{ persona.display_name|default:"—" }}</td>
+      <td>{{ persona.full_name|default:"—" }}</td>
+      <td>
+        {% if persona.tts_voice_name %}
+          {{ persona.tts_voice_name }}
+          {% if not persona.tts_voice_enabled %}
+            <span style="color:#c62828;"> (disabled)</span>
+          {% endif %}
+        {% else %}
+          <span style="color:#c62828;">no logical voice selected</span>
+        {% endif %}
+      </td>
+      <td>
+        <a href="{{ persona.change_url }}">Edit</a>
+        {% if persona.referenced %}
+          <span style="color:#888;font-size:0.85em;"> (in use by the current schedule)</span>
+        {% else %}
+          &middot; <a href="{{ persona.delete_url }}">Delete</a>
+        {% endif %}
+      </td>
+    </tr>
+    {% empty %}
+    <tr><td colspan="5" style="color:#888;">No Weather Voice Personas exist yet.</td></tr>
+    {% endfor %}
+  </tbody>
+</table>
+
+<div class="submit-row">
+  <a href="{{ add_url }}" class="button default">+ Add a new persona</a>
+  <a href="{{ change_url }}" class="button cancel-link">Back to Weather Configuration</a>
+</div>
+
+</div>
+{% endblock %}

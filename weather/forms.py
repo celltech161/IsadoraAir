@@ -8,6 +8,8 @@ persona validation layer around them, deliberately kept separate from
 that module's own provider-free/DB-free boundary)."""
 from __future__ import annotations
 
+from decimal import ROUND_HALF_UP, Decimal
+
 from django import forms
 from django.utils import timezone
 
@@ -215,11 +217,73 @@ class HourlyScheduleField(forms.Field):
 
 
 class WeatherConfigForm(forms.ModelForm):
+    """r0053 (Pass D): also shadows alert_sound_interval_seconds with an
+    operator-facing minutes field -- see alert_sound_interval_minutes/
+    save() below. The stored seconds column and weather_ingest's own
+    runtime contract (WeatherConfig.alert_sound_interval_seconds via
+    dump_weather_config) are completely unchanged; only this form's
+    presentation converts."""
+
     voice_schedule = HourlyScheduleField(
         label="Announcer schedule",
         help_text="Click an hour to assign the announcer on duty. Times shown are station-local.",
     )
+    alert_sound_interval_minutes = forms.DecimalField(
+        label="Repeat alert beep every",
+        min_value=Decimal("0.01"),
+        max_digits=8,
+        decimal_places=2,
+        help_text="Minutes. Stored internally as alert_sound_interval_seconds -- "
+                   "the value weather_ingest actually reads is unchanged, this is "
+                   "presentation only. An existing value that isn't an exact whole "
+                   "minute (e.g. 90 seconds) round-trips exactly as 1.50 here.",
+    )
+    # r0053 amendment: shadows alert_sound_trigger_events (a JSONField)
+    # with a plain one-event-name-per-line editor -- friendlier than
+    # typing raw JSON, and avoids the "must be valid JSON syntax"
+    # failure mode for an operator who just wants to add one event
+    # name. Structured storage (a JSON list) is unchanged; only this
+    # form's presentation is a text box.
+    alert_sound_trigger_events_text = forms.CharField(
+        label="Alert types that trigger the repeating beep",
+        required=False,
+        widget=forms.Textarea(attrs={"rows": 4, "cols": 40}),
+        help_text="One NWS event name per line, e.g. \"Tornado Warning\" -- select/configure "
+                   "the NWS event names that activate the repeating Alert Beep FX Cart. This "
+                   "setting does not control generated spoken Weather or AMBER alert "
+                   "statements. Matching is case-insensitive substring, same as before this "
+                   "was configurable. Leave blank so no NWS event triggers the beep.",
+    )
 
     class Meta:
         model = WeatherConfig
-        fields = "__all__"
+        exclude = ["alert_sound_interval_seconds", "alert_sound_trigger_events"]
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if not self.is_bound and self.instance is not None and self.instance.pk:
+            seconds = self.instance.alert_sound_interval_seconds
+            minutes = (Decimal(seconds) / Decimal(60)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            self.fields["alert_sound_interval_minutes"].initial = minutes
+            events = self.instance.alert_sound_trigger_events or []
+            self.fields["alert_sound_trigger_events_text"].initial = "\n".join(events)
+
+    def clean_alert_sound_trigger_events_text(self):
+        raw = self.cleaned_data.get("alert_sound_trigger_events_text", "")
+        # Blank lines dropped; order and exact wording of each
+        # non-blank line preserved verbatim (arbitrary event-name
+        # strings, not a fixed choice list) -- an entirely blank
+        # field is the valid, deliberate "no event triggers the
+        # beep" empty list, not an error.
+        return [line.strip() for line in raw.splitlines() if line.strip()]
+
+    def save(self, commit=True):
+        instance = super().save(commit=False)
+        minutes = self.cleaned_data["alert_sound_interval_minutes"]
+        seconds = int((minutes * 60).to_integral_value(rounding=ROUND_HALF_UP))
+        instance.alert_sound_interval_seconds = seconds
+        instance.alert_sound_trigger_events = self.cleaned_data["alert_sound_trigger_events_text"]
+        if commit:
+            instance.save()
+            self.save_m2m()
+        return instance

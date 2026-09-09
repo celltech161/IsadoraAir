@@ -185,8 +185,10 @@ class WeatherConfigAdminGridIntegrationTests(TestCase):
             "nws_alert_zone": self.config.nws_alert_zone, "nws_forecast_office": self.config.nws_forecast_office,
             "nws_forecast_grid_x": self.config.nws_forecast_grid_x, "nws_forecast_grid_y": self.config.nws_forecast_grid_y,
             "nws_cloud_stations": self.config.nws_cloud_stations,
+            # r0053: WeatherConfigForm now presents this as minutes, not
+            # raw seconds -- see WeatherConfigForm.save()/__init__().
+            "alert_sound_interval_minutes": self.config.alert_sound_interval_seconds / 60,
             "notify_email": self.config.notify_email,
-            "alert_sound_interval_seconds": self.config.alert_sound_interval_seconds,
             "_save": "Save",
         }
         if self.config.alert_sound_enabled:
@@ -202,7 +204,11 @@ class WeatherConfigAdminGridIntegrationTests(TestCase):
         body = response.content.decode()
         self.assertIn("wx-schedule-grid", body)
         self.assertEqual(body.count("wx-hour-select"), 24)  # 24 real selects, one per hour
-        self.assertNotIn("<textarea", body)  # the old raw-JSON textarea is gone
+        # The old raw-JSON voice_schedule textarea is gone -- a
+        # DIFFERENT field (r0053's alert_sound_trigger_events_text)
+        # legitimately uses a <textarea> now, so this checks specifically
+        # for a schedule-shaped one rather than "no textarea anywhere".
+        self.assertNotIn('<textarea name="voice_schedule"', body)
 
     def test_current_hour_is_marked_in_rendered_page(self):
         self.client.force_login(self.super)

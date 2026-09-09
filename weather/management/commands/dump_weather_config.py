@@ -42,4 +42,10 @@ class Command(BaseCommand):
             "alert_sound_enabled": cfg.alert_sound_enabled,
             "alert_sound_cart_id": cfg.alert_sound_cart_id,
             "alert_sound_interval_seconds": cfg.alert_sound_interval_seconds,
+            # r0053: Weather Alert Beep qualifying-event list ONLY --
+            # has no bearing on the spoken WxAlert/AMBER-family
+            # statement pipelines, which have their own independent
+            # selection rules (see weather_ingest/update_local_wx_
+            # data.py's own event_triggers_alert_beep()).
+            "alert_sound_trigger_events": cfg.alert_sound_trigger_events,
         }))

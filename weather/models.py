@@ -1,6 +1,30 @@
 from django.db import models, transaction
 
 
+# r0053: the Weather Alert Beep's qualifying-event list. Historically a
+# hard-coded ALERT_KEYWORDS list in weather_ingest/update_local_wx_
+# data.py -- moved here so it's operator-configurable, but the DEFAULT
+# is these exact four values so an upgrade preserves current production
+# behavior with no operator action required. This governs ONLY the
+# repeating sonar/ping FX Cart (alert_sound_cart below) -- it has no
+# effect on the generated spoken WxAlert or AMBER-family statements,
+# which have their own independent selection rules.
+DEFAULT_ALERT_SOUND_TRIGGER_EVENTS = [
+    "Tornado Warning",
+    "Severe Thunderstorm Warning",
+    "Tornado Watch",
+    "Severe Thunderstorm Watch",
+]
+
+
+def _default_alert_sound_trigger_events():
+    # A plain list literal is mutable shared state if used directly as
+    # a Django field default -- a callable returning a fresh list each
+    # time is the correct pattern (same reasoning as Python's own
+    # "mutable default argument" pitfall).
+    return list(DEFAULT_ALERT_SOUND_TRIGGER_EVENTS)
+
+
 DEFAULT_AMBER_EVENT_CODES = "BLU,CAE,MEP"
 
 DEFAULT_AMBER_SAME_CODES = ",".join([
@@ -41,7 +65,13 @@ class WeatherConfig(models.Model):
 
     nws_alert_zone = models.CharField(
         max_length=16, default="KSC143",
-        help_text="NWS public forecast zone for active alerts, e.g. KSC143.",
+        help_text="NWS county/zone UGC used to look up active alerts, e.g. KSC143 -- "
+                   "a COUNTY UGC (the 'C' in KSC143), not a public forecast-zone code "
+                   "('Z'). Deliberately county-based: NWS alert lookup by county "
+                   "returns both county-based alerts and zone-based alerts mapped to "
+                   "that county, so this is not a mistake to 'correct' to a KSZ... "
+                   "code. The NWS Setup discovery action above always discovers and "
+                   "offers this same county UGC, never a forecast-zone code.",
     )
     nws_forecast_office = models.CharField(
         max_length=8, default="TOP",
@@ -93,6 +123,17 @@ class WeatherConfig(models.Model):
         default=600,
         help_text="How often the beep replays while a watch/warning remains active, "
                    "in seconds. Re-read fresh every check -- no restart needed.",
+    )
+    alert_sound_trigger_events = models.JSONField(
+        default=_default_alert_sound_trigger_events,
+        help_text="NWS event names (e.g. \"Tornado Warning\") that activate the "
+                   "repeating Alert Beep FX Cart -- case-insensitive substring match "
+                   "against the NWS event name, matching current production behavior. "
+                   "This does NOT control generated spoken Weather or AMBER alert "
+                   "statements (see WxAlert/wx_alert.mp3 readiness in Weather Setup "
+                   "Status for those) -- it governs only the repeating sonar/ping FX "
+                   "Cart selected above. An empty list means no NWS event ever "
+                   "triggers the beep.",
     )
 
     class Meta:

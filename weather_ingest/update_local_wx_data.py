@@ -77,6 +77,12 @@ RDS_FILE_2 = DATA_DIR / "rds_wind.txt"
 # Alerts
 ALERT_ZONE = CFG["nws_alert_zone"]
 ALERT_URL = f"https://api.weather.gov/alerts/active?zone={ALERT_ZONE}"
+# Weather Alert Beep activation state (the repeating sonar/ping FX Cart
+# fired via wx_alert_beep.py -> fire_fx_cart -- see ALERT_SOUND_TRIGGER_
+# EVENTS below). Deliberately NOT the spoken WxAlert statement pipeline
+# (WX_WATCHWARN_FILE/wx_alert.py below) -- the two are independent by
+# design (r0053 amendment): an NWS event can qualify for one, the
+# other, both, or neither.
 ALERT_STATUS = DATA_DIR / "alert.txt"
 ALERT_DESCRIPTION = DATA_DIR / "warn.txt"
 
@@ -111,10 +117,52 @@ NWS_STATIONS = {
     for code in CFG["nws_cloud_stations"]
 }
 
-ALERT_KEYWORDS = [
+# r0053 amendment: this used to be a hard-coded list. It now comes from
+# WeatherConfig.alert_sound_trigger_events via dump_weather_config's
+# JSON bridge (CFG) -- these four remain the fallback ONLY for a config
+# JSON dumped by an older Django checkout that predates the field (so a
+# mid-upgrade window never silently disables the beep), never a
+# production behavior change. A configured EMPTY list is a deliberate,
+# valid choice -- "no NWS event triggers the repeating beep" -- and is
+# passed through as-is, never replaced by this fallback (see CFG.get()
+# below: only a MISSING key falls back, not a present-but-empty one).
+_LEGACY_ALERT_KEYWORDS_FALLBACK = [
     "Tornado Warning", "Severe Thunderstorm Warning",
-    "Tornado Watch", "Severe Thunderstorm Watch"
+    "Tornado Watch", "Severe Thunderstorm Watch",
 ]
+ALERT_SOUND_TRIGGER_EVENTS = CFG.get("alert_sound_trigger_events", _LEGACY_ALERT_KEYWORDS_FALLBACK)
+
+
+def event_triggers_alert_beep(event, configured_triggers):
+    """Weather Alert Beep qualifying-event check ONLY -- this has
+    nothing to do with which NWS Watches/Warnings get spoken in
+    active_watches_warnings.json (see _is_watch_or_warning(), an
+    entirely independent suffix check) or with AMBER-family alerts
+    (amber_poll.py, untouched by this). Case-insensitive substring
+    match -- preserves the exact semantics of the original hard-coded
+    ALERT_KEYWORDS list byte-for-byte, now sourced from
+    WeatherConfig.alert_sound_trigger_events.
+
+    Defensive against malformed PERSISTED data (r0053 review amendment
+    -- the field is admin-form-guarded, but it's still a raw JSONField
+    underneath, and this cron job must never crash or, worse, have a
+    stray blank/whitespace-only stored entry match every single NWS
+    event): a non-list/tuple `configured_triggers` matches nothing; a
+    non-string entry is ignored; a blank/whitespace-only string entry
+    is ignored (never treated as "" being a substring of everything).
+    Every valid non-empty string entry still matches exactly as before."""
+    if not isinstance(configured_triggers, (list, tuple)):
+        return False
+    event_lower = (event or "").lower()
+    for trigger in configured_triggers:
+        if not isinstance(trigger, str):
+            continue
+        trigger = trigger.strip()
+        if not trigger:
+            continue
+        if trigger.lower() in event_lower:
+            return True
+    return False
 
 VERBOSE = True
 
@@ -931,14 +979,14 @@ def update_wx_alerts():
         alerts = r.json().get("features", [])
 
         latest_by_event = {}
-        severe_active = False
+        severe_active = False  # Weather Alert Beep activation state ONLY -- see event_triggers_alert_beep()
         for a in alerts:
             p = a.get("properties", {})
             event = p.get("event", "")
             headline = p.get("headline", "")
             if not headline:
                 continue
-            if any(k.lower() in event.lower() for k in ALERT_KEYWORDS):
+            if event_triggers_alert_beep(event, ALERT_SOUND_TRIGGER_EVENTS):
                 severe_active = True
 
             sent_dt = _alert_sent_dt(p)

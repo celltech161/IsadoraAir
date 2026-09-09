@@ -176,6 +176,82 @@ class DiagnosticsConfigurationTests(TestCase):
         snap = self.snapshot()
         self.assertEqual(snap.get("alert_fx_cart").state, "needs_attention")
 
+    def test_alert_beep_enabled_empty_trigger_list_is_optional_disabled(self):
+        """r0053 review amendment: an intentional empty trigger list is
+        a valid configuration ('will never fire'), not an error --
+        checked BEFORE cart readiness, since cart state is moot if
+        nothing can ever trigger it."""
+        cart = FXCart.objects.create(name="Beep", filepath="/nonexistent/beep.wav")  # even a broken cart...
+        WeatherConfig.objects.create(
+            pk=1, voice_schedule=[["default", 0, 23]], alert_sound_enabled=True, alert_sound_cart=cart,
+            alert_sound_trigger_events=[],
+        )
+        WeatherVoicePersona.objects.create(slot="default")
+        snap = self.snapshot()
+        fact = snap.get("alert_fx_cart")
+        self.assertEqual(fact.state, "optional_disabled")  # ...never surfaces as needs_attention here
+        self.assertIn("will not fire", fact.summary)
+
+    def test_alert_beep_enabled_non_list_trigger_config_is_needs_attention(self):
+        cfg = WeatherConfig.objects.create(pk=1, voice_schedule=[["default", 0, 23]], alert_sound_enabled=True)
+        WeatherVoicePersona.objects.create(slot="default")
+        # Simulate malformed persisted JSON bypassing the Admin form's
+        # own guarantees -- diagnostics must still handle it safely.
+        WeatherConfig.objects.filter(pk=1).update(alert_sound_trigger_events="Tornado Warning")
+        snap = self.snapshot()
+        fact = snap.get("alert_fx_cart")
+        self.assertEqual(fact.state, "needs_attention")
+        self.assertIn("malformed", fact.summary.lower())
+
+    def test_alert_beep_enabled_list_with_non_string_entry_is_needs_attention(self):
+        cfg = WeatherConfig.objects.create(pk=1, voice_schedule=[["default", 0, 23]], alert_sound_enabled=True)
+        WeatherVoicePersona.objects.create(slot="default")
+        WeatherConfig.objects.filter(pk=1).update(alert_sound_trigger_events=["Tornado Warning", 123])
+        snap = self.snapshot()
+        self.assertEqual(snap.get("alert_fx_cart").state, "needs_attention")
+
+    def test_alert_beep_enabled_blank_string_only_list_is_needs_attention(self):
+        cfg = WeatherConfig.objects.create(pk=1, voice_schedule=[["default", 0, 23]], alert_sound_enabled=True)
+        WeatherVoicePersona.objects.create(slot="default")
+        WeatherConfig.objects.filter(pk=1).update(alert_sound_trigger_events=["", "   "])
+        snap = self.snapshot()
+        self.assertEqual(snap.get("alert_fx_cart").state, "needs_attention")
+
+    def test_alert_beep_valid_trigger_list_evidence_includes_count_and_events(self):
+        with tempfile.NamedTemporaryFile(suffix=".wav") as f:
+            cart = FXCart.objects.create(name="WXAlert Beeps", filepath=f.name)
+            WeatherConfig.objects.create(
+                pk=1, voice_schedule=[["default", 0, 23]], alert_sound_enabled=True, alert_sound_cart=cart,
+                alert_sound_trigger_events=["Tornado Warning", "Severe Thunderstorm Warning",
+                                            "Tornado Watch", "Severe Thunderstorm Watch"],
+            )
+            WeatherVoicePersona.objects.create(slot="default")
+            snap = self.snapshot()
+        fact = snap.get("alert_fx_cart")
+        self.assertEqual(fact.state, "ready")
+        self.assertEqual(fact.evidence["trigger_event_count"], 4)
+        self.assertEqual(len(fact.evidence["trigger_events"]), 4)
+        self.assertIn("4 trigger event type", fact.summary)
+        self.assertIn("WXAlert Beeps", fact.summary)
+
+    def test_generated_artifact_wx_alert_fact_is_not_mixed_with_alert_fx_cart(self):
+        """Keeps the two facts distinct per the r0053 review amendment:
+        alert_fx_cart is the repeating FX Cart beep; generated_artifact:
+        wx_alert is the spoken urgent-alert artifact. Neither's evidence
+        should leak the other's identity."""
+        with tempfile.NamedTemporaryFile(suffix=".wav") as f:
+            cart = FXCart.objects.create(name="WXAlert Beeps", filepath=f.name)
+            WeatherConfig.objects.create(
+                pk=1, voice_schedule=[["default", 0, 23]], alert_sound_enabled=True, alert_sound_cart=cart,
+            )
+            WeatherVoicePersona.objects.create(slot="default")
+            snap = self.snapshot()
+        cart_fact = snap.get("alert_fx_cart")
+        wx_alert_fact = snap.get("generated_artifact:wx_alert")
+        self.assertIsNotNone(wx_alert_fact)
+        self.assertNotEqual(cart_fact.key, wx_alert_fact.key)
+        self.assertNotIn("trigger_events", wx_alert_fact.evidence or {})
+
     def test_blank_notify_email_is_optional_disabled(self):
         WeatherConfig.load()
         snap = self.snapshot()
