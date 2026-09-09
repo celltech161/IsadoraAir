@@ -40,6 +40,7 @@ from isadoraair.runtime_validation import (
     _piper_smoke,
     _probe_runtime_packages,
     validate_current_runtime,
+    validate_fdkaac_capability,
 )
 from isadoraair.tts.errors import TTSRuntimeUnavailable
 
@@ -625,6 +626,80 @@ class FdkaacRuntimeValidatorTests(RuntimeValidatorFixture):
             self.fdkaac_args[0][1:],
             (self.fdkaac_binary, Path(self.manifest["components"]["fdkaac"]["runtime"]["library_root"])),
         )
+
+    def test_public_single_component_boundary_passes_and_preserves_reasons(self):
+        self.executable(self.fdkaac_binary)
+        reasons = ("streaming AAC output", "exact launch script invokes fdkaac")
+        component = validate_fdkaac_capability(
+            reasons=reasons,
+            validator=self.validator(),
+        )
+        self.assertEqual(component.status, STATUS_PASS)
+        self.assertEqual(component.reasons, reasons)
+        self.assertEqual(self.calls, {"kokoro": 0, "piper": 0, "fdkaac": 1})
+
+    def test_public_single_component_boundary_returns_fail_evidence(self):
+        self.executable(self.fdkaac_binary)
+
+        def fail(script, binary, library_root):
+            raise RuntimeValidationError("profile/linkage capability failed")
+
+        component = validate_fdkaac_capability(
+            reasons=("encoder preflight",),
+            validator=self.validator(self.seams(fdkaac=fail)),
+        )
+        self.assertEqual(component.status, STATUS_FAIL)
+        self.assertEqual(component.reasons, ("encoder preflight",))
+        self.assertIn("profile/linkage capability failed", component.diagnostics)
+        self.assertEqual(self.calls["kokoro"], 0)
+        self.assertEqual(self.calls["piper"], 0)
+
+    def test_public_single_component_boundary_invalid_contract_fails_closed(self):
+        missing = self.root / "missing-runtime-components.json"
+        component = validate_fdkaac_capability(
+            reasons=("encoder preflight",),
+            manifest_path=missing,
+        )
+        self.assertEqual(component.status, STATUS_FAIL)
+        self.assertTrue(component.required)
+        self.assertEqual(component.reasons, ("encoder preflight",))
+        self.assertEqual(
+            component.diagnostics,
+            ("runtime component contract is invalid",),
+        )
+
+    def test_full_validation_reuses_public_component_dispatch(self):
+        self.executable(self.fdkaac_binary)
+        requirements = self.requirements(fdkaac=True)
+        validator = self.validator()
+        with patch.object(
+            validator,
+            "validate_component",
+            wraps=validator.validate_component,
+        ) as validate_component:
+            evidence = validator.validate(requirements)
+        self.assertEqual(evidence.components["fdkaac"].status, STATUS_PASS)
+        self.assertEqual(validate_component.call_count, 3)
+        self.assertEqual(
+            {call.args[0].name for call in validate_component.call_args_list},
+            {"fdkaac", "kokoro", "piper"},
+        )
+
+    def test_public_dispatch_unexpected_validator_failure_is_safe(self):
+        self.executable(self.fdkaac_binary)
+
+        def fail(script, binary, library_root):
+            raise RuntimeError("password=do-not-leak")
+
+        component = validate_fdkaac_capability(
+            validator=self.validator(self.seams(fdkaac=fail)),
+        )
+        self.assertEqual(component.status, STATUS_FAIL)
+        self.assertEqual(
+            component.diagnostics,
+            ("unexpected validator failure: RuntimeError",),
+        )
+        self.assertNotIn("do-not-leak", str(component.to_dict()))
 
     def test_required_missing_binary_fails_without_running_host_validator(self):
         component = self.validator().validate(

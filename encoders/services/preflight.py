@@ -17,8 +17,13 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from isadoraair.runtime_validation import (
+    STATUS_PASS,
+    validate_fdkaac_capability,
+)
+
 from . import lkg
-from .encoder_manager import FDKAAC_PATH
+from .encoder_manager import script_requires_fdkaac
 
 # Bounded -- Phase 2E's own requirement. `--check` is a pure static
 # pass over a script that, at most, defines one ALSA source, a handful
@@ -30,6 +35,7 @@ from .encoder_manager import FDKAAC_PATH
 LIQUIDSOAP_CHECK_TIMEOUT_SECONDS = 20
 
 LIQUIDSOAP_BINARY = "liquidsoap"
+RUNTIME_CAPABILITY_FAILURE = "runtime_capability"
 
 
 @dataclass
@@ -42,30 +48,102 @@ class PreflightResult:
     ok: bool
     reason: str = ""
     detail: dict = field(default_factory=dict)
+    failure_kind: str | None = None
 
 
-def check_dependencies(encoders):
-    """Binary existence/executability + runtime-directory writability
+def _validate_fdkaac(reasons):
+    safe_reasons = tuple(reasons) or ("exact Liquidsoap script invokes fdkaac",)
+    evidence = validate_fdkaac_capability(reasons=safe_reasons)
+    if evidence.status == STATUS_PASS:
+        return PreflightResult(
+            ok=True,
+            reason="fdkaac runtime capability ok",
+            detail={
+                "component": "fdkaac",
+                "status": evidence.status,
+                "reasons": list(evidence.reasons),
+                "observed": evidence.observed,
+                "capabilities": list(evidence.capabilities),
+            },
+        )
+    return PreflightResult(
+        ok=False,
+        reason="fdkaac runtime capability validation failed",
+        failure_kind=RUNTIME_CAPABILITY_FAILURE,
+        detail={
+            "component": "fdkaac",
+            "status": evidence.status,
+            "reasons": list(evidence.reasons),
+            "observed": evidence.observed,
+            "capabilities": list(evidence.capabilities),
+            "diagnostics": list(evidence.diagnostics),
+        },
+    )
+
+
+def check_script_runtime_capabilities(script_text, *, reasons=()):
+    """Capability-gate the exact Liquidsoap script that may be launched.
+
+    Detection is delegated to encoder_manager's renderer-coupled parser;
+    Foundation E remains the sole authority for what constitutes working
+    fdkaac/libfdk-aac capability.
+    """
+    if not script_requires_fdkaac(script_text):
+        return PreflightResult(ok=True, reason="runtime capabilities not required")
+    return _validate_fdkaac(reasons)
+
+
+def check_dependencies(encoders, *, script_path=None, script_text=None):
+    """Liquidsoap + runtime capability + directory writability checks
     -- every check here is safe to run without competing for the live
     ALSA source. Returns PreflightResult.
 
-    encoders: the candidate's own encoder list, so the fdkaac check
-    only fires when the candidate actually configures AAC -- an
-    MP3-only candidate must not be rejected over a codec it doesn't use."""
+    When the exact rendered script is supplied, it is authoritative for
+    fdkaac requirement discovery (including Aircheck and persisted LKG
+    content). The encoder-list fallback preserves the public helper's
+    direct-call behavior for streaming AAC without consulting or creating
+    AircheckConfig."""
     problems = []
+    capability_detail = None
+    capability_failure_kind = None
+    ordinary_problem_count = 0
 
     liquidsoap_path = shutil.which(LIQUIDSOAP_BINARY)
     if liquidsoap_path is None:
         problems.append(f"{LIQUIDSOAP_BINARY!r} binary not found on PATH")
+        ordinary_problem_count += 1
     elif not _is_executable(liquidsoap_path):
         problems.append(f"{liquidsoap_path!r} exists but is not executable")
+        ordinary_problem_count += 1
 
-    needs_aac = any(e.format == "aac" for e in encoders)
-    if needs_aac:
-        if not Path(FDKAAC_PATH).is_file():
-            problems.append(f"AAC is configured but {FDKAAC_PATH!r} does not exist")
-        elif not _is_executable(FDKAAC_PATH):
-            problems.append(f"{FDKAAC_PATH!r} exists but is not executable")
+    if script_text is None and script_path is not None:
+        try:
+            script_text = Path(script_path).read_text(encoding="utf-8")
+        except OSError:
+            problems.append("rendered Liquidsoap script could not be read")
+            ordinary_problem_count += 1
+
+    streaming_aac = any(getattr(encoder, "format", None) == "aac" for encoder in encoders)
+    needs_fdkaac = (
+        script_requires_fdkaac(script_text)
+        if script_text is not None
+        else streaming_aac
+    )
+    if needs_fdkaac:
+        reasons = []
+        if streaming_aac:
+            reasons.append("streaming AAC output")
+        if script_text is not None:
+            reasons.append("exact rendered Liquidsoap script invokes fdkaac")
+        capability = (
+            check_script_runtime_capabilities(script_text, reasons=tuple(reasons))
+            if script_text is not None
+            else _validate_fdkaac(tuple(reasons))
+        )
+        capability_detail = capability.detail
+        if not capability.ok:
+            problems.append(capability.reason)
+            capability_failure_kind = capability.failure_kind
 
     for label, path in (
         ("candidate directory", lkg.CANDIDATE_DIR),
@@ -74,10 +152,31 @@ def check_dependencies(encoders):
         writable, reason = _dir_writable(path)
         if not writable:
             problems.append(f"{label} ({path}) is not writable: {reason}")
+            ordinary_problem_count += 1
 
     if problems:
-        return PreflightResult(ok=False, reason="; ".join(problems), detail={"problems": problems})
-    return PreflightResult(ok=True, reason="dependencies ok")
+        detail = {"problems": problems}
+        if capability_detail is not None:
+            detail["fdkaac"] = capability_detail
+        # A runtime-capability classification is transient only when it
+        # is the sole failed dependency.  If Liquidsoap or a required
+        # directory is also broken, preserve the existing ordinary
+        # preflight classification rather than masking that separate
+        # failure behind the fdkaac infrastructure result.
+        failure_kind = (
+            capability_failure_kind
+            if capability_failure_kind == RUNTIME_CAPABILITY_FAILURE
+            and ordinary_problem_count == 0
+            else None
+        )
+        return PreflightResult(
+            ok=False,
+            reason="; ".join(problems),
+            detail=detail,
+            failure_kind=failure_kind,
+        )
+    detail = {"fdkaac": capability_detail} if capability_detail is not None else {}
+    return PreflightResult(ok=True, reason="dependencies ok", detail=detail)
 
 
 def _is_executable(path_str):
@@ -165,7 +264,7 @@ def run_preflight(script_path, encoders):
     pass) the syntax check. Short-circuits on the first failure so a
     missing binary is reported plainly rather than also attempting
     (and failing differently on) the syntax check."""
-    dep_result = check_dependencies(encoders)
+    dep_result = check_dependencies(encoders, script_path=script_path)
     if not dep_result.ok:
         return dep_result
     return check_liquidsoap_syntax(script_path, encoders)

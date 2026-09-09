@@ -17,6 +17,12 @@ from django.test import SimpleTestCase
 
 from encoders.models import Encoder
 from encoders.services import preflight
+from encoders.services.encoder_manager import FDKAAC_PATH
+from isadoraair.runtime_validation import (
+    ComponentEvidence,
+    STATUS_FAIL,
+    STATUS_PASS,
+)
 
 
 def make_encoder(**overrides):
@@ -28,6 +34,28 @@ def make_encoder(**overrides):
     )
     defaults.update(overrides)
     return Encoder(**defaults)
+
+
+def fdkaac_evidence(status=STATUS_PASS, *, diagnostics=(), binary_present=True):
+    return ComponentEvidence(
+        required=True,
+        status=status,
+        reasons=("test preflight",),
+        observed={"binary_present": binary_present},
+        capabilities=(
+            {
+                "name": "lc_he_hev2_encode_and_decode",
+                "verified": status == STATUS_PASS,
+            },
+        ),
+        diagnostics=tuple(diagnostics),
+    )
+
+
+FDKAAC_SCRIPT = (
+    f'output = output.file(%external(process="{FDKAAC_PATH} -R --raw-channels 2 '
+    '--raw-rate 44100 -p 29 -o - -", header=false), "out.aac", source)'
+)
 
 
 # ---------------------------------------------------------------------
@@ -68,29 +96,152 @@ class CheckDependenciesTests(SimpleTestCase):
         self.assertIn("not executable", result.reason)
 
     def test_fdkaac_missing_with_aac_configured_fails(self):
-        with patch.object(preflight.shutil, "which", return_value="/usr/bin/liquidsoap"), \
-             patch.object(preflight, "_is_executable", side_effect=lambda p: p == "/usr/bin/liquidsoap"), \
-             patch.object(preflight.Path, "is_file", return_value=False):
+        with (
+            patch.object(preflight.shutil, "which", return_value="/usr/bin/liquidsoap"),
+            patch.object(preflight, "_is_executable", return_value=True),
+            patch.object(
+                preflight,
+                "validate_fdkaac_capability",
+                return_value=fdkaac_evidence(
+                    STATUS_FAIL,
+                    diagnostics=("canonical fdkaac binary is unavailable",),
+                    binary_present=False,
+                ),
+            ),
+        ):
             result = preflight.check_dependencies([make_encoder(format="aac")])
         self.assertFalse(result.ok)
-        self.assertIn("fdkaac", result.reason)
+        self.assertIn("capability validation failed", result.reason)
 
     def test_fdkaac_missing_with_mp3_only_config_does_not_fail(self):
         """The critical distinction: a codec check must only fire for
         a codec the CANDIDATE actually uses -- an MP3-only candidate
         must never be rejected over fdkaac."""
-        with patch.object(preflight.shutil, "which", return_value="/usr/bin/liquidsoap"), \
-             patch.object(preflight, "_is_executable", return_value=True), \
-             patch.object(preflight.Path, "is_file", return_value=False):
+        with (
+            patch.object(preflight.shutil, "which", return_value="/usr/bin/liquidsoap"),
+            patch.object(preflight, "_is_executable", return_value=True),
+            patch.object(preflight, "validate_fdkaac_capability") as capability,
+        ):
             result = preflight.check_dependencies([make_encoder(format="mp3")])
         self.assertTrue(result.ok)
+        capability.assert_not_called()
+
+    def test_vorbis_only_non_aircheck_group_does_not_validate_fdkaac(self):
+        with (
+            patch.object(preflight.shutil, "which", return_value="/usr/bin/liquidsoap"),
+            patch.object(preflight, "_is_executable", return_value=True),
+            patch.object(preflight, "validate_fdkaac_capability") as capability,
+        ):
+            result = preflight.check_dependencies([make_encoder(format="vorbis")])
+        self.assertTrue(result.ok)
+        capability.assert_not_called()
 
     def test_fdkaac_present_and_executable_with_aac_ok(self):
-        with patch.object(preflight.shutil, "which", return_value="/usr/bin/liquidsoap"), \
-             patch.object(preflight, "_is_executable", return_value=True), \
-             patch.object(preflight.Path, "is_file", return_value=True):
+        with (
+            patch.object(preflight.shutil, "which", return_value="/usr/bin/liquidsoap"),
+            patch.object(preflight, "_is_executable", return_value=True),
+            patch.object(
+                preflight,
+                "validate_fdkaac_capability",
+                return_value=fdkaac_evidence(),
+            ) as capability,
+        ):
             result = preflight.check_dependencies([make_encoder(format="aac")])
         self.assertTrue(result.ok)
+        capability.assert_called_once()
+
+    def test_exact_he_aac_aircheck_script_with_mp3_vorbis_streams_validates_fdkaac(self):
+        encoders = [make_encoder(format="mp3"), make_encoder(format="vorbis")]
+        with (
+            patch.object(preflight.shutil, "which", return_value="/usr/bin/liquidsoap"),
+            patch.object(preflight, "_is_executable", return_value=True),
+            patch.object(
+                preflight,
+                "validate_fdkaac_capability",
+                return_value=fdkaac_evidence(),
+            ) as capability,
+        ):
+            result = preflight.check_dependencies(
+                encoders,
+                script_text=FDKAAC_SCRIPT,
+            )
+        self.assertTrue(result.ok)
+        capability.assert_called_once()
+        self.assertIn(
+            "exact rendered Liquidsoap script invokes fdkaac",
+            capability.call_args.kwargs["reasons"],
+        )
+
+    def test_non_fdkaac_aircheck_formats_do_not_validate_fdkaac(self):
+        formats = {
+            "mp3": "%mp3(bitrate=320)",
+            "flac": "%flac",
+            "wav": "%wav",
+        }
+        for name, rendered_format in formats.items():
+            with (
+                self.subTest(format=name),
+                patch.object(preflight.shutil, "which", return_value="/usr/bin/liquidsoap"),
+                patch.object(preflight, "_is_executable", return_value=True),
+                patch.object(preflight, "validate_fdkaac_capability") as capability,
+            ):
+                result = preflight.check_dependencies(
+                    [make_encoder(format="mp3")],
+                    script_text=f"aircheck_output = output.file({rendered_format}, source)",
+                )
+            self.assertTrue(result.ok)
+            capability.assert_not_called()
+
+    def test_aac_stream_still_validates_with_non_he_aac_aircheck(self):
+        script = (
+            FDKAAC_SCRIPT
+            + '\naircheck_output = output.file(%flac, "out.flac", source)'
+        )
+        with (
+            patch.object(preflight.shutil, "which", return_value="/usr/bin/liquidsoap"),
+            patch.object(preflight, "_is_executable", return_value=True),
+            patch.object(
+                preflight,
+                "validate_fdkaac_capability",
+                return_value=fdkaac_evidence(),
+            ) as capability,
+        ):
+            result = preflight.check_dependencies(
+                [make_encoder(format="aac")],
+                script_text=script,
+            )
+        self.assertTrue(result.ok)
+        capability.assert_called_once()
+
+    def test_binary_present_but_profile_or_linkage_failure_rejects_preflight(self):
+        failed = fdkaac_evidence(
+            STATUS_FAIL,
+            diagnostics=("authoritative HE-AAC validator exited with status 1",),
+            binary_present=True,
+        )
+        with (
+            patch.object(preflight.shutil, "which", return_value="/usr/bin/liquidsoap"),
+            patch.object(preflight, "_is_executable", return_value=True),
+            patch.object(
+                preflight,
+                "validate_fdkaac_capability",
+                return_value=failed,
+            ),
+        ):
+            result = preflight.check_dependencies(
+                [make_encoder(format="mp3")],
+                script_text=FDKAAC_SCRIPT,
+            )
+        self.assertFalse(result.ok)
+        self.assertEqual(
+            result.failure_kind,
+            preflight.RUNTIME_CAPABILITY_FAILURE,
+        )
+        self.assertTrue(result.detail["fdkaac"]["observed"]["binary_present"])
+        self.assertFalse(
+            result.detail["fdkaac"]["capabilities"][0]["verified"]
+        )
+        self.assertNotIn("authoritative HE-AAC", result.reason)
 
     def test_candidate_directory_unwritable_fails(self):
         unwritable_root = Path(self._tmpdir.name) / "locked"
@@ -104,11 +255,22 @@ class CheckDependenciesTests(SimpleTestCase):
         self.assertIn("candidate directory", result.reason)
 
     def test_multiple_problems_all_listed(self):
-        with patch.object(preflight.shutil, "which", return_value=None), \
-             patch.object(preflight.Path, "is_file", return_value=False):
+        with (
+            patch.object(preflight.shutil, "which", return_value=None),
+            patch.object(
+                preflight,
+                "validate_fdkaac_capability",
+                return_value=fdkaac_evidence(
+                    STATUS_FAIL,
+                    diagnostics=("canonical fdkaac binary is unavailable",),
+                    binary_present=False,
+                ),
+            ),
+        ):
             result = preflight.check_dependencies([make_encoder(format="aac")])
         self.assertFalse(result.ok)
         self.assertGreaterEqual(len(result.detail["problems"]), 2)
+        self.assertIsNone(result.failure_kind)
 
 
 # ---------------------------------------------------------------------
@@ -213,6 +375,33 @@ class RunPreflightTests(SimpleTestCase):
             result = preflight.run_preflight("/tmp/x.liq", [make_encoder()])
         self.assertTrue(result.ok)
         mock_syntax_check.assert_called_once()
+
+    def test_fdkaac_capability_failure_short_circuits_before_liquidsoap_check(self):
+        with tempfile.TemporaryDirectory() as directory:
+            script_path = Path(directory) / "candidate.liq"
+            script_path.write_text(FDKAAC_SCRIPT, encoding="utf-8")
+            failed = fdkaac_evidence(
+                STATUS_FAIL,
+                diagnostics=("profile/linkage capability failed",),
+            )
+            with (
+                patch.object(preflight.shutil, "which", return_value="/usr/bin/liquidsoap"),
+                patch.object(preflight, "_is_executable", return_value=True),
+                patch.object(
+                    preflight,
+                    "validate_fdkaac_capability",
+                    return_value=failed,
+                ),
+                patch.object(
+                    preflight,
+                    "check_liquidsoap_syntax",
+                ) as syntax_check,
+                patch.object(preflight.lkg, "CANDIDATE_DIR", Path(directory)),
+                patch.object(preflight.lkg, "LKG_DIR", Path(directory)),
+            ):
+                result = preflight.run_preflight(script_path, [make_encoder()])
+        self.assertFalse(result.ok)
+        syntax_check.assert_not_called()
 
 
 # ---------------------------------------------------------------------

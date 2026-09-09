@@ -561,23 +561,42 @@ class RuntimeValidator:
             diagnostics=tuple(sorted(diagnostics)),
         )
 
-    def validate(self, requirements: RuntimeRequirements) -> RuntimeEvidence:
+    def validate_component(self, requirement: ComponentRequirement) -> ComponentEvidence:
+        """Validate one explicitly-required runtime component.
+
+        This is the public, read-only Foundation E boundary for callers
+        that need one capability without paying for unrelated TTS smoke
+        tests.  The full validate() path below deliberately delegates
+        through this method so component policy has one implementation.
+        Unexpected failures are reduced to typed, secret-free evidence.
+        """
         validators = {
             "fdkaac": self._validate_fdkaac,
             "kokoro": self._validate_kokoro,
             "piper": self._validate_piper,
         }
+        validator = validators.get(requirement.name)
+        if validator is None:
+            return ComponentEvidence(
+                required=requirement.required,
+                status=STATUS_FAIL,
+                reasons=requirement.reasons,
+                diagnostics=("unsupported runtime component",),
+            )
+        try:
+            return validator(requirement)
+        except Exception as exc:
+            return ComponentEvidence(
+                required=requirement.required,
+                status=STATUS_FAIL,
+                reasons=requirement.reasons,
+                diagnostics=(f"unexpected validator failure: {exc.__class__.__name__}",),
+            )
+
+    def validate(self, requirements: RuntimeRequirements) -> RuntimeEvidence:
         components: dict[str, ComponentEvidence] = {}
         for name in COMPONENT_NAMES:
-            try:
-                components[name] = validators[name](requirements.components[name])
-            except Exception as exc:  # one component must not suppress all evidence
-                components[name] = ComponentEvidence(
-                    required=requirements.components[name].required,
-                    status=STATUS_FAIL,
-                    reasons=requirements.components[name].reasons,
-                    diagnostics=(f"unexpected validator failure: {exc.__class__.__name__}",),
-                )
+            components[name] = self.validate_component(requirements.components[name])
         try:
             contract_hash = _sha256(self.manifest_path)
         except OSError as exc:
@@ -601,6 +620,43 @@ def _invalid_contract_evidence(manifest_path: Path) -> RuntimeEvidence:
         components={},
         contract_errors=("runtime component contract is invalid",),
     )
+
+
+def validate_fdkaac_capability(
+    *,
+    reasons: tuple[str, ...] = (),
+    validator: RuntimeValidator | None = None,
+    manifest_path: Path = MANIFEST_PATH,
+) -> ComponentEvidence:
+    """Validate only the canonical fdkaac capability, without repair.
+
+    A real required ComponentRequirement carries the caller's safe
+    reasons into evidence.  Contract-load and unexpected construction
+    failures fail closed without exposing exception text or invoking
+    Kokoro/Piper validation.
+    """
+    requirement = ComponentRequirement(
+        name="fdkaac",
+        required=True,
+        reasons=tuple(reasons),
+    )
+    try:
+        active_validator = validator or RuntimeValidator(manifest_path=manifest_path)
+    except RuntimeComponentContractError:
+        return ComponentEvidence(
+            required=True,
+            status=STATUS_FAIL,
+            reasons=requirement.reasons,
+            diagnostics=("runtime component contract is invalid",),
+        )
+    except Exception as exc:
+        return ComponentEvidence(
+            required=True,
+            status=STATUS_FAIL,
+            reasons=requirement.reasons,
+            diagnostics=(f"unexpected validator failure: {exc.__class__.__name__}",),
+        )
+    return active_validator.validate_component(requirement)
 
 
 def validate_current_runtime(

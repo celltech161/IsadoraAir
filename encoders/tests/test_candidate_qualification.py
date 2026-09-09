@@ -32,6 +32,11 @@ from monitoring.services import probes as probes_module
 # they're the actual rendered output of build_liquidsoap_script; these
 # hand-written placeholders need it added explicitly.
 FAKE_LKG_SCRIPT = 'generation = "fake-lkg-gen"\n# placeholder LKG script body for testing\n'
+FDKAAC_LKG_SCRIPT = (
+    'generation = "fake-lkg-gen"\n'
+    f'aircheck_format = %external(process="{em.FDKAAC_PATH} -R --raw-channels 2 '
+    '--raw-rate 44100 -p 29 -o - -", header=false)\n'
+)
 
 
 class CandidateFixtureMixin(EncoderManagerFixtureMixin):
@@ -91,6 +96,80 @@ class LaunchGroupDecisionTests(CandidateFixtureMixin, TransactionTestCase):
         self.assertTrue(ok)
         self.assertEqual(manager._launch_kind["airtap"], "accepted")
         mock_preflight.assert_not_called()
+
+    def test_matching_accepted_lkg_fdkaac_failure_blocks_before_popen(self):
+        from aircheck.models import AircheckConfig
+
+        AircheckConfig.objects.update_or_create(
+            pk=1,
+            defaults={"audio_format": "mp3", "bitrate": "320k"},
+        )
+        manager = em.EncoderManager()
+        encoders = [make_encoder(format="mp3")]
+        fingerprint = lkg_module.compute_fingerprint("airtap", encoders)
+        lkg_module.write_lkg(
+            em._slug("airtap"),
+            FDKAAC_LKG_SCRIPT,
+            {"fingerprint": fingerprint},
+        )
+        self.runtime_capability_mock.return_value = (
+            preflight_module.PreflightResult(
+                ok=False,
+                reason="fdkaac runtime capability validation failed",
+            )
+        )
+        with patch.object(em.subprocess, "Popen") as popen:
+            ok = manager._launch_group("airtap", encoders)
+        self.assertFalse(ok)
+        popen.assert_not_called()
+        checked_script = self.runtime_capability_mock.call_args.args[0]
+        self.assertTrue(em.script_requires_fdkaac(checked_script))
+
+    def test_matching_accepted_non_fdkaac_lkg_wins_over_current_he_aac_config(self):
+        from aircheck.models import AircheckConfig
+
+        AircheckConfig.objects.update_or_create(
+            pk=1,
+            defaults={"audio_format": "he_aac", "bitrate": "64k"},
+        )
+        manager = em.EncoderManager()
+        encoders = [make_encoder(format="mp3")]
+        fingerprint = lkg_module.compute_fingerprint("airtap", encoders)
+        lkg_module.write_lkg(
+            em._slug("airtap"),
+            FAKE_LKG_SCRIPT,
+            {"fingerprint": fingerprint},
+        )
+        ok = manager._launch_group("airtap", encoders)
+        self.assertTrue(ok)
+        checked_script = self.runtime_capability_mock.call_args.args[0]
+        self.assertFalse(em.script_requires_fdkaac(checked_script))
+
+    def test_rejected_candidate_fdkaac_lkg_fallback_is_gated_before_popen(self):
+        manager = em.EncoderManager()
+        encoders = [make_encoder(format="mp3")]
+        desired = lkg_module.compute_fingerprint("airtap", encoders)
+        manager._rejected_fingerprints["airtap"] = {desired}
+        lkg_module.write_lkg(
+            em._slug("airtap"),
+            FDKAAC_LKG_SCRIPT,
+            {"fingerprint": "accepted-fingerprint"},
+        )
+        self.runtime_capability_mock.return_value = (
+            preflight_module.PreflightResult(
+                ok=False,
+                reason="fdkaac runtime capability validation failed",
+            )
+        )
+        with patch.object(em.subprocess, "Popen") as popen:
+            ok = manager._launch_group("airtap", encoders)
+        self.assertFalse(ok)
+        popen.assert_not_called()
+        self.assertTrue(
+            em.script_requires_fdkaac(
+                self.runtime_capability_mock.call_args.args[0]
+            )
+        )
 
     def test_mismatched_lkg_fingerprint_goes_through_candidate_pipeline(self):
         manager = em.EncoderManager()
@@ -527,6 +606,34 @@ class RollbackTests(CandidateFixtureMixin, TransactionTestCase):
 
         self.assertEqual(manager._launch_kind["airtap"], "rollback")
         self.assertIn("airtap", manager._current)  # a NEW generation is now running
+
+    def test_fdkaac_rollback_capability_failure_blocks_before_popen(self):
+        manager = em.EncoderManager()
+        encoders = [make_encoder(name="failed-candidate")]
+        lkg_module.write_lkg(
+            em._slug("airtap"),
+            FDKAAC_LKG_SCRIPT,
+            {"fingerprint": "accepted-fingerprint"},
+        )
+        self.runtime_capability_mock.return_value = (
+            preflight_module.PreflightResult(
+                ok=False,
+                reason="fdkaac runtime capability validation failed",
+            )
+        )
+        with patch.object(em.subprocess, "Popen") as popen:
+            manager._start_rollback(
+                "airtap",
+                encoders,
+                "candidate qualification failed",
+            )
+        popen.assert_not_called()
+        self.assertTrue(manager._critical_stopped["airtap"])
+        self.assertTrue(
+            em.script_requires_fdkaac(
+                self.runtime_capability_mock.call_args.args[0]
+            )
+        )
 
     def test_rollback_launches_a_fresh_generation_not_the_old_one(self):
         manager = em.EncoderManager()

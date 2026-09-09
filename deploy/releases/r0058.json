@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "release_id": "r0058",
+  "previous_release_id": "r0057",
+  "minimum_updater_protocol_version": 5,
+  "summary": "Closes P1 2.2's HE-AAC preflight gap with Foundation E's authoritative fdkaac capability validator. Every exact Liquidsoap script is structurally inspected and gated before candidate, accepted-LKG, fallback-LKG, or rollback launch; MP3/Vorbis groups remain ungated unless their Aircheck output uses HE-AAC. No migration, dependency, runtime-component, updater, recovery, installer, systemd-unit, or production change.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-encoders"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0007"
+}

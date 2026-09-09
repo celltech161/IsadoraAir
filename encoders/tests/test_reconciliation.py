@@ -46,6 +46,15 @@ def make_saved_encoder(name="test-mp3", **overrides):
     return Encoder.objects.create(**defaults)
 
 
+def runtime_capability_failure():
+    return preflight_module.PreflightResult(
+        ok=False,
+        reason="fdkaac runtime capability validation failed",
+        detail={"fdkaac": {"component": "fdkaac", "status": "FAIL"}},
+        failure_kind=preflight_module.RUNTIME_CAPABILITY_FAILURE,
+    )
+
+
 class ReconciliationFixtureMixin(CandidateFixtureMixin):
     """On top of CandidateFixtureMixin's own patches: a default mock
     for evaluate_encoder_group_health covering the ENTIRE test body,
@@ -265,6 +274,203 @@ class StaticPreflightFailureLeavesRunningGroupUntouchedTests(ReconciliationFixtu
 
         state = self.read_group_state("airtap")
         self.assertEqual(state["last_reconcile_result"], "static_preflight_rejected")
+        desired_fp = lkg_module.compute_fingerprint("airtap", [encoder])
+        self.assertIn(desired_fp, manager._rejected_fingerprints["airtap"])
+
+
+class RuntimeCapabilityRetryTests(ReconciliationFixtureMixin, TransactionTestCase):
+    def _changed_aac_group(self):
+        from aircheck.models import AircheckConfig
+
+        AircheckConfig.objects.update_or_create(
+            pk=1,
+            defaults={"audio_format": "mp3", "bitrate": "320k"},
+        )
+        manager = em.EncoderManager()
+        encoder = make_saved_encoder()
+        pid, generation = self.bootstrap_accepted(manager, "airtap", encoder)
+        encoder.format = "aac"
+        encoder.bitrate_kbps = 64
+        encoder.save()
+        fingerprint = lkg_module.compute_fingerprint("airtap", [encoder])
+        return manager, encoder, fingerprint, pid, generation
+
+    def test_failure_keeps_healthy_lkg_and_records_nonsticky_retry(self):
+        manager, encoder, fingerprint, pid, generation = self._changed_aac_group()
+        proc = self._live_procs[pid]
+        calls_before = self.popen_call_count()
+
+        with patch.object(
+            preflight_module, "run_preflight",
+            return_value=runtime_capability_failure(),
+        ):
+            manager._reconcile_changed_group("airtap", [encoder], fingerprint)
+
+        proc.terminate.assert_not_called()
+        self.assertEqual(self.popen_call_count(), calls_before)
+        self.assertEqual(manager._current["airtap"]["generation"], generation)
+        self.assertNotIn(fingerprint, manager._rejected_fingerprints.get("airtap", set()))
+        self.assertEqual(
+            manager._runtime_capability_retries["airtap"]["fingerprint"],
+            fingerprint,
+        )
+        self.assertNotIn("airtap", manager._retry_at)
+        state = self.read_group_state("airtap")
+        self.assertEqual(state["reconcile_status"], "runtime_capability_blocked")
+        self.assertEqual(state["last_reconcile_result"], "runtime_capability_blocked")
+        self.assertIsNotNone(state["next_runtime_capability_probe_at"])
+
+    def test_immediate_tick_does_not_reprobe_or_touch_live_child(self):
+        manager, encoder, fingerprint, pid, generation = self._changed_aac_group()
+        proc = self._live_procs[pid]
+        calls_before = self.popen_call_count()
+
+        with patch.object(
+            preflight_module, "run_preflight",
+            return_value=runtime_capability_failure(),
+        ) as probe:
+            manager._reconcile_changed_group("airtap", [encoder], fingerprint)
+            manager._reconcile_changed_group("airtap", [encoder], fingerprint)
+
+        probe.assert_called_once()
+        proc.terminate.assert_not_called()
+        self.assertEqual(self.popen_call_count(), calls_before)
+        self.assertEqual(manager._current["airtap"]["generation"], generation)
+
+    def test_same_fingerprint_retries_after_deadline_and_launches_candidate(self):
+        manager, encoder, fingerprint, pid, _generation = self._changed_aac_group()
+        proc = self._live_procs[pid]
+        with patch.object(
+            preflight_module, "run_preflight",
+            return_value=runtime_capability_failure(),
+        ):
+            manager._reconcile_changed_group("airtap", [encoder], fingerprint)
+
+        manager._runtime_capability_retries["airtap"]["next_probe_at"] = 0
+        with patch.object(
+            preflight_module, "run_preflight",
+            return_value=preflight_module.PreflightResult(ok=True),
+        ) as recovered_probe:
+            manager._reconcile_changed_group("airtap", [encoder], fingerprint)
+
+        recovered_probe.assert_called_once()
+        proc.terminate.assert_called_once()
+        self.assertEqual(manager._launch_kind["airtap"], "candidate")
+        self.assertEqual(manager._running_fingerprint["airtap"], fingerprint)
+        self.assertNotIn("airtap", manager._runtime_capability_retries)
+
+    def test_repeated_failures_use_capped_backoff_without_hot_loop(self):
+        manager, encoder, fingerprint, pid, _generation = self._changed_aac_group()
+        proc = self._live_procs[pid]
+
+        with (
+            patch.object(em, "RETRY_BACKOFF_SECONDS", [5, 10]),
+            patch.object(em.time, "monotonic", return_value=100.0) as monotonic,
+            patch.object(
+                preflight_module, "run_preflight",
+                return_value=runtime_capability_failure(),
+            ) as probe,
+        ):
+            manager._reconcile_changed_group("airtap", [encoder], fingerprint)
+            self.assertEqual(manager._runtime_capability_retries["airtap"]["next_probe_at"], 105.0)
+            manager._reconcile_changed_group("airtap", [encoder], fingerprint)
+            monotonic.return_value = 105.0
+            manager._reconcile_changed_group("airtap", [encoder], fingerprint)
+            self.assertEqual(manager._runtime_capability_retries["airtap"]["next_probe_at"], 115.0)
+            manager._reconcile_changed_group("airtap", [encoder], fingerprint)
+            monotonic.return_value = 115.0
+            manager._reconcile_changed_group("airtap", [encoder], fingerprint)
+            self.assertEqual(manager._runtime_capability_retries["airtap"]["next_probe_at"], 125.0)
+
+        self.assertEqual(probe.call_count, 3)
+        self.assertEqual(manager._runtime_capability_retries["airtap"]["retry_index"], 1)
+        proc.terminate.assert_not_called()
+
+    def test_changed_fingerprint_discards_old_block_and_evaluates_immediately(self):
+        manager, encoder, old_fingerprint, pid, _generation = self._changed_aac_group()
+        with patch.object(
+            preflight_module, "run_preflight",
+            return_value=runtime_capability_failure(),
+        ):
+            manager._reconcile_changed_group("airtap", [encoder], old_fingerprint)
+
+        encoder.bitrate_kbps = 96
+        encoder.save()
+        new_fingerprint = lkg_module.compute_fingerprint("airtap", [encoder])
+        self.assertNotEqual(new_fingerprint, old_fingerprint)
+        with patch.object(
+            preflight_module, "run_preflight",
+            return_value=preflight_module.PreflightResult(ok=True),
+        ) as new_probe:
+            manager._reconcile_changed_group("airtap", [encoder], new_fingerprint)
+
+        new_probe.assert_called_once()
+        self._live_procs[pid].terminate.assert_called_once()
+        self.assertEqual(manager._running_fingerprint["airtap"], new_fingerprint)
+        self.assertNotIn("airtap", manager._runtime_capability_retries)
+
+    def test_cold_start_falls_back_to_non_fdkaac_lkg_then_same_desired_recovers(self):
+        manager = em.EncoderManager()
+        desired = make_saved_encoder(format="aac", bitrate_kbps=64)
+        fingerprint = lkg_module.compute_fingerprint("airtap", [desired])
+        lkg_module.write_lkg(
+            em._slug("airtap"),
+            'generation = "old"\n# non-fdkaac LKG\n',
+            {"fingerprint": "accepted-fingerprint", "destinations": []},
+        )
+
+        with patch.object(
+            preflight_module, "run_preflight",
+            return_value=runtime_capability_failure(),
+        ):
+            self.assertTrue(manager._launch_group("airtap", [desired]))
+
+        self.assertEqual(manager._launch_kind["airtap"], "accepted")
+        self.assertEqual(manager._running_fingerprint["airtap"], "accepted-fingerprint")
+        self.assertNotIn(fingerprint, manager._rejected_fingerprints.get("airtap", set()))
+        self.assertIn("airtap", manager._runtime_capability_retries)
+
+        manager._runtime_capability_retries["airtap"]["next_probe_at"] = 0
+        with patch.object(
+            preflight_module, "run_preflight",
+            return_value=preflight_module.PreflightResult(ok=True),
+        ):
+            manager._reconcile_changed_group("airtap", [desired], fingerprint)
+        self.assertEqual(manager._launch_kind["airtap"], "candidate")
+        self.assertNotIn("airtap", manager._runtime_capability_retries)
+
+    def test_group_removal_clears_runtime_capability_retry(self):
+        manager, encoder, fingerprint, _pid, _generation = self._changed_aac_group()
+        with patch.object(
+            preflight_module, "run_preflight",
+            return_value=runtime_capability_failure(),
+        ):
+            manager._reconcile_changed_group("airtap", [encoder], fingerprint)
+        self.assertIn("airtap", manager._runtime_capability_retries)
+
+        self.assertTrue(manager._remove_group_intentionally("airtap"))
+        self.assertNotIn("airtap", manager._runtime_capability_retries)
+
+    def test_exact_launch_capability_disappearance_blocks_candidate_and_rolls_back(self):
+        manager, encoder, fingerprint, pid, _generation = self._changed_aac_group()
+        calls_before = self.popen_call_count()
+
+        def exact_launch_gate(script, **_kwargs):
+            if em.script_requires_fdkaac(script):
+                return runtime_capability_failure()
+            return preflight_module.PreflightResult(ok=True)
+
+        self.runtime_capability_mock.side_effect = exact_launch_gate
+        with patch.object(
+            preflight_module, "run_preflight",
+            return_value=preflight_module.PreflightResult(ok=True),
+        ):
+            manager._reconcile_changed_group("airtap", [encoder], fingerprint)
+
+        self._live_procs[pid].terminate.assert_called_once()
+        self.assertEqual(self.popen_call_count(), calls_before + 1)
+        self.assertEqual(manager._launch_kind["airtap"], "rollback")
+        self.assertNotIn(fingerprint, manager._rejected_fingerprints.get("airtap", set()))
 
 
 # ---------------------------------------------------------------------

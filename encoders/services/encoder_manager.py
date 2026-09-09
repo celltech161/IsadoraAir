@@ -217,6 +217,28 @@ def _liq_string(value):
 
 
 _GENERATION_LINE_PATTERN = re.compile(r'^generation = "[^"]*"$', re.MULTILINE)
+_FDKAAC_EXTERNAL_PROCESS_PATTERN = re.compile(
+    rf'%external\(\s*process="{re.escape(FDKAAC_PATH)}(?=[\s"])(?:\\.|[^"\\])*",'
+    r'\s*header=false\s*\)'
+)
+
+
+def script_requires_fdkaac(script_text):
+    """True only for a rendered %external process invoking canonical fdkaac.
+
+    A plain occurrence of the path/name (including encoder metadata or
+    comments) is not enough.  This deliberately recognizes the exact
+    one-line shape emitted by _format_block/_aircheck_format_block and
+    therefore remains backward-compatible with persisted pre-r0058 LKG
+    scripts without adding mutable sidecar metadata.
+    """
+    if not isinstance(script_text, str):
+        return False
+    return any(
+        _FDKAAC_EXTERNAL_PROCESS_PATTERN.search(line)
+        for line in script_text.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    )
 
 
 def _substitute_generation(script_text, new_generation):
@@ -1147,12 +1169,21 @@ class EncoderManager:
         self._qualify_deadline = {}
         # input_device -> set of fingerprints (encoders.services.lkg.
         # compute_fingerprint) that have already failed candidate
-        # qualification (validation, preflight, OR live) and must not
+        # qualification (validation, configuration/static preflight, OR
+        # live) and must not
         # be silently auto-retried -- Phase 2K's "keep the rejected
         # configuration from being automatically retried forever."
         # Cleared for a slug only when a DIFFERENT fingerprint is next
         # attempted (a distinct admin edit is allowed a fresh try).
         self._rejected_fingerprints = {}
+        # input_device -> transient Foundation E fdkaac capability
+        # retry state for one exact desired fingerprint.  This is
+        # intentionally separate from both _rejected_fingerprints
+        # (configuration failures are sticky) and _retry_at (which may
+        # launch when no child is live).  While an LKG remains on-air,
+        # this state only throttles reconciliation's static capability
+        # re-probe and can never dispatch a second process by itself.
+        self._runtime_capability_retries = {}
         # input_device -> True once BOTH a candidate AND its rollback
         # have failed -- Phase 2K's "do not endlessly bounce
         # candidate -> LKG -> candidate -> LKG." While True, _launch_
@@ -1398,6 +1429,12 @@ class EncoderManager:
             "next_retry_at": next_retry_at,
             "launch_kind": self._launch_kind.get(input_device, "accepted"),
             "critical_stopped": bool(self._critical_stopped.get(input_device)),
+            "runtime_capability_blocked_fingerprint": (
+                self._runtime_capability_retries.get(input_device, {}).get("fingerprint")
+            ),
+            "next_runtime_capability_probe_at": (
+                self._runtime_capability_retries.get(input_device, {}).get("next_probe_wall_at")
+            ),
             # Phase 3B: desired/running/accepted, non-secret (fingerprints
             # are one-way hashes; see lkg.compute_fingerprint) -- the
             # channel a SEPARATE process (admin, monitoring) reads to
@@ -1447,7 +1484,75 @@ class EncoderManager:
             return "in_sync"
         if desired in self._rejected_fingerprints.get(input_device, set()):
             return "rejected"
+        capability_retry = self._runtime_capability_retries.get(input_device)
+        if capability_retry and capability_retry.get("fingerprint") == desired:
+            return "runtime_capability_blocked"
         return "reconcile_pending"
+
+    def _clear_runtime_capability_retry(self, input_device, fingerprint=None):
+        """Drop a transient fdkaac block, optionally only for one fp."""
+        current = self._runtime_capability_retries.get(input_device)
+        if current is None:
+            return False
+        if fingerprint is not None and current.get("fingerprint") != fingerprint:
+            return False
+        self._runtime_capability_retries.pop(input_device, None)
+        return True
+
+    def _reset_runtime_capability_retry_for_new_fingerprint(self, input_device, fingerprint):
+        current = self._runtime_capability_retries.get(input_device)
+        if current is not None and current.get("fingerprint") != fingerprint:
+            self._runtime_capability_retries.pop(input_device, None)
+
+    def _runtime_capability_probe_deferred(self, input_device, fingerprint):
+        self._reset_runtime_capability_retry_for_new_fingerprint(input_device, fingerprint)
+        current = self._runtime_capability_retries.get(input_device)
+        return bool(
+            current
+            and current.get("fingerprint") == fingerprint
+            and time.monotonic() < current.get("next_probe_at", 0)
+        )
+
+    def _record_runtime_capability_failure(self, input_device, encoders, fingerprint, reason, detail=None):
+        """Record a transient, bounded fdkaac capability re-probe.
+
+        This deliberately does not touch _rejected_fingerprints.  A
+        repaired runtime must make the same unchanged desired
+        configuration eligible again without an admin edit or service
+        restart.
+        """
+        current = self._runtime_capability_retries.get(input_device)
+        index = current.get("retry_index", 0) if current and current.get("fingerprint") == fingerprint else 0
+        capped_index = min(index, len(RETRY_BACKOFF_SECONDS) - 1)
+        delay = RETRY_BACKOFF_SECONDS[capped_index]
+        next_probe_wall_at = time.time() + delay
+        self._runtime_capability_retries[input_device] = {
+            "fingerprint": fingerprint,
+            "retry_index": min(capped_index + 1, len(RETRY_BACKOFF_SECONDS) - 1),
+            "next_probe_at": time.monotonic() + delay,
+            "next_probe_wall_at": next_probe_wall_at,
+        }
+        self._log(
+            input_device,
+            f"Candidate runtime capability unavailable: {reason}; retrying in {delay}s.",
+            force=True,
+        )
+        emit_event(
+            category="encoder", level="error",
+            title=f"Encoder group '{input_device}' candidate runtime capability unavailable",
+            detail={
+                "input_device": input_device,
+                "fingerprint": fingerprint,
+                "reason": reason,
+                "encoder_names": [e.name for e in encoders],
+                "retry_delay_seconds": delay,
+                "next_runtime_capability_probe_at": next_probe_wall_at,
+                **(detail or {}),
+            },
+            dedupe_key=f"encoder|candidate-runtime-capability-failed|{input_device}|{fingerprint}",
+        )
+        self._write_group_state(input_device)
+        return delay
 
     def _schedule_retry(self, input_device):
         """Advance (never reset except by _check_health's stabilization
@@ -1525,6 +1630,27 @@ class EncoderManager:
             # goes to air -- that's the DEFAULT_INPUT_DEVICE tap.
             host_aircheck = input_device == DEFAULT_INPUT_DEVICE
             script = build_liquidsoap_script(input_device, encoders, host_aircheck=host_aircheck, generation=generation)
+
+        # r0058: the exact script about to be launched is authoritative.
+        # This choke point covers newly-rendered candidates, accepted
+        # persisted LKGs, rejected-candidate fallback, live rollback, and
+        # reconciliation.  The static candidate pipeline also performs
+        # this gate before a healthy child can be stopped; repeating it
+        # here closes the dependency-disappeared-after-preflight race.
+        from . import preflight as preflight_module
+
+        capability = preflight_module.check_script_runtime_capabilities(
+            script,
+            reasons=(f"encoder group '{input_device}' exact launch script invokes fdkaac",),
+        )
+        if not capability.ok:
+            return self._record_launch_failure(
+                input_device,
+                meta,
+                RuntimeError(capability.reason),
+                "runtime capability preflight failed",
+            )
+
         script_path = SCRIPT_DIR / f"encoders_{_slug(input_device)}.liq"
         try:
             script_path.write_text(script, encoding="utf-8")
@@ -1814,11 +1940,13 @@ class EncoderManager:
              opening the live ALSA device), and only then launch on
              probation for live qualification."""
         from . import lkg as lkg_module
+        from . import preflight as preflight_module
 
         close_old_connections()
         slug = _slug(input_device)
         desired_fp = lkg_module.compute_fingerprint(input_device, encoders)
         self._desired_fingerprint[input_device] = desired_fp
+        self._reset_runtime_capability_retry_for_new_fingerprint(input_device, desired_fp)
         try:
             lkg_script, lkg_meta = lkg_module.read_lkg(slug)
         except OSError as exc:
@@ -1847,7 +1975,10 @@ class EncoderManager:
         if lkg_script is not None and desired_fp == lkg_fp:
             self._launch_kind[input_device] = "accepted"
             self._clear_qualification_tracking(input_device)
-            ok = self._start_group(input_device, encoders)
+            # Launch the exact already-qualified script, not a fresh
+            # rendering that may differ in Aircheck format/bitrate even
+            # though those fields are not yet in the encoder fingerprint.
+            ok = self._start_group(input_device, encoders, script_override=lkg_script)
             if ok:
                 self._running_fingerprint[input_device] = desired_fp
             return ok
@@ -1881,9 +2012,19 @@ class EncoderManager:
         # critical-stopped from an earlier, unrelated incident.
         ok, candidate_script, failure_kind, reason, detail = self._static_check_candidate(input_device, encoders)
         if not ok:
-            self._reject_prelaunch_candidate(input_device, encoders, desired_fp, failure_kind, reason, detail=detail)
+            if failure_kind == preflight_module.RUNTIME_CAPABILITY_FAILURE:
+                self._record_runtime_capability_failure(
+                    input_device, encoders, desired_fp, reason, detail=detail,
+                )
+            else:
+                self._reject_prelaunch_candidate(
+                    input_device, encoders, desired_fp, failure_kind, reason, detail=detail,
+                )
             return self._fallback_after_rejected_prelaunch_candidate(input_device, encoders, lkg_script, lkg_meta)
 
+        # Foundation E passed for this exact desired fingerprint. Any
+        # later collision/launch failure is a separate lifecycle state.
+        self._clear_runtime_capability_retry(input_device, desired_fp)
         if self._cross_group_collision_blocked(input_device, encoders, desired_fp):
             # Deliberately NOT added to _rejected_fingerprints -- see
             # _cross_group_collision_blocked's own comment: re-evaluated
@@ -1897,6 +2038,7 @@ class EncoderManager:
         # after the fact -- Phase 3E).
         ok = self._start_group(input_device, encoders, script_override=candidate_script)
         if ok:
+            self._clear_runtime_capability_retry(input_device, desired_fp)
             self._launch_kind[input_device] = "candidate"
             self._candidate_fingerprint[input_device] = desired_fp
             self._candidate_encoders[input_device] = encoders
@@ -1942,8 +2084,9 @@ class EncoderManager:
 
         Returns (ok, candidate_script_or_None, failure_kind_or_None,
         reason_or_None, detail_dict). `failure_kind` is "validation" or
-        "preflight", matching _reject_prelaunch_candidate's own
-        vocabulary. `candidate_script` is the EXACT text that passed --
+        "preflight" for sticky configuration/static failures, or the
+        typed "runtime_capability" category for transient Foundation E
+        fdkaac failure. `candidate_script` is the EXACT text that passed --
         a caller that goes on to launch it must launch this exact
         string (via _start_group's script_override), never re-render,
         so the configuration that was checked is provably the
@@ -1973,7 +2116,12 @@ class EncoderManager:
             lkg_module.cleanup_candidate(candidate_path)
 
         if not result.ok:
-            return False, None, "preflight", result.reason, result.detail
+            failure_kind = (
+                preflight_module.RUNTIME_CAPABILITY_FAILURE
+                if result.failure_kind == preflight_module.RUNTIME_CAPABILITY_FAILURE
+                else "preflight"
+            )
+            return False, None, failure_kind, result.reason, result.detail
         return True, script, None, None, {}
 
     def _reject_prelaunch_candidate(self, input_device, encoders, fingerprint, failure_kind, reason, detail=None):
@@ -2300,6 +2448,7 @@ class EncoderManager:
             )
             return
         self._rejected_fingerprints.pop(input_device, None)
+        self._clear_runtime_capability_retry(input_device, fingerprint)
         self._critical_stopped.pop(input_device, None)
         self._launch_kind[input_device] = "accepted"
         self._accepted_fingerprint[input_device] = fingerprint
@@ -2737,6 +2886,7 @@ class EncoderManager:
         self._launch_kind.pop(input_device, None)
         self._critical_stopped.pop(input_device, None)
         self._rejected_fingerprints.pop(input_device, None)
+        self._runtime_capability_retries.pop(input_device, None)
         self._candidate_fingerprint.pop(input_device, None)
         self._candidate_encoders.pop(input_device, None)
         self._running_fingerprint.pop(input_device, None)
@@ -2770,6 +2920,10 @@ class EncoderManager:
         script_override, same discipline _launch_group's own candidate
         pipeline now follows), handing off to the unmodified Phase 2
         qualification/promotion/rollback machinery from there."""
+        from . import preflight as preflight_module
+
+        self._desired_fingerprint[input_device] = desired_fp
+        self._reset_runtime_capability_retry_for_new_fingerprint(input_device, desired_fp)
         rejected = self._rejected_fingerprints.get(input_device, set())
         if desired_fp in rejected:
             # Known-bad -- do nothing. Unlike _launch_group's bootstrap
@@ -2778,15 +2932,30 @@ class EncoderManager:
             # configuration, which simply stays as-is.
             return
 
+        if self._runtime_capability_probe_deferred(input_device, desired_fp):
+            # The current healthy/LKG child remains untouched. This
+            # only throttles the expensive Foundation E probe; it does
+            # not enter _retry_at or dispatch a process itself.
+            return
+
         if self._cross_group_collision_blocked(input_device, desired_encoders, desired_fp):
             return  # re-evaluated fresh next tick -- not sticky (see _cross_group_collision_blocked)
 
         ok, candidate_script, failure_kind, reason, detail = self._static_check_candidate(input_device, desired_encoders)
         if not ok:
-            self._reject_prelaunch_candidate(input_device, desired_encoders, desired_fp, failure_kind, reason, detail=detail)
-            self._record_reconcile_outcome(input_device, f"static_{failure_kind}_rejected", reason)
+            if failure_kind == preflight_module.RUNTIME_CAPABILITY_FAILURE:
+                self._record_runtime_capability_failure(
+                    input_device, desired_encoders, desired_fp, reason, detail=detail,
+                )
+                self._record_reconcile_outcome(input_device, "runtime_capability_blocked", reason)
+            else:
+                self._reject_prelaunch_candidate(
+                    input_device, desired_encoders, desired_fp, failure_kind, reason, detail=detail,
+                )
+                self._record_reconcile_outcome(input_device, f"static_{failure_kind}_rejected", reason)
             return
 
+        self._clear_runtime_capability_retry(input_device, desired_fp)
         self._record_reconcile_outcome(input_device, "replacement_started")
         if not self._stop_group_intentionally(input_device, reason=f"replacing with newly-preflighted configuration (fingerprint {desired_fp[:12]})"):
             # Phase 3F: could not confirm the old process is gone --
@@ -2819,6 +2988,7 @@ class EncoderManager:
             self._start_rollback(input_device, desired_encoders, "failed to launch replacement candidate immediately after intentional stop during reconciliation")
             return
 
+        self._clear_runtime_capability_retry(input_device, desired_fp)
         self._launch_kind[input_device] = "candidate"
         self._candidate_fingerprint[input_device] = desired_fp
         self._candidate_encoders[input_device] = desired_encoders
@@ -2876,6 +3046,7 @@ class EncoderManager:
         known_devices = (
             set(self._procs) | set(self._retry_at) | set(self._meta)
             | set(self._current) | set(self._launch_kind)
+            | set(self._runtime_capability_retries)
         )
 
         # Phase 3C "removed" -- instant and safe regardless of any
@@ -2886,6 +3057,7 @@ class EncoderManager:
         known_devices = (
             set(self._procs) | set(self._retry_at) | set(self._meta)
             | set(self._current) | set(self._launch_kind)
+            | set(self._runtime_capability_retries)
         )
 
         # Phase 3K: at most one topology REPLACEMENT in flight at a
@@ -2928,6 +3100,7 @@ class EncoderManager:
         for input_device, encoders in desired_groups.items():
             desired_fp = lkg_module.compute_fingerprint(input_device, encoders)
             self._desired_fingerprint[input_device] = desired_fp
+            self._reset_runtime_capability_retry_for_new_fingerprint(input_device, desired_fp)
             if input_device in desired_conflicts:
                 # Ambiguous desired topology -- neither side may be
                 # dispatched until the operator resolves it (Issue 2).
@@ -2969,6 +3142,11 @@ class EncoderManager:
                 if cached and not all(getattr(e, "protocol", None) is not None for e in cached):
                     self._running_encoders[input_device] = encoders
                 continue  # Phase 3C "unchanged" -- do absolutely nothing
+            if self._runtime_capability_probe_deferred(input_device, desired_fp):
+                # Do not let a deferred capability probe consume this
+                # tick's single transition slot; another unrelated
+                # changed group remains eligible to reconcile.
+                continue
             candidates.append(("changed", input_device, encoders, desired_fp))
 
         if not candidates or transitioning:

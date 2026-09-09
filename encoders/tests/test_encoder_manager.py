@@ -96,6 +96,72 @@ class BuildLiquidsoapScriptTests(TestCase):
         self.assertNotIn("settings.server.telnet.set(true)", without_aircheck)
         self.assertNotIn("aircheck_output = output.file(", without_aircheck)
 
+    def test_exact_script_detector_recognizes_he_aac_aircheck_with_mp3_stream(self):
+        from aircheck.models import AircheckConfig
+
+        AircheckConfig.objects.update_or_create(
+            pk=1,
+            defaults={"audio_format": "he_aac", "bitrate": "64k"},
+        )
+        script = em.build_liquidsoap_script(
+            "airtap",
+            [make_encoder(format="mp3")],
+            host_aircheck=True,
+            generation="g",
+        )
+        self.assertTrue(em.script_requires_fdkaac(script))
+
+    def test_exact_script_detector_skips_mp3_flac_and_wav_aircheck(self):
+        from aircheck.models import AircheckConfig
+
+        for audio_format in ("mp3", "flac", "wav"):
+            with self.subTest(audio_format=audio_format):
+                AircheckConfig.objects.update_or_create(
+                    pk=1,
+                    defaults={"audio_format": audio_format, "bitrate": "320k"},
+                )
+                script = em.build_liquidsoap_script(
+                    "airtap",
+                    [make_encoder(format="mp3")],
+                    host_aircheck=True,
+                    generation="g",
+                )
+                self.assertFalse(em.script_requires_fdkaac(script))
+
+    def test_exact_script_detector_recognizes_aac_stream_on_non_aircheck_group(self):
+        script = em.build_liquidsoap_script(
+            "plughw:9,9",
+            [make_encoder(format="aac", bitrate_kbps=128)],
+            host_aircheck=False,
+            generation="g",
+        )
+        self.assertTrue(em.script_requires_fdkaac(script))
+
+    def test_exact_script_detector_rejects_fdkaac_wrapper_prefix(self):
+        script = (
+            f'output_format = %external(process="{em.FDKAAC_PATH}-wrapper '
+            '-R -o - -", header=false)\n'
+        )
+        self.assertFalse(em.script_requires_fdkaac(script))
+
+    def test_exact_script_detector_ignores_metadata_and_comment_mentions(self):
+        script = em.build_liquidsoap_script(
+            "plughw:9,9",
+            [
+                make_encoder(
+                    format="mp3",
+                    station_name=f"Uses {em.FDKAAC_PATH} elsewhere",
+                )
+            ],
+            host_aircheck=False,
+            generation="g",
+        )
+        script += (
+            f'\n# %external(process="{em.FDKAAC_PATH} -R -o - -", '
+            'header=false)\n'
+        )
+        self.assertFalse(em.script_requires_fdkaac(script))
+
     def test_multiple_encoders_fan_out_from_one_source(self):
         script = em.build_liquidsoap_script(
             "airtap", [make_encoder(name="a", mount="/1"), make_encoder(name="b", mount="/2")],
@@ -467,6 +533,13 @@ class EncoderManagerFixtureMixin:
         ):
             patcher.start()
             self.addCleanup(patcher.stop)
+
+        capability_patcher = patch(
+            "encoders.services.preflight.check_script_runtime_capabilities",
+            return_value=MagicMock(ok=True, reason="runtime capabilities ok", detail={}),
+        )
+        self.runtime_capability_mock = capability_patcher.start()
+        self.addCleanup(capability_patcher.stop)
 
         self._fake_pid_counter = 1000
         self._popen_should_fail = False
