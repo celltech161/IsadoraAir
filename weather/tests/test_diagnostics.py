@@ -247,6 +247,26 @@ class DiagnosticsDataDirectoryTests(TestCase):
         self.assertEqual(fact.evidence["timestamp_source"], "file_mtime")
         self.assertIsNotNone(fact.age_seconds)
 
+    def test_simple_json_file_age_uses_injected_now_deterministically(self):
+        """r0051: _check_simple_json_file() previously called
+        dj_timezone.now() internally instead of using the snapshot's own
+        injected `now` -- this pins a file's mtime exactly and proves
+        the resulting age_seconds is exact, not merely non-null, for
+        BOTH files that function covers (processed_weather.json and
+        sky_condition.json)."""
+        import os
+        for filename in ("processed_weather.json", "sky_condition.json"):
+            path = self.data_dir / filename
+            write_json(path, {"ok": True})
+            fixed_mtime = (NOW - timedelta(hours=3)).timestamp()
+            os.utime(path, (fixed_mtime, fixed_mtime))
+
+        snap = self.snapshot(now=NOW)
+
+        for filename in ("processed_weather.json", "sky_condition.json"):
+            fact = snap.get(f"weather_data_file:{filename}")
+            self.assertEqual(fact.age_seconds, 10800.0, filename)
+
     def test_semantic_timestamp_used_over_mtime_for_latest_weather(self):
         ts = (NOW - timedelta(seconds=437)).isoformat().replace("+00:00", "Z")
         write_json(self.data_dir / "latest_weather.json", {"tempf": 72, "timestamp": ts})
@@ -445,24 +465,129 @@ class DiagnosticsGeneratedArtifactTests(TestCase):
         snap = self.snapshot()
         self.assertEqual(snap.get("generated_artifact:wx_temp").state, "degraded")
 
-    def test_event_driven_alert_artifact_absent_is_not_applicable(self):
-        snap = self.snapshot()
-        self.assertEqual(snap.get("generated_artifact:wx_alert").state, "not_applicable")
+    # generated_artifact:wx_alert (the shared, event-driven WxAlert
+    # artifact) is NOT covered here -- its state depends on active-alert
+    # applicability, not merely file/Track presence. See
+    # DiagnosticsWxAlertApplicabilityTests below (r0051).
 
-    def test_event_driven_alert_artifact_present_is_ready(self):
-        alert_category = make_category("WxAlert")
+
+class DiagnosticsWxAlertApplicabilityTests(TestCase):
+    """r0051: WxAlert/wx_alert.mp3 is the urgent spoken statement shared
+    by BOTH ordinary NWS watch/warning alerts and AMBER-family alerts
+    (never the FX "alert beep", which is `alert_fx_cart`). A historical
+    file/Track surviving after an alert ends must not be reported as a
+    currently `ready` artifact -- see diagnostics.py's
+    _classify_alert_applicability() / _check_wx_alert_artifact()."""
+
+    def setUp(self):
+        self.lib_tmp = tempfile.TemporaryDirectory(prefix="isadoraair-wxdiag-alertlib-")
+        self.addCleanup(self.lib_tmp.cleanup)
+        self.library_root = Path(self.lib_tmp.name)
+        self.data_tmp = tempfile.TemporaryDirectory(prefix="isadoraair-wxdiag-alertdata-")
+        self.addCleanup(self.data_tmp.cleanup)
+        self.data_dir = Path(self.data_tmp.name)
+        WeatherConfig.load()
+        self.category = make_category("WxAlert")
+
+    def snapshot(self):
+        return get_weather_diagnostics(now=NOW, data_dir=self.data_dir, library_root=self.library_root)
+
+    def _write_watch_warnings(self, entries):
+        write_json(self.data_dir / "active_watches_warnings.json", entries)
+
+    def _configure_amber(self, enabled, entries=None):
+        AmberAlertConfig.objects.create(pk=1, enabled=enabled)
+        if entries is not None:
+            write_json(self.data_dir / "active_amber_alerts.json", entries)
+
+    def _make_artifact(self, ready2air=True):
         path = self.library_root / "WxAlert" / "wx_alert.mp3"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"id3")
-        make_track(path, alert_category, ready2air=True)
+        make_track(path, self.category, ready2air=ready2air)
+        return path
+
+    def test_no_active_alerts_and_artifact_absent_is_not_applicable(self):
+        self._write_watch_warnings([])  # confirmed zero; AMBER left unconfigured (disabled)
+        snap = self.snapshot()
+        self.assertEqual(snap.get("generated_artifact:wx_alert").state, "not_applicable")
+
+    def test_no_active_alerts_and_old_file_track_ready_is_not_applicable(self):
+        self._write_watch_warnings([])
+        self._make_artifact(ready2air=True)
+        snap = self.snapshot()
+        fact = snap.get("generated_artifact:wx_alert")
+        self.assertEqual(fact.state, "not_applicable")
+        self.assertIn("historical", fact.summary.lower())
+        # historical evidence is preserved, not discarded
+        self.assertIsNotNone(fact.path)
+        self.assertIsNotNone(fact.age_seconds)
+
+    def test_active_weather_warning_and_artifact_ready_is_ready(self):
+        self._write_watch_warnings([{"event": "Tornado Warning", "text": "...", "text_core": "..."}])
+        self._make_artifact(ready2air=True)
+        snap = self.snapshot()
+        self.assertEqual(snap.get("generated_artifact:wx_alert").state, "ready")
+
+    def test_active_amber_alert_and_artifact_ready_is_ready(self):
+        self._write_watch_warnings([])
+        self._configure_amber(True, entries=[
+            {"identifier": "x1", "event": "Child Abduction Emergency", "text": "...", "text_core": "..."},
+        ])
+        self._make_artifact(ready2air=True)
+        snap = self.snapshot()
+        self.assertEqual(snap.get("generated_artifact:wx_alert").state, "ready")
+
+    def test_active_alert_and_artifact_missing_is_needs_attention(self):
+        self._write_watch_warnings([{"event": "Tornado Warning", "text": "...", "text_core": "..."}])
+        snap = self.snapshot()  # no file/Track created at all
+        self.assertEqual(snap.get("generated_artifact:wx_alert").state, "needs_attention")
+
+    def test_active_alert_and_track_missing_is_needs_attention(self):
+        self._write_watch_warnings([{"event": "Tornado Warning", "text": "...", "text_core": "..."}])
+        path = self.library_root / "WxAlert" / "wx_alert.mp3"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"id3")  # file present, no Track
+        snap = self.snapshot()
+        self.assertEqual(snap.get("generated_artifact:wx_alert").state, "needs_attention")
+
+    def test_unknown_active_state_does_not_become_not_applicable(self):
+        # active_watches_warnings.json is missing entirely (degraded --
+        # pipeline hasn't run yet, NOT confirmed zero) and AMBER is left
+        # unconfigured (confirmed zero) -- overall must stay unknown.
+        self._make_artifact(ready2air=True)
+        snap = self.snapshot()
+        fact = snap.get("generated_artifact:wx_alert")
+        self.assertNotEqual(fact.state, "not_applicable")
+        self.assertEqual(fact.state, "degraded")
+
+    def test_malformed_watch_warnings_does_not_become_not_applicable(self):
+        (self.data_dir / "active_watches_warnings.json").write_text("{bad")
+        self._make_artifact(ready2air=True)
+        snap = self.snapshot()
+        self.assertNotEqual(snap.get("generated_artifact:wx_alert").state, "not_applicable")
+
+    def test_amber_disabled_and_zero_weather_alerts_is_not_applicable(self):
+        self._write_watch_warnings([])
+        self._configure_amber(False)
+        snap = self.snapshot()
+        self.assertEqual(snap.get("generated_artifact:wx_alert").state, "not_applicable")
+
+    def test_amber_disabled_and_active_weather_alert_is_active(self):
+        self._write_watch_warnings([{"event": "Tornado Warning", "text": "...", "text_core": "..."}])
+        self._configure_amber(False)
+        self._make_artifact(ready2air=True)
         snap = self.snapshot()
         self.assertEqual(snap.get("generated_artifact:wx_alert").state, "ready")
 
 
 class DiagnosticsSideEffectTests(TestCase):
     """Proves collection is genuinely side-effect-free (Pass B section
-    10). No HTTP, no TTS, no subprocess, no writes, no Track/config
-    mutation."""
+    10, strengthened r0051). No HTTP, no TTS, no subprocess, no writes,
+    no Track/config mutation -- and specifically, no singleton
+    auto-creation via WeatherConfig.load()/AmberAlertConfig.load() just
+    because diagnostics ran against a database with none of that
+    configured yet."""
 
     def test_no_subprocess_calls(self):
         WeatherConfig.load()
@@ -481,11 +606,53 @@ class DiagnosticsSideEffectTests(TestCase):
         uopen.assert_not_called()
 
     def test_no_config_or_track_mutation(self):
-        WeatherConfig.load()
-        before = WeatherConfig.objects.count(), Track.objects.count()
+        # Deliberately NOT pre-creating WeatherConfig here -- a test
+        # claiming "diagnostics doesn't mutate config" must not itself
+        # create the very row it's proving isn't created.
+        before = (
+            WeatherConfig.objects.count(), AmberAlertConfig.objects.count(),
+            WeatherVoicePersona.objects.count(), Track.objects.count(),
+        )
         get_weather_diagnostics(now=NOW)
-        after = WeatherConfig.objects.count(), Track.objects.count()
+        after = (
+            WeatherConfig.objects.count(), AmberAlertConfig.objects.count(),
+            WeatherVoicePersona.objects.count(), Track.objects.count(),
+        )
         self.assertEqual(before, after)
+
+    def test_zero_configuration_rows_causes_no_mutation_and_returns_useful_facts(self):
+        """The r0051 regression test for the critical fix: running
+        diagnostics against a database with NO WeatherConfig, NO
+        AmberAlertConfig, and NO WeatherVoicePersona must not create any
+        of them (WeatherConfig.load()/AmberAlertConfig.load() are
+        get_or_create and would have), and must still return a useful,
+        non-exceptional snapshot."""
+        self.assertFalse(WeatherConfig.objects.exists())
+        self.assertFalse(AmberAlertConfig.objects.exists())
+        self.assertFalse(WeatherVoicePersona.objects.exists())
+        before = (
+            WeatherConfig.objects.count(), AmberAlertConfig.objects.count(),
+            WeatherVoicePersona.objects.count(), Track.objects.count(),
+        )
+
+        snapshot = get_weather_diagnostics(now=NOW)  # must not raise
+
+        after = (
+            WeatherConfig.objects.count(), AmberAlertConfig.objects.count(),
+            WeatherVoicePersona.objects.count(), Track.objects.count(),
+        )
+        self.assertEqual(before, after)
+        self.assertEqual(before, (0, 0, 0, 0))
+
+        # Useful, clearly-actionable structured facts -- not a crash,
+        # and AMBER is never reported as if it were actively configured.
+        self.assertEqual(snapshot.get("station_location").state, "needs_attention")
+        self.assertEqual(snapshot.get("nws_config").state, "needs_attention")
+        self.assertEqual(snapshot.get("announcer_schedule").state, "needs_attention")
+        self.assertEqual(snapshot.get("alert_fx_cart").state, "needs_attention")
+        self.assertEqual(snapshot.get("notifications").state, "needs_attention")
+        self.assertEqual(snapshot.get("amber_alerts_config").state, "optional_disabled")
+        self.assertEqual(snapshot.get("amber_alerts_data").state, "optional_disabled")
 
     def test_does_not_write_into_weather_data_dir(self):
         with tempfile.TemporaryDirectory(prefix="isadoraair-wxdiag-safety-") as tmp:
@@ -521,6 +688,25 @@ class WeatherEnvAdminUsesDiagnosticsTests(TestCase):
         body = resp.content.decode()
         self.assertIn("latest_weather.json", body)
         self.assertIn("wind_history.json", body)
+
+    def test_malformed_but_present_file_is_not_described_as_missing(self):
+        """r0051: a physically present but malformed file must be
+        distinguished from a genuinely absent one -- both used to
+        collapse into the same 'Missing' bucket because the page only
+        checked `state == 'ready'`."""
+        (self.data_dir / "latest_weather.json").write_text("{not json")
+        url = reverse("admin:weather_weatherconfig_weather_env")
+        resp = self.client.get(url)
+        self.assertEqual(resp.status_code, 200)
+        body = resp.content.decode()
+        self.assertIn("Present but failed to parse", body)
+        # The malformed file must not appear in the "Missing" clause --
+        # check the literal adjacency, not just "is the word present
+        # somewhere on the page" (it legitimately is, in the other clause).
+        self.assertNotIn(
+            "Missing (optional -- not required to save this page): latest_weather.json",
+            body,
+        )
 
 
 class WeatherDiagnosticsCommandTests(TestCase):

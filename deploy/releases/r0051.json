@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "release_id": "r0051",
+  "previous_release_id": "r0050",
+  "minimum_updater_protocol_version": 5,
+  "summary": "Independent-review fixes to r0050 Weather diagnostics: read-only config lookup (no more WeatherConfig.load()/AmberAlertConfig.load() get_or_create side effects); wx_alert artifact state now derives from active watch/warning+AMBER evidence instead of treating a historical file/Track as ready; file facts carry exists evidence for Admin; one file-age check now uses the snapshot's injected clock. No schema, network, TTS, subprocess, or on-air behavior change.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-gunicorn"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0007"
+}

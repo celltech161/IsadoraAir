@@ -126,13 +126,27 @@ class WeatherConfigAdmin(admin.ModelAdmin):
             data_dir_value = None
         if data_dir_value:
             snapshot = get_weather_diagnostics(data_dir=Path(data_dir_value))
+            # r0051: a malformed-but-present file is physically here --
+            # `exists` (structured filesystem evidence on the fact,
+            # independent of `state`) is what settles that, so a parse
+            # failure is never described as "Missing". State alone
+            # decides only healthy-vs-not among files that DO exist.
             present = []
+            unhealthy = []
             missing = []
             for key in _WEATHER_DIAGNOSTIC_FILE_KEYS:
                 fact = snapshot.get(key)
                 filename = key.split(":", 1)[1]
-                (present if fact and fact.state == "ready" else missing).append(filename)
+                exists = bool(fact and fact.evidence and fact.evidence.get("exists"))
+                if fact and fact.state == "ready":
+                    present.append(filename)
+                elif exists:
+                    unhealthy.append(filename)
+                else:
+                    missing.append(filename)
             status_text = f"Diagnostic files currently in the saved directory: {', '.join(present) if present else 'none yet'}."
+            if unhealthy:
+                status_text += f" Present but failed to parse (needs attention): {', '.join(unhealthy)}."
             if missing:
                 status_text += f" Missing (optional -- not required to save this page): {', '.join(missing)}."
             notices.append({"level": "info", "text": status_text})
