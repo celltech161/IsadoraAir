@@ -166,10 +166,47 @@ def format_rainfall_inches(a):
 
 # ---------------- FORECAST ----------------
 
+# Matches weather.diagnostics.FORECAST_CACHE_WARN_HOURS -- kept in sync
+# manually since this script's isolated venv cannot import the Django
+# app. Was a warn-only boundary before P1 2.4 Pass G (the cache was
+# still returned and broadcast indefinitely past this age); now
+# authoritative -- see get_periods()'s own docstring.
+FORECAST_CACHE_STALE_HOURS = 6
+
+
+class ForecastUnavailableError(Exception):
+    """No usable forecast data exists this run: the live NWS fetch
+    failed (or returned no periods) AND no cache is usable -- missing,
+    malformed/empty, or older than FORECAST_CACHE_STALE_HOURS. Callers
+    (main(), via build_announcement()) must abort the ENTIRE run
+    without synthesizing or publishing anything, leaving whichever
+    artifact this invocation targets (current_obs.mp3 or forecast.mp3)
+    exactly as it was."""
+
+
 def get_periods():
     """Fetch the full NWS periods list (typically 14 periods) and cache
-    it. On fetch failure, fall back to the cached periods list with a
-    staleness warning if old."""
+    it. On live-fetch failure (or an empty periods list from a 200
+    response), falls back to the cached periods list ONLY if it is at
+    most FORECAST_CACHE_STALE_HOURS old.
+
+    P1 2.4 Pass G: a cache older than that boundary is now REFUSED
+    outright (raises ForecastUnavailableError) rather than logged as a
+    warning and broadcast indefinitely -- do not synthesize a new
+    forecast announcement from forecast data this stale. The previous
+    known-good broadcast artifact is left completely untouched by the
+    caller in that case; see main().
+
+    Returns (periods, source_kind, source_age_seconds, used_fallback)
+    on success:
+      source_kind          "live_nws" or "cached_fallback"
+      source_age_seconds   0.0 for a live fetch; the cache file's age
+                            in seconds for a fallback
+      used_fallback        False for a live fetch, True for a cache
+                            fallback -- Weather asset provenance
+                            (P1 2.4 Pass G) records this verbatim.
+
+    Raises ForecastUnavailableError when nothing usable is available."""
     try:
         r = requests.get(FORECAST_URL, headers=NWS_HEADERS, timeout=NWS_TIMEOUT)
         r.raise_for_status()
@@ -182,24 +219,35 @@ def get_periods():
                 log(f"Forecast periods cached to {FORECAST_CACHE_FILE} ({len(periods)} periods)")
             except Exception as e:
                 log(f"Could not write forecast cache: {e}")
-        return periods
+            return periods, "live_nws", 0.0, False
+        log("NWS returned no forecast periods; falling back to cache if usable.")
     except Exception as e:
         log(f"Forecast fetch failed: {e}")
-        if os.path.exists(FORECAST_CACHE_FILE):
-            try:
-                age_sec = time.time() - os.path.getmtime(FORECAST_CACHE_FILE)
-                age_hr = age_sec / 3600.0
-                if age_hr > 6:
-                    log(f"WARNING: cached forecast is {age_hr:.1f} hours old - "
-                        f"NWS has been unreachable for an extended period.")
-                with open(FORECAST_CACHE_FILE, "r") as f:
-                    cached = json.load(f)
-                if isinstance(cached, list) and cached:
-                    log(f"Using cached forecast from {FORECAST_CACHE_FILE} (age {age_hr:.1f}h)")
-                    return cached
-            except Exception as e2:
-                log(f"Failed to read cached forecast: {e2}")
-        return []
+
+    if os.path.exists(FORECAST_CACHE_FILE):
+        try:
+            age_sec = time.time() - os.path.getmtime(FORECAST_CACHE_FILE)
+            age_hr = age_sec / 3600.0
+            with open(FORECAST_CACHE_FILE, "r") as f:
+                cached = json.load(f)
+            if isinstance(cached, list) and cached:
+                if age_hr > FORECAST_CACHE_STALE_HOURS:
+                    log(
+                        f"Cached forecast is {age_hr:.1f}h old, past the "
+                        f"{FORECAST_CACHE_STALE_HOURS}h boundary -- refusing to use it. "
+                        f"The previous broadcast artifact will be left untouched."
+                    )
+                    raise ForecastUnavailableError(
+                        f"live fetch failed and cached forecast is {age_hr:.1f}h old "
+                        f"(exceeds the {FORECAST_CACHE_STALE_HOURS}h boundary)"
+                    )
+                log(f"Using cached forecast from {FORECAST_CACHE_FILE} (age {age_hr:.1f}h)")
+                return cached, "cached_fallback", age_sec, True
+        except ForecastUnavailableError:
+            raise
+        except Exception as e2:
+            log(f"Failed to read cached forecast: {e2}")
+    raise ForecastUnavailableError("live fetch failed and no usable forecast cache exists")
 
 def speak_forecast(periods):
     """Render a list of NWS period dicts into a single broadcast-ready
@@ -487,7 +535,10 @@ def build_announcement(mode, voice):
             rain_str += f" Of that, {format_rainfall_inches(hourly)} fell in the past hour."
         announcement += rain_str
 
-    periods = get_periods()
+    # Raises ForecastUnavailableError (propagated to main(), which
+    # aborts the whole run without publishing anything) when no usable
+    # forecast data exists this run -- see get_periods()'s docstring.
+    periods, source_kind, source_age_seconds, used_fallback = get_periods()
     sliced = periods[: mode["periods"]]
     forecast = speak_forecast(sliced)
     if forecast:
@@ -505,7 +556,12 @@ def build_announcement(mode, voice):
     # NWS alert detail + optional AMBER content -- lands under a single
     # announcer bow-out instead of the signoff sitting mid-message.
     announcement += f" For Oak Grove Radio ninety-eight point five, {voice['signoff']}"
-    return announcement
+    forecast_meta = {
+        "source_kind": source_kind,
+        "source_age_seconds": source_age_seconds,
+        "used_fallback": used_fallback,
+    }
+    return announcement, forecast_meta
 
 
 # Rotating connectors used to introduce each alert AFTER the first.
@@ -671,8 +727,8 @@ def parse_args():
 
 def main():
     """Returns True on success, False on any real synthesis-generation
-    failure (voice resolution, canonical CLI, MP3 conversion, or
-    delivery)."""
+    failure (voice resolution, unusable forecast data, canonical CLI,
+    MP3 conversion, or delivery)."""
     args = parse_args()
     mode = MODES[args.mode]
     try:
@@ -691,7 +747,17 @@ def main():
 
     try:
         log(f"=== WX Forecast Announcer Started (mode={args.mode} voice={voice_key}) ===")
-        announcement = build_announcement(mode, voice)
+        try:
+            announcement, forecast_meta = build_announcement(mode, voice)
+        except ForecastUnavailableError as e:
+            log(f"Forecast unavailable: {e}")
+            notify(
+                f"wx_forecast ({args.mode}) FAILED",
+                f"No usable forecast data this run ({e}). The previous "
+                f"broadcast artifact has been left untouched -- nothing was "
+                f"synthesized or published.",
+            )
+            return False
         log(f"Announcement: {announcement}")
         os.makedirs(tmp_dir, exist_ok=True)
 
@@ -708,7 +774,13 @@ def main():
             return False
 
         try:
-            dest = deliver(output_mp3, mode["category_code"], mode["dest_filename"])
+            dest = deliver(
+                output_mp3, mode["category_code"], mode["dest_filename"],
+                producer="wx_forecast.py", voice=voice["name"],
+                source_kind=forecast_meta["source_kind"],
+                source_age_seconds=forecast_meta["source_age_seconds"],
+                used_fallback=forecast_meta["used_fallback"],
+            )
             log(f"Delivered and synced: {dest}")
         except Exception as e:
             log(f"Delivery failed: {e}")

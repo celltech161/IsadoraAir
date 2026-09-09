@@ -43,6 +43,11 @@ FAKE_CFG = {
     "alert_sound_interval_seconds": 600,
 }
 
+# P1 2.4 Pass G: build_announcement() now returns (text, forecast_meta)
+# instead of a bare string -- stand-in metadata for tests below that
+# mock build_announcement() wholesale and only care about the text.
+FAKE_FORECAST_META = {"source_kind": "live_nws", "source_age_seconds": 0.0, "used_fallback": False}
+
 
 def _import_entry_points():
     """Import entry points without crossing into production Django."""
@@ -150,7 +155,7 @@ class ForecastVoiceAutoTests(unittest.TestCase):
 
     def test_main_with_auto_resolves_and_synthesizes_with_resolved_voice(self):
         with patch.object(sys, "argv", ["wx_forecast.py", "--mode", "1day", "--voice", "auto"]), \
-             patch.object(wx_forecast, "build_announcement", return_value="Test announcement."), \
+             patch.object(wx_forecast, "build_announcement", return_value=("Test announcement.", FAKE_FORECAST_META)), \
              patch.object(wx_forecast, "generate_wav_with_piper", return_value=voices_ok()) as mock_gen, \
              patch.object(wx_forecast, "convert_to_mp3", return_value=True), \
              patch.object(wx_forecast, "deliver", return_value="/srv/dest.mp3"), \
@@ -176,7 +181,7 @@ class ForecastVoiceAutoTests(unittest.TestCase):
         for voice_arg in ("day", "night"):
             with self.subTest(voice=voice_arg):
                 with patch.object(sys, "argv", ["wx_forecast.py", "--mode", "1day", "--voice", voice_arg]), \
-                     patch.object(wx_forecast, "build_announcement", return_value="Test announcement."), \
+                     patch.object(wx_forecast, "build_announcement", return_value=("Test announcement.", FAKE_FORECAST_META)), \
                      patch.object(wx_forecast, "generate_wav_with_piper", return_value=voices_ok()) as mock_gen, \
                      patch.object(wx_forecast, "convert_to_mp3", return_value=True), \
                      patch.object(wx_forecast, "deliver", return_value="/srv/dest.mp3"), \
@@ -316,7 +321,7 @@ class FailedCliOutputCannotProceedTests(unittest.TestCase):
 
     def test_wx_forecast_failed_synthesis_never_reaches_ffmpeg_or_delivery(self):
         with patch.object(sys, "argv", ["wx_forecast.py", "--mode", "1day", "--voice", "day"]), \
-             patch.object(wx_forecast, "build_announcement", return_value="Test."), \
+             patch.object(wx_forecast, "build_announcement", return_value=("Test.", FAKE_FORECAST_META)), \
              patch.object(wx_forecast, "generate_wav_with_piper", return_value=voices_fail()), \
              patch.object(wx_forecast, "convert_to_mp3") as mock_convert, \
              patch.object(wx_forecast, "deliver") as mock_deliver, \

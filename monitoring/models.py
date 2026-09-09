@@ -45,6 +45,7 @@ class MonitorCheck(models.Model):
         ("audio_silence", "Audio Silence (Liquidsoap)"),
         ("encoder_group", "Encoder Stream Health"),
         ("rbds", "RBDS Connection"),
+        ("weather", "Weather Health"),
     ]
 
     name = models.CharField(max_length=100, unique=True)

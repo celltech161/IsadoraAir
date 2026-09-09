@@ -724,6 +724,47 @@ def probe_rbds(check):
     return "ok", {"current_ps": data.get("current_ps"), "current_rt": data.get("current_rt")}
 
 
+def probe_weather(check):
+    """Delegates entirely to weather.diagnostics.get_weather_diagnostics()
+    -- the one Weather readiness/provenance authority (P1 1.15/2.4
+    Passes B/G) -- rather than reimplementing any Weather rule here.
+
+    Maps DiagnosticFact states onto Monitoring's own vocabulary:
+      needs_attention -> critical (something requires operator action)
+      degraded        -> warning  (suboptimal, not necessarily urgent)
+      ready / optional_disabled / not_applicable -> ok
+
+    Any unexpected exception from the Weather diagnostics call itself
+    is caught here and reported as 'unknown' rather than propagating --
+    belt-and-suspenders alongside _run_cycle's own generic per-probe
+    exception handling, since Weather evidence collection touches the
+    filesystem and ORM in ways worth failing safe on specifically."""
+    try:
+        from weather.diagnostics import get_weather_diagnostics
+        snapshot = get_weather_diagnostics()
+    except Exception as exc:
+        return "unknown", {"error": str(exc)}
+
+    needs_attention = [f.key for f in snapshot.facts if f.state == "needs_attention"]
+    degraded = [f.key for f in snapshot.facts if f.state == "degraded"]
+
+    if needs_attention:
+        return "critical", {
+            "reason": f"{len(needs_attention)} Weather fact(s) need attention: {', '.join(needs_attention)}",
+            "needs_attention_keys": needs_attention,
+            "degraded_keys": degraded,
+        }
+    if degraded:
+        return "warning", {
+            "reason": f"{len(degraded)} Weather fact(s) degraded: {', '.join(degraded)}",
+            "degraded_keys": degraded,
+        }
+    return "ok", {
+        "reason": "all Weather facts ready, not_applicable, or optional_disabled",
+        "fact_count": len(snapshot.facts),
+    }
+
+
 PROBE_DISPATCH = {
     "systemd": probe_systemd,
     "disk": probe_disk,
@@ -735,4 +776,5 @@ PROBE_DISPATCH = {
     "audio_silence": probe_audio_silence,
     "encoder_group": probe_encoder_group,
     "rbds": probe_rbds,
+    "weather": probe_weather,
 }

@@ -1,20 +1,26 @@
-"""Weather diagnostics/readiness authority (P1 1.15 / 2.4 Pass B).
+"""Weather diagnostics/readiness authority (P1 1.15 / 2.4 Passes B, G).
 
 One reusable, side-effect-free, structured snapshot of Weather
 configuration/data/artifact evidence -- consumed by the Admin "Weather
-data storage" subpage and by the `weather_diagnostics` management
-command (Pass B's two proving consumers). Later work (Setup Status UI,
-Monitoring, provenance/freshness policy) is expected to build on this
-same authority rather than re-deriving its own notion of "is Weather
-healthy".
+data storage" subpage, the `weather_diagnostics` management command
+(Pass B's two proving consumers), and (Pass G) the Monitoring
+`weather` probe (monitoring/services/probes.py::probe_weather). All
+three read this SAME authority rather than re-deriving their own
+notion of "is Weather healthy".
 
-Design rule (see the Pass B brief): evidence first, policy later. This
-module reports facts -- a file exists, a timestamp's age in seconds, a
-persona has no voice, a schedule doesn't cover every hour -- it does
-NOT invent new staleness/fallback thresholds. The one deliberate
-exception is wx_forecast.py's own pre-existing 6-hour "cache is stale"
-warning, which is exposed here as `degraded` evidence rather than
-reinvented.
+Design rule (see the Pass B brief): evidence first, policy later. Pass
+G adds the "policy later" half for routine (non-event-driven)
+freshness -- see weather/freshness.py for the actual thresholds/
+cadence rationale, applied here via _freshness_overlay() -- and
+provenance -- see weather/provenance.py, applied here via
+_apply_provenance_overlay(). The one threshold this module has always
+exposed (even before Pass G's own freshness policy) is wx_forecast.py's
+pre-existing 6-hour "cache is stale" warning, surfaced as `degraded`
+evidence at `forecast_cache` rather than reinvented; Pass G additionally
+made that same six-hour value AUTHORITATIVE on the producer side (see
+weather_ingest/wx_forecast.py's own docstring) -- a distinct question
+from whether the currently-PUBLISHED WxForecast/WxObs artifact itself
+is fresh, which _ARTIFACT_FRESHNESS_SECONDS answers.
 
 State vocabulary (`DiagnosticFact.state`):
     ready             -- evidence collected and everything checked is fine
@@ -63,6 +69,7 @@ behavior; only this collector must stay pure.
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 import re
 from dataclasses import dataclass
@@ -74,6 +81,14 @@ from django.conf import settings
 from django.utils import timezone as dj_timezone
 
 from library.models import Category, Track
+from . import provenance as provenance_mod
+from .freshness import (
+    CURRENT_DERIVED_FRESHNESS_SECONDS,
+    WX_FORECAST_FRESHNESS_SECONDS,
+    WX_OBS_FRESHNESS_SECONDS,
+    WX_TEMP_FRESHNESS_SECONDS,
+    is_stale,
+)
 from .models import AmberAlertConfig, WeatherConfig, WeatherVoicePersona, normalize_alert_sound_trigger_events
 from .persona_readiness import check_persona_slots
 from .voice_schedule import ScheduleError, expand_to_hours
@@ -231,8 +246,10 @@ def get_weather_diagnostics(now=None, data_dir=None, library_root=None) -> Weath
     for suffix, category_code, filename, event_driven in GENERATED_ARTIFACTS:
         applicability = alert_applicability if event_driven else None
         facts.append(_check_generated_artifact(
-            suffix, category_code, filename, event_driven, library_root, now, applicability,
+            suffix, category_code, filename, event_driven, library_root, data_dir, now, applicability,
         ))
+
+    facts.append(_check_rbds_weather_provenance(data_dir))
 
     return WeatherDiagnosticsSnapshot(generated_at=_iso(now), facts=tuple(facts))
 
@@ -511,6 +528,24 @@ def _mtime_evidence(path: Path, now):
     return _iso(mtime), _age_seconds(now, mtime)
 
 
+def _freshness_overlay(state: str, summary: str, age_seconds, threshold_seconds: float):
+    """If `state` is otherwise 'ready' but `age_seconds` exceeds
+    `threshold_seconds` (see weather.freshness), downgrades to
+    'degraded' and appends a plain-English staleness note to
+    `summary`. Never touches a state that is already worse than
+    'ready' -- staleness is additive evidence, never a reason to mask
+    an existing needs_attention/degraded/not_applicable/
+    optional_disabled fact with a different-sounding one."""
+    if state != "ready" or not is_stale(age_seconds, threshold_seconds):
+        return state, summary
+    age_minutes = age_seconds / 60.0
+    threshold_minutes = threshold_seconds / 60.0
+    return "degraded", (
+        f"{summary} Stale: {age_minutes:.0f} min old "
+        f"(freshness threshold {threshold_minutes:.0f} min)."
+    )
+
+
 def _check_simple_json_file(path: Path, now) -> DiagnosticFact:
     """Generic evidence for a data file with no semantic timestamp and
     no established staleness policy -- presence/parse-validity plus
@@ -537,9 +572,11 @@ def _check_simple_json_file(path: Path, now) -> DiagnosticFact:
             evidence={"exists": True},
         )
     timestamp, age = _mtime_evidence(path, now)
+    state, summary = _freshness_overlay(
+        "ready", f"{path.name} exists and parses.", age, CURRENT_DERIVED_FRESHNESS_SECONDS,
+    )
     return DiagnosticFact(
-        key=key, state="ready",
-        summary=f"{path.name} exists and parses.", path=str(path),
+        key=key, state=state, summary=summary, path=str(path),
         timestamp=timestamp, age_seconds=age,
         evidence={"timestamp_source": "file_mtime", "exists": True},
     )
@@ -554,14 +591,22 @@ def _check_latest_weather(path: Path, now) -> DiagnosticFact:
         return DiagnosticFact(key=key, state="needs_attention", summary="latest_weather.json exists but failed to parse.", detail=error, path=str(path), evidence={"exists": True})
     ts = _parse_semantic_timestamp(data.get("timestamp")) if isinstance(data, dict) else None
     if ts is not None:
+        age = _age_seconds(now, ts)
+        state, summary = _freshness_overlay(
+            "ready", "latest_weather.json exists and parses.", age, CURRENT_DERIVED_FRESHNESS_SECONDS,
+        )
         return DiagnosticFact(
-            key=key, state="ready", summary="latest_weather.json exists and parses.",
-            path=str(path), timestamp=_iso(ts), age_seconds=_age_seconds(now, ts),
+            key=key, state=state, summary=summary,
+            path=str(path), timestamp=_iso(ts), age_seconds=age,
             evidence={"timestamp_source": "payload.timestamp", "exists": True},
         )
     timestamp, age = _mtime_evidence(path, now)
+    state, summary = _freshness_overlay(
+        "ready", "latest_weather.json exists and parses (no semantic timestamp found).",
+        age, CURRENT_DERIVED_FRESHNESS_SECONDS,
+    )
     return DiagnosticFact(
-        key=key, state="ready", summary="latest_weather.json exists and parses (no semantic timestamp found).",
+        key=key, state=state, summary=summary,
         path=str(path), timestamp=timestamp, age_seconds=age,
         evidence={"timestamp_source": "file_mtime", "exists": True},
     )
@@ -584,14 +629,21 @@ def _check_wind_history(path: Path, now) -> DiagnosticFact:
                 latest_ts = ts
     evidence = {"entry_count": len(data), "exists": True}
     if latest_ts is not None:
+        age = _age_seconds(now, latest_ts)
+        state, summary = _freshness_overlay(
+            "ready", f"wind_history.json has {len(data)} entr(y/ies).", age, CURRENT_DERIVED_FRESHNESS_SECONDS,
+        )
         return DiagnosticFact(
-            key=key, state="ready", summary=f"wind_history.json has {len(data)} entr(y/ies).",
-            path=str(path), count=len(data), timestamp=_iso(latest_ts), age_seconds=_age_seconds(now, latest_ts),
+            key=key, state=state, summary=summary,
+            path=str(path), count=len(data), timestamp=_iso(latest_ts), age_seconds=age,
             evidence={**evidence, "timestamp_source": "latest_entry.time"},
         )
     timestamp, age = _mtime_evidence(path, now)
+    state, summary = _freshness_overlay(
+        "ready", f"wind_history.json has {len(data)} entr(y/ies).", age, CURRENT_DERIVED_FRESHNESS_SECONDS,
+    )
     return DiagnosticFact(
-        key=key, state="ready", summary=f"wind_history.json has {len(data)} entr(y/ies).",
+        key=key, state=state, summary=summary,
         path=str(path), count=len(data), timestamp=timestamp, age_seconds=age,
         evidence={**evidence, "timestamp_source": "file_mtime"},
     )
@@ -606,14 +658,22 @@ def _check_smoothed_wind(path: Path, now) -> DiagnosticFact:
         return DiagnosticFact(key=key, state="needs_attention", summary="smoothed_wind.json exists but failed to parse.", detail=error, path=str(path), evidence={"exists": True})
     ts = _parse_semantic_timestamp(data.get("time")) if isinstance(data, dict) else None
     if ts is not None:
+        age = _age_seconds(now, ts)
+        state, summary = _freshness_overlay(
+            "ready", "smoothed_wind.json exists and parses.", age, CURRENT_DERIVED_FRESHNESS_SECONDS,
+        )
         return DiagnosticFact(
-            key=key, state="ready", summary="smoothed_wind.json exists and parses.",
-            path=str(path), timestamp=_iso(ts), age_seconds=_age_seconds(now, ts),
+            key=key, state=state, summary=summary,
+            path=str(path), timestamp=_iso(ts), age_seconds=age,
             evidence={"timestamp_source": "payload.time", "exists": True},
         )
     timestamp, age = _mtime_evidence(path, now)
+    state, summary = _freshness_overlay(
+        "ready", "smoothed_wind.json exists and parses (no semantic timestamp found).",
+        age, CURRENT_DERIVED_FRESHNESS_SECONDS,
+    )
     return DiagnosticFact(
-        key=key, state="ready", summary="smoothed_wind.json exists and parses (no semantic timestamp found).",
+        key=key, state=state, summary=summary,
         path=str(path), timestamp=timestamp, age_seconds=age,
         evidence={"timestamp_source": "file_mtime", "exists": True},
     )
@@ -669,9 +729,24 @@ def _check_watch_warnings(path: Path, now) -> DiagnosticFact:
         return DiagnosticFact(key=key, state="needs_attention", summary="Watch/warning snapshot is not a list.", path=str(path), evidence={"exists": True})
     events = [e.get("event") for e in data if isinstance(e, dict) and e.get("event")]
     timestamp, age = _mtime_evidence(path, now)
+    # P1 2.4 Pass G: this is recurring source evidence written every
+    # successful update_local_wx_data.py cycle (5-minute cadence, same
+    # as the other CURRENT_DERIVED_FRESHNESS_SECONDS-governed files) --
+    # a stale snapshot must downgrade to `degraded` so
+    # _confirmed_active_count() (which only trusts a `ready` state)
+    # stops treating it as trustworthy current-alert evidence. This is
+    # what makes a stale EMPTY snapshot correctly fall through to
+    # `unknown` applicability below instead of a confident `no_active`
+    # -- see _classify_alert_applicability()'s own docstring; no change
+    # was needed there, since it already refuses to trust anything
+    # short of `ready`.
+    state, summary = _freshness_overlay(
+        "ready",
+        f"{len(data)} active watch/warning(s)." if data else "No active watches/warnings.",
+        age, CURRENT_DERIVED_FRESHNESS_SECONDS,
+    )
     return DiagnosticFact(
-        key=key, state="ready",
-        summary=f"{len(data)} active watch/warning(s)." if data else "No active watches/warnings.",
+        key=key, state=state, summary=summary,
         path=str(path), count=len(data), timestamp=timestamp, age_seconds=age,
         evidence={"events": events, "timestamp_source": "file_mtime", "exists": True},
     )
@@ -750,20 +825,103 @@ def _classify_alert_applicability(watch_fact: DiagnosticFact, amber_data_fact: D
     return "unknown"
 
 
+# Per-suffix routine-artifact freshness thresholds (weather.freshness)
+# -- wx_alert intentionally has NO entry here. It is event-driven; its
+# "not_applicable when nothing is currently active" semantics are
+# entirely owned by _classify_alert_applicability()/
+# _check_wx_alert_artifact() below, never by an age comparison.
+_ARTIFACT_FRESHNESS_SECONDS = {
+    "wx_temp": WX_TEMP_FRESHNESS_SECONDS,
+    "wx_obs": WX_OBS_FRESHNESS_SECONDS,
+    "wx_forecast": WX_FORECAST_FRESHNESS_SECONDS,
+}
+
+
+def _apply_provenance_overlay(fact: DiagnosticFact, data_dir: Path, category_code: str, expected_path: Path) -> DiagnosticFact:
+    """Compares the artifact's recorded provenance sidecar (weather.
+    provenance) against the actual file currently on disk, and folds
+    the result into `fact`:
+
+      - no sidecar at all -- a legacy artifact published before
+        provenance existed, or before its producer's first post-r0057
+        regeneration. NOT an error: downgrades an otherwise-`ready`
+        fact to `degraded` (never upgrades/masks a fact that was
+        already worse than `ready` for some other reason).
+      - sidecar present but its recorded final_path/sha256 disagree
+        with the actual current file -- real integrity evidence that
+        something published this file OUTSIDE the normal publish_
+        weather_asset pipeline. Always forces `needs_attention`.
+      - sidecar present and matches -- no change to `fact.state`, just
+        attaches the provenance payload as evidence.
+
+    Only called when the artifact file actually exists -- provenance
+    has nothing to compare against otherwise, and the missing-file
+    case is already `needs_attention`/`degraded` for its own reasons."""
+    payload, error = provenance_mod.read_provenance(data_dir, category_code)
+    if error == "missing":
+        evidence = {**(fact.evidence or {}), "provenance_state": "missing"}
+        if fact.state == "ready":
+            return dataclasses.replace(
+                fact, state="degraded",
+                summary=f"{fact.summary} No provenance sidecar recorded yet.",
+                evidence=evidence,
+            )
+        return dataclasses.replace(fact, evidence=evidence)
+    if error:
+        evidence = {**(fact.evidence or {}), "provenance_state": "malformed", "provenance_error": error}
+        return dataclasses.replace(
+            fact, state="needs_attention",
+            summary=f"{fact.summary} Provenance sidecar exists but failed to parse.",
+            evidence=evidence,
+        )
+
+    try:
+        actual_hash = provenance_mod.sha256_of(expected_path)
+    except OSError:
+        actual_hash = None
+    recorded_path = payload.get("final_path")
+    recorded_hash = payload.get("sha256")
+    mismatch = (recorded_path != str(expected_path)) or (
+        actual_hash is not None and recorded_hash != actual_hash
+    )
+    evidence = {
+        **(fact.evidence or {}),
+        "provenance_state": "mismatch" if mismatch else "ok",
+        "provenance": payload,
+    }
+    if mismatch:
+        return dataclasses.replace(
+            fact, state="needs_attention",
+            summary=f"{fact.summary} Provenance sidecar disagrees with the current artifact.",
+            detail=(f"{fact.detail} " if fact.detail else "")
+                   + "Recorded provenance path/hash does not match the file currently on disk.",
+            evidence=evidence,
+        )
+    return dataclasses.replace(fact, evidence=evidence)
+
+
 def _check_generated_artifact(
-    suffix, category_code, filename, event_driven, library_root: Path, now, alert_applicability: str | None = None,
+    suffix, category_code, filename, event_driven, library_root: Path, data_dir: Path, now,
+    alert_applicability: str | None = None,
 ) -> DiagnosticFact:
     """Inspects file-vs-Track agreement WITHOUT mutating anything --
     never creates a Track, never calls sync_track_file, never
-    synthesizes. delivery.py already atomically publishes the file and
-    runs sync_track_file together, so a disagreement here (file without
-    a Track, or vice versa) is itself useful evidence of something
-    interrupted between those two steps.
+    synthesizes. publish_weather_asset already atomically publishes the
+    file and runs sync_track_file together, so a disagreement here
+    (file without a Track, or vice versa) is itself useful evidence of
+    something interrupted between those two steps.
 
     `alert_applicability` (only meaningful when `event_driven`) is
     _classify_alert_applicability()'s verdict, computed once from the
     already-collected watch/warning + AMBER-data facts -- this function
-    never independently decides whether an alert is active."""
+    never independently decides whether an alert is active.
+
+    Two P1 2.4 Pass G overlays are applied uniformly to whichever fact
+    the logic below produces, for BOTH event-driven and routine
+    artifacts, whenever the file exists: a per-suffix freshness
+    threshold (routine artifacts only -- see _ARTIFACT_FRESHNESS_
+    SECONDS) and the provenance sidecar comparison (all artifacts,
+    including wx_alert -- see _apply_provenance_overlay)."""
     key = f"generated_artifact:{suffix}"
     expected_path = library_root / category_code / filename
     file_exists = expected_path.is_file()
@@ -781,8 +939,16 @@ def _check_generated_artifact(
         evidence["track_id"] = track.id
 
     if event_driven:
-        return _check_wx_alert_artifact(key, expected_path, file_exists, track, timestamp, age, evidence, alert_applicability)
+        fact = _check_wx_alert_artifact(key, expected_path, file_exists, track, timestamp, age, evidence, alert_applicability)
+    else:
+        fact = _check_routine_generated_artifact(key, suffix, filename, expected_path, file_exists, track, timestamp, age, evidence)
 
+    if file_exists:
+        fact = _apply_provenance_overlay(fact, data_dir, category_code, expected_path)
+    return fact
+
+
+def _check_routine_generated_artifact(key, suffix, filename, expected_path, file_exists, track, timestamp, age, evidence) -> DiagnosticFact:
     if not file_exists and track is None:
         return DiagnosticFact(
             key=key, state="degraded",
@@ -808,9 +974,12 @@ def _check_generated_artifact(
             path=str(expected_path), timestamp=timestamp, age_seconds=age,
             evidence=evidence,
         )
+    state, summary = _freshness_overlay(
+        "ready", f"{filename} is present and its Track is Ready to Air.",
+        age, _ARTIFACT_FRESHNESS_SECONDS.get(suffix, float("inf")),
+    )
     return DiagnosticFact(
-        key=key, state="ready",
-        summary=f"{filename} is present and its Track is Ready to Air.",
+        key=key, state=state, summary=summary,
         path=str(expected_path), timestamp=timestamp, age_seconds=age,
         evidence=evidence,
     )
@@ -877,4 +1046,79 @@ def _check_wx_alert_artifact(key, expected_path, file_exists, track, timestamp, 
         key=key, state="needs_attention",
         summary="An alert is active but wx_alert.mp3's Track is not marked Ready to Air.",
         path=str(expected_path), timestamp=timestamp, age_seconds=age, evidence=evidence,
+    )
+
+
+# ---------------------------------
+# RBDS cross-check (P1 2.4 Pass G)
+# ---------------------------------
+
+# update_local_wx_data.py's own RDS_FILE_1/RDS_FILE_2 basenames --
+# the only two filenames Weather ever writes for RBDS RadioText
+# consumption. Kept as a literal set here rather than importing
+# weather_ingest (a separate, isolated venv/checkout this Django app
+# has no import path to at all).
+_CANONICAL_RDS_FILENAMES = {"rds_temp.txt", "rds_wind.txt"}
+
+
+def _check_rbds_weather_provenance(data_dir: Path) -> DiagnosticFact:
+    """r0048 RDS wrong-path regression. A station may point one or more
+    RBDSMessage rows (Source Type = Local file) at Weather's
+    rds_temp.txt/rds_wind.txt for RadioText -- entirely optional, since
+    a station need not use Weather RadioText at all, so no such row
+    existing is `not_applicable`, not an error.
+
+    When such a row DOES exist, its resolved file_path must equal the
+    exact canonical file under WEATHER_DATA_DIR. A row still pointing
+    at a legacy standalone-repo path (e.g. /home/jreed/weather-ingest/
+    .../rds_temp.txt) is `needs_attention` even when that old file
+    happens to still exist and contain plausible-looking text -- this
+    is a real repository incident (r0048), not a hypothetical: an
+    operator/installer left an RBDS message pointed at the pre-
+    migration standalone tree instead of the canonical IsadoraAir
+    Weather data directory, so RadioText kept silently broadcasting
+    ever-more-stale legacy data while canonical Weather data was
+    current and correct.
+
+    Never auto-rewrites the RBDSMessage row -- this is detection-only
+    evidence, exactly like every other fact this module collects."""
+    from rbds.models import RBDSMessage
+
+    candidates = [
+        row for row in RBDSMessage.objects.filter(enabled=True, source_type="file").exclude(file_path="")
+        if Path(row.file_path).name in _CANONICAL_RDS_FILENAMES
+    ]
+
+    if not candidates:
+        return DiagnosticFact(
+            key="rbds_weather_provenance", state="not_applicable",
+            summary="No enabled RBDS message is configured to read a Weather RadioText file.",
+        )
+
+    mismatches = []
+    for row in candidates:
+        basename = Path(row.file_path).name
+        expected_path = (Path(data_dir) / basename).resolve()
+        actual_path = Path(row.file_path).expanduser().resolve()
+        if actual_path != expected_path:
+            mismatches.append({
+                "id": row.id, "name": row.name,
+                "actual_path": str(actual_path), "expected_path": str(expected_path),
+            })
+
+    if mismatches:
+        return DiagnosticFact(
+            key="rbds_weather_provenance", state="needs_attention",
+            summary=f"{len(mismatches)} RBDS message(s) point at a Weather RadioText file "
+                    f"outside the canonical Weather data directory.",
+            detail="An RBDS 'Local file' message's configured path must match the canonical "
+                   "rds_temp.txt/rds_wind.txt file under WEATHER_DATA_DIR -- a stale/legacy "
+                   "path is never auto-corrected here; an operator must update the RBDS message.",
+            evidence={"mismatches": mismatches, "matching_row_count": len(candidates)},
+        )
+    return DiagnosticFact(
+        key="rbds_weather_provenance", state="ready",
+        summary=f"{len(candidates)} RBDS message(s) correctly reference the canonical "
+                f"Weather RadioText file(s).",
+        evidence={"matching_row_count": len(candidates)},
     )

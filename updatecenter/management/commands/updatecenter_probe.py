@@ -14,7 +14,20 @@ def _ref(key):
 
 
 _SIMPLE_LITERAL_DEFAULT_TYPES = (bool, int, float, str, bytes)
-_NON_DATABASE_FIELD_METADATA = frozenset({"help_text"})
+# help_text: pure admin-form display text, never reaches the database.
+# choices (P1 2.4 Pass G): Django does not enforce `choices` at the
+# database level for an ordinary CharField/PositiveSmallIntegerField/
+# etc -- no CHECK constraint or native ENUM type is generated; it is
+# purely an application/ModelForm validation concern (see Django's own
+# BaseDatabaseSchemaEditor.alter_field(), whose db_parameters()
+# comparison never inspects `choices`). Adding a new choice (e.g.
+# MonitorCheck.KIND_CHOICES gaining a "weather" entry) is therefore the
+# exact same kind of approved non-database metadata change as a
+# help_text edit, not a schema change -- see
+# ActualMonitoringWeatherKindMigrationClassificationTests in
+# updatecenter/tests/test_updatecenter_probe.py for the actual on-disk
+# migration this was proven against.
+_NON_DATABASE_FIELD_METADATA = frozenset({"help_text", "choices"})
 
 
 def _classify_add_field(operation):

@@ -11,7 +11,7 @@ from library.models import AnalysisConfig, Album, Artist, Category, Genre, Track
 from library.services.related_artists import resolve_fallback_metadata
 
 
-def sync_track_file(filepath, ready2air=True):
+def sync_track_file(filepath, ready2air=True, wave_dir=None):
     """Sync exactly one file into the library and force fresh analysis.
     Built for ingestion pipelines (e.g. syndicated show fetchers, and
     aircheck.services.recorder's Stop path) that write or replace a file
@@ -33,6 +33,17 @@ def sync_track_file(filepath, ready2air=True):
     should require human review before ever being schedulable -- e.g.
     an Aircheck recording, which is archival (a record of what already
     aired), not new programming.
+
+    wave_dir: None (default, unchanged behavior for every existing
+    caller) uses the real get_waveforms_dir(). A caller may pass an
+    explicit scratch directory instead so analysis writes its waveform
+    JSON there rather than into the real WAVEFORMS_DIR -- see
+    weather/publication.py::publish_weather_asset, which analyzes into
+    a publication-owned scratch directory and only publishes the
+    resulting <track_id>.json into the real directory once analysis
+    has genuinely succeeded, so a failed first-generation analysis
+    never touches the real waveform directory AT ALL (nothing to scan
+    for or clean up afterward).
 
     Raises CommandError (a plain exception outside management-command
     context -- callers that aren't a Command themselves should just
@@ -140,7 +151,7 @@ def sync_track_file(filepath, ready2air=True):
             category.next_start_threshold_db_override,
             category.cue_in_threshold_db_override,
         )
-    wave_dir = get_waveforms_dir()
+    wave_dir = wave_dir if wave_dir is not None else get_waveforms_dir()
 
     # existing_related="" forces fresh related-artist extraction --
     # new content at this path means the previous episode's

@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "release_id": "r0057",
+  "previous_release_id": "r0056",
+  "minimum_updater_protocol_version": 5,
+  "summary": "Pass G: adds Weather freshness policy and generated-artifact provenance sidecars to the diagnostics authority, makes wx_forecast.py's six-hour cache boundary authoritative, replaces weather_ingest's delivery sequence with a last-known-good publish_weather_asset command, adds an RBDS wrong-path check (r0048 regression), and wires Weather health into Monitoring via a new weather MonitorCheck kind. No Weather audio/category/filename/cue/schedule change; the three alert paths remain independent.",
+  "migrations_required": [
+    "monitoring.0012_alter_monitorcheck_kind"
+  ],
+  "migration_compatibility": "additive",
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-gunicorn",
+    "isadoraair-monitoring"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0007"
+}

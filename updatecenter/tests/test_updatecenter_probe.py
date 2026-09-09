@@ -309,3 +309,36 @@ class ActualR0056WebRequestsMigrationClassificationTests(SimpleTestCase):
             {item["detail"] for item in classifications},
             {"non-null field with explicit simple literal default"},
         )
+
+
+class ActualMonitoringWeatherKindMigrationClassificationTests(SimpleTestCase):
+    """r0057 (Pass G) adds a new 'weather' choice to MonitorCheck.kind's
+    KIND_CHOICES -- Django generates an AlterField for this (choices is
+    part of the field's deconstructed kwargs), but choices is NOT
+    database-affecting (see _NON_DATABASE_FIELD_METADATA's own comment
+    in updatecenter_probe.py). This proves the ACTUAL on-disk migration
+    Update Center will encounter classifies additive, not manual."""
+
+    def test_every_actual_monitoring_0012_operation_is_additive(self):
+        loader = MigrationLoader(None)
+        migration_key = ("monitoring", "0012_alter_monitorcheck_kind")
+        migration = loader.disk_migrations[migration_key]
+        state = loader.project_state([("monitoring", "0011_transmitter_vendor_and_password")])
+        classifications = []
+
+        for operation in migration.operations:
+            before_state = state.clone()
+            operation.state_forwards("monitoring", state)
+            classifications.append(
+                _classify_operation(
+                    operation, app_label="monitoring", before_state=before_state, after_state=state,
+                )
+            )
+
+        self.assertEqual(len(classifications), 1)
+        self.assertEqual(classifications[0]["operation"], "AlterField")
+        self.assertEqual(classifications[0]["classification"], "additive")
+        self.assertEqual(
+            classifications[0]["detail"],
+            "field definition differs only in approved non-database metadata",
+        )

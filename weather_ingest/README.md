@@ -144,14 +144,27 @@ See `.gitignore` for the exact exclusion list.
 ## What IS versioned
 
 All `*.py` source (top level and `lib/`), plus `media/weather_beeps.flac`
--- a small, fixed audio asset `wx_alert_beep.py` plays, not generated
-output.
+-- a small, fixed legacy audio asset, not generated output.
 
+**`weather_beeps.flac` is NOT the runtime Weather Alert Beep source**
+(corrected in P1 2.4 Pass G -- a prior version of this document
+claimed `wx_alert_beep.py` plays this file; it does not, and static
+source-text review confirms `wx_alert_beep.py` contains no reference
+to this file at all). The actual runtime beep is the operator-selected
+FX Cart configured at `WeatherConfig.alert_sound_cart`, fired via
+IsadoraAir's `fire_fx_cart` management command bridge -- see
+`wx_alert_beep.py`'s own header comment and
+`weather.diagnostics._check_alert_fx_cart()`, the one readiness
+authority for that cart's configuration.
 
 Repository history establishes that `weather_beeps.flac` was imported
 byte-for-byte from the standalone repository, but contains no source,
 author, license, or acquisition record. Its provenance is not
-established from repository evidence.
+established from repository evidence. It remains versioned here as a
+legacy artifact only -- removal or replacement with a known-origin
+bundled sound is future cleanup, not a runtime dependency, since
+nothing in this project's current runtime path reads it.
+
 ## Voice resolution (shared-TTS migration)
 
 `auto` or an explicit arbitrary persona slot resolves identically

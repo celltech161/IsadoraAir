@@ -5,6 +5,7 @@ properties, and its two proving consumers (Admin subpage + management
 command) -- see weather/diagnostics.py's own module docstring for the
 design rules being enforced here."""
 import json
+import shutil
 import subprocess
 import tempfile
 from datetime import datetime, timedelta, timezone as dt_timezone
@@ -19,6 +20,7 @@ from django.urls import reverse
 
 from isadoraair.tts.models import StationTTSVoice
 from library.models import Artist, Category, CategoryKind, FXCart, Track
+from weather import provenance as provenance_mod
 from weather.diagnostics import FORECAST_CACHE_WARN_HOURS, get_weather_diagnostics
 from weather.models import AmberAlertConfig, WeatherConfig, WeatherVoicePersona
 
@@ -51,6 +53,21 @@ def make_track(filepath, category, ready2air=True):
 def write_json(path, obj):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(obj))
+
+
+def write_matching_provenance(data_dir, category_code, final_path, **overrides):
+    """Writes a provenance sidecar that genuinely matches `final_path`
+    (real sha256, real path) -- the P1 2.4 Pass G "everything is
+    correctly published" baseline a `ready` generated-artifact fact
+    now also requires. Tests proving the missing/mismatched-provenance
+    overlay itself deliberately do NOT call this helper."""
+    kwargs = dict(
+        category_code=category_code, filename=Path(final_path).name, final_path=final_path,
+        producer="test", generated_at="2026-09-08T12:00:00Z", voice="Test_Voice",
+        source_kind="derived_local", source_age_seconds=1.0, used_fallback=False,
+    )
+    kwargs.update(overrides)
+    return provenance_mod.write_provenance(data_dir, **kwargs)
 
 
 class DiagnosticsConfigurationTests(TestCase):
@@ -469,6 +486,70 @@ class DiagnosticsAlertsTests(TestCase):
         self.assertEqual(fact.count, 1)
         self.assertEqual(fact.evidence["events"], ["Tornado Warning"])
 
+    def test_recent_empty_snapshot_preserves_existing_not_applicable_behavior(self):
+        """P1 2.4 Pass G freshness correction must not disturb the
+        existing, already-tested no-active/not_applicable behavior for
+        a genuinely recent snapshot."""
+        import os
+        path = self.data_dir / "active_watches_warnings.json"
+        write_json(path, [])
+        recent = (NOW - timedelta(minutes=5)).timestamp()
+        os.utime(path, (recent, recent))
+        snap = self.snapshot()
+        self.assertEqual(snap.get("watch_warnings").state, "ready")
+        self.assertEqual(snap.get("generated_artifact:wx_alert").state, "not_applicable")
+
+    def test_stale_empty_snapshot_is_degraded_not_ready(self):
+        """Recurring source evidence (5-minute update_local_wx_data.py
+        cadence) -- a stale snapshot is no longer authoritative current-
+        alert evidence, even though its CONTENT (an empty list) would
+        otherwise read as a confident zero. Age/count evidence is
+        retained on the fact even though state downgrades."""
+        import os
+        from weather.freshness import CURRENT_DERIVED_FRESHNESS_SECONDS
+        path = self.data_dir / "active_watches_warnings.json"
+        write_json(path, [])
+        stale = (NOW - timedelta(seconds=CURRENT_DERIVED_FRESHNESS_SECONDS + 60)).timestamp()
+        os.utime(path, (stale, stale))
+        snap = self.snapshot()
+        fact = snap.get("watch_warnings")
+        self.assertEqual(fact.state, "degraded")
+        self.assertEqual(fact.count, 0)
+        self.assertIsNotNone(fact.age_seconds)
+
+    def test_stale_populated_snapshot_is_also_degraded(self):
+        import os
+        from weather.freshness import CURRENT_DERIVED_FRESHNESS_SECONDS
+        path = self.data_dir / "active_watches_warnings.json"
+        write_json(path, [{"event": "Tornado Warning", "text": "...", "text_core": "..."}])
+        stale = (NOW - timedelta(seconds=CURRENT_DERIVED_FRESHNESS_SECONDS + 60)).timestamp()
+        os.utime(path, (stale, stale))
+        snap = self.snapshot()
+        fact = snap.get("watch_warnings")
+        self.assertEqual(fact.state, "degraded")
+        self.assertEqual(fact.count, 1, "count evidence is retained even though state downgrades")
+
+    def test_stale_empty_watch_snapshot_makes_wx_alert_applicability_unknown(self):
+        """The critical safety property: a stale but confirmed-EMPTY
+        watch snapshot must NEVER be read as a confident 'no active
+        alert' -- it must fall through to `unknown` applicability
+        (generated_artifact:wx_alert -> degraded), not `not_applicable`,
+        since staleness means the snapshot can no longer be trusted to
+        reflect the CURRENT alert state at all. AMBER is left
+        unconfigured (confirmed zero on its own), so this isolates the
+        watch-snapshot staleness effect specifically."""
+        import os
+        from weather.freshness import CURRENT_DERIVED_FRESHNESS_SECONDS
+        path = self.data_dir / "active_watches_warnings.json"
+        write_json(path, [])
+        stale = (NOW - timedelta(seconds=CURRENT_DERIVED_FRESHNESS_SECONDS + 60)).timestamp()
+        os.utime(path, (stale, stale))
+        snap = self.snapshot()
+        self.assertEqual(snap.get("watch_warnings").state, "degraded")
+        fact = snap.get("generated_artifact:wx_alert")
+        self.assertEqual(fact.state, "degraded")
+        self.assertNotEqual(fact.state, "not_applicable")
+
     def test_malformed_watch_warning_json_is_needs_attention(self):
         (self.data_dir / "active_watches_warnings.json").write_text("{bad")
         snap = self.snapshot()
@@ -534,8 +615,49 @@ class DiagnosticsGeneratedArtifactTests(TestCase):
         path = self._artifact_path()
         path.write_bytes(b"id3")
         make_track(path, self.category, ready2air=True)
+        write_matching_provenance(self.data_dir, "WxTemp", path)
         snap = self.snapshot()
         self.assertEqual(snap.get("generated_artifact:wx_temp").state, "ready")
+
+    def test_file_present_track_present_but_no_provenance_sidecar_is_degraded(self):
+        # P1 2.4 Pass G: a legacy artifact published before provenance
+        # existed (or before its producer's first post-r0057
+        # regeneration) is NOT an error -- degraded, not needs_attention.
+        path = self._artifact_path()
+        path.write_bytes(b"id3")
+        make_track(path, self.category, ready2air=True)
+        snap = self.snapshot()
+        fact = snap.get("generated_artifact:wx_temp")
+        self.assertEqual(fact.state, "degraded")
+        self.assertIn("provenance", fact.summary.lower())
+
+    def test_provenance_hash_mismatch_is_needs_attention(self):
+        path = self._artifact_path()
+        path.write_bytes(b"id3")
+        make_track(path, self.category, ready2air=True)
+        write_matching_provenance(self.data_dir, "WxTemp", path)
+        # Something replaced the file OUTSIDE publish_weather_asset
+        # after provenance was recorded -- the sidecar now disagrees.
+        path.write_bytes(b"tampered-content")
+        snap = self.snapshot()
+        fact = snap.get("generated_artifact:wx_temp")
+        self.assertEqual(fact.state, "needs_attention")
+        self.assertIn("provenance", fact.summary.lower())
+
+    def test_provenance_path_mismatch_is_needs_attention(self):
+        path = self._artifact_path()
+        path.write_bytes(b"id3")
+        make_track(path, self.category, ready2air=True)
+        sidecar = write_matching_provenance(self.data_dir, "WxTemp", path)
+        # Hash still matches (same bytes); only the recorded path is
+        # wrong -- e.g. the artifact was moved/renamed outside
+        # publish_weather_asset since provenance was last recorded.
+        payload = json.loads(sidecar.read_text())
+        payload["final_path"] = "/some/other/path/current_temp.mp3"
+        sidecar.write_text(json.dumps(payload))
+        snap = self.snapshot()
+        fact = snap.get("generated_artifact:wx_temp")
+        self.assertEqual(fact.state, "needs_attention")
 
     def test_file_present_track_missing_needs_attention(self):
         path = self._artifact_path()
@@ -600,6 +722,7 @@ class DiagnosticsWxAlertApplicabilityTests(TestCase):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"id3")
         make_track(path, self.category, ready2air=ready2air)
+        write_matching_provenance(self.data_dir, "WxAlert", path, alert_family="nws_watch_warning")
         return path
 
     def test_no_active_alerts_and_artifact_absent_is_not_applicable(self):
@@ -674,6 +797,217 @@ class DiagnosticsWxAlertApplicabilityTests(TestCase):
         self._make_artifact(ready2air=True)
         snap = self.snapshot()
         self.assertEqual(snap.get("generated_artifact:wx_alert").state, "ready")
+
+
+class DiagnosticsFreshnessTests(TestCase):
+    """P1 2.4 Pass G: routine (non-event-driven) evidence now carries a
+    freshness interpretation on top of the raw age evidence Pass B
+    already collected -- see weather/freshness.py for the thresholds
+    and cadence rationale."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="isadoraair-wxdiag-fresh-")
+        self.addCleanup(self.tmp.cleanup)
+        self.data_dir = Path(self.tmp.name)
+        self.lib_tmp = tempfile.TemporaryDirectory(prefix="isadoraair-wxdiag-fresh-lib-")
+        self.addCleanup(self.lib_tmp.cleanup)
+        self.library_root = Path(self.lib_tmp.name)
+        WeatherConfig.load()
+
+    def snapshot(self):
+        return get_weather_diagnostics(now=NOW, data_dir=self.data_dir, library_root=self.library_root)
+
+    def _age_file(self, path, age_seconds):
+        import os
+        ts = (NOW - timedelta(seconds=age_seconds)).timestamp()
+        os.utime(path, (ts, ts))
+
+    def test_fresh_current_derived_file_is_ready(self):
+        from weather.freshness import CURRENT_DERIVED_FRESHNESS_SECONDS
+        path = self.data_dir / "sky_condition.json"
+        write_json(path, {"condition": "clear"})
+        self._age_file(path, CURRENT_DERIVED_FRESHNESS_SECONDS - 60)
+        snap = self.snapshot()
+        self.assertEqual(snap.get("weather_data_file:sky_condition.json").state, "ready")
+
+    def test_stale_current_derived_file_is_degraded(self):
+        from weather.freshness import CURRENT_DERIVED_FRESHNESS_SECONDS
+        path = self.data_dir / "sky_condition.json"
+        write_json(path, {"condition": "clear"})
+        self._age_file(path, CURRENT_DERIVED_FRESHNESS_SECONDS + 60)
+        snap = self.snapshot()
+        fact = snap.get("weather_data_file:sky_condition.json")
+        self.assertEqual(fact.state, "degraded")
+        self.assertIn("stale", fact.summary.lower())
+
+    def test_fresh_latest_weather_semantic_timestamp_is_ready(self):
+        from weather.freshness import CURRENT_DERIVED_FRESHNESS_SECONDS
+        ts = NOW - timedelta(seconds=CURRENT_DERIVED_FRESHNESS_SECONDS - 60)
+        write_json(self.data_dir / "latest_weather.json", {"timestamp": ts.isoformat().replace("+00:00", "Z")})
+        snap = self.snapshot()
+        self.assertEqual(snap.get("weather_data_file:latest_weather.json").state, "ready")
+
+    def test_stale_latest_weather_semantic_timestamp_is_degraded(self):
+        from weather.freshness import CURRENT_DERIVED_FRESHNESS_SECONDS
+        ts = NOW - timedelta(seconds=CURRENT_DERIVED_FRESHNESS_SECONDS + 60)
+        write_json(self.data_dir / "latest_weather.json", {"timestamp": ts.isoformat().replace("+00:00", "Z")})
+        snap = self.snapshot()
+        self.assertEqual(snap.get("weather_data_file:latest_weather.json").state, "degraded")
+
+    def _generated_artifact(self, category_code, filename, age_seconds):
+        category = make_category(category_code)
+        path = self.library_root / category_code / filename
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"id3")
+        make_track(path, category, ready2air=True)
+        write_matching_provenance(self.data_dir, category_code, path)
+        self._age_file(path, age_seconds)
+        return path
+
+    def test_fresh_wx_temp_artifact_is_ready(self):
+        from weather.freshness import WX_TEMP_FRESHNESS_SECONDS
+        self._generated_artifact("WxTemp", "current_temp.mp3", WX_TEMP_FRESHNESS_SECONDS - 60)
+        snap = self.snapshot()
+        self.assertEqual(snap.get("generated_artifact:wx_temp").state, "ready")
+
+    def test_stale_wx_temp_artifact_is_degraded(self):
+        from weather.freshness import WX_TEMP_FRESHNESS_SECONDS
+        self._generated_artifact("WxTemp", "current_temp.mp3", WX_TEMP_FRESHNESS_SECONDS + 60)
+        snap = self.snapshot()
+        fact = snap.get("generated_artifact:wx_temp")
+        self.assertEqual(fact.state, "degraded")
+        self.assertIn("stale", fact.summary.lower())
+
+    def test_fresh_wx_obs_artifact_is_ready(self):
+        from weather.freshness import WX_OBS_FRESHNESS_SECONDS
+        self._generated_artifact("WxObs", "current_obs.mp3", WX_OBS_FRESHNESS_SECONDS - 60)
+        snap = self.snapshot()
+        self.assertEqual(snap.get("generated_artifact:wx_obs").state, "ready")
+
+    def test_stale_wx_obs_artifact_is_degraded(self):
+        from weather.freshness import WX_OBS_FRESHNESS_SECONDS
+        self._generated_artifact("WxObs", "current_obs.mp3", WX_OBS_FRESHNESS_SECONDS + 60)
+        snap = self.snapshot()
+        self.assertEqual(snap.get("generated_artifact:wx_obs").state, "degraded")
+
+    def test_fresh_wx_forecast_artifact_is_ready(self):
+        from weather.freshness import WX_FORECAST_FRESHNESS_SECONDS
+        self._generated_artifact("WxForecast", "forecast.mp3", WX_FORECAST_FRESHNESS_SECONDS - 60)
+        snap = self.snapshot()
+        self.assertEqual(snap.get("generated_artifact:wx_forecast").state, "ready")
+
+    def test_stale_wx_forecast_artifact_is_degraded(self):
+        from weather.freshness import WX_FORECAST_FRESHNESS_SECONDS
+        self._generated_artifact("WxForecast", "forecast.mp3", WX_FORECAST_FRESHNESS_SECONDS + 60)
+        snap = self.snapshot()
+        self.assertEqual(snap.get("generated_artifact:wx_forecast").state, "degraded")
+
+    def test_wx_alert_has_no_freshness_threshold_applied(self):
+        """Event-driven WxAlert must never be judged stale merely for
+        being old -- its state is entirely applicability-driven (see
+        DiagnosticsWxAlertApplicabilityTests). A very old, currently-
+        active alert artifact must still read `ready`, not `degraded`."""
+        from weather.freshness import WX_FORECAST_FRESHNESS_SECONDS
+        write_json(self.data_dir / "active_watches_warnings.json", [
+            {"event": "Tornado Warning", "text": "...", "text_core": "..."},
+        ])
+        self._generated_artifact("WxAlert", "wx_alert.mp3", WX_FORECAST_FRESHNESS_SECONDS * 10)
+        snap = self.snapshot()
+        self.assertEqual(snap.get("generated_artifact:wx_alert").state, "ready")
+
+
+class DiagnosticsRBDSProvenanceTests(TestCase):
+    """r0048 RDS wrong-path regression (P1 2.4 Pass G): an RBDSMessage
+    'Local file' row pointed at Weather's rds_temp.txt/rds_wind.txt must
+    resolve to the canonical file under WEATHER_DATA_DIR, never a
+    legacy/standalone path -- see diagnostics.py's
+    _check_rbds_weather_provenance()."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="isadoraair-wxdiag-rbds-")
+        self.addCleanup(self.tmp.cleanup)
+        self.data_dir = Path(self.tmp.name)
+        WeatherConfig.load()
+
+    def snapshot(self):
+        return get_weather_diagnostics(now=NOW, data_dir=self.data_dir)
+
+    def _make_message(self, file_path, enabled=True, source_type="file"):
+        from rbds.models import RBDSMessage
+        return RBDSMessage.objects.create(
+            name="Weather Temp", source_type=source_type, file_path=str(file_path), enabled=enabled,
+        )
+
+    def test_no_matching_rows_is_not_applicable(self):
+        snap = self.snapshot()
+        self.assertEqual(snap.get("rbds_weather_provenance").state, "not_applicable")
+
+    def test_unrelated_file_message_is_not_applicable(self):
+        # A Local-file RBDS message that isn't about Weather RadioText
+        # at all must not be swept into this check.
+        self._make_message(self.data_dir / "some_other_file.txt")
+        snap = self.snapshot()
+        self.assertEqual(snap.get("rbds_weather_provenance").state, "not_applicable")
+
+    def test_disabled_message_is_ignored(self):
+        self._make_message(self.data_dir / "rds_temp.txt", enabled=False)
+        snap = self.snapshot()
+        self.assertEqual(snap.get("rbds_weather_provenance").state, "not_applicable")
+
+    def test_canonical_path_is_ready(self):
+        canonical = self.data_dir / "rds_temp.txt"
+        canonical.write_text("72F Clear")
+        self._make_message(canonical)
+        snap = self.snapshot()
+        fact = snap.get("rbds_weather_provenance")
+        self.assertEqual(fact.state, "ready")
+        self.assertEqual(fact.evidence["matching_row_count"], 1)
+
+    def test_real_r0048_incident_legacy_path_is_needs_attention(self):
+        """Reproduces the real incident: canonical Weather RDS data is
+        current and correct, but a legacy standalone-repo copy of the
+        SAME filename is stale yet still readable, and the RBDS message
+        points at that legacy file instead of the canonical one."""
+        canonical = self.data_dir / "rds_temp.txt"
+        canonical.write_text("72F Clear")  # current, correct
+
+        legacy_root = Path(self.tmp.name).parent / "legacy-weather-ingest-standalone"
+        legacy_root.mkdir(exist_ok=True)
+        legacy_path = legacy_root / "rds_temp.txt"
+        legacy_path.write_text("58F Cloudy")  # stale, but plausible-looking text
+        self.addCleanup(shutil.rmtree, legacy_root, ignore_errors=True)
+
+        self._make_message(legacy_path)
+
+        snap = self.snapshot()
+        fact = snap.get("rbds_weather_provenance")
+        self.assertEqual(fact.state, "needs_attention")
+        mismatch = fact.evidence["mismatches"][0]
+        self.assertEqual(mismatch["actual_path"], str(legacy_path.resolve()))
+        self.assertEqual(mismatch["expected_path"], str((self.data_dir / "rds_temp.txt").resolve()))
+
+    def test_rds_wind_txt_also_covered(self):
+        canonical = self.data_dir / "rds_wind.txt"
+        canonical.write_text("Wind 10 mph")
+        self._make_message(canonical)
+        snap = self.snapshot()
+        self.assertEqual(snap.get("rbds_weather_provenance").state, "ready")
+
+    def test_never_auto_rewrites_the_row(self):
+        from rbds.models import RBDSMessage
+        legacy_path = self.data_dir.parent / "legacy_rds_temp.txt"
+        legacy_path.write_text("stale")
+        self.addCleanup(legacy_path.unlink, missing_ok=True)
+        # Give it the canonical basename so it matches the check.
+        actual_legacy = self.data_dir.parent / "rds_temp.txt"
+        legacy_path.rename(actual_legacy)
+        self.addCleanup(actual_legacy.unlink, missing_ok=True)
+        message = self._make_message(actual_legacy)
+
+        self.snapshot()
+
+        message.refresh_from_db()
+        self.assertEqual(message.file_path, str(actual_legacy))  # untouched
 
 
 class DiagnosticsSideEffectTests(TestCase):

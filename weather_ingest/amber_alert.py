@@ -178,7 +178,11 @@ def _main_body():
         log.error("Concat failed; nothing to insert. Previous wx_alert.mp3 (if any) is untouched.")
         return False
 
-    dest = deliver(COMBINED_OUTPUT, CATEGORY_CODE, DEST_FILENAME)
+    dest = deliver(
+        COMBINED_OUTPUT, CATEGORY_CODE, DEST_FILENAME,
+        producer="amber_alert.py", voice=voice["name"],
+        source_kind="event", alert_family="ipaws_amber",
+    )
     log.info("Delivered and synced: %s", dest)
 
     _fire_insert_urgent()

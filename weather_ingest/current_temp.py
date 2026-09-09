@@ -48,6 +48,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
@@ -318,7 +319,16 @@ def main():
             return False
 
         try:
-            dest = deliver(OUTPUT_MP3, CATEGORY_CODE, DEST_FILENAME)
+            source_age_seconds = None
+            try:
+                source_age_seconds = time.time() - os.path.getmtime(DATA_FILE)
+            except OSError:
+                pass  # provenance is best-effort; publish proceeds either way
+            dest = deliver(
+                OUTPUT_MP3, CATEGORY_CODE, DEST_FILENAME,
+                producer="current_temp.py", voice=voice["name"],
+                source_kind="derived_local", source_age_seconds=source_age_seconds,
+            )
             log.info("Delivered and synced: %s", dest)
         except Exception as e:
             log.error("Delivery failed: %s", e)

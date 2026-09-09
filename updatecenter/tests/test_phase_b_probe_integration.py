@@ -87,6 +87,20 @@ class R0011ProspectiveR0012TargetSchemaTests(TransactionTestCase):
     """Exercise the real incident migration through the staged-target contract."""
 
     migration_ref = "monitoring.0011_transmitter_vendor_and_password"
+    # Every monitoring migration that exists AFTER r0010 in the current
+    # source tree's dependency graph -- this test starts the DB frozen
+    # at monitoring.0010 (see r0010_targets below) and must therefore
+    # expect ALL of them as pending, not just the one this test's
+    # docstring names as "the real incident migration". r0057 (P1 2.4
+    # Pass G) added monitoring.0012_alter_monitorcheck_kind (a new
+    # MonitorCheck.kind choice, additive) on top of 0011 -- this tuple
+    # was updated accordingly, the same reasoning as updatecenter/
+    # tests/test_planner.py's SchemaDriftDetectionTests.MIGRATION
+    # constant needing to track the actual current leaf.
+    pending_migration_refs = (
+        "monitoring.0011_transmitter_vendor_and_password",
+        "monitoring.0012_alter_monitorcheck_kind",
+    )
 
     def test_r0012_probe_accepts_and_applies_r0011_from_supported_baselines(self):
         executor = MigrationExecutor(connection)
@@ -128,7 +142,7 @@ class R0011ProspectiveR0012TargetSchemaTests(TransactionTestCase):
                         installed_release_id=installed_release,
                         target_release_id="r0012",
                         releases_in_plan=releases_in_plan,
-                        migrations_required=(self.migration_ref,),
+                        migrations_required=self.pending_migration_refs,
                         migration_compatibility="additive",
                     )
                     actual = executor_validator._validate_target_schema(
@@ -137,7 +151,7 @@ class R0011ProspectiveR0012TargetSchemaTests(TransactionTestCase):
                         {"applied": target_payload["applied"]},
                         migration_already_started=False,
                     )
-                    self.assertEqual(actual, (self.migration_ref,))
+                    self.assertEqual(actual, self.pending_migration_refs)
 
             # Complete the isolated transition and prove the real migration
             # becomes applied with no target-schema work left pending.
