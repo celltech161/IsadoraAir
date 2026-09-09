@@ -8,11 +8,19 @@ from django.utils.html import format_html
 
 from isadoraair import env_admin, env_config
 
+from .diagnostics import get_weather_diagnostics
 from .forms import WeatherConfigForm
 from .models import AmberAlertConfig, WeatherConfig, WeatherVoicePersona
 
 _WEATHER_ENV_KEYS = ["WEATHER_DATA_DIR"]
-_WEATHER_DIAGNOSTIC_FILES = ["latest_weather.json", "wind_history.json", "smoothed_wind.json"]
+# r0050: proves weather.diagnostics is genuinely reusable -- this page no
+# longer maintains its own separate hardcoded file-presence list, it
+# reads the same facts the weather_diagnostics management command does.
+_WEATHER_DIAGNOSTIC_FILE_KEYS = [
+    "weather_data_file:latest_weather.json",
+    "weather_data_file:wind_history.json",
+    "weather_data_file:smoothed_wind.json",
+]
 
 
 @admin.register(WeatherVoicePersona)
@@ -117,8 +125,13 @@ class WeatherConfigAdmin(admin.ModelAdmin):
         except env_config.EnvConfigError:
             data_dir_value = None
         if data_dir_value:
-            present = [f for f in _WEATHER_DIAGNOSTIC_FILES if (Path(data_dir_value) / f).is_file()]
-            missing = [f for f in _WEATHER_DIAGNOSTIC_FILES if f not in present]
+            snapshot = get_weather_diagnostics(data_dir=Path(data_dir_value))
+            present = []
+            missing = []
+            for key in _WEATHER_DIAGNOSTIC_FILE_KEYS:
+                fact = snapshot.get(key)
+                filename = key.split(":", 1)[1]
+                (present if fact and fact.state == "ready" else missing).append(filename)
             status_text = f"Diagnostic files currently in the saved directory: {', '.join(present) if present else 'none yet'}."
             if missing:
                 status_text += f" Missing (optional -- not required to save this page): {', '.join(missing)}."

@@ -12,6 +12,7 @@ from django import forms
 from django.utils import timezone
 
 from .models import WeatherConfig, WeatherVoicePersona
+from .persona_readiness import check_persona_slots
 from .voice_schedule import ScheduleError, compress_from_hours, expand_to_hours
 
 
@@ -204,22 +205,11 @@ class HourlyScheduleField(forms.Field):
             raise forms.ValidationError(str(exc)) from exc
 
         referenced_slots = sorted(set(hour_to_slot.values()))
-        personas = {
-            persona.slot: persona
-            for persona in WeatherVoicePersona.objects.filter(slot__in=referenced_slots).select_related("tts_voice")
-        }
-        problems = []
-        for slot in referenced_slots:
-            persona = personas.get(slot)
-            if persona is None:
-                problems.append(f'"{slot}" is scheduled but no Weather Voice Persona exists for that slot.')
-                continue
-            label = persona.display_name or persona.full_name or slot
-            if persona.tts_voice_id is None:
-                problems.append(f'"{label}" is scheduled but has no logical station voice selected.')
-                continue
-            if not persona.tts_voice.enabled:
-                problems.append(f'"{label}" is scheduled but its station voice ({persona.tts_voice.name}) is disabled.')
+        problems = [
+            check.problem
+            for check in check_persona_slots(referenced_slots)
+            if check.problem
+        ]
         if problems:
             raise forms.ValidationError(problems)
 
