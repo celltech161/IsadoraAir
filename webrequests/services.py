@@ -1,7 +1,5 @@
 import json
-import os
 import re
-import subprocess
 import time
 from datetime import timedelta
 from pathlib import Path
@@ -11,9 +9,13 @@ from django.db import close_old_connections, connection, transaction
 from django.db.utils import OperationalError
 from django.utils import timezone
 
+from isadoraair.announcements import (
+    AnnouncementTrackMetadata,
+    SpeechSpliceAnnouncement,
+    render_announcement,
+)
 from isadoraair.tts.errors import TTSConfigurationError
-from isadoraair.tts.station import synthesize_station_voice
-from library.models import Category, LogItem, PlaylistLog, RecencyConfig, Track
+from library.models import LogItem, PlaylistLog, RecencyConfig, Track
 from library.services.log_builder import get_recent_exclusions, get_separation
 from library.services.related_artists import track_identity_keys
 from monitoring.models import emit_event
@@ -475,139 +477,63 @@ def build_dedication_intro_text(track, requester_name, dedication_message):
     return sentence
 
 
-def _probe_duration(path):
-    """Same ffprobe pattern as library/management/commands/
-    prep_mitd_show.py's _probe_duration -- duration in seconds as a float."""
-    out = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-         "-of", "default=nw=1:nk=1", str(path)],
-        check=True, capture_output=True, text=True, timeout=15,
-    )
-    return float(out.stdout.strip())
-
-
-def _synthesize_dedication_wav(cfg, text, tmp_wav):
-    """cfg is the already-loaded WebRequestConfig singleton (callers
-    already load it once per request; no extra query here).
-
-    dedication_tts_voice must be set -- routed through the station's
-    own logical-voice API (isadoraair.tts.station), which resolves the
-    logical name to a real provider/voice/engine internally. This
-    function passes only cfg.dedication_tts_voice.name -- the logical
-    name an operator picked in Django Admin -- never a Kokoro provider
-    voice id; the caller has no other knowledge of or access to
-    provider infrastructure.
-
-    dedication_tts_voice is null (still this field's default, e.g. a
-    fresh install that has never had an operator select one in Django
-    Admin) is now an invalid configuration state: the direct-Kokoro
-    fallback this used to run (a hardcoded `/home/jreed/kokoro/bin/
-    kokoro_synth` invocation with a hardcoded "am_fenrir" voice) was
-    retired in r0029; that runtime no longer exists. Raises
-    TTSConfigurationError immediately rather than attempting a deleted
-    binary -- caught by synthesize_dedication_intro()'s own wrapping
-    try/except below, same non-fatal, no-intro-attached contract as any
-    other synthesis failure."""
-
-    if cfg.dedication_tts_voice_id is None:
-        raise TTSConfigurationError(
-            "WebRequestConfig.dedication_tts_voice is not set -- dedication intros have "
-            "no other way to resolve a voice. The legacy direct-Kokoro fallback this used "
-            "to run was retired in r0029 and no longer exists. Select a Dedication TTS "
-            "Voice in Django Admin (Web Requests configuration) to enable dedication intros."
-        )
-
-    synthesize_station_voice(
-        text,
-        voice=cfg.dedication_tts_voice.name,
-        output_path=tmp_wav,
-        timeout_seconds=cfg.dedication_tts_timeout_seconds,
-    )
-
-
 def synthesize_dedication_intro(req):
-    """Renders req's spoken intro via shared TTS, converts to FLAC, and
-    attaches it as req.intro_track -- called from the
-    generate_dedication_intros command (its own timer, deliberately kept
-    OUT of refresh_song_request_statuses, which must stay fast and
-    reliable; TTS plus ffmpeg can take tens of seconds worst
-    case). Whole body in one try/except: a failure on one request must
-    not stop the command's loop over the others.
+    """Render a Speech Splice and attach it with the feature-owned CAS.
 
-    Returns True iff req.intro_track actually got set -- callers should
-    use this return value rather than a follow-up refresh_from_db() (a
-    deleted request or a DB hiccup right at that moment would otherwise
-    raise OUTSIDE this function's own exception boundary and abort the
-    caller's whole loop over the remaining candidates)."""
+    The generation command remains the caller so slow TTS never enters the
+    reconciliation loop. Returns True only when this request wins the CAS;
+    every failure remains local to this request and is retried next cycle.
+    """
     try:
-        track = req.track  # the REQUEST's own stable FK, not log_item.track,
-        # which can in principle change during the several seconds synthesis takes
-        text = build_dedication_intro_text(track, req.requester_name, req.dedication_message)
+        track = req.track  # Stable request FK, not mutable log_item.track.
+        text = build_dedication_intro_text(
+            track, req.requester_name, req.dedication_message
+        )
+        final_path = DEDICATION_ROOT / f"request-{req.id}.flac"
+        # external_request_id is opaque external data and is never a path.
 
-        DEDICATION_ROOT.mkdir(parents=True, exist_ok=True)
-        final_path = DEDICATION_ROOT / f"request-{req.id}.flac"  # LOCAL pk only --
-        # external_request_id is an opaque string from a system we don't
-        # control, never trusted unsanitized in a filesystem path
-        tmp_wav = DEDICATION_ROOT / f".request-{req.id}.{os.getpid()}.tmp.wav"
-        tmp_flac = DEDICATION_ROOT / f".request-{req.id}.{os.getpid()}.tmp.flac"
-        try:
-            cfg = WebRequestConfig.load()
-            _synthesize_dedication_wav(cfg, text, tmp_wav)
-            subprocess.run(["ffmpeg", "-y", "-i", str(tmp_wav), str(tmp_flac)],
-                            check=True, timeout=30, capture_output=True)
-            duration = _probe_duration(tmp_flac)
-            os.replace(tmp_flac, final_path)  # atomic -- no reader ever sees a partial file
-        finally:
-            for p in (tmp_wav, tmp_flac):
-                try:
-                    p.unlink()
-                except FileNotFoundError:
-                    pass
+        cfg = WebRequestConfig.load()
+        if cfg.dedication_tts_voice_id is None:
+            raise TTSConfigurationError(
+                "WebRequestConfig.dedication_tts_voice is not set -- dedication intros have "
+                "no other way to resolve a voice. The legacy direct-Kokoro fallback this used "
+                "to run was retired in r0029 and no longer exists. Select a Dedication TTS "
+                "Voice in Django Admin (Web Requests configuration) to enable dedication intros."
+            )
 
-        with transaction.atomic():
-            # Metadata mirrors the REQUESTED SONG -- _create_deck() calls
-            # _write_now_playing(track) for every fresh deck, so stream
-            # metadata, RBDS, and the engine dashboard correctly show
-            # "Free Fallin' - Tom Petty" from the moment the intro
-            # starts, not an internal id. TuneIn specifically is
-            # DIFFERENT -- it's driven by the PlayEvent ledger (dedupes
-            # on PlayEvent id), not _write_now_playing, and
-            # Dedications-category plays deliberately don't create a
-            # PlayEvent (see _create_deck) -- so TuneIn correctly keeps
-            # showing the previous song through the announcement and
-            # only updates once the requested song's own PlayEvent is
-            # created a few seconds later. That's correct, not a gap:
-            # driven by the same royalty-safe ledger as everything else,
-            # rather than updating early off an announcement that isn't
-            # itself a performance.
-            intro_track, _ = Track.objects.update_or_create(
-                filepath=str(final_path),
-                defaults=dict(
-                    filename=final_path.name, format="flac",
-                    title=track.title, artist=track.artist,
-                    duration_seconds=duration, cue_in_seconds=0,
-                    # Explicit non-null next_start_seconds opts OUT of
-                    # isadoraair-analyze.timer's periodic sweep (only
-                    # re-analyzes next_start_seconds__isnull=True rows)
-                    # -- that sweep's envelope-threshold cue-point
-                    # detection is built for music, not a few seconds of
-                    # speech, and risks firing the crossfade mid-sentence.
-                    next_start_seconds=duration,
-                    category=Category.objects.get(code="Dedications"),
+        # Web Requests still owns all feature meaning. The renderer receives
+        # the configured logical station voice and deterministic local-pk path,
+        # plus metadata intentionally mirroring the requested song.
+        rendered = render_announcement(
+            SpeechSpliceAnnouncement(
+                text=text,
+                logical_voice=cfg.dedication_tts_voice.name,
+                destination=final_path,
+                timeout_seconds=cfg.dedication_tts_timeout_seconds,
+                metadata=AnnouncementTrackMetadata(
+                    title=track.title,
+                    artist=track.artist,
+                    category_code="Dedications",
                     ready2air=True,
                 ),
             )
+        )
+        intro_track = rendered.track
+        if intro_track is None:  # Defensive: this mode always creates a Track.
+            raise RuntimeError("Speech Splice renderer returned no Track")
+
+        with transaction.atomic():
             updated = SongRequest.objects.filter(
-                id=req.id, status="scheduled", track_id=req.track_id, intro_track__isnull=True,
+                id=req.id,
+                status="scheduled",
+                track_id=req.track_id,
+                intro_track__isnull=True,
             ).update(intro_track=intro_track)
 
         if not updated:
-            # Request resolved to something else while synthesis ran, or
-            # a concurrent run already attached this same Track (the
-            # deterministic path + update_or_create means both runs
-            # converge on the SAME row). Only clean up if NOTHING still
-            # references it -- a SongRequest FK or a LogItem (already
-            # spliced/aired).
+            # Request state changed during rendering or another caller already
+            # attached the deterministic Track. Ownership decisions stay here:
+            # preserve anything referenced by a request or an aired/spliced log.
             still_referenced = (
                 SongRequest.objects.filter(intro_track=intro_track).exists()
                 or LogItem.objects.filter(track=intro_track).exists()
@@ -619,63 +545,23 @@ def synthesize_dedication_intro(req):
                 except FileNotFoundError:
                     pass
             return False
-
-        # Waveform display data (samples_left/right + waveform_path) --
-        # the same analyze_one_track() call api_library_upload and
-        # sync_track_file already use for a fresh Track outside the
-        # normal timer sweep (see library/views.py). Needed here for
-        # the same reason those call sites need it: next_start_seconds
-        # being pre-set above (deliberately, to opt OUT of
-        # isadoraair-analyze.timer's periodic sweep) means that sweep's
-        # own `next_start_seconds__isnull=True` filter would otherwise
-        # never pick this row up, leaving it with no waveform in the UI
-        # at all, forever. Own try/except: a failure here must not
-        # undo the intro_track attachment that already succeeded above,
-        # or report this call as a failure -- the only thing that
-        # actually matters (the request having a playable intro) is
-        # already done regardless.
-        try:
-            from library.management.commands.analyze_tracks import analyze_one_track, get_waveforms_dir
-            from library.models import AnalysisConfig
-            cfg = AnalysisConfig.load()
-            cfg_values = (
-                cfg.analysis_sample_rate, cfg.analysis_window_seconds, cfg.waveform_points,
-                cfg.next_start_threshold_db, cfg.cue_in_threshold_db, cfg.cue_in_min_seconds,
+        if rendered.analysis_attempted and not rendered.analysis_succeeded:
+            print(
+                f"  Dedication waveform generation failed for request {req.id} "
+                f"(non-fatal): {rendered.analysis_error or 'analysis did not complete'}"
             )
-            row = (
-                intro_track.id, intro_track.filepath, intro_track.filename,
-                intro_track.duration_seconds, intro_track.title,
-                intro_track.artist.name if intro_track.artist_id else "", "",
-            )
-            analyze_one_track(row, cfg_values, get_waveforms_dir(), force=True)
-            # analyze_one_track's own envelope-threshold next_start/cue_in
-            # detection is built for music, not a few seconds of speech --
-            # re-assert the deliberate values from above regardless of
-            # whatever it guessed, same reasoning as the comment on
-            # next_start_seconds up in the update_or_create call.
-            Track.objects.filter(id=intro_track.id).update(
-                next_start_seconds=duration, cue_in_seconds=0,
-            )
-        except Exception as exc:
-            print(f"  Dedication waveform generation failed for request {req.id} (non-fatal): {exc}")
 
         return True
     except Exception as exc:
-        print(f"  Dedication intro synthesis failed for request {req.id} (non-fatal, retried next cycle): {exc}")
+        print(
+            f"  Dedication intro synthesis failed for request {req.id} "
+            f"(non-fatal, retried next cycle): {exc}"
+        )
         emit_event(
-            category="webrequests", level="warning", title="Dedication intro synthesis failed",
+            category="webrequests",
+            level="warning",
+            title="Dedication intro synthesis failed",
             detail={"request_id": req.external_request_id, "error": str(exc)},
             dedupe_key=f"webrequests|dedication-synth-failed|{req.id}",
         )
-        # The FLAC write happens BEFORE the DB transaction -- if that
-        # transaction is what failed (Track never got committed), the
-        # file is now a true orphan (not just "unattached," genuinely
-        # unowned). Best-effort, conservative cleanup: only remove it if
-        # no Track row claims this exact path.
-        try:
-            final_path = DEDICATION_ROOT / f"request-{req.id}.flac"
-            if final_path.exists() and not Track.objects.filter(filepath=str(final_path)).exists():
-                final_path.unlink()
-        except Exception:
-            pass  # already in the outer failure handler -- never let cleanup itself raise
         return False

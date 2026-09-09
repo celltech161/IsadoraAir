@@ -34,6 +34,7 @@ from django.test import TransactionTestCase
 from django.utils import timezone
 
 import library.services.engine as eng_module
+from isadoraair.announcements import renderer as announcement_renderer_module
 from isadoraair.tts.models import StationTTSVoice
 from library.models import (
     Artist, Category, CategoryKind, LogItem, PlaylistLog, Track, VoiceTrack, VoiceTrackConfig,
@@ -216,7 +217,7 @@ class DedicationSynthesisTests(DedicationFixtureMixin, TransactionTestCase):
             Path(output_path).write_bytes(b"WAV")
             return Path(output_path)
 
-        station_patcher = patch.object(services_module, "synthesize_station_voice", side_effect=fake_station_synth)
+        station_patcher = patch.object(announcement_renderer_module, "synthesize_station_voice", side_effect=fake_station_synth)
         station_patcher.start()
         self.addCleanup(station_patcher.stop)
 
@@ -225,11 +226,11 @@ class DedicationSynthesisTests(DedicationFixtureMixin, TransactionTestCase):
                 Path(cmd[-1]).write_bytes(b"FLAC")
             return MagicMock(returncode=0)
 
-        run_patcher = patch.object(services_module.subprocess, "run", side_effect=fake_run)
+        run_patcher = patch.object(announcement_renderer_module.subprocess, "run", side_effect=fake_run)
         run_patcher.start()
         self.addCleanup(run_patcher.stop)
 
-        duration_patcher = patch.object(services_module, "_probe_duration", return_value=6.5)
+        duration_patcher = patch.object(announcement_renderer_module, "_probe_duration", return_value=6.5)
         duration_patcher.start()
         self.addCleanup(duration_patcher.stop)
 
@@ -306,9 +307,12 @@ class DedicationSynthesisTests(DedicationFixtureMixin, TransactionTestCase):
         item = self.make_item(log, 0, track=track)
         req = self.make_request(track, status="scheduled", log_item=item)
 
-        with patch(
-            "library.management.commands.analyze_tracks.analyze_one_track",
-            side_effect=RuntimeError("ffmpeg exploded"),
+        with (
+            patch(
+                "library.management.commands.analyze_tracks.analyze_one_track",
+                side_effect=RuntimeError("ffmpeg exploded"),
+            ),
+            patch("builtins.print") as mock_print,
         ):
             result = synthesize_dedication_intro(req)
 
@@ -316,6 +320,13 @@ class DedicationSynthesisTests(DedicationFixtureMixin, TransactionTestCase):
         req.refresh_from_db()
         self.assertIsNotNone(req.intro_track_id)
         self.assertEqual(req.intro_track.next_start_seconds, req.intro_track.duration_seconds)
+        self.assertTrue(
+            any(
+                "Dedication waveform generation failed" in str(call)
+                and "ffmpeg exploded" in str(call)
+                for call in mock_print.call_args_list
+            )
+        )
 
     def test_winner_selection_survives_across_two_command_runs(self):
         """Round 4's bug: filtering intro_track__isnull=True FIRST let
@@ -445,11 +456,11 @@ class DedicationSharedTTSRoutingTests(DedicationFixtureMixin, TransactionTestCas
                 Path(cmd[-1]).write_bytes(b"FLAC")
             return MagicMock(returncode=0)
 
-        run_patcher = patch.object(services_module.subprocess, "run", side_effect=fake_run)
+        run_patcher = patch.object(announcement_renderer_module.subprocess, "run", side_effect=fake_run)
         run_patcher.start()
         self.addCleanup(run_patcher.stop)
 
-        duration_patcher = patch.object(services_module, "_probe_duration", return_value=6.5)
+        duration_patcher = patch.object(announcement_renderer_module, "_probe_duration", return_value=6.5)
         duration_patcher.start()
         self.addCleanup(duration_patcher.stop)
 
@@ -479,11 +490,9 @@ class DedicationSharedTTSRoutingTests(DedicationFixtureMixin, TransactionTestCas
         """dedication_tts_voice is null (this fixture's/field's
         default) is an invalid configuration state as of r0029 -- the
         direct-Kokoro fallback this used to run no longer exists.
-        _synthesize_dedication_wav() must raise TTSConfigurationError
-        immediately, WITHOUT calling synthesize_station_voice or any
-        subprocess -- and synthesize_dedication_intro()'s own outer
-        try/except must absorb that non-fatally, same contract as any
-        other synthesis failure (see test_shared_tts_failure_is_non_
+        synthesize_dedication_intro() must reject it before invoking shared
+        TTS or ffmpeg and absorb that failure non-fatally, using the same
+        contract as any other synthesis failure (see test_shared_tts_failure_is_non_
         fatal_and_emits_warning_event below)."""
         self.assertIsNone(self.cfg.dedication_tts_voice_id, "fixture default must stay blank")
         track = self.make_track(title="Free Fallin'")
@@ -491,16 +500,13 @@ class DedicationSharedTTSRoutingTests(DedicationFixtureMixin, TransactionTestCas
         item = self.make_item(log, 0, track=track)
         req = self.make_request(track, status="scheduled", log_item=item, requester_name="Justin")
 
-        from isadoraair.tts.errors import TTSConfigurationError
-        with patch.object(services_module, "synthesize_station_voice") as mock_station, \
+        with patch.object(announcement_renderer_module, "synthesize_station_voice") as mock_station, \
              patch.object(services_module, "emit_event") as mock_emit:
-            with self.assertRaises(TTSConfigurationError):
-                services_module._synthesize_dedication_wav(self.cfg, "text", Path("/unused"))
             result = synthesize_dedication_intro(req)
 
         self.assertFalse(result, "best-effort: a blank dedication voice must not raise or crash the caller")
         mock_station.assert_not_called()
-        services_module.subprocess.run.assert_not_called()
+        announcement_renderer_module.subprocess.run.assert_not_called()
         req.refresh_from_db()
         self.assertIsNone(req.intro_track_id, "no partial Track should be attached")
         mock_emit.assert_called_once()
@@ -515,7 +521,7 @@ class DedicationSharedTTSRoutingTests(DedicationFixtureMixin, TransactionTestCas
         item = self.make_item(log, 0, track=track)
         req = self.make_request(track, status="scheduled", log_item=item, requester_name="Justin")
 
-        with patch.object(services_module, "synthesize_station_voice",
+        with patch.object(announcement_renderer_module, "synthesize_station_voice",
                            side_effect=self._fake_station_synth) as mock_station:
             result = synthesize_dedication_intro(req)
 
@@ -533,7 +539,7 @@ class DedicationSharedTTSRoutingTests(DedicationFixtureMixin, TransactionTestCas
         item = self.make_item(log, 0, track=track)
         req = self.make_request(track, status="scheduled", log_item=item)
 
-        with patch.object(services_module, "synthesize_station_voice",
+        with patch.object(announcement_renderer_module, "synthesize_station_voice",
                            side_effect=self._fake_station_synth) as mock_station:
             synthesize_dedication_intro(req)
 
@@ -547,7 +553,7 @@ class DedicationSharedTTSRoutingTests(DedicationFixtureMixin, TransactionTestCas
         item = self.make_item(log, 0, track=track)
         req = self.make_request(track, status="scheduled", log_item=item)
 
-        with patch.object(services_module, "synthesize_station_voice",
+        with patch.object(announcement_renderer_module, "synthesize_station_voice",
                            side_effect=RuntimeError("provider unavailable")), \
              patch.object(services_module, "emit_event") as mock_emit:
             result = synthesize_dedication_intro(req)
@@ -572,7 +578,7 @@ class DedicationSharedTTSRoutingTests(DedicationFixtureMixin, TransactionTestCas
         item = self.make_item(log, 0, track=track)
         req = self.make_request(track, status="scheduled", log_item=item, requester_name="Justin")
 
-        with patch.object(services_module, "synthesize_station_voice", side_effect=self._fake_station_synth):
+        with patch.object(announcement_renderer_module, "synthesize_station_voice", side_effect=self._fake_station_synth):
             result = synthesize_dedication_intro(req)
 
         self.assertTrue(result)
