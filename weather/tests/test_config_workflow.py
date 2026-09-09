@@ -298,6 +298,47 @@ class AlertBeepTriggerEventsTests(TestCase):
             "Tornado Warning\nFlash Flood Emergency",
         )
 
+    def test_stored_none_displays_four_defaults_in_admin_form(self):
+        """r0053 migration-compatibility correction: the field is now
+        nullable (so the protected updater's schema classifier accepts
+        the AddField automatically) -- a stored NULL must display
+        exactly as if the four legacy defaults had been saved, never
+        as an empty textarea (that would misrepresent a migration
+        artifact as the operator's own deliberate empty choice)."""
+        cfg = WeatherConfig.objects.create(
+            pk=1, voice_schedule=[["default", 0, 23]], alert_sound_trigger_events=None,
+        )
+        self.assertIsNone(WeatherConfig.objects.get(pk=1).alert_sound_trigger_events)
+        form = WeatherConfigForm(instance=cfg)
+        self.assertEqual(
+            form.fields["alert_sound_trigger_events_text"].initial,
+            "\n".join(DEFAULT_ALERT_SOUND_TRIGGER_EVENTS),
+        )
+
+    def test_stored_none_dumps_four_defaults_to_weather_ingest(self):
+        cfg = WeatherConfig.objects.create(
+            pk=1, voice_schedule=[["default", 0, 23]], alert_sound_trigger_events=None,
+        )
+        out = StringIO()
+        call_command("dump_weather_config", stdout=out)
+        payload = json.loads(out.getvalue())
+        self.assertEqual(payload["alert_sound_trigger_events"], DEFAULT_ALERT_SOUND_TRIGGER_EVENTS)
+
+    def test_explicit_empty_list_stays_empty_through_admin_model_and_dump(self):
+        """The opposite case must NOT collapse into the same treatment
+        as None -- `value or defaults` would incorrectly do that,
+        since both None and [] are falsy in Python."""
+        cfg = WeatherConfig.objects.create(
+            pk=1, voice_schedule=[["default", 0, 23]], alert_sound_trigger_events=[],
+        )
+        self.assertEqual(WeatherConfig.objects.get(pk=1).alert_sound_trigger_events, [])
+        form = WeatherConfigForm(instance=cfg)
+        self.assertEqual(form.fields["alert_sound_trigger_events_text"].initial, "")
+        out = StringIO()
+        call_command("dump_weather_config", stdout=out)
+        payload = json.loads(out.getvalue())
+        self.assertEqual(payload["alert_sound_trigger_events"], [])
+
     def test_empty_textarea_saves_as_explicit_empty_list(self):
         """Preferred semantics: no NWS event triggers the repeating
         beep when the operator clears the field entirely."""

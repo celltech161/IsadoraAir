@@ -3,7 +3,7 @@ import json
 from django.conf import settings
 from django.core.management.base import BaseCommand
 
-from weather.models import WeatherConfig, WeatherVoicePersona
+from weather.models import WeatherConfig, WeatherVoicePersona, normalize_alert_sound_trigger_events
 
 
 class Command(BaseCommand):
@@ -46,6 +46,10 @@ class Command(BaseCommand):
             # has no bearing on the spoken WxAlert/AMBER-family
             # statement pipelines, which have their own independent
             # selection rules (see weather_ingest/update_local_wx_
-            # data.py's own event_triggers_alert_beep()).
-            "alert_sound_trigger_events": cfg.alert_sound_trigger_events,
+            # data.py's own event_triggers_alert_beep()). Always a real
+            # list -- a stored NULL (the migration-compatibility state;
+            # see normalize_alert_sound_trigger_events()) is resolved to
+            # the four legacy defaults here so weather_ingest never
+            # needs its own None-handling.
+            "alert_sound_trigger_events": normalize_alert_sound_trigger_events(cfg.alert_sound_trigger_events),
         }))

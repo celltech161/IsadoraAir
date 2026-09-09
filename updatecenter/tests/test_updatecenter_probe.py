@@ -205,3 +205,58 @@ class ActualR0011MigrationClassificationTests(SimpleTestCase):
             ]
             * 5,
         )
+
+
+class ActualR0053WeatherMigrationClassificationTests(SimpleTestCase):
+    """r0053 reached production Update Center before anyone mechanically
+    classified the actual migration -- its AddField's non-null callable
+    (JSON list) default made the updater correctly reject it
+    (MIGRATION_OPERATION_MANUAL) rather than mutate schema unsafely.
+    The fix made the field nullable (see weather/models.py's own
+    normalize_alert_sound_trigger_events() for the resulting NULL
+    semantics); this test proves the ACTUAL on-disk migration file
+    Update Center will encounter classifies fully additive, not a
+    synthetic stand-in field."""
+
+    def test_every_actual_weather_0009_operation_is_additive(self):
+        loader = MigrationLoader(None)
+        migration_key = (
+            "weather", "0009_weatherconfig_alert_sound_trigger_events_and_more",
+        )
+        migration = loader.disk_migrations[migration_key]
+        state = loader.project_state(
+            [("weather", "0008_alter_weatherconfig_voice_schedule_and_more")]
+        )
+        classifications = []
+
+        for operation in migration.operations:
+            before_state = (
+                state.clone()
+                if operation.__class__.__name__ == "AlterField"
+                else None
+            )
+            operation.state_forwards("weather", state)
+            classifications.append(
+                _classify_operation(
+                    operation,
+                    app_label="weather",
+                    before_state=before_state,
+                    after_state=state,
+                )
+            )
+
+        self.assertEqual(len(classifications), 2)
+        self.assertEqual(
+            [item["operation"] for item in classifications],
+            ["AddField", "AlterField"],
+        )
+        self.assertNotIn("manual", {item["classification"] for item in classifications})
+        self.assertEqual(
+            {item["classification"] for item in classifications},
+            {"additive"},
+        )
+        self.assertEqual(classifications[0]["detail"], "nullable field")
+        self.assertEqual(
+            classifications[1]["detail"],
+            "field definition differs only in approved non-database metadata",
+        )

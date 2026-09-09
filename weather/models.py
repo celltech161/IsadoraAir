@@ -25,6 +25,43 @@ def _default_alert_sound_trigger_events():
     return list(DEFAULT_ALERT_SOUND_TRIGGER_EVENTS)
 
 
+def normalize_alert_sound_trigger_events(raw):
+    """The one shared place every consumer (WeatherConfigForm,
+    dump_weather_config, weather.diagnostics) normalizes a stored
+    alert_sound_trigger_events value before interpreting it -- keeps
+    the r0053 migration-compatibility NULL semantics from being
+    reimplemented three times.
+
+    WeatherConfig.alert_sound_trigger_events is nullable purely so the
+    protected updater's schema classifier can add the column
+    automatically (a non-null AddField requires a simple scalar
+    default, which a JSON list can never satisfy) -- NULL is therefore
+    a deliberate migration-compatibility state, not malformed data and
+    not an operator's explicit choice:
+
+      None (SQL NULL)     -> the four legacy defaults, AS IF an
+                              upgraded row had always been configured
+                              with them (this is the actual, correct
+                              legacy production behavior being
+                              preserved -- never treated as "no
+                              trigger configured").
+      []                  -> returned unchanged -- an operator's own
+                              deliberate "no NWS event triggers the
+                              beep" choice, never silently restored to
+                              the defaults.
+      anything else        -> returned unchanged; callers (diagnostics
+                              in particular) remain responsible for
+                              deciding whether a non-None, non-list, or
+                              otherwise malformed value is usable.
+
+    This normalization applies ONLY to the Weather Alert Beep's
+    trigger-event configuration -- it has no bearing on spoken WxAlert
+    or AMBER-family alert selection, which never touch this field."""
+    if raw is None:
+        return list(DEFAULT_ALERT_SOUND_TRIGGER_EVENTS)
+    return raw
+
+
 DEFAULT_AMBER_EVENT_CODES = "BLU,CAE,MEP"
 
 DEFAULT_AMBER_SAME_CODES = ",".join([
@@ -125,6 +162,7 @@ class WeatherConfig(models.Model):
                    "in seconds. Re-read fresh every check -- no restart needed.",
     )
     alert_sound_trigger_events = models.JSONField(
+        null=True,
         default=_default_alert_sound_trigger_events,
         help_text="NWS event names (e.g. \"Tornado Warning\") that activate the "
                    "repeating Alert Beep FX Cart -- case-insensitive substring match "
@@ -133,7 +171,12 @@ class WeatherConfig(models.Model):
                    "statements (see WxAlert/wx_alert.mp3 readiness in Weather Setup "
                    "Status for those) -- it governs only the repeating sonar/ping FX "
                    "Cart selected above. An empty list means no NWS event ever "
-                   "triggers the beep.",
+                   "triggers the beep. Nullable so the protected updater's schema "
+                   "classifier can add this column automatically (a non-null AddField "
+                   "must have a simple scalar default, which a JSON list can never "
+                   "be) -- see normalize_alert_sound_trigger_events() below, which "
+                   "treats a stored NULL as exactly these same four legacy defaults, "
+                   "never as malformed or as an operator's explicit empty choice.",
     )
 
     class Meta:

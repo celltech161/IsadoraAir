@@ -963,3 +963,100 @@ class CheckoutNotAtReleaseCommitTests(TestCase):
             self.assertEqual(plan.installed_release_id, "r0002")
             self.assertEqual(plan.installed_commit, r0002_canonical_sha)
             self.assertEqual(plan.target_release_id, "r0002")
+
+
+class R0052ToR0054RecoveryPlanTests(TestCase):
+    """r0054 recovery regression: reproduces the real r0052 -> r0053
+    (rejected before schema/source mutation) -> r0054 (corrective)
+    situation end-to-end through the real planner, using the ACTUAL
+    manifest content from this repository's own deploy/releases/
+    {r0053,r0054}.json (never hand-duplicated data that could quietly
+    drift from the real manifests) against a synthetic FakeRepo git
+    history -- the same throwaway-real-repo technique every other test
+    in this file already uses (see gitfixtures.py). r0052 itself is
+    modeled as the chain's bootstrap release so the fixture needs no
+    earlier history, matching MultiReleaseAggregateTests' own
+    convention above.
+
+    Proves a station still installed at exact r0052 derives a trusted,
+    correctly-aggregated plan whose target is r0054: the two-release
+    transition (r0053, r0054) is planned as one unit, the migration
+    r0053 introduced is surfaced with "additive" compatibility, the
+    Gunicorn restart r0053 declared is preserved in the aggregate, and
+    the resolved target commit is r0054's own.
+
+    This test does NOT independently prove the real weather.0009
+    migration itself classifies safely -- the migration file written
+    into the FakeRepo below is a placeholder, used only because this
+    test is about release planning/aggregation, not migration content.
+    That separate proof is ActualR0053WeatherMigrationClassificationTests
+    in test_updatecenter_probe.py, which loads the real Django-
+    registered weather.0009 migration from this exact r0054 source
+    tree. r0054 intentionally corrects that migration's field
+    definition relative to rejected r0053 (the new JSONField becomes
+    nullable); the classifier test proves the CORRECTED target-tree
+    migration is additive. Together the two tests reproduce the full
+    safety property that correctly failed the first r0053 installation
+    attempt and now succeeds for r0054."""
+
+    REAL_RELEASES_DIR = Path(__file__).resolve().parent.parent.parent / "deploy" / "releases"
+
+    def _real_manifest(self, release_id):
+        return json.loads((self.REAL_RELEASES_DIR / f"{release_id}.json").read_text())
+
+    def test_station_on_r0052_derives_trusted_plan_targeting_r0054(self):
+        real_r0053 = self._real_manifest("r0053")
+        real_r0054 = self._real_manifest("r0054")
+        self.assertEqual(real_r0053["previous_release_id"], "r0052")
+        self.assertEqual(real_r0054["previous_release_id"], "r0053")
+        # The real manifests' own minimum_supported_release_id ("r0007")
+        # refers to real chain history this synthetic 3-release fixture
+        # (r0052 as bootstrap) doesn't include -- build_chain requires
+        # that id to exist IN the chain being validated. Overridden to
+        # the fixture's own bootstrap release; every other real field
+        # (migrations_required, migration_compatibility,
+        # services_requiring_restart, etc.) is used completely verbatim.
+        real_r0053["minimum_supported_release_id"] = "r0052"
+        real_r0054["minimum_supported_release_id"] = "r0052"
+
+        with FakeRepo() as repo:
+            releases_dir = repo.work / "deploy" / "releases"
+            # For a bootstrap release, resolve_release_commit() uses the
+            # manifest's own bootstrap_commit field directly as the
+            # canonical commit -- NOT "whichever commit introduced the
+            # manifest file" (that rule is for every OTHER release,
+            # resolved via find_introducing_commit instead). Matches
+            # every other bootstrap-based fixture in this file.
+            bootstrap_sha = repo.rev_parse("HEAD")
+            _write_manifest(releases_dir, _bootstrap(bootstrap_sha, release_id="r0052"))
+            repo.commit("r0052 (accepted installed baseline)", push=True)
+
+            _write_manifest(releases_dir, real_r0053)
+            repo.write(
+                "weather/migrations/0009_weatherconfig_alert_sound_trigger_events_and_more.py",
+                "# placeholder -- see ActualR0053WeatherMigrationClassificationTests for the real file\n",
+            )
+            repo.commit("r0053 (rejected by updater before mutation)", push=True)
+
+            _write_manifest(releases_dir, real_r0054)
+            repo.commit("r0054 (corrective)", push=True)
+            target_sha = repo.rev_parse("HEAD")
+
+            # The station never advanced past r0052 -- exactly the real
+            # situation (the failed r0053 install left HEAD at r0052).
+            repo.reset_local_to(bootstrap_sha)
+
+            plan = planner.build_plan(repo.work, "deploy/releases")
+
+            self.assertEqual(plan.safety_status, planner.SafetyStatus.READY_TO_PLAN)
+            self.assertEqual(plan.installed_release_id, "r0052")
+            self.assertEqual(plan.installed_commit, bootstrap_sha)
+            self.assertEqual(plan.releases_in_plan, ("r0053", "r0054"))
+            self.assertEqual(plan.target_release_id, "r0054")
+            self.assertEqual(plan.target_commit, target_sha)
+            self.assertIn(
+                "weather.0009_weatherconfig_alert_sound_trigger_events_and_more",
+                plan.migrations.expected_transition_unapplied + plan.migrations.already_applied,
+            )
+            self.assertEqual(plan.migrations.compatibility, "additive")
+            self.assertIn("isadoraair-gunicorn", plan.services_requiring_restart)

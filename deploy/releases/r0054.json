@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "release_id": "r0054",
+  "previous_release_id": "r0053",
+  "minimum_updater_protocol_version": 5,
+  "summary": "Corrects r0053's Weather Alert Beep trigger-field migration for protected-updater compatibility by making the new JSONField nullable and defining explicit NULL-as-legacy-default semantics. r0053 was rejected before schema/source mutation; r0054 preserves the same Pass D behavior with an automatically classifiable additive migration.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-gunicorn"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0007"
+}

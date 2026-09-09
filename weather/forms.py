@@ -13,7 +13,7 @@ from decimal import ROUND_HALF_UP, Decimal
 from django import forms
 from django.utils import timezone
 
-from .models import WeatherConfig, WeatherVoicePersona
+from .models import WeatherConfig, WeatherVoicePersona, normalize_alert_sound_trigger_events
 from .persona_readiness import check_persona_slots
 from .voice_schedule import ScheduleError, compress_from_hours, expand_to_hours
 
@@ -265,7 +265,11 @@ class WeatherConfigForm(forms.ModelForm):
             seconds = self.instance.alert_sound_interval_seconds
             minutes = (Decimal(seconds) / Decimal(60)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
             self.fields["alert_sound_interval_minutes"].initial = minutes
-            events = self.instance.alert_sound_trigger_events or []
+            # normalize_..., NOT `value or defaults` -- that would wrongly
+            # turn a deliberately-saved empty list into the defaults too
+            # (both are falsy). Only a genuine stored NULL becomes the
+            # four legacy defaults; a stored [] stays an empty textarea.
+            events = normalize_alert_sound_trigger_events(self.instance.alert_sound_trigger_events)
             self.fields["alert_sound_trigger_events_text"].initial = "\n".join(events)
 
     def clean_alert_sound_trigger_events_text(self):

@@ -74,7 +74,7 @@ from django.conf import settings
 from django.utils import timezone as dj_timezone
 
 from library.models import Category, Track
-from .models import AmberAlertConfig, WeatherConfig, WeatherVoicePersona
+from .models import AmberAlertConfig, WeatherConfig, WeatherVoicePersona, normalize_alert_sound_trigger_events
 from .persona_readiness import check_persona_slots
 from .voice_schedule import ScheduleError, expand_to_hours
 
@@ -366,7 +366,13 @@ def _check_alert_fx_cart(cfg: WeatherConfig | None) -> DiagnosticFact:
             summary="Alert beep is disabled.",
         )
 
-    triggers = cfg.alert_sound_trigger_events
+    # A stored NULL is a deliberate migration-compatibility state (see
+    # normalize_alert_sound_trigger_events()), never malformed data and
+    # never an operator's explicit empty choice -- it evaluates to the
+    # same four legacy defaults an upgraded row has always effectively
+    # had, so it proceeds straight into the normal readiness checks
+    # below exactly as if those defaults had been saved explicitly.
+    triggers = normalize_alert_sound_trigger_events(cfg.alert_sound_trigger_events)
     well_formed = isinstance(triggers, list) and all(isinstance(t, str) and t.strip() for t in triggers)
     if not well_formed:
         return DiagnosticFact(

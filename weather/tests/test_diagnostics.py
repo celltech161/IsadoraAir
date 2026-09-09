@@ -234,6 +234,25 @@ class DiagnosticsConfigurationTests(TestCase):
         self.assertIn("4 trigger event type", fact.summary)
         self.assertIn("WXAlert Beeps", fact.summary)
 
+    def test_stored_none_trigger_list_evaluates_effective_four_defaults(self):
+        """r0053 migration-compatibility correction: a stored NULL is
+        deliberate (see normalize_alert_sound_trigger_events()), not
+        malformed -- it must proceed straight into normal cart
+        readiness using the effective four legacy defaults, never
+        reported as needs_attention nor as optional_disabled."""
+        with tempfile.NamedTemporaryFile(suffix=".wav") as f:
+            cart = FXCart.objects.create(name="WXAlert Beeps", filepath=f.name)
+            WeatherConfig.objects.create(
+                pk=1, voice_schedule=[["default", 0, 23]], alert_sound_enabled=True, alert_sound_cart=cart,
+                alert_sound_trigger_events=None,
+            )
+            WeatherVoicePersona.objects.create(slot="default")
+            snap = self.snapshot()
+        fact = snap.get("alert_fx_cart")
+        self.assertEqual(fact.state, "ready")
+        self.assertEqual(fact.evidence["trigger_event_count"], 4)
+        self.assertIn("Tornado Warning", fact.evidence["trigger_events"])
+
     def test_generated_artifact_wx_alert_fact_is_not_mixed_with_alert_fx_cart(self):
         """Keeps the two facts distinct per the r0053 review amendment:
         alert_fx_cart is the repeating FX Cart beep; generated_artifact:
