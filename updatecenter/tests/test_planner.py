@@ -712,17 +712,29 @@ class MigrationAggregationTests(TestCase):
 
 class SchemaDriftDetectionTests(TestCase):
     """[P0] 1.1 CORRECTION -- the real product guarantee this whole
-    correction pass exists to add. Marks one REAL migration
-    (webrequests.0008, the exact migration from the actual production
-    incident) as unapplied via Django's own MigrationRecorder --
+    correction pass exists to add. Marks one REAL migration -- the
+    CURRENT leaf migration of the webrequests app, the exact migration
+    from the actual production incident at the time this test was
+    written -- as unapplied via Django's own MigrationRecorder --
     bookkeeping only, no raw SQL, no dependence on any DB error string
     -- and proves build_plan() correctly refuses to call the station
     healthy when a release manifest doesn't account for it, and
     blocks regardless of whether a manifest declares it. A manifest
     describes the release transition; it cannot make CURRENT schema
-    healthy."""
+    healthy.
 
-    MIGRATION = ("webrequests", "0009_alter_webrequestconfig_dedication_tts_timeout_seconds_and_more")
+    MIGRATION must always name the webrequests app's CURRENT leaf
+    migration, not an arbitrary historical one: Django's own
+    MigrationExecutor.migration_plan() skips a target it already
+    considers applied without inspecting that target's own
+    dependencies -- so marking an INTERIOR (non-leaf) migration
+    unapplied while a real leaf migration on top of it remains marked
+    applied is invisible to check_schema_health(), and this test would
+    silently stop testing anything. r0056 (Pass F) added
+    webrequests/migrations/0010_..., moving the leaf from 0009 to
+    0010 -- this constant was updated accordingly."""
+
+    MIGRATION = ("webrequests", "0010_webrequestconfig_dedication_anonymous_message_template_and_more")
 
     def _mark_unapplied(self):
         recorder = MigrationRecorder(connection)
@@ -746,7 +758,7 @@ class SchemaDriftDetectionTests(TestCase):
 
                 plan = planner.build_plan(repo.work, "deploy/releases")
                 self.assertEqual(plan.safety_status, planner.SafetyStatus.SCHEMA_DRIFT_DETECTED)
-                self.assertIn("webrequests.0009_alter_webrequestconfig_dedication_tts_timeout_seconds_and_more", plan.schema_pending_migrations)
+                self.assertIn("webrequests.0010_webrequestconfig_dedication_anonymous_message_template_and_more", plan.schema_pending_migrations)
                 self.assertEqual(plan.schema_health_status, schema_health.SchemaHealthStatus.UNAPPLIED_MIGRATIONS_DETECTED)
         finally:
             self._mark_applied(recorder)
@@ -761,7 +773,7 @@ class SchemaDriftDetectionTests(TestCase):
                 releases_dir = repo.work / "deploy" / "releases"
                 _write_manifest(releases_dir, _bootstrap(
                     repo.rev_parse("HEAD"),
-                    migrations_required=["webrequests.0009_alter_webrequestconfig_dedication_tts_timeout_seconds_and_more"],
+                    migrations_required=["webrequests.0010_webrequestconfig_dedication_anonymous_message_template_and_more"],
                     migration_compatibility="additive",
                 ))
                 repo.commit("bootstrap", push=True)
@@ -769,7 +781,7 @@ class SchemaDriftDetectionTests(TestCase):
                 plan = planner.build_plan(repo.work, "deploy/releases")
                 self.assertEqual(plan.safety_status, planner.SafetyStatus.SCHEMA_DRIFT_DETECTED)
                 self.assertIn(
-                    "webrequests.0009_alter_webrequestconfig_dedication_tts_timeout_seconds_and_more",
+                    "webrequests.0010_webrequestconfig_dedication_anonymous_message_template_and_more",
                     plan.schema_pending_migrations,
                 )
         finally:

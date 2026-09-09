@@ -135,6 +135,96 @@ Store historical request rows even after their track leaves the active
 catalog. Names and dedication messages are untrusted listener text: validate,
 escape when displayed, and apply an appropriate privacy/retention policy.
 
+## Dedication intro evidence and spoken-text policy
+
+This section is internal to IsadoraAir -- none of these fields or rules are
+part of the public-site protocol above, and none of the four internal fields
+below are sent to or read from the public site.
+
+### Evidence fields
+
+A `SongRequest` can carry an auto-generated spoken "dedication intro" clip,
+spliced immediately ahead of the requested track. Four existing fields
+represent four DISTINCT facts about that process; none of them is the same
+as the requested track's own fulfillment. Do not conflate them:
+
+| Field | Means | Does NOT mean |
+|---|---|---|
+| `intro_track` | A generated spoken artifact exists and is associated with this request. | That the intro was ever queued or aired. |
+| `intro_log_item` | The generated intro was actually spliced into a specific playlist occurrence ahead of `log_item`. Pairing/restart-recovery evidence. | That the intro was audibly played. |
+| `intro_log_item.played_at` | The existing engine occurrence evidence that the dedication intro's LogItem actually began playback, under the same engine clock used for every other LogItem. This is the strongest currently-existing evidence the dedication aired. | "First audible PCM" or any other more specific claim -- it is exactly the same LogItem playback-start write every other LogItem gets, no more and no less. Roadmap item 1.6 will eventually decide what the station-wide authoritative air-timestamp definition should be; this document does not pre-empt that. |
+| `log_item` | The specific requested-song occurrence this request was assigned to. | That the song has aired yet -- see `fulfilled_at`. |
+| `fulfilled_at` | The requested song actually began playing -- set only after the requested song's own `LogItem.played_at` write succeeds (`webrequests.services.mark_song_requests_aired`). | The moment the dedication intro aired. A song can be fulfilled with no intro ever having aired, or existing at all; a dedication can occur without its song showing fulfilled yet in a narrow timing window. |
+
+In short, four distinct milestones exist and must stay distinct:
+"dedication generated" (`intro_track`), "dedication placed" (`intro_log_item`),
+"dedication occurred" (`intro_log_item.played_at` non-null), and "requested
+song fulfilled" (`fulfilled_at`). IsadoraAir's Song Request Admin surfaces all
+four as computed, read-only fields (`intro_artifact_status`,
+`intro_queue_status`, `intro_play_status`, `requested_song_status`) so an
+operator can tell them apart at a glance -- these are derived purely from the
+fields above and are never themselves persisted.
+
+No additional evidence timestamp or model exists or is needed for this: every
+fact above is already fully represented by an existing field.
+
+### Station-editable dedication/request templates
+
+The spoken wording for a dedication/request intro comes from four explicit
+templates on `WebRequestConfig`, editable in Django Admin (Web Requests
+configuration > "Dedication Wording"), selected by whether a normalized
+requester name and/or dedication message is present:
+
+- `dedication_named_message_template` -- name AND message present.
+- `dedication_named_request_template` -- name present, no message.
+- `dedication_anonymous_message_template` -- message present, no name.
+- `dedication_anonymous_request_template` -- neither present.
+
+Each template may reference only these four placeholders, and nothing else:
+
+```text
+{title}
+{artist}
+{requester_name}
+{dedication_message}
+```
+
+Attribute access (`{track.title}`), indexing (`{foo[0]}`), conversion syntax
+(`{title!r}`), format specs (`{title:>20}`), unknown placeholders, and
+malformed braces are all rejected -- both when a template is saved in Admin
+and again at render time (so stale data written outside Admin cannot bypass
+the check). Braces appearing inside a listener's own name or message are
+always plain text, never reinterpreted as template syntax. See
+`webrequests/dedication_text.py` for the implementation and
+`docs/SPEECH_TEXT_NORMALIZATION_AUDIT.md`'s "Web Requests dedication speech"
+section for which parts of the spoken text remain code-owned normalization
+rather than station-editable wording.
+
+### Local spoken-length policy
+
+Independent of the public site's own 2,000-character `dedication_message`
+transport limit above, IsadoraAir enforces its own, much smaller, locally
+authoritative on-air policy before ever synthesizing an intro:
+
+- A normalized dedication message longer than
+  `WebRequestConfig.dedication_message_spoken_limit` (default 300 characters,
+  station-editable between 50 and 1000).
+- A fully-rendered script (after template substitution) longer than 600
+  characters -- a fixed, code-owned ceiling guarding against unexpectedly
+  large track title/artist metadata bypassing the message-only limit above.
+
+Either violation is deterministic and is never resolved by truncating the
+listener's text or the rendered script. Instead, intro generation is skipped
+for that request: no `intro_track` is attached, the requested song's own
+scheduling and fulfillment continue completely unaffected, and a "Dedication
+intro suppressed by text policy" warning event is emitted
+(`webrequests/services.py::synthesize_dedication_intro`). Because the length
+check runs entirely in-process before any shared-TTS/ffmpeg work begins, a
+station template or listener input that can never pass this policy costs
+essentially nothing even if it is naturally re-evaluated on every
+`generate_dedication_intros` command cycle -- unlike an actual synthesis
+attempt, it never becomes an expensive repeated failure.
+
 ## Authentication and common response rules
 
 The public site implements the three fixed paths below relative to
@@ -258,7 +348,10 @@ Field rules:
 - `requester_name`: optional string, maximum 100 characters; null may be used
   for empty.
 - `dedication_message`: optional string, maximum 2,000 characters; null may be
-  used for empty.
+  used for empty. This is a transport/storage limit only, deliberately not
+  weakened. IsadoraAir applies its own, much smaller, local on-air spoken
+  length policy before ever synthesizing an intro -- see "Dedication intro
+  evidence and spoken-text policy" below.
 - `submitted_at`: required RFC 3339/ISO 8601 timestamp with an explicit UTC
   offset; preserve the original public-site submission time.
 - At most 500 requests per response, within IsadoraAir's configured response

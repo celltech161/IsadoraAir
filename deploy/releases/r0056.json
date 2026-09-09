@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "release_id": "r0056",
+  "previous_release_id": "r0055",
+  "minimum_updater_protocol_version": 5,
+  "summary": "Pass F: moves dedication/request spoken wording into four station-editable WebRequestConfig templates (webrequests/dedication_text.py), validated against a trusted placeholder allowlist, plus a local on-air spoken-length policy independent of the public site's transport limits. Formalizes existing dedication evidence (intro_track/intro_log_item/played_at/fulfilled_at) as read-only Admin fields; adds no new evidence field. Default template output is byte-identical to pre-r0056 wording.",
+  "migrations_required": [
+    "webrequests.0010_webrequestconfig_dedication_anonymous_message_template_and_more"
+  ],
+  "migration_compatibility": "additive",
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-gunicorn",
+    "isadoraair-engine"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0007"
+}

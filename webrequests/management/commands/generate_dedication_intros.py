@@ -2,7 +2,7 @@ from django.core.management.base import BaseCommand
 from django.db import connection
 
 from webrequests.models import SongRequest
-from webrequests.services import synthesize_dedication_intro
+from webrequests.services import DedicationSynthesisOutcome, synthesize_dedication_intro
 
 # Arbitrary fixed two-integer pair for the command-wide Postgres advisory
 # lock -- same idiom as log_builder.py's _advisory_lock_for_hour, just a
@@ -32,7 +32,15 @@ class Command(BaseCommand):
     needed -- filtering intro_track__isnull=True first would let the
     winner's own row drop out of the query the moment it's synthesized,
     making a collapsed duplicate look like "the first row" on the next
-    cycle and get a redundant intro of its own."""
+    cycle and get a redundant intro of its own.
+
+    The five-per-run cap below counts only real synthesis attempts
+    (DedicationSynthesisOutcome.SYNTHESIZED/FAILED) -- a deterministic
+    text-policy suppression (POLICY_SUPPRESSED) never touches shared
+    TTS/ffmpeg at all and does not consume a slot, so several
+    permanently-suppressed winners ordered ahead of a valid one cannot
+    starve it out of a run. See DedicationSynthesisOutcome's docstring
+    in webrequests/services.py."""
 
     help = "Synthesize spoken dedication intros with the configured logical TTS voice."
 
@@ -69,6 +77,7 @@ class Command(BaseCommand):
         seen_log_item_ids = set()
         processed = 0
         synthesized = 0
+        suppressed = 0
         for req in scheduled:
             if req.log_item_id in seen_log_item_ids:
                 continue
@@ -77,9 +86,23 @@ class Command(BaseCommand):
                 continue  # already synthesized on a prior cycle
             if processed >= 5:  # cap per run -- a sudden burst drains across several cycles
                 break
-            success = synthesize_dedication_intro(req)
+            outcome = synthesize_dedication_intro(req)
+            if outcome is DedicationSynthesisOutcome.POLICY_SUPPRESSED:
+                # A deterministic template/input-length violation, caught
+                # before any shared-TTS/ffmpeg work began -- NOT a real
+                # attempt. Deliberately does not count against the
+                # five-per-run cap (see DedicationSynthesisOutcome's own
+                # docstring): otherwise, several permanently-suppressed
+                # requests ordered ahead of a valid one could starve it
+                # out of every run indefinitely. `continue`, not `break`,
+                # so scanning keeps going past it in this same run.
+                suppressed += 1
+                continue
             processed += 1
-            if success:
+            if outcome is DedicationSynthesisOutcome.SYNTHESIZED:
                 synthesized += 1
 
-        self.stdout.write(f"Checked {len(seen_log_item_ids)} slot(s), attempted {processed}, synthesized {synthesized}.")
+        self.stdout.write(
+            f"Checked {len(seen_log_item_ids)} slot(s), attempted {processed}, "
+            f"synthesized {synthesized}, suppressed {suppressed}."
+        )

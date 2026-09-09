@@ -62,17 +62,20 @@ Day/night sky wording in update_local_wx_data is meteorological solar-state lang
 
 ## Web Requests dedication speech
 
-Source: webrequests/services.py:build_dedication_intro_text. Tests: webrequests/tests/test_dedication_intros.py.
+Source: webrequests/dedication_text.py (feature text policy) plus webrequests/services.py:build_dedication_intro_text (thin adapter that resolves station config and delegates). Tests: webrequests/tests/test_dedication_intros.py.
 
-| Rule or phrase | Example input → output | Why / scope / provider dependence | Future classification | Meaning risk and coverage |
+As of r0056 (Pass F), the "Intro template" and "Requester thanks" rows below moved from hardcoded Python strings to four explicit, station-editable `WebRequestConfig` templates (`dedication_named_message_template`, `dedication_named_request_template`, `dedication_anonymous_message_template`, `dedication_anonymous_request_template`) selected by whether a normalized requester name and/or dedication message is present. Their defaults reproduce the exact pre-r0056 wording byte-for-byte. Templates may reference only `{title}` `{artist}` `{requester_name}` `{dedication_message}`; `dedication_text.validate_template` (stdlib `string.Formatter().parse()`, not regex) rejects unknown placeholders, attribute/index access, conversion syntax, format specs, and malformed braces, both at Admin save time and at runtime rendering (stale/pre-existing data cannot bypass validation). The remaining rows stay code-owned normalization -- deliberately not exposed as editable copy, since they encode correctness/safety properties (a literal "Feat" must not be mangled, punctuation must not double) rather than station wording choices.
+
+| Rule or phrase | Example input → output | Why / scope / provider dependence | Classification | Meaning risk and coverage |
 | --- | --- | --- | --- | --- |
 | Featured-artist expansion | “Song (feat. Guest)” → “Song (featuring Guest)” | Avoids “feat.” being spoken as “feet”; title/artist database values stay unchanged | music/dedication-specific normalization; possibly engine-specific after listening | Could change a literal use of “feat.”, so the period and word boundary are constrained; case/title/artist tests exist |
-| Intro template | title/artist → “Now here’s TITLE by ARTIST” | Fixed spoken request framing | station-editable broadcast copy/template | Metadata must not be swapped; exact strings are tested |
+| Intro template | title/artist → “Now here’s TITLE by ARTIST” | Fixed spoken request framing | station-editable broadcast copy/template (`WebRequestConfig.dedication_*_template`, r0056) | Metadata must not be swapped; exact strings are tested |
 | Dedication body whitespace | multi-line listener message → one spaced phrase | Prevents newline/pacing artifacts | music/dedication-specific normalization | User wording punctuation remains otherwise intact; whitespace tests exist |
 | Sentence punctuation | missing terminal punctuation → append period | Produces a complete sentence before thanks copy | music/dedication-specific normalization | Low meaning risk; punctuation variants are tested |
-| Requester thanks | name plus message → “Thanks NAME for your dedication.”; no message → “…request.” | Distinguishes dedication from request and omits the sentence for blank names | station-editable broadcast copy/template | User/name association matters; exact branch tests exist |
+| Requester thanks | name plus message → “Thanks NAME for your dedication.”; no message → “…request.” | Distinguishes dedication from request and omits the sentence for blank names | station-editable broadcast copy/template (`WebRequestConfig.dedication_*_template`, r0056) | User/name association matters; exact branch tests exist |
+| Spoken length policy | normalized message longer than `WebRequestConfig.dedication_message_spoken_limit` (default 300 chars), or a final rendered script longer than 600 chars | Bounds a listener's on-air time and guards against oversized Track metadata; the public site's own 2,000-character transport limit is a separate, much looser guard | must remain code-owned correctness/safety policy | Deterministic, never truncates -- an over-limit script simply is not synthesized and the requested song still airs; see the "Over-limit behavior" note below |
 
-The active configuration is WebRequestConfig.dedication_tts_voice plus dedication_tts_timeout_seconds. A blank voice means no intro is attached; the song request can still air.
+The active configuration is WebRequestConfig.dedication_tts_voice plus dedication_tts_timeout_seconds. A blank voice means no intro is attached; the song request can still air. An invalid/over-limit template or message behaves the same way: `dedication_text.DedicationTextPolicyError` is raised before any shared-TTS/ffmpeg work begins, `synthesize_dedication_intro` catches it, emits a "Dedication intro suppressed by text policy" warning event, and leaves the requested song's own scheduling/fulfillment untouched -- see webrequests/services.py::synthesize_dedication_intro.
 
 ## Road Conditions / KDOT normalization
 

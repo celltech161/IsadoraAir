@@ -27,9 +27,11 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from django.contrib import admin
+from django.core.exceptions import ValidationError
 from django.core.management import call_command
 from django.db import close_old_connections, connection, transaction
 from django.db.utils import OperationalError
+from django.forms import modelform_factory
 from django.test import TransactionTestCase
 from django.utils import timezone
 
@@ -43,7 +45,11 @@ from webrequests.admin import SongRequestAdmin
 from webrequests.management.commands.generate_dedication_intros import DEDICATION_LOCK_KEY
 from webrequests.management.commands.refresh_song_request_statuses import Command as RefreshCommand
 from webrequests.models import SongRequest, WebRequestConfig
-from webrequests.services import build_dedication_intro_text, synthesize_dedication_intro
+from webrequests.services import (
+    DedicationSynthesisOutcome,
+    build_dedication_intro_text,
+    synthesize_dedication_intro,
+)
 import webrequests.services as services_module
 
 from webrequests.tests.test_request_scheduling_lifecycle import WebRequestFixtureMixin
@@ -316,7 +322,7 @@ class DedicationSynthesisTests(DedicationFixtureMixin, TransactionTestCase):
         ):
             result = synthesize_dedication_intro(req)
 
-        self.assertTrue(result, "the intro attachment succeeded -- a cosmetic waveform failure must not undo that")
+        self.assertEqual(result, DedicationSynthesisOutcome.SYNTHESIZED, "the intro attachment succeeded -- a cosmetic waveform failure must not undo that")
         req.refresh_from_db()
         self.assertIsNotNone(req.intro_track_id)
         self.assertEqual(req.intro_track.next_start_seconds, req.intro_track.duration_seconds)
@@ -504,7 +510,7 @@ class DedicationSharedTTSRoutingTests(DedicationFixtureMixin, TransactionTestCas
              patch.object(services_module, "emit_event") as mock_emit:
             result = synthesize_dedication_intro(req)
 
-        self.assertFalse(result, "best-effort: a blank dedication voice must not raise or crash the caller")
+        self.assertEqual(result, DedicationSynthesisOutcome.FAILED, "best-effort: a blank dedication voice must not raise or crash the caller")
         mock_station.assert_not_called()
         announcement_renderer_module.subprocess.run.assert_not_called()
         req.refresh_from_db()
@@ -525,7 +531,7 @@ class DedicationSharedTTSRoutingTests(DedicationFixtureMixin, TransactionTestCas
                            side_effect=self._fake_station_synth) as mock_station:
             result = synthesize_dedication_intro(req)
 
-        self.assertTrue(result)
+        self.assertEqual(result, DedicationSynthesisOutcome.SYNTHESIZED)
         mock_station.assert_called_once()
         args, kwargs = mock_station.call_args
         self.assertEqual(kwargs["voice"], "Dedication_Dave", "caller must pass the logical name, not a provider id")
@@ -558,7 +564,7 @@ class DedicationSharedTTSRoutingTests(DedicationFixtureMixin, TransactionTestCas
              patch.object(services_module, "emit_event") as mock_emit:
             result = synthesize_dedication_intro(req)
 
-        self.assertFalse(result, "best-effort: a shared-TTS failure must not raise or crash the caller")
+        self.assertEqual(result, DedicationSynthesisOutcome.FAILED, "best-effort: a shared-TTS failure must not raise or crash the caller")
         req.refresh_from_db()
         self.assertIsNone(req.intro_track_id, "no partial Track should be attached on failure")
         mock_emit.assert_called_once()
@@ -581,7 +587,7 @@ class DedicationSharedTTSRoutingTests(DedicationFixtureMixin, TransactionTestCas
         with patch.object(announcement_renderer_module, "synthesize_station_voice", side_effect=self._fake_station_synth):
             result = synthesize_dedication_intro(req)
 
-        self.assertTrue(result)
+        self.assertEqual(result, DedicationSynthesisOutcome.SYNTHESIZED)
         req.refresh_from_db()
         self.assertIsNotNone(req.intro_track_id)
         self.assertEqual(req.intro_track.title, track.title)
@@ -592,6 +598,372 @@ class DedicationSharedTTSRoutingTests(DedicationFixtureMixin, TransactionTestCas
             Path(req.intro_track.filepath).exists(),
             "ffmpeg WAV->FLAC conversion must still run for the shared-TTS path",
         )
+
+
+# ---------------------------------------------------------------------
+# r0056 (Pass F). Station template Admin-time validation.
+# ---------------------------------------------------------------------
+class DedicationTemplateAdminValidationTests(WebRequestFixtureMixin, TransactionTestCase):
+    def test_invalid_template_rejected_by_full_clean(self):
+        """Admin's ModelForm always calls instance.full_clean(), which
+        runs field validators -- proving rejection here proves Admin
+        rejects it before save, without needing to wire a fake request
+        through the real ModelAdmin."""
+        self.cfg.dedication_named_request_template = "Now here's {track.title} by {artist}."
+        with self.assertRaises(ValidationError):
+            self.cfg.full_clean()
+
+    def test_valid_custom_template_passes_full_clean(self):
+        self.cfg.dedication_anonymous_request_template = "Coming up: {title} by {artist}."
+        self.cfg.full_clean()  # must not raise
+
+    def test_modelform_rejects_invalid_template(self):
+        """Same validator, exercised the way a bound Django form (which
+        is what Admin actually renders/validates) would."""
+        Form = modelform_factory(WebRequestConfig, fields=["dedication_named_request_template"])
+        form = Form(data={"dedication_named_request_template": "Now here's {track.title} by {artist}."})
+        self.assertFalse(form.is_valid())
+        self.assertIn("dedication_named_request_template", form.errors)
+
+    def test_modelform_accepts_valid_custom_template(self):
+        Form = modelform_factory(WebRequestConfig, fields=["dedication_anonymous_request_template"])
+        form = Form(data={"dedication_anonymous_request_template": "Coming up: {title} by {artist}."})
+        self.assertTrue(form.is_valid(), form.errors)
+
+
+# ---------------------------------------------------------------------
+# r0056 (Pass F). A deterministic text-policy violation (invalid
+# station template or over-length listener message) must never touch
+# the requested song's own lifecycle, and must never reach shared TTS.
+# ---------------------------------------------------------------------
+class DedicationTextPolicyLifecycleTests(DedicationFixtureMixin, TransactionTestCase):
+    def setUp(self):
+        super().setUp()
+        voice = StationTTSVoice.objects.create(
+            name="Dedication_Dave", enabled=True, engine=StationTTSVoice.Engine.KOKORO,
+            provider_voice="am_fenrir", language="en-us", speed=1.0,
+        )
+        self.cfg.dedication_tts_voice = voice
+        self.cfg.save(update_fields=["dedication_tts_voice"])
+
+    def test_invalid_stored_template_suppresses_intro_without_touching_song(self):
+        self.cfg.dedication_named_request_template = "Now here's {track.title} by {artist}."
+        self.cfg.save(update_fields=["dedication_named_request_template"])
+
+        track = self.make_track(title="Free Fallin'")
+        log = self.make_log(date(2027, 7, 1), 5)
+        item = self.make_item(log, 0, track=track)
+        req = self.make_request(track, status="scheduled", log_item=item, requester_name="Justin")
+
+        with patch.object(announcement_renderer_module, "synthesize_station_voice") as mock_station, \
+             patch.object(services_module, "emit_event") as mock_emit:
+            result = synthesize_dedication_intro(req)
+
+        self.assertEqual(result, DedicationSynthesisOutcome.POLICY_SUPPRESSED)
+        mock_station.assert_not_called()
+        req.refresh_from_db()
+        self.assertIsNone(req.intro_track_id, "no partial Track should be attached")
+        self.assertEqual(req.status, "scheduled", "the requested song's schedulability must be unaffected")
+        self.assertEqual(req.log_item_id, item.id)
+        mock_emit.assert_called_once()
+        self.assertEqual(mock_emit.call_args.kwargs["category"], "webrequests")
+        self.assertEqual(mock_emit.call_args.kwargs["level"], "warning")
+        self.assertEqual(mock_emit.call_args.kwargs["title"], "Dedication intro suppressed by text policy")
+
+    def test_over_limit_dedication_message_suppresses_intro_without_touching_song(self):
+        track = self.make_track(title="Free Fallin'")
+        log = self.make_log(date(2027, 7, 2), 5)
+        item = self.make_item(log, 0, track=track)
+        req = self.make_request(
+            track, status="scheduled", log_item=item, requester_name="Justin",
+            dedication_message="x" * 400,
+        )
+
+        with patch.object(announcement_renderer_module, "synthesize_station_voice") as mock_station, \
+             patch.object(services_module, "emit_event") as mock_emit:
+            result = synthesize_dedication_intro(req)
+
+        self.assertEqual(result, DedicationSynthesisOutcome.POLICY_SUPPRESSED)
+        mock_station.assert_not_called()
+        req.refresh_from_db()
+        self.assertIsNone(req.intro_track_id)
+        self.assertEqual(req.status, "scheduled")
+        mock_emit.assert_called_once()
+        self.assertEqual(mock_emit.call_args.kwargs["title"], "Dedication intro suppressed by text policy")
+
+    def test_diagnostic_throttle_failure_does_not_escape_synthesis(self):
+        """A failure inside the SystemEvent throttle lookup itself
+        (e.g. a monitoring-layer DB hiccup) must never escape
+        synthesize_dedication_intro -- the underlying dedication
+        condition is intentionally non-fatal, and a bug in the
+        diagnostics-only throttle must not turn it into a real one
+        that aborts the management-command run."""
+        track = self.make_track(title="Free Fallin'")
+        log = self.make_log(date(2027, 7, 4), 5)
+        item = self.make_item(log, 0, track=track)
+        req = self.make_request(
+            track, status="scheduled", log_item=item, requester_name="Justin",
+            dedication_message="x" * 400,
+        )
+
+        with patch.object(
+            announcement_renderer_module, "synthesize_station_voice"
+        ) as mock_station, patch.object(
+            services_module.SystemEvent.objects, "filter",
+            side_effect=RuntimeError("monitoring unavailable"),
+        ):
+            result = synthesize_dedication_intro(req)
+
+        self.assertEqual(result, DedicationSynthesisOutcome.POLICY_SUPPRESSED)
+        mock_station.assert_not_called()
+        req.refresh_from_db()
+        self.assertIsNone(req.intro_track_id)
+        self.assertEqual(req.status, "scheduled")
+        self.assertEqual(req.log_item_id, item.id)
+
+    def test_generate_dedication_intros_command_completes_normally_after_policy_violation(self):
+        """End-to-end through the real management command: a
+        permanently-doomed request (invalid template) never prevents
+        the command from completing, and never cancels or reschedules
+        the request -- it simply stays exactly where any request with
+        no intro yet normally sits, exactly like a missing-voice or
+        shared-TTS failure would leave it. A policy suppression must
+        NOT be counted as an 'attempted' (expensive) synthesis slot --
+        see DedicationSynthesisAttemptAccountingTests below for the
+        full starvation regression this exists to prevent."""
+        self.cfg.dedication_named_request_template = "Now here's {track.title} by {artist}."
+        self.cfg.save(update_fields=["dedication_named_request_template"])
+
+        track = self.make_track(title="Free Fallin'")
+        log = self.make_log(date(2027, 7, 3), 5)
+        item = self.make_item(log, 0, track=track)
+        req = self.make_request(track, status="scheduled", log_item=item, requester_name="Justin")
+
+        out = StringIO()
+        with patch.object(announcement_renderer_module, "synthesize_station_voice") as mock_station:
+            call_command("generate_dedication_intros", stdout=out)
+
+        mock_station.assert_not_called()
+        req.refresh_from_db()
+        self.assertIsNone(req.intro_track_id)
+        self.assertEqual(req.status, "scheduled")
+        output = out.getvalue()
+        self.assertIn("attempted 0", output, "a policy suppression must not consume an attempt slot")
+        self.assertIn("suppressed 1", output)
+
+
+# ---------------------------------------------------------------------
+# r0056 correction. The five-per-run expensive-attempt cap must count
+# only real (or lost-CAS) synthesis attempts -- never a deterministic
+# text-policy suppression, which never touches shared TTS at all.
+# ---------------------------------------------------------------------
+class DedicationSynthesisAttemptAccountingTests(DedicationFixtureMixin, TransactionTestCase):
+    def setUp(self):
+        super().setUp()
+        self._dedi_tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dedi_tmpdir.cleanup)
+        root_patcher = patch.object(services_module, "DEDICATION_ROOT", Path(self._dedi_tmpdir.name))
+        root_patcher.start()
+        self.addCleanup(root_patcher.stop)
+
+        self.dedication_voice = StationTTSVoice.objects.create(
+            name="Dedication_Dave", enabled=True, engine=StationTTSVoice.Engine.KOKORO,
+            provider_voice="am_fenrir", language="en-us", speed=1.0,
+        )
+        self.cfg.dedication_tts_voice = self.dedication_voice
+        self.cfg.save(update_fields=["dedication_tts_voice"])
+
+        def fake_station_synth(text, *, voice, output_path, speed=None, language=None,
+                                timeout_seconds=None, service=None):
+            Path(output_path).write_bytes(b"WAV")
+            return Path(output_path)
+
+        station_patcher = patch.object(
+            announcement_renderer_module, "synthesize_station_voice", side_effect=fake_station_synth
+        )
+        self.mock_station = station_patcher.start()
+        self.addCleanup(station_patcher.stop)
+
+        def fake_run(cmd, **kwargs):
+            if cmd[0] == "ffmpeg":
+                Path(cmd[-1]).write_bytes(b"FLAC")
+            return MagicMock(returncode=0)
+
+        run_patcher = patch.object(announcement_renderer_module.subprocess, "run", side_effect=fake_run)
+        run_patcher.start()
+        self.addCleanup(run_patcher.stop)
+
+        duration_patcher = patch.object(announcement_renderer_module, "_probe_duration", return_value=6.5)
+        duration_patcher.start()
+        self.addCleanup(duration_patcher.stop)
+
+        analyze_patcher = patch(
+            "library.management.commands.analyze_tracks.analyze_one_track", return_value=True
+        )
+        analyze_patcher.start()
+        self.addCleanup(analyze_patcher.stop)
+
+    def test_five_suppressed_winners_do_not_starve_a_valid_sixth(self):
+        """The exact starvation shape the correction exists to fix:
+        five permanently policy-suppressed scheduled winners ordered
+        ahead of one valid winner must not consume all five
+        expensive-attempt slots -- the valid one must still be reached
+        and synthesized in the SAME command run."""
+        log = self.make_log(date(2027, 9, 1), 5)
+        base_time = timezone.now()
+
+        suppressed_reqs = []
+        suppressed_item_ids = []
+        for i in range(5):
+            track = self.make_track(title=f"Suppressed Song {i}")
+            item = self.make_item(log, i, track=track, scheduled_time=base_time + timedelta(minutes=i))
+            req = self.make_request(
+                track, status="scheduled", log_item=item, requester_name="Justin",
+                dedication_message="x" * 400,  # deterministically over the 300-char spoken limit
+            )
+            suppressed_reqs.append(req)
+            suppressed_item_ids.append(item.id)
+
+        valid_track = self.make_track(title="Valid Song")
+        valid_item = self.make_item(log, 5, track=valid_track, scheduled_time=base_time + timedelta(minutes=5))
+        valid_req = self.make_request(
+            valid_track, status="scheduled", log_item=valid_item, requester_name="Justin",
+            dedication_message="a short dedication",
+        )
+
+        out = StringIO()
+        call_command("generate_dedication_intros", stdout=out)
+
+        self.assertEqual(
+            self.mock_station.call_count, 1,
+            "shared TTS must be invoked exactly once -- for the valid request only; "
+            "the five suppressed requests ahead of it must never reach it",
+        )
+
+        for req, item_id in zip(suppressed_reqs, suppressed_item_ids):
+            req.refresh_from_db()
+            self.assertIsNone(req.intro_track_id, "a suppressed request must never receive an intro")
+            self.assertEqual(req.status, "scheduled", "scheduling/status must be unaffected by suppression")
+            self.assertEqual(req.log_item_id, item_id, "the request's own assignment must be unaffected")
+
+        valid_req.refresh_from_db()
+        self.assertIsNotNone(
+            valid_req.intro_track_id,
+            "the valid request behind five suppressed ones must still be synthesized in this same run",
+        )
+
+        output = out.getvalue()
+        self.assertIn("attempted 1", output, "only the one real synthesis attempt should count")
+        self.assertIn("synthesized 1", output)
+        self.assertIn("suppressed 5", output, "all five deterministic suppressions should be reported, uncapped")
+
+    def test_diagnostic_throttle_failure_on_suppressed_request_does_not_block_later_valid_request(self):
+        """A monitoring-layer hiccup while reporting one suppressed
+        request must not abort the whole command run -- a later, valid
+        winner in the same run must still be reached and synthesized."""
+        log = self.make_log(date(2027, 9, 2), 5)
+        base_time = timezone.now()
+
+        suppressed_track = self.make_track(title="Suppressed Song")
+        suppressed_item = self.make_item(log, 0, track=suppressed_track, scheduled_time=base_time)
+        suppressed_req = self.make_request(
+            suppressed_track, status="scheduled", log_item=suppressed_item, requester_name="Justin",
+            dedication_message="x" * 400,
+        )
+
+        valid_track = self.make_track(title="Valid Song")
+        valid_item = self.make_item(log, 1, track=valid_track, scheduled_time=base_time + timedelta(minutes=1))
+        valid_req = self.make_request(
+            valid_track, status="scheduled", log_item=valid_item, requester_name="Justin",
+            dedication_message="a short dedication",
+        )
+
+        out = StringIO()
+        with patch.object(
+            services_module.SystemEvent.objects, "filter",
+            side_effect=RuntimeError("monitoring unavailable"),
+        ):
+            call_command("generate_dedication_intros", stdout=out)
+
+        self.assertEqual(self.mock_station.call_count, 1, "only the valid request should reach shared TTS")
+
+        suppressed_req.refresh_from_db()
+        self.assertIsNone(suppressed_req.intro_track_id)
+        self.assertEqual(suppressed_req.status, "scheduled")
+
+        valid_req.refresh_from_db()
+        self.assertIsNotNone(
+            valid_req.intro_track_id,
+            "a diagnostics failure on an earlier suppressed request must not block a later valid one",
+        )
+
+        output = out.getvalue()
+        self.assertIn("attempted 1", output)
+        self.assertIn("synthesized 1", output)
+        self.assertIn("suppressed 1", output)
+
+
+# ---------------------------------------------------------------------
+# r0056 (Pass F). Dedication evidence semantics -- formalizes the
+# distinction between "generated", "placed", "occurred", and the
+# requested song's own independent "fulfilled" evidence, using only
+# existing fields (see SongRequest's computed properties in models.py).
+# ---------------------------------------------------------------------
+class DedicationEvidenceStatusTests(DedicationFixtureMixin, TransactionTestCase):
+    def test_no_evidence_at_all(self):
+        track = self.make_track()
+        req = self.make_request(track, status="pending")
+        self.assertEqual(req.intro_artifact_status, "Not generated")
+        self.assertEqual(req.intro_queue_status, "Not spliced")
+        self.assertEqual(req.intro_play_status, "Not spliced")
+        self.assertEqual(req.requested_song_status, "Not scheduled")
+
+    def test_scheduled_song_with_no_intro_yet(self):
+        track = self.make_track()
+        log = self.make_log(date(2027, 8, 1), 5)
+        item = self.make_item(log, 0, track=track)
+        req = self.make_request(track, status="scheduled", log_item=item)
+        self.assertEqual(req.requested_song_status, "Scheduled / not yet fulfilled")
+
+    def test_intro_track_alone_does_not_mean_aired(self):
+        track = self.make_track()
+        intro_track = self.make_dedication_track()
+        req = self.make_request(track, status="scheduled", intro_track=intro_track)
+        self.assertEqual(req.intro_artifact_status, "Generated")
+        self.assertEqual(req.intro_queue_status, "Not spliced")
+        self.assertEqual(req.intro_play_status, "Not spliced")
+
+    def test_intro_log_item_with_played_at_none_does_not_mean_aired(self):
+        track = self.make_track()
+        intro_track = self.make_dedication_track()
+        log = self.make_log(date(2027, 8, 2), 5)
+        intro_item = self.make_dedication_item(log, 0, intro_track)
+        req = self.make_request(
+            track, status="scheduled", intro_track=intro_track, intro_log_item=intro_item,
+        )
+        self.assertEqual(req.intro_queue_status, "Spliced")
+        self.assertEqual(req.intro_play_status, "Spliced / not yet played")
+
+    def test_intro_log_item_played_at_is_the_existing_air_evidence(self):
+        track = self.make_track()
+        intro_track = self.make_dedication_track()
+        log = self.make_log(date(2027, 8, 3), 5)
+        intro_item = self.make_dedication_item(log, 0, intro_track, played_at=timezone.now())
+        req = self.make_request(
+            track, status="fulfilled", intro_track=intro_track, intro_log_item=intro_item,
+        )
+        self.assertIn("Aired at", req.intro_play_status)
+
+    def test_fulfilled_at_is_independent_requested_song_evidence(self):
+        track = self.make_track()
+        log = self.make_log(date(2027, 8, 4), 5)
+        item = self.make_item(log, 0, track=track)
+        req = self.make_request(
+            track, status="fulfilled", log_item=item, fulfilled_at=timezone.now(),
+        )
+        self.assertIn("Fulfilled at", req.requested_song_status)
+        # Independent of dedication evidence -- no intro involved at all.
+        self.assertEqual(req.intro_artifact_status, "Not generated")
 
 
 # ---------------------------------------------------------------------

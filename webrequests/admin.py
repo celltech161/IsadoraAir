@@ -26,6 +26,29 @@ class WebRequestConfigAdmin(admin.ModelAdmin):
             "fields": ["dedication_tts_voice", "dedication_tts_timeout_seconds"],
             "description": "Active shared-TTS settings. Select a logical voice to synthesize intros; blank leaves songs unannounced.",
         }),
+        ("Dedication Wording", {
+            "fields": [
+                "dedication_named_message_template",
+                "dedication_named_request_template",
+                "dedication_anonymous_message_template",
+                "dedication_anonymous_request_template",
+                "dedication_message_spoken_limit",
+            ],
+            "description": (
+                "Station-editable spoken wording for the four possible "
+                "combinations of requester name / dedication message. "
+                "Allowed placeholders in any template: {title} {artist} "
+                "{requester_name} {dedication_message} -- exactly these four, "
+                "no others. Attribute access, indexing, conversion syntax "
+                "(!r), and format specs (:>20) are all rejected on save. "
+                "dedication_message_spoken_limit bounds how long a "
+                "normalized dedication message may be before it is spoken "
+                "on-air (independent of, and much smaller than, the public "
+                "site's own listener-input limit); an over-limit message is "
+                "never truncated -- the intro is simply not generated and "
+                "the requested song still airs plainly."
+            ),
+        }),
         ("Notifications", {
             "fields": ["notify_email"],
         }),
@@ -79,6 +102,43 @@ class SongRequestAdmin(admin.ModelAdmin):
         "submitted_at", "fetched_at", "scheduled_at", "fulfilled_at", "resolved_at",
         "estimated_play_time", "log_item", "status_updated_at",
         "intro_track", "intro_log_item",
+        "intro_artifact_status", "intro_queue_status", "intro_play_status",
+        "requested_song_status",
+    ]
+
+    fieldsets = [
+        (None, {
+            "fields": [
+                "external_request_id", "status", "track",
+                "requester_name", "dedication_message",
+            ],
+        }),
+        ("Schedule & Fulfillment", {
+            "fields": [
+                "submitted_at", "fetched_at", "scheduled_at",
+                "fulfilled_at", "resolved_at", "estimated_play_time",
+                "status_updated_at", "log_item",
+            ],
+        }),
+        ("Dedication Evidence", {
+            "fields": [
+                "intro_track", "intro_artifact_status",
+                "intro_log_item", "intro_queue_status", "intro_play_status",
+                "requested_song_status",
+            ],
+            "description": (
+                "intro_track alone proves only that a spoken artifact was "
+                "generated -- not that it was ever queued or aired. "
+                "intro_log_item proves it was spliced ahead of the "
+                "requested song's occurrence -- pairing/restart-recovery "
+                "evidence, still not proof of audible playback. "
+                "intro_play_status reflects intro_log_item.played_at, the "
+                "strongest currently-existing evidence the intro actually "
+                "occurred. requested_song_status (fulfilled_at) is separate, "
+                "independent evidence for the requested song itself, set "
+                "only once its own LogItem.played_at succeeds."
+            ),
+        }),
     ]
 
     def has_add_permission(self, request):

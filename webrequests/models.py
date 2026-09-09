@@ -1,7 +1,29 @@
 from django.contrib.postgres.fields import ArrayField
 from django.contrib.postgres.indexes import GinIndex
+from django.core.exceptions import ValidationError
+from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models
 from django.utils import timezone
+
+from .dedication_text import (
+    DedicationTemplateError,
+    MAX_DEDICATION_MESSAGE_SPOKEN_LIMIT,
+    MIN_DEDICATION_MESSAGE_SPOKEN_LIMIT,
+)
+from .dedication_text import validate_template as _validate_dedication_template_source
+
+
+def validate_dedication_template_field(value):
+    """Django-facing adapter around dedication_text.validate_template --
+    runs at Admin/ModelForm full_clean() time (field validators run
+    there automatically) so an invalid station template is rejected
+    before save, not just at runtime rendering. Kept as a plain
+    module-level function (not a lambda/closure) so Django's migration
+    serializer can reference it by dotted path."""
+    try:
+        _validate_dedication_template_source(value)
+    except DedicationTemplateError as exc:
+        raise ValidationError(str(exc)) from exc
 
 
 class WebRequestConfig(models.Model):
@@ -88,6 +110,62 @@ class WebRequestConfig(models.Model):
     dedication_tts_timeout_seconds = models.PositiveIntegerField(
         default=30,
         help_text="Shared-TTS timeout for each short dedication intro.",
+    )
+
+    # Four explicit, station-editable spoken templates -- one per
+    # named/anonymous x dedication-message/request-only combination.
+    # Deliberately four separate fields rather than one field with
+    # conditional syntax: see webrequests/dedication_text.py for the
+    # trusted {title}/{artist}/{requester_name}/{dedication_message}
+    # substitution allowlist both Admin (via validate_dedication_
+    # template_field below) and runtime rendering enforce. Defaults
+    # reproduce the exact pre-r0056 hardcoded wording byte-for-byte --
+    # see webrequests/tests/test_dedication_intros.py's
+    # DedicationTextTemplateTests.
+    dedication_named_message_template = models.CharField(
+        max_length=512,
+        default="Now here's {title} by {artist}, {dedication_message} Thanks {requester_name} for your dedication.",
+        validators=[validate_dedication_template_field],
+        help_text="Used when a requester name AND a dedication message are both "
+                   "present. Allowed placeholders: {title} {artist} "
+                   "{requester_name} {dedication_message}.",
+    )
+    dedication_named_request_template = models.CharField(
+        max_length=512,
+        default="Now here's {title} by {artist}. Thanks {requester_name} for your request.",
+        validators=[validate_dedication_template_field],
+        help_text="Used when a requester name is present but no dedication "
+                   "message was given. Allowed placeholders: {title} {artist} "
+                   "{requester_name} {dedication_message}.",
+    )
+    dedication_anonymous_message_template = models.CharField(
+        max_length=512,
+        default="Now here's {title} by {artist}, {dedication_message}",
+        validators=[validate_dedication_template_field],
+        help_text="Used when a dedication message is present but no requester "
+                   "name was given. Allowed placeholders: {title} {artist} "
+                   "{requester_name} {dedication_message}.",
+    )
+    dedication_anonymous_request_template = models.CharField(
+        max_length=512,
+        default="Now here's {title} by {artist}.",
+        validators=[validate_dedication_template_field],
+        help_text="Used when neither a requester name nor a dedication message "
+                   "was given. Allowed placeholders: {title} {artist} "
+                   "{requester_name} {dedication_message}.",
+    )
+    dedication_message_spoken_limit = models.PositiveSmallIntegerField(
+        default=300,
+        validators=[
+            MinValueValidator(MIN_DEDICATION_MESSAGE_SPOKEN_LIMIT),
+            MaxValueValidator(MAX_DEDICATION_MESSAGE_SPOKEN_LIMIT),
+        ],
+        help_text="Local, authoritative on-air length cap for a normalized "
+                   "dedication message -- independent of (and much smaller "
+                   "than) the public site's own 2,000-character transport "
+                   "limit. A message that exceeds this is never truncated: "
+                   "the intro is simply not generated and the requested song "
+                   "still airs plainly.",
     )
 
     class Meta:
@@ -290,3 +368,60 @@ class SongRequest(models.Model):
     def __str__(self):
         track_label = str(self.track) if self.track_id else "(track removed)"
         return f"[{self.status}] {self.requester_name or 'anonymous'}: {track_label}"
+
+    # -------------------------------------------------------------
+    # Read-only dedication evidence -- computed only, never persisted.
+    # Formalizes the distinct facts already represented by existing
+    # fields (see the class docstring's field-by-field notes above and
+    # docs/WEB_REQUESTS_INTEGRATION.md's "Dedication evidence" section)
+    # without adding any new timestamp or model. Surfaced in
+    # SongRequestAdmin's read-only "Dedication Evidence" fieldset.
+    # -------------------------------------------------------------
+    @property
+    def intro_artifact_status(self):
+        """intro_track alone means: a generated spoken artifact exists
+        and is associated with this request. It does NOT mean the
+        intro was ever queued or aired -- see intro_queue_status and
+        intro_play_status for that."""
+        return "Generated" if self.intro_track_id else "Not generated"
+
+    @property
+    def intro_queue_status(self):
+        """intro_log_item means: the generated intro was actually
+        spliced into a specific playlist occurrence ahead of its
+        requested-song assignment. It is pairing/restart-recovery
+        evidence -- it does not, by itself, prove audible playback."""
+        return "Spliced" if self.intro_log_item_id else "Not spliced"
+
+    @property
+    def intro_play_status(self):
+        """intro_log_item.played_at, when non-null, is the existing
+        engine occurrence evidence that the dedication intro's LogItem
+        actually began playback under the same engine clock used by
+        every other LogItem -- the strongest currently-existing
+        dedication-air evidence. This is NOT a claim about "first
+        audible PCM"; it is whatever the existing LogItem playback-
+        start write means, station-wide, until roadmap item 1.6
+        settles that question."""
+        if not self.intro_log_item_id:
+            return "Not spliced"
+        played_at = self.intro_log_item.played_at
+        if played_at is None:
+            return "Spliced / not yet played"
+        return f"Aired at {played_at:%Y-%m-%d %H:%M:%S %Z}"
+
+    @property
+    def requested_song_status(self):
+        """The requested song's own occurrence evidence -- fulfilled_at,
+        set only after the requested song's own LogItem.played_at
+        write succeeds (see webrequests.services.mark_song_requests_
+        aired). Deliberately independent of the dedication intro
+        evidence above: a dedication can air without its song showing
+        fulfilled yet in a narrow timing window, and a song can be
+        fulfilled with no intro ever having aired -- or existed -- at
+        all."""
+        if self.fulfilled_at is not None:
+            return f"Fulfilled at {self.fulfilled_at:%Y-%m-%d %H:%M:%S %Z}"
+        if self.log_item_id:
+            return "Scheduled / not yet fulfilled"
+        return "Not scheduled"

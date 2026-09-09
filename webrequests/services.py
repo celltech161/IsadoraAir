@@ -1,7 +1,7 @@
 import json
-import re
 import time
 from datetime import timedelta
+from enum import Enum
 from pathlib import Path
 
 from django.conf import settings
@@ -18,20 +18,109 @@ from isadoraair.tts.errors import TTSConfigurationError
 from library.models import LogItem, PlaylistLog, RecencyConfig, Track
 from library.services.log_builder import get_recent_exclusions, get_separation
 from library.services.related_artists import track_identity_keys
-from monitoring.models import emit_event
+from monitoring.models import SystemEvent, emit_event
 
+from . import dedication_text
+from .dedication_text import DedicationTextPolicyError
 from .models import SongRequest, WebRequestConfig
 
-DEDICATION_ROOT = Path(settings.LIBRARY_ROOT) / "Dedications"
 
-# "feat." (any case, with the period -- requiring it is what keeps this
-# from also mangling "feat" used as an actual word, e.g. a title like
-# "Incredible Feat") can be spoken as the rhyming word ("feet")
-# rather than expanded to "featuring". Word-boundary on the left only,
-# so it matches both "(feat. X)" and "feat. X" but never touches
-# "featuring" itself (which the same \bfeat\. pattern can't match --
-# "feat" there is followed by "u", not a period).
-_FEATURED_ARTIST_ABBREV_RE = re.compile(r"\bfeat\.", re.IGNORECASE)
+class DedicationSynthesisOutcome(Enum):
+    """Explicit tri-state result of one synthesize_dedication_intro()
+    call. Callers must branch on explicit identity/equality comparison
+    against these members (e.g. `outcome is DedicationSynthesisOutcome.
+    SYNTHESIZED`), never on truthiness -- an ordinary Python Enum
+    member is truthy regardless of which one it is, so a truthiness
+    check would treat every outcome, including POLICY_SUPPRESSED, as
+    "success". generate_dedication_intros.py must name the outcome it
+    means, since exactly one of these three must NOT consume one of
+    the command's five expensive-attempt slots per run (see
+    POLICY_SUPPRESSED)."""
+
+    #: A Track was rendered and attached to this request.
+    SYNTHESIZED = "synthesized"
+    #: A real synthesis attempt happened -- shared TTS/ffmpeg ran, or
+    #: would have but for a configuration problem (e.g. no voice
+    #: selected) -- and did not end in an attached Track (transient
+    #: failure, or this request lost the CAS race to another caller).
+    #: Retried next cycle; DOES consume an attempt slot, same as before
+    #: this outcome type existed.
+    FAILED = "failed"
+    #: A deterministic text-policy violation (invalid station template,
+    #: or listener/track text over the local on-air length policy) was
+    #: caught entirely in-process, before shared TTS was ever invoked.
+    #: Retried next cycle at effectively no cost; must NEVER consume an
+    #: attempt slot -- see dedication_text.DedicationTextPolicyError.
+    POLICY_SUPPRESSED = "policy_suppressed"
+
+
+# How long a policy-suppression warning for the SAME request is allowed
+# to stay "already reported" before another one is emitted. monitoring.
+# emit_event() itself only coalesces repeat emissions of the same
+# dedupe_key onto one row within its own 60-second window (see
+# monitoring/models.py) -- outside that window it starts a brand new
+# SystemEvent row. generate_dedication_intros runs roughly every 15
+# seconds, and a policy-suppressed request can legitimately sit
+# scheduled for hours (fail-open: the song keeps airing normally), so
+# without an extra feature-level gate this would create a fresh
+# SystemEvent row about once a minute for as long as the request
+# waits. This reads the EXISTING SystemEvent table as a throttle --
+# monitoring.emit_event()'s own behavior, table, and coalescing window
+# are untouched, and no new schema is added for this.
+_POLICY_SUPPRESSION_REPORT_INTERVAL = timedelta(minutes=30)
+
+
+def _report_policy_suppression_if_due(req, exc):
+    """Best-effort only, and must NEVER raise. This is diagnostics,
+    called from inside synthesize_dedication_intro's `except
+    DedicationTextPolicyError` handler -- an exception escaping here
+    would NOT be caught by that same try statement's later `except
+    Exception` (Python does not re-dispatch a currently-running except
+    block through its own try's other clauses), so it would otherwise
+    escape synthesize_dedication_intro() entirely and abort the
+    management-command run despite the underlying dedication condition
+    being intentionally non-fatal.
+
+    A failure anywhere in the SystemEvent throttle lookup/decision
+    (querying SystemEvent, evaluating the 30-minute window) is
+    swallowed and falls back to reporting unthrottled -- emit_event()
+    itself is documented as non-throwing (see monitoring/models.py),
+    so this degrades a genuinely broken throttle to "noisier but still
+    reported," never to "an intro suppression this cycle silently
+    crashes dedication processing for the rest of the run."""
+    dedupe_key = f"webrequests|dedication-policy-suppressed|{req.id}"
+    detail = {"request_id": req.external_request_id, "error": str(exc)}
+    try:
+        last_event = (
+            SystemEvent.objects.filter(dedupe_key=dedupe_key)
+            .order_by("-created_at")
+            .first()
+        )
+        if last_event is not None:
+            last_activity = last_event.last_repeated_at or last_event.created_at
+            if last_activity >= timezone.now() - _POLICY_SUPPRESSION_REPORT_INTERVAL:
+                return  # already reported recently for this exact request -- stay quiet
+        emit_event(
+            category="webrequests",
+            level="warning",
+            title="Dedication intro suppressed by text policy",
+            detail=detail,
+            dedupe_key=dedupe_key,
+        )
+    except Exception:
+        # The throttle lookup itself (not emit_event, which does not
+        # raise) is the only realistic failure point above, but this
+        # is diagnostics -- treat ANY failure here the same way:
+        # report unthrottled rather than let it escape.
+        emit_event(
+            category="webrequests",
+            level="warning",
+            title="Dedication intro suppressed by text policy",
+            detail=detail,
+            dedupe_key=dedupe_key,
+        )
+
+DEDICATION_ROOT = Path(settings.LIBRARY_ROOT) / "Dedications"
 
 # Same path engine.py's STATE_PATH writes to -- redefined here rather
 # than imported, since library.services.engine imports FROM this module
@@ -450,49 +539,65 @@ def maybe_schedule_song_request(log_item):
         return log_item
 
 
-def build_dedication_intro_text(track, requester_name, dedication_message):
-    """'Now here's TITLE by ARTIST[, dedication text]. Thanks NAME for
-    your dedication/request.' requester_name is required on the public
-    site (client+server validated there), so the no-name case isn't
-    expected here -- handled defensively anyway (drop the closing
-    sentence) for consistency with how the site's own live preview
-    resolves the same edge case. Track.artist is a non-nullable FK, so
-    no defensive empty-string branch is needed there.
+def build_dedication_intro_text(track, requester_name, dedication_message, cfg=None):
+    """Renders the spoken dedication/request script for `track` via the
+    station-editable templates and local text policy owned by
+    webrequests/dedication_text.py -- this function is now a thin
+    adapter that resolves the four templates and the spoken-message
+    length limit from `cfg` (loaded internally if not passed) and
+    delegates everything else (placeholder substitution, "feat."
+    normalization, requester/message normalization, length policy) to
+    dedication_text.render_dedication_script.
 
-    Title/artist go through the "feat." normalization below -- their
-    display value in the DB/tags is untouched, only the string handed
-    to the configured logical TTS voice."""
-    title = _FEATURED_ARTIST_ABBREV_RE.sub("featuring", track.title)
-    artist_name = _FEATURED_ARTIST_ABBREV_RE.sub("featuring", track.artist.name)
-    sentence = f"Now here's {title} by {artist_name}"
-    dedication_message = " ".join((dedication_message or "").split())  # collapse newlines/whitespace
-    if dedication_message:
-        sentence += f", {dedication_message}"
-    if not sentence.endswith((".", "!", "?")):
-        sentence += "."
-    requester_name = (requester_name or "").strip()
-    if requester_name:
-        kind = "dedication" if dedication_message else "request"
-        sentence += f" Thanks {requester_name} for your {kind}."
-    return sentence
+    Requester_name is required on the public site (client+server
+    validated there), so the no-name case isn't expected here --
+    handled defensively anyway (an anonymous template, dropping the
+    closing "Thanks NAME..." sentence) for consistency with how the
+    site's own live preview resolves the same edge case.
+
+    Raises dedication_text.DedicationTextPolicyError (a station
+    template misconfiguration, or listener/track text that violates
+    the local on-air length policy) exactly when the script cannot be
+    safely rendered. Callers must treat that as an ordinary, request-
+    local "no intro this time" outcome -- see synthesize_dedication_
+    intro below -- never as a reason to affect the requested song's
+    own scheduling or fulfillment."""
+    if cfg is None:
+        cfg = WebRequestConfig.load()
+    return dedication_text.render_dedication_script(
+        title=track.title,
+        artist=track.artist.name,
+        requester_name=requester_name,
+        dedication_message=dedication_message,
+        named_message_template=cfg.dedication_named_message_template,
+        named_request_template=cfg.dedication_named_request_template,
+        anonymous_message_template=cfg.dedication_anonymous_message_template,
+        anonymous_request_template=cfg.dedication_anonymous_request_template,
+        dedication_message_spoken_limit=cfg.dedication_message_spoken_limit,
+    )
 
 
 def synthesize_dedication_intro(req):
     """Render a Speech Splice and attach it with the feature-owned CAS.
 
     The generation command remains the caller so slow TTS never enters the
-    reconciliation loop. Returns True only when this request wins the CAS;
-    every failure remains local to this request and is retried next cycle.
+    reconciliation loop. Returns a DedicationSynthesisOutcome -- SYNTHESIZED
+    only when this request wins the CAS; every other outcome remains local
+    to this request and is retried next cycle. Callers (in particular
+    generate_dedication_intros.py's per-run attempt cap) must branch on the
+    returned outcome explicitly, never on truthiness -- see
+    DedicationSynthesisOutcome's own docstring for why POLICY_SUPPRESSED
+    must never be counted the same as a real attempt.
     """
     try:
         track = req.track  # Stable request FK, not mutable log_item.track.
+        cfg = WebRequestConfig.load()
         text = build_dedication_intro_text(
-            track, req.requester_name, req.dedication_message
+            track, req.requester_name, req.dedication_message, cfg
         )
         final_path = DEDICATION_ROOT / f"request-{req.id}.flac"
         # external_request_id is opaque external data and is never a path.
 
-        cfg = WebRequestConfig.load()
         if cfg.dedication_tts_voice_id is None:
             raise TTSConfigurationError(
                 "WebRequestConfig.dedication_tts_voice is not set -- dedication intros have "
@@ -544,14 +649,32 @@ def synthesize_dedication_intro(req):
                     final_path.unlink()
                 except FileNotFoundError:
                     pass
-            return False
+            return DedicationSynthesisOutcome.FAILED
         if rendered.analysis_attempted and not rendered.analysis_succeeded:
             print(
                 f"  Dedication waveform generation failed for request {req.id} "
                 f"(non-fatal): {rendered.analysis_error or 'analysis did not complete'}"
             )
 
-        return True
+        return DedicationSynthesisOutcome.SYNTHESIZED
+    except DedicationTextPolicyError as exc:
+        # A deterministic template misconfiguration or an over-length
+        # listener/track script -- NOT a transient synthesis failure.
+        # The check that raised this runs entirely in-process before
+        # any shared-TTS/ffmpeg work begins, so retrying every command
+        # cycle (nothing here ever attaches a Track or touches the
+        # request's scheduling/fulfillment) costs essentially nothing,
+        # unlike a real synthesis attempt -- see dedication_text.py's
+        # DedicationTextPolicyError docstring. Diagnostics are
+        # throttled (_report_policy_suppression_if_due), not emitted
+        # every single cycle, since this condition can persist for
+        # hours while the song still airs normally.
+        print(
+            f"  Dedication intro suppressed for request {req.id} "
+            f"(text policy, non-fatal): {exc}"
+        )
+        _report_policy_suppression_if_due(req, exc)
+        return DedicationSynthesisOutcome.POLICY_SUPPRESSED
     except Exception as exc:
         print(
             f"  Dedication intro synthesis failed for request {req.id} "
@@ -564,4 +687,4 @@ def synthesize_dedication_intro(req):
             detail={"request_id": req.external_request_id, "error": str(exc)},
             dedupe_key=f"webrequests|dedication-synth-failed|{req.id}",
         )
-        return False
+        return DedicationSynthesisOutcome.FAILED

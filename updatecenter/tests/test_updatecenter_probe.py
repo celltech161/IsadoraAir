@@ -260,3 +260,52 @@ class ActualR0053WeatherMigrationClassificationTests(SimpleTestCase):
             classifications[1]["detail"],
             "field definition differs only in approved non-database metadata",
         )
+
+
+class ActualR0056WebRequestsMigrationClassificationTests(SimpleTestCase):
+    """r0056 (Pass F) adds five new WebRequestConfig fields -- four
+    station-editable dedication/request templates plus a spoken-length
+    limit -- each a non-null CharField/PositiveSmallIntegerField with
+    an explicit plain string/int default (never a callable), following
+    the exact lesson r0053's rejection taught: a non-null AddField must
+    use a simple scalar literal default to classify as additive. This
+    proves the ACTUAL on-disk migration file Update Center will
+    encounter classifies fully additive, not a synthetic stand-in."""
+
+    def test_every_actual_webrequests_0010_operation_is_additive(self):
+        loader = MigrationLoader(None)
+        migration_key = (
+            "webrequests",
+            "0010_webrequestconfig_dedication_anonymous_message_template_and_more",
+        )
+        migration = loader.disk_migrations[migration_key]
+        state = loader.project_state(
+            [("webrequests", "0009_alter_webrequestconfig_dedication_tts_timeout_seconds_and_more")]
+        )
+        classifications = []
+
+        for operation in migration.operations:
+            operation.state_forwards("webrequests", state)
+            classifications.append(
+                _classify_operation(
+                    operation,
+                    app_label="webrequests",
+                    before_state=None,
+                    after_state=state,
+                )
+            )
+
+        self.assertEqual(len(classifications), 5)
+        self.assertEqual(
+            [item["operation"] for item in classifications],
+            ["AddField"] * 5,
+        )
+        self.assertNotIn("manual", {item["classification"] for item in classifications})
+        self.assertEqual(
+            {item["classification"] for item in classifications},
+            {"additive"},
+        )
+        self.assertEqual(
+            {item["detail"] for item in classifications},
+            {"non-null field with explicit simple literal default"},
+        )
