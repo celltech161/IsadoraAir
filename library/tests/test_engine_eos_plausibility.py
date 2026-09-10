@@ -247,11 +247,82 @@ class SeekRejectionHandlingTests(TransactionTestCase):
     does NOT catch the transient post-seek parser hiccup (seek_simple
     still returns True there), but it's real hygiene for the rarer,
     different case of a seek genuinely being rejected outright (wrong
-    pipeline state, non-seekable source). Static-source checks: full
-    behavioral coverage would need a real GStreamer pipeline, same
-    reasoning the project already applies elsewhere (e.g.
-    test_mark_song_requests_aired_gated_on_played_at_write_succeeding
-    in test_request_scheduling_lifecycle.py)."""
+    pipeline state, non-seekable source). The behavioral regressions below
+    execute the real recreate/seek methods while substituting only the deck
+    construction and GStreamer boundary calls, so bookkeeping, pad-offset
+    rebasing, pause handling, monitoring, and logging remain observable."""
+
+    def test_manual_seek_rejection_rebases_pad_timeline_to_actual_zero(self):
+        """A recreated deck is initially offset for the requested target.
+        If GStreamer rejects that target, both presentation state and the
+        source-pad timeline must describe the actual position (zero)."""
+        stand_in = make_stand_in()
+        stand_in.mixer = MagicMock()
+        old_deck = make_deck()
+        old_deck.paused = True
+        old_deck.paused_position = 12.0
+        new_deck = make_deck()
+        new_deck.started_at = 700.0  # what _create_deck(target) would set
+        new_deck.pipeline.seek_simple.return_value = False
+        stand_in.decks["A"] = old_deck
+        stand_in._remove_deck = MagicMock()
+
+        def recreate(slot, _log_item, resume_position_ns=None):
+            self.assertEqual(resume_position_ns, int(187.02 * eng_module.Gst.SECOND))
+            stand_in.decks[slot] = new_deck
+            return new_deck
+
+        stand_in._create_deck = MagicMock(side_effect=recreate)
+        stand_in._apply_pad_offset = MagicMock()
+        stand_in._get_deck_position = MagicMock(return_value=0.25)
+
+        with (
+            patch.object(eng_module.time, "time", return_value=1000.0),
+            patch.object(eng_module, "emit_event") as mock_emit,
+            patch("builtins.print") as mock_print,
+        ):
+            eng_module.PlaybackEngine._seek_deck(stand_in, "A", 187.02)
+
+        self.assertEqual(new_deck.started_at, 1000.0)
+        self.assertEqual(new_deck.paused_position, 0.25)
+        self.assertNotEqual(new_deck.paused_position, 187.02)
+        stand_in._apply_pad_offset.assert_called_once_with(
+            new_deck.pipeline, internal_position_ns=0
+        )
+        self.assertEqual(mock_emit.call_args.kwargs["detail"]["fallback_seconds"], 0.0)
+        messages = [call.args[0] for call in mock_print.call_args_list if call.args]
+        self.assertTrue(any("rejected -- playing from 0 instead" in item for item in messages))
+        self.assertNotIn("  [A] Seek to 187.0s", messages)
+
+    def test_resume_seek_rejection_rebases_pad_timeline_to_actual_zero(self):
+        stand_in = make_stand_in()
+        old_deck = make_deck()
+        old_deck.paused = True
+        old_deck.paused_position = 42.5
+        new_deck = make_deck()
+        new_deck.started_at = 900.0  # what _create_deck(target) would set
+        new_deck.pipeline.seek_simple.return_value = False
+        stand_in.decks["A"] = old_deck
+        stand_in._remove_deck = MagicMock()
+        stand_in._create_deck = MagicMock(return_value=new_deck)
+        stand_in._apply_pad_offset = MagicMock()
+
+        with (
+            patch.object(eng_module.time, "time", return_value=1000.0),
+            patch.object(eng_module, "emit_event") as mock_emit,
+            patch("builtins.print") as mock_print,
+        ):
+            eng_module.PlaybackEngine._resume_deck(stand_in, "A")
+
+        self.assertEqual(new_deck.started_at, 1000.0)
+        self.assertEqual(new_deck.paused_position, 0.0)
+        stand_in._apply_pad_offset.assert_called_once_with(
+            new_deck.pipeline, internal_position_ns=0
+        )
+        self.assertEqual(mock_emit.call_args.kwargs["detail"]["fallback_seconds"], 0.0)
+        messages = [call.args[0] for call in mock_print.call_args_list if call.args]
+        self.assertTrue(any("rejected -- playing from 0 instead" in item for item in messages))
+        self.assertNotIn("  [A] Resumed at 42.5s", messages)
 
     def test_create_deck_checks_auto_resume_seek_result(self):
         src = inspect.getsource(eng_module.PlaybackEngine._create_deck)
@@ -297,8 +368,7 @@ class SeekRejectionHandlingTests(TransactionTestCase):
         reporting a target the deck never reached."""
         src = inspect.getsource(eng_module.PlaybackEngine._resume_deck)
         start = src.index("if seek_ok:")
-        end = src.index("print(f\"  [{slot}] Resumed", start)
-        seek_result_block = src[start:end]
+        seek_result_block = src[start:]
         self.assertIn("new_deck.seeked_at = time.time()", seek_result_block)
         self.assertIn("new_deck.started_at = time.time()", seek_result_block)
 

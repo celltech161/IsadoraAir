@@ -4933,12 +4933,19 @@ class PlaybackEngine:
                     print(f"  PlayEvent write failed (non-fatal): {exc}")
             print(f"  [{slot}] Playing: {track.artist.name if track.artist else '?'} - {track.title}")
         else:
-            print(f"  [{slot}] Resumed: {track.artist.name if track.artist else '?'} - {track.title} at {start_offset:.1f}s")
+            # resume_position_ns is only the requested starting point at
+            # this stage. The caller still has to apply seek_simple(), which
+            # can reject it, so do not report a successful resume yet.
+            print(f"  [{slot}] Recreated: {track.artist.name if track.artist else '?'} - {track.title} for seek to {start_offset:.1f}s")
 
-        # Auto-resume seek: fresh deck was just linked into the mixer,
-        # do the actual seek now that the pipeline can accept it. Uses
-        # FLUSH so any pre-decoded buffers get dropped -- otherwise we'd
-        # hear a tiny chunk from position 0 before the seek lands.
+        # Auto-resume seek: the fresh deck was just linked into the mixer,
+        # so attempt the actual seek. sync_state_with_parent() only requests
+        # the parent's state asynchronously; seek_simple() can still reject
+        # while that transition is pending, and the rejection path below
+        # deliberately leaves the already-correct zero-position pad offset
+        # in place. Uses FLUSH so any pre-decoded buffers get dropped --
+        # otherwise we'd hear a tiny chunk from position 0 before the seek
+        # lands.
         if _auto_resume_position_ns is not None:
             try:
                 seek_ok = deck.pipeline.seek_simple(
@@ -7893,6 +7900,7 @@ class PlaybackEngine:
         )
         if seek_ok:
             new_deck.seeked_at = time.time()
+            print(f"  [{slot}] Resumed at {resume_position:.1f}s", flush=True)
         else:
             # _create_deck already set started_at as though playback
             # began at resume_position_ns -- that's presentation
@@ -7904,15 +7912,25 @@ class PlaybackEngine:
             # 0), and started_at must reflect that or _get_deck_position
             # (dashboard, crossfade timing) would keep reporting the
             # unreached target indefinitely.
+            # _create_deck also offset the source pad for the requested
+            # internal position. Since decode will actually start at zero,
+            # rebase it against the CURRENT main-pipeline running time; merely
+            # repairing started_at would leave early buffers timestamped far
+            # behind the mixer and make GStreamer drop through them.
+            self._apply_pad_offset(new_deck.pipeline, internal_position_ns=0)
+            new_deck.started_at = time.time()
             print(f"  [{slot}] Resume seek to {resume_position:.1f}s rejected -- playing from 0 instead", flush=True)
             emit_event(
                 category="engine", level="error", title="Deck seek rejected",
-                detail={"slot": slot, "track_id": new_deck.track.id, "target_seconds": resume_position},
+                detail={
+                    "slot": slot,
+                    "track_id": new_deck.track.id,
+                    "target_seconds": resume_position,
+                    "fallback_seconds": 0.0,
+                    "pad_offset_rebased": True,
+                },
                 dedupe_key=f"engine|seek-rejected|slot={slot}|track={new_deck.track.id}",
             )
-            new_deck.started_at = time.time()
-
-        print(f"  [{slot}] Resumed at {resume_position:.1f}s", flush=True)
 
     def _seek_deck(self, slot, position):
         """Mirrors _resume_deck's approach: a flushing seek on a deck
@@ -7954,13 +7972,25 @@ class PlaybackEngine:
             # started_at as though playback began at the target -- if
             # GStreamer rejects this seek, the deck's real audio is
             # still at position 0, and started_at must say so.
+            # _create_deck already offset this fresh bin as though its
+            # internal timeline began at position. Rejected means decode
+            # actually begins at zero, so recompute from the main pipeline's
+            # current running time before any buffers are allowed to inherit
+            # the stale target-based offset.
+            self._apply_pad_offset(new_deck.pipeline, internal_position_ns=0)
+            new_deck.started_at = time.time()
             print(f"  [{slot}] Seek to {position:.1f}s rejected -- playing from 0 instead", flush=True)
             emit_event(
                 category="engine", level="error", title="Deck seek rejected",
-                detail={"slot": slot, "track_id": new_deck.track.id, "target_seconds": position},
+                detail={
+                    "slot": slot,
+                    "track_id": new_deck.track.id,
+                    "target_seconds": position,
+                    "fallback_seconds": 0.0,
+                    "pad_offset_rebased": True,
+                },
                 dedupe_key=f"engine|seek-rejected|slot={slot}|track={new_deck.track.id}",
             )
-            new_deck.started_at = time.time()
 
         if was_paused:
             self._pause_deck(slot)
@@ -7973,7 +8003,8 @@ class PlaybackEngine:
         else:
             self._next_triggered = False
 
-        print(f"  [{slot}] Seek to {position:.1f}s", flush=True)
+        if seek_ok:
+            print(f"  [{slot}] Seek to {position:.1f}s", flush=True)
 
     def _eject_deck(self, slot):
         if slot not in SLOTS:
