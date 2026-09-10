@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "release_id": "r0059",
+  "previous_release_id": "r0058",
+  "minimum_updater_protocol_version": 5,
+  "summary": "Adds a root/operator command that transactionally rotates the PostgreSQL role, Django .env, and updater pgpass credential under one shared lock: fail-closed preflight, service-quiescence enforcement, client-side SCRAM derivation behind a verified PostgreSQL logging/pgAudit suppression boundary, durable crash recovery, bounded Django/psql/pg_dump validation, and rollback before validated-new cleanup. Backup and Update Center admission honor the same lock. No schema or protected-runtime change.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-gunicorn"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0007"
+}

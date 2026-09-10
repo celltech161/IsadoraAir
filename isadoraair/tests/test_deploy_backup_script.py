@@ -84,6 +84,16 @@ class BackupScriptContentTests(SimpleTestCase):
     def test_strict_failure_handling_enabled(self):
         self.assertIn("set -euo pipefail", self.text)
 
+    def test_database_credential_reads_are_covered_by_shared_maintenance_lock(self):
+        lock = self.text.index('DB_MAINTENANCE_LOCK="${ENV_FILE}.lock"')
+        dump = self.text.index('DB_PASSWORD=$(grep')
+        self.assertLess(lock, dump)
+        self.assertIn('flock --shared --wait 1800 9', self.text)
+        self.assertIn('exec 9>>"$DB_MAINTENANCE_LOCK"', self.text)
+        pending = self.text.index('DB_ROTATION_PENDING="${ENV_FILE}.rotation-pending"')
+        self.assertLess(pending, dump)
+        self.assertIn("database credential recovery is pending; backup is blocked", self.text)
+
     def test_music_library_is_never_included_only_documented_as_excluded(self):
         """The single highest-stakes property this backup script has:
         it must never accidentally start including the 717+ GB music
@@ -306,7 +316,7 @@ class BackupScriptContentTests(SimpleTestCase):
         # dedicated v3/runtime-recovery coverage. This assertion still only
         # needs to prove SCRIPT_VERSION was deliberately bumped past its
         # pre-E7B baseline, not pin the exact string forever.
-        self.assertIn('SCRIPT_VERSION="3.0.0"', self.text)
+        self.assertIn('SCRIPT_VERSION="3.1.0"', self.text)
         self.assertNotIn('SCRIPT_VERSION="2.1.0"', self.text)
 
     def test_encryption_step_calls_the_standalone_helper_script(self):
@@ -415,7 +425,7 @@ class RuntimeRecoveryPayloadBackupTests(SimpleTestCase):
         cls.text = SCRIPT_PATH.read_text(encoding="utf-8")
 
     def test_script_version_is_separate_from_archive_format_classification(self):
-        self.assertIn('SCRIPT_VERSION="3.0.0"', self.text)
+        self.assertIn('SCRIPT_VERSION="3.1.0"', self.text)
         self.assertNotIn('SCRIPT_VERSION="2.1.0"', self.text)
         self.assertIn("runtime-recovery-archive.json", self.text)
         self.assertIn("archive_format_version", self.text)

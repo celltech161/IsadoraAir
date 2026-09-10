@@ -4,6 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 import uuid
+from contextlib import nullcontext
 
 from django.apps import apps
 from django.contrib import admin as django_admin
@@ -187,6 +188,7 @@ class UpdateExecutionWebTests(TestCase):
     def test_superuser_eligible_post_recomputes_and_submits_server_plan(self):
         with patch("updatecenter.views.planner.build_plan", return_value=ReadyPlan()) as build, \
              patch("updatecenter.views._backend_readiness", return_value={**READY_PING, "ready": True, "execution_armed": True, "detail": "ready"}), \
+             patch("updatecenter.views.database_maintenance_lock", return_value=nullcontext()), \
              patch("updatecenter.views.submit_job", return_value={"ok": True}) as submit:
             response = self._post(self.superuser)
         self.assertEqual(response.status_code, 302)
@@ -194,6 +196,26 @@ class UpdateExecutionWebTests(TestCase):
         job = UpdateJob.objects.get()
         self.assertEqual(job.target_commit, "b" * 40)
         submit.assert_called_once_with(job)
+
+    def test_database_maintenance_lock_blocks_update_admission(self):
+        from isadoraair.maintenance_lock import MaintenanceLockError
+        with patch("updatecenter.views.planner.build_plan", return_value=ReadyPlan()), \
+             patch("updatecenter.views._backend_readiness", return_value={**READY_PING, "ready": True, "execution_armed": True, "detail": "ready"}), \
+             patch("updatecenter.views.database_maintenance_lock", side_effect=MaintenanceLockError("busy")), \
+             patch("updatecenter.views.create_job") as create:
+            response = self._post(self.superuser)
+        self.assertEqual(response.status_code, 302)
+        create.assert_not_called()
+
+    def test_pending_credential_recovery_blocks_update_admission_after_crash(self):
+        with patch("updatecenter.views.planner.build_plan", return_value=ReadyPlan()), \
+             patch("updatecenter.views._backend_readiness", return_value={**READY_PING, "ready": True, "execution_armed": True, "detail": "ready"}), \
+             patch("updatecenter.views.database_maintenance_lock", return_value=nullcontext()), \
+             patch("updatecenter.views.database_rotation_is_pending", return_value=True), \
+             patch("updatecenter.views.create_job") as create:
+            response = self._post(self.superuser)
+        self.assertEqual(response.status_code, 302)
+        create.assert_not_called()
 
     def test_stale_release_or_fingerprint_is_rejected_before_job_creation(self):
         readiness = {**READY_PING, "ready": True, "execution_armed": True, "detail": "ready"}

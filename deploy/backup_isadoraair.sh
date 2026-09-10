@@ -205,7 +205,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # classifies an archive without a policy-satisfying runtime-recovery/
 # payload as legacy format 2.1.0, never as self-contained v3 -- see
 # docs/RUNTIME_BACKUP_PAYLOAD.md's "Backward compatibility" section.
-SCRIPT_VERSION="3.0.0"
+SCRIPT_VERSION="3.1.0"
 
 # See the DRY_RUN note in the header comment above.
 DRY_RUN="${DRY_RUN:-0}"
@@ -298,10 +298,32 @@ if ! command -v pg_dump >/dev/null 2>&1; then
   echo "Error: pg_dump is not installed (postgresql-client)." >&2
   exit 1
 fi
+if ! command -v flock >/dev/null 2>&1; then
+  echo "Error: flock is not installed (util-linux)." >&2
+  exit 1
+fi
 
 ENV_FILE="$PROJECT_DIR/.env"
 if [ ! -f "$ENV_FILE" ]; then
   echo "Error: $ENV_FILE not found -- can't read DB credentials." >&2
+  exit 1
+fi
+
+# r0059 coordinated database-credential rotation: this is the one shared
+# maintenance lock used by the .env writer, the explicit rotation command,
+# formal backup, and supported Update Center admission. Backup holds a shared
+# lease from before it reads DB credentials until process exit; rotation takes
+# the same inode exclusively. FD 9 remains open for the script lifetime.
+DB_MAINTENANCE_LOCK="${ENV_FILE}.lock"
+exec 9>>"$DB_MAINTENANCE_LOCK"
+chmod 600 "$DB_MAINTENANCE_LOCK"
+if ! flock --shared --wait 1800 9; then
+  echo "Error: timed out waiting for the database maintenance lock." >&2
+  exit 1
+fi
+DB_ROTATION_PENDING="${ENV_FILE}.rotation-pending"
+if [ -e "$DB_ROTATION_PENDING" ] || [ -L "$DB_ROTATION_PENDING" ]; then
+  echo "Error: database credential recovery is pending; backup is blocked." >&2
   exit 1
 fi
 

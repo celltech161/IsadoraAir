@@ -8,6 +8,12 @@ from django.views.decorators.csrf import ensure_csrf_cookie
 from django.views.decorators.http import require_http_methods
 
 from isadoraair.version_info import get_checkout_identity
+from isadoraair.env_config import ENV_FILE_PATH
+from isadoraair.maintenance_lock import (
+    MaintenanceLockError,
+    database_maintenance_lock,
+    database_rotation_is_pending,
+)
 
 from . import manifest as manifest_mod, planner, release_chain
 from .backend_client import BackendError, PROTOCOL_VERSION, UpdaterClient
@@ -207,8 +213,18 @@ def start_update(request):
         return redirect("updatecenter:dashboard")
 
     try:
-        job = create_job(plan=fresh_plan, user=request.user)
-        outcome = submit_job(job)
+        # Shared with backup; exclusive to credential rotation. Holding this
+        # through durable root submission closes the admission race: a job
+        # admitted first remains visible as active root state, while a rotation
+        # which acquired the lock first prevents a new supported submission.
+        with database_maintenance_lock(ENV_FILE_PATH, shared=True, timeout=5.0):
+            if database_rotation_is_pending(ENV_FILE_PATH):
+                raise MaintenanceLockError("database credential recovery is pending")
+            job = create_job(plan=fresh_plan, user=request.user)
+            outcome = submit_job(job)
+    except MaintenanceLockError:
+        messages.error(request, "Database credential maintenance is active; retry after it completes.")
+        return redirect("updatecenter:dashboard")
     except JobSubmissionError as exc:
         messages.error(request, f"Protected updater rejected the job: {str(exc)[:300]}")
         return redirect("updatecenter:dashboard")

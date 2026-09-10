@@ -631,7 +631,7 @@ def _locked(lock_path, timeout=5.0):
 # ---------------------------------------------------------------------
 # Atomic write
 # ---------------------------------------------------------------------
-def _atomic_write_bytes(path, data, mode):
+def _atomic_write_bytes(path, data, mode, *, uid=None, gid=None):
     """temp file in the SAME directory -> write -> flush -> fsync ->
     chmod -> atomic os.replace() -> best-effort directory fsync. Any
     failure before os.replace() leaves `path` completely untouched
@@ -641,9 +641,12 @@ def _atomic_write_bytes(path, data, mode):
     `path` partially written."""
     directory = path.parent
     tmp_path = directory / f".{path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}"
-    fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    fd = os.open(str(tmp_path), flags, 0o600)
     try:
         with os.fdopen(fd, "wb") as f:
+            if uid is not None or gid is not None:
+                os.fchown(f.fileno(), -1 if uid is None else uid, -1 if gid is None else gid)
             f.write(data)
             f.flush()
             os.fsync(f.fileno())
@@ -656,6 +659,32 @@ def _atomic_write_bytes(path, data, mode):
             pass
         raise
     _fsync_dir(directory)
+
+
+def render_database_password_update(original, new_password):
+    """Return ``original`` with only its single DB_PASSWORD line changed.
+
+    DB_PASSWORD deliberately remains absent from MANAGED_SETTINGS, so ordinary
+    web administration cannot edit it. The explicit operator rotator uses the
+    existing structural parser and value encoder while retaining unrelated
+    lines and the original final-newline convention exactly.
+    """
+    try:
+        original_text = bytes(original).decode("utf-8")
+    except (TypeError, UnicodeDecodeError) as exc:
+        raise EnvWriteError("the environment file is not strict UTF-8") from exc
+    encoded = encode_env_value(new_password)
+    pairs = _parse_lines(original_text)
+    indices = _active_line_indices(pairs, "DB_PASSWORD")
+    if len(indices) > 1:
+        raise DuplicateManagedKeyError("DB_PASSWORD")
+    if not indices:
+        raise EnvWriteError("the environment file has no DB_PASSWORD assignment")
+    pairs[indices[0]] = (f"DB_PASSWORD={encoded}", "DB_PASSWORD")
+    rendered = _render_lines(pairs)
+    if original_text and not original_text.endswith("\n"):
+        rendered = rendered[:-1]
+    return rendered.encode("utf-8")
 
 
 def _fsync_dir(directory):
@@ -707,6 +736,16 @@ def update_managed_values(values, env_path=None, lock_path=None, backup_path=Non
     encoded = {key: encode_env_value(value) for key, value in values.items()}
 
     with _locked(lock):
+        # A crashed coordinated DB rotation may need to restore the exact
+        # pre-transaction bytes. Do not accept an ordinary admin write which
+        # that recovery would later and silently discard.
+        from isadoraair.maintenance_lock import MaintenanceLockError, database_rotation_is_pending
+        try:
+            rotation_pending = database_rotation_is_pending(path)
+        except MaintenanceLockError as exc:
+            raise EnvWriteError("could not inspect the database credential recovery gate") from exc
+        if rotation_pending:
+            raise EnvWriteError("database credential recovery is pending")
         try:
             if path.exists():
                 if path.is_symlink():
