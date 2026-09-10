@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "release_id": "r0061",
+  "previous_release_id": "r0060",
+  "minimum_updater_protocol_version": 5,
+  "summary": "Hardens canonical release identity so stale remote-tracking refs, local branches, worktree branches, and unrelated histories cannot interfere with Update Center planning. Release identity remains fail-closed for ambiguity, mutation, delete/re-add, unreachable canonical history, and upstream history rewrites. Advances the protected updater runtime to signed generation 3.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-gunicorn"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0007",
+  "protected_runtime": {
+    "generation": 3,
+    "descriptor_path": "deploy/updater_runtime/protected-runtime-descriptor.json",
+    "descriptor_sha256": "369817ed130cf33c68096ae407a5be14ee1810c0f803575ab9f46877bfb617ca",
+    "minimum_bootstrap_protocol_version": 1,
+    "runtime_version": 5,
+    "manifest_protocol_version": 5,
+    "supported_wire_protocols": [
+      3
+    ],
+    "attestations": [
+      "deploy/updater_attestations/r0061-primary.json"
+    ]
+  }
+}

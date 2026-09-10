@@ -1,5 +1,5 @@
 {
-  "bundle_sha256": "b9f78e90a5a2a77a35f25efccb0d644fad59bfdd4550f1ce32f26d0c758580c6",
+  "bundle_sha256": "0bb697e9b693cb011e40229aec6be23072a8dbf080e4b24d3a52d50f5b85d8b9",
   "entrypoint": "updaterd.py",
   "files": [
     {
@@ -59,8 +59,8 @@
     {
       "mode": "0644",
       "path": "isadoraair_updater/release.py",
-      "sha256": "9c94fca54218d7cc9351ae6e5c96c92914826e99fe53d2fd521842d3df823ad4",
-      "size_bytes": 52189
+      "sha256": "67d293855633bb61756ddfa412dbf5e19c6d2989ffda7099e131f98b2f2cd3ed",
+      "size_bytes": 52645
     },
     {
       "mode": "0644",
@@ -159,7 +159,7 @@
       "size_bytes": 9975
     }
   ],
-  "generation": 2,
+  "generation": 3,
   "manifest_protocol_version": 5,
   "runtime_version": 5,
   "schema_version": 1,
