@@ -408,20 +408,29 @@ def build_plan(checkout_root, releases_dirname: str = release_chain.RELEASES_DIR
                 )
 
     read_ref = remote_ref if (remote_ref and git_adapter.rev_parse(checkout_root, remote_ref)) else "HEAD"
+    canonical_tip = git_adapter.rev_parse(checkout_root, read_ref)
+    if not canonical_tip:
+        return _safe(
+            SafetyStatus.TARGET_COMMIT_UNKNOWN,
+            f"Could not resolve authoritative canonical history at {read_ref!r}.",
+            schema_health, installed_commit=head_sha,
+        )
     try:
-        manifests = release_chain.load_manifest_files_at_ref(checkout_root, read_ref, releases_dirname)
+        manifests = release_chain.load_manifest_files_at_ref(checkout_root, canonical_tip, releases_dirname)
         chain = release_chain.build_chain(manifests)
     except (manifest_mod.ManifestError, release_chain.ChainError) as exc:
         return _safe(SafetyStatus.INVALID_RELEASE_MANIFEST, str(exc), schema_health)
 
     try:
         release_commits = release_chain.resolve_unique_release_commits(
-            chain, checkout_root, releases_dirname,
+            chain, checkout_root, canonical_tip, releases_dirname,
         )
     except release_chain.ChainError as exc:
         return _safe(SafetyStatus.TARGET_COMMIT_UNKNOWN, str(exc), schema_health)
 
-    installed = release_chain.resolve_installed_release(chain, checkout_root, head_sha)
+    installed = release_chain.resolve_installed_release(
+        chain, checkout_root, head_sha, canonical_tip, releases_dirname,
+    )
     if installed is None:
         return _safe(
             SafetyStatus.INSTALLED_RELEASE_UNKNOWN,

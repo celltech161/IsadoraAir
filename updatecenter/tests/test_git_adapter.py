@@ -1,6 +1,8 @@
 """Read-only git adapter tests -- real throwaway git repos, no mocking
 of subprocess itself (proves actual git behavior, not an assumption
 about it). [P0] 1.1 Phase A."""
+import subprocess
+
 from django.test import SimpleTestCase
 
 from updatecenter import git_adapter as ga
@@ -219,11 +221,18 @@ class PathAtCommitTests(SimpleTestCase):
         with FakeRepo() as repo:
             repo.write("deploy/releases/r0002.json", "{}")
             sha = repo.commit("add release")
-            self.assertEqual(ga.find_introducing_commit(repo.work, "deploy/releases/r0002.json"), sha)
+            self.assertEqual(
+                ga.find_introducing_commit(
+                    repo.work, "deploy/releases/r0002.json", repo.rev_parse("origin/main"),
+                ),
+                sha,
+            )
 
     def test_find_introducing_commit_none_when_absent(self):
         with FakeRepo() as repo:
-            self.assertIsNone(ga.find_introducing_commit(repo.work, "deploy/releases/never-added.json"))
+            self.assertIsNone(ga.find_introducing_commit(
+                repo.work, "deploy/releases/never-added.json", repo.rev_parse("origin/main"),
+            ))
 
     def test_find_introducing_commit_rejects_later_manifest_modification(self):
         with FakeRepo() as repo:
@@ -232,4 +241,77 @@ class PathAtCommitTests(SimpleTestCase):
             repo.commit("add immutable release")
             repo.write(path, '{"version": 2}\n')
             repo.commit("illegally modify immutable release")
-            self.assertIsNone(ga.find_introducing_commit(repo.work, path))
+            self.assertIsNone(ga.find_introducing_commit(
+                repo.work, path, repo.rev_parse("origin/main"),
+            ))
+
+    def test_stale_remote_tracking_ref_does_not_change_canonical_identity(self):
+        """A deleted feature's stale origin/* ref is not release authority."""
+        with FakeRepo() as repo:
+            path = "deploy/releases/r0002.json"
+            branch_point = repo.rev_parse("HEAD")
+
+            repo.write(path, '{"canonical": true}\n')
+            canonical = repo.commit("canonical release", push=True)
+
+            subprocess.run(
+                ["git", "checkout", "-q", "-b", "deleted-feature", branch_point],
+                cwd=repo.work, check=True, capture_output=True,
+            )
+            repo.write(path, '{"canonical": false}\n')
+            stale = repo.commit("independent noncanonical release", push=False)
+            subprocess.run(
+                ["git", "update-ref", "refs/remotes/origin/deleted-feature", stale],
+                cwd=repo.work, check=True, capture_output=True,
+            )
+            subprocess.run(
+                ["git", "checkout", "-q", "main"],
+                cwd=repo.work, check=True, capture_output=True,
+            )
+
+            self.assertEqual(ga.find_introducing_commit(
+                repo.work, path, repo.rev_parse("origin/main"),
+            ), canonical)
+
+    def test_unrelated_local_branch_does_not_change_canonical_identity(self):
+        with FakeRepo() as repo:
+            path = "deploy/releases/r0002.json"
+            branch_point = repo.rev_parse("HEAD")
+            repo.write(path, '{"canonical": true}\n')
+            canonical = repo.commit("canonical release", push=True)
+
+            subprocess.run(
+                ["git", "checkout", "-q", "-b", "local-review", branch_point],
+                cwd=repo.work, check=True, capture_output=True,
+            )
+            repo.write(path, '{"canonical": false}\n')
+            repo.commit("independent local release", push=False)
+            subprocess.run(
+                ["git", "checkout", "-q", "main"],
+                cwd=repo.work, check=True, capture_output=True,
+            )
+
+            self.assertEqual(ga.find_introducing_commit(
+                repo.work, path, repo.rev_parse("origin/main"),
+            ), canonical)
+
+    def test_canonical_delete_and_readd_remains_unresolvable(self):
+        with FakeRepo() as repo:
+            path = "deploy/releases/r0002.json"
+            repo.write(path, '{"version": 1}\n')
+            repo.commit("add canonical release", push=True)
+            (repo.work / path).unlink()
+            repo.commit("delete canonical release", push=True)
+            repo.write(path, '{"version": 1}\n')
+            repo.commit("re-add canonical release", push=True)
+
+            self.assertIsNone(ga.find_introducing_commit(
+                repo.work, path, repo.rev_parse("origin/main"),
+            ))
+
+    def test_unreachable_canonical_tip_fails_closed(self):
+        with FakeRepo() as repo:
+            path = "deploy/releases/r0002.json"
+            repo.write(path, "{}")
+            repo.commit("add release", push=True)
+            self.assertIsNone(ga.find_introducing_commit(repo.work, path, "f" * 40))

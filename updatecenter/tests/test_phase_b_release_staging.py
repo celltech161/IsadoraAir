@@ -62,6 +62,40 @@ class TrustedReleaseTests(SimpleTestCase):
         with self.assertRaisesRegex(ReleaseError, "unique immutable"):
             load_chain(self.repo, tip)
 
+    def test_stale_remote_tracking_ref_does_not_change_trusted_identity(self):
+        """Protected release identity is scoped to the fetched trusted tip."""
+        git(self.author, "checkout", "-b", "deleted-feature", self.r0002)
+        stale_manifest = self.author / "deploy" / "releases" / "r0003.json"
+        stale_manifest.write_text('{"noncanonical": true}\n', encoding="utf-8")
+        git(self.author, "add", "deploy/releases/r0003.json")
+        git(self.author, "commit", "-m", "independent stale r0003")
+        git(self.author, "push", "origin", "HEAD:deleted-feature")
+        git(self.author, "checkout", "main")
+
+        git(
+            self.repo.path,
+            "fetch", "origin",
+            "refs/heads/deleted-feature:refs/remotes/origin/deleted-feature",
+        )
+
+        chain = load_chain(self.repo, self.tip)
+        self.assertEqual(chain[-1].commit, self.r0003)
+
+    def test_canonical_delete_and_readd_remains_rejected(self):
+        path = self.author / "deploy" / "releases" / "r0003.json"
+        original = path.read_text(encoding="utf-8")
+        path.unlink()
+        git(self.author, "add", "deploy/releases/r0003.json")
+        git(self.author, "commit", "-m", "delete canonical r0003")
+        path.write_text(original, encoding="utf-8")
+        git(self.author, "add", "deploy/releases/r0003.json")
+        git(self.author, "commit", "-m", "re-add canonical r0003")
+        git(self.author, "push", "origin", "main")
+
+        tip = self.repo.fetch()
+        with self.assertRaisesRegex(ReleaseError, "unique immutable"):
+            load_chain(self.repo, tip)
+
     def test_force_push_is_rejected(self):
         git(self.author, "checkout", "--orphan", "rewritten")
         for child in list(self.author.iterdir()):

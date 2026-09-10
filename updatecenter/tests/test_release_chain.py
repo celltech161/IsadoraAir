@@ -173,7 +173,10 @@ class ResolveReleaseCommitTests(SimpleTestCase):
         with FakeRepo() as repo:
             data = _valid_bootstrap(bootstrap_commit=repo.rev_parse("HEAD"))
             chained = rc.ChainedRelease(manifest=m.validate_manifest_dict(data), index=0)
-            self.assertEqual(rc.resolve_release_commit(chained, repo.work), repo.rev_parse("HEAD"))
+            self.assertEqual(
+                rc.resolve_release_commit(chained, repo.work, repo.rev_parse("origin/main")),
+                repo.rev_parse("HEAD"),
+            )
 
     def test_followup_commit_resolved_from_git_history(self):
         with FakeRepo() as repo:
@@ -182,13 +185,18 @@ class ResolveReleaseCommitTests(SimpleTestCase):
             followup_sha = repo.commit("add r0002 manifest")
             data = _valid_followup()
             chained = rc.ChainedRelease(manifest=m.validate_manifest_dict(data), index=1)
-            self.assertEqual(rc.resolve_release_commit(chained, repo.work), followup_sha)
+            self.assertEqual(
+                rc.resolve_release_commit(chained, repo.work, repo.rev_parse("origin/main")),
+                followup_sha,
+            )
 
     def test_followup_commit_unresolvable_when_file_never_added(self):
         with FakeRepo() as repo:
             data = _valid_followup()
             chained = rc.ChainedRelease(manifest=m.validate_manifest_dict(data), index=1)
-            self.assertIsNone(rc.resolve_release_commit(chained, repo.work))
+            self.assertIsNone(rc.resolve_release_commit(
+                chained, repo.work, repo.rev_parse("origin/main"),
+            ))
 
     def test_followup_commit_unresolvable_after_manifest_modification(self):
         with FakeRepo() as repo:
@@ -199,7 +207,9 @@ class ResolveReleaseCommitTests(SimpleTestCase):
             chained = rc.ChainedRelease(
                 manifest=m.validate_manifest_dict(_valid_followup()), index=1,
             )
-            self.assertIsNone(rc.resolve_release_commit(chained, repo.work))
+            self.assertIsNone(rc.resolve_release_commit(
+                chained, repo.work, repo.rev_parse("origin/main"),
+            ))
 
     def test_two_release_manifests_in_one_commit_are_ambiguous(self):
         with FakeRepo() as repo:
@@ -215,7 +225,9 @@ class ResolveReleaseCommitTests(SimpleTestCase):
                 ),
             })
             with self.assertRaisesMessage(rc.ChainError, "same commit"):
-                rc.resolve_unique_release_commits(chain, repo.work)
+                rc.resolve_unique_release_commits(
+                    chain, repo.work, repo.rev_parse("origin/main"),
+                )
 
 
 class ResolveInstalledReleaseTests(SimpleTestCase):
@@ -224,7 +236,9 @@ class ResolveInstalledReleaseTests(SimpleTestCase):
             head = repo.rev_parse("HEAD")
             data = _valid_bootstrap(bootstrap_commit=head)
             chain = rc.build_chain({"r0001": m.validate_manifest_dict(data)})
-            result = rc.resolve_installed_release(chain, repo.work, head)
+            result = rc.resolve_installed_release(
+                chain, repo.work, head, repo.rev_parse("origin/main"),
+            )
             self.assertEqual(result.manifest.release_id, "r0001")
 
     def test_installed_is_latest_ancestor_when_ahead_of_all_releases(self):
@@ -240,7 +254,9 @@ class ResolveInstalledReleaseTests(SimpleTestCase):
                 "r0002": m.validate_manifest_dict(_valid_followup()),
             }
             chain = rc.build_chain(manifests)
-            result = rc.resolve_installed_release(chain, repo.work, head)
+            result = rc.resolve_installed_release(
+                chain, repo.work, head, repo.rev_parse("origin/main"),
+            )
             self.assertEqual(result.manifest.release_id, "r0002")
 
     def test_none_when_head_predates_bootstrap(self):
@@ -253,5 +269,7 @@ class ResolveInstalledReleaseTests(SimpleTestCase):
             chain = rc.build_chain({"r0001": m.validate_manifest_dict(data)})
             # HEAD (early_sha) predates the declared bootstrap commit --
             # bootstrap is NOT an ancestor of early_sha, so nothing resolves.
-            result = rc.resolve_installed_release(chain, repo.work, early_sha)
+            result = rc.resolve_installed_release(
+                chain, repo.work, early_sha, repo.rev_parse("origin/main"),
+            )
             self.assertIsNone(result)

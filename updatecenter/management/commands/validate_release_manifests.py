@@ -60,8 +60,9 @@ class Command(BaseCommand):
         any_cross_check_failure = False
         resolved_release_by_commit = {}
         head_sha = git_adapter.rev_parse(checkout_root, "HEAD")
+        canonical_tip = head_sha or "HEAD"
         for position, chained in enumerate(chain):
-            commit = release_chain.resolve_release_commit(chained, checkout_root)
+            commit = release_chain.resolve_release_commit(chained, checkout_root, canonical_tip)
             if commit is None:
                 relative_path = f"{release_chain.RELEASES_DIRNAME_DEFAULT}/{chained.manifest.release_id}.json"
                 committed_at_head = bool(
@@ -93,7 +94,7 @@ class Command(BaseCommand):
             previous_commit = None
             if position:
                 previous_commit = release_chain.resolve_release_commit(
-                    chain[position - 1], checkout_root,
+                    chain[position - 1], checkout_root, canonical_tip,
                 )
                 if previous_commit is None:
                     any_cross_check_failure = True

@@ -222,12 +222,14 @@ def build_chain(manifests: dict[str, manifest_mod.ReleaseManifest]) -> list[Chai
 
 
 def resolve_release_commit(chained: ChainedRelease, checkout_root: Path,
-                            releases_dirname: str = RELEASES_DIRNAME_DEFAULT) -> str | None:
+                           canonical_tip: str,
+                           releases_dirname: str = RELEASES_DIRNAME_DEFAULT) -> str | None:
     """The commit associated with one release, per manifest.py's
     documented rule: the bootstrap release's `bootstrap_commit` field
     directly, or -- for every other release -- whichever commit first
     introduced `deploy/releases/<release_id>.json` into this
-    repository's git history (git_adapter.find_introducing_commit).
+    authoritative canonical release ancestry ending at ``canonical_tip``
+    (git_adapter.find_introducing_commit).
     Returns None if that commit cannot be established (file not found
     in history, or added more than once) -- callers must treat that as
     "this release's position in git history is unknown," never guess."""
@@ -235,11 +237,11 @@ def resolve_release_commit(chained: ChainedRelease, checkout_root: Path,
     if rel.is_bootstrap:
         return rel.bootstrap_commit
     relative_path = f"{releases_dirname}/{rel.release_id}.json"
-    return git_adapter.find_introducing_commit(checkout_root, relative_path)
+    return git_adapter.find_introducing_commit(checkout_root, relative_path, canonical_tip)
 
 
 def resolve_unique_release_commits(
-    chain: list[ChainedRelease], checkout_root: Path,
+    chain: list[ChainedRelease], checkout_root: Path, canonical_tip: str,
     releases_dirname: str = RELEASES_DIRNAME_DEFAULT,
 ) -> dict[str, str]:
     """Resolve every release id to one distinct immutable commit.
@@ -254,10 +256,11 @@ def resolve_unique_release_commits(
     owner_by_commit: dict[str, str] = {}
     for chained in chain:
         release_id = chained.manifest.release_id
-        commit = resolve_release_commit(chained, checkout_root, releases_dirname)
+        commit = resolve_release_commit(chained, checkout_root, canonical_tip, releases_dirname)
         if commit is None or not git_adapter.commit_exists(checkout_root, commit):
             raise ChainError(
-                f"release {release_id!r} has no unique, immutable, reachable commit identity"
+                f"release {release_id!r} has no unique, immutable, reachable commit identity "
+                "on authoritative canonical history"
             )
         other = owner_by_commit.get(commit)
         if other is not None:
@@ -271,7 +274,7 @@ def resolve_unique_release_commits(
 
 
 def resolve_installed_release(chain: list[ChainedRelease], checkout_root: Path,
-                               head_sha: str,
+                               head_sha: str, canonical_tip: str,
                                releases_dirname: str = RELEASES_DIRNAME_DEFAULT) -> ChainedRelease | None:
     """Which release, if any, the checkout currently at `head_sha` is
     "on" -- the LATEST release in the chain whose own commit is `head_sha`
@@ -286,7 +289,7 @@ def resolve_installed_release(chain: list[ChainedRelease], checkout_root: Path,
     wrong. Callers must treat None as "cannot determine installed
     release," not as "assume the bootstrap.\""""
     for chained in reversed(chain):
-        commit = resolve_release_commit(chained, checkout_root, releases_dirname)
+        commit = resolve_release_commit(chained, checkout_root, canonical_tip, releases_dirname)
         if commit is None:
             continue
         if commit == head_sha:

@@ -35,8 +35,9 @@ work briefly proposed exactly this before catching it.
 
 The fix is not "compute it some other way" -- it's that this manifest
 format never needs the association at all. A release's commit identity
-is discovered EXTERNALLY, by whichever commit's tree first introduces
-(or currently contains) `deploy/releases/<release_id>.json` --
+is discovered EXTERNALLY, by the unique commit on trusted canonical
+release ancestry that first introduces
+`deploy/releases/<release_id>.json` --
 `release_chain.py`'s `resolve_release_commit()` does this via `git log
 --diff-filter=A`, never by reading a field out of the JSON.
 

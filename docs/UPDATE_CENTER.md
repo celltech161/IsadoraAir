@@ -42,14 +42,17 @@ A manifest committed as part of commit X cannot embed X's own SHA —
 the SHA is a hash of the commit's content, which would include the
 embedded SHA. `updatecenter/manifest.py` forbids `release_commit`/
 `commit`/`sha`/`git_sha` as fields entirely. Instead: a non-bootstrap
-release's commit identity is discovered EXTERNALLY, by whichever
-commit's tree first introduced `deploy/releases/<release_id>.json`
+release's commit identity is discovered EXTERNALLY, by the unique
+commit that first introduced `deploy/releases/<release_id>.json` on
+trusted canonical release ancestry
 (`git log --diff-filter=A`, see `release_chain.resolve_release_commit`).
-That path must have exactly one reachable history commit: modifying,
-deleting, or re-adding an immutable manifest makes identity
-unresolvable and planning fails closed. Each normal release must also
-have its own introducing commit; adding two manifests in one commit is
-ambiguous and rejected.
+That path must have exactly one introducing commit on trusted canonical
+release ancestry: modifying, deleting, or re-adding an immutable manifest
+on that ancestry makes identity unresolvable and planning fails closed.
+Unrelated local, worktree, review, and stale remote-tracking refs do not
+contribute to release identity. Each normal release must also have its own
+introducing commit; adding two manifests in one commit is ambiguous and
+rejected.
 Local-only commits, detached HEAD, dirty trees, and local/remote
 divergence are non-authoritative states and block planning. A station
 cleanly behind `origin` remains supported: manifests and target files

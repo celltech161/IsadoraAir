@@ -15,6 +15,7 @@ class below specifically un-applies one real migration's bookkeeping
 test docstrings for exactly what each one proves."""
 import json
 from pathlib import Path
+import subprocess
 
 from django.db import connection
 from django.db.migrations.recorder import MigrationRecorder
@@ -212,6 +213,27 @@ class ValidUpdateTests(TestCase):
                 planner.TargetSchemaValidationStatus.PENDING,
             )
             self.assertIn("target source", plan.target_schema_validation_detail.lower())
+
+    def test_stale_remote_feature_ref_does_not_block_update_plan(self):
+        repo, releases_dir, bootstrap_sha = self._two_release_repo()
+        with repo:
+            subprocess.run(
+                ["git", "checkout", "-q", "-b", "deleted-feature", bootstrap_sha],
+                cwd=repo.work, check=True, capture_output=True,
+            )
+            _write_manifest(releases_dir, _followup("r0002", "r0001"))
+            stale = repo.commit("independent stale r0002", push=False)
+            subprocess.run(
+                ["git", "update-ref", "refs/remotes/origin/deleted-feature", stale],
+                cwd=repo.work, check=True, capture_output=True,
+            )
+            repo.checkout_branch("main")
+            repo.reset_local_to(bootstrap_sha)
+
+            plan = planner.build_plan(repo.work, "deploy/releases")
+            self.assertEqual(plan.safety_status, planner.SafetyStatus.READY_TO_PLAN)
+            self.assertEqual(plan.target_release_id, "r0002")
+            self.assertEqual(plan.target_commit, repo.rev_parse("origin/main"))
 
     def test_protected_runtime_change_without_manual_intent_is_rejected(self):
         repo, _releases_dir, _bootstrap_sha = self._two_release_repo(

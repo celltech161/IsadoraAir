@@ -366,7 +366,9 @@ def list_files_at_commit(checkout_root: Path, sha: str, relative_dir: str) -> li
     return names
 
 
-def find_introducing_commit(checkout_root: Path, relative_path: str) -> str | None:
+def find_introducing_commit(
+    checkout_root: Path, relative_path: str, canonical_tip: str,
+) -> str | None:
     """The commit that first added `relative_path` (e.g.
     `deploy/releases/r0002.json`) to this repository's history -- the
     ONLY mechanism this codebase uses to associate a non-bootstrap
@@ -380,31 +382,39 @@ def find_introducing_commit(checkout_root: Path, relative_path: str) -> str | No
     outside the repo, but rejecting it explicitly here keeps the
     contract honest rather than relying on git's own leniency.
 
-    Returns None if the path doesn't exist in history, was added more
-    than once, OR has any reachable modification/deletion commit after
-    introduction. Release manifests are immutable: resolving the
-    introducing commit while silently accepting later edits would bind
-    the release id to semantics that did not exist at that commit.
+    `canonical_tip` is the already-resolved authoritative release-history
+    commit (normally the fetched ``origin/<checked-out branch>`` snapshot,
+    or the validated local HEAD bootstrap fallback). Only that commit's
+    ancestry participates. Ordinary local branches, worktree branches,
+    review refs, and stale remote-tracking refs are not release authority
+    merely because their objects remain in this repository.
+
+    Returns None if the path doesn't exist on canonical history, was added
+    more than once on canonical history, OR has any canonical modification/
+    deletion commit after introduction. Release manifests are immutable:
+    resolving the introducing commit while silently accepting later edits
+    would bind the release id to semantics that did not exist at that commit.
     A caller seeing None
     here should treat it as "this release's commit identity could not
     be established," not silently pick one of several candidates.
 
-    Searches `--all` refs (every local branch AND every remote-tracking
-    ref), not just HEAD's own ancestry -- a release several commits
-    ahead of what's currently checked out is, correctly, only
-    reachable via `origin/<branch>` after a fetch (checkout never
-    happens in this module), not via bare HEAD. Using `--all` is what
-    makes "a station several releases behind" actually resolvable at
-    all; scoping to HEAD alone would silently fail to find any release
-    newer than what's locally checked out."""
+    A station behind remains supported because callers pass the fetched
+    canonical remote tip, not bare HEAD. The explicit boundary also keeps
+    identity stable without depending on pruning unrelated refs."""
     if relative_path.startswith("/") or ".." in Path(relative_path).parts:
         raise ValueError(f"relative_path must be repo-relative with no '..': {relative_path!r}")
+    if (
+        len(canonical_tip) != 40
+        or any(character not in "0123456789abcdef" for character in canonical_tip)
+        or not commit_exists(checkout_root, canonical_tip)
+    ):
+        return None
     additions = run_git(
-        ["log", "--all", "--diff-filter=A", "--format=%H", "--", relative_path],
+        ["log", canonical_tip, "--diff-filter=A", "--format=%H", "--", relative_path],
         checkout_root,
     )
     history = run_git(
-        ["log", "--all", "--format=%H", "--", relative_path],
+        ["log", canonical_tip, "--format=%H", "--", relative_path],
         checkout_root,
     )
     if not additions.ok or not additions.stdout or not history.ok or not history.stdout:

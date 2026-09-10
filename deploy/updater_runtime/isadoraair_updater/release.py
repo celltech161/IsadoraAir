@@ -558,10 +558,17 @@ class TrustedRepository:
             raise ReleaseError("release manifest paths are not UTF-8") from exc
         return sorted(PurePosixPath(path).name for path in paths if path and path.endswith(".json"))
 
-    def introducing_commit(self, path: str) -> str | None:
+    def introducing_commit(self, path: str, trusted_tip: str) -> str | None:
+        """Resolve immutable identity only on trusted canonical ancestry.
+
+        Other local, review, or stale remote-tracking refs in the protected
+        object database are deliberately irrelevant.
+        """
         _safe_repo_path(path)
-        additions = self._run(["log", "--all", "--diff-filter=A", "--format=%H", "--", path])
-        history = self._run(["log", "--all", "--format=%H", "--", path])
+        if not re.fullmatch(r"[0-9a-f]{40}", trusted_tip) or not self.commit_exists(trusted_tip):
+            return None
+        additions = self._run(["log", trusted_tip, "--diff-filter=A", "--format=%H", "--", path])
+        history = self._run(["log", trusted_tip, "--format=%H", "--", path])
         if not additions.ok or not history.ok:
             return None
         added = additions.stdout.decode("ascii", "strict").splitlines()
@@ -616,7 +623,13 @@ def load_chain(repository: TrustedRepository, trusted_tip: str) -> list[ChainEnt
     commit_owner: dict[str, str] = {}
     entries: list[ChainEntry] = []
     for index, item in enumerate(ordered):
-        commit = item.bootstrap_commit if index == 0 else repository.introducing_commit(f"{RELEASE_DIR}/{item.release_id}.json")
+        commit = (
+            item.bootstrap_commit
+            if index == 0
+            else repository.introducing_commit(
+                f"{RELEASE_DIR}/{item.release_id}.json", trusted_tip,
+            )
+        )
         if not commit or not repository.commit_exists(commit) or repository.is_ancestor(commit, trusted_tip) is not True:
             raise ReleaseError(f"release {item.release_id} has no unique immutable commit on the trusted branch")
         if commit in commit_owner:
