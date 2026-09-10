@@ -1,0 +1,10 @@
+[Unit]
+Description=Run IsadoraAir weekly backup round-trip verification
+
+[Timer]
+OnCalendar=Sun *-*-* 06:30:00
+Persistent=true
+RandomizedDelaySec=900
+
+[Install]
+WantedBy=timers.target

@@ -21,6 +21,14 @@ from django.test import TestCase, override_settings
 from django.urls import reverse
 
 
+STATUS_SEVERITY = {
+    "ok": 0,
+    "unknown": 1,
+    "warning": 2,
+    "critical": 3,
+}
+
+
 @override_settings(SECURE_SSL_REDIRECT=False)
 class DashboardTransmitterCompatRenderingTests(TestCase):
     def setUp(self):
@@ -84,6 +92,64 @@ class DashboardTransmitterCompatRenderingTests(TestCase):
 
 
 @override_settings(SECURE_SSL_REDIRECT=False)
+class ForwardPowerStatusAggregationTests(TestCase):
+    """r0060 polish: Cobalt forward power displays the worse contributor."""
+
+    def setUp(self):
+        user = User.objects.create_superuser("dashboard-forward-power-aggregation")
+        self.client.force_login(user)
+        response = self.client.get(reverse("monitoring:dashboard"))
+        self.assertEqual(response.status_code, 200)
+        self.content = response.content.decode("utf-8")
+        start = self.content.index("function renderCardBody(check, byTxRef) {")
+        end = self.content.index("function renderGroups(checks) {")
+        self.dispatch = self.content[start:end]
+
+    def test_existing_forward_power_renderer_is_reused_once(self):
+        self.assertEqual(self.content.count("function renderForwardPowerBody("), 1)
+        self.assertNotIn("function renderAggregatedForwardPower", self.content)
+        self.assertIn(
+            "return renderForwardPowerBody(check, worstApplicableStatus(check.status, colorClass));",
+            self.dispatch,
+        )
+
+    def test_status_helper_encodes_the_explicit_dashboard_severity_order(self):
+        for status, severity in STATUS_SEVERITY.items():
+            self.assertIn(f"{status}: {severity},", self.content)
+        self.assertIn("function worstApplicableStatus(...statuses) {", self.content)
+        self.assertIn(
+            "DISPLAY_STATUS_SEVERITY[candidate] > DISPLAY_STATUS_SEVERITY[worst]",
+            self.content,
+        )
+
+    def test_forward_power_and_rf_indicator_both_contribute_without_mutating_check(self):
+        self.assertIn("worstApplicableStatus(check.status, colorClass)", self.dispatch)
+        self.assertNotIn("check.status =", self.dispatch)
+
+    def test_required_forward_power_status_combinations(self):
+        cases = (
+            ("ok", "ok", "ok"),
+            ("unknown", "ok", "unknown"),
+            ("warning", "unknown", "warning"),
+            ("warning", "ok", "warning"),
+            ("critical", "ok", "critical"),
+            ("ok", "warning", "warning"),
+            ("warning", "critical", "critical"),
+            ("critical", "warning", "critical"),
+        )
+        for power, rf, expected in cases:
+            with self.subTest(power=power, rf=rf):
+                effective = max((power, rf), key=STATUS_SEVERITY.__getitem__)
+                self.assertEqual(effective, expected)
+
+    def test_effective_color_reaches_both_values_and_the_existing_bar(self):
+        start = self.content.index("function renderForwardPowerBody(check, colorClass) {")
+        end = self.content.index("function renderFanSpeedBody(check) {")
+        renderer = self.content[start:end]
+        self.assertEqual(renderer.count("${colorClass}"), 3)
+
+
+@override_settings(SECURE_SSL_REDIRECT=False)
 class NativeTx300PowerDashboardRenderingTests(TestCase):
     """r0016: native BW TX300v3 forward/reflected power (meters.pafwd /
     meters.parev) must render using the SAME established C300 renderers
@@ -135,10 +201,10 @@ class NativeTx300PowerDashboardRenderingTests(TestCase):
         self.assertEqual(content.count("function renderForwardPowerBody("), 1)
         self.assertEqual(content.count("function renderReversePowerBody("), 1)
 
-    def test_existing_c300_forward_and_reverse_power_dispatch_unchanged(self):
+    def test_c300_forward_aggregates_while_reverse_dispatch_remains_unchanged(self):
         block = self._dispatch_block()
         self.assertIn(
-            'if (check.tx_ref === "psu.fwd_power") return renderForwardPowerBody(check, colorClass);',
+            "return renderForwardPowerBody(check, worstApplicableStatus(check.status, colorClass));",
             block,
         )
         self.assertIn(

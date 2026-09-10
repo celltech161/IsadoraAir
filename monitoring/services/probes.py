@@ -765,6 +765,28 @@ def probe_weather(check):
     }
 
 
+def probe_backup(check):
+    """PROBE_DISPATCH entry point for kind="backup" -- r0060 Phase 6.
+    Delegates entirely to isadoraair.backup_assurance.evaluate_backup_health(),
+    the one recurring-DR-assurance authority, exactly the way probe_weather
+    delegates to weather.diagnostics above. Reads only the small, local,
+    nonsecret backup-assurance receipts already on disk (last-attempt.json,
+    last-success.json, roundtrip-last-attempt.json, roundtrip-last-success.json)
+    -- never SFTP, never a database connection, never an archive download.
+    Safe to run on this poller's normal ~10s cycle.
+
+    Any unexpected exception from the assurance module itself is caught
+    here and reported as 'unknown' rather than propagating -- belt-and-
+    suspenders alongside _run_cycle's own generic per-probe exception
+    handling, matching probe_weather's own established pattern."""
+    try:
+        from isadoraair.backup_assurance import evaluate_backup_health
+        status, detail = evaluate_backup_health()
+    except Exception as exc:
+        return "unknown", {"error": str(exc)}
+    return status, detail
+
+
 PROBE_DISPATCH = {
     "systemd": probe_systemd,
     "disk": probe_disk,
@@ -777,4 +799,5 @@ PROBE_DISPATCH = {
     "encoder_group": probe_encoder_group,
     "rbds": probe_rbds,
     "weather": probe_weather,
+    "backup": probe_backup,
 }

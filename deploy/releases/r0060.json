@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "release_id": "r0060",
+  "previous_release_id": "r0059",
+  "minimum_updater_protocol_version": 5,
+  "summary": "Recurring disaster-recovery assurance plus a Monitoring Forward Power display fix. Nightly backups verify pg_restore catalogs, record Git cleanliness, and write nonsecret receipts; an optional weekly remote verifier and read-only backup check are included. Cobalt Forward Power displays the worst of its numeric and paired RF-indicator states without changing probes, alerts, or native TX300 behavior. Nightly timer unchanged; one additive choices-only migration; no protected-runtime change.",
+  "migrations_required": [
+    "monitoring.0013_backup_recovery_assurance_check"
+  ],
+  "migration_compatibility": "additive",
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [
+    "isadoraair-backup-verify.service",
+    "isadoraair-backup-verify.timer"
+  ],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-gunicorn",
+    "isadoraair-monitoring"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0007"
+}

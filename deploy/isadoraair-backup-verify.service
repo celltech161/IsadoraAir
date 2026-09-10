@@ -1,0 +1,21 @@
+[Unit]
+Description=IsadoraAir weekly backup round-trip verification (optional)
+# Deliberately does NOT depend on/order against isadoraair-backup.service
+# or its timer -- this verifies the LAST successful nightly backup's
+# already-promoted remote object (via last-success.json), not "whatever
+# is running right now." See deploy/verify_backup_roundtrip.sh's own
+# header for the full design.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=@@ISA_USER@@
+Group=@@ISA_USER@@
+# Optional station functionality (r0060 Phase 6): requires the same
+# configured remote backup target as isadoraair-backup.service
+# (@@ISA_HOME@@/.iasboxbu.cred) and a completed nightly backup's
+# last-success.json receipt. Not auto-installed/enabled by Update
+# Center -- see deploy/README.md and docs/DISASTER_RECOVERY_STATUS.md's
+# Phase 6 section for production activation steps.
+ExecStart=@@ISA_ROOT@@/deploy/verify_backup_roundtrip.sh

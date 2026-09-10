@@ -46,6 +46,7 @@ class MonitorCheck(models.Model):
         ("encoder_group", "Encoder Stream Health"),
         ("rbds", "RBDS Connection"),
         ("weather", "Weather Health"),
+        ("backup", "Backup Recovery Assurance"),
     ]
 
     name = models.CharField(max_length=100, unique=True)

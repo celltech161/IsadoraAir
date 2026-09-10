@@ -93,13 +93,18 @@ class R0011ProspectiveR0012TargetSchemaTests(TransactionTestCase):
     # expect ALL of them as pending, not just the one this test's
     # docstring names as "the real incident migration". r0057 (P1 2.4
     # Pass G) added monitoring.0012_alter_monitorcheck_kind (a new
-    # MonitorCheck.kind choice, additive) on top of 0011 -- this tuple
-    # was updated accordingly, the same reasoning as updatecenter/
-    # tests/test_planner.py's SchemaDriftDetectionTests.MIGRATION
-    # constant needing to track the actual current leaf.
+    # MonitorCheck.kind choice, additive) on top of 0011; r0060 (P0 1.2
+    # Phase 6) added monitoring.0013_backup_recovery_assurance_check
+    # (another new additive kind choice, AlterField only -- see that
+    # migration's own header for why it deliberately carries no
+    # RunPython/data-seeding step) on top of that -- this tuple was
+    # updated accordingly each time, the same reasoning as
+    # updatecenter/tests/test_planner.py's SchemaDriftDetectionTests.
+    # MIGRATION constant needing to track the actual current leaf.
     pending_migration_refs = (
         "monitoring.0011_transmitter_vendor_and_password",
         "monitoring.0012_alter_monitorcheck_kind",
+        "monitoring.0013_backup_recovery_assurance_check",
     )
 
     def test_r0012_probe_accepts_and_applies_r0011_from_supported_baselines(self):
@@ -130,17 +135,32 @@ class R0011ProspectiveR0012TargetSchemaTests(TransactionTestCase):
                 {"additive"},
             )
 
+            # r0060 correction: monitoring.0013 must NOT introduce any
+            # manual-classified operation into the plan -- every
+            # operation across the WHOLE pending plan (0011, 0012, AND
+            # 0013) must be additive, and the aggregate multi-release
+            # transition from r0010/r0009/r0007 all the way through
+            # r0060 must remain eligible for the ordinary, fully
+            # automatic Phase B path -- no ExecutionError, no manual
+            # review required.
+            for item in target_payload["plan"]:
+                for operation in item["operations"]:
+                    self.assertEqual(
+                        operation["classification"], "additive",
+                        f"{item['ref']} unexpectedly has a non-additive operation: {operation}",
+                    )
+
             executor_validator = object.__new__(Executor)
             aggregate_paths = (
-                ("r0010", ("r0011", "r0012")),
-                ("r0009", ("r0010", "r0011", "r0012")),
-                ("r0007", ("r0008", "r0009", "r0010", "r0011", "r0012")),
+                ("r0010", ("r0011", "r0012", "r0060")),
+                ("r0009", ("r0010", "r0011", "r0012", "r0060")),
+                ("r0007", ("r0008", "r0009", "r0010", "r0011", "r0012", "r0060")),
             )
             for installed_release, releases_in_plan in aggregate_paths:
                 with self.subTest(installed_release=installed_release):
                     plan = SimpleNamespace(
                         installed_release_id=installed_release,
-                        target_release_id="r0012",
+                        target_release_id="r0060",
                         releases_in_plan=releases_in_plan,
                         migrations_required=self.pending_migration_refs,
                         migration_compatibility="additive",

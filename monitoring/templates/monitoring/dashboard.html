@@ -769,6 +769,24 @@ function indicatorColorClass(rawValue) {
   return "unknown"; // "0", "B", missing, or anything unrecognized
 }
 
+const DISPLAY_STATUS_SEVERITY = Object.freeze({
+  ok: 0,
+  unknown: 1,
+  warning: 2,
+  critical: 3,
+});
+
+function worstApplicableStatus(...statuses) {
+  return statuses.reduce((worst, status) => {
+    const candidate = Object.prototype.hasOwnProperty.call(DISPLAY_STATUS_SEVERITY, status)
+      ? status
+      : "unknown";
+    return DISPLAY_STATUS_SEVERITY[candidate] > DISPLAY_STATUS_SEVERITY[worst]
+      ? candidate
+      : worst;
+  }, "ok");
+}
+
 function renderForwardPowerBody(check, colorClass) {
   const value = check.detail && check.detail.value;
   const percent = check.detail && check.detail.percent_of_max;
@@ -881,7 +899,9 @@ function renderCardBody(check, byTxRef) {
     const indicatorCheck = byTxRef[pairedIndicatorRef];
     const indicatorValue = indicatorCheck && indicatorCheck.detail && indicatorCheck.detail.value;
     const colorClass = indicatorColorClass(indicatorValue);
-    if (check.tx_ref === "psu.fwd_power") return renderForwardPowerBody(check, colorClass);
+    if (check.tx_ref === "psu.fwd_power") {
+      return renderForwardPowerBody(check, worstApplicableStatus(check.status, colorClass));
+    }
     if (check.tx_ref === "psu.rev_power") return renderReversePowerBody(check, colorClass);
     if (check.tx_ref === "psu.vswr") return renderVswrBody(check, colorClass);
     if (check.tx_ref === "psu.pa_temperature") return renderPaTempBody(check, colorClass);

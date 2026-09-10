@@ -50,6 +50,8 @@ FAIL=0
 NOTE_GIT_SHA=""
 NOTE_BACKUP_SCRIPT_VERSION=""
 NOTE_CREATED=""
+NOTE_GIT_BRANCH=""
+NOTE_GIT_DIRTY=""
 
 pass() { printf '%-28s PASS  %s\n' "$1" "${2:-}"; }
 warn() { printf '%-28s WARN  %s\n' "$1" "${2:-}"; }
@@ -112,9 +114,46 @@ if has_entry "MANIFEST.txt"; then
     NOTE_GIT_SHA=$(printf '%s\n' "$MANIFEST_CONTENT" | grep -E '^IsadoraAir Git SHA:' | sed -E 's/^IsadoraAir Git SHA:\s*//' || true)
     NOTE_BACKUP_SCRIPT_VERSION=$(printf '%s\n' "$MANIFEST_CONTENT" | grep -E '^Backup script version:' | sed -E 's/^Backup script version:\s*//' || true)
     NOTE_CREATED=$(printf '%s\n' "$MANIFEST_CONTENT" | grep -E '^Created \(UTC\):' | sed -E 's/^Created \(UTC\):\s*//' || true)
+    NOTE_GIT_BRANCH=$(printf '%s\n' "$MANIFEST_CONTENT" | grep -E '^IsadoraAir Git Branch:' | sed -E 's/^IsadoraAir Git Branch:\s*//' || true)
+    NOTE_GIT_DIRTY=$(printf '%s\n' "$MANIFEST_CONTENT" | grep -E '^IsadoraAir Git Dirty:' | sed -E 's/^IsadoraAir Git Dirty:\s*//' || true)
   fi
 else
   fail "MANIFEST.txt" "missing from archive"
+fi
+
+# ---- 3b. Git cleanliness (r0060 Phase 6) --------------------------------
+# Additive metadata -- an archive from before this feature existed (or a
+# MANIFEST.txt this script couldn't read at all) simply has no
+# "IsadoraAir Git Dirty:" line, which is WARN/not-applicable, never a
+# structural FAIL: this is purely evidence about whether the recorded
+# Git SHA reconstructs the exact code that was running, not about
+# whether the archive's own DB/config/media content is valid.
+case "$NOTE_GIT_DIRTY" in
+  "")
+    warn "Git checkout cleanliness" "manifest predates this feature (or MANIFEST.txt missing/unreadable) -- not applicable, not a failure. The recorded Git SHA's exact reconstruction cannot be confirmed for this archive."
+    ;;
+  false)
+    pass "Git checkout cleanliness" "clean at backup time -- Git SHA ${NOTE_GIT_SHA:-unknown} (branch ${NOTE_GIT_BRANCH:-unknown}) exactly reconstructs the code that was running"
+    ;;
+  true)
+    warn "Git checkout cleanliness" "DIRTY at backup time -- Git SHA ${NOTE_GIT_SHA:-unknown} does NOT reconstruct uncommitted changes. This is a valid operational backup but is NOT eligible to become the canonical sealed recovery authority."
+    ;;
+  *)
+    warn "Git checkout cleanliness" "unknown (git was unavailable or this was not a git checkout at backup time) -- Git SHA ${NOTE_GIT_SHA:-unknown} is informational only"
+    ;;
+esac
+
+# ---- 3c. Database catalog readability check (r0060 Phase 6) -----------
+# Recorded by the backup script itself (pg_restore --list, run before
+# upload) -- absence here means an archive predating this feature, which
+# is WARN/not-applicable, never a structural FAIL. A present line always
+# reads "ok" -- the backup script aborts before writing MANIFEST.txt at
+# all if the real check failed, so there is no "present but failed" case
+# to distinguish.
+if [ -n "$MANIFEST_CONTENT" ] && printf '%s\n' "$MANIFEST_CONTENT" | grep -qE '^Database catalog check \(pg_restore --list\): ok$'; then
+  pass "Database catalog check" "pg_restore --list succeeded at backup time (recorded in manifest)"
+else
+  warn "Database catalog check" "manifest predates this feature (or MANIFEST.txt missing/unreadable) -- not applicable, not a failure"
 fi
 
 # ---- 4. database.dump: exists + looks like PG custom format ------------

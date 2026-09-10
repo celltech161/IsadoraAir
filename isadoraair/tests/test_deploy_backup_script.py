@@ -205,7 +205,15 @@ class BackupScriptContentTests(SimpleTestCase):
 
     def test_retention_and_cleanup_trap_preserved(self):
         self.assertIn("RETENTION_DAYS=30", self.text)
-        self.assertIn("trap cleanup EXIT", self.text)
+        # r0060 Phase 6: the bare `trap cleanup EXIT` became
+        # `trap finalize EXIT`, where finalize() captures the ORIGINAL
+        # exit code first, records the backup-assurance attempt receipt,
+        # THEN calls cleanup() and re-exits with that preserved code --
+        # see finalize()'s own docstring for why the exit-code capture
+        # must be its first statement.
+        self.assertIn("trap finalize EXIT", self.text)
+        self.assertIn("local exit_code=$?", self.text)
+        self.assertIn('exit "$exit_code"', self.text)
 
     def test_dry_run_mode_skips_credentials_and_network(self):
         """DRY_RUN=1 must never read the credential file and must never
@@ -316,7 +324,7 @@ class BackupScriptContentTests(SimpleTestCase):
         # dedicated v3/runtime-recovery coverage. This assertion still only
         # needs to prove SCRIPT_VERSION was deliberately bumped past its
         # pre-E7B baseline, not pin the exact string forever.
-        self.assertIn('SCRIPT_VERSION="3.1.0"', self.text)
+        self.assertIn('SCRIPT_VERSION="3.2.0"', self.text)
         self.assertNotIn('SCRIPT_VERSION="2.1.0"', self.text)
 
     def test_encryption_step_calls_the_standalone_helper_script(self):
@@ -425,7 +433,7 @@ class RuntimeRecoveryPayloadBackupTests(SimpleTestCase):
         cls.text = SCRIPT_PATH.read_text(encoding="utf-8")
 
     def test_script_version_is_separate_from_archive_format_classification(self):
-        self.assertIn('SCRIPT_VERSION="3.1.0"', self.text)
+        self.assertIn('SCRIPT_VERSION="3.2.0"', self.text)
         self.assertNotIn('SCRIPT_VERSION="2.1.0"', self.text)
         self.assertIn("runtime-recovery-archive.json", self.text)
         self.assertIn("archive_format_version", self.text)
@@ -445,7 +453,16 @@ class RuntimeRecoveryPayloadBackupTests(SimpleTestCase):
         self.assertIn("--current --json", self.text)
         # No independent hash table or wheel/package constant sneaked in.
         self.assertNotIn("kokoro-onnx", self.text)
-        self.assertNotIn("sha256sum", self.text)
+        # r0060 Phase 6 legitimately introduced ONE sha256sum call
+        # elsewhere in this script (the final archive's own identity for
+        # last-success.json, computed after the archive is finished --
+        # see the backup-assurance section) -- scoped here to prove it
+        # still never appears inside the runtime-recovery PAYLOAD
+        # validation section specifically, i.e. this step still never
+        # reimplements its own hash table.
+        section_start = self.text.index("Validating and including the current Runtime Foundation E7 recovery payload")
+        section_end = self.text.index("Encrypting recovery credentials")
+        self.assertNotIn("sha256sum", self.text[section_start:section_end])
 
     def test_no_network_acquisition_introduced(self):
         """This step must never fetch anything -- no pip install, no
@@ -650,6 +667,100 @@ class RuntimeRecoveryPayloadBackupTests(SimpleTestCase):
         # never broadened into a recursive chmod over the copied payload.
         self.assertEqual(payload_step.count("chmod"), 1)
         self.assertNotIn("chmod -R", payload_step)
+
+
+class BackupOptionalEnvReadPipefailTests(SimpleTestCase):
+    """r0060 bugfix -- under this script's own `set -o pipefail`,
+    `VAR=$(grep ... | head -1 | cut ...)` reports the PIPELINE's exit
+    status as grep's own (1, "no match") whenever an optional .env key
+    is absent, even though head/cut both succeed -- which trips `set -e`
+    and aborts the whole backup at the assignment, before the fallback
+    default on the very next line ever runs. Confirmed reproducible
+    standalone: `bash -c 'set -euo pipefail; X=$(grep -E "^NOPE=" \
+    /dev/null | head -1 | cut -d= -f2-); echo ok'` exits 1 and never
+    prints "ok". Fixed here for the two genuinely-optional reads that
+    have a real fallback default (REPORTS_ROOT, DB_HOST, DB_PORT) --
+    DB_NAME/DB_USER/DB_PASSWORD are deliberately left untouched: they
+    are REQUIRED configuration with their own explicit
+    `:  "${VAR:?...}"` fail-closed guards immediately below."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.text = SCRIPT_PATH.read_text(encoding="utf-8")
+
+    def test_strict_failure_handling_still_enabled(self):
+        """This fix must not have loosened the script's overall safety
+        posture -- set -euo pipefail stays on."""
+        self.assertIn("set -euo pipefail", self.text)
+
+    def test_optional_reports_root_read_tolerates_pipefail(self):
+        self.assertIn(
+            "REPORTS_DIR=$(grep -E '^REPORTS_ROOT=' \"$ENV_FILE\" | head -1 | cut -d= -f2- || true)",
+            self.text,
+        )
+        self.assertIn('REPORTS_DIR="${REPORTS_DIR:-/var/lib/isadoraair/reports}"', self.text)
+
+    def test_optional_db_host_and_port_reads_tolerate_pipefail(self):
+        self.assertIn(
+            "DB_HOST=$(grep -E '^DB_HOST=' \"$ENV_FILE\" | head -1 | cut -d= -f2- || true)",
+            self.text,
+        )
+        self.assertIn(
+            "DB_PORT=$(grep -E '^DB_PORT=' \"$ENV_FILE\" | head -1 | cut -d= -f2- || true)",
+            self.text,
+        )
+        self.assertIn('DB_HOST="${DB_HOST:-localhost}"', self.text)
+        self.assertIn('DB_PORT="${DB_PORT:-5432}"', self.text)
+
+    def test_required_db_values_were_not_made_optional(self):
+        """DB_NAME/DB_USER must NOT have grown an `|| true` -- a missing
+        required value must still fail closed via the existing
+        `:  "${VAR:?...}"` guards, not silently become empty."""
+        self.assertIn(
+            "DB_NAME=$(grep -E '^DB_NAME=' \"$ENV_FILE\" | head -1 | cut -d= -f2-)",
+            self.text,
+        )
+        self.assertIn(
+            "DB_USER=$(grep -E '^DB_USER=' \"$ENV_FILE\" | head -1 | cut -d= -f2-)",
+            self.text,
+        )
+        self.assertIn(': "${DB_NAME:?DB_NAME not found in $ENV_FILE}"', self.text)
+        self.assertIn(': "${DB_USER:?DB_USER not found in $ENV_FILE}"', self.text)
+
+    def test_functional_optional_reads_survive_absence_under_real_pipefail(self):
+        """Real, minimal functional proof -- not just a text match --
+        that the exact three-line fallback pattern this script uses for
+        REPORTS_ROOT/DB_HOST/DB_PORT now reaches its own default under
+        `set -euo pipefail` when the key is absent, and that a required
+        value (no `|| true`) still aborts as intended when missing."""
+        env_file = tempfile.NamedTemporaryFile(mode="w", suffix=".env", delete=False)
+        try:
+            env_file.write("DB_NAME=realdb\n")  # DB_HOST/DB_PORT/REPORTS_ROOT deliberately absent
+            env_file.close()
+            script = f"""
+set -euo pipefail
+ENV_FILE={env_file.name}
+DB_HOST=$(grep -E '^DB_HOST=' "$ENV_FILE" | head -1 | cut -d= -f2- || true)
+DB_PORT=$(grep -E '^DB_PORT=' "$ENV_FILE" | head -1 | cut -d= -f2- || true)
+DB_HOST="${{DB_HOST:-localhost}}"
+DB_PORT="${{DB_PORT:-5432}}"
+REPORTS_DIR=$(grep -E '^REPORTS_ROOT=' "$ENV_FILE" | head -1 | cut -d= -f2- || true)
+REPORTS_DIR="${{REPORTS_DIR:-/var/lib/isadoraair/reports}}"
+echo "HOST=$DB_HOST PORT=$DB_PORT REPORTS=$REPORTS_DIR"
+"""
+            result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), "HOST=localhost PORT=5432 REPORTS=/var/lib/isadoraair/reports")
+
+            # And the pre-fix pipeline (no `|| true`) really does abort
+            # under the same absence, confirming this test would have
+            # caught the original bug.
+            broken_script = script.replace("|| true", "")
+            broken = subprocess.run(["bash", "-c", broken_script], capture_output=True, text=True, timeout=10)
+            self.assertNotEqual(broken.returncode, 0)
+        finally:
+            os.unlink(env_file.name)
 
 
 class EncryptRecoveryCredentialsScriptTests(SimpleTestCase):

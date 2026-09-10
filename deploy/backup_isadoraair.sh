@@ -183,11 +183,38 @@
 # end) instead of being deleted, for exactly the kind of local
 # tar -tzf/MANIFEST.txt verification pass this was added for. Nothing
 # else about the archive-building logic changes -- this exercises the
-# real backup path, not a separate one.
+# real backup path, not a separate one. Per the same contract, DRY_RUN
+# also never writes/updates a backup-assurance receipt (see the
+# 2026-09-10 note below) -- a dry run must never be mistaken for a real
+# attempt by Monitoring or the weekly round-trip verifier.
+#
+# 2026-09-10 (r0060) Phase 6 recurring disaster-recovery assurance:
+#   - `isadoraair/backup_assurance.py` (stdlib-only) now records a
+#     durable, nonsecret "running" receipt near startup and updates it
+#     to "success"/"failed" on exit -- see the ATTEMPT_ID/finalize trap
+#     below. A separate, richer last-success.json receipt is written
+#     ONLY after the real SFTP .partial -> final rename and same-session
+#     pruning have actually completed. Both live under
+#     $HOME/.local/state/isadoraair/backup-assurance (mode 0700 dir,
+#     0600 files) -- see that module's own docstring for the exact
+#     schemas and the security invariants (no secrets, no raw `git
+#     status` output, no dirty filenames, ever).
+#   - Git cleanliness (exact HEAD, branch-or-detached, dirty true/false/
+#     unknown) is now captured once per run and recorded both in
+#     MANIFEST.txt and in the receipts above -- a dirty checkout does
+#     NOT abort the backup (the DB/config/media backup is still
+#     valuable), but see docs/DISASTER_RECOVERY_STATUS.md's Phase 6
+#     section: a dirty backup is not eligible to become the canonical
+#     sealed recovery authority, and Monitoring surfaces it as WARNING.
+#   - After `pg_dump -Fc` succeeds, `pg_restore --list` is now run
+#     against the fresh database.dump (read-only, no DB connection) to
+#     prove the catalog is actually readable before anything is
+#     uploaded -- see the "Verifying database dump catalog" step below.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ASSURANCE_MODULE="$SCRIPT_DIR/../isadoraair/backup_assurance.py"
 
 # Version of this Git-owned backup implementation. Archive format is
 # classified separately in runtime-recovery-archive.json: this script
@@ -205,7 +232,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # classifies an archive without a policy-satisfying runtime-recovery/
 # payload as legacy format 2.1.0, never as self-contained v3 -- see
 # docs/RUNTIME_BACKUP_PAYLOAD.md's "Backward compatibility" section.
-SCRIPT_VERSION="3.1.0"
+# 3.2.0 (r0060, Phase 6): adds the pg_restore --list catalog readability
+# check (before upload), git-cleanliness capture in MANIFEST.txt, and
+# durable backup-assurance receipts (isadoraair/backup_assurance.py) --
+# all additive to the archive's own on-disk shape (no new top-level
+# member, no MANIFEST.txt line removed), so this does NOT change
+# ARCHIVE class/format at all -- deploy/restore/inspect_backup.sh keeps
+# reading a pre-3.2.0 archive exactly as before (the new manifest lines
+# are simply absent, treated as WARN/not-applicable, never FAIL).
+SCRIPT_VERSION="3.2.0"
 
 # See the DRY_RUN note in the header comment above.
 DRY_RUN="${DRY_RUN:-0}"
@@ -268,7 +303,43 @@ cleanup() {
     rm -f "$TMP_TAR"
   fi
 }
-trap cleanup EXIT
+
+# r0060 Phase 6: bounded, nonsecret backup-assurance receipt bookkeeping.
+# ATTEMPT_ID is set once attempt-start below has run; CURRENT_STAGE is
+# updated at each major step so a failure receipt names roughly where
+# things went wrong (never a stderr excerpt, never a filename -- see
+# isadoraair/backup_assurance.py's own docstring for why). ATTEMPT_ID
+# stays empty under DRY_RUN=1, so the finalize trap below never touches
+# a receipt in that mode -- this is the ONLY gate that matters for the
+# "DRY_RUN must not mutate assurance state" contract, deliberately
+# simpler than also threading --dry-run through every call.
+ATTEMPT_ID=""
+CURRENT_STAGE="starting"
+
+# The exit-code capture as the trap's OWN FIRST statement matters: any
+# command run later inside this trap (including the backup_assurance.py
+# CLI calls) would otherwise silently overwrite $? by the time the
+# script actually exits, turning e.g. a real exit 1 failure into exit 0
+# just because the LAST thing the trap happened to run succeeded. This
+# preserves the script's original exit code unconditionally -- receipt-
+# writing failure must never hide it (see the module's own docstring).
+finalize() {
+  local exit_code=$?
+  if [ "$DRY_RUN" != "1" ] && [ -n "$ATTEMPT_ID" ]; then
+    if [ "$exit_code" -eq 0 ]; then
+      python3 "$ASSURANCE_MODULE" attempt-finish \
+        --attempt-id "$ATTEMPT_ID" --outcome success --stage complete \
+        >/dev/null 2>&1 || echo "Warning: failed to record backup-assurance success receipt (backup itself succeeded)." >&2
+    else
+      python3 "$ASSURANCE_MODULE" attempt-finish \
+        --attempt-id "$ATTEMPT_ID" --outcome failed --stage "$CURRENT_STAGE" --exit-code "$exit_code" \
+        >/dev/null 2>&1 || echo "Warning: failed to record backup-assurance failure receipt (original failure preserved below)." >&2
+    fi
+  fi
+  cleanup
+  exit "$exit_code"
+}
+trap finalize EXIT
 
 if [ "$DRY_RUN" = "1" ]; then
   echo "DRY_RUN=1: skipping ${CONFIG_FILE} entirely -- no SFTP connection will be opened (no remote listing, no upload, no prune)."
@@ -296,6 +367,10 @@ else
 fi
 if ! command -v pg_dump >/dev/null 2>&1; then
   echo "Error: pg_dump is not installed (postgresql-client)." >&2
+  exit 1
+fi
+if ! command -v pg_restore >/dev/null 2>&1; then
+  echo "Error: pg_restore is not installed (postgresql-client) -- required to verify the database dump's catalog is readable before upload (r0060 Phase 6)." >&2
   exit 1
 fi
 if ! command -v flock >/dev/null 2>&1; then
@@ -359,12 +434,73 @@ sftp_run() {
   done
 }
 
+# Small, safe extraction of one field from a small trusted JSON blob
+# this script itself just produced (validate_runtime_recovery_payload's
+# --json output, or isadoraair/backup_assurance.py's git-state output)
+# -- pure stdlib json, no eval, never passed anything the script didn't
+# just generate itself.
+recovery_json_get() {
+  python3 -c "
+import json, sys
+data = json.loads(sys.argv[1])
+for key in sys.argv[2].split('.'):
+    data = (data or {}).get(key) if isinstance(data, dict) else None
+if isinstance(data, list):
+    print(','.join(str(x) for x in data))
+elif data is None:
+    print('')
+else:
+    print(data)
+" "$1" "$2"
+}
+
+# Normalizes a Python-JSON-derived True/False/"" string (as
+# recovery_json_get prints it) to the lowercase true/false/unknown
+# tokens isadoraair/backup_assurance.py's CLI expects everywhere a
+# tri-state git/validation flag is passed.
+tribool_str() {
+  case "$1" in
+    True|true) echo "true" ;;
+    False|false) echo "false" ;;
+    *) echo "unknown" ;;
+  esac
+}
+
 mkdir -p "$WORKDIR"
 
 echo "IsadoraAir backup starting (script v${SCRIPT_VERSION})..."
 echo "  Host:   ${BAK_HOST}"
 echo "  Remote: ${BAK_PATH}"
 echo
+
+# r0060 Phase 6: one git-cleanliness read for the whole run, shared by
+# MANIFEST.txt below and every backup-assurance receipt -- never
+# recomputed mid-run (the working tree can't meaningfully change during
+# this script's own execution, but reading it once keeps the manifest
+# and the receipts from ever disagreeing with each other). Only the
+# derived sha/branch/detached/dirty fields are ever kept -- see
+# collect_git_state()'s own docstring for why raw `git status` output
+# is never captured here at all.
+GIT_STATE_JSON=$(python3 "$ASSURANCE_MODULE" git-state --repo-root "$PROJECT_DIR")
+GIT_SHA_RAW=$(recovery_json_get "$GIT_STATE_JSON" sha)
+GIT_BRANCH_RAW=$(recovery_json_get "$GIT_STATE_JSON" branch)
+GIT_DETACHED_DISPLAY=$(tribool_str "$(recovery_json_get "$GIT_STATE_JSON" detached)")
+GIT_DIRTY_DISPLAY=$(tribool_str "$(recovery_json_get "$GIT_STATE_JSON" dirty)")
+GIT_SHA="${GIT_SHA_RAW:-unknown}"
+GIT_BRANCH_DISPLAY="${GIT_BRANCH_RAW:-(detached or unknown)}"
+if [ "$GIT_DIRTY_DISPLAY" = "true" ]; then
+  echo "Warning: production checkout has uncommitted changes -- this backup will be recorded as a DIRTY backup. It is still a fully valid operational backup, but is NOT eligible to become the canonical sealed recovery authority (see docs/DISASTER_RECOVERY_STATUS.md)."
+  echo
+fi
+
+if [ "$DRY_RUN" != "1" ]; then
+  ATTEMPT_ID=$(python3 "$ASSURANCE_MODULE" attempt-start --stage "$CURRENT_STAGE" \
+    --git-sha "$GIT_SHA_RAW" --git-branch "$GIT_BRANCH_RAW" \
+    --git-detached "$GIT_DETACHED_DISPLAY" --git-dirty "$GIT_DIRTY_DISPLAY") || ATTEMPT_ID=""
+  if [ -z "$ATTEMPT_ID" ]; then
+    echo "Warning: could not record a backup-assurance 'running' receipt -- continuing with the backup itself." >&2
+  fi
+fi
 
 TO_DELETE=()
 if [ "$DRY_RUN" = "1" ]; then
@@ -407,6 +543,7 @@ EOF
   echo
 fi
 
+CURRENT_STAGE="pg_dump"
 echo "Dumping PostgreSQL database..."
 # Same DB_* values Django itself reads from .env via python-decouple --
 # not duplicated in the cred file, so there's one source of truth for
@@ -414,8 +551,20 @@ echo "Dumping PostgreSQL database..."
 DB_NAME=$(grep -E '^DB_NAME=' "$ENV_FILE" | head -1 | cut -d= -f2-)
 DB_USER=$(grep -E '^DB_USER=' "$ENV_FILE" | head -1 | cut -d= -f2-)
 DB_PASSWORD=$(grep -E '^DB_PASSWORD=' "$ENV_FILE" | head -1 | cut -d= -f2-)
-DB_HOST=$(grep -E '^DB_HOST=' "$ENV_FILE" | head -1 | cut -d= -f2-)
-DB_PORT=$(grep -E '^DB_PORT=' "$ENV_FILE" | head -1 | cut -d= -f2-)
+# 2026-09-10 (r0060) bugfix: DB_HOST/DB_PORT are genuinely OPTIONAL --
+# both have a real fallback default immediately below, matching
+# Django's own decouple default for the same setting. Under this
+# script's `set -o pipefail`, `grep ... | head -1 | cut ...` reports the
+# PIPELINE's exit status as grep's own (1, "no match") whenever the key
+# is absent from .env, even though head/cut both succeed -- which trips
+# `set -e` and aborts the whole backup at this assignment, before the
+# fallback on the next line ever runs. `|| true` restores the intended
+# "absent means use the default" behavior. DB_NAME/DB_USER/DB_PASSWORD
+# below are deliberately left as-is -- they are REQUIRED application
+# configuration with their own explicit `:  "${VAR:?...}"` fail-closed
+# guards a few lines down; this fix does not touch their semantics.
+DB_HOST=$(grep -E '^DB_HOST=' "$ENV_FILE" | head -1 | cut -d= -f2- || true)
+DB_PORT=$(grep -E '^DB_PORT=' "$ENV_FILE" | head -1 | cut -d= -f2- || true)
 DB_HOST="${DB_HOST:-localhost}"
 DB_PORT="${DB_PORT:-5432}"
 : "${DB_NAME:?DB_NAME not found in $ENV_FILE}"
@@ -432,6 +581,23 @@ if [ ! -s "$WORKDIR/database.dump" ]; then
 fi
 echo "  $(du -h "$WORKDIR/database.dump" | cut -f1) database dump"
 
+# r0060 Phase 6, section C: recurring proof the dump's catalog is
+# actually readable -- read-only (`--list` only reads the archive's own
+# TOC, never connects to or mutates any database), bounded, and run
+# BEFORE anything is uploaded so a corrupt/unreadable dump fails the
+# backup closed rather than shipping a file that only LOOKS like a
+# valid pg_dump -Fc archive (the existing PGDMP-magic check above is
+# necessary but not sufficient -- it only proves the first 5 bytes are
+# right).
+CURRENT_STAGE="catalog_check"
+echo "Verifying database dump catalog is readable (pg_restore --list)..."
+if ! pg_restore --list "$WORKDIR/database.dump" > /dev/null; then
+  echo "Error: pg_restore --list could not read the freshly-created database dump's catalog -- aborting before upload." >&2
+  exit 1
+fi
+echo "  ok"
+
+CURRENT_STAGE="app_archive"
 echo "Archiving application tree (code, .env, media)..."
 # -h/--dereference: PROJECT_DIR (/opt/isadoraair by convention) is itself
 # a symlink to the real checkout. Without -h, tar does NOT follow a
@@ -485,6 +651,7 @@ if grep -qE "^$(basename "$PROJECT_DIR")/\.env\.(bak|lock)$" <<< "$APP_TAR_LISTI
   exit 1
 fi
 
+CURRENT_STAGE="etc_live"
 echo "Copying live nginx/systemd configs..."
 mkdir -p "$WORKDIR/etc-live"
 # sites-enabled/isadoraair MUST be a symlink to sites-available/isadoraair
@@ -502,6 +669,7 @@ for svc in isadoraair-gunicorn isadoraair-engine isadoraair-encoders isadoraair-
   [ -r "$unit" ] && cp "$unit" "$WORKDIR/etc-live/"
 done
 
+CURRENT_STAGE="stereotool"
 echo "Copying StereoTool processing profile (.sts), if present..."
 mkdir -p "$WORKDIR/stereotool"
 STS_COUNT=0
@@ -513,6 +681,7 @@ if [ -d "$STEREOTOOL_DIR" ]; then
 fi
 echo "  ${STS_COUNT} .sts profile(s)"
 
+CURRENT_STAGE="srv_content"
 echo "Copying small operator-created station content (FX carts, voicetracks)..."
 mkdir -p "$WORKDIR/srv-content"
 for sub in carts voicetracks; do
@@ -523,8 +692,13 @@ for sub in carts voicetracks; do
 done
 echo "  $(du -sh "$WORKDIR/srv-content" 2>/dev/null | cut -f1) of station content"
 
+CURRENT_STAGE="reports"
 echo "Copying royalty/SoundExchange report filings, if present..."
-REPORTS_DIR=$(grep -E '^REPORTS_ROOT=' "$ENV_FILE" | head -1 | cut -d= -f2-)
+# 2026-09-10 (r0060) bugfix: same `set -o pipefail` gotcha as the
+# DB_HOST/DB_PORT fix above -- REPORTS_ROOT is genuinely optional (see
+# the fallback default immediately below), so an absent grep match must
+# not abort the whole backup here either.
+REPORTS_DIR=$(grep -E '^REPORTS_ROOT=' "$ENV_FILE" | head -1 | cut -d= -f2- || true)
 REPORTS_DIR="${REPORTS_DIR:-/var/lib/isadoraair/reports}"
 if [ -d "$REPORTS_DIR" ]; then
   cp -a "$REPORTS_DIR" "$WORKDIR/reports"
@@ -533,24 +707,8 @@ else
   echo "  (none found at $REPORTS_DIR)"
 fi
 
+CURRENT_STAGE="runtime_recovery"
 echo "Validating and including the current Runtime Foundation E7 recovery payload..."
-# Small, safe extraction of one field from validate_runtime_recovery_payload's
-# --json output -- pure stdlib json, no eval, never passed anything but
-# this script's own already-validated subprocess output.
-recovery_json_get() {
-  python3 -c "
-import json, sys
-data = json.loads(sys.argv[1])
-for key in sys.argv[2].split('.'):
-    data = (data or {}).get(key) if isinstance(data, dict) else None
-if isinstance(data, list):
-    print(','.join(str(x) for x in data))
-elif data is None:
-    print('')
-else:
-    print(data)
-" "$1" "$2"
-}
 
 # One human-readable "component: reason" line per required component's
 # diagnostic reasons -- pure stdlib json, safe (component names and
@@ -692,6 +850,7 @@ RECOVERY_ARCHIVE_FORMAT=$(recovery_json_get "$RECOVERY_ARCHIVE_METADATA_JSON" ar
 RECOVERY_ARCHIVE_CLASS=$(recovery_json_get "$RECOVERY_ARCHIVE_METADATA_JSON" recovery_class)
 echo
 
+CURRENT_STAGE="recovery_credentials"
 echo "Encrypting recovery credentials (if configured)..."
 # See deploy/encrypt_recovery_credentials.sh's own header for the full
 # security model and failure policy. Run unconditionally (including under
@@ -736,10 +895,25 @@ else
 fi
 echo
 
+CURRENT_STAGE="manifest"
 echo "Writing backup manifest..."
-GIT_SHA="unknown"
-if command -v git >/dev/null 2>&1 && [ -d "$PROJECT_DIR/.git" ]; then
-  GIT_SHA=$(git -C "$PROJECT_DIR" rev-parse HEAD 2>/dev/null || echo "unknown")
+# GIT_SHA/GIT_BRANCH_DISPLAY/GIT_DETACHED_DISPLAY/GIT_DIRTY_DISPLAY were
+# already captured once, early in this run (see the git-state block
+# near the top) -- reused here verbatim rather than re-reading git a
+# second time, so the manifest and every backup-assurance receipt can
+# never disagree about the state of the same checkout.
+if [ "$GIT_DIRTY_DISPLAY" = "true" ]; then
+  GIT_DIRTY_MANIFEST_NOTE="NOTE: this checkout had uncommitted changes at backup time -- the Git SHA
+above does NOT reconstruct the exact code that was running. This is a
+fully valid OPERATIONAL backup, but per docs/DISASTER_RECOVERY_STATUS.md
+it is NOT eligible to become the canonical sealed recovery authority."
+elif [ "$GIT_DIRTY_DISPLAY" = "unknown" ]; then
+  GIT_DIRTY_MANIFEST_NOTE="NOTE: checkout cleanliness could not be determined (git unavailable or
+this is not a git checkout) -- treat the Git SHA above as informational
+only."
+else
+  GIT_DIRTY_MANIFEST_NOTE="NOTE: checkout was clean at backup time -- the Git SHA above exactly
+reconstructs the code that was running."
 fi
 cat > "$WORKDIR/MANIFEST.txt" <<MANIFEST
 IsadoraAir disaster-recovery backup manifest
@@ -749,6 +923,10 @@ Archive format version: ${RECOVERY_ARCHIVE_FORMAT}
 Runtime recovery archive class: ${RECOVERY_ARCHIVE_CLASS}
 Created (UTC):          $(date -u -Iseconds)
 IsadoraAir Git SHA:     ${GIT_SHA}
+IsadoraAir Git Branch:  ${GIT_BRANCH_DISPLAY}
+IsadoraAir Git Dirty:   ${GIT_DIRTY_DISPLAY}
+${GIT_DIRTY_MANIFEST_NOTE}
+Database catalog check (pg_restore --list): ok
 Database name:          ${DB_NAME}
 
 Contents of this archive:
@@ -806,12 +984,14 @@ reprovisioned from elsewhere on restore (see docs/DISASTER_RECOVERY.md
   StereoTool license (not a Phase 5 blocker -- see docs/DISASTER_RECOVERY_RESTORE.md; StereoTool runs unlicensed with only an occasional watermark until manually relicensed post-restore)
 MANIFEST
 
+CURRENT_STAGE="final_archive"
 echo "Building final archive..."
 tar czf "$TMP_TAR" -C "$WORKDIR" .
 echo "Archive created:"
 ls -lh "$TMP_TAR"
 echo
 
+CURRENT_STAGE="integrity_check"
 echo "Verifying archive integrity before upload..."
 if ! tar -tzf "$TMP_TAR" > /dev/null; then
   echo "Error: freshly-built archive failed its own integrity check -- aborting before upload." >&2
@@ -840,12 +1020,22 @@ if [ "$RECOVERY_PAYLOAD_INCLUDED" -eq 1 ]; then
 fi
 echo
 
+# r0060 Phase 6: archive identity for last-success.json, computed once
+# the final archive is finished and integrity-checked -- never before
+# (a hash of a not-yet-final archive would be meaningless) and never
+# recomputed after upload (the local file and the just-uploaded remote
+# bytes are the same bytes; sha256sum is cheap, but there is no reason
+# to run it twice).
+ARCHIVE_BYTES=$(stat -c%s "$TMP_TAR" 2>/dev/null || stat -f%z "$TMP_TAR")
+ARCHIVE_SHA256=$(sha256sum "$TMP_TAR" | cut -d' ' -f1)
+
 if [ "$DRY_RUN" = "1" ]; then
   echo "DRY_RUN=1: not uploading, not pruning. Archive left in place for inspection:"
   echo "  ${TMP_TAR}"
   echo
   echo "IsadoraAir backup dry run completed successfully (local archive only, nothing touched remotely)."
 else
+  CURRENT_STAGE="upload"
   echo "Uploading via SFTP (staged, then promoted atomically; pruning old backups in the same session)..."
   {
     echo "cd ${BAK_PATH}"
@@ -869,5 +1059,43 @@ else
     echo "Pruned ${#TO_DELETE[@]} backup(s) older than ${RETENTION_DAYS} days."
   fi
   echo
+
+  # r0060 Phase 6, section A: last-success.json is written HERE and
+  # ONLY here -- strictly after the .partial -> final rename and any
+  # same-session prune deletes above have already completed
+  # successfully (sftp_run only returns 0 once the WHOLE batch,
+  # including the rename and every `rm`, succeeded). Every validation
+  # boolean recorded below is true precisely because this script would
+  # already have exited nonzero earlier if it weren't --
+  # record_success() itself refuses to write a receipt claiming
+  # remote_promotion without it actually being true.
+  CURRENT_STAGE="record_success"
+  RECOVERY_POLICY_SATISFIED_DISPLAY="true"
+  if [ "$RECOVERY_PAYLOAD_INCLUDED" -eq 1 ] && [ -n "${RECOVERY_PAYLOAD_POLICY_SATISFIED:-}" ]; then
+    RECOVERY_POLICY_SATISFIED_DISPLAY=$(tribool_str "$RECOVERY_PAYLOAD_POLICY_SATISFIED")
+    [ "$RECOVERY_POLICY_SATISFIED_DISPLAY" = "unknown" ] && RECOVERY_POLICY_SATISFIED_DISPLAY="true"
+  fi
+  PRODUCT_CONTRACT_ARGS=()
+  if [ -n "${RECOVERY_PAYLOAD_PRODUCT_DIGEST:-}" ]; then
+    PRODUCT_CONTRACT_ARGS=(--product-contract-sha256 "$RECOVERY_PAYLOAD_PRODUCT_DIGEST")
+  fi
+  python3 "$ASSURANCE_MODULE" record-success \
+    --remote-filename "$REMOTE_FILE" \
+    --archive-bytes "$ARCHIVE_BYTES" \
+    --archive-sha256 "$ARCHIVE_SHA256" \
+    --backup-script-version "$SCRIPT_VERSION" \
+    --archive-format-version "$RECOVERY_ARCHIVE_FORMAT" \
+    --recovery-class "$RECOVERY_ARCHIVE_CLASS" \
+    --retention-days "$RETENTION_DAYS" \
+    --git-sha "$GIT_SHA_RAW" --git-branch "$GIT_BRANCH_RAW" \
+    --git-detached "$GIT_DETACHED_DISPLAY" --git-dirty "$GIT_DIRTY_DISPLAY" \
+    "${PRODUCT_CONTRACT_ARGS[@]}" \
+    --database-catalog true \
+    --archive-integrity true \
+    --runtime-extractable true \
+    --recovery-policy-satisfied "$RECOVERY_POLICY_SATISFIED_DISPLAY" \
+    --remote-promotion true \
+    || echo "Warning: failed to record backup-assurance success receipt (backup itself succeeded and was uploaded)." >&2
+
   echo "IsadoraAir backup completed successfully."
 fi

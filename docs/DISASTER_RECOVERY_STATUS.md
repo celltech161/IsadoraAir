@@ -549,6 +549,161 @@ media only ever SUPPLIES the same flags an operator could type by hand.
 
 ---
 
+## Recurring disaster-recovery assurance -- Phase 6 (r0060)
+
+Phases 1-5 (above) proved the backup/restore MECHANISM works. Phase 6
+makes proving it a RECURRING, evidenced, monitored fact rather than
+something re-verified by hand each time someone remembers to. This
+section is the durable policy record; see `isadoraair/backup_assurance.py`
+for the exact receipt schemas, `monitoring/services/probes.py`'s
+`probe_backup` for the Monitoring integration, and
+`deploy/verify_backup_roundtrip.sh` for the weekly verifier itself.
+
+**Remote retention remains 30 days** -- unchanged by Phase 6.
+
+**Every normal nightly backup** (`deploy/backup_isadoraair.sh`, timer
+unchanged: `isadoraair-backup.timer`, 03:30, `Persistent=true`,
+`RandomizedDelaySec=300`) now performs, in order:
+
+1. `pg_dump -Fc`.
+2. `pg_restore --list` against the fresh dump -- read-only, no DB
+   connection, proves the catalog is actually readable before anything
+   uploads. Failure aborts the backup before upload (fail-closed).
+3. Archive integrity validation (`tar -tzf` on the finished archive).
+4. Runtime Foundation safe-extractability / current-station-policy
+   validation (unchanged from r0046 -- see the header comments in
+   `deploy/backup_isadoraair.sh`).
+5. Encrypted recovery-credential preservation, where configured
+   (unchanged from Phase 4.5).
+6. Atomic remote promotion (`.partial` -> final rename, same-session
+   retention pruning).
+
+A **durable, nonsecret attempt receipt** (`last-attempt.json`) is
+written `running` near the very start of the run and updated to
+`success`/`failed` on exit, preserving the script's own original exit
+code even if the receipt write itself fails. A separate, richer
+**success receipt** (`last-success.json`) is written ONLY after step 6
+above has actually completed -- never claims remote promotion that
+hasn't happened. Both live under
+`$HOME/.local/state/isadoraair/backup-assurance/` (directory mode
+0700, files mode 0600). `DRY_RUN=1` never touches either receipt.
+
+**Git checkout cleanliness** is captured once per run (exact HEAD,
+branch-or-detached, dirty true/false/unknown -- never raw `git status`
+output or filenames) and recorded in both `MANIFEST.txt` and the
+receipts. A dirty checkout does **not** abort the backup -- the DB/
+config/media backup is still a fully valid operational backup -- but:
+
+- it is **not eligible to become the canonical sealed recovery
+  authority** (see "Rollback / canonical recovery authority" below);
+- Monitoring surfaces it as **WARNING**, not silently;
+- the recorded Git SHA on a dirty backup does **not** reconstruct the
+  exact code that was running.
+
+`deploy/restore/inspect_backup.sh` parses and displays this metadata.
+An archive predating Phase 6 (no cleanliness lines at all) reads as
+WARN/not-applicable, never a structural FAIL -- and a current archive
+that honestly reports dirty also WARNs, never fails archive structure.
+The backup archive format was **not** bumped for this -- purely
+additive `MANIFEST.txt` lines, no new archive member, no change to
+`runtime-recovery-archive.json`'s own format/class semantics.
+
+**Weekly remote round-trip verification**
+(`deploy/verify_backup_roundtrip.sh`, optional units
+`isadoraair-backup-verify.service`/`.timer`, Sunday 06:30 local,
+`Persistent=true`, `RandomizedDelaySec=900`, deliberately NOT coupled
+to the nightly timer/unit) re-proves the **exact** promoted remote
+object is still there and valid:
+
+1. reads `last-success.json` (never lists/globs the remote directory to
+   guess the newest backup);
+2. validates the recorded filename against the IsadoraAir backup
+   naming contract;
+3. downloads that exact object into a private mode-0700 temp dir;
+4. requires its SHA256 to match the receipt exactly;
+5. reruns `deploy/restore/inspect_backup.sh` against the download;
+6. extracts only `database.dump` and reruns `pg_restore --list`;
+7. requires the archive's own `MANIFEST.txt` Git SHA to equal the
+   receipt's Git SHA, that commit to exist in the local IsadoraAir
+   repository, and to be an ancestor of local canonical `main`;
+8. deletes every downloaded/extracted artifact on every exit path.
+
+This does **not** re-implement P1 1.16's exact release-introduction/
+canonical-release resolver -- exact SHA agreement plus local commit
+existence/`main` ancestry is sufficient recurring assurance for Phase
+6. A separate `roundtrip-last-attempt.json`/`roundtrip-last-success.json`
+receipt pair (same durable-state directory, same security invariants)
+tracks this independently of the nightly receipts. The verifier is
+strictly read-only against the remote (never deletes/mutates the
+archive) and against the local database (never runs an actual restore).
+
+**Monitoring integration**: a new `backup` `MonitorCheck` kind
+(`probe_backup`, read-only, local, no SFTP/DB access -- safe on the
+normal ~10s poll loop) reuses the existing `MonitorCheck`/
+`PROBE_DISPATCH`/`SystemEvent`/notification machinery, no parallel
+alerting path. Default policy (first implementation):
+
+| Signal | Warning | Critical |
+|---|---|---|
+| Nightly backup freshness | > 28h since last success | > 36h |
+| Running attempt | -- | stuck > 2h |
+| Newest completed attempt failed, newer than last success | -- | immediate |
+| Dirty successful backup | immediate | -- |
+| Unknown cleanliness | immediate | -- |
+| Weekly round-trip freshness | > 8 days | > 14 days |
+| Explicit weekly round-trip failure, newer than last success | -- | immediate |
+
+No receipts yet (fresh install) reports `UNKNOWN`, never a misleading
+`OK`. A malformed/corrupt receipt after initialization fails closed as
+`CRITICAL`. A materially-future timestamp is rejected as `CRITICAL`.
+The migration (`monitoring.0013_backup_recovery_assurance_check`) is
+additive-only -- it adds the `"backup"` `MonitorCheck.kind` choice and
+nothing else; it does **not** create any check row, automatically or
+otherwise (no `RunPython`, no `post_migrate` signal, no AppConfig
+startup hook, no hidden get-or-create). A backup-configured station
+instead creates/configures the "Backup Recovery Assurance" check
+**explicitly**, during Phase 6 activation, once the new nightly/round-
+trip receipts already exist -- with the recommended settings
+`kind=backup`, `show_as_card=True`, `notify_on_warning=True`,
+`notify_on_critical=True`, `consecutive_failures_required=1`, and
+`enabled=True` only after that initial acceptance.
+
+**Quarterly**: a lightweight isolated/offline restore acceptance
+through restore Stage 95, using the current sealed recovery media (not
+a fresh backup -- the point is proving the SEALED media still restores).
+
+**At least annually**, or after a MATERIAL recovery-contract change --
+backup archive-format incompatibility; material restore-stage/restore-
+ledger semantics; Ubuntu baseline change; protected updater bootstrap/
+trust reconstruction change; Runtime Foundation provisioning/payload
+contract change; offline dependency-closure change; PostgreSQL restore/
+authentication contract change; companion provisioning contract change
+-- a full fresh-machine E8-style recovery exercise is required. Ordinary
+UI/scheduler/library/audio-feature work does **not**, by itself, trigger
+this requirement.
+
+**Rollback / canonical recovery authority is unchanged by Phase 6**: a
+newer nightly backup, even a clean successful one, does NOT
+automatically become the accepted sealed recovery authority -- that
+still requires formal inspection, exact source/release evidence,
+dependency-closure provenance, complete checksums, and final archive
+sealing, exactly as established in earlier phases above. A dirty-
+worktree backup remains a useful operational backup but can never
+become canonical recovery authority, full stop. The age private
+recovery identity remains separate/off-host by default, unchanged.
+
+**Distinguishing the five DR artifacts** (do not conflate these):
+
+| Artifact | What it proves | Cadence |
+|---|---|---|
+| Nightly operational backup | DB/config/media captured + uploaded just now | Nightly, 03:30 |
+| Weekly round-trip assurance | The LAST successful backup is still intact on the remote | Weekly, Sun 06:30 |
+| Sealed canonical recovery media | A formally inspected, provenance-complete, checksummed E8 export | Only on explicit formal sealing |
+| Quarterly restore exercise | The sealed media still restores, offline/isolated | Quarterly |
+| Annual/material-change full E8 | A genuine fresh-machine recovery, start to finish | Annually, or on material contract change |
+
+---
+
 ## Format notes for future updates to this file
 
 - Update the "Current state" table and "Next single action" at the end

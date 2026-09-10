@@ -1101,6 +1101,72 @@ class InspectBackupFunctionalTests(SimpleTestCase):
         self.assertIn("0775", result.stdout)
 
 
+class InspectBackupGitCleanlinessTests(InspectBackupFunctionalTests):
+    """r0060 Phase 6, section B -- inspect_backup.sh parsing/displaying
+    the new "IsadoraAir Git Branch"/"IsadoraAir Git Dirty"/"Database
+    catalog check" manifest lines. Subclasses InspectBackupFunctionalTests
+    purely to reuse its _build_archive/_run_inspect helpers, not its
+    test methods."""
+
+    def _minimal_archive(self, tmp_subdir, manifest_extra_lines):
+        workdir = self.tmpdir / tmp_subdir
+        workdir.mkdir()
+        (workdir / "MANIFEST.txt").write_text(
+            "IsadoraAir disaster-recovery backup manifest\n"
+            "Backup script version: 3.2.0\n"
+            "Created (UTC):          2026-09-10T03:30:00+00:00\n"
+            "IsadoraAir Git SHA:     " + "a" * 40 + "\n"
+            + manifest_extra_lines,
+        )
+        (workdir / "database.dump").write_bytes(b"PGDMP" + b"\x00" * 100)
+        app_dir = self.tmpdir / f"{tmp_subdir}_app" / "isadoraair"
+        app_dir.mkdir(parents=True)
+        (app_dir / "manage.py").write_text("#!/usr/bin/env python\n")
+        (app_dir / ".env").write_text("SECRET_KEY=test\n")
+        with tarfile.open(workdir / "app.tar.gz", "w:gz") as tf:
+            tf.add(app_dir, arcname="isadoraair")
+        archive_path = self.tmpdir / f"{tmp_subdir}.tar.gz"
+        self._build_archive(workdir, archive_path)
+        return archive_path
+
+    def test_clean_checkout_passes_with_positive_evidence(self):
+        archive_path = self._minimal_archive(
+            "clean",
+            "IsadoraAir Git Branch:  main\n"
+            "IsadoraAir Git Dirty:   false\n"
+            "Database catalog check (pg_restore --list): ok\n",
+        )
+        result = self._run_inspect(archive_path)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("OVERALL: PASS", result.stdout)
+        self.assertIn("clean at backup time", result.stdout)
+        self.assertIn("Database catalog check", result.stdout)
+
+    def test_dirty_checkout_warns_but_does_not_fail_the_archive(self):
+        archive_path = self._minimal_archive(
+            "dirty",
+            "IsadoraAir Git Branch:  main\n"
+            "IsadoraAir Git Dirty:   true\n"
+            "Database catalog check (pg_restore --list): ok\n",
+        )
+        result = self._run_inspect(archive_path)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("OVERALL: PASS", result.stdout)
+        self.assertIn("WARN", result.stdout)
+        self.assertIn("DIRTY at backup time", result.stdout)
+        self.assertIn("NOT eligible to become the canonical sealed recovery authority", result.stdout)
+
+    def test_old_archive_without_cleanliness_metadata_is_warn_not_fail(self):
+        """An archive predating this feature (no 'IsadoraAir Git Dirty:'
+        line at all) must remain structurally valid -- WARN/not-
+        applicable, never a structural FAIL."""
+        archive_path = self._minimal_archive("legacy", "")
+        result = self._run_inspect(archive_path)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("OVERALL: PASS", result.stdout)
+        self.assertIn("not applicable, not a failure", result.stdout)
+
+
 class RestoreLocateRecoveryPayloadFunctionalTests(SimpleTestCase):
     """Runtime Foundation E7B -- real subprocess execution of lib.sh's
     restore_locate_recovery_payload against small synthetic backup-v3-

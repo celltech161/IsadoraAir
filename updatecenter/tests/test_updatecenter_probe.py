@@ -342,3 +342,45 @@ class ActualMonitoringWeatherKindMigrationClassificationTests(SimpleTestCase):
             classifications[0]["detail"],
             "field definition differs only in approved non-database metadata",
         )
+
+
+class ActualMonitoring0013ClassificationTests(SimpleTestCase):
+    """r0060 (P0 1.2 Phase 6) adds another new MonitorCheck.kind choice
+    -- Django generates an AlterField for this (choices is part of the
+    field's deconstructed kwargs, approved non-database metadata, same
+    reasoning as 0012 above). Deliberately additive-ONLY: no RunPython
+    (see that migration's own header for why a data-seeding step was
+    removed -- the default "Backup Recovery Assurance" row is created
+    explicitly during station Phase 6 activation instead). Proves the
+    ACTUAL on-disk migration Update Center will encounter classifies
+    fully additive, remaining eligible for the ordinary automatic
+    migration path with no manual review required."""
+
+    def test_every_actual_monitoring_0013_operation_is_additive(self):
+        loader = MigrationLoader(None)
+        migration_key = ("monitoring", "0013_backup_recovery_assurance_check")
+        migration = loader.disk_migrations[migration_key]
+        state = loader.project_state([("monitoring", "0012_alter_monitorcheck_kind")])
+        classifications = []
+
+        for operation in migration.operations:
+            before_state = state.clone()
+            operation.state_forwards("monitoring", state)
+            classifications.append(
+                _classify_operation(
+                    operation, app_label="monitoring", before_state=before_state, after_state=state,
+                )
+            )
+
+        # No RunPython -- proves the migration was not left carrying any
+        # data-seeding step.
+        self.assertNotIn("RunPython", [item["operation"] for item in classifications])
+
+        self.assertEqual(len(classifications), 1)
+        self.assertEqual(classifications[0]["operation"], "AlterField")
+        self.assertEqual(classifications[0]["classification"], "additive")
+        self.assertEqual(
+            classifications[0]["detail"],
+            "field definition differs only in approved non-database metadata",
+        )
+        self.assertNotIn("manual", {item["classification"] for item in classifications})

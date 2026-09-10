@@ -120,6 +120,7 @@ Timer-driven jobs (fire on a schedule, exit):
 | `isadoraair-web-requests-catalog.timer` | Every 15min — sends the eligible music catalog and 168-hour availability grid to the configured public website. No-op unless Web Requests is enabled. |
 | `isadoraair-aircheck-buffer.timer` | Every minute — rolls over the always-on Aircheck idle working buffer (`/run/isadoraair/aircheck-current.audio`) via the existing `aircheck.reopen` telnet call once it grows past a hard-coded 64 MiB safety limit, but only when no Aircheck session is active. `Nice=19`. Never starts/restarts encoders and fails safely (retries next cycle) if Liquidsoap is unreachable. |
 | `isadoraair-backup.timer` | Nightly full backup (03:30) — runs the repo-managed `deploy/backup_isadoraair.sh`; needs remote-target creds (`@@ISA_HOME@@/.iasboxbu.cred`) outside the repo |
+| `isadoraair-backup-verify.timer` | **Optional** (r0060 Phase 6) — weekly (Sun 06:30) real remote round-trip re-verification of the last successful nightly backup; runs `deploy/verify_backup_roundtrip.sh`; needs the same `@@ISA_HOME@@/.iasboxbu.cred`. Not auto-enabled — enable explicitly once nightly backup receipts exist (see `docs/DISASTER_RECOVERY_STATUS.md`'s Phase 6 section) |
 | `isadoraair-prune-emaillog.timer` | Daily (04:15) EmailLog retention prune, 90-day default |
 | `isadoraair-prune-systemevents.timer` | Daily (04:24) SystemEvent retention prune |
 | `isadoraair-mitd-prep.timer` | Weekly (Mon 10:15) MITD show file staging |

@@ -32,6 +32,21 @@ remote target configured in `~/.iasboxbu.cred` (never in the repo), with
 own exact contents, exclusions, script version, and the IsadoraAir Git
 SHA it was taken alongside.
 
+**Phase 6 recurring assurance (r0060)**: every normal nightly run also
+records the exact Git branch and a true/false/unknown dirty-checkout
+flag (never raw `git status` output or filenames) in `MANIFEST.txt`,
+runs `pg_restore --list` against the fresh dump before upload (read-only,
+no DB connection), and writes durable, nonsecret backup-assurance
+receipts under `$HOME/.local/state/isadoraair/backup-assurance/` that
+Monitoring's `backup` check surfaces. A dirty checkout does not abort
+the backup, but the recorded SHA on a dirty backup does **not**
+reconstruct uncommitted code, and such a backup cannot become the
+canonical sealed recovery authority. A separate weekly job
+(`deploy/verify_backup_roundtrip.sh`) re-proves the last promoted
+remote archive is still intact. See
+`docs/DISASTER_RECOVERY_STATUS.md`'s "Recurring disaster-recovery
+assurance -- Phase 6 (r0060)" section for the complete policy.
+
 **Current script version is 3.0.0** (Runtime Foundation E7B,
 2026-08-29) — it *can* carry an operator-prepared Runtime Foundation E7
 disaster-recovery payload (Kokoro/Piper runtime material and/or
