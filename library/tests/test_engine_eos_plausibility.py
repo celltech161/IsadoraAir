@@ -41,6 +41,7 @@ reflect the deck's real, unseeked position -- otherwise the dashboard,
 crossfade timing, and pause/resume state all keep reporting a target
 the deck never actually reached."""
 import inspect
+import os
 import tempfile
 import threading
 import time
@@ -340,8 +341,67 @@ def _pump_engine(engine, predicate, timeout=3.0):
     return predicate()
 
 
+def _settle_teardowns_then_stop(engine, timeout=10.0):
+    """addCleanup helper for every gated-seek test class below, used in
+    place of calling .stop() on each per-slot BoundedTeardownCoordinator
+    directly. .stop() only asks an idle worker to exit -- per its own
+    docstring, it "deliberately never joins a hung one" -- and, more
+    importantly, a worker with a still-nonempty queue keeps draining
+    it even after _stopping is set, rather than abandoning the backlog.
+    A test that dispatches many deck removals without individually
+    waiting on each one's real NULL transition (repeated-cycle and
+    stress tests especially) can therefore leave a same-named
+    "deck-real-<slot>-test-worker" thread genuinely alive and still
+    working for a little while after the test method itself returns --
+    long enough, in practice, to confuse an unrelated LATER test's own
+    threading.enumerate()-based assertions about ITS OWN identically-
+    named worker (test_engine_deck_lifecycle.py's _make_real_engine()
+    fixture hardcodes that name per slot, not per test instance).
+    Waiting here for each coordinator to have fully drained its queue
+    BEFORE calling .stop() means no test in this file ever hands off a
+    backlog to whatever runs next."""
+    for slot in ("A", "B"):
+        coordinator = engine._deck_teardowns.get(slot)
+        if coordinator is None:
+            continue
+
+        def _settled(coordinator=coordinator):
+            snap = coordinator.snapshot()
+            return snap["queue_depth"] == 0 and snap["active_generation"] is None
+
+        _pump_engine(engine, _settled, timeout=timeout)
+        coordinator.stop()
+
+
 def _pump_until_seek_resolved(engine, deck, timeout=3.0):
     return _pump_engine(engine, lambda: deck.gated_seek is None, timeout=timeout)
+
+
+def _pump_until_seeking(engine, deck, timeout=3.0):
+    return _pump_engine(
+        engine,
+        lambda: deck.gated_seek is not None and deck.gated_seek["phase"] == "seeking",
+        timeout=timeout,
+    )
+
+
+def _controllable_seek(hold_event, real_seek_simple):
+    """A seek_simple() replacement that parks the calling thread (the
+    real background worker _dispatch_gated_seek_call starts) on
+    hold_event until the test releases it, THEN performs the real,
+    original seek_simple() call underneath -- so a released hold still
+    exercises a genuine flush/position change, not a fake success. Lets
+    a lifecycle-collision test land its action while the native call is
+    DETERMINISTICALLY, verifiably still "in flight" (phase ==
+    "seeking"), without needing an actual GStreamer-level hang -- the
+    seam the r0063 ownership-invariant hardening report's stress harness
+    needs."""
+
+    def _fn(*args, **kwargs):
+        hold_event.wait()
+        return real_seek_simple(*args, **kwargs)
+
+    return _fn
 
 
 class GatedSeekSuccessTests(TransactionTestCase):
@@ -360,8 +420,7 @@ class GatedSeekSuccessTests(TransactionTestCase):
         self.engine, self.temp_dir, self.track, self.log_item = _gated_seek_fixture()
         self.addCleanup(self.temp_dir.cleanup)
         self.addCleanup(lambda: self.engine.main_pipeline.set_state(Gst.State.NULL))
-        self.addCleanup(lambda: self.engine._deck_teardowns["A"].stop())
-        self.addCleanup(lambda: self.engine._deck_teardowns["B"].stop())
+        self.addCleanup(lambda: _settle_teardowns_then_stop(self.engine))
         self.engine.main_pipeline.set_state(Gst.State.PLAYING)
 
     def test_successful_manual_seek_lands_on_target_with_no_position_zero_leakage(self):
@@ -457,8 +516,7 @@ class GatedSeekRejectionTests(TransactionTestCase):
         self.engine, self.temp_dir, self.track, self.log_item = _gated_seek_fixture()
         self.addCleanup(self.temp_dir.cleanup)
         self.addCleanup(lambda: self.engine.main_pipeline.set_state(Gst.State.NULL))
-        self.addCleanup(lambda: self.engine._deck_teardowns["A"].stop())
-        self.addCleanup(lambda: self.engine._deck_teardowns["B"].stop())
+        self.addCleanup(lambda: _settle_teardowns_then_stop(self.engine))
         self.engine.main_pipeline.set_state(Gst.State.PLAYING)
 
     def test_manual_seek_rejection_rebases_pad_timeline_to_actual_zero(self):
@@ -552,8 +610,7 @@ class GatedSeekAbandonmentTests(TransactionTestCase):
         self.engine, self.temp_dir, self.track, self.log_item = _gated_seek_fixture()
         self.addCleanup(self.temp_dir.cleanup)
         self.addCleanup(lambda: self.engine.main_pipeline.set_state(Gst.State.NULL))
-        self.addCleanup(lambda: self.engine._deck_teardowns["A"].stop())
-        self.addCleanup(lambda: self.engine._deck_teardowns["B"].stop())
+        self.addCleanup(lambda: _settle_teardowns_then_stop(self.engine))
         self.engine.main_pipeline.set_state(Gst.State.PLAYING)
 
     def test_stuck_seek_call_is_abandoned_and_slot_recovers_at_zero(self):
@@ -591,3 +648,644 @@ class GatedSeekAbandonmentTests(TransactionTestCase):
         self.assertIsNot(replacement, stuck_deck)
         self.assertEqual(mock_emit.call_args_list[0].kwargs["level"], "critical")
         self.assertTrue(mock_emit.call_args_list[0].kwargs["detail"]["restart_recommended"])
+        # r0063 ownership-invariant hardening: the abandoned generation's
+        # mixer request pad is deliberately never released (touching it
+        # again risks the exact contention that just wedged it) -- that
+        # leak must be explicitly counted, not silent, and the mixer
+        # should show exactly one leaked pad plus the replacement's own
+        # fresh one.
+        self.assertEqual(self.engine._quarantined_seek_generation_count(), 1)
+        self.assertTrue(mock_emit.call_args_list[0].kwargs["detail"]["mixer_request_pad_leaked"])
+        self.assertEqual(
+            mock_emit.call_args_list[0].kwargs["detail"]["cumulative_quarantined_generations"], 1
+        )
+        self.assertEqual(len(tuple(self.engine.mixer.sinkpads)), 2)
+
+
+class NeverPrerolledTests(TransactionTestCase):
+    """_advance_gated_seek's "prerolling" phase: the gate condition
+    (a first BLOCK_DOWNSTREAM hit) may simply never arrive -- a source
+    that never produces any data at all, real-world analog being e.g. a
+    file on a wedged network mount. Forced deterministically here with a
+    named pipe (FIFO) as the track's own file, with a background thread
+    holding the WRITE end permanently open but never writing a byte to
+    it: filesrc's open() (synchronous, part of the fast NULL->READY
+    state change) completes immediately since a writer is already
+    present, but every subsequent read() then blocks forever on
+    decodebin's own internal streaming thread -- typefind/decodebin
+    genuinely never receive a single byte, so no sticky event, no
+    buffer, nothing ever reaches the gate. (A bare FIFO with no writer
+    at all was tried first and rejected: filesrc's open() itself then
+    blocks -- on the calling GLib/test thread, synchronously, as part of
+    _create_deck -- which would hang this test's own process, not just
+    the deck being tested.)"""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory(prefix="isadoraair-never-prerolled.")
+        self.addCleanup(self.temp_dir.cleanup)
+        self.fifo_path = Path(self.temp_dir.name) / "never-arrives.wav"
+        os.mkfifo(self.fifo_path)
+        # os.open(..., O_WRONLY) on a FIFO blocks until a reader opens
+        # it too -- filesrc (the reader) doesn't attempt that until the
+        # test method actually triggers deck creation, so this thread is
+        # started here but not waited on until then. Once both ends are
+        # open, this thread just sits there forever -- daemon, never
+        # joined, the fd intentionally never closed or written to for
+        # the rest of the test.
+        self._fifo_writer_fd = None
+        self._fifo_writer_opened = threading.Event()
+
+        def _hold_fifo_writer_open():
+            self._fifo_writer_fd = os.open(str(self.fifo_path), os.O_WRONLY)
+            self._fifo_writer_opened.set()
+
+        threading.Thread(target=_hold_fifo_writer_open, daemon=True).start()
+
+        self.engine = _make_real_engine()
+        # Deliberately NOT a bare main_pipeline.set_state(NULL) -- see
+        # _detach_never_nulled_stuck_deck's own docstring. Registered
+        # BEFORE that NULL cleanup so it runs AFTER it (addCleanup is
+        # LIFO): detach the still-abandoned FIFO deck first, then NULL
+        # the (now child-free-of-it) pipeline.
+        self.addCleanup(lambda: self.engine.main_pipeline.set_state(Gst.State.NULL))
+        self.addCleanup(lambda: self._detach_never_nulled_stuck_deck("A"))
+        self.addCleanup(lambda: _settle_teardowns_then_stop(self.engine))
+        self.track = _make_track(self.fifo_path, track_id=1, duration=6.0, title="Never Prerolls")
+        self.log_item = _make_log_item(self.track, item_id=1)
+        self.engine.main_pipeline.set_state(Gst.State.PLAYING)
+
+    def _detach_never_nulled_stuck_deck(self, slot):
+        """This test class deliberately leaves ITS OWN never-prerolled,
+        FIFO-blocked deck in place rather than ever calling _remove_deck
+        on it (see the test method's own comment on why that specific
+        removal is unsafe). But main_pipeline.set_state(Gst.State.NULL)
+        -- an ordinary, otherwise-harmless cleanup step every other test
+        class in this file uses -- would ITSELF then hang forever
+        transitioning that same stuck child bin to NULL as part of
+        nulling the whole pipeline. Confirmed directly: this exact
+        sequence (leave deck A in place, then main_pipeline.set_state
+        (NULL)) hangs the test process, not just the deck.
+        Unlink+remove (proven fast/safe elsewhere in this file for
+        exactly this reason) detaches it from main_pipeline WITHOUT
+        ever calling set_state on it, so the pipeline's own NULL
+        transition no longer has to wait on it -- the bin itself is
+        simply leaked (never reaches NULL, matching this whole design's
+        established "abandon it, never touch it again" posture for a
+        generation something might still be blocked inside)."""
+        deck = self.engine.decks.get(slot)
+        if deck is None:
+            return
+        try:
+            src_pad = deck.pipeline.get_static_pad("src")
+            if deck.mixer_pad is not None:
+                src_pad.unlink(deck.mixer_pad)
+                self.engine.mixer.release_request_pad(deck.mixer_pad)
+            self.engine.main_pipeline.remove(deck.pipeline)
+        except Exception:
+            pass
+
+    def test_never_prerolled_resolves_boundedly_with_truthful_zero_position(self):
+        with (
+            patch.object(eng_module, "DECK_SEEK_PREROLL_TIMEOUT_SECONDS", 0.3),
+            # _log_item_playable's Path(fp).is_file() check rejects a
+            # FIFO outright (it isn't a regular file) -- bypassed here so
+            # _create_deck reaches real GStreamer construction at all;
+            # the FIFO itself is what then keeps decode from ever
+            # producing anything, which is the actual thing under test.
+            patch.object(eng_module, "_log_item_playable", return_value=(True, None)),
+        ):
+            # _begin_gated_seek directly, not _seek_deck -- _seek_deck
+            # requires an already-occupied slot to seek FROM (it reads
+            # log_item off the existing deck), which is irrelevant here:
+            # this test wants a freshly gated deck targeting the FIFO
+            # from an empty slot, exactly the shared primitive
+            # _seek_deck/_resume_deck both call into regardless.
+            self.engine._begin_gated_seek("A", self.log_item, 3.0, was_paused=False)
+            deck = self.engine.decks["A"]
+            self.assertIsNotNone(deck)
+            self.assertIsNotNone(deck.gated_seek)
+            # Confirms the fixture itself actually connected (filesrc's
+            # read-side open unblocked the writer thread's open too) --
+            # if this is ever false the test below would otherwise be
+            # trivially/vacuously true for the wrong reason.
+            self.assertTrue(self._fifo_writer_opened.wait(timeout=2.0))
+
+            with patch.object(eng_module, "emit_event") as mock_emit, patch("builtins.print"):
+                resolved = _pump_until_seek_resolved(self.engine, deck, timeout=3.0)
+
+        # Bounded resolution -- no hang, no stale gated-seek record.
+        self.assertTrue(resolved)
+        self.assertIsNone(deck.gated_seek)
+        # No false seek success: rejected, not accepted -- the file
+        # never even opened, so decode genuinely never started.
+        self.assertEqual(mock_emit.call_args.kwargs["title"], "Deck seek rejected")
+        self.assertEqual(mock_emit.call_args.kwargs["detail"]["fallback_seconds"], 0.0)
+        # Truthful playback/timing state: started_at reflects "now",
+        # not the never-reached target.
+        self.assertAlmostEqual(deck.started_at, time.time(), delta=0.5)
+        self.assertIsNone(deck.seeked_at)
+        # Deliberately NOT calling _remove_deck(deck) here. A "never
+        # prerolled" outcome only tells us the GATE condition never
+        # arrived within DECK_SEEK_PREROLL_TIMEOUT_SECONDS -- it says
+        # nothing about WHY. In this test the reason is a permanently
+        # blocked filesrc read(), and _remove_deck's deferred
+        # set_state(NULL) on a bin whose filesrc is stuck in a blocking
+        # read can hang the SAME way an unresolved native seek call can
+        # -- confirmed empirically (attempting it here left a genuinely
+        # permanent "deck-real-a-test-worker" thread, since nothing ever
+        # closes this test's own FIFO writer). That specific hazard --
+        # a hung underlying source, as opposed to a hung native seek
+        # call -- is pre-existing and orthogonal to gated seeking
+        # (equally present for a perfectly ordinary, non-seek fresh
+        # track start against the same kind of hung source) and out of
+        # scope for this hardening pass; noted for the report rather
+        # than fixed here. What this test verifies is the rejected-seek
+        # fallback itself (already asserted above): truthful position,
+        # no false success, no stale gated-seek record -- and that a
+        # SEPARATE slot remains completely unaffected by this one
+        # deliberately-abandoned generation.
+        real_wav = Path(self.temp_dir.name) / "real.wav"
+        _write_wav(real_wav, frames=6 * 44100)
+        real_track = _make_track(real_wav, track_id=2, duration=6.0, title="Real Track")
+        real_log_item = _make_log_item(real_track, item_id=2)
+        self.engine._create_deck("B", real_log_item, resume_position_ns=0)
+        self.assertIsNotNone(self.engine.decks["B"])
+        self.assertTrue(_pump_engine(self.engine, lambda: self.engine.decks["B"].media_buffer_count > 0))
+        self.addCleanup(lambda: self.engine._remove_deck(self.engine.decks["B"]))
+
+
+class AcceptedUnconfirmedTests(TransactionTestCase):
+    """_advance_gated_seek's "confirming" phase: seek_simple() itself
+    returns True (the native call is no longer executing, so nothing
+    here risks racing it), but no fresh buffer ever reaches the gate to
+    POSITIVELY confirm decode actually resumed at the claimed position.
+    Forced deterministically by overriding seek_simple with a pure no-op
+    that lies "True" without performing any real seek at all -- nothing
+    flushes the block probe's already-held first hit, so no second hit
+    can ever arrive."""
+
+    def setUp(self):
+        self.engine, self.temp_dir, self.track, self.log_item = _gated_seek_fixture()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.addCleanup(lambda: self.engine.main_pipeline.set_state(Gst.State.NULL))
+        self.addCleanup(lambda: _settle_teardowns_then_stop(self.engine))
+        self.engine.main_pipeline.set_state(Gst.State.PLAYING)
+
+    def test_accepted_unconfirmed_is_never_reported_as_successful(self):
+        self.engine._create_deck("A", self.log_item, resume_position_ns=0)
+        self.assertTrue(_pump_engine(self.engine, lambda: self.engine.decks["A"].media_buffer_count > 0))
+
+        self.engine._seek_deck("A", 3.0)
+        deck = self.engine.decks["A"]
+        # Overridden immediately -- see the same race note in
+        # GatedSeekRejectionTests: _dispatch_gated_seek_call fires the
+        # instant the block probe's first hit is observed, which can
+        # happen before a test-side wait for a later phase would ever
+        # get scheduled.
+        deck.pipeline.seek_simple = lambda *a, **kw: True  # accepts, but performs no real seek
+
+        with (
+            patch.object(eng_module, "DECK_SEEK_POST_SEEK_CONFIRM_TIMEOUT_SECONDS", 0.3),
+            patch.object(eng_module, "emit_event") as mock_emit,
+            patch("builtins.print"),
+        ):
+            resolved = _pump_until_seek_resolved(self.engine, deck, timeout=3.0)
+
+        # Bounded timeout -- no hang, no stale gated-seek record.
+        self.assertTrue(resolved)
+        self.assertIsNone(deck.gated_seek)
+        # No target falsely reported as reached.
+        self.assertEqual(mock_emit.call_args.kwargs["title"], "Deck seek unconfirmed -- replaced at zero")
+        self.assertEqual(mock_emit.call_args.kwargs["detail"]["target_seconds"], 3.0)
+        self.assertEqual(mock_emit.call_args.kwargs["detail"]["fallback_seconds"], 0.0)
+        # Safe fallback semantics -- the original (unconfirmed) generation
+        # is genuinely retired (not left playing, not left leaked), and a
+        # fresh, honest replacement takes over the slot, at position 0
+        # (no stale target-based pad offset survives onto it).
+        self.assertTrue(deck.finished)
+        self.assertTrue(deck.retirement_started)
+        replacement = self.engine.decks["A"]
+        self.assertIsNotNone(replacement)
+        self.assertIsNot(replacement, deck)
+        self.assertIsNone(replacement.seeked_at)
+        self.assertAlmostEqual(replacement.started_at, time.time(), delta=0.5)
+        # No leaked pad here -- unlike timeout_abandon, the native call
+        # already returned, so full, ordinary cleanup was safe.
+        self.assertEqual(self.engine._quarantined_seek_generation_count(), 0)
+        self.assertEqual(len(tuple(self.engine.mixer.sinkpads)), 1)
+        self.assertEqual(len(self.engine._deck_bin_map), 1)
+        # Engine continues -- the replacement itself is a completely
+        # normal, healthy deck.
+        self.assertTrue(_pump_engine(self.engine, lambda: replacement.media_buffer_count > 0))
+
+
+class GatedSeekLifecycleCollisionTests(TransactionTestCase):
+    """The ownership invariant this whole hardening pass exists for:
+    *no thread may destructively mutate or retire a Gst.Bin while an
+    unresolved native seek call can still be operating on that same
+    bin*. Exercised with _controllable_seek, which parks the REAL
+    background worker _dispatch_gated_seek_call starts on a
+    threading.Event -- phase == "seeking" here means a native call is
+    GENUINELY, verifiably still executing, not merely "recently
+    dispatched"."""
+
+    def setUp(self):
+        self.engine, self.temp_dir, self.track, self.log_item = _gated_seek_fixture()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.addCleanup(lambda: self.engine.main_pipeline.set_state(Gst.State.NULL))
+        self.addCleanup(lambda: _settle_teardowns_then_stop(self.engine))
+        self.engine.main_pipeline.set_state(Gst.State.PLAYING)
+
+    def _begin_inflight_seek(self, slot="A", target=3.0):
+        """Common setup for every scenario below: a real deck, seeked,
+        with its native call genuinely parked mid-flight. Returns
+        (deck, hold_event) -- the caller performs its collision action,
+        then must hold.set() to let the worker return before the test
+        ends (an unreleased Event just leaves one harmless permanently-
+        blocked daemon thread, matching GatedSeekAbandonmentTests'
+        module docstring, but releasing it keeps assertions about
+        eventual resolution meaningful)."""
+        self.engine._create_deck(slot, self.log_item, resume_position_ns=0)
+        self.assertTrue(_pump_engine(self.engine, lambda: self.engine.decks[slot].media_buffer_count > 0))
+        self.engine._seek_deck(slot, target)
+        deck = self.engine.decks[slot]
+        hold = threading.Event()
+        real_seek_simple = deck.pipeline.seek_simple
+        deck.pipeline.seek_simple = _controllable_seek(hold, real_seek_simple)
+        self.assertTrue(_pump_until_seeking(self.engine, deck))
+        return deck, hold
+
+    # -- A. Seek vs eject --
+
+    def test_eject_during_inflight_native_seek_is_deferred_not_destructive(self):
+        deck, hold = self._begin_inflight_seek()
+        mixer_pad_before = deck.mixer_pad
+        self.assertIsNotNone(mixer_pad_before)
+
+        self.engine._eject_deck("A")
+
+        # The native call may still be executing -- nothing about this
+        # generation may be destructively touched yet.
+        self.assertFalse(deck.finished)
+        self.assertFalse(deck.retirement_started)
+        self.assertIs(deck.mixer_pad, mixer_pad_before)
+        self.assertEqual(len(tuple(self.engine.mixer.sinkpads)), 1)
+        self.assertIn(id(deck.pipeline), self.engine._deck_bin_map)
+        # Still "occupying" its slot from the engine's own bookkeeping
+        # perspective -- eject hasn't (yet) actually happened.
+        self.assertIs(self.engine.decks["A"], deck)
+
+        hold.set()  # let the native call return
+
+        self.assertTrue(_pump_engine(self.engine, lambda: deck.finished))
+        self.assertTrue(deck.retirement_started)
+        self.assertIsNone(deck.gated_seek)
+        self.assertNotIn(id(deck.pipeline), self.engine._deck_bin_map)
+        # _eject_deck's own _finish() (print + _start_next_track) ran
+        # only once retirement actually completed; _start_next_track is
+        # a no-op in this fixture, so the slot is simply empty now.
+        self.assertIsNone(self.engine.decks["A"])
+        self.assertEqual(len(tuple(self.engine.mixer.sinkpads)), 0)
+        self.assertEqual(self.engine._quarantined_seek_generation_count(), 0)
+
+    # -- B. Seek vs replacement/crossfade --
+
+    def test_start_next_track_never_targets_a_slot_with_an_inflight_seek(self):
+        """_start_next_track's own (pre-existing, unmodified) slot-
+        occupancy guard -- `self.decks.get(slot) is not None` redirects
+        to _free_slot() -- already makes generation N+1 creation on the
+        SAME slot as an in-flight generation N structurally impossible:
+        _create_deck is never even called for that slot while it's
+        occupied, gated seek or not. Proven here against the REAL
+        (unmocked) _start_next_track, with _next_queue_item and
+        _create_deck stubbed only to keep the rest of the real method's
+        body (DB-backed request-scheduling, dedication splicing -- both
+        unrelated to the guard under test) from ever running: is_forced
+        =True and category_id=None on the stub log_item make the real
+        method skip straight from the guard to the _create_deck call
+        this test inspects."""
+        deck, hold = self._begin_inflight_seek()
+
+        with (
+            patch.object(self.engine, "_next_queue_item", return_value=(self.log_item, True)),
+            patch.object(self.engine, "_create_deck") as mock_create_deck,
+        ):
+            eng_module.PlaybackEngine._start_next_track(self.engine, slot="A")
+
+        # _create_deck was called (proving the guard didn't just bail
+        # out entirely) but never against slot "A" -- it redirected to
+        # the free slot "B" instead.
+        mock_create_deck.assert_called_once()
+        self.assertEqual(mock_create_deck.call_args.args[0], "B")
+
+        # Slot A itself, and its genuinely in-flight generation, are
+        # completely untouched.
+        self.assertIs(self.engine.decks["A"], deck)
+        self.assertFalse(deck.finished)
+        self.assertIsNotNone(deck.gated_seek)
+        self.assertEqual(deck.gated_seek["phase"], "seeking")
+
+        hold.set()
+        self.assertTrue(_pump_until_seek_resolved(self.engine, deck))
+
+    # -- C. Seek vs second seek --
+
+    def test_second_seek_during_genuinely_inflight_first_is_dropped(self):
+        deck, hold = self._begin_inflight_seek(target=3.0)
+        first_op = deck.gated_seek
+
+        with patch.object(eng_module, "emit_event") as mock_emit:
+            self.engine._seek_deck("A", 4.0)
+
+        # Dropped, not applied or queued -- the exact same op object,
+        # completely unmodified, still the one and only in-flight
+        # operation.
+        self.assertIs(deck.gated_seek, first_op)
+        mock_emit.assert_called_once()
+        self.assertEqual(mock_emit.call_args.kwargs["title"], "Seek request dropped (already in progress)")
+
+        hold.set()
+        self.assertTrue(_pump_until_seek_resolved(self.engine, deck))
+        # The FIRST seek's target is what's actually reached -- the
+        # dropped second request never influenced anything.
+        ok, pos = deck.pipeline.query_position(Gst.Format.TIME)
+        self.assertTrue(ok)
+        self.assertAlmostEqual(pos / Gst.SECOND, 3.0, delta=0.05)
+
+    def test_pause_during_genuinely_inflight_seek_is_dropped(self):
+        deck, hold = self._begin_inflight_seek()
+        with patch.object(eng_module, "emit_event") as mock_emit:
+            self.engine._pause_deck("A")
+
+        self.assertFalse(deck.paused)
+        mock_emit.assert_called_once()
+        self.assertEqual(mock_emit.call_args.kwargs["title"], "Pause request dropped (seek in flight)")
+
+        hold.set()
+        self.assertTrue(_pump_until_seek_resolved(self.engine, deck))
+
+    # -- D. Seek vs engine shutdown --
+
+    def test_shutdown_leaves_inflight_generation_untouched_and_remains_bounded(self):
+        deck, hold = self._begin_inflight_seek()
+        mixer_pad_before = deck.mixer_pad
+
+        # A second, ordinary (not in flight) deck on slot B, to prove
+        # shutdown still retires everything it safely can.
+        self.engine._create_deck("B", self.log_item, resume_position_ns=0)
+        self.assertTrue(_pump_engine(self.engine, lambda: self.engine.decks["B"].media_buffer_count > 0))
+        healthy_deck = self.engine.decks["B"]
+
+        start = time.monotonic()
+        with patch.object(eng_module, "emit_event") as mock_emit:
+            self.engine.stop()
+        elapsed = time.monotonic() - start
+
+        # Bounded -- stop() must not wait for the wedged native call.
+        self.assertLess(elapsed, 2.0)
+        # The in-flight generation is left completely untouched: never
+        # unlinked, never NULL'd, its mixer request pad never released.
+        self.assertFalse(deck.finished)
+        self.assertFalse(deck.retirement_started)
+        self.assertIs(deck.mixer_pad, mixer_pad_before)
+        self.assertIn(id(deck.pipeline), self.engine._deck_bin_map)
+        self.assertEqual(self.engine._quarantined_seek_generation_count(), 1)
+        self.assertTrue(
+            any(
+                call.kwargs.get("title") == "Deck left untouched at shutdown (seek in flight)"
+                for call in mock_emit.call_args_list
+            )
+        )
+        # The healthy, not-in-flight deck on the other slot WAS retired
+        # normally.
+        self.assertTrue(healthy_deck.retirement_started)
+        self.assertNotIn(id(healthy_deck.pipeline), self.engine._deck_bin_map)
+
+        # Deliberately NOT releasing `hold` here (unlike every other
+        # scenario in this class): main_pipeline is already NULL by this
+        # point (stop()'s own tail), and letting the real, wrapped
+        # seek_simple() run against a bin whose parent pipeline just
+        # changed state out from under it -- purely a test-process
+        # artifact, since production never touches these objects again
+        # after stop() either -- is a needless risk to this test run's
+        # own stability for no assertion this test still needs. One
+        # permanently-parked daemon thread is the same accepted cost as
+        # GatedSeekAbandonmentTests' own stuck-call scenario.
+
+
+class MixedLifecycleStressTests(TransactionTestCase):
+    """Repeated MIXED-operation cycles (not seek-only) against one
+    persistent engine/pipeline -- per the r0063 hardening report's
+    explicit request that normal-operation stress after the collision
+    hardening vary seek success, eject/recreate, pause/resume, rapid
+    back-to-back seeks, and ordinary remove/recreate, rather than only
+    ever repeating the single seek-cycle shape GatedSeekSuccessTests
+    already covers. No cumulative resource growth or ownership
+    ambiguity is acceptable across the whole run."""
+
+    def setUp(self):
+        self.engine, self.temp_dir, self.track, self.log_item = _gated_seek_fixture(duration_seconds=10.0)
+        self.addCleanup(self.temp_dir.cleanup)
+        self.addCleanup(lambda: self.engine.main_pipeline.set_state(Gst.State.NULL))
+        self.addCleanup(lambda: _settle_teardowns_then_stop(self.engine))
+        self.engine.main_pipeline.set_state(Gst.State.PLAYING)
+
+    def _snapshot(self):
+        return {
+            "mixer_sinkpads": len(tuple(self.engine.mixer.sinkpads)),
+            "deck_bin_map": len(self.engine._deck_bin_map),
+            "decks_occupied": sum(1 for d in self.engine.decks.values() if d is not None),
+            "quarantined": self.engine._quarantined_seek_generation_count(),
+        }
+
+    def test_100_mixed_lifecycle_cycles_show_no_cumulative_growth(self):
+        slot = "A"
+        self.engine._create_deck(slot, self.log_item, resume_position_ns=0)
+        self.assertTrue(_pump_engine(self.engine, lambda: self.engine.decks[slot].media_buffer_count > 0))
+
+        operations = [
+            "seek", "seek", "eject_recreate", "seek", "pause_resume",
+            "rapid_seek", "remove_recreate", "seek",
+        ]
+        num_cycles = 104  # >= 100, an even number of full passes over the pattern
+
+        with patch.object(eng_module, "emit_event"), patch("builtins.print"):
+            for i in range(num_cycles):
+                op = operations[i % len(operations)]
+                # Kept well clear of both ends of the 10s track -- not
+                # this test's concern, but landing within
+                # SEEK_EOS_GUARD's plausibility margin of the real end
+                # would exercise a different, already-covered code path
+                # instead of the lifecycle operation actually under test.
+                target = 1.0 + (i % 4)
+
+                # Every real engine command path that can empty a slot
+                # (_eject_deck, natural EOS via _handle_deck_finished)
+                # normally has _start_next_track refill it immediately
+                # afterward -- mocked to a no-op in this fixture (deck
+                # lifecycle, not queue/scheduling, is what's under test
+                # here). Proactively refilling here keeps each cycle
+                # starting from the same known-populated state a real
+                # engine would actually have, rather than each
+                # operation needing to defensively handle "slot
+                # unexpectedly empty" as a special case of its own.
+                if self.engine.decks.get(slot) is None:
+                    self.engine._create_deck(slot, self.log_item, resume_position_ns=0)
+                    self.assertTrue(
+                        _pump_engine(
+                            self.engine,
+                            lambda: self.engine.decks[slot].media_buffer_count > 0,
+                            timeout=3.0,
+                        ),
+                        f"cycle {i} ({op}): could not refill empty slot: {self._snapshot()}",
+                    )
+
+                if op in ("seek", "rapid_seek"):
+                    self.engine._seek_deck(slot, target)
+                    deck = self.engine.decks.get(slot)
+                    if deck is not None:
+                        self.assertTrue(
+                            _pump_until_seek_resolved(self.engine, deck, timeout=5.0),
+                            f"cycle {i} ({op}) never resolved: {self._snapshot()}",
+                        )
+                    if op == "rapid_seek":
+                        # A second seek issued immediately after the
+                        # first has already resolved -- the ordinary
+                        # (not in-flight) back-to-back path, distinct
+                        # from GatedSeekLifecycleCollisionTests' seek-
+                        # during-genuinely-in-flight-seek scenario.
+                        self.engine._seek_deck(slot, target + 0.3)
+                        deck = self.engine.decks.get(slot)
+                        if deck is not None:
+                            self.assertTrue(
+                                _pump_until_seek_resolved(self.engine, deck, timeout=5.0),
+                                f"cycle {i} (rapid_seek #2) never resolved: {self._snapshot()}",
+                            )
+
+                elif op == "eject_recreate":
+                    self.engine._eject_deck(slot)
+                    self.assertTrue(
+                        _pump_engine(self.engine, lambda: self.engine.decks.get(slot) is None, timeout=2.0),
+                        f"cycle {i} (eject) never cleared slot: {self._snapshot()}",
+                    )
+                    self.engine._create_deck(slot, self.log_item, resume_position_ns=0)
+                    self.assertTrue(
+                        _pump_engine(
+                            self.engine,
+                            lambda: self.engine.decks[slot].media_buffer_count > 0,
+                            timeout=3.0,
+                        )
+                    )
+
+                elif op == "pause_resume":
+                    self.engine._pause_deck(slot)
+                    # _pause_deck's own pre-existing, unmodified sequence
+                    # (unlink the deck's src pad from the mixer, THEN
+                    # set_state(PAUSED)) can rarely race a real GStreamer
+                    # streaming error ("not-linked") from the element
+                    # still trying to push through the just-unlinked
+                    # ghost pad -- confirmed directly (not a gated-seek
+                    # interaction: gated_seek was already None here).
+                    # The engine's own EXISTING, separately-tested error
+                    # path (_on_main_bus_error -> _on_deck_error) handles
+                    # that completely safely by retiring the deck, same
+                    # as any other genuine pipeline error -- so `None`
+                    # here is a real, already-safe outcome this test
+                    # must tolerate, not a bug in the gated-seek
+                    # lifecycle this hardening pass is about. The next
+                    # cycle's own top-of-loop "ensure populated" check
+                    # recovers it.
+                    paused_or_recovered = _pump_engine(
+                        self.engine,
+                        lambda: self.engine.decks.get(slot) is None or self.engine.decks[slot].paused,
+                        timeout=2.0,
+                    )
+                    self.assertTrue(paused_or_recovered, f"cycle {i} (pause) never resolved: {self._snapshot()}")
+                    deck = self.engine.decks.get(slot)
+                    if deck is not None and deck.paused:
+                        self.engine._resume_deck(slot)
+                        deck = self.engine.decks.get(slot)
+                        if deck is not None:
+                            self.assertTrue(
+                                _pump_until_seek_resolved(self.engine, deck, timeout=5.0),
+                                f"cycle {i} (resume) never resolved: {self._snapshot()}",
+                            )
+
+                elif op == "remove_recreate":
+                    deck = self.engine.decks.get(slot)
+                    if deck is not None:
+                        self.engine._remove_deck(deck)
+                        self.assertTrue(
+                            _pump_engine(self.engine, lambda: deck.finished, timeout=2.0),
+                            f"cycle {i} (remove) never completed: {self._snapshot()}",
+                        )
+                    self.engine._create_deck(slot, self.log_item, resume_position_ns=0)
+                    self.assertTrue(
+                        _pump_engine(
+                            self.engine,
+                            lambda: self.engine.decks[slot].media_buffer_count > 0,
+                            timeout=3.0,
+                        )
+                    )
+
+                snap = self._snapshot()
+                self.assertLessEqual(snap["mixer_sinkpads"], 1, f"cycle {i} ({op}): {snap}")
+                self.assertLessEqual(snap["deck_bin_map"], 1, f"cycle {i} ({op}): {snap}")
+                self.assertLessEqual(snap["decks_occupied"], 1, f"cycle {i} ({op}): {snap}")
+                self.assertEqual(snap["quarantined"], 0, f"cycle {i} ({op}): {snap}")
+
+        final = self._snapshot()
+        self.assertEqual(final, {
+            "mixer_sinkpads": 1, "deck_bin_map": 1, "decks_occupied": 1, "quarantined": 0,
+        })
+        survivor = self.engine.decks[slot]
+        self.assertIsNotNone(survivor)
+        self.assertIsNone(survivor.gated_seek)
+        self.assertFalse(survivor.finished)
+        self.assertFalse(survivor.retirement_started)
+        self.assertGreater(len(survivor.probe_handles), 0)
+
+        # Let every per-slot teardown coordinator's queue (104 cycles'
+        # worth of ordinary/eject/remove-driven NULL transitions, none
+        # necessarily waited on individually above) actually finish
+        # draining before checking it -- both for this assertion's own
+        # sake and so no backlog is still running (and no
+        # "deck-real-<slot>-test-worker"-named thread still alive) by
+        # the time whatever test runs after this one starts.
+        def _teardowns_fully_settled():
+            for slot_name in ("A", "B"):
+                snap = self.engine._deck_teardowns[slot_name].snapshot()
+                if snap["queue_depth"] != 0 or snap["active_generation"] is not None:
+                    return False
+            return True
+
+        self.assertTrue(_pump_engine(self.engine, _teardowns_fully_settled, timeout=10.0))
+
+        # No abandoned/still-IN_FLIGHT worker left anywhere -- every
+        # per-slot teardown coordinator is healthy (not poisoned) and
+        # idle (nothing active, nothing queued).
+        for slot_name in ("A", "B"):
+            coordinator_snapshot = self.engine._deck_teardowns[slot_name].snapshot()
+            self.assertFalse(coordinator_snapshot["poisoned"], f"slot {slot_name}: {coordinator_snapshot}")
+            self.assertIsNone(coordinator_snapshot["active_generation"], f"slot {slot_name}: {coordinator_snapshot}")
+            self.assertEqual(coordinator_snapshot["queue_depth"], 0, f"slot {slot_name}: {coordinator_snapshot}")
+
+        # Engine genuinely still functional after 104 mixed cycles --
+        # not just "resource counts look right", but a real subsequent
+        # seek actually lands correctly. (main_pipeline's own zero-
+        # timeout get_state() peek is a separately-confirmed-flaky
+        # signal here: a bare set_state(PAUSED) on a plain, no-longer-
+        # linked deck bin -- _pause_deck's own existing, unmodified
+        # behavior, reproduced identically with heavy pause/resume
+        # churn alone -- can leave GStreamer's cached top-level state
+        # reporting stale/transitional values for several real seconds
+        # even under active bus-draining, well after actual playback
+        # has already recovered; not a regression this hardening pass
+        # introduced, and not what this test is meant to verify.)
+        self.engine._seek_deck(slot, 2.0)
+        final_deck = self.engine.decks.get(slot)
+        self.assertIsNotNone(final_deck)
+        self.assertTrue(_pump_until_seek_resolved(self.engine, final_deck, timeout=5.0))
+        ok, pos = final_deck.pipeline.query_position(Gst.Format.TIME)
+        self.assertTrue(ok)
+        self.assertAlmostEqual(pos / Gst.SECOND, 2.0, delta=0.05)

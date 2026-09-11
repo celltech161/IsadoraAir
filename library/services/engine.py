@@ -824,6 +824,14 @@ class PlaybackEngine:
         self.decks = {"A": None, "B": None}
         self._deck_bin_map = {}
         self._deck_generation_serial = 0
+        # r0063 -- explicit accounting for a generation whose native seek
+        # call never returned within DECK_SEEK_CALL_TIMEOUT_SECONDS: its
+        # mixer request pad is deliberately never released (touching it
+        # again risks the exact contention that just wedged it), so this
+        # counts each one so the leak is observable rather than silent.
+        # See _resolve_gated_seek's "timeout_abandon" branch and
+        # _quarantined_seek_generation_count().
+        self._quarantined_seek_generations = 0
         # A wedged NULL poisons only the logical slot which owned that
         # generation. The other A/B slot remains able to retire future decks
         # through its own single bounded worker; the poisoned slot is never
@@ -958,10 +966,16 @@ class PlaybackEngine:
         # Retire active decks through the same exact-generation detach-first
         # primitive used on air. Their potentially hazardous NULL calls remain
         # on the bounded per-slot workers; shutdown never invokes deck NULL on
-        # the GLib/main thread.
+        # the GLib/main thread. _retire_deck_for_shutdown (not the ordinary
+        # _retire_deck_respecting_gated_seek) is required here specifically:
+        # the GLib loop has already stopped iterating by this point (see
+        # run()'s tail), so _deck_seek_tick will never fire again to
+        # observe a deferred retirement -- a deck with a native seek call
+        # possibly still in flight is instead left completely untouched
+        # and abandoned to process exit.
         for deck in tuple(self.decks.values()):
             if deck is not None:
-                self._remove_deck(deck)
+                self._retire_deck_for_shutdown(deck)
         for coordinator in getattr(self, "_deck_teardowns", {}).values():
             # Non-blocking even if a daemon worker is stuck inside a
             # quarantined generation's set_state(NULL).
@@ -7888,6 +7902,22 @@ class PlaybackEngine:
         deck = self.decks.get(slot)
         if not deck or deck.paused:
             return
+        if deck.gated_seek is not None:
+            # A manual seek/resume is still being prepared for this deck
+            # (whether or not its native call has been dispatched yet) --
+            # unlinking/set_state(PAUSED) here could race that
+            # generation's own seek call. Dropped, not queued, matching
+            # _begin_gated_seek's own "second seek in flight" precedent:
+            # the whole preparation resolves in well under a millisecond
+            # in practice (see the r0063 report), so a real collision is
+            # not expected, and the operator can just press pause again.
+            print(f"  [{slot}] Pause request dropped -- a seek is currently in flight", flush=True)
+            emit_event(
+                category="engine", level="warning", title="Pause request dropped (seek in flight)",
+                detail={"slot": slot, "track_id": deck.track.id if deck.track else None},
+                dedupe_key=f"engine|pause-dropped-in-flight|slot={slot}",
+            )
+            return
 
         pos = self._get_deck_position(deck)
         deck.paused_position = pos
@@ -8018,6 +8048,12 @@ class PlaybackEngine:
             "lock": threading.Lock(),
             "block_hits": 0,
             "result": None,
+            # r0063 ownership-invariant hardening -- None until some OTHER
+            # lifecycle action (eject, reload, natural EOS, watchdog) asks
+            # to retire this exact generation while phase == "seeking"
+            # (a native call may still be executing). See
+            # _retire_deck_respecting_gated_seek / _finish_deferred_retirement.
+            "retire_callbacks": None,
         }
 
         def _hold_downstream(_pad, _info):
@@ -8078,6 +8114,16 @@ class PlaybackEngine:
             with op["lock"]:
                 result = op["result"]
             if result is not None:
+                # The native call has returned (accepted or rejected --
+                # either way it is no longer executing), so it is now
+                # exactly as safe to touch this Gst.Bin as it always was.
+                # If some OTHER lifecycle action asked to retire this
+                # generation while that call was still in flight, honor
+                # that instead of exposing/rejecting it as a live deck --
+                # it's being torn down, not seeked.
+                if op["retire_callbacks"] is not None:
+                    self._finish_deferred_retirement(deck)
+                    return
                 if result["outcome"] == "accepted":
                     op["phase"] = "confirming"
                     op["started_monotonic"] = time.monotonic()
@@ -8140,6 +8186,7 @@ class PlaybackEngine:
         slot = op["slot"]
         log_item = op["log_item"]
         target_ns = op["target_ns"]
+        retire_callbacks = op["retire_callbacks"]
 
         if outcome == "timeout_abandon":
             # The native seek call itself did not return within the
@@ -8154,12 +8201,29 @@ class PlaybackEngine:
             # its eventual late result, if it ever arrives, is discarded
             # by the "deck.gated_seek is op" identity check inside the
             # worker (deck.gated_seek is cleared below).
+            #
+            # This deliberately does NOT request a policy restart the way
+            # a wedged set_state(NULL) does (_deck_teardown_tick's
+            # "timed_out" branch) -- that generation is already fully
+            # unlinked from the mixer by the time it wedges, so restarting
+            # only reclaims one stuck background thread; a wedged seek's
+            # mixer request pad is the one thing left permanently
+            # unreleased here (see the comment on
+            # self._quarantined_seek_generations), which is a materially
+            # smaller, self-contained cost than an audible full-engine
+            # restart for what the 230-cycle harness never observed even
+            # once. The leak is deliberately never silent -- every
+            # instance increments _quarantined_seek_generations and is
+            # reported here with "restart_recommended": True so an
+            # operator/monitoring integration can decide.
             deck.gated_seek = None
             with self._lock:
                 if self._deck_bin_map.get(id(deck.pipeline)) is deck:
                     self._deck_bin_map.pop(id(deck.pipeline), None)
                 if self.decks.get(slot) is deck:
                     self.decks[slot] = None
+                self._quarantined_seek_generations += 1
+                quarantine_count = self._quarantined_seek_generations
             deck.finished = True
             deck.retirement_started = True
             emit_event(
@@ -8169,11 +8233,57 @@ class PlaybackEngine:
                     "slot": slot, "track_id": deck.track.id, "track_title": deck.track.title,
                     "generation": deck.generation, "target_seconds": target_ns / Gst.SECOND,
                     "restart_recommended": True,
+                    "mixer_request_pad_leaked": True,
+                    "cumulative_quarantined_generations": quarantine_count,
                 },
                 dedupe_key=f"engine|seek-call-abandoned|slot={slot}|generation={deck.generation}",
             )
             print(f"  [{slot}] Seek call did not return in time -- generation {deck.generation} "
-                  f"permanently isolated, replacing at position 0", flush=True)
+                  f"permanently isolated (quarantine #{quarantine_count}), replacing at position 0",
+                  flush=True)
+            self._create_deck(slot, log_item, resume_position_ns=0)
+            if was_paused:
+                self._pause_deck(slot)
+            for cb in (retire_callbacks or []):
+                try:
+                    cb()
+                except Exception as exc:
+                    print(f"  Deferred deck retirement callback failed (non-fatal): {exc}")
+            return
+
+        if outcome == "accepted_unconfirmed":
+            # seek_simple() itself already returned True -- the native
+            # call is no longer executing, so (unlike timeout_abandon)
+            # touching this bin now is completely safe -- but no fresh
+            # buffer reached the gate to POSITIVELY confirm decode
+            # actually resumed at the claimed position within
+            # DECK_SEEK_POST_SEEK_CONFIRM_TIMEOUT_SECONDS. Per r0062's
+            # own "never claim a position that hasn't been confirmed"
+            # invariant, this must not be reported as a successful seek
+            # (achieved_ns/pad-offset/started_at would otherwise describe
+            # a position nothing has actually proven was reached) --
+            # retire this generation for real and start a fresh, honest,
+            # position-0 replacement, exactly like a rejected seek's own
+            # fallback. retire_callbacks is always None here: any
+            # retirement request arriving during "confirming" is already
+            # handled immediately and synchronously by
+            # _retire_deck_respecting_gated_seek (native call already
+            # returned by this phase, so nothing defers it).
+            ghost_pad.remove_probe(probe_id)
+            deck.gated_seek = None
+            self._remove_deck(deck)
+            print(f"  [{slot}] Seek to {target_ns / Gst.SECOND:.1f}s could not be confirmed -- "
+                  f"replacing at position 0", flush=True)
+            emit_event(
+                category="engine", level="error", title="Deck seek unconfirmed -- replaced at zero",
+                detail={
+                    "slot": slot,
+                    "track_id": log_item.track.id,
+                    "target_seconds": target_ns / Gst.SECOND,
+                    "fallback_seconds": 0.0,
+                },
+                dedupe_key=f"engine|seek-unconfirmed|slot={slot}",
+            )
             self._create_deck(slot, log_item, resume_position_ns=0)
             if was_paused:
                 self._pause_deck(slot)
@@ -8206,18 +8316,20 @@ class PlaybackEngine:
                 dedupe_key=f"engine|seek-rejected|slot={slot}|track={deck.track.id}",
             )
         else:
+            # Only "accepted" ever reaches here -- "accepted_unconfirmed"
+            # returns above instead, since it must never be reported as
+            # a successful seek.
             achieved_ns = target_ns
-            if outcome == "accepted":
-                # Still fully gated at this point -- query the bin's own
-                # internal decode position directly while nothing has
-                # reached the mixer yet. Reliable here specifically
-                # because this is the non-silence-primed path
-                # (resume_position_ns is always set for a seek/resume);
-                # the concat/wall-clock-estimate caveat elsewhere in this
-                # file only applies when silence_primed=True.
-                ok, pos = deck.pipeline.query_position(Gst.Format.TIME)
-                if ok:
-                    achieved_ns = pos
+            # Still fully gated at this point -- query the bin's own
+            # internal decode position directly while nothing has
+            # reached the mixer yet. Reliable here specifically because
+            # this is the non-silence-primed path (resume_position_ns is
+            # always set for a seek/resume); the concat/wall-clock-
+            # estimate caveat elsewhere in this file only applies when
+            # silence_primed=True.
+            ok, pos = deck.pipeline.query_position(Gst.Format.TIME)
+            if ok:
+                achieved_ns = pos
             self._apply_pad_offset(deck.pipeline, internal_position_ns=achieved_ns)
             deck.seeked_at = time.time()
             deck.started_at = time.time() - (achieved_ns / Gst.SECOND)
@@ -8239,27 +8351,188 @@ class PlaybackEngine:
         else:
             self._next_triggered = False
 
+    def _quarantined_seek_generation_count(self):
+        """Cumulative count of generations abandoned because their native
+        seek call never returned (see _resolve_gated_seek's
+        "timeout_abandon" branch) -- each one leaks exactly one mixer
+        request pad forever, by design (touching it again risks the same
+        contention that wedged it). Exists so that leak is observable
+        (tests, and any future monitoring integration) rather than
+        silent."""
+        return self._quarantined_seek_generations
+
+    def _retire_deck_respecting_gated_seek(self, deck, *, on_retired=None):
+        """The ownership-safe substitute for a bare _remove_deck(deck)
+        call anywhere a gated seek might be in flight for this exact
+        generation -- see the r0063 ownership-invariant hardening report.
+        Every OTHER lifecycle path that can retire/replace a deck (eject,
+        log reload, natural EOS, the stuck-deck watchdog) goes through
+        this instead of calling _remove_deck directly, so a bare
+        _remove_deck call anywhere in this file always operates on a
+        generation already known not to have a native call in flight.
+
+        - No gated seek at all, or one whose native call has not been
+          dispatched yet ("prerolling": no background thread exists for
+          this generation yet) or has already returned its result
+          ("confirming": the worker thread that called seek_simple() has
+          already finished and exited) -- _remove_deck() right now is
+          exactly as safe as it always was. Done immediately.
+        - A gated seek whose native call may STILL be executing
+          ("seeking"): _remove_deck() must not run yet. Deferred to the
+          next _deck_seek_tick pass, which only proceeds past this phase
+          once that call has genuinely returned (accepted or rejected --
+          either way, no longer running) -- see _advance_gated_seek's
+          "seeking" phase and _finish_deferred_retirement. The deferred
+          generation is NEVER exposed to the mixer even if its own seek
+          happens to succeed in the meantime; it's being retired, not
+          seeked.
+
+        `on_retired`, if given, is called with no arguments once the
+        generation is actually gone -- immediately for the first case,
+        later (from the GLib thread, inside _finish_deferred_retirement)
+        for the second. Multiple callers deferring against the same
+        in-flight generation all get their callback invoked once it
+        finally clears."""
+        if deck is None:
+            return
+        op = deck.gated_seek
+        if op is None or op["phase"] != "seeking":
+            if op is not None:
+                try:
+                    op["ghost_pad"].remove_probe(op["probe_id"])
+                except Exception:
+                    pass
+                deck.gated_seek = None
+            self._remove_deck(deck)
+            if on_retired is not None:
+                on_retired()
+            return
+
+        if op["retire_callbacks"] is None:
+            op["retire_callbacks"] = []
+        if on_retired is not None:
+            op["retire_callbacks"].append(on_retired)
+
+    def _finish_deferred_retirement(self, deck):
+        """Called only from _advance_gated_seek's "seeking" phase, only
+        once the native seek call has genuinely returned (so this bin has
+        no call executing against it anymore) and at least one caller
+        asked to retire this generation instead of seeking it via
+        _retire_deck_respecting_gated_seek."""
+        op = deck.gated_seek
+        callbacks = op["retire_callbacks"] or []
+        try:
+            op["ghost_pad"].remove_probe(op["probe_id"])
+        except Exception:
+            pass
+        deck.gated_seek = None
+        self._remove_deck(deck)
+        for cb in callbacks:
+            try:
+                cb()
+            except Exception as exc:
+                print(f"  Deferred deck retirement callback failed (non-fatal): {exc}")
+
+    def _retire_deck_for_shutdown(self, deck):
+        """Shutdown-only variant of _retire_deck_respecting_gated_seek.
+
+        stop() runs only after self.loop.run() has already returned (see
+        run()'s tail) -- the GLib main loop is no longer iterating by
+        then, so _deck_seek_tick will never fire again to observe a
+        deferred retirement's eventual resolution the way normal
+        operation does. Waiting for that here would mean stop() itself
+        could block indefinitely on a wedged native call, which is
+        exactly the kind of unbounded shutdown this design exists to
+        avoid.
+
+        Process exit is the safe ownership boundary instead: a
+        generation whose native seek call may still be executing is left
+        completely untouched -- never unlinked, never released from the
+        mixer, never NULL'd -- and simply abandoned to the OS, which
+        reclaims every file descriptor, thread, and byte of memory
+        unconditionally on process exit regardless of what a wedged
+        native call might still be holding. Every other generation
+        (no gated seek, or one whose native call has already returned)
+        is retired exactly as it always was."""
+        if deck is None:
+            return
+        op = deck.gated_seek
+        if op is not None and op["phase"] == "seeking":
+            with self._lock:
+                self._quarantined_seek_generations += 1
+                quarantine_count = self._quarantined_seek_generations
+            print(f"  [{deck.slot}] Shutdown: leaving generation {deck.generation} untouched "
+                  f"(native seek may still be executing, quarantine #{quarantine_count}) -- "
+                  f"process exit will reclaim it", flush=True)
+            emit_event(
+                category="engine", level="warning",
+                title="Deck left untouched at shutdown (seek in flight)",
+                detail={
+                    "slot": deck.slot, "generation": deck.generation,
+                    "track_id": deck.track.id if deck.track else None,
+                    "mixer_request_pad_leaked_until_process_exit": True,
+                    "cumulative_quarantined_generations": quarantine_count,
+                },
+                dedupe_key=f"engine|shutdown-seek-in-flight|slot={deck.slot}|generation={deck.generation}",
+            )
+            return
+        if op is not None:
+            try:
+                op["ghost_pad"].remove_probe(op["probe_id"])
+            except Exception:
+                pass
+            deck.gated_seek = None
+        self._remove_deck(deck)
+
     def _eject_deck(self, slot):
         if slot not in SLOTS:
             return
         deck = self.decks.get(slot)
-        if deck:
-            self._remove_deck(deck)
-        print(f"  [{slot}] Ejected")
-        self._start_next_track(slot=slot)
+
+        def _finish():
+            print(f"  [{slot}] Ejected")
+            self._start_next_track(slot=slot)
+
+        if deck is None:
+            _finish()
+            return
+        # If deck's own gated seek is still "seeking" (native call maybe
+        # in flight), this defers the actual removal -- and therefore
+        # _finish() -- to the moment that call genuinely returns. See
+        # _retire_deck_respecting_gated_seek.
+        self._retire_deck_respecting_gated_seek(deck, on_retired=_finish)
 
     def _reload_and_restart_current_log(self):
         """Tear down whatever's playing and switch to the current
         hour's approved log right away, instead of waiting for the
         natural end-of-track/end-of-hour transition. Used when
         something just replaced the current hour's log out from under
-        the engine (e.g. a manual 'play this playlist now' request)."""
+        the engine (e.g. a manual 'play this playlist now' request).
+
+        Every occupied slot goes through _retire_deck_respecting_gated_seek
+        rather than a bare _remove_deck -- if one (or both) has a native
+        seek call genuinely in flight, the rest of this method is
+        deferred via the shared countdown until every slot has actually
+        cleared, exactly as it always was when nothing was in flight."""
         close_old_connections()
         with self._lock:
             decks_to_remove = [d for d in self.decks.values() if d]
-        for deck in decks_to_remove:
-            self._remove_deck(deck)
 
+        if not decks_to_remove:
+            self._finish_reload_and_restart_current_log()
+            return
+
+        remaining = {"count": len(decks_to_remove)}
+
+        def _on_one_retired():
+            remaining["count"] -= 1
+            if remaining["count"] <= 0:
+                self._finish_reload_and_restart_current_log()
+
+        for deck in decks_to_remove:
+            self._retire_deck_respecting_gated_seek(deck, on_retired=_on_one_retired)
+
+    def _finish_reload_and_restart_current_log(self):
         self._next_triggered = False
         now = timezone.localtime()
         self._load_log_for(now.date(), now.hour)
@@ -8578,13 +8851,23 @@ class PlaybackEngine:
                     },
                     dedupe_key=f"engine|stuck|generation={deck.generation}",
                 )
-                self._remove_deck(deck)
-                self._next_triggered = False
-                if self.decks.get(self._other_slot(slot)) is None and not self.manual_mode:
-                    self._start_next_track(slot=slot)
-                # File stat, DB write, and validator wake happen only after
-                # detach-first retirement and any immediate playout advance.
-                self._persist_media_incident(incident_evidence)
+                def _finish_watchdog_removal(slot=slot, incident_evidence=incident_evidence):
+                    self._next_triggered = False
+                    if self.decks.get(self._other_slot(slot)) is None and not self.manual_mode:
+                        self._start_next_track(slot=slot)
+                    # File stat, DB write, and validator wake happen only
+                    # after detach-first retirement and any immediate
+                    # playout advance.
+                    self._persist_media_incident(incident_evidence)
+
+                # In practice this deck's own gated seek (if any) will
+                # always have long since resolved or timed out by the
+                # time DECK_STUCK_TIMEOUT_SECONDS (30s) has elapsed --
+                # DECK_SEEK_*_TIMEOUT_SECONDS bound the whole preparation
+                # to well under that -- but route through the same safe
+                # helper as every other retirement path anyway rather
+                # than relying on that timing margin never changing.
+                self._retire_deck_respecting_gated_seek(deck, on_retired=_finish_watchdog_removal)
 
     @_glib_safe(default_return=True)
     def _poll_position(self):
@@ -8938,26 +9221,36 @@ class PlaybackEngine:
         vt_outgoing_track_id = self._vt.get("outgoing_track_id")
         if (vt_phase in ("outro_playing", "outro_tail")
                 and deck.track.id == vt_outgoing_track_id):
-            self._remove_deck(deck)
-            self._vt_handle_outgoing_ended()
+            # In practice a genuine EOS cannot reach this callback while
+            # deck.gated_seek is still active -- the same BLOCK_DOWNSTREAM
+            # probe that gates a fresh replacement's buffers also gates
+            # any (extremely unlikely, freshly-created-deck) EOS reaching
+            # this exact pad -- but route through the safe helper anyway
+            # rather than relying on that reasoning never changing.
+            self._retire_deck_respecting_gated_seek(deck, on_retired=self._vt_handle_outgoing_ended)
             return
 
-        self._remove_deck(deck)
-        other_deck = self.decks[self._other_slot(slot)]
-        if other_deck is not None:
-            # The crossfade already handed off to the other slot before
-            # this one finished — nothing more to do, it's playing.
-            return
-        if self.manual_mode:
-            # DJ is holding for a talk-over and the song ran out before
-            # they flipped back to Auto -- leave the slot empty (mic-only)
-            # rather than starting the next track out from under them.
-            self._manual_hold_pending = True
-            return
-        # Nothing had triggered yet (e.g. a track too short to ever hit
-        # the crossfade trigger) — this was the only thing playing, so
-        # start the next queued item now, in the slot that just freed up.
-        self._start_next_track(slot=slot)
+        def _finish_handle_deck_finished(slot=slot):
+            other_deck = self.decks[self._other_slot(slot)]
+            if other_deck is not None:
+                # The crossfade already handed off to the other slot
+                # before this one finished — nothing more to do, it's
+                # playing.
+                return
+            if self.manual_mode:
+                # DJ is holding for a talk-over and the song ran out
+                # before they flipped back to Auto -- leave the slot
+                # empty (mic-only) rather than starting the next track
+                # out from under them.
+                self._manual_hold_pending = True
+                return
+            # Nothing had triggered yet (e.g. a track too short to ever
+            # hit the crossfade trigger) — this was the only thing
+            # playing, so start the next queued item now, in the slot
+            # that just freed up.
+            self._start_next_track(slot=slot)
+
+        self._retire_deck_respecting_gated_seek(deck, on_retired=_finish_handle_deck_finished)
 
     def _on_log_exhausted(self, slot):
         print(f"  [{slot}] Log exhausted for this hour.")

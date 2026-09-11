@@ -146,6 +146,7 @@ def _make_real_engine():
     engine.decks = {"A": None, "B": None}
     engine._deck_bin_map = {}
     engine._deck_generation_serial = 0
+    engine._quarantined_seek_generations = 0
     engine._deck_teardowns = {
         slot: audio_recovery.BoundedTeardownCoordinator(
             f"deck-real-{slot.lower()}-test", timeout_s=1.0, queue_capacity=16
@@ -163,6 +164,12 @@ def _make_real_engine():
     engine._write_now_playing = lambda _track: None
     engine._write_rbds_category_state = lambda _track: None
     engine._start_next_track = lambda **_kwargs: None
+    # r0063 -- lets a test call the real engine.stop() directly (e.g. for
+    # shutdown-vs-in-flight-seek collision tests) without needing to set
+    # up Remote DJ or the on-disk engine-state writer, neither relevant
+    # to deck lifecycle.
+    engine.remote_dj_session = None
+    engine._write_state = lambda **_kwargs: None
     # loop is what _request_restart tries to quit(); MagicMock keeps the
     # try/except path a no-op instead of an AttributeError when a real
     # deck test happens to trigger the poison path.
