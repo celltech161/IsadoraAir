@@ -257,6 +257,24 @@ DECK_SEEK_TICK_MS = 150
 DECK_SEEK_PREROLL_TIMEOUT_SECONDS = 6.0
 DECK_SEEK_CALL_TIMEOUT_SECONDS = 6.0
 DECK_SEEK_POST_SEEK_CONFIRM_TIMEOUT_SECONDS = 4.0
+# r0064 -- upper plausibility bound for a confirmed-buffer PTS or a
+# query_position() result trusted as a real seek-achieved position.
+# GST_CLOCK_TIME_NONE (a guint64 sentinel, (2**64)-1 -- confirmed
+# directly against this build: a freshly constructed/unstamped
+# Gst.Buffer's default .pts IS this exact value) is Python-int
+# 18446744073709551615, NOT Python None, so a bare `is not None` check
+# does not catch it -- and it is by far not the only way a buffer could
+# carry a bogus timestamp. One day of media is already an absurd upper
+# bound for anything this engine ever plays; anything at or above it is
+# treated as untrustworthy exactly like a missing PTS, never trusted
+# as an "achieved" position.
+DECK_SEEK_MAX_PLAUSIBLE_PTS_NS = 24 * 3600 * Gst.SECOND
+
+
+def _plausible_seek_position_ns(value_ns):
+    """True only for a value safe to trust as a real, achieved seek
+    position -- see DECK_SEEK_MAX_PLAUSIBLE_PTS_NS's own comment."""
+    return value_ns is not None and 0 <= value_ns < DECK_SEEK_MAX_PLAUSIBLE_PTS_NS
 
 # Remote DJ over WebRTC.
 # Opus's RTP payload mandates 48kHz per RFC 7587 regardless of
@@ -8365,19 +8383,56 @@ class PlaybackEngine:
             # first buffer the mixer ever sees from this generation
             # already carries correct timing; nothing is ever released
             # using a stale or transitional offset.
-            achieved_ns = target_ns
-            if op.get("confirmed_buffer_pts") is not None:
-                achieved_ns = op["confirmed_buffer_pts"]
+            #
+            # r0064 validation pass -- PTS plausibility hierarchy:
+            #   1. the confirmed post-seek buffer's own PTS, if it is a
+            #      real, plausible timestamp (never GST_CLOCK_TIME_NONE
+            #      or any other absurd value -- see
+            #      _plausible_seek_position_ns's own comment: that
+            #      sentinel is a defined Python int, not None, so a bare
+            #      `is not None` check alone does not catch it, and a
+            #      raw/parsed buffer immediately after a discontinuity
+            #      can legitimately carry it);
+            #   2. otherwise a direct query_position() (still fully
+            #      gated here, so this is the exact same safe call site
+            #      the pre-r0064 code always used), if ITS result is
+            #      also plausible;
+            #   3. otherwise this is NOT a position this engine can
+            #      truthfully claim was reached, even though the gate
+            #      itself was satisfied by a real buffer -- handled
+            #      identically to "accepted_unconfirmed" (retire this
+            #      generation for real, replace at a truthful position
+            #      0) rather than ever reporting success against an
+            #      unproven position. confirming_hit_but_no_position is
+            #      never expected in practice (the "confirming" phase's
+            #      block_hits check only fires once a real buffer has
+            #      set confirmed_buffer_pts), so this path existing at
+            #      all is belt-and-braces, not a normal outcome.
+            achieved_ns = None
+            confirmed_pts = op.get("confirmed_buffer_pts")
+            if _plausible_seek_position_ns(confirmed_pts):
+                achieved_ns = confirmed_pts
             else:
-                # Belt-and-braces only -- "accepted" always arrives via
-                # the "confirming" phase's block_hits check, which never
-                # fires without a real buffer setting confirmed_buffer_pts
-                # first. Falls back to a direct position query (still
-                # fully gated here) rather than ever trusting the
-                # pre-seek target_ns as an "achieved" position.
                 ok, pos = deck.pipeline.query_position(Gst.Format.TIME)
-                if ok:
+                if ok and _plausible_seek_position_ns(pos):
                     achieved_ns = pos
+
+            if achieved_ns is None:
+                print(f"  [{slot}] Seek to {target_ns / Gst.SECOND:.1f}s confirmed by the gate but no "
+                      f"plausible position could be established (confirmed_buffer_pts={confirmed_pts!r}) -- "
+                      f"treating as unconfirmed", flush=True)
+                emit_event(
+                    category="engine", level="error",
+                    title="Deck seek confirmed with no plausible position -- treated as unconfirmed",
+                    detail={
+                        "slot": slot, "track_id": deck.track.id, "track_title": deck.track.title,
+                        "target_seconds": target_ns / Gst.SECOND,
+                        "confirmed_buffer_pts": confirmed_pts,
+                    },
+                    dedupe_key=f"engine|seek-implausible-pts|slot={slot}",
+                )
+                return self._resolve_gated_seek(deck, outcome="accepted_unconfirmed")
+
             self._apply_pad_offset(deck.pipeline, internal_position_ns=achieved_ns)
             deck.seeked_at = time.time()
             deck.started_at = time.time() - (achieved_ns / Gst.SECOND)

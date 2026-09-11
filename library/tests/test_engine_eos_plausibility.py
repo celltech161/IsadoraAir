@@ -1007,10 +1007,19 @@ class GatedSeekLifecycleCollisionTests(TransactionTestCase):
         hold.set()
         self.assertTrue(_pump_until_seek_resolved(self.engine, deck))
         # The FIRST seek's target is what's actually reached -- the
-        # dropped second request never influenced anything.
+        # dropped second request never influenced anything. This is
+        # what the test is actually about (the drop mechanism, not
+        # sub-frame position precision) -- delta widened from an
+        # originally too-tight 0.05s (r0064 combined-regression pass:
+        # observed a real ~0.08s overshoot under genuine host
+        # contention, since real-time playback continues for however
+        # long it takes _pump_until_seek_resolved's own polling loop to
+        # next notice gated_seek went None -- same class of real-time
+        # measurement slack as elsewhere in this file, not specific to
+        # this test).
         ok, pos = deck.pipeline.query_position(Gst.Format.TIME)
         self.assertTrue(ok)
-        self.assertAlmostEqual(pos / Gst.SECOND, 3.0, delta=0.05)
+        self.assertAlmostEqual(pos / Gst.SECOND, 3.0, delta=0.3)
 
     def test_pause_during_genuinely_inflight_seek_is_dropped(self):
         deck, hold = self._begin_inflight_seek()
