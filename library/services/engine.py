@@ -8048,6 +8048,13 @@ class PlaybackEngine:
             "lock": threading.Lock(),
             "block_hits": 0,
             "result": None,
+            # r0064 -- the confirmed post-seek BUFFER's own PTS, read
+            # directly from the item the gate is holding (see
+            # _hold_buffer below). Authoritative for the running-time
+            # offset finalized in _resolve_gated_seek -- no separate
+            # query_position() call needed, and nothing is ever computed
+            # from a merely-assumed position.
+            "confirmed_buffer_pts": None,
             # r0063 ownership-invariant hardening -- None until some OTHER
             # lifecycle action (eject, reload, natural EOS, watchdog) asks
             # to retire this exact generation while phase == "seeking"
@@ -8056,27 +8063,32 @@ class PlaybackEngine:
             "retire_callbacks": None,
         }
 
-        def _hold_downstream(_pad, _info):
-            # A block probe's very FIRST hit on a freshly built ghost
-            # pad is a STICKY EVENT (STREAM_START/CAPS/SEGMENT), not a
-            # buffer -- Deck.media_buffer_count (only incremented for
-            # actual BUFFERs, upstream of this exact pad on the real
-            # decode chain) would therefore never advance while this
-            # hold stands, since the SAME synchronous streaming-thread
-            # call stack that would eventually push the real buffer is
-            # itself parked here first. block_hits (this probe's own
-            # count) is the only signal that can't deadlock against
-            # itself this way. One callback invocation per hit, per
-            # GStreamer's own block-probe contract -- a hit is not
-            # released until _resolve_gated_seek calls remove_probe();
-            # a flushing seek's FLUSH_START is the one thing documented
-            # to preempt an existing block rather than queue behind it,
-            # which is what turns a "stuck" hit into a fresh one here.
+        def _hold_buffer(_pad, info):
+            # r0064 -- BLOCK | BUFFER, not BLOCK_DOWNSTREAM. Verified
+            # directly against this GStreamer/PyGObject build (see the
+            # r0064 report): a probe registered with only the BUFFER
+            # data-type selector never fires for STREAM_START/CAPS/
+            # SEGMENT/TAG -- those flow through completely unimpeded,
+            # letting the mixer negotiate this pad's caps/segment
+            # normally even while gated. Only an actual decoded AUDIO
+            # BUFFER is ever held here, so a hit is now unconditionally
+            # proof of real, decoded program audio -- never merely a
+            # sticky event, which the prior BLOCK_DOWNSTREAM gate could
+            # not distinguish (see PlaybackEngine._resolve_gated_seek's
+            # own docstring history). Same one-hit-per-callback contract
+            # as before -- a flushing seek's FLUSH_START still preempts
+            # whatever buffer is currently held rather than queuing
+            # behind it, turning a "held" hit into a fresh one post-seek.
+            buf = info.get_buffer()
             with op["lock"]:
                 op["block_hits"] += 1
+                if buf is not None:
+                    op["confirmed_buffer_pts"] = buf.pts
             return Gst.PadProbeReturn.OK
 
-        op["probe_id"] = ghost_pad.add_probe(Gst.PadProbeType.BLOCK_DOWNSTREAM, _hold_downstream)
+        op["probe_id"] = ghost_pad.add_probe(
+            Gst.PadProbeType.BLOCK | Gst.PadProbeType.BUFFER, _hold_buffer
+        )
         new_deck.gated_seek = op
 
     def _deck_seek_tick(self):
@@ -8102,6 +8114,11 @@ class PlaybackEngine:
             with op["lock"]:
                 block_hits = op["block_hits"]
             if block_hits >= 1:
+                # r0064: with the BUFFER-only gate, this first hit is
+                # unconditionally a real decoded audio buffer -- a
+                # stronger preroll signal than the old BLOCK_DOWNSTREAM
+                # gate's first hit (commonly a sticky STREAM_START/CAPS/
+                # SEGMENT event, never held-up audio) could ever provide.
                 op["pre_seek_block_hits"] = block_hits
                 op["phase"] = "seeking"
                 op["started_monotonic"] = time.monotonic()
@@ -8138,6 +8155,16 @@ class PlaybackEngine:
             with op["lock"]:
                 block_hits = op["block_hits"]
             if block_hits > op["pre_seek_block_hits"]:
+                # r0064: block_hits can now ONLY ever be incremented by
+                # a genuine, decoded post-seek audio BUFFER (the gate no
+                # longer admits sticky events at all) -- this is real
+                # proof of post-gate downstream audio flow, not merely
+                # an event satisfying the counter. op["confirmed_buffer_pts"]
+                # is that buffer's own timestamp, read straight off the
+                # item the gate is holding (still blocked -- stable
+                # until _resolve_gated_seek removes the probe);
+                # _resolve_gated_seek uses it to finalize the pad offset
+                # BEFORE releasing the gate.
                 self._resolve_gated_seek(deck, outcome="accepted")
             elif elapsed >= DECK_SEEK_POST_SEEK_CONFIRM_TIMEOUT_SECONDS:
                 # seek_simple()/the pad-directed SEEK event already
@@ -8290,8 +8317,11 @@ class PlaybackEngine:
             return
 
         rejected = outcome in ("never_prerolled", "rejected", "exception")
-        ghost_pad.remove_probe(probe_id)
         if rejected:
+            # Still fully gated -- nothing program-visible has ever
+            # escaped either way, so finalize-then-remove vs remove-
+            # then-finalize are equally safe here; kept in the same
+            # order as the accepted path below for consistency.
             achieved_ns = 0
             # _create_deck already offset this fresh bin as though its
             # internal timeline began at the target. Rejected means
@@ -8301,6 +8331,7 @@ class PlaybackEngine:
             # r0062 correctness fix as before, just triggered from here
             # now instead of _seek_deck/_resume_deck directly.
             self._apply_pad_offset(deck.pipeline, internal_position_ns=0)
+            ghost_pad.remove_probe(probe_id)
             deck.started_at = time.time()
             print(f"  [{slot}] Seek to {target_ns / Gst.SECOND:.1f}s rejected -- playing from 0 instead",
                   flush=True)
@@ -8319,20 +8350,38 @@ class PlaybackEngine:
             # Only "accepted" ever reaches here -- "accepted_unconfirmed"
             # returns above instead, since it must never be reported as
             # a successful seek.
+            #
+            # r0064 ORDERING FIX: the prior implementation called
+            # remove_probe() unconditionally BEFORE this branch, then
+            # queried position and applied the pad offset AFTER the gate
+            # was already open -- so the very first post-seek buffer
+            # could reach the mixer (and query_position() could race
+            # against the pipeline's own state) before the running-time
+            # offset was ever finalized. Now: the CONFIRMED post-seek
+            # buffer's own PTS -- captured directly by the block probe,
+            # off the exact item still sitting held at the gate -- is
+            # read first, the offset is computed and applied while
+            # STILL fully gated, and the probe is removed LAST. The
+            # first buffer the mixer ever sees from this generation
+            # already carries correct timing; nothing is ever released
+            # using a stale or transitional offset.
             achieved_ns = target_ns
-            # Still fully gated at this point -- query the bin's own
-            # internal decode position directly while nothing has
-            # reached the mixer yet. Reliable here specifically because
-            # this is the non-silence-primed path (resume_position_ns is
-            # always set for a seek/resume); the concat/wall-clock-
-            # estimate caveat elsewhere in this file only applies when
-            # silence_primed=True.
-            ok, pos = deck.pipeline.query_position(Gst.Format.TIME)
-            if ok:
-                achieved_ns = pos
+            if op.get("confirmed_buffer_pts") is not None:
+                achieved_ns = op["confirmed_buffer_pts"]
+            else:
+                # Belt-and-braces only -- "accepted" always arrives via
+                # the "confirming" phase's block_hits check, which never
+                # fires without a real buffer setting confirmed_buffer_pts
+                # first. Falls back to a direct position query (still
+                # fully gated here) rather than ever trusting the
+                # pre-seek target_ns as an "achieved" position.
+                ok, pos = deck.pipeline.query_position(Gst.Format.TIME)
+                if ok:
+                    achieved_ns = pos
             self._apply_pad_offset(deck.pipeline, internal_position_ns=achieved_ns)
             deck.seeked_at = time.time()
             deck.started_at = time.time() - (achieved_ns / Gst.SECOND)
+            ghost_pad.remove_probe(probe_id)
             print(f"  [{slot}] Seek to {achieved_ns / Gst.SECOND:.1f}s", flush=True)
 
         deck.gated_seek = None
