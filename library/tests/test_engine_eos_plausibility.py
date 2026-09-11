@@ -41,14 +41,27 @@ reflect the deck's real, unseeked position -- otherwise the dashboard,
 crossfade timing, and pause/resume state all keep reporting a target
 the deck never actually reached."""
 import inspect
+import tempfile
 import threading
 import time
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import gi
 from django.test import TransactionTestCase
+
+gi.require_version("Gst", "1.0")
+from gi.repository import GLib, Gst
 
 import library.services.engine as eng_module
 from library.services.engine import DECK_STUCK_TIMEOUT_SECONDS, SEEK_EOS_GUARD_SECONDS, Deck
+from library.tests.test_engine_deck_lifecycle import (
+    _make_log_item,
+    _make_real_engine,
+    _make_track,
+    _wait_until,
+    _write_wav,
+)
 
 
 def make_stand_in():
@@ -252,93 +265,11 @@ class SeekRejectionHandlingTests(TransactionTestCase):
     construction and GStreamer boundary calls, so bookkeeping, pad-offset
     rebasing, pause handling, monitoring, and logging remain observable."""
 
-    def test_manual_seek_rejection_rebases_pad_timeline_to_actual_zero(self):
-        """A recreated deck is initially offset for the requested target.
-        If GStreamer rejects that target, both presentation state and the
-        source-pad timeline must describe the actual position (zero)."""
-        stand_in = make_stand_in()
-        stand_in.mixer = MagicMock()
-        old_deck = make_deck()
-        old_deck.paused = True
-        old_deck.paused_position = 12.0
-        new_deck = make_deck()
-        new_deck.started_at = 700.0  # what _create_deck(target) would set
-        new_deck.pipeline.seek_simple.return_value = False
-        stand_in.decks["A"] = old_deck
-        stand_in._remove_deck = MagicMock()
-
-        def recreate(slot, _log_item, resume_position_ns=None):
-            self.assertEqual(resume_position_ns, int(187.02 * eng_module.Gst.SECOND))
-            stand_in.decks[slot] = new_deck
-            return new_deck
-
-        stand_in._create_deck = MagicMock(side_effect=recreate)
-        stand_in._apply_pad_offset = MagicMock()
-        stand_in._get_deck_position = MagicMock(return_value=0.25)
-
-        with (
-            patch.object(eng_module.time, "time", return_value=1000.0),
-            patch.object(eng_module, "emit_event") as mock_emit,
-            patch("builtins.print") as mock_print,
-        ):
-            eng_module.PlaybackEngine._seek_deck(stand_in, "A", 187.02)
-
-        self.assertEqual(new_deck.started_at, 1000.0)
-        self.assertEqual(new_deck.paused_position, 0.25)
-        self.assertNotEqual(new_deck.paused_position, 187.02)
-        stand_in._apply_pad_offset.assert_called_once_with(
-            new_deck.pipeline, internal_position_ns=0
-        )
-        self.assertEqual(mock_emit.call_args.kwargs["detail"]["fallback_seconds"], 0.0)
-        messages = [call.args[0] for call in mock_print.call_args_list if call.args]
-        self.assertTrue(any("rejected -- playing from 0 instead" in item for item in messages))
-        self.assertNotIn("  [A] Seek to 187.0s", messages)
-
-    def test_resume_seek_rejection_rebases_pad_timeline_to_actual_zero(self):
-        stand_in = make_stand_in()
-        old_deck = make_deck()
-        old_deck.paused = True
-        old_deck.paused_position = 42.5
-        new_deck = make_deck()
-        new_deck.started_at = 900.0  # what _create_deck(target) would set
-        new_deck.pipeline.seek_simple.return_value = False
-        stand_in.decks["A"] = old_deck
-        stand_in._remove_deck = MagicMock()
-        stand_in._create_deck = MagicMock(return_value=new_deck)
-        stand_in._apply_pad_offset = MagicMock()
-
-        with (
-            patch.object(eng_module.time, "time", return_value=1000.0),
-            patch.object(eng_module, "emit_event") as mock_emit,
-            patch("builtins.print") as mock_print,
-        ):
-            eng_module.PlaybackEngine._resume_deck(stand_in, "A")
-
-        self.assertEqual(new_deck.started_at, 1000.0)
-        self.assertEqual(new_deck.paused_position, 0.0)
-        stand_in._apply_pad_offset.assert_called_once_with(
-            new_deck.pipeline, internal_position_ns=0
-        )
-        self.assertEqual(mock_emit.call_args.kwargs["detail"]["fallback_seconds"], 0.0)
-        messages = [call.args[0] for call in mock_print.call_args_list if call.args]
-        self.assertTrue(any("rejected -- playing from 0 instead" in item for item in messages))
-        self.assertNotIn("  [A] Resumed at 42.5s", messages)
-
     def test_create_deck_checks_auto_resume_seek_result(self):
         src = inspect.getsource(eng_module.PlaybackEngine._create_deck)
         self.assertIn("seek_ok = deck.pipeline.seek_simple", src)
         self.assertIn("if not seek_ok:", src)
         self.assertIn("deck.seeked_at = time.time()", src)
-
-    def test_resume_deck_checks_seek_result(self):
-        src = inspect.getsource(eng_module.PlaybackEngine._resume_deck)
-        self.assertIn("seek_ok = new_deck.pipeline.seek_simple", src)
-        self.assertIn("new_deck.seeked_at = time.time()", src)
-
-    def test_seek_deck_checks_seek_result(self):
-        src = inspect.getsource(eng_module.PlaybackEngine._seek_deck)
-        self.assertIn("seek_ok = new_deck.pipeline.seek_simple", src)
-        self.assertIn("new_deck.seeked_at = time.time()", src)
 
     def test_rejected_seek_does_not_corrupt_started_at_with_unreached_target(self):
         """A rejected auto-resume seek must NOT overwrite started_at to
@@ -359,35 +290,304 @@ class SeekRejectionHandlingTests(TransactionTestCase):
         self.assertNotIn("deck.started_at = time.time() - (_auto_resume_position_ns", rejection_branch)
         self.assertIn("deck.seeked_at = time.time()", src[end:end + 200])
 
-    def test_resume_deck_resets_started_at_on_rejected_seek(self):
-        """_create_deck sets Deck.started_at from resume_position_ns as
-        presentation bookkeeping BEFORE this function's own seek_simple
-        call ever runs -- if that seek is rejected, started_at must be
-        corrected back to reflect the deck's real (unseeked) position,
-        or _get_deck_position (dashboard, crossfade timing) keeps
-        reporting a target the deck never reached."""
-        src = inspect.getsource(eng_module.PlaybackEngine._resume_deck)
-        start = src.index("if seek_ok:")
-        seek_result_block = src[start:]
-        self.assertIn("new_deck.seeked_at = time.time()", seek_result_block)
-        self.assertIn("new_deck.started_at = time.time()", seek_result_block)
 
-    def test_seek_deck_resets_started_at_on_rejected_seek(self):
-        src = inspect.getsource(eng_module.PlaybackEngine._seek_deck)
-        start = src.index("if seek_ok:")
-        end = src.index("if was_paused:", start)
-        seek_result_block = src[start:end]
-        self.assertIn("new_deck.seeked_at = time.time()", seek_result_block)
-        self.assertIn("new_deck.started_at = time.time()", seek_result_block)
+def _gated_seek_fixture(duration_seconds=6.0):
+    """A real, hardware-free _seek_deck/_resume_deck fixture -- same
+    _make_real_engine()/_write_wav() building blocks as
+    test_engine_deck_lifecycle.py's RealDeckTopologyTests, long enough
+    (default 6s) that a mid-file seek target is meaningful. Returns
+    (engine, wav_path, track, log_item); the caller owns the
+    TemporaryDirectory/engine cleanup."""
+    temp_dir = tempfile.TemporaryDirectory(prefix="isadoraair-gated-seek.")
+    wav_path = Path(temp_dir.name) / "seek-source.wav"
+    _write_wav(wav_path, frames=int(duration_seconds * 44100))
+    engine = _make_real_engine()
+    track = _make_track(wav_path, track_id=1, duration=duration_seconds, title="Gated Seek Track")
+    log_item = _make_log_item(track, item_id=1)
+    return engine, temp_dir, track, log_item
 
-    def test_seek_deck_does_not_clobber_paused_position_on_rejected_seek(self):
-        """The was_paused branch used to unconditionally overwrite
-        paused_position with the seek TARGET after _pause_deck already
-        derived a real value -- if the seek was rejected, that target
-        was never actually reached, so the overwrite must be
-        conditional on seek_ok."""
-        src = inspect.getsource(eng_module.PlaybackEngine._seek_deck)
-        start = src.index("if was_paused:")
-        was_paused_block = src[start:start + 300]
-        self.assertIn("if seek_ok:", was_paused_block)
-        self.assertIn("new_deck.paused_position = position", was_paused_block)
+
+def _pump_engine(engine, predicate, timeout=3.0):
+    """Pumps the default GLib context (needed for streaming-thread-driven
+    probe callbacks and the GLib.idle_add EOS handoff to run at all) AND
+    drives _deck_seek_tick on every pass -- rather than registering the
+    tick via GLib.timeout_add, which would tie the test to a real
+    recurring wall-clock timer it has no reason to depend on. A harmless
+    no-op call when no deck has a gated seek in flight, so this replaces
+    plain _wait_until throughout this module's gated-seek tests.
+
+    Also explicitly drains engine.main_pipeline's bus on every pass.
+    Empirically (see the r0063 report), a second/third decodebin's own
+    internal ASYNC PAUSED->PLAYING completion can sit unresolved
+    indefinitely under a bare add_signal_watch()-plus-context.iteration()
+    pump in a tight, no-real-blocking test loop -- draining the bus
+    directly is what actually unsticks it. Production is unaffected:
+    the real engine drives a genuine GLib.MainLoop.run(), which dispatches
+    the bus exactly as intended; this is a test-harness-only pumping
+    subtlety, not a behavior this fix depends on."""
+    context = GLib.MainContext.default()
+    bus = engine.main_pipeline.get_bus()
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        while context.pending():
+            context.iteration(False)
+        while bus.pop() is not None:
+            pass
+        engine._deck_seek_tick()
+        if predicate():
+            return True
+        time.sleep(0.001)
+    return predicate()
+
+
+def _pump_until_seek_resolved(engine, deck, timeout=3.0):
+    return _pump_engine(engine, lambda: deck.gated_seek is None, timeout=timeout)
+
+
+class GatedSeekSuccessTests(TransactionTestCase):
+    """_begin_gated_seek (shared by _seek_deck/_resume_deck) gates a
+    freshly linked replacement deck behind a BLOCK_DOWNSTREAM probe on
+    its own ghost pad -- topologically connected to the live mixer
+    exactly as before, but never exchanging a single real buffer with it
+    -- until a flushing seek to the requested position is confirmed. See
+    the r0063 architecture report for the 290-cycle hardware-free harness
+    this design is based on: the immediate-seek-after-link approach it
+    replaces rejected a freshly linked bin's own flushing seek in 29/30
+    cycles of one representative run; gating removes that race (0
+    rejections / 0 hangs / exact position accuracy across 290 cycles)."""
+
+    def setUp(self):
+        self.engine, self.temp_dir, self.track, self.log_item = _gated_seek_fixture()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.addCleanup(lambda: self.engine.main_pipeline.set_state(Gst.State.NULL))
+        self.addCleanup(lambda: self.engine._deck_teardowns["A"].stop())
+        self.addCleanup(lambda: self.engine._deck_teardowns["B"].stop())
+        self.engine.main_pipeline.set_state(Gst.State.PLAYING)
+
+    def test_successful_manual_seek_lands_on_target_with_no_position_zero_leakage(self):
+        self.engine._create_deck("A", self.log_item, resume_position_ns=0)
+        self.assertTrue(_pump_engine(self.engine, lambda: self.engine.decks["A"].media_buffer_count > 0))
+
+        self.engine._seek_deck("A", 3.0)
+        deck = self.engine.decks["A"]
+        self.assertIsNotNone(deck.gated_seek)
+        # Still fully gated immediately after the request -- nothing has
+        # been exposed to the mixer yet, matching "no position-zero
+        # leakage" even for the transient moment before confirmation.
+        self.assertEqual(len(tuple(self.engine.mixer.sinkpads)), 1)
+
+        self.assertTrue(_pump_until_seek_resolved(self.engine, deck))
+        self.assertIsNone(deck.gated_seek)
+        self.assertIsNotNone(deck.seeked_at)
+        ok, pos = deck.pipeline.query_position(Gst.Format.TIME)
+        self.assertTrue(ok)
+        self.assertAlmostEqual(pos / Gst.SECOND, 3.0, delta=0.05)
+
+    def test_repeated_seek_preparation_cycles_leave_no_stale_pads_or_map_entries(self):
+        self.engine._create_deck("A", self.log_item, resume_position_ns=0)
+        self.assertTrue(_pump_engine(self.engine, lambda: self.engine.decks["A"].media_buffer_count > 0))
+
+        for target in (1.0, 2.0, 3.0, 1.5, 2.5):
+            self.engine._seek_deck("A", target)
+            deck = self.engine.decks["A"]
+            self.assertTrue(_pump_until_seek_resolved(self.engine, deck))
+
+        self.assertEqual(len(tuple(self.engine.mixer.sinkpads)), 1)
+        self.assertEqual(len(self.engine._deck_bin_map), 1)
+        survivor = self.engine.decks["A"]
+        self.assertIsNotNone(survivor)
+        self.assertFalse(survivor.finished)
+        self.assertGreater(len(survivor.probe_handles), 0)
+
+    def test_pause_then_resume_shares_the_same_gated_primitive(self):
+        self.engine._create_deck("A", self.log_item, resume_position_ns=0)
+        self.assertTrue(_pump_engine(self.engine, lambda: self.engine.decks["A"].media_buffer_count > 0))
+
+        self.engine._pause_deck("A")
+        self.assertTrue(self.engine.decks["A"].paused)
+
+        self.engine._resume_deck("A")
+        deck = self.engine.decks["A"]
+        self.assertIsNotNone(deck.gated_seek)
+        self.assertTrue(_pump_until_seek_resolved(self.engine, deck))
+        self.assertFalse(deck.paused)
+        self.assertIsNotNone(deck.seeked_at)
+
+    def test_second_request_while_one_is_in_flight_is_dropped_not_applied(self):
+        """Empirically the whole prepare-through-confirm sequence
+        resolves in well under a millisecond once gated (see the
+        report), so a real second request landing inside that window is
+        not expected in practice -- this proves the drop path itself is
+        safe (no exception, no corrupted state, the in-flight seek still
+        resolves normally) rather than asserting a specific coalescing
+        outcome."""
+        self.engine._create_deck("A", self.log_item, resume_position_ns=0)
+        self.assertTrue(_pump_engine(self.engine, lambda: self.engine.decks["A"].media_buffer_count > 0))
+
+        self.engine._seek_deck("A", 3.0)
+        deck = self.engine.decks["A"]
+        first_op = deck.gated_seek
+        self.assertIsNotNone(first_op)
+
+        with patch.object(eng_module, "emit_event") as mock_emit:
+            self.engine._seek_deck("A", 4.0)
+
+        # Untouched -- the second request was dropped, not applied.
+        self.assertIs(deck.gated_seek, first_op)
+        mock_emit.assert_called_once()
+        self.assertEqual(mock_emit.call_args.kwargs["title"], "Seek request dropped (already in progress)")
+
+        self.assertTrue(_pump_until_seek_resolved(self.engine, deck))
+        ok, pos = deck.pipeline.query_position(Gst.Format.TIME)
+        self.assertTrue(ok)
+        self.assertAlmostEqual(pos / Gst.SECOND, 3.0, delta=0.05)
+
+
+class GatedSeekRejectionTests(TransactionTestCase):
+    """seek_simple()'s boolean return value is checked exactly once,
+    inside the background worker _dispatch_gated_seek_call dispatches --
+    a real, hardware-free rejection is forced by overriding the
+    instance's own seek_simple after the gate has armed (PyGObject
+    instances accept plain Python attribute overrides), proving the same
+    r0062 fallback correctness (pad-offset rebased to the CONFIRMED
+    running time, not the unreached target; started_at/paused_position
+    describe the real position) now runs from _resolve_gated_seek."""
+
+    def setUp(self):
+        self.engine, self.temp_dir, self.track, self.log_item = _gated_seek_fixture()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.addCleanup(lambda: self.engine.main_pipeline.set_state(Gst.State.NULL))
+        self.addCleanup(lambda: self.engine._deck_teardowns["A"].stop())
+        self.addCleanup(lambda: self.engine._deck_teardowns["B"].stop())
+        self.engine.main_pipeline.set_state(Gst.State.PLAYING)
+
+    def test_manual_seek_rejection_rebases_pad_timeline_to_actual_zero(self):
+        self.engine._create_deck("A", self.log_item, resume_position_ns=0)
+        self.assertTrue(_pump_engine(self.engine, lambda: self.engine.decks["A"].media_buffer_count > 0))
+
+        self.engine._seek_deck("A", 3.0)
+        deck = self.engine.decks["A"]
+        # Overridden immediately -- _dispatch_gated_seek_call fires the
+        # instant the block probe's first hit is observed, which can
+        # itself happen before a test-side wait for "phase == seeking"
+        # ever gets scheduled; only a same-statement-window override is
+        # race-free against the background worker's own dispatch.
+        deck.pipeline.seek_simple = lambda *a, **kw: False
+
+        with patch.object(eng_module, "emit_event") as mock_emit, patch("builtins.print") as mock_print:
+            self.assertTrue(_pump_until_seek_resolved(self.engine, deck))
+
+        self.assertIsNone(deck.gated_seek)
+        self.assertAlmostEqual(deck.started_at, time.time(), delta=0.5)
+        mock_emit.assert_called_once()
+        self.assertEqual(mock_emit.call_args.kwargs["detail"]["fallback_seconds"], 0.0)
+        self.assertTrue(mock_emit.call_args.kwargs["detail"]["pad_offset_rebased"])
+        messages = [call.args[0] for call in mock_print.call_args_list if call.args]
+        self.assertTrue(any("rejected -- playing from 0 instead" in item for item in messages))
+        self.assertFalse(any("Seek to 3.0s" in item for item in messages if "rejected" not in item))
+
+    def test_resume_seek_rejection_rebases_pad_timeline_and_preserves_pause_derived_position(self):
+        # resume_position_ns=0 -- a genuine fresh (unseeked) deck, so its
+        # real internal position actually starts at (and briefly after
+        # creation, sits near) zero, unlike resume_position_ns=<target>
+        # which is only ever a pre-seek ASSUMPTION until a real seek
+        # confirms it (the exact hazard r0062 already guards against
+        # elsewhere) -- irrelevant for this test anyway, since only
+        # _resume_deck's REJECTION behavior is under test here, not the
+        # specific pre-pause position.
+        self.engine._create_deck("A", self.log_item, resume_position_ns=0)
+        self.assertTrue(_pump_engine(self.engine, lambda: self.engine.decks["A"].media_buffer_count > 0))
+        # A real pause (not hand-set flags) so the deck is genuinely
+        # unlinked from the mixer beforehand, exactly as _resume_deck
+        # would actually encounter it in production.
+        self.engine._pause_deck("A")
+
+        self.engine._resume_deck("A")
+        deck = self.engine.decks["A"]
+        deck.pipeline.seek_simple = lambda *a, **kw: False
+
+        with patch.object(eng_module, "emit_event") as mock_emit, patch("builtins.print"):
+            self.assertTrue(_pump_until_seek_resolved(self.engine, deck))
+
+        self.assertIsNone(deck.gated_seek)
+        self.assertEqual(mock_emit.call_args.kwargs["detail"]["fallback_seconds"], 0.0)
+        # was_paused=False for _resume_deck (its whole point is coming
+        # OUT of pause) -- rejection must not re-pause the deck.
+        self.assertFalse(deck.paused)
+
+    def test_seek_deck_does_not_clobber_pause_derived_position_on_rejected_seek(self):
+        """The was_paused branch must not overwrite _pause_deck's own
+        freshly derived paused_position with the unreached seek target
+        when the seek was rejected."""
+        self.engine._create_deck("A", self.log_item, resume_position_ns=0)
+        self.assertTrue(_pump_engine(self.engine, lambda: self.engine.decks["A"].media_buffer_count > 0))
+        self.engine._pause_deck("A")
+
+        self.engine._seek_deck("A", 5.0)
+        deck = self.engine.decks["A"]
+        deck.pipeline.seek_simple = lambda *a, **kw: False
+
+        with patch.object(eng_module, "emit_event"), patch("builtins.print"):
+            self.assertTrue(_pump_until_seek_resolved(self.engine, deck))
+
+        self.assertTrue(deck.paused)
+        self.assertNotEqual(deck.paused_position, 5.0)
+        self.assertLess(deck.paused_position, 1.0)
+
+
+class GatedSeekAbandonmentTests(TransactionTestCase):
+    """If the native seek call itself never returns, the generation must
+    be permanently isolated (never unblocked, never touched again) and
+    the slot must recover with a fresh position-0 replacement -- bounded
+    failure, never an unbounded hang, mirroring
+    BoundedTeardownCoordinator's own poison-on-timeout posture for an
+    unrecoverable set_state(NULL). The stuck call here is a plain daemon
+    thread parked in time.sleep(); Python threads can't be killed, but
+    daemon threads never block interpreter/process exit, so this is safe
+    to exercise directly in-process (unlike the investigation harness's
+    subprocess-per-cycle discipline, which exists for genuinely
+    unkillable NATIVE calls)."""
+
+    def setUp(self):
+        self.engine, self.temp_dir, self.track, self.log_item = _gated_seek_fixture()
+        self.addCleanup(self.temp_dir.cleanup)
+        self.addCleanup(lambda: self.engine.main_pipeline.set_state(Gst.State.NULL))
+        self.addCleanup(lambda: self.engine._deck_teardowns["A"].stop())
+        self.addCleanup(lambda: self.engine._deck_teardowns["B"].stop())
+        self.engine.main_pipeline.set_state(Gst.State.PLAYING)
+
+    def test_stuck_seek_call_is_abandoned_and_slot_recovers_at_zero(self):
+        self.engine._create_deck("A", self.log_item, resume_position_ns=0)
+        self.assertTrue(_pump_engine(self.engine, lambda: self.engine.decks["A"].media_buffer_count > 0))
+
+        self.engine._seek_deck("A", 3.0)
+        stuck_deck = self.engine.decks["A"]
+        # Overridden immediately, before any pumping -- _dispatch_gated_
+        # seek_call fires the instant the block probe's first hit is
+        # observed, which can happen inside the tick call above before a
+        # test-side wait for a later phase would ever get scheduled;
+        # only a same-statement-window override is race-free.
+        stuck_deck.pipeline.seek_simple = lambda *a, **kw: (time.sleep(999), True)[1]
+
+        with (
+            patch.object(eng_module, "DECK_SEEK_CALL_TIMEOUT_SECONDS", 0.2),
+            patch.object(eng_module, "emit_event") as mock_emit,
+            patch("builtins.print"),
+        ):
+            # _advance_gated_seek re-reads DECK_SEEK_CALL_TIMEOUT_SECONDS
+            # from the module namespace on every tick, so patching it
+            # here (rather than before _seek_deck) still applies in time
+            # for the abandonment check.
+            self.assertTrue(
+                _pump_engine(self.engine, lambda: self.engine.decks["A"] is not stuck_deck, timeout=3.0)
+            )
+
+        self.assertTrue(stuck_deck.finished)
+        self.assertTrue(stuck_deck.retirement_started)
+        self.assertIsNone(stuck_deck.gated_seek)
+        self.assertNotIn(id(stuck_deck.pipeline), self.engine._deck_bin_map)
+        replacement = self.engine.decks["A"]
+        self.assertIsNotNone(replacement)
+        self.assertIsNot(replacement, stuck_deck)
+        self.assertEqual(mock_emit.call_args_list[0].kwargs["level"], "critical")
+        self.assertTrue(mock_emit.call_args_list[0].kwargs["detail"]["restart_recommended"])

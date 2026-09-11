@@ -226,6 +226,38 @@ SEEK_EOS_GUARD_SECONDS = 5.0
 DEFERRED_SEEK_EOS_OBSERVATION_SECONDS = SEEK_EOS_GUARD_SECONDS + 1.0
 SLOTS = ("A", "B")
 
+# r0063 -- gated manual-seek/resume preparation (_begin_gated_seek /
+# _deck_seek_tick / _resolve_gated_seek). A replacement deck is linked
+# into the live mixer exactly as before, but held fully silent behind a
+# BLOCK_DOWNSTREAM probe on its own ghost src pad until a flushing seek
+# to the requested position has been confirmed -- no buffer, partial or
+# otherwise, ever reaches program audio before that. Reproduced via a
+# 290-cycle, hardware-free harness (scratchpad/deck-seek-readiness
+# report) that the CURRENT immediate-seek-after-link approach rejects a
+# freshly linked, still-settling bin's flushing seek far more often than
+# not (29/30 in one representative run) -- a live race between the
+# seek's internal FLUSH handshake and the bin's own not-yet-settled
+# PLAYING transition -- and that gating the pad first removes the race
+# entirely (0 rejections, 0 hangs, exact position accuracy across 290
+# cycles, including the rapid back-to-back scrubbing and zero-settle-
+# time cases that most resemble a real WaveCanvas user). The one call
+# proven capable of blocking natively (the flushing seek itself) always
+# runs on its own background daemon thread, polled (never joined) from
+# the GLib thread -- consistent with this file's existing
+# SlotCoordinator/BoundedTeardownCoordinator discipline of never letting
+# a potentially-hanging native GStreamer call run on, or be waited on
+# by, the GLib thread. If it doesn't return within
+# DECK_SEEK_CALL_TIMEOUT_SECONDS, the generation is permanently
+# abandoned (never unblocked, never touched again) as the only safe
+# response, mirroring BoundedTeardownCoordinator's own poison-on-timeout
+# posture for an unrecoverable set_state(NULL) -- and a fresh
+# position-0 replacement is built immediately so the slot never goes
+# silent.
+DECK_SEEK_TICK_MS = 150
+DECK_SEEK_PREROLL_TIMEOUT_SECONDS = 6.0
+DECK_SEEK_CALL_TIMEOUT_SECONDS = 6.0
+DECK_SEEK_POST_SEEK_CONFIRM_TIMEOUT_SECONDS = 4.0
+
 # Remote DJ over WebRTC.
 # Opus's RTP payload mandates 48kHz per RFC 7587 regardless of
 # AudioPipeline.sample_rate -- this is NOT the same as pipeline_sample_rate
@@ -623,6 +655,14 @@ class Deck:
         self.deferred_seek_eos_pending = False
         self.deferred_seek_eos_baseline = 0
         self.deferred_seek_eos_last_rejected_monotonic = 0.0
+        # r0063 -- non-None while a gated manual-seek/resume preparation is
+        # in flight for this generation (see _begin_gated_seek). A plain
+        # dict, not a dataclass: written from both the GLib thread
+        # (_deck_seek_tick / _begin_gated_seek) and, for the "block_hits"
+        # and "result" keys specifically, other threads (the block
+        # probe's own streaming thread; the background seek-call worker)
+        # -- both guarded by the dict's own "lock" entry.
+        self.gated_seek = None
 
     def mark_milestone(self, name, *, state=None, now=None):
         current = time.monotonic() if now is None else now
@@ -881,6 +921,7 @@ class PlaybackEngine:
         GLib.timeout_add(300, self._output_recovery_tick)
         GLib.timeout_add_seconds(2, self._output_presence_probe_tick)
         GLib.timeout_add(300, self._deck_teardown_tick)
+        GLib.timeout_add(DECK_SEEK_TICK_MS, self._deck_seek_tick)
         self._media_validation_worker.start()
 
         if RemoteDJConfig.load().enabled:
@@ -7873,9 +7914,8 @@ class PlaybackEngine:
         advanced again — root cause not pinned down, and not worth
         blocking on), tear it down and create a fresh bin for the same
         log_item via the normal (well-proven) deck-creation path, then
-        seek it to where it was paused. Two independently-verified
-        mechanisms — track-transition creation and manual seek — doing
-        the work instead of one untested one."""
+        seek it to where it was paused via the same gated-preparation
+        primitive _seek_deck uses -- see _begin_gated_seek."""
         if slot not in SLOTS:
             return
         deck = self.decks.get(slot)
@@ -7884,62 +7924,20 @@ class PlaybackEngine:
 
         resume_position = deck.paused_position
         log_item = deck.log_item
-        self._remove_deck(deck)
-
-        new_deck = self._create_deck(
-            slot, log_item, resume_position_ns=int(resume_position * Gst.SECOND)
-        )
-        if new_deck is None:
-            print(f"  [{slot}] Resume failed — could not recreate deck", flush=True)
-            return
-
-        seek_ok = new_deck.pipeline.seek_simple(
-            Gst.Format.TIME,
-            Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT,
-            int(resume_position * Gst.SECOND),
-        )
-        if seek_ok:
-            new_deck.seeked_at = time.time()
-            print(f"  [{slot}] Resumed at {resume_position:.1f}s", flush=True)
-        else:
-            # _create_deck already set started_at as though playback
-            # began at resume_position_ns -- that's presentation
-            # bookkeeping based on the PARAMETER, not a real seek
-            # _create_deck itself never performs. The actual seek is
-            # this call, made by the caller (us) after _create_deck
-            # returns; if GStreamer rejects it, the deck's real audio
-            # is still wherever decodebin naturally started (position
-            # 0), and started_at must reflect that or _get_deck_position
-            # (dashboard, crossfade timing) would keep reporting the
-            # unreached target indefinitely.
-            # _create_deck also offset the source pad for the requested
-            # internal position. Since decode will actually start at zero,
-            # rebase it against the CURRENT main-pipeline running time; merely
-            # repairing started_at would leave early buffers timestamped far
-            # behind the mixer and make GStreamer drop through them.
-            self._apply_pad_offset(new_deck.pipeline, internal_position_ns=0)
-            new_deck.started_at = time.time()
-            print(f"  [{slot}] Resume seek to {resume_position:.1f}s rejected -- playing from 0 instead", flush=True)
-            emit_event(
-                category="engine", level="error", title="Deck seek rejected",
-                detail={
-                    "slot": slot,
-                    "track_id": new_deck.track.id,
-                    "target_seconds": resume_position,
-                    "fallback_seconds": 0.0,
-                    "pad_offset_rebased": True,
-                },
-                dedupe_key=f"engine|seek-rejected|slot={slot}|track={new_deck.track.id}",
-            )
+        self._begin_gated_seek(slot, log_item, resume_position, was_paused=False)
 
     def _seek_deck(self, slot, position):
-        """Mirrors _resume_deck's approach: a flushing seek on a deck
-        bin that's already linked into the live mixer deadlocked in
-        testing badly enough that systemd needed a SIGKILL to recover
-        (dead air the whole time) — root cause not chased down given
-        the severity, same call as tonight's other "don't mutate the
-        live bin" fixes. Tear the deck down and recreate it fresh at
-        the target position instead of seeking in place."""
+        """A flushing seek on a deck bin that's already linked into the
+        live mixer deadlocked in testing badly enough that systemd
+        needed a SIGKILL to recover (dead air the whole time) — root
+        cause not chased down given the severity at the time. Tear the
+        deck down and recreate it fresh at the target position (as
+        before), but never issue the seek directly into the live-linked
+        bin: _begin_gated_seek holds the replacement fully silent behind
+        a downstream block on its own ghost pad until the seek is
+        confirmed, which a hardware-free harness (see the r0063 report)
+        showed removes the seek's own rejection race entirely -- not
+        merely papering over the historical deadlock risk."""
         if slot not in SLOTS:
             leading = self._leading_deck()
             slot = leading.slot if leading else None
@@ -7951,60 +7949,295 @@ class PlaybackEngine:
 
         was_paused = deck.paused
         log_item = deck.log_item
-        self._remove_deck(deck)
+        self._begin_gated_seek(slot, log_item, position, was_paused=was_paused)
 
-        new_deck = self._create_deck(
-            slot, log_item, resume_position_ns=int(position * Gst.SECOND)
-        )
+    def _begin_gated_seek(self, slot, log_item, target_seconds, *, was_paused):
+        """Shared manual-seek/resume preparation primitive -- see the
+        r0063 architecture report (scratchpad/deck-seek-readiness) for
+        the full investigation this design is based on.
+
+        Removes whatever currently occupies `slot` and builds the
+        replacement exactly as before (_create_deck, linked into the
+        live mixer, resume_position_ns=target), but immediately gates
+        its ghost src pad behind a BLOCK_DOWNSTREAM probe -- topologically
+        connected to the live mixer from the first instant like every
+        other deck, but never exchanging a single real buffer with it.
+        _deck_seek_tick (a plain periodic GLib timer, the same shape as
+        _deck_teardown_tick) advances the preparation in three bounded
+        phases -- wait for real decode to start producing, issue the
+        seek, wait for a confirmed post-seek buffer -- before
+        _resolve_gated_seek does the actual (fast, GLib-thread-safe)
+        mixer exposure or rejection fallback. The one call proven
+        capable of blocking natively (the flushing seek itself) always
+        runs on its own background daemon thread and is polled, never
+        joined, from the GLib thread; a native call that never returns
+        permanently abandons that generation rather than risking a
+        second call against whatever it's stuck holding -- see
+        _resolve_gated_seek's "timeout_abandon" branch.
+
+        If `slot` already has a gated seek in flight, this request is
+        dropped (not queued/coalesced) rather than touching a bin a
+        background thread may still be inside a native call for --
+        empirically (see the report) the whole prepare-through-confirm
+        sequence resolves in well under a millisecond, so a real second
+        request landing inside that window is not expected in practice;
+        a dropped request is cheap and safe, and the operator can just
+        seek again."""
+        existing = self.decks.get(slot)
+        if existing is not None and existing.gated_seek is not None:
+            print(f"  [{slot}] Seek already in progress -- ignoring new request to "
+                  f"{target_seconds:.1f}s", flush=True)
+            emit_event(
+                category="engine", level="warning", title="Seek request dropped (already in progress)",
+                detail={"slot": slot, "target_seconds": target_seconds},
+                dedupe_key=f"engine|seek-dropped-in-flight|slot={slot}",
+            )
+            return
+
+        if existing is not None:
+            self._remove_deck(existing)
+
+        target_ns = int(target_seconds * Gst.SECOND)
+        new_deck = self._create_deck(slot, log_item, resume_position_ns=target_ns)
         if new_deck is None:
             print(f"  [{slot}] Seek failed — could not recreate deck", flush=True)
             return
 
-        seek_ok = new_deck.pipeline.seek_simple(
-            Gst.Format.TIME,
-            Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT,
-            int(position * Gst.SECOND),
-        )
-        if seek_ok:
-            new_deck.seeked_at = time.time()
-        else:
-            # Same reasoning as _resume_deck: _create_deck already set
-            # started_at as though playback began at the target -- if
-            # GStreamer rejects this seek, the deck's real audio is
-            # still at position 0, and started_at must say so.
+        ghost_pad = new_deck.pipeline.get_static_pad("src")
+
+        op = {
+            "target_ns": target_ns,
+            "was_paused": was_paused,
+            "slot": slot,
+            "log_item": log_item,
+            "ghost_pad": ghost_pad,
+            "probe_id": None,
+            "phase": "prerolling",
+            "started_monotonic": time.monotonic(),
+            "pre_seek_block_hits": None,
+            "lock": threading.Lock(),
+            "block_hits": 0,
+            "result": None,
+        }
+
+        def _hold_downstream(_pad, _info):
+            # A block probe's very FIRST hit on a freshly built ghost
+            # pad is a STICKY EVENT (STREAM_START/CAPS/SEGMENT), not a
+            # buffer -- Deck.media_buffer_count (only incremented for
+            # actual BUFFERs, upstream of this exact pad on the real
+            # decode chain) would therefore never advance while this
+            # hold stands, since the SAME synchronous streaming-thread
+            # call stack that would eventually push the real buffer is
+            # itself parked here first. block_hits (this probe's own
+            # count) is the only signal that can't deadlock against
+            # itself this way. One callback invocation per hit, per
+            # GStreamer's own block-probe contract -- a hit is not
+            # released until _resolve_gated_seek calls remove_probe();
+            # a flushing seek's FLUSH_START is the one thing documented
+            # to preempt an existing block rather than queue behind it,
+            # which is what turns a "stuck" hit into a fresh one here.
+            with op["lock"]:
+                op["block_hits"] += 1
+            return Gst.PadProbeReturn.OK
+
+        op["probe_id"] = ghost_pad.add_probe(Gst.PadProbeType.BLOCK_DOWNSTREAM, _hold_downstream)
+        new_deck.gated_seek = op
+
+    def _deck_seek_tick(self):
+        """Periodic (DECK_SEEK_TICK_MS) GLib-thread driver for every
+        deck with an in-flight gated seek. Cheap no-op when nothing is
+        pending -- matches _deck_teardown_tick's shape exactly."""
+        for deck in list(self.decks.values()):
+            if deck is None or deck.gated_seek is None:
+                continue
+            if deck.finished or deck.retirement_started:
+                # Torn down from under the pending seek (e.g. an eject
+                # arrived first) -- nothing left to advance.
+                deck.gated_seek = None
+                continue
+            self._advance_gated_seek(deck)
+        return True
+
+    def _advance_gated_seek(self, deck):
+        op = deck.gated_seek
+        elapsed = time.monotonic() - op["started_monotonic"]
+
+        if op["phase"] == "prerolling":
+            with op["lock"]:
+                block_hits = op["block_hits"]
+            if block_hits >= 1:
+                op["pre_seek_block_hits"] = block_hits
+                op["phase"] = "seeking"
+                op["started_monotonic"] = time.monotonic()
+                self._dispatch_gated_seek_call(deck)
+            elif elapsed >= DECK_SEEK_PREROLL_TIMEOUT_SECONDS:
+                self._resolve_gated_seek(deck, outcome="never_prerolled")
+            return
+
+        if op["phase"] == "seeking":
+            with op["lock"]:
+                result = op["result"]
+            if result is not None:
+                if result["outcome"] == "accepted":
+                    op["phase"] = "confirming"
+                    op["started_monotonic"] = time.monotonic()
+                else:
+                    self._resolve_gated_seek(deck, outcome=result["outcome"])
+                return
+            if elapsed >= DECK_SEEK_CALL_TIMEOUT_SECONDS:
+                self._resolve_gated_seek(deck, outcome="timeout_abandon")
+            return
+
+        if op["phase"] == "confirming":
+            with op["lock"]:
+                block_hits = op["block_hits"]
+            if block_hits > op["pre_seek_block_hits"]:
+                self._resolve_gated_seek(deck, outcome="accepted")
+            elif elapsed >= DECK_SEEK_POST_SEEK_CONFIRM_TIMEOUT_SECONDS:
+                # seek_simple()/the pad-directed SEEK event already
+                # returned True by this point -- GStreamer's own
+                # contract is that the flushing seek's FLUSH_START/
+                # FLUSH_STOP handshake is complete before that call
+                # returns, so this is a belt-and-braces confirmation,
+                # not the primary correctness gate. The bin is not
+                # stuck in a native call here (that call already
+                # returned) -- proceed as accepted rather than abandon
+                # a generation that is not actually wedged.
+                self._resolve_gated_seek(deck, outcome="accepted_unconfirmed")
+            return
+
+    def _dispatch_gated_seek_call(self, deck):
+        op = deck.gated_seek
+        target_ns = op["target_ns"]
+
+        def worker():
+            try:
+                accepted = bool(
+                    deck.pipeline.seek_simple(
+                        Gst.Format.TIME,
+                        Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT,
+                        target_ns,
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001 -- reported as data, never raised across threads
+                with op["lock"]:
+                    if deck.gated_seek is op:
+                        op["result"] = {"outcome": "exception", "detail": repr(exc)}
+                return
+            with op["lock"]:
+                if deck.gated_seek is op:
+                    op["result"] = {"outcome": "accepted" if accepted else "rejected"}
+
+        threading.Thread(
+            target=worker, name=f"deck-seek-{deck.slot}-{deck.generation}", daemon=True
+        ).start()
+
+    def _resolve_gated_seek(self, deck, *, outcome):
+        op = deck.gated_seek
+        ghost_pad = op["ghost_pad"]
+        probe_id = op["probe_id"]
+        was_paused = op["was_paused"]
+        slot = op["slot"]
+        log_item = op["log_item"]
+        target_ns = op["target_ns"]
+
+        if outcome == "timeout_abandon":
+            # The native seek call itself did not return within the
+            # bound -- per BoundedTeardownCoordinator's own established
+            # precedent for an unrecoverable set_state(NULL), this
+            # generation is now permanently abandoned: never unblocked
+            # (nothing it produces can ever reach program audio), never
+            # touched again (a further call risks the exact contention
+            # that just wedged this one), and dropped from engine
+            # bookkeeping so nothing else mistakes it for the active
+            # deck. The background thread itself is simply leaked --
+            # its eventual late result, if it ever arrives, is discarded
+            # by the "deck.gated_seek is op" identity check inside the
+            # worker (deck.gated_seek is cleared below).
+            deck.gated_seek = None
+            with self._lock:
+                if self._deck_bin_map.get(id(deck.pipeline)) is deck:
+                    self._deck_bin_map.pop(id(deck.pipeline), None)
+                if self.decks.get(slot) is deck:
+                    self.decks[slot] = None
+            deck.finished = True
+            deck.retirement_started = True
+            emit_event(
+                category="engine", level="critical",
+                title="Deck seek call did not return -- generation abandoned",
+                detail={
+                    "slot": slot, "track_id": deck.track.id, "track_title": deck.track.title,
+                    "generation": deck.generation, "target_seconds": target_ns / Gst.SECOND,
+                    "restart_recommended": True,
+                },
+                dedupe_key=f"engine|seek-call-abandoned|slot={slot}|generation={deck.generation}",
+            )
+            print(f"  [{slot}] Seek call did not return in time -- generation {deck.generation} "
+                  f"permanently isolated, replacing at position 0", flush=True)
+            self._create_deck(slot, log_item, resume_position_ns=0)
+            if was_paused:
+                self._pause_deck(slot)
+            return
+
+        rejected = outcome in ("never_prerolled", "rejected", "exception")
+        ghost_pad.remove_probe(probe_id)
+        if rejected:
+            achieved_ns = 0
             # _create_deck already offset this fresh bin as though its
-            # internal timeline began at position. Rejected means decode
-            # actually begins at zero, so recompute from the main pipeline's
-            # current running time before any buffers are allowed to inherit
-            # the stale target-based offset.
-            self._apply_pad_offset(new_deck.pipeline, internal_position_ns=0)
-            new_deck.started_at = time.time()
-            print(f"  [{slot}] Seek to {position:.1f}s rejected -- playing from 0 instead", flush=True)
+            # internal timeline began at the target. Rejected means
+            # decode actually begins at zero, so recompute from the main
+            # pipeline's current running time before any buffer is
+            # allowed to inherit the stale target-based offset -- same
+            # r0062 correctness fix as before, just triggered from here
+            # now instead of _seek_deck/_resume_deck directly.
+            self._apply_pad_offset(deck.pipeline, internal_position_ns=0)
+            deck.started_at = time.time()
+            print(f"  [{slot}] Seek to {target_ns / Gst.SECOND:.1f}s rejected -- playing from 0 instead",
+                  flush=True)
             emit_event(
                 category="engine", level="error", title="Deck seek rejected",
                 detail={
                     "slot": slot,
-                    "track_id": new_deck.track.id,
-                    "target_seconds": position,
+                    "track_id": deck.track.id,
+                    "target_seconds": target_ns / Gst.SECOND,
                     "fallback_seconds": 0.0,
                     "pad_offset_rebased": True,
                 },
-                dedupe_key=f"engine|seek-rejected|slot={slot}|track={new_deck.track.id}",
+                dedupe_key=f"engine|seek-rejected|slot={slot}|track={deck.track.id}",
             )
+        else:
+            achieved_ns = target_ns
+            if outcome == "accepted":
+                # Still fully gated at this point -- query the bin's own
+                # internal decode position directly while nothing has
+                # reached the mixer yet. Reliable here specifically
+                # because this is the non-silence-primed path
+                # (resume_position_ns is always set for a seek/resume);
+                # the concat/wall-clock-estimate caveat elsewhere in this
+                # file only applies when silence_primed=True.
+                ok, pos = deck.pipeline.query_position(Gst.Format.TIME)
+                if ok:
+                    achieved_ns = pos
+            self._apply_pad_offset(deck.pipeline, internal_position_ns=achieved_ns)
+            deck.seeked_at = time.time()
+            deck.started_at = time.time() - (achieved_ns / Gst.SECOND)
+            print(f"  [{slot}] Seek to {achieved_ns / Gst.SECOND:.1f}s", flush=True)
+
+        deck.gated_seek = None
 
         if was_paused:
             self._pause_deck(slot)
-            if seek_ok:
-                new_deck.paused_position = position
-            # else: _pause_deck already derived paused_position from a
-            # real _get_deck_position() query against the deck's TRUE
-            # (unseeked, now-corrected-to-0) state -- don't clobber
-            # that with the target the deck never actually reached.
+            if not rejected:
+                # _pause_deck just derived paused_position from a real
+                # _get_deck_position() query; the confirmed achieved
+                # position is authoritative over that estimate. On
+                # rejection, leave _pause_deck's own derived value alone
+                # -- it already reflects the deck's TRUE (unseeked,
+                # now-corrected-to-0) state, and the target was never
+                # actually reached.
+                deck.paused_position = achieved_ns / Gst.SECOND
         else:
             self._next_triggered = False
-
-        if seek_ok:
-            print(f"  [{slot}] Seek to {position:.1f}s", flush=True)
 
     def _eject_deck(self, slot):
         if slot not in SLOTS:
