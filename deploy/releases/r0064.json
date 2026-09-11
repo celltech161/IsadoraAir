@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "release_id": "r0064",
+  "previous_release_id": "r0063",
+  "minimum_updater_protocol_version": 5,
+  "summary": "Fixes a silent post-seek playback stall by requiring a real decoded audio buffer before a WaveCanvas seek or paused-deck resume is accepted, finalizing pad timing while that buffer is still gated, and releasing it only after its timestamp is validated. Preserves r0063 native-seek lifecycle isolation, timeout quarantine, truthful fallback, and EOS protection.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-engine"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0007"
+}
