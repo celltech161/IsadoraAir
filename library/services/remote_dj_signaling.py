@@ -36,6 +36,7 @@ from library.services.remote_dj_connection import (
     FAILURE_SIGNALING_SESSION_BUSY,
     verify_remote_dj_token,
 )
+from library.services.remote_dj_stats import sanitize_browser_stats_payload
 
 TOKEN_MAX_AGE_SECONDS = 60
 # One session already active; a second connection attempt is rejected
@@ -136,6 +137,15 @@ class RemoteDJSignalingServer:
                             self.engine._remote_dj_record_browser_milestone,
                             attempt_id,
                             milestone,
+                            data.get("elapsed_ms"),
+                        )
+                elif msg_type == "stats":
+                    sanitized = sanitize_browser_stats_payload(data.get("stats"))
+                    if sanitized is not None:
+                        GLib.idle_add(
+                            self.engine._remote_dj_record_browser_stats,
+                            attempt_id,
+                            sanitized,
                             data.get("elapsed_ms"),
                         )
         except websockets.exceptions.ConnectionClosed:

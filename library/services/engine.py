@@ -51,6 +51,11 @@ from library.services.remote_dj_connection import (
     RemoteDJConnectionAttempt,
     new_attempt_id,
 )
+from library.services.remote_dj_stats import (
+    parse_webrtc_stats,
+    sanitize_browser_elapsed_ms,
+    sanitize_browser_stats_payload,
+)
 from library.services import audio_recovery
 from library.services.media_health import (
     MediaValidationWorker,
@@ -135,6 +140,10 @@ DJ_DUMP_PCM = Path("/run/isadoraair/remote_dj_first_1s.pcm")
 # history. While False, neither the file nor the pad probe below is
 # ever created -- zero cost, zero growth.
 DJ_DUMP_PCM_ENABLED = False
+# Three one-shot, connection-scoped get-stats probes after server ICE first
+# connects. Together with event-edge probes these can expose a short DTLS gap
+# without creating a continuous/high-frequency diagnostic stream.
+REMOTE_DJ_STATS_PROBE_DELAYS_MS = (250, 750, 1500)
 
 
 def _dj_diag(session, msg):
@@ -620,6 +629,8 @@ class RemoteDJSession:
         self.dj_mixer_pad_src = None   # gate_conv src pad for probe cleanup
         self.caps_probe_id = 0         # pad probe id for the caps-event logger
         self.dump_probe_id = 0         # pad probe id for the PCM dump
+        self.stats_probe_ids = []      # cancellable bounded GLib one-shots
+        self.stats_burst_started = False
 
 
 class Deck:
@@ -7079,9 +7090,185 @@ class PlaybackEngine:
         session = self._remote_dj_session_for_attempt(
             attempt_id, "browser_milestone"
         )
-        if session is not None:
+        elapsed_ms = sanitize_browser_elapsed_ms(elapsed_ms)
+        if session is not None and elapsed_ms is not None:
             self._remote_dj_mark(session, milestone, browser_elapsed_ms=elapsed_ms)
         return False
+
+    def _remote_dj_record_browser_stats(
+        self, attempt_id, payload, elapsed_ms
+    ):
+        session = self._remote_dj_session_for_attempt(
+            attempt_id, "browser_stats"
+        )
+        if session is None:
+            return False
+        sanitized = sanitize_browser_stats_payload(payload)
+        if sanitized is None:
+            return False
+        elapsed_ms = sanitize_browser_elapsed_ms(elapsed_ms)
+        attempt = session.connection_attempt
+        previous_pair = attempt.transport["browser"]["selected_pair"]["exists"]
+        previous_packets = attempt.media_stats["browser_monitor"]["packets_received"]
+        previous_energy = attempt.media_stats["browser_monitor"]["total_audio_energy"]
+        attempt.apply_browser_stats(sanitized)
+
+        pair_exists = sanitized["selected_pair"]["exists"]
+        packets = sanitized["inbound"]["packets_received"]
+        energy = sanitized["inbound"]["total_audio_energy"]
+        if elapsed_ms is not None and pair_exists and not previous_pair:
+            self._remote_dj_mark(
+                session, "selected_candidate_pair", browser_elapsed_ms=elapsed_ms
+            )
+        if (elapsed_ms is not None and packets is not None and packets > 0
+                and not (previous_packets and previous_packets > 0)):
+            self._remote_dj_mark(
+                session, "first_monitor_rtp", browser_elapsed_ms=elapsed_ms
+            )
+        if (elapsed_ms is not None and energy is not None and energy > 0
+                and not (previous_energy and previous_energy > 0)):
+            self._remote_dj_mark(
+                session, "first_monitor_audio_energy", browser_elapsed_ms=elapsed_ms
+            )
+        return False
+
+    def _remote_dj_on_ice_connection_state(
+        self, element, _pspec, callback_context
+    ):
+        expected_session, attempt_id, expected_webrtc = callback_context
+        session = self._remote_dj_session_for_attempt(
+            attempt_id,
+            "server_ice_state",
+            expected_session=expected_session,
+            expected_webrtc=expected_webrtc,
+        )
+        if session is None:
+            return
+        state = element.props.ice_connection_state
+        nick = getattr(state, "value_nick", None)
+        if not session.connection_attempt.record_server_ice_state(nick):
+            return
+        _dj_diag(session, f"webrtc server_ice_state -> {nick}")
+        milestone = {
+            "checking": "server_ice_checking",
+            "connected": "server_ice_connected",
+            "completed": "server_ice_completed",
+        }.get(nick)
+        if milestone:
+            self._remote_dj_mark(session, milestone)
+        self._remote_dj_request_stats(session, f"server_ice_{nick}")
+        if nick in {"connected", "completed"}:
+            self._remote_dj_schedule_stats_burst(session)
+
+    def _remote_dj_on_ice_gathering_state(
+        self, element, _pspec, callback_context
+    ):
+        expected_session, attempt_id, expected_webrtc = callback_context
+        session = self._remote_dj_session_for_attempt(
+            attempt_id,
+            "server_ice_gathering_state",
+            expected_session=expected_session,
+            expected_webrtc=expected_webrtc,
+        )
+        if session is None:
+            return
+        state = element.props.ice_gathering_state
+        nick = getattr(state, "value_nick", None)
+        if session.connection_attempt.record_server_ice_gathering_state(nick):
+            _dj_diag(session, f"webrtc server_ice_gathering_state -> {nick}")
+            self._remote_dj_request_stats(session, f"server_ice_gathering_{nick}")
+
+    def _remote_dj_schedule_stats_burst(self, session):
+        if session.stats_burst_started:
+            return
+        attempt = getattr(session, "connection_attempt", None)
+        if attempt is None or session.webrtc is None:
+            return
+        session.stats_burst_started = True
+        context = (session, attempt.attempt_id, session.webrtc)
+        for delay_ms in REMOTE_DJ_STATS_PROBE_DELAYS_MS:
+            source_id = GLib.timeout_add(
+                delay_ms,
+                self._remote_dj_stats_probe_once,
+                context,
+                f"post_ice_{delay_ms}ms",
+            )
+            session.stats_probe_ids.append(source_id)
+
+    def _remote_dj_stats_probe_once(self, callback_context, trigger):
+        expected_session, attempt_id, expected_webrtc = callback_context
+        session = self._remote_dj_session_for_attempt(
+            attempt_id,
+            "stats_probe_timer",
+            expected_session=expected_session,
+            expected_webrtc=expected_webrtc,
+        )
+        if session is not None:
+            self._remote_dj_request_stats(session, trigger)
+        return False
+
+    def _remote_dj_request_stats(self, session, trigger):
+        attempt = getattr(session, "connection_attempt", None)
+        webrtc = getattr(session, "webrtc", None)
+        if attempt is None or webrtc is None:
+            return
+        current = self._remote_dj_session_for_attempt(
+            attempt.attempt_id,
+            "stats_request",
+            expected_session=session,
+            expected_webrtc=webrtc,
+        )
+        if current is None:
+            return
+        callback_context = (session, attempt.attempt_id, webrtc, trigger)
+        try:
+            promise = Gst.Promise.new_with_change_func(
+                self._remote_dj_on_stats_ready, callback_context
+            )
+            webrtc.emit("get-stats", None, promise)
+        except Exception as exc:
+            # Instrumentation is strictly best-effort and cannot fail a session.
+            _dj_diag(session, f"webrtc get-stats unavailable: {exc!r}")
+
+    def _remote_dj_on_stats_ready(self, promise, callback_context):
+        expected_session, attempt_id, expected_webrtc, trigger = callback_context
+        session = self._remote_dj_session_for_attempt(
+            attempt_id,
+            "server_stats",
+            expected_session=expected_session,
+            expected_webrtc=expected_webrtc,
+        )
+        if session is None:
+            return
+        try:
+            promise.wait()
+            reply = promise.get_reply()
+            parsed = parse_webrtc_stats(reply)
+        except Exception as exc:
+            _dj_diag(session, f"webrtc stats parse unavailable trigger={trigger}: {exc!r}")
+            return
+        session = self._remote_dj_session_for_attempt(
+            attempt_id,
+            "server_stats",
+            expected_session=expected_session,
+            expected_webrtc=expected_webrtc,
+        )
+        if session is None:
+            return
+        attempt = session.connection_attempt
+        previous_dtls = attempt.transport["server"]["dtls_state"]
+        previous_pair = attempt.transport["server"]["selected_pair"]["exists"]
+        previous_packets = attempt.media_stats["remote_mic"]["packets_received"]
+        attempt.apply_server_stats(parsed)
+        dtls_state = attempt.transport["server"]["dtls_state"]
+        pair_exists = attempt.transport["server"]["selected_pair"]["exists"]
+        if dtls_state != previous_dtls and dtls_state in {"connecting", "connected"}:
+            self._remote_dj_mark(session, f"dtls_{dtls_state}")
+        if pair_exists and not previous_pair:
+            self._remote_dj_mark(session, "selected_candidate_pair")
+        packets = attempt.media_stats["remote_mic"]["packets_received"]
+        if packets is not None and packets > 0 and not (previous_packets and previous_packets > 0):
+            self._remote_dj_mark(session, "first_remote_mic_rtp_observed")
 
     def _remote_dj_emit_failure(self, attempt, failure_class, reason):
         attempt.fail(failure_class, reason)
@@ -7598,7 +7785,34 @@ class PlaybackEngine:
         session.webrtc.connect("on-negotiation-needed", self._remote_dj_on_negotiation_needed)
         session.webrtc.connect("on-ice-candidate", self._remote_dj_on_ice_candidate)
         session.webrtc.connect("pad-added", self._remote_dj_on_pad_added)
-        session.webrtc.connect("notify::connection-state", self._remote_dj_on_connection_state)
+        callback_context = (
+            session,
+            session.connection_attempt.attempt_id,
+            session.webrtc,
+        )
+        session.webrtc.connect(
+            "notify::connection-state",
+            self._remote_dj_on_connection_state,
+            callback_context,
+        )
+        session.webrtc.connect(
+            "notify::ice-connection-state",
+            self._remote_dj_on_ice_connection_state,
+            callback_context,
+        )
+        session.webrtc.connect(
+            "notify::ice-gathering-state",
+            self._remote_dj_on_ice_gathering_state,
+            callback_context,
+        )
+        # Record the supported initial "new" states as actual property
+        # observations; notify signals only cover later transitions.
+        self._remote_dj_on_ice_connection_state(
+            session.webrtc, None, callback_context
+        )
+        self._remote_dj_on_ice_gathering_state(
+            session.webrtc, None, callback_context
+        )
 
         # Fix ladder [1] + [2] from
         # remote-dj-cellular-static-fix-ladder.md: sync the fast
@@ -7905,6 +8119,7 @@ class PlaybackEngine:
         if attempt is None:
             return
         self._remote_dj_mark(session, "inbound_source_pad")
+        self._remote_dj_request_stats(session, "inbound_source_pad")
         try:
             self._remote_dj_build_inbound_chain(session, pad, slot)
         except Exception as exc:
@@ -8082,6 +8297,7 @@ class PlaybackEngine:
                 slot2 = self.dj_slots[s.slot_id]
                 slot2.selector.set_property("active-pad", slot2.webrtc_pad)
                 self._remote_dj_mark(s, "first_decoded_remote_mic_buffer")
+                self._remote_dj_request_stats(s, "first_decoded_remote_mic_buffer")
                 print("  Remote DJ: slot selector switched from silence to WebRTC audio")
                 _dj_diag(s, f"slot {slot2.slot_id} selector switched to webrtc_pad (silence -> live)")
             except Exception as exc:
@@ -8146,16 +8362,28 @@ class PlaybackEngine:
         print("  Remote DJ: decode chain wired; waiting for first buffer to flip slot selector")
         session.real_buf_seen = True
 
-    def _remote_dj_on_connection_state(self, element, _pspec):
-        session = self.remote_dj_session
-        if session is None or session.webrtc is not element:
-            return
+    def _remote_dj_on_connection_state(self, element, _pspec, callback_context=None):
+        if callback_context is not None:
+            expected_session, attempt_id, expected_webrtc = callback_context
+            session = self._remote_dj_session_for_attempt(
+                attempt_id,
+                "peer_connection_state",
+                expected_session=expected_session,
+                expected_webrtc=expected_webrtc,
+            )
+            if session is None:
+                return
+        else:
+            session = self.remote_dj_session
+            if session is None or session.webrtc is not element:
+                return
         state = element.props.connection_state
         nick = state.value_nick
         attempt = getattr(session, "connection_attempt", None)
         attempt_id = attempt.attempt_id if attempt is not None else "untracked"
         print(f"  Remote DJ [{attempt_id}] connection state: {nick}")
         _dj_diag(session, f"webrtc connection_state -> {nick}")
+        self._remote_dj_request_stats(session, f"peer_{nick}")
         if state == GstWebRTC.WebRTCPeerConnectionState.CONNECTING:
             self._remote_dj_mark(session, "peer_connecting")
         elif state == GstWebRTC.WebRTCPeerConnectionState.CONNECTED:
@@ -8248,6 +8476,18 @@ class PlaybackEngine:
         if attempt is not None:
             self._remote_dj_last_attempt = attempt
         self.remote_dj_session = None
+
+        # Cancel the small post-ICE stats burst. Completed one-shots no
+        # longer have a source; generation guards also make any callback
+        # already dispatched harmless.
+        main_context = GLib.MainContext.default()
+        for source_id in session.stats_probe_ids:
+            try:
+                if main_context.find_source_by_id(source_id) is not None:
+                    GLib.source_remove(source_id)
+            except Exception:
+                pass
+        session.stats_probe_ids.clear()
 
         slot = self.dj_slots[session.slot_id] if session.slot_id is not None else None
 

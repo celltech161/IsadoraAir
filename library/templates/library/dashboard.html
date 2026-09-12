@@ -1796,6 +1796,8 @@ let rdjConnectStartedAt = null;
 let rdjAttemptId = null;
 let rdjIceServers = [];
 let rdjFirstIceCandidateSeen = false;
+let rdjStatsTimers = [];
+let rdjStatsBurstPc = null;
 
 const RDJ_GAIN_STORAGE_KEY = 'isadoraair.remote_dj.gain_db';
 
@@ -1820,6 +1822,96 @@ function rdjSendMilestone(milestone, elapsedMs = null) {
   rdjWs.send(JSON.stringify({type: 'milestone', milestone, elapsed_ms: Math.max(0, Math.round(elapsed * 10) / 10)}));
 }
 
+function rdjSafeCounter(value, signed = false) {
+  if (!Number.isSafeInteger(value)) return null;
+  if ((!signed && value < 0) || Math.abs(value) > Number.MAX_SAFE_INTEGER) return null;
+  return value;
+}
+
+function rdjSafeMs(value) {
+  return Number.isFinite(value) && value >= 0 && value <= 3600000
+    ? Math.round(value * 1000) / 1000 : null;
+}
+
+function rdjCandidateType(value) {
+  return ['host', 'srflx', 'prflx', 'relay'].includes(value) ? value : null;
+}
+
+function rdjCandidateProtocol(value) {
+  const protocol = typeof value === 'string' ? value.toLowerCase() : null;
+  return ['udp', 'tcp'].includes(protocol) ? protocol : null;
+}
+
+async function rdjCollectStats(pc, ws, attemptId) {
+  if (rdjPc !== pc || rdjWs !== ws || rdjAttemptId !== attemptId ||
+      !ws || ws.readyState !== WebSocket.OPEN) return;
+  let report;
+  try { report = await pc.getStats(); } catch (e) { return; }
+  if (rdjPc !== pc || rdjWs !== ws || rdjAttemptId !== attemptId ||
+      ws.readyState !== WebSocket.OPEN) return;
+
+  const inboundAudio = [];
+  const transports = [];
+  const selectedPairs = [];
+  report.forEach(stat => {
+    if (stat.type === 'inbound-rtp' && !stat.isRemote &&
+        (stat.kind === 'audio' || stat.mediaType === 'audio')) inboundAudio.push(stat);
+    if (stat.type === 'transport' && stat.selectedCandidatePairId) transports.push(stat);
+    if (stat.type === 'candidate-pair' && stat.state === 'succeeded' &&
+        (stat.selected === true || stat.nominated === true)) selectedPairs.push(stat);
+  });
+  inboundAudio.sort((a, b) => String(a.id).localeCompare(String(b.id)));
+  transports.sort((a, b) => String(a.id).localeCompare(String(b.id)));
+  selectedPairs.sort((a, b) => String(a.id).localeCompare(String(b.id)));
+  const inbound = inboundAudio[0] || null;
+  let pair = null;
+  if (transports.length === 1) pair = report.get(transports[0].selectedCandidatePairId) || null;
+  if (!pair && selectedPairs.length === 1) pair = selectedPairs[0];
+  const local = pair && pair.localCandidateId ? report.get(pair.localCandidateId) : null;
+  const remote = pair && pair.remoteCandidateId ? report.get(pair.remoteCandidateId) : null;
+  const localProtocol = local ? rdjCandidateProtocol(local.protocol) : null;
+  const remoteProtocol = remote ? rdjCandidateProtocol(remote.protocol) : null;
+  const protocol = localProtocol && localProtocol === remoteProtocol ? localProtocol : null;
+  const packetsReceived = inbound ? rdjSafeCounter(inbound.packetsReceived) : null;
+  const totalAudioEnergy = inbound && Number.isFinite(inbound.totalAudioEnergy) &&
+    inbound.totalAudioEnergy >= 0 && inbound.totalAudioEnergy <= 1000000000000
+    ? Math.round(inbound.totalAudioEnergy * 1000000) / 1000000 : null;
+  const elapsedMs = rdjConnectStartedAt === null ? null
+    : Math.max(0, Math.round((performance.now() - rdjConnectStartedAt) * 10) / 10);
+
+  ws.send(JSON.stringify({
+    type: 'stats',
+    elapsed_ms: elapsedMs,
+    stats: {
+      ice_state: pc.iceConnectionState,
+      rtt_ms: pair ? rdjSafeMs(pair.currentRoundTripTime * 1000) : null,
+      selected_pair: {
+        exists: !!pair,
+        local_candidate_type: local ? rdjCandidateType(local.candidateType) : null,
+        remote_candidate_type: remote ? rdjCandidateType(remote.candidateType) : null,
+        protocol: protocol,
+      },
+      inbound: {
+        packets_received: packetsReceived,
+        packets_lost: inbound ? rdjSafeCounter(inbound.packetsLost, true) : null,
+        jitter_ms: inbound ? rdjSafeMs(inbound.jitter * 1000) : null,
+        concealed_samples: inbound ? rdjSafeCounter(inbound.concealedSamples) : null,
+        concealment_events: inbound ? rdjSafeCounter(inbound.concealmentEvents) : null,
+        total_audio_energy: totalAudioEnergy,
+      },
+    },
+  }));
+}
+
+function rdjScheduleStatsBurst(pc, ws, attemptId) {
+  if (rdjStatsBurstPc === pc) return;
+  rdjStatsBurstPc = pc;
+  [0, 250, 750, 1500, 2500].forEach(delay => {
+    const timer = setTimeout(() => rdjCollectStats(pc, ws, attemptId), delay);
+    rdjStatsTimers.push(timer);
+  });
+}
+
 async function toggleRemoteDjConnect() {
   if (rdjPc || rdjWs) { rdjDisconnect(); return; }
   // [P1] 1.7 -- live engine mutation gate. Only guards STARTING a new
@@ -1835,6 +1927,9 @@ async function toggleRemoteDjConnect() {
   rdjAttemptId = null;
   rdjIceServers = [];
   rdjFirstIceCandidateSeen = false;
+  rdjStatsTimers.forEach(timer => clearTimeout(timer));
+  rdjStatsTimers = [];
+  rdjStatsBurstPc = null;
   btn.title = '';
 
   let token, tokenElapsedMs;
@@ -1874,23 +1969,35 @@ async function toggleRemoteDjConnect() {
       // for the earlier static-on-playing-deck race -- see
       // engine.py::_remote_dj_build_session's history).
       rdjPc = new RTCPeerConnection({iceServers: rdjIceServers});
+      const statsPc = rdjPc;
+      const statsWs = rdjWs;
+      const statsAttemptId = rdjAttemptId;
       rdjPc.onicecandidate = (e) => {
+        if (rdjPc !== statsPc || rdjWs !== statsWs || rdjAttemptId !== statsAttemptId) return;
         if (e.candidate) {
           if (!rdjFirstIceCandidateSeen) {
             rdjFirstIceCandidateSeen = true;
             rdjSendMilestone('first_browser_ice_candidate');
           }
-          rdjWs.send(JSON.stringify({type: 'ice', sdpMLineIndex: e.candidate.sdpMLineIndex, candidate: e.candidate.candidate}));
+          statsWs.send(JSON.stringify({type: 'ice', sdpMLineIndex: e.candidate.sdpMLineIndex, candidate: e.candidate.candidate}));
         }
       };
       rdjPc.oniceconnectionstatechange = () => {
-        if (rdjPc && rdjPc.iceConnectionState === 'checking') rdjSendMilestone('ice_checking');
-        if (rdjPc && ['connected', 'completed'].includes(rdjPc.iceConnectionState)) rdjSendMilestone('ice_connected');
-        if (rdjPc && ['failed', 'disconnected', 'closed'].includes(rdjPc.iceConnectionState)) {
+        if (rdjPc !== statsPc || rdjWs !== statsWs || rdjAttemptId !== statsAttemptId) return;
+        if (statsPc.iceConnectionState === 'checking') rdjSendMilestone('ice_checking');
+        if (['connected', 'completed'].includes(statsPc.iceConnectionState)) {
+          rdjSendMilestone('ice_connected');
+          rdjScheduleStatsBurst(statsPc, statsWs, statsAttemptId);
+        }
+        if (['failed', 'disconnected', 'closed'].includes(statsPc.iceConnectionState)) {
           rdjDisconnect();
         }
       };
-      rdjPc.ontrack = (e) => { document.getElementById('remoteMonitorAudio').srcObject = e.streams[0]; };
+      rdjPc.ontrack = (e) => {
+        if (rdjPc !== statsPc || rdjWs !== statsWs || rdjAttemptId !== statsAttemptId) return;
+        document.getElementById('remoteMonitorAudio').srcObject = e.streams[0];
+        rdjScheduleStatsBurst(statsPc, statsWs, statsAttemptId);
+      };
 
       await rdjPc.setRemoteDescription({type: 'offer', sdp: msg.sdp});
 
@@ -1965,6 +2072,9 @@ async function toggleRemoteDjConnect() {
 }
 
 function rdjDisconnect() {
+  rdjStatsTimers.forEach(timer => clearTimeout(timer));
+  rdjStatsTimers = [];
+  rdjStatsBurstPc = null;
   if (rdjPc) { rdjPc.close(); rdjPc = null; }
   if (rdjWs) { rdjWs.close(); rdjWs = null; }
   if (rdjAudioCtx) { rdjAudioCtx.close().catch(()=>{}); rdjAudioCtx = null; }

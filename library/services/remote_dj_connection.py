@@ -8,11 +8,19 @@ from urllib.parse import urlsplit
 
 from django.core.signing import BadSignature, TimestampSigner
 
+from library.services.remote_dj_stats import (
+    ICE_GATHERING_STATES,
+    ICE_STATES,
+    empty_media_stats_snapshot,
+    empty_transport_snapshot,
+)
+
 
 TOKEN_SALT = "isadoraair.remote-dj.attempt.v1"
 ATTEMPT_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{16,48}$")
 MAX_REASON_LENGTH = 240
 MAX_BROWSER_ELAPSED_MS = 60 * 60 * 1000
+MAX_TRANSPORT_TRANSITIONS = 12
 
 FAILURE_AUTHORIZATION_TOKEN = "authorization_token"
 FAILURE_SIGNALING_SESSION_BUSY = "signaling_session_busy"
@@ -42,11 +50,20 @@ MILESTONE_ORDER = (
     "answer_submitted",
     "first_server_ice_candidate",
     "first_browser_ice_candidate",
+    "server_ice_checking",
     "peer_connecting",
     "ice_checking",
+    "server_ice_connected",
     "ice_connected",
+    "server_ice_completed",
+    "selected_candidate_pair",
+    "dtls_connecting",
+    "dtls_connected",
     "peer_connected",
+    "first_monitor_rtp",
+    "first_monitor_audio_energy",
     "inbound_source_pad",
+    "first_remote_mic_rtp_observed",
     "first_decoded_remote_mic_buffer",
     "session_stopped",
 )
@@ -58,6 +75,9 @@ BROWSER_MILESTONES = frozenset({
     "first_browser_ice_candidate",
     "ice_checking",
     "ice_connected",
+    "selected_candidate_pair",
+    "first_monitor_rtp",
+    "first_monitor_audio_energy",
 })
 
 
@@ -154,7 +174,90 @@ class RemoteDJConnectionAttempt:
             "browser": {},
         }
         self.failure = None
+        # Fixed-key, JSON-safe observational state. Updates overwrite the
+        # current snapshot; no unbounded history or database telemetry exists.
+        self.transport = empty_transport_snapshot()
+        self.media_stats = empty_media_stats_snapshot()
         self._frozen_elapsed_ms = None
+
+    def record_server_ice_state(self, state):
+        if state not in ICE_STATES:
+            return False
+        previous = self.transport["server"]["ice_state"]
+        self.transport["server"]["ice_state"] = state
+        if state != previous:
+            transitions = self.transport["server"]["ice_transitions"]
+            if len(transitions) < MAX_TRANSPORT_TRANSITIONS:
+                transitions.append({
+                    "state": state,
+                    "elapsed_ms": round(self._server_elapsed_ms(), 1),
+                })
+        return True
+
+    def record_server_ice_gathering_state(self, state):
+        if state not in ICE_GATHERING_STATES:
+            return False
+        previous = self.transport["server"]["ice_gathering_state"]
+        self.transport["server"]["ice_gathering_state"] = state
+        if state != previous:
+            transitions = self.transport["server"]["ice_gathering_transitions"]
+            if len(transitions) < MAX_TRANSPORT_TRANSITIONS:
+                transitions.append({
+                    "state": state,
+                    "elapsed_ms": round(self._server_elapsed_ms(), 1),
+                })
+        return True
+
+    def record_server_dtls_state(self, state):
+        if state is None:
+            return False
+        previous = self.transport["server"]["dtls_state"]
+        self.transport["server"]["dtls_state"] = state
+        if state != previous:
+            observations = self.transport["server"]["dtls_state_observations"]
+            if len(observations) < MAX_TRANSPORT_TRANSITIONS:
+                observations.append({
+                    "state": state,
+                    "elapsed_ms": round(self._server_elapsed_ms(), 1),
+                })
+        return True
+
+    def apply_server_stats(self, parsed):
+        if not isinstance(parsed, dict):
+            return False
+        transport = parsed.get("transport", {})
+        if transport.get("dtls_state") is not None:
+            self.record_server_dtls_state(transport["dtls_state"])
+        if transport.get("dtls_role") is not None:
+            self.transport["server"]["dtls_role"] = transport["dtls_role"]
+        if isinstance(transport.get("selected_pair"), dict):
+            self.transport["server"]["selected_pair"] = dict(
+                transport["selected_pair"]
+            )
+        for section in ("remote_mic", "monitor_return"):
+            values = parsed.get(section)
+            if isinstance(values, dict):
+                for key in self.media_stats[section]:
+                    if values.get(key) is not None:
+                        self.media_stats[section][key] = values[key]
+        return True
+
+    def apply_browser_stats(self, sanitized):
+        if not isinstance(sanitized, dict):
+            return False
+        if sanitized.get("ice_state") is not None:
+            self.transport["browser"]["ice_state"] = sanitized["ice_state"]
+        if sanitized.get("rtt_ms") is not None:
+            self.transport["browser"]["rtt_ms"] = sanitized["rtt_ms"]
+        pair = sanitized.get("selected_pair")
+        if isinstance(pair, dict):
+            self.transport["browser"]["selected_pair"] = dict(pair)
+        inbound = sanitized.get("inbound")
+        if isinstance(inbound, dict):
+            for key in self.media_stats["browser_monitor"]:
+                if inbound.get(key) is not None:
+                    self.media_stats["browser_monitor"][key] = inbound[key]
+        return True
 
     def _server_elapsed_ms(self):
         return max(
@@ -217,6 +320,21 @@ class RemoteDJConnectionAttempt:
             source: dict(values)
             for source, values in self.milestones.items()
         }
+        transport_summary = {
+            domain: {
+                **values,
+                "selected_pair": dict(values["selected_pair"]),
+            }
+            for domain, values in self.transport.items()
+        }
+        for key in (
+            "ice_transitions",
+            "ice_gathering_transitions",
+            "dtls_state_observations",
+        ):
+            transport_summary["server"][key] = [
+                dict(item) for item in self.transport["server"][key]
+            ]
         return {
             "attempt_id": self.attempt_id,
             "status": self.status,
@@ -229,4 +347,9 @@ class RemoteDJConnectionAttempt:
             # from the local Connect click.
             "milestones_ms": milestone_summary,
             "failure": dict(self.failure) if self.failure is not None else None,
+            "transport": transport_summary,
+            "media_stats": {
+                section: dict(values)
+                for section, values in self.media_stats.items()
+            },
         }

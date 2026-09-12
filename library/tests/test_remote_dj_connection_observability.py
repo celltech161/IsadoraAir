@@ -148,6 +148,7 @@ class RemoteDJSignalingAttemptTests(SimpleTestCase):
             _remote_dj_handle_answer=MagicMock(),
             _remote_dj_handle_ice=MagicMock(),
             _remote_dj_record_browser_milestone=MagicMock(),
+            _remote_dj_record_browser_stats=MagicMock(),
             _remote_dj_record_signaling_failure=MagicMock(),
         )
         return signaling.RemoteDJSignalingServer(engine), engine
@@ -265,6 +266,39 @@ class RemoteDJSignalingAttemptTests(SimpleTestCase):
             idle_add.call_args_list[-1].args,
             (engine._remote_dj_session_stop, ATTEMPT_ID),
         )
+
+    def test_browser_stats_are_sanitized_and_bound_to_signed_attempt(self):
+        token, _payload = mint_remote_dj_token(42, attempt_id=ATTEMPT_ID)
+        ws = _FakeWebSocket(token, [json.dumps({
+            "type": "stats",
+            "elapsed_ms": 321.5,
+            "stats": {
+                "ice_state": "connected",
+                "selected_pair": {
+                    "exists": True,
+                    "local_candidate_type": "host",
+                    "remote_candidate_type": "prflx",
+                    "protocol": "udp",
+                    "address": "192.0.2.50",
+                },
+                "inbound": {"packets_received": 5},
+                "raw_candidate": "secret",
+            },
+        })])
+        server, engine = self._server()
+
+        with patch.object(signaling.GLib, "idle_add") as idle_add:
+            asyncio.run(server._handler(ws))
+
+        stats_call = next(
+            call for call in idle_add.call_args_list
+            if call.args and call.args[0] is engine._remote_dj_record_browser_stats
+        )
+        self.assertEqual(stats_call.args[1], ATTEMPT_ID)
+        self.assertEqual(stats_call.args[3], 321.5)
+        rendered = json.dumps(stats_call.args[2])
+        self.assertNotIn("192.0.2.50", rendered)
+        self.assertNotIn("secret", rendered)
 
 
 class RemoteDJAttemptTelemetryTests(SimpleTestCase):

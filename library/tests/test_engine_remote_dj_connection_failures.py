@@ -462,6 +462,8 @@ class RemoteDJEngineStateCompatibilityTests(SimpleTestCase):
                 "elapsed_ms",
                 "milestones_ms",
                 "failure",
+                "transport",
+                "media_stats",
             },
         )
         self.assertEqual(
