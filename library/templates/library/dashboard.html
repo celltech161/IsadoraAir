@@ -93,26 +93,50 @@
   #manualModeBtn.active { background: #d97706; border-color: #d97706; }
   #micPttBtn.active { background: var(--danger); border-color: var(--danger); }
   #micPttBtn:disabled { opacity: 0.55; }
-  #remoteDjConnectBtn.active { background: var(--accent); border-color: var(--accent); }
+  /* P1 1.5 r0074 -- the Remote DJ action and overall link state share
+     one fixed-size control.  Width and height are explicit so Offline,
+     Negotiating, Initializing, Good/Fair/Poor, and Reconnecting never
+     resize the flex item or move adjacent controls.  Two tight line
+     boxes fit inside the same compact 2rem footprint used before r0074.
+     Keep the connected state outlined rather than accent-filled so all
+     semantic status colors remain legible. */
+  #remoteDjConnectBtn {
+    box-sizing: border-box;
+    flex: 0 0 13em;
+    height: 2rem;
+    flex-direction: column;
+    gap: 0;
+    overflow: hidden;
+    white-space: nowrap;
+  }
+  #remoteDjConnectBtn.active {
+    background: transparent;
+    border-color: var(--accent);
+    color: var(--text-main);
+  }
+  .rdj-connect-action {
+    display: block;
+    font-size: 1em;
+    font-weight: 700;
+    line-height: 1;
+  }
+  .rdj-connect-status {
+    display: block;
+    font-size: 0.75em;
+    font-weight: 600;
+    line-height: 1;
+    color: var(--text-muted);
+  }
+  .rdj-connect-status.rdj-status-good { color: #22c55e; }
+  .rdj-connect-status.rdj-status-fair,
+  .rdj-connect-status.rdj-status-reconnecting { color: #d97706; }
+  .rdj-connect-status.rdj-status-poor { color: var(--danger); }
+  .rdj-connect-status.rdj-status-offline,
+  .rdj-connect-status.rdj-status-negotiating,
+  .rdj-connect-status.rdj-status-initializing { color: var(--text-muted); }
   #remoteDjConnectBtn.error { color: var(--danger); border-color: var(--danger); }
   #remoteDjGateBtn.active { background: var(--danger); border-color: var(--danger); }
   #remoteDjGateBtn:disabled { opacity: 0.5; }
-
-  /* P1 1.5 Pass B2 -- restrained link-quality indicator. Text-only, no
-     background fill (the DJ operates the station, not a network
-     dashboard) -- same warning amber #d97706 as .np-countdown.warning
-     and the same accent green as the VU meter, both already used
-     elsewhere on this page, rather than introducing new theme colors. */
-  #remoteDjQualityBadge {
-    align-self: center;
-    font-size: 0.85em;
-    font-weight: 600;
-    white-space: nowrap;
-  }
-  #remoteDjQualityBadge.rdj-quality-good { color: #22c55e; }
-  #remoteDjQualityBadge.rdj-quality-fair { color: #d97706; }
-  #remoteDjQualityBadge.rdj-quality-poor,
-  #remoteDjQualityBadge.rdj-quality-reconnecting { color: var(--danger); }
 
   /* [4.1] Remote Mic PTT VU meter -- the button fill IS the meter, a
      single ::before pseudo-element whose width tracks --remote-dj-vu-pct
@@ -170,6 +194,10 @@
       flex: 0 0 calc(50% - 0.3rem);
       font-size: 0.78rem;
       padding: 0 0.3rem;
+    }
+    #remoteDjConnectBtn {
+      flex-basis: calc(50% - 0.3rem);
+      height: 2rem;
     }
     .playnow-bar { justify-content: space-between; }
   }
@@ -1219,11 +1247,13 @@
   <button class="playnow-btn ops-btn" id="micPttBtn" onclick="toggleMicPtt()" disabled>Studio Mic: OFF</button>
   {% endif %}
   <button class="playnow-btn ops-btn" id="remoteDjConnectBtn" onclick="toggleRemoteDjConnect()" disabled
-          title="Connects THIS browser's mic into the on-air mix as the remote DJ. The Remote Mic button gates it on/off once connected.">Connect Remote</button>
+          aria-label="Connect Remote DJ — Offline"
+          title="Connects THIS browser's mic into the on-air mix as the remote DJ. The Remote Mic button gates it on/off once connected.">
+    <span id="remoteDjConnectAction" class="rdj-connect-action">Connect</span>
+    <span id="remoteDjConnectStatus" class="rdj-connect-status rdj-status-offline" aria-live="polite">Offline</span>
+  </button>
   <button class="playnow-btn ops-btn" id="remoteDjGateBtn" onclick="toggleRemoteDjGate()" disabled
           title="Opens/closes the currently-connected remote DJ's mic into the on-air mix. Disabled when no remote DJ is connected.">Remote Mic: —</button>
-  <span id="remoteDjQualityBadge" class="rdj-quality-badge" hidden
-        title="Sustained bidirectional link quality (Remote Mic uplink + Monitor Return downlink), not a signal-strength meter."></span>
 </div>
 <audio id="remoteMonitorAudio" autoplay style="display: none;"></audio>
 
@@ -1816,6 +1846,7 @@ let rdjIceServers = [];
 let rdjFirstIceCandidateSeen = false;
 let rdjStatsTimers = [];
 let rdjStatsBurstPc = null;
+let rdjConnecting = false;
 // P1 1.5 Pass B1 -- true from our OWN RTCPeerConnection observing
 // iceConnectionState 'disconnected' until it either recovers
 // ('connected'/'completed') or the connection is torn down (local
@@ -1955,6 +1986,20 @@ function rdjStartSustainedQualitySampling(pc, ws, attemptId) {
   );
 }
 
+// r0074 -- update the two text lines inside the existing real button.
+// No state ever adds/removes a sibling control, and CSS fixes the outer
+// dimensions independently of either string's intrinsic width/height.
+function rdjSetConnectPresentation(action, status, statusClass, ariaLabel) {
+  const btn = document.getElementById('remoteDjConnectBtn');
+  const actionLine = document.getElementById('remoteDjConnectAction');
+  const statusLine = document.getElementById('remoteDjConnectStatus');
+  if (!btn || !actionLine || !statusLine) return;
+  actionLine.textContent = action;
+  statusLine.textContent = status;
+  statusLine.className = 'rdj-connect-status rdj-status-' + statusClass;
+  btn.setAttribute('aria-label', ariaLabel);
+}
+
 async function toggleRemoteDjConnect() {
   if (rdjPc || rdjWs) { rdjDisconnect(); return; }
   // [P1] 1.7 -- live engine mutation gate. Only guards STARTING a new
@@ -1963,9 +2008,13 @@ async function toggleRemoteDjConnect() {
   // must stay available even while the status poll is stale.
   if (connectionStale) return;
   const btn = document.getElementById('remoteDjConnectBtn');
+  rdjConnecting = true;
   btn.classList.add('pending');
   btn.classList.remove('error');
-  btn.textContent = 'Connecting…';
+  rdjSetConnectPresentation(
+    'Connecting…', 'Negotiating', 'negotiating',
+    'Remote DJ connecting — Negotiating',
+  );
   rdjConnectStartedAt = performance.now();
   rdjAttemptId = null;
   rdjIceServers = [];
@@ -2030,9 +2079,12 @@ async function toggleRemoteDjConnect() {
         if (statsPc.iceConnectionState === 'checking') rdjSendMilestone('ice_checking');
         if (['connected', 'completed'].includes(statsPc.iceConnectionState)) {
           rdjReconnecting = false;
+          rdjConnecting = false;
+          document.getElementById('remoteDjConnectBtn')?.classList.remove('pending');
           rdjSendMilestone('ice_connected');
           rdjScheduleStatsBurst(statsPc, statsWs, statsAttemptId);
           rdjStartSustainedQualitySampling(statsPc, statsWs, statsAttemptId);
+          renderRemoteDjConnect(window.__rdjLastEngineState || {});
         }
         // P1 1.5 Pass B1 -- 'disconnected' is transient/recoverable (the
         // canonical case is a brief network blip or a WiFi<->cellular
@@ -2048,6 +2100,7 @@ async function toggleRemoteDjConnect() {
         // in rdjWs.onclose below).
         if (statsPc.iceConnectionState === 'disconnected') {
           rdjReconnecting = true;
+          renderRemoteDjConnect(window.__rdjLastEngineState || {});
         }
         if (['failed', 'closed'].includes(statsPc.iceConnectionState)) {
           rdjReconnecting = false;
@@ -2147,18 +2200,22 @@ async function toggleRemoteDjConnect() {
 
 function rdjDisconnect() {
   rdjReconnecting = false;
+  rdjConnecting = false;
   rdjStatsTimers.forEach(timer => clearTimeout(timer));
   rdjStatsTimers = [];
   rdjStatsBurstPc = null;
   if (rdjQualityIntervalId !== null) { clearInterval(rdjQualityIntervalId); rdjQualityIntervalId = null; }
-  renderRemoteDjQuality(null);
   if (rdjPc) { rdjPc.close(); rdjPc = null; }
   if (rdjWs) { rdjWs.close(); rdjWs = null; }
   if (rdjAudioCtx) { rdjAudioCtx.close().catch(()=>{}); rdjAudioCtx = null; }
   rdjGainNode = null;
   const audio = document.getElementById('remoteMonitorAudio');
   if (audio) audio.srcObject = null;
-  // renderRemoteDjConnect() will restore the button label from state.
+  const connectBtn = document.getElementById('remoteDjConnectBtn');
+  if (connectBtn) connectBtn.classList.remove('pending', 'active');
+  rdjSetConnectPresentation(
+    'Connect', 'Offline', 'offline', 'Connect Remote DJ — Offline',
+  );
 }
 
 function rdjConnectFail(msg) {
@@ -2166,55 +2223,86 @@ function rdjConnectFail(msg) {
   const btn = document.getElementById('remoteDjConnectBtn');
   btn.classList.remove('pending');
   btn.classList.add('error');
-  btn.textContent = msg;
+  rdjSetConnectPresentation(
+    'Connect', msg, 'poor', 'Connect Remote DJ — ' + msg,
+  );
   setTimeout(() => btn.classList.remove('error'), 3000);
 }
 
 function renderRemoteDjConnect(data) {
   const btn = document.getElementById('remoteDjConnectBtn');
   if (!btn) return;
+  data = data || {};
   const weAreConnected = !!rdjPc;
-  const someoneElseConnected = data.remote_dj_connected && !weAreConnected;
+  const someoneElseConnected = !!data.remote_dj_connected && !weAreConnected;
   // P1 1.5 Pass B1 -- prefer OUR OWN observed ICE state when we're the
   // connected browser (it updates the instant our RTCPeerConnection
   // sees 'disconnected', ahead of any poll); fall back to the engine's
   // reported remote_dj_reconnecting for anyone else watching this
   // console, so a bystander doesn't see a plain, indistinguishable
   // "Remote in use" while the slot is actually degraded and muted.
-  const reconnecting = weAreConnected ? rdjReconnecting : !!data.remote_dj_reconnecting;
+  // Engine B1/B1.1 is authoritative even when this browser's native
+  // ICE state remains nominally connected (the production media-loss
+  // case).  Local DISCONNECTED remains a faster supplemental signal.
+  const reconnecting = !!data.remote_dj_reconnecting || (weAreConnected && rdjReconnecting);
   btn.disabled = !data.remote_dj_configured || someoneElseConnected;
   btn.classList.toggle('active', weAreConnected);
   if (btn.classList.contains('error')) return;  // transient error msg wins for 3s
-  btn.classList.remove('pending');
-  btn.textContent = !data.remote_dj_configured ? 'Remote: n/a'
-    : weAreConnected ? (reconnecting ? 'Reconnecting…' : 'Disconnect Remote')
-    : someoneElseConnected ? (reconnecting ? 'Remote reconnecting…' : 'Remote in use')
-    : 'Connect Remote';
-}
-
-// P1 1.5 Pass B2 -- restrained "Remote Link: Good/Fair/Poor/Reconnecting"
-// indicator. `data.remote_dj_quality` is None until a session exists;
-// its `overall` is "initializing" until enough sustained samples have
-// accumulated in either direction -- both cases simply hide the badge
-// rather than showing a guessed or "Unknown" state (the Connect button
-// itself already communicates "Connecting…"/"Reconnecting…").
-// `pollNull` lets rdjDisconnect() clear the badge immediately on
-// teardown without waiting for the next ~1s poll() tick.
-function renderRemoteDjQuality(data) {
-  const badge = document.getElementById('remoteDjQualityBadge');
-  if (!badge) return;
-  const quality = data && data.remote_dj_quality;
-  if (!data || !data.remote_dj_connected || !quality || quality.overall === 'initializing') {
-    badge.hidden = true;
-    badge.className = 'rdj-quality-badge';
+  if (!data.remote_dj_configured) {
+    btn.classList.remove('pending');
+    rdjSetConnectPresentation(
+      'Connect', 'Unavailable', 'offline', 'Connect Remote DJ — Unavailable',
+    );
     return;
   }
-  const labels = {good: 'Good', fair: 'Fair', poor: 'Poor', reconnecting: 'Reconnecting'};
-  const label = labels[quality.overall];
-  if (!label) { badge.hidden = true; return; }
-  badge.hidden = false;
-  badge.className = 'rdj-quality-badge rdj-quality-' + quality.overall;
-  badge.textContent = 'Remote Link: ' + label;
+  if (reconnecting && (weAreConnected || someoneElseConnected)) {
+    btn.classList.remove('pending');
+    const action = weAreConnected ? 'Disconnect' : 'Remote in use';
+    const ariaAction = weAreConnected ? 'Disconnect Remote DJ' : 'Remote DJ in use';
+    rdjSetConnectPresentation(
+      action, 'Reconnecting…', 'reconnecting', ariaAction + ' — Reconnecting',
+    );
+    return;
+  }
+  if (rdjConnecting) {
+    rdjSetConnectPresentation(
+      'Connecting…', 'Negotiating', 'negotiating',
+      'Remote DJ connecting — Negotiating',
+    );
+    return;
+  }
+  const quality = data.remote_dj_quality;
+  const overall = quality && quality.overall;
+  const qualityPresentation = {
+    good: ['Good', 'good'],
+    fair: ['Fair', 'fair'],
+    poor: ['Poor', 'poor'],
+  };
+  const presentedQuality = qualityPresentation[overall];
+  if (weAreConnected || someoneElseConnected) {
+    btn.classList.remove('pending');
+    const action = weAreConnected ? 'Disconnect' : 'Remote in use';
+    const ariaAction = weAreConnected ? 'Disconnect Remote DJ' : 'Remote DJ in use';
+    if (presentedQuality) {
+      rdjSetConnectPresentation(
+        action,
+        presentedQuality[0],
+        presentedQuality[1],
+        ariaAction + ' — link quality ' + presentedQuality[0],
+      );
+    } else {
+      // Missing/initializing B2 data is truthful warm-up, never guessed Good.
+      rdjSetConnectPresentation(
+        action, 'Initializing…', 'initializing',
+        ariaAction + ' — link quality initializing',
+      );
+    }
+    return;
+  }
+  btn.classList.remove('pending');
+  rdjSetConnectPresentation(
+    'Connect', 'Offline', 'offline', 'Connect Remote DJ — Offline',
+  );
 }
 
 function renderRemoteDjGate(data) {
@@ -2964,7 +3052,6 @@ async function poll() {
   renderMicPtt(data);
   renderRemoteDjConnect(data);
   renderRemoteDjGate(data);
-  renderRemoteDjQuality(data);
   renderManualMode(data);
   reconcileFxFires(data.fx_fires);
 }

@@ -310,7 +310,7 @@ class RemoteDJQualitySamplerTests(TestCase):
 
 class RemoteDJQualityDashboardTemplateContractTests(TestCase):
     """Lightweight text-contract check on the browser-side sustained
-    sampler and UI indicator -- same pattern as
+    sampler and r0074's integrated button presentation -- same pattern as
     test_remote_dj_transport_observability.py's own template contract
     tests. #36-#39 (UI renders each state) are exercised via this
     static/deterministic contract rather than a browser automation
@@ -330,11 +330,17 @@ class RemoteDJQualityDashboardTemplateContractTests(TestCase):
     def test_sustained_sampler_stopped_on_disconnect(self):
         self.assertIn("clearInterval(rdjQualityIntervalId)", self.template)
 
-    def test_quality_render_function_maps_all_four_states(self):
-        self.assertIn("function renderRemoteDjQuality", self.template)
-        for level in ("good", "fair", "poor", "reconnecting"):
-            self.assertIn(f"{level}:", self.template.split("const labels")[1][:200])
+    def test_quality_button_maps_classifier_states(self):
+        renderer = self.template[
+            self.template.index("function renderRemoteDjConnect"):
+            self.template.index("function renderRemoteDjGate")
+        ]
+        for level in ("good", "fair", "poor"):
+            self.assertIn(f"{level}:", renderer)
+        self.assertIn("'Reconnecting…', 'reconnecting'", renderer)
 
-    def test_quality_badge_never_labeled_signal_strength(self):
+    def test_quality_is_integrated_not_a_signal_strength_badge(self):
         self.assertNotIn("Signal Strength", self.template)
-        self.assertIn("Remote Link:", self.template)
+        self.assertNotIn("Remote Link:", self.template)
+        self.assertNotIn("remoteDjQualityBadge", self.template)
+        self.assertIn("remoteDjConnectStatus", self.template)

@@ -438,7 +438,8 @@ class RemoteDJReconnectDashboardTemplateContractTests(TestCase):
     def test_reconnecting_flag_and_ui_text_present(self):
         self.assertIn("let rdjReconnecting = false;", self.template)
         self.assertIn("'Reconnecting…'", self.template)
-        self.assertIn("'Remote reconnecting…'", self.template)
+        self.assertIn("const reconnecting = !!data.remote_dj_reconnecting", self.template)
+        self.assertIn("weAreConnected ? 'Disconnect' : 'Remote in use'", self.template)
 
     def test_ws_onclose_finalizes_when_peer_still_open(self):
         self.assertIn("if (!rdjPc) { rdjConnectFail('Closed (' + e.code + ')'); return; }", self.template)
