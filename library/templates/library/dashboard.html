@@ -98,6 +98,22 @@
   #remoteDjGateBtn.active { background: var(--danger); border-color: var(--danger); }
   #remoteDjGateBtn:disabled { opacity: 0.5; }
 
+  /* P1 1.5 Pass B2 -- restrained link-quality indicator. Text-only, no
+     background fill (the DJ operates the station, not a network
+     dashboard) -- same warning amber #d97706 as .np-countdown.warning
+     and the same accent green as the VU meter, both already used
+     elsewhere on this page, rather than introducing new theme colors. */
+  #remoteDjQualityBadge {
+    align-self: center;
+    font-size: 0.85em;
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  #remoteDjQualityBadge.rdj-quality-good { color: #22c55e; }
+  #remoteDjQualityBadge.rdj-quality-fair { color: #d97706; }
+  #remoteDjQualityBadge.rdj-quality-poor,
+  #remoteDjQualityBadge.rdj-quality-reconnecting { color: var(--danger); }
+
   /* [4.1] Remote Mic PTT VU meter -- the button fill IS the meter, a
      single ::before pseudo-element whose width tracks --remote-dj-vu-pct
      (a CSS custom property set from JS in pollLevels()/renderRemoteDjVu,
@@ -1206,6 +1222,8 @@
           title="Connects THIS browser's mic into the on-air mix as the remote DJ. The Remote Mic button gates it on/off once connected.">Connect Remote</button>
   <button class="playnow-btn ops-btn" id="remoteDjGateBtn" onclick="toggleRemoteDjGate()" disabled
           title="Opens/closes the currently-connected remote DJ's mic into the on-air mix. Disabled when no remote DJ is connected.">Remote Mic: —</button>
+  <span id="remoteDjQualityBadge" class="rdj-quality-badge" hidden
+        title="Sustained bidirectional link quality (Remote Mic uplink + Monitor Return downlink), not a signal-strength meter."></span>
 </div>
 <audio id="remoteMonitorAudio" autoplay style="display: none;"></audio>
 
@@ -1919,6 +1937,24 @@ function rdjScheduleStatsBurst(pc, ws, attemptId) {
   });
 }
 
+// P1 1.5 Pass B2 -- sustained, low-rate (~1/s) downlink (Monitor Return)
+// quality sampling, separate from the connection-establishment burst
+// above. Reuses rdjCollectStats() and the SAME bounded/sanitized 'stats'
+// message the burst already sends over the existing authenticated
+// Remote DJ signaling channel -- no new transport, no new payload shape.
+// Started once per peer connection (mirrors rdjStatsBurstPc's own
+// dedup); stopped in rdjDisconnect() on teardown/explicit Disconnect.
+const RDJ_QUALITY_SAMPLE_INTERVAL_MS = 1000;
+let rdjQualityIntervalId = null;
+
+function rdjStartSustainedQualitySampling(pc, ws, attemptId) {
+  if (rdjQualityIntervalId !== null) return;
+  rdjQualityIntervalId = setInterval(
+    () => rdjCollectStats(pc, ws, attemptId),
+    RDJ_QUALITY_SAMPLE_INTERVAL_MS,
+  );
+}
+
 async function toggleRemoteDjConnect() {
   if (rdjPc || rdjWs) { rdjDisconnect(); return; }
   // [P1] 1.7 -- live engine mutation gate. Only guards STARTING a new
@@ -1996,6 +2032,7 @@ async function toggleRemoteDjConnect() {
           rdjReconnecting = false;
           rdjSendMilestone('ice_connected');
           rdjScheduleStatsBurst(statsPc, statsWs, statsAttemptId);
+          rdjStartSustainedQualitySampling(statsPc, statsWs, statsAttemptId);
         }
         // P1 1.5 Pass B1 -- 'disconnected' is transient/recoverable (the
         // canonical case is a brief network blip or a WiFi<->cellular
@@ -2021,6 +2058,7 @@ async function toggleRemoteDjConnect() {
         if (rdjPc !== statsPc || rdjWs !== statsWs || rdjAttemptId !== statsAttemptId) return;
         document.getElementById('remoteMonitorAudio').srcObject = e.streams[0];
         rdjScheduleStatsBurst(statsPc, statsWs, statsAttemptId);
+        rdjStartSustainedQualitySampling(statsPc, statsWs, statsAttemptId);
       };
 
       await rdjPc.setRemoteDescription({type: 'offer', sdp: msg.sdp});
@@ -2112,6 +2150,8 @@ function rdjDisconnect() {
   rdjStatsTimers.forEach(timer => clearTimeout(timer));
   rdjStatsTimers = [];
   rdjStatsBurstPc = null;
+  if (rdjQualityIntervalId !== null) { clearInterval(rdjQualityIntervalId); rdjQualityIntervalId = null; }
+  renderRemoteDjQuality(null);
   if (rdjPc) { rdjPc.close(); rdjPc = null; }
   if (rdjWs) { rdjWs.close(); rdjWs = null; }
   if (rdjAudioCtx) { rdjAudioCtx.close().catch(()=>{}); rdjAudioCtx = null; }
@@ -2150,6 +2190,31 @@ function renderRemoteDjConnect(data) {
     : weAreConnected ? (reconnecting ? 'Reconnecting…' : 'Disconnect Remote')
     : someoneElseConnected ? (reconnecting ? 'Remote reconnecting…' : 'Remote in use')
     : 'Connect Remote';
+}
+
+// P1 1.5 Pass B2 -- restrained "Remote Link: Good/Fair/Poor/Reconnecting"
+// indicator. `data.remote_dj_quality` is None until a session exists;
+// its `overall` is "initializing" until enough sustained samples have
+// accumulated in either direction -- both cases simply hide the badge
+// rather than showing a guessed or "Unknown" state (the Connect button
+// itself already communicates "Connecting…"/"Reconnecting…").
+// `pollNull` lets rdjDisconnect() clear the badge immediately on
+// teardown without waiting for the next ~1s poll() tick.
+function renderRemoteDjQuality(data) {
+  const badge = document.getElementById('remoteDjQualityBadge');
+  if (!badge) return;
+  const quality = data && data.remote_dj_quality;
+  if (!data || !data.remote_dj_connected || !quality || quality.overall === 'initializing') {
+    badge.hidden = true;
+    badge.className = 'rdj-quality-badge';
+    return;
+  }
+  const labels = {good: 'Good', fair: 'Fair', poor: 'Poor', reconnecting: 'Reconnecting'};
+  const label = labels[quality.overall];
+  if (!label) { badge.hidden = true; return; }
+  badge.hidden = false;
+  badge.className = 'rdj-quality-badge rdj-quality-' + quality.overall;
+  badge.textContent = 'Remote Link: ' + label;
 }
 
 function renderRemoteDjGate(data) {
@@ -2899,6 +2964,7 @@ async function poll() {
   renderMicPtt(data);
   renderRemoteDjConnect(data);
   renderRemoteDjGate(data);
+  renderRemoteDjQuality(data);
   renderManualMode(data);
   reconcileFxFires(data.fx_fires);
 }

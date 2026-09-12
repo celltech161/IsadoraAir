@@ -56,6 +56,7 @@ from library.services.remote_dj_stats import (
     sanitize_browser_elapsed_ms,
     sanitize_browser_stats_payload,
 )
+from library.services.remote_dj_quality import RemoteDJQualityTracker
 from library.services import audio_recovery
 from library.services.media_health import (
     MediaValidationWorker,
@@ -144,6 +145,16 @@ DJ_DUMP_PCM_ENABLED = False
 # connects. Together with event-edge probes these can expose a short DTLS gap
 # without creating a continuous/high-frequency diagnostic stream.
 REMOTE_DJ_STATS_PROBE_DELAYS_MS = (250, 750, 1500)
+# P1 1.5 Pass B2 -- sustained low-rate link-quality sampling, separate
+# from the one-shot burst above. 1 sample/second is the smallest cadence
+# that gives useful rolling evidence (see remote_dj_quality.py's
+# WINDOW_SECONDS) without adding meaningful per-session work: one
+# Promise-based get-stats() round trip server-side, matched by one
+# getStats() + small JSON send browser-side (see dashboard.html's
+# matching interval). Deliberately far below the 100ms dj_level meter
+# cadence -- this must never become another high-frequency diagnostic
+# stream.
+REMOTE_DJ_QUALITY_SAMPLE_INTERVAL_MS = 1000
 
 
 def _dj_diag(session, msg):
@@ -666,6 +677,14 @@ class RemoteDJSession:
         self.recovery_reason = None
         self.media_recovery_observations = 0
         self.media_recovery_first_monotonic = None
+        # P1 1.5 Pass B2 -- sustained bidirectional link-quality tracker.
+        # One instance per session (never shared across attempts); reset()
+        # on entering Reconnecting so a recovered session gets a genuine
+        # measurement warm-up instead of reusing pre-interruption evidence.
+        # See remote_dj_quality.py and _remote_dj_start_quality_sampler.
+        self.quality = RemoteDJQualityTracker()
+        self.quality_sampler_started = False
+        self.quality_sampler_source_id = 0
 
 
 class Deck:
@@ -7135,6 +7154,19 @@ class PlaybackEngine:
             attempt = getattr(self, "_remote_dj_last_attempt", None)
         return attempt.snapshot() if attempt is not None else None
 
+    def _remote_dj_quality_state(self):
+        """P1 1.5 Pass B2 -- compact current link-quality summary for the
+        ACTIVE session only (unlike _remote_dj_connection_state, this
+        deliberately does not fall back to _remote_dj_last_attempt --
+        quality is a live-session concept with no meaningful "last known"
+        reading once a session has ended). None while no session is
+        active; the dashboard hides the indicator in that case."""
+        session = getattr(self, "remote_dj_session", None)
+        attempt = getattr(session, "connection_attempt", None) if session is not None else None
+        if session is None or attempt is None:
+            return None
+        return session.quality.snapshot(attempt_status=attempt.status, now=time.monotonic())
+
     def _remote_dj_record_browser_milestone(
         self, attempt_id, milestone, elapsed_ms
     ):
@@ -7181,6 +7213,29 @@ class PlaybackEngine:
             self._remote_dj_mark(
                 session, "first_monitor_audio_energy", browser_elapsed_ms=elapsed_ms
             )
+
+        # P1 1.5 Pass B2 -- feed the sustained downlink (Monitor Return)
+        # quality sample from this SAME sanitized payload -- the browser
+        # is the receive end of this direction, so its own counters are
+        # authoritative (see remote_dj_quality.py's module docstring).
+        # This reuses the existing bounded "stats" websocket message the
+        # browser already sends during its connection-establishment
+        # burst; dashboard.html additionally now sends it on a sustained
+        # ~1s interval for the session's lifetime (see rdjCollectStats/
+        # the new sustained interval next to rdjScheduleStatsBurst).
+        # Skipped while Reconnecting -- same rationale as the uplink feed
+        # in _remote_dj_on_stats_ready.
+        if attempt.status != "reconnecting":
+            inbound = sanitized["inbound"]
+            session.quality.note_downlink_sample(
+                time.monotonic(),
+                packets_received=inbound["packets_received"],
+                packets_lost=inbound["packets_lost"],
+                jitter_ms=inbound["jitter_ms"],
+                concealed_samples=inbound["concealed_samples"],
+                concealment_events=inbound["concealment_events"],
+                rtt_ms=sanitized["rtt_ms"],
+            )
         return False
 
     def _remote_dj_on_ice_connection_state(
@@ -7210,6 +7265,7 @@ class PlaybackEngine:
         self._remote_dj_request_stats(session, f"server_ice_{nick}")
         if nick in {"connected", "completed"}:
             self._remote_dj_schedule_stats_burst(session)
+            self._remote_dj_start_quality_sampler(session)
 
     def _remote_dj_on_ice_gathering_state(
         self, element, _pspec, callback_context
@@ -7245,6 +7301,41 @@ class PlaybackEngine:
                 f"post_ice_{delay_ms}ms",
             )
             session.stats_probe_ids.append(source_id)
+
+    def _remote_dj_start_quality_sampler(self, session):
+        """P1 1.5 Pass B2 -- start the one sustained, low-rate get-stats
+        loop that feeds session.quality's uplink (Remote Mic) rolling
+        evidence. Idempotent per session (mirrors stats_burst_started);
+        started once ICE first reaches connected/completed and runs for
+        the rest of the session's life -- it is deliberately NOT paused
+        during Reconnecting (see _remote_dj_on_stats_ready, which is the
+        single place that decides whether a given reply actually feeds
+        the tracker). Stopped only at session teardown."""
+        if session.quality_sampler_started:
+            return
+        attempt = getattr(session, "connection_attempt", None)
+        if attempt is None or session.webrtc is None:
+            return
+        session.quality_sampler_started = True
+        context = (session, attempt.attempt_id, session.webrtc)
+        session.quality_sampler_source_id = GLib.timeout_add(
+            REMOTE_DJ_QUALITY_SAMPLE_INTERVAL_MS,
+            self._remote_dj_on_quality_sample_tick,
+            context,
+        )
+
+    def _remote_dj_on_quality_sample_tick(self, callback_context):
+        expected_session, attempt_id, expected_webrtc = callback_context
+        session = self._remote_dj_session_for_attempt(
+            attempt_id,
+            "quality_sample_timer",
+            expected_session=expected_session,
+            expected_webrtc=expected_webrtc,
+        )
+        if session is None:
+            return False  # session torn down/replaced -- stop this timer
+        self._remote_dj_request_stats(session, "quality_sample")
+        return True  # keep recurring
 
     def _remote_dj_stats_probe_once(self, callback_context, trigger):
         expected_session, attempt_id, expected_webrtc = callback_context
@@ -7328,6 +7419,28 @@ class PlaybackEngine:
         packets = attempt.media_stats["remote_mic"]["packets_received"]
         if packets is not None and packets > 0 and not (previous_packets and previous_packets > 0):
             self._remote_dj_mark(session, "first_remote_mic_rtp_observed")
+
+        # P1 1.5 Pass B2 -- feed the sustained uplink (Remote Mic) quality
+        # sample from the SAME reply this method already parses for every
+        # OTHER purpose (milestones, transport snapshot) -- no separate
+        # get-stats mechanism. Skipped while Reconnecting: B1/B1.1's
+        # attempt.status is authoritative for the DISPLAYED quality
+        # regardless (see remote_dj_quality.snapshot), and evidence
+        # gathered while the transport is known-down would only pollute
+        # the post-recovery warm-up window this tracker's reset() (called
+        # from _remote_dj_begin_recovery) already establishes.
+        if attempt.status != "reconnecting":
+            remote_mic = attempt.media_stats["remote_mic"]
+            media_age_s = None
+            if session.last_media_monotonic is not None:
+                media_age_s = max(0.0, time.monotonic() - session.last_media_monotonic)
+            session.quality.note_uplink_sample(
+                time.monotonic(),
+                packets_received=remote_mic["packets_received"],
+                packets_lost=remote_mic["packets_lost"],
+                jitter_ms=remote_mic["jitter_ms"],
+                media_age_s=media_age_s,
+            )
 
     def _remote_dj_emit_failure(self, attempt, failure_class, reason):
         attempt.fail(failure_class, reason)
@@ -8562,6 +8675,15 @@ class PlaybackEngine:
         session.recovery_reason = reason
         session.media_recovery_observations = 0
         session.media_recovery_first_monotonic = None
+        # P1 1.5 Pass B2 -- clear rolling quality evidence the moment
+        # Reconnecting is entered. B2 is purely observational here: it
+        # does not decide to enter Reconnecting (attempt.mark_reconnecting()
+        # above, owned entirely by B1/B1.1, already did that) -- it only
+        # makes sure the NEXT classification is a genuine post-recovery
+        # warm-up rather than an instant reuse of evidence gathered before
+        # the interruption (which could misleadingly read either Good or
+        # Poor).
+        session.quality.reset()
         grace_seconds = RemoteDJConfig.load().reconnect_grace_seconds
         print(
             f"  Remote DJ [{attempt_id}]: entering Reconnecting "
@@ -8859,6 +8981,16 @@ class PlaybackEngine:
             self._remote_dj_remove_glib_source(session.media_watchdog_source_id)
             session.media_watchdog_source_id = 0
             _dj_diag(session, "media_liveness_watchdog_cancelled")
+
+        # P1 1.5 Pass B2 -- stop the sustained quality sampler too, on
+        # every finalization route (grace expiry, native FAILED/CLOSED,
+        # explicit operator Disconnect). Same generation-guard-makes-a-
+        # late-dispatch-harmless discipline as every other Remote DJ
+        # timer; removing the source is just tidiness.
+        if getattr(session, "quality_sampler_source_id", 0):
+            self._remote_dj_remove_glib_source(session.quality_sampler_source_id)
+            session.quality_sampler_source_id = 0
+            _dj_diag(session, "quality_sampler_stopped")
 
         # P1 1.5 Pass B1 -- cancel a pending recovery-grace deadline too
         # (e.g. finalizing via native FAILED/CLOSED, or an explicit
@@ -10896,6 +11028,11 @@ class PlaybackEngine:
                 # evidence. Additive: the compatibility booleans above
                 # retain their exact meaning and shape.
                 "remote_dj_connection": self._remote_dj_connection_state(),
+                # P1 1.5 Pass B2 -- compact, direction-aware, hysteresis-
+                # smoothed link-quality summary (Good/Fair/Poor, forced to
+                # "reconnecting" whenever B1/B1.1 says so). Purely
+                # observational: see remote_dj_quality.py.
+                "remote_dj_quality": self._remote_dj_quality_state(),
                 # Authoritative FX Cart playback state -- see
                 # _fx_fires_state's own docstring. Drives the dashboard's
                 # progress-bar reconciliation regardless of what
