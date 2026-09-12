@@ -9,9 +9,9 @@ resume/seek position had just been applied -- observed live
 2026-07-31/08-01 as a listener-facing bug: a track audibly restarted
 from the beginning partway through an engine restart's auto-resume.
 
-_on_deck_eos_probed checks the deck's actual position against its
-track's recorded duration before trusting an EOS as genuine, but ONLY
-within a short window (SEEK_EOS_GUARD_SECONDS) after an actual seek was
+_on_deck_eos_probed checks the deck's independent wall-clock media
+position against its track's recorded duration before trusting an EOS,
+but ONLY within a short window (SEEK_EOS_GUARD_SECONDS) after an actual seek was
 applied (Deck.seeked_at) -- an unseeked deck's EOS is trusted exactly
 as it always was, deliberately narrowing the risk surface to just the
 scenario there's independent reason to suspect. The margin itself is
@@ -93,11 +93,15 @@ def make_deck(slot="A", duration_seconds=180.0, title="Test Track", seconds_sinc
 
 
 class EOSPlausibilityTests(TransactionTestCase):
-    def _probe(self, stand_in, deck, position):
+    def _probe(self, stand_in, deck, position, *, wall_position=None):
         deck_bin = object()
         stand_in._deck_bin_map[id(deck_bin)] = deck
         stand_in._get_deck_position = MagicMock(return_value=position)
-        stand_in._handle_deck_finished = MagicMock()
+        deck.started_at = time.time() - (
+            position if wall_position is None else wall_position
+        )
+        if "_handle_deck_finished" not in stand_in.__dict__:
+            stand_in._handle_deck_finished = MagicMock()
         eng_module.PlaybackEngine._on_deck_eos_probed(stand_in, deck_bin)
         return stand_in._handle_deck_finished
 
@@ -133,6 +137,68 @@ class EOSPlausibilityTests(TransactionTestCase):
         self.assertFalse(deck.finished, "the deck must be left alone, not marked finished")
         self.assertIn("I_EOS_REJECTED_POST_SEEK", deck.eos_milestones)
         self.assertNotIn("I_EOS_ACCEPTED", deck.eos_milestones)
+
+    def test_bogus_near_duration_query_cannot_complete_recent_mid_file_seek(self):
+        """Regression for the r0064 production failure.
+
+        GStreamer reports the 60s segment end while the independent media
+        clock says the deck has only reached 30s.  Unmodified r0064 trusted
+        that successful query, accepted EOS, and started the successor.
+        """
+        stand_in = make_stand_in()
+        deck = make_deck(duration_seconds=60.0)
+        stand_in._start_next_track = MagicMock()
+        stand_in._handle_deck_finished = MagicMock(
+            side_effect=lambda _deck: stand_in._start_next_track()
+        )
+
+        with (
+            patch.object(eng_module.time, "time", return_value=1000.0),
+            patch.object(eng_module.GLib, "timeout_add_seconds", return_value=1),
+            patch.object(eng_module, "emit_event"),
+        ):
+            deck.seeked_at = 999.9
+            mock_finished = self._probe(
+                stand_in, deck, position=60.0, wall_position=29.9
+            )
+
+        stand_in._get_deck_position.assert_not_called()
+        mock_finished.assert_not_called()
+        stand_in._start_next_track.assert_not_called()
+        self.assertFalse(deck.completion_claimed)
+        self.assertTrue(deck.deferred_seek_eos_pending)
+        self.assertIn("I_EOS_REJECTED_POST_SEEK", deck.eos_milestones)
+
+    def test_eos_during_each_gated_seek_phase_cannot_claim_completion(self):
+        for phase in ("prerolling", "seeking", "confirming"):
+            with self.subTest(phase=phase):
+                stand_in = make_stand_in()
+                deck = make_deck(duration_seconds=60.0)
+                operation = {"phase": phase}
+                deck.gated_seek = operation
+                deck.seeked_at = None
+                stand_in._start_next_track = MagicMock()
+                stand_in._handle_deck_finished = MagicMock(
+                    side_effect=lambda _deck: stand_in._start_next_track()
+                )
+
+                with patch.object(
+                    eng_module.GLib, "timeout_add_seconds"
+                ) as schedule_deferred:
+                    mock_finished = self._probe(
+                        stand_in, deck, position=60.0, wall_position=30.0
+                    )
+
+                self.assertIs(deck.gated_seek, operation)
+                self.assertIsNone(deck.seeked_at)
+                self.assertFalse(deck.completion_claimed)
+                self.assertIn(
+                    "I_EOS_IGNORED_GATED_SEEK", deck.eos_milestones
+                )
+                stand_in._get_deck_position.assert_not_called()
+                mock_finished.assert_not_called()
+                stand_in._start_next_track.assert_not_called()
+                schedule_deferred.assert_not_called()
 
     # -- Plausibility margin, within the seek window --
 

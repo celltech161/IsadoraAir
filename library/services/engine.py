@@ -9117,7 +9117,19 @@ class PlaybackEngine:
         # concurrent engine-startup load) wasn't and can't safely be
         # replicated in an isolated script -- if a deck genuinely goes
         # silent after this fires, that's the next thing to chase.
-        recent_seek = deck.seeked_at is not None and (time.time() - deck.seeked_at) <= SEEK_EOS_GUARD_SECONDS
+        # While the gated-seek state machine owns this generation, an EOS
+        # event that passes its BUFFER-only gate cannot independently retire
+        # the deck.  Once the operation resolves, any later EOS is evaluated
+        # under the normal recent-seek or natural-completion rules below.
+        if deck.gated_seek is not None:
+            deck.mark_milestone("I_EOS_IGNORED_GATED_SEEK")
+            return
+
+        now = time.time()
+        recent_seek = (
+            deck.seeked_at is not None
+            and (now - deck.seeked_at) <= SEEK_EOS_GUARD_SECONDS
+        )
         if recent_seek:
             duration = deck.track.duration_seconds or 0
             if duration:
@@ -9127,7 +9139,18 @@ class PlaybackEngine:
                 # IDs, sweepers, WxAlert/UrgentPA inserts, dedication
                 # intros are ALL shorter than that 30s margin.
                 margin = min(DECK_STUCK_TIMEOUT_SECONDS, duration / 2)
-                pos = self._get_deck_position(deck)
+                # query_position(TIME) can report the segment end while EOS
+                # is propagating, even when physical playback has only just
+                # reached a mid-file seek target.  Use the independent media
+                # timeline maintained by started_at for this EOS-only check;
+                # _get_deck_position remains unchanged for normal UI/playback
+                # reads.  Missing started_at is conservatively treated as 0
+                # rather than allowing a near-duration query to claim EOS.
+                pos = (
+                    max(0.0, now - deck.started_at)
+                    if deck.started_at is not None
+                    else 0.0
+                )
                 if pos < duration - margin:
                     deck.mark_milestone("I_EOS_REJECTED_POST_SEEK")
                     print(f"  [{deck.slot}] Ignoring implausible post-seek EOS at {pos:.1f}s "
@@ -9138,7 +9161,7 @@ class PlaybackEngine:
                         detail={
                             "slot": deck.slot, "track_id": deck.track.id, "track_title": deck.track.title,
                             "position_seconds": round(pos, 1), "duration_seconds": round(duration, 1),
-                            "seconds_since_seek": round(time.time() - deck.seeked_at, 1),
+                            "seconds_since_seek": round(now - deck.seeked_at, 1),
                         },
                         dedupe_key=f"engine|implausible-eos|slot={deck.slot}|track={deck.track.id}",
                     )
