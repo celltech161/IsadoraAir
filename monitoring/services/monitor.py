@@ -69,11 +69,19 @@ class MonitorManager:
 
         # P1 1.11 -- supervision-marker evidence. See
         # monitoring/services/supervision.py's own docstring for the
-        # full mechanism; None here means either the first invocation
-        # since boot or a missing/malformed marker, neither of which is
-        # ever treated as an incident.
-        prior_invocation = supervision.record_new_invocation(runtime_commit=self._runtime_commit)
-        if supervision.prior_invocation_was_unclean(prior_invocation):
+        # full mechanism; prior_invocation=None means either the first
+        # invocation since boot or a missing/malformed marker, neither
+        # of which is ever treated as an incident. `marker_armed` gates
+        # the report on THIS invocation's own marker write having
+        # actually succeeded -- see record_new_invocation's own
+        # docstring for why an unwritable/full /run/isadoraair must
+        # never be allowed to (a) crash startup, or (b) cause the same
+        # stale prior record to be re-reported as a fresh incident on
+        # every subsequent restart while persistence stays broken.
+        prior_invocation, marker_armed = supervision.record_new_invocation(
+            runtime_commit=self._runtime_commit,
+        )
+        if marker_armed and supervision.prior_invocation_was_unclean(prior_invocation):
             emit_event(
                 category="monitor", level="error",
                 title="Monitoring service recovered after an unclean stop",

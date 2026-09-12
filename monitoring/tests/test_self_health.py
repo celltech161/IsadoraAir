@@ -10,9 +10,10 @@ from monitoring.models import MonitorCheck
 from monitoring.services import self_health
 
 
-def _systemctl_result(stdout):
+def _systemctl_result(stdout, returncode=0):
     result = MagicMock()
     result.stdout = stdout
+    result.returncode = returncode
     return result
 
 
@@ -93,6 +94,110 @@ class BuildOverrideStatusTests(TestCase):
         ):
             status, _detail = self_health._build_override_status(31.0)
         self.assertNotEqual(status, "ok")
+
+    def test_nonzero_returncode_reports_systemd_unavailable_not_inactive(self):
+        """Safety correction: a FAILED systemctl invocation (e.g. the
+        system bus unreachable) must be reason=
+        "heartbeat_stale_systemd_unavailable", never misclassified as
+        reason="service_inactive" -- the latter is a positive claim
+        that systemd confirmed the unit is not running, which a failed
+        query never actually established."""
+        with patch(
+            "monitoring.services.self_health.subprocess.run",
+            return_value=_systemctl_result("ActiveState=inactive\nSubState=dead\n", returncode=1),
+        ):
+            status, detail = self_health._build_override_status(45.0)
+        self.assertEqual(status, "critical")
+        self.assertEqual(detail["reason"], "heartbeat_stale_systemd_unavailable")
+        self.assertNotIn("active_state", detail)
+
+
+class ProbeMonitoringUnitActiveStateTests(TestCase):
+    """Direct unit tests of _probe_monitoring_unit_active_state()'s own
+    contract -- returns (active_state, sub_state) ONLY when systemd
+    actually, successfully reported a usable state; None in every
+    other case. See self_health.py's own docstring for why this
+    distinction matters (a failed query must never be confused with a
+    successful "not active" report)."""
+
+    def test_normal_active_running_result(self):
+        with patch(
+            "monitoring.services.self_health.subprocess.run",
+            return_value=_systemctl_result("ActiveState=active\nSubState=running\n"),
+        ):
+            result = self_health._probe_monitoring_unit_active_state()
+        self.assertEqual(result, ("active", "running"))
+
+    def test_normal_inactive_failed_result(self):
+        with patch(
+            "monitoring.services.self_health.subprocess.run",
+            return_value=_systemctl_result("ActiveState=failed\nSubState=failed\n"),
+        ):
+            result = self_health._probe_monitoring_unit_active_state()
+        self.assertEqual(result, ("failed", "failed"))
+
+    def test_nonzero_return_code_is_none_even_with_active_looking_output(self):
+        """The exact bug being corrected: previously, only stdout was
+        parsed and returncode was ignored entirely -- a failed
+        systemctl invocation that happened to print SOMETHING
+        active-state-shaped (e.g. stale/cached output on some systemd
+        versions, or a partial write before failing) would have been
+        trusted as a real result."""
+        with patch(
+            "monitoring.services.self_health.subprocess.run",
+            return_value=_systemctl_result("ActiveState=active\nSubState=running\n", returncode=1),
+        ):
+            result = self_health._probe_monitoring_unit_active_state()
+        self.assertIsNone(result)
+
+    def test_empty_output_with_return_code_zero_is_none(self):
+        with patch(
+            "monitoring.services.self_health.subprocess.run",
+            return_value=_systemctl_result("", returncode=0),
+        ):
+            result = self_health._probe_monitoring_unit_active_state()
+        self.assertIsNone(result)
+
+    def test_malformed_output_missing_active_state_key_is_none(self):
+        with patch(
+            "monitoring.services.self_health.subprocess.run",
+            return_value=_systemctl_result("SubState=running\n", returncode=0),
+        ):
+            result = self_health._probe_monitoring_unit_active_state()
+        self.assertIsNone(result)
+
+    def test_active_state_present_but_empty_value_is_none(self):
+        with patch(
+            "monitoring.services.self_health.subprocess.run",
+            return_value=_systemctl_result("ActiveState=\nSubState=\n", returncode=0),
+        ):
+            result = self_health._probe_monitoring_unit_active_state()
+        self.assertIsNone(result)
+
+    def test_missing_binary_is_none(self):
+        with patch(
+            "monitoring.services.self_health.subprocess.run",
+            side_effect=FileNotFoundError("no such binary"),
+        ):
+            result = self_health._probe_monitoring_unit_active_state()
+        self.assertIsNone(result)
+
+    def test_timeout_is_none(self):
+        import subprocess
+        with patch(
+            "monitoring.services.self_health.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd="systemctl", timeout=5),
+        ):
+            result = self_health._probe_monitoring_unit_active_state()
+        self.assertIsNone(result)
+
+    def test_generic_oserror_is_none(self):
+        with patch(
+            "monitoring.services.self_health.subprocess.run",
+            side_effect=OSError("some other subprocess failure"),
+        ):
+            result = self_health._probe_monitoring_unit_active_state()
+        self.assertIsNone(result)
 
 
 class ApplySelfHealthOverrideTests(TestCase):

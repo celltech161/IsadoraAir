@@ -237,3 +237,32 @@ class SupervisionMarkerIntegrationTests(TestCase):
 
         data = json.loads(self.marker_path.read_text())
         self.assertFalse(data["clean_shutdown"])
+
+    def test_start_survives_an_unwritable_supervision_marker(self):
+        """Safety correction: an OSError writing the supervision marker
+        (unwritable/full /run/isadoraair, a permissions regression)
+        must NEVER prevent Monitoring from starting -- this is
+        supplemental evidence only, and a Restart=on-failure crash
+        loop over a filesystem problem this feature has no business
+        being fatal about would be strictly worse than just not having
+        the evidence."""
+        manager = self._make_manager_that_runs_one_trivial_cycle()
+        with patch.object(supervision, "_write_marker", side_effect=OSError("disk full")):
+            manager.start()  # must not raise
+        # No incident event either -- armed=False must suppress it (see
+        # test_supervision.py's SupervisionMarkerBestEffortTests for the
+        # focused proof of that contract).
+        self.assertFalse(
+            SystemEvent.objects.filter(dedupe_key="monitor|unclean-restart-recovered").exists()
+        )
+
+    def test_graceful_shutdown_completes_with_marker_unavailable(self):
+        """The mirror case: the marker is unwritable for the ENTIRE
+        invocation (start through the graceful stop path) -- start()
+        must still run its cycle and reach "Monitoring stopped."
+        normally, and mark_clean_shutdown() (also best-effort) must not
+        raise either."""
+        manager = self._make_manager_that_runs_one_trivial_cycle()
+        with patch.object(supervision, "_write_marker", side_effect=OSError("disk full")):
+            manager.start()  # must not raise anywhere, including mark_clean_shutdown()
+        self.assertFalse(self.marker_path.exists())

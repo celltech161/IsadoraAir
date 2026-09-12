@@ -62,8 +62,28 @@ _UTC_ENV = {**os.environ, "TZ": "UTC"}
 
 
 def _probe_monitoring_unit_active_state():
-    """Returns (active_state, sub_state) or None on any subprocess
-    failure (missing systemctl binary, timeout, non-UTF8 output, ...).
+    """Returns (active_state, sub_state) ONLY when systemd actually
+    provided a valid, successful ActiveState -- None in every other
+    case:
+      * subprocess.run() raised (missing systemctl binary, ...);
+      * the command timed out;
+      * a NONZERO return code -- systemctl itself failed (e.g. the
+        system/session bus is unreachable, dbus is down) rather than
+        successfully reporting the unit's state;
+      * output that doesn't contain a usable (non-empty) ActiveState
+        at all.
+
+    This distinction matters: a failed/unavailable systemctl query
+    must surface as reason="heartbeat_stale_systemd_unavailable" (see
+    _build_override_status), never be misclassified as
+    reason="service_inactive" -- the latter is a POSITIVE claim that
+    systemd confirmed the unit is not running, a materially different
+    and more specific statement than "we could not ask." Silently
+    defaulting a missing ActiveState to "unknown" (the earlier version
+    of this function did) would have made an inconclusive query look
+    identical to "systemd says the unit is not active," which is
+    exactly the misclassification this corrects.
+
     A narrow, read-only reuse of probe_systemd's exact `systemctl show`
     invocation shape (monitoring/services/probes.py) -- not calling
     that function directly since it takes a MonitorCheck instance and
@@ -79,12 +99,17 @@ def _probe_monitoring_unit_active_state():
         )
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return None
+    if result.returncode != 0:
+        return None
     props = {}
     for line in result.stdout.splitlines():
         if "=" in line:
             key, _, value = line.partition("=")
             props[key] = value
-    return props.get("ActiveState", "unknown"), props.get("SubState", "")
+    active_state = props.get("ActiveState")
+    if not active_state:
+        return None
+    return active_state, props.get("SubState", "")
 
 
 def _build_override_status(heartbeat_age_seconds):

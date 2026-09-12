@@ -51,23 +51,49 @@ def _write_marker(data):
 
 def record_new_invocation(*, runtime_commit=None):
     """Called exactly once, from MonitorManager.start(), before the
-    poll loop begins. Returns the PRIOR marker's dict (or None if this
-    is the first invocation since boot, or the file was missing/
-    malformed -- both treated identically as "nothing to report") --
-    the caller decides whether that prior record's clean_shutdown is
-    worth a SystemEvent, since emitting one needs a real Django DB
-    write this module has no business making itself. Always writes a
-    FRESH marker for the new invocation, clean_shutdown=False, before
-    returning, regardless of what (if anything) was read."""
+    poll loop begins. Returns (prior, armed):
+
+      * prior -- the PRIOR marker's dict, or None if this is the first
+        invocation since boot, or the prior file was missing/malformed
+        -- all three treated identically as "nothing to report." The
+        read is unconditional and always attempted regardless of
+        whether the write below succeeds.
+      * armed -- True if THIS invocation's own fresh marker was
+        actually written; False if that write failed (an unwritable/
+        full /run/isadoraair, a permissions regression, or any other
+        OSError).
+
+    The supervision marker is SUPPLEMENTAL evidence only, never part
+    of Monitoring's own authoritative health signal
+    (monitoring_state.json) -- this function NEVER raises. A failure
+    to persist it must never prevent the poller from starting or
+    stopping normally, and must never turn into a Restart=on-failure
+    crash loop over a filesystem problem this feature has no business
+    being fatal about.
+
+    The caller MUST treat `prior` as reportable evidence ONLY when
+    `armed` is True. Rationale: if persistence itself is broken
+    (write fails every time), every subsequent invocation would
+    otherwise keep re-reading the SAME stale prior marker (nothing
+    ever succeeds in overwriting it) and re-report the identical
+    incident on every single restart forever. Gating on `armed`
+    collapses that to "stay silent while storage is unavailable"
+    instead -- a single missed incident report under a rare
+    persistence hiccup is the correct trade against spamming the same
+    stale incident indefinitely."""
     prior = _read_marker()
-    _write_marker({
-        "pid": os.getpid(),
-        "invocation_id": uuid.uuid4().hex,
-        "started_at": time.time(),
-        "runtime_commit": runtime_commit,
-        "clean_shutdown": False,
-    })
-    return prior
+    try:
+        _write_marker({
+            "pid": os.getpid(),
+            "invocation_id": uuid.uuid4().hex,
+            "started_at": time.time(),
+            "runtime_commit": runtime_commit,
+            "clean_shutdown": False,
+        })
+        armed = True
+    except OSError:
+        armed = False
+    return prior, armed
 
 
 def mark_clean_shutdown():

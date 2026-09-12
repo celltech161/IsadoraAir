@@ -25,9 +25,10 @@ def _write(path, data):
     path.write_text(json.dumps(data), encoding="utf-8")
 
 
-def _systemctl_result(stdout):
+def _systemctl_result(stdout, returncode=0):
     result = MagicMock()
     result.stdout = stdout
+    result.returncode = returncode
     return result
 
 
