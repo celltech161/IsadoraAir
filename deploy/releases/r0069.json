@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "release_id": "r0069",
+  "previous_release_id": "r0068",
+  "minimum_updater_protocol_version": 5,
+  "summary": "Corrective fix for a r0068 Remote DJ regression: _remote_dj_add_element() treated Gst.Bin.add()'s Python return value as the success signal, but on the production Ubuntu/PyGObject/GStreamer runtime that call returns None even when the element was actually added and parented, causing every Remote DJ connection to fail with a false 'could not add to the main pipeline' error. Now verified by the element's actual parent instead.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-engine"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0007"
+}
