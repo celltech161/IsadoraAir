@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "release_id": "r0073",
+  "previous_release_id": "r0072",
+  "minimum_updater_protocol_version": 5,
+  "summary": "P1 1.5 Pass B2 -- sustained ~1Hz bidirectional Remote DJ link-quality telemetry (Remote Mic uplink from server stats, Monitor Return downlink from browser stats), classified into a hysteresis-smoothed Good/Fair/Poor with Reconnecting authoritative from B1/B1.1. RTT and media-age are corroborating-only signals capped at 'fair' so neither can independently force 'poor'. Purely observational -- no gate/PTT/Manual/recovery/Opus change. Adds a restrained 'Remote Link' indicator to the dashboard.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-engine",
+    "isadoraair-gunicorn"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0007"
+}
