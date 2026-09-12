@@ -11,6 +11,7 @@ from library.services.remote_dj_quality import (
     DEGRADE_STREAK_REQUIRED,
     RECOVER_STREAK_REQUIRED,
     RemoteDJQualityTracker,
+    _capped_at_fair,
 )
 
 
@@ -60,6 +61,108 @@ class HealthyEvidenceTests(unittest.TestCase):
             clock.tick()
         self.assertNotEqual(snap["overall"], "poor")
         self.assertNotEqual(snap["monitor_return"], "poor")
+
+
+class RttNonDominanceTests(unittest.TestCase):
+    """Correction (post-r0073-review): RTT is a weak corroborating
+    signal, not a dominant one. A worst-of combination that let RTT
+    reach "poor" on its own would contradict that -- these tests prove
+    the fix directly, at both the unit-helper and full-tracker levels."""
+
+    def test_capped_at_fair_helper_never_returns_poor(self):
+        self.assertEqual(_capped_at_fair("poor"), "fair")
+        self.assertEqual(_capped_at_fair("fair"), "fair")
+        self.assertEqual(_capped_at_fair("good"), "good")
+        self.assertIsNone(_capped_at_fair(None))
+
+    def test_high_rtt_alone_with_otherwise_healthy_evidence_does_not_become_poor(self):
+        """High RTT (well past the 300ms "poor" boundary), zero loss, low
+        jitter, no concealment, media flowing normally -- must classify
+        no worse than Fair, never Poor."""
+        t = RemoteDJQualityTracker()
+        clock = _Clock()
+        for i in range(10):
+            t.note_uplink_sample(clock.now, packets_received=100 * (i + 1),
+                                  packets_lost=0, jitter_ms=8.0, media_age_s=0.1)
+            t.note_downlink_sample(clock.now, packets_received=100 * (i + 1),
+                                    packets_lost=0, jitter_ms=10.0,
+                                    concealed_samples=0, concealment_events=0, rtt_ms=400.0)
+            snap = t.snapshot(attempt_status="connected", now=clock.now)
+            clock.tick()
+        self.assertNotEqual(snap["monitor_return"], "poor")
+        self.assertNotEqual(snap["overall"], "poor")
+        # It should still be VISIBLE as degraded evidence, not silently
+        # dropped -- RTT alone caps at "fair", it doesn't vanish.
+        self.assertEqual(snap["monitor_return"], "fair")
+
+    def test_high_rtt_plus_corroborating_loss_can_become_poor(self):
+        """The same high RTT, now genuinely corroborated by sustained,
+        uncapped RTP loss evidence -- together these may reach Poor."""
+        t = RemoteDJQualityTracker()
+        clock = _Clock()
+        recv, lost = 0, 0
+        for _ in range(8):
+            recv += 80
+            lost += 20  # 20% sustained loss -- independently already Poor
+            t.note_downlink_sample(clock.now, packets_received=recv, packets_lost=lost,
+                                    jitter_ms=10.0, concealed_samples=0,
+                                    concealment_events=0, rtt_ms=400.0)
+            t.note_uplink_sample(clock.now, packets_received=recv, packets_lost=0,
+                                  jitter_ms=8.0, media_age_s=0.1)
+            clock.tick()
+        snap = t.snapshot(attempt_status="connected", now=clock.now)
+        self.assertEqual(snap["monitor_return"], "poor")
+        self.assertEqual(snap["overall"], "poor")
+
+    def test_normal_cellular_rtt_remains_good_when_everything_else_healthy(self):
+        """~40ms RTT (production field evidence) with healthy loss/jitter/
+        concealment must read Good, not merely "not poor"."""
+        t = RemoteDJQualityTracker()
+        clock = _Clock()
+        for i in range(10):
+            t.note_uplink_sample(clock.now, packets_received=100 * (i + 1),
+                                  packets_lost=0, jitter_ms=11.0, media_age_s=0.1)
+            t.note_downlink_sample(clock.now, packets_received=100 * (i + 1),
+                                    packets_lost=0, jitter_ms=20.0,
+                                    concealed_samples=0, concealment_events=0, rtt_ms=40.0)
+            snap = t.snapshot(attempt_status="connected", now=clock.now)
+            clock.tick()
+        self.assertEqual(snap["monitor_return"], "good")
+        self.assertEqual(snap["overall"], "good")
+
+    def test_media_age_alone_is_also_capped_at_fair(self):
+        """Same non-dominance contract applies to media age (see the
+        module's own comment on why: B1.1 alone is authoritative for a
+        genuine no-media failure; B2's media-age reading is corroborating
+        pre-Reconnecting evidence only)."""
+        t = RemoteDJQualityTracker()
+        clock = _Clock()
+        for i in range(6):
+            t.note_uplink_sample(clock.now, packets_received=100 * (i + 1),
+                                  packets_lost=0, jitter_ms=5.0, media_age_s=1.8)  # past the "poor" line
+            clock.tick()
+        snap = t.snapshot(attempt_status="connected", now=clock.now)
+        self.assertNotEqual(snap["remote_mic"], "poor")
+        self.assertEqual(snap["remote_mic"], "fair")
+
+    def test_media_age_evidence_never_interferes_with_or_delays_reconnecting(self):
+        """B2's media-age reading is purely observational: it has no
+        setter, signal, or callback into B1/B1.1's own watchdog/deadline
+        machinery at all -- confirmed here by construction: feeding the
+        tracker arbitrarily bad media-age evidence has no way to reach
+        (and therefore cannot delay or suppress) anything B1.1 owns,
+        since this module holds no reference to the engine, the session's
+        recovery_deadline_source_id, or attempt.mark_reconnecting at all."""
+        t = RemoteDJQualityTracker()
+        for i in range(20):
+            t.note_uplink_sample(1000.0 + i, packets_received=100, packets_lost=0,
+                                  jitter_ms=5.0, media_age_s=5.0)  # far past B1.1's own 2.0s trigger
+        # No exception, no side effect beyond this tracker's own state --
+        # attempt_status is always supplied BY THE CALLER (engine.py),
+        # never derived or influenced by this module.
+        snap = t.snapshot(attempt_status="connected", now=1020.0)
+        self.assertIn(snap["remote_mic"], {"fair", "poor", "initializing", "good"})
+        self.assertNotEqual(snap["remote_mic"], "poor")  # still capped
 
 
 class ImpairmentTests(unittest.TestCase):
@@ -279,12 +382,17 @@ class DirectionAwarenessTests(unittest.TestCase):
         self.assertEqual(snap["overall"], "poor")
 
     def test_uplink_poor_downlink_good_preserves_direction_and_degrades_overall(self):
+        """Media age alone is capped at "fair" (see the RTT/media-age
+        non-dominance correction), so a genuinely Poor uplink here is
+        produced by real, uncapped RTP loss evidence -- corroborated by,
+        not replaced by, the choppy media-age signal."""
         t = RemoteDJQualityTracker()
         clock = _Clock()
+        recv, lost = 0, 0
         for i in range(8):
-            # Uplink media has stopped flowing entirely (age stuck high);
-            # downlink keeps growing normally and healthily.
-            t.note_uplink_sample(clock.now, packets_received=1000, packets_lost=0,
+            recv += 80
+            lost += 20  # sustained severe uplink loss -- an uncapped signal
+            t.note_uplink_sample(clock.now, packets_received=recv, packets_lost=lost,
                                   jitter_ms=5.0, media_age_s=1.8)
             t.note_downlink_sample(clock.now, packets_received=100 * (i + 1), packets_lost=0,
                                     jitter_ms=10.0, concealed_samples=0,

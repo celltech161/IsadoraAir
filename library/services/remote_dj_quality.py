@@ -70,10 +70,17 @@ LOSS_FAIR_MAX_PCT = 5.0
 JITTER_GOOD_MAX_MS = 50.0
 JITTER_FAIR_MAX_MS = 150.0
 # RTT is one weak signal among several, not a dominant one -- a stable
-# 80-120ms link with no loss/concealment is usable. Thresholds are set
-# high enough that RTT alone essentially never drives a healthy link to
-# Poor; it can only additionally corroborate what loss/jitter/concealment
-# already show.
+# 80-120ms link with no loss/concealment is usable. These thresholds
+# are used to compute RTT's OWN good/fair/poor reading, but that
+# reading is then capped at "fair" (see _capped_at_fair below) before
+# joining the worst-of computation: RTT can push a direction from Good
+# to Fair by itself, and can CORROBORATE an already-Fair-or-worse
+# reading up to Poor together with loss/jitter/concealment/media
+# evidence, but sustained high RTT alone -- with everything else
+# healthy -- can never independently reach Poor. A single fixed
+# threshold ("high" or "not") would collapse the Good/Fair distinction
+# for genuinely low-RTT links; keeping both thresholds preserves that
+# while the cap enforces the non-dominance contract.
 RTT_GOOD_MAX_MS = 150.0
 RTT_FAIR_MAX_MS = 300.0
 # Concealment (browser downlink only): event-COUNT delta over the
@@ -84,9 +91,19 @@ CONCEALMENT_EVENTS_GOOD_MAX = 0
 CONCEALMENT_EVENTS_FAIR_MAX = 3
 # Media-flow freshness (uplink only -- from the existing B1.1
 # last_media_monotonic clock, seconds since the last decoded buffer).
-# Kept comfortably under B1.1's REMOTE_DJ_MEDIA_LIVENESS_TIMEOUT_S
-# (2.0s) so this can flag "getting worse" before B1.1 would force
-# Reconnecting outright.
+# B1.1 authoritatively declares the session Reconnecting once this age
+# reaches REMOTE_DJ_MEDIA_LIVENESS_TIMEOUT_S (2.0s), checked on its own
+# independent 500ms watchdog -- entirely without consulting this
+# module. Given B2's DEGRADE_STREAK_REQUIRED (3 sustained ~1Hz ticks),
+# a raw "poor" reading from media age alone has at most ~1-2 ticks to
+# accumulate before B1.1 already forces Reconnecting and this module
+# stops being fed (see the "reconnecting" skip in engine.py) -- it
+# essentially never has time to become a STABLE Poor on its own. Rather
+# than leave a Poor threshold that reads as meaningful but is not
+# reachable in practice, media age's own contribution is likewise
+# capped at "fair": it can flag "flow is getting choppy" pre-emptively
+# as one corroborating signal, but B1.1 alone remains the sole
+# authority for an actual no-media failure.
 MEDIA_AGE_GOOD_MAX_S = 1.0
 MEDIA_AGE_FAIR_MAX_S = 1.5
 
@@ -97,6 +114,16 @@ def _worse(a, b):
     if b is None:
         return a
     return a if LEVEL_RANK[a] >= LEVEL_RANK[b] else b
+
+
+def _capped_at_fair(level):
+    """RTT and media-age are corroborating signals, never independently
+    dominant: neither may push a direction to "poor" by itself. Loss,
+    jitter, and concealment are NOT capped -- any one of them can still
+    independently reach "poor" (see the existing sustained-impairment
+    tests), and a capped-at-fair signal can still corroborate one of
+    THOSE up to an overall "poor" via the normal worst-of combination."""
+    return "fair" if level == "poor" else level
 
 
 class _BoundedCounterHistory:
@@ -210,17 +237,31 @@ def _level_for(value, good_max, fair_max, *, higher_is_worse=True):
 def _direction_level(*, loss_pct, jitter_ms, rtt_ms, concealment_events_delta=None,
                       media_age_s=None):
     """Worst-of the available signals for one direction. None inputs are
-    simply skipped -- missing evidence never counts as bad evidence."""
+    simply skipped -- missing evidence never counts as bad evidence.
+
+    RTT and media age are corroborating-only: each is capped at "fair"
+    before joining the worst-of so neither can independently force
+    "poor" on an otherwise healthy direction (see _capped_at_fair and
+    the RTT_*/MEDIA_AGE_* constants' own comments). Loss, jitter, and
+    concealment are NOT capped -- any one of them can still
+    independently reach "poor", and a corroborating signal already
+    capped at "fair" can still combine with one of those (via the
+    normal worst-of below) to produce an overall "poor" when both are
+    degraded together."""
     level = None
     level = _worse(level, _level_for(loss_pct, LOSS_GOOD_MAX_PCT, LOSS_FAIR_MAX_PCT))
     level = _worse(level, _level_for(jitter_ms, JITTER_GOOD_MAX_MS, JITTER_FAIR_MAX_MS))
-    level = _worse(level, _level_for(rtt_ms, RTT_GOOD_MAX_MS, RTT_FAIR_MAX_MS))
+    level = _worse(level, _capped_at_fair(
+        _level_for(rtt_ms, RTT_GOOD_MAX_MS, RTT_FAIR_MAX_MS)
+    ))
     if concealment_events_delta is not None:
         level = _worse(level, _level_for(
             concealment_events_delta, CONCEALMENT_EVENTS_GOOD_MAX, CONCEALMENT_EVENTS_FAIR_MAX,
         ))
     if media_age_s is not None:
-        level = _worse(level, _level_for(media_age_s, MEDIA_AGE_GOOD_MAX_S, MEDIA_AGE_FAIR_MAX_S))
+        level = _worse(level, _capped_at_fair(
+            _level_for(media_age_s, MEDIA_AGE_GOOD_MAX_S, MEDIA_AGE_FAIR_MAX_S)
+        ))
     return level
 
 
