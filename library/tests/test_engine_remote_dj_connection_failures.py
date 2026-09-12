@@ -14,12 +14,141 @@ from django.test import SimpleTestCase, TestCase
 import library.services.engine as eng_module
 from library.services.remote_dj_connection import (
     FAILURE_DEPENDENCY_SESSION_BUILD,
+    FAILURE_MEDIA_ROUTING,
     RemoteDJConnectionAttempt,
 )
 from library.tests.test_engine_runtime_commit import make_minimal_stand_in
 
 
 ATTEMPT_ID = "A1_engine_attempt_12345"
+OTHER_ATTEMPT_ID = "B2_engine_attempt_67890"
+
+
+class RemoteDJGenerationBindingTests(SimpleTestCase):
+    def setUp(self):
+        Gst.init(None)
+        self.engine = object.__new__(eng_module.PlaybackEngine)
+        self.engine._remote_dj_server = MagicMock()
+        self.current = self._session(OTHER_ATTEMPT_ID)
+        self.engine.remote_dj_session = self.current
+
+    @staticmethod
+    def _session(attempt_id):
+        session = eng_module.RemoteDJSession()
+        session.connection_attempt = RemoteDJConnectionAttempt(
+            attempt_id, 1_700_000_000_000
+        )
+        session.webrtc = MagicMock()
+        return session
+
+    def test_stale_browser_milestone_cannot_modify_current_attempt(self):
+        self.engine._remote_dj_record_browser_milestone(
+            ATTEMPT_ID, "ice_checking", 125.0
+        )
+        self.assertEqual(self.current.connection_attempt.milestones["browser"], {})
+
+        self.engine._remote_dj_record_browser_milestone(
+            OTHER_ATTEMPT_ID, "ice_checking", 130.0
+        )
+        self.assertEqual(
+            self.current.connection_attempt.milestones["browser"]["ice_checking"],
+            130.0,
+        )
+
+    def test_stale_answer_cannot_be_applied_to_current_webrtc(self):
+        self.engine._remote_dj_handle_answer(ATTEMPT_ID, "stale-sdp")
+        self.current.webrtc.emit.assert_not_called()
+        self.assertNotIn(
+            "answer_received",
+            self.current.connection_attempt.milestones["server"],
+        )
+
+    def test_matching_answer_is_submitted_to_current_webrtc(self):
+        sdp = (
+            "v=0\r\n"
+            "o=- 0 0 IN IP4 127.0.0.1\r\n"
+            "s=-\r\n"
+            "t=0 0\r\n"
+            "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n"
+        )
+        self.engine._remote_dj_handle_answer(OTHER_ATTEMPT_ID, sdp)
+        self.assertEqual(
+            self.current.webrtc.emit.call_args.args[0],
+            "set-remote-description",
+        )
+        milestones = self.current.connection_attempt.milestones["server"]
+        self.assertIn("answer_received", milestones)
+        self.assertIn("answer_submitted", milestones)
+
+    def test_stale_ice_cannot_be_added_but_matching_ice_still_is(self):
+        self.engine._remote_dj_handle_ice(
+            ATTEMPT_ID, 0, "stale-candidate"
+        )
+        self.current.webrtc.emit.assert_not_called()
+
+        self.engine._remote_dj_handle_ice(
+            OTHER_ATTEMPT_ID, 1, "current-candidate"
+        )
+        self.current.webrtc.emit.assert_called_once_with(
+            "add-ice-candidate", 1, "current-candidate"
+        )
+
+    def test_stale_signaling_disconnect_cannot_stop_current_session(self):
+        self.engine._remote_dj_session_stop(ATTEMPT_ID)
+        self.assertIs(self.engine.remote_dj_session, self.current)
+
+    def test_stale_offer_promise_callbacks_cannot_touch_current_session(self):
+        stale = self._session(ATTEMPT_ID)
+        offer_promise = MagicMock()
+        local_desc_promise = MagicMock()
+
+        self.engine._remote_dj_on_offer_created(
+            offer_promise, (stale, ATTEMPT_ID, stale.webrtc)
+        )
+        self.engine._remote_dj_on_local_desc_set(
+            local_desc_promise,
+            (stale, ATTEMPT_ID, stale.webrtc, "stale-offer"),
+        )
+
+        offer_promise.wait.assert_not_called()
+        local_desc_promise.wait.assert_not_called()
+        self.current.webrtc.emit.assert_not_called()
+        self.engine._remote_dj_server.send_json_threadsafe.assert_not_called()
+
+    def test_matching_local_description_callback_queues_offer(self):
+        promise = MagicMock()
+        self.engine._remote_dj_on_local_desc_set(
+            promise,
+            (
+                self.current,
+                OTHER_ATTEMPT_ID,
+                self.current.webrtc,
+                "current-offer",
+            ),
+        )
+
+        promise.wait.assert_called_once()
+        self.engine._remote_dj_server.send_json_threadsafe.assert_called_once_with(
+            {"type": "offer", "sdp": "current-offer"}
+        )
+        self.assertIn(
+            "offer_queued",
+            self.current.connection_attempt.milestones["server"],
+        )
+
+    def test_stale_inbound_failure_cannot_fail_current_session(self):
+        stale = self._session(ATTEMPT_ID)
+        with patch.object(eng_module, "emit_event") as emit_event:
+            self.engine._remote_dj_fail_bound_session(
+                stale,
+                ATTEMPT_ID,
+                FAILURE_MEDIA_ROUTING,
+                "stale inbound build failed",
+            )
+
+        self.assertIs(self.engine.remote_dj_session, self.current)
+        self.assertIsNone(self.current.connection_attempt.failure)
+        emit_event.assert_not_called()
 
 
 class RemoteDJTransceiverBuildGuardTests(SimpleTestCase):

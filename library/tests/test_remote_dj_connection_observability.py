@@ -1,4 +1,5 @@
 import asyncio
+import itertools
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -167,7 +168,8 @@ class RemoteDJSignalingAttemptTests(SimpleTestCase):
             payload["issued_at_ms"],
         ))
         self.assertEqual(
-            idle_add.call_args_list[-1].args, (engine._remote_dj_session_stop,)
+            idle_add.call_args_list[-1].args,
+            (engine._remote_dj_session_stop, payload["attempt_id"]),
         )
 
     def test_invalid_token_is_rejected_before_engine_crossing(self):
@@ -216,13 +218,58 @@ class RemoteDJSignalingAttemptTests(SimpleTestCase):
         )
         self.assertEqual(
             milestone_call.args,
-            (engine._remote_dj_record_browser_milestone, "browser_token_received", 12.3),
+            (
+                engine._remote_dj_record_browser_milestone,
+                ATTEMPT_ID,
+                "browser_token_received",
+                12.3,
+            ),
+        )
+
+    def test_answer_ice_and_finally_callbacks_carry_signed_attempt(self):
+        token, _payload = mint_remote_dj_token(
+            42, attempt_id=ATTEMPT_ID
+        )
+        messages = [
+            json.dumps({"type": "answer", "sdp": "answer-sdp"}),
+            json.dumps({
+                "type": "ice",
+                "sdpMLineIndex": 3,
+                "candidate": "candidate-value",
+            }),
+        ]
+        ws = _FakeWebSocket(token, messages)
+        server, engine = self._server()
+
+        with patch.object(signaling.GLib, "idle_add") as idle_add:
+            asyncio.run(server._handler(ws))
+
+        self.assertIn(
+            (
+                engine._remote_dj_handle_answer,
+                ATTEMPT_ID,
+                "answer-sdp",
+            ),
+            [call.args for call in idle_add.call_args_list],
+        )
+        self.assertIn(
+            (
+                engine._remote_dj_handle_ice,
+                ATTEMPT_ID,
+                3,
+                "candidate-value",
+            ),
+            [call.args for call in idle_add.call_args_list],
+        )
+        self.assertEqual(
+            idle_add.call_args_list[-1].args,
+            (engine._remote_dj_session_stop, ATTEMPT_ID),
         )
 
 
 class RemoteDJAttemptTelemetryTests(SimpleTestCase):
     def _attempt(self):
-        monotonic_values = iter((10.0, 10.1, 10.2, 10.3, 10.4))
+        monotonic_values = itertools.count(10.0, 0.1)
         return RemoteDJConnectionAttempt(
             ATTEMPT_ID,
             1_700_000_000_000,
@@ -236,7 +283,9 @@ class RemoteDJAttemptTelemetryTests(SimpleTestCase):
         attempt.record("glib_session_start")
         attempt.record("browser_token_received", browser_elapsed_ms=20)
         self.assertEqual(attempt.stage, "glib_session_start")
-        self.assertEqual(attempt.milestones["browser_token_received"], 20.0)
+        self.assertEqual(
+            attempt.milestones["browser"]["browser_token_received"], 20.0
+        )
         snapshot = attempt.snapshot()
         self.assertEqual(
             snapshot["milestones_ms"]["browser"]["browser_token_received"],
@@ -244,7 +293,20 @@ class RemoteDJAttemptTelemetryTests(SimpleTestCase):
         )
         self.assertIn("glib_session_start", snapshot["milestones_ms"]["server"])
 
-    def test_duplicate_unknown_and_unbounded_milestones_are_rejected(self):
+    def test_browser_and_server_same_phase_are_retained_independently(self):
+        attempt = self._attempt()
+        self.assertTrue(attempt.record(
+            "first_browser_ice_candidate", browser_elapsed_ms=45.0
+        ))
+        self.assertTrue(attempt.record("first_browser_ice_candidate"))
+
+        snapshot = attempt.snapshot()["milestones_ms"]
+        self.assertEqual(
+            snapshot["browser"]["first_browser_ice_candidate"], 45.0
+        )
+        self.assertIn("first_browser_ice_candidate", snapshot["server"])
+
+    def test_duplicates_are_suppressed_only_within_each_domain(self):
         attempt = self._attempt()
         self.assertTrue(
             attempt.record("browser_token_received", browser_elapsed_ms=20)
@@ -252,11 +314,32 @@ class RemoteDJAttemptTelemetryTests(SimpleTestCase):
         self.assertFalse(
             attempt.record("browser_token_received", browser_elapsed_ms=30)
         )
+        self.assertTrue(attempt.record("browser_token_received"))
+        self.assertFalse(attempt.record("browser_token_received"))
+
+    def test_unknown_and_unbounded_browser_milestones_are_rejected(self):
+        attempt = self._attempt()
         self.assertFalse(attempt.record("client_chose_this"))
         self.assertFalse(
             attempt.record("ice_connected", browser_elapsed_ms=99_000_000)
         )
-        self.assertEqual(len(attempt.milestones), 2)
+        self.assertEqual(attempt.milestones["browser"], {})
+        self.assertEqual(
+            attempt.milestones["server"], {"token_issued": 0.0}
+        )
+
+    def test_stage_progression_is_deterministic_across_timing_domains(self):
+        attempt = self._attempt()
+        attempt.record("websocket_admitted")
+        attempt.record("browser_websocket_open", browser_elapsed_ms=25)
+        attempt.record("glib_session_start")
+        attempt.record("session_build_completed")
+        attempt.record("ice_checking", browser_elapsed_ms=100)
+        attempt.record("peer_connecting")
+        self.assertEqual(attempt.stage, "ice_checking")
+        attempt.record("peer_connected")
+        self.assertEqual(attempt.stage, "peer_connected")
+        self.assertEqual(attempt.status, "connected")
 
     def test_failure_vocabulary_and_reason_are_bounded_in_snapshot(self):
         attempt = self._attempt()

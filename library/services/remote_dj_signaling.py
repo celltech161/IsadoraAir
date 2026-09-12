@@ -118,10 +118,15 @@ class RemoteDJSignalingServer:
                     continue
                 msg_type = data.get("type")
                 if msg_type == "answer":
-                    GLib.idle_add(self.engine._remote_dj_handle_answer, data.get("sdp"))
+                    GLib.idle_add(
+                        self.engine._remote_dj_handle_answer,
+                        attempt_id,
+                        data.get("sdp"),
+                    )
                 elif msg_type == "ice":
                     GLib.idle_add(
                         self.engine._remote_dj_handle_ice,
+                        attempt_id,
                         data.get("sdpMLineIndex"), data.get("candidate"),
                     )
                 elif msg_type == "milestone":
@@ -129,6 +134,7 @@ class RemoteDJSignalingServer:
                     if milestone in BROWSER_MILESTONES:
                         GLib.idle_add(
                             self.engine._remote_dj_record_browser_milestone,
+                            attempt_id,
                             milestone,
                             data.get("elapsed_ms"),
                         )
@@ -138,7 +144,9 @@ class RemoteDJSignalingServer:
             if self._ws is ws:
                 self._ws = None
                 print(f"  Remote DJ disconnected: attempt={attempt_id}")
-                GLib.idle_add(self.engine._remote_dj_session_stop)
+                GLib.idle_add(
+                    self.engine._remote_dj_session_stop, attempt_id
+                )
 
     def send_json_threadsafe(self, obj):
         """Called from the GLib/GStreamer thread to deliver a message

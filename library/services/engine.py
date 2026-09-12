@@ -7010,10 +7010,10 @@ class PlaybackEngine:
             milestone, browser_elapsed_ms=browser_elapsed_ms
         )
         if recorded:
-            elapsed = attempt.milestones[milestone]
             timing_source = (
                 "browser" if browser_elapsed_ms is not None else "server"
             )
+            elapsed = attempt.milestones[timing_source][milestone]
             line = (
                 f"connection_stage={milestone} timing={timing_source} "
                 f"elapsed_ms={elapsed:.1f}"
@@ -7021,6 +7021,46 @@ class PlaybackEngine:
             print(f"  Remote DJ [{attempt.attempt_id}]: {line}")
             _dj_diag(session, line)
         return recorded
+
+    def _remote_dj_session_for_attempt(
+        self,
+        callback_attempt_id,
+        callback_name,
+        *,
+        expected_session=None,
+        expected_webrtc=None,
+    ):
+        """Resolve one asynchronous callback to its authenticated session.
+
+        A callback may outlive teardown and run after a replacement session
+        starts. In that case it is stale evidence, not a failure of the new
+        session, and must have no effect.
+        """
+        session = getattr(self, "remote_dj_session", None)
+        attempt = (
+            getattr(session, "connection_attempt", None)
+            if session is not None
+            else None
+        )
+        matches = (
+            session is not None
+            and attempt is not None
+            and attempt.attempt_id == callback_attempt_id
+            and (expected_session is None or session is expected_session)
+            and (expected_webrtc is None or session.webrtc is expected_webrtc)
+        )
+        if matches:
+            return session
+
+        active_id = attempt.attempt_id if attempt is not None else "none"
+        line = (
+            f"stale_callback_ignored callback={callback_name} "
+            f"callback_attempt={callback_attempt_id} active_attempt={active_id}"
+        )
+        print(f"  Remote DJ: {line}")
+        if session is not None:
+            _dj_diag(session, line)
+        return None
 
     def _remote_dj_connection_state(self):
         session = getattr(self, "remote_dj_session", None)
@@ -7033,12 +7073,14 @@ class PlaybackEngine:
             attempt = getattr(self, "_remote_dj_last_attempt", None)
         return attempt.snapshot() if attempt is not None else None
 
-    def _remote_dj_record_browser_milestone(self, milestone, elapsed_ms):
-        session = self.remote_dj_session
+    def _remote_dj_record_browser_milestone(
+        self, attempt_id, milestone, elapsed_ms
+    ):
+        session = self._remote_dj_session_for_attempt(
+            attempt_id, "browser_milestone"
+        )
         if session is not None:
-            self._remote_dj_mark(
-                session, milestone, browser_elapsed_ms=elapsed_ms
-            )
+            self._remote_dj_mark(session, milestone, browser_elapsed_ms=elapsed_ms)
         return False
 
     def _remote_dj_emit_failure(self, attempt, failure_class, reason):
@@ -7064,6 +7106,25 @@ class PlaybackEngine:
         if session is None:
             return False
         attempt = getattr(session, "connection_attempt", None)
+        if attempt is not None:
+            return self._remote_dj_fail_bound_session(
+                session, attempt.attempt_id, failure_class, reason
+            )
+        self._remote_dj_session_stop()
+        return False
+
+    def _remote_dj_fail_bound_session(
+        self, expected_session, attempt_id, failure_class, reason
+    ):
+        session = self._remote_dj_session_for_attempt(
+            attempt_id,
+            "session_failure",
+            expected_session=expected_session,
+            expected_webrtc=getattr(expected_session, "webrtc", None),
+        )
+        if session is None:
+            return False
+        attempt = session.connection_attempt
         if attempt is not None and attempt.status != "failed":
             self._remote_dj_emit_failure(attempt, failure_class, reason)
             _dj_diag(
@@ -7071,7 +7132,7 @@ class PlaybackEngine:
                 f"connection_failure class={attempt.failure['class']} "
                 f"reason={attempt.failure['reason']}",
             )
-        self._remote_dj_session_stop()
+        self._remote_dj_session_stop(attempt_id)
         return False
 
     def _remote_dj_record_signaling_failure(
@@ -7700,15 +7761,32 @@ class PlaybackEngine:
         session = self.remote_dj_session
         if session is None or session.webrtc is not element:
             return
-        promise = Gst.Promise.new_with_change_func(self._remote_dj_on_offer_created, None)
+        attempt = getattr(session, "connection_attempt", None)
+        if attempt is None:
+            return
+        callback_context = (session, attempt.attempt_id, element)
+        promise = Gst.Promise.new_with_change_func(
+            self._remote_dj_on_offer_created, callback_context
+        )
         element.emit("create-offer", None, promise)
 
-    def _remote_dj_on_offer_created(self, promise, _udata):
+    def _remote_dj_on_offer_created(self, promise, callback_context):
+        expected_session, attempt_id, expected_webrtc = callback_context
+        session = self._remote_dj_session_for_attempt(
+            attempt_id,
+            "offer_created",
+            expected_session=expected_session,
+            expected_webrtc=expected_webrtc,
+        )
+        if session is None:
+            return
         promise.wait()
         reply = promise.get_reply()
         offer = reply.get_value("offer") if reply is not None else None
         if offer is None or offer.sdp is None:
-            self._remote_dj_fail_active_session(
+            self._remote_dj_fail_bound_session(
+                expected_session,
+                attempt_id,
                 FAILURE_MEDIA_ROUTING, "GStreamer did not create a usable SDP offer"
             )
             return
@@ -7718,19 +7796,48 @@ class PlaybackEngine:
         # extract the text BEFORE the emit call below, thread the string
         # (not the description object) through to the callback.
         sdp_text = offer.sdp.as_text()
-        session = self.remote_dj_session
+        session = self._remote_dj_session_for_attempt(
+            attempt_id,
+            "offer_created",
+            expected_session=expected_session,
+            expected_webrtc=expected_webrtc,
+        )
         if session is None:
             return
         self._remote_dj_mark(session, "offer_created")
-        promise2 = Gst.Promise.new_with_change_func(self._remote_dj_on_local_desc_set, sdp_text)
-        session.webrtc.emit("set-local-description", offer, promise2)
+        local_desc_context = (
+            expected_session,
+            attempt_id,
+            expected_webrtc,
+            sdp_text,
+        )
+        promise2 = Gst.Promise.new_with_change_func(
+            self._remote_dj_on_local_desc_set, local_desc_context
+        )
+        expected_webrtc.emit("set-local-description", offer, promise2)
 
-    def _remote_dj_on_local_desc_set(self, promise, sdp_text):
-        promise.wait()
-        session = self.remote_dj_session
+    def _remote_dj_on_local_desc_set(self, promise, callback_context):
+        expected_session, attempt_id, expected_webrtc, sdp_text = callback_context
+        session = self._remote_dj_session_for_attempt(
+            attempt_id,
+            "local_description_set",
+            expected_session=expected_session,
+            expected_webrtc=expected_webrtc,
+        )
         if session is None:
             return
-        self._remote_dj_mark(session, "offer_sent")
+        promise.wait()
+        session = self._remote_dj_session_for_attempt(
+            attempt_id,
+            "local_description_set",
+            expected_session=expected_session,
+            expected_webrtc=expected_webrtc,
+        )
+        if session is None:
+            return
+        # send_json_threadsafe only queues the coroutine onto the signaling
+        # loop; it cannot prove that the WebSocket send completed.
+        self._remote_dj_mark(session, "offer_queued")
         if self._remote_dj_server:
             self._remote_dj_server.send_json_threadsafe({"type": "offer", "sdp": sdp_text})
 
@@ -7744,25 +7851,33 @@ class PlaybackEngine:
                 {"type": "ice", "sdpMLineIndex": mline_index, "candidate": candidate},
             )
 
-    def _remote_dj_handle_answer(self, sdp_text):
-        session = self.remote_dj_session
+    def _remote_dj_handle_answer(self, attempt_id, sdp_text):
+        session = self._remote_dj_session_for_attempt(
+            attempt_id, "browser_answer"
+        )
         if session is None or sdp_text is None:
             return False
         self._remote_dj_mark(session, "answer_received")
         res, sdpmsg = GstSdp.SDPMessage.new_from_text(sdp_text)
         if res != GstSdp.SDPResult.OK or sdpmsg is None:
-            return self._remote_dj_fail_active_session(
+            return self._remote_dj_fail_bound_session(
+                session,
+                attempt_id,
                 FAILURE_MEDIA_ROUTING, "browser SDP answer could not be parsed"
             )
         answer = GstWebRTC.WebRTCSessionDescription.new(GstWebRTC.WebRTCSDPType.ANSWER, sdpmsg)
         promise = Gst.Promise.new()
         session.webrtc.emit("set-remote-description", answer, promise)
         promise.interrupt()
-        self._remote_dj_mark(session, "answer_applied")
+        # The existing non-blocking promise path proves submission only;
+        # it does not prove successful remote-description application.
+        self._remote_dj_mark(session, "answer_submitted")
         return False
 
-    def _remote_dj_handle_ice(self, mline_index, candidate):
-        session = self.remote_dj_session
+    def _remote_dj_handle_ice(self, attempt_id, mline_index, candidate):
+        session = self._remote_dj_session_for_attempt(
+            attempt_id, "browser_ice_candidate"
+        )
         if session is None or mline_index is None or candidate is None:
             return False
         self._remote_dj_mark(session, "first_browser_ice_candidate")
@@ -7779,6 +7894,9 @@ class PlaybackEngine:
             print("  Remote DJ pad-added but no slot claimed on the session — ignoring")
             return
         slot = self.dj_slots[session.slot_id]
+        attempt = getattr(session, "connection_attempt", None)
+        if attempt is None:
+            return
         self._remote_dj_mark(session, "inbound_source_pad")
         try:
             self._remote_dj_build_inbound_chain(session, pad, slot)
@@ -7786,7 +7904,9 @@ class PlaybackEngine:
             reason = str(exc)
             print(f"  Remote DJ inbound media build failed: {reason}")
             GLib.idle_add(
-                self._remote_dj_fail_active_session,
+                self._remote_dj_fail_bound_session,
+                session,
+                attempt.attempt_id,
                 FAILURE_MEDIA_ROUTING,
                 reason,
             )
@@ -8030,7 +8150,7 @@ class PlaybackEngine:
         print(f"  Remote DJ [{attempt_id}] connection state: {nick}")
         _dj_diag(session, f"webrtc connection_state -> {nick}")
         if state == GstWebRTC.WebRTCPeerConnectionState.CONNECTING:
-            self._remote_dj_mark(session, "ice_checking")
+            self._remote_dj_mark(session, "peer_connecting")
         elif state == GstWebRTC.WebRTCPeerConnectionState.CONNECTED:
             self._remote_dj_mark(session, "peer_connected")
         # Breadcrumb on every state edge -- rare per-session, cheap to
@@ -8106,8 +8226,13 @@ class PlaybackEngine:
         self._apply_mic_mode_hold()
         print(f"  Remote DJ gate: {'ON' if active else 'OFF'}")
 
-    def _remote_dj_session_stop(self):
-        session = self.remote_dj_session
+    def _remote_dj_session_stop(self, attempt_id=None):
+        if attempt_id is None:
+            session = self.remote_dj_session
+        else:
+            session = self._remote_dj_session_for_attempt(
+                attempt_id, "signaling_disconnect"
+            )
         if session is None:
             return False
         attempt = getattr(session, "connection_attempt", None)

@@ -32,15 +32,17 @@ MILESTONE_ORDER = (
     "token_issued",
     "browser_token_received",
     "websocket_admitted",
+    "browser_websocket_open",
     "glib_session_start",
     "session_build_started",
     "session_build_completed",
     "offer_created",
-    "offer_sent",
+    "offer_queued",
     "answer_received",
-    "answer_applied",
+    "answer_submitted",
     "first_server_ice_candidate",
     "first_browser_ice_candidate",
+    "peer_connecting",
     "ice_checking",
     "ice_connected",
     "peer_connected",
@@ -144,8 +146,13 @@ class RemoteDJConnectionAttempt:
         )
         self.stage = "token_issued"
         self.status = "connecting"
-        self.milestones = {"token_issued": 0.0}
-        self._milestone_sources = {"token_issued": "server"}
+        # The browser and server clocks are deliberately independent.
+        # Duplicate suppression therefore happens within a timing
+        # domain, never globally by milestone name.
+        self.milestones = {
+            "server": {"token_issued": 0.0},
+            "browser": {},
+        }
         self.failure = None
         self._frozen_elapsed_ms = None
 
@@ -157,9 +164,11 @@ class RemoteDJConnectionAttempt:
         )
 
     def record(self, milestone, *, browser_elapsed_ms=None):
-        if milestone not in MILESTONE_RANK and milestone != "browser_websocket_open":
+        if milestone not in MILESTONE_RANK:
             return False
-        if milestone in self.milestones:
+        source = "browser" if browser_elapsed_ms is not None else "server"
+        domain = self.milestones[source]
+        if milestone in domain:
             return False
         if browser_elapsed_ms is None:
             elapsed_ms = self._server_elapsed_ms()
@@ -170,10 +179,7 @@ class RemoteDJConnectionAttempt:
                 return False
             if not 0 <= elapsed_ms <= MAX_BROWSER_ELAPSED_MS:
                 return False
-        self.milestones[milestone] = round(elapsed_ms, 1)
-        self._milestone_sources[milestone] = (
-            "browser" if browser_elapsed_ms is not None else "server"
-        )
+        domain[milestone] = round(elapsed_ms, 1)
         current_rank = MILESTONE_RANK.get(self.stage, -1)
         new_rank = MILESTONE_RANK.get(milestone, current_rank)
         if self.status != "failed" and new_rank >= current_rank:
@@ -207,10 +213,10 @@ class RemoteDJConnectionAttempt:
         started_at = datetime.fromtimestamp(
             self.issued_at_ms / 1000.0, tz=timezone.utc
         ).isoformat()
-        milestone_summary = {"server": {}, "browser": {}}
-        for name, value in self.milestones.items():
-            source = self._milestone_sources.get(name, "server")
-            milestone_summary[source][name] = value
+        milestone_summary = {
+            source: dict(values)
+            for source, values in self.milestones.items()
+        }
         return {
             "attempt_id": self.attempt_id,
             "status": self.status,
