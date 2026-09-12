@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "release_id": "r0065",
+  "previous_release_id": "r0064",
+  "minimum_updater_protocol_version": 5,
+  "summary": "Fixes premature deck completion after successful manual seeks by evaluating post-seek EOS against the deck's independent wall-clock media timeline instead of GStreamer's EOS-time query_position result, and prevents EOS from independently completing a generation while gated-seek lifecycle ownership is active.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-engine"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0007"
+}
