@@ -194,6 +194,21 @@ LEVEL_PEAK_FALLOFF_DB_PER_SEC = 20.0
 # case where the session object survives but its audio has genuinely
 # stopped flowing (e.g. a WebRTC hiccup).
 REMOTE_DJ_LEVEL_STALE_S = 0.75
+# P1 1.5 Pass B1.1 -- product media-liveness policy.  The inbound
+# `level` element reports every 100ms while decoded Remote Mic buffers
+# continue to arrive, including buffers containing digital silence.  Two
+# seconds therefore tolerates twenty expected report intervals (ordinary
+# jitter and main-loop scheduling noise) while still detecting a dead
+# uplink far sooner than libnice's observed 49-84s terminal transition.
+# This is deliberately separate from REMOTE_DJ_LEVEL_STALE_S: that
+# shorter value only controls whether a dashboard meter sample is fresh.
+REMOTE_DJ_MEDIA_LIVENESS_TIMEOUT_S = 2.0
+REMOTE_DJ_MEDIA_WATCHDOG_INTERVAL_MS = 500
+# A `level` message summarizes roughly 100ms of decoded media, but one
+# late aggregate alone must not flap Reconnecting back to Connected.
+# Require two normal-cadence observations within this small window.
+REMOTE_DJ_MEDIA_RECOVERY_CONFIRMATIONS = 2
+REMOTE_DJ_MEDIA_RECOVERY_CONFIRM_WINDOW_S = 0.5
 POSITION_POLL_MS = 250
 AUTO_BUILD_CHECK_SECONDS = 10
 NEXT_HOUR_LOOKAHEAD_SECONDS = 30
@@ -632,14 +647,25 @@ class RemoteDJSession:
         self.stats_probe_ids = []      # cancellable bounded GLib one-shots
         self.stats_burst_started = False
         # P1 1.5 Pass B1 -- bounded engine-side recovery deadline. Set
-        # when a recoverable transport loss (WebRTC PeerConnectionState
-        # DISCONNECTED) starts this session's product-level "Reconnecting"
+        # when a recoverable transport loss (native DISCONNECTED or the
+        # B1.1 inbound-media liveness fallback) starts this session's
+        # product-level "Reconnecting"
         # grace window; 0 means no deadline is currently pending. Cancelled
         # (reset to 0) on natural same-session recovery; fires exactly once
         # (a GLib one-shot, same discipline as stats_probe_ids) if grace
         # expires without recovery. See _remote_dj_on_connection_state and
         # _remote_dj_on_recovery_deadline.
         self.recovery_deadline_source_id = 0
+        # P1 1.5 Pass B1.1 -- the first decoded Remote Mic buffer arms a
+        # low-frequency watchdog; subsequent `level` messages refresh
+        # this monotonic timestamp without inspecting signal amplitude.
+        # All state is session-local and every callback is also bound to
+        # the attempt/session/webrtc generation.
+        self.media_watchdog_source_id = 0
+        self.last_media_monotonic = None
+        self.recovery_reason = None
+        self.media_recovery_observations = 0
+        self.media_recovery_first_monotonic = None
 
 
 class Deck:
@@ -1547,6 +1573,12 @@ class PlaybackEngine:
         # Unchanged from before [4.1] -- same fields, same log line.
         session = self.remote_dj_session
         if session is not None and message.src is session.dj_level:
+            # P1 1.5 Pass B1.1 -- this message is evidence that decoded
+            # inbound media is still arriving.  Refresh liveness before
+            # parsing meter values: -inf RMS/peak is healthy digital
+            # silence, and even an unusual/malformed level payload must
+            # not turn amplitude parsing into a transport-health test.
+            self._remote_dj_note_media_arrival(session)
             try:
                 peak = list(structure.get_value("peak")) or []
                 rms = list(structure.get_value("rms")) or []
@@ -8325,6 +8357,10 @@ class PlaybackEngine:
                 slot2.selector.set_property("active-pad", slot2.webrtc_pad)
                 self._remote_dj_mark(s, "first_decoded_remote_mic_buffer")
                 self._remote_dj_request_stats(s, "first_decoded_remote_mic_buffer")
+                # This is the first point at which the session has proved
+                # usable inbound Remote Mic media.  Arm the B1.1 liveness
+                # contract here rather than during SDP/ICE establishment.
+                self._remote_dj_note_media_arrival(s)
                 print("  Remote DJ: slot selector switched from silence to WebRTC audio")
                 _dj_diag(s, f"slot {slot2.slot_id} selector switched to webrtc_pad (silence -> live)")
             except Exception as exc:
@@ -8389,6 +8425,223 @@ class PlaybackEngine:
         print("  Remote DJ: decode chain wired; waiting for first buffer to flip slot selector")
         session.real_buf_seen = True
 
+    def _remote_dj_note_media_arrival(self, expected_session, now_monotonic=None):
+        """Record decoded inbound Remote Mic media without considering level.
+
+        The existing `level` element posts at a bounded 100ms cadence while
+        decoded buffers flow, including silent buffers.  The first-buffer
+        probe calls this once to arm the contract; later level messages call
+        it to refresh liveness and, when appropriate, confirm recovery.
+        """
+        attempt = getattr(expected_session, "connection_attempt", None)
+        expected_webrtc = getattr(expected_session, "webrtc", None)
+        if attempt is None or expected_webrtc is None:
+            return False
+        session = self._remote_dj_session_for_attempt(
+            attempt.attempt_id,
+            "inbound_media_arrival",
+            expected_session=expected_session,
+            expected_webrtc=expected_webrtc,
+        )
+        if session is None:
+            return False
+
+        now = time.monotonic() if now_monotonic is None else now_monotonic
+        first_media = session.last_media_monotonic is None
+        session.last_media_monotonic = now
+        if first_media:
+            context = (session, attempt.attempt_id, expected_webrtc)
+            session.media_watchdog_source_id = GLib.timeout_add(
+                REMOTE_DJ_MEDIA_WATCHDOG_INTERVAL_MS,
+                self._remote_dj_on_media_watchdog,
+                context,
+            )
+            print(
+                f"  Remote DJ [{attempt.attempt_id}]: inbound media liveness "
+                f"armed (timeout={REMOTE_DJ_MEDIA_LIVENESS_TIMEOUT_S:.1f}s)"
+            )
+            _dj_diag(
+                session,
+                "media_liveness_armed "
+                f"timeout_seconds={REMOTE_DJ_MEDIA_LIVENESS_TIMEOUT_S:.1f} "
+                f"watchdog_interval_ms={REMOTE_DJ_MEDIA_WATCHDOG_INTERVAL_MS}",
+            )
+            # Keep the first-buffer streaming callback DB-free.  The
+            # attempt-correlated print/diagnostic line is the bounded
+            # "armed" evidence; state transitions below emit SystemEvents.
+
+        if attempt.status != "reconnecting" or session.recovery_reason != "media_liveness_timeout":
+            session.media_recovery_observations = 0
+            session.media_recovery_first_monotonic = None
+            return True
+
+        first_recovery_at = session.media_recovery_first_monotonic
+        if (
+            session.media_recovery_observations == 0
+            or first_recovery_at is None
+            or now - first_recovery_at > REMOTE_DJ_MEDIA_RECOVERY_CONFIRM_WINDOW_S
+        ):
+            session.media_recovery_observations = 1
+            session.media_recovery_first_monotonic = now
+            _dj_diag(session, "media_resumed confirmation=1/2")
+            return True
+
+        session.media_recovery_observations += 1
+        if session.media_recovery_observations >= REMOTE_DJ_MEDIA_RECOVERY_CONFIRMATIONS:
+            self._remote_dj_complete_recovery(session, trigger="media_resumed")
+        return True
+
+    def _remote_dj_on_media_watchdog(self, callback_context):
+        expected_session, attempt_id, expected_webrtc = callback_context
+        session = self._remote_dj_session_for_attempt(
+            attempt_id,
+            "media_liveness_watchdog",
+            expected_session=expected_session,
+            expected_webrtc=expected_webrtc,
+        )
+        if session is None:
+            return False
+        last_media = session.last_media_monotonic
+        if last_media is None:
+            return True
+        age = max(0.0, time.monotonic() - last_media)
+        attempt = session.connection_attempt
+        if (
+            attempt is not None
+            and attempt.status == "connected"
+            and age >= REMOTE_DJ_MEDIA_LIVENESS_TIMEOUT_S
+        ):
+            _dj_diag(
+                session,
+                f"media_liveness_exceeded last_media_age_seconds={age:.3f}",
+            )
+            self._remote_dj_begin_recovery(
+                session,
+                reason="media_liveness_timeout",
+                last_media_age_seconds=age,
+            )
+        return True
+
+    @staticmethod
+    def _remote_dj_remove_glib_source(source_id):
+        if not source_id:
+            return
+        try:
+            main_context = GLib.MainContext.default()
+            if main_context.find_source_by_id(source_id) is not None:
+                GLib.source_remove(source_id)
+        except Exception:
+            pass
+
+    def _remote_dj_begin_recovery(
+        self, session, *, reason, last_media_age_seconds=None
+    ):
+        """Enter the one B1 recovery path for native or media loss."""
+        attempt = getattr(session, "connection_attempt", None)
+        if attempt is None:
+            return False
+        attempt_id = attempt.attempt_id
+        slot = self.dj_slots[session.slot_id] if session.slot_id is not None else None
+
+        # Fail safe before any state/timer work.  Preserve gate_desired;
+        # only the physical contribution is forced silent.
+        if slot is not None and slot.remote_gate.get_property("volume") > 0.0:
+            slot.remote_gate.set_property("volume", 0.0)
+            self._apply_talk_ducking()
+            print("  Remote DJ: gate forced to 0 during recovery (protecting playing deck)")
+            emit_event(
+                category="engine",
+                level="warning",
+                title="Remote DJ gate forced to 0 during transient disconnect",
+                detail={"attempt_id": attempt_id, "reason": reason},
+                dedupe_key="engine|remote_dj|protective_mute",
+            )
+
+        if not attempt.mark_reconnecting():
+            return False
+        session.recovery_reason = reason
+        session.media_recovery_observations = 0
+        session.media_recovery_first_monotonic = None
+        grace_seconds = RemoteDJConfig.load().reconnect_grace_seconds
+        print(
+            f"  Remote DJ [{attempt_id}]: entering Reconnecting "
+            f"(reason={reason}, grace={grace_seconds}s)"
+        )
+        detail = {
+            "attempt_id": attempt_id,
+            "grace_seconds": grace_seconds,
+            "trigger_reason": reason,
+        }
+        if last_media_age_seconds is not None:
+            detail["last_media_age_seconds"] = round(last_media_age_seconds, 3)
+        _dj_diag(
+            session,
+            f"reconnecting_entered reason={reason} grace_seconds={grace_seconds}"
+            + (
+                f" last_media_age_seconds={last_media_age_seconds:.3f}"
+                if last_media_age_seconds is not None
+                else ""
+            ),
+        )
+        emit_event(
+            category="engine",
+            level="warning",
+            title="Remote DJ entered Reconnecting",
+            detail=detail,
+            dedupe_key=f"engine|remote_dj|reconnecting|attempt={attempt_id}",
+        )
+        if session.recovery_deadline_source_id == 0:
+            deadline_context = (session, attempt_id, session.webrtc)
+            session.recovery_deadline_source_id = GLib.timeout_add(
+                int(grace_seconds * 1000),
+                self._remote_dj_on_recovery_deadline,
+                deadline_context,
+            )
+        return True
+
+    def _remote_dj_complete_recovery(self, session, *, trigger):
+        attempt = getattr(session, "connection_attempt", None)
+        if attempt is None or attempt.status != "reconnecting":
+            return False
+        attempt_id = attempt.attempt_id
+        prior_reason = session.recovery_reason
+        if session.recovery_deadline_source_id:
+            self._remote_dj_remove_glib_source(session.recovery_deadline_source_id)
+            session.recovery_deadline_source_id = 0
+            _dj_diag(session, f"recovery_deadline_cancelled trigger={trigger}")
+        if not attempt.mark_recovered():
+            return False
+        session.recovery_reason = None
+        session.media_recovery_observations = 0
+        session.media_recovery_first_monotonic = None
+        print(f"  Remote DJ [{attempt_id}]: recovered within grace -- back to connected")
+        _dj_diag(
+            session,
+            f"reconnect_recovered trigger={trigger} prior_reason={prior_reason}",
+        )
+        emit_event(
+            category="engine",
+            level="info",
+            title="Remote DJ recovered from transient disconnect",
+            detail={
+                "attempt_id": attempt_id,
+                "trigger": trigger,
+                "recovery_reason": prior_reason,
+            },
+            dedupe_key=f"engine|remote_dj|recovered|attempt={attempt_id}",
+        )
+        slot = self.dj_slots[session.slot_id] if session.slot_id is not None else None
+        if (
+            session.gate_desired
+            and slot is not None
+            and slot.remote_gate.get_property("volume") == 0.0
+        ):
+            slot.remote_gate.set_property("volume", 1.0)
+            self._apply_talk_ducking()
+            self._apply_mic_mode_hold()
+            print("  Remote DJ: gate restored to 1.0 after reconnect")
+        return True
+
     def _remote_dj_on_connection_state(self, element, _pspec, callback_context=None):
         if callback_context is not None:
             expected_session, attempt_id, expected_webrtc = callback_context
@@ -8426,100 +8679,15 @@ class PlaybackEngine:
             dedupe_key=f"engine|remote_dj|attempt={attempt_id}|state={nick}",
         )
         if state == GstWebRTC.WebRTCPeerConnectionState.DISCONNECTED:
-            # Transient. The browser may ICE-restart back to CONNECTED
-            # (WiFi<->cellular handover is the canonical case). Don't
-            # tear down yet, but DO force the gate to 0 so any noise
-            # squeezed out of the stalled decode chain -- whether that's
-            # uninitialized-buffer memory from downstream pool
-            # allocations, clock-slave drift in webrtcbin's internal
-            # rtpjitterbuffer bursting timing-wrong frames, or
-            # Opus concealment if it ever gets turned on -- gets
-            # multiplied by zero at this stage instead of summing into
-            # master_mixer and drowning the playing deck in static.
-            # This is the "elusive noise on deck" bug the user hit
-            # infrequently on network handover mid-session. gate_desired
-            # is preserved so _remote_dj_on_connection_state's CONNECTED
-            # branch can restore the DJ's intent on recovery.
-            slot_dc = self.dj_slots[session.slot_id] if session.slot_id is not None else None
-            if slot_dc is not None and slot_dc.remote_gate.get_property("volume") > 0.0:
-                slot_dc.remote_gate.set_property("volume", 0.0)
-                self._apply_talk_ducking()
-                print("  Remote DJ: gate forced to 0 during transient disconnect (protecting playing deck)")
-                emit_event(
-                    category="engine",
-                    level="warning",
-                    title="Remote DJ gate forced to 0 during transient disconnect",
-                    detail={"reason": "protective mute during WebRTC DISCONNECTED"},
-                    dedupe_key="engine|remote_dj|protective_mute",
-                )
-            # P1 1.5 Pass B1 -- product-level "Reconnecting" state plus a
-            # bounded engine-side recovery deadline. Field evidence: a
-            # broken/stale browser can leave the native GstWebRTC
-            # connection-state sitting in DISCONNECTED for ~49s before
-            # libnice itself declares FAILED -- station policy uses a
-            # much shorter grace instead of inheriting that native
-            # terminal timeout. mark_reconnecting() only returns True
-            # coming from a genuinely-established "connected" attempt, so
-            # a DISCONNECTED notify during initial negotiation (never yet
-            # connected) intentionally does not start this timer -- the
-            # existing build-failure/typed-failure paths already cover
-            # that case.
-            if attempt is not None and attempt.mark_reconnecting():
-                grace_seconds = RemoteDJConfig.load().reconnect_grace_seconds
-                print(
-                    f"  Remote DJ [{attempt_id}]: entering Reconnecting "
-                    f"(grace={grace_seconds}s)"
-                )
-                _dj_diag(session, f"reconnecting_entered grace_seconds={grace_seconds}")
-                emit_event(
-                    category="engine",
-                    level="warning",
-                    title="Remote DJ entered Reconnecting",
-                    detail={"attempt_id": attempt_id, "grace_seconds": grace_seconds},
-                    dedupe_key=f"engine|remote_dj|reconnecting|attempt={attempt_id}",
-                )
-                if session.recovery_deadline_source_id == 0:
-                    deadline_context = (session, attempt_id, session.webrtc)
-                    session.recovery_deadline_source_id = GLib.timeout_add(
-                        int(grace_seconds * 1000),
-                        self._remote_dj_on_recovery_deadline,
-                        deadline_context,
-                    )
+            # Preserve B1's native trigger, but route it through the same
+            # protective-mute/deadline machinery as B1.1 media loss.
+            self._remote_dj_begin_recovery(
+                session, reason="transport_disconnected"
+            )
         elif state == GstWebRTC.WebRTCPeerConnectionState.CONNECTED:
-            # P1 1.5 Pass B1 -- same-session recovery: cancel the pending
-            # recovery deadline (if any) and return the attempt to
-            # "connected" BEFORE the pre-existing gate-restore logic below
-            # runs, so gate_desired is honored against the post-recovery
-            # state, not the muted Reconnecting one.
-            if session.recovery_deadline_source_id:
-                try:
-                    main_context = GLib.MainContext.default()
-                    if main_context.find_source_by_id(session.recovery_deadline_source_id) is not None:
-                        GLib.source_remove(session.recovery_deadline_source_id)
-                except Exception:
-                    pass
-                session.recovery_deadline_source_id = 0
-            if attempt is not None and attempt.mark_recovered():
-                print(f"  Remote DJ [{attempt_id}]: recovered within grace -- back to connected")
-                _dj_diag(session, "reconnect_recovered")
-                emit_event(
-                    category="engine",
-                    level="info",
-                    title="Remote DJ recovered from transient disconnect",
-                    detail={"attempt_id": attempt_id},
-                    dedupe_key=f"engine|remote_dj|recovered|attempt={attempt_id}",
-                )
-            # Recovery path -- DJ was live and had the gate open before
-            # the blip; restore what they wanted instead of leaving them
-            # muted after ICE renegotiates. First-time CONNECTED entry
-            # doesn't reopen anything either (gate_desired starts False,
-            # gate stays at its 0.0 initial value).
-            slot_rc = self.dj_slots[session.slot_id] if session.slot_id is not None else None
-            if (session.gate_desired and slot_rc is not None
-                    and slot_rc.remote_gate.get_property("volume") == 0.0):
-                slot_rc.remote_gate.set_property("volume", 1.0)
-                self._apply_talk_ducking()
-                print("  Remote DJ: gate restored to 1.0 after reconnect")
+            self._remote_dj_complete_recovery(
+                session, trigger="transport_connected"
+            )
         elif state == GstWebRTC.WebRTCPeerConnectionState.FAILED:
             self._remote_dj_fail_active_session(
                 FAILURE_ICE_STATE, "WebRTC peer connection entered failed state"
@@ -8554,17 +8722,24 @@ class PlaybackEngine:
             # harmless if it does.
             return False
         print(f"  Remote DJ [{attempt_id}]: recovery grace expired -- finalizing")
-        _dj_diag(session, "recovery_grace_expired")
+        recovery_reason = session.recovery_reason or "unknown"
+        _dj_diag(
+            session,
+            f"recovery_grace_expired recovery_reason={recovery_reason}",
+        )
         emit_event(
             category="engine",
             level="warning",
             title="Remote DJ recovery grace expired",
-            detail={"attempt_id": attempt_id},
+            detail={
+                "attempt_id": attempt_id,
+                "recovery_reason": recovery_reason,
+            },
             dedupe_key=f"engine|remote_dj|grace_expired|attempt={attempt_id}",
         )
         self._remote_dj_fail_active_session(
             FAILURE_ICE_STATE,
-            "transport did not recover within the product recovery grace",
+            f"{recovery_reason} did not recover within the product recovery grace",
         )
         return False
 
@@ -8580,10 +8755,23 @@ class PlaybackEngine:
         # reconnect can restore it, even though the physical volume
         # stays at 0 until the reconnect actually completes.
         session.gate_desired = active
-        slot.remote_gate.set_property("volume", 1.0 if active else 0.0)
+        attempt = getattr(session, "connection_attempt", None)
+        recovering = attempt is not None and attempt.status == "reconnecting"
+        # A PTT-on command during recovery updates intent only.  The
+        # physical gate remains fail-safe muted until the same session's
+        # recovery is positively confirmed.
+        physical_active = active and not recovering
+        slot.remote_gate.set_property("volume", 1.0 if physical_active else 0.0)
         self._apply_talk_ducking()
-        self._apply_mic_mode_hold()
-        print(f"  Remote DJ gate: {'ON' if active else 'OFF'}")
+        # A desired-on command while physically muted for recovery must
+        # not release mic-owned Manual merely because _any_mic_live()
+        # correctly observes the fail-safe physical gate as closed.  A
+        # desired-off command is still an intentional mic release and
+        # retains the normal ownership reevaluation.
+        if not (recovering and active):
+            self._apply_mic_mode_hold()
+        suffix = " (desired; held muted during Reconnecting)" if active and recovering else ""
+        print(f"  Remote DJ gate: {'ON' if active else 'OFF'}{suffix}")
 
     def _remote_dj_emit_ownership_outcome(self, attempt_id, pre_manual, pre_manual_from_mic):
         """P1 1.5 Pass B1 requirement 8 -- bounded, nonsecret evidence of
@@ -8663,6 +8851,15 @@ class PlaybackEngine:
                 pass
         session.stats_probe_ids.clear()
 
+        # B1.1 -- stop the recurring media-liveness watchdog on every
+        # finalization route.  Its generation guard would make a late
+        # dispatch harmless, but removing the source keeps the main loop
+        # and diagnostics tidy.
+        if getattr(session, "media_watchdog_source_id", 0):
+            self._remote_dj_remove_glib_source(session.media_watchdog_source_id)
+            session.media_watchdog_source_id = 0
+            _dj_diag(session, "media_liveness_watchdog_cancelled")
+
         # P1 1.5 Pass B1 -- cancel a pending recovery-grace deadline too
         # (e.g. finalizing via native FAILED/CLOSED, or an explicit
         # operator Disconnect, while a product-level Reconnecting grace
@@ -8671,12 +8868,9 @@ class PlaybackEngine:
         # firing harmless -- but avoids a confusing spurious "grace
         # expired" log/event for a session that's already gone.
         if session.recovery_deadline_source_id:
-            try:
-                if main_context.find_source_by_id(session.recovery_deadline_source_id) is not None:
-                    GLib.source_remove(session.recovery_deadline_source_id)
-            except Exception:
-                pass
+            self._remote_dj_remove_glib_source(session.recovery_deadline_source_id)
             session.recovery_deadline_source_id = 0
+            _dj_diag(session, "recovery_deadline_cancelled trigger=session_stop")
 
         slot = self.dj_slots[session.slot_id] if session.slot_id is not None else None
 
