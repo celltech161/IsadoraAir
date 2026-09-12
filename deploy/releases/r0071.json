@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "release_id": "r0071",
+  "previous_release_id": "r0070",
+  "minimum_updater_protocol_version": 5,
+  "summary": "P1 1.5 Pass B1 -- a recoverable Remote DJ transport loss (WebRTC DISCONNECTED) now immediately mutes Remote Mic and enters a bounded ~10s product-level Reconnecting grace instead of occupying the slot for GStreamer/libnice's native ~49s ICE failure timeout; unrecovered sessions finalize promptly with bounded Auto/Manual outcome evidence. Also corrects r0070's server-side candidate-pair milestone, which could fire before a usable pair was actually nominated.",
+  "migrations_required": [
+    "library.0081_remotedjconfig_reconnect_grace_seconds"
+  ],
+  "migration_compatibility": "additive",
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-engine",
+    "isadoraair-gunicorn"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0007"
+}
