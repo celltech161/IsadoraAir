@@ -1792,6 +1792,10 @@ let rdjWs = null;
 let rdjAudioCtx = null;
 let rdjGainNode = null;
 let rdjCalibrating = false;
+let rdjConnectStartedAt = null;
+let rdjAttemptId = null;
+let rdjIceServers = [];
+let rdjFirstIceCandidateSeen = false;
 
 const RDJ_GAIN_STORAGE_KEY = 'isadoraair.remote_dj.gain_db';
 
@@ -1810,6 +1814,12 @@ function rdjSaveGainDb(db) {
   try { localStorage.setItem(RDJ_GAIN_STORAGE_KEY, String(db)); } catch (e) {}
 }
 
+function rdjSendMilestone(milestone, elapsedMs = null) {
+  if (!rdjWs || rdjWs.readyState !== WebSocket.OPEN || rdjConnectStartedAt === null) return;
+  const elapsed = elapsedMs === null ? performance.now() - rdjConnectStartedAt : elapsedMs;
+  rdjWs.send(JSON.stringify({type: 'milestone', milestone, elapsed_ms: Math.max(0, Math.round(elapsed * 10) / 10)}));
+}
+
 async function toggleRemoteDjConnect() {
   if (rdjPc || rdjWs) { rdjDisconnect(); return; }
   // [P1] 1.7 -- live engine mutation gate. Only guards STARTING a new
@@ -1821,21 +1831,39 @@ async function toggleRemoteDjConnect() {
   btn.classList.add('pending');
   btn.classList.remove('error');
   btn.textContent = 'Connecting…';
+  rdjConnectStartedAt = performance.now();
+  rdjAttemptId = null;
+  rdjIceServers = [];
+  rdjFirstIceCandidateSeen = false;
+  btn.title = '';
 
-  let token;
+  let token, tokenElapsedMs;
   try {
     const r = await fetch('/api/remote-dj/token/', {
       method: 'POST',
       headers: {'X-CSRFToken': getCookie('csrftoken')},
     });
     if (!r.ok) throw new Error('token ' + r.status);
-    ({token} = await r.json());
+    const tokenResponse = await r.json();
+    ({token} = tokenResponse);
+    rdjAttemptId = tokenResponse.attempt_id;
+    rdjIceServers = tokenResponse.ice_servers;
+    tokenElapsedMs = performance.now() - rdjConnectStartedAt;
+    if (!token || !rdjAttemptId || !Array.isArray(rdjIceServers) || !rdjIceServers.length) {
+      throw new Error('incomplete token response');
+    }
+    btn.title = 'Connection attempt ' + rdjAttemptId;
   } catch (e) {
     rdjConnectFail('Token failed');
     return;
   }
 
   rdjWs = new WebSocket('wss://' + location.host + '/ws/remote-dj/?token=' + token);
+  rdjWs.onopen = () => {
+    rdjSendMilestone('browser_connect_start', 0);
+    rdjSendMilestone('browser_token_received', tokenElapsedMs);
+    rdjSendMilestone('browser_websocket_open');
+  };
   rdjWs.onmessage = async (event) => {
     const msg = JSON.parse(event.data);
     if (msg.type === 'offer') {
@@ -1845,13 +1873,19 @@ async function toggleRemoteDjConnect() {
       // ICE completion on cellular first-connect (the vulnerable window
       // for the earlier static-on-playing-deck race -- see
       // engine.py::_remote_dj_build_session's history).
-      rdjPc = new RTCPeerConnection({iceServers: [{urls: 'stun:stun.l.google.com:19302'}]});
+      rdjPc = new RTCPeerConnection({iceServers: rdjIceServers});
       rdjPc.onicecandidate = (e) => {
         if (e.candidate) {
+          if (!rdjFirstIceCandidateSeen) {
+            rdjFirstIceCandidateSeen = true;
+            rdjSendMilestone('first_browser_ice_candidate');
+          }
           rdjWs.send(JSON.stringify({type: 'ice', sdpMLineIndex: e.candidate.sdpMLineIndex, candidate: e.candidate.candidate}));
         }
       };
       rdjPc.oniceconnectionstatechange = () => {
+        if (rdjPc && rdjPc.iceConnectionState === 'checking') rdjSendMilestone('ice_checking');
+        if (rdjPc && ['connected', 'completed'].includes(rdjPc.iceConnectionState)) rdjSendMilestone('ice_connected');
         if (rdjPc && ['failed', 'disconnected', 'closed'].includes(rdjPc.iceConnectionState)) {
           rdjDisconnect();
         }

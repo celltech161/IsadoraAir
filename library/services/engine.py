@@ -43,6 +43,14 @@ from library.services.log_builder import (
     resolve_schedule_block,
 )
 from library.services.remote_dj_signaling import RemoteDJSignalingServer
+from library.services.remote_dj_connection import (
+    FAILURE_DEPENDENCY_SESSION_BUILD,
+    FAILURE_ICE_STATE,
+    FAILURE_MEDIA_ROUTING,
+    FAILURE_SIGNALING_SESSION_BUSY,
+    RemoteDJConnectionAttempt,
+    new_attempt_id,
+)
 from library.services import audio_recovery
 from library.services.media_health import (
     MediaValidationWorker,
@@ -135,10 +143,23 @@ def _dj_diag(session, msg):
     if session is None or getattr(session, "diag_fh", None) is None:
         return
     try:
-        session.diag_fh.write(f"{time.time():.3f} {msg}\n")
+        attempt = getattr(session, "connection_attempt", None)
+        attempt_id = attempt.attempt_id if attempt is not None else "untracked"
+        session.diag_fh.write(
+            f"{time.time():.3f} attempt={attempt_id} {msg}\n"
+        )
         session.diag_fh.flush()
     except OSError:
         pass
+
+
+class RemoteDJSessionBuildError(RuntimeError):
+    """A typed, operator-actionable Remote DJ construction failure."""
+
+    def __init__(self, stage, reason):
+        self.stage = str(stage)[:80]
+        self.reason = " ".join(str(reason).split())[:240]
+        super().__init__(f"{self.stage}: {self.reason}")
 
 # Pre-processor VU meter: values are updated by GStreamer's `level`
 # element sitting on the summed master output (post-mix, post-duck,
@@ -553,6 +574,7 @@ class RemoteDJSession:
 
     MAX_DJ_SLOTS is 1 today; the shape is generalizable to N."""
     def __init__(self):
+        self.connection_attempt = None
         self.webrtc = None
         self.ice_agent = None
         self.slot_id = None            # which self.dj_slots[] index this session took
@@ -811,6 +833,10 @@ class PlaybackEngine:
         # remote DJ at a time" is a confirmed design decision).
         self.remote_dj_tee = None
         self.remote_dj_session = None
+        # Sparse/bounded Pass A1 observability. The active session owns
+        # its attempt; this retains only the most recently completed or
+        # rejected attempt for engine_state after the session is gone.
+        self._remote_dj_last_attempt = None
         # Populated in _build_main_pipeline when RemoteDJConfig.enabled
         # is true. MAX_DJ_SLOTS entries; each holds a persistent audio
         # subchain that owns its own master_mixer sink pad for the
@@ -6976,12 +7002,108 @@ class PlaybackEngine:
             f"channels=2,layout=interleaved",
         )
 
-    def _remote_dj_session_start(self):
+    def _remote_dj_mark(self, session, milestone, *, browser_elapsed_ms=None):
+        attempt = getattr(session, "connection_attempt", None)
+        if attempt is None:
+            return False
+        recorded = attempt.record(
+            milestone, browser_elapsed_ms=browser_elapsed_ms
+        )
+        if recorded:
+            elapsed = attempt.milestones[milestone]
+            timing_source = (
+                "browser" if browser_elapsed_ms is not None else "server"
+            )
+            line = (
+                f"connection_stage={milestone} timing={timing_source} "
+                f"elapsed_ms={elapsed:.1f}"
+            )
+            print(f"  Remote DJ [{attempt.attempt_id}]: {line}")
+            _dj_diag(session, line)
+        return recorded
+
+    def _remote_dj_connection_state(self):
+        session = getattr(self, "remote_dj_session", None)
+        attempt = (
+            getattr(session, "connection_attempt", None)
+            if session is not None
+            else None
+        )
+        if attempt is None:
+            attempt = getattr(self, "_remote_dj_last_attempt", None)
+        return attempt.snapshot() if attempt is not None else None
+
+    def _remote_dj_record_browser_milestone(self, milestone, elapsed_ms):
+        session = self.remote_dj_session
+        if session is not None:
+            self._remote_dj_mark(
+                session, milestone, browser_elapsed_ms=elapsed_ms
+            )
+        return False
+
+    def _remote_dj_emit_failure(self, attempt, failure_class, reason):
+        attempt.fail(failure_class, reason)
+        print(
+            f"  Remote DJ [{attempt.attempt_id}]: failure="
+            f"{attempt.failure['class']} reason={attempt.failure['reason']}"
+        )
+        emit_event(
+            category="engine",
+            level="error",
+            title="Remote DJ connection attempt failed",
+            detail={
+                "attempt_id": attempt.attempt_id,
+                "failure_class": attempt.failure["class"],
+                "reason": attempt.failure["reason"],
+            },
+            dedupe_key=f"engine|remote_dj|failure|attempt={attempt.attempt_id}",
+        )
+
+    def _remote_dj_fail_active_session(self, failure_class, reason):
+        session = self.remote_dj_session
+        if session is None:
+            return False
+        attempt = getattr(session, "connection_attempt", None)
+        if attempt is not None and attempt.status != "failed":
+            self._remote_dj_emit_failure(attempt, failure_class, reason)
+            _dj_diag(
+                session,
+                f"connection_failure class={attempt.failure['class']} "
+                f"reason={attempt.failure['reason']}",
+            )
+        self._remote_dj_session_stop()
+        return False
+
+    def _remote_dj_record_signaling_failure(
+        self, attempt_id, issued_at_ms, failure_class, reason
+    ):
+        attempt = RemoteDJConnectionAttempt(attempt_id, issued_at_ms)
+        self._remote_dj_last_attempt = attempt
+        self._remote_dj_emit_failure(attempt, failure_class, reason)
+        return False
+
+    def _remote_dj_session_start(self, attempt_id=None, issued_at_ms=None):
+        attempt_id = attempt_id or new_attempt_id()
+        issued_at_ms = issued_at_ms or int(time.time() * 1000)
+        attempt = RemoteDJConnectionAttempt(attempt_id, issued_at_ms)
+        attempt.record("websocket_admitted")
+        self._remote_dj_last_attempt = attempt
+
         if self.remote_dj_session is not None:
             print("  Remote DJ session start requested but one is already active — ignoring")
+            self._remote_dj_emit_failure(
+                attempt,
+                FAILURE_SIGNALING_SESSION_BUSY,
+                "an engine session is already active",
+            )
             return False
         if self.remote_dj_tee is None:
             print("  Remote DJ session start requested but the feature isn't built (RemoteDJConfig.enabled was off at pipeline build time) — ignoring")
+            self._remote_dj_emit_failure(
+                attempt,
+                FAILURE_DEPENDENCY_SESSION_BUILD,
+                "Remote DJ pipeline is not configured in this engine process",
+            )
             return False
 
         # Claim a persistent DJ slot. With MAX_DJ_SLOTS=1 today this is
@@ -6992,12 +7114,23 @@ class PlaybackEngine:
         slot = self._dj_slot_available()
         if slot is None:
             print("  Remote DJ session start requested but all DJ slots are occupied — ignoring")
+            self._remote_dj_emit_failure(
+                attempt,
+                FAILURE_SIGNALING_SESSION_BUSY,
+                "all persistent Remote DJ slots are occupied",
+            )
             return False
 
         print(f"  Remote DJ: session starting (claiming slot {slot.slot_id})")
         session = RemoteDJSession()
+        session.connection_attempt = attempt
         session.slot_id = slot.slot_id
         slot.session = session
+        # Publish the claimed session before any fallible configuration
+        # work so the one normal teardown path can reclaim the slot even
+        # if a config read or an early GStreamer property set fails.
+        self.remote_dj_session = session
+        self._remote_dj_mark(session, "glib_session_start")
         # Update the slot's gain from the current RemoteDJAudioInput
         # config now (fresh read at session start; changes take effect
         # on the next connect, same contract as before). Gate stays at
@@ -7006,29 +7139,30 @@ class PlaybackEngine:
         # place this ever hits the DB; _on_element_message's dj_level
         # handler reuses this cached value on every ~100ms meter
         # message rather than querying per-message.
-        dj_gain_db = RemoteDJAudioInput.load().gain_db
-        session.dj_gain_db = dj_gain_db
-        slot.remote_gain.set_property("volume", 10 ** (dj_gain_db / 20.0))
-        slot.remote_gate.set_property("volume", 0.0)
-        self.remote_dj_session = session
-        # Open the two diagnostic sinks. Truncate on each session start
-        # so a post-mortem sees only THIS session's data (the previous
-        # session's log is only interesting up until this one begins).
-        # Both opens are best-effort -- if /run/isadoraair isn't
-        # writable we skip diag entirely and let the session proceed.
         try:
-            DJ_DIAG_LOG.parent.mkdir(parents=True, exist_ok=True)
-            session.diag_fh = open(DJ_DIAG_LOG, "w")
-            _dj_diag(session, f"session_start")
-        except OSError as exc:
-            print(f"  Remote DJ: could not open diag log ({exc})")
-        if DJ_DUMP_PCM_ENABLED:
+            dj_gain_db = RemoteDJAudioInput.load().gain_db
+            session.dj_gain_db = dj_gain_db
+            slot.remote_gain.set_property("volume", 10 ** (dj_gain_db / 20.0))
+            slot.remote_gate.set_property("volume", 0.0)
+            # Open the two diagnostic sinks. Truncate on each session start
+            # so a post-mortem sees only THIS session's data (the previous
+            # session's log is only interesting up until this one begins).
+            # Both opens are best-effort -- if /run/isadoraair isn't
+            # writable we skip diag entirely and let the session proceed.
             try:
-                session.dump_fh = open(DJ_DUMP_PCM, "wb")
+                DJ_DIAG_LOG.parent.mkdir(parents=True, exist_ok=True)
+                session.diag_fh = open(DJ_DIAG_LOG, "w")
+                _dj_diag(session, "session_start")
             except OSError as exc:
-                print(f"  Remote DJ: could not open PCM dump file ({exc})")
-        try:
+                print(f"  Remote DJ: could not open diag log ({exc})")
+            if DJ_DUMP_PCM_ENABLED:
+                try:
+                    session.dump_fh = open(DJ_DUMP_PCM, "wb")
+                except OSError as exc:
+                    print(f"  Remote DJ: could not open PCM dump file ({exc})")
+            self._remote_dj_mark(session, "session_build_started")
             self._remote_dj_build_session(session)
+            self._remote_dj_mark(session, "session_build_completed")
         except Exception as exc:
             # A failure partway through must not leave
             # self.remote_dj_session stuck non-None -- that would
@@ -7037,32 +7171,100 @@ class PlaybackEngine:
             # name here left exactly this stuck state during Stage 5's
             # own first live test, recovered only because GLib.idle_add
             # already isolates exceptions from crashing the main loop.
-            print(f"  Remote DJ session start failed, rolling back: {exc}")
-            self.remote_dj_session = None
-            # Persistent-slot refactor: rollback releases the slot back
-            # to the pool but NEVER touches master_mixer (the slot's
-            # master_mixer pad is persistent). Reset the slot's gate to
-            # 0 defensively in case anything mid-build had already
-            # opened it, and switch the selector to silence in case any
-            # partial link left it pointing at a WebRTC pad with no
-            # upstream.
-            if session.slot_id is not None:
-                slot_rb = self.dj_slots[session.slot_id]
-                slot_rb.session = None
-                slot_rb.remote_gate.set_property("volume", 0.0)
-                slot_rb.selector.set_property("active-pad", slot_rb.silence_pad)
-                peer = slot_rb.webrtc_pad.get_peer()
-                if peer is not None:
-                    peer.unlink(slot_rb.webrtc_pad)
-            for el in session.elements:
-                el.set_state(Gst.State.NULL)
-                if el.get_parent() is self.main_pipeline:
-                    self.main_pipeline.remove(el)
-            if session.monitor_tee_pad is not None:
-                self.remote_dj_tee.release_request_pad(session.monitor_tee_pad)
-            if self._remote_dj_server:
-                self._remote_dj_server.disconnect_threadsafe()
+            reason = str(exc)
+            if isinstance(exc, RemoteDJSessionBuildError):
+                reason = f"{exc.stage}: {exc.reason}"
+            self._remote_dj_emit_failure(
+                attempt, FAILURE_DEPENDENCY_SESSION_BUILD, reason
+            )
+            _dj_diag(session, f"session_build_failed reason={reason}")
+            print(f"  Remote DJ session start failed, rolling back: {reason}")
+            # One lifecycle authority: the normal teardown already
+            # closes the physical gate, restores the persistent slot to
+            # silence, unlinks partial pads, removes ephemeral elements,
+            # releases request pads, and disconnects signaling.
+            self._remote_dj_session_stop()
         return False
+
+    @staticmethod
+    def _remote_dj_require_element(factory_name, stage):
+        element = Gst.ElementFactory.make(factory_name, None)
+        if element is None:
+            raise RemoteDJSessionBuildError(
+                stage, f"required GStreamer element {factory_name!r} is unavailable"
+            )
+        return element
+
+    @staticmethod
+    def _remote_dj_require_static_pad(element, pad_name, stage):
+        pad = element.get_static_pad(pad_name) if element is not None else None
+        if pad is None:
+            element_name = element.get_name() if element is not None else "missing"
+            raise RemoteDJSessionBuildError(
+                stage, f"{element_name!r} has no {pad_name!r} pad"
+            )
+        return pad
+
+    @staticmethod
+    def _remote_dj_link_elements(src, sink, stage):
+        if not src.link(sink):
+            raise RemoteDJSessionBuildError(
+                stage, f"could not link {src.get_name()!r} to {sink.get_name()!r}"
+            )
+
+    def _remote_dj_add_element(self, session, element, stage):
+        if not self.main_pipeline.add(element):
+            raise RemoteDJSessionBuildError(
+                stage, f"could not add {element.get_name()!r} to the main pipeline"
+            )
+        session.elements.append(element)
+
+    @staticmethod
+    def _remote_dj_link_pads(src_pad, sink_pad, stage):
+        if src_pad is None or sink_pad is None:
+            raise RemoteDJSessionBuildError(stage, "required source or sink pad is missing")
+        try:
+            result = src_pad.link(sink_pad)
+        except Gst.LinkError as exc:
+            raise RemoteDJSessionBuildError(stage, f"pad link failed: {exc}") from exc
+        if result != Gst.PadLinkReturn.OK:
+            nick = getattr(result, "value_nick", str(result))
+            raise RemoteDJSessionBuildError(stage, f"pad link returned {nick}")
+
+    def _remote_dj_configure_transceivers(self, session, mon_pay):
+        send_pad = session.webrtc.request_pad_simple("sink_%u")
+        if send_pad is None:
+            raise RemoteDJSessionBuildError(
+                "outgoing_send_pad", "webrtcbin did not provide sink_%u"
+            )
+        send_src = self._remote_dj_require_static_pad(
+            mon_pay, "src", "outgoing_rtp_source_pad"
+        )
+        self._remote_dj_link_pads(
+            send_src, send_pad, "outgoing_rtp_pad_link"
+        )
+        send_transceiver = send_pad.get_property("transceiver")
+        if send_transceiver is None:
+            raise RemoteDJSessionBuildError(
+                "outgoing_transceiver", "send pad has no transceiver"
+            )
+        send_transceiver.props.direction = (
+            GstWebRTC.WebRTCRTPTransceiverDirection.SENDONLY
+        )
+
+        recv_caps = Gst.Caps.from_string(
+            f"application/x-rtp,media=audio,encoding-name=OPUS,"
+            f"clock-rate={REMOTE_DJ_OPUS_RATE},encoding-params=(string)2,payload=97",
+        )
+        recv_transceiver = session.webrtc.emit(
+            "add-transceiver",
+            GstWebRTC.WebRTCRTPTransceiverDirection.RECVONLY,
+            recv_caps,
+        )
+        if recv_transceiver is None:
+            raise RemoteDJSessionBuildError(
+                "incoming_transceiver", "webrtcbin did not add the receive transceiver"
+            )
 
     def _remote_dj_build_session(self, session):
         cfg = RemoteDJConfig.load()
@@ -7089,7 +7291,9 @@ class PlaybackEngine:
                 f"{_mon_diag_running_time_ns / Gst.SECOND:.3f}s",
             )
 
-        session.webrtc = Gst.ElementFactory.make("webrtcbin", None)
+        session.webrtc = self._remote_dj_require_element(
+            "webrtcbin", "webrtcbin_dependency"
+        )
         session.webrtc.set_property("stun-server", cfg.stun_server)
         session.webrtc.set_property("bundle-policy", GstWebRTC.WebRTCBundlePolicy.MAX_BUNDLE)
         # rtpbin latency (the internal jitterbuffer's target buffered
@@ -7122,10 +7326,15 @@ class PlaybackEngine:
         # only a local reference, and always completes cleanly once the
         # reference is kept alive for the session's lifetime.
         session.ice_agent = session.webrtc.get_property("ice-agent")
+        if session.ice_agent is None:
+            raise RemoteDJSessionBuildError(
+                "libnice_ice_agent", "webrtcbin did not expose an ICE agent"
+            )
         session.ice_agent.set_property("min-rtp-port", cfg.ice_udp_min_port)
         session.ice_agent.set_property("max-rtp-port", cfg.ice_udp_max_port)
-        self.main_pipeline.add(session.webrtc)
-        session.elements.append(session.webrtc)
+        self._remote_dj_add_element(
+            session, session.webrtc, "webrtcbin_pipeline_add"
+        )
 
         # --- Outbound: monitor-return branch. Mix-minus by construction
         # for the *remote* mic (never tapped here), but INCLUDES the
@@ -7144,7 +7353,9 @@ class PlaybackEngine:
         # local_mic_tee is only built when both remote_dj is enabled
         # AND local mic exists, so the mic branch here only fires
         # under the same condition.
-        mon_mixer = Gst.ElementFactory.make("audiomixer", None)
+        mon_mixer = self._remote_dj_require_element(
+            "audiomixer", "monitor_mixer_dependency"
+        )
         # start-time-selection: FIRST, not the inherited default (ZERO).
         #
         # Unlike self.mixer / self.master_mixer / self.program_fx_mixer /
@@ -7202,24 +7413,36 @@ class PlaybackEngine:
         # full-output dropout on every remote-DJ connect. Same lesson,
         # same fix as stereotool_queue: this branch may only ever drop
         # its own audio, never block the shared path.
-        mon_decks_q = Gst.ElementFactory.make("queue", None)
+        mon_decks_q = self._remote_dj_require_element(
+            "queue", "monitor_decks_queue_dependency"
+        )
         mon_decks_q.set_property("leaky", 2)  # downstream -- drop oldest, never block the tee
         mon_decks_q.set_property("max-size-time", REMOTE_DJ_MONITOR_QUEUE_MS * Gst.MSECOND)
         mon_decks_q.set_property("max-size-buffers", 0)
         mon_decks_q.set_property("max-size-bytes", 0)
         mon_mic_q = None
         if self.local_mic_tee is not None:
-            mon_mic_q = Gst.ElementFactory.make("queue", None)
+            mon_mic_q = self._remote_dj_require_element(
+                "queue", "monitor_mic_queue_dependency"
+            )
             mon_mic_q.set_property("leaky", 2)
             mon_mic_q.set_property("max-size-time", REMOTE_DJ_MONITOR_QUEUE_MS * Gst.MSECOND)
             mon_mic_q.set_property("max-size-buffers", 0)
             mon_mic_q.set_property("max-size-bytes", 0)
-        mon_q = Gst.ElementFactory.make("queue", None)
+        mon_q = self._remote_dj_require_element(
+            "queue", "monitor_output_queue_dependency"
+        )
         mon_q.set_property("leaky", 1)  # upstream -- can only ever drop its own data
         mon_q.set_property("max-size-time", REMOTE_DJ_MONITOR_QUEUE_MS * Gst.MSECOND)
-        mon_conv = Gst.ElementFactory.make("audioconvert", None)
-        mon_resample = Gst.ElementFactory.make("audioresample", None)
-        mon_caps = Gst.ElementFactory.make("capsfilter", None)
+        mon_conv = self._remote_dj_require_element(
+            "audioconvert", "monitor_convert_dependency"
+        )
+        mon_resample = self._remote_dj_require_element(
+            "audioresample", "monitor_resample_dependency"
+        )
+        mon_caps = self._remote_dj_require_element(
+            "capsfilter", "monitor_caps_dependency"
+        )
         # `channels=2` is load-bearing here, not cosmetic: without it,
         # every element in the mon_conv -> mon_resample -> mon_caps ->
         # mon_enc -> mon_pay chain is pass-through channel-count-wise
@@ -7241,15 +7464,20 @@ class PlaybackEngine:
             "caps",
             Gst.Caps.from_string(f"audio/x-raw,rate={REMOTE_DJ_OPUS_RATE},channels=2"),
         )
-        mon_enc = Gst.ElementFactory.make("opusenc", None)
+        mon_enc = self._remote_dj_require_element(
+            "opusenc", "monitor_opus_encoder_dependency"
+        )
         mon_enc.set_property("frame-size", REMOTE_DJ_OPUS_FRAME_SIZE_MS)
-        mon_pay = Gst.ElementFactory.make("rtpopuspay", None)
+        mon_pay = self._remote_dj_require_element(
+            "rtpopuspay", "monitor_rtp_payloader_dependency"
+        )
         mon_elements = [mon_mixer, mon_decks_q, mon_q, mon_conv, mon_resample, mon_caps, mon_enc, mon_pay]
         if mon_mic_q is not None:
             mon_elements.append(mon_mic_q)
         for el in mon_elements:
-            self.main_pipeline.add(el)
-            session.elements.append(el)
+            self._remote_dj_add_element(
+                session, el, "monitor_element_pipeline_add"
+            )
 
         # Internal monitor-chain links only. The tee pads that feed this
         # chain are deliberately NOT requested or linked here -- that
@@ -7260,12 +7488,12 @@ class PlaybackEngine:
         # errors that propagate back through the tee into the shared
         # on-air path -- observed live as static on the currently-
         # playing deck that persisted until the deck's track ended.
-        mon_mixer.link(mon_q)
-        mon_q.link(mon_conv)
-        mon_conv.link(mon_resample)
-        mon_resample.link(mon_caps)
-        mon_caps.link(mon_enc)
-        mon_enc.link(mon_pay)
+        self._remote_dj_link_elements(mon_mixer, mon_q, "monitor_mixer_link")
+        self._remote_dj_link_elements(mon_q, mon_conv, "monitor_convert_link")
+        self._remote_dj_link_elements(mon_conv, mon_resample, "monitor_resample_link")
+        self._remote_dj_link_elements(mon_resample, mon_caps, "monitor_caps_link")
+        self._remote_dj_link_elements(mon_caps, mon_enc, "monitor_encoder_link")
+        self._remote_dj_link_elements(mon_enc, mon_pay, "monitor_payloader_link")
 
         # Transceiver order matters -- validated the hard way:
         # request_pad_simple("sink_%u") silently reuses any existing
@@ -7274,20 +7502,10 @@ class PlaybackEngine:
         # immediately, so the later add-transceiver(RECVONLY) call below
         # is forced to create a genuinely separate one instead of
         # hijacking this one and collapsing both SDP m-lines into one.
-        send_pad = session.webrtc.request_pad_simple("sink_%u")
-        mon_pay.get_static_pad("src").link(send_pad)
-        send_trans = send_pad.get_property("transceiver")
-        send_trans.props.direction = GstWebRTC.WebRTCRTPTransceiverDirection.SENDONLY
-
         # A RECVONLY transceiver also needs explicit, fully-shaped Opus
-        # RTP caps (encoding-params for channel count, not just
-        # encoding-name/clock-rate/payload) -- without it, Chrome answers
-        # with port=0 and a dummy PCMU codec, silently rejecting the line.
-        recv_caps = Gst.Caps.from_string(
-            f"application/x-rtp,media=audio,encoding-name=OPUS,"
-            f"clock-rate={REMOTE_DJ_OPUS_RATE},encoding-params=(string)2,payload=97",
-        )
-        session.webrtc.emit("add-transceiver", GstWebRTC.WebRTCRTPTransceiverDirection.RECVONLY, recv_caps)
+        # RTP caps. The helper gives every request/link/transceiver result
+        # an explicit typed failure contract before session build proceeds.
+        self._remote_dj_configure_transceivers(session, mon_pay)
 
         # --- Inbound: DEFERRED to _remote_dj_on_pad_added. ---
         # Earlier design used a silence-primed `concat` (see Stage 1 in
@@ -7385,11 +7603,13 @@ class PlaybackEngine:
         # happens.
         def _link_monitor_pad(src_pad, sink_pad, description):
             try:
-                src_pad.link(sink_pad)
-            except Gst.LinkError as exc:
+                self._remote_dj_link_pads(
+                    src_pad, sink_pad, "monitor_return_pad_link"
+                )
+            except RemoteDJSessionBuildError as exc:
                 raise RuntimeError(
                     f"Remote DJ monitor-return link failed ({description}): "
-                    f"{src_pad.get_name()!r} -> {sink_pad.get_name()!r}: {exc}"
+                    f"{exc.reason}"
                 ) from exc
 
         # One-shot monitor-mixer timeline diagnostics -- see mon_mixer's
@@ -7430,19 +7650,50 @@ class PlaybackEngine:
                 return Gst.PadProbeReturn.REMOVE
             pad.add_probe(Gst.PadProbeType.BUFFER, _probe, None)
 
-        _install_first_buffer_diag_probe(mon_mixer.get_static_pad("src"), "mixer_output")
+        mon_mixer_src = self._remote_dj_require_static_pad(
+            mon_mixer, "src", "monitor_mixer_source_pad"
+        )
+        _install_first_buffer_diag_probe(mon_mixer_src, "mixer_output")
 
         session.monitor_tee_pad = self.remote_dj_tee.request_pad_simple("src_%u")
-        _link_monitor_pad(session.monitor_tee_pad, mon_decks_q.get_static_pad("sink"), "remote_dj_tee -> mon_decks_q")
+        if session.monitor_tee_pad is None:
+            raise RemoteDJSessionBuildError(
+                "monitor_tee_request_pad", "remote_dj_tee did not provide src_%u"
+            )
+        mon_decks_sink = self._remote_dj_require_static_pad(
+            mon_decks_q, "sink", "monitor_decks_queue_sink_pad"
+        )
+        _link_monitor_pad(session.monitor_tee_pad, mon_decks_sink, "remote_dj_tee -> mon_decks_q")
         mon_mixer_decks_sink = mon_mixer.request_pad_simple("sink_%u")
-        _link_monitor_pad(mon_decks_q.get_static_pad("src"), mon_mixer_decks_sink, "mon_decks_q -> mon_mixer (decks)")
+        if mon_mixer_decks_sink is None:
+            raise RemoteDJSessionBuildError(
+                "monitor_mixer_decks_pad", "audiomixer did not provide sink_%u"
+            )
+        mon_decks_src = self._remote_dj_require_static_pad(
+            mon_decks_q, "src", "monitor_decks_queue_source_pad"
+        )
+        _link_monitor_pad(mon_decks_src, mon_mixer_decks_sink, "mon_decks_q -> mon_mixer (decks)")
         _install_first_buffer_diag_probe(mon_mixer_decks_sink, "program_monitor_input")
 
         if self.local_mic_tee is not None:
             session.local_mic_tee_pad = self.local_mic_tee.request_pad_simple("src_%u")
-            _link_monitor_pad(session.local_mic_tee_pad, mon_mic_q.get_static_pad("sink"), "local_mic_tee -> mon_mic_q")
+            if session.local_mic_tee_pad is None:
+                raise RemoteDJSessionBuildError(
+                    "local_mic_tee_request_pad", "local_mic_tee did not provide src_%u"
+                )
+            mon_mic_sink = self._remote_dj_require_static_pad(
+                mon_mic_q, "sink", "monitor_mic_queue_sink_pad"
+            )
+            _link_monitor_pad(session.local_mic_tee_pad, mon_mic_sink, "local_mic_tee -> mon_mic_q")
             mon_mixer_mic_sink = mon_mixer.request_pad_simple("sink_%u")
-            _link_monitor_pad(mon_mic_q.get_static_pad("src"), mon_mixer_mic_sink, "mon_mic_q -> mon_mixer (local mic)")
+            if mon_mixer_mic_sink is None:
+                raise RemoteDJSessionBuildError(
+                    "monitor_mixer_mic_pad", "audiomixer did not provide sink_%u"
+                )
+            mon_mic_src = self._remote_dj_require_static_pad(
+                mon_mic_q, "src", "monitor_mic_queue_source_pad"
+            )
+            _link_monitor_pad(mon_mic_src, mon_mixer_mic_sink, "mon_mic_q -> mon_mixer (local mic)")
             _install_first_buffer_diag_probe(mon_mixer_mic_sink, "local_mic_monitor_input")
 
     def _remote_dj_on_negotiation_needed(self, element):
@@ -7455,7 +7706,12 @@ class PlaybackEngine:
     def _remote_dj_on_offer_created(self, promise, _udata):
         promise.wait()
         reply = promise.get_reply()
-        offer = reply.get_value("offer")
+        offer = reply.get_value("offer") if reply is not None else None
+        if offer is None or offer.sdp is None:
+            self._remote_dj_fail_active_session(
+                FAILURE_MEDIA_ROUTING, "GStreamer did not create a usable SDP offer"
+            )
+            return
         # transfer-full gotcha, validated the hard way: set-local-
         # description takes ownership of the offer's boxed SDP, so
         # PyGObject nulls out offer.sdp once the signal consumes it --
@@ -7465,11 +7721,16 @@ class PlaybackEngine:
         session = self.remote_dj_session
         if session is None:
             return
+        self._remote_dj_mark(session, "offer_created")
         promise2 = Gst.Promise.new_with_change_func(self._remote_dj_on_local_desc_set, sdp_text)
         session.webrtc.emit("set-local-description", offer, promise2)
 
     def _remote_dj_on_local_desc_set(self, promise, sdp_text):
         promise.wait()
+        session = self.remote_dj_session
+        if session is None:
+            return
+        self._remote_dj_mark(session, "offer_sent")
         if self._remote_dj_server:
             self._remote_dj_server.send_json_threadsafe({"type": "offer", "sdp": sdp_text})
 
@@ -7477,6 +7738,7 @@ class PlaybackEngine:
         session = self.remote_dj_session
         if session is None or session.webrtc is not element:
             return
+        self._remote_dj_mark(session, "first_server_ice_candidate")
         if self._remote_dj_server:
             self._remote_dj_server.send_json_threadsafe(
                 {"type": "ice", "sdpMLineIndex": mline_index, "candidate": candidate},
@@ -7486,17 +7748,24 @@ class PlaybackEngine:
         session = self.remote_dj_session
         if session is None or sdp_text is None:
             return False
+        self._remote_dj_mark(session, "answer_received")
         res, sdpmsg = GstSdp.SDPMessage.new_from_text(sdp_text)
+        if res != GstSdp.SDPResult.OK or sdpmsg is None:
+            return self._remote_dj_fail_active_session(
+                FAILURE_MEDIA_ROUTING, "browser SDP answer could not be parsed"
+            )
         answer = GstWebRTC.WebRTCSessionDescription.new(GstWebRTC.WebRTCSDPType.ANSWER, sdpmsg)
         promise = Gst.Promise.new()
         session.webrtc.emit("set-remote-description", answer, promise)
         promise.interrupt()
+        self._remote_dj_mark(session, "answer_applied")
         return False
 
     def _remote_dj_handle_ice(self, mline_index, candidate):
         session = self.remote_dj_session
         if session is None or mline_index is None or candidate is None:
             return False
+        self._remote_dj_mark(session, "first_browser_ice_candidate")
         session.webrtc.emit("add-ice-candidate", mline_index, candidate)
         return False
 
@@ -7510,6 +7779,19 @@ class PlaybackEngine:
             print("  Remote DJ pad-added but no slot claimed on the session — ignoring")
             return
         slot = self.dj_slots[session.slot_id]
+        self._remote_dj_mark(session, "inbound_source_pad")
+        try:
+            self._remote_dj_build_inbound_chain(session, pad, slot)
+        except Exception as exc:
+            reason = str(exc)
+            print(f"  Remote DJ inbound media build failed: {reason}")
+            GLib.idle_add(
+                self._remote_dj_fail_active_session,
+                FAILURE_MEDIA_ROUTING,
+                reason,
+            )
+
+    def _remote_dj_build_inbound_chain(self, session, pad, slot):
 
         # Persistent-slot refactor: the DJ subchain now ends at the
         # slot's pre-allocated selector.sink_1 -- everything downstream
@@ -7519,39 +7801,68 @@ class PlaybackEngine:
         # -fed opus decode + resample + capsfilter chain that hands
         # PCM into the selector. On disconnect this chain is torn down
         # and the selector reverts to silence.
-        depay = Gst.ElementFactory.make("rtpopusdepay", None)
-        dec = Gst.ElementFactory.make("opusdec", None)
+        depay = self._remote_dj_require_element(
+            "rtpopusdepay", "inbound_rtp_depayloader_dependency"
+        )
+        dec = self._remote_dj_require_element(
+            "opusdec", "inbound_opus_decoder_dependency"
+        )
         # Diagnostic level meter kept in place -- still useful (cheap;
         # confirms what the Opus decoder is actually producing).
-        session.dj_level = Gst.ElementFactory.make("level", None)
+        session.dj_level = self._remote_dj_require_element(
+            "level", "inbound_level_dependency"
+        )
         session.dj_level.set_property("interval", 100_000_000)  # 100ms
         session.dj_level.set_property("post-messages", True)
-        conv = Gst.ElementFactory.make("audioconvert", None)
-        resample = Gst.ElementFactory.make("audioresample", None)
-        capsfilter = Gst.ElementFactory.make("capsfilter", None)
+        conv = self._remote_dj_require_element(
+            "audioconvert", "inbound_convert_dependency"
+        )
+        resample = self._remote_dj_require_element(
+            "audioresample", "inbound_resample_dependency"
+        )
+        capsfilter = self._remote_dj_require_element(
+            "capsfilter", "inbound_caps_dependency"
+        )
         # opusdec's output is 48kHz-native; resample DOWN to the
         # pipeline rate here. Match the selector's other input (silence)
         # exactly on caps so the switch is seamless.
         capsfilter.set_property("caps", self._remote_dj_pipeline_caps())
-        queue = Gst.ElementFactory.make("queue", None)
+        queue = self._remote_dj_require_element(
+            "queue", "inbound_queue_dependency"
+        )
         for el in (depay, dec, session.dj_level, conv, resample, capsfilter, queue):
-            self.main_pipeline.add(el)
-            session.elements.append(el)
-        depay.link(dec)
-        dec.link(session.dj_level)
-        session.dj_level.link(conv)
-        conv.link(resample)
-        resample.link(capsfilter)
-        capsfilter.link(queue)
+            self._remote_dj_add_element(
+                session, el, "inbound_element_pipeline_add"
+            )
+        self._remote_dj_link_elements(depay, dec, "inbound_depay_decoder_link")
+        self._remote_dj_link_elements(dec, session.dj_level, "inbound_decoder_level_link")
+        self._remote_dj_link_elements(session.dj_level, conv, "inbound_level_convert_link")
+        self._remote_dj_link_elements(conv, resample, "inbound_convert_resample_link")
+        self._remote_dj_link_elements(resample, capsfilter, "inbound_resample_caps_link")
+        self._remote_dj_link_elements(capsfilter, queue, "inbound_caps_queue_link")
         # Link the queue's src to the slot's pre-allocated webrtc_pad on
         # the input-selector. This is a plain pad-to-pad link on an
         # already-existing pad -- no request_pad_simple on the mixer,
         # no aggregator-state mutation, no race.
-        queue.get_static_pad("src").link(slot.webrtc_pad)
-        pad.link(depay.get_static_pad("sink"))
+        queue_src = self._remote_dj_require_static_pad(
+            queue, "src", "inbound_queue_source_pad"
+        )
+        self._remote_dj_link_pads(
+            queue_src, slot.webrtc_pad, "inbound_slot_pad_link"
+        )
+        depay_sink = self._remote_dj_require_static_pad(
+            depay, "sink", "inbound_depayloader_sink_pad"
+        )
+        self._remote_dj_link_pads(
+            pad, depay_sink, "inbound_webrtc_pad_link"
+        )
 
         for el in (depay, dec, session.dj_level, conv, resample, capsfilter, queue):
-            el.sync_state_with_parent()
+            if not el.sync_state_with_parent():
+                raise RemoteDJSessionBuildError(
+                    "inbound_state_sync",
+                    f"{el.get_name()!r} could not synchronize with the pipeline",
+                )
 
         _dj_diag(session, "decode_chain_wired (linked to slot.webrtc_pad)")
 
@@ -7568,7 +7879,6 @@ class PlaybackEngine:
         # produced any data, and the momentary underrun would surface
         # as ~few-ms of drift while opusdec spins up -- the probe
         # eliminates it.
-        queue_src = queue.get_static_pad("src")
         session.dj_mixer_pad_src = queue_src
 
         # DIAGNOSTIC PROBE 1 -- caps events. Every caps event on this
@@ -7644,6 +7954,7 @@ class PlaybackEngine:
                     return Gst.PadProbeReturn.REMOVE
                 slot2 = self.dj_slots[s.slot_id]
                 slot2.selector.set_property("active-pad", slot2.webrtc_pad)
+                self._remote_dj_mark(s, "first_decoded_remote_mic_buffer")
                 print("  Remote DJ: slot selector switched from silence to WebRTC audio")
                 _dj_diag(s, f"slot {slot2.slot_id} selector switched to webrtc_pad (silence -> live)")
             except Exception as exc:
@@ -7714,8 +8025,14 @@ class PlaybackEngine:
             return
         state = element.props.connection_state
         nick = state.value_nick
-        print(f"  Remote DJ connection state: {nick}")
+        attempt = getattr(session, "connection_attempt", None)
+        attempt_id = attempt.attempt_id if attempt is not None else "untracked"
+        print(f"  Remote DJ [{attempt_id}] connection state: {nick}")
         _dj_diag(session, f"webrtc connection_state -> {nick}")
+        if state == GstWebRTC.WebRTCPeerConnectionState.CONNECTING:
+            self._remote_dj_mark(session, "ice_checking")
+        elif state == GstWebRTC.WebRTCPeerConnectionState.CONNECTED:
+            self._remote_dj_mark(session, "peer_connected")
         # Breadcrumb on every state edge -- rare per-session, cheap to
         # emit, invaluable the next time a WebRTC-adjacent bug turns up
         # in the wild and we need to reconstruct the sequence.
@@ -7723,8 +8040,8 @@ class PlaybackEngine:
             category="engine",
             level="info",
             title=f"Remote DJ connection: {nick}",
-            detail={"state": nick},
-            dedupe_key=f"engine|remote_dj|state={nick}",
+            detail={"state": nick, "attempt_id": attempt_id},
+            dedupe_key=f"engine|remote_dj|attempt={attempt_id}|state={nick}",
         )
         if state == GstWebRTC.WebRTCPeerConnectionState.DISCONNECTED:
             # Transient. The browser may ICE-restart back to CONNECTED
@@ -7765,7 +8082,11 @@ class PlaybackEngine:
                 slot_rc.remote_gate.set_property("volume", 1.0)
                 self._apply_talk_ducking()
                 print("  Remote DJ: gate restored to 1.0 after reconnect")
-        elif state in (GstWebRTC.WebRTCPeerConnectionState.FAILED, GstWebRTC.WebRTCPeerConnectionState.CLOSED):
+        elif state == GstWebRTC.WebRTCPeerConnectionState.FAILED:
+            self._remote_dj_fail_active_session(
+                FAILURE_ICE_STATE, "WebRTC peer connection entered failed state"
+            )
+        elif state == GstWebRTC.WebRTCPeerConnectionState.CLOSED:
             self._remote_dj_session_stop()
 
     def _remote_dj_set_gate(self, active):
@@ -7789,7 +8110,11 @@ class PlaybackEngine:
         session = self.remote_dj_session
         if session is None:
             return False
-        print("  Remote DJ: session stopping")
+        attempt = getattr(session, "connection_attempt", None)
+        attempt_id = attempt.attempt_id if attempt is not None else "untracked"
+        print(f"  Remote DJ [{attempt_id}]: session stopping")
+        if attempt is not None:
+            self._remote_dj_last_attempt = attempt
         self.remote_dj_session = None
 
         slot = self.dj_slots[session.slot_id] if session.slot_id is not None else None
@@ -7841,7 +8166,8 @@ class PlaybackEngine:
         for el in session.elements:
             el.set_state(Gst.State.NULL)
         for el in session.elements:
-            self.main_pipeline.remove(el)
+            if el.get_parent() is self.main_pipeline:
+                self.main_pipeline.remove(el)
 
         # Release the slot back to the pool -- the ONLY per-session
         # bookkeeping we do on the persistent audio path. The slot's
@@ -7858,6 +8184,9 @@ class PlaybackEngine:
         # Close diagnostic sinks -- files stay on disk (not truncated
         # here) so a user reporting "static during that last session"
         # has something to inspect. Next session start truncates them.
+        self._remote_dj_mark(session, "session_stopped")
+        if attempt is not None:
+            attempt.end()
         _dj_diag(session, "session_stop")
         if session.diag_fh is not None:
             try:
@@ -7872,7 +8201,7 @@ class PlaybackEngine:
                 pass
             session.dump_fh = None
 
-        print("  Remote DJ: session stopped")
+        print(f"  Remote DJ [{attempt_id}]: session stopped")
         return False
 
     def _start_duck_ramp(self, target):
@@ -9785,6 +10114,10 @@ class PlaybackEngine:
                 "remote_dj_configured": self.remote_dj_tee is not None,
                 "remote_dj_connected": self.remote_dj_session is not None,
                 "remote_dj_live": self._remote_dj_gate_open(),
+                # P1 1.5 Pass A1 -- sparse, bounded connection-attempt
+                # evidence. Additive: the three compatibility booleans
+                # above retain their exact meaning and shape.
+                "remote_dj_connection": self._remote_dj_connection_state(),
                 # Authoritative FX Cart playback state -- see
                 # _fx_fires_state's own docstring. Drives the dashboard's
                 # progress-bar reconciliation regardless of what

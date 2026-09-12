@@ -98,7 +98,8 @@ LEGACY_OPTIONAL = "OPTIONAL"
 REQUIRED_GST_ELEMENTS = [
     "alsasrc", "alsasink", "audioconvert", "audiodynamic", "audiomixer",
     "audioresample", "audiotestsrc", "capsfilter", "concat", "decodebin",
-    "fakesink", "filesrc", "input-selector", "level", "opusdec", "opusenc",
+    "fakesink", "filesrc", "input-selector", "level", "nicesink", "nicesrc",
+    "opusdec", "opusenc",
     "queue", "rglimiter", "rtpopusdepay", "rtpopuspay", "tee", "volume",
     "webrtcbin",
 ]

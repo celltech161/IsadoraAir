@@ -27,9 +27,15 @@ import json
 import threading
 from urllib.parse import parse_qs, urlparse
 
-from django.core.signing import BadSignature, SignatureExpired, TimestampSigner
+from django.core.signing import BadSignature, SignatureExpired
 from gi.repository import GLib
 import websockets
+
+from library.services.remote_dj_connection import (
+    BROWSER_MILESTONES,
+    FAILURE_SIGNALING_SESSION_BUSY,
+    verify_remote_dj_token,
+)
 
 TOKEN_MAX_AGE_SECONDS = 60
 # One session already active; a second connection attempt is rejected
@@ -65,26 +71,50 @@ class RemoteDJSignalingServer:
     async def _handler(self, ws):
         query = parse_qs(urlparse(ws.request.path).query)
         token = query.get("token", [None])[0]
-        signer = TimestampSigner()
         try:
-            user_id = signer.unsign(token, max_age=TOKEN_MAX_AGE_SECONDS)
+            identity = verify_remote_dj_token(
+                token, max_age=TOKEN_MAX_AGE_SECONDS
+            )
         except (BadSignature, SignatureExpired, TypeError):
+            print("  Remote DJ connection refused: failure=authorization_token")
             await ws.close(code=CLOSE_CODE_INVALID_TOKEN, reason="invalid token")
             return
 
+        attempt_id = identity["attempt_id"]
         if self._ws is not None:
+            reason = "a session is already active"
+            print(
+                f"  Remote DJ connection refused: attempt={attempt_id} "
+                f"failure={FAILURE_SIGNALING_SESSION_BUSY}"
+            )
+            GLib.idle_add(
+                self.engine._remote_dj_record_signaling_failure,
+                attempt_id,
+                identity["issued_at_ms"],
+                FAILURE_SIGNALING_SESSION_BUSY,
+                reason,
+            )
             await ws.close(code=CLOSE_CODE_SESSION_BUSY, reason="a session is already active")
             return
 
         self._ws = ws
-        print(f"  Remote DJ connected: user_id={user_id}")
-        GLib.idle_add(self.engine._remote_dj_session_start)
+        print(
+            f"  Remote DJ WebSocket admitted: attempt={attempt_id} "
+            f"user_id={identity['user_id']}"
+        )
+        GLib.idle_add(
+            self.engine._remote_dj_session_start,
+            attempt_id,
+            identity["issued_at_ms"],
+        )
 
         try:
             async for raw in ws:
                 try:
                     data = json.loads(raw)
                 except (json.JSONDecodeError, ValueError):
+                    continue
+                if not isinstance(data, dict):
                     continue
                 msg_type = data.get("type")
                 if msg_type == "answer":
@@ -94,12 +124,21 @@ class RemoteDJSignalingServer:
                         self.engine._remote_dj_handle_ice,
                         data.get("sdpMLineIndex"), data.get("candidate"),
                     )
+                elif msg_type == "milestone":
+                    milestone = data.get("milestone")
+                    if milestone in BROWSER_MILESTONES:
+                        GLib.idle_add(
+                            self.engine._remote_dj_record_browser_milestone,
+                            milestone,
+                            data.get("elapsed_ms"),
+                        )
         except websockets.exceptions.ConnectionClosed:
             pass
         finally:
-            self._ws = None
-            print("  Remote DJ disconnected")
-            GLib.idle_add(self.engine._remote_dj_session_stop)
+            if self._ws is ws:
+                self._ws = None
+                print(f"  Remote DJ disconnected: attempt={attempt_id}")
+                GLib.idle_add(self.engine._remote_dj_session_stop)
 
     def send_json_threadsafe(self, obj):
         """Called from the GLib/GStreamer thread to deliver a message

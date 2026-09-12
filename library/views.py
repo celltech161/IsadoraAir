@@ -14,7 +14,6 @@ from django.views.decorators.http import require_http_methods
 
 from django.core.exceptions import ValidationError
 from django.core.paginator import Paginator
-from django.core.signing import TimestampSigner
 from django.db.models import Count, Q
 from django.db.models.deletion import ProtectedError
 from django.utils import timezone
@@ -23,6 +22,7 @@ from django.shortcuts import get_object_or_404
 
 from .models import Artist, Album, Category, CategoryKind, Genre, Holiday, LogItem, Playlist, PlaylistItem, PlaylistLog, Rotation, RotationSlot, ScheduleBlock, Track
 from .services.log_builder import LOCK_CONTENDED, _build_from_playlist, build_hour_log_for_admin, preview_hour_log
+from .services.remote_dj_connection import browser_ice_servers, mint_remote_dj_token
 from .services.related_artists import (
     autofill_related_artists_for_queryset, canonicalize_related_artists,
     format_related_artists, resolve_fallback_metadata,
@@ -2565,9 +2565,24 @@ def api_remote_dj_token(request):
     if not request.user.groups.filter(name="remote_dj").exists():
         return JsonResponse({"error": "Not authorized for remote DJ access"}, status=403)
 
-    signer = TimestampSigner()
-    token = signer.sign(str(request.user.id))
-    return JsonResponse({"token": token})
+    from library.models import RemoteDJConfig
+
+    try:
+        ice_servers = browser_ice_servers(RemoteDJConfig.load().stun_server)
+    except ValueError as exc:
+        print(f"  Remote DJ token refused: invalid configured STUN server ({exc})")
+        return JsonResponse(
+            {"error": "Remote DJ STUN configuration is invalid"}, status=503
+        )
+
+    token, payload = mint_remote_dj_token(request.user.id)
+    attempt_id = payload["attempt_id"]
+    print(f"  Remote DJ token issued: attempt={attempt_id} user_id={request.user.id}")
+    return JsonResponse({
+        "token": token,
+        "attempt_id": attempt_id,
+        "ice_servers": ice_servers,
+    })
 
 
 @require_http_methods(["GET"])

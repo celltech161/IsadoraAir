@@ -36,18 +36,18 @@ management command, or companion project uses GStreamer.
 | `decodebin` | deck/FX/VT file decode (format-agnostic; see "decodebin's actual decode path" below) | plugins-base (`libgstplayback.so`) | `gstreamer1.0-plugins-base` | ✅ |
 | `fakesink` | probe-only pipelines (duration/analysis passes, test scaffolding) | core | `libgstreamer1.0-0` | ✅ |
 | `webrtcbin` | Remote DJ WebRTC session (SDP/ICE/DTLS-SRTP) | plugins-bad | `gstreamer1.0-plugins-bad` | ✅ |
+| `nicesrc` | Remote DJ libnice ICE receive transport (loaded internally by `webrtcbin`) | nice | `gstreamer1.0-nice` | ✅ |
+| `nicesink` | Remote DJ libnice ICE send transport (loaded internally by `webrtcbin`) | nice | `gstreamer1.0-nice` | ✅ |
 | `opusenc` | monitoring mixdown → Opus (fed to `rtpopuspay`) | plugins-base | `gstreamer1.0-plugins-base` | ✅ |
 | `opusdec` | Remote DJ inbound Opus decode | plugins-base | `gstreamer1.0-plugins-base` | ✅ |
 | `rtpopuspay` | monitoring mixdown RTP payload | plugins-good | `gstreamer1.0-plugins-good` | ✅ |
 | `rtpopusdepay` | Remote DJ inbound RTP depayload | plugins-good | `gstreamer1.0-plugins-good` | ✅ |
 
-**Nice/WebRTC note**: `webrtcbin` itself only needs `gstreamer1.0-plugins-bad`
-(confirmed above — it's `libgstwebrtc.so`, not a separate nice-specific
-element). `gstreamer1.0-nice` (ICE/STUN/TURN, package `gstreamer1.0-nice`,
-0.1.23-2 on production) is a **runtime dependency `webrtcbin` loads
-internally** for ICE candidate gathering, not a distinct element
-IsadoraAir's own code names directly — still required for Remote DJ to
-actually establish a session, just not visible to a code grep.
+**Nice/WebRTC note**: `webrtcbin` comes from `gstreamer1.0-plugins-bad`,
+but a usable Remote DJ session also requires the `nicesrc` and `nicesink`
+elements from `gstreamer1.0-nice`. `webrtcbin` loads those internally for
+ICE candidate gathering/transport, so all three are explicit deployment-
+baseline requirements even though `engine.py` only constructs `webrtcbin`.
 
 ## `decodebin`'s actual decode path
 
