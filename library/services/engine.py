@@ -7274,7 +7274,14 @@ class PlaybackEngine:
             )
 
     def _remote_dj_add_element(self, session, element, stage):
-        if not self.main_pipeline.add(element):
+        # Gst.Bin.add()'s Python return value is not a trustworthy success
+        # signal on every PyGObject/GStreamer combination: on the production
+        # runtime it returns None even when the element was actually added
+        # and parented. The only reliable postcondition is that the element
+        # now reports self.main_pipeline as its parent -- check that instead
+        # of the return value.
+        self.main_pipeline.add(element)
+        if element.get_parent() is not self.main_pipeline:
             raise RemoteDJSessionBuildError(
                 stage, f"could not add {element.get_name()!r} to the main pipeline"
             )

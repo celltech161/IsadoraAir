@@ -224,16 +224,65 @@ class RemoteDJTransceiverBuildGuardTests(SimpleTestCase):
 
     def test_pipeline_add_failure_is_typed_session_build_failure(self):
         self.engine.main_pipeline = MagicMock()
-        self.engine.main_pipeline.add.return_value = False
         element = MagicMock()
         element.get_name.return_value = "partial-webrtc"
-
+        # Real postcondition failure: the element never became a child of
+        # main_pipeline (get_parent() returns a fresh MagicMock, never `is`
+        # self.engine.main_pipeline).
         with self.assertRaisesRegex(
             eng_module.RemoteDJSessionBuildError, "test_pipeline_add"
         ):
             self.engine._remote_dj_add_element(
                 self.session, element, "test_pipeline_add"
             )
+        self.assertEqual(self.session.elements, [])
+
+    def test_add_succeeds_when_binding_returns_none_but_element_is_parented(self):
+        """Production root-cause regression: on the real Ubuntu/PyGObject/
+        GStreamer runtime, Gst.Bin.add() successfully adds and parents the
+        element but returns Python None. _remote_dj_add_element must treat
+        this as success -- the only trustworthy signal is the element's
+        actual parent, not the binding's return value."""
+        Gst.init(None)
+        self.engine.main_pipeline = Gst.Bin.new("test-main-pipeline")
+        real_add = self.engine.main_pipeline.add
+
+        def _add_that_returns_none(el):
+            real_add(el)
+            return None
+
+        self.engine.main_pipeline.add = _add_that_returns_none
+
+        element = Gst.ElementFactory.make("fakesink", "test-webrtcbin-stand-in")
+        self.assertIsNotNone(element, "fakesink must be available in the test environment")
+
+        # Must not raise, even though add() itself returned None.
+        self.engine._remote_dj_add_element(self.session, element, "test_pipeline_add")
+
+        self.assertIs(element.get_parent(), self.engine.main_pipeline)
+        self.assertIn(element, self.session.elements)
+
+    def test_add_failure_is_detected_by_postcondition_even_if_binding_lies(self):
+        """The mirror case: even if a binding's return value were to claim
+        success, a genuine failure to parent the element must still be
+        caught -- the postcondition, not the return value, is authoritative
+        in both directions."""
+        Gst.init(None)
+        self.engine.main_pipeline = Gst.Bin.new("test-main-pipeline")
+
+        def _add_that_lies(el):
+            # Never actually adds/parents the element, but claims success.
+            return True
+
+        self.engine.main_pipeline.add = _add_that_lies
+
+        element = Gst.ElementFactory.make("fakesink", "test-webrtcbin-stand-in-2")
+        self.assertIsNotNone(element, "fakesink must be available in the test environment")
+
+        with self.assertRaisesRegex(
+            eng_module.RemoteDJSessionBuildError, "test_pipeline_add"
+        ):
+            self.engine._remote_dj_add_element(self.session, element, "test_pipeline_add")
         self.assertEqual(self.session.elements, [])
 
 
