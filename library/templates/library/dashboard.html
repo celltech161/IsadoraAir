@@ -1798,6 +1798,13 @@ let rdjIceServers = [];
 let rdjFirstIceCandidateSeen = false;
 let rdjStatsTimers = [];
 let rdjStatsBurstPc = null;
+// P1 1.5 Pass B1 -- true from our OWN RTCPeerConnection observing
+// iceConnectionState 'disconnected' until it either recovers
+// ('connected'/'completed') or the connection is torn down (local
+// terminal state, or the server closing the signaling socket once its
+// own recovery grace expires). While true, the peer connection is
+// deliberately NOT closed -- see oniceconnectionstatechange below.
+let rdjReconnecting = false;
 
 const RDJ_GAIN_STORAGE_KEY = 'isadoraair.remote_dj.gain_db';
 
@@ -1986,10 +1993,27 @@ async function toggleRemoteDjConnect() {
         if (rdjPc !== statsPc || rdjWs !== statsWs || rdjAttemptId !== statsAttemptId) return;
         if (statsPc.iceConnectionState === 'checking') rdjSendMilestone('ice_checking');
         if (['connected', 'completed'].includes(statsPc.iceConnectionState)) {
+          rdjReconnecting = false;
           rdjSendMilestone('ice_connected');
           rdjScheduleStatsBurst(statsPc, statsWs, statsAttemptId);
         }
-        if (['failed', 'disconnected', 'closed'].includes(statsPc.iceConnectionState)) {
+        // P1 1.5 Pass B1 -- 'disconnected' is transient/recoverable (the
+        // canonical case is a brief network blip or a WiFi<->cellular
+        // handover): the engine is already muting Remote Mic and running
+        // its own bounded recovery grace, so eagerly closing OUR peer
+        // connection here would destroy a session the engine is
+        // intentionally still allowing to recover, and would force a
+        // full reconnect even for a blip that could have self-healed.
+        // Only reflect it in the UI; wait for either a real recovery
+        // (above) or a genuinely terminal signal: our own 'failed'/
+        // 'closed', an explicit user Disconnect click, or the server
+        // closing the signaling socket once ITS grace expires (handled
+        // in rdjWs.onclose below).
+        if (statsPc.iceConnectionState === 'disconnected') {
+          rdjReconnecting = true;
+        }
+        if (['failed', 'closed'].includes(statsPc.iceConnectionState)) {
+          rdjReconnecting = false;
           rdjDisconnect();
         }
       };
@@ -2068,10 +2092,23 @@ async function toggleRemoteDjConnect() {
     }
   };
   rdjWs.onerror = () => rdjConnectFail('WS error');
-  rdjWs.onclose = (e) => { if (!rdjPc) rdjConnectFail('Closed (' + e.code + ')'); };
+  rdjWs.onclose = (e) => {
+    if (!rdjPc) { rdjConnectFail('Closed (' + e.code + ')'); return; }
+    // P1 1.5 Pass B1 -- the peer connection is still open (we're either
+    // fully connected or riding out a 'disconnected' reconnect grace),
+    // yet the SERVER closed the signaling socket. That only happens on
+    // an authoritative engine-side finalize (native ICE failure, or our
+    // own recovery grace expiring) -- tear down locally so the UI can't
+    // keep showing a live console after the engine already released the
+    // slot. No error flash: this is an expected outcome of an
+    // unrecovered disconnect, not a failed connection attempt.
+    rdjReconnecting = false;
+    rdjDisconnect();
+  };
 }
 
 function rdjDisconnect() {
+  rdjReconnecting = false;
   rdjStatsTimers.forEach(timer => clearTimeout(timer));
   rdjStatsTimers = [];
   rdjStatsBurstPc = null;
@@ -2098,13 +2135,20 @@ function renderRemoteDjConnect(data) {
   if (!btn) return;
   const weAreConnected = !!rdjPc;
   const someoneElseConnected = data.remote_dj_connected && !weAreConnected;
+  // P1 1.5 Pass B1 -- prefer OUR OWN observed ICE state when we're the
+  // connected browser (it updates the instant our RTCPeerConnection
+  // sees 'disconnected', ahead of any poll); fall back to the engine's
+  // reported remote_dj_reconnecting for anyone else watching this
+  // console, so a bystander doesn't see a plain, indistinguishable
+  // "Remote in use" while the slot is actually degraded and muted.
+  const reconnecting = weAreConnected ? rdjReconnecting : !!data.remote_dj_reconnecting;
   btn.disabled = !data.remote_dj_configured || someoneElseConnected;
   btn.classList.toggle('active', weAreConnected);
   if (btn.classList.contains('error')) return;  // transient error msg wins for 3s
   btn.classList.remove('pending');
   btn.textContent = !data.remote_dj_configured ? 'Remote: n/a'
-    : weAreConnected ? 'Disconnect Remote'
-    : someoneElseConnected ? 'Remote in use'
+    : weAreConnected ? (reconnecting ? 'Reconnecting…' : 'Disconnect Remote')
+    : someoneElseConnected ? (reconnecting ? 'Remote reconnecting…' : 'Remote in use')
     : 'Connect Remote';
 }
 

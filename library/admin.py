@@ -987,6 +987,14 @@ class RemoteDJConfigAdmin(admin.ModelAdmin):
         ("WebRTC/ICE", {
             "fields": ["stun_server", "ice_udp_min_port", "ice_udp_max_port"],
         }),
+        ("Reconnect / recovery", {
+            "fields": ["reconnect_grace_seconds"],
+            "description": "How long a transient transport loss is given "
+                            "to recover before the engine finalizes the "
+                            "session and frees the slot. Applies "
+                            "immediately to the next reconnect grace "
+                            "timer -- no restart required.",
+        }),
     ]
 
     def has_add_permission(self, request):

@@ -57,6 +57,17 @@ MILESTONE_ORDER = (
     "ice_connected",
     "server_ice_completed",
     "selected_candidate_pair",
+    # P1 1.5 Pass B1 -- the SERVER-side get-stats snapshot can expose a
+    # transport's selected-candidate-pair-id before the remote answer/
+    # browser candidates even exist (proven in r0070 production: the
+    # snapshot only means "candidate-pair stats were present in this
+    # promise reply," never "a usable pair was actually nominated").
+    # Renamed rather than reusing "selected_candidate_pair" (which stays
+    # exactly as before for the BROWSER's own, separately-verified,
+    # selected/nominated-pair report) so a truthful name can never be
+    # confused with the misleading server-side one it replaces. See
+    # _remote_dj_on_stats_ready.
+    "candidate_pair_stats_present",
     "dtls_connecting",
     "dtls_connected",
     "peer_connected",
@@ -289,6 +300,31 @@ class RemoteDJConnectionAttempt:
             self.stage = milestone
         if milestone in {"ice_connected", "peer_connected"}:
             self.status = "connected"
+        return True
+
+    def mark_reconnecting(self):
+        """P1 1.5 Pass B1 -- product-level lifecycle transition: an
+        established session's transport became recoverably disconnected
+        (WebRTC PeerConnectionState DISCONNECTED, or equivalent). Returns
+        True only if this actually changed status -- i.e. the attempt was
+        genuinely "connected" immediately before. A DISCONNECTED signal
+        arriving before the session ever reached "connected" (still
+        mid-negotiation) is not a recoverable-established-session event
+        and must not start a recovery-grace window; the caller uses this
+        return value to decide whether to do so."""
+        if self.status != "connected":
+            return False
+        self.status = "reconnecting"
+        return True
+
+    def mark_recovered(self):
+        """The mirror of mark_reconnecting(): the SAME session's transport
+        recovered before its recovery grace expired. Returns True only if
+        a transition actually happened (i.e. the attempt was genuinely
+        "reconnecting")."""
+        if self.status != "reconnecting":
+            return False
+        self.status = "connected"
         return True
 
     def fail(self, failure_class, reason):

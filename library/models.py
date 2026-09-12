@@ -1345,6 +1345,20 @@ class RemoteDJConfig(models.Model):
                    "small target.",
     )
     ice_udp_max_port = models.PositiveIntegerField(default=40010)
+    reconnect_grace_seconds = models.PositiveIntegerField(
+        default=10,
+        help_text="P1 1.5 Pass B1 -- how long an established Remote DJ "
+                   "session may stay in a muted 'Reconnecting' state after "
+                   "a recoverable transport loss (WebRTC PeerConnectionState "
+                   "DISCONNECTED) before the engine finalizes it and "
+                   "releases the slot, instead of waiting for GStreamer/"
+                   "libnice's own much longer native ICE failure timeout "
+                   "(observed ~49s in production field evidence). Read "
+                   "fresh every time a transient disconnect starts a new "
+                   "recovery-grace timer -- applies immediately, no engine "
+                   "restart or new session required. Bounded to 3-30 "
+                   "seconds.",
+    )
 
     class Meta:
         verbose_name = "Remote DJ Configuration"
@@ -1352,6 +1366,12 @@ class RemoteDJConfig(models.Model):
 
     def __str__(self):
         return "Remote DJ Configuration"
+
+    def clean(self):
+        if not 3 <= self.reconnect_grace_seconds <= 30:
+            raise ValidationError(
+                {"reconnect_grace_seconds": "Must be between 3 and 30 seconds."}
+            )
 
     def save(self, *args, **kwargs):
         self.pk = 1

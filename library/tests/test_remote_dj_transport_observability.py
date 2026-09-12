@@ -307,8 +307,35 @@ class RemoteDJTransportGenerationTests(SimpleTestCase):
             "connecting",
         )
         self.assertIn("dtls_connecting", attempt.milestones["server"])
-        self.assertIn("selected_candidate_pair", attempt.milestones["server"])
+        # P1 1.5 Pass B1 correction: this fixture's transport is only
+        # "connecting" (never proven connected/usable) -- the truthful
+        # name for what a get-stats snapshot alone can prove is
+        # "candidate_pair_stats_present", NOT "selected_candidate_pair"
+        # (which stays reserved for the browser's own, separately
+        # verified, selected/nominated-pair report). See
+        # test_server_candidate_pair_milestone_is_never_misreported_as_selected
+        # below for the explicit regression against the old name.
+        self.assertIn("candidate_pair_stats_present", attempt.milestones["server"])
         self.assertEqual(attempt.media_stats["remote_mic"]["packets_received"], 81)
+
+    def test_server_candidate_pair_milestone_is_never_misreported_as_selected(self):
+        """P1 1.5 Pass B1 regression -- production proved this SERVER-side
+        get-stats snapshot can report a selected-candidate-pair-id before
+        the remote answer/browser candidates even exist. The old
+        "selected_candidate_pair" name is a false claim of a usable,
+        nominated pair; it must never appear in the SERVER timing domain
+        again (the browser domain is untouched -- see
+        test_current_browser_stats_add_fixed_state_and_real_milestones)."""
+        promise = MagicMock()
+        promise.get_reply.return_value = _stats_report()
+        self.engine._remote_dj_on_stats_ready(
+            promise,
+            (self.current, ATTEMPT_B, self.current.webrtc, "test"),
+        )
+        attempt = self.current.connection_attempt
+        self.assertNotIn("selected_candidate_pair", attempt.milestones["server"])
+        # The final sanitized topology itself is unaffected by the rename.
+        self.assertTrue(attempt.transport["server"]["selected_pair"]["exists"])
 
 
 class RemoteDJTransportStateContractTests(SimpleTestCase):

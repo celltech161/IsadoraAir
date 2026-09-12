@@ -631,6 +631,15 @@ class RemoteDJSession:
         self.dump_probe_id = 0         # pad probe id for the PCM dump
         self.stats_probe_ids = []      # cancellable bounded GLib one-shots
         self.stats_burst_started = False
+        # P1 1.5 Pass B1 -- bounded engine-side recovery deadline. Set
+        # when a recoverable transport loss (WebRTC PeerConnectionState
+        # DISCONNECTED) starts this session's product-level "Reconnecting"
+        # grace window; 0 means no deadline is currently pending. Cancelled
+        # (reset to 0) on natural same-session recovery; fires exactly once
+        # (a GLib one-shot, same discipline as stats_probe_ids) if grace
+        # expires without recovery. See _remote_dj_on_connection_state and
+        # _remote_dj_on_recovery_deadline.
+        self.recovery_deadline_source_id = 0
 
 
 class Deck:
@@ -6897,6 +6906,16 @@ class PlaybackEngine:
             return False
         return self.dj_slots[s.slot_id].remote_gate.get_property("volume") > 0.0
 
+    def _remote_dj_reconnecting(self):
+        """P1 1.5 Pass B1 -- True iff a Remote DJ session is currently
+        active AND inside its bounded recovery-grace window (see
+        RemoteDJConnectionAttempt.mark_reconnecting/mark_recovered).
+        Public-state accessor only; the actual state machine lives on
+        the connection attempt, driven by _remote_dj_on_connection_state."""
+        s = self.remote_dj_session
+        attempt = getattr(s, "connection_attempt", None) if s is not None else None
+        return attempt is not None and attempt.status == "reconnecting"
+
     def _set_mic_ptt(self, active):
         if self.mic_ptt_volume is None:
             print("  mic_ptt requested but mic is not configured/available — ignoring")
@@ -7265,7 +7284,15 @@ class PlaybackEngine:
         if dtls_state != previous_dtls and dtls_state in {"connecting", "connected"}:
             self._remote_dj_mark(session, f"dtls_{dtls_state}")
         if pair_exists and not previous_pair:
-            self._remote_dj_mark(session, "selected_candidate_pair")
+            # P1 1.5 Pass B1 correction: this SERVER-side get-stats
+            # snapshot can expose a selected-candidate-pair-id before the
+            # remote answer/browser candidates even exist (proven in r0070
+            # production) -- it only proves "candidate-pair stats were
+            # present in this reply," never "a usable pair was actually
+            # nominated." Named accordingly; the final sanitized topology
+            # in attempt.transport["server"]["selected_pair"] is unchanged
+            # and unaffected by this rename.
+            self._remote_dj_mark(session, "candidate_pair_stats_present")
         packets = attempt.media_stats["remote_mic"]["packets_received"]
         if packets is not None and packets > 0 and not (previous_packets and previous_packets > 0):
             self._remote_dj_mark(session, "first_remote_mic_rtp_observed")
@@ -8425,7 +8452,63 @@ class PlaybackEngine:
                     detail={"reason": "protective mute during WebRTC DISCONNECTED"},
                     dedupe_key="engine|remote_dj|protective_mute",
                 )
+            # P1 1.5 Pass B1 -- product-level "Reconnecting" state plus a
+            # bounded engine-side recovery deadline. Field evidence: a
+            # broken/stale browser can leave the native GstWebRTC
+            # connection-state sitting in DISCONNECTED for ~49s before
+            # libnice itself declares FAILED -- station policy uses a
+            # much shorter grace instead of inheriting that native
+            # terminal timeout. mark_reconnecting() only returns True
+            # coming from a genuinely-established "connected" attempt, so
+            # a DISCONNECTED notify during initial negotiation (never yet
+            # connected) intentionally does not start this timer -- the
+            # existing build-failure/typed-failure paths already cover
+            # that case.
+            if attempt is not None and attempt.mark_reconnecting():
+                grace_seconds = RemoteDJConfig.load().reconnect_grace_seconds
+                print(
+                    f"  Remote DJ [{attempt_id}]: entering Reconnecting "
+                    f"(grace={grace_seconds}s)"
+                )
+                _dj_diag(session, f"reconnecting_entered grace_seconds={grace_seconds}")
+                emit_event(
+                    category="engine",
+                    level="warning",
+                    title="Remote DJ entered Reconnecting",
+                    detail={"attempt_id": attempt_id, "grace_seconds": grace_seconds},
+                    dedupe_key=f"engine|remote_dj|reconnecting|attempt={attempt_id}",
+                )
+                if session.recovery_deadline_source_id == 0:
+                    deadline_context = (session, attempt_id, session.webrtc)
+                    session.recovery_deadline_source_id = GLib.timeout_add(
+                        int(grace_seconds * 1000),
+                        self._remote_dj_on_recovery_deadline,
+                        deadline_context,
+                    )
         elif state == GstWebRTC.WebRTCPeerConnectionState.CONNECTED:
+            # P1 1.5 Pass B1 -- same-session recovery: cancel the pending
+            # recovery deadline (if any) and return the attempt to
+            # "connected" BEFORE the pre-existing gate-restore logic below
+            # runs, so gate_desired is honored against the post-recovery
+            # state, not the muted Reconnecting one.
+            if session.recovery_deadline_source_id:
+                try:
+                    main_context = GLib.MainContext.default()
+                    if main_context.find_source_by_id(session.recovery_deadline_source_id) is not None:
+                        GLib.source_remove(session.recovery_deadline_source_id)
+                except Exception:
+                    pass
+                session.recovery_deadline_source_id = 0
+            if attempt is not None and attempt.mark_recovered():
+                print(f"  Remote DJ [{attempt_id}]: recovered within grace -- back to connected")
+                _dj_diag(session, "reconnect_recovered")
+                emit_event(
+                    category="engine",
+                    level="info",
+                    title="Remote DJ recovered from transient disconnect",
+                    detail={"attempt_id": attempt_id},
+                    dedupe_key=f"engine|remote_dj|recovered|attempt={attempt_id}",
+                )
             # Recovery path -- DJ was live and had the gate open before
             # the blip; restore what they wanted instead of leaving them
             # muted after ICE renegotiates. First-time CONNECTED entry
@@ -8444,6 +8527,47 @@ class PlaybackEngine:
         elif state == GstWebRTC.WebRTCPeerConnectionState.CLOSED:
             self._remote_dj_session_stop()
 
+    def _remote_dj_on_recovery_deadline(self, callback_context):
+        """P1 1.5 Pass B1 -- fires once, RemoteDJConfig.reconnect_grace_
+        seconds after a session entered Reconnecting, unless it recovered
+        first (see the CONNECTED branch of _remote_dj_on_connection_state,
+        which cancels this via GLib.source_remove and returns False here
+        forever). Bound to the originating attempt/session/webrtcbin via
+        the same _remote_dj_session_for_attempt generation guard every
+        other async Remote DJ callback uses -- a stale timer from a
+        replaced or already-finalized session resolves to no session and
+        does nothing."""
+        expected_session, attempt_id, expected_webrtc = callback_context
+        session = self._remote_dj_session_for_attempt(
+            attempt_id,
+            "recovery_deadline",
+            expected_session=expected_session,
+            expected_webrtc=expected_webrtc,
+        )
+        if session is None:
+            return False
+        session.recovery_deadline_source_id = 0
+        attempt = session.connection_attempt
+        if attempt is None or attempt.status != "reconnecting":
+            # Recovered or finalized through some other path without this
+            # timer having been cancelled first -- shouldn't happen, but
+            # harmless if it does.
+            return False
+        print(f"  Remote DJ [{attempt_id}]: recovery grace expired -- finalizing")
+        _dj_diag(session, "recovery_grace_expired")
+        emit_event(
+            category="engine",
+            level="warning",
+            title="Remote DJ recovery grace expired",
+            detail={"attempt_id": attempt_id},
+            dedupe_key=f"engine|remote_dj|grace_expired|attempt={attempt_id}",
+        )
+        self._remote_dj_fail_active_session(
+            FAILURE_ICE_STATE,
+            "transport did not recover within the product recovery grace",
+        )
+        return False
+
     def _remote_dj_set_gate(self, active):
         session = self.remote_dj_session
         if session is None or session.slot_id is None:
@@ -8460,6 +8584,56 @@ class PlaybackEngine:
         self._apply_talk_ducking()
         self._apply_mic_mode_hold()
         print(f"  Remote DJ gate: {'ON' if active else 'OFF'}")
+
+    def _remote_dj_emit_ownership_outcome(self, attempt_id, pre_manual, pre_manual_from_mic):
+        """P1 1.5 Pass B1 requirement 8 -- bounded, nonsecret evidence of
+        the Auto/Manual outcome a Remote DJ finalization actually
+        produced. Called from _remote_dj_session_stop AFTER
+        _apply_mic_mode_hold() has already run its normal, UNMODIFIED
+        reevaluation (see _apply_mic_mode_hold's own docstring for that
+        contract) -- this only classifies and reports what happened; it
+        never changes manual_mode or `_manual_from_mic` itself.
+
+        `pre_manual`/`pre_manual_from_mic` are this engine's manual_mode/
+        `_manual_from_mic` captured immediately before that reevaluation
+        ran (with the remote gate already forced to 0). Classification:
+          - pre_manual is False: Auto already -- Remote DJ held nothing;
+            nothing to report.
+          - pre_manual is True, pre_manual_from_mic is False: Case B/C,
+            pre-existing or operator-asserted Manual -- untouched by
+            design (one label covers both; `_manual_from_mic` already
+            treats them identically).
+          - pre_manual and pre_manual_from_mic were both True, and
+            manual_mode is STILL True after the reevaluation: Case D --
+            can only mean some other mic (Studio Mic) is still live,
+            since the remote gate was already forced to 0 before this
+            ran, so _any_mic_live() is otherwise False.
+          - pre_manual and pre_manual_from_mic were both True, and
+            manual_mode is now False: Case A -- the mic-hold Remote DJ
+            (at least in part) caused has genuinely released.
+        """
+        if not pre_manual:
+            return
+        if not pre_manual_from_mic:
+            reason, restored, preserved = "operator_manual", None, "manual"
+        elif self.manual_mode:
+            reason, restored, preserved = "studio_mic_still_live", None, "manual"
+        else:
+            reason, restored, preserved = "remote_mic_auto_hold_released", "auto", None
+        label = f"automation_restored={restored}" if restored else f"automation_preserved={preserved}"
+        print(f"  Remote DJ [{attempt_id}]: {label} reason={reason}")
+        detail = {"attempt_id": attempt_id, "reason": reason}
+        if restored:
+            detail["automation_restored"] = restored
+        else:
+            detail["automation_preserved"] = preserved
+        emit_event(
+            category="engine",
+            level="info",
+            title=f"Remote DJ finalized: {label}",
+            detail=detail,
+            dedupe_key=f"engine|remote_dj|automation_outcome|attempt={attempt_id}",
+        )
 
     def _remote_dj_session_stop(self, attempt_id=None):
         if attempt_id is None:
@@ -8489,6 +8663,21 @@ class PlaybackEngine:
                 pass
         session.stats_probe_ids.clear()
 
+        # P1 1.5 Pass B1 -- cancel a pending recovery-grace deadline too
+        # (e.g. finalizing via native FAILED/CLOSED, or an explicit
+        # operator Disconnect, while a product-level Reconnecting grace
+        # was still running). Not required for correctness -- the
+        # deadline callback's own generation check already makes a stale
+        # firing harmless -- but avoids a confusing spurious "grace
+        # expired" log/event for a session that's already gone.
+        if session.recovery_deadline_source_id:
+            try:
+                if main_context.find_source_by_id(session.recovery_deadline_source_id) is not None:
+                    GLib.source_remove(session.recovery_deadline_source_id)
+            except Exception:
+                pass
+            session.recovery_deadline_source_id = 0
+
         slot = self.dj_slots[session.slot_id] if session.slot_id is not None else None
 
         # Safety first: close the gate before tearing anything down. In
@@ -8498,11 +8687,25 @@ class PlaybackEngine:
         if slot is not None:
             slot.remote_gate.set_property("volume", 0.0)
             self._apply_talk_ducking()
+            # P1 1.5 Pass B1 requirement 8 -- capture ownership state
+            # BEFORE the reevaluation below so the outcome can be
+            # classified and reported afterward. This only observes;
+            # _apply_mic_mode_hold()'s own decision is unmodified.
+            # getattr(..., False): several existing test harnesses build a
+            # bare PlaybackEngine via object.__new__() and mock out
+            # _apply_mic_mode_hold entirely, never setting these -- same
+            # defensive-access convention already used throughout this
+            # file (e.g. getattr(session, "connection_attempt", None)).
+            pre_manual = getattr(self, "manual_mode", False)
+            pre_manual_from_mic = getattr(self, "_manual_from_mic", False)
             # Also fold any mic-held Manual back to Auto now that the
             # remote is definitively off -- session_stop is one of the
             # implicit "gate goes off" paths where _remote_dj_set_gate
             # isn't called.
             self._apply_mic_mode_hold()
+            self._remote_dj_emit_ownership_outcome(
+                attempt_id, pre_manual, pre_manual_from_mic
+            )
 
         # Persistent-slot teardown -- structurally simpler than the
         # pre-refactor path:
@@ -10486,9 +10689,18 @@ class PlaybackEngine:
                 "remote_dj_configured": self.remote_dj_tee is not None,
                 "remote_dj_connected": self.remote_dj_session is not None,
                 "remote_dj_live": self._remote_dj_gate_open(),
+                # P1 1.5 Pass B1 -- true only while the active session is
+                # inside its bounded recovery-grace window (transport
+                # DISCONNECTED, Remote Mic already forced silent, waiting
+                # to see if the SAME session recovers before the product
+                # deadline). remote_dj_connected stays true throughout
+                # (the slot is still occupied) -- this is what lets the
+                # dashboard show "Reconnecting" instead of a plain
+                # "In use" that looks identical to a healthy connection.
+                "remote_dj_reconnecting": self._remote_dj_reconnecting(),
                 # P1 1.5 Pass A1 -- sparse, bounded connection-attempt
-                # evidence. Additive: the three compatibility booleans
-                # above retain their exact meaning and shape.
+                # evidence. Additive: the compatibility booleans above
+                # retain their exact meaning and shape.
                 "remote_dj_connection": self._remote_dj_connection_state(),
                 # Authoritative FX Cart playback state -- see
                 # _fx_fires_state's own docstring. Drives the dashboard's
