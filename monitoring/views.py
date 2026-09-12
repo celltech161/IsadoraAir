@@ -11,6 +11,7 @@ from django.views.decorators.http import require_http_methods
 from django.utils import timezone as django_tz
 
 from .models import ListenerPeak, MonitorCheck, SystemEvent, emit_event
+from .services import self_health
 from .services.release_status import get_release_status
 from updatecenter.backend_client import BackendError, UpdaterClient
 
@@ -26,14 +27,51 @@ def monitoring_dashboard(request):
 
 @require_http_methods(["GET"])
 def api_monitoring_status(request):
+    # P1 1.11 -- missing/malformed state is pre-existing behavior,
+    # UNCHANGED: still an immediate stale=True with no "checkout" key
+    # at all (see monitoring/tests/test_release_status.py's own
+    # regression guard for this exact early-return shape). The one
+    # addition is routing the (necessarily empty) checks list through
+    # self_health.apply_self_health_override -- heartbeat_age_seconds=
+    # None there means "no usable timestamp exists at all," a DIFFERENT
+    # (and, if anything, more severe) case than "a real but old
+    # timestamp," which apply_self_health_override's own reason=
+    # "no_heartbeat_recorded" vs "heartbeat_stale_process_alive" split
+    # exists to distinguish. This can turn `checks` from `[]` into a
+    # single synthesized Monitoring Service card ONLY if such a check
+    # is actually configured+enabled -- see
+    # self_health._synthesize_from_config's own docstring for why it
+    # never invents an unconfigured card.
     if not STATE_PATH.is_file():
-        return JsonResponse({"checks": [], "timestamp": 0, "stale": True})
+        return JsonResponse({
+            "checks": self_health.apply_self_health_override([], None),
+            "timestamp": 0, "stale": True,
+        })
     try:
         data = json.loads(STATE_PATH.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return JsonResponse({"checks": [], "timestamp": 0, "stale": True})
+        return JsonResponse({
+            "checks": self_health.apply_self_health_override([], None),
+            "timestamp": 0, "stale": True,
+        })
     data.pop("_cooldowns", None)  # internal bookkeeping, not for the browser
-    data["stale"] = (time.time() - data.get("timestamp", 0)) > STATE_STALE_SECONDS
+    timestamp = data.get("timestamp", 0)
+    data["stale"] = (time.time() - timestamp) > STATE_STALE_SECONDS
+
+    # P1 1.11 -- independent Monitoring-service self-health. ONLY
+    # consulted on the (rare) stale path -- see self_health.
+    # apply_self_health_override's own docstring for why the one
+    # systemctl subprocess call this makes must stay off a healthy
+    # station's ordinary 5-second poll. A dead/wedged poller's own
+    # last self-report for ITS OWN card must never be trusted once the
+    # overall state is already known to be stale; every OTHER check's
+    # card is unaffected (their own status/detail still simply reflect
+    # whatever the poller last actually observed, which is exactly
+    # what the pre-existing page-level stale banner already warns
+    # about).
+    if data["stale"]:
+        heartbeat_age = (time.time() - timestamp) if timestamp else None
+        data["checks"] = self_health.apply_self_health_override(data.get("checks", []), heartbeat_age)
 
     # 1.7 release/version-skew visibility. `data` here IS the monitoring
     # poller's own state dict (it already carries its own runtime_commit,

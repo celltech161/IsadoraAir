@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "release_id": "r0066",
+  "previous_release_id": "r0065",
+  "minimum_updater_protocol_version": 5,
+  "summary": "P1 1.11 -- independent Monitoring-service self-health. The Monitoring Service card no longer trusts its own stale self-report (server overrides it from real systemd state + heartbeat age, by unit not name). Adds WatchdogSec=60/NotifyAccess=main so a wedged poller is recovered by systemd, via a small stdlib sd_notify helper; keepalive only follows a successful state write. A /run marker distinguishes clean vs unclean restarts (SystemEvent on the latter), never flagging a reboot.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [
+    "isadoraair-monitoring.service"
+  ],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-monitoring",
+    "isadoraair-gunicorn"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0007"
+}

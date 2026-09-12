@@ -10,6 +10,50 @@ ExecStart=@@ISA_ROOT@@/venv/bin/python @@ISA_ROOT@@/manage.py run_monitoring
 Restart=on-failure
 RestartSec=5
 EnvironmentFile=@@ISA_ROOT@@/.env
+# P1 1.11 -- alive-but-wedged self-supervision. Type= is deliberately
+# left at its default (simple), NOT changed to `notify`: Type=notify
+# only changes what "the service finished starting" means (systemd
+# waits for an explicit READY=1 before considering the unit started;
+# this project's manage.py run_monitoring never sends one and doesn't
+# need to -- there is no dependent unit whose own startup should block
+# on Monitoring's first successful cycle). The watchdog ping mechanism
+# below (WatchdogSec= + $NOTIFY_SOCKET + periodic WATCHDOG=1 datagrams
+# -- see monitoring/services/sd_notify.py) is completely independent
+# of Type= and works identically under Type=simple; systemd sets
+# $NOTIFY_SOCKET for ANY service whose NotifyAccess= is not "none",
+# regardless of Type. (Verified against systemd.exec(5)/sd_notify(3)/
+# systemd.service(5) on this host's systemd 259; the mechanism is
+# unchanged since systemd v183.)
+#
+# NotifyAccess=main is REQUIRED for the watchdog keepalive to have any
+# effect at all -- the systemd default (NotifyAccess=none) silently
+# DISCARDS every notification datagram sent by the unit's own
+# process(es), which would make WatchdogSec= below fire on every
+# single cycle (no keepalive ever reaches systemd) rather than only on
+# a genuine wedge. "main" (not "all") is correct here: this unit has
+# exactly one long-lived main process (ExecStart, no forking, no
+# auxiliary workers) -- there is only one process that could ever
+# legitimately claim "I am healthy."
+NotifyAccess=main
+# WatchdogSec=60 -- 6x the poll loop's own POLL_SECONDS=10 cadence (see
+# monitoring/services/monitor.py) and 2x the existing dashboard
+# staleness threshold (monitoring/views.py's STATE_STALE_SECONDS=30).
+# The two thresholds intentionally answer DIFFERENT questions and must
+# not be made equal: the 30s UI threshold exists to warn a human
+# quickly that data looks old; this 60s watchdog exists to let systemd
+# recover a wedged process WITHOUT needing a human watching a browser
+# tab at all. 60s gives one full extra poll-cycle's worth of margin
+# over a single missed/slow cycle (network hiccup reaching a
+# transmitter, one slow `systemctl show` under load) before concluding
+# the process itself is unresponsive, while still recovering a
+# genuinely wedged poller in roughly the same order of magnitude as the
+# UI would have already flagged it as stale. The keepalive itself is
+# only ever sent AFTER monitoring_state.json's own successful atomic
+# write completes (see monitor.py's _run_cycle) -- a cycle that hangs
+# BEFORE reaching that write (a wedged systemctl/psutil/DB call) simply
+# stops sending keepalives and gets caught by this timeout exactly as
+# intended.
+WatchdogSec=60
 
 [Install]
 WantedBy=multi-user.target

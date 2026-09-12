@@ -24,6 +24,7 @@ from django.utils import timezone as django_tz  # noqa: E402
 
 from encoders.models import Encoder  # noqa: E402
 from monitoring.models import ListenerPeak, MonitorCheck, TransmitterConfig, emit_event  # noqa: E402
+from monitoring.services import sd_notify, supervision  # noqa: E402
 from monitoring.services.notify import maybe_notify  # noqa: E402
 from monitoring.services.probes import PROBE_DISPATCH  # noqa: E402
 from monitoring.services.shoutcast import fetch_shoutcast_stats  # noqa: E402
@@ -66,6 +67,24 @@ class MonitorManager:
         self._load_persisted_cooldowns()
         psutil.cpu_percent(interval=None)  # prime the comparator -- first real call is meaningless otherwise
 
+        # P1 1.11 -- supervision-marker evidence. See
+        # monitoring/services/supervision.py's own docstring for the
+        # full mechanism; None here means either the first invocation
+        # since boot or a missing/malformed marker, neither of which is
+        # ever treated as an incident.
+        prior_invocation = supervision.record_new_invocation(runtime_commit=self._runtime_commit)
+        if supervision.prior_invocation_was_unclean(prior_invocation):
+            emit_event(
+                category="monitor", level="error",
+                title="Monitoring service recovered after an unclean stop",
+                detail={
+                    "prior_pid": prior_invocation.get("pid"),
+                    "prior_started_at": prior_invocation.get("started_at"),
+                    "prior_runtime_commit": prior_invocation.get("runtime_commit"),
+                },
+                dedupe_key="monitor|unclean-restart-recovered",
+            )
+
         signal.signal(signal.SIGTERM, self._handle_signal)
         signal.signal(signal.SIGINT, self._handle_signal)
 
@@ -73,6 +92,12 @@ class MonitorManager:
         while self.running:
             self._run_cycle()
             time.sleep(POLL_SECONDS)
+        # Reached ONLY on a graceful exit (self.running went False AND
+        # the in-flight cycle/sleep already returned normally) -- a
+        # watchdog-triggered SIGABRT, OOM-kill, `kill -9`, or an
+        # uncaught exception escaping the loop above never reaches this
+        # line. See supervision.mark_clean_shutdown's own docstring.
+        supervision.mark_clean_shutdown()
         print("Monitoring stopped.")
 
     def stop(self):
@@ -199,6 +224,37 @@ class MonitorManager:
             tx_client.__exit__(None, None, None)
 
         self._write_state(results)
+
+        # P1 1.11 -- systemd watchdog keepalive. Deliberately placed
+        # HERE: downstream of _write_state's own successful atomic
+        # promotion of monitoring_state.json (the "primary Monitoring
+        # health state" this whole feature is about), and BEFORE the
+        # best-effort listener-poll path below -- a Shoutcast hiccup
+        # must never withhold a keepalive the actual health state has
+        # already earned. If _write_state itself raised, this line
+        # (and the loop that reaches it) is never executed at all, so
+        # no keepalive is ever sent for a cycle that didn't actually
+        # complete -- see MonitorManager.start()'s own bare `while
+        # self.running: self._run_cycle()` (no try/except around the
+        # call), which lets that exception propagate all the way out
+        # and kill the process, exactly the outcome that should follow
+        # a cycle unable to write its own authoritative state.
+        # watchdog_enabled() is a no-op (returns False) whenever this
+        # process is not running under systemd's WatchdogSec=
+        # supervision at all (dev, tests, CI) -- notify() itself is
+        # ALSO a safe no-op with no $NOTIFY_SOCKET, so this check is a
+        # belt-and-braces avoidance of a pointless socket-open attempt,
+        # not a correctness requirement.
+        if sd_notify.watchdog_enabled() and not sd_notify.notify(watchdog=True):
+            # NOTIFY_SOCKET existed (we ARE meant to be watched) but the
+            # datagram could not be delivered -- see sd_notify.notify's
+            # own docstring for why this is deliberately NOT retried or
+            # escalated: systemd's own watchdog timer elapsing and
+            # restarting a poller that can't even signal its own health
+            # is the correct, fail-safe outcome, not a bug to work
+            # around here.
+            print("  [watchdog] WATCHDOG=1 notification could not be delivered")
+
         # Separate from the check-status write above -- listener poll is
         # independent state (dashboard widget vs. monitoring cards) and
         # a Shoutcast unreachable shouldn't take down the check-status

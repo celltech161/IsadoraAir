@@ -567,17 +567,37 @@ function barRow(label, value, status) {
   `;
 }
 
+// P1 1.11 -- when the Monitoring Service's own card has been
+// overridden server-side (monitoring/services/self_health.py, only
+// ever when the overall page state is already stale), detail.reason
+// distinguishes WHY it's unhealthy beyond the generic "Stopped" this
+// function already showed for any non-ok/unknown systemd check. Every
+// OTHER systemd card (never carries a "reason") renders exactly as
+// before -- this is purely additive.
+const SELF_HEALTH_CAPTIONS = {
+  service_inactive: "Stopped",
+  heartbeat_stale_process_alive: "Unresponsive",
+  heartbeat_stale_systemd_unavailable: "Heartbeat stale",
+  no_heartbeat_recorded: "No heartbeat",
+};
+
 function renderSystemdBody(check) {
   const uptimeSeconds = check.detail && check.detail.uptime_seconds;
   const uptimeHours = uptimeSeconds != null ? (uptimeSeconds / 3600).toFixed(2) : null;
+  const reason = check.detail && check.detail.reason;
   const caption = check.status === "ok" ? "Running"
     : check.status === "unknown" ? "Unknown"
-    : "Stopped";
+    : (reason && SELF_HEALTH_CAPTIONS[reason]) || "Stopped";
+  const heartbeatAge = check.detail && check.detail.heartbeat_age_seconds;
+  const heartbeatLine = (reason && heartbeatAge != null)
+    ? `<div class="mon-card-detail">Last heartbeat ${Math.round(heartbeatAge)}s ago</div>`
+    : "";
   return `
     <div class="mon-led-row">
       <span class="mon-led ${check.status}"></span>
       <span class="mon-led-caption">${caption}</span>
     </div>
+    ${heartbeatLine}
     <div class="mon-uptime-row">
       <span class="mon-uptime">${uptimeHours != null ? `Up ${uptimeHours} hrs` : ""}</span>
       <button class="mon-restart-btn" data-check-id="${check.id}" data-check-name="${escapeHtmlAttr(check.name)}" onclick="restartService(this)">Restart</button>
