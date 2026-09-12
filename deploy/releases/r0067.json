@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "release_id": "r0067",
+  "previous_release_id": "r0066",
+  "minimum_updater_protocol_version": 5,
+  "summary": "Safety follow-up to r0066 Monitoring self-health: supervision-marker persistence is now strictly best-effort (can't crash-loop the poller; armed-state gating stops repeated false unclean-restart events if persistence stays broken), and a failed/malformed systemd self-health probe is classified as systemd-unavailable rather than misreported as confirmed-inactive. Also a product-focused README.md rewrite -- no runtime behavior change from the doc edit.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-monitoring",
+    "isadoraair-gunicorn"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0007"
+}
