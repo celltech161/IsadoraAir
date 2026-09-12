@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "release_id": "r0072",
+  "previous_release_id": "r0071",
+  "minimum_updater_protocol_version": 5,
+  "summary": "P1 1.5 Pass B1.1 -- adds a generation-safe inbound Remote Mic media-liveness fallback for the production path where GStreamer/libnice remains nominally connected after media stops. Established decoded media now arms a 2-second monotonic watchdog; expiry immediately mutes Remote Mic and reuses the existing configurable Reconnecting grace, while confirmed same-session media resumption recovers without treating a silent microphone as failed.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-engine"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0007"
+}
