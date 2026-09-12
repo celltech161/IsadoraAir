@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "release_id": "r0074",
+  "previous_release_id": "r0073",
+  "minimum_updater_protocol_version": 5,
+  "summary": "P1 1.5 Remote DJ dashboard follow-up -- remove the standalone Remote Link badge and place action plus overall link state in the existing fixed-size, two-line Connect/Disconnect button. The presentation covers Offline, Negotiating, Initializing, Good, Fair, Poor, and B1/B1.1-authoritative Reconnecting without shifting adjacent controls. Direction-specific B2 telemetry and all classifier, recovery, gate/PTT, signaling, and audio behavior remain unchanged.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-gunicorn"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0007"
+}
