@@ -152,7 +152,7 @@ as the requested track's own fulfillment. Do not conflate them:
 |---|---|---|
 | `intro_track` | A generated spoken artifact exists and is associated with this request. | That the intro was ever queued or aired. |
 | `intro_log_item` | The generated intro was actually spliced into a specific playlist occurrence ahead of `log_item`. Pairing/restart-recovery evidence. | That the intro was audibly played. |
-| `intro_log_item.played_at` | The existing engine occurrence evidence that the dedication intro's LogItem actually began playback, under the same engine clock used for every other LogItem. This is the strongest currently-existing evidence the dedication aired. | "First audible PCM" or any other more specific claim -- it is exactly the same LogItem playback-start write every other LogItem gets, no more and no less. Roadmap item 1.6 will eventually decide what the station-wide authoritative air-timestamp definition should be; this document does not pre-empt that. |
+| `intro_log_item.played_at` | Authoritative evidence that the dedication intro crossed the engine's first-buffer streaming boundary, under the same engine clock used for every other LogItem. This is the strongest evidence the dedication aired. | Deck construction, metadata publication, pipeline creation, a playback claim, or a guarantee that downstream hardware rendered the samples. |
 | `log_item` | The specific requested-song occurrence this request was assigned to. | That the song has aired yet -- see `fulfilled_at`. |
 | `fulfilled_at` | The requested song actually began playing -- set only after the requested song's own `LogItem.played_at` write succeeds (`webrequests.services.mark_song_requests_aired`). | The moment the dedication intro aired. A song can be fulfilled with no intro ever having aired, or existing at all; a dedication can occur without its song showing fulfilled yet in a narrow timing window. |
 
@@ -165,8 +165,11 @@ four as computed, read-only fields (`intro_artifact_status`,
 operator can tell them apart at a glance -- these are derived purely from the
 fields above and are never themselves persisted.
 
-No additional evidence timestamp or model exists or is needed for this: every
-fact above is already fully represented by an existing field.
+`LogItem.playback_claimed_at` is separate engine-ownership evidence. It blocks
+late scheduling or dedication mutation once the engine commits the occurrence,
+but it is deliberately not an "aired" milestone and does not fulfill a request.
+The four listener-facing milestones above remain represented by their existing
+fields.
 
 ### Station-editable dedication/request templates
 

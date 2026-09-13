@@ -293,10 +293,10 @@ def classify_log_item(log_item, state):
 
 def mark_song_requests_aired(log_item, aired_at):
     """Promotes every SongRequest scheduled into log_item to fulfilled,
-    the instant it actually starts playing -- called from engine.py's
-    _create_deck right after LogItem.played_at itself is successfully
-    written (and only then; see _create_deck's played_at_written guard
-    -- this must not fire off a failed or skipped played_at write).
+    at its authoritative first-real-buffer air start. The engine calls this
+    inside the same transaction that writes LogItem.played_at, Track
+    accounting, and the occurrence's PlayEvent; it must never run at claim or
+    deck-construction time.
 
     Filtered on BOTH log_item_id and track_id: if the LogItem's track
     changed again after this request was scheduled into it (a
@@ -318,8 +318,9 @@ def maybe_schedule_song_request(log_item):
     an open request hour and there's an eligible waiting request, swaps
     the track in-place (mutating track / track_title / track_artist)
     and marks that request `scheduled` -- NOT `fulfilled`: fulfillment
-    now only happens once the track actually starts airing (see
-    mark_song_requests_aired, called from engine.py's _create_deck).
+    now only happens once the track reaches the authoritative real-output
+    boundary (see mark_song_requests_aired, called from engine.py's
+    _record_occurrence_air_start transaction).
 
     Called from two places:
       1. refresh_song_request_statuses (every ~20s, on every upcoming
@@ -435,6 +436,7 @@ def maybe_schedule_song_request(log_item):
                 # time the lock is actually acquired.
                 if (
                     locked_item.played_at is not None
+                    or locked_item.playback_claimed_at is not None
                     or locked_item.track_id is None
                     or locked_item.category_id is None
                     or locked_item.category.kind.code != "music"
@@ -628,12 +630,32 @@ def synthesize_dedication_intro(req):
             raise RuntimeError("Speech Splice renderer returned no Track")
 
         with transaction.atomic():
-            updated = SongRequest.objects.filter(
-                id=req.id,
-                status="scheduled",
-                track_id=req.track_id,
-                intro_track__isnull=True,
-            ).update(intro_track=intro_track)
+            # Serialize the final attachment against the engine's playback
+            # claim. A related-field predicate alone is only an MVCC snapshot
+            # and could still see NULL while an uncommitted claim owns the
+            # LogItem row.
+            locked_item = None
+            if req.log_item_id is not None:
+                locked_item = (
+                    LogItem.objects.select_for_update(of=("self",))
+                    .only("id", "playback_claimed_at", "played_at")
+                    .filter(id=req.log_item_id)
+                    .first()
+                )
+            if (
+                locked_item is None
+                or locked_item.playback_claimed_at is not None
+                or locked_item.played_at is not None
+            ):
+                updated = 0
+            else:
+                updated = SongRequest.objects.filter(
+                    id=req.id,
+                    status="scheduled",
+                    track_id=req.track_id,
+                    log_item_id=locked_item.id,
+                    intro_track__isnull=True,
+                ).update(intro_track=intro_track)
 
         if not updated:
             # Request state changed during rendering or another caller already

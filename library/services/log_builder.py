@@ -272,14 +272,14 @@ def get_recent_exclusions(target_datetime, artist_sep_hours, title_sep_hours,
 
     # played_at__isnull=False: only items that actually aired count as
     # "played" for recency-window purposes. LogItems that were picked
-    # into an hour's log but never reached _create_deck (e.g. the hour
+    # into an hour's log but never reached authoritative real output
+    # (e.g. the hour
     # rolled over first) DON'T contribute to the exclusion set --
     # otherwise a track we NEVER PLAYED would still block itself from
     # being re-picked in the next hour or two, which is exactly the
     # opposite of what recency separation is supposed to do.
-    # _create_deck writes played_at when it commits a track to a deck,
-    # BEFORE the audio actually starts, so an in-preroll pick counts
-    # normally.
+    # playback_claimed_at deliberately does not participate: a claimed
+    # in-preroll/failed deck has not aired and must not count for recency.
     recent_items = (
         LogItem.objects
         .filter(

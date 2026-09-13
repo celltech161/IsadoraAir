@@ -178,6 +178,37 @@ class RecentHistoryExclusionTests(TestCase):
         )
         self.assertIn(played_track.id, exclude_tracks)
 
+    def test_claimed_but_never_played_occurrence_does_not_enter_recency(self):
+        claimed_track = make_track(
+            "Claimed Only", "Claimed Artist", related_artists="Claimed Related",
+            category=self.category,
+        )
+        log = PlaylistLog.objects.create(
+            date=self.now.date(), hour=(self.now.hour + 1) % 24, status="approved"
+        )
+        LogItem.objects.create(
+            playlist_log=log,
+            position=0,
+            scheduled_time=self.now - timedelta(minutes=30),
+            track=claimed_track,
+            track_title=claimed_track.title,
+            track_artist=claimed_track.artist.name,
+            category=self.category,
+            playback_claimed_at=self.now - timedelta(minutes=31),
+            played_at=None,
+        )
+
+        excluded_tracks, excluded_identities = get_recent_exclusions(
+            self.now,
+            artist_sep_hours=2.5,
+            title_sep_hours=8.0,
+            already_picked_tracks=[],
+            already_picked_identity_keys=set(),
+        )
+        self.assertNotIn(claimed_track.id, excluded_tracks)
+        self.assertNotIn("claimed artist", excluded_identities)
+        self.assertNotIn("claimed related", excluded_identities)
+
 
 class SeparationLooseningTests(TestCase):
     """Related-artist exclusion must loosen at the same point and by

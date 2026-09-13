@@ -22,13 +22,13 @@ class Command(BaseCommand):
     """Re-evaluates every SongRequest on a timer (systemd), independent
     of the public-site transport. Lifecycle: pending/no_slot_soon (waiting)
     -> scheduled (assigned to a specific LogItem) -> fulfilled (that
-    LogItem actually aired -- set by the engine's _create_deck, not by
-    this command). unavailable/expired are terminal failures.
+    LogItem actually aired -- set by the engine's authoritative
+    first-real-buffer transaction, not by this command).
+    unavailable/expired are terminal failures.
 
-      1. Self-heals scheduled requests the engine already played but
-         may not have promoted to fulfilled (a DB-write race between
-         LogItem.played_at succeeding and the engine's
-         mark_song_requests_aired call failing/not running).
+      1. Self-heals legacy/inconsistent scheduled requests whose LogItem
+         already has authoritative played_at evidence. Phase B normally
+         writes played_at and fulfillment atomically.
       2. Reconciles every other still-scheduled-but-unaired request
          against the running engine's live state
          (webrequests.services.classify_log_item): a request whose
@@ -253,6 +253,7 @@ class Command(BaseCommand):
             item for item in (
                 LogItem.objects.filter(
                     scheduled_time__gte=current_hour_start, scheduled_time__lt=lookahead_cutoff,
+                    playback_claimed_at__isnull=True,
                     played_at__isnull=True, category__kind__code="music",
                     playlist_log__status="approved",
                 )
@@ -284,6 +285,7 @@ class Command(BaseCommand):
             item for item in (
                 LogItem.objects.filter(
                     scheduled_time__gte=current_hour_start, scheduled_time__lt=lookahead_cutoff,
+                    playback_claimed_at__isnull=True,
                     played_at__isnull=True, category__kind__code="music",
                     playlist_log__status="approved",
                 )

@@ -797,6 +797,9 @@ class LogItem(models.Model):
     track_title = models.CharField(max_length=255, blank=True, default="")
     track_artist = models.CharField(max_length=255, blank=True, default="")
     category = models.ForeignKey(Category, on_delete=models.SET_NULL, null=True, blank=True)
+    # One-way engine commitment for this concrete occurrence. This closes the
+    # row to late scheduling/dedication mutation; it is not evidence of air.
+    playback_claimed_at = models.DateTimeField(null=True, blank=True, db_index=True)
     played_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
@@ -1521,8 +1524,9 @@ class CDRipConfig(models.Model):
 
 class PlayEvent(models.Model):
     """Append-only ledger of every track that actually hit the mixer.
-    Written by the playback engine at _create_deck (started_at + all
-    snapshot fields set) and updated at _remove_deck (ended_at +
+    Written by the playback engine when a fresh LogItem's first real
+    post-primer buffer crosses the deck output boundary (started_at +
+    all snapshot fields set) and updated at _remove_deck (ended_at +
     duration_played_seconds set). Distinct from LogItem.played_at
     because retention differs -- programming logs (PlaylistLog /
     LogItem) may be pruned to save space, but play evidence must be
@@ -1555,6 +1559,13 @@ class PlayEvent(models.Model):
     track = models.ForeignKey(
         Track, on_delete=models.SET_NULL, null=True, blank=True,
         related_name="play_events",
+    )
+    # Immutable occurrence identity. Nullable so historical events remain
+    # explicitly uncorrelated; unique so one logical LogItem can create at
+    # most one royalty event even when callbacks race or repeat. This scalar
+    # intentionally survives deletion of the source LogItem.
+    log_item_id_snapshot = models.BigIntegerField(
+        null=True, blank=True, unique=True,
     )
 
     # Snapshot fields -- immutable once written. Kept independent of

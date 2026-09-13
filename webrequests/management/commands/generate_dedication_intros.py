@@ -61,13 +61,10 @@ class Command(BaseCommand):
         scheduled = (
             SongRequest.objects.filter(
                 status="scheduled", log_item__isnull=False,
-                # Don't synthesize for a song that's already airing/aired --
-                # a real, if brief, window exists where played_at is set but
-                # status hasn't been promoted to fulfilled yet (self-heal
-                # hasn't run, or mark_song_requests_aired itself hasn't
-                # completed). Any intro built in that window can never be
-                # spliced (the LogItem is already past _next_queue_item) --
-                # pure wasted synthesis.
+                # Don't synthesize after the engine has committed this
+                # occurrence, even if no real buffer has aired yet. Any intro
+                # built after claim can no longer be safely spliced.
+                log_item__playback_claimed_at__isnull=True,
                 log_item__played_at__isnull=True,
             )
             .select_related("log_item", "track", "track__artist")

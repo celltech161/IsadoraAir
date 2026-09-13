@@ -391,6 +391,28 @@ class SchedulerBugRegressionTests(WebRequestFixtureMixin, TransactionTestCase):
         self.assertIsNotNone(result.played_at)
         self.assertEqual(SongRequest.objects.filter(status="scheduled").count(), 0)
 
+    def test_playback_claim_blocks_late_slot_mutation_before_played_at(self):
+        log = self.make_log(date(2027, 4, 3), 14)
+        original_track = self.make_track(title="Claimed Rotation Pick")
+        item = self.make_item(log, 0, scheduled_time=timezone.now(), track=original_track)
+        item.playback_claimed_at = timezone.now()
+        item.save(update_fields=["playback_claimed_at"])
+        requested_track = self.make_track(title="Too Late Request")
+        req = self.make_request(
+            requested_track,
+            status="pending",
+            submitted_at=timezone.now() - timedelta(hours=1),
+        )
+
+        result = maybe_schedule_song_request(item)
+
+        result.refresh_from_db()
+        req.refresh_from_db()
+        self.assertEqual(result.track_id, original_track.id)
+        self.assertIsNone(result.played_at)
+        self.assertEqual(req.status, "pending")
+        self.assertIsNone(req.log_item_id)
+
 
 class DriftedScheduledTimeCandidateTests(WebRequestFixtureMixin, TransactionTestCase):
     """2026-08-20 fix: refresh_song_request_statuses' candidate queries
@@ -736,19 +758,23 @@ class EngineCallSiteTests(TransactionTestCase):
         stand_in._on_log_exhausted.assert_called_once_with("A")
         self.assertEqual(stand_in._next_queue_item.call_count, 2)
 
-    def test_mark_song_requests_aired_gated_on_played_at_write_succeeding(self):
-        """Static confirmation that _create_deck only calls
-        mark_song_requests_aired after played_at itself was
-        successfully written -- not merely attempted, and not blocked
-        by an unrelated Track counter-update failure. Full GStreamer
-        simulation isn't practical here; this mirrors the established
-        static-source-check pattern used elsewhere in this project's
-        engine tests for the same kind of guard-structure proof."""
-        src = inspect.getsource(eng_module.PlaybackEngine._create_deck)
-        self.assertIn("played_at_written = False", src)
-        self.assertIn("played_at_written = True", src)
-        self.assertIn("if played_at_written:", src)
-        self.assertIn("mark_song_requests_aired(", src)
+    def test_mark_song_requests_aired_is_inside_authoritative_transaction(self):
+        """The request transition shares the played_at/count/event unit.
+
+        Dynamic rollback and duplicate-callback coverage lives in the Phase B
+        accounting tests; this source check protects the call-site boundary.
+        """
+        src = inspect.getsource(
+            eng_module.PlaybackEngine._record_occurrence_air_start
+        )
+        self.assertIn("with transaction.atomic():", src)
+        self.assertIn('locked_item.save(update_fields=["played_at"])', src)
+        self.assertIn("mark_song_requests_aired(locked_item, air_started_at)", src)
+        self.assertIn("PlayEvent.objects.create(", src)
+        self.assertLess(
+            src.index('locked_item.save(update_fields=["played_at"])'),
+            src.index("mark_song_requests_aired(locked_item, air_started_at)"),
+        )
 
 
 class ReconciliationPassTests(WebRequestFixtureMixin, TransactionTestCase):

@@ -367,6 +367,38 @@ class DedicationSynthesisTests(DedicationFixtureMixin, TransactionTestCase):
         req.refresh_from_db()
         self.assertIsNone(req.intro_track_id)
 
+    def test_claimed_not_yet_played_log_item_excluded_from_synthesis(self):
+        track = self.make_track()
+        log = self.make_log(date(2027, 5, 1), 14)
+        item = self.make_item(log, 0, track=track)
+        item.playback_claimed_at = timezone.now()
+        item.save(update_fields=["playback_claimed_at"])
+        req = self.make_request(track, status="scheduled", log_item=item)
+
+        call_command("generate_dedication_intros", stdout=StringIO())
+
+        req.refresh_from_db()
+        self.assertIsNone(req.intro_track_id)
+
+    def test_claim_winning_during_render_blocks_final_attachment_cas(self):
+        track = self.make_track()
+        log = self.make_log(date(2027, 5, 1), 15)
+        item = self.make_item(log, 0, track=track)
+        req = self.make_request(track, status="scheduled", log_item=item)
+        real_render = services_module.render_announcement
+
+        def render_then_claim(*args, **kwargs):
+            rendered = real_render(*args, **kwargs)
+            LogItem.objects.filter(id=item.id).update(playback_claimed_at=timezone.now())
+            return rendered
+
+        with patch.object(services_module, "render_announcement", side_effect=render_then_claim):
+            result = synthesize_dedication_intro(req)
+
+        req.refresh_from_db()
+        self.assertEqual(result, DedicationSynthesisOutcome.FAILED)
+        self.assertIsNone(req.intro_track_id)
+
     def test_advisory_lock_blocks_overlapping_invocation(self):
         track = self.make_track()
         log = self.make_log(date(2027, 5, 1), 8)
@@ -993,6 +1025,26 @@ class DedicationSpliceTests(DedicationFixtureMixin, TransactionTestCase):
         self.assertEqual(stand_in._queue_cursor, 1)
         self.assertEqual([i.id for i in stand_in.log_items], [result.id, song_item.id])
 
+    def test_claimed_song_cannot_receive_a_late_intro_splice(self):
+        track = self.make_track()
+        log = self.make_log(date(2027, 5, 2), 15)
+        song_item = self.make_item(log, 0, track=track)
+        song_item.playback_claimed_at = timezone.now()
+        song_item.save(update_fields=["playback_claimed_at"])
+        intro_track = self.make_dedication_track()
+        req = self.make_request(track, status="scheduled", log_item=song_item)
+        req.intro_track = intro_track
+        req.save(update_fields=["intro_track"])
+        stand_in = self.make_engine_stand_in(current_log=log, log_items=[song_item])
+        stand_in._queue_cursor = 1
+
+        result = stand_in._maybe_insert_dedication_intro(song_item)
+
+        self.assertEqual(result.id, song_item.id)
+        self.assertEqual(LogItem.objects.filter(playlist_log=log).count(), 1)
+        req.refresh_from_db()
+        self.assertIsNone(req.intro_log_item_id)
+
     def test_slot_wide_marker_covers_all_collapsed_requests(self):
         track = self.make_track()
         log = self.make_log(date(2027, 5, 2), 6)
@@ -1064,7 +1116,10 @@ class DedicationTransactionalityTests(DedicationFixtureMixin, TransactionTestCas
             # select_for_update() lookup chains .filter() off the
             # QuerySet select_for_update() returns, a different call
             # site entirely, left untouched.
-            if set(kwargs) == {"status", "log_item_id", "track_id"}:
+            if set(kwargs) == {
+                "status", "log_item_id",
+                "log_item__playback_claimed_at__isnull", "track_id",
+            }:
                 return _ZeroUpdateQuerySet()
             return real_manager_filter(*args, **kwargs)
 
@@ -1214,14 +1269,14 @@ class DedicationStartNextTrackTests(DedicationFixtureMixin, TransactionTestCase)
 
 
 # ---------------------------------------------------------------------
-# 11. PlayEvent exclusion for Dedications plays (static-source check --
-# _create_deck needs a real GStreamer pipeline to exercise live, same
-# reasoning as the scheduling suite's played_at_written check)
+# 11. PlayEvent exclusion for Dedications plays. The Phase B engine module
+# also has a real-DB behavioral test; this keeps the local source contract
+# explicit beside the rest of the dedication suite.
 # ---------------------------------------------------------------------
 class DedicationPlayEventTests(TransactionTestCase):
     def test_create_deck_excludes_playevent_for_dedications_category(self):
-        src = inspect.getsource(eng_module.PlaybackEngine._create_deck)
-        self.assertIn('log_item.category.code == "Dedications"', src)
+        src = inspect.getsource(eng_module.PlaybackEngine._record_occurrence_air_start)
+        self.assertIn('locked_item.category.code == "Dedications"', src)
         self.assertIn("is_dedication_play", src)
         self.assertIn("if not is_dedication_play:", src)
         self.assertIn("PlayEvent.objects.create(", src)

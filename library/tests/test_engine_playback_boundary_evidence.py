@@ -370,7 +370,11 @@ class AutoResumeObservationTests(_BoundaryTestBase):
         wav_path = self._wav("auto-resume.wav", frames=4 * 44100, silent=False)
         track = _make_track(wav_path, 20, duration=4.0, title="Auto Resume Track")
         item = _make_log_item(track, 20)
-        self.engine._resume_hint = {"track_id": track.id, "position": 1.5}
+        self.engine._resume_hint = {
+            "track_id": track.id,
+            "position": 1.5,
+            "log_item_id": item.id,
+        }
         with patch("builtins.print"):
             deck = self.engine._create_deck("A", item)
         self.assertIsNotNone(deck)

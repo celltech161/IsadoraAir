@@ -215,7 +215,7 @@ class SongRequest(models.Model):
                       pending/no_slot_soon rather than leaving it stuck.
       fulfilled    -- the track has ACTUALLY started playing (set from
                       the engine's real air-start event, LogItem.played_at
-                      -- see library.services.engine._create_deck /
+                      -- see library.services.engine._record_occurrence_air_start /
                       webrequests.services.mark_song_requests_aired).
                       log_item is (usually still) set. This is
                       deliberately NOT the same moment as scheduling --

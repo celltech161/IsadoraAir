@@ -163,6 +163,16 @@ def _make_real_engine():
     engine._next_triggered = False
     engine._write_now_playing = lambda _track: None
     engine._write_rbds_category_state = lambda _track: None
+    # Real-topology fixtures use MagicMock LogItems rather than persisted
+    # occurrences. Keep their focus on GStreamer lifecycle; Phase B's claim
+    # and transactional accounting have dedicated real-DB tests.
+    def claim_fixture_occurrence(item):
+        item.playback_claimed_at = eng_module.timezone.now()
+        item.played_at = None
+        return True
+
+    engine._claim_playback_occurrence = claim_fixture_occurrence
+    engine._schedule_occurrence_air_start_from_probe = lambda _deck: None
     engine._start_next_track = lambda **_kwargs: None
     # r0063 -- lets a test call the real engine.stop() directly (e.g. for
     # shutdown-vs-in-flight-seek collision tests) without needing to set

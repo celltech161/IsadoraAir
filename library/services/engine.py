@@ -243,10 +243,8 @@ SILENCE_PRIME_SECONDS = 0.3
 # docs/PLAYBACK_EVIDENCE_BOUNDARY_PHASE_A.md for the supporting
 # evidence and the isolated harness that established it.
 #
-# Phase A is observational only: nothing reads this milestone to drive
-# LogItem.played_at, Track.last_played_at, Track.play_count,
-# mark_song_requests_aired, or PlayEvent yet -- those still all commit
-# earlier, synchronously inside _create_deck, exactly as before.
+# Phase B consumes this same evidence only for fresh logical occurrences,
+# handing it to the GLib thread before any ORM/accounting work occurs.
 FIRST_REAL_POST_PRIMER_MILESTONE = "REAL_CONTENT_CROSSED_POST_PRIMER_BOUNDARY"
 DECK_STUCK_TIMEOUT_SECONDS = 30  # generous margin past a track's own duration before assuming its EOS was missed
 DECK_TEARDOWN_TIMEOUT_SECONDS = 10.0
@@ -712,6 +710,8 @@ class Deck:
         mixer_pad,
         silence_primed=False,
         generation=0,
+        air_start_eligible=False,
+        continuation_reason=None,
     ):
         self.slot = slot
         self.track = track
@@ -719,6 +719,19 @@ class Deck:
         self.pipeline = pipeline
         self.mixer_pad = mixer_pad
         self.generation = generation
+        # [P2] 1.6 Phase B -- logical-occurrence semantics are distinct
+        # from GStreamer generations. Only a genuinely fresh occurrence may
+        # turn first-real-buffer evidence into persistent accounting. Seek,
+        # pause/resume, and restart auto-resume generations remain observable
+        # but are never eligible to create a second logical play.
+        self.air_start_eligible = air_start_eligible
+        self.continuation_reason = continuation_reason
+        self.air_start_dispatched = False
+        self.air_start_dispatch_source_id = 0
+        self.air_start_attempts = 0
+        self.air_start_recorded = False
+        self.air_start_last_error = None
+        self._air_start_lock = threading.Lock()
         self.started_at = None
         self.finished = False
         self.retirement_started = False
@@ -738,11 +751,10 @@ class Deck:
         # window right after an actual seek, rather than distrusting
         # EOS for the deck's whole lifetime.
         self.seeked_at = None
-        # PlayEvent row id written at _create_deck; closed out (ended_at
-        # + duration_played_seconds) at _remove_deck. None if the write
-        # failed at deck creation -- in which case no close-out attempt
-        # is made either, avoiding a spurious update against a row that
-        # doesn't exist.
+        # PlayEvent row id written by the authoritative air-start callback;
+        # closed out (ended_at + duration_played_seconds) at _remove_deck.
+        # Continuation generations deliberately keep this None in Phase B;
+        # durable cross-generation duration belongs to Phase C.
         self.play_event_id = None
         # Per-generation, bounded EOS/resource diagnostics. Streaming threads
         # only update counters/timestamps; no buffer or event is logged here.
@@ -3622,7 +3634,7 @@ class PlaybackEngine:
         # positioned in the DB where the queue cursor was at insertion
         # time; every restart would then replay yesterday's severe
         # thunderstorm alert until the hour rolls over. `played_at` is
-        # set at the moment a track's deck starts (_create_deck), so
+        # set at the first confirmed real post-primer output buffer, so
         # "played_at set" = "started airing", which is the right
         # granularity for skip-on-restart (a track that started but was
         # interrupted mid-play is still skipped rather than resumed,
@@ -4783,6 +4795,235 @@ class PlaybackEngine:
         running_time = clock.get_time() - self.main_pipeline.get_base_time()
         deck_bin.get_static_pad("src").set_offset(running_time - internal_position_ns)
 
+    def _claim_playback_occurrence(self, log_item):
+        """Persist the one-way engine commitment for one concrete LogItem.
+
+        A claim is not evidence that media aired. It only closes the row to
+        scheduling/dedication mutation before a live deck can expose it. The
+        original timestamp survives every recreation of the same occurrence.
+        """
+        try:
+            close_old_connections()
+            with transaction.atomic():
+                # Keep the engine's single GLib thread bounded if a Web
+                # Request transaction currently owns this row.
+                with connection.cursor() as cur:
+                    cur.execute("SET LOCAL lock_timeout = '250ms'")
+                locked = (
+                    LogItem.objects.select_for_update(of=("self",))
+                    .only("id", "playback_claimed_at", "played_at")
+                    .get(pk=log_item.id)
+                )
+                if locked.playback_claimed_at is None:
+                    locked.playback_claimed_at = timezone.now()
+                    locked.save(update_fields=["playback_claimed_at"])
+                log_item.playback_claimed_at = locked.playback_claimed_at
+                log_item.played_at = locked.played_at
+            return True
+        except Exception as exc:
+            print(
+                f"  Playback claim failed for log_item={getattr(log_item, 'id', None)}; "
+                f"deck not created: {exc}"
+            )
+            try:
+                emit_event(
+                    category="engine",
+                    level="error",
+                    title="Playback occurrence claim failed",
+                    detail={"log_item_id": getattr(log_item, "id", None), "error": str(exc)},
+                    dedupe_key=f"engine|playback-claim-failed|{getattr(log_item, 'id', None)}",
+                )
+            except Exception:
+                pass
+            return False
+
+    def _schedule_occurrence_air_start_from_probe(self, deck):
+        """Streaming-thread-safe one-shot handoff of first-real evidence.
+
+        This method performs only bounded in-memory work, captures the wall
+        clock at the observed buffer, and schedules one GLib callback. It must
+        never perform ORM, filesystem, network, or event-ledger I/O.
+        """
+        if not deck.air_start_eligible:
+            return
+        with deck._air_start_lock:
+            if deck.air_start_dispatched:
+                return
+            deck.air_start_dispatched = True
+            air_started_at = timezone.now()
+            source_id = GLib.idle_add(
+                self._record_occurrence_air_start,
+                deck.slot,
+                deck.generation,
+                deck.log_item.id,
+                air_started_at,
+            )
+            deck.air_start_dispatch_source_id = source_id or 0
+            if not source_id:
+                deck.air_start_last_error = "GLib.idle_add returned no source id"
+
+    def _record_occurrence_air_start(
+        self, slot, generation, log_item_id, air_started_at
+    ):
+        """Commit one authoritative actual-start transition on GLib's thread.
+
+        The LogItem row lock serializes duplicate/racing callbacks. played_at
+        is the idempotency gate, while PlayEvent's unique occurrence snapshot
+        is a database-level backstop. All station accounting writes share this
+        transaction and the exact timestamp captured by the boundary probe.
+        """
+        with self._lock:
+            deck = self.decks.get(slot)
+            if (
+                deck is None
+                or deck.generation != generation
+                or deck.log_item.id != log_item_id
+                or not deck.air_start_eligible
+            ):
+                return False
+
+        with deck._air_start_lock:
+            deck.air_start_attempts += 1
+
+        play_event_id = None
+        transition_recorded = False
+        persisted_played_at = None
+        try:
+            close_old_connections()
+            with transaction.atomic():
+                locked_item = (
+                    LogItem.objects.select_for_update(of=("self",))
+                    .select_related(
+                        "track", "track__artist", "track__album",
+                        "category", "category__kind",
+                    )
+                    .get(pk=log_item_id)
+                )
+                if locked_item.playback_claimed_at is None:
+                    raise RuntimeError("air-start evidence arrived for an unclaimed occurrence")
+                if locked_item.track_id != deck.track.id:
+                    raise RuntimeError(
+                        "claimed occurrence track changed before air start "
+                        f"(expected={deck.track.id}, actual={locked_item.track_id})"
+                    )
+
+                if locked_item.played_at is None:
+                    locked_item.played_at = air_started_at
+                    locked_item.save(update_fields=["played_at"])
+
+                    # F() makes the increment atomic even if another process
+                    # updates unrelated Track state concurrently.
+                    Track.objects.filter(id=locked_item.track_id).update(
+                        last_played_at=air_started_at,
+                        play_count=F("play_count") + 1,
+                    )
+                    mark_song_requests_aired(locked_item, air_started_at)
+
+                    is_dedication_play = bool(
+                        locked_item.category_id
+                        and locked_item.category
+                        and locked_item.category.code == "Dedications"
+                    )
+                    if not is_dedication_play:
+                        track = locked_item.track
+                        pe_source = (
+                            "insert" if getattr(locked_item, "position", 0) >= 9999
+                            else "scheduled"
+                        )
+                        pe_category_kind = ""
+                        if (
+                            locked_item.category_id
+                            and locked_item.category
+                            and locked_item.category.kind_id
+                        ):
+                            pe_category_kind = locked_item.category.kind.name
+                        play_event = PlayEvent.objects.create(
+                            log_item_id_snapshot=locked_item.id,
+                            track=track,
+                            track_title=track.title or "",
+                            track_artist=track.artist.name if track.artist else "",
+                            album_title=track.album.title if track.album else "",
+                            record_label=track.record_label or "",
+                            isrc=getattr(track, "isrc", "") or "",
+                            category_kind=pe_category_kind,
+                            source=pe_source,
+                            started_at=air_started_at,
+                        )
+                        play_event_id = play_event.id
+                    transition_recorded = True
+                else:
+                    # Duplicate callback after a committed transition. Never
+                    # manufacture missing historical correlation here.
+                    play_event_id = (
+                        PlayEvent.objects.filter(log_item_id_snapshot=log_item_id)
+                        .values_list("id", flat=True)
+                        .first()
+                    )
+                persisted_played_at = locked_item.played_at
+
+            # Only publish in-memory state after the whole DB transaction
+            # commits. A rollback therefore cannot make the live deck claim a
+            # PlayEvent or played_at value that persistence does not contain.
+            with self._lock:
+                current = self.decks.get(slot)
+                if (
+                    current is deck
+                    and current.generation == generation
+                    and current.log_item.id == log_item_id
+                ):
+                    current.play_event_id = play_event_id
+                    current.air_start_recorded = True
+                    current.air_start_last_error = None
+                    current.log_item.played_at = persisted_played_at
+                    if transition_recorded:
+                        current.track.last_played_at = air_started_at
+                        if isinstance(current.track.play_count, int):
+                            current.track.play_count += 1
+            if transition_recorded:
+                print(
+                    f"  [{slot}] Playing: "
+                    f"{deck.track.artist.name if deck.track.artist else '?'} - {deck.track.title}"
+                )
+            return False
+        except Exception as exc:
+            with deck._air_start_lock:
+                deck.air_start_last_error = str(exc)
+                attempts = deck.air_start_attempts
+            print(
+                f"  Authoritative air-start transaction failed for "
+                f"log_item={log_item_id} generation={generation}: {exc}"
+            )
+            try:
+                emit_event(
+                    category="engine",
+                    level="error",
+                    title="Playback air-start accounting failed",
+                    detail={
+                        "slot": slot,
+                        "generation": generation,
+                        "log_item_id": log_item_id,
+                        "attempt": attempts,
+                        "error": str(exc),
+                    },
+                    dedupe_key=f"engine|air-start-accounting|{log_item_id}",
+                )
+            except Exception:
+                pass
+            # One bounded same-process retry preserves the original observed
+            # timestamp. Phase C owns any durable retry/recovery subsystem.
+            with self._lock:
+                still_current = self.decks.get(slot) is deck
+            if attempts < 2 and still_current:
+                GLib.timeout_add_seconds(
+                    1,
+                    self._record_occurrence_air_start,
+                    slot,
+                    generation,
+                    log_item_id,
+                    air_started_at,
+                )
+            return False
+
     def _create_deck(self, slot, log_item, resume_position_ns=None):
         # Belt-and-braces: _next_queue_item already filters unplayable
         # items, but _create_deck is also reached from other paths
@@ -4797,9 +5038,6 @@ class PlaybackEngine:
         track = log_item.track
         filepath = track.filepath
 
-        self._write_now_playing(track)
-        self._write_rbds_category_state(track)
-
         # Auto-resume: if the previous engine instance was mid-play on
         # the same track (see _read_resume_hint), seek the fresh deck
         # to that position after creation. Hint is consumed once --
@@ -4810,12 +5048,52 @@ class PlaybackEngine:
         # linked -- matches what happens when we manually issue a seek
         # from the /api/engine/seek/ endpoint against a running deck.
         _auto_resume_position_ns = None
+        continuation_reason = "manual_seek_or_resume" if resume_position_ns is not None else None
         if resume_position_ns is None and getattr(self, "_resume_hint", None):
             hint = self._resume_hint
-            if hint["track_id"] == track.id:
+            if (
+                hint["track_id"] == track.id
+                and hint.get("log_item_id") == log_item.id
+            ):
                 _auto_resume_position_ns = int(hint["position"] * Gst.SECOND)
+                continuation_reason = "auto_resume"
                 print(f"  Auto-resuming deck [{slot}] at {hint['position']:.1f}s (track match)")
+            elif hint["track_id"] == track.id:
+                print(
+                    f"  Ignoring resume hint for track {track.id}: logical occurrence "
+                    f"mismatch (hint={hint.get('log_item_id')}, selected={log_item.id})"
+                )
             self._resume_hint = None
+
+        # Claim only after all caller-side request substitution/dedication
+        # selection and the centralized playability gate have resolved the
+        # concrete occurrence, but before presentation or live-pipeline work.
+        if not self._claim_playback_occurrence(log_item):
+            return None
+
+        air_start_eligible = continuation_reason is None and log_item.played_at is None
+        if continuation_reason == "auto_resume" and log_item.played_at is None:
+            # The first decoded buffer after a restart seek cannot reconstruct
+            # the original air-start instant. Preserve the honest claimed /
+            # not-played state for Phase C instead of inventing evidence.
+            print(
+                f"  Auto-resume occurrence log_item={log_item.id} has no authoritative "
+                "played_at; continuation will not synthesize one"
+            )
+            emit_event(
+                category="engine",
+                level="warning",
+                title="Auto-resume occurrence lacks authoritative air start",
+                detail={"slot": slot, "track_id": track.id, "log_item_id": log_item.id},
+                dedupe_key=f"engine|auto-resume-unstarted|{log_item.id}",
+            )
+        elif continuation_reason is None and log_item.played_at is not None:
+            # Defensive replay of an already-started logical occurrence: it
+            # may produce audio, but it can never count as another play.
+            continuation_reason = "already_started_occurrence"
+
+        self._write_now_playing(track)
+        self._write_rbds_category_state(track)
 
         src = Gst.ElementFactory.make("filesrc", None)
         src.set_property("location", filepath)
@@ -4956,6 +5234,7 @@ class PlaybackEngine:
                 deck.mark_media_buffer()
                 if not silence_primed and not first_real_marked["done"]:
                     deck.mark_milestone(FIRST_REAL_POST_PRIMER_MILESTONE)
+                    self._schedule_occurrence_air_start_from_probe(deck)
                     first_real_marked["done"] = True
             elif info.type & Gst.PadProbeType.EVENT_DOWNSTREAM:
                 event = info.get_event()
@@ -5058,6 +5337,7 @@ class PlaybackEngine:
                 if info.type & Gst.PadProbeType.BUFFER:
                     if concat.get_property("active-pad") == real_concat_sink:
                         deck.mark_milestone(FIRST_REAL_POST_PRIMER_MILESTONE)
+                        self._schedule_occurrence_air_start_from_probe(deck)
                         return Gst.PadProbeReturn.REMOVE
                 return Gst.PadProbeReturn.OK
 
@@ -5090,6 +5370,8 @@ class PlaybackEngine:
             mixer_pad=mixer_pad,
             silence_primed=silence_primed,
             generation=generation,
+            air_start_eligible=air_start_eligible,
+            continuation_reason=continuation_reason,
         )
         deck.probe_handles = probe_handles
         deck.signal_handles = signal_handles
@@ -5111,83 +5393,20 @@ class PlaybackEngine:
             self._deck_bin_map[id(deck_bin)] = deck
         deck_bin.sync_state_with_parent()
 
-        if resume_position_ns is None:
-            aired_at = timezone.now()
-            played_at_written = False
-            try:
-                close_old_connections()
-                log_item.played_at = aired_at
-                log_item.save(update_fields=["played_at"])
-                played_at_written = True
-                Track.objects.filter(id=track.id).update(
-                    last_played_at=aired_at,
-                    play_count=track.play_count + 1,
-                )
-            except Exception as exc:
-                print(f"  DB write failed (non-fatal): {exc}")
-            # Web Requests fulfillment is gated on played_at ITSELF
-            # having succeeded, independent of whether the Track
-            # counter update above (a separate statement, same
-            # try/except) also succeeded -- must not mark a request
-            # fulfilled when played_at never actually saved, and must
-            # not skip marking it fulfilled just because an unrelated
-            # counter update happened to fail.
-            if played_at_written:
-                try:
-                    mark_song_requests_aired(log_item, aired_at)
-                except Exception as exc:
-                    print(f"  Web request air-time update failed (non-fatal): {exc}")
-            # Append-only PlayEvent ledger for royalty / SoundExchange
-            # reporting -- distinct from LogItem.played_at because it
-            # snapshots ISRC / album / label / category_kind that a
-            # future Track edit or LogItem prune could otherwise wipe.
-            # Best-effort: any DB failure here is logged and dropped --
-            # missing a PlayEvent row for a single spin is preferable to
-            # failing the deck-creation path and dropping the track.
-            #
-            # Dedications-category plays are excluded entirely -- a
-            # spoken intro isn't a performance of a recording, and
-            # counting it would double-count a spin (the requested song
-            # right behind it gets its own PlayEvent normally).
-            # LogItem.played_at is still written above regardless,
-            # unaffected -- this exclusion only skips the PlayEvent row.
-            is_dedication_play = bool(
-                log_item.category_id and log_item.category and log_item.category.code == "Dedications"
+        if air_start_eligible:
+            print(
+                f"  [{slot}] Prepared claimed occurrence: "
+                f"{track.artist.name if track.artist else '?'} - {track.title}"
             )
-            if not is_dedication_play:
-                try:
-                    close_old_connections()
-                    # position >= 9999 is api_engine_insert_track's marker
-                    # for a manual / remote-DJ insert. Playlist-play-now
-                    # rebuilds a whole PlaylistLog and looks like a normal
-                    # scheduled hour from here, so it also reads as
-                    # "scheduled" -- fine for royalty reporting (SoundExchange
-                    # doesn't distinguish), and if we later want the split we
-                    # can add a `source` field to LogItem itself.
-                    pe_source = "insert" if getattr(log_item, "position", 0) >= 9999 else "scheduled"
-                    pe_category_kind = ""
-                    if log_item.category_id and log_item.category and log_item.category.kind_id:
-                        pe_category_kind = log_item.category.kind.name
-                    pe = PlayEvent.objects.create(
-                        track=track,
-                        track_title=track.title or "",
-                        track_artist=(track.artist.name if track.artist else ""),
-                        album_title=(track.album.title if track.album else ""),
-                        record_label=track.record_label or "",
-                        isrc=getattr(track, "isrc", "") or "",
-                        category_kind=pe_category_kind,
-                        source=pe_source,
-                        started_at=timezone.now(),
-                    )
-                    deck.play_event_id = pe.id
-                except Exception as exc:
-                    print(f"  PlayEvent write failed (non-fatal): {exc}")
-            print(f"  [{slot}] Playing: {track.artist.name if track.artist else '?'} - {track.title}")
         else:
-            # resume_position_ns is only the requested starting point at
-            # this stage. The caller still has to apply seek_simple(), which
-            # can reject it, so do not report a successful resume yet.
-            print(f"  [{slot}] Recreated: {track.artist.name if track.artist else '?'} - {track.title} for seek to {start_offset:.1f}s")
+            # A continuation generation is never a new logical play. The
+            # requested position may still be rejected later; do not report a
+            # successful resume or new accounting transition here.
+            print(
+                f"  [{slot}] Recreated ({continuation_reason or 'continuation'}): "
+                f"{track.artist.name if track.artist else '?'} - {track.title} "
+                f"for seek to {start_offset:.1f}s"
+            )
 
         # Auto-resume seek: the fresh deck was just linked into the mixer,
         # so attempt the actual seek. sync_state_with_parent() only requests
@@ -5823,9 +6042,10 @@ class PlaybackEngine:
             # Dedications sort first regardless of age; otherwise, sort
             # by log_item_id ascending so the OLDEST (outgoing) LogItem
             # wins when a mid-crossfade snapshot has both slots
-            # populated. Missing log_item_id sinks to the end (older
-            # state files without the field still match on track_id at
-            # deck creation time -- pre-fix behavior).
+            # populated. Missing log_item_id sinks to the end. Older state
+            # files without occurrence identity are retained for diagnostic
+            # visibility but cannot authorize auto-resume at deck creation;
+            # Phase B requires an exact Track + LogItem match.
             candidates.sort(key=lambda c: (not c["is_dedication"], c["log_item_id"] is None, c["log_item_id"] or 0))
             hint = candidates[0]
             self._resume_hint = {
@@ -6836,7 +7056,9 @@ class PlaybackEngine:
 
         close_old_connections()
         already_spliced = SongRequest.objects.filter(
-            status="scheduled", log_item_id=log_item.id, intro_log_item__isnull=False,
+            status="scheduled", log_item_id=log_item.id,
+            log_item__playback_claimed_at__isnull=True,
+            intro_log_item__isnull=False,
         ).exists()
         if already_spliced:
             return log_item
@@ -6844,6 +7066,7 @@ class PlaybackEngine:
         candidate = (
             SongRequest.objects.filter(
                 log_item_id=log_item.id, status="scheduled",
+                log_item__playback_claimed_at__isnull=True,
                 intro_track__isnull=False, intro_track__ready2air=True,
             )
             .order_by("submitted_at").first()
@@ -6858,6 +7081,24 @@ class PlaybackEngine:
         insert_at = self._queue_cursor - 1
         with transaction.atomic():
             with self._locked_playlist_log():
+                # Serialize the splice itself against playback claim. A join
+                # filter on SongRequest is not enough under MVCC: it can see
+                # the old NULL value while the claim transaction is still
+                # uncommitted. Lock order stays PlaylistLog -> LogItem ->
+                # SongRequest, matching request scheduling.
+                locked_occurrence = (
+                    LogItem.objects.select_for_update(of=("self",))
+                    .only(
+                        "id", "track_id", "playback_claimed_at", "played_at"
+                    )
+                    .get(id=log_item.id)
+                )
+                if (
+                    locked_occurrence.playback_claimed_at is not None
+                    or locked_occurrence.played_at is not None
+                    or locked_occurrence.track_id != log_item.track_id
+                ):
+                    return log_item
                 locked = (
                     # of=("self",) -- same fix as webrequests.services.
                     # maybe_schedule_song_request's own lock: Postgres
@@ -6866,7 +7107,12 @@ class PlaybackEngine:
                     # select_related below exactly that once combined
                     # with select_for_update.
                     SongRequest.objects.select_for_update(of=("self",))
-                    .filter(id=candidate.id, status="scheduled", log_item_id=log_item.id, track_id=log_item.track_id)
+                    .filter(
+                        id=candidate.id, status="scheduled",
+                        log_item_id=log_item.id,
+                        track_id=locked_occurrence.track_id,
+                        log_item__playback_claimed_at__isnull=True,
+                    )
                     .select_related("intro_track", "intro_track__category")
                     .first()
                 )
@@ -6879,7 +7125,9 @@ class PlaybackEngine:
                 # covered when the song comes back around as a forced
                 # follow-up.
                 claimed = SongRequest.objects.filter(
-                    status="scheduled", log_item_id=log_item.id, track_id=log_item.track_id,
+                    status="scheduled", log_item_id=log_item.id,
+                    log_item__playback_claimed_at__isnull=True,
+                    track_id=locked_occurrence.track_id,
                 ).update(intro_log_item=intro_item, status_updated_at=timezone.now())
                 if claimed == 0:
                     # Shouldn't happen given the lock above matched `locked`
