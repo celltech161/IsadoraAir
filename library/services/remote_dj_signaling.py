@@ -53,6 +53,11 @@ class RemoteDJSignalingServer:
         self.port = port
         self._loop = None
         self._ws = None
+        # Logical admission ownership is attempt-correlated and distinct
+        # from the lifetime of the physical WebSocket.  A retired socket
+        # may still be completing its close handshake after these fields
+        # have moved on to a newly admitted attempt.
+        self._ws_attempt_id = None
 
     def start(self):
         threading.Thread(target=self._run_thread, daemon=True).start()
@@ -82,7 +87,7 @@ class RemoteDJSignalingServer:
             return
 
         attempt_id = identity["attempt_id"]
-        if self._ws is not None:
+        if self._ws_attempt_id is not None:
             reason = "a session is already active"
             print(
                 f"  Remote DJ connection refused: attempt={attempt_id} "
@@ -99,6 +104,7 @@ class RemoteDJSignalingServer:
             return
 
         self._ws = ws
+        self._ws_attempt_id = attempt_id
         print(
             f"  Remote DJ WebSocket admitted: attempt={attempt_id} "
             f"user_id={identity['user_id']}"
@@ -151,35 +157,80 @@ class RemoteDJSignalingServer:
         except websockets.exceptions.ConnectionClosed:
             pass
         finally:
-            if self._ws is ws:
+            # Only the handler which still owns logical admission may
+            # release it and ask the engine to stop.  An engine-retired A
+            # can finish physically closing after B is admitted; A's
+            # delayed finally must be completely inert toward B.
+            if self._ws_attempt_id == attempt_id and self._ws is ws:
                 self._ws = None
+                self._ws_attempt_id = None
                 print(f"  Remote DJ disconnected: attempt={attempt_id}")
                 GLib.idle_add(
                     self.engine._remote_dj_session_stop, attempt_id
                 )
 
-    def send_json_threadsafe(self, obj):
+    def send_json_threadsafe(self, attempt_id, obj):
         """Called from the GLib/GStreamer thread to deliver a message
-        (offer/ICE candidate) to the currently-connected browser, if any."""
-        if self._loop is None or self._ws is None:
+        (offer/ICE candidate) only to the browser which owns that signed
+        attempt.  The owner check runs on the signaling loop, not here,
+        so a queued A send can never be redirected to a later owner B."""
+        if self._loop is None:
             return
-        asyncio.run_coroutine_threadsafe(self._send(obj), self._loop)
+        asyncio.run_coroutine_threadsafe(
+            self._send(attempt_id, obj), self._loop
+        )
 
-    def disconnect_threadsafe(self):
-        """Operator-triggered force-disconnect (or a reaction to the
-        webrtcbin connection itself failing) -- closes the actual
-        websocket if it's still open. A no-op if the browser already
-        disconnected on its own (the ordinary case, which drives session
-        teardown the other way: _handler's own `finally` block, not this
-        method)."""
-        if self._loop is None or self._ws is None:
-            return
-        asyncio.run_coroutine_threadsafe(self._ws.close(), self._loop)
+    def retire_attempt_threadsafe(self, attempt_id):
+        """Relinquish an engine-finalized attempt's logical signaling
+        ownership, then close its detached physical socket asynchronously.
 
-    async def _send(self, obj):
-        if self._ws is None:
+        The attempt comparison and both ownership mutations run on the
+        signaling asyncio loop.  A stale/repeated retirement can therefore
+        neither release nor close a newer attempt's socket.
+        """
+        if self._loop is None:
             return
+        asyncio.run_coroutine_threadsafe(
+            self._retire_attempt(attempt_id), self._loop
+        )
+
+    async def _retire_attempt(self, attempt_id):
+        active_attempt = self._ws_attempt_id
+        if active_attempt != attempt_id:
+            if active_attempt is not None:
+                print(
+                    "  Remote DJ stale_signaling_retire_ignored "
+                    f"attempt={attempt_id} active_attempt={active_attempt}"
+                )
+            return False
+
+        detached_ws = self._ws
+        self._ws = None
+        self._ws_attempt_id = None
+        print(f"  Remote DJ signaling_owner_retired attempt={attempt_id}")
+        if detached_ws is None:
+            return True
+
+        print(f"  Remote DJ signaling_socket_close_started attempt={attempt_id}")
         try:
-            await self._ws.send(json.dumps(obj))
+            await detached_ws.close()
+        except Exception as exc:
+            print(
+                "  Remote DJ signaling_socket_close_failed "
+                f"attempt={attempt_id} error={type(exc).__name__}"
+            )
+            return False
+        print(f"  Remote DJ signaling_socket_close_completed attempt={attempt_id}")
+        return True
+
+    async def _send(self, attempt_id, obj):
+        if self._ws_attempt_id != attempt_id or self._ws is None:
+            return
+        # Capture the matching socket before send() yields.  Even if this
+        # attempt is retired while the send awaits, it remains bound to
+        # A's detached socket and can never be redirected onto owner B.
+        ws = self._ws
+        try:
+            await ws.send(json.dumps(obj))
         except Exception as exc:
             print(f"  Remote DJ send failed: {exc}")

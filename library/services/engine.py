@@ -8229,10 +8229,14 @@ class PlaybackEngine:
         if session is None:
             return
         # send_json_threadsafe only queues the coroutine onto the signaling
-        # loop; it cannot prove that the WebSocket send completed.
+        # loop; it cannot prove that the WebSocket send completed.  The
+        # attempt identity also prevents a delayed A offer from reaching a
+        # newly admitted owner B.
         self._remote_dj_mark(session, "offer_queued")
         if self._remote_dj_server:
-            self._remote_dj_server.send_json_threadsafe({"type": "offer", "sdp": sdp_text})
+            self._remote_dj_server.send_json_threadsafe(
+                attempt_id, {"type": "offer", "sdp": sdp_text}
+            )
 
     def _remote_dj_on_ice_candidate(self, element, mline_index, candidate):
         session = self.remote_dj_session
@@ -8241,6 +8245,7 @@ class PlaybackEngine:
         self._remote_dj_mark(session, "first_server_ice_candidate")
         if self._remote_dj_server:
             self._remote_dj_server.send_json_threadsafe(
+                session.connection_attempt.attempt_id,
                 {"type": "ice", "sdpMLineIndex": mline_index, "candidate": candidate},
             )
 
@@ -8961,6 +8966,15 @@ class PlaybackEngine:
             self._remote_dj_last_attempt = attempt
         self.remote_dj_session = None
 
+        # r0075 -- engine finalization is authoritative for logical
+        # signaling ownership.  Retire this exact signed attempt as soon
+        # as the engine session is cleared; the signaling loop releases
+        # admission before awaiting the detached socket's close handshake.
+        # A natural browser-first close has already released ownership, so
+        # the same operation is an idempotent no-op on that path.
+        if self._remote_dj_server and attempt is not None:
+            self._remote_dj_server.retire_attempt_threadsafe(attempt_id)
+
         # Cancel the small post-ICE stats burst. Completed one-shots no
         # longer have a source; generation guards also make any callback
         # already dispatched harmless.
@@ -9078,9 +9092,6 @@ class PlaybackEngine:
         if slot is not None:
             slot.session = None
             _dj_diag(session, f"slot {slot.slot_id} released back to pool")
-
-        if self._remote_dj_server:
-            self._remote_dj_server.disconnect_threadsafe()
 
         # Close diagnostic sinks -- files stay on disk (not truncated
         # here) so a user reporting "static during that last session"

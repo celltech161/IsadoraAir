@@ -96,6 +96,7 @@ class RemoteDJGenerationBindingTests(SimpleTestCase):
     def test_stale_signaling_disconnect_cannot_stop_current_session(self):
         self.engine._remote_dj_session_stop(ATTEMPT_ID)
         self.assertIs(self.engine.remote_dj_session, self.current)
+        self.engine._remote_dj_server.retire_attempt_threadsafe.assert_not_called()
 
     def test_stale_offer_promise_callbacks_cannot_touch_current_session(self):
         stale = self._session(ATTEMPT_ID)
@@ -129,11 +130,26 @@ class RemoteDJGenerationBindingTests(SimpleTestCase):
 
         promise.wait.assert_called_once()
         self.engine._remote_dj_server.send_json_threadsafe.assert_called_once_with(
-            {"type": "offer", "sdp": "current-offer"}
+            OTHER_ATTEMPT_ID,
+            {"type": "offer", "sdp": "current-offer"},
         )
         self.assertIn(
             "offer_queued",
             self.current.connection_attempt.milestones["server"],
+        )
+
+    def test_server_ice_send_is_bound_to_current_attempt(self):
+        self.engine._remote_dj_on_ice_candidate(
+            self.current.webrtc, 2, "current-candidate"
+        )
+
+        self.engine._remote_dj_server.send_json_threadsafe.assert_called_once_with(
+            OTHER_ATTEMPT_ID,
+            {
+                "type": "ice",
+                "sdpMLineIndex": 2,
+                "candidate": "current-candidate",
+            },
         )
 
     def test_stale_inbound_failure_cannot_fail_current_session(self):
@@ -367,7 +383,9 @@ class RemoteDJBuildRollbackTests(TestCase):
             engine._remote_dj_last_attempt.failure["class"],
             FAILURE_DEPENDENCY_SESSION_BUILD,
         )
-        engine._remote_dj_server.disconnect_threadsafe.assert_called_once()
+        engine._remote_dj_server.retire_attempt_threadsafe.assert_called_once_with(
+            ATTEMPT_ID
+        )
         emit_event.assert_called_once()
 
     def test_partial_elements_and_request_pad_are_reclaimed(self):

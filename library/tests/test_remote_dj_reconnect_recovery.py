@@ -215,6 +215,9 @@ class RemoteDJReconnectRecoveryTests(TestCase):
     def test_explicit_disconnect_is_immediate_and_final(self):
         self.engine._remote_dj_session_stop()
         self.assertIsNone(self.engine.remote_dj_session)
+        self.engine._remote_dj_server.retire_attempt_threadsafe.assert_called_once_with(
+            self.attempt_id
+        )
 
     # -- 11/12: stale generation safety --
 

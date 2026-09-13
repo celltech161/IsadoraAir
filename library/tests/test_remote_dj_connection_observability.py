@@ -185,12 +185,16 @@ class RemoteDJSignalingAttemptTests(SimpleTestCase):
         token, payload = mint_remote_dj_token(42, attempt_id=ATTEMPT_ID)
         ws = _FakeWebSocket(token)
         server, engine = self._server()
-        server._ws = object()
+        active_ws = object()
+        server._ws = active_ws
+        server._ws_attempt_id = "already_active_attempt"
 
         with patch.object(signaling.GLib, "idle_add") as idle_add:
             asyncio.run(server._handler(ws))
 
         self.assertEqual(ws.closed[0], signaling.CLOSE_CODE_SESSION_BUSY)
+        self.assertEqual(server._ws_attempt_id, "already_active_attempt")
+        self.assertIsNotNone(server._ws)
         self.assertEqual(idle_add.call_args.args, (
             engine._remote_dj_record_signaling_failure,
             payload["attempt_id"],
@@ -198,6 +202,8 @@ class RemoteDJSignalingAttemptTests(SimpleTestCase):
             FAILURE_SIGNALING_SESSION_BUSY,
             "a session is already active",
         ))
+        self.assertIs(server._ws, active_ws)
+        self.assertEqual(server._ws_attempt_id, "already_active_attempt")
 
     def test_browser_milestone_cannot_select_engine_attempt(self):
         token, _payload = mint_remote_dj_token(42, attempt_id=ATTEMPT_ID)
