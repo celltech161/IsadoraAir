@@ -233,6 +233,21 @@ NEXT_HOUR_LOOKAHEAD_SECONDS = 30
 MAX_CLOCK_RECOVERY_SECONDS = 600
 CACHE_WARM_LEAD_SECONDS = 3.0
 SILENCE_PRIME_SECONDS = 0.3
+# [P2] 1.6 Phase A -- observational milestone name for the first buffer
+# empirically confirmed to have crossed the deck's post-primer output
+# boundary (concat's src pad once concat's own active-pad bookkeeping
+# already reports the real branch, or -- for a non-primed
+# resume_position_ns recreation, where there is no primer/concat at all
+# -- the deck's real decode-stage pad itself) toward the live mixer.
+# See _create_deck's real_output_boundary_probe / real_stage_probe and
+# docs/PLAYBACK_EVIDENCE_BOUNDARY_PHASE_A.md for the supporting
+# evidence and the isolated harness that established it.
+#
+# Phase A is observational only: nothing reads this milestone to drive
+# LogItem.played_at, Track.last_played_at, Track.play_count,
+# mark_song_requests_aired, or PlayEvent yet -- those still all commit
+# earlier, synchronously inside _create_deck, exactly as before.
+FIRST_REAL_POST_PRIMER_MILESTONE = "REAL_CONTENT_CROSSED_POST_PRIMER_BOUNDARY"
 DECK_STUCK_TIMEOUT_SECONDS = 30  # generous margin past a track's own duration before assuming its EOS was missed
 DECK_TEARDOWN_TIMEOUT_SECONDS = 10.0
 DECK_WATCHDOG_WINDOW_SECONDS = 10 * 60
@@ -4826,6 +4841,7 @@ class PlaybackEngine:
         # fully-registered generation rather than racing map registration.
         deck = None
         real_stage_src = None
+        concat = None
         real_concat_sink = None
         concat_src = None
         probe_handles = []
@@ -4920,9 +4936,27 @@ class PlaybackEngine:
 
         signal_handles.append((decode, decode.connect("pad-added", on_pad_added)))
 
+        # [P2] 1.6 Phase A -- one-shot flag for the non-primed
+        # (resume_position_ns given) path only. For a non-primed deck
+        # there is no silence primer and no concat: real_stage_src IS
+        # the ghost pad's own target (see the `else` branch below), so
+        # the very first buffer observed here has already, by
+        # definition, crossed the deck's real output boundary -- unlike
+        # the primed path, where this same pad sits upstream of concat
+        # and firing here would be firing on mere decode/branch
+        # activity (see real_output_boundary_probe below for why the
+        # primed path needs a different, concat-active-pad-gated
+        # check). Plain closure bool, not deck-lock-protected: GStreamer
+        # serializes buffer pushes through one pad one at a time, so
+        # this single-generation closure sees no concurrent writers.
+        first_real_marked = {"done": False}
+
         def real_stage_probe(pad, info):
             if info.type & Gst.PadProbeType.BUFFER:
                 deck.mark_media_buffer()
+                if not silence_primed and not first_real_marked["done"]:
+                    deck.mark_milestone(FIRST_REAL_POST_PRIMER_MILESTONE)
+                    first_real_marked["done"] = True
             elif info.type & Gst.PadProbeType.EVENT_DOWNSTREAM:
                 event = info.get_event()
                 if event is not None and event.type == Gst.EventType.EOS:
@@ -4982,6 +5016,53 @@ class PlaybackEngine:
                     ),
                 )
             )
+
+            # [P2] 1.6 Phase A -- primed-path first-real-output boundary.
+            # A plain BUFFER probe on concat_src alone cannot distinguish
+            # the silence-prime buffer from real content (both are
+            # ordinary buffers on the same pad); this is why
+            # mark_media_buffer() on real_stage_src (upstream of concat)
+            # was never proof of crossing this boundary either -- decode
+            # can produce/queue a buffer into concat's real sink well
+            # before concat has switched away from serving the primer.
+            #
+            # concat exposes its own switch as a plain, readable
+            # "active-pad" GObject property. Checked from inside THIS
+            # buffer's own probe invocation (not a separately-timed
+            # notify::active-pad callback -- confirmed empirically to
+            # fire slightly earlier than the buffer it precedes; see
+            # scratchpad/playback_boundary_p2_1_6/harness_concat_boundary.py
+            # and docs/PLAYBACK_EVIDENCE_BOUNDARY_PHASE_A.md), so the
+            # read is buffer-instant-correlated: the harness confirmed
+            # active-pad reads back the silence sink for the primer
+            # buffer and the real sink for every buffer from the real
+            # branch, with no observed ambiguity. Amplitude-independent
+            # -- a digitally silent real track switches active-pad
+            # exactly the same way a normal one does.
+            #
+            # Self-removes (PadProbeReturn.REMOVE) the instant it fires
+            # -- true one-shot per generation, and no per-buffer cost
+            # for the remainder of the track once real content is
+            # already flowing. Deliberately NOT added to probe_handles:
+            # unlike every other probe here (which must stay reachable
+            # for _remove_deck's explicit pad.remove_probe() cleanup,
+            # since they're still needed for as long as the deck lives),
+            # this probe's own lifecycle is already fully self-managed
+            # -- either it fires and removes itself, or it never fires
+            # and is discarded along with the pad/element themselves
+            # when the bin is torn down. Registering it anyway would
+            # make teardown's own remove_probe() call race a probe that
+            # may already be gone, which GStreamer logs as a harmless
+            # but noisy "pad has no probe with id" warning.
+            def real_output_boundary_probe(pad, info):
+                if info.type & Gst.PadProbeType.BUFFER:
+                    if concat.get_property("active-pad") == real_concat_sink:
+                        deck.mark_milestone(FIRST_REAL_POST_PRIMER_MILESTONE)
+                        return Gst.PadProbeReturn.REMOVE
+                return Gst.PadProbeReturn.OK
+
+            concat_src.add_probe(Gst.PadProbeType.BUFFER, real_output_boundary_probe)
+
         probe_handles.append(
             (
                 ghost_pad,
