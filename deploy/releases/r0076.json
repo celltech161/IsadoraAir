@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "release_id": "r0076",
+  "previous_release_id": "r0075",
+  "minimum_updater_protocol_version": 5,
+  "summary": "P2 1.6 Phases A-C -- authoritative playback/accounting. 'played' means the first confirmed real-content buffer crossing the deck's proven post-primer boundary, not deck construction. playback_claimed_at is engine commitment, never air evidence. One occurrence yields at most one played_at write, play-count increment, fulfillment, and PlayEvent; new PlayEventSegment evidence accumulates duration across seek/pause/restart, excluding primer/gaps/downtime. Royalty CSV/summary and TuneIn reflect this.",
+  "migrations_required": [
+    "library.0082_logitem_playback_claim_and_playevent_occurrence",
+    "library.0083_playevent_duration_segments"
+  ],
+  "migration_compatibility": "additive",
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-engine",
+    "isadoraair-gunicorn"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0007"
+}
