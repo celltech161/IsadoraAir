@@ -332,30 +332,21 @@ class SeekRejectionHandlingTests(TransactionTestCase):
     construction and GStreamer boundary calls, so bookkeeping, pad-offset
     rebasing, pause handling, monitoring, and logging remain observable."""
 
-    def test_create_deck_checks_auto_resume_seek_result(self):
+    def test_create_deck_routes_auto_resume_through_confirmed_gated_seek(self):
         src = inspect.getsource(eng_module.PlaybackEngine._create_deck)
-        self.assertIn("seek_ok = deck.pipeline.seek_simple", src)
-        self.assertIn("if not seek_ok:", src)
-        self.assertIn("deck.seeked_at = time.time()", src)
+        self.assertIn("return self._begin_gated_seek", src)
+        self.assertIn('continuation_reason="auto_resume"', src)
+        self.assertNotIn("deck.pipeline.seek_simple", src)
 
-    def test_rejected_seek_does_not_corrupt_started_at_with_unreached_target(self):
-        """A rejected auto-resume seek must NOT overwrite started_at to
-        claim the target position -- the deck is genuinely still at 0,
-        and the earlier (already-correct) started_at assignment must
-        survive untouched. Regression for a bug caught while writing
-        this fix (not by the outside review): the first draft applied
-        the started_at rewrite unconditionally regardless of seek_ok.
-        _create_deck has several unrelated "except Exception as exc:"
-        blocks elsewhere in the function, so anchor narrowly on the
-        "if not seek_ok: ... else:" pair itself rather than searching
-        for the next except clause (which could belong to a different,
-        earlier try block)."""
-        src = inspect.getsource(eng_module.PlaybackEngine._create_deck)
-        start = src.index("if not seek_ok:")
-        end = src.index("else:", start)
-        rejection_branch = src[start:end]
-        self.assertNotIn("deck.started_at = time.time() - (_auto_resume_position_ns", rejection_branch)
-        self.assertIn("deck.seeked_at = time.time()", src[end:end + 200])
+    def test_rejected_seek_rebases_to_zero_before_gate_release(self):
+        src = inspect.getsource(eng_module.PlaybackEngine._resolve_gated_seek)
+        rejected = src[src.index('if rejected:'):src.index('else:', src.index('if rejected:'))]
+        self.assertIn("internal_position_ns=0", rejected)
+        self.assertIn("ghost_pad.remove_probe(probe_id)", rejected)
+        self.assertLess(
+            rejected.index("internal_position_ns=0"),
+            rejected.index("ghost_pad.remove_probe(probe_id)"),
+        )
 
 
 def _gated_seek_fixture(duration_seconds=6.0):

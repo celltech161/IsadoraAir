@@ -356,17 +356,12 @@ class ManualSeekRecreationTests(TransactionTestCase):
 
 
 class AutoResumeObservationTests(_BoundaryTestBase):
-    """Scenario H: the _resume_hint path. The recreated generation keeps
-    silence_primed=True (auto-resume seeks AFTER creation rather than
-    passing resume_position_ns -- see _create_deck's own docstring), so
-    the boundary evidence here comes from the SAME concat/active-pad
-    mechanism as an ordinary fresh start, observed BEFORE the auto-
-    resume seek is even issued. Document, don't silently assume, that
-    this means the milestone reflects content from the start of the
-    track, not from the resumed position -- Phase A observes this; it
-    does not change accounting."""
+    """Scenario H: Phase C routes _resume_hint through the established
+    buffer-only gated seek. Phase A's generic milestone can still observe
+    preroll, but duration evidence remains disabled until the accepted
+    post-seek buffer is released."""
 
-    def test_auto_resume_hint_keeps_silence_prime_and_fires_boundary_pre_seek(self):
+    def test_auto_resume_hint_is_nonprimed_gated_and_duration_starts_post_seek(self):
         wav_path = self._wav("auto-resume.wav", frames=4 * 44100, silent=False)
         track = _make_track(wav_path, 20, duration=4.0, title="Auto Resume Track")
         item = _make_log_item(track, 20)
@@ -375,17 +370,22 @@ class AutoResumeObservationTests(_BoundaryTestBase):
             "position": 1.5,
             "log_item_id": item.id,
         }
+        item.played_at = eng_module.timezone.now()
+        self.engine._claim_playback_occurrence = lambda _item: True
         with patch("builtins.print"):
             deck = self.engine._create_deck("A", item)
         self.assertIsNotNone(deck)
-        self.assertTrue(deck.silence_primed, "auto-resume must keep the silence prime intact")
+        self.assertFalse(deck.silence_primed)
+        self.assertIsNotNone(deck.gated_seek)
+        self.assertFalse(deck.duration_segment_active)
         self.assertIsNone(self.engine._resume_hint, "hint must be consumed exactly once")
         self.engine.main_pipeline.set_state(Gst.State.PLAYING)
         self.assertTrue(
-            _wait_until(lambda: FIRST_REAL_POST_PRIMER_MILESTONE in deck.eos_milestones, timeout=5.0),
+            _pump_until_seek_resolved(self.engine, deck, timeout=5.0),
             deck.milestone_snapshot(),
         )
         self.assertEqual(deck.eos_milestones[FIRST_REAL_POST_PRIMER_MILESTONE]["count"], 1)
+        self.assertTrue(deck.duration_segment_active)
         self.engine._remove_deck(deck)
 
 

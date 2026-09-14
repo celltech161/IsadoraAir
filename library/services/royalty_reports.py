@@ -370,7 +370,7 @@ def generate_soundexchange_nce(period_start, period_end, ath_override=None):
     # opportunity, not a report bug.
     counts = Counter()
     key_meta = {}
-    for pe in qs.iterator():
+    for pe in qs.iterator(chunk_size=1000):
         if pe.isrc:
             key = ("isrc", pe.isrc)
         else:
@@ -448,6 +448,30 @@ def generate_summary(period_start, period_end):
         duration_played_seconds__lt=SOUNDEXCHANGE_MIN_SECONDS,
     )
     lines.append(f"Music plays below {SOUNDEXCHANGE_MIN_SECONDS:.0f}s (excluded): {short_qs.count():,}")
+    interrupted_qualified = PlayEvent.objects.filter(
+        started_at__gte=_period_bounds(period_start, period_end)[0],
+        started_at__lte=_period_bounds(period_start, period_end)[1],
+        category_kind="Music",
+        duration_evidence_state="interrupted",
+        duration_played_seconds__gte=SOUNDEXCHANGE_MIN_SECONDS,
+    ).count()
+    ambiguous_interrupted = PlayEvent.objects.filter(
+        started_at__gte=_period_bounds(period_start, period_end)[0],
+        started_at__lte=_period_bounds(period_start, period_end)[1],
+        category_kind="Music",
+        duration_evidence_state="interrupted",
+        duration_played_seconds__lt=SOUNDEXCHANGE_MIN_SECONDS,
+    ).count()
+    if interrupted_qualified:
+        lines.append(
+            "Crash-interrupted plays with >=30s confirmed "
+            f"(definitely qualified, included): {interrupted_qualified:,}"
+        )
+    if ambiguous_interrupted:
+        lines.append(
+            "WARNING: crash-interrupted plays with <30s confirmed "
+            f"(threshold ambiguous, excluded from automatic export): {ambiguous_interrupted:,}"
+        )
     unclosed = PlayEvent.objects.filter(
         started_at__gte=_period_bounds(period_start, period_end)[0],
         started_at__lte=_period_bounds(period_start, period_end)[1],
@@ -495,12 +519,15 @@ def generate_raw_csv(period_start, period_end):
         "track_artist", "track_title",
         "album_title", "record_label", "isrc",
         "track_id",
+        "log_item_id_snapshot", "duration_evidence_state",
+        "segment_count", "interrupted_segment_count", "termination_reasons",
     ])
     start, end = _period_bounds(period_start, period_end)
     qs = PlayEvent.objects.filter(
         started_at__gte=start, started_at__lte=end,
-    ).order_by("started_at")
-    for pe in qs.iterator():
+    ).prefetch_related("duration_segments").order_by("started_at")
+    for pe in qs.iterator(chunk_size=1000):
+        segments = list(pe.duration_segments.all())
         writer.writerow([
             pe.started_at.isoformat(),
             pe.ended_at.isoformat() if pe.ended_at else "",
@@ -509,6 +536,15 @@ def generate_raw_csv(period_start, period_end):
             pe.track_artist, pe.track_title,
             pe.album_title, pe.record_label, pe.isrc,
             pe.track_id or "",
+            pe.log_item_id_snapshot or "",
+            pe.duration_evidence_state,
+            len(segments),
+            sum(segment.evidence_state == "interrupted" for segment in segments),
+            "|".join(
+                segment.termination_reason
+                for segment in segments
+                if segment.termination_reason
+            ),
         ])
     return buf.getvalue(), "csv"
 

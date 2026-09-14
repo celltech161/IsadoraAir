@@ -7,6 +7,7 @@ import sys
 import threading
 import time
 import traceback
+import uuid
 from collections import deque
 from datetime import timedelta
 from pathlib import Path
@@ -25,11 +26,11 @@ django.setup()
 from contextlib import contextmanager
 
 from django.db import close_old_connections, connection, transaction
-from django.db.models import F
+from django.db.models import F, Sum
 from django.db.utils import OperationalError
 from django.utils import timezone
 from hardware.models import AudioInput, AudioOutput, AudioPipeline, DuckingConfig, RemoteDJAudioInput
-from library.models import Category, FXBusConfig, FXCart, LogItem, PlayEvent, PlaylistLog, RemoteDJConfig, Track, VoiceTrack, VoiceTrackConfig
+from library.models import Category, FXBusConfig, FXCart, LogItem, PlayEvent, PlayEventSegment, PlaylistLog, RemoteDJConfig, Track, VoiceTrack, VoiceTrackConfig
 from monitoring.models import emit_event
 from webrequests.models import SongRequest
 from library.services.log_builder import (
@@ -323,6 +324,10 @@ SLOTS = ("A", "B")
 # position-0 replacement is built immediately so the slot never goes
 # silent.
 DECK_SEEK_TICK_MS = 150
+# Phase C duration evidence is accumulated per program buffer in memory and
+# persisted as an absolute segment total on this low-rate timer. A crash may
+# lose at most the uncheckpointed tail; it never causes downtime to be added.
+PLAYBACK_DURATION_CHECKPOINT_SECONDS = 5
 DECK_SEEK_PREROLL_TIMEOUT_SECONDS = 6.0
 DECK_SEEK_CALL_TIMEOUT_SECONDS = 6.0
 DECK_SEEK_POST_SEEK_CONFIRM_TIMEOUT_SECONDS = 4.0
@@ -712,6 +717,7 @@ class Deck:
         generation=0,
         air_start_eligible=False,
         continuation_reason=None,
+        continuation_start_on_first_real=False,
     ):
         self.slot = slot
         self.track = track
@@ -726,6 +732,7 @@ class Deck:
         # but are never eligible to create a second logical play.
         self.air_start_eligible = air_start_eligible
         self.continuation_reason = continuation_reason
+        self.continuation_start_on_first_real = continuation_start_on_first_real
         self.air_start_dispatched = False
         self.air_start_dispatch_source_id = 0
         self.air_start_attempts = 0
@@ -751,11 +758,21 @@ class Deck:
         # window right after an actual seek, rather than distrusting
         # EOS for the deck's whole lifetime.
         self.seeked_at = None
-        # PlayEvent row id written by the authoritative air-start callback;
-        # closed out (ended_at + duration_played_seconds) at _remove_deck.
-        # Continuation generations deliberately keep this None in Phase B;
-        # durable cross-generation duration belongs to Phase C.
+        # PlayEvent row id written by authoritative fresh start or resolved
+        # from the occurrence key for a confirmed continuation segment.
         self.play_event_id = None
+        # [P2] 1.6 Phase C -- one durable idempotency key per process-local
+        # deck generation. Buffer duration is accumulated under a lock only
+        # while this generation is confirmed as contributing to program.
+        self.duration_generation_id = uuid.uuid4()
+        self.duration_segment_id = None
+        self.duration_segment_active = False
+        self.duration_segment_started_at = None
+        self.duration_segment_ended_at = None
+        self.duration_start_reason = ""
+        self.duration_confirmed_seconds = 0.0
+        self.duration_persisted_seconds = 0.0
+        self._duration_lock = threading.Lock()
         # Per-generation, bounded EOS/resource diagnostics. Streaming threads
         # only update counters/timestamps; no buffer or event is logged here.
         self.created_monotonic = time.monotonic()
@@ -813,6 +830,55 @@ class Deck:
         with self._milestone_lock:
             self.media_buffer_count += 1
             self.last_media_buffer_monotonic = current
+
+    def activate_duration_segment(self, started_at, reason):
+        """Enable program-buffer accounting exactly once for this generation."""
+        with self._duration_lock:
+            if self.duration_segment_active or self.duration_segment_started_at is not None:
+                return False
+            self.duration_segment_active = True
+            self.duration_segment_started_at = started_at
+            self.duration_start_reason = reason
+            return True
+
+    def mark_program_buffer(self, buffer):
+        """Streaming-thread-only bounded accumulation; never performs I/O."""
+        if buffer is None:
+            return
+        duration_ns = buffer.duration
+        if (
+            duration_ns is None
+            or duration_ns == Gst.CLOCK_TIME_NONE
+            or duration_ns < 0
+            or duration_ns > 60 * Gst.SECOND
+        ):
+            return
+        with self._duration_lock:
+            if self.duration_segment_active:
+                self.duration_confirmed_seconds += duration_ns / Gst.SECOND
+
+    def duration_snapshot(self, *, freeze=False, ended_at=None):
+        with self._duration_lock:
+            if freeze and self.duration_segment_active:
+                self.duration_segment_active = False
+                self.duration_segment_ended_at = ended_at or timezone.now()
+            return {
+                "generation_id": self.duration_generation_id,
+                "segment_id": self.duration_segment_id,
+                "started_at": self.duration_segment_started_at,
+                "start_reason": self.duration_start_reason,
+                "ended_at": self.duration_segment_ended_at,
+                "confirmed_seconds": self.duration_confirmed_seconds,
+                "persisted_seconds": self.duration_persisted_seconds,
+                "active": self.duration_segment_active,
+            }
+
+    def mark_duration_persisted(self, segment_id, confirmed_seconds):
+        with self._duration_lock:
+            self.duration_segment_id = segment_id
+            self.duration_persisted_seconds = max(
+                self.duration_persisted_seconds, confirmed_seconds
+            )
 
     def milestone_snapshot(self, *, now=None):
         current = time.monotonic() if now is None else now
@@ -1034,6 +1100,10 @@ class PlaybackEngine:
         # be skipped. See _apply_resume_hint_queue_rewind.
         self._apply_resume_hint_queue_rewind()
         self._restore_dedication_sequence_from_resume_hint()
+        # Only now is the current queue/forced continuation known. Reconcile
+        # stale segments after that validation so an on-disk hint for a
+        # regenerated/missing occurrence cannot leave a clean event open.
+        self._reconcile_playback_duration_state()
 
         if not self.log_items and not self._forced_next_items:
             print("No approved log for current hour. Waiting...")
@@ -1066,6 +1136,10 @@ class PlaybackEngine:
         GLib.timeout_add_seconds(2, self._output_presence_probe_tick)
         GLib.timeout_add(300, self._deck_teardown_tick)
         GLib.timeout_add(DECK_SEEK_TICK_MS, self._deck_seek_tick)
+        GLib.timeout_add_seconds(
+            PLAYBACK_DURATION_CHECKPOINT_SECONDS,
+            self._checkpoint_playback_durations,
+        )
         self._media_validation_worker.start()
 
         if RemoteDJConfig.load().enabled:
@@ -1094,6 +1168,10 @@ class PlaybackEngine:
 
     def stop(self):
         self.running = False
+        # Preserve occurrence identity/position before detach clears the deck
+        # map. The subsequent clean segment close excludes all service
+        # downtime, and the next process may continue the same PlayEvent.
+        self._write_state(transport="STOPPED")
         # Non-blocking: if a validator child is active, its process group is
         # terminated/reaped by the daemon worker after observing this signal.
         worker = getattr(self, "_media_validation_worker", None)
@@ -1122,7 +1200,6 @@ class PlaybackEngine:
             self.main_pipeline.set_state(Gst.State.NULL)
         if self.loop.is_running():
             self.loop.quit()
-        self._write_state(transport="STOPPED")
         print("Engine stopped.")
 
     def _handle_signal_glib(self):
@@ -4851,19 +4928,30 @@ class PlaybackEngine:
                 return
             deck.air_start_dispatched = True
             air_started_at = timezone.now()
+            # The fresh segment uses the exact Phase-B authoritative air-start
+            # timestamp. Activation happens before this buffer proceeds to the
+            # deck ghost pad, where its duration is accumulated.
+            if not (
+                deck.log_item.category_id
+                and deck.log_item.category
+                and deck.log_item.category.code == "Dedications"
+            ):
+                deck.activate_duration_segment(air_started_at, "fresh_air_start")
             source_id = GLib.idle_add(
                 self._record_occurrence_air_start,
                 deck.slot,
                 deck.generation,
                 deck.log_item.id,
                 air_started_at,
+                deck.duration_generation_id,
             )
             deck.air_start_dispatch_source_id = source_id or 0
             if not source_id:
                 deck.air_start_last_error = "GLib.idle_add returned no source id"
 
     def _record_occurrence_air_start(
-        self, slot, generation, log_item_id, air_started_at
+        self, slot, generation, log_item_id, air_started_at,
+        duration_generation_id=None,
     ):
         """Commit one authoritative actual-start transition on GLib's thread.
 
@@ -4879,11 +4967,24 @@ class PlaybackEngine:
                 or deck.generation != generation
                 or deck.log_item.id != log_item_id
                 or not deck.air_start_eligible
+                or (
+                    duration_generation_id is not None
+                    and deck.duration_generation_id != duration_generation_id
+                )
             ):
                 return False
 
         with deck._air_start_lock:
             deck.air_start_attempts += 1
+
+        if not (
+            deck.log_item.category_id
+            and deck.log_item.category
+            and deck.log_item.category.code == "Dedications"
+        ):
+            # Defensive for direct/retried callbacks: production normally
+            # activated this in the streaming handoff before scheduling us.
+            deck.activate_duration_segment(air_started_at, "fresh_air_start")
 
         play_event_id = None
         transition_recorded = False
@@ -4948,8 +5049,21 @@ class PlaybackEngine:
                             category_kind=pe_category_kind,
                             source=pe_source,
                             started_at=air_started_at,
+                            duration_evidence_state="active",
+                        )
+                        segment = PlayEventSegment.objects.create(
+                            play_event=play_event,
+                            generation_id=deck.duration_generation_id,
+                            log_item_id_snapshot=locked_item.id,
+                            deck_slot=slot,
+                            deck_generation=generation,
+                            start_reason="fresh_air_start",
+                            started_at=air_started_at,
+                            confirmed_duration_seconds=0.0,
+                            evidence_state="active",
                         )
                         play_event_id = play_event.id
+                        segment_id = segment.id
                     transition_recorded = True
                 else:
                     # Duplicate callback after a committed transition. Never
@@ -4972,6 +5086,14 @@ class PlaybackEngine:
                     and current.log_item.id == log_item_id
                 ):
                     current.play_event_id = play_event_id
+                    if play_event_id and not transition_recorded:
+                        existing_segment = PlayEventSegment.objects.filter(
+                            generation_id=current.duration_generation_id
+                        ).values_list("id", "confirmed_duration_seconds").first()
+                        if existing_segment:
+                            current.mark_duration_persisted(*existing_segment)
+                    elif play_event_id:
+                        current.mark_duration_persisted(segment_id, 0.0)
                     current.air_start_recorded = True
                     current.air_start_last_error = None
                     current.log_item.played_at = persisted_played_at
@@ -5021,10 +5143,102 @@ class PlaybackEngine:
                     generation,
                     log_item_id,
                     air_started_at,
+                    duration_generation_id,
                 )
             return False
 
-    def _create_deck(self, slot, log_item, resume_position_ns=None):
+    def _schedule_continuation_segment_start(self, deck, reason):
+        """Open duration evidence for an accepted continuation generation.
+
+        This is safe to call while a seek's confirmed buffer is still held at
+        the ghost-pad gate. It performs only in-memory activation and schedules
+        ORM work on GLib; releasing the gate then lets that same buffer count.
+        """
+        if deck.log_item.played_at is None:
+            # An auto-resume hint can identify a claimed occurrence whose
+            # authoritative fresh air-start transaction never happened. It
+            # must not acquire duration or reconstruct a PlayEvent.
+            return False
+        started_at = timezone.now()
+        if not deck.activate_duration_segment(started_at, reason):
+            return False
+        source_id = GLib.idle_add(
+            self._record_continuation_segment_start,
+            deck.slot,
+            deck.generation,
+            deck.log_item.id,
+            deck.duration_generation_id,
+            started_at,
+            reason,
+        )
+        return bool(source_id)
+
+    def _record_continuation_segment_start(
+        self, slot, generation, log_item_id, duration_generation_id,
+        started_at, reason,
+    ):
+        with self._lock:
+            deck = self.decks.get(slot)
+            if (
+                deck is None
+                or deck.generation != generation
+                or deck.log_item.id != log_item_id
+                or deck.duration_generation_id != duration_generation_id
+            ):
+                return False
+        try:
+            close_old_connections()
+            with transaction.atomic():
+                play_event = (
+                    PlayEvent.objects.select_for_update()
+                    .filter(log_item_id_snapshot=log_item_id)
+                    .first()
+                )
+                if play_event is None:
+                    # A claimed-but-never-aired occurrence cannot acquire a
+                    # continuation duration or reconstruct an unknown start.
+                    return False
+                segment, _created = PlayEventSegment.objects.get_or_create(
+                    generation_id=duration_generation_id,
+                    defaults={
+                        "play_event": play_event,
+                        "log_item_id_snapshot": log_item_id,
+                        "deck_slot": slot,
+                        "deck_generation": generation,
+                        "start_reason": reason,
+                        "started_at": started_at,
+                        "confirmed_duration_seconds": 0.0,
+                        "evidence_state": "active",
+                    },
+                )
+                if segment.play_event_id != play_event.id:
+                    raise RuntimeError("duration generation belongs to another occurrence")
+                if play_event.ended_at is not None:
+                    play_event.ended_at = None
+                if play_event.duration_evidence_state != "interrupted":
+                    play_event.duration_evidence_state = "active"
+                play_event.save(update_fields=["ended_at", "duration_evidence_state"])
+            with self._lock:
+                current = self.decks.get(slot)
+                if (
+                    current is deck
+                    and current.generation == generation
+                    and current.duration_generation_id == duration_generation_id
+                ):
+                    current.play_event_id = play_event.id
+                    current.mark_duration_persisted(
+                        segment.id, segment.confirmed_duration_seconds
+                    )
+            return False
+        except Exception as exc:
+            print(f"  Continuation segment start failed (non-fatal): {exc}")
+            return False
+
+    def _create_deck(
+        self, slot, log_item, resume_position_ns=None,
+        *, continuation_reason_override=None,
+        continuation_start_on_first_real=False,
+    ):
         # Belt-and-braces: _next_queue_item already filters unplayable
         # items, but _create_deck is also reached from other paths
         # (_insert_urgent_next, crossfade swap, log reload flow). One
@@ -5038,32 +5252,35 @@ class PlaybackEngine:
         track = log_item.track
         filepath = track.filepath
 
-        # Auto-resume: if the previous engine instance was mid-play on
-        # the same track (see _read_resume_hint), seek the fresh deck
-        # to that position after creation. Hint is consumed once --
-        # clearing on match OR mismatch so future deck loads follow
-        # their normal path. Unlike the pause-resume path (which sets
-        # resume_position_ns to skip silence prime), auto-resume keeps
-        # the silence prime intact and just seeks after the deck is
-        # linked -- matches what happens when we manually issue a seek
-        # from the /api/engine/seek/ endpoint against a running deck.
-        _auto_resume_position_ns = None
-        continuation_reason = "manual_seek_or_resume" if resume_position_ns is not None else None
+        # Auto-resume reuses the same confirmed, buffer-only gated-seek
+        # state machine as manual seek. No position-zero buffer can reach
+        # program, and no continuation segment can start, before the seek is
+        # positively established. The explicit override prevents recursion
+        # when _begin_gated_seek builds its non-primed replacement.
+        continuation_reason = (
+            continuation_reason_override
+            or ("manual_seek_or_resume" if resume_position_ns is not None else None)
+        )
         if resume_position_ns is None and getattr(self, "_resume_hint", None):
             hint = self._resume_hint
+            self._resume_hint = None
             if (
                 hint["track_id"] == track.id
                 and hint.get("log_item_id") == log_item.id
             ):
-                _auto_resume_position_ns = int(hint["position"] * Gst.SECOND)
-                continuation_reason = "auto_resume"
                 print(f"  Auto-resuming deck [{slot}] at {hint['position']:.1f}s (track match)")
+                return self._begin_gated_seek(
+                    slot,
+                    log_item,
+                    hint["position"],
+                    was_paused=False,
+                    continuation_reason="auto_resume",
+                )
             elif hint["track_id"] == track.id:
                 print(
                     f"  Ignoring resume hint for track {track.id}: logical occurrence "
                     f"mismatch (hint={hint.get('log_item_id')}, selected={log_item.id})"
                 )
-            self._resume_hint = None
 
         # Claim only after all caller-side request substitution/dedication
         # selection and the centralized playability gate have resolved the
@@ -5235,6 +5452,10 @@ class PlaybackEngine:
                 if not silence_primed and not first_real_marked["done"]:
                     deck.mark_milestone(FIRST_REAL_POST_PRIMER_MILESTONE)
                     self._schedule_occurrence_air_start_from_probe(deck)
+                    if deck.continuation_start_on_first_real:
+                        self._schedule_continuation_segment_start(
+                            deck, deck.continuation_reason or "continuation_at_zero"
+                        )
                     first_real_marked["done"] = True
             elif info.type & Gst.PadProbeType.EVENT_DOWNSTREAM:
                 event = info.get_event()
@@ -5254,8 +5475,11 @@ class PlaybackEngine:
         # Block EOS from reaching audiomixer. The streaming-thread probe only
         # records bounded state and hands completion to the GLib thread.
         def eos_probe(pad, info):
+            if info.type & Gst.PadProbeType.BUFFER:
+                deck.mark_program_buffer(info.get_buffer())
+                return Gst.PadProbeReturn.OK
             event = info.get_event()
-            if event.type == Gst.EventType.EOS:
+            if event is not None and event.type == Gst.EventType.EOS:
                 deck.mark_milestone("E_DECK_GHOST_SRC_EOS")
                 deck.mark_milestone("F_EOS_PROBE_ENTERED")
                 source_id = GLib.idle_add(self._on_deck_eos_probed, deck_bin, deck)
@@ -5347,7 +5571,7 @@ class PlaybackEngine:
             (
                 ghost_pad,
                 ghost_pad.add_probe(
-                    Gst.PadProbeType.EVENT_DOWNSTREAM,
+                    Gst.PadProbeType.BUFFER | Gst.PadProbeType.EVENT_DOWNSTREAM,
                     eos_probe,
                 ),
             )
@@ -5372,6 +5596,7 @@ class PlaybackEngine:
             generation=generation,
             air_start_eligible=air_start_eligible,
             continuation_reason=continuation_reason,
+            continuation_start_on_first_real=continuation_start_on_first_real,
         )
         deck.probe_handles = probe_handles
         deck.signal_handles = signal_handles
@@ -5407,48 +5632,6 @@ class PlaybackEngine:
                 f"{track.artist.name if track.artist else '?'} - {track.title} "
                 f"for seek to {start_offset:.1f}s"
             )
-
-        # Auto-resume seek: the fresh deck was just linked into the mixer,
-        # so attempt the actual seek. sync_state_with_parent() only requests
-        # the parent's state asynchronously; seek_simple() can still reject
-        # while that transition is pending, and the rejection path below
-        # deliberately leaves the already-correct zero-position pad offset
-        # in place. Uses FLUSH so any pre-decoded buffers get dropped --
-        # otherwise we'd hear a tiny chunk from position 0 before the seek
-        # lands.
-        if _auto_resume_position_ns is not None:
-            try:
-                seek_ok = deck.pipeline.seek_simple(
-                    Gst.Format.TIME,
-                    Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT,
-                    _auto_resume_position_ns,
-                )
-                if not seek_ok:
-                    # Confirmed via isolated repro of the 2026-08-01
-                    # incident that this does NOT catch the transient
-                    # post-seek parser hiccup (seek_simple still
-                    # returns True there) -- this path is for an
-                    # outright-rejected seek instead (e.g. wrong
-                    # pipeline state), a different, rarer failure mode
-                    # worth its own visibility.
-                    print(f"  [{slot}] Auto-resume seek to {_auto_resume_position_ns / Gst.SECOND:.1f}s rejected")
-                    emit_event(
-                        category="engine", level="error", title="Deck seek rejected",
-                        detail={"slot": slot, "track_id": track.id,
-                                "target_seconds": _auto_resume_position_ns / Gst.SECOND},
-                        dedupe_key=f"engine|seek-rejected|slot={slot}|track={track.id}",
-                    )
-                else:
-                    deck.seeked_at = time.time()
-                    # started_at drives _get_deck_position; adjust it
-                    # so UI position readouts line up with the audio.
-                    # Only when the seek actually succeeded -- a
-                    # rejected seek leaves the deck genuinely at 0,
-                    # and started_at was already set correctly for
-                    # that by the code above.
-                    deck.started_at = time.time() - (_auto_resume_position_ns / Gst.SECOND)
-            except Exception as exc:
-                print(f"  Auto-resume seek failed (non-fatal): {exc}")
 
         return deck
 
@@ -5735,25 +5918,191 @@ class PlaybackEngine:
         except Exception:
             pass
 
-    def _close_deck_play_event(self, deck):
-        """Best-effort PlayEvent close-out after live-topology isolation."""
-        if deck.play_event_id:
-            try:
-                close_old_connections()
-                now = timezone.now()
-                pe = PlayEvent.objects.filter(id=deck.play_event_id).only(
-                    "id", "started_at"
-                ).first()
-                if pe is not None:
-                    duration = None
-                    if pe.started_at:
-                        duration = max(0.0, (now - pe.started_at).total_seconds())
-                    PlayEvent.objects.filter(id=pe.id).update(
-                        ended_at=now,
-                        duration_played_seconds=duration,
+    def _persist_deck_duration(
+        self, deck, *, close_segment=False, occurrence_terminal=False,
+        termination_reason="", interrupted=False,
+    ):
+        """Persist one immutable generation snapshot and parent aggregate.
+
+        The child row's UUID makes creation idempotent. Both the absolute
+        segment total and the sum-derived PlayEvent aggregate are changed in
+        one transaction, so retries cannot double-add duration.
+        """
+        snapshot = deck.duration_snapshot(freeze=close_segment)
+        started_at = snapshot["started_at"]
+        confirmed = snapshot["confirmed_seconds"]
+        persistence_at = timezone.now()
+        segment_boundary_at = (
+            snapshot["ended_at"] or persistence_at
+            if close_segment and not interrupted else None
+        )
+        try:
+            close_old_connections()
+            with transaction.atomic():
+                play_event = None
+                if deck.play_event_id:
+                    play_event = (
+                        PlayEvent.objects.select_for_update()
+                        .filter(id=deck.play_event_id).first()
                     )
-            except Exception as exc:
-                print(f"  PlayEvent close-out failed (non-fatal): {exc}")
+                if play_event is None:
+                    play_event = (
+                        PlayEvent.objects.select_for_update()
+                        .filter(log_item_id_snapshot=deck.log_item.id).first()
+                    )
+                if play_event is None:
+                    return False
+
+                segment = None
+                if started_at is not None:
+                    segment, _created = PlayEventSegment.objects.get_or_create(
+                        generation_id=deck.duration_generation_id,
+                        defaults={
+                            "play_event": play_event,
+                            "log_item_id_snapshot": deck.log_item.id,
+                            "deck_slot": deck.slot,
+                            "deck_generation": deck.generation,
+                            "start_reason": snapshot["start_reason"],
+                            "started_at": started_at,
+                            "confirmed_duration_seconds": confirmed,
+                            "evidence_state": "active",
+                        },
+                    )
+                    if segment.play_event_id != play_event.id:
+                        raise RuntimeError("duration generation belongs to another occurrence")
+                    updates = {
+                        "confirmed_duration_seconds": max(
+                            segment.confirmed_duration_seconds, confirmed
+                        ),
+                        "last_confirmed_at": timezone.now(),
+                    }
+                    if close_segment and segment.evidence_state == "active":
+                        updates.update({
+                            "ended_at": segment_boundary_at,
+                            "termination_reason": termination_reason,
+                            "evidence_state": "interrupted" if interrupted else "complete",
+                        })
+                    PlayEventSegment.objects.filter(id=segment.id).update(**updates)
+                    segment.confirmed_duration_seconds = updates["confirmed_duration_seconds"]
+
+                aggregate = (
+                    PlayEventSegment.objects.filter(play_event=play_event)
+                    .aggregate(total=Sum("confirmed_duration_seconds"))["total"]
+                    or 0.0
+                )
+                has_interruption = PlayEventSegment.objects.filter(
+                    play_event=play_event, evidence_state="interrupted"
+                ).exists()
+                parent_updates = {
+                    "duration_played_seconds": aggregate,
+                    "duration_evidence_state": (
+                        "interrupted" if has_interruption
+                        else "complete" if occurrence_terminal
+                        else "active"
+                    ),
+                }
+                if occurrence_terminal:
+                    # A crash-interrupted occurrence deliberately retains an
+                    # unknown terminal end. Clean terminal paths use the exact
+                    # detach boundary, or the latest already-closed segment if
+                    # the occurrence was paused when it was ended.
+                    if not has_interruption:
+                        terminal_at = persistence_at
+                        if terminal_at is None:
+                            terminal_at = (
+                                PlayEventSegment.objects.filter(
+                                    play_event=play_event, ended_at__isnull=False
+                                ).order_by("-ended_at")
+                                .values_list("ended_at", flat=True).first()
+                            )
+                        parent_updates["ended_at"] = terminal_at
+                PlayEvent.objects.filter(id=play_event.id).update(**parent_updates)
+            if segment is not None:
+                deck.play_event_id = play_event.id
+                deck.mark_duration_persisted(
+                    segment.id, segment.confirmed_duration_seconds
+                )
+            return True
+        except Exception as exc:
+            print(f"  Playback duration persistence failed (non-fatal): {exc}")
+            return False
+
+    def _checkpoint_playback_durations(self):
+        """Low-rate GLib callback; the streaming path never waits for DB."""
+        with self._lock:
+            decks = tuple(deck for deck in self.decks.values() if deck is not None)
+        for deck in decks:
+            snapshot = deck.duration_snapshot()
+            if (
+                snapshot["active"]
+                and snapshot["confirmed_seconds"] > snapshot["persisted_seconds"]
+            ):
+                self._persist_deck_duration(deck)
+        return True
+
+    def _reconcile_playback_duration_state(self):
+        """Conservatively reconcile prior-process segments at startup."""
+        hint = getattr(self, "_resume_hint", None) or {}
+        resume_log_item_id = hint.get("log_item_id")
+        if hasattr(self, "log_items"):
+            loaded = list(self.log_items or []) + list(
+                getattr(self, "_forced_next_items", []) or []
+            )
+            resume_is_loadable = any(
+                item.id == resume_log_item_id
+                and getattr(getattr(item, "track", None), "id", None)
+                == hint.get("track_id")
+                for item in loaded
+            )
+            if not resume_is_loadable:
+                resume_log_item_id = None
+        try:
+            close_old_connections()
+            with transaction.atomic():
+                stale = list(
+                    PlayEventSegment.objects.select_for_update()
+                    .filter(evidence_state="active")
+                    .values_list("id", "play_event_id")
+                )
+                if stale:
+                    stale_ids = [row[0] for row in stale]
+                    PlayEventSegment.objects.filter(id__in=stale_ids).update(
+                        evidence_state="interrupted",
+                        termination_reason="process_interrupted",
+                        ended_at=None,
+                    )
+                event_ids = {row[1] for row in stale}
+                event_ids.update(
+                    PlayEvent.objects.filter(
+                        duration_evidence_state="active", ended_at__isnull=True
+                    ).values_list("id", flat=True)
+                )
+                for play_event in PlayEvent.objects.select_for_update().filter(id__in=event_ids):
+                    segments = PlayEventSegment.objects.filter(play_event=play_event)
+                    total = segments.aggregate(
+                        total=Sum("confirmed_duration_seconds")
+                    )["total"] or 0.0
+                    interrupted_exists = segments.filter(
+                        evidence_state="interrupted"
+                    ).exists()
+                    updates = {
+                        "duration_played_seconds": total,
+                        "duration_evidence_state": (
+                            "interrupted" if interrupted_exists else "active"
+                        ),
+                    }
+                    same_occurrence_resume = (
+                        resume_log_item_id is not None
+                        and play_event.log_item_id_snapshot == resume_log_item_id
+                    )
+                    if not interrupted_exists and not same_occurrence_resume:
+                        updates["ended_at"] = segments.filter(
+                            ended_at__isnull=False
+                        ).order_by("-ended_at").values_list("ended_at", flat=True).first()
+                        updates["duration_evidence_state"] = "complete"
+                    PlayEvent.objects.filter(id=play_event.id).update(**updates)
+        except Exception as exc:
+            print(f"  Playback duration startup reconciliation failed (non-fatal): {exc}")
 
     def _schedule_deck_null(self, deck):
         """Send only the hazardous NULL transition to one bounded worker."""
@@ -5810,7 +6159,9 @@ class PlaybackEngine:
             deck.mark_milestone("O_NULL_TRANSITION_NOT_STARTED", state=outcome)
         return outcome
 
-    def _remove_deck(self, deck):
+    def _remove_deck(
+        self, deck, *, occurrence_terminal=True, termination_reason=None
+    ):
         """Detach one exact generation first, then retire it off-thread.
 
         Unlink/release/remove are intentionally performed on the GLib thread
@@ -5844,6 +6195,11 @@ class PlaybackEngine:
         except Exception as exc:
             isolation_errors.append(f"mixer unlink failed: {exc!r}")
             deck.mark_milestone("L_MIXER_UNLINK_FAILED", state=repr(exc))
+
+        # Stop duration accumulation at the unlink boundary itself, before
+        # request-pad release, bin removal, or asynchronous NULL can consume
+        # more internal buffers.
+        deck.duration_snapshot(freeze=True, ended_at=timezone.now())
 
         if mixer_pad is not None:
             try:
@@ -5885,7 +6241,14 @@ class PlaybackEngine:
         # Dispatch hazardous quiescence immediately after isolation; database
         # accounting must not delay it (or live-mixer detach above).
         self._schedule_deck_null(deck)
-        self._close_deck_play_event(deck)
+        self._persist_deck_duration(
+            deck,
+            close_segment=True,
+            occurrence_terminal=occurrence_terminal,
+            termination_reason=(
+                termination_reason or deck.completion_reason or "generation_retired"
+            ),
+        )
         return True
 
     @_glib_safe(default_return=True)
@@ -9519,9 +9882,20 @@ class PlaybackEngine:
             deck.pipeline.get_static_pad("src").unlink(deck.mixer_pad)
         except Exception as exc:
             print(f"  [{slot}] pause: unlink failed: {exc}", flush=True)
+        deck.duration_snapshot(freeze=True, ended_at=timezone.now())
         if deck.mixer_pad is not None:
             self.mixer.release_request_pad(deck.mixer_pad)
         deck.mixer_pad = None
+
+        # Mixer unlink is the truthful end of this generation's program
+        # contribution. Pause is a continuation boundary, never a logical
+        # occurrence terminal.
+        self._persist_deck_duration(
+            deck,
+            close_segment=True,
+            occurrence_terminal=False,
+            termination_reason="paused",
+        )
 
         ret = deck.pipeline.set_state(Gst.State.PAUSED)
         print(f"  [{slot}] Paused at {pos:.1f}s (set_state PAUSED -> {ret})", flush=True)
@@ -9569,7 +9943,10 @@ class PlaybackEngine:
         log_item = deck.log_item
         self._begin_gated_seek(slot, log_item, position, was_paused=was_paused)
 
-    def _begin_gated_seek(self, slot, log_item, target_seconds, *, was_paused):
+    def _begin_gated_seek(
+        self, slot, log_item, target_seconds, *, was_paused,
+        continuation_reason=None,
+    ):
         """Shared manual-seek/resume preparation primitive -- see the
         r0063 architecture report (scratchpad/deck-seek-readiness) for
         the full investigation this design is based on.
@@ -9613,13 +9990,26 @@ class PlaybackEngine:
             return
 
         if existing is not None:
-            self._remove_deck(existing)
+            self._remove_deck(
+                existing,
+                occurrence_terminal=False,
+                termination_reason="seek_replaced",
+            )
 
         target_ns = int(target_seconds * Gst.SECOND)
-        new_deck = self._create_deck(slot, log_item, resume_position_ns=target_ns)
+        continuation_reason = continuation_reason or (
+            "pause_resume" if existing is not None and existing.paused
+            else "manual_seek"
+        )
+        new_deck = self._create_deck(
+            slot,
+            log_item,
+            resume_position_ns=target_ns,
+            continuation_reason_override=continuation_reason,
+        )
         if new_deck is None:
             print(f"  [{slot}] Seek failed — could not recreate deck", flush=True)
-            return
+            return None
 
         ghost_pad = new_deck.pipeline.get_static_pad("src")
 
@@ -9649,6 +10039,7 @@ class PlaybackEngine:
             # (a native call may still be executing). See
             # _retire_deck_respecting_gated_seek / _finish_deferred_retirement.
             "retire_callbacks": None,
+            "continuation_reason": continuation_reason,
         }
 
         def _hold_buffer(_pad, info):
@@ -9678,6 +10069,7 @@ class PlaybackEngine:
             Gst.PadProbeType.BLOCK | Gst.PadProbeType.BUFFER, _hold_buffer
         )
         new_deck.gated_seek = op
+        return new_deck
 
     def _deck_seek_tick(self):
         """Periodic (DECK_SEEK_TICK_MS) GLib-thread driver for every
@@ -9856,7 +10248,13 @@ class PlaybackEngine:
             print(f"  [{slot}] Seek call did not return in time -- generation {deck.generation} "
                   f"permanently isolated (quarantine #{quarantine_count}), replacing at position 0",
                   flush=True)
-            self._create_deck(slot, log_item, resume_position_ns=0)
+            self._create_deck(
+                slot,
+                log_item,
+                resume_position_ns=0,
+                continuation_reason_override="seek_timeout_fallback_zero",
+                continuation_start_on_first_real=not was_paused,
+            )
             if was_paused:
                 self._pause_deck(slot)
             for cb in (retire_callbacks or []):
@@ -9886,7 +10284,11 @@ class PlaybackEngine:
             # returned by this phase, so nothing defers it).
             ghost_pad.remove_probe(probe_id)
             deck.gated_seek = None
-            self._remove_deck(deck)
+            self._remove_deck(
+                deck,
+                occurrence_terminal=False,
+                termination_reason="seek_unconfirmed",
+            )
             print(f"  [{slot}] Seek to {target_ns / Gst.SECOND:.1f}s could not be confirmed -- "
                   f"replacing at position 0", flush=True)
             emit_event(
@@ -9899,7 +10301,13 @@ class PlaybackEngine:
                 },
                 dedupe_key=f"engine|seek-unconfirmed|slot={slot}",
             )
-            self._create_deck(slot, log_item, resume_position_ns=0)
+            self._create_deck(
+                slot,
+                log_item,
+                resume_position_ns=0,
+                continuation_reason_override="seek_unconfirmed_fallback_zero",
+                continuation_start_on_first_real=not was_paused,
+            )
             if was_paused:
                 self._pause_deck(slot)
             return
@@ -9919,6 +10327,10 @@ class PlaybackEngine:
             # r0062 correctness fix as before, just triggered from here
             # now instead of _seek_deck/_resume_deck directly.
             self._apply_pad_offset(deck.pipeline, internal_position_ns=0)
+            if not was_paused:
+                self._schedule_continuation_segment_start(
+                    deck, "seek_rejected_fallback_zero"
+                )
             ghost_pad.remove_probe(probe_id)
             deck.started_at = time.time()
             print(f"  [{slot}] Seek to {target_ns / Gst.SECOND:.1f}s rejected -- playing from 0 instead",
@@ -10006,6 +10418,10 @@ class PlaybackEngine:
             self._apply_pad_offset(deck.pipeline, internal_position_ns=achieved_ns)
             deck.seeked_at = time.time()
             deck.started_at = time.time() - (achieved_ns / Gst.SECOND)
+            if not was_paused:
+                self._schedule_continuation_segment_start(
+                    deck, op.get("continuation_reason") or "seek_confirmed"
+                )
             ghost_pad.remove_probe(probe_id)
             print(f"  [{slot}] Seek to {achieved_ns / Gst.SECOND:.1f}s", flush=True)
 
@@ -10156,7 +10572,11 @@ class PlaybackEngine:
             except Exception:
                 pass
             deck.gated_seek = None
-        self._remove_deck(deck)
+        self._remove_deck(
+            deck,
+            occurrence_terminal=False,
+            termination_reason="clean_shutdown",
+        )
 
     def _eject_deck(self, slot):
         if slot not in SLOTS:

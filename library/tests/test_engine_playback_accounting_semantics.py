@@ -274,10 +274,14 @@ class DedicationAndContinuationTests(PlaybackAccountingFixture):
             engine._schedule_occurrence_air_start_from_probe(deck)
 
         idle_add.assert_called_once()
-        callback, slot, generation, log_item_id, captured_at = idle_add.call_args.args
+        (
+            callback, slot, generation, log_item_id, captured_at,
+            duration_generation_id,
+        ) = idle_add.call_args.args
         self.assertEqual(callback, engine._record_occurrence_air_start)
         self.assertEqual((slot, generation, log_item_id), ("A", 1, item.id))
         self.assertTrue(timezone.is_aware(captured_at))
+        self.assertEqual(duration_generation_id, deck.duration_generation_id)
         self.assertEqual(deck.air_start_dispatch_source_id, 42)
 
         source = inspect.getsource(
@@ -294,6 +298,8 @@ class RealBoundaryAccountingIntegrationTests(PlaybackAccountingFixture):
         engine = _make_real_engine()
         engine.__dict__.pop("_claim_playback_occurrence")
         engine.__dict__.pop("_schedule_occurrence_air_start_from_probe")
+        engine.__dict__.pop("_persist_deck_duration")
+        engine.__dict__.pop("_schedule_continuation_segment_start")
 
         def cleanup_engine():
             engine.main_pipeline.set_state(Gst.State.NULL)
@@ -398,6 +404,13 @@ class RealBoundaryAccountingIntegrationTests(PlaybackAccountingFixture):
         )
         event.refresh_from_db()
         self.assertGreaterEqual(event.duration_played_seconds, 0.0)
+        segment = event.duration_segments.get()
+        self.assertEqual(segment.started_at, event.started_at)
+        self.assertEqual(segment.evidence_state, "complete")
+        self.assertAlmostEqual(
+            event.duration_played_seconds,
+            segment.confirmed_duration_seconds,
+        )
 
     def test_auto_resume_with_null_played_at_is_conservative_and_diagnostic(self):
         temp_dir = tempfile.TemporaryDirectory(prefix="isadoraair-phase-b-auto-resume.")

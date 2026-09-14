@@ -1,3 +1,5 @@
+import uuid
+
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.core.validators import URLValidator
@@ -1526,8 +1528,9 @@ class PlayEvent(models.Model):
     """Append-only ledger of every track that actually hit the mixer.
     Written by the playback engine when a fresh LogItem's first real
     post-primer buffer crosses the deck output boundary (started_at +
-    all snapshot fields set) and updated at _remove_deck (ended_at +
-    duration_played_seconds set). Distinct from LogItem.played_at
+    all snapshot fields set). Phase C child segments accumulate confirmed
+    buffer duration across generation replacement and only terminal logical
+    occurrence close sets ended_at. Distinct from LogItem.played_at
     because retention differs -- programming logs (PlaylistLog /
     LogItem) may be pruned to save space, but play evidence must be
     retained for statutory-license reporting audits (SoundExchange
@@ -1545,7 +1548,7 @@ class PlayEvent(models.Model):
     overrides) -- read-only from the outside.
 
     The 30-second SoundExchange threshold is applied at REPORT time
-    (query filter on duration_played_seconds), not at write time --
+    (query filter on confirmed duration_played_seconds), not at write time --
     that way short-cut plays still exist as evidence for the
     operator's own bookkeeping and only get excluded from the PRO
     export."""
@@ -1554,6 +1557,13 @@ class PlayEvent(models.Model):
         ("scheduled", "Scheduled"),
         ("insert", "Manual insert / remote-DJ"),
         ("playlist_play_now", "Playlist Play Now"),
+    ]
+
+    DURATION_EVIDENCE_CHOICES = [
+        ("legacy", "Legacy / pre-segment semantics"),
+        ("active", "Active, complete evidence so far"),
+        ("complete", "Terminal, complete evidence"),
+        ("interrupted", "Contains an uncertain interruption tail"),
     ]
 
     track = models.ForeignKey(
@@ -1585,6 +1595,14 @@ class PlayEvent(models.Model):
     started_at = models.DateTimeField(db_index=True)
     ended_at = models.DateTimeField(null=True, blank=True)
     duration_played_seconds = models.FloatField(null=True, blank=True)
+    # Phase C aggregate evidence state. Historical rows deliberately keep the
+    # explicit legacy default and receive no fabricated segment rows.
+    duration_evidence_state = models.CharField(
+        max_length=16,
+        choices=DURATION_EVIDENCE_CHOICES,
+        default="legacy",
+        db_index=True,
+    )
 
     class Meta:
         indexes = [
@@ -1597,6 +1615,62 @@ class PlayEvent(models.Model):
             f"{self.started_at:%Y-%m-%d %H:%M:%S} "
             f"[{self.category_kind or 'none'}] "
             f"{self.track_artist} -- {self.track_title}"
+        )
+
+
+class PlayEventSegment(models.Model):
+    """Durable, evidence-backed program-audio interval for one PlayEvent.
+
+    One logical occurrence can span multiple deck generations. Streaming-pad
+    probes accumulate buffer durations only in memory; the engine checkpoints
+    that absolute confirmed total at low frequency and closes it at the
+    detach/pause boundary. An interrupted segment intentionally has no guessed
+    ``ended_at`` and retains only its last durable confirmed total.
+    """
+
+    EVIDENCE_STATE_CHOICES = [
+        ("active", "Active"),
+        ("complete", "Complete"),
+        ("interrupted", "Interrupted / uncertain tail"),
+    ]
+
+    play_event = models.ForeignKey(
+        PlayEvent,
+        on_delete=models.CASCADE,
+        related_name="duration_segments",
+    )
+    # Process-global occurrence-generation identity. The engine's integer deck
+    # generation restarts at zero per process, so it is diagnostic only and
+    # this UUID is the durable idempotency key.
+    generation_id = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+    log_item_id_snapshot = models.BigIntegerField(null=True, blank=True, db_index=True)
+    deck_slot = models.CharField(max_length=1, blank=True, default="")
+    deck_generation = models.PositiveBigIntegerField(default=0)
+    start_reason = models.CharField(max_length=48, blank=True, default="")
+    started_at = models.DateTimeField()
+    last_confirmed_at = models.DateTimeField(null=True, blank=True)
+    ended_at = models.DateTimeField(null=True, blank=True)
+    confirmed_duration_seconds = models.FloatField(default=0.0)
+    termination_reason = models.CharField(max_length=64, blank=True, default="")
+    evidence_state = models.CharField(
+        max_length=16,
+        choices=EVIDENCE_STATE_CHOICES,
+        default="active",
+        db_index=True,
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["started_at", "id"]
+        indexes = [
+            models.Index(fields=["play_event", "evidence_state"]),
+        ]
+
+    def __str__(self):
+        return (
+            f"PlayEvent {self.play_event_id} segment {self.generation_id} "
+            f"[{self.evidence_state}] {self.confirmed_duration_seconds:.3f}s"
         )
 
 

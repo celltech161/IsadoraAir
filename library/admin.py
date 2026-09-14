@@ -32,6 +32,7 @@ from .models import (
     MediaPlaybackIncident,
     NavMenuItem,
     PlayEvent,
+    PlayEventSegment,
     Playlist,
     PlaylistItem,
     PlaylistLog,
@@ -63,7 +64,7 @@ from .models import (
 # grouping changes.
 _TRAFFIC_MODELS = {"playlist", "rotation", "scheduleblock", "playlistlog"}
 _CONFIG_MODELS = {"analysisconfig", "recencyconfig", "uitheme", "logfillconfig", "uploadconfig", "navmenuitem", "remotedjconfig", "stationtimeconfig", "stationinfo", "tuneinconfig", "fxbusconfig", "fxcart", "voicetrackconfig"}
-_LOG_MODELS = {"emaillog", "playevent", "mediaplaybackincident", "royaltyreport"}
+_LOG_MODELS = {"emaillog", "playevent", "playeventsegment", "mediaplaybackincident", "royaltyreport"}
 
 
 class SectionedAdminSite(admin.AdminSite):
@@ -1271,13 +1272,14 @@ class EmailLogAdmin(admin.ModelAdmin):
 @admin.register(PlayEvent)
 class PlayEventAdmin(admin.ModelAdmin):
     """Read-only view of the airplay ledger. Rows are written by the
-    engine at deck creation/removal; the admin must never mutate them
+    engine at authoritative air start and segment/occurrence close; the admin must never mutate them
     (per PlayEvent's docstring -- historical integrity for statutory
     reporting)."""
 
     list_display = ("started_at", "category_kind", "track_artist",
-                    "track_title", "isrc", "duration_played_seconds", "source")
-    list_filter = ("category_kind", "source")
+                    "track_title", "isrc", "duration_played_seconds",
+                    "duration_evidence_state", "source")
+    list_filter = ("category_kind", "source", "duration_evidence_state")
     search_fields = ("track_title", "track_artist", "isrc", "album_title")
     date_hierarchy = "started_at"
     ordering = ("-started_at",)
@@ -1285,8 +1287,33 @@ class PlayEventAdmin(admin.ModelAdmin):
     readonly_fields = (
         "track", "track_title", "track_artist", "album_title", "record_label",
         "isrc", "category_kind", "source",
-        "started_at", "ended_at", "duration_played_seconds",
+        "log_item_id_snapshot", "started_at", "ended_at",
+        "duration_played_seconds", "duration_evidence_state",
     )
+    fields = readonly_fields
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+
+@admin.register(PlayEventSegment)
+class PlayEventSegmentAdmin(admin.ModelAdmin):
+    """Read-only generation-level evidence behind PlayEvent aggregates."""
+
+    list_display = (
+        "started_at", "play_event", "deck_slot", "deck_generation",
+        "confirmed_duration_seconds", "evidence_state", "termination_reason",
+    )
+    list_filter = ("evidence_state", "start_reason", "termination_reason")
+    search_fields = ("=play_event_id", "=log_item_id_snapshot", "=generation_id")
+    ordering = ("-started_at",)
+    readonly_fields = tuple(field.name for field in PlayEventSegment._meta.fields)
     fields = readonly_fields
 
     def has_add_permission(self, request):

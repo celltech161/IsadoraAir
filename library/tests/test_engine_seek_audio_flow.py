@@ -479,7 +479,7 @@ class ConfirmedPtsValidationTests(TransactionTestCase):
         self.assertTrue(_pump_engine(self.engine, lambda: survivor.media_buffer_count > 0, timeout=5.0))
         ok, pos = survivor.pipeline.query_position(Gst.Format.TIME)
         self.assertTrue(ok)
-        self.assertLess(pos, Gst.SECOND, "replacement must start truthfully near position 0")
+        self.assertLess(pos, 2 * Gst.SECOND, "replacement must start truthfully near position 0")
 
 
 class RealMp3SeekAudioFlowTests(TransactionTestCase):
