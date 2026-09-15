@@ -4,8 +4,102 @@ from django import forms
 from django.contrib import admin, messages
 
 from hardware.devices import list_input_devices
+from monitoring.services.config_audit import emit_config_change_event
 
 from .models import Encoder, RUNTIME_AFFECTING_FIELDS
+
+
+# Password is always secret.  ``url`` is rendered as public station metadata,
+# but URLField permits user-info/query/fragment text that could contain a token;
+# retain the fact that it changed without persisting its value in audit history.
+_ENCODER_REDACTED_AUDIT_FIELDS = frozenset({"password", "url"})
+
+
+def _encoder_runtime_field_names():
+    """Return model-order fields while keeping the model set authoritative."""
+
+    return tuple(
+        field.name
+        for field in Encoder._meta.fields
+        if field.name in RUNTIME_AFFECTING_FIELDS
+    )
+
+
+def _persisted_encoder_audit_snapshot(obj):
+    if not getattr(obj, "pk", None):
+        return None
+    fields = _encoder_runtime_field_names()
+    row = Encoder.objects.filter(pk=obj.pk).values("pk", "name", *fields).first()
+    if row is None:
+        return None
+    return {
+        "pk": row["pk"],
+        "name": row["name"],
+        "runtime": {field: row[field] for field in fields},
+    }
+
+
+def _current_encoder_audit_snapshot(obj):
+    fields = _encoder_runtime_field_names()
+    return {
+        "pk": obj.pk,
+        "name": obj.name,
+        "runtime": {field: getattr(obj, field) for field in fields},
+    }
+
+
+def _audit_encoder_change(*, request, action, before, after):
+    """Emit one sanitized desired-configuration audit for an Admin operation."""
+
+    fields = _encoder_runtime_field_names()
+    old_values = (before or {}).get("runtime", {})
+    new_values = (after or {}).get("runtime", {})
+    if before is None or after is None:
+        changed_fields = list(fields)
+    else:
+        changed_fields = [
+            field for field in fields if old_values[field] != new_values[field]
+        ]
+    if not changed_fields:
+        return
+
+    changes = {}
+    redacted_fields = []
+    for field in changed_fields:
+        if field in _ENCODER_REDACTED_AUDIT_FIELDS:
+            redacted_fields.append(field)
+            continue
+        changes[field] = {
+            "old": old_values.get(field) if before is not None else None,
+            "new": new_values.get(field) if after is not None else None,
+        }
+
+    # The manager only reconciles a row that was or is enabled.  A disabled
+    # row staying disabled is still consequential desired configuration and
+    # audited, but must not be described as pending runtime adoption.
+    reconciliation_pending = bool(
+        old_values.get("enabled") or new_values.get("enabled")
+    )
+    apply_mode = (
+        "desired_configuration_saved_pending_encoder_manager_reconciliation"
+        if reconciliation_pending
+        else "desired_configuration_saved_disabled_no_reconciliation"
+    )
+    identity = after if after is not None else before
+    emit_config_change_event(
+        category="encoder",
+        title=f"Encoder configuration {action}d",
+        action=action,
+        object_type="encoders.Encoder",
+        object_id=(identity or {}).get("pk"),
+        object_name=(identity or {}).get("name"),
+        changed_fields=changed_fields,
+        changes=changes,
+        redacted_fields=redacted_fields,
+        request=request,
+        apply_modes={field: apply_mode for field in changed_fields},
+        restart_required=False,
+    )
 
 
 def _notify_reconciliation_pending(request):
@@ -15,11 +109,11 @@ def _notify_reconciliation_pending(request):
     save already happened by the time this is called) and tells the
     operator the encoder manager will pick the change up on its own,
     on its existing ~5s reconciliation cadence (see encoders/services/
-    encoder_manager.py's _reconcile). No subprocess, no sudo, nothing
-    to defer to transaction.on_commit() -- there is no dispatch left
-    to race the DB write becoming visible; the manager only ever reads
-    fully-committed state on its own schedule regardless of exactly
-    when in a future tick it looks.
+    encoder_manager.py's _reconcile). No subprocess, no sudo, and no
+    reconciliation dispatch to defer -- the manager only ever reads
+    fully-committed state on its own schedule regardless of exactly when
+    in a future tick it looks. Configuration audit persistence is a
+    separate concern handled commit-safely by the shared audit helper.
 
     Coalescing: a request attribute, same pattern the old
     mark_encoder_restart_needed used -- a changelist bulk-edit touching
@@ -207,7 +301,14 @@ class EncoderAdmin(admin.ModelAdmin):
         return form
 
     def save_model(self, request, obj, form, change):
+        before = _persisted_encoder_audit_snapshot(obj) if change else None
         super().save_model(request, obj, form, change)
+        _audit_encoder_change(
+            request=request,
+            action="update" if change else "create",
+            before=before,
+            after=_current_encoder_audit_snapshot(obj),
+        )
         is_enabled = bool(obj.enabled)
         if not change:
             # A disabled row was never part of the running topology --
@@ -232,7 +333,14 @@ class EncoderAdmin(admin.ModelAdmin):
 
     def delete_model(self, request, obj):
         was_enabled = obj.enabled
+        before = _current_encoder_audit_snapshot(obj)
         super().delete_model(request, obj)
+        _audit_encoder_change(
+            request=request,
+            action="delete",
+            before=before,
+            after=None,
+        )
         # Deleting a row that was already disabled doesn't change the
         # running topology -- it was never part of it.
         if was_enabled:
@@ -240,6 +348,14 @@ class EncoderAdmin(admin.ModelAdmin):
 
     def delete_queryset(self, request, queryset):
         had_enabled_encoder = queryset.filter(enabled=True).exists()
+        snapshots = [_current_encoder_audit_snapshot(obj) for obj in queryset]
         super().delete_queryset(request, queryset)
+        for before in snapshots:
+            _audit_encoder_change(
+                request=request,
+                action="delete",
+                before=before,
+                after=None,
+            )
         if had_enabled_encoder:
             _notify_reconciliation_pending(request)

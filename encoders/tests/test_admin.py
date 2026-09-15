@@ -141,10 +141,9 @@ class NoPrivilegedDispatchTests(TestCase):
 
     def test_admin_module_imports_no_subprocess_or_transaction(self):
         # subprocess: nothing in this module ever shells out anymore.
-        # transaction: nothing here defers to on_commit() anymore --
-        # there's no dispatch left to race the DB write becoming
-        # visible; the manager only ever reads fully-committed state on
-        # its own independent schedule.
+        # transaction: there is still no reconciliation dispatch to
+        # coordinate. The shared configuration-audit helper owns its own
+        # commit-safe callback, so this module does not import transaction.
         self.assertFalse(hasattr(encoders_admin, "subprocess"))
         self.assertFalse(hasattr(encoders_admin, "transaction"))
 
