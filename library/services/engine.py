@@ -3,7 +3,6 @@ import json
 import os
 import signal
 import socket
-import sys
 import threading
 import time
 import traceback
@@ -1147,24 +1146,34 @@ class PlaybackEngine:
             self._remote_dj_server = RemoteDJSignalingServer(self)
             self._remote_dj_server.start()
 
-        GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGTERM, self._handle_signal_glib)
-        GLib.unix_signal_add(GLib.PRIORITY_HIGH, signal.SIGINT, self._handle_signal_glib)
+        try:
+            GLib.unix_signal_add(
+                GLib.PRIORITY_HIGH, signal.SIGTERM, self._handle_signal_glib
+            )
+            GLib.unix_signal_add(
+                GLib.PRIORITY_HIGH, signal.SIGINT, self._handle_signal_glib
+            )
 
-        # Also set Python-level handler as fallback for pre-loop signals
-        def _force_quit(signum, frame):
-            print("\nForce quit.")
-            self.running = False
-            try:
-                self.loop.quit()
-            except Exception:
-                pass
-            sys.exit(1)
-        signal.signal(signal.SIGTERM, _force_quit)
-        signal.signal(signal.SIGINT, _force_quit)
+            # Also set a Python-level fallback for signals delivered before
+            # GLib dispatches its source. SystemExit still unwinds through the
+            # finally block below, so an orderly signal cannot bypass the
+            # known mixer-unlink/segment-close boundary in stop().
+            def _force_quit(signum, frame):
+                print("\nForce quit.")
+                self.running = False
+                try:
+                    self.loop.quit()
+                except Exception:
+                    pass
+                raise SystemExit(0)
 
-        print("Engine started.")
-        self.loop.run()
-        self.stop()
+            signal.signal(signal.SIGTERM, _force_quit)
+            signal.signal(signal.SIGINT, _force_quit)
+
+            print("Engine started.")
+            self.loop.run()
+        finally:
+            self.stop()
 
     def stop(self):
         self.running = False

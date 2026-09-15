@@ -2,6 +2,7 @@
 
 from datetime import date, timedelta
 import inspect
+import signal
 from unittest.mock import MagicMock, patch
 
 from django.test import TransactionTestCase
@@ -188,6 +189,97 @@ class ContinuationDurationTests(DurationFixture):
         self.assertAlmostEqual(event.duration_played_seconds, 14)
         self.assertEqual(event.duration_segments.count(), 3)
         self.assertEqual(PlayEvent.objects.count(), 1)
+        self.assertEqual(event.duration_evidence_state, "complete")
+        self.assertIsNotNone(event.ended_at)
+
+    def test_orderly_signal_restart_then_eos_finalizes_complete_occurrence(self):
+        """Regression for production LogItem 44463 / PlayEvent 28976."""
+        event = self.start_fresh()
+        original_event_id = event.id
+        original_played_at = self.item.played_at
+        for seconds in (50, 50, 21.3):
+            self.add_duration(self.deck, seconds)
+
+        # Exercise the real start() signal-fallback path. Before this fix its
+        # SystemExit bypassed the following stop(), leaving segment A active
+        # for startup reconciliation to misclassify as process_interrupted.
+        installed_handlers = {}
+
+        def install_handler(signum, handler):
+            installed_handlers[signum] = handler
+
+        def deliver_sigterm_from_loop():
+            installed_handlers[signal.SIGTERM](signal.SIGTERM, None)
+
+        self.engine.log_items = []
+        self.engine._forced_next_items = []
+        self.engine._media_validation_worker = MagicMock()
+        self.engine._deck_teardowns = {}
+        self.engine._deck_bin_map = {id(self.deck.pipeline): self.deck}
+        self.engine.remote_dj_session = None
+        self.engine.main_pipeline = MagicMock()
+        self.engine.mixer = MagicMock()
+        self.engine.loop = MagicMock()
+        self.engine.loop.run.side_effect = deliver_sigterm_from_loop
+
+        with (
+            patch.object(self.engine, "_read_resume_hint"),
+            patch.object(self.engine, "_build_main_pipeline"),
+            patch.object(self.engine, "_load_current_hour_log"),
+            patch.object(self.engine, "_apply_resume_hint_queue_rewind"),
+            patch.object(self.engine, "_restore_dedication_sequence_from_resume_hint"),
+            patch.object(self.engine, "_reconcile_playback_duration_state"),
+            patch.object(self.engine, "_write_state"),
+            patch.object(self.engine, "_schedule_deck_null", return_value="queued"),
+            patch.object(
+                eng_module.RemoteDJConfig,
+                "load",
+                return_value=MagicMock(enabled=False),
+            ),
+            patch.object(eng_module.GLib, "timeout_add", return_value=1),
+            patch.object(eng_module.GLib, "timeout_add_seconds", return_value=1),
+            patch.object(eng_module.GLib, "unix_signal_add", return_value=1),
+            patch.object(eng_module.signal, "signal", side_effect=install_handler),
+        ):
+            with self.assertRaises(SystemExit) as stopped:
+                self.engine.start()
+        self.assertEqual(stopped.exception.code, 0)
+
+        event.refresh_from_db()
+        first = event.duration_segments.get()
+        self.assertEqual(first.evidence_state, "complete")
+        self.assertEqual(first.termination_reason, "clean_shutdown")
+        self.assertIsNotNone(first.ended_at)
+        self.assertEqual(event.duration_evidence_state, "active")
+        self.assertIsNone(event.ended_at)
+
+        resumed = self.start_continuation(2, "auto_resume")
+        for seconds in (50, 50, 50, 11.7):
+            self.add_duration(resumed, seconds)
+        self.engine._persist_deck_duration(
+            resumed,
+            close_segment=True,
+            occurrence_terminal=True,
+            termination_reason="natural_eos",
+        )
+
+        event.refresh_from_db()
+        self.item.refresh_from_db()
+        self.track.refresh_from_db()
+        segments = list(event.duration_segments.order_by("started_at", "id"))
+        self.assertEqual(event.id, original_event_id)
+        self.assertEqual(self.item.played_at, original_played_at)
+        self.assertEqual(self.track.play_count, 1)
+        self.assertEqual(PlayEvent.objects.count(), 1)
+        self.assertEqual(len(segments), 2)
+        self.assertEqual(
+            [segment.evidence_state for segment in segments],
+            ["complete", "complete"],
+        )
+        self.assertEqual(segments[1].termination_reason, "natural_eos")
+        self.assertAlmostEqual(event.duration_played_seconds, 283.0)
+        self.assertEqual(event.duration_evidence_state, "complete")
+        self.assertIsNotNone(event.ended_at)
 
     def test_preconfirmation_buffer_and_stale_callback_cannot_start_segment(self):
         event = self.start_fresh()
@@ -279,6 +371,7 @@ class ContinuationDurationTests(DurationFixture):
 class CrashAndTransactionTests(DurationFixture):
     def test_crash_retains_checkpoint_marks_uncertainty_and_same_resume_continues(self):
         event = self.start_fresh()
+        original_played_at = self.item.played_at
         self.add_duration(self.deck, 31)
         self.engine._persist_deck_duration(self.deck)
         self.engine._resume_hint = {
@@ -299,10 +392,21 @@ class CrashAndTransactionTests(DurationFixture):
             termination_reason="natural_eos",
         )
         event.refresh_from_db()
+        self.item.refresh_from_db()
+        self.track.refresh_from_db()
+        segments = list(event.duration_segments.order_by("started_at", "id"))
         self.assertEqual(event.duration_segments.count(), 2)
+        self.assertEqual(segments[0].evidence_state, "interrupted")
+        self.assertIsNone(segments[0].ended_at)
+        self.assertEqual(segments[0].termination_reason, "process_interrupted")
+        self.assertEqual(segments[1].evidence_state, "complete")
+        self.assertEqual(segments[1].termination_reason, "natural_eos")
         self.assertEqual(event.duration_evidence_state, "interrupted")
         self.assertAlmostEqual(event.duration_played_seconds, 33)
         self.assertIsNone(event.ended_at)
+        self.assertEqual(self.item.played_at, original_played_at)
+        self.assertEqual(self.track.play_count, 1)
+        self.assertEqual(PlayEvent.objects.count(), 1)
 
     def test_crash_different_occurrence_never_invents_end_or_downtime(self):
         event = self.start_fresh()

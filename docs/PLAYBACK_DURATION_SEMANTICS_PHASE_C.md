@@ -89,6 +89,17 @@ occurrence-keyed PlayEvent. Service downtime has no buffers and cannot count.
 A clean open occurrence with no matching hint is finalized at its latest known
 closed segment boundary during startup reconciliation.
 
+SIGTERM/SIGINT cleanup is unconditional: both the GLib signal path and the
+Python pre-dispatch fallback unwind through `stop()`. A contributing generation
+is therefore unlinked at the known mixer boundary and closed `complete` with
+termination reason `clean_shutdown`; it is never converted to
+`process_interrupted` merely because the Python fallback delivered the orderly
+signal. If that occurrence auto-resumes and later reaches terminal EOS, the
+parent becomes `complete`, receives the EOS terminal `ended_at`, and aggregates
+the two complete segments while excluding the restart gap. If startup finds no
+valid continuation, the existing reconciliation rule instead finalizes the
+clean occurrence at its last known closed-segment boundary.
+
 The hint is considered resumable only when the exact Track + LogItem is still
 present in the loaded/forced startup queue; a stale hint for a regenerated or
 missing occurrence cannot keep an event open.
@@ -105,6 +116,11 @@ parent is marked interrupted and never uses next-startup time as an end. An
 exact auto-resume adds a new segment to the same PlayEvent without erasing the
 old uncertainty. A mismatch or lost `/run` hint leaves the old interrupted
 occurrence auditable with an unknown terminal end.
+
+This stale-active rule remains the abrupt-crash contrast to orderly shutdown:
+SIGKILL, host loss, or another disappearance that never reached the mixer
+unlink/close transaction permanently leaves that segment and parent
+`interrupted`, even if a later continuation itself finishes normally.
 
 ## Reporting and external identity
 

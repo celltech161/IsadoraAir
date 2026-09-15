@@ -412,6 +412,42 @@ class RealBoundaryAccountingIntegrationTests(PlaybackAccountingFixture):
             segment.confirmed_duration_seconds,
         )
 
+    def test_controlled_stop_closes_real_contributing_generation_cleanly(self):
+        temp_dir = tempfile.TemporaryDirectory(prefix="isadoraair-clean-stop-boundary.")
+        self.addCleanup(temp_dir.cleanup)
+        media_path = Path(temp_dir.name) / "clean-stop.wav"
+        _write_wav(media_path, frames=44100 * 5)
+        track, item = self.make_occurrence()
+        track.filepath = str(media_path)
+        track.filename = media_path.name
+        track.save(update_fields=["filepath", "filename"])
+
+        engine = self.make_real_engine()
+        deck = engine._create_deck("A", item)
+        self.assertIsNotNone(deck)
+        engine.main_pipeline.set_state(Gst.State.PLAYING)
+        self.assertTrue(
+            _wait_until(
+                lambda: PlayEvent.objects.filter(
+                    log_item_id_snapshot=item.id
+                ).exists(),
+                timeout=5.0,
+            ),
+            deck.milestone_snapshot(),
+        )
+
+        engine.stop()
+
+        event = PlayEvent.objects.get(log_item_id_snapshot=item.id)
+        segment = event.duration_segments.get()
+        self.assertTrue(deck.retirement_started)
+        self.assertTrue(deck.detached_from_mixer)
+        self.assertEqual(segment.evidence_state, "complete")
+        self.assertEqual(segment.termination_reason, "clean_shutdown")
+        self.assertIsNotNone(segment.ended_at)
+        self.assertEqual(event.duration_evidence_state, "active")
+        self.assertIsNone(event.ended_at)
+
     def test_auto_resume_with_null_played_at_is_conservative_and_diagnostic(self):
         temp_dir = tempfile.TemporaryDirectory(prefix="isadoraair-phase-b-auto-resume.")
         self.addCleanup(temp_dir.cleanup)
