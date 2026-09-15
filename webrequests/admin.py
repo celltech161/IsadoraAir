@@ -3,6 +3,11 @@ from django.http import HttpResponseRedirect
 from django.urls import reverse
 from django.utils import timezone
 
+from .config_audit import (
+    emit_web_request_config_change,
+    persisted_web_request_config_snapshot,
+    web_request_config_snapshot,
+)
 from .models import SongRequest, WebRequestConfig
 
 
@@ -64,6 +69,16 @@ class WebRequestConfigAdmin(admin.ModelAdmin):
         obj = WebRequestConfig.load()
         return HttpResponseRedirect(
             reverse("admin:webrequests_webrequestconfig_change", args=[obj.pk])
+        )
+
+    def save_model(self, request, obj, form, change):
+        before = persisted_web_request_config_snapshot(obj) if change else None
+        super().save_model(request, obj, form, change)
+        emit_web_request_config_change(
+            request=request,
+            action="update" if change else "create",
+            before=before,
+            after=web_request_config_snapshot(obj),
         )
 
 

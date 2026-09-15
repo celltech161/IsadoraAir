@@ -5,6 +5,13 @@ from django.shortcuts import render
 from django.views.decorators.csrf import ensure_csrf_cookie
 from django.views.decorators.http import require_http_methods
 
+from .config_audit import (
+    DAY_NAMES,
+    WEB_REQUEST_STAFF_API_FIELDS,
+    emit_web_request_config_change,
+    persisted_web_request_config_snapshot,
+    web_request_config_snapshot,
+)
 from .models import WebRequestConfig
 
 
@@ -51,6 +58,9 @@ def api_web_request_config(request):
     except (json.JSONDecodeError, ValueError):
         return JsonResponse({"error": "Invalid JSON"}, status=400)
 
+    before = persisted_web_request_config_snapshot(
+        config, fields=WEB_REQUEST_STAFF_API_FIELDS
+    )
     if "enabled" in body:
         config.enabled = bool(body["enabled"])
     if "max_fulfilled_per_hour" in body:
@@ -61,6 +71,16 @@ def api_web_request_config(request):
         config.expire_after_hours = max(1, int(body["expire_after_hours"]))
 
     config.save()
+    emit_web_request_config_change(
+        request=request,
+        action="update",
+        before=before,
+        after=web_request_config_snapshot(
+            config, fields=WEB_REQUEST_STAFF_API_FIELDS
+        ),
+        fields=WEB_REQUEST_STAFF_API_FIELDS,
+        change_source="webrequests_staff_config_api",
+    )
     return JsonResponse({"ok": True})
 
 
@@ -81,7 +101,9 @@ def api_open_slot_toggle(request):
     if not (0 <= slot <= 167):
         return JsonResponse({"error": "slot out of range"}, status=400)
 
+    before = persisted_web_request_config_snapshot(config, fields=("open_slots",))
     open_slots = set(config.open_slots)
+    was_open = slot in open_slots
     if slot in open_slots:
         open_slots.discard(slot)
         now_open = False
@@ -90,6 +112,22 @@ def api_open_slot_toggle(request):
         now_open = True
     config.open_slots = sorted(open_slots)
     config.save()
+    emit_web_request_config_change(
+        request=request,
+        action="update",
+        before=before,
+        after=web_request_config_snapshot(config, fields=("open_slots",)),
+        fields=("open_slots",),
+        change_source="webrequests_schedule_slot_toggle",
+        schedule_change={
+            "operation": "slot_toggle",
+            "day_of_week": slot // 24,
+            "day": DAY_NAMES[slot // 24],
+            "hour": slot % 24,
+            "old": was_open,
+            "new": now_open,
+        },
+    )
     return JsonResponse({"slot": slot, "open": now_open})
 
 
@@ -110,8 +148,10 @@ def api_open_slot_toggle_row(request):
     if not (0 <= day_of_week <= 6):
         return JsonResponse({"error": "day_of_week out of range"}, status=400)
 
+    before = persisted_web_request_config_snapshot(config, fields=("open_slots",))
     row_slots = [day_of_week * 24 + hour for hour in range(24)]
     open_slots = set(config.open_slots)
+    old_row_slots = open_slots.intersection(row_slots)
     # Same "not any()" master-toggle formula as the Track grid's
     # toggle_row, substituting open<->blocked: if NOTHING in the row is
     # currently open, clicking opens the whole row; if ANYTHING is
@@ -127,6 +167,24 @@ def api_open_slot_toggle_row(request):
         open_slots.difference_update(row_slots)
     config.open_slots = sorted(open_slots)
     config.save()
+    affected_slots = (
+        len(row_slots) - len(old_row_slots) if now_open else len(old_row_slots)
+    )
+    emit_web_request_config_change(
+        request=request,
+        action="update",
+        before=before,
+        after=web_request_config_snapshot(config, fields=("open_slots",)),
+        fields=("open_slots",),
+        change_source="webrequests_schedule_day_toggle",
+        schedule_change={
+            "operation": "day_toggle",
+            "day_of_week": day_of_week,
+            "day": DAY_NAMES[day_of_week],
+            "new_state": now_open,
+            "affected_slots": affected_slots,
+        },
+    )
     return JsonResponse({"day_of_week": day_of_week, "slots": row_slots, "open": now_open})
 
 
@@ -144,8 +202,10 @@ def api_open_slot_toggle_column(request):
     if not (0 <= hour <= 23):
         return JsonResponse({"error": "hour out of range"}, status=400)
 
+    before = persisted_web_request_config_snapshot(config, fields=("open_slots",))
     column_slots = [dow * 24 + hour for dow in range(7)]
     open_slots = set(config.open_slots)
+    old_column_slots = open_slots.intersection(column_slots)
     # Same "not any()" convention as toggle_row above / the Track grid's
     # toggle_column -- see that comment for why not "not all()".
     now_open = not any(s in open_slots for s in column_slots)
@@ -156,4 +216,23 @@ def api_open_slot_toggle_column(request):
         open_slots.difference_update(column_slots)
     config.open_slots = sorted(open_slots)
     config.save()
+    affected_slots = (
+        len(column_slots) - len(old_column_slots)
+        if now_open
+        else len(old_column_slots)
+    )
+    emit_web_request_config_change(
+        request=request,
+        action="update",
+        before=before,
+        after=web_request_config_snapshot(config, fields=("open_slots",)),
+        fields=("open_slots",),
+        change_source="webrequests_schedule_hour_toggle",
+        schedule_change={
+            "operation": "hour_toggle",
+            "hour": hour,
+            "new_state": now_open,
+            "affected_slots": affected_slots,
+        },
+    )
     return JsonResponse({"hour": hour, "slots": column_slots, "open": now_open})
