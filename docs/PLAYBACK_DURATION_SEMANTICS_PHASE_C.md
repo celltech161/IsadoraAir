@@ -89,16 +89,21 @@ occurrence-keyed PlayEvent. Service downtime has no buffers and cannot count.
 A clean open occurrence with no matching hint is finalized at its latest known
 closed segment boundary during startup reconciliation.
 
-SIGTERM/SIGINT cleanup is unconditional: both the GLib signal path and the
-Python pre-dispatch fallback unwind through `stop()`. A contributing generation
-is therefore unlinked at the known mixer boundary and closed `complete` with
-termination reason `clean_shutdown`; it is never converted to
-`process_interrupted` merely because the Python fallback delivered the orderly
-signal. If that occurrence auto-resumes and later reaches terminal EOS, the
-parent becomes `complete`, receives the EOS terminal `ended_at`, and aggregates
-the two complete segments while excluding the restart gap. If startup finds no
-valid continuation, the existing reconciliation rule instead finalizes the
-clean occurrence at its last known closed-segment boundary.
+GLib's Unix signal sources are the sole steady-state SIGTERM/SIGINT authority.
+They are registered before startup can construct a contributing deck, so a
+signal received before `loop.run()` remains pending for safe main-context
+dispatch. No Python `signal.signal()` handler competes for those signals or
+raises an asynchronous exception inside an arbitrary GLib callback. The GLib
+handler idempotently requests loop exit; the current callback returns, the loop
+unwinds, and `stop()` runs exactly once.
+
+That orderly path unlinks a contributing generation at the known mixer
+boundary and closes it `complete` with termination reason `clean_shutdown`. If
+the occurrence auto-resumes and later reaches terminal EOS, the parent becomes
+`complete`, receives the EOS terminal `ended_at`, and aggregates the complete
+segments while excluding the restart gap. If startup finds no valid
+continuation, the existing reconciliation rule instead finalizes the clean
+occurrence at its last known closed-segment boundary.
 
 The hint is considered resumable only when the exact Track + LogItem is still
 present in the loaded/forced startup queue; a stale hint for a regenerated or

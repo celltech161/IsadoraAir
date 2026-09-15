@@ -1072,6 +1072,8 @@ class PlaybackEngine:
         self._live_fill_in_progress = False  # guarded by self._lock -- see _try_extend_live_log_async
         self._live_fill_generation = 0  # guarded by self._lock -- bumped on every dispatch, see _try_extend_live_log_async
         self.running = False
+        self._orderly_shutdown_requested = False
+        self._stop_started = False
         self._position_timer = None
         self._lock = threading.RLock()
         self._building_hours = set()  # {(date, hour)} currently being async-built -- guarded by self._lock
@@ -1084,6 +1086,26 @@ class PlaybackEngine:
 
     def start(self):
         self.running = True
+        self._orderly_shutdown_requested = False
+        self._stop_started = False
+
+        # GLib owns normal SIGTERM/SIGINT delivery for the entire interval in
+        # which startup can construct a contributing deck. Signals received
+        # before loop.run() remain pending on the main context and are handled
+        # there once it starts dispatching. Do not install Python handlers for
+        # these same signals: an exception raised from one can interrupt any
+        # Python bytecode currently running inside a GLib callback, and
+        # installing one after unix_signal_add() replaces the disposition on
+        # this platform rather than providing an independent fallback.
+        self._signal_source_ids = (
+            GLib.unix_signal_add(
+                GLib.PRIORITY_HIGH, signal.SIGTERM, self._handle_signal_glib
+            ),
+            GLib.unix_signal_add(
+                GLib.PRIORITY_HIGH, signal.SIGINT, self._handle_signal_glib
+            ),
+        )
+
         # Bookmark from previous instance MUST be read BEFORE the first
         # _create_deck call (via _start_next_track), otherwise the deck
         # gets built without the auto-resume seek and only a subsequent
@@ -1147,35 +1169,23 @@ class PlaybackEngine:
             self._remote_dj_server.start()
 
         try:
-            GLib.unix_signal_add(
-                GLib.PRIORITY_HIGH, signal.SIGTERM, self._handle_signal_glib
-            )
-            GLib.unix_signal_add(
-                GLib.PRIORITY_HIGH, signal.SIGINT, self._handle_signal_glib
-            )
-
-            # Also set a Python-level fallback for signals delivered before
-            # GLib dispatches its source. SystemExit still unwinds through the
-            # finally block below, so an orderly signal cannot bypass the
-            # known mixer-unlink/segment-close boundary in stop().
-            def _force_quit(signum, frame):
-                print("\nForce quit.")
-                self.running = False
-                try:
-                    self.loop.quit()
-                except Exception:
-                    pass
-                raise SystemExit(0)
-
-            signal.signal(signal.SIGTERM, _force_quit)
-            signal.signal(signal.SIGINT, _force_quit)
-
             print("Engine started.")
             self.loop.run()
         finally:
             self.stop()
 
     def stop(self):
+        lock = getattr(self, "_lock", None)
+        if lock is None:
+            if getattr(self, "_stop_started", False):
+                return
+            self._stop_started = True
+        else:
+            with lock:
+                if getattr(self, "_stop_started", False):
+                    return
+                self._stop_started = True
+
         self.running = False
         # Preserve occurrence identity/position before detach clears the deck
         # map. The subsequent clean segment close excludes all service
@@ -1212,9 +1222,16 @@ class PlaybackEngine:
         print("Engine stopped.")
 
     def _handle_signal_glib(self):
-        print("Shutting down...")
-        self.loop.quit()
+        self._request_orderly_shutdown("signal")
         return GLib.SOURCE_REMOVE
+
+    def _request_orderly_shutdown(self, reason):
+        """Request one clean exit from a safe GLib main-context boundary."""
+        if getattr(self, "_orderly_shutdown_requested", False):
+            return
+        self._orderly_shutdown_requested = True
+        print(f"Shutting down... ({reason})")
+        self.loop.quit()
 
     def _resolve_studio_monitor_device(self):
         try:

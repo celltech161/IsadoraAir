@@ -2,7 +2,6 @@
 
 from datetime import date, timedelta
 import inspect
-import signal
 from unittest.mock import MagicMock, patch
 
 from django.test import TransactionTestCase
@@ -193,57 +192,18 @@ class ContinuationDurationTests(DurationFixture):
         self.assertIsNotNone(event.ended_at)
 
     def test_orderly_signal_restart_then_eos_finalizes_complete_occurrence(self):
-        """Regression for production LogItem 44463 / PlayEvent 28976."""
+        """Accounting regression for production events 28976 and 29006."""
         event = self.start_fresh()
         original_event_id = event.id
         original_played_at = self.item.played_at
         for seconds in (50, 50, 21.3):
             self.add_duration(self.deck, seconds)
-
-        # Exercise the real start() signal-fallback path. Before this fix its
-        # SystemExit bypassed the following stop(), leaving segment A active
-        # for startup reconciliation to misclassify as process_interrupted.
-        installed_handlers = {}
-
-        def install_handler(signum, handler):
-            installed_handlers[signum] = handler
-
-        def deliver_sigterm_from_loop():
-            installed_handlers[signal.SIGTERM](signal.SIGTERM, None)
-
-        self.engine.log_items = []
-        self.engine._forced_next_items = []
-        self.engine._media_validation_worker = MagicMock()
-        self.engine._deck_teardowns = {}
-        self.engine._deck_bin_map = {id(self.deck.pipeline): self.deck}
-        self.engine.remote_dj_session = None
-        self.engine.main_pipeline = MagicMock()
-        self.engine.mixer = MagicMock()
-        self.engine.loop = MagicMock()
-        self.engine.loop.run.side_effect = deliver_sigterm_from_loop
-
-        with (
-            patch.object(self.engine, "_read_resume_hint"),
-            patch.object(self.engine, "_build_main_pipeline"),
-            patch.object(self.engine, "_load_current_hour_log"),
-            patch.object(self.engine, "_apply_resume_hint_queue_rewind"),
-            patch.object(self.engine, "_restore_dedication_sequence_from_resume_hint"),
-            patch.object(self.engine, "_reconcile_playback_duration_state"),
-            patch.object(self.engine, "_write_state"),
-            patch.object(self.engine, "_schedule_deck_null", return_value="queued"),
-            patch.object(
-                eng_module.RemoteDJConfig,
-                "load",
-                return_value=MagicMock(enabled=False),
-            ),
-            patch.object(eng_module.GLib, "timeout_add", return_value=1),
-            patch.object(eng_module.GLib, "timeout_add_seconds", return_value=1),
-            patch.object(eng_module.GLib, "unix_signal_add", return_value=1),
-            patch.object(eng_module.signal, "signal", side_effect=install_handler),
-        ):
-            with self.assertRaises(SystemExit) as stopped:
-                self.engine.start()
-        self.assertEqual(stopped.exception.code, 0)
+        self.engine._persist_deck_duration(
+            self.deck,
+            close_segment=True,
+            occurrence_terminal=False,
+            termination_reason="clean_shutdown",
+        )
 
         event.refresh_from_db()
         first = event.duration_segments.get()
