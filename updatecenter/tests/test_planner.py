@@ -1094,3 +1094,81 @@ class R0052ToR0054RecoveryPlanTests(TestCase):
             )
             self.assertEqual(plan.migrations.compatibility, "additive")
             self.assertIn("isadoraair-gunicorn", plan.services_requiring_restart)
+
+
+class R0075ToR0077RecoveryPlanTests(TestCase):
+    """Prove the published-r0076 correction aggregates without duplication."""
+
+    REAL_RELEASES_DIR = Path(__file__).resolve().parents[2] / "deploy" / "releases"
+
+    def _real_manifest(self, release_id):
+        return json.loads(
+            (self.REAL_RELEASES_DIR / f"{release_id}.json").read_text(
+                encoding="utf-8"
+            )
+        )
+
+    def test_station_on_r0075_derives_exact_r0076_r0077_plan(self):
+        real_r0076 = self._real_manifest("r0076")
+        real_r0077 = self._real_manifest("r0077")
+        self.assertEqual(real_r0076["previous_release_id"], "r0075")
+        self.assertEqual(real_r0077["previous_release_id"], "r0076")
+        self.assertEqual(real_r0077["migrations_required"], [])
+        self.assertEqual(real_r0077["services_requiring_restart"], [])
+
+        # This three-release fixture begins at r0075, so its minimum-supported
+        # ids must refer to that synthetic bootstrap. All operational action
+        # fields remain exactly those from the real r0076/r0077 manifests.
+        real_r0076["minimum_supported_release_id"] = "r0075"
+        real_r0077["minimum_supported_release_id"] = "r0075"
+
+        with FakeRepo() as repo:
+            releases_dir = repo.work / "deploy" / "releases"
+            bootstrap_sha = repo.rev_parse("HEAD")
+            _write_manifest(
+                releases_dir,
+                _bootstrap(bootstrap_sha, release_id="r0075"),
+            )
+            repo.commit("r0075 accepted production baseline", push=True)
+
+            _write_manifest(releases_dir, real_r0076)
+            repo.write(
+                "library/migrations/0082_logitem_playback_claim_and_playevent_occurrence.py",
+                "# planner fixture; the real migration is tested separately\n",
+            )
+            repo.write(
+                "library/migrations/0083_playevent_duration_segments.py",
+                "# rejected r0076 shape\n",
+            )
+            repo.commit("r0076 published but rejected before mutation", push=True)
+
+            _write_manifest(releases_dir, real_r0077)
+            repo.write(
+                "library/migrations/0083_playevent_duration_segments.py",
+                "# corrected r0077 target-source shape\n",
+            )
+            repo.commit("r0077 corrective target", push=True)
+            target_sha = repo.rev_parse("HEAD")
+            repo.reset_local_to(bootstrap_sha)
+
+            plan = planner.build_plan(repo.work, "deploy/releases")
+
+            self.assertEqual(plan.safety_status, planner.SafetyStatus.READY_TO_PLAN)
+            self.assertEqual(plan.installed_release_id, "r0075")
+            self.assertEqual(plan.installed_commit, bootstrap_sha)
+            self.assertEqual(plan.releases_in_plan, ("r0076", "r0077"))
+            self.assertEqual(plan.target_release_id, "r0077")
+            self.assertEqual(plan.target_commit, target_sha)
+            self.assertEqual(
+                plan.migrations.explicitly_required,
+                (
+                    "library.0082_logitem_playback_claim_and_playevent_occurrence",
+                    "library.0083_playevent_duration_segments",
+                ),
+            )
+            self.assertEqual(plan.migrations.compatibility, "additive")
+            self.assertEqual(
+                plan.services_requiring_restart,
+                ("isadoraair-gunicorn", "isadoraair-engine"),
+            )
+            self.assertFalse(plan.runtime_components_changed)

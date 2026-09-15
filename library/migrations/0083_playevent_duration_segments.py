@@ -21,7 +21,6 @@ class Migration(migrations.Migration):
                     ("complete", "Terminal, complete evidence"),
                     ("interrupted", "Contains an uncertain interruption tail"),
                 ],
-                db_index=True,
                 default="legacy",
                 max_length=16,
             ),

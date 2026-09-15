@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "release_id": "r0077",
+  "previous_release_id": "r0076",
+  "minimum_updater_protocol_version": 5,
+  "summary": "Corrects library.0083 for protected-updater compatibility after r0076 was rejected before DDL. The duration evidence state remains non-null with the legacy default and Phase C semantics unchanged; only its unnecessary standalone index is removed. r0076 continues to supply the aggregated migration and service-restart actions.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0007"
+}

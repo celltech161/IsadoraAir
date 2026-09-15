@@ -311,6 +311,60 @@ class ActualR0056WebRequestsMigrationClassificationTests(SimpleTestCase):
         )
 
 
+class ActualR0077DurationEvidenceMigrationClassificationTests(SimpleTestCase):
+    """The corrected target-tree 0083 must remain automatically deployable.
+
+    r0076's protected updater rejected the actual AddField because its
+    single-column index made the operation manual. Production never executed
+    the migration, so r0077 corrects the same target migration in place.
+    Loading the real migration guards that exact release path rather than a
+    synthetic lookalike field.
+    """
+
+    def test_every_actual_library_0083_operation_is_additive(self):
+        loader = MigrationLoader(None)
+        migration_key = ("library", "0083_playevent_duration_segments")
+        migration = loader.disk_migrations[migration_key]
+        state = loader.project_state(
+            [("library", "0082_logitem_playback_claim_and_playevent_occurrence")]
+        )
+        classifications = []
+
+        for operation in migration.operations:
+            operation.state_forwards("library", state)
+            classifications.append(
+                _classify_operation(
+                    operation,
+                    app_label="library",
+                    before_state=None,
+                    after_state=state,
+                )
+            )
+
+        self.assertEqual(
+            [item["operation"] for item in classifications],
+            ["AddField", "CreateModel"],
+        )
+        self.assertNotIn(
+            "manual", {item["classification"] for item in classifications}
+        )
+        self.assertEqual(
+            classifications,
+            [
+                {
+                    "operation": "AddField",
+                    "classification": "additive",
+                    "detail": "non-null field with explicit simple literal default",
+                },
+                {
+                    "operation": "CreateModel",
+                    "classification": "additive",
+                    "detail": "new table/model",
+                },
+            ],
+        )
+
+
 class ActualMonitoringWeatherKindMigrationClassificationTests(SimpleTestCase):
     """r0057 (Pass G) adds a new 'weather' choice to MonitorCheck.kind's
     KIND_CHOICES -- Django generates an AlterField for this (choices is

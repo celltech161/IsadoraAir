@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from django.db import connection
 from django.db.migrations.executor import MigrationExecutor
 from django.test import SimpleTestCase, TestCase, TransactionTestCase
+from django.utils import timezone
 
 from .phase_b_helpers import PROJECT_ROOT, config_dict
 from isadoraair_updater.checkpoint import create_checkpoint, verify_checkpoint
@@ -185,6 +186,105 @@ class R0011ProspectiveR0012TargetSchemaTests(TransactionTestCase):
         finally:
             # A failed assertion must not leave the shared test database at an
             # old schema for later test classes.
+            MigrationExecutor(connection).migrate(latest_targets)
+
+
+class R0075ProspectiveR0077TargetSchemaTests(TransactionTestCase):
+    """Exercise the exact protected r0075-to-r0077 schema transition."""
+
+    pending_migration_refs = (
+        "library.0082_logitem_playback_claim_and_playevent_occurrence",
+        "library.0083_playevent_duration_segments",
+    )
+
+    def test_corrected_target_probe_and_real_postgres_migration(self):
+        executor = MigrationExecutor(connection)
+        latest_targets = executor.loader.graph.leaf_nodes()
+        r0075_targets = [
+            ("library", "0081_remotedjconfig_reconnect_grace_seconds")
+            if app_label == "library"
+            else (app_label, migration_name)
+            for app_label, migration_name in latest_targets
+        ]
+
+        try:
+            executor.migrate(r0075_targets)
+            r0075_executor = MigrationExecutor(connection)
+            historical_apps = r0075_executor.loader.project_state(
+                r0075_targets
+            ).apps
+            HistoricalPlayEvent = historical_apps.get_model("library", "PlayEvent")
+            historical = HistoricalPlayEvent.objects.create(started_at=timezone.now())
+
+            target_payload = _strict_probe(
+                json.dumps(build_probe_payload()).encode("utf-8")
+            )
+            self.assertEqual(
+                tuple(item["ref"] for item in target_payload["plan"]),
+                self.pending_migration_refs,
+            )
+            for migration in target_payload["plan"]:
+                for operation in migration["operations"]:
+                    self.assertEqual(
+                        operation["classification"],
+                        "additive",
+                        f"{migration['ref']} is not automatically executable: {operation}",
+                    )
+
+            migration_0083 = target_payload["plan"][1]
+            self.assertEqual(
+                [item["operation"] for item in migration_0083["operations"]],
+                ["AddField", "CreateModel"],
+            )
+            self.assertEqual(
+                migration_0083["operations"][0]["detail"],
+                "non-null field with explicit simple literal default",
+            )
+
+            plan = SimpleNamespace(
+                installed_release_id="r0075",
+                target_release_id="r0077",
+                releases_in_plan=("r0076", "r0077"),
+                migrations_required=self.pending_migration_refs,
+                migration_compatibility="additive",
+            )
+            validator = object.__new__(Executor)
+            actual = validator._validate_target_schema(
+                plan,
+                target_payload,
+                {"applied": target_payload["applied"]},
+                migration_already_started=False,
+            )
+            self.assertEqual(actual, self.pending_migration_refs)
+
+            MigrationExecutor(connection).migrate(latest_targets)
+
+            from library.models import PlayEvent, PlayEventSegment
+
+            migrated = PlayEvent.objects.get(pk=historical.pk)
+            self.assertEqual(migrated.duration_evidence_state, "legacy")
+            self.assertFalse(
+                PlayEventSegment.objects.filter(play_event=migrated).exists()
+            )
+            self.assertFalse(
+                PlayEvent._meta.get_field("duration_evidence_state").db_index
+            )
+            with connection.cursor() as cursor:
+                constraints = connection.introspection.get_constraints(
+                    cursor, PlayEvent._meta.db_table
+                )
+            standalone_indexes = [
+                name
+                for name, details in constraints.items()
+                if details.get("index")
+                and details.get("columns") == ["duration_evidence_state"]
+            ]
+            self.assertEqual(standalone_indexes, [])
+            self.assertEqual(
+                PlayEventSegment._meta.get_field("generation_id").unique,
+                True,
+            )
+        finally:
             MigrationExecutor(connection).migrate(latest_targets)
 
 

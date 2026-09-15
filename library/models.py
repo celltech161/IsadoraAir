@@ -1601,7 +1601,6 @@ class PlayEvent(models.Model):
         max_length=16,
         choices=DURATION_EVIDENCE_CHOICES,
         default="legacy",
-        db_index=True,
     )
 
     class Meta:
