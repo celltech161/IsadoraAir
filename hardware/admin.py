@@ -14,10 +14,190 @@ from .devices import (
 )
 from .models import AudioInput, AudioOutput, AudioPipeline, DuckingConfig, RemoteDJAudioInput
 from monitoring.models import emit_event
+from monitoring.services.config_audit import emit_config_change_event
 from updatecenter.backend_client import BackendError, UpdaterClient
 
 # Must match engine.py's STUDIO_MONITOR_NAME.
 STUDIO_MONITOR_NAME = "Studio Monitor"
+
+_PIPELINE_AUDIT_FIELDS = (
+    "sample_rate",
+    "program_gain_db",
+    "ducking_enabled",
+    "duck_level_db",
+    "remote_dj_gain_db",
+)
+_PIPELINE_APPLY_MODES = {
+    "sample_rate": "engine_restart_required",
+    "program_gain_db": "engine_restart_required",
+    "ducking_enabled": "next_ptt_transition",
+    "duck_level_db": "next_ptt_transition",
+    "remote_dj_gain_db": "next_remote_dj_session",
+}
+_AUDIO_INPUT_AUDIT_FIELDS = (
+    "name",
+    "device",
+    "device_identity_kind",
+    "device_identity",
+    "gain_db",
+)
+_AUDIO_OUTPUT_AUDIT_FIELDS = (
+    "name",
+    "device",
+    "device_identity_kind",
+    "device_identity",
+)
+_STUDIO_MONITOR_AGC_AUDIT_FIELDS = (
+    "agc_enabled",
+    "agc_ratio",
+    "agc_threshold",
+    "agc_soft_knee",
+    "agc_makeup_gain_db",
+)
+_SAFE_MIXER_VALUE_TYPES = (bool, int, float, str, type(None))
+
+
+def _persisted_audio_snapshot(model, obj, fields):
+    """Read the exact pre-save values for one explicitly audited model."""
+
+    if not getattr(obj, "pk", None):
+        return None
+    row = model.objects.filter(pk=obj.pk).values(
+        "pk", *fields, "mixer_control_values"
+    ).first()
+    return dict(row) if row is not None else None
+
+
+def _current_audio_snapshot(obj, fields):
+    snapshot = {"pk": obj.pk}
+    snapshot.update({field: getattr(obj, field) for field in fields})
+    snapshot["mixer_control_values"] = dict(obj.mixer_control_values or {})
+    return snapshot
+
+
+def _safe_audio_changes(before, after, fields):
+    """Return compact safe scalar and per-control mixer differences."""
+
+    changed_fields = []
+    changes = {}
+    redacted_fields = []
+    for field in fields:
+        old = before.get(field) if before is not None else None
+        new = after.get(field) if after is not None else None
+        if before is not None and after is not None and old == new:
+            continue
+        changed_fields.append(field)
+        changes[field] = {"old": old, "new": new}
+
+    old_mixer = (before or {}).get("mixer_control_values") or {}
+    new_mixer = (after or {}).get("mixer_control_values") or {}
+    for control_id in sorted(set(old_mixer) | set(new_mixer)):
+        old = old_mixer.get(control_id)
+        new = new_mixer.get(control_id)
+        if before is not None and after is not None and old == new:
+            continue
+        field = f"mixer_control_values.{control_id}"
+        changed_fields.append(field)
+        if isinstance(old, _SAFE_MIXER_VALUE_TYPES) and isinstance(
+            new, _SAFE_MIXER_VALUE_TYPES
+        ):
+            changes[field] = {"old": old, "new": new}
+        else:
+            # Admin-generated controls are scalar.  If legacy/corrupt JSON is
+            # unexpectedly structured, retain the field name but never dump it.
+            redacted_fields.append(field)
+    return changed_fields, changes, redacted_fields
+
+
+def _input_apply_modes(action, changed_fields):
+    return {
+        field: (
+            "no_hardware_reversal_on_delete"
+            if action == "delete" and field.startswith("mixer_control_values.")
+            else "immediate_hardware_apply_attempted"
+            if field.startswith("mixer_control_values.")
+            else "engine_restart_required"
+        )
+        for field in changed_fields
+    }
+
+
+def _output_apply_modes(action, before, after, changed_fields):
+    old_name = (before or {}).get("name")
+    new_name = (after or {}).get("name")
+    studio_monitor = STUDIO_MONITOR_NAME in {old_name, new_name}
+    modes = {}
+    for field in changed_fields:
+        if field.startswith("mixer_control_values."):
+            modes[field] = (
+                "no_hardware_reversal_on_delete"
+                if action == "delete"
+                else "immediate_hardware_apply_attempted"
+            )
+        elif action == "delete" or field == "name":
+            modes[field] = "engine_restart_required"
+        elif field == "device":
+            modes[field] = (
+                "live_output_reload_requested"
+                if studio_monitor
+                else "engine_restart_required"
+            )
+        elif field in {"device_identity_kind", "device_identity"}:
+            modes[field] = "live_recovery_config_refresh_requested"
+        elif field in _STUDIO_MONITOR_AGC_AUDIT_FIELDS:
+            modes[field] = "live_output_reload_requested"
+        else:
+            modes[field] = "configuration_persisted"
+    return modes
+
+
+def _audit_audio_device_change(*, request, action, object_type, before, after):
+    """Emit one explicit Admin-transaction audit for an input or output."""
+
+    is_input = object_type == "hardware.AudioInput"
+    fields = _AUDIO_INPUT_AUDIT_FIELDS if is_input else _AUDIO_OUTPUT_AUDIT_FIELDS
+    names = {(before or {}).get("name"), (after or {}).get("name")}
+    if not is_input and STUDIO_MONITOR_NAME in names:
+        fields += _STUDIO_MONITOR_AGC_AUDIT_FIELDS
+    changed_fields, changes, redacted = _safe_audio_changes(before, after, fields)
+    if not changed_fields:
+        return
+
+    if is_input:
+        apply_modes = _input_apply_modes(action, changed_fields)
+        restart_required = any(
+            not field.startswith("mixer_control_values.")
+            for field in changed_fields
+        )
+        label = "Audio input"
+    else:
+        apply_modes = _output_apply_modes(action, before, after, changed_fields)
+        restart_required = any(
+            mode == "engine_restart_required" for mode in apply_modes.values()
+        )
+        label = "Audio output"
+
+    identity = after if after is not None else before
+    emit_config_change_event(
+        category="hardware",
+        title=f"{label} configuration {action}d",
+        action=action,
+        object_type=object_type,
+        object_id=(identity or {}).get("pk"),
+        object_name=(identity or {}).get("name"),
+        changed_fields=changed_fields,
+        changes=changes,
+        redacted_fields=redacted,
+        request=request,
+        apply_modes=apply_modes,
+        restart_required=restart_required,
+    )
+
+
+def _audio_snapshot_fields(model):
+    if model is AudioInput:
+        return _AUDIO_INPUT_AUDIT_FIELDS
+    return _AUDIO_OUTPUT_AUDIT_FIELDS + _STUDIO_MONITOR_AGC_AUDIT_FIELDS
 
 
 def _alsa_store(request=None):
@@ -342,6 +522,35 @@ class AudioPipelineAdmin(admin.ModelAdmin):
         )
 
     def save_model(self, request, obj, form, change):
+        old_pipeline = AudioPipeline.objects.filter(pk=obj.pk).values(
+            "sample_rate", "program_gain_db"
+        ).first() if obj.pk else None
+        old_ducking = DuckingConfig.objects.filter(pk=1).values(
+            "enabled", "duck_level_db"
+        ).first()
+        old_remote = RemoteDJAudioInput.objects.filter(pk=1).values("gain_db").first()
+        before = None
+        if old_pipeline is not None:
+            before = {
+                "sample_rate": old_pipeline["sample_rate"],
+                "program_gain_db": old_pipeline["program_gain_db"],
+                "ducking_enabled": (
+                    old_ducking["enabled"]
+                    if old_ducking is not None
+                    else DuckingConfig._meta.get_field("enabled").get_default()
+                ),
+                "duck_level_db": (
+                    old_ducking["duck_level_db"]
+                    if old_ducking is not None
+                    else DuckingConfig._meta.get_field("duck_level_db").get_default()
+                ),
+                "remote_dj_gain_db": (
+                    old_remote["gain_db"]
+                    if old_remote is not None
+                    else RemoteDJAudioInput._meta.get_field("gain_db").get_default()
+                ),
+            }
+
         super().save_model(request, obj, form, change)
         # Fold the extra fields onto their own singletons.
         ducking = DuckingConfig.load()
@@ -351,6 +560,43 @@ class AudioPipelineAdmin(admin.ModelAdmin):
         rdj = RemoteDJAudioInput.load()
         rdj.gain_db = form.cleaned_data["remote_dj_gain_db"]
         rdj.save()
+
+        after = {
+            "sample_rate": obj.sample_rate,
+            "program_gain_db": obj.program_gain_db,
+            "ducking_enabled": ducking.enabled,
+            "duck_level_db": ducking.duck_level_db,
+            "remote_dj_gain_db": rdj.gain_db,
+        }
+        changed_fields = []
+        changes = {}
+        for field in _PIPELINE_AUDIT_FIELDS:
+            old = before.get(field) if before is not None else None
+            new = after[field]
+            if before is not None and old == new:
+                continue
+            changed_fields.append(field)
+            changes[field] = {"old": old, "new": new}
+        if changed_fields:
+            emit_config_change_event(
+                category="hardware",
+                title="Audio pipeline configuration updated",
+                action="update",
+                object_type="hardware.AudioPipeline",
+                object_id=obj.pk,
+                object_name=str(obj),
+                changed_fields=changed_fields,
+                changes=changes,
+                redacted_fields=[],
+                request=request,
+                apply_modes={
+                    field: _PIPELINE_APPLY_MODES[field]
+                    for field in changed_fields
+                },
+                restart_required=bool(
+                    {"sample_rate", "program_gain_db"} & set(changed_fields)
+                ),
+            )
 
         # Only restart the engine if a field that actually requires it
         # changed -- Ducking is read live per PTT, Remote DJ gain per
@@ -398,6 +644,34 @@ class _DeviceFieldAdmin(admin.ModelAdmin):
     list_display = ["name", "device", "sort_order"]
     list_editable = ["sort_order"]
     ordering = ["sort_order", "name"]
+
+    def delete_model(self, request, obj):
+        fields = _audio_snapshot_fields(self.model)
+        before = _current_audio_snapshot(obj, fields)
+        super().delete_model(request, obj)
+        _audit_audio_device_change(
+            request=request,
+            action="delete",
+            object_type=f"hardware.{self.model.__name__}",
+            before=before,
+            after=None,
+        )
+
+    def delete_queryset(self, request, queryset):
+        # Django's default delete-selected action calls delete_queryset(), not
+        # delete_model().  Freeze one compact safe snapshot per selected row so
+        # bulk deletion cannot bypass the same audit contract.
+        fields = _audio_snapshot_fields(self.model)
+        snapshots = [_current_audio_snapshot(obj, fields) for obj in queryset]
+        super().delete_queryset(request, queryset)
+        for before in snapshots:
+            _audit_audio_device_change(
+                request=request,
+                action="delete",
+                object_type=f"hardware.{self.model.__name__}",
+                before=before,
+                after=None,
+            )
 
     def get_form(self, request, obj=None, **kwargs):
         form = super().get_form(request, obj, **kwargs)
@@ -515,6 +789,8 @@ class AudioOutputAdmin(_DeviceFieldAdmin):
         return form
 
     def save_model(self, request, obj, form, change):
+        fields = _audio_snapshot_fields(AudioOutput)
+        before = _persisted_audio_snapshot(AudioOutput, obj, fields) if change else None
         super().save_model(request, obj, form, change)
         # [P0] 1.3C integration-bug fix -- this used to ALSO write a
         # separate "reload_agc_config" command directly to
@@ -532,6 +808,13 @@ class AudioOutputAdmin(_DeviceFieldAdmin):
         # device swap + AGC together. Nothing to write here anymore.
         _apply_mixer_form_changes_for_effective_target(
             request, obj, form, "playback"
+        )
+        _audit_audio_device_change(
+            request=request,
+            action="update" if change else "create",
+            object_type="hardware.AudioOutput",
+            before=before,
+            after=_current_audio_snapshot(obj, fields),
         )
 
 
@@ -605,9 +888,18 @@ class AudioInputAdmin(_DeviceFieldAdmin):
         return form
 
     def save_model(self, request, obj, form, change):
+        fields = _audio_snapshot_fields(AudioInput)
+        before = _persisted_audio_snapshot(AudioInput, obj, fields) if change else None
         super().save_model(request, obj, form, change)
         _apply_mixer_form_changes_for_effective_target(
             request, obj, form, "capture"
+        )
+        _audit_audio_device_change(
+            request=request,
+            action="update" if change else "create",
+            object_type="hardware.AudioInput",
+            before=before,
+            after=_current_audio_snapshot(obj, fields),
         )
 
 
