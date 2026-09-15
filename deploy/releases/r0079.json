@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "release_id": "r0079",
+  "previous_release_id": "r0078",
+  "minimum_updater_protocol_version": 5,
+  "summary": "P2 1.6 signal-race closeout -- make GLib Unix signal sources the sole steady-state SIGTERM/SIGINT authority, register them before deck-building startup, and idempotently unwind through one orderly engine stop. This prevents Python signal exceptions from interrupting active GLib callbacks while preserving crash uncertainty and policy-restart exit semantics.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-engine"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0007"
+}
