@@ -8,10 +8,16 @@ from django.urls import path, reverse
 from django.utils.html import format_html, format_html_join
 
 from isadoraair import env_admin, env_config
+from monitoring.services.config_audit import emit_config_change_event
 
 from .diagnostics import get_weather_diagnostics
 from .forms import WeatherConfigForm
-from .models import AmberAlertConfig, WeatherConfig, WeatherVoicePersona
+from .models import (
+    AmberAlertConfig,
+    WeatherConfig,
+    WeatherVoicePersona,
+    normalize_alert_sound_trigger_events,
+)
 from .nws_discovery import NWSDiscoveryError, fetch_nws_point
 from .setup_status import render_setup_status
 from .voice_schedule import ScheduleError, expand_to_hours
@@ -21,6 +27,44 @@ _WEATHER_ENV_KEYS = ["WEATHER_DATA_DIR"]
 # write -- also the exact set validated via WeatherConfig.full_clean()
 # before that write (see nws_discovery_view).
 _NWS_APPLY_FIELDS = ["nws_forecast_office", "nws_forecast_grid_x", "nws_forecast_grid_y", "nws_alert_zone"]
+_WEATHER_CONFIG_AUDIT_FIELDS = (
+    "station_lat", "station_lon", "sun_alt_threshold_deg", "nws_alert_zone",
+    "nws_forecast_office", "nws_forecast_grid_x", "nws_forecast_grid_y",
+    "nws_cloud_stations", "voice_schedule", "notify_email",
+    "alert_sound_enabled", "alert_sound_cart",
+    "alert_sound_interval_seconds", "alert_sound_trigger_events",
+)
+_WEATHER_CONFIG_APPLY_MODES = {
+    "station_lat": "next_weather_ingest_cycle",
+    "station_lon": "next_weather_ingest_cycle",
+    "sun_alt_threshold_deg": "next_weather_ingest_cycle",
+    "nws_alert_zone": "next_weather_ingest_cycle",
+    "nws_forecast_office": "next_forecast_cycle",
+    "nws_forecast_grid_x": "next_forecast_cycle",
+    "nws_forecast_grid_y": "next_forecast_cycle",
+    "nws_cloud_stations": "next_weather_ingest_cycle",
+    "voice_schedule": "next_voice_schedule_evaluation",
+    "notify_email": "next_weather_notification_attempt",
+    "alert_sound_enabled": "next_alert_beep_evaluation",
+    "alert_sound_cart": "next_alert_beep_evaluation",
+    "alert_sound_interval_seconds": "next_alert_beep_evaluation",
+    # dump_weather_config exports this field, but the available ingest
+    # consumer still uses its legacy hard-coded list. Do not claim adoption.
+    "alert_sound_trigger_events": "runtime_adoption_not_confirmed",
+}
+_WEATHER_PRIVATE_AUDIT_FIELDS = frozenset({"notify_email"})
+
+_AMBER_CONFIG_AUDIT_FIELDS = (
+    "enabled", "ipaws_base_url", "event_codes", "same_codes",
+    "poll_cadence_minutes", "include_instruction_in_forecast",
+)
+_AMBER_CONFIG_APPLY_MODES = {
+    field: "next_amber_alert_poll" for field in _AMBER_CONFIG_AUDIT_FIELDS
+}
+_AMBER_PRIVATE_AUDIT_FIELDS = frozenset({"ipaws_base_url"})
+
+_ALERT_EVENT_AUDIT_MAX_ITEMS = 20
+_ALERT_EVENT_AUDIT_MAX_LENGTH = 120
 # r0050: proves weather.diagnostics is genuinely reusable -- this page no
 # longer maintains its own separate hardcoded file-presence list, it
 # reads the same facts the weather_diagnostics management command does.
@@ -29,6 +73,216 @@ _WEATHER_DIAGNOSTIC_FILE_KEYS = [
     "weather_data_file:wind_history.json",
     "weather_data_file:smoothed_wind.json",
 ]
+
+
+def _normalized_weather_alert_events(raw):
+    """Return the effective case-insensitive event-name set when valid."""
+
+    events = normalize_alert_sound_trigger_events(raw)
+    if not isinstance(events, list) or not all(
+        isinstance(event, str) for event in events
+    ):
+        return None
+    unique = {}
+    for event in events:
+        event = event.strip()
+        if not event:
+            continue
+        key = event.casefold()
+        # Case variants are runtime-equivalent. Choose a deterministic display
+        # spelling so duplicates cannot inflate the retained summary.
+        unique[key] = min(event, unique.get(key, event))
+    return [unique[key] for key in sorted(unique)]
+
+
+def _weather_alert_event_audit_summary(raw):
+    """Bound the unbounded JSON field without retaining arbitrary JSON."""
+
+    events = _normalized_weather_alert_events(raw)
+    if events is None:
+        return {
+            "count": None,
+            "events": [],
+            "truncated": True,
+            "representation": "invalid_non_string_list_omitted",
+        }
+    retained = [
+        event[:_ALERT_EVENT_AUDIT_MAX_LENGTH]
+        for event in events[:_ALERT_EVENT_AUDIT_MAX_ITEMS]
+    ]
+    return {
+        "count": len(events),
+        "events": retained,
+        "truncated": (
+            len(events) > _ALERT_EVENT_AUDIT_MAX_ITEMS
+            or any(len(event) > _ALERT_EVENT_AUDIT_MAX_LENGTH for event in events)
+        ),
+    }
+
+
+def _voice_schedule_audit_value(raw):
+    """Retain only the bounded validated schedule shape used by the form."""
+
+    if (
+        isinstance(raw, list)
+        and len(raw) <= 24
+        and all(
+            isinstance(entry, (list, tuple))
+            and len(entry) == 3
+            and isinstance(entry[0], str)
+            and len(entry[0]) <= 64
+            and isinstance(entry[1], int)
+            and isinstance(entry[2], int)
+            for entry in raw
+        )
+    ):
+        return [list(entry) for entry in raw]
+    return {
+        "entry_count": len(raw) if isinstance(raw, list) else None,
+        "representation": "invalid_or_unbounded_schedule_omitted",
+    }
+
+
+def _weather_config_snapshot_values(obj, fields):
+    comparison = {}
+    audit = {}
+    for field in fields:
+        if field == "alert_sound_cart":
+            comparison[field] = obj.alert_sound_cart_id
+            audit[field] = {
+                "id": obj.alert_sound_cart_id,
+                "name": obj.alert_sound_cart.name if obj.alert_sound_cart_id else None,
+            }
+        elif field == "alert_sound_trigger_events":
+            normalized = _normalized_weather_alert_events(
+                obj.alert_sound_trigger_events
+            )
+            comparison[field] = (
+                ("valid", tuple(event.casefold() for event in normalized))
+                if normalized is not None
+                else ("invalid", obj.alert_sound_trigger_events)
+            )
+            audit[field] = _weather_alert_event_audit_summary(
+                obj.alert_sound_trigger_events
+            )
+        elif field == "voice_schedule":
+            comparison[field] = obj.voice_schedule
+            audit[field] = _voice_schedule_audit_value(obj.voice_schedule)
+        elif field == "nws_cloud_stations":
+            stations = [
+                station.strip()
+                for station in obj.nws_cloud_stations.split(",")
+                if station.strip()
+            ]
+            comparison[field] = stations
+            audit[field] = stations
+        elif field == "notify_email":
+            comparison[field] = obj.notify_email
+            audit[field] = None
+        else:
+            comparison[field] = getattr(obj, field)
+            audit[field] = getattr(obj, field)
+    return comparison, audit
+
+
+def _weather_config_snapshot(obj, fields=_WEATHER_CONFIG_AUDIT_FIELDS):
+    comparison, audit = _weather_config_snapshot_values(obj, fields)
+    return {"pk": obj.pk, "comparison": comparison, "audit": audit}
+
+
+def _persisted_weather_config_snapshot(
+    obj, fields=_WEATHER_CONFIG_AUDIT_FIELDS
+):
+    if not getattr(obj, "pk", None):
+        return None
+    persisted = WeatherConfig.objects.select_related("alert_sound_cart").filter(
+        pk=obj.pk
+    ).first()
+    return _weather_config_snapshot(persisted, fields) if persisted else None
+
+
+def _normalized_code_list(raw, *, uppercase):
+    codes = {
+        code.strip().upper() if uppercase else code.strip()
+        for code in (raw or "").split(",")
+        if code.strip()
+    }
+    return sorted(codes)
+
+
+def _amber_config_snapshot(obj):
+    event_codes = _normalized_code_list(obj.event_codes, uppercase=True)
+    same_codes = _normalized_code_list(obj.same_codes, uppercase=False)
+    return {
+        "pk": obj.pk,
+        "comparison": {
+            "enabled": obj.enabled,
+            "ipaws_base_url": obj.ipaws_base_url,
+            "event_codes": event_codes,
+            "same_codes": same_codes,
+            "poll_cadence_minutes": obj.poll_cadence_minutes,
+            "include_instruction_in_forecast": obj.include_instruction_in_forecast,
+        },
+        "audit": {
+            "enabled": obj.enabled,
+            "ipaws_base_url": None,
+            "event_codes": {"count": len(event_codes), "codes": event_codes},
+            "same_codes": {"count": len(same_codes), "codes": same_codes},
+            "poll_cadence_minutes": obj.poll_cadence_minutes,
+            "include_instruction_in_forecast": obj.include_instruction_in_forecast,
+        },
+    }
+
+
+def _persisted_amber_config_snapshot(obj):
+    if not getattr(obj, "pk", None):
+        return None
+    persisted = AmberAlertConfig.objects.filter(pk=obj.pk).first()
+    return _amber_config_snapshot(persisted) if persisted else None
+
+
+def _audit_weather_config_change(
+    *, request, action, before, after, fields, title, object_type,
+    object_name, apply_modes, private_fields=(), change_source="django_admin",
+):
+    old_comparison = (before or {}).get("comparison", {})
+    new_comparison = after["comparison"]
+    changed_fields = (
+        list(fields)
+        if before is None
+        else [
+            field
+            for field in fields
+            if old_comparison[field] != new_comparison[field]
+        ]
+    )
+    if not changed_fields:
+        return
+
+    private = frozenset(private_fields)
+    changes = {
+        field: {
+            "old": before["audit"][field] if before is not None else None,
+            "new": after["audit"][field],
+        }
+        for field in changed_fields
+        if field not in private
+    }
+    emit_config_change_event(
+        category="weather",
+        title=title,
+        action=action,
+        object_type=object_type,
+        object_id=after["pk"],
+        object_name=object_name,
+        changed_fields=changed_fields,
+        changes=changes,
+        redacted_fields=[field for field in changed_fields if field in private],
+        request=request,
+        change_source=change_source,
+        apply_modes={field: apply_modes[field] for field in changed_fields},
+        restart_required=False,
+    )
 
 
 def _weather_schedule_reference_status():
@@ -209,6 +463,22 @@ class WeatherConfigAdmin(admin.ModelAdmin):
             reverse("admin:weather_weatherconfig_change", args=[obj.pk])
         )
 
+    def save_model(self, request, obj, form, change):
+        before = _persisted_weather_config_snapshot(obj) if change else None
+        super().save_model(request, obj, form, change)
+        _audit_weather_config_change(
+            request=request,
+            action="update" if change else "create",
+            before=before,
+            after=_weather_config_snapshot(obj),
+            fields=_WEATHER_CONFIG_AUDIT_FIELDS,
+            title="Weather configuration updated",
+            object_type="weather.WeatherConfig",
+            object_name="Weather Configuration",
+            apply_modes=_WEATHER_CONFIG_APPLY_MODES,
+            private_fields=_WEATHER_PRIVATE_AUDIT_FIELDS,
+        )
+
     @admin.display(description="")
     def setup_status(self, obj):
         """Pass C: the whole panel is rendered by weather.setup_status
@@ -375,6 +645,9 @@ class WeatherConfigAdmin(admin.ModelAdmin):
                 # save would, not bypass it. full_clean() converts an
                 # overlong/malformed value into a caught
                 # ValidationError instead of a DB-level exception.
+                before = _persisted_weather_config_snapshot(
+                    obj, fields=_NWS_APPLY_FIELDS
+                )
                 office = (request.POST.get("grid_id") or "").strip()
                 county_ugc = (request.POST.get("county_ugc") or "").strip()
                 try:
@@ -416,6 +689,18 @@ class WeatherConfigAdmin(admin.ModelAdmin):
                     return HttpResponseRedirect(discovery_url)
 
                 obj.save(update_fields=_NWS_APPLY_FIELDS)
+                _audit_weather_config_change(
+                    request=request,
+                    action="update",
+                    before=before,
+                    after=_weather_config_snapshot(obj, fields=_NWS_APPLY_FIELDS),
+                    fields=_NWS_APPLY_FIELDS,
+                    title="Weather NWS configuration updated",
+                    object_type="weather.WeatherConfig",
+                    object_name="Weather Configuration",
+                    apply_modes=_WEATHER_CONFIG_APPLY_MODES,
+                    change_source="weather_nws_discovery_apply",
+                )
                 self.message_user(
                     request,
                     f"Applied discovered NWS values: office {office}, grid {grid_x},{grid_y}, "
@@ -545,4 +830,20 @@ class AmberAlertConfigAdmin(admin.ModelAdmin):
         obj = AmberAlertConfig.load()
         return HttpResponseRedirect(
             reverse("admin:weather_amberalertconfig_change", args=[obj.pk])
+        )
+
+    def save_model(self, request, obj, form, change):
+        before = _persisted_amber_config_snapshot(obj) if change else None
+        super().save_model(request, obj, form, change)
+        _audit_weather_config_change(
+            request=request,
+            action="update" if change else "create",
+            before=before,
+            after=_amber_config_snapshot(obj),
+            fields=_AMBER_CONFIG_AUDIT_FIELDS,
+            title="AMBER alert configuration updated",
+            object_type="weather.AmberAlertConfig",
+            object_name="AMBER Alert Configuration",
+            apply_modes=_AMBER_CONFIG_APPLY_MODES,
+            private_fields=_AMBER_PRIVATE_AUDIT_FIELDS,
         )
