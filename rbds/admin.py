@@ -9,6 +9,7 @@ from django.utils.html import format_html, format_html_join
 from .models import RBDSConfig, RBDSMessage, RBDSPSFrame
 from .services import dynamic_ps
 from monitoring.models import emit_event
+from monitoring.services.config_audit import emit_config_change_event
 from updatecenter.backend_client import BackendError, UpdaterClient
 
 # Same path RBDSManager's own NOW_PLAYING_PATH points at (rbds_manager.py,
@@ -21,6 +22,92 @@ from updatecenter.backend_client import BackendError, UpdaterClient
 # preview intentionally does NOT reuse RBDSManager's last-good-value
 # caching either.
 _NOW_PLAYING_PATH = Path("/run/isadoraair/now_playing.json")
+
+
+# Explicit safe-value allowlist for the singleton's operator-editable
+# configuration. RBDSPSFrame and RBDSMessage are deliberately separate live
+# content records and are not part of this audit boundary.
+_RBDS_CONFIG_AUDIT_FIELDS = (
+    "host", "port", "transport", "protocol", "uecp_site_address",
+    "uecp_encoder_address", "station_ps", "ps_mode", "dynamic_ps_text",
+    "dynamic_ps_format", "dynamic_ps_mode", "dynamic_ps_frame_seconds",
+    "long_ps_managed", "long_ps_enabled", "long_ps_source",
+    "long_ps_static_text", "pi_code", "ecc", "language_code", "pty", "tp",
+    "ta", "ms", "di_dynamic_pty", "di_compressed", "di_artificial_head",
+    "di_stereo", "af_frequencies_mhz", "send_ct", "now_playing_format",
+    "use_rt_plus", "nowplaying_min_seconds",
+)
+
+
+def _persisted_rbds_config_snapshot(obj):
+    if not getattr(obj, "pk", None):
+        return None
+    row = RBDSConfig.objects.filter(pk=obj.pk).values(
+        "pk", *_RBDS_CONFIG_AUDIT_FIELDS
+    ).first()
+    if row is None:
+        return None
+    return {
+        "pk": row["pk"],
+        "values": {field: row[field] for field in _RBDS_CONFIG_AUDIT_FIELDS},
+    }
+
+
+def _current_rbds_config_snapshot(obj):
+    return {
+        "pk": obj.pk,
+        "values": {
+            field: getattr(obj, field) for field in _RBDS_CONFIG_AUDIT_FIELDS
+        },
+    }
+
+
+def _audit_rbds_config_change(*, request, action, before, after):
+    old_values = (before or {}).get("values", {})
+    new_values = after["values"]
+    changed_fields = (
+        list(_RBDS_CONFIG_AUDIT_FIELDS)
+        if before is None
+        else [
+            field
+            for field in _RBDS_CONFIG_AUDIT_FIELDS
+            if old_values[field] != new_values[field]
+        ]
+    )
+    if not changed_fields:
+        return
+
+    changes = {
+        field: {
+            "old": old_values.get(field) if before is not None else None,
+            "new": new_values[field],
+        }
+        for field in changed_fields
+    }
+    topology_fields = RBDSConfigAdmin.RESTART_TOPOLOGY_FIELDS.intersection(
+        changed_fields
+    )
+    emit_config_change_event(
+        category="rbds",
+        title="RBDS configuration updated",
+        action=action,
+        object_type="rbds.RBDSConfig",
+        object_id=after["pk"],
+        object_name="RBDS Config",
+        changed_fields=changed_fields,
+        changes=changes,
+        redacted_fields=[],
+        request=request,
+        apply_modes={
+            field: (
+                "protected_rbds_restart_required"
+                if field in topology_fields
+                else "next_rbds_poll"
+            )
+            for field in changed_fields
+        },
+        restart_required=bool(topology_fields) or action == "create",
+    )
 
 
 def _read_current_now_playing():
@@ -188,7 +275,14 @@ class RBDSConfigAdmin(admin.ModelAdmin):
     generated_ps_preview.short_description = "Generated frame preview"
 
     def save_model(self, request, obj, form, change):
+        before = _persisted_rbds_config_snapshot(obj) if change else None
         super().save_model(request, obj, form, change)
+        _audit_rbds_config_change(
+            request=request,
+            action="update" if change else "create",
+            before=before,
+            after=_current_rbds_config_snapshot(obj),
+        )
         # Only an actual connection-topology change needs a restart --
         # can't hot-swap TCP<->UDP or reconnect with a different site/
         # encoder address mid-stream, matching EncoderAdmin's precedent

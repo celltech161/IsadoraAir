@@ -15,6 +15,7 @@ from django.utils.html import escape, format_html
 from django.utils.safestring import mark_safe
 
 from isadoraair import env_admin, env_config
+from monitoring.services.config_audit import emit_config_change_event
 
 from .models import (
     Album,
@@ -65,6 +66,117 @@ from .models import (
 _TRAFFIC_MODELS = {"playlist", "rotation", "scheduleblock", "playlistlog"}
 _CONFIG_MODELS = {"analysisconfig", "recencyconfig", "uitheme", "logfillconfig", "uploadconfig", "navmenuitem", "remotedjconfig", "stationtimeconfig", "stationinfo", "tuneinconfig", "fxbusconfig", "fxcart", "voicetrackconfig"}
 _LOG_MODELS = {"emaillog", "playevent", "playeventsegment", "mediaplaybackincident", "royaltyreport"}
+
+
+_REMOTE_DJ_CONFIG_AUDIT_FIELDS = (
+    "enabled", "stun_server", "ice_udp_min_port", "ice_udp_max_port",
+    "reconnect_grace_seconds",
+)
+_REMOTE_DJ_APPLY_MODES = {
+    "enabled": "engine_restart_required",
+    "stun_server": "next_remote_dj_session",
+    "ice_udp_min_port": "next_remote_dj_session",
+    "ice_udp_max_port": "next_remote_dj_session",
+    "reconnect_grace_seconds": "next_remote_dj_recovery_decision",
+}
+_FX_BUS_CONFIG_AUDIT_FIELDS = ("volume_db", "polyphony_cap")
+_FX_BUS_APPLY_MODES = {
+    # engine.py has a live reload handler, but this Admin save has no command
+    # writer. Saved-state truth must not claim the running gain was updated.
+    "volume_db": "runtime_adoption_not_confirmed",
+    # _fx_fire() reads this value fresh before admitting each new fire.
+    "polyphony_cap": "next_fx_fire",
+}
+_VOICE_TRACK_CONFIG_AUDIT_FIELDS = (
+    "program_duck_db", "duck_ramp_ms", "min_gap_ms",
+)
+_VOICE_TRACK_APPLY_MODES = {
+    "program_duck_db": "next_voice_track_sequence",
+    "duck_ramp_ms": "next_voice_track_phase",
+    "min_gap_ms": "next_voice_track_gap",
+}
+
+
+def _persisted_singleton_config_snapshot(model, obj, fields):
+    """Read only the explicit pre-save configuration allowlist."""
+
+    if not getattr(obj, "pk", None):
+        return None
+    row = model.objects.filter(pk=obj.pk).values("pk", *fields).first()
+    if row is None:
+        return None
+    return {
+        "pk": row["pk"],
+        "values": {field: row[field] for field in fields},
+    }
+
+
+def _current_singleton_config_snapshot(obj, fields):
+    return {
+        "pk": obj.pk,
+        "values": {field: getattr(obj, field) for field in fields},
+    }
+
+
+def _audit_library_singleton_config_change(
+    *, request, action, before, after, fields, title, object_type, object_name,
+    apply_modes, redacted_fields=(), restart_fields=(),
+):
+    """Queue one sanitized, commit-safe event for an explicit allowlist."""
+
+    old_values = (before or {}).get("values", {})
+    new_values = after["values"]
+    changed_fields = (
+        list(fields)
+        if before is None
+        else [field for field in fields if old_values[field] != new_values[field]]
+    )
+    if not changed_fields:
+        return
+
+    redacted = frozenset(redacted_fields)
+    changes = {
+        field: {
+            "old": old_values.get(field) if before is not None else None,
+            "new": new_values[field],
+        }
+        for field in changed_fields
+        if field not in redacted
+    }
+    changed_redacted_fields = [
+        field for field in changed_fields if field in redacted
+    ]
+    restart_changed = set(restart_fields).intersection(changed_fields)
+
+    # Explicit creation is only possible when no singleton exists. A disabled
+    # Remote DJ creation does not alter engine topology; an enabled one does.
+    restart_required = bool(restart_changed)
+    if action == "create" and "enabled" in restart_changed:
+        restart_required = bool(new_values["enabled"])
+    resolved_apply_modes = {
+        field: apply_modes[field] for field in changed_fields
+    }
+    if (
+        action == "create"
+        and "enabled" in resolved_apply_modes
+        and not new_values["enabled"]
+    ):
+        resolved_apply_modes["enabled"] = "saved_disabled_state_no_runtime_change"
+
+    emit_config_change_event(
+        category="library",
+        title=title,
+        action=action,
+        object_type=object_type,
+        object_id=after["pk"],
+        object_name=object_name,
+        changed_fields=changed_fields,
+        changes=changes,
+        redacted_fields=changed_redacted_fields,
+        request=request,
+        apply_modes=resolved_apply_modes,
+        restart_required=restart_required,
+    )
 
 
 class SectionedAdminSite(admin.AdminSite):
@@ -1010,6 +1122,30 @@ class RemoteDJConfigAdmin(admin.ModelAdmin):
             reverse("admin:library_remotedjconfig_change", args=[obj.pk])
         )
 
+    def save_model(self, request, obj, form, change):
+        before = (
+            _persisted_singleton_config_snapshot(
+                RemoteDJConfig, obj, _REMOTE_DJ_CONFIG_AUDIT_FIELDS
+            )
+            if change else None
+        )
+        super().save_model(request, obj, form, change)
+        _audit_library_singleton_config_change(
+            request=request,
+            action="update" if change else "create",
+            before=before,
+            after=_current_singleton_config_snapshot(
+                obj, _REMOTE_DJ_CONFIG_AUDIT_FIELDS
+            ),
+            fields=_REMOTE_DJ_CONFIG_AUDIT_FIELDS,
+            title="Remote DJ configuration updated",
+            object_type="library.RemoteDJConfig",
+            object_name="Remote DJ Configuration",
+            apply_modes=_REMOTE_DJ_APPLY_MODES,
+            redacted_fields={"stun_server"},
+            restart_fields={"enabled"},
+        )
+
 
 class NavMenuChildInline(SortableTabularInline):
     # Self-referential inline: children of the parent NavMenuItem being
@@ -1485,6 +1621,28 @@ class FXBusConfigAdmin(admin.ModelAdmin):
             reverse("admin:library_fxbusconfig_change", args=[obj.pk])
         )
 
+    def save_model(self, request, obj, form, change):
+        before = (
+            _persisted_singleton_config_snapshot(
+                FXBusConfig, obj, _FX_BUS_CONFIG_AUDIT_FIELDS
+            )
+            if change else None
+        )
+        super().save_model(request, obj, form, change)
+        _audit_library_singleton_config_change(
+            request=request,
+            action="update" if change else "create",
+            before=before,
+            after=_current_singleton_config_snapshot(
+                obj, _FX_BUS_CONFIG_AUDIT_FIELDS
+            ),
+            fields=_FX_BUS_CONFIG_AUDIT_FIELDS,
+            title="FX bus configuration updated",
+            object_type="library.FXBusConfig",
+            object_name="FX Bus",
+            apply_modes=_FX_BUS_APPLY_MODES,
+        )
+
 
 @admin.register(VoiceTrack)
 class VoiceTrackAdmin(admin.ModelAdmin):
@@ -1544,4 +1702,26 @@ class VoiceTrackConfigAdmin(admin.ModelAdmin):
         obj = VoiceTrackConfig.load()
         return HttpResponseRedirect(
             reverse("admin:library_voicetrackconfig_change", args=[obj.pk])
+        )
+
+    def save_model(self, request, obj, form, change):
+        before = (
+            _persisted_singleton_config_snapshot(
+                VoiceTrackConfig, obj, _VOICE_TRACK_CONFIG_AUDIT_FIELDS
+            )
+            if change else None
+        )
+        super().save_model(request, obj, form, change)
+        _audit_library_singleton_config_change(
+            request=request,
+            action="update" if change else "create",
+            before=before,
+            after=_current_singleton_config_snapshot(
+                obj, _VOICE_TRACK_CONFIG_AUDIT_FIELDS
+            ),
+            fields=_VOICE_TRACK_CONFIG_AUDIT_FIELDS,
+            title="Voice track configuration updated",
+            object_type="library.VoiceTrackConfig",
+            object_name="Voice Track Config",
+            apply_modes=_VOICE_TRACK_APPLY_MODES,
         )
