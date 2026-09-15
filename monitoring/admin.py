@@ -9,11 +9,222 @@ from django.utils.html import format_html, format_html_join
 from isadoraair import env_config
 
 from .models import ListenerPeak, MonitorCheck, NotificationConfig, SystemEvent, TransmitterConfig, emit_event
+from .services.config_audit import emit_config_change_event
 from .services.notify import send_test_email
 from .services.transmitters import (
     TransmitterConfigurationError,
     transmitter_type_requires_password,
 )
+
+
+# ``name`` is operational rather than card-only presentation: monitor.py and
+# notify.py use it in transition-event titles and notification subjects/bodies.
+# ``show_as_card`` and ``sort_order`` are deliberately absent from this list.
+_MONITOR_CHECK_AUDIT_FIELDS = (
+    "name",
+    "kind",
+    "enabled",
+    "systemd_unit",
+    "disk_path",
+    "thermal_zone_label",
+    "transmitter_parameter",
+    "transmitter_indicator",
+    "fault_values",
+    "warn_values",
+    "silence_device_slug",
+    "encoder_group_slug",
+    "encoder_group_systemd_unit",
+    "warning_threshold",
+    "critical_threshold",
+    "threshold_direction",
+    "consecutive_failures_required",
+    "notify_on_warning",
+    "notify_on_critical",
+)
+_MONITOR_CHECK_COMMON_EFFECTIVE_FIELDS = frozenset({
+    "name",
+    "kind",
+    "enabled",
+    "consecutive_failures_required",
+    "notify_on_warning",
+    "notify_on_critical",
+})
+_MONITOR_CHECK_KIND_FIELDS = {
+    "systemd": frozenset({"systemd_unit"}),
+    "disk": frozenset({"disk_path"}),
+    "temperature": frozenset({"thermal_zone_label"}),
+    "transmitter_param": frozenset({"transmitter_parameter"}),
+    "transmitter_indicator": frozenset({
+        "transmitter_indicator", "fault_values", "warn_values",
+    }),
+    "audio_silence": frozenset({"silence_device_slug"}),
+    "encoder_group": frozenset({
+        "encoder_group_slug", "encoder_group_systemd_unit",
+    }),
+}
+_THRESHOLD_MONITOR_KINDS = frozenset({
+    "disk", "cpu", "memory", "temperature", "transmitter_param",
+})
+_MONITOR_CHECK_THRESHOLD_FIELDS = frozenset({
+    "warning_threshold", "critical_threshold", "threshold_direction",
+})
+_TRANSMITTER_CONFIG_AUDIT_FIELDS = (
+    "transmitter_type",
+    "host",
+    "port",
+    "password",
+    "timeout_seconds",
+    "poll_interval_seconds",
+    "full_power_watts",
+)
+_NOTIFICATION_CONFIG_AUDIT_FIELDS = (
+    "enabled",
+    "recipients",
+    "cooldown_minutes",
+)
+
+
+def _persisted_config_snapshot(model, obj, fields):
+    """Read the exact pre-save values for one explicitly audited model."""
+
+    if not getattr(obj, "pk", None):
+        return None
+    row = model.objects.filter(pk=obj.pk).values("pk", *fields).first()
+    if row is None:
+        return None
+    return {
+        "pk": row["pk"],
+        "values": {field: row[field] for field in fields},
+    }
+
+
+def _current_config_snapshot(obj, fields):
+    return {
+        "pk": obj.pk,
+        "values": {field: getattr(obj, field) for field in fields},
+    }
+
+
+def _audit_monitoring_config_change(
+    *,
+    request,
+    action,
+    before,
+    after,
+    fields,
+    category,
+    title,
+    object_type,
+    object_name,
+    apply_mode,
+    private_fields=(),
+):
+    """Emit one sanitized desired-policy audit for an Admin operation."""
+
+    old_values = (before or {}).get("values", {})
+    new_values = (after or {}).get("values", {})
+    if before is None or after is None:
+        changed_fields = list(fields)
+    else:
+        changed_fields = [
+            field for field in fields if old_values[field] != new_values[field]
+        ]
+    if not changed_fields:
+        return
+
+    private = frozenset(private_fields)
+    changes = {}
+    redacted_fields = []
+    for field in changed_fields:
+        if field in private:
+            redacted_fields.append(field)
+            continue
+        changes[field] = {
+            "old": old_values.get(field) if before is not None else None,
+            "new": new_values.get(field) if after is not None else None,
+        }
+
+    identity = after if after is not None else before
+    emit_config_change_event(
+        category=category,
+        title=title,
+        action=action,
+        object_type=object_type,
+        object_id=(identity or {}).get("pk"),
+        object_name=object_name,
+        changed_fields=changed_fields,
+        changes=changes,
+        redacted_fields=redacted_fields,
+        request=request,
+        apply_modes={field: apply_mode for field in changed_fields},
+        restart_required=False,
+    )
+
+
+def _monitor_check_effective_fields(snapshot):
+    """Return the compact operational configuration active for one check."""
+
+    values = (snapshot or {}).get("values", {})
+    kind = values.get("kind")
+    selected = set(_MONITOR_CHECK_COMMON_EFFECTIVE_FIELDS)
+    selected.update(_MONITOR_CHECK_KIND_FIELDS.get(kind, ()))
+    if kind in _THRESHOLD_MONITOR_KINDS:
+        selected.update(_MONITOR_CHECK_THRESHOLD_FIELDS)
+    return tuple(field for field in _MONITOR_CHECK_AUDIT_FIELDS if field in selected)
+
+
+def _audit_monitor_check_change(*, request, action, before, after):
+    identity = after if after is not None else before
+    values = (identity or {}).get("values", {})
+    fields = (
+        _MONITOR_CHECK_AUDIT_FIELDS
+        if before is not None and after is not None
+        else _monitor_check_effective_fields(identity)
+    )
+    _audit_monitoring_config_change(
+        request=request,
+        action=action,
+        before=before,
+        after=after,
+        fields=fields,
+        category="monitor",
+        title=f"Monitoring check configuration {action}d",
+        object_type="monitoring.MonitorCheck",
+        object_name=values.get("name"),
+        apply_mode="next_monitoring_poll",
+    )
+
+
+def _audit_transmitter_config_change(*, request, action, before, after):
+    _audit_monitoring_config_change(
+        request=request,
+        action=action,
+        before=before,
+        after=after,
+        fields=_TRANSMITTER_CONFIG_AUDIT_FIELDS,
+        category="monitoring",
+        title=f"Transmitter configuration {action}d",
+        object_type="monitoring.TransmitterConfig",
+        object_name="Transmitter Config",
+        apply_mode="next_transmitter_poll",
+        private_fields={"password"},
+    )
+
+
+def _audit_notification_config_change(*, request, action, before, after):
+    _audit_monitoring_config_change(
+        request=request,
+        action=action,
+        before=before,
+        after=after,
+        fields=_NOTIFICATION_CONFIG_AUDIT_FIELDS,
+        category="monitoring",
+        title=f"Notification configuration {action}d",
+        object_type="monitoring.NotificationConfig",
+        object_name="Notification Config",
+        apply_mode="next_notification_evaluation",
+        private_fields={"recipients"},
+    )
 
 
 class TransmitterConfigAdminForm(forms.ModelForm):
@@ -79,11 +290,51 @@ class MonitorCheckAdmin(admin.ModelAdmin):
         ("Alerting", {"fields": ["consecutive_failures_required", "notify_on_warning", "notify_on_critical"]}),
     ]
 
-    # No Media/js confirm dialog and no save_model()/delete_model()
-    # restart here, unlike EncoderAdmin/AudioPipelineAdmin — the poller
+    # No Media/js confirm dialog or restart here, unlike
+    # EncoderAdmin/AudioPipelineAdmin — the poller
     # re-reads MonitorCheck.objects.filter(enabled=True) fresh every
     # cycle (~10s), so a save just takes effect on the next tick with no
     # disruptive side effect to confirm.
+
+    def save_model(self, request, obj, form, change):
+        before = (
+            _persisted_config_snapshot(
+                MonitorCheck, obj, _MONITOR_CHECK_AUDIT_FIELDS
+            )
+            if change
+            else None
+        )
+        super().save_model(request, obj, form, change)
+        _audit_monitor_check_change(
+            request=request,
+            action="update" if change else "create",
+            before=before,
+            after=_current_config_snapshot(obj, _MONITOR_CHECK_AUDIT_FIELDS),
+        )
+
+    def delete_model(self, request, obj):
+        before = _current_config_snapshot(obj, _MONITOR_CHECK_AUDIT_FIELDS)
+        super().delete_model(request, obj)
+        _audit_monitor_check_change(
+            request=request,
+            action="delete",
+            before=before,
+            after=None,
+        )
+
+    def delete_queryset(self, request, queryset):
+        snapshots = [
+            _current_config_snapshot(obj, _MONITOR_CHECK_AUDIT_FIELDS)
+            for obj in queryset
+        ]
+        super().delete_queryset(request, queryset)
+        for before in snapshots:
+            _audit_monitor_check_change(
+                request=request,
+                action="delete",
+                before=before,
+                after=None,
+            )
 
 
 class _SingletonAdmin(admin.ModelAdmin):
@@ -117,6 +368,24 @@ class TransmitterConfigAdmin(_SingletonAdmin):
         "poll_interval_seconds",
         "full_power_watts",
     ]
+
+    def save_model(self, request, obj, form, change):
+        before = (
+            _persisted_config_snapshot(
+                TransmitterConfig, obj, _TRANSMITTER_CONFIG_AUDIT_FIELDS
+            )
+            if change
+            else None
+        )
+        super().save_model(request, obj, form, change)
+        _audit_transmitter_config_change(
+            request=request,
+            action="update" if change else "create",
+            before=before,
+            after=_current_config_snapshot(
+                obj, _TRANSMITTER_CONFIG_AUDIT_FIELDS
+            ),
+        )
 
 
 @admin.register(NotificationConfig)
@@ -157,6 +426,24 @@ class NotificationConfigAdmin(_SingletonAdmin):
             "fields": ["smtp_status", "smtp_env_link", "send_test_email_button"],
         }),
     ]
+
+    def save_model(self, request, obj, form, change):
+        before = (
+            _persisted_config_snapshot(
+                NotificationConfig, obj, _NOTIFICATION_CONFIG_AUDIT_FIELDS
+            )
+            if change
+            else None
+        )
+        super().save_model(request, obj, form, change)
+        _audit_notification_config_change(
+            request=request,
+            action="update" if change else "create",
+            before=before,
+            after=_current_config_snapshot(
+                obj, _NOTIFICATION_CONFIG_AUDIT_FIELDS
+            ),
+        )
 
     def get_urls(self):
         return [
