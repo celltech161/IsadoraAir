@@ -181,6 +181,10 @@ class WeatherConfigAuditTests(TestCase):
         self.assertNotIn(events[-1], repr(event.detail))
         self.assertEqual(
             event.detail["apply_modes"]["alert_sound_trigger_events"],
+            "next_weather_ingest_cycle",
+        )
+        self.assertNotEqual(
+            event.detail["apply_modes"]["alert_sound_trigger_events"],
             "runtime_adoption_not_confirmed",
         )
 

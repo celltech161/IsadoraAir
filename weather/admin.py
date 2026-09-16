@@ -48,9 +48,9 @@ _WEATHER_CONFIG_APPLY_MODES = {
     "alert_sound_enabled": "next_alert_beep_evaluation",
     "alert_sound_cart": "next_alert_beep_evaluation",
     "alert_sound_interval_seconds": "next_alert_beep_evaluation",
-    # dump_weather_config exports this field, but the available ingest
-    # consumer still uses its legacy hard-coded list. Do not claim adoption.
-    "alert_sound_trigger_events": "runtime_adoption_not_confirmed",
+    # update_local_wx_data reads this through dump_weather_config at the
+    # start of each weather-ingest one-shot; no service restart is needed.
+    "alert_sound_trigger_events": "next_weather_ingest_cycle",
 }
 _WEATHER_PRIVATE_AUDIT_FIELDS = frozenset({"notify_email"})
 
