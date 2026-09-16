@@ -204,6 +204,49 @@ class FxFireLifecycleStateTests(TransactionTestCase):
         self.assertEqual(len(state), 1)
         self.assertEqual(state[0]["cart_id"], cart_a.id)  # only the one that actually got in
 
+    def test_lowered_cap_applies_to_next_fire_without_stopping_active_voices(self):
+        FXBusConfig.objects.filter(pk=1).update(polyphony_cap=2)
+        cart_a = make_cart(name="A")
+        cart_b = make_cart(name="B")
+        cart_c = make_cart(name="C")
+
+        with _patched_element_factory():
+            self.assertTrue(self.stand_in._fx_fire(cart_a.id))
+            self.assertTrue(self.stand_in._fx_fire(cart_b.id))
+        active_before = dict(self.stand_in._fx_fires)
+
+        # Same running engine object, no reload command: only the persisted
+        # singleton changes. Existing voices remain even though their count
+        # is now above the new cap; the next admission is rejected.
+        FXBusConfig.objects.filter(pk=1).update(polyphony_cap=1)
+        with _patched_element_factory():
+            self.assertFalse(self.stand_in._fx_fire(cart_c.id))
+
+        self.assertEqual(self.stand_in._fx_fires, active_before)
+        self.assertEqual(self.stand_in._fx_active_count(), 2)
+
+    def test_raised_cap_is_read_fresh_and_admits_a_later_fire(self):
+        FXBusConfig.objects.filter(pk=1).update(polyphony_cap=1)
+        cart_a = make_cart(name="A")
+        cart_b = make_cart(name="B")
+
+        with _patched_element_factory():
+            self.assertTrue(self.stand_in._fx_fire(cart_a.id))
+            self.assertFalse(self.stand_in._fx_fire(cart_b.id))
+        self.assertEqual(self.stand_in._fx_active_count(), 1)
+
+        # Raising only the persisted cap is sufficient; _fx_fire performs
+        # the fresh read before this later admission decision.
+        FXBusConfig.objects.filter(pk=1).update(polyphony_cap=2)
+        with _patched_element_factory():
+            self.assertTrue(self.stand_in._fx_fire(cart_b.id))
+
+        self.assertEqual(self.stand_in._fx_active_count(), 2)
+        self.assertEqual(
+            {fire["cart_id"] for fire in self.stand_in._fx_fires.values()},
+            {cart_a.id, cart_b.id},
+        )
+
     def test_retrigger_restart_replaces_not_duplicates(self):
         cart = make_cart(retrigger_mode="restart")
         with _patched_element_factory():

@@ -6651,10 +6651,11 @@ class PlaybackEngine:
                 return False
             # 'restart' -> fall through to start a new fire below
 
-        # Polyphony cap. After honoring retrigger (which may have freed
-        # slots via stop) check the live count. A 5th simultaneous fire
-        # from different carts gets dropped rather than kicking any
-        # existing one -- less surprising to the operator.
+        # Polyphony cap. Read the persisted singleton fresh for every
+        # admission decision; it is not cached or represented by a fixed
+        # pool in the pipeline. After honoring retrigger (which may have
+        # freed a slot), compare it with the live count. An over-cap fire
+        # is dropped rather than stopping any existing voice.
         try:
             cap = FXBusConfig.load().polyphony_cap
         except Exception:
@@ -7255,8 +7256,9 @@ class PlaybackEngine:
                 if cart_id:
                     self._fx_fire(int(cart_id))
             elif cmd == "reload_fx_config":
-                # Volume-only reload; polyphony cap changes need a restart
-                # because the fx_submix pool sizing is set at build.
+                # Volume-only reload. _fx_fire reads polyphony_cap fresh
+                # for each admission decision, so the cap needs neither
+                # this command nor a pipeline rebuild/restart.
                 self._fx_apply_volume()
             elif cmd == "reload_voicetrack_config":
                 # Duck depth / ramp / gap reads happen at fire time, so

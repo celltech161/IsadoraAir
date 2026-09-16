@@ -61,6 +61,13 @@ class FXBusAdminLiveReloadTests(TestCase):
             )
         return callbacks
 
+    def test_operator_help_describes_polyphony_next_fire_semantics(self):
+        description = self.admin.fieldsets[0][1]["description"]
+        self.assertIn("subsequent FX fire admission decisions", description)
+        self.assertIn("without a restart", description)
+        self.assertIn("currently active fires continue", description)
+        self.assertNotIn("requires an engine restart", description)
+
     def test_volume_change_waits_for_commit_then_publishes_exact_command(self):
         observed = []
 

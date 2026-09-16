@@ -1803,7 +1803,11 @@ class FXBusConfig(models.Model):
     into the main mixer. 0.0 = unity (typical). Negative for softer,
     positive for hotter. Deliberate limit: [-24, +6] since going
     beyond +6 into the shared master mixer starts to compete with
-    program audio."""
+    program audio.
+
+    polyphony_cap is read from this singleton for every new FX Cart
+    admission decision. It does not size the sub-mixer or stop voices
+    that are already active."""
 
     volume_db = models.FloatField(
         default=0.0,

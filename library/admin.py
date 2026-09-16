@@ -1603,8 +1603,8 @@ class FXBusConfigAdmin(admin.ModelAdmin):
             "description": (
                 "FX bus output gain into the master mixer plus a cap on simultaneous "
                 "fires. Volume takes effect on the next engine command tick (no "
-                "restart). Polyphony cap requires an engine restart to re-provision "
-                "the sub-mixer's slot count."
+                "restart). Polyphony changes apply to subsequent FX fire admission "
+                "decisions without a restart; currently active fires continue."
             ),
         }),
     ]
