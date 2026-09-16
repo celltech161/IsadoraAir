@@ -175,13 +175,25 @@ class FXBusConfigAuditTests(SingletonAuditTestCase):
     admin_class = FXBusConfigAdmin
     object_type = "library.FXBusConfig"
 
-    def test_volume_change_does_not_overclaim_unwired_runtime_reload(self):
+    def setUp(self):
+        super().setUp()
+        self.command_writer_patcher = patch(
+            "library.admin._write_engine_command"
+        )
+        self.command_writer = self.command_writer_patcher.start()
+        self.addCleanup(self.command_writer_patcher.stop)
+
+    def test_volume_change_reports_live_update_after_commit(self):
         self.save({"volume_db": -3.5})
         detail = _audit_events(self.object_type)[0].detail
         self.assertEqual(detail["changed_fields"], ["volume_db"])
         self.assertEqual(
             detail["apply_modes"],
-            {"volume_db": "runtime_adoption_not_confirmed"},
+            {"volume_db": "live_runtime_update_after_commit"},
+        )
+        self.assertNotEqual(
+            detail["apply_modes"]["volume_db"],
+            "runtime_adoption_not_confirmed",
         )
         self.assertFalse(detail["restart_required"])
 
@@ -200,7 +212,7 @@ class FXBusConfigAuditTests(SingletonAuditTestCase):
         self.assertEqual(
             events[0].detail["apply_modes"],
             {
-                "volume_db": "runtime_adoption_not_confirmed",
+                "volume_db": "live_runtime_update_after_commit",
                 "polyphony_cap": "next_fx_fire",
             },
         )
@@ -209,10 +221,11 @@ class FXBusConfigAuditTests(SingletonAuditTestCase):
         self.assert_noop_and_rollback("volume_db", -4.0)
         self.assert_rapid_saves_are_distinct("volume_db", -1.0, -2.0)
 
-    def test_admin_save_preserves_absence_of_runtime_command_writer(self):
-        with patch.object(Path, "write_text") as write_text:
-            self.save({"volume_db": -5.0})
-        write_text.assert_not_called()
+    def test_audit_remains_persistence_not_runtime_success_evidence(self):
+        self.save({"volume_db": -5.0})
+        retained = repr(_audit_events(self.object_type)[0].detail).lower()
+        self.assertNotIn("reload succeeded", retained)
+        self.assertNotIn("running engine updated", retained)
 
 
 class VoiceTrackConfigAuditTests(SingletonAuditTestCase):

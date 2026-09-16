@@ -6,6 +6,7 @@ from django.contrib import admin, messages
 from library.auth_forms import InviteCapablePasswordResetForm
 from django.contrib.auth.forms import UserChangeForm as DjangoUserChangeForm
 from django.contrib.auth.models import User
+from django.db import transaction
 from django.db.models import Count
 from django.http import HttpResponseRedirect
 from django.template.loader import render_to_string
@@ -14,6 +15,7 @@ from django.urls import path, reverse
 from django.utils.html import escape, format_html
 from django.utils.safestring import mark_safe
 
+from hardware.signals import _write_engine_command
 from isadoraair import env_admin, env_config
 from monitoring.services.config_audit import emit_config_change_event
 
@@ -81,9 +83,9 @@ _REMOTE_DJ_APPLY_MODES = {
 }
 _FX_BUS_CONFIG_AUDIT_FIELDS = ("volume_db", "polyphony_cap")
 _FX_BUS_APPLY_MODES = {
-    # engine.py has a live reload handler, but this Admin save has no command
-    # writer. Saved-state truth must not claim the running gain was updated.
-    "volume_db": "runtime_adoption_not_confirmed",
+    # Admin publishes reload_fx_config only after the save commits. The
+    # audit remains persistence evidence, not proof the engine consumed it.
+    "volume_db": "live_runtime_update_after_commit",
     # _fx_fire() reads this value fresh before admitting each new fire.
     "polyphony_cap": "next_fx_fire",
 }
@@ -1629,13 +1631,21 @@ class FXBusConfigAdmin(admin.ModelAdmin):
             if change else None
         )
         super().save_model(request, obj, form, change)
+        after = _current_singleton_config_snapshot(
+            obj, _FX_BUS_CONFIG_AUDIT_FIELDS
+        )
+        if (
+            before is None
+            or before["values"]["volume_db"] != after["values"]["volume_db"]
+        ):
+            transaction.on_commit(
+                lambda: _write_engine_command({"command": "reload_fx_config"})
+            )
         _audit_library_singleton_config_change(
             request=request,
             action="update" if change else "create",
             before=before,
-            after=_current_singleton_config_snapshot(
-                obj, _FX_BUS_CONFIG_AUDIT_FIELDS
-            ),
+            after=after,
             fields=_FX_BUS_CONFIG_AUDIT_FIELDS,
             title="FX bus configuration updated",
             object_type="library.FXBusConfig",
