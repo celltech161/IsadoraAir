@@ -578,10 +578,11 @@ class AudioPipelineAdmin(admin.ModelAdmin):
             changed_fields.append(field)
             changes[field] = {"old": old, "new": new}
         if changed_fields:
+            action = "create" if before is None else "update"
             emit_config_change_event(
                 category="hardware",
-                title="Audio pipeline configuration updated",
-                action="update",
+                title=f"Audio pipeline configuration {action}d",
+                action=action,
                 object_type="hardware.AudioPipeline",
                 object_id=obj.pk,
                 object_name=str(obj),

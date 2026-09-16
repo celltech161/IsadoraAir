@@ -54,10 +54,14 @@ class AudioPipelineConfigurationAuditTests(TestCase):
         return client
 
     def test_single_folded_field_emits_one_non_restart_event(self):
+        # The singleton/default rows loaded in setUp are read-time creation,
+        # not an explicit operator configuration change.
+        self.assertEqual(_audit_events(), [])
         client = self._save(changed_data=["ducking_enabled"], ducking_enabled=True)
 
         event = _audit_events()[0]
         self.assertEqual(event.title, "Audio pipeline configuration updated")
+        self.assertEqual(event.detail["action"], "update")
         self.assertEqual(event.detail["changed_fields"], ["ducking_enabled"])
         self.assertEqual(
             event.detail["changes"]["ducking_enabled"],
@@ -69,6 +73,27 @@ class AudioPipelineConfigurationAuditTests(TestCase):
         )
         self.assertFalse(event.detail["restart_required"])
         client.restart_operator_service.assert_not_called()
+
+    def test_explicit_create_uses_create_action_and_title(self):
+        self.pipeline.delete()
+        pipeline = AudioPipeline()
+        form = SimpleNamespace(
+            cleaned_data={
+                "ducking_enabled": self.ducking.enabled,
+                "duck_level_db": self.ducking.duck_level_db,
+                "remote_dj_gain_db": self.remote.gain_db,
+            },
+            changed_data=[],
+        )
+
+        with self.captureOnCommitCallbacks(execute=True):
+            self.admin.save_model(None, pipeline, form, change=False)
+
+        events = _audit_events()
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].title, "Audio pipeline configuration created")
+        self.assertEqual(events[0].detail["action"], "create")
+        self.assertEqual(events[0].detail["object_id"], pipeline.pk)
 
     def test_fields_across_three_models_emit_one_event_and_one_restart_request(self):
         new_rate = 44100 if self.pipeline.sample_rate != 44100 else 48000

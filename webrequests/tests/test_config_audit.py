@@ -140,8 +140,11 @@ class WebRequestConfigAdminAuditTests(TestCase):
         callbacks = self._save(updates, execute=False)
         self.assertEqual(_audit_events(), [])
         self.assertEqual(len(callbacks), 1)
+        closure_text = repr(
+            [cell.cell_contents for cell in (callbacks[0].__closure__ or ())]
+        )
         for value in updates.values():
-            self.assertNotIn(value, repr(callbacks[0]))
+            self.assertNotIn(value, closure_text)
         callbacks[0]()
         event = _audit_events()[0]
         self.assertEqual(event.detail["changed_fields"], list(updates))
@@ -156,7 +159,10 @@ class WebRequestConfigAdminAuditTests(TestCase):
         )
         self.assertEqual(_audit_events(), [])
         self.assertEqual(len(callbacks), 1)
-        self.assertNotIn(PRIVATE_EMAIL, repr(callbacks[0]))
+        closure_text = repr(
+            [cell.cell_contents for cell in (callbacks[0].__closure__ or ())]
+        )
+        self.assertNotIn(PRIVATE_EMAIL, closure_text)
         callbacks[0]()
         event = _audit_events()[0]
         self.assertEqual(event.detail["changed_fields"], ["notify_email"])
