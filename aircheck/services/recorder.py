@@ -21,14 +21,13 @@ homes.
 ffmpeg_pid is preserved on AircheckSession for backward compatibility
 with old rows but is always None on new sessions.
 
-Idle working-buffer maintenance (maintain_idle_buffer): because
-output.file above runs continuously -- even with no session active --
-the tmpfs working file at AIRCHECK_CURRENT_PATH grows without bound
-until the next Start/Stop cuts it. maintain_idle_buffer periodically
-rolls it over via the SAME aircheck.reopen telnet call Start/Stop
-already use, purely to bound tmpfs growth, never touching
-AircheckSession. See AIRCHECK_LOCK_PATH below for how this is kept
-safe to run concurrently with a real Start/Stop.
+Working-buffer maintenance (maintain_idle_buffer): because output.file
+above runs continuously, the tmpfs working file at
+AIRCHECK_CURRENT_PATH grows until it is cut. Idle files are discarded
+with the existing reopen operation. Active logical sessions use the
+same bounded working-file policy, but each closed segment is copied to
+persistent per-session staging before its /run handoff is removed.
+See AIRCHECK_LOCK_PATH below for cross-process serialization.
 """
 import errno
 import fcntl
@@ -58,6 +57,7 @@ from monitoring.models import emit_event
 
 
 REMUX_PENDING_NOTE = "remux in progress"
+FINALIZATION_PENDING_NOTE = "finalization in progress"
 REMUX_INTERMEDIATE_DIR = Path("/run/isadoraair")
 
 # Substrings that show up in exit_note ONLY when finalization definitively
@@ -73,7 +73,12 @@ REMUX_INTERMEDIATE_DIR = Path("/run/isadoraair")
 #   "no audio to" -- "no audio to remux" / "no audio to move" (working
 #                    file was already missing at Stop -- nothing to save).
 #   "could not stage intermediate" -- he_aac: couldn't even begin the remux.
-FINALIZATION_ERROR_MARKERS = (" failed: ", "no audio to", "could not stage intermediate")
+FINALIZATION_ERROR_MARKERS = (
+    " failed: ",
+    "no audio to",
+    "could not stage intermediate",
+    "finalization failed:",
+)
 
 # Runtime state file the /monitoring/ Aircheck card reads (via
 # aircheck:api-status) to show idle-buffer-guard health. Written by
@@ -101,12 +106,31 @@ AIRCHECK_BUFFER_HEARTBEAT_STALE_SECONDS = 165
 # wait on it.
 AIRCHECK_LOCK_PATH = "/run/isadoraair/aircheck.lock"
 
-# Safety ceiling for the always-on idle working buffer (see module
-# docstring). 64 MiB is generous headroom above a realistic per-minute
-# maintenance cadence's worth of growth for any configured aircheck
-# format, while still bounding tmpfs exhaustion risk if the timer is
-# ever delayed or disabled for a while.
-AIRCHECK_IDLE_BUFFER_MAX_BYTES = 64 * 1024 * 1024
+# Safety ceiling for the always-on working file (idle or active). The
+# timer observes this once a minute, so this is a cut trigger rather
+# than a mathematical hard maximum: one timer interval of overshoot is
+# expected. Active segments leave /run after each successful cut.
+AIRCHECK_WORKING_FILE_MAX_BYTES = 64 * 1024 * 1024
+# Backward-compatible import name for older callers/tests. There is now
+# one policy for both idle and active working files.
+AIRCHECK_IDLE_BUFFER_MAX_BYTES = AIRCHECK_WORKING_FILE_MAX_BYTES
+
+STAGING_ROOT_NAME = ".isadoraair-aircheck-staging"
+SEGMENT_NAME_PREFIX = "segment-"
+SEGMENT_PARTIAL_SUFFIX = ".partial"
+HANDOFF_NAME_PREFIX = "aircheck-segment-"
+FFMPEG_TIMEOUT_SECONDS = 3600
+
+SOURCE_EXTENSION_BY_FORMAT = {
+    "he_aac": "aac",  # Liquidsoap/fdkaac source is ADTS; final is M4A.
+    "mp3": "mp3",
+    "flac": "flac",
+    "wav": "wav",
+}
+
+
+class SegmentError(RuntimeError):
+    """A preservation-safe segment cut, transfer, or finalization failure."""
 
 
 @contextmanager
@@ -250,8 +274,9 @@ def start_recording():
     Triggers `aircheck.reopen` over telnet -- liquidsoap closes its
     current working file (AIRCHECK_CURRENT_PATH) and starts a fresh
     one at the same path. The session row records the INTENDED final
-    destination; the actual file lives at AIRCHECK_CURRENT_PATH until
-    Stop moves it there.
+    destination; the current bounded source segment lives at
+    AIRCHECK_CURRENT_PATH, while completed long-session segments live
+    in persistent session staging until Stop finalizes them.
 
     Runs under AIRCHECK_LOCK_PATH, blocking, for its entire body --
     serializes against Stop, against a second concurrent Start (the
@@ -274,9 +299,13 @@ def start_recording():
         stamp = timezone.localtime().strftime(cfg.filename_template)
         out_path = out_dir / f"{stamp}.{cfg.file_extension()}"
 
-        # Guard against second-precision collisions on rapid Start clicks.
-        if out_path.exists():
-            out_path = out_dir / f"{stamp}-{datetime.now().microsecond}.{cfg.file_extension()}"
+        # Guard against second-precision collisions on rapid/back-to-back
+        # sessions. A prior segmented session can be finalizing before its
+        # destination exists, so the session row also reserves that path.
+        suffix = None
+        while out_path.exists() or AircheckSession.objects.filter(filename=str(out_path)).exists():
+            suffix = datetime.now().microsecond if suffix is None else suffix + 1
+            out_path = out_dir / f"{stamp}-{suffix}.{cfg.file_extension()}"
 
         try:
             _send_telnet(f"{AIRCHECK_OUTPUT_ID}.reopen")
@@ -294,59 +323,340 @@ def start_recording():
         return session, None
 
 
+def _source_extension(session):
+    return SOURCE_EXTENSION_BY_FORMAT.get(session.audio_format, "audio")
+
+
+def _staging_dir(session):
+    """Persistent, session-owned segment directory derived from the
+    immutable destination captured on the session row -- never from a
+    later AircheckConfig edit."""
+    dest = Path(session.filename)
+    return dest.parent / STAGING_ROOT_NAME / str(session.id)
+
+
+def _segment_path(session, sequence):
+    return _staging_dir(session) / (
+        f"{SEGMENT_NAME_PREFIX}{sequence:06d}.{_source_extension(session)}"
+    )
+
+
+def _handoff_path(session, sequence):
+    working = Path(AIRCHECK_CURRENT_PATH)
+    return working.with_name(
+        f"{HANDOFF_NAME_PREFIX}{session.id}-{sequence:06d}.handoff"
+    )
+
+
+def _parse_handoff_sequence(session, path):
+    prefix = f"{HANDOFF_NAME_PREFIX}{session.id}-"
+    name = path.name
+    if not name.startswith(prefix) or not name.endswith(".handoff"):
+        return None
+    raw = name[len(prefix):-len(".handoff")]
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def _parse_segment_sequence(session, path):
+    prefix = SEGMENT_NAME_PREFIX
+    suffix = f".{_source_extension(session)}"
+    name = path.name
+    if not name.startswith(prefix) or not name.endswith(suffix):
+        return None
+    raw = name[len(prefix):-len(suffix)]
+    if not raw.isdigit():
+        return None
+    return int(raw)
+
+
+def _discover_segments(session):
+    """Return committed persistent segments in deterministic order.
+    Temporary copy artifacts deliberately do not match this pattern."""
+    staging = _staging_dir(session)
+    ext = _source_extension(session)
+    found = []
+    for path in staging.glob(f"{SEGMENT_NAME_PREFIX}*.{ext}"):
+        sequence = _parse_segment_sequence(session, path)
+        if sequence is not None:
+            found.append((sequence, path))
+    return [path for _, path in sorted(found)]
+
+
+def _pending_handoffs(session):
+    working = Path(AIRCHECK_CURRENT_PATH)
+    matches = []
+    for path in working.parent.glob(f"{HANDOFF_NAME_PREFIX}{session.id}-*.handoff"):
+        sequence = _parse_handoff_sequence(session, path)
+        if sequence is not None:
+            matches.append((sequence, path))
+    return sorted(matches)
+
+
+def _next_segment_sequence(session):
+    sequences = []
+    for path in _discover_segments(session):
+        sequences.append(_parse_segment_sequence(session, path))
+    sequences.extend(sequence for sequence, _ in _pending_handoffs(session))
+    return max(sequences, default=0) + 1
+
+
+def _fsync_directory(path):
+    """Best-effort directory durability matching the module's atomic
+    heartbeat convention without making unsupported filesystems fatal."""
+    try:
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
+def _copy_handoff_to_staging(session, sequence, handoff):
+    """Copy a closed /run handoff to persistent storage safely.
+
+    The committed segment name appears only after the copy is flushed
+    and fsynced. The /run source is removed only after that atomic
+    publish. A retry after a crash recognizes an already-committed,
+    same-sized segment and removes only the redundant handoff.
+    """
+    staging = _staging_dir(session)
+    try:
+        staging.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise SegmentError(f"cannot create staging directory {staging}: {exc}")
+
+    committed = _segment_path(session, sequence)
+    partial = staging / f".{committed.name}{SEGMENT_PARTIAL_SUFFIX}"
+    if committed.exists():
+        try:
+            same_size = committed.stat().st_size == handoff.stat().st_size
+        except OSError as exc:
+            raise SegmentError(f"cannot compare committed segment {committed}: {exc}")
+        if not same_size:
+            raise SegmentError(
+                f"committed segment collision for session {session.id} sequence {sequence}"
+            )
+        try:
+            handoff.unlink()
+        except OSError as exc:
+            raise SegmentError(f"committed segment exists but handoff cleanup failed: {exc}")
+        return committed
+
+    try:
+        with open(handoff, "rb") as src, open(partial, "wb") as dst:
+            shutil.copyfileobj(src, dst, length=1024 * 1024)
+            dst.flush()
+            os.fsync(dst.fileno())
+        os.replace(partial, committed)
+        _fsync_directory(staging)
+    except OSError as exc:
+        raise SegmentError(f"persistent segment copy failed: {exc}")
+
+    try:
+        handoff.unlink()
+    except OSError as exc:
+        # The durable segment is authoritative; a later recovery pass
+        # will size-match and remove this duplicate handoff safely.
+        raise SegmentError(f"segment committed but /run handoff cleanup failed: {exc}")
+    return committed
+
+
+def _recover_pending_handoffs(session):
+    """Recover transfer/cut artifacts after a maintenance-process exit.
+
+    If the fixed working path exists, Liquidsoap has completed the
+    reopen and any handoff is closed, so finish its persistent copy. If
+    the fixed path is absent, the writer may still own the renamed inode;
+    restore that pathname instead of treating live audio as closed.
+    """
+    recovered = []
+    working = Path(AIRCHECK_CURRENT_PATH)
+    pending = _pending_handoffs(session)
+    for sequence, handoff in pending:
+        committed = _segment_path(session, sequence)
+        if committed.exists():
+            recovered.append(_copy_handoff_to_staging(session, sequence, handoff))
+            continue
+        if not working.exists():
+            try:
+                handoff.rename(working)
+            except OSError as exc:
+                raise SegmentError(f"cannot restore pending active handoff {handoff}: {exc}")
+            raise SegmentError(
+                "restored a pending handoff to the active working path; retry segmentation later"
+            )
+        recovered.append(_copy_handoff_to_staging(session, sequence, handoff))
+    return recovered
+
+
+def _isolate_active_working_file(session, sequence):
+    """Perform the proven rename-before-reopen cut primitive.
+
+    Liquidsoap keeps writing the renamed inode until reopen is processed,
+    so samples produced between these operations remain in the old
+    segment. On an acknowledged failure with no new fixed path, rename
+    that still-open inode back so capture continues coherently.
+    """
+    working = Path(AIRCHECK_CURRENT_PATH)
+    handoff = _handoff_path(session, sequence)
+    if handoff.exists():
+        raise SegmentError(f"handoff already exists: {handoff}")
+    try:
+        working.rename(handoff)
+    except FileNotFoundError:
+        raise SegmentError(f"working file {working} is missing")
+    except OSError as exc:
+        raise SegmentError(f"cannot isolate working file {working}: {exc}")
+
+    try:
+        _send_telnet(f"{AIRCHECK_OUTPUT_ID}.reopen")
+    except TelnetError as exc:
+        if not working.exists():
+            try:
+                handoff.rename(working)
+            except OSError as restore_exc:
+                raise SegmentError(
+                    f"reopen failed ({exc}); active handoff retained at {handoff}; "
+                    f"working-path restore also failed: {restore_exc}"
+                )
+            raise SegmentError(
+                f"reopen failed ({exc}); active working pathname restored"
+            )
+        # The command can be processed even if its response is lost. A
+        # new fixed path is objective evidence that the boundary happened;
+        # preserve the closed handoff but still report the control failure.
+        raise SegmentError(
+            f"reopen response failed ({exc}) after a new working path appeared; "
+            f"closed handoff retained at {handoff}"
+        )
+    return handoff
+
+
+def _cut_and_stage_active_segment(session):
+    """Cut and persist exactly one active-session segment."""
+    # Preflight persistent ownership before moving the only active path.
+    staging = _staging_dir(session)
+    try:
+        staging.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise SegmentError(f"cannot create staging directory {staging}: {exc}")
+
+    _recover_pending_handoffs(session)
+    sequence = _next_segment_sequence(session)
+    handoff = _isolate_active_working_file(session, sequence)
+    return _copy_handoff_to_staging(session, sequence, handoff)
+
+
 def stop_recording():
     """Stop the currently-running session, if any. Returns
-    (session, error). Triggers a fresh reopen so the working file
-    gets closed cleanly, then finalizes the just-closed file to the
-    session's destination.
+    (session, error). The active working inode is renamed before reopen,
+    using the same preservation-safe boundary as maintenance.
 
     Finalization branches on format:
-      - mp3/flac/wav: synchronous shutil.move from tmpfs to disk.
-        Blocks for the duration of the copy (~1s per hundred MB on
-        a spinning disk).
-      - he_aac: fdkaac has been writing ADTS-framed AAC to the
-        working file, which is streamable but not the .m4a container
-        the session's dest expects. Move the ADTS working file to a
-        session-tagged intermediate name in /run (near-instant on
-        tmpfs), mark the session as ended with a "remux pending"
-        note, and hand off to a daemon thread that ffmpeg-remuxes
-        (ADTS -> m4a, `-c copy`, no re-encode) and updates the row
-        on completion. Stop returns to the caller within a few ms
-        rather than waiting seconds for the remux.
+      - an ordinary short MP3/FLAC/WAV session keeps the direct-move
+        fast path;
+      - an ordinary HE-AAC session keeps the existing async ADTS->M4A
+        remux path;
+      - any session with persistent segments (or an unexpectedly large
+        final working file) stages the final source and asynchronously
+        finalizes the ordered set into one destination container.
 
-        Runs under AIRCHECK_LOCK_PATH, blocking, for the synchronous
-        portion only -- through the point the working file has been
-        moved/renamed off AIRCHECK_CURRENT_PATH and the session row
-        updated. The async he_aac remux thread (which only ever
-        touches its own intermediate file, never AIRCHECK_CURRENT_PATH)
-        deliberately runs AFTER the lock is released -- holding it for
-        up to ffmpeg's 600s timeout would starve idle maintenance and
-        any subsequent Start/Stop for far too long."""
+    The lock is released before multi-segment ffmpeg finalization starts,
+    so another logical session can begin immediately. All essential
+    source state lives in persistent staging, not only in the daemon
+    thread."""
+    segmented_job = None
     with _aircheck_lock(blocking=True):
         session = AircheckSession.objects.filter(still_running=True).order_by("-started_at").first()
         if session is None:
             return None, "no active session"
 
-        telnet_note = ""
         try:
-            _send_telnet(f"{AIRCHECK_OUTPUT_ID}.reopen")
-        except TelnetError as exc:
-            # Working file may still be flushed on close by whatever's
-            # left of liquidsoap; we can still attempt the finalization
-            # below.
-            telnet_note = f"telnet reopen failed at Stop: {exc}; "
+            _recover_pending_handoffs(session)
+        except SegmentError as exc:
+            return None, f"cannot recover pending Aircheck segment: {exc}"
 
         working = Path(AIRCHECK_CURRENT_PATH)
         dest = Path(session.filename)
-        session.still_running = False
-        session.ended_at = timezone.now()
+        prior_segments = _discover_segments(session)
+        try:
+            working_size = working.stat().st_size
+        except OSError:
+            working_size = None
+        use_segmented_finalization = bool(prior_segments) or (
+            working_size is not None and working_size >= AIRCHECK_WORKING_FILE_MAX_BYTES
+        )
 
-        if session.audio_format == "he_aac":
-            _finalize_he_aac_async(session, working, dest, telnet_note)
+        # Preserve the established short-session missing-file behavior:
+        # there is no source inode to abandon, so end the row and record
+        # the ordinary "no audio to move/remux" finalization error. With
+        # earlier committed segments, however, a missing current path is
+        # an unsafe/incomplete final boundary and Stop must remain retryable.
+        if not working.is_file() and not prior_segments:
+            telnet_note = ""
+            try:
+                _send_telnet(f"{AIRCHECK_OUTPUT_ID}.reopen")
+            except TelnetError as exc:
+                telnet_note = f"telnet reopen failed at Stop: {exc}; "
+            session.still_running = False
+            session.ended_at = timezone.now()
+            if session.audio_format == "he_aac":
+                _finalize_he_aac_async(session, working, dest, telnet_note)
+            else:
+                _finalize_direct_move(session, working, dest, telnet_note)
+            return session, None
+
+        sequence = _next_segment_sequence(session)
+        try:
+            handoff = _isolate_active_working_file(session, sequence)
+        except SegmentError as exc:
+            # Stop did not obtain a safe boundary. Keep the logical
+            # session running so the operator can retry without losing
+            # the still-active source.
+            return None, f"could not stop Aircheck safely: {exc}"
+
+        if use_segmented_finalization:
+            try:
+                _copy_handoff_to_staging(session, sequence, handoff)
+            except SegmentError as exc:
+                # A new working file is already capturing. Keep the
+                # logical session active and the handoff recoverable;
+                # the next maintenance/Stop call will retry the copy.
+                emit_event(
+                    category="aircheck", level="warning",
+                    title="Aircheck final segment staging failed",
+                    detail={"session_id": session.id, "error": str(exc)},
+                    dedupe_key=f"aircheck|final-segment-stage|{session.id}",
+                )
+                return None, f"could not persist final Aircheck segment: {exc}"
+            session.still_running = False
+            session.ended_at = timezone.now()
+            session.exit_note = FINALIZATION_PENDING_NOTE
+            session.save(update_fields=["still_running", "ended_at", "exit_note"])
+            segmented_job = (session.id, str(dest))
+        elif session.audio_format == "he_aac":
+            session.still_running = False
+            session.ended_at = timezone.now()
+            _finalize_he_aac_async(session, handoff, dest, "")
         else:
-            _finalize_direct_move(session, working, dest, telnet_note)
+            session.still_running = False
+            session.ended_at = timezone.now()
+            _finalize_direct_move(session, handoff, dest, "")
 
-        return session, None
+    if segmented_job is not None:
+        t = threading.Thread(
+            target=_segmented_finalize_worker,
+            args=segmented_job,
+            daemon=True,
+            name=f"aircheck-finalize-{session.id}",
+        )
+        t.start()
+    return session, None
 
 
 def _finalize_direct_move(session, working, dest, telnet_note):
@@ -496,6 +806,175 @@ def _mark_remux_failed(session_id, telnet_note, err):
         pass
 
 
+def _write_concat_manifest(path, segments):
+    """Atomically publish an ffconcat list. Committed segments have
+    deterministic names, while this manifest and transfer partials are
+    deliberately distinguishable from source audio discovery."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    lines = []
+    for segment in segments:
+        escaped = str(segment.resolve()).replace("'", "'\\''")
+        lines.append(f"file '{escaped}'\n")
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.writelines(lines)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        _fsync_directory(path.parent)
+    except OSError as exc:
+        raise SegmentError(f"cannot write concat manifest: {exc}")
+
+
+def _validate_final_audio(path):
+    if not path.is_file() or path.stat().st_size <= 0:
+        raise SegmentError(f"final output is missing or empty: {path}")
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error", "-select_streams", "a:0",
+                "-show_entries", "stream=codec_type:format=duration", "-of", "json",
+                str(path),
+            ],
+            capture_output=True, text=True, timeout=60, check=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        raise SegmentError(
+            f"ffprobe rejected final output: {(exc.stderr or '').strip()[:300]}"
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        raise SegmentError(f"ffprobe failed for final output: {exc}")
+    try:
+        probe = json.loads(result.stdout)
+        streams = probe.get("streams") or []
+        duration = float((probe.get("format") or {}).get("duration", 0))
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise SegmentError(f"ffprobe returned invalid final-output metadata: {exc}")
+    if not streams or streams[0].get("codec_type") != "audio":
+        raise SegmentError(f"final output has no decodable audio stream: {path}")
+    if duration <= 0:
+        raise SegmentError(f"final output has no positive duration: {path}")
+
+
+def _finalize_segment_set(session, dest):
+    """Stream-copy all committed source segments into one final file.
+
+    The concat demuxer normalizes packet ordering for MP3/ADTS and writes
+    one correct output container. WAV likewise becomes one WAV mux with
+    one final header -- source containers are never byte-appended.
+    HE-AAC adds the standard ADTS-to-ASC bitstream filter for M4A. FLAC
+    is the one exception to stream-copy: its STREAMINFO total-samples
+    metadata remains that of the first source under ffmpeg ``-c copy``,
+    so ffmpeg performs a lossless FLAC decode/re-encode to write a
+    truthful single-stream header.
+    """
+    segments = _discover_segments(session)
+    if not segments:
+        raise SegmentError("no committed segments available for finalization")
+    staging = _staging_dir(session)
+    manifest = staging / "segments.ffconcat"
+    _write_concat_manifest(manifest, segments)
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    partial_dest = dest.parent / (
+        f".{dest.stem}.aircheck-partial-{session.id}{dest.suffix}"
+    )
+    try:
+        partial_dest.unlink(missing_ok=True)
+    except OSError as exc:
+        raise SegmentError(f"cannot clear prior finalization partial: {exc}")
+
+    cmd = [
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
+        "-f", "concat", "-safe", "0", "-i", str(manifest),
+        "-map", "0:a:0", "-c:a", "flac" if session.audio_format == "flac" else "copy",
+    ]
+    if session.audio_format == "he_aac":
+        cmd += ["-bsf:a", "aac_adtstoasc"]
+    cmd.append(str(partial_dest))
+    try:
+        subprocess.run(
+            cmd, capture_output=True, text=True,
+            timeout=FFMPEG_TIMEOUT_SECONDS, check=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        raise SegmentError(
+            f"ffmpeg concat exit {exc.returncode}: {(exc.stderr or '').strip()[:300]}"
+        )
+    except subprocess.TimeoutExpired:
+        raise SegmentError(
+            f"ffmpeg concat timed out after {FFMPEG_TIMEOUT_SECONDS}s"
+        )
+    except OSError as exc:
+        raise SegmentError(f"ffmpeg concat spawn failed: {exc}")
+
+    _validate_final_audio(partial_dest)
+    try:
+        os.replace(partial_dest, dest)
+        _fsync_directory(dest.parent)
+    except OSError as exc:
+        raise SegmentError(f"cannot publish final Aircheck output: {exc}")
+
+    # Only a validated, atomically-published destination authorizes
+    # source cleanup.
+    for segment in segments:
+        segment.unlink()
+    manifest.unlink(missing_ok=True)
+    for partial in staging.glob(f".*{SEGMENT_PARTIAL_SUFFIX}"):
+        partial.unlink(missing_ok=True)
+    try:
+        staging.rmdir()
+        staging.parent.rmdir()
+    except OSError:
+        pass
+    return dest.stat().st_size
+
+
+def _mark_segmented_finalization_failed(session_id, err):
+    message = f"finalization failed: {str(err)[:170]}"
+    try:
+        session = AircheckSession.objects.get(id=session_id)
+        session.exit_note = message
+        session.save(update_fields=["exit_note"])
+    except AircheckSession.DoesNotExist:
+        pass
+    emit_event(
+        category="aircheck", level="warning",
+        title="Aircheck segmented finalization failed",
+        detail={"session_id": session_id, "error": str(err)},
+        dedupe_key=f"aircheck|segmented-finalization|{session_id}",
+    )
+
+
+def _segmented_finalize_worker(session_id, dest_path):
+    """Finalize persistent segments outside AIRCHECK_LOCK_PATH.
+
+    A daemon-thread/process exit can leave the row pending, but never
+    destroys the deterministic on-disk sources. Pass 1.13B may add a
+    retry/retention supervisor; today an operator can rerun this helper
+    from a Django shell after inspecting the preserved staging set.
+    """
+    close_old_connections()
+    try:
+        try:
+            session = AircheckSession.objects.get(id=session_id)
+        except AircheckSession.DoesNotExist:
+            return
+        dest = Path(dest_path)
+        try:
+            size = _finalize_segment_set(session, dest)
+        except Exception as exc:
+            _mark_segmented_finalization_failed(session_id, exc)
+            return
+
+        session.size_bytes = size
+        session.exit_note = ""
+        session.save(update_fields=["size_bytes", "exit_note"])
+        _sync_finalized_recording_to_library(dest)
+    finally:
+        close_old_connections()
+
+
 def _sync_finalized_recording_to_library(dest):
     """Best-effort: if AircheckConfig.output_directory happens to live
     under LIBRARY_ROOT with a matching Category (see sync_track_file's
@@ -545,42 +1024,52 @@ def _sync_finalized_recording_to_library(dest):
         close_old_connections()
 
 
-def maintain_idle_buffer(max_bytes=AIRCHECK_IDLE_BUFFER_MAX_BYTES):
-    """Idle-time protection against unbounded growth of the always-on
-    working file at AIRCHECK_CURRENT_PATH (see module docstring and
-    encoder_manager._aircheck_block -- output.file never stops writing,
-    even with no Aircheck session in progress, and is only otherwise
-    cut on an explicit Start/Stop). Intended to be called on a ~1min
-    timer via the maintain_aircheck_buffer management command.
+def maintain_idle_buffer(max_bytes=None):
+    """Bound the always-on Liquidsoap working file in idle and active use.
 
-    Deliberately narrow: the ONLY action this ever takes is the same
-    `aircheck.reopen` telnet call Start/Stop already use, and only when
-    genuinely idle and oversized. Never unlinks, renames, truncates, or
-    otherwise touches the working file from Python, and never creates
-    or modifies an AircheckSession -- a normal idle rollover is
-    invisible to session history, exactly like the file being cut by a
-    real Start/Stop is the only thing that should ever appear there.
+    Idle rollover retains the established reopen-and-discard behavior.
+    During a logical recording, an oversized working inode is instead
+    isolated with rename-before-reopen and copied into persistent,
+    session-owned staging. The session stays active and the newly opened
+    fixed path continues capture. The timer cadence means ``max_bytes``
+    is an observed cut trigger, not an exact upper bound.
 
     Returns one of:
       "lock_busy"      -- a real Start/Stop (or another maintenance
                            run) currently holds AIRCHECK_LOCK_PATH;
                            skipped harmlessly, retried next cycle.
-      "active_session"  -- an AircheckSession is running; never rolls
-                           over a file a real session is relying on.
       "missing"         -- AIRCHECK_CURRENT_PATH doesn't exist (e.g.
                            encoders not up yet); nothing to do.
-      "below_limit"     -- working file is under max_bytes; no-op.
-      "rolled"          -- issued exactly one aircheck.reopen.
-      "error"           -- stat failed, or the telnet reopen itself
-                           failed; file/session left untouched, a
-                           deduplicated warning SystemEvent is emitted
-                           (telnet-failure case only)."""
+      "idle_below_limit" / "active_below_limit" -- no-op.
+      "idle_rolled"     -- issued one idle aircheck.reopen.
+      "active_segmented" -- one active segment reached persistent storage.
+      "idle_error" / "active_segment_failed" -- preservation-safe
+                           failure; a deduplicated warning is emitted
+                           for actionable cut/transfer failures."""
+    if max_bytes is None:
+        max_bytes = AIRCHECK_WORKING_FILE_MAX_BYTES
+
     with _aircheck_lock(blocking=False) as acquired:
         if not acquired:
             return "lock_busy"
 
-        if AircheckSession.objects.filter(still_running=True).exists():
-            return "active_session"
+        session = (
+            AircheckSession.objects.filter(still_running=True)
+            .order_by("-started_at")
+            .first()
+        )
+        recovered = []
+        if session is not None and _pending_handoffs(session):
+            try:
+                recovered = _recover_pending_handoffs(session)
+            except SegmentError as exc:
+                emit_event(
+                    category="aircheck", level="warning",
+                    title="Active Aircheck segment recovery failed",
+                    detail={"session_id": session.id, "error": str(exc)},
+                    dedupe_key=f"aircheck|active-segment-failed|{session.id}",
+                )
+                return "active_segment_failed"
 
         working = Path(AIRCHECK_CURRENT_PATH)
         try:
@@ -588,10 +1077,30 @@ def maintain_idle_buffer(max_bytes=AIRCHECK_IDLE_BUFFER_MAX_BYTES):
         except FileNotFoundError:
             return "missing"
         except OSError:
-            return "error"
+            return "active_segment_failed" if session else "idle_error"
 
         if size < max_bytes:
-            return "below_limit"
+            if recovered:
+                return "active_segmented"
+            return "active_below_limit" if session else "idle_below_limit"
+
+        if session is not None:
+            try:
+                _cut_and_stage_active_segment(session)
+            except SegmentError as exc:
+                emit_event(
+                    category="aircheck", level="warning",
+                    title="Active Aircheck segmentation failed",
+                    detail={
+                        "session_id": session.id,
+                        "error": str(exc),
+                        "size_bytes": size,
+                        "max_bytes": max_bytes,
+                    },
+                    dedupe_key=f"aircheck|active-segment-failed|{session.id}",
+                )
+                return "active_segment_failed"
+            return "active_segmented"
 
         try:
             _send_telnet(f"{AIRCHECK_OUTPUT_ID}.reopen")
@@ -602,9 +1111,9 @@ def maintain_idle_buffer(max_bytes=AIRCHECK_IDLE_BUFFER_MAX_BYTES):
                 detail={"error": str(exc), "size_bytes": size, "max_bytes": max_bytes},
                 dedupe_key="aircheck|idle-buffer-reopen-failed",
             )
-            return "error"
+            return "idle_error"
 
-        return "rolled"
+        return "idle_rolled"
 
 
 def classify_finalization(session):
@@ -627,7 +1136,7 @@ def classify_finalization(session):
     if session.still_running:
         return "recording"
     note = session.exit_note or ""
-    if REMUX_PENDING_NOTE in note:
+    if REMUX_PENDING_NOTE in note or FINALIZATION_PENDING_NOTE in note:
         return "finalizing"
     if any(marker in note for marker in FINALIZATION_ERROR_MARKERS):
         return "error"
@@ -663,25 +1172,25 @@ def record_buffer_heartbeat(result, size_bytes, max_bytes):
     """Persist the outcome of one maintain_idle_buffer invocation to
     AIRCHECK_BUFFER_STATE_PATH for the /monitoring/ Aircheck card to
     read. Called by the maintain_aircheck_buffer management command
-    AFTER maintain_idle_buffer has already made its (unchanged) rollover
+    AFTER maintain_idle_buffer has already made its rollover/segmentation
     decision -- this function is pure reporting and never influences
     that decision.
 
-    last_rollover_at is preserved across invocations that didn't roll
-    (so the card can still show "last rollover: 2h ago" on an ordinary
-    below_limit cycle) and only refreshed to this invocation's
-    checked_at when result == "rolled".
+    Idle rollover and active segmentation timestamps are preserved
+    independently across other results.
 
     Best-effort both ways: a missing or malformed prior state file is
     treated as "no prior state" rather than raised, and a write failure
     (e.g. /run momentarily unwritable) is swallowed -- this heartbeat
     must never be able to fail the maintenance command itself."""
     prior_rollover_at = None
+    prior_segmented_at = None
     try:
         with open(AIRCHECK_BUFFER_STATE_PATH, "r", encoding="utf-8") as f:
             prior = json.load(f)
         if isinstance(prior, dict):
             prior_rollover_at = prior.get("last_rollover_at")
+            prior_segmented_at = prior.get("last_segmented_at")
     except (OSError, ValueError):
         pass  # missing or malformed prior state -- start fresh, not fatal
 
@@ -691,7 +1200,8 @@ def record_buffer_heartbeat(result, size_bytes, max_bytes):
         "result": result,
         "size_bytes": size_bytes,
         "max_bytes": max_bytes,
-        "last_rollover_at": checked_at if result == "rolled" else prior_rollover_at,
+        "last_rollover_at": checked_at if result == "idle_rolled" else prior_rollover_at,
+        "last_segmented_at": checked_at if result == "active_segmented" else prior_segmented_at,
     }
     try:
         _atomic_write_json(Path(AIRCHECK_BUFFER_STATE_PATH), state)

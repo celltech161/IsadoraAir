@@ -1,5 +1,5 @@
 [Unit]
-Description=Roll over the idle Aircheck working buffer once a minute if it has grown past the safety limit
+Description=Bound the Aircheck working buffer once a minute during idle and active sessions
 
 [Timer]
 OnBootSec=1min

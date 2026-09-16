@@ -97,14 +97,14 @@ class IdleBufferMaintenanceTests(AircheckRecorderTestBase):
         self.write_working_file(50)
         with patch.object(recorder, "_send_telnet") as telnet:
             result = recorder.maintain_idle_buffer(max_bytes=100)
-        self.assertEqual(result, "below_limit")
+        self.assertEqual(result, "idle_below_limit")
         telnet.assert_not_called()
 
     def test_oversized_idle_file_issues_exactly_one_reopen(self):
         self.write_working_file(200)
         with patch.object(recorder, "_send_telnet") as telnet:
             result = recorder.maintain_idle_buffer(max_bytes=100)
-        self.assertEqual(result, "rolled")
+        self.assertEqual(result, "idle_rolled")
         telnet.assert_called_once_with(f"{recorder.AIRCHECK_OUTPUT_ID}.reopen")
 
     def test_successful_idle_rollover_touches_no_session(self):
@@ -112,19 +112,27 @@ class IdleBufferMaintenanceTests(AircheckRecorderTestBase):
         self.assertEqual(AircheckSession.objects.count(), 0)
         with patch.object(recorder, "_send_telnet"):
             result = recorder.maintain_idle_buffer(max_bytes=100)
-        self.assertEqual(result, "rolled")
+        self.assertEqual(result, "idle_rolled")
         self.assertEqual(AircheckSession.objects.count(), 0)
 
-    def test_active_session_with_oversized_file_skips_rollover(self):
-        AircheckSession.objects.create(
-            filename="/tmp/whatever.mp3", audio_format="mp3", bitrate="320k",
+    def test_active_session_with_oversized_file_is_persistently_segmented(self):
+        session = AircheckSession.objects.create(
+            filename=str(self.out_dir / "whatever.mp3"), audio_format="mp3", bitrate="320k",
             source_device="airtap", still_running=True,
         )
         self.write_working_file(200)
-        with patch.object(recorder, "_send_telnet") as telnet:
+        def reopen(_command):
+            self.write_working_file(1)
+        with patch.object(recorder, "_send_telnet", side_effect=reopen) as telnet:
             result = recorder.maintain_idle_buffer(max_bytes=100)
-        self.assertEqual(result, "active_session")
-        telnet.assert_not_called()
+        self.assertEqual(result, "active_segmented")
+        telnet.assert_called_once()
+        session.refresh_from_db()
+        self.assertTrue(session.still_running)
+        self.assertEqual(self.working_path.stat().st_size, 1)
+        segments = recorder._discover_segments(session)
+        self.assertEqual(len(segments), 1)
+        self.assertEqual(segments[0].stat().st_size, 200)
 
     def test_lock_busy_skips_with_no_reopen(self):
         self.write_working_file(200)
@@ -167,7 +175,7 @@ class IdleBufferMaintenanceTests(AircheckRecorderTestBase):
         self.write_working_file(200)
         with patch.object(recorder, "_send_telnet", side_effect=recorder.TelnetError("no route")):
             result = recorder.maintain_idle_buffer(max_bytes=100)
-        self.assertEqual(result, "error")
+        self.assertEqual(result, "idle_error")
         # File left completely untouched -- no destructive action taken.
         self.assertTrue(self.working_path.exists())
         self.assertEqual(self.working_path.stat().st_size, 200)
@@ -190,8 +198,8 @@ class IdleBufferMaintenanceTests(AircheckRecorderTestBase):
         with patch.object(recorder, "_send_telnet") as telnet:
             first = recorder.maintain_idle_buffer(max_bytes=100)
             second = recorder.maintain_idle_buffer(max_bytes=100)
-        self.assertEqual(first, "below_limit")
-        self.assertEqual(second, "below_limit")
+        self.assertEqual(first, "idle_below_limit")
+        self.assertEqual(second, "idle_below_limit")
         telnet.assert_not_called()
         self.assertEqual(SystemEvent.objects.count(), 0)
 
@@ -383,39 +391,39 @@ class BufferHeartbeatTests(AircheckRecorderTestBase):
 
     def test_first_heartbeat_with_no_prior_file(self):
         self.assertFalse(Path(self.buffer_state_path).exists())
-        recorder.record_buffer_heartbeat("below_limit", 1234, recorder.AIRCHECK_IDLE_BUFFER_MAX_BYTES)
+        recorder.record_buffer_heartbeat("idle_below_limit", 1234, recorder.AIRCHECK_WORKING_FILE_MAX_BYTES)
 
         state = self._read_state()
-        self.assertEqual(state["result"], "below_limit")
+        self.assertEqual(state["result"], "idle_below_limit")
         self.assertEqual(state["size_bytes"], 1234)
-        self.assertEqual(state["max_bytes"], recorder.AIRCHECK_IDLE_BUFFER_MAX_BYTES)
+        self.assertEqual(state["max_bytes"], recorder.AIRCHECK_WORKING_FILE_MAX_BYTES)
         self.assertIsInstance(state["checked_at"], (int, float))
         self.assertIsNone(state["last_rollover_at"])
 
     def test_normal_below_limit_heartbeat(self):
-        recorder.record_buffer_heartbeat("below_limit", 500, 1000)
+        recorder.record_buffer_heartbeat("idle_below_limit", 500, 1000)
         state = self._read_state()
-        self.assertEqual(state["result"], "below_limit")
+        self.assertEqual(state["result"], "idle_below_limit")
         self.assertEqual(state["size_bytes"], 500)
         self.assertEqual(state["max_bytes"], 1000)
         self.assertIsNone(state["last_rollover_at"])
 
     def test_rolled_heartbeat_records_last_rollover_at(self):
-        recorder.record_buffer_heartbeat("rolled", 200, 1000)
+        recorder.record_buffer_heartbeat("idle_rolled", 200, 1000)
         state = self._read_state()
-        self.assertEqual(state["result"], "rolled")
+        self.assertEqual(state["result"], "idle_rolled")
         self.assertIsNotNone(state["last_rollover_at"])
         self.assertEqual(state["last_rollover_at"], state["checked_at"])
 
     def test_later_below_limit_heartbeat_preserves_last_rollover_at(self):
-        recorder.record_buffer_heartbeat("rolled", 200, 1000)
+        recorder.record_buffer_heartbeat("idle_rolled", 200, 1000)
         rolled_state = self._read_state()
         rollover_at = rolled_state["last_rollover_at"]
         self.assertIsNotNone(rollover_at)
 
-        recorder.record_buffer_heartbeat("below_limit", 300, 1000)
+        recorder.record_buffer_heartbeat("idle_below_limit", 300, 1000)
         later_state = self._read_state()
-        self.assertEqual(later_state["result"], "below_limit")
+        self.assertEqual(later_state["result"], "idle_below_limit")
         self.assertEqual(later_state["last_rollover_at"], rollover_at)
         # checked_at itself still advances even though last_rollover_at didn't.
         self.assertGreaterEqual(later_state["checked_at"], rolled_state["checked_at"])
@@ -425,21 +433,27 @@ class BufferHeartbeatTests(AircheckRecorderTestBase):
         with open(self.buffer_state_path, "w", encoding="utf-8") as f:
             f.write("{not valid json::")
 
-        recorder.record_buffer_heartbeat("below_limit", 42, 1000)  # must not raise
+        recorder.record_buffer_heartbeat("idle_below_limit", 42, 1000)  # must not raise
 
         state = self._read_state()
-        self.assertEqual(state["result"], "below_limit")
+        self.assertEqual(state["result"], "idle_below_limit")
         self.assertIsNone(state["last_rollover_at"])  # malformed prior treated as "no prior state"
 
     def test_atomic_write_leaves_no_tmp_file_and_valid_json(self):
-        recorder.record_buffer_heartbeat("rolled", 10, 1000)
-        recorder.record_buffer_heartbeat("below_limit", 20, 1000)
+        recorder.record_buffer_heartbeat("idle_rolled", 10, 1000)
+        recorder.record_buffer_heartbeat("idle_below_limit", 20, 1000)
 
         tmp_path = Path(self.buffer_state_path).with_suffix(".tmp")
         self.assertFalse(tmp_path.exists())
         # If this parses, the final file was never left half-written.
         state = self._read_state()
-        self.assertEqual(state["result"], "below_limit")
+        self.assertEqual(state["result"], "idle_below_limit")
+
+    def test_active_segment_heartbeat_tracks_separate_timestamp(self):
+        recorder.record_buffer_heartbeat("active_segmented", 10, 1000)
+        state = self._read_state()
+        self.assertEqual(state["last_segmented_at"], state["checked_at"])
+        self.assertIsNone(state["last_rollover_at"])
 
 
 class FinalizationClassificationTests(AircheckRecorderTestBase):
@@ -462,6 +476,10 @@ class FinalizationClassificationTests(AircheckRecorderTestBase):
 
     def test_remux_pending_is_finalizing(self):
         session = self._make(False, exit_note=recorder.REMUX_PENDING_NOTE)
+        self.assertEqual(recorder.classify_finalization(session), "finalizing")
+
+    def test_segmented_finalization_pending_is_finalizing(self):
+        session = self._make(False, exit_note=recorder.FINALIZATION_PENDING_NOTE)
         self.assertEqual(recorder.classify_finalization(session), "finalizing")
 
     def test_remux_failed_is_error(self):

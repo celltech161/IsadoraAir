@@ -77,12 +77,19 @@ def _maintenance_dict():
         # No usable heartbeat yet (missing file, malformed JSON, or a
         # checked_at that isn't actually a timestamp) -- unknown, not
         # "not stale". Never invent a healthy state from absence.
-        return {"result": None, "checked_at": None, "last_rollover_at": None, "stale": None}
+        return {
+            "result": None,
+            "checked_at": None,
+            "last_rollover_at": None,
+            "last_segmented_at": None,
+            "stale": None,
+        }
     age_seconds = timezone.now().timestamp() - checked_at
     return {
         "result": heartbeat.get("result"),
         "checked_at": checked_at,
         "last_rollover_at": heartbeat.get("last_rollover_at"),
+        "last_segmented_at": heartbeat.get("last_segmented_at"),
         "stale": age_seconds > recorder.AIRCHECK_BUFFER_HEARTBEAT_STALE_SECONDS,
     }
 
@@ -97,7 +104,7 @@ def _buffer_dict():
     return {
         "exists": exists,
         "size_bytes": size_bytes,
-        "max_bytes": recorder.AIRCHECK_IDLE_BUFFER_MAX_BYTES,
+        "max_bytes": recorder.AIRCHECK_WORKING_FILE_MAX_BYTES,
         "maintenance": _maintenance_dict(),
     }
 
@@ -107,8 +114,8 @@ def api_aircheck_status(request):
     """Current recording state -- polled by the /monitoring/ card so
     the button reflects reality even if a session was started from a
     different admin session or reaped after a worker restart. Also
-    reports the idle working-buffer's live size relative to the idle
-    rollover threshold, the maintenance heartbeat's health, and the
+    reports the working segment's live size relative to the shared
+    idle/active cut threshold, the maintenance heartbeat's health, and the
     most recently stopped session's finalization state -- all
     read-only stats/JSON reads, tolerant of anything being missing or
     malformed so this endpoint never 500s over a runtime status file."""

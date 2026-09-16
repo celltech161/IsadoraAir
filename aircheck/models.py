@@ -115,8 +115,9 @@ class AircheckSession(models.Model):
     file was manually deleted).
 
     still_running defaults to True on create; the stop endpoint flips
-    it and sets end_time. A row still marked running whose ffmpeg PID
-    is dead is recovered on the next start attempt.
+    it and sets ended_at. The legacy ffmpeg_pid is not used by the
+    Liquidsoap-owned recorder. Long logical sessions may have durable
+    internal segments, but still produce this row's single filename.
     """
     started_at = models.DateTimeField(auto_now_add=True)
     ended_at = models.DateTimeField(null=True, blank=True)

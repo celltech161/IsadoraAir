@@ -33,10 +33,10 @@ class MaintainAircheckBufferCommandTests(AircheckRecorderTestBase):
     def test_heartbeat_uses_the_patched_working_file_not_the_real_one(self):
         self.write_working_file(500)
         output = self.run_command("--max-bytes", "1000")
-        self.assertIn("below_limit", output)
+        self.assertIn("idle_below_limit", output)
 
         state = self._read_heartbeat()
-        self.assertEqual(state["result"], "below_limit")
+        self.assertEqual(state["result"], "idle_below_limit")
         # This is the regression check: size_bytes must come from the
         # per-test tempdir file, never the real /run/isadoraair path.
         self.assertEqual(state["size_bytes"], 500)
@@ -46,14 +46,14 @@ class MaintainAircheckBufferCommandTests(AircheckRecorderTestBase):
         self.write_working_file(2000)
         self.run_command("--max-bytes", "1000")
         state = self._read_heartbeat()
-        self.assertEqual(state["result"], "rolled")
+        self.assertEqual(state["result"], "idle_rolled")
         self.assertIsNotNone(state["last_rollover_at"])
 
     def test_default_max_bytes_uses_patched_production_constant(self):
         self.write_working_file(100)
-        self.run_command()  # no --max-bytes: must use recorder.AIRCHECK_IDLE_BUFFER_MAX_BYTES
+        self.run_command()  # no --max-bytes: must use the production ceiling
         state = self._read_heartbeat()
-        self.assertEqual(state["max_bytes"], recorder.AIRCHECK_IDLE_BUFFER_MAX_BYTES)
+        self.assertEqual(state["max_bytes"], recorder.AIRCHECK_WORKING_FILE_MAX_BYTES)
 
     def test_missing_working_file_records_null_size(self):
         self.assertFalse(self.working_path.exists())

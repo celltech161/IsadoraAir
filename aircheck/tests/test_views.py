@@ -41,9 +41,9 @@ class AircheckStatusApiTests(AircheckRecorderFixtureMixin, TestCase):
 
     def write_heartbeat(self, **overrides):
         state = {
-            "checked_at": time.time(), "result": "below_limit",
-            "size_bytes": 100, "max_bytes": recorder.AIRCHECK_IDLE_BUFFER_MAX_BYTES,
-            "last_rollover_at": None,
+            "checked_at": time.time(), "result": "idle_below_limit",
+            "size_bytes": 100, "max_bytes": recorder.AIRCHECK_WORKING_FILE_MAX_BYTES,
+            "last_rollover_at": None, "last_segmented_at": None,
         }
         state.update(overrides)
         Path(self.buffer_state_path).parent.mkdir(parents=True, exist_ok=True)
@@ -72,7 +72,7 @@ class AircheckStatusApiTests(AircheckRecorderFixtureMixin, TestCase):
         data = self.status()
         self.assertFalse(data["recording"])
         self.assertEqual(data["buffer"]["size_bytes"], 12345)
-        self.assertEqual(data["buffer"]["max_bytes"], recorder.AIRCHECK_IDLE_BUFFER_MAX_BYTES)
+        self.assertEqual(data["buffer"]["max_bytes"], recorder.AIRCHECK_WORKING_FILE_MAX_BYTES)
 
     def test_missing_working_file_returns_safe_status_not_500(self):
         self.assertFalse(self.working_path.exists())
@@ -91,10 +91,10 @@ class AircheckStatusApiTests(AircheckRecorderFixtureMixin, TestCase):
         self.assertIsNone(m["stale"])  # unknown, not "not stale"
 
     def test_fresh_heartbeat_is_not_stale(self):
-        self.write_heartbeat(checked_at=time.time() - 5, result="below_limit")
+        self.write_heartbeat(checked_at=time.time() - 5, result="active_below_limit")
         data = self.status()
         m = data["buffer"]["maintenance"]
-        self.assertEqual(m["result"], "below_limit")
+        self.assertEqual(m["result"], "active_below_limit")
         self.assertFalse(m["stale"])
 
     def test_old_heartbeat_is_stale(self):
@@ -113,9 +113,23 @@ class AircheckStatusApiTests(AircheckRecorderFixtureMixin, TestCase):
 
     def test_rolled_heartbeat_reports_last_rollover_at(self):
         rollover_ts = time.time() - 3600
-        self.write_heartbeat(result="below_limit", last_rollover_at=rollover_ts)
+        self.write_heartbeat(result="idle_below_limit", last_rollover_at=rollover_ts)
         data = self.status()
         self.assertEqual(data["buffer"]["maintenance"]["last_rollover_at"], rollover_ts)
+
+    def test_active_segment_heartbeat_reports_last_segmented_at(self):
+        segmented_ts = time.time() - 30
+        self.write_heartbeat(result="active_segmented", last_segmented_at=segmented_ts)
+        data = self.status()
+        self.assertEqual(data["buffer"]["maintenance"]["last_segmented_at"], segmented_ts)
+
+    def test_monitoring_card_describes_active_protection_not_pause(self):
+        response = self.client.get(reverse("monitoring:dashboard"))
+        self.assertEqual(response.status_code, 200)
+        body = response.content.decode("utf-8")
+        self.assertNotIn("paused while recording", body)
+        self.assertIn("Current segment:", body)
+        self.assertIn("active_segment_failed", body)
 
     # --- recent_session / finalization classification ---------------------
 
@@ -139,6 +153,11 @@ class AircheckStatusApiTests(AircheckRecorderFixtureMixin, TestCase):
 
     def test_he_aac_pending_session_classified_finalizing(self):
         self._make_session(False, exit_note=recorder.REMUX_PENDING_NOTE)
+        data = self.status()
+        self.assertEqual(data["recent_session"]["finalization"], "finalizing")
+
+    def test_segmented_session_classified_finalizing(self):
+        self._make_session(False, exit_note=recorder.FINALIZATION_PENDING_NOTE)
         data = self.status()
         self.assertEqual(data["recent_session"]["finalization"], "finalizing")
 

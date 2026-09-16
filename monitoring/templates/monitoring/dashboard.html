@@ -1288,11 +1288,9 @@ function truncateNote(note, maxLen) {
 }
 // Maps the buffer-guard maintenance heartbeat to a compact status line.
 // Priority: unknown (no heartbeat yet) > stale (timer itself looks dead)
-// > "paused while recording" (the card's own live recording knowledge,
-// more reliable than a once-a-minute heartbeat's result field) > the
-// heartbeat's own result. active_session/lock_busy are expected/benign,
-// never rendered as a warning -- see recorder.maintain_idle_buffer's
-// own return-value contract.
+// > actionable errors/unavailable > ordinary healthy/busy results.
+// Active recordings use the same guard: oversized working files become
+// persistent session segments rather than pausing protection.
 function bufferGuardStatus(buffer, recording) {
   const m = (buffer && buffer.maintenance) || {};
   if (m.checked_at == null) {
@@ -1302,10 +1300,7 @@ function bufferGuardStatus(buffer, recording) {
   if (m.stale) {
     return { text: `Buffer guard: stale • last checked ${agoText}`, color: '#f59e0b' };
   }
-  if (recording) {
-    return { text: `Buffer guard: paused while recording • checked ${agoText}`, color: 'var(--text-muted)' };
-  }
-  if (m.result === 'error') {
+  if (m.result === 'idle_error' || m.result === 'active_segment_failed') {
     return { text: `Buffer guard: error • checked ${agoText}`, color: 'var(--danger)' };
   }
   if (m.result === 'missing') {
@@ -1314,7 +1309,13 @@ function bufferGuardStatus(buffer, recording) {
   if (m.result === 'lock_busy') {
     return { text: `Buffer guard: busy • checked ${agoText}`, color: 'var(--text-muted)' };
   }
-  // below_limit, rolled, or anything else the guard reports while idle.
+  if (m.result === 'active_segmented') {
+    return { text: `Buffer guard: active segment persisted • checked ${agoText}`, color: 'var(--accent)' };
+  }
+  if (m.result === 'idle_rolled') {
+    return { text: `Buffer guard: idle rollover complete • checked ${agoText}`, color: 'var(--accent)' };
+  }
+  // idle/active below-limit and successful cut results are healthy.
   return { text: `Buffer guard: healthy • checked ${agoText}`, color: 'var(--accent)' };
 }
 function bufferBarStatusClass(percent) {
@@ -1349,21 +1350,28 @@ async function pollAircheck() {
         `<div style="font-size:0.7rem;color:var(--text-muted);margin-top:0.15rem;">${(s.filename || '').split('/').pop()}</div>` +
         guardLine;
       // Rare overlap: a new recording started while the PREVIOUS
-      // session's async HE-AAC remux is still finishing -- the active
+      // session's async finalization is still finishing -- the active
       // recording stays the primary (REC) state; this is just a small
       // secondary note, not a second card state.
       if (recent && recent.finalization === 'finalizing') {
         detailHtml += `<div style="font-size:0.65rem;color:var(--text-muted);margin-top:0.1rem;">` +
-          `Previous session still finalizing (HE-AAC remux)</div>`;
+          `Previous session still finalizing</div>`;
       }
       document.getElementById('aircheckDetail').innerHTML = detailHtml;
-      // Live working-file size, NOT AircheckSession.size_bytes (that
-      // field is only populated during/after Stop) -- and never shown
-      // relative to the idle 64 MiB limit, which is not a recording cap.
+      // Live current-segment size, NOT AircheckSession.size_bytes (that
+      // field is only populated during/after Stop). The threshold is a
+      // once-a-minute cut trigger, so a short overshoot is expected.
       document.getElementById('aircheckSize').textContent =
-        buffer.size_bytes != null ? `Current recording: ${fmtSize(buffer.size_bytes)}` : '';
+        buffer.size_bytes != null ? `Current segment: ${fmtSize(buffer.size_bytes)}${buffer.max_bytes ? ' / ' + fmtSize(buffer.max_bytes) : ''}` : '';
       document.getElementById('aircheckSize').className = 'mon-uptime';
-      document.getElementById('aircheckBufferBar').innerHTML = '';
+      if (buffer.size_bytes != null && buffer.max_bytes) {
+        const percent = (buffer.size_bytes / buffer.max_bytes) * 100;
+        document.getElementById('aircheckBufferBar').innerHTML =
+          `<div class="mon-bar-track" style="margin-top:0.3rem;"><div class="mon-bar-fill ${bufferBarStatusClass(percent)}" ` +
+          `style="width:${Math.max(0, Math.min(100, percent))}%;"></div></div>`;
+      } else {
+        document.getElementById('aircheckBufferBar').innerHTML = '';
+      }
       // Tick the elapsed clock every second between polls so it looks live.
       if (window._aircheckTick) clearInterval(window._aircheckTick);
       window._aircheckTick = setInterval(() => {
@@ -1376,13 +1384,13 @@ async function pollAircheck() {
       let detailHtml = '';
       if (finalizing) {
         detailHtml += `${(recent.filename || '').split('/').pop()}` +
-          `<div style="font-size:0.7rem;color:var(--text-muted);margin-top:0.15rem;">HE-AAC remux in progress</div>`;
+          `<div style="font-size:0.7rem;color:var(--text-muted);margin-top:0.15rem;">Finalization in progress</div>`;
       }
       detailHtml += guardLine;
 
       const rollover = buffer.maintenance && buffer.maintenance.last_rollover_at;
       detailHtml += `<div style="font-size:0.7rem;color:var(--text-muted);margin-top:0.15rem;">` +
-        (rollover ? `Last rollover: ${formatSince(rollover)} ago` : 'Last rollover: none yet') + `</div>`;
+        (rollover ? `Last idle rollover: ${formatSince(rollover)} ago` : 'Last idle rollover: none yet') + `</div>`;
 
       if (recent && !finalizing) {
         if (recent.finalization === 'error') {
@@ -1401,9 +1409,8 @@ async function pollAircheck() {
       }
       document.getElementById('aircheckDetail').innerHTML = detailHtml;
 
-      // Idle working-buffer size + progress bar, relative to the 64 MiB
-      // idle rollover threshold -- this branch only ever runs while NOT
-      // recording, so it can never be confused with a recording cap.
+      // Idle working-buffer size + progress bar relative to the same
+      // 64 MiB observed cut trigger used for active segments.
       if (buffer.exists && buffer.size_bytes != null && buffer.max_bytes) {
         const percent = (buffer.size_bytes / buffer.max_bytes) * 100;
         const barStatus = bufferBarStatusClass(percent);

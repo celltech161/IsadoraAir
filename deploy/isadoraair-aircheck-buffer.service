@@ -1,5 +1,5 @@
 [Unit]
-Description=IsadoraAir Aircheck idle working-buffer rollover maintenance
+Description=IsadoraAir Aircheck working-buffer rollover and active segmentation
 After=network.target postgresql.service isadoraair-encoders.service
 
 [Service]
