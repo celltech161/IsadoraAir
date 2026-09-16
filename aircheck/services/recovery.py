@@ -805,6 +805,72 @@ def inventory_summary(*, active_session_id=None):
     }
 
 
+# --- Default /run capacity MonitorCheck provisioning (P2 1.13B2) --------
+#
+# Originally a RunPython data migration (monitoring/migrations/0014_
+# seed_run_tmpfs_disk_check.py, P2 1.13B). Removed: RunPython falls
+# outside Update Center's Phase B v1 automatic-migration allowlist (see
+# updatecenter/management/commands/updatecenter_probe.py's
+# _classify_operation -- anything that isn't CreateModel/AddField/
+# AlterField classifies "manual"), so a pure default-row-seeding step
+# would have forced this entire release to require manual review to
+# deploy for no schema reason. monitoring/migrations/0013's own history
+# already established the fix for this exact situation: seed default
+# configuration through a normal runtime/activation path instead of a
+# migration. Here, that path is the existing recovery-maintenance
+# timer this same roadmap item already introduced.
+
+RUN_TMPFS_MONITOR_CHECK_NAME = "Disk: /run (runtime tmpfs)"
+RUN_TMPFS_MONITOR_CHECK_DEFAULTS = {
+    "kind": "disk",
+    "sort_order": 70,
+    "disk_path": "/run",
+    "warning_threshold": 60.0,
+    "critical_threshold": 75.0,
+}
+
+
+def ensure_run_tmpfs_monitor_check():
+    """Idempotently provisions the default "/run" capacity MonitorCheck.
+    Called only from the non-dry-run recovery-maintenance path (never
+    at import time, never from a model save(), never from a request
+    handler, never from dry-run) -- see run_recovery_maintenance.
+
+    Semantic-duplicate policy: a single kind="disk", disk_path="/run"
+    query covers both "the canonical named row already exists" (it
+    necessarily has this same kind/path) and "an operator already has
+    their own equivalent /run disk check under a different name" --
+    either way, nothing is created. Falling through to get_or_create
+    keyed on the canonical name is still name-idempotent on its own
+    even in the edge case where an operator kept the canonical row but
+    retargeted ITS disk_path elsewhere. No field on an existing row is
+    ever touched -- only genuine absence of any /run disk check at all
+    is filled.
+
+    Never raises: a failure here must never abort the rest of recovery
+    maintenance (see run_recovery_maintenance) -- preservation of
+    recoverable audio does not depend on a dashboard check existing.
+    Returns True if a row was created, False otherwise."""
+    from monitoring.models import MonitorCheck  # lazy: keeps this aircheck module's monitoring dependency narrow and deliberate (matches its existing emit_event import), never a module-level coupling beyond what already exists
+
+    try:
+        if MonitorCheck.objects.filter(kind="disk", disk_path="/run").exists():
+            return False
+        _, created = MonitorCheck.objects.get_or_create(
+            name=RUN_TMPFS_MONITOR_CHECK_NAME,
+            defaults=RUN_TMPFS_MONITOR_CHECK_DEFAULTS,
+        )
+        return created
+    except Exception as exc:
+        emit_event(
+            category="aircheck", level="warning",
+            title="Aircheck could not provision default /run capacity monitor",
+            detail={"error": str(exc)[:300]},
+            dedupe_key="aircheck|run-monitor-provision-failed",
+        )
+        return False
+
+
 # --- Maintenance-cadence entry points ------------------------------------
 
 def run_bounded_reconciliation(active_session_id=None):
@@ -830,17 +896,37 @@ def run_recovery_maintenance(*, dry_run=False):
     and a systemd Type=oneshot unit's own process lifetime IS the
     timer's busy window -- letting that run inside the one-minute unit
     would silently suspend routine /run reconciliation for the same
-    duration. This function performs (in order): automatic
-    pending-finalization retry, stale-success staging cleanup, and
-    bounded age/byte retention -- each mediated by finalization_lock or
-    real Pass-A/A2 validation, never by heuristic."""
+    duration. This function performs (in order): default /run capacity
+    MonitorCheck provisioning (P2 1.13B2 -- never on a dry run),
+    automatic pending-finalization retry, stale-success staging
+    cleanup, and bounded age/byte retention -- each mediated by
+    finalization_lock or real Pass-A/A2 validation, never by
+    heuristic. ensure_run_tmpfs_monitor_check() already never raises on
+    its own; the extra try/except here is deliberate defense in depth
+    -- preservation of recoverable audio must never depend on a
+    dashboard check successfully existing, so even an unanticipated
+    failure at this call site (not just the ordinary DB/validation
+    errors the helper already catches) can never skip retry/retention.
+    Ordered first only so the dashboard gains visibility as early in a
+    maintenance cycle as possible."""
+    monitor_check_created = False
     retry_result = {"candidates": 0, "succeeded": 0, "failed": 0, "skipped_locked": 0}
     stale_removed = []
     if not dry_run:
+        try:
+            monitor_check_created = ensure_run_tmpfs_monitor_check()
+        except Exception as exc:
+            emit_event(
+                category="aircheck", level="warning",
+                title="Aircheck /run capacity monitor provisioning failed unexpectedly",
+                detail={"error": str(exc)[:300]},
+                dedupe_key="aircheck|run-monitor-provision-unexpected-failure",
+            )
         retry_result = retry_pending_finalizations()
         stale_removed = collect_stale_success_cleanup(dry_run=False)
     retention_result = collect_retention(dry_run=dry_run)
     return {
+        "run_tmpfs_monitor_check_created": monitor_check_created,
         "retry": retry_result,
         "stale_success_cleaned": len(stale_removed),
         "retention": retention_result,

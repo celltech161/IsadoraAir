@@ -578,3 +578,58 @@ class LibrarySyncConvergenceTests(SegmentationFixture, _TransactionTestCase):
         self.assertEqual(result["candidates"], 0)
         self.assertEqual(Track.objects.filter(filepath=str(dest)).count(), 1)
         self.assertEqual(Track.objects.get(filepath=str(dest)).id, first_track_id)
+
+
+# ======================================================================
+# P2 1.13B2 -- /run MonitorCheck provisioning, exercised through the
+# real management-command path (not just calling the helper directly).
+# ======================================================================
+
+from django.core.management import call_command
+
+from monitoring.models import MonitorCheck
+
+
+class RunTmpfsMonitorCheckCommandIntegrationTests(RecoveryFixture, TestCase):
+    def test_actual_management_command_path_provisions_the_check(self):
+        """Unlike monitoring's own direct-helper tests, this exercises
+        `manage.py maintain_aircheck_recovery` itself -- the real
+        production entry point -- end to end."""
+        self.assertFalse(MonitorCheck.objects.filter(name="Disk: /run (runtime tmpfs)").exists())
+        call_command("maintain_aircheck_recovery")
+        self.assertTrue(MonitorCheck.objects.filter(name="Disk: /run (runtime tmpfs)").exists())
+
+    def test_dry_run_creates_nothing(self):
+        call_command("maintain_aircheck_recovery", "--dry-run")
+        self.assertFalse(MonitorCheck.objects.filter(name="Disk: /run (runtime tmpfs)").exists())
+
+    def test_dry_run_result_reflects_no_provisioning_attempted(self):
+        result = recovery.run_recovery_maintenance(dry_run=True)
+        self.assertFalse(result["run_tmpfs_monitor_check_created"])
+        self.assertFalse(MonitorCheck.objects.filter(name="Disk: /run (runtime tmpfs)").exists())
+
+    def test_provisioning_failure_does_not_abort_unrelated_recovery_reconciliation(self):
+        """Defense-in-depth proof: even if ensure_run_tmpfs_monitor_check
+        itself unexpectedly raised (bypassing its own internal
+        try/except), retry/retention must still run. A genuinely
+        pending session in this same maintenance cycle proves the rest
+        of the command completed."""
+        session = self.make_session("mp3")
+        session.still_running = False
+        session.exit_note = recorder.FINALIZATION_PENDING_NOTE
+        session.ended_at = timezone.now() - timedelta(seconds=recovery.PENDING_FINALIZATION_GRACE_SECONDS + 60)
+        session.save(update_fields=["still_running", "exit_note", "ended_at"])
+        _real_mp3(recorder._segment_path(session, 1))
+
+        with patch.object(recovery, "ensure_run_tmpfs_monitor_check", side_effect=RuntimeError("boom")):
+            result = recovery.run_recovery_maintenance(dry_run=False)
+
+        self.assertFalse(MonitorCheck.objects.filter(name="Disk: /run (runtime tmpfs)").exists())
+        self.assertEqual(result["retry"]["succeeded"], 1)
+        session.refresh_from_db()
+        self.assertEqual(recorder.classify_finalization(session), "complete")
+        self.assertTrue(
+            SystemEvent.objects.filter(
+                category="aircheck", title__icontains="provisioning failed unexpectedly"
+            ).exists()
+        )
