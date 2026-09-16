@@ -486,3 +486,257 @@ class FormatAcceptanceTests(SegmentationFixture, TestCase):
 
     def test_three_segment_wav_to_one_valid_wav(self):
         self.assert_format_finalizes("wav")
+
+
+class DecodeValidationTests(SegmentationFixture, TestCase):
+    """P2 1.13A2 -- ffprobe/container metadata alone can pass on a file
+    whose audio data is corrupted partway through; only a real decode
+    proves the stream is actually sound. These tests pin the gate
+    between concat/remux and source cleanup added in this pass."""
+
+    def _write_metadata_valid_but_decode_broken_mp3(self, path, duration=1.0):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                "-f", "lavfi", "-i", f"sine=frequency=440:sample_rate=48000:duration={duration}",
+                "-c:a", "libmp3lame", "-b:a", "192k", str(path),
+            ],
+            check=True, capture_output=True,
+        )
+        # Corrupt only the interior of the compressed data -- CBR MP3's
+        # container-level duration is a size/bitrate estimate, not a
+        # full-file frame scan, so this reliably still probes as valid
+        # metadata while desyncing enough frame sync words to make a
+        # real decode fail.
+        data = bytearray(path.read_bytes())
+        n = len(data)
+        for i in range(int(n * 0.4), int(n * 0.6)):
+            data[i] = 0xFF
+        path.write_bytes(bytes(data))
+
+    def test_metadata_passes_but_decode_fails_on_damaged_audio(self):
+        """Exercises the real validation command boundary directly
+        against an intentionally damaged file: proves requirement (1)
+        of the hardening -- ffprobe alone is not sufficient."""
+        candidate = self.out_dir / "damaged.mp3"
+        self._write_metadata_valid_but_decode_broken_mp3(candidate)
+
+        probe = subprocess.run(
+            [
+                "ffprobe", "-v", "error", "-select_streams", "a:0",
+                "-show_entries", "stream=codec_type:format=duration", "-of", "json",
+                str(candidate),
+            ],
+            check=True, capture_output=True, text=True,
+        )
+        probe_data = json.loads(probe.stdout)
+        self.assertEqual(probe_data["streams"][0]["codec_type"], "audio")
+        self.assertGreater(float(probe_data["format"]["duration"]), 0)
+
+        with self.assertRaises(recorder.SegmentError) as ctx:
+            recorder._validate_final_audio(candidate)
+        self.assertIn("decode", str(ctx.exception).lower())
+
+    def test_finalization_worker_treats_decode_failure_as_error_and_preserves_everything(self):
+        session = self.make_session("mp3")
+        session.still_running = False
+        session.exit_note = recorder.FINALIZATION_PENDING_NOTE
+        session.save(update_fields=["still_running", "exit_note"])
+        source = recorder._segment_path(session, 1)
+        self._write_metadata_valid_but_decode_broken_mp3(source)
+        staging = recorder._staging_dir(session)
+
+        with patch.object(recorder, "close_old_connections"), \
+             patch.object(recorder, "_sync_finalized_recording_to_library") as sync:
+            recorder._segmented_finalize_worker(session.id, session.filename)
+
+        session.refresh_from_db()
+        self.assertEqual(recorder.classify_finalization(session), "error")
+        self.assertIn("decode", session.exit_note.lower())
+        self.assertTrue(source.exists())
+        self.assertTrue(staging.exists())
+        self.assertFalse(Path(session.filename).exists())
+        sync.assert_not_called()
+
+    def test_decode_validate_audio_timeout_is_a_segment_error(self):
+        """Direct unit test of the real timeout branch -- proves a
+        validation timeout is treated exactly like any other validation
+        failure (recoverable), without waiting on a real slow decode."""
+        candidate = self.out_dir / "slow.mp3"
+        candidate.parent.mkdir(parents=True, exist_ok=True)
+        candidate.write_bytes(b"irrelevant-to-this-branch")
+        with patch.object(
+            recorder.subprocess, "run",
+            side_effect=subprocess.TimeoutExpired(cmd=["ffmpeg"], timeout=5),
+        ):
+            with self.assertRaises(recorder.SegmentError) as ctx:
+                recorder._decode_validate_audio(candidate, duration_seconds=10)
+        self.assertIn("timed out", str(ctx.exception).lower())
+
+    def test_finalization_worker_treats_decode_timeout_as_error_and_preserves_everything(self):
+        session = self.make_session("mp3")
+        session.still_running = False
+        session.exit_note = recorder.FINALIZATION_PENDING_NOTE
+        session.save(update_fields=["still_running", "exit_note"])
+        source = recorder._segment_path(session, 1)
+        source.parent.mkdir(parents=True, exist_ok=True)
+        # Real, valid audio -- the concat step itself must succeed so
+        # this test actually reaches (and exercises) the mocked decode-
+        # validation timeout branch rather than failing earlier at concat.
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=0.3",
+                "-c:a", "libmp3lame", "-b:a", "192k", str(source),
+            ],
+            check=True, capture_output=True,
+        )
+        staging = recorder._staging_dir(session)
+
+        with patch.object(recorder, "close_old_connections"), \
+             patch.object(recorder, "_sync_finalized_recording_to_library") as sync, \
+             patch.object(
+                 recorder, "_decode_validate_audio",
+                 side_effect=recorder.SegmentError("final output decode validation timed out after 999s"),
+             ):
+            recorder._segmented_finalize_worker(session.id, session.filename)
+
+        session.refresh_from_db()
+        self.assertEqual(recorder.classify_finalization(session), "error")
+        self.assertIn("timed out", session.exit_note.lower())
+        self.assertTrue(source.exists())
+        self.assertTrue(staging.exists())
+        self.assertFalse(Path(session.filename).exists())
+        sync.assert_not_called()
+
+    def test_decode_validation_timeout_is_duration_derived_with_floor_and_ceiling(self):
+        self.assertEqual(
+            recorder._decode_validation_timeout(0), recorder.DECODE_VALIDATION_MIN_SECONDS
+        )
+        self.assertEqual(
+            recorder._decode_validation_timeout(recorder.DECODE_VALIDATION_MAX_SECONDS * 1000),
+            recorder.DECODE_VALIDATION_MAX_SECONDS,
+        )
+        mid_duration = 10_000
+        expected = mid_duration * recorder.DECODE_VALIDATION_SECONDS_PER_DURATION_SECOND
+        self.assertTrue(recorder.DECODE_VALIDATION_MIN_SECONDS < expected < recorder.DECODE_VALIDATION_MAX_SECONDS)
+        self.assertAlmostEqual(recorder._decode_validation_timeout(mid_duration), expected)
+
+    def test_valid_audio_still_completes_and_cleans_normally(self):
+        """Regression guard: the new decode gate must not reject audio
+        that genuinely decodes cleanly -- complements the four existing
+        FormatAcceptanceTests, which already re-run under the new gate
+        since it is wired into _validate_final_audio unconditionally."""
+        session = self.make_session("mp3")
+        session.still_running = False
+        session.save(update_fields=["still_running"])
+        for sequence in range(1, 3):
+            path = recorder._segment_path(session, sequence)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            subprocess.run(
+                [
+                    "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                    "-f", "lavfi", "-i", f"sine=frequency={440 + sequence * 50}:sample_rate=48000:duration=0.3",
+                    "-c:a", "libmp3lame", "-b:a", "192k", str(path),
+                ],
+                check=True, capture_output=True,
+            )
+        size = recorder._finalize_segment_set(session, Path(session.filename))
+        self.assertGreater(size, 0)
+        self.assertFalse(recorder._staging_dir(session).exists())
+
+
+class WavRf64Tests(SegmentationFixture, TestCase):
+    """P2 1.13A2 -- make the long-WAV intention explicit rather than
+    relying on the installed ffmpeg's default (which, as of the
+    ffmpeg 8.0.1 in this environment, defaults -rf64 to "never" --
+    verified directly with `ffmpeg -h muxer=wav`, not assumed)."""
+
+    def _write_short_wav_segment(self, session, sequence=1, frames=4800):
+        path = recorder._segment_path(session, sequence)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with wave.open(str(path), "wb") as output:
+            output.setnchannels(1)
+            output.setsampwidth(2)
+            output.setframerate(48000)
+            output.writeframes(b"\x00\x00" * frames)
+        return path
+
+    def _spy_on_concat_command(self):
+        captured = {}
+        real_run = recorder.subprocess.run
+
+        def spy(cmd, *args, **kwargs):
+            if cmd and cmd[0] == "ffmpeg" and "concat" in cmd:
+                captured["cmd"] = cmd
+            return real_run(cmd, *args, **kwargs)
+
+        return captured, spy
+
+    def test_wav_finalization_command_explicitly_requests_rf64_auto(self):
+        session = self.make_session("wav")
+        session.still_running = False
+        session.save(update_fields=["still_running"])
+        self._write_short_wav_segment(session)
+
+        captured, spy = self._spy_on_concat_command()
+        with patch.object(recorder.subprocess, "run", side_effect=spy):
+            recorder._finalize_segment_set(session, Path(session.filename))
+
+        cmd = captured["cmd"]
+        self.assertIn("-rf64", cmd)
+        self.assertEqual(cmd[cmd.index("-rf64") + 1], "auto")
+
+    def test_non_wav_finalization_does_not_request_rf64(self):
+        session = self.make_session("mp3")
+        session.still_running = False
+        session.save(update_fields=["still_running"])
+        path = recorder._segment_path(session, 1)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=0.3",
+                "-c:a", "libmp3lame", "-b:a", "192k", str(path),
+            ],
+            check=True, capture_output=True,
+        )
+
+        captured, spy = self._spy_on_concat_command()
+        with patch.object(recorder.subprocess, "run", side_effect=spy):
+            recorder._finalize_segment_set(session, Path(session.filename))
+
+        self.assertNotIn("-rf64", captured["cmd"])
+
+    def test_small_wav_output_stays_plain_riff_with_rf64_auto(self):
+        session = self.make_session("wav")
+        session.still_running = False
+        session.save(update_fields=["still_running"])
+        self._write_short_wav_segment(session)
+
+        recorder._finalize_segment_set(session, Path(session.filename))
+
+        header = Path(session.filename).read_bytes()[:4]
+        self.assertEqual(header, b"RIFF")
+
+    def test_small_wav_pcm_sample_format_unaffected_by_rf64_flag(self):
+        session = self.make_session("wav")
+        session.still_running = False
+        session.save(update_fields=["still_running"])
+        self._write_short_wav_segment(session)
+
+        recorder._finalize_segment_set(session, Path(session.filename))
+
+        probe = subprocess.run(
+            [
+                "ffprobe", "-v", "error", "-select_streams", "a:0",
+                "-show_entries", "stream=codec_name,sample_rate,channels", "-of", "json",
+                session.filename,
+            ],
+            check=True, capture_output=True, text=True,
+        )
+        stream = json.loads(probe.stdout)["streams"][0]
+        self.assertEqual(stream["codec_name"], "pcm_s16le")
+        self.assertEqual(int(stream["sample_rate"]), 48000)
+        self.assertEqual(int(stream["channels"]), 1)

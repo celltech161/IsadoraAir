@@ -121,6 +121,21 @@ SEGMENT_PARTIAL_SUFFIX = ".partial"
 HANDOFF_NAME_PREFIX = "aircheck-segment-"
 FFMPEG_TIMEOUT_SECONDS = 3600
 
+# Bounded full-decode validation (see _decode_validate_audio) runs after
+# the concat/remux step and before source cleanup, so it needs its own
+# timeout independent of FFMPEG_TIMEOUT_SECONDS above. A fixed ceiling
+# sized for a short recording would be too tight for a very long one; a
+# duration-derived budget with a floor and a ceiling keeps both ends
+# sane. Real decode is virtually always much faster than realtime for
+# every format this module produces (HE-AAC/MP3/FLAC/WAV), so budgeting
+# a quarter of the program's own duration is generous headroom even on
+# degraded hardware, while the ceiling keeps a worst-case multi-day
+# recording bounded rather than open-ended. The floor covers short
+# recordings plus fixed process-spawn/teardown overhead.
+DECODE_VALIDATION_MIN_SECONDS = 120
+DECODE_VALIDATION_MAX_SECONDS = 6 * 3600
+DECODE_VALIDATION_SECONDS_PER_DURATION_SECOND = 0.25
+
 SOURCE_EXTENSION_BY_FORMAT = {
     "he_aac": "aac",  # Liquidsoap/fdkaac source is ADTS; final is M4A.
     "mp3": "mp3",
@@ -433,6 +448,16 @@ def _copy_handoff_to_staging(session, sequence, handoff):
     committed = _segment_path(session, sequence)
     partial = staging / f".{committed.name}{SEGMENT_PARTIAL_SUFFIX}"
     if committed.exists():
+        # Size equality is NOT a general content-integrity proof -- it is
+        # sufficient here only because of stronger invariants elsewhere:
+        # a given (session.id, sequence) handoff name is produced by
+        # exactly one cut, is never reused for different audio, and its
+        # content is fixed the moment Liquidsoap closes it (see
+        # _isolate_active_working_file); committed segment publication
+        # is itself atomic (partial -> os.replace). So if both names
+        # exist, they can only ever describe the same logical segment,
+        # possibly copied twice across a crash/retry -- never two
+        # different segments that happen to collide in size.
         try:
             same_size = committed.stat().st_size == handoff.stat().st_size
         except OSError as exc:
@@ -855,6 +880,55 @@ def _validate_final_audio(path):
     if duration <= 0:
         raise SegmentError(f"final output has no positive duration: {path}")
 
+    _decode_validate_audio(path, duration)
+
+
+def _decode_validation_timeout(duration_seconds):
+    """Duration-derived decode-validation budget -- see the constants'
+    own comment above for the reasoning. Never shorter than the floor,
+    never longer than the ceiling, regardless of how long the program
+    itself ran."""
+    return min(
+        DECODE_VALIDATION_MAX_SECONDS,
+        max(DECODE_VALIDATION_MIN_SECONDS, duration_seconds * DECODE_VALIDATION_SECONDS_PER_DURATION_SECOND),
+    )
+
+
+def _decode_validate_audio(path, duration_seconds):
+    """Full decode of the selected audio stream -- metadata/ffprobe
+    checks alone accept a file with a valid-enough header and a
+    plausible duration even if the actual audio data is corrupt partway
+    through. This is the gate between concat/remux and source cleanup:
+    raising here leaves every committed segment and the staging
+    directory exactly as _finalize_segment_set's caller already treats
+    any other validation failure -- nothing is published, nothing is
+    deleted. No output file is written (``-f null -``); this only
+    proves the stream decodes cleanly end to end.
+
+    Matches the full-decode argument convention already established by
+    library/services/media_health.py's own _ffmpeg_decode (-xerror
+    turns any decode error into a nonzero exit rather than a warning
+    logged and ignored)."""
+    timeout = _decode_validation_timeout(duration_seconds)
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-hide_banner", "-nostdin", "-v", "error", "-xerror",
+                "-threads", "1", "-i", str(path), "-map", "0:a:0", "-f", "null", "-",
+            ],
+            capture_output=True, text=True, timeout=timeout, check=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        raise SegmentError(
+            f"final output failed full decode validation: {(exc.stderr or '').strip()[:300]}"
+        )
+    except subprocess.TimeoutExpired:
+        raise SegmentError(
+            f"final output decode validation timed out after {timeout:.0f}s"
+        )
+    except OSError as exc:
+        raise SegmentError(f"final output decode validation failed to start: {exc}")
+
 
 def _finalize_segment_set(session, dest):
     """Stream-copy all committed source segments into one final file.
@@ -891,6 +965,16 @@ def _finalize_segment_set(session, dest):
     ]
     if session.audio_format == "he_aac":
         cmd += ["-bsf:a", "aac_adtstoasc"]
+    if session.audio_format == "wav":
+        # The installed ffmpeg's WAV muxer defaults -rf64 to "never" --
+        # a long enough logical recording would silently produce an
+        # invalid/overflowed classic-RIFF header past ~4 GiB without
+        # this. "auto" promotes to an RF64 header only once the output
+        # actually grows large enough to need it, so an ordinary short
+        # WAV stays plain RIFF and PCM sample format is unaffected
+        # either way -- this only changes which container header is
+        # written, never how samples are encoded.
+        cmd += ["-rf64", "auto"]
     cmd.append(str(partial_dest))
     try:
         subprocess.run(
