@@ -2,7 +2,7 @@ from pathlib import Path
 
 from django.core.management.base import BaseCommand, CommandError
 
-from aircheck.services import recorder
+from aircheck.services import recorder, recovery
 from aircheck.services.recorder import maintain_idle_buffer, record_buffer_heartbeat
 
 # AIRCHECK_CURRENT_PATH/AIRCHECK_WORKING_FILE_MAX_BYTES are read as
@@ -23,7 +23,16 @@ class Command(BaseCommand):
     isadoraair-aircheck-buffer.timer every minute; safe to run
     concurrently with a real Start/Stop or with itself (non-blocking
     lock acquisition means an overlapping/contended run just reports
-    "lock_busy" and exits)."""
+    "lock_busy" and exits).
+
+    P2 1.13B: also runs recovery.run_bounded_reconciliation every
+    cycle -- evacuating whatever /run handoffs and legacy HE-AAC
+    intermediates are currently stranded. This is bounded, single-
+    file-copy-class work, the same cost class as the active-segment
+    cut this command already performs every cycle. It deliberately
+    does NOT retry a pending finalization or run retention scanning --
+    both can legitimately take much longer than this one-minute timer
+    should ever be occupied for; see maintain_aircheck_recovery."""
 
     help = (
         "Working-buffer maintenance for the always-on Aircheck output.file "
@@ -55,6 +64,15 @@ class Command(BaseCommand):
         kwargs = {} if max_bytes is None else {"max_bytes": max_bytes}
         result = maintain_idle_buffer(**kwargs)
 
+        # Runs after the cut/idle decision, using whichever session (if
+        # any) is active AFTER that decision -- so it never second-
+        # guesses maintain_idle_buffer's own choice, only cleans up
+        # /run debris that decision does not touch.
+        active = recorder.current_session()
+        reconciliation = recovery.run_bounded_reconciliation(
+            active_session_id=active.id if active else None
+        )
+
         # Observed AFTER the maintenance action so a cut cycle's
         # heartbeat reflects the fresh (small) file, not its pre-roll
         # size. Best-effort -- a stat failure here must not affect the
@@ -63,6 +81,9 @@ class Command(BaseCommand):
             size_bytes = Path(recorder.AIRCHECK_CURRENT_PATH).stat().st_size
         except OSError:
             size_bytes = None
-        record_buffer_heartbeat(result, size_bytes, effective_max_bytes)
+        record_buffer_heartbeat(result, size_bytes, effective_max_bytes, reconciliation)
 
-        self.stdout.write(f"aircheck working buffer maintenance: {result}")
+        self.stdout.write(
+            f"aircheck working buffer maintenance: {result} "
+            f"(reconciliation: {reconciliation})"
+        )

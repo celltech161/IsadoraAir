@@ -1034,10 +1034,17 @@ def _segmented_finalize_worker(session_id, dest_path):
     """Finalize persistent segments outside AIRCHECK_LOCK_PATH.
 
     A daemon-thread/process exit can leave the row pending, but never
-    destroys the deterministic on-disk sources. Pass 1.13B may add a
-    retry/retention supervisor; today an operator can rerun this helper
-    from a Django shell after inspecting the preserved staging set.
-    """
+    destroys the deterministic on-disk sources -- P2 1.13B's maintain_
+    aircheck_recovery command retries a stranded pending session using
+    this exact function, never a second implementation.
+
+    Acquires aircheck.services.recovery's per-session finalization_lock
+    (blocking -- this is the original, normally-uncontended owner) for
+    the duration of the real work, so a concurrent 1.13B recovery pass's
+    own non-blocking attempt correctly observes "already owned" and
+    never duplicates this finalization. Imported lazily to avoid a
+    circular import (recovery imports this module for its own reuse of
+    _finalize_segment_set etc.)."""
     close_old_connections()
     try:
         try:
@@ -1045,15 +1052,17 @@ def _segmented_finalize_worker(session_id, dest_path):
         except AircheckSession.DoesNotExist:
             return
         dest = Path(dest_path)
-        try:
-            size = _finalize_segment_set(session, dest)
-        except Exception as exc:
-            _mark_segmented_finalization_failed(session_id, exc)
-            return
+        from aircheck.services import recovery  # lazy: avoid recorder<->recovery import cycle
+        with recovery.finalization_lock(session, blocking=True):
+            try:
+                size = _finalize_segment_set(session, dest)
+            except Exception as exc:
+                _mark_segmented_finalization_failed(session_id, exc)
+                return
 
-        session.size_bytes = size
-        session.exit_note = ""
-        session.save(update_fields=["size_bytes", "exit_note"])
+            session.size_bytes = size
+            session.exit_note = ""
+            session.save(update_fields=["size_bytes", "exit_note"])
         _sync_finalized_recording_to_library(dest)
     finally:
         close_old_connections()
@@ -1252,8 +1261,30 @@ def _atomic_write_json(path, data):
         raise
 
 
-def record_buffer_heartbeat(result, size_bytes, max_bytes):
-    """Persist the outcome of one maintain_idle_buffer invocation to
+def _read_prior_heartbeat():
+    try:
+        with open(AIRCHECK_BUFFER_STATE_PATH, "r", encoding="utf-8") as f:
+            prior = json.load(f)
+    except (OSError, ValueError):
+        return {}
+    return prior if isinstance(prior, dict) else {}
+
+
+# Bounded, fixed set of recovery-summary keys the less-frequent 1.13B
+# recovery pass writes -- see record_recovery_heartbeat. Listed
+# explicitly (rather than merging an arbitrary dict) so this state file
+# can never grow unbounded no matter how recovery.inventory_summary()'s
+# own shape evolves.
+_RECOVERY_HEARTBEAT_KEYS = (
+    "recovery_checked_at", "recovery_pending_count", "recovery_retry_succeeded",
+    "recovery_retry_failed", "recovery_failed_recovery_count",
+    "recovery_failed_recovery_bytes", "recovery_deleted_sets", "recovery_deleted_bytes",
+)
+
+
+def record_buffer_heartbeat(result, size_bytes, max_bytes, reconciliation=None):
+    """Persist the outcome of one maintain_idle_buffer invocation (plus,
+    since P2 1.13B, the same cycle's bounded /run reconciliation) to
     AIRCHECK_BUFFER_STATE_PATH for the /monitoring/ Aircheck card to
     read. Called by the maintain_aircheck_buffer management command
     AFTER maintain_idle_buffer has already made its rollover/segmentation
@@ -1261,33 +1292,58 @@ def record_buffer_heartbeat(result, size_bytes, max_bytes):
     that decision.
 
     Idle rollover and active segmentation timestamps are preserved
-    independently across other results.
+    independently across other results. The separate, less-frequent
+    recovery pass's own fields (see record_recovery_heartbeat) are
+    preserved here too -- both maintenance cadences update the SAME
+    fixed-shape state file rather than each inventing its own channel.
 
     Best-effort both ways: a missing or malformed prior state file is
     treated as "no prior state" rather than raised, and a write failure
     (e.g. /run momentarily unwritable) is swallowed -- this heartbeat
     must never be able to fail the maintenance command itself."""
-    prior_rollover_at = None
-    prior_segmented_at = None
-    try:
-        with open(AIRCHECK_BUFFER_STATE_PATH, "r", encoding="utf-8") as f:
-            prior = json.load(f)
-        if isinstance(prior, dict):
-            prior_rollover_at = prior.get("last_rollover_at")
-            prior_segmented_at = prior.get("last_segmented_at")
-    except (OSError, ValueError):
-        pass  # missing or malformed prior state -- start fresh, not fatal
-
+    prior = _read_prior_heartbeat()
     checked_at = time.time()
     state = {
         "checked_at": checked_at,
         "result": result,
         "size_bytes": size_bytes,
         "max_bytes": max_bytes,
-        "last_rollover_at": checked_at if result == "idle_rolled" else prior_rollover_at,
-        "last_segmented_at": checked_at if result == "active_segmented" else prior_segmented_at,
+        "last_rollover_at": checked_at if result == "idle_rolled" else prior.get("last_rollover_at"),
+        "last_segmented_at": checked_at if result == "active_segmented" else prior.get("last_segmented_at"),
     }
+    for key in _RECOVERY_HEARTBEAT_KEYS:
+        if key in prior:
+            state[key] = prior[key]
+    if reconciliation:
+        state["run_handoffs_evacuated"] = reconciliation.get("handoffs_evacuated")
+        state["run_legacy_evacuated"] = reconciliation.get("legacy_evacuated")
     try:
         _atomic_write_json(Path(AIRCHECK_BUFFER_STATE_PATH), state)
     except OSError:
         pass  # heartbeat is best-effort reporting, never fatal
+
+
+def record_recovery_heartbeat(recovery_result):
+    """Same fixed-name state file as record_buffer_heartbeat, updated
+    by the separate, less-frequent maintain_aircheck_recovery command.
+    Overlays only its own bounded key set (_RECOVERY_HEARTBEAT_KEYS)
+    onto whatever the 1-minute buffer heartbeat most recently wrote, so
+    neither writer clobbers the other's fields. Best-effort, never
+    fatal to the calling command."""
+    prior = _read_prior_heartbeat()
+    retry = recovery_result.get("retry", {})
+    retention = recovery_result.get("retention", {})
+    prior.update({
+        "recovery_checked_at": time.time(),
+        "recovery_pending_count": retry.get("candidates"),
+        "recovery_retry_succeeded": retry.get("succeeded"),
+        "recovery_retry_failed": retry.get("failed"),
+        "recovery_failed_recovery_count": retention.get("total_sets"),
+        "recovery_failed_recovery_bytes": retention.get("total_bytes"),
+        "recovery_deleted_sets": retention.get("deleted_sets"),
+        "recovery_deleted_bytes": retention.get("deleted_bytes"),
+    })
+    try:
+        _atomic_write_json(Path(AIRCHECK_BUFFER_STATE_PATH), prior)
+    except OSError:
+        pass

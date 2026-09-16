@@ -1,0 +1,22 @@
+[Unit]
+Description=Retry stranded Aircheck finalizations and bound recovery/retention storage every 5 minutes
+
+[Timer]
+# Deliberately a separate, slower timer from isadoraair-aircheck-
+# buffer.timer (every 1 minute): the work this one triggers --
+# automatic pending-finalization retry -- calls the real ffmpeg concat/
+# decode-validation finalization path, which can legitimately run for
+# hours on a very long recording. A systemd Type=oneshot unit's own
+# process lifetime is its timer's busy window; folding this into the
+# one-minute buffer timer would silently suspend routine /run
+# reconciliation for that same duration. systemd will not start a new
+# instance of this unit while a previous one is still running, and
+# aircheck.services.recovery's own per-session finalization lock
+# provides a second, independent guard against duplicate work even if
+# that were ever not true.
+OnBootSec=5min
+OnUnitActiveSec=5min
+Persistent=false
+
+[Install]
+WantedBy=timers.target

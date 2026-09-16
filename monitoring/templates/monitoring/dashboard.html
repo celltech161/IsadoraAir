@@ -1323,6 +1323,22 @@ function bufferBarStatusClass(percent) {
   if (percent >= 80) return 'warning';
   return 'ok';
 }
+// P2 1.13B -- concise recovery/retention pressure line. Operator only
+// needs: healthy (nothing shown) vs. recoverable failures exist vs.
+// bytes are accumulating. Never a filesystem browser -- no paths, no
+// per-artifact listing here; use `manage.py maintain_aircheck_recovery
+// --dry-run` for that.
+function recoveryPressureLine(recovery) {
+  if (!recovery) return '';
+  const count = recovery.failed_recovery_count;
+  const bytes = recovery.failed_recovery_bytes;
+  const pending = recovery.pending_finalizations;
+  if (!count && !pending) return '';
+  const parts = [];
+  if (pending) parts.push(`${pending} finalization${pending === 1 ? '' : 's'} pending`);
+  if (count) parts.push(`${count} recoverable failure${count === 1 ? '' : 's'}${bytes ? ' (' + fmtSize(bytes) + ')' : ''}`);
+  return `<div style="font-size:0.7rem;color:#f59e0b;margin-top:0.15rem;">${parts.join(' • ')}</div>`;
+}
 async function pollAircheck() {
   try {
     const r = await fetch("{% url 'aircheck:api-status' %}");
@@ -1343,12 +1359,13 @@ async function pollAircheck() {
 
     const guard = bufferGuardStatus(buffer, rec);
     const guardLine = `<div style="font-size:0.7rem;color:${guard.color};margin-top:0.15rem;">${guard.text}</div>`;
+    const recoveryLine = recoveryPressureLine(data.recovery);
 
     if (rec && s) {
       const fmtLabel = s.audio_format.toUpperCase() + (s.bitrate ? ' ' + s.bitrate : '');
       let detailHtml = `${fmtLabel} • elapsed <span id="aircheckElapsed">${fmtElapsed(s.started_at)}</span>` +
         `<div style="font-size:0.7rem;color:var(--text-muted);margin-top:0.15rem;">${(s.filename || '').split('/').pop()}</div>` +
-        guardLine;
+        guardLine + recoveryLine;
       // Rare overlap: a new recording started while the PREVIOUS
       // session's async finalization is still finishing -- the active
       // recording stays the primary (REC) state; this is just a small
@@ -1386,7 +1403,7 @@ async function pollAircheck() {
         detailHtml += `${(recent.filename || '').split('/').pop()}` +
           `<div style="font-size:0.7rem;color:var(--text-muted);margin-top:0.15rem;">Finalization in progress</div>`;
       }
-      detailHtml += guardLine;
+      detailHtml += guardLine + recoveryLine;
 
       const rollover = buffer.maintenance && buffer.maintenance.last_rollover_at;
       detailHtml += `<div style="font-size:0.7rem;color:var(--text-muted);margin-top:0.15rem;">` +

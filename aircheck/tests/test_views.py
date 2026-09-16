@@ -187,3 +187,68 @@ class AircheckStatusApiTests(AircheckRecorderFixtureMixin, TestCase):
         self.assertIn("recording", data)
         self.assertIn("session", data)
         self.assertIn("server_time", data)
+
+    # --- P2 1.13B recovery metrics (29-34) ----------------------------
+
+    def test_29_recovery_inventory_metrics_are_returned_truthfully(self):
+        self.write_heartbeat(
+            recovery_checked_at=time.time(),
+            recovery_pending_count=2,
+            recovery_failed_recovery_count=3,
+            recovery_failed_recovery_bytes=12345,
+            run_handoffs_evacuated=1,
+            run_legacy_evacuated=0,
+        )
+        data = self.status()
+        rec = data["recovery"]
+        self.assertEqual(rec["pending_finalizations"], 2)
+        self.assertEqual(rec["failed_recovery_count"], 3)
+        self.assertEqual(rec["failed_recovery_bytes"], 12345)
+        self.assertEqual(rec["run_handoffs_evacuated"], 1)
+        self.assertEqual(rec["run_legacy_evacuated"], 0)
+
+    def test_30_missing_or_malformed_recovery_state_does_not_500(self):
+        # No heartbeat file at all.
+        data = self.status()
+        self.assertIsNone(data["recovery"]["pending_finalizations"])
+
+        # Malformed JSON.
+        Path(self.buffer_state_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(self.buffer_state_path, "w", encoding="utf-8") as f:
+            f.write("{not valid json::")
+        data2 = self.status()
+        self.assertIsNone(data2["recovery"]["pending_finalizations"])
+
+    def test_31_dashboard_indicates_recoverable_failure_pressure(self):
+        self.write_heartbeat(recovery_failed_recovery_count=1, recovery_failed_recovery_bytes=500)
+        response = self.client.get(reverse("monitoring:dashboard"))
+        self.assertEqual(response.status_code, 200)
+        body = response.content.decode("utf-8")
+        self.assertIn("recoveryPressureLine", body)  # the new JS helper is actually wired in
+
+    def test_32_healthy_system_recovery_summary_stays_concise(self):
+        self.write_heartbeat(recovery_failed_recovery_count=0, recovery_pending_count=0)
+        data = self.status()
+        rec = data["recovery"]
+        self.assertEqual(rec["failed_recovery_count"], 0)
+        self.assertEqual(rec["pending_finalizations"], 0)
+
+    def test_33_maintenance_heartbeat_staleness_unaffected_by_recovery_fields(self):
+        self.write_heartbeat(checked_at=time.time() - 5, result="active_below_limit", recovery_pending_count=0)
+        data = self.status()
+        self.assertFalse(data["buffer"]["maintenance"]["stale"])
+
+    def test_34_old_heartbeat_without_recovery_keys_is_safe(self):
+        # Exactly the pre-1.13B heartbeat shape -- no recovery_* keys
+        # at all. Must not KeyError/500.
+        state = {
+            "checked_at": time.time(), "result": "active_below_limit",
+            "size_bytes": 100, "max_bytes": recorder.AIRCHECK_WORKING_FILE_MAX_BYTES,
+            "last_rollover_at": None, "last_segmented_at": None,
+        }
+        Path(self.buffer_state_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(self.buffer_state_path, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+        data = self.status()
+        self.assertIsNone(data["recovery"]["pending_finalizations"])
+        self.assertIsNone(data["recovery"]["failed_recovery_count"])

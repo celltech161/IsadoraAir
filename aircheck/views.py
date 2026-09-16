@@ -109,16 +109,37 @@ def _buffer_dict():
     }
 
 
+def _recovery_dict():
+    """P2 1.13B recovery/retention pressure -- read straight from the
+    same maintenance heartbeat file _maintenance_dict() already reads
+    (recorder.record_recovery_heartbeat's own bounded key set), never a
+    live filesystem/DB inventory scan on every dashboard poll. Missing/
+    stale fields (no recovery pass has run yet, or the heartbeat file
+    is malformed) render as None/unknown, exactly like the rest of this
+    module's tolerant-of-absence convention -- never fabricated as
+    healthy."""
+    heartbeat = _read_buffer_heartbeat() or {}
+    return {
+        "checked_at": heartbeat.get("recovery_checked_at"),
+        "pending_finalizations": heartbeat.get("recovery_pending_count"),
+        "failed_recovery_count": heartbeat.get("recovery_failed_recovery_count"),
+        "failed_recovery_bytes": heartbeat.get("recovery_failed_recovery_bytes"),
+        "run_handoffs_evacuated": heartbeat.get("run_handoffs_evacuated"),
+        "run_legacy_evacuated": heartbeat.get("run_legacy_evacuated"),
+    }
+
+
 @require_http_methods(["GET"])
 def api_aircheck_status(request):
     """Current recording state -- polled by the /monitoring/ card so
     the button reflects reality even if a session was started from a
     different admin session or reaped after a worker restart. Also
     reports the working segment's live size relative to the shared
-    idle/active cut threshold, the maintenance heartbeat's health, and the
-    most recently stopped session's finalization state -- all
-    read-only stats/JSON reads, tolerant of anything being missing or
-    malformed so this endpoint never 500s over a runtime status file."""
+    idle/active cut threshold, the maintenance heartbeat's health, the
+    most recently stopped session's finalization state, and (P2 1.13B)
+    a concise recovery/retention pressure summary -- all read-only
+    stats/JSON reads, tolerant of anything being missing or malformed
+    so this endpoint never 500s over a runtime status file."""
     session = current_session()
     return JsonResponse({
         "recording": session is not None,
@@ -126,6 +147,7 @@ def api_aircheck_status(request):
         "server_time": timezone.now().isoformat(),
         "buffer": _buffer_dict(),
         "recent_session": _session_dict(_most_recently_stopped_session()),
+        "recovery": _recovery_dict(),
     })
 
 
