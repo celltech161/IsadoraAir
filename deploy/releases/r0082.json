@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "release_id": "r0082",
+  "previous_release_id": "r0081",
+  "minimum_updater_protocol_version": 5,
+  "summary": "P2 1.13: Aircheck /run exhaustion containment -- active-session segmentation, decode-validated finalization cleanup, pending-finalization recovery with bounded failed-artifact retention and /run capacity monitoring, remote-DJ diagnostic tmpfs containment, and a bounded engine-command queue. Authorizes the two new Aircheck systemd units (buffer, recovery) through a signed protected-runtime policy generation (3 -> 4) rather than manual/out-of-band installation.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [
+    "isadoraair-aircheck-buffer.service",
+    "isadoraair-aircheck-buffer.timer"
+  ],
+  "systemd_units_new_required": [
+    "isadoraair-aircheck-recovery.service",
+    "isadoraair-aircheck-recovery.timer"
+  ],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-gunicorn",
+    "isadoraair-engine"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0007",
+  "protected_runtime": {
+    "generation": 4,
+    "descriptor_path": "deploy/updater_runtime/protected-runtime-descriptor.json",
+    "descriptor_sha256": "69f5246574cd03e1a05ba0b9f49f738cd15d452c9b1acfe3f24cf7b9ff21ee23",
+    "minimum_bootstrap_protocol_version": 1,
+    "runtime_version": 5,
+    "manifest_protocol_version": 5,
+    "supported_wire_protocols": [
+      3
+    ],
+    "attestations": [
+      "deploy/updater_attestations/r0082-primary.json"
+    ]
+  }
+}
