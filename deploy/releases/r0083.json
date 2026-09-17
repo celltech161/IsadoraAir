@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "release_id": "r0083",
+  "previous_release_id": "r0082",
+  "minimum_updater_protocol_version": 5,
+  "summary": "Two small polish items: (1) DuckingConfig.ptt_auto_manual_enabled makes PTT-driven Auto/Manual ownership optional, default true (preserves r0082 behavior); disabled means PTT never changes Auto/Manual and operator-owned Manual is never touched. (2) UITheme branding cleanup -- logo is Admin-header-only (bundled IsadoraAir fallback), station_logo is the ordinary front-end/login/welcome brand, no more stacked logos.",
+  "migrations_required": [
+    "hardware.0011_duckingconfig_ptt_auto_manual_enabled",
+    "library.0084_alter_uitheme_logo_alter_uitheme_station_logo"
+  ],
+  "migration_compatibility": "additive",
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-gunicorn",
+    "isadoraair-engine"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0007",
+  "protected_runtime": null
+}
