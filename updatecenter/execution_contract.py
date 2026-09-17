@@ -66,3 +66,23 @@ def protected_runtime_execution_fingerprint(**values) -> str:
     payload = protected_runtime_fingerprint_payload(**values)
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(raw).hexdigest()
+
+
+def intermediate_protected_runtime_fingerprint_payload(**values) -> dict:
+    """Django-side mirror of the worker's intermediate contract v4."""
+    base = protected_runtime_fingerprint_payload(**values)
+    return {
+        **{key: value for key, value in base.items() if key != "contract_version"},
+        "contract_version": 4,
+        "protected_runtime_transition": {
+            "release_id": values["protected_runtime_release_id"],
+            "previous_release_id": values["protected_runtime_previous_release_id"],
+            "commit": values["protected_runtime_commit"],
+        },
+    }
+
+
+def intermediate_protected_runtime_execution_fingerprint(**values) -> str:
+    payload = intermediate_protected_runtime_fingerprint_payload(**values)
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()

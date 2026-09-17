@@ -407,8 +407,8 @@ class Executor:
         return active_slot, candidate_slot, client
 
     def _execute_runtime_handoff(self, job_id: str, plan: TrustedPlan, protected_runtime_field, milestones: set):
-        """D3: the OLD worker's own short pipeline for a job whose
-        target release declares protected_runtime -- stage+verify the
+        """D3: the OLD worker's own short pipeline for a job crossing
+        a protected-runtime transition -- stage+verify the
         candidate from root-trusted Git, request supervisor
         activation, then YIELD (return without raising and WITHOUT
         calling store.succeed()/store.fail()) so this job stays
@@ -419,6 +419,14 @@ class Executor:
         their own (mark_candidate_verified is a LOCAL sanity record,
         not runtime_activation_accepted)."""
         try:
+            transition = plan.protected_runtime_transition
+            if transition is None or transition.field != protected_runtime_field:
+                raise ExecutionError(
+                    "RUNTIME_PROVENANCE_MISSING",
+                    "protected-runtime handoff lacks exact introducing-release provenance",
+                    manual=True,
+                )
+
             if MILESTONE_RUNTIME_DESCRIPTOR_VALIDATED not in milestones:
                 self.store.milestone(job_id, MILESTONE_RUNTIME_DESCRIPTOR_VALIDATED)
                 milestones.add(MILESTONE_RUNTIME_DESCRIPTOR_VALIDATED)
@@ -428,7 +436,7 @@ class Executor:
             if slots_root is None or activation_socket is None:
                 raise ExecutionError(
                     "UNBOOTSTRAPPED_SUPERVISOR",
-                    "this station's protected_runtime target requires a Phase-D supervisor, "
+                    "this station's protected_runtime transition requires a Phase-D supervisor, "
                     "but none is configured (phase_d_supervisor_slots_root/activation_socket are null)",
                     manual=True,
                 )
@@ -436,8 +444,12 @@ class Executor:
             if MILESTONE_RUNTIME_CANDIDATE_STAGED not in milestones:
                 active_slot, candidate_slot, _client = self._resolve_candidate_slot(activation_socket)
                 staging = new_supervisor_staging_directory(slots_root)
-                materialized = materialize_candidate(self.repository, protected_runtime_field, plan.target_commit, staging)
-                stage_attestations(self.repository, protected_runtime_field, plan.target_commit, slots_root, candidate_slot)
+                materialized = materialize_candidate(
+                    self.repository, protected_runtime_field, transition.commit, staging,
+                )
+                stage_attestations(
+                    self.repository, protected_runtime_field, transition.commit, slots_root, candidate_slot,
+                )
                 stage_descriptor(materialized.descriptor_bytes, slots_root, candidate_slot)
                 publish_to_candidate_slot(slots_root, candidate_slot, staging, active_slot=active_slot)
                 self.store.update(job_id, protected_runtime_candidate={
@@ -456,7 +468,7 @@ class Executor:
                 # side before ACTIVATION_REQUESTED -- D3-A's own
                 # "request is intent, never authorization" rule).
                 # Required for THIS worker to safely reason about
-                # whether the target release's own new (to THIS
+                # whether the aggregated plan's new (to THIS
                 # worker's active policy) managed unit is legitimately
                 # authorized -- see verify_new_units_authorized_by_
                 # candidate_policy below.
@@ -477,7 +489,8 @@ class Executor:
                 outcome = verify_candidate_independently(
                     trust_policy=trust_policy, descriptor_bytes=descriptor_bytes, bundle_root=bundle_root,
                     attestations_dir=attestations_staging_directory(slots_root, candidate_slot),
-                    release_id=plan.target_release_id, previous_release_id=plan.installed_release_id,
+                    release_id=transition.release_id,
+                    previous_release_id=transition.previous_release_id,
                     previous_generation=runtime_state["active_generation"],
                     current_bootstrap_protocol_version=1, current_wire_protocol_version=PROTOCOL_VERSION,
                 )
@@ -513,7 +526,8 @@ class Executor:
                 client.request_activation(
                     transaction_id=job_id, candidate_slot=record["candidate_slot"],
                     candidate_generation=record["generation"], candidate_descriptor_sha256=record["descriptor_sha256"],
-                    release_id=plan.target_release_id, previous_release_id=plan.installed_release_id,
+                    release_id=transition.release_id,
+                    previous_release_id=transition.previous_release_id,
                 )
                 self.store.milestone(job_id, MILESTONE_RUNTIME_ACTIVATION_REQUESTED)
                 milestones.add(MILESTONE_RUNTIME_ACTIVATION_REQUESTED)
@@ -686,9 +700,9 @@ class Executor:
             self.store.update(job_id, trusted_plan=plan_record)
             self.store.milestone(job_id, "trusted_plan_validated")
 
-            # Update Center Phase D, D4: three-way branch for a target
-            # release that declares protected_runtime (plan.
-            # protected_runtime, set by derive_plan() -- D3-J). Never a
+            # Update Center Phase D, D4: three-way branch for any plan
+            # crossing an effective protected-runtime transition (plan.
+            # protected_runtime, set by derive_plan()). Never a
             # simple binary "handoff needed or not" -- D4-D's own
             # "prove old and new workers can never mutate the same job
             # concurrently" requires distinguishing exactly which of
@@ -851,7 +865,7 @@ class Executor:
 
 
 def dataclass_to_dict(plan: TrustedPlan) -> dict:
-    return {
+    result = {
         "installed_release_id": plan.installed_release_id,
         "installed_commit": plan.installed_commit,
         "target_release_id": plan.target_release_id,
@@ -873,3 +887,12 @@ def dataclass_to_dict(plan: TrustedPlan) -> dict:
         "manual_bootstrap_required": plan.manual_bootstrap_required,
         "fingerprint": plan.fingerprint,
     }
+    transition = plan.protected_runtime_transition
+    result["protected_runtime_transition"] = None if transition is None else {
+        "release_id": transition.release_id,
+        "previous_release_id": transition.previous_release_id,
+        "commit": transition.commit,
+        "generation": transition.field.generation,
+        "descriptor_sha256": transition.field.descriptor_sha256,
+    }
+    return result

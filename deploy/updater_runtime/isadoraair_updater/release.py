@@ -199,6 +199,21 @@ class ChainEntry:
 
 
 @dataclasses.dataclass(frozen=True)
+class ProtectedRuntimeTransition:
+    """Immutable provenance for the effective runtime transition.
+
+    The final application target can be an ordinary release later than
+    the release which introduced the runtime. Keep the field and its
+    canonical release identity together so staging, attestation binding,
+    and fingerprinting cannot borrow final-target facts.
+    """
+    field: ProtectedRuntimeField
+    release_id: str
+    previous_release_id: str | None
+    commit: str
+
+
+@dataclasses.dataclass(frozen=True)
 class TrustedPlan:
     installed_release_id: str
     installed_commit: str
@@ -220,22 +235,19 @@ class TrustedPlan:
     minimum_updater_protocol_version: int
     manual_bootstrap_required: bool
     fingerprint: str
-    # Update Center Phase D, D3-J: the TARGET release's own protected_
-    # runtime field, when it declares one -- None for every ordinary
-    # (non-Phase-D) release, which is every release through r0026 and
-    # every future release that does not touch the protected runtime.
-    # A DEFAULT of None (rather than a new required positional field)
-    # so every existing `TrustedPlan(**data)` test fixture across this
-    # codebase -- none of which know this field exists -- keeps
-    # constructing a plain v2 plan unchanged; only derive_plan() below
-    # ever populates it from a real independently-resolved chain.
-    protected_runtime: ProtectedRuntimeField | None = None
+    # The newest protected-runtime transition in releases_in_plan, if
+    # any. It may belong to the final target (legacy/direct case) or
+    # to an intermediate release crossed on the way to that target.
+    protected_runtime_transition: ProtectedRuntimeTransition | None = None
+
+    @property
+    def protected_runtime(self) -> ProtectedRuntimeField | None:
+        """Compatibility view used by the mutation and handoff gates."""
+        transition = self.protected_runtime_transition
+        return transition.field if transition is not None else None
 
     def fingerprint_payload(self) -> dict:
-        """v2 payload for an ordinary release, v3 (D3-J) the moment
-        this plan's own target release declares protected_runtime --
-        never decided by a caller, never by a flag, only by this
-        plan's own already-independently-resolved fact."""
+        """v2 ordinary, legacy-compatible v3 direct, or v4 intermediate."""
         values = dict(
             installed_release_id=self.installed_release_id,
             installed_commit=self.installed_commit,
@@ -257,16 +269,27 @@ class TrustedPlan:
             minimum_updater_protocol_version=self.minimum_updater_protocol_version,
             manual_bootstrap_required=self.manual_bootstrap_required,
         )
-        if self.protected_runtime is None:
+        transition = self.protected_runtime_transition
+        if transition is None:
             return execution_fingerprint_payload(**values)
-        return protected_runtime_fingerprint_payload(
+        runtime_values = dict(
             **values,
-            protected_runtime_generation=self.protected_runtime.generation,
-            protected_runtime_descriptor_sha256=self.protected_runtime.descriptor_sha256,
-            protected_runtime_minimum_bootstrap_protocol_version=self.protected_runtime.minimum_bootstrap_protocol_version,
-            protected_runtime_runtime_version=self.protected_runtime.runtime_version,
-            protected_runtime_manifest_protocol_version=self.protected_runtime.manifest_protocol_version,
-            protected_runtime_supported_wire_protocols=self.protected_runtime.supported_wire_protocols,
+            protected_runtime_generation=transition.field.generation,
+            protected_runtime_descriptor_sha256=transition.field.descriptor_sha256,
+            protected_runtime_minimum_bootstrap_protocol_version=transition.field.minimum_bootstrap_protocol_version,
+            protected_runtime_runtime_version=transition.field.runtime_version,
+            protected_runtime_manifest_protocol_version=transition.field.manifest_protocol_version,
+            protected_runtime_supported_wire_protocols=transition.field.supported_wire_protocols,
+        )
+        if transition.release_id == self.target_release_id:
+            # Bootstrap invariant: old generation-3/4 workers use this
+            # exact v3 payload for a direct protected target.
+            return protected_runtime_fingerprint_payload(**runtime_values)
+        return intermediate_protected_runtime_fingerprint_payload(
+            **runtime_values,
+            protected_runtime_release_id=transition.release_id,
+            protected_runtime_previous_release_id=transition.previous_release_id,
+            protected_runtime_commit=transition.commit,
         )
 
 
@@ -338,6 +361,26 @@ def protected_runtime_fingerprint_payload(**values) -> dict:
             "runtime_version": values["protected_runtime_runtime_version"],
             "manifest_protocol_version": values["protected_runtime_manifest_protocol_version"],
             "supported_wire_protocols": list(values["protected_runtime_supported_wire_protocols"]),
+        },
+    }
+
+
+def intermediate_protected_runtime_fingerprint_payload(**values) -> dict:
+    """Fingerprint contract v4 for a non-target runtime transition.
+
+    Contract v3 stays byte-for-byte unchanged for direct protected targets
+    so a legacy worker can authorize a bridge job which the new candidate
+    re-derives. The previously unrepresentable intermediate case adds the
+    introducing release's immutable canonical provenance.
+    """
+    base = protected_runtime_fingerprint_payload(**values)
+    return {
+        **{key: value for key, value in base.items() if key != "contract_version"},
+        "contract_version": 4,
+        "protected_runtime_transition": {
+            "release_id": values["protected_runtime_release_id"],
+            "previous_release_id": values["protected_runtime_previous_release_id"],
+            "commit": values["protected_runtime_commit"],
         },
     }
 
@@ -690,6 +733,25 @@ def _previous_protected_runtime_generation(
     return None
 
 
+def _effective_protected_runtime_transition(
+    transitions: list[ChainEntry],
+) -> ProtectedRuntimeTransition | None:
+    """Return the latest runtime-bearing release still to be crossed."""
+    entry = next(
+        (candidate for candidate in reversed(transitions)
+         if candidate.manifest.protected_runtime is not None),
+        None,
+    )
+    if entry is None:
+        return None
+    return ProtectedRuntimeTransition(
+        field=entry.manifest.protected_runtime,
+        release_id=entry.manifest.release_id,
+        previous_release_id=entry.manifest.previous_release_id,
+        commit=entry.commit,
+    )
+
+
 def _cross_check(repository: TrustedRepository, previous_commit: str, entry: ChainEntry, *,
                   chain: list[ChainEntry], known_units: frozenset[str] | None = None):
     manifest = entry.manifest
@@ -886,38 +948,21 @@ def derive_plan(repository: TrustedRepository, trusted_tip: str, live_head: str,
         minimum_updater_protocol_version=max(entry.manifest.minimum_updater_protocol_version for entry in transitions),
         manual_bootstrap_required=any(entry.manifest.manual_bootstrap_required for entry in transitions),
     )
-    # D3-J: fingerprint contract v3 becomes authoritative the moment
-    # the TARGET release itself (never merely some earlier release
-    # somewhere in the transition list) declares protected_runtime --
-    # target.manifest is the release actually being installed, and is
-    # the release whose protected_runtime field (if any) governs
-    # whether a runtime handoff is required for THIS plan at all (see
-    # runtime_handoff.handoff_required()). An ordinary release with no
-    # protected_runtime field anywhere in its transition list keeps
-    # using the exact v2 payload/fingerprint unchanged -- this is not
-    # a reinterpretation of v2, it is the same function, called with
-    # the same values, whenever protected_runtime is None.
-    protected_runtime = target.manifest.protected_runtime
-    if protected_runtime is None:
-        plan_fingerprint = fingerprint(execution_fingerprint_payload(**values))
-    else:
-        plan_fingerprint = fingerprint(protected_runtime_fingerprint_payload(
-            **values,
-            protected_runtime_generation=protected_runtime.generation,
-            protected_runtime_descriptor_sha256=protected_runtime.descriptor_sha256,
-            protected_runtime_minimum_bootstrap_protocol_version=protected_runtime.minimum_bootstrap_protocol_version,
-            protected_runtime_runtime_version=protected_runtime.runtime_version,
-            protected_runtime_manifest_protocol_version=protected_runtime.manifest_protocol_version,
-            protected_runtime_supported_wire_protocols=protected_runtime.supported_wire_protocols,
-        ))
-    return TrustedPlan(**values, fingerprint=plan_fingerprint, protected_runtime=protected_runtime)
+    # Select the newest protected transition the installed station has
+    # not yet crossed. A later ordinary final target does not erase the
+    # runtime handoff required by an intermediate release.
+    protected_transition = _effective_protected_runtime_transition(transitions)
+    provisional = TrustedPlan(
+        **values, fingerprint="", protected_runtime_transition=protected_transition,
+    )
+    plan_fingerprint = fingerprint(provisional.fingerprint_payload())
+    return dataclasses.replace(provisional, fingerprint=plan_fingerprint)
 
 
 def manifest_for_release(chain: list[ChainEntry], release_id: str) -> Manifest:
     """D3: a caller that already paid for one load_chain() call (e.g.
     Executor.execute(), which needs `chain` for exactly one lookup --
-    whether the TARGET release declares protected_runtime, see
-    runtime_handoff.py) can look up any one release's own manifest by
+    a release's manifest) can look up any one release's own manifest by
     id without a second trusted-Git read. Raises, rather than
     returning None, for an unknown release_id -- every real caller
     already has a release_id that derive_plan() itself just proved is
@@ -957,10 +1002,11 @@ def manual_blockers(plan: TrustedPlan, *, known_units: frozenset[str] | None = N
         blockers.append("DESTRUCTIVE_MIGRATION_MANUAL")
     if plan.systemd_units_removed_or_renamed:
         blockers.append("SYSTEMD_REMOVAL_MANUAL")
-    # D4-G/D4-H: for an ORDINARY release (no protected_runtime), an
+    # D4-G/D4-H: for an ORDINARY plan (no effective protected-runtime
+    # transition), an
     # unknown unit is a hard, CURRENT-RUNTIME EXECUTABLE ACTION
     # blocker -- exactly as before Phase D existed. For a
-    # protected_runtime release, this check is deliberately DEFERRED
+    # plan crossing a protected_runtime release, this check is deliberately DEFERRED
     # (never decided here at all): the target runtime's own candidate
     # policy may legitimately authorize a name this worker's own
     # active policy has never seen -- see runtime_handoff.py's own

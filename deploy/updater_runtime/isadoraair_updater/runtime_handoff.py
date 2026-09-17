@@ -18,9 +18,9 @@ worker's OWN independent re-verification of the just-staged candidate
 (verify_candidate_independently, below) -- defense in depth alongside
 the supervisor's own check, never a replacement for it, and used ONLY
 to decide whether THIS worker may safely proceed to REQUEST_ACTIVATION
-for a target release naming a managed unit outside its own current
+for a plan naming a managed unit outside its own current
 policy -- never to authorize mutation, which this worker still never
-performs for a protected_runtime release at all."""
+performs before protected-runtime acceptance."""
 from __future__ import annotations
 
 import dataclasses
@@ -107,24 +107,23 @@ HANDOFF_MILESTONES = (
 SAFE_YIELD_MILESTONE = MILESTONE_RUNTIME_ACTIVATION_REQUESTED
 
 # D3-K: the ONE milestone that must already be durable before ANY
-# production-mutation executor call may run, for a job whose target
-# release declares protected_runtime. See require_mutation_allowed().
+# production-mutation executor call may run, for a job crossing an
+# effective protected-runtime transition. See require_mutation_allowed().
 MUTATION_GATE_MILESTONE = MILESTONE_RUNTIME_ACTIVATION_ACCEPTED
 
 
 def handoff_required(protected_runtime_field: ProtectedRuntimeField | None) -> bool:
     """The one predicate everything else in this module is keyed off
-    of. True iff the ALREADY-INDEPENDENTLY-RESOLVED target release
-    (release.TrustedPlan.protected_runtime, or release.
-    manifest_for_release(chain, target_release_id).protected_runtime)
-    declares a protected_runtime field at all -- never inferred from
-    file content, a request field, or a worker's own opinion."""
+    of. True iff the already independently resolved plan crosses a
+    protected-runtime transition (direct target or intermediate) --
+    never inferred from file content, a request field, or a worker's
+    own opinion."""
     return protected_runtime_field is not None
 
 
 def require_mutation_allowed(protected_runtime_field: ProtectedRuntimeField | None, milestones) -> None:
     """D3-K's central pre-mutation gate. A complete no-op for an
-    ordinary release (protected_runtime_field is None) -- every
+    ordinary plan (protected_runtime_field is None) -- every
     existing Phase-B mutation call site's behavior is BYTE-FOR-BYTE
     unchanged for every release that does not declare protected_
     runtime (parity, D3-C/D3-K's own explicit requirement). For a
@@ -138,8 +137,8 @@ def require_mutation_allowed(protected_runtime_field: ProtectedRuntimeField | No
         return
     if MUTATION_GATE_MILESTONE not in set(milestones):
         raise MutationGateError(
-            "production mutation refused: this job's target release declares "
-            f"protected_runtime, and {MUTATION_GATE_MILESTONE!r} is not yet a durable "
+            "production mutation refused: this job crosses protected_runtime, and "
+            f"{MUTATION_GATE_MILESTONE!r} is not yet a durable "
             "milestone -- runtime activation has not been accepted"
         )
 

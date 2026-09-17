@@ -84,6 +84,10 @@ SCHEMA_VERSION = 1
 # PROTOCOL_VERSION bump; see that module's own docstring for the full
 # reasoning and test_phase_d3_version_bridge.py for the cross-copy
 # lockstep proof.
+#
+# The r0084 skipped-transition correction intentionally remains protocol 5.
+# It repairs existing Phase-D semantics; a bump would strand legacy workers
+# before they could activate the direct protected bridge release.
 UPDATER_PROTOCOL_VERSION = 5
 
 RELEASE_ID_PATTERN = re.compile(r"^r[0-9]{4,}$")

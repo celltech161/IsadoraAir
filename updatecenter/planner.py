@@ -27,7 +27,11 @@ from django.db.migrations.loader import MigrationLoader
 from django.db import connection
 
 from . import cross_check, git_adapter, manifest as manifest_mod, release_chain, schema_health as schema_health_mod
-from .execution_contract import execution_fingerprint, protected_runtime_execution_fingerprint
+from .execution_contract import (
+    execution_fingerprint,
+    intermediate_protected_runtime_execution_fingerprint,
+    protected_runtime_execution_fingerprint,
+)
 
 # Deliberately matches ARCHITECTURE_REPORT.md §15's restart ordering,
 # derived from these units' own declared `After=` dependencies
@@ -639,21 +643,20 @@ def build_plan(checkout_root, releases_dirname: str = release_chain.RELEASES_DIR
         minimum_updater_protocol_version=minimum_protocol,
         manual_bootstrap_required=manual_bootstrap_required,
     )
-    # D3-J: fingerprint v3 becomes authoritative the moment the TARGET
-    # release itself declares protected_runtime -- the exact same rule
-    # deploy/updater_runtime/isadoraair_updater/release.py's own
-    # derive_plan() applies (see that module's own D3-J docstring),
-    # restated here independently so Django's own submitted plan_
-    # fingerprint (job_service.create_job -> UpdateJob.plan_fingerprint)
-    # already matches what the worker will independently re-derive,
-    # rather than always submitting v2 and relying on the worker to
-    # reinterpret it. An ordinary release (protected_runtime is None)
-    # keeps using v2, unchanged.
-    if latest.manifest.protected_runtime is None:
+    # Match the protected worker independently: the newest runtime-bearing
+    # release in the traversed transitions is effective. Ordinary plans
+    # retain v2; a direct protected target retains legacy-compatible v3;
+    # only the newly representable intermediate case uses provenance-aware
+    # contract v4.
+    protected_chained = next(
+        (item for item in reversed(releases_in_plan) if item.manifest.protected_runtime is not None),
+        None,
+    )
+    if protected_chained is None:
         execution_fp = execution_fingerprint(**_fingerprint_values)
     else:
-        protected_runtime = latest.manifest.protected_runtime
-        execution_fp = protected_runtime_execution_fingerprint(
+        protected_runtime = protected_chained.manifest.protected_runtime
+        protected_values = dict(
             **_fingerprint_values,
             protected_runtime_generation=protected_runtime.generation,
             protected_runtime_descriptor_sha256=protected_runtime.descriptor_sha256,
@@ -662,6 +665,15 @@ def build_plan(checkout_root, releases_dirname: str = release_chain.RELEASES_DIR
             protected_runtime_manifest_protocol_version=protected_runtime.manifest_protocol_version,
             protected_runtime_supported_wire_protocols=protected_runtime.supported_wire_protocols,
         )
+        if protected_chained.manifest.release_id == latest.manifest.release_id:
+            execution_fp = protected_runtime_execution_fingerprint(**protected_values)
+        else:
+            execution_fp = intermediate_protected_runtime_execution_fingerprint(
+                **protected_values,
+                protected_runtime_release_id=protected_chained.manifest.release_id,
+                protected_runtime_previous_release_id=protected_chained.manifest.previous_release_id,
+                protected_runtime_commit=release_commits[protected_chained.manifest.release_id],
+            )
 
     return Plan(
         safety_status=safety_status, safety_detail=safety_detail,

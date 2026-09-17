@@ -30,12 +30,17 @@ PROTOCOL_VERSION = 3
 # a generation supplies one, D0 generation 1's compiled
 # MANAGED_UNIT_POLICIES otherwise), the runtime-handoff milestone
 # vocabulary and central pre-mutation gate (runtime_handoff.py), and
-# fingerprint contract v3 becoming authoritative for a protected-
+# fingerprint contract v3 becoming authoritative for a direct protected-
 # runtime target release (release.py's derive_plan()). This is a real
 # change to what this package's own code DOES, not a redefinition of
 # either protocol number below -- see D3's own workorder: "Do not bump
 # merely for cosmetics."
-RUNTIME_VERSION = 5
+#
+# 5 -> 6 (r0084 correctness repair): planning and handoff now preserve
+# the newest protected-runtime transition crossed by an aggregated plan,
+# including its introducing release/predecessor/commit provenance. Direct
+# protected targets retain their legacy v3 authorization fingerprint.
+RUNTIME_VERSION = 6
 
 # The release-MANIFEST execution-semantics protocol (see release.py's
 # manual_blockers(), compared against each release's declared
@@ -66,6 +71,11 @@ RUNTIME_VERSION = 5
 # minimum_updater_protocol_version=5 so a pre-Phase-D updater refuses
 # it (UPDATER_UPGRADE_REQUIRED) rather than attempting its ordinary
 # pipeline against a runtime it cannot actually replace.
+#
+# r0084 deliberately retains 5: selecting an intermediate protected
+# transition repairs the existing Phase-D execution meaning. Raising this
+# value would make the generation-3 WRJE worker reject the bridge before it
+# could activate the corrected generation-5 runtime.
 MANIFEST_PROTOCOL_VERSION = 5
 
 # The BOOTSTRAP SUPERVISOR protocol (Update Center Phase D, [P1] 1.16
