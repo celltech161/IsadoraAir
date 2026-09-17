@@ -22,6 +22,7 @@ from django.db.migrations.recorder import MigrationRecorder
 from django.test import SimpleTestCase, TestCase
 
 from updatecenter import manifest as m, planner, schema_health
+from updatecenter.execution_contract import intermediate_protected_runtime_execution_fingerprint
 from .gitfixtures import FakeRepo
 
 
@@ -213,6 +214,64 @@ class ValidUpdateTests(TestCase):
                 planner.TargetSchemaValidationStatus.PENDING,
             )
             self.assertIn("target source", plan.target_schema_validation_detail.lower())
+
+    def test_intermediate_protected_transition_uses_v4_fingerprint(self):
+        with FakeRepo() as repo:
+            releases_dir = repo.work / "deploy" / "releases"
+            bootstrap_sha = repo.rev_parse("HEAD")
+            _write_manifest(releases_dir, _bootstrap(bootstrap_sha))
+            repo.commit("add bootstrap manifest", push=True)
+
+            protected_runtime = {
+                "generation": 1,
+                "descriptor_path": "deploy/updater_runtime/protected-runtime-descriptor.json",
+                "descriptor_sha256": "d" * 64,
+                "minimum_bootstrap_protocol_version": 1,
+                "runtime_version": 6,
+                "manifest_protocol_version": 5,
+                "supported_wire_protocols": [3],
+                "attestations": ["deploy/updater_attestations/r0006-primary.json"],
+            }
+            _write_manifest(releases_dir, _followup(
+                "r0006", "r0001", minimum_updater_protocol_version=5,
+                protected_runtime=protected_runtime,
+            ))
+            repo.write("deploy/updater_runtime/worker.py", "# generation one\n")
+            r0006_commit = repo.commit("add protected r0006", push=True)
+
+            _write_manifest(releases_dir, _followup(
+                "r0007", "r0006", minimum_updater_protocol_version=5,
+                protected_runtime=None,
+            ))
+            r0007_commit = repo.commit("add ordinary r0007", push=True)
+            repo.reset_local_to(bootstrap_sha)
+
+            plan = planner.build_plan(repo.work, "deploy/releases")
+            self.assertEqual(plan.safety_status, planner.SafetyStatus.READY_TO_PLAN)
+            self.assertEqual(plan.target_release_id, "r0007")
+            self.assertEqual(plan.releases_in_plan, ("r0006", "r0007"))
+            expected = intermediate_protected_runtime_execution_fingerprint(
+                installed_release_id="r0001", installed_commit=bootstrap_sha,
+                target_release_id="r0007", target_commit=r0007_commit,
+                releases_in_plan=("r0006", "r0007"), migrations_required=(),
+                migration_compatibility=None, python_requirements_changed=False,
+                apt_packages_new=(), systemd_units_changed=(),
+                systemd_units_new_required=(), systemd_units_new_optional=(),
+                systemd_units_removed_or_renamed=(), collectstatic_required=False,
+                services_requiring_restart=(), nginx_changed=False,
+                runtime_components_changed=False, minimum_updater_protocol_version=5,
+                manual_bootstrap_required=False,
+                protected_runtime_generation=1,
+                protected_runtime_descriptor_sha256="d" * 64,
+                protected_runtime_minimum_bootstrap_protocol_version=1,
+                protected_runtime_runtime_version=6,
+                protected_runtime_manifest_protocol_version=5,
+                protected_runtime_supported_wire_protocols=(3,),
+                protected_runtime_release_id="r0006",
+                protected_runtime_previous_release_id="r0001",
+                protected_runtime_commit=r0006_commit,
+            )
+            self.assertEqual(plan.fingerprint, expected)
 
     def test_stale_remote_feature_ref_does_not_block_update_plan(self):
         repo, releases_dir, bootstrap_sha = self._two_release_repo()

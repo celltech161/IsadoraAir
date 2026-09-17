@@ -469,10 +469,15 @@ run as root**; see this section's own "what remains" list at the end.
 ### Version identities
 
 - `PROTOCOL_VERSION = 3` (Django↔worker wire shape) — **unchanged**.
-- `RUNTIME_VERSION = 4 → 5`, `MANIFEST_PROTOCOL_VERSION = 4 → 5` — a
+- D3 originally moved `RUNTIME_VERSION = 4 → 5` and
+  `MANIFEST_PROTOCOL_VERSION = 4 → 5` — a
   real change to worker code and to `protected_runtime`'s own
   execution semantics (see below), not a cosmetic bump. Mirrored in
   `updatecenter/manifest.py`'s `UPDATER_PROTOCOL_VERSION`.
+- The r0084 skipped-transition correctness repair moves only
+  `RUNTIME_VERSION = 5 → 6`. The manifest protocol remains 5, the wire
+  protocol remains 3, and the bootstrap protocol remains 1: old Phase-D
+  workers must still be able to execute a direct protected r0084 bridge.
 - `BOOTSTRAP_PROTOCOL_VERSION = 1` — unchanged.
 
 ### D3-A — real worker↔supervisor IPC
@@ -586,8 +591,9 @@ wholesale copy of supervisor slot-activation state.
 
 ### D3-E/D3-F — durable job ownership transfer, proven not asserted
 
-`Executor._execute_runtime_handoff()`: for a job whose target release
-declares `protected_runtime`, the old worker validates just enough to
+`Executor._execute_runtime_handoff()`: for a job crossing an effective
+protected-runtime transition (direct target or intermediate), the old
+worker validates just enough to
 know a handoff is required, stages+publishes the candidate, requests
 activation, and — once `runtime_activation_requested` is durable —
 calls `self.store.close()` (releasing the real `fcntl.flock` exclusive
@@ -654,26 +660,39 @@ already required — no new code path, no new trust decision — proven by
 `test_phase_d3_fingerprint_v3.py`'s cross-boundary parity and by
 `test_phase_d3_executor_handoff.py`'s own idempotent-reentry test.
 
-### D3-J — fingerprint contract v3
+### D3-J — fingerprint contracts v3/v4
 
-`release.py`'s `protected_runtime_fingerprint_payload()` (already
-written in D1) is now what `derive_plan()` actually uses whenever the
-TARGET release declares `protected_runtime` — `TrustedPlan` gained a
-`protected_runtime: ProtectedRuntimeField | None = None` field
-(default preserves every existing `TrustedPlan(**data)` test fixture).
+`release.py`'s `protected_runtime_fingerprint_payload()` remains the
+byte-for-byte contract-v3 authorization for a direct protected target.
+That compatibility is intentional: a legacy worker can persist the r0084
+job fingerprint before generation 5 starts, and the candidate can rederive
+the identical value. Ordinary plans retain contract v2 unchanged.
+
+For a plan that crosses a protected release before a later ordinary final
+target, `derive_plan()` selects the newest such transition and records a
+frozen `ProtectedRuntimeTransition`: its field, introducing release ID,
+that manifest's canonical predecessor, and its introducing commit. This
+newly representable case uses contract v4, which embeds all v3 runtime
+facts plus those three provenance facts. Candidate bytes and attestations
+come from the introducing commit; worker verification and supervisor
+activation use the introducing release/predecessor binding. The requested
+final application target remains unchanged.
+
 `updatecenter/execution_contract.py` gained an independently-maintained
-mirror, `protected_runtime_fingerprint_payload()`/
-`protected_runtime_execution_fingerprint()`, and `planner.py`'s
-`build_plan()` now selects v2/v3 the same way. `test_phase_d3_
+mirror for both protected contracts, and `planner.py`'s `build_plan()`
+selects v2/v3/v4 by the same transition scan. `test_phase_d3_
 fingerprint_v3.py` proves Django's and the worker's independent v3
 computations are byte-identical for the same facts, that v3 preserves
 every v2 fact unchanged except `contract_version`, and that v2/v3
-never accidentally collide.
+never accidentally collide. `test_r0084_skipped_protected_runtime.py`
+proves v4 parity, provenance tamper sensitivity, latest-transition
+selection, the historical r0081→r0083 Aircheck case, and direct-target
+legacy fingerprint parity.
 
 ### D3-K — mutation gate
 
 `runtime_handoff.require_mutation_allowed()`: a complete no-op for an
-ordinary release; for a `protected_runtime` release, refuses
+ordinary plan; for any plan crossing `protected_runtime`, refuses
 (`MutationGateError`) unless `runtime_activation_accepted` is already a
 durable milestone. Called individually at **every** production-
 mutating call site in `Executor.execute()` — checkpoint/migration,

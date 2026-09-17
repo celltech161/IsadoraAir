@@ -401,3 +401,35 @@ class EvaluateThresholdTests(SimpleTestCase):
         result = evaluate_threshold(policy, self.statement, assertions)
         self.assertFalse(result.satisfied)
         self.assertEqual(result.verified_count, 1)
+
+    def test_r0084_canonical_and_wrje_bridge_assertions_are_statement_exact(self):
+        """One descriptor may carry canonical and bridge assertions.
+
+        Threshold 1 remains exact: each caller accepts only the signature
+        authored over its own predecessor binding, and an uncovered r0082
+        caller accepts neither.
+        """
+        policy = self._policy(threshold=1)
+        descriptor_sha256 = "5" * 64
+        statements = {
+            predecessor: build_attestation_statement(
+                release_id="r0084", previous_release_id=predecessor,
+                generation=5, descriptor_sha256=descriptor_sha256,
+            )
+            for predecessor in ("r0081", "r0082", "r0083")
+        }
+        assertions = [
+            SignatureAssertion("signer-a", _sign(self.priv_a, statements["r0083"])),
+            SignatureAssertion("signer-a", _sign(self.priv_a, statements["r0081"])),
+        ]
+
+        canonical = evaluate_threshold(policy, statements["r0083"], assertions)
+        bridge = evaluate_threshold(policy, statements["r0081"], assertions)
+        uncovered = evaluate_threshold(policy, statements["r0082"], assertions)
+
+        self.assertTrue(canonical.satisfied)
+        self.assertTrue(bridge.satisfied)
+        self.assertFalse(uncovered.satisfied)
+        self.assertEqual(canonical.verified_count, 1)
+        self.assertEqual(bridge.verified_count, 1)
+        self.assertEqual(uncovered.verified_count, 0)

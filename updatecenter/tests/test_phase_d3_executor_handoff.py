@@ -14,6 +14,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
+from unittest.mock import patch
 
 from django.test import SimpleTestCase
 
@@ -313,6 +314,87 @@ class ExecutorRuntimeHandoffEndToEndTests(SimpleTestCase):
             second["protected_runtime_candidate"]["descriptor_sha256"],
         )
 
+    def test_intermediate_runtime_handoff_keeps_later_ordinary_final_target(self):
+        """A r0003 -> r0005 job hands off through r0004 generation 2.
+
+        The only valid test signature is bound to r0004/r0003.  Therefore
+        reaching runtime_activation_requested also proves both worker-side
+        verification and supervisor-side verification received the runtime
+        transition's provenance instead of r0005/r0003.
+        """
+        releases = self.author / "deploy" / "releases"
+        r0005_manifest = {
+            "schema_version": 1, "release_id": "r0005", "previous_release_id": "r0004",
+            "minimum_updater_protocol_version": 5, "summary": "ordinary final target",
+            "migrations_required": [], "migration_compatibility": None,
+            "python_requirements_changed": False, "requirements_sha256": None,
+            "apt_packages_new": [], "systemd_units_changed": [],
+            "systemd_units_new_required": [], "systemd_units_new_optional": [],
+            "systemd_units_removed_or_renamed": [], "collectstatic_required": False,
+            "services_requiring_restart": [], "nginx_changed": False,
+            "runtime_components_changed": False, "minimum_supported_release_id": "r0003",
+            "manual_bootstrap_required": False, "protected_runtime": None,
+        }
+        (releases / "r0005.json").write_text(json.dumps(r0005_manifest))
+        git(self.author, "add", "deploy/releases/r0005.json")
+        git(self.author, "commit", "-m", "r0005 ordinary final target")
+        r0005_commit = git(self.author, "rev-parse", "HEAD")
+        git(self.author, "push", "origin", "main")
+
+        job_id = str(uuid.uuid4())
+        from isadoraair_updater.release import derive_plan
+        plan = derive_plan(
+            self.executor.repository, self.executor.repository.fetch(), self.r0003_commit, "r0005",
+        )
+        self.assertEqual(plan.target_commit, r0005_commit)
+        self.assertEqual(plan.protected_runtime_transition.release_id, "r0004")
+        self.assertEqual(plan.protected_runtime_transition.commit, self.r0004_commit)
+        self.assertEqual(plan.fingerprint_payload()["contract_version"], 4)
+        self.old_store.accept(job_id, "r0005", plan.fingerprint)
+
+        result = self.executor.execute(job_id)
+
+        self.assertEqual(result["state"], "running", result.get("failure_detail"))
+        self.assertIn("runtime_activation_requested", result["milestones"])
+        self.assertEqual(result["requested_target_release_id"], "r0005")
+        self.assertEqual(result["trusted_plan"]["target_release_id"], "r0005")
+        self.assertEqual(
+            result["trusted_plan"]["protected_runtime_transition"]["release_id"], "r0004",
+        )
+        self.assertEqual(result["protected_runtime_candidate"]["generation"], 2)
+        self.assertNotIn("source_advanced", result["milestones"])
+
+        # A generation-2 candidate now takes the released lock, re-fetches
+        # and independently re-derives the SAME final r0005 plan/fingerprint,
+        # accepts this exact handoff identity, and reaches the central
+        # mutation barrier with r0005 still the application target. Stop at
+        # that barrier so this focused test performs no application mutation.
+        candidate_store = JobStore(self.jobs_root, self.logs_root, acquire_daemon_lock=True)
+        candidate = Executor(
+            self.config, candidate_store, CommandRunner(),
+            expected_handoff_generation=2,
+            expected_handoff_descriptor_sha256=plan.protected_runtime.descriptor_sha256,
+            expected_resumable_job_uuid=job_id,
+        )
+
+        class ReachedMutationBarrier(BaseException):
+            pass
+
+        try:
+            with patch.object(candidate, "_enter_mutation_phase", side_effect=ReachedMutationBarrier):
+                with self.assertRaises(ReachedMutationBarrier):
+                    candidate.execute(job_id)
+            resumed = candidate_store.load(job_id)
+            self.assertIn("runtime_activation_accepted", resumed["milestones"])
+            self.assertEqual(resumed["trusted_plan"]["target_release_id"], "r0005")
+            self.assertEqual(
+                resumed["trusted_plan"]["protected_runtime_transition"]["release_id"], "r0004",
+            )
+            self.assertNotIn("current_schema_validated", resumed["milestones"])
+            self.assertNotIn("source_advanced", resumed["milestones"])
+        finally:
+            candidate_store.close()
+
 
 class MutationGateWiringTests(SimpleTestCase):
     """Confirms Executor._require_mutation_allowed actually converts
@@ -340,7 +422,7 @@ class MutationGateWiringTests(SimpleTestCase):
             minimum_bootstrap_protocol_version=1, runtime_version=5, manifest_protocol_version=5,
             supported_wire_protocols=(3,), attestations=("deploy/updater_attestations/a.json",),
         )
-        from isadoraair_updater.release import TrustedPlan
+        from isadoraair_updater.release import ProtectedRuntimeTransition, TrustedPlan
         plan = TrustedPlan(
             installed_release_id="r0002", installed_commit="a" * 40, target_release_id="r0003",
             target_commit="b" * 40, releases_in_plan=("r0003",), migrations_required=(),
@@ -349,7 +431,9 @@ class MutationGateWiringTests(SimpleTestCase):
             systemd_units_removed_or_renamed=(), collectstatic_required=False,
             services_requiring_restart=(), nginx_changed=False, runtime_components_changed=False,
             minimum_updater_protocol_version=5, manual_bootstrap_required=False, fingerprint="f" * 64,
-            protected_runtime=field,
+            protected_runtime_transition=ProtectedRuntimeTransition(
+                field=field, release_id="r0003", previous_release_id="r0002", commit="b" * 40,
+            ),
         )
         with self.assertRaises(ExecutionError) as ctx:
             self.executor._require_mutation_allowed(plan, {"runtime_activation_requested"})

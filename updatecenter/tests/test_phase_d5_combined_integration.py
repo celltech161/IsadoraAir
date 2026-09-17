@@ -27,6 +27,7 @@ from isadoraair_updater.config import validate_config_dict
 from isadoraair_updater.release import (
     GENERATION_1_POLICY_DOCUMENT,
     KNOWN_MANAGED_UNITS,
+    ProtectedRuntimeTransition,
     TrustedPlan,
     manual_blockers,
 )
@@ -64,6 +65,12 @@ def _protected_field() -> ProtectedRuntimeField:
 
 
 def _trusted_plan(*, protected=True) -> TrustedPlan:
+    transition = None
+    if protected:
+        transition = ProtectedRuntimeTransition(
+            field=_protected_field(), release_id="r0027",
+            previous_release_id="r0026", commit="b" * 40,
+        )
     return TrustedPlan(
         installed_release_id="r0026", installed_commit="a" * 40,
         target_release_id="r0027", target_commit="b" * 40,
@@ -73,7 +80,7 @@ def _trusted_plan(*, protected=True) -> TrustedPlan:
         systemd_units_removed_or_renamed=(), collectstatic_required=False,
         services_requiring_restart=(), nginx_changed=False, runtime_components_changed=False,
         minimum_updater_protocol_version=5, manual_bootstrap_required=False,
-        fingerprint="f" * 64, protected_runtime=_protected_field() if protected else None,
+        fingerprint="f" * 64, protected_runtime_transition=transition,
     )
 
 
