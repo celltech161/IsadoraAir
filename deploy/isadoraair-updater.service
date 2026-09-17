@@ -1,3 +1,15 @@
+# OBSOLETE, PRE-PHASE-D LEGACY MATERIAL -- retained for historical/
+# rollback/release-chain context only (r0003-r0006 manual bridge era;
+# see docs/UPDATE_CENTER.md's own historical runbook). Superseded by the
+# Phase-D bootstrap supervisor (deploy/updater-bootstrapd.service) --
+# see docs/UPDATE_CENTER_PHASE_D.md's "Legacy updater retirement"
+# section. On a completed Phase-D station this unit must be MASKED, not
+# merely disabled (deploy/updater_bootstrap/tools/
+# legacy_updater_retirement.py). Do not install/enable/start this unit
+# on a station that already has a working Phase-D supervisor -- its
+# ExecStart/config contract predates the phase_d_* station-config
+# fields entirely and will crash-loop, and it shares RuntimeDirectory=
+# isadoraair-updater with the live supervisor-owned worker socket.
 [Unit]
 Description=IsadoraAir protected update executor
 After=network-online.target postgresql.service
