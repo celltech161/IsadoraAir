@@ -28,7 +28,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent / "lib"))
+from isadoraair.engine_commands import enqueue_engine_command  # noqa: E402
 from delivery import deliver  # noqa: E402
 import voices  # noqa: E402
 from voices import VoiceResolutionError, resolve_voice  # noqa: E402
@@ -53,7 +55,6 @@ COMBINED_OUTPUT = os.path.join(TMP_DIR, "wx_alert.mp3")
 CATEGORY_CODE = "WxAlert"
 DEST_FILENAME = "wx_alert.mp3"
 
-ENGINE_CMD_PATH = Path("/run/isadoraair/engine_cmd.json")
 LOCKFILE = "/tmp/amber-alert.lock"
 
 
@@ -125,12 +126,10 @@ def _concat_clips(clip_paths, output_path):
 
 
 def _fire_insert_urgent():
-    ENGINE_CMD_PATH.parent.mkdir(parents=True, exist_ok=True)
-    ENGINE_CMD_PATH.write_text(
-        json.dumps({"command": "insert_urgent", "category": CATEGORY_CODE}),
-        encoding="utf-8",
+    enqueue_engine_command(
+        {"command": "insert_urgent", "category": CATEGORY_CODE}
     )
-    log.info("Fired insert_urgent command for category %s", CATEGORY_CODE)
+    log.info("Queued insert_urgent command for category %s", CATEGORY_CODE)
 
 
 def _main_body():

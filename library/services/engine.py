@@ -58,6 +58,12 @@ from library.services.remote_dj_stats import (
 )
 from library.services.remote_dj_quality import RemoteDJQualityTracker
 from library.services import audio_recovery
+from isadoraair.engine_commands import (
+    ENGINE_COMMAND_BATCH_SIZE,
+    EngineCommandError,
+    consume_engine_command_file,
+    list_committed_engine_commands,
+)
 from library.services.media_health import (
     MediaValidationWorker,
     capture_deck_evidence,
@@ -7380,116 +7386,160 @@ class PlaybackEngine:
             return time.time() - deck.started_at
         return 0.0
 
-    def _check_commands(self):
-        try:
-            if not CMD_PATH.is_file():
-                return
-            data = json.loads(CMD_PATH.read_text(encoding="utf-8"))
-            CMD_PATH.unlink(missing_ok=True)
+    def _dispatch_engine_command(self, data):
+        """Apply one decoded command, independent of its IPC transport."""
 
-            cmd = data.get("command")
-            if cmd == "seek":
-                position = float(data.get("position", 0))
-                slot = data.get("slot")
-                self._seek_deck(slot, position)
-            elif cmd == "reload_audio_output":
-                # [P0] 1.3C: also refreshes every output slot's recovery-
-                # identity fields as part of the same command -- see
-                # _reload_output_recovery_identity's own docstring for
-                # why this is folded in here rather than as a second,
-                # separately-fired command (engine_cmd.json is a single-
-                # slot channel; a second _write_engine_command call from
-                # the same admin save would just overwrite this one
-                # before the engine ever reads it).
-                #
-                # [P0] 1.3C integration-bug fix -- AGC reapply used to be
-                # dispatched as a SEPARATE "reload_agc_config" command,
-                # written directly by AudioOutputAdmin.save_model() after
-                # super().save_model() had already let this signal fire.
-                # Both writers targeted the same single-slot
-                # engine_cmd.json, so the admin's later write reliably
-                # clobbered this one before the engine ever polled it --
-                # a Studio Monitor save's identity refresh was silently
-                # lost every time, only the AGC reapply ever landed.
-                # Fixed by making "reload_audio_output" Studio Monitor's
-                # ONE unified live-reload command: identity refresh,
-                # device swap, AND AGC reapply, all under this single
-                # command. See hardware/admin.py's save_model for the
-                # writer-side half of this fix.
-                self._apply_agc_config()
-                identity_changes = self._reload_output_recovery_identity()
-                self._apply_audio_output_device(
-                    self._resolve_studio_monitor_device(),
-                    identity_changed="studio_monitor" in identity_changes)
-            elif cmd == "reload_audio_output_recovery_config":
-                # [P0] 1.3C -- for AudioOutput rows other than Studio
-                # Monitor (Stereotool Input today), which have no live
-                # device-swap path at all -- see hardware/signals.py.
-                self._reload_output_recovery_identity()
-            elif cmd == "reload_agc_config":
-                # No longer written anywhere as of the integration-bug
-                # fix above (AGC reapply now rides along with
-                # "reload_audio_output" instead) -- kept as a harmless,
-                # still-correct standalone handler in case some future
-                # caller wants AGC-only reapply without the rest.
-                self._apply_agc_config()
-            elif cmd == "reload_current_log":
-                self._reload_and_restart_current_log()
-            elif cmd == "deck_pause":
-                self._pause_deck(data.get("slot"))
-            elif cmd == "deck_resume":
-                self._resume_deck(data.get("slot"))
-            elif cmd == "deck_eject":
-                self._eject_deck(data.get("slot"))
-            elif cmd == "force_next_hour":
-                # Manual testing hook: do exactly what
-                # _ensure_upcoming_logs does naturally ~30s before top of
-                # hour, on demand instead of waiting for the real clock.
-                # Deliberately synchronous/blocking -- unlike the
-                # recurring auto-build, an operator invoking this
-                # expects it to be done by the time it returns.
-                now = timezone.localtime()
-                next_hour = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
-                log, error = build_and_approve_hour_log_locked(next_hour.date(), next_hour.hour)
-                if error and error != LOCK_CONTENDED:
-                    print(f"  force_next_hour build failed for {next_hour.date()} {next_hour.hour:02d}:00 -- {error}")
-                    emit_event(
-                        category="engine", level="warning", title="force_next_hour build failed",
-                        detail={"date": str(next_hour.date()), "hour": next_hour.hour, "error": error},
-                    )
-                elif error == LOCK_CONTENDED:
-                    print(f"  force_next_hour deferred for {next_hour.date()} {next_hour.hour:02d}:00 -- already being built elsewhere")
-                self._advance_to_next_hour_log(next_hour.date(), next_hour.hour)
-            elif cmd == "mic_ptt":
-                self._set_mic_ptt(bool(data.get("active")))
-            elif cmd == "set_manual_mode":
-                self._set_manual_mode(bool(data.get("active")))
-            elif cmd == "insert_urgent":
-                self._insert_urgent_next(data.get("category", "WxAlert"))
-            elif cmd == "remote_dj_gate":
-                self._remote_dj_set_gate(bool(data.get("active")))
-            elif cmd == "remote_dj_disconnect":
-                self._remote_dj_session_stop()
-            elif cmd == "fx_fire":
-                cart_id = data.get("cart_id")
-                if cart_id:
-                    self._fx_fire(int(cart_id))
-            elif cmd == "reload_fx_config":
-                # Volume-only reload. _fx_fire reads polyphony_cap fresh
-                # for each admission decision, so the cap needs neither
-                # this command nor a pipeline rebuild/restart.
-                self._fx_apply_volume()
-            elif cmd == "reload_voicetrack_config":
-                # Duck depth / ramp / gap reads happen at fire time, so
-                # a config change lands on the very next VT sequence
-                # without a restart. This handler is a no-op today --
-                # kept for API symmetry with reload_fx_config and to
-                # give the admin form a Save button that isn't
-                # misleading. Behavior belongs in _vt_* helpers (Phase
-                # 1d-ii).
-                pass
+        cmd = data.get("command")
+        if cmd == "seek":
+            position = float(data.get("position", 0))
+            slot = data.get("slot")
+            self._seek_deck(slot, position)
+        elif cmd == "reload_audio_output":
+            # [P0] 1.3C: also refreshes every output slot's recovery-
+            # identity fields as part of the same command -- see
+            # _reload_output_recovery_identity's own docstring for
+            # why this is folded in here rather than as a second command.
+            # Historically engine_cmd.json was a single-slot channel, so
+            # a second write from the same admin save overwrote this one.
+            #
+            # [P0] 1.3C integration-bug fix -- AGC reapply used to be
+            # dispatched as a SEPARATE "reload_agc_config" command,
+            # written directly by AudioOutputAdmin.save_model() after
+            # super().save_model() had already let this signal fire.
+            # Both writers historically targeted the same single-slot
+            # engine_cmd.json, so the admin's later write reliably
+            # clobbered this one before the engine ever polled it --
+            # a Studio Monitor save's identity refresh was silently
+            # lost every time, only the AGC reapply ever landed.
+            # Fixed by making "reload_audio_output" Studio Monitor's
+            # ONE unified live-reload command: identity refresh,
+            # device swap, AND AGC reapply, all under this single
+            # command. See hardware/admin.py's save_model for the
+            # writer-side half of this fix.
+            self._apply_agc_config()
+            identity_changes = self._reload_output_recovery_identity()
+            self._apply_audio_output_device(
+                self._resolve_studio_monitor_device(),
+                identity_changed="studio_monitor" in identity_changes)
+        elif cmd == "reload_audio_output_recovery_config":
+            # [P0] 1.3C -- for AudioOutput rows other than Studio
+            # Monitor (Stereotool Input today), which have no live
+            # device-swap path at all -- see hardware/signals.py.
+            self._reload_output_recovery_identity()
+        elif cmd == "reload_agc_config":
+            # No longer written anywhere as of the integration-bug
+            # fix above (AGC reapply now rides along with
+            # "reload_audio_output" instead) -- kept as a harmless,
+            # still-correct standalone handler in case some future
+            # caller wants AGC-only reapply without the rest.
+            self._apply_agc_config()
+        elif cmd == "reload_current_log":
+            self._reload_and_restart_current_log()
+        elif cmd == "deck_pause":
+            self._pause_deck(data.get("slot"))
+        elif cmd == "deck_resume":
+            self._resume_deck(data.get("slot"))
+        elif cmd == "deck_eject":
+            self._eject_deck(data.get("slot"))
+        elif cmd == "force_next_hour":
+            # Manual testing hook: do exactly what
+            # _ensure_upcoming_logs does naturally ~30s before top of
+            # hour, on demand instead of waiting for the real clock.
+            # Deliberately synchronous/blocking -- unlike the
+            # recurring auto-build, an operator invoking this
+            # expects it to be done by the time it returns.
+            now = timezone.localtime()
+            next_hour = (now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+            log, error = build_and_approve_hour_log_locked(next_hour.date(), next_hour.hour)
+            if error and error != LOCK_CONTENDED:
+                print(f"  force_next_hour build failed for {next_hour.date()} {next_hour.hour:02d}:00 -- {error}")
+                emit_event(
+                    category="engine", level="warning", title="force_next_hour build failed",
+                    detail={"date": str(next_hour.date()), "hour": next_hour.hour, "error": error},
+                )
+            elif error == LOCK_CONTENDED:
+                print(f"  force_next_hour deferred for {next_hour.date()} {next_hour.hour:02d}:00 -- already being built elsewhere")
+            self._advance_to_next_hour_log(next_hour.date(), next_hour.hour)
+        elif cmd == "mic_ptt":
+            self._set_mic_ptt(bool(data.get("active")))
+        elif cmd == "set_manual_mode":
+            self._set_manual_mode(bool(data.get("active")))
+        elif cmd == "insert_urgent":
+            self._insert_urgent_next(data.get("category", "WxAlert"))
+        elif cmd == "remote_dj_gate":
+            self._remote_dj_set_gate(bool(data.get("active")))
+        elif cmd == "remote_dj_disconnect":
+            self._remote_dj_session_stop()
+        elif cmd == "fx_fire":
+            cart_id = data.get("cart_id")
+            if cart_id:
+                self._fx_fire(int(cart_id))
+        elif cmd == "reload_fx_config":
+            # Volume-only reload. _fx_fire reads polyphony_cap fresh
+            # for each admission decision, so the cap needs neither
+            # this command nor a pipeline rebuild/restart.
+            self._fx_apply_volume()
+        elif cmd == "reload_voicetrack_config":
+            # Duck depth / ramp / gap reads happen at fire time, so
+            # a config change lands on the very next VT sequence
+            # without a restart. This handler is a no-op today --
+            # kept for API symmetry with reload_fx_config and to
+            # give the admin form a Save button that isn't
+            # misleading. Behavior belongs in _vt_* helpers (Phase
+            # 1d-ii).
+            pass
+
+    def _dispatch_engine_command_safely(self, data, source):
+        try:
+            self._dispatch_engine_command(data)
         except Exception as exc:
-            print(f"  Command error: {exc}")
+            print(f"  Command error ({source}): {exc}")
+
+    def _consume_legacy_engine_command(self):
+        """Consume at most one transition-era single-slot command."""
+
+        if not CMD_PATH.is_file():
+            return
+        try:
+            try:
+                raw = CMD_PATH.read_text(encoding="utf-8")
+            finally:
+                # At-most-once: a malformed command must not poison every poll.
+                CMD_PATH.unlink(missing_ok=True)
+            data = json.loads(raw)
+            if not isinstance(data, dict):
+                raise ValueError("legacy engine command must be a JSON object")
+            command = data.get("command")
+            if not isinstance(command, str) or not command.strip():
+                raise ValueError("legacy engine command requires a nonblank command")
+        except Exception as exc:
+            print(f"  Legacy command error: {exc}")
+            return
+        self._dispatch_engine_command_safely(data, "legacy")
+
+    def _check_commands(self):
+        """Drain one legacy command, then one bounded FIFO queue batch.
+
+        Cross-transport causal order is unknowable because the legacy file has
+        no sequence metadata. Giving it one bounded slot first preserves old
+        caller latency, while the fixed queue batch guarantees both transports
+        make progress on every 250 ms engine poll.
+        """
+
+        self._consume_legacy_engine_command()
+        try:
+            paths = list_committed_engine_commands(limit=ENGINE_COMMAND_BATCH_SIZE)
+        except EngineCommandError as exc:
+            print(f"  Command queue scan error: {exc}")
+            return
+        for path in paths:
+            try:
+                data = consume_engine_command_file(path)
+            except EngineCommandError as exc:
+                print(f"  Queued command error ({path.name}): {exc}")
+                continue
+            if data is not None:
+                self._dispatch_engine_command_safely(data, path.name)
 
     def _splice_log_item_db_at(self, insert_at, track, category):
         """DB-only half of a queue splice -- caller must already be

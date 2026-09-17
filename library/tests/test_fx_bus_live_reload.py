@@ -10,7 +10,8 @@ from django.contrib import admin as django_admin
 from django.db import transaction
 from django.test import TestCase
 
-import hardware.signals as engine_commands
+from isadoraair import engine_commands as command_queue
+from isadoraair.engine_commands import EngineCommandQueueFull
 import library.services.engine as engine_module
 from library.admin import FXBusConfigAdmin
 from library.models import FXBusConfig
@@ -142,28 +143,36 @@ class FXBusAdminLiveReloadTests(TestCase):
         )
 
     def test_unavailable_command_endpoint_does_not_undo_committed_save(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            unavailable = Path(tmp) / "missing" / "engine_cmd.json"
-            with patch.object(engine_commands, "CMD_PATH", unavailable):
+        with self.assertLogs("hardware.signals", level="ERROR") as logs:
+            with patch(
+                "hardware.signals.enqueue_engine_command",
+                side_effect=EngineCommandQueueFull("queue full"),
+            ):
                 self._save({"volume_db": -5.0})
 
         self.config.refresh_from_db()
         self.assertEqual(self.config.volume_db, -5.0)
         self.assertEqual(len(_audit_events()), 1)
+        self.assertIn("live-reload command was not queued", logs.output[0])
 
     def test_real_publisher_payload_drives_real_engine_handler_contract(self):
         engine = _engine_stand_in()
         active_fire_before = dict(engine._fx_fires)
         with tempfile.TemporaryDirectory() as tmp:
-            command_path = Path(tmp) / "engine_cmd.json"
-            with patch.object(engine_commands, "CMD_PATH", command_path):
+            root = Path(tmp)
+            queue_dir = root / "engine_cmd.d"
+            lock_path = root / "engine_cmd.lock"
+            legacy_path = root / "engine_cmd.json"
+            with patch.object(command_queue, "ENGINE_COMMAND_QUEUE_DIR", queue_dir), \
+                 patch.object(command_queue, "ENGINE_COMMAND_LOCK_PATH", lock_path), \
+                 patch.object(engine_module, "CMD_PATH", legacy_path):
                 self._save({"volume_db": -6.0})
-            self.assertEqual(
-                json.loads(command_path.read_text(encoding="utf-8")),
-                RELOAD_PAYLOAD,
-            )
-
-            with patch.object(engine_module, "CMD_PATH", command_path):
+                paths = command_queue.list_committed_engine_commands()
+                self.assertEqual(len(paths), 1)
+                self.assertEqual(
+                    json.loads(paths[0].read_text(encoding="utf-8")),
+                    RELOAD_PAYLOAD,
+                )
                 engine._check_commands()
 
         engine.fx_bus_gain.set_property.assert_called_once_with(

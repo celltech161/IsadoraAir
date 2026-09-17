@@ -1,17 +1,11 @@
 """[P0] 1.3C pre-commit review -- hardware/signals.py's AudioOutput
-post_save handler now writes ONE of two commands depending on which row
-was saved (see that module's own updated docstring for why exactly one,
-never two, given engine_cmd.json is a single-slot channel). No prior
-test coverage of this signal existed at all; added here alongside this
+post_save handler now queues ONE of two commands depending on which row
+was saved (see that module's own updated docstring for why exactly one).
+No prior test coverage of this signal existed at all; added here alongside this
 phase's own change to it.
 
-CMD_PATH is patched to a throwaway tempfile in every test -- this box IS
-production (isadoraair-engine.service is live), and the real
-/run/isadoraair/engine_cmd.json is that engine's actual IPC inbox. A
-test must never write to it."""
-import json
-import tempfile
-from pathlib import Path
+The shared enqueue call is mocked in every test so this production-adjacent
+test box never receives a live engine command."""
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -23,16 +17,20 @@ from hardware.models import AudioOutput
 
 class AudioOutputReloadSignalTests(TestCase):
     def _save_and_read_command(self, name, device="plughw:9,0", **extra_fields):
-        with tempfile.TemporaryDirectory() as tmp:
-            cmd_path = Path(tmp) / "engine_cmd.json"
-            with patch("hardware.signals.CMD_PATH", cmd_path), \
-                 self.captureOnCommitCallbacks(execute=True):
-                obj, _ = AudioOutput.objects.get_or_create(name=name, defaults={"device": device})
-                for field, value in extra_fields.items():
-                    setattr(obj, field, value)
-                obj.save()
-            self.assertTrue(cmd_path.is_file(), "committed save must write a command")
-            return json.loads(cmd_path.read_text(encoding="utf-8"))
+        published = []
+        with patch("hardware.signals.enqueue_engine_command", side_effect=published.append), \
+             self.captureOnCommitCallbacks(execute=True):
+            obj, _ = AudioOutput.objects.get_or_create(name=name, defaults={"device": device})
+        # Object creation is its own model save and legitimately schedules its
+        # own reload. This helper is asserting the following explicit save.
+        published.clear()
+        with patch("hardware.signals.enqueue_engine_command", side_effect=published.append), \
+             self.captureOnCommitCallbacks(execute=True):
+            for field, value in extra_fields.items():
+                setattr(obj, field, value)
+            obj.save()
+        self.assertEqual(len(published), 1, "committed save must queue one command")
+        return published[0]
 
     def test_studio_monitor_save_writes_reload_audio_output(self):
         payload = self._save_and_read_command("Studio Monitor")
@@ -61,33 +59,29 @@ class AudioOutputReloadSignalTests(TestCase):
 
 
     def test_command_is_published_only_after_transaction_commit(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            cmd_path = Path(tmp) / "engine_cmd.json"
-            with patch("hardware.signals.CMD_PATH", cmd_path):
-                with self.captureOnCommitCallbacks(execute=False) as callbacks:
-                    obj, _ = AudioOutput.objects.get_or_create(name="Studio Monitor")
-                    obj.device_identity_kind = "alsa_card_id"
-                    obj.device_identity = "CODEC"
-                    obj.save()
-                    self.assertFalse(cmd_path.exists())
-                self.assertGreaterEqual(len(callbacks), 1)
-                for callback in callbacks:
-                    callback()
-            self.assertEqual(
-                json.loads(cmd_path.read_text(encoding="utf-8")),
-                {"command": "reload_audio_output"})
-
-    def test_rolled_back_save_publishes_no_command(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            cmd_path = Path(tmp) / "engine_cmd.json"
-            with patch("hardware.signals.CMD_PATH", cmd_path), \
-                 self.captureOnCommitCallbacks(execute=False) as callbacks:
+        published = []
+        with patch("hardware.signals.enqueue_engine_command", side_effect=published.append):
+            with self.captureOnCommitCallbacks(execute=False) as callbacks:
                 obj, _ = AudioOutput.objects.get_or_create(name="Studio Monitor")
                 obj.device_identity_kind = "alsa_card_id"
                 obj.device_identity = "CODEC"
                 obj.save()
+                self.assertEqual(published, [])
             self.assertGreaterEqual(len(callbacks), 1)
-            self.assertFalse(cmd_path.exists())
+            for callback in callbacks:
+                callback()
+        self.assertEqual(published, [{"command": "reload_audio_output"}])
+
+    def test_rolled_back_save_publishes_no_command(self):
+        published = []
+        with patch("hardware.signals.enqueue_engine_command", side_effect=published.append), \
+             self.captureOnCommitCallbacks(execute=False) as callbacks:
+            obj, _ = AudioOutput.objects.get_or_create(name="Studio Monitor")
+            obj.device_identity_kind = "alsa_card_id"
+            obj.device_identity = "CODEC"
+            obj.save()
+        self.assertGreaterEqual(len(callbacks), 1)
+        self.assertEqual(published, [])
 
 
 class AudioOutputAdminSaveModelIntegrationTests(TestCase):
@@ -95,7 +89,7 @@ class AudioOutputAdminSaveModelIntegrationTests(TestCase):
     the Django Admin went through AudioOutputAdmin.save_model(), not
     just the post_save signal in isolation -- and save_model() used to
     write a SECOND, separate "reload_agc_config" command directly to
-    engine_cmd.json, AFTER super().save_model() (which fires the
+    the historical engine_cmd.json slot, AFTER super().save_model() (which fires the
     post_save signal above, writing "reload_audio_output") had already
     run. Both writers targeted the same single-slot file, so the
     admin's later write reliably clobbered the signal's -- an identity
@@ -104,26 +98,24 @@ class AudioOutputAdminSaveModelIntegrationTests(TestCase):
     obj.save() directly, could never have caught this -- they never
     exercise save_model() at all. These do.
 
-    CMD_PATH is patched to a throwaway tempfile in every test -- same
-    production-safety requirement as above. amixer/alsactl subprocess
+    The shared enqueue call is mocked in every test. amixer/alsactl subprocess
     calls (triggered by mixer-control changes) are mocked in the one
     test that exercises them -- this must never touch real hardware,
     on this box least of all."""
 
     def _save_via_admin(self, obj, form=None, mock_subprocess=False):
         admin_instance = AudioOutputAdmin(AudioOutput, None)
-        with tempfile.TemporaryDirectory() as tmp:
-            cmd_path = Path(tmp) / "engine_cmd.json"
-            with patch("hardware.signals.CMD_PATH", cmd_path), \
-                 self.captureOnCommitCallbacks(execute=True):
-                if mock_subprocess:
-                    with patch("hardware.admin.subprocess.run") as mock_run:
-                        mock_run.return_value = SimpleNamespace(returncode=0, stdout="", stderr="")
-                        admin_instance.save_model(request=None, obj=obj, form=form, change=True)
-                else:
+        published = []
+        with patch("hardware.signals.enqueue_engine_command", side_effect=published.append), \
+             self.captureOnCommitCallbacks(execute=True):
+            if mock_subprocess:
+                with patch("hardware.admin.subprocess.run") as mock_run:
+                    mock_run.return_value = SimpleNamespace(returncode=0, stdout="", stderr="")
                     admin_instance.save_model(request=None, obj=obj, form=form, change=True)
-            self.assertTrue(cmd_path.is_file(), "save_model must have produced a command")
-            return json.loads(cmd_path.read_text(encoding="utf-8"))
+            else:
+                admin_instance.save_model(request=None, obj=obj, form=form, change=True)
+        self.assertEqual(len(published), 1, "save_model must queue one command")
+        return published[0]
 
     def test_studio_monitor_identity_save_via_admin_writes_reload_audio_output(self):
         """The exact production scenario reported: device=plughw:2,0,
@@ -185,9 +177,8 @@ class AudioOutputAdminSaveModelIntegrationTests(TestCase):
         obj.save(update_fields=["mixer_control_values"]), which re-fires
         AudioOutput's post_save signal a SECOND time within the same
         admin save. Both writes are "reload_audio_output" for Studio
-        Monitor -- same command, same single-slot file -- so the file's
-        final content is still exactly that command, never a different,
-        conflicting one."""
+        Monitor. The narrow mixer snapshot save is excluded by the signal so
+        the bounded queue still receives exactly one unified command."""
         obj, _ = AudioOutput.objects.get_or_create(
             name="Studio Monitor", defaults={"device": "plughw:2,0"})
         # This name is seeded blank-device by a data migration

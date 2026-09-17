@@ -1,17 +1,7 @@
-import json
-from pathlib import Path
-
 from django.core.management.base import BaseCommand, CommandError
 
+from isadoraair.engine_commands import EngineCommandError, enqueue_engine_command
 from library.models import FXCart
-
-# Deliberately NOT imported from library.services.engine (which pulls in
-# GStreamer/gi bindings at module scope) -- same reasoning library.views'
-# api_fx_fire keeps its own inline Path("/run/isadoraair/engine_cmd.json")
-# rather than importing the engine module. Every engine_cmd.json writer in
-# this project inlines this literal rather than sharing a helper; matched
-# here rather than introducing a one-off IPC abstraction.
-ENGINE_CMD_PATH = Path("/run/isadoraair/engine_cmd.json")
 
 
 class Command(BaseCommand):
@@ -34,7 +24,7 @@ class Command(BaseCommand):
     every other fx_fire caller -- dashboard buttons, remote-DJ console,
     and this command all funnel through the identical engine-side
     _fx_fire). This command only confirms the cart exists/is enabled and
-    that the engine command file was written; it implements no GStreamer
+    that the engine command was queued; it implements no GStreamer
     playback, calls no ffmpeg, and touches no ALSA device itself."""
 
     help = "Fire an FXCart through the IsadoraAir engine's existing fx_fire command."
@@ -54,11 +44,8 @@ class Command(BaseCommand):
             raise CommandError(f"FXCart {cart_id} not found or disabled")
 
         try:
-            ENGINE_CMD_PATH.write_text(
-                json.dumps({"command": "fx_fire", "cart_id": cart_id}),
-                encoding="utf-8",
-            )
-        except OSError as exc:
+            enqueue_engine_command({"command": "fx_fire", "cart_id": cart_id})
+        except EngineCommandError as exc:
             raise CommandError(f"engine command dispatch failed: {exc}")
 
-        self.stdout.write(f"Fired fx_fire for cart {cart_id}")
+        self.stdout.write(f"Queued fx_fire for cart {cart_id}")

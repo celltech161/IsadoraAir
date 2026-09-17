@@ -20,6 +20,8 @@ from django.utils import timezone
 
 from django.shortcuts import get_object_or_404
 
+from isadoraair.engine_commands import EngineCommandError, enqueue_engine_command
+
 from .models import Artist, Album, Category, CategoryKind, Genre, Holiday, LogItem, Playlist, PlaylistItem, PlaylistLog, Rotation, RotationSlot, ScheduleBlock, Track
 from .services.log_builder import LOCK_CONTENDED, _build_from_playlist, build_hour_log_for_admin, preview_hour_log
 from .services.remote_dj_connection import browser_ice_servers, mint_remote_dj_token
@@ -36,6 +38,18 @@ from .services.track_filters import filter_tracks
 # of this codebase avoids. No circularity: webrequests.services imports
 # from library.models/library.services.*, never from library.views.
 from webrequests.services import _read_engine_state
+
+
+def _enqueue_engine_command_response(payload):
+    """Return a truthful 503 response on bounded IPC failure, else ``None``."""
+
+    try:
+        enqueue_engine_command(payload)
+    except EngineCommandError as exc:
+        return JsonResponse(
+            {"error": f"engine command dispatch failed: {exc}"}, status=503
+        )
+    return None
 
 
 @ensure_csrf_cookie
@@ -879,8 +893,11 @@ def api_playlist_play_now(request, pk):
     log.status = "approved"
     log.save(update_fields=["status"])
 
-    cmd_path = Path("/run/isadoraair/engine_cmd.json")
-    cmd_path.write_text(json.dumps({"command": "reload_current_log"}), encoding="utf-8")
+    error_response = _enqueue_engine_command_response(
+        {"command": "reload_current_log"}
+    )
+    if error_response is not None:
+        return error_response
 
     return JsonResponse({"ok": True, "log_id": log.id, "item_count": log.items.count()})
 
@@ -2044,8 +2061,9 @@ def api_engine_seek(request):
     if slot:
         cmd["slot"] = slot.upper()
 
-    cmd_path = Path("/run/isadoraair/engine_cmd.json")
-    cmd_path.write_text(json.dumps(cmd), encoding="utf-8")
+    error_response = _enqueue_engine_command_response(cmd)
+    if error_response is not None:
+        return error_response
     return JsonResponse({"ok": True})
 
 
@@ -2065,11 +2083,11 @@ def api_engine_deck_command(request, slot):
     if action not in ("pause", "resume", "eject"):
         return JsonResponse({"error": "action must be pause, resume, or eject"}, status=400)
 
-    cmd_path = Path("/run/isadoraair/engine_cmd.json")
-    cmd_path.write_text(
-        json.dumps({"command": f"deck_{action}", "slot": slot}),
-        encoding="utf-8",
+    error_response = _enqueue_engine_command_response(
+        {"command": f"deck_{action}", "slot": slot}
     )
+    if error_response is not None:
+        return error_response
     return JsonResponse({"ok": True})
 
 
@@ -2085,19 +2103,22 @@ def api_engine_mic_ptt(request):
     if not isinstance(active, bool):
         return JsonResponse({"error": "active must be a boolean"}, status=400)
 
-    Path("/run/isadoraair/engine_cmd.json").write_text(
-        json.dumps({"command": "mic_ptt", "active": active}), encoding="utf-8",
+    error_response = _enqueue_engine_command_response(
+        {"command": "mic_ptt", "active": active}
     )
+    if error_response is not None:
+        return error_response
     return JsonResponse({"ok": True})
 
 
 @csrf_exempt
 @require_http_methods(["POST"])
 def api_engine_remote_dj_gate(request):
-    """Operator-side gate toggle for the currently-connected remote DJ,
-    dispatched over the same engine_cmd.json channel the local mic PTT
-    uses. Mirrors api_engine_mic_ptt; the engine ignores it if no
-    remote-DJ session is active."""
+    """Operator-side gate toggle for the currently-connected remote DJ.
+
+    Mirrors api_engine_mic_ptt; the engine ignores it if no remote-DJ
+    session is active.
+    """
     try:
         body = json.loads(request.body)
     except (json.JSONDecodeError, ValueError):
@@ -2107,9 +2128,11 @@ def api_engine_remote_dj_gate(request):
     if not isinstance(active, bool):
         return JsonResponse({"error": "active must be a boolean"}, status=400)
 
-    Path("/run/isadoraair/engine_cmd.json").write_text(
-        json.dumps({"command": "remote_dj_gate", "active": active}), encoding="utf-8",
+    error_response = _enqueue_engine_command_response(
+        {"command": "remote_dj_gate", "active": active}
     )
+    if error_response is not None:
+        return error_response
     return JsonResponse({"ok": True})
 
 
@@ -2125,9 +2148,11 @@ def api_engine_manual_mode(request):
     if not isinstance(active, bool):
         return JsonResponse({"error": "active must be a boolean"}, status=400)
 
-    Path("/run/isadoraair/engine_cmd.json").write_text(
-        json.dumps({"command": "set_manual_mode", "active": active}), encoding="utf-8",
+    error_response = _enqueue_engine_command_response(
+        {"command": "set_manual_mode", "active": active}
     )
+    if error_response is not None:
+        return error_response
     return JsonResponse({"ok": True})
 
 
@@ -2535,14 +2560,11 @@ def api_fx_fire(request):
     if cart is None:
         return JsonResponse({"error": "cart not found or disabled"}, status=404)
 
-    cmd_path = Path("/run/isadoraair/engine_cmd.json")
-    try:
-        cmd_path.write_text(
-            json.dumps({"command": "fx_fire", "cart_id": int(cart_id)}),
-            encoding="utf-8",
-        )
-    except OSError as exc:
-        return JsonResponse({"error": f"engine command dispatch failed: {exc}"}, status=500)
+    error_response = _enqueue_engine_command_response(
+        {"command": "fx_fire", "cart_id": int(cart_id)}
+    )
+    if error_response is not None:
+        return error_response
     return JsonResponse({
         "ok": True,
         "cart_id": cart_id,

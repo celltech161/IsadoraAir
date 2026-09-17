@@ -17,6 +17,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+from isadoraair.engine_commands import EngineCommandQueueFull
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(PROJECT_ROOT / "lib"))
@@ -65,6 +67,40 @@ def _import_entry_points():
 
 
 current_temp, wx_alert, amber_alert, wx_forecast = _import_entry_points()
+
+
+class UrgentInsertQueueProducerTests(unittest.TestCase):
+    def test_weather_urgent_insert_uses_shared_queue(self):
+        with patch.object(wx_alert, "enqueue_engine_command") as enqueue:
+            wx_alert.fire_insert_urgent()
+        enqueue.assert_called_once_with(
+            {"command": "insert_urgent", "category": "WxAlert"}
+        )
+
+    def test_amber_urgent_insert_uses_shared_queue(self):
+        with patch.object(amber_alert, "enqueue_engine_command") as enqueue:
+            amber_alert._fire_insert_urgent()
+        enqueue.assert_called_once_with(
+            {"command": "insert_urgent", "category": "WxAlert"}
+        )
+
+    def test_weather_queue_failure_is_not_reported_as_success(self):
+        with patch.object(
+            wx_alert,
+            "enqueue_engine_command",
+            side_effect=EngineCommandQueueFull("queue full"),
+        ):
+            with self.assertRaises(EngineCommandQueueFull):
+                wx_alert.fire_insert_urgent()
+
+    def test_amber_queue_failure_is_not_reported_as_success(self):
+        with patch.object(
+            amber_alert,
+            "enqueue_engine_command",
+            side_effect=EngineCommandQueueFull("queue full"),
+        ):
+            with self.assertRaises(EngineCommandQueueFull):
+                amber_alert._fire_insert_urgent()
 
 
 class FilenameCategoryMetadataUnchangedTests(unittest.TestCase):

@@ -794,8 +794,8 @@ class AudioOutputAdmin(_DeviceFieldAdmin):
         before = _persisted_audio_snapshot(AudioOutput, obj, fields) if change else None
         super().save_model(request, obj, form, change)
         # [P0] 1.3C integration-bug fix -- this used to ALSO write a
-        # separate "reload_agc_config" command directly to
-        # engine_cmd.json here, racing hardware/signals.py's post_save
+        # separate "reload_agc_config" command directly to the historical
+        # engine_cmd.json single slot here, racing hardware/signals.py's post_save
         # handler (fired a moment earlier, inside super().save_model()
         # above) for the same single-slot IPC file: whichever write
         # landed second silently clobbered the first before the engine

@@ -1488,13 +1488,13 @@ class ReloadAudioOutputCommandDispatchTests(MockEmitEventMixin, SimpleTestCase):
     AND _apply_agc_config(), all under this single command. AGC reapply
     used to arrive only via a separate "reload_agc_config" command
     written directly by AudioOutputAdmin.save_model() -- which raced and
-    clobbered THIS command's own write to the same single-slot
+    clobbered THIS command's own write to the historical single-slot
     engine_cmd.json (see hardware/admin.py's save_model docstring and
     hardware/tests/test_audio_output_recovery_reload_signal.py's
     AudioOutputAdminSaveModelIntegrationTests for the admin-side half of
     this fix). Uses lightweight recording stubs rather than assertions
-    inside the stubs themselves -- _check_commands wraps its whole
-    dispatch in a bare `except Exception: print(...)`, so an
+    inside the stubs themselves -- command dispatch catches and reports
+    handler exceptions, so an
     AssertionError raised from inside a stub would be silently
     swallowed there instead of failing the test.
 
