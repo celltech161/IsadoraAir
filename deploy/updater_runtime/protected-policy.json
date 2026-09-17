@@ -1,6 +1,22 @@
 {
   "managed_units": [
     {
+      "policy": "INSTALL_ONLY",
+      "unit": "isadoraair-aircheck-buffer.service"
+    },
+    {
+      "policy": "ENABLE_NOW",
+      "unit": "isadoraair-aircheck-buffer.timer"
+    },
+    {
+      "policy": "INSTALL_ONLY",
+      "unit": "isadoraair-aircheck-recovery.service"
+    },
+    {
+      "policy": "ENABLE_NOW",
+      "unit": "isadoraair-aircheck-recovery.timer"
+    },
+    {
       "policy": "ENABLE_NOW",
       "unit": "isadoraair-encoders.service"
     },
