@@ -118,20 +118,26 @@ NOW_PLAYING_PATH = Path("/run/isadoraair/now_playing.json")
 RBDS_CATEGORY_STATE_PATH = Path("/run/isadoraair/rbds_category_state.json")
 
 # Remote DJ diagnostic instrumentation -- see class RemoteDJSession's
-# docstring and _remote_dj_on_pad_added. Truncated + reopened on every
-# session start; left in place after session stop so a post-mortem
-# can inspect the last session's data if the user reports static.
+# docstring and _remote_dj_on_pad_added. Reset on every session start;
+# left in place after session stop so a post-mortem can inspect the last
+# session. A 2 MiB current file plus one 2 MiB backup retains recent
+# evidence while bounding total text diagnostics to 4 MiB. Individual
+# 16 KiB lines prevent one unexpectedly large GStreamer debug string
+# from consuming the whole set.
 DJ_DIAG_LOG = Path("/run/isadoraair/remote_dj_diag.log")
+DJ_DIAG_MAX_BYTES = 2 * 1024 * 1024
+DJ_DIAG_MAX_LINE_BYTES = 16 * 1024
+DJ_DIAG_TRUNCATION_MARKER = " ...[diagnostic_message_truncated]"
 # Raw S16LE stereo 44100 -- can be replayed via
 # `ffplay -f s16le -ar 44100 -ac 2 /run/isadoraair/remote_dj_first_1s.pcm`
-# or examined in Audacity by importing as raw. Continuous session-length
-# dump of every buffer that reaches master_mixer via the DJ pad. Kept the
-# `_first_1s` name for backward compatibility of any monitoring/muscle
-# memory; it now covers the whole session -- unbounded by session
-# length, ~10 MB/min at S16 stereo 44100 (a multi-hour remote DJ show
-# can put several GB on /run's tmpfs, shared with unrelated operational
-# state like engine_state.json/levels.json).
+# or examined in Audacity by importing as raw. Kept the `_first_1s` name
+# for backward compatibility of monitoring/muscle memory. When explicitly
+# enabled, capture stops at exactly 64 MiB: about 380.4 seconds (6m20s)
+# at 176,400 bytes/s. This is ample troubleshooting evidence without a
+# session-length-dependent tmpfs footprint.
 DJ_DUMP_PCM = Path("/run/isadoraair/remote_dj_first_1s.pcm")
+DJ_DUMP_PCM_MAX_BYTES = 64 * 1024 * 1024
+DJ_DUMP_PROGRESS_BYTES = 44100 * 2 * 2  # ~1s of stereo S16LE
 # This instrumentation was built to hunt the static-on-connect bug
 # during Remote DJ connection establishment -- that investigation is
 # resolved, so the dump is OFF by default (2026-08-20 audit). Left
@@ -157,20 +163,230 @@ REMOTE_DJ_STATS_PROBE_DELAYS_MS = (250, 750, 1500)
 REMOTE_DJ_QUALITY_SAMPLE_INTERVAL_MS = 1000
 
 
+def _dj_diag_backup_path():
+    return Path(f"{DJ_DIAG_LOG}.1")
+
+
+def _bounded_utf8_text(value, max_bytes, marker=DJ_DIAG_TRUNCATION_MARKER):
+    """Return text whose UTF-8 representation is no larger than max_bytes."""
+    if max_bytes <= 0:
+        return ""
+    raw = str(value).encode("utf-8", errors="replace")
+    if len(raw) <= max_bytes:
+        return raw.decode("utf-8")
+    marker_bytes = marker.encode("utf-8")
+    if len(marker_bytes) >= max_bytes:
+        return raw[:max_bytes].decode("utf-8", errors="ignore")
+    prefix = raw[:max_bytes - len(marker_bytes)].decode("utf-8", errors="ignore")
+    return prefix + marker
+
+
+def _dj_diag_line(session, msg, max_bytes=None):
+    if max_bytes is None:
+        max_bytes = min(DJ_DIAG_MAX_LINE_BYTES, DJ_DIAG_MAX_BYTES)
+    if max_bytes <= 0:
+        return ""
+    attempt = getattr(session, "connection_attempt", None)
+    attempt_id = attempt.attempt_id if attempt is not None else "untracked"
+    line = f"{time.time():.3f} attempt={attempt_id} {msg}"
+    # Reserve the final newline inside the exact byte ceiling.
+    body = _bounded_utf8_text(line, max(0, max_bytes - 1))
+    return body + "\n" if body else ""
+
+
+def _close_diag_locked(session):
+    fh = getattr(session, "diag_fh", None)
+    session.diag_fh = None
+    if fh is not None:
+        try:
+            fh.close()
+        except Exception:
+            pass
+
+
+def _reset_remote_dj_diagnostics(session):
+    """Start one fresh, bounded text-diagnostic set for this session."""
+    lock = session.diag_lock
+    with lock:
+        _close_diag_locked(session)
+        session.diag_bytes_written = 0
+        try:
+            DJ_DIAG_LOG.parent.mkdir(parents=True, exist_ok=True)
+            _dj_diag_backup_path().unlink(missing_ok=True)
+            session.diag_fh = open(DJ_DIAG_LOG, "w", encoding="utf-8")
+            return True
+        except Exception:
+            _close_diag_locked(session)
+            return False
+
+
+def _close_remote_dj_diagnostics(session):
+    with session.diag_lock:
+        _close_diag_locked(session)
+
+
+def _rotate_diag_locked(session):
+    """Rotate current -> one backup. Caller holds session.diag_lock."""
+    fh = getattr(session, "diag_fh", None)
+    if fh is None:
+        return False
+    try:
+        fh.flush()
+        fh.close()
+        session.diag_fh = None
+        os.replace(DJ_DIAG_LOG, _dj_diag_backup_path())
+        session.diag_fh = open(DJ_DIAG_LOG, "w", encoding="utf-8")
+        session.diag_bytes_written = 0
+        marker = _dj_diag_line(session, "diagnostic_log_rotated")
+        if marker:
+            session.diag_fh.write(marker)
+            session.diag_fh.flush()
+            session.diag_bytes_written = len(marker.encode("utf-8"))
+        return True
+    except Exception:
+        _close_diag_locked(session)
+        return False
+
+
 def _dj_diag(session, msg):
-    """Timestamped append to the remote-DJ diagnostic log. No-op if the
-    session's diag file couldn't be opened (permissions / disk full)."""
+    """Bounded timestamped Remote-DJ diagnostic append.
+
+    GStreamer bus callbacks and streaming pad probes can overlap, so the
+    small per-session lock serializes only text-file write/rotation state.
+    Any diagnostic failure disables text logging; no exception can escape
+    into Remote DJ session or audio control.
+    """
     if session is None or getattr(session, "diag_fh", None) is None:
         return
+    lock = getattr(session, "diag_lock", None)
+    if lock is None:
+        return
+    with lock:
+        if session.diag_fh is None:
+            return
+        try:
+            line = _dj_diag_line(session, msg)
+            line_bytes = len(line.encode("utf-8"))
+            if session.diag_bytes_written + line_bytes > DJ_DIAG_MAX_BYTES:
+                if not _rotate_diag_locked(session):
+                    return
+                remaining = DJ_DIAG_MAX_BYTES - session.diag_bytes_written
+                line = _dj_diag_line(
+                    session, msg,
+                    max_bytes=min(DJ_DIAG_MAX_LINE_BYTES, remaining),
+                )
+                line_bytes = len(line.encode("utf-8"))
+            if not line or session.diag_bytes_written + line_bytes > DJ_DIAG_MAX_BYTES:
+                return
+            session.diag_fh.write(line)
+            session.diag_fh.flush()
+            session.diag_bytes_written += line_bytes
+        except Exception:
+            _close_diag_locked(session)
+
+
+def _close_remote_dj_pcm(session):
+    fh = getattr(session, "dump_fh", None)
+    session.dump_fh = None
+    if fh is not None:
+        try:
+            fh.close()
+        except Exception:
+            pass
+
+
+def _reset_remote_dj_pcm(session, enabled):
+    """Reset PCM state and optionally open one fresh bounded dump."""
+    _close_remote_dj_pcm(session)
+    session.dump_bytes_written = 0
+    session.dump_last_marked_bytes = 0
+    session.dump_capped = False
+    session.dump_failed = False
+    session.dump_terminal_logged = False
+    if not enabled:
+        try:
+            DJ_DUMP_PCM.unlink(missing_ok=True)
+        except OSError as exc:
+            session.dump_failed = True
+            _dj_diag(session, f"pcm_dump_reset_failed error={exc!r}")
+        return False
     try:
-        attempt = getattr(session, "connection_attempt", None)
-        attempt_id = attempt.attempt_id if attempt is not None else "untracked"
-        session.diag_fh.write(
-            f"{time.time():.3f} attempt={attempt_id} {msg}\n"
+        DJ_DUMP_PCM.parent.mkdir(parents=True, exist_ok=True)
+        session.dump_fh = open(DJ_DUMP_PCM, "wb")
+        return True
+    except OSError as exc:
+        session.dump_failed = True
+        _dj_diag(session, f"pcm_dump_open_failed error={exc!r}")
+        return False
+
+
+def _finish_remote_dj_pcm(session, *, capped=False, error=None):
+    """Close/disable PCM capture and emit its terminal diagnostic once."""
+    _close_remote_dj_pcm(session)
+    if capped:
+        session.dump_capped = True
+    if error is not None:
+        session.dump_failed = True
+    if session.dump_terminal_logged:
+        return
+    session.dump_terminal_logged = True
+    if capped:
+        _dj_diag(session, f"pcm_dump_cap_reached bytes={session.dump_bytes_written}")
+    elif error is not None:
+        _dj_diag(
+            session,
+            f"pcm_dump_write_failed bytes={session.dump_bytes_written} error={error!r}",
         )
-        session.diag_fh.flush()
-    except OSError:
-        pass
+
+
+def _remote_dj_pcm_dump_probe(_pad, info, context):
+    """Actual hot-path dump probe: exact bounded write, then self-remove."""
+    engine, expected_session = context
+    try:
+        session = getattr(engine, "remote_dj_session", None)
+        if session is not expected_session or session.dump_fh is None:
+            return Gst.PadProbeReturn.REMOVE
+        buf = info.get_buffer()
+        if buf is None:
+            return Gst.PadProbeReturn.OK
+        ok, mapinfo = buf.map(Gst.MapFlags.READ)
+        if not ok:
+            return Gst.PadProbeReturn.OK
+        try:
+            remaining = max(0, DJ_DUMP_PCM_MAX_BYTES - session.dump_bytes_written)
+            if remaining == 0:
+                _finish_remote_dj_pcm(session, capped=True)
+                return Gst.PadProbeReturn.REMOVE
+            write_size = min(mapinfo.size, remaining)
+            payload = bytes(mapinfo.data)[:write_size]
+            written = session.dump_fh.write(payload)
+            if written is None:
+                written = len(payload)
+            session.dump_bytes_written += written
+            if written != len(payload):
+                raise OSError(f"short PCM diagnostic write ({written}/{len(payload)})")
+            if session.dump_bytes_written >= DJ_DUMP_PCM_MAX_BYTES:
+                _finish_remote_dj_pcm(session, capped=True)
+                return Gst.PadProbeReturn.REMOVE
+            if (
+                session.dump_bytes_written - session.dump_last_marked_bytes
+                >= DJ_DUMP_PROGRESS_BYTES
+            ):
+                _dj_diag(
+                    session,
+                    f"dump_progress bytes={session.dump_bytes_written} "
+                    f"(~{session.dump_bytes_written / 176400:.2f}s of audio)",
+                )
+                session.dump_last_marked_bytes = session.dump_bytes_written
+        except OSError as exc:
+            _finish_remote_dj_pcm(session, error=exc)
+            return Gst.PadProbeReturn.REMOVE
+        finally:
+            buf.unmap(mapinfo)
+    except Exception as exc:
+        _finish_remote_dj_pcm(expected_session, error=exc)
+        return Gst.PadProbeReturn.REMOVE
+    return Gst.PadProbeReturn.OK
 
 
 class RemoteDJSessionBuildError(RuntimeError):
@@ -648,16 +864,19 @@ class RemoteDJSession:
         # connection recovers without them touching anything. See
         # _remote_dj_on_connection_state.
         self.gate_desired = False
-        # Diagnostic instrumentation added 2026-07-20 to trap evidence
-        # of the still-unresolved "playing deck goes to static when a
-        # remote-DJ connects" bug. Everything below is per-session
-        # state that's opened/wired at session_start and cleaned up at
-        # session_stop. None of it affects audio behavior -- pure
-        # observation.
+        # Per-session diagnostic state. The original static-on-connect
+        # investigation is resolved, but these bounded breadcrumbs remain
+        # useful for future Remote DJ post-mortems. None of this state is
+        # allowed to affect audio behavior.
         self.diag_fh = None            # open file handle for the diag log
+        self.diag_lock = threading.Lock()  # bus/timer + streaming-probe writers
+        self.diag_bytes_written = 0
         self.dump_fh = None            # open file handle for the PCM dump
         self.dump_bytes_written = 0    # running total for progress logging
         self.dump_last_marked_bytes = 0  # when we last emitted a progress line
+        self.dump_capped = False
+        self.dump_failed = False
+        self.dump_terminal_logged = False
         self.dj_level = None           # `level` element between opusdec and audioconvert
         # [4.1] Remote Mic PTT VU meter. dj_gain_db is captured ONCE at
         # session start (see _remote_dj_session_start) from the same
@@ -3452,8 +3671,8 @@ class PlaybackEngine:
         # Remote-DJ diagnostic bus watchers -- see _on_dj_bus_msg. These
         # route WARN/INFO/ERROR messages originating from a currently-
         # active remote-DJ session's elements (webrtcbin included) to
-        # DJ_DIAG_LOG for the still-unresolved static-on-deck bug's
-        # post-mortem. Wired once here at pipeline build time; the
+        # the bounded DJ_DIAG_LOG for a future post-mortem. Wired once
+        # here at pipeline build time; the
         # handler itself no-ops when no session is active, so this is
         # zero overhead when the remote DJ isn't in use.
         bus.connect("message::warning", self._on_dj_bus_msg)
@@ -8284,22 +8503,19 @@ class PlaybackEngine:
             session.dj_gain_db = dj_gain_db
             slot.remote_gain.set_property("volume", 10 ** (dj_gain_db / 20.0))
             slot.remote_gate.set_property("volume", 0.0)
-            # Open the two diagnostic sinks. Truncate on each session start
-            # so a post-mortem sees only THIS session's data (the previous
-            # session's log is only interesting up until this one begins).
-            # Both opens are best-effort -- if /run/isadoraair isn't
-            # writable we skip diag entirely and let the session proceed.
-            try:
-                DJ_DIAG_LOG.parent.mkdir(parents=True, exist_ok=True)
-                session.diag_fh = open(DJ_DIAG_LOG, "w")
+            # Start one fresh bounded diagnostic set. Previous current/
+            # backup text evidence expires together so files never mix
+            # sessions. PCM is likewise reset; while disabled its stale
+            # last-session artifact is removed. Every operation is best-
+            # effort and observation-only.
+            if _reset_remote_dj_diagnostics(session):
                 _dj_diag(session, "session_start")
-            except OSError as exc:
-                print(f"  Remote DJ: could not open diag log ({exc})")
-            if DJ_DUMP_PCM_ENABLED:
-                try:
-                    session.dump_fh = open(DJ_DUMP_PCM, "wb")
-                except OSError as exc:
-                    print(f"  Remote DJ: could not open PCM dump file ({exc})")
+            else:
+                print("  Remote DJ: could not reset/open bounded diagnostic log")
+            if DJ_DUMP_PCM_ENABLED and not _reset_remote_dj_pcm(session, True):
+                print("  Remote DJ: could not open bounded PCM dump file")
+            elif not DJ_DUMP_PCM_ENABLED:
+                _reset_remote_dj_pcm(session, False)
             self._remote_dj_mark(session, "session_build_started")
             self._remote_dj_build_session(session)
             self._remote_dj_mark(session, "session_build_completed")
@@ -9159,26 +9375,6 @@ class PlaybackEngine:
             Gst.PadProbeType.EVENT_DOWNSTREAM, _caps_log_probe, None,
         )
 
-        # DIAGNOSTIC PROBE 2 -- continuous raw-PCM dump of what the
-        # master_mixer actually sees, S16LE 44.1kHz stereo. Installed
-        # on the MASTER_MIXER SINK PAD (not on gate_conv src) so we
-        # get every buffer that reaches the mixer without competing
-        # with the BLOCK_DOWNSTREAM first-buffer probe on the source
-        # side -- the previous placement dumped only ~100ms because
-        # the block-and-unblock cycle appeared to interfere with the
-        # source-pad BUFFER probe firing reliably afterward. Sink-pad
-        # observation is cleaner: the mixer's sink pad only exists
-        # AFTER _on_first_buffer_ready links it, so we install the
-        # probe there in one place, at the right time.
-        #
-        # Now runs for the WHOLE session, not first 1s -- catches the
-        # bug even if it fires mid-session after the DJ opens the
-        # gate. A typical session's PCM footprint is ~176 KB/s =
-        # ~10 MB/min, fine on tmpfs.
-        # Replay via:
-        #   ffplay -f s16le -ar 44100 -ac 2 /run/isadoraair/remote_dj_first_1s.pcm
-        # or import in Audacity as raw S16LE stereo 44100.
-
         def _on_first_buffer_ready(probed_pad, info, _u):
             """Fires when opusdec's first decoded buffer reaches the
             end of the ephemeral decode chain. All this does now is
@@ -9213,7 +9409,7 @@ class PlaybackEngine:
             _on_first_buffer_ready, None,
         )
 
-        # Continuous PCM dump probe -- unchanged intent (post-mortem of
+        # Bounded PCM dump probe -- unchanged intent (post-mortem of
         # what audio actually flowed during this session) but now
         # installed on queue_src (last element before the selector)
         # rather than on a master_mixer sink pad that doesn't exist
@@ -9223,38 +9419,12 @@ class PlaybackEngine:
         # DJ_DUMP_PCM's definition) -- gated below and at the open()
         # call in _remote_dj_session_start, so none of this fires at
         # all while disabled.
-        _DUMP_LOG_EVERY_BYTES = 44100 * 2 * 2  # ~1s of stereo S16
-        def _dump_probe(probed_pad2, info2, _u2):
-            try:
-                s2 = self.remote_dj_session
-                if s2 is not session or s2.dump_fh is None:
-                    return Gst.PadProbeReturn.REMOVE
-                buf = info2.get_buffer()
-                if buf is not None:
-                    ok, mapinfo = buf.map(Gst.MapFlags.READ)
-                    if ok:
-                        try:
-                            s2.dump_fh.write(bytes(mapinfo.data)[:mapinfo.size])
-                            s2.dump_bytes_written = getattr(s2, "dump_bytes_written", 0) + mapinfo.size
-                            last_marked = getattr(s2, "dump_last_marked_bytes", 0)
-                            if s2.dump_bytes_written - last_marked >= _DUMP_LOG_EVERY_BYTES:
-                                _dj_diag(s2, f"dump_progress bytes={s2.dump_bytes_written} (~{s2.dump_bytes_written/176400:.2f}s of audio)")
-                                s2.dump_last_marked_bytes = s2.dump_bytes_written
-                        except OSError:
-                            pass
-                        finally:
-                            buf.unmap(mapinfo)
-            except Exception as exc:
-                try:
-                    _dj_diag(session, f"dump_probe DISABLED after exception: {exc!r}")
-                except Exception:
-                    pass
-                return Gst.PadProbeReturn.REMOVE
-            return Gst.PadProbeReturn.OK
         if DJ_DUMP_PCM_ENABLED:
             try:
                 session.dump_probe_id = queue_src.add_probe(
-                    Gst.PadProbeType.BUFFER, _dump_probe, None,
+                    Gst.PadProbeType.BUFFER,
+                    _remote_dj_pcm_dump_probe,
+                    (self, session),
                 )
                 _dj_diag(session, "dump probe installed on queue src (feeding slot selector)")
             except Exception as exc:
@@ -9820,18 +9990,8 @@ class PlaybackEngine:
         if attempt is not None:
             attempt.end()
         _dj_diag(session, "session_stop")
-        if session.diag_fh is not None:
-            try:
-                session.diag_fh.close()
-            except OSError:
-                pass
-            session.diag_fh = None
-        if session.dump_fh is not None:
-            try:
-                session.dump_fh.close()
-            except OSError:
-                pass
-            session.dump_fh = None
+        _close_remote_dj_diagnostics(session)
+        _close_remote_dj_pcm(session)
 
         print(f"  Remote DJ [{attempt_id}]: session stopped")
         return False
