@@ -1005,18 +1005,54 @@ updater_bootstrap/tools/legacy_updater_retirement.py` -- dependency-free
 (no Django/application-checkout import), mirroring `updatecenter/
 backend_client.py`'s own "unprivileged strict client" convention and
 `protected_runtime_release.py`'s release-authoring-tool convention.
-`check_retirement_preflight()` requires, before ever touching the
-installed unit: supervisor loaded/enabled/active, worker socket present,
-PING healthy (`protected_runtime_valid`, `update_execution_enabled`, and
-`maintenance_busy=False` -- the last one this tool's own root-side proxy
-for "no active/locked UpdateJob," checked without any Django/database
-dependency, since this tool must run standalone as root), and protected-
-runtime state readable with `activation` null. An **active** legacy unit
-is refused as a distinct, separate condition (`LegacyUnitActiveError`) --
-retirement never runs `systemctl stop` on it itself, because that could
-remove `/run/isadoraair-updater` out from under the live worker via the
-shared `RuntimeDirectory=` reference count; an active legacy unit needs
-a deliberate, separately-decided recovery action, not this tool.
+
+**Two deliberately separate trust/application layers -- do not conflate
+them:**
+
+1. **Root maintenance helper** (`check_retirement_preflight()`, entirely
+   protected-updater/systemd-side, zero Django/database dependency):
+   supervisor loaded/enabled/active; worker socket present; PING
+   healthy (`protected_runtime_valid`, `update_execution_enabled`); no
+   protected-runtime activation in flight (`activation` null); no
+   protected-updater **operator-maintenance** action in flight (PING's
+   own `maintenance_busy` field -- the protected daemon's separate
+   operator-maintenance-worker flag, **not** an UpdateJob proxy of any
+   kind); and the legacy unit's own safe/inactive state (idempotent if
+   already masked).
+2. **Application-layer prerequisite** (the *operator's* responsibility,
+   checked separately, never by this helper): no ORDINARY Update Center
+   job may own the active lock. For a normal IsadoraAir application
+   host:
+   ```bash
+   cd /opt/isadoraair && ./venv/bin/python manage.py shell -c '
+   from updatecenter.models import UpdateJob
+   print(list(UpdateJob.objects.filter(active_lock=1)
+               .values("id", "state", "current_step", "target_release_id")))
+   '
+   ```
+   Expected: `[]`. If any row is returned, **STOP** -- do not run the
+   helper until that job reaches a terminal state and releases its
+   lock. If the application root differs from `/opt/isadoraair`, run the
+   equivalent station-local check there instead -- this module never
+   hardcodes an application path, and never will.
+
+An **active** legacy unit is refused as a distinct, separate condition
+(`LegacyUnitActiveError`) -- retirement never runs `systemctl stop` on
+it itself, because that could remove `/run/isadoraair-updater` out from
+under the live worker via the shared `RuntimeDirectory=` reference
+count; an active legacy unit needs a deliberate, separately-decided
+recovery action, not this tool.
+
+> **Corrected 2026-09-17** (same day as the retirement itself): an
+> earlier draft of this tool/doc incorrectly described `maintenance_
+> busy=false` as a proxy for "no active/locked UpdateJob." It is not --
+> it reflects only the protected daemon's own operator-maintenance
+> worker. Both production retirements (Oak Grove, WRJE) were still
+> correctly guarded at the time: Oak Grove's ordinary update state was
+> known idle, and WRJE was explicitly checked beforehand with the exact
+> `UpdateJob.objects.filter(active_lock=1)` query above, which returned
+> `[]`. This was a helper/documentation correctness issue caught before
+> it could cause a real gap, not a production incident.
 
 Ordering for a fresh/future Phase-D bootstrap (D0's own manual bridge,
 or any future automated equivalent): (1) verify supervisor installation/
@@ -1056,6 +1092,22 @@ concept). See `test_legacy_updater_retirement.py` for the full test
 matrix and `deploy/isadoraair-updater.service`'s own header comment for
 the "this must never be installed/startable on a completed Phase-D
 system" marker left directly on the historical template.
+
+**Production status (2026-09-17):** both production stations have
+already completed host-side retirement successfully and are not touched
+again by this correction:
+
+```
+Oak Grove:
+  isadoraair-updater.service = masked/inactive
+  updater-bootstrapd.service = active
+
+WRJE:
+  isadoraair-updater.service = masked/inactive
+  updater-bootstrapd.service = active
+```
+
+The legacy unit cannot be started on either station.
 
 ## D5 pre-bootstrap integration contract
 

@@ -30,6 +30,25 @@ root via `sudo python3` against a real station, exactly like this
 package's sibling protected_runtime_release.py (release-authoring) and
 the real worker's own daemon.py (station execution).
 
+Two deliberately separate trust/application layers -- this module only
+ever implements the first:
+
+  1. Root maintenance helper (this module). Verifies Phase-D authority
+     (supervisor loaded/enabled/active), protected worker health (socket
+     present, PING succeeds, `protected_runtime_valid`, `update_
+     execution_enabled`), no protected-runtime activation in flight, no
+     protected-updater OPERATOR-MAINTENANCE action in flight (PING's own
+     `maintenance_busy` field -- the protected daemon's separate
+     operator-maintenance worker flag, NOT an UpdateJob proxy of any
+     kind), and the legacy unit's own safe/inactive state.
+  2. Application-layer prerequisite (the operator's job, not this
+     module's). No ORDINARY Update Center job may own the active lock
+     (`UpdateJob.objects.filter(active_lock=1)` must be empty) before
+     retirement is safe. This module cannot check this itself without
+     crossing into Django/PostgreSQL/the application checkout, which it
+     deliberately never does -- see check_retirement_preflight()'s own
+     docstring for the exact operator command to run first.
+
 Two halves:
   - Pure, unprivileged, fully unit-testable decision logic (dataclasses +
     check_retirement_preflight/is_already_retired) -- everything above
@@ -87,6 +106,15 @@ class RuntimeStateFacts:
 
 @dataclasses.dataclass(frozen=True)
 class PingFacts:
+    """`maintenance_busy` is the protected daemon's own flag for whether
+    its SEPARATE operator-maintenance worker is currently active -- it
+    has nothing to do with ordinary UpdateJob execution and must never
+    be read as evidence that no ordinary update job is active/locked.
+    Whether an ordinary UpdateJob owns the active lock is an
+    application-layer fact (Django/PostgreSQL) this dependency-free
+    module cannot and does not check -- see check_retirement_preflight's
+    own docstring for the operator command that establishes it
+    separately, before running this helper at all."""
     ok: bool
     protected_runtime_valid: bool
     update_execution_enabled: bool
@@ -127,7 +155,37 @@ def check_retirement_preflight(snapshot: PreflightSnapshot) -> None:
     """Raises RetirementRefused (LegacyUnitActiveError for the one
     special case) with a specific, actionable reason unless every
     required condition holds. Never mutates anything -- callers decide
-    what to do with a clean bill of health."""
+    what to do with a clean bill of health.
+
+    IMPORTANT -- application-layer prerequisite this function does NOT
+    check: no ORDINARY Update Center job may own the active lock. This
+    is a Django/PostgreSQL fact this dependency-free module has no way
+    to observe (and deliberately never will -- no Django import, no
+    database access, no `manage.py`, no application-checkout coupling).
+    Before running this helper at all, the operator must separately
+    confirm this on the station itself, e.g. for a normal IsadoraAir
+    application host:
+
+        cd /opt/isadoraair && ./venv/bin/python manage.py shell -c '
+        from updatecenter.models import UpdateJob
+        print(list(UpdateJob.objects.filter(active_lock=1)
+                    .values("id", "state", "current_step", "target_release_id")))
+        '
+
+    Expected output: `[]`. If any row is returned, STOP -- do not run
+    this helper until that job reaches a terminal state and releases
+    its lock. (If the application root differs from /opt/isadoraair,
+    run the equivalent station-local check there instead -- this
+    module never hardcodes an application path.)
+
+    What this function DOES verify itself, entirely from the protected-
+    updater/systemd side: Phase-D authority (supervisor loaded/enabled/
+    active), protected worker health (socket, PING, protected_runtime_
+    valid, update_execution_enabled), no protected-runtime activation in
+    flight, no protected-updater OPERATOR-MAINTENANCE action in flight
+    (PING's `maintenance_busy` -- see PingFacts' own docstring for why
+    this is NOT an UpdateJob proxy), and the legacy unit's safe/inactive
+    state."""
 
     # The one condition checked first and distinctly: an active legacy
     # unit is a STOP condition, not merely one more failed check.
@@ -157,9 +215,11 @@ def check_retirement_preflight(snapshot: PreflightSnapshot) -> None:
         raise RetirementRefused("worker reports update_execution_enabled=false")
     if snapshot.ping.maintenance_busy:
         raise RetirementRefused(
-            "worker reports maintenance_busy=true -- an update/handoff may be in flight; "
-            "this is this tool's own proxy for 'no active/locked UpdateJob', checked from "
-            "the privileged side without any Django/database dependency"
+            "worker reports maintenance_busy=true -- the protected updater's own "
+            "operator-maintenance action is currently active. This is NOT a check for an "
+            "ordinary UpdateJob: confirm separately, as an application-layer prerequisite, "
+            "that no ordinary UpdateJob owns the active lock (see this function's own "
+            "docstring for the operator command) before retrying"
         )
 
     if snapshot.runtime_state is None:
@@ -410,14 +470,23 @@ def main(argv: list[str] | None = None) -> int:
         print(f"REFUSED: {exc}", file=sys.stderr)
         return 1
 
+    reminder = (
+        "Reminder: this helper checked protected-updater/operator-maintenance idleness "
+        "(PING maintenance_busy=false), NOT ordinary UpdateJob state. Confirm separately "
+        "that no ordinary UpdateJob owns the active lock -- see check_retirement_preflight()'s "
+        "own docstring for the operator command -- before treating this as a full go-ahead."
+    )
+
     if result.already_retired:
         print(f"ALREADY RETIRED: {LEGACY_UNIT} is masked/inactive -- no action taken.")
         return 0
     if not args.apply:
         print(f"PREFLIGHT OK: {LEGACY_UNIT} may be retired (dry-run -- pass --apply to perform it).")
+        print(reminder)
         return 0
     print(f"RETIRED: {LEGACY_UNIT} is now {result.is_enabled_after}/{result.is_active_after}.")
     print(f"Rollback evidence: {result.rollback_dir}")
+    print(reminder)
     return 0
 
 

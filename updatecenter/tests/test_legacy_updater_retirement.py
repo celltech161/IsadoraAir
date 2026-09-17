@@ -133,12 +133,28 @@ class PreflightRefusalTests(SimpleTestCase):
         with self.assertRaises(RetirementRefused):
             check_retirement_preflight(snapshot)
 
-    def test_maintenance_busy_refused(self):
-        """maintenance_busy is this tool's own root-side proxy for 'no
-        active/locked UpdateJob', checked without any Django dependency."""
+    def test_maintenance_busy_true_refuses_and_names_operator_maintenance_not_updatejob(self):
+        """maintenance_busy reflects only the protected daemon's own
+        SEPARATE operator-maintenance worker -- it is not, and must
+        never be documented/tested as, evidence about an ordinary
+        UpdateJob. The refusal message must talk about operator
+        maintenance, and must not claim to have verified UpdateJob/
+        active_lock state itself."""
         snapshot = _healthy_snapshot(ping=PingFacts(ok=True, protected_runtime_valid=True, update_execution_enabled=True, maintenance_busy=True))
-        with self.assertRaises(RetirementRefused):
+        with self.assertRaises(RetirementRefused) as ctx:
             check_retirement_preflight(snapshot)
+        message = str(ctx.exception).lower()
+        self.assertIn("operator", message)
+        self.assertIn("maintenance", message)
+
+    def test_maintenance_busy_false_only_satisfies_the_operator_maintenance_check(self):
+        """A healthy, maintenance_busy=false snapshot passes preflight --
+        but this proves only that the protected daemon's own operator-
+        maintenance worker is idle. It is NOT proof that no ordinary
+        UpdateJob owns the active lock; that remains an external,
+        application-layer prerequisite this module never checks."""
+        snapshot = _healthy_snapshot(ping=PingFacts(ok=True, protected_runtime_valid=True, update_execution_enabled=True, maintenance_busy=False))
+        check_retirement_preflight(snapshot)  # must not raise -- but proves nothing about UpdateJob state
 
     def test_unreadable_runtime_state_refused(self):
         snapshot = _healthy_snapshot(runtime_state=None)
@@ -345,3 +361,59 @@ class SignedPolicyExclusionTests(SimpleTestCase):
         unit_names = {entry["unit"] for entry in policy["managed_units"]}
         self.assertNotIn(retirement.LEGACY_UNIT, unit_names)
         self.assertNotIn(retirement.SUPERVISOR_UNIT, unit_names)
+
+
+class DependencyFreeAndDocumentationTests(SimpleTestCase):
+    """The helper must remain safe and useful outside a Django checkout,
+    and must explicitly document the UpdateJob prerequisite as an
+    external, application-layer responsibility -- not something it
+    checks itself."""
+
+    def test_module_has_no_django_or_updatecenter_or_database_imports(self):
+        import ast
+
+        source = Path(retirement.__file__).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        forbidden_prefixes = ("django", "updatecenter", "psycopg2", "isadoraair")
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    self.assertFalse(
+                        any(alias.name.startswith(prefix) for prefix in forbidden_prefixes),
+                        f"forbidden import: {alias.name!r}",
+                    )
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                self.assertFalse(
+                    any(node.module.startswith(prefix) for prefix in forbidden_prefixes),
+                    f"forbidden import: {node.module!r}",
+                )
+
+    def test_module_never_hardcodes_opt_isadoraair_as_a_real_path_constant(self):
+        """/opt/isadoraair may appear only inside documentation/docstring
+        prose (the operator-facing example command) -- never as a real
+        Path(...) constant or default argument the module's own code
+        depends on."""
+        import ast
+
+        source = Path(retirement.__file__).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "Path":
+                for arg in node.args:
+                    if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                        self.assertNotIn("/opt/isadoraair", arg.value)
+
+    def test_docstrings_document_the_updatejob_operator_prerequisite_command(self):
+        source = Path(retirement.__file__).read_text(encoding="utf-8")
+        self.assertIn("UpdateJob.objects.filter(active_lock=1)", source)
+        self.assertIn("manage.py shell", source)
+
+    def test_maintenance_busy_docstring_disclaims_updatejob_proxy(self):
+        doc = retirement.PingFacts.__doc__ or ""
+        self.assertIn("operator-maintenance", doc)
+        self.assertNotIn("proxy for 'no active/locked UpdateJob'", doc)
+
+    def test_cli_output_carries_the_updatejob_reminder(self):
+        import inspect
+        main_source = inspect.getsource(retirement.main)
+        self.assertIn("ordinary UpdateJob", main_source)
