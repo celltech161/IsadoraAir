@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "release_id": "r0084",
+  "previous_release_id": "r0083",
+  "minimum_updater_protocol_version": 5,
+  "summary": "Corrects Update Center planning so a skipped protected-runtime transition (e.g. r0082 generation-4 Aircheck authorization) is no longer discarded when a later ordinary release becomes the target -- fixes the WRJE r0081->r0083 MANUAL_PREREQUISITE: UNKNOWN_MANAGED_UNIT failure. Ships as protected-runtime generation 5 (runtime_version 6) so pre-fix workers can directly activate the corrected worker. No Django migrations; managed-unit policy unchanged.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-gunicorn"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0081",
+  "protected_runtime": {
+    "generation": 5,
+    "descriptor_path": "deploy/updater_runtime/protected-runtime-descriptor.json",
+    "descriptor_sha256": "b0baa3957297a59bab03ef08539d3bb5291faad261d7c6c92008cd4eade8edc1",
+    "minimum_bootstrap_protocol_version": 1,
+    "runtime_version": 6,
+    "manifest_protocol_version": 5,
+    "supported_wire_protocols": [
+      3
+    ],
+    "attestations": [
+      "deploy/updater_attestations/r0084-from-r0081.json",
+      "deploy/updater_attestations/r0084-from-r0082.json",
+      "deploy/updater_attestations/r0084-from-r0083.json"
+    ]
+  }
+}
