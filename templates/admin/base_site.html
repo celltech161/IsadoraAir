@@ -1,0 +1,34 @@
+{% extends "admin/base.html" %}
+{% load static %}
+
+{% block extrastyle %}
+{{ block.super }}
+<style>
+  #site-name .isadoraair-admin-brand {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+  #site-name .isadoraair-admin-brand-logo {
+    height: 28px;
+    width: auto;
+    max-width: 140px;
+    object-fit: contain;
+    display: block;
+  }
+</style>
+{% endblock %}
+
+{% block branding %}
+<div id="site-name">
+  <a href="{% url 'admin:index' %}" class="isadoraair-admin-brand">
+    <img class="isadoraair-admin-brand-logo"
+         src="{% if ui_theme.logo %}{{ ui_theme.logo.url }}{% else %}{% static 'library/img/isadoraair_logo.png' %}{% endif %}"
+         alt="">
+    <span>Administration</span>
+  </a>
+</div>
+{% if user.is_anonymous %}
+  {% include "admin/color_theme_toggle.html" %}
+{% endif %}
+{% endblock %}

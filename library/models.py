@@ -1010,8 +1010,17 @@ class UITheme(models.Model):
     nav_clock_font_weight = models.CharField(max_length=10, default="700", help_text="Any CSS font-weight value, e.g. 400, 600, 700.")
     nav_clock_color = models.CharField(max_length=50, default="rgba(249, 250, 251, 0.85)", help_text="Any CSS color value (hex, rgb, rgba).")
 
-    logo = models.ImageField(upload_to="ui_theme/", blank=True, null=True, help_text="Nav bar logo. Leave blank to use the default IsadoraAir logo.")
-    station_logo = models.ImageField(upload_to="ui_theme/", blank=True, null=True, help_text="Station logo shown just below the IsadoraAir logo on the login screen. Leave blank to hide.")
+    logo = models.ImageField(
+        upload_to="ui_theme/", blank=True, null=True,
+        help_text="Product logo used in the Django Administration header. Leave "
+                   "blank to use the bundled IsadoraAir logo.",
+    )
+    station_logo = models.ImageField(
+        upload_to="ui_theme/", blank=True, null=True,
+        help_text="Station-facing logo used on ordinary IsadoraAir pages and "
+                   "login/welcome screens. Leave blank to use the bundled "
+                   "IsadoraAir logo.",
+    )
 
     # --- Deck overlay (text sitting on top of album art) ---
     deck_text_shadow_color = models.CharField(

@@ -679,6 +679,10 @@ class UIThemeAdmin(admin.ModelAdmin):
     fieldsets = [
         ("Branding", {
             "fields": ["logo", "station_logo"],
+            "description": "logo is the product/Administration identity (Django "
+                            "Admin header only). station_logo is what ordinary "
+                            "station pages and login/welcome screens show. Each "
+                            "falls back to the bundled IsadoraAir logo when blank.",
         }),
         ("Palette", {
             "fields": [
@@ -719,6 +723,19 @@ class UIThemeAdmin(admin.ModelAdmin):
     def formfield_for_dbfield(self, db_field, request, **kwargs):
         if db_field.name in _UITHEME_COLOR_FIELDS:
             kwargs["widget"] = RGBAColorWidget
+        # r0083 -- display-only labels distinguishing the two logo roles.
+        # Admin-form `label`, never the model's own verbose_name: a
+        # verbose_name change shows up in AlterField's deconstruct() and
+        # would make Update Center's migration classifier treat this as
+        # a database-affecting change (manual), when it is really the
+        # exact same kind of pure-display metadata as help_text (which
+        # IS on the classifier's approved list). See
+        # updatecenter/management/commands/updatecenter_probe.py's own
+        # _NON_DATABASE_FIELD_METADATA.
+        if db_field.name == "logo":
+            kwargs["label"] = "IsadoraAir / Administration logo"
+        elif db_field.name == "station_logo":
+            kwargs["label"] = "Station logo"
         return super().formfield_for_dbfield(db_field, request, **kwargs)
 
     def has_add_permission(self, request):
