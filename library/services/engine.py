@@ -1244,6 +1244,12 @@ class PlaybackEngine:
         # An explicit operator toggle of manual_mode CLEARS this flag,
         # so a manually-selected Manual survives the next mic release.
         self._manual_from_mic = False
+        # Cached, reporting-only mirror of DuckingConfig.ptt_auto_manual_
+        # enabled -- refreshed on every actual mic/PTT transition inside
+        # _apply_mic_mode_hold() (same "live-read-on-transition" contract
+        # as ducking itself), never re-read on the high-frequency
+        # _write_state() poll tick.
+        self._ptt_auto_manual_enabled = True
         self._duck_ramp_source_id = None
         self.pipeline_sample_rate = None
         self.main_pipeline = None
@@ -7998,7 +8004,27 @@ class PlaybackEngine:
         `_manual_from_mic` (see `_set_manual_mode`), so a user override
         during a live mic wins and doesn't get overwritten on the next
         mic transition.
+
+        DuckingConfig.ptt_auto_manual_enabled (r0083) gates this whole
+        method the same "read fresh on every transition" way ducking
+        itself already works -- when disabled, PTT must never change
+        Auto/Manual mode at all; the operator's own explicit
+        set_manual_mode command (which never routes through here) is
+        the only way to change mode. The one exception is the stale-
+        hold edge case: if this feature previously put the engine into
+        Manual (`_manual_from_mic` still True) and was THEN disabled
+        while a mic was still live, the very next mic/PTT transition
+        must release that self-created hold back to Auto via the
+        existing safe release path rather than stranding it forever --
+        an operator-owned Manual (`_manual_from_mic` already False) is
+        never touched by this.
         """
+        self._ptt_auto_manual_enabled = DuckingConfig.load().ptt_auto_manual_enabled
+        if not self._ptt_auto_manual_enabled:
+            if self._manual_from_mic:
+                self._set_manual_mode(False, _from_mic_release=True)
+                self._manual_from_mic = False
+            return
         any_live = self._any_mic_live()
         if any_live and not self.manual_mode:
             self.manual_mode = True
@@ -12005,6 +12031,14 @@ class PlaybackEngine:
                 "deck_recovery": self._deck_recovery_state(),
                 "manual_mode": self.manual_mode,
                 "manual_from_mic": self._manual_from_mic,
+                # Cached from the last mic/PTT transition (see
+                # _apply_mic_mode_hold's own docstring) -- operator
+                # guidance only, never a security boundary.
+                # getattr(..., True): same defensive-access convention as
+                # every other attribute here several test harnesses build
+                # via a bare object.__new__(PlaybackEngine), never running
+                # __init__ -- True matches this feature's own default.
+                "ptt_auto_manual_enabled": getattr(self, "_ptt_auto_manual_enabled", True),
                 # Same "configured vs. live" distinction as the mic fields
                 # above -- remote_dj_configured means the feature is built
                 # into this pipeline at all (RemoteDJConfig.enabled at

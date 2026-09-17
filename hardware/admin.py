@@ -25,6 +25,7 @@ _PIPELINE_AUDIT_FIELDS = (
     "program_gain_db",
     "ducking_enabled",
     "duck_level_db",
+    "ptt_auto_manual_enabled",
     "remote_dj_gain_db",
 )
 _PIPELINE_APPLY_MODES = {
@@ -32,6 +33,7 @@ _PIPELINE_APPLY_MODES = {
     "program_gain_db": "engine_restart_required",
     "ducking_enabled": "next_ptt_transition",
     "duck_level_db": "next_ptt_transition",
+    "ptt_auto_manual_enabled": "next_ptt_transition",
     "remote_dj_gain_db": "next_remote_dj_session",
 }
 _AUDIO_INPUT_AUDIT_FIELDS = (
@@ -463,6 +465,15 @@ class AudioPipelineForm(forms.ModelForm):
                   "in dB. Negative = quieter (-12 = roughly quarter volume). Ramped "
                   "over ~500ms on PTT toggle. Takes effect on the NEXT toggle.",
     )
+    ptt_auto_manual_enabled = forms.BooleanField(
+        required=False,
+        label="PTT automatically holds Manual mode",
+        help_text="When enabled, taking either the Studio Mic or Remote DJ mic "
+                  "live automatically changes Auto to Manual and restores Auto "
+                  "when the final mic releases, but only if PTT caused Manual "
+                  "mode. When disabled, PTT never changes Auto/Manual mode; "
+                  "select Manual explicitly when desired.",
+    )
     remote_dj_gain_db = forms.FloatField(
         label="Remote DJ mic gain (dB)",
         help_text="Software gain applied to the incoming remote-DJ mic before it "
@@ -480,6 +491,7 @@ class AudioPipelineForm(forms.ModelForm):
         ducking = DuckingConfig.load()
         self.fields["ducking_enabled"].initial = ducking.enabled
         self.fields["duck_level_db"].initial = ducking.duck_level_db
+        self.fields["ptt_auto_manual_enabled"].initial = ducking.ptt_auto_manual_enabled
         self.fields["remote_dj_gain_db"].initial = RemoteDJAudioInput.load().gain_db
 
 
@@ -495,6 +507,10 @@ class AudioPipelineAdmin(admin.ModelAdmin):
                 "save (brief on-air silence). vu_meter_min_db is client-side "
                 "only and takes effect on next dashboard reload; no restart."
             ),
+        }),
+        ("PTT / Automation Mode", {
+            "fields": ("ptt_auto_manual_enabled",),
+            "description": "Read fresh by the engine on each PTT/mic transition -- no restart needed.",
         }),
         ("Ducking (mic on-air)", {
             "fields": ("ducking_enabled", "duck_level_db"),
@@ -526,7 +542,7 @@ class AudioPipelineAdmin(admin.ModelAdmin):
             "sample_rate", "program_gain_db"
         ).first() if obj.pk else None
         old_ducking = DuckingConfig.objects.filter(pk=1).values(
-            "enabled", "duck_level_db"
+            "enabled", "duck_level_db", "ptt_auto_manual_enabled"
         ).first()
         old_remote = RemoteDJAudioInput.objects.filter(pk=1).values("gain_db").first()
         before = None
@@ -544,6 +560,11 @@ class AudioPipelineAdmin(admin.ModelAdmin):
                     if old_ducking is not None
                     else DuckingConfig._meta.get_field("duck_level_db").get_default()
                 ),
+                "ptt_auto_manual_enabled": (
+                    old_ducking["ptt_auto_manual_enabled"]
+                    if old_ducking is not None
+                    else DuckingConfig._meta.get_field("ptt_auto_manual_enabled").get_default()
+                ),
                 "remote_dj_gain_db": (
                     old_remote["gain_db"]
                     if old_remote is not None
@@ -556,6 +577,7 @@ class AudioPipelineAdmin(admin.ModelAdmin):
         ducking = DuckingConfig.load()
         ducking.enabled = form.cleaned_data["ducking_enabled"]
         ducking.duck_level_db = form.cleaned_data["duck_level_db"]
+        ducking.ptt_auto_manual_enabled = form.cleaned_data["ptt_auto_manual_enabled"]
         ducking.save()
         rdj = RemoteDJAudioInput.load()
         rdj.gain_db = form.cleaned_data["remote_dj_gain_db"]
@@ -566,6 +588,7 @@ class AudioPipelineAdmin(admin.ModelAdmin):
             "program_gain_db": obj.program_gain_db,
             "ducking_enabled": ducking.enabled,
             "duck_level_db": ducking.duck_level_db,
+            "ptt_auto_manual_enabled": ducking.ptt_auto_manual_enabled,
             "remote_dj_gain_db": rdj.gain_db,
         }
         changed_fields = []

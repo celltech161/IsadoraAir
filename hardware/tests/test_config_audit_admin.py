@@ -39,6 +39,7 @@ class AudioPipelineConfigurationAuditTests(TestCase):
         cleaned = {
             "ducking_enabled": self.ducking.enabled,
             "duck_level_db": self.ducking.duck_level_db,
+            "ptt_auto_manual_enabled": self.ducking.ptt_auto_manual_enabled,
             "remote_dj_gain_db": self.remote.gain_db,
         }
         cleaned.update(values)
@@ -74,6 +75,32 @@ class AudioPipelineConfigurationAuditTests(TestCase):
         self.assertFalse(event.detail["restart_required"])
         client.restart_operator_service.assert_not_called()
 
+    def test_ptt_auto_manual_enabled_change_emits_one_non_restart_event(self):
+        # r0083 -- default is True (see the setUp() singleton row and the
+        # model field default), so disabling it is the observable change.
+        self.assertTrue(self.ducking.ptt_auto_manual_enabled)
+        self.assertEqual(_audit_events(), [])
+        client = self._save(
+            changed_data=["ptt_auto_manual_enabled"], ptt_auto_manual_enabled=False,
+        )
+
+        event = _audit_events()[0]
+        self.assertEqual(event.title, "Audio pipeline configuration updated")
+        self.assertEqual(event.detail["changed_fields"], ["ptt_auto_manual_enabled"])
+        self.assertEqual(
+            event.detail["changes"]["ptt_auto_manual_enabled"],
+            {"old": True, "new": False},
+        )
+        self.assertEqual(
+            event.detail["apply_modes"],
+            {"ptt_auto_manual_enabled": "next_ptt_transition"},
+        )
+        self.assertFalse(event.detail["restart_required"])
+        client.restart_operator_service.assert_not_called()
+        # The singleton row is actually persisted, not just audited.
+        self.ducking.refresh_from_db()
+        self.assertFalse(self.ducking.ptt_auto_manual_enabled)
+
     def test_explicit_create_uses_create_action_and_title(self):
         self.pipeline.delete()
         pipeline = AudioPipeline()
@@ -81,6 +108,7 @@ class AudioPipelineConfigurationAuditTests(TestCase):
             cleaned_data={
                 "ducking_enabled": self.ducking.enabled,
                 "duck_level_db": self.ducking.duck_level_db,
+                "ptt_auto_manual_enabled": self.ducking.ptt_auto_manual_enabled,
                 "remote_dj_gain_db": self.remote.gain_db,
             },
             changed_data=[],
@@ -153,6 +181,7 @@ class AudioPipelineConfigurationAuditTests(TestCase):
             cleaned_data={
                 "ducking_enabled": self.ducking.enabled,
                 "duck_level_db": self.ducking.duck_level_db,
+                "ptt_auto_manual_enabled": self.ducking.ptt_auto_manual_enabled,
                 "remote_dj_gain_db": self.remote.gain_db,
             },
             changed_data=["program_gain_db"],
@@ -176,6 +205,7 @@ class AudioPipelineConfigurationAuditTests(TestCase):
             cleaned_data={
                 "ducking_enabled": self.ducking.enabled,
                 "duck_level_db": self.ducking.duck_level_db,
+                "ptt_auto_manual_enabled": self.ducking.ptt_auto_manual_enabled,
                 "remote_dj_gain_db": self.remote.gain_db,
             },
             changed_data=["program_gain_db"],

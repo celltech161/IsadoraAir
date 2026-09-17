@@ -232,6 +232,15 @@ class DuckingConfig(models.Model):
                    "live, in dB (negative = quieter, e.g. -12 = roughly quarter "
                    "volume). Ramped over ~500ms on PTT toggle, not instant.",
     )
+    ptt_auto_manual_enabled = models.BooleanField(
+        default=True,
+        help_text="When enabled, taking either the Studio Mic or Remote DJ mic "
+                   "live automatically changes Auto to Manual and restores Auto "
+                   "when the final mic releases, but only if PTT caused Manual "
+                   "mode. When disabled, PTT never changes Auto/Manual mode; "
+                   "select Manual explicitly when desired. Read fresh by the "
+                   "engine on each PTT/mic transition -- no restart needed.",
+    )
 
     class Meta:
         verbose_name = "Ducking Config"

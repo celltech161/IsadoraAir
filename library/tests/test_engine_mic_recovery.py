@@ -209,6 +209,7 @@ class MockDuckingMixin:
         class _FakeDucking:
             enabled = False
             duck_level_db = -6.0
+            ptt_auto_manual_enabled = True
 
         patcher = patch.object(hw_models.DuckingConfig, "load", staticmethod(lambda: _FakeDucking()))
         patcher.start()

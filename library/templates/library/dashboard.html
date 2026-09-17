@@ -2364,6 +2364,14 @@ function renderManualMode(data) {
   btn.textContent = data.manual_mode
     ? (data.manual_from_mic ? 'Manual (mic)' : 'Manual')
     : 'Auto';
+  // Operator guidance only, never a security boundary (r0083) -- the
+  // tooltip must not promise PTT-driven Manual when the station has
+  // disabled it. data.ptt_auto_manual_enabled defaults truthy if the
+  // key is ever missing (older engine_state.json before a restart),
+  // matching the feature's own default-enabled behavior.
+  btn.title = (data.ptt_auto_manual_enabled !== false)
+    ? "Manual holds the next track until you flip back to Auto -- for talking over a song's outro. Auto-switches while any mic is live."
+    : "Manual holds the next track until you flip back to Auto -- for talking over a song's outro. PTT does not change Auto/Manual on this station; select Manual explicitly.";
 }
 
 // [P1] 1.7 -- browser-side stale-connection guardrail (Fix B). Uses
