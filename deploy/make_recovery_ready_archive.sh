@@ -74,8 +74,13 @@ git -C "$PROJECT_DIR" bundle create "$WORKDIR/archive/recovery/IsadoraAir.bundle
 git -C "$SYNDICATED_DIR" bundle create "$WORKDIR/archive/recovery/syndicated-ingest.bundle" --all
 git -C "$OGREMOTE_DIR" bundle create "$WORKDIR/archive/recovery/ogremote-ingest.bundle" --all
 
+# `git bundle verify` requires repository context even for a bundle with no
+# prerequisites. Use one disposable bare repository solely as that context;
+# nothing is fetched into it and the source checkouts/bundles remain untouched.
+VERIFY_REPO="$WORKDIR/bundle-verify.git"
+git init --bare -q "$VERIFY_REPO"
 for bundle in IsadoraAir.bundle syndicated-ingest.bundle ogremote-ingest.bundle; do
-  git bundle verify "$WORKDIR/archive/recovery/$bundle" >/dev/null
+  git -C "$VERIFY_REPO" bundle verify "$WORKDIR/archive/recovery/$bundle" >/dev/null
   echo "  $bundle: verified"
 done
 
@@ -139,6 +144,6 @@ echo "Recovery-ready archive created:"
 echo "  $OUTPUT"
 echo "  bytes:  $OUTPUT_BYTES"
 echo "  sha256: $OUTPUT_SHA"
-echo "  IsadoraAir:       $APP_SHA"
+echo "  IsadoraAir:        $APP_SHA"
 echo "  syndicated-ingest: $SYNDICATED_SHA"
 echo "  ogremote-ingest:   $OGREMOTE_SHA"
