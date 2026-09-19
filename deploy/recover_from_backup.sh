@@ -83,9 +83,6 @@ echo "Extracting embedded recovery code bundles..."
 rm -rf "$RECOVERY_ROOT"
 mkdir -p "$RECOVERY_ROOT"
 
-# Extract only recovery/. Reject links and path traversal before writing any
-# archive member. The backup is trusted operational data, but the bootstrap is
-# deliberately fail-closed against malformed member names/types anyway.
 python3 - "$ARCHIVE" "$STATE_ROOT" <<'PY'
 import pathlib, sys, tarfile
 archive = pathlib.Path(sys.argv[1])
@@ -124,8 +121,11 @@ done
   sha256sum -c SHA256SUMS
 )
 
+VERIFY_REPO="$STATE_ROOT/bundle-verify.git"
+rm -rf "$VERIFY_REPO"
+git init --bare -q "$VERIFY_REPO"
 for bundle in IsadoraAir.bundle syndicated-ingest.bundle ogremote-ingest.bundle; do
-  git bundle verify "$RECOVERY_ROOT/$bundle" >/dev/null
+  git -C "$VERIFY_REPO" bundle verify "$RECOVERY_ROOT/$bundle" >/dev/null
   echo "  $bundle: verified"
 done
 
@@ -148,10 +148,6 @@ seed_checkout() {
   git clone "$bundle" "$target"
 }
 
-# Seed the canonical checkout without ever running git as root. /opt itself is
-# root-owned on a fresh Ubuntu install, so clone under the operator-owned
-# persistent recovery state first, create the empty canonical directory with
-# sudo, then copy the checkout into that operator-owned target.
 if [ -d /opt/isadoraair/.git ]; then
   echo "IsadoraAir checkout already exists at /opt/isadoraair; preserving it for resume."
 elif [ -e /opt/isadoraair ] && [ -n "$(ls -A /opt/isadoraair 2>/dev/null)" ]; then
@@ -175,9 +171,6 @@ git -C /opt/isadoraair checkout --detach "$EXPECTED_APP_SHA"
 seed_checkout "$RECOVERY_ROOT/syndicated-ingest.bundle" "$HOME/syndicated-ingest" "syndicated-ingest"
 seed_checkout "$RECOVERY_ROOT/ogremote-ingest.bundle" "$HOME/ogremote-ingest" "ogremote-ingest"
 
-# Install every optional public OS integration group from ordinary online Ubuntu
-# sources. This deliberately trades a small amount of extra installed software
-# for a recovery procedure with no station-specific package-selection ceremony.
 echo
 echo "Installing IsadoraAir OS prerequisites from online Ubuntu/Snap sources..."
 /opt/isadoraair/deploy/restore/10-packages.sh \
@@ -196,9 +189,6 @@ echo "Starting canonical bare-metal restore..."
   --isa-user "$ISA_USER" \
   --non-interactive
 
-# The embedded bundles are bootstrap authority, not the desired long-term
-# remotes after a successful connected restore. Reset origins only after the
-# entire bare-metal wrapper (including post-rebind Stage 95) has passed.
 git -C /opt/isadoraair remote set-url origin https://github.com/celltech161/IsadoraAir.git
 if [ -d "$HOME/syndicated-ingest/.git" ]; then
   git -C "$HOME/syndicated-ingest" remote set-url origin git@github.com:celltech161/syndicated-ingest.git
