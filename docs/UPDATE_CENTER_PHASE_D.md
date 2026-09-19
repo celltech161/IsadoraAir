@@ -975,6 +975,140 @@ suite (`test_phase_b_security.py`) both pass unchanged.
   `/usr/local/libexec/` install, the Phase-D systemd unit's actual
   activation, retiring the old updater, r0026/r0027.
 
+### Legacy updater retirement (defined -- see below)
+
+The "retiring the old updater" item above was left open by every prior
+phase. **The canonical completed-Phase-D systemd authority contract is
+now defined:**
+
+```
+updater-bootstrapd.service:  enabled, active
+isadoraair-updater.service:  masked,  inactive
+```
+
+Not merely `disabled` -- a disabled unit remains trivially startable by
+`systemctl start`, and `deploy/isadoraair-updater.service` and `deploy/
+updater-bootstrapd.service` declare an overlapping `RuntimeDirectory=
+isadoraair-updater`, so starting the legacy unit is structurally capable
+of colliding with the live supervisor-owned worker's runtime directory
+(the exact hazard behind a real 2026-09-17 incident: an operator/agent
+ran `systemctl start isadoraair-updater.service` on Oak Grove, expecting
+it to be "the protected updater," and it crash-looped every `RestartSec`
+because its own config-loading contract predates the Phase-D `phase_d_*`
+station-config fields entirely -- it has been obsolete since D0, not
+merely unused). `systemctl mask` closes this structurally: a masked
+unit's `systemctl start` fails immediately, with no window in which its
+`RuntimeDirectory=` declaration is ever evaluated.
+
+The decision logic and privileged mechanics live in `deploy/
+updater_bootstrap/tools/legacy_updater_retirement.py` -- dependency-free
+(no Django/application-checkout import), mirroring `updatecenter/
+backend_client.py`'s own "unprivileged strict client" convention and
+`protected_runtime_release.py`'s release-authoring-tool convention.
+
+**Two deliberately separate trust/application layers -- do not conflate
+them:**
+
+1. **Root maintenance helper** (`check_retirement_preflight()`, entirely
+   protected-updater/systemd-side, zero Django/database dependency):
+   supervisor loaded/enabled/active; worker socket present; PING
+   healthy (`protected_runtime_valid`, `update_execution_enabled`); no
+   protected-runtime activation in flight (`activation` null); no
+   protected-updater **operator-maintenance** action in flight (PING's
+   own `maintenance_busy` field -- the protected daemon's separate
+   operator-maintenance-worker flag, **not** an UpdateJob proxy of any
+   kind); and the legacy unit's own safe/inactive state (idempotent if
+   already masked).
+2. **Application-layer prerequisite** (the *operator's* responsibility,
+   checked separately, never by this helper): no ORDINARY Update Center
+   job may own the active lock. For a normal IsadoraAir application
+   host:
+   ```bash
+   cd /opt/isadoraair && ./venv/bin/python manage.py shell -c '
+   from updatecenter.models import UpdateJob
+   print(list(UpdateJob.objects.filter(active_lock=1)
+               .values("id", "state", "current_step", "target_release_id")))
+   '
+   ```
+   Expected: `[]`. If any row is returned, **STOP** -- do not run the
+   helper until that job reaches a terminal state and releases its
+   lock. If the application root differs from `/opt/isadoraair`, run the
+   equivalent station-local check there instead -- this module never
+   hardcodes an application path, and never will.
+
+An **active** legacy unit is refused as a distinct, separate condition
+(`LegacyUnitActiveError`) -- retirement never runs `systemctl stop` on
+it itself, because that could remove `/run/isadoraair-updater` out from
+under the live worker via the shared `RuntimeDirectory=` reference
+count; an active legacy unit needs a deliberate, separately-decided
+recovery action, not this tool.
+
+> **Corrected 2026-09-17** (same day as the retirement itself): an
+> earlier draft of this tool/doc incorrectly described `maintenance_
+> busy=false` as a proxy for "no active/locked UpdateJob." It is not --
+> it reflects only the protected daemon's own operator-maintenance
+> worker. Both production retirements (Oak Grove, WRJE) were still
+> correctly guarded at the time: Oak Grove's ordinary update state was
+> known idle, and WRJE was explicitly checked beforehand with the exact
+> `UpdateJob.objects.filter(active_lock=1)` query above, which returned
+> `[]`. This was a helper/documentation correctness issue caught before
+> it could cause a real gap, not a production incident.
+
+Ordering for a fresh/future Phase-D bootstrap (D0's own manual bridge,
+or any future automated equivalent): (1) verify supervisor installation/
+config/trust/runtime state, (2) confirm the supervisor can own the
+active worker, (3) establish Phase-D authority (this is what r0026's
+manual bridge already does today), (4) **only then** retire/mask the
+legacy unit via this tool, (5) re-verify supervisor health. A bootstrap
+that fails before step 3 must leave the legacy unit exactly as it found
+it -- a station must never end up with *neither* updater authority
+available. This tool enforces that ordering itself: `check_retirement_
+preflight()`'s supervisor-health requirements make it structurally
+impossible to reach the masking step before Phase-D authority is
+already proven established.
+
+Recovery/restore (`isadoraair/phase_d_recovery.py`): `restore_phase_d_
+component()`/`publish_phase_d_component()` never reference the legacy
+unit at all (see `test_legacy_updater_retirement.py`'s structural
+proof) -- restoring the supervisor's own trust/slots/runtime-state
+material cannot reinstall or re-enable `isadoraair-updater.service`,
+because no code path in that module writes to it. A station already
+retired stays retired through a restore; a station not yet retired
+is unaffected by a restore either way. Recovery's own existing fail-
+closed behavior (refusing on invalid supervisor source/trust/runtime
+state, or no valid active protected slot) is unchanged and must never
+be weakened by masking the legacy unit as a side effect of a failed
+restore -- a failed restore must never leave a station with neither
+updater authority usable.
+
+This is host/operator maintenance, not an Update Center release action:
+no application source change, no protected-runtime generation change,
+no Django migration, no signed managed-unit-policy change. `isadoraair-
+updater.service` must never be added to the generation-5 (or any)
+signed policy merely to let Update Center manipulate it -- that would
+conflate protected-worker managed-unit authority (an ordinary-operation
+concept) with root/operator station maintenance (a one-time, per-host
+concept). See `test_legacy_updater_retirement.py` for the full test
+matrix and `deploy/isadoraair-updater.service`'s own header comment for
+the "this must never be installed/startable on a completed Phase-D
+system" marker left directly on the historical template.
+
+**Production status (2026-09-17):** both production stations have
+already completed host-side retirement successfully and are not touched
+again by this correction:
+
+```
+Oak Grove:
+  isadoraair-updater.service = masked/inactive
+  updater-bootstrapd.service = active
+
+WRJE:
+  isadoraair-updater.service = masked/inactive
+  updater-bootstrapd.service = active
+```
+
+The legacy unit cannot be started on either station.
+
 ## D5 pre-bootstrap integration contract
 
 D5 implements the release-authoring and recovery substrate before any station
