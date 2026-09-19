@@ -18,16 +18,28 @@ matching every other Foundation E validator command):
      from every other failure specifically so a caller can choose to
      treat "not yet adopted" differently from "broken", e.g. a nightly
      backup that only WARNS when no operator policy requires this
-     payload to exist yet, but always fails on a broken one."""
+     payload to exist yet, but always fails on a broken one.
+
+The automatic/current-station policy also proves protected-updater
+*freshness*: if that component is required, its captured active generation
+and descriptor must match the protected-runtime descriptor committed in the
+application checkout running this command. This closes the physical DR drill's
+case where an internally-valid generation-2 payload remained selected while
+the application had advanced to generation 5. Explicit/historical validation
+remains portable and does not impose this current-checkout comparison.
+"""
 
 from __future__ import annotations
 
 import json as json_module
 from pathlib import Path
 
+from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
 
+from isadoraair.recovery_freshness import compare_protected_updater_to_product
 from isadoraair.runtime_recovery import (
+    PROTECTED_UPDATER_SUBDIR,
     RECOVERY_POLICY_COMPONENT_NAMES,
     RESULT_PASS,
     RecoveryPayloadNotConfiguredError,
@@ -49,7 +61,9 @@ class Command(BaseCommand):
         "--require-components) or, normally, --require-current-station-policy "
         "(r0046) -- derived automatically and fail-closed from this station's "
         "current configuration plus an independent protected_updater product "
-        "rule. Never modifies anything."
+        "rule. Automatic policy also requires the protected-updater capture to "
+        "match this checkout's committed protected-runtime generation/descriptor. "
+        "Never modifies anything."
     )
 
     def add_arguments(self, parser):
@@ -101,10 +115,13 @@ class Command(BaseCommand):
                 "kokoro/piper/fdkaac from this station's CURRENT configuration "
                 "(isadoraair.runtime_requirements), native_fdkaac from fdkaac, "
                 "and protected_updater from an independent product/deployment "
-                "rule -- never from the payload's own state. Fails closed "
-                "(CommandError) if station configuration cannot be resolved. "
-                "Mutually exclusive with --require/--require-components; this "
-                "is the mode a normal scheduled backup should use."
+                "rule -- never from the payload's own state. If protected_updater "
+                "is required, also require its captured active generation and "
+                "descriptor to match this checkout's committed protected runtime. "
+                "Fails closed (CommandError) if station configuration or freshness "
+                "cannot be resolved. Mutually exclusive with --require/"
+                "--require-components; this is the mode a normal scheduled backup "
+                "should use."
             ),
         )
         parser.add_argument(
@@ -198,11 +215,21 @@ class Command(BaseCommand):
         evidence = validate_current_recovery_payload(payload_root)
         policy = evaluate_recovery_policy(evidence, required) if policy_requested else None
 
+        protected_freshness = None
+        if automatic_requested and "protected_updater" in required:
+            protected_freshness = compare_protected_updater_to_product(
+                component_root=payload_root / PROTECTED_UPDATER_SUBDIR,
+                repository_root=settings.BASE_DIR,
+            )
+
         if options["json_output"]:
             payload = evidence.to_dict()
             payload["pointer_configured"] = True
             payload["resolved_path"] = str(payload_root)
             payload["policy"] = policy.to_dict() if policy is not None else None
+            payload["protected_updater_freshness"] = (
+                protected_freshness.to_dict() if protected_freshness is not None else None
+            )
             if payload["policy"] is not None:
                 payload["policy"]["source"] = policy_source
                 payload["policy"]["reasons"] = {
@@ -222,6 +249,13 @@ class Command(BaseCommand):
                 self.stdout.write(f"  tts components: {', '.join(evidence.tts_components)}")
             freshness = evidence.piper_freshness
             self.stdout.write(f"  piper station selection: {freshness.state}")
+            if protected_freshness is not None:
+                self.stdout.write(
+                    "  protected_updater application freshness: "
+                    + ("CURRENT" if protected_freshness.current else "STALE/UNPROVEN")
+                )
+                if protected_freshness.diagnostic:
+                    self.stdout.write(f"    {protected_freshness.diagnostic}")
             if policy is not None:
                 self.stdout.write(
                     f"  recovery policy ({policy_source}, {', '.join(sorted(required)) or '(none)'}): "
@@ -237,4 +271,11 @@ class Command(BaseCommand):
             raise CommandError(
                 f"recovery payload does not satisfy the required-component policy -- missing: "
                 f"{', '.join(sorted(policy.missing))}"
+            )
+        if protected_freshness is not None and not (
+            protected_freshness.checked and protected_freshness.current
+        ):
+            raise CommandError(
+                protected_freshness.diagnostic
+                or "protected-updater recovery payload freshness could not be proven"
             )
