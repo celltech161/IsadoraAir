@@ -148,24 +148,22 @@ seed_checkout() {
   git clone "$bundle" "$target"
 }
 
-# Establish /opt/isadoraair as the ordinary operator. The only privileged
-# operation here is creating/chowning the initially-empty canonical directory.
-if [ ! -e /opt/isadoraair ]; then
-  sudo mkdir -p /opt/isadoraair
-  sudo chown "$ISA_USER:$ISA_GROUP" /opt/isadoraair
-elif [ ! -d /opt/isadoraair/.git ] && [ -n "$(ls -A /opt/isadoraair 2>/dev/null)" ]; then
+# Seed the canonical checkout without ever running git as root. /opt itself is
+# root-owned on a fresh Ubuntu install, so clone under the operator-owned
+# persistent recovery state first, create the empty canonical directory with
+# sudo, then copy the checkout into that operator-owned target.
+if [ -d /opt/isadoraair/.git ]; then
+  echo "IsadoraAir checkout already exists at /opt/isadoraair; preserving it for resume."
+elif [ -e /opt/isadoraair ] && [ -n "$(ls -A /opt/isadoraair 2>/dev/null)" ]; then
   fail "/opt/isadoraair already exists with non-Git content; refusing to overwrite it"
   exit 1
 else
+  APP_SEED="$STATE_ROOT/IsadoraAir-seed"
+  rm -rf "$APP_SEED"
+  git clone "$RECOVERY_ROOT/IsadoraAir.bundle" "$APP_SEED"
+  sudo mkdir -p /opt/isadoraair
   sudo chown "$ISA_USER:$ISA_GROUP" /opt/isadoraair
-fi
-
-if [ ! -d /opt/isadoraair/.git ]; then
-  # git clone requires the destination not to exist. /opt itself is root-owned,
-  # so create the clone beside the prepared empty directory and move its content
-  # in without ever running git as root.
-  rmdir /opt/isadoraair
-  git clone "$RECOVERY_ROOT/IsadoraAir.bundle" /opt/isadoraair
+  cp -a "$APP_SEED/." /opt/isadoraair/
 fi
 
 if ! git -C /opt/isadoraair cat-file -e "${EXPECTED_APP_SHA}^{commit}" 2>/dev/null; then
