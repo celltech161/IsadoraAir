@@ -187,6 +187,7 @@ echo "Starting canonical bare-metal restore..."
   --force-production-target \
   --owner "$ISA_USER:$ISA_GROUP" \
   --isa-user "$ISA_USER" \
+  --resume \
   --non-interactive
 
 git -C /opt/isadoraair remote set-url origin https://github.com/celltech161/IsadoraAir.git

@@ -772,3 +772,65 @@ class Stage40Then80ResumedThen90ChainTests(SimpleTestCase):
 
         for pattern in ("systemctl start", "systemctl enable", "systemctl reload", "systemctl restart"):
             self.assertNotIn(pattern, stage40.stdout + stage80.stdout + stage90.stdout)
+
+class ArchiveOnlyRecoveryBootstrapContractTests(SimpleTestCase):
+    """Physical-DR regression coverage for the archive-only wrapper.
+
+    recover_from_backup.sh deliberately runs Stage 10 packages before
+    handing control to the canonical bare-metal orchestrator. Stage 10
+    participates in the durable restore ledger, so that handoff must be
+    an explicit --resume. Without it, the canonical restore re-enters an
+    already-started restore as an ordinary fresh run -- the exact failure
+    reproduced during the first physical bare-metal acceptance drill.
+    """
+
+    def test_archive_bootstrap_resumes_canonical_restore(self):
+        script = (
+            REPO_ROOT / "deploy" / "recover_from_backup.sh"
+        ).read_text(encoding="utf-8")
+
+        package_start = script.index(
+            "/opt/isadoraair/deploy/restore/10-packages.sh"
+        )
+        restore_start = script.index(
+            "/opt/isadoraair/deploy/restore/bare_metal_restore.sh",
+            package_start,
+        )
+
+        # Bound the invocation at the first command following the
+        # multi-line bare_metal_restore command. This keeps the assertion
+        # attached to the actual handoff rather than accepting an
+        # unrelated --resume anywhere else in the wrapper.
+        remote_reset = script.index(
+            "git -C /opt/isadoraair remote set-url origin",
+            restore_start,
+        )
+        invocation = script[restore_start:remote_reset]
+
+        self.assertIn(
+            "--resume",
+            invocation,
+            "archive-only bootstrap pre-runs Stage 10, so its canonical "
+            "bare-metal restore handoff must use --resume",
+        )
+
+        self.assertIn("--non-interactive", invocation)
+        self.assertLess(
+            invocation.index("--resume"),
+            invocation.index("--non-interactive"),
+        )
+
+    def test_archive_bootstrap_runs_stage10_before_canonical_restore(self):
+        """Protect the premise that makes --resume mandatory."""
+        script = (
+            REPO_ROOT / "deploy" / "recover_from_backup.sh"
+        ).read_text(encoding="utf-8")
+
+        package_start = script.index(
+            "/opt/isadoraair/deploy/restore/10-packages.sh"
+        )
+        restore_start = script.index(
+            "/opt/isadoraair/deploy/restore/bare_metal_restore.sh"
+        )
+
+        self.assertLess(package_start, restore_start)
