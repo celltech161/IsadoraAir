@@ -306,6 +306,78 @@ guard_never_touch_music_library() {
 }
 
 # ---------------------------------------------------------------------
+# restore_ensure_user_in_group USER GROUP
+#
+# DR-03: a bare-metal restore must reconstruct supplementary-group
+# membership required by hardware-facing services. The first physical
+# DR drill restored the service account but left it outside the `audio`
+# group, while ALSA device nodes were root:audio 0660.
+#
+# This operates only on the REAL host when called by Stage 90. Staging
+# roots deliberately do not mutate the installer host's account DB.
+#
+# Apply mode:
+#   - user and group must already exist; fail closed otherwise
+#   - membership is idempotently established with usermod -aG
+#   - membership is re-read from NSS immediately and verified
+#
+# Plan mode:
+#   - never mutates account state
+#   - reports what would be changed
+#
+# New systemd processes resolve the updated supplementary groups when
+# started. An already-existing interactive login session may need a new
+# login/session before its own process group list changes.
+restore_ensure_user_in_group() {
+  local user="$1" group="$2"
+  local groups=""
+
+  if ! getent passwd "$user" >/dev/null 2>&1; then
+    if [ "$RESTORE_MODE" = "apply" ]; then
+      log_error "Required service user '$user' does not exist; cannot establish supplementary group '$group'."
+      return 1
+    fi
+    log_warn "Service user '$user' does not currently exist; apply would require it before adding group '$group'."
+    return 0
+  fi
+
+  if ! getent group "$group" >/dev/null 2>&1; then
+    if [ "$RESTORE_MODE" = "apply" ]; then
+      log_error "Required supplementary group '$group' does not exist; refusing to invent a replacement group identity."
+      return 1
+    fi
+    log_warn "Supplementary group '$group' does not currently exist; apply would fail closed."
+    return 0
+  fi
+
+  groups="$(id -nG "$user" 2>/dev/null || true)"
+  if printf '%s\n' "$groups" | tr ' ' '\n' | grep -Fxq "$group"; then
+    log_info "Service user '$user' is already a member of '$group'."
+    return 0
+  fi
+
+  if [ "$RESTORE_MODE" != "apply" ]; then
+    log_plan "sudo usermod -aG $group $user"
+    return 0
+  fi
+
+  log_apply "add service user '$user' to supplementary group '$group'"
+  if ! sudo usermod -aG "$group" "$user"; then
+    log_error "Failed to add service user '$user' to supplementary group '$group'."
+    return 1
+  fi
+
+  groups="$(id -nG "$user" 2>/dev/null || true)"
+  if ! printf '%s\n' "$groups" | tr ' ' '\n' | grep -Fxq "$group"; then
+    log_error "usermod returned success, but '$user' is still not reported as a member of '$group'; refusing to continue."
+    return 1
+  fi
+
+  log_info "Service user '$user' supplementary-group membership verified: '$group'."
+  return 0
+}
+
+# ---------------------------------------------------------------------
 # ensure_confined_directory ROOT TARGET MODE UID GID
 #
 # Runtime Foundation E7D (2026-09-04) -- the shared, confined directory-

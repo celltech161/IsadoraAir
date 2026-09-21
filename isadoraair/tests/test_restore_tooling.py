@@ -1979,6 +1979,175 @@ exec "${{args[@]}}"
         self.assertIn('"accepted":true', accept.stdout.replace(" ", ""))
 
 
+
+class RestoreAudioGroupMembershipTests(SimpleTestCase):
+    """DR-03: restore the service account's required `audio` membership
+    without depending on an existing login session or duplicating the
+    contract into every systemd unit."""
+
+    def setUp(self):
+        self.tmpdir = Path(
+            tempfile.mkdtemp(prefix="isadoraair-dr03-audio-group-")
+        )
+        self.addCleanup(shutil.rmtree, self.tmpdir, ignore_errors=True)
+
+        self.fakebin = self.tmpdir / "fakebin"
+        self.fakebin.mkdir()
+
+        self.state = self.tmpdir / "membership-state"
+        self.sudo_log = self.tmpdir / "sudo.log"
+
+        (self.fakebin / "getent").write_text(
+            """#!/usr/bin/env bash
+set -u
+if [ "$1" = "passwd" ] && [ "$2" = "station" ]; then
+  [ "${FAKE_USER_EXISTS:-1}" = "1" ] || exit 2
+  echo 'station:x:1000:1000::/home/station:/bin/bash'
+  exit 0
+fi
+if [ "$1" = "group" ] && [ "$2" = "audio" ]; then
+  [ "${FAKE_AUDIO_EXISTS:-1}" = "1" ] || exit 2
+  echo 'audio:x:29:'
+  exit 0
+fi
+exec /usr/bin/getent "$@"
+""",
+            encoding="utf-8",
+        )
+
+        (self.fakebin / "id").write_text(
+            f"""#!/usr/bin/env bash
+set -u
+if [ "$1" = "-nG" ] && [ "${{2:-}}" = "station" ]; then
+  if [ -f "{self.state}" ]; then
+    echo 'station audio'
+  else
+    echo 'station'
+  fi
+  exit 0
+fi
+exec /usr/bin/id "$@"
+""",
+            encoding="utf-8",
+        )
+
+        (self.fakebin / "usermod").write_text(
+            f"""#!/usr/bin/env bash
+set -u
+if [ "${{FAKE_USERMOD_FAIL:-0}}" = "1" ]; then
+  exit 1
+fi
+if [ "$*" != "-aG audio station" ]; then
+  echo "unexpected usermod argv: $*" >&2
+  exit 97
+fi
+touch "{self.state}"
+exit 0
+""",
+            encoding="utf-8",
+        )
+
+        (self.fakebin / "sudo").write_text(
+            f"""#!/usr/bin/env bash
+printf '%s\\n' "$*" >> "{self.sudo_log}"
+exec "$@"
+""",
+            encoding="utf-8",
+        )
+
+        for path in self.fakebin.iterdir():
+            path.chmod(0o755)
+
+    def _run(self, *, mode="--apply", extra_env=None):
+        script = (
+            "set -euo pipefail; "
+            f'source "{RESTORE_DIR / "lib.sh"}"; '
+            f"restore_parse_common_args {mode} >/dev/null 2>&1; "
+            "restore_ensure_user_in_group station audio"
+        )
+        env = {
+            **os.environ,
+            "PATH": f"{self.fakebin}:{os.environ['PATH']}",
+        }
+        if extra_env:
+            env.update(extra_env)
+        return subprocess.run(
+            ["bash", "-c", script],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            env=env,
+        )
+
+    def _sudo_calls(self):
+        if not self.sudo_log.exists():
+            return []
+        return [
+            line
+            for line in self.sudo_log.read_text(
+                encoding="utf-8"
+            ).splitlines()
+            if line
+        ]
+
+    def test_missing_membership_is_added_and_verified(self):
+        result = self._run()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue(self.state.is_file())
+        self.assertEqual(
+            self._sudo_calls(),
+            ["usermod -aG audio station"],
+        )
+        self.assertIn("membership verified", result.stdout)
+
+    def test_existing_membership_is_idempotent(self):
+        self.state.touch()
+        result = self._run()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self._sudo_calls(), [])
+        self.assertIn("already a member", result.stdout)
+
+    def test_missing_audio_group_fails_closed(self):
+        result = self._run(extra_env={"FAKE_AUDIO_EXISTS": "0"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self._sudo_calls(), [])
+        self.assertIn("does not exist", result.stdout + result.stderr)
+
+    def test_missing_service_user_fails_closed(self):
+        result = self._run(extra_env={"FAKE_USER_EXISTS": "0"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self._sudo_calls(), [])
+        self.assertIn("does not exist", result.stdout + result.stderr)
+
+    def test_usermod_failure_fails_closed(self):
+        result = self._run(extra_env={"FAKE_USERMOD_FAIL": "1"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "usermod -aG audio station",
+            self._sudo_calls(),
+        )
+
+    def test_plan_never_modifies_membership(self):
+        result = self._run(mode="--plan")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(self.state.exists())
+        self.assertEqual(self._sudo_calls(), [])
+        self.assertIn("usermod -aG audio station", result.stdout)
+
+    def test_stage90_wires_real_host_membership_and_skips_staging(self):
+        source = (RESTORE_DIR / "90-system-config.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            'restore_ensure_user_in_group "$ISA_USER" audio',
+            source,
+        )
+        self.assertIn(
+            'if [ -n "$RESTORE_STAGING_ROOT" ]; then',
+            source,
+        )
+
+
 class RestoreManageSharedHelperTests(SimpleTestCase):
     """Runtime Foundation E7C (2026-09-04): lib.sh's restore_manage /
     restore_manage_command is the ONE shared mechanism stages 50/70/75/90

@@ -282,6 +282,20 @@ else
   log_info "Protected-updater checkpoint surface established: $UPDATER_CHECKPOINT_DIR"
 fi
 
+# ---- DR-03. Service-account audio-group membership -----------------------
+# The audio-facing IsadoraAir processes run as @@ISA_USER@@ and rely on
+# that account's ordinary Unix supplementary groups. The units do not
+# duplicate this with SupplementaryGroups=audio. Reconstruct the account
+# contract on the real host before controlled service bring-up.
+#
+# Never mutate the installer host's account database during an isolated
+# --staging-root restore.
+if [ -n "$RESTORE_STAGING_ROOT" ]; then
+  log_info "Audio supplementary-group convergence skipped in staging mode; target-host account membership is a real-host concern."
+else
+  restore_ensure_user_in_group "$ISA_USER" audio
+fi
+
 # ---- 2. asound.conf (not tokenized -- installed as-is) --------------------
 install_rendered "$REPO_ROOT/deploy/asound.conf" "$ETC_ROOT/asound.conf"
 
