@@ -468,6 +468,44 @@ class SndAloopModprobeConfigStructuralCheckTests(SimpleTestCase):
         self.assertEqual(check.detail, "content mismatch")
 
 
+    def _modules_load_check(self, target_root):
+        return next(
+            c
+            for c in self._check(target_root)
+            if c.label == "snd-aloop modules-load.d config"
+        )
+
+    def test_missing_modules_load_config_fails_closed(self):
+        with tempfile.TemporaryDirectory(prefix="isadoraair-e6-aloop-modules-") as tmp:
+            check = self._modules_load_check(tmp)
+        self.assertEqual(check.state, LEGACY_MISSING)
+
+    def test_correctly_installed_modules_load_config_passes(self):
+        project_root = Path(__file__).resolve().parent.parent.parent
+        source = project_root / "deploy" / "snd-aloop-modules.conf"
+        with tempfile.TemporaryDirectory(prefix="isadoraair-e6-aloop-modules-") as tmp:
+            dest_dir = Path(tmp) / "etc" / "modules-load.d"
+            dest_dir.mkdir(parents=True)
+            (dest_dir / "snd-aloop.conf").write_text(
+                source.read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+            check = self._modules_load_check(tmp)
+        self.assertEqual(check.state, LEGACY_PASS)
+
+    def test_mismatched_modules_load_config_fails_closed(self):
+        with tempfile.TemporaryDirectory(prefix="isadoraair-e6-aloop-modules-") as tmp:
+            dest_dir = Path(tmp) / "etc" / "modules-load.d"
+            dest_dir.mkdir(parents=True)
+            (dest_dir / "snd-aloop.conf").write_text(
+                "snd-dummy\n",
+                encoding="utf-8",
+            )
+            check = self._modules_load_check(tmp)
+        self.assertEqual(check.state, LEGACY_MISSING)
+        self.assertEqual(check.detail, "content mismatch")
+
+
 class ScratchSurfaceAbsentIsDeferredNotFailTests(SimpleTestCase):
     """r0042, Defect B: /run/isadoraair/tts does not exist until
     systemd-tmpfiles runs it at boot (deploy/isadoraair-tmpfiles.conf) --
@@ -552,6 +590,14 @@ class Stage95PreBootAcceptanceTargetTests(SimpleTestCase):
                 (project_root / "deploy" / "isadoraair-aloop.conf").read_text(encoding="utf-8"),
                 encoding="utf-8",
             )
+            modules_load_dir = target_root / "etc" / "modules-load.d"
+            modules_load_dir.mkdir(parents=True)
+            (modules_load_dir / "snd-aloop.conf").write_text(
+                (project_root / "deploy" / "snd-aloop-modules.conf").read_text(
+                    encoding="utf-8"
+                ),
+                encoding="utf-8",
+            )
             tmpfiles_dir = target_root / "etc" / "tmpfiles.d"
             tmpfiles_dir.mkdir(parents=True)
             (tmpfiles_dir / "isadoraair.conf").write_text(
@@ -588,6 +634,7 @@ class Stage95PreBootAcceptanceTargetTests(SimpleTestCase):
                 )
             self.assertTrue(any(c.label == "snd-aloop module" for c in checks))
             self.assertTrue(any(c.label == "snd-aloop modprobe.d config" and c.state == LEGACY_PASS for c in checks))
+            self.assertTrue(any(c.label == "snd-aloop modules-load.d config" and c.state == LEGACY_PASS for c in checks))
             self.assertTrue(any(c.label == "TTS scratch tmpfiles config" and c.state == LEGACY_PASS for c in checks))
 
 

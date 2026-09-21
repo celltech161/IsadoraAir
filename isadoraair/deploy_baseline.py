@@ -355,9 +355,10 @@ def _check_directories(
             detail = "matches Git-owned authority" if state == LEGACY_PASS else "content mismatch"
             results.append(LegacyCheck("TTS scratch tmpfiles config", state, detail))
 
-    # r0042: the modprobe.d config's INSTALLATION is structural (gates
-    # here, target-root-mapped so an offline staging target is covered
-    # too) -- whether the kernel module is actually LOADED right now is
+    # r0042/DR-04: the persistent snd-aloop declarations are structural
+    # and gate here, target-root-mapped so an offline staging target is
+    # covered too. Both the modprobe options and modules-load declaration
+    # must be present; whether the kernel module is actually LOADED is
     # separate live/deferred evidence, see _check_snd_aloop() above.
     aloop_conf = _map_target_path(target_root, Path("/etc/modprobe.d/isadoraair-aloop.conf"))
     source_aloop_conf = project_root / "deploy" / "isadoraair-aloop.conf"
@@ -375,6 +376,50 @@ def _check_directories(
             state = LEGACY_PASS if actual_conf == expected_conf else LEGACY_MISSING
             detail = "matches Git-owned authority" if state == LEGACY_PASS else "content mismatch"
             results.append(LegacyCheck("snd-aloop modprobe.d config", state, detail))
+
+    # DR-04 physical bare-metal acceptance: the modprobe options are only
+    # half of the persistent contract. The module must also be declared
+    # for boot-time loading. This is structural, target-root-mapped
+    # evidence just like the modprobe.d config above; actual kernel load
+    # and card topology remain deferred live evidence.
+    aloop_modules = _map_target_path(
+        target_root, Path("/etc/modules-load.d/snd-aloop.conf")
+    )
+    source_aloop_modules = project_root / "deploy" / "snd-aloop-modules.conf"
+    if not aloop_modules.is_file():
+        results.append(
+            LegacyCheck(
+                "snd-aloop modules-load.d config",
+                LEGACY_MISSING,
+                f"{aloop_modules} is missing",
+            )
+        )
+    else:
+        try:
+            expected_modules = source_aloop_modules.read_text(encoding="utf-8")
+            actual_modules = aloop_modules.read_text(encoding="utf-8")
+        except OSError as exc:
+            results.append(
+                LegacyCheck(
+                    "snd-aloop modules-load.d config",
+                    LEGACY_MISSING,
+                    str(exc),
+                )
+            )
+        else:
+            state = (
+                LEGACY_PASS
+                if actual_modules == expected_modules
+                else LEGACY_MISSING
+            )
+            detail = (
+                "matches Git-owned authority"
+                if state == LEGACY_PASS
+                else "content mismatch"
+            )
+            results.append(
+                LegacyCheck("snd-aloop modules-load.d config", state, detail)
+            )
     return results
 
 
