@@ -2766,6 +2766,49 @@ class RuntimeFoundationE5SystemConfigFunctionalTests(SimpleTestCase):
         self.assertIn("isadoraair.conf", result.stdout)
         self.assertIn("isadoraair-runtime.conf", result.stdout)
 
+    def test_dr02_real_host_materializes_legacy_tmpfiles_before_bringup(self):
+        """Physical-DR regression: installing isadoraair.conf is not enough
+        before first reboot; Stage 90 must explicitly materialize it."""
+        source = (RESTORE_DIR / "90-system-config.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            'sudo systemd-tmpfiles --create "$TMPFILES_CONFIG"',
+            source,
+        )
+        self.assertIn(
+            'TMPFILES_CONFIG="/etc/tmpfiles.d/isadoraair.conf"',
+            source,
+        )
+
+        # The actual rule remains the sole real-host authority for these
+        # paths; Stage 90 must not hand-roll mkdir/chown for canonical /run.
+        tmpfiles = (
+            RESTORE_DIR.parent / "isadoraair-tmpfiles.conf"
+        ).read_text(encoding="utf-8")
+        self.assertIn("d /run/isadoraair 0755", tmpfiles)
+        self.assertIn("d /run/isadoraair/tts 0700", tmpfiles)
+
+    def test_dr02_staging_still_uses_confined_numeric_identity(self):
+        """Offline staging must not invoke host systemd-tmpfiles."""
+        app_root = self.staging / "opt" / "isadoraair"
+        app_root.mkdir(parents=True)
+        (app_root / ".env").write_text("SECRET_KEY=test\\n", encoding="utf-8")
+
+        result = self._run("--apply")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        run_dir = self.staging / "run" / "isadoraair"
+        tts_dir = run_dir / "tts"
+        self.assertTrue(run_dir.is_dir())
+        self.assertTrue(tts_dir.is_dir())
+        self.assertEqual(stat.S_IMODE(run_dir.stat().st_mode), 0o755)
+        self.assertEqual(stat.S_IMODE(tts_dir.stat().st_mode), 0o700)
+        self.assertNotIn(
+            "systemd-tmpfiles --create",
+            result.stdout + result.stderr,
+        )
+
     def test_dr01_establishes_protected_updater_checkpoint_surface(self):
         """Physical-DR regression: updater-bootstrapd has
         /var/backups/isadoraair/update-checkpoints in ReadWritePaths, so

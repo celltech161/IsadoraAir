@@ -441,26 +441,39 @@ else
 fi
 
 # ---- 4b. Legacy scratch surface (/run/isadoraair, /run/isadoraair/tts)
-#      -- staging only -------------------------------------------------
+# ---------------------------------------------------------------------
 # isadoraair/runtime_scratch.py's own module docstring: this TTS scratch
 # surface is deliberately NOT part of Runtime Foundation E5 (section 4
 # above) -- it stays owned by the pre-existing deploy/isadoraair-
 # tmpfiles.conf / @@ISA_USER@@ convention, whose config file section 1
-# above already rendered to $ETC_ROOT/tmpfiles.d/isadoraair.conf. This
-# establishes exactly the two directories that file declares
-# (`d /run/isadoraair 0755 ...` / `d /run/isadoraair/tts 0700 ...`) --
-# not a second, competing authority for them, and not service
-# activation: nothing is started, enabled, or reloaded.
+# above already rendered to $ETC_ROOT/tmpfiles.d/isadoraair.conf.
 #
-# On a REAL (non-staging) host this is a no-op: systemd itself creates
-# these from that same rendered config at boot, using the real service
-# account's real /etc/passwd entry -- this stage never needs to (and
-# does not) fabricate them there, and never invents a Unix account.
-# A --staging-root tree is never booted, so nothing else ever creates
-# them there -- hence this section, gated on --staging-root only, using
-# the SAME trusted ISA_UID/ISA_GID identity resolved above (explicit
-# --isa-uid/--isa-gid, or the caller's own identity by default).
-if [ -n "$RESTORE_STAGING_ROOT" ]; then
+# DR-02 (first physical bare-metal acceptance): merely installing that
+# tmpfiles rule is insufficient on a freshly restored host that has not
+# rebooted yet. Monitoring was started during controlled bring-up before
+# systemd had ever materialized /run/isadoraair and failed with
+# PermissionError. Stage 90 therefore executes the SAME tmpfiles
+# authority immediately on a real host. This is directory provisioning,
+# not service activation: nothing is started, enabled, or reloaded.
+#
+# A --staging-root tree has no guaranteed passwd/group database for
+# systemd-tmpfiles to resolve @@ISA_USER@@ against, so its existing
+# confined implementation remains the correct offline equivalent, using
+# the trusted numeric ISA_UID/ISA_GID pair.
+if [ -z "$RESTORE_STAGING_ROOT" ]; then
+  TMPFILES_CONFIG="/etc/tmpfiles.d/isadoraair.conf"
+  if [ "$RESTORE_MODE" != "apply" ]; then
+    log_plan "sudo systemd-tmpfiles --create $TMPFILES_CONFIG"
+  else
+    if ! command -v systemd-tmpfiles >/dev/null 2>&1; then
+      log_error "systemd-tmpfiles is required to materialize $TMPFILES_CONFIG before service bring-up."
+      exit 1
+    fi
+    log_apply "materialize legacy IsadoraAir runtime scratch directories from $TMPFILES_CONFIG"
+    sudo systemd-tmpfiles --create "$TMPFILES_CONFIG"
+    log_info "Legacy scratch tmpfiles materialized on the real host; no reboot is required before controlled service bring-up."
+  fi
+else
   SCRATCH_RUN_DIR="$RESTORE_STAGING_ROOT/run/isadoraair"
   SCRATCH_TTS_DIR="$SCRATCH_RUN_DIR/tts"
   if [ "$RESTORE_MODE" != "apply" ]; then
