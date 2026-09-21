@@ -2935,6 +2935,50 @@ class RuntimeFoundationE5SystemConfigFunctionalTests(SimpleTestCase):
         self.assertIn("isadoraair.conf", result.stdout)
         self.assertIn("isadoraair-runtime.conf", result.stdout)
 
+    def test_dr04_installs_persistent_snd_aloop_module_load_contract(self):
+        """Physical-DR regression: restoring the modprobe options alone
+        does not cause snd-aloop to load after boot. Stage 90 must also
+        install the corresponding modules-load.d declaration."""
+        result = self._run("--apply")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        module_load = (
+            self.staging / "etc" / "modules-load.d" / "snd-aloop.conf"
+        )
+        options = (
+            self.staging / "etc" / "modprobe.d" / "isadoraair-aloop.conf"
+        )
+
+        self.assertTrue(module_load.is_file())
+        self.assertFalse(module_load.is_symlink())
+        self.assertEqual(
+            module_load.read_text(encoding="utf-8"),
+            "snd-aloop\n",
+        )
+        self.assertEqual(
+            stat.S_IMODE(module_load.stat().st_mode),
+            0o644,
+        )
+
+        self.assertTrue(options.is_file())
+        self.assertIn(
+            "options snd-aloop enable=1,1,1 index=0,3,4",
+            options.read_text(encoding="utf-8"),
+        )
+
+    def test_dr04_plan_previews_module_load_without_writing_it(self):
+        result = self._run("--plan")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        module_load = (
+            self.staging / "etc" / "modules-load.d" / "snd-aloop.conf"
+        )
+        self.assertFalse(module_load.exists())
+        self.assertIn(
+            "modules-load.d/snd-aloop.conf",
+            result.stdout,
+        )
+
     def test_dr02_real_host_materializes_legacy_tmpfiles_before_bringup(self):
         """Physical-DR regression: installing isadoraair.conf is not enough
         before first reboot; Stage 90 must explicitly materialize it."""
@@ -3124,6 +3168,7 @@ class RuntimeFoundationE5SystemConfigFunctionalTests(SimpleTestCase):
         candidates = [
             self.staging / "etc" / "tmpfiles.d" / "isadoraair.conf",
             self.staging / "etc" / "modprobe.d" / "isadoraair-aloop.conf",
+            self.staging / "etc" / "modules-load.d" / "snd-aloop.conf",
             self.staging / "etc" / "needrestart" / "conf.d" / "isadoraair.conf",
             self.staging / "etc" / "asound.conf",
             self.staging / "etc" / "nginx" / "snippets" / "isadoraair-locations.conf",

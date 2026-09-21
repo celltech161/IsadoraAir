@@ -225,6 +225,7 @@ for f in "$REPO_ROOT"/deploy/*.service "$REPO_ROOT"/deploy/*.timer "$REPO_ROOT"/
   dest="$ETC_ROOT/systemd/system/$(basename "$f")"
   case "$(basename "$f")" in
     isadoraair-aloop.conf) dest="$ETC_ROOT/modprobe.d/$(basename "$f")" ;;
+    snd-aloop-modules.conf) dest="$ETC_ROOT/modules-load.d/snd-aloop.conf" ;;
     isadoraair-tmpfiles.conf) dest="$ETC_ROOT/tmpfiles.d/isadoraair.conf" ;;
     needrestart-isadoraair.conf) dest="$ETC_ROOT/needrestart/conf.d/isadoraair.conf" ;;
   esac
