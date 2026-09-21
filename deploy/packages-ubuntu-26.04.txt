@@ -54,6 +54,10 @@ CORE=(
 AUDIO_GSTREAMER=(
   python3-gi
   gir1.2-gstreamer-1.0
+  gir1.2-freedesktop
+  gir1.2-gst-plugins-base-1.0
+  gir1.2-gst-plugins-extra-1.0
+  gir1.2-gst-plugins-bad-1.0
   gstreamer1.0-tools
   gstreamer1.0-alsa
   gstreamer1.0-plugins-base

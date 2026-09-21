@@ -108,6 +108,18 @@ REQUIRED_GST_DECODE_ELEMENTS = [
     "flacparse", "flacdec", "qtdemux", "avdec_aac", "mpegaudioparse",
     "id3demux", "avdec_mp3", "aiffparse", "wavparse",
 ]
+
+# DR-05: gst-inspect element availability is not sufficient evidence for
+# the Python engine. The first physical bare-metal recovery had webrtcbin
+# installed and discoverable but could not import GstSdp/GstWebRTC through
+# PyGObject until the corresponding GI typelib packages were installed.
+REQUIRED_GST_GI_NAMESPACES = (
+    "Gst",
+    "GstBase",
+    "GstSdp",
+    "GstWebRTC",
+)
+
 MIN_PYTHON = (3, 14)
 
 
@@ -170,6 +182,60 @@ def _check_one_gst_element(gst_inspect: str, elem: str) -> LegacyCheck:
     return LegacyCheck(f"  element {elem}", LEGACY_PASS, None)
 
 
+def _check_gstreamer_gi_namespaces(
+    *, gi_module=None, repository=None
+) -> list[LegacyCheck]:
+    """Verify the exact PyGObject namespaces required by the audio/WebRTC
+    runtime.
+
+    This is deliberately separate from gst-inspect element validation:
+    plugin binaries can be present while their Python introspection
+    typelibs are absent, which is exactly what the physical DR drill
+    reproduced.
+    """
+    if gi_module is None or repository is None:
+        try:
+            import gi as imported_gi
+            from gi import repository as imported_repository
+        except Exception as exc:
+            return [
+                LegacyCheck(
+                    f"  GI namespace {namespace}",
+                    LEGACY_MISSING,
+                    f"PyGObject unavailable: {exc}",
+                )
+                for namespace in REQUIRED_GST_GI_NAMESPACES
+            ]
+
+        if gi_module is None:
+            gi_module = imported_gi
+        if repository is None:
+            repository = imported_repository
+
+    results = []
+    for namespace in REQUIRED_GST_GI_NAMESPACES:
+        try:
+            gi_module.require_version(namespace, "1.0")
+            getattr(repository, namespace)
+        except Exception as exc:
+            results.append(
+                LegacyCheck(
+                    f"  GI namespace {namespace}",
+                    LEGACY_MISSING,
+                    str(exc),
+                )
+            )
+        else:
+            results.append(
+                LegacyCheck(
+                    f"  GI namespace {namespace}",
+                    LEGACY_PASS,
+                    None,
+                )
+            )
+    return results
+
+
 def _check_gstreamer() -> list[LegacyCheck]:
     gst_inspect = shutil.which("gst-inspect-1.0")
     if gst_inspect is None:
@@ -183,6 +249,7 @@ def _check_gstreamer() -> list[LegacyCheck]:
     except Exception as exc:
         ver_line = f"version check failed: {exc}"
     results = [LegacyCheck("GStreamer", LEGACY_PASS, ver_line)]
+    results.extend(_check_gstreamer_gi_namespaces())
     for elem in REQUIRED_GST_ELEMENTS + REQUIRED_GST_DECODE_ELEMENTS:
         results.append(_check_one_gst_element(gst_inspect, elem))
     return results

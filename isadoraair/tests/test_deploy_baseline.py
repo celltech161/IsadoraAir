@@ -334,6 +334,114 @@ class ManagementCommandTests(SimpleTestCase):
             self.assertNotEqual(code, 0)
 
 
+
+class GStreamerGiNamespaceBaselineTests(SimpleTestCase):
+    """DR-05: GStreamer plugin presence and PyGObject namespace presence
+    are separate runtime contracts. A recovered host must satisfy both."""
+
+    class FakeGI:
+        def __init__(self, missing=()):
+            self.missing = set(missing)
+
+        def require_version(self, namespace, version):
+            if namespace in self.missing:
+                raise ValueError(f"Namespace {namespace} not available")
+
+    @staticmethod
+    def _repository():
+        from isadoraair.deploy_baseline import REQUIRED_GST_GI_NAMESPACES
+
+        class Repository:
+            pass
+
+        repository = Repository()
+        for namespace in REQUIRED_GST_GI_NAMESPACES:
+            setattr(repository, namespace, object())
+        return repository
+
+    def test_required_namespace_contract_is_exact(self):
+        from isadoraair.deploy_baseline import REQUIRED_GST_GI_NAMESPACES
+
+        self.assertEqual(
+            REQUIRED_GST_GI_NAMESPACES,
+            ("Gst", "GstBase", "GstSdp", "GstWebRTC"),
+        )
+
+    def test_all_required_namespaces_pass(self):
+        from isadoraair.deploy_baseline import (
+            LEGACY_PASS,
+            _check_gstreamer_gi_namespaces,
+        )
+
+        checks = _check_gstreamer_gi_namespaces(
+            gi_module=self.FakeGI(),
+            repository=self._repository(),
+        )
+
+        self.assertEqual(len(checks), 4)
+        for check in checks:
+            self.assertEqual(check.state, LEGACY_PASS, check.detail)
+
+    def test_missing_webrtc_namespace_fails_closed(self):
+        from isadoraair.deploy_baseline import (
+            LEGACY_MISSING,
+            _check_gstreamer_gi_namespaces,
+        )
+
+        checks = _check_gstreamer_gi_namespaces(
+            gi_module=self.FakeGI(missing={"GstWebRTC"}),
+            repository=self._repository(),
+        )
+
+        check = next(
+            c for c in checks
+            if c.label == "  GI namespace GstWebRTC"
+        )
+        self.assertEqual(check.state, LEGACY_MISSING)
+        self.assertIn("not available", check.detail)
+
+    def test_missing_sdp_namespace_fails_closed(self):
+        from isadoraair.deploy_baseline import (
+            LEGACY_MISSING,
+            _check_gstreamer_gi_namespaces,
+        )
+
+        checks = _check_gstreamer_gi_namespaces(
+            gi_module=self.FakeGI(missing={"GstSdp"}),
+            repository=self._repository(),
+        )
+
+        check = next(
+            c for c in checks
+            if c.label == "  GI namespace GstSdp"
+        )
+        self.assertEqual(check.state, LEGACY_MISSING)
+
+    def test_authoritative_package_group_contains_gi_closure(self):
+        project_root = Path(__file__).resolve().parent.parent.parent
+        manifest = (
+            project_root / "deploy" / "packages-ubuntu-26.04.txt"
+        ).read_text(encoding="utf-8")
+
+        start = manifest.index("AUDIO_GSTREAMER=(")
+        end = manifest.index("\n)", start)
+        audio_group = manifest[start:end]
+
+        for package in (
+            "python3-gi",
+            "gir1.2-gstreamer-1.0",
+            "gir1.2-freedesktop",
+            "gir1.2-gst-plugins-base-1.0",
+            "gir1.2-gst-plugins-extra-1.0",
+            "gir1.2-gst-plugins-bad-1.0",
+        ):
+            self.assertIn(
+                f"\n  {package}",
+                audio_group,
+                f"{package} missing from AUDIO_GSTREAMER",
+            )
+
+
 class SndAloopDeferredLiveEvidenceTests(SimpleTestCase):
     """r0042, Defect B: Stage 95's canonical acceptance point is
     post-Stage-90, pre-service-activation -- BEFORE any reboot or manual

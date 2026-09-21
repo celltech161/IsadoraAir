@@ -85,7 +85,7 @@ sudo apt install python3-gi gir1.2-gstreamer-1.0 gstreamer1.0-alsa \
 
 Cross-checked against the table above:
 
-- `python3-gi`, `gir1.2-gstreamer-1.0` — required (PyGObject bindings; production also has `gir1.2-gst-plugins-base-1.0`/`-bad-1.0`/`-extra-1.0` installed, none of which engine.py's own imports require directly, but harmless/typically pulled in transitively).
+- Python GI closure — **required**: `python3-gi`, `gir1.2-gstreamer-1.0`, `gir1.2-freedesktop`, `gir1.2-gst-plugins-base-1.0`, `gir1.2-gst-plugins-extra-1.0`, and `gir1.2-gst-plugins-bad-1.0`. The first physical bare-metal DR drill proved that ordinary GStreamer plugin availability is not sufficient: the recovered Engine could see GStreamer itself but failed because `GstSdp`/`GstWebRTC` GI namespaces were absent. The deployment baseline therefore validates `Gst`, `GstBase`, `GstSdp`, and `GstWebRTC` explicitly.
 - `gstreamer1.0-alsa` — **required** (`alsasrc`/`alsasink`).
 - `gstreamer1.0-plugins-base` — **required** (majority of the element list, including `decodebin` itself).
 - `gstreamer1.0-plugins-good` — **required** (`level`, `audiodynamic`, `rglimiter`, `rtpopus{pay,depay}`, plus FLAC/MP3-tag/WAV demux/decode).
