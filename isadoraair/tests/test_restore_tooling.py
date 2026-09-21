@@ -2766,6 +2766,61 @@ class RuntimeFoundationE5SystemConfigFunctionalTests(SimpleTestCase):
         self.assertIn("isadoraair.conf", result.stdout)
         self.assertIn("isadoraair-runtime.conf", result.stdout)
 
+    def test_dr01_establishes_protected_updater_checkpoint_surface(self):
+        """Physical-DR regression: updater-bootstrapd has
+        /var/backups/isadoraair/update-checkpoints in ReadWritePaths, so
+        Stage 90 must establish it before later service bring-up."""
+        app_root = self.staging / "opt" / "isadoraair"
+        app_root.mkdir(parents=True)
+        (app_root / ".env").write_text("SECRET_KEY=test\\n", encoding="utf-8")
+
+        result = self._run("--apply")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        backup_root = self.staging / "var" / "backups" / "isadoraair"
+        checkpoints = backup_root / "update-checkpoints"
+
+        self.assertTrue(backup_root.is_dir())
+        self.assertTrue(checkpoints.is_dir())
+        self.assertFalse(backup_root.is_symlink())
+        self.assertFalse(checkpoints.is_symlink())
+
+        self.assertEqual(stat.S_IMODE(backup_root.stat().st_mode), 0o755)
+        self.assertEqual(stat.S_IMODE(checkpoints.stat().st_mode), 0o700)
+
+        # Staging mode is intentionally unprivileged; canonical real-host
+        # mode uses install -o root -g root and is covered structurally below.
+        self.assertEqual(backup_root.stat().st_uid, os.getuid())
+        self.assertEqual(backup_root.stat().st_gid, os.getgid())
+        self.assertEqual(checkpoints.stat().st_uid, os.getuid())
+        self.assertEqual(checkpoints.stat().st_gid, os.getgid())
+
+    def test_dr01_plan_previews_checkpoint_surface_without_creating_it(self):
+        result = self._run("--plan")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        checkpoints = (
+            self.staging / "var" / "backups" /
+            "isadoraair" / "update-checkpoints"
+        )
+        self.assertFalse(checkpoints.exists())
+        self.assertIn("update-checkpoints", result.stdout)
+
+    def test_dr01_canonical_contract_requires_root_owned_install(self):
+        """Static half of the real-host privilege contract; the staging
+        functional test above proves the actual filesystem behavior."""
+        source = (RESTORE_DIR / "90-system-config.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            'sudo install -d -o root -g root -m 0755 "$UPDATER_BACKUP_ROOT"',
+            source,
+        )
+        self.assertIn(
+            'sudo install -d -o root -g root -m 0700 "$UPDATER_CHECKPOINT_DIR"',
+            source,
+        )
+
     def test_apply_without_venv_falls_back_to_minimal_runtime_tmpfiles_install(self):
         app_root = self.staging / "opt" / "isadoraair"
         app_root.mkdir(parents=True)

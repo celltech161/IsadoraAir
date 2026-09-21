@@ -234,6 +234,54 @@ for f in "$REPO_ROOT"/deploy/*.service "$REPO_ROOT"/deploy/*.timer "$REPO_ROOT"/
 done
 log_info "Rendered $UNIT_COUNT unit/timer/conf file(s)."
 
+# ---- DR-01. Protected-updater checkpoint surface -------------------------
+# updater-bootstrapd.service and the legacy updater unit both declare
+# /var/backups/isadoraair/update-checkpoints in ReadWritePaths. systemd's
+# mount namespace setup fails with status=226/NAMESPACE if that path does
+# not exist before service start. The first physical bare-metal DR drill
+# reproduced exactly that failure.
+#
+# Stage 90 owns installation of those units, so it also owns establishing
+# their required persistent checkpoint surface. This is NOT service
+# activation: nothing is started/enabled/reloaded here.
+#
+# Canonical host:
+#   /var/backups/isadoraair                    root:root 0755
+#   /var/backups/isadoraair/update-checkpoints root:root 0700
+#
+# Staging-root runs establish the same path/modes below the staging tree,
+# using the current unprivileged identity while retaining the confined-
+# path/symlink protections used elsewhere by Stage 90.
+if [ -n "$RESTORE_STAGING_ROOT" ]; then
+  UPDATER_BACKUP_ROOT="$RESTORE_STAGING_ROOT/var/backups/isadoraair"
+  UPDATER_CHECKPOINT_DIR="$UPDATER_BACKUP_ROOT/update-checkpoints"
+else
+  UPDATER_BACKUP_ROOT="/var/backups/isadoraair"
+  UPDATER_CHECKPOINT_DIR="$UPDATER_BACKUP_ROOT/update-checkpoints"
+fi
+
+if [ "$RESTORE_MODE" != "apply" ]; then
+  if [ "$USE_SUDO" -eq 1 ]; then
+    log_plan "sudo install -d -o root -g root -m 0755 $UPDATER_BACKUP_ROOT"
+    log_plan "sudo install -d -o root -g root -m 0700 $UPDATER_CHECKPOINT_DIR"
+  else
+    log_plan "establish $UPDATER_BACKUP_ROOT (0755) and $UPDATER_CHECKPOINT_DIR (0700) beneath staging root"
+  fi
+else
+  if [ "$USE_SUDO" -eq 1 ]; then
+    log_apply "establish protected-updater checkpoint directories"
+    sudo install -d -o root -g root -m 0755 "$UPDATER_BACKUP_ROOT"
+    sudo install -d -o root -g root -m 0700 "$UPDATER_CHECKPOINT_DIR"
+  else
+    STAGING_UID="$(id -u)"
+    STAGING_GID="$(id -g)"
+    log_apply "establish staged protected-updater checkpoint directories"
+    ensure_confined_directory       "$RESTORE_STAGING_ROOT" "$UPDATER_BACKUP_ROOT"       0755 "$STAGING_UID" "$STAGING_GID"
+    ensure_confined_directory       "$RESTORE_STAGING_ROOT" "$UPDATER_CHECKPOINT_DIR"       0700 "$STAGING_UID" "$STAGING_GID"
+  fi
+  log_info "Protected-updater checkpoint surface established: $UPDATER_CHECKPOINT_DIR"
+fi
+
 # ---- 2. asound.conf (not tokenized -- installed as-is) --------------------
 install_rendered "$REPO_ROOT/deploy/asound.conf" "$ETC_ROOT/asound.conf"
 
