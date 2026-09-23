@@ -38,23 +38,22 @@ audio. The three `snd-aloop` instances are *not* at risk of this
 (pinned by `index=` in `/etc/modprobe.d/isadoraair-aloop.conf`) — only
 the two real hardware devices are.
 
-Not fixed in this pass (Phase 3's stated goal is understanding today's
-routing, not redesigning device discovery) — feeds directly into
-roadmap item 1.3 (USB recovery). The durable fix, when that item is
-scoped, is almost certainly ALSA's own persistent card-naming
-mechanism (`udev` rules keyed on the codec's stable identity, or
-`/etc/asound.conf`'s `pcm.!default`/`ctl.!default` blocks switching from
-`card 2` to a name-based `hw:PCH` reference — HDA Intel PCH's
-short-name `PCH` is itself derived from a stable PCI-slot/subsystem
-match, not enumeration order, so this could be a small, low-risk fix
-when that roadmap item is actually scoped — noted here, not applied
-now).
+The original Phase 3 inventory predated IsadoraAir's later stable
+ALSA-identity recovery work. The application now supports ALSA short-card
+identities such as `PCH` independently of numeric card order. During the
+physical-DR remediation, the separate repo-managed `/etc/asound.conf`
+global `pcm.!default` / `ctl.!default` override was also removed rather
+than rebound to one particular physical codec: no IsadoraAir application
+consumer relies on ALSA `default`, and restoring a source-station physical
+default onto materially different replacement hardware is unsafe. The
+portable `airtap` alias remains because it targets the intentionally pinned
+`Loopback_1` topology.
 
 ## Configuration file inventory
 
 | File | Role |
 |---|---|
-| `/etc/asound.conf` (repo: `deploy/asound.conf`, byte-identical, confirmed via `diff`) | `pcm.!default`/`ctl.!default` → card 2; `airtap`/`airtap_ds` dsnoop alias definitions with the full period/buffer-size tuning rationale in its own comments |
+| `/etc/asound.conf` (repo: `deploy/asound.conf`) | IsadoraAir-specific logical aliases only: `airtap`/`airtap_ds` dsnoop definitions with the full period/buffer-size tuning rationale. No physical `pcm.!default`/`ctl.!default` override is restored. |
 | `/etc/modprobe.d/isadoraair-aloop.conf` (repo: `deploy/isadoraair-aloop.conf`, **added this Phase 3 pass** — previously host-only, a real DR gap) | Pins `snd-aloop` to three instances at indices 0/3/4 |
 | `/etc/modules-load.d/snd-aloop.conf` (single line `snd-aloop`, not repo-managed -- trivial enough that a one-line `README.md` command is the whole "install," no file worth versioning) | Loads the module at boot |
 | `hardware.AudioOutput`/`hardware.AudioInput` DB rows (station-specific, not in any repo) | Maps the human-facing device names (`Studio Monitor`, `Studio Microphone 1`, `Stereotool Input`) to ALSA device strings; read by `library/services/engine.py`'s `_resolve_studio_monitor_device`/`_resolve_mic_device`/`_resolve_stereotool_device` |

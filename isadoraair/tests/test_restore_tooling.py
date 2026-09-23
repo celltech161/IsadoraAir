@@ -2935,6 +2935,33 @@ class RuntimeFoundationE5SystemConfigFunctionalTests(SimpleTestCase):
         self.assertIn("isadoraair.conf", result.stdout)
         self.assertIn("isadoraair-runtime.conf", result.stdout)
 
+    def test_hw03_asound_has_no_source_host_physical_default(self):
+        """Physical DR must not restore the source machine's global ALSA
+        default card. Application audio bindings are station DB state and
+        airtap is the only repo-owned ALSA alias needed here."""
+        result = self._run("--apply")
+        self.assertEqual(
+            result.returncode,
+            0,
+            result.stdout + result.stderr,
+        )
+
+        restored = self.staging / "etc" / "asound.conf"
+        self.assertTrue(restored.is_file())
+
+        text = restored.read_text(encoding="utf-8")
+
+        self.assertNotIn("pcm.!default", text)
+        self.assertNotIn("ctl.!default", text)
+        self.assertNotIn("card 2", text)
+
+        self.assertIn("pcm.airtap {", text)
+        self.assertIn("pcm.airtap_ds {", text)
+        self.assertIn(
+            'pcm "hw:Loopback_1,1,0"',
+            text,
+        )
+
     def test_dr04_installs_persistent_snd_aloop_module_load_contract(self):
         """Physical-DR regression: restoring the modprobe options alone
         does not cause snd-aloop to load after boot. Stage 90 must also
