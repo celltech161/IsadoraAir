@@ -142,6 +142,8 @@ Drop-in configs (installed as-is, no per-install variation apart from the ones a
 | `isadoraair-aloop.conf` | `/etc/modprobe.d/isadoraair-aloop.conf` — pins `snd-aloop` to three loopback cards at fixed indices 0/3/4, which `asound.conf`'s `airtap`/`airtap_ds` aliases (and StereoTool's configured device) depend on by exact card number. Also requires `/etc/modules-load.d/snd-aloop.conf` containing the single line `snd-aloop` (`echo snd-aloop \| sudo tee /etc/modules-load.d/snd-aloop.conf`) so the module loads at boot at all -- see the main `README.md`'s "ALSA loopback module" step and this file's own header comment for the full reasoning. |
 | `stereotool.service.example` | Generic/manual fallback for `/etc/systemd/system/stereotool.service` when no archived live supervision unit exists. Normal backup recovery is archive-conditioned: if `etc-live/stereotool.service` is present, Stage 90 restores that station-specific unit verbatim as disabled/inactive configuration and syntax-checks it; it never enables or starts it. |
 
+New DR-10 backups also carry `stereotool/provenance.json`: non-secret identity metadata for the external proprietary processor (binary path/size/SHA-256/version, service/profile hashes, and `.stereo_tool.rc` presence/size/hash only). The binary and plaintext runtime state are deliberately not bundled.
+
 ### One authoritative nginx config
 
 `sites-enabled/isadoraair` must be a **symlink** to `sites-available/isadoraair`,

@@ -230,6 +230,33 @@ check_optional_dir "StereoTool profile (.sts)"     'stereotool/.*\.sts$'
 check_optional_dir "Station content (srv-content)" 'srv-content/'
 check_optional_dir "Reports"                       'reports/'
 
+
+# ---- DR-10. Stereo Tool external-runtime provenance -----------------
+# Backward compatibility: old archives legitimately lack this record and
+# remain valid with a WARN. Once provenance.json exists, however, its hashes
+# and bundled/not-bundled claims are an integrity contract and fail closed.
+if has_entry 'stereotool/provenance\.json$'; then
+  if command -v python3 >/dev/null 2>&1; then
+    STEREOTOOL_PROVENANCE_VERIFY_OUTPUT=""
+    STEREOTOOL_PROVENANCE_VERIFY_EXIT=0
+    STEREOTOOL_PROVENANCE_VERIFY_OUTPUT=$(
+      python3 "$SCRIPT_DIR/stereotool_provenance.py" \
+        verify-archive --archive "$ARCHIVE" 2>&1
+    ) || STEREOTOOL_PROVENANCE_VERIFY_EXIT=$?
+
+    if [ "$STEREOTOOL_PROVENANCE_VERIFY_EXIT" -eq 0 ]; then
+      pass "StereoTool provenance" "$STEREOTOOL_PROVENANCE_VERIFY_OUTPUT"
+    else
+      fail "StereoTool provenance" "$STEREOTOOL_PROVENANCE_VERIFY_OUTPUT"
+    fi
+  else
+    fail "StereoTool provenance" "provenance exists but python3 is unavailable for validation"
+  fi
+else
+  warn "StereoTool provenance" "archive predates DR-10 provenance metadata -- not applicable, not a failure"
+fi
+
+
 # ---- 8. Plaintext credential leak check (REQUIRED, every archive, every
 #         format -- old backups never had these at all, so this can never
 #         legitimately fire on a pre-encryption-feature archive either).
@@ -243,6 +270,22 @@ if [ -n "$PLAINTEXT_CRED_HITS" ]; then
   fail "Plaintext credential check" "FOUND plaintext credential file(s) in archive -- this must never happen: $(printf '%s' "$PLAINTEXT_CRED_HITS" | tr '\n' ' ')"
 else
   pass "Plaintext credential check" "no plaintext .iasboxbu.cred/.syndicated_ingest.cred/.ogremote_ingest.cred found anywhere in archive"
+fi
+
+
+# DR-10 security boundary: .stereo_tool.rc contains live processor state and
+# may contain registration/license material. DR-10 records only its
+# presence/size/SHA-256. Plaintext inclusion is never permitted; encrypted
+# preservation belongs to DR-11/DR-12.
+PLAINTEXT_STEREOTOOL_STATE_HITS=$(
+  printf '%s\n' "$LISTING" \
+    | grep -E '(^|/)\.stereo_tool\.rc$' \
+    || true
+)
+if [ -n "$PLAINTEXT_STEREOTOOL_STATE_HITS" ]; then
+  fail "StereoTool plaintext state" "FOUND plaintext .stereo_tool.rc in archive -- this must never happen"
+else
+  pass "StereoTool plaintext state" "no plaintext .stereo_tool.rc found anywhere in archive"
 fi
 
 # ---- 9. Encrypted recovery-credential preservation (2026-08-18,

@@ -5613,3 +5613,324 @@ class DisasterRecoveryStereoToolServiceRestoreTests(SimpleTestCase):
         self.assertIn("enabled or started", runbook)
         self.assertIn("archive-conditioned", deploy_readme)
         self.assertIn("disabled/inactive configuration", deploy_readme)
+
+
+
+class DisasterRecoveryStereoToolProvenanceTests(SimpleTestCase):
+    """DR-10: external processor identity without bundling proprietary/secret state."""
+
+    def setUp(self):
+        self.tmpdir = Path(
+            tempfile.mkdtemp(prefix="isadoraair-stereotool-prov-")
+        )
+        self.addCleanup(shutil.rmtree, self.tmpdir, ignore_errors=True)
+
+        self.helper = RESTORE_DIR / "stereotool_provenance.py"
+
+        self.source_root = self.tmpdir / "source-stereotool"
+        self.source_root.mkdir()
+
+        self.binary = self.source_root / "custom_stereo_binary"
+        self.binary.write_bytes(
+            b"\x7fELF synthetic test fixture\n"
+            b"Thimeo Stereo Tool 11.05 (for Linux) "
+            b"(C) Thimeo Audio Technology\n"
+            + b"\x00" * 256
+        )
+        self.binary.chmod(0o755)
+
+        self.service = self.tmpdir / "stereotool.service"
+        self.service.write_text(
+            "[Unit]\n"
+            "Description=StereoTool test\n"
+            "[Service]\n"
+            f"ExecStart={self.binary} -p 9099 -w 10.0/8\n"
+            "LimitRTPRIO=95\n"
+            "CPUSchedulingPolicy=fifo\n"
+            "CPUSchedulingPriority=80\n",
+            encoding="utf-8",
+        )
+
+        self.profile_dir = self.tmpdir / "archive-profile-dir"
+        self.profile_dir.mkdir()
+
+        self.profile = self.profile_dir / "Station Processing.sts"
+        self.profile.write_bytes(b"synthetic-stereo-profile\n")
+
+        self.runtime_state = self.tmpdir / ".stereo_tool.rc"
+        self.runtime_secret = "DO-NOT-LEAK-REGISTRATION-TEST-VALUE"
+        self.runtime_state.write_text(
+            "normal_setting=1\n"
+            f"registration_key={self.runtime_secret}\n",
+            encoding="utf-8",
+        )
+
+        self.provenance = self.profile_dir / "provenance.json"
+
+        self.collect_result = self._collect(
+            binary=self.binary,
+            service=self.service,
+            output=self.provenance,
+        )
+
+        self.assertEqual(
+            self.collect_result.returncode,
+            0,
+            self.collect_result.stdout + self.collect_result.stderr,
+        )
+
+    def _collect(self, *, binary, service, output):
+        return subprocess.run(
+            [
+                sys.executable,
+                str(self.helper),
+                "collect",
+                "--service-unit-file",
+                str(service),
+                "--service-unit-source-path",
+                "/etc/systemd/system/stereotool.service",
+                "--profile-dir",
+                str(self.profile_dir),
+                "--profile-source-root",
+                "/source/station/stereotool",
+                "--runtime-state",
+                str(self.runtime_state),
+                "--fallback-binary",
+                str(binary),
+                "--output",
+                str(output),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+    def _build_archive(
+        self,
+        name,
+        *,
+        tamper_service=False,
+        tamper_profile=False,
+        include_plaintext_runtime=False,
+    ):
+        root = self.tmpdir / name
+        (root / "stereotool").mkdir(parents=True)
+        (root / "etc-live").mkdir(parents=True)
+
+        shutil.copy2(
+            self.provenance,
+            root / "stereotool" / "provenance.json",
+        )
+        shutil.copy2(
+            self.profile,
+            root / "stereotool" / self.profile.name,
+        )
+        shutil.copy2(
+            self.service,
+            root / "etc-live" / "stereotool.service",
+        )
+
+        if tamper_service:
+            target = root / "etc-live" / "stereotool.service"
+            data = bytearray(target.read_bytes())
+            if not data:
+                raise AssertionError("service tamper fixture unexpectedly empty")
+            data[len(data) // 2] ^= 0x01
+            target.write_bytes(bytes(data))
+
+        if tamper_profile:
+            target = root / "stereotool" / self.profile.name
+            data = bytearray(target.read_bytes())
+            if not data:
+                raise AssertionError("profile tamper fixture unexpectedly empty")
+            data[len(data) // 2] ^= 0x01
+            target.write_bytes(bytes(data))
+
+        if include_plaintext_runtime:
+            shutil.copy2(
+                self.runtime_state,
+                root / ".stereo_tool.rc",
+            )
+
+        archive = self.tmpdir / f"{name}.tar.gz"
+        with tarfile.open(archive, "w:gz") as tf:
+            tf.add(root, arcname=".")
+        return archive
+
+    def _verify(self, archive):
+        return subprocess.run(
+            [
+                sys.executable,
+                str(self.helper),
+                "verify-archive",
+                "--archive",
+                str(archive),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+    def test_collection_records_identity_without_secret_contents(self):
+        document_text = self.provenance.read_text(encoding="utf-8")
+        document = json.loads(document_text)
+
+        self.assertEqual(document["schema_version"], 1)
+        self.assertEqual(document["product"], "Thimeo Stereo Tool")
+        self.assertEqual(
+            document["classification"],
+            "external_proprietary",
+        )
+        self.assertFalse(document["binary_bundled"])
+
+        binary = document["binary"]
+        self.assertTrue(binary["present"])
+        self.assertEqual(
+            binary["configured_path"],
+            str(self.binary),
+        )
+        self.assertEqual(
+            binary["path_source"],
+            "service_execstart",
+        )
+        self.assertEqual(binary["reported_version"], "11.05")
+        self.assertEqual(
+            binary["reported_version_source"],
+            "embedded_product_string",
+        )
+        self.assertFalse(binary["bundled"])
+        self.assertEqual(
+            binary["sha256"],
+            hashlib.sha256(self.binary.read_bytes()).hexdigest(),
+        )
+
+        service = document["service_unit"]
+        self.assertTrue(service["present"])
+        self.assertTrue(service["bundled"])
+        self.assertEqual(
+            service["archive_path"],
+            "etc-live/stereotool.service",
+        )
+
+        self.assertEqual(len(document["profiles"]), 1)
+        self.assertEqual(
+            document["profiles"][0]["archive_path"],
+            "stereotool/Station Processing.sts",
+        )
+
+        runtime = document["runtime_state"]
+        self.assertTrue(runtime["present"])
+        self.assertFalse(runtime["bundled"])
+        self.assertTrue(runtime["secret_bearing"])
+        self.assertFalse(runtime["contents_recorded"])
+        self.assertNotIn(self.runtime_secret, document_text)
+
+    def test_future_version_is_discovered_generically(self):
+        future_binary = self.source_root / "future_stereo_binary"
+        future_binary.write_bytes(
+            b"\x7fELF future fixture\n"
+            b"Thimeo Stereo Tool 12.34 (for Linux) "
+            b"(C) Thimeo Audio Technology\n"
+            + b"\x00" * 128
+        )
+        future_binary.chmod(0o755)
+
+        future_service = self.tmpdir / "future-stereotool.service"
+        future_service.write_text(
+            "[Service]\n"
+            f"ExecStart={future_binary} -p 8085\n",
+            encoding="utf-8",
+        )
+
+        output = self.tmpdir / "future-provenance.json"
+        result = self._collect(
+            binary=future_binary,
+            service=future_service,
+            output=output,
+        )
+
+        self.assertEqual(
+            result.returncode,
+            0,
+            result.stdout + result.stderr,
+        )
+
+        document = json.loads(output.read_text(encoding="utf-8"))
+        self.assertEqual(
+            document["binary"]["reported_version"],
+            "12.34",
+        )
+        self.assertEqual(
+            document["binary"]["reported_version_source"],
+            "embedded_product_string",
+        )
+
+    def test_intact_archive_provenance_verifies(self):
+        archive = self._build_archive("intact")
+        result = self._verify(archive)
+
+        self.assertEqual(
+            result.returncode,
+            0,
+            result.stdout + result.stderr,
+        )
+        summary = json.loads(result.stdout)
+        self.assertTrue(summary["verified"])
+        self.assertEqual(summary["reported_version"], "11.05")
+        self.assertEqual(summary["profiles"], 1)
+
+    def test_service_tamper_is_rejected(self):
+        archive = self._build_archive(
+            "service-tamper",
+            tamper_service=True,
+        )
+        result = self._verify(archive)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "service_unit SHA-256 mismatch",
+            result.stderr,
+        )
+
+    def test_profile_tamper_is_rejected(self):
+        archive = self._build_archive(
+            "profile-tamper",
+            tamper_profile=True,
+        )
+        result = self._verify(archive)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("SHA-256 mismatch", result.stderr)
+
+    def test_plaintext_runtime_state_is_rejected(self):
+        archive = self._build_archive(
+            "plaintext-runtime",
+            include_plaintext_runtime=True,
+        )
+        result = self._verify(archive)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "plaintext .stereo_tool.rc is present",
+            result.stderr,
+        )
+
+    def test_backup_inspector_and_docs_are_wired_to_provenance_contract(self):
+        backup = (
+            REPO_ROOT / "deploy" / "backup_isadoraair.sh"
+        ).read_text(encoding="utf-8")
+        inspector = (
+            RESTORE_DIR / "inspect_backup.sh"
+        ).read_text(encoding="utf-8")
+        runbook = (
+            REPO_ROOT / "docs" / "DISASTER_RECOVERY_RESTORE.md"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("stereotool_provenance.py", backup)
+        self.assertIn("stereotool/provenance.json", backup)
+        self.assertIn("verify-archive --archive", inspector)
+        self.assertIn(".stereo_tool\\.rc", inspector)
+        self.assertIn("binary_bundled=false", runbook)
+        self.assertIn("runtime_state.bundled=false", runbook)
+        self.assertIn("without executing the", runbook)
+        self.assertIn("future versions", runbook)

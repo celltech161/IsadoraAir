@@ -240,7 +240,11 @@ ASSURANCE_MODULE="$SCRIPT_DIR/../isadoraair/backup_assurance.py"
 # ARCHIVE class/format at all -- deploy/restore/inspect_backup.sh keeps
 # reading a pre-3.2.0 archive exactly as before (the new manifest lines
 # are simply absent, treated as WARN/not-applicable, never FAIL).
-SCRIPT_VERSION="3.2.0"
+# 3.3.0 (DR-10): adds non-secret Stereo Tool external-runtime provenance.
+# This is additive archive metadata only; it does NOT bundle the proprietary
+# processor binary or plaintext runtime state and does not change the Runtime
+# Foundation recovery archive class/format.
+SCRIPT_VERSION="3.3.0"
 
 # See the DRY_RUN note in the header comment above.
 DRY_RUN="${DRY_RUN:-0}"
@@ -257,6 +261,7 @@ CONFIG_FILE="$HOME/.iasboxbu.cred"
 # plain shell default instead.
 PROJECT_DIR="${PROJECT_DIR:-/opt/isadoraair}"
 STEREOTOOL_DIR="${STEREOTOOL_DIR:-$HOME/stereotool}"
+STEREOTOOL_RC="${STEREOTOOL_RC:-$HOME/.stereo_tool.rc}"
 # Runtime Foundation E7B -- see the 2026-08-29/2026-09-08 header notes
 # above and docs/RUNTIME_BACKUP_PAYLOAD.md. RECOVERY_PAYLOAD_ROOT is
 # WHERE to look for the station's current, already-prepared-and-activated
@@ -681,6 +686,17 @@ if [ -d "$STEREOTOOL_DIR" ]; then
 fi
 echo "  ${STS_COUNT} .sts profile(s)"
 
+echo "Recording non-secret StereoTool external-runtime provenance..."
+python3 "$SCRIPT_DIR/restore/stereotool_provenance.py" collect \
+  --service-unit-file "$WORKDIR/etc-live/stereotool.service" \
+  --service-unit-source-path "/etc/systemd/system/stereotool.service" \
+  --profile-dir "$WORKDIR/stereotool" \
+  --profile-source-root "$STEREOTOOL_DIR" \
+  --runtime-state "$STEREOTOOL_RC" \
+  --fallback-binary "$STEREOTOOL_DIR/stereo_tool_gui_64" \
+  --output "$WORKDIR/stereotool/provenance.json"
+echo "  provenance: stereotool/provenance.json"
+
 CURRENT_STAGE="srv_content"
 echo "Copying small operator-created station content (FX carts, voicetracks)..."
 mkdir -p "$WORKDIR/srv-content"
@@ -937,6 +953,7 @@ Contents of this archive:
   etc-live/isadoraair-*.service          live systemd units, 5 core services
   etc-live/stereotool.service            live StereoTool supervision unit (if present)
   stereotool/*.sts                       StereoTool processing profile(s) (${STS_COUNT} found)
+  stereotool/provenance.json            non-secret external runtime identity; binary/runtime state are NOT bundled
   srv-content/carts/                     FX Cart audio (operator-uploaded)
   srv-content/voicetracks/               recorded voicetrack audio (operator-created)
   reports/                               SoundExchange/royalty report filings (if present)

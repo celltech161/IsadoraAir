@@ -869,6 +869,26 @@ audio content itself is present.
 
 ## StereoTool
 
+DR-10 adds `stereotool/provenance.json` to new backups. This is a
+machine-readable **identity record**, not a copy of the proprietary runtime.
+It records the configured binary path, binary size/SHA-256, a safely extracted
+embedded product version when available, the archived service-unit hash, every
+archived `.sts` profile hash, and `.stereo_tool.rc` presence/size/SHA-256 only.
+The record explicitly says `binary_bundled=false` and
+`runtime_state.bundled=false`; `.stereo_tool.rc` contents are never read into
+the JSON and plaintext `.stereo_tool.rc` in an archive is an inspection
+failure. Old pre-DR-10 archives remain valid with a provenance warning.
+
+The binary SHA-256 is the authoritative runtime identity. `reported_version`
+is descriptive evidence extracted generically from the binary's own embedded
+`Thimeo Stereo Tool <version> (for Linux)` string **without executing the
+binary**. The matcher is not tied to 11.05; future versions using the same
+embedded product-string form are recorded automatically. If a future vendor
+build changes that string format, `reported_version` may be null while the
+binary SHA-256 still provides exact identity. Actual preservation of
+secret-bearing live runtime state remains DR-11/DR-12 and must use encryption
+rather than plaintext backup inclusion.
+
 The binary and license are **never** part of this repo or the backup —
 proprietary. **The binary itself is still a real manual step** (obtain
 from the vendor, install at the expected path) — but **the license is
