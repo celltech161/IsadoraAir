@@ -3243,6 +3243,11 @@ class Stage90NginxExitCodeGatingTests(SimpleTestCase):
         self.addCleanup(shutil.rmtree, self.tmpdir, ignore_errors=True)
         self.fake_etc = self.tmpdir / "fake-etc"
         self.fake_etc.mkdir()
+        # DR-01 added a second privileged Stage-90 surface outside /etc.
+        # Redirect it into this fixture's private tree as well.
+        self.fake_var_backups_isadoraair = (
+            self.tmpdir / "fake-var-backups-isadoraair"
+        )
         self.target_root = self.tmpdir / "opt" / "isadoraair"
         self.fakebin = self.tmpdir / "fakebin"
         self.fakebin.mkdir()
@@ -3257,7 +3262,9 @@ for a in "$@"; do
   case "$a" in
     -o|-g) skip_next=1; continue ;;
   esac
-  args+=("${{a//\\/etc/{self.fake_etc}}}")
+  rewritten="${{a//\\/etc/{self.fake_etc}}}"
+  rewritten="${{rewritten//\\/var\\/backups\\/isadoraair/{self.fake_var_backups_isadoraair}}}"
+  args+=("$rewritten")
 done
 exec "${{args[@]}}"
 """,
@@ -3302,7 +3309,6 @@ exec "${{args[@]}}"
         result = self._run()
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("90-system-config: PASS", result.stdout)
-
 
 class Stage80CompanionProvisioningExitCodeTests(SimpleTestCase):
     """r0042: a requested companion repository that could not actually be
@@ -5390,3 +5396,220 @@ class DisasterRecoveryNginxGenericHostContractTests(SimpleTestCase):
             "no source-host hostname or private IP",
             self.dr_doc,
         )
+
+class DisasterRecoveryStereoToolServiceRestoreTests(SimpleTestCase):
+    """DR-09: restore archived StereoTool supervision without activating it."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+
+        cls.tmpdir = Path(
+            tempfile.mkdtemp(prefix="isadoraair-dr09-stereotool-")
+        )
+        cls.addClassCleanup(shutil.rmtree, cls.tmpdir, ignore_errors=True)
+
+        cls.archived_unit = (
+            "[Unit]\n"
+            "Description=DR-09 archived StereoTool sentinel\n"
+            "After=sound.target\n"
+            "Wants=sound.target\n"
+            "\n"
+            "[Service]\n"
+            "Type=simple\n"
+            "User=source-station-user\n"
+            "Group=audio\n"
+            "SupplementaryGroups=audio\n"
+            "WorkingDirectory=/source/station/stereotool\n"
+            "ExecStart=/source/station/stereotool/custom_stereo_binary "
+            "-p 9099 -w 10.0/8\n"
+            "Restart=on-failure\n"
+            "RestartSec=2\n"
+            "LimitRTPRIO=95\n"
+            "LimitMEMLOCK=infinity\n"
+            "CapabilityBoundingSet=CAP_SYS_NICE\n"
+            "AmbientCapabilities=CAP_SYS_NICE\n"
+            "CPUSchedulingPolicy=fifo\n"
+            "CPUSchedulingPriority=80\n"
+            "IOSchedulingClass=realtime\n"
+            "IOSchedulingPriority=2\n"
+            "\n"
+            "[Install]\n"
+            "WantedBy=multi-user.target\n"
+        )
+
+        with_unit_root = cls.tmpdir / "archive-with-unit"
+        (with_unit_root / "etc-live").mkdir(parents=True)
+        (with_unit_root / "etc-live" / "stereotool.service").write_text(
+            cls.archived_unit,
+            encoding="utf-8",
+        )
+        cls.archive_with_unit = cls.tmpdir / "with-unit.tar.gz"
+        with tarfile.open(cls.archive_with_unit, "w:gz") as tf:
+            tf.add(with_unit_root, arcname=".")
+
+        no_unit_root = cls.tmpdir / "archive-without-unit"
+        no_unit_root.mkdir()
+        (no_unit_root / "MANIFEST.txt").write_text(
+            "DR-09 no StereoTool unit fixture\n",
+            encoding="utf-8",
+        )
+        cls.archive_without_unit = cls.tmpdir / "without-unit.tar.gz"
+        with tarfile.open(cls.archive_without_unit, "w:gz") as tf:
+            tf.add(no_unit_root, arcname=".")
+
+        cls.staging_with_unit = cls.tmpdir / "staging-with-unit"
+        cls.with_unit_result = subprocess.run(
+            [
+                str(RESTORE_DIR / "90-system-config.sh"),
+                "--archive",
+                str(cls.archive_with_unit),
+                "--staging-root",
+                str(cls.staging_with_unit),
+                "--apply",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+
+        cls.staging_without_unit = cls.tmpdir / "staging-without-unit"
+        cls.without_unit_result = subprocess.run(
+            [
+                str(RESTORE_DIR / "90-system-config.sh"),
+                "--archive",
+                str(cls.archive_without_unit),
+                "--staging-root",
+                str(cls.staging_without_unit),
+                "--apply",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+
+        cls.plan_staging = cls.tmpdir / "staging-plan"
+        cls.plan_result = subprocess.run(
+            [
+                str(RESTORE_DIR / "90-system-config.sh"),
+                "--archive",
+                str(cls.archive_with_unit),
+                "--staging-root",
+                str(cls.plan_staging),
+                "--plan",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+
+    def test_archive_unit_is_restored_byte_for_byte_with_safe_mode(self):
+        result = self.with_unit_result
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        restored = (
+            self.staging_with_unit
+            / "etc/systemd/system/stereotool.service"
+        )
+        self.assertTrue(restored.is_file())
+        self.assertEqual(
+            restored.read_text(encoding="utf-8"),
+            self.archived_unit,
+        )
+        self.assertEqual(stat.S_IMODE(restored.stat().st_mode), 0o644)
+        self.assertIn(
+            "StereoTool supervision restored from archive evidence",
+            result.stdout,
+        )
+
+    def test_restore_preserves_station_specific_binary_and_realtime_contract(self):
+        restored = (
+            self.staging_with_unit
+            / "etc/systemd/system/stereotool.service"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn(
+            "ExecStart=/source/station/stereotool/custom_stereo_binary "
+            "-p 9099 -w 10.0/8",
+            restored,
+        )
+        self.assertIn("LimitRTPRIO=95", restored)
+        self.assertIn("CPUSchedulingPolicy=fifo", restored)
+        self.assertIn("CPUSchedulingPriority=80", restored)
+
+    def test_stage90_never_activates_the_restored_stereotool_unit(self):
+        result = self.with_unit_result
+        combined = result.stdout + result.stderr
+
+        wants_link = (
+            self.staging_with_unit
+            / "etc/systemd/system/multi-user.target.wants/stereotool.service"
+        )
+        self.assertFalse(wants_link.exists() or wants_link.is_symlink())
+        self.assertIn("deliberately UNACTIVATED", combined)
+
+        stage90 = (RESTORE_DIR / "90-system-config.sh").read_text(
+            encoding="utf-8"
+        )
+        start = stage90.index("# ---- DR-09.")
+        end = stage90.index("# ---- DR-01.", start)
+        dr09_block = stage90[start:end]
+        executable_lines = []
+        for line in dr09_block.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            executable_lines.append(stripped)
+
+        executable_source = "\n".join(executable_lines)
+
+        for forbidden in (
+            "systemctl enable",
+            "systemctl start",
+            "systemctl restart",
+            "systemctl reload",
+            "enable --now",
+        ):
+            self.assertNotIn(forbidden, executable_source)
+
+    def test_archive_without_unit_does_not_invent_one(self):
+        result = self.without_unit_result
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        restored = (
+            self.staging_without_unit
+            / "etc/systemd/system/stereotool.service"
+        )
+        self.assertFalse(restored.exists() or restored.is_symlink())
+        self.assertIn(
+            "no etc-live/stereotool.service",
+            result.stdout,
+        )
+
+    def test_plan_reports_restore_but_does_not_mutate(self):
+        result = self.plan_result
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        restored = (
+            self.plan_staging
+            / "etc/systemd/system/stereotool.service"
+        )
+        self.assertFalse(restored.exists() or restored.is_symlink())
+        self.assertIn(
+            "do NOT enable/start/reload",
+            result.stdout,
+        )
+
+    def test_operator_docs_match_archive_conditioned_restore_contract(self):
+        runbook = (
+            REPO_ROOT / "docs" / "DISASTER_RECOVERY_RESTORE.md"
+        ).read_text(encoding="utf-8")
+        deploy_readme = (
+            REPO_ROOT / "deploy" / "README.md"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("etc-live/stereotool.service", runbook)
+        self.assertIn("NEVER", runbook)
+        self.assertIn("enabled or started", runbook)
+        self.assertIn("archive-conditioned", deploy_readme)
+        self.assertIn("disabled/inactive configuration", deploy_readme)

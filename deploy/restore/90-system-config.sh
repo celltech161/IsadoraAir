@@ -235,6 +235,76 @@ for f in "$REPO_ROOT"/deploy/*.service "$REPO_ROOT"/deploy/*.timer "$REPO_ROOT"/
 done
 log_info "Rendered $UNIT_COUNT unit/timer/conf file(s)."
 
+# ---- DR-09. Archived external-processor supervision unit ------------------
+# StereoTool itself is proprietary and is never bundled by IsadoraAir, but
+# backup_isadoraair.sh deliberately captures the station's LIVE supervision
+# unit as etc-live/stereotool.service when one exists. That archived unit is
+# the only recovery artifact that already knows this station's actual
+# external-processor path, binary variant, command-line flags, service
+# identity, and realtime scheduling parameters.
+#
+# Restore that exact unit as CONFIGURATION only. Installing a unit file does
+# not enable or start it, and this stage must never create the
+# multi-user.target.wants symlink or call systemctl enable/start/reload.
+# Replacement hardware may require paths, ALSA state, or processor settings
+# to be adjusted before an operator deliberately activates it.
+#
+# The repo's stereotool.service.example remains the generic/manual fallback
+# for a station whose archive does not contain a live StereoTool unit.
+STEREOTOOL_UNIT_DEST="$ETC_ROOT/systemd/system/stereotool.service"
+STEREOTOOL_UNIT_MEMBER=""
+
+if [ -n "$RESTORE_ARCHIVE" ] && [ -f "$RESTORE_ARCHIVE" ]; then
+  STEREOTOOL_ARCHIVE_LISTING="$(tar -tzf "$RESTORE_ARCHIVE" 2>/dev/null)" || {
+    log_error "Could not list archive while checking for etc-live/stereotool.service: $RESTORE_ARCHIVE"
+    exit 1
+  }
+
+  if grep -qE '^(\./)?etc-live/stereotool\.service$' <<< "$STEREOTOOL_ARCHIVE_LISTING"; then
+    if grep -qE '^\./etc-live/stereotool\.service$' <<< "$STEREOTOOL_ARCHIVE_LISTING"; then
+      STEREOTOOL_UNIT_MEMBER="./etc-live/stereotool.service"
+    else
+      STEREOTOOL_UNIT_MEMBER="etc-live/stereotool.service"
+    fi
+
+    if [ "$RESTORE_MODE" = "apply" ]; then
+      log_apply "restore archived StereoTool supervision unit -> $STEREOTOOL_UNIT_DEST (configuration only; NOT enabled or started)"
+      STEREOTOOL_UNIT_TMP="$(mktemp)"
+      if ! tar -xzO -f "$RESTORE_ARCHIVE" "$STEREOTOOL_UNIT_MEMBER" > "$STEREOTOOL_UNIT_TMP"; then
+        rm -f "$STEREOTOOL_UNIT_TMP"
+        log_error "Failed to extract $STEREOTOOL_UNIT_MEMBER from $RESTORE_ARCHIVE"
+        exit 1
+      fi
+      if [ ! -s "$STEREOTOOL_UNIT_TMP" ]; then
+        rm -f "$STEREOTOOL_UNIT_TMP"
+        log_error "$STEREOTOOL_UNIT_MEMBER is empty -- refusing to install an empty stereotool.service"
+        exit 1
+      fi
+
+      if [ "$USE_SUDO" -eq 1 ]; then
+        sudo mkdir -p "$(dirname "$STEREOTOOL_UNIT_DEST")"
+        sudo install -o root -g root -m 0644 "$STEREOTOOL_UNIT_TMP" "$STEREOTOOL_UNIT_DEST"
+      else
+        mkdir -p "$(dirname "$STEREOTOOL_UNIT_DEST")"
+        install -m 0644 "$STEREOTOOL_UNIT_TMP" "$STEREOTOOL_UNIT_DEST"
+      fi
+      rm -f "$STEREOTOOL_UNIT_TMP"
+
+      RENDERED_UNITS+=("$STEREOTOOL_UNIT_DEST")
+      log_info "StereoTool supervision restored from archive evidence: $STEREOTOOL_UNIT_DEST"
+      log_warn "StereoTool service remains deliberately UNACTIVATED. Review its archived source-station User/WorkingDirectory/ExecStart plus replacement-host audio/device state before enabling it."
+    else
+      log_plan "restore $STEREOTOOL_UNIT_MEMBER -> $STEREOTOOL_UNIT_DEST mode 0644; syntax-check only; do NOT enable/start/reload"
+    fi
+  else
+    log_info "Archive contains no etc-live/stereotool.service -- no external-processor supervision unit will be invented."
+  fi
+elif [ -n "$RESTORE_ARCHIVE" ]; then
+  log_warn "Archive path is not a readable file ($RESTORE_ARCHIVE) -- StereoTool supervision cannot be reconstructed from archive evidence in this Stage 90 invocation."
+else
+  log_info "No archive supplied to Stage 90 -- StereoTool supervision is not auto-installed; deploy/stereotool.service.example remains the manual fallback."
+fi
+
 # ---- DR-01. Protected-updater checkpoint surface -------------------------
 # updater-bootstrapd.service and the legacy updater unit both declare
 # /var/backups/isadoraair/update-checkpoints in ReadWritePaths. systemd's

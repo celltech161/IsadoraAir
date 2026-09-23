@@ -901,11 +901,14 @@ piece of this genuinely backed up) and prints a checklist:
                                        watermark until then (~1 minute to
                                        enter once ready)
 [ ] Service unit valid?            -- automated by 90-system-config.sh
-                                       (deploy/stereotool.service.example,
-                                       copy + fill in placeholders + rename
-                                       to stereotool.service deliberately --
-                                       not matched by the *.service install
-                                       glob on purpose)
+                                       when the backup contains
+                                       etc-live/stereotool.service: the exact
+                                       archived station-specific unit is
+                                       restored + syntax-checked but NEVER
+                                       enabled or started. The repo's
+                                       stereotool.service.example remains the
+                                       manual fallback when no archived unit
+                                       exists.
 ```
 The first, second, and fourth items gate **full station readiness**;
 the license does not gate anything in this tooling's own sense — track
