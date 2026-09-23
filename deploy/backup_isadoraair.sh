@@ -24,9 +24,10 @@
 #   - Small, operator-created /srv/isadoraair content (FX Cart audio,
 #     voicetracks) and royalty/SoundExchange report filings, if present.
 #   - If configured (BACKUP_RECOVERY_AGE_RECIPIENT/_FILE): age-encrypted
-#     copies of ~/.iasboxbu.cred, ~/.syndicated_ingest.cred, and
-#     ~/.ogremote_ingest.cred, under recovery-credentials/*.age — see the
-#     2026-08-18 note below and deploy/encrypt_recovery_credentials.sh.
+#     copies of ~/.iasboxbu.cred, ~/.syndicated_ingest.cred,
+#     ~/.ogremote_ingest.cred, and secret-bearing ~/.stereo_tool.rc,
+#     under recovery-credentials/*.age — see the 2026-08-18 and DR-11/12
+#     notes below and deploy/encrypt_recovery_credentials.sh.
 #     Disabled by default; never included in plaintext either way.
 #   - The station's CURRENT Runtime Foundation E7 disaster-recovery
 #     payload (an offline-capable copy of the E3 Kokoro/Piper TTS bundle
@@ -244,7 +245,10 @@ ASSURANCE_MODULE="$SCRIPT_DIR/../isadoraair/backup_assurance.py"
 # This is additive archive metadata only; it does NOT bundle the proprietary
 # processor binary or plaintext runtime state and does not change the Runtime
 # Foundation recovery archive class/format.
-SCRIPT_VERSION="3.3.0"
+# 3.4.0 (DR-11/DR-12): preserves secret-bearing ~/.stereo_tool.rc through
+# the existing public-key age recovery pipeline. Plaintext remains forbidden;
+# only recovery-credentials/stereotool_state.cred.age may enter the archive.
+SCRIPT_VERSION="3.4.0"
 
 # See the DRY_RUN note in the header comment above.
 DRY_RUN="${DRY_RUN:-0}"
@@ -874,9 +878,9 @@ echo "Encrypting recovery credentials (if configured)..."
 # every filesystem operation"; exercising this step locally under DRY_RUN
 # is exactly how an operator proves the mechanism works before trusting it
 # on a real nightly run. This step never touches ~/.iasboxbu.cred's SFTP
-# credentials (BAK_HOST etc.) -- it only ever reads the file's raw bytes
-# as an opaque blob to encrypt, the same as the other two credential
-# files, never parsing/using any value from it.
+# credentials (BAK_HOST etc.) -- it only ever reads protected source-file
+# bytes as opaque blobs to encrypt, including secret-bearing Stereo Tool
+# runtime state, never parsing/using any value from those files.
 RECOVERY_CRED_DIR="$WORKDIR/recovery-credentials"
 RECOVERY_CRED_STATUS_OUTPUT=""
 if ! RECOVERY_CRED_STATUS_OUTPUT=$("$SCRIPT_DIR/encrypt_recovery_credentials.sh" "$RECOVERY_CRED_DIR"); then
@@ -906,7 +910,7 @@ Recovery credential cipher: age"
 Recovery credential ${name}: ${status}"
   done <<< "$RECOVERY_CRED_LINES"
 else
-  echo "  disabled (BACKUP_RECOVERY_AGE_RECIPIENT/_FILE not configured) -- ~/.iasboxbu.cred, ~/.syndicated_ingest.cred, ~/.ogremote_ingest.cred are NOT included in this archive, same as every backup before this feature existed"
+  echo "  disabled (BACKUP_RECOVERY_AGE_RECIPIENT/_FILE not configured) -- ~/.iasboxbu.cred, ~/.syndicated_ingest.cred, ~/.ogremote_ingest.cred, and ~/.stereo_tool.rc are NOT included in this archive"
   RECOVERY_CRED_MANIFEST_BLOCK="Recovery credential encryption: disabled (BACKUP_RECOVERY_AGE_RECIPIENT/_FILE not configured)"
 fi
 echo
@@ -959,7 +963,7 @@ Contents of this archive:
   reports/                               SoundExchange/royalty report filings (if present)
   runtime-recovery/                      Runtime Foundation E7 disaster-recovery payload (if configured -- see below)
   runtime-recovery-archive.json          machine-readable archive/recovery classification
-  recovery-credentials/*.age             age-encrypted companion credential copies (if configured -- see below; NEVER plaintext)
+  recovery-credentials/*.age             age-encrypted protected recovery inputs (if configured -- see below; NEVER plaintext)
 
 Deliberately EXCLUDED from this backup (see docs/DISASTER_RECOVERY.md):
   /srv/isadoraair/music        717+ GB audio library -- separate storage-resilience task
@@ -991,8 +995,10 @@ see docs/DISASTER_RECOVERY_RESTORE.md "Encrypted recovery-credential
 preservation". It is NOT a bootstrap source for retrieving this archive
 in the first place -- ~/.iasboxbu.cred's own external off-host copy is
 still what a recovery starts from; this encrypted copy is for keeping
-that (and the other two) current/authoritative going forward and for
-restoring them once the archive is already in hand.
+those protected recovery inputs current/authoritative going forward and
+for restoring them once the archive is already in hand. Stereo Tool state,
+when present, is recovery-credentials/stereotool_state.cred.age and decrypts
+back to ~/.stereo_tool.rc; plaintext .stereo_tool.rc is never archived.
 
 Secrets NEVER included in ANY form, even encrypted -- must be
 reprovisioned from elsewhere on restore (see docs/DISASTER_RECOVERY.md

@@ -607,6 +607,7 @@ IsadoraAir host
     |-- ~/.iasboxbu.cred
     |-- ~/.syndicated_ingest.cred
     |-- ~/.ogremote_ingest.cred
+    |-- ~/.stereo_tool.rc
     |
     |-- recovery encryption PUBLIC key / recipient
     |   (BACKUP_RECOVERY_AGE_RECIPIENT / _FILE -- non-secret, but still
@@ -618,6 +619,7 @@ nightly backup
         iasboxbu.cred.age
         syndicated_ingest.cred.age
         ogremote_ingest.cred.age
+        stereotool_state.cred.age
 ```
 
 The matching **private** age identity/decryption key is never generated
@@ -675,8 +677,9 @@ both lines pre-written and commented out):
 
 Neither set (the default on every fresh/generic install) = feature
 **disabled** — backups proceed exactly as before this feature existed,
-with `~/.iasboxbu.cred`/`~/.syndicated_ingest.cred`/`~/.ogremote_ingest.cred`
-simply not included in any form, same as always. Once either is set, the
+with `~/.iasboxbu.cred`/`~/.syndicated_ingest.cred`/
+`~/.ogremote_ingest.cred`/`~/.stereo_tool.rc` simply not included in any
+form. Once either recipient setting is set, the
 backup **fails closed** before upload on: the `age` binary missing, the
 recipient failing a basic structural check, an `age` invocation failing,
 or a resulting ciphertext file being empty — see
@@ -685,7 +688,18 @@ conditions. A source credential file simply not existing on this host
 (e.g. ogremote-ingest not in use) is never a failure — it's recorded as
 "absent" in the manifest and the backup proceeds.
 
-### Manual recovery: decrypting the credential files
+### Manual recovery: decrypting the protected recovery files
+
+Stereo Tool's `.stereo_tool.rc` is included in this same mechanism because
+the file contains durable processor runtime state and may contain
+registration/license material. Its archive member is
+`recovery-credentials/stereotool_state.cred.age`; plaintext
+`.stereo_tool.rc` remains forbidden anywhere in the archive. After off-host
+decryption, install it as `~/.stereo_tool.rc` with mode **0600** before
+Stereo Tool is started. Do not treat restoration of this state as permission
+to start Stereo Tool: DR hardware-binding validation remains a separate
+pre-start gate.
+
 
 Not automated, and deliberately so — no script this repo ships ever
 handles the private key. Run these on the machine that actually holds
@@ -706,8 +720,10 @@ age --decrypt -i /path/to/recovery-private-key.txt \
   -o syndicated_ingest.cred recovery-credentials/syndicated_ingest.cred.age
 age --decrypt -i /path/to/recovery-private-key.txt \
   -o ogremote_ingest.cred recovery-credentials/ogremote_ingest.cred.age
+age --decrypt -i /path/to/recovery-private-key.txt \
+  -o stereo_tool.rc recovery-credentials/stereotool_state.cred.age
 
-# 3. Transfer the three decrypted files to the restored IsadoraAir host
+# 3. Transfer the decrypted recovery files to the restored IsadoraAir host
 #    by whatever secure channel the operator normally uses (scp over
 #    the restored host's own SSH, a USB drive, etc.) -- this step is
 #    intentionally not prescribed further; it's a one-time transfer of
@@ -718,7 +734,12 @@ age --decrypt -i /path/to/recovery-private-key.txt \
 mv iasboxbu.cred ~/.iasboxbu.cred
 mv syndicated_ingest.cred ~/.syndicated_ingest.cred
 mv ogremote_ingest.cred ~/.ogremote_ingest.cred
-chmod 0600 ~/.iasboxbu.cred ~/.syndicated_ingest.cred ~/.ogremote_ingest.cred
+mv stereo_tool.rc ~/.stereo_tool.rc
+chmod 0600 \
+  ~/.iasboxbu.cred \
+  ~/.syndicated_ingest.cred \
+  ~/.ogremote_ingest.cred \
+  ~/.stereo_tool.rc
 
 # 5. Verify expected key names are present WITHOUT displaying values --
 #    e.g. for .iasboxbu.cred:
@@ -741,11 +762,14 @@ that calculus changes later (repeated real-world friction, not just
 theoretical tidiness), building one remains an option — it would need to
 satisfy exactly those constraints and nothing less.
 
-### Production activation steps (not performed by this pass)
+### Production activation / verification
 
-Repo changes establish the mechanism; the following remain deliberately
-undone until separately approved, and none of them happen on the
-IsadoraAir server itself except the last two:
+The mechanism remains disabled by default on a fresh/generic install.
+On the current production station, however, the public recipient-file
+configuration has since been activated through
+`BACKUP_RECOVERY_AGE_RECIPIENT_FILE`; the private age identity remains
+off-host. The checklist below is retained as the required activation and
+verification procedure for any new/rebuilt station:
 
 1. Generate the age recovery keypair on an off-host machine (the
    operator's recovery PC, or another trusted machine that is not this
@@ -788,17 +812,14 @@ drill isn't mis-scored by conflating them:
   bare-machine restore needs (GitHub access, the backup archive itself,
   the three credential files, `.env`/DB via the archive, StereoTool
   running unlicensed) has a known, verified path to obtain it.
-- **Encrypted nightly credential preservation: implementation complete,
-  production activation pending.** The mechanism described above
-  (`deploy/encrypt_recovery_credentials.sh`, the archive's
-  `recovery-credentials/*.age`, `inspect_backup.sh`'s new checks) is
-  built and tested, but `BACKUP_RECOVERY_AGE_RECIPIENT(_FILE)` is not
-  yet configured on production — see "Production activation steps"
-  above. **This does not block Phase 5** — the operator's off-host PC
-  copy is already sufficient on its own; the encrypted-backup mechanism
-  is additional defense-in-depth for keeping that copy's authoritative
-  content current automatically, not a prerequisite for the bare-machine
-  drill.
+- **Encrypted nightly recovery-secret preservation: ACTIVE on the current
+  production station.** The public recipient-file configuration is present;
+  the private age identity remains off-host by design. The mechanism now
+  covers the three existing credential files plus secret-bearing Stereo Tool
+  runtime state (`recovery-credentials/stereotool_state.cred.age`).
+  Fresh/generic installs still default to disabled until an operator provides
+  a public recipient. This remains defense-in-depth rather than the bootstrap
+  source for retrieving the archive itself.
 
 Nothing in this pass discovered a new blocker requiring Phase 5 to wait
 further — this conclusion should not be read as "everything is

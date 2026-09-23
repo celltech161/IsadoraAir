@@ -2,9 +2,12 @@
 # deploy/encrypt_recovery_credentials.sh -- IsadoraAir 1.2 disaster-recovery
 # Phase 4.5 final follow-up (2026-08-18).
 #
-# Encrypts the three companion-project credential files (never IsadoraAir's
-# own .env, which is already covered by the ordinary app.tar.gz backup) into
-# age ciphertext, for inclusion in the nightly backup archive by
+# Encrypts the recovery-sensitive files that must survive total host loss:
+# the three companion/backup credential files plus Stereo Tool's secret-bearing
+# ~/.stereo_tool.rc runtime state. IsadoraAir's own .env is deliberately NOT
+# handled here because it is already covered by ordinary app.tar.gz recovery.
+# Every source handled here enters the archive as age ciphertext only, for
+# inclusion in the nightly backup archive by
 # deploy/backup_isadoraair.sh. Split out as its own small, standalone,
 # independently-testable script -- same architectural pattern this repo
 # already uses for deploy/restore/inspect_backup.sh (a focused helper with
@@ -41,17 +44,18 @@
 #   - the resolved recipient failing a basic structural sanity check,
 #   - any individual `age` encryption invocation failing,
 #   - a resulting .age file being empty.
-# An individual SOURCE credential file simply not existing on this host is
-# NOT a failure -- none of the three are required for IsadoraAir's own core
-# function (see docs/RUNTIME_BASELINE.md's restore-order map: these are
-# companion-project extras), so a station not running one of those
-# companion projects correctly has no file to encrypt for it.
+# An individual protected SOURCE file simply not existing on this host is
+# NOT a failure. The credential sources are companion/backup extras, and
+# Stereo Tool runtime state exists only on stations using that processor.
+# Absence is therefore recorded explicitly rather than guessed at or treated
+# as a backup failure.
 #
-# Source credential paths are overridable via env for testability (never
+# Source recovery-file paths are overridable via env for testability (never
 # for production use -- production always uses the real $HOME paths):
 #   IASBOXBU_CRED_FILE            default $HOME/.iasboxbu.cred
 #   SYNDICATED_INGEST_CRED_FILE   default $HOME/.syndicated_ingest.cred
 #   OGREMOTE_INGEST_CRED_FILE     default $HOME/.ogremote_ingest.cred
+#   STEREOTOOL_RC_FILE            default $HOME/.stereo_tool.rc
 #
 # Usage:
 #   deploy/encrypt_recovery_credentials.sh <output-dir>
@@ -73,6 +77,7 @@
 #   CRED iasboxbu included
 #   CRED syndicated_ingest absent
 #   CRED ogremote_ingest included
+#   CRED stereotool_state included
 #
 # Exit codes: 0 = success (whether disabled, or enabled and fully
 # succeeded). 1 = explicitly configured but failed closed -- caller must
@@ -92,6 +97,7 @@ BACKUP_RECOVERY_AGE_RECIPIENT_FILE="${BACKUP_RECOVERY_AGE_RECIPIENT_FILE:-}"
 IASBOXBU_CRED_FILE="${IASBOXBU_CRED_FILE:-$HOME/.iasboxbu.cred}"
 SYNDICATED_INGEST_CRED_FILE="${SYNDICATED_INGEST_CRED_FILE:-$HOME/.syndicated_ingest.cred}"
 OGREMOTE_INGEST_CRED_FILE="${OGREMOTE_INGEST_CRED_FILE:-$HOME/.ogremote_ingest.cred}"
+STEREOTOOL_RC_FILE="${STEREOTOOL_RC_FILE:-$HOME/.stereo_tool.rc}"
 
 # ---- Not configured at all -> feature OFF, not an error -------------------
 # Deliberately checked before anything else (no `age` lookup, no file I/O
@@ -158,6 +164,11 @@ CRED_ENTRIES=(
   "iasboxbu:${IASBOXBU_CRED_FILE}"
   "syndicated_ingest:${SYNDICATED_INGEST_CRED_FILE}"
   "ogremote_ingest:${OGREMOTE_INGEST_CRED_FILE}"
+  # Logical name deliberately differs from the source filename. The existing
+  # manifest/inspector protocol accepts [a-z_]+ names and emits
+  # recovery-credentials/<name>.cred.age. The decrypted recovery destination
+  # is documented separately as ~/.stereo_tool.rc.
+  "stereotool_state:${STEREOTOOL_RC_FILE}"
 )
 
 for entry in "${CRED_ENTRIES[@]}"; do

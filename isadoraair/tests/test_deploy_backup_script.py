@@ -324,7 +324,7 @@ class BackupScriptContentTests(SimpleTestCase):
         # dedicated v3/runtime-recovery coverage. This assertion still only
         # needs to prove SCRIPT_VERSION was deliberately bumped past its
         # pre-E7B baseline, not pin the exact string forever.
-        self.assertIn('SCRIPT_VERSION="3.2.0"', self.text)
+        self.assertIn('SCRIPT_VERSION="3.4.0"', self.text)
         self.assertNotIn('SCRIPT_VERSION="2.1.0"', self.text)
 
     def test_encryption_step_calls_the_standalone_helper_script(self):
@@ -433,7 +433,7 @@ class RuntimeRecoveryPayloadBackupTests(SimpleTestCase):
         cls.text = SCRIPT_PATH.read_text(encoding="utf-8")
 
     def test_script_version_is_separate_from_archive_format_classification(self):
-        self.assertIn('SCRIPT_VERSION="3.2.0"', self.text)
+        self.assertIn('SCRIPT_VERSION="3.4.0"', self.text)
         self.assertNotIn('SCRIPT_VERSION="2.1.0"', self.text)
         self.assertIn("runtime-recovery-archive.json", self.text)
         self.assertIn("archive_format_version", self.text)
@@ -783,6 +783,7 @@ class EncryptRecoveryCredentialsScriptTests(SimpleTestCase):
         self.iasboxbu = self.cred_dir / "iasboxbu.cred"
         self.syndicated = self.cred_dir / "syndicated.cred"
         self.ogremote = self.cred_dir / "ogremote.cred"
+        self.stereotool_rc = self.cred_dir / ".stereo_tool.rc"
 
     def _base_env(self, **overrides):
         env = dict(os.environ)
@@ -791,12 +792,19 @@ class EncryptRecoveryCredentialsScriptTests(SimpleTestCase):
         env["IASBOXBU_CRED_FILE"] = str(self.iasboxbu)
         env["SYNDICATED_INGEST_CRED_FILE"] = str(self.syndicated)
         env["OGREMOTE_INGEST_CRED_FILE"] = str(self.ogremote)
+        env["STEREOTOOL_RC_FILE"] = str(self.stereotool_rc)
         env.update(overrides)
         return env
 
     def _run(self, env):
+        # Invoke bash by absolute path so tests that deliberately remove the
+        # directory containing `age` from PATH still execute the helper.
+        # Calling the script directly would route its `#!/usr/bin/env bash`
+        # shebang through that intentionally-restricted PATH and could fail
+        # with rc=127 before the helper gets a chance to perform its own
+        # `command -v age` fail-closed check.
         return subprocess.run(
-            [str(ENCRYPT_CREDS_SCRIPT), str(self.output_dir)],
+            ["/bin/bash", str(ENCRYPT_CREDS_SCRIPT), str(self.output_dir)],
             capture_output=True, text=True, timeout=30, env=env,
         )
 
@@ -921,6 +929,7 @@ class EncryptRecoveryCredentialsScriptTests(SimpleTestCase):
         self.assertIn("CRED iasboxbu included", result.stdout)
         self.assertIn("CRED syndicated_ingest included", result.stdout)
         self.assertIn("CRED ogremote_ingest absent", result.stdout)
+        self.assertIn("CRED stereotool_state absent", result.stdout)
 
         iasboxbu_age = self.output_dir / "iasboxbu.cred.age"
         syndicated_age = self.output_dir / "syndicated_ingest.cred.age"
@@ -961,10 +970,75 @@ class EncryptRecoveryCredentialsScriptTests(SimpleTestCase):
         self.assertIn("CRED iasboxbu included", result.stdout)
 
     @unittest.skipUnless(AGE_INSTALLED, "age is not installed on this test machine")
-    def test_all_three_credentials_absent_still_enabled_zero_included(self):
-        """A syntactically valid, real recipient with zero source
-        credential files present on this host must not be a failure --
-        matches the documented "absent is not a failure" policy."""
+    def test_enabled_encrypts_stereotool_state_and_round_trips_exactly(self):
+        """Stereo Tool runtime state is secret-bearing durable state: only
+        age ciphertext may enter the recovery directory, and a disposable
+        private key must recover the source bytes exactly."""
+        recipient, identity_path = self._make_keypair()
+
+        source_bytes = (
+            b"synthetic_setting=1\n"
+            b"registration_key=DO-NOT-LEAK-STEREOTOOL-TEST-SECRET\n"
+            b"binaryish=\x00\x01\x02\n"
+        )
+        self.stereotool_rc.write_bytes(source_bytes)
+
+        result = self._run(
+            self._base_env(
+                BACKUP_RECOVERY_AGE_RECIPIENT=recipient,
+            )
+        )
+        self.assertEqual(
+            result.returncode,
+            0,
+            result.stdout + result.stderr,
+        )
+        self.assertIn(
+            "CRED stereotool_state included",
+            result.stdout,
+        )
+        self.assertNotIn(
+            "DO-NOT-LEAK-STEREOTOOL-TEST-SECRET",
+            result.stdout + result.stderr,
+        )
+
+        age_path = (
+            self.output_dir / "stereotool_state.cred.age"
+        )
+        self.assertTrue(age_path.is_file())
+        self.assertGreater(age_path.stat().st_size, 0)
+        self.assertEqual(
+            age_path.stat().st_mode & 0o777,
+            0o600,
+        )
+        self.assertNotIn(
+            b"DO-NOT-LEAK-STEREOTOOL-TEST-SECRET",
+            age_path.read_bytes(),
+        )
+
+        decrypt = subprocess.run(
+            [
+                "age",
+                "--decrypt",
+                "-i",
+                str(identity_path),
+                str(age_path),
+            ],
+            capture_output=True,
+            timeout=15,
+        )
+        self.assertEqual(
+            decrypt.returncode,
+            0,
+            decrypt.stderr.decode(errors="replace"),
+        )
+        self.assertEqual(decrypt.stdout, source_bytes)
+
+    @unittest.skipUnless(AGE_INSTALLED, "age is not installed on this test machine")
+    def test_all_recovery_sources_absent_still_enabled_zero_included(self):
+        """A syntactically valid, real recipient with zero protected
+        recovery source files present must not be a failure -- matches the
+        documented "absent is not a failure" policy."""
         recipient, _identity_path = self._make_keypair()
         result = self._run(self._base_env(BACKUP_RECOVERY_AGE_RECIPIENT=recipient))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -972,6 +1046,7 @@ class EncryptRecoveryCredentialsScriptTests(SimpleTestCase):
         self.assertIn("CRED iasboxbu absent", result.stdout)
         self.assertIn("CRED syndicated_ingest absent", result.stdout)
         self.assertIn("CRED ogremote_ingest absent", result.stdout)
+        self.assertIn("CRED stereotool_state absent", result.stdout)
         self.assertEqual(list(self.output_dir.glob("*.age")), [])
 
 
