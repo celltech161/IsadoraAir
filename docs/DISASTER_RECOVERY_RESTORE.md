@@ -918,10 +918,12 @@ running.
 ## Certificates
 
 `deploy/restore/90-system-config.sh` installs the **generic** nginx
-template — self-signed cert only, `default_server`. It does not assume
-`acme.sh`/Let's Encrypt state is recoverable (see the secrets table
-above). Three options for the public HTTPS hostname, in order of
-preference:
+template — replacement-safe HTTP/HTTPS default vhosts using
+`server_name _;`, with the self-signed certificate on HTTPS. The generic
+template deliberately contains no source-host hostname or private IP.
+It does not assume `acme.sh`/Let's Encrypt state is recoverable (see the
+secrets table above). Three options for the public HTTPS hostname, in
+order of preference:
 
 1. **Issue a fresh certificate** — re-run `acme.sh`'s DNS-01 issuance
    against the DNS provider (IONOS, for `radio.oakgroveradio.com`) once

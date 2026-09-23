@@ -5334,3 +5334,59 @@ class DisasterRecoveryNginxDefaultSiteContractTests(SimpleTestCase):
         self.assertTrue(self.default_enabled.is_dir())
         self.assertEqual(sentinel.read_text(encoding="utf-8"), "preserve-me\n")
         self.assertTrue(self.default_available.is_file())
+
+class DisasterRecoveryNginxGenericHostContractTests(SimpleTestCase):
+    """DR-08C: recovery nginx defaults must never carry source-host identity."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.template = (
+            RESTORE_DIR.parent / "isadoraair.nginx"
+        ).read_text(encoding="utf-8")
+        cls.readme = (
+            RESTORE_DIR.parent / "README.md"
+        ).read_text(encoding="utf-8")
+        cls.dr_doc = (
+            RESTORE_DIR.parent.parent / "docs" / "DISASTER_RECOVERY_RESTORE.md"
+        ).read_text(encoding="utf-8")
+
+    def test_generic_http_and_https_vhosts_are_explicit_defaults(self):
+        self.assertEqual(
+            self.template.count("listen 80 default_server;"),
+            1,
+        )
+        self.assertEqual(
+            self.template.count("listen 443 ssl default_server;"),
+            1,
+        )
+
+    def test_generic_vhosts_use_host_neutral_server_names(self):
+        self.assertEqual(self.template.count("server_name _;"), 2)
+        self.assertNotIn("192.168.1.125", self.template)
+        self.assertNotIn("server_name isadoraair", self.template)
+
+    def test_public_hostname_remains_a_separate_station_specific_vhost(self):
+        self.assertIn(
+            "add a SEPARATE `listen 443 ssl;` server block for that hostname",
+            self.template,
+        )
+        self.assertIn(
+            "server_name your.public.hostname.example;",
+            self.readme,
+        )
+        self.assertIn(
+            "add a **second**",
+            self.readme,
+        )
+
+    def test_recovery_docs_pin_replacement_safe_generic_contract(self):
+        self.assertIn(
+            "replacement-safe HTTP/HTTPS default vhosts",
+            self.dr_doc,
+        )
+        self.assertIn("`server_name _;`", self.dr_doc)
+        self.assertIn(
+            "no source-host hostname or private IP",
+            self.dr_doc,
+        )

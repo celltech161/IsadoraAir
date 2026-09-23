@@ -1,6 +1,9 @@
 server {
-    listen 80;
-    server_name isadoraair 192.168.1.125;
+    # Generic recovery/default HTTP vhost. DR-08C: never bake the source
+    # station's hostname or private address into a replacement-machine
+    # restore. Public/station-specific names belong in separate vhosts.
+    listen 80 default_server;
+    server_name _;
 
     # GW3000/Ecowitt weather gateway is IoT firmware with no TLS support --
     # this one path is proxied plain-HTTP instead of hitting the
@@ -24,8 +27,10 @@ server {
 }
 
 server {
+    # Generic self-signed HTTPS fallback for LAN/recovery access. Any real
+    # public hostname remains a separate station-specific TLS vhost below.
     listen 443 ssl default_server;
-    server_name isadoraair 192.168.1.125;
+    server_name _;
 
     ssl_certificate     /etc/ssl/isadoraair/selfsigned.crt;
     ssl_certificate_key /etc/ssl/isadoraair/selfsigned.key;

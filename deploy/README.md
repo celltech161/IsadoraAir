@@ -64,7 +64,7 @@ for f in deploy/*.service deploy/*.timer deploy/*.conf; do
     "$f" | sudo tee "/etc/systemd/system/$(basename "$f")" > /dev/null
 done
 
-# 3. nginx site (adjust server_name inside first if needed) + its shared
+# 3. nginx site (generic replacement-safe default vhosts) + its shared
 # location-block snippet -- isadoraair.nginx `include`s this, so both
 # files need to land in nginx's config tree, not just the site file.
 # sites-enabled MUST be a symlink to sites-available, never a second
@@ -162,12 +162,14 @@ symlink in the first place) catch that.
 
 ### Public HTTPS with your own domain
 
-The `isadoraair.nginx` template ships with one HTTPS server block, on
-the self-signed cert, marked `default_server`. If you also want a real
-public hostname (Let's Encrypt or any other CA), add a **second**
-`listen 443 ssl;` block rather than replacing the first one — this
-keeps LAN/legacy access on the self-signed cert working via SNI fallback
-to the `default_server` block:
+The `isadoraair.nginx` template ships replacement-safe generic HTTP and
+HTTPS default vhosts using `server_name _;`; the HTTPS fallback uses the
+self-signed cert. The generic blocks deliberately contain no hostname or
+private IP from the machine that produced the backup. If you also want a
+real public hostname (Let's Encrypt or any other CA), add a **second**
+`listen 443 ssl;` block rather than replacing the generic HTTPS fallback —
+this keeps LAN/recovery access on the self-signed cert working via SNI
+fallback to the `default_server` block:
 
 ```nginx
 server {
