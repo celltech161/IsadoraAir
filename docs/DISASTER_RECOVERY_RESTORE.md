@@ -981,6 +981,84 @@ the source of truth if this ever needs re-deriving** — the graph above
 is not the Phase 4 spec's own suggested example order verbatim; it's
 what the actual units say, cross-checked.
 
+### Protected updater activation and bounded readiness
+
+Stage 75 deliberately restores the protected Phase-D updater **without**
+starting or enabling it. Activation is a separate privileged bring-up
+step. Do not treat the first failed worker-socket PING immediately after
+`systemctl start` as a restore failure: the supervisor can be active
+before the worker has finished binding `/run/isadoraair-updater/updater.sock`.
+
+Resolve the controller from the active runtime slot recorded by the
+restored supervisor state, start the supervisor, and poll PING for at
+most 30 seconds:
+
+```bash
+UPDATER_STATE=/var/lib/isadoraair-updater-bootstrap/runtime-state.json
+
+ACTIVE_SLOT="$(
+  sudo /usr/bin/python3 -I -B -c \
+    'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["active_slot"])' \
+    "$UPDATER_STATE"
+)"
+
+case "$ACTIVE_SLOT" in
+  A|B)
+    ;;
+  *)
+    echo "Invalid protected-updater active slot: $ACTIVE_SLOT" >&2
+    exit 1
+    ;;
+esac
+
+UPDATER_CTL="/var/lib/isadoraair-updater-bootstrap/runtime-slots/$ACTIVE_SLOT/updaterctl.py"
+
+if [ ! -f "$UPDATER_CTL" ]; then
+  echo "Protected-updater controller is missing: $UPDATER_CTL" >&2
+  exit 1
+fi
+
+sudo systemctl enable --now updater-bootstrapd.service
+
+updater_ready=false
+for attempt in $(seq 1 30); do
+  if PING_JSON="$(
+    sudo /usr/bin/python3 -I -B "$UPDATER_CTL" ping 2>&1
+  )"; then
+    printf '%s\n' "$PING_JSON"
+    updater_ready=true
+    break
+  fi
+  sleep 1
+done
+
+if [ "$updater_ready" = true ]; then
+  echo "Protected updater readiness check succeeded"
+else
+  echo "Updater did not become ready within 30 seconds" >&2
+  sudo systemctl --no-pager --full status updater-bootstrapd.service
+  exit 1
+fi
+
+systemctl is-active updater-bootstrapd.service
+systemctl is-enabled updater-bootstrapd.service
+```
+
+The controller is a Python source file invoked explicitly through
+`/usr/bin/python3`; it does **not** need to have its executable bit set.
+Test it with `-f`, not `-x`.
+
+A successful bounded PING establishes that the worker socket has become
+reachable. Inspect the returned JSON and require the protected/config/
+trusted-repository readiness fields appropriate to the restored runtime.
+The execution-armed state must match the intended recovery posture; do
+not change that state merely to make this acceptance step pass.
+
+If the first few PING attempts fail because the worker socket does not
+yet exist or accept connections, that is normal startup convergence.
+Only failure to become healthy within the bounded window is an
+acceptance failure.
+
 ### Software-complete vs. audio-hardware-ready
 
 `95-validate.sh`'s PASS means the *software* restore is complete and

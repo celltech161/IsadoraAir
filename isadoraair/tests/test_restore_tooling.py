@@ -5045,3 +5045,77 @@ exit 99
             capture_output=True, text=True, timeout=30, env=self._env(),
         )
         self.assertNotIn("also requires --snap-dir", result.stdout + result.stderr)
+
+
+class ProtectedUpdaterDisasterRecoveryReadinessContractTests(SimpleTestCase):
+    """DR-06 physical bare-metal regression.
+
+    Stage 75 deliberately does not activate the restored protected
+    updater. The manual DR bring-up contract must therefore use bounded
+    readiness polling rather than scoring the first asynchronous worker
+    socket probe as a restore failure.
+    """
+
+    def _section(self):
+        runbook = (
+            REPO_ROOT / "docs" / "DISASTER_RECOVERY_RESTORE.md"
+        ).read_text(encoding="utf-8")
+
+        marker = "### Protected updater activation and bounded readiness"
+        self.assertIn(marker, runbook)
+
+        section = runbook.split(marker, 1)[1]
+        section = section.split(
+            "### Software-complete vs. audio-hardware-ready",
+            1,
+        )[0]
+        return section
+
+    def test_uses_active_phase_d_slot(self):
+        section = self._section()
+        self.assertIn(
+            "/var/lib/isadoraair-updater-bootstrap/runtime-state.json",
+            section,
+        )
+        self.assertIn('"active_slot"', section)
+        self.assertIn(
+            "/var/lib/isadoraair-updater-bootstrap/runtime-slots/"
+            '$ACTIVE_SLOT/updaterctl.py',
+            section,
+        )
+
+    def test_controller_is_required_as_file_not_executable(self):
+        section = self._section()
+        self.assertIn('if [ ! -f "$UPDATER_CTL" ]', section)
+        self.assertNotIn('if [ -x "$UPDATER_CTL" ]', section)
+
+    def test_activation_uses_phase_d_supervisor(self):
+        section = self._section()
+        self.assertIn(
+            "sudo systemctl enable --now updater-bootstrapd.service",
+            section,
+        )
+
+    def test_readiness_is_bounded_not_single_shot(self):
+        section = self._section()
+        self.assertIn("for attempt in $(seq 1 30)", section)
+        self.assertIn("sleep 1", section)
+        self.assertIn(
+            'sudo /usr/bin/python3 -I -B "$UPDATER_CTL" ping',
+            section,
+        )
+        self.assertIn(
+            "Updater did not become ready within 30 seconds",
+            section,
+        )
+
+    def test_runbook_preserves_readiness_semantics(self):
+        section = self._section()
+        self.assertIn(
+            "Only failure to become healthy within the bounded window",
+            section,
+        )
+        self.assertIn(
+            "The execution-armed state must match the intended recovery posture",
+            section,
+        )
