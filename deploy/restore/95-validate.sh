@@ -272,8 +272,25 @@ else
   _restore_check_weather_runtime_structural
 fi
 
-log_info "--- Static/media readiness (informational only -- not run) ---"
-log_info "collectstatic has not been run by this stage -- it's safe/additive but left as an explicit Phase 5 operator step, same as service bring-up. STATIC_ROOT/MEDIA_ROOT ownership should match \$ISA_USER before gunicorn starts."
+log_info "--- Static readiness ---"
+if STATIC_ROOT_PATH=$("$VENV_PY" -c 'import os; os.environ.setdefault("DJANGO_SETTINGS_MODULE", "isadoraair.settings"); import django; django.setup(); from django.conf import settings; print(settings.STATIC_ROOT)' | tail -n 1); then
+  STATIC_SENTINEL="$STATIC_ROOT_PATH/admin/css/base.css"
+  if [ -z "$STATIC_ROOT_PATH" ]; then
+    log_error "STATIC_ROOT resolved empty -- restored static assets cannot be validated."
+    OVERALL_OK=0
+  elif [ ! -d "$STATIC_ROOT_PATH" ]; then
+    log_error "STATIC_ROOT is missing: $STATIC_ROOT_PATH -- Stage 60 collectstatic did not produce the required web assets."
+    OVERALL_OK=0
+  elif [ ! -f "$STATIC_SENTINEL" ]; then
+    log_error "Django admin static sentinel is missing: $STATIC_SENTINEL -- rerun Stage 60 before service bring-up."
+    OVERALL_OK=0
+  else
+    log_info "static readiness: PASS ($STATIC_SENTINEL present)"
+  fi
+else
+  log_error "Unable to resolve STATIC_ROOT from the restored Django settings."
+  OVERALL_OK=0
+fi
 
 if [ "$OVERALL_OK" -eq 1 ]; then
   if [ "$RESTORE_MODE" = "apply" ]; then

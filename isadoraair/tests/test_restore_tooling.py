@@ -5119,3 +5119,83 @@ class ProtectedUpdaterDisasterRecoveryReadinessContractTests(SimpleTestCase):
             "The execution-armed state must match the intended recovery posture",
             section,
         )
+
+class DisasterRecoveryStaticAssetsContractTests(SimpleTestCase):
+    """DR-08A regression for bare-metal static-asset completeness."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.stage60 = (RESTORE_DIR / "60-python.sh").read_text(encoding="utf-8")
+        cls.stage95 = (RESTORE_DIR / "95-validate.sh").read_text(encoding="utf-8")
+
+    def test_stage60_collects_static_before_recording_pass(self):
+        command = (
+            '"$VENV_DIR/bin/python" manage.py collectstatic '
+            "--noinput --skip-checks"
+        )
+        self.assertIn(command, self.stage60)
+        self.assertLess(
+            self.stage60.index(command),
+            self.stage60.index('restore_ledger_record "60-python"'),
+        )
+
+    def test_stage60_plan_previews_collectstatic(self):
+        self.assertIn(
+            'log_plan "cd $RESTORE_TARGET_ROOT && '
+            '$VENV_DIR/bin/python manage.py collectstatic '
+            '--noinput --skip-checks"',
+            self.stage60,
+        )
+
+    def test_stage60_collectstatic_failure_is_fatal(self):
+        start = self.stage60.index(
+            'log_info "Collecting static assets into the restored STATIC_ROOT..."'
+        )
+        end = self.stage60.index(
+            'log_warn "No .env at $ENV_FILE',
+            start,
+        )
+        block = self.stage60[start:end]
+        self.assertIn("collectstatic FAILED", block)
+        self.assertIn("exit 1", block)
+
+    def test_stage95_is_read_only_and_gates_on_admin_static_sentinel(self):
+        self.assertIn(
+            'STATIC_SENTINEL="$STATIC_ROOT_PATH/admin/css/base.css"',
+            self.stage95,
+        )
+        self.assertIn('if [ ! -f "$STATIC_SENTINEL" ]', self.stage95)
+        missing_start = self.stage95.index('elif [ ! -f "$STATIC_SENTINEL" ]')
+        missing_end = self.stage95.index(
+            'else\n    log_info "static readiness: PASS',
+            missing_start,
+        )
+        missing_block = self.stage95[missing_start:missing_end]
+        self.assertIn("OVERALL_OK=0", missing_block)
+        self.assertNotIn("OVERALD_OK", missing_block)
+        self.assertIn("static readiness: PASS", self.stage95)
+
+        for line in self.stage95.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            self.assertNotIn(
+                "manage.py collectstatic",
+                line,
+                "Stage 95 must remain read-only and must not regenerate static assets",
+            )
+
+    def test_stage95_no_longer_treats_static_readiness_as_informational(self):
+        self.assertNotIn(
+            "Static/media readiness (informational only -- not run)",
+            self.stage95,
+        )
+        self.assertNotIn(
+            "collectstatic has not been run by this stage",
+            self.stage95,
+        )
+        self.assertIn(
+            'log_error "STATIC_ROOT is missing:',
+            self.stage95,
+        )

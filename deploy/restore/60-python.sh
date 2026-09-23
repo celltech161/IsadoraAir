@@ -92,12 +92,21 @@ print('Gst version:', '.'.join(str(x) for x in Gst.version()))
       log_error "manage.py check FAILED -- see output above. This usually means .env/database issues from earlier stages, not this stage itself."
       exit 1
     fi
+
+    log_info "Collecting static assets into the restored STATIC_ROOT..."
+    if ( cd "$RESTORE_TARGET_ROOT" && "$VENV_DIR/bin/python" manage.py collectstatic --noinput --skip-checks ); then
+      log_info "collectstatic: PASS"
+    else
+      log_error "collectstatic FAILED -- the restored web UI is not software-complete."
+      exit 1
+    fi
   else
-    log_warn "No .env at $ENV_FILE -- skipping manage.py check (run 20-application.sh first for a full verification)."
+    log_warn "No .env at $ENV_FILE -- skipping manage.py check and collectstatic (run 20-application.sh first for a full verification)."
   fi
 else
   log_plan "$VENV_DIR/bin/python -c \"import gi; ...; Gst.init(None)\""
   log_plan "cd $RESTORE_TARGET_ROOT && $VENV_DIR/bin/python manage.py check"
+  log_plan "cd $RESTORE_TARGET_ROOT && $VENV_DIR/bin/python manage.py collectstatic --noinput --skip-checks"
 fi
 
 # ---------------------------------------------------------------------
