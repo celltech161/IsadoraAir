@@ -5199,3 +5199,138 @@ class DisasterRecoveryStaticAssetsContractTests(SimpleTestCase):
             'log_error "STATIC_ROOT is missing:',
             self.stage95,
         )
+
+
+class DisasterRecoveryNginxDefaultSiteContractTests(SimpleTestCase):
+    """DR-08B: bare-metal recovery must disable Ubuntu's enabled nginx default site."""
+
+    def setUp(self):
+        super().setUp()
+        self.tmpdir = Path(tempfile.mkdtemp(prefix="isadoraair-dr08b-nginx-"))
+        self.addCleanup(shutil.rmtree, self.tmpdir, ignore_errors=True)
+        self.staging = self.tmpdir / "staging"
+
+        self.available = self.staging / "etc/nginx/sites-available"
+        self.enabled = self.staging / "etc/nginx/sites-enabled"
+        self.available.mkdir(parents=True)
+        self.enabled.mkdir(parents=True)
+
+        self.default_available = self.available / "default"
+        self.default_available.write_text(
+            "PACKAGE-OWNED-DEFAULT-SENTINEL\n",
+            encoding="utf-8",
+        )
+        self.default_enabled = self.enabled / "default"
+        self.default_enabled.symlink_to("../sites-available/default")
+
+    def _run(self, mode):
+        return subprocess.run(
+            [
+                str(RESTORE_DIR / "90-system-config.sh"),
+                "--staging-root",
+                str(self.staging),
+                mode,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+
+    def test_apply_disables_only_enabled_default_and_preserves_package_file(self):
+        result = self._run("--apply")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        self.assertFalse(
+            self.default_enabled.exists() or self.default_enabled.is_symlink(),
+            "sites-enabled/default must be absent after Stage 90",
+        )
+        self.assertTrue(self.default_available.is_file())
+        self.assertEqual(
+            self.default_available.read_text(encoding="utf-8"),
+            "PACKAGE-OWNED-DEFAULT-SENTINEL\n",
+        )
+
+        isadoraair_enabled = self.enabled / "isadoraair"
+        self.assertTrue(isadoraair_enabled.is_symlink())
+        self.assertIn("Disabled stock nginx default site", result.stdout)
+
+    def test_apply_is_idempotent_when_default_site_is_already_disabled(self):
+        self.default_enabled.unlink()
+
+        first = self._run("--apply")
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        self.assertIn("already disabled", first.stdout)
+
+        second = self._run("--apply")
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+        self.assertIn("already disabled", second.stdout)
+
+        self.assertTrue(self.default_available.is_file())
+        self.assertFalse(
+            self.default_enabled.exists() or self.default_enabled.is_symlink()
+        )
+
+    def test_plan_previews_disable_without_mutating_default_site(self):
+        result = self._run("--plan")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+        self.assertTrue(self.default_enabled.is_symlink())
+        self.assertTrue(self.default_available.is_file())
+        self.assertIn(
+            "disable stock nginx default site only; preserve sites-available/default",
+            result.stdout,
+        )
+
+    def test_stage90_never_targets_sites_available_default_for_removal(self):
+        source = (RESTORE_DIR / "90-system-config.sh").read_text(encoding="utf-8")
+
+        self.assertIn(
+            'DEFAULT_NGINX_SITE_LINK="$ETC_ROOT/nginx/sites-enabled/default"',
+            source,
+        )
+
+        block_start = source.index(
+            'DEFAULT_NGINX_SITE_LINK="$ETC_ROOT/nginx/sites-enabled/default"'
+        )
+        block_end = source.index("# ---- 3b. Self-signed TLS certificate", block_start)
+        default_site_block = source[block_start:block_end]
+
+        removal_lines = []
+        for line in default_site_block.splitlines():
+            stripped = line.strip()
+            if stripped.startswith(("rm ", "sudo rm ", "unlink ", "sudo unlink ")):
+                removal_lines.append(stripped)
+
+        self.assertEqual(
+            removal_lines,
+            [
+                'sudo rm -f -- "$DEFAULT_NGINX_SITE_LINK"',
+                'rm -f -- "$DEFAULT_NGINX_SITE_LINK"',
+            ],
+        )
+
+        self.assertNotIn(
+            'rm -f -- "$ETC_ROOT/nginx/sites-available/default"',
+            source,
+        )
+        self.assertNotIn(
+            'unlink "$ETC_ROOT/nginx/sites-available/default"',
+            source,
+        )
+
+    def test_directory_at_enabled_default_fails_closed_without_removal(self):
+        self.default_enabled.unlink()
+        self.default_enabled.mkdir()
+        sentinel = self.default_enabled / "DO-NOT-DELETE"
+        sentinel.write_text("preserve-me\n", encoding="utf-8")
+
+        result = self._run("--apply")
+
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(
+            "is a directory, not the conventional nginx default-site link/file",
+            result.stdout + result.stderr,
+        )
+        self.assertTrue(self.default_enabled.is_dir())
+        self.assertEqual(sentinel.read_text(encoding="utf-8"), "preserve-me\n")
+        self.assertTrue(self.default_available.is_file())

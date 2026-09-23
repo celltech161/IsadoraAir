@@ -303,6 +303,15 @@ install_rendered "$REPO_ROOT/deploy/asound.conf" "$ETC_ROOT/asound.conf"
 # ---- 3. nginx site + snippet ----------------------------------------------
 install_rendered "$REPO_ROOT/deploy/isadoraair-locations.conf" "$ETC_ROOT/nginx/snippets/isadoraair-locations.conf"
 install_rendered "$REPO_ROOT/deploy/isadoraair.nginx" "$ETC_ROOT/nginx/sites-available/isadoraair"
+
+# DR-08B: Ubuntu's nginx package ships sites-available/default and, on a
+# fresh host, may enable it through sites-enabled/default. That stock site
+# declares `listen 80 default_server`, so merely enabling IsadoraAir beside
+# it does not give IsadoraAir deterministic ownership of unmatched HTTP
+# requests. Preserve the package-owned sites-available/default reference
+# file, but converge its enabled link to ABSENT before nginx -t / bring-up.
+DEFAULT_NGINX_SITE_LINK="$ETC_ROOT/nginx/sites-enabled/default"
+
 if [ "$RESTORE_MODE" = "apply" ]; then
   if [ "$USE_SUDO" -eq 1 ]; then
     sudo mkdir -p "$ETC_ROOT/nginx/sites-enabled"
@@ -312,8 +321,27 @@ if [ "$RESTORE_MODE" = "apply" ]; then
     ln -sf "$ETC_ROOT/nginx/sites-available/isadoraair" "$ETC_ROOT/nginx/sites-enabled/isadoraair"
   fi
   log_info "sites-enabled/isadoraair -> sites-available/isadoraair (symlink, per deploy/README.md's 'One authoritative nginx config')."
+
+  # A directory at this exact path is not the normal package layout and
+  # must never be recursively removed just to make recovery continue.
+  if [ -d "$DEFAULT_NGINX_SITE_LINK" ] && [ ! -L "$DEFAULT_NGINX_SITE_LINK" ]; then
+    log_error "$DEFAULT_NGINX_SITE_LINK is a directory, not the conventional nginx default-site link/file -- refusing to remove it automatically."
+    exit 1
+  fi
+
+  if [ -e "$DEFAULT_NGINX_SITE_LINK" ] || [ -L "$DEFAULT_NGINX_SITE_LINK" ]; then
+    if [ "$USE_SUDO" -eq 1 ]; then
+      sudo rm -f -- "$DEFAULT_NGINX_SITE_LINK"
+    else
+      rm -f -- "$DEFAULT_NGINX_SITE_LINK"
+    fi
+    log_info "Disabled stock nginx default site: $DEFAULT_NGINX_SITE_LINK (sites-available/default preserved)."
+  else
+    log_info "Stock nginx default site already disabled: $DEFAULT_NGINX_SITE_LINK absent."
+  fi
 else
   log_plan "ln -sf $ETC_ROOT/nginx/sites-available/isadoraair $ETC_ROOT/nginx/sites-enabled/isadoraair"
+  log_plan "rm -f -- $DEFAULT_NGINX_SITE_LINK (disable stock nginx default site only; preserve sites-available/default)"
 fi
 
 # ---- 3b. Self-signed TLS certificate -------------------------------------
