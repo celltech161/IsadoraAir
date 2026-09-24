@@ -27,7 +27,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import gi
 
@@ -2841,5 +2841,186 @@ class OutputMonitoringDedupeDefenseInDepthTests(TestCase):
 
             self.assertTrue(wait_until(lambda: slot.coordinator.state != audio_recovery.SlotState.RECOVERING,
                                         timeout=3.0))
+        finally:
+            pipeline.set_state(Gst.State.NULL)
+
+
+class AudioGapDiagnosticTests(SimpleTestCase):
+    """Focused regression coverage for bounded, metrics-only gap evidence."""
+
+    def test_alsa_procfs_parser_retains_runway_and_pointer_fields(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            status = Path(temp_dir) / "status"
+            status.write_text(
+                "state: RUNNING\n"
+                "delay       : 7384\n"
+                "avail       : 1436\n"
+                "avail_max   : 1514\n"
+                "-----\n"
+                "hw_ptr      : 1000\n"
+                "appl_ptr    : 8384\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(eng_module._read_alsa_pcm_status(status), {
+                "state": "RUNNING", "delay": 7384, "avail": 1436,
+                "avail_max": 1514, "hw_ptr": 1000, "appl_ptr": 8384,
+            })
+
+    def test_ring_rotates_to_one_bounded_backup(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "gap.jsonl"
+            ring = eng_module.AudioGapDiagnosticRing(
+                lambda _now: None, path=path, max_bytes=150, interval_s=0.05)
+            try:
+                for index in range(30):
+                    ring._append({"wall_ts": index, "payload": "x" * 35})
+            finally:
+                ring._close()
+
+            self.assertTrue(path.exists())
+            self.assertTrue(ring.backup_path.exists())
+            self.assertLessEqual(path.stat().st_size, 150)
+            self.assertLessEqual(ring.backup_path.stat().st_size, 150)
+            self.assertEqual(
+                sorted(p.name for p in Path(temp_dir).iterdir()),
+                ["gap.jsonl", "gap.jsonl.1"],
+            )
+
+    def test_pre_stereotool_probe_records_timing_not_payload(self):
+        obj = make_output_engine_stand_in()
+        obj._audio_gap_pre_buffer_state = None
+        obj._audio_gap_pre_buffer_count = 0
+        obj._audio_gap_pre_discont_count = 0
+
+        first = Gst.Buffer.new_allocate(None, 4096, None)
+        first.pts = 1_000_000_000
+        first.duration = 20_000_000
+        second = Gst.Buffer.new_allocate(None, 4096, None)
+        second.pts = 1_030_000_000
+        second.duration = 20_000_000
+        second.set_flags(Gst.BufferFlags.DISCONT)
+
+        class Info:
+            def __init__(self, buffer):
+                self.buffer = buffer
+
+            def get_buffer(self):
+                return self.buffer
+
+        self.assertEqual(obj._on_audio_gap_pre_buffer(None, Info(first)), Gst.PadProbeReturn.OK)
+        self.assertEqual(obj._on_audio_gap_pre_buffer(None, Info(second)), Gst.PadProbeReturn.OK)
+        state = obj._audio_gap_pre_buffer_state
+        self.assertEqual(state["count"], 2)
+        self.assertEqual(state["discont_count"], 1)
+        self.assertEqual(state["pts_gap_ns"], 10_000_000)
+        self.assertNotIn("data", state)
+        self.assertNotIn("payload", state)
+
+    def test_pre_transients_between_sampler_writes_remain_latched(self):
+        """A later normal buffer must not erase a 10-20ms arrival delay
+        before the independent 20Hz sampler gets its next turn."""
+        class Info:
+            def __init__(self, buffer):
+                self.buffer = buffer
+
+            def get_buffer(self):
+                return self.buffer
+
+        for delay_ms in (10, 15, 20):
+            with self.subTest(delay_ms=delay_ms):
+                obj = make_output_engine_stand_in()
+                obj._audio_gap_pre_buffer_state = None
+                obj._audio_gap_pre_buffer_count = 0
+                obj._audio_gap_pre_discont_count = 0
+                obj._audio_gap_pre_transient_count = 0
+                obj._audio_gap_pre_last_transient_state = None
+
+                buffers = []
+                for pts_ms in (0, 5, 10, 15):
+                    buffer = Gst.Buffer.new_allocate(None, 256, None)
+                    buffer.pts = pts_ms * Gst.MSECOND
+                    buffer.duration = 5 * Gst.MSECOND
+                    buffers.append(buffer)
+
+                base = 1_000_000_000
+                arrivals = [
+                    base,
+                    base + (5 + delay_ms) * 1_000_000,
+                    base + (10 + delay_ms) * 1_000_000,
+                    base + (15 + delay_ms) * 1_000_000,
+                ]
+                with patch.object(eng_module.time, "monotonic_ns", side_effect=arrivals):
+                    for buffer in buffers:
+                        obj._on_audio_gap_pre_buffer(None, Info(buffer))
+
+                state = obj._audio_gap_pre_buffer_state
+                self.assertEqual(state["arrival_late_by_ns"], 0)
+                self.assertEqual(state["transient_count"], 1)
+                self.assertEqual(
+                    state["last_transient_arrival_late_by_ns"],
+                    delay_ms * 1_000_000,
+                )
+                self.assertEqual(state["last_transient_pts_gap_ns"], 0)
+
+                obj._stereotool_slot = MagicMock(current_sink=None)
+                obj._stereotool_slot.queue.get_property.return_value = 0
+                obj._audio_gap_last_pre_transient_count = 0
+                with patch.object(eng_module, "_read_alsa_pcm_status", return_value=None), \
+                     patch.object(eng_module, "_read_small_json", return_value=None):
+                    persisted = obj._audio_gap_diagnostic_snapshot(time.monotonic())
+                self.assertEqual(persisted["pre"]["transient_delta"], 1)
+                self.assertEqual(
+                    persisted["pre"]["last_transient_arrival_late_by_ns"],
+                    delay_ms * 1_000_000,
+                )
+
+    def test_snapshot_joins_pre_queue_sink_alsa_and_post_evidence(self):
+        obj = make_output_engine_stand_in()
+        pipeline, slot = build_slot_in_pipeline(
+            obj, name="Stereotool Input", kind="stereotool")
+        try:
+            now_ns = time.monotonic_ns()
+            obj._audio_gap_pre_level_state = {
+                "monotonic_ns": now_ns, "wall_ts": time.time(),
+                "rms_db": [-18.0, -19.0], "peak_db": [-3.0, -4.0],
+            }
+            obj._audio_gap_pre_buffer_state = {
+                "monotonic_ns": now_ns, "count": 10, "discont_count": 0,
+                "pts_ns": 1_000_000_000, "duration_ns": 20_000_000,
+                "pts_gap_ns": 0, "transient_count": 2,
+            }
+            obj._audio_gap_last_sampler_monotonic = None
+            obj._audio_gap_last_rendered = None
+            obj._audio_gap_last_buffer_count = None
+            obj._audio_gap_last_pre_transient_count = None
+            obj._audio_gap_last_post_transient_count = None
+            first_post = {
+                "timestamp": time.time(), "frame_interval_ms": 46.4,
+                "levels_db": [-12.0, -13.0], "generation": "g",
+                "transient_count": 4,
+            }
+            second_post = dict(first_post, transient_count=5)
+            alsa = {
+                "state": "RUNNING", "delay": 7800, "avail": 1020,
+                "hw_ptr": 100, "appl_ptr": 7900,
+            }
+            with patch.object(eng_module, "_read_alsa_pcm_status", return_value=alsa), \
+                 patch.object(eng_module, "_read_small_json",
+                              side_effect=[first_post, second_post]):
+                first = obj._audio_gap_diagnostic_snapshot(time.monotonic())
+                obj._audio_gap_pre_buffer_state = dict(
+                    obj._audio_gap_pre_buffer_state, count=13, transient_count=3)
+                second = obj._audio_gap_diagnostic_snapshot(time.monotonic() + 0.05)
+
+            self.assertEqual(first["schema"], 1)
+            self.assertEqual(first["pre"]["rms_db"], [-18.0, -19.0])
+            self.assertEqual(second["pre"]["buffer_delta"], 3)
+            self.assertEqual(second["pre"]["transient_delta"], 1)
+            self.assertEqual(second["alsa"]["delay"], 7800)
+            self.assertEqual(second["post"]["frame_interval_ms"], 46.4)
+            self.assertEqual(second["post"]["transient_delta"], 1)
+            self.assertIn("level_time_ns", second["queue"])
+            self.assertIn("rendered", second["sink"])
+            self.assertNotIn("audio", second)
         finally:
             pipeline.set_state(Gst.State.NULL)

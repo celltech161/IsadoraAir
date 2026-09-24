@@ -96,6 +96,25 @@ class BuildLiquidsoapScriptTests(TestCase):
         self.assertNotIn("settings.server.telnet.set(true)", without_aircheck)
         self.assertNotIn("aircheck_output = output.file(", without_aircheck)
 
+    def test_post_stereotool_diagnostic_reuses_only_aircheck_source(self):
+        """Post-ST evidence must piggyback on the one existing airtap
+        consumer, never add a second input.alsa or affect non-Aircheck groups."""
+        with_aircheck = em.build_liquidsoap_script(
+            "airtap", [make_encoder()], host_aircheck=True, generation="diag-gen")
+        without_aircheck = em.build_liquidsoap_script(
+            "airtap", [make_encoder()], host_aircheck=False, generation="diag-gen")
+
+        self.assertEqual(with_aircheck.count("source = input.alsa"), 1)
+        self.assertIn("source.on_frame(before=false, synchronous=false, write_post_stereotool_diag)",
+                      with_aircheck)
+        self.assertIn(f'file.write(data=state, atomic=true, temp_dir="/run/isadoraair", "{em.POST_STEREOTOOL_DIAG_PATH}")',
+                      with_aircheck)
+        self.assertIn("frame_interval_ms = post_diag_frame_interval_ms()", with_aircheck)
+        self.assertIn("transient_count = post_diag_transient_count()", with_aircheck)
+        self.assertIn("last_transient_delay_ms = post_diag_last_transient_delay_ms()", with_aircheck)
+        self.assertIn("levels_db = source.dB_levels()", with_aircheck)
+        self.assertNotIn("write_post_stereotool_diag", without_aircheck)
+
     def test_exact_script_detector_recognizes_he_aac_aircheck_with_mp3_stream(self):
         from aircheck.models import AircheckConfig
 
@@ -291,6 +310,42 @@ class BuildLiquidsoapScriptRealSyntaxTests(TestCase):
                 capture_output=True, text=True, timeout=30,
             )
         self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+
+
+class PostStereoToolTransientLatchTests(SimpleTestCase):
+    """Execute the exact generated Liquidsoap latch with synthetic delays.
+
+    Each delayed callback is followed by a normal callback before inspection,
+    proving that a 10/15/20ms event cannot be overwritten between Engine's
+    20Hz diagnostic reads.
+    """
+
+    def test_10_15_20ms_frame_delays_survive_a_following_normal_frame(self):
+        if shutil.which("liquidsoap") is None:
+            self.skipTest("liquidsoap not installed on this box")
+
+        for delay_ms in (10, 15, 20):
+            with self.subTest(delay_ms=delay_ms), tempfile.TemporaryDirectory() as tmpdir:
+                script = "\n".join(em._post_stereotool_latch_lines() + [
+                    "post_diag_last_frame_at.set(0.0)",
+                    "expected_s = post_diag_expected_frame_ms / 1000.0",
+                    "observe_post_stereotool_frame(expected_s)",
+                    f"observe_post_stereotool_frame((2.0 * expected_s) + {delay_ms / 1000.0})",
+                    f"observe_post_stereotool_frame((3.0 * expected_s) + {delay_ms / 1000.0})",
+                    'print("LATCH count=#{post_diag_transient_count()} delay=#{post_diag_last_transient_delay_ms()}")',
+                    "shutdown(code=0)",
+                ]) + "\n"
+                script_path = Path(tmpdir) / "latch.liq"
+                script_path.write_text(script, encoding="utf-8")
+                result = subprocess.run(
+                    ["liquidsoap", "-q", str(script_path)],
+                    capture_output=True, text=True, timeout=30,
+                )
+
+                self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+                self.assertIn("LATCH count=1", result.stdout)
+                reported = float(result.stdout.rsplit("delay=", 1)[1].strip())
+                self.assertAlmostEqual(reported, delay_ms, delta=0.01)
 
 
 class StartupClassifierScriptTests(TestCase):

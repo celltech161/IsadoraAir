@@ -184,6 +184,12 @@ AIRCHECK_TELNET_HOST = "127.0.0.1"
 AIRCHECK_TELNET_PORT = 1234
 AIRCHECK_CURRENT_PATH = "/run/isadoraair/aircheck-current.audio"
 AIRCHECK_OUTPUT_ID = "aircheck"
+# Latest post-StereoTool frame evidence from the already-open airtap source.
+# This is metrics-only (frame cadence + dB levels), atomically overwritten on
+# tmpfs, and consumed by Engine's bounded audio-gap diagnostic ring.  No
+# second ALSA client and no additional program-audio recording are introduced.
+POST_STEREOTOOL_DIAG_PATH = "/run/isadoraair/post_stereotool_audio.json"
+POST_STEREOTOOL_TRANSIENT_THRESHOLD_MS = 8.0
 
 # shout2send-style protocol mapping doesn't apply here — Liquidsoap has
 # distinct operators instead: output.icecast for real Icecast 2 (mount
@@ -214,6 +220,37 @@ def _liq_string(value):
     if "#{" in value:
         raise ValueError('Refusing to embed "#{" in a Liquidsoap string literal (interpolation injection risk).')
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _post_stereotool_latch_lines():
+    """Liquidsoap state that makes one short delayed frame persistent.
+
+    The current interval still updates on every callback, but the cumulative
+    counter and last-event fields change only for an >=8ms excess. Engine can
+    therefore sample at 20Hz without a following normal frame erasing a
+    10-20ms event that occurred wholly between two samples.
+    """
+    return [
+        'post_diag_expected_frame_ms = frame.duration() * 1000.0',
+        'post_diag_last_frame_at = ref(time())',
+        'post_diag_frame_count = ref(0)',
+        'post_diag_frame_interval_ms = ref(0.0)',
+        'post_diag_transient_count = ref(0)',
+        'post_diag_last_transient_at = ref(0.0)',
+        'post_diag_last_transient_delay_ms = ref(0.0)',
+        'def observe_post_stereotool_frame(now) =',
+        '  frame_interval_ms = (now - post_diag_last_frame_at()) * 1000.0',
+        '  post_diag_last_frame_at.set(now)',
+        '  post_diag_frame_count.set(post_diag_frame_count() + 1)',
+        '  post_diag_frame_interval_ms.set(frame_interval_ms)',
+        '  late_by_ms = frame_interval_ms - post_diag_expected_frame_ms',
+        f'  if late_by_ms >= {POST_STEREOTOOL_TRANSIENT_THRESHOLD_MS} then',
+        '    post_diag_transient_count.set(post_diag_transient_count() + 1)',
+        '    post_diag_last_transient_at.set(now)',
+        '    post_diag_last_transient_delay_ms.set(late_by_ms)',
+        '  end',
+        'end',
+    ]
 
 
 _GENERATION_LINE_PATTERN = re.compile(r'^generation = "[^"]*"$', re.MULTILINE)
@@ -1111,6 +1148,34 @@ def build_liquidsoap_script(input_device, encoders, host_aircheck=False, generat
         'update_now_playing()',
         '',
     ]
+    if host_aircheck:
+        # Attach to the SAME blank.detect-wrapped source already feeding both
+        # encoders and Aircheck.  source.on_frame therefore observes the real
+        # post-StereoTool airtap without opening another PCM consumer.  The
+        # callback writes only one latest-state file; Engine's separately
+        # bounded JSONL ring supplies retention and cross-boundary correlation.
+        lines += _post_stereotool_latch_lines() + [
+            'def write_post_stereotool_diag() =',
+            '  now = time()',
+            '  observe_post_stereotool_frame(now)',
+            '  state = json.stringify(compact=true, {',
+            '    timestamp = now,',
+            '    frame_interval_ms = post_diag_frame_interval_ms(),',
+            '    expected_frame_ms = post_diag_expected_frame_ms,',
+            '    frame_count = post_diag_frame_count(),',
+            '    transient_count = post_diag_transient_count(),',
+            '    last_transient_at = post_diag_last_transient_at(),',
+            '    last_transient_delay_ms = post_diag_last_transient_delay_ms(),',
+            '    levels_db = source.dB_levels(),',
+            '    input_device = input_device_str,',
+            '    pid = process.pid(),',
+            '    generation = generation,',
+            '  })',
+            f'  file.write(data=state, atomic=true, temp_dir="/run/isadoraair", {_liq_string(POST_STEREOTOOL_DIAG_PATH)})',
+            'end',
+            'source.on_frame(before=false, synchronous=false, write_post_stereotool_diag)',
+            '',
+        ]
     for encoder, key in zip(encoders, dest_keys):
         lines += _output_block(encoder, "source", key)
     if host_aircheck:

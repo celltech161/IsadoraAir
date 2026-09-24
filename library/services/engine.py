@@ -133,6 +133,21 @@ NOW_PLAYING_PATH = Path("/run/isadoraair/now_playing.json")
 # file.watch, so it doesn't need the same in-place-write care.
 RBDS_CATEGORY_STATE_PATH = Path("/run/isadoraair/rbds_category_state.json")
 
+# Focused, always-bounded evidence for rare sub-second program-audio gaps.
+# The sampler runs on its own daemon thread so procfs/tmpfs I/O can never
+# block a GStreamer streaming thread or the GLib main loop.  Two 4 MiB JSONL
+# files retain roughly 5-7 minutes at 20 Hz (record size varies slightly),
+# contain metrics only -- never PCM/program content -- and live on tmpfs.
+AUDIO_GAP_DIAG_PATH = Path("/run/isadoraair/audio_gap_diagnostics.jsonl")
+AUDIO_GAP_DIAG_MAX_BYTES = 4 * 1024 * 1024
+AUDIO_GAP_DIAG_INTERVAL_S = 0.05
+# A little below the operator's 10ms lower estimate so integer/timestamp
+# rounding cannot turn a real 10ms event into a false negative.
+AUDIO_GAP_TRANSIENT_THRESHOLD_NS = 8 * 1_000_000
+# Use ALSA's stable card-ID symlink rather than today's numeric card index.
+AUDIO_GAP_ALSA_STATUS_PATH = Path("/proc/asound/Loopback/pcm0p/sub0/status")
+POST_STEREOTOOL_DIAG_PATH = Path("/run/isadoraair/post_stereotool_audio.json")
+
 # Remote DJ diagnostic instrumentation -- see class RemoteDJSession's
 # docstring and _remote_dj_on_pad_added. Reset on every session start;
 # left in place after session stop so a post-mortem can inspect the last
@@ -299,6 +314,141 @@ def _dj_diag(session, msg):
             session.diag_bytes_written += line_bytes
         except Exception:
             _close_diag_locked(session)
+
+
+def _read_alsa_pcm_status(path=AUDIO_GAP_ALSA_STATUS_PATH):
+    """Read one ALSA procfs status snapshot without opening the PCM.
+
+    None means the procfs endpoint was absent/unreadable.  Only the small
+    numeric/state fields needed to distinguish a drained playback ring from a
+    healthy one are retained; malformed individual fields degrade to strings
+    rather than escaping into the diagnostic sampler.
+    """
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return None
+    result = {}
+    numeric = {"delay", "avail", "avail_max", "hw_ptr", "appl_ptr"}
+    for raw_line in text.splitlines():
+        if ":" not in raw_line:
+            continue
+        key, value = (part.strip() for part in raw_line.split(":", 1))
+        if key not in numeric and key != "state":
+            continue
+        if key in numeric:
+            try:
+                value = int(value)
+            except ValueError:
+                pass
+        result[key] = value
+    return result or None
+
+
+def _read_small_json(path):
+    """Best-effort read for one small tmpfs state file."""
+    try:
+        value = json.loads(Path(path).read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else None
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+
+
+class AudioGapDiagnosticRing:
+    """Low-overhead 20 Hz sampler with a hard two-file retention bound.
+
+    snapshot_fn executes only on this daemon thread.  A failure to sample or
+    write is intentionally diagnostic-only: it is swallowed and retried on
+    the next cadence, never propagated into playout.  Rotation is current ->
+    ``.1``; at most 2 * max_bytes is retained.
+    """
+
+    def __init__(self, snapshot_fn, *, path=AUDIO_GAP_DIAG_PATH,
+                 max_bytes=AUDIO_GAP_DIAG_MAX_BYTES,
+                 interval_s=AUDIO_GAP_DIAG_INTERVAL_S):
+        self.snapshot_fn = snapshot_fn
+        self.path = Path(path)
+        self.max_bytes = int(max_bytes)
+        self.interval_s = float(interval_s)
+        self._stop = threading.Event()
+        self._thread = None
+        self._fh = None
+        self._bytes_written = 0
+
+    @property
+    def backup_path(self):
+        return Path(f"{self.path}.1")
+
+    def start(self):
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(
+            target=self._run, name="audio-gap-diagnostic", daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=max(0.25, self.interval_s * 4))
+        self._thread = None
+        self._close()
+
+    def _close(self):
+        fh = self._fh
+        self._fh = None
+        if fh is not None:
+            try:
+                fh.close()
+            except OSError:
+                pass
+
+    def _open(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if self.path.exists() and self.path.stat().st_size >= self.max_bytes:
+            os.replace(self.path, self.backup_path)
+        self._fh = open(self.path, "a", encoding="utf-8", buffering=1)
+        self._bytes_written = self.path.stat().st_size
+
+    def _rotate(self):
+        self._close()
+        os.replace(self.path, self.backup_path)
+        self._fh = open(self.path, "w", encoding="utf-8", buffering=1)
+        self._bytes_written = 0
+
+    def _append(self, record):
+        line = json.dumps(record, separators=(",", ":"), ensure_ascii=True) + "\n"
+        encoded_size = len(line.encode("utf-8"))
+        if encoded_size > self.max_bytes:
+            return
+        if self._fh is None:
+            self._open()
+        if self._bytes_written + encoded_size > self.max_bytes:
+            self._rotate()
+        self._fh.write(line)
+        self._bytes_written += encoded_size
+
+    def _run(self):
+        next_sample = time.monotonic()
+        try:
+            while not self._stop.is_set():
+                delay = next_sample - time.monotonic()
+                if delay > 0 and self._stop.wait(delay):
+                    break
+                sampled_at = time.monotonic()
+                try:
+                    record = self.snapshot_fn(sampled_at)
+                    if record is not None:
+                        self._append(record)
+                except Exception:
+                    self._close()
+                # Never burst/catch up after a delayed sample.  A long sample
+                # interval is itself retained evidence in the next record.
+                next_sample = max(next_sample + self.interval_s,
+                                  sampled_at + self.interval_s)
+        finally:
+            self._close()
 
 
 def _close_remote_dj_pcm(session):
@@ -1339,6 +1489,22 @@ class PlaybackEngine:
         # Checked by _next_queue_item BEFORE normal cursor logic.
         self._forced_next_items = []
         self._urgent_retry_counts = {}  # {category_code: count} -- per-category, not shared
+        # Sub-second program-gap evidence.  Streaming callbacks only replace
+        # tiny in-memory snapshots; the independent sampler owns every procfs
+        # read and tmpfs append/rotation operation.
+        self._audio_gap_pre_level_state = None
+        self._audio_gap_pre_buffer_state = None
+        self._audio_gap_pre_buffer_count = 0
+        self._audio_gap_pre_discont_count = 0
+        self._audio_gap_pre_transient_count = 0
+        self._audio_gap_pre_last_transient_state = None
+        self._audio_gap_last_sampler_monotonic = None
+        self._audio_gap_last_rendered = None
+        self._audio_gap_last_buffer_count = None
+        self._audio_gap_last_pre_transient_count = None
+        self._audio_gap_last_post_transient_count = None
+        self._audio_gap_diagnostics = AudioGapDiagnosticRing(
+            self._audio_gap_diagnostic_snapshot)
 
     def start(self):
         self.running = True
@@ -1368,6 +1534,11 @@ class PlaybackEngine:
         # deck load (much later, at track boundary) picks up the hint.
         self._read_resume_hint()
         self._build_main_pipeline()
+        # Starts only after the StereoTool slot and its persistent queue exist.
+        # With no StereoTool output configured there is no relevant bridge to
+        # diagnose, so no sampler thread or diagnostic files are created.
+        if self._stereotool_slot is not None:
+            self._audio_gap_diagnostics.start()
         self._load_current_hour_log()
         # If the resume hint carries a log_item_id that lives in the
         # just-loaded queue, back the cursor up so that item loads
@@ -1443,6 +1614,9 @@ class PlaybackEngine:
                 self._stop_started = True
 
         self.running = False
+        diagnostics = getattr(self, "_audio_gap_diagnostics", None)
+        if diagnostics is not None:
+            diagnostics.stop()
         # Preserve occurrence identity/position before detach clears the deck
         # map. The subsequent clean segment close excludes all service
         # downtime, and the next process may continue the same PlayEvent.
@@ -2063,6 +2237,15 @@ class PlaybackEngine:
             # own docstring for exactly which of those applies and why.
             "remote_dj": self._remote_dj_level_payload(),
         }
+        # Immutable assignment only: the independent diagnostic sampler reads
+        # this latest pre-StereoTool level snapshot without performing any I/O
+        # or locking on the GLib message path.
+        self._audio_gap_pre_level_state = {
+            "monotonic_ns": time.monotonic_ns(),
+            "wall_ts": payload["ts"],
+            "rms_db": rms,
+            "peak_db": peak,
+        }
         try:
             LEVELS_PATH.parent.mkdir(parents=True, exist_ok=True)
             LEVELS_TMP_PATH.write_text(json.dumps(payload), encoding="utf-8")
@@ -2073,6 +2256,217 @@ class PlaybackEngine:
             # try again with fresh values.
             pass
         return True
+
+    def _on_audio_gap_pre_buffer(self, pad, info):
+        """Streaming-thread probe: counters/timestamps only, never audio data."""
+        try:
+            buffer = info.get_buffer()
+            if buffer is None:
+                return Gst.PadProbeReturn.OK
+            now_ns = time.monotonic_ns()
+            pts = buffer.pts
+            duration = buffer.duration
+            invalid = Gst.CLOCK_TIME_NONE
+            pts_ns = None if pts in (None, invalid) or pts < 0 else int(pts)
+            duration_ns = (
+                None if duration in (None, invalid) or duration < 0 else int(duration)
+            )
+            previous = getattr(self, "_audio_gap_pre_buffer_state", None)
+            pts_gap_ns = None
+            arrival_interval_ns = None
+            arrival_late_by_ns = None
+            if (
+                previous is not None
+                and previous.get("pts_ns") is not None
+                and previous.get("duration_ns") is not None
+                and pts_ns is not None
+            ):
+                pts_gap_ns = pts_ns - (
+                    previous["pts_ns"] + previous["duration_ns"])
+            if previous is not None and previous.get("monotonic_ns") is not None:
+                arrival_interval_ns = max(0, now_ns - previous["monotonic_ns"])
+                if previous.get("duration_ns") is not None:
+                    arrival_late_by_ns = max(
+                        0, arrival_interval_ns - previous["duration_ns"])
+            count = getattr(self, "_audio_gap_pre_buffer_count", 0) + 1
+            discont_count = getattr(self, "_audio_gap_pre_discont_count", 0)
+            is_discont = buffer.has_flags(Gst.BufferFlags.DISCONT)
+            if is_discont:
+                discont_count += 1
+            is_transient = any((
+                is_discont,
+                arrival_late_by_ns is not None
+                and arrival_late_by_ns >= AUDIO_GAP_TRANSIENT_THRESHOLD_NS,
+                pts_gap_ns is not None
+                and abs(pts_gap_ns) >= AUDIO_GAP_TRANSIENT_THRESHOLD_NS,
+            ))
+            transient_count = getattr(self, "_audio_gap_pre_transient_count", 0)
+            last_transient = getattr(
+                self, "_audio_gap_pre_last_transient_state", None)
+            if is_transient:
+                transient_count += 1
+                last_transient = {
+                    "monotonic_ns": now_ns,
+                    "arrival_late_by_ns": arrival_late_by_ns,
+                    "pts_gap_ns": pts_gap_ns,
+                    "discont": bool(is_discont),
+                }
+            self._audio_gap_pre_buffer_count = count
+            self._audio_gap_pre_discont_count = discont_count
+            self._audio_gap_pre_transient_count = transient_count
+            self._audio_gap_pre_last_transient_state = last_transient
+            self._audio_gap_pre_buffer_state = {
+                "monotonic_ns": now_ns,
+                "count": count,
+                "discont_count": discont_count,
+                "pts_ns": pts_ns,
+                "duration_ns": duration_ns,
+                "pts_gap_ns": pts_gap_ns,
+                "arrival_interval_ns": arrival_interval_ns,
+                "arrival_late_by_ns": arrival_late_by_ns,
+                # Cumulative/last-event evidence deliberately survives later
+                # normal buffers until the 20Hz sampler persists it.
+                "transient_count": transient_count,
+                "last_transient_monotonic_ns": (
+                    last_transient.get("monotonic_ns") if last_transient else None),
+                "last_transient_arrival_late_by_ns": (
+                    last_transient.get("arrival_late_by_ns") if last_transient else None),
+                "last_transient_pts_gap_ns": (
+                    last_transient.get("pts_gap_ns") if last_transient else None),
+                "last_transient_discont": (
+                    last_transient.get("discont") if last_transient else None),
+            }
+        except Exception:
+            pass
+        return Gst.PadProbeReturn.OK
+
+    def _audio_gap_diagnostic_snapshot(self, sampled_at=None):
+        """Build one metrics-only record on the diagnostic worker thread."""
+        slot = getattr(self, "_stereotool_slot", None)
+        if slot is None:
+            return None
+        sampled_at = time.monotonic() if sampled_at is None else sampled_at
+        now_ns = time.monotonic_ns()
+        wall_ts = time.time()
+        previous_sample = getattr(self, "_audio_gap_last_sampler_monotonic", None)
+        sample_interval_ms = (
+            None if previous_sample is None else round((sampled_at - previous_sample) * 1000, 3)
+        )
+        self._audio_gap_last_sampler_monotonic = sampled_at
+
+        queue_state = {}
+        for output_key, property_name in (
+            ("level_time_ns", "current-level-time"),
+            ("level_buffers", "current-level-buffers"),
+            ("level_bytes", "current-level-bytes"),
+        ):
+            try:
+                queue_state[output_key] = int(slot.queue.get_property(property_name))
+            except Exception:
+                queue_state[output_key] = None
+
+        rendered = _output_sink_rendered_count(slot.current_sink) if slot.current_sink else None
+        previous_rendered = getattr(self, "_audio_gap_last_rendered", None)
+        rendered_delta = None
+        if rendered is not None and previous_rendered is not None and rendered >= previous_rendered:
+            rendered_delta = rendered - previous_rendered
+        self._audio_gap_last_rendered = rendered
+
+        pre_level = getattr(self, "_audio_gap_pre_level_state", None)
+        pre_buffer = getattr(self, "_audio_gap_pre_buffer_state", None)
+        buffer_count = pre_buffer.get("count") if pre_buffer else None
+        previous_buffer_count = getattr(self, "_audio_gap_last_buffer_count", None)
+        buffer_delta = None
+        if buffer_count is not None and previous_buffer_count is not None and buffer_count >= previous_buffer_count:
+            buffer_delta = buffer_count - previous_buffer_count
+        self._audio_gap_last_buffer_count = buffer_count
+
+        pre_transient_count = (
+            pre_buffer.get("transient_count") if pre_buffer else None)
+        previous_pre_transient_count = getattr(
+            self, "_audio_gap_last_pre_transient_count", None)
+        pre_transient_delta = None
+        if (
+            pre_transient_count is not None
+            and previous_pre_transient_count is not None
+            and pre_transient_count >= previous_pre_transient_count
+        ):
+            pre_transient_delta = (
+                pre_transient_count - previous_pre_transient_count)
+        self._audio_gap_last_pre_transient_count = pre_transient_count
+
+        def age_ms(snapshot):
+            if not snapshot or snapshot.get("monotonic_ns") is None:
+                return None
+            return round(max(0, now_ns - snapshot["monotonic_ns"]) / 1_000_000, 3)
+
+        post = _read_small_json(POST_STEREOTOOL_DIAG_PATH)
+        if post is not None:
+            try:
+                post["age_ms"] = round(max(0.0, wall_ts - float(post["timestamp"])) * 1000, 3)
+            except (KeyError, TypeError, ValueError):
+                post["age_ms"] = None
+            try:
+                last_transient_at = float(post["last_transient_at"])
+                post["last_transient_age_ms"] = (
+                    round(max(0.0, wall_ts - last_transient_at) * 1000, 3)
+                    if last_transient_at > 0 else None
+                )
+            except (KeyError, TypeError, ValueError):
+                post["last_transient_age_ms"] = None
+            post_transient_count = post.get("transient_count")
+            previous_post_transient_count = getattr(
+                self, "_audio_gap_last_post_transient_count", None)
+            post["transient_delta"] = None
+            if (
+                isinstance(post_transient_count, int)
+                and isinstance(previous_post_transient_count, int)
+                and post_transient_count >= previous_post_transient_count
+            ):
+                post["transient_delta"] = (
+                    post_transient_count - previous_post_transient_count)
+            self._audio_gap_last_post_transient_count = post_transient_count
+
+        return {
+            "schema": 1,
+            "wall_ts": wall_ts,
+            "monotonic_ns": now_ns,
+            "sample_interval_ms": sample_interval_ms,
+            "pre": {
+                "level_age_ms": age_ms(pre_level),
+                "rms_db": pre_level.get("rms_db") if pre_level else None,
+                "peak_db": pre_level.get("peak_db") if pre_level else None,
+                "buffer_age_ms": age_ms(pre_buffer),
+                "buffer_count": buffer_count,
+                "buffer_delta": buffer_delta,
+                "discont_count": pre_buffer.get("discont_count") if pre_buffer else None,
+                "pts_ns": pre_buffer.get("pts_ns") if pre_buffer else None,
+                "duration_ns": pre_buffer.get("duration_ns") if pre_buffer else None,
+                "pts_gap_ns": pre_buffer.get("pts_gap_ns") if pre_buffer else None,
+                "arrival_interval_ns": (
+                    pre_buffer.get("arrival_interval_ns") if pre_buffer else None),
+                "arrival_late_by_ns": (
+                    pre_buffer.get("arrival_late_by_ns") if pre_buffer else None),
+                "transient_count": pre_transient_count,
+                "transient_delta": pre_transient_delta,
+                "last_transient_age_ms": age_ms({
+                    "monotonic_ns": pre_buffer.get("last_transient_monotonic_ns")
+                }) if pre_buffer and pre_buffer.get("last_transient_monotonic_ns") else None,
+                "last_transient_arrival_late_by_ns": (
+                    pre_buffer.get("last_transient_arrival_late_by_ns")
+                    if pre_buffer else None),
+                "last_transient_pts_gap_ns": (
+                    pre_buffer.get("last_transient_pts_gap_ns")
+                    if pre_buffer else None),
+                "last_transient_discont": (
+                    pre_buffer.get("last_transient_discont")
+                    if pre_buffer else None),
+            },
+            "queue": queue_state,
+            "sink": {"rendered": rendered, "rendered_delta": rendered_delta},
+            "alsa": _read_alsa_pcm_status(),
+            "post": post,
+        }
 
     def _remote_dj_level_payload(self):
         """[4.1] Returns the most recent gain-adjusted Remote DJ level
@@ -3724,6 +4118,12 @@ class PlaybackEngine:
         self.output_level.set_property("interval", LEVEL_INTERVAL_MS * Gst.MSECOND)
         self.output_level.set_property("peak-ttl", LEVEL_PEAK_TTL_MS * Gst.MSECOND)
         self.output_level.set_property("peak-falloff", LEVEL_PEAK_FALLOFF_DB_PER_SEC)
+        # Metrics-only continuity probe immediately before the StereoTool tee.
+        # It never maps or retains buffer payloads; it records only arrival,
+        # duration/PTS continuity, and DISCONT counters in memory for the
+        # independent 20 Hz diagnostic sampler.
+        self.output_level.get_static_pad("src").add_probe(
+            Gst.PadProbeType.BUFFER, self._on_audio_gap_pre_buffer)
 
         # [P0] 1.3C -- Studio Monitor's containment/recovery boundary.
         # Built UNCONDITIONALLY (unlike StereoTool below) -- per the task
