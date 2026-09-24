@@ -98,6 +98,16 @@ STEREOTOOL_OUTPUT_NAME = "Stereotool Input"
 OUTPUT_HEALTH_STABILIZATION_S = 0.5
 OUTPUT_HEALTH_CHECK_DEADLINE_S = 5.0  # generous grace for a real device -- Round 6's real rebuilds took well under this
 OUTPUT_RENDER_VERIFY_DEADLINE_S = 2.0  # bounded window, valve open, waiting for stats()["rendered"] to actually increase
+
+# HW-04/05/06 -- live hardware media-flow observability. This is deliberately
+# separate from SlotCoordinator state (recovery-operation state) and from
+# library.services.media_health (deck/media-file incident validation).
+LIVE_MEDIA_HEALTH_FLOWING = "FLOWING"
+LIVE_MEDIA_HEALTH_NOT_FLOWING = "NOT_FLOWING"
+LIVE_MEDIA_HEALTH_UNVERIFIED = "UNVERIFIED"
+MIC_MEDIA_HEALTH_STALE_MS = 250
+MIC_MEDIA_HEALTH_STARTUP_GRACE_S = 1.0
+OUTPUT_MEDIA_HEALTH_STALE_S = 1.0
 OUTPUT_RECOVERY_SLOT_TIMEOUT_S = 15.0  # matches mic's own SlotCoordinator timeout_s
 
 # Studio mic input, mixed in via a second (master) mixer downstream of
@@ -754,6 +764,17 @@ class OutputRecoverySlot:
         self.device_present = None            # observability only; None = unknown/not probed yet
         self.last_error = None
         self.last_state_change_at = None
+
+        # HW-04/06 -- live media-flow observation is a separate axis from
+        # coordinator.state. A new/current sink starts UNVERIFIED;
+        # _output_media_health_state() proves FLOWING only after the rendered
+        # counter advances, and may later report NOT_FLOWING without changing
+        # recovery policy or touching the pipeline.
+        self.media_observation_sink = current_sink
+        self.media_observation_started_at = time.monotonic()
+        self.media_last_rendered = None
+        self.media_last_progress_at = None
+
         self._device_loss_epoch = 0
         self._device_loss_epoch_lock = threading.Lock()
         # [P0] 1.3C physical-acceptance-failure fix -- a UI-facing loss-
@@ -1208,6 +1229,10 @@ class PlaybackEngine:
         self._mic_legacy_device = ""
         self._mic_buf_last_ns = None
         self._mic_buf_count = 0
+        # HW-05/06 -- generation-specific media observation. mic_ok remains
+        # a compatibility/recovery flag; it is not physical-capture proof.
+        self._mic_media_baseline_count = 0
+        self._mic_media_observation_started_at = None
         # Remote DJ over WebRTC. remote_dj_tee only exists at all when
         # RemoteDJConfig.enabled (see _build_main_pipeline) -- while off,
         # these all stay None and the pipeline topology is unchanged from
@@ -1925,6 +1950,13 @@ class PlaybackEngine:
         # see _on_mic_error, which now additionally drives recovery).
         # Only RECOVERY attempts (after an observed failure) go through
         # the guarded background-worker path in _mic_dispatch_rebuild.
+        #
+        # HW-05/06: begin a generation-specific media observation window
+        # before generation 1 is linked. This closes the old semantic gap
+        # where mic_ok=True at construction time could be mistaken for proof
+        # that the ALSA source had actually emitted a buffer.
+        self._mic_media_baseline_count = self._mic_buf_count
+        self._mic_media_observation_started_at = time.monotonic()
         hw_bin, hw_src = self._build_mic_hw_generation(mic_device)
         mic_bin.add(hw_bin)
         hw_bin.get_static_pad("src").link(queue.get_static_pad("sink"))
@@ -2321,6 +2353,11 @@ class PlaybackEngine:
             self._mic_identity_kind, self._mic_identity, self._mic_legacy_device)
         if not runtime_device:
             return
+        # HW-05/06: prove buffers from this candidate generation, not from a
+        # previously-retired one. Recovery's existing health rule is unchanged;
+        # this is only the operator-facing observation baseline.
+        self._mic_media_baseline_count = self._mic_buf_count
+        self._mic_media_observation_started_at = time.monotonic()
         new_bin, new_src = self._build_mic_hw_generation(runtime_device)
         self._mic_bin.add(new_bin)
         new_bin.get_static_pad("src").link(self._mic_quarantine_q.get_static_pad("sink"))
@@ -2552,6 +2589,43 @@ class PlaybackEngine:
         self._mic_dispatch_rebuild()
         return True
 
+    def _mic_media_health_state(self):
+        """Return current physical capture-flow evidence without changing it.
+
+        HW-05/06: SlotCoordinator state and ``mic_ok`` are intentionally not
+        treated as proof of capture. The quarantine-queue probe observes only
+        the real hardware generation, so a fresh buffer from the current
+        generation is direct media-flow evidence. A short startup window is
+        UNVERIFIED rather than falsely healthy or falsely failed.
+        """
+        if self._mic_slot is None:
+            return None
+
+        now = time.monotonic()
+        started_at = getattr(self, "_mic_media_observation_started_at", None)
+        baseline = getattr(self, "_mic_media_baseline_count", 0)
+        count = getattr(self, "_mic_buf_count", 0)
+        age_ms = self._mic_buffer_age_ms()
+
+        has_generation = (
+            getattr(self, "_mic_hw_bin", None) is not None
+            or getattr(self, "_mic_pending_hw_bin", None) is not None
+        )
+        if not has_generation:
+            status = LIVE_MEDIA_HEALTH_NOT_FLOWING
+        elif count > baseline and age_ms is not None and age_ms <= MIC_MEDIA_HEALTH_STALE_MS:
+            status = LIVE_MEDIA_HEALTH_FLOWING
+        elif started_at is None or (now - started_at) < MIC_MEDIA_HEALTH_STARTUP_GRACE_S:
+            status = LIVE_MEDIA_HEALTH_UNVERIFIED
+        else:
+            status = LIVE_MEDIA_HEALTH_NOT_FLOWING
+
+        return {
+            "status": status,
+            "buffer_age_ms": age_ms,
+            "buffers_observed_this_generation": max(0, count - baseline),
+        }
+
     def _mic_recovery_state(self):
         """[P0] 1.3B2 -- engine_state.json's mic_recovery block. None
         when no mic is configured at all (matches mic_configured=False;
@@ -2576,6 +2650,7 @@ class PlaybackEngine:
             "last_error": self._mic_last_error,
             "last_state_change": self._mic_last_state_change_at,
             "next_retry_in_s": next_retry_in_s,
+            "media_health": self._mic_media_health_state(),
             "restart_required": snapshot["state"] == audio_recovery.SlotState.RESTART_REQUIRED.value,
         }
 
@@ -3450,6 +3525,79 @@ class PlaybackEngine:
             self._output_dispatch_rebuild(slot)
         return True
 
+    def _output_media_health_state(self, slot):
+        """Return observed render-flow health for one active output sink.
+
+        HW-04/06: ``SlotCoordinator.OK`` means no unresolved recovery
+        operation; it is not physical-audio proof. GstBaseSink's rendered
+        counter is the same non-blocking evidence recovery already trusts.
+        A new sink needs one baseline sample before FLOWING can be proven.
+        """
+        now = time.monotonic()
+        sink = slot.current_sink
+
+        if sink is None:
+            slot.media_observation_sink = None
+            slot.media_observation_started_at = now
+            slot.media_last_rendered = None
+            slot.media_last_progress_at = None
+            return {
+                "status": LIVE_MEDIA_HEALTH_NOT_FLOWING,
+                "rendered_count": None,
+                "last_progress_age_s": None,
+            }
+
+        if sink is not getattr(slot, "media_observation_sink", None):
+            slot.media_observation_sink = sink
+            slot.media_observation_started_at = now
+            slot.media_last_rendered = None
+            slot.media_last_progress_at = None
+
+        rendered = _output_sink_rendered_count(sink)
+        if rendered is None:
+            return {
+                "status": LIVE_MEDIA_HEALTH_UNVERIFIED,
+                "rendered_count": None,
+                "last_progress_age_s": None,
+            }
+
+        last = getattr(slot, "media_last_rendered", None)
+        if last is None or rendered < last:
+            slot.media_last_rendered = rendered
+            slot.media_observation_started_at = now
+            slot.media_last_progress_at = None
+            return {
+                "status": LIVE_MEDIA_HEALTH_UNVERIFIED,
+                "rendered_count": rendered,
+                "last_progress_age_s": None,
+            }
+
+        if rendered > last:
+            slot.media_last_rendered = rendered
+            slot.media_last_progress_at = now
+            return {
+                "status": LIVE_MEDIA_HEALTH_FLOWING,
+                "rendered_count": rendered,
+                "last_progress_age_s": 0.0,
+            }
+
+        progress_at = getattr(slot, "media_last_progress_at", None)
+        observation_started = getattr(slot, "media_observation_started_at", now)
+        reference = progress_at if progress_at is not None else observation_started
+        age_s = max(0.0, now - reference)
+        if age_s >= OUTPUT_MEDIA_HEALTH_STALE_S:
+            status = LIVE_MEDIA_HEALTH_NOT_FLOWING
+        elif progress_at is not None:
+            status = LIVE_MEDIA_HEALTH_FLOWING
+        else:
+            status = LIVE_MEDIA_HEALTH_UNVERIFIED
+
+        return {
+            "status": status,
+            "rendered_count": rendered,
+            "last_progress_age_s": round(age_s, 3),
+        }
+
     def _output_recovery_state(self):
         """[P0] 1.3C -- engine_state.json's output_recovery block, keyed
         by slot kind ("studio_monitor"/"stereotool"). {} if no output
@@ -3500,6 +3648,7 @@ class PlaybackEngine:
                 "next_retry_in_s": next_retry_in_s,
                 "last_error": slot.last_error,
                 "last_state_change": slot.last_state_change_at,
+                "media_health": self._output_media_health_state(slot),
                 "restart_required": snapshot["state"] == audio_recovery.SlotState.RESTART_REQUIRED.value,
             }
         return out

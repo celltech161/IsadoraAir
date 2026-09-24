@@ -1720,8 +1720,23 @@ function renderMicPtt(data) {
   btn.disabled = !data.mic_configured || weAreRemote;
   btn.classList.remove('pending');
   btn.classList.toggle('active', !!data.mic_live);
-  btn.textContent = (data.mic_configured && data.mic_ok === false)
-    ? 'Studio Mic: ERROR' : (data.mic_live ? 'Studio Mic: LIVE' : 'Studio Mic: OFF');
+  // HW-05/06: mic_ok is a compatibility/recovery flag, not physical-flow
+  // proof. Prefer the additive hardware-buffer health signal when present;
+  // older engine payloads without it retain the legacy ERROR/LIVE/OFF view.
+  const micHealth = data.mic_recovery?.media_health?.status || null;
+  if (data.mic_live) {
+    btn.textContent = (data.mic_ok === false || micHealth === 'NOT_FLOWING')
+      ? 'Studio Mic: LIVE (ERROR)'
+      : (micHealth === 'UNVERIFIED')
+        ? 'Studio Mic: LIVE (CHECKING)'
+        : 'Studio Mic: LIVE';
+  } else {
+    btn.textContent = (data.mic_configured && (data.mic_ok === false || micHealth === 'NOT_FLOWING'))
+      ? 'Studio Mic: ERROR'
+      : (data.mic_configured && micHealth === 'UNVERIFIED')
+        ? 'Studio Mic: CHECKING'
+        : 'Studio Mic: OFF';
+  }
 }
 
 async function toggleRemoteDjGate() {
