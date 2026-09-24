@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "release_id": "r0086",
+  "previous_release_id": "r0085",
+  "minimum_updater_protocol_version": 5,
+  "summary": "P0 1.2 physical disaster-recovery remediation: harden archive bootstrap, restore missing runtime/deployment prerequisites, make nginx and snd-aloop replacement-safe, preserve Stereo Tool recovery state/provenance, validate replacement audio bindings, and expose truthful media-flow health. Requires four GStreamer GI apt prerequisites to be installed manually. No migrations, Python requirements, systemd units, static assets, or protected runtime changes.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [
+    "gir1.2-freedesktop",
+    "gir1.2-gst-plugins-base-1.0",
+    "gir1.2-gst-plugins-extra-1.0",
+    "gir1.2-gst-plugins-bad-1.0"
+  ],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-gunicorn",
+    "isadoraair-engine"
+  ],
+  "nginx_changed": true,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0081",
+  "protected_runtime": null
+}
