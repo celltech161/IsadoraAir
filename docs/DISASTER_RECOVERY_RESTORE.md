@@ -1157,8 +1157,36 @@ start the engine until it passes. The command never silently falls back to
 a source-machine numeric output path.
 
 Microphone/input capability is intentionally separate from this output
-gate. Replacement-host input capability/readiness is validated separately
-and must not be inferred from an output-gate PASS.
+gate and must not be inferred from an output-gate PASS.
+
+### Pre-engine studio-microphone binding gate
+
+If `Studio Microphone 1` is configured, run the read-only input-binding
+readiness check before starting `isadoraair-engine`:
+
+```bash
+venv/bin/python manage.py check_audio_input_bindings
+```
+
+This command does **not** open a capture PCM, alter any `AudioInput` row,
+or start/restart a service. It uses the same direction-aware ALSA discovery
+as Django Admin and requires the configured stable `alsa_card_id` to be
+capture-capable on `DEV=0`, matching the engine's
+`plughw:CARD=<id>,DEV=0` runtime contract.
+
+A missing or completely unconfigured `Studio Microphone 1` is reported as
+`NOT_CONFIGURED` and is safe for engine bring-up: the engine already treats
+that state as "local studio microphone disabled." A configured mic with only
+a raw/legacy device path, a blank stable identity, or an identity that is not
+capture-capable on `DEV=0` is `REBIND_REQUIRED`. In that case, use Django
+Admin to select the replacement capture hardware and its stable ALSA card
+identity, rerun the command, and do not start the engine until the configured
+mic reports `READY`.
+
+The first mic hardware generation now uses that same stable identity
+resolution as later hotplug-recovery generations. A source-host numeric
+`plughw:N,M` value therefore cannot override a configured stable identity
+during cold start.
 
 ## ALSA / snd-aloop
 
@@ -1180,6 +1208,12 @@ identified hardware; it does not make a source-station identity valid on
 materially different replacement hardware. Run
 `manage.py check_audio_output_bindings` before engine activation to detect
 that case and require an explicit operator rebind.
+
+The studio microphone follows the same stable-card runtime form. Its
+replacement-host gate is direction-aware: a card merely appearing in
+`/proc/asound/cards` is insufficient; the configured identity must also
+offer capture on `DEV=0`. Run `manage.py check_audio_input_bindings` before
+engine activation whenever `Studio Microphone 1` is configured.
 
 
 ## After bring-up: confirming real readiness

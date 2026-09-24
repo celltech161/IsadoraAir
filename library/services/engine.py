@@ -1812,9 +1812,20 @@ class PlaybackEngine:
         pad, per the locked design in
         scratchpad/audio_recovery/PHASE_P0_1.3_DISCOVERY_AND_DESIGN.md."""
         mic_device = self._resolve_mic_device()
+        self._resolve_mic_identity()
+
+        # Stable identity must win from generation 1, not only after a
+        # device-loss rebuild. Keep legacy startup behavior unchanged when
+        # no supported stable identity is configured.
+        if self._mic_identity_kind == "alsa_card_id" and self._mic_identity:
+            mic_device = audio_recovery.resolve_runtime_device(
+                self._mic_identity_kind,
+                self._mic_identity,
+                self._mic_legacy_device or mic_device or "",
+            )
+
         if not mic_device:
             return []
-        self._resolve_mic_identity()
 
         # Persistent silence fallback -- must exist before any hardware
         # failure can occur, per the locked design ("the silence fallback

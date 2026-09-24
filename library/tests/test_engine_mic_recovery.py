@@ -745,6 +745,22 @@ class RebuiltGenerationClockPolicyTests(MockDuckingMixin, SimpleTestCase):
         _, src = obj._build_mic_hw_generation("plughw:CARD=FRESH,DEV=0")
         self.assertEqual(src.get_property("device"), "plughw:CARD=FRESH,DEV=0")
 
+    def test_cold_start_prefers_stable_identity_over_legacy_device(self):
+        obj = make_mic_stand_in(
+            identity_kind="alsa_card_id",
+            identity="PCH",
+            legacy_device="plughw:99,0",
+        )
+
+        obj._build_mic_chain()
+
+        src = obj._mic_hw_bin.get_by_name("mic_src_gen1")
+        self.assertIsNotNone(src)
+        self.assertEqual(
+            src.get_property("device"),
+            "plughw:CARD=PCH,DEV=0",
+        )
+
     def test_generation_counter_increments_each_call(self):
         obj = make_mic_stand_in()
         gen0 = obj._mic_hw_generation
