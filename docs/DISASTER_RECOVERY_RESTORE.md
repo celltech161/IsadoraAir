@@ -698,7 +698,8 @@ registration/license material. Its archive member is
 decryption, install it as `~/.stereo_tool.rc` with mode **0600** before
 Stereo Tool is started. Do not treat restoration of this state as permission
 to start Stereo Tool: DR hardware-binding validation remains a separate
-pre-start gate.
+pre-start gate. Run `venv/bin/python manage.py check_stereotool_bindings`
+on the restored host before enabling or starting `stereotool.service`.
 
 
 Not automated, and deliberately so — no script this repo ships ever
@@ -1187,6 +1188,70 @@ The first mic hardware generation now uses that same stable identity
 resolution as later hotplug-recovery generations. A source-host numeric
 `plughw:N,M` value therefore cannot override a configured stable identity
 during cold start.
+
+### Pre-Stereo Tool hardware-binding gate
+
+Before enabling or starting `stereotool.service` on restored/replacement
+hardware, install the recovered `~/.stereo_tool.rc` with mode **0600** and run:
+
+```bash
+venv/bin/python manage.py check_stereotool_bindings
+```
+
+The normal check is deliberately read-only: it does not open an ALSA PCM,
+rewrite Stereo Tool state, write an acceptance marker, or touch the service.
+Stereo Tool's Linux `Device ID` strings can contain friendly labels while still
+embedding source-machine numeric ALSA coordinates such as `(hw:1,0)`. Those
+`hw:N,M` coordinates are host-specific; the fact that card `N` happens to exist
+on the replacement host is not proof that it is the same hardware.
+
+Bindings with an explicit `Enabled = 0` are reported but do not block by
+themselves. The primary `[Soundcard - Input]` section is intentionally
+fail-closed when it has a `Device ID` but no section-local `Enabled` field:
+physical production evidence showed that this state can be actively capturing.
+An unknown enable value, an unrecognized device-address form, missing runtime
+state, no recognized hardware bindings, or an RC mode other than `0600` also
+prevents the command from passing.
+
+For an active binding that contains the recognized Linux `(hw:N,M)` form,
+`REVIEW_REQUIRED` is the expected first result after bare-metal recovery.
+Inspect the reported mapping in Stereo Tool on the replacement host and either
+reassign it or deliberately confirm that the saved mapping is correct. After
+that operator review, record acceptance of the **current** mappings:
+
+```bash
+venv/bin/python manage.py check_stereotool_bindings --accept-current
+```
+
+`--accept-current` is the only mutating mode of this command. It still never
+changes `.stereo_tool.rc`, opens a PCM, starts/stops a service, or writes the
+database. It writes only the host-local
+`~/.stereo_tool.bindings.accepted.json` marker with mode **0600**. That marker
+contains no `Device ID` strings and no Stereo Tool registration/license,
+password, token, or other processor state. It contains only a schema version,
+the host's `/etc/machine-id`, a SHA-256 fingerprint of the recognized
+hardware-routing fields, and a SHA-256 fingerprint of the current ALSA
+card-ID-to-index inventory.
+
+Acceptance therefore does not silently travel with a restored configuration.
+It becomes invalid if the recognized hardware bindings change, if the machine
+ID changes, or if ALSA cards re-enumerate/change identity. Do **not** copy the
+acceptance marker from the source host or treat it as a recovery artifact.
+Generate it only after reviewing the mappings on the replacement host.
+`--accept-current` also refuses ambiguous/unrecognized active settings and a
+saved `hw:N,M` whose card index is absent from the current host.
+
+After acceptance, rerun the normal read-only command:
+
+```bash
+venv/bin/python manage.py check_stereotool_bindings
+```
+
+`READY` is permission to proceed to deliberate Stereo Tool activation, not
+proof that audio is flowing. `NOT_CONFIGURED` means there is no usable saved
+hardware configuration yet; keep Stereo Tool stopped until configuration is
+established and the check passes. The validator never rewrites a `Device ID`
+or silently substitutes replacement hardware.
 
 ## ALSA / snd-aloop
 
