@@ -1130,6 +1130,36 @@ staging as an expected, hardware-specific readiness gap, not a software
 restore failure — this distinction matters specifically because Phase
 5's drill environment may not reproduce every USB device exactly.
 
+### Pre-engine audio-output binding gate
+
+Before starting `isadoraair-engine` on restored or replacement hardware,
+run the read-only output-binding readiness check from the restored
+application root:
+
+```bash
+venv/bin/python manage.py check_audio_output_bindings
+```
+
+This command does **not** open an ALSA PCM, alter any `AudioOutput` row,
+or start/restart a service. It compares the engine-owned output roles' stable `device_identity`
+values with the ALSA card IDs currently present on the host. The required
+`Studio Monitor` row must be configured. `Stereotool Input`, when
+configured, must also use a supported stable `alsa_card_id` identity that
+exists on the replacement host. Unrelated `AudioOutput` rows do not gate
+engine activation.
+
+`PASS` means the restored output identities are safe to hand to the engine;
+it does not prove that the downstream analog, processor, transmitter, or RF
+path is correct. A `REBIND_REQUIRED` or `UNCONFIGURED` result is an
+intentional pre-start stop: use Django Admin to select the replacement
+hardware and its stable ALSA card identity, rerun the command, and do not
+start the engine until it passes. The command never silently falls back to
+a source-machine numeric output path.
+
+Microphone/input capability is intentionally separate from this output
+gate. Replacement-host input capability/readiness is validated separately
+and must not be inferred from an output-gate PASS.
+
 ## ALSA / snd-aloop
 
 `90-system-config.sh` installs `deploy/isadoraair-aloop.conf` to
@@ -1140,10 +1170,17 @@ kernel module reload (or reboot) is required afterward for the pinned
 boot) plus `sudo modprobe -r snd_aloop && sudo modprobe snd-aloop` (or
 just reboot). Verify with `cat /proc/asound/cards` — three "Loopback"
 entries at indices 0/3/4 alongside real hardware, or via
-`manage.py check_deploy_baseline`'s own snd-aloop check. The unstable
-real USB sound-card numbering (`docs/ALSA_DEVICE_INVENTORY.md`'s
-`plughw:2,0` note) is **not** solved by this tooling — remains roadmap
-item 1.3.
+`manage.py check_deploy_baseline`'s own snd-aloop check.
+
+Physical audio outputs no longer have to follow the source machine's
+numeric ALSA card order: `hardware.AudioOutput` supports stable
+`alsa_card_id` identities, and the engine resolves those identities to
+`plughw:CARD=<id>,DEV=0`. That solves re-enumeration of the same
+identified hardware; it does not make a source-station identity valid on
+materially different replacement hardware. Run
+`manage.py check_audio_output_bindings` before engine activation to detect
+that case and require an explicit operator rebind.
+
 
 ## After bring-up: confirming real readiness
 
