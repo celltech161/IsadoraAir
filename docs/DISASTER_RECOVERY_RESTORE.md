@@ -1256,14 +1256,14 @@ or silently substitutes replacement hardware.
 ## ALSA / snd-aloop
 
 `90-system-config.sh` installs `deploy/isadoraair-aloop.conf` to
-`/etc/modprobe.d/` and `deploy/asound.conf` to `/etc/asound.conf`. A
-kernel module reload (or reboot) is required afterward for the pinned
-3-instance loopback layout to take effect —
-`echo snd-aloop | sudo tee /etc/modules-load.d/snd-aloop.conf` (loads at
-boot) plus `sudo modprobe -r snd_aloop && sudo modprobe snd-aloop` (or
-just reboot). Verify with `cat /proc/asound/cards` — three "Loopback"
-entries at indices 0/3/4 alongside real hardware, or via
-`manage.py check_deploy_baseline`'s own snd-aloop check.
+`/etc/modprobe.d/` and `deploy/asound.conf` to `/etc/asound.conf`. The pinned
+3-instance loopback layout takes effect on the next boot; ensure `snd-aloop`
+is listed under `/etc/modules-load.d/` and reboot the host after installing
+the modprobe configuration. Do **not** unload `snd_aloop` on a live station
+merely to apply the new options. After reboot, verify with
+`cat /proc/asound/cards` — three "Loopback" entries at indices 0/3/4 alongside
+real hardware — or via `manage.py check_deploy_baseline`'s own snd-aloop
+check.
 
 Physical audio outputs no longer have to follow the source machine's
 numeric ALSA card order: `hardware.AudioOutput` supports stable

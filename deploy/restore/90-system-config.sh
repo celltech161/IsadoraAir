@@ -677,7 +677,7 @@ if [ "$RESTORE_MODE" = "apply" ]; then
       if [ "$LOOPBACK_COUNT" -ge 3 ]; then
         log_info "snd-aloop: $LOOPBACK_COUNT Loopback card(s) present in /proc/asound/cards -- module is loaded with the expected 3-instance layout."
       else
-        log_warn "snd-aloop: only $LOOPBACK_COUNT Loopback card(s) found (expected 3 at indices 0/3/4) -- module may not be loaded yet with the isadoraair-aloop.conf options installed above. A reboot (or 'sudo modprobe -r snd_aloop && sudo modprobe snd-aloop') is needed after installing the modprobe.d config for it to take effect -- see README.md's 'ALSA loopback module' section."
+        log_warn "snd-aloop: only $LOOPBACK_COUNT Loopback card(s) found (expected 3 at indices 0/3/4) -- module may not be loaded yet with the isadoraair-aloop.conf options installed above. Reboot the host after installing the modprobe.d config so the pinned layout can take effect; do not unload snd_aloop on a live station -- see README.md's 'ALSA loopback module' section."
       fi
     else
       log_warn "snd-aloop: /proc/asound/cards not present -- no ALSA sound subsystem on this host, or snd-aloop not loaded at all."
