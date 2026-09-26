@@ -23,6 +23,7 @@ STUDIO_MONITOR_NAME = "Studio Monitor"
 _PIPELINE_AUDIT_FIELDS = (
     "sample_rate",
     "program_gain_db",
+    "audio_gap_diagnostics_enabled",
     "ducking_enabled",
     "duck_level_db",
     "ptt_auto_manual_enabled",
@@ -31,6 +32,7 @@ _PIPELINE_AUDIT_FIELDS = (
 _PIPELINE_APPLY_MODES = {
     "sample_rate": "engine_restart_required",
     "program_gain_db": "engine_restart_required",
+    "audio_gap_diagnostics_enabled": "engine_and_encoders_restart_required",
     "ducking_enabled": "next_ptt_transition",
     "duck_level_db": "next_ptt_transition",
     "ptt_auto_manual_enabled": "next_ptt_transition",
@@ -444,9 +446,10 @@ class AudioPipelineForm(forms.ModelForm):
     audio config in one place". The extra fields load from and save
     back to their own singleton rows.
 
-    Restart discipline (see save_model): only sample_rate and
-    program_gain_db actually require an engine restart -- both are
-    baked into pipeline topology at build time. Ducking is re-read by
+    Restart discipline (see save_model): sample_rate and program_gain_db
+    trigger an engine restart because both are baked into pipeline topology.
+    The audio-gap gate is saved only and needs a later coordinated Engine +
+    encoder restart. Ducking is re-read by
     the engine on every PTT toggle (per DuckingConfig's docstring);
     Remote DJ gain is re-read at session start (per
     RemoteDJAudioInput's docstring). Editing only those on this page
@@ -484,7 +487,10 @@ class AudioPipelineForm(forms.ModelForm):
 
     class Meta:
         model = AudioPipeline
-        fields = ["sample_rate", "program_gain_db", "vu_meter_min_db"]
+        fields = [
+            "sample_rate", "program_gain_db", "vu_meter_min_db",
+            "audio_gap_diagnostics_enabled",
+        ]
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -506,6 +512,14 @@ class AudioPipelineAdmin(admin.ModelAdmin):
                 "build time -- changing either triggers an engine restart on "
                 "save (brief on-air silence). vu_meter_min_db is client-side "
                 "only and takes effect on next dashboard reload; no restart."
+            ),
+        }),
+        ("Diagnostics", {
+            "fields": ("audio_gap_diagnostics_enabled",),
+            "description": (
+                "Saved as the desired startup state. A controlled restart of both "
+                "the IsadoraAir Engine and encoder services is required; saving "
+                "this page does not restart either service."
             ),
         }),
         ("PTT / Automation Mode", {
@@ -539,7 +553,7 @@ class AudioPipelineAdmin(admin.ModelAdmin):
 
     def save_model(self, request, obj, form, change):
         old_pipeline = AudioPipeline.objects.filter(pk=obj.pk).values(
-            "sample_rate", "program_gain_db"
+            "sample_rate", "program_gain_db", "audio_gap_diagnostics_enabled"
         ).first() if obj.pk else None
         old_ducking = DuckingConfig.objects.filter(pk=1).values(
             "enabled", "duck_level_db", "ptt_auto_manual_enabled"
@@ -550,6 +564,8 @@ class AudioPipelineAdmin(admin.ModelAdmin):
             before = {
                 "sample_rate": old_pipeline["sample_rate"],
                 "program_gain_db": old_pipeline["program_gain_db"],
+                "audio_gap_diagnostics_enabled": old_pipeline[
+                    "audio_gap_diagnostics_enabled"],
                 "ducking_enabled": (
                     old_ducking["enabled"]
                     if old_ducking is not None
@@ -586,6 +602,7 @@ class AudioPipelineAdmin(admin.ModelAdmin):
         after = {
             "sample_rate": obj.sample_rate,
             "program_gain_db": obj.program_gain_db,
+            "audio_gap_diagnostics_enabled": obj.audio_gap_diagnostics_enabled,
             "ducking_enabled": ducking.enabled,
             "duck_level_db": ducking.duck_level_db,
             "ptt_auto_manual_enabled": ducking.ptt_auto_manual_enabled,
@@ -618,9 +635,18 @@ class AudioPipelineAdmin(admin.ModelAdmin):
                     for field in changed_fields
                 },
                 restart_required=bool(
-                    {"sample_rate", "program_gain_db"} & set(changed_fields)
+                    {"sample_rate", "program_gain_db",
+                     "audio_gap_diagnostics_enabled"} & set(changed_fields)
                 ),
             )
+
+        if "audio_gap_diagnostics_enabled" in set(form.changed_data):
+            if request is not None:
+                messages.warning(
+                    request,
+                    "Audio-gap diagnostic preference saved. Restart both the "
+                    "IsadoraAir Engine and encoder services for it to take effect.",
+                )
 
         # Only restart the engine if a field that actually requires it
         # changed -- Ducking is read live per PTT, Remote DJ gain per

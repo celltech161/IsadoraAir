@@ -33,6 +33,7 @@ from encoders.services import lkg as lkg_module
 from encoders.services import preflight as preflight_module
 from encoders.services import validation as validation_module
 from encoders.tests.test_candidate_qualification import CandidateFixtureMixin
+from hardware.models import AudioPipeline
 from monitoring.services import probes as probes_module
 
 
@@ -1783,3 +1784,46 @@ class LegacyV1ToV2ConfigFormatTransitionTests(ReconciliationFixtureMixin, Transa
         meta = lkg_module.read_lkg_meta(em._slug("airtap"))
         self.assertEqual(meta["destinations"][0]["provider"], "generic")
         self.assertEqual(meta["fingerprint"], lkg_module.compute_fingerprint("airtap", [encoder]))
+
+
+class LegacyV2ToV3AudioGapTransitionTests(ReconciliationFixtureMixin, TransactionTestCase):
+    """The post-StereoTool callback is a renderer change, not a DB edit."""
+
+    def test_v2_lkg_is_replaced_through_candidate_qualification(self):
+        encoder = make_saved_encoder()
+        pipeline = AudioPipeline.load()
+        pipeline.audio_gap_diagnostics_enabled = True
+        pipeline.save(update_fields=["audio_gap_diagnostics_enabled"])
+        old_script = 'generation = "v2-generation"\n# no post diagnostic callback\n'
+        with patch.object(lkg_module, "ENCODER_CONFIG_FORMAT_VERSION", 2):
+            v2_fingerprint = lkg_module.compute_fingerprint("airtap", [encoder])
+        lkg_module.write_lkg(em._slug("airtap"), old_script, {
+            "fingerprint": v2_fingerprint,
+            "input_device": "airtap",
+            "encoder_ids": [encoder.id],
+            "encoder_names": [encoder.name],
+            "destinations": [{
+                "encoder_id": encoder.id, "name": encoder.name,
+                "host": encoder.host, "port": encoder.port,
+                "shoutcast_sid": encoder.shoutcast_sid,
+                "protocol": encoder.protocol, "mount": encoder.mount,
+                "provider": encoder.provider,
+            }],
+        })
+
+        current_fingerprint = lkg_module.compute_fingerprint(
+            "airtap", [encoder], audio_gap_diagnostics_enabled=True)
+        self.assertNotEqual(v2_fingerprint, current_fingerprint)
+        manager = em.EncoderManager()
+        manager._launch_group("airtap", [encoder])
+
+        self.assertEqual(manager._launch_kind["airtap"], "candidate")
+        active_script = manager._scripts["airtap"].read_text(encoding="utf-8")
+        self.assertIn("write_post_stereotool_diag", active_script)
+        self.assertIn("source.on_frame", active_script)
+
+        self.qualify_via_check_health(manager)
+        promoted_script, promoted_meta = lkg_module.read_lkg(em._slug("airtap"))
+        self.assertEqual(manager._launch_kind["airtap"], "accepted")
+        self.assertIn("write_post_stereotool_diag", promoted_script)
+        self.assertEqual(promoted_meta["fingerprint"], current_fingerprint)

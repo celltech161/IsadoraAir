@@ -16,8 +16,9 @@ class AudioPipeline(models.Model):
     remote-DJ voice can't push the summed peak past 0 dBFS at the input
     to StereoTool. Applied via a `volume` element in the engine chain.
 
-    Both fields require an engine restart to change — the admin change
-    form prompts for and triggers this on save."""
+    The topology fields require an engine restart to change. The diagnostic
+    feature gate is also startup-bound, but intentionally requires an operator-
+    coordinated Engine + encoder restart rather than restarting on save."""
     SAMPLE_RATE_CHOICES = [
         (32000, "32 kHz"),
         (44100, "44.1 kHz"),
@@ -47,6 +48,16 @@ class AudioPipeline(models.Model):
                    "values (e.g. -60) stretch the low end for finer detail "
                    "in quiet program. Client-side display only -- takes "
                    "effect on next dashboard reload, no engine restart.",
+    )
+    audio_gap_diagnostics_enabled = models.BooleanField(
+        default=False,
+        verbose_name="Enable audio-gap diagnostics",
+        help_text=(
+            "Enable bounded sub-second audio-gap diagnostics for troubleshooting "
+            "the Engine → StereoTool → encoder audio path. Enabling or disabling "
+            "this setting requires a restart of the IsadoraAir Engine and encoder "
+            "services to take effect."
+        ),
     )
 
     class Meta:

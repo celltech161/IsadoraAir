@@ -54,6 +54,7 @@ django.setup()
 from django.db import close_old_connections  # noqa: E402
 
 from encoders.models import Encoder  # noqa: E402
+from hardware.models import AudioPipeline  # noqa: E402
 from monitoring.models import emit_event  # noqa: E402
 from isadoraair.version_info import capture_runtime_commit  # noqa: E402
 
@@ -223,31 +224,43 @@ def _liq_string(value):
 
 
 def _post_stereotool_latch_lines():
-    """Liquidsoap state that makes one short delayed frame persistent.
+    """Liquidsoap state that makes one short frame-arrival delay persistent.
 
     The current interval still updates on every callback, but the cumulative
-    counter and last-event fields change only for an >=8ms excess. Engine can
-    therefore sample at 20Hz without a following normal frame erasing a
-    10-20ms event that occurred wholly between two samples.
+    counter and last-event fields change only for an >=8ms excess. Liquidsoap
+    normally invokes these callbacks in batches on this host, so this is
+    scheduler context rather than standalone audio-continuity evidence. Engine
+    can still sample at 20Hz without a following callback erasing a 10-20ms
+    arrival event that occurred wholly between two samples.
     """
     return [
         'post_diag_expected_frame_ms = frame.duration() * 1000.0',
-        'post_diag_last_frame_at = ref(time())',
+        # Zero is an explicit "not observed yet" sentinel.  Initializing this
+        # to render time would make startup/render delay look like a real late
+        # frame before the source has delivered its first frame.
+        'post_diag_last_frame_at = ref(0.0)',
         'post_diag_frame_count = ref(0)',
         'post_diag_frame_interval_ms = ref(0.0)',
-        'post_diag_transient_count = ref(0)',
-        'post_diag_last_transient_at = ref(0.0)',
-        'post_diag_last_transient_delay_ms = ref(0.0)',
+        'post_diag_arrival_jitter_count = ref(0)',
+        'post_diag_last_arrival_jitter_at = ref(0.0)',
+        'post_diag_last_arrival_jitter_late_ms = ref(0.0)',
+        'post_diag_max_arrival_jitter_ms = ref(0.0)',
         'def observe_post_stereotool_frame(now) =',
-        '  frame_interval_ms = (now - post_diag_last_frame_at()) * 1000.0',
+        '  previous_frame_at = post_diag_last_frame_at()',
+        '  frame_interval_ms = if previous_frame_at > 0.0 then',
+        '    (now - previous_frame_at) * 1000.0',
+        '  else',
+        '    0.0',
+        '  end',
         '  post_diag_last_frame_at.set(now)',
         '  post_diag_frame_count.set(post_diag_frame_count() + 1)',
         '  post_diag_frame_interval_ms.set(frame_interval_ms)',
         '  late_by_ms = frame_interval_ms - post_diag_expected_frame_ms',
-        f'  if late_by_ms >= {POST_STEREOTOOL_TRANSIENT_THRESHOLD_MS} then',
-        '    post_diag_transient_count.set(post_diag_transient_count() + 1)',
-        '    post_diag_last_transient_at.set(now)',
-        '    post_diag_last_transient_delay_ms.set(late_by_ms)',
+        f'  if previous_frame_at > 0.0 and late_by_ms >= {POST_STEREOTOOL_TRANSIENT_THRESHOLD_MS} then',
+        '    post_diag_arrival_jitter_count.set(post_diag_arrival_jitter_count() + 1)',
+        '    post_diag_last_arrival_jitter_at.set(now)',
+        '    post_diag_last_arrival_jitter_late_ms.set(late_by_ms)',
+        '    post_diag_max_arrival_jitter_ms.set(max(post_diag_max_arrival_jitter_ms(), late_by_ms))',
         '  end',
         'end',
     ]
@@ -782,7 +795,10 @@ def _telnet_server_block():
     ]
 
 
-def build_liquidsoap_script(input_device, encoders, host_aircheck=False, generation=""):
+def build_liquidsoap_script(
+    input_device, encoders, host_aircheck=False, generation="",
+    audio_gap_diagnostics_enabled=False,
+):
     """One shared `input.alsa` (the device is only ever opened once) fanned
     out to one output.* block per encoder that uses this device.
 
@@ -1148,32 +1164,44 @@ def build_liquidsoap_script(input_device, encoders, host_aircheck=False, generat
         'update_now_playing()',
         '',
     ]
-    if host_aircheck:
+    if host_aircheck and audio_gap_diagnostics_enabled:
         # Attach to the SAME blank.detect-wrapped source already feeding both
         # encoders and Aircheck.  source.on_frame therefore observes the real
         # post-StereoTool airtap without opening another PCM consumer.  The
-        # callback writes only one latest-state file; Engine's separately
-        # bounded JSONL ring supplies retention and cross-boundary correlation.
+        # synchronous callback does only constant-time ref/counter work, so a
+        # 10-20ms delay is latched at the actual frame boundary.  One recurrent
+        # worker writes the latest state at 20Hz; it never competes with another
+        # writer for file.write's atomic temp path.  Engine's separately bounded
+        # JSONL ring supplies retention and cross-boundary correlation.
         lines += _post_stereotool_latch_lines() + [
+            'def observe_post_stereotool_frame_callback() =',
+            '  observe_post_stereotool_frame(time())',
+            'end',
             'def write_post_stereotool_diag() =',
             '  now = time()',
-            '  observe_post_stereotool_frame(now)',
-            '  state = json.stringify(compact=true, {',
-            '    timestamp = now,',
-            '    frame_interval_ms = post_diag_frame_interval_ms(),',
-            '    expected_frame_ms = post_diag_expected_frame_ms,',
-            '    frame_count = post_diag_frame_count(),',
-            '    transient_count = post_diag_transient_count(),',
-            '    last_transient_at = post_diag_last_transient_at(),',
-            '    last_transient_delay_ms = post_diag_last_transient_delay_ms(),',
-            '    levels_db = source.dB_levels(),',
-            '    input_device = input_device_str,',
-            '    pid = process.pid(),',
-            '    generation = generation,',
-            '  })',
-            f'  file.write(data=state, atomic=true, temp_dir="/run/isadoraair", {_liq_string(POST_STEREOTOOL_DIAG_PATH)})',
+            '  try',
+            '    state = json.stringify(compact=true, {',
+            '      timestamp = now,',
+            '      last_frame_at = post_diag_last_frame_at(),',
+            '      frame_interval_ms = post_diag_frame_interval_ms(),',
+            '      expected_frame_ms = post_diag_expected_frame_ms,',
+            '      frame_count = post_diag_frame_count(),',
+            '      arrival_jitter_count = post_diag_arrival_jitter_count(),',
+            '      last_arrival_jitter_at = post_diag_last_arrival_jitter_at(),',
+            '      last_arrival_jitter_late_ms = post_diag_last_arrival_jitter_late_ms(),',
+            '      max_arrival_jitter_ms = post_diag_max_arrival_jitter_ms(),',
+            '      levels_db = source.dB_levels(),',
+            '      input_device = input_device_str,',
+            '      pid = process.pid(),',
+            '      generation = generation,',
+            '    })',
+            f'    file.write(data=state, atomic=true, temp_dir="/run/isadoraair", {_liq_string(POST_STEREOTOOL_DIAG_PATH)})',
+            '  catch _ do',
+            '    ()',
+            '  end',
             'end',
-            'source.on_frame(before=false, synchronous=false, write_post_stereotool_diag)',
+            'source.on_frame(before=false, synchronous=true, observe_post_stereotool_frame_callback)',
+            'thread.run(every=0.05, fast=false, write_post_stereotool_diag)',
             '',
         ]
     for encoder, key in zip(encoders, dest_keys):
@@ -1195,6 +1223,19 @@ class EncoderManager:
         # describe this one process, so any one of them is sufficient
         # for the monitoring side to read.
         self._runtime_commit = capture_runtime_commit()
+        try:
+            self._audio_gap_diagnostics_enabled = bool(
+                AudioPipeline.load().audio_gap_diagnostics_enabled)
+        except Exception as exc:
+            # Optional instrumentation fails closed without preventing encoders
+            # or Aircheck from starting.
+            print(
+                "Failed to read audio-gap diagnostic setting "
+                f"({exc}); diagnostics disabled")
+            self._audio_gap_diagnostics_enabled = False
+        print(
+            "Audio-gap diagnostics -> "
+            f"{'enabled' if self._audio_gap_diagnostics_enabled else 'disabled'}")
         self.running = False
         self._procs = {}          # input_device -> subprocess.Popen
         self._scripts = {}        # input_device -> Path
@@ -1694,7 +1735,11 @@ class EncoderManager:
             # can't bind the same telnet port, and aircheck records what
             # goes to air -- that's the DEFAULT_INPUT_DEVICE tap.
             host_aircheck = input_device == DEFAULT_INPUT_DEVICE
-            script = build_liquidsoap_script(input_device, encoders, host_aircheck=host_aircheck, generation=generation)
+            script = build_liquidsoap_script(
+                input_device, encoders, host_aircheck=host_aircheck,
+                generation=generation,
+                audio_gap_diagnostics_enabled=self._audio_gap_diagnostics_enabled,
+            )
 
         # r0058: the exact script about to be launched is authoritative.
         # This choke point covers newly-rendered candidates, accepted
@@ -2009,7 +2054,12 @@ class EncoderManager:
 
         close_old_connections()
         slug = _slug(input_device)
-        desired_fp = lkg_module.compute_fingerprint(input_device, encoders)
+        desired_fp = lkg_module.compute_fingerprint(
+            input_device, encoders,
+            audio_gap_diagnostics_enabled=(
+                self._audio_gap_diagnostics_enabled
+                and input_device == DEFAULT_INPUT_DEVICE),
+        )
         self._desired_fingerprint[input_device] = desired_fp
         self._reset_runtime_capability_retry_for_new_fingerprint(input_device, desired_fp)
         try:
@@ -2166,7 +2216,11 @@ class EncoderManager:
 
         slug = _slug(input_device)
         host_aircheck = input_device == DEFAULT_INPUT_DEVICE
-        script = build_liquidsoap_script(input_device, encoders, host_aircheck=host_aircheck, generation=generation_label)
+        script = build_liquidsoap_script(
+            input_device, encoders, host_aircheck=host_aircheck,
+            generation=generation_label,
+            audio_gap_diagnostics_enabled=self._audio_gap_diagnostics_enabled,
+        )
         try:
             candidate_path = lkg_module.write_candidate(slug, script)
         except OSError as exc:
@@ -3163,7 +3217,12 @@ class EncoderManager:
 
         candidates = []
         for input_device, encoders in desired_groups.items():
-            desired_fp = lkg_module.compute_fingerprint(input_device, encoders)
+            desired_fp = lkg_module.compute_fingerprint(
+                input_device, encoders,
+                audio_gap_diagnostics_enabled=(
+                    self._audio_gap_diagnostics_enabled
+                    and input_device == DEFAULT_INPUT_DEVICE),
+            )
             self._desired_fingerprint[input_device] = desired_fp
             self._reset_runtime_capability_retry_for_new_fingerprint(input_device, desired_fp)
             if input_device in desired_conflicts:

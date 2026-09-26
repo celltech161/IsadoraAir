@@ -100,20 +100,40 @@ class BuildLiquidsoapScriptTests(TestCase):
         """Post-ST evidence must piggyback on the one existing airtap
         consumer, never add a second input.alsa or affect non-Aircheck groups."""
         with_aircheck = em.build_liquidsoap_script(
-            "airtap", [make_encoder()], host_aircheck=True, generation="diag-gen")
+            "airtap", [make_encoder()], host_aircheck=True, generation="diag-gen",
+            audio_gap_diagnostics_enabled=True)
         without_aircheck = em.build_liquidsoap_script(
             "airtap", [make_encoder()], host_aircheck=False, generation="diag-gen")
 
         self.assertEqual(with_aircheck.count("source = input.alsa"), 1)
-        self.assertIn("source.on_frame(before=false, synchronous=false, write_post_stereotool_diag)",
+        self.assertIn("source.on_frame(before=false, synchronous=true, observe_post_stereotool_frame_callback)",
                       with_aircheck)
+        self.assertIn("thread.run(every=0.05, fast=false, write_post_stereotool_diag)",
+                      with_aircheck)
+        callback = with_aircheck.split("def observe_post_stereotool_frame_callback() =", 1)[1].split("end", 1)[0]
+        self.assertNotIn("file.write", callback)
+        self.assertNotIn("json.stringify", callback)
         self.assertIn(f'file.write(data=state, atomic=true, temp_dir="/run/isadoraair", "{em.POST_STEREOTOOL_DIAG_PATH}")',
                       with_aircheck)
         self.assertIn("frame_interval_ms = post_diag_frame_interval_ms()", with_aircheck)
-        self.assertIn("transient_count = post_diag_transient_count()", with_aircheck)
-        self.assertIn("last_transient_delay_ms = post_diag_last_transient_delay_ms()", with_aircheck)
+        self.assertIn("last_frame_at = post_diag_last_frame_at()", with_aircheck)
+        self.assertIn("arrival_jitter_count = post_diag_arrival_jitter_count()", with_aircheck)
+        self.assertIn("last_arrival_jitter_late_ms = post_diag_last_arrival_jitter_late_ms()", with_aircheck)
+        self.assertIn("max_arrival_jitter_ms = post_diag_max_arrival_jitter_ms()", with_aircheck)
         self.assertIn("levels_db = source.dB_levels()", with_aircheck)
         self.assertNotIn("write_post_stereotool_diag", without_aircheck)
+
+    def test_disabled_diagnostics_omit_callback_without_altering_aircheck(self):
+        script = em.build_liquidsoap_script(
+            "airtap", [make_encoder()], host_aircheck=True, generation="g",
+            audio_gap_diagnostics_enabled=False,
+        )
+
+        self.assertNotIn("write_post_stereotool_diag", script)
+        self.assertNotIn("post_diag_", script)
+        self.assertIn("settings.server.telnet.set(true)", script)
+        self.assertIn("aircheck_output = output.file(", script)
+        self.assertEqual(script.count("source = input.alsa"), 1)
 
     def test_exact_script_detector_recognizes_he_aac_aircheck_with_mp3_stream(self):
         from aircheck.models import AircheckConfig
@@ -301,6 +321,7 @@ class BuildLiquidsoapScriptRealSyntaxTests(TestCase):
             "airtap",
             [make_encoder(name="a", format="mp3", mount="/1"), make_encoder(name="b", format="aac", mount="/2", bitrate_kbps=64)],
             host_aircheck=True, generation="synxtest",
+            audio_gap_diagnostics_enabled=True,
         )
         with tempfile.TemporaryDirectory() as tmpdir:
             script_path = Path(tmpdir) / "test.liq"
@@ -332,7 +353,7 @@ class PostStereoToolTransientLatchTests(SimpleTestCase):
                     "observe_post_stereotool_frame(expected_s)",
                     f"observe_post_stereotool_frame((2.0 * expected_s) + {delay_ms / 1000.0})",
                     f"observe_post_stereotool_frame((3.0 * expected_s) + {delay_ms / 1000.0})",
-                    'print("LATCH count=#{post_diag_transient_count()} delay=#{post_diag_last_transient_delay_ms()}")',
+                    'print("LATCH count=#{post_diag_arrival_jitter_count()} delay=#{post_diag_last_arrival_jitter_late_ms()} max=#{post_diag_max_arrival_jitter_ms()}")',
                     "shutdown(code=0)",
                 ]) + "\n"
                 script_path = Path(tmpdir) / "latch.liq"
@@ -344,8 +365,31 @@ class PostStereoToolTransientLatchTests(SimpleTestCase):
 
                 self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
                 self.assertIn("LATCH count=1", result.stdout)
-                reported = float(result.stdout.rsplit("delay=", 1)[1].strip())
-                self.assertAlmostEqual(reported, delay_ms, delta=0.01)
+                reported_delay = float(
+                    result.stdout.rsplit("delay=", 1)[1].split(" max=", 1)[0])
+                reported_max = float(result.stdout.rsplit("max=", 1)[1].strip())
+                self.assertAlmostEqual(reported_delay, delay_ms, delta=0.01)
+                self.assertAlmostEqual(reported_max, delay_ms, delta=0.01)
+
+
+class AudioGapFeatureGateStartupTests(TestCase):
+    def test_manager_caches_setting_until_controlled_restart(self):
+        from hardware.models import AudioPipeline
+
+        pipeline = AudioPipeline.load()
+        pipeline.audio_gap_diagnostics_enabled = False
+        pipeline.save(update_fields=["audio_gap_diagnostics_enabled"])
+        manager = em.EncoderManager()
+
+        pipeline.audio_gap_diagnostics_enabled = True
+        pipeline.save(update_fields=["audio_gap_diagnostics_enabled"])
+
+        self.assertFalse(manager._audio_gap_diagnostics_enabled)
+        script = em.build_liquidsoap_script(
+            "airtap", [make_encoder()], host_aircheck=True, generation="g",
+            audio_gap_diagnostics_enabled=manager._audio_gap_diagnostics_enabled,
+        )
+        self.assertNotIn("write_post_stereotool_diag", script)
 
 
 class StartupClassifierScriptTests(TestCase):

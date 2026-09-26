@@ -2848,6 +2848,40 @@ class OutputMonitoringDedupeDefenseInDepthTests(TestCase):
 class AudioGapDiagnosticTests(SimpleTestCase):
     """Focused regression coverage for bounded, metrics-only gap evidence."""
 
+    def test_disabled_startup_has_no_probe_thread_or_writer(self):
+        obj = make_output_engine_stand_in()
+        obj._audio_gap_diagnostics_enabled = False
+        obj._stereotool_slot = MagicMock()
+        preexisting_ring = MagicMock()
+        obj._audio_gap_diagnostics = preexisting_ring
+        level = MagicMock()
+
+        self.assertIsNone(obj._install_audio_gap_pre_probe(level))
+        obj._start_audio_gap_diagnostics()
+
+        level.get_static_pad.assert_not_called()
+        preexisting_ring.start.assert_not_called()
+        # No new ring means no diagnostic JSONL writer/thread can exist.
+        self.assertIs(obj._audio_gap_diagnostics, preexisting_ring)
+
+    def test_enabled_startup_installs_probe_and_starts_bounded_writer(self):
+        obj = make_output_engine_stand_in()
+        obj._audio_gap_diagnostics_enabled = True
+        obj._stereotool_slot = MagicMock()
+        level = MagicMock()
+        pad = level.get_static_pad.return_value
+        pad.add_probe.return_value = 42
+        ring = MagicMock()
+
+        with patch.object(eng_module, "AudioGapDiagnosticRing", return_value=ring):
+            self.assertEqual(obj._install_audio_gap_pre_probe(level), 42)
+            obj._start_audio_gap_diagnostics()
+
+        pad.add_probe.assert_called_once_with(
+            Gst.PadProbeType.BUFFER, obj._on_audio_gap_pre_buffer)
+        ring.start.assert_called_once_with()
+        self.assertIs(obj._audio_gap_diagnostics, ring)
+
     def test_alsa_procfs_parser_retains_runway_and_pointer_fields(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             status = Path(temp_dir) / "status"
@@ -2916,9 +2950,9 @@ class AudioGapDiagnosticTests(SimpleTestCase):
         self.assertNotIn("data", state)
         self.assertNotIn("payload", state)
 
-    def test_pre_transients_between_sampler_writes_remain_latched(self):
-        """A later normal buffer must not erase a 10-20ms arrival delay
-        before the independent 20Hz sampler gets its next turn."""
+    def test_pre_arrival_jitter_between_sampler_writes_remains_advisory_latched(self):
+        """A later normal buffer must not erase a 10-20ms arrival delay,
+        but raw scheduler timing remains separate from continuity evidence."""
         class Info:
             def __init__(self, buffer):
                 self.buffer = buffer
@@ -2932,8 +2966,12 @@ class AudioGapDiagnosticTests(SimpleTestCase):
                 obj._audio_gap_pre_buffer_state = None
                 obj._audio_gap_pre_buffer_count = 0
                 obj._audio_gap_pre_discont_count = 0
-                obj._audio_gap_pre_transient_count = 0
-                obj._audio_gap_pre_last_transient_state = None
+                obj._audio_gap_pre_arrival_jitter_count = 0
+                obj._audio_gap_pre_max_arrival_jitter_ns = 0
+                obj._audio_gap_pre_last_arrival_jitter_state = None
+                obj._audio_gap_pre_continuity_event_count = 0
+                obj._audio_gap_pre_max_abs_pts_gap_ns = 0
+                obj._audio_gap_pre_last_continuity_event_state = None
 
                 buffers = []
                 for pts_ms in (0, 5, 10, 15):
@@ -2955,24 +2993,74 @@ class AudioGapDiagnosticTests(SimpleTestCase):
 
                 state = obj._audio_gap_pre_buffer_state
                 self.assertEqual(state["arrival_late_by_ns"], 0)
-                self.assertEqual(state["transient_count"], 1)
+                self.assertEqual(state["arrival_jitter_count"], 1)
                 self.assertEqual(
-                    state["last_transient_arrival_late_by_ns"],
+                    state["last_arrival_jitter_late_by_ns"],
                     delay_ms * 1_000_000,
                 )
-                self.assertEqual(state["last_transient_pts_gap_ns"], 0)
+                self.assertEqual(
+                    state["max_arrival_jitter_ns"], delay_ms * 1_000_000)
+                self.assertEqual(state["continuity_event_count"], 0)
 
                 obj._stereotool_slot = MagicMock(current_sink=None)
                 obj._stereotool_slot.queue.get_property.return_value = 0
-                obj._audio_gap_last_pre_transient_count = 0
+                obj._audio_gap_last_pre_arrival_jitter_count = 0
+                obj._audio_gap_last_pre_continuity_event_count = 0
                 with patch.object(eng_module, "_read_alsa_pcm_status", return_value=None), \
                      patch.object(eng_module, "_read_small_json", return_value=None):
                     persisted = obj._audio_gap_diagnostic_snapshot(time.monotonic())
-                self.assertEqual(persisted["pre"]["transient_delta"], 1)
+                self.assertEqual(persisted["pre"]["arrival_jitter_delta"], 1)
+                self.assertEqual(persisted["pre"]["continuity_event_delta"], 0)
                 self.assertEqual(
-                    persisted["pre"]["last_transient_arrival_late_by_ns"],
+                    persisted["pre"]["last_arrival_jitter_late_by_ns"],
                     delay_ms * 1_000_000,
                 )
+
+    def test_pre_pts_events_between_sampler_writes_remain_latched(self):
+        """A healthy following buffer cannot erase a 10/15/20ms PTS event."""
+        class Info:
+            def __init__(self, buffer):
+                self.buffer = buffer
+
+            def get_buffer(self):
+                return self.buffer
+
+        for gap_ms in (10, 15, 20):
+            with self.subTest(gap_ms=gap_ms):
+                obj = make_output_engine_stand_in()
+                obj._audio_gap_pre_buffer_state = None
+                obj._audio_gap_pre_buffer_count = 0
+                obj._audio_gap_pre_discont_count = 0
+                obj._audio_gap_pre_arrival_jitter_count = 0
+                obj._audio_gap_pre_max_arrival_jitter_ns = 0
+                obj._audio_gap_pre_last_arrival_jitter_state = None
+                obj._audio_gap_pre_continuity_event_count = 0
+                obj._audio_gap_pre_max_abs_pts_gap_ns = 0
+                obj._audio_gap_pre_last_continuity_event_state = None
+
+                pts_values = (0, 5 + gap_ms, 10 + gap_ms, 15 + gap_ms)
+                buffers = []
+                for pts_ms in pts_values:
+                    buffer = Gst.Buffer.new_allocate(None, 256, None)
+                    buffer.pts = pts_ms * Gst.MSECOND
+                    buffer.duration = 5 * Gst.MSECOND
+                    buffers.append(buffer)
+                base = 1_000_000_000
+                with patch.object(
+                    eng_module.time, "monotonic_ns",
+                    side_effect=[base + n * 5_000_000 for n in range(4)],
+                ):
+                    for buffer in buffers:
+                        obj._on_audio_gap_pre_buffer(None, Info(buffer))
+
+                state = obj._audio_gap_pre_buffer_state
+                self.assertEqual(state["pts_gap_ns"], 0)
+                self.assertEqual(state["continuity_event_count"], 1)
+                self.assertEqual(
+                    state["last_continuity_pts_gap_ns"], gap_ms * 1_000_000)
+                self.assertEqual(
+                    state["max_abs_pts_gap_ns"], gap_ms * 1_000_000)
+                self.assertEqual(state["arrival_jitter_count"], 0)
 
     def test_snapshot_joins_pre_queue_sink_alsa_and_post_evidence(self):
         obj = make_output_engine_stand_in()
@@ -2987,19 +3075,23 @@ class AudioGapDiagnosticTests(SimpleTestCase):
             obj._audio_gap_pre_buffer_state = {
                 "monotonic_ns": now_ns, "count": 10, "discont_count": 0,
                 "pts_ns": 1_000_000_000, "duration_ns": 20_000_000,
-                "pts_gap_ns": 0, "transient_count": 2,
+                "pts_gap_ns": 0, "arrival_jitter_count": 2,
+                "continuity_event_count": 1,
             }
             obj._audio_gap_last_sampler_monotonic = None
             obj._audio_gap_last_rendered = None
             obj._audio_gap_last_buffer_count = None
-            obj._audio_gap_last_pre_transient_count = None
-            obj._audio_gap_last_post_transient_count = None
+            obj._audio_gap_last_pre_arrival_jitter_count = None
+            obj._audio_gap_last_pre_continuity_event_count = None
+            obj._audio_gap_last_post_arrival_jitter_count = None
             first_post = {
                 "timestamp": time.time(), "frame_interval_ms": 46.4,
+                "last_frame_at": time.time(),
                 "levels_db": [-12.0, -13.0], "generation": "g",
-                "transient_count": 4,
+                "arrival_jitter_count": 4,
+                "last_arrival_jitter_at": time.time(),
             }
-            second_post = dict(first_post, transient_count=5)
+            second_post = dict(first_post, arrival_jitter_count=5)
             alsa = {
                 "state": "RUNNING", "delay": 7800, "avail": 1020,
                 "hw_ptr": 100, "appl_ptr": 7900,
@@ -3009,16 +3101,19 @@ class AudioGapDiagnosticTests(SimpleTestCase):
                               side_effect=[first_post, second_post]):
                 first = obj._audio_gap_diagnostic_snapshot(time.monotonic())
                 obj._audio_gap_pre_buffer_state = dict(
-                    obj._audio_gap_pre_buffer_state, count=13, transient_count=3)
+                    obj._audio_gap_pre_buffer_state, count=13,
+                    arrival_jitter_count=3, continuity_event_count=2)
                 second = obj._audio_gap_diagnostic_snapshot(time.monotonic() + 0.05)
 
-            self.assertEqual(first["schema"], 1)
+            self.assertEqual(first["schema"], 3)
             self.assertEqual(first["pre"]["rms_db"], [-18.0, -19.0])
             self.assertEqual(second["pre"]["buffer_delta"], 3)
-            self.assertEqual(second["pre"]["transient_delta"], 1)
+            self.assertEqual(second["pre"]["arrival_jitter_delta"], 1)
+            self.assertEqual(second["pre"]["continuity_event_delta"], 1)
             self.assertEqual(second["alsa"]["delay"], 7800)
             self.assertEqual(second["post"]["frame_interval_ms"], 46.4)
-            self.assertEqual(second["post"]["transient_delta"], 1)
+            self.assertIsNotNone(second["post"]["frame_age_ms"])
+            self.assertEqual(second["post"]["arrival_jitter_delta"], 1)
             self.assertIn("level_time_ns", second["queue"])
             self.assertIn("rendered", second["sink"])
             self.assertNotIn("audio", second)

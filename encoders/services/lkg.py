@@ -135,7 +135,27 @@ _KEEP_VERSIONS = 2
 # as last-known-good again. This is the intended, one-time effect of
 # deploying this change, not a bug -- see this feature's own completion
 # report for what to expect immediately after deploy.
-ENCODER_CONFIG_FORMAT_VERSION = 2
+#
+# 2 -> 3 (audio-gap diagnostics, 2026-09-25): the default airtap script now
+# attaches the metrics-only post-StereoTool source.on_frame callback used by
+# the bounded diagnostic ring.  A v2 LKG cannot contain that callback.  The
+# bump is therefore required even when the Encoder rows are unchanged, so the
+# existing candidate/preflight/qualification machinery renders and promotes
+# the new script instead of silently taking the accepted-v2 fast path.
+#
+# 3 -> 4 (audio-gap diagnostics, 2026-09-25): v3 used an asynchronous
+# source.on_frame callback as both observer and atomic file writer.  Live
+# scheduling showed callbacks could overlap and report scheduler backlog as
+# media delay.  v4 latches frame timing synchronously and gives file I/O to one
+# recurrent 20Hz worker, requiring a corrected candidate even if v3 briefly
+# reached LKG before the follow-up activation.
+#
+# 4 -> 5 (audio-gap diagnostics, 2026-09-25): live synchronous observation
+# proved source.on_frame delivery is itself normally batched.  v5 names that
+# cumulative wall-clock signal as advisory arrival jitter rather than implying
+# media continuity, and forces the corrected script through probation after v4
+# was promoted during live validation.
+ENCODER_CONFIG_FORMAT_VERSION = 5
 
 
 def _ensure_dir(path, mode):
@@ -178,7 +198,9 @@ def _atomic_write_text(path, text, mode):
     os.replace(tmp_path, path)
 
 
-def compute_fingerprint(input_device, encoders):
+def compute_fingerprint(
+    input_device, encoders, *, audio_gap_diagnostics_enabled=False,
+):
     """Deterministic SHA-256 hex digest over the runtime-affecting
     configuration of `encoders` (an iterable of Encoder rows, already
     filtered to the ones sharing `input_device`) -- a one-way hash, so
@@ -204,7 +226,9 @@ def compute_fingerprint(input_device, encoders):
     Also includes ENCODER_CONFIG_FORMAT_VERSION (see its own docstring
     above) -- a manual, explicit renderer/schema version, NOT a hash of
     source code. Bump that constant, not this function, when a code
-    change alters what gets generated/launched for the same DB rows.
+    change alters what gets generated/launched for the same DB rows. The
+    startup-cached audio-gap feature gate is included for the same reason: it
+    changes the rendered airtap script even though no Encoder row changed.
 
     Rows are sorted by their full canonical representation (every
     RUNTIME_AFFECTING_FIELDS value, in the same fixed field order)
@@ -228,7 +252,12 @@ def compute_fingerprint(input_device, encoders):
         for enc in encoders
     ]
     rows.sort(key=lambda d: tuple(str(d.get(f)) for f in fields))
-    payload = {"version": ENCODER_CONFIG_FORMAT_VERSION, "input_device": input_device, "encoders": rows}
+    payload = {
+        "version": ENCODER_CONFIG_FORMAT_VERSION,
+        "input_device": input_device,
+        "audio_gap_diagnostics_enabled": bool(audio_gap_diagnostics_enabled),
+        "encoders": rows,
+    }
     return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()
 
 

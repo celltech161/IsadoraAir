@@ -157,9 +157,19 @@ def _describe_group_status(slug, input_device, encoders):
     -- level=None means nothing worth surfacing (desired matches
     accepted and the group isn't on probation/rollback/critical-stop)."""
     from .services import lkg
-    from .services.encoder_manager import _group_state_path_for_slug
+    from .services.encoder_manager import (
+        DEFAULT_INPUT_DEVICE,
+        _group_state_path_for_slug,
+    )
 
-    desired_fp = lkg.compute_fingerprint(input_device, encoders)
+    from hardware.models import AudioPipeline
+
+    desired_fp = lkg.compute_fingerprint(
+        input_device, encoders,
+        audio_gap_diagnostics_enabled=bool(
+            AudioPipeline.load().audio_gap_diagnostics_enabled
+            and input_device == DEFAULT_INPUT_DEVICE),
+    )
     accepted_fp = (lkg.read_lkg_meta(slug) or {}).get("fingerprint")
 
     group_state = {}

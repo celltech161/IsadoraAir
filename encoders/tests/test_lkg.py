@@ -715,6 +715,13 @@ class FingerprintVersionTests(SimpleTestCase):
             fp_v2 = lkg.compute_fingerprint("airtap", [make_encoder()])
         self.assertNotEqual(fp_v1, fp_v2)
 
+    def test_audio_gap_feature_gate_changes_fingerprint(self):
+        disabled = lkg.compute_fingerprint(
+            "airtap", [make_encoder()], audio_gap_diagnostics_enabled=False)
+        enabled = lkg.compute_fingerprint(
+            "airtap", [make_encoder()], audio_gap_diagnostics_enabled=True)
+        self.assertNotEqual(disabled, enabled)
+
     def test_version_is_included_in_payload_not_just_incidentally_different(self):
         """Confirms the version genuinely participates in the hashed
         payload (not, say, accidentally unused) by checking two

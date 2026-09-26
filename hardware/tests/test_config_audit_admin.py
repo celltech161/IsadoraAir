@@ -43,7 +43,10 @@ class AudioPipelineConfigurationAuditTests(TestCase):
             "remote_dj_gain_db": self.remote.gain_db,
         }
         cleaned.update(values)
-        for field in ("sample_rate", "program_gain_db", "vu_meter_min_db"):
+        for field in (
+            "sample_rate", "program_gain_db", "vu_meter_min_db",
+            "audio_gap_diagnostics_enabled",
+        ):
             if field in values:
                 setattr(self.pipeline, field, values[field])
         form = SimpleNamespace(cleaned_data=cleaned, changed_data=list(changed_data))
@@ -169,6 +172,26 @@ class AudioPipelineConfigurationAuditTests(TestCase):
         self.assertEqual(
             _audit_events()[0].detail["changed_fields"], ["program_gain_db"]
         )
+
+    def test_audio_gap_switch_is_audited_but_does_not_restart_on_save(self):
+        self.assertFalse(self.pipeline.audio_gap_diagnostics_enabled)
+        client = self._save(
+            changed_data=["audio_gap_diagnostics_enabled"],
+            audio_gap_diagnostics_enabled=True,
+        )
+
+        self.pipeline.refresh_from_db()
+        self.assertTrue(self.pipeline.audio_gap_diagnostics_enabled)
+        detail = _audit_events()[0].detail
+        self.assertEqual(
+            detail["changed_fields"], ["audio_gap_diagnostics_enabled"])
+        self.assertEqual(
+            detail["apply_modes"],
+            {"audio_gap_diagnostics_enabled":
+             "engine_and_encoders_restart_required"},
+        )
+        self.assertTrue(detail["restart_required"])
+        client.restart_operator_service.assert_not_called()
 
     def test_pending_restart_warning_remains_separate_from_saved_config_audit(self):
         client = Mock()

@@ -142,8 +142,12 @@ AUDIO_GAP_DIAG_PATH = Path("/run/isadoraair/audio_gap_diagnostics.jsonl")
 AUDIO_GAP_DIAG_MAX_BYTES = 4 * 1024 * 1024
 AUDIO_GAP_DIAG_INTERVAL_S = 0.05
 # A little below the operator's 10ms lower estimate so integer/timestamp
-# rounding cannot turn a real 10ms event into a false negative.
-AUDIO_GAP_TRANSIENT_THRESHOLD_NS = 8 * 1_000_000
+# rounding cannot turn a real 10ms event into a false negative. Wall-clock
+# arrival observations use this only as an advisory scheduler-jitter latch;
+# PTS/DISCONT use it as continuity evidence. They are deliberately counted
+# separately because normal GStreamer delivery can be bursty while media-time
+# continuity and downstream runway remain healthy.
+AUDIO_GAP_EVENT_THRESHOLD_NS = 8 * 1_000_000
 # Use ALSA's stable card-ID symlink rather than today's numeric card index.
 AUDIO_GAP_ALSA_STATUS_PATH = Path("/proc/asound/Loopback/pcm0p/sub0/status")
 POST_STEREOTOOL_DIAG_PATH = Path("/run/isadoraair/post_stereotool_audio.json")
@@ -1496,15 +1500,22 @@ class PlaybackEngine:
         self._audio_gap_pre_buffer_state = None
         self._audio_gap_pre_buffer_count = 0
         self._audio_gap_pre_discont_count = 0
-        self._audio_gap_pre_transient_count = 0
-        self._audio_gap_pre_last_transient_state = None
+        self._audio_gap_pre_arrival_jitter_count = 0
+        self._audio_gap_pre_max_arrival_jitter_ns = 0
+        self._audio_gap_pre_last_arrival_jitter_state = None
+        self._audio_gap_pre_continuity_event_count = 0
+        self._audio_gap_pre_max_abs_pts_gap_ns = 0
+        self._audio_gap_pre_last_continuity_event_state = None
         self._audio_gap_last_sampler_monotonic = None
         self._audio_gap_last_rendered = None
         self._audio_gap_last_buffer_count = None
-        self._audio_gap_last_pre_transient_count = None
-        self._audio_gap_last_post_transient_count = None
-        self._audio_gap_diagnostics = AudioGapDiagnosticRing(
-            self._audio_gap_diagnostic_snapshot)
+        self._audio_gap_last_pre_arrival_jitter_count = None
+        self._audio_gap_last_pre_continuity_event_count = None
+        self._audio_gap_last_post_arrival_jitter_count = None
+        # Loaded once at startup, before pipeline construction. The admin
+        # checkbox is desired state only; a save never rewires a live graph.
+        self._audio_gap_diagnostics_enabled = False
+        self._audio_gap_diagnostics = None
 
     def start(self):
         self.running = True
@@ -1533,12 +1544,13 @@ class PlaybackEngine:
         # gets built without the auto-resume seek and only a subsequent
         # deck load (much later, at track boundary) picks up the hint.
         self._read_resume_hint()
+        self._audio_gap_diagnostics_enabled = (
+            self._resolve_audio_gap_diagnostics_enabled())
         self._build_main_pipeline()
         # Starts only after the StereoTool slot and its persistent queue exist.
         # With no StereoTool output configured there is no relevant bridge to
         # diagnose, so no sampler thread or diagnostic files are created.
-        if self._stereotool_slot is not None:
-            self._audio_gap_diagnostics.start()
+        self._start_audio_gap_diagnostics()
         self._load_current_hour_log()
         # If the resume hint carries a log_item_id that lives in the
         # just-loaded queue, back the cursor up so that item loads
@@ -2237,15 +2249,16 @@ class PlaybackEngine:
             # own docstring for exactly which of those applies and why.
             "remote_dj": self._remote_dj_level_payload(),
         }
-        # Immutable assignment only: the independent diagnostic sampler reads
-        # this latest pre-StereoTool level snapshot without performing any I/O
-        # or locking on the GLib message path.
-        self._audio_gap_pre_level_state = {
-            "monotonic_ns": time.monotonic_ns(),
-            "wall_ts": payload["ts"],
-            "rms_db": rms,
-            "peak_db": peak,
-        }
+        if getattr(self, "_audio_gap_diagnostics_enabled", False):
+            # Immutable assignment only: the independent diagnostic sampler
+            # reads this latest pre-StereoTool level snapshot without doing I/O
+            # or locking on the GLib message path.
+            self._audio_gap_pre_level_state = {
+                "monotonic_ns": time.monotonic_ns(),
+                "wall_ts": payload["ts"],
+                "rms_db": rms,
+                "peak_db": peak,
+            }
         try:
             LEVELS_PATH.parent.mkdir(parents=True, exist_ok=True)
             LEVELS_TMP_PATH.write_text(json.dumps(payload), encoding="utf-8")
@@ -2293,28 +2306,62 @@ class PlaybackEngine:
             is_discont = buffer.has_flags(Gst.BufferFlags.DISCONT)
             if is_discont:
                 discont_count += 1
-            is_transient = any((
-                is_discont,
+            # Raw wall-clock arrival is intentionally advisory. In this live
+            # GStreamer graph ordinary scheduling can deliver healthy buffers
+            # in bursts, so an arrival delay alone is not an audio gap. Keep a
+            # cumulative latch/max/timestamp so a 10-20ms observation between
+            # sampler writes remains visible, but separate it from media-time
+            # continuity evidence (PTS and DISCONT) below.
+            is_arrival_jitter = (
                 arrival_late_by_ns is not None
-                and arrival_late_by_ns >= AUDIO_GAP_TRANSIENT_THRESHOLD_NS,
-                pts_gap_ns is not None
-                and abs(pts_gap_ns) >= AUDIO_GAP_TRANSIENT_THRESHOLD_NS,
-            ))
-            transient_count = getattr(self, "_audio_gap_pre_transient_count", 0)
-            last_transient = getattr(
-                self, "_audio_gap_pre_last_transient_state", None)
-            if is_transient:
-                transient_count += 1
-                last_transient = {
+                and arrival_late_by_ns >= AUDIO_GAP_EVENT_THRESHOLD_NS
+            )
+            arrival_jitter_count = getattr(
+                self, "_audio_gap_pre_arrival_jitter_count", 0)
+            max_arrival_jitter_ns = getattr(
+                self, "_audio_gap_pre_max_arrival_jitter_ns", 0)
+            last_arrival_jitter = getattr(
+                self, "_audio_gap_pre_last_arrival_jitter_state", None)
+            if is_arrival_jitter:
+                arrival_jitter_count += 1
+                max_arrival_jitter_ns = max(
+                    max_arrival_jitter_ns, arrival_late_by_ns)
+                last_arrival_jitter = {
                     "monotonic_ns": now_ns,
-                    "arrival_late_by_ns": arrival_late_by_ns,
+                    "late_by_ns": arrival_late_by_ns,
+                }
+
+            is_continuity_event = (
+                is_discont
+                or (
+                    pts_gap_ns is not None
+                    and abs(pts_gap_ns) >= AUDIO_GAP_EVENT_THRESHOLD_NS
+                )
+            )
+            continuity_event_count = getattr(
+                self, "_audio_gap_pre_continuity_event_count", 0)
+            max_abs_pts_gap_ns = getattr(
+                self, "_audio_gap_pre_max_abs_pts_gap_ns", 0)
+            last_continuity_event = getattr(
+                self, "_audio_gap_pre_last_continuity_event_state", None)
+            if is_continuity_event:
+                continuity_event_count += 1
+                if pts_gap_ns is not None:
+                    max_abs_pts_gap_ns = max(
+                        max_abs_pts_gap_ns, abs(pts_gap_ns))
+                last_continuity_event = {
+                    "monotonic_ns": now_ns,
                     "pts_gap_ns": pts_gap_ns,
                     "discont": bool(is_discont),
                 }
             self._audio_gap_pre_buffer_count = count
             self._audio_gap_pre_discont_count = discont_count
-            self._audio_gap_pre_transient_count = transient_count
-            self._audio_gap_pre_last_transient_state = last_transient
+            self._audio_gap_pre_arrival_jitter_count = arrival_jitter_count
+            self._audio_gap_pre_max_arrival_jitter_ns = max_arrival_jitter_ns
+            self._audio_gap_pre_last_arrival_jitter_state = last_arrival_jitter
+            self._audio_gap_pre_continuity_event_count = continuity_event_count
+            self._audio_gap_pre_max_abs_pts_gap_ns = max_abs_pts_gap_ns
+            self._audio_gap_pre_last_continuity_event_state = last_continuity_event
             self._audio_gap_pre_buffer_state = {
                 "monotonic_ns": now_ns,
                 "count": count,
@@ -2324,17 +2371,27 @@ class PlaybackEngine:
                 "pts_gap_ns": pts_gap_ns,
                 "arrival_interval_ns": arrival_interval_ns,
                 "arrival_late_by_ns": arrival_late_by_ns,
-                # Cumulative/last-event evidence deliberately survives later
-                # normal buffers until the 20Hz sampler persists it.
-                "transient_count": transient_count,
-                "last_transient_monotonic_ns": (
-                    last_transient.get("monotonic_ns") if last_transient else None),
-                "last_transient_arrival_late_by_ns": (
-                    last_transient.get("arrival_late_by_ns") if last_transient else None),
-                "last_transient_pts_gap_ns": (
-                    last_transient.get("pts_gap_ns") if last_transient else None),
-                "last_transient_discont": (
-                    last_transient.get("discont") if last_transient else None),
+                # Both cumulative latches deliberately survive later normal
+                # buffers until the independent 20Hz sampler persists them.
+                "arrival_jitter_count": arrival_jitter_count,
+                "max_arrival_jitter_ns": max_arrival_jitter_ns,
+                "last_arrival_jitter_monotonic_ns": (
+                    last_arrival_jitter.get("monotonic_ns")
+                    if last_arrival_jitter else None),
+                "last_arrival_jitter_late_by_ns": (
+                    last_arrival_jitter.get("late_by_ns")
+                    if last_arrival_jitter else None),
+                "continuity_event_count": continuity_event_count,
+                "max_abs_pts_gap_ns": max_abs_pts_gap_ns,
+                "last_continuity_event_monotonic_ns": (
+                    last_continuity_event.get("monotonic_ns")
+                    if last_continuity_event else None),
+                "last_continuity_pts_gap_ns": (
+                    last_continuity_event.get("pts_gap_ns")
+                    if last_continuity_event else None),
+                "last_continuity_discont": (
+                    last_continuity_event.get("discont")
+                    if last_continuity_event else None),
             }
         except Exception:
             pass
@@ -2381,19 +2438,32 @@ class PlaybackEngine:
             buffer_delta = buffer_count - previous_buffer_count
         self._audio_gap_last_buffer_count = buffer_count
 
-        pre_transient_count = (
-            pre_buffer.get("transient_count") if pre_buffer else None)
-        previous_pre_transient_count = getattr(
-            self, "_audio_gap_last_pre_transient_count", None)
-        pre_transient_delta = None
-        if (
-            pre_transient_count is not None
-            and previous_pre_transient_count is not None
-            and pre_transient_count >= previous_pre_transient_count
-        ):
-            pre_transient_delta = (
-                pre_transient_count - previous_pre_transient_count)
-        self._audio_gap_last_pre_transient_count = pre_transient_count
+        def cumulative_delta(current, previous):
+            if (
+                isinstance(current, int)
+                and isinstance(previous, int)
+                and current >= previous
+            ):
+                return current - previous
+            return None
+
+        pre_arrival_jitter_count = (
+            pre_buffer.get("arrival_jitter_count") if pre_buffer else None)
+        previous_pre_arrival_jitter_count = getattr(
+            self, "_audio_gap_last_pre_arrival_jitter_count", None)
+        pre_arrival_jitter_delta = cumulative_delta(
+            pre_arrival_jitter_count, previous_pre_arrival_jitter_count)
+        self._audio_gap_last_pre_arrival_jitter_count = (
+            pre_arrival_jitter_count)
+
+        pre_continuity_event_count = (
+            pre_buffer.get("continuity_event_count") if pre_buffer else None)
+        previous_pre_continuity_event_count = getattr(
+            self, "_audio_gap_last_pre_continuity_event_count", None)
+        pre_continuity_event_delta = cumulative_delta(
+            pre_continuity_event_count, previous_pre_continuity_event_count)
+        self._audio_gap_last_pre_continuity_event_count = (
+            pre_continuity_event_count)
 
         def age_ms(snapshot):
             if not snapshot or snapshot.get("monotonic_ns") is None:
@@ -2407,28 +2477,41 @@ class PlaybackEngine:
             except (KeyError, TypeError, ValueError):
                 post["age_ms"] = None
             try:
-                last_transient_at = float(post["last_transient_at"])
-                post["last_transient_age_ms"] = (
-                    round(max(0.0, wall_ts - last_transient_at) * 1000, 3)
-                    if last_transient_at > 0 else None
+                last_frame_at = float(post["last_frame_at"])
+                post["frame_age_ms"] = (
+                    round(max(0.0, wall_ts - last_frame_at) * 1000, 3)
+                    if last_frame_at > 0 else None
                 )
             except (KeyError, TypeError, ValueError):
-                post["last_transient_age_ms"] = None
-            post_transient_count = post.get("transient_count")
-            previous_post_transient_count = getattr(
-                self, "_audio_gap_last_post_transient_count", None)
-            post["transient_delta"] = None
+                post["frame_age_ms"] = None
+            try:
+                last_arrival_jitter_at = float(post["last_arrival_jitter_at"])
+                post["last_arrival_jitter_age_ms"] = (
+                    round(max(0.0, wall_ts - last_arrival_jitter_at) * 1000, 3)
+                    if last_arrival_jitter_at > 0 else None
+                )
+            except (KeyError, TypeError, ValueError):
+                post["last_arrival_jitter_age_ms"] = None
+            # The fallback accepts a short overlap with the pre-v5 writer
+            # during a controlled encoder restart.  Both names are advisory.
+            post_arrival_jitter_count = post.get(
+                "arrival_jitter_count", post.get("transient_count"))
+            previous_post_arrival_jitter_count = getattr(
+                self, "_audio_gap_last_post_arrival_jitter_count", None)
+            post["arrival_jitter_delta"] = None
             if (
-                isinstance(post_transient_count, int)
-                and isinstance(previous_post_transient_count, int)
-                and post_transient_count >= previous_post_transient_count
+                isinstance(post_arrival_jitter_count, int)
+                and isinstance(previous_post_arrival_jitter_count, int)
+                and post_arrival_jitter_count >= previous_post_arrival_jitter_count
             ):
-                post["transient_delta"] = (
-                    post_transient_count - previous_post_transient_count)
-            self._audio_gap_last_post_transient_count = post_transient_count
+                post["arrival_jitter_delta"] = (
+                    post_arrival_jitter_count
+                    - previous_post_arrival_jitter_count)
+            self._audio_gap_last_post_arrival_jitter_count = (
+                post_arrival_jitter_count)
 
         return {
-            "schema": 1,
+            "schema": 3,
             "wall_ts": wall_ts,
             "monotonic_ns": now_ns,
             "sample_interval_ms": sample_interval_ms,
@@ -2447,19 +2530,37 @@ class PlaybackEngine:
                     pre_buffer.get("arrival_interval_ns") if pre_buffer else None),
                 "arrival_late_by_ns": (
                     pre_buffer.get("arrival_late_by_ns") if pre_buffer else None),
-                "transient_count": pre_transient_count,
-                "transient_delta": pre_transient_delta,
-                "last_transient_age_ms": age_ms({
-                    "monotonic_ns": pre_buffer.get("last_transient_monotonic_ns")
-                }) if pre_buffer and pre_buffer.get("last_transient_monotonic_ns") else None,
-                "last_transient_arrival_late_by_ns": (
-                    pre_buffer.get("last_transient_arrival_late_by_ns")
+                # Advisory scheduler-jitter evidence; never sufficient by
+                # itself for the analysis helper to conclude an audio gap.
+                "arrival_jitter_count": pre_arrival_jitter_count,
+                "arrival_jitter_delta": pre_arrival_jitter_delta,
+                "max_arrival_jitter_ns": (
+                    pre_buffer.get("max_arrival_jitter_ns")
                     if pre_buffer else None),
-                "last_transient_pts_gap_ns": (
-                    pre_buffer.get("last_transient_pts_gap_ns")
+                "last_arrival_jitter_age_ms": age_ms({
+                    "monotonic_ns": pre_buffer.get(
+                        "last_arrival_jitter_monotonic_ns")
+                }) if pre_buffer and pre_buffer.get(
+                    "last_arrival_jitter_monotonic_ns") else None,
+                "last_arrival_jitter_late_by_ns": (
+                    pre_buffer.get("last_arrival_jitter_late_by_ns")
                     if pre_buffer else None),
-                "last_transient_discont": (
-                    pre_buffer.get("last_transient_discont")
+                # Primary pre-StereoTool continuity evidence.
+                "continuity_event_count": pre_continuity_event_count,
+                "continuity_event_delta": pre_continuity_event_delta,
+                "max_abs_pts_gap_ns": (
+                    pre_buffer.get("max_abs_pts_gap_ns")
+                    if pre_buffer else None),
+                "last_continuity_event_age_ms": age_ms({
+                    "monotonic_ns": pre_buffer.get(
+                        "last_continuity_event_monotonic_ns")
+                }) if pre_buffer and pre_buffer.get(
+                    "last_continuity_event_monotonic_ns") else None,
+                "last_continuity_pts_gap_ns": (
+                    pre_buffer.get("last_continuity_pts_gap_ns")
+                    if pre_buffer else None),
+                "last_continuity_discont": (
+                    pre_buffer.get("last_continuity_discont")
                     if pre_buffer else None),
             },
             "queue": queue_state,
@@ -4069,6 +4170,37 @@ class PlaybackEngine:
         print(f"  Pipeline sample rate -> {rate}")
         return rate
 
+    def _resolve_audio_gap_diagnostics_enabled(self):
+        """Read the persistent feature gate once for this Engine process."""
+        try:
+            enabled = bool(AudioPipeline.load().audio_gap_diagnostics_enabled)
+        except Exception as exc:
+            # Diagnostics are optional. A configuration read failure must not
+            # block playout and must fail closed (no diagnostic hot-path work).
+            print(
+                "  Failed to read audio-gap diagnostic setting "
+                f"({exc}); diagnostics disabled")
+            return False
+        print(f"  Audio-gap diagnostics -> {'enabled' if enabled else 'disabled'}")
+        return enabled
+
+    def _start_audio_gap_diagnostics(self):
+        """Start the bounded sampler only for an enabled StereoTool path."""
+        if not getattr(self, "_audio_gap_diagnostics_enabled", False):
+            return
+        if self._stereotool_slot is None:
+            return
+        self._audio_gap_diagnostics = AudioGapDiagnosticRing(
+            self._audio_gap_diagnostic_snapshot)
+        self._audio_gap_diagnostics.start()
+
+    def _install_audio_gap_pre_probe(self, level_element):
+        """Install the diagnostic-only pad probe only in enabled startups."""
+        if not getattr(self, "_audio_gap_diagnostics_enabled", False):
+            return None
+        return level_element.get_static_pad("src").add_probe(
+            Gst.PadProbeType.BUFFER, self._on_audio_gap_pre_buffer)
+
     def _build_main_pipeline(self):
         self.main_pipeline = Gst.Pipeline.new("isadoraair")
         self.pipeline_sample_rate = self._resolve_pipeline_sample_rate()
@@ -4119,11 +4251,9 @@ class PlaybackEngine:
         self.output_level.set_property("peak-ttl", LEVEL_PEAK_TTL_MS * Gst.MSECOND)
         self.output_level.set_property("peak-falloff", LEVEL_PEAK_FALLOFF_DB_PER_SEC)
         # Metrics-only continuity probe immediately before the StereoTool tee.
-        # It never maps or retains buffer payloads; it records only arrival,
-        # duration/PTS continuity, and DISCONT counters in memory for the
-        # independent 20 Hz diagnostic sampler.
-        self.output_level.get_static_pad("src").add_probe(
-            Gst.PadProbeType.BUFFER, self._on_audio_gap_pre_buffer)
+        # It never maps or retains buffer payloads. The helper is a strict
+        # no-op when the startup-cached feature gate is disabled.
+        self._install_audio_gap_pre_probe(self.output_level)
 
         # [P0] 1.3C -- Studio Monitor's containment/recovery boundary.
         # Built UNCONDITIONALLY (unlike StereoTool below) -- per the task
