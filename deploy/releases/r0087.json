@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "release_id": "r0087",
+  "previous_release_id": "r0086",
+  "minimum_updater_protocol_version": 5,
+  "summary": "P2 audio-gap diagnostics: add bounded two-sided Engine-to-StereoTool-to-encoder telemetry, preserve sub-20-ms cumulative evidence, classify burst-scheduled arrival timing as advisory, activate corrected post-StereoTool telemetry through LKG probation, add a Django-admin master switch, and provide timestamp-centered analysis. Includes one additive migration and an admin static asset; no requirements, packages, systemd, nginx, or protected-runtime changes.",
+  "migrations_required": [
+    "hardware.0012_audiopipeline_audio_gap_diagnostics_enabled"
+  ],
+  "migration_compatibility": "additive",
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": true,
+  "services_requiring_restart": [
+    "isadoraair-gunicorn",
+    "isadoraair-engine",
+    "isadoraair-encoders"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0081",
+  "protected_runtime": null
+}
