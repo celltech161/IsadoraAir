@@ -517,9 +517,12 @@ class AudioPipelineAdmin(admin.ModelAdmin):
         ("Diagnostics", {
             "fields": ("audio_gap_diagnostics_enabled",),
             "description": (
-                "Saved as the desired startup state. A controlled restart of both "
-                "the IsadoraAir Engine and encoder services is required; saving "
-                "this page does not restart either service."
+                "Checked enables the bounded audio-artifact transport diagnostics; "
+                "unchecked disables all active diagnostic sampling, callbacks, and "
+                "writes. This is saved as the desired startup state. Restart "
+                "isadoraair-engine and isadoraair-encoders for a change to take "
+                "effect; saving this page does not restart either service and "
+                "StereoTool does not need a restart."
             ),
         }),
         ("PTT / Automation Mode", {

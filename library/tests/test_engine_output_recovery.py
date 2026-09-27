@@ -2852,17 +2852,20 @@ class AudioGapDiagnosticTests(SimpleTestCase):
         obj = make_output_engine_stand_in()
         obj._audio_gap_diagnostics_enabled = False
         obj._stereotool_slot = MagicMock()
-        preexisting_ring = MagicMock()
-        obj._audio_gap_diagnostics = preexisting_ring
+        obj._audio_gap_diagnostics = None
+        obj._audio_gap_alsa_boundary_sampler = None
         level = MagicMock()
 
-        self.assertIsNone(obj._install_audio_gap_pre_probe(level))
-        obj._start_audio_gap_diagnostics()
+        with patch.object(eng_module, "AlsaBoundarySampler") as sampler_class, \
+                patch.object(eng_module, "AudioGapDiagnosticRing") as ring_class:
+            self.assertIsNone(obj._install_audio_gap_pre_probe(level))
+            obj._start_audio_gap_diagnostics()
 
         level.get_static_pad.assert_not_called()
-        preexisting_ring.start.assert_not_called()
-        # No new ring means no diagnostic JSONL writer/thread can exist.
-        self.assertIs(obj._audio_gap_diagnostics, preexisting_ring)
+        sampler_class.assert_not_called()
+        ring_class.assert_not_called()
+        self.assertIsNone(obj._audio_gap_diagnostics)
+        self.assertIsNone(obj._audio_gap_alsa_boundary_sampler)
 
     def test_enabled_startup_installs_probe_and_starts_bounded_writer(self):
         obj = make_output_engine_stand_in()
@@ -2873,7 +2876,9 @@ class AudioGapDiagnosticTests(SimpleTestCase):
         pad.add_probe.return_value = 42
         ring = MagicMock()
 
-        with patch.object(eng_module, "AudioGapDiagnosticRing", return_value=ring):
+        with patch.object(
+            eng_module, "AudioGapDiagnosticRing", return_value=ring,
+        ) as ring_class:
             self.assertEqual(obj._install_audio_gap_pre_probe(level), 42)
             obj._start_audio_gap_diagnostics()
 
@@ -2881,6 +2886,14 @@ class AudioGapDiagnosticTests(SimpleTestCase):
             Gst.PadProbeType.BUFFER, obj._on_audio_gap_pre_buffer)
         ring.start.assert_called_once_with()
         self.assertIs(obj._audio_gap_diagnostics, ring)
+        self.assertIsInstance(
+            obj._audio_gap_alsa_boundary_sampler,
+            eng_module.AlsaBoundarySampler,
+        )
+        ring_class.assert_called_once_with(
+            obj._audio_gap_diagnostic_snapshot,
+            fast_sample_fn=obj._audio_gap_alsa_boundary_sampler.sample,
+        )
 
     def test_alsa_procfs_parser_retains_runway_and_pointer_fields(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2899,6 +2912,72 @@ class AudioGapDiagnosticTests(SimpleTestCase):
                 "state": "RUNNING", "delay": 7384, "avail": 1436,
                 "avail_max": 1514, "hw_ptr": 1000, "appl_ptr": 8384,
             })
+
+    def test_fast_boundary_sampler_latches_10_15_20ms_pointer_stalls(self):
+        """A recovered transient between two 20Hz JSON writes must leave
+        interval evidence without any PCM read or fast-cadence file write."""
+        for stall_ms in (10, 15, 20):
+            with self.subTest(stall_ms=stall_ms):
+                statuses = []
+                pointer = 0
+                for elapsed_ms in range(0, 51, 5):
+                    if elapsed_ms == 5:
+                        pointer = 384
+                    elif elapsed_ms > 5 + stall_ms:
+                        # Catch up fully: the final 50ms pointer delta can look
+                        # healthy even though progress paused in the middle.
+                        pointer = elapsed_ms * 44100 // 1000
+                    statuses.append({
+                        "state": "RUNNING",
+                        "delay": 100 + (400 if 5 < elapsed_ms <= 5 + stall_ms else 0),
+                        "avail": 100 + (400 if 5 < elapsed_ms <= 5 + stall_ms else 0),
+                        "avail_max": 500,
+                        "hw_ptr": pointer,
+                        "appl_ptr": pointer,
+                    })
+                iterators = {
+                    Path("pre"): iter(statuses),
+                    Path("post"): iter([dict(item) for item in statuses]),
+                }
+                sampler = eng_module.AlsaBoundarySampler(
+                    paths={
+                        "B_pre_capture": Path("pre"),
+                        "C_post_playback": Path("post"),
+                    },
+                    reader=lambda path: next(iterators[path]),
+                )
+                for index in range(len(statuses)):
+                    sampler.sample(index * 0.005)
+                boundaries = sampler.snapshot_and_reset(50_000_000)
+
+                for boundary in ("B_pre_capture", "C_post_playback"):
+                    snapshot = boundaries[boundary]
+                    self.assertEqual(snapshot["samples"], len(statuses))
+                    self.assertEqual(snapshot["read_errors"], 0)
+                    self.assertEqual(snapshot["non_running_count"], 0)
+                    self.assertEqual(snapshot["pointer_reset_count"], 0)
+                    self.assertGreaterEqual(
+                        snapshot["appl_ptr_stall_max_ms"], stall_ms)
+                    self.assertGreaterEqual(
+                        snapshot["hw_ptr_stall_max_ms"], stall_ms)
+                    self.assertEqual(snapshot["delay_max"], 500)
+                    self.assertGreater(snapshot["appl_ptr_delta"], 0)
+
+    def test_post_capture_marks_kernel_appl_pointer_unobservable(self):
+        sampler = eng_module.AlsaBoundarySampler(
+            paths={"D_post_capture": Path("ignored")},
+            reader=lambda _path: {
+                "state": "RUNNING", "delay": 100, "avail": 100,
+                "avail_max": 100, "hw_ptr": 1000, "appl_ptr": 0,
+            },
+        )
+        sampler.sample(1.0)
+        snapshot = sampler.snapshot_and_reset(1_000_000_000)["D_post_capture"]
+        self.assertFalse(snapshot["appl_ptr_observable"])
+        self.assertTrue(snapshot["hw_ptr"])
+        self.assertIsNone(snapshot["appl_ptr"])
+        self.assertIsNone(snapshot["appl_ptr_delta"])
+        self.assertIsNone(snapshot["appl_ptr_stall_max_ms"])
 
     def test_ring_rotates_to_one_bounded_backup(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -3084,14 +3163,18 @@ class AudioGapDiagnosticTests(SimpleTestCase):
             obj._audio_gap_last_pre_arrival_jitter_count = None
             obj._audio_gap_last_pre_continuity_event_count = None
             obj._audio_gap_last_post_arrival_jitter_count = None
+            post_now = time.time()
             first_post = {
-                "timestamp": time.time(), "frame_interval_ms": 46.4,
-                "last_frame_at": time.time(),
+                "timestamp": post_now, "frame_interval_ms": 46.4,
+                "last_frame_at": post_now,
                 "levels_db": [-12.0, -13.0], "generation": "g",
                 "arrival_jitter_count": 4,
-                "last_arrival_jitter_at": time.time(),
+                "last_arrival_jitter_at": post_now,
+                "source_time": 100.0,
             }
-            second_post = dict(first_post, arrival_jitter_count=5)
+            second_post = dict(
+                first_post, arrival_jitter_count=5,
+                timestamp=post_now + 0.05, source_time=100.05)
             alsa = {
                 "state": "RUNNING", "delay": 7800, "avail": 1020,
                 "hw_ptr": 100, "appl_ptr": 7900,
@@ -3105,7 +3188,7 @@ class AudioGapDiagnosticTests(SimpleTestCase):
                     arrival_jitter_count=3, continuity_event_count=2)
                 second = obj._audio_gap_diagnostic_snapshot(time.monotonic() + 0.05)
 
-            self.assertEqual(first["schema"], 3)
+            self.assertEqual(first["schema"], 4)
             self.assertEqual(first["pre"]["rms_db"], [-18.0, -19.0])
             self.assertEqual(second["pre"]["buffer_delta"], 3)
             self.assertEqual(second["pre"]["arrival_jitter_delta"], 1)
@@ -3114,6 +3197,9 @@ class AudioGapDiagnosticTests(SimpleTestCase):
             self.assertEqual(second["post"]["frame_interval_ms"], 46.4)
             self.assertIsNotNone(second["post"]["frame_age_ms"])
             self.assertEqual(second["post"]["arrival_jitter_delta"], 1)
+            self.assertAlmostEqual(second["post"]["source_time_delta_ms"], 50.0)
+            self.assertAlmostEqual(second["post"]["writer_interval_ms"], 50.0)
+            self.assertAlmostEqual(second["post"]["source_clock_gap_ms"], 0.0)
             self.assertIn("level_time_ns", second["queue"])
             self.assertIn("rendered", second["sink"])
             self.assertNotIn("audio", second)

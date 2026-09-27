@@ -146,6 +146,9 @@ class Command(BaseCommand):
         post_age = values("post", "age_ms")
         post_frame_age = values("post", "frame_age_ms")
         post_interval = values("post", "frame_interval_ms")
+        post_source_delta = values("post", "source_time_delta_ms")
+        post_writer_interval = values("post", "writer_interval_ms")
+        post_source_clock_gap = values("post", "source_clock_gap_ms")
         def post_arrival_jitter_delta(record):
             value = _nested(record, "post", "arrival_jitter_delta")
             if not isinstance(value, (int, float)):
@@ -172,6 +175,19 @@ class Command(BaseCommand):
             record for record in records
             if (_nested(record, "post", "frame_age_ms") or 0) >= 150
         ]
+        boundary_records = [
+            record for record in records
+            if isinstance(record.get("alsa_boundaries"), dict)
+        ]
+        boundary_fault_samples = sum(
+            (_nested(record, "alsa_boundaries", boundary,
+                     "non_running_count") or 0)
+            + (_nested(record, "alsa_boundaries", boundary,
+                       "pointer_reset_count") or 0)
+            for record in boundary_records
+            for boundary in (
+                "B_pre_capture", "C_post_playback", "D_post_capture")
+        )
 
         start = datetime.fromtimestamp(records[0]["wall_ts"]).astimezone().isoformat()
         end = datetime.fromtimestamp(records[-1]["wall_ts"]).astimezone().isoformat()
@@ -193,6 +209,9 @@ class Command(BaseCommand):
         range_text("post frame interval", post_interval, unit="ms")
         range_text("post sample age", post_age, unit="ms")
         range_text("post frame age", post_frame_age, unit="ms")
+        range_text("post source-time delta", post_source_delta, unit="ms")
+        range_text("post writer interval", post_writer_interval, unit="ms")
+        range_text("post source-clock gap", post_source_clock_gap, unit="ms")
         self.stdout.write(
             "latched evidence in window: "
             f"pre_continuity={pre_continuity_count:.0f} "
@@ -206,19 +225,69 @@ class Command(BaseCommand):
             "boundary assessment: "
             f"pre-StereoTool={'EVIDENCE' if pre_continuity_count else 'none'}, "
             f"ALSA runway={'EVIDENCE' if alsa_starvation_records else 'none'}, "
-            f"post-StereoTool={'ADVISORY' if post_arrival_jitter_count or post_stall_records else 'none'}")
-        if pre_continuity_count or alsa_starvation_records:
+            f"StereoTool-adjacent ALSA="
+            f"{'EVIDENCE' if boundary_fault_samples else 'none'}, "
+            f"post-StereoTool="
+            f"{'ADVISORY' if post_arrival_jitter_count or post_stall_records else 'none'}")
+        if pre_continuity_count or alsa_starvation_records or boundary_fault_samples:
             self.stdout.write(
                 "conclusion: corroborating continuity/runway evidence is present; "
                 "inspect the boundary-specific samples below")
         elif (pre_arrival_jitter_count or post_arrival_jitter_count
                 or post_stall_records):
             self.stdout.write(
-                "conclusion: no corroborated audio-gap evidence; raw pre/post "
-                "arrival jitter is advisory scheduler context only")
+                "conclusion: no transport-level discontinuity evidence; raw "
+                "pre/post arrival jitter is advisory scheduler context only")
         else:
             self.stdout.write(
-                "conclusion: no corroborated audio-gap evidence in the retained window")
+                "conclusion: no transport-level discontinuity evidence in the "
+                "retained window")
+        self.stdout.write(
+            "content-integrity limitation: healthy transport does not exclude "
+            "a short repeated, muted, time-corrected, or corrupted PCM fragment")
+
+        if boundary_records:
+            self.stdout.write("StereoTool-adjacent ALSA boundary telemetry:")
+            for boundary in (
+                "A_pre_playback", "B_pre_capture",
+                "C_post_playback", "D_post_capture",
+            ):
+                snapshots = [
+                    _nested(record, "alsa_boundaries", boundary)
+                    for record in boundary_records
+                ]
+                snapshots = [item for item in snapshots if isinstance(item, dict)]
+                if not snapshots:
+                    self.stdout.write(f"  {boundary}: unavailable")
+                    continue
+                states = sorted({
+                    item.get("state") for item in snapshots if item.get("state")
+                })
+                non_running = sum(
+                    item.get("non_running_count", 0) or 0 for item in snapshots)
+                resets = sum(
+                    item.get("pointer_reset_count", 0) or 0 for item in snapshots)
+                read_errors = sum(
+                    item.get("read_errors", 0) or 0 for item in snapshots)
+                delay_lows = _finite_numbers(
+                    item.get("delay_min", item.get("delay")) for item in snapshots)
+                delay_highs = _finite_numbers(
+                    item.get("delay_max", item.get("delay")) for item in snapshots)
+                hw_stalls = _finite_numbers(
+                    item.get("hw_ptr_stall_max_ms") for item in snapshots)
+                appl_stalls = _finite_numbers(
+                    item.get("appl_ptr_stall_max_ms") for item in snapshots)
+                evidence = bool(non_running or resets)
+                self.stdout.write(
+                    f"  {boundary}: {'EVIDENCE' if evidence else 'none'} "
+                    f"states={states or ['unknown']} non_running={non_running} "
+                    f"pointer_resets={resets} read_errors={read_errors} "
+                    f"delay={min(delay_lows) if delay_lows else None}.."
+                    f"{max(delay_highs) if delay_highs else None} "
+                    f"hw_stall_max={max(hw_stalls) if hw_stalls else None}ms "
+                    f"appl_stall_max={max(appl_stalls) if appl_stalls else None}ms "
+                    f"appl_ptr_observable={snapshots[-1].get('appl_ptr_observable')}"
+                )
 
         notable = []
         for record in records:
@@ -232,6 +301,15 @@ class Command(BaseCommand):
                 (_nested(record, "post", "frame_age_ms") or 0) >= 150,
                 pre_event_deltas(record)[1] > 0,
                 post_arrival_jitter_delta(record) > 0,
+                abs(_nested(record, "post", "source_clock_gap_ms") or 0) >= 8,
+                any(
+                    (_nested(record, "alsa_boundaries", boundary,
+                             "non_running_count") or 0) > 0
+                    or (_nested(record, "alsa_boundaries", boundary,
+                                "pointer_reset_count") or 0) > 0
+                    for boundary in (
+                        "B_pre_capture", "C_post_playback", "D_post_capture")
+                ),
             ))
             if close or anomalous:
                 notable.append(record)
@@ -254,7 +332,9 @@ class Command(BaseCommand):
                 f"post_age={_nested(record, 'post', 'age_ms')}ms "
                 f"post_frame_age={_nested(record, 'post', 'frame_age_ms')}ms "
                 f"post_arrival_jitter={post_arrival_jitter_delta(record)} "
-                f"post_arrival_late={_nested(record, 'post', 'last_arrival_jitter_late_ms')}ms")
+                f"post_arrival_late={_nested(record, 'post', 'last_arrival_jitter_late_ms')}ms "
+                f"post_source_delta={_nested(record, 'post', 'source_time_delta_ms')}ms "
+                f"post_source_gap={_nested(record, 'post', 'source_clock_gap_ms')}ms")
 
     def _print_journal(self, target_dt, window):
         start = (target_dt - timedelta(seconds=window)).isoformat()

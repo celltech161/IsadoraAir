@@ -1169,7 +1169,9 @@ def build_liquidsoap_script(
         # encoders and Aircheck.  source.on_frame therefore observes the real
         # post-StereoTool airtap without opening another PCM consumer.  The
         # synchronous callback does only constant-time ref/counter work, so a
-        # 10-20ms delay is latched at the actual frame boundary.  One recurrent
+        # 10-20ms transport delay is latched at the actual frame boundary. A
+        # shorter repeated/corrupted PCM fragment can remain invisible while
+        # pointers and media time advance normally. One recurrent
         # worker writes the latest state at 20Hz; it never competes with another
         # writer for file.write's atomic temp path.  Engine's separately bounded
         # JSONL ring supplies retention and cross-boundary correlation.
@@ -1190,6 +1192,11 @@ def build_liquidsoap_script(
             '      last_arrival_jitter_at = post_diag_last_arrival_jitter_at(),',
             '      last_arrival_jitter_late_ms = post_diag_last_arrival_jitter_late_ms(),',
             '      max_arrival_jitter_ms = post_diag_max_arrival_jitter_ms(),',
+            # Clock/media progression is polled by this independent 20Hz
+            # worker, not derived from source.on_frame callback arrival.  It
+            # therefore remains useful when normal callback batching makes
+            # frame wall timing advisory-only.
+            '      source_time = source.time(),',
             '      levels_db = source.dB_levels(),',
             '      input_device = input_device_str,',
             '      pid = process.pid(),',

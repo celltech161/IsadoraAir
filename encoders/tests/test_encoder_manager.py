@@ -120,6 +120,7 @@ class BuildLiquidsoapScriptTests(TestCase):
         self.assertIn("arrival_jitter_count = post_diag_arrival_jitter_count()", with_aircheck)
         self.assertIn("last_arrival_jitter_late_ms = post_diag_last_arrival_jitter_late_ms()", with_aircheck)
         self.assertIn("max_arrival_jitter_ms = post_diag_max_arrival_jitter_ms()", with_aircheck)
+        self.assertIn("source_time = source.time()", with_aircheck)
         self.assertIn("levels_db = source.dB_levels()", with_aircheck)
         self.assertNotIn("write_post_stereotool_diag", without_aircheck)
 
@@ -131,6 +132,9 @@ class BuildLiquidsoapScriptTests(TestCase):
 
         self.assertNotIn("write_post_stereotool_diag", script)
         self.assertNotIn("post_diag_", script)
+        self.assertNotIn("source.on_frame", script)
+        self.assertNotIn("source.time()", script)
+        self.assertNotIn(em.POST_STEREOTOOL_DIAG_PATH, script)
         self.assertIn("settings.server.telnet.set(true)", script)
         self.assertIn("aircheck_output = output.file(", script)
         self.assertEqual(script.count("source = input.alsa"), 1)

@@ -62,9 +62,12 @@ class AnalyzeAudioGapCommandTests(TestCase):
         self.assertIn("pre_arrival_jitter_advisory=3", output)
         self.assertIn(
             "boundary assessment: pre-StereoTool=none, ALSA runway=none, "
-            "post-StereoTool=none", output)
-        self.assertIn("no corroborated audio-gap evidence", output)
+            "StereoTool-adjacent ALSA=none, post-StereoTool=none", output)
+        self.assertIn("no transport-level discontinuity evidence", output)
         self.assertIn("advisory scheduler context only", output)
+        self.assertIn(
+            "healthy transport does not exclude a short repeated, muted, "
+            "time-corrected, or corrupted PCM fragment", output)
 
     def test_boundary_evidence_is_reported_separately(self):
         record = self._record()
@@ -77,7 +80,7 @@ class AnalyzeAudioGapCommandTests(TestCase):
 
         self.assertIn(
             "boundary assessment: pre-StereoTool=EVIDENCE, ALSA runway=EVIDENCE, "
-            "post-StereoTool=ADVISORY", output)
+            "StereoTool-adjacent ALSA=none, post-StereoTool=ADVISORY", output)
         self.assertIn("corroborating continuity/runway evidence is present", output)
 
     def test_post_frame_age_not_writer_age_identifies_current_stall(self):
@@ -92,7 +95,7 @@ class AnalyzeAudioGapCommandTests(TestCase):
         stalled_frames["post"]["frame_age_ms"] = 500.0
         output = self._run([stalled_frames])
         self.assertIn("post-StereoTool=ADVISORY", output)
-        self.assertIn("no corroborated audio-gap evidence", output)
+        self.assertIn("no transport-level discontinuity evidence", output)
 
     def test_legacy_combined_latch_with_only_arrival_delay_is_advisory(self):
         record = self._record()
@@ -110,7 +113,7 @@ class AnalyzeAudioGapCommandTests(TestCase):
 
         self.assertIn("pre_continuity=0", output)
         self.assertIn("pre_arrival_jitter_advisory=2", output)
-        self.assertIn("no corroborated audio-gap evidence", output)
+        self.assertIn("no transport-level discontinuity evidence", output)
 
     def test_disabled_without_ring_reports_telemetry_unavailable(self):
         pipeline = AudioPipeline.load()
@@ -127,3 +130,50 @@ class AnalyzeAudioGapCommandTests(TestCase):
         self.assertIn(
             "Audio-gap diagnostics are not currently enabled or no retained "
             "diagnostic data is available.", output.getvalue())
+
+    def test_four_boundary_summary_reports_latched_fast_procfs_evidence(self):
+        record = self._record()
+        record["schema"] = 4
+        record["alsa_boundaries"] = {
+            "A_pre_playback": {"state": "RUNNING", "delay": 7800},
+            "B_pre_capture": {
+                "state": "RUNNING", "samples": 10, "read_errors": 0,
+                "non_running_count": 0, "pointer_reset_count": 0,
+                "delay_min": 10, "delay_max": 500,
+                "hw_ptr_stall_max_ms": 10.0,
+                "appl_ptr_stall_max_ms": 20.0,
+                "appl_ptr_observable": True,
+            },
+            "C_post_playback": {
+                "state": "RUNNING", "samples": 10, "read_errors": 0,
+                "non_running_count": 1, "pointer_reset_count": 0,
+                "delay_min": 1200, "delay_max": 1800,
+                "hw_ptr_stall_max_ms": 10.0,
+                "appl_ptr_stall_max_ms": 25.0,
+                "appl_ptr_observable": True,
+            },
+            "D_post_capture": {
+                "state": "RUNNING", "samples": 10, "read_errors": 0,
+                "non_running_count": 0, "pointer_reset_count": 0,
+                "delay_min": 100, "delay_max": 200,
+                "hw_ptr_stall_max_ms": 10.0,
+                "appl_ptr_stall_max_ms": 50.0,
+                "appl_ptr_observable": False,
+            },
+        }
+        record["post"].update({
+            "source_time_delta_ms": 40.0,
+            "writer_interval_ms": 50.0,
+            "source_clock_gap_ms": 10.0,
+        })
+
+        output = self._run([record])
+
+        self.assertIn("StereoTool-adjacent ALSA boundary telemetry:", output)
+        self.assertIn("B_pre_capture: none", output)
+        self.assertIn("C_post_playback: EVIDENCE", output)
+        self.assertIn("D_post_capture: none", output)
+        self.assertIn("appl_ptr_observable=False", output)
+        self.assertIn("post source-clock gap: min=10.000ms max=10.000ms", output)
+        self.assertIn("StereoTool-adjacent ALSA=EVIDENCE", output)
+        self.assertIn("corroborating continuity/runway evidence is present", output)

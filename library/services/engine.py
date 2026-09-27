@@ -133,14 +133,25 @@ NOW_PLAYING_PATH = Path("/run/isadoraair/now_playing.json")
 # file.watch, so it doesn't need the same in-place-write care.
 RBDS_CATEGORY_STATE_PATH = Path("/run/isadoraair/rbds_category_state.json")
 
-# Focused, always-bounded evidence for rare sub-second program-audio gaps.
+# Focused, always-bounded transport evidence for rare sub-second program-audio
+# artifacts (including blemishes/stutters that are not necessarily silence).
 # The sampler runs on its own daemon thread so procfs/tmpfs I/O can never
 # block a GStreamer streaming thread or the GLib main loop.  Two 4 MiB JSONL
 # files retain roughly 5-7 minutes at 20 Hz (record size varies slightly),
 # contain metrics only -- never PCM/program content -- and live on tmpfs.
 AUDIO_GAP_DIAG_PATH = Path("/run/isadoraair/audio_gap_diagnostics.jsonl")
-AUDIO_GAP_DIAG_MAX_BYTES = 4 * 1024 * 1024
+# Schema 4 adds three compact StereoTool-adjacent procfs summaries.  Eight MiB
+# per file preserves roughly the previous 4-5 minute two-file time horizon
+# while retaining the same hard two-file rotation bound (16 MiB total).
+AUDIO_GAP_DIAG_MAX_BYTES = 8 * 1024 * 1024
 AUDIO_GAP_DIAG_INTERVAL_S = 0.05
+# StereoTool's live capture/playback periods are 384 frames / 8.7ms.  The
+# ordinary 20Hz JSON writer can therefore miss a 10-20ms pointer/runway
+# excursion that begins and recovers between records.  Sample only procfs at
+# 200Hz, retain interval extrema/stall duration in memory, and continue writing
+# JSON at 20Hz.  This stays on the existing diagnostic daemon thread: no PCM
+# open, no streaming-thread work, and no 200Hz filesystem writes.
+AUDIO_GAP_ALSA_FAST_INTERVAL_S = 0.005
 # A little below the operator's 10ms lower estimate so integer/timestamp
 # rounding cannot turn a real 10ms event into a false negative. Wall-clock
 # arrival observations use this only as an advisory scheduler-jitter latch;
@@ -150,6 +161,11 @@ AUDIO_GAP_DIAG_INTERVAL_S = 0.05
 AUDIO_GAP_EVENT_THRESHOLD_NS = 8 * 1_000_000
 # Use ALSA's stable card-ID symlink rather than today's numeric card index.
 AUDIO_GAP_ALSA_STATUS_PATH = Path("/proc/asound/Loopback/pcm0p/sub0/status")
+AUDIO_GAP_ALSA_BOUNDARY_PATHS = {
+    "B_pre_capture": Path("/proc/asound/Loopback/pcm1c/sub0/status"),
+    "C_post_playback": Path("/proc/asound/Loopback_1/pcm0p/sub0/status"),
+    "D_post_capture": Path("/proc/asound/Loopback_1/pcm1c/sub0/status"),
+}
 POST_STEREOTOOL_DIAG_PATH = Path("/run/isadoraair/post_stereotool_audio.json")
 
 # Remote DJ diagnostic instrumentation -- see class RemoteDJSession's
@@ -358,19 +374,159 @@ def _read_small_json(path):
         return None
 
 
-class AudioGapDiagnosticRing:
-    """Low-overhead 20 Hz sampler with a hard two-file retention bound.
+class AlsaBoundarySampler:
+    """Fast, metrics-only procfs sampler for boundaries B/C/D.
 
-    snapshot_fn executes only on this daemon thread.  A failure to sample or
-    write is intentionally diagnostic-only: it is swallowed and retried on
-    the next cadence, never propagated into playout.  Rotation is current ->
-    ``.1``; at most 2 * max_bytes is retained.
+    ALSA state is sampled at 200Hz but reduced to one 20Hz interval summary.
+    Pointer stall maxima and delay/avail extrema therefore survive after a
+    short transient recovers, without opening another PCM consumer or writing
+    at the fast cadence.  Endpoint D is the dsnoop-owned kernel capture PCM;
+    its kernel appl_ptr is normally zero and must not be mistaken for
+    Liquidsoap consumption progress.  Its state/hw_ptr still establish that
+    the post-ST loopback producer continued.
     """
 
-    def __init__(self, snapshot_fn, *, path=AUDIO_GAP_DIAG_PATH,
+    _EXTREMA_FIELDS = ("delay", "avail", "avail_max")
+    _POINTER_FIELDS = ("hw_ptr", "appl_ptr")
+
+    def __init__(self, paths=None, reader=None):
+        self.paths = dict(paths or AUDIO_GAP_ALSA_BOUNDARY_PATHS)
+        self.reader = reader or _read_alsa_pcm_status
+        self._states = {
+            name: {
+                "last": None,
+                "last_change_ns": {},
+                "window": self._new_window(),
+            }
+            for name in self.paths
+        }
+
+    @staticmethod
+    def _new_window(last=None):
+        window = {
+            "samples": 0,
+            "read_errors": 0,
+            "non_running_count": 0,
+            "last_non_running_ns": None,
+            "pointer_reset_count": 0,
+        }
+        if isinstance(last, dict):
+            for key in AlsaBoundarySampler._POINTER_FIELDS:
+                value = last.get(key)
+                if isinstance(value, int):
+                    window[f"first_{key}"] = value
+                    window[f"last_{key}"] = value
+        return window
+
+    def sample(self, sampled_at=None):
+        now_ns = (
+            time.monotonic_ns()
+            if sampled_at is None else int(float(sampled_at) * 1_000_000_000)
+        )
+        for name, path in self.paths.items():
+            state = self._states[name]
+            window = state["window"]
+            status = self.reader(path)
+            if not isinstance(status, dict):
+                window["read_errors"] += 1
+                continue
+            window["samples"] += 1
+            if status.get("state") != "RUNNING":
+                window["non_running_count"] += 1
+                window["last_non_running_ns"] = now_ns
+            for key in self._EXTREMA_FIELDS:
+                value = status.get(key)
+                if not isinstance(value, int):
+                    continue
+                low_key = f"min_{key}"
+                high_key = f"max_{key}"
+                window[low_key] = min(window.get(low_key, value), value)
+                window[high_key] = max(window.get(high_key, value), value)
+            previous = state["last"]
+            for key in self._POINTER_FIELDS:
+                if name == "D_post_capture" and key == "appl_ptr":
+                    continue
+                value = status.get(key)
+                if not isinstance(value, int):
+                    continue
+                window.setdefault(f"first_{key}", value)
+                window[f"last_{key}"] = value
+                previous_value = previous.get(key) if isinstance(previous, dict) else None
+                if not isinstance(previous_value, int) or value != previous_value:
+                    if isinstance(previous_value, int) and value < previous_value:
+                        window["pointer_reset_count"] += 1
+                    state["last_change_ns"][key] = now_ns
+                changed_at = state["last_change_ns"].setdefault(key, now_ns)
+                stall_ns = max(0, now_ns - changed_at)
+                stall_key = f"max_{key}_stall_ns"
+                window[stall_key] = max(window.get(stall_key, 0), stall_ns)
+            state["last"] = status
+
+    def snapshot_and_reset(self, sampled_at_ns=None):
+        sampled_at_ns = time.monotonic_ns() if sampled_at_ns is None else sampled_at_ns
+        result = {}
+        for name, state in self._states.items():
+            window = state["window"]
+            last = state["last"] or {}
+            item = {
+                "samples": window["samples"],
+                "read_errors": window["read_errors"],
+                "state": last.get("state"),
+                "non_running_count": window["non_running_count"],
+                "pointer_reset_count": window["pointer_reset_count"],
+                # dsnoop's kernel capture PCM deliberately leaves appl_ptr at
+                # zero; only its hw_ptr/state are meaningful at endpoint D.
+                "appl_ptr_observable": name != "D_post_capture",
+            }
+            last_non_running_ns = window.get("last_non_running_ns")
+            item["last_non_running_age_ms"] = (
+                round(max(0, sampled_at_ns - last_non_running_ns) / 1_000_000, 3)
+                if isinstance(last_non_running_ns, int) else None
+            )
+            for key in self._EXTREMA_FIELDS:
+                item[key] = last.get(key)
+                item[f"{key}_min"] = window.get(f"min_{key}")
+                item[f"{key}_max"] = window.get(f"max_{key}")
+            for key in self._POINTER_FIELDS:
+                if name == "D_post_capture" and key == "appl_ptr":
+                    item[key] = None
+                    item[f"{key}_delta"] = None
+                    item[f"{key}_stall_max_ms"] = None
+                    continue
+                current = last.get(key)
+                first = window.get(f"first_{key}")
+                final = window.get(f"last_{key}")
+                item[key] = current
+                item[f"{key}_delta"] = (
+                    final - first
+                    if isinstance(first, int) and isinstance(final, int) and final >= first
+                    else None
+                )
+                item[f"{key}_stall_max_ms"] = round(
+                    window.get(f"max_{key}_stall_ns", 0) / 1_000_000, 3)
+            result[name] = item
+            state["window"] = self._new_window(last)
+        return result
+
+
+class AudioGapDiagnosticRing:
+    """Low-overhead diagnostic sampler with a hard two-file retention bound.
+
+    The optional metrics-only procfs callback and the 20 Hz snapshot callback
+    execute only on this daemon thread.  A failure to sample or write is
+    intentionally diagnostic-only: it is swallowed and retried on the next
+    cadence, never propagated into playout.  Rotation is current -> ``.1``;
+    at most 2 * max_bytes is retained.
+    """
+
+    def __init__(self, snapshot_fn, *, fast_sample_fn=None,
+                 fast_interval_s=AUDIO_GAP_ALSA_FAST_INTERVAL_S,
+                 path=AUDIO_GAP_DIAG_PATH,
                  max_bytes=AUDIO_GAP_DIAG_MAX_BYTES,
                  interval_s=AUDIO_GAP_DIAG_INTERVAL_S):
         self.snapshot_fn = snapshot_fn
+        self.fast_sample_fn = fast_sample_fn
+        self.fast_interval_s = float(fast_interval_s)
         self.path = Path(path)
         self.max_bytes = int(max_bytes)
         self.interval_s = float(interval_s)
@@ -435,22 +591,37 @@ class AudioGapDiagnosticRing:
 
     def _run(self):
         next_sample = time.monotonic()
+        next_fast_sample = next_sample
         try:
             while not self._stop.is_set():
-                delay = next_sample - time.monotonic()
+                deadline = (
+                    min(next_sample, next_fast_sample)
+                    if self.fast_sample_fn is not None else next_sample
+                )
+                delay = deadline - time.monotonic()
                 if delay > 0 and self._stop.wait(delay):
                     break
                 sampled_at = time.monotonic()
-                try:
-                    record = self.snapshot_fn(sampled_at)
-                    if record is not None:
-                        self._append(record)
-                except Exception:
-                    self._close()
-                # Never burst/catch up after a delayed sample.  A long sample
-                # interval is itself retained evidence in the next record.
-                next_sample = max(next_sample + self.interval_s,
-                                  sampled_at + self.interval_s)
+                if self.fast_sample_fn is not None and sampled_at >= next_fast_sample:
+                    try:
+                        self.fast_sample_fn(sampled_at)
+                    except Exception:
+                        pass
+                    next_fast_sample = max(
+                        next_fast_sample + self.fast_interval_s,
+                        sampled_at + self.fast_interval_s,
+                    )
+                if sampled_at >= next_sample:
+                    try:
+                        record = self.snapshot_fn(sampled_at)
+                        if record is not None:
+                            self._append(record)
+                    except Exception:
+                        self._close()
+                    # Never burst/catch up after a delayed sample.  A long
+                    # interval is itself retained evidence in the next record.
+                    next_sample = max(next_sample + self.interval_s,
+                                      sampled_at + self.interval_s)
         finally:
             self._close()
 
@@ -1493,7 +1664,7 @@ class PlaybackEngine:
         # Checked by _next_queue_item BEFORE normal cursor logic.
         self._forced_next_items = []
         self._urgent_retry_counts = {}  # {category_code: count} -- per-category, not shared
-        # Sub-second program-gap evidence.  Streaming callbacks only replace
+        # Sub-second program-artifact transport evidence. Streaming callbacks only replace
         # tiny in-memory snapshots; the independent sampler owns every procfs
         # read and tmpfs append/rotation operation.
         self._audio_gap_pre_level_state = None
@@ -1512,10 +1683,13 @@ class PlaybackEngine:
         self._audio_gap_last_pre_arrival_jitter_count = None
         self._audio_gap_last_pre_continuity_event_count = None
         self._audio_gap_last_post_arrival_jitter_count = None
+        self._audio_gap_last_post_source_time = None
+        self._audio_gap_last_post_writer_timestamp = None
         # Loaded once at startup, before pipeline construction. The admin
         # checkbox is desired state only; a save never rewires a live graph.
         self._audio_gap_diagnostics_enabled = False
         self._audio_gap_diagnostics = None
+        self._audio_gap_alsa_boundary_sampler = None
 
     def start(self):
         self.running = True
@@ -2308,7 +2482,7 @@ class PlaybackEngine:
                 discont_count += 1
             # Raw wall-clock arrival is intentionally advisory. In this live
             # GStreamer graph ordinary scheduling can deliver healthy buffers
-            # in bursts, so an arrival delay alone is not an audio gap. Keep a
+            # in bursts, so an arrival delay alone is not an audio artifact. Keep a
             # cumulative latch/max/timestamp so a 10-20ms observation between
             # sampler writes remains visible, but separate it from media-time
             # continuity evidence (PTS and DISCONT) below.
@@ -2509,9 +2683,50 @@ class PlaybackEngine:
                     - previous_post_arrival_jitter_count)
             self._audio_gap_last_post_arrival_jitter_count = (
                 post_arrival_jitter_count)
+            source_time = post.get("source_time")
+            writer_timestamp = post.get("timestamp")
+            previous_source_time = getattr(
+                self, "_audio_gap_last_post_source_time", None)
+            previous_writer_timestamp = getattr(
+                self, "_audio_gap_last_post_writer_timestamp", None)
+            post["source_time_delta_ms"] = None
+            post["writer_interval_ms"] = None
+            post["source_clock_gap_ms"] = None
+            if (
+                isinstance(source_time, (int, float))
+                and isinstance(previous_source_time, (int, float))
+                and source_time >= previous_source_time
+                and isinstance(writer_timestamp, (int, float))
+                and isinstance(previous_writer_timestamp, (int, float))
+                and writer_timestamp > previous_writer_timestamp
+            ):
+                source_delta_ms = (source_time - previous_source_time) * 1000.0
+                writer_interval_ms = (
+                    writer_timestamp - previous_writer_timestamp) * 1000.0
+                post["source_time_delta_ms"] = round(source_delta_ms, 3)
+                post["writer_interval_ms"] = round(writer_interval_ms, 3)
+                post["source_clock_gap_ms"] = round(
+                    writer_interval_ms - source_delta_ms, 3)
+            if isinstance(source_time, (int, float)):
+                self._audio_gap_last_post_source_time = source_time
+            if isinstance(writer_timestamp, (int, float)):
+                self._audio_gap_last_post_writer_timestamp = writer_timestamp
+
+        alsa = _read_alsa_pcm_status()
+        boundary_sampler = getattr(
+            self, "_audio_gap_alsa_boundary_sampler", None)
+        alsa_boundaries = (
+            boundary_sampler.snapshot_and_reset(now_ns)
+            if boundary_sampler is not None else None
+        )
+        if isinstance(alsa_boundaries, dict):
+            # A remains the established Engine-side playback status.  Keep the
+            # top-level `alsa` compatibility field below while also presenting
+            # all four landmarks together for the next analyzer.
+            alsa_boundaries["A_pre_playback"] = alsa
 
         return {
-            "schema": 3,
+            "schema": 4,
             "wall_ts": wall_ts,
             "monotonic_ns": now_ns,
             "sample_interval_ms": sample_interval_ms,
@@ -2531,7 +2746,7 @@ class PlaybackEngine:
                 "arrival_late_by_ns": (
                     pre_buffer.get("arrival_late_by_ns") if pre_buffer else None),
                 # Advisory scheduler-jitter evidence; never sufficient by
-                # itself for the analysis helper to conclude an audio gap.
+                # itself for the analysis helper to conclude a transport fault.
                 "arrival_jitter_count": pre_arrival_jitter_count,
                 "arrival_jitter_delta": pre_arrival_jitter_delta,
                 "max_arrival_jitter_ns": (
@@ -2565,7 +2780,8 @@ class PlaybackEngine:
             },
             "queue": queue_state,
             "sink": {"rendered": rendered, "rendered_delta": rendered_delta},
-            "alsa": _read_alsa_pcm_status(),
+            "alsa": alsa,
+            "alsa_boundaries": alsa_boundaries,
             "post": post,
         }
 
@@ -4190,8 +4406,11 @@ class PlaybackEngine:
             return
         if self._stereotool_slot is None:
             return
+        self._audio_gap_alsa_boundary_sampler = AlsaBoundarySampler()
         self._audio_gap_diagnostics = AudioGapDiagnosticRing(
-            self._audio_gap_diagnostic_snapshot)
+            self._audio_gap_diagnostic_snapshot,
+            fast_sample_fn=self._audio_gap_alsa_boundary_sampler.sample,
+        )
         self._audio_gap_diagnostics.start()
 
     def _install_audio_gap_pre_probe(self, level_element):
