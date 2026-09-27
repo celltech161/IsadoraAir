@@ -114,7 +114,7 @@ def api_restart_check(request, check_id):
     """
     result = authorize(request.user, "monitoring.restart_service")
     if not result:
-        return forbidden_response(result)
+        return forbidden_response(result, user=request.user, capability_slug="monitoring.restart_service")
 
     check = get_object_or_404(MonitorCheck, pk=check_id, kind="systemd")
     if not check.systemd_unit:

@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 
 from django.contrib.auth.models import Group, User
 from django.core.signing import BadSignature, SignatureExpired
-from django.test import SimpleTestCase, TestCase, override_settings
+from django.test import SimpleTestCase, TestCase, TransactionTestCase, override_settings
 
 from isadoraair.deploy_baseline import REQUIRED_GST_ELEMENTS
 from library.models import RemoteDJConfig
@@ -140,7 +140,45 @@ class _FakeWebSocket:
         self.closed = (code, reason)
 
 
-class RemoteDJSignalingAttemptTests(SimpleTestCase):
+class RemoteDJSignalingAttemptTests(TransactionTestCase):
+    """Roadmap 2.5C: _handler() now re-runs a real authorize() check
+    against a freshly-fetched User row (see remote_dj_signaling.py's own
+    docstring on why) -- these tests mint tokens for a genuine,
+    remote_dj.connect-capable User rather than an arbitrary bare id.
+    TransactionTestCase (not TestCase/SimpleTestCase): the authorization
+    check runs via sync_to_async in a SEPARATE thread with its own DB
+    connection -- an ordinary TestCase's uncommitted, rolled-back
+    transaction on the main test thread's connection is invisible to
+    that other connection, so the User created in setUp() would
+    otherwise appear not to exist. TransactionTestCase actually commits
+    (and truncates between tests), which is genuinely required here, not
+    just a slower alternative.
+
+    Deliberately NOT serialized_rollback=True (which would otherwise be
+    needed so a per-test flush() doesn't wipe the authz app's migration-
+    seeded Capability/Role/GroupRole rows): combining serialized_rollback
+    with other such TransactionTestCase classes in the same full-suite
+    run can hit a documented Django/ContentType duplicate-key collision.
+    setUp() below re-creates the remote_dj Group's Role/Capability
+    binding itself (get_or_create, idempotent) instead, so this class
+    never depends on migration-seeded data surviving a prior test's
+    flush."""
+
+    def setUp(self):
+        from authz.models import Capability, GroupRole, Role, RoleCapability
+
+        self.user = User.objects.create_user("signaling-attempt-tests-dj", password="pw")
+        group, _created = Group.objects.get_or_create(name="remote_dj")
+        self.user.groups.add(group)
+
+        capability, _ = Capability.objects.get_or_create(
+            slug="remote_dj.connect",
+            defaults={"label": "Connect as a Remote DJ", "requires_schedule": True},
+        )
+        role, _ = Role.objects.get_or_create(name="Remote Host")
+        RoleCapability.objects.get_or_create(role=role, capability=capability)
+        GroupRole.objects.get_or_create(group=group, defaults={"role": role})
+
     def _server(self):
         engine = SimpleNamespace(
             _remote_dj_session_start=MagicMock(),
@@ -155,7 +193,7 @@ class RemoteDJSignalingAttemptTests(SimpleTestCase):
 
     def test_valid_socket_admits_only_signed_attempt_identity(self):
         token, payload = mint_remote_dj_token(
-            42, attempt_id=ATTEMPT_ID, issued_at_ms=1_700_000_000_000
+            self.user.id, attempt_id=ATTEMPT_ID, issued_at_ms=1_700_000_000_000
         )
         ws = _FakeWebSocket(token)
         server, engine = self._server()
@@ -167,6 +205,7 @@ class RemoteDJSignalingAttemptTests(SimpleTestCase):
             engine._remote_dj_session_start,
             payload["attempt_id"],
             payload["issued_at_ms"],
+            self.user.id,
         ))
         self.assertEqual(
             idle_add.call_args_list[-1].args,
@@ -181,8 +220,29 @@ class RemoteDJSignalingAttemptTests(SimpleTestCase):
         self.assertEqual(ws.closed[0], signaling.CLOSE_CODE_INVALID_TOKEN)
         idle_add.assert_not_called()
 
+    def test_unauthorized_user_is_rejected_before_engine_crossing(self):
+        """Roadmap 2.5C: a validly-SIGNED token for a user who no longer
+        (or never did) holds remote_dj.connect must still be refused --
+        proves _handler() checks live authorization, not just the
+        signature."""
+        outsider = User.objects.create_user("signaling-outsider", password="pw")
+        token, _payload = mint_remote_dj_token(outsider.id, attempt_id=ATTEMPT_ID)
+        ws = _FakeWebSocket(token)
+        server, _engine = self._server()
+        with patch.object(signaling.GLib, "idle_add") as idle_add:
+            asyncio.run(server._handler(ws))
+        self.assertEqual(ws.closed[0], signaling.CLOSE_CODE_NOT_AUTHORIZED)
+        # idle_add IS called once, for the observability failure record
+        # (same as the session-busy path) -- but never to cross into an
+        # actual engine session.
+        session_start_calls = [
+            call for call in idle_add.call_args_list
+            if call.args and call.args[0] is _engine._remote_dj_session_start
+        ]
+        self.assertEqual(session_start_calls, [])
+
     def test_session_busy_has_typed_attempt_correlated_failure(self):
-        token, payload = mint_remote_dj_token(42, attempt_id=ATTEMPT_ID)
+        token, payload = mint_remote_dj_token(self.user.id, attempt_id=ATTEMPT_ID)
         ws = _FakeWebSocket(token)
         server, engine = self._server()
         active_ws = object()
@@ -206,7 +266,7 @@ class RemoteDJSignalingAttemptTests(SimpleTestCase):
         self.assertEqual(server._ws_attempt_id, "already_active_attempt")
 
     def test_browser_milestone_cannot_select_engine_attempt(self):
-        token, _payload = mint_remote_dj_token(42, attempt_id=ATTEMPT_ID)
+        token, _payload = mint_remote_dj_token(self.user.id, attempt_id=ATTEMPT_ID)
         raw = json.dumps({
             "type": "milestone",
             "milestone": "browser_token_received",
@@ -235,7 +295,7 @@ class RemoteDJSignalingAttemptTests(SimpleTestCase):
 
     def test_answer_ice_and_finally_callbacks_carry_signed_attempt(self):
         token, _payload = mint_remote_dj_token(
-            42, attempt_id=ATTEMPT_ID
+            self.user.id, attempt_id=ATTEMPT_ID
         )
         messages = [
             json.dumps({"type": "answer", "sdp": "answer-sdp"}),
@@ -274,7 +334,7 @@ class RemoteDJSignalingAttemptTests(SimpleTestCase):
         )
 
     def test_browser_stats_are_sanitized_and_bound_to_signed_attempt(self):
-        token, _payload = mint_remote_dj_token(42, attempt_id=ATTEMPT_ID)
+        token, _payload = mint_remote_dj_token(self.user.id, attempt_id=ATTEMPT_ID)
         ws = _FakeWebSocket(token, [json.dumps({
             "type": "stats",
             "elapsed_ms": 321.5,

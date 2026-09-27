@@ -4,7 +4,8 @@ import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from django.test import SimpleTestCase
+from django.contrib.auth.models import Group, User
+from django.test import TransactionTestCase
 
 from library.services import remote_dj_signaling as signaling
 from library.services.remote_dj_connection import mint_remote_dj_token
@@ -45,7 +46,31 @@ class _LifecycleWebSocket:
         self.iteration_done.set()
 
 
-class RemoteDJSignalingLifecycleTests(SimpleTestCase):
+class RemoteDJSignalingLifecycleTests(TransactionTestCase):
+    """Roadmap 2.5C: _handler() now re-runs a real authorize() check
+    against a freshly-fetched User row, via sync_to_async on a SEPARATE
+    thread/DB connection -- TransactionTestCase (not TestCase/
+    SimpleTestCase), since an ordinary TestCase's rolled-back
+    transaction on the main test thread is invisible to that other
+    connection. Deliberately NOT serialized_rollback=True -- see
+    test_remote_dj_connection_observability.py's identically-reasoned
+    class docstring; setUp() below is self-sufficient instead."""
+
+    def setUp(self):
+        from authz.models import Capability, GroupRole, Role, RoleCapability
+
+        self.user = User.objects.create_user("signaling-lifecycle-tests-dj", password="pw")
+        group, _created = Group.objects.get_or_create(name="remote_dj")
+        self.user.groups.add(group)
+
+        capability, _ = Capability.objects.get_or_create(
+            slug="remote_dj.connect",
+            defaults={"label": "Connect as a Remote DJ", "requires_schedule": True},
+        )
+        role, _ = Role.objects.get_or_create(name="Remote Host")
+        RoleCapability.objects.get_or_create(role=role, capability=capability)
+        GroupRole.objects.get_or_create(group=group, defaults={"role": role})
+
     def _server(self):
         engine = SimpleNamespace(
             _remote_dj_session_start=MagicMock(),
@@ -60,18 +85,25 @@ class RemoteDJSignalingLifecycleTests(SimpleTestCase):
 
     @staticmethod
     async def _wait_until(predicate):
+        # Roadmap 2.5C: _handler() now awaits a real sync_to_async call
+        # (a genuine cross-thread DB round trip) before admission, so a
+        # bare `await asyncio.sleep(0)` -- which only yields to the event
+        # loop without advancing real time -- can exhaust every iteration
+        # before that other thread has even started. A small positive
+        # sleep gives it actual wall-clock time; 100 * 0.01s = up to 1s,
+        # comfortably more than a local query needs.
         for _ in range(100):
             if predicate():
                 return
-            await asyncio.sleep(0)
+            await asyncio.sleep(0.01)
         raise AssertionError("async signaling condition was not reached")
 
     def test_retired_a_close_may_stall_while_b_is_admitted_and_survives_a_finally(self):
         """Production race: logical release does not await physical close."""
 
         async def scenario():
-            token_a, _ = mint_remote_dj_token(42, attempt_id=ATTEMPT_A)
-            token_b, _ = mint_remote_dj_token(42, attempt_id=ATTEMPT_B)
+            token_a, _ = mint_remote_dj_token(self.user.id, attempt_id=ATTEMPT_A)
+            token_b, _ = mint_remote_dj_token(self.user.id, attempt_id=ATTEMPT_B)
             ws_a = _LifecycleWebSocket(token_a)
             ws_b = _LifecycleWebSocket(token_b)
             server, engine = self._server()
@@ -125,7 +157,7 @@ class RemoteDJSignalingLifecycleTests(SimpleTestCase):
 
     def test_stale_retire_cannot_release_or_close_b(self):
         async def scenario():
-            token_b, _ = mint_remote_dj_token(42, attempt_id=ATTEMPT_B)
+            token_b, _ = mint_remote_dj_token(self.user.id, attempt_id=ATTEMPT_B)
             ws_b = _LifecycleWebSocket(token_b)
             server, _engine = self._server()
             server._ws = ws_b
@@ -142,8 +174,8 @@ class RemoteDJSignalingLifecycleTests(SimpleTestCase):
 
     def test_repeated_retire_of_a_is_idempotent_after_b_takes_ownership(self):
         async def scenario():
-            token_a, _ = mint_remote_dj_token(42, attempt_id=ATTEMPT_A)
-            token_b, _ = mint_remote_dj_token(42, attempt_id=ATTEMPT_B)
+            token_a, _ = mint_remote_dj_token(self.user.id, attempt_id=ATTEMPT_A)
+            token_b, _ = mint_remote_dj_token(self.user.id, attempt_id=ATTEMPT_B)
             ws_a = _LifecycleWebSocket(token_a)
             ws_b = _LifecycleWebSocket(token_b)
             ws_a.allow_close.set()
@@ -165,7 +197,7 @@ class RemoteDJSignalingLifecycleTests(SimpleTestCase):
 
     def test_natural_close_releases_owner_and_stops_matching_engine_attempt(self):
         async def scenario():
-            token_a, _ = mint_remote_dj_token(42, attempt_id=ATTEMPT_A)
+            token_a, _ = mint_remote_dj_token(self.user.id, attempt_id=ATTEMPT_A)
             ws_a = _LifecycleWebSocket(token_a)
             server, engine = self._server()
 
@@ -188,7 +220,7 @@ class RemoteDJSignalingLifecycleTests(SimpleTestCase):
 
     def test_attempt_correlated_send_never_crosses_to_new_owner(self):
         async def scenario():
-            token_b, _ = mint_remote_dj_token(42, attempt_id=ATTEMPT_B)
+            token_b, _ = mint_remote_dj_token(self.user.id, attempt_id=ATTEMPT_B)
             ws_b = _LifecycleWebSocket(token_b)
             server, _engine = self._server()
             server._ws = ws_b

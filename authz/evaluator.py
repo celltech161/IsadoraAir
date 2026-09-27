@@ -63,6 +63,55 @@ falls in a DST-transition's ambiguous or nonexistent hour. No separate
 DST-disambiguation policy is implemented; a station whose scheduled
 handoff moment lands exactly inside a DST transition is a known,
 accepted edge case, not specially handled.
+
+Roadmap 2.5C -- safe activation (`schedule_policy`): 2.5B's schedule
+check must not become authoritative at a real production endpoint the
+moment 2.5C's code ships, because every existing Remote Host has zero
+TalentAssignment rows (the concept didn't exist before 2.5B) -- see
+docs/AUTHORIZATION.md's "Safe activation" section. `ScheduleAccessConfig.
+scheduled_enforcement_enabled` (default **False** on every existing and
+fresh install) is the station-wide switch an operator flips once
+TalentAssignments are actually configured. `authorize()`'s
+`schedule_policy` kwarg controls how a call site relates to that switch:
+
+  - `SCHEDULE_POLICY_ENFORCE` (default) -- respect the station switch.
+    OFF: a requires_schedule=True capability behaves like an ordinary
+    one (compatibility bypass -- capability possession is still
+    mandatory, the assignment/window requirement is skipped). ON: full
+    schedule evaluation. This is what every real production call site
+    uses.
+  - `SCHEDULE_POLICY_STRICT` -- always fully evaluate the schedule
+    window regardless of the station switch. Used by tests that assert
+    the scheduling MECHANISM itself is correct independent of whether
+    any particular station has activated it yet, and by the activation-
+    safety validation this module also provides.
+  - `SCHEDULE_POLICY_IGNORE` -- never evaluate the schedule window;
+    capability possession alone is sufficient. Used for page-
+    reachability-style checks (e.g. whether to render the Remote DJ
+    console at all) where the UX goal is "let a Remote Host see their
+    console/status even outside their window" -- the actual privileged
+    OPERATION (minting a connect token, firing a control command) is
+    where the real schedule_policy="enforce" check bites. See
+    library.views.remote_dj_page.
+
+This is NOT the same knob as authorize()'s existing staff/superuser
+bypass or ordinary capability check -- `scheduled_enforcement_enabled`
+being OFF never means "authorization is off." Capability possession,
+`is_active`, and `is_authenticated` are checked unconditionally
+regardless of schedule_policy or the station switch.
+
+`bypass_cache=True` skips the process-local Group->capability cache and
+reads fresh from the database. Real Django request handlers never need
+this (the cache is invalidated correctly within that process via
+Django signals). It exists for `library.services.engine.py`'s Remote DJ
+periodic re-authorization tick and its signaling-admission check, which
+run inside the SEPARATE `manage.py run_engine` process -- a Role/
+GroupRole edit made through the web (gunicorn) process's admin fires
+Django signals only in THAT process, so the engine process's own cached
+copy would otherwise never see the change short of an engine restart.
+Since these are rare, low-frequency calls (at most one active Remote DJ
+session at a time), the cache's performance benefit is irrelevant there
+and correctness/freshness matters far more.
 """
 import dataclasses
 import datetime as dt
@@ -90,6 +139,12 @@ CODE_CAPABILITY_MISSING = "capability_missing"
 CODE_NO_ASSIGNMENT = "no_assignment"
 CODE_OUTSIDE_SCHEDULE_WINDOW = "outside_schedule_window"
 CODE_INACTIVE_ASSIGNMENT = "inactive_assignment"
+
+# Roadmap 2.5C schedule_policy values -- see module docstring's "safe
+# activation" section for exactly what each one means.
+SCHEDULE_POLICY_ENFORCE = "enforce"
+SCHEDULE_POLICY_STRICT = "strict"
+SCHEDULE_POLICY_IGNORE = "ignore"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -256,21 +311,24 @@ def _check_schedule(user, capability_slug, *, now=None):
 # The evaluator
 # ---------------------------------------------------------------
 
-def authorize(user, capability_slug, *, resource=None, context=None, now=None):
+def authorize(
+    user, capability_slug, *, resource=None, context=None, now=None,
+    schedule_policy=SCHEDULE_POLICY_ENFORCE, bypass_cache=False,
+):
     """Return an AuthzResult for whether `user` may exercise
     `capability_slug`.
 
     `resource` and `context` are accepted now (part of the stable API
-    surface roadmap 2.5C will extend) but nothing shipped through 2.5B
-    uses either for anything -- no capability is resource-scoped yet.
-    They exist so call sites can start passing them (e.g. resource=track)
+    surface roadmap 2.5C will extend) but nothing shipped yet uses
+    either for anything -- no capability is resource-scoped yet. They
+    exist so call sites can start passing them (e.g. resource=track)
     without a second migration of every call site later.
 
     `now`, when given, must be an aware datetime and is used as "the
     current instant" for schedule evaluation instead of the real wall
-    clock -- for deterministic tests and any future caller that already
-    has an authoritative instant in hand. Irrelevant for a capability
-    that doesn't require_schedule.
+    clock. `schedule_policy` and `bypass_cache` are documented in this
+    module's docstring ("Roadmap 2.5C -- safe activation"). Both are
+    irrelevant for a capability that doesn't requires_schedule.
 
     Never raises for an ordinary authorization outcome. DOES raise
     ValueError for a capability_slug that isn't a real, seeded Capability
@@ -300,7 +358,7 @@ def authorize(user, capability_slug, *, resource=None, context=None, now=None):
     if user.is_staff:
         return _allowed("Authorized: staff compatibility bypass (see PROJECT_NOTES.md).")
 
-    capability_map = get_group_capability_map()
+    capability_map = _load_group_capability_map() if bypass_cache else get_group_capability_map()
     user_group_names = set(user.groups.values_list("name", flat=True))
     granted = frozenset().union(
         *(capability_map.get(name, frozenset()) for name in user_group_names)
@@ -315,23 +373,107 @@ def authorize(user, capability_slug, *, resource=None, context=None, now=None):
     if not capability.requires_schedule:
         return _allowed(f"Authorized via Role-granted capability {capability_slug!r}.")
 
-    # Role/Group grants the capability, but it's schedule-restricted:
-    # possession alone is not enough -- a TalentAssignment must also be
-    # currently in its effective window. A missing/expired/inactive
-    # assignment can never be compensated for by capability possession,
-    # and capability possession can never be skipped just because an
-    # assignment exists (checked above, in that order, on purpose).
+    if schedule_policy == SCHEDULE_POLICY_IGNORE:
+        return _allowed(
+            f"Authorized via Role-granted capability {capability_slug!r} "
+            "(schedule check explicitly skipped by the caller)."
+        )
+
+    if schedule_policy == SCHEDULE_POLICY_ENFORCE and not ScheduleAccessConfig.load().scheduled_enforcement_enabled:
+        return _allowed(
+            f"Authorized via Role-granted capability {capability_slug!r} "
+            "(scheduled enforcement is currently disabled station-wide -- "
+            "compatibility policy)."
+        )
+
+    # Either schedule_policy=="strict", or "enforce" with the station
+    # switch ON: possession alone is not enough -- a TalentAssignment
+    # must also be currently in its effective window. A missing/expired/
+    # inactive assignment can never be compensated for by capability
+    # possession, and capability possession can never be skipped just
+    # because an assignment exists (checked above, in that order, on
+    # purpose).
     return _check_schedule(user, capability_slug, now=now)
 
 
-def forbidden_response(result):
+def forbidden_response(result, *, user=None, capability_slug=None):
     """Convenience for API views: turn a denied AuthzResult into the
     right status code (401 for not-even-authenticated, 403 for every
     other denial) with a JSON body. `result.allowed` must be False --
     callers check that themselves first, same as every other view-side
     permission helper in this codebase (e.g. api_track_detail's own
-    HttpResponseForbidden pattern)."""
+    HttpResponseForbidden pattern).
+
+    Roadmap 2.5C: when `user` and `capability_slug` are given, also
+    records a lightweight audit event (see _emit_denial_event) -- every
+    real call site added in 2.5C passes both; 2.5A's original two call
+    sites keep working exactly as before if a future edit ever omits
+    them (audit is additive, never load-bearing for the response
+    itself)."""
     from django.http import JsonResponse
+
+    if capability_slug is not None:
+        _emit_denial_event(user, capability_slug, result)
 
     status = 401 if result.code == CODE_UNAUTHENTICATED else 403
     return JsonResponse({"error": result.reason}, status=status)
+
+
+def _emit_denial_event(user, capability_slug, result):
+    """Roadmap 2.5C audit trail. Reuses monitoring.models.SystemEvent --
+    the existing operator-facing event log -- rather than a parallel
+    logging subsystem. Coalesces via SystemEvent's own existing 60-second
+    dedupe window (keyed on user+capability+code) so a script hammering
+    a denied endpoint produces one row with a rising repeat_count, not a
+    flood. Never raises (emit_event's own contract) and never includes
+    the request body, a token, or any secret -- only identity/capability/
+    outcome."""
+    from monitoring.models import emit_event
+
+    username = getattr(user, "username", None) or "anonymous"
+    emit_event(
+        category="authz",
+        level="warning",
+        title=f"Authorization denied: {capability_slug}",
+        detail={"user": username, "capability": capability_slug, "code": result.code},
+        dedupe_key=f"authz|denied|{username}|{capability_slug}|{result.code}",
+    )
+
+
+def users_missing_talent_assignments_for_scheduled_capabilities():
+    """Roadmap 2.5C activation safety (docs/AUTHORIZATION.md's "Safe
+    activation" section). Returns the list of active, non-staff,
+    non-superuser Users who hold at least one requires_schedule=True
+    capability through their ordinary Group->Role chain but have ZERO
+    TalentAssignment rows at all (active or not -- existence, not
+    liveness: a future/recurring assignment is enough, per the operator's
+    own instruction; this deliberately does NOT evaluate any assignment's
+    live window). Used by authz.admin.ScheduleAccessConfigForm to refuse
+    turning ScheduleAccessConfig.scheduled_enforcement_enabled ON while
+    such an account exists -- the simplest understandable safe rule:
+    don't allow enabling enforcement while a Remote Host has no talent
+    schedule configured at all."""
+    from django.contrib.auth import get_user_model
+
+    User = get_user_model()
+    scheduled_slugs = frozenset(
+        Capability.objects.filter(requires_schedule=True).values_list("slug", flat=True)
+    )
+    if not scheduled_slugs:
+        return []
+
+    capability_map = _load_group_capability_map()
+    users_with_any_assignment = frozenset(
+        TalentAssignment.objects.values_list("user_id", flat=True)
+    )
+
+    missing = []
+    candidates = User.objects.filter(is_active=True, is_staff=False, is_superuser=False).prefetch_related("groups")
+    for user in candidates:
+        user_group_names = {g.name for g in user.groups.all()}
+        granted = frozenset().union(
+            *(capability_map.get(name, frozenset()) for name in user_group_names)
+        ) if user_group_names else frozenset()
+        if granted & scheduled_slugs and user.id not in users_with_any_assignment:
+            missing.append(user)
+    return missing

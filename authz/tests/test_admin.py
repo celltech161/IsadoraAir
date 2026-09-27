@@ -5,10 +5,12 @@ untested registrations."""
 import datetime as dt
 
 from django.contrib.auth import get_user_model
+from django.contrib.auth.models import Group
 from django.test import TestCase, override_settings
 from django.urls import reverse
 
-from authz.models import ScheduleAccessConfig, TalentAssignment
+from authz.models import Capability, GroupRole, Role, RoleCapability, ScheduleAccessConfig, TalentAssignment
+from monitoring.models import SystemEvent
 
 User = get_user_model()
 
@@ -36,6 +38,61 @@ class ScheduleAccessConfigAdminTests(TestCase):
         ScheduleAccessConfig.load()
         resp = self.client.get(reverse("admin:authz_scheduleaccessconfig_add"))
         self.assertEqual(resp.status_code, 403)
+
+    def _post_config(self, cfg, *, enabled, pre=10, post=15):
+        return self.client.post(
+            reverse("admin:authz_scheduleaccessconfig_change", args=[cfg.pk]),
+            data={
+                "pre_schedule_allowance_minutes": str(pre),
+                "post_schedule_allowance_minutes": str(post),
+                "scheduled_enforcement_enabled": "on" if enabled else "",
+            },
+        )
+
+    def test_enabling_with_an_unscheduled_remote_host_is_refused(self):
+        role = Role.objects.create(name="Activation Admin Test Role")
+        RoleCapability.objects.create(role=role, capability=Capability.objects.get(slug="remote_dj.connect"))
+        group = Group.objects.create(name="Activation Admin Test Group")
+        GroupRole.objects.create(group=group, role=role)
+        dj = User.objects.create_user("activation_admin_dj", password="pw")
+        dj.groups.add(group)
+
+        cfg = ScheduleAccessConfig.load()
+        resp = self._post_config(cfg, enabled=True)
+
+        self.assertEqual(resp.status_code, 200)  # re-renders the form with an error, not a redirect
+        self.assertContains(resp, "activation_admin_dj")
+        cfg.refresh_from_db()
+        self.assertFalse(cfg.scheduled_enforcement_enabled)
+
+    def test_enabling_after_an_assignment_exists_succeeds(self):
+        role = Role.objects.create(name="Activation Admin Test Role 2")
+        RoleCapability.objects.create(role=role, capability=Capability.objects.get(slug="remote_dj.connect"))
+        group = Group.objects.create(name="Activation Admin Test Group 2")
+        GroupRole.objects.create(group=group, role=role)
+        dj = User.objects.create_user("activation_admin_dj_2", password="pw")
+        dj.groups.add(group)
+        TalentAssignment.objects.create(
+            user=dj, day_of_week=3, start_time=dt.time(18, 0), end_time=dt.time(20, 0),
+        )
+
+        cfg = ScheduleAccessConfig.load()
+        resp = self._post_config(cfg, enabled=True)
+
+        self.assertEqual(resp.status_code, 302)
+        cfg.refresh_from_db()
+        self.assertTrue(cfg.scheduled_enforcement_enabled)
+
+    def test_toggling_enforcement_emits_an_audit_event(self):
+        cfg = ScheduleAccessConfig.load()
+        before_count = SystemEvent.objects.filter(category="authz").count()
+
+        resp = self._post_config(cfg, enabled=True)
+        self.assertEqual(resp.status_code, 302)
+
+        events = SystemEvent.objects.filter(category="authz").order_by("-created_at")
+        self.assertEqual(events.count(), before_count + 1)
+        self.assertIn("ENABLED", events.first().title)
 
 
 @override_settings(SECURE_SSL_REDIRECT=False)

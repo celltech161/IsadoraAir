@@ -2,21 +2,40 @@ import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from django.contrib.auth import get_user_model
 from django.test import RequestFactory, TestCase
 
 from isadoraair.engine_commands import EngineCommandQueueFull
 from library import views
 from library.models import FXCart
 
+User = get_user_model()
+
 
 class EngineCommandHttpProducerTests(TestCase):
+    """Roadmap 2.5C: these views now call authorize(request.user, ...)
+    as their first line -- calling a view function directly through a
+    bare RequestFactory request (deliberately bypassing every
+    middleware, including AuthenticationMiddleware, to isolate "does
+    this view build the right engine command payload") means
+    request.user is never set at all unless this fixture sets it
+    itself. A superuser sidesteps every capability/schedule check
+    unconditionally, keeping this file's actual concern (the payload
+    shape) independent of which capability each endpoint happens to
+    require."""
+
     def setUp(self):
         self.factory = RequestFactory()
+        self.superuser = User.objects.create_superuser(
+            "engine_command_producer_su", "su@example.invalid", "pw"
+        )
 
     def _post(self, path, payload):
-        return self.factory.post(
+        request = self.factory.post(
             path, data=json.dumps(payload), content_type="application/json"
         )
+        request.user = self.superuser
+        return request
 
     @patch("library.views.enqueue_engine_command")
     def test_library_seek_enqueues_exact_payload(self, enqueue):

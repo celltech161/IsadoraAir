@@ -21,18 +21,38 @@ validated end-to-end in Stage 2/3 of the offline harness work:
   - GLib/GStreamer thread -> websocket thread: send_json_threadsafe()
     below, via asyncio.run_coroutine_threadsafe against the loop captured
     once the server coroutine starts running.
+
+Roadmap 2.5C -- this server is a SEPARATE trust boundary from Django's
+request pipeline: it runs its own raw websockets.serve(), inside this
+same process (see RemoteDJSignalingServer.start()), never through
+GroupBasedAccessMiddleware or any Django view. A valid token signature
+proves the token was genuinely minted by api_remote_dj_token at some
+point in the last TOKEN_MAX_AGE_SECONDS -- it does NOT prove the
+authorization that was true at mint time is STILL true now (the Role
+could have been edited, the account disabled, the TalentAssignment
+disabled/deleted, or scheduled enforcement flipped on, all in the
+interim). _handler() therefore re-runs the full authz.evaluator.authorize()
+check for remote_dj.connect against a freshly-fetched User row before
+admitting -- see the call below. bypass_cache=True is used because this
+process (`manage.py run_engine`) never receives the Django signals a Role
+edit made through the web/gunicorn process fires -- see authorize()'s own
+docstring for why that specific staleness only matters here.
 """
 import asyncio
 import json
 import threading
 from urllib.parse import parse_qs, urlparse
 
+from asgiref.sync import sync_to_async
+from django.contrib.auth import get_user_model
 from django.core.signing import BadSignature, SignatureExpired
 from gi.repository import GLib
 import websockets
 
+from authz.evaluator import authorize
 from library.services.remote_dj_connection import (
     BROWSER_MILESTONES,
+    FAILURE_AUTHORIZATION_TOKEN,
     FAILURE_SIGNALING_SESSION_BUSY,
     verify_remote_dj_token,
 )
@@ -44,6 +64,7 @@ TOKEN_MAX_AGE_SECONDS = 60
 # at a time" decision).
 CLOSE_CODE_SESSION_BUSY = 4002
 CLOSE_CODE_INVALID_TOKEN = 4001
+CLOSE_CODE_NOT_AUTHORIZED = 4003
 
 
 class RemoteDJSignalingServer:
@@ -87,6 +108,37 @@ class RemoteDJSignalingServer:
             return
 
         attempt_id = identity["attempt_id"]
+
+        # Roadmap 2.5C -- a valid signature only proves the token was
+        # minted at some point in the last TOKEN_MAX_AGE_SECONDS; it does
+        # NOT prove the authorization that was true at mint time still
+        # holds now. Re-run the real check against a freshly-fetched
+        # User row (never trust the signed payload's claims about
+        # capability/schedule -- only its user_id) before admitting.
+        # Django refuses synchronous ORM access from a running asyncio
+        # event loop regardless of which OS thread is running it (this
+        # handler is a plain `async def` coroutine even though it lives
+        # on its own dedicated thread) -- sync_to_async hands the actual
+        # DB work to a worker thread the same way Django's own docs
+        # prescribe for exactly this situation.
+        auth_result = await sync_to_async(self._check_remote_dj_authorization)(
+            identity["user_id"], attempt_id
+        )
+        if not auth_result.allowed:
+            print(
+                f"  Remote DJ connection refused: attempt={attempt_id} "
+                f"failure={FAILURE_AUTHORIZATION_TOKEN} reason={auth_result.code}"
+            )
+            GLib.idle_add(
+                self.engine._remote_dj_record_signaling_failure,
+                attempt_id,
+                identity["issued_at_ms"],
+                FAILURE_AUTHORIZATION_TOKEN,
+                auth_result.reason,
+            )
+            await ws.close(code=CLOSE_CODE_NOT_AUTHORIZED, reason="not authorized")
+            return
+
         if self._ws_attempt_id is not None:
             reason = "a session is already active"
             print(
@@ -113,6 +165,7 @@ class RemoteDJSignalingServer:
             self.engine._remote_dj_session_start,
             attempt_id,
             identity["issued_at_ms"],
+            identity["user_id"],
         )
 
         try:
@@ -168,6 +221,49 @@ class RemoteDJSignalingServer:
                 GLib.idle_add(
                     self.engine._remote_dj_session_stop, attempt_id
                 )
+
+    @staticmethod
+    def _check_remote_dj_authorization(user_id, attempt_id):
+        """Synchronous DB work for the admission check above, run via
+        sync_to_async (Django refuses direct synchronous ORM access from
+        a running asyncio event loop, regardless of OS thread -- see the
+        _handler call site's own comment). Fetches a fresh User row
+        every call (no per-connection caching) and asks the real
+        evaluator -- see this module's own docstring for why
+        bypass_cache=True matters here. Also emits the denial audit
+        event, in this SAME sync_to_async-wrapped call, when denied --
+        emit_event is itself a DB write, so it must run on this same
+        safe thread rather than back in the coroutine.
+
+        Closes its own DB connection before returning: sync_to_async
+        runs this on a throwaway thread-pool worker thread that Django's
+        normal per-request connection cleanup never sees (there's no
+        request here), so an idle connection would otherwise accumulate
+        on that thread for as long as the process runs."""
+        from django.db import connections
+
+        User = get_user_model()
+        try:
+            try:
+                user = User.objects.get(pk=user_id)
+            except User.DoesNotExist:
+                user = None
+            result = authorize(user, "remote_dj.connect", bypass_cache=True)
+            if not result.allowed:
+                try:
+                    from monitoring.models import emit_event
+                    emit_event(
+                        category="authz",
+                        level="warning",
+                        title="Remote DJ signaling admission denied",
+                        detail={"user_id": user_id, "attempt_id": attempt_id, "code": result.code},
+                        dedupe_key=f"authz|signaling_denied|{user_id}",
+                    )
+                except Exception as exc:
+                    print(f"  Remote DJ: failed to emit admission-denied audit event: {exc}")
+            return result
+        finally:
+            connections.close_all()
 
     def send_json_threadsafe(self, attempt_id, obj):
         """Called from the GLib/GStreamer thread to deliver a message

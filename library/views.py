@@ -217,7 +217,7 @@ def api_category_list(request):
     # Contributor accounts being able to read this list.
     result = authorize(request.user, "library.manage_categories")
     if not result:
-        return forbidden_response(result)
+        return forbidden_response(result, user=request.user, capability_slug="library.manage_categories")
 
     try:
         body = json.loads(request.body)
@@ -294,7 +294,7 @@ def api_category_detail(request, pk):
     # see PROJECT_NOTES.md's "Roadmap 2.5" section.
     result = authorize(request.user, "library.manage_categories")
     if not result:
-        return forbidden_response(result)
+        return forbidden_response(result, user=request.user, capability_slug="library.manage_categories")
 
     if request.method == "DELETE":
         try:
@@ -375,7 +375,7 @@ def api_track_repick_cue_points(request, pk):
     "Roadmap 2.5" section."""
     result = authorize(request.user, "library.manage_tracks")
     if not result:
-        return forbidden_response(result)
+        return forbidden_response(result, user=request.user, capability_slug="library.manage_tracks")
 
     from library.management.commands.analyze_tracks import (
         apply_category_thresholds, repick_cue_points_from_json,
@@ -441,7 +441,7 @@ def api_category_repick_cue_points(request, pk):
     reachability-only gap as api_category_detail (see its comment)."""
     result = authorize(request.user, "library.manage_categories")
     if not result:
-        return forbidden_response(result)
+        return forbidden_response(result, user=request.user, capability_slug="library.manage_categories")
 
     from library.management.commands.analyze_tracks import (
         apply_category_thresholds, repick_cue_points_from_json,
@@ -544,7 +544,7 @@ def api_category_reset_analysis(request, pk):
     reachability-only gap as api_category_detail (see its comment)."""
     result = authorize(request.user, "library.manage_categories")
     if not result:
-        return forbidden_response(result)
+        return forbidden_response(result, user=request.user, capability_slug="library.manage_categories")
 
     category = get_object_or_404(Category, pk=pk)
     from library.models import Track
@@ -924,7 +924,18 @@ def api_playlist_copy(request, pk):
 def api_playlist_play_now(request, pk):
     """Force the engine to play this playlist immediately, replacing
     whatever's assigned to the current hour rather than waiting for a
-    scheduled slot."""
+    scheduled slot.
+
+    Roadmap 2.5C: requires playout.queue_manage. Found during the
+    mandated repository-wide re-sweep -- same shape as api_engine_set_next/
+    api_engine_insert_track (remote_dj_page's own docstring names "Play
+    Now" as an intended Remote Host feature; previously reachable only
+    via the seeded regex GroupAccess grant, with no other check at
+    all)."""
+    result = authorize(request.user, "playout.queue_manage")
+    if not result:
+        return forbidden_response(result, user=request.user, capability_slug="playout.queue_manage")
+
     playlist = get_object_or_404(Playlist, pk=pk)
 
     now = timezone.localtime()
@@ -1041,7 +1052,7 @@ def api_track_bulk(request):
     check. See PROJECT_NOTES.md's "Roadmap 2.5" section."""
     result = authorize(request.user, "library.manage_tracks")
     if not result:
-        return forbidden_response(result)
+        return forbidden_response(result, user=request.user, capability_slug="library.manage_tracks")
 
     try:
         body = json.loads(request.body)
@@ -1555,7 +1566,7 @@ def api_track_reanalyze(request, pk):
     comment for the reachability gap this closes)."""
     result = authorize(request.user, "library.manage_tracks")
     if not result:
-        return forbidden_response(result)
+        return forbidden_response(result, user=request.user, capability_slug="library.manage_tracks")
 
     from library.management.commands.analyze_tracks import (
         analyze_one_track, apply_category_thresholds, get_waveforms_dir,
@@ -1677,7 +1688,7 @@ def api_track_write_metadata(request, pk):
     comment for the reachability gap this closes)."""
     result = authorize(request.user, "library.manage_tracks")
     if not result:
-        return forbidden_response(result)
+        return forbidden_response(result, user=request.user, capability_slug="library.manage_tracks")
 
     track = get_object_or_404(Track.objects.select_related("artist", "album", "genre"), pk=pk)
     try:
@@ -2019,6 +2030,17 @@ def _read_engine_queue_state():
 @csrf_exempt
 @require_http_methods(["POST"])
 def api_engine_set_next(request):
+    """Roadmap 2.5C: requires playout.queue_manage (schedule-restricted
+    for non-staff/superuser). Force a queued item to play next -- the
+    remote_dj-mode "force-next" button (dashboard.html's setNext())
+    posts here; remote_dj_page's own docstring documents this as
+    intended Remote Host behavior, distinct from playout.control (seek/
+    deck transport), which stays operator-only. See authz.migrations.
+    0006_correct_remote_host_playout_capability."""
+    result = authorize(request.user, "playout.queue_manage")
+    if not result:
+        return forbidden_response(result, user=request.user, capability_slug="playout.queue_manage")
+
     try:
         body = json.loads(request.body)
     except (json.JSONDecodeError, ValueError):
@@ -2071,6 +2093,12 @@ def _reposition_items(items, model=LogItem):
 @csrf_exempt
 @require_http_methods(["POST"])
 def api_engine_insert_track(request):
+    """Roadmap 2.5C: requires playout.queue_manage (see api_engine_set_next's
+    comment)."""
+    result = authorize(request.user, "playout.queue_manage")
+    if not result:
+        return forbidden_response(result, user=request.user, capability_slug="playout.queue_manage")
+
     try:
         body = json.loads(request.body)
     except (json.JSONDecodeError, ValueError):
@@ -2111,6 +2139,14 @@ def api_engine_insert_track(request):
 @csrf_exempt
 @require_http_methods(["POST"])
 def api_engine_seek(request):
+    """Roadmap 2.5C: requires playout.control -- operator/Station-
+    Administrator only. remote_dj_page's own docstring documents
+    "waveform click-seek" as hidden in remote_dj mode; this is not
+    granted to the Remote Host Role."""
+    result = authorize(request.user, "playout.control")
+    if not result:
+        return forbidden_response(result, user=request.user, capability_slug="playout.control")
+
     try:
         body = json.loads(request.body)
     except (json.JSONDecodeError, ValueError):
@@ -2134,6 +2170,14 @@ def api_engine_seek(request):
 @csrf_exempt
 @require_http_methods(["POST"])
 def api_engine_deck_command(request, slot):
+    """Roadmap 2.5C: requires playout.control -- operator/Station-
+    Administrator only. remote_dj_page's own docstring documents "deck
+    eject/pause" as hidden in remote_dj mode; this is not granted to the
+    Remote Host Role."""
+    result = authorize(request.user, "playout.control")
+    if not result:
+        return forbidden_response(result, user=request.user, capability_slug="playout.control")
+
     slot = slot.upper()
     if slot not in ("A", "B"):
         return JsonResponse({"error": "slot must be A or B"}, status=400)
@@ -2158,6 +2202,15 @@ def api_engine_deck_command(request, slot):
 @csrf_exempt
 @require_http_methods(["POST"])
 def api_engine_mic_ptt(request):
+    """Roadmap 2.5C: requires studio.mic_ptt -- operator/Station-
+    Administrator only. remote_dj_page's own docstring documents
+    "Studio Mic PTT" as hidden in remote_dj mode (dashboard.html's
+    micPttBtn is wrapped in {% if mode != 'remote_dj' %}); not granted
+    to the Remote Host Role."""
+    result = authorize(request.user, "studio.mic_ptt")
+    if not result:
+        return forbidden_response(result, user=request.user, capability_slug="studio.mic_ptt")
+
     try:
         body = json.loads(request.body)
     except (json.JSONDecodeError, ValueError):
@@ -2178,11 +2231,18 @@ def api_engine_mic_ptt(request):
 @csrf_exempt
 @require_http_methods(["POST"])
 def api_engine_remote_dj_gate(request):
-    """Operator-side gate toggle for the currently-connected remote DJ.
+    """Gate toggle for the currently-connected remote DJ's mic. Usable
+    by either the operator (console) OR the connected remote DJ
+    themselves (dashboard.html's remoteDjGateBtn is NOT hidden in
+    remote_dj mode -- both parties may see and use this control); the
+    engine ignores it if no remote-DJ session is active.
 
-    Mirrors api_engine_mic_ptt; the engine ignores it if no remote-DJ
-    session is active.
-    """
+    Roadmap 2.5C: requires remote_dj.mic_gate (schedule-restricted for
+    non-staff/superuser)."""
+    result = authorize(request.user, "remote_dj.mic_gate")
+    if not result:
+        return forbidden_response(result, user=request.user, capability_slug="remote_dj.mic_gate")
+
     try:
         body = json.loads(request.body)
     except (json.JSONDecodeError, ValueError):
@@ -2203,6 +2263,13 @@ def api_engine_remote_dj_gate(request):
 @csrf_exempt
 @require_http_methods(["POST"])
 def api_engine_manual_mode(request):
+    """Roadmap 2.5C: requires playout.manual_mode (schedule-restricted
+    for non-staff/superuser). dashboard.html's manualModeBtn is shown in
+    both console modes -- Remote Host holds this capability."""
+    result = authorize(request.user, "playout.manual_mode")
+    if not result:
+        return forbidden_response(result, user=request.user, capability_slug="playout.manual_mode")
+
     try:
         body = json.loads(request.body)
     except (json.JSONDecodeError, ValueError):
@@ -2257,14 +2324,23 @@ def remote_dj_page(request):
     slims Deck B on mobile portrait, but keeps search-to-add, Play
     Now, drag-to-reorder queue, and force-next buttons available
     (same as the full console) -- a remote DJ is trusted to queue,
-    reorder, and jump ahead in their own show. Gated on the same
-    `remote_dj` group the WebRTC token endpoint already checks;
-    anyone not in the group gets a 'not authorized' minimal page
-    instead of the console."""
+    reorder, and jump ahead in their own show.
+
+    Roadmap 2.5C: gated on the remote_dj.connect CAPABILITY (was: the
+    literal `remote_dj` group). Deliberately schedule_policy="ignore" --
+    this is page reachability, not the privileged operation itself (see
+    authz.evaluator's "safe activation" docstring section): a Remote
+    Host should be able to see their own console/status at any time,
+    including outside their scheduled window, so they can watch their
+    upcoming show approach. The actual privileged action -- minting a
+    connect token -- is gated with the real schedule policy in
+    api_remote_dj_token, which is where an outside-window Remote Host
+    actually gets turned away with a specific reason."""
+    from authz.evaluator import SCHEDULE_POLICY_IGNORE
     from library.models import AnalysisConfig, FXCart, Playlist
     from hardware.models import AudioPipeline
-    authorized = request.user.groups.filter(name="remote_dj").exists()
-    if not authorized:
+    result = authorize(request.user, "remote_dj.connect", schedule_policy=SCHEDULE_POLICY_IGNORE)
+    if not result:
         return render(request, "library/remote_dj_unauthorized.html")
     return render(request, "library/dashboard.html", {
         "playlists": Playlist.objects.all().order_by("name"),
@@ -2280,14 +2356,13 @@ VOICETRACK_UPLOAD_DIR = Path("/srv/isadoraair/voicetracks")
 
 
 def _can_edit_voicetracks(user):
-    """Staff, superuser, or a remote_dj group member. Contributor is
-    library-management, not on-air, so no VT recording. Matches the
-    design conversation."""
-    if not (user and user.is_authenticated):
-        return False
-    if user.is_staff or user.is_superuser:
-        return True
-    return user.groups.filter(name="remote_dj").exists()
+    """Roadmap 2.5C: requires voicetrack.record (staff/superuser bypass
+    unconditionally, per authorize()'s own compatibility rule; Contributor
+    is library-management, not on-air, so doesn't hold it). Not schedule-
+    restricted -- a host may prepare voice tracks any time, not only
+    during their show (was: staff/superuser or literal `remote_dj` group
+    membership; unchanged effective behavior, now capability-based)."""
+    return bool(authorize(user, "voicetrack.record"))
 
 
 @ensure_csrf_cookie
@@ -2600,16 +2675,22 @@ def api_fx_cart_upload(request):
 @csrf_exempt
 @require_http_methods(["POST"])
 def api_fx_fire(request):
-    """Fires an FXCart into the on-air mix. Access-controlled: reached
-    only by users whose group grants /api/fx/, which today means staff/
-    superuser (via bypass) and remote_dj (via GroupAccess seed). Contributor
-    doesn't get here because it lacks the dashboard/remote-dj prefixes
-    already.
+    """Fires an FXCart into the on-air mix.
+
+    Roadmap 2.5C: requires fx.fire (schedule-restricted for non-staff/
+    superuser). Was: reachable by anyone whose group granted /api/fx/
+    with no other check (staff/superuser via bypass, remote_dj via
+    GroupAccess; Contributor never reached it because it lacked the
+    dashboard/remote-dj prefixes already).
 
     Retrigger / polyphony / access are enforced engine-side (single source
     of truth). This view just relays cart_id via the engine command file --
     an engine restart would drop any in-flight fires the same way it drops
     everything else, which is acceptable for one-shot audio."""
+    result = authorize(request.user, "fx.fire")
+    if not result:
+        return forbidden_response(result, user=request.user, capability_slug="fx.fire")
+
     from library.models import FXCart
     try:
         body = json.loads(request.body)
@@ -2641,15 +2722,26 @@ def api_fx_fire(request):
 @require_http_methods(["POST"])
 def api_remote_dj_token(request):
     """Mints a short-lived signaling token for the Remote DJ over WebRTC
-    feature. Gated on
-    the "remote_dj" Group, not just being logged in -- LoginRequiredMiddleware
-    already covers "logged in" for every view, but the studio-mic-adjacent
-    capability shouldn't be handed to every dashboard account by default.
-    The token only needs to survive the signaling websocket's handshake
-    (validated with the same max_age on the other end) -- the open socket
-    itself is the session after that, not the token."""
-    if not request.user.groups.filter(name="remote_dj").exists():
-        return JsonResponse({"error": "Not authorized for remote DJ access"}, status=403)
+    feature. The token only needs to survive the signaling websocket's
+    handshake (validated with the same max_age on the other end) -- the
+    open socket itself is the session after that, not the token.
+
+    Roadmap 2.5C: requires remote_dj.connect (was: the literal `remote_dj`
+    group). Schedule-restricted -- when ScheduleAccessConfig.
+    scheduled_enforcement_enabled is ON, this ALSO requires the caller's
+    current station-local time to fall inside an active TalentAssignment's
+    effective window; when OFF, capability possession alone is sufficient
+    (compatibility policy for stations that haven't configured
+    TalentAssignments yet -- see docs/AUTHORIZATION.md's "Safe
+    activation" section). The denial reason (result.reason) is
+    deliberately generic/operator-facing text, not raw internal state --
+    see forbidden_response and AuthzResult.reason's own construction;
+    nothing here exposes signing keys, other users' schedules, or
+    anything beyond what this account itself needs to understand why it
+    was refused."""
+    result = authorize(request.user, "remote_dj.connect")
+    if not result:
+        return forbidden_response(result, user=request.user, capability_slug="remote_dj.connect")
 
     from library.models import RemoteDJConfig
 
@@ -3257,7 +3349,7 @@ def api_track_blocked_slot_toggle(request, pk):
     check. See PROJECT_NOTES.md's "Roadmap 2.5" section."""
     result = authorize(request.user, "library.manage_tracks")
     if not result:
-        return forbidden_response(result)
+        return forbidden_response(result, user=request.user, capability_slug="library.manage_tracks")
 
     track = get_object_or_404(Track, pk=pk)
     try:
@@ -3292,7 +3384,7 @@ def api_track_blocked_slot_toggle_row(request, pk):
     api_track_blocked_slot_toggle's comment)."""
     result = authorize(request.user, "library.manage_tracks")
     if not result:
-        return forbidden_response(result)
+        return forbidden_response(result, user=request.user, capability_slug="library.manage_tracks")
 
     track = get_object_or_404(Track, pk=pk)
     try:
@@ -3325,7 +3417,7 @@ def api_track_blocked_slot_toggle_column(request, pk):
     api_track_blocked_slot_toggle's comment)."""
     result = authorize(request.user, "library.manage_tracks")
     if not result:
-        return forbidden_response(result)
+        return forbidden_response(result, user=request.user, capability_slug="library.manage_tracks")
 
     track = get_object_or_404(Track, pk=pk)
     try:

@@ -141,23 +141,72 @@ class TalentAssignmentAdmin(admin.ModelAdmin):
         return obj.crosses_midnight
 
 
+class ScheduleAccessConfigForm(forms.ModelForm):
+    class Meta:
+        model = ScheduleAccessConfig
+        fields = [
+            "pre_schedule_allowance_minutes", "post_schedule_allowance_minutes",
+            "scheduled_enforcement_enabled",
+        ]
+
+    def clean_scheduled_enforcement_enabled(self):
+        """Roadmap 2.5C activation safety (docs/AUTHORIZATION.md's "Safe
+        activation" section). Refuses to save with this ON while any
+        active, non-staff account holds a schedule-restricted capability
+        but has zero TalentAssignment rows configured at all -- turning
+        enforcement on would otherwise silently lock that account out the
+        moment this form saves. Existence, not liveness: a future/
+        recurring assignment is enough (see
+        users_missing_talent_assignments_for_scheduled_capabilities's own
+        docstring) -- this is deliberately not a live authorize() check."""
+        enabled = self.cleaned_data["scheduled_enforcement_enabled"]
+        if enabled:
+            from authz.evaluator import users_missing_talent_assignments_for_scheduled_capabilities
+            missing = users_missing_talent_assignments_for_scheduled_capabilities()
+            if missing:
+                names = ", ".join(sorted(u.username for u in missing))
+                raise forms.ValidationError(
+                    "Cannot enable scheduled enforcement: the following account(s) "
+                    "hold a schedule-restricted capability (e.g. Remote DJ connect) "
+                    f"but have NO Talent Assignment configured at all: {names}. "
+                    "Add at least one assignment for each (Config > Talent "
+                    "Assignments, or that user's own admin page) before enabling."
+                )
+        return enabled
+
+
 @admin.register(ScheduleAccessConfig)
 class ScheduleAccessConfigAdmin(admin.ModelAdmin):
-    """Singleton -- station-wide pre/post schedule access allowances
-    applied to every TalentAssignment. Same singleton admin pattern as
+    """Singleton -- station-wide pre/post schedule access allowances and
+    the scheduled-enforcement activation switch, applied to every
+    schedule-restricted capability check. Same singleton admin pattern as
     library.admin.StationTimeConfigAdmin: add is blocked once the one row
     exists, delete is blocked entirely, and the changelist redirects
     straight to that row's own change page."""
+    form = ScheduleAccessConfigForm
     fieldsets = (
         (None, {
             "fields": ("pre_schedule_allowance_minutes", "post_schedule_allowance_minutes"),
             "description": (
                 "How many minutes before/after an assignment's scheduled "
                 "start/end its schedule-restricted capabilities (Remote "
-                "DJ connect, playout control, manual mode, mic gates, FX "
+                "DJ connect, queue management, manual mode, mic gates, FX "
                 "fire) become/remain usable. Both accept 0. Applied "
                 "station-wide -- there is no per-user or per-assignment "
                 "override."
+            ),
+        }),
+        ("Activation", {
+            "fields": ("scheduled_enforcement_enabled",),
+            "description": (
+                "OFF (default): schedule-restricted capabilities behave "
+                "like ordinary ones -- the account must still hold the "
+                "capability through a Role, but no Talent Assignment is "
+                "required. ON: the account must ALSO have an active "
+                "Talent Assignment whose window currently covers the "
+                "capability being used. Turning this ON is refused if "
+                "any account would be immediately locked out -- see this "
+                "field's own help text."
             ),
         }),
     )
@@ -173,3 +222,20 @@ class ScheduleAccessConfigAdmin(admin.ModelAdmin):
         return HttpResponseRedirect(
             reverse("admin:authz_scheduleaccessconfig_change", args=[obj.pk])
         )
+
+    def save_model(self, request, obj, form, change):
+        was_enabled = None
+        if change:
+            was_enabled = ScheduleAccessConfig.objects.filter(pk=obj.pk).values_list(
+                "scheduled_enforcement_enabled", flat=True
+            ).first()
+        super().save_model(request, obj, form, change)
+        if was_enabled is not None and was_enabled != obj.scheduled_enforcement_enabled:
+            from monitoring.models import emit_event
+            state = "ENABLED" if obj.scheduled_enforcement_enabled else "disabled"
+            emit_event(
+                category="authz",
+                level="warning",
+                title=f"Scheduled talent enforcement {state}",
+                detail={"by": getattr(request.user, "username", "")},
+            )

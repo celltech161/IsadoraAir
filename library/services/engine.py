@@ -777,6 +777,14 @@ REMOTE_DJ_MEDIA_WATCHDOG_INTERVAL_MS = 500
 # Require two normal-cadence observations within this small window.
 REMOTE_DJ_MEDIA_RECOVERY_CONFIRMATIONS = 2
 REMOTE_DJ_MEDIA_RECOVERY_CONFIRM_WINDOW_S = 0.5
+# Roadmap 2.5C -- periodic re-authorization cadence for an active
+# Remote DJ session (see _remote_dj_authorization_tick). This is the
+# documented maximum delay between authorization actually becoming
+# invalid (schedule window ended, Role/assignment revoked, account
+# disabled) and the session being torn down -- keep
+# docs/AUTHORIZATION.md's "Active-session reauthorization" section in
+# sync with this value.
+REMOTE_DJ_AUTHZ_TICK_SECONDS = 5
 POSITION_POLL_MS = 250
 AUTO_BUILD_CHECK_SECONDS = 10
 NEXT_HOUR_LOOKAHEAD_SECONDS = 30
@@ -1195,6 +1203,14 @@ class RemoteDJSession:
     MAX_DJ_SLOTS is 1 today; the shape is generalizable to N."""
     def __init__(self):
         self.connection_attempt = None
+        # Roadmap 2.5C -- the Django user_id this session is signed in
+        # as, threaded through from the signaling server's already-
+        # verified token identity (see RemoteDJSignalingServer._handler
+        # and _remote_dj_session_start). None only for a session built
+        # by an offline test harness that never goes through signaling
+        # at all; _remote_dj_authorization_tick treats that as "nothing
+        # to re-check" rather than erroring.
+        self.user_id = None
         self.webrtc = None
         self.ice_agent = None
         self.slot_id = None            # which self.dj_slots[] index this session took
@@ -1780,6 +1796,11 @@ class PlaybackEngine:
             self._warm_stun_dns()
             self._remote_dj_server = RemoteDJSignalingServer(self)
             self._remote_dj_server.start()
+            # Roadmap 2.5C -- periodic re-authorization of whichever
+            # Remote DJ session is active (no-op tick when none is).
+            GLib.timeout_add_seconds(
+                REMOTE_DJ_AUTHZ_TICK_SECONDS, self._remote_dj_authorization_tick
+            )
 
         try:
             print("Engine started.")
@@ -9426,7 +9447,7 @@ class PlaybackEngine:
         self._remote_dj_emit_failure(attempt, failure_class, reason)
         return False
 
-    def _remote_dj_session_start(self, attempt_id=None, issued_at_ms=None):
+    def _remote_dj_session_start(self, attempt_id=None, issued_at_ms=None, user_id=None):
         attempt_id = attempt_id or new_attempt_id()
         issued_at_ms = issued_at_ms or int(time.time() * 1000)
         attempt = RemoteDJConnectionAttempt(attempt_id, issued_at_ms)
@@ -9468,6 +9489,7 @@ class PlaybackEngine:
         print(f"  Remote DJ: session starting (claiming slot {slot.slot_id})")
         session = RemoteDJSession()
         session.connection_attempt = attempt
+        session.user_id = user_id  # roadmap 2.5C -- see _remote_dj_authorization_tick
         session.slot_id = slot.slot_id
         slot.session = session
         # Publish the claimed session before any fallible configuration
@@ -9526,6 +9548,81 @@ class PlaybackEngine:
             # releases request pads, and disconnects signaling.
             self._remote_dj_session_stop()
         return False
+
+    def _remote_dj_authorization_tick(self):
+        """Roadmap 2.5C -- periodic re-authorization of the active
+        Remote DJ session. Registered at REMOTE_DJ_AUTHZ_TICK_SECONDS
+        cadence (only when RemoteDJConfig.enabled, alongside the
+        signaling server itself -- see start()); a no-op GLib timer tick
+        when no session is active, same discipline as
+        _mic_presence_probe_tick/_output_presence_probe_tick above.
+
+        Detects every case the roadmap names: the assignment's effective
+        end reached, the TalentAssignment disabled/deleted, the Role/
+        capability removed, the account disabled, and scheduled
+        enforcement being turned on/off in the interim -- all of these
+        fall out of simply re-running the SAME authorize() check the
+        signaling server used at admission, against a freshly-fetched
+        User row, every tick. No second schedule calculator exists here;
+        this calls the identical authz.evaluator.authorize() the rest of
+        2.5 uses. bypass_cache=True for the same cross-process-staleness
+        reason as the signaling admission check.
+
+        Termination reuses the existing normal _remote_dj_session_stop()
+        path verbatim -- gate closes, manual-mode-from-mic folds back to
+        Auto, slot/signaling teardown all happen exactly as an ordinary
+        disconnect. This is deliberately NOT treated as a transport
+        failure: no reconnect-grace window is granted (RemoteDJConfig.
+        reconnect_grace_seconds exists for a recoverable WebRTC
+        transport loss, a different concept -- an authorization
+        revocation is not recoverable by waiting).
+
+        Maximum expected delay between authorization actually becoming
+        invalid and the session being torn down: one tick interval,
+        REMOTE_DJ_AUTHZ_TICK_SECONDS (documented in docs/AUTHORIZATION.md
+        -- keep that doc in sync if this constant changes). In
+        particular, a scheduled effective_end is exclusive (roadmap
+        2.5B's half-open interval) -- the FIRST tick at or after that
+        instant sees authorize() deny and retires the session; there is
+        no added grace beyond the tick cadence itself."""
+        session = self.remote_dj_session
+        if session is None:
+            return True
+        user_id = getattr(session, "user_id", None)
+        if user_id is None:
+            return True
+
+        close_old_connections()
+        from django.contrib.auth import get_user_model
+        from authz.evaluator import authorize as _authorize
+
+        try:
+            user = get_user_model().objects.get(pk=user_id)
+        except get_user_model().DoesNotExist:
+            allowed, code, reason = False, "account_deleted", "Account no longer exists."
+        else:
+            result = _authorize(user, "remote_dj.connect", bypass_cache=True)
+            allowed, code, reason = result.allowed, result.code, result.reason
+
+        if not allowed:
+            attempt = getattr(session, "connection_attempt", None)
+            attempt_id = attempt.attempt_id if attempt is not None else "untracked"
+            print(
+                f"  Remote DJ [{attempt_id}]: authorization revoked "
+                f"(code={code}) -- terminating session"
+            )
+            try:
+                emit_event(
+                    category="authz",
+                    level="warning",
+                    title="Remote DJ session terminated: authorization revoked",
+                    detail={"user_id": user_id, "attempt_id": attempt_id, "code": code},
+                    dedupe_key=f"authz|session_revoked|{user_id}",
+                )
+            except Exception as exc:
+                print(f"  Remote DJ: failed to emit session-revoked audit event: {exc}")
+            self._remote_dj_session_stop()
+        return True
 
     @staticmethod
     def _remote_dj_require_element(factory_name, stage):

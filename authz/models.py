@@ -227,15 +227,32 @@ class ScheduleAccessConfig(models.Model):
                    "0 is valid (access ends exactly at the scheduled end "
                    "time).",
     )
+    scheduled_enforcement_enabled = models.BooleanField(
+        default=False,
+        help_text="Roadmap 2.5C activation switch. OFF (the default, "
+                   "including on every existing/upgraded installation): "
+                   "schedule-restricted capabilities behave as ordinary "
+                   "capabilities -- the account must still hold the "
+                   "capability, but no TalentAssignment is required. ON: "
+                   "the account must ALSO have an active TalentAssignment "
+                   "whose effective window covers the current moment. "
+                   "This never affects ordinary (non-scheduled) "
+                   "capabilities. The admin form refuses to turn this ON "
+                   "while an active, non-staff account holds a "
+                   "schedule-restricted capability but has zero Talent "
+                   "Assignment rows configured at all -- see "
+                   "docs/AUTHORIZATION.md's \"Safe activation\" section.",
+    )
 
     class Meta:
         verbose_name = "Schedule Access Config"
         verbose_name_plural = "Schedule Access Config"
 
     def __str__(self):
+        state = "ON" if self.scheduled_enforcement_enabled else "OFF"
         return (
             f"Schedule Access (pre={self.pre_schedule_allowance_minutes}min, "
-            f"post={self.post_schedule_allowance_minutes}min)"
+            f"post={self.post_schedule_allowance_minutes}min, enforcement={state})"
         )
 
     def save(self, *args, **kwargs):

@@ -9,7 +9,14 @@ exactly how a future 2.5C caller with its own authoritative instant
 Capability fixture used throughout: `remote_dj.connect`
 (requires_schedule=True, seeded by authz.migrations.0002) granted via a
 dedicated test Role/Group, kept separate from the real seeded "Remote
-Host" Role so a test's Role edits can never affect another test."""
+Host" Role so a test's Role edits can never affect another test.
+
+Roadmap 2.5C note: every check here uses schedule_policy="strict" (via
+the `check()` helper below) so this file keeps testing the scheduling
+MECHANISM itself, independent of ScheduleAccessConfig.
+scheduled_enforcement_enabled (default OFF as of 2.5C -- see
+authz.tests.test_scheduled_enforcement_activation for coverage of the
+station-switch/compatibility-policy behavior that flag controls)."""
 import datetime as dt
 from zoneinfo import ZoneInfo
 
@@ -23,6 +30,7 @@ from authz.evaluator import (
     CODE_INACTIVE_ASSIGNMENT,
     CODE_NO_ASSIGNMENT,
     CODE_OUTSIDE_SCHEDULE_WINDOW,
+    SCHEDULE_POLICY_STRICT,
     authorize,
 )
 from authz.models import Capability, GroupRole, Role, RoleCapability, ScheduleAccessConfig, TalentAssignment
@@ -76,7 +84,7 @@ class ScheduledEvaluatorTestCase(TestCase):
         return TalentAssignment.objects.create(**kwargs)
 
     def check(self, when):
-        return authorize(self.user, "remote_dj.connect", now=when)
+        return authorize(self.user, "remote_dj.connect", now=when, schedule_policy=SCHEDULE_POLICY_STRICT)
 
 
 class OrdinaryAssignmentWindowTests(ScheduledEvaluatorTestCase):
