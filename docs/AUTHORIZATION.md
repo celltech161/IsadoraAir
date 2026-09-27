@@ -1,7 +1,7 @@
 # Authorization — capability architecture (Roadmap 2.5)
 
-This document covers what exists **today**, after Phase 2.5D (bounded
-authorization closeout). See
+This document covers what exists **today**, after Phase 2.5E (final
+library authorization closeout). See
 `PROJECT_NOTES.md`'s "Roadmap 2.5" section for the full audit history, the
 operator's binding corrections to the original design, and the
 phase-by-phase continuation record. This document is the durable,
@@ -412,7 +412,7 @@ playlist play-now, and is what the Remote Host Role actually holds. This is
 a correction to an inaccurate mapping discovered before it caused harm, not
 an expansion of anyone's real access.
 
-## Endpoint-to-capability mapping (roadmap 2.5A–2.5D)
+## Endpoint-to-capability mapping (roadmap 2.5A–2.5E)
 
 Every mutation/control endpoint below enforces `authorize()` server-side;
 none of them rely on `GroupAccess` for anything but coarse page
@@ -439,6 +439,10 @@ distinction").
 | `api_log_build/update/delete/reorder/item_swap` | `schedule.edit` | log reads and preview/dry-run remain capability-free |
 | `POST /monitoring/api/listeners/reset-peak/`, `reset-tlh/` | `monitoring.reset_listener_counters` | Remote Host reachability does not grant reset authority |
 | `POST /api/aircheck/start/`, `stop/` | `aircheck.control` | status read remains capability-free |
+| `POST /api/library/upload/` (`api_library_upload`) | `library.upload` | Contributor's category-auto-pin rule applies AFTER this gate, unchanged (see "Roadmap 2.5E" below) |
+| `PATCH`/`DELETE /api/tracks/<pk>/` (`api_track_detail`), general branch | `library.manage_tracks` | Contributor/remote_dj's own-upload-delete carve-out is a separate, narrower path — see below |
+| `DELETE /api/tracks/<pk>/`, Contributor own-upload carve-out | `library.upload` | AND the pre-existing ownership rule (own upload, not yet `ready2air`) — capability alone never authorizes deleting a track that isn't the caller's own unreviewed upload |
+| `POST /api/tracks/autofill-related-artists/` (`api_track_autofill_related_artists`) | `library.manage_tracks` | replaces the prior negative "not Contributor/remote_dj" check |
 
 `GroupAccess` reachability gaps closed alongside the capability mapping
 (without either, the intended feature simply doesn't work end to end —
@@ -633,19 +637,70 @@ workorder's own instruction, found:
   **If CD control is ever exposed to a non-staff workspace/group, add an
   independent server-side capability boundary before widening
   `GroupAccess`.**
-- The final 2.5D mutation sweep confirmed three pre-existing library
-  write surfaces that do not yet fit the final capability taxonomy:
-  `api_library_upload` does not enforce `library.upload` before applying
-  its Contributor category-pin rule; `api_track_detail` does not enforce
-  `library.manage_tracks` before applying its Contributor own-upload
-  deletion/read-only rules; and `api_track_autofill_related_artists`
-  relies on `user_is_library_read_only` rather than
-  `library.manage_tracks`. The two named seeded non-staff Groups remain
-  constrained by those legacy group/resource checks, but these are not
-  capability boundaries and a newly created Group with widened
-  `GroupAccess` could expose them. They were outside the finite 2.5D
-  punch list and were therefore documented rather than silently added to
-  scope. Close them before declaring the whole roadmap item complete.
+- `api_log_reorder`'s arbitrary-`PlaylistLog`-primary-key/resource-scope
+  question (noted above) remains open — a future phase should decide
+  whether it needs a current-log/resource-scope rule of its own.
+
+No other GroupAccess-only mutation surface is known. **This is the last
+item on the roadmap 2.5 punch list; with 2.5E landed, roadmap 2.5's
+authorization scope is frozen.** Any future feature work must preserve
+the central invariant this whole roadmap item exists to establish:
+**adding `GroupAccess` reachability must never, by itself, authorize a
+state-changing operation.** A new endpoint needs its own `authorize()`
+call (or an independent staff/superuser check) before it is wired into
+any URL a non-staff Group can reach — GroupAccess is reachability, never
+authority.
+
+## Roadmap 2.5E — final library authorization closeout
+
+The 2.5D final mutation audit (previous section) found three pre-existing
+library write surfaces outside its finite punch list that did not yet fit
+the A/B/C/D taxonomy. All three are now closed:
+
+- **`api_library_upload`** now requires `library.upload` before doing
+  anything else. Contributor and Station Administrator already held it
+  (`authz.0002`/`0007`); Remote Host does not have it and was never
+  intended to upload. The pre-existing Contributor category-auto-pin rule
+  (posted `category_id` is ignored/overridden to the Contributor's own
+  username-matched Category) is a **resource** restriction layered on
+  top of this capability, unchanged — it still runs after the gate, not
+  instead of it.
+- **`api_track_detail`**'s general (non-Contributor/non-remote_dj) branch
+  now requires `library.manage_tracks` before any `PATCH`/`DELETE`. Reads
+  are untouched. The Contributor own-upload-delete carve-out is handled
+  as a **separate** path: it requires `library.upload` (the capability
+  that already governs everything a Contributor may do to material they
+  personally uploaded) **AND** the pre-existing ownership rule (own
+  upload, not yet `ready2air`) — capability possession alone still never
+  authorizes deleting a track that isn't the caller's own unreviewed
+  upload, and the ownership rule alone still never authorizes it without
+  the capability either. `library.manage_tracks` was deliberately **not**
+  granted to Contributor for this: the seeded vocabulary has no
+  narrower "manage only my own uploads" slug, and using the broad
+  track-management capability here would have overgranted Contributor
+  authority over every track in the library for an unrelated reason. This
+  is the "A" resolution the workorder asked for — the existing, narrower
+  `library.upload` capability already covers this scenario — not a new
+  capability and not a design defect.
+- **`api_track_autofill_related_artists`** now calls
+  `authorize(request.user, "library.manage_tracks")` instead of the
+  negative `user_is_library_read_only(...)` check. Behaviorally identical
+  for Contributor and remote_dj (neither holds `library.manage_tracks`,
+  so both remain blocked exactly as before); the difference is that
+  authority is now a positive grant, not "not a member of these two
+  specific groups." No object/ownership rule applies — this is a bulk
+  operation over a filtered queryset, not scoped to one owned track.
+
+Tests: `library.tests.test_authz_library_closeout_2_5e` (21 tests) —
+unauthenticated/reachable-but-uncapable/capable/staff/superuser for each
+of the three endpoints, plus explicit proofs that the Contributor
+category-pin and own-upload-delete resource rules survive unchanged and
+that capability possession never bypasses them.
+
+Repeating the final mutation audit after these three fixes found no
+further unexplained `GroupAccess`-only mutation surface — see the
+"Remaining authorization debt" section above for the complete, now-final
+list of accepted debt (CD controls, `api_log_reorder`'s resource scope).
 
 ## Security defects closed in 2.5A
 

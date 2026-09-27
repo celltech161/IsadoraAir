@@ -1256,13 +1256,18 @@ def api_track_autofill_related_artists(request):
     Always applies (apply=True) -- the frontend's own confirm() dialog
     is this endpoint's "are you sure", there's no separate dry-run mode
     over HTTP (that's what the management command is for)."""
-    from library.middleware import user_is_library_read_only
-
-    # Same explicit check api_track_detail uses for every other write
-    # -- the toolbar button being hidden for read-only users is a UX
-    # nicety, not the actual protection.
-    if user_is_library_read_only(request.user):
-        return JsonResponse({"error": "Read-only for this account."}, status=403)
+    # Roadmap 2.5E: replaces the prior "allowed unless Contributor/
+    # remote_dj" negative check with a positive capability requirement.
+    # Behaviorally identical for the two seeded non-staff Groups (neither
+    # holds library.manage_tracks, so both remain blocked exactly as
+    # before) but closes the gap for any future Group whose GroupAccess
+    # reaches this URL without also being granted track-management
+    # authority. This is a bulk operation over a filtered queryset, not
+    # scoped to any one owned object, so no additional resource/ownership
+    # rule applies here.
+    result = authorize(request.user, "library.manage_tracks")
+    if not result:
+        return forbidden_response(result, user=request.user, capability_slug="library.manage_tracks")
 
     try:
         body = json.loads(request.body) if request.body else {}
@@ -1415,9 +1420,30 @@ def api_track_detail(request, pk):
                 return JsonResponse({"error": "You can only delete your own not-yet-approved uploads."}, status=403)
             if request.method not in ("GET", "DELETE"):
                 return JsonResponse({"error": "Read-only for this account."}, status=403)
+            # Roadmap 2.5E: the ownership check above is a RESOURCE
+            # restriction (which track), not an authority check (whether
+            # this account may ever retract an upload). That authority
+            # comes from the same library.upload capability that let a
+            # Contributor create the upload in the first place -- this
+            # vocabulary has no narrower "manage own uploads" slug, and
+            # granting library.manage_tracks here would overgrant full
+            # track-management authority for an unrelated reason. See
+            # docs/AUTHORIZATION.md.
+            result = authorize(request.user, "library.upload")
+            if not result:
+                return forbidden_response(result, user=request.user, capability_slug="library.upload")
         else:
             # remote_dj (or any future non-Contributor read-only role)
             return JsonResponse({"error": "Read-only for this account."}, status=403)
+    else:
+        # Roadmap 2.5E: previously zero check here -- any account NOT in
+        # the literal Contributor/remote_dj groups (e.g. a future Group
+        # whose GroupAccess widens to reach /api/tracks/) got unrestricted
+        # mutate access. Staff/superuser continue to bypass via
+        # authorize() itself.
+        result = authorize(request.user, "library.manage_tracks")
+        if not result:
+            return forbidden_response(result, user=request.user, capability_slug="library.manage_tracks")
 
     if request.method == "DELETE":
         ok, reason = _delete_track_and_file(track)
@@ -2931,6 +2957,18 @@ def api_library_upload(request):
     from library.management.commands.import_songs import SUPPORTED_EXT, parse_tags
     from library.middleware import user_is_contributor
     from library.models import UploadConfig
+
+    # Roadmap 2.5E: this endpoint previously had no capability check at
+    # all -- Contributor's category-auto-pin rule below is a RESOURCE
+    # restriction (which category), not an authority check (whether the
+    # caller may upload in the first place). Contributor and Station
+    # Administrator already hold library.upload (authz.0002/0007), so
+    # this changes nothing for either; it closes the gap for any future
+    # Group whose GroupAccess happens to reach this URL without also
+    # being deliberately granted upload authority.
+    result = authorize(request.user, "library.upload")
+    if not result:
+        return forbidden_response(result, user=request.user, capability_slug="library.upload")
 
     is_contributor = user_is_contributor(request.user)
 
