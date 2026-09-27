@@ -445,10 +445,12 @@ def users_missing_talent_assignments_for_scheduled_capabilities():
     activation" section). Returns the list of active, non-staff,
     non-superuser Users who hold at least one requires_schedule=True
     capability through their ordinary Group->Role chain but have ZERO
-    TalentAssignment rows at all (active or not -- existence, not
-    liveness: a future/recurring assignment is enough, per the operator's
-    own instruction; this deliberately does NOT evaluate any assignment's
-    live window). Used by authz.admin.ScheduleAccessConfigForm to refuse
+    ACTIVE TalentAssignment rows. This is still an existence check, not
+    a live-window check: an active future specific-date assignment or an
+    active recurring assignment is enough, per the operator's instruction.
+    An inactive row is deliberately insufficient because enabling
+    enforcement would immediately lock that account out. Used by
+    authz.admin.ScheduleAccessConfigForm to refuse
     turning ScheduleAccessConfig.scheduled_enforcement_enabled ON while
     such an account exists -- the simplest understandable safe rule:
     don't allow enabling enforcement while a Remote Host has no talent
@@ -463,8 +465,8 @@ def users_missing_talent_assignments_for_scheduled_capabilities():
         return []
 
     capability_map = _load_group_capability_map()
-    users_with_any_assignment = frozenset(
-        TalentAssignment.objects.values_list("user_id", flat=True)
+    users_with_active_assignment = frozenset(
+        TalentAssignment.objects.filter(active=True).values_list("user_id", flat=True)
     )
 
     missing = []
@@ -474,6 +476,6 @@ def users_missing_talent_assignments_for_scheduled_capabilities():
         granted = frozenset().union(
             *(capability_map.get(name, frozenset()) for name in user_group_names)
         ) if user_group_names else frozenset()
-        if granted & scheduled_slugs and user.id not in users_with_any_assignment:
+        if granted & scheduled_slugs and user.id not in users_with_active_assignment:
             missing.append(user)
     return missing

@@ -83,6 +83,32 @@ class ScheduleAccessConfigAdminTests(TestCase):
         cfg.refresh_from_db()
         self.assertTrue(cfg.scheduled_enforcement_enabled)
 
+    def test_enabling_with_only_an_inactive_assignment_is_refused(self):
+        role = Role.objects.create(name="Activation Admin Test Role Inactive")
+        RoleCapability.objects.create(
+            role=role, capability=Capability.objects.get(slug="remote_dj.connect")
+        )
+        group = Group.objects.create(name="Activation Admin Test Group Inactive")
+        GroupRole.objects.create(group=group, role=role)
+        dj = User.objects.create_user("activation_admin_inactive_dj", password="pw")
+        dj.groups.add(group)
+        TalentAssignment.objects.create(
+            user=dj,
+            day_of_week=3,
+            start_time=dt.time(18, 0),
+            end_time=dt.time(20, 0),
+            active=False,
+        )
+
+        cfg = ScheduleAccessConfig.load()
+        resp = self._post_config(cfg, enabled=True)
+
+        self.assertEqual(resp.status_code, 200)
+        self.assertContains(resp, "activation_admin_inactive_dj")
+        self.assertContains(resp, "NO ACTIVE Talent Assignment")
+        cfg.refresh_from_db()
+        self.assertFalse(cfg.scheduled_enforcement_enabled)
+
     def test_toggling_enforcement_emits_an_audit_event(self):
         cfg = ScheduleAccessConfig.load()
         before_count = SystemEvent.objects.filter(category="authz").count()

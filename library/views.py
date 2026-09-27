@@ -102,6 +102,10 @@ def api_schedule_list(request):
         )
         return JsonResponse({"blocks": [_block_to_dict(b) for b in blocks]})
 
+    result = authorize(request.user, "schedule.edit")
+    if not result:
+        return forbidden_response(result, user=request.user, capability_slug="schedule.edit")
+
     try:
         body = json.loads(request.body)
     except (json.JSONDecodeError, ValueError):
@@ -153,6 +157,10 @@ def api_schedule_list(request):
 
 @require_http_methods(["DELETE"])
 def api_schedule_delete(request, pk):
+    result = authorize(request.user, "schedule.edit")
+    if not result:
+        return forbidden_response(result, user=request.user, capability_slug="schedule.edit")
+
     deleted, _ = ScheduleBlock.objects.filter(pk=pk).delete()
     return JsonResponse({"ok": True, "deleted": deleted > 0})
 
@@ -569,6 +577,12 @@ def api_rotation_list(request):
         ]
         return JsonResponse({"rotations": data})
 
+    result = authorize(request.user, "rotations_playlists.edit")
+    if not result:
+        return forbidden_response(
+            result, user=request.user, capability_slug="rotations_playlists.edit"
+        )
+
     try:
         body = json.loads(request.body)
     except (json.JSONDecodeError, ValueError):
@@ -622,10 +636,17 @@ def _rotation_to_dict(rotation):
 
 @require_http_methods(["GET", "PATCH", "DELETE"])
 def api_rotation_detail(request, pk):
-    rotation = get_object_or_404(Rotation, pk=pk)
-
     if request.method == "GET":
+        rotation = get_object_or_404(Rotation, pk=pk)
         return JsonResponse(_rotation_to_dict(rotation))
+
+    result = authorize(request.user, "rotations_playlists.edit")
+    if not result:
+        return forbidden_response(
+            result, user=request.user, capability_slug="rotations_playlists.edit"
+        )
+
+    rotation = get_object_or_404(Rotation, pk=pk)
 
     if request.method == "DELETE":
         try:
@@ -656,6 +677,12 @@ def api_rotation_detail(request, pk):
 
 @require_http_methods(["POST"])
 def api_rotation_add_slot(request, pk):
+    result = authorize(request.user, "rotations_playlists.edit")
+    if not result:
+        return forbidden_response(
+            result, user=request.user, capability_slug="rotations_playlists.edit"
+        )
+
     rotation = get_object_or_404(Rotation, pk=pk)
 
     try:
@@ -687,6 +714,12 @@ def api_rotation_add_slot(request, pk):
 
 @require_http_methods(["DELETE"])
 def api_rotation_remove_slot(request, slot_id):
+    result = authorize(request.user, "rotations_playlists.edit")
+    if not result:
+        return forbidden_response(
+            result, user=request.user, capability_slug="rotations_playlists.edit"
+        )
+
     slot = get_object_or_404(RotationSlot.objects.select_related("rotation"), pk=slot_id)
     rotation = slot.rotation
     slot.delete()
@@ -699,6 +732,12 @@ def api_rotation_remove_slot(request, slot_id):
 
 @require_http_methods(["POST"])
 def api_rotation_reorder(request, pk):
+    result = authorize(request.user, "rotations_playlists.edit")
+    if not result:
+        return forbidden_response(
+            result, user=request.user, capability_slug="rotations_playlists.edit"
+        )
+
     rotation = get_object_or_404(Rotation, pk=pk)
 
     try:
@@ -721,6 +760,12 @@ def api_rotation_reorder(request, pk):
 def api_rotation_copy(request, pk):
     """Duplicate a rotation and all its slots under a new name -- for
     building a variant rotation without starting from an empty slot list."""
+    result = authorize(request.user, "rotations_playlists.edit")
+    if not result:
+        return forbidden_response(
+            result, user=request.user, capability_slug="rotations_playlists.edit"
+        )
+
     source = get_object_or_404(Rotation, pk=pk)
 
     try:
@@ -763,6 +808,12 @@ def api_playlist_list(request):
             for p in playlists
         ]
         return JsonResponse({"playlists": data})
+
+    result = authorize(request.user, "rotations_playlists.edit")
+    if not result:
+        return forbidden_response(
+            result, user=request.user, capability_slug="rotations_playlists.edit"
+        )
 
     try:
         body = json.loads(request.body)
@@ -808,10 +859,17 @@ def _playlist_to_dict(playlist):
 
 @require_http_methods(["GET", "PATCH", "DELETE"])
 def api_playlist_detail(request, pk):
-    playlist = get_object_or_404(Playlist, pk=pk)
-
     if request.method == "GET":
+        playlist = get_object_or_404(Playlist, pk=pk)
         return JsonResponse(_playlist_to_dict(playlist))
+
+    result = authorize(request.user, "rotations_playlists.edit")
+    if not result:
+        return forbidden_response(
+            result, user=request.user, capability_slug="rotations_playlists.edit"
+        )
+
+    playlist = get_object_or_404(Playlist, pk=pk)
 
     if request.method == "DELETE":
         try:
@@ -842,6 +900,12 @@ def api_playlist_detail(request, pk):
 
 @require_http_methods(["POST"])
 def api_playlist_add_item(request, pk):
+    result = authorize(request.user, "rotations_playlists.edit")
+    if not result:
+        return forbidden_response(
+            result, user=request.user, capability_slug="rotations_playlists.edit"
+        )
+
     playlist = get_object_or_404(Playlist, pk=pk)
 
     try:
@@ -863,6 +927,12 @@ def api_playlist_add_item(request, pk):
 
 @require_http_methods(["DELETE"])
 def api_playlist_remove_item(request, item_id):
+    result = authorize(request.user, "rotations_playlists.edit")
+    if not result:
+        return forbidden_response(
+            result, user=request.user, capability_slug="rotations_playlists.edit"
+        )
+
     item = get_object_or_404(PlaylistItem.objects.select_related("playlist"), pk=item_id)
     playlist = item.playlist
     item.delete()
@@ -875,6 +945,12 @@ def api_playlist_remove_item(request, item_id):
 
 @require_http_methods(["POST"])
 def api_playlist_reorder(request, pk):
+    result = authorize(request.user, "rotations_playlists.edit")
+    if not result:
+        return forbidden_response(
+            result, user=request.user, capability_slug="rotations_playlists.edit"
+        )
+
     playlist = get_object_or_404(Playlist, pk=pk)
 
     try:
@@ -897,6 +973,12 @@ def api_playlist_reorder(request, pk):
 def api_playlist_copy(request, pk):
     """Duplicate a playlist and all its items under a new name -- for
     building a variant playlist without starting from an empty list."""
+    result = authorize(request.user, "rotations_playlists.edit")
+    if not result:
+        return forbidden_response(
+            result, user=request.user, capability_slug="rotations_playlists.edit"
+        )
+
     source = get_object_or_404(Playlist, pk=pk)
 
     try:
@@ -1813,6 +1895,10 @@ def _is_active_or_imminent_hour(target_date, hour):
 
 @require_http_methods(["POST"])
 def api_log_build(request):
+    result = authorize(request.user, "schedule.edit")
+    if not result:
+        return forbidden_response(result, user=request.user, capability_slug="schedule.edit")
+
     try:
         body = json.loads(request.body)
     except (json.JSONDecodeError, ValueError):
@@ -1918,6 +2004,10 @@ def api_log_list_date(request, date_str):
 
 @require_http_methods(["PATCH"])
 def api_log_update(request, pk):
+    result = authorize(request.user, "schedule.edit")
+    if not result:
+        return forbidden_response(result, user=request.user, capability_slug="schedule.edit")
+
     log = get_object_or_404(PlaylistLog, pk=pk)
 
     try:
@@ -1935,12 +2025,20 @@ def api_log_update(request, pk):
 
 @require_http_methods(["DELETE"])
 def api_log_delete(request, pk):
+    result = authorize(request.user, "schedule.edit")
+    if not result:
+        return forbidden_response(result, user=request.user, capability_slug="schedule.edit")
+
     deleted, _ = PlaylistLog.objects.filter(pk=pk, status="draft").delete()
     return JsonResponse({"ok": True, "deleted": deleted > 0})
 
 
 @require_http_methods(["PATCH"])
 def api_log_item_swap(request, item_id):
+    result = authorize(request.user, "schedule.edit")
+    if not result:
+        return forbidden_response(result, user=request.user, capability_slug="schedule.edit")
+
     item = get_object_or_404(LogItem.objects.select_related("playlist_log"), pk=item_id)
     if item.playlist_log.status != "draft":
         return JsonResponse({"error": "Cannot modify an approved log"}, status=400)
@@ -1969,6 +2067,10 @@ def api_log_item_swap(request, item_id):
 
 @require_http_methods(["POST"])
 def api_log_reorder(request, pk):
+    result = authorize(request.user, "schedule.edit")
+    if not result:
+        return forbidden_response(result, user=request.user, capability_slug="schedule.edit")
+
     log = get_object_or_404(PlaylistLog, pk=pk)
 
     try:

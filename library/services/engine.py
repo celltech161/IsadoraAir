@@ -9617,7 +9617,7 @@ class PlaybackEngine:
                     level="warning",
                     title="Remote DJ session terminated: authorization revoked",
                     detail={"user_id": user_id, "attempt_id": attempt_id, "code": code},
-                    dedupe_key=f"authz|session_revoked|{user_id}",
+                    dedupe_key=f"authz|session_revoked|{user_id}|{code}",
                 )
             except Exception as exc:
                 print(f"  Remote DJ: failed to emit session-revoked audit event: {exc}")

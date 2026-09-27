@@ -153,10 +153,10 @@ class ScheduleAccessConfigForm(forms.ModelForm):
         """Roadmap 2.5C activation safety (docs/AUTHORIZATION.md's "Safe
         activation" section). Refuses to save with this ON while any
         active, non-staff account holds a schedule-restricted capability
-        but has zero TalentAssignment rows configured at all -- turning
+        but has no active TalentAssignment configured -- turning
         enforcement on would otherwise silently lock that account out the
         moment this form saves. Existence, not liveness: a future/
-        recurring assignment is enough (see
+        active future or recurring assignment is enough (see
         users_missing_talent_assignments_for_scheduled_capabilities's own
         docstring) -- this is deliberately not a live authorize() check."""
         enabled = self.cleaned_data["scheduled_enforcement_enabled"]
@@ -168,8 +168,8 @@ class ScheduleAccessConfigForm(forms.ModelForm):
                 raise forms.ValidationError(
                     "Cannot enable scheduled enforcement: the following account(s) "
                     "hold a schedule-restricted capability (e.g. Remote DJ connect) "
-                    f"but have NO Talent Assignment configured at all: {names}. "
-                    "Add at least one assignment for each (Config > Talent "
+                    f"but have NO ACTIVE Talent Assignment configured: {names}. "
+                    "Add or activate at least one assignment for each (Config > Talent "
                     "Assignments, or that user's own admin page) before enabling."
                 )
         return enabled

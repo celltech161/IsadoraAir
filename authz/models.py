@@ -239,8 +239,8 @@ class ScheduleAccessConfig(models.Model):
                    "This never affects ordinary (non-scheduled) "
                    "capabilities. The admin form refuses to turn this ON "
                    "while an active, non-staff account holds a "
-                   "schedule-restricted capability but has zero Talent "
-                   "Assignment rows configured at all -- see "
+                   "schedule-restricted capability but has no active "
+                   "Talent Assignment configured -- see "
                    "docs/AUTHORIZATION.md's \"Safe activation\" section.",
     )
 

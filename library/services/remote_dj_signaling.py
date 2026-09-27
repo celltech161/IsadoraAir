@@ -257,7 +257,7 @@ class RemoteDJSignalingServer:
                         level="warning",
                         title="Remote DJ signaling admission denied",
                         detail={"user_id": user_id, "attempt_id": attempt_id, "code": result.code},
-                        dedupe_key=f"authz|signaling_denied|{user_id}",
+                        dedupe_key=f"authz|signaling_denied|{user_id}|{result.code}",
                     )
                 except Exception as exc:
                     print(f"  Remote DJ: failed to emit admission-denied audit event: {exc}")

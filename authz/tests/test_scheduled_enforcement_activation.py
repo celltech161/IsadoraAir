@@ -149,7 +149,7 @@ class MissingAssignmentValidationTests(TestCase):
         missing = users_missing_talent_assignments_for_scheduled_capabilities()
         self.assertIn(user, missing)
 
-    def test_excludes_a_user_with_at_least_one_assignment_row_even_if_inactive(self):
+    def test_finds_a_user_with_only_inactive_assignments(self):
         role, group = make_scheduled_role_and_group("has_row")
         user = User.objects.create_user("has_assignment_row_user", password="pw")
         user.groups.add(group)
@@ -157,6 +157,36 @@ class MissingAssignmentValidationTests(TestCase):
             user=user, day_of_week=1, start_time=dt.time(1, 0), end_time=dt.time(2, 0),
             active=False,
         )
+        missing = users_missing_talent_assignments_for_scheduled_capabilities()
+        self.assertIn(user, missing)
+
+    def test_active_future_specific_date_assignment_satisfies_activation_safety(self):
+        role, group = make_scheduled_role_and_group("future_specific")
+        user = User.objects.create_user("future_specific_assignment_user", password="pw")
+        user.groups.add(group)
+        TalentAssignment.objects.create(
+            user=user,
+            specific_date=dt.date(2099, 1, 1),
+            start_time=dt.time(1, 0),
+            end_time=dt.time(2, 0),
+            active=True,
+        )
+
+        missing = users_missing_talent_assignments_for_scheduled_capabilities()
+        self.assertNotIn(user, missing)
+
+    def test_active_recurring_assignment_satisfies_activation_safety(self):
+        role, group = make_scheduled_role_and_group("active_recurring")
+        user = User.objects.create_user("active_recurring_assignment_user", password="pw")
+        user.groups.add(group)
+        TalentAssignment.objects.create(
+            user=user,
+            day_of_week=1,
+            start_time=dt.time(1, 0),
+            end_time=dt.time(2, 0),
+            active=True,
+        )
+
         missing = users_missing_talent_assignments_for_scheduled_capabilities()
         self.assertNotIn(user, missing)
 

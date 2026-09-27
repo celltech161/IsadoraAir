@@ -1,7 +1,7 @@
 # Authorization — capability architecture (Roadmap 2.5)
 
-This document covers what exists **today**, after Phase 2.5C (Enforcement
-Sweep, Remote DJ Session Authority, Audit, and Safe Activation). See
+This document covers what exists **today**, after Phase 2.5D (bounded
+authorization closeout). See
 `PROJECT_NOTES.md`'s "Roadmap 2.5" section for the full audit history, the
 operator's binding corrections to the original design, and the
 phase-by-phase continuation record. This document is the durable,
@@ -15,13 +15,15 @@ Upgrade/install (enforcement defaults OFF -- current behavior preserved)
 verify Roles (Config > Roles -- confirm Contributor/Remote Host/Station
    Administrator capabilities match what you expect)
    ->
-configure Talent Assignments (each User's own admin page, or Config >
-   Talent Assignments station-wide) for every account that needs a
+configure active Talent Assignments (Django Admin > Authentication and
+   Authorization > Users > the account's Talent Assignments inline, or
+   Config > Talent Assignments station-wide) for every account that needs a
    requires_schedule=True capability (today: Remote Host)
    ->
-review pre/post allowances (Config > Schedule Access)
+review pre/post allowances (Django Admin > Config > Schedule Access)
    ->
-enable Scheduled Talent Enforcement (same page's checkbox -- refused if
+enable Scheduled Talent Enforcement (the same Schedule Access page's
+   checkbox -- refused if
    any account would be immediately locked out; see "Safe activation"
    below)
    ->
@@ -309,7 +311,7 @@ for a small-station operator to reason about. The 10/15 defaults match
 the exact example numbers used throughout the roadmap 2.5 audit and
 workorder discussion.
 
-### Safe activation (roadmap 2.5C)
+### Safe activation (roadmap 2.5C, tightened in 2.5D)
 
 2.5B established the mechanism but deliberately called it from no real
 endpoint (every existing `remote_dj` account had zero `TalentAssignment`
@@ -340,12 +342,13 @@ clean_scheduled_enforcement_enabled()` refuses to save the field as `True`
 if `authz.evaluator.users_missing_talent_assignments_for_scheduled_
 capabilities()` returns any account — every active, non-staff,
 non-superuser user who holds a `requires_schedule=True` capability
-through their ordinary Group→Role chain but has **zero**
-`TalentAssignment` rows at all. This is an *existence* check, not a live
-window check: a future or purely-recurring assignment satisfies it (per
-the operator's own instruction — a DJ scheduled for next Tuesday should
-not block activation today). Turning enforcement back **OFF** is never
-blocked and never touches any `TalentAssignment` row.
+through their ordinary Group→Role chain but has **zero active**
+`TalentAssignment` rows. This is an *active-row existence* check, not a
+live-window check: an active future specific-date assignment or an active
+recurring assignment satisfies it (a DJ scheduled for next Tuesday should
+not block activation today), while inactive-only rows do not. Turning
+enforcement back **OFF** is never blocked and never touches any
+`TalentAssignment` row.
 
 **The evaluator's `requires_schedule` semantics were never weakened** to
 make this safe — `schedule_policy="strict"` (used by tests and by the
@@ -374,8 +377,8 @@ this document.
 | `library.upload` | no | no (existing checks unchanged) |
 | `library.manage_tracks` | no | **yes** (2.5A) |
 | `library.manage_categories` | no | **yes** (2.5A) |
-| `schedule.edit` | no | no (established, not wired up — nothing reachable today) |
-| `rotations_playlists.edit` | no | no (established, not wired up — nothing reachable today) |
+| `schedule.edit` | no | **yes** (2.5D) — schedule and PlaylistLog mutations |
+| `rotations_playlists.edit` | no | **yes** (2.5D) — rotation and playlist-definition mutations |
 | `voicetrack.record` | no | **yes** (2.5C — `_can_edit_voicetracks` now calls `authorize()`) |
 | `remote_dj.connect` | yes | **yes** (2.5C) — token issuance, signaling admission, session re-check |
 | `playout.control` | yes | **yes** (2.5C) — seek, deck commands (transport control; operator-only) |
@@ -388,6 +391,8 @@ this document.
 | `reports.view` | no | no (existing staff-only check unchanged) |
 | `webrequests.administer` | no | no (existing staff-only check unchanged) |
 | `monitoring.restart_service` | no | **yes** (2.5A) |
+| `monitoring.reset_listener_counters` | no | **yes** (2.5D) — peak/TLH resets |
+| `aircheck.control` | no | **yes** (2.5D) — start/stop Aircheck recording |
 | `system.administer` | no | no (reserved; nothing is gated on it yet) |
 
 **Vocabulary correction in 2.5C** (`authz.migrations.0006_correct_remote_host_
@@ -407,7 +412,7 @@ playlist play-now, and is what the Remote Host Role actually holds. This is
 a correction to an inaccurate mapping discovered before it caused harm, not
 an expansion of anyone's real access.
 
-## Endpoint-to-capability mapping (roadmap 2.5C)
+## Endpoint-to-capability mapping (roadmap 2.5A–2.5D)
 
 Every mutation/control endpoint below enforces `authorize()` server-side;
 none of them rely on `GroupAccess` for anything but coarse page
@@ -428,6 +433,12 @@ distinction").
 | `POST /api/engine/mic-ptt/` (`api_engine_mic_ptt`) | `studio.mic_ptt` | operator-only in practice (no Role grants it but Station Administrator) |
 | `POST /api/fx/fire/` (`api_fx_fire`) | `fx.fire` | |
 | `_can_edit_voicetracks()` (5 call sites: upload/audio/save/delete + `voicetracks_page`) | `voicetrack.record` | not schedule-restricted; unchanged effective behavior |
+| `POST /api/schedule/`, `DELETE /api/schedule/<pk>/` | `schedule.edit` | schedule reads remain capability-free |
+| all mutation methods on `/api/rotations/...` | `rotations_playlists.edit` | rotation reads remain capability-free |
+| all playlist-definition mutation methods on `/api/playlists/...` | `rotations_playlists.edit` | excludes `play-now`, which remains `playout.queue_manage` |
+| `api_log_build/update/delete/reorder/item_swap` | `schedule.edit` | log reads and preview/dry-run remain capability-free |
+| `POST /monitoring/api/listeners/reset-peak/`, `reset-tlh/` | `monitoring.reset_listener_counters` | Remote Host reachability does not grant reset authority |
+| `POST /api/aircheck/start/`, `stop/` | `aircheck.control` | status read remains capability-free |
 
 `GroupAccess` reachability gaps closed alongside the capability mapping
 (without either, the intended feature simply doesn't work end to end —
@@ -506,7 +517,8 @@ authorization revocation is not recoverable by waiting.
 
 Reuses `monitoring.models.SystemEvent`/`emit_event()` (`category="authz"`)
 — no parallel logging subsystem. Coalesced via `emit_event`'s own existing
-60-second dedupe window (keyed on user+capability+code, or user+attempt),
+60-second dedupe window (keyed on user+capability+code, or
+user+attempt+outcome code),
 so a script hammering a denied endpoint produces one row with a rising
 `repeat_count`, never a flood. Never logs credentials, signed tokens, or
 unnecessary personal data — only identity (username), capability, and
@@ -605,31 +617,35 @@ workorder's own instruction, found:
 - **Update Center / Web Requests config / Reports staff-only checks** —
   unchanged, proven still exclusive of any talent Role by
   `library.tests.test_authz_administrative_boundary_2_5c`.
-- **`schedule.edit`/`rotations_playlists.edit`** — rows exist (2.5A),
-  still not wired to any view: no `GroupAccess` grants any group
-  reachability into `/api/schedule/`, `/api/rotations/`, or
-  `/api/playlists/` (mutation paths) today, so there is no currently-
-  exploitable gap to close, and wiring them up preemptively is outside
-  2.5C's scope.
+- **`schedule.edit`/`rotations_playlists.edit`** — established in 2.5A
+  and now enforced by 2.5D at the schedule, PlaylistLog, rotation, and
+  playlist-definition mutation boundaries listed above.
 
 ### Remaining authorization debt
 
-- `api_log_reorder` (drag-to-reorder) — see above; needs a resource-scope
-  check, not just a capability slug.
-- `api_log_build`/`api_log_preview`/`api_log_get`/`api_log_list_date`/
-  `api_log_update`/`api_log_delete`/`api_log_item_swap` — no capability
-  check, not currently reachable by any non-staff group (no `GroupAccess`
-  grant), not in any phase's named target list.
+- `api_log_reorder` now has the primary `schedule.edit` boundary, but it
+  still accepts an arbitrary `PlaylistLog` primary key. A future phase
+  should decide whether it also needs a current-log/resource-scope rule;
+  2.5D deliberately does not redesign PlaylistLog ownership.
 - `api_cd_detect`/`api_cd_eject`/`api_cd_rip_start`/`api_cd_rip_status`/
-  `api_cd_rip_cancel` — no capability check, not currently reachable by
-  any non-staff group, physical-hardware-adjacent.
-- `api_schedule_list`/`api_schedule_delete`, `api_rotation_*`,
-  `api_playlist_list`/`api_playlist_detail`/`api_playlist_add_item`/
-  `api_playlist_remove_item`/`api_playlist_reorder`/`api_playlist_copy` —
-  no capability check, not currently reachable by any non-staff group.
-
-None of these are reachable by any seeded, non-staff Group today — they
-are documented gaps for a future pass, not currently-exploitable defects.
+  `api_cd_rip_cancel` remain outside capability authorization. They are
+  physical-hardware-adjacent and no seeded non-staff Group can reach them.
+  **If CD control is ever exposed to a non-staff workspace/group, add an
+  independent server-side capability boundary before widening
+  `GroupAccess`.**
+- The final 2.5D mutation sweep confirmed three pre-existing library
+  write surfaces that do not yet fit the final capability taxonomy:
+  `api_library_upload` does not enforce `library.upload` before applying
+  its Contributor category-pin rule; `api_track_detail` does not enforce
+  `library.manage_tracks` before applying its Contributor own-upload
+  deletion/read-only rules; and `api_track_autofill_related_artists`
+  relies on `user_is_library_read_only` rather than
+  `library.manage_tracks`. The two named seeded non-staff Groups remain
+  constrained by those legacy group/resource checks, but these are not
+  capability boundaries and a newly created Group with widened
+  `GroupAccess` could expose them. They were outside the finite 2.5D
+  punch list and were therefore documented rather than silently added to
+  scope. Close them before declaring the whole roadmap item complete.
 
 ## Security defects closed in 2.5A
 
@@ -655,7 +671,7 @@ endpoint with no other check at all:
    `api_track_repick_cue_points`, and the three blocked-slot toggle
    endpoints. Now requires `library.manage_tracks`.
 
-## Seeded Roles (migrations `authz.0002`, corrected by `authz.0006`)
+## Seeded Roles (migrations `authz.0002`, corrected by `authz.0006` and `authz.0007`)
 
 | Role | Bound Group | Capabilities |
 |---|---|---|
@@ -665,6 +681,12 @@ endpoint with no other check at all:
 
 `Remote Host` holds `playout.queue_manage`, not `playout.control` — see
 the "Capability vocabulary" section's correction note.
+
+`authz.0007` repairs 2.5C's omission of `playout.queue_manage` from
+Station Administrator and grants that Role both new 2.5D capabilities,
+`monitoring.reset_listener_counters` and `aircheck.control`. Remote Host
+receives neither new administrative capability. The resulting Station
+Administrator seed contains the complete capability vocabulary.
 
 The seed migration only binds `GroupRole` rows for `Contributor` and
 `remote_dj` because those are the only groups with real, existing
@@ -703,3 +725,8 @@ redirects straight to that row's own change page.
 activation-safety validation (see "Safe activation" above) and a
 `save_model` audit hook that records an `authz` `SystemEvent` whenever
 the field actually changes value.
+
+**Roadmap 2.5D**: activation validation now requires at least one active
+assignment row for every affected active non-staff/non-superuser account;
+inactive-only rows block activation, while an active future specific-date
+or recurring assignment is sufficient.

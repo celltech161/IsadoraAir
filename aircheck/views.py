@@ -6,6 +6,8 @@ from django.http import JsonResponse
 from django.utils import timezone
 from django.views.decorators.http import require_http_methods
 
+from authz.evaluator import authorize, forbidden_response
+
 from .models import AircheckSession
 from .services import recorder
 from .services.recorder import classify_finalization, current_session, start_recording, stop_recording
@@ -153,6 +155,10 @@ def api_aircheck_status(request):
 
 @require_http_methods(["POST"])
 def api_aircheck_start(request):
+    result = authorize(request.user, "aircheck.control")
+    if not result:
+        return forbidden_response(result, user=request.user, capability_slug="aircheck.control")
+
     session, error = start_recording()
     if session is None:
         return JsonResponse({"error": error or "start failed"}, status=500)
@@ -164,6 +170,10 @@ def api_aircheck_start(request):
 
 @require_http_methods(["POST"])
 def api_aircheck_stop(request):
+    result = authorize(request.user, "aircheck.control")
+    if not result:
+        return forbidden_response(result, user=request.user, capability_slug="aircheck.control")
+
     session, error = stop_recording()
     if session is None:
         return JsonResponse({"error": error or "stop failed"}, status=409)

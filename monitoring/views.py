@@ -179,6 +179,14 @@ def api_listener_peak_reset(request):
     Shoutcast because we're already in the request/response path and
     an extra sync HTTP GET here would double our exposure to network
     hiccups. Stale state is fine -- it's at most 10 seconds old."""
+    result = authorize(request.user, "monitoring.reset_listener_counters")
+    if not result:
+        return forbidden_response(
+            result,
+            user=request.user,
+            capability_slug="monitoring.reset_listener_counters",
+        )
+
     current_total = 0
     if LISTENER_STATE_PATH.is_file():
         try:
@@ -211,6 +219,14 @@ def api_listener_tlh_reset(request):
     Unlike peak (reset to the current live total), TLH is a cumulative
     SUM with no "current value" to reset to -- resetting means starting
     the running total fresh at 0.0 hours from right now."""
+    result = authorize(request.user, "monitoring.reset_listener_counters")
+    if not result:
+        return forbidden_response(
+            result,
+            user=request.user,
+            capability_slug="monitoring.reset_listener_counters",
+        )
+
     tlh = ListenerPeak.load()
     tlh.tlh_hours = 0.0
     tlh.tlh_since_at = django_tz.now()
