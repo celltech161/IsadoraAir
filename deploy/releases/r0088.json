@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "release_id": "r0088",
+  "previous_release_id": "r0087",
+  "minimum_updater_protocol_version": 5,
+  "summary": "Finalize optional audio-artifact diagnostics: add bounded 200 Hz read-only procfs sampling around StereoTool, retain 20 Hz schema-4 correlation output, add Liquidsoap source-clock context, harden the master-switch OFF path and LKG identity, use transport-accurate conclusions, and add operator documentation. No migrations, requirements, packages, systemd units, static assets, ALSA changes, or protected-runtime changes.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-gunicorn",
+    "isadoraair-engine",
+    "isadoraair-encoders"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0081",
+  "protected_runtime": null
+}
