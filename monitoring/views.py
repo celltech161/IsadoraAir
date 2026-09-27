@@ -10,6 +10,8 @@ from django.views.decorators.http import require_http_methods
 
 from django.utils import timezone as django_tz
 
+from authz.evaluator import authorize, forbidden_response
+
 from .models import ListenerPeak, MonitorCheck, SystemEvent, emit_event
 from .services import self_health
 from .services.release_status import get_release_status
@@ -101,7 +103,19 @@ def api_restart_check(request, check_id):
     root-owned station allowlist. The broker admits at most one maintenance
     worker and acknowledges promptly, so Gunicorn never owns a potentially
     long systemd stop/start operation.
+
+    Roadmap 2.5A: this actually restarts a real systemd unit through the
+    root-owned protected broker -- it must never be reachable by anything
+    less than an explicitly capable account. Previously guarded only by
+    GroupAccess reachability (remote_dj's seeded /monitoring/ prefix,
+    granted purely for dashboard viewing, happened to also reach this
+    endpoint with zero other check). See PROJECT_NOTES.md's "Roadmap 2.5"
+    section.
     """
+    result = authorize(request.user, "monitoring.restart_service")
+    if not result:
+        return forbidden_response(result)
+
     check = get_object_or_404(MonitorCheck, pk=check_id, kind="systemd")
     if not check.systemd_unit:
         return JsonResponse({"error": "No systemd unit configured for this check"}, status=400)

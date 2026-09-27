@@ -20,6 +20,8 @@ from django.utils import timezone
 
 from django.shortcuts import get_object_or_404
 
+from authz.evaluator import authorize, forbidden_response
+
 from isadoraair.engine_commands import EngineCommandError, enqueue_engine_command
 
 from .models import Artist, Album, Category, CategoryKind, Genre, Holiday, LogItem, Playlist, PlaylistItem, PlaylistLog, Rotation, RotationSlot, ScheduleBlock, Track
@@ -209,6 +211,14 @@ def api_category_list(request):
         )
         return JsonResponse({"categories": [_category_to_dict(c) for c in categories]})
 
+    # Roadmap 2.5A: category CREATE requires library.manage_categories.
+    # Reads (the GET branch above) are deliberately left open -- the
+    # /library/import/ upload page's category dropdown depends on
+    # Contributor accounts being able to read this list.
+    result = authorize(request.user, "library.manage_categories")
+    if not result:
+        return forbidden_response(result)
+
     try:
         body = json.loads(request.body)
     except (json.JSONDecodeError, ValueError):
@@ -276,6 +286,15 @@ def api_category_detail(request, pk):
             for r in Rotation.objects.filter(slots__category=category).distinct()
         ]
         return JsonResponse(data)
+
+    # Roadmap 2.5A: category UPDATE/DELETE require library.manage_categories.
+    # Previously reachable by any Contributor account (their GroupAccess
+    # prefix /api/categories/ was granted only for the GET branch above,
+    # to populate the upload page's dropdown) with zero other check --
+    # see PROJECT_NOTES.md's "Roadmap 2.5" section.
+    result = authorize(request.user, "library.manage_categories")
+    if not result:
+        return forbidden_response(result)
 
     if request.method == "DELETE":
         try:
@@ -348,7 +367,16 @@ def api_track_repick_cue_points(request, pk):
     Returns 400 when the track's waveform JSON is missing or lacks
     envelope data (pre-envelope-persistence): the client-side handler
     surfaces the error message so the operator knows to use "Reanalyze
-    Track" (which does the full decode + envelope pass) instead."""
+    Track" (which does the full decode + envelope pass) instead.
+
+    Roadmap 2.5A: requires library.manage_tracks -- previously reachable
+    by any Contributor/remote_dj account via their /api/tracks/
+    GroupAccess prefix with zero other check. See PROJECT_NOTES.md's
+    "Roadmap 2.5" section."""
+    result = authorize(request.user, "library.manage_tracks")
+    if not result:
+        return forbidden_response(result)
+
     from library.management.commands.analyze_tracks import (
         apply_category_thresholds, repick_cue_points_from_json,
     )
@@ -407,7 +435,14 @@ def api_category_repick_cue_points(request, pk):
     (uploads, edits, previous slow-path repicks).
 
     Returns a per-path breakdown so the operator sees fast-path coverage
-    grow over time as the library backfills organically."""
+    grow over time as the library backfills organically.
+
+    Roadmap 2.5A: requires library.manage_categories -- same
+    reachability-only gap as api_category_detail (see its comment)."""
+    result = authorize(request.user, "library.manage_categories")
+    if not result:
+        return forbidden_response(result)
+
     from library.management.commands.analyze_tracks import (
         apply_category_thresholds, repick_cue_points_from_json,
     )
@@ -503,7 +538,14 @@ def api_category_reset_analysis(request, pk):
     Deliberately fires the work asynchronously (via the existing
     analyze timer) rather than blocking the HTTP request on a
     potentially-minutes-long re-analysis loop -- same pattern as
-    api_library_upload since 178dc70."""
+    api_library_upload since 178dc70.
+
+    Roadmap 2.5A: requires library.manage_categories -- same
+    reachability-only gap as api_category_detail (see its comment)."""
+    result = authorize(request.user, "library.manage_categories")
+    if not result:
+        return forbidden_response(result)
+
     category = get_object_or_404(Category, pk=pk)
     from library.models import Track
     count = Track.objects.filter(category=category).update(next_start_seconds=None)
@@ -993,6 +1035,14 @@ def api_track_list(request):
 
 @require_http_methods(["POST"])
 def api_track_bulk(request):
+    """Roadmap 2.5A: requires library.manage_tracks -- includes a bulk
+    "delete" action, previously reachable by any Contributor/remote_dj
+    account via their /api/tracks/ GroupAccess prefix with zero other
+    check. See PROJECT_NOTES.md's "Roadmap 2.5" section."""
+    result = authorize(request.user, "library.manage_tracks")
+    if not result:
+        return forbidden_response(result)
+
     try:
         body = json.loads(request.body)
     except (json.JSONDecodeError, ValueError):
@@ -1499,7 +1549,14 @@ def api_track_reanalyze(request, pk):
     ever touches next_start_seconds/cue_in_seconds/waveform_path/
     related_artists/duration_seconds -- the manually-set marks (intro,
     sweep, outro, hooks) are never written by analyze_one_track, so this
-    can't clobber a human's own cue-point edits."""
+    can't clobber a human's own cue-point edits.
+
+    Roadmap 2.5A: requires library.manage_tracks (see api_track_bulk's
+    comment for the reachability gap this closes)."""
+    result = authorize(request.user, "library.manage_tracks")
+    if not result:
+        return forbidden_response(result)
+
     from library.management.commands.analyze_tracks import (
         analyze_one_track, apply_category_thresholds, get_waveforms_dir,
     )
@@ -1614,7 +1671,14 @@ def api_track_write_metadata(request, pk):
     can't drift apart from each other the way a file-only or DB-only
     save would risk. record_label is always DB-only (see
     _METADATA_TAG_MAP) -- still saved to the Track row, just never
-    written into the file."""
+    written into the file.
+
+    Roadmap 2.5A: requires library.manage_tracks (see api_track_bulk's
+    comment for the reachability gap this closes)."""
+    result = authorize(request.user, "library.manage_tracks")
+    if not result:
+        return forbidden_response(result)
+
     track = get_object_or_404(Track.objects.select_related("artist", "album", "genre"), pk=pk)
     try:
         body = json.loads(request.body)
@@ -3187,6 +3251,14 @@ def api_track_download(request, pk):
 
 @require_http_methods(["POST"])
 def api_track_blocked_slot_toggle(request, pk):
+    """Roadmap 2.5A: requires library.manage_tracks -- previously
+    reachable (and, per the template, previously actually presented in
+    the UI) to any Contributor/remote_dj account with zero server-side
+    check. See PROJECT_NOTES.md's "Roadmap 2.5" section."""
+    result = authorize(request.user, "library.manage_tracks")
+    if not result:
+        return forbidden_response(result)
+
     track = get_object_or_404(Track, pk=pk)
     try:
         slot = int(json.loads(request.body)["slot"])
@@ -3214,7 +3286,14 @@ def api_track_blocked_slot_toggle_row(request, pk):
     is currently blocked, the click clears the whole row; if the row is
     fully open, the click blocks the whole row. A single read-modify-
     write, not 24 individual toggle calls, so the row updates atomically
-    in one request."""
+    in one request.
+
+    Roadmap 2.5A: requires library.manage_tracks (see
+    api_track_blocked_slot_toggle's comment)."""
+    result = authorize(request.user, "library.manage_tracks")
+    if not result:
+        return forbidden_response(result)
+
     track = get_object_or_404(Track, pk=pk)
     try:
         day_of_week = int(json.loads(request.body)["day_of_week"])
@@ -3240,7 +3319,14 @@ def api_track_blocked_slot_toggle_row(request, pk):
 def api_track_blocked_slot_toggle_column(request, pk):
     """Flips an entire hour-of-day column (all 7 days at that hour) as a
     unit -- same master-toggle convention as toggle_row above, just
-    sliced the other way across the grid."""
+    sliced the other way across the grid.
+
+    Roadmap 2.5A: requires library.manage_tracks (see
+    api_track_blocked_slot_toggle's comment)."""
+    result = authorize(request.user, "library.manage_tracks")
+    if not result:
+        return forbidden_response(result)
+
     track = get_object_or_404(Track, pk=pk)
     try:
         hour = int(json.loads(request.body)["hour"])

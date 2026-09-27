@@ -1230,8 +1230,15 @@ try:
     from django.contrib.auth.admin import GroupAdmin
     from django.contrib.auth.models import Group as AuthGroup
 
+    from authz.admin import GroupRoleInline
+
     class GroupAdminWithAccess(GroupAdmin):
-        inlines = [GroupAccessInline]
+        # GroupAccessInline (reachability) and GroupRoleInline
+        # (capability, roadmap 2.5) shown on the same Group change page
+        # -- deliberately two separate inlines/models, never merged,
+        # per the 2.5 design: a URL being reachable must never itself
+        # imply an operational capability.
+        inlines = [GroupAccessInline, GroupRoleInline]
 
     admin.site.unregister(AuthGroup)
     admin.site.register(AuthGroup, GroupAdminWithAccess)
