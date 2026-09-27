@@ -15,6 +15,7 @@ from django.urls import path, reverse
 from django.utils.html import escape, format_html
 from django.utils.safestring import mark_safe
 
+from authz.admin import TalentAssignmentInline
 from hardware.signals import _write_engine_command
 from isadoraair import env_admin, env_config
 from monitoring.services.config_audit import emit_config_change_event
@@ -1316,6 +1317,11 @@ class InviteCapableUserAdmin(admin.ModelAdmin):
     ordering = ["username"]
     filter_horizontal = ["groups", "user_permissions"]
     form = DjangoUserChangeForm  # the real one -- read-only hash display + "change password" link
+    # Roadmap 2.5B -- an operator looking at a talent account sees/edits
+    # that person's show windows directly. Does NOT imply this account's
+    # Role/capabilities -- those remain entirely on the Groups field
+    # above; a TalentAssignment is temporal scope, never a grant.
+    inlines = [TalentAssignmentInline]
     fieldsets = (
         (None, {"fields": ("username", "password")}),
         ("Personal info", {"fields": ("first_name", "last_name", "email", "invite_button")}),

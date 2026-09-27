@@ -110,15 +110,20 @@ class CapabilityCompositionTests(TestCase):
 
     def test_ordinary_talent_capability_does_not_grant_administrative_authority(self):
         """The one-way implication from PROJECT_NOTES.md's "Roadmap 2.5"
-        section: holding e.g. remote_dj.connect must never make
+        section: holding an ordinary talent capability must never make
         is_staff/is_superuser true, and must never satisfy
-        system.administer."""
-        role = make_role("Talent Only Role", ["remote_dj.connect", "playout.control"])
+        system.administer. Deliberately uses unscheduled capabilities
+        (library.view, voicetrack.record) so this test's composition-vs-
+        administrative-authority assertion stays independent of roadmap
+        2.5B's schedule-window mechanics -- see
+        authz.tests.test_scheduled_evaluator for the requires_schedule=True
+        capability behavior (remote_dj.connect, playout.control, etc.)."""
+        role = make_role("Talent Only Role", ["library.view", "voicetrack.record"])
         group = make_group_with_role("Talent Only Group", role)
         user = User.objects.create_user("talent1", "talent1@example.invalid", "pw")
         user.groups.add(group)
 
-        self.assertTrue(authorize(user, "remote_dj.connect").allowed)
+        self.assertTrue(authorize(user, "library.view").allowed)
         self.assertFalse(authorize(user, "system.administer").allowed)
         self.assertFalse(user.is_staff)
         self.assertFalse(user.is_superuser)
