@@ -143,7 +143,10 @@ class NoExecutionEndpointTests(TestCase):
     def test_only_narrow_phase_c_urls_are_registered(self):
         from updatecenter.urls import urlpatterns
         names = sorted(p.name for p in urlpatterns)
-        self.assertEqual(names, ["check-for-updates", "dashboard", "job-status", "start-update"])
+        self.assertEqual(names, [
+            "approve-migration-plan", "check-for-updates", "dashboard",
+            "job-status", "migration-plan-review", "start-update",
+        ])
 
 
 @override_settings(SECURE_SSL_REDIRECT=False)

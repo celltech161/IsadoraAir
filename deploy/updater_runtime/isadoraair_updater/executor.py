@@ -39,11 +39,16 @@ from protected_bootstrap.trust import TrustPolicyError, parse_trust_policy_dict
 
 
 class ExecutionError(RuntimeError):
-    def __init__(self, classification: str, detail: str, *, manual: bool = False):
+    def __init__(self, classification: str, detail: str, *, manual: bool = False, migration_plan_review: dict | None = None):
         super().__init__(detail)
         self.classification = classification
         self.detail = detail
         self.manual = manual
+        # Structured evidence for MIGRATION_OPERATION_MANUAL only -- see
+        # JobStore.fail()'s own matching parameter and docs/UPDATE_CENTER.md's
+        # "Reviewed migration approval" section. None for every other
+        # ExecutionError.
+        self.migration_plan_review = migration_plan_review
 
 
 _ENV_KEYS = frozenset({
@@ -103,6 +108,43 @@ def _decode(result: ProcessResult, settings: dict[str, str]) -> str:
     return _redact(combined, settings)
 
 
+_HEX64 = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _valid_manual_operations(value, *, plan_refs: set[str]) -> bool:
+    if not isinstance(value, list):
+        return False
+    refs = re.compile(r"^[a-z][a-z0-9_]*\.[0-9]{4}_[a-z0-9_]+$")
+    for entry in value:
+        if not isinstance(entry, dict) or set(entry) != {"ref", "operation_index", "operation", "classification", "detail"}:
+            return False
+        if not isinstance(entry["ref"], str) or not refs.fullmatch(entry["ref"]) or entry["ref"] not in plan_refs:
+            return False
+        if not isinstance(entry["operation_index"], int) or isinstance(entry["operation_index"], bool) or entry["operation_index"] < 0:
+            return False
+        if entry["classification"] != "manual":
+            return False
+        if not isinstance(entry["operation"], str) or not isinstance(entry["detail"], str):
+            return False
+    return True
+
+
+def _valid_approval(value) -> bool:
+    if value is None:
+        return True
+    if not isinstance(value, dict):
+        return False
+    if value.get("found") is False:
+        return set(value) == {"found"}
+    if value.get("found") is True:
+        return (
+            set(value) == {"found", "id", "approved_by", "approved_at"}
+            and isinstance(value["id"], str) and isinstance(value["approved_by"], str)
+            and isinstance(value["approved_at"], str)
+        )
+    return False
+
+
 def _strict_probe(raw: bytes) -> dict:
     if len(raw) > 1024 * 1024:
         raise ExecutionError("PROBE_INVALID", "migration probe output exceeds 1 MiB")
@@ -110,13 +152,23 @@ def _strict_probe(raw: bytes) -> dict:
         payload = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, ValueError) as exc:
         raise ExecutionError("PROBE_INVALID", "migration probe did not emit strict JSON") from exc
-    required = {"schema_version", "status", "plan", "nodes", "applied", "conflicts", "replacements"}
+    required = {
+        "schema_version", "status", "plan", "nodes", "applied", "conflicts", "replacements",
+        "release_id", "target_commit", "manifest_sha256", "migration_plan_digest",
+        "manual_operations", "approval",
+    }
     if not isinstance(payload, dict) or set(payload) != required or payload.get("schema_version") != 1 or payload.get("status") != "ok":
         raise ExecutionError("PROBE_INVALID", "migration probe schema/status mismatch")
     if not isinstance(payload["plan"], list) or not isinstance(payload["nodes"], dict) or not isinstance(payload["applied"], list):
         raise ExecutionError("PROBE_INVALID", "migration probe collection types are invalid")
     if not isinstance(payload["conflicts"], dict) or not isinstance(payload["replacements"], list):
         raise ExecutionError("PROBE_INVALID", "migration probe conflict/replacement types are invalid")
+    for key in ("release_id", "target_commit"):
+        if payload[key] is not None and not isinstance(payload[key], str):
+            raise ExecutionError("PROBE_INVALID", f"migration probe {key} has an invalid type")
+    for key in ("manifest_sha256", "migration_plan_digest"):
+        if payload[key] is not None and (not isinstance(payload[key], str) or not _HEX64.fullmatch(payload[key])):
+            raise ExecutionError("PROBE_INVALID", f"migration probe {key} is not a valid digest")
     refs = re.compile(r"^[a-z][a-z0-9_]*\.[0-9]{4}_[a-z0-9_]+$")
     for ref, dependencies in payload["nodes"].items():
         if not isinstance(ref, str) or not refs.fullmatch(ref) or not isinstance(dependencies, list) or any(not isinstance(dep, str) or not refs.fullmatch(dep) for dep in dependencies):
@@ -125,10 +177,12 @@ def _strict_probe(raw: bytes) -> dict:
         raise ExecutionError("PROBE_INVALID", "migration applied set contains an invalid reference")
     seen = set()
     for item in payload["plan"]:
-        if not isinstance(item, dict) or set(item) != {"ref", "dependencies", "operations"}:
+        if not isinstance(item, dict) or set(item) != {"ref", "dependencies", "operations", "migration_file_sha256"}:
             raise ExecutionError("PROBE_INVALID", "migration plan item shape is invalid")
         if item["ref"] in seen or item["ref"] not in payload["nodes"] or item["dependencies"] != payload["nodes"][item["ref"]]:
             raise ExecutionError("PROBE_INVALID", "migration plan identity/dependencies are inconsistent")
+        if not isinstance(item["migration_file_sha256"], str) or not _HEX64.fullmatch(item["migration_file_sha256"]):
+            raise ExecutionError("PROBE_INVALID", "migration plan item file digest is invalid")
         seen.add(item["ref"])
         if not isinstance(item["operations"], list):
             raise ExecutionError("PROBE_INVALID", "migration operations must be a list")
@@ -136,6 +190,14 @@ def _strict_probe(raw: bytes) -> dict:
             if (not isinstance(operation, dict) or set(operation) != {"operation", "classification", "detail"}
                     or operation["classification"] not in {"additive", "manual"}):
                 raise ExecutionError("PROBE_INVALID", "migration operation classification is invalid")
+    if not _valid_manual_operations(payload["manual_operations"], plan_refs=seen):
+        raise ExecutionError("PROBE_INVALID", "migration probe manual_operations shape is invalid")
+    if not _valid_approval(payload["approval"]):
+        raise ExecutionError("PROBE_INVALID", "migration probe approval shape is invalid")
+    if payload["manual_operations"] and payload["migration_plan_digest"] is None:
+        raise ExecutionError("PROBE_INVALID", "migration probe has manual operations but no digest")
+    if payload["approval"] is not None and not payload["manual_operations"]:
+        raise ExecutionError("PROBE_INVALID", "migration probe reported an approval with no manual operations")
     return payload
 
 
@@ -239,11 +301,17 @@ class Executor:
         )
         return result, settings
 
-    def _probe(self, source: Path) -> dict:
-        result, settings = self._run_app(source, ["updatecenter_probe", "--skip-checks"], timeout=120)
+    def _probe(self, source: Path, *, release_id: str | None = None, target_commit: str | None = None) -> dict:
+        arguments = ["updatecenter_probe", "--skip-checks"]
+        if release_id is not None or target_commit is not None:
+            arguments += ["--release-id", release_id, "--target-commit", target_commit]
+        result, settings = self._run_app(source, arguments, timeout=120)
         if not result.ok:
             raise ExecutionError("PROBE_FAILED", _decode(result, settings))
-        return _strict_probe(result.stdout.strip())
+        payload = _strict_probe(result.stdout.strip())
+        if payload["release_id"] != release_id or payload["target_commit"] != target_commit:
+            raise ExecutionError("PROBE_INVALID", "migration probe echoed a different release/target than requested")
+        return payload
 
     def _app_git(self, args: list[str], *, timeout: float = 60) -> ProcessResult:
         return self.runner.run_as_user(
@@ -292,7 +360,7 @@ class Executor:
             raise ExecutionError("CURRENT_SCHEMA_UNHEALTHY", f"current source has migration conflicts/replacements/pending work: {pending!r}")
         return payload
 
-    def _validate_target_schema(self, plan: TrustedPlan, payload: dict, current_payload: dict,
+    def _validate_target_schema(self, plan: TrustedPlan, payload: dict, current_payload: dict, job_id: str,
                                 *, migration_already_started: bool) -> tuple[str, ...]:
         if payload["conflicts"]:
             raise ExecutionError("TARGET_MIGRATION_CONFLICT", "target migration graph reports conflicts")
@@ -316,14 +384,42 @@ class Executor:
             )
         if actual and plan.migration_compatibility != "additive":
             raise ExecutionError("MIGRATION_NOT_AUTOMATABLE", "manifest does not classify target migration work as additive", manual=True)
-        for item in payload["plan"]:
-            for operation in item["operations"]:
-                if operation["classification"] != "additive":
-                    raise ExecutionError(
-                        "MIGRATION_OPERATION_MANUAL",
-                        f"{item['ref']} contains {operation['operation']}: {operation['detail']}",
-                        manual=True,
-                    )
+        # Reviewed migration approval: the mechanical classifier above
+        # (MIGRATION_NOT_AUTOMATABLE) and everything before it in this
+        # function are UNCHANGED and unconditional -- an approval can
+        # never apply to a manifest declaring destructive work, a
+        # conflicting/ambiguous/mismatched graph, or pre-applied
+        # migrations. Only the narrow "this operation is outside the
+        # mechanical automatic allowlist" gate below can be satisfied by
+        # a reviewed approval, and only for the EXACT plan payload
+        # (itself freshly, independently recomputed by updatecenter_probe
+        # against the staged target we just fetched -- never a digest
+        # supplied by Django/a browser) already reports a match for.
+        # See docs/UPDATE_CENTER.md's "Reviewed migration approval".
+        if payload["manual_operations"]:
+            approval = payload["approval"]
+            if approval is not None and approval.get("found"):
+                self.store.append_log(
+                    job_id,
+                    f"reviewed migration approval {approval['id']} (by {approval['approved_by']} at "
+                    f"{approval['approved_at']}) matched digest {payload['migration_plan_digest']} -- proceeding",
+                )
+            else:
+                raise ExecutionError(
+                    "MIGRATION_OPERATION_MANUAL",
+                    "; ".join(
+                        f"{entry['ref']} contains {entry['operation']}: {entry['detail']}"
+                        for entry in payload["manual_operations"]
+                    ),
+                    manual=True,
+                    migration_plan_review={
+                        "release_id": payload["release_id"],
+                        "target_commit": payload["target_commit"],
+                        "manifest_sha256": payload["manifest_sha256"],
+                        "migration_plan_digest": payload["migration_plan_digest"],
+                        "manual_operations": payload["manual_operations"],
+                    },
+                )
         return actual
 
     def _advance_source(self, plan: TrustedPlan):
@@ -760,9 +856,11 @@ class Executor:
                 cleanup(self.config.staging_root, job_id)
             staged = materialize(self.repository, plan.target_commit, self.config.staging_root, job_id)
             self.store.milestone(job_id, "target_staged")
-            target_payload = self._probe(staged.source_root)
+            target_payload = self._probe(
+                staged.source_root, release_id=plan.target_release_id, target_commit=plan.target_commit,
+            )
             actual_migrations = self._validate_target_schema(
-                plan, target_payload, current_payload,
+                plan, target_payload, current_payload, job_id,
                 migration_already_started="migration_started" in milestones,
             )
             self.store.milestone(job_id, "target_schema_validated")
@@ -850,7 +948,10 @@ class Executor:
             return self.store.succeed(job_id)
         except ExecutionError as exc:
             cleanup_staging()
-            return self.store.fail(job_id, exc.classification, exc.detail, manual=exc.manual)
+            return self.store.fail(
+                job_id, exc.classification, exc.detail, manual=exc.manual,
+                migration_plan_review=exc.migration_plan_review,
+            )
         except (ReleaseError, StagingError, CheckpointError, SystemdError, ProtectionError, JobError, OSError) as exc:
             cleanup_staging()
             current = self.store.load(job_id)

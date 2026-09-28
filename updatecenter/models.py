@@ -117,6 +117,21 @@ class UpdateJob(models.Model):
     failure_detail = models.TextField(blank=True, default="")
     requires_manual_intervention = models.BooleanField(default=False)
 
+    # Reviewed-migration-approval workflow: populated only when the
+    # protected executor's mechanical migration classifier finds one or
+    # more non-additive operations. Root independently computes this
+    # (see updatecenter_probe.build_probe_payload) and reports it inside
+    # the SAME GET_JOB_STATUS response failure_classification/detail
+    # already use -- this is one more optional key on an existing
+    # message, not a new protocol action. Django never writes this
+    # field; job_service._reconcile_response only ever copies what root
+    # reported. Structure: {"release_id", "target_commit",
+    # "manifest_sha256", "migration_plan_digest", "manual_operations":
+    # [{"ref", "operation_index", "operation", "classification",
+    # "detail"}, ...]}. See MigrationPlanApproval below and
+    # docs/UPDATE_CENTER.md's "Reviewed migration approval" section.
+    migration_plan_review = models.JSONField(null=True, blank=True, default=None)
+
     # Durable copy of the daemon's own log for this job, written once
     # at completion (success OR failure) -- the live, in-progress log
     # lives on tmpfs and does not survive a reboot; this field is what
@@ -158,3 +173,82 @@ class UpdateJob(models.Model):
 
     def __str__(self):
         return f"{self.id} ({self.installed_release_id} -> {self.target_release_id}, {self.state})"
+
+
+class MigrationPlanApproval(models.Model):
+    """A privileged operator's explicit, reviewed sign-off for a specific,
+    exact migration plan the protected mechanical classifier could not
+    prove automatic on its own.
+
+    This is NOT a bypass switch and NOT bound merely to a release id --
+    see docs/UPDATE_CENTER.md's "Reviewed migration approval" section for
+    the full trust-boundary reasoning. In short: this row only ever
+    RECORDS a decision. The protected executor never trusts anything
+    written here directly -- on every job it independently re-fetches the
+    trusted target, re-stages it, and re-runs the exact same mechanical
+    classifier (updatecenter_probe) that produced the digest in the first
+    place, computed fresh from what is actually staged. Only if that
+    FRESH computation's own digest happens to equal a stored row's digest
+    does the executor treat the plan as reviewed -- an approval can never
+    be supplied by a browser/request and substituted for that
+    recomputation, and any change anywhere in the plan (a different
+    migration file, a different operation, a different order, a
+    different target commit, a different manifest) changes the digest
+    and silently stops matching, requiring fresh review.
+
+    migration_plan_digest is intentionally NOT unique by itself --
+    target_release_id is part of the identity too, since two different
+    releases could theoretically compute the same content-derived digest
+    only in a cryptographic-collision scenario this system does not need
+    to additionally special-case; scoping by release_id costs nothing and
+    removes any ambiguity about which release an approval is for."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+
+    target_release_id = models.CharField(max_length=32)
+    target_commit = models.CharField(max_length=40)
+    migration_plan_digest = models.CharField(max_length=64)
+
+    # Human-readable copy of exactly what was reviewed, for the audit
+    # trail and for rendering the approval's own detail page -- never
+    # consulted by the executor for the actual go/no-go decision, only
+    # migration_plan_digest is. Same shape as UpdateJob.migration_plan_
+    # review's own "manual_operations" list.
+    manual_operations_snapshot = models.JSONField(default=list, blank=True)
+
+    # Provenance only (which stopped job this review was read from) --
+    # nullable/SET_NULL since a source job may later be pruned from the
+    # bounded root job-state retention window without invalidating the
+    # approval itself (the approval's own digest is self-contained).
+    source_job = models.ForeignKey(
+        UpdateJob, null=True, blank=True, on_delete=models.SET_NULL, related_name="+",
+    )
+
+    approved_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="+",
+    )
+    # Immutable snapshot, same convention as UpdateJob.initiated_by_username
+    # -- a deleted/renamed account must never erase who actually approved
+    # this from the audit trail.
+    approved_by_username = models.CharField(max_length=150, editable=False)
+    approved_at = models.DateTimeField(auto_now_add=True)
+
+    # The operator's own written justification -- required in practice by
+    # the review view (blank=True at the model layer only so a future
+    # data migration/fixture is not forced to invent one).
+    reason = models.TextField(blank=True, default="")
+
+    class Meta:
+        ordering = ["-approved_at"]
+        verbose_name = "Migration Plan Approval"
+        verbose_name_plural = "Migration Plan Approvals"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["target_release_id", "migration_plan_digest"],
+                name="updatecenter_one_approval_per_release_digest",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.target_release_id} @ {self.migration_plan_digest[:12]} (approved by {self.approved_by_username})"

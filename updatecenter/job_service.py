@@ -169,6 +169,8 @@ def _reconcile_response(job: UpdateJob, response: dict, *, backend: UpdaterClien
     job.progress_detail = f"Protected backend: {job.current_step}"[:500]
     job.failure_classification = str(root_job.get("failure_classification", ""))[:64]
     job.failure_detail = str(root_job.get("failure_detail", ""))[:10000]
+    review = root_job.get("migration_plan_review")
+    job.migration_plan_review = review if isinstance(review, dict) else None
     terminal = job.state in UpdateJobState.TERMINAL
     job.requires_manual_intervention = job.state == UpdateJobState.MANUAL_INTERVENTION_REQUIRED
     if terminal:

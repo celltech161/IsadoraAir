@@ -173,6 +173,14 @@
         <strong>{{ operator_service_restarts|join:", "|default:"None" }}</strong>
       </div>
     </div>
+    {% if plan.migrations and plan.migrations.compatibility != "destructive" %}
+    <p class="uc-note">
+      "Automatic" above reflects this release's own declared intent, not a per-operation
+      guarantee -- the protected updater independently re-classifies every individual migration
+      operation at install time and safely stops for reviewed approval if any operation is
+      outside its narrow mechanical allowlist, even for a release declared additive here.
+    </p>
+    {% endif %}
 
     {% if active_job %}
     <!-- An active job owning the lock is EXPECTED while an install is
@@ -289,6 +297,13 @@
     <div class="uc-row"><span class="k">Completed</span><span class="v">{{ shown_job.finished_at|default:shown_job.created_at|date:"Y-m-d H:i" }}</span></div>
     {% if shown_job.state != "succeeded" %}
     <p class="uc-alert">{{ shown_job.failure_detail|default:shown_job.progress_detail|default:"The update did not complete successfully. Review its details." }}</p>
+    {% endif %}
+    {% if shown_job.migration_plan_review %}
+    <p class="uc-note">
+      The protected updater's mechanical migration classifier could not prove every operation
+      in this plan automatic. <a class="uc-link" href="{% url 'updatecenter:migration-plan-review' shown_job.id %}">Review migration plan</a>
+      to see exactly what it found and, if appropriate, record a reviewed approval.
+    </p>
     {% endif %}
     <details class="uc-details">
       <summary>Last update details</summary>

@@ -1,0 +1,130 @@
+{% extends "base.html" %}
+
+{% block title %}Migration plan review — {{ review.release_id }} — IsadoraAir{% endblock %}
+
+{% block extra_css %}
+<style>
+  .uc-page { max-width: 1120px; margin: 0 auto; }
+  .uc-panel, .uc-hero {
+    background: var(--panel-bg); border: 1px solid var(--border-subtle);
+    border-radius: 10px; margin-bottom: 0.75rem; padding: 0.85rem 1rem;
+  }
+  .uc-panel h2 { margin: 0 0 0.45rem; font-size: 1rem; }
+  .uc-row { display: flex; justify-content: space-between; gap: 1rem; padding: 0.18rem 0; font-size: 0.88rem; }
+  .uc-row .k { color: var(--text-muted); }
+  .uc-row .v { color: var(--text-main); font-family: monospace; text-align: right; overflow-wrap: anywhere; }
+  .uc-note { color: var(--text-muted); font-size: 0.82rem; margin: 0.35rem 0 0; }
+  .uc-warning-box {
+    border-left: 3px solid var(--danger); padding: 0.5rem 0.8rem;
+    background: rgba(220, 90, 90, 0.06); border-radius: 6px; margin: 0.6rem 0;
+  }
+  table.uc-ops { width: 100%; border-collapse: collapse; font-size: 0.85rem; margin-top: 0.5rem; }
+  table.uc-ops th, table.uc-ops td {
+    text-align: left; padding: 0.4rem 0.5rem; border-bottom: 1px solid var(--border-subtle);
+  }
+  table.uc-ops th { color: var(--text-muted); font-weight: 600; font-size: 0.78rem; }
+  .uc-digest { font-family: monospace; font-size: 0.8rem; word-break: break-all; }
+  textarea.uc-reason { width: 100%; min-height: 4.5rem; font-family: inherit; font-size: 0.9rem; }
+  button.uc-btn {
+    background: var(--accent); color: #fff; border: none; border-radius: 6px;
+    padding: 0.5rem 1rem; font-size: 0.9rem; cursor: pointer;
+  }
+  button.uc-btn.uc-danger-btn { background: var(--danger); }
+  .uc-already-approved {
+    border-left: 3px solid #78c88c; padding: 0.5rem 0.8rem;
+    background: rgba(120, 200, 140, 0.08); border-radius: 6px; margin: 0.6rem 0;
+  }
+</style>
+{% endblock %}
+
+{% block content %}
+<div class="uc-page">
+  <h1>Migration plan review</h1>
+  <p class="uc-note">
+    <a class="uc-link" href="{% url 'updatecenter:dashboard' %}">&larr; Back to Update Center</a>
+  </p>
+
+  <section class="uc-panel">
+    <h2>What the protected updater found</h2>
+    <div class="uc-row"><span class="k">Job</span><span class="v">{{ job.id }}</span></div>
+    <div class="uc-row"><span class="k">Target release</span><span class="v">{{ review.release_id }}</span></div>
+    <div class="uc-row"><span class="k">Trusted target commit</span><span class="v">{{ review.target_commit }}</span></div>
+    <div class="uc-row"><span class="k">Migration plan digest</span><span class="v uc-digest">{{ review.migration_plan_digest }}</span></div>
+    <p class="uc-note">
+      This digest is a deterministic fingerprint of the exact release, target commit, release
+      manifest, and every migration operation in this plan (including each migration file's own
+      content). Any change to any of that -- a different commit, a different migration, an added,
+      removed, reordered, or reclassified operation -- produces a different digest. An approval
+      below only ever matches this EXACT plan; it can never be reused for a changed one.
+    </p>
+  </section>
+
+  <section class="uc-panel">
+    <h2>Operations outside the mechanical automatic allowlist</h2>
+    <p class="uc-note">
+      The protected updater's classifier automatically proves only a narrow set of operations
+      safe (new tables, and simple nullable/defaulted column additions). Everything below required
+      a privileged human to review it directly against the actual pre-release production schema
+      and data before it can be approved.
+    </p>
+    <table class="uc-ops">
+      <thead>
+        <tr><th>Migration</th><th>Operation #</th><th>Type</th><th>Classifier reason</th></tr>
+      </thead>
+      <tbody>
+        {% for op in review.manual_operations %}
+        <tr>
+          <td>{{ op.ref }}</td>
+          <td>{{ op.operation_index }}</td>
+          <td>{{ op.operation }}</td>
+          <td>{{ op.detail }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </section>
+
+  <div class="uc-warning-box">
+    <strong>There is no automatic rollback.</strong> Approving this plan does not itself run
+    anything -- it only lets a future update job's protected executor proceed past this specific
+    mechanical gate for this exact plan. Review each operation above against the station's actual
+    current production schema and data before approving. This approval applies only to the exact
+    plan digest shown above, for release {{ review.release_id }} only.
+  </div>
+
+  {% if existing_approval %}
+  <section class="uc-panel">
+    <div class="uc-already-approved">
+      Already approved by <strong>{{ existing_approval.approved_by_username }}</strong>
+      on {{ existing_approval.approved_at|date:"Y-m-d H:i" }} UTC.
+      {% if existing_approval.reason %}<br>Reason: {{ existing_approval.reason }}{% endif %}
+    </div>
+    <p class="uc-note">
+      Start a new update job from the Update Center dashboard to apply this exact plan -- this
+      stopped job remains a permanent, unmodified record and is never resumed automatically.
+    </p>
+  </section>
+  {% elif request.user.is_superuser %}
+  <section class="uc-panel">
+    <h2>Approve reviewed migration plan</h2>
+    <form method="post" action="{% url 'updatecenter:approve-migration-plan' job.id %}">
+      {% csrf_token %}
+      <input type="hidden" name="confirmed_migration_plan_digest" value="{{ review.migration_plan_digest }}">
+      <label for="uc-reason">Written justification (required)</label>
+      <textarea class="uc-reason" id="uc-reason" name="reason" required
+                placeholder="e.g. Reviewed authz.0001's Role.capabilities AddField: ManyToManyField with an explicit through= model created earlier in the same migration -- Django emits no schema SQL for this operation. The five RunPython operations only seed rows into tables this same plan just created; none touch pre-existing production data except library.0085, which appends one line to remote_dj's existing GroupAccess row."></textarea>
+      <p class="uc-note">
+        This records who approved this exact plan, when, and why -- it does not weaken the
+        mechanical classifier for any other release or any other plan.
+      </p>
+      <button class="uc-btn uc-danger-btn" type="submit"
+              onclick="return window.confirm('Approve this exact reviewed migration plan for {{ review.release_id|escapejs }}? A future update job will be allowed to proceed past the mechanical classifier for this plan only.');">
+        Approve reviewed migration plan
+      </button>
+    </form>
+  </section>
+  {% else %}
+  <p class="uc-note">Approving a reviewed migration plan requires a superuser account.</p>
+  {% endif %}
+</div>
+{% endblock %}

@@ -9,4 +9,12 @@ urlpatterns = [
     path("check-for-updates/", views.check_for_updates, name="check-for-updates"),
     path("start/", views.start_update, name="start-update"),
     path("jobs/<uuid:job_id>/status/", views.job_status, name="job-status"),
+    path(
+        "jobs/<uuid:job_id>/migration-review/",
+        views.migration_plan_review, name="migration-plan-review",
+    ),
+    path(
+        "jobs/<uuid:job_id>/migration-review/approve/",
+        views.approve_migration_plan, name="approve-migration-plan",
+    ),
 ]

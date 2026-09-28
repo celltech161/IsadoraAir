@@ -1377,3 +1377,201 @@ Keep execution disarmed until every check is healthy. Only then may root edit
 `update_execution_enabled` to `true`, restart only
 `isadoraair-updater.service`, repeat the bounded PING, and require `/updates/`
 to report READY / ARMED.
+
+## Reviewed migration approval
+
+Motivated by the real r0089 release (roadmap 2.5's `authz` app + `library.0085`):
+its migration set contains six operations (one `ManyToManyField`-through
+`AddField`, five `RunPython` data-seed operations) that are genuinely safe
+against the actual pre-release production schema but that the protected
+executor's deliberately narrow mechanical classifier cannot prove automatic on
+its own. Before this section, a job hitting `MIGRATION_OPERATION_MANUAL` had no
+path forward except `manual_intervention_required` forever, or manually running
+`manage.py migrate` outside the protected updater entirely -- exactly the
+shortcut this whole architecture exists to make unnecessary. This section
+closes that gap as a **general** capability, not an r0089-specific bypass nor
+any weakening of the classifier: it never becomes more permissive, and this
+mechanism works for any future release with genuinely reviewed non-additive
+operations.
+
+### Three-tier migration safety model
+
+```
+Tier 1: manifest author intent      migration_compatibility ("additive"/"destructive")
+Tier 2: mechanical classification   updatecenter_probe's per-operation classifier
+Tier 3: privileged human review     MigrationPlanApproval (this section)
+```
+
+Tier 1 is what a release author *declares*. It is trusted as authored, reviewed
+intent (see "Cross-checking: machine-verifiable facts vs. release-author intent"
+above) and gates the coarse `MIGRATION_NOT_AUTOMATABLE` check -- a release
+declaring `"destructive"` is blocked outright, before Tier 3 is ever consulted.
+Tier 2 is what the executor can *mechanically prove* about each individual
+operation without a human: only `CreateModel` and a narrow, specific shape of
+`AddField`/`AlterField` (see `updatecenter_probe.py`'s `_classify_add_field`/
+`_classify_alter_field`) are ever classified `"additive"`; everything else
+(every `RunPython`, every relational/unique/indexed/no-default `AddField`, every
+database-affecting `AlterField`) is `"manual"` -- deliberately, permanently, and
+this section does not loosen that rule. Tier 3 is a privileged human's explicit,
+recorded review of the SPECIFIC operations Tier 2 could not prove, for a SPECIFIC
+release and a SPECIFIC exact plan. Tier 3 can never substitute for Tier 1 or
+Tier 2 -- it only ever supplies the one missing fact Tier 2 cannot derive on its
+own ("a human looked at these exact operations against the actual production
+schema and confirms they're safe"), and it is consulted only after Tier 1 and
+Tier 2 both already say "otherwise fine."
+
+### Why a plain Django model, not a signed protected-runtime artifact
+
+Section 9's own question -- considered directly, not assumed. A `MigrationPlanApproval`
+row is the right trust-proportional choice here, not a shortcut:
+
+- **The web process writes it; the protected executor never trusts it directly.**
+  Every job that reaches the classifier gate independently re-fetches the
+  trusted target, re-stages it, and re-runs `updatecenter_probe` against what is
+  ACTUALLY staged -- exactly the same subprocess it already ran to classify the
+  plan in the first place. That fresh run recomputes `migration_plan_digest` from
+  the real, current, root-verified staged source and only THEN looks up whether
+  any stored approval's digest happens to equal it. A row's *content* is never
+  the authority; only an exact digest match against an independent, live
+  recomputation is. A forged, stale, or wrong-release row simply never matches
+  anything and is harmless by construction (see `test_migration_plan_probe_wire_
+  validation.py`, `test_r0089_migration_approval_acceptance.py`).
+- **The DB is already a trusted oracle for "what has actually happened."**
+  `_validate_current_schema`/`current_payload["applied"]` already trust
+  `django_migrations` (also a plain DB table) as ground truth for the current
+  schema. `MigrationPlanApproval` is architecturally the same kind of fact.
+- **A signed bundle would be the wrong tool.** Signed generations exist for
+  rarely-changing, offline-key-gated, immutable code/policy -- not for a
+  per-release operator action that should be as ordinary as any other
+  superuser-only Django Admin/view action. Routing approvals through the signed-
+  bundle mechanism would force a new protected-runtime generation for every
+  single approval, which is disproportionate and would slow down exactly the
+  case this section exists to unblock.
+- **No new protocol action was needed.** Approval CREATION is an ordinary
+  Django view (superuser-only, matching this app's existing convention).
+  Approval CONSUMPTION happens entirely inside the EXISTING `updatecenter_probe`
+  subprocess call the executor already makes for classification -- extended to
+  also look up a matching `MigrationPlanApproval` row (as ISA_USER, against the
+  real database, using the staged target's OWN copy of this exact file) and
+  report `{"found": true/false, ...}` in its existing JSON output. The daemon's
+  socket protocol (`PING`/`START_UPDATE`/`GET_JOB_STATUS`/`GET_JOB_LOG`/
+  `RESTART_OPERATOR_SERVICE`/`STORE_ALSA_STATE`/`GET_MAINTENANCE_STATUS`) is
+  completely unchanged.
+
+### Canonical migration plan digest
+
+`updatecenter_probe.compute_migration_plan_digest()` binds, as one canonical
+JSON object hashed with SHA-256:
+
+- the target `release_id` and trusted `target_commit`;
+- a SHA-256 of the release manifest's own bytes at that commit;
+- the COMPLETE ordered plan -- every migration (not just the manual subset),
+  each migration's own ref, a SHA-256 of that migration FILE's actual bytes (so
+  a same-named migration with different content never collides), and every
+  operation's type/classification/detail, in plan order.
+
+Any change anywhere in this -- a different target commit, a different manifest,
+a different migration's bytes, an added/removed/reordered/reclassified
+operation -- produces a different digest. There is no separate invalidation
+logic for "the plan changed": a stale approval simply stops matching a freshly
+computed digest. See `test_migration_plan_digest.py` for the exhaustive proof
+of each sensitivity the workorder required.
+
+### Approval scope and identity
+
+A `MigrationPlanApproval` row is identified by `(target_release_id,
+migration_plan_digest)` (a real unique constraint) -- release id is included
+even though the digest is already release-specific, purely so identity is
+never ambiguous even in a theoretical hash-collision scenario. It records
+`target_commit`, a human-readable `manual_operations_snapshot` (audit/display
+only, never consulted for the match decision), `approved_by`/
+`approved_by_username` (immutable snapshot, same convention as
+`UpdateJob.initiated_by_username`), `approved_at`, a required written `reason`,
+and `source_job` (provenance only, `SET_NULL` -- an approval survives its
+source job being pruned from root's bounded job-state retention window).
+
+There is no reusable wildcard approval. An approval only ever matches the EXACT
+plan it was created against; it says nothing about any other release, any other
+target commit, or the same release with even one migration operation changed.
+
+### Executor gate
+
+```
+target staged
+  -> migration plan mechanically classified (updatecenter_probe, extended)
+  -> all operations additive?
+       YES -> continue exactly as before (unchanged automatic path)
+       NO  -> probe already looked up a matching MigrationPlanApproval
+              (same DB, same digest it just computed)
+              found & matching -> log the approval, continue to checkpoint/migrate
+              not found        -> MIGRATION_OPERATION_MANUAL, manual_intervention_required,
+                                   with the full manual-operation list + digest
+                                   recorded into the job's own evidence
+```
+
+This is `executor.py`'s `_validate_target_schema` -- the approval check is the
+LAST thing in that function, after every existing check (conflicts,
+replacements, dependency closure, pre-applied-migration detection, the
+manifest-level `"destructive"` gate). None of those become weaker or
+conditional on an approval; an approval can only ever satisfy the one narrow
+"this operation is outside the mechanical automatic allowlist" gate, nothing
+else. A conflicting graph, a destructive manifest, a pre-applied migration, an
+unreachable protected runtime, or a failed signature check all still fail
+exactly as before regardless of any approval.
+
+### Terminal jobs and the new-job requirement
+
+`manual_intervention_required` remains a terminal `UpdateJob`/root job state --
+unchanged, and this section adds no resume/retry/override action to either.
+The historical job that first discovers a manual-operation set (e.g. r0089's
+real `0053ede7-ffca-46e8-b163-c3f8aa5226c4`) is never mutated, never resumed,
+and stays exactly as it was: a permanent record. Approving a plan creates a
+brand-new, independent `MigrationPlanApproval` row and nothing else -- the
+operator must start a genuinely new `UpdateJob` to actually apply it. That new
+job's executor performs its own complete, independent staging and
+classification from scratch; it happens to find a matching approval this time
+only because nothing about the plan has changed since review.
+
+### Operator workflow
+
+1. A job stops `manual_intervention_required` with `failure_classification ==
+   "MIGRATION_OPERATION_MANUAL"`. The Update Center dashboard shows a "Review
+   migration plan" link for it (`/updates/jobs/<job_id>/migration-review/`,
+   staff-or-superuser to view, matching this app's existing boundary).
+2. The review page shows the target release, trusted commit, plan digest, and
+   every manual-classified operation with its classifier reason -- sourced
+   entirely from that job's own root-reported evidence, never re-derived by
+   Django. It states plainly that there is no automatic rollback and that
+   approval applies only to the exact digest shown.
+3. A superuser (never staff alone -- matches `start_update`'s own existing
+   superuser-only gate for "especially sensitive" Update Center actions) writes
+   a required justification and clicks "Approve reviewed migration plan." This
+   creates the `MigrationPlanApproval` row. It does not start, resume, or touch
+   any job.
+4. The operator starts a NEW update job from the dashboard as usual. If nothing
+   about the plan has changed, the executor's fresh, independent recomputation
+   finds the matching approval and proceeds through the ordinary checkpoint/
+   migrate/advance/restart pipeline exactly as any fully-automatic release would.
+
+### Remaining limitations
+
+- The classifier itself is unchanged and deliberately conservative -- a
+  `ManyToManyField`-through `AddField` (like r0089's `authz.0001_initial`,
+  which Django's own schema editor never emits any SQL for at all) is still
+  classified `"manual"` and still requires review every time it recurs, unless
+  a future, SEPARATE, narrowly-scoped classifier improvement is made (the
+  original workorder explicitly left this optional and separate from this
+  section; not done here).
+- Review quality is only as good as the human doing it -- this section
+  supplies binding, audit, and a hard technical guarantee that an approval can
+  never apply to a changed plan, but it cannot verify that the written
+  `reason` is actually correct. That judgment remains the approving
+  superuser's own responsibility, same as every other privileged Update Center
+  action.
+- The review page's manual-operations list is sourced from whichever job most
+  recently recorded evidence for that release; if root's bounded job-state
+  retention window (`MAX_JOB_RECORDS`) has since pruned the discovering job
+  entirely, an operator would need a fresh job run to regenerate reviewable
+  evidence before a first-time approval could be created for that release (an
+  already-existing `MigrationPlanApproval` row is unaffected either way, since
+  it is a separate, durable Django-side table).

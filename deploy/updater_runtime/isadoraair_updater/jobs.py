@@ -179,6 +179,15 @@ class JobStore:
             # state, which remains the supervisor's own, not
             # duplicated here (D3-D's own explicit instruction).
             "protected_runtime_candidate": None,
+            # Reviewed migration approval: structured evidence set only by
+            # fail(..., migration_plan_review=...) when the mechanical
+            # classifier finds non-additive operations with no matching
+            # approval (see executor.py's _validate_target_schema). Absent
+            # on every job predating this field -- load()/GET_JOB_STATUS
+            # must use .get(), never bracket access, so historical job
+            # state files (immutable evidence, never rewritten) remain
+            # readable unchanged.
+            "migration_plan_review": None,
         }
         self._atomic_write(path, state)
         self.append_log(job_id, "job accepted")
@@ -189,6 +198,7 @@ class JobStore:
         allowed = {
             "state", "current_step", "failure_classification", "failure_detail",
             "trusted_plan", "checkpoint", "protected_runtime_candidate",
+            "migration_plan_review",
         }
         if set(changes) - allowed:
             raise JobError("attempt to write unknown job-state fields")
@@ -210,15 +220,24 @@ class JobStore:
         self.append_log(job_id, f"milestone: {name}")
         return state
 
-    def fail(self, job_id: str, classification: str, detail: str, *, manual: bool) -> dict:
+    def fail(self, job_id: str, classification: str, detail: str, *, manual: bool,
+             migration_plan_review: dict | None = None) -> dict:
         safe_detail = " ".join(str(detail).split())[:4000]
-        state = self.update(
-            job_id,
-            state="manual_intervention_required" if manual else "failed",
-            current_step="failed",
-            failure_classification=classification[:64],
-            failure_detail=safe_detail,
-        )
+        changes = {
+            "state": "manual_intervention_required" if manual else "failed",
+            "current_step": "failed",
+            "failure_classification": classification[:64],
+            "failure_detail": safe_detail,
+        }
+        if migration_plan_review is not None:
+            if not isinstance(migration_plan_review, dict):
+                raise JobError("migration_plan_review must be a dict")
+            try:
+                json.dumps(migration_plan_review)
+            except (TypeError, ValueError) as exc:
+                raise JobError("migration_plan_review is not JSON-serializable") from exc
+            changes["migration_plan_review"] = migration_plan_review
+        state = self.update(job_id, **changes)
         self.append_log(job_id, f"failure {classification}: {safe_detail}")
         return state
 

@@ -348,6 +348,11 @@ class UpdaterDaemon:
                     "failure_classification": state["failure_classification"],
                     "failure_detail": state["failure_detail"],
                     "trusted_plan": state["trusted_plan"],
+                    # .get(), not state[...]: absent on every job state
+                    # file written before this field existed (including
+                    # the immutable historical r0089 job) -- those must
+                    # keep working unchanged, never rewritten to backfill it.
+                    "migration_plan_review": state.get("migration_plan_review"),
                 },
             }
         if request.action == "GET_JOB_LOG":

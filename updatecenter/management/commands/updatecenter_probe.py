@@ -1,7 +1,24 @@
-"""Strict machine-readable schema probe executed as ISA_USER by Phase B."""
+"""Strict machine-readable schema probe executed as ISA_USER by Phase B.
+
+Roadmap: reviewed migration approval. When invoked with --release-id and
+--target-commit (only the protected executor's TARGET-schema probe call
+does this -- see executor.py's _validate_target_schema), this command
+also computes a canonical migration_plan_digest over the exact plan it
+just derived and independently looks up a matching
+updatecenter.models.MigrationPlanApproval row. This keeps the ENTIRE
+trust-sensitive recomputation inside this one process: it is always
+invoked by root, as ISA_USER, against a root-staged, provenance-verified
+target commit's OWN copy of this exact file -- never against the
+currently-running Gunicorn process's code, and never influenced by an
+ordinary Django request. See docs/UPDATE_CENTER.md's "Reviewed migration
+approval" section for the complete trust-boundary reasoning."""
 from __future__ import annotations
 
+import hashlib
+import importlib
 import json
+import sys
+from pathlib import Path
 
 from django.core.management.base import BaseCommand
 from django.db import connection
@@ -148,7 +165,88 @@ def _classify_operation(
     return {"operation": name, "classification": "manual", "detail": "operation is outside the Phase B v1 automatic allowlist"}
 
 
-def build_probe_payload():
+def _migration_file_sha256(migration) -> str:
+    module_name = type(migration).__module__
+    module = sys.modules.get(module_name) or importlib.import_module(module_name)
+    with open(module.__file__, "rb") as fh:
+        return hashlib.sha256(fh.read()).hexdigest()
+
+
+def extract_manual_operations(plan: list[dict]) -> list[dict]:
+    """Every non-additive operation across the whole plan, in plan order
+    -- not just the first one encountered (unlike the executor's actual
+    go/no-go loop, which the caller is responsible for). Used both to
+    populate UpdateJob.migration_plan_review for operator review and as
+    part of the canonical digest input below."""
+    manual = []
+    for item in plan:
+        for index, operation in enumerate(item["operations"]):
+            if operation["classification"] != "additive":
+                manual.append({
+                    "ref": item["ref"],
+                    "operation_index": index,
+                    "operation": operation["operation"],
+                    "classification": operation["classification"],
+                    "detail": operation["detail"],
+                })
+    return manual
+
+
+def compute_migration_plan_digest(*, release_id: str, target_commit: str, manifest_sha256: str, plan: list[dict]) -> str:
+    """Deterministic digest binding release_id, target_commit, the
+    manifest's own bytes, and the COMPLETE ordered plan (every migration,
+    every operation -- not just the manual subset) including each
+    migration FILE's own content hash. Any change anywhere in this --
+    a different target commit, a different manifest, a different
+    migration's bytes, an added/removed/reordered/reclassified operation
+    -- produces a different digest, so a stale approval simply stops
+    matching rather than needing bespoke invalidation logic. See
+    docs/UPDATE_CENTER.md's "Reviewed migration approval" section."""
+    canonical = {
+        "digest_schema_version": 1,
+        "release_id": release_id,
+        "target_commit": target_commit,
+        "manifest_sha256": manifest_sha256,
+        "plan": [
+            {
+                "ref": item["ref"],
+                "migration_file_sha256": item["migration_file_sha256"],
+                "operations": [
+                    {
+                        "operation": operation["operation"],
+                        "classification": operation["classification"],
+                        "detail": operation["detail"],
+                    }
+                    for operation in item["operations"]
+                ],
+            }
+            for item in plan
+        ],
+    }
+    raw = json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _lookup_approval(*, release_id: str, digest: str) -> dict:
+    from updatecenter.models import MigrationPlanApproval
+
+    row = (
+        MigrationPlanApproval.objects
+        .filter(target_release_id=release_id, migration_plan_digest=digest)
+        .order_by("-approved_at")
+        .first()
+    )
+    if row is None:
+        return {"found": False}
+    return {
+        "found": True,
+        "id": str(row.id),
+        "approved_by": row.approved_by_username,
+        "approved_at": row.approved_at.isoformat(),
+    }
+
+
+def build_probe_payload(*, release_id: str | None = None, target_commit: str | None = None):
     executor = MigrationExecutor(connection)
     loader = executor.loader
     conflicts = loader.detect_conflicts()
@@ -182,6 +280,7 @@ def build_probe_payload():
         plan.append({
             "ref": _ref((migration.app_label, migration.name)),
             "dependencies": sorted(_ref(parent.key) for parent in node.parents),
+            "migration_file_sha256": _migration_file_sha256(migration),
             "operations": operations,
         })
     nodes = {}
@@ -191,7 +290,7 @@ def build_probe_payload():
         _ref(key) for key, migration in loader.disk_migrations.items()
         if getattr(migration, "replaces", None)
     )
-    return {
+    payload = {
         "schema_version": 1,
         "status": "ok",
         "plan": plan,
@@ -199,14 +298,51 @@ def build_probe_payload():
         "applied": sorted(_ref(key) for key in loader.applied_migrations),
         "conflicts": {app: sorted(names) for app, names in sorted(conflicts.items())},
         "replacements": replacements,
+        "release_id": release_id,
+        "target_commit": target_commit,
+        "manifest_sha256": None,
+        "migration_plan_digest": None,
+        # Deliberately gated on full release context below, same as the
+        # digest -- "manual operations were found" is only meaningful
+        # alongside "for which release," and every real consumer
+        # (the executor's approval gate) only ever calls this WITH both.
+        "manual_operations": [],
+        "approval": None,
     }
+    if release_id is not None and target_commit is not None:
+        manifest_path = Path("deploy") / "releases" / f"{release_id}.json"
+        manifest_sha256 = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+        digest = compute_migration_plan_digest(
+            release_id=release_id, target_commit=target_commit,
+            manifest_sha256=manifest_sha256, plan=plan,
+        )
+        payload["manifest_sha256"] = manifest_sha256
+        payload["migration_plan_digest"] = digest
+        payload["manual_operations"] = extract_manual_operations(plan)
+        if payload["manual_operations"]:
+            payload["approval"] = _lookup_approval(release_id=release_id, digest=digest)
+    return payload
 
 
 class Command(BaseCommand):
     help = "Emit the read-only migration graph/plan contract used by the protected Phase B updater."
 
+    def add_arguments(self, parser):
+        parser.add_argument(
+            "--release-id", default=None,
+            help="Target release id (e.g. r0089). Only the protected executor's TARGET-schema "
+                 "probe call supplies this; enables migration_plan_digest/approval lookup.",
+        )
+        parser.add_argument(
+            "--target-commit", default=None,
+            help="Target release's trusted commit SHA, as already independently resolved by the "
+                 "caller. Embedded in the digest verbatim; this command does not itself verify it.",
+        )
+
     def handle(self, *args, **options):
-        payload = build_probe_payload()
+        payload = build_probe_payload(
+            release_id=options.get("release_id"), target_commit=options.get("target_commit"),
+        )
         raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
         if len(raw.encode("utf-8")) > 1024 * 1024:
             raise RuntimeError("migration probe output exceeds 1 MiB")

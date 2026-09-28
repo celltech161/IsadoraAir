@@ -2,6 +2,7 @@
 from pathlib import Path
 
 from django.contrib import messages
+from django.db import IntegrityError, transaction
 from django.http import HttpResponseForbidden, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.views.decorators.csrf import ensure_csrf_cookie
@@ -18,7 +19,7 @@ from isadoraair.maintenance_lock import (
 from . import manifest as manifest_mod, planner, release_chain
 from .backend_client import BackendError, PROTOCOL_VERSION, UpdaterClient
 from .job_service import JobSubmissionError, create_job, reconcile_job, submit_job
-from .models import UpdateJob, UpdateJobState
+from .models import MigrationPlanApproval, UpdateJob, UpdateJobState
 from .schema_health import SchemaHealthStatus
 
 
@@ -263,6 +264,7 @@ def job_status(request, job_id):
         "failure_classification": job.failure_classification,
         "failure_detail": job.failure_detail[:4000],
         "requires_manual_intervention": job.requires_manual_intervention,
+        "has_migration_plan_review": bool(job.migration_plan_review),
         "created_at": job.created_at.isoformat(),
         "started_at": job.started_at.isoformat() if job.started_at else None,
         "finished_at": job.finished_at.isoformat() if job.finished_at else None,
@@ -271,3 +273,79 @@ def job_status(request, job_id):
         "backend_detail": reconciliation_error or "",
         "log_tail": log_tail[-32768:],
     })
+
+
+@require_http_methods(["GET"])
+def migration_plan_review(request, job_id):
+    """Operator review surface for a job the mechanical migration
+    classifier stopped with MIGRATION_OPERATION_MANUAL. Staff may view
+    it (matches the rest of the Update Center); only a superuser sees
+    the approval form -- same boundary start_update already enforces,
+    per docs/UPDATE_CENTER.md's existing "superuser for especially
+    sensitive operations" convention."""
+    denied = _permission_check(request)
+    if denied:
+        return denied
+    job = get_object_or_404(UpdateJob, pk=job_id)
+    if job.state not in UpdateJobState.TERMINAL:
+        job, _reconciliation_error = _refresh_job(job)
+    review = job.migration_plan_review
+    if not review:
+        messages.info(request, "This job has no reviewed-migration-approval evidence to show.")
+        return redirect("updatecenter:dashboard")
+    existing_approval = MigrationPlanApproval.objects.filter(
+        target_release_id=review.get("release_id"),
+        migration_plan_digest=review.get("migration_plan_digest"),
+    ).first()
+    return render(request, "updatecenter/migration_plan_review.html", {
+        "job": job,
+        "review": review,
+        "existing_approval": existing_approval,
+    })
+
+
+@require_http_methods(["POST"])
+def approve_migration_plan(request, job_id):
+    denied = _permission_check(request)
+    if denied:
+        return denied
+    if not request.user.is_superuser:
+        return HttpResponseForbidden("Only a superuser may approve a reviewed migration plan.")
+    job = get_object_or_404(UpdateJob, pk=job_id)
+    review = job.migration_plan_review
+    if not review or not review.get("migration_plan_digest") or not review.get("release_id"):
+        messages.error(request, "This job has no reviewed-migration-approval evidence to approve.")
+        return redirect("updatecenter:dashboard")
+    posted_digest = request.POST.get("confirmed_migration_plan_digest", "")
+    if posted_digest != review["migration_plan_digest"]:
+        messages.error(
+            request,
+            "The migration plan under review changed since this page was loaded. "
+            "Reload the review page before approving.",
+        )
+        return redirect("updatecenter:migration-plan-review", job_id=job.id)
+    reason = request.POST.get("reason", "").strip()
+    if not reason:
+        messages.error(request, "A written reason is required to approve a reviewed migration plan.")
+        return redirect("updatecenter:migration-plan-review", job_id=job.id)
+    try:
+        with transaction.atomic():
+            MigrationPlanApproval.objects.create(
+                target_release_id=review["release_id"],
+                target_commit=review.get("target_commit", ""),
+                migration_plan_digest=review["migration_plan_digest"],
+                manual_operations_snapshot=review.get("manual_operations", []),
+                source_job=job,
+                approved_by=request.user,
+                approved_by_username=request.user.get_username(),
+                reason=reason,
+            )
+    except IntegrityError:
+        messages.info(request, "This exact migration plan was already approved.")
+        return redirect("updatecenter:migration-plan-review", job_id=job.id)
+    messages.success(
+        request,
+        "Reviewed migration plan approved. Start a new update job to apply it -- this does not "
+        "resume or modify the stopped job, which remains a permanent record.",
+    )
+    return redirect("updatecenter:migration-plan-review", job_id=job.id)

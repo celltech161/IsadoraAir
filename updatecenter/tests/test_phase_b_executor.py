@@ -32,15 +32,33 @@ def trusted_plan(**changes):
 
 
 def probe(plan=True, manual=False):
+    operation = {"operation": "RemoveField" if manual else "AddField", "classification": "manual" if manual else "additive", "detail": "test"}
     item = {
         "ref": "sample.0002_add", "dependencies": ["sample.0001_initial"],
-        "operations": [{"operation": "RemoveField" if manual else "AddField", "classification": "manual" if manual else "additive", "detail": "test"}],
+        "migration_file_sha256": "0" * 64,
+        "operations": [operation],
     }
+    manual_operations = (
+        [{"ref": "sample.0002_add", "operation_index": 0, "operation": operation["operation"],
+          "classification": "manual", "detail": "test"}]
+        if plan and manual else []
+    )
     return {
         "schema_version": 1, "status": "ok", "plan": [item] if plan else [],
         "nodes": {"sample.0001_initial": [], "sample.0002_add": ["sample.0001_initial"]},
         "applied": ["sample.0001_initial"] + ([] if plan else ["sample.0002_add"]),
         "conflicts": {}, "replacements": [],
+        # This module calls _validate_target_schema directly (bypassing
+        # _strict_probe entirely), so these six keys only need to be
+        # internally consistent with each other, not digest-verified --
+        # release/target/digest are None here on purpose: none of these
+        # tests exercise the reviewed-approval path (see
+        # test_migration_plan_executor_approval.py for that), only the
+        # existing "no approval possible -> still raise" default, which
+        # this reproduces exactly (manual_operations non-empty, approval
+        # None).
+        "release_id": None, "target_commit": None, "manifest_sha256": None,
+        "migration_plan_digest": None, "manual_operations": manual_operations, "approval": None,
     }
 
 
@@ -70,7 +88,7 @@ class ExecutorSchemaComparisonTests(SimpleTestCase):
         self.temp.cleanup()
 
     def test_dependency_closure_exact_match_allowed(self):
-        actual = self.executor._validate_target_schema(trusted_plan(), probe(), {"applied": ["sample.0001_initial"]}, migration_already_started=False)
+        actual = self.executor._validate_target_schema(trusted_plan(), probe(), {"applied": ["sample.0001_initial"]}, "test-job-id", migration_already_started=False)
         self.assertEqual(actual, ("sample.0002_add",))
 
     def test_unexpected_target_migration_rejected(self):
@@ -78,17 +96,17 @@ class ExecutorSchemaComparisonTests(SimpleTestCase):
         payload["nodes"]["other.0001_initial"] = []
         payload["plan"].append({"ref": "other.0001_initial", "dependencies": [], "operations": []})
         with self.assertRaisesRegex(ExecutionError, "differs"):
-            self.executor._validate_target_schema(trusted_plan(), payload, {"applied": ["sample.0001_initial"]}, migration_already_started=False)
+            self.executor._validate_target_schema(trusted_plan(), payload, {"applied": ["sample.0001_initial"]}, "test-job-id", migration_already_started=False)
 
     def test_missing_expected_migration_rejected(self):
         payload = probe()
         del payload["nodes"]["sample.0002_add"]
         with self.assertRaisesRegex(ExecutionError, "absent"):
-            self.executor._validate_target_schema(trusted_plan(), payload, {"applied": []}, migration_already_started=False)
+            self.executor._validate_target_schema(trusted_plan(), payload, {"applied": []}, "test-job-id", migration_already_started=False)
 
     def test_manifest_additive_cannot_override_destructive_operation(self):
         with self.assertRaises(ExecutionError) as caught:
-            self.executor._validate_target_schema(trusted_plan(), probe(manual=True), {"applied": ["sample.0001_initial"]}, migration_already_started=False)
+            self.executor._validate_target_schema(trusted_plan(), probe(manual=True), {"applied": ["sample.0001_initial"]}, "test-job-id", migration_already_started=False)
         self.assertTrue(caught.exception.manual)
 
     def test_conflict_and_replacement_fail_closed(self):
@@ -96,11 +114,11 @@ class ExecutorSchemaComparisonTests(SimpleTestCase):
             payload = probe()
             payload[key] = value
             with self.assertRaises(ExecutionError):
-                self.executor._validate_target_schema(trusted_plan(), payload, {"applied": []}, migration_already_started=False)
+                self.executor._validate_target_schema(trusted_plan(), payload, {"applied": []}, "test-job-id", migration_already_started=False)
 
     def test_preapplied_transition_without_job_milestone_is_manual(self):
         with self.assertRaises(ExecutionError) as caught:
-            self.executor._validate_target_schema(trusted_plan(), probe(plan=False), {"applied": ["sample.0001_initial", "sample.0002_add"]}, migration_already_started=False)
+            self.executor._validate_target_schema(trusted_plan(), probe(plan=False), {"applied": ["sample.0001_initial", "sample.0002_add"]}, "test-job-id", migration_already_started=False)
         self.assertTrue(caught.exception.manual)
 
     def test_application_database_identity_must_match_root_config(self):

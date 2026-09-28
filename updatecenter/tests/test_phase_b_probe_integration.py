@@ -170,6 +170,7 @@ class R0011ProspectiveR0012TargetSchemaTests(TransactionTestCase):
                         plan,
                         target_payload,
                         {"applied": target_payload["applied"]},
+                        "test-job-id",
                         migration_already_started=False,
                     )
                     self.assertEqual(actual, self.pending_migration_refs)
@@ -253,6 +254,7 @@ class R0075ProspectiveR0077TargetSchemaTests(TransactionTestCase):
                 plan,
                 target_payload,
                 {"applied": target_payload["applied"]},
+                "test-job-id",
                 migration_already_started=False,
             )
             self.assertEqual(actual, self.pending_migration_refs)
