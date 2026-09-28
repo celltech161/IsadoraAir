@@ -40,7 +40,21 @@ PROTOCOL_VERSION = 3
 # the newest protected-runtime transition crossed by an aggregated plan,
 # including its introducing release/predecessor/commit provenance. Direct
 # protected targets retain their legacy v3 authorization fingerprint.
-RUNTIME_VERSION = 6
+#
+# 6 -> 7 (reviewed migration approval): executor.py's _validate_target_
+# schema now checks a matching updatecenter.models.MigrationPlanApproval
+# (looked up by the existing updatecenter_probe subprocess call, which now
+# also accepts --release-id/--target-commit) before raising
+# MIGRATION_OPERATION_MANUAL, and threads a job_id through so it can log
+# which approval was used. jobs.py/daemon.py gained one new optional key
+# (migration_plan_review) on the EXISTING GET_JOB_STATUS response and job-
+# state schema -- no wire PROTOCOL_VERSION bump (no request/response field
+# changed shape, only a new optional field was added) and no
+# MANIFEST_PROTOCOL_VERSION bump (no release-manifest field's execution
+# meaning changed). A real code change to this package regardless, per
+# this constant's own rule -- see docs/UPDATE_CENTER.md's "Reviewed
+# migration approval" section.
+RUNTIME_VERSION = 7
 
 # The release-MANIFEST execution-semantics protocol (see release.py's
 # manual_blockers(), compared against each release's declared
