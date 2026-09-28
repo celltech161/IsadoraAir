@@ -1,5 +1,5 @@
 {
-  "bundle_sha256": "6c31a3a84a72d9a967860fd35a90d80f8d953d621d2db702cbbef3a1c8e73ffe",
+  "bundle_sha256": "83eb6dda4652df1a5c1c76f84a2556ee0931edb20287fd8266289672da13d15a",
   "entrypoint": "updaterd.py",
   "files": [
     {
@@ -11,8 +11,8 @@
     {
       "mode": "0644",
       "path": "isadoraair_updater/__init__.py",
-      "sha256": "1dd3ae8809f0a28b2db5cbd9951866e2ca8277d001c39e4b51cfe7b42040a1d5",
-      "size_bytes": 6591
+      "sha256": "2166a4adb6fdbd6d3d03830308b5f74c57c00522018851a2bff3abbc33a1dd90",
+      "size_bytes": 7472
     },
     {
       "mode": "0644",
@@ -29,20 +29,20 @@
     {
       "mode": "0644",
       "path": "isadoraair_updater/daemon.py",
-      "sha256": "a5aa341905ca53469ab342c48714e71556a0b0bc9c69e04237bd19a0f51d3b39",
-      "size_bytes": 23191
+      "sha256": "a58e436e57000bdfd2e02f897cd9486e75fd9420b6649980301dc12315bf716a",
+      "size_bytes": 23566
     },
     {
       "mode": "0644",
       "path": "isadoraair_updater/executor.py",
-      "sha256": "4162d182c2a3e5d1b28bf3ebb122d8d206de07f313b3a1b5dad7222f1bac7bb2",
-      "size_bytes": 50694
+      "sha256": "048edd079480200db4a7ecd9804e4729d6f446d612f5fda2c85b8337f31c6410",
+      "size_bytes": 56406
     },
     {
       "mode": "0644",
       "path": "isadoraair_updater/jobs.py",
-      "sha256": "3ba4d9df5d7a825e056fc8ec1e670cf7f86eeeea1d64a31419cc34ec0fb60da2",
-      "size_bytes": 15416
+      "sha256": "b208a5e746a5ed2d2bd5b6f7cf5dd0055bcfffd198c30c9fdd870749359bac6c",
+      "size_bytes": 16578
     },
     {
       "mode": "0644",
@@ -159,9 +159,9 @@
       "size_bytes": 9975
     }
   ],
-  "generation": 5,
+  "generation": 6,
   "manifest_protocol_version": 5,
-  "runtime_version": 6,
+  "runtime_version": 7,
   "schema_version": 1,
   "supported_wire_protocols": [
     3
