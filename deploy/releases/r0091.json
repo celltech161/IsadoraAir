@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "release_id": "r0091",
+  "previous_release_id": "r0090",
+  "minimum_updater_protocol_version": 5,
+  "summary": "Protected-runtime-only release. Ships generation 7 (runtime_version 8): fixes the r0090 production PROBE_INVALID defect -- executor.py's probe-schema check now selects the legacy or reviewed-plan shape based on the caller's own review context instead of requiring the reviewed shape unconditionally. No application migrations; no managed-unit policy change.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0081",
+  "protected_runtime": {
+    "generation": 7,
+    "descriptor_path": "deploy/updater_runtime/protected-runtime-descriptor.json",
+    "descriptor_sha256": "63b51ad4f7404c8bdd34004235c17e332d9a78afa89a87943541ce773c6cdf32",
+    "minimum_bootstrap_protocol_version": 1,
+    "runtime_version": 8,
+    "manifest_protocol_version": 5,
+    "supported_wire_protocols": [
+      3
+    ],
+    "attestations": [
+      "deploy/updater_attestations/r0091-primary.json"
+    ]
+  }
+}
