@@ -54,7 +54,27 @@ PROTOCOL_VERSION = 3
 # meaning changed). A real code change to this package regardless, per
 # this constant's own rule -- see docs/UPDATE_CENTER.md's "Reviewed
 # migration approval" section.
-RUNTIME_VERSION = 7
+#
+# 7 -> 8 (generation-6 probe-compatibility repair -- r0090 production
+# incident): executor.py's _strict_probe() required the full 13-key
+# reviewed-plan payload shape UNCONDITIONALLY, including for the
+# current-schema probe, which always runs against whatever application
+# source is CURRENTLY installed -- before any source advancement in the
+# same job. Protected-runtime generation and ordinary application-source
+# deployment are on independent cadences, so a currently-installed
+# source may correctly predate this feature and emit only the legacy
+# 7-key shape (see docs/UPDATE_CENTER.md's "Reviewed migration approval"
+# section). _strict_probe now selects its required schema from the
+# CALLER's own review-context flag (whether release_id/target_commit was
+# actually requested), never from the payload's own claimed shape: the
+# current-schema probe accepts either the exact legacy 7-key shape or
+# the full 13-key shape held at its documented null defaults, while the
+# target-schema probe is completely unchanged -- still exactly the full
+# 13-key shape, strictly validated. No wire PROTOCOL_VERSION bump, no
+# MANIFEST_PROTOCOL_VERSION bump, no BOOTSTRAP_PROTOCOL_VERSION bump --
+# this is a correctness fix to this package's own probe-parsing code,
+# not a change to any cross-process compatibility contract.
+RUNTIME_VERSION = 8
 
 # The release-MANIFEST execution-semantics protocol (see release.py's
 # manual_blockers(), compared against each release's declared
