@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "release_id": "r0089",
+  "previous_release_id": "r0088",
+  "minimum_updater_protocol_version": 5,
+  "summary": "Roadmap 2.5 -- talent roles/capabilities/scheduled access. Adds authz app (Role/Capability/authorize()/TalentAssignment); migrates library/monitoring/aircheck/playout mutations off GroupAccess-only reachability; adds Remote DJ re-authorization + audit trail; adds scheduled_enforcement_enabled switch, OFF by default, NOT enabled here. Fixes a pre-existing Remote DJ set-next gap (library.0085). Preserves Contributor/staff/superuser behavior. 8 additive migrations; no requirements/systemd changes.",
+  "migrations_required": [
+    "authz.0001_initial",
+    "authz.0002_seed_capabilities_and_roles",
+    "authz.0003_scheduleaccessconfig_talentassignment",
+    "authz.0004_seed_schedule_access_config",
+    "authz.0005_scheduleaccessconfig_scheduled_enforcement_enabled",
+    "authz.0006_correct_remote_host_playout_capability",
+    "authz.0007_authorization_closeout_capabilities",
+    "library.0085_remote_dj_queue_set_next_access"
+  ],
+  "migration_compatibility": "additive",
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-gunicorn",
+    "isadoraair-engine"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0081",
+  "protected_runtime": null
+}
