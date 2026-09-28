@@ -145,30 +145,85 @@ def _valid_approval(value) -> bool:
     return False
 
 
-def _strict_probe(raw: bytes) -> dict:
+_LEGACY_PROBE_KEYS = frozenset({
+    "schema_version", "status", "plan", "nodes", "applied", "conflicts", "replacements",
+})
+_REVIEW_PROBE_KEYS = _LEGACY_PROBE_KEYS | frozenset({
+    "release_id", "target_commit", "manifest_sha256", "migration_plan_digest",
+    "manual_operations", "approval",
+})
+
+
+def _strict_probe(raw: bytes, *, review_context: bool) -> dict:
+    """Parse and strictly validate one migration-probe response.
+
+    `review_context` is set by the CALLER (never inferred from the
+    payload itself) based on whether THIS probe invocation supplied
+    --release-id/--target-commit:
+
+    * review_context=True (the target-schema probe, which always
+      supplies release_id/target_commit and runs against the staged
+      candidate source): the payload MUST be exactly the full 13-key
+      reviewed-plan shape -- unchanged from before, no relaxation.
+    * review_context=False (the current-schema probe, which always
+      runs against self.config.application_root -- the live,
+      not-yet-advanced application checkout -- BEFORE any source
+      advancement in this same job): the payload must be EITHER the
+      exact legacy 7-key shape (an application source that predates
+      the reviewed-migration-approval probe schema -- protected-
+      runtime generation and ordinary application-source deployment
+      are on independent cadences, so a currently-installed source
+      may legitimately not know these fields exist) OR the full
+      13-key shape with the six review-only fields held at their
+      fixed, documented "no context requested" defaults (release_id/
+      target_commit/manifest_sha256/migration_plan_digest=None,
+      manual_operations=[], approval=None) -- the honest output of an
+      already-upgraded script that was simply never asked for review
+      context. A context-less call reporting anything else in those
+      six fields is fabricating review evidence nobody asked for and
+      is rejected exactly like any other schema violation.
+
+    In every case the accepted key set is one of two fixed, closed
+    shapes -- never a partial/arbitrary mix -- so a target probe that
+    only emits the legacy shape is rejected, and a current probe
+    polluted with real (non-default) review data is equally rejected.
+    """
     if len(raw) > 1024 * 1024:
         raise ExecutionError("PROBE_INVALID", "migration probe output exceeds 1 MiB")
     try:
         payload = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, ValueError) as exc:
         raise ExecutionError("PROBE_INVALID", "migration probe did not emit strict JSON") from exc
-    required = {
-        "schema_version", "status", "plan", "nodes", "applied", "conflicts", "replacements",
-        "release_id", "target_commit", "manifest_sha256", "migration_plan_digest",
-        "manual_operations", "approval",
-    }
-    if not isinstance(payload, dict) or set(payload) != required or payload.get("schema_version") != 1 or payload.get("status") != "ok":
+    keys = set(payload) if isinstance(payload, dict) else set()
+    if review_context:
+        shape_ok = keys == _REVIEW_PROBE_KEYS
+        has_review_fields = True
+    else:
+        shape_ok = keys in (_LEGACY_PROBE_KEYS, _REVIEW_PROBE_KEYS)
+        has_review_fields = keys == _REVIEW_PROBE_KEYS
+    if not isinstance(payload, dict) or not shape_ok or payload.get("schema_version") != 1 or payload.get("status") != "ok":
         raise ExecutionError("PROBE_INVALID", "migration probe schema/status mismatch")
     if not isinstance(payload["plan"], list) or not isinstance(payload["nodes"], dict) or not isinstance(payload["applied"], list):
         raise ExecutionError("PROBE_INVALID", "migration probe collection types are invalid")
     if not isinstance(payload["conflicts"], dict) or not isinstance(payload["replacements"], list):
         raise ExecutionError("PROBE_INVALID", "migration probe conflict/replacement types are invalid")
-    for key in ("release_id", "target_commit"):
-        if payload[key] is not None and not isinstance(payload[key], str):
-            raise ExecutionError("PROBE_INVALID", f"migration probe {key} has an invalid type")
-    for key in ("manifest_sha256", "migration_plan_digest"):
-        if payload[key] is not None and (not isinstance(payload[key], str) or not _HEX64.fullmatch(payload[key])):
-            raise ExecutionError("PROBE_INVALID", f"migration probe {key} is not a valid digest")
+    if has_review_fields:
+        for key in ("release_id", "target_commit"):
+            if payload[key] is not None and not isinstance(payload[key], str):
+                raise ExecutionError("PROBE_INVALID", f"migration probe {key} has an invalid type")
+        for key in ("manifest_sha256", "migration_plan_digest"):
+            if payload[key] is not None and (not isinstance(payload[key], str) or not _HEX64.fullmatch(payload[key])):
+                raise ExecutionError("PROBE_INVALID", f"migration probe {key} is not a valid digest")
+        if not isinstance(payload["manual_operations"], list):
+            raise ExecutionError("PROBE_INVALID", "migration probe manual_operations has an invalid type")
+        if not _valid_approval(payload["approval"]):
+            raise ExecutionError("PROBE_INVALID", "migration probe approval shape is invalid")
+        if not review_context and (
+            payload["release_id"] is not None or payload["target_commit"] is not None
+            or payload["manifest_sha256"] is not None or payload["migration_plan_digest"] is not None
+            or payload["manual_operations"] or payload["approval"] is not None
+        ):
+            raise ExecutionError("PROBE_INVALID", "migration probe reported review evidence without review context")
     refs = re.compile(r"^[a-z][a-z0-9_]*\.[0-9]{4}_[a-z0-9_]+$")
     for ref, dependencies in payload["nodes"].items():
         if not isinstance(ref, str) or not refs.fullmatch(ref) or not isinstance(dependencies, list) or any(not isinstance(dep, str) or not refs.fullmatch(dep) for dep in dependencies):
@@ -190,14 +245,15 @@ def _strict_probe(raw: bytes) -> dict:
             if (not isinstance(operation, dict) or set(operation) != {"operation", "classification", "detail"}
                     or operation["classification"] not in {"additive", "manual"}):
                 raise ExecutionError("PROBE_INVALID", "migration operation classification is invalid")
-    if not _valid_manual_operations(payload["manual_operations"], plan_refs=seen):
-        raise ExecutionError("PROBE_INVALID", "migration probe manual_operations shape is invalid")
-    if not _valid_approval(payload["approval"]):
-        raise ExecutionError("PROBE_INVALID", "migration probe approval shape is invalid")
-    if payload["manual_operations"] and payload["migration_plan_digest"] is None:
-        raise ExecutionError("PROBE_INVALID", "migration probe has manual operations but no digest")
-    if payload["approval"] is not None and not payload["manual_operations"]:
-        raise ExecutionError("PROBE_INVALID", "migration probe reported an approval with no manual operations")
+    if review_context:
+        if not _valid_manual_operations(payload["manual_operations"], plan_refs=seen):
+            raise ExecutionError("PROBE_INVALID", "migration probe manual_operations shape is invalid")
+        if not _valid_approval(payload["approval"]):
+            raise ExecutionError("PROBE_INVALID", "migration probe approval shape is invalid")
+        if payload["manual_operations"] and payload["migration_plan_digest"] is None:
+            raise ExecutionError("PROBE_INVALID", "migration probe has manual operations but no digest")
+        if payload["approval"] is not None and not payload["manual_operations"]:
+            raise ExecutionError("PROBE_INVALID", "migration probe reported an approval with no manual operations")
     return payload
 
 
@@ -302,14 +358,15 @@ class Executor:
         return result, settings
 
     def _probe(self, source: Path, *, release_id: str | None = None, target_commit: str | None = None) -> dict:
+        review_context = release_id is not None or target_commit is not None
         arguments = ["updatecenter_probe", "--skip-checks"]
-        if release_id is not None or target_commit is not None:
+        if review_context:
             arguments += ["--release-id", release_id, "--target-commit", target_commit]
         result, settings = self._run_app(source, arguments, timeout=120)
         if not result.ok:
             raise ExecutionError("PROBE_FAILED", _decode(result, settings))
-        payload = _strict_probe(result.stdout.strip())
-        if payload["release_id"] != release_id or payload["target_commit"] != target_commit:
+        payload = _strict_probe(result.stdout.strip(), review_context=review_context)
+        if review_context and (payload["release_id"] != release_id or payload["target_commit"] != target_commit):
             raise ExecutionError("PROBE_INVALID", "migration probe echoed a different release/target than requested")
         return payload
 
