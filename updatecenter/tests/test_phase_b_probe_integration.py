@@ -123,7 +123,7 @@ class R0011ProspectiveR0012TargetSchemaTests(TransactionTestCase):
             # probe is imported from this staged post-r0011/r0012 source.
             executor.migrate(r0010_targets)
             target_payload = _strict_probe(
-                json.dumps(build_probe_payload()).encode("utf-8")
+                json.dumps(build_probe_payload()).encode("utf-8"), review_context=False,
             )
             migration = next(
                 item
@@ -218,7 +218,7 @@ class R0075ProspectiveR0077TargetSchemaTests(TransactionTestCase):
             historical = HistoricalPlayEvent.objects.create(started_at=timezone.now())
 
             target_payload = _strict_probe(
-                json.dumps(build_probe_payload()).encode("utf-8")
+                json.dumps(build_probe_payload()).encode("utf-8"), review_context=False,
             )
             self.assertEqual(
                 tuple(item["ref"] for item in target_payload["plan"]),
