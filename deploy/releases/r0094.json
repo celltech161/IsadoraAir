@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "release_id": "r0094",
+  "previous_release_id": "r0093",
+  "minimum_updater_protocol_version": 5,
+  "summary": "Atomic-packaging recovery for r0093, whose attestation was committed after its release-introducing commit and so was unreadable to the updater. Ships the byte-identical generation-9 runtime code as generation 10 (runtime version 10 unchanged) with manifest, descriptor and attestation introduced in one commit. No application migrations or managed-unit policy changes.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0081",
+  "protected_runtime": {
+    "generation": 10,
+    "descriptor_path": "deploy/updater_runtime/protected-runtime-descriptor.json",
+    "descriptor_sha256": "9117bb24052cfe6639fcf489024206065ce634fe53f2d0437707e6fdbf822f8f",
+    "minimum_bootstrap_protocol_version": 1,
+    "runtime_version": 10,
+    "manifest_protocol_version": 5,
+    "supported_wire_protocols": [
+      3,
+      4
+    ],
+    "attestations": [
+      "deploy/updater_attestations/r0094-primary.json"
+    ]
+  }
+}
