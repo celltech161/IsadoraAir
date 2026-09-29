@@ -6,6 +6,7 @@ import http.client
 import os
 from pathlib import Path
 import re
+import shutil
 import stat
 from urllib.parse import urlsplit
 
@@ -22,10 +23,11 @@ from .release import (
 from .runtime_handoff import (
     MILESTONE_RUNTIME_ACTIVATION_REQUESTED, MILESTONE_RUNTIME_CANDIDATE_STAGED,
     MILESTONE_RUNTIME_CANDIDATE_VERIFIED, MILESTONE_RUNTIME_DESCRIPTOR_VALIDATED,
-    MILESTONE_RUNTIME_GENERATION_COMMITTED,
+    MILESTONE_RUNTIME_GENERATION_COMMITTED, MILESTONE_RUNTIME_ALREADY_AUTHORITATIVE,
     MUTATION_GATE_MILESTONE, SAFE_YIELD_MILESTONE, HandoffError, MutationGateError,
     attestations_staging_directory, descriptor_staging_path, handoff_required, materialize_candidate,
-    new_supervisor_staging_directory, publish_to_candidate_slot, require_mutation_allowed,
+    mutation_gate_satisfied, new_supervisor_staging_directory, publish_to_candidate_slot,
+    require_mutation_allowed,
     stage_attestations, stage_descriptor, verify_candidate_independently,
     verify_new_units_authorized_by_candidate_policy,
 )
@@ -554,12 +556,73 @@ class Executor:
         except (OSError, ValueError, TrustPolicyError):
             return None
 
-    def _resolve_candidate_slot(self, activation_socket: Path) -> tuple[str, str, SupervisorClient]:
+    def _authoritative_runtime_state(self, client: SupervisorClient) -> dict:
+        state = client.get_runtime_state()
+        active_slot = state.get("active_slot")
+        active_generation = state.get("active_generation")
+        active_descriptor = state.get("active_descriptor_sha256")
+        activation_in_flight = state.get("activation_in_flight")
+        if (active_slot not in {"A", "B"}
+                or isinstance(active_generation, bool)
+                or not isinstance(active_generation, int)
+                or active_generation < 1
+                or not isinstance(active_descriptor, str)
+                or not re.fullmatch(r"[0-9a-f]{64}", active_descriptor)
+                or not isinstance(activation_in_flight, bool)):
+            raise ExecutionError(
+                "RUNTIME_STATE_INVALID",
+                "supervisor returned an invalid authoritative runtime identity",
+                manual=True,
+            )
+        return state
+
+    def _resolve_candidate_slot(self, activation_socket: Path) -> tuple[str, str, SupervisorClient, dict]:
         client = SupervisorClient(activation_socket)
-        runtime_state = client.get_runtime_state()
+        runtime_state = self._authoritative_runtime_state(client)
         active_slot = runtime_state["active_slot"]
         candidate_slot = "B" if active_slot == "A" else "A"
-        return active_slot, candidate_slot, client
+        return active_slot, candidate_slot, client, runtime_state
+
+    @staticmethod
+    def _already_authoritative_record(plan: TrustedPlan, transition, runtime_state: dict) -> dict:
+        return {
+            "mode": "already_authoritative",
+            "generation": transition.field.generation,
+            "descriptor_sha256": transition.field.descriptor_sha256,
+            "active_slot": runtime_state["active_slot"],
+            "introducing_release_id": transition.release_id,
+            "introducing_commit": transition.commit,
+            "target_release_id": plan.target_release_id,
+            "target_commit": plan.target_commit,
+            "trusted_plan_fingerprint": plan.fingerprint,
+        }
+
+    def _validate_already_authoritative_satisfaction(
+        self, job_id: str, plan: TrustedPlan, transition, activation_socket: Path,
+    ) -> None:
+        """Re-prove a persisted exact-active gate after every restart.
+
+        The root-owned record is narrow durable evidence, not a substitute for
+        the freshly derived plan or the supervisor.  A resumed job must match
+        both again before the alternate mutation gate is honored.
+        """
+        record = self.store.load(job_id).get("protected_runtime_satisfaction")
+        client = SupervisorClient(activation_socket)
+        try:
+            runtime_state = self._authoritative_runtime_state(client)
+        except SupervisorClientError as exc:
+            raise ExecutionError("RUNTIME_HANDOFF_FAILED", str(exc), manual=False) from exc
+        expected = self._already_authoritative_record(plan, transition, runtime_state)
+        if (runtime_state["active_generation"] != transition.field.generation
+                or runtime_state["active_descriptor_sha256"] != transition.field.descriptor_sha256
+                or runtime_state["activation_in_flight"]
+                or record != expected):
+            raise ExecutionError(
+                "RUNTIME_AUTHORITY_EVIDENCE_MISMATCH",
+                "persisted already-authoritative evidence does not match the freshly trusted plan "
+                "and current supervisor runtime identity",
+                manual=True,
+            )
 
     def _execute_runtime_handoff(self, job_id: str, plan: TrustedPlan, protected_runtime_field, milestones: set):
         """D3: the OLD worker's own short pipeline for a job crossing
@@ -596,17 +659,130 @@ class Executor:
                     manual=True,
                 )
 
+            client = SupervisorClient(activation_socket)
+            initial_runtime_state = self._authoritative_runtime_state(client)
+            active_generation = initial_runtime_state["active_generation"]
+            active_descriptor = initial_runtime_state["active_descriptor_sha256"]
+            target_generation = protected_runtime_field.generation
+            target_descriptor = protected_runtime_field.descriptor_sha256
+
+            if initial_runtime_state["activation_in_flight"]:
+                raise ExecutionError(
+                    "PROTECTED_RUNTIME_ACTIVATION_IN_FLIGHT",
+                    "supervisor reports a protected-runtime activation already in flight",
+                    manual=True,
+                )
+
+            if active_generation == target_generation and active_descriptor == target_descriptor:
+                if (MILESTONE_RUNTIME_CANDIDATE_STAGED in milestones
+                        or MILESTONE_RUNTIME_CANDIDATE_VERIFIED in milestones
+                        or MILESTONE_RUNTIME_ACTIVATION_REQUESTED in milestones
+                        or self.store.load(job_id).get("protected_runtime_candidate") is not None):
+                    raise ExecutionError(
+                        "RUNTIME_HANDOFF_STATE_AMBIGUOUS",
+                        "exact active runtime was observed, but this job also carries unfinished "
+                        "candidate-handoff evidence",
+                        manual=True,
+                    )
+                record = self._already_authoritative_record(plan, transition, initial_runtime_state)
+                self.store.update(job_id, protected_runtime_satisfaction=record)
+                if MILESTONE_RUNTIME_ALREADY_AUTHORITATIVE not in milestones:
+                    self.store.milestone(job_id, MILESTONE_RUNTIME_ALREADY_AUTHORITATIVE)
+                    milestones.add(MILESTONE_RUNTIME_ALREADY_AUTHORITATIVE)
+                self.store.append_log(
+                    job_id,
+                    "exact protected runtime required by the trusted plan is already authoritative; "
+                    "candidate staging and activation skipped",
+                )
+                return None
+
+            if active_generation >= target_generation:
+                raise ExecutionError(
+                    "PROTECTED_RUNTIME_REPLAY_OR_ROLLBACK",
+                    "active protected runtime does not exactly match the trusted target and the target "
+                    f"is not newer (active_generation={active_generation}, "
+                    f"target_generation={target_generation}, descriptor_match=false)",
+                    manual=True,
+                )
+
             if MILESTONE_RUNTIME_CANDIDATE_STAGED not in milestones:
-                active_slot, candidate_slot, _client = self._resolve_candidate_slot(activation_socket)
+                active_slot = initial_runtime_state["active_slot"]
+                candidate_slot = "B" if active_slot == "A" else "A"
                 staging = new_supervisor_staging_directory(slots_root)
-                materialized = materialize_candidate(
-                    self.repository, protected_runtime_field, transition.commit, staging,
-                )
-                stage_attestations(
-                    self.repository, protected_runtime_field, transition.commit, slots_root, candidate_slot,
-                )
-                stage_descriptor(materialized.descriptor_bytes, slots_root, candidate_slot)
-                publish_to_candidate_slot(slots_root, candidate_slot, staging, active_slot=active_slot)
+                try:
+                    materialized = materialize_candidate(
+                        self.repository, protected_runtime_field, transition.commit, staging,
+                    )
+                    stage_attestations(
+                        self.repository, protected_runtime_field, transition.commit, slots_root, candidate_slot,
+                    )
+                    stage_descriptor(materialized.descriptor_bytes, slots_root, candidate_slot)
+                    trust_policy = self._load_phase_d_trust_policy()
+                    if trust_policy is None:
+                        raise ExecutionError(
+                            "UNBOOTSTRAPPED_SUPERVISOR",
+                            "this worker has no configured phase_d_trust_policy_path/phase_d_signer_root -- "
+                            "cannot independently verify the staged candidate",
+                            manual=True,
+                        )
+                    outcome = verify_candidate_independently(
+                        trust_policy=trust_policy, descriptor_bytes=materialized.descriptor_bytes,
+                        bundle_root=staging,
+                        attestations_dir=attestations_staging_directory(slots_root, candidate_slot),
+                        release_id=transition.release_id,
+                        previous_release_id=transition.previous_release_id,
+                        previous_generation=active_generation,
+                        current_bootstrap_protocol_version=1,
+                        current_wire_protocol_version=HANDOFF_WIRE_PROTOCOL,
+                    )
+                    if not outcome.ok:
+                        raise ExecutionError(
+                            "CANDIDATE_INDEPENDENT_VERIFICATION_FAILED",
+                            "; ".join(outcome.reasons), manual=True,
+                        )
+                    needed_units = (
+                        set(plan.systemd_units_changed) | set(plan.systemd_units_new_required)
+                    ) - resolve_known_managed_units(active_policy=self.active_policy)
+                    manifest_declared = (
+                        set(plan.systemd_units_changed)
+                        | set(plan.systemd_units_new_required)
+                        | set(plan.systemd_units_new_optional)
+                    )
+                    unit_violations = verify_new_units_authorized_by_candidate_policy(
+                        needed_units=frozenset(needed_units),
+                        manifest_declared_units=frozenset(manifest_declared),
+                        candidate_policy=outcome.candidate_policy,
+                    )
+                    if unit_violations:
+                        raise ExecutionError(
+                            "NEW_MANAGED_UNIT_NOT_AUTHORIZED", "; ".join(unit_violations), manual=True,
+                        )
+
+                    # A second authoritative read closes the window between
+                    # preflight and publication.  Any concurrent state change
+                    # is refused before the previous-LKG slot is replaced.
+                    publish_runtime_state = self._authoritative_runtime_state(client)
+                    if any(
+                        publish_runtime_state[key] != initial_runtime_state[key]
+                        for key in (
+                            "active_slot", "active_generation", "active_descriptor_sha256",
+                            "activation_in_flight",
+                        )
+                    ):
+                        raise ExecutionError(
+                            "RUNTIME_STATE_CHANGED_DURING_PREFLIGHT",
+                            "authoritative runtime identity changed during candidate preflight",
+                            manual=True,
+                        )
+                    publish_to_candidate_slot(slots_root, candidate_slot, staging, active_slot=active_slot)
+                except Exception:
+                    if staging.exists():
+                        shutil.rmtree(staging, ignore_errors=True)
+                    descriptor_staging_path(slots_root, candidate_slot).unlink(missing_ok=True)
+                    shutil.rmtree(
+                        attestations_staging_directory(slots_root, candidate_slot), ignore_errors=True,
+                    )
+                    raise
                 self.store.update(job_id, protected_runtime_candidate={
                     "generation": protected_runtime_field.generation,
                     "descriptor_sha256": materialized.descriptor_sha256,
@@ -629,8 +805,7 @@ class Executor:
                 # candidate_policy below.
                 record = self.store.load(job_id)["protected_runtime_candidate"]
                 candidate_slot = record["candidate_slot"]
-                _active_slot, _cs, client = self._resolve_candidate_slot(activation_socket)
-                runtime_state = client.get_runtime_state()
+                _active_slot, _cs, client, runtime_state = self._resolve_candidate_slot(activation_socket)
                 bundle_root = Path(slots_root) / candidate_slot
                 descriptor_bytes = descriptor_staging_path(slots_root, candidate_slot).read_bytes()
                 trust_policy = self._load_phase_d_trust_policy()
@@ -677,7 +852,7 @@ class Executor:
 
             if MILESTONE_RUNTIME_ACTIVATION_REQUESTED not in milestones:
                 record = self.store.load(job_id)["protected_runtime_candidate"]
-                _active_slot, _candidate_slot, client = self._resolve_candidate_slot(activation_socket)
+                _active_slot, _candidate_slot, client, _runtime_state = self._resolve_candidate_slot(activation_socket)
                 client.request_activation(
                     transaction_id=job_id, candidate_slot=record["candidate_slot"],
                     candidate_generation=record["generation"], candidate_descriptor_sha256=record["descriptor_sha256"],
@@ -799,8 +974,8 @@ class Executor:
         require_mutation_allowed() calls throughout the pipeline below
         remain, unchanged, as defense-in-depth: this call and those
         calls share the exact same underlying rule (a no-op for an
-        ordinary release, a hard gate on MUTATION_GATE_MILESTONE for a
-        protected_runtime one), so a bug in one is never silently
+        ordinary release, a hard gate on one of the two explicit protected-
+        runtime authority milestones for a protected_runtime one), so a bug in one is never silently
         compensated for by the other -- both must independently agree
         mutation is allowed."""
         self._require_mutation_allowed(plan, milestones)
@@ -864,11 +1039,11 @@ class Executor:
             # three roles THIS process may legitimately play for this
             # job right now:
             #
-            #   1. MUTATION_GATE_MILESTONE already present -- runtime
-            #      acceptance already happened (by some earlier
-            #      candidate call). Fall straight through to the
-            #      unchanged Phase-B pipeline below, gated at every
-            #      mutating step by require_mutation_allowed().
+            #   1. One mutation-gate milestone already present -- either
+            #      activation was accepted by this job's candidate, or this
+            #      job durably proved the exact trusted runtime was already
+            #      authoritative. The latter is re-proved against the
+            #      supervisor on every resume before falling through.
             #   2. SAFE_YIELD_MILESTONE present, acceptance not yet --
             #      a handoff is already in flight. ONLY a process the
             #      supervisor actually launched as THIS exact candidate
@@ -884,7 +1059,31 @@ class Executor:
             #   3. Neither milestone present -- this is the OLD
             #      worker's own first pass: stage+verify+request
             #      activation, then YIELD (_execute_runtime_handoff).
-            if handoff_required(plan.protected_runtime) and MUTATION_GATE_MILESTONE not in milestones:
+            if handoff_required(plan.protected_runtime):
+                transition = plan.protected_runtime_transition
+                if transition is None:
+                    raise ExecutionError(
+                        "RUNTIME_PROVENANCE_MISSING",
+                        "protected-runtime plan lacks exact introducing-release provenance",
+                        manual=True,
+                    )
+                activation_socket = self.config.phase_d_supervisor_activation_socket
+                if activation_socket is None:
+                    raise ExecutionError(
+                        "UNBOOTSTRAPPED_SUPERVISOR",
+                        "this station's protected_runtime transition requires a Phase-D supervisor socket",
+                        manual=True,
+                    )
+
+                # A persisted exact-active proof is intentionally not
+                # self-authenticating.  Revalidate it against the freshly
+                # derived trusted plan and the supervisor on every resume.
+                if MILESTONE_RUNTIME_ALREADY_AUTHORITATIVE in milestones:
+                    self._validate_already_authoritative_satisfaction(
+                        job_id, plan, transition, activation_socket,
+                    )
+
+            if handoff_required(plan.protected_runtime) and not mutation_gate_satisfied(milestones):
                 if SAFE_YIELD_MILESTONE in milestones:
                     if not self._is_authorized_candidate_for(job_id, plan.protected_runtime):
                         self.store.append_log(
@@ -900,7 +1099,12 @@ class Executor:
                     # SAME mutation pipeline an ordinary release uses,
                     # through the SAME central barrier immediately below.
                 else:
-                    return self._execute_runtime_handoff(job_id, plan, plan.protected_runtime, milestones)
+                    handoff_result = self._execute_runtime_handoff(
+                        job_id, plan, plan.protected_runtime, milestones,
+                    )
+                    if handoff_result is not None:
+                        return handoff_result
+                    milestones = set(self.store.load(job_id)["milestones"])
 
             # D4-I: central mutation-phase barrier -- see
             # _enter_mutation_phase's own docstring. Every mutating

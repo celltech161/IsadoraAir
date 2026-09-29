@@ -73,3 +73,13 @@ operator reviews and approves a terminal discovery job with this generation's
 `updaterctl.py migration-review` and `approve-migration-plan` commands, then
 starts a distinct execution job. Full commands and trust-boundary details are
 in `docs/UPDATE_CENTER.md`.
+
+Generation 9/runtime 10 is the r0093 protected-runtime idempotency recovery.
+Before publishing an inactive candidate slot, the executor obtains the
+supervisor's authoritative active generation and descriptor. An exact match to
+the freshly trusted plan is recorded as the distinct durable
+`runtime_already_authoritative` proof and satisfies the same mutation invariant
+without staging, activation, or handoff. Same/higher non-matches fail closed.
+Genuine forward candidates are signature/inventory/bundle verified while still
+under `.staging`, before the prior-LKG slot is replaced. Wire protocols remain
+3 and 4; manifest protocol remains 5.

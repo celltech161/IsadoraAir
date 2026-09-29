@@ -284,7 +284,10 @@ class IntermediateHandoffProvenanceTests(SimpleTestCase):
             self.activation = None
 
         def get_runtime_state(self):
-            return {"active_generation": 4, "active_slot": "A"}
+            return {
+                "active_generation": 4, "active_descriptor_sha256": "c" * 64,
+                "active_slot": "A", "activation_in_flight": False,
+            }
 
         def request_activation(self, **kwargs):
             self.activation = kwargs
@@ -314,13 +317,16 @@ class IntermediateHandoffProvenanceTests(SimpleTestCase):
                 phase_d_supervisor_slots_root=root,
                 phase_d_supervisor_activation_socket=root / "activation.sock",
             )
-            executor._resolve_candidate_slot = lambda _socket: ("A", "B", client)
+            executor._resolve_candidate_slot = lambda _socket: (
+                "A", "B", client, client.get_runtime_state(),
+            )
             executor._load_phase_d_trust_policy = lambda: object()
             materialized = SimpleNamespace(descriptor_bytes=b"{}", descriptor_sha256="d" * 64)
             verification = SimpleNamespace(ok=True, reasons=(), candidate_policy=None)
 
             with (
                 patch("isadoraair_updater.executor.new_supervisor_staging_directory", return_value=root / "stage"),
+                patch("isadoraair_updater.executor.SupervisorClient", return_value=client),
                 patch("isadoraair_updater.executor.materialize_candidate", return_value=materialized) as materialize,
                 patch("isadoraair_updater.executor.stage_attestations") as attestations,
                 patch("isadoraair_updater.executor.stage_descriptor"),

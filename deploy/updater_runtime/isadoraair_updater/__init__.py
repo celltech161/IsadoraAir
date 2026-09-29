@@ -89,7 +89,15 @@ HANDOFF_WIRE_PROTOCOL = SUPPORTED_WIRE_PROTOCOLS[0]
 # probe is discovery-only, the executor performs exact protected lookup, and
 # protocol v4 adds the narrow approval action while this generation continues
 # accepting v3 from the still-installed r0088 application.
-RUNTIME_VERSION = 9
+#
+# 9 -> 10 (r0093 runtime-idempotency recovery): a fresh job whose trusted plan
+# crosses a protected-runtime transition now recognizes the exact generation +
+# descriptor already authoritative in the supervisor, records that distinct
+# durable proof, and continues without replaying activation. Equal-generation
+# descriptor mismatches and lower targets remain hard failures. Genuine forward
+# candidates are independently verified in .staging before the inactive slot is
+# replaced.
+RUNTIME_VERSION = 10
 
 # The release-MANIFEST execution-semantics protocol (see release.py's
 # manual_blockers(), compared against each release's declared

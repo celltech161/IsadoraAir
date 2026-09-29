@@ -81,6 +81,7 @@ MILESTONE_RUNTIME_CANDIDATE_STAGED = "runtime_candidate_staged"
 MILESTONE_RUNTIME_CANDIDATE_VERIFIED = "runtime_candidate_verified"
 MILESTONE_RUNTIME_ACTIVATION_REQUESTED = "runtime_activation_requested"
 MILESTONE_RUNTIME_ACTIVATION_ACCEPTED = "runtime_activation_accepted"
+MILESTONE_RUNTIME_ALREADY_AUTHORITATIVE = "runtime_already_authoritative"
 MILESTONE_RUNTIME_GENERATION_COMMITTED = "runtime_generation_committed"
 
 HANDOFF_MILESTONES = (
@@ -106,10 +107,28 @@ HANDOFF_MILESTONES = (
 # job may resume before production mutation").
 SAFE_YIELD_MILESTONE = MILESTONE_RUNTIME_ACTIVATION_REQUESTED
 
-# D3-K: the ONE milestone that must already be durable before ANY
-# production-mutation executor call may run, for a job crossing an
-# effective protected-runtime transition. See require_mutation_allowed().
+# D3-K's original handoff gate remains this exact constant for compatibility.
+# Generation 9 adds a distinct alternate exact-active proof below; callers use
+# mutation_gate_satisfied() rather than conflating the two audit meanings.
 MUTATION_GATE_MILESTONE = MILESTONE_RUNTIME_ACTIVATION_ACCEPTED
+MUTATION_GATE_MILESTONES = frozenset({
+    MILESTONE_RUNTIME_ACTIVATION_ACCEPTED,
+    MILESTONE_RUNTIME_ALREADY_AUTHORITATIVE,
+})
+
+
+def mutation_gate_satisfied(milestones) -> bool:
+    """Return whether either auditable protected-runtime authority path
+    has completed.
+
+    ``runtime_activation_accepted`` means this job performed a handoff and
+    the launched candidate accepted ownership.  ``runtime_already_authoritative``
+    means this job independently matched the supervisor's active generation
+    *and* descriptor to its freshly derived trusted plan.  They are alternate
+    proofs of the same mutation prerequisite, deliberately kept as distinct
+    milestones so the durable audit trail never conflates them.
+    """
+    return bool(MUTATION_GATE_MILESTONES & set(milestones))
 
 
 def handoff_required(protected_runtime_field: ProtectedRuntimeField | None) -> bool:
@@ -127,19 +146,20 @@ def require_mutation_allowed(protected_runtime_field: ProtectedRuntimeField | No
     existing Phase-B mutation call site's behavior is BYTE-FOR-BYTE
     unchanged for every release that does not declare protected_
     runtime (parity, D3-C/D3-K's own explicit requirement). For a
-    protected_runtime release, raises MutationGateError unless
-    MUTATION_GATE_MILESTONE is already present in `milestones` --
+    protected_runtime release, raises MutationGateError unless either the
+    candidate-acceptance milestone or the exact-already-authoritative milestone
+    is already present in `milestones` --
     fail closed, never a default-permissive gate a future refactor
     could quietly stop calling and not notice (see executor.py's own
     call sites, one per mutating operation, never a single check at
     the top of execute())."""
     if protected_runtime_field is None:
         return
-    if MUTATION_GATE_MILESTONE not in set(milestones):
+    if not mutation_gate_satisfied(milestones):
         raise MutationGateError(
             "production mutation refused: this job crosses protected_runtime, and "
-            f"{MUTATION_GATE_MILESTONE!r} is not yet a durable "
-            "milestone -- runtime activation has not been accepted"
+            "neither runtime activation acceptance nor an exact already-authoritative "
+            "runtime match is yet a durable milestone"
         )
 
 

@@ -17,7 +17,8 @@ from .phase_b_helpers import RUNTIME_ROOT, git  # noqa: F401
 from isadoraair_updater.process import CommandRunner
 from isadoraair_updater.release import TrustedRepository
 from isadoraair_updater.runtime_handoff import (
-    HANDOFF_MILESTONES, MUTATION_GATE_MILESTONE, SAFE_YIELD_MILESTONE,
+    HANDOFF_MILESTONES, MILESTONE_RUNTIME_ALREADY_AUTHORITATIVE,
+    MUTATION_GATE_MILESTONE, SAFE_YIELD_MILESTONE,
     HandoffError, MutationGateError, RecoveryAmbiguous,
     classify_handoff_recovery, handoff_required, materialize_candidate,
     require_mutation_allowed,
@@ -190,6 +191,16 @@ class MutationGateTests(SimpleTestCase):
             attestations=("deploy/updater_attestations/a.json",),
         )
         require_mutation_allowed(field, ["runtime_activation_requested", MUTATION_GATE_MILESTONE])
+
+    def test_exact_already_authoritative_milestone_is_distinct_and_allowed(self):
+        field = ProtectedRuntimeField(
+            generation=1, descriptor_path="deploy/updater_runtime/d.json",
+            descriptor_sha256="a" * 64, minimum_bootstrap_protocol_version=1,
+            runtime_version=5, manifest_protocol_version=5, supported_wire_protocols=(3,),
+            attestations=("deploy/updater_attestations/a.json",),
+        )
+        self.assertNotEqual(MILESTONE_RUNTIME_ALREADY_AUTHORITATIVE, MUTATION_GATE_MILESTONE)
+        require_mutation_allowed(field, [MILESTONE_RUNTIME_ALREADY_AUTHORITATIVE])
 
     def test_handoff_required_predicate(self):
         self.assertFalse(handoff_required(None))

@@ -1588,6 +1588,35 @@ produce the same identity, apply all nine migrations, verify the database,
 advance source, and perform declared restarts. Keep execution disarmed on any
 identity mismatch or unexpected graph.
 
+### r0093 exact-active runtime idempotency recovery
+
+Production proved one further lifecycle requirement after r0092 generation 8
+activated successfully and Job A stopped at manual review: the required fresh
+Job B reconstructs the same trusted release plan while application source is
+still r0088. Generation 8 treated that already-completed transition as a new
+candidate, replaced the inactive slot, and then correctly rejected `8 > 8`.
+
+Generation 9/runtime 10 distinguishes three authoritative supervisor states
+before publishing candidate bytes:
+
+- exact active `(generation, descriptor)` equality records a per-job
+  `runtime_already_authoritative` milestone plus a narrow root-owned evidence
+  record bound to the introducing release/commit and trusted-plan fingerprint;
+  no slot, activation, or handoff operation occurs;
+- same/higher active generation with any nonmatching identity fails closed as
+  replay/rollback ambiguity before either slot is touched;
+- a genuinely newer target is fully materialized and independently verifies
+  its signature, descriptor, inventory, bundle, and candidate policy under
+  `.staging` before the inactive/previous-LKG slot is replaced. The supervisor
+  still repeats its own independent verification before activation.
+
+The exact-active milestone is deliberately distinct from
+`runtime_activation_accepted`, but both satisfy the same central and per-
+mutator invariant. On resume, an exact-active job re-derives and fingerprint-
+checks the trusted plan and re-reads the supervisor; the persisted evidence is
+not accepted by itself. Equality of generation alone is never sufficient.
+Wire protocols remain 3/4 and manifest protocol remains 5.
+
 ### Remaining limitations
 
 - The classifier itself is unchanged and deliberately conservative -- a

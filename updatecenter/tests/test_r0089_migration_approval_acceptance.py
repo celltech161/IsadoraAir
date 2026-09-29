@@ -6,7 +6,9 @@ updatecenter back to 0002 as well as authz/library, proving the target probe
 has no approval table available.
 """
 from pathlib import Path
+import json
 import tempfile
+import types
 from unittest import mock
 import uuid
 
@@ -20,14 +22,50 @@ from isadoraair_updater.config import validate_config_dict
 from isadoraair_updater.executor import Executor, _strict_probe
 from isadoraair_updater.jobs import JobStore
 from isadoraair_updater.process import CommandRunner, ProcessResult
-from isadoraair_updater.release import TrustedPlan
+from isadoraair_updater.release import ProtectedRuntimeTransition, TrustedPlan
 from isadoraair_updater.staging import StagedSource
+from protected_bootstrap.manifest_field import parse_protected_runtime_field
 from updatecenter import release_chain
 from updatecenter.management.commands.updatecenter_probe import build_probe_payload
 
 
 R0088_COMMIT = "edc5d5c8f345ba18646db66a9a050093d1a076b0"
-R0092_TARGET_COMMIT = "b" * 40
+R0092_TARGET_COMMIT = "abb3a54df5d7de6da1af07a43324e42d602ed75c"
+R0092_DESCRIPTOR = "89fe055e69769e4a5716f8c3ce010fe7a33b3cb3a58f400ca93401296764d4ce"
+
+
+class PersistentSupervisor:
+    """Authoritative supervisor double persisted across Job A and Job B."""
+    active_generation = 7
+    active_descriptor = "7" * 64
+    active_slot = "A"
+    activation_requests = []
+    acceptance_confirmations = []
+
+    def __init__(self, socket_path):
+        self.socket_path = socket_path
+
+    def get_runtime_state(self):
+        return {
+            "ok": True, "active_slot": type(self).active_slot,
+            "active_generation": type(self).active_generation,
+            "active_descriptor_sha256": type(self).active_descriptor,
+            "activation_in_flight": bool(type(self).activation_requests)
+            and not bool(type(self).acceptance_confirmations),
+            "phase": None,
+            "runtime_activation_accepted": bool(type(self).acceptance_confirmations),
+        }
+
+    def request_activation(self, **kwargs):
+        type(self).activation_requests.append(kwargs)
+        return {"ok": True}
+
+    def confirm_runtime_acceptance(self, **kwargs):
+        type(self).acceptance_confirmations.append(kwargs)
+        type(self).active_generation = kwargs["candidate_generation"]
+        type(self).active_descriptor = kwargs["candidate_descriptor_sha256"]
+        type(self).active_slot = kwargs["candidate_slot"]
+        return {"ok": True}
 
 
 class RecordingSystemd:
@@ -124,11 +162,19 @@ class R0092ProductionBootstrapAcceptanceTests(TransactionTestCase):
 
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
-        self.config = validate_config_dict(
-            config_dict(self.root, str(self.root / "upstream.git")), allow_local_repository=True,
-        )
+        config = config_dict(self.root, str(self.root / "upstream.git"))
+        config["phase_d_supervisor_slots_root"] = str(self.root / "runtime-slots")
+        config["phase_d_supervisor_activation_socket"] = str(self.root / "activation.sock")
+        self.config = validate_config_dict(config, allow_local_repository=True)
         self.store = JobStore(self.config.jobs_root, self.config.logs_root, acquire_daemon_lock=False)
         self.systemd = RecordingSystemd()
+        r0092_data = json.loads(
+            (PROJECT_ROOT / "deploy" / "releases" / "r0092.json").read_text(encoding="utf-8")
+        )
+        protected_runtime = parse_protected_runtime_field(r0092_data["protected_runtime"])
+        self.assertEqual(protected_runtime.generation, 8)
+        self.assertEqual(protected_runtime.runtime_version, 9)
+        self.assertEqual(protected_runtime.descriptor_sha256, R0092_DESCRIPTOR)
         self.plan = TrustedPlan(
             installed_release_id="r0088", installed_commit=R0088_COMMIT,
             target_release_id="r0092", target_commit=R0092_TARGET_COMMIT,
@@ -142,15 +188,21 @@ class R0092ProductionBootstrapAcceptanceTests(TransactionTestCase):
             nginx_changed=False, runtime_components_changed=False,
             minimum_updater_protocol_version=5, manual_bootstrap_required=False,
             fingerprint="f" * 64,
-            # Runtime handoff itself has dedicated integration coverage. This
-            # fixture starts at the accepted generation-8 mutation boundary.
-            protected_runtime_transition=None,
+            protected_runtime_transition=ProtectedRuntimeTransition(
+                field=protected_runtime, release_id="r0092", previous_release_id="r0091",
+                commit=R0092_TARGET_COMMIT,
+            ),
         )
         self.executor = ProductionStateExecutor(
             self.config, self.store, CommandRunner(), systemd_manager=self.systemd,
             leaf_targets=self.leaf_targets,
         )
         self.executor.repository.fetch = lambda: R0092_TARGET_COMMIT
+        PersistentSupervisor.active_generation = 7
+        PersistentSupervisor.active_descriptor = "7" * 64
+        PersistentSupervisor.active_slot = "A"
+        PersistentSupervisor.activation_requests = []
+        PersistentSupervisor.acceptance_confirmations = []
 
     def tearDown(self):
         MigrationExecutor(connection).migrate(self.leaf_targets)
@@ -178,25 +230,63 @@ class R0092ProductionBootstrapAcceptanceTests(TransactionTestCase):
         self.assertIsNone(first_payload["approval"])
 
         job_a = self._accept()
-        with mock.patch("isadoraair_updater.executor.derive_plan", return_value=self.plan), \
+        verification = types.SimpleNamespace(ok=True, reasons=(), candidate_policy=None)
+        runtime_materialized = types.SimpleNamespace(
+            descriptor_bytes=b"{}", descriptor_sha256=R0092_DESCRIPTOR,
+        )
+        runtime_publications = []
+        with mock.patch("isadoraair_updater.executor.SupervisorClient", PersistentSupervisor), \
+                mock.patch("isadoraair_updater.executor.derive_plan", return_value=self.plan), \
+                mock.patch("isadoraair_updater.executor.materialize_candidate", return_value=runtime_materialized), \
+                mock.patch("isadoraair_updater.executor.stage_attestations"), \
+                mock.patch("isadoraair_updater.executor.verify_candidate_independently", return_value=verification), \
+                mock.patch.object(self.executor, "_load_phase_d_trust_policy", return_value=object()), \
+                mock.patch("isadoraair_updater.executor.publish_to_candidate_slot",
+                           side_effect=lambda *args, **kwargs: runtime_publications.append((args, kwargs))):
+            yielded = self.executor.execute(job_a)
+
+        self.assertEqual(yielded["state"], "running")
+        self.assertIn("runtime_activation_requested", yielded["milestones"])
+        self.assertEqual(len(PersistentSupervisor.activation_requests), 1)
+        self.assertEqual(len(runtime_publications), 1)
+
+        # A separately constructed generation-8 worker resumes the same
+        # durable Job A, accepts the activation, and only then reaches review.
+        candidate_store = JobStore(
+            self.config.jobs_root, self.config.logs_root, acquire_daemon_lock=False,
+        )
+        self.addCleanup(candidate_store.close)
+        candidate = ProductionStateExecutor(
+            self.config, candidate_store, CommandRunner(), systemd_manager=self.systemd,
+            leaf_targets=self.leaf_targets,
+            expected_handoff_generation=8,
+            expected_handoff_descriptor_sha256=R0092_DESCRIPTOR,
+            expected_resumable_job_uuid=job_a,
+        )
+        candidate.repository.fetch = lambda: R0092_TARGET_COMMIT
+        with mock.patch("isadoraair_updater.executor.SupervisorClient", PersistentSupervisor), \
+                mock.patch("isadoraair_updater.executor.derive_plan", return_value=self.plan), \
                 mock.patch("isadoraair_updater.executor.materialize", side_effect=lambda *args: self._staged(job_a)), \
                 mock.patch("isadoraair_updater.executor.cleanup"), \
                 mock.patch("isadoraair_updater.executor.create_checkpoint", return_value={"schema_version": 1}), \
                 mock.patch("isadoraair_updater.executor.verify_checkpoint", return_value=False):
-            result_a = self.executor.execute(job_a)
+            result_a = candidate.execute(job_a)
 
         self.assertEqual(result_a["state"], "manual_intervention_required")
         self.assertEqual(result_a["failure_classification"], "MIGRATION_OPERATION_MANUAL")
         self.assertIn("target_staged", result_a["milestones"])
         self.assertNotIn("migration_started", result_a["milestones"])
         self.assertNotIn("source_advanced", result_a["milestones"])
-        self.assertEqual(self.executor.migrate_calls, 0)
-        self.assertEqual(self.executor.source_advance_calls, 0)
+        self.assertEqual(candidate.migrate_calls, 0)
+        self.assertEqual(candidate.source_advance_calls, 0)
         self.assertEqual(self.systemd.reconciled, 0)
+        self.assertEqual(PersistentSupervisor.active_generation, 8)
+        self.assertEqual(PersistentSupervisor.active_descriptor, R0092_DESCRIPTOR)
+        self.assertEqual(len(PersistentSupervisor.acceptance_confirmations), 1)
         self.assertNotIn("updatecenter_migrationplanapproval", connection.introspection.table_names())
 
         review_before = dict(result_a["migration_plan_review"])
-        approval, created = self.executor.approval_store.create_from_job(
+        approval, created = candidate.approval_store.create_from_job(
             job_a,
             confirmed_migration_plan_digest=review_before["migration_plan_digest"],
             approved_by_username="release_operator",
@@ -207,20 +297,33 @@ class R0092ProductionBootstrapAcceptanceTests(TransactionTestCase):
 
         job_b = self._accept()
         self.assertNotEqual(job_a, job_b)
-        with mock.patch("isadoraair_updater.executor.derive_plan", return_value=self.plan), \
+        job_b_executor = ProductionStateExecutor(
+            self.config, self.store, CommandRunner(), systemd_manager=self.systemd,
+            leaf_targets=self.leaf_targets,
+        )
+        job_b_executor.repository.fetch = lambda: R0092_TARGET_COMMIT
+        with mock.patch("isadoraair_updater.executor.SupervisorClient", PersistentSupervisor), \
+                mock.patch("isadoraair_updater.executor.derive_plan", return_value=self.plan), \
+                mock.patch("isadoraair_updater.executor.materialize_candidate") as restage_runtime, \
+                mock.patch("isadoraair_updater.executor.publish_to_candidate_slot") as republish_runtime, \
                 mock.patch("isadoraair_updater.executor.materialize", side_effect=lambda *args: self._staged(job_b)), \
                 mock.patch("isadoraair_updater.executor.cleanup"), \
                 mock.patch("isadoraair_updater.executor.create_checkpoint", return_value={"schema_version": 1}), \
                 mock.patch("isadoraair_updater.executor.verify_checkpoint", return_value=False):
-            result_b = self.executor.execute(job_b)
+            result_b = job_b_executor.execute(job_b)
 
         self.assertEqual(result_b["state"], "succeeded")
-        self.assertEqual(self.executor.migrate_calls, 1)
-        self.assertEqual(self.executor.source_advance_calls, 1)
+        self.assertEqual(job_b_executor.migrate_calls, 1)
+        self.assertEqual(job_b_executor.source_advance_calls, 1)
         self.assertEqual(self.systemd.reconciled, 1)
         self.assertEqual(self.systemd.restarted, ["isadoraair-gunicorn", "isadoraair-engine"])
         self.assertIn("database_verified", result_b["milestones"])
         self.assertIn("source_advanced", result_b["milestones"])
+        self.assertIn("runtime_already_authoritative", result_b["milestones"])
+        self.assertNotIn("runtime_activation_requested", result_b["milestones"])
+        restage_runtime.assert_not_called()
+        republish_runtime.assert_not_called()
+        self.assertEqual(len(PersistentSupervisor.activation_requests), 1)
         self.assertIn("updatecenter_migrationplanapproval", connection.introspection.table_names())
         after = build_probe_payload()
         self.assertEqual(after["plan"], [])

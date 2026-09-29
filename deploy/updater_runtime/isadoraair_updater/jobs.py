@@ -179,6 +179,12 @@ class JobStore:
             # state, which remains the supervisor's own, not
             # duplicated here (D3-D's own explicit instruction).
             "protected_runtime_candidate": None,
+            # Generation 9 exact-active idempotency.  This remains distinct
+            # from protected_runtime_candidate: it records that THIS job
+            # freshly matched the supervisor's authoritative active runtime
+            # to THIS job's exact trusted plan, without staging or activating
+            # a candidate.  Historical job files legitimately lack the key.
+            "protected_runtime_satisfaction": None,
             # Reviewed migration approval: structured evidence set only by
             # fail(..., migration_plan_review=...) when the mechanical
             # classifier finds non-additive operations with no matching
@@ -198,7 +204,7 @@ class JobStore:
         allowed = {
             "state", "current_step", "failure_classification", "failure_detail",
             "trusted_plan", "checkpoint", "protected_runtime_candidate",
-            "migration_plan_review",
+            "protected_runtime_satisfaction", "migration_plan_review",
         }
         if set(changes) - allowed:
             raise JobError("attempt to write unknown job-state fields")
