@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "release_id": "r0093",
+  "previous_release_id": "r0092",
+  "minimum_updater_protocol_version": 5,
+  "summary": "Protected-runtime-only recovery. Ships generation 9/runtime 10: fresh jobs recognize an exact trusted runtime already authoritative without replaying activation; equal/higher nonmatches fail before slot publication; genuine forward candidates are independently verified in staging before replacing the inactive previous-LKG slot. No application migrations or managed-unit policy changes.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0081",
+  "protected_runtime": {
+    "generation": 9,
+    "descriptor_path": "deploy/updater_runtime/protected-runtime-descriptor.json",
+    "descriptor_sha256": "dd76a5d7ca970a2c843e22d9683ff5b2cbd10ce95d4693764240b7d707217685",
+    "minimum_bootstrap_protocol_version": 1,
+    "runtime_version": 10,
+    "manifest_protocol_version": 5,
+    "supported_wire_protocols": [
+      3,
+      4
+    ],
+    "attestations": [
+      "deploy/updater_attestations/r0093-primary.json"
+    ]
+  }
+}

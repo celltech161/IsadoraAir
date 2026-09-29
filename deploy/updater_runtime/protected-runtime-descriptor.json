@@ -1,18 +1,18 @@
 {
-  "bundle_sha256": "c762736649f21cce483ad6e3c6b5c2d6df3087ca8e809afc8e11bf827414eacc",
+  "bundle_sha256": "7d1f832094a45d2f16c88256872f415cd7212e0d3df0f3adc3f94687d2ad8144",
   "entrypoint": "updaterd.py",
   "files": [
     {
       "mode": "0644",
       "path": "README.md",
-      "sha256": "8b3749595e477d9031693fb8db0ace6cf8e717a3d472cad1eb2ba041c89dfe39",
-      "size_bytes": 4426
+      "sha256": "735735edaf2c0b91b844a7e822d6bbcd914540e6c08e12dfebd2152500e93d84",
+      "size_bytes": 5069
     },
     {
       "mode": "0644",
       "path": "isadoraair_updater/__init__.py",
-      "sha256": "06f63b1fc80f4b4c3d16a2966794ad06b058a5abb94b3d170057d6a28dc2eb95",
-      "size_bytes": 9783
+      "sha256": "0d4d5790bec95a2b449f80dcc3861301041effbd7e22bcaa6151ae6fc2afa3e5",
+      "size_bytes": 10270
     },
     {
       "mode": "0644",
@@ -41,14 +41,14 @@
     {
       "mode": "0644",
       "path": "isadoraair_updater/executor.py",
-      "sha256": "5cbe51be1ed1f5a10955f99ed448d39af3eb2a54a8cbafdb3a2e7432e7912bd3",
-      "size_bytes": 60144
+      "sha256": "7549667190f0be8660d8182b5d3026e05965329ccb4dcaca3d642c7a5342c215",
+      "size_bytes": 71367
     },
     {
       "mode": "0644",
       "path": "isadoraair_updater/jobs.py",
-      "sha256": "b208a5e746a5ed2d2bd5b6f7cf5dd0055bcfffd198c30c9fdd870749359bac6c",
-      "size_bytes": 16578
+      "sha256": "2cf0b39d179d1a4118bbaca64bb6a709231c906e84aee2ef6303cb92239d8f16",
+      "size_bytes": 17043
     },
     {
       "mode": "0644",
@@ -71,8 +71,8 @@
     {
       "mode": "0644",
       "path": "isadoraair_updater/runtime_handoff.py",
-      "sha256": "45f85a0205876ecaec36f6a833ac388c7d48f74749fefb160cd636f123463ebb",
-      "size_bytes": 30426
+      "sha256": "f1fdd4285f1c45fc8c16beae6071b29e120379ec2c1c956257f1cd8f12314200",
+      "size_bytes": 31387
     },
     {
       "mode": "0644",
@@ -165,9 +165,9 @@
       "size_bytes": 9975
     }
   ],
-  "generation": 8,
+  "generation": 9,
   "manifest_protocol_version": 5,
-  "runtime_version": 9,
+  "runtime_version": 10,
   "schema_version": 1,
   "supported_wire_protocols": [
     3,
