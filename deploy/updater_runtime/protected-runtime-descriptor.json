@@ -1,18 +1,24 @@
 {
-  "bundle_sha256": "ef669e237415e05f085b7f604e97ae9e72b56e55b38ee7d437c629c8742d4f24",
+  "bundle_sha256": "c762736649f21cce483ad6e3c6b5c2d6df3087ca8e809afc8e11bf827414eacc",
   "entrypoint": "updaterd.py",
   "files": [
     {
       "mode": "0644",
       "path": "README.md",
-      "sha256": "0a71a3985b1e71562f0a1863cc816abc954670c69414ea404f9c9e60a90ebf26",
-      "size_bytes": 3803
+      "sha256": "8b3749595e477d9031693fb8db0ace6cf8e717a3d472cad1eb2ba041c89dfe39",
+      "size_bytes": 4426
     },
     {
       "mode": "0644",
       "path": "isadoraair_updater/__init__.py",
-      "sha256": "e2dc572a0a5a8988e0f5e1731737d61036726ccfa15de8a63569bd082142982e",
-      "size_bytes": 8799
+      "sha256": "06f63b1fc80f4b4c3d16a2966794ad06b058a5abb94b3d170057d6a28dc2eb95",
+      "size_bytes": 9783
+    },
+    {
+      "mode": "0644",
+      "path": "isadoraair_updater/approvals.py",
+      "sha256": "35e76f40d3f49ed01b334dab810ee974cb748f4cdfe334b10d2ed0685efc8faa",
+      "size_bytes": 14429
     },
     {
       "mode": "0644",
@@ -23,20 +29,20 @@
     {
       "mode": "0644",
       "path": "isadoraair_updater/config.py",
-      "sha256": "f12d9f4e1e8da5728ea23f2aecb8009d664c1d62d12809f81430bbb99374d36f",
-      "size_bytes": 15695
+      "sha256": "12aa764b376d3116e82d3f721fa295923f100884d131cfc23ed6a7f08cbef95a",
+      "size_bytes": 16171
     },
     {
       "mode": "0644",
       "path": "isadoraair_updater/daemon.py",
-      "sha256": "a58e436e57000bdfd2e02f897cd9486e75fd9420b6649980301dc12315bf716a",
-      "size_bytes": 23566
+      "sha256": "cba002a713c245ee94b9e9786b70e501c6e64fda4bf173efde67f64bc9bfcc9f",
+      "size_bytes": 24414
     },
     {
       "mode": "0644",
       "path": "isadoraair_updater/executor.py",
-      "sha256": "e8622b96ba901b39153724833cccf1a862464541ec0e44932bf192ca8b9df814",
-      "size_bytes": 59636
+      "sha256": "5cbe51be1ed1f5a10955f99ed448d39af3eb2a54a8cbafdb3a2e7432e7912bd3",
+      "size_bytes": 60144
     },
     {
       "mode": "0644",
@@ -53,14 +59,14 @@
     {
       "mode": "0644",
       "path": "isadoraair_updater/protocol.py",
-      "sha256": "6b65d2297394055b6b0e4e0a0fa21d73bb2169d00e34143ad9e85f96657e8bf3",
-      "size_bytes": 4626
+      "sha256": "f2792a2e53e3575380221376f8ded485ec0c5b010f2452f96579a1f3c736153b",
+      "size_bytes": 6526
     },
     {
       "mode": "0644",
       "path": "isadoraair_updater/release.py",
-      "sha256": "745f0fe254e27d75d9c74e83e5ead1a70c1430bd014c8e43d43f665ea84f43b3",
-      "size_bytes": 53766
+      "sha256": "535d54f918d6affadc6d42a8ab82e3d14e49b797186e5d05f3aa5b1e01c70d45",
+      "size_bytes": 54804
     },
     {
       "mode": "0644",
@@ -149,8 +155,8 @@
     {
       "mode": "0644",
       "path": "updaterctl.py",
-      "sha256": "450e478d13c21200c6631683bb43782f46240ae1f65a3fe9818d12884c3f2832",
-      "size_bytes": 1740
+      "sha256": "8ba61dbde12c24a042ee845bf44bdd07f6c0509306f9e113e14521a59edaf04a",
+      "size_bytes": 6448
     },
     {
       "mode": "0755",
@@ -159,11 +165,12 @@
       "size_bytes": 9975
     }
   ],
-  "generation": 7,
+  "generation": 8,
   "manifest_protocol_version": 5,
-  "runtime_version": 8,
+  "runtime_version": 9,
   "schema_version": 1,
   "supported_wire_protocols": [
-    3
+    3,
+    4
   ]
 }

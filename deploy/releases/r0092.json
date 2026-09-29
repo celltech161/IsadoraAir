@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "release_id": "r0092",
+  "previous_release_id": "r0091",
+  "minimum_updater_protocol_version": 5,
+  "summary": "Protected migration-approval bootstrap recovery. Ships protected generation 8/runtime 9 with a root-owned exact-plan ApprovalStore, discovery-only staged probe, protocol-v3/v4 bridge, privileged bootstrap review CLI, and prospective migration-declaration completeness enforcement. Explicitly declares the previously omitted updatecenter.0003 migration; application approval rows remain audit-only.",
+  "migrations_required": [
+    "updatecenter.0003_updatejob_migration_plan_review_and_more"
+  ],
+  "migration_compatibility": "additive",
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-gunicorn"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0081",
+  "protected_runtime": {
+    "generation": 8,
+    "descriptor_path": "deploy/updater_runtime/protected-runtime-descriptor.json",
+    "descriptor_sha256": "89fe055e69769e4a5716f8c3ce010fe7a33b3cb3a58f400ca93401296764d4ce",
+    "minimum_bootstrap_protocol_version": 1,
+    "runtime_version": 9,
+    "manifest_protocol_version": 5,
+    "supported_wire_protocols": [
+      3,
+      4
+    ],
+    "attestations": [
+      "deploy/updater_attestations/r0092-primary.json"
+    ]
+  }
+}
