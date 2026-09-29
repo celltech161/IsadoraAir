@@ -20,6 +20,11 @@ class Command(BaseCommand):
         parser.add_argument("--previous-policy")
         parser.add_argument("--previous-commit")
         parser.add_argument("--target-commit")
+        parser.add_argument(
+            "--identity-tip",
+            help="commit whose ancestry stands in for production's fetched canonical tip "
+                 "when resolving the release's immutable identity (default: HEAD)",
+        )
 
     def handle(self, *args, **options):
         checkout = Path(__file__).resolve().parents[3]
@@ -32,6 +37,7 @@ class Command(BaseCommand):
                 previous_generation=options["previous_generation"],
                 previous_policy_path=Path(options["previous_policy"]) if options["previous_policy"] else None,
                 previous_commit=options["previous_commit"], target_commit=options["target_commit"],
+                identity_tip=options["identity_tip"],
             )
         except ProtectedReleaseValidationError as exc:
             raise CommandError(str(exc)) from exc

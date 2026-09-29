@@ -186,6 +186,18 @@ class ProtectedRuntimeReleaseToolTests(SimpleTestCase):
         }))
         previous_policy = self.root / "previous-policy.json"
         previous_policy.write_bytes(generation_one_policy_bytes())
+        # The validator now always establishes release identity from Git, so
+        # the fixture checkout is a real repository whose only commit does not
+        # yet contain the release (the pre-signing "prospective" state; the
+        # committed-mode contract is exercised by test_release_identity_closure).
+        (checkout / "README").write_text("baseline\n", encoding="utf-8")
+        for arguments in (
+            ("init", "-b", "main"), ("config", "user.email", "test@example.invalid"),
+            ("config", "user.name", "Test"), ("config", "commit.gpgsign", "false"),
+            ("add", "README"), ("commit", "-m", "baseline"),
+        ):
+            subprocess.run(["git", "-C", str(checkout), *arguments], check=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         evidence = validate_protected_release(
             checkout_root=checkout, manifest_path=manifest_path,
             trust_policy_path=trust_path, signer_directory=signers,

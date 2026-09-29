@@ -1617,6 +1617,44 @@ checks the trusted plan and re-reads the supervisor; the persisted evidence is
 not accepted by itself. Equality of generation alone is never sufficient.
 Wire protocols remain 3/4 and manifest protocol remains 5.
 
+### r0094 atomic release packaging (release-identity closure)
+
+r0093's first production attempt failed with `RUNTIME_HANDOFF_FAILED:
+attestation 'deploy/updater_attestations/r0093-primary.json' is unreadable at
+4643760`. Nothing cryptographic was wrong. r0093's manifest and descriptor were
+committed unsigned (`4643760`) and its attestation was added by a later commit
+(`f43266c`). A release's immutable identity is the single commit that added
+`deploy/releases/<id>.json` (`TrustedRepository.introducing_commit()`, which
+also requires the manifest to be touched exactly once, ever), and the worker
+reads the descriptor, every runtime file and every attestation from **that**
+commit. A later commit can never repair it, and touching the manifest again
+makes the release unresolvable rather than fixed. r0093 therefore stays in
+published history unmodified; r0094 supersedes it.
+
+Packaging rule: **the first commit that introduces `deploy/releases/<id>.json`
+must also contain the descriptor, every inventory file and every attestation it
+declares.** Never commit an unsigned release. The order is: build the
+descriptor and manifest in the working tree, emit the statement, stop for
+offline signing, write the attestation into the same working tree, confirm the
+descriptor is unchanged, then make one release-introduction commit.
+
+`manage.py validate_protected_runtime_release` enforces this ("release-identity
+closure") and reports it as `release_identity` in its evidence:
+
+- `prospective_atomic` -- the manifest has never been committed (the correct
+  state during signing). Every artifact the manifest declares must exist in the
+  working tree and must not be Git-ignored.
+- `committed` -- the manifest is in history. The validator resolves the release
+  with production's own `introducing_commit()`, runs production's own
+  `materialize_candidate()` and `stage_attestations()` against that commit, and
+  then performs the complete authoring validation on bytes read from that
+  commit, never from the working tree. `--identity-tip` (default `HEAD`)
+  stands in for production's fetched canonical tip.
+
+Re-run the validator in `committed` mode on the release commit before any
+publication. The r0090/r0091/r0092 releases satisfy it; r0093 is rejected with
+production's exact error.
+
 ### Remaining limitations
 
 - The classifier itself is unchanged and deliberately conservative -- a
