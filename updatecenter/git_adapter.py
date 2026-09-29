@@ -308,6 +308,24 @@ def read_bytes_at_commit(checkout_root: Path, sha: str, relative_path: str) -> b
     return stdout
 
 
+def is_path_ignored(checkout_root: Path, relative_path: str) -> bool | None:
+    """Whether `git check-ignore` says `relative_path` is ignored in this
+    checkout (True/False), or None if that could not be determined. Read-only:
+    release authoring uses this to prove a declared artifact would not be
+    silently omitted from a `git add`."""
+    if relative_path.startswith("/") or ".." in Path(relative_path).parts:
+        raise ValueError(f"relative_path must be repo-relative with no '..': {relative_path!r}")
+    returncode, _ = _run_git_argv(
+        ["git", "-C", str(checkout_root), "check-ignore", "-q", "--", relative_path],
+        GIT_TIMEOUT_SECONDS,
+    )
+    if returncode == 0:
+        return True
+    if returncode == 1:
+        return False
+    return None
+
+
 def changed_paths_between(checkout_root: Path, before_sha: str, after_sha: str,
                           relative_dir: str) -> tuple[str, ...] | None:
     """Repo-relative changed paths below one directory, without checkout."""

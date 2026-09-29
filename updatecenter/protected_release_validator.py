@@ -37,7 +37,6 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
-import subprocess
 import sys
 import tempfile
 
@@ -249,15 +248,6 @@ def _production_repository(checkout: Path):
     return trusted_repository(Path(common.stdout), upstream="", branch="main", runner=command_runner())
 
 
-def _is_git_ignored(checkout: Path, relative: str) -> bool:
-    result = subprocess.run(
-        ["git", "-C", str(checkout), "check-ignore", "-q", "--", relative],
-        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        check=False, timeout=30,
-    )
-    return result.returncode == 0
-
-
 def _declared_paths(manifest_relative: str, field, descriptor_bytes: bytes) -> list[str]:
     """Every repo path production reads from the release's identity commit."""
     _runtime_modules()  # ensures deploy/updater_runtime is importable
@@ -288,8 +278,8 @@ def _verify_prospective_atomic(
     for relative in _declared_paths(manifest_relative, field, descriptor_file.read_bytes()):
         if not (checkout / relative).is_file():
             problems.append(f"{relative} is absent from the working tree")
-        elif _is_git_ignored(checkout, relative):
-            problems.append(f"{relative} is Git-ignored and would be omitted from the release commit")
+        elif git_adapter.is_path_ignored(checkout, relative) is not False:
+            problems.append(f"{relative} is Git-ignored (or ignore status is unknown) and would be omitted from the release commit")
     if problems:
         raise ProtectedReleaseValidationError(
             "release identity closure failed (prospective): the commit that first introduces "
