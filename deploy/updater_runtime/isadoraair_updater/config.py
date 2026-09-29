@@ -104,6 +104,17 @@ class StationConfig:
     def live_manage_py(self) -> Path:
         return self.application_root / "manage.py"
 
+    @property
+    def approvals_root(self) -> Path:
+        """Updater-owned approval store, outside the application schema.
+
+        Derive this from the existing root-owned jobs location so generation 8
+        can be activated on stations whose immutable configuration predates the
+        approval store.  Making this a required configuration key would create
+        another bootstrap dependency.
+        """
+        return self.jobs_root.parent / "migration-approvals"
+
 
 def _plain_string(value, field: str, *, maximum: int = 4096) -> str:
     if not isinstance(value, str) or not value or len(value) > maximum:

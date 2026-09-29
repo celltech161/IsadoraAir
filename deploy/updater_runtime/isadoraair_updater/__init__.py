@@ -16,7 +16,16 @@ installed under ``/usr/local/libexec/isadoraair-updater``.
 # ONLY for an actual wire-protocol shape change (new/changed request or
 # response fields) -- never merely because release-manifest execution
 # semantics changed; that is MANIFEST_PROTOCOL_VERSION's job below.
-PROTOCOL_VERSION = 3
+PROTOCOL_VERSION = 4
+# Generation 8 deliberately bridges the already-deployed v3 Django client and
+# CLI while introducing one v4-only action.  PING replies in the request's
+# version so an r0088 client does not mistake a compatible bridge for a break.
+SUPPORTED_WIRE_PROTOCOLS = (3, 4)
+# The protected-runtime handoff bridge is negotiated on the oldest protocol
+# this worker still promises to serve.  This lets generation 8 validate a
+# history containing v3-only intermediate generations while selecting the
+# newest effective candidate, and protects the still-installed r0088 client.
+HANDOFF_WIRE_PROTOCOL = SUPPORTED_WIRE_PROTOCOLS[0]
 
 # This package's own code version -- independent of both protocol
 # numbers above and below.
@@ -74,7 +83,13 @@ PROTOCOL_VERSION = 3
 # MANIFEST_PROTOCOL_VERSION bump, no BOOTSTRAP_PROTOCOL_VERSION bump --
 # this is a correctness fix to this package's own probe-parsing code,
 # not a change to any cross-process compatibility contract.
-RUNTIME_VERSION = 8
+#
+# 8 -> 9 (r0092 bootstrap recovery): approval authority moves out of the
+# application migration graph into the root-owned ApprovalStore. The staged
+# probe is discovery-only, the executor performs exact protected lookup, and
+# protocol v4 adds the narrow approval action while this generation continues
+# accepting v3 from the still-installed r0088 application.
+RUNTIME_VERSION = 9
 
 # The release-MANIFEST execution-semantics protocol (see release.py's
 # manual_blockers(), compared against each release's declared

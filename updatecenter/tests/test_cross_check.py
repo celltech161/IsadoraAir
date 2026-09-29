@@ -32,6 +32,55 @@ class MigrationCrossCheckTests(SimpleTestCase):
             with self.assertRaises(ValueError):
                 cc.cross_check_release(rel, "a" * 40, repo.work)
 
+    def test_r0092_newly_introduced_migration_must_be_declared(self):
+        with FakeRepo() as repo:
+            previous = repo.rev_parse("HEAD")
+            repo.write("sample/migrations/0001_initial.py", "# migration\n")
+            target = repo.commit("introduce migration without declaration")
+            rel = m.validate_manifest_dict(_valid_followup(
+                release_id="r0092", previous_release_id="r0091",
+                migrations_required=[], migration_compatibility=None,
+                python_requirements_changed=False, requirements_sha256=None,
+            ))
+            findings = cc.cross_check_release(
+                rel, target, repo.work, app_label_paths={"sample": "sample"},
+                previous_commit=previous,
+            )
+            self.assertTrue(any("absent from this release" in item.detail for item in findings))
+
+    def test_r0092_declared_new_migration_passes_completeness_guard(self):
+        with FakeRepo() as repo:
+            previous = repo.rev_parse("HEAD")
+            repo.write("sample/migrations/0001_initial.py", "# migration\n")
+            target = repo.commit("introduce declared migration")
+            rel = m.validate_manifest_dict(_valid_followup(
+                release_id="r0092", previous_release_id="r0091",
+                migrations_required=["sample.0001_initial"],
+                migration_compatibility="additive",
+                python_requirements_changed=False, requirements_sha256=None,
+            ))
+            findings = cc.cross_check_release(
+                rel, target, repo.work, app_label_paths={"sample": "sample"},
+                previous_commit=previous,
+            )
+            self.assertFalse(any("absent from this release" in item.detail for item in findings))
+
+    def test_pre_r0092_history_is_not_retroactively_subject_to_guard(self):
+        with FakeRepo() as repo:
+            previous = repo.rev_parse("HEAD")
+            repo.write("sample/migrations/0001_initial.py", "# migration\n")
+            target = repo.commit("historical migration")
+            rel = m.validate_manifest_dict(_valid_followup(
+                release_id="r0091", previous_release_id="r0090",
+                migrations_required=[], migration_compatibility=None,
+                python_requirements_changed=False, requirements_sha256=None,
+            ))
+            findings = cc.cross_check_release(
+                rel, target, repo.work, app_label_paths={"sample": "sample"},
+                previous_commit=previous,
+            )
+            self.assertFalse(any("absent from this release" in item.detail for item in findings))
+
 
 class RequirementsCrossCheckTests(SimpleTestCase):
     def test_matching_hash_not_flagged(self):

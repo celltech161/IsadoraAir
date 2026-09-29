@@ -287,8 +287,16 @@ def migration_plan_review(request, job_id):
     if denied:
         return denied
     job = get_object_or_404(UpdateJob, pk=job_id)
-    if job.state not in UpdateJobState.TERMINAL:
-        job, _reconciliation_error = _refresh_job(job)
+    # Root remains authoritative even for a terminal Job A. The database
+    # field is only a UI mirror and must not manufacture approval evidence.
+    try:
+        response = UpdaterClient().get_job_status(job.id)
+        root_job = response.get("job")
+        if isinstance(root_job, dict) and isinstance(root_job.get("migration_plan_review"), dict):
+            job.migration_plan_review = root_job["migration_plan_review"]
+    except BackendError:
+        if job.state not in UpdateJobState.TERMINAL:
+            job, _reconciliation_error = _refresh_job(job)
     review = job.migration_plan_review
     if not review:
         messages.info(request, "This job has no reviewed-migration-approval evidence to show.")
@@ -329,20 +337,35 @@ def approve_migration_plan(request, job_id):
         messages.error(request, "A written reason is required to approve a reviewed migration plan.")
         return redirect("updatecenter:migration-plan-review", job_id=job.id)
     try:
-        with transaction.atomic():
-            MigrationPlanApproval.objects.create(
-                target_release_id=review["release_id"],
-                target_commit=review.get("target_commit", ""),
-                migration_plan_digest=review["migration_plan_digest"],
-                manual_operations_snapshot=review.get("manual_operations", []),
-                source_job=job,
-                approved_by=request.user,
-                approved_by_username=request.user.get_username(),
-                reason=reason,
-            )
-    except IntegrityError:
-        messages.info(request, "This exact migration plan was already approved.")
+        UpdaterClient().approve_migration_plan(
+            job_id=job.id,
+            confirmed_migration_plan_digest=posted_digest,
+            approved_by_username=request.user.get_username(),
+            reason=reason,
+        )
+    except BackendError as exc:
+        messages.error(request, f"Protected updater rejected the approval: {exc}")
         return redirect("updatecenter:migration-plan-review", job_id=job.id)
+    # updatecenter.0003 remains an audit/compatibility mirror after bootstrap;
+    # this write has no authorization effect. Root accepted first.
+    try:
+        with transaction.atomic():
+            MigrationPlanApproval.objects.get_or_create(
+                target_release_id=review["release_id"],
+                migration_plan_digest=review["migration_plan_digest"],
+                defaults=dict(
+                    target_commit=review.get("target_commit", ""),
+                    manual_operations_snapshot=review.get("manual_operations", []),
+                    source_job=job,
+                    approved_by=request.user,
+                    approved_by_username=request.user.get_username(),
+                    reason=reason,
+                ),
+            )
+    except (IntegrityError, TypeError):
+        # Root approval is already durable and authoritative. Failure to write
+        # the optional application audit mirror must not misreport rejection.
+        pass
     messages.success(
         request,
         "Reviewed migration plan approved. Start a new update job to apply it -- this does not "

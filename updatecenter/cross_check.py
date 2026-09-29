@@ -20,12 +20,16 @@ anything in this module."""
 from __future__ import annotations
 
 import dataclasses
+from pathlib import Path
+import re
 
 from . import git_adapter, manifest as manifest_mod
 
 REQUIREMENTS_PATH = "requirements.txt"
 DEPLOY_DIR = "deploy"
 _PRE_GUARD_RELEASES = frozenset({"r0001", "r0002", "r0003", "r0004", "r0005"})
+_MIGRATION_COMPLETENESS_START = 92
+_MIGRATION_FILE = re.compile(r"^(?P<name>[0-9]{4}_[a-z0-9_]+)\.py$")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -57,9 +61,60 @@ def cross_check_release(rel: manifest_mod.ReleaseManifest, target_commit: str, c
     findings.extend(_check_requirements(rel, target_commit, checkout_root))
     findings.extend(_check_units(rel, target_commit, checkout_root))
     if previous_commit is not None:
+        findings.extend(_check_new_migrations_declared(
+            rel, previous_commit, target_commit, checkout_root,
+            app_label_paths or {},
+        ))
         findings.extend(_check_protected_runtime_intent(
             rel, previous_commit, target_commit, checkout_root,
         ))
+    return findings
+
+
+def _check_new_migrations_declared(rel, previous_commit, target_commit,
+                                   checkout_root, app_label_paths) -> list[CrossCheckFinding]:
+    """Prospective r0092+ guard against introducing undeclared migrations.
+
+    Historical manifests are immutable and predate this rule. Only files absent
+    at the predecessor and present at this release's target are considered
+    introduced; editing an old migration remains governed by review/signing and
+    is not silently reinterpreted as a new deployment declaration.
+    """
+    try:
+        release_number = int(rel.release_id[1:])
+    except (TypeError, ValueError):
+        return []
+    if release_number < _MIGRATION_COMPLETENESS_START:
+        return []
+    declared = set(rel.migrations_required)
+    findings = []
+    for app_label, package_dir in sorted(app_label_paths.items()):
+        migration_dir = f"{package_dir}/migrations"
+        changed = git_adapter.changed_paths_between(
+            checkout_root, previous_commit, target_commit, migration_dir,
+        )
+        if changed is None:
+            findings.append(CrossCheckFinding(
+                field="migrations_required",
+                detail=f"could not verify newly introduced migrations under {migration_dir}",
+            ))
+            continue
+        for path in changed:
+            match = _MIGRATION_FILE.fullmatch(Path(path).name)
+            if match is None:
+                continue
+            existed_before = git_adapter.path_exists_at_commit(checkout_root, previous_commit, path)
+            exists_at_target = git_adapter.path_exists_at_commit(checkout_root, target_commit, path)
+            if existed_before is False and exists_at_target is True:
+                ref = f"{app_label}.{match.group('name')}"
+                if ref not in declared:
+                    findings.append(CrossCheckFinding(
+                        field="migrations_required",
+                        detail=(
+                            f"{path} is newly introduced by {rel.release_id}, but {ref!r} "
+                            "is absent from this release's migrations_required"
+                        ),
+                    ))
     return findings
 
 

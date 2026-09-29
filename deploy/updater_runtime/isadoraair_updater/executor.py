@@ -9,7 +9,8 @@ import re
 import stat
 from urllib.parse import urlsplit
 
-from . import PROTOCOL_VERSION
+from . import HANDOFF_WIRE_PROTOCOL
+from .approvals import ApprovalError, ApprovalStore, approval_identity
 from .checkpoint import CheckpointError, create_checkpoint, verify_checkpoint
 from .config import StationConfig
 from .jobs import JobError, JobStore
@@ -129,22 +130,6 @@ def _valid_manual_operations(value, *, plan_refs: set[str]) -> bool:
     return True
 
 
-def _valid_approval(value) -> bool:
-    if value is None:
-        return True
-    if not isinstance(value, dict):
-        return False
-    if value.get("found") is False:
-        return set(value) == {"found"}
-    if value.get("found") is True:
-        return (
-            set(value) == {"found", "id", "approved_by", "approved_at"}
-            and isinstance(value["id"], str) and isinstance(value["approved_by"], str)
-            and isinstance(value["approved_at"], str)
-        )
-    return False
-
-
 _LEGACY_PROBE_KEYS = frozenset({
     "schema_version", "status", "plan", "nodes", "applied", "conflicts", "replacements",
 })
@@ -216,8 +201,8 @@ def _strict_probe(raw: bytes, *, review_context: bool) -> dict:
                 raise ExecutionError("PROBE_INVALID", f"migration probe {key} is not a valid digest")
         if not isinstance(payload["manual_operations"], list):
             raise ExecutionError("PROBE_INVALID", "migration probe manual_operations has an invalid type")
-        if not _valid_approval(payload["approval"]):
-            raise ExecutionError("PROBE_INVALID", "migration probe approval shape is invalid")
+        if payload["approval"] is not None:
+            raise ExecutionError("PROBE_INVALID", "migration probe must not supply approval authority")
         if not review_context and (
             payload["release_id"] is not None or payload["target_commit"] is not None
             or payload["manifest_sha256"] is not None or payload["migration_plan_digest"] is not None
@@ -248,8 +233,8 @@ def _strict_probe(raw: bytes, *, review_context: bool) -> dict:
     if review_context:
         if not _valid_manual_operations(payload["manual_operations"], plan_refs=seen):
             raise ExecutionError("PROBE_INVALID", "migration probe manual_operations shape is invalid")
-        if not _valid_approval(payload["approval"]):
-            raise ExecutionError("PROBE_INVALID", "migration probe approval shape is invalid")
+        if payload["approval"] is not None:
+            raise ExecutionError("PROBE_INVALID", "migration probe must not supply approval authority")
         if payload["manual_operations"] and payload["migration_plan_digest"] is None:
             raise ExecutionError("PROBE_INVALID", "migration probe has manual operations but no digest")
         if payload["approval"] is not None and not payload["manual_operations"]:
@@ -285,12 +270,14 @@ def _dependency_closure(nodes: dict[str, list[str]], expected: tuple[str, ...]) 
 class Executor:
     def __init__(self, config: StationConfig, store: JobStore, runner: CommandRunner,
                  *, systemd_manager: SystemdManager | None = None,
+                 approval_store: ApprovalStore | None = None,
                  expected_handoff_generation: int | None = None,
                  expected_handoff_descriptor_sha256: str | None = None,
                  expected_resumable_job_uuid: str | None = None,
                  active_policy=None):
         self.config = config
         self.store = store
+        self.approval_store = approval_store or ApprovalStore(config.approvals_root, store)
         self.runner = runner
         self.repository = TrustedRepository(config.trusted_repository, config.trusted_repository_url, config.trusted_branch, runner)
         # D4-P: this worker's OWN independently-loaded active signed
@@ -454,11 +441,25 @@ class Executor:
         # supplied by Django/a browser) already reports a match for.
         # See docs/UPDATE_CENTER.md's "Reviewed migration approval".
         if payload["manual_operations"]:
-            approval = payload["approval"]
-            if approval is not None and approval.get("found"):
+            try:
+                identity = approval_identity(
+                    target_release_id=payload["release_id"],
+                    target_commit=payload["target_commit"],
+                    target_manifest_sha256=payload["manifest_sha256"],
+                    migration_plan_digest=payload["migration_plan_digest"],
+                    trusted_plan_fingerprint=plan.fingerprint,
+                )
+                approval = self.approval_store.find(identity)
+            except ApprovalError as exc:
+                raise ExecutionError(
+                    "MIGRATION_APPROVAL_STORE_INVALID",
+                    f"protected approval store rejected the exact plan identity: {exc}",
+                    manual=True,
+                ) from exc
+            if approval is not None:
                 self.store.append_log(
                     job_id,
-                    f"reviewed migration approval {approval['id']} (by {approval['approved_by']} at "
+                    f"reviewed migration approval {approval['approval_id']} (by {approval['approved_by_username']} at "
                     f"{approval['approved_at']}) matched digest {payload['migration_plan_digest']} -- proceeding",
                 )
             else:
@@ -474,6 +475,7 @@ class Executor:
                         "target_commit": payload["target_commit"],
                         "manifest_sha256": payload["manifest_sha256"],
                         "migration_plan_digest": payload["migration_plan_digest"],
+                        "trusted_plan_fingerprint": plan.fingerprint,
                         "manual_operations": payload["manual_operations"],
                     },
                 )
@@ -645,7 +647,7 @@ class Executor:
                     release_id=transition.release_id,
                     previous_release_id=transition.previous_release_id,
                     previous_generation=runtime_state["active_generation"],
-                    current_bootstrap_protocol_version=1, current_wire_protocol_version=PROTOCOL_VERSION,
+                    current_bootstrap_protocol_version=1, current_wire_protocol_version=HANDOFF_WIRE_PROTOCOL,
                 )
                 if not outcome.ok:
                     raise ExecutionError(

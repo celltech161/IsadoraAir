@@ -62,7 +62,7 @@ class StrictProbeMigrationApprovalShapeTests(SimpleTestCase):
         with self.assertRaisesRegex(ExecutionError, "no digest"):
             _strict_probe(encode(payload), review_context=True)
 
-    def test_approval_present_without_any_manual_operations_is_rejected(self):
+    def test_probe_cannot_supply_approval_authority(self):
         """A forged "approval found" claim attached to a payload with
         nothing to approve is exactly the kind of manufactured-approval
         shape this must fail closed on."""
@@ -70,7 +70,7 @@ class StrictProbeMigrationApprovalShapeTests(SimpleTestCase):
             migration_plan_digest="a" * 64,
             approval={"found": True, "id": "x", "approved_by": "y", "approved_at": "z"},
         )
-        with self.assertRaisesRegex(ExecutionError, "approval with no manual operations"):
+        with self.assertRaisesRegex(ExecutionError, "must not supply approval authority"):
             _strict_probe(encode(payload), review_context=True)
 
     def test_malformed_digest_is_rejected(self):
@@ -89,7 +89,7 @@ class StrictProbeMigrationApprovalShapeTests(SimpleTestCase):
         with self.assertRaisesRegex(ExecutionError, "manual_operations shape"):
             _strict_probe(encode(payload), review_context=True)
 
-    def test_approval_shape_must_be_exactly_found_false_or_found_true_with_fields(self):
+    def test_every_non_null_approval_shape_is_rejected(self):
         base = valid_payload(
             migration_plan_digest="a" * 64,
             manual_operations=[{
@@ -98,6 +98,7 @@ class StrictProbeMigrationApprovalShapeTests(SimpleTestCase):
             }],
         )
         for bad_approval in (
+            {"found": False},
             {"found": True},  # missing id/approved_by/approved_at
             {"found": True, "id": 5, "approved_by": "y", "approved_at": "z"},  # wrong type
             {"maybe": "found"},  # unknown shape entirely

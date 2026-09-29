@@ -10,6 +10,7 @@ Update Center at all -- proven directly here rather than assumed.
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group
 from django.test import Client, TestCase, override_settings
+from unittest import mock
 
 from authz.models import Capability, GroupRole, Role, RoleCapability
 from updatecenter.models import MigrationPlanApproval, UpdateJob, UpdateJobState
@@ -33,6 +34,7 @@ def make_review(digest=DIGEST):
     return {
         "release_id": "r0089", "target_commit": "2" * 40, "manifest_sha256": "3" * 64,
         "migration_plan_digest": digest,
+        "trusted_plan_fingerprint": "4" * 64,
         "manual_operations": [{
             "ref": "authz.0001_initial", "operation_index": 0, "operation": "AddField",
             "classification": "manual", "detail": "non-null AddField uses relational field",
@@ -69,6 +71,14 @@ class ApprovalAuthorizationTests(TestCase):
             RoleCapability.objects.get_or_create(role=role, capability=capability)
         GroupRole.objects.get_or_create(group=sa_group, defaults={"role": role})
         self.station_admin_talent.groups.add(sa_group)
+        self.client_patch = mock.patch("updatecenter.views.UpdaterClient")
+        client_class = self.client_patch.start()
+        client_class.return_value.approve_migration_plan.return_value = {
+            "ok": True, "approval": {"approval_id": "root-owned"},
+        }
+
+    def tearDown(self):
+        self.client_patch.stop()
 
     def _approve_url(self, job=None):
         return f"/updates/jobs/{(job or self.job).id}/migration-review/approve/"
@@ -161,19 +171,13 @@ class ApprovalAuthorizationTests(TestCase):
         self.assertEqual(resp.status_code, 302)
         self.assertFalse(MigrationPlanApproval.objects.exists())
 
-    def test_forged_approval_row_for_another_release_never_matches(self):
-        """Directly proves an approval's identity is release+digest, not
-        digest alone -- a row for r0090 with the SAME digest string must
-        never satisfy a lookup for r0089."""
+    def test_application_approval_row_is_audit_only_not_probe_authority(self):
         MigrationPlanApproval.objects.create(
             target_release_id="r0090", target_commit="2" * 40,
             migration_plan_digest=DIGEST, approved_by_username="someone", reason="wrong release",
         )
-        from updatecenter.management.commands.updatecenter_probe import _lookup_approval
-        self.assertEqual(_lookup_approval(release_id="r0089", digest=DIGEST), {"found": False})
-        self.assertTrue(
-            _lookup_approval(release_id="r0090", digest=DIGEST)["found"]
-        )
+        from updatecenter.management.commands.updatecenter_probe import build_probe_payload
+        self.assertIsNone(build_probe_payload()["approval"])
 
     def test_job_without_migration_plan_review_redirects_with_message(self):
         empty_job = make_job(migration_plan_review=None, state=UpdateJobState.FAILED)

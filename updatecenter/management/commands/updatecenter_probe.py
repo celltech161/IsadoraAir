@@ -4,9 +4,10 @@ Roadmap: reviewed migration approval. When invoked with --release-id and
 --target-commit (only the protected executor's TARGET-schema probe call
 does this -- see executor.py's _validate_target_schema), this command
 also computes a canonical migration_plan_digest over the exact plan it
-just derived and independently looks up a matching
-updatecenter.models.MigrationPlanApproval row. This keeps the ENTIRE
-trust-sensitive recomputation inside this one process: it is always
+just derived. Approval lookup is intentionally NOT performed here: the
+first reviewed migration may create the application's former approval
+table, so authority lives in the protected updater's root-owned store.
+The trust-sensitive plan recomputation remains inside this process: it is always
 invoked by root, as ISA_USER, against a root-staged, provenance-verified
 target commit's OWN copy of this exact file -- never against the
 currently-running Gunicorn process's code, and never influenced by an
@@ -227,25 +228,6 @@ def compute_migration_plan_digest(*, release_id: str, target_commit: str, manife
     return hashlib.sha256(raw).hexdigest()
 
 
-def _lookup_approval(*, release_id: str, digest: str) -> dict:
-    from updatecenter.models import MigrationPlanApproval
-
-    row = (
-        MigrationPlanApproval.objects
-        .filter(target_release_id=release_id, migration_plan_digest=digest)
-        .order_by("-approved_at")
-        .first()
-    )
-    if row is None:
-        return {"found": False}
-    return {
-        "found": True,
-        "id": str(row.id),
-        "approved_by": row.approved_by_username,
-        "approved_at": row.approved_at.isoformat(),
-    }
-
-
 def build_probe_payload(*, release_id: str | None = None, target_commit: str | None = None):
     executor = MigrationExecutor(connection)
     loader = executor.loader
@@ -319,8 +301,6 @@ def build_probe_payload(*, release_id: str | None = None, target_commit: str | N
         payload["manifest_sha256"] = manifest_sha256
         payload["migration_plan_digest"] = digest
         payload["manual_operations"] = extract_manual_operations(plan)
-        if payload["manual_operations"]:
-            payload["approval"] = _lookup_approval(release_id=release_id, digest=digest)
     return payload
 
 
@@ -331,7 +311,7 @@ class Command(BaseCommand):
         parser.add_argument(
             "--release-id", default=None,
             help="Target release id (e.g. r0089). Only the protected executor's TARGET-schema "
-                 "probe call supplies this; enables migration_plan_digest/approval lookup.",
+                 "probe call supplies this; enables migration_plan_digest computation.",
         )
         parser.add_argument(
             "--target-commit", default=None,

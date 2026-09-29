@@ -1,137 +1,228 @@
-"""Reviewed migration approval -- r0089 principal acceptance fixture.
+"""Production-faithful r0088 -> r0092 reviewed-migration lifecycle.
 
-r0089 (roadmap 2.5's authz app + library.0085) is the real-world release
-that originally motivated this workorder: its migration set contains six
-operations the mechanical classifier cannot prove automatic (one
-ManyToManyField-through AddField, five RunPython data-seed operations).
-This file proves the mechanism discovers exactly that set NATURALLY, by
-rolling this test database back to its pre-r0089 state and running the
-real build_probe_payload() against the real migration graph -- nothing
-about r0089, authz, or these specific migration names is hard-coded
-anywhere in the implementation itself (see updatecenter_probe.py and
-executor.py: neither imports or references "r0089"/"authz" at all).
-
-Uses the same real-migration-rollback technique already established in
-test_phase_b_probe_integration.py's R0011/R0075 classes.
+The filename is retained to avoid silently dropping the former principal
+acceptance suite.  Unlike that suite, this fixture explicitly rolls
+updatecenter back to 0002 as well as authz/library, proving the target probe
+has no approval table available.
 """
-from django.contrib.auth import get_user_model
+from pathlib import Path
+import tempfile
+from unittest import mock
+import uuid
+
 from django.db import connection
 from django.db.migrations.executor import MigrationExecutor
-from django.test import Client, TransactionTestCase, override_settings
+from django.test import TransactionTestCase
 
+from .phase_b_helpers import PROJECT_ROOT, config_dict
+from .test_gen7_heterogeneous_probe_compatibility import _run_real_legacy_probe
+from isadoraair_updater.config import validate_config_dict
+from isadoraair_updater.executor import Executor, _strict_probe
+from isadoraair_updater.jobs import JobStore
+from isadoraair_updater.process import CommandRunner, ProcessResult
+from isadoraair_updater.release import TrustedPlan
+from isadoraair_updater.staging import StagedSource
+from updatecenter import release_chain
 from updatecenter.management.commands.updatecenter_probe import build_probe_payload
-from updatecenter.models import MigrationPlanApproval, UpdateJob, UpdateJobState
-
-User = get_user_model()
-
-R0089_TARGET_COMMIT = "0" * 40  # placeholder -- this test never touches git, only DB state
 
 
-@override_settings(SECURE_SSL_REDIRECT=False)
-class R0089AcceptanceTests(TransactionTestCase):
+R0088_COMMIT = "edc5d5c8f345ba18646db66a9a050093d1a076b0"
+R0092_TARGET_COMMIT = "b" * 40
+
+
+class RecordingSystemd:
+    def __init__(self):
+        self.reconciled = 0
+        self.restarted = []
+
+    def reconcile(self, source, plan):
+        self.reconciled += 1
+        return {}
+
+    def restart_declared(self, services):
+        self.restarted.extend(services)
+        return list(services)
+
+
+class ProductionStateExecutor(Executor):
+    """Real execute() state machine with only host mutations test-doubled."""
+
+    def __init__(self, *args, leaf_targets, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.leaf_targets = leaf_targets
+        self.live_head = R0088_COMMIT
+        self.migrate_calls = 0
+        self.source_advance_calls = 0
+        self.http_calls = 0
+        self.legacy_current = _strict_probe(_run_real_legacy_probe(), review_context=False)
+
+    def _live_identity(self):
+        return {"branch": "main", "head": self.live_head}
+
+    def _validate_current_schema(self):
+        # Actual r0088 script bytes, executed as a subprocess by the helper.
+        self.assert_current_probe_was_legacy = set(self.legacy_current) == {
+            "schema_version", "status", "plan", "nodes", "applied", "conflicts", "replacements",
+        }
+        return self.legacy_current
+
+    def _probe(self, source, *, release_id=None, target_commit=None):
+        if release_id is not None:
+            return build_probe_payload(release_id=release_id, target_commit=target_commit)
+        return build_probe_payload()
+
+    def _run_app(self, source, arguments, *, timeout):
+        if arguments[:2] == ["migrate", "--noinput"]:
+            self.migrate_calls += 1
+            MigrationExecutor(connection).migrate(self.leaf_targets)
+            return ProcessResult(tuple(arguments), 0, b"", b""), {}
+        raise AssertionError(f"unexpected application mutation: {arguments!r}")
+
+    def _advance_source(self, plan):
+        self.source_advance_calls += 1
+        self.live_head = plan.target_commit
+
+    def _postflight_http(self):
+        self.http_calls += 1
+
+
+class R0092ProductionBootstrapAcceptanceTests(TransactionTestCase):
+    reset_sequences = True
+
     def setUp(self):
-        self.executor = MigrationExecutor(connection)
-        self.pre_r0089_targets = [
-            ("authz", None),
-            ("library", "0084_alter_uitheme_logo_alter_uitheme_station_logo"),
+        migration_executor = MigrationExecutor(connection)
+        self.leaf_targets = migration_executor.loader.graph.leaf_nodes()
+        production_targets = []
+        for app_label, migration_name in self.leaf_targets:
+            if app_label == "authz":
+                continue
+            if app_label == "updatecenter":
+                migration_name = "0002_alter_updatejob_state"
+            elif app_label == "library":
+                migration_name = "0084_alter_uitheme_logo_alter_uitheme_station_logo"
+            production_targets.append((app_label, migration_name))
+        # Build forward from an actually empty disposable schema. This avoids
+        # relying on reversibility of data migrations and produces the exact
+        # migration-recorder state production has, including zero authz rows.
+        with connection.cursor() as cursor:
+            cursor.execute("DROP SCHEMA public CASCADE")
+            cursor.execute("CREATE SCHEMA public")
+        MigrationExecutor(connection).migrate(production_targets)
+        self.assertNotIn("updatecenter_migrationplanapproval", connection.introspection.table_names())
+
+        manifests = release_chain.load_manifest_files(PROJECT_ROOT / "deploy" / "releases")
+        chain = release_chain.build_chain(manifests)
+        transition = [
+            item.manifest for item in chain
+            if "r0088" < item.manifest.release_id <= "r0092"
         ]
-        self.leaf_targets = self.executor.loader.graph.leaf_nodes()
-        self.executor.migrate(self.pre_r0089_targets)
+        self.migration_refs = tuple(
+            ref for manifest in transition for ref in manifest.migrations_required
+        )
+        self.assertEqual(len(self.migration_refs), 9)
+        self.assertEqual(self.migration_refs[-1], "updatecenter.0003_updatejob_migration_plan_review_and_more")
+
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.config = validate_config_dict(
+            config_dict(self.root, str(self.root / "upstream.git")), allow_local_repository=True,
+        )
+        self.store = JobStore(self.config.jobs_root, self.config.logs_root, acquire_daemon_lock=False)
+        self.systemd = RecordingSystemd()
+        self.plan = TrustedPlan(
+            installed_release_id="r0088", installed_commit=R0088_COMMIT,
+            target_release_id="r0092", target_commit=R0092_TARGET_COMMIT,
+            releases_in_plan=tuple(item.release_id for item in transition),
+            migrations_required=self.migration_refs,
+            migration_compatibility="additive", python_requirements_changed=False,
+            apt_packages_new=(), systemd_units_changed=(), systemd_units_new_required=(),
+            systemd_units_new_optional=(), systemd_units_removed_or_renamed=(),
+            collectstatic_required=False,
+            services_requiring_restart=("isadoraair-gunicorn", "isadoraair-engine"),
+            nginx_changed=False, runtime_components_changed=False,
+            minimum_updater_protocol_version=5, manual_bootstrap_required=False,
+            fingerprint="f" * 64,
+            # Runtime handoff itself has dedicated integration coverage. This
+            # fixture starts at the accepted generation-8 mutation boundary.
+            protected_runtime_transition=None,
+        )
+        self.executor = ProductionStateExecutor(
+            self.config, self.store, CommandRunner(), systemd_manager=self.systemd,
+            leaf_targets=self.leaf_targets,
+        )
+        self.executor.repository.fetch = lambda: R0092_TARGET_COMMIT
 
     def tearDown(self):
         MigrationExecutor(connection).migrate(self.leaf_targets)
+        self.store.close()
+        self.temp.cleanup()
 
-    def test_discovers_exactly_six_manual_operations_naturally(self):
-        payload = build_probe_payload(release_id="r0089", target_commit=R0089_TARGET_COMMIT)
-        self.assertEqual(len(payload["manual_operations"]), 6)
-        refs = sorted({entry["ref"] for entry in payload["manual_operations"]})
-        self.assertEqual(refs, sorted([
-            "authz.0001_initial",
-            "authz.0002_seed_capabilities_and_roles",
-            "authz.0004_seed_schedule_access_config",
-            "authz.0006_correct_remote_host_playout_capability",
-            "authz.0007_authorization_closeout_capabilities",
-            "library.0085_remote_dj_queue_set_next_access",
-        ]))
-        # The one AddField (Role.capabilities, M2M-through) plus five
-        # RunPython -- exactly the shape investigated in the original
-        # r0089 report, discovered here mechanically, not asserted by fiat.
-        by_ref = {entry["ref"]: entry for entry in payload["manual_operations"]}
-        self.assertEqual(by_ref["authz.0001_initial"]["operation"], "AddField")
-        for ref in (
-            "authz.0002_seed_capabilities_and_roles", "authz.0004_seed_schedule_access_config",
-            "authz.0006_correct_remote_host_playout_capability",
-            "authz.0007_authorization_closeout_capabilities",
-            "library.0085_remote_dj_queue_set_next_access",
-        ):
-            self.assertEqual(by_ref[ref]["operation"], "RunPython")
+    def _accept(self):
+        job_id = str(uuid.uuid4())
+        self.store.accept(job_id, "r0092", self.plan.fingerprint)
+        return job_id
 
-    def test_produces_a_stable_digest_across_repeated_probes(self):
-        first = build_probe_payload(release_id="r0089", target_commit=R0089_TARGET_COMMIT)
-        second = build_probe_payload(release_id="r0089", target_commit=R0089_TARGET_COMMIT)
-        self.assertEqual(first["migration_plan_digest"], second["migration_plan_digest"])
-        self.assertIsNotNone(first["migration_plan_digest"])
-
-    def test_without_approval_reports_not_found_and_no_wildcard_matches(self):
-        payload = build_probe_payload(release_id="r0089", target_commit=R0089_TARGET_COMMIT)
-        self.assertEqual(payload["approval"], {"found": False})
-
-        # An approval for a DIFFERENT release must never match.
-        MigrationPlanApproval.objects.create(
-            target_release_id="r0090", target_commit=R0089_TARGET_COMMIT,
-            migration_plan_digest=payload["migration_plan_digest"],
-            approved_by_username="operator", reason="wrong release",
-        )
-        payload_again = build_probe_payload(release_id="r0089", target_commit=R0089_TARGET_COMMIT)
-        self.assertEqual(payload_again["approval"], {"found": False})
-
-        # An approval for r0089 with a WRONG (stale/forged) digest must
-        # never match either -- this is the "no wildcard approval" and
-        # "browser/forged digest cannot substitute" proof: only an
-        # approval whose digest is EXACTLY what this fresh, independent
-        # recomputation produced is ever honored.
-        MigrationPlanApproval.objects.create(
-            target_release_id="r0089", target_commit=R0089_TARGET_COMMIT,
-            migration_plan_digest="f" * 64,
-            approved_by_username="operator", reason="forged/stale digest",
-        )
-        payload_yet_again = build_probe_payload(release_id="r0089", target_commit=R0089_TARGET_COMMIT)
-        self.assertEqual(payload_yet_again["approval"], {"found": False})
-
-    def test_exact_approval_through_the_real_view_is_then_found(self):
-        payload = build_probe_payload(release_id="r0089", target_commit=R0089_TARGET_COMMIT)
-        digest = payload["migration_plan_digest"]
-
-        superuser = User.objects.create_superuser("r0089_su", "su@example.invalid", "pw")
-        job = UpdateJob.objects.create(
-            initiated_by=superuser, initiated_by_username="r0089_su",
-            installed_release_id="r0088", target_release_id="r0089",
-            installed_commit="1" * 40, target_commit=R0089_TARGET_COMMIT,
-            state=UpdateJobState.MANUAL_INTERVENTION_REQUIRED,
-            failure_classification="MIGRATION_OPERATION_MANUAL",
-            migration_plan_review={
-                "release_id": "r0089", "target_commit": R0089_TARGET_COMMIT,
-                "manifest_sha256": "a" * 64, "migration_plan_digest": digest,
-                "manual_operations": payload["manual_operations"],
-            },
-        )
-        client = Client()
-        client.force_login(superuser)
-        response = client.post(
-            f"/updates/jobs/{job.id}/migration-review/approve/",
-            {"confirmed_migration_plan_digest": digest, "reason": "Reviewed all six operations; safe."},
-        )
-        self.assertEqual(response.status_code, 302)
-        self.assertTrue(
-            MigrationPlanApproval.objects.filter(target_release_id="r0089", migration_plan_digest=digest).exists()
+    def _staged(self, job_id):
+        return StagedSource(
+            job_root=self.config.staging_root / job_id,
+            source_root=PROJECT_ROOT,
+            archive_path=self.config.staging_root / job_id / "target.tar",
         )
 
-        # Fresh, independent recomputation now finds it.
-        final_payload = build_probe_payload(release_id="r0089", target_commit=R0089_TARGET_COMMIT)
-        self.assertTrue(final_payload["approval"]["found"])
-        self.assertEqual(final_payload["approval"]["approved_by"], "r0089_su")
+    def test_two_distinct_jobs_discover_approve_recompute_and_apply_all_nine(self):
+        first_payload = build_probe_payload(
+            release_id="r0092", target_commit=R0092_TARGET_COMMIT,
+        )
+        self.assertEqual(tuple(item["ref"] for item in first_payload["plan"]), self.migration_refs)
+        self.assertEqual(len(first_payload["manual_operations"]), 6)
+        self.assertIsNone(first_payload["approval"])
 
-        # The ORIGINAL stopped job is untouched -- still exactly the
-        # historical record it was, never resumed/mutated by the approval.
-        job.refresh_from_db()
-        self.assertEqual(job.state, UpdateJobState.MANUAL_INTERVENTION_REQUIRED)
+        job_a = self._accept()
+        with mock.patch("isadoraair_updater.executor.derive_plan", return_value=self.plan), \
+                mock.patch("isadoraair_updater.executor.materialize", side_effect=lambda *args: self._staged(job_a)), \
+                mock.patch("isadoraair_updater.executor.cleanup"), \
+                mock.patch("isadoraair_updater.executor.create_checkpoint", return_value={"schema_version": 1}), \
+                mock.patch("isadoraair_updater.executor.verify_checkpoint", return_value=False):
+            result_a = self.executor.execute(job_a)
+
+        self.assertEqual(result_a["state"], "manual_intervention_required")
+        self.assertEqual(result_a["failure_classification"], "MIGRATION_OPERATION_MANUAL")
+        self.assertIn("target_staged", result_a["milestones"])
+        self.assertNotIn("migration_started", result_a["milestones"])
+        self.assertNotIn("source_advanced", result_a["milestones"])
+        self.assertEqual(self.executor.migrate_calls, 0)
+        self.assertEqual(self.executor.source_advance_calls, 0)
+        self.assertEqual(self.systemd.reconciled, 0)
+        self.assertNotIn("updatecenter_migrationplanapproval", connection.introspection.table_names())
+
+        review_before = dict(result_a["migration_plan_review"])
+        approval, created = self.executor.approval_store.create_from_job(
+            job_a,
+            confirmed_migration_plan_digest=review_before["migration_plan_digest"],
+            approved_by_username="release_operator",
+            reason="Reviewed all six operations against the r0088 schema and data.",
+        )
+        self.assertTrue(created)
+        self.assertEqual(self.store.load(job_a)["migration_plan_review"], review_before)
+
+        job_b = self._accept()
+        self.assertNotEqual(job_a, job_b)
+        with mock.patch("isadoraair_updater.executor.derive_plan", return_value=self.plan), \
+                mock.patch("isadoraair_updater.executor.materialize", side_effect=lambda *args: self._staged(job_b)), \
+                mock.patch("isadoraair_updater.executor.cleanup"), \
+                mock.patch("isadoraair_updater.executor.create_checkpoint", return_value={"schema_version": 1}), \
+                mock.patch("isadoraair_updater.executor.verify_checkpoint", return_value=False):
+            result_b = self.executor.execute(job_b)
+
+        self.assertEqual(result_b["state"], "succeeded")
+        self.assertEqual(self.executor.migrate_calls, 1)
+        self.assertEqual(self.executor.source_advance_calls, 1)
+        self.assertEqual(self.systemd.reconciled, 1)
+        self.assertEqual(self.systemd.restarted, ["isadoraair-gunicorn", "isadoraair-engine"])
+        self.assertIn("database_verified", result_b["milestones"])
+        self.assertIn("source_advanced", result_b["milestones"])
+        self.assertIn("updatecenter_migrationplanapproval", connection.introspection.table_names())
+        after = build_probe_payload()
+        self.assertEqual(after["plan"], [])
+        self.assertTrue(set(self.migration_refs).issubset(set(after["applied"])))
+        self.assertEqual(approval["source_job_id"], job_a)

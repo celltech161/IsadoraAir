@@ -6,7 +6,7 @@ import json
 import re
 import uuid
 
-from . import PROTOCOL_VERSION
+from . import SUPPORTED_WIRE_PROTOCOLS
 
 
 MAX_REQUEST_BYTES = 8192
@@ -14,10 +14,11 @@ MAX_RESPONSE_BYTES = 131072
 MAX_LOG_TAIL_BYTES = 65536
 RELEASE_ID = re.compile(r"^r[0-9]{4,}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
-ACTIONS = frozenset({
+LEGACY_ACTIONS = frozenset({
     "PING", "START_UPDATE", "GET_JOB_STATUS", "GET_JOB_LOG",
     "RESTART_OPERATOR_SERVICE", "STORE_ALSA_STATE", "GET_MAINTENANCE_STATUS",
 })
+ACTIONS = LEGACY_ACTIONS | {"APPROVE_MIGRATION_PLAN"}
 SYSTEMD_UNIT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.@-]{0,98}\.service$")
 
 
@@ -27,6 +28,7 @@ class ProtocolError(ValueError):
 
 @dataclasses.dataclass(frozen=True)
 class Request:
+    protocol_version: int
     action: str
     job_id: str | None = None
     requested_target_release_id: str | None = None
@@ -34,6 +36,9 @@ class Request:
     max_bytes: int | None = None
     service: str | None = None
     operation_id: str | None = None
+    confirmed_migration_plan_digest: str | None = None
+    approved_by_username: str | None = None
+    reason: str | None = None
 
 
 def _uuid(value, field="job_id") -> str:
@@ -60,27 +65,50 @@ def decode_request(raw: bytes) -> Request:
     action = data.get("action")
     if action not in ACTIONS:
         raise ProtocolError("unknown action")
+    version = data.get("protocol_version")
+    if not isinstance(version, int) or isinstance(version, bool) or version not in SUPPORTED_WIRE_PROTOCOLS:
+        raise ProtocolError("unsupported protocol_version")
+    if version == 3 and action not in LEGACY_ACTIONS:
+        raise ProtocolError("action is unavailable in protocol_version 3")
     required = {"PING": {"protocol_version", "action"},
                 "START_UPDATE": {"protocol_version", "action", "job_id", "requested_target_release_id", "expected_plan_fingerprint"},
                 "GET_JOB_STATUS": {"protocol_version", "action", "job_id"},
                 "GET_JOB_LOG": {"protocol_version", "action", "job_id", "max_bytes"},
                 "RESTART_OPERATOR_SERVICE": {"protocol_version", "action", "service"},
                 "STORE_ALSA_STATE": {"protocol_version", "action"},
-                "GET_MAINTENANCE_STATUS": {"protocol_version", "action", "operation_id"}}[action]
+                "GET_MAINTENANCE_STATUS": {"protocol_version", "action", "operation_id"},
+                "APPROVE_MIGRATION_PLAN": {
+                    "protocol_version", "action", "job_id",
+                    "confirmed_migration_plan_digest", "approved_by_username", "reason",
+                }}[action]
     if set(data) != required:
         raise ProtocolError(f"{action} fields must be exactly {sorted(required)!r}")
-    if data["protocol_version"] != PROTOCOL_VERSION or isinstance(data["protocol_version"], bool):
-        raise ProtocolError("unsupported protocol_version")
     if action in {"PING", "STORE_ALSA_STATE"}:
-        return Request(action=action)
+        return Request(protocol_version=version, action=action)
     if action == "RESTART_OPERATOR_SERVICE":
         service = data["service"]
         if not isinstance(service, str) or not SYSTEMD_UNIT.fullmatch(service):
             raise ProtocolError("service must be one exact syntactically valid .service name")
-        return Request(action=action, service=service)
+        return Request(protocol_version=version, action=action, service=service)
     if action == "GET_MAINTENANCE_STATUS":
-        return Request(action=action, operation_id=_uuid(data["operation_id"], "operation_id"))
+        return Request(protocol_version=version, action=action, operation_id=_uuid(data["operation_id"], "operation_id"))
     job_id = _uuid(data["job_id"])
+    if action == "APPROVE_MIGRATION_PLAN":
+        digest = data["confirmed_migration_plan_digest"]
+        operator = data["approved_by_username"]
+        reason = data["reason"]
+        if not isinstance(digest, str) or not SHA256.fullmatch(digest):
+            raise ProtocolError("confirmed_migration_plan_digest must be lowercase SHA-256")
+        if (not isinstance(operator, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.@+-]{0,149}", operator)):
+            raise ProtocolError("approved_by_username has an invalid shape")
+        if (not isinstance(reason, str) or not reason.strip() or len(reason) > 2000
+                or any(ch in reason for ch in ("\x00", "\r"))):
+            raise ProtocolError("reason is empty, invalid, or exceeds 2000 characters")
+        return Request(
+            protocol_version=version, action=action, job_id=job_id,
+            confirmed_migration_plan_digest=digest,
+            approved_by_username=operator, reason=reason,
+        )
     if action == "START_UPDATE":
         release = data["requested_target_release_id"]
         fingerprint = data["expected_plan_fingerprint"]
@@ -88,13 +116,17 @@ def decode_request(raw: bytes) -> Request:
             raise ProtocolError("requested_target_release_id must match r####")
         if not isinstance(fingerprint, str) or not SHA256.fullmatch(fingerprint):
             raise ProtocolError("expected_plan_fingerprint must be lowercase SHA-256")
-        return Request(action, job_id, release, fingerprint)
+        return Request(
+            protocol_version=version, action=action, job_id=job_id,
+            requested_target_release_id=release,
+            expected_plan_fingerprint=fingerprint,
+        )
     if action == "GET_JOB_LOG":
         maximum = data["max_bytes"]
         if not isinstance(maximum, int) or isinstance(maximum, bool) or not 1 <= maximum <= MAX_LOG_TAIL_BYTES:
             raise ProtocolError(f"max_bytes must be between 1 and {MAX_LOG_TAIL_BYTES}")
-        return Request(action, job_id, max_bytes=maximum)
-    return Request(action, job_id)
+        return Request(protocol_version=version, action=action, job_id=job_id, max_bytes=maximum)
+    return Request(protocol_version=version, action=action, job_id=job_id)
 
 
 def encode_response(data: dict) -> bytes:

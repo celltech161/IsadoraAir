@@ -18,7 +18,7 @@ sudo-policy verification, and final arming gate are maintained in
 The operator must edit the root-owned station identity deliberately, install a
 reviewed/rendered copy of `deploy/isadoraair-updater.service`, and complete the
 unrestricted-sudo remediation described in `docs/UPDATE_CENTER.md` before
-arming update execution. Protocol v3 maintenance requests may be exercised
+arming update execution. Protocol v3/v4 maintenance requests may be exercised
 while the updater remains disarmed; `START_UPDATE` cannot.
 
 Runtime v4 keeps protocol v3 and formalizes two boundaries discovered during
@@ -63,3 +63,13 @@ activation policy" and "Release-manifest protocol version" sections.
 If the trusted upstream uses SSH, provision a dedicated root-owned read-only
 deploy key and known-host entry separately. Do not reuse an application-owned
 SSH key or place credential material in `station.json`.
+
+Generation 8/runtime 9 is the r0092 approval-bootstrap recovery. It accepts
+wire v3 and v4; v4 adds only `APPROVE_MIGRATION_PLAN`. The authoritative
+approval store is derived from `jobs_root` at sibling
+`migration-approvals/`, root-owned 0700 with 0600 atomic records. The staged
+Django probe never reads approval state. For an r0088 application, an OS-root
+operator reviews and approves a terminal discovery job with this generation's
+`updaterctl.py migration-review` and `approve-migration-plan` commands, then
+starts a distinct execution job. Full commands and trust-boundary details are
+in `docs/UPDATE_CENTER.md`.

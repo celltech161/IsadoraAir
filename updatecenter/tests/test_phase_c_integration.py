@@ -92,7 +92,7 @@ class ReadinessTests(SimpleTestCase):
         The Install gate must compare a release's minimum against the
         manifest-semantics version, never backend_client.PROTOCOL_VERSION.
         """
-        self.assertEqual(PROTOCOL_VERSION, 3)
+        self.assertEqual(PROTOCOL_VERSION, 4)
         self.assertEqual(manifest_mod.UPDATER_PROTOCOL_VERSION, 5)
 
         request = SimpleNamespace(

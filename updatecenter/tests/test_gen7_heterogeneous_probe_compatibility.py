@@ -145,7 +145,7 @@ class Gen7HeterogeneousProbeCompatibilityTests(TransactionTestCase):
         self.assertEqual(target_payload["release_id"], "r0089")
         self.assertEqual(target_payload["target_commit"], R0089_TARGET_COMMIT)
         self.assertTrue(target_payload["manual_operations"], "r0089's real manual operations must be discovered")
-        self.assertEqual(target_payload["approval"], {"found": False})
+        self.assertIsNone(target_payload["approval"])
 
         # 7-8: execution progresses into migration-plan review and reaches
         # manual_intervention_required (MIGRATION_OPERATION_MANUAL) because
@@ -155,8 +155,10 @@ class Gen7HeterogeneousProbeCompatibilityTests(TransactionTestCase):
             releases_in_plan=("r0089",),
             migrations_required=tuple(sorted(item["ref"] for item in target_payload["plan"])),
             migration_compatibility="additive",
+            fingerprint="f" * 64,
         )
         validator = object.__new__(Executor)
+        validator.approval_store = types.SimpleNamespace(find=lambda identity: None)
         with self.assertRaises(ExecutionError) as caught:
             validator._validate_target_schema(
                 plan, target_payload, {"applied": current_payload["applied"]},
@@ -185,7 +187,7 @@ class Gen7HeterogeneousProbeCompatibilityTests(TransactionTestCase):
         current_payload.update({
             "release_id": "r0089", "target_commit": R0089_TARGET_COMMIT,
             "manifest_sha256": "a" * 64, "migration_plan_digest": "b" * 64,
-            "manual_operations": [], "approval": {"found": False},
+            "manual_operations": [], "approval": None,
         })
         with self.assertRaisesRegex(ExecutionError, "review evidence without review context"):
             _strict_probe(json.dumps(current_payload).encode("utf-8"), review_context=False)

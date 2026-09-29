@@ -15,7 +15,7 @@ from django.test import SimpleTestCase
 
 from .phase_b_helpers import config_dict
 from isadoraair_updater.config import validate_config_dict
-from isadoraair_updater.executor import ExecutionError, Executor
+from isadoraair_updater.executor import ExecutionError, Executor, dataclass_to_dict
 from isadoraair_updater.jobs import JobStore
 from isadoraair_updater.process import CommandRunner
 from isadoraair_updater.release import TrustedPlan
@@ -41,13 +41,13 @@ def trusted_plan(**changes):
 DIGEST = "d" * 64
 
 
-def probe_with_manual_op(*, approval=None):
+def probe_with_manual_op(**changes):
     operation = {"operation": "AddField", "classification": "manual", "detail": "non-null AddField uses relational field"}
     item = {
         "ref": "sample.0001_initial", "dependencies": [],
         "migration_file_sha256": "0" * 64, "operations": [operation],
     }
-    return {
+    payload = {
         "schema_version": 1, "status": "ok", "plan": [item],
         "nodes": {"sample.0001_initial": []},
         "applied": [], "conflicts": {}, "replacements": [],
@@ -58,8 +58,10 @@ def probe_with_manual_op(*, approval=None):
             "operation": "AddField", "classification": "manual",
             "detail": "non-null AddField uses relational field",
         }],
-        "approval": approval,
+        "approval": None,
     }
+    payload.update(changes)
+    return payload
 
 
 def probe_all_additive():
@@ -109,7 +111,7 @@ class ExecutorApprovalGateTests(SimpleTestCase):
     def test_manual_operation_with_no_approval_stops_manual_with_evidence(self):
         with self.assertRaises(ExecutionError) as caught:
             self.executor._validate_target_schema(
-                trusted_plan(), probe_with_manual_op(approval={"found": False}), {"applied": []}, self.job_id,
+                trusted_plan(), probe_with_manual_op(), {"applied": []}, self.job_id,
                 migration_already_started=False,
             )
         exc = caught.exception
@@ -118,6 +120,7 @@ class ExecutorApprovalGateTests(SimpleTestCase):
         self.assertIsNotNone(exc.migration_plan_review)
         self.assertEqual(exc.migration_plan_review["release_id"], "r0089")
         self.assertEqual(exc.migration_plan_review["migration_plan_digest"], DIGEST)
+        self.assertEqual(exc.migration_plan_review["trusted_plan_fingerprint"], "f" * 64)
         self.assertEqual(len(exc.migration_plan_review["manual_operations"]), 1)
 
     def test_manual_operation_with_no_approval_key_at_all_stops_manual(self):
@@ -126,15 +129,31 @@ class ExecutorApprovalGateTests(SimpleTestCase):
         an explicit not-found -- never silently permissive."""
         with self.assertRaises(ExecutionError) as caught:
             self.executor._validate_target_schema(
-                trusted_plan(), probe_with_manual_op(approval=None), {"applied": []}, self.job_id,
+                trusted_plan(), probe_with_manual_op(), {"applied": []}, self.job_id,
                 migration_already_started=False,
             )
         self.assertTrue(caught.exception.manual)
 
     def test_exact_matching_approval_proceeds_without_raising(self):
+        plan = trusted_plan()
+        payload = probe_with_manual_op()
+        self.store.update(self.job_id, trusted_plan=dataclass_to_dict(plan))
+        try:
+            self.executor._validate_target_schema(
+                plan, payload, {"applied": []}, self.job_id,
+                migration_already_started=False,
+            )
+        except ExecutionError as exc:
+            self.store.fail(
+                self.job_id, exc.classification, exc.detail, manual=exc.manual,
+                migration_plan_review=exc.migration_plan_review,
+            )
+        self.executor.approval_store.create_from_job(
+            self.job_id, confirmed_migration_plan_digest=DIGEST,
+            approved_by_username="operator", reason="Reviewed exact test plan.",
+        )
         actual = self.executor._validate_target_schema(
-            trusted_plan(),
-            probe_with_manual_op(approval={"found": True, "id": "approval-1", "approved_by": "op", "approved_at": "2026-01-01T00:00:00+00:00"}),
+            plan, payload,
             {"applied": []}, self.job_id,
             migration_already_started=False,
         )
@@ -147,14 +166,14 @@ class ExecutorApprovalGateTests(SimpleTestCase):
         with self.assertRaises(ExecutionError) as caught:
             self.executor._validate_target_schema(
                 trusted_plan(migration_compatibility="destructive"),
-                probe_with_manual_op(approval={"found": True, "id": "x", "approved_by": "op", "approved_at": "now"}),
+                probe_with_manual_op(),
                 {"applied": []}, self.job_id,
                 migration_already_started=False,
             )
         self.assertEqual(caught.exception.classification, "MIGRATION_NOT_AUTOMATABLE")
 
     def test_approval_never_bypasses_conflict_detection(self):
-        payload = probe_with_manual_op(approval={"found": True, "id": "x", "approved_by": "op", "approved_at": "now"})
+        payload = probe_with_manual_op()
         payload["conflicts"] = {"sample": ["0001_a", "0001_b"]}
         with self.assertRaises(ExecutionError) as caught:
             self.executor._validate_target_schema(
@@ -163,7 +182,7 @@ class ExecutorApprovalGateTests(SimpleTestCase):
         self.assertEqual(caught.exception.classification, "TARGET_MIGRATION_CONFLICT")
 
     def test_approval_never_bypasses_dependency_closure_mismatch(self):
-        payload = probe_with_manual_op(approval={"found": True, "id": "x", "approved_by": "op", "approved_at": "now"})
+        payload = probe_with_manual_op()
         payload["nodes"]["other.0001_initial"] = []
         payload["plan"].append({
             "ref": "other.0001_initial", "dependencies": [],

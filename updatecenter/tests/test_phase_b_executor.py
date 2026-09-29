@@ -54,11 +54,10 @@ def probe(plan=True, manual=False):
         # release/target/digest are None here on purpose: none of these
         # tests exercise the reviewed-approval path (see
         # test_migration_plan_executor_approval.py for that), only the
-        # existing "no approval possible -> still raise" default, which
-        # this reproduces exactly (manual_operations non-empty, approval
-        # None).
-        "release_id": None, "target_commit": None, "manifest_sha256": None,
-        "migration_plan_digest": None, "manual_operations": manual_operations, "approval": None,
+        # existing "no approval possible -> still raise" default.
+        "release_id": "r0003", "target_commit": "b" * 40, "manifest_sha256": "c" * 64,
+        "migration_plan_digest": "d" * 64 if manual_operations else None,
+        "manual_operations": manual_operations, "approval": None,
     }
 
 

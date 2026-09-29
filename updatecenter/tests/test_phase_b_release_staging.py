@@ -148,6 +148,37 @@ class TrustedReleaseTests(SimpleTestCase):
         plan = derive_plan(repo, tip, r2, "r0003")
         self.assertIn("PYTHON_REQUIREMENTS_MANUAL", manual_blockers(plan))
 
+    def test_r0092_protected_preflight_rejects_new_undeclared_migration(self):
+        _author, upstream, _bootstrap, r2, _r3 = create_release_repository(
+            self.root / "undeclared-migration",
+            third_release_id="r0092",
+            third_release_files={"sample/migrations/0001_initial.py": "# migration\n"},
+        )
+        repo = TrustedRepository(
+            self.root / "undeclared-migration.git", str(upstream), "main", CommandRunner(),
+        )
+        tip = repo.fetch()
+        with self.assertRaisesRegex(ReleaseError, "absent from migrations_required"):
+            derive_plan(repo, tip, r2, "r0092")
+
+    def test_r0092_protected_preflight_accepts_new_declared_migration(self):
+        _author, upstream, _bootstrap, r2, _r3 = create_release_repository(
+            self.root / "declared-migration",
+            third_release_id="r0092",
+            third_release_changes={
+                "migrations_required": ["sample.0001_initial"],
+                "migration_compatibility": "additive",
+            },
+        )
+        repo = TrustedRepository(
+            self.root / "declared-migration.git", str(upstream), "main", CommandRunner(),
+        )
+        tip = repo.fetch()
+        self.assertEqual(
+            derive_plan(repo, tip, r2, "r0092").migrations_required,
+            ("sample.0001_initial",),
+        )
+
     def test_explicit_manual_bootstrap_gate_aggregates_and_blocks_root_execution(self):
         _author, upstream, _bootstrap, r2, _r3 = create_release_repository(
             self.root / "manual-bootstrap",

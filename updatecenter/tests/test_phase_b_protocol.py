@@ -5,7 +5,7 @@ from django.test import SimpleTestCase
 
 from .phase_b_helpers import RUNTIME_ROOT  # also installs runtime on sys.path
 from isadoraair_updater.protocol import MAX_REQUEST_BYTES, ProtocolError, decode_request, encode_response
-from isadoraair_updater import PROTOCOL_VERSION, RUNTIME_VERSION
+from isadoraair_updater import PROTOCOL_VERSION, RUNTIME_VERSION, SUPPORTED_WIRE_PROTOCOLS
 
 
 def _request(**changes):
@@ -15,9 +15,26 @@ def _request(**changes):
 
 
 class StrictProtocolTests(SimpleTestCase):
-    def test_runtime_v8_keeps_wire_protocol_v3(self):
-        self.assertEqual(PROTOCOL_VERSION, 3)
-        self.assertEqual(RUNTIME_VERSION, 8)
+    def test_runtime_v9_bridges_wire_protocol_v3_and_v4(self):
+        self.assertEqual(PROTOCOL_VERSION, 4)
+        self.assertEqual(SUPPORTED_WIRE_PROTOCOLS, (3, 4))
+        self.assertEqual(RUNTIME_VERSION, 9)
+
+    def test_protocol_v3_remains_usable_for_legacy_actions(self):
+        decoded = decode_request(json.dumps({"protocol_version": 3, "action": "PING"}).encode())
+        self.assertEqual(decoded.protocol_version, 3)
+
+    def test_approval_action_requires_v4_and_exact_fields(self):
+        payload = {
+            "protocol_version": 4, "action": "APPROVE_MIGRATION_PLAN",
+            "job_id": str(uuid.uuid4()),
+            "confirmed_migration_plan_digest": "a" * 64,
+            "approved_by_username": "operator", "reason": "reviewed",
+        }
+        self.assertEqual(decode_request(json.dumps(payload).encode()).action, "APPROVE_MIGRATION_PLAN")
+        payload["protocol_version"] = 3
+        with self.assertRaises(ProtocolError):
+            decode_request(json.dumps(payload).encode())
 
     def test_ping_is_exact(self):
         self.assertEqual(decode_request(_request()).action, "PING")

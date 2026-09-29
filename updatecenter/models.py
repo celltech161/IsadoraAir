@@ -176,25 +176,14 @@ class UpdateJob(models.Model):
 
 
 class MigrationPlanApproval(models.Model):
-    """A privileged operator's explicit, reviewed sign-off for a specific,
-    exact migration plan the protected mechanical classifier could not
-    prove automatic on its own.
+    """Deprecated application audit mirror of a protected approval.
 
-    This is NOT a bypass switch and NOT bound merely to a release id --
-    see docs/UPDATE_CENTER.md's "Reviewed migration approval" section for
-    the full trust-boundary reasoning. In short: this row only ever
-    RECORDS a decision. The protected executor never trusts anything
-    written here directly -- on every job it independently re-fetches the
-    trusted target, re-stages it, and re-runs the exact same mechanical
-    classifier (updatecenter_probe) that produced the digest in the first
-    place, computed fresh from what is actually staged. Only if that
-    FRESH computation's own digest happens to equal a stored row's digest
-    does the executor treat the plan as reviewed -- an approval can never
-    be supplied by a browser/request and substituted for that
-    recomputation, and any change anywhere in the plan (a different
-    migration file, a different operation, a different order, a
-    different target commit, a different manifest) changes the digest
-    and silently stops matching, requiring fresh review.
+    Since r0092 the authoritative decision is a root-owned ApprovalStore
+    record outside the application migration graph. The web view asks that
+    protected authority to approve first and writes this row only afterward
+    for compatibility/display. Neither updatecenter_probe nor the executor
+    consults this model, which is essential when updatecenter.0003 (the
+    migration creating this table) is itself part of the reviewed plan.
 
     migration_plan_digest is intentionally NOT unique by itself --
     target_release_id is part of the identity too, since two different

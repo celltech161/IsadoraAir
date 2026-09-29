@@ -11,7 +11,8 @@ import struct
 import threading
 import uuid
 
-from . import BOOTSTRAP_PROTOCOL_VERSION, PROTOCOL_VERSION, RUNTIME_VERSION
+from . import BOOTSTRAP_PROTOCOL_VERSION, PROTOCOL_VERSION, RUNTIME_VERSION, SUPPORTED_WIRE_PROTOCOLS
+from .approvals import ApprovalError, ApprovalStore
 from .config import StationConfig
 from .executor import Executor
 from .jobs import JobError, JobStore
@@ -88,8 +89,10 @@ class UpdaterDaemon:
         self.expected_handoff_descriptor_sha256 = expected_handoff_descriptor_sha256
         self.expected_resumable_job_uuid = expected_resumable_job_uuid
         self.store = store or JobStore(config.jobs_root, config.logs_root)
+        self.approval_store = ApprovalStore(config.approvals_root, self.store)
         self.executor = executor or Executor(
             config, self.store, self.runner,
+            approval_store=self.approval_store,
             expected_handoff_generation=expected_handoff_generation,
             expected_handoff_descriptor_sha256=expected_handoff_descriptor_sha256,
             expected_resumable_job_uuid=expected_resumable_job_uuid,
@@ -276,7 +279,7 @@ class UpdaterDaemon:
             candidate_generation=self.expected_handoff_generation,
             candidate_descriptor_sha256=self.expected_handoff_descriptor_sha256,
             bootstrap_protocol_version=BOOTSTRAP_PROTOCOL_VERSION,
-            supported_wire_protocols=(PROTOCOL_VERSION,),
+            supported_wire_protocols=SUPPORTED_WIRE_PROTOCOLS,
             config_parsed=True,
             privilege_drop_self_check_passed=self._protected_runtime_valid,
             job_store_ready=self.store._lock_handle is not None,
@@ -289,7 +292,8 @@ class UpdaterDaemon:
         if request.action == "PING":
             return {
                 "ok": True,
-                "protocol_version": PROTOCOL_VERSION,
+                "protocol_version": request.protocol_version,
+                "supported_wire_protocols": list(SUPPORTED_WIRE_PROTOCOLS),
                 "runtime_version": RUNTIME_VERSION,
                 "protected_runtime_valid": self._protected_runtime_valid,
                 "config_valid": True,
@@ -327,6 +331,19 @@ class UpdaterDaemon:
                 raise
             self._ensure_worker(request.job_id)
             return {"ok": True, "accepted": True, "idempotent": not created, "job_id": request.job_id, "state": state["state"]}
+        if request.action == "APPROVE_MIGRATION_PLAN":
+            record, created = self.approval_store.create_from_job(
+                request.job_id,
+                confirmed_migration_plan_digest=request.confirmed_migration_plan_digest,
+                approved_by_username=request.approved_by_username,
+                reason=request.reason,
+            )
+            return {
+                "ok": True,
+                "approved": True,
+                "idempotent": not created,
+                "approval": record,
+            }
         if request.action == "RESTART_OPERATOR_SERVICE":
             if request.service not in self.config.operator_restart_units:
                 raise ProtocolError("service is outside the root-owned operator restart allowlist")
@@ -368,7 +385,7 @@ class UpdaterDaemon:
                 raise ProtocolError("peer is not authorized")
             request = decode_request(raw_request)
             response = self._dispatch(request)
-        except (ProtocolError, JobError) as exc:
+        except (ProtocolError, JobError, ApprovalError) as exc:
             response = {"ok": False, "error": type(exc).__name__, "detail": str(exc)[:500]}
         except TimeoutError:
             response = {

@@ -7,7 +7,7 @@ import socket
 import uuid
 
 
-PROTOCOL_VERSION = 3
+PROTOCOL_VERSION = 4
 MAX_RESPONSE_BYTES = 131072
 
 
@@ -79,6 +79,18 @@ class UpdaterClient:
 
     def get_job_status(self, job_id: uuid.UUID) -> dict:
         return self._request({"protocol_version": PROTOCOL_VERSION, "action": "GET_JOB_STATUS", "job_id": str(job_id)})
+
+    def approve_migration_plan(self, *, job_id: uuid.UUID,
+                               confirmed_migration_plan_digest: str,
+                               approved_by_username: str, reason: str) -> dict:
+        return self._request({
+            "protocol_version": PROTOCOL_VERSION,
+            "action": "APPROVE_MIGRATION_PLAN",
+            "job_id": str(job_id),
+            "confirmed_migration_plan_digest": confirmed_migration_plan_digest,
+            "approved_by_username": approved_by_username,
+            "reason": reason,
+        })
 
     def get_job_log(self, job_id: uuid.UUID, *, max_bytes: int = 32768) -> str:
         response = self._request({

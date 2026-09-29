@@ -8,7 +8,7 @@ import json
 from pathlib import Path, PurePosixPath
 import re
 
-from . import BOOTSTRAP_PROTOCOL_VERSION, MANIFEST_PROTOCOL_VERSION, PROTOCOL_VERSION
+from . import BOOTSTRAP_PROTOCOL_VERSION, HANDOFF_WIRE_PROTOCOL, MANIFEST_PROTOCOL_VERSION
 from .process import CommandRunner, ProcessResult
 from .security import assert_root_protected, assert_root_protected_parents
 
@@ -161,6 +161,8 @@ FORBIDDEN_FIELDS = frozenset({
     "script", "exec", "release_commit", "commit", "sha", "git_sha",
 })
 APP_MIGRATION_PATHS = {"tts": "isadoraair/tts"}
+MIGRATION_COMPLETENESS_START_RELEASE = 92
+MIGRATION_FILENAME_RE = re.compile(r"^[0-9]{4}_[a-z0-9_]+\.py$")
 
 
 class ReleaseError(ValueError):
@@ -802,7 +804,7 @@ def _cross_check(repository: TrustedRepository, previous_commit: str, entry: Cha
         protected_runtime_field=manifest.protected_runtime,
         previous_generation=_previous_protected_runtime_generation(repository, chain, entry.index),
         current_bootstrap_protocol_version=BOOTSTRAP_PROTOCOL_VERSION,
-        current_wire_protocol_version=PROTOCOL_VERSION,
+        current_wire_protocol_version=HANDOFF_WIRE_PROTOCOL,
     )
     if not protected_runtime_result.ok:
         raise ReleaseError(
@@ -814,6 +816,24 @@ def _cross_check(repository: TrustedRepository, previous_commit: str, entry: Cha
         root = APP_MIGRATION_PATHS.get(app, app)
         if not repository.path_exists(entry.commit, f"{root}/migrations/{name}.py"):
             raise ReleaseError(f"{manifest.release_id}: declared migration {ref} is absent from its commit")
+    if int(manifest.release_id[1:]) >= MIGRATION_COMPLETENESS_START_RELEASE:
+        declared_paths = {
+            f"{APP_MIGRATION_PATHS.get(app, app)}/migrations/{name}.py"
+            for app, name in (ref.split(".", 1) for ref in manifest.migrations_required)
+        }
+        introduced = set()
+        for status, path in repository.changed_paths(previous_commit, entry.commit, "."):
+            pure = PurePosixPath(path)
+            if (status == "A" and len(pure.parts) >= 3
+                    and pure.parts[-2] == "migrations"
+                    and MIGRATION_FILENAME_RE.fullmatch(pure.name)):
+                introduced.add(path)
+        undeclared = introduced - declared_paths
+        if undeclared:
+            raise ReleaseError(
+                f"{manifest.release_id}: newly introduced migration file(s) "
+                f"{sorted(undeclared)!r} are absent from migrations_required"
+            )
     if manifest.python_requirements_changed:
         requirements = repository.read_file(entry.commit, "requirements.txt")
         if requirements is None or hashlib.sha256(requirements).hexdigest() != manifest.requirements_sha256:

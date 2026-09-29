@@ -438,6 +438,51 @@ class DaemonPeerTests(SimpleTestCase):
         response = self._roundtrip(daemon, {"protocol_version": 3, "action": "PING"})
         self.assertTrue(response["ok"])
 
+    def test_v4_approval_action_derives_authority_from_root_job(self):
+        job_id = str(uuid.uuid4())
+        fingerprint = "f" * 64
+        digest = "d" * 64
+        self.store.accept(job_id, "r0092", fingerprint)
+        self.store.update(job_id, trusted_plan={
+            "target_release_id": "r0092", "target_commit": "b" * 40,
+            "fingerprint": fingerprint, "releases_in_plan": ["r0092"],
+            "migrations_required": ["sample.0001_initial"],
+        })
+        self.store.fail(
+            job_id, "MIGRATION_OPERATION_MANUAL", "manual", manual=True,
+            migration_plan_review={
+                "release_id": "r0092", "target_commit": "b" * 40,
+                "manifest_sha256": "c" * 64,
+                "migration_plan_digest": digest,
+                "trusted_plan_fingerprint": fingerprint,
+                "manual_operations": [{
+                    "ref": "sample.0001_initial", "operation_index": 0,
+                    "operation": "RunPython", "classification": "manual",
+                    "detail": "outside automatic allowlist",
+                }],
+            },
+        )
+        daemon = UpdaterDaemon(
+            self.config, store=self.store, executor=_NeverExecutor(),
+            authorized_uids={os.getuid()}, authorized_gids=set(),
+        )
+        response = self._roundtrip(daemon, {
+            "protocol_version": 4, "action": "APPROVE_MIGRATION_PLAN",
+            "job_id": job_id, "confirmed_migration_plan_digest": digest,
+            "approved_by_username": "operator", "reason": "reviewed",
+        })
+        self.assertTrue(response["ok"])
+        self.assertEqual(response["approval"]["source_job_id"], job_id)
+
+    def test_v3_ping_receives_v3_compatible_reply(self):
+        daemon = UpdaterDaemon(
+            self.config, store=self.store, executor=_NeverExecutor(),
+            authorized_uids={os.getuid()}, authorized_gids=set(),
+        )
+        response = self._roundtrip(daemon, {"protocol_version": 3, "action": "PING"})
+        self.assertEqual(response["protocol_version"], 3)
+        self.assertEqual(response["supported_wire_protocols"], [3, 4])
+
     def test_bad_peer_denied_before_dispatch(self):
         daemon = UpdaterDaemon(
             self.config, store=self.store, executor=_NeverExecutor(),

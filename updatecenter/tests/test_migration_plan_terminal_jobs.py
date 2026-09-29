@@ -11,6 +11,7 @@ r0089 job, 0053ede7-ffca-46e8-b163-c3f8aa5226c4, is exactly this shape).
 import json
 from pathlib import Path
 import tempfile
+from unittest import mock
 
 from django.contrib.auth import get_user_model
 from django.test import Client, TestCase, override_settings
@@ -94,6 +95,7 @@ class ApprovalDoesNotMutateSourceJobTests(TestCase):
         self.review = {
             "release_id": "r0089", "target_commit": "2" * 40, "manifest_sha256": "3" * 64,
             "migration_plan_digest": "a" * 64,
+            "trusted_plan_fingerprint": "4" * 64,
             "manual_operations": [{"ref": "authz.0001_initial", "operation_index": 0, "operation": "AddField", "classification": "manual", "detail": "x"}],
         }
         self.job = UpdateJob.objects.create(
@@ -106,6 +108,14 @@ class ApprovalDoesNotMutateSourceJobTests(TestCase):
         self.before_state = self.job.state
         self.before_finished_at = self.job.finished_at
         self.before_review = json.loads(json.dumps(self.job.migration_plan_review))
+        self.client_patch = mock.patch("updatecenter.views.UpdaterClient")
+        client_class = self.client_patch.start()
+        client_class.return_value.approve_migration_plan.return_value = {
+            "ok": True, "approval": {"approval_id": "root-owned"},
+        }
+
+    def tearDown(self):
+        self.client_patch.stop()
 
     def test_approving_never_changes_the_source_jobs_own_fields(self):
         client = Client()

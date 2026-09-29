@@ -49,13 +49,17 @@
     <div class="uc-row"><span class="k">Job</span><span class="v">{{ job.id }}</span></div>
     <div class="uc-row"><span class="k">Target release</span><span class="v">{{ review.release_id }}</span></div>
     <div class="uc-row"><span class="k">Trusted target commit</span><span class="v">{{ review.target_commit }}</span></div>
+    <div class="uc-row"><span class="k">Target manifest SHA-256</span><span class="v uc-digest">{{ review.manifest_sha256 }}</span></div>
+    <div class="uc-row"><span class="k">Trusted-plan fingerprint</span><span class="v uc-digest">{{ review.trusted_plan_fingerprint }}</span></div>
     <div class="uc-row"><span class="k">Migration plan digest</span><span class="v uc-digest">{{ review.migration_plan_digest }}</span></div>
     <p class="uc-note">
       This digest is a deterministic fingerprint of the exact release, target commit, release
       manifest, and every migration operation in this plan (including each migration file's own
       content). Any change to any of that -- a different commit, a different migration, an added,
       removed, reordered, or reclassified operation -- produces a different digest. An approval
-      below only ever matches this EXACT plan; it can never be reused for a changed one.
+      below only ever matches this EXACT plan and trusted release chain; it can never be
+      reused for a changed one. The protected updater—not this application database—is
+      the approval authority.
     </p>
   </section>
 
