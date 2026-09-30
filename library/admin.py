@@ -45,6 +45,8 @@ from .models import (
     RotationSlot,
     RoyaltyReport,
     ScheduleBlock,
+    ScheduleProfile,
+    ScheduleProfileState,
     Genre,
     FXBusConfig,
     FXCart,
@@ -579,11 +581,73 @@ class PlaylistAdmin(SortableAdminBase, admin.ModelAdmin):
         return obj._item_count
 
 
+@admin.register(ScheduleProfile)
+class ScheduleProfileAdmin(admin.ModelAdmin):
+    """Inspection/engineering surface only. Profile lifecycle (create,
+    clone, activate, archive) belongs to the /schedule/ UI; the active and
+    default profiles are shown but only changed through ScheduleProfileState,
+    and deletion is disabled here (referenced profiles are PROTECTed anyway)."""
+    list_display = ["name", "uuid", "role", "sort_order", "is_archived", "block_count", "created_at"]
+    list_filter = ["is_archived"]
+    search_fields = ["name", "uuid"]
+    readonly_fields = ["uuid", "is_archived", "created_at", "updated_at"]
+
+    def get_queryset(self, request):
+        return super().get_queryset(request).annotate(_block_count=Count("schedule_blocks"))
+
+    @admin.display(description="Blocks", ordering="_block_count")
+    def block_count(self, obj):
+        return obj._block_count
+
+    @admin.display(description="Role")
+    def role(self, obj):
+        # Read-only lookup: an admin display must never recover or rewrite
+        # the state row (ScheduleProfileState.load() may create it).
+        state = ScheduleProfileState.objects.filter(pk=1).first()
+        if state is None:
+            return "state missing"
+        roles = []
+        if obj.pk == state.active_profile_id:
+            roles.append("ACTIVE")
+        if obj.pk == state.default_profile_id:
+            roles.append("DEFAULT")
+        return ", ".join(roles)
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+
+@admin.register(ScheduleProfileState)
+class ScheduleProfileStateAdmin(admin.ModelAdmin):
+    """Read-only view of the active/default pointers. Deliberately not
+    editable here so activation cannot happen as an unaudited admin click."""
+    list_display = ["__str__", "active_profile", "default_profile", "updated_at"]
+    readonly_fields = ["active_profile", "default_profile", "updated_at"]
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+
 @admin.register(ScheduleBlock)
 class ScheduleBlockAdmin(admin.ModelAdmin):
-    list_display = ["__str__", "rotation", "playlist", "start_time", "end_time"]
-    list_filter = ["day_of_week", "rotation", "playlist"]
+    list_display = ["__str__", "profile", "rotation", "playlist", "start_time", "end_time"]
+    list_filter = ["profile", "day_of_week", "rotation", "playlist"]
     autocomplete_fields = ["rotation", "playlist"]
+
+    def get_changeform_initial_data(self, request):
+        initial = super().get_changeform_initial_data(request)
+        # Read-only lookup; if the state row is missing the field is simply
+        # left for the operator to choose explicitly.
+        active_id = ScheduleProfileState.objects.filter(pk=1).values_list("active_profile_id", flat=True).first()
+        if active_id is not None:
+            initial.setdefault("profile", active_id)
+        return initial
 
 
 class LogItemInline(admin.TabularInline):
@@ -595,8 +659,10 @@ class LogItemInline(admin.TabularInline):
 
 @admin.register(PlaylistLog)
 class PlaylistLogAdmin(admin.ModelAdmin):
-    list_display = ["date", "hour", "status", "generated_at"]
-    list_filter = ["status", "date"]
+    list_display = ["date", "hour", "status", "schedule_profile", "generated_at"]
+    list_filter = ["status", "schedule_profile", "date"]
+    # Provenance is a record of what happened at generation time.
+    readonly_fields = ["schedule_profile"]
     inlines = [LogItemInline]
 
 

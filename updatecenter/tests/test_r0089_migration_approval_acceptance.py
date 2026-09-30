@@ -14,6 +14,7 @@ import uuid
 
 from django.db import connection
 from django.db.migrations.executor import MigrationExecutor
+from django.db.migrations.graph import MigrationGraph
 from django.test import TransactionTestCase
 
 from .phase_b_helpers import PROJECT_ROOT, config_dict
@@ -27,6 +28,28 @@ from isadoraair_updater.staging import StagedSource
 from protected_bootstrap.manifest_field import parse_protected_runtime_field
 from updatecenter import release_chain
 from updatecenter.management.commands.updatecenter_probe import build_probe_payload
+
+# This is a historical r0088 -> r0092 simulation, but the probe always reports
+# every pending migration in the checkout it inspects and this suite runs it
+# against the live working tree. Migrations added after r0092 (3.1A's
+# library.0086-0088, and any later ones) therefore must not leak into the
+# simulated r0092 plan: pin the library leaf to the one r0092 shipped. Every
+# other app already sits at its r0092-era leaf.
+R0092_LIBRARY_LEAF = ("library", "0085_remote_dj_queue_set_next_access")
+
+
+def _r0092_leaf_nodes(nodes):
+    return [R0092_LIBRARY_LEAF if node[0] == "library" else node for node in nodes]
+
+
+def r0092_tree_probe(**kwargs):
+    original = MigrationGraph.leaf_nodes
+
+    def leaf_nodes(graph, app=None):
+        return _r0092_leaf_nodes(original(graph, app))
+
+    with mock.patch.object(MigrationGraph, "leaf_nodes", leaf_nodes):
+        return build_probe_payload(**kwargs)
 
 
 R0088_COMMIT = "edc5d5c8f345ba18646db66a9a050093d1a076b0"
@@ -106,8 +129,8 @@ class ProductionStateExecutor(Executor):
 
     def _probe(self, source, *, release_id=None, target_commit=None):
         if release_id is not None:
-            return build_probe_payload(release_id=release_id, target_commit=target_commit)
-        return build_probe_payload()
+            return r0092_tree_probe(release_id=release_id, target_commit=target_commit)
+        return r0092_tree_probe()
 
     def _run_app(self, source, arguments, *, timeout):
         if arguments[:2] == ["migrate", "--noinput"]:
@@ -129,7 +152,8 @@ class R0092ProductionBootstrapAcceptanceTests(TransactionTestCase):
 
     def setUp(self):
         migration_executor = MigrationExecutor(connection)
-        self.leaf_targets = migration_executor.loader.graph.leaf_nodes()
+        self.current_leaf_targets = migration_executor.loader.graph.leaf_nodes()
+        self.leaf_targets = _r0092_leaf_nodes(self.current_leaf_targets)
         production_targets = []
         for app_label, migration_name in self.leaf_targets:
             if app_label == "authz":
@@ -205,7 +229,7 @@ class R0092ProductionBootstrapAcceptanceTests(TransactionTestCase):
         PersistentSupervisor.acceptance_confirmations = []
 
     def tearDown(self):
-        MigrationExecutor(connection).migrate(self.leaf_targets)
+        MigrationExecutor(connection).migrate(self.current_leaf_targets)
         self.store.close()
         self.temp.cleanup()
 
@@ -222,7 +246,7 @@ class R0092ProductionBootstrapAcceptanceTests(TransactionTestCase):
         )
 
     def test_two_distinct_jobs_discover_approve_recompute_and_apply_all_nine(self):
-        first_payload = build_probe_payload(
+        first_payload = r0092_tree_probe(
             release_id="r0092", target_commit=R0092_TARGET_COMMIT,
         )
         self.assertEqual(tuple(item["ref"] for item in first_payload["plan"]), self.migration_refs)
@@ -325,7 +349,7 @@ class R0092ProductionBootstrapAcceptanceTests(TransactionTestCase):
         republish_runtime.assert_not_called()
         self.assertEqual(len(PersistentSupervisor.activation_requests), 1)
         self.assertIn("updatecenter_migrationplanapproval", connection.introspection.table_names())
-        after = build_probe_payload()
+        after = r0092_tree_probe()
         self.assertEqual(after["plan"], [])
         self.assertTrue(set(self.migration_refs).issubset(set(after["applied"])))
         self.assertEqual(approval["source_job_id"], job_a)

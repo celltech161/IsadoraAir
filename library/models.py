@@ -685,6 +685,117 @@ class PlaylistItem(models.Model):
 
 
 # ---------------------------------------------------------------
+# ScheduleProfile - a named, stable schedule namespace (roadmap 3.1)
+# ---------------------------------------------------------------
+
+class ScheduleProfileStateError(RuntimeError):
+    """The active/default schedule profile pointers are missing and cannot
+    be reconstructed without guessing."""
+
+
+class ScheduleProfile(models.Model):
+    """A named schedule namespace. Every ScheduleBlock (weekly recurring
+    AND one-off specific_date) belongs to exactly one profile, and
+    schedule resolution never crosses profiles: a specific-date block in
+    profile A has no effect while resolving profile B, and a missing
+    block in the selected profile does NOT fall through to another one.
+
+    `uuid` is the immutable, station-independent identity that future
+    schedule-aware features and portable configuration can reference;
+    the integer pk stays the convenient internal key. The name is only a
+    label. "Which profile is in use" lives in ScheduleProfileState, never
+    in a per-row flag, so there is exactly one authoritative pointer.
+
+    Lifecycle (create/clone/activate/archive UI) arrives in a later
+    release; `is_archived` is reserved for it. Profiles referenced by a
+    ScheduleBlock or a generated PlaylistLog cannot be deleted (PROTECT)."""
+    uuid = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+    name = models.CharField(max_length=100, unique=True)
+    description = models.TextField(blank=True, default="")
+    sort_order = models.IntegerField(default=0)
+    is_archived = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["sort_order", "name"]
+
+    def __str__(self):
+        return self.name
+
+
+class ScheduleProfileState(models.Model):
+    """Singleton (pk=1) holding the two distinct profile pointers.
+
+    * active_profile  -- the profile used for NEW schedule resolution now.
+    * default_profile -- the persistent normal/fallback profile that later
+      lifecycle/event features return to.
+
+    Both start out pointing at the migrated "Default Schedule". Changing
+    the active pointer never rewrites existing PlaylistLogs and never
+    rebuilds already-built future logs."""
+    active_profile = models.ForeignKey(
+        ScheduleProfile, on_delete=models.PROTECT, related_name="+",
+    )
+    default_profile = models.ForeignKey(
+        ScheduleProfile, on_delete=models.PROTECT, related_name="+",
+    )
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Schedule Profile State"
+        verbose_name_plural = "Schedule Profile State"
+
+    def __str__(self):
+        return f"Active: {self.active_profile}; Default: {self.default_profile}"
+
+    def save(self, *args, **kwargs):
+        self.pk = 1
+        super().save(*args, **kwargs)
+
+    @classmethod
+    def load(cls):
+        """The state row, with both profiles loaded in the same query.
+
+        The 3.1A migration always creates it, so a missing row is an
+        abnormal state and this fails closed rather than guessing:
+
+        * row exists -> returned as is;
+        * row missing and EXACTLY ONE profile exists -> the row is
+          recreated with that sole profile as both active and default
+          (there is nothing to choose between);
+        * row missing and several profiles exist -> ScheduleProfileStateError.
+          Which one is active or default is a station decision; picking by
+          pk, sort order, name or archive flag could silently switch the
+          on-air schedule;
+        * row missing and no profile exists -> ScheduleProfileStateError.
+          Configuration is never manufactured at runtime."""
+        related = ("active_profile", "default_profile")
+        try:
+            return cls.objects.select_related(*related).get(pk=1)
+        except cls.DoesNotExist:
+            pass
+        profile_ids = list(ScheduleProfile.objects.values_list("pk", flat=True)[:2])
+        if len(profile_ids) != 1:
+            raise ScheduleProfileStateError(
+                "ScheduleProfileState is missing and cannot be reconstructed safely: "
+                + ("no schedule profile exists" if not profile_ids
+                   else "more than one schedule profile exists, so the active and default "
+                        "profiles are ambiguous")
+                + ". Restore the singleton row (pk=1) with the intended active_profile and "
+                  "default_profile; nothing was changed."
+            )
+        cls.objects.get_or_create(
+            pk=1, defaults={"active_profile_id": profile_ids[0], "default_profile_id": profile_ids[0]},
+        )
+        return cls.objects.select_related(*related).get(pk=1)
+
+    @classmethod
+    def get_active_profile(cls):
+        return cls.load().active_profile
+
+
+# ---------------------------------------------------------------
 # ScheduleBlock - maps a Rotation or Playlist onto real time
 # ---------------------------------------------------------------
 
@@ -699,15 +810,24 @@ class ScheduleBlock(models.Model):
     Content: exactly one of (rotation, playlist) must be set — also
     enforced by check constraint.
 
-    Precedence is implicit, not an explicit priority field: a
-    ScheduleBlock with specific_date matching that date always wins
-    over a recurring day_of_week match. Holiday specials and one-off
-    remote broadcasts just override transparently."""
+    Precedence is implicit, not an explicit priority field: within one
+    profile, a ScheduleBlock with specific_date matching that date always
+    wins over a recurring day_of_week match. Holiday specials and one-off
+    remote broadcasts just override transparently.
+
+    Every block belongs to exactly one ScheduleProfile. Within a profile
+    a recurring slot is unique by (day_of_week, start_time) and a dated
+    slot by (specific_date, start_time) -- exact start_time, not hour, so
+    several blocks with different start times inside one hour remain
+    representable later."""
     DAY_CHOICES = [
         (0, "Monday"), (1, "Tuesday"), (2, "Wednesday"), (3, "Thursday"),
         (4, "Friday"), (5, "Saturday"), (6, "Sunday"),
     ]
 
+    profile = models.ForeignKey(
+        ScheduleProfile, on_delete=models.PROTECT, related_name="schedule_blocks",
+    )
     day_of_week = models.PositiveSmallIntegerField(choices=DAY_CHOICES, null=True, blank=True)
     specific_date = models.DateField(null=True, blank=True)
     start_time = models.TimeField()
@@ -737,6 +857,19 @@ class ScheduleBlock(models.Model):
                     | models.Q(rotation__isnull=True, playlist__isnull=False)
                 ),
                 name="scheduleblock_exactly_one_of_rotation_or_playlist",
+            ),
+            # One side of day_of_week/specific_date is always NULL, so
+            # plain NULL-tolerant uniqueness would never fire; these are
+            # partial (conditional) unique constraints per block kind.
+            models.UniqueConstraint(
+                fields=["profile", "day_of_week", "start_time"],
+                condition=models.Q(day_of_week__isnull=False),
+                name="scheduleblock_unique_weekly_slot_per_profile",
+            ),
+            models.UniqueConstraint(
+                fields=["profile", "specific_date", "start_time"],
+                condition=models.Q(specific_date__isnull=False),
+                name="scheduleblock_unique_dated_slot_per_profile",
             ),
         ]
 
@@ -771,6 +904,16 @@ class PlaylistLog(models.Model):
     hour = models.PositiveSmallIntegerField(default=0)
     generated_at = models.DateTimeField(auto_now=True)
     status = models.CharField(max_length=10, choices=STATUS_CHOICES, default="draft")
+    # Provenance: the profile actually used when this log was generated
+    # (captured once at build start, never re-derived from the current
+    # active pointer). NULL means legacy/unknown -- logs generated before
+    # profiles existed, or built directly from a chosen playlist rather
+    # than by schedule resolution. Historical rows are deliberately NOT
+    # backfilled: assigning them to a profile would manufacture history.
+    schedule_profile = models.ForeignKey(
+        ScheduleProfile, on_delete=models.PROTECT, null=True, blank=True,
+        related_name="playlist_logs",
+    )
 
     class Meta:
         ordering = ["-date", "hour"]
@@ -782,8 +925,9 @@ class PlaylistLog(models.Model):
 
 class LogItem(models.Model):
     """One scheduled track within a PlaylistLog, produced by the
-    rotation walker: ScheduleBlock -> Clock -> ClockSlot -> Rotation ->
-    RotationSlot (by weight) -> Category -> Track.
+    rotation walker: ScheduleProfile -> ScheduleBlock -> Rotation ->
+    RotationSlot (by weight) -> Category -> Track (or ScheduleBlock ->
+    Playlist -> PlaylistItem -> Track). There is no Clock/ClockSlot layer.
 
     track_title/track_artist are a snapshot of the track's identity at
     the moment this LogItem was created -- kept independent of the live

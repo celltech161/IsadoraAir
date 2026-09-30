@@ -21,6 +21,7 @@ from library.models import (
     PlaylistLog,
     RecencyConfig,
     ScheduleBlock,
+    ScheduleProfileState,
     Track,
 )
 from library.services.related_artists import track_identity_keys
@@ -185,28 +186,37 @@ def _music_holiday_pool(chosen_holiday_codes, target_datetime):
     return qs
 
 
-def resolve_schedule_block(target_date, hour):
-    """Find the ScheduleBlock that applies to a given date+hour. A
-    specific_date match always beats a recurring day_of_week match."""
-    t = time(hour, 0)
+def get_active_schedule_profile():
+    """The ScheduleProfile used for NEW schedule resolution right now
+    (ScheduleProfileState.active_profile). One indexed query. Callers that
+    perform a multi-step operation (a log build, an API request) must call
+    this ONCE at their boundary and pass the resulting profile down, never
+    re-read it per step."""
+    return ScheduleProfileState.get_active_profile()
 
-    block = (
+
+def resolve_schedule_block(target_date, hour, profile=None):
+    """Find the ScheduleBlock that applies to a given date+hour WITHIN ONE
+    PROFILE: that profile's specific_date match, else that profile's
+    recurring day_of_week match, else None. It never falls through to
+    another profile, and a specific-date block in one profile never affects
+    another. `profile` is a concrete ScheduleProfile; omitted, the active
+    profile is used (compatibility for callers that only ask "is this hour
+    scheduled?" and do not build)."""
+    if profile is None:
+        profile = get_active_schedule_profile()
+    t = time(hour, 0)
+    in_profile = (
         ScheduleBlock.objects
-        .filter(specific_date=target_date, start_time=t)
+        .filter(profile=profile, start_time=t)
         .select_related("rotation", "playlist")
-        .first()
     )
+
+    block = in_profile.filter(specific_date=target_date).first()
     if block:
         return block
 
-    dow = target_date.weekday()
-    block = (
-        ScheduleBlock.objects
-        .filter(day_of_week=dow, start_time=t, specific_date__isnull=True)
-        .select_related("rotation", "playlist")
-        .first()
-    )
-    return block
+    return in_profile.filter(day_of_week=target_date.weekday(), specific_date__isnull=True).first()
 
 
 def _tracks_for_category(category, target_datetime=None):
@@ -1322,7 +1332,8 @@ def fill_remaining_hour(picks, accumulated_seconds, target_datetime,
     return picks, accumulated_seconds
 
 
-def _build_from_rotation(target_date, hour, rotation, target_duration_seconds=NOMINAL_HOUR_SECONDS):
+def _build_from_rotation(target_date, hour, rotation, target_duration_seconds=NOMINAL_HOUR_SECONDS,
+                         schedule_profile=None):
     slots = list(
         rotation.slots
         .select_related("category__kind", "track", "track__category__kind", "track__artist")
@@ -1596,10 +1607,11 @@ def _build_from_rotation(target_date, hour, rotation, target_duration_seconds=NO
     else:
         print(f"  Hour log selection diagnostics for {target_date} {hour:02d}:00 (healthy, no monitoring event needed):", diagnostics_detail)
 
-    return _persist_log(target_date, hour, picks)
+    return _persist_log(target_date, hour, picks, schedule_profile=schedule_profile)
 
 
-def _build_from_playlist(target_date, hour, playlist, target_duration_seconds=NOMINAL_HOUR_SECONDS):
+def _build_from_playlist(target_date, hour, playlist, target_duration_seconds=NOMINAL_HOUR_SECONDS,
+                         schedule_profile=None):
     items = list(
         playlist.items
         .select_related("track", "track__category", "track__artist")
@@ -1630,17 +1642,22 @@ def _build_from_playlist(target_date, hour, playlist, target_duration_seconds=NO
         picks, accumulated_seconds, target_datetime,
         target_duration_seconds=target_duration_seconds,
     )
-    return _persist_log(target_date, hour, picks)
+    return _persist_log(target_date, hour, picks, schedule_profile=schedule_profile)
 
 
-def _persist_log(target_date, hour, picks):
+def _persist_log(target_date, hour, picks, schedule_profile=None):
     """Delete-then-recreate is only safe as one atomic unit -- an
     exception (or a concurrent process crash) between the delete and the
     bulk_create used to be able to leave an hour with NO PlaylistLog row
     at all, a state _install_built_hour/_ensure_log_building have no
     recovery path for short of the next AUTO_BUILD_CHECK_SECONDS tick
     rebuilding from scratch. Wrapping in transaction.atomic() makes the
-    whole delete+create+bulk_create sequence all-or-nothing."""
+    whole delete+create+bulk_create sequence all-or-nothing.
+
+    `schedule_profile` is the profile this build actually resolved under
+    (captured once by build_hour_log); it is recorded as the log's
+    provenance. None (a build not driven by schedule resolution, e.g. "play
+    this playlist now") records NULL -- never a guess at the active profile."""
     with transaction.atomic():
         PlaylistLog.objects.filter(date=target_date, hour=hour).delete()
 
@@ -1648,6 +1665,7 @@ def _persist_log(target_date, hour, picks):
             date=target_date,
             hour=hour,
             status="draft",
+            schedule_profile=schedule_profile,
         )
 
         log_items = [
@@ -1695,15 +1713,27 @@ def append_fill_items(log, picks, start_position):
     return log_items
 
 
-def build_hour_log(target_date, hour, target_duration_seconds=NOMINAL_HOUR_SECONDS):
-    block = resolve_schedule_block(target_date, hour)
+def build_hour_log(target_date, hour, target_duration_seconds=NOMINAL_HOUR_SECONDS, schedule_profile=None):
+    """Build (and persist as a draft) the log for one hour. The schedule
+    profile is captured exactly once here -- the supplied concrete profile,
+    else the active profile -- then used for both resolution and the
+    persisted provenance, so a concurrent active-profile change can never
+    make one build resolve under one profile and record another."""
+    profile = schedule_profile if schedule_profile is not None else get_active_schedule_profile()
+    block = resolve_schedule_block(target_date, hour, profile=profile)
     if block is None:
         return None, "No schedule block for this hour."
 
     if block.playlist_id:
-        return _build_from_playlist(target_date, hour, block.playlist, target_duration_seconds=target_duration_seconds)
+        return _build_from_playlist(
+            target_date, hour, block.playlist,
+            target_duration_seconds=target_duration_seconds, schedule_profile=profile,
+        )
     if block.rotation_id:
-        return _build_from_rotation(target_date, hour, block.rotation, target_duration_seconds=target_duration_seconds)
+        return _build_from_rotation(
+            target_date, hour, block.rotation,
+            target_duration_seconds=target_duration_seconds, schedule_profile=profile,
+        )
 
     return None, "ScheduleBlock has neither rotation nor playlist."
 
@@ -1808,7 +1838,7 @@ def _describe_track_issues(track, prefix, issues):
         issues.append({"severity": "warning", "message": f"{prefix}: '{label}' is not marked ready2air."})
 
 
-def preview_hour_log(target_date, hour, target_duration_seconds=NOMINAL_HOUR_SECONDS):
+def preview_hour_log(target_date, hour, target_duration_seconds=NOMINAL_HOUR_SECONDS, schedule_profile=None):
     """Read-only dry run of the same schedule-block/rotation/playlist walk
     as build_hour_log, for health-checking a rotation or playlist without
     touching PlaylistLog/LogItem at all -- never persists anything, so it
@@ -1819,7 +1849,8 @@ def preview_hour_log(target_date, hour, target_duration_seconds=NOMINAL_HOUR_SEC
     (empty categories, missing analysis, an under-filled hour), not for
     previewing an exact future log."""
     issues = []
-    block = resolve_schedule_block(target_date, hour)
+    profile = schedule_profile if schedule_profile is not None else get_active_schedule_profile()
+    block = resolve_schedule_block(target_date, hour, profile=profile)
     if block is None:
         issues.append({"severity": "error", "message": f"No schedule block covers {target_date} hour {hour}."})
         return {

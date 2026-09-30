@@ -37,7 +37,10 @@ from django.test import TransactionTestCase
 from django.utils import timezone
 
 import library.services.engine as eng_module
-from library.models import Category, CategoryKind, LogItem, PlaylistLog, Rotation, ScheduleBlock
+from library.models import (
+    Category, CategoryKind, LogItem, PlaylistLog, Rotation, ScheduleBlock,
+)
+from library.tests.schedule_profile_helpers import ensure_schedule_profile_state
 from library.services.log_builder import (
     LOCK_CONTENDED,
     build_and_approve_hour_log_locked,
@@ -92,6 +95,7 @@ class HourLogFixtureMixin:
 
     def make_schedule_block(self, d, hour, *, specific=True):
         return ScheduleBlock.objects.create(
+            profile=ensure_schedule_profile_state().active_profile,
             specific_date=d if specific else None,
             day_of_week=None if specific else d.weekday(),
             start_time=dt_time(hour, 0),

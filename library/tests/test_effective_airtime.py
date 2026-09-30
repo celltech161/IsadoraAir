@@ -38,6 +38,7 @@ from library.models import (
     Artist, Category, CategoryKind, LogItem, Playlist, PlaylistItem,
     Rotation, RotationSlot, ScheduleBlock, Track,
 )
+from library.tests.schedule_profile_helpers import ensure_schedule_profile_state
 from library.services.log_builder import (
     DURATION_FIT_MARGIN,
     _build_from_playlist,
@@ -253,6 +254,7 @@ class CrossPathAirtimeConsistencyTests(TestCase):
         RotationSlot.objects.create(rotation=rotation, position=0, track=self.ref_track)
         RotationSlot.objects.create(rotation=rotation, position=1, track=self.marker_track)
         ScheduleBlock.objects.create(
+            profile=ensure_schedule_profile_state().active_profile,
             specific_date=date(2027, 5, 13), start_time=time(9, 0), end_time=time(10, 0), rotation=rotation,
         )
 

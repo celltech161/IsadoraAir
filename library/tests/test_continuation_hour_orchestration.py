@@ -27,6 +27,7 @@ from library.models import (
     ScheduleBlock,
     Track,
 )
+from library.tests.schedule_profile_helpers import ensure_schedule_profile_state
 
 
 FRIDAY = date(2027, 3, 5)
@@ -61,6 +62,10 @@ def make_stand_in():
 class ContinuationHourOrchestrationTests(TransactionTestCase):
     def setUp(self):
         super().setUp()
+        # Blank-hour scenarios create no ScheduleBlock, yet the engine still
+        # resolves against the active profile; a TransactionTestCase flush
+        # removed the migration's profile state and production never recreates it.
+        ensure_schedule_profile_state()
         self.tempdir = tempfile.TemporaryDirectory()
         self.addCleanup(self.tempdir.cleanup)
         kind = CategoryKind.objects.create(
@@ -116,6 +121,7 @@ class ContinuationHourOrchestrationTests(TransactionTestCase):
         rotation=None,
     ):
         return ScheduleBlock.objects.create(
+            profile=ensure_schedule_profile_state().active_profile,
             specific_date=target_date if specific else None,
             day_of_week=None if specific else target_date.weekday(),
             start_time=dt_time(hour, 0),

@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "release_id": "r0096",
+  "previous_release_id": "r0095",
+  "minimum_updater_protocol_version": 5,
+  "summary": "P1 3.1A Schedule Profile Foundation. Adds a stable ScheduleProfile identity and singleton active/default state, migrates the existing schedule into one 'Default Schedule' (ambiguous data aborts; nothing is merged or deleted), and makes schedule resolution and new PlaylistLog provenance profile-aware, failing closed if profile state is ambiguous. /schedule/ is unchanged; no profile UI or minute scheduling yet. Avoid editing /schedule/ while this release installs.",
+  "migrations_required": [
+    "library.0086_scheduleprofile_foundation_schema",
+    "library.0087_backfill_default_schedule_profile",
+    "library.0088_enforce_schedule_profile_integrity"
+  ],
+  "migration_compatibility": "additive",
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-gunicorn",
+    "isadoraair-engine"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0081",
+  "protected_runtime": null
+}

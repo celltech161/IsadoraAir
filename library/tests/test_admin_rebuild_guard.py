@@ -11,7 +11,10 @@ from django.test import TestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
 
-from library.models import Category, CategoryKind, PlaylistLog, Rotation, RotationSlot, ScheduleBlock
+from library.models import (
+    Category, CategoryKind, PlaylistLog, Rotation, RotationSlot, ScheduleBlock,
+)
+from library.tests.schedule_profile_helpers import ensure_schedule_profile_state
 from library.views import _is_active_or_imminent_hour
 
 
@@ -20,6 +23,7 @@ def make_schedule_block(target_date, hour, rotation):
     ScheduleBlock fixture for resolve_schedule_block's exact
     start_time == time(hour, 0) matching."""
     return ScheduleBlock.objects.create(
+        profile=ensure_schedule_profile_state().active_profile,
         specific_date=target_date, start_time=time(hour, 0),
         end_time=time((hour + 1) % 24, 0), rotation=rotation,
     )

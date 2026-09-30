@@ -25,7 +25,10 @@ from authz.evaluator import authorize, forbidden_response
 from isadoraair.engine_commands import EngineCommandError, enqueue_engine_command
 
 from .models import Artist, Album, Category, CategoryKind, Genre, Holiday, LogItem, Playlist, PlaylistItem, PlaylistLog, Rotation, RotationSlot, ScheduleBlock, Track
-from .services.log_builder import LOCK_CONTENDED, _build_from_playlist, build_hour_log_for_admin, preview_hour_log
+from .services.log_builder import (
+    LOCK_CONTENDED, _build_from_playlist, build_hour_log_for_admin, get_active_schedule_profile,
+    preview_hour_log,
+)
 from .services.remote_dj_connection import browser_ice_servers, mint_remote_dj_token
 from .services.related_artists import (
     autofill_related_artists_for_queryset, canonicalize_related_artists,
@@ -93,10 +96,14 @@ def _block_to_dict(b):
 
 @require_http_methods(["GET", "POST"])
 def api_schedule_list(request):
+    # 3.1A: the ordinary /schedule/ page still shows ONE schedule -- the
+    # active profile's. The profile is read once per request and used for
+    # both the read and the write below; the request/response shape is
+    # unchanged from r0095.
     if request.method == "GET":
         blocks = (
             ScheduleBlock.objects
-            .filter(day_of_week__isnull=False)
+            .filter(profile=get_active_schedule_profile(), day_of_week__isnull=False)
             .select_related("rotation", "playlist")
             .order_by("day_of_week", "start_time")
         )
@@ -144,6 +151,7 @@ def api_schedule_list(request):
         defaults["rotation"] = None
 
     block, created = ScheduleBlock.objects.update_or_create(
+        profile=get_active_schedule_profile(),
         day_of_week=day_of_week,
         start_time=time(hour, 0),
         specific_date=None,
@@ -161,7 +169,9 @@ def api_schedule_delete(request, pk):
     if not result:
         return forbidden_response(result, user=request.user, capability_slug="schedule.edit")
 
-    deleted, _ = ScheduleBlock.objects.filter(pk=pk).delete()
+    # Scoped to the active profile so a block id can never silently delete
+    # a block belonging to a different profile.
+    deleted, _ = ScheduleBlock.objects.filter(pk=pk, profile=get_active_schedule_profile()).delete()
     return JsonResponse({"ok": True, "deleted": deleted > 0})
 
 
