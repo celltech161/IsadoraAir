@@ -293,12 +293,62 @@
     .schedule-wrap { display: none; }
     .mobile-schedule { display: block; }
   }
+
+  .profile-panel { background: var(--panel-bg); border: 1px solid var(--border-subtle); border-radius: 8px; padding: .75rem; margin-bottom: .85rem; }
+  .profile-row, .profile-actions, .mode-row { display: flex; align-items: center; gap: .45rem; flex-wrap: wrap; }
+  .profile-row select, .profile-row input { background: var(--bg-darker); color: var(--text-main); border: 1px solid var(--border-subtle); border-radius: 6px; padding: .42rem .55rem; }
+  .profile-row select { min-width: 230px; }
+  .profile-actions { margin-top: .6rem; }
+  .profile-actions button, .mode-row button, .date-cell button { background: var(--bg-dark); color: var(--text-main); border: 1px solid var(--border-subtle); border-radius: 6px; padding: .38rem .55rem; cursor: pointer; }
+  .profile-actions button:hover, .mode-row button:hover { border-color: var(--accent); }
+  .profile-actions button.danger { color: var(--danger); }
+  .state-badge { border-radius: 999px; padding: .2rem .48rem; font-size: .7rem; font-weight: 800; background: rgba(148,163,184,.18); }
+  .state-badge.active { color: var(--accent-soft); }
+  .state-badge.archived { color: var(--danger); }
+  .profile-notice { margin-top: .5rem; color: var(--text-muted); font-size: .8rem; }
+  .mode-row { margin-top: .75rem; border-top: 1px solid var(--border-subtle); padding-top: .65rem; }
+  .mode-row button.selected { border-color: var(--accent); color: var(--accent-soft); }
+  .date-schedule { display: none; margin-top: .85rem; }
+  .date-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(145px, 1fr)); gap: 5px; }
+  .date-cell { min-height: 76px; border: 1px solid var(--border-subtle); background: rgba(15,23,42,.6); border-radius: 7px; padding: .45rem; cursor: pointer; }
+  .date-cell .date-hour { color: var(--text-muted); font-size: .72rem; font-weight: 700; }
+  .date-cell .date-name { display: block; margin-top: .3rem; font-size: .8rem; font-weight: 700; }
+  .date-cell .origin { display: block; margin-top: .25rem; font-size: .66rem; text-transform: uppercase; letter-spacing: .04em; color: var(--text-muted); }
+  .date-cell.override { border-color: var(--accent); }
+  .date-cell button { margin-top: .35rem; padding: .2rem .35rem; font-size: .68rem; }
+  .schedule-readonly .rotation-toolbar, .schedule-readonly .mobile-palette { opacity: .45; pointer-events: none; }
+  .api-error { color: var(--danger); font-size: .8rem; margin-top: .4rem; min-height: 1em; }
 </style>
 {% endblock %}
 
 {% block content %}
+<section class="profile-panel" aria-label="Schedule profile controls">
+  <div class="profile-row">
+    <strong>Profile:</strong>
+    <select id="profileSelect" aria-label="Selected schedule profile"></select>
+    <span id="profileBadges"></span>
+  </div>
+  <div class="profile-actions">
+    <button type="button" onclick="newProfile()">New Profile</button>
+    <button type="button" data-profile-write onclick="editProfile()">Edit</button>
+    <button type="button" onclick="cloneProfile()">Clone</button>
+    <button type="button" data-profile-write onclick="activateProfile()">Activate</button>
+    <button type="button" data-profile-write onclick="setDefaultProfile()">Set Default</button>
+    <button type="button" data-profile-write onclick="archiveProfile()">Archive</button>
+    <button type="button" data-profile-restore onclick="restoreProfile()" hidden>Restore</button>
+    <button type="button" class="danger" data-profile-delete onclick="deleteProfile()">Delete</button>
+  </div>
+  <div id="profileNotice" class="profile-notice"></div>
+  <div class="mode-row">
+    <button type="button" id="weeklyModeButton" class="selected" onclick="setMode('weekly')">Weekly Schedule</button>
+    <button type="button" id="dateModeButton" onclick="setMode('date')">Date Override</button>
+    <label id="datePickerWrap" hidden>Date: <input id="overrideDate" type="date"></label>
+  </div>
+  <div id="apiError" class="api-error" role="alert"></div>
+</section>
+
 <!-- Desktop layout -->
-<div class="schedule-wrap">
+<div id="weeklyDesktop" class="schedule-wrap">
   <div class="rotation-toolbar">
     <div class="rotation-toolbar-top">
       <input type="text" class="rotation-filter" id="rotationFilterDesktop" placeholder="Filter rotations &amp; playlists…" oninput="filterPalette(this.value, 'desktop')">
@@ -364,7 +414,7 @@
 </div>
 
 <!-- Mobile layout -->
-<div class="mobile-schedule">
+<div id="weeklyMobile" class="mobile-schedule">
   <div class="mobile-palette">
     <div class="rotation-toolbar-top">
       <input type="text" class="rotation-filter" id="rotationFilterMobile" placeholder="Filter rotations &amp; playlists…" oninput="filterPalette(this.value, 'mobile')">
@@ -390,6 +440,11 @@
 
   <div class="day-picker" id="dayPicker"></div>
   <div class="mobile-hours" id="mobileHours"></div>
+</div>
+
+<div id="dateSchedule" class="date-schedule">
+  <p class="profile-notice">Outlined cells are explicit overrides. Other populated cells are inherited from the weekly schedule.</p>
+  <div id="dateGrid" class="date-grid"></div>
 </div>
 {% endblock %}
 
@@ -419,6 +474,10 @@ const PALETTE = [
 let selectedKind = null;
 let selectedContentId = null;
 let selectedContentName = null;
+let profiles = [];
+let selectedProfile = null;
+let activeProfileUuid = null;
+let scheduleMode = 'weekly';
 // Default to today's day-of-week (Monday=0, matching the grid's convention —
 // same conversion highlightNow() uses) so mobile opens on the current day
 // instead of always Monday.
@@ -451,6 +510,162 @@ function getCookie(name) {
       val = decodeURIComponent(c.substring(name.length + 1));
   });
   return val;
+}
+
+function showError(message) {
+  document.getElementById('apiError').textContent = message || '';
+}
+
+async function apiRequest(url, options = {}) {
+  const response = await fetch(url, options);
+  let data = {};
+  try { data = await response.json(); } catch (_) { /* response has no JSON */ }
+  if (!response.ok) {
+    const blockers = data.blockers ? ` ${data.blockers.join('; ')}.` : '';
+    throw new Error((data.error || `Request failed (${response.status})`) + blockers);
+  }
+  return data;
+}
+
+function selectedProfileQuery(extra = '') {
+  if (!selectedProfile) return extra;
+  const joiner = extra.includes('?') ? '&' : '?';
+  return `${extra}${joiner}profile=${encodeURIComponent(selectedProfile.uuid)}`;
+}
+
+function updateProfileChrome() {
+  if (!selectedProfile) return;
+  const badges = [];
+  if (selectedProfile.is_active) badges.push('<span class="state-badge active">ACTIVE</span>');
+  if (selectedProfile.is_default) badges.push('<span class="state-badge">DEFAULT</span>');
+  if (selectedProfile.is_archived) badges.push('<span class="state-badge archived">ARCHIVED</span>');
+  if (!selectedProfile.is_active && !selectedProfile.is_default && !selectedProfile.is_archived) badges.push('<span class="state-badge">INACTIVE</span>');
+  document.getElementById('profileBadges').innerHTML = badges.join(' ');
+  const notice = selectedProfile.is_archived
+    ? 'This archived profile is inspectable but read-only. Restore it to edit or select it for lifecycle actions.'
+    : (!selectedProfile.is_active ? 'This profile is not currently used for new schedule resolution.' : 'This profile is currently used for new schedule resolution.');
+  document.getElementById('profileNotice').textContent = notice;
+  document.body.classList.toggle('schedule-readonly', selectedProfile.is_archived);
+  document.querySelectorAll('[data-profile-write]').forEach(button => button.hidden = selectedProfile.is_archived);
+  document.querySelectorAll('[data-profile-restore]').forEach(button => button.hidden = !selectedProfile.is_archived);
+  document.querySelectorAll('[data-profile-delete]').forEach(button => button.disabled = !selectedProfile.can_delete);
+}
+
+async function loadProfiles(preferredUuid = null) {
+  try {
+    const data = await apiRequest('/api/schedule/profiles/');
+    profiles = data.profiles;
+    activeProfileUuid = data.active_profile_uuid;
+    const keep = preferredUuid || (selectedProfile && selectedProfile.uuid) || activeProfileUuid;
+    selectedProfile = profiles.find(p => p.uuid === keep) || profiles[0];
+    const select = document.getElementById('profileSelect');
+    select.innerHTML = '';
+    profiles.forEach(profile => {
+      const option = document.createElement('option');
+      option.value = profile.uuid;
+      option.textContent = profile.name + (profile.is_archived ? ' (Archived)' : '');
+      option.selected = selectedProfile && profile.uuid === selectedProfile.uuid;
+      select.appendChild(option);
+    });
+    updateProfileChrome();
+    if (scheduleMode === 'date') await loadDateSchedule(); else await loadSchedule();
+  } catch (error) { showError(error.message); }
+}
+
+async function lifecycleAction(action, body = {}) {
+  showError('');
+  try {
+    const result = await apiRequest(`/api/schedule/profiles/${selectedProfile.uuid}/${action}/`, {
+      method: 'POST', headers: {'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken')},
+      body: JSON.stringify(body),
+    });
+    await loadProfiles(result.uuid || selectedProfile.uuid);
+    return result;
+  } catch (error) { showError(error.message); return null; }
+}
+
+async function newProfile() {
+  const name = window.prompt('Name for the new empty schedule profile:');
+  if (!name) return;
+  try {
+    const result = await apiRequest('/api/schedule/profiles/', {
+      method: 'POST', headers: {'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken')},
+      body: JSON.stringify({name}),
+    });
+    await loadProfiles(result.uuid);
+  } catch (error) { showError(error.message); }
+}
+
+async function editProfile() {
+  const name = window.prompt('Profile name:', selectedProfile.name);
+  if (!name) return;
+  const description = window.prompt('Description:', selectedProfile.description || '');
+  if (description === null) return;
+  const sortOrder = window.prompt('Sort order:', String(selectedProfile.sort_order));
+  if (sortOrder === null) return;
+  try {
+    await apiRequest(`/api/schedule/profiles/${selectedProfile.uuid}/`, {
+      method: 'PATCH', headers: {'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken')},
+      body: JSON.stringify({name, description, sort_order: Number(sortOrder)}),
+    });
+    await loadProfiles(selectedProfile.uuid);
+  } catch (error) { showError(error.message); }
+}
+
+async function cloneProfile() {
+  const name = window.prompt(`Name for the clone of “${selectedProfile.name}”:`, `${selectedProfile.name} Copy`);
+  if (!name) return;
+  const include = window.confirm('Include all one-date overrides? Choose Cancel to clone recurring weekly rows only.');
+  await lifecycleAction('clone', {name, include_date_overrides: include});
+}
+
+async function activateProfile() {
+  if (selectedProfile.is_active) return;
+  if (!window.confirm('Activate this profile now? Already-generated and approved logs will be left untouched.')) return;
+  const result = await lifecycleAction('activate', {expected_active_profile_uuid: activeProfileUuid});
+  // A stale-state 409 means another browser won. Refresh the badges/pointer
+  // immediately while leaving the conflict message visible for the operator.
+  if (!result) {
+    const message = document.getElementById('apiError').textContent;
+    await loadProfiles(selectedProfile.uuid);
+    showError(message);
+  }
+}
+
+async function setDefaultProfile() {
+  if (selectedProfile.is_default) return;
+  if (!window.confirm('Set this as the default profile? This does not activate it or rebuild logs.')) return;
+  await lifecycleAction('set-default');
+}
+
+async function archiveProfile() {
+  if (!window.confirm('Archive this profile? Its schedule and log provenance will be retained.')) return;
+  await lifecycleAction('archive');
+}
+
+async function restoreProfile() { await lifecycleAction('restore'); }
+
+async function deleteProfile() {
+  if (!selectedProfile.can_delete) { showError('Only an unused profile with no active/default role, blocks, or log references can be deleted.'); return; }
+  if (!window.confirm('Permanently delete this unused profile?')) return;
+  try {
+    await apiRequest(`/api/schedule/profiles/${selectedProfile.uuid}/`, {
+      method: 'DELETE', headers: {'X-CSRFToken': getCookie('csrftoken')},
+    });
+    selectedProfile = null;
+    await loadProfiles();
+  } catch (error) { showError(error.message); }
+}
+
+async function setMode(mode) {
+  scheduleMode = mode;
+  document.getElementById('weeklyModeButton').classList.toggle('selected', mode === 'weekly');
+  document.getElementById('dateModeButton').classList.toggle('selected', mode === 'date');
+  document.getElementById('datePickerWrap').hidden = mode !== 'date';
+  document.getElementById('weeklyDesktop').style.display = mode === 'weekly' ? '' : 'none';
+  document.getElementById('weeklyMobile').style.display = mode === 'weekly' ? '' : 'none';
+  document.getElementById('dateSchedule').style.display = mode === 'date' ? 'block' : 'none';
+  if (mode === 'date') await loadDateSchedule(); else await loadSchedule();
 }
 
 function selectContent(btn, kind, id, name) {
@@ -542,12 +757,13 @@ function flashCell(cell) {
 }
 
 async function onCellClick(day, hour, cell) {
+  if (selectedProfile && selectedProfile.is_archived) return;
   if (selectedKind === null) {
     onCellClear(day, hour, cell);
     return;
   }
 
-  const body = { day_of_week: day, hour: hour };
+  const body = { profile_uuid: selectedProfile.uuid, day_of_week: day, hour: hour };
   if (selectedKind === 'playlist') {
     body.playlist_id = selectedContentId;
   } else {
@@ -580,10 +796,11 @@ async function onCellClick(day, hour, cell) {
 }
 
 async function onCellClear(day, hour, cell) {
+  if (selectedProfile && selectedProfile.is_archived) return;
   const blockId = cells[day][hour];
   if (!blockId) return;
 
-  const resp = await fetch(`/api/schedule/${blockId}/`, {
+  const resp = await fetch(`/api/schedule/${blockId}/?profile=${encodeURIComponent(selectedProfile.uuid)}`, {
     method: 'DELETE',
     headers: { 'X-CSRFToken': getCookie('csrftoken') },
   });
@@ -658,7 +875,14 @@ function renderMobileHours() {
 
 // --- Load schedule data ---
 async function loadSchedule() {
-  const resp = await fetch('/api/schedule/');
+  if (!selectedProfile) return;
+  for (let d = 0; d < 7; d++) {
+    for (let h = 0; h < 24; h++) {
+      const cell = getCell(d, h);
+      if (cell) clearCell(cell); else clearCellData(d, h);
+    }
+  }
+  const resp = await fetch(`/api/schedule/?profile=${encodeURIComponent(selectedProfile.uuid)}`);
   if (!resp.ok) return;
 
   const data = await resp.json();
@@ -683,6 +907,70 @@ async function loadSchedule() {
   highlightNow();
 }
 
+async function loadDateSchedule() {
+  if (!selectedProfile) return;
+  const date = document.getElementById('overrideDate').value;
+  if (!date) return;
+  try {
+    const data = await apiRequest(`/api/schedule/?profile=${encodeURIComponent(selectedProfile.uuid)}&date=${encodeURIComponent(date)}`);
+    const grid = document.getElementById('dateGrid');
+    grid.innerHTML = '';
+    data.cells.forEach(cell => {
+      const node = document.createElement('div');
+      node.className = `date-cell ${cell.origin === 'date_override' ? 'override' : ''}`;
+      const effective = cell.effective_block;
+      if (effective) node.style.backgroundColor = contentColor(effective.content_kind, effective.content_id);
+      const origin = cell.origin === 'date_override' ? 'Date override' : (cell.origin === 'weekly' ? 'Inherited weekly' : 'No schedule');
+      node.innerHTML = `<span class="date-hour">${HOUR_LABELS[cell.hour]}</span><span class="date-name">${effective ? escapeHtml(effective.content_name) : 'Empty'}</span><span class="origin">${origin}</span>`;
+      node.addEventListener('click', () => assignDateCell(cell.hour));
+      if (cell.explicit_block_id) {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.textContent = 'Revert to Weekly';
+        button.addEventListener('click', event => { event.stopPropagation(); revertDateCell(cell.explicit_block_id); });
+        node.appendChild(button);
+      }
+      grid.appendChild(node);
+    });
+  } catch (error) { showError(error.message); }
+}
+
+function escapeHtml(value) {
+  const node = document.createElement('span');
+  node.textContent = value || '';
+  return node.innerHTML;
+}
+
+async function assignDateCell(hour) {
+  if (selectedProfile.is_archived) return;
+  if (selectedKind === null) {
+    showError('A date override must select valid content. Use “Revert to Weekly” to remove an explicit override; blank overrides are not supported.');
+    return;
+  }
+  const body = {profile_uuid: selectedProfile.uuid, specific_date: document.getElementById('overrideDate').value, hour};
+  body[selectedKind === 'playlist' ? 'playlist_id' : 'rotation_id'] = selectedContentId;
+  try {
+    await apiRequest('/api/schedule/', {
+      method: 'POST', headers: {'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken')},
+      body: JSON.stringify(body),
+    });
+    await loadDateSchedule();
+    await loadProfiles(selectedProfile.uuid);
+  } catch (error) { showError(error.message); }
+}
+
+async function revertDateCell(blockId) {
+  if (selectedProfile.is_archived) return;
+  const date = document.getElementById('overrideDate').value;
+  try {
+    await apiRequest(`/api/schedule/${blockId}/?profile=${encodeURIComponent(selectedProfile.uuid)}&date=${encodeURIComponent(date)}`, {
+      method: 'DELETE', headers: {'X-CSRFToken': getCookie('csrftoken')},
+    });
+    await loadDateSchedule();
+    await loadProfiles(selectedProfile.uuid);
+  } catch (error) { showError(error.message); }
+}
+
 // Color the palette buttons
 document.addEventListener('DOMContentLoaded', () => {
   document.querySelectorAll('.rotation-btn[data-rotation-id]').forEach(btn => {
@@ -698,7 +986,16 @@ document.addEventListener('DOMContentLoaded', () => {
 
   buildGrid();
   buildDayPicker();
-  loadSchedule();
+  const today = new Date();
+  const localDate = new Date(today.getTime() - today.getTimezoneOffset() * 60000).toISOString().slice(0, 10);
+  document.getElementById('overrideDate').value = localDate;
+  document.getElementById('overrideDate').addEventListener('change', loadDateSchedule);
+  document.getElementById('profileSelect').addEventListener('change', async event => {
+    selectedProfile = profiles.find(profile => profile.uuid === event.target.value);
+    updateProfileChrome();
+    if (scheduleMode === 'date') await loadDateSchedule(); else await loadSchedule();
+  });
+  loadProfiles();
   highlightNow();
   setInterval(highlightNow, 60000);
 });

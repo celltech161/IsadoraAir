@@ -1,9 +1,11 @@
 # Schedule profiles (roadmap 3.1)
 
-3.1A is the foundation only: a stable profile identity, a profile-scoped
-resolver, and truthful log provenance. A station that never creates a second
-profile behaves exactly as before. The multi-profile `/schedule/` UI, date
-override editor and minute-level scheduling arrive in later 3.1 releases.
+3.1A established the stable profile identity, profile-scoped resolver and
+truthful log provenance. 3.1B adds the operator workflow on the existing
+`/schedule/` page: named profile lifecycle, explicit activation/default
+selection, inactive-profile editing and hourly one-date overrides. A station
+that never creates a second profile behaves exactly as before. Minute-level
+scheduling remains deferred to 3.1C.
 
 ## Model
 
@@ -96,3 +98,34 @@ flag could silently switch the on-air schedule); no profile exists ->
 `ScheduleProfileStateError` (configuration is never manufactured at runtime).
 Resolution with an explicitly supplied profile does not read the state row.
 Admin displays only read the row and never recreate it.
+
+## Operator workflow (3.1B)
+
+Selecting a profile in `/schedule/` changes only what the operator is viewing
+and editing. It never activates that profile. Active and default are separate,
+explicit actions; either can change without rebuilding, deleting, approving or
+otherwise reinterpreting a `PlaylistLog`. Activation uses the active UUID the
+browser observed as an optimistic-concurrency token and returns a conflict if
+another session activated a profile first.
+
+Profile creation starts empty and inactive. Clone creates a new UUID and copies
+the source's exact recurring `ScheduleBlock` rows; date rows are included only
+when explicitly requested. Rotations and Playlists remain shared definitions,
+and generated logs are never copied. Archived profiles remain inspectable but
+cannot be edited, activated or set as default. Active/default profiles cannot
+be archived. Hard deletion is limited to a profile that is neither active nor
+default and has no blocks or log-provenance references.
+
+The schedule API remains backward compatible: omitting a profile means the
+active profile. `profile=<uuid>` on reads/deletes and `profile_uuid` on writes
+target an inactive profile without activating it. A date read returns 24
+server-resolved hourly cells whose origin is `date_override`, `weekly` or
+`none`. Assigning content to a date cell creates/updates only its dated row;
+"Revert to Weekly" deletes only that row and reveals the recurring row again.
+There is intentionally no representation for an explicitly blank one-date
+override in 3.1B.
+
+All lifecycle mutations require `schedule.edit` and emit privacy-safe
+`SystemEvent` audit records with stable profile UUIDs. The
+`ScheduleProfileState` Django admin remains read-only; lifecycle authority is
+the schedule workflow, not an unaudited admin pointer edit.

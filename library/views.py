@@ -14,6 +14,7 @@ from django.views.decorators.http import require_http_methods
 
 from django.core.exceptions import ValidationError
 from django.core.paginator import Paginator
+from django.db import transaction
 from django.db.models import Count, Q
 from django.db.models.deletion import ProtectedError
 from django.utils import timezone
@@ -24,7 +25,11 @@ from authz.evaluator import authorize, forbidden_response
 
 from isadoraair.engine_commands import EngineCommandError, enqueue_engine_command
 
-from .models import Artist, Album, Category, CategoryKind, Genre, Holiday, LogItem, Playlist, PlaylistItem, PlaylistLog, Rotation, RotationSlot, ScheduleBlock, Track
+from .models import (
+    Artist, Album, Category, CategoryKind, Genre, Holiday, LogItem, Playlist,
+    PlaylistItem, PlaylistLog, Rotation, RotationSlot, ScheduleBlock,
+    ScheduleProfile, ScheduleProfileState, Track,
+)
 from .services.log_builder import (
     LOCK_CONTENDED, _build_from_playlist, build_hour_log_for_admin, get_active_schedule_profile,
     preview_hour_log,
@@ -35,6 +40,11 @@ from .services.related_artists import (
     format_related_artists, resolve_fallback_metadata,
 )
 from .services.track_filters import filter_tracks
+from .services.schedule_profiles import (
+    ProfileLifecycleError, activate_profile, archive_profile, clone_profile,
+    create_profile, delete_profile, edit_profile, restore_profile,
+    set_default_profile,
+)
 
 # _read_engine_state (not the whole module) -- webrequests.services
 # already defines the one shared "is the running engine's state fresh
@@ -94,6 +104,215 @@ def _block_to_dict(b):
     }
 
 
+def _json_body(request):
+    try:
+        value = json.loads(request.body or b"{}")
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+        raise ValidationError("Invalid JSON")
+    if not isinstance(value, dict):
+        raise ValidationError("JSON body must be an object")
+    return value
+
+
+def _lifecycle_error_response(exc):
+    payload = {"error": exc.message}
+    if exc.blockers:
+        payload["blockers"] = exc.blockers
+    if exc.current_active_uuid:
+        payload["current_active_profile_uuid"] = exc.current_active_uuid
+    return JsonResponse(payload, status=exc.status)
+
+
+def _schedule_edit_denial(request):
+    result = authorize(request.user, "schedule.edit")
+    if result:
+        return None
+    return forbidden_response(result, user=request.user, capability_slug="schedule.edit")
+
+
+def _profile_for_uuid(value):
+    try:
+        return ScheduleProfile.objects.get(uuid=value)
+    except (ScheduleProfile.DoesNotExist, ValidationError, ValueError):
+        raise Http404("Schedule profile not found")
+
+
+def _selected_profile(request, body=None):
+    value = request.GET.get("profile")
+    if body is not None:
+        value = body.get("profile_uuid", value)
+    return _profile_for_uuid(value) if value else get_active_schedule_profile()
+
+
+def _profile_to_dict(profile, state, *, block_count=None, log_count=None):
+    if block_count is None:
+        block_count = profile.schedule_blocks.count()
+    if log_count is None:
+        log_count = profile.playlist_logs.count()
+    is_active = state.active_profile_id == profile.pk
+    is_default = state.default_profile_id == profile.pk
+    return {
+        "uuid": str(profile.uuid),
+        "name": profile.name,
+        "description": profile.description,
+        "sort_order": profile.sort_order,
+        "is_archived": profile.is_archived,
+        "is_active": is_active,
+        "is_default": is_default,
+        "block_count": block_count,
+        "playlist_log_count": log_count,
+        "can_delete": not is_active and not is_default and block_count == 0 and log_count == 0,
+    }
+
+
+def _parse_hour(value):
+    try:
+        hour = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValidationError("hour must be 0-23") from exc
+    if not 0 <= hour <= 23:
+        raise ValidationError("hour must be 0-23")
+    return hour
+
+
+def _parse_iso_date(value):
+    try:
+        return date_type.fromisoformat(str(value))
+    except (TypeError, ValueError) as exc:
+        raise ValidationError("date must be a valid ISO YYYY-MM-DD date") from exc
+
+
+def _effective_date_payload(profile, target_date):
+    weekly = {
+        row.start_time: row
+        for row in ScheduleBlock.objects.filter(
+            profile=profile, day_of_week=target_date.weekday(), specific_date__isnull=True,
+        ).select_related("rotation", "playlist")
+    }
+    overrides = {
+        row.start_time: row
+        for row in ScheduleBlock.objects.filter(
+            profile=profile, specific_date=target_date, day_of_week__isnull=True,
+        ).select_related("rotation", "playlist")
+    }
+    cells = []
+    for hour in range(24):
+        slot = time(hour, 0)
+        explicit = overrides.get(slot)
+        inherited = weekly.get(slot)
+        effective = explicit or inherited
+        cell = {
+            "hour": hour,
+            "origin": "date_override" if explicit else ("weekly" if inherited else "none"),
+            "explicit_block_id": explicit.pk if explicit else None,
+            "inherited_block_id": inherited.pk if inherited else None,
+            "effective_block": _block_to_dict(effective) if effective else None,
+        }
+        cells.append(cell)
+    return {
+        "profile_uuid": str(profile.uuid),
+        "date": target_date.isoformat(),
+        "weekday": target_date.weekday(),
+        "cells": cells,
+    }
+
+
+@require_http_methods(["GET", "POST"])
+def api_schedule_profiles(request):
+    if request.method == "GET":
+        state = ScheduleProfileState.load()
+        profiles = ScheduleProfile.objects.annotate(
+            _block_count=Count("schedule_blocks", distinct=True),
+            _log_count=Count("playlist_logs", distinct=True),
+        ).order_by("sort_order", "name")
+        return JsonResponse({
+            "active_profile_uuid": str(state.active_profile.uuid),
+            "default_profile_uuid": str(state.default_profile.uuid),
+            "profiles": [
+                _profile_to_dict(p, state, block_count=p._block_count, log_count=p._log_count)
+                for p in profiles
+            ],
+        })
+    denied = _schedule_edit_denial(request)
+    if denied:
+        return denied
+    try:
+        body = _json_body(request)
+        sort_order = body.get("sort_order")
+        if sort_order is not None:
+            sort_order = int(sort_order)
+        profile = create_profile(
+            name=body.get("name"), description=body.get("description", ""),
+            sort_order=sort_order, actor=request.user,
+        )
+    except (ProfileLifecycleError, ValidationError, TypeError, ValueError) as exc:
+        if isinstance(exc, ProfileLifecycleError):
+            return _lifecycle_error_response(exc)
+        return JsonResponse({"error": str(exc)}, status=400)
+    state = ScheduleProfileState.load()
+    return JsonResponse(_profile_to_dict(profile, state), status=201)
+
+
+@require_http_methods(["GET", "PATCH", "DELETE"])
+def api_schedule_profile_detail(request, profile_uuid):
+    profile = _profile_for_uuid(profile_uuid)
+    state = ScheduleProfileState.load()
+    if request.method == "GET":
+        return JsonResponse(_profile_to_dict(profile, state))
+    denied = _schedule_edit_denial(request)
+    if denied:
+        return denied
+    try:
+        if request.method == "DELETE":
+            identity = delete_profile(profile, actor=request.user)
+            return JsonResponse({"ok": True, **identity})
+        profile = edit_profile(profile, changes=_json_body(request), actor=request.user)
+        return JsonResponse(_profile_to_dict(profile, ScheduleProfileState.load()))
+    except (ProfileLifecycleError, ValidationError) as exc:
+        if isinstance(exc, ProfileLifecycleError):
+            return _lifecycle_error_response(exc)
+        return JsonResponse({"error": str(exc)}, status=400)
+
+
+@require_http_methods(["POST"])
+def api_schedule_profile_action(request, profile_uuid, action):
+    denied = _schedule_edit_denial(request)
+    if denied:
+        return denied
+    profile = _profile_for_uuid(profile_uuid)
+    try:
+        body = _json_body(request)
+        if action == "clone":
+            clone = clone_profile(
+                profile, name=body.get("name"), description=body.get("description"),
+                sort_order=body.get("sort_order"),
+                include_date_overrides=body.get("include_date_overrides", False) is True,
+                actor=request.user,
+            )
+            return JsonResponse(_profile_to_dict(clone, ScheduleProfileState.load()), status=201)
+        if action == "activate":
+            state, changed = activate_profile(
+                profile, expected_active_profile_uuid=body.get("expected_active_profile_uuid"), actor=request.user,
+            )
+        elif action == "set-default":
+            state, changed = set_default_profile(profile, actor=request.user)
+        elif action == "archive":
+            profile, changed = archive_profile(profile, actor=request.user)
+            state = ScheduleProfileState.load()
+        elif action == "restore":
+            profile, changed = restore_profile(profile, actor=request.user)
+            state = ScheduleProfileState.load()
+        else:
+            raise Http404("Unknown profile action")
+        payload = _profile_to_dict(profile, state)
+        payload["changed"] = changed
+        return JsonResponse(payload)
+    except (ProfileLifecycleError, ValidationError, TypeError, ValueError) as exc:
+        if isinstance(exc, ProfileLifecycleError):
+            return _lifecycle_error_response(exc)
+        return JsonResponse({"error": str(exc)}, status=400)
+
+
 @require_http_methods(["GET", "POST"])
 def api_schedule_list(request):
     # 3.1A: the ordinary /schedule/ page still shows ONE schedule -- the
@@ -101,40 +320,65 @@ def api_schedule_list(request):
     # both the read and the write below; the request/response shape is
     # unchanged from r0095.
     if request.method == "GET":
+        profile = _selected_profile(request)
+        if request.GET.get("date") is not None:
+            try:
+                target_date = _parse_iso_date(request.GET.get("date"))
+            except ValidationError as exc:
+                return JsonResponse({"error": exc.message}, status=400)
+            return JsonResponse(_effective_date_payload(profile, target_date))
         blocks = (
             ScheduleBlock.objects
-            .filter(profile=get_active_schedule_profile(), day_of_week__isnull=False)
+            .filter(profile=profile, day_of_week__isnull=False)
             .select_related("rotation", "playlist")
             .order_by("day_of_week", "start_time")
         )
         return JsonResponse({"blocks": [_block_to_dict(b) for b in blocks]})
 
-    result = authorize(request.user, "schedule.edit")
-    if not result:
-        return forbidden_response(result, user=request.user, capability_slug="schedule.edit")
+    denied = _schedule_edit_denial(request)
+    if denied:
+        return denied
 
     try:
-        body = json.loads(request.body)
-    except (json.JSONDecodeError, ValueError):
-        return JsonResponse({"error": "Invalid JSON"}, status=400)
+        body = _json_body(request)
+    except ValidationError as exc:
+        return JsonResponse({"error": exc.message}, status=400)
+
+    profile = _selected_profile(request, body)
 
     day_of_week = body.get("day_of_week")
-    hour = body.get("hour")
+    specific_date_value = body.get("specific_date")
+    try:
+        hour = _parse_hour(body.get("hour"))
+    except ValidationError as exc:
+        return JsonResponse({"error": exc.message}, status=400)
     # Accept either {"rotation_id": ...} or {"playlist_id": ...}. The
     # schedule grid UI only writes rotations right now; playlist-backed
     # blocks come from admin and are read-only via this endpoint.
     rotation_id = body.get("rotation_id")
     playlist_id = body.get("playlist_id")
 
-    if day_of_week is None or hour is None:
-        return JsonResponse({"error": "day_of_week and hour are required"}, status=400)
+    if day_of_week is None and specific_date_value is None:
+        return JsonResponse({"error": "day_of_week or specific_date is required"}, status=400)
+    if day_of_week is not None and specific_date_value is not None:
+        return JsonResponse({"error": "day_of_week and specific_date are mutually exclusive"}, status=400)
     if (rotation_id is None) == (playlist_id is None):
         return JsonResponse({"error": "exactly one of rotation_id or playlist_id is required"}, status=400)
 
-    if not (0 <= day_of_week <= 6):
-        return JsonResponse({"error": "day_of_week must be 0-6"}, status=400)
-    if not (0 <= hour <= 23):
-        return JsonResponse({"error": "hour must be 0-23"}, status=400)
+    target_date = None
+    if specific_date_value is not None:
+        try:
+            target_date = _parse_iso_date(specific_date_value)
+        except ValidationError as exc:
+            return JsonResponse({"error": exc.message}, status=400)
+        day_of_week = None
+    else:
+        try:
+            day_of_week = int(day_of_week)
+        except (TypeError, ValueError):
+            return JsonResponse({"error": "day_of_week must be 0-6"}, status=400)
+        if not 0 <= day_of_week <= 6:
+            return JsonResponse({"error": "day_of_week must be 0-6"}, status=400)
 
     defaults = {"end_time": time((hour + 1) % 24, 0)}
     if rotation_id is not None:
@@ -150,13 +394,17 @@ def api_schedule_list(request):
             return JsonResponse({"error": "Playlist not found"}, status=404)
         defaults["rotation"] = None
 
-    block, created = ScheduleBlock.objects.update_or_create(
-        profile=get_active_schedule_profile(),
-        day_of_week=day_of_week,
-        start_time=time(hour, 0),
-        specific_date=None,
-        defaults=defaults,
-    )
+    with transaction.atomic():
+        profile = ScheduleProfile.objects.select_for_update().get(pk=profile.pk)
+        if profile.is_archived:
+            return JsonResponse({"error": "Archived profiles are read-only."}, status=409)
+        block, created = ScheduleBlock.objects.update_or_create(
+            profile=profile,
+            day_of_week=day_of_week,
+            start_time=time(hour, 0),
+            specific_date=target_date,
+            defaults=defaults,
+        )
 
     payload = _block_to_dict(block)
     payload["created"] = created
@@ -165,13 +413,26 @@ def api_schedule_list(request):
 
 @require_http_methods(["DELETE"])
 def api_schedule_delete(request, pk):
-    result = authorize(request.user, "schedule.edit")
-    if not result:
-        return forbidden_response(result, user=request.user, capability_slug="schedule.edit")
+    denied = _schedule_edit_denial(request)
+    if denied:
+        return denied
 
-    # Scoped to the active profile so a block id can never silently delete
-    # a block belonging to a different profile.
-    deleted, _ = ScheduleBlock.objects.filter(pk=pk, profile=get_active_schedule_profile()).delete()
+    profile = _selected_profile(request)
+    with transaction.atomic():
+        profile = ScheduleProfile.objects.select_for_update().get(pk=profile.pk)
+        if profile.is_archived:
+            return JsonResponse({"error": "Archived profiles are read-only."}, status=409)
+
+        # Scope both the block identity and the selected profile. A stale id
+        # from another profile can never delete that other profile's row.
+        blocks = ScheduleBlock.objects.filter(pk=pk, profile=profile)
+        if request.GET.get("date") is not None:
+            try:
+                target_date = _parse_iso_date(request.GET.get("date"))
+            except ValidationError as exc:
+                return JsonResponse({"error": exc.message}, status=400)
+            blocks = blocks.filter(specific_date=target_date)
+        deleted, _ = blocks.delete()
     return JsonResponse({"ok": True, "deleted": deleted > 0})
 
 
