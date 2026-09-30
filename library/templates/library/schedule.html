@@ -266,32 +266,18 @@
 
   .mobile-hour-cell.empty .rotation-name { color: transparent; }
 
-  .mobile-palette {
-    margin-bottom: 0.75rem;
-    display: flex;
-    flex-direction: column;
-    gap: 0.4rem;
-  }
-
-  .mobile-palette-scroll {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 4px;
-    max-height: 132px;
-    overflow-y: auto;
-    padding-bottom: 4px;
-  }
-
-  .mobile-palette-scroll .rotation-btn {
-    flex-shrink: 0;
-    width: auto;
-    padding: 0.32rem 0.6rem;
-    font-size: 0.72rem;
-  }
-
   @media (max-width: 768px) {
     .schedule-wrap { display: none; }
     .mobile-schedule { display: block; }
+    .content-picker .rotation-group {
+      max-height: 132px;
+      overflow-y: auto;
+    }
+    .content-picker .rotation-btn {
+      flex-shrink: 0;
+      padding: 0.32rem 0.6rem;
+      font-size: 0.72rem;
+    }
   }
 
   .profile-panel { background: var(--panel-bg); border: 1px solid var(--border-subtle); border-radius: 8px; padding: .75rem; margin-bottom: .85rem; }
@@ -316,7 +302,8 @@
   .date-cell .origin { display: block; margin-top: .25rem; font-size: .66rem; text-transform: uppercase; letter-spacing: .04em; color: var(--text-muted); }
   .date-cell.override { border-color: var(--accent); }
   .date-cell button { margin-top: .35rem; padding: .2rem .35rem; font-size: .68rem; }
-  .schedule-readonly .rotation-toolbar, .schedule-readonly .mobile-palette { opacity: .45; pointer-events: none; }
+  .content-picker { margin-bottom: .85rem; }
+  .schedule-readonly .content-picker { opacity: .45; pointer-events: none; }
   .api-error { color: var(--danger); font-size: .8rem; margin-top: .4rem; min-height: 1em; }
 </style>
 {% endblock %}
@@ -347,41 +334,44 @@
   <div id="apiError" class="api-error" role="alert"></div>
 </section>
 
-<!-- Desktop layout -->
-<div id="weeklyDesktop" class="schedule-wrap">
-  <div class="rotation-toolbar">
-    <div class="rotation-toolbar-top">
-      <input type="text" class="rotation-filter" id="rotationFilterDesktop" placeholder="Filter rotations &amp; playlists…" oninput="filterPalette(this.value, 'desktop')">
-      <button class="rotation-btn clear-btn" data-rotation-id="clear" onclick="selectContent(this, null, null, null)">
-        Clear
-      </button>
-    </div>
-
-    <div class="rotation-group-label">Rotations</div>
-    <div class="rotation-group">
-      {% for rotation in rotations %}
-      <button class="rotation-btn" data-rotation-id="{{ rotation.id }}"
-              onclick="selectContent(this, 'rotation', {{ rotation.id }}, '{{ rotation.name|escapejs }}')">
-        {{ rotation.name }}
-      </button>
-      {% empty %}
-      <p class="palette-empty">No rotations configured. <a href="{% url 'library:rotations' %}" style="color:var(--accent)">Add a rotation</a>.</p>
-      {% endfor %}
-    </div>
-
-    <div class="rotation-group-label">Playlists</div>
-    <div class="rotation-group">
-      {% for playlist in playlists %}
-      <button class="rotation-btn" data-playlist-id="{{ playlist.id }}"
-              onclick="selectContent(this, 'playlist', {{ playlist.id }}, '{{ playlist.name|escapejs }}')">
-        {{ playlist.name }}
-      </button>
-      {% empty %}
-      <p class="palette-empty">No playlists yet. Build one on the <a href="{% url 'library:playlists' %}" style="color:var(--accent)">Playlists</a> page.</p>
-      {% endfor %}
-    </div>
+<!-- One shared picker serves Weekly and Date Override modes. Keeping it
+     outside both mode containers makes the same selection state available
+     on desktop and mobile without duplicating a second palette. -->
+<div id="contentPicker" class="rotation-toolbar content-picker" aria-label="Schedule content picker">
+  <div class="rotation-toolbar-top">
+    <input type="text" class="rotation-filter" id="rotationFilter" placeholder="Filter rotations &amp; playlists…" oninput="filterPalette(this.value)">
+    <button class="rotation-btn clear-btn" data-rotation-id="clear" onclick="selectContent(this, null, null, null)">
+      Clear
+    </button>
   </div>
 
+  <div class="rotation-group-label">Rotations</div>
+  <div class="rotation-group">
+    {% for rotation in rotations %}
+    <button class="rotation-btn" data-rotation-id="{{ rotation.id }}"
+            onclick="selectContent(this, 'rotation', {{ rotation.id }}, '{{ rotation.name|escapejs }}')">
+      {{ rotation.name }}
+    </button>
+    {% empty %}
+    <p class="palette-empty">No rotations configured. <a href="{% url 'library:rotations' %}" style="color:var(--accent)">Add a rotation</a>.</p>
+    {% endfor %}
+  </div>
+
+  <div class="rotation-group-label">Playlists</div>
+  <div class="rotation-group">
+    {% for playlist in playlists %}
+    <button class="rotation-btn" data-playlist-id="{{ playlist.id }}"
+            onclick="selectContent(this, 'playlist', {{ playlist.id }}, '{{ playlist.name|escapejs }}')">
+      {{ playlist.name }}
+    </button>
+    {% empty %}
+    <p class="palette-empty">No playlists yet. Build one on the <a href="{% url 'library:playlists' %}" style="color:var(--accent)">Playlists</a> page.</p>
+    {% endfor %}
+  </div>
+</div>
+
+<!-- Desktop layout -->
+<div id="weeklyDesktop" class="schedule-wrap">
   <div class="grid-container">
     <div class="schedule-grid" id="scheduleGrid">
       <div class="grid-header corner"></div>
@@ -415,29 +405,6 @@
 
 <!-- Mobile layout -->
 <div id="weeklyMobile" class="mobile-schedule">
-  <div class="mobile-palette">
-    <div class="rotation-toolbar-top">
-      <input type="text" class="rotation-filter" id="rotationFilterMobile" placeholder="Filter rotations &amp; playlists…" oninput="filterPalette(this.value, 'mobile')">
-      <button class="rotation-btn clear-btn" data-rotation-id="clear" onclick="selectContent(this, null, null, null)">
-        Clear
-      </button>
-    </div>
-    <div class="mobile-palette-scroll">
-      {% for rotation in rotations %}
-      <button class="rotation-btn" data-rotation-id="{{ rotation.id }}"
-              onclick="selectContent(this, 'rotation', {{ rotation.id }}, '{{ rotation.name|escapejs }}')">
-        {{ rotation.name }}
-      </button>
-      {% endfor %}
-      {% for playlist in playlists %}
-      <button class="rotation-btn" data-playlist-id="{{ playlist.id }}"
-              onclick="selectContent(this, 'playlist', {{ playlist.id }}, '{{ playlist.name|escapejs }}')">
-        {{ playlist.name }}
-      </button>
-      {% endfor %}
-    </div>
-  </div>
-
   <div class="day-picker" id="dayPicker"></div>
   <div class="mobile-hours" id="mobileHours"></div>
 </div>
@@ -679,17 +646,23 @@ function selectContent(btn, kind, id, name) {
 // 93+ rotations/playlists is too many to scan by eye alone -- a live
 // text filter narrows the wrapped button list down as you type. The
 // Clear button always stays visible regardless of the filter text.
-function filterPalette(query, scope) {
+function filterPalette(query) {
   const q = query.trim().toLowerCase();
-  const root = scope === 'mobile'
-    ? document.querySelector('.mobile-palette-scroll')
-    : document.querySelector('.rotation-toolbar');
+  const root = document.getElementById('contentPicker');
   if (!root) return;
   root.querySelectorAll('.rotation-btn').forEach(btn => {
     if (btn.classList.contains('clear-btn')) return;
     const name = btn.textContent.trim().toLowerCase();
     btn.classList.toggle('hidden-by-filter', q.length > 0 && !name.includes(q));
   });
+}
+
+function stationIsoDate() {
+  const stationNow = window.stationNowParts();
+  const year = String(stationNow.year).padStart(4, '0');
+  const month = String(stationNow.month).padStart(2, '0');
+  const day = String(stationNow.day).padStart(2, '0');
+  return `${year}-${month}-${day}`;
 }
 
 // --- Desktop grid ---
@@ -986,9 +959,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
   buildGrid();
   buildDayPicker();
-  const today = new Date();
-  const localDate = new Date(today.getTime() - today.getTimezoneOffset() * 60000).toISOString().slice(0, 10);
-  document.getElementById('overrideDate').value = localDate;
+  document.getElementById('overrideDate').value = stationIsoDate();
   document.getElementById('overrideDate').addEventListener('change', loadDateSchedule);
   document.getElementById('profileSelect').addEventListener('change', async event => {
     selectedProfile = profiles.find(profile => profile.uuid === event.target.value);

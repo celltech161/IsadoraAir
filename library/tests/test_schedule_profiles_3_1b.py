@@ -76,10 +76,26 @@ class ProfileLifecycleApiTests(ApiMixin, TestCase):
         for marker in (
             'id="profileSelect"', "New Profile", "Activate", "Set Default",
             "Weekly Schedule", "Date Override", "Revert to Weekly",
-            "expected_active_profile_uuid",
+            "expected_active_profile_uuid", 'id="contentPicker"',
         ):
             with self.subTest(marker=marker):
                 self.assertIn(marker, html)
+        # The single picker is outside both mode-specific containers, so it
+        # remains usable when either Weekly or Date Override hides its body.
+        self.assertEqual(html.count('id="contentPicker"'), 1)
+        self.assertEqual(html.count('id="rotationFilter"'), 1)
+        self.assertLess(html.index('id="contentPicker"'), html.index('id="weeklyDesktop"'))
+        self.assertLess(html.index('id="contentPicker"'), html.index('id="dateSchedule"'))
+        self.assertIn(".schedule-readonly .content-picker", html)
+
+    def test_override_date_initializes_from_station_time_not_browser_time(self):
+        html = self.client.get(reverse("library:schedule")).content.decode()
+        self.assertIn("function stationIsoDate()", html)
+        self.assertIn("const stationNow = window.stationNowParts();", html)
+        self.assertIn("String(stationNow.month).padStart(2, '0')", html)
+        self.assertIn("document.getElementById('overrideDate').value = stationIsoDate();", html)
+        self.assertNotIn("getTimezoneOffset", html)
+        self.assertNotIn("const today = new Date()", html)
 
     def test_create_lists_profile_without_activating_or_defaulting_it(self):
         profile = self.create_profile()
