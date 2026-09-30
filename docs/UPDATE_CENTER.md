@@ -53,6 +53,16 @@ Unrelated local, worktree, review, and stale remote-tracking refs do not
 contribute to release identity. Each normal release must also have its own
 introducing commit; adding two manifests in one commit is ambiguous and
 rejected.
+
+Application-side planning batches that canonical manifest-history inspection:
+one additions-only history traversal and one all-touches traversal cover the
+ordinary manifests in the chain, and Python applies the same per-path rule
+described above. This is only a process-count/performance implementation
+detail. Immutable identity still comes exclusively from the supplied exact
+canonical tip and remains fail-closed for absent, touched, deleted, re-added,
+or duplicate-commit manifests. The scalar resolver remains covered as the
+semantic oracle for the batched result.
+
 Local-only commits, detached HEAD, dirty trees, and local/remote
 divergence are non-authoritative states and block planning. A station
 cleanly behind `origin` remains supported: manifests and target files

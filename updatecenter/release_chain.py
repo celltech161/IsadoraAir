@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+from collections.abc import Mapping
 from pathlib import Path
 
 from . import git_adapter, manifest as manifest_mod
@@ -247,16 +248,29 @@ def resolve_unique_release_commits(
     """Resolve every release id to one distinct immutable commit.
 
     A normal release whose manifest was modified/deleted/re-added is
-    unresolved by ``find_introducing_commit``. Two manifests first
+    unresolved by the batched introducing-commit resolver. Two manifests first
     added by one commit are also rejected: otherwise two deployment
     transitions would collapse onto one source identity and installed
     release resolution would silently skip one of them.
     """
+    ordinary_paths = {
+        chained.manifest.release_id: f"{releases_dirname}/{chained.manifest.release_id}.json"
+        for chained in chain
+        if not chained.manifest.is_bootstrap
+    }
+    batch_identities = git_adapter.find_introducing_commits(
+        checkout_root, ordinary_paths.values(), canonical_tip,
+    )
+
     resolved: dict[str, str] = {}
     owner_by_commit: dict[str, str] = {}
     for chained in chain:
         release_id = chained.manifest.release_id
-        commit = resolve_release_commit(chained, checkout_root, canonical_tip, releases_dirname)
+        commit = (
+            chained.manifest.bootstrap_commit
+            if chained.manifest.is_bootstrap
+            else batch_identities[ordinary_paths[release_id]]
+        )
         if commit is None or not git_adapter.commit_exists(checkout_root, commit):
             raise ChainError(
                 f"release {release_id!r} has no unique, immutable, reachable commit identity "
@@ -273,25 +287,37 @@ def resolve_unique_release_commits(
     return resolved
 
 
-def resolve_installed_release(chain: list[ChainedRelease], checkout_root: Path,
-                               head_sha: str, canonical_tip: str,
-                               releases_dirname: str = RELEASES_DIRNAME_DEFAULT) -> ChainedRelease | None:
+def resolve_installed_release(
+    chain: list[ChainedRelease], checkout_root: Path, head_sha: str,
+    release_commits: Mapping[str, str],
+) -> ChainedRelease | None:
     """Which release, if any, the checkout currently at `head_sha` is
     "on" -- the LATEST release in the chain whose own commit is `head_sha`
     itself or an ancestor of it. Walks the chain from latest to
     earliest (not earliest to latest) so the first match found is
     already the correct answer, no extra "keep the latest match" state
-    needed.
+    needed. ``release_commits`` must be the complete, already-verified mapping
+    returned by ``resolve_unique_release_commits``; this function deliberately
+    has no canonical-tip fallback and therefore cannot repeat identity-history
+    queries during planning.
 
     Returns None if not even the bootstrap release's commit is an
     ancestor of head_sha -- meaning this checkout predates the entire
     known release chain, or the chain's bootstrap_commit is simply
     wrong. Callers must treat None as "cannot determine installed
     release," not as "assume the bootstrap.\""""
+    missing = [
+        chained.manifest.release_id
+        for chained in chain
+        if chained.manifest.release_id not in release_commits
+    ]
+    if missing:
+        raise ChainError(
+            f"resolved release commit mapping is incomplete; missing {missing!r}"
+        )
+
     for chained in reversed(chain):
-        commit = resolve_release_commit(chained, checkout_root, canonical_tip, releases_dirname)
-        if commit is None:
-            continue
+        commit = release_commits[chained.manifest.release_id]
         if commit == head_sha:
             return chained
         if git_adapter.is_ancestor(checkout_root, commit, head_sha):

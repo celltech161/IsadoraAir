@@ -2,10 +2,11 @@
 import json
 import tempfile
 from pathlib import Path
+from unittest import mock
 
 from django.test import SimpleTestCase
 
-from updatecenter import manifest as m, release_chain as rc
+from updatecenter import git_adapter as ga, manifest as m, release_chain as rc
 from .gitfixtures import FakeRepo
 from .test_manifest import _valid_bootstrap, _valid_followup
 
@@ -237,7 +238,7 @@ class ResolveInstalledReleaseTests(SimpleTestCase):
             data = _valid_bootstrap(bootstrap_commit=head)
             chain = rc.build_chain({"r0001": m.validate_manifest_dict(data)})
             result = rc.resolve_installed_release(
-                chain, repo.work, head, repo.rev_parse("origin/main"),
+                chain, repo.work, head, {"r0001": head},
             )
             self.assertEqual(result.manifest.release_id, "r0001")
 
@@ -254,8 +255,11 @@ class ResolveInstalledReleaseTests(SimpleTestCase):
                 "r0002": m.validate_manifest_dict(_valid_followup()),
             }
             chain = rc.build_chain(manifests)
+            release_commits = rc.resolve_unique_release_commits(
+                chain, repo.work, repo.rev_parse("origin/main"),
+            )
             result = rc.resolve_installed_release(
-                chain, repo.work, head, repo.rev_parse("origin/main"),
+                chain, repo.work, head, release_commits,
             )
             self.assertEqual(result.manifest.release_id, "r0002")
 
@@ -270,6 +274,99 @@ class ResolveInstalledReleaseTests(SimpleTestCase):
             # HEAD (early_sha) predates the declared bootstrap commit --
             # bootstrap is NOT an ancestor of early_sha, so nothing resolves.
             result = rc.resolve_installed_release(
-                chain, repo.work, early_sha, repo.rev_parse("origin/main"),
+                chain, repo.work, early_sha, {"r0001": later_sha},
             )
             self.assertIsNone(result)
+
+    def test_incomplete_resolved_mapping_fails_closed(self):
+        with FakeRepo() as repo:
+            head = repo.rev_parse("HEAD")
+            chain = rc.build_chain({
+                "r0001": m.validate_manifest_dict(_valid_bootstrap(bootstrap_commit=head)),
+            })
+            with self.assertRaisesMessage(rc.ChainError, "mapping is incomplete"):
+                rc.resolve_installed_release(chain, repo.work, head, {})
+
+
+class BatchedReleaseIdentityComplexityTests(SimpleTestCase):
+    def test_hundred_release_chain_uses_two_log_processes_and_reuses_mapping(self):
+        with FakeRepo() as repo:
+            bootstrap_sha = repo.rev_parse("HEAD")
+            manifests = {
+                "r0001": m.validate_manifest_dict(
+                    _valid_bootstrap(bootstrap_commit=bootstrap_sha)
+                ),
+            }
+            paths = []
+            for number in range(2, 102):
+                release_id = f"r{number:04d}"
+                previous_id = f"r{number - 1:04d}"
+                path = f"deploy/releases/{release_id}.json"
+                repo.write(path, "{}\n")
+                repo.commit(f"add {release_id}", push=False)
+                paths.append(path)
+                manifests[release_id] = m.validate_manifest_dict(
+                    _valid_followup(
+                        release_id=release_id,
+                        previous_release_id=previous_id,
+                    )
+                )
+            tip = repo.rev_parse("HEAD")
+            chain = rc.build_chain(manifests)
+
+            with mock.patch.object(
+                ga, "_run_git_argv", wraps=ga._run_git_argv,
+            ) as scalar_run:
+                scalar = {
+                    path: ga.find_introducing_commit(repo.work, path, tip)
+                    for path in paths
+                }
+            scalar_logs = sum(
+                1 for call in scalar_run.call_args_list
+                if call.args[0][3] == "log"
+            )
+            self.assertEqual(scalar_logs, 200)
+
+            with mock.patch.object(
+                ga, "_run_git_argv", wraps=ga._run_git_argv,
+            ) as batched_run:
+                release_commits = rc.resolve_unique_release_commits(
+                    chain, repo.work, tip,
+                )
+                installed = rc.resolve_installed_release(
+                    chain, repo.work, tip, release_commits,
+                )
+            batched_logs = sum(
+                1 for call in batched_run.call_args_list
+                if call.args[0][3] == "log"
+            )
+            self.assertEqual(batched_logs, 2)
+            self.assertEqual(installed.manifest.release_id, "r0101")
+            self.assertEqual(
+                {path: release_commits[Path(path).stem] for path in paths},
+                scalar,
+            )
+
+
+class RealReleaseChainBatchParityTests(SimpleTestCase):
+    def test_current_repository_chain_matches_scalar_oracle_byte_for_byte(self):
+        project_root = Path(__file__).resolve().parents[2]
+        canonical_tip = ga.rev_parse(project_root, "HEAD")
+        self.assertIsNotNone(canonical_tip)
+        manifests = rc.load_manifest_files_at_ref(project_root, canonical_tip)
+        chain = rc.build_chain(manifests)
+
+        scalar = {}
+        for chained in chain:
+            release_id = chained.manifest.release_id
+            scalar[release_id] = rc.resolve_release_commit(
+                chained, project_root, canonical_tip,
+            )
+        self.assertNotIn(None, scalar.values())
+
+        batched = rc.resolve_unique_release_commits(
+            chain, project_root, canonical_tip,
+        )
+        self.assertEqual(batched, scalar)
+        self.assertIn("r0093", batched)
+        self.assertIn("r0094", batched)

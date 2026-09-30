@@ -442,3 +442,120 @@ def find_introducing_commit(
     if len(added_shas) != 1 or history_shas != added_shas:
         return None
     return added_shas[0]
+
+
+_BATCH_LOG_RECORD_MARKER = b"\x00\x1e\x00"
+_BATCH_LOG_HEADER_SUFFIX = b"\x00\x1f\x00\x00\n"
+
+
+def _batched_path_history(
+    checkout_root: Path,
+    relative_paths: tuple[str, ...],
+    canonical_tip: str,
+    *,
+    additions_only: bool,
+) -> dict[str, list[str]] | None:
+    """Return canonical-history commits grouped by requested path.
+
+    Git's ``-z`` name output keeps path boundaries unambiguous.  The
+    pretty-format control records delimit commits; every emitted path must
+    be one of the paths supplied by the caller.  Any truncation, malformed
+    record, undecodable path, or unexpected path fails the whole read closed
+    instead of returning a partial identity map.
+    """
+    history_filter = ["--diff-filter=A"] if additions_only else []
+    returncode, stdout = _run_git_argv(
+        [
+            "git", "-C", str(checkout_root), "log", canonical_tip,
+            *history_filter,
+            "--format=%x00%x1e%x00%H%x00%x1f%x00",
+            "--name-only", "-z", "--", *relative_paths,
+        ],
+        GIT_TIMEOUT_SECONDS,
+    )
+    if returncode != 0 or len(stdout) >= MAX_OUTPUT_BYTES:
+        return None
+
+    histories = {path: [] for path in relative_paths}
+    if not stdout:
+        return histories
+
+    records = stdout.split(_BATCH_LOG_RECORD_MARKER)
+    if not records or records[0] != b"" or len(records) == 1:
+        return None
+    for record in records[1:]:
+        if len(record) < 40 + len(_BATCH_LOG_HEADER_SUFFIX):
+            return None
+        sha_bytes = record[:40]
+        if (
+            any(character not in b"0123456789abcdef" for character in sha_bytes)
+            or record[40:40 + len(_BATCH_LOG_HEADER_SUFFIX)] != _BATCH_LOG_HEADER_SUFFIX
+        ):
+            return None
+        path_bytes = record[40 + len(_BATCH_LOG_HEADER_SUFFIX):]
+        if not path_bytes or not path_bytes.endswith(b"\x00"):
+            return None
+        try:
+            changed_paths = [
+                raw_path.decode("utf-8")
+                for raw_path in path_bytes[:-1].split(b"\x00")
+                if raw_path
+            ]
+        except UnicodeDecodeError:
+            return None
+        if not changed_paths or any(path not in histories for path in changed_paths):
+            return None
+        sha = sha_bytes.decode("ascii")
+        for path in dict.fromkeys(changed_paths):
+            histories[path].append(sha)
+    return histories
+
+
+def find_introducing_commits(
+    checkout_root: Path, relative_paths, canonical_tip: str,
+) -> dict[str, str | None]:
+    """Batch form of :func:`find_introducing_commit` with identical rules.
+
+    Exactly two canonical ``git log`` traversals cover the entire supplied
+    path set: one additions-only history and one complete touch history.
+    Each result is accepted only when both histories contain the same single
+    commit.  The result contains every distinct supplied path; ``None`` means
+    that path has no unique immutable identity (or that the batched history
+    read failed closed).
+    """
+    if isinstance(relative_paths, (str, bytes)):
+        raise TypeError("relative_paths must be an iterable of repo-relative strings")
+    paths = tuple(dict.fromkeys(relative_paths))
+    for relative_path in paths:
+        if not isinstance(relative_path, str):
+            raise TypeError("relative_paths must contain only strings")
+        if relative_path.startswith("/") or ".." in Path(relative_path).parts:
+            raise ValueError(
+                f"relative_path must be repo-relative with no '..': {relative_path!r}"
+            )
+
+    unresolved = {path: None for path in paths}
+    if (
+        len(canonical_tip) != 40
+        or any(character not in "0123456789abcdef" for character in canonical_tip)
+        or not commit_exists(checkout_root, canonical_tip)
+    ):
+        return unresolved
+    if not paths:
+        return unresolved
+
+    additions = _batched_path_history(
+        checkout_root, paths, canonical_tip, additions_only=True,
+    )
+    history = _batched_path_history(
+        checkout_root, paths, canonical_tip, additions_only=False,
+    )
+    if additions is None or history is None:
+        return unresolved
+
+    return {
+        path: additions[path][0]
+        if len(additions[path]) == 1 and history[path] == additions[path]
+        else None
+        for path in paths
+    }

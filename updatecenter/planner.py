@@ -433,7 +433,7 @@ def build_plan(checkout_root, releases_dirname: str = release_chain.RELEASES_DIR
         return _safe(SafetyStatus.TARGET_COMMIT_UNKNOWN, str(exc), schema_health)
 
     installed = release_chain.resolve_installed_release(
-        chain, checkout_root, head_sha, canonical_tip, releases_dirname,
+        chain, checkout_root, head_sha, release_commits,
     )
     if installed is None:
         return _safe(

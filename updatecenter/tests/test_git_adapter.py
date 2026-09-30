@@ -2,6 +2,7 @@
 of subprocess itself (proves actual git behavior, not an assumption
 about it). [P0] 1.1 Phase A."""
 import subprocess
+from unittest import mock
 
 from django.test import SimpleTestCase
 
@@ -315,3 +316,179 @@ class PathAtCommitTests(SimpleTestCase):
             repo.write(path, "{}")
             repo.commit("add release", push=True)
             self.assertIsNone(ga.find_introducing_commit(repo.work, path, "f" * 40))
+
+
+class BatchedIntroducingCommitTests(SimpleTestCase):
+    def assert_batch_matches_scalar(self, repo, paths, tip=None):
+        tip = tip or repo.rev_parse("origin/main")
+        scalar = {
+            path: ga.find_introducing_commit(repo.work, path, tip)
+            for path in paths
+        }
+        self.assertEqual(ga.find_introducing_commits(repo.work, paths, tip), scalar)
+        return scalar
+
+    def test_ordinary_absent_and_two_paths_added_together_match_scalar(self):
+        with FakeRepo() as repo:
+            ordinary = "deploy/releases/r0002.json"
+            together_a = "deploy/releases/r0003.json"
+            together_b = "deploy/releases/r0004.json"
+            absent = "deploy/releases/absent.json"
+            repo.write(ordinary, "{}\n")
+            ordinary_sha = repo.commit("ordinary release")
+            repo.write(together_a, "{}\n")
+            repo.write(together_b, "{}\n")
+            together_sha = repo.commit("two release manifests")
+
+            result = self.assert_batch_matches_scalar(
+                repo, [ordinary, absent, together_a, together_b],
+            )
+            self.assertEqual(result[ordinary], ordinary_sha)
+            self.assertIsNone(result[absent])
+            self.assertEqual(result[together_a], together_sha)
+            self.assertEqual(result[together_b], together_sha)
+
+    def test_modified_deleted_and_readded_paths_match_scalar(self):
+        with FakeRepo() as repo:
+            modified = "deploy/releases/r0002.json"
+            deleted = "deploy/releases/r0003.json"
+            readded = "deploy/releases/r0004.json"
+            for path in (modified, deleted, readded):
+                repo.write(path, '{"version": 1}\n')
+                repo.commit(f"add {path}")
+            repo.write(modified, '{"version": 2}\n')
+            repo.commit("modify immutable manifest")
+            (repo.work / deleted).unlink()
+            repo.commit("delete immutable manifest")
+            (repo.work / readded).unlink()
+            repo.commit("delete before re-add")
+            repo.write(readded, '{"version": 1}\n')
+            repo.commit("re-add immutable manifest")
+
+            result = self.assert_batch_matches_scalar(repo, [modified, deleted, readded])
+            self.assertEqual(result, {modified: None, deleted: None, readded: None})
+
+    def test_unrelated_commits_and_noncanonical_refs_do_not_influence_batch(self):
+        with FakeRepo() as repo:
+            path = "deploy/releases/r0002.json"
+            branch_point = repo.rev_parse("HEAD")
+            repo.write(path, '{"canonical": true}\n')
+            canonical = repo.commit("canonical release", push=True)
+            repo.write("unrelated.txt", "later\n")
+            repo.commit("unrelated canonical commit", push=True)
+            canonical_tip = repo.rev_parse("origin/main")
+
+            subprocess.run(
+                ["git", "checkout", "-q", "-b", "local-review", branch_point],
+                cwd=repo.work, check=True, capture_output=True,
+            )
+            repo.write(path, '{"canonical": false}\n')
+            alternate = repo.commit("noncanonical alternate", push=False)
+            subprocess.run(
+                ["git", "update-ref", "refs/remotes/origin/stale-review", alternate],
+                cwd=repo.work, check=True, capture_output=True,
+            )
+            subprocess.run(
+                ["git", "checkout", "-q", "main"],
+                cwd=repo.work, check=True, capture_output=True,
+            )
+
+            result = self.assert_batch_matches_scalar(repo, [path], canonical_tip)
+            self.assertEqual(result[path], canonical)
+
+    def test_station_behind_uses_supplied_canonical_tip_not_head(self):
+        with FakeRepo() as repo:
+            behind_head = repo.rev_parse("HEAD")
+            path = "deploy/releases/r0002.json"
+            repo.write(path, "{}\n")
+            introduced = repo.commit("release ahead of station", push=True)
+            canonical_tip = repo.rev_parse("origin/main")
+            repo.reset_local_to(behind_head)
+
+            result = self.assert_batch_matches_scalar(repo, [path], canonical_tip)
+            self.assertEqual(result[path], introduced)
+
+    def test_rename_into_and_out_of_release_directory_match_scalar(self):
+        with FakeRepo() as repo:
+            renamed_in = "deploy/releases/r0002.json"
+            repo.write("staging/r0002.json", "{}\n")
+            repo.commit("stage manifest")
+            (repo.work / "deploy/releases").mkdir(parents=True, exist_ok=True)
+            subprocess.run(
+                ["git", "mv", "staging/r0002.json", renamed_in],
+                cwd=repo.work, check=True, capture_output=True,
+            )
+            repo.commit("rename manifest into release directory")
+
+            renamed_out = "deploy/releases/r0003.json"
+            repo.write(renamed_out, "{}\n")
+            repo.commit("add manifest that will move")
+            (repo.work / "archive").mkdir(parents=True, exist_ok=True)
+            subprocess.run(
+                ["git", "mv", renamed_out, "archive/r0003.json"],
+                cwd=repo.work, check=True, capture_output=True,
+            )
+            repo.commit("rename manifest out of release directory")
+
+            self.assert_batch_matches_scalar(repo, [renamed_in, renamed_out])
+
+    def test_merge_ancestry_matches_scalar(self):
+        with FakeRepo() as repo:
+            path = "deploy/releases/r0002.json"
+            subprocess.run(
+                ["git", "checkout", "-q", "-b", "side"],
+                cwd=repo.work, check=True, capture_output=True,
+            )
+            repo.write(path, "{}\n")
+            introduced = repo.commit("release introduced on side branch", push=False)
+            repo.write("side.txt", "side\n")
+            repo.commit("side branch", push=False)
+            subprocess.run(
+                ["git", "checkout", "-q", "main"],
+                cwd=repo.work, check=True, capture_output=True,
+            )
+            repo.write("main.txt", "main\n")
+            repo.commit("main branch", push=False)
+            subprocess.run(
+                ["git", "merge", "--no-ff", "-q", "side", "-m", "merge side"],
+                cwd=repo.work, check=True, capture_output=True,
+            )
+            tip = repo.rev_parse("HEAD")
+
+            result = self.assert_batch_matches_scalar(repo, [path], tip)
+            self.assertEqual(result[path], introduced)
+
+    def test_invalid_tip_and_paths_fail_closed_like_scalar_contract(self):
+        with FakeRepo() as repo:
+            path = "deploy/releases/r0002.json"
+            repo.write(path, "{}\n")
+            repo.commit("release")
+            self.assertEqual(
+                ga.find_introducing_commits(repo.work, [path], "f" * 40),
+                {path: None},
+            )
+            with self.assertRaises(ValueError):
+                ga.find_introducing_commits(
+                    repo.work, ["../../etc/passwd"], repo.rev_parse("origin/main"),
+                )
+
+    def test_malformed_or_truncated_git_output_fails_entire_batch_closed(self):
+        with FakeRepo() as repo:
+            paths = ["deploy/releases/r0002.json", "deploy/releases/r0003.json"]
+            tip = repo.rev_parse("origin/main")
+            with mock.patch.object(
+                ga, "_run_git_argv", return_value=(0, b"malformed history output"),
+            ):
+                self.assertIsNone(
+                    ga._batched_path_history(
+                        repo.work, tuple(paths), tip, additions_only=True,
+                    )
+                )
+            with mock.patch.object(
+                ga, "_run_git_argv", return_value=(0, b"x" * ga.MAX_OUTPUT_BYTES),
+            ):
+                self.assertIsNone(
+                    ga._batched_path_history(
+                        repo.work, tuple(paths), tip, additions_only=False,
+                    )
+                )
