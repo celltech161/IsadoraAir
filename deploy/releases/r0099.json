@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "release_id": "r0099",
+  "previous_release_id": "r0098",
+  "minimum_updater_protocol_version": 5,
+  "summary": "Exact engine restart/resume and hardened MP3 seek: after a restart the engine resumes the interrupted track at its saved position (early-rollover queues and true crossfades handled), and seek/resume exposes audio only once its target is confirmed. No migrations, requirements/packages, systemd, nginx, static or protected-runtime changes. Only the engine restarts; Gunicorn is unchanged. A restart still releases an active manual hold.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-engine"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0081",
+  "protected_runtime": null
+}
