@@ -22,7 +22,19 @@
     display: flex;
     align-items: center;
     gap: 0.5rem;
+    flex-wrap: wrap;
   }
+
+  .content-picker-heading {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: .5rem 1rem;
+    flex-wrap: wrap;
+  }
+  .content-picker-heading strong { font-size: .86rem; }
+  .selected-content-status { color: var(--text-muted); font-size: .76rem; }
+  .selected-content-status strong { color: var(--text-main); }
 
   .rotation-filter {
     flex: 1;
@@ -66,6 +78,18 @@
   }
 
   .rotation-btn:hover { opacity: 1; }
+  .rotation-btn:focus-visible,
+  .profile-panel button:focus-visible,
+  .profile-panel select:focus-visible,
+  .profile-panel input:focus-visible,
+  .date-hour-main:focus-visible,
+  .date-hour-actions button:focus-visible,
+  .hour-detail-head button:focus-visible,
+  .hour-detail-btn:focus-visible,
+  .cell-detail-btn:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
   .rotation-btn.selected {
     border-color: #fff;
     opacity: 1;
@@ -281,12 +305,12 @@
   }
 
   .profile-panel { background: var(--panel-bg); border: 1px solid var(--border-subtle); border-radius: 8px; padding: .75rem; margin-bottom: .85rem; }
-  .profile-row, .profile-actions, .mode-row { display: flex; align-items: center; gap: .45rem; flex-wrap: wrap; }
+  .profile-row, .profile-actions, .mode-row, .date-controls { display: flex; align-items: center; gap: .45rem; flex-wrap: wrap; }
   .profile-row select, .profile-row input { background: var(--bg-darker); color: var(--text-main); border: 1px solid var(--border-subtle); border-radius: 6px; padding: .42rem .55rem; }
   .profile-row select { min-width: 230px; }
   .profile-actions { margin-top: .6rem; }
-  .profile-actions button, .mode-row button, .date-cell button { background: var(--bg-dark); color: var(--text-main); border: 1px solid var(--border-subtle); border-radius: 6px; padding: .38rem .55rem; cursor: pointer; }
-  .profile-actions button:hover, .mode-row button:hover { border-color: var(--accent); }
+  .profile-actions button, .mode-row button, .date-controls button { background: var(--bg-dark); color: var(--text-main); border: 1px solid var(--border-subtle); border-radius: 6px; padding: .38rem .55rem; cursor: pointer; }
+  .profile-actions button:hover, .mode-row button:hover, .date-controls button:hover { border-color: var(--accent); }
   .profile-actions button.danger { color: var(--danger); }
   .state-badge { border-radius: 999px; padding: .2rem .48rem; font-size: .7rem; font-weight: 800; background: rgba(148,163,184,.18); }
   .state-badge.active { color: var(--accent-soft); }
@@ -294,14 +318,61 @@
   .profile-notice { margin-top: .5rem; color: var(--text-muted); font-size: .8rem; }
   .mode-row { margin-top: .75rem; border-top: 1px solid var(--border-subtle); padding-top: .65rem; }
   .mode-row button.selected { border-color: var(--accent); color: var(--accent-soft); }
+  .date-controls { margin-left: .25rem; }
+  .date-controls[hidden] { display: none; }
+  .date-controls label { color: var(--text-muted); font-size: .78rem; font-weight: 700; }
+  .date-controls input { background: var(--bg-darker); color: var(--text-main); border: 1px solid var(--border-subtle); border-radius: 6px; padding: .38rem .5rem; color-scheme: dark; }
   .date-schedule { display: none; margin-top: .85rem; }
-  .date-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(145px, 1fr)); gap: 5px; }
-  .date-cell { min-height: 76px; border: 1px solid var(--border-subtle); background: rgba(15,23,42,.6); border-radius: 7px; padding: .45rem; cursor: pointer; }
-  .date-cell .date-hour { color: var(--text-muted); font-size: .72rem; font-weight: 700; }
-  .date-cell .date-name { display: block; margin-top: .3rem; font-size: .8rem; font-weight: 700; }
-  .date-cell .origin { display: block; margin-top: .25rem; font-size: .66rem; text-transform: uppercase; letter-spacing: .04em; color: var(--text-muted); }
-  .date-cell.override { border-color: var(--accent); }
-  .date-cell button { margin-top: .35rem; padding: .2rem .35rem; font-size: .68rem; }
+  .date-schedule-head { display: flex; justify-content: space-between; align-items: end; gap: .5rem 1rem; flex-wrap: wrap; margin-bottom: .55rem; }
+  .date-schedule-head h2 { margin: 0; font-size: 1rem; }
+  .date-schedule-head .profile-notice { margin: 0; }
+  .date-hour-list { display: flex; flex-direction: column; gap: 4px; }
+  .date-hour-row {
+    --content-color: transparent;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: stretch;
+    border: 1px solid var(--border-subtle);
+    background: rgba(15,23,42,.6);
+    border-radius: 7px;
+    overflow: hidden;
+  }
+  .date-hour-row.origin-date-override { border-color: var(--accent); box-shadow: inset 3px 0 0 var(--accent); }
+  .date-hour-row.origin-none { border-style: dashed; }
+  .date-hour-main {
+    display: grid;
+    grid-template-columns: 92px 82px minmax(0, 1fr) auto;
+    align-items: center;
+    gap: .65rem;
+    width: 100%;
+    min-width: 0;
+    min-height: 48px;
+    padding: .48rem .65rem;
+    border: 0;
+    border-left: 5px solid var(--content-color);
+    background: transparent;
+    color: var(--text-main);
+    text-align: left;
+    cursor: pointer;
+  }
+  .date-hour-main.kind-playlist { border-left-style: dashed; }
+  .date-hour-main:disabled { cursor: default; opacity: .72; }
+  .date-hour-main:not(:disabled):hover { background-color: rgba(255,255,255,.055); }
+  .date-hour { color: var(--text-muted); font-size: .78rem; font-weight: 800; white-space: nowrap; }
+  .date-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: .83rem; font-weight: 700; }
+  .date-name.empty { color: var(--text-muted); font-weight: 600; }
+  .date-origin-badge { display: inline-flex; justify-content: center; border-radius: 999px; padding: .18rem .42rem; font-size: .62rem; font-weight: 900; letter-spacing: .04em; border: 1px solid var(--border-subtle); color: var(--text-muted); }
+  .date-origin-badge.override { border-color: var(--accent); color: var(--accent-soft); background: rgba(34,197,94,.1); }
+  .date-origin-badge.empty { border-style: dashed; color: var(--text-muted); }
+  .date-hour-actions { display: flex; align-items: center; justify-content: flex-end; gap: .35rem; padding: .35rem .5rem; border-left: 1px solid var(--border-subtle); }
+  .date-hour-actions button { min-height: 34px; background: var(--bg-dark); color: var(--text-main); border: 1px solid var(--border-subtle); border-radius: 6px; padding: .3rem .5rem; cursor: pointer; font-size: .7rem; white-space: nowrap; }
+  .date-hour-actions button:hover { border-color: var(--accent); }
+  .date-hour-actions button:disabled { cursor: not-allowed; opacity: .45; }
+  .date-hour-row.has-detail .date-hour-main {
+    --content-color: #94a3b8;
+    background-color: #475569;
+    background-image: repeating-linear-gradient(135deg, rgba(255,255,255,.16) 0 4px, rgba(0,0,0,.14) 4px 8px);
+  }
   .content-picker { margin-bottom: .85rem; }
   .schedule-readonly .content-picker { opacity: .45; pointer-events: none; }
   .api-error { color: var(--danger); font-size: .8rem; margin-top: .4rem; min-height: 1em; }
@@ -312,8 +383,7 @@
      the overview never implies a single source owns the whole hour. */
   .grid-cell .cell-label { pointer-events: none; }
   .grid-cell.has-detail,
-  .mobile-hour-cell.has-detail,
-  .date-cell.has-detail {
+  .mobile-hour-cell.has-detail {
     background-color: #475569 !important;
     background-image: repeating-linear-gradient(135deg, rgba(255,255,255,.16) 0 4px, rgba(0,0,0,.14) 4px 8px);
   }
@@ -341,9 +411,32 @@
   .minute-cell:focus-visible { outline: 2px solid var(--accent); }
   .hour-detail-segments { margin-top: .6rem; font-size: .76rem; color: var(--text-muted); }
   .schedule-readonly .minute-cell { cursor: default; }
+  @media (max-width: 1100px) {
+    .minute-grid { grid-template-columns: repeat(10, minmax(0, 1fr)); }
+  }
+  @media (max-width: 900px) {
+    .minute-grid { grid-template-columns: repeat(8, minmax(0, 1fr)); }
+  }
   @media (max-width: 768px) {
     .minute-grid { grid-template-columns: repeat(6, minmax(0, 1fr)); }
     .minute-cell { min-height: 48px; }
+    .profile-row select { min-width: min(230px, 100%); max-width: 100%; }
+    .date-controls { width: 100%; margin-left: 0; }
+    .date-controls label { flex: 1; }
+    .date-controls input { width: 100%; }
+  }
+  @media (max-width: 620px) {
+    .date-hour-row { grid-template-columns: minmax(0, 1fr); }
+    .date-hour-main { grid-template-columns: 78px 72px minmax(0, 1fr) auto; gap: .45rem; }
+    .date-hour-actions { border-left: 0; border-top: 1px solid var(--border-subtle); padding: .3rem .5rem; }
+    .date-hour-actions button { min-height: 38px; }
+  }
+  @media (max-width: 480px) {
+    .minute-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+    .date-hour-main { grid-template-columns: 72px 66px minmax(0, 1fr) auto; padding: .48rem .45rem; gap: .35rem; }
+    .date-hour { font-size: .72rem; }
+    .date-origin-badge { font-size: .58rem; padding-inline: .32rem; }
+    .date-schedule-head { align-items: start; }
   }
 </style>
 {% endblock %}
@@ -369,7 +462,12 @@
   <div class="mode-row">
     <button type="button" id="weeklyModeButton" class="selected" onclick="setMode('weekly')">Weekly Schedule</button>
     <button type="button" id="dateModeButton" onclick="setMode('date')">Date Override</button>
-    <label id="datePickerWrap" hidden>Date: <input id="overrideDate" type="date"></label>
+    <div id="dateControls" class="date-controls" hidden aria-label="Date Override navigation">
+      <button type="button" id="previousDateButton" title="Previous day" aria-label="Previous day" onclick="shiftOverrideDate(-1)">&larr;</button>
+      <label>Date: <input id="overrideDate" type="date" aria-label="Selected override date"></label>
+      <button type="button" id="nextDateButton" title="Next day" aria-label="Next day" onclick="shiftOverrideDate(1)">&rarr;</button>
+      <button type="button" id="todayButton" onclick="selectToday()">Today</button>
+    </div>
   </div>
   <div id="apiError" class="api-error" role="alert"></div>
 </section>
@@ -378,9 +476,13 @@
      outside both mode containers makes the same selection state available
      on desktop and mobile without duplicating a second palette. -->
 <div id="contentPicker" class="rotation-toolbar content-picker" aria-label="Schedule content picker">
+  <div class="content-picker-heading">
+    <strong>Schedule content</strong>
+    <span id="selectedContentStatus" class="selected-content-status" aria-live="polite">Selected: <strong>Clear / remove</strong></span>
+  </div>
   <div class="rotation-toolbar-top">
-    <input type="text" class="rotation-filter" id="rotationFilter" placeholder="Filter rotations &amp; playlists…" oninput="filterPalette(this.value)">
-    <button class="rotation-btn clear-btn" data-rotation-id="clear" onclick="selectContent(this, null, null, null)">
+    <input type="text" class="rotation-filter" id="rotationFilter" aria-label="Filter schedule content" placeholder="Filter rotations &amp; playlists…" oninput="filterPalette(this.value)">
+    <button type="button" class="rotation-btn clear-btn selected" data-rotation-id="clear" aria-pressed="true" onclick="selectContent(this, null, null, null)">
       Clear
     </button>
   </div>
@@ -388,7 +490,7 @@
   <div class="rotation-group-label">Rotations</div>
   <div class="rotation-group">
     {% for rotation in rotations %}
-    <button class="rotation-btn" data-rotation-id="{{ rotation.id }}"
+    <button type="button" class="rotation-btn content-rotation" data-rotation-id="{{ rotation.id }}" aria-pressed="false"
             onclick="selectContent(this, 'rotation', {{ rotation.id }}, '{{ rotation.name|escapejs }}')">
       {{ rotation.name }}
     </button>
@@ -400,7 +502,7 @@
   <div class="rotation-group-label">Playlists</div>
   <div class="rotation-group">
     {% for playlist in playlists %}
-    <button class="rotation-btn" data-playlist-id="{{ playlist.id }}"
+    <button type="button" class="rotation-btn content-playlist" data-playlist-id="{{ playlist.id }}" aria-pressed="false"
             onclick="selectContent(this, 'playlist', {{ playlist.id }}, '{{ playlist.name|escapejs }}')">
       {{ playlist.name }}
     </button>
@@ -450,8 +552,11 @@
 </div>
 
 <div id="dateSchedule" class="date-schedule">
-  <p class="profile-notice">Outlined cells are explicit overrides. Other populated cells are inherited from the weekly schedule. Striped cells contain minute transitions &mdash; open Hour Detail to see them.</p>
-  <div id="dateGrid" class="date-grid"></div>
+  <div class="date-schedule-head">
+    <h2 id="selectedDateTitle">Date Override</h2>
+    <p class="profile-notice">Each badge identifies the :00 assignment. Striped rows have minute transitions; Hour Detail shows the server-resolved timeline.</p>
+  </div>
+  <div id="dateHourList" class="date-hour-list" aria-label="24-hour Date Override schedule"></div>
 </div>
 
 <!-- Hour Detail: the sixty minute positions of one hour. Only explicit
@@ -462,7 +567,7 @@
     <h3 id="hourDetailTitle">Hour Detail</h3>
     <button type="button" id="hourDetailClose" onclick="closeHourDetail()">Close</button>
   </div>
-  <p class="hour-detail-help">Select a Rotation or Playlist above, then click a minute to start it there. The :00 minute is the hour&rsquo;s base assignment. Choose <em>Clear</em> and click a marked transition to remove only that transition. Only marked (&bull;) minutes are stored.</p>
+  <p class="hour-detail-help">Select a Rotation or Playlist above, then click a minute to start it there. The :00 minute is the hour&rsquo;s base assignment. Choose <em>Clear</em> and click a marked transition to remove only that transition. Solid marked (&bull;) cells are explicit; dashed cells are effective inherited weekly transitions. Only explicit transitions are stored.</p>
   <div id="minuteGrid" class="minute-grid" role="group" aria-label="Minutes 00 to 59"></div>
   <div id="hourDetailSegments" class="hour-detail-segments"></div>
 </section>
@@ -482,6 +587,12 @@ const HOUR_LABELS = [
   '6:00a','7:00a','8:00a','9:00a','10:00a','11:00a',
   '12:00p','1:00p','2:00p','3:00p','4:00p','5:00p',
   '6:00p','7:00p','8:00p','9:00p','10:00p','11:00p',
+];
+const DATE_HOUR_LABELS = [
+  '12:00 AM','1:00 AM','2:00 AM','3:00 AM','4:00 AM','5:00 AM',
+  '6:00 AM','7:00 AM','8:00 AM','9:00 AM','10:00 AM','11:00 AM',
+  '12:00 PM','1:00 PM','2:00 PM','3:00 PM','4:00 PM','5:00 PM',
+  '6:00 PM','7:00 PM','8:00 PM','9:00 PM','10:00 PM','11:00 PM',
 ];
 
 const PALETTE = [
@@ -696,7 +807,7 @@ async function setMode(mode) {
   scheduleMode = mode;
   document.getElementById('weeklyModeButton').classList.toggle('selected', mode === 'weekly');
   document.getElementById('dateModeButton').classList.toggle('selected', mode === 'date');
-  document.getElementById('datePickerWrap').hidden = mode !== 'date';
+  document.getElementById('dateControls').hidden = mode !== 'date';
   document.getElementById('weeklyDesktop').style.display = mode === 'weekly' ? '' : 'none';
   document.getElementById('weeklyMobile').style.display = mode === 'weekly' ? '' : 'none';
   document.getElementById('dateSchedule').style.display = mode === 'date' ? 'block' : 'none';
@@ -704,11 +815,17 @@ async function setMode(mode) {
 }
 
 function selectContent(btn, kind, id, name) {
-  document.querySelectorAll('.rotation-btn').forEach(b => b.classList.remove('selected'));
+  document.querySelectorAll('.rotation-btn').forEach(b => {
+    b.classList.remove('selected');
+    b.setAttribute('aria-pressed', 'false');
+  });
   btn.classList.add('selected');
+  btn.setAttribute('aria-pressed', 'true');
   selectedKind = kind;
   selectedContentId = id;
   selectedContentName = name;
+  const label = kind ? `${kind === 'playlist' ? 'Playlist' : 'Rotation'}: ${name}` : 'Clear / remove';
+  document.getElementById('selectedContentStatus').innerHTML = `Selected: <strong>${escapeHtml(label)}</strong>`;
 }
 
 // 93+ rotations/playlists is too many to scan by eye alone -- a live
@@ -732,6 +849,32 @@ function stationIsoDate() {
   const day = String(stationNow.day).padStart(2, '0');
   return `${year}-${month}-${day}`;
 }
+
+function formatSelectedDate(isoDate) {
+  const [year, month, day] = isoDate.split('-').map(Number);
+  if (!year || !month || !day) return isoDate;
+  const value = new Date(Date.UTC(year, month - 1, day));
+  return new Intl.DateTimeFormat(undefined, {
+    weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', timeZone: 'UTC',
+  }).format(value);
+}
+
+function setOverrideDate(isoDate) {
+  const input = document.getElementById('overrideDate');
+  input.value = isoDate;
+  closeHourDetail();
+  if (scheduleMode === 'date') loadDateSchedule();
+}
+
+function shiftOverrideDate(days) {
+  const value = document.getElementById('overrideDate').value;
+  const [year, month, day] = value.split('-').map(Number);
+  if (!year || !month || !day) return;
+  const shifted = new Date(Date.UTC(year, month - 1, day + days)).toISOString().slice(0, 10);
+  setOverrideDate(shifted);
+}
+
+function selectToday() { setOverrideDate(stationIsoDate()); }
 
 // --- Desktop grid ---
 function buildGrid() {
@@ -1000,32 +1143,72 @@ async function loadDateSchedule() {
   if (!selectedProfile) return;
   const date = document.getElementById('overrideDate').value;
   if (!date) return;
+  const requestedProfileUuid = selectedProfile.uuid;
+  const requestedDate = date;
   try {
-    const data = await apiRequest(`/api/schedule/?profile=${encodeURIComponent(selectedProfile.uuid)}&date=${encodeURIComponent(date)}`);
-    const grid = document.getElementById('dateGrid');
-    grid.innerHTML = '';
+    const data = await apiRequest(`/api/schedule/?profile=${encodeURIComponent(requestedProfileUuid)}&date=${encodeURIComponent(requestedDate)}`);
+    // A slower response for a previously selected profile/date must never
+    // overwrite the newly selected context.
+    if (scheduleMode !== 'date' || !selectedProfile
+        || selectedProfile.uuid !== requestedProfileUuid
+        || document.getElementById('overrideDate').value !== requestedDate) return;
+    document.getElementById('selectedDateTitle').textContent = formatSelectedDate(data.date);
+    const list = document.getElementById('dateHourList');
+    list.innerHTML = '';
     data.cells.forEach(cell => {
       const node = document.createElement('div');
-      node.className = `date-cell ${cell.origin === 'date_override' ? 'override' : ''} ${cell.detail_count ? 'has-detail' : ''}`;
+      node.className = `date-hour-row origin-${cell.origin.replace('_', '-')} ${cell.detail_count ? 'has-detail' : ''}`;
       const effective = cell.effective_block;
-      if (effective && !cell.detail_count) node.style.backgroundColor = contentColor(effective.content_kind, effective.content_id);
-      const origin = cell.origin === 'date_override' ? 'Date override' : (cell.origin === 'weekly' ? 'Inherited weekly' : 'No schedule');
-      const detailNote = cell.detail_count ? `<span class="detail-badge">+${cell.detail_count}</span>` : '';
-      node.innerHTML = `<span class="date-hour">${HOUR_LABELS[cell.hour]}${detailNote}</span><span class="date-name">${effective ? escapeHtml(effective.content_name) : 'Empty'}</span><span class="origin">${origin}</span>`;
-      node.addEventListener('click', () => assignDateCell(cell.hour));
+      const originLabel = cell.origin === 'date_override' ? 'OVERRIDE' : (cell.origin === 'weekly' ? 'WEEKLY' : 'EMPTY');
+
+      const assignButton = document.createElement('button');
+      assignButton.type = 'button';
+      assignButton.className = `date-hour-main${effective && effective.content_kind === 'playlist' && !cell.detail_count ? ' kind-playlist' : ''}`;
+      assignButton.disabled = selectedProfile.is_archived;
+      assignButton.title = selectedProfile.is_archived
+        ? 'Archived profiles are read-only'
+        : `Apply selected content at ${DATE_HOUR_LABELS[cell.hour]}`;
+      assignButton.setAttribute('aria-label', `${DATE_HOUR_LABELS[cell.hour]}, ${originLabel.toLowerCase()}, ${effective ? effective.content_name : 'empty'}${cell.detail_count ? `, ${cell.detail_count} additional transition${cell.detail_count === 1 ? '' : 's'}` : ''}. ${assignButton.title}`);
+      if (effective && !cell.detail_count) {
+        assignButton.style.setProperty('--content-color', contentColor(effective.content_kind, effective.content_id));
+      }
+      const hourLabel = document.createElement('span');
+      hourLabel.className = 'date-hour';
+      hourLabel.textContent = DATE_HOUR_LABELS[cell.hour];
+      const originBadge = document.createElement('span');
+      originBadge.className = `date-origin-badge ${cell.origin === 'date_override' ? 'override' : (cell.origin === 'none' ? 'empty' : 'weekly')}`;
+      originBadge.textContent = originLabel;
+      const contentName = document.createElement('span');
+      contentName.className = `date-name${effective ? '' : ' empty'}`;
+      contentName.textContent = effective ? effective.content_name : '—';
+      const detailBadge = document.createElement('span');
+      detailBadge.className = 'detail-badge';
+      detailBadge.textContent = cell.detail_count ? `+${cell.detail_count}` : '';
+      detailBadge.title = cell.detail_count ? `${cell.detail_count} additional effective transition${cell.detail_count === 1 ? '' : 's'} in this hour` : '';
+      assignButton.append(hourLabel, originBadge, contentName, detailBadge);
+      assignButton.addEventListener('click', () => assignDateCell(cell.hour));
+      node.appendChild(assignButton);
+
+      const actions = document.createElement('div');
+      actions.className = 'date-hour-actions';
       const detailButton = document.createElement('button');
       detailButton.type = 'button';
-      detailButton.textContent = 'Hour detail';
+      detailButton.className = 'date-detail-button';
+      detailButton.textContent = 'Hour Detail';
+      detailButton.setAttribute('aria-label', `Open Hour Detail for ${DATE_HOUR_LABELS[cell.hour]}`);
       detailButton.addEventListener('click', event => { event.stopPropagation(); openHourDetail('date', null, cell.hour); });
-      node.appendChild(detailButton);
+      actions.appendChild(detailButton);
       if (cell.explicit_block_id) {
         const button = document.createElement('button');
         button.type = 'button';
         button.textContent = 'Revert to Weekly';
+        button.disabled = selectedProfile.is_archived;
+        button.title = selectedProfile.is_archived ? 'Archived profiles are read-only' : 'Remove this exact dated base assignment';
         button.addEventListener('click', event => { event.stopPropagation(); revertDateCell(cell.explicit_block_id); });
-        node.appendChild(button);
+        actions.appendChild(button);
       }
-      grid.appendChild(node);
+      node.appendChild(actions);
+      list.appendChild(node);
     });
   } catch (error) { showError(error.message); }
 }
@@ -1049,7 +1232,6 @@ async function assignDateCell(hour) {
       method: 'POST', headers: {'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken')},
       body: JSON.stringify(body),
     });
-    await loadDateSchedule();
     await loadProfiles(selectedProfile.uuid);
   } catch (error) { showError(error.message); }
 }
@@ -1061,7 +1243,6 @@ async function revertDateCell(blockId) {
     await apiRequest(`/api/schedule/${blockId}/?profile=${encodeURIComponent(selectedProfile.uuid)}&date=${encodeURIComponent(date)}`, {
       method: 'DELETE', headers: {'X-CSRFToken': getCookie('csrftoken')},
     });
-    await loadDateSchedule();
     await loadProfiles(selectedProfile.uuid);
   } catch (error) { showError(error.message); }
 }
@@ -1191,7 +1372,7 @@ document.addEventListener('DOMContentLoaded', () => {
   buildGrid();
   buildDayPicker();
   document.getElementById('overrideDate').value = stationIsoDate();
-  document.getElementById('overrideDate').addEventListener('change', () => { closeHourDetail(); loadDateSchedule(); });
+  document.getElementById('overrideDate').addEventListener('change', event => setOverrideDate(event.target.value));
   document.getElementById('profileSelect').addEventListener('change', async event => {
     selectedProfile = profiles.find(profile => profile.uuid === event.target.value);
     closeHourDetail();

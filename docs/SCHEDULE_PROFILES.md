@@ -199,3 +199,25 @@ is drawn as a neutral striped cell with a `+N` count. The Hour Detail panel (a
 detail button on a cell, or *Detail* on mobile; *Hour detail* in Date Override)
 shows the minutes as the server resolved them. Only the marked transitions
 persist.
+
+## Operator presentation (3.1D)
+
+The Date Override view is a vertical 24-hour operator schedule on both desktop
+and mobile. Each row labels the effective `HH:00` assignment as **WEEKLY**,
+**OVERRIDE** or **EMPTY** using the server's `origin` value. A striped row and
+`+N` badge mean that the hour has additional effective minute transitions, so
+the assignment shown at `:00` must not be read as owning the whole hour. Open
+**Hour Detail** for the authoritative server-resolved 60-minute timeline;
+solid marked cells are explicit transitions and dashed cells are effective
+inherited weekly transitions. Shadowed weekly rows are not displayed as
+effective inherited transitions.
+
+The Previous, Next, Today and native date controls change only the date being
+inspected inside the selected profile. The same Rotation/Playlist picker is
+shared with Weekly mode and remains available while Hour Detail is open.
+Selecting content and pressing an editable hour creates or updates its dated
+`:00` row. **Revert to Weekly** retains its narrow meaning: it deletes only the
+identified explicit dated base row, subject to the existing dependency/conflict
+checks, and then reveals the recurring weekly layer. Nonzero dated transitions
+continue to be edited individually in Hour Detail. Archived profiles remain
+inspectable while assignment, revert and minute-write controls are read-only.

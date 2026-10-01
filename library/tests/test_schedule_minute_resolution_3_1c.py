@@ -1054,7 +1054,7 @@ class HourDetailPageMarkupTests(ResolverFixtures, ApiMixin, TestCase):
         self.assertIn("if (block.start_minute) { detailCounts[block.day_of_week][block.start_hour] += 1; continue; }", self.html)
 
     def test_a_detailed_hour_has_a_distinct_neutral_overview_state(self):
-        for marker in (".grid-cell.has-detail", ".mobile-hour-cell.has-detail", ".date-cell.has-detail",
+        for marker in (".grid-cell.has-detail", ".mobile-hour-cell.has-detail", ".date-hour-row.has-detail",
                        "const DETAIL_COLOR = '#475569'", "cell.classList.toggle('has-detail', extra > 0)",
                        "detail-badge"):
             with self.subTest(marker=marker):
@@ -1072,8 +1072,10 @@ class HourDetailPageMarkupTests(ResolverFixtures, ApiMixin, TestCase):
     def test_hour_detail_closes_when_its_context_changes(self):
         self.assertIn("closeHourDetail();\n  scheduleMode = mode;", self.html)
         self.assertIn("closeHourDetail();\n    updateProfileChrome();", self.html)
-        self.assertIn("addEventListener('change', () => { closeHourDetail(); loadDateSchedule(); })", self.html)
+        self.assertIn("function setOverrideDate(isoDate)", self.html)
+        self.assertIn("input.value = isoDate;\n  closeHourDetail();", self.html)
+        self.assertIn("addEventListener('change', event => setOverrideDate(event.target.value))", self.html)
 
-    def test_deferred_date_override_redesign_is_not_part_of_this_page(self):
-        # The existing whole-day card grid is kept for 3.1C.
-        self.assertIn('id="dateGrid" class="date-grid"', self.html)
+    def test_date_override_uses_the_3_1d_vertical_day_surface(self):
+        self.assertIn('id="dateHourList" class="date-hour-list"', self.html)
+        self.assertNotIn('id="dateGrid" class="date-grid"', self.html)
