@@ -1163,7 +1163,8 @@ def _identity_keys_for_picks(picks):
 
 def fill_remaining_hour(picks, accumulated_seconds, target_datetime,
                         active_holiday_codes=None, daily_shares=None,
-                        identity_cache=None, target_duration_seconds=NOMINAL_HOUR_SECONDS):
+                        identity_cache=None, target_duration_seconds=NOMINAL_HOUR_SECONDS,
+                        scheduled_time_offset_seconds=0.0):
     """Top up `picks` with fallback-category tracks (admin-configured via
     LogFillConfig) until `target_duration_seconds` is filled, or as
     tightly as duration-fit allows. Called after any build path in case
@@ -1223,7 +1224,9 @@ def fill_remaining_hour(picks, accumulated_seconds, target_datetime,
     def _append_fill_pick(track):
         nonlocal accumulated_seconds, remaining
         track_duration = effective_airtime_seconds(track)
-        scheduled_time = target_datetime + timedelta(seconds=accumulated_seconds)
+        scheduled_time = target_datetime + timedelta(
+            seconds=scheduled_time_offset_seconds + accumulated_seconds
+        )
         picks.append({
             "position": len(picks),
             "scheduled_time": scheduled_time,
@@ -1391,12 +1394,15 @@ class HourBuildContext:
     picked_tracks: list = field(default_factory=list)
     picked_identity_keys: set = field(default_factory=set)
     accumulated_seconds: float = 0.0
+    scheduled_time_offset_seconds: float = 0.0
     rotation_walked: bool = False
 
     def record_pick(self, track, category):
         self.picks.append({
             "position": len(self.picks),
-            "scheduled_time": self.target_datetime + timedelta(seconds=self.accumulated_seconds),
+            "scheduled_time": self.target_datetime + timedelta(
+                seconds=self.scheduled_time_offset_seconds + self.accumulated_seconds
+            ),
             "track": track,
             "category": category,
         })
@@ -1461,7 +1467,9 @@ def _walk_rotation_segment(ctx, slots, segment_end_seconds, observer=None):
         if observer is not None and label is not None:
             observer.on_pick(track, label)
         track_duration = effective_airtime_seconds(track)
-        scheduled_time = target_datetime + timedelta(seconds=accumulated_seconds)
+        scheduled_time = target_datetime + timedelta(
+            seconds=ctx.scheduled_time_offset_seconds + accumulated_seconds
+        )
         picks.append({
             "position": len(picks),
             "scheduled_time": scheduled_time,
@@ -1738,6 +1746,26 @@ def _plan_hour(target_date, hour, plans, target_duration_seconds, observer=None)
             observer.on_empty_source(plan)
 
     ctx = _new_hour_context(target_date, hour, target_duration_seconds)
+    # A partial-hour schedule begins after an intentional continuation
+    # prefix. Seed the build clock at the first non-elapsed transition so
+    # generated LogItems retain their true wall-clock eligibility boundary.
+    # When clock-drift recovery starts after that transition, nominal_start
+    # is negative and the build correctly begins immediately at offset zero.
+    first_applicable_start = next(
+        (nominal_start for plan, nominal_start, _end, elapsed in windows
+         if not elapsed and not plan.empty),
+        0.0,
+    )
+    ctx.accumulated_seconds = max(0.0, first_applicable_start)
+    if plans and plans[0].start_minute > 0:
+        # `_segment_windows` uses a build-relative clock when an upcoming
+        # hour is projected to start late. Keep selection on that clock, but
+        # shift persisted timestamps back onto the real wall clock: a 11:30
+        # takeover built for an 11:05 projected start is still 11:30, not
+        # 11:25. If projected start is already 11:40, its first item is 11:40.
+        ctx.scheduled_time_offset_seconds = max(
+            0.0, NOMINAL_HOUR_SECONDS - target_duration_seconds,
+        )
     records = []
     for plan, nominal_start, end, elapsed in windows:
         record = {
@@ -1774,6 +1802,7 @@ def _plan_hour(target_date, hour, plans, target_duration_seconds, observer=None)
             daily_shares=ctx.daily_shares,
             identity_cache=ctx.identity_cache,
             target_duration_seconds=end,
+            scheduled_time_offset_seconds=ctx.scheduled_time_offset_seconds,
         )
         ctx.resync_from_picks()
         record["actual_end_seconds"] = ctx.accumulated_seconds
@@ -1929,11 +1958,11 @@ def build_hour_log(target_date, hour, target_duration_seconds=NOMINAL_HOUR_SECON
 
     The hour's effective schedule segments (3.1C minute transitions) are
     resolved once for that profile and built into ONE combined pick list that
-    is persisted ONCE as the hour's single PlaylistLog. An hour with no
-    minute transitions has exactly one segment and behaves as it always did.
-    The legacy exact-hour helper `resolve_schedule_block` is intentionally
-    not used here and keeps its HH:00 meaning for the engine's blank-hour
-    continuation logic."""
+    is persisted ONCE as the hour's single PlaylistLog. A partial hour seeds
+    its build clock at the first transition; an hour with no schedule rows
+    remains unbuildable. The legacy exact-hour helper
+    `resolve_schedule_block` remains available to compatibility callers but
+    is not used for this build."""
     profile = schedule_profile if schedule_profile is not None else get_active_schedule_profile()
     segments = resolve_schedule_segments(target_date, hour, profile)
     if not segments:
@@ -2165,6 +2194,7 @@ def preview_hour_log(target_date, hour, target_duration_seconds=NOMINAL_HOUR_SEC
     result = {
         "date": target_date.isoformat(),
         "hour": hour,
+        "continuation_until_minute": plans[0].start_minute if plans[0].start_minute > 0 else None,
         "source": plans[0].kind if len(plans) == 1 else (kinds.pop() if len(kinds) == 1 else "mixed"),
         "source_name": " → ".join(plan.name for plan in plans),
         "total_seconds": accumulated_seconds,

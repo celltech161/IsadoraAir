@@ -6,13 +6,14 @@ hour built from several segments, persisted once).
 """
 import json
 import tempfile
-from datetime import date, time
+from datetime import date, datetime, time
 from pathlib import Path
 from unittest.mock import patch
 
 from django.db import connection
 from django.test import TestCase, TransactionTestCase, override_settings
 from django.urls import reverse
+from django.utils import timezone
 
 from library.models import (
     Artist, Category, CategoryKind, LogFillConfig, LogItem, Playlist, PlaylistItem,
@@ -213,10 +214,23 @@ class SegmentResolutionTests(ResolverFixtures, TestCase):
         override.delete()
         self.assertEqual(shape(self.segments()), [(0, "A", "weekly"), (30, "B", "weekly")])
 
-    def test_an_hour_with_only_later_rows_is_not_buildable(self):
+    def test_an_hour_with_only_later_rows_is_a_layered_partial_hour(self):
         make_row(self.profile, 10, 30, rotation=self.B, dow=0)
         make_row(self.profile, 10, 40, rotation=self.C, on=MONDAY)
-        self.assertEqual(self.segments(), [])
+        self.assertEqual(shape(self.segments()), [(30, "B", "weekly"), (40, "C", "date_override")])
+
+    def test_a_dated_later_row_without_weekly_base_is_a_partial_hour(self):
+        make_row(self.profile, 10, 30, rotation=self.D, on=MONDAY)
+        self.assertEqual(shape(self.segments()), [(30, "D", "date_override")])
+
+    def test_earlier_dated_partial_shadows_a_later_weekly_partial(self):
+        make_row(self.profile, 10, 30, rotation=self.B, dow=0)
+        make_row(self.profile, 10, 20, rotation=self.D, on=MONDAY)
+        self.assertEqual(shape(self.segments()), [(20, "D", "date_override")])
+        entries = self.date_entries()
+        self.assertTrue(all(entry["continuation"] for entry in entries[:20]))
+        self.assertEqual(entries[30]["effective_block"].rotation.name, "D")
+        self.assertFalse(entries[30]["inherited_transition"])
 
     def test_a_dated_override_alone_is_a_valid_base_for_that_date(self):
         make_row(self.profile, 10, 0, rotation=self.D, on=MONDAY)
@@ -235,7 +249,7 @@ class SegmentResolutionTests(ResolverFixtures, TestCase):
         make_row(self.profile, 10, 0, rotation=self.A, dow=0)
         make_row(self.profile, 11, 15, rotation=self.B, dow=0)
         self.assertEqual(shape(self.segments(hour=10)), [(0, "A", "weekly")])
-        self.assertEqual(self.segments(hour=11), [])
+        self.assertEqual(shape(self.segments(hour=11)), [(15, "B", "weekly")])
 
     def test_first_segment_is_always_the_legacy_exact_hour_row(self):
         make_row(self.profile, 10, 0, rotation=self.A, dow=0)
@@ -257,7 +271,10 @@ class SegmentResolutionTests(ResolverFixtures, TestCase):
         # that started earlier is never carried into a later hour.
         self.assertIsNone(resolve_schedule_block(MONDAY, 11, profile=self.profile))
         self.assertIsNone(resolve_schedule_block(MONDAY, 23, profile=self.profile))
-        self.assertEqual(resolve_schedule_segments(MONDAY, 23, self.profile), [])
+        self.assertEqual(
+            [s.start_minute for s in resolve_schedule_segments(MONDAY, 23, self.profile)],
+            [30],
+        )
 
     def test_minute_map_marks_explicit_inherited_and_segment_starts(self):
         make_row(self.profile, 10, 0, rotation=self.A, dow=0)
@@ -276,14 +293,15 @@ class SegmentResolutionTests(ResolverFixtures, TestCase):
         self.assertIsNotNone(weekly_view[30]["explicit_block"])
         self.assertIsNone(weekly_view[20]["explicit_block"])
 
-    def test_orphan_rows_are_flagged_and_never_effective(self):
+    def test_later_only_rows_form_a_partial_hour_with_a_continuation_prefix(self):
         make_row(self.profile, 10, 30, rotation=self.B, dow=0)
         weekly, dated = load_hour_rows(self.profile, MONDAY, 10)
         entries = minute_map(weekly, dated, layer="weekly")
         self.assertFalse(entries[30]["has_base"])
-        self.assertTrue(entries[30]["orphan"])
-        self.assertEqual({entry["origin"] for entry in entries}, {"none"})
-        self.assertEqual(effective_segments(weekly, dated), [])
+        self.assertFalse(entries[30]["orphan"])
+        self.assertTrue(all(entry["continuation"] for entry in entries[:30]))
+        self.assertTrue(all(not entry["continuation"] for entry in entries[30:]))
+        self.assertEqual([s.start_minute for s in effective_segments(weekly, dated)], [30])
 
 
 @override_settings(SECURE_SSL_REDIRECT=False)
@@ -366,31 +384,27 @@ class MinuteApiTests(ResolverFixtures, ApiMixin, TestCase):
             set(ScheduleBlock.objects.values_list("end_time", flat=True)), {time(11, 0)},
         )
 
-    def test_a_weekly_transition_without_a_base_is_rejected(self):
+    def test_a_weekly_transition_without_a_base_creates_a_partial_hour(self):
         response = self.write(minute=30)
-        self.assertEqual(response.status_code, 409)
-        self.assertIn("base assignment", response.json()["error"])
-        self.assertFalse(ScheduleBlock.objects.exists())
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(ScheduleBlock.objects.get().start_time, time(10, 30))
 
-    def test_a_dated_transition_needs_an_effective_base_but_may_inherit_the_weekly_one(self):
-        rejected = self.write(minute=30, on=MONDAY)
-        self.assertEqual(rejected.status_code, 409)
+    def test_a_dated_transition_without_a_base_creates_a_partial_hour(self):
+        accepted_partial = self.write(minute=30, on=MONDAY)
+        self.assertEqual(accepted_partial.status_code, 200)
         self.write(minute=0)  # weekly base for Mondays
         accepted = self.write(minute=30, rotation=self.D, on=MONDAY)
         self.assertEqual(accepted.status_code, 200, accepted.content)
-        # A date on a different weekday has no weekly base.
-        self.assertEqual(self.write(minute=30, on=TUESDAY).status_code, 409)
-        # ... but a dated base at HH:00 provides one.
-        self.assertEqual(self.write(minute=0, on=TUESDAY).status_code, 200)
+        # A date on a different weekday is independently valid as partial.
         self.assertEqual(self.write(minute=30, on=TUESDAY).status_code, 200)
 
-    def test_deleting_a_weekly_base_with_dependent_transitions_is_rejected(self):
+    def test_deleting_a_weekly_base_preserves_later_partial_transitions(self):
         base = ScheduleBlock.objects.get(pk=self.write(minute=0).json()["id"])
-        self.write(minute=30, rotation=self.B)
+        later = ScheduleBlock.objects.get(pk=self.write(minute=30, rotation=self.B).json()["id"])
         response = self.delete(base)
-        self.assertEqual(response.status_code, 409)
-        self.assertTrue(response.json()["blockers"])
-        self.assertTrue(ScheduleBlock.objects.filter(pk=base.pk).exists())
+        self.assertEqual(response.json(), {"ok": True, "deleted": True})
+        self.assertFalse(ScheduleBlock.objects.filter(pk=base.pk).exists())
+        self.assertTrue(ScheduleBlock.objects.filter(pk=later.pk).exists())
 
     def test_base_can_be_deleted_once_its_transitions_are_removed(self):
         base = ScheduleBlock.objects.get(pk=self.write(minute=0).json()["id"])
@@ -398,12 +412,12 @@ class MinuteApiTests(ResolverFixtures, ApiMixin, TestCase):
         self.assertEqual(self.delete(later).json(), {"ok": True, "deleted": True})
         self.assertEqual(self.delete(base).json(), {"ok": True, "deleted": True})
 
-    def test_deleting_a_weekly_base_that_strands_a_dated_transition_is_rejected(self):
+    def test_deleting_a_weekly_base_leaves_a_valid_dated_partial_transition(self):
         base = ScheduleBlock.objects.get(pk=self.write(minute=0).json()["id"])
-        self.write(minute=30, rotation=self.D, on=MONDAY)
+        later = ScheduleBlock.objects.get(pk=self.write(minute=30, rotation=self.D, on=MONDAY).json()["id"])
         response = self.delete(base)
-        self.assertEqual(response.status_code, 409)
-        self.assertIn("2027-03-01", " ".join(response.json()["blockers"]))
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(ScheduleBlock.objects.filter(pk=later.pk).exists())
 
     def test_deleting_a_dated_base_is_allowed_when_a_weekly_base_remains(self):
         self.write(minute=0)
@@ -411,10 +425,11 @@ class MinuteApiTests(ResolverFixtures, ApiMixin, TestCase):
         self.write(minute=30, rotation=self.E, on=MONDAY)
         self.assertEqual(self.delete(dated_base, on=MONDAY).json(), {"ok": True, "deleted": True})
 
-    def test_deleting_a_dated_base_without_a_weekly_base_is_rejected_while_transitions_remain(self):
+    def test_deleting_a_dated_base_without_a_weekly_base_leaves_a_partial_hour(self):
         dated_base = ScheduleBlock.objects.get(pk=self.write(minute=0, rotation=self.D, on=MONDAY).json()["id"])
-        self.write(minute=30, rotation=self.E, on=MONDAY)
-        self.assertEqual(self.delete(dated_base, on=MONDAY).status_code, 409)
+        later = ScheduleBlock.objects.get(pk=self.write(minute=30, rotation=self.E, on=MONDAY).json()["id"])
+        self.assertEqual(self.delete(dated_base, on=MONDAY).status_code, 200)
+        self.assertTrue(ScheduleBlock.objects.filter(pk=later.pk).exists())
 
     def test_revert_deletes_only_the_exact_dated_transition(self):
         weekly = ScheduleBlock.objects.get(pk=self.write(minute=0).json()["id"])
@@ -536,6 +551,27 @@ class MinuteApiTests(ResolverFixtures, ApiMixin, TestCase):
         self.assertEqual(cells[11]["detail_count"], 0)
         self.assertEqual(cells[10]["effective_block"]["content_name"], "A")  # base unchanged
 
+    def test_partial_hour_detail_and_date_overview_expose_continuation_and_detail(self):
+        make_row(self.default, 11, 30, rotation=self.B, on=MONDAY)
+        detail = self.hour_detail(
+            date=MONDAY.isoformat(), hour=11, profile=self.default.uuid,
+        ).json()
+        self.assertFalse(detail["has_base"])
+        self.assertTrue(detail["is_partial_hour"])
+        self.assertEqual(detail["takeover_minute"], 30)
+        self.assertTrue(all(m["continuation"] for m in detail["minutes"][:30]))
+        self.assertTrue(all(not m["continuation"] for m in detail["minutes"][30:]))
+        self.assertEqual(detail["minutes"][30]["effective_block"]["content_name"], "B")
+
+        url = reverse("library:api-schedule-list")
+        payload = self.client.get(url, {
+            "date": MONDAY.isoformat(), "profile": self.default.uuid,
+        }).json()
+        cell = payload["cells"][11]
+        self.assertEqual(cell["origin"], "none")
+        self.assertIsNone(cell["effective_block"])
+        self.assertEqual(cell["detail_count"], 1)
+
     def test_existing_hourly_payload_shape_is_preserved_with_additive_minute_field(self):
         make_row(self.default, 7, 0, rotation=self.A, dow=2)
         listed = self.client.get(reverse("library:api-schedule-list") + f"?profile={self.default.uuid}").json()
@@ -646,6 +682,63 @@ class CombinedHourBuilderTests(BuilderFixtures, TransactionTestCase):
         self.assertEqual(times, sorted(times))
         base = times[0]
         self.assertEqual([(t - base).total_seconds() for t in times], [300.0 * i for i in range(12)])
+
+    def test_partial_single_starts_items_at_takeover_without_synthetic_continuation(self):
+        self.schedule(10, (30, self.rot_b))
+        log, error = self.build()
+        self.assertIsNone(error)
+        self.assertEqual(PlaylistLog.objects.count(), 1)
+        items = list(log.items.order_by("position"))
+        self.assertEqual([item.position for item in items], list(range(len(items))))
+        hour_start = timezone.make_aware(datetime.combine(MONDAY, time(10, 0)))
+        self.assertEqual((items[0].scheduled_time - hour_start).total_seconds(), 1800.0)
+        self.assertTrue(all(item.track_title.startswith("B") for item in items))
+        preview, preview_error = preview_hour_log(MONDAY, 10)
+        self.assertIsNone(preview_error)
+        self.assertEqual(preview["continuation_until_minute"], 30)
+        self.assertEqual(preview["segments"][0]["start_minute"], 30)
+        self.assertEqual(
+            datetime.fromisoformat(preview["items"][0]["scheduled_time"]),
+            items[0].scheduled_time,
+        )
+
+    def test_partial_multiple_preserves_nominal_boundaries_and_natural_overrun(self):
+        self.schedule(10, (20, self.rot_b), (45, self.rot_a))
+        preview, error = preview_hour_log(MONDAY, 10)
+        self.assertIsNone(error)
+        self.assertEqual(preview["continuation_until_minute"], 20)
+        self.assertEqual(
+            [(s["start_minute"], s["nominal_start_seconds"]) for s in preview["segments"]],
+            [(20, 1200.0), (45, 2700.0)],
+        )
+        self.assertEqual(preview["segments"][0]["actual_start_seconds"], 1200.0)
+        self.assertGreaterEqual(preview["segments"][1]["actual_start_seconds"], 2700.0)
+
+    def test_partial_takeover_timestamp_survives_clock_drift_projection(self):
+        self.schedule(10, (30, self.rot_b))
+        hour_start = timezone.make_aware(datetime.combine(MONDAY, time(10, 0)))
+        for target, expected_offset in ((3300.0, 1800.0), (1200.0, 2400.0)):
+            with self.subTest(target_duration_seconds=target):
+                preview, error = preview_hour_log(
+                    MONDAY, 10, target_duration_seconds=target,
+                )
+                self.assertIsNone(error)
+                first = datetime.fromisoformat(preview["items"][0]["scheduled_time"])
+                self.assertEqual((first - hour_start).total_seconds(), expected_offset)
+
+    def test_approved_partial_log_is_reused_after_schedule_changes(self):
+        self.schedule(10, (30, self.rot_b))
+        built, error = build_and_approve_hour_log_locked(MONDAY, 10)
+        self.assertIsNone(error)
+        before = list(built.items.order_by("position").values_list("pk", "scheduled_time"))
+        self.schedule(10, (0, self.rot_a), (45, self.rot_a))
+        reused, error = build_and_approve_hour_log_locked(MONDAY, 10)
+        self.assertIsNone(error)
+        self.assertEqual(reused.pk, built.pk)
+        self.assertEqual(
+            list(reused.items.order_by("position").values_list("pk", "scheduled_time")),
+            before,
+        )
 
     def test_exactly_one_playlistlog_exists_for_the_hour_and_none_at_the_transitions(self):
         self.schedule(10, (0, self.rot_a), (30, self.rot_b), (45, self.rot_a))
@@ -946,11 +1039,15 @@ class CombinedHourBuilderTests(BuilderFixtures, TransactionTestCase):
         self.assertEqual((log, error), (None, "No schedule block for this hour."))
         self.assertEqual(list(PlaylistLog.objects.values_list("hour", flat=True)), [22])
 
-    def test_a_lone_minute_row_does_not_turn_a_blank_hour_into_a_buildable_one(self):
+    def test_a_lone_minute_row_builds_a_partial_hour_at_its_real_offset(self):
         self.schedule(23, (30, self.rot_a))
         self.assertIsNone(resolve_schedule_block(MONDAY, 23, profile=self.profile))
         log, error = build_hour_log(MONDAY, 23)
-        self.assertEqual((log, error), (None, "No schedule block for this hour."))
+        self.assertIsNone(error)
+        self.assertEqual(log.hour, 23)
+        first = log.items.order_by("position").first()
+        self.assertEqual(first.position, 0)
+        self.assertGreaterEqual(first.scheduled_time.minute, 30)
 
     def test_the_next_real_scheduled_hour_still_builds_normally(self):
         self.schedule(22, (0, self.playlist_of("Feature", self.tracks("E", 4, seconds=900.0))))

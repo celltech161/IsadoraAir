@@ -413,7 +413,7 @@
   .minute-cell.explicit::after { content: "●"; position: absolute; top: 1px; right: 3px; font-size: .5rem; }
   .minute-cell.inherited-transition { border-color: rgba(255,255,255,.55); border-style: dashed; }
   .minute-cell.none { color: var(--text-muted); }
-  .minute-cell.orphan { border-color: var(--danger); }
+  .minute-cell.continuation { background: repeating-linear-gradient(135deg, rgba(100,116,139,.20) 0 5px, rgba(15,23,42,.6) 5px 10px); }
   .minute-cell.kind-playlist { border-left: 3px dashed rgba(255,255,255,.6); }
   .minute-cell:focus-visible { outline: 2px solid var(--accent); }
   .hour-detail-segments { margin-top: .6rem; font-size: .76rem; color: var(--text-muted); }
@@ -574,7 +574,7 @@
     <h3 id="hourDetailTitle">Hour Detail</h3>
     <button type="button" id="hourDetailClose" onclick="closeHourDetail()">Close</button>
   </div>
-  <p class="hour-detail-help">Select a Rotation or Playlist above, then click a minute to start it there. The :00 minute is the hour&rsquo;s base assignment. Choose <em>Clear</em> and click a marked transition to remove only that transition. Solid marked (&bull;) cells are explicit; dashed cells are effective inherited weekly transitions. Only explicit transitions are stored.</p>
+  <p class="hour-detail-help">Select a Rotation or Playlist above, then click any minute to start it there. If :00 is empty, the previous program continues until the first transition. Choose <em>Clear</em> and click a marked transition to remove only that transition. Solid marked (&bull;) cells are explicit; dashed cells are effective inherited weekly transitions. Only explicit transitions are stored.</p>
   <div id="minuteGrid" class="minute-grid" role="group" aria-label="Minutes 00 to 59"></div>
   <div id="hourDetailSegments" class="hour-detail-segments"></div>
 </section>
@@ -1402,11 +1402,11 @@ function renderHourDetail(data, ctx) {
     cell.className = 'minute-cell'
       + (entry.explicit_block_id ? ' explicit' : '')
       + (entry.inherited_transition ? ' inherited-transition' : '')
-      + (entry.orphan ? ' orphan' : '')
+      + (entry.continuation ? ' continuation' : '')
       + (effective ? '' : ' none')
       + (effective && effective.content_kind === 'playlist' ? ' kind-playlist' : '');
     if (effective) cell.style.backgroundColor = contentColor(effective.content_kind, effective.content_id);
-    const originText = entry.origin === 'date_override' ? 'date override' : (entry.origin === 'weekly' ? 'weekly' : 'empty');
+    const originText = entry.origin === 'date_override' ? 'date override' : (entry.origin === 'weekly' ? 'weekly' : (entry.continuation ? 'previous program continues' : 'empty'));
     const kindText = entry.explicit_block_id ? 'explicit transition' : (entry.inherited_transition ? 'inherited transition' : originText);
     cell.title = `:${String(entry.minute).padStart(2, '0')} \u2014 ${effective ? effective.content_name : 'empty'} (${kindText})`;
     cell.setAttribute('aria-label', cell.title);
@@ -1414,6 +1414,12 @@ function renderHourDetail(data, ctx) {
     number.className = 'minute-num';
     number.textContent = `:${String(entry.minute).padStart(2, '0')}`;
     cell.appendChild(number);
+    if (entry.continuation && entry.minute === 0) {
+      const name = document.createElement('span');
+      name.className = 'minute-name';
+      name.textContent = 'Continues';
+      cell.appendChild(name);
+    }
     if (effective && (entry.segment_start || entry.explicit_block_id)) {
       const name = document.createElement('span');
       name.className = 'minute-name';
@@ -1425,8 +1431,9 @@ function renderHourDetail(data, ctx) {
   });
   const origins = {weekly: 'weekly', date_override: 'date override'};
   document.getElementById('hourDetailSegments').textContent = data.segments.length
-    ? 'Effective: ' + data.segments.map(s => `${s.start_time} ${s.block.content_name} (${origins[s.origin] || s.origin})`).join('  \u2192  ')
-    : 'No effective assignment at :00 \u2014 this hour is not scheduled.';
+    ? (data.is_partial_hour ? `Previous program continues until ${String(data.hour).padStart(2, '0')}:${String(data.takeover_minute).padStart(2, '0')}  \u2192  ` : 'Effective: ')
+      + data.segments.map(s => `${s.start_time} ${s.block.content_name} (${origins[s.origin] || s.origin})`).join('  \u2192  ')
+    : 'No schedule rows \u2014 previous active program continues.';
 }
 
 async function onMinuteClick(entry, ctx) {

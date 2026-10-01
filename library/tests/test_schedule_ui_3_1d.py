@@ -95,22 +95,22 @@ class DateOverridePayloadTests(ApiMixin, TestCase):
         self.assertEqual(other_cell["origin"], "date_override")
         self.assertEqual(other_cell["effective_block"]["content_id"], self.rotation_b.pk)
 
-    def test_revert_conflict_preserves_related_rows_and_exact_delete_is_narrow(self):
+    def test_revert_base_preserves_later_partial_row_and_exact_delete_is_narrow(self):
         base = row(self.default, 8, 0, rotation=self.rotation_a, on=MONDAY)
         transition = row(self.default, 8, 20, rotation=self.rotation_b, on=MONDAY)
         base_url = reverse("library:api-schedule-delete", args=[base.pk])
-        blocked = self.client.delete(
+        removed_base = self.client.delete(
             f"{base_url}?profile={self.default.uuid}&date={MONDAY.isoformat()}"
         )
-        self.assertEqual(blocked.status_code, 409)
-        self.assertEqual(ScheduleBlock.objects.filter(pk__in=[base.pk, transition.pk]).count(), 2)
+        self.assertEqual(removed_base.status_code, 200)
+        self.assertFalse(ScheduleBlock.objects.filter(pk=base.pk).exists())
+        self.assertTrue(ScheduleBlock.objects.filter(pk=transition.pk).exists())
 
         transition_url = reverse("library:api-schedule-delete", args=[transition.pk])
         removed = self.client.delete(
             f"{transition_url}?profile={self.default.uuid}&date={MONDAY.isoformat()}"
         )
         self.assertEqual(removed.status_code, 200)
-        self.assertTrue(ScheduleBlock.objects.filter(pk=base.pk).exists())
         self.assertFalse(ScheduleBlock.objects.filter(pk=transition.pk).exists())
 
 
@@ -141,6 +141,21 @@ class SchedulePage31DMarkupTests(ApiMixin, TestCase):
             self.assertIn(field, script)
         for forbidden in ("resolve_schedule_segments", "Math.max(", ".sort(", ".reduce("):
             self.assertNotIn(forbidden, script)
+
+    def test_hour_detail_renders_server_derived_partial_continuation_state(self):
+        for marker in (
+            "entry.continuation", "data.is_partial_hour", "data.takeover_minute",
+            "Previous program continues", "minute-cell.continuation",
+        ):
+            self.assertIn(marker, self.html)
+        # The browser consumes the semantic field; it does not infer the
+        # continuation prefix from the first segment itself.
+        detail_script = self.html[
+            self.html.index("function renderHourDetail("):
+            self.html.index("async function onMinuteClick(")
+        ]
+        self.assertNotIn("Math.min", detail_script)
+        self.assertNotIn("segments[0].start_minute", detail_script)
 
     def test_date_navigation_and_selected_date_heading_are_exposed(self):
         for marker in (

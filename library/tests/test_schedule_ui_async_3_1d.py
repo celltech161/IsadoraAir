@@ -380,3 +380,90 @@ class AsyncContextBrowserTests(LiveServerTestCase):
                     self.assertTrue(page.locator("#hourDetail").is_hidden())
                     self.assertEqual(page.locator("#minuteGrid .minute-cell").count(), 0)
         self.assert_clean()
+
+    # ---- 5. 3.1E partial-hour workflow at supported widths ---------------
+    def test_partial_hour_workflow_is_truthful_and_responsive(self):
+        with self.session() as pw:
+            for width in WIDTHS:
+                with self.subTest(width=width):
+                    page = self.open_page(pw, width)
+                    self.pick(page, "Bravo Rot")
+
+                    # Weekly blank hour -> :30 partial transition.
+                    page.evaluate("openHourDetail('weekly', 0, 12)")
+                    page.wait_for_function(
+                        "document.querySelectorAll('#minuteGrid .minute-cell').length === 60"
+                    )
+                    page.locator('#minuteGrid .minute-cell[data-minute="30"]').click()
+                    page.wait_for_function(
+                        "document.querySelectorAll('#minuteGrid .minute-cell.explicit').length === 1"
+                    )
+                    page.locator("#hourDetailClose").click()
+                    page.evaluate("openHourDetail('weekly', 0, 12)")
+                    page.wait_for_function(
+                        "document.querySelectorAll('#minuteGrid .minute-cell').length === 60"
+                        " && document.querySelectorAll('#minuteGrid .minute-cell.explicit').length === 1"
+                    )
+                    self.assertIn("continues until 12:30", page.inner_text("#hourDetailSegments"))
+                    self.assertIn("Continues", page.inner_text('#minuteGrid .minute-cell[data-minute="0"]'))
+                    self.assertIn("Bravo Rot", page.get_attribute(
+                        '#minuteGrid .minute-cell[data-minute="30"]', "title"
+                    ))
+                    page.wait_for_function(
+                        "document.querySelector('.grid-cell[data-day=\"0\"][data-hour=\"12\"]')?.classList.contains('has-detail') === true"
+                    )
+                    weekly_cell = page.locator('.grid-cell[data-day="0"][data-hour="12"]')
+                    self.assertTrue(weekly_cell.evaluate("e => e.classList.contains('has-detail')"))
+                    self.assertEqual(weekly_cell.locator(".detail-badge").inner_text(), "+1")
+
+                    # Add then remove only the base; :30 remains a valid
+                    # partial transition and the overview stays detailed.
+                    page.locator('#minuteGrid .minute-cell[data-minute="0"]').click()
+                    page.wait_for_function(
+                        "document.querySelectorAll('#minuteGrid .minute-cell.explicit').length === 2"
+                    )
+                    page.locator("#contentPicker .clear-btn").click()
+                    page.locator('#minuteGrid .minute-cell[data-minute="0"]').click()
+                    page.wait_for_function(
+                        "document.querySelectorAll('#minuteGrid .minute-cell.explicit').length === 1"
+                    )
+                    page.wait_for_function(
+                        "document.querySelector('.grid-cell[data-day=\"0\"][data-hour=\"12\"]')?.classList.contains('has-detail') === true"
+                    )
+                    self.assertIn("continues until 12:30", page.inner_text("#hourDetailSegments"))
+
+                    # Date Override has the same server-derived behavior and
+                    # its overview remains truthfully EMPTY +1.
+                    self.pick(page, "Charlie Rot")
+                    self.to_date_mode(page)
+                    page.locator("#dateHourList .date-detail-button").nth(13).click()
+                    page.wait_for_function(
+                        "document.querySelectorAll('#minuteGrid .minute-cell').length === 60"
+                    )
+                    page.locator('#minuteGrid .minute-cell[data-minute="30"]').click()
+                    page.wait_for_function(
+                        "document.querySelectorAll('#minuteGrid .minute-cell.explicit').length === 1"
+                    )
+                    page.wait_for_function(
+                        "document.querySelectorAll('#dateHourList .date-hour-row').length === 24"
+                        " && document.getElementById('dateHourList').getAttribute('aria-busy') === 'false'"
+                        " && document.querySelectorAll('#dateHourList .date-hour-row')[13]?.classList.contains('has-detail') === true"
+                    )
+                    self.assertIn("EMPTY", self.row_text(page, 13))
+                    self.assertIn("+1", self.row_text(page, 13))
+                    self.assertIn("continues until 13:30", page.inner_text("#hourDetailSegments"))
+                    self.assert_no_overflow(page, width)
+                    page.close()
+        self.assertEqual(
+            list(ScheduleBlock.objects.filter(
+                profile=self.profile, day_of_week=0, start_time=time(12, 30),
+            ).values_list("rotation__name", flat=True)),
+            ["Bravo Rot"],
+        )
+        self.assertEqual(
+            list(ScheduleBlock.objects.filter(
+                profile=self.profile, specific_date=MONDAY, start_time=time(13, 30),
+            ).values_list("rotation__name", flat=True)),
+            ["Charlie Rot"],
+        )
+        self.assert_clean()

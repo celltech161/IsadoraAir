@@ -4,7 +4,8 @@
 truthful log provenance. 3.1B adds the operator workflow on the existing
 `/schedule/` page: named profile lifecycle, explicit activation/default
 selection, inactive-profile editing and hourly one-date overrides. 3.1C adds
-minute-resolution scheduling (see "Minute resolution (3.1C)" below). A station
+minute-resolution scheduling (see "Minute resolution (3.1C)" below), and 3.1E
+adds partial-hour takeover from continuation. A station
 that never creates a second profile, or never adds a minute transition, behaves
 exactly as before.
 
@@ -32,8 +33,8 @@ block per `(profile, specific_date, start_time)`.
 
 `resolve_schedule_block(target_date, hour, profile=None)` is the **legacy
 exact-hour compatibility resolver**. It only ever looks at a row starting
-exactly at `HH:00` and is deliberately unchanged by 3.1C (the engine's
-blank-continuation-hour logic depends on that meaning). Minute detail is
+exactly at `HH:00` and is deliberately unchanged as a compatibility helper.
+Minute detail is
 resolved by the separate `resolve_schedule_segments` described below.
 
 1. that profile's `specific_date` block starting exactly at `HH:00`;
@@ -155,12 +156,12 @@ first row, weekly inheritance remains visible. Example -- weekly `10:00 A`,
 `D` from `10:20`, `E` from `10:50`. There are no blank/tombstone overrides;
 "Revert" deletes exactly that dated row and reveals the lower layer.
 
-**Base-hour invariant.** A buildable hour needs an effective assignment at
-`HH:00`; an hour holding only later rows resolves to no segments, so a lone
-`10:30` row cannot make a blank hour "partially scheduled". Writes enforce it: a
-non-zero weekly transition needs a weekly `HH:00` base, and a non-zero dated
-transition needs a dated base or a weekly base for that date (409 otherwise).
-Deleting a base while later transitions depend on it is a 409 with the blockers.
+**3.1E supersedes the base-hour invariant.** A lone later row such as `10:30 B`
+is a valid *partial-hour schedule*. The previous active program owns the
+*continuation window* from `10:00` through `10:29`; B's *takeover minute* is
+`10:30`. Nonzero weekly and dated writes no longer require a `HH:00` row, and
+deleting a base preserves all later rows, turning the hour into a partial hour.
+No base row, previous-hour block or continuation item is manufactured.
 
 **One PlaylistLog per hour, built once.** `build_hour_log` captures the profile
 once, resolves the hour's ordered segments once, builds them into one pick list
@@ -179,9 +180,9 @@ consumed by an overrun still begins -- one Rotation track or the whole Playlist 
 never skipped. A segment whose window ended before a late-started hour began is
 reported `elapsed_before_start` and not built.
 
-**Unchanged contracts.** Blank continuation hours stay blank (a block that
-started earlier is never carried into a later hour, and no extra log is built
-there); schedule edits never rewrite, rebuild or unapprove an existing log; the
+**Unchanged contracts.** Completely blank continuation hours stay blank (a
+block that started earlier is never carried into a later hour, and no extra log
+is built there); schedule edits never rewrite, rebuild or unapprove an existing log; the
 `(date, hour)` advisory lock remains the single build authority; the engine still
 builds one wall-clock hour at a time. Cloning copies the exact rows, minute
 transitions included.
@@ -191,8 +192,11 @@ quantizing). Block payloads gain `start_minute`. `GET /api/schedule/hour-detail/
 (`?day_of_week=N` or `?date=YYYY-MM-DD`, `&hour=H`, optional `&profile=<uuid>`)
 returns the server-derived sixty-minute detail for the Hour Detail panel, marking
 explicit transitions, inherited weekly transitions (date mode) and whether each
-minute is a date override, weekly or empty. `preview_hour_log` runs the same
-segment builder without persisting and adds a `segments` list.
+minute is a date override, weekly, continuation or empty. Additive
+`is_partial_hour`, `takeover_minute` and per-minute `continuation` fields keep
+the browser from reimplementing precedence. `preview_hour_log` runs the same
+segment builder without persisting and adds `segments` and
+`continuation_until_minute`.
 
 **UI.** The weekly 7x24 overview is unchanged; an hour holding minute transitions
 is drawn as a neutral striped cell with a `+N` count. The Hour Detail panel (a
@@ -217,7 +221,30 @@ inspected inside the selected profile. The same Rotation/Playlist picker is
 shared with Weekly mode and remains available while Hour Detail is open.
 Selecting content and pressing an editable hour creates or updates its dated
 `:00` row. **Revert to Weekly** retains its narrow meaning: it deletes only the
-identified explicit dated base row, subject to the existing dependency/conflict
-checks, and then reveals the recurring weekly layer. Nonzero dated transitions
+identified explicit dated base row and then reveals the recurring weekly layer
+or a valid partial hour. Nonzero dated transitions
 continue to be edited individually in Hour Detail. Archived profiles remain
 inspectable while assignment, revert and minute-write controls are read-only.
+
+## Partial-hour takeover (3.1E)
+
+A partial hour has one or more effective transition rows but no effective row
+at `HH:00`. It is distinct from a completely blank hour: the resolver returns
+its later segments, the builder creates one PlaylistLog for the wall hour, and
+the Date Override overview truthfully shows **EMPTY +N**. Minutes before the
+first transition are explicitly server-labelled as continuation.
+
+The build clock begins at the first transition's nominal offset. For `11:30 B`,
+the first generated LogItem is scheduled at 11:30; no synthetic continuation
+item participates in recency or appears in the partial log. Natural boundary,
+Playlist atomicity, overrun, late-start and approved-log immutability rules are
+otherwise unchanged.
+
+The engine may prebuild and approve a partial log, but all queue load, advance,
+peek, crossfade and restart paths gate it by its persisted first-item takeover
+timestamp. Before takeover, the prior active log retains queue ownership and
+the existing live-fill path can extend it. At takeover, future queue ownership
+switches to the partial log without touching the currently playing deck; that
+deck finishes or crossfades naturally. A track crossing the takeover minute is
+therefore expected, not a hard-cut failure. Restart recovery continues to keep
+the interrupted occurrence identity separate from the saved active queue.

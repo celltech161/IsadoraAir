@@ -9,7 +9,7 @@ import time
 import traceback
 import uuid
 from collections import deque
-from datetime import timedelta
+from datetime import datetime as datetime_cls, time as datetime_time, timedelta
 from pathlib import Path
 
 import gi
@@ -41,8 +41,9 @@ from library.services.log_builder import (
     build_and_approve_hour_log_locked,
     effective_airtime_seconds,
     fill_remaining_hour,
-    resolve_schedule_block,
+    get_active_schedule_profile,
 )
+from library.services.schedule_resolution import resolve_schedule_segments
 from library.services.remote_dj_signaling import RemoteDJSignalingServer
 from library.services.remote_dj_connection import (
     FAILURE_DEPENDENCY_SESSION_BUILD,
@@ -1726,6 +1727,7 @@ class PlaybackEngine:
         self._resume_item = None
         self._next_hour_peek = None
         self._next_hour_peek_at = 0.0
+        self._next_hour_peek_key = None
         self._last_live_extend_attempt = 0.0
         self._live_fill_in_progress = False  # guarded by self._lock -- see _try_extend_live_log_async
         self._live_fill_generation = 0  # guarded by self._lock -- bumped on every dispatch, see _try_extend_live_log_async
@@ -4877,16 +4879,15 @@ class PlaybackEngine:
         if self.current_log is not None:
             return
 
-        fallback = (
+        fallbacks = (
             PlaylistLog.objects
             .filter(date=now.date(), status="approved", hour__lte=now.hour)
             .order_by("-hour")
-            .first()
         )
-        if fallback:
-            print(f"No log for hour {now.hour}, falling back to hour {fallback.hour}")
-            self._load_log_for(fallback.date, fallback.hour)
-            return
+        for fallback in fallbacks:
+            print(f"No eligible log for hour {now.hour}, trying hour {fallback.hour}")
+            if self._load_log_for(fallback.date, fallback.hour):
+                return
 
         continuation = self._prior_date_startup_continuation(now)
         if continuation is None:
@@ -4911,8 +4912,16 @@ class PlaybackEngine:
         that it started and that it retains an unplayed, playable item.
         """
         try:
-            if resolve_schedule_block(now.date(), now.hour) is not None:
-                return None
+            profile = get_active_schedule_profile()
+            segments = resolve_schedule_segments(now.date(), now.hour, profile)
+            if segments:
+                first = segments[0].start_minute
+                takeover_at = now.replace(minute=first, second=0, microsecond=0)
+                # An ordinary hour, or a partial hour whose takeover is due,
+                # owns startup. Before a future partial takeover, yesterday's
+                # proven continuation remains eligible.
+                if first == 0 or now >= takeover_at:
+                    return None
 
             previous_date = now.date() - timedelta(days=1)
             hint = getattr(self, "_resume_hint", None)
@@ -4951,7 +4960,8 @@ class PlaybackEngine:
             print(f"Startup continuation fallback inspection failed (non-fatal): {exc}")
         return None
 
-    def _load_log_for(self, target_date, hour):
+    def _approved_log_queue(self, target_date, hour):
+        """Return an approved log and its playable materialized queue."""
         close_old_connections()
         log = (
             PlaylistLog.objects
@@ -4959,19 +4969,8 @@ class PlaybackEngine:
             .first()
         )
         if not log:
-            self.current_log = None
-            self.log_items = []
-            self._queue_cursor = 0
-            return
-
-        self.current_log = log
-        # [P0] 1.8 defense-in-depth -- _apply_poison_skip removes any
-        # LogItem occurrence the previous process recorded as having
-        # poisoned a deck slot. The authoritative gate is
-        # _is_poison_guarded at the selection sites; this filter avoids
-        # even loading the row into the live queue where it could be
-        # observed and reported multiple times.
-        self.log_items = self._apply_poison_skip(list(
+            return None, []
+        items = self._apply_poison_skip(list(
             log.items
             .select_related(
                 "track", "track__artist", "track__album", "track__category", "track__category__kind",
@@ -4984,6 +4983,61 @@ class PlaybackEngine:
             )
             .order_by("position")
         ))
+        return log, items
+
+    @staticmethod
+    def _log_queue_eligibility(log, items, wall_now):
+        """Return ``(eligible, takeover_at)`` for an approved log queue.
+
+        Ordinary logs begin at their nominal wall-hour and retain the existing
+        early-rollover policy. A log whose first persisted item begins later
+        is a partial-hour log: that independently materialized timestamp is
+        the hard lower bound for every queue-install/peek path. Using approved
+        log data also preserves generated-log immutability if the schedule is
+        edited after approval.
+        """
+        if not items:
+            # Preserve the established meaning of an approved empty ordinary
+            # log. Real partial builds cannot approve without a source item;
+            # installation paths that require playout still reject empties.
+            return True, None
+        hour_start = timezone.make_aware(
+            datetime_cls.combine(log.date, datetime_time(log.hour, 0)),
+            timezone.get_current_timezone(),
+        )
+        first_scheduled = min(item.scheduled_time for item in items)
+        hour_end = hour_start + timedelta(hours=1)
+        # Only an offset within this log's own wall hour is the durable
+        # partial-hour marker. Legacy/imported fixtures with timestamps wholly
+        # outside their nominal hour retain ordinary-log compatibility.
+        takeover_at = first_scheduled if hour_start < first_scheduled < hour_end else None
+        return takeover_at is None or wall_now >= takeover_at, takeover_at
+
+    def _load_log_for(self, target_date, hour):
+        """Load one approved queue if its partial-hour boundary permits it.
+
+        An ineligible partial log is a non-mutating refusal: the older active
+        continuation queue must remain intact. A genuinely absent target keeps
+        the historical clearing behavior for callers performing a real load.
+        """
+        log, items = self._approved_log_queue(target_date, hour)
+        if not log:
+            self.current_log = None
+            self.log_items = []
+            self._queue_cursor = 0
+            return False
+        eligible, takeover_at = self._log_queue_eligibility(
+            log, items, timezone.localtime(),
+        )
+        if not eligible:
+            print(
+                f"  Keeping prior queue: partial log {target_date} {hour:02d}:00 "
+                f"is not eligible until {takeover_at.isoformat()}"
+            )
+            return False
+
+        self.current_log = log
+        self.log_items = items
         # Advance past anything already played -- an engine restart
         # mid-hour must NOT replay the log from position 0, or we'd
         # start hearing tracks that already aired. Especially bad for
@@ -5007,6 +5061,7 @@ class PlaybackEngine:
         skipped = self._queue_cursor
         print(f"Loaded log for {target_date} {hour:02d}:00 — {len(self.log_items)} items "
               f"({'resuming at position ' + str(skipped) if skipped else 'from top'})")
+        return True
 
     def _active_log_has_committed_playout(self):
         """Whether the active log still owns real program audio to play.
@@ -5048,21 +5103,35 @@ class PlaybackEngine:
     def _current_hour_schedule_state(self, now):
         """Central current-hour orchestration classification.
 
-        ``resolve_schedule_block`` intentionally remains exact-start. A
-        blank wall-clock hour is a healthy continuation only while an older
-        active log still has committed playout; an exhausted/missing old log
-        is an unscheduled gap, not silently accepted merely because a stale
-        PlaylistLog row exists.
+        3.1E distinguishes a genuinely blank hour from a partial hour before
+        and after its takeover minute. A blank wall-clock hour is a healthy
+        continuation only while an older active log still has committed
+        playout; an exhausted/missing old log is an unscheduled gap, not
+        silently accepted merely because a stale PlaylistLog row exists.
         """
         now_key = (now.date(), now.hour)
         active_key = (
             (self.current_log.date, self.current_log.hour)
             if self.current_log is not None else None
         )
-        schedule_block = resolve_schedule_block(now.date(), now.hour)
+        profile = get_active_schedule_profile()
+        segments = resolve_schedule_segments(now.date(), now.hour, profile)
+        schedule_block = segments[0].block if segments and segments[0].start_minute == 0 else None
+        first_transition_minute = segments[0].start_minute if segments else None
+        takeover_time = (
+            now.replace(minute=first_transition_minute, second=0, microsecond=0)
+            if first_transition_minute is not None else None
+        )
+        takeover_due = bool(takeover_time is not None and now >= takeover_time)
 
-        if schedule_block is not None:
+        if segments and first_transition_minute == 0:
             state = "scheduled"
+            has_committed_playout = False
+        elif segments and not takeover_due:
+            state = "partial_before_takeover"
+            has_committed_playout = self._active_log_has_committed_playout()
+        elif segments:
+            state = "partial_due"
             has_committed_playout = False
         elif active_key is not None and active_key > now_key:
             state = "early_rollover"
@@ -5083,7 +5152,13 @@ class PlaybackEngine:
             "now_key": now_key,
             "active_key": active_key,
             "schedule_block": schedule_block,
-            "schedule_expected": schedule_block is not None,
+            "has_hour_schedule": bool(segments),
+            # Compatibility alias for existing orchestration/tests. It now
+            # means "this hour has buildable schedule rows", not HH:00 exact.
+            "schedule_expected": bool(segments),
+            "first_transition_minute": first_transition_minute,
+            "takeover_time": takeover_time,
+            "takeover_due": takeover_due,
             "has_committed_playout": has_committed_playout,
         }
 
@@ -5123,8 +5198,15 @@ class PlaybackEngine:
         # been the first to notice the worker it just started.
         self._ensure_log_building(
             now.date(), now.hour,
-            schedule_expected=hour_state["schedule_expected"],
+            schedule_expected=hour_state["has_hour_schedule"],
         )
+
+        # A due partial hour changes only FUTURE queue ownership. The
+        # centralized eligibility gate inside _advance_to_next_hour_log keeps
+        # this a no-op before takeover and leaves any playing deck untouched.
+        if hour_state["state"] == "partial_due":
+            self._advance_to_next_hour_log(now.date(), now.hour)
+            hour_state = self._current_hour_schedule_state(now)
 
         # Monitoring: distinguish a genuine missed/late rollover (the
         # active log is BEHIND wall-clock time) from two states that
@@ -5142,7 +5224,7 @@ class PlaybackEngine:
         now_key = hour_state["now_key"]
         active_key = hour_state["active_key"]
 
-        if hour_state["state"] == "scheduled" and active_key is not None and active_key < now_key:
+        if hour_state["state"] in ("scheduled", "partial_due") and active_key is not None and active_key < now_key:
             if not PlaylistLog.objects.filter(date=now.date(), hour=now.hour, status="approved").exists():
                 with self._lock:
                     build_in_progress = now_key in self._building_hours
@@ -5156,7 +5238,7 @@ class PlaybackEngine:
                     },
                     dedupe_key=f"engine|late-hour-log|{now.date()}|{now.hour}",
                 )
-        elif hour_state["state"] == "scheduled" and active_key is None:
+        elif hour_state["state"] in ("scheduled", "partial_due") and active_key is None:
             if not PlaylistLog.objects.filter(date=now.date(), hour=now.hour, status="approved").exists():
                 with self._lock:
                     build_in_progress = now_key in self._building_hours
@@ -5204,7 +5286,7 @@ class PlaybackEngine:
             if active_key is not None and active_key > now_key:
                 # Intentional early rollover: never move the queue backward.
                 pass
-            elif active_key == now_key or hour_state["schedule_expected"]:
+            elif active_key == now_key or hour_state["state"] in ("scheduled", "partial_due"):
                 self._load_log_for(now.date(), now.hour)
             # During a blank continuation/gap, retain the older active log.
             # Its queued items or an async live-fill proposal still belong to
@@ -5216,7 +5298,7 @@ class PlaybackEngine:
             ):
                 self._start_next_track()
             elif (
-                hour_state["state"] == "unscheduled_gap"
+                hour_state["state"] in ("unscheduled_gap", "partial_before_takeover")
                 and active_key is not None and active_key < now_key
             ):
                 self._try_extend_live_log_async()
@@ -5272,23 +5354,19 @@ class PlaybackEngine:
                 )
                 return
 
-        close_old_connections()
-        log = (
-            PlaylistLog.objects
-            .filter(date=target_date, hour=target_hour, status="approved")
-            .first()
-        )
+        log, items = self._approved_log_queue(target_date, target_hour)
         if not log:
             return
-        items = self._apply_poison_skip(list(  # [P0] 1.8 defense-in-depth
-            log.items
-            .select_related(
-                "track", "track__artist", "track__album", "track__category", "track__category__kind",
-                "category", "category__kind",  # LogItem's own category, read directly by dedication logic
-            )
-            .order_by("position")
-        ))
         if not items:
+            return
+        eligible, takeover_at = self._log_queue_eligibility(
+            log, items, timezone.localtime(),
+        )
+        if not eligible:
+            print(
+                f"  Deferring partial queue {target_date} {target_hour:02d}:00 "
+                f"until {takeover_at.isoformat()}"
+            )
             return
 
         self.current_log = log
@@ -5296,6 +5374,7 @@ class PlaybackEngine:
         self._queue_cursor = 0
         self._next_hour_peek = None
         self._next_hour_peek_at = 0.0
+        self._next_hour_peek_key = None
         print(f"  Advanced active queue to next hour ahead of TOH: {log.date} {log.hour:02d}:00 ({len(items)} items)")
 
     def _ensure_log_building(
@@ -5338,7 +5417,8 @@ class PlaybackEngine:
         if PlaylistLog.objects.filter(date=target_date, hour=target_hour, status="approved").exists():
             return "approved"
         if schedule_expected is None:
-            schedule_expected = resolve_schedule_block(target_date, target_hour) is not None
+            profile = get_active_schedule_profile()
+            schedule_expected = bool(resolve_schedule_segments(target_date, target_hour, profile))
         if not schedule_expected:
             return "unscheduled"
         key = (target_date, target_hour)
@@ -5463,40 +5543,48 @@ class PlaybackEngine:
         return None
 
     def _peek_next_hour(self):
-        """Read-only look at the next hour's already-approved log (built
-        by `_ensure_upcoming_logs` ~NEXT_HOUR_LOOKAHEAD_SECONDS before top
-        of hour), without switching engine state to it. Cached briefly
-        since this can be polled every _poll_position tick (500ms) once
-        the current hour's queue is running low. Mirrors the same
-        `next_hour = (now + timedelta(hours=1)).replace(...)` pattern used
-        elsewhere in this file, so day-rollover behaves identically."""
-        now = time.time()
-        if self._next_hour_peek is not None and now - self._next_hour_peek_at < 5.0:
-            return self._next_hour_peek
+        """Read-only look at the next queue that is eligible to take over.
 
-        close_old_connections()
+        Ordinarily that is the following wall hour. During a partial current
+        hour it is deliberately hidden before takeover, then becomes the
+        current hour's partial log at/after takeover if the older continuation
+        queue is still active. Candidate material is cached, but eligibility
+        is rechecked on every poll so crossing the boundary is never delayed
+        by the five-second DB cache.
+        """
         wall_now = timezone.localtime()
-        next_hour = (wall_now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
-        log = (
-            PlaylistLog.objects
-            .filter(date=next_hour.date(), hour=next_hour.hour, status="approved")
-            .first()
-        )
-        result = None
-        if log:
-            items = self._apply_poison_skip(list(  # [P0] 1.8 defense-in-depth
-                log.items
-                .select_related(
-                "track", "track__artist", "track__album", "track__category", "track__category__kind",
-                "category", "category__kind",  # LogItem's own category, read directly by dedication logic
-            )
-                .order_by("position")
-            ))
-            if items:
-                result = (log, items)
+        hour_state = self._current_hour_schedule_state(wall_now)
+        if hour_state["state"] == "partial_before_takeover":
+            return None
+        if (
+            hour_state["state"] == "partial_due"
+            and (hour_state["active_key"] is None or hour_state["active_key"] < hour_state["now_key"])
+        ):
+            target = wall_now.replace(minute=0, second=0, microsecond=0)
+        else:
+            target = (wall_now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+        target_key = (target.date(), target.hour)
 
+        monotonic_now = time.time()
+        cached_key = getattr(self, "_next_hour_peek_key", None)
+        if (
+            self._next_hour_peek is not None
+            and cached_key == target_key
+            and monotonic_now - self._next_hour_peek_at < 5.0
+        ):
+            log, items = self._next_hour_peek
+            eligible, _takeover_at = self._log_queue_eligibility(log, items, wall_now)
+            return self._next_hour_peek if eligible else None
+
+        log, items = self._approved_log_queue(*target_key)
+        result = (log, items) if log and items else None
         self._next_hour_peek = result
-        self._next_hour_peek_at = now
+        self._next_hour_peek_at = monotonic_now
+        self._next_hour_peek_key = target_key
+        if result:
+            eligible, _takeover_at = self._log_queue_eligibility(log, items, wall_now)
+            if not eligible:
+                return None
         return result
 
     def _committed_future_runway_seconds(self):
@@ -5885,6 +5973,7 @@ class PlaybackEngine:
             self._queue_cursor = 0
             self._next_hour_peek = None
             self._next_hour_peek_at = 0.0
+            self._next_hour_peek_key = None
             print(f"  Rolled over to next hour's log: {log.date} {log.hour:02d}:00 ({len(items)} items)")
             return True
         self._try_extend_live_log_async()
@@ -13465,8 +13554,19 @@ class PlaybackEngine:
         print(f"  [{slot}] Log exhausted for this hour.")
         now = timezone.localtime()
         hour_state = self._current_hour_schedule_state(now)
+        if hour_state["state"] == "partial_due":
+            # The eligible target is THIS wall hour's partial queue, never
+            # the following wall hour. If its build is still missing, wait
+            # and retry instead of skipping an entire programming boundary.
+            self._load_log_for(now.date(), now.hour)
+            if self.log_items:
+                self._start_next_track(slot=slot)
+            else:
+                print("Eligible partial-hour log is not ready. Waiting...")
+                GLib.timeout_add_seconds(30, self._try_load_next_hour)
+            return
         if (
-            not hour_state["schedule_expected"]
+            (not hour_state["has_hour_schedule"] or hour_state["state"] == "partial_before_takeover")
             and hour_state["active_key"] is not None
             and hour_state["active_key"] < hour_state["now_key"]
         ):
@@ -13493,7 +13593,7 @@ class PlaybackEngine:
         now = timezone.localtime()
         hour_state = self._current_hour_schedule_state(now)
         if (
-            not hour_state["schedule_expected"]
+            (not hour_state["has_hour_schedule"] or hour_state["state"] == "partial_before_takeover")
             and hour_state["active_key"] is not None
             and hour_state["active_key"] < hour_state["now_key"]
         ):

@@ -47,6 +47,7 @@ def make_stand_in():
     obj._queue_cursor = 0
     obj._next_hour_peek = None
     obj._next_hour_peek_at = 0.0
+    obj._next_hour_peek_key = None
     obj._last_live_extend_attempt = 0.0
     obj._live_fill_in_progress = False
     obj._live_fill_generation = 0
@@ -94,7 +95,7 @@ class ContinuationHourOrchestrationTests(TransactionTestCase):
             next_start_seconds=duration,
         )
 
-    def make_log(self, target_date, hour, *, tracks, played=False):
+    def make_log(self, target_date, hour, *, tracks, played=False, scheduled_at=None):
         log = PlaylistLog.objects.create(
             date=target_date, hour=hour, status="approved"
         )
@@ -104,7 +105,9 @@ class ContinuationHourOrchestrationTests(TransactionTestCase):
                 LogItem.objects.create(
                     playlist_log=log,
                     position=position,
-                    scheduled_time=timezone.now(),
+                    scheduled_time=scheduled_at or timezone.make_aware(
+                        timezone.datetime.combine(target_date, dt_time(hour, 0))
+                    ),
                     track=track,
                     category=self.category,
                     played_at=timezone.now() if played else None,
@@ -119,12 +122,13 @@ class ContinuationHourOrchestrationTests(TransactionTestCase):
         *,
         specific=True,
         rotation=None,
+        minute=0,
     ):
         return ScheduleBlock.objects.create(
             profile=ensure_schedule_profile_state().active_profile,
             specific_date=target_date if specific else None,
             day_of_week=None if specific else target_date.weekday(),
-            start_time=dt_time(hour, 0),
+            start_time=dt_time(hour, minute),
             end_time=dt_time((hour + 1) % 24, 0),
             rotation=rotation or self.rotation,
         )
@@ -164,6 +168,137 @@ class ContinuationHourOrchestrationTests(TransactionTestCase):
             log_item=item,
             track=item.track,
         )
+
+    def partial_log(self, target_date, hour, minute, track):
+        return self.make_log(
+            target_date, hour, tracks=[track],
+            scheduled_at=self.fake_now(target_date, hour, minute=minute),
+        )
+
+    def test_partial_next_hour_is_prebuilt_but_not_installed_or_peeked_early(self):
+        old_track = self.make_track(duration=7200)
+        old_log, (old_item,) = self.make_log(FRIDAY, 10, tracks=[old_track], played=True)
+        self.make_block(FRIDAY, 11, minute=30)
+        self.partial_log(FRIDAY, 11, 30, self.make_track())
+        stand_in = make_stand_in()
+        self.put_last_item_on_deck(stand_in, old_log, old_item)
+        now = self.fake_now(FRIDAY, 10, minute=59)
+
+        with patch.object(eng_module.timezone, "localtime", return_value=now):
+            stand_in._advance_to_next_hour_log(FRIDAY, 11)
+            peek = stand_in._peek_next_hour()
+
+        self.assertEqual(stand_in.current_log.id, old_log.id)
+        self.assertIsNone(peek)
+
+    def test_partial_hour_before_takeover_is_intentional_continuation_without_warning(self):
+        old_track = self.make_track(duration=7200)
+        old_log, (old_item,) = self.make_log(FRIDAY, 10, tracks=[old_track], played=True)
+        self.make_block(FRIDAY, 11, minute=30)
+        self.partial_log(FRIDAY, 11, 30, self.make_track())
+        stand_in = make_stand_in()
+        self.put_last_item_on_deck(stand_in, old_log, old_item)
+        now = self.fake_now(FRIDAY, 11, minute=10)
+
+        emitted, thread = self.run_tick(stand_in, now)
+
+        self.assertEqual(stand_in._current_hour_schedule_state(now)["state"], "partial_before_takeover")
+        self.assertEqual(stand_in.current_log.id, old_log.id)
+        self.assertEqual(emitted, [])
+        thread.assert_not_called()
+
+    def test_partial_takeover_switches_future_queue_without_touching_playing_deck(self):
+        old_track = self.make_track(duration=7200)
+        old_log, (old_item,) = self.make_log(FRIDAY, 10, tracks=[old_track], played=True)
+        self.make_block(FRIDAY, 11, minute=30)
+        partial, (partial_item,) = self.partial_log(FRIDAY, 11, 30, self.make_track())
+        stand_in = make_stand_in()
+        self.put_last_item_on_deck(stand_in, old_log, old_item)
+        deck_before = stand_in.decks["A"]
+
+        emitted, thread = self.run_tick(stand_in, self.fake_now(FRIDAY, 11, minute=30))
+
+        self.assertEqual(stand_in.current_log.id, partial.id)
+        self.assertEqual(stand_in.log_items[0].id, partial_item.id)
+        self.assertEqual(stand_in._queue_cursor, 0)
+        self.assertIs(stand_in.decks["A"], deck_before)
+        self.assertEqual(emitted, [])
+        thread.assert_not_called()
+
+    def test_exhaustion_before_partial_takeover_uses_live_fill_not_partial_log(self):
+        old_track = self.make_track()
+        old_log, (old_item,) = self.make_log(FRIDAY, 10, tracks=[old_track], played=True)
+        self.make_block(FRIDAY, 11, minute=30)
+        self.partial_log(FRIDAY, 11, 30, self.make_track())
+        stand_in = make_stand_in()
+        stand_in.current_log = old_log
+        stand_in.log_items = [old_item]
+        stand_in._queue_cursor = 1
+
+        with patch.object(
+            eng_module.timezone, "localtime",
+            return_value=self.fake_now(FRIDAY, 11, minute=17),
+        ), patch.object(eng_module, "GLib"):
+            stand_in._on_log_exhausted("A")
+
+        self.assertEqual(stand_in.current_log.id, old_log.id)
+        stand_in._try_extend_live_log_async.assert_called_once()
+
+    def test_missing_due_partial_log_never_skips_to_following_hour(self):
+        old_log, (old_item,) = self.make_log(
+            FRIDAY, 10, tracks=[self.make_track()], played=True,
+        )
+        self.make_block(FRIDAY, 11, minute=30)
+        following, _ = self.make_log(FRIDAY, 12, tracks=[self.make_track()])
+        stand_in = make_stand_in()
+        stand_in.current_log = old_log
+        stand_in.log_items = [old_item]
+        stand_in._queue_cursor = 1
+
+        with patch.object(
+            eng_module.timezone, "localtime",
+            return_value=self.fake_now(FRIDAY, 11, minute=30),
+        ), patch.object(eng_module, "GLib") as glib:
+            stand_in._on_log_exhausted("A")
+
+        self.assertNotEqual(getattr(stand_in.current_log, "id", None), following.id)
+        self.assertEqual(stand_in.log_items, [])
+        glib.timeout_add_seconds.assert_called_once_with(30, stand_in._try_load_next_hour)
+
+    def test_startup_before_partial_takeover_recovers_prior_same_day_queue(self):
+        played = self.make_track()
+        future = self.make_track()
+        prior, items = self.make_log(FRIDAY, 10, tracks=[played, future])
+        items[0].played_at = timezone.now()
+        items[0].save(update_fields=["played_at"])
+        self.make_block(FRIDAY, 11, minute=30)
+        self.partial_log(FRIDAY, 11, 30, self.make_track())
+        stand_in = make_stand_in()
+
+        with patch.object(
+            eng_module.timezone, "localtime",
+            return_value=self.fake_now(FRIDAY, 11, minute=10),
+        ):
+            stand_in._load_current_hour_log()
+
+        self.assertEqual(stand_in.current_log.id, prior.id)
+        self.assertEqual(stand_in._queue_cursor, 1)
+
+    def test_startup_after_partial_takeover_loads_partial_queue(self):
+        prior, _ = self.make_log(FRIDAY, 10, tracks=[self.make_track()], played=True)
+        self.make_block(FRIDAY, 11, minute=30)
+        partial, (partial_item,) = self.partial_log(FRIDAY, 11, 30, self.make_track())
+        stand_in = make_stand_in()
+
+        with patch.object(
+            eng_module.timezone, "localtime",
+            return_value=self.fake_now(FRIDAY, 11, minute=35),
+        ):
+            stand_in._load_current_hour_log()
+
+        self.assertNotEqual(prior.id, partial.id)
+        self.assertEqual(stand_in.current_log.id, partial.id)
+        self.assertEqual(stand_in.log_items[0].id, partial_item.id)
 
     def test_blank_hour_long_last_item_is_healthy_continuation(self):
         track = self.make_track(duration=7200)

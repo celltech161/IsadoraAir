@@ -6,7 +6,7 @@ import json
 import tempfile
 import threading
 import time
-from datetime import date, timedelta
+from datetime import date, time as dt_time, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -15,7 +15,10 @@ from django.test import TransactionTestCase
 from django.utils import timezone
 
 import library.services.engine as eng_module
-from library.models import Artist, Category, CategoryKind, LogItem, PlaylistLog, Track
+from library.models import (
+    Artist, Category, CategoryKind, LogItem, PlaylistLog, Rotation,
+    ScheduleBlock, Track,
+)
 from library.services.engine import Deck, PlaybackEngine
 from library.tests.schedule_profile_helpers import ensure_schedule_profile_state
 from library.tests.test_continuation_hour_orchestration import make_stand_in
@@ -454,6 +457,44 @@ class EarlyRolloverQueueSeparationTests(TwoHourFixture):
         aired = {item_id for item_id, _ in created}
         self.assertNotIn(self.item_next.id, aired)
         self.assertNotIn(self.item_n2.id, aired)
+
+    def test_partial_takeover_restart_keeps_old_occurrence_and_new_active_queue_separate(self):
+        profile = ensure_schedule_profile_state().active_profile
+        rotation = Rotation.objects.create(name="Partial Restart Rotation")
+        ScheduleBlock.objects.create(
+            profile=profile, specific_date=self.log.date,
+            start_time=dt_time(1, 30), end_time=dt_time(2, 0), rotation=rotation,
+        )
+        takeover = timezone.make_aware(
+            timezone.datetime.combine(self.log.date, dt_time(1, 30))
+        )
+        for offset, item in enumerate(self.x_items):
+            item.scheduled_time = takeover + timedelta(minutes=offset)
+            item.save(update_fields=["scheduled_time"])
+
+        self.write_resume_state(
+            saved_position=4.0, queue_log=self.new_log,
+            queue_resume_cursor=0, queue_resume_next_id=self.x_items[0].id,
+        )
+        engine = self.engine()
+        now = timezone.make_aware(
+            timezone.datetime.combine(self.log.date, dt_time(1, 35))
+        )
+        self.recover(engine, now=now)
+
+        self.assertEqual(engine._resume_hint["playlist_log_id"], self.log.id)
+        self.assertEqual(engine.current_log.id, self.new_log.id)
+        self.assertEqual(engine._resume_item.id, self.item_n.id)
+        self.assertEqual(engine._queue_cursor, 0)
+        self.assertEqual(engine._current_hour_schedule_state(now)["state"], "partial_due")
+
+        created = self.start_tracks(engine, 3)
+        self.assertEqual(
+            created,
+            [(self.item_n.id, True), (self.x_items[0].id, False), (self.x_items[1].id, False)],
+        )
+        self.assertNotIn(self.item_next.id, {item_id for item_id, _ in created})
+        self.assertNotIn(self.item_n2.id, {item_id for item_id, _ in created})
 
     def test_an_older_saved_queue_never_replaces_a_newer_occurrence_log(self):
         # Occurrence belongs to 01:00; the saved queue claims 00:00. An older

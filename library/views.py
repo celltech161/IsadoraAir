@@ -41,8 +41,8 @@ from .services.related_artists import (
 )
 from .services.track_filters import filter_tracks
 from .services.schedule_resolution import (
-    ScheduleConflict, assert_base_for_write, assert_can_delete, detail_counts_for_date,
-    effective_segments, load_hour_rows, load_weekly_hour_rows, minute_map,
+    detail_counts_for_date, effective_segments, load_hour_rows,
+    load_weekly_hour_rows, minute_map,
 )
 from .services.schedule_profiles import (
     ProfileLifecycleError, activate_profile, archive_profile, clone_profile,
@@ -422,12 +422,6 @@ def api_schedule_list(request):
         profile = ScheduleProfile.objects.select_for_update().get(pk=profile.pk)
         if profile.is_archived:
             return JsonResponse({"error": "Archived profiles are read-only."}, status=409)
-        try:
-            assert_base_for_write(
-                profile, day_of_week=day_of_week, specific_date=target_date, hour=hour, minute=minute,
-            )
-        except ScheduleConflict as exc:
-            return JsonResponse({"error": exc.message}, status=exc.status)
         block, created = ScheduleBlock.objects.update_or_create(
             profile=profile,
             day_of_week=day_of_week,
@@ -465,13 +459,6 @@ def api_schedule_delete(request, pk):
         row = blocks.select_related("profile").first()
         if row is None:
             return JsonResponse({"ok": True, "deleted": False})
-        try:
-            assert_can_delete(row)
-        except ScheduleConflict as exc:
-            payload = {"error": exc.message}
-            if exc.blockers:
-                payload["blockers"] = exc.blockers
-            return JsonResponse(payload, status=exc.status)
         # Exactly this one explicit row; never the base or sibling transitions.
         deleted, _ = ScheduleBlock.objects.filter(pk=row.pk, profile=profile).delete()
     return JsonResponse({"ok": True, "deleted": deleted > 0})
@@ -515,7 +502,9 @@ def api_schedule_hour_detail(request):
         "day_of_week": day_of_week,
         "date": target_date.isoformat() if target_date else None,
         "hour": hour,
-        "has_base": bool(segments),
+        "has_base": bool(segments and segments[0].start_minute == 0),
+        "is_partial_hour": bool(segments and segments[0].start_minute > 0),
+        "takeover_minute": segments[0].start_minute if segments else None,
         "minutes": [
             {
                 "minute": entry["minute"],
@@ -524,6 +513,7 @@ def api_schedule_hour_detail(request):
                 "explicit_block_id": entry["explicit_block"].pk if entry["explicit_block"] else None,
                 "inherited_transition": entry["inherited_transition"],
                 "segment_start": entry["segment_start"],
+                "continuation": entry["continuation"],
                 "orphan": entry["orphan"],
             }
             for entry in entries
