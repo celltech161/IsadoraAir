@@ -25,6 +25,7 @@ from library.models import (
     Track,
 )
 from library.services.related_artists import track_identity_keys
+from library.services.schedule_resolution import resolve_schedule_segments
 
 
 class TrackIdentityCache:
@@ -1332,53 +1333,132 @@ def fill_remaining_hour(picks, accumulated_seconds, target_datetime,
     return picks, accumulated_seconds
 
 
-def _build_from_rotation(target_date, hour, rotation, target_duration_seconds=NOMINAL_HOUR_SECONDS,
-                         schedule_profile=None):
-    slots = list(
-        rotation.slots
-        .select_related("category__kind", "track", "track__category__kind", "track__artist")
-        .order_by("position")
-    )
-    if not slots:
-        return None, f"Rotation '{rotation.name}' has no slots."
+@dataclass
+class SegmentPlan:
+    """One programming source to walk inside a combined hour build."""
+    kind: str                      # "rotation" | "playlist"
+    source: object                 # Rotation | Playlist
+    start_minute: int = 0
+    origin: str | None = None      # "weekly" | "date_override" | None (direct build)
+    block_id: int | None = None
+    slots: list | None = None
+    items: list | None = None
+    empty: bool = False
 
+    @property
+    def name(self):
+        return self.source.name
+
+
+def _plan_for_rotation(rotation):
+    return SegmentPlan(kind="rotation", source=rotation)
+
+
+def _plan_for_playlist(playlist):
+    return SegmentPlan(kind="playlist", source=playlist)
+
+
+def _plan_for_segment(segment):
+    block = segment.block
+    plan = SegmentPlan(
+        kind="playlist" if block.playlist_id else "rotation",
+        source=block.playlist if block.playlist_id else block.rotation,
+        start_minute=segment.start_minute, origin=segment.origin, block_id=block.pk,
+    )
+    return plan
+
+
+@dataclass
+class HourBuildContext:
+    """Selection state for ONE combined hour build.
+
+    Every segment of the hour shares this object, so tracks and artist
+    identities picked by an earlier segment (including explicit Playlist
+    items) keep excluding later Rotation picks, timing is one continuous
+    clock, and the hour is persisted exactly once.
+    """
+    target_date: object
+    hour: int
+    target_datetime: object
+    target_duration_seconds: float
+    recency_cfg: object
+    active_holiday_codes: list
+    daily_shares: dict
+    identity_cache: object
+    diagnostics: object
+    picks: list = field(default_factory=list)
+    picked_tracks: list = field(default_factory=list)
+    picked_identity_keys: set = field(default_factory=set)
+    accumulated_seconds: float = 0.0
+    rotation_walked: bool = False
+
+    def record_pick(self, track, category):
+        self.picks.append({
+            "position": len(self.picks),
+            "scheduled_time": self.target_datetime + timedelta(seconds=self.accumulated_seconds),
+            "track": track,
+            "category": category,
+        })
+        self.picked_tracks.append(track)
+        self.picked_identity_keys.update(track_identity_keys(
+            track.artist.name if track.artist_id else None, track.related_artists,
+        ))
+        self.accumulated_seconds += effective_airtime_seconds(track)
+
+    def resync_from_picks(self):
+        """Re-derive the exclusion state after fill_remaining_hour appended
+        picks to the shared list (in place, so existing references stay valid)."""
+        self.picked_tracks[:] = [pick["track"] for pick in self.picks]
+        self.picked_identity_keys.clear()
+        self.picked_identity_keys.update(_identity_keys_for_picks(self.picks))
+
+
+def _new_hour_context(target_date, hour, target_duration_seconds):
     recency_cfg = RecencyConfig.load()
-    target_datetime = timezone.make_aware(
-        datetime.combine(target_date, time(hour, 0))
-    )
-
-    # Station-wide holiday injection state, computed once at build
-    # start. `active_holidays` is the set of Holidays in their ramp
-    # window; `daily_shares` maps each active holiday's code to the
-    # linear-tent share for today (0 at ramp edges, max_share at peak).
-    # On each music-kind category-random slot we roll a per-holiday die
-    # (independent draws): if `random() < daily_shares[code]`, that
-    # slot becomes a "holiday slot" for that holiday and its pool is
-    # replaced with a station-wide music-kind holiday pool via
-    # _music_holiday_pool. Slots that DIDN'T roll yes on any holiday
-    # get their normal pool with active-holiday-tagged tracks excluded
-    # (so they can't sneak in through their filed category and inflate
-    # the effective share). Non-music-kind slots (Legal ID, imaging,
-    # weather, etc.) are unaffected either way.
+    target_datetime = timezone.make_aware(datetime.combine(target_date, time(hour, 0)))
+    # Station-wide holiday injection state, computed once per hour build
+    # (see the long comment history in _walk_rotation_segment's callers).
     active_holidays = _active_holidays_at(target_datetime)
-    active_holiday_codes = [h.code for h in active_holidays]
-    daily_shares = {
-        h.code: _holiday_daily_share(h, target_datetime.date())
-        for h in active_holidays
-    }
-
-    identity_cache = TrackIdentityCache()
-    picks = []
-    picked_tracks = []
-    picked_identity_keys = set()
-    accumulated_seconds = 0.0
-    diagnostics = SelectionDiagnostics(
-        target_duration_seconds=target_duration_seconds,
-        late_offset_seconds=max(0.0, NOMINAL_HOUR_SECONDS - target_duration_seconds),
+    return HourBuildContext(
+        target_date=target_date, hour=hour, target_datetime=target_datetime,
+        target_duration_seconds=target_duration_seconds, recency_cfg=recency_cfg,
+        active_holiday_codes=[h.code for h in active_holidays],
+        daily_shares={h.code: _holiday_daily_share(h, target_datetime.date()) for h in active_holidays},
+        identity_cache=TrackIdentityCache(),
+        diagnostics=SelectionDiagnostics(
+            target_duration_seconds=target_duration_seconds,
+            late_offset_seconds=max(0.0, NOMINAL_HOUR_SECONDS - target_duration_seconds),
+        ),
     )
 
-    def _append_pick(track, category):
+
+def _slot_label(idx, category):
+    return f"Slot {idx + 1} ({category.name if category else '?'})"
+
+
+def _walk_rotation_segment(ctx, slots, segment_end_seconds, observer=None):
+    """Walk one rotation's slots into the shared context until the segment's
+    budget is reached. The picking logic is the original single-hour loop,
+    unchanged: `segment_end_seconds` plays the role the hour's
+    target_duration_seconds always had, so landing pairs / exact-fit engage
+    as the SEGMENT boundary approaches (boundary landing, never a hard cut)."""
+    ctx.rotation_walked = True
+    recency_cfg = ctx.recency_cfg
+    target_datetime = ctx.target_datetime
+    active_holiday_codes = ctx.active_holiday_codes
+    daily_shares = ctx.daily_shares
+    identity_cache = ctx.identity_cache
+    picks = ctx.picks
+    picked_tracks = ctx.picked_tracks
+    picked_identity_keys = ctx.picked_identity_keys
+    accumulated_seconds = ctx.accumulated_seconds
+    diagnostics = ctx.diagnostics
+    target_duration_seconds = segment_end_seconds
+
+    def _append_pick(track, category, label=None):
         nonlocal accumulated_seconds
+        if observer is not None and label is not None:
+            observer.on_pick(track, label)
         track_duration = effective_airtime_seconds(track)
         scheduled_time = target_datetime + timedelta(seconds=accumulated_seconds)
         picks.append({
@@ -1443,7 +1523,7 @@ def _build_from_rotation(target_date, hour, rotation, target_duration_seconds=NO
             # which only ever looks at slots[idx+1] to decide whether a
             # pair is even attemptable, and always falls back to a plain
             # single pick if that neighbor is direct-track).
-            _append_pick(slot.track, slot.track.category)
+            _append_pick(slot.track, slot.track.category, _slot_label(idx, slot.track.category))
             diagnostics.direct_track_inserts += 1
             idx += 1
             if accumulated_seconds >= target_duration_seconds:
@@ -1469,9 +1549,11 @@ def _build_from_rotation(target_date, hour, rotation, target_duration_seconds=NO
                                       exclude_holiday_codes, remaining)
             if track is None:
                 diagnostics.pool_exhausted_picks += 1
+                if observer is not None:
+                    observer.on_pool_exhausted(idx, category)
                 idx += 1
                 continue
-            _append_pick(track, category)
+            _append_pick(track, category, _slot_label(idx, category))
             if mode == "normal":
                 diagnostics.normal_picks += 1
             else:
@@ -1532,8 +1614,8 @@ def _build_from_rotation(target_date, hour, rotation, target_duration_seconds=NO
                 track_a = resolved.get(pair_result.candidate_a.track_id)
                 track_b = resolved.get(pair_result.candidate_b.track_id)
                 if track_a is not None and track_b is not None:
-                    _append_pick(track_a, category)
-                    _append_pick(track_b, category_b)
+                    _append_pick(track_a, category, _slot_label(idx, category))
+                    _append_pick(track_b, category_b, _slot_label(idx + 1, category_b))
                     diagnostics.landing_pairs += 1
                     diagnostics.landing_errors.append(pair_result.landing_error)
                     idx += 2
@@ -1561,23 +1643,132 @@ def _build_from_rotation(target_date, hour, rotation, target_duration_seconds=NO
                                       exclude_holiday_codes_a, remaining, force_fit_mode=True)
             if track is None:
                 diagnostics.pool_exhausted_picks += 1
+                if observer is not None:
+                    observer.on_pool_exhausted(idx, category)
                 idx += 1
                 continue
-            _append_pick(track, category)
+            _append_pick(track, category, _slot_label(idx, category))
             diagnostics.exact_fit_picks += 1
             idx += 1
 
         if accumulated_seconds >= target_duration_seconds:
             break
 
-    picks, accumulated_seconds = fill_remaining_hour(
-        picks, accumulated_seconds, target_datetime,
-        active_holiday_codes=active_holiday_codes,
-        daily_shares=daily_shares,
-        identity_cache=identity_cache,
-        target_duration_seconds=target_duration_seconds,
-    )
+    ctx.accumulated_seconds = accumulated_seconds
 
+
+def _walk_playlist_segment(ctx, items, observer=None):
+    """Append every explicit playlist item, in order. A Playlist is curated:
+    it is never truncated to fit a later boundary, and its tracks seed the
+    shared exclusion state for any Rotation segment that follows."""
+    for item in items:
+        track = item.track
+        if observer is not None:
+            observer.on_pick(track, f"Playlist position {item.position + 1}")
+        ctx.record_pick(track, track.category)
+
+
+def _segment_windows(plans, target_duration_seconds):
+    """(plan, nominal_start_offset, end_offset, elapsed) per plan, in seconds
+    of the accumulated build clock.
+
+    The log's clock starts at hour start; when clock-drift recovery shortens
+    the target the real start is `late` seconds into the hour, so a wall-clock
+    transition at minute M sits at M*60 - late on that clock. A segment whose
+    whole window ended before the real start (end <= 0) is `elapsed` and is not
+    built; the final segment is never elapsed.
+    """
+    late = max(0.0, NOMINAL_HOUR_SECONDS - target_duration_seconds)
+    windows = []
+    previous_end = None
+    for index, plan in enumerate(plans):
+        start = plan.start_minute * 60 - late
+        if index + 1 < len(plans):
+            end = min(plans[index + 1].start_minute * 60 - late, target_duration_seconds)
+        else:
+            end = target_duration_seconds
+        if previous_end is not None:
+            end = max(end, previous_end)
+        previous_end = end
+        windows.append((plan, start, end, index + 1 < len(plans) and end <= 0))
+    return windows
+
+
+def _plan_hour(target_date, hour, plans, target_duration_seconds, observer=None):
+    """Build the combined pick list for one hour WITHOUT persisting.
+
+    Returns (ctx, records, error). `error` is a message only when there is no
+    observer (a real build must not persist anything for an unusable source);
+    a preview observer instead records the problem and skips that segment.
+    """
+    for plan in plans:
+        if plan.kind == "rotation":
+            plan.slots = list(
+                plan.source.slots
+                .select_related("category__kind", "track", "track__category__kind", "track__artist")
+                .order_by("position")
+            )
+            plan.empty = not plan.slots
+            message = f"Rotation '{plan.name}' has no slots."
+        else:
+            plan.items = list(
+                plan.source.items
+                .select_related("track", "track__category", "track__artist")
+                .order_by("position")
+            )
+            plan.empty = not plan.items
+            message = f"Playlist '{plan.name}' has no items."
+        if plan.empty:
+            if observer is None:
+                return None, None, message
+            observer.on_empty_source(plan)
+
+    ctx = _new_hour_context(target_date, hour, target_duration_seconds)
+    records = []
+    for plan, nominal_start, end, elapsed in _segment_windows(plans, target_duration_seconds):
+        record = {
+            "start_minute": plan.start_minute,
+            "start_time": f"{hour:02d}:{plan.start_minute:02d}",
+            "origin": plan.origin,
+            "source": plan.kind,
+            "source_name": plan.name,
+            "block_id": plan.block_id,
+            "nominal_start_seconds": nominal_start,
+            "end_boundary_seconds": end,
+            "elapsed_before_start": elapsed,
+            "actual_start_seconds": None,
+            "actual_end_seconds": None,
+            "delay_seconds": 0.0,
+            "items": 0,
+        }
+        records.append(record)
+        if elapsed or plan.empty:
+            continue
+        before = len(ctx.picks)
+        record["actual_start_seconds"] = ctx.accumulated_seconds
+        # A segment that begins after its nominal start (an earlier explicit
+        # Playlist or a track that ran past the boundary) is delayed, never
+        # skipped and never hard-cut.
+        record["delay_seconds"] = max(0.0, ctx.accumulated_seconds - max(nominal_start, 0.0))
+        if plan.kind == "rotation":
+            _walk_rotation_segment(ctx, plan.slots, end, observer)
+        else:
+            _walk_playlist_segment(ctx, plan.items, observer)
+        ctx.picks, ctx.accumulated_seconds = fill_remaining_hour(
+            ctx.picks, ctx.accumulated_seconds, ctx.target_datetime,
+            active_holiday_codes=ctx.active_holiday_codes,
+            daily_shares=ctx.daily_shares,
+            identity_cache=ctx.identity_cache,
+            target_duration_seconds=end,
+        )
+        ctx.resync_from_picks()
+        record["actual_end_seconds"] = ctx.accumulated_seconds
+        record["items"] = len(ctx.picks) - before
+    return ctx, records, None
+
+
+def _emit_selection_diagnostics(ctx, records):
+    target_date, hour, diagnostics = ctx.target_date, ctx.hour, ctx.diagnostics
     # Monitoring philosophy (1.1 follow-up): Monitoring tells the
     # operator when the scheduler needs attention; ordinary application
     # logs explain what it did. The full diagnostic payload is always
@@ -1589,6 +1780,15 @@ def _build_from_rotation(target_date, hour, rotation, target_duration_seconds=NO
     # duplicated here (they already have their own separate visibility,
     # or would require a large schema change to instrument).
     diagnostics_detail = {"date": target_date.isoformat(), "hour": hour, **diagnostics.as_detail()}
+    if len(records) > 1:
+        diagnostics_detail["segments"] = [
+            {
+                "start": record["start_time"], "source": f"{record['source']}:{record['source_name']}",
+                "delay_seconds": round(record["delay_seconds"], 1),
+                "elapsed_before_start": record["elapsed_before_start"], "items": record["items"],
+            }
+            for record in records
+        ]
     if diagnostics.needs_operator_attention():
         reasons = []
         if diagnostics.pool_exhausted_picks > 0:
@@ -1607,42 +1807,35 @@ def _build_from_rotation(target_date, hour, rotation, target_duration_seconds=NO
     else:
         print(f"  Hour log selection diagnostics for {target_date} {hour:02d}:00 (healthy, no monitoring event needed):", diagnostics_detail)
 
-    return _persist_log(target_date, hour, picks, schedule_profile=schedule_profile)
+
+def _build_hour_from_plans(target_date, hour, plans, target_duration_seconds, schedule_profile):
+    """Plan every segment, then persist the hour exactly ONCE."""
+    ctx, records, error = _plan_hour(target_date, hour, plans, target_duration_seconds)
+    if error:
+        return None, error
+    if len(records) > 1:
+        print(f"  Hour log segments for {target_date} {hour:02d}:00:", [
+            {k: (round(v, 1) if isinstance(v, float) else v) for k, v in record.items()
+             if k in ("start_time", "source", "source_name", "delay_seconds", "elapsed_before_start", "items")}
+            for record in records
+        ])
+    if ctx.rotation_walked:
+        _emit_selection_diagnostics(ctx, records)
+    return _persist_log(target_date, hour, ctx.picks, schedule_profile=schedule_profile)
+
+
+def _build_from_rotation(target_date, hour, rotation, target_duration_seconds=NOMINAL_HOUR_SECONDS,
+                         schedule_profile=None):
+    return _build_hour_from_plans(
+        target_date, hour, [_plan_for_rotation(rotation)], target_duration_seconds, schedule_profile,
+    )
 
 
 def _build_from_playlist(target_date, hour, playlist, target_duration_seconds=NOMINAL_HOUR_SECONDS,
                          schedule_profile=None):
-    items = list(
-        playlist.items
-        .select_related("track", "track__category", "track__artist")
-        .order_by("position")
+    return _build_hour_from_plans(
+        target_date, hour, [_plan_for_playlist(playlist)], target_duration_seconds, schedule_profile,
     )
-    if not items:
-        return None, f"Playlist '{playlist.name}' has no items."
-
-    target_datetime = timezone.make_aware(
-        datetime.combine(target_date, time(hour, 0))
-    )
-
-    picks = []
-    accumulated_seconds = 0.0
-    for item in items:
-        track = item.track
-        track_duration = effective_airtime_seconds(track)
-        scheduled_time = target_datetime + timedelta(seconds=accumulated_seconds)
-        picks.append({
-            "position": len(picks),
-            "scheduled_time": scheduled_time,
-            "track": track,
-            "category": track.category,
-        })
-        accumulated_seconds += track_duration
-
-    picks, accumulated_seconds = fill_remaining_hour(
-        picks, accumulated_seconds, target_datetime,
-        target_duration_seconds=target_duration_seconds,
-    )
-    return _persist_log(target_date, hour, picks, schedule_profile=schedule_profile)
 
 
 def _persist_log(target_date, hour, picks, schedule_profile=None):
@@ -1718,24 +1911,25 @@ def build_hour_log(target_date, hour, target_duration_seconds=NOMINAL_HOUR_SECON
     profile is captured exactly once here -- the supplied concrete profile,
     else the active profile -- then used for both resolution and the
     persisted provenance, so a concurrent active-profile change can never
-    make one build resolve under one profile and record another."""
+    make one build resolve under one profile and record another.
+
+    The hour's effective schedule segments (3.1C minute transitions) are
+    resolved once for that profile and built into ONE combined pick list that
+    is persisted ONCE as the hour's single PlaylistLog. An hour with no
+    minute transitions has exactly one segment and behaves as it always did.
+    The legacy exact-hour helper `resolve_schedule_block` is intentionally
+    not used here and keeps its HH:00 meaning for the engine's blank-hour
+    continuation logic."""
     profile = schedule_profile if schedule_profile is not None else get_active_schedule_profile()
-    block = resolve_schedule_block(target_date, hour, profile=profile)
-    if block is None:
+    segments = resolve_schedule_segments(target_date, hour, profile)
+    if not segments:
         return None, "No schedule block for this hour."
-
-    if block.playlist_id:
-        return _build_from_playlist(
-            target_date, hour, block.playlist,
-            target_duration_seconds=target_duration_seconds, schedule_profile=profile,
-        )
-    if block.rotation_id:
-        return _build_from_rotation(
-            target_date, hour, block.rotation,
-            target_duration_seconds=target_duration_seconds, schedule_profile=profile,
-        )
-
-    return None, "ScheduleBlock has neither rotation nor playlist."
+    if any(not (s.block.playlist_id or s.block.rotation_id) for s in segments):
+        return None, "ScheduleBlock has neither rotation nor playlist."
+    return _build_hour_from_plans(
+        target_date, hour, [_plan_for_segment(segment) for segment in segments],
+        target_duration_seconds, profile,
+    )
 
 
 @contextmanager
@@ -1838,175 +2032,88 @@ def _describe_track_issues(track, prefix, issues):
         issues.append({"severity": "warning", "message": f"{prefix}: '{label}' is not marked ready2air."})
 
 
+class _PreviewObserver:
+    """Collects the structural findings the preview reports while the REAL
+    segment builder (`_plan_hour`) walks the hour without persisting."""
+
+    def __init__(self, target_datetime):
+        self.target_datetime = target_datetime
+        self.issues = []
+
+    def on_pick(self, track, label):
+        _describe_track_issues(track, label, self.issues)
+
+    def on_empty_source(self, plan):
+        noun = "slots" if plan.kind == "rotation" else "items"
+        self.issues.append({
+            "severity": "error",
+            "message": f"{plan.kind.capitalize()} '{plan.name}' has no {noun}.",
+        })
+
+    def on_pool_exhausted(self, idx, category):
+        pool_size = _tracks_for_category(category, target_datetime=self.target_datetime).count()
+        if pool_size == 0:
+            self.issues.append({
+                "severity": "error",
+                "message": f"Slot {idx + 1}: category '{category.name}' has zero eligible tracks (empty, or none marked ready2air).",
+            })
+        else:
+            self.issues.append({
+                "severity": "warning",
+                "message": f"Slot {idx + 1}: category '{category.name}' had no track survive recency separation (pool of {pool_size}).",
+            })
+
+
+def _segment_record_for_api(record):
+    rounded = {}
+    for key, value in record.items():
+        rounded[key] = round(value, 1) if isinstance(value, float) else value
+    return rounded
+
+
 def preview_hour_log(target_date, hour, target_duration_seconds=NOMINAL_HOUR_SECONDS, schedule_profile=None):
-    """Read-only dry run of the same schedule-block/rotation/playlist walk
-    as build_hour_log, for health-checking a rotation or playlist without
-    touching PlaylistLog/LogItem at all -- never persists anything, so it
-    can never disturb a real (possibly already-on-air) log for this date
-    and hour. Category slots still use weighted random selection, so the
-    exact tracks picked here won't necessarily match a real build (or
-    what actually aired) -- this is for surfacing structural problems
-    (empty categories, missing analysis, an under-filled hour), not for
-    previewing an exact future log."""
+    """Read-only dry run of the real hour build, for health-checking a
+    rotation or playlist without touching PlaylistLog/LogItem at all -- never
+    persists anything, so it can never disturb a real (possibly already-on-air)
+    log for this date and hour.
+
+    It resolves the same ordered schedule segments for the same captured
+    profile and walks them with the same segment builder (`_plan_hour`) that
+    `build_hour_log` uses, so a minute-detailed hour is previewed as one
+    combined hour with the same carried selection state, boundary landing and
+    delay semantics. Category slots still use weighted random selection, so the
+    exact tracks picked here won't necessarily match a real build (or what
+    actually aired) -- this is for surfacing structural problems (empty
+    categories, missing analysis, an under-filled hour), not for previewing an
+    exact future log. `segments` lists every evaluated schedule segment; the
+    single-source `source`/`source_name` fields are kept (a hyphenated
+    sequence of names for a minute-detailed hour).
+    """
     issues = []
     profile = schedule_profile if schedule_profile is not None else get_active_schedule_profile()
-    block = resolve_schedule_block(target_date, hour, profile=profile)
-    if block is None:
+    segments = resolve_schedule_segments(target_date, hour, profile)
+    if not segments:
         issues.append({"severity": "error", "message": f"No schedule block covers {target_date} hour {hour}."})
         return {
             "date": target_date.isoformat(), "hour": hour, "source": None,
             "source_name": None, "items": [], "issues": issues, "total_seconds": 0,
+            "segments": [],
+        }, None
+    if any(not (segment.block.playlist_id or segment.block.rotation_id) for segment in segments):
+        issues.append({"severity": "error", "message": "Schedule block has neither rotation nor playlist configured."})
+        return {
+            "date": target_date.isoformat(), "hour": hour, "source": None,
+            "source_name": None, "items": [], "issues": issues, "total_seconds": 0,
+            "segments": [],
         }, None
 
-    target_datetime = timezone.make_aware(datetime.combine(target_date, time(hour, 0)))
-    picks = []
-    accumulated_seconds = 0.0
-    source = None
-    source_name = None
-    walked = False
+    plans = [_plan_for_segment(segment) for segment in segments]
+    observer = _PreviewObserver(timezone.make_aware(datetime.combine(target_date, time(hour, 0))))
+    ctx, records, _error = _plan_hour(target_date, hour, plans, target_duration_seconds, observer)
+    issues.extend(observer.issues)
+    picks, accumulated_seconds = ctx.picks, ctx.accumulated_seconds
 
-    if block.playlist_id:
-        source = "playlist"
-        source_name = block.playlist.name
-        items = list(
-            block.playlist.items
-            .select_related("track", "track__artist", "track__category")
-            .order_by("position")
-        )
-        if not items:
-            issues.append({"severity": "error", "message": f"Playlist '{block.playlist.name}' has no items."})
-        else:
-            walked = True
-        for item in items:
-            track = item.track
-            _describe_track_issues(track, f"Playlist position {item.position + 1}", issues)
-            track_duration = effective_airtime_seconds(track)
-            scheduled_time = target_datetime + timedelta(seconds=accumulated_seconds)
-            picks.append({
-                "position": len(picks), "scheduled_time": scheduled_time,
-                "track": track, "category": track.category,
-            })
-            accumulated_seconds += track_duration
-
-    elif block.rotation_id:
-        source = "rotation"
-        source_name = block.rotation.name
-        slots = list(
-            block.rotation.slots
-            .select_related("category__kind", "track", "track__category__kind", "track__artist")
-            .order_by("position")
-        )
-        if not slots:
-            issues.append({"severity": "error", "message": f"Rotation '{block.rotation.name}' has no slots."})
-        else:
-            walked = True
-
-        recency_cfg = RecencyConfig.load()
-        identity_cache = TrackIdentityCache()
-        picked_tracks = []
-        picked_identity_keys = set()
-        active_holidays = _active_holidays_at(target_datetime)
-        active_holiday_codes = [h.code for h in active_holidays]
-        daily_shares = {
-            h.code: _holiday_daily_share(h, target_datetime.date())
-            for h in active_holidays
-        }
-
-        for idx, slot in enumerate(slots):
-            if slot.track_id:
-                track = slot.track
-                category = track.category
-            else:
-                category = slot.category
-            # See _build_from_rotation -- effective separation for THIS
-            # slot's category, computed once per iteration and used for
-            # both the pick and the emit gate below.
-            artist_sep, title_sep = get_separation(category, recency_cfg)
-
-            if not slot.track_id:
-                exclude_track_ids, exclude_identity_keys = get_recent_exclusions(
-                    target_datetime, artist_sep, title_sep, picked_tracks, picked_identity_keys,
-                )
-
-                is_music_slot = category is not None and category.kind.code == "music"
-                chosen_holiday_codes = []
-                if is_music_slot and active_holiday_codes:
-                    for code, share in daily_shares.items():
-                        if random.random() < share:
-                            chosen_holiday_codes.append(code)
-                pool_override_qs = None
-                pool_key = None
-                exclude_holiday_codes = None
-                if chosen_holiday_codes:
-                    pool_override_qs = _music_holiday_pool(chosen_holiday_codes, target_datetime)
-                    pool_key = ("holiday", tuple(sorted(chosen_holiday_codes)))
-                elif is_music_slot and active_holiday_codes:
-                    exclude_holiday_codes = active_holiday_codes
-
-                remaining = target_duration_seconds - accumulated_seconds
-                track = pick_track(
-                    category, exclude_track_ids, exclude_identity_keys,
-                    artist_sep, title_sep, target_datetime,
-                    remaining_seconds=remaining,
-                    hard_exclude_track_ids={t.id for t in picked_tracks},
-                    hard_exclude_identity_keys=set(picked_identity_keys),
-                    active_holiday_codes=active_holiday_codes,
-                    pool_override_qs=pool_override_qs,
-                    exclude_holiday_codes=exclude_holiday_codes,
-                    identity_cache=identity_cache,
-                    pool_key=pool_key,
-                )
-                if track is None:
-                    pool_size = _tracks_for_category(category, target_datetime=target_datetime).count()
-                    if pool_size == 0:
-                        issues.append({
-                            "severity": "error",
-                            "message": f"Slot {idx + 1}: category '{category.name}' has zero eligible tracks (empty, or none marked ready2air).",
-                        })
-                    else:
-                        issues.append({
-                            "severity": "warning",
-                            "message": f"Slot {idx + 1}: category '{category.name}' had no track survive recency separation (pool of {pool_size}).",
-                        })
-                    continue
-
-            _describe_track_issues(track, f"Slot {idx + 1} ({category.name if category else '?'})", issues)
-
-            track_duration = effective_airtime_seconds(track)
-            scheduled_time = target_datetime + timedelta(seconds=accumulated_seconds)
-            picks.append({
-                "position": len(picks), "scheduled_time": scheduled_time,
-                "track": track, "category": category,
-            })
-            # Always accumulate; see _build_from_rotation for rationale.
-            picked_tracks.append(track)
-            picked_identity_keys |= track_identity_keys(
-                track.artist.name if track.artist_id else None, track.related_artists,
-            )
-            accumulated_seconds += track_duration
-            if accumulated_seconds >= target_duration_seconds:
-                break
-
-    else:
-        issues.append({"severity": "error", "message": "Schedule block has neither rotation nor playlist configured."})
-
-    if walked:
-        # Rotation branch has the holiday state computed above; the
-        # playlist branch doesn't need it (tracks are fixed).
-        if source == "rotation":
-            picks, accumulated_seconds = fill_remaining_hour(
-                picks, accumulated_seconds, target_datetime,
-                active_holiday_codes=active_holiday_codes,
-                daily_shares=daily_shares,
-                identity_cache=identity_cache,
-                target_duration_seconds=target_duration_seconds,
-            )
-        else:
-            picks, accumulated_seconds = fill_remaining_hour(
-                picks, accumulated_seconds, target_datetime,
-                target_duration_seconds=target_duration_seconds,
-            )
-
+    if any(not plan.empty for plan in plans):
         shortfall = target_duration_seconds - accumulated_seconds
         if shortfall > DURATION_FIT_MARGIN:
             issues.append({
@@ -2017,6 +2124,13 @@ def preview_hour_log(target_date, hour, target_duration_seconds=NOMINAL_HOUR_SEC
             issues.append({
                 "severity": "warning",
                 "message": f"Hour overshoots by {int(accumulated_seconds - target_duration_seconds)}s.",
+            })
+    for record in records:
+        if record["delay_seconds"] > DURATION_FIT_MARGIN:
+            issues.append({
+                "severity": "warning",
+                "message": f"Segment {record['start_time']} ({record['source']} '{record['source_name']}') starts "
+                           f"{int(record['delay_seconds'])}s after its scheduled time because earlier programming ran long.",
             })
 
     seen_counts = {}
@@ -2033,13 +2147,15 @@ def preview_hour_log(target_date, hour, target_duration_seconds=NOMINAL_HOUR_SEC
                 "message": f"'{t.artist.name if t.artist_id else 'Unknown'} - {t.title}' is scheduled {seen_counts[tid]} times in this hour.",
             })
 
+    kinds = {plan.kind for plan in plans}
     result = {
         "date": target_date.isoformat(),
         "hour": hour,
-        "source": source,
-        "source_name": source_name,
+        "source": plans[0].kind if len(plans) == 1 else (kinds.pop() if len(kinds) == 1 else "mixed"),
+        "source_name": " → ".join(plan.name for plan in plans),
         "total_seconds": accumulated_seconds,
         "issues": issues,
+        "segments": [_segment_record_for_api(record) for record in records],
         "items": [
             {
                 "position": p["position"],

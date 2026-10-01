@@ -40,6 +40,10 @@ from .services.related_artists import (
     format_related_artists, resolve_fallback_metadata,
 )
 from .services.track_filters import filter_tracks
+from .services.schedule_resolution import (
+    ScheduleConflict, assert_base_for_write, assert_can_delete, detail_counts_for_date,
+    effective_segments, load_hour_rows, load_weekly_hour_rows, minute_map,
+)
 from .services.schedule_profiles import (
     ProfileLifecycleError, activate_profile, archive_profile, clone_profile,
     create_profile, delete_profile, edit_profile, restore_profile,
@@ -98,6 +102,7 @@ def _block_to_dict(b):
         "id": b.id,
         "day_of_week": b.day_of_week,
         "start_hour": b.start_time.hour,
+        "start_minute": b.start_time.minute,
         "content_kind": content_kind,
         "content_id": content.id if content else None,
         "content_name": content.name if content else None,
@@ -175,6 +180,20 @@ def _parse_hour(value):
     return hour
 
 
+def _parse_minute(value):
+    """Minute-of-hour 0..59, default 0 when omitted. Strict: integers only (or
+    an integer string); floats and other values are rejected, never rounded."""
+    if value is None:
+        return 0
+    if isinstance(value, bool):
+        raise ValidationError("minute must be an integer 0-59")
+    if isinstance(value, str) and re.fullmatch(r"-?\d+", value.strip()):
+        value = int(value.strip())
+    if not isinstance(value, int) or not 0 <= value <= 59:
+        raise ValidationError("minute must be an integer 0-59")
+    return value
+
+
 def _parse_iso_date(value):
     try:
         return date_type.fromisoformat(str(value))
@@ -195,6 +214,7 @@ def _effective_date_payload(profile, target_date):
             profile=profile, specific_date=target_date, day_of_week__isnull=True,
         ).select_related("rotation", "playlist")
     }
+    detail_counts = detail_counts_for_date(profile, target_date)
     cells = []
     for hour in range(24):
         slot = time(hour, 0)
@@ -207,6 +227,9 @@ def _effective_date_payload(profile, target_date):
             "explicit_block_id": explicit.pk if explicit else None,
             "inherited_block_id": inherited.pk if inherited else None,
             "effective_block": _block_to_dict(effective) if effective else None,
+            # Server-derived (layered resolver): effective transitions after
+            # the base in this hour, for the "detailed hour" indicator.
+            "detail_count": detail_counts.get(hour, 0),
         }
         cells.append(cell)
     return {
@@ -350,6 +373,7 @@ def api_schedule_list(request):
     specific_date_value = body.get("specific_date")
     try:
         hour = _parse_hour(body.get("hour"))
+        minute = _parse_minute(body.get("minute"))
     except ValidationError as exc:
         return JsonResponse({"error": exc.message}, status=400)
     # Accept either {"rotation_id": ...} or {"playlist_id": ...}. The
@@ -398,10 +422,16 @@ def api_schedule_list(request):
         profile = ScheduleProfile.objects.select_for_update().get(pk=profile.pk)
         if profile.is_archived:
             return JsonResponse({"error": "Archived profiles are read-only."}, status=409)
+        try:
+            assert_base_for_write(
+                profile, day_of_week=day_of_week, specific_date=target_date, hour=hour, minute=minute,
+            )
+        except ScheduleConflict as exc:
+            return JsonResponse({"error": exc.message}, status=exc.status)
         block, created = ScheduleBlock.objects.update_or_create(
             profile=profile,
             day_of_week=day_of_week,
-            start_time=time(hour, 0),
+            start_time=time(hour, minute),
             specific_date=target_date,
             defaults=defaults,
         )
@@ -432,8 +462,82 @@ def api_schedule_delete(request, pk):
             except ValidationError as exc:
                 return JsonResponse({"error": exc.message}, status=400)
             blocks = blocks.filter(specific_date=target_date)
-        deleted, _ = blocks.delete()
+        row = blocks.select_related("profile").first()
+        if row is None:
+            return JsonResponse({"ok": True, "deleted": False})
+        try:
+            assert_can_delete(row)
+        except ScheduleConflict as exc:
+            payload = {"error": exc.message}
+            if exc.blockers:
+                payload["blockers"] = exc.blockers
+            return JsonResponse(payload, status=exc.status)
+        # Exactly this one explicit row; never the base or sibling transitions.
+        deleted, _ = ScheduleBlock.objects.filter(pk=row.pk, profile=profile).delete()
     return JsonResponse({"ok": True, "deleted": deleted > 0})
+
+
+@require_http_methods(["GET"])
+def api_schedule_hour_detail(request):
+    """Server-derived minute detail for ONE hour of one profile.
+
+    Weekly mode (?day_of_week=N) or Date mode (?date=YYYY-MM-DD), plus
+    ?hour=H and optional ?profile=<uuid>. The layered resolver is
+    authoritative; the browser only renders what is returned here.
+    """
+    profile = _selected_profile(request)
+    try:
+        hour = _parse_hour(request.GET.get("hour"))
+        date_value = request.GET.get("date")
+        if date_value is not None:
+            target_date = _parse_iso_date(date_value)
+            weekly_rows, dated_rows = load_hour_rows(profile, target_date, hour)
+            layer, day_of_week = "date", target_date.weekday()
+        else:
+            try:
+                day_of_week = int(request.GET.get("day_of_week"))
+            except (TypeError, ValueError):
+                raise ValidationError("day_of_week must be 0-6")
+            if not 0 <= day_of_week <= 6:
+                raise ValidationError("day_of_week must be 0-6")
+            target_date = None
+            weekly_rows, dated_rows = load_weekly_hour_rows(profile, day_of_week, hour), []
+            layer = "weekly"
+    except ValidationError as exc:
+        return JsonResponse({"error": exc.message}, status=400)
+
+    entries = minute_map(weekly_rows, dated_rows, layer=layer)
+    segments = effective_segments(weekly_rows, dated_rows)
+    return JsonResponse({
+        "profile_uuid": str(profile.uuid),
+        "is_archived": profile.is_archived,
+        "mode": layer,
+        "day_of_week": day_of_week,
+        "date": target_date.isoformat() if target_date else None,
+        "hour": hour,
+        "has_base": bool(segments),
+        "minutes": [
+            {
+                "minute": entry["minute"],
+                "origin": entry["origin"],
+                "effective_block": _block_to_dict(entry["effective_block"]) if entry["effective_block"] else None,
+                "explicit_block_id": entry["explicit_block"].pk if entry["explicit_block"] else None,
+                "inherited_transition": entry["inherited_transition"],
+                "segment_start": entry["segment_start"],
+                "orphan": entry["orphan"],
+            }
+            for entry in entries
+        ],
+        "segments": [
+            {
+                "start_minute": segment.start_minute,
+                "start_time": f"{hour:02d}:{segment.start_minute:02d}",
+                "origin": segment.origin,
+                "block": _block_to_dict(segment.block),
+            }
+            for segment in segments
+        ],
+    })
 
 
 # ---------------------------------------------------------------

@@ -17,6 +17,7 @@ urlpatterns = [
     path('api/cd/rip-status/', views.api_cd_rip_status, name='api-cd-rip-status'),
     path('api/cd/rip-cancel/', views.api_cd_rip_cancel, name='api-cd-rip-cancel'),
     path('api/schedule/', views.api_schedule_list, name='api-schedule-list'),
+    path('api/schedule/hour-detail/', views.api_schedule_hour_detail, name='api-schedule-hour-detail'),
     path('api/schedule/<int:pk>/', views.api_schedule_delete, name='api-schedule-delete'),
     path('api/schedule/profiles/', views.api_schedule_profiles, name='api-schedule-profiles'),
     path('api/schedule/profiles/<uuid:profile_uuid>/', views.api_schedule_profile_detail, name='api-schedule-profile-detail'),
