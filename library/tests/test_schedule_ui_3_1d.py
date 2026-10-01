@@ -142,15 +142,6 @@ class SchedulePage31DMarkupTests(ApiMixin, TestCase):
         for forbidden in ("resolve_schedule_segments", "Math.max(", ".sort(", ".reduce("):
             self.assertNotIn(forbidden, script)
 
-    def test_profile_and_date_changes_cannot_render_a_stale_response(self):
-        for marker in (
-            "const requestedProfileUuid = selectedProfile.uuid;",
-            "const requestedDate = date;",
-            "selectedProfile.uuid !== requestedProfileUuid",
-            "document.getElementById('overrideDate').value !== requestedDate",
-        ):
-            self.assertIn(marker, self.html)
-
     def test_date_navigation_and_selected_date_heading_are_exposed(self):
         for marker in (
             'id="previousDateButton"', 'id="nextDateButton"', 'id="todayButton"',
@@ -182,3 +173,144 @@ class SchedulePage31DMarkupTests(ApiMixin, TestCase):
         ):
             self.assertIn(marker, self.html)
         self.assertNotIn(".date-hour-list { overflow-x:", self.html)
+
+
+def js_function(html, signature, until):
+    """The source text of one script function (up to the next marker)."""
+    start = html.index(signature)
+    return html[start:html.index(until, start)]
+
+
+@override_settings(SECURE_SSL_REDIRECT=False)
+class ScheduleAsyncContextContractTests(ApiMixin, TestCase):
+    """Static contract for the async hardening: request identity + context.
+
+    The behavioral proof (real overlapping/out-of-order responses in Chromium)
+    lives in test_schedule_ui_async_3_1d.py; these guard the code shape.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.html = self.client.get(reverse("library:schedule")).content.decode()
+        self.load_date = js_function(self.html, "async function loadDateSchedule(", "function escapeHtml(")
+
+    # 1 -- the Date Override surface is invalidated synchronously
+    def test_date_surface_is_cleared_and_marked_busy_before_the_request_is_awaited(self):
+        body = self.load_date
+        self.assertLess(body.index("++dateScheduleRequestGeneration"), body.index("await apiRequest"))
+        self.assertLess(body.index("showDateScheduleLoading()"), body.index("await apiRequest"))
+        loading = js_function(self.html, "function showDateScheduleLoading(", "function dateScheduleContextIsLive(")
+        self.assertIn("setAttribute('aria-busy', 'true')", loading)
+        self.assertIn("list.replaceChildren(", loading)  # rows removed, not just hidden
+        self.assertIn("Loading schedule", loading)
+        self.assertIn("role', 'status'", self.html)
+        # Busy is cleared only by the request that is still current.
+        self.assertIn("setAttribute('aria-busy', 'false')", body)
+        self.assertLess(body.index("showDateScheduleLoading()"), body.index("formatSelectedDate(ctx.date)"))
+        self.assertLess(body.index("formatSelectedDate(ctx.date)"), body.index("await apiRequest"))
+
+    def test_loading_state_holds_height_instead_of_collapsing_the_page(self):
+        loading = js_function(self.html, "function showDateScheduleLoading(", "function dateScheduleContextIsLive(")
+        self.assertIn("style.minHeight", loading)
+        self.assertNotIn("overflow-x", loading)
+
+    # 2 -- same profile/date overlapping requests
+    def test_date_requests_are_ordered_by_a_monotonic_generation_not_just_profile_and_date(self):
+        self.assertIn("let dateScheduleRequestGeneration = 0;", self.html)
+        live = js_function(self.html, "function dateScheduleContextIsLive(", "async function loadDateSchedule(")
+        self.assertIn("ctx.generation === dateScheduleRequestGeneration", live)
+        self.assertIn("selectedProfile.uuid === ctx.profileUuid", live)
+        self.assertIn("document.getElementById('overrideDate').value === ctx.date", live)
+        self.assertIn("scheduleMode === 'date'", live)
+        body = self.load_date
+        self.assertEqual(body.count("if (!dateScheduleContextIsLive(ctx)) return;"), 2)  # render path AND error path
+        self.assertIn("Object.freeze({generation, profileUuid: selectedProfile.uuid, date})", body)
+        # Even a bail-out (no profile/date) supersedes earlier requests.
+        self.assertLess(body.index("++dateScheduleRequestGeneration"), body.index("if (!selectedProfile || !date)"))
+
+    def test_stale_failures_cannot_overwrite_a_newer_context(self):
+        catch = self.load_date[self.load_date.index("} catch (error) {"):]
+        self.assertLess(catch.index("dateScheduleContextIsLive(ctx)"), catch.index("showError(error.message)"))
+        refresh = js_function(self.html, "async function refreshHourDetail(", "function renderHourDetail(")
+        catch = refresh[refresh.index("} catch (error) {"):]
+        self.assertLess(catch.index("if (!isCurrent()) return;"), catch.index("showError(error.message)"))
+
+    def test_date_rows_and_actions_are_bound_to_the_context_that_rendered_them(self):
+        self.assertIn("assignDateCell(cell.hour, ctx)", self.html)
+        self.assertIn("revertDateCell(cell.explicit_block_id, ctx)", self.html)
+        for signature, until in (
+            ("async function assignDateCell(", "async function revertDateCell("),
+            ("async function revertDateCell(", "// --- Hour Detail (3.1C) ---"),
+        ):
+            body = js_function(self.html, signature, until)
+            self.assertIn("if (!dateScheduleContextIsLive(ctx)", body)
+            self.assertIn("ctx.profileUuid", body)
+            self.assertIn("ctx.date", body)
+        assign = js_function(self.html, "async function assignDateCell(", "async function revertDateCell(")
+        self.assertNotIn("document.getElementById('overrideDate')", assign)  # no live re-read at write time
+
+    # 3 -- Hour Detail request identity
+    def test_hour_detail_requests_carry_an_immutable_full_context_and_a_generation(self):
+        opened = js_function(self.html, "async function openHourDetail(", "function closeHourDetail(")
+        self.assertIn("Object.freeze({", opened)
+        for field in ("mode", "day", "hour", "profileUuid", "date"):
+            self.assertIn(field, opened)
+        self.assertIn("let hourDetailRequestGeneration = 0;", self.html)
+        refresh = js_function(self.html, "async function refreshHourDetail(", "function renderHourDetail(")
+        self.assertIn("++hourDetailRequestGeneration", refresh)
+        self.assertLess(refresh.index("++hourDetailRequestGeneration"), refresh.index("await apiRequest"))
+        self.assertIn("generation === hourDetailRequestGeneration && hourDetailContextIsLive(ctx)", refresh)
+        self.assertLess(refresh.index("await apiRequest"), refresh.index("if (!isCurrent()) return;"))
+        self.assertLess(refresh.index("if (!isCurrent()) return;"), refresh.index("renderHourDetail(data, ctx)"))
+        live = js_function(self.html, "function hourDetailContextIsLive(", "function hourDetailTitle(")
+        for clause in (
+            "hourDetail === ctx", "selectedProfile.uuid === ctx.profileUuid",
+            "scheduleMode === ctx.mode", "document.getElementById('overrideDate').value === ctx.date",
+        ):
+            self.assertIn(clause, live)
+
+    def test_hour_detail_rendering_and_writes_never_read_the_mutable_global(self):
+        for signature, until in (
+            ("function renderHourDetail(", "async function onMinuteClick("),
+            ("async function onMinuteClick(", "async function afterMinuteWrite("),
+            ("function hourDetailQuery(", "function hourDetailContextIsLive("),
+        ):
+            body = js_function(self.html, signature, until)
+            self.assertNotIn("hourDetail.", body, signature)
+        minute = js_function(self.html, "async function onMinuteClick(", "async function afterMinuteWrite(")
+        self.assertIn("if (!hourDetailContextIsLive(ctx)", minute)
+        self.assertIn("onMinuteClick(entry, ctx)", self.html)
+        self.assertNotIn("document.getElementById('overrideDate')", minute)
+
+    def test_opening_a_context_removes_the_previous_minutes_before_loading(self):
+        opened = js_function(self.html, "async function openHourDetail(", "function closeHourDetail(")
+        self.assertLess(opened.index("showHourDetailLoading(ctx)"), opened.index("await refreshHourDetail()"))
+        loading = js_function(self.html, "function showHourDetailLoading(", "async function openHourDetail(")
+        self.assertIn("grid.replaceChildren()", loading)
+        self.assertIn("setAttribute('aria-busy', 'true')", loading)
+
+    # 4 -- close / context change invalidation
+    def test_closing_hour_detail_invalidates_the_in_flight_generation(self):
+        close = js_function(self.html, "function closeHourDetail(", "async function refreshHourDetail(")
+        self.assertIn("hourDetail = null;", close)
+        self.assertIn("hourDetailRequestGeneration++", close)
+        self.assertIn("hidden = true", close)
+
+    def test_every_context_change_closes_hour_detail_before_anything_loads(self):
+        for signature, until in (
+            ("async function setMode(", "function selectContent("),
+            ("function setOverrideDate(", "function shiftOverrideDate("),
+        ):
+            body = js_function(self.html, signature, until)
+            self.assertIn("closeHourDetail();", body)
+        self.assertIn("dateScheduleRequestGeneration++;", js_function(self.html, "async function setMode(", "function selectContent("))
+        picker = js_function(self.html, "function buildDayPicker(", "function renderMobileHours(")
+        self.assertIn("closeHourDetail();", picker)
+        select = js_function(self.html, "getElementById('profileSelect').addEventListener('change'", "loadProfiles();")
+        self.assertLess(select.index("closeHourDetail();"), select.index("loadDateSchedule()"))
+
+    def test_server_derived_rendering_is_untouched_by_the_hardening(self):
+        for field in ("cell.origin", "cell.effective_block", "cell.detail_count", "cell.explicit_block_id"):
+            self.assertIn(field, self.load_date)
+        for forbidden in ("resolve_schedule_segments", ".sort(", ".reduce("):
+            self.assertNotIn(forbidden, self.load_date)

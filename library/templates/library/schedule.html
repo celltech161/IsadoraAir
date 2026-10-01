@@ -327,6 +327,13 @@
   .date-schedule-head h2 { margin: 0; font-size: 1rem; }
   .date-schedule-head .profile-notice { margin: 0; }
   .date-hour-list { display: flex; flex-direction: column; gap: 4px; }
+  .date-load-state {
+    padding: .9rem .75rem;
+    border: 1px dashed var(--border-subtle);
+    border-radius: 7px;
+    color: var(--text-muted);
+    font-size: .85rem;
+  }
   .date-hour-row {
     --content-color: transparent;
     display: grid;
@@ -625,7 +632,14 @@ for (let d = 0; d < 7; d++) {
   for (let h = 0; h < 24; h++) { cells[d][h] = null; detailCounts[d][h] = 0; }
 }
 const DETAIL_COLOR = '#475569';
-let hourDetail = null;  // {mode: 'weekly'|'date', day, hour}
+// Immutable Hour Detail context captured when the panel opens:
+// {mode: 'weekly'|'date', day, hour, profileUuid, date}. Every request and
+// every click handler is bound to the exact context object it started from.
+let hourDetail = null;
+// Monotonic request identities. Only the newest request of each kind may
+// render, clear a loading state or surface an error; older ones are inert.
+let hourDetailRequestGeneration = 0;
+let dateScheduleRequestGeneration = 0;
 
 // Store content info per cell for mobile rendering
 const cellRotations = {};
@@ -804,6 +818,7 @@ async function deleteProfile() {
 
 async function setMode(mode) {
   closeHourDetail();
+  dateScheduleRequestGeneration++;  // a late Date Override response must go inert
   scheduleMode = mode;
   document.getElementById('weeklyModeButton').classList.toggle('selected', mode === 'weekly');
   document.getElementById('dateModeButton').classList.toggle('selected', mode === 'date');
@@ -1034,6 +1049,7 @@ function buildDayPicker() {
     btn.className = 'day-picker-btn' + (dow === mobileDay ? ' active' : '');
     btn.textContent = name;
     btn.addEventListener('click', () => {
+      closeHourDetail();  // a different weekly day is a different Hour Detail context
       mobileDay = dow;
       document.querySelectorAll('.day-picker-btn').forEach(b => b.classList.remove('active'));
       btn.classList.add('active');
@@ -1139,22 +1155,58 @@ async function loadSchedule() {
   highlightNow();
 }
 
+// The Date Override surface is bound to the request that rendered it.
+function dateScheduleStateNode(text) {
+  const node = document.createElement('div');
+  node.className = 'date-load-state';
+  node.setAttribute('role', 'status');
+  node.textContent = text;
+  return node;
+}
+
+// Called synchronously when a load begins: the previous context's rows are
+// removed (not merely hidden) so nothing stale stays clickable while the new
+// request is in flight. The old height is held to avoid a scroll jump.
+function showDateScheduleLoading() {
+  const list = document.getElementById('dateHourList');
+  const height = list.offsetHeight;
+  list.style.minHeight = height ? `${height}px` : '';
+  list.setAttribute('aria-busy', 'true');
+  list.replaceChildren(dateScheduleStateNode('Loading schedule\u2026'));
+}
+
+function dateScheduleContextIsLive(ctx) {
+  return !!ctx && ctx.generation === dateScheduleRequestGeneration
+    && scheduleMode === 'date' && !!selectedProfile
+    && selectedProfile.uuid === ctx.profileUuid
+    && document.getElementById('overrideDate').value === ctx.date;
+}
+
 async function loadDateSchedule() {
-  if (!selectedProfile) return;
+  // Every call supersedes all earlier ones, including when it bails out.
+  const generation = ++dateScheduleRequestGeneration;
+  const list = document.getElementById('dateHourList');
   const date = document.getElementById('overrideDate').value;
-  if (!date) return;
-  const requestedProfileUuid = selectedProfile.uuid;
-  const requestedDate = date;
+  if (!selectedProfile || !date) {
+    list.style.minHeight = '';
+    list.setAttribute('aria-busy', 'false');
+    list.replaceChildren();
+    return;
+  }
+  const ctx = Object.freeze({generation, profileUuid: selectedProfile.uuid, date});
+  showDateScheduleLoading();
+  // The newest request owns the heading from the moment it starts, so it never
+  // names a different date than the one in the date field while loading.
+  document.getElementById('selectedDateTitle').textContent = formatSelectedDate(ctx.date);
   try {
-    const data = await apiRequest(`/api/schedule/?profile=${encodeURIComponent(requestedProfileUuid)}&date=${encodeURIComponent(requestedDate)}`);
-    // A slower response for a previously selected profile/date must never
-    // overwrite the newly selected context.
-    if (scheduleMode !== 'date' || !selectedProfile
-        || selectedProfile.uuid !== requestedProfileUuid
-        || document.getElementById('overrideDate').value !== requestedDate) return;
+    const data = await apiRequest(`/api/schedule/?profile=${encodeURIComponent(ctx.profileUuid)}&date=${encodeURIComponent(ctx.date)}`);
+    // Not the newest request for the still-selected profile/date: inert. The
+    // generation (not just profile/date) is what rejects an overlapping
+    // earlier request for the SAME context.
+    if (!dateScheduleContextIsLive(ctx)) return;
     document.getElementById('selectedDateTitle').textContent = formatSelectedDate(data.date);
     const list = document.getElementById('dateHourList');
-    list.innerHTML = '';
+    list.replaceChildren();
     data.cells.forEach(cell => {
       const node = document.createElement('div');
       node.className = `date-hour-row origin-${cell.origin.replace('_', '-')} ${cell.detail_count ? 'has-detail' : ''}`;
@@ -1186,7 +1238,7 @@ async function loadDateSchedule() {
       detailBadge.textContent = cell.detail_count ? `+${cell.detail_count}` : '';
       detailBadge.title = cell.detail_count ? `${cell.detail_count} additional effective transition${cell.detail_count === 1 ? '' : 's'} in this hour` : '';
       assignButton.append(hourLabel, originBadge, contentName, detailBadge);
-      assignButton.addEventListener('click', () => assignDateCell(cell.hour));
+      assignButton.addEventListener('click', () => assignDateCell(cell.hour, ctx));
       node.appendChild(assignButton);
 
       const actions = document.createElement('div');
@@ -1204,13 +1256,21 @@ async function loadDateSchedule() {
         button.textContent = 'Revert to Weekly';
         button.disabled = selectedProfile.is_archived;
         button.title = selectedProfile.is_archived ? 'Archived profiles are read-only' : 'Remove this exact dated base assignment';
-        button.addEventListener('click', event => { event.stopPropagation(); revertDateCell(cell.explicit_block_id); });
+        button.addEventListener('click', event => { event.stopPropagation(); revertDateCell(cell.explicit_block_id, ctx); });
         actions.appendChild(button);
       }
       node.appendChild(actions);
       list.appendChild(node);
     });
-  } catch (error) { showError(error.message); }
+    list.style.minHeight = '';
+    list.setAttribute('aria-busy', 'false');
+  } catch (error) {
+    if (!dateScheduleContextIsLive(ctx)) return;  // a stale failure never speaks for the new context
+    list.style.minHeight = '';
+    list.setAttribute('aria-busy', 'false');
+    list.replaceChildren(dateScheduleStateNode('This day\u2019s schedule could not be loaded.'));
+    showError(error.message);
+  }
 }
 
 function escapeHtml(value) {
@@ -1219,13 +1279,14 @@ function escapeHtml(value) {
   return node.innerHTML;
 }
 
-async function assignDateCell(hour) {
-  if (selectedProfile.is_archived) return;
+async function assignDateCell(hour, ctx) {
+  // A row from an older render can never write into the current context.
+  if (!dateScheduleContextIsLive(ctx) || selectedProfile.is_archived) return;
   if (selectedKind === null) {
-    showError('A date override must select valid content. Use “Revert to Weekly” to remove an explicit override; blank overrides are not supported.');
+    showError('A date override must select valid content. Use \u201cRevert to Weekly\u201d to remove an explicit override; blank overrides are not supported.');
     return;
   }
-  const body = {profile_uuid: selectedProfile.uuid, specific_date: document.getElementById('overrideDate').value, hour};
+  const body = {profile_uuid: ctx.profileUuid, specific_date: ctx.date, hour};
   body[selectedKind === 'playlist' ? 'playlist_id' : 'rotation_id'] = selectedContentId;
   try {
     await apiRequest('/api/schedule/', {
@@ -1236,11 +1297,10 @@ async function assignDateCell(hour) {
   } catch (error) { showError(error.message); }
 }
 
-async function revertDateCell(blockId) {
-  if (selectedProfile.is_archived) return;
-  const date = document.getElementById('overrideDate').value;
+async function revertDateCell(blockId, ctx) {
+  if (!dateScheduleContextIsLive(ctx) || selectedProfile.is_archived) return;
   try {
-    await apiRequest(`/api/schedule/${blockId}/?profile=${encodeURIComponent(selectedProfile.uuid)}&date=${encodeURIComponent(date)}`, {
+    await apiRequest(`/api/schedule/${blockId}/?profile=${encodeURIComponent(ctx.profileUuid)}&date=${encodeURIComponent(ctx.date)}`, {
       method: 'DELETE', headers: {'X-CSRFToken': getCookie('csrftoken')},
     });
     await loadProfiles(selectedProfile.uuid);
@@ -1250,40 +1310,90 @@ async function revertDateCell(blockId) {
 // --- Hour Detail (3.1C) ---
 // The server resolves every minute (layering, inheritance, base-hour rules);
 // this script only renders the response and sends exact-minute writes.
-function hourDetailQuery() {
-  const base = `profile=${encodeURIComponent(selectedProfile.uuid)}&hour=${hourDetail.hour}`;
-  return hourDetail.mode === 'date'
-    ? `${base}&date=${encodeURIComponent(document.getElementById('overrideDate').value)}`
-    : `${base}&day_of_week=${hourDetail.day}`;
+function hourDetailQuery(ctx) {
+  const base = `profile=${encodeURIComponent(ctx.profileUuid)}&hour=${ctx.hour}`;
+  return ctx.mode === 'date'
+    ? `${base}&date=${encodeURIComponent(ctx.date)}`
+    : `${base}&day_of_week=${ctx.day}`;
+}
+
+// True only while `ctx` is still THE open Hour Detail context and the page is
+// still on the profile / mode / date it was opened for.
+function hourDetailContextIsLive(ctx) {
+  return !!ctx && hourDetail === ctx && !!selectedProfile
+    && selectedProfile.uuid === ctx.profileUuid
+    && scheduleMode === ctx.mode
+    && (ctx.mode !== 'date' || document.getElementById('overrideDate').value === ctx.date);
+}
+
+function hourDetailTitle(ctx) {
+  const dayName = ctx.mode === 'weekly' ? DAYS[DISPLAY_TO_DOW.indexOf(ctx.day)] : ctx.date;
+  const modeName = ctx.mode === 'weekly' ? 'Weekly' : 'Date Override';
+  return `Hour Detail \u2014 ${dayName} ${HOUR_LABELS[ctx.hour]} (${modeName})`;
+}
+
+// Opening a context clears the previous one's minutes at once (so stale
+// minute buttons cannot be clicked) and shows a loading state in their place.
+function showHourDetailLoading(ctx) {
+  const grid = document.getElementById('minuteGrid');
+  const height = grid.offsetHeight;
+  grid.style.minHeight = height ? `${height}px` : '';
+  grid.setAttribute('aria-busy', 'true');
+  grid.replaceChildren();
+  document.getElementById('hourDetailTitle').textContent = hourDetailTitle(ctx);
+  document.getElementById('hourDetailSegments').textContent = 'Loading Hour Detail\u2026';
 }
 
 async function openHourDetail(mode, day, hour) {
   if (!selectedProfile) return;
-  hourDetail = {mode, day, hour};
+  const ctx = Object.freeze({
+    mode, day, hour, profileUuid: selectedProfile.uuid,
+    date: mode === 'date' ? document.getElementById('overrideDate').value : null,
+  });
+  hourDetail = ctx;
   document.getElementById('hourDetail').hidden = false;
+  showHourDetailLoading(ctx);
   await refreshHourDetail();
-  document.getElementById('hourDetail').scrollIntoView({block: 'nearest', behavior: 'smooth'});
+  if (hourDetailContextIsLive(ctx)) {
+    document.getElementById('hourDetail').scrollIntoView({block: 'nearest', behavior: 'smooth'});
+  }
 }
 
 function closeHourDetail() {
   hourDetail = null;
+  hourDetailRequestGeneration++;  // any in-flight response is now inert
+  const grid = document.getElementById('minuteGrid');
+  grid.style.minHeight = '';
+  grid.setAttribute('aria-busy', 'false');
+  grid.replaceChildren();
   document.getElementById('hourDetail').hidden = true;
 }
 
 async function refreshHourDetail() {
-  if (!hourDetail || !selectedProfile) return;
+  const ctx = hourDetail;
+  if (!hourDetailContextIsLive(ctx)) return;
+  const generation = ++hourDetailRequestGeneration;
+  const isCurrent = () => generation === hourDetailRequestGeneration && hourDetailContextIsLive(ctx);
   try {
-    const data = await apiRequest(`/api/schedule/hour-detail/?${hourDetailQuery()}`);
-    renderHourDetail(data);
-  } catch (error) { showError(error.message); }
+    const data = await apiRequest(`/api/schedule/hour-detail/?${hourDetailQuery(ctx)}`);
+    if (!isCurrent()) return;  // superseded, closed, or the page moved on
+    renderHourDetail(data, ctx);
+  } catch (error) {
+    if (!isCurrent()) return;
+    const grid = document.getElementById('minuteGrid');
+    grid.style.minHeight = '';
+    grid.setAttribute('aria-busy', 'false');
+    document.getElementById('hourDetailSegments').textContent = 'Hour Detail could not be loaded.';
+    showError(error.message);
+  }
 }
 
-function renderHourDetail(data) {
-  const dayName = hourDetail.mode === 'weekly' ? DAYS[DISPLAY_TO_DOW.indexOf(hourDetail.day)] : data.date;
-  const modeName = hourDetail.mode === 'weekly' ? 'Weekly' : 'Date Override';
-  document.getElementById('hourDetailTitle').textContent = `Hour Detail \u2014 ${dayName} ${HOUR_LABELS[hourDetail.hour]} (${modeName})`;
+function renderHourDetail(data, ctx) {
+  document.getElementById('hourDetailTitle').textContent = hourDetailTitle(ctx);
   const grid = document.getElementById('minuteGrid');
-  grid.innerHTML = '';
+  grid.replaceChildren();
+  grid.style.minHeight = '';
+  grid.setAttribute('aria-busy', 'false');
   data.minutes.forEach(entry => {
     const cell = document.createElement('button');
     cell.type = 'button';
@@ -1310,7 +1420,7 @@ function renderHourDetail(data) {
       name.textContent = effective.content_name;
       cell.appendChild(name);
     }
-    cell.addEventListener('click', () => onMinuteClick(entry));
+    cell.addEventListener('click', () => onMinuteClick(entry, ctx));
     grid.appendChild(cell);
   });
   const origins = {weekly: 'weekly', date_override: 'date override'};
@@ -1319,8 +1429,9 @@ function renderHourDetail(data) {
     : 'No effective assignment at :00 \u2014 this hour is not scheduled.';
 }
 
-async function onMinuteClick(entry) {
-  if (!hourDetail || !selectedProfile || selectedProfile.is_archived) return;
+async function onMinuteClick(entry, ctx) {
+  // A minute rendered for an older / closed context can never write.
+  if (!hourDetailContextIsLive(ctx) || selectedProfile.is_archived) return;
   if (selectedKind === null) {
     // "Clear" is selected: remove exactly the explicit transition at this minute.
     if (!entry.explicit_block_id) {
@@ -1328,18 +1439,18 @@ async function onMinuteClick(entry) {
       return;
     }
     try {
-      const dateQuery = hourDetail.mode === 'date' ? `&date=${encodeURIComponent(document.getElementById('overrideDate').value)}` : '';
-      await apiRequest(`/api/schedule/${entry.explicit_block_id}/?profile=${encodeURIComponent(selectedProfile.uuid)}${dateQuery}`, {
+      const dateQuery = ctx.mode === 'date' ? `&date=${encodeURIComponent(ctx.date)}` : '';
+      await apiRequest(`/api/schedule/${entry.explicit_block_id}/?profile=${encodeURIComponent(ctx.profileUuid)}${dateQuery}`, {
         method: 'DELETE', headers: {'X-CSRFToken': getCookie('csrftoken')},
       });
       showError('');
-      await afterMinuteWrite();
+      await afterMinuteWrite(ctx);
     } catch (error) { showError(error.message); }
     return;
   }
-  const body = {profile_uuid: selectedProfile.uuid, hour: hourDetail.hour, minute: entry.minute};
-  if (hourDetail.mode === 'date') body.specific_date = document.getElementById('overrideDate').value;
-  else body.day_of_week = hourDetail.day;
+  const body = {profile_uuid: ctx.profileUuid, hour: ctx.hour, minute: entry.minute};
+  if (ctx.mode === 'date') body.specific_date = ctx.date;
+  else body.day_of_week = ctx.day;
   body[selectedKind === 'playlist' ? 'playlist_id' : 'rotation_id'] = selectedContentId;
   try {
     await apiRequest('/api/schedule/', {
@@ -1347,12 +1458,12 @@ async function onMinuteClick(entry) {
       body: JSON.stringify(body),
     });
     showError('');
-    await afterMinuteWrite();
+    await afterMinuteWrite(ctx);
   } catch (error) { showError(error.message); }
 }
 
-async function afterMinuteWrite() {
-  await refreshHourDetail();
+async function afterMinuteWrite(ctx) {
+  if (hourDetailContextIsLive(ctx)) await refreshHourDetail();
   if (scheduleMode === 'date') await loadDateSchedule(); else await loadSchedule();
 }
 

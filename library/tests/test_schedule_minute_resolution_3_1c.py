@@ -1061,16 +1061,18 @@ class HourDetailPageMarkupTests(ResolverFixtures, ApiMixin, TestCase):
                 self.assertIn(marker, self.html)
 
     def test_writes_send_the_exact_minute_and_clearing_uses_only_the_explicit_row(self):
-        self.assertIn("body = {profile_uuid: selectedProfile.uuid, hour: hourDetail.hour, minute: entry.minute}", self.html)
+        # 3.1D hardening: the write body comes from the immutable context the minute was rendered for.
+        self.assertIn("body = {profile_uuid: ctx.profileUuid, hour: ctx.hour, minute: entry.minute}", self.html)
         self.assertIn("if (!entry.explicit_block_id)", self.html)
         self.assertIn("/api/schedule/${entry.explicit_block_id}/", self.html)
 
     def test_archived_profiles_cannot_write_from_hour_detail(self):
-        self.assertIn("if (!hourDetail || !selectedProfile || selectedProfile.is_archived) return;", self.html)
+        self.assertIn("if (!hourDetailContextIsLive(ctx) || selectedProfile.is_archived) return;", self.html)
         self.assertIn(".schedule-readonly .minute-cell", self.html)
 
     def test_hour_detail_closes_when_its_context_changes(self):
-        self.assertIn("closeHourDetail();\n  scheduleMode = mode;", self.html)
+        self.assertIn("closeHourDetail();\n  dateScheduleRequestGeneration++;", self.html)
+        self.assertIn("scheduleMode = mode;", self.html)
         self.assertIn("closeHourDetail();\n    updateProfileChrome();", self.html)
         self.assertIn("function setOverrideDate(isoDate)", self.html)
         self.assertIn("input.value = isoDate;\n  closeHourDetail();", self.html)
