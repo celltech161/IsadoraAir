@@ -841,3 +841,64 @@ class CarriedSelectionStateTests(BuilderFixtures, TransactionTestCase):
             log, error = build_hour_log(MONDAY, 10)
             self.assertIsNone(error)
             self.assertEqual(sorted(self.titles(log)), ["Q-song", "R-song"])
+
+
+@override_settings(SECURE_SSL_REDIRECT=False)
+class HourDetailPageMarkupTests(ResolverFixtures, ApiMixin, TestCase):
+    """Structural checks on the /schedule/ page; the browser behavior itself is
+    covered by the Chromium smoke test."""
+
+    def setUp(self):
+        ApiMixin.setUp(self)
+        self.build_resolver_fixtures(base_fixtures=False)
+        self.html = self.client.get(reverse("library:schedule")).content.decode()
+
+    def test_page_exposes_the_hour_detail_surface_for_both_modes(self):
+        for marker in (
+            'id="hourDetail"', 'id="minuteGrid"', 'role="group" aria-label="Minutes 00 to 59"',
+            "function openHourDetail(", "function renderHourDetail(", "/api/schedule/hour-detail/",
+            "Hour detail", "Hour Detail",
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, self.html)
+        self.assertEqual(self.html.count('id="hourDetail"'), 1)
+        # Still ONE shared picker outside both mode containers (3.1B contract).
+        self.assertEqual(self.html.count('id="contentPicker"'), 1)
+        self.assertLess(self.html.index('id="contentPicker"'), self.html.index('id="weeklyDesktop"'))
+
+    def test_detail_positions_come_from_the_server_response_not_client_precedence_logic(self):
+        script = self.html[self.html.index("function renderHourDetail("):self.html.index("async function onMinuteClick(")]
+        self.assertIn("data.minutes.forEach(", script)
+        for server_field in ("entry.effective_block", "entry.explicit_block_id", "entry.inherited_transition", "entry.origin"):
+            self.assertIn(server_field, script)
+        # The script renders what it is given; it never walks rows to decide precedence.
+        for forbidden in ("Math.max(", ".filter(", ".sort(", ".reduce("):
+            self.assertNotIn(forbidden, script)
+
+    def test_weekly_load_counts_minute_rows_as_detail_instead_of_overwriting_the_hour_cell(self):
+        self.assertIn("if (block.start_minute) { detailCounts[block.day_of_week][block.start_hour] += 1; continue; }", self.html)
+
+    def test_a_detailed_hour_has_a_distinct_neutral_overview_state(self):
+        for marker in (".grid-cell.has-detail", ".mobile-hour-cell.has-detail", ".date-cell.has-detail",
+                       "const DETAIL_COLOR = '#475569'", "cell.classList.toggle('has-detail', extra > 0)",
+                       "detail-badge"):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, self.html)
+
+    def test_writes_send_the_exact_minute_and_clearing_uses_only_the_explicit_row(self):
+        self.assertIn("body = {profile_uuid: selectedProfile.uuid, hour: hourDetail.hour, minute: entry.minute}", self.html)
+        self.assertIn("if (!entry.explicit_block_id)", self.html)
+        self.assertIn("/api/schedule/${entry.explicit_block_id}/", self.html)
+
+    def test_archived_profiles_cannot_write_from_hour_detail(self):
+        self.assertIn("if (!hourDetail || !selectedProfile || selectedProfile.is_archived) return;", self.html)
+        self.assertIn(".schedule-readonly .minute-cell", self.html)
+
+    def test_hour_detail_closes_when_its_context_changes(self):
+        self.assertIn("closeHourDetail();\n  scheduleMode = mode;", self.html)
+        self.assertIn("closeHourDetail();\n    updateProfileChrome();", self.html)
+        self.assertIn("addEventListener('change', () => { closeHourDetail(); loadDateSchedule(); })", self.html)
+
+    def test_deferred_date_override_redesign_is_not_part_of_this_page(self):
+        # The existing whole-day card grid is kept for 3.1C.
+        self.assertIn('id="dateGrid" class="date-grid"', self.html)

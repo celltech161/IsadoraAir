@@ -3,9 +3,10 @@
 3.1A established the stable profile identity, profile-scoped resolver and
 truthful log provenance. 3.1B adds the operator workflow on the existing
 `/schedule/` page: named profile lifecycle, explicit activation/default
-selection, inactive-profile editing and hourly one-date overrides. A station
-that never creates a second profile behaves exactly as before. Minute-level
-scheduling remains deferred to 3.1C.
+selection, inactive-profile editing and hourly one-date overrides. 3.1C adds
+minute-resolution scheduling (see "Minute resolution (3.1C)" below). A station
+that never creates a second profile, or never adds a minute transition, behaves
+exactly as before.
 
 ## Model
 
@@ -29,7 +30,11 @@ block per `(profile, specific_date, start_time)`.
 
 ## Resolution
 
-`resolve_schedule_block(target_date, hour, profile=None)`:
+`resolve_schedule_block(target_date, hour, profile=None)` is the **legacy
+exact-hour compatibility resolver**. It only ever looks at a row starting
+exactly at `HH:00` and is deliberately unchanged by 3.1C (the engine's
+blank-continuation-hour logic depends on that meaning). Minute detail is
+resolved by the separate `resolve_schedule_segments` described below.
 
 1. that profile's `specific_date` block starting exactly at `HH:00`;
 2. else that profile's recurring `day_of_week` block starting at `HH:00`;
@@ -129,3 +134,68 @@ All lifecycle mutations require `schedule.edit` and emit privacy-safe
 `SystemEvent` audit records with stable profile UUIDs. The
 `ScheduleProfileState` Django admin remains read-only; lifecycle authority is
 the schedule workflow, not an unaudited admin pointer edit.
+
+## Minute resolution (3.1C)
+
+**Storage: transition rows, no migration.** `ScheduleBlock.start_time` was
+always a `TimeField` and uniqueness is by exact `start_time`, so a schedule may
+hold several rows in one hour. `10:00 A`, `10:30 B`, `10:45 A` is exactly three
+rows -- never sixty. The `HH:00` row is the *base* of the hour; later rows are
+explicit transitions layered on it. Only rows that start exactly on a minute
+take part (a hand-entered `10:30:15` is ignored).
+
+**Layering** (`library/services/schedule_resolution.py`, always inside ONE
+profile): the recurring weekly layer is the lower layer and the selected date's
+`specific_date` rows are the override layer. Within a layer the latest row at or
+before a minute wins. The date layer takes precedence from its first row onward:
+a *later* weekly transition does not punch through an already-active dated row,
+and a later dated row supersedes an earlier dated row. Before a date layer's
+first row, weekly inheritance remains visible. Example -- weekly `10:00 A`,
+`10:30 B`, `10:45 C` with dated `10:20 D`, `10:50 E` gives `A` until `10:19`,
+`D` from `10:20`, `E` from `10:50`. There are no blank/tombstone overrides;
+"Revert" deletes exactly that dated row and reveals the lower layer.
+
+**Base-hour invariant.** A buildable hour needs an effective assignment at
+`HH:00`; an hour holding only later rows resolves to no segments, so a lone
+`10:30` row cannot make a blank hour "partially scheduled". Writes enforce it: a
+non-zero weekly transition needs a weekly `HH:00` base, and a non-zero dated
+transition needs a dated base or a weekly base for that date (409 otherwise).
+Deleting a base while later transitions depend on it is a 409 with the blockers.
+
+**One PlaylistLog per hour, built once.** `build_hour_log` captures the profile
+once, resolves the hour's ordered segments once, builds them into one pick list
+and persists it exactly once. The segments share one build context, so tracks,
+artist/related-artist identities, the identity cache, holiday state and the
+accumulated clock carry across boundaries (explicit Playlist items seed the
+exclusions for a later Rotation, but are never altered by recency).
+
+**Boundaries are programming intent, not hard cuts.** A segment's budget is the
+next transition (shifted by `late` seconds when clock-drift recovery shortens the
+hour), so the existing pair-landing/exact-fit logic lands near the boundary at a
+natural track edge; nothing is truncated and playback is untouched. A Playlist is
+never cut: if it overruns, the next segment starts late (deterministic, recorded
+as `delay_seconds`, shown in the preview). A segment whose whole window was
+consumed by an overrun still begins -- one Rotation track or the whole Playlist --
+never skipped. A segment whose window ended before a late-started hour began is
+reported `elapsed_before_start` and not built.
+
+**Unchanged contracts.** Blank continuation hours stay blank (a block that
+started earlier is never carried into a later hour, and no extra log is built
+there); schedule edits never rewrite, rebuild or unapprove an existing log; the
+`(date, hour)` advisory lock remains the single build authority; the engine still
+builds one wall-clock hour at a time. Cloning copies the exact rows, minute
+transitions included.
+
+**API.** Writes accept `minute` (integer 0-59, default 0; no rounding or
+quantizing). Block payloads gain `start_minute`. `GET /api/schedule/hour-detail/`
+(`?day_of_week=N` or `?date=YYYY-MM-DD`, `&hour=H`, optional `&profile=<uuid>`)
+returns the server-derived sixty-minute detail for the Hour Detail panel, marking
+explicit transitions, inherited weekly transitions (date mode) and whether each
+minute is a date override, weekly or empty. `preview_hour_log` runs the same
+segment builder without persisting and adds a `segments` list.
+
+**UI.** The weekly 7x24 overview is unchanged; an hour holding minute transitions
+is drawn as a neutral striped cell with a `+N` count. The Hour Detail panel (a
+detail button on a cell, or *Detail* on mobile; *Hour detail* in Date Override)
+shows the minutes as the server resolved them. Only the marked transitions
+persist.

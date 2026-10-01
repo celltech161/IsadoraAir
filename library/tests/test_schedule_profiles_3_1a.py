@@ -520,8 +520,11 @@ class ScheduleApiCompatibilityTests(ScheduleFixtureMixin, TestCase):
         self.dated(self.default, 7, MONDAY)
         self.client.force_login(self.reader)
         payload = self.client.get(self.url).json()
+        # r0095 shape plus the additive 3.1C `start_minute` key (0 for an hourly row), which
+        # lets clients tell minute transitions from the :00 base; no existing key changed.
         self.assertEqual(payload, {"blocks": [{
-            "id": block.id, "day_of_week": 2, "start_hour": 7, "content_kind": "rotation",
+            "id": block.id, "day_of_week": 2, "start_hour": 7, "start_minute": 0,
+            "content_kind": "rotation",
             "content_id": self.rotation_a.id, "content_name": "Rotation A",
         }]})
 
