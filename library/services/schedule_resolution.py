@@ -134,9 +134,9 @@ def minute_map(weekly_rows, dated_rows, *, layer):
     ``minute``, ``origin`` (date_override / weekly / none), ``effective_block``
     (ScheduleBlock or None), ``explicit_block`` (the row IN THE EDITED LAYER
     that starts exactly at this minute, or None), ``inherited_transition``
-    (date layer only: a weekly row starts here and is not overridden by an
-    explicit dated row), ``segment_start`` (an effective segment begins here)
-    and ``has_base``. Rows that cannot take effect because the hour has no
+    (date layer only: a weekly row starts here AND is the effective source at
+    this minute, i.e. no dated row at or before it shadows it),
+    ``segment_start`` (an effective segment begins here) and ``has_base``. Rows that cannot take effect because the hour has no
     base are reported as ``orphan`` explicit rows and never as effective.
     """
     weekly, dated = _index(weekly_rows), _index(dated_rows)
@@ -153,8 +153,12 @@ def minute_map(weekly_rows, dated_rows, *, layer):
             "origin": origin,
             "effective_block": row,
             "explicit_block": explicit,
+            # A weekly transition is "inherited" only when it actually becomes
+            # effective here: a weekly row shadowed by an earlier dated row
+            # (origin is the date layer) is not.
             "inherited_transition": bool(
-                layer == "date" and minute in weekly and explicit is None and has_base
+                layer == "date" and minute in weekly and explicit is None
+                and has_base and origin == ORIGIN_WEEKLY
             ),
             "segment_start": minute in segment_starts,
             "has_base": has_base,

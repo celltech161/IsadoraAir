@@ -123,6 +123,74 @@ class SegmentResolutionTests(ResolverFixtures, TestCase):
             self.assertEqual(entries[minute]["effective_block"].rotation.name, "D", minute)
             self.assertEqual(entries[minute]["origin"], "date_override")
 
+    def inherited(self, entries):
+        return [e["minute"] for e in entries if e["inherited_transition"]]
+
+    def date_entries(self):
+        weekly, dated = load_hour_rows(self.profile, MONDAY, 10)
+        return minute_map(weekly, dated, layer="date")
+
+    def test_a_weekly_transition_shadowed_by_an_active_dated_row_is_not_inherited(self):
+        make_row(self.profile, 10, 0, rotation=self.A, dow=0)
+        make_row(self.profile, 10, 30, rotation=self.B, dow=0)
+        make_row(self.profile, 10, 20, rotation=self.D, on=MONDAY)
+        entries = self.date_entries()
+        self.assertEqual(entries[30]["effective_block"].rotation.name, "D")
+        self.assertEqual(entries[30]["origin"], "date_override")
+        self.assertFalse(entries[30]["inherited_transition"])
+        self.assertFalse(entries[30]["segment_start"])
+
+    def test_a_dated_base_shadows_every_later_weekly_transition(self):
+        make_row(self.profile, 10, 0, rotation=self.A, dow=0)
+        make_row(self.profile, 10, 30, rotation=self.B, dow=0)
+        make_row(self.profile, 10, 0, rotation=self.D, on=MONDAY)
+        entries = self.date_entries()
+        self.assertEqual(self.inherited(entries), [])
+        self.assertEqual(entries[0]["explicit_block"].rotation.name, "D")
+
+    def test_weekly_transitions_before_the_first_dated_row_are_still_inherited(self):
+        make_row(self.profile, 10, 0, rotation=self.A, dow=0)
+        make_row(self.profile, 10, 10, rotation=self.C, dow=0)
+        make_row(self.profile, 10, 30, rotation=self.B, dow=0)
+        make_row(self.profile, 10, 20, rotation=self.D, on=MONDAY)
+        entries = self.date_entries()
+        self.assertEqual(self.inherited(entries), [0, 10])  # 10:30 is shadowed
+        self.assertEqual(entries[10]["origin"], "weekly")
+
+    def test_a_genuinely_inherited_weekly_transition_is_identified(self):
+        make_row(self.profile, 10, 0, rotation=self.A, dow=0)
+        make_row(self.profile, 10, 30, rotation=self.B, dow=0)
+        make_row(self.profile, 10, 45, rotation=self.D, on=MONDAY)
+        entries = self.date_entries()
+        self.assertEqual(self.inherited(entries), [0, 30])
+        self.assertEqual(entries[30]["origin"], "weekly")
+        self.assertTrue(entries[30]["segment_start"])
+
+    def test_explicit_dated_transitions_are_explicit_not_inherited(self):
+        make_row(self.profile, 10, 0, rotation=self.A, dow=0)
+        make_row(self.profile, 10, 30, rotation=self.B, dow=0)
+        make_row(self.profile, 10, 30, rotation=self.D, on=MONDAY)
+        entries = self.date_entries()
+        self.assertEqual(entries[30]["explicit_block"].rotation.name, "D")
+        self.assertFalse(entries[30]["inherited_transition"])
+        self.assertEqual(entries[30]["origin"], "date_override")
+
+    def test_inherited_is_only_ever_reported_where_the_effective_resolver_agrees(self):
+        make_row(self.profile, 10, 0, rotation=self.A, dow=0)
+        make_row(self.profile, 10, 15, rotation=self.B, dow=0)
+        make_row(self.profile, 10, 30, rotation=self.C, dow=0)
+        make_row(self.profile, 10, 50, rotation=self.E, dow=0)
+        make_row(self.profile, 10, 20, rotation=self.D, on=MONDAY)
+        weekly, dated = load_hour_rows(self.profile, MONDAY, 10)
+        starts = {s.start_minute: s for s in effective_segments(weekly, dated)}
+        for entry in minute_map(weekly, dated, layer="date"):
+            if entry["inherited_transition"]:
+                self.assertIn(entry["minute"], starts)
+                self.assertEqual(starts[entry["minute"]].origin, "weekly")
+                self.assertEqual(starts[entry["minute"]].block.pk, entry["effective_block"].pk)
+        # The weekly layer's own map is unaffected: nothing is ever "inherited" there.
+        self.assertEqual(self.inherited(minute_map(weekly, [], layer="weekly")), [])
+
     def test_a_dated_row_at_the_base_covers_the_whole_hour_over_weekly_transitions(self):
         make_row(self.profile, 10, 0, rotation=self.A, dow=0)
         make_row(self.profile, 10, 30, rotation=self.B, dow=0)
@@ -200,7 +268,8 @@ class SegmentResolutionTests(ResolverFixtures, TestCase):
         self.assertEqual(len(entries), 60)
         self.assertIsNone(entries[0]["explicit_block"])
         self.assertTrue(entries[20]["explicit_block"] is not None and entries[20]["segment_start"])
-        self.assertTrue(entries[30]["inherited_transition"])  # weekly row, shadowed by the active dated layer
+        self.assertTrue(entries[0]["inherited_transition"])  # weekly base, before the first dated row
+        self.assertFalse(entries[30]["inherited_transition"])  # weekly row shadowed by the active dated layer
         self.assertFalse(entries[30]["segment_start"])
         self.assertEqual({entry["origin"] for entry in entries}, {"weekly", "date_override"})
         weekly_view = minute_map(weekly, dated, layer="weekly")
@@ -417,11 +486,36 @@ class MinuteApiTests(ResolverFixtures, ApiMixin, TestCase):
         self.assertEqual(by_minute[5]["origin"], "weekly")
         self.assertEqual(by_minute[25]["origin"], "date_override")
         self.assertTrue(by_minute[20]["explicit_block_id"])
-        self.assertTrue(by_minute[30]["inherited_transition"])
+        # Weekly 10:30 B is shadowed by the active dated 10:20 D: never "inherited".
+        self.assertFalse(by_minute[30]["inherited_transition"])
+        self.assertEqual(by_minute[30]["effective_block"]["content_name"], "D")
+        # The weekly 10:00 base precedes the first dated row and is inherited.
+        self.assertTrue(by_minute[0]["inherited_transition"])
         self.assertEqual(by_minute[40]["effective_block"]["content_name"], "D")
         empty = self.hour_detail(date=MONDAY.isoformat(), hour=11, profile=self.default.uuid).json()
         self.assertFalse(empty["has_base"])
         self.assertEqual({m["origin"] for m in empty["minutes"]}, {"none"})
+
+    def test_hour_detail_api_metadata_is_consistent_with_effective_segments(self):
+        make_row(self.default, 10, 0, rotation=self.A, dow=0)
+        make_row(self.default, 10, 10, rotation=self.C, dow=0)
+        make_row(self.default, 10, 30, rotation=self.B, dow=0)
+        make_row(self.default, 10, 20, rotation=self.D, on=MONDAY)
+        data = self.hour_detail(date=MONDAY.isoformat(), hour=10, profile=self.default.uuid).json()
+        weekly, dated = load_hour_rows(self.default, MONDAY, 10)
+        expected = effective_segments(weekly, dated)
+        self.assertEqual(
+            [(s["start_minute"], s["origin"], s["block"]["id"]) for s in data["segments"]],
+            [(s.start_minute, s.origin, s.block.pk) for s in expected],
+        )
+        by_minute = {m["minute"]: m for m in data["minutes"]}
+        self.assertEqual({m for m, e in by_minute.items() if e["segment_start"]}, {s.start_minute for s in expected})
+        self.assertEqual({m for m, e in by_minute.items() if e["inherited_transition"]}, {0, 10})
+        self.assertFalse(by_minute[30]["inherited_transition"])
+        self.assertEqual(by_minute[30]["effective_block"]["content_name"], "D")
+        self.assertEqual(by_minute[30]["origin"], "date_override")
+        self.assertTrue(by_minute[20]["explicit_block_id"])
+        self.assertFalse(by_minute[20]["inherited_transition"])
 
     def test_hour_detail_is_scoped_to_the_selected_profile_and_validates_input(self):
         make_row(self.default, 10, 0, rotation=self.A, dow=0)
@@ -758,6 +852,87 @@ class CombinedHourBuilderTests(BuilderFixtures, TransactionTestCase):
         preview, _ = preview_hour_log(MONDAY, 10, target_duration_seconds=1200.0)
         self.assertTrue(preview["segments"][0]["elapsed_before_start"])
         self.assertFalse(preview["segments"][1]["elapsed_before_start"])
+
+    def test_an_elapsed_empty_rotation_does_not_block_the_later_active_rotation(self):
+        empty = Rotation.objects.create(name="Empty Rotation")
+        self.schedule(10, (0, empty), (30, self.rot_b))
+        log, error = self.build(target_duration_seconds=1200.0)
+        self.assertIsNone(error)
+        titles = self.titles(log)
+        self.assertTrue(titles and all(t.startswith("B") for t in titles), titles)
+        self.assertEqual(PlaylistLog.objects.filter(date=MONDAY, hour=10).count(), 1)
+        self.assertEqual(PlaylistLog.objects.count(), 1)
+
+    def test_an_elapsed_empty_playlist_does_not_block_a_later_active_rotation_or_playlist(self):
+        empty = Playlist.objects.create(name="Empty Playlist")
+        self.schedule(10, (0, empty), (30, self.rot_b))
+        log, error = self.build(target_duration_seconds=1200.0)
+        self.assertIsNone(error)
+        self.assertTrue(all(t.startswith("B") for t in self.titles(log)))
+        PlaylistLog.objects.all().delete()
+        ScheduleBlock.objects.all().delete()
+        later_playlist = self.playlist_of("Later Playlist", self.tracks("P", 2))
+        self.schedule(10, (0, empty), (30, later_playlist))
+        log, error = self.build(target_duration_seconds=1200.0)
+        self.assertIsNone(error)
+        # The playlist leads; whatever follows is ordinary end-of-segment fill.
+        self.assertEqual(self.titles(log)[:2], ["P1", "P2"])
+        self.assertEqual(PlaylistLog.objects.count(), 1)
+
+    def test_a_non_elapsed_empty_rotation_still_fails_the_real_build(self):
+        empty = Rotation.objects.create(name="Empty Rotation")
+        self.schedule(10, (0, empty), (30, self.rot_b))
+        log, error = self.build()  # full hour: the 10:00 segment is active
+        self.assertIsNone(log)
+        self.assertEqual(error, "Rotation 'Empty Rotation' has no slots.")
+        self.assertFalse(PlaylistLog.objects.exists())
+
+    def test_a_non_elapsed_empty_playlist_still_fails_the_real_build(self):
+        empty = Playlist.objects.create(name="Empty Playlist")
+        self.schedule(10, (0, self.rot_a), (30, empty))
+        log, error = self.build()
+        self.assertIsNone(log)
+        self.assertEqual(error, "Playlist 'Empty Playlist' has no items.")
+        self.assertFalse(PlaylistLog.objects.exists())
+        # The last (never-elapsed) segment is validated even in a late-start hour.
+        log, error = self.build(target_duration_seconds=1200.0)
+        self.assertEqual((log, error), (None, "Playlist 'Empty Playlist' has no items."))
+        self.assertFalse(PlaylistLog.objects.exists())
+
+    def test_preview_does_not_report_an_elapsed_empty_source_as_an_error(self):
+        for empty in (Rotation.objects.create(name="Empty Rotation"), Playlist.objects.create(name="Empty Playlist")):
+            ScheduleBlock.objects.all().delete()
+            self.schedule(10, (0, empty), (30, self.rot_b))
+            preview, error = preview_hour_log(MONDAY, 10, target_duration_seconds=1200.0)
+            self.assertIsNone(error)
+            self.assertFalse(
+                [i for i in preview["issues"] if "has no slots" in i["message"] or "has no items" in i["message"]],
+                preview["issues"],
+            )
+            self.assertFalse([i for i in preview["issues"] if i["severity"] == "error"], preview["issues"])
+            first, second = preview["segments"]
+            self.assertTrue(first["elapsed_before_start"])
+            self.assertEqual(first["items"], 0)
+            self.assertFalse(second["elapsed_before_start"])
+            self.assertTrue(preview["items"] and all(i["title"].startswith("B") for i in preview["items"]))
+        self.assertFalse(PlaylistLog.objects.exists())
+
+    def test_preview_reports_a_non_elapsed_empty_source(self):
+        empty = Rotation.objects.create(name="Empty Rotation")
+        self.schedule(10, (0, empty), (30, self.rot_b))
+        preview, _ = preview_hour_log(MONDAY, 10)
+        errors = [i["message"] for i in preview["issues"] if i["severity"] == "error"]
+        self.assertIn("Rotation 'Empty Rotation' has no slots.", errors)
+        self.assertFalse(preview["segments"][0]["elapsed_before_start"])
+        self.assertFalse(PlaylistLog.objects.exists())
+
+    def test_preview_and_real_build_agree_on_which_segments_are_applicable(self):
+        empty = Rotation.objects.create(name="Empty Rotation")
+        self.schedule(10, (0, empty), (30, self.rot_b))
+        preview, _ = preview_hour_log(MONDAY, 10, target_duration_seconds=1200.0)
+        log, error = self.build(target_duration_seconds=1200.0)
+        self.assertIsNone(error)
+        self.assertEqual([i["title"] for i in preview["items"]], self.titles(log))
 
     def test_no_prior_block_fallback_and_no_duplicate_log_in_a_continuation_hour(self):
         long_playlist = self.playlist_of("Evening Feature", self.tracks("E", 4, seconds=900.0))  # 3600s

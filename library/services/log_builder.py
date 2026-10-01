@@ -1344,6 +1344,7 @@ class SegmentPlan:
     slots: list | None = None
     items: list | None = None
     empty: bool = False
+    elapsed: bool = False          # window ended before a late start; never built or validated
 
     @property
     def name(self):
@@ -1694,30 +1695,43 @@ def _segment_windows(plans, target_duration_seconds):
     return windows
 
 
+def _load_plan_source(plan):
+    """Load a plan's slots/items and flag an empty source. Returns the
+    structural-error message for an empty source, else None."""
+    if plan.kind == "rotation":
+        plan.slots = list(
+            plan.source.slots
+            .select_related("category__kind", "track", "track__category__kind", "track__artist")
+            .order_by("position")
+        )
+        plan.empty = not plan.slots
+        return f"Rotation '{plan.name}' has no slots." if plan.empty else None
+    plan.items = list(
+        plan.source.items
+        .select_related("track", "track__category", "track__artist")
+        .order_by("position")
+    )
+    plan.empty = not plan.items
+    return f"Playlist '{plan.name}' has no items." if plan.empty else None
+
+
 def _plan_hour(target_date, hour, plans, target_duration_seconds, observer=None):
     """Build the combined pick list for one hour WITHOUT persisting.
 
     Returns (ctx, records, error). `error` is a message only when there is no
     observer (a real build must not persist anything for an unusable source);
     a preview observer instead records the problem and skips that segment.
+
+    Applicability comes first: the segment windows are computed from the start
+    minutes alone, and a segment whose whole window elapsed before a late start
+    is never loaded or validated, so an empty source there cannot fail the build.
     """
-    for plan in plans:
-        if plan.kind == "rotation":
-            plan.slots = list(
-                plan.source.slots
-                .select_related("category__kind", "track", "track__category__kind", "track__artist")
-                .order_by("position")
-            )
-            plan.empty = not plan.slots
-            message = f"Rotation '{plan.name}' has no slots."
-        else:
-            plan.items = list(
-                plan.source.items
-                .select_related("track", "track__category", "track__artist")
-                .order_by("position")
-            )
-            plan.empty = not plan.items
-            message = f"Playlist '{plan.name}' has no items."
+    windows = _segment_windows(plans, target_duration_seconds)
+    for plan, _nominal_start, _end, elapsed in windows:
+        plan.elapsed = elapsed
+        if elapsed:
+            continue
+        message = _load_plan_source(plan)
         if plan.empty:
             if observer is None:
                 return None, None, message
@@ -1725,7 +1739,7 @@ def _plan_hour(target_date, hour, plans, target_duration_seconds, observer=None)
 
     ctx = _new_hour_context(target_date, hour, target_duration_seconds)
     records = []
-    for plan, nominal_start, end, elapsed in _segment_windows(plans, target_duration_seconds):
+    for plan, nominal_start, end, elapsed in windows:
         record = {
             "start_minute": plan.start_minute,
             "start_time": f"{hour:02d}:{plan.start_minute:02d}",
@@ -2113,7 +2127,7 @@ def preview_hour_log(target_date, hour, target_duration_seconds=NOMINAL_HOUR_SEC
     issues.extend(observer.issues)
     picks, accumulated_seconds = ctx.picks, ctx.accumulated_seconds
 
-    if any(not plan.empty for plan in plans):
+    if any(not (plan.empty or plan.elapsed) for plan in plans):
         shortfall = target_duration_seconds - accumulated_seconds
         if shortfall > DURATION_FIT_MARGIN:
             issues.append({
