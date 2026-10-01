@@ -45,7 +45,16 @@ architectural warning) was NOT independently confirmed by a real
 two-input (sentinel + target) topology in the isolated harness or in
 this file's own TwoInputMixerFlowTests -- included anyway, since the
 task explicitly required proving it either way, not merely asserting it
-away."""
+away.
+
+The P0 restart-recovery pass adds the next empirical correction.  Blocking
+the initial pre-seek buffer can intermittently starve MP3 preroll, especially
+when the predecessor decodebin is being torn down concurrently.  The current
+path therefore closes a pre-sync valve, observes initial decoded flow with a
+nonblocking BUFFER probe, defers predecessor NULL, and installs BLOCK|BUFFER
+only after native seek return to freeze and validate the exact first post-seek
+buffer.  The historical tests below remain useful, while the real-media and
+stress cases exercise this final two-stage gate."""
 from __future__ import annotations
 
 import subprocess
@@ -73,6 +82,16 @@ from library.tests.test_engine_eos_plausibility import (
     _pump_until_seek_resolved,
     _settle_teardowns_then_stop,
 )
+
+
+def _slot_seek_resolved(engine, slot):
+    """True only after any teardown-waiting request and its gated seek end."""
+    deck = engine.decks.get(slot)
+    return (
+        deck is not None
+        and slot not in getattr(engine, "_pending_gated_seeks", {})
+        and deck.gated_seek is None
+    )
 
 
 def _make_real_engine_clocked():
@@ -120,6 +139,22 @@ def _make_vbr_mp3(wav_path, mp3_path):
     )
 
 
+def _make_tagged_mp3(wav_path, mp3_path):
+    """VBR MP3 with ID3 metadata, exercising the id3demux path explicitly."""
+    subprocess.run(
+        [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+            "-i", str(wav_path), "-c:a", "libmp3lame", "-q:a", "4",
+            "-metadata", "title=Restart Resume Fixture",
+            "-metadata", "artist=IsadoraAir Test",
+            "-metadata", "album=Seek Corpus",
+            str(mp3_path),
+        ],
+        check=True,
+        timeout=20,
+    )
+
+
 def _make_flac(wav_path, flac_path):
     subprocess.run(
         [
@@ -159,6 +194,7 @@ class BufferOnlyGateConfirmationTests(TransactionTestCase):
             captured["confirmed_buffer_pts"] = op.get("confirmed_buffer_pts") if op else None
             captured["pre_seek_block_hits"] = op.get("pre_seek_block_hits") if op else None
             captured["block_hits"] = op.get("block_hits") if op else None
+            captured["post_seek_block_hits"] = op.get("post_seek_block_hits") if op else None
             return real_resolve(deck, outcome=outcome)
 
         self.engine._resolve_gated_seek = spy
@@ -174,25 +210,22 @@ class BufferOnlyGateConfirmationTests(TransactionTestCase):
         captured = self._seek_and_capture_resolution("A", 3.0)
 
         self.assertEqual(captured["outcome"], "accepted")
-        # The gate's mask is BLOCK | BUFFER now -- GStreamer will simply
-        # never invoke the probe callback for a STREAM_START/CAPS/
-        # SEGMENT/TAG event, so a populated confirmed_buffer_pts is only
-        # reachable via a genuine decoded audio buffer. None here would
-        # mean the old (fixed) bug -- an event-only "confirmation".
+        # Both readiness probes are BUFFER-only. The initial observer is
+        # nonblocking behind a closed valve; after seek return it is replaced
+        # by a one-buffer blocker. Neither can be satisfied by STREAM_START,
+        # CAPS, SEGMENT, or TAG events.
         self.assertIsNotNone(captured["confirmed_buffer_pts"])
         self.assertGreaterEqual(captured["confirmed_buffer_pts"], 0)
-        # Two distinct real-buffer hits: one during "prerolling" (before
-        # the seek was even dispatched) and a second, later one during
-        # "confirming" (after the flush) -- exactly the invariant the
-        # production "confirming" phase checks (block_hits >
-        # pre_seek_block_hits).
+        # Distinct real-buffer evidence exists on both sides: initial readiness
+        # count before native seek, then exactly one held post-seek buffer.
         self.assertIsNotNone(captured["pre_seek_block_hits"])
-        self.assertGreater(captured["block_hits"], captured["pre_seek_block_hits"])
+        self.assertGreaterEqual(captured["pre_seek_block_hits"], 1)
+        self.assertGreaterEqual(captured["post_seek_block_hits"], 1)
 
     def test_gate_probe_mask_never_admits_downstream_events(self):
         """Directly exercises the probe registration itself: attaches an
         independent, non-blocking, EVENT_DOWNSTREAM-only observer to the
-        SAME ghost pad _begin_gated_seek gates, and confirms real
+        same decoded-audio pad _begin_gated_seek observes, and confirms real
         STREAM_START/CAPS/SEGMENT events do flow through unimpeded (the
         mixer still negotiates normally) while the deck's own gate
         remains unresolved -- i.e. the fix does not stall event
@@ -265,7 +298,8 @@ class PadOffsetOrderingTests(TransactionTestCase):
         self.assertIn("apply_pad_offset", order)
         self.assertIn("remove_probe", order)
         self.assertLess(
-            order.index("apply_pad_offset"), order.index("remove_probe"),
+            order.index("apply_pad_offset"),
+            max(i for i, event in enumerate(order) if event == "remove_probe"),
             f"pad offset must be finalized before the gate is released, got order={order}",
         )
 
@@ -296,7 +330,7 @@ class PreSeekVsPostSeekBufferIdentityTests(TransactionTestCase):
     def test_confirmed_pts_corresponds_to_a_buffer_observed_after_flush_start(self):
         # NOTE on approach: an earlier version of this test tried to
         # verify this with a SEPARATE, independently-registered
-        # non-blocking probe layered on the same ghost pad. That
+        # non-blocking probe layered on the same decoded-audio pad. That
         # doesn't work on this GStreamer build -- confirmed directly:
         # the gate's own BLOCK|BUFFER probe is registered FIRST (inside
         # _begin_gated_seek, before this test ever gets a handle on the
@@ -337,7 +371,7 @@ class PreSeekVsPostSeekBufferIdentityTests(TransactionTestCase):
             # PRE-seek buffer's PTS; the confirmatory seek_simple()
             # call (which triggers the FLUSH that can ever change it)
             # has not been issued yet.
-            captured["pre_seek_pts"] = op.get("confirmed_buffer_pts")
+            captured["pre_seek_pts"] = op.get("preroll_buffer_pts")
             captured["pre_seek_block_hits"] = op.get("block_hits")
             return real_dispatch(deck)
 
@@ -345,7 +379,7 @@ class PreSeekVsPostSeekBufferIdentityTests(TransactionTestCase):
             op = deck.gated_seek
             captured["outcome"] = outcome
             captured["post_seek_pts"] = op.get("confirmed_buffer_pts") if op else None
-            captured["post_seek_block_hits"] = op.get("block_hits") if op else None
+            captured["post_seek_block_hits"] = op.get("post_seek_block_hits") if op else None
             return real_resolve(deck, outcome=outcome)
 
         self.engine._dispatch_gated_seek_call = dispatch_spy
@@ -363,10 +397,9 @@ class PreSeekVsPostSeekBufferIdentityTests(TransactionTestCase):
         # acceptance -- i.e. a genuinely NEW (post-flush) buffer must
         # have arrived to satisfy the "confirming" phase's own
         # block_hits > pre_seek_block_hits check.
-        self.assertGreater(
-            captured["post_seek_block_hits"], captured["pre_seek_block_hits"],
-            "no additional gate hit occurred between dispatch and acceptance -- "
-            "the state machine should never have reached 'accepted' at all",
+        self.assertGreaterEqual(
+            captured["post_seek_block_hits"], 1,
+            "no post-return buffer reached the one-buffer confirmation gate",
         )
 
         # Negative proof: the PTS used to confirm acceptance is not the
@@ -582,6 +615,7 @@ class RealMp3SeekAudioFlowTests(TransactionTestCase):
         captured = self._spy_resolve()
 
         for target in (10.0, 25.0, 15.0, 30.0, 8.0):
+            captured.clear()
             # _seek_deck() is a no-op on an already-empty slot (see its
             # own docstring/implementation: "deck = self.decks.get(slot);
             # if not deck: return") -- under real system load, enough
@@ -612,8 +646,22 @@ class RealMp3SeekAudioFlowTests(TransactionTestCase):
                 _pump_engine(self.engine, lambda: self.engine.decks.get("A") is not None, timeout=15.0),
                 f"slot A never repopulated after seek to {target}s",
             )
+            self.assertTrue(
+                _pump_engine(
+                    self.engine,
+                    lambda: _slot_seek_resolved(self.engine, "A"),
+                    timeout=15.0,
+                )
+            )
+            # A first-attempt no-buffer timeout is allowed to replace its
+            # fully gated generation with one exact-target retry.  Judge the
+            # final slot owner/result, not the retired first attempt.
             deck = self.engine.decks["A"]
-            self.assertTrue(_pump_engine(self.engine, lambda: deck.gated_seek is None, timeout=15.0))
+            self.assertNotEqual(
+                captured.get("outcome"),
+                "never_prerolled",
+                f"bounded MP3 retry also failed to preroll at {target}s",
+            )
             # Every one of _resolve_gated_seek's outcomes -- accepted,
             # or any of the pre-existing r0063 safety fallbacks
             # (never_prerolled/timeout_abandon/accepted_unconfirmed/
@@ -637,6 +685,67 @@ class RealMp3SeekAudioFlowTests(TransactionTestCase):
                 f"master mixer output never resumed after MP3 seek to {target}s "
                 f"(outcome={captured.get('outcome')})",
             )
+
+
+class RealMp3AutoResumeAudioFlowTests(TransactionTestCase):
+    """Exercise the actual _create_deck auto-resume route on an empty slot."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory(prefix="isadoraair-auto-resume-mp3.")
+        self.addCleanup(self.temp_dir.cleanup)
+        wav_path = Path(self.temp_dir.name) / "source.wav"
+        _write_wav(wav_path, frames=120 * 44100)
+        self.mp3_path = Path(self.temp_dir.name) / "source.mp3"
+        _make_mp3(wav_path, self.mp3_path)
+        self.engine = _make_real_engine_clocked()
+        self.addCleanup(lambda: self.engine.main_pipeline.set_state(Gst.State.NULL))
+        self.addCleanup(lambda: _settle_teardowns_then_stop(self.engine))
+        self.track = _make_track(
+            self.mp3_path, track_id=1, duration=120.0, title="Restart MP3"
+        )
+        self.log_item = _make_log_item(self.track, item_id=17)
+        self.log_item.played_at = object()
+        self.engine._claim_playback_occurrence = lambda _item: True
+        self.engine.main_pipeline.set_state(Gst.State.PLAYING)
+
+    def test_auto_resume_seeks_exact_occurrence_and_confirms_master_output(self):
+        self.engine._resume_hint = {
+            "track_id": self.track.id,
+            "log_item_id": self.log_item.id,
+            "position": 20.0,
+            "saved_position": 20.25,
+            "state_age_seconds": 0.5,
+        }
+        captured = {}
+        real_resolve = self.engine._resolve_gated_seek
+
+        def spy(deck, *, outcome):
+            captured["outcome"] = outcome
+            captured["pts"] = deck.gated_seek.get("confirmed_buffer_pts")
+            return real_resolve(deck, outcome=outcome)
+
+        self.engine._resolve_gated_seek = spy
+        before = self.engine._test_output_buffers
+        deck = self.engine._create_deck("A", self.log_item)
+
+        self.assertIsNotNone(deck)
+        self.assertEqual(deck.log_item.id, 17)
+        self.assertEqual(deck.continuation_reason, "auto_resume")
+        self.assertTrue(
+            _pump_engine(self.engine, lambda: deck.gated_seek is None, timeout=15.0)
+        )
+        self.assertEqual(captured.get("outcome"), "accepted")
+        self.assertIsNotNone(captured.get("pts"))
+        ok, position = deck.pipeline.query_position(Gst.Format.TIME)
+        self.assertTrue(ok)
+        self.assertAlmostEqual(position / Gst.SECOND, 20.0, delta=0.5)
+        self.assertTrue(
+            _pump_engine(
+                self.engine,
+                lambda: self.engine._test_output_buffers > before,
+                timeout=5.0,
+            )
+        )
 
 
 class BackwardSeekProductionScenarioTests(TransactionTestCase):
@@ -750,8 +859,10 @@ class MultiFormatSeekTests(TransactionTestCase):
         self.addCleanup(lambda: _settle_teardowns_then_stop(self.engine))
         self.engine.main_pipeline.set_state(Gst.State.PLAYING)
 
-    def _seek_both_directions_and_verify(self, path, title):
-        track = _make_track(path, track_id=1, duration=120.0, title=title)
+    def _seek_both_directions_and_verify(
+        self, path, title, *, duration=120.0, targets=(30.0, 12.0),
+    ):
+        track = _make_track(path, track_id=1, duration=duration, title=title)
         log_item = _make_log_item(track, item_id=1)
         self.engine._create_deck("A", log_item, resume_position_ns=0)
         self.assertTrue(_pump_engine(self.engine, lambda: self.engine.decks["A"].media_buffer_count > 0, timeout=5.0))
@@ -765,21 +876,25 @@ class MultiFormatSeekTests(TransactionTestCase):
 
         self.engine._resolve_gated_seek = spy
 
-        for target in (30.0, 12.0):  # forward then backward
+        for target in targets:  # forward then backward
             pre_seek_count = self.engine._test_output_buffers
             self.engine._seek_deck("A", target)
-            deck = self.engine.decks["A"]
             self.assertTrue(
-                _pump_engine(self.engine, lambda: deck.gated_seek is None, timeout=15.0),
+                _pump_engine(
+                    self.engine,
+                    lambda: _slot_seek_resolved(self.engine, "A"),
+                    timeout=15.0,
+                ),
                 f"[{title}] seek to {target}s never resolved",
             )
+            active_deck = self.engine.decks["A"]
             # Measured IMMEDIATELY on resolution -- see
             # BackwardSeekProductionScenarioTests._run_one_backward_seek_cycle's
             # identical comment; the master-output-resume wait below
             # lets real-time playback continue and would otherwise let
             # "achieved position" drift with however long that wait
             # happened to take.
-            ok, pos = deck.pipeline.query_position(Gst.Format.TIME)
+            ok, pos = active_deck.pipeline.query_position(Gst.Format.TIME)
             self.assertTrue(ok)
 
             outcome = captured.get("outcome")
@@ -791,7 +906,12 @@ class MultiFormatSeekTests(TransactionTestCase):
             resume_timeout = 5.0 if outcome == "accepted" else 30.0
             self.assertTrue(
                 _pump_engine(
-                    self.engine, lambda: self.engine._test_output_buffers > pre_seek_count, timeout=resume_timeout
+                    self.engine,
+                    lambda: (
+                        self.engine._test_output_buffers > pre_seek_count
+                        and self.engine.decks["A"].media_buffer_count > 0
+                    ),
+                    timeout=resume_timeout,
                 ),
                 f"[{title}] master mixer output never resumed after seek to {target}s (outcome={outcome})",
             )
@@ -810,6 +930,25 @@ class MultiFormatSeekTests(TransactionTestCase):
         vbr_path = Path(self.temp_dir.name) / "vbr.mp3"
         _make_vbr_mp3(self.wav_path, vbr_path)
         self._seek_both_directions_and_verify(vbr_path, "VBR MP3")
+
+    def test_short_cbr_mp3_forward_then_backward(self):
+        short_wav = Path(self.temp_dir.name) / "short.wav"
+        # Materially shorter than the 120-second long fixtures while still
+        # leaving enough real-time runway for two clocked seek assertions.
+        _write_wav(short_wav, frames=20 * 44100)
+        short_path = Path(self.temp_dir.name) / "short-cbr.mp3"
+        _make_mp3(short_wav, short_path)
+        self._seek_both_directions_and_verify(
+            short_path,
+            "Short CBR MP3",
+            duration=20.0,
+            targets=(8.0, 2.0),
+        )
+
+    def test_tagged_vbr_mp3_forward_then_backward(self):
+        tagged_path = Path(self.temp_dir.name) / "tagged-vbr.mp3"
+        _make_tagged_mp3(self.wav_path, tagged_path)
+        self._seek_both_directions_and_verify(tagged_path, "Tagged VBR MP3")
 
     def test_wav_control_forward_then_backward(self):
         self._seek_both_directions_and_verify(self.wav_path, "WAV control")
@@ -896,8 +1035,13 @@ class TwoInputMixerFlowTests(TransactionTestCase):
                 _pump_engine(self.engine, lambda: self.engine.decks.get("A") is not None, timeout=15.0),
                 f"slot A never repopulated after seek to {target}s",
             )
-            deck = self.engine.decks["A"]
-            self.assertTrue(_pump_engine(self.engine, lambda: deck.gated_seek is None, timeout=15.0))
+            self.assertTrue(
+                _pump_engine(
+                    self.engine,
+                    lambda: _slot_seek_resolved(self.engine, "A"),
+                    timeout=15.0,
+                )
+            )
 
             self.assertTrue(
                 _pump_engine(self.engine, lambda: self.engine._test_output_buffers > pre_output_count, timeout=12.0),
@@ -1003,11 +1147,18 @@ class StressSeekAudioFlowTests(TransactionTestCase):
                     _pump_engine(self.engine, lambda: self.engine.decks.get(slot) is not None, timeout=15.0),
                     f"cycle {i} (target={target}): slot never repopulated after _seek_deck",
                 )
-                new_deck = self.engine.decks[slot]
                 self.assertTrue(
-                    _pump_engine(self.engine, lambda: new_deck.gated_seek is None, timeout=15.0),
+                    _pump_engine(
+                        self.engine,
+                        lambda: _slot_seek_resolved(self.engine, slot),
+                        timeout=15.0,
+                    ),
                     f"cycle {i} (target={target}) never resolved",
                 )
+                # A bounded never-prerolled retry deliberately replaces the
+                # first gated generation.  Inspect the slot's final owner,
+                # not the generation captured before that retry could occur.
+                new_deck = self.engine.decks[slot]
 
                 # Leak checks apply regardless of which outcome fired.
                 self.assertLessEqual(len(tuple(self.engine.mixer.sinkpads)), 1, f"cycle {i}: stale sinkpad")
@@ -1039,6 +1190,35 @@ class StressSeekAudioFlowTests(TransactionTestCase):
                     # already-tested fallback path recovers under
                     # variable host load.
                     non_accepted_outcomes.append((i, target, outcome))
+                    self.assertTrue(
+                        _pump_engine(
+                            self.engine,
+                            lambda: (
+                                self.engine._test_output_buffers > pre_output_count
+                                and self.engine.decks.get(slot) is not None
+                                and self.engine.decks[slot].media_buffer_count > 0
+                            ),
+                            timeout=30.0,
+                        ),
+                        f"cycle {i} (target={target}, outcome={outcome}): "
+                        "bounded fallback never restored master output; "
+                        f"teardown={self.engine._deck_teardowns[slot].snapshot()} "
+                        f"deck={self.engine.decks.get(slot)} "
+                        f"media={getattr(self.engine.decks.get(slot), 'media_buffer_count', None)} "
+                        f"milestones={self.engine.decks[slot].milestone_snapshot() if self.engine.decks.get(slot) else None}",
+                    )
+                    self.assertTrue(
+                        _pump_engine(
+                            self.engine,
+                            lambda: (
+                                self.engine._deck_teardowns[slot].snapshot()["active_generation"]
+                                is None
+                                and self.engine._deck_teardowns[slot].snapshot()["queue_depth"] == 0
+                            ),
+                            timeout=5.0,
+                        ),
+                        f"cycle {i}: fallback predecessor teardown did not settle",
+                    )
                     continue
 
                 # The common case, and the one this whole investigation
@@ -1061,6 +1241,22 @@ class StressSeekAudioFlowTests(TransactionTestCase):
                     ),
                     f"cycle {i} (target={target}, outcome={outcome}): master mixer output never resumed",
                 )
+                # This test is 104 independent seek cycles, not a synthetic
+                # zero-delay teardown storm.  Let the bounded worker finish
+                # the just-proven predecessor before launching the next seek;
+                # production command polling naturally provides this spacing.
+                self.assertTrue(
+                    _pump_engine(
+                        self.engine,
+                        lambda: (
+                            self.engine._deck_teardowns[slot].snapshot()["active_generation"]
+                            is None
+                            and self.engine._deck_teardowns[slot].snapshot()["queue_depth"] == 0
+                        ),
+                        timeout=5.0,
+                    ),
+                    f"cycle {i}: predecessor teardown did not settle",
+                )
 
         # Deliberately NOT a hard threshold on how many cycles fell back
         # to a non-"accepted" outcome: confirmed directly (see the r0064
@@ -1078,9 +1274,15 @@ class StressSeekAudioFlowTests(TransactionTestCase):
         # always demonstrably resumes), never leaked (sinkpad/
         # deck_bin_map bounded), and whenever a seek IS accepted, a real
         # buffer backs it. Recorded here purely for visibility.
+        fallback_counts = {
+            name: sum(
+                1 for _, _, value in non_accepted_outcomes if value == name
+            )
+            for name in sorted({value for _, _, value in non_accepted_outcomes})
+        }
         print(
             f"  [stress] {len(non_accepted_outcomes)}/{num_cycles} cycles took a "
-            f"non-accepted bounded-safety fallback (see non_accepted_outcomes)",
+            f"non-accepted bounded-safety fallback; outcomes={fallback_counts}",
             flush=True,
         )
 

@@ -1,5 +1,6 @@
 import functools
 import json
+import math
 import os
 import signal
 import socket
@@ -120,6 +121,16 @@ DUCK_RAMP_MS = 500
 DUCK_RAMP_STEPS = 20  # ~25ms per step -- smooth enough for a loudness fade, not sample-accurate automation
 
 STATE_PATH = Path("/run/isadoraair/engine_state.json")
+# Restart recovery stays on tmpfs with the existing engine-state snapshot.
+# A service restart retains it; a machine reboot clears it.  Ninety seconds
+# comfortably covers an orderly systemd restart while refusing an abandoned
+# snapshot after a prolonged outage.  Resume slightly behind the last captured
+# point so a stale-by-one-poll crash snapshot replays a fraction of a second
+# rather than silently skipping program audio.
+RESUME_STATE_VERSION = 1
+RESUME_STATE_MAX_AGE_SECONDS = 90.0
+RESUME_REPLAY_OVERLAP_SECONDS = 0.25
+RESUME_END_GUARD_SECONDS = 0.25
 CMD_PATH = Path("/run/isadoraair/engine_cmd.json")
 NOW_PLAYING_PATH = Path("/run/isadoraair/now_playing.json")
 # Deliberately a SEPARATE file from NOW_PLAYING_PATH above, not an
@@ -860,12 +871,14 @@ SEEK_EOS_GUARD_SECONDS = 5.0
 DEFERRED_SEEK_EOS_OBSERVATION_SECONDS = SEEK_EOS_GUARD_SECONDS + 1.0
 SLOTS = ("A", "B")
 
-# r0063 -- gated manual-seek/resume preparation (_begin_gated_seek /
-# _deck_seek_tick / _resolve_gated_seek). A replacement deck is linked
-# into the live mixer exactly as before, but held fully silent behind a
-# BLOCK_DOWNSTREAM probe on its own ghost src pad until a flushing seek
-# to the requested position has been confirmed -- no buffer, partial or
-# otherwise, ever reaches program audio before that. Reproduced via a
+# r0063/r0064, hardened for restart recovery -- gated manual-seek/resume
+# preparation (_begin_gated_seek / _deck_seek_tick / _resolve_gated_seek).
+# A replacement deck is linked into the live mixer exactly as before, but a
+# pre-sync valve keeps its program audio silent while a nonblocking BUFFER
+# observer proves initial decoder flow.  After the flushing seek returns, a
+# one-buffer BLOCK|BUFFER probe freezes the exact first post-seek buffer so its
+# PTS can be validated and its running-time offset applied before release.
+# Reproduced via a
 # 290-cycle, hardware-free harness (scratchpad/deck-seek-readiness
 # report) that the CURRENT immediate-seek-after-link approach rejects a
 # freshly linked, still-settling bin's flushing seek far more often than
@@ -895,6 +908,11 @@ PLAYBACK_DURATION_CHECKPOINT_SECONDS = 5
 DECK_SEEK_PREROLL_TIMEOUT_SECONDS = 6.0
 DECK_SEEK_CALL_TIMEOUT_SECONDS = 6.0
 DECK_SEEK_POST_SEEK_CONFIRM_TIMEOUT_SECONDS = 4.0
+# A detached predecessor is already inaudible and consumes no mixer pad.  Keep
+# its hazardous asynchronous NULL transition out of the next decoder's startup
+# window; rapid subsequent seeks inherit the pending cleanup instead of racing
+# a new MP3 decodebin against teardown of the prior one.
+DECK_SEEK_PREDECESSOR_QUIET_SECONDS = 1.0
 # r0064 -- upper plausibility bound for a confirmed-buffer PTS or a
 # query_position() result trusted as a real seek-achieved position.
 # GST_CLOCK_TIME_NONE (a guint64 sentinel, (2**64)-1 -- confirmed
@@ -907,6 +925,10 @@ DECK_SEEK_POST_SEEK_CONFIRM_TIMEOUT_SECONDS = 4.0
 # treated as untrustworthy exactly like a missing PTS, never trusted
 # as an "achieved" position.
 DECK_SEEK_MAX_PLAUSIBLE_PTS_NS = 24 * 3600 * Gst.SECOND
+# KEY_UNIT MP3 seeks may land on a nearby frame, but a buffer several seconds
+# from the requested target is proof that a nominally accepted seek did not
+# actually take effect. This also defeats a false `seek_simple() == True`.
+DECK_SEEK_TARGET_TOLERANCE_NS = 1 * Gst.SECOND
 
 
 def _plausible_seek_position_ns(value_ns):
@@ -1398,6 +1420,10 @@ class Deck:
         # probe's own streaming thread; the background seek-call worker)
         # -- both guarded by the dict's own "lock" entry.
         self.gated_seek = None
+        self.seek_gate_pad = None
+        self.seek_gate_valve = None
+        self.failed_seek_predecessors = []
+        self.failed_seek_retire_after_monotonic = 0.0
 
     def mark_milestone(self, name, *, state=None, now=None):
         current = time.monotonic() if now is None else now
@@ -1515,6 +1541,10 @@ class PlaybackEngine:
         # the CURRENT checkout and show a compact mismatch indicator
         # without ever re-deriving it live. See isadoraair/version_info.py.
         self._runtime_commit = capture_runtime_commit()
+        # One identity per engine process.  Persisted with every resume
+        # snapshot so diagnostics can distinguish a fresh service instance
+        # from the instance whose on-air state it is recovering.
+        self._engine_session_id = str(uuid.uuid4())
         self._media_validation_worker = MediaValidationWorker()
         Gst.init(None)
         self.loop = GLib.MainLoop()
@@ -1643,6 +1673,12 @@ class PlaybackEngine:
             )
             for slot in SLOTS
         }
+        # Latest manual seek per slot waiting for an earlier generation's
+        # bounded NULL worker to become idle.  Starting a fresh MP3 decodebin
+        # while that worker is tearing down its predecessor is the reproduced
+        # intermittent never-prerolled race; ordinary playback continues while
+        # this small control-plane request waits.
+        self._pending_gated_seeks = {}
         self._deck_watchdog_times = deque()
         self._cache_warm_item_id = None
         self._last_queue_reload = 0
@@ -4777,6 +4813,35 @@ class PlaybackEngine:
 
     def _load_current_hour_log(self):
         now = timezone.localtime()
+
+        # A fresh, independently validated resume hint is stronger startup
+        # evidence than the wall clock.  The interrupted occurrence can still
+        # belong to the preceding hour (or date) while its nominal successor's
+        # scheduled time is already in the past.  Load that exact approved log
+        # first; _apply_resume_hint_queue_rewind subsequently aligns its cursor
+        # to the exact LogItem.  Invalid/deleted/mismatched state never reaches
+        # this point because _read_resume_hint fails closed.
+        hint = getattr(self, "_resume_hint", None)
+        hinted_log_id = hint.get("playlist_log_id") if hint else None
+        if hinted_log_id:
+            hinted_log = PlaylistLog.objects.filter(
+                id=hinted_log_id, status="approved"
+            ).first()
+            if hinted_log is not None:
+                self._load_log_for(hinted_log.date, hinted_log.hour)
+                if any(item.id == hint["log_item_id"] for item in self.log_items):
+                    print(
+                        "Startup resume log: selected approved log "
+                        f"{hinted_log.id} for interrupted log_item "
+                        f"{hint['log_item_id']} instead of wall-clock inference"
+                    )
+                    return
+                print(
+                    "Startup resume log rejected after load: interrupted "
+                    f"log_item {hint['log_item_id']} is no longer present"
+                )
+                self._resume_hint = None
+
         self._load_log_for(now.date(), now.hour)
 
         # An approved exact-hour log owns startup even when it is empty.
@@ -4899,11 +4964,11 @@ class PlaybackEngine:
         # time; every restart would then replay yesterday's severe
         # thunderstorm alert until the hour rolls over. `played_at` is
         # set at the first confirmed real post-primer output buffer, so
-        # "played_at set" = "started airing", which is the right
-        # granularity for skip-on-restart (a track that started but was
-        # interrupted mid-play is still skipped rather than resumed,
-        # which matches the resume-from-next-boundary contract every
-        # other restart path already uses).
+        # "played_at set" = "started airing".  This remains the safe
+        # fallback when no trustworthy process snapshot exists.  A fresh,
+        # independently validated resume record is applied afterward by
+        # _apply_resume_hint_queue_rewind and may deliberately realign this
+        # cursor to the exact interrupted, already-started occurrence.
         self._queue_cursor = 0
         for i, item in enumerate(self.log_items):
             if item.played_at is None:
@@ -6338,7 +6403,7 @@ class PlaybackEngine:
         """Open duration evidence for an accepted continuation generation.
 
         This is safe to call while a seek's confirmed buffer is still held at
-        the ghost-pad gate. It performs only in-memory activation and schedules
+        the decoded-audio gate. It performs only in-memory activation and schedules
         ORM work on GLib; releasing the gate then lets that same buffer count.
         """
         if deck.log_item.played_at is None:
@@ -6425,6 +6490,7 @@ class PlaybackEngine:
         self, slot, log_item, resume_position_ns=None,
         *, continuation_reason_override=None,
         continuation_start_on_first_real=False,
+        before_sync=None,
     ):
         # Belt-and-braces: _next_queue_item already filters unplayable
         # items, but _create_deck is also reached from other paths
@@ -6455,7 +6521,12 @@ class PlaybackEngine:
                 hint["track_id"] == track.id
                 and hint.get("log_item_id") == log_item.id
             ):
-                print(f"  Auto-resuming deck [{slot}] at {hint['position']:.1f}s (track match)")
+                print(
+                    f"  [{slot}] Restoring interrupted log_item {log_item.id} "
+                    f"(track {track.id}) at {hint['position']:.1f}s; "
+                    f"saved={hint.get('saved_position', hint['position']):.1f}s, "
+                    f"age={hint.get('state_age_seconds', 0.0):.1f}s"
+                )
                 return self._begin_gated_seek(
                     slot,
                     log_item,
@@ -6523,6 +6594,7 @@ class PlaybackEngine:
         # fully-registered generation rather than racing map registration.
         deck = None
         real_stage_src = None
+        seek_gate_valve = None
         concat = None
         real_concat_sink = None
         concat_src = None
@@ -6606,6 +6678,9 @@ class PlaybackEngine:
                         pad.link(convert.get_static_pad("sink"))
         else:
             real_stage_src = resample.get_static_pad("src")
+            seek_gate_valve = Gst.ElementFactory.make("valve", None)
+            deck_bin.add(seek_gate_valve)
+            resample.link(seek_gate_valve)
 
             def on_pad_added(element, pad):
                 if pad.get_current_caps():
@@ -6614,7 +6689,7 @@ class PlaybackEngine:
                         probe_id = pad.add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM, decoder_probe)
                         probe_handles.append((pad, probe_id))
                         pad.link(convert.get_static_pad("sink"))
-                        ghost_pad.set_target(resample.get_static_pad("src"))
+                        ghost_pad.set_target(seek_gate_valve.get_static_pad("src"))
 
         signal_handles.append((decode, decode.connect("pad-added", on_pad_added)))
 
@@ -6787,6 +6862,12 @@ class PlaybackEngine:
         )
         deck.probe_handles = probe_handles
         deck.signal_handles = signal_handles
+        # Stable, statically-created decoded-audio boundary for gated seeks.
+        # The bin ghost pad starts targetless and only acquires this pad from
+        # decodebin's dynamic pad-added callback; attaching the readiness gate
+        # to that dynamic ghost-pad boundary was itself intermittent on MP3.
+        deck.seek_gate_pad = real_stage_src
+        deck.seek_gate_valve = seek_gate_valve
         start_offset = (resume_position_ns or 0) / Gst.SECOND
         # For primed decks, "position 0" (start of the real content) is
         # SILENCE_PRIME_SECONDS after creation, not immediately — shift
@@ -6803,6 +6884,17 @@ class PlaybackEngine:
         with self._lock:
             self.decks[slot] = deck
             self._deck_bin_map[id(deck_bin)] = deck
+        # Gated seek preparation must close its valve and arm the nonblocking
+        # readiness observer before this bin is synchronized with the already-
+        # PLAYING parent.  Arming them after
+        # sync leaves a real streaming-thread race: a short/fast MP3 can emit
+        # its readiness buffer before _create_deck returns, after which the
+        # seek state machine waits six seconds for evidence that already
+        # escaped (the intermittent `never_prerolled` failure).  The callback
+        # is an internal construction seam used only by _begin_gated_seek;
+        # ordinary deck creation remains unchanged.
+        if before_sync is not None:
+            before_sync(deck)
         deck_bin.sync_state_with_parent()
 
         if air_start_eligible:
@@ -7347,7 +7439,8 @@ class PlaybackEngine:
         return outcome
 
     def _remove_deck(
-        self, deck, *, occurrence_terminal=True, termination_reason=None
+        self, deck, *, occurrence_terminal=True, termination_reason=None,
+        defer_null=False,
     ):
         """Detach one exact generation first, then retire it off-thread.
 
@@ -7425,9 +7518,19 @@ class PlaybackEngine:
                 dedupe_key=f"engine|deck-isolation|generation={deck.generation}",
             )
 
-        # Dispatch hazardous quiescence immediately after isolation; database
-        # accounting must not delay it (or live-mixer detach above).
-        self._schedule_deck_null(deck)
+        # Normal retirement dispatches hazardous quiescence immediately after
+        # isolation.  Gated seek replacement is the one exception: it may
+        # defer this NULL transition until the replacement has positively
+        # produced its post-seek buffer.  Real-MP3 repetition proved that
+        # racing an old decodebin's NULL transition against a new decodebin's
+        # startup can starve the new generation's preroll for the full timeout.
+        # The old bin is already unlinked and removed from main_pipeline here,
+        # so deferral cannot leak its audio; the seek op retains the sole
+        # reference and schedules NULL on every resolution/retirement path.
+        if defer_null:
+            deck.mark_milestone("O_NULL_TRANSITION_DEFERRED_FOR_SEEK")
+        else:
+            self._schedule_deck_null(deck)
         self._persist_deck_duration(
             deck,
             close_segment=True,
@@ -7436,6 +7539,7 @@ class PlaybackEngine:
                 termination_reason or deck.completion_reason or "generation_retired"
             ),
         )
+        self._retire_failed_seek_predecessors(deck)
         return True
 
     @_glib_safe(default_return=True)
@@ -7521,104 +7625,188 @@ class PlaybackEngine:
             self._start_next_track()
         return True
 
+    @staticmethod
+    def _sanitize_resume_position(log_item, saved_position):
+        """Return a conservative, bounded seek target for one occurrence.
+
+        The last snapshot is already at most one 250 ms poll old during a
+        crash, and graceful shutdown takes a final sample.  Subtract one poll
+        interval rather than adding service downtime: a small replay overlap
+        is preferable to skipping audio.  Unknown media bounds fail safely to
+        the same track at zero.  Known bounds never seek at/past the effective
+        transition or duration boundary.
+        """
+        try:
+            saved = float(saved_position)
+        except (TypeError, ValueError):
+            raise ValueError("saved position is not numeric")
+        if not math.isfinite(saved) or saved < 0:
+            raise ValueError("saved position is invalid")
+
+        track = log_item.track
+        bounds = []
+        for value in (track.next_start_seconds, track.duration_seconds):
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(number) and number > 0:
+                bounds.append(number)
+
+        if not bounds:
+            return 0.0, "same_item_zero_missing_duration"
+
+        effective_end = min(bounds)
+        latest_safe = max(0.0, effective_end - RESUME_END_GUARD_SECONDS)
+        target = max(0.0, saved - RESUME_REPLAY_OVERLAP_SECONDS)
+        target = min(target, latest_safe)
+        reason = "saved_position_with_overlap"
+        if target < max(0.0, saved - RESUME_REPLAY_OVERLAP_SECONDS):
+            reason = "clamped_before_effective_end"
+        return round(target, 3), reason
+
     def _read_resume_hint(self):
-        """Look for a bookmark file left by the PREVIOUS engine instance
-        (STATE_PATH survives a service restart because it lives on the
-        tmpfs /run, which is only cleared on reboot). If it's fresh
-        (< 90s old), record the (track_id, position, log_item_id) of
-        whatever was playing so the FIRST matching deck load in
-        _create_deck can seek back to that spot -- turning an engine
-        restart mid-song into a ~1-2s dead-air gap instead of a "start
-        next track from scratch" jump.
+        """Load and independently validate the previous process's on-air item.
 
-        Only bookmarks positions > 5s (a track that JUST started
-        doesn't need a seek).
-
-        Prefers the deck with the OLDEST-known log_item_id when both
-        slots are populated (a mid-crossfade snapshot). Rationale: the
-        queue cursor advances the moment a new deck is created, so at
-        any mid-crossfade moment the cursor is already past whatever
-        deck A is on -- if we pick deck B's hint, the next
-        _load_current_hour_log will resume-at-cursor which is already
-        past deck A's LogItem, and the next _start_next_track will
-        load deck B's item, and deck B's audio (which is what the
-        listener actually hears LATER in the crossfade) resumes
-        correctly. But the outgoing (deck A) audio gets restarted from
-        zero as it re-enters as the next-item after cursor advance --
-        same on-air artefact the 09:48 restart produced (Cannons
-        loaded from 0 while Glen Campbell's remaining ~4 minutes were
-        skipped).
-
-        Fix: pick the deck whose log_item_id is OLDEST in queue order
-        (i.e. the outgoing deck), and later in _create_deck we rewind
-        the queue cursor to that item so IT loads first. Deck A hint
-        is preferred; if only B is populated we take that instead.
-
-        A Dedications-category deck is ALWAYS a candidate regardless of
-        the 5s position floor, and always sorts first regardless of the
-        oldest-log_item-id tiebreak above -- a spoken intro is only a
-        few seconds long, so it would almost never clear the floor, and
-        even when it did, would lose the crossfade tiebreak to the
-        (older-log_item-id) outgoing music track every time. Without
-        this, a crash while a dedication intro was on-air would
-        essentially never produce a correct resume hint, silently
-        defeating _restore_dedication_sequence_from_resume_hint below."""
+        ``engine_state.json`` is the existing tmpfs durability boundary: it
+        survives a service restart and disappears on reboot.  New snapshots
+        carry one explicit ``resume`` record selected only from a deck with
+        authoritative air-start evidence.  The legacy r0098 deck fields are
+        accepted for the first upgrade restart, but receive the same database
+        validation here.  In both formats, PlaylistLog + LogItem + Track must
+        match an approved, playable, already-started occurrence; the queue
+        cursor and nominal scheduled time are never authority.
+        """
         self._resume_hint = None
         try:
             if not STATE_PATH.is_file():
                 return
-            age = time.time() - STATE_PATH.stat().st_mtime
-            if age > 90:
-                return
             data = json.loads(STATE_PATH.read_text(encoding="utf-8"))
-            # Collect candidates from both slots.
-            candidates = []
-            for slot in ("A", "B"):
-                deck = (data.get("decks") or {}).get(slot)
-                if not deck or not deck.get("track_id"):
-                    continue
-                is_dedication = deck.get("category") == "Dedications"
-                position = float(deck.get("position", 0))
-                if position > 5 or is_dedication:
+            captured_at = data.get("timestamp", STATE_PATH.stat().st_mtime)
+            age = time.time() - float(captured_at)
+            if age < -5.0 or age > RESUME_STATE_MAX_AGE_SECONDS:
+                print(
+                    "  Resume state rejected: stale or future-dated "
+                    f"snapshot (age {age:.1f}s)"
+                )
+                return
+
+            resume = data.get("resume")
+            if resume is not None:
+                if resume.get("version") != RESUME_STATE_VERSION:
+                    print("  Resume state rejected: unsupported version")
+                    return
+                if not resume.get("actually_playing"):
+                    print("  Resume state rejected: item was not actually playing")
+                    return
+                candidate = dict(resume)
+            else:
+                # One-release compatibility for an r0098 state file.  Do not
+                # restore a merely paused/prepared deck; database played_at
+                # validation below is still mandatory.
+                candidates = []
+                for slot in SLOTS:
+                    deck = (data.get("decks") or {}).get(slot)
+                    if not deck or deck.get("paused") or not deck.get("track_id"):
+                        continue
                     candidates.append({
                         "slot": slot,
-                        "track_id": deck["track_id"],
-                        "position": position,
+                        "track_id": deck.get("track_id"),
                         "log_item_id": deck.get("log_item_id"),
-                        "is_dedication": is_dedication,
+                        "playlist_log_id": deck.get("playlist_log_id") or data.get("log_id"),
+                        "saved_position": deck.get("position"),
+                        "log_position": deck.get("log_position"),
+                        "is_dedication": deck.get("category") == "Dedications",
+                        "session_id": data.get("engine_session_id"),
                     })
-            if not candidates:
+                if not candidates:
+                    return
+                candidates.sort(key=lambda item: (
+                    not item["is_dedication"],
+                    item["log_position"] is None,
+                    item["log_position"] if item["log_position"] is not None
+                    else (item["log_item_id"] or 0),
+                ))
+                candidate = candidates[0]
+
+            previous_session_id = candidate.get("session_id")
+            if (
+                previous_session_id
+                and previous_session_id == getattr(self, "_engine_session_id", None)
+            ):
+                print("  Resume state rejected: snapshot belongs to current engine session")
                 return
-            # Dedications sort first regardless of age; otherwise, sort
-            # by log_item_id ascending so the OLDEST (outgoing) LogItem
-            # wins when a mid-crossfade snapshot has both slots
-            # populated. Missing log_item_id sinks to the end. Older state
-            # files without occurrence identity are retained for diagnostic
-            # visibility but cannot authorize auto-resume at deck creation;
-            # Phase B requires an exact Track + LogItem match.
-            candidates.sort(key=lambda c: (not c["is_dedication"], c["log_item_id"] is None, c["log_item_id"] or 0))
-            hint = candidates[0]
+
+            log_item_id = int(candidate["log_item_id"])
+            track_id = int(candidate["track_id"])
+            playlist_log_id = int(candidate["playlist_log_id"])
+            item = (
+                LogItem.objects.select_related("playlist_log", "track")
+                .filter(
+                    id=log_item_id,
+                    track_id=track_id,
+                    playlist_log_id=playlist_log_id,
+                    playlist_log__status="approved",
+                )
+                .first()
+            )
+            if item is None:
+                print(
+                    "  Resume state rejected: PlaylistLog/LogItem/Track identity "
+                    "no longer matches"
+                )
+                return
+            if item.played_at is None:
+                print(
+                    f"  Resume state rejected: log_item {item.id} was prepared/claimed "
+                    "but has no authoritative air-start evidence"
+                )
+                return
+            playable, reason = _log_item_playable(item)
+            if not playable:
+                print(f"  Resume state rejected: {reason}")
+                return
+
+            saved_position = candidate.get(
+                "saved_position", candidate.get("position")
+            )
+            target, position_policy = self._sanitize_resume_position(
+                item, saved_position
+            )
+            capture_kind = (
+                "graceful_shutdown"
+                if data.get("transport") == "STOPPED"
+                else "recent_crash_snapshot"
+            )
             self._resume_hint = {
-                "track_id": hint["track_id"],
-                "position": hint["position"],
-                "log_item_id": hint["log_item_id"],
+                "track_id": track_id,
+                "log_item_id": log_item_id,
+                "playlist_log_id": playlist_log_id,
+                "position": target,
+                "saved_position": float(saved_position),
+                "position_policy": position_policy,
+                "slot": candidate.get("slot"),
+                "state_age_seconds": age,
+                "previous_session_id": previous_session_id,
+                "capture_kind": capture_kind,
             }
             print(
-                f"  Resume hint: track {hint['track_id']} at {hint['position']:.1f}s "
-                f"(log_item {hint['log_item_id']}, slot {hint['slot']}, age {age:.1f}s)"
+                "  Resume state accepted: "
+                f"log_item {log_item_id}, log {playlist_log_id}, track {track_id}, "
+                f"saved {float(saved_position):.1f}s -> seek {target:.1f}s, "
+                f"slot {candidate.get('slot')}, age {age:.1f}s, {capture_kind}"
             )
         except Exception as exc:
-            print(f"  Resume hint read failed (non-fatal): {exc}")
+            print(f"  Resume state read failed closed (non-fatal): {exc}")
 
     def _apply_resume_hint_queue_rewind(self):
         """Called AFTER _load_current_hour_log. If we have a resume
-        hint carrying a log_item_id, walk the queue and back the
-        cursor up to that item so it loads first when
-        _start_next_track fires. If the hint's LogItem isn't in the
-        current-hour queue (e.g. the log was regenerated across the
-        restart), leave the cursor alone and let the normal flow
-        proceed; the resume-hint's track_id match in _create_deck
-        won't fire, and playback starts fresh -- same as pre-fix."""
+        hint carrying a log_item_id, set the cursor to that exact item so it
+        loads first when _start_next_track fires.  Exact assignment matters:
+        a prior unplayed row must not pull the cursor backward, and an already
+        played interrupted row must not leave it advanced to N+1.  If the
+        validated occurrence disappeared after the read/load boundary, clear
+        the hint and retain the log loader's normal safe cursor."""
         hint = getattr(self, "_resume_hint", None)
         if not hint or not hint.get("log_item_id"):
             return
@@ -7627,13 +7815,12 @@ class PlaybackEngine:
         target = hint["log_item_id"]
         for idx, item in enumerate(self.log_items):
             if item.id == target:
-                # Only rewind (never advance) -- the cursor may already
-                # be at target from _load_current_hour_log's own
-                # resume-at logic; leave it alone in that case.
-                if getattr(self, "_queue_cursor", 0) > idx:
-                    print(f"  Resume queue cursor: rewinding {self._queue_cursor} -> {idx}")
-                    self._queue_cursor = idx
+                previous = getattr(self, "_queue_cursor", 0)
+                self._queue_cursor = idx
+                print(f"  Resume queue cursor: aligning {previous} -> {idx}")
                 return
+        print(f"  Resume state rejected: log_item {target} disappeared from loaded queue")
+        self._resume_hint = None
 
     # ------------------------------------------------------------------
     # FX bus (one-shot audio carts / hotkeys)
@@ -11195,11 +11382,11 @@ class PlaybackEngine:
         cause not chased down given the severity at the time. Tear the
         deck down and recreate it fresh at the target position (as
         before), but never issue the seek directly into the live-linked
-        bin: _begin_gated_seek holds the replacement fully silent behind
-        a downstream block on its own ghost pad until the seek is
-        confirmed, which a hardware-free harness (see the r0063 report)
-        showed removes the seek's own rejection race entirely -- not
-        merely papering over the historical deadlock risk."""
+        bin: _begin_gated_seek closes a pre-sync decoded-audio valve, proves
+        initial decoder flow without blocking the streaming thread, and then
+        freezes one real post-seek buffer until its PTS is validated.  This
+        preserves the r0063 deadlock containment while avoiding the MP3
+        preroll starvation reproduced during restart-recovery hardening."""
         if slot not in SLOTS:
             leading = self._leading_deck()
             slot = leading.slot if leading else None
@@ -11215,18 +11402,22 @@ class PlaybackEngine:
 
     def _begin_gated_seek(
         self, slot, log_item, target_seconds, *, was_paused,
-        continuation_reason=None,
+        continuation_reason=None, _preroll_attempt=1,
+        _retained_failed_predecessors=None,
     ):
         """Shared manual-seek/resume preparation primitive -- see the
         r0063 architecture report (scratchpad/deck-seek-readiness) for
         the full investigation this design is based on.
 
         Removes whatever currently occupies `slot` and builds the
-        replacement exactly as before (_create_deck, linked into the
-        live mixer, resume_position_ns=target), but immediately gates
-        its ghost src pad behind a BLOCK_DOWNSTREAM probe -- topologically
-        connected to the live mixer from the first instant like every
-        other deck, but never exchanging a single real buffer with it.
+        replacement exactly as before (_create_deck, linked into the live
+        mixer, resume_position_ns=target), but closes a valve at the stable
+        decoded-audio boundary *before* synchronizing the bin to its PLAYING
+        parent.  A BUFFER-only observer proves initial decoder flow without
+        parking the streaming thread.  Once the native seek returns, that
+        observer is replaced immediately with a one-buffer BLOCK|BUFFER probe
+        that freezes the first post-seek buffer for PTS validation.  The valve
+        opens only after that validation and the running-time offset are done.
         _deck_seek_tick (a plain periodic GLib timer, the same shape as
         _deck_teardown_tick) advances the preparation in three bounded
         phases -- wait for real decode to start producing, issue the
@@ -11240,14 +11431,11 @@ class PlaybackEngine:
         second call against whatever it's stuck holding -- see
         _resolve_gated_seek's "timeout_abandon" branch.
 
-        If `slot` already has a gated seek in flight, this request is
-        dropped (not queued/coalesced) rather than touching a bin a
-        background thread may still be inside a native call for --
-        empirically (see the report) the whole prepare-through-confirm
-        sequence resolves in well under a millisecond, so a real second
-        request landing inside that window is not expected in practice;
-        a dropped request is cheap and safe, and the operator can just
-        seek again."""
+        A request that arrives while this exact slot already has a native seek
+        in flight is rejected rather than touching that generation.  A request
+        that arrives while bounded teardown from the preceding seek is still
+        active is coalesced to the latest request and dispatched once the
+        per-slot teardown worker is idle."""
         existing = self.decks.get(slot)
         if existing is not None and existing.gated_seek is not None:
             print(f"  [{slot}] Seek already in progress -- ignoring new request to "
@@ -11259,11 +11447,51 @@ class PlaybackEngine:
             )
             return
 
+        # A successful/fallback replacement may still own quiesced, detached
+        # predecessors.  Dispatch their bounded cleanup first, then wait for
+        # that slot's single teardown worker to finish before constructing the
+        # next decoder.  Playback from `existing` remains uninterrupted while
+        # this control-plane request is pending.
+        if existing is not None and existing.failed_seek_predecessors:
+            self._retire_failed_seek_predecessors(existing)
+        coordinator = getattr(self, "_deck_teardowns", {}).get(slot)
+        if coordinator is not None and _preroll_attempt == 1:
+            teardown = coordinator.snapshot()
+            if teardown["active_generation"] is not None or teardown["queue_depth"]:
+                pending = getattr(self, "_pending_gated_seeks", None)
+                if pending is None:
+                    pending = self._pending_gated_seeks = {}
+                pending[slot] = {
+                    "log_item": log_item,
+                    "target_seconds": target_seconds,
+                    "was_paused": was_paused,
+                    "continuation_reason": continuation_reason,
+                }
+                print(
+                    f"  [{slot}] Seek to {target_seconds:.1f}s waiting for "
+                    "prior decoder teardown",
+                    flush=True,
+                )
+                return existing
+
+        inherited_predecessors = []
         if existing is not None:
-            self._remove_deck(
-                existing,
-                occurrence_terminal=False,
-                termination_reason="seek_replaced",
+            # If another seek arrives before this generation's quiet cleanup
+            # window expires, transfer ownership of every detached predecessor
+            # into the new operation.  Dispatching their NULL transitions now
+            # would recreate the exact decode-startup race this path prevents.
+            inherited_predecessors = list(existing.failed_seek_predecessors)
+            existing.failed_seek_predecessors = []
+            existing.failed_seek_retire_after_monotonic = 0.0
+            # Quiesce the known-good predecessor before detaching it.  Leaving
+            # a PLAYING decodebin unparented while its replacement starts was
+            # enough to reproduce the same intermittent MP3 preroll starvation
+            # even when the hazardous NULL transition itself was deferred.
+            # PLAYING->PAUSED is the already-established, bounded operation
+            # used by _pause_deck; only NULL is delegated to the worker.
+            pause_result = existing.pipeline.set_state(Gst.State.PAUSED)
+            existing.mark_milestone(
+                "K_SEEK_PREDECESSOR_PAUSED", state=str(pause_result)
             )
 
         target_ns = int(target_seconds * Gst.SECOND)
@@ -11271,30 +11499,20 @@ class PlaybackEngine:
             "pause_resume" if existing is not None and existing.paused
             else "manual_seek"
         )
-        new_deck = self._create_deck(
-            slot,
-            log_item,
-            resume_position_ns=target_ns,
-            continuation_reason_override=continuation_reason,
-        )
-        if new_deck is None:
-            print(f"  [{slot}] Seek failed — could not recreate deck", flush=True)
-            return None
-
-        ghost_pad = new_deck.pipeline.get_static_pad("src")
-
         op = {
             "target_ns": target_ns,
             "was_paused": was_paused,
             "slot": slot,
             "log_item": log_item,
-            "ghost_pad": ghost_pad,
+            "ghost_pad": None,
+            "valve": None,
             "probe_id": None,
             "phase": "prerolling",
             "started_monotonic": time.monotonic(),
             "pre_seek_block_hits": None,
             "lock": threading.Lock(),
             "block_hits": 0,
+            "post_seek_block_hits": 0,
             "result": None,
             # r0064 -- the confirmed post-seek BUFFER's own PTS, read
             # directly from the item the gate is holding (see
@@ -11303,6 +11521,7 @@ class PlaybackEngine:
             # query_position() call needed, and nothing is ever computed
             # from a merely-assumed position.
             "confirmed_buffer_pts": None,
+            "preroll_buffer_pts": None,
             # r0063 ownership-invariant hardening -- None until some OTHER
             # lifecycle action (eject, reload, natural EOS, watchdog) asks
             # to retire this exact generation while phase == "seeking"
@@ -11310,47 +11529,242 @@ class PlaybackEngine:
             # _retire_deck_respecting_gated_seek / _finish_deferred_retirement.
             "retire_callbacks": None,
             "continuation_reason": continuation_reason,
+            # The paused predecessor remains linked until the successor's gate
+            # has caught its first real decoded buffer.  A linked pad alone is
+            # not enough: detaching before decoder readiness can still let the
+            # parent observe a transient inputless/non-producing condition.
+            "replaced_deck_awaiting_detach": existing,
+            "replaced_deck_awaiting_null": None,
+            "preroll_attempt": _preroll_attempt,
+            "retained_failed_predecessors": list(
+                _retained_failed_predecessors or []
+            ) + inherited_predecessors,
         }
 
         def _hold_buffer(_pad, info):
-            # r0064 -- BLOCK | BUFFER, not BLOCK_DOWNSTREAM. Verified
-            # directly against this GStreamer/PyGObject build (see the
-            # r0064 report): a probe registered with only the BUFFER
-            # data-type selector never fires for STREAM_START/CAPS/
-            # SEGMENT/TAG -- those flow through completely unimpeded,
-            # letting the mixer negotiate this pad's caps/segment
-            # normally even while gated. Only an actual decoded AUDIO
-            # BUFFER is ever held here, so a hit is now unconditionally
-            # proof of real, decoded program audio -- never merely a
-            # sticky event, which the prior BLOCK_DOWNSTREAM gate could
-            # not distinguish (see PlaybackEngine._resolve_gated_seek's
-            # own docstring history). Same one-hit-per-callback contract
-            # as before -- a flushing seek's FLUSH_START still preempts
-            # whatever buffer is currently held rather than queuing
-            # behind it, turning a "held" hit into a fresh one post-seek.
+            # Nonblocking BUFFER-only readiness observer.  It never fires for
+            # STREAM_START/CAPS/SEGMENT/TAG and never parks the streaming
+            # thread, so one hit is proof that this decoder can produce real
+            # audio without recreating the old MP3 preroll deadlock.
             buf = info.get_buffer()
+            wake_driver = False
             with op["lock"]:
                 op["block_hits"] += 1
-                if buf is not None:
-                    op["confirmed_buffer_pts"] = buf.pts
+                if op["block_hits"] == 1:
+                    wake_driver = True
+                if buf is not None and op["preroll_buffer_pts"] is None:
+                    op["preroll_buffer_pts"] = buf.pts
+            if wake_driver:
+                # Two one-shot handoffs per seek (first readiness buffer and
+                # first held post-seek buffer), never one idle per buffer.
+                # The streaming thread still performs only bounded bookkeeping;
+                # all state transitions remain on the GLib thread.
+                def _wake_once():
+                    self._deck_seek_tick()
+                    return False
+
+                GLib.idle_add(_wake_once)
             return Gst.PadProbeReturn.OK
 
-        op["probe_id"] = ghost_pad.add_probe(
-            Gst.PadProbeType.BLOCK | Gst.PadProbeType.BUFFER, _hold_buffer
+        def _hold_post_seek_buffer(_pad, info):
+            buf = info.get_buffer()
+            wake_driver = False
+            with op["lock"]:
+                op["post_seek_block_hits"] += 1
+                if op["post_seek_block_hits"] == 1:
+                    op["confirmed_buffer_pts"] = (
+                        buf.pts if buf is not None else None
+                    )
+                    wake_driver = True
+            if wake_driver:
+                def _wake_once():
+                    self._deck_seek_tick()
+                    return False
+
+                GLib.idle_add(_wake_once)
+            return Gst.PadProbeReturn.OK
+
+        op["post_seek_probe_callback"] = _hold_post_seek_buffer
+
+        def _arm_gate_before_sync(deck):
+            gate_pad = deck.seek_gate_pad
+            valve = deck.seek_gate_valve
+            # Keep downstream negotiation and clocking alive with GAP events
+            # while preventing program audio from escaping.  Unlike a BLOCK
+            # probe this never parks the decoder's streaming thread, so MP3
+            # preroll can complete independently of mixer scheduling.
+            valve.set_property("drop-mode", 2)  # transform-to-gap
+            valve.set_property("drop", True)
+            op["ghost_pad"] = gate_pad
+            op["valve"] = valve
+            op["probe_id"] = gate_pad.add_probe(
+                Gst.PadProbeType.BUFFER,
+                _hold_buffer,
+            )
+            deck.gated_seek = op
+
+        new_deck = self._create_deck(
+            slot,
+            log_item,
+            resume_position_ns=target_ns,
+            continuation_reason_override=continuation_reason,
+            before_sync=_arm_gate_before_sync,
         )
-        new_deck.gated_seek = op
+        if new_deck is None:
+            if existing is not None:
+                existing.failed_seek_predecessors = inherited_predecessors
+                with self._lock:
+                    self.decks[slot] = existing
+                if not was_paused:
+                    existing.pipeline.set_state(Gst.State.PLAYING)
+            print(f"  [{slot}] Seek failed — could not recreate deck", flush=True)
+            return None
+        if new_deck.gated_seek is not op or op["probe_id"] is None:
+            # Internal invariant: no seek generation may be synchronized to
+            # PLAYING without its output gate already armed.
+            print(f"  [{slot}] Seek failed — pre-sync gate was not armed", flush=True)
+            self._remove_deck(
+                new_deck,
+                occurrence_terminal=False,
+                termination_reason="seek_gate_not_armed",
+            )
+            if existing is not None:
+                existing.failed_seek_predecessors = inherited_predecessors
+                with self._lock:
+                    self.decks[slot] = existing
+                if not was_paused:
+                    existing.pipeline.set_state(Gst.State.PLAYING)
+            return None
         return new_deck
+
+    def _detach_seek_replaced_deck(self, op):
+        """Detach a paused predecessor only after successor preroll exists."""
+        replaced = op.get("replaced_deck_awaiting_detach") if op else None
+        if replaced is None:
+            return
+        op["replaced_deck_awaiting_detach"] = None
+        self._remove_deck(
+            replaced,
+            occurrence_terminal=False,
+            termination_reason="seek_replaced",
+            defer_null=True,
+        )
+        op["replaced_deck_awaiting_null"] = replaced
+
+    def _finish_seek_replaced_deck_teardown(self, op):
+        """Dispatch a seek-replaced generation's deferred NULL exactly once."""
+        self._detach_seek_replaced_deck(op)
+        replaced = op.get("replaced_deck_awaiting_null") if op else None
+        if replaced is None:
+            return
+        op["replaced_deck_awaiting_null"] = None
+        self._schedule_deck_null(replaced)
+
+    def _retire_failed_seek_records(self, pending):
+        """Retire gated topology holders after replacement media is proven."""
+        for record in list(pending or []):
+            failed = record.get("deck")
+            if failed is not None:
+                try:
+                    record["ghost_pad"].remove_probe(record["probe_id"])
+                except Exception:
+                    pass
+                failed.gated_seek = None
+                self._remove_deck(
+                    failed,
+                    occurrence_terminal=False,
+                    termination_reason="seek_never_prerolled",
+                )
+            replaced = record.get("replaced_deck_awaiting_null")
+            if replaced is not None:
+                self._schedule_deck_null(replaced)
+
+    def _hold_seek_predecessors_until_stable(self, deck, op):
+        """Give one audible replacement ownership of quiesced predecessors.
+
+        The old bins are already paused, unlinked from the mixer, and removed
+        from the parent.  Only their bounded NULL calls remain.  Holding those
+        calls for a short seek-free interval prevents teardown of decoder N
+        from starving decoder N+1's MP3 startup.  A rapid later seek transfers
+        these records in _begin_gated_seek; normal playback retires them from
+        _deck_seek_tick after confirmed media has remained stable.
+        """
+        pending = list(op.get("retained_failed_predecessors") or [])
+        op["retained_failed_predecessors"] = []
+        replaced = op.get("replaced_deck_awaiting_null")
+        if replaced is not None:
+            pending.append({
+                "deck": None,
+                "replaced_deck_awaiting_null": replaced,
+            })
+            op["replaced_deck_awaiting_null"] = None
+        if not pending:
+            return
+        deck.failed_seek_predecessors.extend(pending)
+        deck.failed_seek_retire_after_monotonic = (
+            time.monotonic() + DECK_SEEK_PREDECESSOR_QUIET_SECONDS
+        )
+
+    def _retire_failed_seek_predecessors(self, fallback):
+        pending = getattr(fallback, "failed_seek_predecessors", None)
+        if not pending:
+            return
+        fallback.failed_seek_predecessors = []
+        fallback.failed_seek_retire_after_monotonic = 0.0
+        self._retire_failed_seek_records(pending)
 
     def _deck_seek_tick(self):
         """Periodic (DECK_SEEK_TICK_MS) GLib-thread driver for every
         deck with an in-flight gated seek. Cheap no-op when nothing is
         pending -- matches _deck_teardown_tick's shape exactly."""
+        pending_seeks = getattr(self, "_pending_gated_seeks", {})
+        for slot, pending in list(pending_seeks.items()):
+            coordinator = getattr(self, "_deck_teardowns", {}).get(slot)
+            teardown = coordinator.snapshot() if coordinator is not None else None
+            if teardown is not None and teardown["poisoned"]:
+                pending_seeks.pop(slot, None)
+                emit_event(
+                    category="engine",
+                    level="critical",
+                    title="Deck seek cancelled -- teardown worker poisoned",
+                    detail={
+                        "slot": slot,
+                        "log_item_id": pending["log_item"].id,
+                        "target_seconds": pending["target_seconds"],
+                    },
+                    dedupe_key=f"engine|seek-teardown-poisoned|slot={slot}",
+                )
+                continue
+            if teardown is not None and (
+                teardown["active_generation"] is not None
+                or teardown["queue_depth"]
+            ):
+                continue
+            pending_seeks.pop(slot, None)
+            self._begin_gated_seek(
+                slot,
+                pending["log_item"],
+                pending["target_seconds"],
+                was_paused=pending["was_paused"],
+                continuation_reason=pending["continuation_reason"],
+            )
+
         for deck in list(self.decks.values()):
-            if deck is None or deck.gated_seek is None:
+            if deck is None:
+                continue
+            if (
+                deck.failed_seek_predecessors
+                and deck.media_buffer_count > 0
+                and time.monotonic()
+                >= deck.failed_seek_retire_after_monotonic
+            ):
+                self._retire_failed_seek_predecessors(deck)
+            if deck.gated_seek is None:
                 continue
             if deck.finished or deck.retirement_started:
                 # Torn down from under the pending seek (e.g. an eject
                 # arrived first) -- nothing left to advance.
+                self._finish_seek_replaced_deck_teardown(deck.gated_seek)
                 deck.gated_seek = None
                 continue
             self._advance_gated_seek(deck)
@@ -11364,12 +11778,11 @@ class PlaybackEngine:
             with op["lock"]:
                 block_hits = op["block_hits"]
             if block_hits >= 1:
-                # r0064: with the BUFFER-only gate, this first hit is
-                # unconditionally a real decoded audio buffer -- a
-                # stronger preroll signal than the old BLOCK_DOWNSTREAM
-                # gate's first hit (commonly a sticky STREAM_START/CAPS/
-                # SEGMENT event, never held-up audio) could ever provide.
+                # The initial BUFFER-only observer is nonblocking and cannot
+                # be satisfied by a sticky event.  It proves decoder readiness
+                # before the known-good predecessor is detached.
                 op["pre_seek_block_hits"] = block_hits
+                self._detach_seek_replaced_deck(op)
                 op["phase"] = "seeking"
                 op["started_monotonic"] = time.monotonic()
                 self._dispatch_gated_seek_call(deck)
@@ -11392,6 +11805,8 @@ class PlaybackEngine:
                     self._finish_deferred_retirement(deck)
                     return
                 if result["outcome"] == "accepted":
+                    # The worker installed the one-buffer blocker immediately
+                    # after native seek return, before publishing this result.
                     op["phase"] = "confirming"
                     op["started_monotonic"] = time.monotonic()
                 else:
@@ -11403,16 +11818,12 @@ class PlaybackEngine:
 
         if op["phase"] == "confirming":
             with op["lock"]:
-                block_hits = op["block_hits"]
-            if block_hits > op["pre_seek_block_hits"]:
-                # r0064: block_hits can now ONLY ever be incremented by
-                # a genuine, decoded post-seek audio BUFFER (the gate no
-                # longer admits sticky events at all) -- this is real
-                # proof of post-gate downstream audio flow, not merely
-                # an event satisfying the counter. op["confirmed_buffer_pts"]
-                # is that buffer's own timestamp, read straight off the
-                # item the gate is holding (still blocked -- stable
-                # until _resolve_gated_seek removes the probe);
+                post_seek_block_hits = op["post_seek_block_hits"]
+            if post_seek_block_hits > 0:
+                # post_seek_block_hits can only be incremented by a genuine,
+                # decoded post-seek BUFFER held by BLOCK|BUFFER.  This is real
+                # proof of post-seek audio flow, not merely a sticky event.
+                # op["confirmed_buffer_pts"] is that held buffer's timestamp;
                 # _resolve_gated_seek uses it to finalize the pad offset
                 # BEFORE releasing the gate.
                 self._resolve_gated_seek(deck, outcome="accepted")
@@ -11447,6 +11858,29 @@ class PlaybackEngine:
                     if deck.gated_seek is op:
                         op["result"] = {"outcome": "exception", "detail": repr(exc)}
                 return
+            if accepted:
+                # Pad-probe mutation is thread-safe in GStreamer. Freeze the
+                # first buffer immediately on native return; waiting for the
+                # 150 ms GLib poll lets fast decoders advance past the target.
+                with op["lock"]:
+                    if deck.gated_seek is not op:
+                        return
+                    op["pre_seek_block_hits"] = op["block_hits"]
+                    op["confirmed_buffer_pts"] = None
+                    op["post_seek_block_hits"] = 0
+                op["ghost_pad"].remove_probe(op["probe_id"])
+                post_probe_id = op["ghost_pad"].add_probe(
+                    Gst.PadProbeType.BLOCK | Gst.PadProbeType.BUFFER,
+                    op["post_seek_probe_callback"],
+                )
+                with op["lock"]:
+                    if deck.gated_seek is not op:
+                        try:
+                            op["ghost_pad"].remove_probe(post_probe_id)
+                        except Exception:
+                            pass
+                        return
+                    op["probe_id"] = post_probe_id
             with op["lock"]:
                 if deck.gated_seek is op:
                     op["result"] = {"outcome": "accepted" if accepted else "rejected"}
@@ -11518,13 +11952,20 @@ class PlaybackEngine:
             print(f"  [{slot}] Seek call did not return in time -- generation {deck.generation} "
                   f"permanently isolated (quarantine #{quarantine_count}), replacing at position 0",
                   flush=True)
-            self._create_deck(
+            fallback = self._create_deck(
                 slot,
                 log_item,
                 resume_position_ns=0,
                 continuation_reason_override="seek_timeout_fallback_zero",
                 continuation_start_on_first_real=not was_paused,
             )
+            if fallback is not None:
+                self._hold_seek_predecessors_until_stable(fallback, op)
+            else:
+                self._finish_seek_replaced_deck_teardown(op)
+                self._retire_failed_seek_records(
+                    op.get("retained_failed_predecessors") or []
+                )
             if was_paused:
                 self._pause_deck(slot)
             for cb in (retire_callbacks or []):
@@ -11558,7 +11999,12 @@ class PlaybackEngine:
                 deck,
                 occurrence_terminal=False,
                 termination_reason="seek_unconfirmed",
+                defer_null=True,
             )
+            op.setdefault("retained_failed_predecessors", []).append({
+                "deck": None,
+                "replaced_deck_awaiting_null": deck,
+            })
             print(f"  [{slot}] Seek to {target_ns / Gst.SECOND:.1f}s could not be confirmed -- "
                   f"replacing at position 0", flush=True)
             emit_event(
@@ -11571,18 +12017,128 @@ class PlaybackEngine:
                 },
                 dedupe_key=f"engine|seek-unconfirmed|slot={slot}",
             )
-            self._create_deck(
+            fallback = self._create_deck(
                 slot,
                 log_item,
                 resume_position_ns=0,
                 continuation_reason_override="seek_unconfirmed_fallback_zero",
                 continuation_start_on_first_real=not was_paused,
             )
+            if fallback is not None:
+                self._hold_seek_predecessors_until_stable(fallback, op)
+            else:
+                self._finish_seek_replaced_deck_teardown(op)
+                self._retire_failed_seek_records(
+                    op.get("retained_failed_predecessors") or []
+                )
             if was_paused:
                 self._pause_deck(slot)
             return
 
-        rejected = outcome in ("never_prerolled", "rejected", "exception")
+        if outcome == "never_prerolled":
+            # No decoded buffer ever reached the pre-sync gate, so merely
+            # removing that gate would expose a generation for which there is
+            # no evidence that decode can produce audio at all (the historic
+            # silent-stall failure).  Start a fresh generation of the SAME
+            # logical occurrence at truthful position zero while retaining
+            # this gate as a topology holder. This is the final bounded
+            # restart fallback: never skip to N+1 and never report the
+            # requested position as restored.
+            # Keep this non-producing generation fully gated and attached for
+            # the brief fallback startup. Removing the last mixer pad here can
+            # drive audiomixer to EOS; NULLing it here can race the fallback's
+            # decoder. It cannot emit program audio because its BUFFER gate is
+            # still installed. The fallback owns and retires it immediately
+            # after proving a real decoded media buffer.
+            # The failed generation's still-installed gate keeps a mixer input
+            # present while the old audible predecessor is detached.  This is
+            # the bounded retry's topology holder.
+            self._detach_seek_replaced_deck(op)
+            deck.gated_seek = None
+            retained = list(op.get("retained_failed_predecessors") or [])
+            retained.append({
+                "deck": deck,
+                "ghost_pad": ghost_pad,
+                "probe_id": probe_id,
+                "replaced_deck_awaiting_null": op.get(
+                    "replaced_deck_awaiting_null"
+                ),
+            })
+            op["replaced_deck_awaiting_null"] = None
+
+            if op.get("preroll_attempt", 1) < 2:
+                with self._lock:
+                    if self.decks.get(slot) is deck:
+                        self.decks[slot] = None
+                print(
+                    f"  [{slot}] Seek/preroll attempt 1 produced no decoded "
+                    f"buffer for log_item {log_item.id}; retrying exact target "
+                    f"{target_ns / Gst.SECOND:.1f}s once",
+                    flush=True,
+                )
+                retry = self._begin_gated_seek(
+                    slot,
+                    log_item,
+                    target_ns / Gst.SECOND,
+                    was_paused=was_paused,
+                    continuation_reason=op.get("continuation_reason"),
+                    _preroll_attempt=2,
+                    _retained_failed_predecessors=retained,
+                )
+                if retry is not None:
+                    return
+                self._retire_failed_seek_records(retained)
+                return
+            print(
+                f"  [{slot}] Seek/preroll produced no decoded buffer for "
+                f"log_item {log_item.id} at {target_ns / Gst.SECOND:.1f}s -- "
+                "starting same-item position-0 fallback behind retained gate",
+                flush=True,
+            )
+            emit_event(
+                category="engine",
+                level="error",
+                title="Deck seek never prerolled -- zero fallback started",
+                detail={
+                    "slot": slot,
+                    "track_id": log_item.track.id,
+                    "log_item_id": log_item.id,
+                    "target_seconds": target_ns / Gst.SECOND,
+                    "fallback_seconds": 0.0,
+                    "seek_outcome": outcome,
+                },
+                dedupe_key=f"engine|seek-never-prerolled|slot={slot}|track={log_item.track.id}",
+            )
+            fallback = self._create_deck(
+                slot,
+                log_item,
+                resume_position_ns=None,
+                continuation_reason_override="seek_never_prerolled_fallback_zero",
+                continuation_start_on_first_real=not was_paused,
+            )
+            if fallback is None:
+                # No owner exists to keep the holder bounded; retire it now.
+                try:
+                    ghost_pad.remove_probe(probe_id)
+                except Exception:
+                    pass
+                self._remove_deck(
+                    deck,
+                    occurrence_terminal=False,
+                    termination_reason="seek_zero_fallback_create_failed",
+                )
+                self._finish_seek_replaced_deck_teardown(op)
+                self._retire_failed_seek_records(retained)
+                return
+            fallback.failed_seek_predecessors = retained
+            fallback.failed_seek_retire_after_monotonic = (
+                time.monotonic() + DECK_SEEK_PREDECESSOR_QUIET_SECONDS
+            )
+            if was_paused:
+                self._pause_deck(slot)
+            return
+
+        rejected = outcome in ("rejected", "exception")
         if rejected:
             # Still fully gated -- nothing program-visible has ever
             # escaped either way, so finalize-then-remove vs remove-
@@ -11601,17 +12157,21 @@ class PlaybackEngine:
                 self._schedule_continuation_segment_start(
                     deck, "seek_rejected_fallback_zero"
                 )
+            op["valve"].set_property("drop", False)
             ghost_pad.remove_probe(probe_id)
             deck.started_at = time.time()
-            print(f"  [{slot}] Seek to {target_ns / Gst.SECOND:.1f}s rejected -- playing from 0 instead",
+            print(f"  [{slot}] Seek/preroll outcome {outcome} for log_item {log_item.id} "
+                  f"at {target_ns / Gst.SECOND:.1f}s -- playing same item from 0 instead",
                   flush=True)
             emit_event(
                 category="engine", level="error", title="Deck seek rejected",
                 detail={
                     "slot": slot,
                     "track_id": deck.track.id,
+                    "log_item_id": log_item.id,
                     "target_seconds": target_ns / Gst.SECOND,
                     "fallback_seconds": 0.0,
+                    "seek_outcome": outcome,
                     "pad_offset_rebased": True,
                 },
                 dedupe_key=f"engine|seek-rejected|slot={slot}|track={deck.track.id}",
@@ -11685,6 +12245,30 @@ class PlaybackEngine:
                 )
                 return self._resolve_gated_seek(deck, outcome="accepted_unconfirmed")
 
+            if abs(achieved_ns - target_ns) > DECK_SEEK_TARGET_TOLERANCE_NS:
+                print(
+                    f"  [{slot}] Seek to {target_ns / Gst.SECOND:.1f}s produced "
+                    f"buffer position {achieved_ns / Gst.SECOND:.1f}s -- treating "
+                    "as unconfirmed",
+                    flush=True,
+                )
+                emit_event(
+                    category="engine",
+                    level="error",
+                    title="Deck seek buffer did not match requested target",
+                    detail={
+                        "slot": slot,
+                        "track_id": deck.track.id,
+                        "log_item_id": log_item.id,
+                        "target_seconds": target_ns / Gst.SECOND,
+                        "confirmed_seconds": achieved_ns / Gst.SECOND,
+                    },
+                    dedupe_key=f"engine|seek-target-mismatch|slot={slot}",
+                )
+                return self._resolve_gated_seek(
+                    deck, outcome="accepted_unconfirmed"
+                )
+
             self._apply_pad_offset(deck.pipeline, internal_position_ns=achieved_ns)
             deck.seeked_at = time.time()
             deck.started_at = time.time() - (achieved_ns / Gst.SECOND)
@@ -11692,8 +12276,13 @@ class PlaybackEngine:
                 self._schedule_continuation_segment_start(
                     deck, op.get("continuation_reason") or "seek_confirmed"
                 )
+            op["valve"].set_property("drop", False)
             ghost_pad.remove_probe(probe_id)
-            print(f"  [{slot}] Seek to {achieved_ns / Gst.SECOND:.1f}s", flush=True)
+            print(
+                f"  [{slot}] Seek/preroll verified for log_item {log_item.id}: "
+                f"decoded post-seek buffer at {achieved_ns / Gst.SECOND:.1f}s",
+                flush=True,
+            )
 
         deck.gated_seek = None
 
@@ -11710,6 +12299,10 @@ class PlaybackEngine:
                 deck.paused_position = achieved_ns / Gst.SECOND
         else:
             self._next_triggered = False
+        self._finish_seek_replaced_deck_teardown(op)
+        self._retire_failed_seek_records(
+            op.get("retained_failed_predecessors") or []
+        )
 
     def _quarantined_seek_generation_count(self):
         """Cumulative count of generations abandoned because their native
@@ -11764,6 +12357,10 @@ class PlaybackEngine:
                     pass
                 deck.gated_seek = None
             self._remove_deck(deck)
+            self._finish_seek_replaced_deck_teardown(op)
+            self._retire_failed_seek_records(
+                op.get("retained_failed_predecessors") or [] if op else []
+            )
             if on_retired is not None:
                 on_retired()
             return
@@ -11787,6 +12384,10 @@ class PlaybackEngine:
             pass
         deck.gated_seek = None
         self._remove_deck(deck)
+        self._finish_seek_replaced_deck_teardown(op)
+        self._retire_failed_seek_records(
+            op.get("retained_failed_predecessors") or []
+        )
         for cb in callbacks:
             try:
                 cb()
@@ -11818,6 +12419,7 @@ class PlaybackEngine:
             return
         op = deck.gated_seek
         if op is not None and op["phase"] == "seeking":
+            self._finish_seek_replaced_deck_teardown(op)
             with self._lock:
                 self._quarantined_seek_generations += 1
                 quarantine_count = self._quarantined_seek_generations
@@ -11842,6 +12444,7 @@ class PlaybackEngine:
             except Exception:
                 pass
             deck.gated_seek = None
+            self._finish_seek_replaced_deck_teardown(op)
         self._remove_deck(
             deck,
             occurrence_terminal=False,
@@ -12608,12 +13211,9 @@ class PlaybackEngine:
         vt_outgoing_track_id = self._vt.get("outgoing_track_id")
         if (vt_phase in ("outro_playing", "outro_tail")
                 and deck.track.id == vt_outgoing_track_id):
-            # In practice a genuine EOS cannot reach this callback while
-            # deck.gated_seek is still active -- the same BLOCK_DOWNSTREAM
-            # probe that gates a fresh replacement's buffers also gates
-            # any (extremely unlikely, freshly-created-deck) EOS reaching
-            # this exact pad -- but route through the safe helper anyway
-            # rather than relying on that reasoning never changing.
+            # A genuine EOS is not expected here while seek preparation owns
+            # the generation, but route through the ownership-safe helper
+            # rather than relying on timing or probe behavior never changing.
             self._retire_deck_respecting_gated_seek(deck, on_retired=self._vt_handle_outgoing_ended)
             return
 
@@ -12954,6 +13554,46 @@ class PlaybackEngine:
             eta += q_airtime
         return queue
 
+    def _build_resume_state(self, decks_out, *, captured_at, transport):
+        """Select one authoritative interrupted occurrence for restart.
+
+        ``played_at``/``actually_playing`` proves real program contribution;
+        a claimed or prepared N+1 is never eligible even though the in-memory
+        queue cursor already moved past it.  During the brief interval where
+        two decks genuinely contribute, Dedications retain their established
+        priority and otherwise the earlier queue position (the outgoing item)
+        wins, preventing its remaining audio from being skipped.
+        """
+        candidates = [
+            deck for deck in decks_out.values()
+            if deck and deck.get("actually_playing")
+        ]
+        if not candidates:
+            return None
+        candidates.sort(key=lambda item: (
+            item.get("category") != "Dedications",
+            item.get("log_position") is None,
+            item.get("log_position")
+            if item.get("log_position") is not None
+            else item.get("log_item_id", 0),
+        ))
+        selected = candidates[0]
+        return {
+            "version": RESUME_STATE_VERSION,
+            "session_id": getattr(self, "_engine_session_id", None),
+            "captured_at": captured_at,
+            "capture_transport": transport,
+            "actually_playing": True,
+            "playlist_log_id": selected["playlist_log_id"],
+            "log_item_id": selected["log_item_id"],
+            "log_position": selected.get("log_position"),
+            "track_id": selected["track_id"],
+            "slot": selected["slot"],
+            "deck_generation": selected.get("generation"),
+            "saved_position": selected["position"],
+            "media_buffers": selected.get("media_buffers", 0),
+        }
+
     def _write_state(self, transport="PLAYING"):
         try:
             STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -12969,7 +13609,20 @@ class PlaybackEngine:
                     continue
                 pos = self._get_deck_position(deck)
                 t = deck.track
+                log_item = getattr(deck, "log_item", None)
+                media_buffers = getattr(deck, "media_buffer_count", 0)
+                actually_playing = bool(
+                    log_item is not None
+                    and log_item.played_at is not None
+                    and not getattr(deck, "paused", False)
+                    and not getattr(deck, "finished", False)
+                    and not getattr(deck, "retirement_started", False)
+                    and not getattr(deck, "detached_from_mixer", False)
+                    and getattr(deck, "mixer_pad", None) is not None
+                    and media_buffers > 0
+                )
                 decks_out[slot] = {
+                    "slot": slot,
                     "track_id": t.id,
                     # log_item_id is the auto-resume key. The queue
                     # cursor advances past a LogItem the moment its
@@ -12983,7 +13636,12 @@ class PlaybackEngine:
                     # a mid-crossfade restart correctly captures the
                     # hint but the wrong LogItem loads first, no
                     # match, no seek.
-                    "log_item_id": deck.log_item.id if deck.log_item else None,
+                    "playlist_log_id": log_item.playlist_log_id if log_item else None,
+                    "log_item_id": log_item.id if log_item else None,
+                    "log_position": log_item.position if log_item else None,
+                    "generation": getattr(deck, "generation", None),
+                    "actually_playing": actually_playing,
+                    "media_buffers": media_buffers,
                     "title": t.title,
                     "artist": t.artist.name if t.artist else "",
                     "album": t.album.title if t.album else "",
@@ -13004,16 +13662,21 @@ class PlaybackEngine:
             # offsets use deliberately different formulas.
             queue = self._compute_queue_eta_state(snapshot)
 
+            captured_at = time.time()
             state = {
                 "transport": transport,
                 "decks": decks_out,
+                "resume": self._build_resume_state(
+                    decks_out, captured_at=captured_at, transport=transport
+                ),
                 "queue": queue,
                 "queue_cursor": self._queue_cursor,
                 "total_items": len(self.log_items),
                 "log_id": self.current_log.id if self.current_log else None,
                 "hour": self.current_log.hour if self.current_log else None,
                 "date": self.current_log.date.isoformat() if self.current_log else None,
-                "timestamp": time.time(),
+                "timestamp": captured_at,
+                "engine_session_id": getattr(self, "_engine_session_id", None),
                 # mic_configured distinguishes "never wired up" (button
                 # disabled) from "wired up but off"; mic_ok distinguishes
                 # "configured but currently erroring" from healthy;

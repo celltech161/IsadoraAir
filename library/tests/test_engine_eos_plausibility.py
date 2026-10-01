@@ -434,6 +434,19 @@ def _pump_until_seek_resolved(engine, deck, timeout=3.0):
     return _pump_engine(engine, lambda: deck.gated_seek is None, timeout=timeout)
 
 
+def _pump_until_slot_seek_resolved(engine, slot, timeout=3.0):
+    """Follow a teardown-queued seek through to the slot's final owner."""
+    return _pump_engine(
+        engine,
+        lambda: (
+            slot not in getattr(engine, "_pending_gated_seeks", {})
+            and engine.decks.get(slot) is not None
+            and engine.decks[slot].gated_seek is None
+        ),
+        timeout=timeout,
+    )
+
+
 def _pump_until_seeking(engine, deck, timeout=3.0):
     return _pump_engine(
         engine,
@@ -462,16 +475,13 @@ def _controllable_seek(hold_event, real_seek_simple):
 
 
 class GatedSeekSuccessTests(TransactionTestCase):
-    """_begin_gated_seek (shared by _seek_deck/_resume_deck) gates a
-    freshly linked replacement deck behind a BLOCK_DOWNSTREAM probe on
-    its own ghost pad -- topologically connected to the live mixer
-    exactly as before, but never exchanging a single real buffer with it
-    -- until a flushing seek to the requested position is confirmed. See
-    the r0063 architecture report for the 290-cycle hardware-free harness
-    this design is based on: the immediate-seek-after-link approach it
-    replaces rejected a freshly linked bin's own flushing seek in 29/30
-    cycles of one representative run; gating removes that race (0
-    rejections / 0 hangs / exact position accuracy across 290 cycles)."""
+    """_begin_gated_seek (shared by _seek_deck/_resume_deck) closes a
+    pre-sync valve on a freshly linked replacement, observes initial decoded
+    flow without blocking it, then holds one post-seek buffer until its PTS is
+    validated.  The deck stays topologically connected to the live mixer but
+    cannot emit program audio until confirmation.  This retains r0063's
+    deadlock containment while avoiding the reproduced MP3 preroll starvation
+    from blocking the initial decoded buffer."""
 
     def setUp(self):
         self.engine, self.temp_dir, self.track, self.log_item = _gated_seek_fixture()
@@ -490,7 +500,9 @@ class GatedSeekSuccessTests(TransactionTestCase):
         # Still fully gated immediately after the request -- nothing has
         # been exposed to the mixer yet, matching "no position-zero
         # leakage" even for the transient moment before confirmation.
-        self.assertEqual(len(tuple(self.engine.mixer.sinkpads)), 1)
+        # The paused predecessor remains linked until the successor produces
+        # its first decoded buffer, preventing a transient zero-input mixer.
+        self.assertEqual(len(tuple(self.engine.mixer.sinkpads)), 2)
 
         self.assertTrue(_pump_until_seek_resolved(self.engine, deck))
         self.assertIsNone(deck.gated_seek)
@@ -506,7 +518,7 @@ class GatedSeekSuccessTests(TransactionTestCase):
         for target in (1.0, 2.0, 3.0, 1.5, 2.5):
             self.engine._seek_deck("A", target)
             deck = self.engine.decks["A"]
-            self.assertTrue(_pump_until_seek_resolved(self.engine, deck))
+            self.assertTrue(_pump_until_slot_seek_resolved(self.engine, "A"))
 
         self.assertEqual(len(tuple(self.engine.mixer.sinkpads)), 1)
         self.assertEqual(len(self.engine._deck_bin_map), 1)
@@ -583,7 +595,7 @@ class GatedSeekRejectionTests(TransactionTestCase):
         self.engine._seek_deck("A", 3.0)
         deck = self.engine.decks["A"]
         # Overridden immediately -- _dispatch_gated_seek_call fires the
-        # instant the block probe's first hit is observed, which can
+        # instant the initial readiness observer's first hit is seen, which can
         # itself happen before a test-side wait for "phase == seeking"
         # ever gets scheduled; only a same-statement-window override is
         # race-free against the background worker's own dispatch.
@@ -598,7 +610,10 @@ class GatedSeekRejectionTests(TransactionTestCase):
         self.assertEqual(mock_emit.call_args.kwargs["detail"]["fallback_seconds"], 0.0)
         self.assertTrue(mock_emit.call_args.kwargs["detail"]["pad_offset_rebased"])
         messages = [call.args[0] for call in mock_print.call_args_list if call.args]
-        self.assertTrue(any("rejected -- playing from 0 instead" in item for item in messages))
+        self.assertTrue(any(
+            "outcome rejected" in item and "playing same item from 0 instead" in item
+            for item in messages
+        ))
         self.assertFalse(any("Seek to 3.0s" in item for item in messages if "rejected" not in item))
 
     def test_resume_seek_rejection_rebases_pad_timeline_and_preserves_pause_derived_position(self):
@@ -677,8 +692,8 @@ class GatedSeekAbandonmentTests(TransactionTestCase):
         self.engine._seek_deck("A", 3.0)
         stuck_deck = self.engine.decks["A"]
         # Overridden immediately, before any pumping -- _dispatch_gated_
-        # seek_call fires the instant the block probe's first hit is
-        # observed, which can happen inside the tick call above before a
+        # seek_call fires the instant the readiness observer's first hit is
+        # seen, which can happen inside the tick call above before a
         # test-side wait for a later phase would ever get scheduled;
         # only a same-statement-window override is race-free.
         stuck_deck.pipeline.seek_simple = lambda *a, **kw: (time.sleep(999), True)[1]
@@ -721,7 +736,7 @@ class GatedSeekAbandonmentTests(TransactionTestCase):
 
 class NeverPrerolledTests(TransactionTestCase):
     """_advance_gated_seek's "prerolling" phase: the gate condition
-    (a first BLOCK_DOWNSTREAM hit) may simply never arrive -- a source
+    (a first decoded BUFFER hit) may simply never arrive -- a source
     that never produces any data at all, real-world analog being e.g. a
     file on a wedged network mount. Forced deterministically here with a
     named pipe (FIFO) as the track's own file, with a background thread
@@ -827,40 +842,69 @@ class NeverPrerolledTests(TransactionTestCase):
             # trivially/vacuously true for the wrong reason.
             self.assertTrue(self._fifo_writer_opened.wait(timeout=2.0))
 
-            with patch.object(eng_module, "emit_event") as mock_emit, patch("builtins.print"):
-                resolved = _pump_until_seek_resolved(self.engine, deck, timeout=3.0)
+            # The FIFO fixture's read is intentionally unkillable. Production
+            # must dispatch its NULL through the bounded worker (and request a
+            # policy restart if that worker times out), but starting that known
+            # permanent worker inside this shared test process would pollute
+            # later thread-boundedness tests. Assert dispatch and stub only the
+            # hazardous operation itself here.
+            with (
+                patch.object(eng_module, "emit_event") as mock_emit,
+                patch.object(self.engine, "_schedule_deck_null") as mock_null,
+                patch("builtins.print"),
+            ):
+                # The first no-buffer timeout now triggers one exact-target
+                # retry.  Wait for that retry to fail boundedly too and for
+                # the final same-item position-zero fallback to own both
+                # still-gated failed generations.
+                resolved = _pump_engine(
+                    self.engine,
+                    lambda: (
+                        self.engine.decks["A"] is not None
+                        and self.engine.decks["A"] is not deck
+                        and self.engine.decks["A"].gated_seek is None
+                        and len(
+                            self.engine.decks["A"].failed_seek_predecessors
+                        ) == 2
+                    ),
+                    timeout=3.0,
+                )
 
         # Bounded resolution -- no hang, no stale gated-seek record.
         self.assertTrue(resolved)
         self.assertIsNone(deck.gated_seek)
-        # No false seek success: rejected, not accepted -- the file
-        # never even opened, so decode genuinely never started.
-        self.assertEqual(mock_emit.call_args.kwargs["title"], "Deck seek rejected")
+        # No false seek success: the non-producing generation is retired and
+        # the SAME logical occurrence is queued at zero -- never skipped.
+        self.assertEqual(
+            mock_emit.call_args.kwargs["title"],
+            "Deck seek never prerolled -- zero fallback started",
+        )
         self.assertEqual(mock_emit.call_args.kwargs["detail"]["fallback_seconds"], 0.0)
-        # Truthful playback/timing state: started_at reflects "now",
-        # not the never-reached target.
-        self.assertAlmostEqual(deck.started_at, time.time(), delta=0.5)
-        self.assertIsNone(deck.seeked_at)
-        # Deliberately NOT calling _remove_deck(deck) here. A "never
-        # prerolled" outcome only tells us the GATE condition never
-        # arrived within DECK_SEEK_PREROLL_TIMEOUT_SECONDS -- it says
-        # nothing about WHY. In this test the reason is a permanently
-        # blocked filesrc read(), and _remove_deck's deferred
-        # set_state(NULL) on a bin whose filesrc is stuck in a blocking
-        # read can hang the SAME way an unresolved native seek call can
-        # -- confirmed empirically (attempting it here left a genuinely
-        # permanent "deck-real-a-test-worker" thread, since nothing ever
-        # closes this test's own FIFO writer). That specific hazard --
-        # a hung underlying source, as opposed to a hung native seek
-        # call -- is pre-existing and orthogonal to gated seeking
-        # (equally present for a perfectly ordinary, non-seek fresh
-        # track start against the same kind of hung source) and out of
-        # scope for this hardening pass; noted for the report rather
-        # than fixed here. What this test verifies is the rejected-seek
-        # fallback itself (already asserted above): truthful position,
-        # no false success, no stale gated-seek record -- and that a
-        # SEPARATE slot remains completely unaffected by this one
-        # deliberately-abandoned generation.
+        mock_null.assert_not_called()
+        replacement = self.engine.decks["A"]
+        self.assertIsNot(replacement, deck)
+        self.assertEqual(replacement.log_item.id, self.log_item.id)
+        failed_generations = [
+            record["deck"] for record in replacement.failed_seek_predecessors
+        ]
+        self.assertEqual(len(failed_generations), 2)
+        self.assertIs(failed_generations[0], deck)
+        self.assertIsNot(failed_generations[1], deck)
+        self.assertIsNot(failed_generations[1], replacement)
+        # This fixture is defined never to return from NULL; production's
+        # coordinator would become poisoned and request a policy restart. The
+        # retained gate is detached explicitly under the stubbed NULL call so
+        # this shared test process is not left with the known-unreturning FIFO
+        # worker.
+        with patch.object(self.engine, "_schedule_deck_null") as cleanup_null:
+            self.engine._retire_failed_seek_predecessors(replacement)
+        self.assertEqual(
+            [call.args[0] for call in cleanup_null.call_args_list],
+            failed_generations,
+        )
+        # The failed generation is detached before its potentially stuck NULL
+        # transition is delegated; an unaffected second slot keeps working
+        # while that slot waits for teardown/restart policy.
         real_wav = Path(self.temp_dir.name) / "real.wav"
         _write_wav(real_wav, frames=6 * 44100)
         real_track = _make_track(real_wav, track_id=2, duration=6.0, title="Real Track")
@@ -877,9 +921,10 @@ class AcceptedUnconfirmedTests(TransactionTestCase):
     here risks racing it), but no fresh buffer ever reaches the gate to
     POSITIVELY confirm decode actually resumed at the claimed position.
     Forced deterministically by overriding seek_simple with a pure no-op
-    that lies "True" without performing any real seek at all -- nothing
-    flushes the block probe's already-held first hit, so no second hit
-    can ever arrive."""
+    that lies "True" without performing any real seek.  The post-return
+    BLOCK|BUFFER probe may observe continuing decoder flow, but its PTS
+    cannot match the requested target, so the generation must still be
+    treated as unconfirmed."""
 
     def setUp(self):
         self.engine, self.temp_dir, self.track, self.log_item = _gated_seek_fixture()
@@ -896,7 +941,7 @@ class AcceptedUnconfirmedTests(TransactionTestCase):
         deck = self.engine.decks["A"]
         # Overridden immediately -- see the same race note in
         # GatedSeekRejectionTests: _dispatch_gated_seek_call fires the
-        # instant the block probe's first hit is observed, which can
+        # instant the initial readiness observer's first hit is seen, which can
         # happen before a test-side wait for a later phase would ever
         # get scheduled.
         deck.pipeline.seek_simple = lambda *a, **kw: True  # accepts, but performs no real seek
@@ -1211,7 +1256,7 @@ class MixedLifecycleStressTests(TransactionTestCase):
                     deck = self.engine.decks.get(slot)
                     if deck is not None:
                         self.assertTrue(
-                            _pump_until_seek_resolved(self.engine, deck, timeout=5.0),
+                            _pump_until_slot_seek_resolved(self.engine, slot, timeout=5.0),
                             f"cycle {i} ({op}) never resolved: {self._snapshot()}",
                         )
                     if op == "rapid_seek":
@@ -1224,7 +1269,7 @@ class MixedLifecycleStressTests(TransactionTestCase):
                         deck = self.engine.decks.get(slot)
                         if deck is not None:
                             self.assertTrue(
-                                _pump_until_seek_resolved(self.engine, deck, timeout=5.0),
+                                _pump_until_slot_seek_resolved(self.engine, slot, timeout=5.0),
                                 f"cycle {i} (rapid_seek #2) never resolved: {self._snapshot()}",
                             )
 
@@ -1273,7 +1318,7 @@ class MixedLifecycleStressTests(TransactionTestCase):
                         deck = self.engine.decks.get(slot)
                         if deck is not None:
                             self.assertTrue(
-                                _pump_until_seek_resolved(self.engine, deck, timeout=5.0),
+                                _pump_until_slot_seek_resolved(self.engine, slot, timeout=5.0),
                                 f"cycle {i} (resume) never resolved: {self._snapshot()}",
                             )
 
@@ -1348,10 +1393,26 @@ class MixedLifecycleStressTests(TransactionTestCase):
         # even under active bus-draining, well after actual playback
         # has already recovered; not a regression this hardening pass
         # introduced, and not what this test is meant to verify.)
+        real_resolve = self.engine._resolve_gated_seek
+        confirmed = {}
+
+        def capture_final_resolution(deck, *, outcome):
+            if outcome == "accepted" and deck.gated_seek is not None:
+                confirmed["pts"] = deck.gated_seek.get("confirmed_buffer_pts")
+            return real_resolve(deck, outcome=outcome)
+
+        self.engine._resolve_gated_seek = capture_final_resolution
         self.engine._seek_deck(slot, 2.0)
+        self.assertTrue(
+            _pump_until_slot_seek_resolved(self.engine, slot, timeout=5.0)
+        )
         final_deck = self.engine.decks.get(slot)
         self.assertIsNotNone(final_deck)
-        self.assertTrue(_pump_until_seek_resolved(self.engine, final_deck, timeout=5.0))
+        # Assert the held confirmation buffer itself, not a later live position
+        # query that advances while the GLib pump returns under suite load.
+        self.assertAlmostEqual(
+            confirmed["pts"] / Gst.SECOND, 2.0, delta=0.05
+        )
         ok, pos = final_deck.pipeline.query_position(Gst.Format.TIME)
         self.assertTrue(ok)
-        self.assertAlmostEqual(pos / Gst.SECOND, 2.0, delta=0.05)
+        self.assertGreaterEqual(pos, confirmed["pts"])
