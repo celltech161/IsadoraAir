@@ -122,7 +122,7 @@ class _SignalProbeEngine(PlaybackEngine):
     def _load_current_hour_log(self):
         return None
 
-    def _apply_resume_hint_queue_rewind(self):
+    def _install_resume_occurrence(self):
         return None
 
     def _restore_dedication_sequence_from_resume_hint(self):
@@ -152,7 +152,7 @@ def _disable_startup_callbacks(engine):
     engine._read_resume_hint = lambda: None
     engine._build_main_pipeline = lambda: None
     engine._load_current_hour_log = lambda: None
-    engine._apply_resume_hint_queue_rewind = lambda: None
+    engine._install_resume_occurrence = lambda: None
     engine._restore_dedication_sequence_from_resume_hint = lambda: None
     engine._reconcile_playback_duration_state = lambda: None
     engine._poll_position = lambda: GLib.SOURCE_CONTINUE

@@ -406,7 +406,7 @@ class ContinuationHourOrchestrationTests(TransactionTestCase):
         self.assertEqual(emitted, [])
         self.assertEqual(stand_in.current_log.id, midnight.id)
 
-    def test_same_day_restart_loads_prior_log_and_resume_hint_rewinds_last_item(self):
+    def test_same_day_restart_loads_prior_log_and_resume_hint_installs_last_item(self):
         first = self.make_track()
         last = self.make_track(duration=7200)
         prior, items = self.make_log(
@@ -425,9 +425,12 @@ class ContinuationHourOrchestrationTests(TransactionTestCase):
             "position": 5100.0,
             "log_item_id": items[-1].id,
         }
-        stand_in._apply_resume_hint_queue_rewind()
+        stand_in._install_resume_occurrence()
 
-        self.assertEqual(stand_in._queue_cursor, 1)
+        # The interrupted last item is a DIRECT resume item; the queue itself
+        # continues after it (nothing further in this log).
+        self.assertEqual(stand_in._resume_item.id, items[-1].id)
+        self.assertEqual(stand_in._queue_cursor, len(items))
         state = stand_in._current_hour_schedule_state(now)
         self.assertEqual(state["state"], "continuation")
         self.assertTrue(state["has_committed_playout"])
@@ -468,8 +471,9 @@ class ContinuationHourOrchestrationTests(TransactionTestCase):
 
         self.assertEqual(stand_in.current_log.id, prior.id)
         self.assertEqual(stand_in._queue_cursor, 1)
-        stand_in._apply_resume_hint_queue_rewind()
-        self.assertEqual(stand_in._queue_cursor, 0)
+        stand_in._install_resume_occurrence()
+        self.assertEqual(stand_in._resume_item.id, item.id)
+        self.assertEqual(stand_in._queue_cursor, 1)  # the queue resumes AFTER it
         self.assertEqual(stand_in.log_items[0].track_id, long_track.id)
         state = stand_in._current_hour_schedule_state(now)
         self.assertEqual(state["state"], "continuation")

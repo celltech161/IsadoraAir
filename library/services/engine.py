@@ -1443,6 +1443,28 @@ class Deck:
             self.media_buffer_count += 1
             self.last_media_buffer_monotonic = current
 
+    def program_gate_open(self):
+        """True only when nothing holds this generation's decoded audio back.
+
+        A gated seek/resume replacement intentionally lets decoded buffers
+        pile up behind a closed valve before its target is confirmed, so
+        ``media_buffer_count`` cannot prove program contribution for it.  The
+        gate is open only when no gated seek is unresolved AND the real valve
+        (if this generation has one) reports ``drop == False``.  Resolution
+        opens the valve before clearing ``gated_seek``, so both conditions
+        together are the explicit "confirmed and exposed" state.  Any doubt
+        (an unreadable valve) fails closed.
+        """
+        if self.gated_seek is not None:
+            return False
+        valve = self.seek_gate_valve
+        if valve is None:
+            return True
+        try:
+            return not bool(valve.get_property("drop"))
+        except Exception:
+            return False
+
     def activate_duration_segment(self, started_at, reason):
         """Enable program-buffer accounting exactly once for this generation."""
         with self._duration_lock:
@@ -1699,6 +1721,9 @@ class PlaybackEngine:
         self.current_log = None
         self.log_items = []
         self._queue_cursor = 0
+        # A validated interrupted occurrence waiting to be handed out ahead of
+        # the queue (see _install_resume_occurrence / _next_queue_item).
+        self._resume_item = None
         self._next_hour_peek = None
         self._next_hour_peek_at = 0.0
         self._last_live_extend_attempt = 0.0
@@ -1778,13 +1803,11 @@ class PlaybackEngine:
         # diagnose, so no sampler thread or diagnostic files are created.
         self._start_audio_gap_diagnostics()
         self._load_current_hour_log()
-        # If the resume hint carries a log_item_id that lives in the
-        # just-loaded queue, back the cursor up so that item loads
-        # first -- otherwise a mid-crossfade snapshot would resume at
-        # the deck-B item (cursor was already advanced past deck A's
-        # item at crossfade-time) and deck A's remaining audio would
-        # be skipped. See _apply_resume_hint_queue_rewind.
-        self._apply_resume_hint_queue_rewind()
+        # The interrupted occurrence is installed as a DIRECT resume item and
+        # the queue cursor is settled from the independently validated queue
+        # context -- the occurrence never becomes (or relocates) the active
+        # queue. See _install_resume_occurrence.
+        self._install_resume_occurrence()
         self._restore_dedication_sequence_from_resume_hint()
         # Only now is the current queue/forced continuation known. Reconcile
         # stale segments after that validation so an on-disk hint for a
@@ -4815,31 +4838,36 @@ class PlaybackEngine:
         now = timezone.localtime()
 
         # A fresh, independently validated resume hint is stronger startup
-        # evidence than the wall clock.  The interrupted occurrence can still
-        # belong to the preceding hour (or date) while its nominal successor's
-        # scheduled time is already in the past.  Load that exact approved log
-        # first; _apply_resume_hint_queue_rewind subsequently aligns its cursor
-        # to the exact LogItem.  Invalid/deleted/mismatched state never reaches
-        # this point because _read_resume_hint fails closed.
+        # evidence than the wall clock.  The ACTIVE QUEUE the previous engine
+        # had committed (``hint["queue"]``) is loaded -- which, after an early
+        # rollover, is NEWER than the interrupted occurrence's own log.  Only
+        # when no valid queue context exists does the occurrence's log serve
+        # as the queue.  The occurrence itself is installed separately
+        # (_install_resume_occurrence); it does not decide which log is active.
         hint = getattr(self, "_resume_hint", None)
-        hinted_log_id = hint.get("playlist_log_id") if hint else None
-        if hinted_log_id:
-            hinted_log = PlaylistLog.objects.filter(
-                id=hinted_log_id, status="approved"
-            ).first()
-            if hinted_log is not None:
+        if hint:
+            queue = hint.get("queue")
+            candidate_log_ids = []
+            if queue:
+                candidate_log_ids.append(queue["playlist_log_id"])
+            if hint.get("playlist_log_id"):
+                candidate_log_ids.append(hint["playlist_log_id"])
+            for log_id in dict.fromkeys(candidate_log_ids):
+                hinted_log = PlaylistLog.objects.filter(
+                    id=log_id, status="approved"
+                ).first()
+                if hinted_log is None:
+                    continue
                 self._load_log_for(hinted_log.date, hinted_log.hour)
-                if any(item.id == hint["log_item_id"] for item in self.log_items):
+                if self.current_log is not None and self.current_log.id == hinted_log.id:
                     print(
-                        "Startup resume log: selected approved log "
-                        f"{hinted_log.id} for interrupted log_item "
-                        f"{hint['log_item_id']} instead of wall-clock inference"
+                        "Startup resume queue: selected approved log "
+                        f"{hinted_log.id} ({'saved active queue' if queue and log_id == queue['playlist_log_id'] else 'occurrence log, no saved queue'}) "
+                        "instead of wall-clock inference"
                     )
                     return
-                print(
-                    "Startup resume log rejected after load: interrupted "
-                    f"log_item {hint['log_item_id']} is no longer present"
-                )
+            if candidate_log_ids:
+                print("Startup resume queue could not be loaded; falling back to wall clock")
                 self._resume_hint = None
 
         self._load_log_for(now.date(), now.hour)
@@ -4967,7 +4995,7 @@ class PlaybackEngine:
         # "played_at set" = "started airing".  This remains the safe
         # fallback when no trustworthy process snapshot exists.  A fresh,
         # independently validated resume record is applied afterward by
-        # _apply_resume_hint_queue_rewind and may deliberately realign this
+        # _install_resume_occurrence and may deliberately settle this
         # cursor to the exact interrupted, already-started occurrence.
         self._queue_cursor = 0
         for i, item in enumerate(self.log_items):
@@ -4991,6 +5019,10 @@ class PlaybackEngine:
         """
         if self.current_log is None:
             return False
+        # A restored interrupted occurrence that has not yet been handed to a
+        # deck is committed playout, even though it sits outside the queue.
+        if getattr(self, "_resume_item", None) is not None:
+            return True
         active_log_id = self.current_log.id
         with self._lock:
             decks = tuple(self.decks.values())
@@ -5919,6 +5951,28 @@ class PlaybackEngine:
         normal cursor/rollover walk -- the caller (_start_next_track)
         uses this to skip web-request scheduling/dedication-insertion
         for an item that's already been through that decision."""
+        # The interrupted occurrence restored at startup precedes EVERYTHING,
+        # including forced follow-ups, and is handed out exactly once. It is
+        # outside the queue, so no cursor moves; any forced copy of the same
+        # item (a dedication intro re-armed alongside its song) is dropped so
+        # the occurrence cannot air twice.
+        resume_item = getattr(self, "_resume_item", None)
+        if resume_item is not None:
+            self._resume_item = None
+            self._forced_next_items = [
+                i for i in self._forced_next_items if i.id != resume_item.id
+            ]
+            hint = getattr(self, "_resume_hint", None)
+            if hint and hint.get("log_item_id") == resume_item.id:
+                playable, reason = _log_item_playable(resume_item)
+                if self._is_poison_guarded(resume_item):
+                    self._resume_hint = None
+                elif playable:
+                    return resume_item, True
+                else:
+                    print(f"  Skipping resume occurrence id={resume_item.id}: {reason}")
+                    self._resume_hint = None
+
         # Forced items are checked FIRST, unconditionally -- see
         # _maybe_insert_dedication_intro/_restore_followup_for_intro for
         # why this is what makes a dedication's song survive an hour
@@ -6062,7 +6116,7 @@ class PlaybackEngine:
         # item (already-committed intro/follow-up pair placed by an
         # earlier splice, or an urgent alert) and on the resume path --
         # the LogItem about to be handed to _create_deck is one
-        # _apply_resume_hint_queue_rewind already rewound the cursor to,
+        # _install_resume_occurrence handed out directly,
         # meant to CONTINUE from a mid-play position -- not an "open
         # request slot." A swap here would replace log_item.track with a
         # different track, which then wouldn't match hint["track_id"] in
@@ -7327,6 +7381,8 @@ class PlaybackEngine:
             loaded = list(self.log_items or []) + list(
                 getattr(self, "_forced_next_items", []) or []
             )
+            if getattr(self, "_resume_item", None) is not None:
+                loaded.append(self._resume_item)
             resume_is_loadable = any(
                 item.id == resume_log_item_id
                 and getattr(getattr(item, "track", None), "id", None)
@@ -7632,9 +7688,15 @@ class PlaybackEngine:
         The last snapshot is already at most one 250 ms poll old during a
         crash, and graceful shutdown takes a final sample.  Subtract one poll
         interval rather than adding service downtime: a small replay overlap
-        is preferable to skipping audio.  Unknown media bounds fail safely to
-        the same track at zero.  Known bounds never seek at/past the effective
-        transition or duration boundary.
+        is preferable to skipping audio.
+
+        The hard ceiling is the media's own duration -- what can actually be
+        sought and played.  ``next_start_seconds`` is only the automation /
+        crossfade TRIGGER; a track legitimately plays past it (manual hold,
+        delayed handoff, an unmixed track), so it must never rewind a
+        recovered position.  What automation does after recovery remains the
+        engine's normal next-start logic.  An unknown duration means no safe
+        bound exists and fails safely to the same item at zero.
         """
         try:
             saved = float(saved_position)
@@ -7644,26 +7706,109 @@ class PlaybackEngine:
             raise ValueError("saved position is invalid")
 
         track = log_item.track
-        bounds = []
-        for value in (track.next_start_seconds, track.duration_seconds):
-            try:
-                number = float(value)
-            except (TypeError, ValueError):
-                continue
-            if math.isfinite(number) and number > 0:
-                bounds.append(number)
-
-        if not bounds:
+        try:
+            duration = float(track.duration_seconds)
+        except (TypeError, ValueError):
+            duration = None
+        if duration is None or not math.isfinite(duration) or duration <= 0:
             return 0.0, "same_item_zero_missing_duration"
 
-        effective_end = min(bounds)
-        latest_safe = max(0.0, effective_end - RESUME_END_GUARD_SECONDS)
-        target = max(0.0, saved - RESUME_REPLAY_OVERLAP_SECONDS)
-        target = min(target, latest_safe)
+        latest_safe = max(0.0, duration - RESUME_END_GUARD_SECONDS)
+        wanted = max(0.0, saved - RESUME_REPLAY_OVERLAP_SECONDS)
+        target = min(wanted, latest_safe)
         reason = "saved_position_with_overlap"
-        if target < max(0.0, saved - RESUME_REPLAY_OVERLAP_SECONDS):
-            reason = "clamped_before_effective_end"
+        if target < wanted:
+            reason = "clamped_before_media_end"
         return round(target, 3), reason
+
+    def _legacy_resume_candidate(self, data):
+        """Pick the interrupted occurrence from an r0098-format state file.
+
+        r0098 wrote per-deck ``track_id``/``log_item_id``/position but no deck
+        PlaylistLog identity and no ``actually_playing`` flag.  Only decks
+        whose LogItem the database shows as already aired are eligible (a
+        merely prepared successor never is), and -- matching the new policy --
+        the NEWEST air start wins.  Returns ``(candidate, other_item_ids)``
+        where ``other_item_ids`` are the remaining decks' LogItems (used only
+        to give prepared-but-unaired items back to the queue).  The deck's
+        PlaylistLog is NEVER taken from the top-level ``log_id``: that is the
+        active QUEUE and, during early rollover, a different log.
+        """
+        decks = data.get("decks") or {}
+        entries = []
+        for slot in SLOTS:
+            deck = decks.get(slot)
+            if not deck or deck.get("paused") or not deck.get("track_id"):
+                continue
+            try:
+                log_item_id = int(deck.get("log_item_id"))
+            except (TypeError, ValueError):
+                continue
+            entries.append((slot, deck, log_item_id))
+        if not entries:
+            return None, []
+        aired = dict(
+            LogItem.objects.filter(
+                id__in=[entry[2] for entry in entries], played_at__isnull=False,
+            ).values_list("id", "played_at")
+        )
+        eligible = [entry for entry in entries if entry[2] in aired]
+        if not eligible:
+            return None, []
+        slot, deck, log_item_id = max(
+            eligible, key=lambda entry: (aired[entry[2]], entry[2])
+        )
+        candidate = {
+            "slot": slot,
+            "track_id": deck.get("track_id"),
+            "log_item_id": log_item_id,
+            # Deliberately no playlist_log_id: derived from the LogItem row.
+            "saved_position": deck.get("position"),
+            "log_position": deck.get("log_position"),
+            "session_id": data.get("engine_session_id"),
+        }
+        others = [entry[2] for entry in entries if entry[2] != log_item_id]
+        return candidate, others
+
+    def _read_queue_context(self, data, occurrence_log, legacy_other_item_ids):
+        """Validate the previous process's ACTIVE QUEUE, independently of the
+        interrupted occurrence.  Returns a context dict or None.
+
+        New snapshots carry ``log_id`` + ``queue_resume_cursor`` +
+        ``queue_resume_next_log_item_id`` (identity, to detect a stale cursor);
+        an r0098 file only has ``log_id`` + ``queue_cursor``.  The queue log
+        must exist, be approved, and never be OLDER than the occurrence's own
+        log: an older queue must not replace a newer early-rollover queue.
+        """
+        try:
+            log_id = int(data.get("log_id"))
+        except (TypeError, ValueError):
+            return None
+        queue_log = PlaylistLog.objects.filter(id=log_id, status="approved").first()
+        if queue_log is None:
+            return None
+        if (queue_log.date, queue_log.hour) < (occurrence_log.date, occurrence_log.hour):
+            print(
+                "  Resume queue context rejected: saved queue log "
+                f"{queue_log.id} is older than the interrupted occurrence's log"
+            )
+            return None
+        has_identity = "queue_resume_next_log_item_id" in data
+        raw_cursor = data.get("queue_resume_cursor" if has_identity else "queue_cursor")
+        try:
+            cursor = int(raw_cursor)
+            if cursor < 0:
+                cursor = None
+        except (TypeError, ValueError):
+            cursor = None
+        return {
+            "playlist_log_id": queue_log.id,
+            "source": "snapshot" if has_identity else "legacy_r0098",
+            "has_identity": has_identity,
+            "cursor": cursor,
+            "next_log_item_id": data.get("queue_resume_next_log_item_id") if has_identity else None,
+            "prepared_item_ids": [] if has_identity else list(legacy_other_item_ids),
+        }
 
     def _read_resume_hint(self):
         """Load and independently validate the previous process's on-air item.
@@ -7671,13 +7816,18 @@ class PlaybackEngine:
         ``engine_state.json`` is the existing tmpfs durability boundary: it
         survives a service restart and disappears on reboot.  New snapshots
         carry one explicit ``resume`` record selected only from a deck with
-        authoritative air-start evidence.  The legacy r0098 deck fields are
-        accepted for the first upgrade restart, but receive the same database
-        validation here.  In both formats, PlaylistLog + LogItem + Track must
-        match an approved, playable, already-started occurrence; the queue
-        cursor and nominal scheduled time are never authority.
+        authoritative, program-visible air evidence.  The legacy r0098 deck
+        fields are accepted for the first upgrade restart, but receive the same
+        database validation here.
+
+        The OCCURRENCE (LogItem + Track, with its PlaylistLog DERIVED from the
+        database row and required to be approved) and the active QUEUE
+        (``hint["queue"]``) are separate facts: the queue the previous engine
+        had already committed for what follows is never inferred from the
+        occurrence's log or the wall clock.
         """
         self._resume_hint = None
+        self._resume_item = None
         try:
             if not STATE_PATH.is_file():
                 return
@@ -7691,6 +7841,7 @@ class PlaybackEngine:
                 )
                 return
 
+            legacy_other_item_ids = []
             resume = data.get("resume")
             if resume is not None:
                 if resume.get("version") != RESUME_STATE_VERSION:
@@ -7701,33 +7852,9 @@ class PlaybackEngine:
                     return
                 candidate = dict(resume)
             else:
-                # One-release compatibility for an r0098 state file.  Do not
-                # restore a merely paused/prepared deck; database played_at
-                # validation below is still mandatory.
-                candidates = []
-                for slot in SLOTS:
-                    deck = (data.get("decks") or {}).get(slot)
-                    if not deck or deck.get("paused") or not deck.get("track_id"):
-                        continue
-                    candidates.append({
-                        "slot": slot,
-                        "track_id": deck.get("track_id"),
-                        "log_item_id": deck.get("log_item_id"),
-                        "playlist_log_id": deck.get("playlist_log_id") or data.get("log_id"),
-                        "saved_position": deck.get("position"),
-                        "log_position": deck.get("log_position"),
-                        "is_dedication": deck.get("category") == "Dedications",
-                        "session_id": data.get("engine_session_id"),
-                    })
-                if not candidates:
+                candidate, legacy_other_item_ids = self._legacy_resume_candidate(data)
+                if candidate is None:
                     return
-                candidates.sort(key=lambda item: (
-                    not item["is_dedication"],
-                    item["log_position"] is None,
-                    item["log_position"] if item["log_position"] is not None
-                    else (item["log_item_id"] or 0),
-                ))
-                candidate = candidates[0]
 
             previous_session_id = candidate.get("session_id")
             if (
@@ -7739,23 +7866,28 @@ class PlaybackEngine:
 
             log_item_id = int(candidate["log_item_id"])
             track_id = int(candidate["track_id"])
-            playlist_log_id = int(candidate["playlist_log_id"])
             item = (
                 LogItem.objects.select_related("playlist_log", "track")
                 .filter(
                     id=log_item_id,
                     track_id=track_id,
-                    playlist_log_id=playlist_log_id,
                     playlist_log__status="approved",
                 )
                 .first()
             )
+            claimed_log_id = candidate.get("playlist_log_id")
+            if item is not None and claimed_log_id is not None:
+                # A new-format record states its PlaylistLog; it must agree
+                # with the database row.  An r0098 record has none to check.
+                if int(claimed_log_id) != item.playlist_log_id:
+                    item = None
             if item is None:
                 print(
                     "  Resume state rejected: PlaylistLog/LogItem/Track identity "
                     "no longer matches"
                 )
                 return
+            playlist_log_id = item.playlist_log_id
             if item.played_at is None:
                 print(
                     f"  Resume state rejected: log_item {item.id} was prepared/claimed "
@@ -7778,6 +7910,9 @@ class PlaybackEngine:
                 if data.get("transport") == "STOPPED"
                 else "recent_crash_snapshot"
             )
+            queue = self._read_queue_context(
+                data, item.playlist_log, legacy_other_item_ids
+            )
             self._resume_hint = {
                 "track_id": track_id,
                 "log_item_id": log_item_id,
@@ -7789,38 +7924,116 @@ class PlaybackEngine:
                 "state_age_seconds": age,
                 "previous_session_id": previous_session_id,
                 "capture_kind": capture_kind,
+                "queue": queue,
             }
             print(
                 "  Resume state accepted: "
                 f"log_item {log_item_id}, log {playlist_log_id}, track {track_id}, "
                 f"saved {float(saved_position):.1f}s -> seek {target:.1f}s, "
-                f"slot {candidate.get('slot')}, age {age:.1f}s, {capture_kind}"
+                f"slot {candidate.get('slot')}, age {age:.1f}s, {capture_kind}; "
+                f"queue log {queue['playlist_log_id'] if queue else 'unknown'} "
+                f"({queue['source'] if queue else 'none'})"
             )
         except Exception as exc:
             print(f"  Resume state read failed closed (non-fatal): {exc}")
 
-    def _apply_resume_hint_queue_rewind(self):
-        """Called AFTER _load_current_hour_log. If we have a resume
-        hint carrying a log_item_id, set the cursor to that exact item so it
-        loads first when _start_next_track fires.  Exact assignment matters:
-        a prior unplayed row must not pull the cursor backward, and an already
-        played interrupted row must not leave it advanced to N+1.  If the
-        validated occurrence disappeared after the read/load boundary, clear
-        the hint and retain the log loader's normal safe cursor."""
+    def _validated_saved_queue_cursor(self, queue):
+        """Cursor index in the loaded queue log from the saved queue context,
+        or None when it cannot be trusted (stale/mismatched identity)."""
+        items = self.log_items
+        count = len(items)
+        positions = {item.id: index for index, item in enumerate(items)}
+        if queue["has_identity"]:
+            next_id = queue["next_log_item_id"]
+            if next_id is None:
+                # The previous queue had nothing further in this log. Items
+                # appended since (live fill) begin at the saved cursor.
+                cursor = queue["cursor"]
+                return count if cursor is None else min(cursor, count)
+            index = positions.get(next_id)
+            if index is None:
+                return None
+            if items[index].played_at is not None:
+                # The saved "next" has already aired: stale cursor state.
+                return None
+            return index
+        cursor = queue["cursor"]
+        if cursor is None:
+            return None
+        cursor = min(cursor, count)
+        for item_id in queue["prepared_item_ids"]:
+            index = positions.get(item_id)
+            if index is not None and items[index].played_at is None:
+                cursor = min(cursor, index)
+        return cursor
+
+    def _install_resume_occurrence(self):
+        """Called AFTER _load_current_hour_log. Installs the validated
+        interrupted occurrence as a DIRECT resume item and settles the queue
+        cursor from the independently validated queue context.
+
+        The occurrence is never placed into, and never relocates, the active
+        queue: ``current_log``/``log_items`` stay the queue the previous
+        engine had committed (possibly an early-rollover log newer than the
+        occurrence's own).  ``_next_queue_item`` hands the resume item out
+        first; the queue then continues from the settled cursor, exactly once.
+        """
         hint = getattr(self, "_resume_hint", None)
+        self._resume_item = None
         if not hint or not hint.get("log_item_id"):
             return
-        if not hasattr(self, "log_items") or not self.log_items:
+        log_items = list(getattr(self, "log_items", None) or [])
+        occurrence_id = hint["log_item_id"]
+        item = next((i for i in log_items if i.id == occurrence_id), None)
+        if item is None:
+            item = (
+                LogItem.objects
+                .select_related(
+                    "playlist_log", "track", "track__artist", "track__album",
+                    "track__category", "track__category__kind",
+                    "category", "category__kind",
+                )
+                .filter(
+                    id=occurrence_id, track_id=hint["track_id"],
+                    playlist_log__status="approved",
+                )
+                .first()
+            )
+        if item is None or item.track_id != hint["track_id"]:
+            print(f"  Resume state rejected: log_item {occurrence_id} is no longer loadable")
+            self._resume_hint = None
             return
-        target = hint["log_item_id"]
-        for idx, item in enumerate(self.log_items):
-            if item.id == target:
-                previous = getattr(self, "_queue_cursor", 0)
-                self._queue_cursor = idx
-                print(f"  Resume queue cursor: aligning {previous} -> {idx}")
-                return
-        print(f"  Resume state rejected: log_item {target} disappeared from loaded queue")
-        self._resume_hint = None
+
+        current = self.current_log
+        same_log = current is not None and item.playlist_log_id == current.id
+        occurrence_index = (
+            next((i for i, q in enumerate(log_items) if q.id == occurrence_id), None)
+            if same_log else None
+        )
+        queue = hint.get("queue")
+        saved = None
+        if queue and current is not None and queue["playlist_log_id"] == current.id:
+            saved = self._validated_saved_queue_cursor(queue)
+
+        previous = getattr(self, "_queue_cursor", 0)
+        if (
+            saved is not None
+            and not (occurrence_index is not None and saved <= occurrence_index)
+        ):
+            cursor, source = saved, "saved_queue"
+        elif occurrence_index is not None:
+            cursor, source = occurrence_index + 1, "after_occurrence"
+        else:
+            cursor, source = previous, "unplayed_default"
+        self._queue_cursor = cursor
+        hint["queue_source"] = source
+        self._resume_item = item
+        print(
+            f"  Resume occurrence log_item {occurrence_id} (log {item.playlist_log_id}) "
+            f"installed directly; active queue log "
+            f"{current.id if current is not None else None} cursor {previous} -> "
+            f"{cursor} ({source})"
+        )
 
     # ------------------------------------------------------------------
     # FX bus (one-shot audio carts / hotkeys)
@@ -8987,7 +9200,7 @@ class PlaybackEngine:
 
     def _restore_dedication_sequence_from_resume_hint(self):
         """Startup-only -- called from start(), right after
-        _apply_resume_hint_queue_rewind(). Blanket try/except: an
+        _install_resume_occurrence(). Blanket try/except: an
         unhandled exception here would prevent the engine from starting
         at all over an optional recovery feature failing, categorically
         worse than just not recovering the pairing this one time.
@@ -13554,15 +13767,29 @@ class PlaybackEngine:
             eta += q_airtime
         return queue
 
-    def _build_resume_state(self, decks_out, *, captured_at, transport):
-        """Select one authoritative interrupted occurrence for restart.
+    @staticmethod
+    def _select_resume_deck(decks_out):
+        """The ONE occurrence a single-deck restart restores, or None.
 
-        ``played_at``/``actually_playing`` proves real program contribution;
-        a claimed or prepared N+1 is never eligible even though the in-memory
-        queue cursor already moved past it.  During the brief interval where
-        two decks genuinely contribute, Dedications retain their established
-        priority and otherwise the earlier queue position (the outgoing item)
-        wins, preventing its remaining audio from being skipped.
+        Policy (deterministic, listener-centred): only a deck that is
+        positively contributing program audio (``actually_playing``) is
+        eligible.  A claimed/prepared successor never is.  When two ordinary
+        program decks are BOTH genuinely airing (a true crossfade) the
+        NEWER/incoming occurrence wins -- the one whose air start is latest,
+        then the higher deck generation, then slot name.  A restart cannot
+        keep both decks, so the outgoing tail is the sacrificed audio; the
+        incoming occurrence has already begun airing and restoring it at its
+        own saved position neither replays nor skips its remainder.  The
+        outgoing item is never restored as well, so no logical occurrence is
+        emitted twice.
+
+        There is deliberately NO Dedications-first exception: a dedication
+        that is the incoming occurrence already wins by recency, and
+        preferring an outgoing dedication intro over its incoming paired song
+        would drop that song after only its crossfade entrance aired.  The
+        intro -> song pairing is still re-armed by
+        ``_restore_dedication_sequence_from_resume_hint`` whenever an intro
+        is the restored occurrence with its song not yet aired.
         """
         candidates = [
             deck for deck in decks_out.values()
@@ -13570,14 +13797,29 @@ class PlaybackEngine:
         ]
         if not candidates:
             return None
-        candidates.sort(key=lambda item: (
-            item.get("category") != "Dedications",
-            item.get("log_position") is None,
-            item.get("log_position")
-            if item.get("log_position") is not None
-            else item.get("log_item_id", 0),
-        ))
-        selected = candidates[0]
+
+        def newest_first(deck):
+            started = deck.get("air_started_at")
+            return (
+                started if started is not None else float("-inf"),
+                deck.get("generation") or 0,
+                deck.get("slot") or "",
+            )
+
+        return max(candidates, key=newest_first)
+
+    def _build_resume_state(self, decks_out, *, captured_at, transport):
+        """Serialize the interrupted occurrence (see ``_select_resume_deck``).
+
+        ``played_at``/``actually_playing`` proves real program contribution;
+        a claimed or prepared N+1 is never eligible even though the in-memory
+        queue cursor already moved past it.  This record describes ONLY the
+        media occurrence to recreate; which queue plays after it is persisted
+        separately (``queue_resume_*`` in the state file).
+        """
+        selected = self._select_resume_deck(decks_out)
+        if selected is None:
+            return None
         return {
             "version": RESUME_STATE_VERSION,
             "session_id": getattr(self, "_engine_session_id", None),
@@ -13593,6 +13835,38 @@ class PlaybackEngine:
             "saved_position": selected["position"],
             "media_buffers": selected.get("media_buffers", 0),
         }
+
+    def _queue_resume_context(self, snapshot, decks_out):
+        """The active queue as the NEXT process must rebuild it.
+
+        Independent of the interrupted occurrence: the occurrence may belong
+        to an older log than the queue (early rollover).  The queue's next
+        item is the first item not already committed to air, so a deck that
+        only PREPARED an item (not actually playing) returns that item to the
+        queue; ``queue_cursor`` itself has already moved past it.  Returns
+        ``(cursor, next_log_item_id)``; ``next_log_item_id`` is None when the
+        active log has nothing further.
+        """
+        current_log = self.current_log
+        if current_log is None:
+            return None, None
+        cursor = self._queue_cursor
+        positions = {item.id: index for index, item in enumerate(self.log_items)}
+        for slot, deck in snapshot.items():
+            entry = decks_out.get(slot)
+            log_item = getattr(deck, "log_item", None) if deck else None
+            if (
+                entry is None
+                or log_item is None
+                or entry.get("actually_playing")
+                or log_item.playlist_log_id != current_log.id
+            ):
+                continue
+            index = positions.get(log_item.id)
+            if index is not None:
+                cursor = min(cursor, index)
+        next_item = self.log_items[cursor] if 0 <= cursor < len(self.log_items) else None
+        return cursor, (next_item.id if next_item is not None else None)
 
     def _write_state(self, transport="PLAYING"):
         try:
@@ -13620,6 +13894,10 @@ class PlaybackEngine:
                     and not getattr(deck, "detached_from_mixer", False)
                     and getattr(deck, "mixer_pad", None) is not None
                     and media_buffers > 0
+                    # An unresolved gated seek decodes behind a closed valve:
+                    # buffers there are not program audio. Only a confirmed,
+                    # exposed generation is authoritative resume evidence.
+                    and deck.program_gate_open()
                 )
                 decks_out[slot] = {
                     "slot": slot,
@@ -13640,6 +13918,11 @@ class PlaybackEngine:
                     "log_item_id": log_item.id if log_item else None,
                     "log_position": log_item.position if log_item else None,
                     "generation": getattr(deck, "generation", None),
+                    "air_started_at": (
+                        log_item.played_at.timestamp()
+                        if log_item is not None and log_item.played_at is not None
+                        else None
+                    ),
                     "actually_playing": actually_playing,
                     "media_buffers": media_buffers,
                     "title": t.title,
@@ -13661,6 +13944,9 @@ class PlaybackEngine:
             # follow-up) and why the current-deck and future-queue
             # offsets use deliberately different formulas.
             queue = self._compute_queue_eta_state(snapshot)
+            queue_resume_cursor, queue_resume_next_id = self._queue_resume_context(
+                snapshot, decks_out
+            )
 
             captured_at = time.time()
             state = {
@@ -13671,6 +13957,11 @@ class PlaybackEngine:
                 ),
                 "queue": queue,
                 "queue_cursor": self._queue_cursor,
+                # Restart-only queue identity (see _queue_resume_context):
+                # ``log_id`` above is the ACTIVE QUEUE's log, which can be
+                # newer than the interrupted occurrence's own log.
+                "queue_resume_cursor": queue_resume_cursor,
+                "queue_resume_next_log_item_id": queue_resume_next_id,
                 "total_items": len(self.log_items),
                 "log_id": self.current_log.id if self.current_log else None,
                 "hour": self.current_log.hour if self.current_log else None,
