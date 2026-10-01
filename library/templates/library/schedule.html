@@ -305,6 +305,46 @@
   .content-picker { margin-bottom: .85rem; }
   .schedule-readonly .content-picker { opacity: .45; pointer-events: none; }
   .api-error { color: var(--danger); font-size: .8rem; margin-top: .4rem; min-height: 1em; }
+
+  /* --- 3.1C minute detail ---
+     An hour that holds explicit minute transitions is drawn in a neutral,
+     striped "detailed" style with a +N count instead of one content color, so
+     the overview never implies a single source owns the whole hour. */
+  .grid-cell .cell-label { pointer-events: none; }
+  .grid-cell.has-detail,
+  .mobile-hour-cell.has-detail,
+  .date-cell.has-detail {
+    background-color: #475569 !important;
+    background-image: repeating-linear-gradient(135deg, rgba(255,255,255,.16) 0 4px, rgba(0,0,0,.14) 4px 8px);
+  }
+  .detail-badge { font-size: .62rem; font-weight: 800; background: rgba(0,0,0,.45); border-radius: 999px; padding: 0 .3rem; margin-left: .25rem; }
+  .detail-badge:empty { display: none; }
+  .cell-detail-btn { position: absolute; top: 1px; right: 1px; width: 15px; height: 15px; line-height: 12px; padding: 0; border: 0; border-radius: 3px; background: rgba(0,0,0,.45); color: #fff; font-size: .62rem; cursor: pointer; opacity: .55; }
+  .grid-cell:hover .cell-detail-btn, .cell-detail-btn:focus { opacity: 1; }
+  .mobile-hour-cell .hour-detail-btn { margin-left: auto; background: rgba(0,0,0,.4); color: #fff; border: 1px solid rgba(255,255,255,.3); border-radius: 6px; padding: .22rem .5rem; font-size: .7rem; cursor: pointer; }
+  .hour-detail { margin-top: .85rem; background: var(--panel-bg); border: 1px solid var(--border-subtle); border-radius: 8px; padding: .75rem; }
+  .hour-detail[hidden] { display: none; }
+  .hour-detail-head { display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; justify-content: space-between; }
+  .hour-detail-head h3 { margin: 0; font-size: .95rem; }
+  .hour-detail-head button { background: var(--bg-dark); color: var(--text-main); border: 1px solid var(--border-subtle); border-radius: 6px; padding: .3rem .55rem; cursor: pointer; }
+  .hour-detail-help { color: var(--text-muted); font-size: .76rem; margin: .45rem 0; line-height: 1.4; }
+  .minute-grid { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); gap: 3px; }
+  .minute-cell { position: relative; min-height: 44px; padding: .2rem .15rem; border: 2px solid transparent; border-radius: 5px; background: rgba(15,23,42,.6); color: #fff; font-size: .62rem; font-weight: 700; cursor: pointer; text-align: center; overflow: hidden; }
+  .minute-cell .minute-num { display: block; font-size: .64rem; opacity: .85; }
+  .minute-cell .minute-name { display: block; font-size: .56rem; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .minute-cell.explicit { border-color: #fff; box-shadow: 0 0 0 1px #000 inset; }
+  .minute-cell.explicit::after { content: "●"; position: absolute; top: 1px; right: 3px; font-size: .5rem; }
+  .minute-cell.inherited-transition { border-color: rgba(255,255,255,.55); border-style: dashed; }
+  .minute-cell.none { color: var(--text-muted); }
+  .minute-cell.orphan { border-color: var(--danger); }
+  .minute-cell.kind-playlist { border-left: 3px dashed rgba(255,255,255,.6); }
+  .minute-cell:focus-visible { outline: 2px solid var(--accent); }
+  .hour-detail-segments { margin-top: .6rem; font-size: .76rem; color: var(--text-muted); }
+  .schedule-readonly .minute-cell { cursor: default; }
+  @media (max-width: 768px) {
+    .minute-grid { grid-template-columns: repeat(6, minmax(0, 1fr)); }
+    .minute-cell { min-height: 48px; }
+  }
 </style>
 {% endblock %}
 
@@ -410,9 +450,22 @@
 </div>
 
 <div id="dateSchedule" class="date-schedule">
-  <p class="profile-notice">Outlined cells are explicit overrides. Other populated cells are inherited from the weekly schedule.</p>
+  <p class="profile-notice">Outlined cells are explicit overrides. Other populated cells are inherited from the weekly schedule. Striped cells contain minute transitions &mdash; open Hour Detail to see them.</p>
   <div id="dateGrid" class="date-grid"></div>
 </div>
+
+<!-- Hour Detail: the sixty minute positions of one hour. Only explicit
+     transitions (marked) are stored; every other minute shows what the server
+     resolves as effective. -->
+<section id="hourDetail" class="hour-detail" aria-label="Hour detail" hidden>
+  <div class="hour-detail-head">
+    <h3 id="hourDetailTitle">Hour Detail</h3>
+    <button type="button" id="hourDetailClose" onclick="closeHourDetail()">Close</button>
+  </div>
+  <p class="hour-detail-help">Select a Rotation or Playlist above, then click a minute to start it there. The :00 minute is the hour&rsquo;s base assignment. Choose <em>Clear</em> and click a marked transition to remove only that transition. Only marked (&bull;) minutes are stored.</p>
+  <div id="minuteGrid" class="minute-grid" role="group" aria-label="Minutes 00 to 59"></div>
+  <div id="hourDetailSegments" class="hour-detail-segments"></div>
+</section>
 {% endblock %}
 
 {% block extra_js %}
@@ -453,10 +506,15 @@ let scheduleMode = 'weekly';
 let mobileDay = window.stationNowParts().weekday;
 
 const cells = {};
+// Number of explicit minute transitions (start_minute > 0) per weekly hour.
+const detailCounts = {};
 for (let d = 0; d < 7; d++) {
   cells[d] = {};
-  for (let h = 0; h < 24; h++) cells[d][h] = null;
+  detailCounts[d] = {};
+  for (let h = 0; h < 24; h++) { cells[d][h] = null; detailCounts[d][h] = 0; }
 }
+const DETAIL_COLOR = '#475569';
+let hourDetail = null;  // {mode: 'weekly'|'date', day, hour}
 
 // Store content info per cell for mobile rendering
 const cellRotations = {};
@@ -481,6 +539,15 @@ function getCookie(name) {
 
 function showError(message) {
   document.getElementById('apiError').textContent = message || '';
+}
+
+// Show the server's explanation (for example a base-hour conflict) instead of
+// silently ignoring a rejected schedule write.
+async function reportFailure(resp) {
+  let data = {};
+  try { data = await resp.json(); } catch (_) { /* no JSON body */ }
+  const blockers = data.blockers ? ` ${data.blockers.join('; ')}.` : '';
+  showError((data.error || `Request failed (${resp.status})`) + blockers);
 }
 
 async function apiRequest(url, options = {}) {
@@ -625,6 +692,7 @@ async function deleteProfile() {
 }
 
 async function setMode(mode) {
+  closeHourDetail();
   scheduleMode = mode;
   document.getElementById('weeklyModeButton').classList.toggle('selected', mode === 'weekly');
   document.getElementById('dateModeButton').classList.toggle('selected', mode === 'date');
@@ -681,6 +749,18 @@ function buildGrid() {
       const dow = DISPLAY_TO_DOW[d];
       cell.dataset.day = dow;
       cell.dataset.hour = h;
+      const label = document.createElement('span');
+      label.className = 'cell-label';
+      const badge = document.createElement('span');
+      badge.className = 'detail-badge';
+      const detailButton = document.createElement('button');
+      detailButton.type = 'button';
+      detailButton.className = 'cell-detail-btn';
+      detailButton.textContent = '\u22EF';
+      detailButton.title = 'Hour detail';
+      detailButton.setAttribute('aria-label', `Open hour detail for ${DAYS[d]} ${HOUR_LABELS[h]}`);
+      detailButton.addEventListener('click', event => { event.stopPropagation(); openHourDetail('weekly', dow, h); });
+      cell.append(label, badge, detailButton);
       cell.addEventListener('click', () => onCellClick(dow, h, cell));
       cell.addEventListener('contextmenu', (e) => {
         e.preventDefault();
@@ -695,16 +775,29 @@ function getCell(day, hour) {
   return document.querySelector(`.grid-cell[data-day="${day}"][data-hour="${hour}"]`);
 }
 
+// Draws one overview cell from the stored base assignment and the number of
+// explicit minute transitions. A detailed hour is neutral/striped with a +N
+// count so it never looks like one source owns the whole hour.
+function styleCell(cell) {
+  const day = parseInt(cell.dataset.day);
+  const hour = parseInt(cell.dataset.hour);
+  const info = cellRotations[day][hour];
+  const extra = detailCounts[day][hour] || 0;
+  cell.querySelector('.cell-label').textContent = info ? info.contentName : '';
+  cell.querySelector('.detail-badge').textContent = extra ? `+${extra}` : '';
+  cell.dataset.blockId = cells[day][hour] || '';
+  cell.classList.toggle('empty', !info && !extra);
+  cell.classList.toggle('has-detail', extra > 0);
+  cell.classList.toggle('kind-playlist', !!info && info.kind === 'playlist' && !extra);
+  cell.style.backgroundColor = extra ? DETAIL_COLOR : (info ? contentColor(info.kind, info.contentId) : '');
+}
+
 function fillCell(cell, kind, contentId, contentName, blockId) {
   const day = parseInt(cell.dataset.day);
   const hour = parseInt(cell.dataset.hour);
   cells[day][hour] = blockId;
   cellRotations[day][hour] = { kind, contentId, contentName };
-  cell.dataset.blockId = blockId || '';
-  cell.textContent = contentName;
-  cell.style.backgroundColor = contentColor(kind, contentId);
-  cell.classList.remove('empty');
-  cell.classList.toggle('kind-playlist', kind === 'playlist');
+  styleCell(cell);
 }
 
 function clearCellData(day, hour) {
@@ -716,11 +809,8 @@ function clearCell(cell) {
   const day = parseInt(cell.dataset.day);
   const hour = parseInt(cell.dataset.hour);
   clearCellData(day, hour);
-  cell.dataset.blockId = '';
-  cell.textContent = '';
-  cell.style.backgroundColor = '';
-  cell.classList.add('empty');
-  cell.classList.remove('kind-playlist');
+  detailCounts[day][hour] = 0;
+  styleCell(cell);
 }
 
 function flashCell(cell) {
@@ -752,7 +842,8 @@ async function onCellClick(day, hour, cell) {
     body: JSON.stringify(body),
   });
 
-  if (!resp.ok) return;
+  if (!resp.ok) { await reportFailure(resp); return; }
+  showError('');
 
   const data = await resp.json();
 
@@ -778,7 +869,8 @@ async function onCellClear(day, hour, cell) {
     headers: { 'X-CSRFToken': getCookie('csrftoken') },
   });
 
-  if (!resp.ok) return;
+  if (!resp.ok) { await reportFailure(resp); return; }
+  showError('');
 
   // Update desktop
   const desktopCell = getCell(day, hour);
@@ -834,6 +926,24 @@ function renderMobileHours() {
     name.textContent = info ? info.contentName : '';
     row.appendChild(name);
 
+    const extra = detailCounts[mobileDay][h] || 0;
+    if (extra) {
+      row.classList.add('has-detail');
+      row.classList.remove('empty', 'kind-playlist');
+      row.style.backgroundColor = DETAIL_COLOR;
+      const badge = document.createElement('span');
+      badge.className = 'detail-badge';
+      badge.textContent = `+${extra}`;
+      row.appendChild(badge);
+    }
+    const detailButton = document.createElement('button');
+    detailButton.type = 'button';
+    detailButton.className = 'hour-detail-btn';
+    detailButton.textContent = 'Detail';
+    detailButton.setAttribute('aria-label', `Open hour detail for ${HOUR_LABELS[h]}`);
+    detailButton.addEventListener('click', event => { event.stopPropagation(); openHourDetail('weekly', mobileDay, h); });
+    row.appendChild(detailButton);
+
     row.addEventListener('click', () => {
       if (selectedKind === null) {
         onCellClear(mobileDay, h, null);
@@ -851,6 +961,7 @@ async function loadSchedule() {
   if (!selectedProfile) return;
   for (let d = 0; d < 7; d++) {
     for (let h = 0; h < 24; h++) {
+      detailCounts[d][h] = 0;
       const cell = getCell(d, h);
       if (cell) clearCell(cell); else clearCellData(d, h);
     }
@@ -859,7 +970,11 @@ async function loadSchedule() {
   if (!resp.ok) return;
 
   const data = await resp.json();
+  // Explicit minute transitions (start_minute > 0) are only COUNTED here; the
+  // hour cell itself always shows the :00 base. Which source is effective at
+  // any minute is resolved by the server (Hour Detail), never in this script.
   for (const block of data.blocks) {
+    if (block.start_minute) { detailCounts[block.day_of_week][block.start_hour] += 1; continue; }
     const desktopCell = getCell(block.day_of_week, block.start_hour);
     if (desktopCell) {
       fillCell(desktopCell, block.content_kind, block.content_id, block.content_name, block.id);
@@ -872,6 +987,7 @@ async function loadSchedule() {
       };
     }
   }
+  document.querySelectorAll('.grid-cell').forEach(styleCell);
   renderMobileHours();
   // Mobile hour cells don't exist until this async load finishes, so the
   // DOMContentLoaded handler's call to highlightNow() almost always runs
@@ -890,12 +1006,18 @@ async function loadDateSchedule() {
     grid.innerHTML = '';
     data.cells.forEach(cell => {
       const node = document.createElement('div');
-      node.className = `date-cell ${cell.origin === 'date_override' ? 'override' : ''}`;
+      node.className = `date-cell ${cell.origin === 'date_override' ? 'override' : ''} ${cell.detail_count ? 'has-detail' : ''}`;
       const effective = cell.effective_block;
-      if (effective) node.style.backgroundColor = contentColor(effective.content_kind, effective.content_id);
+      if (effective && !cell.detail_count) node.style.backgroundColor = contentColor(effective.content_kind, effective.content_id);
       const origin = cell.origin === 'date_override' ? 'Date override' : (cell.origin === 'weekly' ? 'Inherited weekly' : 'No schedule');
-      node.innerHTML = `<span class="date-hour">${HOUR_LABELS[cell.hour]}</span><span class="date-name">${effective ? escapeHtml(effective.content_name) : 'Empty'}</span><span class="origin">${origin}</span>`;
+      const detailNote = cell.detail_count ? `<span class="detail-badge">+${cell.detail_count}</span>` : '';
+      node.innerHTML = `<span class="date-hour">${HOUR_LABELS[cell.hour]}${detailNote}</span><span class="date-name">${effective ? escapeHtml(effective.content_name) : 'Empty'}</span><span class="origin">${origin}</span>`;
       node.addEventListener('click', () => assignDateCell(cell.hour));
+      const detailButton = document.createElement('button');
+      detailButton.type = 'button';
+      detailButton.textContent = 'Hour detail';
+      detailButton.addEventListener('click', event => { event.stopPropagation(); openHourDetail('date', null, cell.hour); });
+      node.appendChild(detailButton);
       if (cell.explicit_block_id) {
         const button = document.createElement('button');
         button.type = 'button';
@@ -944,6 +1066,115 @@ async function revertDateCell(blockId) {
   } catch (error) { showError(error.message); }
 }
 
+// --- Hour Detail (3.1C) ---
+// The server resolves every minute (layering, inheritance, base-hour rules);
+// this script only renders the response and sends exact-minute writes.
+function hourDetailQuery() {
+  const base = `profile=${encodeURIComponent(selectedProfile.uuid)}&hour=${hourDetail.hour}`;
+  return hourDetail.mode === 'date'
+    ? `${base}&date=${encodeURIComponent(document.getElementById('overrideDate').value)}`
+    : `${base}&day_of_week=${hourDetail.day}`;
+}
+
+async function openHourDetail(mode, day, hour) {
+  if (!selectedProfile) return;
+  hourDetail = {mode, day, hour};
+  document.getElementById('hourDetail').hidden = false;
+  await refreshHourDetail();
+  document.getElementById('hourDetail').scrollIntoView({block: 'nearest', behavior: 'smooth'});
+}
+
+function closeHourDetail() {
+  hourDetail = null;
+  document.getElementById('hourDetail').hidden = true;
+}
+
+async function refreshHourDetail() {
+  if (!hourDetail || !selectedProfile) return;
+  try {
+    const data = await apiRequest(`/api/schedule/hour-detail/?${hourDetailQuery()}`);
+    renderHourDetail(data);
+  } catch (error) { showError(error.message); }
+}
+
+function renderHourDetail(data) {
+  const dayName = hourDetail.mode === 'weekly' ? DAYS[DISPLAY_TO_DOW.indexOf(hourDetail.day)] : data.date;
+  const modeName = hourDetail.mode === 'weekly' ? 'Weekly' : 'Date Override';
+  document.getElementById('hourDetailTitle').textContent = `Hour Detail \u2014 ${dayName} ${HOUR_LABELS[hourDetail.hour]} (${modeName})`;
+  const grid = document.getElementById('minuteGrid');
+  grid.innerHTML = '';
+  data.minutes.forEach(entry => {
+    const cell = document.createElement('button');
+    cell.type = 'button';
+    cell.dataset.minute = entry.minute;
+    const effective = entry.effective_block;
+    cell.className = 'minute-cell'
+      + (entry.explicit_block_id ? ' explicit' : '')
+      + (entry.inherited_transition ? ' inherited-transition' : '')
+      + (entry.orphan ? ' orphan' : '')
+      + (effective ? '' : ' none')
+      + (effective && effective.content_kind === 'playlist' ? ' kind-playlist' : '');
+    if (effective) cell.style.backgroundColor = contentColor(effective.content_kind, effective.content_id);
+    const originText = entry.origin === 'date_override' ? 'date override' : (entry.origin === 'weekly' ? 'weekly' : 'empty');
+    const kindText = entry.explicit_block_id ? 'explicit transition' : (entry.inherited_transition ? 'inherited transition' : originText);
+    cell.title = `:${String(entry.minute).padStart(2, '0')} \u2014 ${effective ? effective.content_name : 'empty'} (${kindText})`;
+    cell.setAttribute('aria-label', cell.title);
+    const number = document.createElement('span');
+    number.className = 'minute-num';
+    number.textContent = `:${String(entry.minute).padStart(2, '0')}`;
+    cell.appendChild(number);
+    if (effective && (entry.segment_start || entry.explicit_block_id)) {
+      const name = document.createElement('span');
+      name.className = 'minute-name';
+      name.textContent = effective.content_name;
+      cell.appendChild(name);
+    }
+    cell.addEventListener('click', () => onMinuteClick(entry));
+    grid.appendChild(cell);
+  });
+  const origins = {weekly: 'weekly', date_override: 'date override'};
+  document.getElementById('hourDetailSegments').textContent = data.segments.length
+    ? 'Effective: ' + data.segments.map(s => `${s.start_time} ${s.block.content_name} (${origins[s.origin] || s.origin})`).join('  \u2192  ')
+    : 'No effective assignment at :00 \u2014 this hour is not scheduled.';
+}
+
+async function onMinuteClick(entry) {
+  if (!hourDetail || !selectedProfile || selectedProfile.is_archived) return;
+  if (selectedKind === null) {
+    // "Clear" is selected: remove exactly the explicit transition at this minute.
+    if (!entry.explicit_block_id) {
+      showError(`There is no explicit transition at :${String(entry.minute).padStart(2, '0')} to clear.`);
+      return;
+    }
+    try {
+      const dateQuery = hourDetail.mode === 'date' ? `&date=${encodeURIComponent(document.getElementById('overrideDate').value)}` : '';
+      await apiRequest(`/api/schedule/${entry.explicit_block_id}/?profile=${encodeURIComponent(selectedProfile.uuid)}${dateQuery}`, {
+        method: 'DELETE', headers: {'X-CSRFToken': getCookie('csrftoken')},
+      });
+      showError('');
+      await afterMinuteWrite();
+    } catch (error) { showError(error.message); }
+    return;
+  }
+  const body = {profile_uuid: selectedProfile.uuid, hour: hourDetail.hour, minute: entry.minute};
+  if (hourDetail.mode === 'date') body.specific_date = document.getElementById('overrideDate').value;
+  else body.day_of_week = hourDetail.day;
+  body[selectedKind === 'playlist' ? 'playlist_id' : 'rotation_id'] = selectedContentId;
+  try {
+    await apiRequest('/api/schedule/', {
+      method: 'POST', headers: {'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken')},
+      body: JSON.stringify(body),
+    });
+    showError('');
+    await afterMinuteWrite();
+  } catch (error) { showError(error.message); }
+}
+
+async function afterMinuteWrite() {
+  await refreshHourDetail();
+  if (scheduleMode === 'date') await loadDateSchedule(); else await loadSchedule();
+}
+
 // Color the palette buttons
 document.addEventListener('DOMContentLoaded', () => {
   document.querySelectorAll('.rotation-btn[data-rotation-id]').forEach(btn => {
@@ -960,9 +1191,10 @@ document.addEventListener('DOMContentLoaded', () => {
   buildGrid();
   buildDayPicker();
   document.getElementById('overrideDate').value = stationIsoDate();
-  document.getElementById('overrideDate').addEventListener('change', loadDateSchedule);
+  document.getElementById('overrideDate').addEventListener('change', () => { closeHourDetail(); loadDateSchedule(); });
   document.getElementById('profileSelect').addEventListener('change', async event => {
     selectedProfile = profiles.find(profile => profile.uuid === event.target.value);
+    closeHourDetail();
     updateProfileChrome();
     if (scheduleMode === 'date') await loadDateSchedule(); else await loadSchedule();
   });
