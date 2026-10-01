@@ -528,19 +528,71 @@ class EarlyRolloverQueueSeparationTests(TwoHourFixture):
         self.assertEqual(payload["queue_resume_cursor"], 0)
         self.assertEqual(payload["queue_resume_next_log_item_id"], self.x_items[0].id)
 
-    def test_a_stale_saved_next_item_falls_back_to_after_the_occurrence(self):
-        # Saved "next" names an item that already aired: untrustworthy.
-        self.item_next.played_at = timezone.now()
-        self.item_next.save(update_fields=["played_at"])
+    def test_successor_that_aired_after_the_last_snapshot_never_replays(self):
+        """The real race: snapshot says N on air with N+1 next; N+1 then begins
+        airing (played_at commits) and the engine dies before the next state
+        write.  Recovery rejects the stale saved identity, resumes N, and the
+        queue continues at N+2 -- N+1 is never handed out again."""
         self.write_resume_state(
             queue_log=self.log, queue_resume_cursor=1,
             queue_resume_next_id=self.item_next.id,
         )
+        # AFTER the snapshot was written:
+        self.item_next.played_at = timezone.now()
+        self.item_next.save(update_fields=["played_at"])
+        engine = self.engine()
+
+        self.recover(engine)
+
+        self.assertEqual(engine._resume_hint["queue"]["next_log_item_id"], self.item_next.id)
+        self.assertIsNone(engine._validated_saved_queue_cursor(engine._resume_hint["queue"]))  # rejected
+        self.assertEqual(engine._resume_hint["queue_source"], "after_occurrence")
+        self.assertEqual(engine._resume_item.id, self.item_n.id)
+        self.assertEqual(engine._queue_cursor, 2)  # N+2, not N+1
+        # Drive the real next-item path to exhaustion of this log.
+        handed_out = []
+        while True:
+            item, _forced = engine._next_queue_item()
+            if item is None or item.playlist_log_id != self.log.id:
+                break
+            handed_out.append(item.id)
+        self.assertEqual(handed_out, [self.item_n.id, self.item_n2.id])
+        self.assertNotIn(self.item_next.id, handed_out)
+
+    def test_stale_successor_race_through_the_real_start_path(self):
+        self.write_resume_state(
+            queue_log=self.log, queue_resume_cursor=1,
+            queue_resume_next_id=self.item_next.id,
+        )
+        self.item_next.played_at = timezone.now()
+        self.item_next.save(update_fields=["played_at"])
         engine = self.engine()
         self.recover(engine)
-        self.assertEqual(engine._resume_hint["queue_source"], "after_occurrence")
+        created = self.start_tracks(engine, 2)
+        self.assertEqual(created, [(self.item_n.id, True), (self.item_n2.id, False)])
+
+    def test_a_genuinely_unplayed_successor_still_follows_the_occurrence(self):
+        # No usable saved identity, N+1 never aired: the safe cursor is N+1.
+        self.write_resume_state(queue_log=self.log)
+        engine = self.engine()
+        self.recover(engine)
+        created = self.start_tracks(engine, 3)
+        self.assertEqual([i for i, _ in created], [self.item_n.id, self.item_next.id, self.item_n2.id])
+
+    def test_the_fallback_never_moves_behind_the_resumed_occurrence(self):
+        # A strange unplayed row positioned BEFORE N: the loader's cursor
+        # points at it, but recovery must continue after N and never hand it out.
+        early_track = self.make_track("Strange Earlier Row")
+        early = self.make_item(
+            10, early_track, played_at=None, scheduled_time=timezone.now() - timedelta(minutes=5),
+        )
+        self.write_resume_state(queue_log=self.log)
+        engine = self.engine()
+        self.recover(engine)
+        self.assertEqual(engine.log_items[engine._queue_cursor].id, self.item_next.id)
         created = self.start_tracks(engine, 2)
         self.assertEqual([i for i, _ in created], [self.item_n.id, self.item_next.id])
+        self.assertNotIn(early.id, [i for i, _ in created])
 
     def test_a_saved_cursor_at_or_before_the_occurrence_cannot_replay_it(self):
         self.write_resume_state(
@@ -740,6 +792,19 @@ class LegacyR0098UpgradeStateTests(TwoHourFixture):
         self.assertEqual(engine._resume_hint["log_item_id"], self.item_next.id)
         created = self.start_tracks(engine, 2)
         self.assertEqual([i for i, _ in created], [self.item_next.id, self.item_n2.id])
+
+    def test_legacy_successor_that_aired_after_the_snapshot_never_replays(self):
+        # r0098 wrote queue_cursor=1 (N+1) and cannot be identity-checked; N+1
+        # then aired before the crash.  The loader's first-unplayed cursor wins.
+        self.state_path.write_text(json.dumps(self.legacy_payload(
+            deck_a=self.legacy_deck(self.item_n), log_id=self.log.id, queue_cursor=1,
+        )), encoding="utf-8")
+        self.item_next.played_at = timezone.now()
+        self.item_next.save(update_fields=["played_at"])
+        engine = self.engine()
+        self.recover(engine)
+        created = self.start_tracks(engine, 2)
+        self.assertEqual(created, [(self.item_n.id, True), (self.item_n2.id, False)])
 
     def test_legacy_same_log_state_still_resumes_exactly(self):
         self.state_path.write_text(json.dumps(self.legacy_payload(

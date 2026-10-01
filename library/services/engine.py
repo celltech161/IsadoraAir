@@ -8015,14 +8015,23 @@ class PlaybackEngine:
         if queue and current is not None and queue["playlist_log_id"] == current.id:
             saved = self._validated_saved_queue_cursor(queue)
 
+        # ``previous`` is _load_log_for's safe cursor: the first item whose
+        # played_at is still NULL.  Nothing below may ever move the queue
+        # BACKWARD from it -- an item that began airing after the last state
+        # snapshot (its played_at has since committed) must not air again.
         previous = getattr(self, "_queue_cursor", 0)
         if (
             saved is not None
             and not (occurrence_index is not None and saved <= occurrence_index)
         ):
-            cursor, source = saved, "saved_queue"
+            # A validated saved cursor can only trail the loader's when it was
+            # not identity-checked (an r0098 file): clamp it forward.
+            cursor, source = max(saved, previous), "saved_queue"
         elif occurrence_index is not None:
-            cursor, source = occurrence_index + 1, "after_occurrence"
+            # Saved identity unusable: continue after the resumed occurrence
+            # (handed out directly, exactly once) but never behind the safe
+            # first-unplayed cursor.
+            cursor, source = max(previous, occurrence_index + 1), "after_occurrence"
         else:
             cursor, source = previous, "unplayed_default"
         self._queue_cursor = cursor
