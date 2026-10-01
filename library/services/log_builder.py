@@ -1751,20 +1751,25 @@ def _plan_hour(target_date, hour, plans, target_duration_seconds, observer=None)
     # generated LogItems retain their true wall-clock eligibility boundary.
     # When clock-drift recovery starts after that transition, nominal_start
     # is negative and the build correctly begins immediately at offset zero.
-    first_applicable_start = next(
-        (nominal_start for plan, nominal_start, _end, elapsed in windows
+    first_applicable = next(
+        ((plan, nominal_start) for plan, nominal_start, _end, elapsed in windows
          if not elapsed and not plan.empty),
-        0.0,
+        None,
     )
+    first_applicable_start = first_applicable[1] if first_applicable else 0.0
     ctx.accumulated_seconds = max(0.0, first_applicable_start)
-    if plans and plans[0].start_minute > 0:
+    if plans and plans[0].start_minute > 0 and first_applicable:
         # `_segment_windows` uses a build-relative clock when an upcoming
         # hour is projected to start late. Keep selection on that clock, but
-        # shift persisted timestamps back onto the real wall clock: a 11:30
-        # takeover built for an 11:05 projected start is still 11:30, not
-        # 11:25. If projected start is already 11:40, its first item is 11:40.
+        # shift persisted timestamps back onto the real wall-clock transition:
+        # a 11:30 takeover remains 11:30 whether the projected start is 11:05
+        # or 11:40. If that segment is wholly elapsed, use the next applicable
+        # segment's own transition instead. This timestamp is also the durable
+        # no-early-play eligibility boundary for the approved partial log.
+        first_plan, _nominal_start = first_applicable
         ctx.scheduled_time_offset_seconds = max(
-            0.0, NOMINAL_HOUR_SECONDS - target_duration_seconds,
+            0.0,
+            first_plan.start_minute * 60 - ctx.accumulated_seconds,
         )
     records = []
     for plan, nominal_start, end, elapsed in windows:

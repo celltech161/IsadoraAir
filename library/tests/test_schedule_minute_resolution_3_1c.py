@@ -717,14 +717,54 @@ class CombinedHourBuilderTests(BuilderFixtures, TransactionTestCase):
     def test_partial_takeover_timestamp_survives_clock_drift_projection(self):
         self.schedule(10, (30, self.rot_b))
         hour_start = timezone.make_aware(datetime.combine(MONDAY, time(10, 0)))
-        for target, expected_offset in ((3300.0, 1800.0), (1200.0, 2400.0)):
+        for target in (3300.0, 1200.0):
             with self.subTest(target_duration_seconds=target):
                 preview, error = preview_hour_log(
                     MONDAY, 10, target_duration_seconds=target,
                 )
                 self.assertIsNone(error)
                 first = datetime.fromisoformat(preview["items"][0]["scheduled_time"])
-                self.assertEqual((first - hour_start).total_seconds(), expected_offset)
+                self.assertEqual((first - hour_start).total_seconds(), 1800.0)
+
+    def test_late_projection_uses_the_first_nonelapsed_transition_as_takeover(self):
+        self.schedule(10, (20, self.rot_b), (45, self.rot_a))
+        hour_start = timezone.make_aware(datetime.combine(MONDAY, time(10, 0)))
+        preview, error = preview_hour_log(
+            MONDAY, 10, target_duration_seconds=600.0,
+        )
+        self.assertIsNone(error)
+        self.assertTrue(preview["segments"][0]["elapsed_before_start"])
+        first = datetime.fromisoformat(preview["items"][0]["scheduled_time"])
+        self.assertEqual((first - hour_start).total_seconds(), 2700.0)
+
+    def test_late_projected_partial_log_becomes_engine_eligible_exactly_at_the_transition(self):
+        """Builder and engine meet here: the engine's no-early-play gate reads
+        the approved log's first persisted scheduled_time, so a late projection
+        must never push that boundary past the real transition (which would
+        delay queue ownership) nor before it (which would allow early play)."""
+        from library.services.engine import PlaybackEngine
+
+        def at(hour, minute, second=0):
+            return timezone.make_aware(datetime.combine(MONDAY, time(hour, minute, second)))
+
+        scenarios = (
+            # (hour, schedule entries, projected target, takeover minute)
+            (10, ((30, self.rot_b),), 3300.0, 30),                       # projected start 10:05, before takeover
+            (11, ((30, self.rot_b),), 1200.0, 30),                       # projected start 10:40-style: after takeover
+            (12, ((20, self.rot_b), (45, self.rot_a)), 600.0, 45),       # first segment wholly elapsed
+        )
+        for hour, entries, target, takeover_minute in scenarios:
+            with self.subTest(hour=hour, target=target, takeover=takeover_minute):
+                self.schedule(hour, *entries)
+                log, error = build_hour_log(MONDAY, hour, target_duration_seconds=target)
+                self.assertIsNone(error)
+                items = list(log.items.order_by("position"))
+                just_before = at(hour, takeover_minute - 1, 59)
+                eligible, takeover_at = PlaybackEngine._log_queue_eligibility(log, items, just_before)
+                self.assertFalse(eligible, "a partial log must not be playable before its transition")
+                self.assertEqual(takeover_at, at(hour, takeover_minute))
+                eligible, _ = PlaybackEngine._log_queue_eligibility(log, items, at(hour, takeover_minute))
+                self.assertTrue(eligible, "...and must be playable AT its transition, not later")
 
     def test_approved_partial_log_is_reused_after_schedule_changes(self):
         self.schedule(10, (30, self.rot_b))
