@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "release_id": "r0097",
+  "previous_release_id": "r0096",
+  "minimum_updater_protocol_version": 5,
+  "summary": "3.1B Schedule Profile & Date Override Workflow. /schedule/ gains named schedule profiles (create, edit, clone, activate with a concurrency check, archive/restore, guarded delete), explicit editing of inactive profiles, and one-date overrides with weekly inheritance and Revert to Weekly. Existing logs and their profile provenance are untouched; nothing is rebuilt automatically. No migrations, requirements, packages, systemd units, static assets, nginx, engine or protected-runtime changes.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-gunicorn"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0081",
+  "protected_runtime": null
+}
