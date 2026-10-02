@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "release_id": "r0103",
+  "previous_release_id": "r0102",
+  "minimum_updater_protocol_version": 5,
+  "summary": "Playback recovery now lands seek, pause/resume and engine-restart playback at the correct media position by using GStreamer segment running time, and hardens seek/resume format negotiation including FLAC recovery. The engine also caches approved schedule authority off the 250 ms poll path while preserving immutable takeover boundaries and bounded monotonic revalidation. No migrations, packages, systemd, nginx, static or protected-runtime changes. Engine restart only.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-engine"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0081",
+  "protected_runtime": null
+}
