@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "release_id": "r0101",
+  "previous_release_id": "r0100",
+  "minimum_updater_protocol_version": 5,
+  "summary": "3.1E adds partial-hour scheduling: an hour may continue the prior program until a later minute transition, then hand future queue ownership to the approved partial-hour log without hard-cutting the playing track. Approved takeover boundaries remain immutable across later schedule edits and poison-skip recovery. No migrations, requirements/packages, systemd, nginx, static or protected-runtime changes. Gunicorn and the engine restart.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-gunicorn",
+    "isadoraair-engine"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0081",
+  "protected_runtime": null
+}
