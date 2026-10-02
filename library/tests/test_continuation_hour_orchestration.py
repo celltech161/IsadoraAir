@@ -392,7 +392,13 @@ class ContinuationHourOrchestrationTests(TransactionTestCase):
         emitted, _thread = self.run_tick(stand_in, self.fake_now(FRIDAY, 11, 2))
         self.assertEqual(stand_in.current_log.id, ordinary.id)
         self.assertEqual([item.id for item in stand_in.log_items], [second.id])
-        self.assertEqual(emitted, [])
+        # No scheduling warning. The one-time poison refusal is reported where
+        # the item is actually refused -- queue materialization -- now that the
+        # (r0103) cached authority no longer loads items at all.
+        poison = [e for e in emitted if "poison" in e["title"].lower()]
+        self.assertEqual([e for e in emitted if e not in poison], [])
+        self.assertEqual([e["detail"]["log_item_id"] for e in poison], [first.id])
+        self.assertEqual(poison[0]["detail"]["source"], "materialization")
 
     def test_an_all_poisoned_partial_log_keeps_its_boundary_and_replays_nothing(self):
         stand_in, old_log = self.idle_engine_on_exhausted_old_log()

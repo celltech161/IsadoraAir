@@ -5,6 +5,7 @@ import os
 import signal
 import socket
 import threading
+import dataclasses
 import time
 import traceback
 import uuid
@@ -1339,6 +1340,48 @@ class RemoteDJSession:
         self.quality_sampler_source_id = 0
 
 
+# r0103 / 1.21 -- how long the high-frequency look-ahead may reuse the current
+# hour's schedule-authority record before re-reading it. Event-driven paths
+# (the 10 s orchestration tick, exhaustion/retry, built-hour install, reload
+# commands) always refresh it. Out-of-band admin approve/unapprove/rebuild are
+# not signalled to the engine, so this bound is what keeps the cache honest.
+SCHEDULE_AUTHORITY_REVALIDATE_SECONDS = 5.0
+# Cached look-ahead result meaning "nothing approved/playable for the target".
+# Distinct from None, which (everywhere) means "nothing cached".
+_NO_PEEK_CANDIDATE = object()
+
+
+@dataclasses.dataclass(frozen=True)
+class ScheduleAuthority:
+    """What the current wall hour's programming authority is, in memory.
+
+    ``source == "approved_log"``: an approved PlaylistLog owns the hour; its
+    durable boundary is the earliest PERSISTED in-hour scheduled_time (see
+    PlaybackEngine._log_queue_eligibility). Otherwise ``source == "schedule"``:
+    the live (pre-materialization) schedule resolution. Eligibility is always
+    recomputed from this record against the wall clock -- the record never
+    caches a decision, only the inputs that cannot change for a given log.
+    """
+    hour_key: tuple
+    source: str
+    log_id: int | None
+    first_scheduled: object | None
+    first_transition_minute: int | None
+    has_hour_schedule: bool
+    schedule_block: object | None
+    loaded_monotonic: float
+
+    def as_state(self, now_monotonic):
+        return {
+            "hour": f"{self.hour_key[0].isoformat()} {self.hour_key[1]:02d}",
+            "source": self.source,
+            "log_id": self.log_id,
+            "first_scheduled": self.first_scheduled.isoformat() if self.first_scheduled else None,
+            "first_transition_minute": self.first_transition_minute,
+            "age_seconds": round(now_monotonic - self.loaded_monotonic, 1),
+        }
+
+
 class Deck:
     def __init__(
         self,
@@ -1753,6 +1796,10 @@ class PlaybackEngine:
         self._next_hour_peek = None
         self._next_hour_peek_at = 0.0
         self._next_hour_peek_key = None
+        # r0103 / 1.21 -- in-memory ScheduleAuthority for the current wall
+        # hour (see _schedule_authority). Empty at startup: rebuilt from the
+        # approved PlaylistLog / live schedule on first use, never persisted.
+        self._schedule_authority_cache = None
         self._last_live_extend_attempt = 0.0
         self._live_fill_in_progress = False  # guarded by self._lock -- see _try_extend_live_log_async
         self._live_fill_generation = 0  # guarded by self._lock -- bumped on every dispatch, see _try_extend_live_log_async
@@ -5047,13 +5094,19 @@ class PlaybackEngine:
         # a partial takeover nor turn an ordinary hour into a partial one, and
         # an all-poisoned partial log stays partial until its own boundary.
         first_scheduled = PlaybackEngine._persisted_first_scheduled(log)
+        return PlaybackEngine._takeover_eligibility(log.date, log.hour, first_scheduled, wall_now)
+
+    @staticmethod
+    def _takeover_eligibility(log_date, log_hour, first_scheduled, wall_now):
+        """The single eligibility rule, from an approved log's identity and its
+        earliest persisted scheduled_time (None = no items)."""
         if first_scheduled is None:
             # Preserve the established meaning of an approved empty ordinary
             # log. Real partial builds cannot approve without a source item;
             # installation paths that require playout still reject empties.
             return True, None
         hour_start = timezone.make_aware(
-            datetime_cls.combine(log.date, datetime_time(log.hour, 0)),
+            datetime_cls.combine(log_date, datetime_time(log_hour, 0)),
             timezone.get_current_timezone(),
         )
         hour_end = hour_start + timedelta(hours=1)
@@ -5150,29 +5203,67 @@ class PlaybackEngine:
             for item in items
         )
 
-    def _approved_log_takeover(self, target_date, hour, wall_now):
-        """``(log, eligible, takeover_at)`` for one wall hour's APPROVED log,
-        or ``(None, None, None)`` when nothing is approved yet.
-
-        Deliberately light (this runs on the poll path during a continuation
-        window): only the fields the eligibility gate reads, filtered exactly
-        like every queue-materialization site so the classifier and the gate
-        always see the same item set.
-        """
-        log = (
+    def _load_schedule_authority(self, now):
+        """Read the current wall hour's authority from the database: one
+        aggregate query when an approved log exists (its id + earliest
+        persisted scheduled_time, before any poison filtering), otherwise the
+        live schedule resolution used before materialization."""
+        hour_key = (now.date(), now.hour)
+        approved = (
             PlaylistLog.objects
-            .filter(date=target_date, hour=hour, status="approved")
+            .filter(date=hour_key[0], hour=hour_key[1], status="approved")
+            .annotate(first_scheduled=Min("items__scheduled_time"))
+            .values_list("id", "first_scheduled")
             .first()
         )
-        if log is None:
-            return None, None, None
-        persisted = list(log.items.only("id", "playlist_log", "scheduled_time"))
-        self._remember_persisted_boundary(log, persisted)
-        items = self._apply_poison_skip(persisted)
-        eligible, takeover_at = self._log_queue_eligibility(log, items, wall_now)
-        return log, eligible, takeover_at
+        if approved is not None:
+            log_id, first_scheduled = approved
+            return ScheduleAuthority(
+                hour_key=hour_key, source="approved_log", log_id=log_id,
+                first_scheduled=first_scheduled, first_transition_minute=None,
+                has_hour_schedule=True, schedule_block=None,
+                loaded_monotonic=time.monotonic(),
+            )
+        profile = get_active_schedule_profile()
+        segments = resolve_schedule_segments(hour_key[0], hour_key[1], profile)
+        return ScheduleAuthority(
+            hour_key=hour_key, source="schedule", log_id=None, first_scheduled=None,
+            first_transition_minute=segments[0].start_minute if segments else None,
+            has_hour_schedule=bool(segments),
+            schedule_block=segments[0].block if segments and segments[0].start_minute == 0 else None,
+            loaded_monotonic=time.monotonic(),
+        )
 
-    def _current_hour_schedule_state(self, now):
+    def _schedule_authority(self, now, *, refresh=False):
+        """The current hour's ScheduleAuthority, from memory when possible.
+
+        Re-read from the database when asked (event-driven callers), when the
+        wall hour changed, when nothing is cached (startup), or once the record
+        is older than SCHEDULE_AUTHORITY_REVALIDATE_SECONDS.
+        """
+        hour_key = (now.date(), now.hour)
+        cached = getattr(self, "_schedule_authority_cache", None)
+        if (
+            not refresh
+            and cached is not None
+            and cached.hour_key == hour_key
+            and time.monotonic() - cached.loaded_monotonic < SCHEDULE_AUTHORITY_REVALIDATE_SECONDS
+        ):
+            return cached
+        record = self._load_schedule_authority(now)
+        self._schedule_authority_cache = record
+        return record
+
+    def _invalidate_schedule_authority(self, reason):
+        if getattr(self, "_schedule_authority_cache", None) is not None:
+            print(f"  Schedule authority cache invalidated ({reason})")
+        self._schedule_authority_cache = None
+        # The look-ahead's candidate cache describes the same authority.
+        self._next_hour_peek = None
+        self._next_hour_peek_at = 0.0
+        self._next_hour_peek_key = None
+
+    def _current_hour_schedule_state(self, now, *, refresh=True):
         """Central current-hour orchestration classification.
 
         3.1E distinguishes a genuinely blank hour from a partial hour before
@@ -5194,11 +5285,11 @@ class PlaybackEngine:
             (self.current_log.date, self.current_log.hour)
             if self.current_log is not None else None
         )
-        approved_log, approved_eligible, approved_takeover = self._approved_log_takeover(
-            now.date(), now.hour, now,
-        )
-        if approved_log is not None:
-            authority = "approved_log"
+        record = self._schedule_authority(now, refresh=refresh)
+        if record.source == "approved_log":
+            approved_eligible, approved_takeover = self._takeover_eligibility(
+                now.date(), now.hour, record.first_scheduled, now,
+            )
             schedule_block = None
             has_hour_schedule = True
             if approved_takeover is not None:
@@ -5226,7 +5317,7 @@ class PlaybackEngine:
                 has_committed_playout = False
             return {
                 "state": state,
-                "authority": authority,
+                "authority": record.source,
                 "now_key": now_key,
                 "active_key": active_key,
                 "schedule_block": schedule_block,
@@ -5238,23 +5329,22 @@ class PlaybackEngine:
                 "has_committed_playout": has_committed_playout,
             }
 
-        profile = get_active_schedule_profile()
-        segments = resolve_schedule_segments(now.date(), now.hour, profile)
-        schedule_block = segments[0].block if segments and segments[0].start_minute == 0 else None
-        first_transition_minute = segments[0].start_minute if segments else None
+        schedule_block = record.schedule_block
+        first_transition_minute = record.first_transition_minute
+        has_hour_schedule = record.has_hour_schedule
         takeover_time = (
             now.replace(minute=first_transition_minute, second=0, microsecond=0)
             if first_transition_minute is not None else None
         )
         takeover_due = bool(takeover_time is not None and now >= takeover_time)
 
-        if segments and first_transition_minute == 0:
+        if has_hour_schedule and first_transition_minute == 0:
             state = "scheduled"
             has_committed_playout = False
-        elif segments and not takeover_due:
+        elif has_hour_schedule and not takeover_due:
             state = "partial_before_takeover"
             has_committed_playout = self._active_log_has_committed_playout()
-        elif segments:
+        elif has_hour_schedule:
             state = "partial_due"
             has_committed_playout = False
         elif active_key is not None and active_key > now_key:
@@ -5277,10 +5367,10 @@ class PlaybackEngine:
             "now_key": now_key,
             "active_key": active_key,
             "schedule_block": schedule_block,
-            "has_hour_schedule": bool(segments),
+            "has_hour_schedule": has_hour_schedule,
             # Compatibility alias for existing orchestration/tests. It now
             # means "this hour has buildable schedule rows", not HH:00 exact.
-            "schedule_expected": bool(segments),
+            "schedule_expected": has_hour_schedule,
             "first_transition_minute": first_transition_minute,
             "takeover_time": takeover_time,
             "takeover_due": takeover_due,
@@ -5618,6 +5708,8 @@ class PlaybackEngine:
         the next 10s tick noticed."""
         if not self.running:
             return False
+        # A log this engine just built and approved changes authority now.
+        self._invalidate_schedule_authority("built hour installed")
         self._advance_to_next_hour_log(target_date, target_hour)
         with self._lock:
             idle = self.decks["A"] is None and self.decks["B"] is None
@@ -5673,12 +5765,18 @@ class PlaybackEngine:
         Ordinarily that is the following wall hour. During a partial current
         hour it is deliberately hidden before takeover, then becomes the
         current hour's partial log at/after takeover if the older continuation
-        queue is still active. Candidate material is cached, but eligibility
-        is rechecked on every poll so crossing the boundary is never delayed
-        by the five-second DB cache.
+        queue is still active.
+
+        r0103 / 1.21: this runs on the 250 ms poll path (twice per tick while a
+        queue is exhausted: crossfade look-ahead + state-file preview), so it
+        reads the in-memory ScheduleAuthority record and caches its candidate
+        -- including "nothing approved yet" -- for SCHEDULE_AUTHORITY_REVALIDATE_
+        SECONDS. Eligibility is still recomputed from the approved log's
+        immutable boundary against the wall clock on EVERY call, so crossing
+        a takeover boundary is never delayed and nothing can play early.
         """
         wall_now = timezone.localtime()
-        hour_state = self._current_hour_schedule_state(wall_now)
+        hour_state = self._current_hour_schedule_state(wall_now, refresh=False)
         if hour_state["state"] == "partial_before_takeover":
             return None
         if (
@@ -5695,15 +5793,17 @@ class PlaybackEngine:
         if (
             self._next_hour_peek is not None
             and cached_key == target_key
-            and monotonic_now - self._next_hour_peek_at < 5.0
+            and monotonic_now - self._next_hour_peek_at < SCHEDULE_AUTHORITY_REVALIDATE_SECONDS
         ):
+            if self._next_hour_peek is _NO_PEEK_CANDIDATE:
+                return None  # cached: nothing approved/playable for the target
             log, items = self._next_hour_peek
             eligible, _takeover_at = self._log_queue_eligibility(log, items, wall_now)
             return self._next_hour_peek if eligible else None
 
         log, items = self._approved_log_queue(*target_key)
         result = (log, items) if log and items else None
-        self._next_hour_peek = result
+        self._next_hour_peek = result if result is not None else _NO_PEEK_CANDIDATE
         self._next_hour_peek_at = monotonic_now
         self._next_hour_peek_key = target_key
         if result:
@@ -9009,6 +9109,8 @@ class PlaybackEngine:
             # caller wants AGC-only reapply without the rest.
             self._apply_agc_config()
         elif cmd == "reload_current_log":
+            # Play-now approves a replacement current-hour log, then sends this.
+            self._invalidate_schedule_authority("reload_current_log")
             self._reload_and_restart_current_log()
         elif cmd == "deck_pause":
             self._pause_deck(data.get("slot"))
@@ -14262,6 +14364,13 @@ class PlaybackEngine:
                 # Monitoring to recommend a controlled restart without the
                 # engine doing so automatically.
                 "deck_recovery": self._deck_recovery_state(),
+                # r0103 / 1.21 -- the cached current-hour authority record
+                # (memory only; never a database read from this writer).
+                "schedule_authority": (
+                    self._schedule_authority_cache.as_state(time.monotonic())
+                    if getattr(self, "_schedule_authority_cache", None) is not None
+                    else None
+                ),
                 "manual_mode": self.manual_mode,
                 "manual_from_mic": self._manual_from_mic,
                 # Cached from the last mic/PTT transition (see
