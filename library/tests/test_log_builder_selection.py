@@ -4,7 +4,7 @@ category: the extended effective-weight formula (existing rotation_weight
 + dormancy formula, PLUS the new x2.0 bonus for never-played/>365-day-idle
 tracks) and its SQL/Python equivalence proof.
 
-Uses TestCase (the real, isolated test_isadoraair DB) throughout -- never
+Uses TestCase (the real, isolated test_<DB_NAME> DB) throughout -- never
 the production DB. See log_builder.py's _effective_weight_sql (SQL) and
 compute_effective_weight (Python) for the two implementations under test."""
 import math
