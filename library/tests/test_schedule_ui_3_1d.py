@@ -157,6 +157,27 @@ class SchedulePage31DMarkupTests(ApiMixin, TestCase):
         self.assertNotIn("Math.min", detail_script)
         self.assertNotIn("segments[0].start_minute", detail_script)
 
+    def test_hour_detail_exposes_exact_transition_context_delete_without_replacing_clear(self):
+        for marker in (
+            "Right-click an explicit transition to remove",
+            "Touch/keyboard: select <em>Clear</em>",
+            "cell.addEventListener('contextmenu'",
+            "deleteMinuteTransition(entry, ctx)",
+            "entry.explicit_block_id", "entry.inherited_transition",
+            "This transition is inherited from Weekly",
+            "No explicit transition begins at",
+        ):
+            self.assertIn(marker, self.html)
+        deletion = js_function(
+            self.html, "async function deleteMinuteTransition(",
+            "async function afterMinuteWrite(",
+        )
+        self.assertIn("if (!hourDetailContextIsLive(ctx)) return;", deletion)
+        self.assertIn("selectedProfile.is_archived", deletion)
+        self.assertIn("ctx.profileUuid", deletion)
+        self.assertIn("ctx.date", deletion)
+        self.assertNotIn("effective_block.id", deletion)
+
     def test_date_navigation_and_selected_date_heading_are_exposed(self):
         for marker in (
             'id="previousDateButton"', 'id="nextDateButton"', 'id="todayButton"',
@@ -208,6 +229,14 @@ class ScheduleAsyncContextContractTests(ApiMixin, TestCase):
         super().setUp()
         self.html = self.client.get(reverse("library:schedule")).content.decode()
         self.load_date = js_function(self.html, "async function loadDateSchedule(", "function escapeHtml(")
+        self.load_weekly = js_function(
+            self.html, "async function loadSchedule(",
+            "// The Date Override surface is bound",
+        )
+        self.load_profiles = js_function(
+            self.html, "async function loadProfiles(",
+            "async function lifecycleAction(",
+        )
 
     # 1 -- the Date Override surface is invalidated synchronously
     def test_date_surface_is_cleared_and_marked_busy_before_the_request_is_awaited(self):
@@ -249,6 +278,64 @@ class ScheduleAsyncContextContractTests(ApiMixin, TestCase):
         refresh = js_function(self.html, "async function refreshHourDetail(", "function renderHourDetail(")
         catch = refresh[refresh.index("} catch (error) {"):]
         self.assertLess(catch.index("if (!isCurrent()) return;"), catch.index("showError(error.message)"))
+
+    def test_weekly_requests_are_generation_and_profile_bound(self):
+        self.assertIn("let weeklyScheduleRequestGeneration = 0;", self.html)
+        live = js_function(
+            self.html, "function weeklyScheduleContextIsLive(",
+            "async function loadSchedule(",
+        )
+        self.assertIn("ctx.generation === weeklyScheduleRequestGeneration", live)
+        self.assertIn("scheduleMode === 'weekly'", live)
+        self.assertIn("selectedProfile.uuid === ctx.profileUuid", live)
+        self.assertLess(
+            self.load_weekly.index("++weeklyScheduleRequestGeneration"),
+            self.load_weekly.index("await apiRequest"),
+        )
+        self.assertIn("Object.freeze({generation, profileUuid: selectedProfile.uuid})", self.load_weekly)
+        self.assertEqual(
+            self.load_weekly.count("if (!weeklyScheduleContextIsLive(ctx)) return;"), 2,
+        )
+        loading = js_function(
+            self.html, "function clearWeeklyScheduleForLoad(",
+            "function weeklyScheduleContextIsLive(",
+        )
+        self.assertIn("setAttribute('aria-busy', 'true')", loading)
+        self.assertIn("clearCell", loading)
+
+    def test_profile_requests_are_ordered_and_preserve_captured_selection_preference(self):
+        self.assertIn("let profileRequestGeneration = 0;", self.html)
+        body = self.load_profiles
+        self.assertLess(body.index("++profileRequestGeneration"), body.index("await apiRequest"))
+        self.assertIn("Object.freeze({", body)
+        self.assertIn("preferredUuid", body)
+        self.assertIn("selectedUuid: selectedProfile ? selectedProfile.uuid : null", body)
+        self.assertIn("const isCurrent = () => generation === profileRequestGeneration", body)
+        self.assertLess(body.index("await apiRequest"), body.index("if (!isCurrent()) return;"))
+        catch = body[body.index("} catch (error) {"):]
+        self.assertLess(catch.index("if (!isCurrent()) return;"), catch.index("showError(error.message)"))
+        picker = js_function(
+            self.html, "getElementById('profileSelect').addEventListener('change'", "loadProfiles();",
+        )
+        self.assertIn("profileRequestGeneration++", picker)
+        self.assertIn("setAttribute('aria-busy', 'false')", picker)
+
+    def test_minute_delete_results_and_errors_are_inert_after_context_change(self):
+        deletion = js_function(
+            self.html, "async function deleteMinuteTransition(",
+            "async function afterMinuteWrite(",
+        )
+        self.assertGreaterEqual(deletion.count("hourDetailContextIsLive(ctx)"), 3)
+        self.assertLess(
+            deletion.index("await apiRequest"),
+            deletion.index("if (!hourDetailContextIsLive(ctx)) return;", deletion.index("await apiRequest")),
+        )
+        after = js_function(
+            self.html, "async function afterMinuteWrite(",
+            "// Color the palette buttons",
+        )
+        self.assertGreaterEqual(after.count("if (!hourDetailContextIsLive(ctx)) return;"), 2)
+        self.assertIn("if (ctx.mode === 'date')", after)
 
     def test_date_rows_and_actions_are_bound_to_the_context_that_rendered_them(self):
         self.assertIn("assignDateCell(cell.hour, ctx)", self.html)

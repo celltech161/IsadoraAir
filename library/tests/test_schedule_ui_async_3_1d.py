@@ -52,6 +52,7 @@ class AsyncContextBrowserTests(LiveServerTestCase):
         Capability.objects.get_or_create(slug="schedule.edit", defaults={"label": "Edit schedule"})
         self.profile = ensure_schedule_profile_state().active_profile
         self.second = ScheduleProfile.objects.create(name="Second Profile")
+        self.archived = ScheduleProfile.objects.create(name="Archived Profile", is_archived=True)
         self.alpha = Rotation.objects.create(name="Alpha Rot")
         self.bravo = Rotation.objects.create(name="Bravo Rot")
         self.charlie = Rotation.objects.create(name="Charlie Rot")
@@ -168,6 +169,11 @@ class AsyncContextBrowserTests(LiveServerTestCase):
             if cell["effective_block"]:
                 cell["effective_block"]["content_name"] = "STALE-DATA"
 
+    @staticmethod
+    def make_weekly_stale(payload):
+        for block in payload["blocks"]:
+            block["content_name"] = "STALE-WEEKLY"
+
     # ---- 1. non-interactive while the new context loads --------------------
     def test_old_rows_are_removed_and_busy_while_a_new_date_loads(self):
         with self.session() as pw:
@@ -262,6 +268,80 @@ class AsyncContextBrowserTests(LiveServerTestCase):
             self.release_all(page)
             page.wait_for_function("document.querySelectorAll('#dateHourList .date-hour-row').length === 24")
             self.assertIn("Charlie Rot", self.row_text(page, 10))
+        self.assert_clean()
+
+    # ---- 2b. Weekly/profile list request ordering -------------------------
+    def test_weekly_profile_switch_ignores_late_success_and_late_failure(self):
+        with self.session() as pw:
+            page = self.open_page(pw, 1366)
+            self.hold(page, r".*/api/schedule/\?profile=.*")
+            page.evaluate("() => { loadSchedule(); }")  # A: active profile
+            page.select_option("#profileSelect", label="Second Profile")  # B
+            self.wait_held(page, 2)
+            request_a, request_b = self.held[0], self.held[1]
+
+            self.release(request_b)
+            page.wait_for_function(
+                "document.querySelector('.grid-cell[data-day=\"0\"][data-hour=\"10\"] .cell-label')?.textContent === 'Charlie Rot'"
+            )
+            self.release(request_a, mutate=self.make_weekly_stale)
+            page.wait_for_timeout(400)
+            self.assertNotIn("STALE-WEEKLY", page.inner_text("#weeklyDesktop"))
+            self.assertIn("Charlie Rot", page.inner_text(
+                '.grid-cell[data-day="0"][data-hour="10"]'
+            ))
+
+            # Repeat with the older request failing after the newer context
+            # has painted; the stale error must remain silent.
+            self.hold(page, r".*/api/schedule/\?profile=.*")
+            page.evaluate("() => { loadSchedule(); }")  # A1: Second
+            page.select_option("#profileSelect", label=self.profile.name)  # B1: active
+            self.wait_held(page, 2)
+            old, newest = self.held[0], self.held[1]
+            self.release(newest)
+            page.wait_for_function(
+                "document.querySelector('.grid-cell[data-day=\"0\"][data-hour=\"10\"] .cell-label')?.textContent === 'Alpha Rot'"
+            )
+            old.fulfill(status=500, json={"error": "stale weekly boom"})
+            page.wait_for_timeout(400)
+            self.assertNotIn("stale weekly boom", page.inner_text("#apiError"))
+            self.assertEqual(page.get_attribute("#weeklyDesktop", "aria-busy"), "false")
+        self.assert_clean()
+
+    def test_profile_list_reordering_preserves_the_newest_preferred_selection(self):
+        with self.session() as pw:
+            page = self.open_page(pw, 1366)
+            self.hold(page, r".*/api/schedule/profiles/$")
+            page.evaluate("uuid => { loadProfiles(uuid); }", str(self.profile.uuid))
+            page.evaluate("uuid => { loadProfiles(uuid); }", str(self.second.uuid))
+            self.wait_held(page, 2)
+            request_a, request_b = self.held[0], self.held[1]
+
+            self.release(request_b)
+            page.wait_for_function(
+                "uuid => document.getElementById('profileSelect').value === uuid",
+                arg=str(self.second.uuid),
+            )
+            self.release(request_a)
+            page.wait_for_timeout(400)
+            self.assertEqual(page.input_value("#profileSelect"), str(self.second.uuid))
+            self.assertIn("Charlie Rot", page.inner_text(
+                '.grid-cell[data-day="0"][data-hour="10"]'
+            ))
+
+            self.hold(page, r".*/api/schedule/profiles/$")
+            page.evaluate("uuid => { loadProfiles(uuid); }", str(self.profile.uuid))
+            page.evaluate("uuid => { loadProfiles(uuid); }", str(self.second.uuid))
+            self.wait_held(page, 2)
+            old, newest = self.held[0], self.held[1]
+            self.release(newest)
+            page.wait_for_function(
+                "uuid => document.getElementById('profileSelect').value === uuid",
+                arg=str(self.second.uuid),
+            )
+            old.fulfill(status=500, json={"error": "stale profile boom"})
+            page.wait_for_timeout(400)
+            self.assertNotIn("stale profile boom", page.inner_text("#apiError"))
         self.assert_clean()
 
     # ---- writes land only in the visibly selected context ------------------
@@ -359,6 +439,34 @@ class AsyncContextBrowserTests(LiveServerTestCase):
             page.wait_for_timeout(400)
             self.assertNotIn("stale hour boom", page.inner_text("#apiError"))
             self.assertTrue(page.locator("#hourDetail").is_hidden())
+        self.assert_clean()
+
+    def test_right_click_delete_response_cannot_repaint_a_new_hour_context(self):
+        transition = self.weekly(self.profile, 0, 11, self.bravo, minute=30)
+        with self.session() as pw:
+            page = self.open_page(pw, 1366)
+            self.open_weekly_detail(page, 11)
+            page.wait_for_function("document.querySelectorAll('#minuteGrid .minute-cell').length === 60")
+            self.hold(page, r".*/api/schedule/\d+/.*")
+            page.locator('#minuteGrid .minute-cell[data-minute="30"]').dispatch_event("contextmenu")
+            self.wait_held(page, 1)
+
+            page.select_option("#profileSelect", label="Second Profile")
+            page.wait_for_function(
+                "document.querySelector('.grid-cell[data-day=\"0\"][data-hour=\"10\"] .cell-label')?.textContent === 'Charlie Rot'"
+            )
+            self.open_weekly_detail(page, 10)
+            page.wait_for_function("document.querySelectorAll('#minuteGrid .minute-cell').length === 60")
+            self.assertIn("10:00a", page.inner_text("#hourDetailTitle"))
+
+            self.release_all(page)
+            page.wait_for_timeout(500)
+            self.assertIn("10:00a", page.inner_text("#hourDetailTitle"))
+            self.assertEqual(page.locator("#minuteGrid .minute-cell").count(), 60)
+            self.assertFalse(ScheduleBlock.objects.filter(pk=transition.pk).exists())
+            self.assertFalse(ScheduleBlock.objects.filter(
+                profile=self.second, day_of_week=0, start_time=time(11, 30),
+            ).exists())
         self.assert_clean()
 
     def test_changing_profile_mode_or_date_invalidates_an_open_hour_detail(self):
@@ -466,4 +574,82 @@ class AsyncContextBrowserTests(LiveServerTestCase):
             ).values_list("rotation__name", flat=True)),
             ["Charlie Rot"],
         )
+        self.assert_clean()
+
+    def test_right_click_exact_delete_and_layer_protection_at_supported_widths(self):
+        with self.session() as pw:
+            for index, width in enumerate(WIDTHS):
+                with self.subTest(width=width):
+                    hour = 12 + index
+                    page = self.open_page(pw, width)
+                    self.pick(page, "Bravo Rot")
+                    page.evaluate("h => openHourDetail('weekly', 0, h)", hour)
+                    page.wait_for_function("document.querySelectorAll('#minuteGrid .minute-cell').length === 60")
+
+                    # Create :00 and :30. A carried :31 cell must not infer
+                    # or remove the explicit :30 transition.
+                    page.locator('#minuteGrid .minute-cell[data-minute="0"]').click()
+                    page.wait_for_function("document.querySelectorAll('#minuteGrid .minute-cell.explicit').length === 1")
+                    page.locator('#minuteGrid .minute-cell[data-minute="30"]').click()
+                    page.wait_for_function("document.querySelectorAll('#minuteGrid .minute-cell.explicit').length === 2")
+                    page.locator('#minuteGrid .minute-cell[data-minute="31"]').dispatch_event("contextmenu")
+                    self.assertIn("No explicit transition begins at :31", page.inner_text("#apiError"))
+                    self.assertEqual(page.locator("#minuteGrid .minute-cell.explicit").count(), 2)
+
+                    # Clear + left-click remains the touch/keyboard route.
+                    page.locator("#contentPicker .clear-btn").click()
+                    page.locator('#minuteGrid .minute-cell[data-minute="30"]').click()
+                    page.wait_for_function("document.querySelectorAll('#minuteGrid .minute-cell.explicit').length === 1")
+                    self.pick(page, "Bravo Rot")
+                    page.locator('#minuteGrid .minute-cell[data-minute="30"]').click()
+                    page.wait_for_function("document.querySelectorAll('#minuteGrid .minute-cell.explicit').length === 2")
+
+                    # Right-clicking :00 removes only that row and exposes the
+                    # 3.1E partial-hour continuation presentation.
+                    page.locator('#minuteGrid .minute-cell[data-minute="0"]').dispatch_event("contextmenu")
+                    page.wait_for_function("document.querySelectorAll('#minuteGrid .minute-cell.explicit').length === 1")
+                    self.assertIn(f"continues until {hour:02d}:30", page.inner_text("#hourDetailSegments"))
+
+                    # In Date Override, the Weekly :30 row is protected. A
+                    # dated row at the same minute can be created and removed,
+                    # revealing the inherited Weekly transition again.
+                    self.to_date_mode(page)
+                    page.locator("#dateHourList .date-detail-button").nth(hour).click()
+                    page.wait_for_function("document.querySelectorAll('#minuteGrid .minute-cell').length === 60")
+                    page.locator('#minuteGrid .minute-cell[data-minute="30"]').dispatch_event("contextmenu")
+                    self.assertIn("inherited from Weekly", page.inner_text("#apiError"))
+                    self.pick(page, "Charlie Rot")
+                    page.locator('#minuteGrid .minute-cell[data-minute="30"]').click()
+                    page.wait_for_function(
+                        "document.querySelector('#minuteGrid .minute-cell[data-minute=\"30\"]')?.classList.contains('explicit') === true"
+                    )
+                    page.locator('#minuteGrid .minute-cell[data-minute="30"]').dispatch_event("contextmenu")
+                    page.wait_for_function(
+                        "document.querySelector('#minuteGrid .minute-cell[data-minute=\"30\"]')?.classList.contains('inherited-transition') === true"
+                    )
+
+                    # Archived profiles remain inspectable but right-click is
+                    # mutation-free. Clear remains visible at mobile width.
+                    page.select_option("#profileSelect", label="Archived Profile (Archived)")
+                    page.wait_for_function("document.body.classList.contains('schedule-readonly')")
+                    page.evaluate("h => openHourDetail('date', null, h)", hour)
+                    page.wait_for_function("document.querySelectorAll('#minuteGrid .minute-cell').length === 60")
+                    page.locator('#minuteGrid .minute-cell[data-minute="0"]').dispatch_event("contextmenu")
+                    self.assertIn("Archived profiles are read-only", page.inner_text("#apiError"))
+                    self.assertTrue(page.locator("#contentPicker .clear-btn").is_visible())
+                    self.assert_no_overflow(page, width)
+                    page.close()
+
+        for index, _width in enumerate(WIDTHS):
+            hour = 12 + index
+            self.assertFalse(ScheduleBlock.objects.filter(
+                profile=self.profile, day_of_week=0, start_time=time(hour, 0),
+            ).exists())
+            self.assertTrue(ScheduleBlock.objects.filter(
+                profile=self.profile, day_of_week=0, start_time=time(hour, 30),
+                rotation=self.bravo,
+            ).exists())
+            self.assertFalse(ScheduleBlock.objects.filter(
+                profile=self.profile, specific_date=MONDAY, start_time=time(hour, 30),
+            ).exists())
         self.assert_clean()

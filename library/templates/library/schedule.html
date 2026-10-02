@@ -574,7 +574,7 @@
     <h3 id="hourDetailTitle">Hour Detail</h3>
     <button type="button" id="hourDetailClose" onclick="closeHourDetail()">Close</button>
   </div>
-  <p class="hour-detail-help">Select a Rotation or Playlist above, then click any minute to start it there. If :00 is empty, the previous program continues until the first transition. Choose <em>Clear</em> and click a marked transition to remove only that transition. Solid marked (&bull;) cells are explicit; dashed cells are effective inherited weekly transitions. Only explicit transitions are stored.</p>
+  <p class="hour-detail-help"><strong>Click to assign &bull; Right-click an explicit transition to remove.</strong> Touch/keyboard: select <em>Clear</em>, then activate the marked transition. If :00 is empty, the previous program continues until the first transition. Solid marked (&bull;) cells are explicit; dashed cells are effective inherited weekly transitions. Only explicit transitions are stored.</p>
   <div id="minuteGrid" class="minute-grid" role="group" aria-label="Minutes 00 to 59"></div>
   <div id="hourDetailSegments" class="hour-detail-segments"></div>
 </section>
@@ -640,6 +640,8 @@ let hourDetail = null;
 // render, clear a loading state or surface an error; older ones are inert.
 let hourDetailRequestGeneration = 0;
 let dateScheduleRequestGeneration = 0;
+let weeklyScheduleRequestGeneration = 0;
+let profileRequestGeneration = 0;
 
 // Store content info per cell for mobile rendering
 const cellRotations = {};
@@ -711,13 +713,22 @@ function updateProfileChrome() {
 }
 
 async function loadProfiles(preferredUuid = null) {
+  const generation = ++profileRequestGeneration;
+  const select = document.getElementById('profileSelect');
+  const ctx = Object.freeze({
+    generation,
+    preferredUuid,
+    selectedUuid: selectedProfile ? selectedProfile.uuid : null,
+  });
+  const isCurrent = () => generation === profileRequestGeneration;
+  select.setAttribute('aria-busy', 'true');
   try {
     const data = await apiRequest('/api/schedule/profiles/');
+    if (!isCurrent()) return;
     profiles = data.profiles;
     activeProfileUuid = data.active_profile_uuid;
-    const keep = preferredUuid || (selectedProfile && selectedProfile.uuid) || activeProfileUuid;
+    const keep = ctx.preferredUuid || ctx.selectedUuid || activeProfileUuid;
     selectedProfile = profiles.find(p => p.uuid === keep) || profiles[0];
-    const select = document.getElementById('profileSelect');
     select.innerHTML = '';
     profiles.forEach(profile => {
       const option = document.createElement('option');
@@ -726,9 +737,14 @@ async function loadProfiles(preferredUuid = null) {
       option.selected = selectedProfile && profile.uuid === selectedProfile.uuid;
       select.appendChild(option);
     });
+    select.setAttribute('aria-busy', 'false');
     updateProfileChrome();
     if (scheduleMode === 'date') await loadDateSchedule(); else await loadSchedule();
-  } catch (error) { showError(error.message); }
+  } catch (error) {
+    if (!isCurrent()) return;
+    select.setAttribute('aria-busy', 'false');
+    showError(error.message);
+  }
 }
 
 async function lifecycleAction(action, body = {}) {
@@ -819,6 +835,7 @@ async function deleteProfile() {
 async function setMode(mode) {
   closeHourDetail();
   dateScheduleRequestGeneration++;  // a late Date Override response must go inert
+  weeklyScheduleRequestGeneration++;  // likewise for a late Weekly response
   scheduleMode = mode;
   document.getElementById('weeklyModeButton').classList.toggle('selected', mode === 'weekly');
   document.getElementById('dateModeButton').classList.toggle('selected', mode === 'date');
@@ -1116,8 +1133,9 @@ function renderMobileHours() {
 }
 
 // --- Load schedule data ---
-async function loadSchedule() {
-  if (!selectedProfile) return;
+function clearWeeklyScheduleForLoad() {
+  document.getElementById('weeklyDesktop').setAttribute('aria-busy', 'true');
+  document.getElementById('weeklyMobile').setAttribute('aria-busy', 'true');
   for (let d = 0; d < 7; d++) {
     for (let h = 0; h < 24; h++) {
       detailCounts[d][h] = 0;
@@ -1125,34 +1143,60 @@ async function loadSchedule() {
       if (cell) clearCell(cell); else clearCellData(d, h);
     }
   }
-  const resp = await fetch(`/api/schedule/?profile=${encodeURIComponent(selectedProfile.uuid)}`);
-  if (!resp.ok) return;
-
-  const data = await resp.json();
-  // Explicit minute transitions (start_minute > 0) are only COUNTED here; the
-  // hour cell itself always shows the :00 base. Which source is effective at
-  // any minute is resolved by the server (Hour Detail), never in this script.
-  for (const block of data.blocks) {
-    if (block.start_minute) { detailCounts[block.day_of_week][block.start_hour] += 1; continue; }
-    const desktopCell = getCell(block.day_of_week, block.start_hour);
-    if (desktopCell) {
-      fillCell(desktopCell, block.content_kind, block.content_id, block.content_name, block.id);
-    } else {
-      cells[block.day_of_week][block.start_hour] = block.id;
-      cellRotations[block.day_of_week][block.start_hour] = {
-        kind: block.content_kind,
-        contentId: block.content_id,
-        contentName: block.content_name,
-      };
-    }
-  }
-  document.querySelectorAll('.grid-cell').forEach(styleCell);
   renderMobileHours();
-  // Mobile hour cells don't exist until this async load finishes, so the
-  // DOMContentLoaded handler's call to highlightNow() almost always runs
-  // before them — meaning the mobile current-hour highlight would
-  // otherwise silently not appear until the next 60s interval tick.
-  highlightNow();
+}
+
+function weeklyScheduleContextIsLive(ctx) {
+  return !!ctx && ctx.generation === weeklyScheduleRequestGeneration
+    && scheduleMode === 'weekly' && !!selectedProfile
+    && selectedProfile.uuid === ctx.profileUuid;
+}
+
+async function loadSchedule() {
+  const generation = ++weeklyScheduleRequestGeneration;
+  if (!selectedProfile) {
+    clearWeeklyScheduleForLoad();
+    document.getElementById('weeklyDesktop').setAttribute('aria-busy', 'false');
+    document.getElementById('weeklyMobile').setAttribute('aria-busy', 'false');
+    return;
+  }
+  const ctx = Object.freeze({generation, profileUuid: selectedProfile.uuid});
+  clearWeeklyScheduleForLoad();
+  try {
+    const data = await apiRequest(`/api/schedule/?profile=${encodeURIComponent(ctx.profileUuid)}`);
+    if (!weeklyScheduleContextIsLive(ctx)) return;
+    // Explicit minute transitions (start_minute > 0) are only COUNTED here;
+    // the hour cell itself always shows the :00 base. Which source is
+    // effective at any minute is resolved by the server (Hour Detail), never
+    // in this script.
+    for (const block of data.blocks) {
+      if (block.start_minute) { detailCounts[block.day_of_week][block.start_hour] += 1; continue; }
+      const desktopCell = getCell(block.day_of_week, block.start_hour);
+      if (desktopCell) {
+        fillCell(desktopCell, block.content_kind, block.content_id, block.content_name, block.id);
+      } else {
+        cells[block.day_of_week][block.start_hour] = block.id;
+        cellRotations[block.day_of_week][block.start_hour] = {
+          kind: block.content_kind,
+          contentId: block.content_id,
+          contentName: block.content_name,
+        };
+      }
+    }
+    document.querySelectorAll('.grid-cell').forEach(styleCell);
+    renderMobileHours();
+    document.getElementById('weeklyDesktop').setAttribute('aria-busy', 'false');
+    document.getElementById('weeklyMobile').setAttribute('aria-busy', 'false');
+    // Mobile hour cells don't exist until this async load finishes, so the
+    // DOMContentLoaded handler's call to highlightNow() almost always runs
+    // before them. Reapply it once the current render is complete.
+    highlightNow();
+  } catch (error) {
+    if (!weeklyScheduleContextIsLive(ctx)) return;
+    document.getElementById('weeklyDesktop').setAttribute('aria-busy', 'false');
+    document.getElementById('weeklyMobile').setAttribute('aria-busy', 'false');
+    showError(error.message);
+  }
 }
 
 // The Date Override surface is bound to the request that rendered it.
@@ -1427,6 +1471,10 @@ function renderHourDetail(data, ctx) {
       cell.appendChild(name);
     }
     cell.addEventListener('click', () => onMinuteClick(entry, ctx));
+    cell.addEventListener('contextmenu', event => {
+      event.preventDefault();
+      deleteMinuteTransition(entry, ctx);
+    });
     grid.appendChild(cell);
   });
   const origins = {weekly: 'weekly', date_override: 'date override'};
@@ -1450,9 +1498,12 @@ async function onMinuteClick(entry, ctx) {
       await apiRequest(`/api/schedule/${entry.explicit_block_id}/?profile=${encodeURIComponent(ctx.profileUuid)}${dateQuery}`, {
         method: 'DELETE', headers: {'X-CSRFToken': getCookie('csrftoken')},
       });
+      if (!hourDetailContextIsLive(ctx)) return;
       showError('');
       await afterMinuteWrite(ctx);
-    } catch (error) { showError(error.message); }
+    } catch (error) {
+      if (hourDetailContextIsLive(ctx)) showError(error.message);
+    }
     return;
   }
   const body = {profile_uuid: ctx.profileUuid, hour: ctx.hour, minute: entry.minute};
@@ -1464,14 +1515,45 @@ async function onMinuteClick(entry, ctx) {
       method: 'POST', headers: {'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken')},
       body: JSON.stringify(body),
     });
+    if (!hourDetailContextIsLive(ctx)) return;
     showError('');
     await afterMinuteWrite(ctx);
-  } catch (error) { showError(error.message); }
+  } catch (error) {
+    if (hourDetailContextIsLive(ctx)) showError(error.message);
+  }
+}
+
+async function deleteMinuteTransition(entry, ctx) {
+  if (!hourDetailContextIsLive(ctx)) return;
+  if (selectedProfile.is_archived) {
+    showError('Archived profiles are read-only.');
+    return;
+  }
+  const minute = String(entry.minute).padStart(2, '0');
+  if (!entry.explicit_block_id) {
+    showError(entry.inherited_transition
+      ? 'This transition is inherited from Weekly. Edit the Weekly schedule to remove it.'
+      : `No explicit transition begins at :${minute}.`);
+    return;
+  }
+  const dateQuery = ctx.mode === 'date' ? `&date=${encodeURIComponent(ctx.date)}` : '';
+  try {
+    await apiRequest(`/api/schedule/${entry.explicit_block_id}/?profile=${encodeURIComponent(ctx.profileUuid)}${dateQuery}`, {
+      method: 'DELETE', headers: {'X-CSRFToken': getCookie('csrftoken')},
+    });
+    if (!hourDetailContextIsLive(ctx)) return;
+    showError('');
+    await afterMinuteWrite(ctx);
+  } catch (error) {
+    if (hourDetailContextIsLive(ctx)) showError(error.message);
+  }
 }
 
 async function afterMinuteWrite(ctx) {
-  if (hourDetailContextIsLive(ctx)) await refreshHourDetail();
-  if (scheduleMode === 'date') await loadDateSchedule(); else await loadSchedule();
+  if (!hourDetailContextIsLive(ctx)) return;
+  await refreshHourDetail();
+  if (!hourDetailContextIsLive(ctx)) return;
+  if (ctx.mode === 'date') await loadDateSchedule(); else await loadSchedule();
 }
 
 // Color the palette buttons
@@ -1492,6 +1574,8 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('overrideDate').value = stationIsoDate();
   document.getElementById('overrideDate').addEventListener('change', event => setOverrideDate(event.target.value));
   document.getElementById('profileSelect').addEventListener('change', async event => {
+    profileRequestGeneration++;  // an in-flight profile refresh cannot undo this explicit choice
+    event.target.setAttribute('aria-busy', 'false');
     selectedProfile = profiles.find(profile => profile.uuid === event.target.value);
     closeHourDetail();
     updateProfileChrome();
