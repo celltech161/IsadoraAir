@@ -20,6 +20,7 @@ from datetime import date, time
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
+from django.db import connection, connections
 from django.test import Client, LiveServerTestCase, override_settings
 
 from authz.models import Capability
@@ -73,7 +74,19 @@ class AsyncContextBrowserTests(LiveServerTestCase):
     # ---- browser plumbing -------------------------------------------------
     @contextlib.contextmanager
     def session(self):
-        """Playwright, with every browser closed BEFORE the driver stops."""
+        """Playwright, with every browser closed BEFORE the driver stops, and
+        every Django DB connection opened inside the session closed with it.
+
+        r0104 / 1.18: Django keeps connections in context-local storage.
+        Inside ``sync_playwright()`` ORM calls (force_login, DB assertions)
+        resolve to a different contextvars context, so the connection they
+        open is invisible to the test's ordinary teardown, which runs after
+        this block exits. Left open, it made Django's final DROP of the test
+        database fail with "being accessed by other users" (exit 1) after every
+        test had passed. Close it here, deterministically, while its context is
+        still current and after the browsers (and their in-flight requests to
+        the live server) are gone.
+        """
         self._browsers = []
         with sync_playwright() as pw:
             try:
@@ -84,6 +97,7 @@ class AsyncContextBrowserTests(LiveServerTestCase):
                         browser.close()
                     except Exception:
                         pass
+                connections.close_all()
 
     def open_page(self, pw, width, height=900):
         browser = pw.chromium.launch()
@@ -173,6 +187,27 @@ class AsyncContextBrowserTests(LiveServerTestCase):
     def make_weekly_stale(payload):
         for block in payload["blocks"]:
             block["content_name"] = "STALE-WEEKLY"
+
+    # ---- harness: a browser session leaves no DB session behind -----------
+    def test_a_browser_session_leaves_no_database_connection_behind(self):
+        """r0104 / 1.18 regression: ORM use inside sync_playwright() (here the
+        session-cookie login plus a DB read) must not leave a connection open
+        on the test database once the session ends -- that orphan used to make
+        the final DROP DATABASE fail after every test passed."""
+        with self.session() as pw:
+            page = self.open_page(pw, 1366)            # force_login inside Playwright
+            self.assertTrue(ScheduleProfile.objects.filter(pk=self.second.pk).exists())
+            self.assertTrue(page.locator("#profileSelect").count())
+        with connection.cursor() as cur:
+            # Client backends only: DROP DATABASE itself terminates any
+            # autovacuum worker, so only these can block it.
+            cur.execute(
+                "SELECT count(*) FROM pg_stat_activity "
+                "WHERE datname = current_database() AND pid <> pg_backend_pid() "
+                "AND backend_type = 'client backend'"
+            )
+            others = cur.fetchone()[0]
+        self.assertEqual(others, 0, "a database session outlived the browser session")
 
     # ---- 1. non-interactive while the new context loads --------------------
     def test_old_rows_are_removed_and_busy_while_a_new_date_loads(self):

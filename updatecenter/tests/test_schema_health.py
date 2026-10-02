@@ -5,10 +5,20 @@ Uses Django's own MigrationRecorder to deterministically simulate
 DB-error-string match) rather than relying on the test database's
 incidental applied-state."""
 from django.db import connection
+from django.db.migrations.loader import MigrationLoader
 from django.db.migrations.recorder import MigrationRecorder
 from django.test import TestCase
 
 from updatecenter import schema_health
+
+
+def _leaf(app_label):
+    """The app's CURRENT leaf migration. check_schema_health() plans to
+    the graph's leaf nodes, so only an unapplied leaf (or chain ending in
+    one) is "pending"; a hard-coded name silently stops being a leaf the
+    moment the app gains a newer migration (webrequests.0010, r0056)."""
+    (leaf,) = MigrationLoader(None, ignore_no_migrations=True).graph.leaf_nodes(app_label)
+    return leaf
 
 
 class SchemaHealthTests(TestCase):
@@ -21,20 +31,18 @@ class SchemaHealthTests(TestCase):
 
     def test_unapplied_migration_detected_deterministically(self):
         recorder = MigrationRecorder(connection)
-        recorder.record_unapplied("webrequests", "0009_alter_webrequestconfig_dedication_tts_timeout_seconds_and_more")
+        app, name = _leaf("webrequests")
+        recorder.record_unapplied(app, name)
         try:
             result = schema_health.check_schema_health()
             self.assertEqual(result.status, schema_health.SchemaHealthStatus.UNAPPLIED_MIGRATIONS_DETECTED)
-            self.assertIn("webrequests.0009_alter_webrequestconfig_dedication_tts_timeout_seconds_and_more", result.pending_migrations)
+            self.assertIn(f"{app}.{name}", result.pending_migrations)
         finally:
-            recorder.record_applied("webrequests", "0009_alter_webrequestconfig_dedication_tts_timeout_seconds_and_more")
+            recorder.record_applied(app, name)
 
     def test_multiple_unapplied_migrations_all_listed(self):
         recorder = MigrationRecorder(connection)
-        targets = [
-            ("webrequests", "0009_alter_webrequestconfig_dedication_tts_timeout_seconds_and_more"),
-            ("road_conditions", "0011_alter_roadconditionsconfiguration_tts_timeout_seconds_and_more"),
-        ]
+        targets = [_leaf("webrequests"), _leaf("road_conditions")]
         for app, name in targets:
             recorder.record_unapplied(app, name)
         try:
@@ -59,7 +67,8 @@ class SchemaHealthTests(TestCase):
         """Confirms the recorder round-trip itself is clean -- the
         fixture technique other tests rely on actually works both ways."""
         recorder = MigrationRecorder(connection)
-        recorder.record_unapplied("webrequests", "0009_alter_webrequestconfig_dedication_tts_timeout_seconds_and_more")
-        recorder.record_applied("webrequests", "0009_alter_webrequestconfig_dedication_tts_timeout_seconds_and_more")
+        app, name = _leaf("webrequests")
+        recorder.record_unapplied(app, name)
+        recorder.record_applied(app, name)
         result = schema_health.check_schema_health()
         self.assertEqual(result.status, schema_health.SchemaHealthStatus.SCHEMA_CURRENT)

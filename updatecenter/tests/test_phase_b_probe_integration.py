@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
@@ -6,9 +7,11 @@ import subprocess
 import sys
 import tempfile
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from django.db import connection
 from django.db.migrations.executor import MigrationExecutor
+from django.db.migrations.graph import MigrationGraph
 from django.test import SimpleTestCase, TestCase, TransactionTestCase
 from django.utils import timezone
 
@@ -197,6 +200,26 @@ class R0075ProspectiveR0077TargetSchemaTests(TransactionTestCase):
         "library.0082_logitem_playback_claim_and_playevent_occurrence",
         "library.0083_playevent_duration_segments",
     )
+    # The library leaf of the staged r0077 target source. The probe plans to
+    # the loaded graph's leaf nodes, and this checkout's graph has grown past
+    # r0077 (library.0084+), so the r0077 target graph is represented by
+    # pinning library's leaf here rather than by assuming the current source
+    # tree IS r0077 -- that assumption broke as soon as 0084 landed.
+    r0077_library_leaf = ("library", "0083_playevent_duration_segments")
+
+    @contextmanager
+    def _r0077_target_graph(self):
+        current_leaf_nodes = MigrationGraph.leaf_nodes
+
+        def leaf_nodes(graph, app=None):
+            leaves = current_leaf_nodes(graph, app)
+            return sorted(
+                self.r0077_library_leaf if app_label == "library" else (app_label, name)
+                for app_label, name in leaves
+            )
+
+        with patch.object(MigrationGraph, "leaf_nodes", leaf_nodes):
+            yield
 
     def test_corrected_target_probe_and_real_postgres_migration(self):
         executor = MigrationExecutor(connection)
@@ -217,9 +240,10 @@ class R0075ProspectiveR0077TargetSchemaTests(TransactionTestCase):
             HistoricalPlayEvent = historical_apps.get_model("library", "PlayEvent")
             historical = HistoricalPlayEvent.objects.create(started_at=timezone.now())
 
-            target_payload = _strict_probe(
-                json.dumps(build_probe_payload()).encode("utf-8"), review_context=False,
-            )
+            with self._r0077_target_graph():
+                target_payload = _strict_probe(
+                    json.dumps(build_probe_payload()).encode("utf-8"), review_context=False,
+                )
             self.assertEqual(
                 tuple(item["ref"] for item in target_payload["plan"]),
                 self.pending_migration_refs,
@@ -296,10 +320,26 @@ class RealPostgresCheckpointTests(TestCase):
             root = Path(temporary)
             settings = connection.settings_dict
             raw = config_dict(root, str(root / "upstream.git"))
+            # create_checkpoint runs pg_dump under the runner's controlled
+            # environment (HOME=/nonexistent) and authenticates ONLY through
+            # database.pgpass_file, exactly as on a station. With
+            # pgpass_file=None this test only passed on hosts that allowed
+            # passwordless localhost auth, so give it a real 0600 pgpass for
+            # the isolated test database.
+            pgpass = root / "pgpass"
+            fields = [
+                settings["HOST"], str(settings["PORT"]), settings["NAME"],
+                settings["USER"], settings["PASSWORD"],
+            ]
+            fd = os.open(pgpass, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                stream.write(":".join(
+                    field.replace("\\", "\\\\").replace(":", "\\:") for field in fields
+                ) + "\n")
             raw["database"] = {
                 "name": settings["NAME"], "user": settings["USER"],
                 "host": settings["HOST"], "port": int(settings["PORT"]),
-                "pgpass_file": None,
+                "pgpass_file": str(pgpass),
             }
             Path(raw["application_environment_file"]).write_text(
                 f"SECRET_KEY=test\nDB_NAME={settings['NAME']}\nDB_USER={settings['USER']}\n"

@@ -516,6 +516,9 @@ class HardwareBrokerTests(TestCase):
             cleaned_data={
                 "ducking_enabled": ducking.enabled,
                 "duck_level_db": ducking.duck_level_db,
+                # Required by hardware.admin.AudioPipelineAdmin.save_model since
+                # the PTT auto-manual field joined the form (b6c875e).
+                "ptt_auto_manual_enabled": ducking.ptt_auto_manual_enabled,
                 "remote_dj_gain_db": remote.gain_db,
             },
         )
