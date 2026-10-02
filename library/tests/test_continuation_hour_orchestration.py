@@ -17,6 +17,7 @@ from django.test import TransactionTestCase
 from django.utils import timezone
 
 import library.services.engine as eng_module
+from library.services.engine import PlaybackEngine
 from library.models import (
     Artist,
     Category,
@@ -328,6 +329,100 @@ class ContinuationHourOrchestrationTests(TransactionTestCase):
         _emitted, thread = self.run_tick(stand_in, self.fake_now(FRIDAY, 11, 10))
         thread.assert_called()  # the prospective partial hour is still built
         self.assertEqual(stand_in.current_log.id, old_log.id)
+
+    # -- poison skips an occurrence; it never moves the approved boundary --
+    def approved_log_with_items(self, hour, minutes):
+        """An approved log for FRIDAY ``hour`` whose items are persisted at
+        the given in-hour minutes (in order)."""
+        tracks = [self.make_track() for _ in minutes]
+        log, items = self.make_log(
+            FRIDAY, hour, tracks=tracks,
+            scheduled_at=self.fake_now(FRIDAY, hour, minute=minutes[0]),
+        )
+        for item, minute in zip(items, minutes):
+            LogItem.objects.filter(pk=item.pk).update(
+                scheduled_time=self.fake_now(FRIDAY, hour, minute=minute),
+            )
+        return log, list(log.items.order_by("position"))
+
+    def idle_engine_on_exhausted_old_log(self):
+        old_log, (old_item,) = self.make_log(FRIDAY, 10, tracks=[self.make_track()], played=True)
+        stand_in = make_stand_in()
+        stand_in.current_log = old_log
+        stand_in.log_items = [old_item]
+        stand_in._queue_cursor = 1
+        return stand_in, old_log
+
+    def test_a_poisoned_first_occurrence_does_not_delay_a_partial_takeover(self):
+        stand_in, old_log, _partial, _item, _block = self.approved_partial_at_1130()
+        _partial.delete()
+        partial, (first, second) = self.approved_log_with_items(11, (30, 34))
+        stand_in._poison_skip_identities = [(partial.id, first.id)]
+
+        before = self.state_at(stand_in, 29, 59)
+        self.assertEqual(before["state"], "partial_before_takeover")
+        self.assertEqual((before["takeover_time"].hour, before["takeover_time"].minute), (11, 30))
+        due = self.state_at(stand_in, 30)
+        self.assertEqual(due["state"], "partial_due")  # 11:30, not 11:34
+        peek = self.peek_at(stand_in, 30)
+        self.assertIsNotNone(peek)
+        self.assertEqual([item.id for item in peek[1]], [second.id])
+
+        deck_before = stand_in.decks["A"]
+        self.run_tick(stand_in, self.fake_now(FRIDAY, 11, 30))
+        self.assertEqual(stand_in.current_log.id, partial.id)
+        self.assertEqual([item.id for item in stand_in.log_items], [second.id])  # A skipped
+        self.assertIs(stand_in.decks["A"], deck_before)
+        selected, _forced = stand_in._next_queue_item()
+        self.assertEqual(selected.id, second.id)
+
+    def test_a_poisoned_first_occurrence_never_makes_an_ordinary_hour_partial(self):
+        stand_in, _old_log = self.idle_engine_on_exhausted_old_log()
+        ordinary, (first, second) = self.approved_log_with_items(11, (0, 4))
+        stand_in._poison_skip_identities = [(ordinary.id, first.id)]
+
+        state = self.state_at(stand_in, 2)
+        self.assertEqual(state["state"], "scheduled")
+        self.assertEqual(state["authority"], "approved_log")
+        self.assertTrue(state["takeover_due"])
+        self.assertIsNone(
+            PlaybackEngine._log_queue_eligibility(ordinary, [second], self.fake_now(FRIDAY, 11, 2))[1],
+            "an ordinary hour must not acquire an 11:04 partial boundary",
+        )
+        emitted, _thread = self.run_tick(stand_in, self.fake_now(FRIDAY, 11, 2))
+        self.assertEqual(stand_in.current_log.id, ordinary.id)
+        self.assertEqual([item.id for item in stand_in.log_items], [second.id])
+        self.assertEqual(emitted, [])
+
+    def test_an_all_poisoned_partial_log_keeps_its_boundary_and_replays_nothing(self):
+        stand_in, old_log = self.idle_engine_on_exhausted_old_log()
+        self.make_block(FRIDAY, 11, minute=30)
+        partial, (first, second) = self.approved_log_with_items(11, (30, 34))
+        stand_in._poison_skip_identities = [(partial.id, first.id), (partial.id, second.id)]
+
+        # Before 11:30 it is still a partial hour -- never reinterpreted as an
+        # ordinary/empty log that could replace the continuation early.
+        early = self.state_at(stand_in, 10)
+        self.assertEqual(early["state"], "partial_before_takeover")
+        self.assertEqual((early["takeover_time"].hour, early["takeover_time"].minute), (11, 30))
+        self.run_tick(stand_in, self.fake_now(FRIDAY, 11, 10))
+        self.assertEqual(stand_in.current_log.id, old_log.id)
+        with patch.object(
+            eng_module.timezone, "localtime", return_value=self.fake_now(FRIDAY, 11, 10),
+        ), patch.object(eng_module, "GLib"):
+            stand_in._on_log_exhausted("A")
+        self.assertEqual(stand_in.current_log.id, old_log.id)
+        stand_in._try_extend_live_log_async.assert_called_once()  # existing continuation policy
+        self.assertEqual(self.state_at(stand_in, 29, 59)["state"], "partial_before_takeover")
+
+        # At its own boundary it becomes due; nothing poisoned is ever offered.
+        self.assertEqual(self.state_at(stand_in, 30)["state"], "partial_due")
+        self.assertIsNone(self.peek_at(stand_in, 30))
+        self.run_tick(stand_in, self.fake_now(FRIDAY, 11, 30))
+        with patch.object(eng_module.timezone, "localtime", return_value=self.fake_now(FRIDAY, 11, 30)):
+            stand_in._load_log_for(FRIDAY, 11)   # the exhaustion path's own load
+        offered = {item.id for item in stand_in.log_items}
+        self.assertFalse(offered & {first.id, second.id})
 
     def test_exhaustion_before_partial_takeover_uses_live_fill_not_partial_log(self):
         old_track = self.make_track()

@@ -26,7 +26,7 @@ django.setup()
 from contextlib import contextmanager
 
 from django.db import close_old_connections, connection, transaction
-from django.db.models import F, Sum
+from django.db.models import F, Min, Sum
 from django.db.utils import OperationalError
 from django.utils import timezone
 from hardware.models import AudioInput, AudioOutput, AudioPipeline, DuckingConfig, RemoteDJAudioInput
@@ -4970,7 +4970,7 @@ class PlaybackEngine:
         )
         if not log:
             return None, []
-        items = self._apply_poison_skip(list(
+        persisted = list(
             log.items
             .select_related(
                 "track", "track__artist", "track__album", "track__category", "track__category__kind",
@@ -4982,8 +4982,29 @@ class PlaybackEngine:
                 "category", "category__kind",
             )
             .order_by("position")
-        ))
-        return log, items
+        )
+        # The takeover boundary is programming intent: taken from EVERY
+        # persisted item before poison filtering, which only shapes the
+        # playable queue (a poisoned occurrence is skipped, never rescheduled).
+        self._remember_persisted_boundary(log, persisted)
+        return log, self._apply_poison_skip(persisted)
+
+    @staticmethod
+    def _remember_persisted_boundary(log, persisted_items):
+        log._persisted_first_scheduled = min(
+            (item.scheduled_time for item in persisted_items), default=None,
+        )
+
+    @staticmethod
+    def _persisted_first_scheduled(log):
+        """Earliest persisted ``scheduled_time`` of the approved log, before
+        any poison/playability filtering. Memoized on the instance; loaders
+        seed it from rows they already fetched, so the poll path adds no query."""
+        if not hasattr(log, "_persisted_first_scheduled"):
+            log._persisted_first_scheduled = (
+                log.items.aggregate(first=Min("scheduled_time"))["first"]
+            )
+        return log._persisted_first_scheduled
 
     @staticmethod
     def _log_queue_eligibility(log, items, wall_now):
@@ -4996,7 +5017,12 @@ class PlaybackEngine:
         log data also preserves generated-log immutability if the schedule is
         edited after approval.
         """
-        if not items:
+        # ``items`` is the PLAYABLE queue (poison/unplayable filtered); it never
+        # defines the boundary. A poisoned first occurrence must neither delay
+        # a partial takeover nor turn an ordinary hour into a partial one, and
+        # an all-poisoned partial log stays partial until its own boundary.
+        first_scheduled = PlaybackEngine._persisted_first_scheduled(log)
+        if first_scheduled is None:
             # Preserve the established meaning of an approved empty ordinary
             # log. Real partial builds cannot approve without a source item;
             # installation paths that require playout still reject empties.
@@ -5005,7 +5031,6 @@ class PlaybackEngine:
             datetime_cls.combine(log.date, datetime_time(log.hour, 0)),
             timezone.get_current_timezone(),
         )
-        first_scheduled = min(item.scheduled_time for item in items)
         hour_end = hour_start + timedelta(hours=1)
         # Only an offset within this log's own wall hour is the durable
         # partial-hour marker. Legacy/imported fixtures with timestamps wholly
@@ -5116,9 +5141,9 @@ class PlaybackEngine:
         )
         if log is None:
             return None, None, None
-        items = self._apply_poison_skip(list(
-            log.items.only("id", "playlist_log", "scheduled_time")
-        ))
+        persisted = list(log.items.only("id", "playlist_log", "scheduled_time"))
+        self._remember_persisted_boundary(log, persisted)
+        items = self._apply_poison_skip(persisted)
         eligible, takeover_at = self._log_queue_eligibility(log, items, wall_now)
         return log, eligible, takeover_at
 
