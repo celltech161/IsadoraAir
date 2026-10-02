@@ -5788,7 +5788,10 @@ class PlaybackEngine:
             target = (wall_now + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
         target_key = (target.date(), target.hour)
 
-        monotonic_now = time.time()
+        # Monotonic, never the wall clock: a backward system-clock step must not
+        # stretch the bounded revalidation window (pre-existing in r0102; now
+        # load-bearing because 1.21 also caches negative results here).
+        monotonic_now = time.monotonic()
         cached_key = getattr(self, "_next_hour_peek_key", None)
         if (
             self._next_hour_peek is not None

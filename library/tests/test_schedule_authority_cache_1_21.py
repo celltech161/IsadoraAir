@@ -119,6 +119,40 @@ class ScheduleAuthorityCacheTests(TransactionTestCase):
                 self.assertIsNone(self.peek(stand_in, 50))
         self.assertEqual(len(ctx.captured_queries), 0)
 
+    def test_lookahead_cache_expiry_follows_monotonic_time_not_the_wall_clock(self):
+        # Ordinary hour on its last item, next hour unbuilt: the look-ahead
+        # caches "nothing approved" (the negative result 1.21 added).
+        ScheduleBlock.objects.all().delete()
+        self.make_block(FRIDAY, 11)
+        ordinary, _ = self.make_log(FRIDAY, 11, tracks=[self.make_track()])
+        stand_in = make_stand_in()
+        stand_in.current_log, stand_in.log_items, stand_in._queue_cursor = ordinary, [], 0
+        self.assertIsNone(self.peek(stand_in, 50))
+        cached_at = stand_in._next_hour_peek_at
+        real_monotonic = eng_module.time.monotonic
+
+        def lookahead_reads(ctx):
+            return [q for q in ctx.captured_queries if "MIN(" not in q["sql"].upper()]
+
+        # A backward wall-clock step (NTP/manual correction) must not keep the
+        # entry alive: only monotonic elapsed time decides expiry.
+        bound = eng_module.SCHEDULE_AUTHORITY_REVALIDATE_SECONDS
+        with patch.object(eng_module.time, "time", lambda: 0.0), \
+                patch.object(eng_module.time, "monotonic", lambda: cached_at + bound + 0.5), \
+                CaptureQueriesContext(connection) as ctx:
+            self.assertIsNone(self.peek(stand_in, 50))
+        self.assertEqual(len(lookahead_reads(ctx)), 1, "entry did not expire on monotonic time")
+        self.assertEqual(stand_in._next_hour_peek_at, cached_at + bound + 0.5)
+
+        # Conversely, a forward wall-clock jump alone does not expire it early.
+        refreshed_at = stand_in._next_hour_peek_at
+        with patch.object(eng_module.time, "time", lambda: real_monotonic() + 10 ** 9), \
+                patch.object(eng_module.time, "monotonic", lambda: refreshed_at + 1.0), \
+                CaptureQueriesContext(connection) as ctx:
+            self.assertIsNone(self.peek(stand_in, 50))
+        self.assertEqual(lookahead_reads(ctx), [], "a wall-clock jump expired the entry")
+        self.assertEqual(stand_in._next_hour_peek_at, refreshed_at)
+
     # 3 -- the cache neither advances nor delays a takeover ------------------
     def test_cached_lookahead_crosses_the_approved_boundary_exactly(self):
         partial, (item,) = self.approved_partial()
