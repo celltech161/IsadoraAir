@@ -72,6 +72,55 @@ def _task_count():
     return len(tuple(Path("/proc/self/task").iterdir()))
 
 
+def _task_ids():
+    return frozenset(task.name for task in Path("/proc/self/task").iterdir())
+
+
+# GStreamer's default task pool is a non-exclusive GThreadPool. A streaming
+# thread whose task stopped idles briefly (~0.5 s) in that pool, then parks in
+# GLib's global unused-thread list (GLib.ThreadPool.get_num_unused_threads(),
+# capped by get_max_unused_threads()) or exits. An instantaneous
+# /proc/self/task count taken mid-churn is therefore "deck generation rate x
+# pool idle window" plus whatever an earlier test's pool threads have not yet
+# drained: it swings by dozens with CPU speed and load and is not an
+# IsadoraAir-owned quantity (r0104/1.18 measured 112-207 mid-churn settling to
+# the same 15 every run). A real per-generation leak is different: its
+# threads stay in use, so it survives settling and scales with retirements.
+POOL_IDLE_QUIET_SECONDS = 0.75
+
+
+def _settled_owned_task_count(timeout=5.0):
+    """OS tasks once pool threads have gone idle, minus GLib's parked cache.
+
+    Waits (bounded) until neither the task count nor GLib's parked
+    unused-thread count has changed for POOL_IDLE_QUIET_SECONDS, which is
+    longer than the pool's idle window, then returns the threads that are
+    still doing something: the process's own threads, live pipelines'
+    streaming threads, and anything leaked.
+    """
+
+    def sample():
+        return _task_count(), GLib.ThreadPool.get_num_unused_threads()
+
+    observed = {"sample": sample(), "since": time.monotonic()}
+
+    def settled():
+        current = sample()
+        now = time.monotonic()
+        if current != observed["sample"]:
+            observed.update(sample=current, since=now)
+            return False
+        return now - observed["since"] >= POOL_IDLE_QUIET_SECONDS
+
+    if not _wait_until(settled, timeout=timeout):
+        raise AssertionError(
+            f"OS task count did not settle within {timeout}s "
+            f"(last tasks/parked={observed['sample']})"
+        )
+    tasks, parked = observed["sample"]
+    return tasks - parked
+
+
 def _write_wav(path, *, frames=441, sample_rate=44100):
     with wave.open(str(path), "wb") as output:
         output.setnchannels(2)
@@ -232,6 +281,21 @@ class RealDeckTopologyTests(SimpleTestCase):
         for coordinator in self.engine._deck_teardowns.values():
             coordinator.stop()
         self.engine.main_pipeline.set_state(Gst.State.NULL)
+        # stop() deliberately never joins (production must not wait on a
+        # hung NULL). Tests must: every test's coordinators reuse the same
+        # worker thread names, so a worker that outlives its test -- e.g. a
+        # deliberately wedged one whose release was skipped by an earlier
+        # assertion failure -- otherwise surfaces later as another test's
+        # "3 != 2" worker count. Tests that wedge a worker release it via
+        # addCleanup/finally, which runs before this cleanup.
+        for coordinator in self.engine._deck_teardowns.values():
+            worker = coordinator._worker
+            if worker is not None:
+                worker.join(timeout=5.0)
+                self.assertFalse(
+                    worker.is_alive(),
+                    f"{worker.name} outlived its test: {coordinator.snapshot()}",
+                )
 
     def _create(
         self,
@@ -329,7 +393,7 @@ class RealDeckTopologyTests(SimpleTestCase):
                 _wait_until(lambda: self.engine._deck_teardowns["A"].snapshot()["completed"] == 25)
             )
             rss_start = _rss_bytes()
-            tasks_start = _task_count()
+            tasks_start = _settled_owned_task_count()
             threads_start = threading.active_count()
             for generation in range(26, 226):
                 last = self._create(generation)
@@ -347,12 +411,13 @@ class RealDeckTopologyTests(SimpleTestCase):
         self.assertEqual(_pipeline_child_count(self.engine.main_pipeline), 2)
         self.assertEqual(self.engine._deck_teardowns["A"].snapshot()["worker_starts"], 1)
         self.assertLessEqual(threading.active_count(), threads_start + 1)
-        self.assertLessEqual(_task_count(), tasks_start + 2)
+        tasks_end = _settled_owned_task_count()
+        self.assertLessEqual(tasks_end, tasks_start + 2)
         self.assertLess(_rss_bytes() - rss_start, 16 * 1024 * 1024)
         print(
             "healthy-churn-resources "
             f"cycles=200 pads={len(tuple(self.engine.mixer.sinkpads))} "
-            f"map={len(self.engine._deck_bin_map)} task_delta={_task_count() - tasks_start} "
+            f"map={len(self.engine._deck_bin_map)} task_delta={tasks_end - tasks_start} "
             f"thread_delta={threading.active_count() - threads_start} "
             f"rss_delta={_rss_bytes() - rss_start}",
             flush=True,
@@ -363,6 +428,9 @@ class RealDeckTopologyTests(SimpleTestCase):
         """A wedged NULL must not turn every later deck into another leak."""
         self.engine.main_pipeline.set_state(Gst.State.PLAYING)
         release = threading.Event()
+        # Release the deliberately wedged A worker even if an assertion below
+        # fails, so it cannot outlive this test (see _cleanup_engine).
+        self.addCleanup(release.set)
         coordinator = self.engine._deck_teardowns["A"]
         original_submit = coordinator.submit
 
@@ -394,7 +462,7 @@ class RealDeckTopologyTests(SimpleTestCase):
                 del warm
         gc.collect()
         rss_start = _rss_bytes()
-        tasks_start = _task_count()
+        tasks_start = _settled_owned_task_count()
         threads_start = threading.active_count()
         generation_refs = []
         resource_samples = []
@@ -439,12 +507,13 @@ class RealDeckTopologyTests(SimpleTestCase):
         # One additional long-lived worker belongs to the surviving B
         # teardown boundary; it services all 100 retirements.
         self.assertLessEqual(threading.active_count(), threads_start + 1)
-        self.assertLessEqual(_task_count(), tasks_start + 8)
-        self.assertLessEqual(
-            max(sample["tasks"] for sample in resource_samples[-3:])
-            - min(sample["tasks"] for sample in resource_samples[-3:]),
-            2,
-        )
+        # Thread growth is judged on settled, IsadoraAir-relevant counts, not
+        # on the mid-churn samples above: those track GStreamer's pool idle
+        # window (see POOL_IDLE_QUIET_SECONDS) and are kept for the printed
+        # evidence only. A leak of even one streaming thread per detached
+        # generation would put the settled delta near 100.
+        tasks_end = _settled_owned_task_count()
+        self.assertLessEqual(tasks_end, tasks_start + 2)
         self.assertLess(_rss_bytes() - rss_start, 32 * 1024 * 1024)
         self.assertLessEqual(sum(ref() is not None for ref in generation_refs), 1)
         print(
@@ -453,7 +522,7 @@ class RealDeckTopologyTests(SimpleTestCase):
             f"pads={len(tuple(self.engine.mixer.sinkpads))} "
             f"children={_pipeline_child_count(self.engine.main_pipeline)} "
             f"map={len(self.engine._deck_bin_map)} "
-            f"task_delta={_task_count() - tasks_start} "
+            f"task_delta={tasks_end - tasks_start} "
             f"thread_delta={threading.active_count() - threads_start} "
             f"rss_delta={_rss_bytes() - rss_start} samples={resource_samples}",
             flush=True,
@@ -562,8 +631,15 @@ class RealDeckTopologyTests(SimpleTestCase):
                     "deck-real-a-test-worker",
                     "deck-real-b-test-worker",
                 }
+                wedged_workers = {coordinator_a._worker, coordinator_b._worker}
+                # Exactly this engine's two wedged workers -- by identity, so
+                # the assertion is about these coordinators, not about how
+                # many same-named threads exist process-wide.
+                self.assertEqual(len(wedged_workers), 2)
+                self.assertTrue(all(worker.is_alive() for worker in wedged_workers))
                 self.assertEqual(
-                    sum(t.name in worker_names for t in threading.enumerate()), 2
+                    {t for t in threading.enumerate() if t.name in worker_names},
+                    wedged_workers,
                 )
                 critical_before = len(
                     [
@@ -585,7 +661,7 @@ class RealDeckTopologyTests(SimpleTestCase):
                 # generation, dispatch teardown work, or emit another event.
                 self.engine._queue_cursor = 17
                 generation_before = self.engine._deck_generation_serial
-                tasks_before = _task_count()
+                task_ids_before = _task_ids()
                 threads_before = threading.active_count()
                 rss_before = _rss_bytes()
                 with patch.object(self.engine, "_next_queue_item") as next_item:
@@ -600,11 +676,16 @@ class RealDeckTopologyTests(SimpleTestCase):
                 self.assertEqual(self.engine._deck_bin_map, {})
                 self.assertEqual(len(tuple(self.engine.mixer.sinkpads)), 0)
                 self.assertEqual(_pipeline_child_count(self.engine.main_pipeline), 2)
-                self.assertEqual(_task_count(), tasks_before)
+                # Not one OS thread was created by 100 refused starts. (A
+                # count comparison here also failed when an earlier test's
+                # idle pool threads exited inside this window.)
+                new_task_ids = _task_ids() - task_ids_before
+                self.assertEqual(new_task_ids, frozenset())
                 self.assertEqual(threading.active_count(), threads_before)
                 self.assertLessEqual(_rss_bytes() - rss_before, 1024 * 1024)
                 self.assertEqual(
-                    sum(t.name in worker_names for t in threading.enumerate()), 2
+                    {t for t in threading.enumerate() if t.name in worker_names},
+                    wedged_workers,
                 )
                 self.assertEqual(coordinator_a.snapshot()["worker_starts"], 1)
                 self.assertEqual(coordinator_b.snapshot()["worker_starts"], 1)
@@ -622,7 +703,7 @@ class RealDeckTopologyTests(SimpleTestCase):
                     f"pads={len(tuple(self.engine.mixer.sinkpads))} "
                     f"children={_pipeline_child_count(self.engine.main_pipeline)} "
                     f"map={len(self.engine._deck_bin_map)} "
-                    f"task_delta={_task_count() - tasks_before} "
+                    f"new_tasks={len(new_task_ids)} "
                     f"thread_delta={threading.active_count() - threads_before} "
                     f"rss_delta={_rss_bytes() - rss_before}",
                     flush=True,
@@ -851,7 +932,7 @@ class RealDeckTopologyTests(SimpleTestCase):
         self.assertTrue(_wait_until(lambda: warmup.finished))
         self.assertTrue(_wait_until(lambda: self.engine._deck_teardowns["A"].snapshot()["completed"] == 1))
         rss_start = _rss_bytes()
-        tasks_start = _task_count()
+        tasks_start = _settled_owned_task_count()
         threads_start = threading.active_count()
         output_start = self.engine._test_output_buffers
         with patch.object(GLib, "idle_add", side_effect=suppress_only_deck_completion):
@@ -877,12 +958,13 @@ class RealDeckTopologyTests(SimpleTestCase):
         self.assertGreater(self.engine._test_output_buffers, output_start)
         self.assertEqual(self.engine._deck_teardowns["A"].snapshot()["worker_starts"], 1)
         self.assertLessEqual(threading.active_count(), threads_start + 1)
-        self.assertLessEqual(_task_count(), tasks_start + 2)
+        tasks_end = _settled_owned_task_count()
+        self.assertLessEqual(tasks_end, tasks_start + 2)
         self.assertLess(_rss_bytes() - rss_start, 32 * 1024 * 1024)
         print(
             "contained-storm-resources "
             f"watchdogs=100 pads={len(tuple(self.engine.mixer.sinkpads))} "
-            f"map={len(self.engine._deck_bin_map)} task_delta={_task_count() - tasks_start} "
+            f"map={len(self.engine._deck_bin_map)} task_delta={tasks_end - tasks_start} "
             f"thread_delta={threading.active_count() - threads_start} "
             f"rss_delta={_rss_bytes() - rss_start}",
             flush=True,
