@@ -49,18 +49,22 @@ A factual comparison against systems stations evaluating IsadoraAir are likely a
 - Drive offset and staging configuration are admin-editable — swapping drives doesn't need a redeploy
 
 **Schedule Programming**
-- A 7×24 schedule grid assigns either a weighted Rotation or a fixed Playlist to each hour, recurring by day-of-week or one-off for a specific date
+- Named Schedule Profiles separate programming plans, with explicit active and default profiles plus recurring Weekly and one-date override layers
+- The 7×24 overview opens an Hour Detail editor for exact-minute Rotation or Playlist transitions; date overrides inherit Weekly programming until their own first transition
+- An hour may be completely blank (the previous program continues) or partial: for example, a lone `11:30 Rotation B` continues the prior program until 11:30, then hands the future queue to B without hard-cutting the track already on air
 - Rotations are ordered category slots; Playlists are hand-built ordered track lists
 - Holiday-themed rotation weighting with configurable ramp-in/ramp-out
+- See [`docs/SCHEDULE_PROFILES.md`](docs/SCHEDULE_PROFILES.md) for profile, layering, and partial-hour semantics
 
 **Log Builder**
-- Generates each hour automatically from its schedule, with configurable recency/artist separation (including related-artist identity) and no manual approval gate
+- Generates one PlaylistLog per scheduled wall-clock hour, with configurable recency/artist separation (including related-artist identity) and no manual approval gate
 - Lands each hour's end precisely against the real next-hour boundary, with a fallback category to top up a short hour and bounded live backfill for genuine gaps
-- A schedule hour can be left intentionally blank to let the current program continue instead of forcing an artificial break
+- A completely blank hour keeps continuation ownership with the prior program; a partial hour builds only its later transitions and becomes eligible at its first scheduled minute
+- Exact-minute transitions express programming intent at natural track/playlist boundaries; they do not chop audio at the clock minute
 
 **Playback Engine**
 - Dual-deck playout with real crossfading timed off each track's own analyzed cue-in/next-start points — not a scripted fade curve
-- Broadcast-clock hour handling keeps playback locked to wall-clock top-of-hour
+- Broadcast-clock queue handoffs follow scheduled hour/minute eligibility while allowing the already-playing track to finish or crossfade naturally
 - Pause, resume, eject, and reliable live seek per deck, fully controllable from the dashboard waveform
 - Automatic recovery from USB audio-device loss/re-enumeration, with failure containment that isolates a bad playback attempt rather than taking down the whole station
 
@@ -72,7 +76,7 @@ A factual comparison against systems stations evaluating IsadoraAir are likely a
 **Remote DJ over WebRTC**
 - A browser-based remote console lets a DJ connect from any phone or laptop, hear program audio via mix-minus monitor return, and talk over via a gated remote mic
 - Full queue authority for the connected DJ — search, play now, reorder, force-next — so they can run a complete show remotely
-- Login-gated to a dedicated group with short-lived signaling tokens; the same ducking configuration applies to whichever mic (studio or remote) is live
+- Server-enforced roles/capabilities, short-lived signaling tokens, and optional scheduled TalentAssignment windows gate access; active sessions are re-authorized so revoked access does not linger
 
 **Live Dashboard**
 - Dual-deck view with click-to-seek waveform, live position, and transport controls; the idle deck previews what's coming up next
@@ -92,7 +96,7 @@ A factual comparison against systems stations evaluating IsadoraAir are likely a
 
 **Aircheck Recording**
 - On-demand start/stop from any dashboard, capturing the actual on-air signal — not a re-decode of the library file
-- An always-ready backend means no per-session subprocess and no contention with the streaming encoders
+- An always-ready backend means no per-session subprocess and no contention with the streaming encoders; active recordings segment safely to bound the working file and recover interrupted finalization
 - Finalized recordings are compactly archived (HE-AAC) and can be auto-indexed into the library for operator review
 
 **Streaming Encoders**
@@ -119,13 +123,14 @@ A factual comparison against systems stations evaluating IsadoraAir are likely a
 
 **Admin & Configuration**
 - Django admin organized into Library / Traffic / Config / Logs, with an editable nav menu and site-wide theme (colors, clock style, default album art) — no template edits
-- Group-based access control: non-staff users see only the pages their groups are granted, admin-editable with no code change
+- Groups bind named station Roles to granular Capabilities; operational endpoints enforce those capabilities server-side, and schedule-restricted talent access can additionally require an active TalentAssignment window
 - Selected operational settings (SMTP, library paths, MusicBrainz contact, weather/report directories) are admin-editable with explicit saved-vs-running state, rather than requiring `.env` edits
 - Password-reset and admin-invite account flows, an audit log of every outgoing email, and login-lockout on repeated failed sign-ins
 
 **Managed Update Center**
 - Staff/superusers can inspect release state and available updates; installation is superuser-only
-- Declarative release manifests validate checkout, schema, and prerequisites before an install is offered; a separately installed, protected backend independently re-authorizes and applies only release-declared safe actions
+- Declarative, signed release manifests validate checkout, schema, prerequisites, and protected-runtime compatibility before an install is offered; a separately installed backend independently re-authorizes and applies only release-declared actions
+- Migration plans are mechanically classified. Operations outside the automatic allowlist stop at an explicit review point and require a fresh approval bound to the exact release/commit/manifest/plan digest; unsupported or destructive transitions remain fail-closed rather than being treated as universally unattended
 - Dirty, divergent, or otherwise untrustworthy source/release state fails closed rather than guessing
 
 **Text-to-Speech**
@@ -148,6 +153,7 @@ IsadoraAir (Django 5.2 LTS)
 ├── library/                       # Library, scheduling, dashboard + playback app
 │   ├── services/engine.py         # GStreamer playback engine (standalone process)
 │   └── ...                        # Models, views, admin, CD ripping, log builder, related-artist logic
+├── authz/                         # Roles, capabilities, talent windows + authorization audit
 ├── hardware/                      # Audio I/O, ducking, stable-device identity, Remote DJ audio input
 ├── aircheck/                      # Aircheck recording/session management
 ├── webrequests/                   # Native request sync, scheduling + dedication intros
@@ -167,7 +173,7 @@ IsadoraAir (Django 5.2 LTS)
 ## Stack
 
 - **Backend:** Django 5.2 LTS on Python 3.14, PostgreSQL 18, Gunicorn
-- **Playback:** GStreamer 1.28.x (PyGObject) — standalone engine process, IPC with Django via JSON state/command files
+- **Playback:** the GStreamer 1.28.x series supplied and maintained through supported Ubuntu 26.04 packages (PyGObject) — standalone engine process, bounded file-based IPC with Django
 - **Streaming:** Liquidsoap 2.4.x — standalone encoder manager relaying to Icecast/Shoutcast, including Live365/Radio.co provider presets
 - **Hardware control:** ALSA (`amixer`/`arecord`/`aplay`) for device enumeration, stable identity resolution, and mixer control
 - **Frontend:** Django templates, vanilla JavaScript (no framework)
@@ -489,13 +495,15 @@ already carries over if your folders are grouped that way.
 Rivendell's Clocks vs Log approach. A `Rotation` is an ordered list of
 category slots the log builder fills by weighted random pick,
 respecting recency separation; a `Playlist` is a curated ordered list
-of specific tracks copied verbatim. A `ScheduleBlock` maps either one
-onto real time — recurring weekly, or one-off for a specific date.
+of specific tracks copied verbatim. A `ScheduleBlock` is an exact-minute
+transition inside one Schedule Profile's recurring Weekly or one-date
+override layer; several transitions can share one wall-clock hour and still
+produce one generated PlaylistLog.
 
 **There's no separate workstation install per operator.** Everything
-is web-based. Any operator with a browser and login credentials can do
-anything they have permission for from anywhere, including a live DJ
-shift via the WebRTC Remote DJ console.
+is web-based. Roles and Capabilities decide what each signed-in operator may
+do, and scheduled TalentAssignments can further scope on-air access; an
+authorized operator can run a live shift through the WebRTC Remote DJ console.
 
 **Commercial-style traffic (underwriting, affidavits, spot rotation)
 is not part of the current implementation.** The existing "Traffic"
@@ -525,16 +533,12 @@ removed rather than kept as checked-off entries.
 ### Near-term hardening
 
 - Hands-off bootable recovery-media / operator closeout
-- GStreamer 1.28.x upgrade and regression validation — current target 1.28.7
 - Remote DJ connection/link-quality hardening
-- Playback/accounting semantics — an authoritative definition of "played"
 - Future-log readiness validation
-- Aircheck `/run`/working-storage containment and retention guardrails
 
 ### Built features needing their next layer
 
 - Scheduled Aircheck recording tied to `/schedule/` program blocks
-- Granular talent roles, capabilities, and scheduled access
 - Log-position voice tracking + remote talent job workflow
 - Native managed recurring/syndicated ingestion
 - Advanced music scheduling rules + category-health diagnostics
@@ -548,7 +552,6 @@ removed rather than kept as checked-off entries.
 
 ### Independent capability direction
 
-- Multiple `/schedule/` profiles
 - Portable configuration export/import for schedules, rotations, and playlists
 - Interactive fresh-machine installer
 - NCE-friendly underwriting / traffic / PSA scheduling + reconciliation
