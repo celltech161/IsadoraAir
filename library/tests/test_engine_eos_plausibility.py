@@ -338,14 +338,28 @@ class SeekRejectionHandlingTests(TransactionTestCase):
         self.assertIn('continuation_reason="auto_resume"', src)
         self.assertNotIn("deck.pipeline.seek_simple", src)
 
-    def test_rejected_seek_rebases_to_zero_before_gate_release(self):
+    def test_rejected_seek_never_releases_its_advanced_decoder_as_position_zero(self):
+        """r0103 / 1.19: the rejected generation's decoder ran behind the closed
+        valve for the whole gated period, so it is NOT at 0. Its gate must never
+        be opened under a "0" label; a fresh position-0 generation replaces it."""
         src = inspect.getsource(eng_module.PlaybackEngine._resolve_gated_seek)
-        rejected = src[src.index('if rejected:'):src.index('else:', src.index('if rejected:'))]
-        self.assertIn("internal_position_ns=0", rejected)
-        self.assertIn("ghost_pad.remove_probe(probe_id)", rejected)
+        start = src.index('if outcome in ("rejected", "exception"):')
+        rejected = src[start:src.index("return", start)]
+        self.assertIn("_replace_gated_seek_with_zero_fallback(", rejected)
+        self.assertNotIn('set_property("drop", False)', rejected)
+        self.assertNotIn("_apply_pad_offset", rejected)
+
+    def test_accepted_seek_offsets_from_gstreamer_running_time_before_gate_release(self):
+        """r0103 / 1.19 root cause: after a flushing seek the confirmed
+        buffer's RUNNING time is ~0, not its media position; the pad offset
+        must come from GStreamer's segment and precede the gate opening."""
+        src = inspect.getsource(eng_module.PlaybackEngine._resolve_gated_seek)
+        self.assertIn("_segment_running_time_ns(ghost_pad, achieved_ns)", src)
+        self.assertIn("internal_position_ns=internal_running_ns", src)
+        self.assertNotIn("internal_position_ns=achieved_ns", src)
         self.assertLess(
-            rejected.index("internal_position_ns=0"),
-            rejected.index("ghost_pad.remove_probe(probe_id)"),
+            src.index("internal_position_ns=internal_running_ns"),
+            src.rindex('op["valve"].set_property("drop", False)'),
         )
 
 
@@ -588,27 +602,50 @@ class GatedSeekRejectionTests(TransactionTestCase):
         self.addCleanup(lambda: _settle_teardowns_then_stop(self.engine))
         self.engine.main_pipeline.set_state(Gst.State.PLAYING)
 
-    def test_manual_seek_rejection_rebases_pad_timeline_to_actual_zero(self):
+    def seek_with_injected_rejection(self, start_seek):
+        """Force a native seek rejection and follow the slot to its final owner.
+
+        Rejection is injected at the class level for the whole window, so it
+        does not matter which deck object exists when the background worker
+        dispatches (a seek legitimately waits as *pending* while a prior
+        decoder teardown is still in flight -- patching one instance raced
+        that and could silently test nothing). Returns the retired generation,
+        the live replacement and the captured emit/print mocks.
+        """
+        retired = []
+        real = self.engine._replace_gated_seek_with_zero_fallback
+
+        def record(deck, **kwargs):
+            retired.append(deck)
+            return real(deck, **kwargs)
+
+        self.engine._replace_gated_seek_with_zero_fallback = record
+        with patch.object(Gst.Element, "seek_simple", lambda *a, **kw: False), \
+                patch.object(eng_module, "emit_event") as mock_emit, \
+                patch("builtins.print") as mock_print:
+            start_seek()
+            self.assertTrue(_pump_until_slot_seek_resolved(self.engine, "A", timeout=10.0))
+        self.assertEqual(len(retired), 1, "exactly one rejected generation must be replaced")
+        return retired[0], self.engine.decks["A"], mock_emit, mock_print
+
+    def test_manual_seek_rejection_replaces_generation_with_fresh_position_zero(self):
         self.engine._create_deck("A", self.log_item, resume_position_ns=0)
         self.assertTrue(_pump_engine(self.engine, lambda: self.engine.decks["A"].media_buffer_count > 0))
 
-        self.engine._seek_deck("A", 3.0)
-        deck = self.engine.decks["A"]
-        # Overridden immediately -- _dispatch_gated_seek_call fires the
-        # instant the initial readiness observer's first hit is seen, which can
-        # itself happen before a test-side wait for "phase == seeking"
-        # ever gets scheduled; only a same-statement-window override is
-        # race-free against the background worker's own dispatch.
-        deck.pipeline.seek_simple = lambda *a, **kw: False
+        rejected, live, mock_emit, mock_print = self.seek_with_injected_rejection(
+            lambda: self.engine._seek_deck("A", 3.0)
+        )
 
-        with patch.object(eng_module, "emit_event") as mock_emit, patch("builtins.print") as mock_print:
-            self.assertTrue(_pump_until_seek_resolved(self.engine, deck))
-
-        self.assertIsNone(deck.gated_seek)
-        self.assertAlmostEqual(deck.started_at, time.time(), delta=0.5)
+        # The rejected generation is retired, never exposed as "position 0".
+        self.assertIsNone(rejected.gated_seek)
+        self.assertTrue(rejected.retirement_started)
+        self.assertIsNot(live, rejected)
+        self.assertEqual(live.continuation_reason, "seek_rejected_fallback_zero")
+        self.assertAlmostEqual(live.started_at, time.time(), delta=0.5)
+        self.assertLess(self.engine._get_deck_position(live), 0.5)
         mock_emit.assert_called_once()
         self.assertEqual(mock_emit.call_args.kwargs["detail"]["fallback_seconds"], 0.0)
-        self.assertTrue(mock_emit.call_args.kwargs["detail"]["pad_offset_rebased"])
+        self.assertTrue(mock_emit.call_args.kwargs["detail"]["replaced_with_fresh_generation"])
         messages = [call.args[0] for call in mock_print.call_args_list if call.args]
         self.assertTrue(any(
             "outcome rejected" in item and "playing same item from 0 instead" in item
@@ -616,53 +653,43 @@ class GatedSeekRejectionTests(TransactionTestCase):
         ))
         self.assertFalse(any("Seek to 3.0s" in item for item in messages if "rejected" not in item))
 
-    def test_resume_seek_rejection_rebases_pad_timeline_and_preserves_pause_derived_position(self):
-        # resume_position_ns=0 -- a genuine fresh (unseeked) deck, so its
-        # real internal position actually starts at (and briefly after
-        # creation, sits near) zero, unlike resume_position_ns=<target>
-        # which is only ever a pre-seek ASSUMPTION until a real seek
-        # confirms it (the exact hazard r0062 already guards against
-        # elsewhere) -- irrelevant for this test anyway, since only
-        # _resume_deck's REJECTION behavior is under test here, not the
-        # specific pre-pause position.
+    def test_resume_seek_rejection_replaces_generation_and_stays_unpaused(self):
+        # resume_position_ns=0 -- a genuine fresh (unseeked) deck. A real pause
+        # (not hand-set flags) so the deck is genuinely unlinked from the mixer
+        # beforehand, exactly as _resume_deck encounters it in production.
         self.engine._create_deck("A", self.log_item, resume_position_ns=0)
         self.assertTrue(_pump_engine(self.engine, lambda: self.engine.decks["A"].media_buffer_count > 0))
-        # A real pause (not hand-set flags) so the deck is genuinely
-        # unlinked from the mixer beforehand, exactly as _resume_deck
-        # would actually encounter it in production.
         self.engine._pause_deck("A")
 
-        self.engine._resume_deck("A")
-        deck = self.engine.decks["A"]
-        deck.pipeline.seek_simple = lambda *a, **kw: False
+        rejected, live, mock_emit, _print = self.seek_with_injected_rejection(
+            lambda: self.engine._resume_deck("A")
+        )
 
-        with patch.object(eng_module, "emit_event") as mock_emit, patch("builtins.print"):
-            self.assertTrue(_pump_until_seek_resolved(self.engine, deck))
-
-        self.assertIsNone(deck.gated_seek)
         self.assertEqual(mock_emit.call_args.kwargs["detail"]["fallback_seconds"], 0.0)
-        # was_paused=False for _resume_deck (its whole point is coming
-        # OUT of pause) -- rejection must not re-pause the deck.
-        self.assertFalse(deck.paused)
+        # was_paused=False for _resume_deck (its whole point is coming OUT of
+        # pause) -- rejection must not re-pause the live replacement.
+        self.assertIsNot(live, rejected)
+        self.assertEqual(live.continuation_reason, "seek_rejected_fallback_zero")
+        self.assertFalse(live.paused)
 
     def test_seek_deck_does_not_clobber_pause_derived_position_on_rejected_seek(self):
-        """The was_paused branch must not overwrite _pause_deck's own
-        freshly derived paused_position with the unreached seek target
-        when the seek was rejected."""
+        """The was_paused branch must not report the unreached seek target, and
+        must report the replacement's TRUE position (genuinely ~0)."""
         self.engine._create_deck("A", self.log_item, resume_position_ns=0)
         self.assertTrue(_pump_engine(self.engine, lambda: self.engine.decks["A"].media_buffer_count > 0))
         self.engine._pause_deck("A")
 
-        self.engine._seek_deck("A", 5.0)
-        deck = self.engine.decks["A"]
-        deck.pipeline.seek_simple = lambda *a, **kw: False
+        rejected, live, _emit, _print = self.seek_with_injected_rejection(
+            lambda: self.engine._seek_deck("A", 5.0)
+        )
 
-        with patch.object(eng_module, "emit_event"), patch("builtins.print"):
-            self.assertTrue(_pump_until_seek_resolved(self.engine, deck))
-
-        self.assertTrue(deck.paused)
-        self.assertNotEqual(deck.paused_position, 5.0)
-        self.assertLess(deck.paused_position, 1.0)
+        # Previously flaky (1.0-1.5 s): the rejected generation's decoder had
+        # already advanced behind the closed valve yet was labelled "0". The
+        # paused live replacement is genuinely at 0, so this is deterministic.
+        self.assertIsNot(live, rejected)
+        self.assertTrue(live.paused)
+        self.assertNotEqual(live.paused_position, 5.0)
+        self.assertLess(live.paused_position, 0.5)
 
 
 class GatedSeekAbandonmentTests(TransactionTestCase):

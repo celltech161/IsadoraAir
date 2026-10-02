@@ -937,6 +937,31 @@ def _plausible_seek_position_ns(value_ns):
     position -- see DECK_SEEK_MAX_PLAUSIBLE_PTS_NS's own comment."""
     return value_ns is not None and 0 <= value_ns < DECK_SEEK_MAX_PLAUSIBLE_PTS_NS
 
+
+def _segment_running_time_ns(pad, position_ns):
+    """GStreamer's own running time for ``position_ns`` on ``pad``'s current
+    segment, or None when there is no usable segment mapping.
+
+    r0103 / 1.19: a FLUSHING seek to T starts a new segment (start=T, base=0),
+    so the first post-seek buffer at media time T has running time ~0, NOT T.
+    The deck's mixer pad offset must be computed from this running time; using
+    the media position instead made post-seek audio arrive T seconds late, and
+    the mixer's catch-up then discarded ~T seconds of media (seek/resume to T
+    played from ~2T; past mid-track that overshoots the end -> early EOS).
+    """
+    if pad is None or position_ns is None:
+        return None
+    event = pad.get_sticky_event(Gst.EventType.SEGMENT, 0)
+    if event is None:
+        return None
+    segment = event.parse_segment()
+    if segment.format != Gst.Format.TIME:
+        return None
+    sign, running_ns = segment.to_running_time_full(Gst.Format.TIME, position_ns)
+    if sign == 0:
+        return None
+    return sign * running_ns
+
 # Remote DJ over WebRTC.
 # Opus's RTP payload mandates 48kHz per RFC 7587 regardless of
 # AudioPipeline.sample_rate -- this is NOT the same as pipeline_sample_rate
@@ -6358,9 +6383,10 @@ class PlaybackEngine:
         its buffers as already old (by however long the pipeline's
         been running) and skips/drops through them to catch up —
         playback becomes audible partway into the track instead of at
-        its start. `internal_position_ns` is wherever this bin's own
-        timeline is starting from — 0 for a fresh track, or the frozen
-        position when resuming a paused deck."""
+        its start. `internal_position_ns` is this bin's own RUNNING time at
+        the moment it joins the mixer -- 0 for a fresh, unseeked track. After a
+        flushing seek it is the running time of the confirmed post-seek buffer
+        (see _segment_running_time_ns), which is ~0, never the media position."""
         clock = self.main_pipeline.get_clock()
         if not clock:
             return
@@ -6921,9 +6947,24 @@ class PlaybackEngine:
                         pad.link(convert.get_static_pad("sink"))
         else:
             real_stage_src = resample.get_static_pad("src")
+            # r0103 / 1.19: the same fixed output contract a primed deck has.
+            # Without it a seek/resume generation offered the media's native
+            # format; when its predecessor's mixer pad was released mid-seek,
+            # the (format-agnostic) deck mixer renegotiated toward that format
+            # while post-seek buffers were in flight and the parser stopped
+            # with not-negotiated -- e.g. a non-44.1 kHz/mono FLAC deck ending
+            # with an ERROR right after a verified seek. Measured: 22.05 kHz
+            # mono FLAC seek-from-playing 6/8 errors vs 0/16 for media already
+            # in the pipeline format.
+            seek_output_caps = Gst.ElementFactory.make("capsfilter", None)
+            seek_output_caps.set_property("caps", Gst.Caps.from_string(
+                f"audio/x-raw,rate={self.pipeline_sample_rate},channels=2"
+            ))
             seek_gate_valve = Gst.ElementFactory.make("valve", None)
+            deck_bin.add(seek_output_caps)
             deck_bin.add(seek_gate_valve)
-            resample.link(seek_gate_valve)
+            resample.link(seek_output_caps)
+            seek_output_caps.link(seek_gate_valve)
 
             def on_pad_added(element, pad):
                 if pad.get_current_caps():
@@ -12404,18 +12445,6 @@ class PlaybackEngine:
             # handled immediately and synchronously by
             # _retire_deck_respecting_gated_seek (native call already
             # returned by this phase, so nothing defers it).
-            ghost_pad.remove_probe(probe_id)
-            deck.gated_seek = None
-            self._remove_deck(
-                deck,
-                occurrence_terminal=False,
-                termination_reason="seek_unconfirmed",
-                defer_null=True,
-            )
-            op.setdefault("retained_failed_predecessors", []).append({
-                "deck": None,
-                "replaced_deck_awaiting_null": deck,
-            })
             print(f"  [{slot}] Seek to {target_ns / Gst.SECOND:.1f}s could not be confirmed -- "
                   f"replacing at position 0", flush=True)
             emit_event(
@@ -12428,22 +12457,10 @@ class PlaybackEngine:
                 },
                 dedupe_key=f"engine|seek-unconfirmed|slot={slot}",
             )
-            fallback = self._create_deck(
-                slot,
-                log_item,
-                resume_position_ns=0,
-                continuation_reason_override="seek_unconfirmed_fallback_zero",
-                continuation_start_on_first_real=not was_paused,
+            self._replace_gated_seek_with_zero_fallback(
+                deck, termination_reason="seek_unconfirmed",
+                continuation_reason="seek_unconfirmed_fallback_zero",
             )
-            if fallback is not None:
-                self._hold_seek_predecessors_until_stable(fallback, op)
-            else:
-                self._finish_seek_replaced_deck_teardown(op)
-                self._retire_failed_seek_records(
-                    op.get("retained_failed_predecessors") or []
-                )
-            if was_paused:
-                self._pause_deck(slot)
             return
 
         if outcome == "never_prerolled":
@@ -12549,28 +12566,15 @@ class PlaybackEngine:
                 self._pause_deck(slot)
             return
 
-        rejected = outcome in ("rejected", "exception")
-        if rejected:
-            # Still fully gated -- nothing program-visible has ever
-            # escaped either way, so finalize-then-remove vs remove-
-            # then-finalize are equally safe here; kept in the same
-            # order as the accepted path below for consistency.
-            achieved_ns = 0
-            # _create_deck already offset this fresh bin as though its
-            # internal timeline began at the target. Rejected means
-            # decode actually begins at zero, so recompute from the main
-            # pipeline's current running time before any buffer is
-            # allowed to inherit the stale target-based offset -- same
-            # r0062 correctness fix as before, just triggered from here
-            # now instead of _seek_deck/_resume_deck directly.
-            self._apply_pad_offset(deck.pipeline, internal_position_ns=0)
-            if not was_paused:
-                self._schedule_continuation_segment_start(
-                    deck, "seek_rejected_fallback_zero"
-                )
-            op["valve"].set_property("drop", False)
-            ghost_pad.remove_probe(probe_id)
-            deck.started_at = time.time()
+        if outcome in ("rejected", "exception"):
+            # r0103 / 1.19: no flushing seek happened, but this generation's
+            # decoder has been running behind the closed valve for the whole
+            # gated period -- it is already 0.2-1.5 s into the media, not at
+            # 0. Re-labelling it "0" (the historical behaviour) both misstated
+            # the position and inserted an equal silent gap at the mixer.
+            # Like an unconfirmed seek, retire it and start a fresh, honest
+            # position-0 generation of the same occurrence; that needs no
+            # seek at all, so it also holds for genuinely unseekable media.
             print(f"  [{slot}] Seek/preroll outcome {outcome} for log_item {log_item.id} "
                   f"at {target_ns / Gst.SECOND:.1f}s -- playing same item from 0 instead",
                   flush=True)
@@ -12583,137 +12587,197 @@ class PlaybackEngine:
                     "target_seconds": target_ns / Gst.SECOND,
                     "fallback_seconds": 0.0,
                     "seek_outcome": outcome,
-                    "pad_offset_rebased": True,
+                    "replaced_with_fresh_generation": True,
                 },
                 dedupe_key=f"engine|seek-rejected|slot={slot}|track={deck.track.id}",
             )
+            self._replace_gated_seek_with_zero_fallback(
+                deck, termination_reason="seek_rejected",
+                continuation_reason="seek_rejected_fallback_zero",
+            )
+            return
+
+        # Only "accepted" ever reaches here -- "accepted_unconfirmed"
+        # returns above instead, since it must never be reported as
+        # a successful seek.
+        #
+        # r0064 ORDERING FIX: the prior implementation called
+        # remove_probe() unconditionally BEFORE this branch, then
+        # queried position and applied the pad offset AFTER the gate
+        # was already open -- so the very first post-seek buffer
+        # could reach the mixer (and query_position() could race
+        # against the pipeline's own state) before the running-time
+        # offset was ever finalized. Now: the CONFIRMED post-seek
+        # buffer's own PTS -- captured directly by the block probe,
+        # off the exact item still sitting held at the gate -- is
+        # read first, the offset is computed and applied while
+        # STILL fully gated, and the probe is removed LAST. The
+        # first buffer the mixer ever sees from this generation
+        # already carries correct timing; nothing is ever released
+        # using a stale or transitional offset.
+        #
+        # r0064 validation pass -- PTS plausibility hierarchy:
+        #   1. the confirmed post-seek buffer's own PTS, if it is a
+        #      real, plausible timestamp (never GST_CLOCK_TIME_NONE
+        #      or any other absurd value -- see
+        #      _plausible_seek_position_ns's own comment: that
+        #      sentinel is a defined Python int, not None, so a bare
+        #      `is not None` check alone does not catch it, and a
+        #      raw/parsed buffer immediately after a discontinuity
+        #      can legitimately carry it);
+        #   2. otherwise a direct query_position() (still fully
+        #      gated here, so this is the exact same safe call site
+        #      the pre-r0064 code always used), if ITS result is
+        #      also plausible;
+        #   3. otherwise this is NOT a position this engine can
+        #      truthfully claim was reached, even though the gate
+        #      itself was satisfied by a real buffer -- handled
+        #      identically to "accepted_unconfirmed" (retire this
+        #      generation for real, replace at a truthful position
+        #      0) rather than ever reporting success against an
+        #      unproven position. confirming_hit_but_no_position is
+        #      never expected in practice (the "confirming" phase's
+        #      block_hits check only fires once a real buffer has
+        #      set confirmed_buffer_pts), so this path existing at
+        #      all is belt-and-braces, not a normal outcome.
+        achieved_ns = None
+        confirmed_pts = op.get("confirmed_buffer_pts")
+        if _plausible_seek_position_ns(confirmed_pts):
+            achieved_ns = confirmed_pts
         else:
-            # Only "accepted" ever reaches here -- "accepted_unconfirmed"
-            # returns above instead, since it must never be reported as
-            # a successful seek.
-            #
-            # r0064 ORDERING FIX: the prior implementation called
-            # remove_probe() unconditionally BEFORE this branch, then
-            # queried position and applied the pad offset AFTER the gate
-            # was already open -- so the very first post-seek buffer
-            # could reach the mixer (and query_position() could race
-            # against the pipeline's own state) before the running-time
-            # offset was ever finalized. Now: the CONFIRMED post-seek
-            # buffer's own PTS -- captured directly by the block probe,
-            # off the exact item still sitting held at the gate -- is
-            # read first, the offset is computed and applied while
-            # STILL fully gated, and the probe is removed LAST. The
-            # first buffer the mixer ever sees from this generation
-            # already carries correct timing; nothing is ever released
-            # using a stale or transitional offset.
-            #
-            # r0064 validation pass -- PTS plausibility hierarchy:
-            #   1. the confirmed post-seek buffer's own PTS, if it is a
-            #      real, plausible timestamp (never GST_CLOCK_TIME_NONE
-            #      or any other absurd value -- see
-            #      _plausible_seek_position_ns's own comment: that
-            #      sentinel is a defined Python int, not None, so a bare
-            #      `is not None` check alone does not catch it, and a
-            #      raw/parsed buffer immediately after a discontinuity
-            #      can legitimately carry it);
-            #   2. otherwise a direct query_position() (still fully
-            #      gated here, so this is the exact same safe call site
-            #      the pre-r0064 code always used), if ITS result is
-            #      also plausible;
-            #   3. otherwise this is NOT a position this engine can
-            #      truthfully claim was reached, even though the gate
-            #      itself was satisfied by a real buffer -- handled
-            #      identically to "accepted_unconfirmed" (retire this
-            #      generation for real, replace at a truthful position
-            #      0) rather than ever reporting success against an
-            #      unproven position. confirming_hit_but_no_position is
-            #      never expected in practice (the "confirming" phase's
-            #      block_hits check only fires once a real buffer has
-            #      set confirmed_buffer_pts), so this path existing at
-            #      all is belt-and-braces, not a normal outcome.
-            achieved_ns = None
-            confirmed_pts = op.get("confirmed_buffer_pts")
-            if _plausible_seek_position_ns(confirmed_pts):
-                achieved_ns = confirmed_pts
-            else:
-                ok, pos = deck.pipeline.query_position(Gst.Format.TIME)
-                if ok and _plausible_seek_position_ns(pos):
-                    achieved_ns = pos
+            ok, pos = deck.pipeline.query_position(Gst.Format.TIME)
+            if ok and _plausible_seek_position_ns(pos):
+                achieved_ns = pos
 
-            if achieved_ns is None:
-                print(f"  [{slot}] Seek to {target_ns / Gst.SECOND:.1f}s confirmed by the gate but no "
-                      f"plausible position could be established (confirmed_buffer_pts={confirmed_pts!r}) -- "
-                      f"treating as unconfirmed", flush=True)
-                emit_event(
-                    category="engine", level="error",
-                    title="Deck seek confirmed with no plausible position -- treated as unconfirmed",
-                    detail={
-                        "slot": slot, "track_id": deck.track.id, "track_title": deck.track.title,
-                        "target_seconds": target_ns / Gst.SECOND,
-                        "confirmed_buffer_pts": confirmed_pts,
-                    },
-                    dedupe_key=f"engine|seek-implausible-pts|slot={slot}",
-                )
-                return self._resolve_gated_seek(deck, outcome="accepted_unconfirmed")
+        if achieved_ns is None:
+            print(f"  [{slot}] Seek to {target_ns / Gst.SECOND:.1f}s confirmed by the gate but no "
+                  f"plausible position could be established (confirmed_buffer_pts={confirmed_pts!r}) -- "
+                  f"treating as unconfirmed", flush=True)
+            emit_event(
+                category="engine", level="error",
+                title="Deck seek confirmed with no plausible position -- treated as unconfirmed",
+                detail={
+                    "slot": slot, "track_id": deck.track.id, "track_title": deck.track.title,
+                    "target_seconds": target_ns / Gst.SECOND,
+                    "confirmed_buffer_pts": confirmed_pts,
+                },
+                dedupe_key=f"engine|seek-implausible-pts|slot={slot}",
+            )
+            return self._resolve_gated_seek(deck, outcome="accepted_unconfirmed")
 
-            if abs(achieved_ns - target_ns) > DECK_SEEK_TARGET_TOLERANCE_NS:
-                print(
-                    f"  [{slot}] Seek to {target_ns / Gst.SECOND:.1f}s produced "
-                    f"buffer position {achieved_ns / Gst.SECOND:.1f}s -- treating "
-                    "as unconfirmed",
-                    flush=True,
-                )
-                emit_event(
-                    category="engine",
-                    level="error",
-                    title="Deck seek buffer did not match requested target",
-                    detail={
-                        "slot": slot,
-                        "track_id": deck.track.id,
-                        "log_item_id": log_item.id,
-                        "target_seconds": target_ns / Gst.SECOND,
-                        "confirmed_seconds": achieved_ns / Gst.SECOND,
-                    },
-                    dedupe_key=f"engine|seek-target-mismatch|slot={slot}",
-                )
-                return self._resolve_gated_seek(
-                    deck, outcome="accepted_unconfirmed"
-                )
-
-            self._apply_pad_offset(deck.pipeline, internal_position_ns=achieved_ns)
-            deck.seeked_at = time.time()
-            deck.started_at = time.time() - (achieved_ns / Gst.SECOND)
-            if not was_paused:
-                self._schedule_continuation_segment_start(
-                    deck, op.get("continuation_reason") or "seek_confirmed"
-                )
-            op["valve"].set_property("drop", False)
-            ghost_pad.remove_probe(probe_id)
+        if abs(achieved_ns - target_ns) > DECK_SEEK_TARGET_TOLERANCE_NS:
             print(
-                f"  [{slot}] Seek/preroll verified for log_item {log_item.id}: "
-                f"decoded post-seek buffer at {achieved_ns / Gst.SECOND:.1f}s",
+                f"  [{slot}] Seek to {target_ns / Gst.SECOND:.1f}s produced "
+                f"buffer position {achieved_ns / Gst.SECOND:.1f}s -- treating "
+                "as unconfirmed",
                 flush=True,
             )
+            emit_event(
+                category="engine",
+                level="error",
+                title="Deck seek buffer did not match requested target",
+                detail={
+                    "slot": slot,
+                    "track_id": deck.track.id,
+                    "log_item_id": log_item.id,
+                    "target_seconds": target_ns / Gst.SECOND,
+                    "confirmed_seconds": achieved_ns / Gst.SECOND,
+                },
+                dedupe_key=f"engine|seek-target-mismatch|slot={slot}",
+            )
+            return self._resolve_gated_seek(
+                deck, outcome="accepted_unconfirmed"
+            )
+
+        # The pad offset maps this bin's RUNNING time onto the mixer's.
+        # After the flushing seek that running time restarts near 0 at
+        # the target; it is read from GStreamer's segment for the very
+        # buffer the gate holds, never inferred from the media position.
+        internal_running_ns = _segment_running_time_ns(ghost_pad, achieved_ns)
+        if internal_running_ns is None:
+            print(
+                f"  [{slot}] Seek to {target_ns / Gst.SECOND:.1f}s produced a buffer with no "
+                "usable segment running time -- treating as unconfirmed",
+                flush=True,
+            )
+            return self._resolve_gated_seek(deck, outcome="accepted_unconfirmed")
+        self._apply_pad_offset(deck.pipeline, internal_position_ns=internal_running_ns)
+        deck.seeked_at = time.time()
+        deck.started_at = time.time() - (achieved_ns / Gst.SECOND)
+        if not was_paused:
+            self._schedule_continuation_segment_start(
+                deck, op.get("continuation_reason") or "seek_confirmed"
+            )
+        op["valve"].set_property("drop", False)
+        ghost_pad.remove_probe(probe_id)
+        print(
+            f"  [{slot}] Seek/preroll verified for log_item {log_item.id}: "
+            f"decoded post-seek buffer at {achieved_ns / Gst.SECOND:.1f}s "
+            f"(track_id={deck.track.id} requested_seek_ns={target_ns} "
+            f"confirmed_position_ns={achieved_ns} "
+            f"segment_running_time_ns={internal_running_ns} "
+            f"reason={op.get('continuation_reason')})",
+            flush=True,
+        )
 
         deck.gated_seek = None
 
         if was_paused:
             self._pause_deck(slot)
-            if not rejected:
-                # _pause_deck just derived paused_position from a real
-                # _get_deck_position() query; the confirmed achieved
-                # position is authoritative over that estimate. On
-                # rejection, leave _pause_deck's own derived value alone
-                # -- it already reflects the deck's TRUE (unseeked,
-                # now-corrected-to-0) state, and the target was never
-                # actually reached.
-                deck.paused_position = achieved_ns / Gst.SECOND
+            # _pause_deck just derived paused_position from a real
+            # _get_deck_position() query; the confirmed achieved position is
+            # authoritative over that estimate. (Only an accepted seek reaches
+            # here: every fallback outcome returned above.)
+            deck.paused_position = achieved_ns / Gst.SECOND
         else:
             self._next_triggered = False
         self._finish_seek_replaced_deck_teardown(op)
         self._retire_failed_seek_records(
             op.get("retained_failed_predecessors") or []
         )
+
+    def _replace_gated_seek_with_zero_fallback(self, deck, *, termination_reason, continuation_reason):
+        """Retire a gated-seek generation whose target was not reached and
+        start a fresh, honest position-0 generation of the same occurrence.
+
+        Shared by the unconfirmed and rejected outcomes so both describe the
+        same truth: the replacement is genuinely at 0 (no seek is needed to get
+        there). The retired generation stays isolated until the replacement
+        has proven stable, exactly as before.
+        """
+        op = deck.gated_seek
+        slot = op["slot"]
+        log_item = op["log_item"]
+        was_paused = op["was_paused"]
+        op["ghost_pad"].remove_probe(op["probe_id"])
+        deck.gated_seek = None
+        self._remove_deck(
+            deck,
+            occurrence_terminal=False,
+            termination_reason=termination_reason,
+            defer_null=True,
+        )
+        op.setdefault("retained_failed_predecessors", []).append({
+            "deck": None,
+            "replaced_deck_awaiting_null": deck,
+        })
+        fallback = self._create_deck(
+            slot,
+            log_item,
+            resume_position_ns=0,
+            continuation_reason_override=continuation_reason,
+            continuation_start_on_first_real=not was_paused,
+        )
+        if fallback is not None:
+            self._hold_seek_predecessors_until_stable(fallback, op)
+        else:
+            self._finish_seek_replaced_deck_teardown(op)
+            self._retire_failed_seek_records(
+                op.get("retained_failed_predecessors") or []
+            )
+        if was_paused:
+            self._pause_deck(slot)
+        return fallback
 
     def _quarantined_seek_generation_count(self):
         """Cumulative count of generations abandoned because their native
