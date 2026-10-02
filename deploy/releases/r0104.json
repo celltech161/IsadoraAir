@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "release_id": "r0104",
+  "previous_release_id": "r0103",
+  "minimum_updater_protocol_version": 5,
+  "summary": "Development/test safety and validation-harness release. The destructive-test guard now proves both a test_* database and a non-production, non-superuser PostgreSQL role before any TransactionTestCase flush, failing closed. Browser tests close Playwright-context DB connections; stale Update Center fixtures and deck-lifecycle thread assertions are corrected. Tests and docs only: no runtime, migration, package, systemd, nginx or static changes. No service restarts.",
+  "migrations_required": [],
+  "migration_compatibility": null,
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0081",
+  "protected_runtime": null
+}
