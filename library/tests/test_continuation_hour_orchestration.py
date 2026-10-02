@@ -225,6 +225,110 @@ class ContinuationHourOrchestrationTests(TransactionTestCase):
         self.assertEqual(emitted, [])
         thread.assert_not_called()
 
+    # -- approved-log authority: edits after approval cannot move a takeover --
+    def approved_partial_at_1130(self):
+        """Old 10:00 track still on air; an 11:30 partial log built and
+        approved from an 11:30 ScheduleBlock."""
+        old_track = self.make_track(duration=7200)
+        old_log, (old_item,) = self.make_log(FRIDAY, 10, tracks=[old_track], played=True)
+        block = self.make_block(FRIDAY, 11, minute=30)
+        partial, (partial_item,) = self.partial_log(FRIDAY, 11, 30, self.make_track())
+        stand_in = make_stand_in()
+        self.put_last_item_on_deck(stand_in, old_log, old_item)
+        return stand_in, old_log, partial, partial_item, block
+
+    def state_at(self, stand_in, minute, second=0):
+        return stand_in._current_hour_schedule_state(self.fake_now(FRIDAY, 11, minute, second))
+
+    def peek_at(self, stand_in, minute, second=0):
+        stand_in._next_hour_peek = None  # never answer from the 5 s cache
+        with patch.object(
+            eng_module.timezone, "localtime",
+            return_value=self.fake_now(FRIDAY, 11, minute, second),
+        ):
+            return stand_in._peek_next_hour()
+
+    def assert_takes_over_exactly_at_1130(self, stand_in, old_log, partial, partial_item):
+        before = self.state_at(stand_in, 29, 59)
+        self.assertEqual(before["state"], "partial_before_takeover")
+        self.assertEqual(before["authority"], "approved_log")
+        self.assertEqual((before["takeover_time"].hour, before["takeover_time"].minute), (11, 30))
+        self.assertIsNone(self.peek_at(stand_in, 29, 59))
+        self.run_tick(stand_in, self.fake_now(FRIDAY, 11, 29, 59))
+        self.assertEqual(stand_in.current_log.id, old_log.id)
+
+        due = self.state_at(stand_in, 30)
+        self.assertEqual(due["state"], "partial_due")
+        peek = self.peek_at(stand_in, 30)
+        self.assertIsNotNone(peek, "crossfade look-ahead must see the approved partial log at 11:30")
+        self.assertEqual(peek[0].id, partial.id)
+        deck_before = stand_in.decks["A"]
+        self.run_tick(stand_in, self.fake_now(FRIDAY, 11, 30))
+        self.assertEqual(stand_in.current_log.id, partial.id)
+        self.assertEqual(stand_in.log_items[0].id, partial_item.id)
+        self.assertIs(stand_in.decks["A"], deck_before)  # no hard cut
+
+    def test_a_later_schedule_edit_does_not_delay_an_approved_partial_takeover(self):
+        stand_in, old_log, partial, partial_item, block = self.approved_partial_at_1130()
+        ScheduleBlock.objects.filter(pk=block.pk).update(start_time=dt_time(11, 45))
+        self.assert_takes_over_exactly_at_1130(stand_in, old_log, partial, partial_item)
+
+    def test_deleting_the_schedule_does_not_cancel_an_approved_partial_takeover(self):
+        stand_in, old_log, partial, partial_item, _block = self.approved_partial_at_1130()
+        ScheduleBlock.objects.filter(specific_date=FRIDAY).delete()
+        self.assertFalse(ScheduleBlock.objects.filter(specific_date=FRIDAY).exists())
+        self.assert_takes_over_exactly_at_1130(stand_in, old_log, partial, partial_item)
+
+    def test_an_earlier_schedule_edit_cannot_advance_an_approved_partial_takeover(self):
+        stand_in, old_log, partial, partial_item, block = self.approved_partial_at_1130()
+        ScheduleBlock.objects.filter(pk=block.pk).update(start_time=dt_time(11, 15))
+        at_quarter = self.state_at(stand_in, 15)
+        self.assertEqual(at_quarter["state"], "partial_before_takeover")
+        self.assertIsNone(self.peek_at(stand_in, 15))
+        emitted, _thread = self.run_tick(stand_in, self.fake_now(FRIDAY, 11, 15))
+        self.assertEqual(stand_in.current_log.id, old_log.id)
+        self.assertEqual(emitted, [])
+        self.assert_takes_over_exactly_at_1130(stand_in, old_log, partial, partial_item)
+
+    def test_an_approved_ordinary_hour_is_not_reinterpreted_by_a_later_partial_edit(self):
+        old_track = self.make_track()
+        old_log, (old_item,) = self.make_log(FRIDAY, 10, tracks=[old_track], played=True)
+        block = self.make_block(FRIDAY, 11)  # ordinary 11:00
+        ordinary, (first_item, _second) = self.make_log(
+            FRIDAY, 11, tracks=[self.make_track(), self.make_track()],
+        )
+        ScheduleBlock.objects.filter(pk=block.pk).update(start_time=dt_time(11, 40))  # now "partial"
+        stand_in = make_stand_in()
+        stand_in.current_log = old_log
+        stand_in.log_items = [old_item]
+        stand_in._queue_cursor = 1  # old log exhausted, decks idle
+
+        state = self.state_at(stand_in, 10)
+        self.assertEqual(state["state"], "scheduled")
+        self.assertEqual(state["authority"], "approved_log")
+        self.assertTrue(state["takeover_due"])
+        emitted, _thread = self.run_tick(stand_in, self.fake_now(FRIDAY, 11, 10))
+        # Established ordinary behavior: the idle engine installs the hour's
+        # approved log now rather than waiting for an 11:40 "takeover".
+        self.assertEqual(stand_in.current_log.id, ordinary.id)
+        self.assertEqual(stand_in.log_items[0].id, first_item.id)
+        self.assertEqual(emitted, [])
+
+    def test_before_materialization_the_live_schedule_still_classifies_the_hour(self):
+        old_track = self.make_track(duration=7200)
+        old_log, (old_item,) = self.make_log(FRIDAY, 10, tracks=[old_track], played=True)
+        self.make_block(FRIDAY, 11, minute=30)
+        stand_in = make_stand_in()
+        self.put_last_item_on_deck(stand_in, old_log, old_item)
+
+        state = self.state_at(stand_in, 10)
+        self.assertEqual(state["authority"], "schedule")
+        self.assertEqual(state["state"], "partial_before_takeover")
+        self.assertTrue(state["has_hour_schedule"])
+        _emitted, thread = self.run_tick(stand_in, self.fake_now(FRIDAY, 11, 10))
+        thread.assert_called()  # the prospective partial hour is still built
+        self.assertEqual(stand_in.current_log.id, old_log.id)
+
     def test_exhaustion_before_partial_takeover_uses_live_fill_not_partial_log(self):
         old_track = self.make_track()
         old_log, (old_item,) = self.make_log(FRIDAY, 10, tracks=[old_track], played=True)

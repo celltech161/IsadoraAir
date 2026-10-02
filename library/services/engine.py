@@ -5100,6 +5100,28 @@ class PlaybackEngine:
             for item in items
         )
 
+    def _approved_log_takeover(self, target_date, hour, wall_now):
+        """``(log, eligible, takeover_at)`` for one wall hour's APPROVED log,
+        or ``(None, None, None)`` when nothing is approved yet.
+
+        Deliberately light (this runs on the poll path during a continuation
+        window): only the fields the eligibility gate reads, filtered exactly
+        like every queue-materialization site so the classifier and the gate
+        always see the same item set.
+        """
+        log = (
+            PlaylistLog.objects
+            .filter(date=target_date, hour=hour, status="approved")
+            .first()
+        )
+        if log is None:
+            return None, None, None
+        items = self._apply_poison_skip(list(
+            log.items.only("id", "playlist_log", "scheduled_time")
+        ))
+        eligible, takeover_at = self._log_queue_eligibility(log, items, wall_now)
+        return log, eligible, takeover_at
+
     def _current_hour_schedule_state(self, now):
         """Central current-hour orchestration classification.
 
@@ -5108,12 +5130,64 @@ class PlaybackEngine:
         continuation only while an older active log still has committed
         playout; an exhausted/missing old log is an unscheduled gap, not
         silently accepted merely because a stale PlaylistLog row exists.
+
+        Authority: once the current hour has an APPROVED log, that log -- via
+        its materialized items and ``_log_queue_eligibility`` -- is the
+        immutable programming authority for the hour. Editing or deleting
+        ScheduleBlocks afterward can neither advance, delay nor cancel its
+        takeover, and an approved ordinary hour is never reinterpreted as
+        partial. Live schedule resolution is consulted only before an hour is
+        materialized (blank / ordinary / prospective partial / build needed).
         """
         now_key = (now.date(), now.hour)
         active_key = (
             (self.current_log.date, self.current_log.hour)
             if self.current_log is not None else None
         )
+        approved_log, approved_eligible, approved_takeover = self._approved_log_takeover(
+            now.date(), now.hour, now,
+        )
+        if approved_log is not None:
+            authority = "approved_log"
+            schedule_block = None
+            has_hour_schedule = True
+            if approved_takeover is not None:
+                takeover_time = approved_takeover.astimezone(timezone.get_current_timezone())
+                first_transition_minute = takeover_time.minute
+                takeover_due = bool(approved_eligible)
+                if takeover_due:
+                    state = "partial_due"
+                    has_committed_playout = False
+                else:
+                    state = "partial_before_takeover"
+                    has_committed_playout = self._active_log_has_committed_playout()
+            else:
+                # Ordinary approved hour: established full-hour behavior,
+                # including the intentional early-rollover label when the
+                # active queue already moved ahead of the wall clock.
+                first_transition_minute = 0
+                takeover_time = now.replace(minute=0, second=0, microsecond=0)
+                takeover_due = True
+                state = (
+                    "early_rollover"
+                    if active_key is not None and active_key > now_key
+                    else "scheduled"
+                )
+                has_committed_playout = False
+            return {
+                "state": state,
+                "authority": authority,
+                "now_key": now_key,
+                "active_key": active_key,
+                "schedule_block": schedule_block,
+                "has_hour_schedule": has_hour_schedule,
+                "schedule_expected": has_hour_schedule,
+                "first_transition_minute": first_transition_minute,
+                "takeover_time": takeover_time,
+                "takeover_due": takeover_due,
+                "has_committed_playout": has_committed_playout,
+            }
+
         profile = get_active_schedule_profile()
         segments = resolve_schedule_segments(now.date(), now.hour, profile)
         schedule_block = segments[0].block if segments and segments[0].start_minute == 0 else None
@@ -5149,6 +5223,7 @@ class PlaybackEngine:
 
         return {
             "state": state,
+            "authority": "schedule",
             "now_key": now_key,
             "active_key": active_key,
             "schedule_block": schedule_block,
