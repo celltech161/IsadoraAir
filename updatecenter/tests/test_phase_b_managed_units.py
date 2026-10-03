@@ -365,8 +365,8 @@ class ManifestProtocolBumpTests(SimpleTestCase):
         self.root = Path(self.temp.name)
         self.addCleanup(self.temp.cleanup)
 
-    def test_manifest_protocol_bumped_to_six(self):
-        self.assertEqual(MANIFEST_PROTOCOL_VERSION, 6)
+    def test_manifest_protocol_bumped_to_five(self):
+        self.assertEqual(MANIFEST_PROTOCOL_VERSION, 5)
 
     def test_manifest_protocol_remains_independent_of_wire_v4(self):
         # Same invariant test_phase_b_protocol.py's own

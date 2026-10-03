@@ -88,11 +88,7 @@ SCHEMA_VERSION = 1
 # The r0084 skipped-transition correction intentionally remains protocol 5.
 # It repairs existing Phase-D semantics; a bump would strand legacy workers
 # before they could activate the direct protected bridge release.
-#
-# 5 -> 6 (P1 1.17): optional trusted companion migration authorization and
-# allowlisted read-only migration data preflight identifiers gain execution
-# meaning. Fingerprint contract v5 binds both fields.
-UPDATER_PROTOCOL_VERSION = 6
+UPDATER_PROTOCOL_VERSION = 5
 
 RELEASE_ID_PATTERN = re.compile(r"^r[0-9]{4,}$")
 # "app_label.migration_name", matching Django's own migration-name
@@ -118,10 +114,6 @@ APT_PACKAGE_PATTERN = re.compile(r"^[a-z0-9][a-z0-9.+-]*$")
 # cross_check.py's job -- this pattern alone does not prove the unit is
 # real, only that its name has the right shape to possibly be one.
 UNIT_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]*\.(service|timer)$")
-MIGRATION_PREFLIGHT_ID_PATTERN = re.compile(r"^[a-z][a-z0-9_.-]{0,127}$")
-MIGRATION_AUTHORIZATION_PATH_PATTERN = re.compile(
-    r"^deploy/migration_authorizations/r[0-9]{4,}\.json$"
-)
 
 MIGRATION_COMPATIBILITY_VALUES = frozenset({"additive", "destructive"})
 
@@ -186,8 +178,6 @@ KNOWN_FIELDS = frozenset({
     "minimum_supported_release_id",
     "manual_bootstrap_required",
     "protected_runtime",
-    "migration_authorization",
-    "migration_preflight_checks",
 })
 
 # D1-A (Update Center Phase D): the optional protected-runtime bundle
@@ -366,8 +356,6 @@ class ReleaseManifest:
     minimum_supported_release_id: str | None
     manual_bootstrap_required: bool
     protected_runtime: ProtectedRuntimeManifestField | None
-    migration_authorization: str | None = None
-    migration_preflight_checks: tuple[str, ...] = ()
 
     @property
     def is_bootstrap(self) -> bool:
@@ -559,29 +547,6 @@ def validate_manifest_dict(data: dict, *, source_label: str = "<manifest>") -> R
 
     protected_runtime = _validate_protected_runtime(data.get("protected_runtime"), source_label)
 
-    migration_authorization = data.get("migration_authorization")
-    if migration_authorization is not None:
-        _require_type(migration_authorization, str, "migration_authorization")
-        expected = f"deploy/migration_authorizations/{release_id}.json"
-        if (not MIGRATION_AUTHORIZATION_PATH_PATTERN.fullmatch(migration_authorization)
-                or migration_authorization != expected):
-            raise ManifestError(
-                f"{source_label}: migration_authorization must be exactly {expected!r}"
-            )
-    migration_preflight_checks = _require_str_list(
-        data.get("migration_preflight_checks", []),
-        "migration_preflight_checks", MIGRATION_PREFLIGHT_ID_PATTERN,
-    )
-    if migration_authorization is not None or migration_preflight_checks:
-        if not migrations_required:
-            raise ManifestError(
-                f"{source_label}: migration authorization/preflight requires migrations_required"
-            )
-        if min_protocol < 6:
-            raise ManifestError(
-                f"{source_label}: migration authorization/preflight requires updater protocol 6"
-            )
-
     return ReleaseManifest(
         schema_version=schema_version,
         release_id=release_id,
@@ -605,8 +570,6 @@ def validate_manifest_dict(data: dict, *, source_label: str = "<manifest>") -> R
         minimum_supported_release_id=minimum_supported_release_id,
         manual_bootstrap_required=manual_bootstrap_required,
         protected_runtime=protected_runtime,
-        migration_authorization=migration_authorization,
-        migration_preflight_checks=migration_preflight_checks,
     )
 
 

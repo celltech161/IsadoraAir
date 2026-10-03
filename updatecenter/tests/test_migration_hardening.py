@@ -1,12 +1,17 @@
-"""P1 1.17 -- protocol-6 migration hardening: contracts, fleet authorization,
-and partial-prefix recovery through the REAL protected executor.
+"""P1 1.17 -- migration hardening through the REAL protected executor.
+
+* central authorization through discovered trusted companions (executor gate);
+* the target-code preflight registry contract;
+* partial-prefix recovery: crash windows, the in-flight bound, the final
+  owned-prefix assertions and their races, and PostgreSQL-not-ready recovery.
 
 Recovery tests drive Executor.execute() itself. Only process boundaries are
 replaced: the application command runner, the probe, Git, staging, and the
-database recorder -- which is a stateful FakeRecorder whose rows change
-exactly when a (fake) migrate command commits, so crash/resume/retry
-behavior is exercised against one consistent database story.
-Real-PostgreSQL coverage lives in test_migration_hardening_postgres.py.
+database recorder -- a stateful FakeRecorder whose rows change exactly when
+a (fake) migrate command commits or a test simulates an outside actor.
+Companion trust rules: test_migration_authorization_companions.py.
+Real-PostgreSQL coverage: test_migration_hardening_postgres.py.
+Runtime-10 bootstrap: test_runtime11_bootstrap.py.
 """
 from __future__ import annotations
 
@@ -18,28 +23,21 @@ import uuid
 
 from django.test import SimpleTestCase
 
-from updatecenter.manifest import ManifestError, validate_manifest_dict
-from updatecenter.execution_contract import (
-    execution_fingerprint_payload, migration_hardening_execution_fingerprint,
-)
 from updatecenter.management.commands import updatecenter_migration_preflight as preflight
 
-from .phase_b_helpers import config_dict, manifest
+from .phase_b_helpers import config_dict
 from isadoraair_updater.config import validate_config_dict
-from isadoraair_updater.executor import ExecutionError, Executor
+from isadoraair_updater.executor import OBSERVATION_READINESS_DELAYS, ExecutionError, Executor
 from isadoraair_updater.jobs import JobStore
 from isadoraair_updater.process import CommandRunner, ProcessResult
+from isadoraair_updater.release import ReleaseError, TrustedPlan
 from isadoraair_updater.staging import StagedSource
-from isadoraair_updater.release import (
-    ReleaseError, TrustedPlan, fingerprint, load_central_migration_authorization,
-)
 
 BASE = "base.0001_initial"
 M1 = "sample.0001_first"
 M2 = "sample.0002_second"
 FULL_DIGEST = "d" * 64
 SUFFIX_DIGEST = "3" * 64
-AUTH_PATH = "deploy/migration_authorizations/r0105.json"
 
 
 def plan(**changes):
@@ -51,7 +49,7 @@ def plan(**changes):
         apt_packages_new=(), systemd_units_changed=(), systemd_units_new_required=(),
         systemd_units_new_optional=(), systemd_units_removed_or_renamed=(),
         collectstatic_required=False, services_requiring_restart=(), nginx_changed=False,
-        runtime_components_changed=False, minimum_updater_protocol_version=6,
+        runtime_components_changed=False, minimum_updater_protocol_version=5,
         manual_bootstrap_required=False, fingerprint="f" * 64,
     )
     values.update(changes)
@@ -67,363 +65,209 @@ def migration_item(ref, dependencies, *, file_sha="0" * 64, operations=None):
     }
 
 
+def make_executor(root: Path):
+    config = validate_config_dict(config_dict(root, str(root / "upstream.git")), allow_local_repository=True)
+    store = JobStore(config.jobs_root, config.logs_root, acquire_daemon_lock=False)
+    return config, store, Executor(config, store, CommandRunner())
+
+
 # ---------------------------------------------------------------------------
-# B2 -- target-side central authorization (fleet / skipped releases)
+# Central authorization through discovered companions (executor gate)
 # ---------------------------------------------------------------------------
 
-SHA_A, SHA_B, SHA_C, SHA_D = "a1" * 32, "b2" * 32, "c3" * 32, "d4" * 32
+SHA_A, SHA_B, SHA_C = "a1" * 32, "b2" * 32, "c3" * 32
 MA, MB, MC, MD = "app.0101_a", "app.0102_b", "app.0103_c", "app.0104_d"
+ID_A = (MA, SHA_A, 0, "RunPython", "manual")
+ID_B = (MB, SHA_B, 0, "RunSQL", "manual")
+ID_C = (MC, SHA_C, 1, "RunPython", "manual")
 RUN_PYTHON = {"operation": "RunPython", "classification": "manual", "detail": "outside allowlist"}
 RUN_SQL = {"operation": "RunSQL", "classification": "manual", "detail": "outside allowlist"}
-OP_A = {"ref": MA, "migration_file_sha256": SHA_A, "operation_index": 0, "operation": "RunPython", "classification": "manual"}
-OP_B = {"ref": MB, "migration_file_sha256": SHA_B, "operation_index": 0, "operation": "RunSQL", "classification": "manual"}
-OP_C = {"ref": MC, "migration_file_sha256": SHA_C, "operation_index": 1, "operation": "RunPython", "classification": "manual"}
+ADDITIVE = {"operation": "CreateModel", "classification": "additive", "detail": "new table/model"}
 
 
-class FakeRepository:
-    """Git boundary only. The companion's provenance/immutability rules are
-    applied by the real load_central_migration_authorization()."""
-
-    def __init__(self, record, *, introducing="c" * 40, ancestry=True):
-        self.raw = record if isinstance(record, bytes) else json.dumps(record).encode()
-        self.introducing = introducing
-        self.ancestry = ancestry
-
-    def read_file(self, tip, path, maximum=65536):
-        return self.raw
-
-    def introducing_commit(self, path, tip):
-        return self.introducing
-
-    def is_ancestor(self, before, after):
-        return self.ancestry
-
-
-def central_record(operations=(OP_A, OP_B, OP_C), **changes):
-    value = {
-        "schema_version": 1, "release_id": "r0105", "target_commit": "b" * 40,
-        "manifest_sha256": "c" * 64, "authorized_manual_operations": [dict(op) for op in operations],
-    }
-    value.update(changes)
-    return value
-
-
-def station_plan(*migrations):
-    """A station's own derived plan: [(ref, file_sha, operations)]."""
+def station_payload(*migrations):
     items, manual = [], []
     for ref, sha, operations in migrations:
         items.append(migration_item(ref, [], file_sha=sha, operations=operations))
         for index, operation in enumerate(operations):
             if operation["classification"] != "additive":
                 manual.append({"ref": ref, "operation_index": index, **operation})
-    return items, manual
+    return {
+        "nodes": {item["ref"]: [] for item in items}, "applied": [], "plan": items,
+        "conflicts": {}, "replacements": [], "release_id": "r0107", "target_commit": "b" * 40,
+        "manifest_sha256": "c" * 64, "migration_plan_digest": "7" * 64,
+        "manual_operations": manual, "approval": None,
+    }
 
 
-ADDITIVE = {"operation": "CreateModel", "classification": "additive", "detail": "new table/model"}
-STATION_A = station_plan((MA, SHA_A, [RUN_PYTHON]), (MB, SHA_B, [RUN_SQL]))                       # r0104 -> target
-STATION_B = station_plan((MA, SHA_A, [RUN_PYTHON]), (MB, SHA_B, [RUN_SQL]), (MC, SHA_C, [ADDITIVE, RUN_PYTHON]))  # r0103 -> target
-STATION_C = station_plan((MA, SHA_A, [RUN_PYTHON]))                                               # another baseline
+class CentralAuthorizationGateTests(SimpleTestCase):
+    """One release-local companion set {A,B,C} serves every baseline."""
 
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.config, self.store, self.executor = make_executor(Path(self.temp.name))
 
-class TargetSideCentralAuthorizationTests(SimpleTestCase):
-    def check(self, station, record=None, *, repository=None, **plan_changes):
-        items, manual = station
-        return load_central_migration_authorization(
-            repository or FakeRepository(record or central_record()), "e" * 40,
-            plan(migration_authorization=AUTH_PATH, **plan_changes),
-            manifest_sha256="c" * 64, plan_items=items, manual_operations=manual,
+    def tearDown(self):
+        self.store.close()
+        self.temp.cleanup()
+
+    def validate(self, payload, *, installed, releases, fingerprint, authorizations):
+        job_id = str(uuid.uuid4())
+        self.store.accept(job_id, "r0107", fingerprint)
+        trusted = plan(
+            installed_release_id=installed, releases_in_plan=releases, fingerprint=fingerprint,
+            target_release_id="r0107", migrations_required=tuple(item["ref"] for item in payload["plan"]),
         )
+        try:
+            with (
+                mock.patch("isadoraair_updater.executor.load_plan_authorizations", return_value=authorizations) as loader,
+                mock.patch.object(self.executor.approval_store, "find", return_value=None) as local_find,
+            ):
+                try:
+                    return self.executor._validate_target_schema(
+                        trusted, payload, {"nodes": {}, "applied": []}, job_id,
+                        migration_already_started=False, trusted_tip="e" * 40,
+                    ), local_find, loader
+                except ExecutionError as exc:
+                    return exc, local_find, loader
+        finally:
+            self.store.fail(job_id, "TEST_DONE", "validation-only fixture job", manual=False)
 
-    def test_f1_station_subset_of_authorized_set_is_approved(self):
-        self.assertIsNotNone(self.check(STATION_A))
-
-    def test_f2_skipped_release_baseline_with_every_authorized_op_is_approved(self):
-        self.assertIsNotNone(self.check(
-            STATION_B, installed_release_id="r0103", installed_commit="9" * 40,
-            releases_in_plan=("r0104", "r0105"), fingerprint="1" * 64,
-        ))
-
-    def test_f3_other_baseline_with_single_op_is_approved(self):
-        self.assertIsNotNone(self.check(STATION_C, installed_release_id="r0102", fingerprint="2" * 64))
-
-    def test_f4_unauthorized_manual_op_is_not_covered(self):
-        station = station_plan((MA, SHA_A, [RUN_PYTHON]), (MD, SHA_D, [RUN_PYTHON]))
-        self.assertIsNone(self.check(station))
-
-    def test_f5_same_ref_and_index_but_changed_file_bytes_is_rejected(self):
-        station = station_plan((MA, "ee" * 32, [RUN_PYTHON]))
-        self.assertIsNone(self.check(station))
-
-    def test_f6_same_operation_at_different_index_is_rejected(self):
-        station = station_plan((MA, SHA_A, [ADDITIVE, RUN_PYTHON]))
-        self.assertIsNone(self.check(station))
-
-    def test_different_operation_type_at_same_position_is_rejected(self):
-        station = station_plan((MA, SHA_A, [RUN_SQL]))
-        self.assertIsNone(self.check(station))
-
-    def test_release_target_and_manifest_identity_must_match(self):
-        for changes in ({"release_id": "r0106"}, {"target_commit": "1" * 40}, {"manifest_sha256": "1" * 64}):
-            with self.subTest(**changes):
-                self.assertIsNone(self.check(STATION_A, central_record(**changes)))
-
-    def test_no_manual_operations_needs_no_central_authorization(self):
-        self.assertIsNone(self.check(station_plan((MA, SHA_A, [ADDITIVE]))))
-
-    def test_companion_without_unique_unmodified_introduction_is_unusable(self):
-        self.assertIsNone(self.check(STATION_A, repository=FakeRepository(central_record(), introducing=None)))
-
-    def test_non_descendant_companion_fails_closed(self):
-        with self.assertRaises(ReleaseError):
-            self.check(STATION_A, repository=FakeRepository(central_record(), ancestry=False))
-
-    def test_companion_in_the_target_commit_itself_fails_closed(self):
-        with self.assertRaises(ReleaseError):
-            self.check(STATION_A, repository=FakeRepository(central_record(), introducing="b" * 40))
-
-    def test_malformed_records_fail_closed(self):
-        cases = {
-            "legacy baseline-bound schema": {
-                "schema_version": 1, "release_id": "r0105", "target_commit": "b" * 40,
-                "manifest_sha256": "c" * 64, "migration_plan_digest": FULL_DIGEST,
-                "manual_operations": [], "trusted_plan_fingerprint": "f" * 64,
-            },
-            "duplicate operation": central_record(operations=(OP_A, OP_A)),
-            "additive classification": central_record(operations=({**OP_A, "classification": "additive"},)),
-            "boolean index": central_record(operations=({**OP_A, "operation_index": True},)),
-            "extra key": central_record(operations=({**OP_A, "detail": "x"},)),
-            "empty set": central_record(operations=()),
-            "bad file sha": central_record(operations=({**OP_A, "migration_file_sha256": "x"},)),
-        }
-        for label, record in cases.items():
-            with self.subTest(label), self.assertRaises(ReleaseError):
-                self.check(STATION_A, record)
-
-    def test_one_authorization_serves_two_different_baselines_through_the_executor(self):
-        """Executor-level fleet proof: KOGR-style r0104 and WRJE-style r0103
-        stations have different plans and fingerprints; the same companion
-        satisfies both without consulting local approval."""
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            config = validate_config_dict(config_dict(root, str(root / "upstream.git")), allow_local_repository=True)
-            store = JobStore(config.jobs_root, config.logs_root, acquire_daemon_lock=False)
-            executor = Executor(config, store, CommandRunner())
-            executor.repository = FakeRepository(central_record())
-            stations = (
-                ("r0104", "a" * 40, ("r0105",), "f" * 64, STATION_A),
-                ("r0103", "9" * 40, ("r0104", "r0105"), "1" * 64, STATION_B),
-            )
-            try:
-                for installed, installed_commit, releases, plan_fp, (items, manual) in stations:
-                    with self.subTest(installed=installed):
-                        job_id = str(uuid.uuid4())
-                        store.accept(job_id, "r0105", plan_fp)
-                        refs = [item["ref"] for item in items]
-                        nodes = {ref: [] for ref in refs}
-                        payload = {
-                            "nodes": nodes, "applied": [], "plan": items, "conflicts": {}, "replacements": [],
-                            "release_id": "r0105", "target_commit": "b" * 40, "manifest_sha256": "c" * 64,
-                            "migration_plan_digest": "7" * 64, "manual_operations": manual, "approval": None,
-                        }
-                        trusted = plan(
-                            installed_release_id=installed, installed_commit=installed_commit,
-                            releases_in_plan=releases, migrations_required=tuple(refs),
-                            fingerprint=plan_fp, migration_authorization=AUTH_PATH,
-                        )
-                        with mock.patch.object(executor.approval_store, "find") as local_find:
-                            actual = executor._validate_target_schema(
-                                trusted, payload, {"nodes": {}, "applied": []}, job_id,
-                                migration_already_started=False, trusted_tip="e" * 40,
-                            )
-                        local_find.assert_not_called()
-                        self.assertEqual(actual, tuple(refs))
-                        self.assertEqual(executor.last_authorization_source, "central")
-                        store.fail(job_id, "TEST_DONE", "validation-only fixture job", manual=False)
-            finally:
-                store.close()
-
-    def test_uncovered_plan_falls_back_to_exact_local_approval_gate(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            config = validate_config_dict(config_dict(root, str(root / "upstream.git")), allow_local_repository=True)
-            store = JobStore(config.jobs_root, config.logs_root, acquire_daemon_lock=False)
-            executor = Executor(config, store, CommandRunner())
-            executor.repository = FakeRepository(central_record())
-            job_id = str(uuid.uuid4())
-            store.accept(job_id, "r0105", "f" * 64)
-            items, manual = station_plan((MA, SHA_A, [RUN_PYTHON]), (MD, SHA_D, [RUN_PYTHON]))
-            payload = {
-                "nodes": {MA: [], MD: []}, "applied": [], "plan": items, "conflicts": {}, "replacements": [],
-                "release_id": "r0105", "target_commit": "b" * 40, "manifest_sha256": "c" * 64,
-                "migration_plan_digest": "7" * 64, "manual_operations": manual, "approval": None,
-            }
-            try:
-                with mock.patch.object(executor.approval_store, "find", return_value=None) as local_find:
-                    with self.assertRaises(ExecutionError) as caught:
-                        executor._validate_target_schema(
-                            plan(migrations_required=(MA, MD), migration_authorization=AUTH_PATH),
-                            payload, {"nodes": {}, "applied": []}, job_id,
-                            migration_already_started=False, trusted_tip="e" * 40,
-                        )
-                local_find.assert_called_once()
-                self.assertEqual(caught.exception.classification, "MIGRATION_OPERATION_MANUAL")
-                self.assertIsNotNone(caught.exception.migration_plan_review)
-            finally:
-                store.close()
-
-    def test_protocol_six_fingerprint_is_identical_across_trust_boundary(self):
-        protected_plan = plan(
-            migration_authorization="deploy/migration_authorizations/r0105.json",
-            migration_preflight_checks=("library.schedule_block_duplicate_times",),
+    def test_two_baselines_and_a_skipped_path_are_authorized_by_the_same_companions(self):
+        authorizations = {"r0106": frozenset({ID_A, ID_C}), "r0107": frozenset({ID_B})}
+        stations = (
+            ("r0106", ("r0107",), "1" * 64, station_payload((MB, SHA_B, [RUN_SQL]))),
+            ("r0105", ("r0106", "r0107"), "2" * 64,
+             station_payload((MA, SHA_A, [RUN_PYTHON]), (MB, SHA_B, [RUN_SQL]), (MC, SHA_C, [ADDITIVE, RUN_PYTHON]))),
+            ("r0104", ("r0105", "r0106", "r0107"), "3" * 64, station_payload((MA, SHA_A, [RUN_PYTHON]))),
         )
-        values = {
-            key: getattr(protected_plan, key)
-            for key in (
-                "installed_release_id", "installed_commit", "target_release_id", "target_commit",
-                "releases_in_plan", "migrations_required", "migration_compatibility",
-                "python_requirements_changed", "apt_packages_new", "systemd_units_changed",
-                "systemd_units_new_required", "systemd_units_new_optional",
-                "systemd_units_removed_or_renamed", "collectstatic_required",
-                "services_requiring_restart", "nginx_changed", "runtime_components_changed",
-                "minimum_updater_protocol_version", "manual_bootstrap_required",
-            )
-        }
-        django_hash = migration_hardening_execution_fingerprint(
-            execution_fingerprint_payload(**values),
-            migration_authorization=protected_plan.migration_authorization,
-            migration_preflight_checks=protected_plan.migration_preflight_checks,
+        for installed, releases, fp, payload in stations:
+            with self.subTest(installed=installed):
+                result, local_find, loader = self.validate(
+                    payload, installed=installed, releases=releases, fingerprint=fp, authorizations=authorizations,
+                )
+                self.assertIsInstance(result, tuple)
+                self.assertEqual(self.executor.last_authorization_source, "central")
+                local_find.assert_not_called()
+                self.assertEqual(loader.call_args.args[2].releases_in_plan, releases)
+
+    def test_uncovered_operation_falls_back_to_exact_local_approval(self):
+        payload = station_payload((MA, SHA_A, [RUN_PYTHON]), (MD, "d4" * 32, [RUN_PYTHON]))
+        result, local_find, _loader = self.validate(
+            payload, installed="r0104", releases=("r0105",), fingerprint="4" * 64,
+            authorizations={"r0105": frozenset({ID_A})},
         )
-        self.assertEqual(django_hash, fingerprint(protected_plan.fingerprint_payload()))
+        local_find.assert_called_once()
+        self.assertEqual(result.classification, "MIGRATION_OPERATION_MANUAL")
+        self.assertIsNotNone(result.migration_plan_review)
 
+    def test_no_manual_operations_never_consults_companions(self):
+        result, local_find, loader = self.validate(
+            station_payload((MA, SHA_A, [ADDITIVE])), installed="r0104", releases=("r0105",),
+            fingerprint="5" * 64, authorizations={},
+        )
+        loader.assert_not_called()
+        local_find.assert_not_called()
+        self.assertEqual(self.executor.last_authorization_source, "not_required")
 
-
-
-class MigrationManifestContractTests(SimpleTestCase):
-    def data(self, **changes):
-        value = manifest("r0105", "r0104", migrations_required=[M2],
-                         migration_compatibility="additive", minimum_updater_protocol_version=6)
-        value.update(changes)
-        return value
-
-    def test_authorization_path_is_accepted(self):
-        parsed = validate_manifest_dict(self.data(
-            migration_authorization="deploy/migration_authorizations/r0105.json"))
-        self.assertEqual(parsed.migration_authorization, "deploy/migration_authorizations/r0105.json")
-
-    def test_wrong_authorization_path_is_rejected(self):
-        with self.assertRaises(ManifestError):
-            validate_manifest_dict(self.data(migration_authorization="deploy/migration_authorizations/r9999.json"))
-
-    def test_new_fields_require_protocol_six(self):
-        with self.assertRaises(ManifestError):
-            validate_manifest_dict(self.data(
-                minimum_updater_protocol_version=5,
-                migration_preflight_checks=["library.schedule_block_duplicate_times"],
-            ))
-
-    def test_unknown_shaped_preflight_is_rejected(self):
-        with self.assertRaises(ManifestError):
-            validate_manifest_dict(self.data(migration_preflight_checks=["../../shell"]))
-
-    def test_legacy_manifest_defaults_are_unchanged(self):
-        parsed = validate_manifest_dict(manifest("r0105", "r0104"))
-        self.assertIsNone(parsed.migration_authorization)
-        self.assertEqual(parsed.migration_preflight_checks, ())
-
-
-class PreflightContractTests(SimpleTestCase):
-    def test_unknown_check_fails_closed_without_database_access(self):
-        result = preflight.run_preflights(["unknown.check"])
-        self.assertEqual(result["status"], "failed")
-        self.assertEqual(result["checks"][0]["status"], "unknown")
-
-    @mock.patch.object(preflight, "transaction")
-    @mock.patch.object(preflight, "connection")
-    def test_postgres_transaction_is_made_read_only(self, connection, transaction):
-        connection.vendor = "postgresql"
-        cursor = connection.cursor.return_value.__enter__.return_value
-        preflight.CHECKS["test.pass"] = lambda value: {"ok": True, "count": 0}
-        try:
-            result = preflight.run_preflights(["test.pass"])
-        finally:
-            del preflight.CHECKS["test.pass"]
-        cursor.execute.assert_called_once_with("SET TRANSACTION READ ONLY")
-        self.assertEqual(result["status"], "ok")
-
-    @mock.patch.object(preflight, "transaction")
-    @mock.patch.object(preflight, "connection")
-    def test_failed_check_reports_exact_evidence(self, connection, transaction):
-        connection.vendor = "postgresql"
-        preflight.CHECKS["test.fail"] = lambda value: {"ok": False, "ids": [7, 9]}
-        try:
-            result = preflight.run_preflights(["test.fail"])
-        finally:
-            del preflight.CHECKS["test.fail"]
-        self.assertEqual(result["checks"][0]["evidence"], {"ids": [7, 9]})
-
-    @mock.patch.object(preflight, "transaction")
-    @mock.patch.object(preflight, "connection")
-    def test_transaction_is_always_rolled_back(self, connection, transaction):
-        connection.vendor = "postgresql"
-        preflight.CHECKS["test.pass"] = lambda value: {"ok": True}
-        try:
-            preflight.run_preflights(["test.pass"])
-        finally:
-            del preflight.CHECKS["test.pass"]
-        transaction.set_rollback.assert_called_once_with(True)
-
-    def test_registry_contains_only_explicit_known_check(self):
-        self.assertIn("library.schedule_block_duplicate_times", preflight.CHECKS)
-        self.assertNotIn("shell", preflight.CHECKS)
-
-    def test_executor_blocks_on_failed_structured_preflight(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            config = validate_config_dict(config_dict(root, str(root / "upstream.git")), allow_local_repository=True)
-            store = JobStore(config.jobs_root, config.logs_root, acquire_daemon_lock=False)
-            executor = Executor(config, store, CommandRunner())
-            raw = json.dumps({
-                "schema_version": 1, "status": "failed", "checks": [{
-                    "id": "library.schedule_block_duplicate_times", "status": "failed",
-                    "evidence": {"offending_group_count": 1, "ids": [4, 8]},
-                }],
-            }).encode()
-            with mock.patch.object(executor, "_run_app", return_value=(ProcessResult(("python",), 0, raw, b""), {})):
-                with self.assertRaises(ExecutionError) as caught:
-                    executor._run_migration_preflights(
-                        root, ("library.schedule_block_duplicate_times",),
-                    )
-            self.assertEqual(caught.exception.classification, "MIGRATION_PREFLIGHT_BLOCKED")
-            self.assertIn("4", caught.exception.detail)
-            store.close()
-
-    def test_preflight_call_precedes_migration_started_in_executor(self):
-        source = (Path(__file__).parents[2] / "deploy/updater_runtime/isadoraair_updater/executor.py").read_text()
-        execute_body = source[source.index("def execute(self, job_id") :]
-        migration_block = execute_body[execute_body.index("if actual_migrations") :]
-        self.assertLess(migration_block.index("_run_migration_preflights"), migration_block.index('"migration_started"'))
-
-    @mock.patch.object(preflight, "transaction")
-    @mock.patch.object(preflight, "connection")
-    def test_r0097_style_conflict_blocks_then_corrected_data_passes(self, connection, transaction):
-        connection.vendor = "postgresql"
-        outcomes = iter((
-            {"ok": False, "offending_group_count": 1, "ids": [4, 8]},
-            {"ok": True, "offending_group_count": 0, "ids": []},
-        ))
-        preflight.CHECKS["test.conflict"] = lambda value: next(outcomes)
-        try:
-            blocked = preflight.run_preflights(["test.conflict"])
-            passed = preflight.run_preflights(["test.conflict"])
-        finally:
-            del preflight.CHECKS["test.conflict"]
-        self.assertEqual(blocked["status"], "failed")
-        self.assertEqual(passed["status"], "ok")
-
+    def test_bad_companion_fails_closed(self):
+        job_id = str(uuid.uuid4())
+        self.store.accept(job_id, "r0107", "6" * 64)
+        with mock.patch("isadoraair_updater.executor.load_plan_authorizations",
+                        side_effect=ReleaseError("companion was modified after introduction")):
+            with self.assertRaises(ReleaseError):
+                self.executor._validate_target_schema(
+                    plan(fingerprint="6" * 64, migrations_required=(MA,)),
+                    station_payload((MA, SHA_A, [RUN_PYTHON])), {"nodes": {}, "applied": []}, job_id,
+                    migration_already_started=False, trusted_tip="e" * 40,
+                )
 
 
 # ---------------------------------------------------------------------------
-# B1 / S3 -- partial-prefix recovery through the real executor
+# Target-code preflight registry contract
+# ---------------------------------------------------------------------------
+
+class PreflightRegistryContractTests(SimpleTestCase):
+    def test_registry_is_explicit_and_keyed_by_pending_migration(self):
+        self.assertEqual(set(preflight.REGISTRY), {preflight.M0087, preflight.M0088})
+
+    @mock.patch.object(preflight, "transaction")
+    @mock.patch.object(preflight, "connection")
+    def test_unregistered_pending_refs_run_no_checks_inside_a_read_only_transaction(self, connection, transaction):
+        connection.vendor = "postgresql"
+        cursor = connection.cursor.return_value.__enter__.return_value
+        cursor.fetchall.return_value = []
+        result = preflight.run_preflights(["sample.0001_first"])
+        self.assertEqual(result, {"schema_version": 1, "status": "ok", "checks": []})
+        self.assertEqual(cursor.execute.call_args_list[0].args, ("SET TRANSACTION READ ONLY",))
+        transaction.set_rollback.assert_called_once_with(True)
+
+    @mock.patch.object(preflight, "transaction")
+    @mock.patch.object(preflight, "connection")
+    def test_a_registered_failure_reports_migration_and_evidence(self, connection, transaction):
+        connection.vendor = "postgresql"
+        connection.cursor.return_value.__enter__.return_value.fetchall.return_value = []
+        with mock.patch.dict(preflight.REGISTRY, {"x.0001_y": [("x.check", lambda cursor, pending: {"ok": False, "ids": [4]})]}):
+            result = preflight.run_preflights(["x.0001_y"])
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["checks"], [{"id": "x.check", "migration": "x.0001_y", "status": "failed",
+                                             "evidence": {"ids": [4]}}])
+
+    @mock.patch.object(preflight, "transaction")
+    @mock.patch.object(preflight, "connection")
+    def test_a_pending_ref_that_is_already_applied_fails_closed(self, connection, transaction):
+        connection.vendor = "postgresql"
+        connection.cursor.return_value.__enter__.return_value.fetchall.return_value = [("library", "0087_backfill_default_schedule_profile")]
+        result = preflight.run_preflights([preflight.M0087])
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["checks"][0]["id"], "updater.pending_stage_consistency")
+
+    def _executor_with(self, payload):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        _config, store, executor = make_executor(Path(temp.name))
+        self.addCleanup(store.close)
+        raw = json.dumps(payload).encode()
+        patcher = mock.patch.object(executor, "_run_app", return_value=(ProcessResult(("python",), 0, raw, b""), {}))
+        self.run_app = patcher.start()
+        self.addCleanup(patcher.stop)
+        return executor
+
+    def test_executor_passes_trusted_pending_refs_and_blocks_on_failure(self):
+        executor = self._executor_with({"schema_version": 1, "status": "failed", "checks": [
+            {"id": "library.0087.global_slot_ambiguity", "migration": preflight.M0087, "status": "failed",
+             "evidence": {"offending_group_count": 1}},
+        ]})
+        with self.assertRaises(ExecutionError) as caught:
+            executor._run_migration_preflights(Path("/x"), (preflight.M0087, preflight.M0088))
+        self.assertEqual(caught.exception.classification, "MIGRATION_PREFLIGHT_BLOCKED")
+        arguments = self.run_app.call_args.args[1]
+        self.assertEqual(arguments, ["updatecenter_migration_preflight", "--skip-checks",
+                                     "--pending", preflight.M0087, "--pending", preflight.M0088])
+
+    def test_executor_rejects_results_for_unrequested_migrations_or_contradictory_status(self):
+        for payload in (
+            {"schema_version": 1, "status": "ok", "checks": [
+                {"id": "x.check", "migration": "other.0001_x", "status": "passed", "evidence": {}}]},
+            {"schema_version": 1, "status": "ok", "checks": [
+                {"id": "x.check", "migration": M1, "status": "failed", "evidence": {}}]},
+        ):
+            with self.subTest(payload=payload):
+                executor = self._executor_with(payload)
+                with self.assertRaises(ExecutionError) as caught:
+                    executor._run_migration_preflights(Path("/x"), (M1,))
+                self.assertEqual(caught.exception.classification, "MIGRATION_PREFLIGHT_INVALID")
+
+    def test_preflight_runs_before_migration_started(self):
+        source = (Path(__file__).parents[2] / "deploy/updater_runtime/isadoraair_updater/executor.py").read_text()
+        block = source[source.index("def execute(self, job_id"):]
+        block = block[block.index("if actual_migrations"):]
+        self.assertLess(block.index("_run_migration_preflights(staged.source_root, actual_migrations)"),
+                        block.index('"migration_started"'))
+
+
+# ---------------------------------------------------------------------------
+# Partial-prefix recovery through the real executor
 # ---------------------------------------------------------------------------
 
 class _Crash(BaseException):
@@ -436,6 +280,7 @@ class FakeRecorder:
     def __init__(self):
         self.rows = {}
         self._next = 40
+        self.unavailable_attempts = 0
 
     def apply(self, ref):
         self._next += 1
@@ -445,6 +290,9 @@ class FakeRecorder:
         del self.rows[ref]
 
     def observe(self, refs):
+        if self.unavailable_attempts:
+            self.unavailable_attempts -= 1
+            raise ExecutionError("MIGRATION_OBSERVATION_FAILED", "the database system is starting up", manual=True)
         return {ref: dict(self.rows[ref]) for ref in refs if ref in self.rows}
 
 
@@ -454,15 +302,15 @@ class PartialPrefixRecoveryExecutionTests(SimpleTestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
-        self.config = validate_config_dict(
-            config_dict(self.root, str(self.root / "upstream.git")), allow_local_repository=True,
-        )
-        self.store = JobStore(self.config.jobs_root, self.config.logs_root, acquire_daemon_lock=False)
-        self.executor = Executor(self.config, self.store, CommandRunner())
+        self.config, self.store, self.executor = make_executor(self.root)
+        self.sleeps = []
+        self.executor._sleep = self.sleeps.append
         self.plan = plan()
         self.recorder = FakeRecorder()
         self.head = "a" * 40
         self.migrate_calls = []
+        self.probe_hooks = {}
+        self.preflight_hook = None
         stage_root = self.root / "stage-source"
         stage_root.mkdir()
         (stage_root / "manage.py").touch()
@@ -484,6 +332,10 @@ class PartialPrefixRecoveryExecutionTests(SimpleTestCase):
         return [BASE, *[ref for ref in (M1, M2) if ref in self.recorder.rows]]
 
     def _probe(self, source, *, release_id=None, target_commit=None, recovery_plan_refs=()):
+        self.probe_count += 1
+        hook = self.probe_hooks.get(self.probe_count)
+        if hook is not None and hook[0] == "before":
+            hook[1]()
         remaining = [ref for ref in (M1, M2) if ref not in self.recorder.rows]
         payload = {
             "schema_version": 1, "status": "ok",
@@ -497,23 +349,28 @@ class PartialPrefixRecoveryExecutionTests(SimpleTestCase):
             "manual_operations": [], "approval": None,
         }
         if recovery_plan_refs:
-            payload["recovery_plan"] = [
-                migration_item(ref, [BASE] if ref == M1 else [M1]) for ref in recovery_plan_refs
-            ]
+            payload["recovery_plan"] = [migration_item(ref, [BASE] if ref == M1 else [M1]) for ref in recovery_plan_refs]
             payload["recovery_migration_plan_digest"] = FULL_DIGEST if list(recovery_plan_refs) == [M1, M2] else "8" * 64
             payload["recovery_manual_operations"] = []
+        if hook is not None and hook[0] == "after":
+            hook[1]()
         return payload
 
     def _current(self):
         return {"nodes": {BASE: []}, "applied": self._applied()}
 
     def run_job(self, job_id, *, outcomes=None, accept=True):
-        """outcomes: ref -> "ok" | "fail" | "crash_after_commit" | "oserror"."""
+        """outcomes: ref -> "ok" | "fail" | "crash_after_commit" | "crash_before_commit" | "oserror"."""
         outcomes = outcomes or {}
+        self.probe_count = 0
         if accept:
             self.store.accept(job_id, "r0105", self.plan.fingerprint)
 
         def run_app(source, arguments, *, timeout):
+            if arguments[0] == "updatecenter_migration_preflight":
+                if self.preflight_hook is not None:
+                    self.preflight_hook()
+                return ProcessResult(tuple(arguments), 0, b'{"checks":[],"schema_version":1,"status":"ok"}', b""), {}
             if arguments[0] != "migrate":
                 raise AssertionError(f"unexpected application command {arguments!r}")
             ref = f"{arguments[1]}.{arguments[2]}"
@@ -521,6 +378,8 @@ class PartialPrefixRecoveryExecutionTests(SimpleTestCase):
             outcome = outcomes.get(ref, "ok")
             if outcome == "oserror":
                 raise OSError(24, "Too many open files")
+            if outcome == "crash_before_commit":
+                raise _Crash()
             if outcome in {"ok", "crash_after_commit"}:
                 self.recorder.apply(ref)
             if outcome == "crash_after_commit":
@@ -558,121 +417,157 @@ class PartialPrefixRecoveryExecutionTests(SimpleTestCase):
         self.assertEqual(evidence["prior_job_id"], prior_job)
         self.assertEqual(evidence["successful_prefix"], [M1, M2])
         self.assertEqual(evidence["permitted_action"], "none")
-        self.assertEqual(set(evidence["prefix_records"]), {M1, M2})
+        self.assertIsNone(evidence["in_flight_migration"])
         self.assertEqual(evidence["prefix_records"][M1], self.recorder.rows[M1])
-        self.assertIn("database_verified", retry["milestones"])
-        self.assertIn("source_advanced", retry["milestones"])
         self.assertLess(retry["milestones"].index("database_verified"), retry["milestones"].index("source_advanced"))
         return retry
 
-    # -- crash windows -----------------------------------------------------
+    def failed_after_m1(self):
+        job = str(uuid.uuid4())
+        failed = self.run_job(job, outcomes={M2: "fail"})
+        self.assertEqual(failed["migration_recovery"]["successful_prefix"], [M1])
+        return job
+
+    def assert_blocked(self, result, *, no_migration=True):
+        self.assertEqual(result["failure_classification"], "TARGET_MIGRATION_PREAPPLIED", result.get("failure_detail"))
+        self.assertNotIn("source_advanced", result["milestones"])
+        if no_migration:
+            self.assertEqual(self.migrate_calls, [])
+
+    # -- B1 crash windows ------------------------------------------------------
     def test_h1_m1_commits_then_hard_kill_then_resume_then_fresh_retry_runs_only_m2(self):
         job = str(uuid.uuid4())
         with self.assertRaises(_Crash):
             self.run_job(job, outcomes={M1: "crash_after_commit"})
-        crashed = self.store.load(job)
-        self.assertEqual(crashed["state"], "running")
-        self.assertEqual(crashed["migration_recovery"]["successful_prefix"], [])   # evidence write never happened
-        self.assertIn(M1, self.recorder.rows)                                      # but M1 committed
-
-        resumed = self.run_job(job, accept=False)          # daemon restart resumes the same job
+        crashed = self.store.load(job)["migration_recovery"]
+        self.assertEqual((crashed["successful_prefix"], crashed["in_flight_migration"]), ([], M1))
+        resumed = self.run_job(job, accept=False)
         self.assertEqual(resumed["failure_classification"], "AMBIGUOUS_INTERRUPTED_MIGRATION")
         evidence = resumed["migration_recovery"]
         self.assertTrue(evidence["finalized"])
         self.assertEqual(evidence["successful_prefix"], [M1])
         self.assertEqual(evidence["prefix_records"], {M1: self.recorder.rows[M1]})
-        self.assertEqual(evidence["first_remaining_migration"], M2)
-        self.assertEqual(evidence["permitted_action"], "retry_same_exact_release")
-        self.assertEqual(self.migrate_calls, [M1])         # the resumed job ran nothing
-
-        self.fresh_retry_succeeds_with_only([M2], prior_job=job)
-
-    def test_h1_crash_after_last_migration_leaves_a_complete_prefix_that_finishes_without_migrating(self):
-        job = str(uuid.uuid4())
-        with self.assertRaises(_Crash):
-            self.run_job(job, outcomes={M2: "crash_after_commit"})
-        resumed = self.run_job(job, accept=False)
-        evidence = resumed["migration_recovery"]
-        self.assertEqual(evidence["successful_prefix"], [M1, M2])
-        self.assertIsNone(evidence["first_remaining_migration"])
-        self.migrate_calls.clear()
-        retry = self.run_job(str(uuid.uuid4()))
-        self.assertEqual(retry["state"], "succeeded", retry.get("failure_detail"))
-        self.assertEqual(self.migrate_calls, [])
-        self.assertIn("source_advanced", retry["milestones"])
-
-    def test_h2_oserror_invoking_m2_after_durable_m1_then_fresh_retry_runs_only_m2(self):
-        job = str(uuid.uuid4())
-        failed = self.run_job(job, outcomes={M2: "oserror"})
-        self.assertEqual(failed["failure_classification"], "SAFE_EXECUTION_FAILURE")
-        evidence = failed["migration_recovery"]
-        self.assertTrue(evidence["finalized"])
-        self.assertEqual(evidence["successful_prefix"], [M1])
-        self.assertEqual(evidence["failure_classification"], "SAFE_EXECUTION_FAILURE")
-        self.fresh_retry_succeeds_with_only([M2], prior_job=job)
-
-    def test_ordinary_m2_failure_then_fresh_retry_runs_only_m2(self):
-        job = str(uuid.uuid4())
-        failed = self.run_job(job, outcomes={M2: "fail"})
-        self.assertEqual(failed["failure_classification"], "MIGRATION_FAILED")
-        self.assertEqual(failed["migration_recovery"]["successful_prefix"], [M1])
-        self.assertTrue(failed["migration_recovery"]["finalized"])
+        self.assertIsNone(evidence["in_flight_migration"])
         self.fresh_retry_succeeds_with_only([M2], prior_job=job)
 
     def test_h1_repeated_five_times_is_deterministic(self):
         for attempt in range(5):
             with self.subTest(attempt=attempt):
-                self.recorder = FakeRecorder()
-                self.head = "a" * 40
-                self.migrate_calls = []
+                self.recorder, self.head, self.migrate_calls = FakeRecorder(), "a" * 40, []
                 job = str(uuid.uuid4())
                 with self.assertRaises(_Crash):
                     self.run_job(job, outcomes={M1: "crash_after_commit"})
                 self.run_job(job, accept=False)
                 self.fresh_retry_succeeds_with_only([M2], prior_job=job)
 
-    # -- ownership must not be inferred -------------------------------------
-    def _failed_after_m1(self):
+    def test_h2_oserror_invoking_m2_after_durable_m1_then_fresh_retry_runs_only_m2(self):
         job = str(uuid.uuid4())
-        self.run_job(job, outcomes={M2: "fail"})
-        return job
+        failed = self.run_job(job, outcomes={M2: "oserror"})
+        self.assertEqual(failed["failure_classification"], "SAFE_EXECUTION_FAILURE")
+        self.assertTrue(failed["migration_recovery"]["finalized"])
+        self.assertEqual(failed["migration_recovery"]["successful_prefix"], [M1])
+        self.fresh_retry_succeeds_with_only([M2], prior_job=job)
 
-    def test_s3_reapplied_m1_with_new_row_identity_is_not_updater_owned(self):
-        self._failed_after_m1()
-        self.recorder.unapply(M1)
-        self.recorder.apply(M1)                     # same name, new id/applied
+    def test_ordinary_m2_failure_then_fresh_retry_runs_only_m2(self):
+        job = self.failed_after_m1()
+        self.fresh_retry_succeeds_with_only([M2], prior_job=job)
+
+    def test_crash_after_the_last_migration_finishes_without_re_running_and_verifies_first(self):
+        job = str(uuid.uuid4())
+        with self.assertRaises(_Crash):
+            self.run_job(job, outcomes={M2: "crash_after_commit"})
+        resumed = self.run_job(job, accept=False)
+        self.assertEqual(resumed["migration_recovery"]["successful_prefix"], [M1, M2])
         self.migrate_calls.clear()
         retry = self.run_job(str(uuid.uuid4()))
-        self.assertEqual(retry["failure_classification"], "TARGET_MIGRATION_PREAPPLIED")
+        self.assertEqual(retry["state"], "succeeded", retry.get("failure_detail"))
         self.assertEqual(self.migrate_calls, [])
+        # target, recovery, the complete-prefix VERIFICATION probe (before
+        # database_verified -- see race 4), then the ordinary postflight probe.
+        self.assertEqual(self.probe_count, 4)
+        self.assertLess(retry["milestones"].index("database_verified"), retry["milestones"].index("source_advanced"))
 
-    def test_s3_rewritten_applied_timestamp_is_not_updater_owned(self):
-        self._failed_after_m1()
-        self.recorder.rows[M1]["applied"] = "2030-01-01T00:00:00.000000Z"
-        retry = self.run_job(str(uuid.uuid4()))
-        self.assertEqual(retry["failure_classification"], "TARGET_MIGRATION_PREAPPLIED")
+    # -- in-flight bound -------------------------------------------------------
+    def test_committed_in_flight_migration_may_be_claimed(self):
+        job = str(uuid.uuid4())
+        with self.assertRaises(_Crash):
+            self.run_job(job, outcomes={M2: "crash_after_commit"})
+        self.assertEqual(self.store.load(job)["migration_recovery"]["in_flight_migration"], M2)
+        resumed = self.run_job(job, accept=False)
+        self.assertEqual(resumed["migration_recovery"]["successful_prefix"], [M1, M2])
 
-    def test_manually_applied_remaining_migration_is_not_updater_owned(self):
-        self._failed_after_m1()
-        self.recorder.apply(M2)                     # operator ran `migrate` by hand
-        self.migrate_calls.clear()
-        retry = self.run_job(str(uuid.uuid4()))
-        self.assertEqual(retry["failure_classification"], "TARGET_MIGRATION_PREAPPLIED")
-        self.assertEqual(self.migrate_calls, [])
-
-    def test_unfinalized_evidence_is_never_accepted(self):
-        job = self._failed_after_m1()
-        state = self.store.load(job)
-        evidence = dict(state["migration_recovery"])
-        # Simulate legacy/stranded evidence that never reached finalization.
+    def test_crash_then_manual_next_migration_cannot_be_claimed(self):
+        """M1 recorded, crash before M2 was ever marked in-flight, operator
+        applies M2 by hand before restart: M2 must never become updater-owned."""
+        job = str(uuid.uuid4())
+        with self.assertRaises(_Crash):
+            self.run_job(job, outcomes={M2: "crash_before_commit"})
         path = self.config.jobs_root / f"{job}.json"
         raw = json.loads(path.read_text())
-        raw["migration_recovery"] = {**evidence, "finalized": False}
+        raw["migration_recovery"]["in_flight_migration"] = None      # died before the M2 in-flight write
         path.write_text(json.dumps(raw))
-        retry = self.run_job(str(uuid.uuid4()))
-        self.assertEqual(retry["failure_classification"], "TARGET_MIGRATION_PREAPPLIED")
+        self.recorder.apply(M2)                                       # operator: manage.py migrate
+        resumed = self.run_job(job, accept=False)
+        self.assertFalse(resumed["migration_recovery"]["finalized"])
+        self.migrate_calls.clear()
+        self.assert_blocked(self.run_job(str(uuid.uuid4())))
 
-    def test_other_identity_fields_block_recovery(self):
+    # -- S3 / final ownership assertions and their races -----------------------
+    def test_s3_reapplied_m1_with_new_row_identity_is_not_updater_owned(self):
+        self.failed_after_m1()
+        self.recorder.unapply(M1)
+        self.recorder.apply(M1)
+        self.migrate_calls.clear()
+        self.assert_blocked(self.run_job(str(uuid.uuid4())))
+
+    def test_s3_rewritten_applied_timestamp_is_not_updater_owned(self):
+        self.failed_after_m1()
+        self.recorder.rows[M1]["applied"] = "2030-01-01T00:00:00.000000Z"
+        self.migrate_calls.clear()
+        self.assert_blocked(self.run_job(str(uuid.uuid4())))
+
+    def test_manually_applied_remaining_migration_is_not_updater_owned(self):
+        self.failed_after_m1()
+        self.recorder.apply(M2)
+        self.migrate_calls.clear()
+        self.assert_blocked(self.run_job(str(uuid.uuid4())))
+
+    def test_race_1_extra_migration_between_target_probe_and_recovery_observation(self):
+        self.failed_after_m1()
+        self.probe_hooks = {1: ("after", lambda: self.recorder.apply(M2))}
+        self.migrate_calls.clear()
+        self.assert_blocked(self.run_job(str(uuid.uuid4())))
+
+    def test_race_2_extra_migration_after_recovery_selection_before_recovery_probe(self):
+        self.failed_after_m1()
+        self.probe_hooks = {2: ("before", lambda: self.recorder.apply(M2))}
+        self.migrate_calls.clear()
+        self.assert_blocked(self.run_job(str(uuid.uuid4())))
+
+    def test_race_3_extra_migration_after_target_validation_before_migration_started(self):
+        self.failed_after_m1()
+        self.preflight_hook = lambda: self.recorder.apply(M2)
+        self.migrate_calls.clear()
+        retry = self.run_job(str(uuid.uuid4()))
+        self.assert_blocked(retry)
+        self.assertNotIn("migration_started", retry["milestones"])
+
+    def test_race_4_complete_prefix_row_changes_before_final_verification(self):
+        job = str(uuid.uuid4())
+        with self.assertRaises(_Crash):
+            self.run_job(job, outcomes={M2: "crash_after_commit"})
+        self.run_job(job, accept=False)
+
+        def rewrite():
+            self.recorder.unapply(M1)
+            self.recorder.apply(M1)
+        self.probe_hooks = {3: ("after", rewrite)}     # the complete-prefix verification probe
+        self.migrate_calls.clear()
+        retry = self.run_job(str(uuid.uuid4()))
+        self.assert_blocked(retry)
+        self.assertNotIn("database_verified", retry["milestones"])
+
+    def test_identity_mismatches_block_recovery(self):
         cases = {
             "other release": {"release_id": "r0106"},
             "other target": {"target_commit": "1" * 40},
@@ -681,72 +576,93 @@ class PartialPrefixRecoveryExecutionTests(SimpleTestCase):
             "noncontiguous prefix": {"successful_prefix": [M2], "prefix_records": {}},
             "missing records": {"prefix_records": {}},
             "foreign evidence job": {"evidence_job_id": "22222222-2222-2222-2222-222222222222"},
+            "impossible in-flight": {"in_flight_migration": M1},
         }
         for label, change in cases.items():
             with self.subTest(label):
-                self.recorder = FakeRecorder()
-                self.head = "a" * 40
-                job = self._failed_after_m1()
+                self.recorder, self.head, self.migrate_calls = FakeRecorder(), "a" * 40, []
+                job = self.failed_after_m1()
                 path = self.config.jobs_root / f"{job}.json"
                 raw = json.loads(path.read_text())
                 raw["migration_recovery"] = {**raw["migration_recovery"], **change}
                 path.write_text(json.dumps(raw))
-                retry = self.run_job(str(uuid.uuid4()))
-                self.assertEqual(retry["failure_classification"], "TARGET_MIGRATION_PREAPPLIED")
-                # mark the retry terminal so the next subTest starts clean
-                for state in self.store.list_states():
-                    self.assertNotEqual(state["state"], "running")
+                self.migrate_calls.clear()
+                self.assert_blocked(self.run_job(str(uuid.uuid4())))
 
-    # -- finalize_from_observation fails closed -------------------------------
-    def _unfinalized_after_crash(self):
+    def test_unprovable_unfinalized_evidence_is_never_accepted(self):
         job = str(uuid.uuid4())
         with self.assertRaises(_Crash):
             self.run_job(job, outcomes={M1: "crash_after_commit"})
-        return job
+        self.store.fail(job, "AMBIGUOUS_INTERRUPTED_MIGRATION", "worker died", manual=True)
+        self.recorder.apply(M2)                         # beyond the single in-flight migration
+        self.migrate_calls.clear()
+        retry = self.run_job(str(uuid.uuid4()))
+        self.assert_blocked(retry)
+        self.assertFalse(self.store.load(job)["migration_recovery"]["finalized"])
 
+    # -- finalization fails closed ---------------------------------------------
     def test_finalization_refuses_noncontiguous_observation(self):
-        job = self._unfinalized_after_crash()
+        job = str(uuid.uuid4())
+        with self.assertRaises(_Crash):
+            self.run_job(job, outcomes={M1: "crash_after_commit"})
         self.recorder.unapply(M1)
-        self.recorder.apply(M2)                     # M2 applied without M1
-        resumed = self.run_job(job, accept=False)
-        self.assertFalse(resumed["migration_recovery"]["finalized"])
+        self.recorder.apply(M2)
+        self.assertFalse(self.run_job(job, accept=False)["migration_recovery"]["finalized"])
 
-    def test_finalization_refuses_when_recorded_row_changed(self):
+    def test_finalization_refuses_when_a_recorded_row_changed(self):
         job = str(uuid.uuid4())
         with self.assertRaises(_Crash):
             self.run_job(job, outcomes={M2: "crash_after_commit"})
-        # M1's row identity was durably recorded before the crash on M2.
-        self.assertEqual(self.store.load(job)["migration_recovery"]["successful_prefix"], [M1])
         self.recorder.unapply(M1)
         self.recorder.apply(M1)
-        resumed = self.run_job(job, accept=False)
-        self.assertFalse(resumed["migration_recovery"]["finalized"])
-
-    def test_finalization_refuses_corrupt_identity(self):
-        job = self._unfinalized_after_crash()
-        path = self.config.jobs_root / f"{job}.json"
-        raw = json.loads(path.read_text())
-        raw["migration_recovery"]["release_id"] = "r0999"
-        path.write_text(json.dumps(raw))
-        resumed = self.run_job(job, accept=False)
-        self.assertFalse(resumed["migration_recovery"]["finalized"])
+        self.assertFalse(self.run_job(job, accept=False)["migration_recovery"]["finalized"])
 
     def test_finalization_never_masks_the_original_failure(self):
-        job = self._unfinalized_after_crash()
+        job = str(uuid.uuid4())
+        with self.assertRaises(_Crash):
+            self.run_job(job, outcomes={M1: "crash_after_commit"})
         with mock.patch.object(FakeRecorder, "observe", side_effect=RuntimeError("psql unavailable")):
             resumed = self.run_job(job, accept=False)
         self.assertEqual(resumed["failure_classification"], "AMBIGUOUS_INTERRUPTED_MIGRATION")
         self.assertFalse(resumed["migration_recovery"]["finalized"])
 
+    # -- PostgreSQL not ready after a power loss ---------------------------------
+    def test_database_back_within_the_bounded_wait_finalizes_at_resume(self):
+        job = str(uuid.uuid4())
+        with self.assertRaises(_Crash):
+            self.run_job(job, outcomes={M1: "crash_after_commit"})
+        self.recorder.unavailable_attempts = 3
+        resumed = self.run_job(job, accept=False)
+        self.assertTrue(resumed["migration_recovery"]["finalized"])
+        self.assertEqual(self.sleeps, list(OBSERVATION_READINESS_DELAYS[:3]))
+        self.fresh_retry_succeeds_with_only([M2], prior_job=job)
+
+    def test_database_still_down_then_later_exact_retry_finalizes_and_continues(self):
+        job = str(uuid.uuid4())
+        with self.assertRaises(_Crash):
+            self.run_job(job, outcomes={M1: "crash_after_commit"})
+        self.recorder.unavailable_attempts = len(OBSERVATION_READINESS_DELAYS) + 1     # outlasts the bounded wait
+        resumed = self.run_job(job, accept=False)
+        self.assertEqual(resumed["failure_classification"], "AMBIGUOUS_INTERRUPTED_MIGRATION")
+        self.assertFalse(resumed["migration_recovery"]["finalized"])              # 2. could not reach the DB
+        self.assertEqual(self.sleeps, list(OBSERVATION_READINESS_DELAYS))        #    bounded, then fail safe
+        retry = self.fresh_retry_succeeds_with_only([M2], prior_job=job)           # 3-5. DB up: finalize + continue
+        finalized = self.store.load(job)["migration_recovery"]
+        self.assertTrue(finalized["finalized"])
+        self.assertEqual(finalized["successful_prefix"], [M1])
+        self.assertEqual(retry["state"], "succeeded")
+
+    # -- evidence integrity --------------------------------------------------------
     def test_finalized_evidence_cannot_be_rewritten(self):
-        job = self._failed_after_m1()
+        job = self.failed_after_m1()
         with self.assertRaises(Exception):
             self.store.update(job, migration_recovery={**self.store.load(job)["migration_recovery"], "successful_prefix": []})
 
     def test_recorded_authorization_source_is_the_real_one(self):
-        job = self._failed_after_m1()
-        self.assertEqual(self.store.load(job)["migration_recovery"]["authorization_source"], "not_required")
-        self.assertNotIn("exact_plan_authorization_matches", self.store.load(job)["migration_recovery"])
+        job = self.failed_after_m1()
+        evidence = self.store.load(job)["migration_recovery"]
+        self.assertEqual(evidence["authorization_source"], "not_required")
+        self.assertNotIn("exact_plan_authorization_matches", evidence)
 
 
 class ProbeContextShapeTests(SimpleTestCase):
@@ -775,3 +691,61 @@ class ProbeContextShapeTests(SimpleTestCase):
         self.assertIn("recovery_plan", _strict_probe(self.payload(recovery=True), review_context=True, recovery_context=True))
         with self.assertRaises(ExecutionError):
             _strict_probe(self.payload(), review_context=True, recovery_context=True)
+
+
+class NonAtomicClassificationTests(SimpleTestCase):
+    """Every operation of an atomic=False migration is manual, in the forward
+    plan and in the reconstructed plan alike; atomic migrations are untouched."""
+
+    def _migration(self, *, atomic):
+        from django.db import migrations, models
+
+        class Migration(migrations.Migration):
+            operations = [migrations.CreateModel("Widget", [("id", models.BigAutoField(primary_key=True))])]
+        migration = Migration("0002_widget", "sample")
+        migration.atomic = atomic
+        return migration
+
+    def _forward(self, migration):
+        from django.db.migrations.state import ProjectState
+        from updatecenter.management.commands.updatecenter_probe import _classify_migration_operation
+        state = ProjectState()
+        result = []
+        for operation in migration.operations:
+            operation.state_forwards(migration.app_label, state)
+            result.append(_classify_migration_operation(migration, operation, after_state=state))
+        return result
+
+    def _reconstructed(self, migration):
+        from django.db.migrations.state import ProjectState
+        from updatecenter.management.commands import updatecenter_probe
+        loader = mock.Mock()
+        loader.disk_migrations = {("sample", "0002_widget"): migration}
+        loader.graph.node_map = {("sample", "0002_widget"): mock.Mock(parents=[])}
+        loader.project_state.return_value = ProjectState()
+        with mock.patch.object(updatecenter_probe, "_migration_file_sha256", return_value="0" * 64):
+            return updatecenter_probe._serialize_exact_plan(loader, ["sample.0002_widget"])[0]["operations"]
+
+    def test_non_atomic_migration_is_manual_in_forward_and_reconstructed_plans(self):
+        from updatecenter.management.commands.updatecenter_probe import NON_ATOMIC_DETAIL
+        migration = self._migration(atomic=False)
+        expected = [{"operation": "CreateModel", "classification": "manual", "detail": NON_ATOMIC_DETAIL}]
+        self.assertEqual(self._forward(migration), expected)
+        self.assertEqual(self._reconstructed(self._migration(atomic=False)), expected)
+
+    def test_atomic_twin_keeps_its_ordinary_classification_and_digest(self):
+        from updatecenter.management.commands.updatecenter_probe import _classify_operation, compute_migration_plan_digest
+        from django.db.migrations.state import ProjectState
+        migration = self._migration(atomic=True)
+        classified = self._forward(migration)
+        state = ProjectState()
+        operation = self._migration(atomic=True).operations[0]
+        operation.state_forwards("sample", state)
+        self.assertEqual(classified, [_classify_operation(operation, app_label="sample", after_state=state)])
+        self.assertEqual(classified[0]["classification"], "additive")
+        item = {"ref": "sample.0002_widget", "migration_file_sha256": "0" * 64, "operations": classified}
+        legacy = {"ref": "sample.0002_widget", "migration_file_sha256": "0" * 64,
+                  "operations": [_classify_operation(operation, app_label="sample", after_state=state)]}
+        kwargs = dict(release_id="r0105", target_commit="b" * 40, manifest_sha256="c" * 64)
+        self.assertEqual(compute_migration_plan_digest(plan=[item], **kwargs),
+                         compute_migration_plan_digest(plan=[legacy], **kwargs))

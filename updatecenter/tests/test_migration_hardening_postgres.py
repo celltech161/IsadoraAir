@@ -3,9 +3,8 @@
 * the protected runtime's psql recorder observation (S3 row identity) and
   its read-only session;
 * the read-only migration preflight transaction;
-* library.schedule_block_duplicate_times at every schedule-schema stage
-  (S2): pre-0086, 0086 (profile-less rows), 0087 (no uniqueness yet), and
-  the current schema;
+* the stage-aware ScheduleBlock preflights (S2), each confirmed against the
+  REAL next migration (0087 / 0088) on the same data;
 * exact-plan digest reconstruction on the real migration graph.
 
 All run inside the isolated `test_*` database via `manage.py test`.
@@ -31,7 +30,6 @@ from isadoraair_updater.executor import ExecutionError, Executor
 from isadoraair_updater.jobs import JobStore
 from isadoraair_updater.process import CommandRunner
 
-CHECK = "library.schedule_block_duplicate_times"
 
 
 def _library_targets(leaf):
@@ -110,38 +108,49 @@ class ReadOnlyPreflightTests(TransactionTestCase):
         from library.models import ScheduleProfile
         ScheduleProfile.objects.create(name="ro-before")
 
-        def writes(cursor):
+        def writes(cursor, pending):
             cursor.execute("UPDATE library_scheduleprofile SET name = 'mutated' WHERE name = 'ro-before'")
             return {"ok": True}
 
-        def advances_sequence(cursor):
+        def advances_sequence(cursor, pending):
             cursor.execute("SELECT nextval(pg_get_serial_sequence('library_scheduleprofile', 'id'))")
             return {"ok": True}
 
         for check in (writes, advances_sequence):
-            with self.subTest(check=check.__name__), mock.patch.dict(preflight.CHECKS, {"ro.check": check}, clear=True):
+            with self.subTest(check=check.__name__), \
+                    mock.patch.dict(preflight.REGISTRY, {"ro.0001_check": [("ro.check", check)]}, clear=True):
                 with self.assertRaisesRegex(Exception, "read-only transaction"):
-                    preflight.run_preflights(["ro.check"])
+                    preflight.run_preflights(["ro.0001_check"])
         self.assertTrue(ScheduleProfile.objects.filter(name="ro-before").exists())
         self.assertFalse(ScheduleProfile.objects.filter(name="mutated").exists())
 
 
-class ScheduleBlockPreflightTests(TransactionTestCase):
-    """S2: the check follows library.0088's per-profile uniqueness at every stage."""
+class ScheduleBlockStagePreflightTests(TransactionTestCase):
+    """S2: each registered check reports exactly what the immediately pending
+    migration will do. Every verdict is confirmed by running the REAL next
+    migration on the same data."""
 
     def setUp(self):
         from library.models import Rotation
         self.rotation = Rotation.objects.create(name=f"preflight-{uuid.uuid4().hex[:8]}").id
         self.leaves, _ = _library_targets("0088_enforce_schedule_profile_integrity")
 
-    def _migrate_library(self, leaf):
-        _leaves, targets = _library_targets(leaf)
-        MigrationExecutor(connection).migrate(targets)
-
-    def _restore(self):
+    def tearDown(self):
         with connection.cursor() as cursor:
             cursor.execute("DELETE FROM library_scheduleblock")
         MigrationExecutor(connection).migrate(self.leaves)
+
+    def _stage(self, leaf):
+        _leaves, targets = _library_targets(leaf)
+        MigrationExecutor(connection).migrate(targets)
+
+    def _real_migration_succeeds(self, leaf):
+        _leaves, targets = _library_targets(leaf)
+        try:
+            MigrationExecutor(connection).migrate(targets)
+            return True
+        except Exception:  # noqa: BLE001 -- 0087's RuntimeError or 0088's IntegrityError
+            return False
 
     def _profile(self, cursor, name):
         cursor.execute(
@@ -163,72 +172,82 @@ class ScheduleBlockPreflightTests(TransactionTestCase):
         )
         return cursor.fetchone()[0]
 
-    def _run(self):
-        result = preflight.run_preflights([CHECK])
-        return result["status"], result["checks"][0]["evidence"]
+    def _preflight(self, *pending):
+        result = preflight.run_preflights(list(pending))
+        return result["status"], {item["id"]: item for item in result["checks"]}
 
-    def test_same_time_in_two_profiles_passes_on_the_current_schema(self):
-        from library.models import ScheduleBlock, ScheduleProfile
-        for name in ("weekday-ops", "holiday-ops"):
-            ScheduleBlock.objects.create(
-                profile=ScheduleProfile.objects.create(name=name), day_of_week=0,
-                start_time=time(6), end_time=time(7), rotation_id=self.rotation,
-            )
-        status, evidence = self._run()
-        self.assertEqual(status, "ok", evidence)
-        self.assertTrue(evidence["profile_scoped"])
+    # -- stage 0086: 0087 and 0088 pending ------------------------------------
+    def test_0086_cross_profile_duplicate_fails_like_0087_does(self):
+        self._stage("0086_scheduleprofile_foundation_schema")
+        with connection.cursor() as cursor:
+            other = self._profile(cursor, "other")
+            unassigned = self._block(cursor, day=2, at=8, profile=None)
+            assigned = self._block(cursor, day=2, at=8, profile=other)
+        status, checks = self._preflight(preflight.M0087, preflight.M0088)
+        self.assertEqual(status, "failed")
+        check = checks["library.0087.global_slot_ambiguity"]
+        self.assertEqual(check["status"], "failed")
+        self.assertEqual(check["evidence"]["offending_groups"][0]["scope"], "global")
+        self.assertEqual(check["evidence"]["offending_groups"][0]["schedule_block_ids"], sorted([unassigned, assigned]))
+        self.assertFalse(self._real_migration_succeeds("0087_backfill_default_schedule_profile"))
 
-    def test_duplicate_within_one_profile_fails_before_0088_enforces_it(self):
-        try:
-            self._migrate_library("0087_backfill_default_schedule_profile")
-            with connection.cursor() as cursor:
-                ops = self._profile(cursor, "ops")
-                other = self._profile(cursor, "other")
-                first = self._block(cursor, profile=ops)
-                second = self._block(cursor, profile=ops)
-                self._block(cursor, profile=other)            # same time, different profile: valid
-            status, evidence = self._run()
-            self.assertEqual(status, "failed")
-            self.assertEqual(evidence["offending_group_count"], 1)
-            group = evidence["offending_groups"][0]
-            self.assertEqual(group["profile"], ops)
-            self.assertEqual(group["identity"], ["0", "06:00:00"])
-            self.assertEqual(group["schedule_block_ids"], [first, second])
-        finally:
-            self._restore()
+    def test_0086_clean_data_passes_and_0087_then_0088_really_succeed(self):
+        self._stage("0086_scheduleprofile_foundation_schema")
+        with connection.cursor() as cursor:
+            self._block(cursor, day=2, at=8, profile=None)
+            self._block(cursor, day=2, at=9, profile=None)
+        self.assertEqual(self._preflight(preflight.M0087, preflight.M0088)[0], "ok")
+        self.assertTrue(self._real_migration_succeeds("0087_backfill_default_schedule_profile"))
+        self.assertTrue(self._real_migration_succeeds("0088_enforce_schedule_profile_integrity"))
 
-    def test_profile_less_rows_join_the_default_profile_like_0087_will(self):
-        try:
-            self._migrate_library("0086_scheduleprofile_foundation_schema")
-            with connection.cursor() as cursor:
-                cursor.execute("SELECT id FROM library_scheduleprofile WHERE name = %s", [preflight.DEFAULT_PROFILE_NAME])
-                row = cursor.fetchone()
-                default = row[0] if row else self._profile(cursor, preflight.DEFAULT_PROFILE_NAME)
-                other = self._profile(cursor, "other")
-                existing = self._block(cursor, day=1, at=7, profile=default)
-                unassigned = self._block(cursor, day=1, at=7, profile=None)   # -> Default Schedule
-                self._block(cursor, day=2, at=8, profile=None)
-                self._block(cursor, day=2, at=8, profile=other)             # different profile: valid
-            status, evidence = self._run()
-            self.assertEqual(status, "failed")
-            self.assertEqual(evidence["offending_group_count"], 1)
-            self.assertEqual(evidence["offending_groups"][0]["profile"], default)
-            self.assertEqual(evidence["offending_groups"][0]["schedule_block_ids"], sorted([existing, unassigned]))
-        finally:
-            self._restore()
+    def test_before_0086_every_block_shares_one_future_profile(self):
+        self._stage("0085_remote_dj_queue_set_next_access")
+        with connection.cursor() as cursor:
+            ids = [self._block(cursor), self._block(cursor)]
+        status, checks = self._preflight(preflight.M0087, preflight.M0088)
+        self.assertEqual(status, "failed")
+        self.assertEqual(checks["library.0087.global_slot_ambiguity"]["evidence"]["offending_groups"][0]["schedule_block_ids"], ids)
 
-    def test_before_profiles_exist_every_block_shares_the_future_default(self):
-        try:
-            self._migrate_library("0085_remote_dj_queue_set_next_access")
-            with connection.cursor() as cursor:
-                ids = [self._block(cursor), self._block(cursor)]
-                self._block(cursor, day=3)
-            status, evidence = self._run()
-            self.assertEqual(status, "failed")
-            self.assertFalse(evidence["profile_scoped"])
-            self.assertEqual(evidence["offending_groups"][0]["schedule_block_ids"], ids)
-        finally:
-            self._restore()
+    # -- stage 0087: only 0088 pending ----------------------------------------
+    def test_0087_cross_profile_same_time_passes_and_0088_really_succeeds(self):
+        self._stage("0087_backfill_default_schedule_profile")
+        with connection.cursor() as cursor:
+            first, second = self._profile(cursor, "weekday"), self._profile(cursor, "holiday")
+            self._block(cursor, profile=first)
+            self._block(cursor, profile=second)
+        status, checks = self._preflight(preflight.M0088)
+        self.assertEqual(status, "ok", checks)
+        self.assertNotIn("library.0087.global_slot_ambiguity", checks)
+        self.assertTrue(self._real_migration_succeeds("0088_enforce_schedule_profile_integrity"))
+
+    def test_0087_same_profile_duplicate_fails_like_0088_does(self):
+        self._stage("0087_backfill_default_schedule_profile")
+        with connection.cursor() as cursor:
+            ops = self._profile(cursor, "ops")
+            ids = [self._block(cursor, profile=ops), self._block(cursor, profile=ops)]
+        status, checks = self._preflight(preflight.M0088)
+        self.assertEqual(status, "failed")
+        group = checks["library.0088.profile_integrity"]["evidence"]["offending_groups"][0]
+        self.assertEqual((group["scope"], group["key"], group["schedule_block_ids"]), ({"profile_id": ops}, ["0", "06:00:00"], ids))
+        self.assertFalse(self._real_migration_succeeds("0088_enforce_schedule_profile_integrity"))
+
+    def test_0087_null_profile_fails_like_0088_does(self):
+        self._stage("0087_backfill_default_schedule_profile")
+        with connection.cursor() as cursor:
+            orphan = self._block(cursor, profile=None)
+        status, checks = self._preflight(preflight.M0088)
+        self.assertEqual(status, "failed")
+        problems = checks["library.0088.profile_integrity"]["evidence"]["null_profile_problems"]
+        self.assertEqual(problems[0]["schedule_block_ids"], [orphan])
+        self.assertFalse(self._real_migration_succeeds("0088_enforce_schedule_profile_integrity"))
+
+    # -- stage 0088 applied ----------------------------------------------------
+    def test_after_0088_no_historical_check_runs(self):
+        status, checks = self._preflight("library.0089_future_unregistered")
+        self.assertEqual((status, checks), ("ok", {}))
+        status, checks = self._preflight(preflight.M0088)
+        self.assertEqual(status, "failed")
+        self.assertEqual(list(checks), ["updater.pending_stage_consistency"])
 
     def test_default_profile_name_matches_migration_0087(self):
         import importlib

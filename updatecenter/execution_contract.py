@@ -36,22 +36,6 @@ def execution_fingerprint(**values) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
-def migration_hardening_fingerprint_payload(base: dict, *, migration_authorization, migration_preflight_checks) -> dict:
-    """Protocol-6 extension. Legacy plans never enter this function."""
-    return {
-        **{key: value for key, value in base.items() if key != "contract_version"},
-        "contract_version": 5,
-        "migration_authorization": migration_authorization,
-        "migration_preflight_checks": list(migration_preflight_checks),
-    }
-
-
-def migration_hardening_execution_fingerprint(base: dict, **values) -> str:
-    payload = migration_hardening_fingerprint_payload(base, **values)
-    raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(raw).hexdigest()
-
-
 def protected_runtime_fingerprint_payload(**values) -> dict:
     """Update Center Phase D, D3-J: Django's own independently-
     maintained mirror of deploy/updater_runtime/isadoraair_updater/

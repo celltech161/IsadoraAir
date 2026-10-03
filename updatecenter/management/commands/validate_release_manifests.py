@@ -15,7 +15,9 @@ from pathlib import Path
 
 from django.core.management.base import BaseCommand
 
-from updatecenter import cross_check, git_adapter, manifest as manifest_mod, planner, release_chain
+from updatecenter import (
+    cross_check, git_adapter, manifest as manifest_mod, migration_authorization, planner, release_chain,
+)
 
 
 class Command(BaseCommand):
@@ -114,6 +116,35 @@ class Command(BaseCommand):
                     self.stderr.write(self.style.ERROR(f"    - [{f.field}] {f.detail}"))
             else:
                 self.stdout.write(self.style.SUCCESS(f"  {chained.manifest.release_id} @ {commit[:12]}: PASS"))
+            # Trusted companion migration authorization (runtime 11): the
+            # same rules protected runtime 11 applies when it discovers it.
+            if head_sha:
+                try:
+                    authorized = migration_authorization.validate_release_companion(
+                        checkout_root, head_sha, release_id=chained.manifest.release_id,
+                        release_commit=commit, migrations_required=chained.manifest.migrations_required,
+                        app_label_paths=app_label_paths,
+                    )
+                except migration_authorization.CompanionError as exc:
+                    any_cross_check_failure = True
+                    self.stderr.write(self.style.ERROR(f"  {chained.manifest.release_id}: companion: {exc}"))
+                else:
+                    if authorized is not None:
+                        self.stdout.write(self.style.SUCCESS(
+                            f"  {chained.manifest.release_id}: companion authorization PASS "
+                            f"({len(authorized)} reviewed manual operation(s))"
+                        ))
+
+        if head_sha:
+            orphans = migration_authorization.orphan_companions(
+                checkout_root, head_sha, [c.manifest.release_id for c in chain],
+            )
+            if orphans:
+                any_cross_check_failure = True
+                self.stderr.write(self.style.ERROR(
+                    f"FAIL: {migration_authorization.AUTHORIZATION_DIR}/ holds files that are not a "
+                    f"<release_id>.json companion of a release in the chain: {orphans!r}"
+                ))
 
         if any_cross_check_failure:
             self.stderr.write(self.style.ERROR("FAIL: one or more releases' manifest claims disagree with actual repository content."))

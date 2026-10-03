@@ -148,6 +148,12 @@ class ProductionStateExecutor(Executor):
         return r0092_tree_probe()
 
     def _run_app(self, source, arguments, *, timeout):
+        if arguments and arguments[0] == "updatecenter_migration_preflight":
+            # The REAL target preflight command, against the real test DB.
+            from updatecenter.management.commands.updatecenter_migration_preflight import run_preflights
+            pending = [arguments[index + 1] for index, value in enumerate(arguments) if value == "--pending"]
+            payload = json.dumps(run_preflights(pending), sort_keys=True, separators=(",", ":"))
+            return ProcessResult(tuple(arguments), 0, payload.encode("utf-8"), b""), {}
         if arguments and arguments[0] == "migrate":
             self.migrate_calls += 1
             MigrationExecutor(connection).migrate([(arguments[1], arguments[2])])
@@ -210,6 +216,12 @@ class R0092ProductionBootstrapAcceptanceTests(TransactionTestCase):
         config["phase_d_supervisor_activation_socket"] = str(self.root / "activation.sock")
         self.config = validate_config_dict(config, allow_local_repository=True)
         self.store = JobStore(self.config.jobs_root, self.config.logs_root, acquire_daemon_lock=False)
+        # Historical r0092 has no deploy/migration_authorizations companion:
+        # runtime 11's discovery finds none, so the exact LOCAL approval path
+        # this acceptance test exercises is what authorizes it.
+        no_companions = mock.patch("isadoraair_updater.executor.load_plan_authorizations", return_value={})
+        no_companions.start()
+        self.addCleanup(no_companions.stop)
         self.systemd = RecordingSystemd()
         r0092_data = json.loads(
             (PROJECT_ROOT / "deploy" / "releases" / "r0092.json").read_text(encoding="utf-8")

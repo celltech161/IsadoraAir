@@ -1577,166 +1577,167 @@ for Update Center operations; the web route adds the existing authenticated
 superuser/CSRF boundary. The bootstrap CLI adds the stronger local root check
 because r0088 cannot render the new UI.
 
-### Protocol-6 central authorization, preflight, and partial-prefix recovery
+### Runtime 11: companion authorization, migration preflights, partial-prefix recovery
 
-Protocol 6 adds two optional release-manifest fields. A release with migrations
-may name `migration_preflight_checks`, a list of identifiers from the protected
-closed registry, and may reference exactly
-`deploy/migration_authorizations/<release-id>.json`. Both require protocol 6;
-old manifests omit them and retain their byte-for-byte legacy fingerprint.
+Protected runtime 11 is the capability boundary. **Release manifests do not
+change.** They stay manifest protocol 5 indefinitely
+(`MANIFEST_PROTOCOL_VERSION = 5`, `UPDATER_PROTOCOL_VERSION = 5`; every
+`minimum_updater_protocol_version` stays at most 5). No manifest field points at
+any of the new behavior. Both runtime 11 and the Django validator reject
+`migration_authorization` and `migration_preflight_checks` as unknown manifest
+fields; they were briefly proposed and then withdrawn.
 
-#### Bootstrap rule: runtime 11 first, protocol-6 fields later
+#### Why runtime 10 can always bootstrap
 
-A runtime-10 (protocol-5) worker parses **every** manifest on the trusted tip
-and hard-rejects unknown fields. One manifest using a protocol-6 field would
-therefore stop such a station from planning anything, including the release
-that would upgrade it. The rollout is fixed:
+Before handing off, a runtime-10 worker runs, in order:
 
-1. **r0105 is the runtime-11 bootstrap release.** Its manifest is
-   protocol-5 shaped: `minimum_updater_protocol_version: 5`, no
-   `migration_authorization`, no `migration_preflight_checks`. It carries a
-   `protected_runtime` transition whose signed descriptor advertises
-   `runtime_version: 11` and `manifest_protocol_version: 6`. Old supervisors
-   accept any `manifest_protocol_version >= 1`. The runtime-10 worker parses
-   the chain, plans r0105, and hands off to runtime 11 at the mutation gate,
-   **before** staging or probing the target. Runtime 11 then applies the
-   ordinary target transition, including `updatecenter.0004`, and source
-   advancement stays behind the existing mutation gate.
-2. **Protocol-6 fields first appear in a later release (r0106+)**, and only
-   once every station has installed r0105.
+1. `derive_plan()`, which parses **every** manifest on the trusted tip;
+2. the expected-fingerprint check;
+3. the minimum-protocol gate (`manual_blockers`).
 
-Both chain builders enforce this, so the rule does not rely on documentation:
-`updatecenter/release_chain.py` (`build_chain`, used by
-`validate_release_manifests` and the planner) and runtime 11's own
-`load_chain` refuse a chain in which the first release delivering runtime >= 11
-/ protocol >= 6 uses protocol-6 fields or a protocol-6 minimum, or in which any
-earlier release does.
+Because every manifest stays protocol-5 shaped, and companions live where
+runtime 10 never looks, a station that skipped r0105 still:
 
-The ordinary target probe keeps emitting exactly the 13-key reviewed-plan
-shape that every earlier runtime accepts. The three recovery keys appear only
-when runtime 11 explicitly requests a recovery reconstruction
-(`--recovery-plan-ref`), and `_strict_probe` requires exactly the shape the
-caller requested.
+* parses the whole chain, including later releases' companions;
+* derives its plan (for example r0104 → r0107);
+* selects r0105 as the required intermediate protected-runtime transition;
+* hands off to runtime 11 before staging or probing.
 
-#### Target-side central migration authorization
+Runtime 11 then re-derives the **same** fingerprint, because companions are
+never fingerprint input, and performs the migration work.
+`updatecenter/tests/test_runtime11_bootstrap.py` proves this with the actual
+r0104 runtime, extracted from Git, on the real release chain.
 
-The authorization is a companion artifact, not an inline manifest object. A
-release commit cannot contain its own commit SHA, and putting the manifest's
-SHA-256 inside the manifest would be self-referential. Authoring is a
-two-commit operation:
+The r0105 protected-runtime descriptor advertises `runtime_version: 11` with
+`manifest_protocol_version: 5`.
 
-1. Commit A introduces the immutable release manifest and source.
-2. A later metadata-only commit B introduces the companion.
+#### Trusted companion migration authorization
 
-The protected repository proves B is a unique, never-modified file on canonical
-trusted ancestry, strictly after A. **The artifact has no signature of its
-own.** It inherits the trust of the root-configured, fast-forward-only trusted
-repository, exactly like the release code.
+Path convention: `deploy/migration_authorizations/<release_id>.json`, at most
+one per release.
 
-The closed record (`schema_version: 1`) binds:
+* **Why runtime 10 ignores it:** runtime 10 enumerates only
+  `deploy/releases/*.json`, and its predecessor-diff rules match only:
+  * new files in a directory literally named `migrations`;
+  * top-level `deploy/*.service` / `deploy/*.timer`;
+  * anything under `deploy/updater_runtime/`;
+  * `requirements.txt` and `deploy/isadoraair.nginx`.
+* **Provenance:**
+  * the release must exist in the trusted chain;
+  * the companion is added exactly once, strictly after that release's
+    introducing (target) commit, on the trusted tip's history;
+  * it is introduced by a single-parent commit that changes only
+    `deploy/migration_authorizations/`;
+  * any later modification, deletion or re-addition **fails closed**.
+* **Trust:** it inherits the trust of the root-configured, fast-forward-only
+  trusted repository. It has **no signature of its own**.
+* **Closed schema (`schema_version: 1`):**
+  * `release_id`
+  * `target_commit` (the release's own introducing commit)
+  * `manifest_sha256` (SHA-256 of that release's manifest bytes, computed from
+    Git)
+  * `authorized_manual_operations`: entries of `{ref, migration_file_sha256,
+    operation_index, operation, classification: "manual"}`
+* **Release-local:** a companion for release R may authorize only operations
+  in migrations R itself declares in `migrations_required`, pinned to their
+  exact bytes at R's commit.
+* **Discovery (runtime 11):** for a plan with manual operations, every release
+  in `releases_in_plan` is checked. Each present companion is validated
+  against its own release, and their authorized sets are unioned. Central
+  approval applies only if **every** manual operation in the station's own
+  derived plan (exact ref, file SHA-256, index, operation, classification) is
+  in that union. Extra authorized operations never add anything to a plan. If
+  coverage is incomplete, exact station-local approval still applies.
+* **Absence and failure:** an absent companion contributes nothing. A
+  malformed or badly provenanced companion fails the job before any mutation.
+* **Fingerprint and digest:** companions are never part of the trusted-plan
+  fingerprint or the migration-plan digest.
+* **Validation:** `manage.py validate_release_manifests` applies the same rules
+  through an independent mirror (`updatecenter/migration_authorization.py`)
+  and rejects stray files in the directory. Runtime/Django parity is
+  regression-tested case by case.
 
-* `release_id`
-* `target_commit` (commit A)
-* `manifest_sha256`
-* `authorized_manual_operations`: the reviewed set of manual-classified
-  operations, each as `{ref, migration_file_sha256, operation_index, operation,
-  classification: "manual"}`. That pins each one to the exact migration source
-  bytes and the exact operation position. Free-text detail is never matched.
+**Publication sequence.** The remote must learn both commits in one ref
+update:
 
-The record is deliberately **not** bound to any source baseline, plan digest or
-plan fingerprint, so one artifact serves every station and every
-skipped-release path to that target. Each station still derives its own exact
-plan, and every mechanical plan, schema and trust check still runs. The
-companion satisfies the manual-operation gate only when **every**
-manual-classified operation in that station's own plan is in the authorized
-set. Extra authorized operations are allowed, because other baselines may
-encounter them, but they never add anything to a plan.
+1. Create the release commit and manifest.
+2. Record its immutable commit SHA and the manifest's SHA-256.
+3. Create the metadata-only companion commit immediately after it.
+4. Run `manage.py validate_release_manifests`.
+5. Push the branch **once**, advancing the ref directly to the companion
+   commit.
 
-Any uncovered or differing operation (new operation, different file bytes,
-different index) means the companion does not apply, and the exact
-station-local approval path remains available. A malformed or wrongly
-provenanced companion fails the job outright as evidence of tampering or a
-broken release.
+A station that installs before a companion exists simply needs local
+approval; preflights do not depend on companions.
 
-#### Read-only preflights
+#### Read-only migration preflights
 
-Preflight identifiers are data, never module paths or commands. The staged
-target's `updatecenter_migration_preflight` command:
+Preflights live in the target application code, not in manifests.
+`updatecenter_migration_preflight --pending <ref>…` receives the trusted
+pending migration refs from runtime 11. It runs the checks registered for
+those refs in an explicit registry, inside one PostgreSQL `READ ONLY`
+transaction that is always rolled back. If a ref it was told is pending is
+already recorded as applied, it fails closed. Each registered check models
+exactly what that pending migration will reject:
 
-* maps each identifier through a closed registry;
-* enters one PostgreSQL `READ ONLY` transaction;
-* returns bounded structured evidence;
-* always rolls the transaction back.
+* **`library.0087_backfill_default_schedule_profile` pending:**
+  `library.0087.global_slot_ambiguity`. This is 0087's own pre-check:
+  duplicate `(day_of_week, start_time)` or `(specific_date, start_time)`
+  **globally, ignoring profile**.
+* **`library.0088_enforce_schedule_profile_integrity` pending:**
+  `library.0088.profile_integrity`, covering 0088's per-profile uniqueness
+  and its NOT NULL profile and `ScheduleProfileState` pointers. If 0087 is
+  also pending, rows are evaluated as 0087 will leave them.
+* **0088 applied:** neither check runs.
 
-It runs after target plan/authorization validation but before checkpoint
-creation and `migration_started`. Unknown checks, malformed output, or a failed
-check stop the job before any migration command.
-
-The registered `library.schedule_block_duplicate_times` check models
-`library.0088`'s per-profile uniqueness at whatever schema stage the station is
-in. Blocks at the same day/time in **different** profiles pass. Rows that are,
-or will become (via `0087`'s Default Schedule assignment), duplicates within
-one profile fail, with the profile and row ids as evidence.
+Evidence names the migration and check, the global or profile scope, the
+conflicting key, the true count, bounded row IDs and truncation.
 
 #### Partial-prefix recovery
 
-Migration execution is deliberately one migration target at a time.
+Migrations run one at a time.
 
-**Before the first command:** root-owned job state records the exact plan
-identity and checkpoint.
+**During execution.** Before each command, root-owned evidence records that
+migration as `in_flight_migration`. After the command, the worker reads
+`django_migrations` directly via `psql` (read-only, using the checkpoint's
+database identity). It then persists, in one write:
 
-**After every command:** the worker reads the database's own `django_migrations`
-rows. It does this through `psql`, using the checkpoint's database identity, in
-a read-only session. It persists the observed contiguous successful prefix
-together with each prefix row's exact `id` and `applied` timestamp.
+* the contiguous applied prefix;
+* each prefix row's exact `id` and `applied` timestamp;
+* the cleared in-flight marker.
 
-**Interruption:** every exit path that can follow mutation finalizes the
-evidence from that database observation, never from the last evidence write.
-This covers a migration failure, any other exception, and
-`AMBIGUOUS_INTERRUPTED_MIGRATION` after a hard kill or power loss. Finalization
-requires all of the following:
+**Finalization after any interruption.** This covers a migration failure, any
+other exception, and `AMBIGUOUS_INTERRUPTED_MIGRATION` after a hard kill.
+Evidence is finalized from database observation only. The observation may
+extend the recorded prefix by **at most the single recorded in-flight
+migration**, so nothing an operator applies after a crash can be claimed.
+PostgreSQL that is still recovering after a power loss gets a bounded
+readiness wait (about 60 s). If it is still unavailable, the evidence stays
+unfinalized, and a later exact retry repeats the same observation-based
+finalization before deciding.
 
-* the job's own self-consistent identity;
-* an applied set that is exactly a contiguous prefix;
-* a prefix that only extends what was recorded;
-* unchanged row identities for every previously recorded migration.
+**Continuation.** Recovery requires finalized evidence for the exact release,
+target, manifest and fingerprint, plus a verified checkpoint. The owned prefix
+is then re-proven by `_assert_owned_prefix`: observed transition rows must be
+exactly the prefix, with identical row identity. This runs:
 
-Otherwise the evidence stays unfinalized and later jobs fail closed.
+* at recovery discovery;
+* during recovery target validation, where the recovery probe may not widen
+  the applied set;
+* immediately before `migration_started`;
+* for a complete prefix, after the verification probe and immediately before
+  `database_verified`.
 
-**Classifying a fresh job:** a fresh job may classify existing target
-migrations as `UPDATER_OWNED_PARTIAL_PREFIX` only when all of these match
-finalized evidence from a failed prior protected job: release, target commit,
-manifest hash, fingerprint, ordered full plan, currently applied prefix,
-verified checkpoint, **and the live `django_migrations` row identity of every
-prefix migration**. A complete prefix (the job died after the last migration
-but before verification) is accepted too. The retry then runs no migration but
-re-validates, verifies and advances source.
+Any discrepancy is `TARGET_MIGRATION_PREAPPLIED`. Migration records are never
+faked, rewritten or rolled back.
 
-The staged target independently reconstructs the original full plan, so the
-digest stays stable even though the ordinary forward plan now contains only the
-remaining suffix. Preflights and central/local authorization are rerun, and
-execution starts at the first remaining migration. Any missing, corrupt,
-non-contiguous, extra, re-applied, or mismatched evidence remains
-`TARGET_MIGRATION_PREAPPLIED`. Migration records are never faked, rewritten, or
-rolled back.
-
-**Limitation:** every operation in a non-atomic (`atomic=False`) migration is
-classified manual, because such a migration can partially commit before Django
-records it. A reviewed approval is therefore required, and a retry re-runs that
-migration from the start. No current IsadoraAir migration is non-atomic.
-
-#### Operator display
+Every operation in a non-atomic (`atomic=False`) migration is classified
+manual, because such a migration can partially commit before Django records
+it. No current IsadoraAir migration is non-atomic.
 
 Update Center shows the recovery block only for a failed job whose finalized,
-proven evidence permits a retry. It never shows it for a successful job or for
-unproven evidence. The block shows:
-
-* the evidence and continued-from job IDs;
-* the applied prefix and the first remaining migration;
-* the pre-transition checkpoint digest;
-* the actual authorization source (`central`, `local` or `not_required`, as
-  recorded by the executor);
-* the blocking reason.
+proven evidence permits a retry. It shows the executor-recorded authorization
+source: `central`, `local` or `not_required`.
 
 ### Migration declaration completeness (r0092+)
 

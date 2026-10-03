@@ -249,7 +249,14 @@ class ExecutorOrderingTests(SimpleTestCase):
         compare = mock.patch.object(self.executor, "_validate_target_schema", return_value=("sample.0002_add",))
         checkpoint = mock.patch("isadoraair_updater.executor.create_checkpoint", return_value={"valid": True, "dump_file": "x", "size_bytes": 1, "sha256": "d" * 64})
         migrate_result = ProcessResult(("python",), 0 if migration_success else 1, b"ok" if migration_success else b"", b"failed" if not migration_success else b"")
-        migrate = mock.patch.object(self.executor, "_run_app", return_value=(migrate_result, {"DB_PASSWORD": "secret", "SECRET_KEY": "key"}))
+        def run_app(source, arguments, *, timeout):
+            if arguments[0] == "updatecenter_migration_preflight":
+                # Runtime 11 always asks the target for its registered
+                # read-only preflights of the pending migrations.
+                ok = b'{"checks":[],"schema_version":1,"status":"ok"}'
+                return ProcessResult(tuple(arguments), 0, ok, b""), {}
+            return migrate_result, {"DB_PASSWORD": "secret", "SECRET_KEY": "key"}
+        migrate = mock.patch.object(self.executor, "_run_app", side_effect=run_app)
         # The database recorder after the (mocked) migrate command: the
         # migration row exists only if the command succeeded.
         recorded = (
