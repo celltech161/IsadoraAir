@@ -17,7 +17,7 @@ from django.db.migrations.executor import MigrationExecutor
 from django.db.migrations.graph import MigrationGraph
 from django.test import TransactionTestCase
 
-from .phase_b_helpers import PROJECT_ROOT, config_dict
+from .phase_b_helpers import PROJECT_ROOT, config_dict, orm_migration_records
 from .test_gen7_heterogeneous_probe_compatibility import _run_real_legacy_probe
 from isadoraair_updater.config import validate_config_dict
 from isadoraair_updater.executor import Executor, _strict_probe
@@ -153,6 +153,10 @@ class ProductionStateExecutor(Executor):
             MigrationExecutor(connection).migrate([(arguments[1], arguments[2])])
             return ProcessResult(tuple(arguments), 0, b"", b""), {}
         raise AssertionError(f"unexpected application mutation: {arguments!r}")
+
+    def _observe_migration_records(self, refs):
+        # The REAL test-database recorder rows these in-process migrations wrote.
+        return orm_migration_records(refs)
 
     def _advance_source(self, plan):
         self.source_advance_calls += 1

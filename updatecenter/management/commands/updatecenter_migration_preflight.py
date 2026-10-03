@@ -7,28 +7,84 @@ from django.core.management.base import BaseCommand
 from django.db import connection, transaction
 
 
+GROUP_LIMIT = 25
+ROW_ID_LIMIT = 20
+# The profile library.0087 assigns every profile-less ScheduleBlock to
+# (get_or_create by this exact name) before library.0088 enforces
+# per-profile uniqueness. Kept equal to that migration's INITIAL_PROFILE_NAME.
+DEFAULT_PROFILE_NAME = "Default Schedule"
+
+
+def _column_exists(cursor, table, column):
+    cursor.execute(
+        "SELECT 1 FROM information_schema.columns "
+        "WHERE table_schema = current_schema() AND table_name = %s AND column_name = %s",
+        [table, column],
+    )
+    return cursor.fetchone() is not None
+
+
 def _schedule_block_duplicate_times(cursor):
+    """Rows that are, or will become, duplicates under library.0088's
+    per-profile constraints:
+
+        UNIQUE (profile, day_of_week, start_time)   WHERE day_of_week IS NOT NULL
+        UNIQUE (profile, specific_date, start_time) WHERE specific_date IS NOT NULL
+
+    The effective profile is the one each row will belong to once the
+    target transition finishes:
+
+    * before library.0086 (no profile column), every block is assigned
+      to the single 0087 default profile, so ALL blocks share one
+      effective profile (exactly 0087's own pre-check);
+    * after 0086, a block keeps its profile; a profile-less block joins
+      the existing "Default Schedule" profile (0087's get_or_create), or
+      a brand-new one if none exists yet.
+
+    Two blocks at the same day/time in DIFFERENT profiles are valid and
+    never reported.
+    """
+    has_profile = _column_exists(cursor, "library_scheduleblock", "profile_id")
+    if has_profile:
+        cursor.execute("SELECT id FROM library_scheduleprofile WHERE name = %s", [DEFAULT_PROFILE_NAME])
+        row = cursor.fetchone()
+        default_profile_id = row[0] if row else None
+        # -1 is never a real primary key: profile-less rows with no existing
+        # default profile form one new (future default) profile.
+        effective = "COALESCE(profile_id, %s, -1)"
+        effective_params = [default_profile_id]
+    else:
+        effective = "0"
+        effective_params = []
     groups = []
-    for kind, columns, predicate in (
-        ("recurring", ("day_of_week", "start_time"), "day_of_week IS NOT NULL"),
-        ("specific-date", ("specific_date", "start_time"), "specific_date IS NOT NULL"),
-    ):
-        names = ", ".join(columns)
-        cursor.execute(
-            f"SELECT {names}, COUNT(*) FROM library_scheduleblock "
-            f"WHERE {predicate} GROUP BY {names} HAVING COUNT(*) > 1 "
-            f"ORDER BY {names} LIMIT 25"
+    total = 0
+    for kind, column in (("recurring", "day_of_week"), ("specific-date", "specific_date")):
+        base = (
+            f"SELECT {effective} AS effective_profile, {column}, start_time, COUNT(*) AS n, "
+            f"(array_agg(id ORDER BY id))[1:{ROW_ID_LIMIT}] AS ids "
+            f"FROM library_scheduleblock WHERE {column} IS NOT NULL "
+            f"GROUP BY 1, {column}, start_time HAVING COUNT(*) > 1"
         )
-        for row in cursor.fetchall():
+        cursor.execute(f"SELECT COUNT(*) FROM ({base}) AS duplicate_groups", effective_params)
+        total += cursor.fetchone()[0]
+        cursor.execute(f"{base} ORDER BY 1, {column}, start_time LIMIT {GROUP_LIMIT}", effective_params)
+        for effective_profile, key, start_time, count, ids in cursor.fetchall():
             groups.append({
                 "kind": kind,
-                "identity": [str(value) for value in row[:-1]],
-                "count": row[-1],
+                "profile": (
+                    None if not has_profile
+                    else ("new default (unassigned rows)" if effective_profile == -1 else effective_profile)
+                ),
+                "identity": [str(key), str(start_time)],
+                "count": count,
+                "schedule_block_ids": list(ids),
             })
     return {
-        "ok": not groups,
-        "offending_group_count": len(groups),
+        "ok": total == 0,
+        "offending_group_count": total,
         "offending_groups": groups,
+        "offending_groups_truncated": total > len(groups),
+        "profile_scoped": has_profile,
     }
 
 

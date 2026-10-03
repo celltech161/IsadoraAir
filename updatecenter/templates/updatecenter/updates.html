@@ -305,22 +305,24 @@
       to see exactly what it found and, if appropriate, record a reviewed approval.
     </p>
     {% endif %}
-    {% if shown_job.migration_recovery and shown_job.migration_recovery.successful_prefix %}
+    {% with recovery=shown_job.partial_prefix_recovery %}
+    {% if recovery %}
     <div class="uc-note">
-      <strong>UPDATER_OWNED_PARTIAL_PREFIX</strong>: the protected updater proved that this
-      exact job applied a contiguous prefix for {{ shown_job.migration_recovery.release_id }}.
-      Retry the same exact release after correcting the reported failure; do not edit migration
-      records manually.
-      <div class="uc-row"><span class="k">Evidence job</span><span class="v">{{ shown_job.migration_recovery.evidence_job_id }}</span></div>
-      <div class="uc-row"><span class="k">Prior job</span><span class="v">{{ shown_job.migration_recovery.prior_job_id|default:"—" }}</span></div>
-      <div class="uc-row"><span class="k">Applied prefix</span><span class="v">{{ shown_job.migration_recovery.successful_prefix|join:", " }}</span></div>
-      <div class="uc-row"><span class="k">First remaining</span><span class="v">{{ shown_job.migration_recovery.first_remaining_migration|default:"—" }}</span></div>
-      <div class="uc-row"><span class="k">Checkpoint</span><span class="v">{{ shown_job.migration_recovery.checkpoint.sha256|default:"unavailable" }}</span></div>
-      <div class="uc-row"><span class="k">Exact plan/authorization</span><span class="v">{% if shown_job.migration_recovery.exact_plan_authorization_matches %}matched{% else %}not proven{% endif %}</span></div>
-      <div class="uc-row"><span class="k">Permitted action</span><span class="v">{{ shown_job.migration_recovery.permitted_action }}</span></div>
-      <div class="uc-row"><span class="k">Blocking reason</span><span class="v">{{ shown_job.migration_recovery.failure_classification }} {{ shown_job.migration_recovery.failure_detail }}</span></div>
+      <strong>UPDATER_OWNED_PARTIAL_PREFIX</strong>: the protected updater recorded, and verified
+      against the database's own migration records, that this transition to {{ recovery.release_id }}
+      stopped part-way. The migrations listed below are its own work. Correct the reported failure,
+      then retry the same exact release; it continues from the first remaining migration. Do not
+      edit migration records manually.
+      <div class="uc-row"><span class="k">Evidence job</span><span class="v">{{ recovery.evidence_job_id }}</span></div>
+      <div class="uc-row"><span class="k">Continued from</span><span class="v">{{ recovery.prior_job_id|default:"—" }}</span></div>
+      <div class="uc-row"><span class="k">Applied prefix</span><span class="v">{{ recovery.successful_prefix|join:", " }}</span></div>
+      <div class="uc-row"><span class="k">First remaining</span><span class="v">{{ recovery.first_remaining_migration|default:"none (all migrations applied; verification and source advance remain)" }}</span></div>
+      <div class="uc-row"><span class="k">Pre-transition checkpoint</span><span class="v">{{ recovery.checkpoint.sha256|default:"unavailable" }}</span></div>
+      <div class="uc-row"><span class="k">Migration authorization</span><span class="v">{% if recovery.authorization_source == "central" %}central (trusted companion authorization){% elif recovery.authorization_source == "local" %}local (exact station approval){% else %}not required (no manual operations){% endif %}</span></div>
+      <div class="uc-row"><span class="k">Blocking reason</span><span class="v">{{ recovery.failure_classification }} {{ recovery.failure_detail }}</span></div>
     </div>
     {% endif %}
+    {% endwith %}
     <details class="uc-details">
       <summary>Last update details</summary>
       <div class="uc-details-body">

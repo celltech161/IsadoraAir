@@ -219,7 +219,54 @@ def build_chain(manifests: dict[str, manifest_mod.ReleaseManifest]) -> list[Chai
                 f"{minimum!r} must be an earlier release in the same chain"
             )
 
+    problem = protocol_six_bootstrap_problem(ordered)
+    if problem is not None:
+        raise ChainError(problem)
     return ordered
+
+
+# Protocol-6 bootstrap rule (P1 1.17) -- Django's independent mirror of
+# deploy/updater_runtime/isadoraair_updater/release.py's
+# protocol_six_bootstrap_problem(). A runtime-10 (protocol-5) worker parses
+# EVERY manifest on the trusted tip and hard-rejects unknown fields, so
+# protocol-6 fields (or a protocol-6 minimum) may first appear only strictly
+# after the release that delivers protected runtime 11 / manifest protocol 6,
+# and that delivery release must itself stay protocol-5 parseable/installable.
+PROTOCOL_SIX_RUNTIME_VERSION = 11
+PROTOCOL_SIX_MANIFEST_VERSION = 6
+
+
+def _uses_protocol_six_fields(item: manifest_mod.ReleaseManifest) -> bool:
+    return item.migration_authorization is not None or bool(item.migration_preflight_checks)
+
+
+def protocol_six_bootstrap_problem(ordered: list[ChainedRelease]) -> str | None:
+    delivery = None
+    for chained in ordered:
+        item = chained.manifest
+        runtime = item.protected_runtime
+        delivers = (
+            runtime is not None
+            and runtime.runtime_version >= PROTOCOL_SIX_RUNTIME_VERSION
+            and runtime.manifest_protocol_version >= PROTOCOL_SIX_MANIFEST_VERSION
+        )
+        uses_six = _uses_protocol_six_fields(item) or item.minimum_updater_protocol_version >= PROTOCOL_SIX_MANIFEST_VERSION
+        if delivers and delivery is None:
+            delivery = chained.index
+            if uses_six:
+                return (
+                    f"release {item.release_id!r} delivers protected runtime {runtime.runtime_version}/protocol "
+                    f"{runtime.manifest_protocol_version} and must stay protocol-5 compatible: no "
+                    "migration_authorization/migration_preflight_checks and minimum_updater_protocol_version <= 5"
+                )
+            continue
+        if uses_six and (delivery is None or chained.index <= delivery):
+            return (
+                f"release {item.release_id!r} uses protocol-6 manifest semantics before any earlier release "
+                f"delivers protected runtime {PROTOCOL_SIX_RUNTIME_VERSION} (protocol "
+                f"{PROTOCOL_SIX_MANIFEST_VERSION}); runtime-10 stations could not parse or install the chain"
+            )
+    return None
 
 
 def resolve_release_commit(chained: ChainedRelease, checkout_root: Path,

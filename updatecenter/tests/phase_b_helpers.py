@@ -148,3 +148,26 @@ def config_dict(root: Path, upstream: str) -> dict:
         "database": {"name": "test", "user": "test", "host": "localhost", "port": 5432, "pgpass_file": None},
         "gunicorn_health_url": "http://127.0.0.1:8000/login/",
     }
+
+
+def orm_migration_records(refs) -> dict:
+    """django_migrations row identity for `refs`, read through Django's own
+    connection -- for in-process executor shims that apply REAL migrations
+    to the test database. Same shape and UTC formatting as the protected
+    runtime's psql observation (Executor._observe_migration_records)."""
+    from datetime import timezone as _timezone
+
+    from django.db import connection as _connection
+
+    wanted = set(refs)
+    records = {}
+    with _connection.cursor() as cursor:
+        cursor.execute("SELECT id, app, name, applied FROM django_migrations ORDER BY id")
+        for row_id, app, name, applied in cursor.fetchall():
+            ref = f"{app}.{name}"
+            if ref in wanted:
+                records[ref] = {
+                    "id": row_id,
+                    "applied": applied.astimezone(_timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+                }
+    return records

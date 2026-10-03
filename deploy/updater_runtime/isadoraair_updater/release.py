@@ -343,26 +343,82 @@ def fingerprint(payload: dict) -> str:
 
 _AUTHORIZATION_FIELDS = frozenset({
     "schema_version", "release_id", "target_commit", "manifest_sha256",
-    "migration_plan_digest", "manual_operations", "trusted_plan_fingerprint",
+    "authorized_manual_operations",
+})
+_AUTHORIZED_OPERATION_FIELDS = frozenset({
+    "ref", "migration_file_sha256", "operation_index", "operation", "classification",
 })
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
+_OPERATION_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,99}$")
+MAX_AUTHORIZED_OPERATIONS = 1000
+
+
+def manual_operation_identity(operation: dict, migration_file_sha256: str) -> tuple:
+    """The exact reviewed identity of one manual-classified operation.
+
+    Bound to the migration's exact source bytes (file SHA-256) and the
+    operation's exact position in it. Free-text `detail` is deliberately
+    not part of the identity: it is derived from those bytes, never
+    matched fuzzily.
+    """
+    return (
+        operation["ref"], migration_file_sha256, operation["operation_index"],
+        operation["operation"], operation["classification"],
+    )
+
+
+def _parse_authorized_operations(value) -> frozenset:
+    if not isinstance(value, list) or not value or len(value) > MAX_AUTHORIZED_OPERATIONS:
+        raise ReleaseError("migration authorization must list 1..1000 authorized manual operations")
+    identities = set()
+    for entry in value:
+        if not isinstance(entry, dict) or set(entry) != _AUTHORIZED_OPERATION_FIELDS:
+            raise ReleaseError("migration authorization operation has an invalid closed schema")
+        index = entry["operation_index"]
+        if (not isinstance(entry["ref"], str) or not MIGRATION_RE.fullmatch(entry["ref"])
+                or not isinstance(entry["migration_file_sha256"], str)
+                or not _HEX64.fullmatch(entry["migration_file_sha256"])
+                or isinstance(index, bool) or not isinstance(index, int) or index < 0
+                or not isinstance(entry["operation"], str) or not _OPERATION_NAME_RE.fullmatch(entry["operation"])
+                or entry["classification"] != "manual"):
+            raise ReleaseError("migration authorization operation identity is invalid")
+        identity = manual_operation_identity(entry, entry["migration_file_sha256"])
+        if identity in identities:
+            raise ReleaseError("migration authorization lists a duplicate operation")
+        identities.add(identity)
+    return frozenset(identities)
 
 
 def load_central_migration_authorization(
     repository: "TrustedRepository", trusted_tip: str, plan: TrustedPlan, *,
-    manifest_sha256: str, migration_plan_digest: str, manual_operations: list[dict],
+    manifest_sha256: str, plan_items: list[dict], manual_operations: list[dict],
 ) -> dict | None:
-    """Return an exact trusted companion authorization, or None on mismatch.
+    """Return the trusted companion authorization if it covers this plan.
 
-    The companion is introduced by a later metadata-only commit because a
-    release commit cannot contain its own commit SHA or manifest digest. Git's
-    protected canonical ancestry supplies the trust chain; the artifact binds
-    every independently recomputed execution fact.
+    Target-side contract (protocol 6). The companion is introduced by a
+    later metadata-only commit because a release commit cannot contain
+    its own commit SHA or manifest digest. It inherits the trust of the
+    root-configured, fast-forward-only trusted repository (there is no
+    separate signature): it must be added exactly once, never modified,
+    strictly after the target commit, on the trusted tip's ancestry.
+
+    It binds the target release, exact target commit and manifest bytes,
+    plus the set of reviewed manual-classified operations, each pinned
+    to exact migration source bytes and operation position. It is NOT
+    bound to any source baseline, so one artifact serves every station
+    and skipped-release path to this target. A station accepts it only
+    when EVERY manual operation in its own, independently derived plan
+    is in the authorized set. Extra authorized operations are allowed
+    (other baselines may need them) but never add anything to a plan.
+    Returns None (no central authority; the exact station-local approval
+    path still applies) on any identity mismatch or uncovered operation.
+    Malformed or wrongly-provenanced companions raise: that is evidence
+    of tampering or a broken release, not a mere mismatch.
     """
     path = plan.migration_authorization
-    if path is None:
+    if path is None or not manual_operations:
         return None
-    raw = repository.read_file(trusted_tip, path, maximum=65536)
+    raw = repository.read_file(trusted_tip, path, maximum=262144)
     introducing = repository.introducing_commit(path, trusted_tip)
     if raw is None or introducing is None:
         return None
@@ -376,28 +432,27 @@ def load_central_migration_authorization(
         raise ReleaseError("migration authorization is not valid UTF-8 JSON") from exc
     if not isinstance(record, dict) or set(record) != _AUTHORIZATION_FIELDS or record.get("schema_version") != 1:
         raise ReleaseError("migration authorization has an invalid closed schema")
-    if not all(isinstance(record.get(key), str) for key in (
-        "release_id", "target_commit", "manifest_sha256", "migration_plan_digest",
-        "trusted_plan_fingerprint",
-    )):
+    if not all(isinstance(record.get(key), str) for key in ("release_id", "target_commit", "manifest_sha256")):
         raise ReleaseError("migration authorization identity fields must be strings")
     if not re.fullmatch(r"[0-9a-f]{40}", record["target_commit"]):
         raise ReleaseError("migration authorization target_commit is invalid")
-    if any(not _HEX64.fullmatch(record[key]) for key in (
-        "manifest_sha256", "migration_plan_digest", "trusted_plan_fingerprint",
-    )):
-        raise ReleaseError("migration authorization digest field is invalid")
-    if not isinstance(record.get("manual_operations"), list):
-        raise ReleaseError("migration authorization manual_operations must be a list")
-    expected = {
-        "release_id": plan.target_release_id,
-        "target_commit": plan.target_commit,
-        "manifest_sha256": manifest_sha256,
-        "migration_plan_digest": migration_plan_digest,
-        "manual_operations": manual_operations,
-        "trusted_plan_fingerprint": plan.fingerprint,
-    }
-    if any(record.get(key) != value for key, value in expected.items()):
+    if not _HEX64.fullmatch(record["manifest_sha256"]):
+        raise ReleaseError("migration authorization manifest_sha256 is invalid")
+    authorized = _parse_authorized_operations(record["authorized_manual_operations"])
+    if (record["release_id"] != plan.target_release_id
+            or record["target_commit"] != plan.target_commit
+            or record["manifest_sha256"] != manifest_sha256):
+        return None
+    file_digests = {}
+    for item in plan_items:
+        file_digests[item["ref"]] = item["migration_file_sha256"]
+    local = set()
+    for operation in manual_operations:
+        file_digest = file_digests.get(operation["ref"])
+        if file_digest is None:
+            return None
+        local.add(manual_operation_identity(operation, file_digest))
+    if not local <= authorized:
         return None
     return record
 
@@ -717,6 +772,45 @@ class TrustedRepository:
         )
 
 
+# Protocol-6 bootstrap rule (P1 1.17). A runtime-10 (protocol-5) worker parses
+# EVERY manifest on the trusted tip and hard-rejects unknown fields, so a single
+# manifest using protocol-6 fields would stop such a station planning anything,
+# including the release that would upgrade it. Protocol-6 fields therefore
+# first appear strictly AFTER the release that delivers runtime 11; that
+# delivery release must itself stay protocol-5 parseable and installable.
+PROTOCOL_SIX_RUNTIME_VERSION = 11
+PROTOCOL_SIX_MANIFEST_VERSION = 6
+
+
+def protocol_six_bootstrap_problem(ordered) -> str | None:
+    """`ordered` is the chain, bootstrap first, as tuples of
+    (release_id, minimum_updater_protocol_version, uses_protocol_six_fields,
+    protected runtime_version or None, protected manifest_protocol_version or None).
+    Mirrored by updatecenter/release_chain.py."""
+    delivery = None
+    for index, (release_id, minimum, uses_fields, runtime_version, manifest_protocol) in enumerate(ordered):
+        delivers = (
+            runtime_version is not None and runtime_version >= PROTOCOL_SIX_RUNTIME_VERSION
+            and manifest_protocol is not None and manifest_protocol >= PROTOCOL_SIX_MANIFEST_VERSION
+        )
+        if delivers and delivery is None:
+            delivery = index
+            if uses_fields or minimum >= PROTOCOL_SIX_MANIFEST_VERSION:
+                return (
+                    f"release {release_id} delivers protected runtime {runtime_version}/protocol "
+                    f"{manifest_protocol} and must stay protocol-5 compatible: no migration_authorization/"
+                    "migration_preflight_checks and minimum_updater_protocol_version <= 5"
+                )
+            continue
+        if (uses_fields or minimum >= PROTOCOL_SIX_MANIFEST_VERSION) and (delivery is None or index <= delivery):
+            return (
+                f"release {release_id} uses protocol-6 manifest semantics before any earlier release "
+                f"delivers protected runtime {PROTOCOL_SIX_RUNTIME_VERSION} (protocol "
+                f"{PROTOCOL_SIX_MANIFEST_VERSION}); runtime-10 stations could not parse or install the chain"
+            )
+    return None
+
+
 def load_chain(repository: TrustedRepository, trusted_tip: str) -> list[ChainEntry]:
     manifests: dict[str, Manifest] = {}
     for name in repository.list_release_files(trusted_tip):
@@ -776,6 +870,18 @@ def load_chain(repository: TrustedRepository, trusted_tip: str) -> list[ChainEnt
         minimum = entry.manifest.minimum_supported_release_id
         if minimum is not None and (minimum not in indexes or indexes[minimum] >= entry.index):
             raise ReleaseError(f"release {entry.manifest.release_id} has an invalid minimum supported release")
+    problem = protocol_six_bootstrap_problem([
+        (
+            entry.manifest.release_id,
+            entry.manifest.minimum_updater_protocol_version,
+            entry.manifest.migration_authorization is not None or bool(entry.manifest.migration_preflight_checks),
+            entry.manifest.protected_runtime.runtime_version if entry.manifest.protected_runtime else None,
+            entry.manifest.protected_runtime.manifest_protocol_version if entry.manifest.protected_runtime else None,
+        )
+        for entry in entries
+    ])
+    if problem is not None:
+        raise ReleaseError(problem)
     return entries
 
 

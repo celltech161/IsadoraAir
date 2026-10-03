@@ -250,11 +250,18 @@ class ExecutorOrderingTests(SimpleTestCase):
         checkpoint = mock.patch("isadoraair_updater.executor.create_checkpoint", return_value={"valid": True, "dump_file": "x", "size_bytes": 1, "sha256": "d" * 64})
         migrate_result = ProcessResult(("python",), 0 if migration_success else 1, b"ok" if migration_success else b"", b"failed" if not migration_success else b"")
         migrate = mock.patch.object(self.executor, "_run_app", return_value=(migrate_result, {"DB_PASSWORD": "secret", "SECRET_KEY": "key"}))
+        # The database recorder after the (mocked) migrate command: the
+        # migration row exists only if the command succeeded.
+        recorded = (
+            {"sample.0002_add": {"id": 7, "applied": "2026-10-03T00:00:00.000000Z"}}
+            if migration_success else {}
+        )
+        observe = mock.patch.object(self.executor, "_observe_migration_records", return_value=recorded)
 
         def advance(_plan):
             self.events.append("advance")
         advance_patch = mock.patch.object(self.executor, "_advance_source", side_effect=advance)
-        return [live, fetch, derive, blockers, current, cleanup_patch, stage, target_probe, compare, checkpoint, migrate, advance_patch]
+        return [live, fetch, derive, blockers, current, cleanup_patch, stage, target_probe, compare, checkpoint, migrate, observe, advance_patch]
 
     def _run_with(self, patches):
         entered = [item.start() for item in patches]

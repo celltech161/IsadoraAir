@@ -166,6 +166,31 @@ def _classify_operation(
     return {"operation": name, "classification": "manual", "detail": "operation is outside the Phase B v1 automatic allowlist"}
 
 
+NON_ATOMIC_DETAIL = (
+    "non-atomic migration (atomic=False): its operations may partially commit, so a "
+    "failure cannot be proven clean and partial-prefix continuation is not automatic"
+)
+
+
+def _classify_migration_operation(migration, operation, *, before_state=None, after_state=None):
+    """_classify_operation, plus the migration-level atomicity rule.
+
+    A non-atomic migration can commit part of its work and then fail before
+    Django records it as applied. The protected updater would then re-run
+    it from the start, so every operation in such a migration requires a
+    reviewed approval rather than mechanical acceptance. No current
+    IsadoraAir migration is non-atomic; digests of atomic migrations are
+    unchanged.
+    """
+    classified = _classify_operation(
+        operation, app_label=migration.app_label,
+        before_state=before_state, after_state=after_state,
+    )
+    if getattr(migration, "atomic", True) is False:
+        return {"operation": classified["operation"], "classification": "manual", "detail": NON_ATOMIC_DETAIL}
+    return classified
+
+
 def _migration_file_sha256(migration) -> str:
     module_name = type(migration).__module__
     module = sys.modules.get(module_name) or importlib.import_module(module_name)
@@ -246,9 +271,8 @@ def _serialize_exact_plan(loader, refs: list[str]) -> list[dict]:
         for operation in migration.operations:
             before_state = state.clone() if operation.__class__.__name__ == "AlterField" else None
             operation.state_forwards(migration.app_label, state)
-            operations.append(_classify_operation(
-                operation, app_label=migration.app_label,
-                before_state=before_state, after_state=state,
+            operations.append(_classify_migration_operation(
+                migration, operation, before_state=before_state, after_state=state,
             ))
         result.append({
             "ref": ref,
@@ -284,11 +308,8 @@ def build_probe_payload(*, release_id: str | None = None, target_commit: str | N
             )
             operation.state_forwards(migration.app_label, project_state)
             operations.append(
-                _classify_operation(
-                    operation,
-                    app_label=migration.app_label,
-                    before_state=before_state,
-                    after_state=project_state,
+                _classify_migration_operation(
+                    migration, operation, before_state=before_state, after_state=project_state,
                 )
             )
         plan.append({
@@ -322,10 +343,9 @@ def build_probe_payload(*, release_id: str | None = None, target_commit: str | N
         # (the executor's approval gate) only ever calls this WITH both.
         "manual_operations": [],
         "approval": None,
-        "recovery_plan": None,
-        "recovery_migration_plan_digest": None,
-        "recovery_manual_operations": [],
     }
+    if recovery_plan_refs and (release_id is None or target_commit is None):
+        raise RuntimeError("a recovery plan reconstruction requires full release context")
     if release_id is not None and target_commit is not None:
         manifest_path = Path("deploy") / "releases" / f"{release_id}.json"
         manifest_sha256 = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
@@ -337,6 +357,9 @@ def build_probe_payload(*, release_id: str | None = None, target_commit: str | N
         payload["migration_plan_digest"] = digest
         payload["manual_operations"] = extract_manual_operations(plan)
         if recovery_plan_refs:
+            # Recovery keys exist ONLY when the protected executor asked for
+            # a recovery reconstruction. The ordinary target probe keeps the
+            # exact 13-key review shape every earlier runtime accepts.
             recovery_plan = _serialize_exact_plan(loader, recovery_plan_refs)
             payload["recovery_plan"] = recovery_plan
             payload["recovery_migration_plan_digest"] = compute_migration_plan_digest(

@@ -177,6 +177,34 @@ class UpdateJob(models.Model):
     def __str__(self):
         return f"{self.id} ({self.installed_release_id} -> {self.target_release_id}, {self.state})"
 
+    @property
+    def partial_prefix_recovery(self) -> dict | None:
+        """The root-owned recovery evidence, only when it is genuinely an
+        actionable, PROVEN partial prefix -- otherwise None.
+
+        Everything shown is copied from the protected updater's own
+        finalized evidence (executor._finalize_recovery_from_observation
+        and the success path); nothing is inferred here. It is None for a
+        successful job (its evidence covers the complete plan and permits
+        no action), for unfinalized evidence (not proven), for any other
+        classification, and for malformed evidence.
+        """
+        evidence = self.migration_recovery
+        if self.state not in {UpdateJobState.FAILED, UpdateJobState.MANUAL_INTERVENTION_REQUIRED}:
+            return None
+        if (not isinstance(evidence, dict)
+                or evidence.get("finalized") is not True
+                or evidence.get("classification") != "UPDATER_OWNED_PARTIAL_PREFIX"
+                or evidence.get("permitted_action") != "retry_same_exact_release"
+                or evidence.get("authorization_source") not in {"not_required", "central", "local"}):
+            return None
+        plan = evidence.get("ordered_target_plan")
+        prefix = evidence.get("successful_prefix")
+        if (not isinstance(plan, list) or not isinstance(prefix, list) or not prefix
+                or prefix != plan[:len(prefix)]):
+            return None
+        return evidence
+
 
 class MigrationPlanApproval(models.Model):
     """Deprecated application audit mirror of a protected approval.

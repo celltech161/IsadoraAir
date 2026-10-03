@@ -144,8 +144,33 @@ _RECOVERY_PROBE_KEYS = _REVIEW_PROBE_KEYS | frozenset({
     "recovery_plan", "recovery_migration_plan_digest", "recovery_manual_operations",
 })
 
+PSQL = "/usr/bin/psql"
+_MIGRATION_REF_RE = re.compile(r"^[a-z][a-z0-9_]*\.[0-9]{4}_[a-z0-9_]+$")
+_APPLIED_UTC_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}Z$")
+# Closed protocol-6 partial-prefix evidence schema. prefix_records holds the
+# exact django_migrations row identity ({"id", "applied"}) observed for every
+# migration in successful_prefix, so a later unapply/re-apply of the same
+# names cannot masquerade as the updater's own work.
+RECOVERY_EVIDENCE_FIELDS = frozenset({
+    "schema_version", "classification", "evidence_job_id", "prior_job_id", "release_id", "target_commit",
+    "manifest_sha256", "migration_plan_digest", "trusted_plan_fingerprint",
+    "ordered_target_plan", "successful_prefix", "prefix_records", "checkpoint", "failure_classification",
+    "failure_detail", "continued_from_job_id", "authorization_source", "finalized",
+    "first_remaining_migration", "permitted_action",
+})
+AUTHORIZATION_SOURCES = frozenset({"not_required", "central", "local"})
 
-def _strict_probe(raw: bytes, *, review_context: bool) -> dict:
+
+def _contiguous_prefix(ordered: list[str], present) -> list[str]:
+    prefix = []
+    for ref in ordered:
+        if ref not in present:
+            break
+        prefix.append(ref)
+    return prefix
+
+
+def _strict_probe(raw: bytes, *, review_context: bool, recovery_context: bool = False) -> dict:
     """Parse and strictly validate one migration-probe response.
 
     `review_context` is set by the CALLER (never inferred from the
@@ -174,11 +199,20 @@ def _strict_probe(raw: bytes, *, review_context: bool) -> dict:
       six fields is fabricating review evidence nobody asked for and
       is rejected exactly like any other schema violation.
 
-    In every case the accepted key set is one of two fixed, closed
-    shapes -- never a partial/arbitrary mix -- so a target probe that
-    only emits the legacy shape is rejected, and a current probe
-    polluted with real (non-default) review data is equally rejected.
+    * recovery_context=True (protocol 6, only ever requested together
+      with review context and explicit --recovery-plan-ref arguments):
+      the payload MUST be exactly the 16-key recovery shape. The
+      ordinary target probe never emits recovery keys, so it keeps the
+      exact 13-key shape every earlier runtime generation accepts.
+
+    In every case the accepted key set is one of the fixed, closed
+    shapes the CALLER requested -- never a partial/arbitrary mix -- so a
+    target probe that only emits the legacy shape is rejected, a current
+    probe polluted with real (non-default) review data is equally
+    rejected, and recovery evidence nobody asked for is rejected too.
     """
+    if recovery_context and not review_context:
+        raise ExecutionError("PROBE_INVALID", "recovery probe context requires review context")
     if len(raw) > 1024 * 1024:
         raise ExecutionError("PROBE_INVALID", "migration probe output exceeds 1 MiB")
     try:
@@ -186,12 +220,15 @@ def _strict_probe(raw: bytes, *, review_context: bool) -> dict:
     except (UnicodeDecodeError, ValueError) as exc:
         raise ExecutionError("PROBE_INVALID", "migration probe did not emit strict JSON") from exc
     keys = set(payload) if isinstance(payload, dict) else set()
-    if review_context:
-        shape_ok = keys in (_REVIEW_PROBE_KEYS, _RECOVERY_PROBE_KEYS)
+    if recovery_context:
+        shape_ok = keys == _RECOVERY_PROBE_KEYS
+        has_review_fields = True
+    elif review_context:
+        shape_ok = keys == _REVIEW_PROBE_KEYS
         has_review_fields = True
     else:
-        shape_ok = keys in (_LEGACY_PROBE_KEYS, _REVIEW_PROBE_KEYS, _RECOVERY_PROBE_KEYS)
-        has_review_fields = keys in (_REVIEW_PROBE_KEYS, _RECOVERY_PROBE_KEYS)
+        shape_ok = keys in (_LEGACY_PROBE_KEYS, _REVIEW_PROBE_KEYS)
+        has_review_fields = keys == _REVIEW_PROBE_KEYS
     if not isinstance(payload, dict) or not shape_ok or payload.get("schema_version") != 1 or payload.get("status") != "ok":
         raise ExecutionError("PROBE_INVALID", "migration probe schema/status mismatch")
     if not isinstance(payload["plan"], list) or not isinstance(payload["nodes"], dict) or not isinstance(payload["applied"], list):
@@ -213,9 +250,6 @@ def _strict_probe(raw: bytes, *, review_context: bool) -> dict:
             payload["release_id"] is not None or payload["target_commit"] is not None
             or payload["manifest_sha256"] is not None or payload["migration_plan_digest"] is not None
             or payload["manual_operations"] or payload["approval"] is not None
-            or payload.get("recovery_plan") is not None
-            or payload.get("recovery_migration_plan_digest") is not None
-            or payload.get("recovery_manual_operations")
         ):
             raise ExecutionError("PROBE_INVALID", "migration probe reported review evidence without review context")
     refs = re.compile(r"^[a-z][a-z0-9_]*\.[0-9]{4}_[a-z0-9_]+$")
@@ -248,27 +282,31 @@ def _strict_probe(raw: bytes, *, review_context: bool) -> dict:
             raise ExecutionError("PROBE_INVALID", "migration probe has manual operations but no digest")
         if payload["approval"] is not None and not payload["manual_operations"]:
             raise ExecutionError("PROBE_INVALID", "migration probe reported an approval with no manual operations")
-    if keys == _RECOVERY_PROBE_KEYS:
+    if recovery_context:
         recovery_plan = payload["recovery_plan"]
         recovery_digest = payload["recovery_migration_plan_digest"]
         recovery_manual = payload["recovery_manual_operations"]
-        if recovery_plan is None:
-            if recovery_digest is not None or recovery_manual:
-                raise ExecutionError("PROBE_INVALID", "migration probe reported partial recovery evidence")
-        else:
-            if not review_context or not isinstance(recovery_plan, list):
-                raise ExecutionError("PROBE_INVALID", "migration recovery plan has an invalid context/type")
-            if not isinstance(recovery_digest, str) or not _HEX64.fullmatch(recovery_digest):
-                raise ExecutionError("PROBE_INVALID", "migration recovery digest is invalid")
-            recovery_refs = set()
-            for item in recovery_plan:
-                if (not isinstance(item, dict)
-                        or set(item) != {"ref", "dependencies", "operations", "migration_file_sha256"}
-                        or item["ref"] in recovery_refs or item["ref"] not in payload["nodes"]):
-                    raise ExecutionError("PROBE_INVALID", "migration recovery plan item is invalid")
-                recovery_refs.add(item["ref"])
-            if not _valid_manual_operations(recovery_manual, plan_refs=recovery_refs):
-                raise ExecutionError("PROBE_INVALID", "migration recovery manual operations are invalid")
+        if not isinstance(recovery_plan, list) or not recovery_plan:
+            raise ExecutionError("PROBE_INVALID", "migration recovery plan is missing or empty")
+        if not isinstance(recovery_digest, str) or not _HEX64.fullmatch(recovery_digest):
+            raise ExecutionError("PROBE_INVALID", "migration recovery digest is invalid")
+        recovery_refs = set()
+        for item in recovery_plan:
+            if (not isinstance(item, dict)
+                    or set(item) != {"ref", "dependencies", "operations", "migration_file_sha256"}
+                    or item["ref"] in recovery_refs or item["ref"] not in payload["nodes"]
+                    or item["dependencies"] != payload["nodes"][item["ref"]]
+                    or not isinstance(item["migration_file_sha256"], str)
+                    or not _HEX64.fullmatch(item["migration_file_sha256"])
+                    or not isinstance(item["operations"], list)):
+                raise ExecutionError("PROBE_INVALID", "migration recovery plan item is invalid")
+            for operation in item["operations"]:
+                if (not isinstance(operation, dict) or set(operation) != {"operation", "classification", "detail"}
+                        or operation["classification"] not in {"additive", "manual"}):
+                    raise ExecutionError("PROBE_INVALID", "migration recovery operation classification is invalid")
+            recovery_refs.add(item["ref"])
+        if not _valid_manual_operations(recovery_manual, plan_refs=recovery_refs):
+            raise ExecutionError("PROBE_INVALID", "migration recovery manual operations are invalid")
     return payload
 
 
@@ -340,6 +378,7 @@ class Executor:
             )
         self.expected_handoff_generation = expected_handoff_generation
         self.expected_handoff_descriptor_sha256 = expected_handoff_descriptor_sha256
+        self.last_authorization_source = "not_required"
         self.expected_resumable_job_uuid = expected_resumable_job_uuid
 
     def _app_env(self, source: Path) -> tuple[dict[str, str], dict[str, str]]:
@@ -385,9 +424,14 @@ class Executor:
         result, settings = self._run_app(source, arguments, timeout=120)
         if not result.ok:
             raise ExecutionError("PROBE_FAILED", _decode(result, settings))
-        payload = _strict_probe(result.stdout.strip(), review_context=review_context)
+        payload = _strict_probe(
+            result.stdout.strip(), review_context=review_context,
+            recovery_context=bool(recovery_plan_refs),
+        )
         if review_context and (payload["release_id"] != release_id or payload["target_commit"] != target_commit):
             raise ExecutionError("PROBE_INVALID", "migration probe echoed a different release/target than requested")
+        if recovery_plan_refs and [item["ref"] for item in payload["recovery_plan"]] != list(recovery_plan_refs):
+            raise ExecutionError("PROBE_INVALID", "migration recovery probe reconstructed a different plan than requested")
         return payload
 
     def _app_git(self, args: list[str], *, timeout: float = 60) -> ProcessResult:
@@ -472,7 +516,195 @@ class Executor:
             )
         return payload
 
+    def _observe_migration_records(self, refs) -> dict[str, dict]:
+        """Exact django_migrations rows for `refs`, read straight from PostgreSQL.
+
+        Uses the same database identity as the checkpoint pg_dump, in a
+        read-only session, independent of which application source is
+        installed or whether a staged target still exists -- the
+        interrupted-resume path has neither. Returns {ref: {"id", "applied"}}
+        for every requested ref that has a row; a ref with more than one
+        row is ambiguous and raises.
+        """
+        wanted = set(refs)
+        db = self.config.database
+        query = (
+            "SELECT id, app, name, "
+            "to_char(applied AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') "
+            "FROM django_migrations ORDER BY id"
+        )
+        argv = self.runner.argv_as_user(self.config.application_user, [
+            PSQL, "--no-psqlrc", "--no-password", "--no-align", "--tuples-only",
+            "--field-separator=|", "--set=ON_ERROR_STOP=1",
+            "--host", db.host, "--port", str(db.port), "--username", db.user, "--dbname", db.name,
+            "--command", query,
+        ])
+        env = {"PGOPTIONS": "-c default_transaction_read_only=on"}
+        if db.pgpass_file:
+            env["PGPASSFILE"] = str(db.pgpass_file)
+        result = self.runner.run(argv, timeout=60, env=env)
+        if not result.ok or result.output_truncated:
+            raise ExecutionError(
+                "MIGRATION_OBSERVATION_FAILED",
+                f"could not read django_migrations (returncode={result.returncode!r}, timed_out={result.timed_out})",
+                manual=True,
+            )
+        records: dict[str, dict] = {}
+        try:
+            lines = result.stdout.decode("utf-8", "strict").splitlines()
+        except UnicodeDecodeError as exc:
+            raise ExecutionError("MIGRATION_OBSERVATION_FAILED", "django_migrations output is not UTF-8", manual=True) from exc
+        for line in lines:
+            if not line:
+                continue
+            parts = line.split("|")
+            if len(parts) != 4 or not parts[0].isdigit() or not _APPLIED_UTC_RE.fullmatch(parts[3]):
+                raise ExecutionError("MIGRATION_OBSERVATION_FAILED", "django_migrations row is malformed", manual=True)
+            ref = f"{parts[1]}.{parts[2]}"
+            if ref not in wanted:
+                continue
+            if ref in records:
+                raise ExecutionError(
+                    "MIGRATION_RECORD_AMBIGUOUS", f"django_migrations holds more than one row for {ref}", manual=True,
+                )
+            records[ref] = {"id": int(parts[0]), "applied": parts[3]}
+        return records
+
+    def _recovery_evidence_problem(self, state: dict, evidence) -> str | None:
+        """Why `evidence` is not a self-consistent protocol-6 record of
+        `state`'s own job, or None. Checks the closed schema, the job
+        identity, the trusted-plan identity recorded by that job, the
+        prefix/record shape, and the checkpoint. It never proves anything
+        about the live database -- callers compare against observation."""
+        if not isinstance(evidence, dict) or set(evidence) != RECOVERY_EVIDENCE_FIELDS:
+            return "evidence schema is not the closed protocol-6 shape"
+        if (evidence.get("schema_version") != 1
+                or evidence.get("classification") != "UPDATER_OWNED_PARTIAL_PREFIX"
+                or evidence.get("evidence_job_id") != state.get("job_id")):
+            return "evidence identity does not belong to this job"
+        trusted = state.get("trusted_plan")
+        if (not isinstance(trusted, dict)
+                or evidence.get("release_id") != trusted.get("target_release_id")
+                or evidence.get("target_commit") != trusted.get("target_commit")
+                or evidence.get("trusted_plan_fingerprint") != trusted.get("fingerprint")):
+            return "evidence does not match the job's own trusted plan"
+        if (not isinstance(evidence.get("manifest_sha256"), str) or not _HEX64.fullmatch(evidence["manifest_sha256"])
+                or not isinstance(evidence.get("migration_plan_digest"), str)
+                or not _HEX64.fullmatch(evidence["migration_plan_digest"])
+                or evidence.get("authorization_source") not in AUTHORIZATION_SOURCES):
+            return "evidence digests or authorization source are invalid"
+        plan_refs = evidence.get("ordered_target_plan")
+        prefix = evidence.get("successful_prefix")
+        records = evidence.get("prefix_records")
+        if (not isinstance(plan_refs, list) or not plan_refs
+                or any(not isinstance(ref, str) or not _MIGRATION_REF_RE.fullmatch(ref) for ref in plan_refs)
+                or len(plan_refs) != len(set(plan_refs))
+                or not isinstance(prefix, list) or prefix != plan_refs[:len(prefix)]):
+            return "evidence plan/prefix is not an ordered contiguous prefix"
+        if (not isinstance(records, dict) or set(records) != set(prefix)
+                or any(not isinstance(value, dict) or set(value) != {"id", "applied"}
+                       or isinstance(value["id"], bool) or not isinstance(value["id"], int)
+                       or not isinstance(value["applied"], str) or not _APPLIED_UTC_RE.fullmatch(value["applied"])
+                       for value in records.values())):
+            return "evidence prefix records are missing or malformed"
+        checkpoint = evidence.get("checkpoint")
+        if (not isinstance(checkpoint, dict)
+                or checkpoint.get("target_release_id") != trusted.get("target_release_id")
+                or checkpoint.get("target_commit") != trusted.get("target_commit")
+                or checkpoint.get("installed_release_id") != trusted.get("installed_release_id")
+                or checkpoint.get("installed_commit") != trusted.get("installed_commit")
+                or not verify_checkpoint(self.config.checkpoint_root, checkpoint)):
+            return "evidence checkpoint is missing, unverifiable, or for another transition"
+        return None
+
+    def _finalize_recovery_from_observation(self, job_id: str, classification: str, detail: str) -> None:
+        """The one canonical finalization for an interrupted/failed migration job.
+
+        Called from every exit path that can follow migration mutation:
+        a migration ExecutionError, any other failure after
+        migration_started, and AMBIGUOUS_INTERRUPTED_MIGRATION on resume
+        (the hard-kill case: a migration committed and the worker died
+        before its evidence write). The database recorder, not the last
+        evidence write, decides what was applied:
+
+        * the recorded identity must be this job's own, self-consistent;
+        * the observed applied target migrations must be exactly a
+          contiguous prefix of the recorded ordered plan (no gaps, no
+          extras, no out-of-order application);
+        * observation may only EXTEND the recorded prefix, and every
+          previously recorded row must still have its exact id/applied;
+        * only then is the observed prefix persisted and finalized.
+
+        Anything else leaves the evidence unfinalized, so a later job
+        keeps failing closed with TARGET_MIGRATION_PREAPPLIED. This never
+        raises: a finalization problem must not mask the original failure.
+        """
+        try:
+            state = self.store.load(job_id)
+            evidence = state.get("migration_recovery")
+            if not isinstance(evidence, dict) or evidence.get("finalized") is not False:
+                return
+            problem = self._recovery_evidence_problem(state, evidence)
+            if problem is not None:
+                self.store.append_log(job_id, f"recovery evidence left unfinalized: {problem}")
+                return
+            ordered = evidence["ordered_target_plan"]
+            observed = self._observe_migration_records(ordered)
+            prefix = _contiguous_prefix(ordered, observed)
+            if set(observed) != set(prefix):
+                self.store.append_log(
+                    job_id, "recovery evidence left unfinalized: applied target migrations are not a contiguous prefix",
+                )
+                return
+            recorded = evidence["successful_prefix"]
+            if prefix[:len(recorded)] != recorded or any(
+                observed[ref] != evidence["prefix_records"][ref] for ref in recorded
+            ):
+                self.store.append_log(
+                    job_id, "recovery evidence left unfinalized: previously recorded migration rows changed",
+                )
+                return
+            if not prefix:
+                return
+            finalized = dict(evidence)
+            finalized.update(
+                successful_prefix=list(prefix),
+                prefix_records={ref: observed[ref] for ref in prefix},
+                failure_classification=classification[:64],
+                failure_detail=" ".join(detail.split())[:4000],
+                first_remaining_migration=ordered[len(prefix)] if len(prefix) < len(ordered) else None,
+                permitted_action="retry_same_exact_release",
+                finalized=True,
+            )
+            self.store.update(job_id, migration_recovery=finalized)
+            self.store.append_log(
+                job_id, f"recovery evidence finalized from database observation: {len(prefix)} of {len(ordered)} applied",
+            )
+        except Exception as exc:  # noqa: BLE001 -- never mask the job's own failure
+            try:
+                self.store.append_log(job_id, f"recovery evidence left unfinalized: {type(exc).__name__}: {exc}")
+            except Exception:  # noqa: BLE001
+                pass
+
     def _find_partial_recovery(self, plan: TrustedPlan, payload: dict, current_payload: dict) -> dict | None:
+        """Prior protected evidence that proves the already-applied part of
+        this exact transition was applied by the updater, or None.
+
+        The burden of proof stays on the updater. A candidate is accepted
+        only when ALL of these hold:
+
+        * it is finalized, self-consistent evidence of a failed job (see
+          _recovery_evidence_problem), for this exact release, target
+          commit, manifest bytes and trusted-plan fingerprint;
+        * its recorded full plan is exactly this transition's migrations
+          and its recorded prefix is exactly what is applied now;
+        * every prefix migration's live django_migrations row still has
+          the exact id/applied identity the updater observed.
+
+        A complete prefix (every migration applied, the job died before
+        verification) is accepted too: the retry then runs no migration
+        but still re-validates, verifies, and advances source normally.
+        """
         if "nodes" not in current_payload:
             # Compatibility for unit-test/legacy internal callers. A real
             # probe always supplies nodes; recovery is never inferred without it.
@@ -482,54 +714,47 @@ class Executor:
         applied_transition = transition & set(payload["applied"])
         if not applied_transition:
             return None
-        required = {
-            "schema_version", "classification", "evidence_job_id", "prior_job_id", "release_id", "target_commit",
-            "manifest_sha256", "migration_plan_digest", "trusted_plan_fingerprint",
-            "ordered_target_plan", "successful_prefix", "checkpoint", "failure_classification",
-            "failure_detail", "continued_from_job_id", "authorization_source", "finalized",
-            "first_remaining_migration", "exact_plan_authorization_matches", "permitted_action",
-        }
         candidates = []
         for state in self.store.list_states():
             evidence = state.get("migration_recovery")
-            if (not isinstance(evidence, dict) or set(evidence) != required
-                    or evidence.get("schema_version") != 1 or evidence.get("finalized") is not True
-                    or evidence.get("classification") != "UPDATER_OWNED_PARTIAL_PREFIX"):
+            if (not isinstance(evidence, dict) or evidence.get("finalized") is not True
+                    or state.get("state") not in {"failed", "manual_intervention_required"}):
                 continue
-            plan_refs = evidence.get("ordered_target_plan")
-            prefix = evidence.get("successful_prefix")
-            if (not isinstance(plan_refs, list) or not plan_refs
-                    or any(not isinstance(ref, str) for ref in plan_refs)
-                    or len(plan_refs) != len(set(plan_refs))
-                    or not isinstance(prefix, list) or not prefix
-                    or prefix != plan_refs[:len(prefix)] or len(prefix) >= len(plan_refs)):
+            if self._recovery_evidence_problem(state, evidence) is not None:
                 continue
-            identity_matches = (
-                evidence.get("release_id") == plan.target_release_id
-                and evidence.get("target_commit") == plan.target_commit
-                and evidence.get("manifest_sha256") == payload["manifest_sha256"]
-                and evidence.get("trusted_plan_fingerprint") == plan.fingerprint
-                and evidence.get("evidence_job_id") == state.get("job_id")
-            )
-            if (not identity_matches or set(plan_refs) != transition
-                    or set(prefix) != applied_transition
-                    or not verify_checkpoint(self.config.checkpoint_root, evidence.get("checkpoint"))):
-                continue
-            checkpoint = evidence["checkpoint"]
-            if (checkpoint.get("target_release_id") != plan.target_release_id
-                    or checkpoint.get("target_commit") != plan.target_commit
-                    or checkpoint.get("installed_release_id") != plan.installed_release_id
-                    or checkpoint.get("installed_commit") != plan.installed_commit):
+            plan_refs = evidence["ordered_target_plan"]
+            prefix = evidence["successful_prefix"]
+            if (not prefix
+                    or evidence["release_id"] != plan.target_release_id
+                    or evidence["target_commit"] != plan.target_commit
+                    or evidence["manifest_sha256"] != payload["manifest_sha256"]
+                    or evidence["trusted_plan_fingerprint"] != plan.fingerprint
+                    or evidence["checkpoint"].get("installed_release_id") != plan.installed_release_id
+                    or evidence["checkpoint"].get("installed_commit") != plan.installed_commit
+                    or set(plan_refs) != transition
+                    or set(prefix) != applied_transition):
                 continue
             candidates.append((len(prefix), state.get("updated_at", ""), evidence))
         if not candidates:
             return None
         candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
-        return candidates[0][2]
+        evidence = candidates[0][2]
+        observed = self._observe_migration_records(evidence["ordered_target_plan"])
+        if any(observed.get(ref) != evidence["prefix_records"][ref] for ref in evidence["successful_prefix"]):
+            # Same names, different rows: unapplied and re-applied outside
+            # the updater (or rewritten). Ownership is not proven.
+            return None
+        return evidence
 
     def _validate_target_schema(self, plan: TrustedPlan, payload: dict, current_payload: dict, job_id: str,
                                 *, migration_already_started: bool,
                                 recovery: dict | None = None, trusted_tip: str | None = None) -> tuple[str, ...]:
+        # Which authority actually satisfied the manual-operation gate for
+        # THIS validation: "not_required" (no manual operations), "central"
+        # (trusted companion covered every local manual operation) or
+        # "local" (exact station approval). Read by execute() for the
+        # recovery evidence -- never inferred later from display state.
+        self.last_authorization_source = "not_required"
         if payload["conflicts"]:
             raise ExecutionError("TARGET_MIGRATION_CONFLICT", "target migration graph reports conflicts")
         if payload["replacements"]:
@@ -588,11 +813,16 @@ class Executor:
                 central = load_central_migration_authorization(
                     self.repository, trusted_tip, plan,
                     manifest_sha256=authorization_payload["manifest_sha256"],
-                    migration_plan_digest=authorization_payload["migration_plan_digest"],
+                    plan_items=authorization_payload["plan"],
                     manual_operations=authorization_payload["manual_operations"],
                 )
             if central is not None:
-                self.store.append_log(job_id, "exact centrally trusted migration authorization matched; proceeding")
+                self.store.append_log(
+                    job_id,
+                    f"centrally trusted migration authorization {plan.migration_authorization} covers every "
+                    f"one of this plan's {len(authorization_payload['manual_operations'])} manual operation(s); proceeding",
+                )
+                self.last_authorization_source = "central"
                 return actual
             try:
                 identity = approval_identity(
@@ -615,6 +845,7 @@ class Executor:
                     f"reviewed migration approval {approval['approval_id']} (by {approval['approved_by_username']} at "
                     f"{approval['approved_at']}) matched digest {authorization_payload['migration_plan_digest']} -- proceeding",
                 )
+                self.last_authorization_source = "local"
             else:
                 raise ExecutionError(
                     "MIGRATION_OPERATION_MANUAL",
@@ -1137,6 +1368,14 @@ class Executor:
             return state
         milestones = set(state["milestones"])
         if "migration_started" in milestones and "database_verified" not in milestones:
+            # The worker died mid-migration (power loss, kill). Automatic
+            # retry of THIS job stays forbidden, but the database recorder
+            # can still prove exactly which updater-owned prefix committed,
+            # so a fresh exact retry is not stranded.
+            self._finalize_recovery_from_observation(
+                job_id, "AMBIGUOUS_INTERRUPTED_MIGRATION",
+                "worker interrupted after migration_started; prefix finalized from database observation",
+            )
             return self.store.fail(
                 job_id, "AMBIGUOUS_INTERRUPTED_MIGRATION",
                 "migration started without a durable verified-completion milestone; automatic retry is forbidden",
@@ -1313,6 +1552,10 @@ class Executor:
                     target_payload["recovery_migration_plan_digest"]
                     if recovery is not None else target_payload["migration_plan_digest"]
                 )
+                prefix_records = dict(recovery["prefix_records"]) if recovery is not None else {}
+                # Identity and plan are durable BEFORE migration_started, so
+                # any later interruption can be finalized purely from what
+                # the database recorder shows (_finalize_recovery_from_observation).
                 recovery_record = {
                     "schema_version": 1,
                     "classification": "UPDATER_OWNED_PARTIAL_PREFIX",
@@ -1325,16 +1568,13 @@ class Executor:
                     "trusted_plan_fingerprint": plan.fingerprint,
                     "ordered_target_plan": full_plan,
                     "successful_prefix": successful_prefix,
+                    "prefix_records": prefix_records,
                     "checkpoint": checkpoint,
                     "failure_classification": "",
                     "failure_detail": "",
                     "continued_from_job_id": recovery["evidence_job_id"] if recovery is not None else None,
-                    "authorization_source": (
-                        "central_or_exact_local" if target_payload.get("manual_operations")
-                        or target_payload.get("recovery_manual_operations") else "mechanical_additive"
-                    ),
+                    "authorization_source": self.last_authorization_source,
                     "first_remaining_migration": full_plan[len(successful_prefix)],
-                    "exact_plan_authorization_matches": True,
                     "permitted_action": "retry_same_exact_release",
                     "finalized": False,
                 }
@@ -1348,21 +1588,26 @@ class Executor:
                         ["migrate", app_label, migration_name, "--noinput", "--skip-checks"],
                         timeout=1800,
                     )
-                    observed = self._probe(staged.source_root)
-                    if observed["conflicts"] or observed["replacements"]:
-                        raise ExecutionError(
-                            "MIGRATION_STATE_DRIFT", "migration command left conflicts/replacements",
-                            manual=True,
-                        )
-                    observed_prefix = [item for item in full_plan if item in set(observed["applied"])]
-                    if observed_prefix != full_plan[:len(observed_prefix)]:
+                    # The recorder is the authority: what is applied, and the
+                    # exact row identity of each applied prefix migration.
+                    observed = self._observe_migration_records(full_plan)
+                    observed_prefix = _contiguous_prefix(full_plan, observed)
+                    if set(observed) != set(observed_prefix):
                         raise ExecutionError(
                             "MIGRATION_STATE_DRIFT", "applied target migrations are not a contiguous trusted prefix",
                             manual=True,
                         )
+                    if (observed_prefix[:len(successful_prefix)] != successful_prefix
+                            or any(observed[item] != prefix_records[item] for item in successful_prefix)):
+                        raise ExecutionError(
+                            "MIGRATION_STATE_DRIFT", "previously recorded target migration rows changed during the job",
+                            manual=True,
+                        )
                     if len(observed_prefix) > len(successful_prefix):
                         successful_prefix = observed_prefix
+                        prefix_records = {item: observed[item] for item in successful_prefix}
                         recovery_record["successful_prefix"] = list(successful_prefix)
+                        recovery_record["prefix_records"] = dict(prefix_records)
                         recovery_record["first_remaining_migration"] = (
                             full_plan[len(successful_prefix)] if len(successful_prefix) < len(full_plan) else None
                         )
@@ -1444,21 +1689,7 @@ class Executor:
             return self.store.succeed(job_id)
         except ExecutionError as exc:
             cleanup_staging()
-            current = self.store.load(job_id)
-            evidence = current.get("migration_recovery")
-            if isinstance(evidence, dict) and evidence.get("finalized") is False:
-                prefix = evidence.get("successful_prefix")
-                full = evidence.get("ordered_target_plan")
-                if (isinstance(prefix, list) and prefix
-                        and isinstance(full, list) and len(prefix) < len(full)
-                        and prefix == full[:len(prefix)]):
-                    evidence = dict(evidence)
-                    evidence["failure_classification"] = exc.classification[:64]
-                    evidence["failure_detail"] = " ".join(exc.detail.split())[:4000]
-                    evidence["first_remaining_migration"] = full[len(prefix)]
-                    evidence["permitted_action"] = "retry_same_exact_release"
-                    evidence["finalized"] = True
-                    self.store.update(job_id, migration_recovery=evidence)
+            self._finalize_recovery_from_observation(job_id, exc.classification, exc.detail)
             return self.store.fail(
                 job_id, exc.classification, exc.detail, manual=exc.manual,
                 migration_plan_review=exc.migration_plan_review,
@@ -1470,6 +1701,8 @@ class Executor:
                 {"migration_started", "database_verified", "source_advanced"}
                 & set(current.get("milestones", []))
             )
+            if "migration_started" in current.get("milestones", []):
+                self._finalize_recovery_from_observation(job_id, "SAFE_EXECUTION_FAILURE", str(exc))
             return self.store.fail(
                 job_id, "SAFE_EXECUTION_FAILURE", str(exc),
                 manual=crossed_mutation_boundary or isinstance(exc, (SystemdError, ProtectionError)),
