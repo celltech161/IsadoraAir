@@ -1,5 +1,5 @@
 {
-  "bundle_sha256": "7d1f832094a45d2f16c88256872f415cd7212e0d3df0f3adc3f94687d2ad8144",
+  "bundle_sha256": "10f16dcb0a00a264411ac12802efb79ae02b7a20153668c0e0fbbf48a9dc9669",
   "entrypoint": "updaterd.py",
   "files": [
     {
@@ -11,8 +11,8 @@
     {
       "mode": "0644",
       "path": "isadoraair_updater/__init__.py",
-      "sha256": "0d4d5790bec95a2b449f80dcc3861301041effbd7e22bcaa6151ae6fc2afa3e5",
-      "size_bytes": 10270
+      "sha256": "d7b2f9de728e5973a6e44ac339b382e5c5cc4c85ec785262d0a53888046f4a2c",
+      "size_bytes": 10772
     },
     {
       "mode": "0644",
@@ -35,20 +35,26 @@
     {
       "mode": "0644",
       "path": "isadoraair_updater/daemon.py",
-      "sha256": "cba002a713c245ee94b9e9786b70e501c6e64fda4bf173efde67f64bc9bfcc9f",
-      "size_bytes": 24414
+      "sha256": "cf797e7c9fbe8dfcc141ee7b704ee54d6a3fff94212b5c27ccaf028c9c3c87ff",
+      "size_bytes": 24489
     },
     {
       "mode": "0644",
       "path": "isadoraair_updater/executor.py",
-      "sha256": "7549667190f0be8660d8182b5d3026e05965329ccb4dcaca3d642c7a5342c215",
-      "size_bytes": 71367
+      "sha256": "0ec511e1bb9d3ae3f5b313526005968bfd3b711550f62a1d852519e8b358ad52",
+      "size_bytes": 114106
     },
     {
       "mode": "0644",
       "path": "isadoraair_updater/jobs.py",
-      "sha256": "2cf0b39d179d1a4118bbaca64bb6a709231c906e84aee2ef6303cb92239d8f16",
-      "size_bytes": 17043
+      "sha256": "a45fedb73838c57549021370846326d394c9300a66623017b2c53c6bf6269f34",
+      "size_bytes": 17639
+    },
+    {
+      "mode": "0644",
+      "path": "isadoraair_updater/migration_authorization.py",
+      "sha256": "bc259c0e9ed90f5be56a457c6e584a45c61ac3352c66d88e676d4baab7753389",
+      "size_bytes": 10661
     },
     {
       "mode": "0644",
@@ -165,9 +171,9 @@
       "size_bytes": 9975
     }
   ],
-  "generation": 10,
+  "generation": 11,
   "manifest_protocol_version": 5,
-  "runtime_version": 10,
+  "runtime_version": 11,
   "schema_version": 1,
   "supported_wire_protocols": [
     3,

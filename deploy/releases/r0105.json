@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "release_id": "r0105",
+  "previous_release_id": "r0104",
+  "minimum_updater_protocol_version": 5,
+  "summary": "P1 1.17 Update Center migration hardening and protected runtime 11 bootstrap. Adds trusted release-local companion authorization for reviewed manual operations, target-code read-only migration-data preflights, exact partial-prefix recovery, and PostgreSQL-guarded atomic migration ownership with nonce-bound receipts. Adds the additive UpdateJob migration-recovery field. Manifest protocol remains 5 for runtime-10 parsing and handoff compatibility.",
+  "migrations_required": [
+    "updatecenter.0004_updatejob_migration_recovery"
+  ],
+  "migration_compatibility": "additive",
+  "manual_bootstrap_required": false,
+  "python_requirements_changed": false,
+  "requirements_sha256": null,
+  "apt_packages_new": [],
+  "systemd_units_changed": [],
+  "systemd_units_new_required": [],
+  "systemd_units_new_optional": [],
+  "systemd_units_removed_or_renamed": [],
+  "collectstatic_required": false,
+  "services_requiring_restart": [
+    "isadoraair-gunicorn"
+  ],
+  "nginx_changed": false,
+  "runtime_components_changed": false,
+  "minimum_supported_release_id": "r0081",
+  "protected_runtime": {
+    "generation": 11,
+    "descriptor_path": "deploy/updater_runtime/protected-runtime-descriptor.json",
+    "descriptor_sha256": "e03da969306cac324d7992455556f0d7bc6972d0299c37f5e3774f3980ba7781",
+    "minimum_bootstrap_protocol_version": 1,
+    "runtime_version": 11,
+    "manifest_protocol_version": 5,
+    "supported_wire_protocols": [
+      3,
+      4
+    ],
+    "attestations": [
+      "deploy/updater_attestations/r0105-primary.json"
+    ]
+  }
+}
