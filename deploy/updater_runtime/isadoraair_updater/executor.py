@@ -152,13 +152,18 @@ _APPLIED_UTC_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-
 # exact django_migrations row identity ({"id", "applied"}) observed for every
 # migration in successful_prefix, so a later unapply/re-apply of the same
 # names cannot masquerade as the updater's own work. in_flight_migration is
-# the ONE migration whose command is currently running (persisted before the
-# command, cleared after its observation); crash finalization may extend the
-# recorded prefix by at most that migration.
+# the ONE migration whose command is about to run / running (persisted before
+# the command, cleared after its observation). in_flight_absence_proven is
+# set durably only after a fresh observation, taken AFTER the marker was
+# written, proved the migration still absent and the owned prefix unchanged.
+# Crash finalization may extend the recorded prefix by at most the in-flight
+# migration, and only when its absence was proven: anything applied before
+# that proof was not done by the updater.
 RECOVERY_EVIDENCE_FIELDS = frozenset({
     "schema_version", "classification", "evidence_job_id", "prior_job_id", "release_id", "target_commit",
     "manifest_sha256", "migration_plan_digest", "trusted_plan_fingerprint",
-    "ordered_target_plan", "successful_prefix", "prefix_records", "in_flight_migration", "checkpoint",
+    "ordered_target_plan", "successful_prefix", "prefix_records", "in_flight_migration",
+    "in_flight_absence_proven", "checkpoint",
     "failure_classification", "failure_detail", "continued_from_job_id", "authorization_source", "finalized",
     "first_remaining_migration", "permitted_action",
 })
@@ -602,15 +607,19 @@ class Executor:
         django_migrations for the exact ordered target transition and require
         the applied set to be exactly the owned prefix, with every row's exact
         id/applied identity unchanged. Anything else fails closed."""
-        observed = self._observe_migration_records(recovery["ordered_target_plan"])
-        prefix = recovery["successful_prefix"]
+        self._assert_exact_prefix(
+            recovery["ordered_target_plan"], recovery["successful_prefix"], recovery["prefix_records"],
+        )
+
+    def _assert_exact_prefix(self, ordered: list[str], prefix: list[str], records: dict) -> None:
+        observed = self._observe_migration_records(ordered)
         if set(observed) != set(prefix):
             raise ExecutionError(
                 "TARGET_MIGRATION_PREAPPLIED",
                 f"applied target migrations {sorted(observed)!r} are not exactly the updater-owned prefix {prefix!r}",
                 manual=True,
             )
-        if any(observed[ref] != recovery["prefix_records"][ref] for ref in prefix):
+        if any(observed[ref] != records[ref] for ref in prefix):
             raise ExecutionError(
                 "TARGET_MIGRATION_PREAPPLIED",
                 "an updater-owned migration row was unapplied, re-applied or rewritten outside the updater",
@@ -651,6 +660,9 @@ class Executor:
         in_flight = evidence.get("in_flight_migration")
         if in_flight is not None and (len(prefix) >= len(plan_refs) or in_flight != plan_refs[len(prefix)]):
             return "evidence in-flight migration is not the next migration after the prefix"
+        proven = evidence.get("in_flight_absence_proven")
+        if not isinstance(proven, bool) or (proven and in_flight is None):
+            return "evidence in-flight absence proof is invalid"
         if (not isinstance(records, dict) or set(records) != set(prefix)
                 or any(not isinstance(value, dict) or set(value) != {"id", "applied"}
                        or isinstance(value["id"], bool) or not isinstance(value["id"], int)
@@ -708,7 +720,10 @@ class Executor:
                 return
             recorded = evidence["successful_prefix"]
             in_flight = evidence["in_flight_migration"]
-            allowed = [recorded] + ([[*recorded, in_flight]] if in_flight is not None else [])
+            # The in-flight migration is claimable only if a post-marker
+            # observation durably proved it absent before the command ran.
+            claimable = in_flight is not None and evidence["in_flight_absence_proven"] is True
+            allowed = [recorded] + ([[*recorded, in_flight]] if claimable else [])
             if prefix not in allowed:
                 # Only the one migration the updater was running may be newly
                 # claimed; anything else applied since is not provably ours.
@@ -730,6 +745,7 @@ class Executor:
                 successful_prefix=list(prefix),
                 prefix_records={ref: observed[ref] for ref in prefix},
                 in_flight_migration=None,
+                in_flight_absence_proven=False,
                 failure_classification=classification[:64],
                 failure_detail=" ".join(detail.split())[:4000],
                 first_remaining_migration=ordered[len(prefix)] if len(prefix) < len(ordered) else None,
@@ -1657,6 +1673,7 @@ class Executor:
                     "successful_prefix": successful_prefix,
                     "prefix_records": prefix_records,
                     "in_flight_migration": None,
+                    "in_flight_absence_proven": False,
                     "checkpoint": checkpoint,
                     "failure_classification": "",
                     "failure_detail": "",
@@ -1675,9 +1692,19 @@ class Executor:
                 for ref in actual_migrations:
                     expected_after_command = [*successful_prefix, ref]
                     app_label, migration_name = ref.split(".", 1)
-                    # Durable BEFORE the command: if the worker dies during it,
-                    # crash finalization may claim at most this one migration.
+                    # 1. Durable in-flight marker (absence not yet proven).
                     recovery_record["in_flight_migration"] = ref
+                    recovery_record["in_flight_absence_proven"] = False
+                    self.store.update(job_id, migration_recovery=recovery_record)
+                    # 2. Fresh observation AFTER the marker: the transition must
+                    # still be exactly the owned prefix with identical rows, so
+                    # `ref` itself is absent. A migration applied by anyone in
+                    # the gap before this proof is never the updater's: fail
+                    # closed without invoking migrate (which would be a no-op
+                    # that appears to "apply" it).
+                    self._assert_exact_prefix(full_plan, successful_prefix, prefix_records)
+                    # 3. Durable proof; only now may a crash claim `ref`.
+                    recovery_record["in_flight_absence_proven"] = True
                     self.store.update(job_id, migration_recovery=recovery_record)
                     result, settings = self._run_app(
                         staged.source_root,
@@ -1715,8 +1742,9 @@ class Executor:
                             full_plan[len(successful_prefix)] if len(successful_prefix) < len(full_plan) else None
                         )
                     # One atomic state write records the observed prefix AND
-                    # clears the in-flight marker.
+                    # clears the in-flight marker and its absence proof.
                     recovery_record["in_flight_migration"] = None
+                    recovery_record["in_flight_absence_proven"] = False
                     self.store.update(job_id, migration_recovery=recovery_record)
                     if not result.ok:
                         raise ExecutionError("MIGRATION_FAILED", _decode(result, settings), manual=True)

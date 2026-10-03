@@ -249,21 +249,25 @@ class ExecutorOrderingTests(SimpleTestCase):
         compare = mock.patch.object(self.executor, "_validate_target_schema", return_value=("sample.0002_add",))
         checkpoint = mock.patch("isadoraair_updater.executor.create_checkpoint", return_value={"valid": True, "dump_file": "x", "size_bytes": 1, "sha256": "d" * 64})
         migrate_result = ProcessResult(("python",), 0 if migration_success else 1, b"ok" if migration_success else b"", b"failed" if not migration_success else b"")
+        # The database recorder: the migration row exists only AFTER a
+        # successful (mocked) migrate command -- runtime 11 also observes
+        # it before the command to prove it was not already applied.
+        recorder = {}
+
         def run_app(source, arguments, *, timeout):
             if arguments[0] == "updatecenter_migration_preflight":
                 # Runtime 11 always asks the target for its registered
                 # read-only preflights of the pending migrations.
                 ok = b'{"checks":[],"schema_version":1,"status":"ok"}'
                 return ProcessResult(tuple(arguments), 0, ok, b""), {}
+            if arguments[0] == "migrate" and migration_success:
+                recorder["sample.0002_add"] = {"id": 7, "applied": "2026-10-03T00:00:00.000000Z"}
             return migrate_result, {"DB_PASSWORD": "secret", "SECRET_KEY": "key"}
         migrate = mock.patch.object(self.executor, "_run_app", side_effect=run_app)
-        # The database recorder after the (mocked) migrate command: the
-        # migration row exists only if the command succeeded.
-        recorded = (
-            {"sample.0002_add": {"id": 7, "applied": "2026-10-03T00:00:00.000000Z"}}
-            if migration_success else {}
+        observe = mock.patch.object(
+            self.executor, "_observe_migration_records",
+            side_effect=lambda refs: {ref: dict(recorder[ref]) for ref in refs if ref in recorder},
         )
-        observe = mock.patch.object(self.executor, "_observe_migration_records", return_value=recorded)
 
         def advance(_plan):
             self.events.append("advance")

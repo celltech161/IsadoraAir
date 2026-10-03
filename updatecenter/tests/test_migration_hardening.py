@@ -567,6 +567,94 @@ class PartialPrefixRecoveryExecutionTests(SimpleTestCase):
         self.assert_blocked(retry)
         self.assertNotIn("database_verified", retry["milestones"])
 
+    # -- Race C: the gap between the owned-prefix proof and invoking migrate ----
+    def _at_m2_marker(self, action, *, when):
+        """Run `action` exactly at the durable M2 in-flight marker write
+        (absence not yet proven): just before it ("before") or right after
+        it ("after") -- the previously vulnerable boundary, which lies
+        after decision point #3 and after any preflight. Returns a context
+        manager and the list recording that the hook fired."""
+        original = self.store.update
+        fired = []
+
+        def update(job_id, **changes):
+            evidence = changes.get("migration_recovery")
+            at_marker = (isinstance(evidence, dict) and evidence.get("in_flight_migration") == M2
+                         and evidence.get("in_flight_absence_proven") is False and not fired)
+            if at_marker and when == "before":
+                fired.append(True)
+                action()
+            result = original(job_id, **changes)
+            if at_marker and when == "after":
+                fired.append(True)
+                action()
+            return result
+        return mock.patch.object(self.store, "update", side_effect=update), fired
+
+    def _race_c(self, when):
+        prior = self.failed_after_m1()                                 # recovery owns [M1]
+        hook, fired = self._at_m2_marker(lambda: self.recorder.apply(M2), when=when)
+        self.migrate_calls.clear()
+        with hook:
+            retry = self.run_job(str(uuid.uuid4()))
+        self.assertEqual(fired, [True])                                # injected at the boundary
+        self.assertIn("migration_started", retry["milestones"])        # i.e. past point #3 and preflight
+        self.assert_blocked(retry)                                     # PREAPPLIED, no verify/advance
+        self.assertEqual(self.migrate_calls, [])                       # migrate never used to "apply" M2
+        evidence = retry["migration_recovery"]
+        self.assertEqual(evidence["successful_prefix"], [M1])
+        self.assertFalse(evidence["finalized"])                        # M2 not claimable: absence never proven
+        self.assertFalse(evidence["in_flight_absence_proven"])
+        self.migrate_calls.clear()
+        self.assert_blocked(self.run_job(str(uuid.uuid4())))           # nothing later claims it either
+        self.assertEqual(self.store.load(prior)["migration_recovery"]["successful_prefix"], [M1])
+
+    def test_race_c_manual_m2_just_before_the_in_flight_marker_is_never_claimed(self):
+        self._race_c("before")
+
+    def test_race_c_manual_m2_just_after_the_in_flight_marker_is_never_claimed(self):
+        self._race_c("after")
+
+    def test_crash_after_marker_before_absence_proof_cannot_claim_a_manual_m2(self):
+        self.failed_after_m1()
+
+        def crash_and_manual_apply():
+            self.recorder.apply(M2)                                    # operator, in the gap
+            raise _Crash()
+        hook, fired = self._at_m2_marker(crash_and_manual_apply, when="after")
+        job = str(uuid.uuid4())
+        with hook, self.assertRaises(_Crash):
+            self.run_job(job)
+        self.assertEqual(fired, [True])
+        evidence = self.store.load(job)["migration_recovery"]
+        self.assertEqual((evidence["in_flight_migration"], evidence["in_flight_absence_proven"]), (M2, False))
+        resumed = self.run_job(job, accept=False)
+        self.assertFalse(resumed["migration_recovery"]["finalized"])
+        self.migrate_calls.clear()
+        self.assert_blocked(self.run_job(str(uuid.uuid4())))
+
+    def test_positive_m2_proven_absent_invoked_committed_then_crash_is_recoverable(self):
+        prior = self.failed_after_m1()                                 # recovery owns [M1]
+        self.migrate_calls.clear()
+        job = str(uuid.uuid4())
+        with self.assertRaises(_Crash):
+            self.run_job(job, outcomes={M2: "crash_after_commit"})
+        self.assertEqual(self.migrate_calls, [M2])                     # the updater really invoked M2
+        crashed = self.store.load(job)["migration_recovery"]
+        self.assertEqual(crashed["prior_job_id"], prior)
+        self.assertEqual((crashed["successful_prefix"], crashed["in_flight_migration"],
+                          crashed["in_flight_absence_proven"]), ([M1], M2, True))
+        resumed = self.run_job(job, accept=False)
+        evidence = resumed["migration_recovery"]
+        self.assertTrue(evidence["finalized"])
+        self.assertEqual(evidence["successful_prefix"], [M1, M2])     # M2 legitimately claimed
+        self.assertEqual(evidence["prefix_records"][M2], self.recorder.rows[M2])
+        self.migrate_calls.clear()
+        retry = self.run_job(str(uuid.uuid4()))
+        self.assertEqual(retry["state"], "succeeded", retry.get("failure_detail"))
+        self.assertEqual(self.migrate_calls, [])                       # complete prefix: nothing re-run
+        self.assertLess(retry["milestones"].index("database_verified"), retry["milestones"].index("source_advanced"))
+
     def test_identity_mismatches_block_recovery(self):
         cases = {
             "other release": {"release_id": "r0106"},

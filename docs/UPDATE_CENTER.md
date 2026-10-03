@@ -1698,7 +1698,11 @@ conflicting key, the true count, bounded row IDs and truncation.
 Migrations run one at a time.
 
 **During execution.** Before each command, root-owned evidence records that
-migration as `in_flight_migration`. After the command, the worker reads
+migration as `in_flight_migration`. A fresh observation taken *after* that marker
+must then show the transition is still exactly the owned prefix, with the migration
+absent. Only then is `in_flight_absence_proven` recorded and `migrate` invoked.
+A migration someone applies in that gap is `TARGET_MIGRATION_PREAPPLIED` and is
+never claimed. After the command, the worker reads
 `django_migrations` directly via `psql` (read-only, using the checkpoint's
 database identity). It then persists, in one write:
 
@@ -1710,7 +1714,7 @@ database identity). It then persists, in one write:
 other exception, and `AMBIGUOUS_INTERRUPTED_MIGRATION` after a hard kill.
 Evidence is finalized from database observation only. The observation may
 extend the recorded prefix by **at most the single recorded in-flight
-migration**, so nothing an operator applies after a crash can be claimed.
+migration, and only once its absence was proven**, so nothing an operator applies after a crash can be claimed.
 PostgreSQL that is still recovering after a power loss gets a bounded
 readiness wait (about 60 s). If it is still unavailable, the evidence stays
 unfinalized, and a later exact retry repeats the same observation-based
