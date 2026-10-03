@@ -5,6 +5,7 @@ acceptance suite.  Unlike that suite, this fixture explicitly rolls
 updatecenter back to 0002 as well as authz/library, proving the target probe
 has no approval table available.
 """
+import io
 from pathlib import Path
 import json
 import tempfile
@@ -12,12 +13,15 @@ import types
 from unittest import mock
 import uuid
 
+from django.core.management import call_command
 from django.db import connection
 from django.db.migrations.executor import MigrationExecutor
 from django.db.migrations.graph import MigrationGraph
 from django.test import TransactionTestCase
 
-from .phase_b_helpers import PROJECT_ROOT, config_dict, orm_migration_records
+from .phase_b_helpers import (
+    PROJECT_ROOT, config_dict, drop_guarded_receipt_table, orm_guarded_receipts, orm_migration_records,
+)
 from .test_gen7_heterogeneous_probe_compatibility import _run_real_legacy_probe
 from isadoraair_updater.config import validate_config_dict
 from isadoraair_updater.executor import Executor, _strict_probe
@@ -154,15 +158,21 @@ class ProductionStateExecutor(Executor):
             pending = [arguments[index + 1] for index, value in enumerate(arguments) if value == "--pending"]
             payload = json.dumps(run_preflights(pending), sort_keys=True, separators=(",", ":"))
             return ProcessResult(tuple(arguments), 0, payload.encode("utf-8"), b""), {}
-        if arguments and arguments[0] == "migrate":
+        if arguments and arguments[0] == "updatecenter_apply_migration_guarded":
+            # The REAL guarded command (lock, proof, migrate, receipt) against
+            # the real test DB, through its own argument handling.
             self.migrate_calls += 1
-            MigrationExecutor(connection).migrate([(arguments[1], arguments[2])])
-            return ProcessResult(tuple(arguments), 0, b"", b""), {}
+            output = io.StringIO()
+            call_command(*arguments, stdout=output)
+            return ProcessResult(tuple(arguments), 0, output.getvalue().encode("utf-8"), b""), {}
         raise AssertionError(f"unexpected application mutation: {arguments!r}")
 
     def _observe_migration_records(self, refs):
         # The REAL test-database recorder rows these in-process migrations wrote.
         return orm_migration_records(refs)
+
+    def _observe_guarded_receipt(self, nonce):
+        return orm_guarded_receipts(nonce)
 
     def _advance_source(self, plan):
         self.source_advance_calls += 1
@@ -260,6 +270,7 @@ class R0092ProductionBootstrapAcceptanceTests(TransactionTestCase):
         PersistentSupervisor.acceptance_confirmations = []
 
     def tearDown(self):
+        drop_guarded_receipt_table()
         MigrationExecutor(connection).migrate(self.current_leaf_targets)
         self.store.close()
         self.temp.cleanup()

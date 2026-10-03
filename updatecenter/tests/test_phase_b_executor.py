@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 import tempfile
 import uuid
@@ -248,11 +249,10 @@ class ExecutorOrderingTests(SimpleTestCase):
         )
         compare = mock.patch.object(self.executor, "_validate_target_schema", return_value=("sample.0002_add",))
         checkpoint = mock.patch("isadoraair_updater.executor.create_checkpoint", return_value={"valid": True, "dump_file": "x", "size_bytes": 1, "sha256": "d" * 64})
-        migrate_result = ProcessResult(("python",), 0 if migration_success else 1, b"ok" if migration_success else b"", b"failed" if not migration_success else b"")
-        # The database recorder: the migration row exists only AFTER a
-        # successful (mocked) migrate command -- runtime 11 also observes
-        # it before the command to prove it was not already applied.
-        recorder = {}
+        # The database recorder and guarded-apply receipts: the migration
+        # row and its receipt exist only AFTER a successful (mocked) guarded
+        # apply -- runtime 11 re-observes both before extending its prefix.
+        recorder, receipts = {}, []
 
         def run_app(source, arguments, *, timeout):
             if arguments[0] == "updatecenter_migration_preflight":
@@ -260,19 +260,33 @@ class ExecutorOrderingTests(SimpleTestCase):
                 # read-only preflights of the pending migrations.
                 ok = b'{"checks":[],"schema_version":1,"status":"ok"}'
                 return ProcessResult(tuple(arguments), 0, ok, b""), {}
-            if arguments[0] == "migrate" and migration_success:
-                recorder["sample.0002_add"] = {"id": 7, "applied": "2026-10-03T00:00:00.000000Z"}
-            return migrate_result, {"DB_PASSWORD": "secret", "SECRET_KEY": "key"}
+            if arguments[0] != "updatecenter_apply_migration_guarded":
+                raise AssertionError(f"unexpected application command {arguments!r}")
+            if not migration_success:
+                return ProcessResult(tuple(arguments), 1, b"", b"failed"), {"DB_PASSWORD": "secret", "SECRET_KEY": "key"}
+            values = dict(zip(arguments[2::2], arguments[3::2]))
+            row = {"id": 7, "applied": "2026-10-03T00:00:00.000000Z"}
+            recorder[values["--migration"]] = row
+            receipts.append({"nonce": values["--nonce"], "job_id": values["--job-id"],
+                             "migration": values["--migration"], "django_migration_id": 7,
+                             "applied_utc": row["applied"]})
+            payload = {"schema_version": 1, "status": "applied", "migration": values["--migration"],
+                       "nonce": values["--nonce"], "row": row}
+            return ProcessResult(tuple(arguments), 0, json.dumps(payload).encode(), b""), {}
         migrate = mock.patch.object(self.executor, "_run_app", side_effect=run_app)
         observe = mock.patch.object(
             self.executor, "_observe_migration_records",
             side_effect=lambda refs: {ref: dict(recorder[ref]) for ref in refs if ref in recorder},
         )
+        observe_receipt = mock.patch.object(
+            self.executor, "_observe_guarded_receipt",
+            side_effect=lambda nonce: [dict(item) for item in receipts if item["nonce"] == nonce],
+        )
 
         def advance(_plan):
             self.events.append("advance")
         advance_patch = mock.patch.object(self.executor, "_advance_source", side_effect=advance)
-        return [live, fetch, derive, blockers, current, cleanup_patch, stage, target_probe, compare, checkpoint, migrate, observe, advance_patch]
+        return [live, fetch, derive, blockers, current, cleanup_patch, stage, target_probe, compare, checkpoint, migrate, observe, advance_patch, observe_receipt]
 
     def _run_with(self, patches):
         entered = [item.start() for item in patches]

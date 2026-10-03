@@ -12,6 +12,12 @@ from django.test import SimpleTestCase
 from updatecenter import git_adapter, manifest as m
 
 APP_ROOT = Path(__file__).resolve().parents[1]
+# The ONE sanctioned migration-applying module (P1 1.17): the protected
+# updater's guarded one-migration apply. Only the protected root runtime runs
+# it -- as the application user, through the staged target's manage.py,
+# exactly where it previously ran `manage.py migrate`. Nothing else in this
+# app may import or reference it (see GuardedApplyIsolationTests).
+GUARDED_APPLY = APP_ROOT / "management" / "commands" / "updatecenter_apply_migration_guarded.py"
 
 
 def _all_py_files():
@@ -151,6 +157,10 @@ class NoExecutionCodeTests(SimpleTestCase):
                 continue
             text = path.read_text(encoding="utf-8")
             for forbidden in self.FORBIDDEN_CALLS:
+                if path == GUARDED_APPLY and forbidden == 'call_command("migrate"':
+                    # Exactly one in-transaction migrate of exactly one migration.
+                    self.assertEqual(text.count(forbidden), 1, path)
+                    continue
                 self.assertNotIn(forbidden, text, f"{path} contains {forbidden!r}")
 
     def test_migrationexecutor_only_ever_calls_migration_plan_never_migrate(self):
@@ -167,3 +177,22 @@ class NoExecutionCodeTests(SimpleTestCase):
             for node in ast.walk(tree):
                 if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "migrate":
                     self.fail(f"{path} calls a `.migrate(...)` method -- Phase A must only ever read migration state, never apply it")
+
+
+class GuardedApplyIsolationTests(SimpleTestCase):
+    """The exemption above is for one file only, reachable only as a
+    management command invoked by the protected runtime."""
+
+    def test_no_other_app_module_imports_or_names_the_guarded_apply(self):
+        self.assertTrue(GUARDED_APPLY.is_file())
+        for path in _all_py_files():
+            if path == GUARDED_APPLY:
+                continue
+            text = path.read_text(encoding="utf-8")
+            self.assertNotIn("apply_migration_guarded", text, f"{path} references the guarded apply")
+            self.assertNotIn("apply_guarded", text, f"{path} references the guarded apply")
+
+    def test_web_entry_points_never_run_management_commands(self):
+        for name in ("views.py", "urls.py", "job_service.py", "backend_client.py", "planner.py", "schema_health.py"):
+            path = APP_ROOT / name
+            self.assertNotIn("call_command", path.read_text(encoding="utf-8"), path)

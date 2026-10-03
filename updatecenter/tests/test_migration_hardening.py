@@ -7,8 +7,11 @@
 
 Recovery tests drive Executor.execute() itself. Only process boundaries are
 replaced: the application command runner, the probe, Git, staging, and the
-database recorder -- a stateful FakeRecorder whose rows change exactly when
-a (fake) migrate command commits or a test simulates an outside actor.
+database recorder -- a stateful FakeRecorder whose rows (and guarded-apply
+receipts) change exactly when a (fake) guarded apply commits or a test
+simulates an outside actor. The fake guarded command reproduces the real
+one's proof/refusal contract; the real command, its lock and its atomicity
+are proven against PostgreSQL in test_migration_guarded_apply_postgres.py.
 Companion trust rules: test_migration_authorization_companions.py.
 Real-PostgreSQL coverage: test_migration_hardening_postgres.py.
 Runtime-10 bootstrap: test_runtime11_bootstrap.py.
@@ -279,6 +282,7 @@ class FakeRecorder:
 
     def __init__(self):
         self.rows = {}
+        self.receipts = []          # updatecenter_guarded_migration_receipt rows
         self._next = 40
         self.unavailable_attempts = 0
 
@@ -295,6 +299,33 @@ class FakeRecorder:
             raise ExecutionError("MIGRATION_OBSERVATION_FAILED", "the database system is starting up", manual=True)
         return {ref: dict(self.rows[ref]) for ref in refs if ref in self.rows}
 
+    def receipt(self, nonce, job_id, ref):
+        self.receipts.append({
+            "nonce": nonce, "job_id": job_id, "migration": ref,
+            "django_migration_id": self.rows[ref]["id"], "applied_utc": self.rows[ref]["applied"],
+        })
+
+    def observe_receipt(self, nonce):
+        return [dict(item) for item in self.receipts if item["nonce"] == nonce]
+
+
+def _guarded_arguments(arguments):
+    """Parse the guarded command line exactly as the real command's argparse does."""
+    assert arguments[:2] == ["updatecenter_apply_migration_guarded", "--skip-checks"], arguments
+    parsed = {"transition": [], "owned": {}}
+    pairs = arguments[2:]
+    assert len(pairs) % 2 == 0, arguments
+    for flag, value in zip(pairs[::2], pairs[1::2]):
+        if flag == "--transition":
+            parsed["transition"].append(value)
+        elif flag == "--owned":
+            ref, _, identity = value.partition("=")
+            row_id, _, applied = identity.partition(",")
+            parsed["owned"][ref] = {"id": int(row_id), "applied": applied}
+        else:
+            parsed[flag[2:].replace("-", "_")] = value
+    return parsed
+
 
 class PartialPrefixRecoveryExecutionTests(SimpleTestCase):
     """M1 -> M2 transition from r0104 to r0105 (M2 depends on M1)."""
@@ -308,7 +339,9 @@ class PartialPrefixRecoveryExecutionTests(SimpleTestCase):
         self.plan = plan()
         self.recorder = FakeRecorder()
         self.head = "a" * 40
-        self.migrate_calls = []
+        self.migrate_calls = []        # guarded-apply invocations (refs)
+        self.guard_applied = []        # refs the guarded transaction actually committed
+        self.guard_invocations = []    # parsed guarded command lines + in-flight evidence at invocation
         self.probe_hooks = {}
         self.preflight_hook = None
         stage_root = self.root / "stage-source"
@@ -371,20 +404,52 @@ class PartialPrefixRecoveryExecutionTests(SimpleTestCase):
                 if self.preflight_hook is not None:
                     self.preflight_hook()
                 return ProcessResult(tuple(arguments), 0, b'{"checks":[],"schema_version":1,"status":"ok"}', b""), {}
-            if arguments[0] != "migrate":
+            if arguments[0] != "updatecenter_apply_migration_guarded":
                 raise AssertionError(f"unexpected application command {arguments!r}")
-            ref = f"{arguments[1]}.{arguments[2]}"
+            request = _guarded_arguments(arguments)
+            ref = request["migration"]
             self.migrate_calls.append(ref)
+            self.guard_invocations.append(
+                (request, dict(self.store.load(request["job_id"])["migration_recovery"])),
+            )
             outcome = outcomes.get(ref, "ok")
+
+            def emit(payload, returncode=0):
+                return ProcessResult(tuple(arguments), returncode, json.dumps(payload).encode(), b""), {}
+
+            def refused(reason):
+                return emit({"schema_version": 1, "status": "refused", "reason": reason})
             if outcome == "oserror":
                 raise OSError(24, "Too many open files")
-            if outcome == "crash_before_commit":
+            if outcome == "crash_before_commit":      # process/transaction died before COMMIT
                 raise _Crash()
-            if outcome in {"ok", "crash_after_commit"}:
-                self.recorder.apply(ref)
-            if outcome == "crash_after_commit":
+            if outcome == "lock_timeout":
+                return refused("lock_timeout")
+            if outcome == "non_atomic":
+                return refused("NON_ATOMIC_UNSUPPORTED")
+            # The guarded proof, as the real command makes it under the lock.
+            present = {item: self.recorder.rows[item] for item in request["transition"] if item in self.recorder.rows}
+            if ref in present:
+                return refused("next_migration_already_applied")
+            if set(present) != set(request["owned"]):
+                return refused("applied_transition_differs_from_owned_prefix")
+            if any(present[item] != request["owned"][item] for item in present):
+                return refused("owned_recorder_row_identity_changed")
+            if outcome == "fail":                      # migration raised: everything rolled back
+                return ProcessResult(tuple(arguments), 1, b"", b"boom"), {}
+            self.recorder.apply(ref)
+            self.guard_applied.append(ref)
+            if outcome != "no_receipt":
+                self.recorder.receipt(request["nonce"], request["job_id"], ref)
+            if outcome == "crash_after_commit":        # committed, worker died before its evidence write
                 raise _Crash()
-            return ProcessResult(tuple(arguments), 0 if outcome == "ok" else 1, b"", b"" if outcome == "ok" else b"boom"), {}
+            if outcome == "external_next_after_commit":
+                self.recorder.apply(M2)                # an outside actor right after our COMMIT
+            row = dict(self.recorder.rows[ref])
+            if outcome == "wrong_row":
+                row["id"] += 1
+            return emit({"schema_version": 1, "status": "applied", "migration": ref,
+                         "nonce": request["nonce"], "row": row})
 
         def advance(_plan):
             self.head = "b" * 40
@@ -399,6 +464,7 @@ class PartialPrefixRecoveryExecutionTests(SimpleTestCase):
             mock.patch("isadoraair_updater.executor.cleanup"),
             mock.patch.object(self.executor, "_probe", side_effect=self._probe),
             mock.patch.object(self.executor, "_observe_migration_records", side_effect=self.recorder.observe),
+            mock.patch.object(self.executor, "_observe_guarded_receipt", side_effect=self.recorder.observe_receipt),
             mock.patch("isadoraair_updater.executor.create_checkpoint", return_value=self.checkpoint),
             mock.patch("isadoraair_updater.executor.verify_checkpoint", return_value=True),
             mock.patch.object(self.executor, "_run_app", side_effect=run_app),
@@ -505,6 +571,7 @@ class PartialPrefixRecoveryExecutionTests(SimpleTestCase):
         path = self.config.jobs_root / f"{job}.json"
         raw = json.loads(path.read_text())
         raw["migration_recovery"]["in_flight_migration"] = None      # died before the M2 in-flight write
+        raw["migration_recovery"]["in_flight_nonce"] = None
         path.write_text(json.dumps(raw))
         self.recorder.apply(M2)                                       # operator: manage.py migrate
         resumed = self.run_job(job, accept=False)
@@ -567,11 +634,11 @@ class PartialPrefixRecoveryExecutionTests(SimpleTestCase):
         self.assert_blocked(retry)
         self.assertNotIn("database_verified", retry["milestones"])
 
-    # -- Race C: the gap between the owned-prefix proof and invoking migrate ----
+    # -- Race C / crash semantics A-G around the guarded apply ----------------
     def _at_m2_marker(self, action, *, when):
-        """Run `action` exactly at the durable M2 in-flight marker write
-        (absence not yet proven): just before it ("before") or right after
-        it ("after") -- the previously vulnerable boundary, which lies
+        """Run `action` exactly at the durable M2 in-flight write (migration +
+        nonce, before the guarded command): just before it ("before") or right
+        after it ("after") -- the previously vulnerable boundary, which lies
         after decision point #3 and after any preflight. Returns a context
         manager and the list recording that the hook fired."""
         original = self.store.update
@@ -580,7 +647,7 @@ class PartialPrefixRecoveryExecutionTests(SimpleTestCase):
         def update(job_id, **changes):
             evidence = changes.get("migration_recovery")
             at_marker = (isinstance(evidence, dict) and evidence.get("in_flight_migration") == M2
-                         and evidence.get("in_flight_absence_proven") is False and not fired)
+                         and evidence.get("in_flight_nonce") is not None and not fired)
             if at_marker and when == "before":
                 fired.append(True)
                 action()
@@ -591,7 +658,13 @@ class PartialPrefixRecoveryExecutionTests(SimpleTestCase):
             return result
         return mock.patch.object(self.store, "update", side_effect=update), fired
 
+    def assert_m2_never_credited(self, prior):
+        self.migrate_calls.clear()
+        self.assert_blocked(self.run_job(str(uuid.uuid4())))           # nothing later claims it either
+        self.assertEqual(self.store.load(prior)["migration_recovery"]["successful_prefix"], [M1])
+
     def _race_c(self, when):
+        """E -- an external M2 commits before the guarded transaction locks."""
         prior = self.failed_after_m1()                                 # recovery owns [M1]
         hook, fired = self._at_m2_marker(lambda: self.recorder.apply(M2), when=when)
         self.migrate_calls.clear()
@@ -599,15 +672,15 @@ class PartialPrefixRecoveryExecutionTests(SimpleTestCase):
             retry = self.run_job(str(uuid.uuid4()))
         self.assertEqual(fired, [True])                                # injected at the boundary
         self.assertIn("migration_started", retry["milestones"])        # i.e. past point #3 and preflight
-        self.assert_blocked(retry)                                     # PREAPPLIED, no verify/advance
-        self.assertEqual(self.migrate_calls, [])                       # migrate never used to "apply" M2
+        self.assert_blocked(retry, no_migration=False)                 # PREAPPLIED, no verify/advance
+        self.assertIn("next_migration_already_applied", retry["failure_detail"])
+        self.assertEqual(self.migrate_calls, [M2])                     # the guard was asked ...
+        self.assertEqual(self.guard_applied, [M1])                     # ... and refused: only the old M1
         evidence = retry["migration_recovery"]
         self.assertEqual(evidence["successful_prefix"], [M1])
-        self.assertFalse(evidence["finalized"])                        # M2 not claimable: absence never proven
-        self.assertFalse(evidence["in_flight_absence_proven"])
-        self.migrate_calls.clear()
-        self.assert_blocked(self.run_job(str(uuid.uuid4())))           # nothing later claims it either
-        self.assertEqual(self.store.load(prior)["migration_recovery"]["successful_prefix"], [M1])
+        self.assertFalse(evidence["finalized"])                        # M2 not claimable: no receipt
+        self.assertEqual(self.recorder.observe_receipt(evidence["in_flight_nonce"]), [])
+        self.assert_m2_never_credited(prior)
 
     def test_race_c_manual_m2_just_before_the_in_flight_marker_is_never_claimed(self):
         self._race_c("before")
@@ -615,11 +688,11 @@ class PartialPrefixRecoveryExecutionTests(SimpleTestCase):
     def test_race_c_manual_m2_just_after_the_in_flight_marker_is_never_claimed(self):
         self._race_c("after")
 
-    def test_crash_after_marker_before_absence_proof_cannot_claim_a_manual_m2(self):
-        self.failed_after_m1()
+    def test_a_crash_before_the_guarded_command_then_manual_m2_cannot_be_claimed(self):
+        prior = self.failed_after_m1()
 
         def crash_and_manual_apply():
-            self.recorder.apply(M2)                                    # operator, in the gap
+            self.recorder.apply(M2)                                    # operator, after the crash
             raise _Crash()
         hook, fired = self._at_m2_marker(crash_and_manual_apply, when="after")
         job = str(uuid.uuid4())
@@ -627,13 +700,35 @@ class PartialPrefixRecoveryExecutionTests(SimpleTestCase):
             self.run_job(job)
         self.assertEqual(fired, [True])
         evidence = self.store.load(job)["migration_recovery"]
-        self.assertEqual((evidence["in_flight_migration"], evidence["in_flight_absence_proven"]), (M2, False))
+        self.assertEqual(evidence["in_flight_migration"], M2)
+        self.assertIsNotNone(evidence["in_flight_nonce"])               # nonce durable, no receipt
+        self.assertEqual(self.recorder.observe_receipt(evidence["in_flight_nonce"]), [])
         resumed = self.run_job(job, accept=False)
         self.assertFalse(resumed["migration_recovery"]["finalized"])
-        self.migrate_calls.clear()
-        self.assert_blocked(self.run_job(str(uuid.uuid4())))
+        self.assert_m2_never_credited(prior)
 
-    def test_positive_m2_proven_absent_invoked_committed_then_crash_is_recoverable(self):
+    def test_b_c_guarded_transaction_dies_before_commit_then_retry_runs_only_m2(self):
+        """B/C: the guarded transaction rolled back (crash after the proof or
+        during the atomic migration): no M2, no receipt; the in-flight
+        identity alone claims nothing and the retry applies M2 normally."""
+        prior = self.failed_after_m1()
+        job = str(uuid.uuid4())
+        self.migrate_calls.clear()
+        with self.assertRaises(_Crash):
+            self.run_job(job, outcomes={M2: "crash_before_commit"})
+        crashed = self.store.load(job)["migration_recovery"]
+        self.assertEqual((crashed["successful_prefix"], crashed["in_flight_migration"]), ([M1], M2))
+        self.assertNotIn(M2, self.recorder.rows)
+        self.assertEqual(self.recorder.observe_receipt(crashed["in_flight_nonce"]), [])
+        resumed = self.run_job(job, accept=False)
+        finalized = resumed["migration_recovery"]
+        self.assertTrue(finalized["finalized"])
+        self.assertEqual(finalized["successful_prefix"], [M1])
+        self.assertIsNone(finalized["in_flight_nonce"])
+        self.assertEqual(finalized["prior_job_id"], prior)
+        self.fresh_retry_succeeds_with_only([M2], prior_job=job)
+
+    def test_d_receipt_backed_commit_then_crash_is_recoverable(self):
         prior = self.failed_after_m1()                                 # recovery owns [M1]
         self.migrate_calls.clear()
         job = str(uuid.uuid4())
@@ -642,8 +737,11 @@ class PartialPrefixRecoveryExecutionTests(SimpleTestCase):
         self.assertEqual(self.migrate_calls, [M2])                     # the updater really invoked M2
         crashed = self.store.load(job)["migration_recovery"]
         self.assertEqual(crashed["prior_job_id"], prior)
-        self.assertEqual((crashed["successful_prefix"], crashed["in_flight_migration"],
-                          crashed["in_flight_absence_proven"]), ([M1], M2, True))
+        self.assertEqual((crashed["successful_prefix"], crashed["in_flight_migration"]), ([M1], M2))
+        self.assertEqual(self.recorder.observe_receipt(crashed["in_flight_nonce"]), [{
+            "nonce": crashed["in_flight_nonce"], "job_id": job, "migration": M2,
+            "django_migration_id": self.recorder.rows[M2]["id"], "applied_utc": self.recorder.rows[M2]["applied"],
+        }])
         resumed = self.run_job(job, accept=False)
         evidence = resumed["migration_recovery"]
         self.assertTrue(evidence["finalized"])
@@ -655,6 +753,165 @@ class PartialPrefixRecoveryExecutionTests(SimpleTestCase):
         self.assertEqual(self.migrate_calls, [])                       # complete prefix: nothing re-run
         self.assertLess(retry["milestones"].index("database_verified"), retry["milestones"].index("source_advanced"))
 
+    def _crash_after_m2_commit_then_tamper(self, tamper):
+        prior = self.failed_after_m1()
+        job = str(uuid.uuid4())
+        with self.assertRaises(_Crash):
+            self.run_job(job, outcomes={M2: "crash_after_commit"})
+        tamper(self.recorder.receipts, self.store.load(job)["migration_recovery"]["in_flight_nonce"])
+        resumed = self.run_job(job, accept=False)
+        self.assertFalse(resumed["migration_recovery"]["finalized"])
+        self.assert_m2_never_credited(prior)
+
+    def test_d_contradictory_receipt_fails_closed(self):
+        cases = {
+            "other job": lambda receipts, _n: receipts[-1].update(job_id="22222222-2222-2222-2222-222222222222"),
+            "other migration": lambda receipts, _n: receipts[-1].update(migration=M1),
+            "other row id": lambda receipts, _n: receipts[-1].update(django_migration_id=999),
+            "other applied": lambda receipts, _n: receipts[-1].update(applied_utc="2030-01-01T00:00:00.000000Z"),
+            "duplicate": lambda receipts, _n: receipts.append(dict(receipts[-1])),
+            "missing": lambda receipts, _n: receipts.pop(),
+            "other nonce": lambda receipts, _n: receipts[-1].update(nonce=str(uuid.uuid4())),
+        }
+        for label, tamper in cases.items():
+            with self.subTest(label):
+                self.recorder, self.head, self.migrate_calls = FakeRecorder(), "a" * 40, []
+                self._crash_after_m2_commit_then_tamper(tamper)
+
+    def test_d_receipt_lookup_failure_never_claims(self):
+        prior = self.failed_after_m1()
+        job = str(uuid.uuid4())
+        with self.assertRaises(_Crash):
+            self.run_job(job, outcomes={M2: "crash_after_commit"})
+        with mock.patch.object(FakeRecorder, "observe_receipt", side_effect=ExecutionError(
+                "MIGRATION_OBSERVATION_FAILED", "guarded-migration receipt is malformed", manual=True)):
+            resumed = self.run_job(job, accept=False)
+        self.assertEqual(resumed["failure_classification"], "AMBIGUOUS_INTERRUPTED_MIGRATION")
+        self.assertFalse(resumed["migration_recovery"]["finalized"])
+        self.assertEqual(self.store.load(prior)["migration_recovery"]["successful_prefix"], [M1])
+
+    def test_g_external_next_migration_is_never_credited_because_of_a_receipt(self):
+        """M1 has a valid receipt; an outside actor applies M2 right after
+        M1's guarded commit: the job fails closed on drift and finalization
+        never extends the owned prefix past the receipted migration."""
+        job = str(uuid.uuid4())
+        failed = self.run_job(job, outcomes={M1: "external_next_after_commit"})
+        self.assertEqual(failed["failure_classification"], "MIGRATION_STATE_DRIFT")
+        self.assertNotIn("source_advanced", failed["milestones"])
+        evidence = failed["migration_recovery"]
+        self.assertFalse(evidence["finalized"])
+        self.assertEqual(evidence["in_flight_migration"], M1)
+        self.assertEqual(len(self.recorder.observe_receipt(evidence["in_flight_nonce"])), 1)   # M1's receipt
+        self.migrate_calls.clear()
+        self.assert_blocked(self.run_job(str(uuid.uuid4())))
+
+    def test_g_receipted_crash_then_external_next_migration_is_not_finalized(self):
+        job = str(uuid.uuid4())
+        with self.assertRaises(_Crash):
+            self.run_job(job, outcomes={M1: "crash_after_commit"})
+        self.recorder.apply(M2)
+        self.assertFalse(self.run_job(job, accept=False)["migration_recovery"]["finalized"])
+        self.migrate_calls.clear()
+        self.assert_blocked(self.run_job(str(uuid.uuid4())))
+
+    # -- the guarded command's contract with the runtime -----------------------
+    def test_guarded_command_receives_the_durable_nonce_and_exact_owned_rows(self):
+        prior = self.failed_after_m1()
+        self.guard_invocations.clear()
+        retry = self.run_job(str(uuid.uuid4()))
+        self.assertEqual(retry["state"], "succeeded", retry.get("failure_detail"))
+        [(request, evidence)] = self.guard_invocations
+        self.assertEqual(request["migration"], M2)
+        self.assertEqual(request["transition"], [M1, M2])
+        self.assertEqual(request["owned"], {M1: self.recorder.rows[M1]})
+        self.assertEqual(request["job_id"], retry["job_id"])
+        # Persisted BEFORE the command ran: exactly this migration and nonce.
+        self.assertEqual((evidence["in_flight_migration"], evidence["in_flight_nonce"]), (M2, request["nonce"]))
+        self.assertEqual(uuid.UUID(request["nonce"]).version, 4)
+        self.assertEqual(self.store.load(prior)["migration_recovery"]["successful_prefix"], [M1])
+        self.assertIsNone(retry["migration_recovery"]["in_flight_nonce"])
+
+    def test_every_guarded_invocation_uses_a_fresh_nonce(self):
+        job = str(uuid.uuid4())
+        self.assertEqual(self.run_job(job)["state"], "succeeded")
+        nonces = [request["nonce"] for request, _evidence in self.guard_invocations]
+        self.assertEqual(len(nonces), 2)
+        self.assertEqual(len(set(nonces)), 2)
+
+    def test_output_alone_is_never_trusted(self):
+        for outcome in ("no_receipt", "wrong_row"):
+            with self.subTest(outcome):
+                self.recorder, self.head, self.migrate_calls = FakeRecorder(), "a" * 40, []
+                prior = self.failed_after_m1()
+                failed = self.run_job(str(uuid.uuid4()), outcomes={M2: outcome})
+                self.assertEqual(failed["failure_classification"], "MIGRATION_STATE_DRIFT")
+                self.assertNotIn("source_advanced", failed["milestones"])
+                evidence = failed["migration_recovery"]
+                if outcome == "no_receipt":
+                    # Applied without a receipt is never the updater's.
+                    self.assertEqual(evidence["successful_prefix"], [M1])
+                    self.assertFalse(evidence["finalized"])
+                    self.assert_m2_never_credited(prior)
+                else:
+                    # The output lied about the row; the live row and the exact
+                    # receipt in the database -- not the output -- decide.
+                    self.assertEqual(evidence["successful_prefix"], [M1, M2])
+                    self.assertEqual(evidence["prefix_records"][M2], self.recorder.rows[M2])
+
+    def test_lock_timeout_is_retryable_and_claims_nothing(self):
+        prior = self.failed_after_m1()
+        job = str(uuid.uuid4())
+        failed = self.run_job(job, outcomes={M2: "lock_timeout"})
+        self.assertEqual(failed["failure_classification"], "MIGRATION_LOCK_TIMEOUT")
+        self.assertEqual(failed["state"], "failed")                   # not manual intervention
+        self.assertNotIn(M2, self.recorder.rows)
+        self.assertTrue(failed["migration_recovery"]["finalized"])
+        self.assertEqual(failed["migration_recovery"]["successful_prefix"], [M1])
+        self.assertEqual(failed["migration_recovery"]["prior_job_id"], prior)
+        self.fresh_retry_succeeds_with_only([M2], prior_job=job)
+
+    def test_non_atomic_refusal_fails_closed(self):
+        self.failed_after_m1()
+        failed = self.run_job(str(uuid.uuid4()), outcomes={M2: "non_atomic"})
+        self.assertEqual(failed["failure_classification"], "NON_ATOMIC_MIGRATION_UNSUPPORTED")
+        self.assertEqual(failed["state"], "manual_intervention_required")
+        self.assertNotIn(M2, self.recorder.rows)
+        self.assertNotIn("source_advanced", failed["milestones"])
+
+    def test_malformed_guarded_results_fail_closed(self):
+        payloads = [
+            b"not json",
+            b'{"schema_version":1,"status":"applied"}',
+            b'{"schema_version":2,"status":"refused","reason":"x"}',
+            b'{"schema_version":1,"status":"refused","reason":"has space"}',
+            b'{"schema_version":1,"status":"refused","reason":"x","extra":1}',
+        ]
+        for raw in payloads:
+            with self.subTest(raw=raw):
+                with mock.patch.object(self.executor, "_run_app", return_value=(
+                        ProcessResult(("x",), 0, raw, b""), {})):
+                    with self.assertRaises(ExecutionError) as caught:
+                        self.executor._apply_migration_guarded(
+                            self.root, job_id=str(uuid.uuid4()), nonce=str(uuid.uuid4()), migration=M2,
+                            transition=[M1, M2], owned={M1: {"id": 1, "applied": "2026-10-03T00:00:00.000000Z"}},
+                        )
+                self.assertIn(caught.exception.classification, {"MIGRATION_GUARD_INVALID", "TARGET_MIGRATION_PREAPPLIED"})
+                self.assertTrue(caught.exception.manual)
+
+    def test_applied_result_for_another_nonce_or_migration_is_rejected(self):
+        nonce = str(uuid.uuid4())
+        for change in ({"nonce": str(uuid.uuid4())}, {"migration": M1}, {"row": {"id": True, "applied": "x"}}):
+            payload = {"schema_version": 1, "status": "applied", "migration": M2, "nonce": nonce,
+                       "row": {"id": 7, "applied": "2026-10-03T00:00:00.000000Z"}, **change}
+            with self.subTest(change=change), mock.patch.object(self.executor, "_run_app", return_value=(
+                    ProcessResult(("x",), 0, json.dumps(payload).encode(), b""), {})):
+                with self.assertRaises(ExecutionError) as caught:
+                    self.executor._apply_migration_guarded(
+                        self.root, job_id=str(uuid.uuid4()), nonce=nonce, migration=M2, transition=[M1, M2],
+                        owned={M1: {"id": 1, "applied": "2026-10-03T00:00:00.000000Z"}},
+                    )
+                self.assertEqual(caught.exception.classification, "MIGRATION_GUARD_INVALID")
+
     def test_identity_mismatches_block_recovery(self):
         cases = {
             "other release": {"release_id": "r0106"},
@@ -664,7 +921,11 @@ class PartialPrefixRecoveryExecutionTests(SimpleTestCase):
             "noncontiguous prefix": {"successful_prefix": [M2], "prefix_records": {}},
             "missing records": {"prefix_records": {}},
             "foreign evidence job": {"evidence_job_id": "22222222-2222-2222-2222-222222222222"},
-            "impossible in-flight": {"in_flight_migration": M1},
+            "impossible in-flight": {"in_flight_migration": M1, "in_flight_nonce": str(uuid.uuid4())},
+            "nonce without in-flight": {"in_flight_nonce": str(uuid.uuid4())},
+            "in-flight without nonce": {"in_flight_migration": M2},
+            "non-uuid4 nonce": {"in_flight_migration": M2, "in_flight_nonce": str(uuid.uuid1())},
+            "legacy absence proof": {"in_flight_absence_proven": True},
         }
         for label, change in cases.items():
             with self.subTest(label):

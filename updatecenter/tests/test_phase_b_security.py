@@ -116,7 +116,10 @@ class ProtectedRuntimeStaticTests(SimpleTestCase):
     def test_root_migration_and_live_git_are_explicitly_run_as_user(self):
         executor = (RUNTIME_PACKAGE / "executor.py").read_text(encoding="utf-8")
         self.assertIn("self.runner.run_as_user", executor)
-        self.assertIn('["migrate", app_label, migration_name, "--noinput", "--skip-checks"]', executor)
+        # Migrations are applied ONLY through the staged target's guarded
+        # one-migration command (P1 1.17), never an ordinary `migrate`.
+        self.assertIn('arguments = ["updatecenter_apply_migration_guarded", "--skip-checks",', executor)
+        self.assertNotIn('["migrate"', executor)
         self.assertIn('[GIT, "-C", str(self.config.application_root)', executor)
         self.assertNotRegex(executor, r"self\.runner\.run\(\s*\[GIT,\s*\"-C\",\s*str\(self\.config\.application_root\)")
 

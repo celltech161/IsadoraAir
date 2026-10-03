@@ -1697,24 +1697,75 @@ conflicting key, the true count, bounded row IDs and truncation.
 
 Migrations run one at a time.
 
-**During execution.** Before each command, root-owned evidence records that
-migration as `in_flight_migration`. A fresh observation taken *after* that marker
-must then show the transition is still exactly the owned prefix, with the migration
-absent. Only then is `in_flight_absence_proven` recorded and `migrate` invoked.
-A migration someone applies in that gap is `TARGET_MIGRATION_PREAPPLIED` and is
-never claimed. After the command, the worker reads
-`django_migrations` directly via `psql` (read-only, using the checkpoint's
-database identity). It then persists, in one write:
+**During execution.** Before each migration, root-owned evidence records it
+as `in_flight_migration` together with a fresh uuid4 `in_flight_nonce`. On
+its own this claims nothing. The worker then runs the staged target's
+`manage.py updatecenter_apply_migration_guarded`, the ownership boundary. In
+**one PostgreSQL transaction on one session**, it:
+
+1. sets `SET LOCAL lock_timeout = '120s'` and takes
+   `LOCK TABLE django_migrations IN ACCESS EXCLUSIVE MODE`;
+2. proves that the live transition rows are exactly the owned prefix, with the
+   same `id` and `applied` for every row. The requested migration must be the
+   first unowned one, it must be absent, and there may be no duplicate or
+   extra transition rows. The nonce must be unused;
+3. requires Django's own plan to that target to be exactly that one forward
+   migration, and the migration to be atomic. Otherwise the result is
+   `NON_ATOMIC_UNSUPPORTED`, manual, and fails closed;
+4. applies it with Django's real `migrate`, in-process, on the same
+   connection;
+5. requires exactly one new recorder row (that migration) and nothing else
+   changed;
+6. inserts a receipt into `updatecenter_guarded_migration_receipt`. The
+   receipt holds the nonce (primary key), `job_id`, the migration, the
+   `django_migrations.id` (unique) and the exact `applied` timestamp.
+
+Schema change, recorder row and receipt commit together or not at all. A
+refusal is raised inside the transaction, so everything rolls back, including
+a first-time creation of the receipt table. It is then reported as
+`{"status": "refused", "reason"}`. The receipt table therefore exists only once
+a guarded apply has committed; a missing table means "no receipt". Runtime
+code only creates, inserts and reads receipts. Nothing updates or deletes
+them.
+
+The command's JSON output is never trusted alone. The worker re-reads
+`django_migrations` and the receipt directly via `psql` (read-only, using the
+checkpoint's database identity). It extends the owned prefix only when the
+applied set is exactly the prefix plus this migration, and when the row and
+the receipt match the nonce, job, migration, `id` and `applied` exactly. It
+then persists, in one write:
 
 * the contiguous applied prefix;
 * each prefix row's exact `id` and `applied` timestamp;
-* the cleared in-flight marker.
+* the cleared in-flight migration and nonce.
+
+The outcomes of a race on that migration are:
+
+* **An external migration that commits before the lock.** The guard
+  refuses. The job fails `TARGET_MIGRATION_PREAPPLIED` with no receipt, and
+  nothing is ever claimed.
+* **An external `migrate` that starts after the lock.** It blocks on its
+  first read of `django_migrations` until the updater commits, then finds the
+  migration applied.
+* **A raw insert that starts after the lock.** It also blocks, and can only
+  land after the commit. The result is a duplicate row, which observation
+  reports as `MIGRATION_RECORD_AMBIGUOUS`, and it is never credited.
 
 **Finalization after any interruption.** This covers a migration failure, any
 other exception, and `AMBIGUOUS_INTERRUPTED_MIGRATION` after a hard kill.
 Evidence is finalized from database observation only. The observation may
 extend the recorded prefix by **at most the single recorded in-flight
-migration, and only once its absence was proven**, so nothing an operator applies after a crash can be claimed.
+migration, and only with that nonce's exact receipt**. Several receipt states
+leave the evidence unfinalized:
+
+* a missing receipt;
+* a duplicate receipt;
+* a receipt that contradicts the evidence;
+* a receipt that cannot be read;
+* any other applied transition migration.
+
+A receipt therefore never makes a later migration updater-owned, and nothing
+an operator applies after a crash can be claimed.
 PostgreSQL that is still recovering after a power loss gets a bounded
 readiness wait (about 60 s). If it is still unavailable, the evidence stays
 unfinalized, and a later exact retry repeats the same observation-based
@@ -1738,6 +1789,33 @@ faked, rewritten or rolled back.
 Every operation in a non-atomic (`atomic=False`) migration is classified
 manual, because such a migration can partially commit before Django records
 it. No current IsadoraAir migration is non-atomic.
+
+The receipt proves ownership only, not correctness. Target-schema
+verification, migration-plan completion, `database_verified` and the
+source-advance gate run unchanged. `source_advanced` still happens strictly
+after full database verification.
+
+**Operational notes for the guarded apply:**
+
+* **Brief blocking.** `ACCESS EXCLUSIVE` on `django_migrations` blocks every
+  reader of that table for the duration of one migration. This includes
+  `manage.py migrate`, `showmigrations` and `pg_dump`. Application requests do
+  not read it.
+* **Bounded lock waits.** Lock waits are bounded by `lock_timeout = 120s`.
+  This covers the initial lock and every lock the migration's own DDL waits
+  for. A timeout rolls everything back. The job fails `MIGRATION_LOCK_TIMEOUT`,
+  which is retryable rather than manual: nothing changed and there is no
+  receipt.
+* **Backups.** A concurrent backup (`pg_dump` holds `ACCESS SHARE`) or a
+  concurrent migration can cause that retryable timeout. Schedule installs
+  outside backup windows.
+* **Deadlocks.** PostgreSQL may choose either competing transaction as a
+  deadlock victim. Both outcomes are safe:
+  * if the updater is the victim, the guard rolls back completely, reports
+    `deadlock_victim`, and the job fails `MIGRATION_LOCK_TIMEOUT`;
+  * if the other session is the victim, the updater commits with its receipt.
+* **Never kill sessions.** Never terminate database sessions to "help" an
+  install along. Let the bounded timeout expire and retry later.
 
 Update Center shows the recovery block only for a failed job whose finalized,
 proven evidence permits a retry. It shows the executor-recorded authorization

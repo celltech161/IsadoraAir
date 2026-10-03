@@ -171,3 +171,36 @@ def orm_migration_records(refs) -> dict:
                     "applied": applied.astimezone(_timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
                 }
     return records
+
+
+def orm_guarded_receipts(nonce: str) -> list[dict]:
+    """Guarded-migration receipts for `nonce`, read through Django's own
+    connection -- same shape as Executor._observe_guarded_receipt. A missing
+    receipt table means no receipt."""
+    from django.db import connection as _connection
+
+    from updatecenter.management.commands.updatecenter_apply_migration_guarded import RECEIPT_TABLE
+
+    with _connection.cursor() as cursor:
+        cursor.execute("SELECT to_regclass(%s) IS NOT NULL", [RECEIPT_TABLE])
+        if not cursor.fetchone()[0]:
+            return []
+        cursor.execute(
+            f"SELECT nonce::text, job_id::text, migration, django_migration_id, applied_utc "
+            f"FROM {RECEIPT_TABLE} WHERE nonce = %s",
+            [nonce],
+        )
+        return [
+            {"nonce": n, "job_id": j, "migration": m, "django_migration_id": i, "applied_utc": a}
+            for n, j, m, i, a in cursor.fetchall()
+        ]
+
+
+def drop_guarded_receipt_table() -> None:
+    """TEST-ONLY cleanup of the on-demand receipt table in the test database."""
+    from django.db import connection as _connection
+
+    from updatecenter.management.commands.updatecenter_apply_migration_guarded import RECEIPT_TABLE
+
+    with _connection.cursor() as cursor:
+        cursor.execute(f"DROP TABLE IF EXISTS {RECEIPT_TABLE}")

@@ -9,6 +9,7 @@ import re
 import shutil
 import stat
 import time
+import uuid
 from urllib.parse import urlsplit
 
 from . import HANDOFF_WIRE_PROTOCOL
@@ -148,22 +149,26 @@ _RECOVERY_PROBE_KEYS = _REVIEW_PROBE_KEYS | frozenset({
 PSQL = "/usr/bin/psql"
 _MIGRATION_REF_RE = re.compile(r"^[a-z][a-z0-9_]*\.[0-9]{4}_[a-z0-9_]+$")
 _APPLIED_UTC_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{6}Z$")
+_UUID4_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
+_GUARD_REASON_RE = re.compile(r"^[A-Za-z0-9_]{1,96}$")
+GUARDED_RECEIPT_TABLE = "updatecenter_guarded_migration_receipt"
 # Closed runtime-11 partial-prefix evidence schema. prefix_records holds the
 # exact django_migrations row identity ({"id", "applied"}) observed for every
 # migration in successful_prefix, so a later unapply/re-apply of the same
-# names cannot masquerade as the updater's own work. in_flight_migration is
-# the ONE migration whose command is about to run / running (persisted before
-# the command, cleared after its observation). in_flight_absence_proven is
-# set durably only after a fresh observation, taken AFTER the marker was
-# written, proved the migration still absent and the owned prefix unchanged.
-# Crash finalization may extend the recorded prefix by at most the in-flight
-# migration, and only when its absence was proven: anything applied before
-# that proof was not done by the updater.
+# names cannot masquerade as the updater's own work. in_flight_migration and
+# in_flight_nonce (a fresh uuid4) are persisted together before the guarded
+# target command (updatecenter_apply_migration_guarded) runs that one
+# migration. The command proves ownership and applies the migration under
+# ACCESS EXCLUSIVE on django_migrations in ONE PostgreSQL transaction that also
+# commits a receipt keyed by that nonce. Crash finalization may extend the
+# recorded prefix by the in-flight migration only when that exact receipt
+# (nonce, job, migration, recorder row id and applied) exists: the receipt is
+# the database-side proof that the updater's guarded transaction applied it.
 RECOVERY_EVIDENCE_FIELDS = frozenset({
     "schema_version", "classification", "evidence_job_id", "prior_job_id", "release_id", "target_commit",
     "manifest_sha256", "migration_plan_digest", "trusted_plan_fingerprint",
     "ordered_target_plan", "successful_prefix", "prefix_records", "in_flight_migration",
-    "in_flight_absence_proven", "checkpoint",
+    "in_flight_nonce", "checkpoint",
     "failure_classification", "failure_detail", "continued_from_job_id", "authorization_source", "finalized",
     "first_remaining_migration", "permitted_action",
 })
@@ -535,23 +540,10 @@ class Executor:
             )
         return payload
 
-    def _observe_migration_records(self, refs) -> dict[str, dict]:
-        """Exact django_migrations rows for `refs`, read straight from PostgreSQL.
-
-        Uses the same database identity as the checkpoint pg_dump, in a
-        read-only session, independent of which application source is
-        installed or whether a staged target still exists -- the
-        interrupted-resume path has neither. Returns {ref: {"id", "applied"}}
-        for every requested ref that has a row; a ref with more than one
-        row is ambiguous and raises.
-        """
-        wanted = set(refs)
+    def _psql_lines(self, query: str) -> list[str]:
+        """Run one read-only query through the checkpoint's database identity
+        (psql, read-only session) and return its unaligned output lines."""
         db = self.config.database
-        query = (
-            "SELECT id, app, name, "
-            "to_char(applied AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') "
-            "FROM django_migrations ORDER BY id"
-        )
         argv = self.runner.argv_as_user(self.config.application_user, [
             PSQL, "--no-psqlrc", "--no-password", "--no-align", "--tuples-only",
             "--field-separator=|", "--set=ON_ERROR_STOP=1",
@@ -565,17 +557,32 @@ class Executor:
         if not result.ok or result.output_truncated:
             raise ExecutionError(
                 "MIGRATION_OBSERVATION_FAILED",
-                f"could not read django_migrations (returncode={result.returncode!r}, timed_out={result.timed_out})",
+                f"could not read migration state (returncode={result.returncode!r}, timed_out={result.timed_out})",
                 manual=True,
             )
-        records: dict[str, dict] = {}
         try:
-            lines = result.stdout.decode("utf-8", "strict").splitlines()
+            return [line for line in result.stdout.decode("utf-8", "strict").splitlines() if line]
         except UnicodeDecodeError as exc:
-            raise ExecutionError("MIGRATION_OBSERVATION_FAILED", "django_migrations output is not UTF-8", manual=True) from exc
+            raise ExecutionError("MIGRATION_OBSERVATION_FAILED", "migration state output is not UTF-8", manual=True) from exc
+
+    def _observe_migration_records(self, refs) -> dict[str, dict]:
+        """Exact django_migrations rows for `refs`, read straight from PostgreSQL.
+
+        Uses the same database identity as the checkpoint pg_dump, in a
+        read-only session, independent of which application source is
+        installed or whether a staged target still exists -- the
+        interrupted-resume path has neither. Returns {ref: {"id", "applied"}}
+        for every requested ref that has a row; a ref with more than one
+        row is ambiguous and raises.
+        """
+        wanted = set(refs)
+        lines = self._psql_lines(
+            "SELECT id, app, name, "
+            "to_char(applied AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') "
+            "FROM django_migrations ORDER BY id"
+        )
+        records: dict[str, dict] = {}
         for line in lines:
-            if not line:
-                continue
             parts = line.split("|")
             if len(parts) != 4 or not parts[0].isdigit() or not _APPLIED_UTC_RE.fullmatch(parts[3]):
                 raise ExecutionError("MIGRATION_OBSERVATION_FAILED", "django_migrations row is malformed", manual=True)
@@ -588,6 +595,84 @@ class Executor:
                 )
             records[ref] = {"id": int(parts[0]), "applied": parts[3]}
         return records
+
+    def _observe_guarded_receipt(self, nonce: str) -> list[dict]:
+        """Every guarded-migration receipt for `nonce` (normally zero or one).
+        A missing receipt table means no receipt exists -- never ownership."""
+        if not _UUID4_RE.fullmatch(nonce):
+            raise ExecutionError("MIGRATION_OBSERVATION_FAILED", "invalid guarded-migration nonce", manual=True)
+        exists = self._psql_lines(f"SELECT to_regclass('{GUARDED_RECEIPT_TABLE}') IS NOT NULL")
+        if exists == ["f"]:
+            return []
+        if exists != ["t"]:
+            raise ExecutionError("MIGRATION_OBSERVATION_FAILED", "could not determine receipt table presence", manual=True)
+        lines = self._psql_lines(
+            f"SELECT nonce, job_id, migration, django_migration_id, applied_utc FROM {GUARDED_RECEIPT_TABLE} "
+            f"WHERE nonce = '{nonce}'"
+        )
+        receipts = []
+        for line in lines:
+            parts = line.split("|")
+            if len(parts) != 5 or not parts[3].isdigit():
+                raise ExecutionError("MIGRATION_OBSERVATION_FAILED", "guarded-migration receipt is malformed", manual=True)
+            receipts.append({
+                "nonce": parts[0], "job_id": parts[1], "migration": parts[2],
+                "django_migration_id": int(parts[3]), "applied_utc": parts[4],
+            })
+        return receipts
+
+    def _receipt_proves(self, nonce: str, *, job_id: str, migration: str, row: dict) -> bool:
+        receipts = self._observe_guarded_receipt(nonce)
+        return receipts == [{
+            "nonce": nonce, "job_id": job_id, "migration": migration,
+            "django_migration_id": row["id"], "applied_utc": row["applied"],
+        }]
+
+    def _apply_migration_guarded(self, source: Path, *, job_id: str, nonce: str, migration: str,
+                                 transition: list[str], owned: dict) -> dict:
+        """Run the staged target's guarded one-migration apply and strictly
+        validate its bounded result. Returns the applied recorder row."""
+        arguments = ["updatecenter_apply_migration_guarded", "--skip-checks",
+                     "--job-id", job_id, "--nonce", nonce, "--migration", migration]
+        for ref in transition:
+            arguments += ["--transition", ref]
+        for ref in transition:
+            if ref in owned:
+                arguments += ["--owned", f"{ref}={owned[ref]['id']},{owned[ref]['applied']}"]
+        result, settings = self._run_app(source, arguments, timeout=1800)
+        if not result.ok:
+            raise ExecutionError("MIGRATION_FAILED", _decode(result, settings), manual=True)
+        try:
+            payload = json.loads(result.stdout.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise ExecutionError("MIGRATION_GUARD_INVALID", "guarded apply did not emit strict JSON", manual=True) from exc
+        if isinstance(payload, dict) and set(payload) == {"schema_version", "status", "reason"} \
+                and payload["schema_version"] == 1 and payload["status"] == "refused" \
+                and isinstance(payload["reason"], str) and _GUARD_REASON_RE.fullmatch(payload["reason"]):
+            reason = payload["reason"]
+            if reason in {"lock_timeout", "deadlock_victim"}:
+                # The guarded transaction rolled back completely: retryable.
+                raise ExecutionError(
+                    "MIGRATION_LOCK_TIMEOUT",
+                    f"guarded apply of {migration} lost a database lock wait ({reason}); nothing changed, retry later",
+                )
+            if reason == "NON_ATOMIC_UNSUPPORTED":
+                raise ExecutionError(
+                    "NON_ATOMIC_MIGRATION_UNSUPPORTED",
+                    f"{migration} is not atomic; guarded automatic application requires explicit operator recovery",
+                    manual=True,
+                )
+            raise ExecutionError("TARGET_MIGRATION_PREAPPLIED", f"guarded apply of {migration} refused: {reason}", manual=True)
+        row = payload.get("row") if isinstance(payload, dict) else None
+        if (not isinstance(payload, dict)
+                or set(payload) != {"schema_version", "status", "migration", "nonce", "row"}
+                or payload["schema_version"] != 1 or payload["status"] != "applied"
+                or payload["migration"] != migration or payload["nonce"] != nonce
+                or not isinstance(row, dict) or set(row) != {"id", "applied"}
+                or isinstance(row["id"], bool) or not isinstance(row["id"], int)
+                or not isinstance(row["applied"], str) or not _APPLIED_UTC_RE.fullmatch(row["applied"])):
+            raise ExecutionError("MIGRATION_GUARD_INVALID", "guarded apply result is invalid", manual=True)
+        return row
 
     def _observe_migration_records_when_ready(self, refs) -> dict[str, dict]:
         """_observe_migration_records with a bounded wait for PostgreSQL to
@@ -660,9 +745,10 @@ class Executor:
         in_flight = evidence.get("in_flight_migration")
         if in_flight is not None and (len(prefix) >= len(plan_refs) or in_flight != plan_refs[len(prefix)]):
             return "evidence in-flight migration is not the next migration after the prefix"
-        proven = evidence.get("in_flight_absence_proven")
-        if not isinstance(proven, bool) or (proven and in_flight is None):
-            return "evidence in-flight absence proof is invalid"
+        nonce = evidence.get("in_flight_nonce")
+        if (nonce is None) != (in_flight is None) or (nonce is not None and (
+                not isinstance(nonce, str) or not _UUID4_RE.fullmatch(nonce))):
+            return "evidence in-flight nonce is invalid"
         if (not isinstance(records, dict) or set(records) != set(prefix)
                 or any(not isinstance(value, dict) or set(value) != {"id", "applied"}
                        or isinstance(value["id"], bool) or not isinstance(value["id"], int)
@@ -720,9 +806,15 @@ class Executor:
                 return
             recorded = evidence["successful_prefix"]
             in_flight = evidence["in_flight_migration"]
-            # The in-flight migration is claimable only if a post-marker
-            # observation durably proved it absent before the command ran.
-            claimable = in_flight is not None and evidence["in_flight_absence_proven"] is True
+            # The in-flight migration is claimable only with the exact receipt
+            # the guarded transaction committed together with it.
+            claimable = (
+                in_flight is not None and in_flight in observed
+                and self._receipt_proves(
+                    evidence["in_flight_nonce"], job_id=evidence["evidence_job_id"],
+                    migration=in_flight, row=observed[in_flight],
+                )
+            )
             allowed = [recorded] + ([[*recorded, in_flight]] if claimable else [])
             if prefix not in allowed:
                 # Only the one migration the updater was running may be newly
@@ -745,7 +837,7 @@ class Executor:
                 successful_prefix=list(prefix),
                 prefix_records={ref: observed[ref] for ref in prefix},
                 in_flight_migration=None,
-                in_flight_absence_proven=False,
+                in_flight_nonce=None,
                 failure_classification=classification[:64],
                 failure_detail=" ".join(detail.split())[:4000],
                 first_remaining_migration=ordered[len(prefix)] if len(prefix) < len(ordered) else None,
@@ -1673,7 +1765,7 @@ class Executor:
                     "successful_prefix": successful_prefix,
                     "prefix_records": prefix_records,
                     "in_flight_migration": None,
-                    "in_flight_absence_proven": False,
+                    "in_flight_nonce": None,
                     "checkpoint": checkpoint,
                     "failure_classification": "",
                     "failure_detail": "",
@@ -1691,68 +1783,53 @@ class Executor:
                 self.store.milestone(job_id, "migration_started")
                 for ref in actual_migrations:
                     expected_after_command = [*successful_prefix, ref]
-                    app_label, migration_name = ref.split(".", 1)
-                    # 1. Durable in-flight marker (absence not yet proven).
+                    # 1. Durable in-flight identity: exactly this migration and
+                    # a fresh nonce. On its own this never proves ownership.
+                    nonce = str(uuid.uuid4())
                     recovery_record["in_flight_migration"] = ref
-                    recovery_record["in_flight_absence_proven"] = False
+                    recovery_record["in_flight_nonce"] = nonce
                     self.store.update(job_id, migration_recovery=recovery_record)
-                    # 2. Fresh observation AFTER the marker: the transition must
-                    # still be exactly the owned prefix with identical rows, so
-                    # `ref` itself is absent. A migration applied by anyone in
-                    # the gap before this proof is never the updater's: fail
-                    # closed without invoking migrate (which would be a no-op
-                    # that appears to "apply" it).
-                    self._assert_exact_prefix(full_plan, successful_prefix, prefix_records)
-                    # 3. Durable proof; only now may a crash claim `ref`.
-                    recovery_record["in_flight_absence_proven"] = True
-                    self.store.update(job_id, migration_recovery=recovery_record)
-                    result, settings = self._run_app(
-                        staged.source_root,
-                        ["migrate", app_label, migration_name, "--noinput", "--skip-checks"],
-                        timeout=1800,
+                    # 2. The ownership boundary: one PostgreSQL transaction under
+                    # ACCESS EXCLUSIVE on django_migrations proves the exact owned
+                    # prefix and absence, applies exactly `ref`, and commits its
+                    # recorder row together with the nonce-bound receipt.
+                    row = self._apply_migration_guarded(
+                        staged.source_root, job_id=job_id, nonce=nonce, migration=ref,
+                        transition=full_plan, owned=prefix_records,
                     )
-                    # The recorder is the authority: what is applied, and the
-                    # exact row identity of each applied prefix migration.
+                    # 3. Never trust the command's output alone: re-observe the
+                    # recorder and the receipt through the protected path.
                     observed = self._observe_migration_records(full_plan)
-                    observed_prefix = _contiguous_prefix(full_plan, observed)
-                    if set(observed) != set(observed_prefix):
+                    if (_contiguous_prefix(full_plan, observed) != expected_after_command
+                            or set(observed) != set(expected_after_command)):
                         raise ExecutionError(
-                            "MIGRATION_STATE_DRIFT", "applied target migrations are not a contiguous trusted prefix",
+                            "MIGRATION_STATE_DRIFT",
+                            f"applied target migrations {sorted(observed)!r} are not exactly the owned prefix plus {ref}",
                             manual=True,
                         )
-                    if (observed_prefix[:len(successful_prefix)] != successful_prefix
-                            or any(observed[item] != prefix_records[item] for item in successful_prefix)):
+                    if any(observed[item] != prefix_records[item] for item in successful_prefix):
                         raise ExecutionError(
                             "MIGRATION_STATE_DRIFT", "previously recorded target migration rows changed during the job",
                             manual=True,
                         )
-                    if (len(observed_prefix) > len(successful_prefix)
-                            and observed_prefix != expected_after_command):
+                    if observed[ref] != row or not self._receipt_proves(nonce, job_id=job_id, migration=ref, row=row):
                         raise ExecutionError(
                             "MIGRATION_STATE_DRIFT",
-                            "target migrations beyond the in-flight migration appeared during the job",
+                            f"{ref}'s recorder row and guarded receipt do not match the guarded apply result",
                             manual=True,
                         )
-                    if len(observed_prefix) > len(successful_prefix):
-                        successful_prefix = observed_prefix
-                        prefix_records = {item: observed[item] for item in successful_prefix}
-                        recovery_record["successful_prefix"] = list(successful_prefix)
-                        recovery_record["prefix_records"] = dict(prefix_records)
-                        recovery_record["first_remaining_migration"] = (
-                            full_plan[len(successful_prefix)] if len(successful_prefix) < len(full_plan) else None
-                        )
-                    # One atomic state write records the observed prefix AND
-                    # clears the in-flight marker and its absence proof.
+                    # 4. One atomic state write: extend the owned prefix with the
+                    # exact row identity and clear the in-flight identity.
+                    successful_prefix = expected_after_command
+                    prefix_records = {**prefix_records, ref: row}
+                    recovery_record["successful_prefix"] = list(successful_prefix)
+                    recovery_record["prefix_records"] = dict(prefix_records)
+                    recovery_record["first_remaining_migration"] = (
+                        full_plan[len(successful_prefix)] if len(successful_prefix) < len(full_plan) else None
+                    )
                     recovery_record["in_flight_migration"] = None
-                    recovery_record["in_flight_absence_proven"] = False
+                    recovery_record["in_flight_nonce"] = None
                     self.store.update(job_id, migration_recovery=recovery_record)
-                    if not result.ok:
-                        raise ExecutionError("MIGRATION_FAILED", _decode(result, settings), manual=True)
-                    if successful_prefix != expected_after_command:
-                        raise ExecutionError(
-                            "MIGRATION_VERIFY_FAILED", "migration command did not produce its exact trusted prefix",
-                            manual=True,
-                        )
                 verified = self._probe(staged.source_root)
                 if verified["conflicts"] or verified["replacements"] or verified["plan"]:
                     raise ExecutionError("MIGRATION_VERIFY_FAILED", "target schema is not clean after migration", manual=True)
